@@ -1,5 +1,6 @@
 [package]
 name = "cardinal-blob"
+description = "Content-defined chunking, convergent encryption, blob indexes, and the object store of the Cardinal protocol"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -7,3 +8,14 @@ license.workspace = true
 authors.workspace = true
 
 [dependencies]
+cardinal-encoding.workspace = true
+cardinal-crypto.workspace = true
+blake3.workspace = true
+zeroize.workspace = true
+
+[dev-dependencies]
+cardinal-crypto.workspace = true
+proptest.workspace = true
+serde_json.workspace = true
+hex.workspace = true
+blake3.workspace = true

@@ -130,6 +130,15 @@ version = "0.1.0"
 [[package]]
 name = "cardinal-blob"
 version = "0.1.0"
+dependencies = [
+ "blake3",
+ "cardinal-crypto",
+ "cardinal-encoding",
+ "hex",
+ "proptest",
+ "serde_json",
+ "zeroize",
+]
 
 [[package]]
 name = "cardinal-contact"
@@ -181,6 +190,14 @@ version = "0.1.0"
 [[package]]
 name = "cardinal-sync"
 version = "0.1.0"
+dependencies = [
+ "blake3",
+ "cardinal-crypto",
+ "cardinal-encoding",
+ "hex",
+ "proptest",
+ "serde_json",
+]
 
 [[package]]
 name = "cardinald"

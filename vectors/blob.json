@@ -1,0 +1,228 @@
+{
+  "chunking": {
+    "avg": 65536,
+    "gear_first": [
+      "f8c2cf09b62aca0f",
+      "2d73792e9f507c13",
+      "6abc744f5c535417",
+      "63415112bcf3c812"
+    ],
+    "gear_last": "da221286978eeca7",
+    "gear_table_blake3": "c6d09883bef92d042adca8190a935a47b3155513b121add8d8e458c42fe14288",
+    "mask_easy": "fffc000000000000",
+    "mask_hard": "ffffc00000000000",
+    "max": 262144,
+    "min": 16384
+  },
+  "convergence_secret": "d311886d2c147e1f20d052870a9aec70670b0d0e6bd9276490f6027960928b43",
+  "description": "Blobs (blobs.md). gear[i] = first 8 bytes LE of BLAKE3(\"cardinal 1 gear\" || byte(i)) for i in 0..=255; gear_table_blake3 is BLAKE3 of the 256 entries as consecutive 8-byte little-endian words. Inputs are BLAKE3(\"cardinal test vector \" || label) extended to the given length. convergence secret = derive(\"convergence\", epoch key); key = BLAKE3.keyed_hash(secret, plaintext); ciphertext = ChaCha20-Poly1305(key, zero nonce, empty aad); id = BLAKE3(ciphertext). Index entry length for an index is the blob bytes it covers; an index naming level-L indexes has level L+1.",
+  "empty_blob_reference": "25018202ccb8d81ed1f86fd59b066dec7b882e9211505dfaaca14b4b44066a0e19be46c4028202c1922be811b67ed236616f12f06efc30e9f547c3f3479cf1e8b335c1dea67bbc03000400",
+  "epoch_key": "cfa3698a3a37ccc7564397f79e4ff5754676f611b8c64d7a0c257daead2750ea",
+  "pseudorandom": {
+    "boundaries": [
+      40922,
+      147184,
+      216434,
+      293081,
+      374488,
+      467441,
+      560884,
+      653374,
+      764987,
+      831361,
+      906997,
+      981610,
+      1068163,
+      1206962,
+      1288695,
+      1352734,
+      1405327,
+      1485564,
+      1500000
+    ],
+    "chunks": [
+      {
+        "id": "2577671230ce638fa96abb985990e6bbefbf02b7673d1368a027100a8401aacb",
+        "key": "1c0e08b154692bb4588792a64c62f1c219c63a10918d867dcf383bf4477418fa",
+        "length": 40922,
+        "offset": 0,
+        "plaintext_blake3": "eae11c11993fb0d28167680ce583a371e88da3e00abe7dbc63c7b11b6babd80a"
+      },
+      {
+        "id": "d2e0bb10a4afb993fc6c8c6d68ef87fec9fa6ddbdd2b716b5914b62b706e1d8d",
+        "key": "d610b83af74fab50ccf2778272c5a98ff9cb885bdaa9469e192a3a5cb9f1859e",
+        "length": 106262,
+        "offset": 40922,
+        "plaintext_blake3": "5d07bae403347e31e7b409211ac1cf7e3e8cbfdcddd47c54e9e02367c82a9e13"
+      },
+      {
+        "id": "c59de3a22b8d42bfc58b3f7736b3e7ce9846de86b2ad14848fd5eb853d6ca4ee",
+        "key": "a3e96a3f92e1f8a8f5024e256b1d4b3af53b2ec49cc81be6f36eed3195171bc0",
+        "length": 69250,
+        "offset": 147184,
+        "plaintext_blake3": "01ecee3e6b31bfe424ecbbf75f00c3a75288903956ffe8a6c22c6fbf92eb6a28"
+      },
+      {
+        "id": "7e22d109d06cf02370cfb6f9f99f43826059502918300bb68d0595160f0b856d",
+        "key": "dff69d7430037c7d47a5733fbe77221c0eeb307387923f741b2ffadd5a4b4714",
+        "length": 76647,
+        "offset": 216434,
+        "plaintext_blake3": "91f76101ba5d69ded6963c7555e87dfc67d7614ecd716204595890c93344cc10"
+      },
+      {
+        "id": "5efe3b93e6b208568b3133060af294b0100842a869c78b445c2c6d4eee7b8286",
+        "key": "1987d8d068696c721d00af2adb50356bff7c2e2f129e0abd1ee536d19433ee93",
+        "length": 81407,
+        "offset": 293081,
+        "plaintext_blake3": "3db980dd0ad749fdddb047007f8cd09a5f8dc750e2f6d8ecb4a927bf0e7495c4"
+      },
+      {
+        "id": "12c3a37cd46a9b29f8fadb69a4c8aae271f5913151442852d27b12685f92755e",
+        "key": "cfa8b96d4607ae24cee9a204fee8ea8aa16bb8347e0367cbc90bb0be0628cad9",
+        "length": 92953,
+        "offset": 374488,
+        "plaintext_blake3": "123c87578c1b4390094876f8afbb9cb9a5a102ae056c9f10013919adae531392"
+      },
+      {
+        "id": "767c24cbfd46d9ad3de17ae802fd6b915db328c9031e595315eef37c2762bf6f",
+        "key": "5353de9269c8074ebcc40d2f2edc94d90cb12ca1f9f9df94eb5cac20bf175f32",
+        "length": 93443,
+        "offset": 467441,
+        "plaintext_blake3": "10010e5f59453662d6d319a5d056a6ba03beabdf3862bdfad507c24c07c1f190"
+      },
+      {
+        "id": "0ddbfc9411130c73ce4092638726c28a79c444ef53e8630bf8c94714be203136",
+        "key": "d8bbfa1717f9ca1725d62f3680c02b352ffe1d221017202635860335443b3a66",
+        "length": 92490,
+        "offset": 560884,
+        "plaintext_blake3": "223129ef430944cb4cc1cbf301e791acbbad08c054f36208799b6e280e75b588"
+      },
+      {
+        "id": "6431fa651e2120e4690bba2910a3bfd60ba3d2143cccc8a7bdc691ec95e6d36f",
+        "key": "71ebad71e281e01ea74b42447eaa047d6d89ed008d7c90c1a024736464126826",
+        "length": 111613,
+        "offset": 653374,
+        "plaintext_blake3": "7081ec7dd1951eb5fb3c5ea2ef2ba51b621e0633c07466c8dc9a0098ba491df7"
+      },
+      {
+        "id": "9ac9a6d1b8a67efea389b86355b29362238520198f4b10fecd72273dbaeb65d0",
+        "key": "71e1563fef7439ea28d692acbede09696ebaddc57e6b89dba763f8b454704e44",
+        "length": 66374,
+        "offset": 764987,
+        "plaintext_blake3": "e82f8954d0c2e105f7a1c8baf2ffed38fe9d365ee587bf35f25272941349e396"
+      },
+      {
+        "id": "74316d248809866f7d4985efa2b6b7a00c1a3339451d4fdd6fe879fbabc5154c",
+        "key": "eecad0c400eafcfa4fa75b89710b1b19385ee191910d9a853515ea97f999ba08",
+        "length": 75636,
+        "offset": 831361,
+        "plaintext_blake3": "be14b1c6d329ce40c31ba311edc4cc154a8244121391f8ec646a166f5d94f84b"
+      },
+      {
+        "id": "ed077b021f43f7fa3352414bb760f4062eb45337738fc6cc5c11e6f5fee921b7",
+        "key": "fdb847f4e00cfc175ea80d75f392b519bef13efd2c7fba446b14be9c9a15ebf9",
+        "length": 74613,
+        "offset": 906997,
+        "plaintext_blake3": "3a944d0e82b898730eeacf44469af293cba2d3adf7a6cb354668875ec69adcbe"
+      },
+      {
+        "id": "66a301a67de78a16b3e0ee1329a5f7a7982dc0610cde0980a698fe5888dabcf6",
+        "key": "9ca9103a2b3ffe72eb9c3fb8fdcdd673be5a12b09e09ae6aabedbf8fe3945f3e",
+        "length": 86553,
+        "offset": 981610,
+        "plaintext_blake3": "5063cbe10b7a93497f0915ce7d9e0dbf22466f3092e17cb0861b9ef69da4f781"
+      },
+      {
+        "id": "87337fa2308ed5e85b1c2268f930dbb79c0829fe71caee8c65675eb1987e4691",
+        "key": "18b2e851e318d66b4d9eb148e69513b6b44aca4fbf2875abd79780bf59b5a22d",
+        "length": 138799,
+        "offset": 1068163,
+        "plaintext_blake3": "7b27496f09d7d96423dc0be993a685c109792aef8b8a6534f34652e959227e2a"
+      },
+      {
+        "id": "6bee89103edda81b3f8eccfbd4401ec5037930ea0625a2b9a504c2ed89925bac",
+        "key": "7922aa3ef962e61502f4a45cd2585c0c370b140161424b1f37503c2244514a9b",
+        "length": 81733,
+        "offset": 1206962,
+        "plaintext_blake3": "7a7be6ed5208b952f7b4210b688777dfbe1aecda14c5bc2f4591164415a84920"
+      },
+      {
+        "id": "81b1550e8855b49c4f75bf59cf4f95dfb4b382724db3e346efd085d4375c2723",
+        "key": "8d38515200819fda571a5782105533f8d3f5c130f06ba7ca6528d58f6f41f069",
+        "length": 64039,
+        "offset": 1288695,
+        "plaintext_blake3": "0f13f1b1d03e4ac4edfda7434cf3e9caaa00300b4bcfc3da41ca57b0abaf5b2b"
+      },
+      {
+        "id": "7c72175e1ea1cd5250e7219a41ae98635187153bc3695d9c8f27da2163aee5de",
+        "key": "934eaa462b93b74b02e1f4ef446de447f950bcfcbd00617e2f780a41be457e9d",
+        "length": 52593,
+        "offset": 1352734,
+        "plaintext_blake3": "bccec72c5e1d699009e448faca83efe317f37f15499c5b750c07cc84e84c879e"
+      },
+      {
+        "id": "eac39b84cd5b8d6860466b026e4061d99d98160a3c5b38267a10bc901ec5e638",
+        "key": "02303f58afb979cea2052f7d9d6a20a21deae03b8cb6287dc153e0f4d696347a",
+        "length": 80237,
+        "offset": 1405327,
+        "plaintext_blake3": "c4514fe0bdead2ad0c39dbf2008321bfb0262db2b647a126bafea6c581857eff"
+      },
+      {
+        "id": "f75da3700a30a92ee1cf0c245d17f498a909a244dfc67493162bee9de9fab6c7",
+        "key": "689ee97191d5e74a67428241d7af0d11587b2331c2470decab21a8817febec69",
+        "length": 14436,
+        "offset": 1485564,
+        "plaintext_blake3": "842c09370f867d074f5092f72916730e87bee23a22506f605cc7abddeed869c1"
+      }
+    ],
+    "index_plaintext_blake3": "e9577050535e3fd34b804378b5cc3a3a4a4055f72240d62c4734ab9202eb5351",
+    "index_plaintext_length": 1433,
+    "label": "blob input",
+    "length": 1500000,
+    "reference": {
+      "encoding": "2501820272d232d034024097f5daf2fd230cce606f887e0b8c16ae6662594805b6cf80b10282028b0b394119c78fda8ec69bc352ede13cfa61e162312ce7330bb140cec6a532870380b6dc050408",
+      "id": "72d232d034024097f5daf2fd230cce606f887e0b8c16ae6662594805b6cf80b1",
+      "key": "8b0b394119c78fda8ec69bc352ede13cfa61e162312ce7330bb140cec6a53287",
+      "levels": 1,
+      "size": 1500000
+    }
+  },
+  "single_chunk": {
+    "ciphertext": "94f0611ccbb02c1ac554b50c9c28d119b6e904f6852fac7f9f365477bb11ca",
+    "id": "f1a8a74624f94aa26ade2449daac1982520cff5ad2301e8ee4a9f1389a69f0bb",
+    "key": "89338db6210c286d6043b87d28cac953022e918383cd64196febb91f6ea4778a",
+    "plaintext": "hello, cardinal",
+    "public_id": "e12d8ccd200c50f2f08625c80d45652cf5370bcdfe05158e702a929455642f00",
+    "public_key": "853386c29386aba3d4c44533808ebdc80a534bb948a56797494d8b9de1ead7e8"
+  },
+  "synthetic_tree": {
+    "description": "3,001 entries; chunk i has id fixed(\"synthetic chunk id {i}\"), key fixed(\"synthetic chunk key {i}\"), length 65536 + i. Indexes listed in the order they complete.",
+    "indexes": [
+      {
+        "ciphertext_length": 225025,
+        "id": "33288f33faf10442f24f4e8f2b64b237f24aceaf27dc7d8fbd27a77b4df1e97e",
+        "key": "d6d18956934541e26dac133ceb3357d59230e7d6c48a5231049f21d8e3b69d62"
+      },
+      {
+        "ciphertext_length": 98,
+        "id": "a8a03bb219c667611cef0eb23d00afa79a86efad471af05743b06c34246190c6",
+        "key": "3257c750b78b7e5b1d3257dd6ab92671948279033f44ab62beb99d633ca3cc51"
+      },
+      {
+        "ciphertext_length": 175,
+        "id": "1c02aee7c9b414c3096e08b10f069cb3b09411a51db5649f07e8671510d2190d",
+        "key": "3bf563064d15bcfcbc6a454220e05557f1790e497563b6363f7bf9b02169f44d"
+      }
+    ],
+    "levels": 2,
+    "reference": "250182021c02aee7c9b414c3096e08b10f069cb3b09411a51db5649f07e8671510d2190d0282023bf563064d15bcfcbc6a454220e05557f1790e497563b6363f7bf9b02169f44d03e0ffb5ff050410"
+  },
+  "zeros": {
+    "boundaries": [
+      262144,
+      524288,
+      700000
+    ],
+    "length": 700000
+  }
+}
