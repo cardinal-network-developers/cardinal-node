@@ -6,7 +6,28 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
+build = "build.rs"
 
 [dependencies]
+cardinal-crypto.workspace = true
 clap.workspace = true
 anyhow.workspace = true
+blake3.workspace = true
+sha2.workspace = true
+hex.workspace = true
+ureq.workspace = true
+toml.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+# Signs release manifests; used by scripts/release.sh.
+[[bin]]
+name = "cardinal-release-sign"
+path = "src/bin/cardinal-release-sign.rs"
+
+# A front end exposing only the deployment commands, for testing the
+# installer and updater before (and independently of) the full CLI.
+[[bin]]
+name = "cardinal-deploy"
+path = "src/bin/cardinal-deploy.rs"

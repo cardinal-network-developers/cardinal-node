@@ -64,3 +64,8 @@ hex = "0.4"
 # Command line and errors.
 clap = { version = "4.5", features = ["derive"] }
 anyhow = "1"
+
+# Installer and updater (HTTPS via rustls only; no OpenSSL).
+ureq = { version = "3.5", default-features = false, features = ["rustls"] }
+toml = "1"
+tempfile = "3"
