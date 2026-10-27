@@ -1,0 +1,12 @@
+[package]
+name = "cardinal-update"
+description = "Install, update, and uninstall the cardinal binary for one user"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+clap.workspace = true
+anyhow.workspace = true

@@ -9,6 +9,7 @@ members = [
     "crates/sync",
     "crates/link",
     "crates/contact",
+    "crates/update",
     "crates/cardinald",
     "crates/cardinal",
 ]
@@ -35,6 +36,7 @@ cardinal-blob = { path = "crates/blob" }
 cardinal-sync = { path = "crates/sync" }
 cardinal-link = { path = "crates/link" }
 cardinal-contact = { path = "crates/contact" }
+cardinal-update = { path = "crates/update" }
 
 # Cryptography (RustCrypto, dalek, BLAKE3 team, Zcash Foundation).
 blake3 = { version = "1.8", features = ["zeroize"] }
@@ -58,3 +60,7 @@ proptest = "1.12"
 shake = "0.1"
 serde_json = "1"
 hex = "0.4"
+
+# Command line and errors.
+clap = { version = "4.5", features = ["derive"] }
+anyhow = "1"
