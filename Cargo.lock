@@ -178,6 +178,15 @@ dependencies = [
 [[package]]
 name = "cardinal-identity"
 version = "0.1.0"
+dependencies = [
+ "blake3",
+ "cardinal-crypto",
+ "cardinal-encoding",
+ "hex",
+ "proptest",
+ "serde_json",
+ "zeroize",
+]
 
 [[package]]
 name = "cardinal-link"
@@ -186,6 +195,14 @@ version = "0.1.0"
 [[package]]
 name = "cardinal-space"
 version = "0.1.0"
+dependencies = [
+ "blake3",
+ "cardinal-crypto",
+ "cardinal-encoding",
+ "cardinal-identity",
+ "proptest",
+ "zeroize",
+]
 
 [[package]]
 name = "cardinal-sync"
