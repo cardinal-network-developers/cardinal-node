@@ -1,5 +1,6 @@
 [package]
 name = "cardinal-contact"
+description = "Invitations, device pairing with CPace, and LAN discovery for the Cardinal protocol"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -7,3 +8,12 @@ license.workspace = true
 authors.workspace = true
 
 [dependencies]
+cardinal-encoding.workspace = true
+cardinal-crypto.workspace = true
+cardinal-link.workspace = true
+zeroize.workspace = true
+tokio.workspace = true
+socket2.workspace = true
+
+[dev-dependencies]
+hex.workspace = true

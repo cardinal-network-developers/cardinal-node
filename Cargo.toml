@@ -48,6 +48,11 @@ getrandom = "0.4"
 subtle = "2.6"
 zeroize = { version = "1.8", features = ["zeroize_derive"] }
 
+# Networking (link and contact).
+tokio = { version = "1.52", features = ["rt-multi-thread", "net", "sync", "time", "macros", "io-util"] }
+bytes = "1.10"
+socket2 = { version = "0.6", features = ["all"] }
+
 # Testing.
 proptest = "1.12"
 shake = "0.1"
