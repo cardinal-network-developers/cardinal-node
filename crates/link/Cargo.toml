@@ -1,5 +1,6 @@
 [package]
 name = "cardinal-link"
+description = "Link sessions of the Cardinal protocol: handshake, keys, frames, streams"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -7,3 +8,15 @@ license.workspace = true
 authors.workspace = true
 
 [dependencies]
+cardinal-encoding.workspace = true
+cardinal-crypto.workspace = true
+blake3.workspace = true
+chacha20poly1305.workspace = true
+zeroize.workspace = true
+tokio.workspace = true
+bytes.workspace = true
+
+[dev-dependencies]
+cardinal-crypto = { workspace = true, features = ["test-rng"] }
+serde_json.workspace = true
+hex.workspace = true
