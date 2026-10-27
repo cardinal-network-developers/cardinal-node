@@ -1,5 +1,6 @@
 [package]
 name = "cardinal-identity"
+description = "Identity logs and the authority rules of the Cardinal protocol"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -7,3 +8,12 @@ license.workspace = true
 authors.workspace = true
 
 [dependencies]
+cardinal-encoding.workspace = true
+cardinal-crypto.workspace = true
+blake3.workspace = true
+zeroize.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
+serde_json.workspace = true
+hex.workspace = true
