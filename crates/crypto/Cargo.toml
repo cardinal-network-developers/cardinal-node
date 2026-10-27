@@ -1,0 +1,32 @@
+[package]
+name = "cardinal-crypto"
+description = "Cryptographic suite 1 of the Cardinal protocol"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[features]
+# Exposes entry points that take their randomness as arguments, for
+# reproducible test vectors in other crates. Never enable in production.
+test-rng = []
+
+[dependencies]
+cardinal-encoding.workspace = true
+blake3.workspace = true
+curve25519-dalek.workspace = true
+x25519-dalek.workspace = true
+ed25519-zebra.workspace = true
+ml-kem.workspace = true
+chacha20poly1305.workspace = true
+sha2.workspace = true
+getrandom.workspace = true
+subtle.workspace = true
+zeroize.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
+shake.workspace = true
+serde_json.workspace = true
+hex.workspace = true

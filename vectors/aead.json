@@ -1,0 +1,21 @@
+{
+  "chacha20poly1305": [
+    {
+      "aad": "6173736f6369617465642064617461",
+      "ciphertext": "bebc9c64771ed3e407312edd8ca49d8f7ca95bb7c9ae4f7a6a52bab0430e4ba821ef26077c95606d284c6b75a326",
+      "key": "c8d926a3a4018e31574b703ecb34a464d5568c1fbca9136d62eab3472e612450",
+      "nonce": "ff71c399aff89480bba05a40",
+      "plaintext": "706c61696e7465787420666f7220746865204145414420766563746f7273"
+    }
+  ],
+  "description": "ChaCha20-Poly1305 (RFC 8439) and XChaCha20-Poly1305 (draft-irtf-cfrg-xchacha); ciphertext includes the 16-byte tag.",
+  "xchacha20poly1305": [
+    {
+      "aad": "6173736f6369617465642064617461",
+      "ciphertext": "17bdb59543ba8051618a9be3efeceab7cc6f1805ca874616ea5ae682551e98d28a2406e4eee236165a4145a3584d",
+      "key": "c8d926a3a4018e31574b703ecb34a464d5568c1fbca9136d62eab3472e612450",
+      "nonce": "0a4fd8d869f32533cd2f66af24f68b260cbf06ba5b46c8e9",
+      "plaintext": "706c61696e7465787420666f7220746865204145414420766563746f7273"
+    }
+  ]
+}

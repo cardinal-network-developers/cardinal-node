@@ -1,0 +1,55 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/encoding",
+    "crates/crypto",
+    "crates/identity",
+    "crates/space",
+    "crates/blob",
+    "crates/sync",
+    "crates/link",
+    "crates/contact",
+    "crates/cardinald",
+    "crates/cardinal",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+license = "MIT OR Apache-2.0"
+authors = ["Daniel Wigton"]
+
+[profile.dev.package."*"]
+# Optimize dependencies (the cryptography especially) in debug builds so
+# tests that run thousands of operations stay fast.
+opt-level = 2
+
+[workspace.dependencies]
+# Internal crates.
+cardinal-encoding = { path = "crates/encoding" }
+cardinal-crypto = { path = "crates/crypto" }
+cardinal-identity = { path = "crates/identity" }
+cardinal-space = { path = "crates/space" }
+cardinal-blob = { path = "crates/blob" }
+cardinal-sync = { path = "crates/sync" }
+cardinal-link = { path = "crates/link" }
+cardinal-contact = { path = "crates/contact" }
+
+# Cryptography (RustCrypto, dalek, BLAKE3 team, Zcash Foundation).
+blake3 = { version = "1.8", features = ["zeroize"] }
+curve25519-dalek = { version = "5.0", features = ["zeroize"] }
+x25519-dalek = { version = "3.0", features = ["static_secrets", "zeroize"] }
+ed25519-zebra = "5.0"
+ml-kem = { version = "0.3", default-features = false, features = ["zeroize", "hazmat"] }
+chacha20poly1305 = { version = "0.11", default-features = false, features = ["alloc"] }
+sha2 = { version = "0.11", default-features = false }
+getrandom = "0.4"
+subtle = "2.6"
+zeroize = { version = "1.8", features = ["zeroize_derive"] }
+
+# Testing.
+proptest = "1.12"
+shake = "0.1"
+serde_json = "1"
+hex = "0.4"

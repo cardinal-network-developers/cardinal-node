@@ -1,0 +1,29 @@
+{
+  "cases": [
+    {
+      "entropy": "0000000000000000000000000000000000000000000000000000000000000000",
+      "phrase": "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon art",
+      "recovery_public_key_fingerprint": "c5f4cda27fe63eaa4e06a13abba6de6dd2b24134d44f60d8e4662553f5a02373",
+      "recovery_seed": "ebf56f70f33c068dad7c8af50a35cb913ecd45951fcc836345e1fa6154868a4c",
+      "root_public_key": "ed2a98f07bb97c96c24bf6a74b9ef26f28694ac55c2e48b1a1495255cf8b0132",
+      "root_seed": "744c6cf4fa55c46a4b82985a2aa05a10c2754f263b9d92e9094bd7ca5016ce75"
+    },
+    {
+      "entropy": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+      "phrase": "zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo vote",
+      "recovery_public_key_fingerprint": "022278eaf0f5aed88a12b8bcbbe3679053d74566c1fd610fbd995b8d6aa2408f",
+      "recovery_seed": "0e61640af50ea82c39335a2bfba6827001a7721e0b6e15d25826271fa63c6be4",
+      "root_public_key": "1619e5a3bbddb7286aae6e1a39f8edb66fba4ad3e9d99fd0bf6ea259a15fde91",
+      "root_seed": "a21efbdb52004cf392d0d6c99d1999e2260106fc17a562a67ec83adc8a0f4f14"
+    },
+    {
+      "entropy": "ebb689a7e66b44e1924d1f48a38f27ded3a878573d29cd722199979a82241142",
+      "phrase": "two reform hazard smoke reform ignore empty physical emerge broccoli size sad dentist destroy friend pioneer sniff much grid connect popular bamboo eagle extra",
+      "recovery_public_key_fingerprint": "26082013c2f7d92d280f26eb5a2992a828f1dd5f970d1b4dbe4ee1433e1741f1",
+      "recovery_seed": "654f8fcec3c6b53671d6e29340b70e59b5c1b5f8e4bde6236bdbcbe88d4af0c1",
+      "root_public_key": "145c64a3af046185ac9ebcfe4a4e55ae197d2e2a34e062a6eff48bc015ee1482",
+      "root_seed": "4c24d44552a2ac7fb22133b62d8e1326d8813c7f08af238045fb4b9c7bf61e63"
+    }
+  ],
+  "description": "Recovery phrase (identity.md#recovery-phrase): 256 bits of entropy as 24 BIP-39 English words with BIP-39's checksum; no PBKDF2. root_seed = derive(\"root key\", entropy) is the RFC 8032 secret of the root Ed25519 key. recovery_seed = derive(\"recovery key\", entropy) seeds the recovery hybrid key pair (see hybrid.json)."
+}

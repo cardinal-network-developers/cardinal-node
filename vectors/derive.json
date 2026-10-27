@@ -1,0 +1,120 @@
+{
+  "derivations": [
+    {
+      "context": "cardinal 1 seal",
+      "derive": "c2fb39e58405cd7e9628a7fd0f70c0c767f21fb35f7cf2926d00e69f3d6dd618",
+      "derive_96": "c2fb39e58405cd7e9628a7fd0f70c0c767f21fb35f7cf2926d00e69f3d6dd6189b6419ab2648abdc7a158da5680a8d0b63abc7d846ddd5a8fa0b95590f67edb547c5d580e6df652c14e2dbe8ab0d9293b77c7ee5a57df963c7eb7266e75cbdf6",
+      "material_hex": "63617264696e616c2074657374206d6174657269616c",
+      "purpose": "seal"
+    },
+    {
+      "context": "cardinal 1 root key",
+      "derive": "85fc235be21662b0385e098da1377d5ce2befd58e67df94d0a5f9635c9b0a5b1",
+      "derive_96": "85fc235be21662b0385e098da1377d5ce2befd58e67df94d0a5f9635c9b0a5b1b2279e092b8aa49da28307357cee50bb633b435580a031adbf1205db8d31511150a2d6fc55a1655c5c1e6ebb7c3a8370c2bf75b75b3daa612c31ba00637de04b",
+      "material_hex": "63617264696e616c2074657374206d6174657269616c",
+      "purpose": "root key"
+    },
+    {
+      "context": "cardinal 1 recovery key",
+      "derive": "64cd77492a4ba477bd9ce1445e5d9baeeb3ec43f2e7f8ded92d0dba7ec88c258",
+      "derive_96": "64cd77492a4ba477bd9ce1445e5d9baeeb3ec43f2e7f8ded92d0dba7ec88c2586cd30e8bfc7fcab9ac9554b06c50a81b16a7e003b87be2438bfcee9ab1dffdba433ed6b49d29549359b9d47e5b3acc912e02f079bddce3103a457c42f31f4039",
+      "material_hex": "63617264696e616c2074657374206d6174657269616c",
+      "purpose": "recovery key"
+    },
+    {
+      "context": "cardinal 1 entry key",
+      "derive": "4ba057298d05f6750f0ce3152c1f35aedbddb27549dc7db64d469cb4f1b9f0f8",
+      "derive_96": "4ba057298d05f6750f0ce3152c1f35aedbddb27549dc7db64d469cb4f1b9f0f867fc54a9923a9598bbc941da715d71c1821ab797a12bf3b7c2a1d10dc1f4baf282bd8687feecadcaaaabac1b37c22084d9de7bca448dbbde4da6ad4633d1e146",
+      "material_hex": "63617264696e616c2074657374206d6174657269616c",
+      "purpose": "entry key"
+    },
+    {
+      "context": "cardinal 1 epoch id",
+      "derive": "e650629f763a8edbf50dceea0d8281d49ba989e4d9cc63f5649cc3baced62742",
+      "derive_96": "e650629f763a8edbf50dceea0d8281d49ba989e4d9cc63f5649cc3baced62742d20deeb7e614bbb73cbf34524fc93a41d16ee4c6f4c7d02d50afd8406c5edb416b33753d42d079c8016d8faa2996b06f83efa4ef2657bfe91f843f41c3e92b99",
+      "material_hex": "63617264696e616c2074657374206d6174657269616c",
+      "purpose": "epoch id"
+    },
+    {
+      "context": "cardinal 1 convergence",
+      "derive": "5deb646db5dae44fd5e73654055ab0c9bda979693cc0fbfd9981d561543681d4",
+      "derive_96": "5deb646db5dae44fd5e73654055ab0c9bda979693cc0fbfd9981d561543681d42358ff190386d73cfa1ff7c700ad7ee15813b700adf142cb29cf475caca028246e723c7950cb4f8029f223a45ca1fb3d45f46adf724d45c9c895e3f7441d65d0",
+      "material_hex": "63617264696e616c2074657374206d6174657269616c",
+      "purpose": "convergence"
+    },
+    {
+      "context": "cardinal 1 mailbox",
+      "derive": "b0b2151425b1578651d773837e8e59b73eb38f8d75620b623424df97cef92bc1",
+      "derive_96": "b0b2151425b1578651d773837e8e59b73eb38f8d75620b623424df97cef92bc156bbf30e7f1ae2a47bc0cab2321cea915061a85a6334b4559f34bbd52c863c1822d3723209c2904d36b3f4600e3b0e11edf4a69bc21ef391de3f5d4a9083d54d",
+      "material_hex": "63617264696e616c2074657374206d6174657269616c",
+      "purpose": "mailbox"
+    },
+    {
+      "context": "cardinal 1 discovery",
+      "derive": "9959d916e6150c63c6f3f5b296777ab9f90fd42d08e414e481dc7102cf25c9dd",
+      "derive_96": "9959d916e6150c63c6f3f5b296777ab9f90fd42d08e414e481dc7102cf25c9dd508032773d035b047b41ddeaddc66fa8557e53717782b2775fb970b3fdf878557ca7d524c0f5f1899dbf2eaf6010a1df5e01222d11b99cc6dfb4c881c22d414f",
+      "material_hex": "63617264696e616c2074657374206d6174657269616c",
+      "purpose": "discovery"
+    },
+    {
+      "context": "cardinal 1 invite",
+      "derive": "53930042a48fd05015e4920c08d5ffad499e93820596e0a7e515dbcdbf840f3e",
+      "derive_96": "53930042a48fd05015e4920c08d5ffad499e93820596e0a7e515dbcdbf840f3ed130ce930c586c536d951bc36e8c1248f01354c378e057daa6b77c836cd514392e737f6e5c6f4c603b253a29f6d09aab1f24b72717a43d53cda1a46f739fc72e",
+      "material_hex": "63617264696e616c2074657374206d6174657269616c",
+      "purpose": "invite"
+    },
+    {
+      "context": "cardinal 1 token",
+      "derive": "585e332a800e2bdeae6771e99cdcea895a229719bde0dd7bfd41f8c29d065e26",
+      "derive_96": "585e332a800e2bdeae6771e99cdcea895a229719bde0dd7bfd41f8c29d065e26f9c84e0810286b8a305da5f95a47e0b1d83fd6d1a73ececab2ab50351f515de1cd93e2574db2305a828f20067c5aa0ff031e34953d4f9c7963223203ff4caf80",
+      "material_hex": "63617264696e616c2074657374206d6174657269616c",
+      "purpose": "token"
+    },
+    {
+      "context": "cardinal 1 pair",
+      "derive": "ef6bec783a998f71b172f88305ff01ede1b802a4a90c9e3745868778fe867fa5",
+      "derive_96": "ef6bec783a998f71b172f88305ff01ede1b802a4a90c9e3745868778fe867fa53619156c47460bf403903fa369b92e67326bc0776b9385a4d0c0c294e358a1068dc78bcfc5809f0787b95e87dd548b62c358e06ff2d8b1b9b1622e50ee49b096",
+      "material_hex": "63617264696e616c2074657374206d6174657269616c",
+      "purpose": "pair"
+    },
+    {
+      "context": "cardinal 1 handshake",
+      "derive": "b05affe155cbef54b246fb814536a4ab0693132cf7c8e26843785a27af78fb6a",
+      "derive_96": "b05affe155cbef54b246fb814536a4ab0693132cf7c8e26843785a27af78fb6a97b062a7505af7369fbaf3602a9fc01256c78b02124f224813d3bab6d7c7110b1af2422133f5e066fa9bb1daddd807574795647f8fd57c072750588a41f5e1ad",
+      "material_hex": "63617264696e616c2074657374206d6174657269616c",
+      "purpose": "handshake"
+    },
+    {
+      "context": "cardinal 1 rekey",
+      "derive": "b42e687444a873c63c4175566a43ce974f1821a0714671e9bcf1544416833249",
+      "derive_96": "b42e687444a873c63c4175566a43ce974f1821a0714671e9bcf15444168332499e4638effded0ab4da2aaf9c99e9cff1a82edd890939120ca5202dfff4538f53fb35c625f477a17c475ce8809b24f4b596151a43620d9b28892684b974d6039e",
+      "material_hex": "63617264696e616c2074657374206d6174657269616c",
+      "purpose": "rekey"
+    },
+    {
+      "context": "cardinal 1 hybrid key",
+      "derive": "4b7f13ba6af1a422f92ba0c2315914c5dcb7dee7f447f5eb15e1bf2319c5bf1a",
+      "derive_96": "4b7f13ba6af1a422f92ba0c2315914c5dcb7dee7f447f5eb15e1bf2319c5bf1a05972759fb95a517a27dd82914b31a174662071f9595aa8ea07672b918b153117068d691f735f3f787b8cc0aa75c53bbf79469c0a523e27c4b2503b4eeab0ca0",
+      "material_hex": "63617264696e616c2074657374206d6174657269616c",
+      "purpose": "hybrid key"
+    }
+  ],
+  "description": "derive(purpose, material) = BLAKE3.derive_key(\"cardinal 1 \" || purpose, material); 'derive' is the 32-byte output, 'derive_96' the first 96 bytes of the extended output (used for hybrid keys from a seed). hash = BLAKE3, keyed_hash = BLAKE3 keyed mode.",
+  "hash": [
+    {
+      "input_hex": "",
+      "output": "af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262"
+    },
+    {
+      "input_hex": "63617264696e616c",
+      "output": "c36885ea8e3556a4efc12dd6e8df4a8e05728fc0af079ede571108db791ecb11"
+    }
+  ],
+  "keyed_hash": [
+    {
+      "input_hex": "63617264696e616c2031207061697220636f6e6669726d",
+      "key": "6f79ccbeb97eee5ab7c45cded52e24c6330f1d5f46355067882f37fe6c7b8319",
+      "output": "0262baa7a8ab62567c6314d8eb4ea2cf60bcf7bdae66780e23aa3fa9408c0b23"
+    }
+  ]
+}

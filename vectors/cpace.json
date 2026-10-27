@@ -1,0 +1,33 @@
+{
+  "cases": [
+    {
+      "Ya": "a4be34df3fb20c3a1866bfc48bbb99ef157c4468f86f2377aebfd30c6daefd35",
+      "Yb": "625247663faf567e8368c3f4b7707d5396400d7775d071b362b6bd51a702b43f",
+      "ada": "",
+      "adb": "",
+      "ci": "",
+      "isk_ir": "87efc13fe9acded9afd693756b5373449fb9c5efec906b7294bc1235b1a6b465b62a56fe46013d7ce7332a07d4eb10eef6e8c637f1ea0ad3b1aa7ce34a93ad6b",
+      "name": "pairing shape",
+      "pairing_key_K": "87efc13fe9acded9afd693756b5373449fb9c5efec906b7294bc1235b1a6b465",
+      "prs": "616d62657220686172626f72207175696574",
+      "sid": "6ba0057d2556773dfe711f7a26ab2d69c202c2dc685e9e2cb15856ecf94e6d9a",
+      "ya": "89f7732ce91c2684c3e2b6f9e6924024cfc013a447f9564549c093f13aa96c0b",
+      "yb": "afdfca0a3ac17e2d7d65a8c49015c579a2d87a3dc17eae9ee7ef8be396ee9706"
+    },
+    {
+      "Ya": "20023e84c3d18c58c49c237b6d404276732676a23412c92c3b0258bd91256317",
+      "Yb": "e069f76e86abd6a7d1bb64708af90d49abb312f6bc640390147571e2613ec623",
+      "ada": "414461",
+      "adb": "414462",
+      "ci": "6368616e6e656c",
+      "isk_ir": "ac60a3f6320f4eb29e4828a1702b7a0d3b1566d390985e1e160f5ca6914084af397303437979dd6e3fdb0d0bab0abebc4514751803dde6b3b32534225497fa40",
+      "name": "with ci and ad",
+      "pairing_key_K": "ac60a3f6320f4eb29e4828a1702b7a0d3b1566d390985e1e160f5ca6914084af",
+      "prs": "50617373776f7264",
+      "sid": "17ac3d22617a496b9f23054b84e97a95",
+      "ya": "2b8b95891a0ed3af33642063992878575ad6a9b88555121c230a9ecee1fc440f",
+      "yb": "6056111da12f4b643ca2f49531a555616bf763a400c3e2351fa11c8477d1cd06"
+    }
+  ],
+  "description": "CPace over Ristretto255 with SHA-512, initiator-responder mode (transcript_ir), per draft-irtf-cfrg-cpace-21 (whose appendix B.3 vectors this implementation also passes). Scalars are little-endian. pairing_key_K is the first 32 bytes of ISK, the reading of contact.md's K recorded in DEVIATIONS.md."
+}

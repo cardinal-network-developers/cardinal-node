@@ -1,0 +1,249 @@
+{
+  "description": "Cardinal canonical encoding (spec/encoding.md). 'valid' entries: decoding 'hex' MUST succeed, re-encoding MUST give the same bytes, and the canonical text rendering is 'text'. 'invalid' entries MUST be rejected when the input is one value; 'error' names the rule broken (advisory).",
+  "invalid": [
+    {
+      "error": "unexpected_end",
+      "hex": "",
+      "name": "empty input"
+    },
+    {
+      "error": "reserved_type",
+      "hex": "06",
+      "name": "reserved type 6"
+    },
+    {
+      "error": "reserved_type",
+      "hex": "07",
+      "name": "reserved type 7"
+    },
+    {
+      "error": "reserved_type",
+      "hex": "0c0e",
+      "name": "reserved type inside list"
+    },
+    {
+      "error": "non_minimal_varint",
+      "hex": "8000",
+      "name": "non-minimal header"
+    },
+    {
+      "error": "non_minimal_varint",
+      "hex": "888000",
+      "name": "non-minimal header 3 bytes"
+    },
+    {
+      "error": "non_minimal_varint",
+      "hex": "0d810000",
+      "name": "non-minimal record key"
+    },
+    {
+      "error": "varint_too_long",
+      "hex": "80808080808080808001",
+      "name": "varint longer than 9 bytes"
+    },
+    {
+      "error": "unexpected_end",
+      "hex": "80",
+      "name": "truncated varint"
+    },
+    {
+      "error": "trailing_bytes",
+      "hex": "0000",
+      "name": "trailing bytes"
+    },
+    {
+      "error": "length_exceeds_input",
+      "hex": "120a",
+      "name": "bytes length past end"
+    },
+    {
+      "error": "invalid_utf8",
+      "hex": "0bff",
+      "name": "text invalid utf-8"
+    },
+    {
+      "error": "invalid_utf8",
+      "hex": "13c080",
+      "name": "text overlong utf-8"
+    },
+    {
+      "error": "invalid_utf8",
+      "hex": "1beda080",
+      "name": "text surrogate"
+    },
+    {
+      "error": "unsorted_keys",
+      "hex": "1501000000",
+      "name": "record keys unsorted"
+    },
+    {
+      "error": "duplicate_key",
+      "hex": "1501000100",
+      "name": "record keys duplicate"
+    },
+    {
+      "error": "unexpected_end",
+      "hex": "0d00",
+      "name": "record missing value"
+    },
+    {
+      "error": "length_exceeds_input",
+      "hex": "1400",
+      "name": "list count past end"
+    },
+    {
+      "error": "length_exceeds_input",
+      "hex": "fcffffffffffff3f",
+      "name": "huge list count"
+    },
+    {
+      "error": "too_deep",
+      "hex": "0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c00",
+      "name": "depth 33"
+    }
+  ],
+  "valid": [
+    {
+      "hex": "00",
+      "name": "uint 0",
+      "text": "0"
+    },
+    {
+      "hex": "08",
+      "name": "uint 1",
+      "text": "1"
+    },
+    {
+      "hex": "78",
+      "name": "uint 15 (largest one-byte)",
+      "text": "15"
+    },
+    {
+      "hex": "8001",
+      "name": "uint 16",
+      "text": "16"
+    },
+    {
+      "hex": "c03e",
+      "name": "uint 1000",
+      "text": "1000"
+    },
+    {
+      "hex": "808080808001",
+      "name": "uint 2^32",
+      "text": "4294967296"
+    },
+    {
+      "hex": "f8ffffffffffffff7f",
+      "name": "uint max 2^60-1",
+      "text": "1152921504606846975"
+    },
+    {
+      "hex": "01",
+      "name": "neg -1",
+      "text": "-1"
+    },
+    {
+      "hex": "79",
+      "name": "neg -16",
+      "text": "-16"
+    },
+    {
+      "hex": "8101",
+      "name": "neg -17",
+      "text": "-17"
+    },
+    {
+      "hex": "f9ffffffffffffff7f",
+      "name": "neg min -2^60",
+      "text": "-1152921504606846976"
+    },
+    {
+      "hex": "08",
+      "name": "bool true",
+      "text": "1"
+    },
+    {
+      "hex": "02",
+      "name": "empty bytes",
+      "text": "h''"
+    },
+    {
+      "hex": "220001feff",
+      "name": "bytes",
+      "text": "h'0001feff'"
+    },
+    {
+      "hex": "8202abababababababababababababababababababababababababababababababab",
+      "name": "bytes 32",
+      "text": "h'abababababababababababababababababababababababababababababababab'"
+    },
+    {
+      "hex": "03",
+      "name": "empty text",
+      "text": "\"\""
+    },
+    {
+      "hex": "1b416e61",
+      "name": "text",
+      "text": "\"Ana\""
+    },
+    {
+      "hex": "b3016c696e650a2271756f74656422205c20746162092001",
+      "name": "text escapes",
+      "text": "\"line\\n\\\"quoted\\\" \\\\ tab\\t \\u0001\""
+    },
+    {
+      "hex": "53636166c3a920f09f90a6",
+      "name": "text non-ascii",
+      "text": "\"café 🐦\""
+    },
+    {
+      "hex": "04",
+      "name": "empty list",
+      "text": "[]"
+    },
+    {
+      "hex": "1c081b74776f0a03",
+      "name": "list",
+      "text": "[1, \"two\", h'03']"
+    },
+    {
+      "hex": "05",
+      "name": "empty record",
+      "text": "{}"
+    },
+    {
+      "hex": "1d003001120a0b031b416e61",
+      "name": "spec example",
+      "text": "{0: 6, 1: h'0a0b', 3: \"Ana\"}"
+    },
+    {
+      "hex": "2500207f0b6180010b6280808080802011",
+      "name": "record with large and unknown keys",
+      "text": "{0: 4, 127: \"a\", 128: \"b\", 1099511627776: -3}"
+    },
+    {
+      "hex": "150082020101010101010101010101010101010101010101010101010101010101010101010c0d0104",
+      "name": "nested",
+      "text": "{0: h'0101010101010101010101010101010101010101010101010101010101010101', 1: [{1: []}]}"
+    },
+    {
+      "hex": "0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c00",
+      "name": "depth 32 (maximum)",
+      "text": "[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[0]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]"
+    },
+    {
+      "hex": "c20c0707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707",
+      "name": "bytes 200 (two-byte header)",
+      "text": "h'0707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707'"
+    },
+    {
+      "hex": "1d0008014a1500100123626f647902141501820201010101010101010101010101010101010101010101010101010101010101010282041111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111115018202020202020202020202020202020202020202020202020202020202020202020202820422222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222",
+      "id": "5c1893e5e38ca135190c0f5412301f4483dafe258544a9f97d5d988e44e7cd4e",
+      "name": "signed object structure",
+      "signing_message": "63617264696e616c2073696720315c1893e5e38ca135190c0f5412301f4483dafe258544a9f97d5d988e44e7cd4e",
+      "text": "{0: 1, 1: h'1500100123626f6479', 2: [{1: h'0101010101010101010101010101010101010101010101010101010101010101', 2: h'11111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111'}, {1: h'0202020202020202020202020202020202020202020202020202020202020202', 2: h'22222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222'}]}"
+    }
+  ]
+}
