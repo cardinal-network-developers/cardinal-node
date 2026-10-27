@@ -347,6 +347,7 @@ dependencies = [
  "cardinal-link",
  "cardinal-space",
  "cardinal-sync",
+ "cardinal-update",
  "fuser",
  "hex",
  "libc",
@@ -354,6 +355,8 @@ dependencies = [
  "serde_json",
  "tempfile",
  "tokio",
+ "toml",
+ "toml_edit",
  "tracing",
  "tracing-subscriber",
  "zeroize",
@@ -1415,6 +1418,7 @@ dependencies = [
  "indexmap",
  "toml_datetime",
  "toml_parser",
+ "toml_writer",
  "winnow",
 ]
 

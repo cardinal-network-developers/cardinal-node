@@ -1,6 +1,8 @@
-//! Local settings (`config.json` in the data directory). Everything a
-//! person's other devices need to know lives in the account space instead;
-//! this file holds only what is about this one device.
+//! Local settings: the `[daemon]` table of `config.toml`, which is shared
+//! with `cardinal-update` (it owns `[update]`; other tables are kept as
+//! they are when saving). Everything a person's other devices need to know
+//! lives in the account space instead; this holds only what is about this
+//! one device.
 
 use std::path::{Path, PathBuf};
 
@@ -24,7 +26,9 @@ pub struct Config {
     pub listen: String,
     /// Also listen on UDP (experimental: no congestion control yet).
     pub udp: bool,
-    /// Where the files space is mounted; `None` to not mount.
+    /// Where the files space is mounted; `None` (written as `""`) to not
+    /// mount.
+    #[serde(with = "opt_path")]
     pub mount: Option<PathBuf>,
     /// `full` or `on-demand`.
     pub retention: String,
@@ -66,21 +70,70 @@ pub fn default_name() -> String {
         .unwrap_or_else(|| "this device".into())
 }
 
+mod opt_path {
+    use serde::{Deserialize, Deserializer, Serializer};
+    use std::path::PathBuf;
+
+    pub fn serialize<S: Serializer>(p: &Option<PathBuf>, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(
+            &p.as_ref()
+                .map(|p| p.display().to_string())
+                .unwrap_or_default(),
+        )
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Option<PathBuf>, D::Error> {
+        let s = String::deserialize(d)?;
+        Ok(if s.is_empty() {
+            None
+        } else {
+            Some(PathBuf::from(s))
+        })
+    }
+}
+
+fn read_table(path: &Path) -> anyhow::Result<toml::Table> {
+    match std::fs::read_to_string(path) {
+        Ok(t) => t
+            .parse::<toml::Table>()
+            .map_err(|e| anyhow::anyhow!("{} is not valid TOML: {e}", path.display())),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(toml::Table::new()),
+        Err(e) => Err(e.into()),
+    }
+}
+
 impl Config {
     /// Loads the settings, or the defaults if there are none.
     pub fn load(path: &Path) -> anyhow::Result<Config> {
-        match std::fs::read(path) {
-            Ok(b) => Ok(serde_json::from_slice(&b)
-                .map_err(|e| anyhow::anyhow!("{} is not valid: {e}", path.display()))?),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Config::default()),
-            Err(e) => Err(e.into()),
+        let t = read_table(path)?;
+        match t.get("daemon") {
+            Some(v) => v
+                .clone()
+                .try_into()
+                .map_err(|e| anyhow::anyhow!("[daemon] in {} is not valid: {e}", path.display())),
+            None => Ok(Config::default()),
         }
     }
 
-    /// Saves the settings.
+    /// Saves the settings into `[daemon]`, keeping the other tables and
+    /// their comments.
     pub fn save(&self, path: &Path) -> anyhow::Result<()> {
-        let b = serde_json::to_vec_pretty(self)?;
-        write_private(path, &b, 0o600)?;
+        let text = match std::fs::read_to_string(path) {
+            Ok(t) => t,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+            Err(e) => return Err(e.into()),
+        };
+        let mut doc: toml_edit::DocumentMut = text
+            .parse()
+            .map_err(|e| anyhow::anyhow!("{} is not valid TOML: {e}", path.display()))?;
+        let mine: toml_edit::DocumentMut = toml::to_string(self)?.parse()?;
+        let mut table = mine.as_table().clone();
+        table.set_implicit(false);
+        doc["daemon"] = toml_edit::Item::Table(table);
+        if let Some(d) = path.parent() {
+            std::fs::create_dir_all(d)?;
+        }
+        write_private(path, doc.to_string().as_bytes(), 0o600)?;
         Ok(())
     }
 

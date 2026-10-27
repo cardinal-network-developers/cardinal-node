@@ -65,7 +65,8 @@ pub struct Overrides {
 pub async fn run(paths: Paths, o: Overrides) -> anyhow::Result<()> {
     std::fs::create_dir_all(&paths.home)?;
     let mut config = Config::load(&paths.config())?;
-    let mut changed = !paths.config().exists();
+    let mut changed = Config::load(&paths.config()).is_ok()
+        && !std::fs::read_to_string(paths.config()).is_ok_and(|t| t.contains("[daemon]"));
     if let Some(l) = o.listen {
         changed |= config.listen != l;
         config.listen = l;

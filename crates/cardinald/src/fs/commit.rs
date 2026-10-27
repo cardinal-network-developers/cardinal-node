@@ -62,8 +62,12 @@ pub fn encode(
     }))
 }
 
+/// One commit at a time (the scheduler and `cardinal flush`).
+static COMMITTING: Mutex<()> = Mutex::new(());
+
 /// Commits everything pending. Returns the number of entries written.
 pub fn commit(d: &Arc<Daemon>, tree: &Mutex<Tree>, space: &SpaceId) -> anyhow::Result<usize> {
+    let _one = COMMITTING.lock().unwrap_or_else(|e| e.into_inner());
     // A: what needs encoding.
     let to_encode: Vec<(u64, u64, Arc<Staged>)> = {
         let t = lock(tree);

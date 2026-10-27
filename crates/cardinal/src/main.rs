@@ -17,7 +17,7 @@ use serde_json::{json, Value};
 #[derive(Parser)]
 #[command(
     name = "cardinal",
-    version,
+    version = cardinal_update::VERSION,
     about = "One folder, the same on every device you own.",
     after_help = "Start here: `cardinal init` on your first device, then `cardinal pair` on each \
                   other device."
@@ -356,8 +356,7 @@ async fn init(
         for _ in 0..3 {
             let w1 = prompt(&format!("Word number {}: ", picks[0] + 1))?;
             let w2 = prompt(&format!("Word number {}: ", picks[1] + 1))?;
-            if w1.eq_ignore_ascii_case(list[picks[0]]) && w2.eq_ignore_ascii_case(list[picks[1]])
-            {
+            if w1.eq_ignore_ascii_case(list[picks[0]]) && w2.eq_ignore_ascii_case(list[picks[1]]) {
                 ok = true;
                 break;
             }

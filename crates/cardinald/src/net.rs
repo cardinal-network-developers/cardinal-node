@@ -33,9 +33,14 @@ const MAX_MESSAGE: usize = 48 * 1024 * 1024;
 /// Ids per blob request: 16 chunks of at most 256 KiB.
 const BLOB_BATCH: usize = 16;
 /// Blob requests in flight per peer.
-const BLOB_PARALLEL: usize = 8;
+const BLOB_PARALLEL: usize = 4;
 /// How long one request may take.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
+/// How long one blob request (at most 4 MiB) may take before it is
+/// retried.
+const BLOB_TIMEOUT: Duration = Duration::from_secs(20);
+/// Rounds over the online devices before giving up on some ids.
+const BLOB_ROUNDS: usize = 3;
 
 fn to_value(m: &Message) -> Value {
     Value::Record(m.to_record())
@@ -114,16 +119,21 @@ pub async fn sync_all(d: &Arc<Daemon>, s: &Session) {
     let labels = d.core().labels();
     for label in labels {
         if let Err(e) = reconcile(d, s, label).await {
-            tracing::debug!("reconcile {} with {}: {e:#}", short(&label), short(&s.peer_static()));
+            tracing::debug!(
+                "reconcile {} with {}: {e:#}",
+                short(&label),
+                short(&s.peer_static())
+            );
         }
     }
 }
 
 async fn handle_stream(d: &Arc<Daemon>, s: &Session, mut st: Stream) -> anyhow::Result<()> {
-    let kind = d.classify(s);
     if st.service() == Service::BLOB {
+        tracing::trace!("blob stream {} accepted", st.id());
         return serve_blob(d, st).await;
     }
+    let kind = d.classify(s);
     if st.service() != Service::SYNC {
         st.reset(0);
         return Ok(());
@@ -142,11 +152,8 @@ async fn handle_stream(d: &Arc<Daemon>, s: &Session, mut st: Stream) -> anyhow::
             let mut rec = Reconciler::new(label, set);
             let mut ranges = ranges;
             let mut rounds = 0u32;
-            loop {
-                match rec.receive(&ranges)? {
-                    Some(reply) => st.send_message(&to_value(&reply)).await?,
-                    None => break,
-                }
+            while let Some(reply) = rec.receive(&ranges)? {
+                st.send_message(&to_value(&reply)).await?;
                 if rec.is_done() {
                     break;
                 }
@@ -358,6 +365,7 @@ async fn serve_blob(d: &Arc<Daemon>, mut st: Stream) -> anyhow::Result<()> {
         return Ok(());
     };
     let req = BlobRequest::decode(&v.encode())?;
+    tracing::trace!("serving {} blob objects", req.ids.len());
     let store = d.store.clone();
     let reply = tokio::task::spawn_blocking(move || {
         req.serve(|id| {
@@ -370,6 +378,7 @@ async fn serve_blob(d: &Arc<Daemon>, mut st: Stream) -> anyhow::Result<()> {
     let v = cardinal_encoding::decode(&bytes)?;
     st.send_message(&v).await?;
     st.shutdown().await?;
+    tracing::trace!("blob stream {} served {} bytes", st.id(), bytes.len());
     Ok(())
 }
 
@@ -383,12 +392,15 @@ async fn blob_request(
     st.send_message(&cardinal_encoding::decode(&req.encode())?)
         .await?;
     st.shutdown().await?;
-    let v = tokio::time::timeout(REQUEST_TIMEOUT, st.recv_message_max(MAX_MESSAGE))
+    tracing::trace!("blob request on stream {}", st.id());
+    let v = tokio::time::timeout(BLOB_TIMEOUT, st.recv_message_max(MAX_MESSAGE))
         .await
         .map_err(|_| anyhow::anyhow!("timed out"))??
         .ok_or_else(|| anyhow::anyhow!("no reply"))?;
     let reply = BlobReply::decode(&v.encode())?;
-    Ok(reply.verified())
+    let got = reply.verified();
+    tracing::trace!("got {} blob objects", got.len());
+    Ok(got)
 }
 
 /// Fetches chunks and indexes from this person's online devices. Returns
@@ -403,31 +415,49 @@ pub async fn fetch_blobs(
         ids.iter().filter(|i| seen.insert(**i)).copied().collect()
     };
     let mut out = Vec::new();
-    for s in d.own_sessions() {
-        if remaining.is_empty() {
+    for round in 0..BLOB_ROUNDS {
+        let sessions = d.own_sessions();
+        tracing::trace!(
+            "fetching {} objects from {} devices (round {round})",
+            remaining.len(),
+            sessions.len()
+        );
+        let mut any_failed = false;
+        for s in sessions {
+            if remaining.is_empty() {
+                break;
+            }
+            let mut set = tokio::task::JoinSet::new();
+            let mut batches = remaining.chunks(BLOB_BATCH).map(|c| c.to_vec());
+            let mut failures = 0;
+            loop {
+                while set.len() < BLOB_PARALLEL && failures < 3 {
+                    let Some(b) = batches.next() else { break };
+                    let s2 = s.clone();
+                    set.spawn(async move { blob_request(&s2, b, priority).await });
+                }
+                let Some(r) = set.join_next().await else {
+                    break;
+                };
+                match r {
+                    Ok(Ok(items)) => out.extend(items),
+                    Ok(Err(e)) => {
+                        tracing::debug!("blob request to {}: {e:#}", short(&s.peer_static()));
+                        failures += 1;
+                        any_failed = true;
+                    }
+                    Err(_) => {
+                        failures += 1;
+                        any_failed = true;
+                    }
+                }
+            }
+            let got: HashSet<[u8; 32]> = out.iter().map(|(i, _)| *i).collect();
+            remaining.retain(|i| !got.contains(i));
+        }
+        if remaining.is_empty() || !any_failed {
             break;
         }
-        let mut set = tokio::task::JoinSet::new();
-        let mut batches = remaining.chunks(BLOB_BATCH).map(|c| c.to_vec());
-        let mut failed = false;
-        loop {
-            while set.len() < BLOB_PARALLEL && !failed {
-                let Some(b) = batches.next() else { break };
-                let s2 = s.clone();
-                set.spawn(async move { blob_request(&s2, b, priority).await });
-            }
-            let Some(r) = set.join_next().await else { break };
-            match r {
-                Ok(Ok(items)) => out.extend(items),
-                Ok(Err(e)) => {
-                    tracing::debug!("blob request to {}: {e:#}", short(&s.peer_static()));
-                    failed = true;
-                }
-                Err(_) => failed = true,
-            }
-        }
-        let got: HashSet<[u8; 32]> = out.iter().map(|(i, _)| *i).collect();
-        remaining.retain(|i| !got.contains(i));
     }
     out
 }

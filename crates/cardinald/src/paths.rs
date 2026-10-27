@@ -1,7 +1,11 @@
 //! Where things live on disk.
 //!
-//! - Data: `$CARDINAL_HOME`, else `$XDG_DATA_HOME/cardinal`, else
+//! - Data: `$CARDINAL_HOME`, else `$CARDINAL_DATA_DIR` (set by the
+//!   systemd unit), else `$XDG_DATA_HOME/cardinal`, else
 //!   `~/.local/share/cardinal`.
+//! - Settings: `config.toml` (table `[daemon]`; `[update]` belongs to
+//!   `cardinal-update`) in `$CARDINAL_HOME`, else `$CARDINAL_CONFIG_DIR`,
+//!   else `$XDG_CONFIG_HOME/cardinal`, else `~/.config/cardinal`.
 //! - Control socket: `$CARDINAL_SOCKET`, else
 //!   `$XDG_RUNTIME_DIR/cardinal.sock` for the default data directory and
 //!   `$XDG_RUNTIME_DIR/cardinal-<name>.sock` when `CARDINAL_HOME` is set
@@ -14,6 +18,8 @@ use std::path::{Path, PathBuf};
 pub struct Paths {
     /// The data directory.
     pub home: PathBuf,
+    /// The configuration directory (holds `config.toml`).
+    pub config_dir: PathBuf,
     /// The control socket.
     pub socket: PathBuf,
 }
@@ -27,14 +33,35 @@ fn user_home() -> PathBuf {
 impl Paths {
     /// Paths from the environment.
     pub fn from_env() -> Paths {
-        let custom = std::env::var_os("CARDINAL_HOME").map(PathBuf::from);
-        let home = custom.clone().unwrap_or_else(|| {
-            std::env::var_os("XDG_DATA_HOME")
+        let custom = std::env::var_os("CARDINAL_HOME")
+            .filter(|h| !h.is_empty())
+            .map(PathBuf::from);
+        let deploy = cardinal_update::Paths::from_env().ok();
+        let env_dir = |v: &str| {
+            std::env::var_os(v)
+                .filter(|h| !h.is_empty())
                 .map(PathBuf::from)
-                .unwrap_or_else(|| user_home().join(".local/share"))
-                .join("cardinal")
-        });
+        };
+        let home = custom
+            .clone()
+            .or_else(|| env_dir("CARDINAL_DATA_DIR"))
+            .unwrap_or_else(|| {
+                deploy
+                    .as_ref()
+                    .map(|p| p.data_dir.clone())
+                    .unwrap_or_else(|| user_home().join(".local/share/cardinal"))
+            });
         let home = absolute(&home);
+        let config_dir = match &custom {
+            Some(_) => home.clone(),
+            None => env_dir("CARDINAL_CONFIG_DIR").unwrap_or_else(|| {
+                deploy
+                    .as_ref()
+                    .map(|p| p.config_dir.clone())
+                    .unwrap_or_else(|| user_home().join(".config/cardinal"))
+            }),
+        };
+        let config_dir = absolute(&config_dir);
         let socket = if let Some(s) = std::env::var_os("CARDINAL_SOCKET") {
             PathBuf::from(s)
         } else if let Some(run) = std::env::var_os("XDG_RUNTIME_DIR") {
@@ -46,7 +73,11 @@ impl Paths {
         } else {
             home.join("control.sock")
         };
-        Paths { home, socket }
+        Paths {
+            home,
+            config_dir,
+            socket,
+        }
     }
 
     /// Paths for a data directory, with the socket inside it (tests).
@@ -54,6 +85,7 @@ impl Paths {
         let home = absolute(home);
         Paths {
             socket: home.join("control.sock"),
+            config_dir: home.clone(),
             home,
         }
     }
@@ -62,9 +94,9 @@ impl Paths {
     pub fn device_key(&self) -> PathBuf {
         self.home.join("device.key")
     }
-    /// Settings.
+    /// Settings, shared with `cardinal-update`.
     pub fn config(&self) -> PathBuf {
-        self.home.join("config.json")
+        self.config_dir.join("config.toml")
     }
     /// The identity log.
     pub fn identity_log(&self) -> PathBuf {

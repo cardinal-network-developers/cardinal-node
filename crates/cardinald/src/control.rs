@@ -118,10 +118,13 @@ pub fn node_path(st: &State, node: &NodeId) -> String {
 fn require_files(d: &Daemon) -> anyhow::Result<[u8; 32]> {
     let core = d.core();
     if core.identity.is_none() {
-        anyhow::bail!("this device does not belong to anyone yet: run `cardinal init` or `cardinal pair`");
+        anyhow::bail!(
+            "this device does not belong to anyone yet: run `cardinal init` or `cardinal pair`"
+        );
     }
-    core.files_id()
-        .ok_or_else(|| anyhow::anyhow!("your files have not arrived on this device yet; wait for it to sync"))
+    core.files_id().ok_or_else(|| {
+        anyhow::anyhow!("your files have not arrived on this device yet; wait for it to sync")
+    })
 }
 
 async fn handle(d: &Arc<Daemon>, req: &Value) -> anyhow::Result<Value> {
@@ -152,7 +155,9 @@ async fn handle(d: &Arc<Daemon>, req: &Value) -> anyhow::Result<Value> {
         "pair-show" => {
             let admin = req.get("admin").and_then(|v| v.as_bool()).unwrap_or(false);
             let s = crate::pair::show(d, admin).await?;
-            Ok(json!({"code": s.code, "addrs": s.addrs.iter().map(|a| a.to_string()).collect::<Vec<_>>() }))
+            Ok(
+                json!({"code": s.code, "addrs": s.addrs.iter().map(|a| a.to_string()).collect::<Vec<_>>() }),
+            )
         }
         "pair-status" => {
             let ps = d.pairing.lock().unwrap_or_else(|e| e.into_inner()).clone();
@@ -213,7 +218,11 @@ async fn handle(d: &Arc<Daemon>, req: &Value) -> anyhow::Result<Value> {
             if !found {
                 anyhow::bail!("{addr} is not in the list; see `cardinal peer list`");
             }
-            d.book.lock().unwrap_or_else(|e| e.into_inner()).manual.remove(addr);
+            d.book
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .manual
+                .remove(addr);
             d.save_config()?;
             Ok(json!({}))
         }
@@ -354,14 +363,12 @@ fn devices(d: &Daemon) -> Vec<Value> {
         .map(|k| {
             let x = k.link_key.as_ref().map(|l| *l.x25519());
             let online = k.key == me || x.is_some_and(|x| d.is_online(&x));
-            let addr = x
-                .and_then(|x| d.session_addr(&x))
-                .map(|a| a.to_string())
-                .or_else(|| {
-                    book.addrs
-                        .get(&hex::encode(k.key))
-                        .and_then(|v| v.first().cloned())
-                });
+            // Where it listens, if known; else where its session comes from.
+            let addr = book
+                .addrs
+                .get(&hex::encode(k.key))
+                .and_then(|v| v.first().cloned())
+                .or_else(|| x.and_then(|x| d.session_addr(&x)).map(|a| a.to_string()));
             json!({
                 "name": names.get(&k.key).cloned().unwrap_or_else(|| account::short_key(&k.key)),
                 "key": hex::encode(&k.key[..8]),
@@ -372,7 +379,12 @@ fn devices(d: &Daemon) -> Vec<Value> {
             })
         })
         .collect();
-    v.sort_by_key(|x| (!x["this"].as_bool().unwrap_or(false), x["name"].as_str().unwrap_or("").to_owned()));
+    v.sort_by_key(|x| {
+        (
+            !x["this"].as_bool().unwrap_or(false),
+            x["name"].as_str().unwrap_or("").to_owned(),
+        )
+    });
     v
 }
 
@@ -410,7 +422,10 @@ fn status(d: &Arc<Daemon>) -> Value {
         match m.as_ref() {
             Some(m) => (
                 Some(m.path.display().to_string()),
-                m.tree().lock().unwrap_or_else(|e| e.into_inner()).has_pending(),
+                m.tree()
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .has_pending(),
             ),
             None => (None, false),
         }
@@ -481,7 +496,13 @@ fn conflicts(d: &Daemon) -> anyhow::Result<Value> {
                 .unwrap_or_default()
                 .into_iter()
                 .filter(|e| e.node == n.id && e.conflict_version.is_some())
-                .map(|e| if parent.is_empty() { e.name } else { format!("{parent}/{}", e.name) })
+                .map(|e| {
+                    if parent.is_empty() {
+                        e.name
+                    } else {
+                        format!("{parent}/{}", e.name)
+                    }
+                })
                 .collect()
         };
         out.push(json!({
@@ -494,16 +515,18 @@ fn conflicts(d: &Daemon) -> anyhow::Result<Value> {
     Ok(json!({"conflicts": out}))
 }
 
-/// The content versions of a node, oldest first: (entry, time, device, content).
-fn versions(
-    sp: &cardinal_space::Space,
-    node: &NodeId,
-) -> Vec<([u8; 32], Option<u64>, [u8; 32], Option<Content>)> {
+/// One content version: entry, time, device, content.
+type VersionRow = ([u8; 32], Option<u64>, [u8; 32], Option<Content>);
+
+/// The content versions of a node, oldest first.
+fn versions(sp: &cardinal_space::Space, node: &NodeId) -> Vec<VersionRow> {
     let f = Files::new(sp);
     let mut out = Vec::new();
     for h in f.history(node) {
         let c = match &h.op {
-            SpaceOpBody::Create { fields, .. } => fields.get(FILE_CONTENT).and_then(Content::from_value),
+            SpaceOpBody::Create { fields, .. } => {
+                fields.get(FILE_CONTENT).and_then(Content::from_value)
+            }
             SpaceOpBody::Set { key, value, .. } if *key == FILE_CONTENT => {
                 value.as_ref().and_then(Content::from_value)
             }
@@ -572,9 +595,15 @@ async fn restore(d: &Arc<Daemon>, path: &str, version: u64) -> anyhow::Result<Va
             .get((version as usize).wrapping_sub(1))
             .cloned()
             .ok_or_else(|| {
-                anyhow::anyhow!("{path} has versions 1 to {}; see `cardinal history {path}`", vs.len())
+                anyhow::anyhow!(
+                    "{path} has versions 1 to {}; see `cardinal history {path}`",
+                    vs.len()
+                )
             })?;
-        (r.node, c.ok_or_else(|| anyhow::anyhow!("that version has no content"))?)
+        (
+            r.node,
+            c.ok_or_else(|| anyhow::anyhow!("that version has no content"))?,
+        )
     };
     d.write_and_push(&files_id, vec![files::set_content(node, &content)])?;
     Ok(json!({"path": path, "version": version}))
@@ -602,8 +631,16 @@ fn remove_device(d: &Arc<Daemon>, who: &str) -> anyhow::Result<Value> {
             .collect();
         match matches.as_slice() {
             [] => anyhow::bail!("no device called {who:?}; see `cardinal devices`"),
-            [k] => (*k, names.get(k).cloned().unwrap_or_else(|| account::short_key(k))),
-            _ => anyhow::bail!("several devices match {who:?}; use the key shown by `cardinal devices`"),
+            [k] => (
+                *k,
+                names
+                    .get(k)
+                    .cloned()
+                    .unwrap_or_else(|| account::short_key(k)),
+            ),
+            _ => anyhow::bail!(
+                "several devices match {who:?}; use the key shown by `cardinal devices`"
+            ),
         }
     };
     if key == me {
@@ -616,9 +653,14 @@ fn remove_device(d: &Arc<Daemon>, who: &str) -> anyhow::Result<Value> {
             .enc
             .first()
             .map(|k| cardinal_crypto::HybridKeyPair::from_secret_bytes(&k.secret_bytes()));
-        let e1 = ident.log.remove_key(&d.keys.device.signing, &key).map_err(|e| {
-            anyhow::anyhow!("cannot remove {name}: {e} (only a device with more power can remove it)")
-        })?;
+        let e1 = ident
+            .log
+            .remove_key(&d.keys.device.signing, &key)
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "cannot remove {name}: {e} (only a device with more power can remove it)"
+                )
+            })?;
         ident.record_own(&e1)?;
         let new = cardinal_crypto::HybridKeyPair::generate();
         let e2 = ident

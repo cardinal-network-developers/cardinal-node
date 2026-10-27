@@ -88,10 +88,7 @@ pub fn install(paths: &Paths, prepared: Prepared, config: &Config) -> anyhow::Re
         ],
     )?;
     let space_node = created_node(&written[0].0, 2);
-    core.write(
-        &acc_id,
-        vec![placement_op(space_node, &keys.key(), config)],
-    )?;
+    core.write(&acc_id, vec![placement_op(space_node, &keys.key(), config)])?;
     Ok(())
 }
 

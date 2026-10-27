@@ -97,6 +97,10 @@ pub enum PairState {
         admin_static: [u8; 32],
         /// Its name.
         admin_name: String,
+        /// Its signing key.
+        admin_key: [u8; 32],
+        /// Its link endpoint, as it told us (the IP may be unspecified).
+        admin_addr: Option<SocketAddr>,
     },
     /// Joined.
     Joined {
@@ -410,7 +414,11 @@ impl Daemon {
 
     /// After the identity log changed.
     pub fn identity_changed(&self) {
-        let st = self.core().identity.as_ref().map(|i| i.state());
+        let st = {
+            let mut core = self.core();
+            core.identity_updated();
+            core.identity.as_ref().map(|i| i.state())
+        };
         self.directory.update(st.as_deref());
         self.endpoint.recheck_peers();
         let conns: Vec<Conn> = lock(&self.sessions).values().cloned().collect();
@@ -443,8 +451,25 @@ impl Daemon {
         *lock(&self.pairing) = PairState::Joined { admin_name };
         // Reconnect as a member: the pairing session carried no proof of
         // this device, so the admin will treat a new session normally.
-        if let PairState::Joining { admin_static, .. } = prev {
-            if let Some(c) = lock(&self.sessions).remove(&admin_static) {
+        if let PairState::Joining {
+            admin_static,
+            admin_key,
+            admin_addr,
+            ..
+        } = prev
+        {
+            let old = lock(&self.sessions).remove(&admin_static);
+            if let Some(mut a) = admin_addr {
+                if a.ip().is_unspecified() {
+                    if let Some(r) = old.as_ref().and_then(|c| c.session.remote_addr()) {
+                        a.set_ip(r.ip());
+                    }
+                }
+                if !a.ip().is_unspecified() {
+                    self.learn_addr(&admin_key, a);
+                }
+            }
+            if let Some(c) = old {
                 c.session.close("joined; reconnecting");
             }
         }
@@ -541,7 +566,8 @@ impl Daemon {
                 ops.push(crate::setup::placement_op(node, &me, &cfg));
             }
             None => {
-                let ids = self.write_and_push(&acc, vec![account::create_space(&files, "Cardinal")])?;
+                let ids =
+                    self.write_and_push(&acc, vec![account::create_space(&files, "Cardinal")])?;
                 let node = created_node(&ids[0], 0);
                 let cfg = self.config().clone();
                 ops.push(crate::setup::placement_op(node, &me, &cfg));
@@ -633,7 +659,11 @@ impl Daemon {
     async fn candidate_addrs(&self, key: &KeyId) -> Vec<(SocketAddr, Option<String>)> {
         let (known, manual): (Vec<String>, Vec<(String, Option<String>)>) = {
             let book = lock(&self.book);
-            let known = book.addrs.get(&hex::encode(key)).cloned().unwrap_or_default();
+            let known = book
+                .addrs
+                .get(&hex::encode(key))
+                .cloned()
+                .unwrap_or_default();
             let peers = self.config().peers.clone();
             let manual = peers
                 .into_iter()
@@ -664,7 +694,11 @@ impl Daemon {
         out
     }
 
-    async fn try_device(self: &Arc<Self>, key: KeyId, link: cardinal_crypto::HybridPublicKey) -> bool {
+    async fn try_device(
+        self: &Arc<Self>,
+        key: KeyId,
+        link: cardinal_crypto::HybridPublicKey,
+    ) -> bool {
         for (addr, manual) in self.candidate_addrs(&key).await {
             if self.is_online(link.x25519()) {
                 return true;
@@ -796,7 +830,10 @@ impl Daemon {
             let r = self.endpoint.connect(t).await;
             lock(&self.connecting).remove(&key);
             if let Ok(s) = r {
-                tracing::info!("found {} on the local network at {addr}", self.device_name(&key));
+                tracing::info!(
+                    "found {} on the local network at {addr}",
+                    self.device_name(&key)
+                );
                 self.learn_addr(&key, addr);
                 self.on_session(s);
                 return;
@@ -859,7 +896,8 @@ impl Daemon {
     pub async fn run(self: Arc<Self>) -> anyhow::Result<()> {
         let control = crate::control::serve(self.clone())?;
         tracing::info!(
-            "cardinal daemon started: data in {}, listening on {}, control socket {}",
+            "cardinal {} daemon started: data in {}, listening on {}, control socket {}",
+            cardinal_update::VERSION,
             self.paths.home.display(),
             self.endpoint
                 .tcp_addr()
@@ -886,7 +924,10 @@ impl Daemon {
         tokio::spawn(async move {
             loop {
                 match ev.recv().await {
-                    Ok(EndpointEvent::Closed { peer_static, reason }) => {
+                    Ok(EndpointEvent::Closed {
+                        peer_static,
+                        reason,
+                    }) => {
                         tracing::debug!("session with {} closed: {reason}", short(&peer_static));
                         let gen = lock(&d.sessions).get(&peer_static).map(|c| c.gen);
                         if let Some(g) = gen {
@@ -923,11 +964,34 @@ impl Daemon {
             }
         });
         crate::fetch::start(self.clone());
+        // Report (never install) new releases, if the person allows it.
+        let cfg_path = self.paths.config();
+        tokio::spawn(async move {
+            loop {
+                let p = cfg_path.clone();
+                let r = tokio::task::spawn_blocking(move || -> anyhow::Result<Option<String>> {
+                    let c = cardinal_update::config::UpdateConfig::load(&p)?;
+                    if !c.auto_check {
+                        return Ok(None);
+                    }
+                    cardinal_update::check_for_update()
+                })
+                .await;
+                match r {
+                    Ok(Ok(Some(v))) => tracing::info!(
+                        "cardinal {v} is available (this is {}); run `cardinal update`",
+                        cardinal_update::VERSION
+                    ),
+                    Ok(Err(e)) => tracing::debug!("update check: {e:#}"),
+                    _ => {}
+                }
+                tokio::time::sleep(Duration::from_secs(24 * 3600)).await;
+            }
+        });
         self.housekeeping();
 
         let mut stop = self.stopping.subscribe();
-        let mut term =
-            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+        let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
         tokio::select! {
             _ = tokio::signal::ctrl_c() => tracing::info!("interrupted"),
             _ = term.recv() => tracing::info!("terminated"),

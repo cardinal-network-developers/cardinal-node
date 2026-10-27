@@ -21,15 +21,16 @@ use cardinal_space::account;
 use crate::daemon::{local_ips, Daemon, PairState};
 
 fn local_device(d: &Daemon, identity: Option<[u8; 32]>, power: u64) -> LocalDevice {
-    let port = d.endpoint.tcp_addr().map(|a| a.port()).unwrap_or(0);
+    // An unspecified address means "where you reached my pairing socket".
+    let addr = d
+        .endpoint
+        .tcp_addr()
+        .unwrap_or_else(|| SocketAddr::from(([0, 0, 0, 0], 0)));
     LocalDevice {
         identity,
         signing_key: d.keys.signing.clone(),
         link_key: d.keys.link.public_key().clone(),
-        link_endpoint: EndpointAddr::new(
-            CarrierKind::Tcp,
-            SocketAddr::from(([0, 0, 0, 0], port)),
-        ),
+        link_endpoint: EndpointAddr::new(CarrierKind::Tcp, addr),
         name: d.config().name.clone(),
         join_power: power,
     }
@@ -83,11 +84,16 @@ pub async fn show(d: &Arc<Daemon>, admin: bool) -> anyhow::Result<Shown> {
                     return;
                 };
                 d2.endpoint.add_secret(p.secret_entry());
-                tracing::info!("paired with {}; waiting for it to add this device", p.peer.name);
+                tracing::info!(
+                    "paired with {}; waiting for it to add this device",
+                    p.peer.name
+                );
                 *ps = PairState::Joining {
                     identity,
                     admin_static: *p.peer.link_key.x25519(),
                     admin_name: p.peer.name.clone(),
+                    admin_key: p.peer.signing_key,
+                    admin_addr: p.peer.endpoint.socket_addr(),
                 };
             }
             Err(e) => {
@@ -192,7 +198,9 @@ pub async fn type_code(
             link_key: nd.link_key.clone(),
             proof: nd.proof,
         };
-        let e = ident.log.add_key(&d.keys.device.signing, &req, Some(&enc))?;
+        let e = ident
+            .log
+            .add_key(&d.keys.device.signing, &req, Some(&enc))?;
         ident.record_own(&e)?;
         e
     };
@@ -203,7 +211,12 @@ pub async fn type_code(
     if let Some(acc) = acc {
         d.write_and_push(
             &acc,
-            vec![account::create_device(&nd.signing_key, &nd.name, false, false)],
+            vec![account::create_device(
+                &nd.signing_key,
+                &nd.name,
+                false,
+                false,
+            )],
         )?;
     }
     // Where it listens: its advertised endpoint, at the address we reached.
@@ -215,19 +228,39 @@ pub async fn type_code(
     if link_addr.ip().is_unspecified() {
         link_addr.set_ip(addr.ip());
     }
-    d.learn_addr(&nd.signing_key, link_addr);
-    let target = Target::new(link_addr, CarrierKind::Tcp, &nd.link_key)
-        .with_secret(&paired.link_secret[..])
-        .expect(ExpectedPeer {
-            identity: None,
-            signing_key: Some(nd.signing_key),
-            no_identity: true,
-        });
-    let s = d
-        .endpoint
-        .connect(target)
-        .await
-        .map_err(|e| anyhow::anyhow!("added the device, but could not reach it: {e}"))?;
+    let mut candidates = vec![link_addr];
+    let alt = SocketAddr::new(addr.ip(), link_addr.port());
+    if alt != link_addr {
+        candidates.push(alt);
+    }
+    let mut last = String::new();
+    let mut session = None;
+    'outer: for _ in 0..10 {
+        for a in &candidates {
+            let target = Target::new(*a, CarrierKind::Tcp, &nd.link_key)
+                .with_secret(&paired.link_secret[..])
+                .expect(ExpectedPeer {
+                    identity: None,
+                    signing_key: Some(nd.signing_key),
+                    no_identity: true,
+                });
+            match d.endpoint.connect(target).await {
+                Ok(s) => {
+                    d.learn_addr(&nd.signing_key, *a);
+                    session = Some(s);
+                    break 'outer;
+                }
+                Err(e) => last = format!("{a}: {e}"),
+            }
+        }
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+    let s = session.ok_or_else(|| {
+        anyhow::anyhow!(
+            "added the device, but could not reach it ({last}). Check that it is running and \
+             reachable, then run `cardinal pair` on it again."
+        )
+    })?;
     d.on_session(s);
     tracing::info!("added {} as a {:?} device", nd.name, power);
     Ok(nd.name)

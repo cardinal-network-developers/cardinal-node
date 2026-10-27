@@ -472,3 +472,44 @@ Not implemented yet (the next milestone):
   this machine (about 6 µs at 0.9 GHz); building with `RUSTFLAGS='--cfg
   poly1305_backend="soft"'` makes sealing a 1200-byte packet about twice as
   fast. Worth revisiting before tuning anything else.
+
+## Daemon, mount, and CLI (`cardinald`, `cardinal`)
+
+- **Spec ambiguity: a node cannot be named in the entry that creates it.**
+  `state.md` allows naming a node "in the entry itself", but a node's id is
+  `BLAKE3(entry id || i)` and the entry id covers its ops, so no op can
+  name it. A burst of changes that creates a folder and files in it is
+  therefore written as one entry per level of new folders, in quick
+  succession, rather than "one entry per burst" (`profiles.md#files`). The
+  spec could let ops name a node created earlier in the same entry by its
+  op index.
+- **Spec ambiguity: which device shows the pairing code.** `contact.md`
+  and `experience.md` have the new device show the code and an admin type
+  it; this is what is implemented (`cardinal pair` on the new device,
+  `cardinal pair <code>` on the admin). The proof of possession only works
+  that way round.
+- **Discovery advertises the TCP port.** `hosts.md#local-discovery`
+  advertises "this device's link endpoint"; devices listen on TCP only
+  (UDP streams have no congestion control yet), so the SRV port is the
+  TCP link port.
+- **The pairing endpoint may be unspecified.** A device listening on
+  `0.0.0.0` sends that in pairing info field 4; the typer substitutes the
+  address it reached the pairing socket at.
+- **Spec ambiguity: how a device learns which spaces exist.** sync.md
+  reconciles sets both sides are entitled to, but a new device knows no
+  space ids. Here a device that receives a `reconcile` (or `heads`) for an
+  unknown label *from one of its own devices* answers as if empty and then
+  fetches the set, creating the space. The spec could say this, or have
+  the account space list every space (it does list the files space).
+- **Replacing a file by rename is an edit.** `rename(tmp, file)` over an
+  existing file writes `set` of content on the replaced file's node and
+  deletes the temporary node, so editors' atomic saves keep history and
+  produce conflict copies. `profiles.md#files` does not say how renames
+  onto an existing name map to ops.
+- **Settling a conflict of three or more versions.** Deleting one conflict
+  copy writes a `set` of the main version, which also drops the other
+  copies (they remain in history). A `set` cannot keep two of three values.
+- **Not implemented: `rotate_after`.** Epochs rotate only when a device is
+  removed.
+- **Retention.** `full` keeps every chunk ever fetched or written (no
+  garbage collection yet), which is closer to `history`.

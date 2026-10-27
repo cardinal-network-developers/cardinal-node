@@ -17,6 +17,9 @@ pub struct Loc {
     pub len: u32,
 }
 
+/// Records read when opening: where each is, and its bytes.
+pub type Records = Vec<(Loc, Vec<u8>)>;
+
 /// An append-only record file.
 pub struct AppendLog {
     file: File,
@@ -25,7 +28,7 @@ pub struct AppendLog {
 
 impl AppendLog {
     /// Opens (or creates) the file and returns every record in it.
-    pub fn open(path: &Path) -> std::io::Result<(AppendLog, Vec<(Loc, Vec<u8>)>)> {
+    pub fn open(path: &Path) -> std::io::Result<(AppendLog, Records)> {
         if let Some(d) = path.parent() {
             std::fs::create_dir_all(d)?;
         }

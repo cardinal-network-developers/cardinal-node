@@ -243,10 +243,7 @@ impl Snapshot {
                 entries.push(se);
             }
         }
-        Snapshot {
-            version,
-            entries,
-        }
+        Snapshot { version, entries }
     }
 }
 
@@ -433,7 +430,9 @@ impl Tree {
     pub fn path(&self, mut ino: u64) -> String {
         let mut parts = Vec::new();
         while ino != ROOT_INO && ino != 0 {
-            let Some(i) = self.inodes.get(&ino) else { break };
+            let Some(i) = self.inodes.get(&ino) else {
+                break;
+            };
             parts.push(i.name.clone());
             ino = i.parent;
         }
@@ -445,9 +444,7 @@ impl Tree {
     pub fn new_staged(&mut self) -> std::io::Result<Arc<Staged>> {
         let n = self.next_stage;
         self.next_stage += 1;
-        let path = self
-            .staging
-            .join(format!("{}-{n}", std::process::id()));
+        let path = self.staging.join(format!("{}-{n}", std::process::id()));
         let file = std::fs::OpenOptions::new()
             .read(true)
             .write(true)
@@ -571,7 +568,10 @@ impl Tree {
             .collect();
         for ino in gone {
             let keep = needed.contains(&ino)
-                && !matches!(self.inodes.get(&ino).map(|i| i.kind), Some(Kind::Conflict(_)));
+                && !matches!(
+                    self.inodes.get(&ino).map(|i| i.kind),
+                    Some(Kind::Conflict(_))
+                );
             let i = self.inodes.get_mut(&ino).expect("ino");
             let node = i.node.take().expect("committed");
             match i.kind {
@@ -634,7 +634,14 @@ impl Tree {
             .inodes
             .values()
             .filter(|i| i.ino != ROOT_INO && i.parent != 0)
-            .map(|i| (i.ino, i.parent, i.name.clone(), i.node.is_none() || i.dirty.pos))
+            .map(|i| {
+                (
+                    i.ino,
+                    i.parent,
+                    i.name.clone(),
+                    i.node.is_none() || i.dirty.pos,
+                )
+            })
             .collect();
         // local changes first, so they keep their names
         items.sort_by_key(|(ino, _, _, local)| (!*local, *ino));

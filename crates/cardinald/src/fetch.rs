@@ -38,7 +38,10 @@ impl Fetch for Fetcher {
         let rt = d.rt.clone();
         let got = rt.block_on(crate::net::fetch_blobs(&d, ids, self.priority));
         let n: usize = got.iter().map(|(_, b)| b.len()).sum();
-        d.progress.lock().unwrap_or_else(|e| e.into_inner()).bytes_fetched += n as u64;
+        d.progress
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .bytes_fetched += n as u64;
         Ok(got)
     }
 }
@@ -90,8 +93,10 @@ pub fn start(d: Arc<Daemon>) {
         loop {
             if let Err(e) = pass(&d, &mut complete).await {
                 tracing::debug!("background fetch: {e:#}");
-                d.progress.lock().unwrap_or_else(|e| e.into_inner()).last_error =
-                    Some(format!("{e:#}"));
+                d.progress
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .last_error = Some(format!("{e:#}"));
             }
             // wait for a change, or retry in a while (devices come online)
             let _ = tokio::time::timeout(Duration::from_secs(10), changed.changed()).await;
@@ -140,7 +145,7 @@ async fn pass(d: &Arc<Daemon>, complete: &mut HashSet<[u8; 32]>) -> anyhow::Resu
     for (path, b) in wanted {
         // which objects are missing: walks the indexes, fetching them
         let d2 = d.clone();
-        let b2 = b.clone();
+        let b2 = b;
         let missing = tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<[u8; 32]>> {
             let fetcher = Fetcher::new(&d2, Priority::Background);
             let mut r = BlobReader::new(d2.store.clone(), &fetcher, b2);
@@ -164,7 +169,7 @@ async fn pass(d: &Arc<Daemon>, complete: &mut HashSet<[u8; 32]>) -> anyhow::Resu
             }
         };
         let mut ok = true;
-        for window in missing.chunks(512) {
+        for window in missing.chunks(256) {
             let got = crate::net::fetch_blobs(d, window, Priority::Background).await;
             let n = got.len();
             let bytes: usize = got.iter().map(|(_, x)| x.len()).sum();
@@ -173,7 +178,7 @@ async fn pass(d: &Arc<Daemon>, complete: &mut HashSet<[u8; 32]>) -> anyhow::Resu
                 for (id, data) in &got {
                     store.put(id, data)?;
                 }
-                store.sync()
+                Ok(())
             })
             .await??;
             {
@@ -186,6 +191,10 @@ async fn pass(d: &Arc<Daemon>, complete: &mut HashSet<[u8; 32]>) -> anyhow::Resu
                 break;
             }
         }
+        // one sync per file: syncing every window costs more than the
+        // transfer
+        let store = d.store.clone();
+        tokio::task::spawn_blocking(move || store.sync()).await??;
         if ok {
             complete.insert(b.id);
             let mut pr = d.progress.lock().unwrap_or_else(|e| e.into_inner());
@@ -200,6 +209,9 @@ async fn pass(d: &Arc<Daemon>, complete: &mut HashSet<[u8; 32]>) -> anyhow::Resu
     if failures > 0 {
         anyhow::bail!("{failures} files could not be fetched yet (is another device online?)");
     }
-    d.progress.lock().unwrap_or_else(|e| e.into_inner()).last_error = None;
+    d.progress
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .last_error = None;
     Ok(())
 }

@@ -333,8 +333,7 @@ impl Holder {
         self.persist(&items)?;
         if self.space.is_none() || fresh.len() > 16 {
             self.rebuild(fresh, keys, author);
-        } else {
-            let space = self.space.as_mut().expect("open");
+        } else if let Some(space) = self.space.as_mut() {
             for s in fresh {
                 match space.receive(s.clone(), keys) {
                     Ok(Inserted::Held(_)) => out.missing_parents = true,
@@ -402,7 +401,11 @@ impl Holder {
             anyhow::bail!("unexpected heads after a write")
         };
         if !space.validity().is_valid(&id) {
-            tracing::warn!("space {}: own entry {} is not valid", short(&self.id), short(&id));
+            tracing::warn!(
+                "space {}: own entry {} is not valid",
+                short(&self.id),
+                short(&id)
+            );
         }
         let bytes = sealed.encode();
         let sid = sealed.sealed_id();
@@ -551,6 +554,30 @@ impl Core {
         Ok(self.spaces.get_mut(&id).expect("inserted"))
     }
 
+    /// After the identity log changed (received or written here): reopen
+    /// the encryption keys and re-evaluate every space with the new log.
+    pub fn identity_updated(&mut self) {
+        let Some(ident) = self.identity.as_mut() else {
+            return;
+        };
+        ident.refresh_keys(&self.keys);
+        let st = ident.state();
+        let keys: Vec<HybridKeyPair> = ident
+            .enc
+            .iter()
+            .map(|k| HybridKeyPair::from_secret_bytes(&k.secret_bytes()))
+            .collect();
+        let refs: Vec<&HybridKeyPair> = keys.iter().collect();
+        for h in self.spaces.values_mut() {
+            if let Some(sp) = h.space.as_mut() {
+                sp.set_author(st.clone());
+                h.version += 1;
+            } else {
+                h.rebuild(Vec::new(), &refs, Some(st.clone()));
+            }
+        }
+    }
+
     /// Installs a freshly created identity (`cardinal init`).
     pub fn install_identity(&mut self, log_entries: &[Vec<u8>]) -> anyhow::Result<()> {
         {
@@ -636,22 +663,7 @@ impl Core {
         if let Some(ident) = self.identity.as_mut() {
             let changed = ident.ingest(objects)?;
             if changed {
-                ident.refresh_keys(&self.keys);
-                let st = ident.state();
-                let keys: Vec<HybridKeyPair> = ident
-                    .enc
-                    .iter()
-                    .map(|k| HybridKeyPair::from_secret_bytes(&k.secret_bytes()))
-                    .collect();
-                let refs: Vec<&HybridKeyPair> = keys.iter().collect();
-                for h in self.spaces.values_mut() {
-                    if let Some(sp) = h.space.as_mut() {
-                        sp.set_author(st.clone());
-                        h.version += 1;
-                    } else {
-                        h.rebuild(Vec::new(), &refs, Some(st.clone()));
-                    }
-                }
+                self.identity_updated();
             }
             return Ok(IdentityChange {
                 changed,

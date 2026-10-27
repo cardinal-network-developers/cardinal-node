@@ -26,6 +26,20 @@ authors = ["Daniel Wigton"]
 # tests that run thousands of operations stay fast.
 opt-level = 2
 
+# The protocol crates do per-packet and per-chunk work; unoptimized they
+# are 50-100x slower, which makes the end-to-end tests (and debug daemons)
+# crawl.
+[profile.dev.package.cardinal-encoding]
+opt-level = 2
+[profile.dev.package.cardinal-crypto]
+opt-level = 2
+[profile.dev.package.cardinal-link]
+opt-level = 2
+[profile.dev.package.cardinal-blob]
+opt-level = 2
+[profile.dev.package.cardinal-sync]
+opt-level = 2
+
 [workspace.dependencies]
 # Internal crates.
 cardinal-encoding = { path = "crates/encoding" }

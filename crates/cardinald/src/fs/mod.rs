@@ -97,7 +97,12 @@ fn snapshot(d: &Daemon, space: &SpaceId) -> Option<Snapshot> {
 }
 
 /// Brings the tree up to date with the space and tells the kernel.
-pub fn refresh(d: &Daemon, tree: &Mutex<Tree>, space: &SpaceId, notifier: Option<&fuser::Notifier>) {
+pub fn refresh(
+    d: &Daemon,
+    tree: &Mutex<Tree>,
+    space: &SpaceId,
+    notifier: Option<&fuser::Notifier>,
+) {
     let invals = {
         let core = d.core();
         let Some(h) = core.spaces.get(space) else {
@@ -148,8 +153,8 @@ pub fn mount(d: Arc<Daemon>, space: SpaceId, path: &Path) -> anyhow::Result<Moun
         MountOption::NoSuid,
         MountOption::RW,
     ];
-    let session = fuser::Session::new(fs, path, &opts)
-        .map_err(|e| anyhow::anyhow!("mount failed: {e}"))?;
+    let session =
+        fuser::Session::new(fs, path, &opts).map_err(|e| anyhow::anyhow!("mount failed: {e}"))?;
     let notifier = session.notifier();
     let bg = session.spawn()?;
     let stop = Arc::new(AtomicBool::new(false));
@@ -167,8 +172,8 @@ pub fn mount(d: Arc<Daemon>, space: SpaceId, path: &Path) -> anyhow::Result<Moun
                     break;
                 }
                 let (d3, t3, n3) = (d2.clone(), tree2.clone(), notifier.clone());
-                let _ = tokio::task::spawn_blocking(move || refresh(&d3, &t3, &space, Some(&n3)))
-                    .await;
+                let _ =
+                    tokio::task::spawn_blocking(move || refresh(&d3, &t3, &space, Some(&n3))).await;
             }
         });
     }

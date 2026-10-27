@@ -11,8 +11,8 @@ use std::time::{Duration, Instant, SystemTime};
 use cardinal_blob::{BlobReader, FsStore};
 use cardinal_space::files::Content;
 use fuser::{
-    FileAttr, FileType, Filesystem, ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory,
-    ReplyEmpty, ReplyEntry, ReplyOpen, ReplyStatfs, ReplyWrite, Request, TimeOrNow,
+    FileAttr, FileType, Filesystem, ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory, ReplyEmpty,
+    ReplyEntry, ReplyOpen, ReplyStatfs, ReplyWrite, Request, TimeOrNow,
 };
 use libc::{c_int, EACCES, EEXIST, EINVAL, EIO, EISDIR, ENOENT, ENOTDIR, ENOTEMPTY, EPERM, EXDEV};
 
@@ -491,7 +491,7 @@ impl Filesystem for CardinalFs {
                     let dnode = t.inodes[&dst].node;
                     let snode = t.inodes[&src].node;
                     let ddirty = t.inodes[&dst].dirty;
-                    if dnode.is_some() {
+                    if let Some(dn) = dnode {
                         // forget the destination without deleting its node
                         t.detach(dst);
                         if let Some(di) = t.inodes.get_mut(&dst) {
@@ -504,7 +504,6 @@ impl Filesystem for CardinalFs {
                             t.deleted.push(sn);
                         }
                         t.detach(src);
-                        let dn = dnode.expect("some");
                         t.by_node.insert(dn, src);
                         {
                             let s = t.inodes.get_mut(&src).expect("src");
@@ -748,7 +747,10 @@ impl Filesystem for CardinalFs {
     }
 
     fn fsync(&mut self, _req: &Request<'_>, ino: u64, _fh: u64, _ds: bool, reply: ReplyEmpty) {
-        let st = lock(&self.tree).inodes.get(&ino).and_then(|i| i.staged.clone());
+        let st = lock(&self.tree)
+            .inodes
+            .get(&ino)
+            .and_then(|i| i.staged.clone());
         if let Some(st) = st {
             let _ = st.file.sync_data();
         }
@@ -802,8 +804,8 @@ impl Filesystem for CardinalFs {
     }
 
     fn statfs(&mut self, _req: &Request<'_>, _ino: u64, reply: ReplyStatfs) {
-        let path = std::ffi::CString::new(self.d.paths.home.as_os_str().as_bytes())
-            .unwrap_or_default();
+        let path =
+            std::ffi::CString::new(self.d.paths.home.as_os_str().as_bytes()).unwrap_or_default();
         // SAFETY: statvfs fills the struct; the path is a valid C string.
         let mut s: libc::statvfs = unsafe { std::mem::zeroed() };
         let ok = unsafe { libc::statvfs(path.as_ptr(), &mut s) } == 0;
