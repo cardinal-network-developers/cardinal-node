@@ -115,6 +115,20 @@ fn copies_and_speedtest() {
     });
     assert_ne!(state_of(&a, "beta"), "unchecked");
 
+    // Both devices reconnect after the restart; wait for the session to
+    // settle (duplicate sessions can churn briefly).
+    let beta_online = |a: &Dev| {
+        a.status()["devices"]
+            .as_array()
+            .is_some_and(|d| d.iter().any(|d| d["name"] == "beta" && d["online"] == true))
+    };
+    wait("beta online after alpha's restart", 30, || {
+        beta_online(&a) && {
+            std::thread::sleep(Duration::from_secs(2));
+            beta_online(&a)
+        }
+    });
+
     // The speed test, to every online device and to one by name.
     let out = a.cli(&["speedtest"]);
     eprintln!("---- speedtest ----\n{out}");
