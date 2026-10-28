@@ -91,7 +91,13 @@ impl Source {
                     .get(&url)
                     .call()
                     .with_context(|| format!("fetching {url}"))?;
-                let reader = resp.into_body().into_with_config().limit(max).reader();
+                // ureq fails a body of exactly its limit (it cannot tell
+                // the end from more to come); `Limited` enforces `max`.
+                let reader = resp
+                    .into_body()
+                    .into_with_config()
+                    .limit(max.saturating_add(1))
+                    .reader();
                 Ok(Box::new(Limited {
                     inner: reader,
                     left: max,
@@ -163,5 +169,34 @@ mod tests {
         assert_eq!(s.read("f", 10).unwrap(), b"0123456789");
         assert!(s.read("f", 9).is_err());
         assert!(s.read("missing", 9).is_err());
+    }
+
+    /// Serves `body` once per connection on a loopback port.
+    fn serve(body: &'static [u8], conns: usize) -> String {
+        use std::io::Write;
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = l.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            for c in l.incoming().take(conns) {
+                let mut c = c.unwrap();
+                let mut req = [0u8; 4096];
+                let _ = c.read(&mut req);
+                let head = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                c.write_all(head.as_bytes()).unwrap();
+                c.write_all(body).unwrap();
+            }
+        });
+        format!("http://localhost:{port}")
+    }
+
+    #[test]
+    fn url_reads_are_limited() {
+        let s = Source::parse(&serve(b"0123456789", 2)).unwrap();
+        // a body of exactly the limit is fine
+        assert_eq!(s.read("f", 10).unwrap(), b"0123456789");
+        assert!(s.read("f", 9).is_err());
     }
 }
