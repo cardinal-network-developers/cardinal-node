@@ -14,6 +14,7 @@ use cardinal_crypto::SigningKey;
 use crate::manifest::{self, Artifact, Manifest};
 use crate::ops::{self, UpdateOutcome};
 use crate::paths::Paths;
+use crate::source::Source;
 use crate::system::{Ctx, Output, Prompt, Runner, SystemRunner};
 
 const TARGET: &str = "x86_64-unknown-linux-gnu";
@@ -418,10 +419,11 @@ fn default_sources() {
     let prompt = FakePrompt(None);
     let ctx = env.ctx(&runner, &prompt);
 
-    // A stable install with no configured source explains what to do.
-    env.install_fake("0.1.0");
-    let e = ops::update(&ctx, None, false).unwrap_err();
-    assert!(format!("{e:#}").contains("no release source is configured"));
+    // A stable install with no configured source uses the project's releases.
+    assert_eq!(
+        ops::resolve_source(&ctx, None, "0.1.0").unwrap(),
+        Source::Url(ops::DEFAULT_SOURCE.into())
+    );
 
     // A dev install defaults to the dev release directory.
     env.install_fake("0.1.0-dev.1");

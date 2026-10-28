@@ -1,6 +1,7 @@
 #!/bin/sh
 # Install Cardinal for the current user (no root needed).
 #
+#   curl -fsSL https://github.com/cardinal-network-developers/cardinal-node/releases/latest/download/install.sh | sh
 #   curl -fsSL https://example.org/cardinal/install.sh | sh -s -- https://example.org/cardinal/releases
 #   sh install.sh /path/to/release/directory
 #   CARDINAL_RELEASES=https://example.org/cardinal/releases sh install.sh
@@ -22,10 +23,8 @@ set -eu
 
 die() { echo "install.sh: $*" >&2; exit 1; }
 
-base="${1:-${CARDINAL_RELEASES:-}}"
+base="${1:-${CARDINAL_RELEASES:-https://github.com/cardinal-network-developers/cardinal-node/releases/latest/download}}"
 [ $# -gt 0 ] && shift
-[ -n "$base" ] || die "usage: install.sh <release URL or directory> [cardinal install options]
-       (or set CARDINAL_RELEASES)"
 base="${base%/}"
 
 [ "$(uname -s)" = Linux ] || die "only Linux is supported"

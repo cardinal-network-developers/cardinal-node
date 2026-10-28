@@ -25,10 +25,10 @@ service and keeps everything under your home directory.
 
 ## Install
 
-From a release site:
+From the project's GitHub releases:
 
 ```sh
-curl -fsSL https://RELEASES/install.sh | sh -s -- https://RELEASES
+curl -fsSL https://github.com/cardinal-network-developers/cardinal-node/releases/latest/download/install.sh | sh -s -- https://github.com/cardinal-network-developers/cardinal-node/releases/latest/download
 ```
 
 or from a directory holding a release (`manifest`, `manifest.sig`, and the
@@ -114,8 +114,8 @@ auto_check = true                # the daemon may tell you about new releases
 The source is either an `https://` URL or a local directory; plain `http://`
 is refused except for `localhost`. With no source configured, a development
 build (version `X.Y.Z-dev.N`) reads `~/.local/share/cardinal-dev-releases`,
-where `scripts/dev-release.sh` publishes; a regular build asks you to set a
-source. `channel = "dev"` or `"stable"` overrides that choice.
+where `scripts/dev-release.sh` publishes; a regular build uses the project's
+GitHub releases, `https://github.com/cardinal-network-developers/cardinal-node/releases/latest/download`. `channel = "dev"` or `"stable"` overrides that choice.
 
 ## Version
 

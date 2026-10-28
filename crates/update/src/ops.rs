@@ -263,6 +263,12 @@ fn installed_version(ctx: &Ctx) -> String {
     build_info::VERSION.to_string()
 }
 
+/// Where stable releases come from when no source is configured. GitHub
+/// serves the newest release's assets under this stable URL. Later this
+/// becomes a publisher's space (`later.md`, "Software distribution").
+pub const DEFAULT_SOURCE: &str =
+    "https://github.com/cardinal-network-developers/cardinal-node/releases/latest/download";
+
 /// Where to fetch releases from.
 pub fn resolve_source(ctx: &Ctx, from: Option<&str>, installed: &str) -> anyhow::Result<Source> {
     if let Some(f) = from {
@@ -282,14 +288,7 @@ pub fn resolve_source(ctx: &Ctx, from: Option<&str>, installed: &str) -> anyhow:
     if channel == Channel::Dev {
         return Ok(Source::Dir(ctx.paths.dev_releases.clone()));
     }
-    bail!(
-        "no release source is configured. Either pass one:\n  \
-         cardinal update --from https://example.org/cardinal/releases\n  \
-         cardinal update --from /path/to/release/directory\n\
-         or set it in {}:\n  \
-         [update]\n  source = \"https://example.org/cardinal/releases\"",
-        ctx.paths.config_file().display()
-    )
+    Source::parse(DEFAULT_SOURCE)
 }
 
 /// Fetches and verifies the manifest at `source`.

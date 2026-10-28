@@ -95,8 +95,9 @@ source:
 gh release create v0.2.0 dist/0.2.0/* install.sh --title v0.2.0 --notes-file NOTES.md
 ```
 
-Source: `https://github.com/OWNER/REPO/releases/latest/download`.
-Install: `curl -fsSL https://github.com/OWNER/REPO/releases/latest/download/install.sh | sh -s -- https://github.com/OWNER/REPO/releases/latest/download`.
+Source: `https://github.com/cardinal-network-developers/cardinal-node/releases/latest/download`, which is also the built-in default
+(`DEFAULT_SOURCE` in `crates/update/src/ops.rs`).
+Install: `curl -fsSL https://github.com/cardinal-network-developers/cardinal-node/releases/latest/download/install.sh | sh -s -- https://github.com/cardinal-network-developers/cardinal-node/releases/latest/download`.
 
 GitHub redirects these URLs to its CDN over HTTPS, which `cardinal update`
 follows.
