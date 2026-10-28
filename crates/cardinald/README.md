@@ -134,9 +134,16 @@ committed. Each inode maps to a space node once created there.
   editing the main file settles too. Conflict copies are read-only;
   moving one elsewhere returns `EXDEV`, so `mv` copies it.
 - Changes from other devices are applied when they arrive; local
-  uncommitted changes win over them in the view and are committed on top.
-  A file deleted elsewhere while it has local changes is kept (created
-  again).
+  uncommitted changes win over them in the view. A local edit or delete
+  is written as concurrent with any change to the same file (or beneath
+  the deleted folder) that the mount had not shown when it was made — an
+  entry whose parents exclude those entries — so it becomes a conflict
+  copy or a delete conflict instead of silently replacing the other
+  device's change. A file deleted elsewhere while it has local changes is
+  kept (created again).
+- A burst's files are encoded on up to 8 threads; their chunks are made
+  durable together (one `syncfs` of the blob store when there are many,
+  else one `fsync` each) before the entries naming them are written.
 - Hard links are refused (`EPERM`; git falls back to rename). Extended
   attributes are not supported. Folder modes and times are not synced
   (the files profile has no such fields).

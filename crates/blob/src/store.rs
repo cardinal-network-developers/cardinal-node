@@ -254,6 +254,23 @@ fn parse_hex_id(s: &str) -> Option<Id> {
     Some(id)
 }
 
+/// From how many objects to sync [`FsStore::sync`] syncs the whole file
+/// system instead of each object.
+#[cfg(target_os = "linux")]
+const SYNCFS_FROM: usize = 64;
+
+#[cfg(target_os = "linux")]
+fn syncfs(path: &Path) -> io::Result<()> {
+    use std::os::fd::AsRawFd;
+    let f = File::open(path)?;
+    // SAFETY: syncfs only reads the descriptor, which `f` keeps open.
+    if unsafe { libc::syncfs(f.as_raw_fd()) } == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
 fn sync_dir(path: &Path) -> io::Result<()> {
     File::open(path)?.sync_all()
 }
@@ -447,6 +464,14 @@ impl ObjectStore for FsStore {
     fn sync(&self) -> io::Result<()> {
         let paths = std::mem::take(&mut *self.dirty.lock().unwrap());
         if paths.is_empty() {
+            return Ok(());
+        }
+        // Many objects (a burst of small files): one `syncfs` of the
+        // store's file system flushes them and their directories (new
+        // ones included) in one journal commit, where thousands of
+        // `fsync`s cost seconds.
+        #[cfg(target_os = "linux")]
+        if paths.len() >= SYNCFS_FROM && syncfs(&self.root).is_ok() {
             return Ok(());
         }
         // Many fsyncs in flight at once are far faster than one at a time

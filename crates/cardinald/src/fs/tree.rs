@@ -71,6 +71,7 @@ impl Staged {
         self.with(|f| f.set_len(len))
     }
 
+    #[allow(clippy::len_without_is_empty)] // a length that can fail
     pub fn len(&self) -> io::Result<u64> {
         Ok(std::fs::metadata(&self.path)?.len())
     }
@@ -142,6 +143,10 @@ pub struct Inode {
     pub size: u64,
     /// The committed content (files and conflict copies).
     pub content: Option<Content>,
+    /// The entries of the content versions the local view is based on:
+    /// those last applied, or the entry that committed the local content.
+    /// A local edit supersedes these and only these.
+    pub seen: Vec<EntryId>,
     /// Local content, authoritative when present.
     pub staged: Option<Arc<Staged>>,
     /// Link target.
@@ -180,6 +185,7 @@ impl Inode {
             ctime: now,
             size: 0,
             content: None,
+            seen: Vec::new(),
             staged: None,
             target: String::new(),
             dirty: Dirty::default(),
@@ -222,6 +228,8 @@ pub struct SnapEntry {
     pub kind: FileKind,
     /// The content shown.
     pub content: Option<Content>,
+    /// The entries of every current content version (files).
+    pub versions: Vec<EntryId>,
     /// Mode bits.
     pub mode: Option<u64>,
     /// Modified time (ms).
@@ -234,6 +242,8 @@ pub struct SnapEntry {
 pub struct Snapshot {
     /// The holder's version when it was taken.
     pub version: u64,
+    /// The space's heads when it was taken.
+    pub heads: Vec<EntryId>,
     /// Entries, parents before children.
     pub entries: Vec<SnapEntry>,
 }
@@ -259,6 +269,7 @@ impl Snapshot {
                     version: e.conflict_version,
                     kind: e.kind,
                     content: None,
+                    versions: Vec::new(),
                     mode: None,
                     mtime: None,
                     target: None,
@@ -272,6 +283,7 @@ impl Snapshot {
                             None => versions.last(),
                         };
                         se.content = v.and_then(|v| v.content.clone());
+                        se.versions = versions.iter().map(|v| v.entry).collect();
                         let st = files.stat(&e.node);
                         se.mode = st.as_ref().and_then(|s| s.mode);
                         se.mtime = match e.conflict_version {
@@ -287,7 +299,11 @@ impl Snapshot {
                 entries.push(se);
             }
         }
-        Snapshot { version, entries }
+        Snapshot {
+            version,
+            heads: space.heads(),
+            entries,
+        }
     }
 }
 
@@ -314,7 +330,7 @@ pub struct Tree {
     next_stage: u64,
     staging: PathBuf,
     /// Nodes to delete at the next commit.
-    pub deleted: Vec<NodeId>,
+    pub deleted: Vec<Deleted>,
     /// Conflicts to settle at the next commit: the version to keep, or
     /// `None` for the one shown under the file's own name.
     pub settle: HashMap<NodeId, Option<EntryId>>,
@@ -326,6 +342,25 @@ pub struct Tree {
     pub min_version: u64,
     /// The version last applied.
     pub applied_version: u64,
+    /// The heads of the state this tree shows, apart from the remote
+    /// changes to what has local changes (which [`Tree::apply`] skips):
+    /// what a local change made now has seen.
+    pub seen_heads: Vec<EntryId>,
+    /// Kernel caches to invalidate from an apply made by the committer.
+    pub pending_inval: Vec<Inval>,
+}
+
+/// A node deleted locally, not yet committed.
+#[derive(Clone, Debug)]
+pub struct Deleted {
+    /// The node.
+    pub node: NodeId,
+    /// [`Tree::seen_heads`] when it was deleted: the delete has seen
+    /// these entries and no others.
+    pub base: Vec<EntryId>,
+    /// For a file, the content versions it showed ([`Inode::seen`]): its
+    /// remote changes may have been skipped while it had local ones.
+    pub seen: Option<Vec<EntryId>>,
 }
 
 impl Tree {
@@ -351,6 +386,8 @@ impl Tree {
             last_change: None,
             min_version: 0,
             applied_version: 0,
+            seen_heads: Vec::new(),
+            pending_inval: Vec::new(),
         }
     }
 
@@ -369,6 +406,16 @@ impl Tree {
                 .inodes
                 .values()
                 .any(|i| i.parent != 0 && (i.node.is_none() || i.dirty.any()))
+    }
+
+    /// Records a node to delete at the next commit; `seen`, for a file,
+    /// the content versions its view was based on.
+    pub fn delete_node(&mut self, node: NodeId, seen: Option<Vec<EntryId>>) {
+        self.deleted.push(Deleted {
+            node,
+            base: self.seen_heads.clone(),
+            seen,
+        });
     }
 
     /// Allocates a detached inode.
@@ -418,18 +465,20 @@ impl Tree {
         let Some(i) = self.inodes.get_mut(&ino) else {
             return;
         };
-        if let Some(n) = i.node.take() {
-            match i.kind {
+        let (node, kind) = (i.node.take(), i.kind);
+        let seen = (kind == Kind::File).then(|| i.seen.clone());
+        i.dirty = Dirty::default();
+        if let Some(n) = node {
+            match kind {
                 Kind::Conflict(v) => {
                     self.by_conflict.remove(&(n, v));
                 }
                 _ => {
                     self.by_node.remove(&n);
-                    self.deleted.push(n);
+                    self.delete_node(n, seen);
                 }
             }
         }
-        i.dirty = Dirty::default();
         self.gc(ino);
     }
 
@@ -509,7 +558,12 @@ impl Tree {
         seen.insert(ROOT_INO);
         // desired parent inode and name for each committed inode
         let mut placed: Vec<(u64, u64, String)> = Vec::new();
+        // deleted here and not committed yet: stays gone
+        let deleting: HashSet<NodeId> = self.deleted.iter().map(|d| d.node).collect();
         for e in &snap.entries {
+            if deleting.contains(&e.node) {
+                continue;
+            }
             let Some(&pino) = self.by_node.get(&e.parent) else {
                 continue;
             };
@@ -547,6 +601,12 @@ impl Tree {
             }
             match kind {
                 Kind::File | Kind::Conflict(_) => {
+                    if !inode.dirty.content {
+                        inode.seen = match e.version {
+                            Some(v) => vec![v],
+                            None => e.versions.clone(),
+                        };
+                    }
                     if !inode.dirty.content && inode.content != e.content {
                         inode.content = e.content.clone();
                         inode.size = e.content.as_ref().map(|c| c.size()).unwrap_or(0);
@@ -667,6 +727,7 @@ impl Tree {
             self.gc(ino);
         }
         self.applied_version = snap.version;
+        self.seen_heads = snap.heads.clone();
         inval
     }
 

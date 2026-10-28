@@ -6,18 +6,23 @@
 //! entry (its id depends on the entry's id), so a burst that creates
 //! folders and things inside them is written as one entry per level of
 //! new folders (see DEVIATIONS.md).
+//!
+//! A local change supersedes only what the mount had shown when it was
+//! made: see [`write_pending`].
 
-use std::collections::HashSet;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::collections::{BTreeMap, HashSet};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use cardinal_blob::{BlobWriter, ConvergenceSecret, FsStore, INLINE_LIMIT};
+use cardinal_blob::{BlobWriter, ConvergenceSecret, FsStore, ObjectStore, INLINE_LIMIT};
+use cardinal_identity::EntryId;
 use cardinal_space::files::{self, Content, Files};
-use cardinal_space::{SpaceId, SpaceOp};
+use cardinal_space::state::named_nodes;
+use cardinal_space::{NodeId, Space, SpaceId, SpaceOp, ROOT};
 
-use super::tree::{time_to_ms, Kind, Staged, Tree, ROOT_INO};
-use crate::core::split_ops;
+use super::tree::{time_to_ms, Kind, Snapshot, Staged, Tree, ROOT_INO};
+use crate::core::{split_ops, Core};
 use crate::daemon::Daemon;
 
 /// Quiet period before a burst is committed.
@@ -29,20 +34,58 @@ fn lock(t: &Mutex<Tree>) -> std::sync::MutexGuard<'_, Tree> {
     t.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// A store that defers durability to one [`ObjectStore::sync`] of the
+/// real store after a whole burst is encoded: a blob writer syncs at the
+/// end of every blob, which for thousands of small files is thousands of
+/// rounds of `fsync`.
+struct Unsynced<'a>(&'a FsStore);
+
+impl ObjectStore for Unsynced<'_> {
+    fn has(&self, id: &cardinal_blob::Id) -> std::io::Result<bool> {
+        self.0.has(id)
+    }
+    fn get(&self, id: &cardinal_blob::Id) -> std::io::Result<Option<Vec<u8>>> {
+        self.0.get(id)
+    }
+    fn put(&self, id: &cardinal_blob::Id, bytes: &[u8]) -> std::io::Result<bool> {
+        self.0.put(id, bytes)
+    }
+    fn delete(&self, id: &cardinal_blob::Id) -> std::io::Result<bool> {
+        self.0.delete(id)
+    }
+    fn list(&self) -> std::io::Result<Vec<cardinal_blob::ObjectInfo>> {
+        self.0.list()
+    }
+    fn usage(&self) -> cardinal_blob::Usage {
+        self.0.usage()
+    }
+    fn touch(&self, id: &cardinal_blob::Id) -> std::io::Result<()> {
+        self.0.touch(id)
+    }
+    fn sync(&self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Files up to this size are encoded on one thread each, several files at
+/// once; larger ones use the blob writer's own threads.
+const SMALL: u64 = 4 << 20;
+
 /// Encodes a staged file as content: inline under 1 KiB, else a blob.
-pub fn encode(
-    staged: &Staged,
-    secret: &ConvergenceSecret,
-    store: Arc<FsStore>,
-) -> anyhow::Result<Content> {
+/// The blob's objects are not synced: the caller syncs the store before
+/// an entry names them.
+fn encode(staged: &Staged, secret: &ConvergenceSecret, store: &FsStore) -> anyhow::Result<Content> {
     let len = staged.len()?;
     if len < INLINE_LIMIT as u64 {
         let mut b = vec![0u8; len as usize];
         staged.read_exact_at(&mut b, 0)?;
         return Ok(Content::Inline(b));
     }
-    let mut w = BlobWriter::new(secret, store);
-    let mut buf = vec![0u8; 1 << 20];
+    let mut w = BlobWriter::new(secret, Unsynced(store));
+    if len <= SMALL {
+        w = w.with_threads(1);
+    }
+    let mut buf = vec![0u8; len.clamp(1, 1 << 20) as usize];
     let mut off = 0u64;
     loop {
         let n = staged.read_at(&mut buf, off)?;
@@ -61,12 +104,58 @@ pub fn encode(
     }))
 }
 
+/// Encodes staged files, several at once, then makes every object they
+/// stored durable (one batch of `fsync`s) before returning.
+fn encode_all(
+    items: Vec<(u64, u64, Arc<Staged>)>,
+    secret: &ConvergenceSecret,
+    store: &FsStore,
+) -> anyhow::Result<Vec<(u64, u64, Content)>> {
+    let workers = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1)
+        .clamp(1, 8)
+        .min(items.len().max(1));
+    let next = AtomicUsize::new(0);
+    let items = &items;
+    let results: Vec<anyhow::Result<Vec<(u64, u64, Content)>>> = std::thread::scope(|sc| {
+        let handles: Vec<_> = (0..workers)
+            .map(|_| {
+                sc.spawn(|| {
+                    let mut out = Vec::new();
+                    loop {
+                        let k = next.fetch_add(1, Ordering::Relaxed);
+                        let Some((ino, gen, st)) = items.get(k) else {
+                            break;
+                        };
+                        let c = encode(st, secret, store);
+                        st.close();
+                        out.push((*ino, *gen, c?));
+                    }
+                    Ok(out)
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .map(|h| h.join().expect("encoding thread panicked"))
+            .collect()
+    });
+    let mut encoded = Vec::new();
+    for r in results {
+        encoded.extend(r?);
+    }
+    store.sync()?;
+    Ok(encoded)
+}
+
 /// One commit at a time (the scheduler and `cardinal flush`).
 static COMMITTING: Mutex<()> = Mutex::new(());
 
 /// Commits everything pending. Returns the number of entries written.
 pub fn commit(d: &Arc<Daemon>, tree: &Mutex<Tree>, space: &SpaceId) -> anyhow::Result<usize> {
     let _one = COMMITTING.lock().unwrap_or_else(|e| e.into_inner());
+    let start = Instant::now();
     // A: what needs encoding.
     let to_encode: Vec<(u64, u64, Arc<Staged>)> = {
         let t = lock(tree);
@@ -100,16 +189,118 @@ pub fn commit(d: &Arc<Daemon>, tree: &Mutex<Tree>, space: &SpaceId) -> anyhow::R
                 .ok_or_else(|| anyhow::anyhow!("no epoch key"))?;
             ConvergenceSecret::from_epoch_key(key.bytes())
         };
-        for (ino, gen, st) in to_encode {
-            let c = encode(&st, &secret, d.store.clone());
-            st.close();
-            encoded.push((ino, gen, c?));
-        }
+        encoded = encode_all(to_encode, &secret, &d.store)?;
     }
+    let files = encoded.len();
+    let encoding = start.elapsed();
 
     // C: build ops and write, holding the space then the tree.
-    let mut core = d.core();
-    let mut t = lock(tree);
+    let written = {
+        let mut core = d.core();
+        let mut t = lock(tree);
+        write_pending(&mut core, &mut t, space, encoded)?
+    };
+    let n = written.len();
+    if n > 0 {
+        tracing::debug!(
+            "committed {n} entries, {files} files encoded in {:?}, written in {:?}",
+            encoding,
+            start.elapsed() - encoding
+        );
+        d.push(space, written);
+        d.bump();
+    }
+    Ok(n)
+}
+
+/// Ops that must not descend from some entries: local changes made
+/// without having seen them.
+#[derive(Default)]
+struct Concurrent {
+    ops: Vec<SpaceOp>,
+    effects: Vec<Effect>,
+}
+
+/// The current content versions of `node` that the local view has not
+/// seen (`seen` are the versions it was based on).
+fn unseen_versions(sp: &Space, node: &NodeId, seen: &[EntryId]) -> Vec<EntryId> {
+    Files::new(sp)
+        .content(node)
+        .into_iter()
+        .map(|v| v.entry)
+        .filter(|e| !seen.contains(e))
+        .collect()
+}
+
+/// Entries not seen by a delete made after `base` that touch `node` or a
+/// node beneath it (`state.md#deletion-yields-to-concurrent-work`).
+fn unseen_touching(sp: &Space, base: &[EntryId], node: &NodeId) -> Vec<EntryId> {
+    if base.is_empty() {
+        return Vec::new();
+    }
+    let dag = sp.dag();
+    let known = |x: &EntryId| base.iter().any(|b| dag.is_ancestor_or_self(x, b));
+    // the entries since base: walk back from the heads to what base knew
+    let mut new: Vec<EntryId> = Vec::new();
+    let mut seen: HashSet<EntryId> = HashSet::new();
+    let mut todo: Vec<EntryId> = sp.heads();
+    while let Some(x) = todo.pop() {
+        if !seen.insert(x) || known(&x) {
+            continue;
+        }
+        new.push(x);
+        todo.extend(dag.parents(&x).iter().copied());
+    }
+    if new.is_empty() {
+        return Vec::new();
+    }
+    let st = sp.state();
+    let mut under: HashSet<NodeId> = HashSet::new();
+    let mut stack = vec![*node];
+    while let Some(n) = stack.pop() {
+        if under.insert(n) {
+            stack.extend(st.children(&n).iter().map(|c| c.id));
+        }
+    }
+    new.into_iter()
+        .filter(|x| {
+            dag.get(x).is_some_and(|e| {
+                e.ops()
+                    .iter()
+                    .any(|op| named_nodes(op.body()).iter().any(|n| under.contains(n)))
+            })
+        })
+        .collect()
+}
+
+/// Turns the tree's pending changes into entries in `core` (the commit's
+/// step C; `encoded` is the content encoded for files, by inode and write
+/// generation). Returns the sealed entries written, to push.
+///
+/// A local change is written so that it descends from what the tree had
+/// shown when it was made, and from nothing else it would override: a
+/// content edit whose file got another version from elsewhere in the
+/// meantime (one the tree has not shown, because the file had local
+/// changes or the change had not been applied yet) is written in an entry
+/// concurrent with that version, so both are kept as a conflict; a delete
+/// of something changed elsewhere unseen becomes a delete conflict.
+pub fn write_pending(
+    core: &mut Core,
+    t: &mut Tree,
+    space: &SpaceId,
+    encoded: Vec<(u64, u64, Content)>,
+) -> anyhow::Result<Vec<Vec<u8>>> {
+    // Show the tree everything the space holds first, so that what it
+    // has seen after this commit is everything (see Tree::seen_heads).
+    if let Some(h) = core.spaces.get(space) {
+        if let Some(sp) = h.space.as_ref() {
+            if t.applied_version != h.version {
+                let snap = Snapshot::take(sp, h.version, &core.device_names());
+                let inval = t.apply(&snap);
+                t.pending_inval.extend(inval);
+            }
+        }
+    }
     let mut ready: HashSet<u64> = HashSet::new();
     for (ino, gen, c) in encoded {
         if let Some(i) = t.inodes.get_mut(&ino) {
@@ -128,9 +319,16 @@ pub fn commit(d: &Arc<Daemon>, tree: &Mutex<Tree>, space: &SpaceId) -> anyhow::R
         if rounds > 64 {
             break;
         }
+        let sp = core
+            .spaces
+            .get(space)
+            .and_then(|h| h.space.as_ref())
+            .ok_or_else(|| anyhow::anyhow!("files space not open"))?;
         // (op, what it does to which inode)
         let mut ops: Vec<SpaceOp> = Vec::new();
         let mut effects: Vec<Effect> = Vec::new();
+        // ops to write concurrent with the entries of the key
+        let mut concurrent: BTreeMap<Vec<EntryId>, Concurrent> = BTreeMap::new();
         let mut inos: Vec<u64> = t.inodes.keys().copied().collect();
         inos.sort_unstable();
         for ino in inos {
@@ -173,49 +371,124 @@ pub fn commit(d: &Arc<Daemon>, tree: &Mutex<Tree>, space: &SpaceId) -> anyhow::R
                         ops.push(SpaceOp::mv(node, pnode, &i.name));
                         effects.push(Effect::Clean(ino, Flag::Pos));
                     }
-                    if i.kind == Kind::File && i.dirty.content && content_ready && !i.busy(QUIET) {
+                    let mut own: Vec<(SpaceOp, Effect)> = Vec::new();
+                    let edit =
+                        i.kind == Kind::File && i.dirty.content && content_ready && !i.busy(QUIET);
+                    if edit {
                         let c = i.content.clone().unwrap_or(Content::Inline(Vec::new()));
-                        ops.push(files::set_content(node, &c));
-                        effects.push(Effect::Clean(ino, Flag::Content));
+                        own.push((
+                            files::set_content(node, &c),
+                            Effect::Clean(ino, Flag::Content),
+                        ));
                     }
                     if i.kind == Kind::File && i.dirty.mode {
-                        ops.push(files::set_mode(node, i.perm as u32));
-                        effects.push(Effect::Clean(ino, Flag::Mode));
+                        own.push((
+                            files::set_mode(node, i.perm as u32),
+                            Effect::Clean(ino, Flag::Mode),
+                        ));
                     }
                     if i.kind == Kind::File && i.dirty.mtime {
-                        ops.push(files::set_mtime(node, time_to_ms(i.mtime)));
-                        effects.push(Effect::Clean(ino, Flag::Mtime));
+                        own.push((
+                            files::set_mtime(node, time_to_ms(i.mtime)),
+                            Effect::Clean(ino, Flag::Mtime),
+                        ));
+                    }
+                    // A version from elsewhere this edit has not seen: keep
+                    // both (with the file's mode and time, from the same
+                    // view).
+                    let unseen = if edit {
+                        unseen_versions(sp, &node, &i.seen)
+                    } else {
+                        Vec::new()
+                    };
+                    if unseen.is_empty() {
+                        for (op, eff) in own {
+                            ops.push(op);
+                            effects.push(eff);
+                        }
+                    } else {
+                        let c = concurrent.entry(unseen).or_default();
+                        for (op, eff) in own {
+                            c.ops.push(op);
+                            c.effects.push(eff);
+                        }
                     }
                 }
             }
         }
         if first {
-            for n in std::mem::take(&mut t.deleted) {
-                ops.push(SpaceOp::delete(n));
-                effects.push(Effect::None);
+            for del in std::mem::take(&mut t.deleted) {
+                let mut unseen = unseen_touching(sp, &del.base, &del.node);
+                if let Some(seen) = &del.seen {
+                    for v in unseen_versions(sp, &del.node, seen) {
+                        if !unseen.contains(&v) {
+                            unseen.push(v);
+                        }
+                    }
+                }
+                unseen.sort();
+                if unseen.is_empty() {
+                    ops.push(SpaceOp::delete(del.node));
+                    effects.push(Effect::None);
+                } else {
+                    let c = concurrent.entry(unseen).or_default();
+                    c.ops.push(SpaceOp::delete(del.node));
+                    c.effects.push(Effect::None);
+                }
             }
             let settle: Vec<_> = t.settle.drain().collect();
             if !settle.is_empty() {
-                let sp = core.spaces.get(space).and_then(|h| h.space.as_ref());
-                if let Some(sp) = sp {
-                    let f = Files::new(sp);
-                    for (node, version) in settle {
-                        let vs = f.content(&node);
-                        if vs.len() < 2 {
-                            continue;
-                        }
-                        let pick = match version {
-                            Some(v) => vs.iter().find(|x| x.entry == v),
-                            None => vs.last(),
-                        };
-                        if let Some(c) = pick.and_then(|p| p.content.clone()) {
-                            ops.push(files::set_content(node, &c));
-                            effects.push(Effect::None);
-                        }
+                let f = Files::new(sp);
+                for (node, version) in settle {
+                    let vs = f.content(&node);
+                    if vs.len() < 2 {
+                        continue;
+                    }
+                    let pick = match version {
+                        Some(v) => vs.iter().find(|x| x.entry == v),
+                        None => vs.last(),
+                    };
+                    if let Some(c) = pick.and_then(|p| p.content.clone()) {
+                        ops.push(files::set_content(node, &c));
+                        effects.push(Effect::None);
                     }
                 }
             }
             first = false;
+        }
+        // Concurrent entries first, so the ordinary ones after them
+        // descend from everything again.
+        for (exclude, c) in concurrent {
+            let sp = core
+                .spaces
+                .get(space)
+                .and_then(|h| h.space.as_ref())
+                .ok_or_else(|| anyhow::anyhow!("files space not open"))?;
+            if !can_write_concurrent(sp, &exclude, &c.ops) {
+                tracing::warn!(
+                    "a change made here without seeing one from elsewhere cannot be kept \
+                     apart from it; writing it after"
+                );
+                ops.extend(c.ops);
+                effects.extend(c.effects);
+                continue;
+            }
+            match core.write_entry_concurrent(space, &exclude, c.ops.clone()) {
+                Ok((eid, bytes)) => {
+                    tracing::info!(
+                        "a file changed here and on another device: keeping both versions"
+                    );
+                    written.push(bytes);
+                    finish(t, &eid, &c.effects);
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "cannot keep a concurrent change apart ({e:#}); writing it after"
+                    );
+                    ops.extend(c.ops);
+                    effects.extend(c.effects);
+                }
+            }
         }
         if ops.is_empty() {
             break;
@@ -226,31 +499,12 @@ pub fn commit(d: &Arc<Daemon>, tree: &Mutex<Tree>, space: &SpaceId) -> anyhow::R
             let n = batch.len();
             let (eid, bytes) = core.write_entry(space, batch)?;
             written.push(bytes);
-            for (k, eff) in effects[idx..idx + n].iter().enumerate() {
-                match eff {
-                    Effect::Created(ino) => {
-                        let node = files::created_node(&eid, k);
-                        if let Some(i) = t.inodes.get_mut(ino) {
-                            i.node = Some(node);
-                            i.dirty = Default::default();
-                        }
-                        t.by_node.insert(node, *ino);
-                    }
-                    Effect::Clean(ino, f) => {
-                        if let Some(i) = t.inodes.get_mut(ino) {
-                            match f {
-                                Flag::Pos => i.dirty.pos = false,
-                                Flag::Content => i.dirty.content = false,
-                                Flag::Mode => i.dirty.mode = false,
-                                Flag::Mtime => i.dirty.mtime = false,
-                            }
-                        }
-                    }
-                    Effect::None => {}
-                }
-            }
+            finish(t, &eid, &effects[idx..idx + n]);
             idx += n;
         }
+    }
+    if let Some(sp) = core.spaces.get(space).and_then(|h| h.space.as_ref()) {
+        t.seen_heads = sp.heads();
     }
     // Staged content that is committed and closed is no longer needed:
     // reads come from the blob store.
@@ -266,14 +520,59 @@ pub fn commit(d: &Arc<Daemon>, tree: &Mutex<Tree>, space: &SpaceId) -> anyhow::R
         t.first_change = None;
         t.last_change = None;
     }
-    drop(t);
-    drop(core);
-    let n = written.len();
-    if n > 0 {
-        d.push(space, written);
-        d.bump();
+    Ok(written)
+}
+
+/// Whether ops can be written in an entry concurrent with `exclude`:
+/// every node they name exists in that entry's past.
+fn can_write_concurrent(sp: &Space, exclude: &[EntryId], ops: &[SpaceOp]) -> bool {
+    let parents = sp.latest_excluding(exclude);
+    if parents.is_empty() {
+        return false;
     }
-    Ok(n)
+    let dag = sp.dag();
+    ops.iter().all(|op| {
+        named_nodes(op.body()).iter().all(|n| {
+            *n == ROOT
+                || sp.state().node(n).is_some_and(|x| {
+                    parents
+                        .iter()
+                        .any(|p| dag.is_ancestor_or_self(&x.created_in, p))
+                })
+        })
+    })
+}
+
+/// Records what an entry `eid` with these effects (one per op, in order)
+/// did to the tree.
+fn finish(t: &mut Tree, eid: &EntryId, effects: &[Effect]) {
+    for (k, eff) in effects.iter().enumerate() {
+        match eff {
+            Effect::Created(ino) => {
+                let node = files::created_node(eid, k);
+                if let Some(i) = t.inodes.get_mut(ino) {
+                    i.node = Some(node);
+                    i.dirty = Default::default();
+                    i.seen = vec![*eid];
+                }
+                t.by_node.insert(node, *ino);
+            }
+            Effect::Clean(ino, f) => {
+                if let Some(i) = t.inodes.get_mut(ino) {
+                    match f {
+                        Flag::Pos => i.dirty.pos = false,
+                        Flag::Content => {
+                            i.dirty.content = false;
+                            i.seen = vec![*eid];
+                        }
+                        Flag::Mode => i.dirty.mode = false,
+                        Flag::Mtime => i.dirty.mtime = false,
+                    }
+                }
+            }
+            Effect::None => {}
+        }
+    }
 }
 
 enum Flag {
@@ -313,11 +612,8 @@ pub fn spawn_scheduler(
                     continue;
                 }
                 match commit(&d, &tree, &space) {
-                    Ok(n) => {
+                    Ok(_) => {
                         failures = 0;
-                        if n > 0 {
-                            tracing::debug!("committed {n} entries");
-                        }
                     }
                     Err(e) => {
                         failures += 1;
@@ -328,4 +624,373 @@ pub fn spawn_scheduler(
             }
         })
         .expect("spawn committer")
+}
+
+#[cfg(test)]
+mod tests {
+    //! Local changes against changes from elsewhere the tree has not
+    //! shown yet. A change "from elsewhere" is an entry written to the
+    //! space directly, as an entry received from another device is: it
+    //! descends from everything, and the tree has not applied it.
+
+    use super::*;
+    use crate::config::Config;
+    use crate::keys::Keys;
+    use crate::paths::Paths;
+    use crate::setup;
+
+    struct Fx {
+        _dir: tempfile::TempDir,
+        core: Core,
+        space: SpaceId,
+        t: Tree,
+    }
+
+    impl Fx {
+        fn new() -> Fx {
+            let dir = tempfile::tempdir().unwrap();
+            let paths = Paths::at(dir.path());
+            let p = setup::prepare(&paths).unwrap();
+            setup::install(&paths, p, &Config::default()).unwrap();
+            let keys = Arc::new(Keys::load_or_create(&paths.device_key()).unwrap());
+            let core = Core::load(&paths, keys).unwrap();
+            let space = core.files_id().unwrap();
+            std::fs::create_dir_all(paths.staging()).unwrap();
+            let t = Tree::new(paths.staging());
+            let mut fx = Fx {
+                _dir: dir,
+                core,
+                space,
+                t,
+            };
+            fx.refresh();
+            fx
+        }
+
+        fn sp(&self) -> &Space {
+            self.core.spaces[&self.space].space.as_ref().unwrap()
+        }
+
+        /// What the mount's refresh does when entries arrive.
+        fn refresh(&mut self) {
+            let h = &self.core.spaces[&self.space];
+            let snap = Snapshot::take(
+                h.space.as_ref().unwrap(),
+                h.version,
+                &self.core.device_names(),
+            );
+            self.t.apply(&snap);
+        }
+
+        fn commit(&mut self) -> usize {
+            write_pending(&mut self.core, &mut self.t, &self.space, Vec::new())
+                .unwrap()
+                .len()
+        }
+
+        /// Writes a file under `parent`, as an application would.
+        fn write_in(&mut self, parent: u64, name: &str, bytes: &[u8]) -> u64 {
+            let ino = match self.t.child(parent, name) {
+                Some(i) => i,
+                None => {
+                    let i = self.t.alloc(Kind::File);
+                    self.t.attach(i, parent, name);
+                    i
+                }
+            };
+            let i = self.t.inodes.get_mut(&ino).unwrap();
+            i.content = Some(Content::Inline(bytes.to_vec()));
+            i.size = bytes.len() as u64;
+            i.dirty.content = true;
+            i.write_gen += 1;
+            self.t.touch();
+            ino
+        }
+
+        fn write(&mut self, name: &str, bytes: &[u8]) -> u64 {
+            self.write_in(ROOT_INO, name, bytes)
+        }
+
+        fn node(&self, ino: u64) -> NodeId {
+            self.t.inodes[&ino].node.expect("committed")
+        }
+
+        /// A change from another device, not shown by the tree yet.
+        fn remote(&mut self, op: SpaceOp) -> EntryId {
+            self.core.write_entry(&self.space, vec![op]).unwrap().0
+        }
+
+        /// The content versions of a file, in log order.
+        fn versions(&self, node: &NodeId) -> Vec<Vec<u8>> {
+            Files::new(self.sp())
+                .content(node)
+                .into_iter()
+                .map(|v| match v.content {
+                    Some(Content::Inline(b)) => b,
+                    other => panic!("unexpected content {other:?}"),
+                })
+                .collect()
+        }
+
+        /// The names the mount shows in the root.
+        fn names(&self) -> Vec<String> {
+            self.t.inodes[&ROOT_INO].children.keys().cloned().collect()
+        }
+
+        fn shown(&self, name: &str) -> Vec<u8> {
+            let ino = self.t.child(ROOT_INO, name).expect(name);
+            match &self.t.inodes[&ino].content {
+                Some(Content::Inline(b)) => b.clone(),
+                other => panic!("unexpected content {other:?}"),
+            }
+        }
+    }
+
+    fn sorted(mut v: Vec<Vec<u8>>) -> Vec<Vec<u8>> {
+        v.sort();
+        v
+    }
+
+    /// The reported bug: a remote edit that arrives in the quiet period
+    /// before a local commit of the same file was overwritten.
+    #[test]
+    fn remote_edit_before_local_commit_is_kept_as_conflict() {
+        let mut fx = Fx::new();
+        let ino = fx.write("a.txt", b"v1");
+        fx.commit();
+        fx.refresh();
+        let node = fx.node(ino);
+        fx.remote(files::set_content(
+            node,
+            &Content::Inline(b"remote".to_vec()),
+        ));
+        fx.write("a.txt", b"local");
+        fx.commit();
+        assert_eq!(
+            sorted(fx.versions(&node)),
+            vec![b"local".to_vec(), b"remote".to_vec()]
+        );
+        fx.refresh();
+        let names = fx.names();
+        assert_eq!(names.len(), 2, "{names:?}");
+        assert!(names.contains(&"a.txt".to_string()));
+        assert!(
+            names.iter().any(|n| n.starts_with("a (conflict, ")),
+            "{names:?}"
+        );
+    }
+
+    /// Same race, but the remote edit was applied to the tree (and skipped,
+    /// the file having local changes) before the commit.
+    #[test]
+    fn remote_edit_applied_while_dirty_is_kept_as_conflict() {
+        let mut fx = Fx::new();
+        let ino = fx.write("a.txt", b"v1");
+        fx.commit();
+        fx.refresh();
+        let node = fx.node(ino);
+        fx.write("a.txt", b"local");
+        fx.remote(files::set_content(
+            node,
+            &Content::Inline(b"remote".to_vec()),
+        ));
+        fx.refresh();
+        assert_eq!(fx.shown("a.txt"), b"local", "local changes win in the view");
+        fx.commit();
+        assert_eq!(
+            sorted(fx.versions(&node)),
+            vec![b"local".to_vec(), b"remote".to_vec()]
+        );
+    }
+
+    /// The other order: an edit made after the remote one was shown
+    /// replaces it, with no conflict.
+    #[test]
+    fn edit_after_seeing_remote_edit_replaces_it() {
+        let mut fx = Fx::new();
+        let ino = fx.write("a.txt", b"v1");
+        fx.commit();
+        fx.refresh();
+        let node = fx.node(ino);
+        fx.remote(files::set_content(
+            node,
+            &Content::Inline(b"remote".to_vec()),
+        ));
+        fx.refresh();
+        assert_eq!(fx.shown("a.txt"), b"remote");
+        fx.write("a.txt", b"local");
+        fx.commit();
+        assert_eq!(fx.versions(&node), vec![b"local".to_vec()]);
+    }
+
+    /// Successive local commits, with or without a refresh between them,
+    /// never conflict with each other.
+    #[test]
+    fn own_edits_do_not_conflict() {
+        let mut fx = Fx::new();
+        let ino = fx.write("a.txt", b"v1");
+        fx.commit();
+        let node = fx.node(ino);
+        fx.write("a.txt", b"v2");
+        fx.commit();
+        fx.write("a.txt", b"v3");
+        fx.commit();
+        fx.refresh();
+        fx.write("a.txt", b"v4");
+        fx.commit();
+        assert_eq!(fx.versions(&node), vec![b"v4".to_vec()]);
+        assert_eq!(fx.sp().heads().len(), 1);
+    }
+
+    /// Editing the main file of a conflict that is shown settles it.
+    #[test]
+    fn editing_a_shown_conflict_settles_it() {
+        let mut fx = Fx::new();
+        let ino = fx.write("a.txt", b"v1");
+        fx.commit();
+        fx.refresh();
+        let node = fx.node(ino);
+        fx.remote(files::set_content(
+            node,
+            &Content::Inline(b"remote".to_vec()),
+        ));
+        fx.write("a.txt", b"local");
+        fx.commit();
+        fx.refresh();
+        assert_eq!(fx.versions(&node).len(), 2);
+        fx.write("a.txt", b"merged");
+        fx.commit();
+        assert_eq!(fx.versions(&node), vec![b"merged".to_vec()]);
+        fx.refresh();
+        assert_eq!(fx.names(), vec!["a.txt".to_string()]);
+    }
+
+    /// A local delete of a file edited elsewhere, unseen: a delete
+    /// conflict; the file stays.
+    #[test]
+    fn delete_of_unseen_remote_edit_is_a_delete_conflict() {
+        let mut fx = Fx::new();
+        let ino = fx.write("a.txt", b"v1");
+        fx.commit();
+        fx.refresh();
+        let node = fx.node(ino);
+        fx.remote(files::set_content(
+            node,
+            &Content::Inline(b"remote".to_vec()),
+        ));
+        fx.t.remove(ino);
+        fx.commit();
+        let n = fx.sp().state().node(&node).unwrap();
+        assert!(!n.deleted && n.delete_conflict, "{n:?}");
+        fx.refresh();
+        assert_eq!(fx.shown("a.txt"), b"remote");
+    }
+
+    /// The same with the edit applied to the tree before the delete: the
+    /// delete was made knowing it, and stands.
+    #[test]
+    fn delete_after_seeing_remote_edit_deletes() {
+        let mut fx = Fx::new();
+        let ino = fx.write("a.txt", b"v1");
+        fx.commit();
+        fx.refresh();
+        let node = fx.node(ino);
+        fx.remote(files::set_content(
+            node,
+            &Content::Inline(b"remote".to_vec()),
+        ));
+        fx.refresh();
+        let ino = fx.t.child(ROOT_INO, "a.txt").unwrap();
+        fx.t.remove(ino);
+        fx.commit();
+        assert!(fx.sp().state().node(&node).unwrap().deleted);
+        fx.refresh();
+        assert!(fx.names().is_empty());
+    }
+
+    /// A local edit and then delete of a file whose remote edit was
+    /// skipped (the file had local changes): the delete has not seen it.
+    #[test]
+    fn delete_of_dirty_file_with_skipped_remote_edit_is_a_delete_conflict() {
+        let mut fx = Fx::new();
+        let ino = fx.write("a.txt", b"v1");
+        fx.commit();
+        fx.refresh();
+        let node = fx.node(ino);
+        fx.write("a.txt", b"local");
+        fx.remote(files::set_content(
+            node,
+            &Content::Inline(b"remote".to_vec()),
+        ));
+        fx.refresh();
+        fx.t.remove(ino);
+        fx.commit();
+        let n = fx.sp().state().node(&node).unwrap();
+        assert!(!n.deleted && n.delete_conflict, "{n:?}");
+    }
+
+    /// A local edit of a file deleted elsewhere, unseen: the edit is kept.
+    #[test]
+    fn edit_of_unseen_remote_delete_is_kept() {
+        let mut fx = Fx::new();
+        let ino = fx.write("a.txt", b"v1");
+        fx.commit();
+        fx.refresh();
+        let node = fx.node(ino);
+        fx.remote(SpaceOp::delete(node));
+        fx.write("a.txt", b"local");
+        fx.commit();
+        fx.refresh();
+        assert_eq!(fx.names(), vec!["a.txt".to_string()]);
+        assert_eq!(fx.shown("a.txt"), b"local");
+        let ino = fx.t.child(ROOT_INO, "a.txt").unwrap();
+        let now = fx.node(ino);
+        assert_eq!(fx.versions(&now), vec![b"local".to_vec()]);
+    }
+
+    /// A folder deleted here while a file was added to it elsewhere,
+    /// unseen: the folder and the new file stay.
+    #[test]
+    fn folder_delete_yields_to_unseen_remote_create_inside() {
+        let mut fx = Fx::new();
+        let d = fx.t.alloc(Kind::Dir);
+        fx.t.attach(d, ROOT_INO, "d");
+        fx.t.touch();
+        fx.commit();
+        fx.refresh();
+        let dnode = fx.node(d);
+        let e = fx.remote(files::create_file(
+            dnode,
+            "x.txt",
+            &Content::Inline(b"x".to_vec()),
+            0o644,
+            None,
+        ));
+        fx.t.remove(d);
+        fx.commit();
+        let st = fx.sp().state();
+        assert!(!st.node(&dnode).unwrap().deleted);
+        assert!(!st.node(&files::created_node(&e, 0)).unwrap().deleted);
+    }
+
+    /// A burst of new folders and files commits, with every file under
+    /// its folder.
+    #[test]
+    fn burst_of_nested_creates() {
+        let mut fx = Fx::new();
+        for k in 0..20 {
+            let d = fx.t.alloc(Kind::Dir);
+            fx.t.attach(d, ROOT_INO, &format!("d{k}"));
+            let e = fx.t.alloc(Kind::Dir);
+            fx.t.attach(e, d, "e");
+            for j in 0..10 {
+                fx.write_in(e, &format!("f{j}"), format!("{k}/{j}").as_bytes());
+            }
+        }
+        fx.commit();
+        assert!(!fx.t.has_pending());
+        let f = Files::new(fx.sp());
+        let list = f.list_path("d7/e").unwrap();
+        assert_eq!(list.len(), 10);
+    }
 }

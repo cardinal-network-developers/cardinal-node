@@ -112,11 +112,13 @@ pub fn refresh(
             return;
         };
         let mut t = tree.lock().unwrap_or_else(|e| e.into_inner());
-        if t.applied_version == h.version {
-            return;
+        // what the committer applied
+        let mut invals = std::mem::take(&mut t.pending_inval);
+        if t.applied_version != h.version {
+            let snap = Snapshot::take(sp, h.version, &core.device_names());
+            invals.extend(t.apply(&snap));
         }
-        let snap = Snapshot::take(sp, h.version, &core.device_names());
-        t.apply(&snap)
+        invals
     };
     if let Some(n) = notifier {
         for i in invals {

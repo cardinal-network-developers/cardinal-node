@@ -513,3 +513,23 @@ Not implemented yet (the next milestone):
   removed.
 - **Retention.** `full` keeps every chunk ever fetched or written (no
   garbage collection yet), which is closer to `history`.
+- **Spec ambiguity: what a local change has "seen".** `state.md` decides
+  supersession and delete conflicts by entry ancestry, and an entry's
+  parents are normally all current heads. A device that holds an entry
+  from elsewhere but has not *shown* it yet (it arrived in the quiet
+  period before a commit, or the file had local changes so the mount
+  kept the local view) would, by citing every head, claim to have seen
+  it: a local edit would silently supersede the remote one, a local
+  delete would win over a remote edit. Here such local ops are written in
+  an entry whose parents are the latest entries that do not descend from
+  the unseen ones (`Space::write_concurrent`), so the result is the
+  conflict copy or delete conflict the spec asks for. The spec could say
+  that parents are what the author had *seen*, not merely held, and that
+  writing with older parents is legitimate (`spaces.md` only notes
+  backdating in the context of memberships). When the current epoch began
+  after the unseen entry, or a rotation is due, the change is written
+  normally instead (an old-epoch entry could expose new content to a
+  removed device), with a warning.
+- **A file edited here and deleted elsewhere, unseen,** is created again as
+  a new node rather than kept as a delete conflict of the old one (as
+  before); nothing is lost, but its history starts over.

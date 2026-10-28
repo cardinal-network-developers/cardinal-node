@@ -110,7 +110,9 @@ impl<'r, S: ObjectStore> BlobWriter<'r, S> {
             store,
             secret: secret.clone(),
             reuse: None,
-            buf: Vec::with_capacity(BATCH_BYTES + MAX_SIZE),
+            // grown on demand: most blobs are small, and a batch-sized
+            // buffer per blob costs more than encoding a small one
+            buf: Vec::new(),
             builder: IndexBuilder::new(),
             stats: WriteStats::default(),
             threads,
@@ -158,6 +160,9 @@ impl<'r, S: ObjectStore> BlobWriter<'r, S> {
         };
         if !more(0) {
             return Ok(());
+        }
+        if eof && buf.len() <= MAX_SIZE {
+            return self.process_small();
         }
         let reuse = self.reuse;
         let secret = &self.secret;
@@ -264,6 +269,49 @@ impl<'r, S: ObjectStore> BlobWriter<'r, S> {
         Ok(())
     }
 
+    /// [`process`](Self::process) for the last bytes of a blob when they
+    /// fit one chunk's maximum: on this thread, since starting the
+    /// pipeline's threads costs more than the work.
+    fn process_small(&mut self) -> Result<(), BlobError> {
+        let buf = std::mem::take(&mut self.buf);
+        let mut s = 0;
+        while s < buf.len() {
+            let n = cut(&buf[s..]);
+            let c = &buf[s..s + n];
+            s += n;
+            self.stats.chunks += 1;
+            let entry = match self.reuse.and_then(|r| r.get(c)) {
+                Some(e) => {
+                    self.stats.reused += 1;
+                    e
+                }
+                None => {
+                    let enc = encrypt(&self.secret, c);
+                    if self.store.put(&enc.id, &enc.ciphertext)? {
+                        self.stats.new_objects += 1;
+                        self.stats.new_bytes += enc.ciphertext.len() as u64;
+                    }
+                    IndexEntry {
+                        id: enc.id,
+                        key: enc.key,
+                        len: c.len() as u64,
+                    }
+                }
+            };
+            let store = &self.store;
+            let stats = &mut self.stats;
+            let mut sink = |e: Encrypted| -> Result<(), BlobError> {
+                if store.put(&e.id, &e.ciphertext)? {
+                    stats.new_objects += 1;
+                    stats.new_bytes += e.ciphertext.len() as u64;
+                }
+                Ok(())
+            };
+            self.builder.push(entry, &self.secret, &mut sink)?;
+        }
+        Ok(())
+    }
+
     /// Completes the blob and returns its reference and statistics.
     pub fn finish(mut self) -> Result<(BlobRef, WriteStats), BlobError> {
         self.process(true)?;
@@ -284,6 +332,12 @@ impl<'r, S: ObjectStore> BlobWriter<'r, S> {
 
 impl<S: ObjectStore> Write for BlobWriter<'_, S> {
     fn write(&mut self, data: &[u8]) -> io::Result<usize> {
+        let want = self.buf.len() + data.len();
+        if want > MAX_SIZE && self.buf.capacity() < BATCH_BYTES + MAX_SIZE {
+            // a large blob: buffer whole batches
+            self.buf
+                .reserve_exact(BATCH_BYTES + MAX_SIZE - self.buf.len());
+        }
         self.buf.extend_from_slice(data);
         if self.buf.len() >= BATCH_BYTES {
             self.process(false)?;

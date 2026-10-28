@@ -505,6 +505,7 @@ impl Filesystem for CardinalFs {
                     let dnode = t.inodes[&dst].node;
                     let snode = t.inodes[&src].node;
                     let ddirty = t.inodes[&dst].dirty;
+                    let dseen = t.inodes[&dst].seen.clone();
                     if let Some(dn) = dnode {
                         // forget the destination without deleting its node
                         t.detach(dst);
@@ -515,13 +516,14 @@ impl Filesystem for CardinalFs {
                         t.gc(dst);
                         if let Some(sn) = snode {
                             t.by_node.remove(&sn);
-                            t.deleted.push(sn);
+                            t.delete_node(sn, None);
                         }
                         t.detach(src);
                         t.by_node.insert(dn, src);
                         {
                             let s = t.inodes.get_mut(&src).expect("src");
                             s.node = Some(dn);
+                            s.seen = dseen;
                             s.dirty.content = true;
                             s.dirty.mode = true;
                             s.dirty.mtime = true;

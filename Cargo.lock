@@ -217,6 +217,7 @@ dependencies = [
  "cardinal-crypto",
  "cardinal-encoding",
  "hex",
+ "libc",
  "proptest",
  "serde_json",
  "zeroize",

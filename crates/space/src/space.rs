@@ -373,11 +373,77 @@ impl Space {
         ops: Vec<SpaceOp>,
         time: Option<u64>,
     ) -> Result<SealedEntry, Error> {
+        let heads = self.heads();
+        Ok(self.write_on(author, device, &heads, ops, time)?.1)
+    }
+
+    /// Writes an entry with `ops` that does not descend from any of
+    /// `exclude`: its parents are the latest entries that are not
+    /// descendants of them (or them). The entry is concurrent with each
+    /// of `exclude`, so its `set`s do not supersede theirs and its deletes
+    /// yield to them: for a change made without having seen theirs.
+    ///
+    /// Refused (`NotAllowed`) when no such parents exist, or when the
+    /// current epoch started in an entry the new one would not descend
+    /// from (it must be encrypted under the epoch current in its past).
+    pub fn write_concurrent(
+        &mut self,
+        author: &IdentityLog,
+        device: &SigningKey,
+        exclude: &[EntryId],
+        ops: Vec<SpaceOp>,
+        time: Option<u64>,
+    ) -> Result<(EntryId, SealedEntry), Error> {
+        let parents = self.latest_excluding(exclude);
+        if parents.is_empty() {
+            return Err(Error::NotAllowed("no parents outside the excluded entries"));
+        }
+        let (starter, _) = self.current_epoch.ok_or(Error::NoEpochKey)?;
+        if !parents
+            .iter()
+            .any(|p| self.dag.is_ancestor_or_self(&starter, p))
+        {
+            return Err(Error::NotAllowed(
+                "the current epoch starts after the excluded entries",
+            ));
+        }
+        self.write_on(author, device, &parents, ops, time)
+    }
+
+    /// The maximal entries that are neither one of `exclude` nor descend
+    /// from one: the heads of the graph with `exclude` and everything
+    /// after them removed.
+    pub fn latest_excluding(&self, exclude: &[EntryId]) -> Vec<EntryId> {
+        let mut gone: HashSet<EntryId> = HashSet::new();
+        for x in exclude.iter().filter(|x| self.dag.contains(x)) {
+            gone.insert(*x);
+            gone.extend(self.dag.descendants(x));
+        }
+        let mut candidates: HashSet<EntryId> = self.dag.heads().into_iter().collect();
+        for g in &gone {
+            candidates.extend(self.dag.parents(g).iter().copied());
+        }
+        let mut out: Vec<EntryId> = candidates
+            .into_iter()
+            .filter(|c| !gone.contains(c) && self.dag.children(c).iter().all(|k| gone.contains(k)))
+            .collect();
+        out.sort();
+        out
+    }
+
+    fn write_on(
+        &mut self,
+        author: &IdentityLog,
+        device: &SigningKey,
+        parents: &[EntryId],
+        ops: Vec<SpaceOp>,
+        time: Option<u64>,
+    ) -> Result<(EntryId, SealedEntry), Error> {
         let epoch = self.current_epoch().ok_or(Error::NoEpochKey)?;
         let key = self.keyring.get(&epoch).cloned().ok_or(Error::NoEpochKey)?;
         let mut b = SpaceEntryBuilder::new(
             self.id,
-            &self.heads(),
+            parents,
             author.id(),
             author_head(author, &device.public_key()),
             epoch,
@@ -388,10 +454,11 @@ impl Space {
             b = b.time(t);
         }
         let e = b.sign(device)?;
+        let id = e.id();
         let sealed = SealedEntry::seal(&e, &key, None, self.policy.public)?;
-        self.sealed.insert(e.id(), sealed.clone());
+        self.sealed.insert(id, sealed.clone());
         self.insert_entry(e);
-        Ok(sealed)
+        Ok((id, sealed))
     }
 
     fn owner_membership_for(&self, identity: IdentityId) -> Option<MembershipId> {

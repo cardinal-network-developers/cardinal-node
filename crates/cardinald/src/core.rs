@@ -414,6 +414,38 @@ impl Holder {
         Ok((id, bytes))
     }
 
+    /// Writes one entry with `ops` that does not descend from any of
+    /// `exclude` ([`Space::write_concurrent`]): for local changes made
+    /// without having seen those entries. Refused while an epoch rotation
+    /// is due, or when the current epoch began after `exclude`.
+    pub fn write_concurrent(
+        &mut self,
+        identity: &Identity,
+        keys: &Keys,
+        exclude: &[EntryId],
+        ops: Vec<SpaceOp>,
+    ) -> anyhow::Result<(EntryId, Vec<u8>)> {
+        if self.needs_rotate {
+            anyhow::bail!("an epoch rotation is due");
+        }
+        let space = self
+            .space
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("space not open yet"))?;
+        let (id, sealed) = space.write_concurrent(
+            &identity.log,
+            &keys.device.signing,
+            exclude,
+            ops,
+            Some(now_ms()),
+        )?;
+        let bytes = sealed.encode();
+        let sid = sealed.sealed_id();
+        self.persist(&[(sid, bytes.clone())])?;
+        self.version += 1;
+        Ok((id, bytes))
+    }
+
     /// Writes `ops`, split over as many entries as their size needs.
     pub fn write(
         &mut self,
@@ -759,6 +791,25 @@ impl Core {
             .get_mut(space)
             .ok_or_else(|| anyhow::anyhow!("space not held"))?;
         h.write_one(ident, &self.keys, ops)
+    }
+
+    /// Writes one entry with `ops` concurrent with `exclude`
+    /// ([`Holder::write_concurrent`]).
+    pub fn write_entry_concurrent(
+        &mut self,
+        space: &SpaceId,
+        exclude: &[EntryId],
+        ops: Vec<SpaceOp>,
+    ) -> anyhow::Result<(EntryId, Vec<u8>)> {
+        let ident = self
+            .identity
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("this device has no identity yet"))?;
+        let h = self
+            .spaces
+            .get_mut(space)
+            .ok_or_else(|| anyhow::anyhow!("space not held"))?;
+        h.write_concurrent(ident, &self.keys, exclude, ops)
     }
 
     /// The account space, once held and open.
