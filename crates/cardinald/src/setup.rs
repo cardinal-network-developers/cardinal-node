@@ -92,17 +92,22 @@ pub fn install(paths: &Paths, prepared: Prepared, config: &Config) -> anyhow::Re
     Ok(())
 }
 
+/// The retention policy a configuration asks for.
+pub fn retention(config: &Config) -> Retention {
+    if config.on_demand() {
+        Retention::OnDemand
+    } else {
+        Retention::Full
+    }
+}
+
 /// The placement of the files space on this device.
 pub fn placement_op(
     space_node: cardinal_space::NodeId,
     device: &[u8; 32],
     config: &Config,
 ) -> cardinal_space::SpaceOp {
-    let retention = if config.on_demand() {
-        Retention::OnDemand
-    } else {
-        Retention::Full
-    };
+    let retention = retention(config);
     let path = config.mount.as_ref().map(|p| p.display().to_string());
     account::create_placement(space_node, device, retention, path.as_deref(), false)
 }

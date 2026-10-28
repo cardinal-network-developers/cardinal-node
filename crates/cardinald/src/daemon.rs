@@ -178,6 +178,14 @@ pub struct Daemon {
     /// How fast each device has been sending blob objects
     /// (`sched.rs`), kept across fetches.
     pub blob_stats: Mutex<HashMap<[u8; 32], crate::sched::PeerStats>>,
+    /// Copies of the files space seen on the person's devices
+    /// (`copies.rs`).
+    pub copies: crate::copies::Tracker,
+    /// Speed tests this device serves (`speedtest.rs`).
+    pub speedtest: crate::speedtest::Limiter,
+    /// Held while this device's own account nodes are checked and
+    /// written, so concurrent housekeeping writes them once.
+    placement_lock: Mutex<()>,
     /// Set when the daemon should stop.
     pub stopping: watch::Sender<bool>,
     next_gen: AtomicU64,
@@ -260,6 +268,7 @@ impl Daemon {
             .ok()
             .and_then(|b| serde_json::from_slice(&b).ok())
             .unwrap_or_default();
+        let copies_path = paths.copies();
         let d = Arc::new(Daemon {
             paths,
             config: Mutex::new(config),
@@ -279,6 +288,9 @@ impl Daemon {
             mount_unavailable: Mutex::new(None),
             progress: Mutex::new(Progress::default()),
             blob_stats: Mutex::new(HashMap::new()),
+            copies: crate::copies::Tracker::load(copies_path, crate::copies::Rules::from_env()),
+            speedtest: crate::speedtest::Limiter::default(),
+            placement_lock: Mutex::new(()),
             stopping: watch::channel(false).0,
             next_gen: AtomicU64::new(1),
             started: Instant::now(),
@@ -585,8 +597,13 @@ impl Daemon {
         });
     }
 
+    /// Keeps this device's device node and its placement of the files
+    /// space in the account space, with its current retention, so the
+    /// person's other devices know what it means to keep
+    /// (`blobs.md#counting-copies`).
     fn ensure_placement(self: &Arc<Self>) -> anyhow::Result<()> {
-        let (acc, files, has_device, space_node, has_placement) = {
+        let _one = lock(&self.placement_lock);
+        let (acc, files, has_device, space_node, mine) = {
             let core = self.core();
             let (Some(acc), Some(files)) = (core.account_id(), core.files_id()) else {
                 return Ok(());
@@ -596,28 +613,42 @@ impl Daemon {
             let has_device = account::devices(st).iter().any(|d| d.key == me);
             let rec = account::spaces(st).into_iter().find(|r| r.space == files);
             let space_node = rec.as_ref().map(|r| r.node);
-            let has_placement = rec.is_some_and(|r| r.placements.iter().any(|p| p.device == me));
-            (acc, files, has_device, space_node, has_placement)
+            let mine: Vec<account::PlacementRecord> = rec
+                .map(|r| {
+                    r.placements
+                        .into_iter()
+                        .filter(|p| p.device == me)
+                        .collect()
+                })
+                .unwrap_or_default();
+            (acc, files, has_device, space_node, mine)
         };
         let me = self.keys.key();
+        let cfg = self.config().clone();
         let mut ops = Vec::new();
         if !has_device {
-            let name = self.config().name.clone();
-            ops.push(account::create_device(&me, &name, false, false));
+            ops.push(account::create_device(&me, &cfg.name, false, false));
         }
         match space_node {
-            Some(node) if !has_placement => {
-                let cfg = self.config().clone();
+            Some(node) if mine.is_empty() => {
                 ops.push(crate::setup::placement_op(node, &me, &cfg));
             }
             None => {
                 let ids =
                     self.write_and_push(&acc, vec![account::create_space(&files, "Cardinal")])?;
                 let node = created_node(&ids[0], 0);
-                let cfg = self.config().clone();
                 ops.push(crate::setup::placement_op(node, &me, &cfg));
             }
-            _ => {}
+            Some(_) => {
+                let want = crate::setup::retention(&cfg);
+                for p in mine.iter().filter(|p| p.retention != want) {
+                    tracing::info!(
+                        "recording this device's retention ({}) in the account space",
+                        cfg.retention
+                    );
+                    ops.push(account::set_field(p.node, 2, want as u32));
+                }
+            }
         }
         if !ops.is_empty() {
             self.write_and_push(&acc, ops)?;
@@ -1021,6 +1052,7 @@ impl Daemon {
             }
         });
         crate::fetch::start(self.clone());
+        crate::copies::start(self.clone());
         // Report (never install) new releases, if the person allows it.
         let cfg_path = self.paths.config();
         tokio::spawn(async move {

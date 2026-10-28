@@ -152,5 +152,12 @@ that.
   manager (e.g. `su`, some containers). Log in normally or enable lingering,
   then `systemctl --user daemon-reload && systemctl --user enable --now
   cardinal.service`.
+- Slow sync between two of your devices: `cardinal speedtest` measures the
+  encrypted link to each of them (about 20 seconds per device, nothing
+  written to disk). It shows what Cardinal can move, which is often less
+  than the network can, since encrypting every packet takes processor
+  time. To tell which is the limit, run `iperf3 -s` on one machine and
+  `iperf3 -c <its address>` on the other: if iperf3 is much faster, the
+  processor is the limit, not the network.
 - To go back by hand after an update:
   `mv ~/.local/bin/cardinal.previous ~/.local/bin/cardinal && systemctl --user restart cardinal`.

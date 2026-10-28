@@ -94,6 +94,16 @@ enum Cmd {
     },
     /// List your devices.
     Devices,
+    /// Measure the encrypted link to your other devices: about 10 seconds
+    /// receiving and 10 sending, without touching the disk, and the round
+    /// trip time.
+    Speedtest {
+        /// The device (name or key); default: each online device in turn.
+        device: Option<String>,
+        /// Print the results as JSON.
+        #[arg(long)]
+        json: bool,
+    },
     /// Remove a device you no longer use (it is cut off from your files).
     RemoveDevice {
         /// The device's name or key, as `cardinal devices` shows.
@@ -597,6 +607,9 @@ fn print_status(v: &Value) {
     } else {
         println!("Sync: up to date");
     }
+    for line in copies_lines(&v["copies"], v["devices"].as_array().map_or(0, |d| d.len())) {
+        println!("{line}");
+    }
     let c = v["conflicts"].as_u64().unwrap_or(0);
     if c > 0 {
         println!(
@@ -604,6 +617,241 @@ fn print_status(v: &Value) {
             if c == 1 { " has" } else { "s have" }
         );
     }
+}
+
+/// `4 minutes ago` for a span of `ms`.
+fn ago(ms: u64) -> String {
+    let s = ms / 1000;
+    let unit = |n: u64, what: &str| format!("{n} {what}{} ago", if n == 1 { "" } else { "s" });
+    match s {
+        0..=1 => "just now".into(),
+        2..=59 => unit(s, "second"),
+        60..=3599 => unit(s / 60, "minute"),
+        3600..=172_799 => unit(s / 3600, "hour"),
+        _ => unit(s / 86_400, "day"),
+    }
+}
+
+/// `an hour`, `2 hours`, `3 seconds` for a span of `ms`.
+fn span(ms: u64) -> String {
+    let s = ms / 1000;
+    let n = |n: u64, what: &str, one: &str| {
+        if n == 1 {
+            one.to_owned()
+        } else {
+            format!("{n} {what}s")
+        }
+    };
+    if s >= 3600 && s % 3600 == 0 {
+        n(s / 3600, "hour", "an hour")
+    } else if s >= 60 && s % 60 == 0 {
+        n(s / 60, "minute", "a minute")
+    } else {
+        n(s, "second", "a second")
+    }
+}
+
+/// The `Copies:` lines of `cardinal status`, from its `copies` object
+/// (`blobs.md#counting-copies`). `devices`: how many devices the person
+/// has. Says what was seen, never that files are safe.
+fn copies_lines(c: &Value, devices: usize) -> Vec<String> {
+    if c.is_null() || c["blobs"].as_u64().unwrap_or(0) == 0 {
+        return Vec::new();
+    }
+    let now = c["now"].as_u64().unwrap_or(0);
+    let age = |t: &Value| t.as_u64().map(|t| ago(now.saturating_sub(t)));
+    let holders = c["holders"].as_array().cloned().unwrap_or_default();
+    let name = |h: &Value| {
+        if h["this"] == true {
+            "this device".to_owned()
+        } else {
+            h["name"].as_str().unwrap_or("?").to_owned()
+        }
+    };
+    let is = |h: &Value, k: &str| h[k].as_bool() == Some(true);
+    let counted: Vec<&Value> = holders.iter().filter(|h| is(h, "counted")).collect();
+    let pending: Vec<&Value> = holders
+        .iter()
+        .filter(|h| h["state"] == "unchecked" && is(h, "online") && !is(h, "this"))
+        .collect();
+    let older = span(c["older_than_ms"].as_u64().unwrap_or(3_600_000));
+    let mut out = Vec::new();
+    if holders.is_empty() {
+        out.push(
+            "Copies: no device keeps all your files (each fetches them when opened)".to_owned(),
+        );
+        return out;
+    }
+    let pending_names = pending
+        .iter()
+        .map(|h| name(h))
+        .collect::<Vec<_>>()
+        .join(", ");
+    if counted.is_empty() && !pending.is_empty() {
+        let mut l = format!("Copies: checking {pending_names}…");
+        if c["eligible"].as_u64() == Some(0) {
+            l += &format!(" (nothing older than {older} yet)");
+        }
+        out.push(l);
+    } else if counted.is_empty() {
+        out.push("Copies: none seen recently".to_owned());
+    } else {
+        // When the others were checked at about the same time, say it
+        // once; else per device.
+        let ages: Vec<u64> = counted
+            .iter()
+            .filter(|h| !is(h, "this"))
+            .filter_map(|h| h["last_pass"].as_u64())
+            .map(|t| now.saturating_sub(t))
+            .collect();
+        let interval = c["interval_ms"].as_u64().unwrap_or(600_000);
+        let spread = ages.iter().max().unwrap_or(&0) - ages.iter().min().unwrap_or(&0) > interval;
+        let list: Vec<String> = counted
+            .iter()
+            .map(|h| match age(&h["last_pass"]) {
+                Some(a) if spread && !is(h, "this") => format!("{} (checked {a})", name(h)),
+                _ => name(h),
+            })
+            .collect();
+        let mut l = format!("Copies: {} — {}", counted.len(), list.join(", "));
+        match ages.iter().max() {
+            Some(a) if !spread => l += &format!(" (checked {}; files older than {older})", ago(*a)),
+            Some(_) => l += &format!("; files older than {older}"),
+            None => l += &format!(" (files older than {older})"),
+        }
+        if !pending.is_empty() {
+            l += &format!("; checking {pending_names}…");
+        }
+        out.push(l);
+    }
+    for h in holders
+        .iter()
+        .filter(|h| !is(h, "counted") && !pending.iter().any(|p| std::ptr::eq(*p, *h)))
+    {
+        let when = |k: &str| age(&h[k]).map(|a| format!(" ({a})")).unwrap_or_default();
+        let why = match h["state"].as_str().unwrap_or("") {
+            "fetching" => format!(
+                "fetching files from this device{}; it counts again once it passes a check",
+                when("fetched_at")
+            ),
+            "failed" => format!(
+                "{}{}",
+                h["reason"].as_str().unwrap_or("failed a check"),
+                when("last_fail")
+            ),
+            "stale" => {
+                let mut w = format!("last checked {}", age(&h["last_pass"]).unwrap_or_default());
+                if !is(h, "online") {
+                    w += ", offline";
+                }
+                w
+            }
+            "unchecked" => "offline, not checked yet".to_owned(),
+            _ => h["reason"].as_str().unwrap_or("").to_owned(),
+        };
+        out.push(format!("  {}: not counted — {why}", name(h)));
+    }
+    if counted.len() == 1 && pending.is_empty() {
+        let only = counted[0];
+        let others_expected = holders.len() > 1;
+        out.push(if !is(only, "this") {
+            format!(
+                "Your files are only on {}. Keep a second copy: `cardinal retention full` here, \
+                 or run `cardinal pair` on another device.",
+                name(only)
+            )
+        } else if others_expected {
+            "Your files are only on this device until another device passes its checks.".to_owned()
+        } else if devices > 1 {
+            "Your files are only on this device. Keep a copy on another device: run \
+             `cardinal retention full` on one of your others, or `cardinal pair` on a new one."
+                .to_owned()
+        } else {
+            "Your files are only on this device. Keep a copy on another device: run \
+             `cardinal pair` on it."
+                .to_owned()
+        });
+    }
+    out
+}
+
+/// `0.4 ms` for a round trip.
+fn rtt(ms: f64) -> String {
+    if ms < 0.1 {
+        format!("{ms:.2} ms")
+    } else if ms < 10.0 {
+        format!("{ms:.1} ms")
+    } else {
+        format!("{ms:.0} ms")
+    }
+}
+
+/// `saint-joseph: receive 38.2 MB/s, send 36.9 MB/s, round trip 0.4 ms
+/// (median 0.6 ms)` from a speed test result.
+fn speed_line(v: &Value) -> String {
+    let name = v["device"].as_str().unwrap_or("?");
+    if let Some(e) = v["error"].as_str() {
+        return e.to_owned();
+    }
+    format!(
+        "{name}: receive {}/s, send {}/s, round trip {} (median {})",
+        human_size(v["receive"].as_u64().unwrap_or(0)),
+        human_size(v["send"].as_u64().unwrap_or(0)),
+        rtt(v["rtt_min_ms"].as_f64().unwrap_or(0.0)),
+        rtt(v["rtt_median_ms"].as_f64().unwrap_or(0.0)),
+    )
+}
+
+async fn speedtest(paths: &Paths, device: Option<String>, raw: bool) -> anyhow::Result<()> {
+    let named = device.is_some();
+    let targets: Vec<(String, String)> = match device {
+        Some(d) => vec![(d.clone(), d)],
+        None => {
+            let v = call(paths, json!({"cmd": "devices"})).await?;
+            let all = v["devices"].as_array().cloned().unwrap_or_default();
+            let t: Vec<(String, String)> = all
+                .iter()
+                .filter(|d| d["this"] != true && d["online"] == true)
+                .map(|d| {
+                    (
+                        d["key"].as_str().unwrap_or("").to_owned(),
+                        d["name"].as_str().unwrap_or("?").to_owned(),
+                    )
+                })
+                .collect();
+            if t.is_empty() {
+                anyhow::bail!(
+                    "none of your other devices is online; `cardinal devices` lists them"
+                );
+            }
+            t
+        }
+    };
+    let mut results = Vec::new();
+    for (who, name) in targets {
+        if !raw {
+            eprintln!("Measuring the link to {name}...");
+        }
+        let r = call(paths, json!({"cmd": "speedtest", "device": who})).await;
+        let v = match r {
+            Ok(mut v) => {
+                if let Some(o) = v.as_object_mut() {
+                    o.remove("ok");
+                }
+                v
+            }
+            Err(e) if named => return Err(e),
+            Err(e) => json!({"device": name, "error": format!("{e:#}")}),
+        };
+        if !raw {
+            println!("{}", speed_line(&v));
+        }
+        results.push(v);
+    }
+    if raw {
+        println!("{}", serde_json::to_string_pretty(&results)?);
+    }
+    Ok(())
 }
 
 async fn client(cmd: Cmd) -> anyhow::Result<()> {
@@ -630,6 +878,7 @@ async fn client(cmd: Cmd) -> anyhow::Result<()> {
             print_devices(&v["devices"]);
             Ok(())
         }
+        Cmd::Speedtest { device, json: raw } => speedtest(&paths, device, raw).await,
         Cmd::RemoveDevice { who } => {
             let v = call(&paths, json!({"cmd": "remove-device", "who": who})).await?;
             println!(
@@ -820,6 +1069,127 @@ mod tests {
         );
         let p = json!({"files_pending": 1, "bytes_pending": 500});
         assert_eq!(fetch_line(&p), "fetching 1 file, 500 B left");
+    }
+
+    fn holder(name: &str, this: bool, state: &str, last_pass: Option<u64>) -> Value {
+        json!({"name": name, "this": this, "online": true, "counted": state == "passed",
+            "state": state, "last_pass": last_pass, "reason": null})
+    }
+
+    #[test]
+    fn copies_status_lines() {
+        let now = 10_000_000u64;
+        let c = |holders: Vec<Value>| {
+            json!({"now": now, "blobs": 12, "eligible": 10, "older_than_ms": 3_600_000,
+                "interval_ms": 600_000, "holders": holders})
+        };
+        // Alone.
+        let alone = c(vec![holder("carbonite", true, "passed", Some(now - 1000))]);
+        assert_eq!(
+            copies_lines(&alone, 1),
+            vec![
+                "Copies: 1 — this device (files older than an hour)",
+                "Your files are only on this device. Keep a copy on another device: run \
+                 `cardinal pair` on it."
+            ]
+        );
+        // Three, checked about the same time.
+        let three = c(vec![
+            holder("carbonite", true, "passed", Some(now - 1000)),
+            holder("saint-joseph", false, "passed", Some(now - 240_000)),
+            holder("nuc", false, "passed", Some(now - 200_000)),
+        ]);
+        assert_eq!(
+            copies_lines(&three, 3),
+            vec![
+                "Copies: 3 — this device, saint-joseph, nuc (checked 4 minutes ago; files older \
+                 than an hour)"
+            ]
+        );
+        // One fetching, one offline for a day: per-device ages, and why.
+        let mut fetching = holder("nuc", false, "fetching", Some(now - 3_000_000));
+        fetching["fetched_at"] = json!(now - 120_000);
+        let mixed = c(vec![
+            holder("carbonite", true, "passed", Some(now - 1000)),
+            holder("saint-joseph", false, "passed", Some(now - 60_000)),
+            {
+                let mut h = holder("laptop", false, "passed", Some(now - 7_200_000));
+                h["online"] = json!(false);
+                h
+            },
+            fetching,
+        ]);
+        assert_eq!(
+            copies_lines(&mixed, 4),
+            vec![
+                "Copies: 3 — this device, saint-joseph (checked 1 minute ago), laptop (checked \
+                 2 hours ago); files older than an hour",
+                "  nuc: not counted — fetching files from this device (2 minutes ago); it \
+                 counts again once it passes a check"
+            ]
+        );
+        // Only this device, another catching up.
+        let one = c(vec![
+            holder("carbonite", true, "passed", Some(now - 1000)),
+            fetching_holder(now),
+        ]);
+        let lines = copies_lines(&one, 2);
+        assert_eq!(
+            lines.last().unwrap(),
+            "Your files are only on this device until another device passes its checks."
+        );
+        // Before the first check of another device.
+        let mut start = c(vec![
+            holder("carbonite", true, "passed", None),
+            holder("nuc", false, "unchecked", None),
+        ]);
+        assert_eq!(
+            copies_lines(&start, 2),
+            vec!["Copies: 1 — this device (files older than an hour); checking nuc…"]
+        );
+        // On demand here, nothing old enough to check yet.
+        start["holders"] = json!([holder("nuc", false, "unchecked", None)]);
+        start["eligible"] = json!(0);
+        assert_eq!(
+            copies_lines(&start, 2),
+            vec!["Copies: checking nuc… (nothing older than an hour yet)"]
+        );
+        // No content yet: nothing to say.
+        assert!(copies_lines(&json!({"blobs": 0}), 1).is_empty());
+        assert!(copies_lines(&Value::Null, 1).is_empty());
+    }
+
+    fn fetching_holder(now: u64) -> Value {
+        let mut h = holder("nuc", false, "fetching", Some(now - 3_000_000));
+        h["fetched_at"] = json!(now - 5_000);
+        h
+    }
+
+    #[test]
+    fn speedtest_line() {
+        let v = json!({"device": "saint-joseph", "receive": 38_200_000u64,
+            "send": 36_900_000u64, "rtt_min_ms": 0.42, "rtt_median_ms": 0.61});
+        assert_eq!(
+            speed_line(&v),
+            "saint-joseph: receive 38.2 MB/s, send 36.9 MB/s, round trip 0.4 ms (median 0.6 ms)"
+        );
+        let e = json!({"device": "nuc", "error": "nuc runs an older version without speedtest"});
+        assert_eq!(
+            speed_line(&e),
+            "nuc runs an older version without speedtest"
+        );
+        assert_eq!(
+            (ago(500), ago(4 * 60_000), ago(3 * 86_400_000)),
+            (
+                "just now".into(),
+                "4 minutes ago".into(),
+                "3 days ago".into()
+            )
+        );
+        assert_eq!(
+            (span(3_600_000), span(2_000), span(7_200_000)),
+            ("an hour".into(), "2 seconds".into(), "2 hours".into())
+        );
     }
 
     #[test]

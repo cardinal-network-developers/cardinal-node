@@ -315,10 +315,59 @@ async fn handle(d: &Arc<Daemon>, req: &Value) -> anyhow::Result<Value> {
             d.config().retention = mode.to_owned();
             d.save_config()?;
             d.bump();
+            // Record it in the account space for the other devices.
+            d.housekeeping();
             Ok(json!({"retention": mode}))
         }
+        "speedtest" => speedtest(d, arg(req, "device")?).await,
         other => anyhow::bail!("unknown command {other:?}"),
     }
+}
+
+/// Measures the link to one of the person's devices (`speedtest.rs`).
+async fn speedtest(d: &Arc<Daemon>, who: &str) -> anyhow::Result<Value> {
+    let me = d.keys.key();
+    let (key, name, x) = {
+        let core = d.core();
+        let ident = core
+            .identity
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("this device does not belong to anyone yet"))?;
+        let names = core.device_names();
+        let st = ident.state();
+        let w = who.to_lowercase();
+        let matches: Vec<_> = st
+            .keys
+            .values()
+            .filter(|k| {
+                names.get(&k.key).is_some_and(|n| n.to_lowercase() == w)
+                    || hex::encode(k.key).starts_with(&w)
+            })
+            .collect();
+        let k = match matches.as_slice() {
+            [] => anyhow::bail!("no device called {who:?}; see `cardinal devices`"),
+            [k] => *k,
+            _ => anyhow::bail!(
+                "several devices match {who:?}; use the key shown by `cardinal devices`"
+            ),
+        };
+        let name = names
+            .get(&k.key)
+            .cloned()
+            .filter(|n| !n.is_empty())
+            .unwrap_or_else(|| account::short_key(&k.key));
+        (k.key, name, k.link_key.as_ref().map(|l| *l.x25519()))
+    };
+    if key == me {
+        anyhow::bail!("{name} is this device; name one of your others");
+    }
+    let session = x
+        .and_then(|x| d.own_sessions().into_iter().find(|s| s.peer_static() == x))
+        .ok_or_else(|| anyhow::anyhow!("{name} is offline"))?;
+    let m = crate::speedtest::run(&session, &name).await?;
+    let mut v = m.to_json();
+    v["device"] = json!(name);
+    Ok(v)
 }
 
 fn reload(d: &Arc<Daemon>) -> anyhow::Result<()> {
@@ -465,6 +514,7 @@ fn status(d: &Arc<Daemon>) -> Value {
         "retention": cfg.retention,
         "conflicts": conflicts,
         "progress": progress,
+        "copies": crate::copies::status(d),
         "pairing": pairing,
         "peers": cfg.peers,
         "uptime_s": d.uptime().as_secs(),
@@ -695,19 +745,35 @@ fn remove_device(d: &Arc<Daemon>, who: &str) -> anyhow::Result<Value> {
     };
     d.identity_changed();
     d.push_identity(entries);
-    // forget its device node
+    // forget its device node and its placements
     let acc = {
         let core = d.core();
         core.account_id().and_then(|a| {
             let st = core.spaces[&a].space.as_ref()?.state();
-            account::devices(st)
+            let mut nodes: Vec<NodeId> = account::devices(st)
                 .into_iter()
-                .find(|x| x.key == key)
-                .map(|x| (a, x.node))
+                .filter(|x| x.key == key)
+                .map(|x| x.node)
+                .collect();
+            for rec in account::spaces(st) {
+                nodes.extend(
+                    rec.placements
+                        .iter()
+                        .filter(|p| p.device == key)
+                        .map(|p| p.node),
+                );
+            }
+            Some((a, nodes))
         })
     };
-    if let Some((a, node)) = acc {
-        d.write_and_push(&a, vec![cardinal_space::SpaceOp::delete(node)])?;
+    if let Some((a, nodes)) = acc {
+        if !nodes.is_empty() {
+            let ops = nodes
+                .into_iter()
+                .map(cardinal_space::SpaceOp::delete)
+                .collect();
+            d.write_and_push(&a, ops)?;
+        }
     }
     Ok(json!({"name": name}))
 }

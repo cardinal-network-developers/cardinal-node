@@ -8,6 +8,7 @@
 pub mod applog;
 pub mod config;
 pub mod control;
+pub mod copies;
 pub mod core;
 pub mod daemon;
 pub mod directory;
@@ -19,6 +20,7 @@ pub mod pair;
 pub mod paths;
 pub mod sched;
 pub mod setup;
+pub mod speedtest;
 
 pub use config::Config;
 pub use daemon::Daemon;

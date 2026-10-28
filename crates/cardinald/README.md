@@ -34,6 +34,8 @@ In the data directory:
   1024) and confirmed counters per peer, saved every 30 s and on every new
   session (`Endpoint::{last_counter, set_confirmed_counter, ...}`).
 - `peers.json` — addresses where each own device was reached.
+- `copies.json` — what copy checks saw of each device meant to keep
+  everything (see "Copies").
 
 The recovery phrase is never stored: `cardinal init` shows it once and asks
 for two of the words back (unless `--yes`). The identity encryption key is
@@ -67,9 +69,16 @@ cached in the session table for this reason).
   device in the account space, and opens a link session with
   `derive("invite", K)`. Over it the new device fetches the identity log
   (it accepts only that log, only from that peer), joins, closes the
-  session and reconnects as a member; then everything syncs.
+  session and reconnects as a member; then everything syncs. The new
+  device writes its own device node and placement once it has the
+  account space.
+- A device keeps its placement's retention equal to its own setting:
+  `cardinal retention` updates it (and a changed `config.toml` at the
+  next start), so the others know what each device means to keep.
+  Devices running 0.1.3 or earlier recorded only the retention they had
+  when they were set up or paired.
 - `cardinal remove-device` appends `remove_key` and a fresh encryption
-  key, deletes the device node, and makes every space rotate its epoch at
+  key, deletes the device node and its placements, and makes every space rotate its epoch at
   its next write. Sessions with the removed device close at once
   (`Endpoint::recheck_peers`).
 - The link directory (`directory.rs`) is a snapshot of the devices in
@@ -172,14 +181,79 @@ committed. Each inode maps to a space node once created there.
 `git` and editors work: tested with `git init/add/commit/log/fsck`, vim
 (swap files, rename saves), on one device and seen from the other.
 
+## Copies
+
+`copies.rs` counts copies of the files space by what it sees
+(`blobs.md#counting-copies`, D45); `cardinal status` shows the count:
+
+```
+Copies: 3 — this device, saint-joseph, nuc (checked 4 minutes ago; files older than an hour)
+```
+
+- **Who should keep everything**: devices in effect whose placement of
+  the files space says full retention (or history), and this device when
+  its own setting is full.
+- **Checks**: every 10 minutes (±20%) each online such device is asked,
+  on the ordinary `blob` service at background priority, for 4 objects
+  chosen at random: a blob of the current state weighted by its size,
+  then down its indexes (those this device holds) in proportion to the
+  bytes beneath, sometimes stopping at an index. Only blobs this device
+  first saw more than an hour ago are sampled (the birth time of the top
+  object in the store, or when this run first saw the reference), so a
+  device still copying new files is not failed; the count is of copies
+  of everything older than that. Answers are verified by hash and
+  dropped. This device checks its own store the same way.
+- **Fetching resets the count**: a device meant to keep everything that
+  fetches from this one more than 9 objects first stored here over an
+  hour ago, within one interval (two of its own checks of this device
+  ask for 8), stops counting until it passes a check started 1.5
+  intervals after its last such fetch; it is not checked before. A device that fetches one of the objects being asked
+  of it while the check runs is checked again half an interval later,
+  and fails if it happens again (it may be relaying them).
+- **Repeated fetches**: an object fetched in three fetches at least two
+  intervals apart means the device is not keeping it; it stops counting
+  until it passes a check a day (144 intervals) later. Which objects each
+  device fetched is remembered in memory (200,000 per device).
+- A passed check counts for 7 days, so a laptop that is asleep still
+  counts, with the time it was last checked. Results are kept in
+  `copies.json`: after a restart nothing is shown as unchecked that was
+  checked before.
+- `CARDINAL_TEST_CHECK_INTERVAL_MS` and `CARDINAL_TEST_CHECK_MIN_AGE_MS`
+  shorten the interval and the age (tests).
+
+## Speed test
+
+`cardinal speedtest [DEVICE]` measures the encrypted link to one of the
+person's devices (by default each online one in turn): 20 round trips,
+then 10 s of the other device sending and 10 s of this one sending, from
+memory, with no disk involved. It is a link service of this
+implementation (`speedtest.rs`): the application service
+`BLAKE3("cardinal-node speedtest 1")`, served only on sessions with the
+person's own devices, one test at a time, for a length the serving
+device sets (it resets a test that runs over), and at most two minutes
+of tests in any ten. A device without it (0.1.3 and earlier) resets the
+stream, which `cardinal speedtest` reports as an older version.
+`CARDINAL_TEST_SPEEDTEST_MS` shortens each phase (tests).
+
+The result is what Cardinal can move, which is often less than the
+network can: the link encrypts every packet of about 1,150 bytes on its
+own, which costs processor time (see DEVIATIONS.md, "Link implementation
+notes"). `iperf3` between the same two machines shows what the network
+carries; if it is much faster, the processor is the limit, not the
+network.
+
 ## Control socket
 
 One JSON object per line each way: `{"cmd": "status"}` →
 `{"ok": true, ...}` or `{"ok": false, "error": "..."}`. Commands: `status`,
 `devices`, `remove-device`, `peer-add/remove/list`, `mount`, `unmount`,
 `history`, `restore`, `conflicts`, `pin`, `unpin`, `retention`,
-`pair-show`, `pair-status`, `pair-type`, `reload` (after `init` while the
-daemon runs), `flush` (commit now), `stop`.
+`pair-show`, `pair-status`, `pair-type`, `speedtest` (one device, by
+name or key), `reload` (after `init` while the daemon runs), `flush`
+(commit now), `stop`. `status` includes `copies`: per device meant to
+keep everything, whether it counts (`state`: passed, failed, fetching,
+repeated, stale, unchecked), why not (`reason`), and the times of its
+last check, pass, failure, and fetch.
 
 ## Logs
 
@@ -194,5 +268,6 @@ colours. `CARDINAL_LOG` or `RUST_LOG` sets the filter (`info` by default;
   (as "history" would), and on-demand eviction by budget is not run.
 - Folder ignore patterns are not applied.
 - Hosts (mailbox, relay, storage), guardians, recovery from the phrase.
+  Copies on hosts (host grants) are not counted.
 - Epoch rotation after `rotate_after` entries (only after a device is
   removed).

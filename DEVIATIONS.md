@@ -575,3 +575,68 @@ Not implemented yet (the next milestone):
   per-device throughput and latency estimates, work in proportion to
   throughput, hedged requests when a device is slow. A hedge makes a
   second device send the same objects; the spec does not limit this.
+- **Implementation-specific link service: `speedtest`.** `cardinal
+  speedtest` runs over the application service
+  `BLAKE3("cardinal-node speedtest 1")` (`speedtest.rs`), which no spec
+  defines and other implementations need not offer: round trips, then a
+  fixed length of data each way, from memory. It is served only on
+  sessions with the person's own devices, one test at a time, for a
+  length the serving device sets (it resets a test that runs over), and
+  for at most two minutes in any ten; other requests are refused with a
+  reply, and devices without the service reset the stream. A link-level
+  measurement could instead be a core service, or `ping` frames with
+  padding.
+
+## Counting copies (`spec/blobs.md#counting-copies`)
+
+- **Spec ambiguity: which devices "should keep" a space.** Chosen:
+  devices in effect in the identity log whose placement (account kind 7)
+  under the files space's node says retention 0 (full) or 2 (history),
+  plus this device when its own setting is full. Placements are written
+  at `init` and when a device joins, and now also updated when a device's
+  retention changes (`cardinal retention`, or `config.toml` at the next
+  start); a device running 0.1.3 or earlier may still show the retention
+  it had when it was set up. Host grants are not counted yet.
+- **Spec ambiguity: what checks sample, and from when.** "Chunks chosen
+  at random from those the holder should keep": chosen from the blobs of
+  the current state (every version of a file in conflict), weighted by
+  size, then down the indexes this device holds in proportion to the
+  bytes beneath, sometimes stopping at an index (indexes are kept too),
+  else the top id. Only blobs this device first saw more than an hour
+  ago are sampled: first seen is the birth time of the top object in the
+  store (its modification time where the file system has no birth time;
+  reads touch that, which only delays sampling), or when this run first
+  saw the reference. So the count is of copies of everything older than
+  an hour, and status says so; newer content is still being copied.
+- **Spec conflict: checks are fetches, seen from the other side.** A
+  check "is an ordinary request", so a device cannot tell another
+  device's check of it from a fetch; applied literally, "a holder that
+  fetches a chunk stops counting" makes two holders that check each other
+  reset each other forever (each check comes before the other's wait is
+  over). Chosen: a holder is taken to be fetching only when it is sent
+  more than 9 objects of counted content (first stored here more than an
+  hour ago) within one check interval; up to that is what two of its
+  checks ask for, and one. Objects first stored here less than an hour
+  ago, which holders are still copying, do not reset anyone either. The
+  allowance would let a holder that keeps nothing pass by fetching the
+  checked chunks from the checker as it is asked: a check during which
+  the holder fetches any of the asked objects from the checker is not
+  taken; it is repeated half an interval later and fails if that happens
+  again. The spec could say that checks are exempt by volume, or that
+  only fetches by holders not being checked count.
+- **Readings: the wait, "again and again", "recently".** The wait after
+  a fetch is 1.5 check intervals (15 minutes) after the last fetch, and
+  the holder is not checked before it. An object fetched in three
+  fetches at least two intervals apart (retries and hedged requests
+  closer together are one fetch) marks the holder as not keeping it; it
+  counts again only after passing a check a day after the last such
+  fetch. The objects each holder fetched are remembered in memory only.
+  A passed check counts for 7 days while the holder is not checked again
+  (an offline laptop), and status gives its time. Results are persisted
+  (`copies.json`), so a restart neither drops offline holders nor shows
+  them as unchecked.
+- **Objects belong to the files space.** The store holds the blobs of
+  the files space only, so every object served counts as one of its
+  chunks; with more spaces with blobs, objects would need attributing to
+  spaces. Checks count chunks and indexes only: content under 1 KiB lives
+  in entries, which every device holds.

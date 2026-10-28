@@ -126,7 +126,10 @@ pub async fn sync_all(d: &Arc<Daemon>, s: &Session) {
 async fn handle_stream(d: &Arc<Daemon>, s: &Session, mut st: Stream) -> anyhow::Result<()> {
     if st.service() == Service::BLOB {
         tracing::trace!("blob stream {} accepted", st.id());
-        return serve_blob(d, st).await;
+        return serve_blob(d, s, st).await;
+    }
+    if st.service() == crate::speedtest::service() && crate::speedtest::offered() {
+        return crate::speedtest::serve(d, s, st).await;
     }
     let kind = d.classify(s);
     if st.service() != Service::SYNC {
@@ -368,18 +371,22 @@ fn test_blob_delay() -> Option<u64> {
     })
 }
 
-async fn serve_blob(d: &Arc<Daemon>, mut st: Stream) -> anyhow::Result<()> {
+async fn serve_blob(d: &Arc<Daemon>, s: &Session, mut st: Stream) -> anyhow::Result<()> {
     let Some(v) = st.recv_message_max(1 << 20).await? else {
         return Ok(());
     };
     let req = BlobRequest::decode(&v.encode())?;
     tracing::trace!("serving {} blob objects", req.ids.len());
     let store = d.store.clone();
+    let (d2, peer) = (d.clone(), s.peer_static());
     let reply = tokio::task::spawn_blocking(move || {
-        req.serve(|id| {
+        let reply = req.serve(|id| {
             use cardinal_blob::ObjectStore;
             store.get(id).ok().flatten()
-        })
+        });
+        // Who fetches what, for counting copies (`copies.rs`).
+        d2.copies.observe_serve(&peer, &reply, &store);
+        reply
     })
     .await?;
     let bytes = tokio::task::spawn_blocking(move || reply.encode()).await?;
@@ -394,7 +401,9 @@ async fn serve_blob(d: &Arc<Daemon>, mut st: Stream) -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn blob_request(
+/// Asks one device for objects on the `blob` service: one request, one
+/// reply. Used by fetches and by copy checks alike.
+pub(crate) async fn blob_request(
     s: &Session,
     ids: Vec<[u8; 32]>,
     priority: Priority,
