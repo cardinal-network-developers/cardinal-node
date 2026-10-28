@@ -526,7 +526,24 @@ fn print_devices(devs: &Value) {
         }
         line.push_str(&format!("  [{}]", d["key"].as_str().unwrap_or("")));
         println!("{line}");
+        if let Some(f) = source_line(&d["fetch"]) {
+            println!("      {f}");
+        }
     }
+}
+
+/// `sent 1.1 GB to this device; now 38.0 MB/s, 3 ms` from a device's
+/// `fetch` statistics, if it has sent anything.
+fn source_line(f: &Value) -> Option<String> {
+    if f["replies"].as_u64().unwrap_or(0) == 0 {
+        return None;
+    }
+    Some(format!(
+        "sent {} to this device; now {}/s, {} ms",
+        human_size(f["received"].as_u64().unwrap_or(0)),
+        human_size(f["rate"].as_u64().unwrap_or(0)),
+        f["latency_ms"].as_u64().unwrap_or(0)
+    ))
 }
 
 fn print_status(v: &Value) {
@@ -803,5 +820,17 @@ mod tests {
         );
         let p = json!({"files_pending": 1, "bytes_pending": 500});
         assert_eq!(fetch_line(&p), "fetching 1 file, 500 B left");
+    }
+
+    #[test]
+    fn source_status_line() {
+        let f = serde_json::json!({"rate": 38_000_000u64, "latency_ms": 3,
+            "replies": 412, "received": 1_100_000_000u64});
+        assert_eq!(
+            source_line(&f).unwrap(),
+            "sent 1.1 GB to this device; now 38.0 MB/s, 3 ms"
+        );
+        assert_eq!(source_line(&serde_json::json!({"replies": 0})), None);
+        assert_eq!(source_line(&Value::Null), None);
     }
 }

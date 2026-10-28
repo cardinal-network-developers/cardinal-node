@@ -386,6 +386,7 @@ fn devices(d: &Daemon) -> Vec<Value> {
                     "rate": s.rate as u64,
                     "latency_ms": (s.latency * 1000.0) as u64,
                     "replies": s.samples,
+                    "received": s.bytes_total,
                 })),
             })
         })

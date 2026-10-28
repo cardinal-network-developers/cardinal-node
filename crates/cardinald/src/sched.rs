@@ -71,6 +71,9 @@ pub struct PeerStats {
     pub reply_bytes: f64,
     /// Replies measured.
     pub samples: u64,
+    /// Bytes received from this device since the daemon started,
+    /// including late duplicates of hedged requests.
+    pub bytes_total: u64,
 }
 
 impl PeerStats {
@@ -117,6 +120,7 @@ impl PeerStats {
             self.min_latency = (self.min_latency * 1.02).min(lat);
         }
         self.samples += 1;
+        self.bytes_total += bytes;
     }
 
     /// Throughput over a stretch of time with requests outstanding.
@@ -631,6 +635,7 @@ mod tests {
             min_latency: latency,
             reply_bytes: 1024.0 * 1024.0,
             samples: 10,
+            bytes_total: 0,
         }
     }
 
