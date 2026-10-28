@@ -10,9 +10,15 @@
 //!   keep its link busy: about throughput × best latency, doubled.
 //! - A device new to the scheduler gets a small probe window until it
 //!   has answered.
+//! - New objects are asked in order of their rank (the caller's order),
+//!   then of arrival.
 //! - Objects a device turned out not to have are remembered for a while
 //!   (devices keep fetching) and asked of the others at once. An object
-//!   every live device lacks is reported unavailable.
+//!   every live device lacks is reported unavailable. Before such an
+//!   object goes to a much slower device, a device that lacked it more
+//!   than a moment ago is asked again: devices fetching the same content
+//!   at once then take it from each other rather than all from the slow
+//!   one.
 //! - A request outstanding much longer than its device's typical latency
 //!   is hedged: its ids are asked of another device too, and whichever
 //!   copy arrives first is kept.
@@ -20,13 +26,16 @@
 //! The scheduler does no I/O and takes the time as an argument, so it is
 //! tested on its own; `net.rs` drives it.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::time::{Duration, Instant};
 
 /// An object id.
 pub type Id = [u8; 32];
 /// A device (its link static key).
 pub type Peer = [u8; 32];
+/// Where a new id stands in the queue: lower ranks are asked first, ids
+/// of one rank in the order they came.
+pub type Rank = [u8; 32];
 
 /// Ids per request: 16 chunks of at most 256 KiB.
 pub const BATCH: usize = 16;
@@ -39,6 +48,14 @@ pub const MAX_WINDOW: usize = 12;
 pub const PROBE_WINDOW: usize = 1;
 /// How long a device's "does not have it" is believed.
 pub const LACK_MEMORY: Duration = Duration::from_secs(30);
+/// An object a device lacked longer ago than this is asked of it again
+/// before it goes to a device [`QUICKER`] times slower or more: devices
+/// fetch too, so it may have the object by now, and asking costs a quick
+/// round trip, while a slow source's capacity is best kept for what no
+/// other device has.
+pub const RECHECK_AFTER: Duration = Duration::from_millis(250);
+/// See [`RECHECK_AFTER`] (a ratio of typical latencies).
+pub const QUICKER: f64 = 2.0;
 /// A request is hedged after this many times its device's typical
 /// latency...
 pub const HEDGE_FACTOR: u32 = 4;
@@ -243,7 +260,9 @@ pub struct ReplyOutcome {
 pub struct Scheduler {
     peers: HashMap<Peer, PeerState>,
     order: Vec<Peer>,
-    fresh: VecDeque<Id>,
+    /// Ids not asked yet, by rank and arrival.
+    fresh: BTreeMap<(Rank, u64), Id>,
+    pushed: u64,
     /// Ids to ask again (a device lacked them, or a request failed).
     retry: VecDeque<Id>,
     /// Ids pushed and not yet delivered or given up, with how many
@@ -294,11 +313,19 @@ impl Scheduler {
         self.peers.get(peer).map(|p| p.stats)
     }
 
-    /// Adds an object to fetch (ignored if already wanted).
+    /// Adds an object to fetch, after those added before (ignored if
+    /// already wanted).
     pub fn push(&mut self, id: Id) {
+        self.push_ranked(id, [0; 32]);
+    }
+
+    /// Adds an object to fetch, before those of a higher rank (ignored if
+    /// already wanted).
+    pub fn push_ranked(&mut self, id: Id, rank: Rank) {
         if let std::collections::hash_map::Entry::Vacant(e) = self.wanted.entry(id) {
             e.insert(0);
-            self.fresh.push_back(id);
+            self.fresh.insert((rank, self.pushed), id);
+            self.pushed += 1;
         }
     }
 
@@ -451,10 +478,22 @@ impl Scheduler {
             });
             let mut issued = false;
             for peer in candidates {
-                let ids = self.take_batch(&peer, now);
-                if !ids.is_empty() {
-                    out.push(self.issue(peer, ids, now, false));
+                let (ids, first) = self.take_batch(&peer, now);
+                if let Some((quick, again)) = first {
+                    out.push(self.issue(quick, again, now, false));
                     issued = true;
+                }
+                if !ids.is_empty() {
+                    if self.requests.len() < MAX_TOTAL {
+                        out.push(self.issue(peer, ids, now, false));
+                        issued = true;
+                    } else {
+                        for id in ids.into_iter().rev() {
+                            self.retry.push_front(id);
+                        }
+                    }
+                }
+                if issued {
                     break;
                 }
             }
@@ -466,7 +505,7 @@ impl Scheduler {
         // while making batches), or no device at all.
         self.drop_unreachable(now);
         if !self.peers.values().any(|p| p.live) {
-            while let Some(id) = self.fresh.pop_front() {
+            while let Some((_, id)) = self.fresh.pop_first() {
                 self.give_up(id);
             }
             while let Some(id) = self.retry.pop_front() {
@@ -498,23 +537,43 @@ impl Scheduler {
     }
 
     /// Up to [`BATCH`] ids for `peer`: ids to ask again that it may have,
-    /// then fresh ones.
-    fn take_batch(&mut self, peer: &Peer, now: Instant) -> Vec<Id> {
+    /// then fresh ones. Also up to a batch of ids to ask again of a
+    /// quicker device first (see [`RECHECK_AFTER`]); those are not given
+    /// to `peer` now.
+    fn take_batch(&mut self, peer: &Peer, now: Instant) -> (Vec<Id>, Option<(Peer, Vec<Id>)>) {
         let p = &self.peers[peer];
         let mut ids = Vec::with_capacity(BATCH);
+        let mut first: Option<(Peer, Vec<Id>)> = None;
         if !self.retry.is_empty() {
             let mut keep = VecDeque::with_capacity(self.retry.len());
             while let Some(id) = self.retry.pop_front() {
-                if ids.len() < BATCH && self.wanted.contains_key(&id) && !p.lacks(&id, now) {
-                    ids.push(id);
-                } else if self.wanted.contains_key(&id) {
-                    keep.push_back(id);
+                if !self.wanted.contains_key(&id) {
+                    continue;
                 }
+                if ids.len() < BATCH && !p.lacks(&id, now) {
+                    match self.ask_first(peer, &id, now) {
+                        None => {
+                            ids.push(id);
+                            continue;
+                        }
+                        // asked of the quicker device now, or once it has
+                        // room (it answers soon)
+                        Some((q, true)) => {
+                            let (fq, again) = first.get_or_insert_with(|| (q, Vec::new()));
+                            if *fq == q && again.len() < BATCH {
+                                again.push(id);
+                                continue;
+                            }
+                        }
+                        Some((_, false)) => {}
+                    }
+                }
+                keep.push_back(id);
             }
             self.retry = keep;
         }
         while ids.len() < BATCH {
-            let Some(id) = self.fresh.pop_front() else {
+            let Some((_, id)) = self.fresh.pop_first() else {
                 break;
             };
             if !self.wanted.contains_key(&id) {
@@ -526,7 +585,33 @@ impl Scheduler {
             }
             ids.push(id);
         }
-        ids
+        (ids, first)
+    }
+
+    /// A device to ask for `id` again before `peer`, and whether it has
+    /// room now: one that lacked it longer ago than [`RECHECK_AFTER`] and
+    /// answers sooner than `peer`.
+    fn ask_first(&self, peer: &Peer, id: &Id, now: Instant) -> Option<(Peer, bool)> {
+        let slow = self.peers[peer].stats.latency;
+        let mut found = None;
+        for k in &self.order {
+            let Some(q) = self.peers.get(k).filter(|_| k != peer) else {
+                continue;
+            };
+            if q.live
+                && q.stats.samples > 0
+                && q.stats.latency * QUICKER < slow
+                && q.lacks
+                    .get(id)
+                    .is_some_and(|t| now.saturating_duration_since(*t) >= RECHECK_AFTER)
+            {
+                if q.has_room() {
+                    return Some((*k, true));
+                }
+                found = Some((*k, false));
+            }
+        }
+        found
     }
 
     /// The next time [`poll`](Self::poll) may hedge a request.
@@ -850,6 +935,46 @@ mod tests {
         }
         assert!(s.poll(now).is_empty());
         assert_eq!(s.take_unavailable(), vec![id(1)]);
+    }
+
+    #[test]
+    fn ranked_ids_go_lowest_rank_first() {
+        let mut s = Scheduler::new();
+        s.set_peers(&[(A, measured(50e6, 0.02))]);
+        let n = BATCH as u32;
+        for i in 0..n {
+            s.push_ranked(id(100 + i), [9; 32]);
+        }
+        for i in 0..n {
+            s.push_ranked(id(i), [1; 32]);
+        }
+        let r = s.poll(Instant::now());
+        assert_eq!(r.len(), 2);
+        assert_eq!(r[0].ids, (0..n).map(id).collect::<Vec<_>>());
+        assert_eq!(r[1].ids, (100..100 + n).map(id).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn a_quick_device_is_asked_again_before_a_slow_one() {
+        let t0 = Instant::now();
+        let mut s = Scheduler::new();
+        // A: a slow source; B: a quick device fetching the same content.
+        s.set_peers(&[(A, measured(5e6, 0.5)), (B, measured(50e6, 0.01))]);
+        s.push(id(1));
+        let r = s.poll(t0);
+        assert_eq!((r.len(), r[0].peer), (1, B));
+        s.reply(r[0].id, &[], 0, t0);
+        // A while later, B may have it by now: asked again, not A.
+        let t1 = t0 + Duration::from_secs(1);
+        let r = s.poll(t1);
+        assert_eq!((r.len(), r[0].peer), (1, B), "{r:?}");
+        // It still lacks it: A is asked at once.
+        s.reply(r[0].id, &[], 0, t1);
+        let r = s.poll(t1);
+        assert_eq!((r.len(), r[0].peer), (1, A), "{r:?}");
+        let out = s.reply(r[0].id, &[id(1)], 100, t1 + Duration::from_millis(500));
+        assert_eq!(out.accepted, vec![id(1)]);
+        assert!(s.is_idle());
     }
 
     #[test]

@@ -13,6 +13,7 @@ use cardinal_space::Space;
 
 use crate::daemon::Daemon;
 use crate::net::{BlobEvent, BlobFetch};
+use crate::sched::Rank;
 
 /// Fetches objects from this person's online devices, blocking. Used by
 /// [`BlobReader`] from threads outside the runtime.
@@ -160,8 +161,8 @@ async fn sample_rate(d: Arc<Daemon>) {
 /// What the lister found about one file.
 enum Listed {
     /// Its objects not in the store yet: chunk ids with their plaintext
-    /// lengths (0 for indexes).
-    Missing(usize, Vec<([u8; 32], u64)>),
+    /// lengths (0 for indexes) and ranks.
+    Missing(usize, Vec<([u8; 32], u64, Rank)>),
     /// Its indexes could not be fetched.
     Failed(usize),
 }
@@ -171,6 +172,45 @@ struct FileState {
     /// Objects still missing.
     remaining: usize,
     failed: bool,
+}
+
+/// The background fetch goes in runs of about this much content (64
+/// chunks of average size, four requests): a few consecutive small files,
+/// or consecutive chunks of a larger file.
+const RUN_BYTES: u64 = 4 << 20;
+
+/// Splits `items`, in their natural order, into runs of about
+/// [`RUN_BYTES`] (an item that large is a run alone), each with this
+/// device's rank for it: the hash of the run's first id keyed by this
+/// device's key. See [`pass`].
+fn ranked_runs<T>(
+    key: &[u8; 32],
+    items: Vec<T>,
+    id: impl Fn(&T) -> [u8; 32],
+    size: impl Fn(&T) -> u64,
+) -> Vec<(Rank, Vec<T>)> {
+    let mut runs: Vec<Vec<T>> = Vec::new();
+    let mut run: Vec<T> = Vec::new();
+    let mut bytes = 0u64;
+    for item in items {
+        let n = size(&item);
+        if n >= RUN_BYTES && !run.is_empty() {
+            runs.push(std::mem::take(&mut run));
+            bytes = 0;
+        }
+        bytes += n;
+        run.push(item);
+        if bytes >= RUN_BYTES {
+            runs.push(std::mem::take(&mut run));
+            bytes = 0;
+        }
+    }
+    if !run.is_empty() {
+        runs.push(run);
+    }
+    runs.into_iter()
+        .map(|r| (*blake3::keyed_hash(key, &id(&r[0])).as_bytes(), r))
+        .collect()
 }
 
 /// Files listed ahead of the fetch, at most (bounds memory).
@@ -186,6 +226,21 @@ const PUTS: usize = 6;
 /// requests for several files are in flight together, writes them to the
 /// store, and syncs the store in the background. A file counts as
 /// complete only after a sync that covers all of its objects.
+///
+/// The order is this device's own: the content is split into runs of
+/// about [`RUN_BYTES`] (a few consecutive small files, or part of a larger
+/// file) ranked by a hash keyed by this device's key. Files are listed in
+/// the order of their groups' ranks, and the scheduler asks for the
+/// lowest-ranked run it holds first. Devices that fetch the same new
+/// content at the same time thus take different parts of it from the
+/// source, and then much of the rest from each other (the scheduler asks
+/// a quick device again before a slow one), instead of all asking the
+/// source for the same objects at once. A run keeps objects together, so
+/// a device that has one object of a run likely has the rest, and files
+/// complete as they go. The order is stable across passes and restarts,
+/// and costs nothing on disk: objects are stored by hash, so even a file
+/// fetched front to back is scattered there. Reads through the mount
+/// fetch in file order, at interactive priority.
 async fn pass(d: &Arc<Daemon>, complete: &mut HashSet<[u8; 32]>) -> anyhow::Result<()> {
     let (on_demand, pins) = {
         let c = d.config();
@@ -213,10 +268,22 @@ async fn pass(d: &Arc<Daemon>, complete: &mut HashSet<[u8; 32]>) -> anyhow::Resu
         .filter(|(_, b)| seen.insert(b.id))
         .collect();
     let bytes_wanted: u64 = all.iter().map(|(_, b)| b.size).sum();
-    let wanted: Vec<(String, BlobRef)> = all
+    // Groups of small files, and larger files, listed in rank order; each
+    // file with its group's rank.
+    let key = d.keys.key();
+    let mut groups = ranked_runs(
+        &key,
+        all.into_iter()
+            .filter(|(_, b)| !complete.contains(&b.id))
+            .collect(),
+        |(_, b)| b.id,
+        |(_, b)| b.size,
+    );
+    groups.sort_by_key(|g| g.0);
+    let (ranks, wanted): (Vec<Rank>, Vec<(String, BlobRef)>) = groups
         .into_iter()
-        .filter(|(_, b)| !complete.contains(&b.id))
-        .collect();
+        .flat_map(|(rank, files)| files.into_iter().map(move |f| (rank, f)))
+        .unzip();
     {
         let mut pr = lock(&d.progress);
         pr.bytes_wanted = bytes_wanted;
@@ -231,11 +298,11 @@ async fn pass(d: &Arc<Daemon>, complete: &mut HashSet<[u8; 32]>) -> anyhow::Resu
 
     // The lister.
     let (tx, mut rx) = tokio::sync::mpsc::channel::<Listed>(LIST_AHEAD);
-    let refs: Vec<BlobRef> = wanted.iter().map(|(_, b)| *b).collect();
+    let refs: Vec<(BlobRef, Rank)> = wanted.iter().map(|(_, b)| *b).zip(ranks).collect();
     let d2 = d.clone();
     let lister = tokio::task::spawn_blocking(move || {
         let fetcher = Fetcher::new(&d2, Priority::Background);
-        for (i, b) in refs.into_iter().enumerate() {
+        for (i, (b, rank)) in refs.into_iter().enumerate() {
             if *d2.stopping.borrow() {
                 break;
             }
@@ -251,7 +318,16 @@ async fn pass(d: &Arc<Daemon>, complete: &mut HashSet<[u8; 32]>) -> anyhow::Resu
                             missing.push((id, len));
                         }
                     }
-                    Ok(missing)
+                    // A smaller file goes with its group; a larger one
+                    // in runs, each with its own rank.
+                    Ok(if b.size < RUN_BYTES {
+                        missing.into_iter().map(|(id, l)| (id, l, rank)).collect()
+                    } else {
+                        ranked_runs(&key, missing, |(id, _)| *id, |(_, l)| *l)
+                            .into_iter()
+                            .flat_map(|(r, run)| run.into_iter().map(move |(id, l)| (id, l, r)))
+                            .collect()
+                    })
                 });
             let msg = match listed {
                 Ok(m) => Listed::Missing(i, m),
@@ -339,7 +415,7 @@ async fn pass(d: &Arc<Daemon>, complete: &mut HashSet<[u8; 32]>) -> anyhow::Resu
                 }
                 Some(Listed::Missing(i, missing)) => {
                     let size = wanted[i].1.size;
-                    let missing_bytes: u64 = missing.iter().map(|(_, l)| *l).sum();
+                    let missing_bytes: u64 = missing.iter().map(|(_, l, _)| *l).sum();
                     {
                         let mut pr = lock(&d.progress);
                         pr.bytes_pending = pr
@@ -347,7 +423,7 @@ async fn pass(d: &Arc<Daemon>, complete: &mut HashSet<[u8; 32]>) -> anyhow::Resu
                             .saturating_sub(size.saturating_sub(missing_bytes));
                     }
                     let mut n = 0;
-                    for (id, len) in missing {
+                    for (id, len, rank) in missing {
                         match waiting.get_mut(&id) {
                             Some((fs, _)) => {
                                 if !fs.contains(&i) {
@@ -357,7 +433,7 @@ async fn pass(d: &Arc<Daemon>, complete: &mut HashSet<[u8; 32]>) -> anyhow::Resu
                             }
                             None => {
                                 waiting.insert(id, (vec![i], len));
-                                fetch.push(id);
+                                fetch.push_ranked(id, rank);
                                 n += 1;
                             }
                         }
@@ -429,4 +505,54 @@ async fn pass(d: &Arc<Daemon>, complete: &mut HashSet<[u8; 32]>) -> anyhow::Resu
 
 fn hex8(id: &[u8; 32]) -> String {
     id[..4].iter().map(|b| format!("{b:02x}")).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn id(n: u32) -> [u8; 32] {
+        let mut i = [0u8; 32];
+        i[..4].copy_from_slice(&n.to_le_bytes());
+        i
+    }
+
+    fn num(i: &[u8; 32]) -> u32 {
+        u32::from_le_bytes(i[..4].try_into().unwrap())
+    }
+
+    #[test]
+    fn runs_keep_objects_together_in_each_devices_order() {
+        // Ten runs of 64 chunks of 64 KiB.
+        let chunks: Vec<([u8; 32], u64)> = (0..640).map(|n| (id(n), 64 << 10)).collect();
+        let order = |key: [u8; 32]| {
+            let mut runs = ranked_runs(&key, chunks.clone(), |c| c.0, |c| c.1);
+            assert_eq!(runs.len(), 10);
+            for (k, (_, run)) in runs.iter().enumerate() {
+                assert_eq!(run[..], chunks[k * 64..(k + 1) * 64]);
+            }
+            runs.sort_by_key(|r| r.0);
+            runs.iter()
+                .map(|(_, r)| num(&r[0].0) / 64)
+                .collect::<Vec<_>>()
+        };
+        let a = order([1; 32]);
+        assert_eq!(a, order([1; 32]), "the same device, the same order");
+        assert_ne!(a, order([2; 32]), "another device, another order");
+        assert_ne!(a, (0..10).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn small_files_share_a_run_and_large_ones_stand_alone() {
+        const MIB: u64 = 1 << 20;
+        let sizes = [1, 1, 10, 1, 3, 1];
+        let files: Vec<([u8; 32], u64)> = (0..sizes.len())
+            .map(|i| (id(i as u32), sizes[i] * MIB))
+            .collect();
+        let runs: Vec<Vec<u32>> = ranked_runs(&[0; 32], files, |f| f.0, |f| f.1)
+            .into_iter()
+            .map(|(_, r)| r.iter().map(|f| num(&f.0)).collect())
+            .collect();
+        assert_eq!(runs, vec![vec![0, 1], vec![2], vec![3, 4], vec![5]]);
+    }
 }
