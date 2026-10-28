@@ -173,6 +173,24 @@ should eventually be resolved by changing either the code or the spec.
 - `MemSet` keeps sorted blocks of at most 512 ids with lazily rebuilt
   prefix sums, so a range fingerprint costs two binary searches and at
   most a few hundred 256-bit additions at any set size.
+- **Background fetch order** (`cardinald/src/fetch.rs`, `sched.rs`). Each
+  device fetches in its own order, with no coordination and nothing on
+  the wire: the wanted files, in their natural order, are split into runs
+  of about 4 MiB (a few consecutive small files, or about 64 consecutive
+  chunks of a larger file), each ranked by BLAKE3 keyed with the device's
+  signing key over the run's first object id. Files are listed in their
+  groups' rank order and the scheduler asks for the lowest-ranked run it
+  holds first; reads through the mount stay in file order. Devices that
+  fetch the same new content at once then take different parts from the
+  source and much of the rest from each other. That needs fresh "not
+  held" answers: an object a device lacked more than 250 ms ago is asked
+  of it again before it goes to a device at least twice as slow to
+  answer (the 30 s memory alone kept a fast neighbour, asked early while
+  it had nothing, out of a short fetch). With a slow source and two fast
+  devices fetching 84 MiB at once (`cardinal/tests/fetch_order.rs`), the
+  source sent 2.0x the data before and 1.1-1.25x after; the rest is the
+  two devices asking for the same run at about the same time, which
+  matters less the longer the fetch.
 ## Identity (`spec/identity.md`, `model/rules.md`, `model/world.py`)
 
 - **Validity is the model, executed.** `cardinal-identity` embeds a port of

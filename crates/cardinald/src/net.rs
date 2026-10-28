@@ -359,8 +359,9 @@ pub async fn push_identity(s: &Session, label: Label, entries: Vec<Vec<u8>>) -> 
 }
 
 /// For tests: `CARDINAL_TEST_BLOB_DELAY_MS` delays every blob reply this
-/// daemon sends, one reply at a time, to stand in for a slow link (about
-/// one reply, typically 1 MiB, per delay).
+/// daemon sends, one reply at a time and in proportion to its size, to
+/// stand in for a slow link (the delay is per MiB; a reply is typically
+/// about 1 MiB, an index or a "not held" much less).
 fn test_blob_delay() -> Option<u64> {
     static DELAY: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
     *DELAY.get_or_init(|| {
@@ -393,7 +394,8 @@ async fn serve_blob(d: &Arc<Daemon>, s: &Session, mut st: Stream) -> anyhow::Res
     if let Some(ms) = test_blob_delay() {
         static SLOW_LINK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
         let _one_at_a_time = SLOW_LINK.lock().await;
-        tokio::time::sleep(Duration::from_millis(ms)).await;
+        let mib = bytes.len() as f64 / (1 << 20) as f64;
+        tokio::time::sleep(Duration::from_secs_f64(ms as f64 / 1000.0 * mib)).await;
     }
     st.send_message_bytes(&bytes).await?;
     st.shutdown().await?;
@@ -491,9 +493,14 @@ impl BlobFetch {
         }
     }
 
-    /// Adds an id to fetch.
+    /// Adds an id to fetch, after those added before.
     pub fn push(&mut self, id: [u8; 32]) {
         self.sched.push(id);
+    }
+
+    /// Adds an id to fetch, before those of a higher rank.
+    pub fn push_ranked(&mut self, id: [u8; 32], rank: crate::sched::Rank) {
+        self.sched.push_ranked(id, rank);
     }
 
     /// Ids wanted and not received yet.
@@ -565,11 +572,13 @@ impl BlobFetch {
 
     fn done(&mut self, r: BlobDone) {
         let now = Instant::now();
+        let mut received = 0;
         match r.result {
             Ok(reply) => {
                 let got = reply.verified();
                 let ids: Vec<[u8; 32]> = got.iter().map(|(i, _)| *i).collect();
                 let bytes: u64 = got.iter().map(|(_, b)| b.len() as u64).sum();
+                received = bytes;
                 let out = self.sched.reply(r.request, &ids, bytes, now);
                 let keep: HashSet<[u8; 32]> = out.accepted.into_iter().collect();
                 let got: Vec<_> = got.into_iter().filter(|(i, _)| keep.contains(i)).collect();
@@ -582,12 +591,12 @@ impl BlobFetch {
                 self.sched.failed(r.request, now);
             }
         }
-        if let Some(st) = self.sched.stats(&r.peer) {
-            self.d
-                .blob_stats
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .insert(r.peer, st);
+        if let Some(mut st) = self.sched.stats(&r.peer) {
+            let mut all = self.d.blob_stats.lock().unwrap_or_else(|e| e.into_inner());
+            // Estimates are this fetch's latest; the total adds up every
+            // fetch's replies (several run at once, each with its own copy).
+            st.bytes_total = all.get(&r.peer).map_or(0, |s| s.bytes_total) + received;
+            all.insert(r.peer, st);
         }
     }
 

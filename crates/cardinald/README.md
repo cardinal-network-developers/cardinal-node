@@ -108,7 +108,9 @@ Over `sync.md`, with one stream per request:
   window per device of about throughput × best latency, doubled (a new
   device gets one request as a probe). An object a device does not have is
   remembered for 30 s and asked of the others at once; it is unavailable
-  only when every online device lacks it. A request outstanding more than
+  only when every online device lacks it. Before such an object goes to a
+  device at least twice as slow to answer, a device that lacked it more
+  than 250 ms ago is asked again (it may be fetching the same content). A request outstanding more than
   4× its device's typical latency (at least 0.75 s) is hedged: its ids are
   asked of another device too and the first copy wins. At most 24
   requests are in flight (replies are ≤ 4 MiB, typically ~1 MiB), and a
@@ -122,7 +124,12 @@ Over `sync.md`, with one stream per request:
   chunks of many files share one `BlobFetch`, received objects are written
   by a few blocking tasks, and the store is synced in the background, one
   sync covering everything written before it. A file counts as complete
-  only after a sync that covers all its objects. If some objects are on no
+  only after a sync that covers all its objects. Each device fetches in
+  its own order: runs of about 4 MiB (a few consecutive small files, or
+  part of a larger file) ranked by BLAKE3 keyed with the device's key over
+  the run's first object id. Devices fetching the same new content at once
+  thus take different parts from the source and most of the rest from
+  each other, without coordinating. If some objects are on no
   online device, the pass ends with an error and is retried after a change,
   when a device comes online, or after 10 s. `cardinal status` shows files
   pending, bytes missing (files not examined yet count in full), the total
