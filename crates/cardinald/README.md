@@ -14,7 +14,7 @@ devices, one synced folder).
 | data (keys, logs, chunks) | `$CARDINAL_HOME`, else `$CARDINAL_DATA_DIR` (set by the systemd unit), else `$XDG_DATA_HOME/cardinal`, else `~/.local/share/cardinal` |
 | settings | `config.toml`, table `[daemon]`, in `$CARDINAL_HOME`, else `$CARDINAL_CONFIG_DIR`, else `$XDG_CONFIG_HOME/cardinal`, else `~/.config/cardinal`. `[update]` belongs to `cardinal-update`; saving keeps the other tables and their comments |
 | control socket | `$CARDINAL_SOCKET`, else `$XDG_RUNTIME_DIR/cardinal.sock` (or `cardinal-<dir>-<hash>.sock` when `CARDINAL_HOME` is set, so two devices can run on one machine), else `<data>/control.sock`; mode 0600 |
-| mount | `~/Cardinal` by default (`[daemon] mount`; `""` for none) |
+| mount | `~/Cardinal` by default (`[daemon] mount`; `""` for none, which `cardinal unmount` saves). Without a usable `/dev/fuse` (containers) the daemon says so once and syncs without a mount |
 
 In the data directory:
 
@@ -92,11 +92,32 @@ Over `sync.md`, with one stream per request:
   genesis just arrived, rebuilds the space from scratch (one evaluation
   instead of one per concurrent entry).
 - Blobs: chunks and indexes are fetched by id on the `blob` service in
-  requests of 16 ids, 4 in flight per device; a request unanswered for
-  20 s is retried (up to 3 rounds over the online devices). **On demand** when a file is read through the mount
-  (interactive priority), and **in the background** for every blob named
-  by current state (all versions of files in conflict) under `full`
-  retention, or for pinned paths under `on-demand`.
+  requests of 16 ids, from **all** online devices at once (`sched.rs`, a
+  pure scheduler driven by `net.rs::BlobFetch`). Per device it keeps a
+  decaying estimate of throughput and latency (kept across fetches), and
+  gives each request to the device expected to finish it first, with a
+  window per device of about throughput × best latency, doubled (a new
+  device gets one request as a probe). An object a device does not have is
+  remembered for 30 s and asked of the others at once; it is unavailable
+  only when every online device lacks it. A request outstanding more than
+  4× its device's typical latency (at least 0.75 s) is hedged: its ids are
+  asked of another device too and the first copy wins. At most 24
+  requests are in flight (replies are ≤ 4 MiB, typically ~1 MiB), and a
+  request unanswered for 20 s fails (three failures in a row leave the
+  device out until it reconnects). **On demand** when a file is read
+  through the mount (interactive priority), and **in the background** for
+  every blob named by current state (all versions of files in conflict)
+  under `full` retention, or for pinned paths under `on-demand`.
+- The background fetch (`fetch.rs`) is a pipeline: a blocking task walks
+  the files' indexes (fetching them) ahead of the transfer, the missing
+  chunks of many files share one `BlobFetch`, received objects are written
+  by a few blocking tasks, and the store is synced in the background, one
+  sync covering everything written before it. A file counts as complete
+  only after a sync that covers all its objects. If some objects are on no
+  online device, the pass ends with an error and is retried after a change,
+  when a device comes online, or after 10 s. `cardinal status` shows files
+  pending, bytes missing (files not examined yet count in full), the total
+  wanted, and the rate over the last 5 s.
 
 Connections: every 2 s, each own device that is not connected is tried at
 its known addresses (from pairing, LAN discovery, earlier connections, and

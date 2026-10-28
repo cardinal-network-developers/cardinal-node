@@ -238,6 +238,8 @@ pub(crate) struct EndpointInner {
     tasks: Mutex<Vec<AbortHandle>>,
     closed: AtomicBool,
     weak: Weak<EndpointInner>,
+    /// Sessions with readers to wake at the end of a carrier batch.
+    deferred: Mutex<Vec<Arc<SessionInner>>>,
 }
 
 /// Forwards carrier packets to the endpoint without keeping it alive.
@@ -247,6 +249,15 @@ impl Ingress for WeakIngress {
     fn ingress(&self, packet: &mut [u8], path: &Path) {
         if let Some(ep) = self.0.upgrade() {
             ep.handle_packet(packet, path);
+        }
+    }
+
+    fn flush(&self) {
+        if let Some(ep) = self.0.upgrade() {
+            let list = std::mem::take(&mut *lock(&ep.deferred));
+            for s in list {
+                s.flush_wakes();
+            }
         }
     }
 }
@@ -309,6 +320,7 @@ impl Endpoint {
             tasks: Mutex::new(Vec::new()),
             closed: AtomicBool::new(false),
             weak: weak.clone(),
+            deferred: Mutex::new(Vec::new()),
         });
         if let Some(u) = udp {
             let h = spawn_udp(u, Arc::new(WeakIngress(Arc::downgrade(&inner))));
@@ -620,7 +632,12 @@ impl EndpointInner {
                 let idx = packet::read_u32(pkt, 4);
                 let s = lock(&self.state).sessions.get(&idx).cloned();
                 if let Some(s) = s {
-                    s.recv(pkt, path);
+                    if s.recv(pkt, path) {
+                        let mut d = lock(&self.deferred);
+                        if !d.iter().any(|x| Arc::ptr_eq(x, &s)) {
+                            d.push(s);
+                        }
+                    }
                 }
             }
             packet::TYPE_INITIATION => self.on_initiation(pkt, path),

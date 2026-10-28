@@ -509,3 +509,67 @@ async fn reconnect_replaces_and_simultaneous_resolves() {
     assert_eq!(ea.sessions().iter().filter(|s| !s.is_closed()).count(), 1);
     assert_eq!(eb.sessions().iter().filter(|s| !s.is_closed()).count(), 1);
 }
+
+/// Many request/reply streams at once, as blob fetching does: every
+/// request must be answered promptly (a flow-control credit leak used to
+/// starve the session after a while).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn many_request_streams() {
+    let (ea, eb, _a, b) = two(|_| {}).await;
+    let target = Target::new(eb.tcp_addr().unwrap(), CarrierKind::Tcp, b.key.public_key());
+    let (sa, sb) = tokio::join!(ea.connect(target), eb.accept());
+    let (sa, sb) = (sa.unwrap(), sb.unwrap());
+    let sb2 = sb.clone();
+    // Server: reads a request (a length), answers that many bytes.
+    let server = tokio::spawn(async move {
+        while let Some(mut st) = sb.accept_stream().await {
+            tokio::spawn(async move {
+                let mut len = [0u8; 4];
+                if st.read_exact(&mut len).await.is_err() {
+                    return;
+                }
+                let n = u32::from_le_bytes(len) as usize;
+                let _ = st.write_all(&vec![7u8; n]).await;
+                let _ = st.shutdown().await;
+            });
+        }
+    });
+    let total = if cfg!(debug_assertions) { 300 } else { 2000 };
+    let mut set = tokio::task::JoinSet::new();
+    let mut done = 0;
+    let mut i = 0u32;
+    while done < total {
+        while set.len() < 8 && i < total as u32 {
+            let s = sa.clone();
+            // Some requests are abandoned after part of the reply, as a
+            // timed-out request is.
+            let abandon = i % 5 == 3;
+            let n = 300_000 + (i % 7) * 50_000;
+            i += 1;
+            set.spawn(async move {
+                let mut st = s.open_stream(Service::BLOB, Priority::Background).unwrap();
+                st.write_all(&n.to_le_bytes()).await.unwrap();
+                if abandon {
+                    // drop after part of the reply, the rest in flight
+                    let mut part = vec![0u8; 100_000];
+                    st.read_exact(&mut part).await.unwrap();
+                    return;
+                }
+                st.shutdown().await.unwrap();
+                let mut got = Vec::new();
+                st.read_to_end(&mut got).await.unwrap();
+                assert_eq!(got.len(), n as usize);
+            });
+        }
+        let Ok(r) = tokio::time::timeout(Duration::from_secs(10), set.join_next()).await else {
+            panic!(
+                "a request stalled\nclient:\n{}\nserver:\n{}",
+                sa.debug_flow(),
+                sb2.debug_flow()
+            );
+        };
+        r.unwrap().unwrap();
+        done += 1;
+    }
+    server.abort();
+}

@@ -473,6 +473,39 @@ Not implemented yet (the next milestone):
   poly1305_backend="soft"'` makes sealing a 1200-byte packet about twice as
   fast. Worth revisiting before tuning anything else.
 
+- **Spec ambiguity: flow control of a reset stream.** The `reset` frame
+  carries no final size (QUIC's RESET_STREAM does), so a receiver that
+  resets a stream cannot tell how much more data the peer sent before it
+  saw the reset. That data counts against the peer's session credit; if the
+  receiver drops it without counting it, the credit leaks away and the
+  session eventually stalls. Chosen without a wire
+  change: a stream reset locally is kept until the peer's `fin` or `reset`
+  arrives, and data arriving for it meanwhile is counted as received and
+  consumed; a side that receives a `reset` while it was still sending
+  answers with a `reset` of its own, so the other side knows the last of
+  the data has arrived. On reliable carriers this is exact. On UDP, data
+  lost before the reset is never resent and its credit is still lost.
+  Suggest: give `reset` a final-size field.
+- **Reading: streams whose first frames arrive out of order.** `link.md`
+  does not say whether a frame for a peer stream id below the highest one
+  seen, never seen before, opens that stream or belongs to one that ended.
+  Streams get ids when opened but send when written, so a later stream
+  often writes first. This implementation used to drop such frames as
+  belonging to an ended stream: the request on that stream was lost, and
+  the blob fetcher waited for its 20 s timeout (the stalls seen while
+  syncing a large folder). Chosen, as QUIC: a new id opens every lower
+  unseen id of the peer's parity; their first frames are accepted later.
+- **Deferred reader wake-ups.** A stream reader waiting for more than is
+  ready is woken once 32 KiB (or what it asked for) is ready, at the end
+  of the stream, or when the carrier has passed on every packet it has
+  buffered, not on every packet. Local only.
+- Per-packet cost, measured again (same machine, loaded by parallel
+  builds): sealing a 64-byte packet takes 5.2 µs with the AVX2 Poly1305
+  backend and 1.3 µs with the soft one; a 1200-byte packet 9.2 vs 7.8 µs;
+  the session core alone moves 52 MB/s vs 61 MB/s. The soft backend is
+  still not forced (it is a global build flag and slows the large-message
+  AEAD of blob chunks).
+
 ## Daemon, mount, and CLI (`cardinald`, `cardinal`)
 
 - **Spec ambiguity: a node cannot be named in the entry that creates it.**
@@ -533,3 +566,12 @@ Not implemented yet (the next milestone):
 - **A file edited here and deleted elsewhere, unseen,** is created again as
   a new node rather than kept as a delete conflict of the old one (as
   before); nothing is lost, but its history starts over.
+- **Spec ambiguity: a device that refuses a blob request.** `sync.md`
+  lets a device refuse requests over its rate limits but gives no reply for
+  "busy", only "not held". The fetcher treats "not held" as "this device
+  lacks it" for 30 s and asks the others; a refusal by silence ends in the
+  20 s timeout. Suggest a "busy, retry later" item.
+- **Choosing which device to ask for blobs** is local policy (`sched.rs`):
+  per-device throughput and latency estimates, work in proportion to
+  throughput, hedged requests when a device is slow. A hedge makes a
+  second device send the same objects; the spec does not limit this.

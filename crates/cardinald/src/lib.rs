@@ -17,6 +17,7 @@ pub mod keys;
 pub mod net;
 pub mod pair;
 pub mod paths;
+pub mod sched;
 pub mod setup;
 
 pub use config::Config;
