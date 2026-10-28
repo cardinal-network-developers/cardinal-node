@@ -629,3 +629,31 @@ fn core_throughput() {
     let secs = start.elapsed().as_secs_f64();
     println!("core: {:.1} MB/s", total as f64 / secs / 1e6);
 }
+
+#[test]
+fn streams_whose_frames_arrive_out_of_order() {
+    let mut p = pair();
+    p.pump();
+    // A opens two streams; the later one writes first.
+    let s1 =
+        p.a.open_stream(Service::BLOB, Priority::Background)
+            .unwrap();
+    let s2 =
+        p.a.open_stream(Service::BLOB, Priority::Background)
+            .unwrap();
+    write_all(&mut p.a, s2, b"second");
+    p.pump();
+    write_all(&mut p.a, s1, b"first");
+    p.a.stream_finish(s1);
+    p.pump();
+    let mut got = Vec::new();
+    while let Some((id, _, _)) = p.b.accept_stream() {
+        got.push((id, read_all(&mut p.b, id)));
+    }
+    got.sort();
+    assert_eq!(
+        got,
+        vec![(s1, b"first".to_vec()), (s2, b"second".to_vec())],
+        "the earlier stream is not taken for one that ended"
+    );
+}

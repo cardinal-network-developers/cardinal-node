@@ -261,8 +261,8 @@ async fn handle(d: &Arc<Daemon>, req: &Value) -> anyhow::Result<Value> {
                 if d2.core().files_id().is_none() {
                     return Ok(());
                 }
-                if let Err(e) = crate::fs::available() {
-                    anyhow::bail!("cannot mount: {e}");
+                if let Err(e) = crate::daemon::fuse_usable() {
+                    anyhow::bail!("cannot mount: FUSE is not available here ({e})");
                 }
                 d2.ensure_mounted();
                 if d2.mount.lock().unwrap_or_else(|e| e.into_inner()).is_none() {
@@ -357,6 +357,11 @@ fn devices(d: &Daemon) -> Vec<Value> {
     };
     let me = d.keys.key();
     let book = d.book.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    let stats = d
+        .blob_stats
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
     let mut v: Vec<Value> = st
         .keys
         .values()
@@ -376,6 +381,12 @@ fn devices(d: &Daemon) -> Vec<Value> {
                 "this": k.key == me,
                 "online": online,
                 "addr": if k.key == me { None } else { addr },
+                // what this device's fetcher thinks of it as a source
+                "fetch": x.and_then(|x| stats.get(&x)).map(|s| json!({
+                    "rate": s.rate as u64,
+                    "latency_ms": (s.latency * 1000.0) as u64,
+                    "replies": s.samples,
+                })),
             })
         })
         .collect();
@@ -448,6 +459,7 @@ fn status(d: &Arc<Daemon>) -> Value {
         "files_ready": files.is_some(),
         "mount": cfg.mount.as_ref().map(|p| p.display().to_string()),
         "mounted": mounted,
+        "mount_unavailable": d.mount_unavailable.lock().unwrap_or_else(|e| e.into_inner()).clone(),
         "pending_changes": pending,
         "retention": cfg.retention,
         "conflicts": conflicts,

@@ -12,9 +12,9 @@
 //!
 //! On the `blob` service, one request and one reply per stream.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use cardinal_encoding::Value;
 use cardinal_link::{Priority, Service, Session, Stream};
@@ -25,22 +25,17 @@ use tokio::io::AsyncWriteExt;
 
 use crate::core::{short, SetExt};
 use crate::daemon::{Daemon, PeerKind};
+use crate::sched::{PeerStats, Scheduler};
 
 /// Pushed entries larger than this travel as `heads` (`sync.md#when-to-sync`).
 const PUSH_LIMIT: usize = 900;
 /// Largest message accepted on a stream.
 const MAX_MESSAGE: usize = 48 * 1024 * 1024;
-/// Ids per blob request: 16 chunks of at most 256 KiB.
-const BLOB_BATCH: usize = 16;
-/// Blob requests in flight per peer.
-const BLOB_PARALLEL: usize = 4;
 /// How long one request may take.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
 /// How long one blob request (at most 4 MiB) may take before it is
 /// retried.
 const BLOB_TIMEOUT: Duration = Duration::from_secs(20);
-/// Rounds over the online devices before giving up on some ids.
-const BLOB_ROUNDS: usize = 3;
 
 fn to_value(m: &Message) -> Value {
     Value::Record(m.to_record())
@@ -360,6 +355,19 @@ pub async fn push_identity(s: &Session, label: Label, entries: Vec<Vec<u8>>) -> 
     Ok(())
 }
 
+/// For tests: `CARDINAL_TEST_BLOB_DELAY_MS` delays every blob reply this
+/// daemon sends, one reply at a time, to stand in for a slow link (about
+/// one reply, typically 1 MiB, per delay).
+fn test_blob_delay() -> Option<u64> {
+    static DELAY: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    *DELAY.get_or_init(|| {
+        std::env::var("CARDINAL_TEST_BLOB_DELAY_MS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .filter(|ms| *ms > 0)
+    })
+}
+
 async fn serve_blob(d: &Arc<Daemon>, mut st: Stream) -> anyhow::Result<()> {
     let Some(v) = st.recv_message_max(1 << 20).await? else {
         return Ok(());
@@ -374,9 +382,13 @@ async fn serve_blob(d: &Arc<Daemon>, mut st: Stream) -> anyhow::Result<()> {
         })
     })
     .await?;
-    let bytes = reply.encode();
-    let v = cardinal_encoding::decode(&bytes)?;
-    st.send_message(&v).await?;
+    let bytes = tokio::task::spawn_blocking(move || reply.encode()).await?;
+    if let Some(ms) = test_blob_delay() {
+        static SLOW_LINK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+        let _one_at_a_time = SLOW_LINK.lock().await;
+        tokio::time::sleep(Duration::from_millis(ms)).await;
+    }
+    st.send_message_bytes(&bytes).await?;
     st.shutdown().await?;
     tracing::trace!("blob stream {} served {} bytes", st.id(), bytes.len());
     Ok(())
@@ -386,21 +398,18 @@ async fn blob_request(
     s: &Session,
     ids: Vec<[u8; 32]>,
     priority: Priority,
-) -> anyhow::Result<Vec<([u8; 32], Vec<u8>)>> {
+) -> anyhow::Result<BlobReply> {
     let req = BlobRequest { ids };
     let mut st = s.open_stream(Service::BLOB, priority)?;
     st.send_message(&cardinal_encoding::decode(&req.encode())?)
         .await?;
     st.shutdown().await?;
     tracing::trace!("blob request on stream {}", st.id());
-    let v = tokio::time::timeout(BLOB_TIMEOUT, st.recv_message_max(MAX_MESSAGE))
+    let body = tokio::time::timeout(BLOB_TIMEOUT, st.recv_message_bytes_max(MAX_MESSAGE))
         .await
         .map_err(|_| anyhow::anyhow!("timed out"))??
         .ok_or_else(|| anyhow::anyhow!("no reply"))?;
-    let reply = BlobReply::decode(&v.encode())?;
-    let got = reply.verified();
-    tracing::trace!("got {} blob objects", got.len());
-    Ok(got)
+    Ok(BlobReply::decode(&body)?)
 }
 
 /// Fetches chunks and indexes from this person's online devices. Returns
@@ -410,56 +419,205 @@ pub async fn fetch_blobs(
     ids: &[[u8; 32]],
     priority: Priority,
 ) -> Vec<([u8; 32], Vec<u8>)> {
-    let mut remaining: Vec<[u8; 32]> = {
-        let mut seen = HashSet::new();
-        ids.iter().filter(|i| seen.insert(**i)).copied().collect()
-    };
-    let mut out = Vec::new();
-    for round in 0..BLOB_ROUNDS {
-        let sessions = d.own_sessions();
-        tracing::trace!(
-            "fetching {} objects from {} devices (round {round})",
-            remaining.len(),
-            sessions.len()
-        );
-        let mut any_failed = false;
-        for s in sessions {
-            if remaining.is_empty() {
-                break;
-            }
-            let mut set = tokio::task::JoinSet::new();
-            let mut batches = remaining.chunks(BLOB_BATCH).map(|c| c.to_vec());
-            let mut failures = 0;
-            loop {
-                while set.len() < BLOB_PARALLEL && failures < 3 {
-                    let Some(b) = batches.next() else { break };
-                    let s2 = s.clone();
-                    set.spawn(async move { blob_request(&s2, b, priority).await });
-                }
-                let Some(r) = set.join_next().await else {
-                    break;
-                };
-                match r {
-                    Ok(Ok(items)) => out.extend(items),
-                    Ok(Err(e)) => {
-                        tracing::debug!("blob request to {}: {e:#}", short(&s.peer_static()));
-                        failures += 1;
-                        any_failed = true;
-                    }
-                    Err(_) => {
-                        failures += 1;
-                        any_failed = true;
-                    }
-                }
-            }
-            let got: HashSet<[u8; 32]> = out.iter().map(|(i, _)| *i).collect();
-            remaining.retain(|i| !got.contains(i));
+    let mut f = BlobFetch::new(d.clone(), priority);
+    let mut seen = HashSet::new();
+    for id in ids {
+        if seen.insert(*id) {
+            f.push(*id);
         }
-        if remaining.is_empty() || !any_failed {
-            break;
+    }
+    let mut out = Vec::new();
+    while let Some(ev) = f.next().await {
+        if let BlobEvent::Got(items) = ev {
+            out.extend(items);
         }
     }
     out
+}
+
+/// What [`BlobFetch::next`] reports.
+#[derive(Debug)]
+pub enum BlobEvent {
+    /// Objects received, verified against their ids.
+    Got(Vec<([u8; 32], Vec<u8>)>),
+    /// Ids that no online device holds (or that every device holding them
+    /// failed to send).
+    Unavailable(Vec<[u8; 32]>),
+}
+
+/// A finished request.
+struct BlobDone {
+    request: u64,
+    peer: [u8; 32],
+    result: anyhow::Result<BlobReply>,
+}
+
+/// Fetches blob objects from all online devices at once, following
+/// [`crate::sched::Scheduler`]: work goes to the devices that are fast
+/// now, objects one device lacks are asked of the others at once, and
+/// slow requests are hedged. Ids can be added while it runs, so a caller
+/// can keep the link busy across files. Per-device estimates live in the
+/// daemon and carry over between fetches.
+pub struct BlobFetch {
+    d: Arc<Daemon>,
+    priority: Priority,
+    sched: Scheduler,
+    sessions: HashMap<[u8; 32], Session>,
+    peers_checked: Option<Instant>,
+    inflight: tokio::task::JoinSet<BlobDone>,
+    ready: VecDeque<BlobEvent>,
+}
+
+impl BlobFetch {
+    /// An empty fetch at `priority`.
+    pub fn new(d: Arc<Daemon>, priority: Priority) -> BlobFetch {
+        BlobFetch {
+            d,
+            priority,
+            sched: Scheduler::new(),
+            sessions: HashMap::new(),
+            peers_checked: None,
+            inflight: tokio::task::JoinSet::new(),
+            ready: VecDeque::new(),
+        }
+    }
+
+    /// Adds an id to fetch.
+    pub fn push(&mut self, id: [u8; 32]) {
+        self.sched.push(id);
+    }
+
+    /// Ids wanted and not received yet.
+    pub fn wanted(&self) -> usize {
+        self.sched.wanted()
+    }
+
+    /// Requests in flight.
+    pub fn in_flight(&self) -> usize {
+        self.inflight.len()
+    }
+
+    /// Whether [`next`](Self::next) has nothing left to report.
+    pub fn is_idle(&self) -> bool {
+        self.sched.is_idle() && self.inflight.is_empty() && self.ready.is_empty()
+    }
+
+    fn refresh_peers(&mut self) {
+        if self
+            .peers_checked
+            .is_some_and(|t| t.elapsed() < Duration::from_millis(500))
+        {
+            return;
+        }
+        self.peers_checked = Some(Instant::now());
+        let sessions = self.d.own_sessions();
+        let stats = self.d.blob_stats.lock().unwrap_or_else(|e| e.into_inner());
+        let peers: Vec<([u8; 32], PeerStats)> = sessions
+            .iter()
+            .map(|s| {
+                let k = s.peer_static();
+                (k, stats.get(&k).copied().unwrap_or_default())
+            })
+            .collect();
+        drop(stats);
+        self.sched.set_peers(&peers);
+        self.sessions = sessions.into_iter().map(|s| (s.peer_static(), s)).collect();
+    }
+
+    fn start_requests(&mut self) {
+        self.refresh_peers();
+        for r in self.sched.poll(Instant::now()) {
+            let Some(s) = self.sessions.get(&r.peer).cloned() else {
+                self.sched.failed(r.id, Instant::now());
+                continue;
+            };
+            if r.hedge {
+                tracing::debug!(
+                    "asking {} too for {} objects (slow request)",
+                    short(&r.peer),
+                    r.ids.len()
+                );
+            }
+            let priority = self.priority;
+            self.inflight.spawn(async move {
+                let result = blob_request(&s, r.ids, priority).await;
+                BlobDone {
+                    request: r.id,
+                    peer: r.peer,
+                    result,
+                }
+            });
+        }
+        let gone = self.sched.take_unavailable();
+        if !gone.is_empty() {
+            self.ready.push_back(BlobEvent::Unavailable(gone));
+        }
+    }
+
+    fn done(&mut self, r: BlobDone) {
+        let now = Instant::now();
+        match r.result {
+            Ok(reply) => {
+                let got = reply.verified();
+                let ids: Vec<[u8; 32]> = got.iter().map(|(i, _)| *i).collect();
+                let bytes: u64 = got.iter().map(|(_, b)| b.len() as u64).sum();
+                let out = self.sched.reply(r.request, &ids, bytes, now);
+                let keep: HashSet<[u8; 32]> = out.accepted.into_iter().collect();
+                let got: Vec<_> = got.into_iter().filter(|(i, _)| keep.contains(i)).collect();
+                if !got.is_empty() {
+                    self.ready.push_back(BlobEvent::Got(got));
+                }
+            }
+            Err(e) => {
+                tracing::debug!("blob request to {}: {e:#}", short(&r.peer));
+                self.sched.failed(r.request, now);
+            }
+        }
+        if let Some(st) = self.sched.stats(&r.peer) {
+            self.d
+                .blob_stats
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(r.peer, st);
+        }
+    }
+
+    /// The next objects received, or ids found unavailable; `None` once
+    /// everything pushed has been reported.
+    pub async fn next(&mut self) -> Option<BlobEvent> {
+        loop {
+            if let Some(ev) = self.ready.pop_front() {
+                return Some(ev);
+            }
+            self.start_requests();
+            if let Some(ev) = self.ready.pop_front() {
+                return Some(ev);
+            }
+            if self.inflight.is_empty() {
+                if self.sched.is_idle() {
+                    return None;
+                }
+                // Devices that may have the rest are busy or gone: look
+                // again shortly.
+                self.peers_checked = None;
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                continue;
+            }
+            let deadline = self
+                .sched
+                .next_deadline()
+                .unwrap_or_else(|| Instant::now() + Duration::from_secs(1))
+                .max(Instant::now() + Duration::from_millis(5));
+            tokio::select! {
+                r = self.inflight.join_next() => match r {
+                    Some(Ok(r)) => self.done(r),
+                    Some(Err(e)) => tracing::debug!("blob request task: {e}"),
+                    None => {}
+                },
+                _ = tokio::time::sleep_until(deadline.into()) => {}
+            }
+        }
+    }
 }
 
 /// Whether a set holds every id.

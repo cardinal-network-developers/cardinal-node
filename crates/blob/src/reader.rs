@@ -324,13 +324,37 @@ impl<'f, S: ObjectStore, F: Fetch + ?Sized> BlobReader<'f, S, F> {
         level: u64,
         f: &mut impl FnMut(&Id),
     ) -> Result<(), BlobError> {
-        f(&entry.id);
+        self.walk_entries(entry, level, &mut |e, _| f(&e.id))
+    }
+
+    /// Like [`for_each_object`](Self::for_each_object), with each object's
+    /// entry and whether it is a chunk (its `len` is then the chunk's
+    /// plaintext length).
+    pub fn for_each_entry(
+        &mut self,
+        mut f: impl FnMut(&IndexEntry, bool),
+    ) -> Result<(), BlobError> {
+        let top = self.top();
+        if self.reference.levels == 0 {
+            f(&top, true);
+            return Ok(());
+        }
+        self.walk_entries(top, self.reference.levels - 1, &mut f)
+    }
+
+    fn walk_entries(
+        &mut self,
+        entry: IndexEntry,
+        level: u64,
+        f: &mut impl FnMut(&IndexEntry, bool),
+    ) -> Result<(), BlobError> {
+        f(&entry, false);
         let index = self.indexes(&[entry], level)?.remove(0);
         for child in &index.entries {
             if level == 0 {
-                f(&child.id);
+                f(child, true);
             } else {
-                self.walk_objects(*child, level - 1, f)?;
+                self.walk_entries(*child, level - 1, f)?;
             }
         }
         Ok(())

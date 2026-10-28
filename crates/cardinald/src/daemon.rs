@@ -111,15 +111,34 @@ pub enum PairState {
     Failed(String),
 }
 
+/// Whether a FUSE mount can work here: `/dev/fuse` and `fusermount3`
+/// present, and `/dev/fuse` openable (containers often lack it, or deny
+/// it, and `fusermount3` then fails obscurely).
+pub fn fuse_usable() -> Result<(), String> {
+    crate::fs::available()?;
+    std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open("/dev/fuse")
+        .map(|_| ())
+        .map_err(|e| format!("cannot open /dev/fuse: {e}"))
+}
+
 /// Background fetching progress.
 #[derive(Clone, Debug, Default, Serialize)]
 pub struct Progress {
     /// Files whose content is not all on this device yet.
     pub files_pending: u64,
-    /// Bytes still to fetch (estimated from file sizes).
+    /// Bytes of content this device keeps (its retention's share of the
+    /// current files).
+    pub bytes_wanted: u64,
+    /// Bytes of that content still missing (files not examined yet count
+    /// in full; partly fetched ones only for what they lack).
     pub bytes_pending: u64,
     /// Bytes fetched since the daemon started.
     pub bytes_fetched: u64,
+    /// Bytes per second fetched, over the last few seconds.
+    pub rate: u64,
     /// The last fetch error.
     pub last_error: Option<String>,
 }
@@ -152,8 +171,13 @@ pub struct Daemon {
     pub pairing: Mutex<PairState>,
     /// The mount, if mounted.
     pub mount: Mutex<Option<crate::fs::Mounted>>,
+    /// Why mounting is impossible here (no FUSE), if it is.
+    pub mount_unavailable: Mutex<Option<String>>,
     /// Background fetching.
     pub progress: Mutex<Progress>,
+    /// How fast each device has been sending blob objects
+    /// (`sched.rs`), kept across fetches.
+    pub blob_stats: Mutex<HashMap<[u8; 32], crate::sched::PeerStats>>,
     /// Set when the daemon should stop.
     pub stopping: watch::Sender<bool>,
     next_gen: AtomicU64,
@@ -252,7 +276,9 @@ impl Daemon {
             changed: watch::channel(0).0,
             pairing: Mutex::new(PairState::Idle),
             mount: Mutex::new(None),
+            mount_unavailable: Mutex::new(None),
             progress: Mutex::new(Progress::default()),
+            blob_stats: Mutex::new(HashMap::new()),
             stopping: watch::channel(false).0,
             next_gen: AtomicU64::new(1),
             started: Instant::now(),
@@ -611,6 +637,18 @@ impl Daemon {
         let Some(files) = self.core().files_id() else {
             return;
         };
+        if let Err(why) = fuse_usable() {
+            let mut prev = lock(&self.mount_unavailable);
+            if prev.as_deref() != Some(why.as_str()) {
+                tracing::warn!(
+                    "FUSE is not available here ({why}); syncing without a mount. \
+                     `cardinal unmount` stops trying for good."
+                );
+                *prev = Some(why);
+            }
+            return;
+        }
+        *lock(&self.mount_unavailable) = None;
         match crate::fs::mount(self.clone(), files, &path) {
             Ok(m) => {
                 tracing::info!("mounted your files at {}", path.display());

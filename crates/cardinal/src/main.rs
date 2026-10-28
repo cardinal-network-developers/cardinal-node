@@ -109,7 +109,9 @@ enum Cmd {
         /// The folder.
         path: Option<PathBuf>,
     },
-    /// Stop showing your files in a folder.
+    /// Stop showing your files in a folder, for good (also on later
+    /// starts, until `cardinal mount`): for hosts without FUSE, such as
+    /// containers.
     Unmount,
     /// List the versions of a file.
     History {
@@ -275,6 +277,26 @@ fn human_size(n: u64) -> String {
     } else {
         format!("{x:.1} {}", units[u])
     }
+}
+
+/// `fetching 412 files, 1.8 GB left, 31.0 MB/s` from `progress`.
+fn fetch_line(p: &Value) -> String {
+    let files = p["files_pending"].as_u64().unwrap_or(0);
+    let mut line = format!(
+        "fetching {} file{}, {} left",
+        files,
+        if files == 1 { "" } else { "s" },
+        human_size(p["bytes_pending"].as_u64().unwrap_or(0))
+    );
+    let wanted = p["bytes_wanted"].as_u64().unwrap_or(0);
+    if wanted > 0 {
+        line += &format!(" of {}", human_size(wanted));
+    }
+    let rate = p["rate"].as_u64().unwrap_or(0);
+    if rate > 0 {
+        line += &format!(", {}/s", human_size(rate));
+    }
+    line
 }
 
 fn human_time(ms: Option<u64>) -> String {
@@ -525,6 +547,11 @@ fn print_status(v: &Value) {
     println!("This device: {}", v["name"].as_str().unwrap_or(""));
     match (v["mounted"].as_str(), v["mount"].as_str()) {
         (Some(m), _) => println!("Your files: {m}"),
+        (None, Some(_)) if v["mount_unavailable"].is_string() => println!(
+            "Your files: FUSE is not available here ({}); syncing without a mount \
+             (`cardinal unmount` stops trying)",
+            v["mount_unavailable"].as_str().unwrap_or("")
+        ),
         (None, Some(m)) if v["files_ready"].as_bool() == Some(true) => {
             println!("Your files: not mounted at {m}; see `cardinal log`")
         }
@@ -544,12 +571,7 @@ fn print_status(v: &Value) {
     let p = &v["progress"];
     let files = p["files_pending"].as_u64().unwrap_or(0);
     if files > 0 {
-        println!(
-            "Sync: fetching {} file{} ({} left)",
-            files,
-            if files == 1 { "" } else { "s" },
-            human_size(p["bytes_pending"].as_u64().unwrap_or(0))
-        );
+        println!("Sync: {}", fetch_line(p));
         if let Some(e) = p["last_error"].as_str() {
             println!("      {e}");
         }
@@ -647,7 +669,10 @@ async fn client(cmd: Cmd) -> anyhow::Result<()> {
         }
         Cmd::Unmount => {
             call(&paths, json!({"cmd": "unmount"})).await?;
-            println!("Unmounted. Your files still sync; `cardinal mount` shows them again.");
+            println!(
+                "Unmounted, and the daemon will not mount again (saved as `mount = \"\"` in \
+                 config.toml). Your files still sync; `cardinal mount` shows them again."
+            );
             Ok(())
         }
         Cmd::History { path } => {
@@ -761,5 +786,22 @@ async fn client(cmd: Cmd) -> anyhow::Result<()> {
             Ok(())
         }
         Cmd::Daemon { .. } | Cmd::Deploy(_) => unreachable!("handled in main"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fetch_status_line() {
+        let p = json!({"files_pending": 412, "bytes_pending": 1_800_000_000u64,
+            "bytes_wanted": 2_000_000_000u64, "rate": 31_000_000});
+        assert_eq!(
+            fetch_line(&p),
+            "fetching 412 files, 1.8 GB left of 2.0 GB, 31.0 MB/s"
+        );
+        let p = json!({"files_pending": 1, "bytes_pending": 500});
+        assert_eq!(fetch_line(&p), "fetching 1 file, 500 B left");
     }
 }

@@ -4,7 +4,7 @@
 //! proofs, and paths. The [`Session`](crate::Session) driver and the
 //! carriers move bytes in and out; nothing here performs I/O.
 
-use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::task::{Context, Poll, Waker};
 use std::time::{Duration, Instant};
@@ -30,6 +30,8 @@ use crate::packet::{
 pub const STREAM_WINDOW: u64 = 256 * 1024;
 /// Initial per-session window.
 pub const SESSION_WINDOW: u64 = 1024 * 1024;
+/// A reader waiting for more than this is woken once this much is ready.
+const WAKE_LOWAT: usize = 32 * 1024;
 /// Bytes an application may buffer in one stream before writes wait.
 const SEND_BUFFER: usize = 1024 * 1024;
 /// How long the previous key phase is accepted after a switch.
@@ -248,6 +250,8 @@ struct StreamState {
     recv_max: u64,
     recv_fin: Option<u64>,
     read_waker: Option<Waker>,
+    /// Bytes the reader asked for when it last had to wait.
+    read_want: usize,
     // Lifecycle.
     reset_remote: Option<u64>,
     reset_local: bool,
@@ -271,9 +275,22 @@ impl StreamState {
     }
 
     fn recv_done(&self) -> bool {
-        self.reset_local
-            || self.reset_remote.is_some()
-            || self.recv_fin.is_some_and(|f| self.recv_read >= f)
+        // A stream reset only locally is kept until the peer's fin or
+        // reset arrives: data the peer sent before it learned of the
+        // reset still counts against the session window, so it is
+        // counted as consumed when it arrives (else the peer's credit
+        // leaks away and the session stalls).
+        self.reset_remote.is_some() || self.recv_fin.is_some_and(|f| self.recv_read >= f)
+    }
+
+    /// Everything received so far is discarded; returns how many bytes
+    /// that consumes.
+    fn discard_received(&mut self) -> u64 {
+        let n = self.recv_highest.saturating_sub(self.recv_read);
+        self.recv_read = self.recv_highest;
+        self.recv_ready.clear();
+        self.recv_ooo.clear();
+        n
     }
 }
 
@@ -345,6 +362,8 @@ pub(crate) struct Conn {
     reliable: bool,
     control: VecDeque<Frame>,
     pending_window: HashSet<u64>,
+    /// Readers to wake once the carrier's batch of packets is processed.
+    deferred_wakes: Vec<Waker>,
     sent: BTreeMap<u64, SentPacket>,
     largest_acked: Option<u64>,
     srtt: Option<Duration>,
@@ -359,6 +378,10 @@ pub(crate) struct Conn {
     streams: BTreeMap<u64, StreamState>,
     next_local_stream: u64,
     highest_peer_stream: u64,
+    /// Peer stream ids below the highest seen whose first frame has not
+    /// arrived yet: streams are opened in id order but their frames can
+    /// arrive in any order (a later stream may write first).
+    peer_unopened: BTreeSet<u64>,
     incoming: VecDeque<u64>,
     rr_cursor: [u64; 3],
     session_send_max: u64,
@@ -436,6 +459,7 @@ impl Conn {
             reliable,
             control: VecDeque::new(),
             pending_window: HashSet::new(),
+            deferred_wakes: Vec::new(),
             sent: BTreeMap::new(),
             largest_acked: None,
             srtt: None,
@@ -448,6 +472,7 @@ impl Conn {
             streams: BTreeMap::new(),
             next_local_stream: if p.role == Role::Initiator { 1 } else { 2 },
             highest_peer_stream: 0,
+            peer_unopened: BTreeSet::new(),
             incoming: VecDeque::new(),
             rr_cursor: [0; 3],
             session_send_max: SESSION_WINDOW,
@@ -1073,13 +1098,24 @@ impl Conn {
     }
 
     fn on_reset(&mut self, id: u64, reason: u64) {
+        // A stream reset before any of its data arrived has ended.
+        self.peer_unopened.remove(&id);
         if let Some(s) = self.streams.get_mut(&id) {
             if s.reset_remote.is_none() {
                 s.reset_remote = Some(reason);
-                let unread: u64 = s.recv_ready.iter().map(|b| b.len() as u64).sum();
-                s.recv_ready.clear();
-                s.recv_ooo.clear();
+                // Echo the reset if this side was still sending, so the
+                // peer knows when the last of that data has arrived.
+                let echo = !s.reset_local && !s.fin_sent;
+                let unread = s.discard_received();
                 self.session_consumed += unread;
+                let s = self.streams.get_mut(&id).expect("stream");
+                if echo {
+                    s.reset_local = true;
+                    self.control.push_back(Frame::Reset { id, reason });
+                    self.signals.driver.notify_one();
+                }
+                self.update_session_window();
+                let s = self.streams.get_mut(&id).expect("stream");
                 s.send_buf.clear();
                 s.retx = RangeSet::new();
                 if let Some(w) = s.read_waker.take() {
@@ -1100,8 +1136,29 @@ impl Conn {
         let local_parity = if self.role == Role::Initiator { 1 } else { 0 };
         let is_local = f.id % 2 == local_parity;
         if !self.streams.contains_key(&f.id) {
-            if is_local || f.id <= self.highest_peer_stream {
+            if is_local || (f.id <= self.highest_peer_stream && !self.peer_unopened.contains(&f.id))
+            {
                 return Ok(()); // A stream that has ended.
+            }
+            if f.id > self.highest_peer_stream {
+                let first = if self.highest_peer_stream == 0 {
+                    if f.id % 2 == 1 {
+                        1
+                    } else {
+                        2
+                    }
+                } else {
+                    self.highest_peer_stream + 2
+                };
+                if (f.id - first) / 2 > MAX_INCOMING_STREAMS as u64 {
+                    return Err("stream id skips too many streams");
+                }
+                self.peer_unopened.extend((first..f.id).step_by(2));
+                if self.peer_unopened.len() > MAX_INCOMING_STREAMS {
+                    return Err("too many streams not yet opened");
+                }
+            } else {
+                self.peer_unopened.remove(&f.id);
             }
             let open = self.streams.values().filter(|s| !s.local).count();
             if open >= MAX_INCOMING_STREAMS {
@@ -1109,10 +1166,20 @@ impl Conn {
                     id: f.id,
                     reason: 1,
                 });
-                self.highest_peer_stream = f.id;
-                return Ok(());
+                self.highest_peer_stream = self.highest_peer_stream.max(f.id);
+                // Kept as reset, to count its data against the window.
+                self.streams.insert(
+                    f.id,
+                    StreamState {
+                        reset_local: true,
+                        handle_dropped: true,
+                        announced: true,
+                        ..Default::default()
+                    },
+                );
+                return self.on_stream_frame(f);
             }
-            self.highest_peer_stream = f.id;
+            self.highest_peer_stream = self.highest_peer_stream.max(f.id);
             self.streams.insert(
                 f.id,
                 StreamState {
@@ -1123,7 +1190,27 @@ impl Conn {
             );
         }
         let s = self.streams.get_mut(&f.id).expect("stream");
-        if s.reset_local || s.reset_remote.is_some() {
+        if s.reset_remote.is_some() {
+            return Ok(());
+        }
+        if s.reset_local {
+            // Data sent before the peer saw the reset: consumed at once.
+            let end = f
+                .offset
+                .checked_add(f.data.len() as u64)
+                .ok_or("offset overflow")?;
+            if end > s.recv_highest {
+                let n = end - s.recv_highest;
+                s.recv_highest = end;
+                s.recv_read = end;
+                self.session_recv_total += n;
+                self.session_consumed += n;
+            }
+            if f.fin {
+                s.recv_fin = Some(end);
+            }
+            self.update_session_window();
+            self.gc_streams();
             return Ok(());
         }
         let len = f.data.len() as u64;
@@ -1195,8 +1282,19 @@ impl Conn {
             self.session_consumed += n;
             self.update_session_window();
         } else if readable {
+            // Wake the reader at once if what it asked for (or a good
+            // amount) is ready, or at the end of the stream; otherwise
+            // when the carrier has handed over all it has read
+            // ([`Conn::take_deferred_wakes`]). Waking per packet costs
+            // some 900 task switches per MiB.
+            let ready = s.recv_contig - s.recv_read;
+            let lowat = s.read_want.clamp(1, WAKE_LOWAT) as u64;
             if let Some(w) = s.read_waker.take() {
-                w.wake();
+                if f.fin || ready >= lowat {
+                    w.wake();
+                } else {
+                    self.deferred_wakes.push(w);
+                }
             }
         }
         let s = self.streams.get_mut(&f.id).expect("stream");
@@ -1207,6 +1305,51 @@ impl Conn {
         }
         self.gc_streams();
         Ok(())
+    }
+
+    /// Flow-control state, for diagnosing stalls.
+    pub fn debug_flow(&self) -> String {
+        let mut out = format!(
+            "session: sent {} / max {}; recv total {} consumed {} max {}; control {} pending_window {}\n",
+            self.session_sent,
+            self.session_send_max,
+            self.session_recv_total,
+            self.session_consumed,
+            self.session_recv_max,
+            self.control.len(),
+            self.pending_window.len()
+        );
+        for (id, s) in &self.streams {
+            out += &format!(
+                "  stream {id}: local {} send next {} end {} max {} fin_req {} fin_sent {} | recv read {} contig {} highest {} max {} fin {:?} | reset l {} r {:?} dropped {} waker {}\n",
+                s.local,
+                s.send_next,
+                s.send_end(),
+                s.send_max,
+                s.fin_requested,
+                s.fin_sent,
+                s.recv_read,
+                s.recv_contig,
+                s.recv_highest,
+                s.recv_max,
+                s.recv_fin,
+                s.reset_local,
+                s.reset_remote,
+                s.handle_dropped,
+                s.read_waker.is_some()
+            );
+        }
+        out
+    }
+
+    /// Whether readers wait for [`take_deferred_wakes`](Self::take_deferred_wakes).
+    pub fn has_deferred_wakes(&self) -> bool {
+        !self.deferred_wakes.is_empty()
+    }
+
+    /// Readers whose wake-up was deferred to the end of a carrier batch.
+    pub fn take_deferred_wakes(&mut self) -> Vec<Waker> {
+        std::mem::take(&mut self.deferred_wakes)
     }
 
     fn update_session_window(&mut self) {
@@ -1314,6 +1457,7 @@ impl Conn {
             return Poll::Ready(Err(std::io::ErrorKind::ConnectionAborted.into()));
         }
         s.read_waker = Some(cx.waker().clone());
+        s.read_want = out.remaining();
         Poll::Pending
     }
 
@@ -1376,12 +1520,11 @@ impl Conn {
                 return;
             }
             s.reset_local = true;
-            let unread: u64 = s.recv_ready.iter().map(|b| b.len() as u64).sum();
-            s.recv_ready.clear();
-            s.recv_ooo.clear();
+            let unread = s.discard_received();
             s.send_buf.clear();
             s.retx = RangeSet::new();
             self.session_consumed += unread;
+            self.update_session_window();
             self.control.push_back(Frame::Reset { id, reason });
             self.signals.driver.notify_one();
         }

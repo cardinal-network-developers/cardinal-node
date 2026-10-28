@@ -36,14 +36,24 @@ impl SessionInner {
         self.conn.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// Processes an incoming data packet.
-    pub fn recv(self: &Arc<Self>, pkt: &mut [u8], path: &Path) {
-        let events = {
+    /// Processes an incoming data packet. Returns whether some reader
+    /// waits for [`flush_wakes`](Self::flush_wakes).
+    pub fn recv(self: &Arc<Self>, pkt: &mut [u8], path: &Path) -> bool {
+        let (events, deferred) = {
             let mut c = self.lock();
             c.recv_packet(pkt, path, Instant::now());
-            c.drain_events()
+            (c.drain_events(), c.has_deferred_wakes())
         };
         self.handle_events(events);
+        deferred
+    }
+
+    /// Wakes the readers whose wake-up waited for the end of a batch.
+    pub fn flush_wakes(&self) {
+        let wakers = self.lock().take_deferred_wakes();
+        for w in wakers {
+            w.wake();
+        }
     }
 
     pub fn handle_events(self: &Arc<Self>, events: Vec<ConnEvent>) {
@@ -198,6 +208,12 @@ impl Session {
     /// Why the session closed, if it has.
     pub fn close_reason(&self) -> Option<CloseReason> {
         self.inner.lock().close.clone()
+    }
+
+    /// Flow-control state, for diagnosing stalls.
+    #[doc(hidden)]
+    pub fn debug_flow(&self) -> String {
+        self.inner.lock().debug_flow()
     }
 
     /// Opens a stream for a service.
@@ -383,6 +399,15 @@ impl Stream {
         self.write_all(&out).await
     }
 
+    /// Writes one message already encoded: its length as a varint, then
+    /// `body` (which must be one encoded value).
+    pub async fn send_message_bytes(&mut self, body: &[u8]) -> std::io::Result<()> {
+        let mut prefix = Vec::with_capacity(10);
+        write_varint(body.len() as u64, &mut prefix);
+        self.write_all(&prefix).await?;
+        self.write_all(body).await
+    }
+
     /// Reads one message; `None` at the end of the stream.
     pub async fn recv_message(&mut self) -> std::io::Result<Option<Value>> {
         self.recv_message_max(DEFAULT_MAX_MESSAGE).await
@@ -390,6 +415,18 @@ impl Stream {
 
     /// [`recv_message`](Stream::recv_message) with a size limit.
     pub async fn recv_message_max(&mut self, max: usize) -> std::io::Result<Option<Value>> {
+        match self.recv_message_bytes_max(max).await? {
+            None => Ok(None),
+            Some(body) => decode(&body)
+                .map(Some)
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string())),
+        }
+    }
+
+    /// Reads one message without decoding it: its encoded bytes, for
+    /// callers that decode the record themselves; `None` at the end of
+    /// the stream.
+    pub async fn recv_message_bytes_max(&mut self, max: usize) -> std::io::Result<Option<Vec<u8>>> {
         let mut prefix = Vec::with_capacity(10);
         loop {
             let mut b = [0u8; 1];
@@ -418,9 +455,7 @@ impl Stream {
         }
         let mut body = vec![0u8; len as usize];
         self.read_exact(&mut body).await?;
-        decode(&body)
-            .map(Some)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))
+        Ok(Some(body))
     }
 }
 

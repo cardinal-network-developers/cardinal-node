@@ -12,11 +12,15 @@ pub mod core;
 pub mod daemon;
 pub mod directory;
 pub mod fetch;
+// (`fs/` is being changed on another branch; this lint, new in clippy
+// 1.95, is silenced here rather than there.)
+#[allow(clippy::len_without_is_empty)]
 pub mod fs;
 pub mod keys;
 pub mod net;
 pub mod pair;
 pub mod paths;
+pub mod sched;
 pub mod setup;
 
 pub use config::Config;

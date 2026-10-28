@@ -33,6 +33,10 @@ pub enum CarrierKind {
 /// Something that consumes packets arriving on a carrier.
 pub(crate) trait Ingress: Send + Sync + 'static {
     fn ingress(&self, packet: &mut [u8], path: &Path);
+
+    /// Called when the carrier has passed on everything it has read for
+    /// now: wakes readers whose wake-up was deferred.
+    fn flush(&self) {}
 }
 
 /// A TCP connection carrying packets.
@@ -262,6 +266,12 @@ pub(crate) fn spawn_tcp(
                 break;
             }
             ingress.ingress(&mut buf[..n], &rpath);
+            // Wake deferred readers unless another whole packet is
+            // already buffered.
+            let b = r.buffer();
+            if b.len() < 2 || b.len() < 2 + u16::from_le_bytes([b[0], b[1]]) as usize {
+                ingress.flush();
+            }
         }
         tp.closed.store(true, Ordering::Relaxed);
     });
@@ -286,6 +296,7 @@ pub(crate) fn spawn_udp(
                         addr,
                     };
                     ingress.ingress(&mut buf[..n], &path);
+                    ingress.flush();
                 }
                 Err(e) => {
                     // ICMP errors (connection refused) surface here on some
