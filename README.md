@@ -36,6 +36,13 @@ curl -fsSL https://github.com/cardinal-network-developers/cardinal-node/releases
 `cardinal update` fetches, verifies, and installs the next release, and
 rolls back if it fails to start. See [docs/install.md](docs/install.md).
 
+`install.sh` cannot check signatures itself. When it finishes it prints the
+release key fingerprint compiled into the binary, which must be:
+
+```text
+2215 1e39 54f0 75a8 1e42 7c9b 72a0 ff7d
+```
+
 ## Build
 
 ```sh
