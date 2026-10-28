@@ -1,0 +1,52 @@
+# Cardinal Node
+
+An experimental implementation of the [Cardinal Core](https://github.com/cardinal-network-developers/cardinal-core)
+specification. It is used to settle the specification, so for now it is
+also the reference: where the two disagree, one of them is wrong, and
+[DEVIATIONS.md](DEVIATIONS.md) records which.
+
+**Status: alpha.** The cryptography has not been audited. Formats may change
+between releases without migration. Keep other copies of anything you put
+in it.
+
+## What works
+
+One person, several Linux devices, one folder that is the same everywhere:
+
+- `cardinal init` on the first device: no account, 24 recovery words.
+- `cardinal pair` on a new device shows a code; type it on the first one.
+- Files appear in `~/Cardinal` on every device, fetched on demand, with
+  history, restore, and conflict copies labeled by device.
+- Devices on the same network find each other; others are added with
+  `cardinal peer add host:7171`.
+
+Not yet: guardians, recovery from the words, sharing with other people,
+hosts, UDP, platforms other than Linux. [PLAN.md](PLAN.md) has the order of
+work.
+
+## Install
+
+Linux with FUSE 3 (`sudo apt install fuse3`), glibc 2.39 or later, and a
+systemd user session. No root needed:
+
+```sh
+curl -fsSL https://github.com/cardinal-network-developers/cardinal-node/releases/latest/download/install.sh | sh
+```
+
+`cardinal update` fetches, verifies, and installs the next release, and
+rolls back if it fails to start. See [docs/install.md](docs/install.md).
+
+## Build
+
+```sh
+cargo build --release
+cargo test --workspace
+```
+
+Releasing is described in [docs/releasing.md](docs/releasing.md).
+
+## License
+
+Licensed under either of [Apache License, Version 2.0](LICENSE-APACHE) or
+[MIT license](LICENSE-MIT), at your option. Contributions are accepted under
+the same terms; see [CONTRIBUTING.md](CONTRIBUTING.md).
