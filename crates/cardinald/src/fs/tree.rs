@@ -9,9 +9,11 @@
 //! without touching what is dirty.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::fs::File;
+use std::fs::{File, OpenOptions};
+use std::io;
+use std::os::unix::fs::FileExt;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use cardinal_identity::{EntryId, KeyId};
@@ -35,10 +37,52 @@ pub enum Kind {
 }
 
 /// A file's content being written locally.
+///
+/// The staging file is opened on demand and closed when no application
+/// has the file open, so copying many files does not hold one descriptor
+/// per file until the next commit.
 pub struct Staged {
-    /// The open staging file.
-    pub file: File,
+    file: Mutex<Option<File>>,
     path: PathBuf,
+}
+
+impl Staged {
+    fn with<R>(&self, f: impl FnOnce(&File) -> io::Result<R>) -> io::Result<R> {
+        let mut g = self.file.lock().unwrap_or_else(|e| e.into_inner());
+        if g.is_none() {
+            *g = Some(OpenOptions::new().read(true).write(true).open(&self.path)?);
+        }
+        f(g.as_ref().expect("opened"))
+    }
+
+    pub fn read_at(&self, buf: &mut [u8], off: u64) -> io::Result<usize> {
+        self.with(|f| f.read_at(buf, off))
+    }
+
+    pub fn read_exact_at(&self, buf: &mut [u8], off: u64) -> io::Result<()> {
+        self.with(|f| f.read_exact_at(buf, off))
+    }
+
+    pub fn write_all_at(&self, buf: &[u8], off: u64) -> io::Result<()> {
+        self.with(|f| f.write_all_at(buf, off))
+    }
+
+    pub fn set_len(&self, len: u64) -> io::Result<()> {
+        self.with(|f| f.set_len(len))
+    }
+
+    pub fn len(&self) -> io::Result<u64> {
+        Ok(std::fs::metadata(&self.path)?.len())
+    }
+
+    pub fn sync_data(&self) -> io::Result<()> {
+        self.with(|f| f.sync_data())
+    }
+
+    /// Closes the staging file; the next access reopens it.
+    pub fn close(&self) {
+        self.file.lock().unwrap_or_else(|e| e.into_inner()).take();
+    }
 }
 
 impl Drop for Staged {
@@ -445,13 +489,16 @@ impl Tree {
         let n = self.next_stage;
         self.next_stage += 1;
         let path = self.staging.join(format!("{}-{n}", std::process::id()));
-        let file = std::fs::OpenOptions::new()
+        let file = OpenOptions::new()
             .read(true)
             .write(true)
             .create(true)
             .truncate(true)
             .open(&path)?;
-        Ok(Arc::new(Staged { file, path }))
+        Ok(Arc::new(Staged {
+            file: Mutex::new(Some(file)),
+            path,
+        }))
     }
 
     /// Brings committed inodes up to date with a snapshot of the space,

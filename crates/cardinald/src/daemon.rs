@@ -172,9 +172,28 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// Raises the open-file limit to the hard limit. The soft default (often
+/// 1024) is too low for a file server with many peers and open files.
+fn raise_fd_limit() {
+    let mut l = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: getrlimit and setrlimit only read and write `l`.
+    unsafe {
+        if libc::getrlimit(libc::RLIMIT_NOFILE, &mut l) == 0 && l.rlim_cur < l.rlim_max {
+            l.rlim_cur = l.rlim_max;
+            if libc::setrlimit(libc::RLIMIT_NOFILE, &l) != 0 {
+                tracing::warn!("cannot raise the open-file limit");
+            }
+        }
+    }
+}
+
 impl Daemon {
     /// Loads everything and binds the link endpoint.
     pub async fn start(paths: Paths, config: Config) -> anyhow::Result<Arc<Daemon>> {
+        raise_fd_limit();
         std::fs::create_dir_all(&paths.home)?;
         let keys = Arc::new(Keys::load_or_create(&paths.device_key())?);
         let core = Core::load(&paths, keys.clone())?;

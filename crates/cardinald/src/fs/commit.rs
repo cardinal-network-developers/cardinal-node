@@ -8,7 +8,6 @@
 //! new folders (see DEVIATIONS.md).
 
 use std::collections::HashSet;
-use std::os::unix::fs::FileExt;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -36,17 +35,17 @@ pub fn encode(
     secret: &ConvergenceSecret,
     store: Arc<FsStore>,
 ) -> anyhow::Result<Content> {
-    let len = staged.file.metadata()?.len();
+    let len = staged.len()?;
     if len < INLINE_LIMIT as u64 {
         let mut b = vec![0u8; len as usize];
-        staged.file.read_exact_at(&mut b, 0)?;
+        staged.read_exact_at(&mut b, 0)?;
         return Ok(Content::Inline(b));
     }
     let mut w = BlobWriter::new(secret, store);
     let mut buf = vec![0u8; 1 << 20];
     let mut off = 0u64;
     loop {
-        let n = staged.file.read_at(&mut buf, off)?;
+        let n = staged.read_at(&mut buf, off)?;
         if n == 0 {
             break;
         }
@@ -102,8 +101,9 @@ pub fn commit(d: &Arc<Daemon>, tree: &Mutex<Tree>, space: &SpaceId) -> anyhow::R
             ConvergenceSecret::from_epoch_key(key.bytes())
         };
         for (ino, gen, st) in to_encode {
-            let c = encode(&st, &secret, d.store.clone())?;
-            encoded.push((ino, gen, c));
+            let c = encode(&st, &secret, d.store.clone());
+            st.close();
+            encoded.push((ino, gen, c?));
         }
     }
 

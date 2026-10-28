@@ -3,7 +3,6 @@
 use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::FileExt;
 use std::path::Path;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant, SystemTime};
@@ -40,6 +39,13 @@ pub struct CardinalFs {
     next_fh: u64,
     uid: u32,
     gid: u32,
+}
+
+/// Logs a local I/O failure and returns its errno, so the application
+/// reports the real cause ("No space left on device", not "I/O error").
+fn errno(what: &str, e: std::io::Error) -> c_int {
+    tracing::warn!("{what}: {e}");
+    e.raw_os_error().unwrap_or(EIO)
 }
 
 fn lock(t: &Mutex<Tree>) -> MutexGuard<'_, Tree> {
@@ -106,10 +112,14 @@ impl CardinalFs {
             return Ok(s);
         }
         let content = t.inodes.get(&ino).ok_or(ENOENT)?.content.clone();
-        let st = t.new_staged().map_err(|_| EIO)?;
+        let st = t
+            .new_staged()
+            .map_err(|e| errno("cannot stage a change", e))?;
         match content {
             None => {}
-            Some(Content::Inline(b)) => st.file.write_all_at(&b, 0).map_err(|_| EIO)?,
+            Some(Content::Inline(b)) => st
+                .write_all_at(&b, 0)
+                .map_err(|e| errno("cannot stage a change", e))?,
             Some(Content::Blob(r)) => {
                 let mut rd = BlobReader::new(self.d.store.clone(), self.fetcher, blob_ref(&r));
                 let mut buf = vec![0u8; 1 << 20];
@@ -122,7 +132,8 @@ impl CardinalFs {
                     if n == 0 {
                         break;
                     }
-                    st.file.write_all_at(&buf[..n], off).map_err(|_| EIO)?;
+                    st.write_all_at(&buf[..n], off)
+                        .map_err(|e| errno("cannot stage a change", e))?;
                     off += n as u64;
                 }
             }
@@ -187,13 +198,16 @@ impl CardinalFs {
             _ => return Err(EACCES),
         }
         let st = if size == 0 {
-            let st = t.new_staged().map_err(|_| EIO)?;
+            let st = t
+                .new_staged()
+                .map_err(|e| errno("cannot stage a change", e))?;
             t.inodes.get_mut(&ino).expect("ino").staged = Some(st.clone());
             st
         } else {
             self.stage(t, ino)?
         };
-        st.file.set_len(size).map_err(|_| EIO)?;
+        st.set_len(size)
+            .map_err(|e| errno("cannot change a file's size", e))?;
         let i = t.inodes.get_mut(&ino).expect("ino");
         i.size = size;
         i.dirty.content = true;
@@ -638,10 +652,10 @@ impl Filesystem for CardinalFs {
             let mut buf = vec![0u8; size as usize];
             let mut got = 0usize;
             while got < buf.len() {
-                match st.file.read_at(&mut buf[got..], offset + got as u64) {
+                match st.read_at(&mut buf[got..], offset + got as u64) {
                     Ok(0) => break,
                     Ok(n) => got += n,
-                    Err(_) => return reply.error(EIO),
+                    Err(e) => return reply.error(errno("cannot read a changed file", e)),
                 }
             }
             return reply.data(&buf[..got]);
@@ -700,8 +714,8 @@ impl Filesystem for CardinalFs {
             Err(e) => return reply.error(e),
         };
         let offset = offset.max(0) as u64;
-        if st.file.write_all_at(data, offset).is_err() {
-            return reply.error(EIO);
+        if let Err(e) = st.write_all_at(data, offset) {
+            return reply.error(errno("cannot save a write", e));
         }
         let i = t.inodes.get_mut(&ino).expect("ino");
         i.size = i.size.max(offset + data.len() as u64);
@@ -732,6 +746,11 @@ impl Filesystem for CardinalFs {
         let mut t = lock(&self.tree);
         if let Some(i) = t.inodes.get_mut(&ino) {
             i.opens = i.opens.saturating_sub(1);
+            if i.opens == 0 {
+                if let Some(st) = &i.staged {
+                    st.close();
+                }
+            }
             if h.as_ref().is_some_and(|h| h.write) {
                 i.writers = i.writers.saturating_sub(1);
                 if i.dirty.content {
@@ -752,7 +771,7 @@ impl Filesystem for CardinalFs {
             .get(&ino)
             .and_then(|i| i.staged.clone());
         if let Some(st) = st {
-            let _ = st.file.sync_data();
+            let _ = st.sync_data();
         }
         reply.ok();
     }
