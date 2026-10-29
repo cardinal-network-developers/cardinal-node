@@ -509,7 +509,7 @@ impl Endpoint {
         }
         let inner = result?;
         let session = Session { inner };
-        match tokio::time::timeout_at(deadline, session.wait_established()).await {
+        match tokio::time::timeout_at(deadline, session.wait_admitted()).await {
             Ok(Ok(())) => Ok(session),
             Ok(Err(e)) => Err(e),
             Err(_) => {
@@ -523,6 +523,27 @@ impl Endpoint {
     pub fn close(&self) {
         self.inner.shutdown();
     }
+
+    /// Closes like [`close`](Self::close), but first waits, at most
+    /// `limit`, for every session to hand its `close` frame to its
+    /// carrier, and a moment for the carrier to write it. A process that
+    /// exits right after `close` sends nothing, and its peers keep a dead
+    /// session until it times out.
+    pub async fn close_gracefully(&self, limit: Duration) {
+        let inner = &self.inner;
+        if inner.close_sessions() {
+            let deadline = tokio::time::Instant::now() + limit;
+            // A session leaves the table once its driver has sent the
+            // close frame.
+            while !lock(&inner.state).sessions.is_empty() && tokio::time::Instant::now() < deadline
+            {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            // Carrier writers flush as soon as their queues drain.
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        inner.stop_carriers();
+    }
 }
 
 impl Drop for EndpointInner {
@@ -533,8 +554,16 @@ impl Drop for EndpointInner {
 
 impl EndpointInner {
     fn shutdown(&self) {
+        if self.close_sessions() {
+            self.stop_carriers();
+        }
+    }
+
+    /// Stops taking packets and closes every session, each sending its
+    /// peer a `close` frame. False if the endpoint was closed already.
+    fn close_sessions(&self) -> bool {
         if self.closed.swap(true, Ordering::Relaxed) {
-            return;
+            return false;
         }
         let sessions: Vec<Arc<SessionInner>> =
             lock(&self.state).sessions.values().cloned().collect();
@@ -546,6 +575,10 @@ impl EndpointInner {
             };
             s.handle_events(events);
         }
+        true
+    }
+
+    fn stop_carriers(&self) {
         // Give drivers a moment to send close frames, then stop carriers.
         let tasks: Vec<AbortHandle> = std::mem::take(&mut *lock(&self.tasks));
         if let Ok(rt) = tokio::runtime::Handle::try_current() {
@@ -921,6 +954,10 @@ impl EndpointInner {
                 if !self.supersede(s) {
                     return;
                 }
+                // Only now may `connect` return it: a session that loses
+                // to a simultaneous one must never reach the caller.
+                s.lock().admitted = true;
+                s.signals.state.notify_waiters();
                 let identity = s.lock().peer_identity;
                 let _ = self.events.send(EndpointEvent::Established {
                     peer_static: s.peer_static,

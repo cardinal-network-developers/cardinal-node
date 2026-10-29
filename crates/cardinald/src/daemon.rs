@@ -173,6 +173,9 @@ pub struct Daemon {
     pub mount: Mutex<Option<crate::fs::Mounted>>,
     /// Why mounting is impossible here (no FUSE), if it is.
     pub mount_unavailable: Mutex<Option<String>>,
+    /// Held while mounting or unmounting, so concurrent housekeeping
+    /// mounts once and a stop never races a mount.
+    mount_lock: Mutex<()>,
     /// Background fetching.
     pub progress: Mutex<Progress>,
     /// How fast each device has been sending blob objects
@@ -286,6 +289,7 @@ impl Daemon {
             pairing: Mutex::new(PairState::Idle),
             mount: Mutex::new(None),
             mount_unavailable: Mutex::new(None),
+            mount_lock: Mutex::new(()),
             progress: Mutex::new(Progress::default()),
             blob_stats: Mutex::new(HashMap::new()),
             copies: crate::copies::Tracker::load(copies_path, crate::copies::Rules::from_env()),
@@ -380,15 +384,26 @@ impl Daemon {
         }
         let gen = self.next_gen.fetch_add(1, Ordering::Relaxed);
         let ps = s.peer_static();
-        lock(&self.sessions).insert(
-            ps,
-            Conn {
-                session: s.clone(),
-                kind,
-                gen,
-                since: Instant::now(),
-            },
-        );
+        {
+            let mut m = lock(&self.sessions);
+            // Replaced already by a simultaneous session with the same
+            // device: that one is (or will be) here instead. Checked under
+            // the lock, since the replacement arrives only after it closed
+            // this one.
+            if s.is_closed() {
+                tracing::debug!("session with {} replaced before use", short(&ps));
+                return;
+            }
+            m.insert(
+                ps,
+                Conn {
+                    session: s.clone(),
+                    kind,
+                    gen,
+                    since: Instant::now(),
+                },
+            );
+        }
         let name = match kind {
             PeerKind::Own(k) => self.device_name(&k),
             _ => "the device being paired".into(),
@@ -592,7 +607,9 @@ impl Daemon {
             if let Err(e) = d.ensure_placement() {
                 tracing::debug!("housekeeping: {e:#}");
             }
-            d.ensure_mounted();
+            // Mounting blocks, and may wait for another mount or unmount.
+            let d2 = d.clone();
+            let _ = tokio::task::spawn_blocking(move || d2.ensure_mounted()).await;
             d.start_discovery();
         });
     }
@@ -657,9 +674,10 @@ impl Daemon {
     }
 
     /// Mounts the files space if it is held, a mount point is configured,
-    /// and it is not mounted yet.
+    /// it is not mounted yet, and the daemon is not stopping.
     pub fn ensure_mounted(self: &Arc<Self>) {
-        if lock(&self.mount).is_some() {
+        let _one_at_a_time = lock(&self.mount_lock);
+        if lock(&self.mount).is_some() || *self.stopping.borrow() {
             return;
         }
         let Some(path) = self.config().mount.clone() else {
@@ -691,6 +709,7 @@ impl Daemon {
 
     /// Unmounts, committing pending changes first.
     pub fn unmount(&self) {
+        let _one_at_a_time = lock(&self.mount_lock);
         let m = lock(&self.mount).take();
         if let Some(m) = m {
             m.unmount();
@@ -803,6 +822,10 @@ impl Daemon {
                     }
                     self.save_book();
                     self.on_session(s);
+                    return true;
+                }
+                // The device's own simultaneous session won: connected.
+                Err(cardinal_link::LinkError::Closed(cardinal_link::CloseReason::Replaced)) => {
                     return true;
                 }
                 Err(e) => {
@@ -1090,7 +1113,11 @@ impl Daemon {
         let d = self.clone();
         tokio::task::spawn_blocking(move || d.unmount()).await?;
         self.save_counters();
-        self.endpoint.close();
+        // Tell the other devices, so they drop the session now rather
+        // than keep a dead one that a restart's new session must beat.
+        self.endpoint
+            .close_gracefully(Duration::from_millis(500))
+            .await;
         drop(control);
         let _ = std::fs::remove_file(&self.paths.socket);
         tracing::info!("stopped");

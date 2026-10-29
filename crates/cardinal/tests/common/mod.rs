@@ -218,4 +218,8 @@ pub fn pair(a: &Dev, b: &Dev) {
     std::io::Read::read_to_string(&mut out, &mut rest).unwrap();
     assert!(shower.wait().unwrap().success(), "{rest}");
     assert!(rest.contains("Done"), "{rest}");
+    // Joining brings several spaces at once, each a reason to mount: the
+    // files are mounted once.
+    b.wait_mounted();
+    assert!(!b.log().contains("cannot mount"), "{}", b.log());
 }

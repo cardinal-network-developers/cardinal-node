@@ -356,6 +356,9 @@ pub(crate) struct Conn {
     initial_rekey_done: bool,
     pub established: bool,
     pub established_at: Option<Instant>,
+    /// The endpoint kept this session after comparing it with any other
+    /// session with the same peer (set after `established`).
+    pub admitted: bool,
     created: Instant,
 
     // Reliability.
@@ -455,6 +458,7 @@ impl Conn {
             initial_rekey_done: false,
             established: false,
             established_at: None,
+            admitted: false,
             created: now,
             reliable,
             control: VecDeque::new(),

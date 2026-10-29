@@ -324,7 +324,10 @@ impl Session {
         ok
     }
 
-    pub(crate) async fn wait_established(&self) -> Result<(), LinkError> {
+    /// Waits until the session is established and the endpoint has kept
+    /// it over any other session with the same peer (`supersede` in
+    /// `endpoint.rs`); a session that loses is closed as replaced.
+    pub(crate) async fn wait_admitted(&self) -> Result<(), LinkError> {
         loop {
             let notified = self.inner.signals.state.notified();
             tokio::pin!(notified);
@@ -334,7 +337,7 @@ impl Session {
                 if let Some(r) = &c.close {
                     return Err(LinkError::Closed(r.clone()));
                 }
-                if c.established {
+                if c.admitted {
                     return Ok(());
                 }
             }
