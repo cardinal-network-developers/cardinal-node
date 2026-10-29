@@ -626,35 +626,15 @@ Not implemented yet (the next milestone):
   reads touch that, which only delays sampling), or when this run first
   saw the reference. So the count is of copies of everything older than
   an hour, and status says so; newer content is still being copied.
-- **Spec conflict: checks are fetches, seen from the other side.** A
-  check "is an ordinary request", so a device cannot tell another
-  device's check of it from a fetch; applied literally, "a holder that
-  fetches a chunk stops counting" makes two holders that check each other
-  reset each other forever (each check comes before the other's wait is
-  over). Chosen: a holder is taken to be fetching only when it is sent
-  more than 9 objects of counted content (first stored here more than an
-  hour ago) within one check interval; up to that is what two of its
-  checks ask for, and one. Objects first stored here less than an hour
-  ago, which holders are still copying, do not reset anyone either. The
-  allowance would let a holder that keeps nothing pass by fetching the
-  checked chunks from the checker as it is asked: a check during which
-  the holder fetches any of the asked objects from the checker is not
-  taken; it is repeated half an interval later and fails if that happens
-  again. The spec could say that checks are exempt by volume, or that
-  only fetches by holders not being checked count.
-- **Readings: the wait, "again and again", "recently".** The wait after
-  a fetch is 1.5 check intervals (15 minutes) after the last fetch, and
-  the holder is not checked before it. An object fetched in three
-  fetches at least two intervals apart (retries and hedged requests
-  closer together are one fetch) marks the holder as not keeping it; it
-  counts again only after passing a check a day after the last such
-  fetch. The objects each holder fetched are remembered in memory only.
-  A passed check counts for 7 days while the holder is not checked again
-  (an offline laptop), and status gives its time. Results are persisted
+- **Readings: failing, "recently".** A check fails when a piece comes
+  back "not held" or does not hash to its id. A check with no answer
+  (timed out; a closed session is not a check) fails only when it is
+  the second in a row: the spec suggests asking again rather than
+  failing at once, and leaves how often to each device. A passed check
+  counts for 7 days while the holder is not checked again (an offline
+  laptop), and status gives its time. Results are persisted
   (`copies.json`), so a restart neither drops offline holders nor shows
   them as unchecked.
-- **Objects belong to the files space.** The store holds the blobs of
-  the files space only, so every object served counts as one of its
-  chunks; with more spaces with blobs, objects would need attributing to
-  spaces. Checks count chunks and indexes only: content under 1 KiB lives
-  in entries, which every device holds.
+- **Only the files space.** It is the only space with blobs, so checks
+  sample it alone. Checks ask for chunks and indexes only: content under
+  1 KiB lives in entries, which every device holds.

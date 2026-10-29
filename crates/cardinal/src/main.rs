@@ -730,10 +730,6 @@ fn copies_lines(c: &Value, devices: usize) -> Vec<String> {
     {
         let when = |k: &str| age(&h[k]).map(|a| format!(" ({a})")).unwrap_or_default();
         let why = match h["state"].as_str().unwrap_or("") {
-            "fetching" => format!(
-                "fetching files from this device{}; it counts again once it passes a check",
-                when("fetched_at")
-            ),
             "failed" => format!(
                 "{}{}",
                 h["reason"].as_str().unwrap_or("failed a check"),
@@ -1106,9 +1102,8 @@ mod tests {
                  than an hour)"
             ]
         );
-        // One fetching, one offline for a day: per-device ages, and why.
-        let mut fetching = holder("nuc", false, "fetching", Some(now - 3_000_000));
-        fetching["fetched_at"] = json!(now - 120_000);
+        // One missing pieces, one offline for a day: per-device ages, and
+        // why.
         let mixed = c(vec![
             holder("carbonite", true, "passed", Some(now - 1000)),
             holder("saint-joseph", false, "passed", Some(now - 60_000)),
@@ -1117,21 +1112,21 @@ mod tests {
                 h["online"] = json!(false);
                 h
             },
-            fetching,
+            failed_holder(now),
         ]);
         assert_eq!(
             copies_lines(&mixed, 4),
             vec![
                 "Copies: 3 — this device, saint-joseph (checked 1 minute ago), laptop (checked \
                  2 hours ago); files older than an hour",
-                "  nuc: not counted — fetching files from this device (2 minutes ago); it \
-                 counts again once it passes a check"
+                "  nuc: not counted — did not have 3 of the 4 pieces of your files asked for \
+                 (2 minutes ago)"
             ]
         );
         // Only this device, another catching up.
         let one = c(vec![
             holder("carbonite", true, "passed", Some(now - 1000)),
-            fetching_holder(now),
+            failed_holder(now),
         ]);
         let lines = copies_lines(&one, 2);
         assert_eq!(
@@ -1159,9 +1154,10 @@ mod tests {
         assert!(copies_lines(&Value::Null, 1).is_empty());
     }
 
-    fn fetching_holder(now: u64) -> Value {
-        let mut h = holder("nuc", false, "fetching", Some(now - 3_000_000));
-        h["fetched_at"] = json!(now - 5_000);
+    fn failed_holder(now: u64) -> Value {
+        let mut h = holder("nuc", false, "failed", Some(now - 3_000_000));
+        h["reason"] = json!("did not have 3 of the 4 pieces of your files asked for");
+        h["last_fail"] = json!(now - 120_000);
         h
     }
 

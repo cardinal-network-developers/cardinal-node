@@ -2,9 +2,9 @@
 //! two daemons on one machine that both keep everything. Checks run
 //! every 1.5 s and count content older than 2 s, so the rules play out in
 //! seconds: a lone device warns; a second device is counted once it
-//! passes checks; one that loses its disk drops out while it fetches
-//! everything again and comes back; one that keeps fetching the same
-//! pieces stops counting.
+//! passes checks; one that loses its disk fails checks while it fetches
+//! everything again, and comes back once it has. Alpha serves pieces
+//! slowly (3 s per MiB), so the fetch takes seconds and a check sees it.
 //!
 //! Skipped (with a message) when `/dev/fuse` or `fusermount3` is missing.
 
@@ -65,6 +65,8 @@ fn copies_and_speedtest() {
             d.env.push((k.into(), v.into()));
         }
     }
+    a.env
+        .push(("CARDINAL_TEST_BLOB_DELAY_MS".into(), "3000".into()));
     a.start();
     let out = a.cli(&["init", "--yes", "--name", "alpha"]);
     assert!(out.contains("Set up"), "{out}");
@@ -146,48 +148,25 @@ fn copies_and_speedtest() {
     assert!(!o.status.success());
     assert!(String::from_utf8_lossy(&o.stderr).contains("this device"));
 
-    // Beta loses its disk: it fetches everything from alpha again, and
-    // alpha stops counting it until it passes a check after a wait.
-    lose_disk(&mut b);
-    wait("alpha sees beta fetching", 40, || {
-        state_of(&a, "beta") == "fetching"
-    });
-    let st = a.cli(&["status"]);
-    eprintln!("---- beta fetching ----\n{st}");
-    assert!(
-        st.contains("beta: not counted — fetching files from this device"),
-        "{st}"
-    );
-    assert!(
-        st.contains("Your files are only on this device until another device passes its checks."),
-        "{st}"
-    );
-    wait("beta counted again", 40, || copies(&a)["count"] == 2);
-
-    // Again and again: beta is not keeping the pieces.
-    let mut repeated = false;
-    for _ in 0..3 {
-        // Fetches closer together than two intervals are one fetch.
-        std::thread::sleep(Duration::from_millis(3500));
+    // Beta loses its disk, twice: alpha's checks find pieces missing while
+    // beta fetches everything again, and count it once it has. Nothing is
+    // declared, and fetching, however often, is not held against it.
+    for round in 0..2 {
         lose_disk(&mut b);
-        wait("alpha sees beta fetching again", 40, || {
-            matches!(state_of(&a, "beta").as_str(), "fetching" | "repeated")
+        wait("alpha finds pieces missing on beta", 40, || {
+            state_of(&a, "beta") == "failed"
         });
-        if state_of(&a, "beta") == "repeated" {
-            repeated = true;
-            break;
-        }
+        let st = a.cli(&["status"]);
+        eprintln!("---- beta rebuilding ({round}) ----\n{st}");
+        assert!(st.contains("beta: not counted — did not have "), "{st}");
+        assert!(
+            st.contains(
+                "Your files are only on this device until another device passes its checks."
+            ),
+            "{st}"
+        );
         wait("beta counted again", 40, || copies(&a)["count"] == 2);
     }
-    assert!(repeated, "beta fetched the same pieces three times");
-    let st = a.cli(&["status"]);
-    eprintln!("---- beta repeated ----\n{st}");
-    assert!(
-        st.contains("beta: not counted — fetched the same pieces"),
-        "{st}"
-    );
-    assert!(st.contains("again and again"), "{st}");
-    assert_eq!(copies(&a)["count"], 1);
 
     // A device without the speed test (0.1.3 and earlier) says so.
     b.env

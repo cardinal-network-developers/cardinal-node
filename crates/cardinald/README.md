@@ -210,17 +210,13 @@ Copies: 3 — this device, saint-joseph, nuc (checked 4 minutes ago; files older
   device still copying new files is not failed; the count is of copies
   of everything older than that. Answers are verified by hash and
   dropped. This device checks its own store the same way.
-- **Fetching resets the count**: a device meant to keep everything that
-  fetches from this one more than 9 objects first stored here over an
-  hour ago, within one interval (two of its own checks of this device
-  ask for 8), stops counting until it passes a check started 1.5
-  intervals after its last such fetch; it is not checked before. A device that fetches one of the objects being asked
-  of it while the check runs is checked again half an interval later,
-  and fails if it happens again (it may be relaying them).
-- **Repeated fetches**: an object fetched in three fetches at least two
-  intervals apart means the device is not keeping it; it stops counting
-  until it passes a check a day (144 intervals) later. Which objects each
-  device fetched is remembered in memory (200,000 per device).
+- **Failing**: a check fails when a piece comes back "not held" or does
+  not hash to its id, and the device stops counting until it passes one.
+  A check that gets no answer (timed out; a closed session is not a
+  check) fails only when it is the second in a row. What other devices
+  fetch is not watched: one rebuilding after a lost disk fails checks
+  until it has the pieces again. Checks trust what comes back, however
+  the device got it (D46).
 - A passed check counts for 7 days, so a laptop that is asleep still
   counts, with the time it was last checked. Results are kept in
   `copies.json`: after a restart nothing is shown as unchecked that was

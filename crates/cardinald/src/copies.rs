@@ -1,9 +1,10 @@
 //! Counting copies of the files space by what was seen
-//! (`blobs.md#counting-copies`, decision D45).
+//! (`blobs.md#counting-copies`, decisions D45 and D46).
 //!
 //! The account space says which devices are meant to keep everything:
 //! placements of the files space with full retention. That is intent.
-//! What this module counts is evidence:
+//! What this module counts is evidence, from spot checks that trust what
+//! comes back:
 //!
 //! - **Checks.** About every 10 minutes, each online device meant to keep
 //!   everything is asked for a few objects (chunks or indexes) chosen at
@@ -12,17 +13,13 @@
 //!   The answers are verified by hash and dropped. Content younger than
 //!   that is left out, so a device still copying new files is not counted
 //!   as failing: the count is of copies of everything older than an hour.
-//! - **Fetching resets the count.** This device notes which of those
-//!   devices fetch such content from it. One that does stops counting
-//!   until it passes a check started longer than one check interval after
-//!   its last fetch (a rebuild after a lost disk is ordinary sync).
-//!   Requests of a few objects per interval are what another device's
-//!   checks of this one look like, and are not taken as fetching (see
-//!   DEVIATIONS.md); a device that answers a check with objects it
-//!   fetches from this device during that check fails it.
-//! - **Repeated fetches.** A device that fetches the same objects from
-//!   this one again and again is not keeping them: it stops counting, and
-//!   status says so.
+//! - **Only a missing or damaged piece fails.** A device that answers
+//!   "not held" for a piece it should keep, or sends one that does not
+//!   hash to its id, stops counting until it passes a check. One that does
+//!   not answer is asked again at its next check, and fails when it misses
+//!   two in a row. What devices fetch is not watched: one rebuilding after
+//!   a lost disk fails checks while pieces are missing and passes once it
+//!   has them again.
 //!
 //! This device counts itself when it keeps everything, unless its own
 //! check (a sample drawn the same way, read from its store) found pieces
@@ -32,7 +29,7 @@
 //! checks. Results are kept in `copies.json`, so a restart does not forget
 //! a device that passed checks and is offline now.
 
-use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
@@ -95,39 +92,10 @@ impl Rules {
         }
         r
     }
-
-    /// A device that fetched counts again only by passing a check that
-    /// started this long after its last fetch: longer than the interval
-    /// between checks.
-    pub fn wait_ms(&self) -> u64 {
-        self.interval_ms + self.interval_ms / 2
-    }
-
-    /// Objects of counted content a device may fetch from this one within
-    /// one interval and still be taken for checking it (two checks' worth,
-    /// and one). More is fetching.
-    pub fn allowance(&self) -> usize {
-        2 * self.sample + 1
-    }
-
-    /// Fetches of one object closer together than this are one fetch
-    /// (retries, hedged requests).
-    pub fn repeat_gap_ms(&self) -> u64 {
-        2 * self.interval_ms
-    }
-
-    /// A device seen fetching the same objects again and again counts
-    /// again only after passing a check this long after the last such
-    /// fetch: a day at the default interval.
-    pub fn repeat_hold_ms(&self) -> u64 {
-        144 * self.interval_ms
-    }
 }
 
-/// Separate fetches of one object that show a device is not keeping it.
-pub const REPEATS: u8 = 3;
-/// Fetched objects remembered per device, at most.
-const FETCHED_MAX: usize = 200_000;
+/// Checks in a row a device may leave unanswered before it fails one.
+pub const MISSES: u8 = 2;
 /// Average chunk size, to weigh blobs by their number of chunks.
 const AVG_CHUNK: u64 = 64 * 1024;
 
@@ -138,6 +106,8 @@ pub enum Outcome {
     Passed,
     /// Something was missing or wrong, in plain words.
     Failed(String),
+    /// No answer (timed out, or the service failed), in plain words.
+    Unanswered(String),
 }
 
 /// What this device has seen of one device meant to keep everything.
@@ -152,16 +122,8 @@ pub struct Holder {
     pub last_fail: Option<u64>,
     /// Why it failed.
     pub fail_reason: Option<String>,
-    /// When it last fetched counted content from this device.
-    pub fetched_at: Option<u64>,
-    /// When it last fetched objects it had fetched before.
-    pub repeated_at: Option<u64>,
-    /// Counted objects sent to it recently: (time, count) per request.
-    #[serde(skip)]
-    recent: VecDeque<(u64, usize)>,
-    /// Objects it fetched (first 8 bytes of the id): last time, times.
-    #[serde(skip)]
-    fetched: HashMap<u64, (u64, u8)>,
+    /// Checks it left unanswered since it last answered one.
+    pub missed: u8,
 }
 
 /// Whether a device counts as a copy now, and if not, why.
@@ -171,17 +133,6 @@ pub enum Verdict {
     Counted {
         /// When.
         checked: u64,
-    },
-    /// It fetched counted content from this device (last at `last`) and
-    /// has not passed a check long enough after.
-    Fetching {
-        /// When it last fetched.
-        last: u64,
-    },
-    /// It fetched the same objects again and again.
-    Repeated {
-        /// When it last did.
-        at: u64,
     },
     /// Its last check failed.
     Failed {
@@ -209,8 +160,6 @@ impl Verdict {
     pub fn state(&self) -> &'static str {
         match self {
             Verdict::Counted { .. } => "passed",
-            Verdict::Fetching { .. } => "fetching",
-            Verdict::Repeated { .. } => "repeated",
             Verdict::Failed { .. } => "failed",
             Verdict::Stale { .. } => "stale",
             Verdict::Unchecked => "unchecked",
@@ -218,103 +167,49 @@ impl Verdict {
     }
 }
 
-fn prefix(id: &[u8; 32]) -> u64 {
-    u64::from_le_bytes(id[..8].try_into().expect("8 bytes"))
-}
-
 impl Holder {
-    /// Records a check that started at `started`.
+    /// Records a check that started at `started`. An unanswered check
+    /// fails only when it is the [`MISSES`]th in a row.
     pub fn checked(&mut self, started: u64, outcome: Outcome) {
         self.last_check = Some(self.last_check.map_or(started, |t| t.max(started)));
         match outcome {
-            Outcome::Passed => self.last_pass = Some(started),
+            Outcome::Passed => {
+                self.last_pass = Some(started);
+                self.missed = 0;
+            }
             Outcome::Failed(why) => {
-                self.last_fail = Some(started);
-                self.fail_reason = Some(why);
+                self.fail(started, why);
+                self.missed = 0;
+            }
+            Outcome::Unanswered(why) => {
+                self.missed = self.missed.saturating_add(1);
+                if self.missed >= MISSES {
+                    let why = format!("did not answer {} checks in a row ({why})", self.missed);
+                    self.fail(started, why);
+                }
             }
         }
     }
 
-    /// This device just sent it `old` objects of counted content (first
-    /// seen here more than the minimum age ago). Returns whether that was
-    /// fetching (more than checks ask for).
-    pub fn served(&mut self, r: &Rules, now: u64, old: &[[u8; 32]]) -> bool {
-        if old.is_empty() {
-            return false;
-        }
-        while self
-            .recent
-            .front()
-            .is_some_and(|(t, _)| now.saturating_sub(*t) >= r.interval_ms)
-        {
-            self.recent.pop_front();
-        }
-        self.recent.push_back((now, old.len()));
-        let total: usize = self.recent.iter().map(|(_, n)| n).sum();
-        if total <= r.allowance() {
-            return false;
-        }
-        self.fetched_at = Some(now);
-        let mut repeated = false;
-        for id in old {
-            match self.fetched.get_mut(&prefix(id)) {
-                None => {
-                    self.fetched.insert(prefix(id), (now, 1));
-                }
-                Some((last, times)) => {
-                    if now.saturating_sub(*last) >= r.repeat_gap_ms() {
-                        *last = now;
-                        *times = times.saturating_add(1);
-                        repeated |= *times >= REPEATS;
-                    }
-                }
-            }
-        }
-        if repeated {
-            self.repeated_at = Some(now);
-        }
-        if self.fetched.len() > FETCHED_MAX {
-            // Forget the half fetched longest ago.
-            let mut times: Vec<u64> = self.fetched.values().map(|(t, _)| *t).collect();
-            let mid = times.len() / 2;
-            let (_, cut, _) = times.select_nth_unstable(mid);
-            let cut = *cut;
-            self.fetched.retain(|_, (t, _)| *t > cut);
-        }
-        true
+    fn fail(&mut self, started: u64, why: String) {
+        self.last_fail = Some(started);
+        self.fail_reason = Some(why);
     }
 
     /// Whether it counts now.
     pub fn verdict(&self, r: &Rules, now: u64) -> Verdict {
-        let passed_since = |t: u64| self.last_pass.is_some_and(|p| p >= t);
-        if let Some(t) = self.repeated_at {
-            if !passed_since(t.saturating_add(r.repeat_hold_ms())) {
-                return Verdict::Repeated { at: t };
-            }
-        }
         // The last check failed (and nothing passed since).
-        let failed = self
+        if let Some(f) = self
             .last_fail
-            .filter(|f| self.last_pass.is_none_or(|p| p <= *f));
-        let failure = |at: u64| Verdict::Failed {
-            at,
-            reason: self
-                .fail_reason
-                .clone()
-                .unwrap_or_else(|| "failed a check".into()),
-        };
-        if let Some(t) = self.fetched_at {
-            let after = t.saturating_add(r.wait_ms());
-            if !passed_since(after) {
-                // A check after the wait says more than "fetching".
-                return match failed {
-                    Some(f) if f >= after => failure(f),
-                    _ => Verdict::Fetching { last: t },
-                };
-            }
-        }
-        if let Some(f) = failed {
-            return failure(f);
+            .filter(|f| self.last_pass.is_none_or(|p| p <= *f))
+        {
+            return Verdict::Failed {
+                at: f,
+                reason: self
+                    .fail_reason
+                    .clone()
+                    .unwrap_or_else(|| "failed a check".into()),
+            };
         }
         match self.last_pass {
             Some(p) if now.saturating_sub(p) <= r.horizon_ms => Verdict::Counted { checked: p },
@@ -341,19 +236,10 @@ impl Holder {
     }
 
     /// When it should be checked next. `jitter` (about 0.8 to 1.2)
-    /// spreads checks out. A device that fetched is checked once the wait
-    /// is over, not before (such a check could not count it).
+    /// spreads checks out.
     pub fn next_check(&self, r: &Rules, jitter: f64) -> u64 {
-        let mut due = self
-            .last_check
-            .map_or(0, |t| t + (r.interval_ms as f64 * jitter) as u64);
-        if let Some(t) = self.fetched_at {
-            let after = t.saturating_add(r.wait_ms());
-            if self.last_pass.is_none_or(|p| p < after) {
-                due = due.max(after + 1);
-            }
-        }
-        due
+        self.last_check
+            .map_or(0, |t| t + (r.interval_ms as f64 * jitter) as u64)
     }
 }
 
@@ -585,15 +471,8 @@ struct View {
 #[derive(Default)]
 struct Inner {
     holders: BTreeMap<KeyId, Holder>,
-    /// Link key -> device, for the other devices meant to keep everything.
-    by_link: HashMap<[u8; 32], KeyId>,
-    /// Checks under way: the objects asked for, and whether the device
-    /// fetched one of them from this device meanwhile.
-    in_flight: HashMap<KeyId, (Vec<[u8; 32]>, bool)>,
-    /// Devices that may have answered a check with what they fetched from
-    /// this device during it: checked again at the time given, and failed
-    /// if it happens again.
-    recheck: HashMap<KeyId, u64>,
+    /// Devices with a check under way.
+    checking: HashSet<KeyId>,
     view: Option<View>,
     dirty: bool,
 }
@@ -662,11 +541,7 @@ impl Tracker {
 
     /// When a device should be checked next ([`Holder::next_check`]).
     fn next_check(&self, key: &KeyId, jitter: f64) -> u64 {
-        let inner = self.lock();
-        if let Some(t) = inner.recheck.get(key) {
-            return *t;
-        }
-        inner
+        self.lock()
             .holders
             .get(key)
             .map_or(0, |h| h.next_check(&self.rules, jitter))
@@ -681,94 +556,39 @@ impl Tracker {
     }
 
     fn set_view(&self, v: View) {
-        let mut inner = self.lock();
-        inner.by_link = v.remote.iter().map(|(k, x)| (*x, *k)).collect();
-        inner.view = Some(v);
+        self.lock().view = Some(v);
     }
 
-    /// After this device served a blob request: notes which objects of
-    /// counted content a device meant to keep everything fetched.
-    pub fn observe_serve(&self, peer: &[u8; 32], reply: &BlobReply, store: &FsStore) {
-        let Some(key) = self.lock().by_link.get(peer).copied() else {
-            return;
-        };
-        let held: Vec<[u8; 32]> = reply
-            .items
-            .iter()
-            .filter_map(|i| match i {
-                BlobItem::Held { id, .. } => Some(*id),
-                BlobItem::NotHeld(_) => None,
-            })
-            .collect();
-        if held.is_empty() {
-            return;
-        }
-        let now = now_ms();
-        let old: Vec<[u8; 32]> = held
-            .iter()
-            .copied()
-            .filter(|id| {
-                born(store, id).is_some_and(|t| now.saturating_sub(t) >= self.rules.min_age_ms)
-            })
-            .collect();
-        let name = self.name(&key);
-        let mut inner = self.lock();
-        if let Some((asked, relayed)) = inner.in_flight.get_mut(&key) {
-            if held.iter().any(|id| asked.contains(id)) {
-                *relayed = true;
-            }
-        }
-        let rules = self.rules;
-        let h = inner.holders.entry(key).or_default();
-        let before = h.verdict(&rules, now).state();
-        if h.served(&rules, now, &old) {
-            let after = h.verdict(&rules, now).state();
-            if after != before {
-                match after {
-                    "repeated" => tracing::warn!(
-                        "{name} fetches the same pieces of your files again and again; not \
-                         counting it as a copy"
-                    ),
-                    _ => tracing::info!(
-                        "{name} is fetching files from this device; it counts as a copy again \
-                         once it passes a check"
-                    ),
-                }
-            }
-            inner.dirty = true;
-        }
-    }
-
-    fn begin(&self, key: KeyId, ids: Vec<[u8; 32]>) {
-        self.lock().in_flight.insert(key, (ids, false));
+    fn begin(&self, key: KeyId) {
+        self.lock().checking.insert(key);
     }
 
     /// Records a finished check (`None`: inconclusive, the session
-    /// closed). A device that fetched some of the asked objects from this
-    /// one while the check ran may have relayed them, or may have been
-    /// checking this device with the same objects at that moment: it is
-    /// checked again half an interval later, and fails if it happens
-    /// again.
+    /// closed). Logs when a device stops or starts counting.
     fn finish(&self, key: KeyId, started: u64, outcome: Option<Outcome>) {
+        let name = self.name(&key);
+        let (rules, now) = (self.rules, now_ms());
         let mut inner = self.lock();
-        let relayed = inner.in_flight.remove(&key).is_some_and(|(_, r)| r);
-        let Some(mut outcome) = outcome else { return };
-        let suspected = inner.recheck.remove(&key).is_some();
-        if relayed && outcome == Outcome::Passed {
-            if !suspected {
-                let at = now_ms() + self.rules.interval_ms / 2;
-                inner.recheck.insert(key, at);
-                return;
+        inner.checking.remove(&key);
+        let Some(outcome) = outcome else { return };
+        let me = inner.view.as_ref().is_some_and(|v| v.me == key);
+        let h = inner.holders.entry(key).or_default();
+        let verdict = |h: &Holder| {
+            if me {
+                h.own_verdict()
+            } else {
+                h.verdict(&rules, now)
             }
-            outcome = Outcome::Failed(
-                "answered checks with pieces it fetched from this device meanwhile".into(),
-            );
+        };
+        let before = verdict(h).counted();
+        h.checked(started, outcome);
+        match (before, verdict(h)) {
+            (true, Verdict::Failed { reason, .. }) => {
+                tracing::warn!("not counting {name} as a copy of your files: {reason}")
+            }
+            (false, v) if v.counted() => tracing::info!("{name} counts as a copy of your files"),
+            _ => {}
         }
-        inner
-            .holders
-            .entry(key)
-            .or_default()
-            .checked(started, outcome);
         inner.dirty = true;
     }
 }
@@ -972,7 +792,7 @@ pub fn start(d: Arc<Daemon>) {
                 };
                 let s = s.clone();
                 running.insert(key);
-                d.copies.begin(key, ids.clone());
+                d.copies.begin(key);
                 checks.spawn(async move {
                     let started = now_ms();
                     let outcome =
@@ -980,9 +800,7 @@ pub fn start(d: Arc<Daemon>) {
                         {
                             Ok(reply) => Some(judge(&ids, &reply, false)),
                             Err(_) if s.is_closed() => None,
-                            Err(e) => {
-                                Some(Outcome::Failed(format!("did not answer a check: {e:#}")))
-                            }
+                            Err(e) => Some(Outcome::Unanswered(format!("{e:#}"))),
                         };
                     (key, started, outcome)
                 });
@@ -1023,12 +841,6 @@ pub fn status(d: &Daemon) -> Value {
         };
         let reason = match &verdict {
             Verdict::Counted { .. } => None,
-            Verdict::Fetching { .. } => Some("fetching files from this device".to_owned()),
-            Verdict::Repeated { .. } => Some(
-                "fetched the same pieces of your files from this device again and again, so it \
-                 is not keeping them"
-                    .to_owned(),
-            ),
             Verdict::Failed { reason, .. } => Some(reason.clone()),
             Verdict::Stale { .. } => Some("not checked recently".to_owned()),
             Verdict::Unchecked => Some("not checked yet".to_owned()),
@@ -1041,12 +853,11 @@ pub fn status(d: &Daemon) -> Value {
             "counted": verdict.counted(),
             "state": verdict.state(),
             "reason": reason,
-            "checking": inner.in_flight.contains_key(k),
+            "checking": inner.checking.contains(k),
             "last_check": h.last_check,
             "last_pass": h.last_pass,
             "last_fail": h.last_fail,
-            "fetched_at": h.fetched_at,
-            "repeated_at": h.repeated_at,
+            "missed": h.missed,
         })
     };
     let mut list = Vec::new();
@@ -1079,10 +890,6 @@ mod tests {
         Rules::default()
     }
 
-    fn ids(range: std::ops::Range<u8>) -> Vec<[u8; 32]> {
-        range.map(|i| [i; 32]).collect()
-    }
-
     #[test]
     fn unchecked_then_passed_then_failed() {
         let r = rules();
@@ -1113,162 +920,92 @@ mod tests {
     }
 
     #[test]
-    fn checks_are_not_fetching() {
-        // Another device checking this one asks for a few objects per
-        // interval: that does not reset it.
+    fn a_missed_answer_fails_only_the_second_time_in_a_row() {
         let r = rules();
         let mut h = Holder::default();
         h.checked(0, Outcome::Passed);
-        let mut t = MIN;
-        for _ in 0..20 {
-            assert!(!h.served(&r, t, &ids(0..r.sample as u8)));
-            t += r.interval_ms / 2; // two checks per interval, at worst
-        }
-        assert!(h.verdict(&r, t).counted());
-        assert_eq!(h.fetched_at, None);
+        let timed_out = || Outcome::Unanswered("timed out".into());
+        // one miss: still counted, and asked again an interval later
+        h.checked(10 * MIN, timed_out());
+        assert!(h.verdict(&r, 10 * MIN + 1).counted());
+        assert_eq!(h.next_check(&r, 1.0), 10 * MIN + r.interval_ms);
+        // an answer in between starts over
+        h.checked(20 * MIN, Outcome::Passed);
+        h.checked(30 * MIN, timed_out());
+        assert!(h.verdict(&r, 30 * MIN + 1).counted());
+        // two in a row fail
+        h.checked(40 * MIN, timed_out());
+        assert_eq!(
+            h.verdict(&r, 40 * MIN + 1),
+            Verdict::Failed {
+                at: 40 * MIN,
+                reason: "did not answer 2 checks in a row (timed out)".into()
+            }
+        );
+        // and it stays failed until it passes
+        h.checked(50 * MIN, timed_out());
+        assert!(!h.verdict(&r, 50 * MIN + 1).counted());
+        h.checked(60 * MIN, Outcome::Passed);
+        assert!(h.verdict(&r, 60 * MIN + 1).counted());
+        assert_eq!(h.missed, 0);
     }
 
     #[test]
-    fn fetching_resets_until_a_check_after_the_wait() {
+    fn a_rebuild_fails_while_pieces_are_missing() {
+        // A device that lost its disk fetches everything again; nothing
+        // is declared and fetching is not held against it.
         let r = rules();
         let mut h = Holder::default();
         h.checked(0, Outcome::Passed);
-        let t = 5 * MIN;
-        assert!(h.served(&r, t, &ids(0..16)));
-        assert_eq!(h.verdict(&r, t), Verdict::Fetching { last: t });
-        // a check before the wait is over does not count it again
-        h.checked(t + r.interval_ms, Outcome::Passed);
+        let missing =
+            Outcome::Failed("did not have 3 of the 4 pieces of your files asked for".into());
+        h.checked(10 * MIN, missing);
+        assert!(!h.verdict(&r, 10 * MIN + 1).counted());
+        h.checked(20 * MIN, Outcome::Passed);
         assert_eq!(
-            h.verdict(&r, t + r.interval_ms + 1),
-            Verdict::Fetching { last: t }
+            h.verdict(&r, 20 * MIN + 1),
+            Verdict::Counted { checked: 20 * MIN }
         );
-        // the next check is due only after the wait
-        assert!(h.next_check(&r, 1.0) > t + r.wait_ms());
-        // one after the wait does
-        h.checked(t + r.wait_ms(), Outcome::Passed);
-        assert!(h.verdict(&r, t + r.wait_ms() + 1).counted());
-        // but a failed check after the wait does not
-        let mut g = Holder::default();
-        g.served(&r, t, &ids(0..16));
-        g.checked(
-            t + r.wait_ms(),
-            Outcome::Failed("did not have 4 of 4".into()),
-        );
-        assert!(matches!(
-            g.verdict(&r, t + r.wait_ms() + 1),
-            Verdict::Failed { .. }
-        ));
     }
 
     #[test]
-    fn small_fetches_add_up() {
-        let r = rules();
-        let mut h = Holder::default();
-        // a check's worth, then a few more objects within the interval
-        assert!(!h.served(&r, 0, &ids(0..4)));
-        assert!(!h.served(&r, 1000, &ids(4..8)));
-        assert!(h.served(&r, 2000, &ids(8..12)));
-        assert_eq!(h.fetched_at, Some(2000));
-        // what was sent an interval ago no longer adds up
-        let mut g = Holder::default();
-        assert!(!g.served(&r, 0, &ids(0..8)));
-        assert!(!g.served(&r, r.interval_ms, &ids(8..16)));
-    }
-
-    #[test]
-    fn repeated_fetches_stop_counting() {
-        let r = rules();
-        let mut h = Holder::default();
-        let batch = ids(0..16);
-        // a rebuild fetches each object once; retries soon after are the
-        // same fetch
-        h.served(&r, 0, &batch);
-        h.served(&r, 20_000, &batch);
-        let t1 = 20_000 + r.wait_ms();
-        h.checked(t1, Outcome::Passed);
-        assert!(h.verdict(&r, t1 + 1).counted());
-        assert_eq!(h.repeated_at, None);
-        // fetched again later: a second fetch, still not "again and again"
-        let t2 = t1 + r.repeat_gap_ms();
-        h.served(&r, t2, &batch);
-        assert_eq!(h.repeated_at, None);
-        // and a third time: it is not keeping them
-        let t3 = t2 + r.repeat_gap_ms();
-        h.served(&r, t3, &batch);
-        assert_eq!(h.repeated_at, Some(t3));
-        assert_eq!(h.verdict(&r, t3), Verdict::Repeated { at: t3 });
-        // passing checks soon after does not count it again
-        h.checked(t3 + r.wait_ms(), Outcome::Passed);
-        assert_eq!(
-            h.verdict(&r, t3 + r.wait_ms() + 1),
-            Verdict::Repeated { at: t3 }
-        );
-        // after the hold, a passing check does
-        let t4 = t3 + r.repeat_hold_ms();
-        h.checked(t4, Outcome::Passed);
-        assert!(h.verdict(&r, t4 + 1).counted());
-    }
-
-    #[test]
-    fn serving_resets_and_relays_are_caught() {
+    fn results_survive_a_restart() {
         let dir = tempfile::tempdir().unwrap();
-        let store = FsStore::open(dir.path().join("blobs"), cardinal_blob::Fsync::Never).unwrap();
-        let r = Rules {
-            min_age_ms: 0,
-            ..Rules::default()
-        };
-        let t = Tracker::load(dir.path().join("copies.json"), r);
-        let (k, link) = ([1u8; 32], [2u8; 32]);
-        t.set_view(View {
-            me: [9; 32],
-            names: HashMap::new(),
-            self_full: true,
-            remote: vec![(k, link)],
-            eligible: 0,
-            blobs: 0,
-        });
-        let objects: Vec<Vec<u8>> = (0..20u8).map(|i| vec![i; 100]).collect();
-        let ids: Vec<[u8; 32]> = objects
-            .iter()
-            .map(|o| {
-                let id = *blake3::hash(o).as_bytes();
-                store.put(&id, o).unwrap();
-                id
-            })
-            .collect();
-        let reply = |n: std::ops::Range<usize>| BlobReply {
-            items: n
-                .map(|i| BlobItem::Held {
-                    id: ids[i],
-                    ciphertext: objects[i].clone(),
-                })
-                .collect(),
-        };
-        // A device that is not meant to keep everything is not tracked.
-        t.observe_serve(&[7; 32], &reply(0..20), &store);
-        assert!(t.lock().holders.is_empty());
-        // During a check of k, k fetches one of the objects asked for: the
-        // check is not taken, k is asked again later...
-        t.begin(k, vec![ids[0], ids[1]]);
-        t.observe_serve(&link, &reply(0..1), &store);
+        let path = dir.path().join("copies.json");
+        let r = rules();
+        let t = Tracker::load(path.clone(), r);
+        let k = [1u8; 32];
+        t.begin(k);
+        assert!(t.lock().checking.contains(&k));
         t.finish(k, 100, Some(Outcome::Passed));
-        assert_eq!(t.lock().holders[&k].last_check, None);
-        assert!(t.next_check(&k, 1.0) > 0);
-        // ...and when it happens again, it fails.
-        t.begin(k, vec![ids[2], ids[3]]);
-        t.observe_serve(&link, &reply(2..3), &store);
-        t.finish(k, 200, Some(Outcome::Passed));
-        assert!(matches!(
-            t.lock().holders[&k].verdict(&r, 300),
-            Verdict::Failed { .. }
-        ));
-        // Fetching many objects resets it; the results survive a restart.
-        t.observe_serve(&link, &reply(0..20), &store);
-        assert!(t.lock().holders[&k].fetched_at.is_some());
+        t.finish(k, 200, Some(Outcome::Unanswered("timed out".into())));
+        // a closed session is not a check
+        t.finish(k, 300, None);
+        assert!(t.lock().checking.is_empty());
         t.save();
-        let again = Tracker::load(dir.path().join("copies.json"), r);
-        assert!(again.lock().holders[&k].fetched_at.is_some());
-        assert_eq!(again.lock().holders[&k].last_fail, Some(200));
+        let again = Tracker::load(path.clone(), r);
+        let h = again.lock().holders[&k].clone();
+        assert_eq!(
+            (h.last_check, h.last_pass, h.missed),
+            (Some(200), Some(100), 1)
+        );
+        again.finish(k, 400, Some(Outcome::Unanswered("timed out".into())));
+        assert!(!again.lock().holders[&k].verdict(&r, 500).counted());
+        // a file written by an earlier build, with fields no longer used
+        std::fs::write(
+            &path,
+            format!(
+                r#"{{"holders": {{"{}": {{"last_check": 5, "last_pass": 5,
+                    "fetched_at": 7, "repeated_at": 9}}}}}}"#,
+                hex::encode(k)
+            ),
+        )
+        .unwrap();
+        let old = Tracker::load(path, r);
+        assert_eq!(
+            old.lock().holders[&k].verdict(&r, 10),
+            Verdict::Counted { checked: 5 }
+        );
     }
 
     #[test]
@@ -1279,22 +1016,6 @@ mod tests {
         assert!(!h.own_verdict().counted());
         h.checked(20, Outcome::Passed);
         assert!(h.own_verdict().counted());
-    }
-
-    #[test]
-    fn persisted_results_round_trip() {
-        let mut h = Holder::default();
-        h.checked(5, Outcome::Passed);
-        h.served(&rules(), 7, &ids(0..20));
-        let s = serde_json::to_string(&h).unwrap();
-        let back: Holder = serde_json::from_str(&s).unwrap();
-        assert_eq!(back.last_pass, Some(5));
-        assert_eq!(back.fetched_at, Some(7));
-        assert_eq!(
-            back.verdict(&rules(), 8),
-            h.verdict(&rules(), 8),
-            "the verdict survives a restart"
-        );
     }
 
     fn blob(i: u8, size: u64) -> BlobRef {
