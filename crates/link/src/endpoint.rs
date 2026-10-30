@@ -99,6 +99,9 @@ pub struct Target {
     pub secret: Option<Zeroizing<Vec<u8>>>,
     /// Who the peer must prove to be when its log is not known yet.
     pub expected: ExpectedPeer,
+    /// A public-service or restore session: nothing but the address and
+    /// X25519 key is known of the peer, and this device has no secret.
+    pub public: bool,
 }
 
 impl Target {
@@ -111,6 +114,22 @@ impl Target {
             peer_kem: Some(peer.kem().clone()),
             secret: None,
             expected: ExpectedPeer::default(),
+            public: false,
+        }
+    }
+
+    /// A public-service or restore session (`hosts.md`): only the X25519
+    /// key, and no secret. The first rekey is what gives it post-quantum
+    /// protection.
+    pub fn public(addr: SocketAddr, carrier: CarrierKind, peer_x25519: [u8; 32]) -> Target {
+        Target {
+            addr,
+            carrier,
+            peer_x25519,
+            peer_kem: None,
+            secret: None,
+            expected: ExpectedPeer::default(),
+            public: true,
         }
     }
 
@@ -128,6 +147,7 @@ impl Target {
             peer_kem: None,
             secret: Some(Zeroizing::new(secret.to_vec())),
             expected: ExpectedPeer::default(),
+            public: false,
         }
     }
 
@@ -225,6 +245,7 @@ struct CookieSecret {
 
 pub(crate) struct EndpointInner {
     config: EndpointConfig,
+    allow_public: AtomicBool,
     identity: RwLock<Option<LocalIdentity>>,
     mac1_key: [u8; 32],
     state: Mutex<State>,
@@ -299,6 +320,7 @@ impl Endpoint {
         let mac1_key = packet::mac1_key(config.link_key.public_key().x25519());
         let identity = RwLock::new(config.identity.clone());
         let inner = Arc::new_cyclic(|weak| EndpointInner {
+            allow_public: AtomicBool::new(config.allow_public),
             config,
             identity,
             mac1_key,
@@ -367,6 +389,11 @@ impl Endpoint {
             .identity
             .write()
             .unwrap_or_else(|e| e.into_inner()) = identity;
+    }
+
+    /// Sets [`EndpointConfig::allow_public`]. Sessions open now stay open.
+    pub fn set_allow_public(&self, allow: bool) {
+        self.inner.allow_public.store(allow, Ordering::Relaxed);
     }
 
     /// Registers a secret (invitation, pairing key, token secret).
@@ -754,7 +781,7 @@ impl EndpointInner {
             .collect();
         let secret_bytes: Vec<&[u8]> = secrets.iter().map(|(_, e)| &e.secret[..]).collect();
         let dir = &self.config.directory;
-        let allow_public = self.config.allow_public;
+        let allow_public = self.allow_public.load(Ordering::Relaxed);
         let Ok(recv) = handshake::receive_initiation(
             &self.config.link_key,
             pkt,
@@ -867,6 +894,8 @@ impl EndpointInner {
                 id: 0,
                 expected: t.expected.clone(),
             }
+        } else if t.public {
+            Admission::Public
         } else {
             Admission::Known
         };

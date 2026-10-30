@@ -72,6 +72,44 @@ async fn two(f: impl Fn(&mut EndpointConfig) + Copy) -> (Endpoint, Endpoint, Dev
     (ea, eb, a, b)
 }
 
+/// A device with no identity, unknown to the host, that knows only the
+/// host's address and X25519 key (`hosts.md#restore`).
+#[tokio::test]
+async fn restore_session_needs_only_the_hosts_x25519_key() {
+    let host = device(1, 0xaa);
+    let stranger = device(2, 0xbb);
+    let dir = MemoryDirectory::new();
+    register(&dir, &host);
+    let eh = endpoint_with(&host, dir, |_| {}).await;
+    let es = endpoint_with(&stranger, MemoryDirectory::new(), |c| c.identity = None).await;
+    let target = || {
+        Target::public(
+            eh.tcp_addr().unwrap(),
+            CarrierKind::Tcp,
+            *host.key.public_key().x25519(),
+        )
+    };
+
+    // Refused in silence until the host allows it.
+    assert!(es.connect(target()).await.is_err());
+    eh.set_allow_public(true);
+    let (sn, sh) = tokio::join!(es.connect(target()), eh.accept());
+    let (sn, sh) = (sn.unwrap(), sh.unwrap());
+    assert_eq!(sh.admission(), Admission::Public);
+    assert_eq!(sn.admission(), Admission::Public);
+    assert_eq!(sn.handshake_hash(), sh.handshake_hash());
+    assert!(
+        sn.stats().rekeys >= 1,
+        "the rekey is its only post-quantum step"
+    );
+    assert!(sh.peer_identity().is_none(), "it has no identity yet");
+    assert_eq!(sn.peer_identity().unwrap().identity, [0xaa; 32]);
+
+    // The wrong key gets nothing, not even an error from the host.
+    let wrong = Target::public(eh.tcp_addr().unwrap(), CarrierKind::Tcp, [9; 32]);
+    assert!(es.connect(wrong).await.is_err());
+}
+
 #[tokio::test]
 async fn tcp_session_streams_and_datagrams() {
     let (ea, eb, _a, b) = two(|_| {}).await;
