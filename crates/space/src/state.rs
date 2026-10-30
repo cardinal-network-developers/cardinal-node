@@ -12,9 +12,11 @@
 //!    it is decided in one pass with a registry of created nodes. O(ops),
 //!    plus an ancestor check per named node.
 //! 2. **Deletes.** Each `delete` is decided against the positions in its
-//!    own causal past and the ops of concurrent accepted entries. This
-//!    replays creates and moves of the delete's past, and scans the entries
-//!    concurrent with it: O(n) per delete.
+//!    own causal past and the ops of concurrent accepted entries
+//!    (`delete_effect` is the definition). Deletes in one entry share that
+//!    work, and the log up to where an entry's past stops being unbroken
+//!    is replayed once for all: O(ops), plus the entries around each entry
+//!    with deletes that may be concurrent with it.
 //! 3. **Application.** Creates, sets, moves, deletes, and restores are
 //!    applied in log order. A set drops the values whose entries are its
 //!    ancestors; a move that would make a node its own ancestor is skipped.
@@ -23,7 +25,7 @@
 //! already applied, which therefore comes last in log order, without
 //! recomputing: its deletes have no concurrent work, and the state so far
 //! is the state of its causal past. Any other arrival recomputes from
-//! scratch, which is O(n log n + deletes × n).
+//! scratch, which is O(n log n + ops), plus that concurrent work.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
@@ -170,6 +172,76 @@ struct DeleteEffect {
     conflict: bool,
 }
 
+/// The delete ops' effects, by entry and op.
+type Effects = HashMap<(EntryId, u32), DeleteEffect>;
+
+/// Where nodes are after some entries' creates and moves.
+#[derive(Default)]
+struct Positions {
+    parent: HashMap<NodeId, NodeId>,
+    children: HashMap<NodeId, HashSet<NodeId>>,
+}
+
+impl Positions {
+    /// Replays an entry's creates and moves, noting in `undo` what they
+    /// replaced.
+    fn replay(&mut self, x: &EntryId, e: &SpaceEntry, undo: &mut Vec<(NodeId, Option<NodeId>)>) {
+        for (i, op) in e.ops().iter().enumerate() {
+            let (n, p) = match op.body() {
+                SpaceOpBody::Create { parent, .. } => (derived_id(x, i), *parent),
+                SpaceOpBody::Move { node, parent, .. }
+                    if !would_cycle(&self.parent, node, parent) =>
+                {
+                    (*node, *parent)
+                }
+                _ => continue,
+            };
+            undo.push((n, self.parent.get(&n).copied()));
+            self.place(n, p);
+        }
+    }
+
+    /// Takes back replays noted in `undo`, newest first.
+    fn undo(&mut self, undo: &mut Vec<(NodeId, Option<NodeId>)>) {
+        while let Some((n, was)) = undo.pop() {
+            match was {
+                Some(p) => self.place(n, p),
+                None => {
+                    if let Some(old) = self.parent.remove(&n) {
+                        if let Some(cs) = self.children.get_mut(&old) {
+                            cs.remove(&n);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    fn place(&mut self, n: NodeId, p: NodeId) {
+        if let Some(old) = self.parent.insert(n, p) {
+            if let Some(cs) = self.children.get_mut(&old) {
+                cs.remove(&n);
+            }
+        }
+        self.children.entry(p).or_default().insert(n);
+    }
+
+    /// `n` and the nodes beneath it. (Accepted entries name only nodes
+    /// from their past and moves that would cycle are skipped, so this is
+    /// a tree; the bound is for safety against what others send.)
+    fn subtree(&self, n: &NodeId) -> Vec<NodeId> {
+        let mut out = vec![*n];
+        let mut i = 0;
+        while i < out.len() && i <= self.parent.len() {
+            if let Some(cs) = self.children.get(&out[i]) {
+                out.extend(cs.iter().copied());
+            }
+            i += 1;
+        }
+        out
+    }
+}
+
 impl State {
     /// An empty state (only the root).
     pub fn new(profile: Profile) -> State {
@@ -191,6 +263,37 @@ impl State {
 
     /// Computes the state of the `valid` entries of `dag`.
     pub fn compute(profile: Profile, dag: &Dag<SpaceEntry>, valid: &HashSet<EntryId>) -> State {
+        State::compute_with(profile, dag, valid, State::delete_effects)
+    }
+
+    /// [`State::compute`] with each delete decided on its own by the
+    /// definition, to test the faster way against.
+    #[doc(hidden)]
+    pub fn compute_by_definition(
+        profile: Profile,
+        dag: &Dag<SpaceEntry>,
+        valid: &HashSet<EntryId>,
+    ) -> State {
+        State::compute_with(profile, dag, valid, |st, dag, accepted| {
+            let mut effects = HashMap::new();
+            for x in accepted {
+                let e = dag.get(x).expect("entry");
+                for (i, op) in e.ops().iter().enumerate() {
+                    if let SpaceOpBody::Delete { node } = op.body() {
+                        effects.insert((*x, i as u32), st.delete_effect(dag, accepted, x, node));
+                    }
+                }
+            }
+            effects
+        })
+    }
+
+    fn compute_with(
+        profile: Profile,
+        dag: &Dag<SpaceEntry>,
+        valid: &HashSet<EntryId>,
+        deletes: impl FnOnce(&State, &Dag<SpaceEntry>, &[EntryId]) -> Effects,
+    ) -> State {
         let mut st = State::new(profile);
         let order: Vec<EntryId> = dag
             .log_order()
@@ -213,15 +316,7 @@ impl State {
             .copied()
             .collect();
         // pass 2: deletes
-        let mut effects: HashMap<(EntryId, u32), DeleteEffect> = HashMap::new();
-        for x in &accepted {
-            let e = dag.get(x).expect("entry");
-            for (i, op) in e.ops().iter().enumerate() {
-                if let SpaceOpBody::Delete { node } = op.body() {
-                    effects.insert((*x, i as u32), st.delete_effect(dag, &accepted, x, node));
-                }
-            }
-        }
+        let mut effects = deletes(&st, dag, &accepted);
         // pass 3: application
         for x in &accepted {
             let e = dag.get(x).expect("entry");
@@ -357,6 +452,124 @@ impl State {
             i += 1;
         }
         out
+    }
+
+    /// The effect of every delete in `accepted`: what `delete_effect`
+    /// gives each, sharing the work. The log up to where an entry's past
+    /// stops being unbroken ([`Dag::prefix`]) is replayed once; then only
+    /// the entries around it, where others can be concurrent with it.
+    fn delete_effects(&self, dag: &Dag<SpaceEntry>, accepted: &[EntryId]) -> Effects {
+        let mut effects = Effects::new();
+        let order = dag.log_order();
+        let index = |x: &EntryId| dag.position(x).expect("entry");
+        let mut is_accepted = vec![false; order.len()];
+        for x in accepted {
+            is_accepted[index(x)] = true;
+        }
+        let deletes_of = |e: &SpaceEntry| -> Vec<(u32, NodeId)> {
+            e.ops()
+                .iter()
+                .enumerate()
+                .filter_map(|(i, op)| match op.body() {
+                    SpaceOpBody::Delete { node } => Some((i as u32, *node)),
+                    _ => None,
+                })
+                .collect()
+        };
+        // Entries with deletes, by the unbroken start of their past: replay
+        // only goes forward.
+        let mut todo: Vec<(usize, usize)> = accepted
+            .iter()
+            .filter(|x| !deletes_of(dag.get(x).expect("entry")).is_empty())
+            .map(|x| (dag.prefix()[index(x)].min(index(x)), index(x)))
+            .collect();
+        todo.sort_unstable();
+        // By log position: the least prefix from here on. Everything from
+        // the first position above `i` descends from the entry at `i`.
+        let mut least = dag.prefix().to_vec();
+        for j in (1..least.len()).rev() {
+            least[j - 1] = least[j - 1].min(least[j]);
+        }
+        // `related[y] == mark`: y is in the past of the current entry, is
+        // that entry, or is after it.
+        let mut related = vec![usize::MAX; order.len()];
+        let mut at = Positions::default();
+        let mut undo = Vec::new();
+        let mut replayed = 0;
+        for (mark, (start, i)) in todo.into_iter().enumerate() {
+            while replayed < start {
+                if is_accepted[replayed] {
+                    let x = &order[replayed];
+                    at.replay(x, dag.get(x).expect("entry"), &mut undo);
+                }
+                replayed += 1;
+            }
+            undo.clear();
+            let x = &order[i];
+            let mut past = Vec::new();
+            let mut walk: Vec<usize> = dag.parents(x).iter().map(index).collect();
+            while let Some(y) = walk.pop() {
+                if y >= start && related[y] != mark {
+                    related[y] = mark;
+                    past.push(y);
+                    walk.extend(dag.parents(&order[y]).iter().map(index));
+                }
+            }
+            past.sort_unstable();
+            for y in past.into_iter().filter(|y| is_accepted[*y]) {
+                let e = dag.get(&order[y]).expect("entry");
+                at.replay(&order[y], e, &mut undo);
+            }
+            related[i] = mark;
+            let end = least.partition_point(|n| *n <= i);
+            let mut walk: Vec<usize> = dag.children(x).iter().map(index).collect();
+            while let Some(y) = walk.pop() {
+                if y < end && related[y] != mark {
+                    related[y] = mark;
+                    walk.extend(dag.children(&order[y]).iter().map(index));
+                }
+            }
+            // Ops of concurrent entries touch what they name and everything
+            // above it, up to a deleted node.
+            let deletes = deletes_of(dag.get(x).expect("entry"));
+            let deleted: HashSet<NodeId> = deletes.iter().map(|(_, n)| *n).collect();
+            let named: HashSet<NodeId> = (start..end)
+                .filter(|y| related[*y] != mark && is_accepted[*y])
+                .flat_map(|y| dag.get(&order[y]).expect("entry").ops())
+                .flat_map(|op| named_nodes(op.body()))
+                .collect();
+            let mut touched: HashMap<NodeId, HashSet<NodeId>> = HashMap::new();
+            for z in named {
+                let mut chain = vec![z];
+                let mut cur = z;
+                loop {
+                    if deleted.contains(&cur) {
+                        touched.entry(cur).or_default().extend(&chain);
+                    }
+                    match at.parent.get(&cur) {
+                        Some(p) if chain.len() <= at.parent.len() => cur = *p,
+                        _ => break,
+                    }
+                    chain.push(cur);
+                }
+            }
+            for (op, n) in deletes {
+                let t = touched.get(&n);
+                effects.insert(
+                    (*x, op),
+                    DeleteEffect {
+                        delete: at
+                            .subtree(&n)
+                            .into_iter()
+                            .filter(|m| !t.is_some_and(|t| t.contains(m)))
+                            .collect(),
+                        conflict: t.is_some(),
+                    },
+                );
+            }
+            at.undo(&mut undo);
+        }
+        effects
     }
 
     fn delete_effect(

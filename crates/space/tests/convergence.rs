@@ -172,6 +172,8 @@ fn run(seed: u64, replicas: usize, steps: usize) -> [u64; 5] {
         );
         let full = State::compute(Profile::FILES, s.dag(), &s.validity().valid);
         assert_eq!(full.canonical(), want, "incremental differs (seed {seed})");
+        let plain = State::compute_by_definition(Profile::FILES, s.dag(), &s.validity().valid);
+        assert_eq!(plain.canonical(), want, "shared work differs (seed {seed})");
     }
     let st = spaces[0].state();
     let stats: Vec<_> = spaces.iter().map(|s| s.stats()).collect();
