@@ -112,11 +112,11 @@ pub enum Message {
         /// Each object's bytes, as stored.
         objects: Vec<Vec<u8>>,
     },
-    /// 4: `{0: 4, 1: space id, 2: sealed ids}`.
+    /// 4: `{0: 4, 1: label, 2: ids}`.
     Heads {
-        /// The space.
-        space: Id,
-        /// Sealed ids of the sender's heads.
+        /// The set.
+        label: Label,
+        /// The latest objects the sender holds.
         ids: Vec<Id>,
     },
 }
@@ -141,9 +141,9 @@ impl Message {
                     Value::List(objects.iter().map(|o| Value::from(o.clone())).collect()),
                 )
             }
-            Message::Heads { space, ids } => Record::new()
+            Message::Heads { label, ids } => Record::new()
                 .with(0, 4u64)
-                .with(1, *space)
+                .with(1, *label)
                 .with(2, id_list(ids)),
         }
     }
@@ -181,7 +181,7 @@ impl Message {
                     .collect::<Result<_, _>>()?,
             },
             4 => Message::Heads {
-                space: label,
+                label,
                 ids: read_ids(r, 2)?,
             },
             _ => return Err(SyncError::UnknownOp(op)),
@@ -204,7 +204,7 @@ impl Message {
             Message::Reconcile { label, .. }
             | Message::Want { label, .. }
             | Message::Objects { label, .. } => label,
-            Message::Heads { space, .. } => space,
+            Message::Heads { label, .. } => label,
         }
     }
 }
@@ -270,7 +270,7 @@ mod tests {
                 objects: vec![b"abc".to_vec(), vec![]],
             },
             Message::Heads {
-                space: [7; 32],
+                label: [7; 32],
                 ids: vec![[8; 32], [9; 32]],
             },
         ];

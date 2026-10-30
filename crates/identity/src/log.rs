@@ -347,6 +347,11 @@ impl IdentityLog {
         self.dag.heads()
     }
 
+    /// Whether entries are waiting for parents.
+    pub fn is_waiting(&self) -> bool {
+        self.dag.held().next().is_some()
+    }
+
     /// The number of entries held (not counting those waiting for
     /// parents).
     pub fn len(&self) -> usize {

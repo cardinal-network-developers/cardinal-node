@@ -176,6 +176,13 @@ pub struct Ingested {
     pub new: usize,
     /// Some entries wait for parents this device lacks.
     pub missing_parents: bool,
+    /// How many objects, new or waiting until now, have all they need
+    /// here: what this device can announce.
+    pub complete: usize,
+    /// Those of them it can pass on as they are. Fewer than `complete` when
+    /// there were many, or some had been waiting: a notice then names the
+    /// heads.
+    pub objects: Vec<Vec<u8>>,
 }
 
 impl Holder {
@@ -325,18 +332,23 @@ impl Holder {
         }
         let mut out = Ingested {
             new: fresh.len(),
-            missing_parents: false,
+            ..Ingested::default()
         };
         if fresh.is_empty() {
+            out.missing_parents = self.is_waiting();
             return Ok(out);
         }
         self.persist(&items)?;
         if self.space.is_none() || fresh.len() > 16 {
+            out.complete = fresh.len();
             self.rebuild(fresh, keys, author);
         } else if let Some(space) = self.space.as_mut() {
-            for s in fresh {
+            for (s, (_, bytes)) in fresh.into_iter().zip(items) {
                 match space.receive(s.clone(), keys) {
-                    Ok(Inserted::Held(_)) => out.missing_parents = true,
+                    Ok(Inserted::Added(released)) => {
+                        out.complete += released.len();
+                        out.objects.push(bytes);
+                    }
                     Ok(_) => {}
                     Err(cardinal_space::Error::NoEpochKey) => self.pending.push(s),
                     Err(e) => tracing::warn!("space {}: entry rejected: {e}", short(&self.id)),
@@ -346,6 +358,7 @@ impl Holder {
                 let pend = std::mem::take(&mut self.pending);
                 for s in pend {
                     match space.receive(s.clone(), keys) {
+                        Ok(Inserted::Added(released)) => out.complete += released.len(),
                         Ok(_) => {}
                         Err(cardinal_space::Error::NoEpochKey) => self.pending.push(s),
                         Err(_) => {}
@@ -354,12 +367,15 @@ impl Holder {
             }
             self.version += 1;
         }
-        if let Some(sp) = &self.space {
-            if sp.dag().held().next().is_some() {
-                out.missing_parents = true;
-            }
-        }
+        out.missing_parents = self.is_waiting();
         Ok(out)
+    }
+
+    /// Whether entries wait for parents this device lacks.
+    fn is_waiting(&self) -> bool {
+        self.space
+            .as_ref()
+            .is_some_and(|sp| sp.dag().held().next().is_some())
     }
 
     /// Writes one entry with `ops`. Returns the entry id and the sealed
@@ -682,6 +698,29 @@ impl Core {
         self.spaces
             .get(label)
             .is_some_and(|h| h.set.contains_id(id))
+    }
+
+    /// Whether objects of a set wait for parents this device lacks.
+    pub fn is_waiting(&self, label: &[u8; 32]) -> bool {
+        if Some(*label) == self.identity_label() {
+            return self.identity.as_ref().is_some_and(|i| i.log.is_waiting());
+        }
+        self.spaces.get(label).is_some_and(|h| h.is_waiting())
+    }
+
+    /// The latest objects of a set, as a `heads` notice names them.
+    pub fn heads(&self, label: &[u8; 32]) -> Vec<[u8; 32]> {
+        if Some(*label) == self.identity_label() {
+            return self
+                .identity
+                .as_ref()
+                .map(|i| i.log.heads())
+                .unwrap_or_default();
+        }
+        self.spaces
+            .get(label)
+            .map(|h| h.head_ids())
+            .unwrap_or_default()
     }
 
     /// Adds identity entries. Before this device belongs to an identity,

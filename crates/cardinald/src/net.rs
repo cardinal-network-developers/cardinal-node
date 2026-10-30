@@ -191,14 +191,18 @@ async fn handle_stream(d: &Arc<Daemon>, s: &Session, mut st: Stream) -> anyhow::
                 ingest(d, s, label, objects, access).await?;
             }
         }
-        Message::Heads { space, ids } => {
-            if d.access(kind, &space) == Access::Full {
-                let missing: Vec<[u8; 32]> = {
+        Message::Heads { label, ids } => {
+            if d.access(kind, &label) == Access::Full {
+                let (missing, waiting): (Vec<[u8; 32]>, bool) = {
                     let core = d.core();
-                    ids.into_iter().filter(|i| !core.has(&space, i)).collect()
+                    let missing = ids.into_iter().filter(|i| !core.has(&label, i)).collect();
+                    (missing, core.is_waiting(&label))
                 };
                 if !missing.is_empty() {
-                    fetch_objects(d, s, space, missing, Access::Full).await?;
+                    fetch_objects(d, s, label, missing, Access::Full).await?;
+                } else if waiting {
+                    // this peer may have what was missing by now
+                    reconcile(d, s, label).await?;
                 }
             }
         }
@@ -313,6 +317,7 @@ async fn ingest(
 ) -> anyhow::Result<()> {
     let d2 = d.clone();
     let outcome = tokio::task::spawn_blocking(move || d2.ingest(label, objects, access)).await??;
+    d.pass_on(label, outcome.complete, outcome.objects, s.peer_static());
     if outcome.missing_parents {
         let d2 = d.clone();
         let s2 = s.clone();
@@ -325,36 +330,26 @@ async fn ingest(
     Ok(())
 }
 
-/// Sends new entries of a space to one peer: the entries themselves if
-/// small, else the heads.
-pub async fn push_space(
+/// Sends one peer a notice (`sync.md#notices`): the objects, if there are
+/// any and they are small, else the heads.
+pub async fn notice(
     s: &Session,
-    space: [u8; 32],
-    entries: &[Vec<u8>],
+    label: Label,
+    objects: &[Vec<u8>],
     heads: Vec<[u8; 32]>,
 ) -> anyhow::Result<()> {
-    let total: usize = entries.iter().map(|e| e.len()).sum();
-    let msg = if total <= PUSH_LIMIT {
+    let total: usize = objects.iter().map(|e| e.len()).sum();
+    let msg = if !objects.is_empty() && total <= PUSH_LIMIT {
         Message::Objects {
-            label: space,
-            objects: entries.to_vec(),
+            label,
+            objects: objects.to_vec(),
         }
     } else {
-        Message::Heads { space, ids: heads }
+        Message::Heads { label, ids: heads }
     };
-    let mut st = s.open_stream(Service::SYNC, Priority::Background)?;
+    let mut st = s.open_stream(Service::SYNC, Priority::Interactive)?;
     st.send_message(&to_value(&msg)).await?;
     st.shutdown().await?;
-    Ok(())
-}
-
-/// Sends identity entries to one peer.
-pub async fn push_identity(s: &Session, label: Label, entries: Vec<Vec<u8>>) -> anyhow::Result<()> {
-    for m in cardinal_sync::objects_messages(label, entries) {
-        let mut st = s.open_stream(Service::SYNC, Priority::Background)?;
-        st.send_message(&to_value(&m)).await?;
-        st.shutdown().await?;
-    }
     Ok(())
 }
 

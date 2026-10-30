@@ -245,6 +245,10 @@ fn quiesce(devs: &[&Dev]) -> Duration {
 
 /// Errors other devices or conflict copies explain.
 fn expected(e: &std::io::Error) -> bool {
+    // Through alpha, a file's data may not have reached anyone in reach yet.
+    if e.raw_os_error() == Some(libc::EIO) {
+        return std::env::var_os("CARDINAL_STRESS_LINE").is_some();
+    }
     matches!(
         e.raw_os_error(),
         Some(libc::ENOENT)
@@ -443,11 +447,14 @@ fn stress() {
         devs[i].start();
         pair(&devs[0], &devs[i]);
     }
-    // Every device reaches every other directly (no discovery here).
-    for a in &devs {
-        for b in &devs {
-            if a.name != b.name {
-                a.cli(&["peer", "add", &format!("127.0.0.1:{}", b.port)]);
+    // Every device reaches every other directly (no discovery here), or
+    // with CARDINAL_STRESS_LINE, only alpha, which they all paired with.
+    if std::env::var_os("CARDINAL_STRESS_LINE").is_none() {
+        for a in &devs {
+            for b in &devs {
+                if a.name != b.name {
+                    a.cli(&["peer", "add", &format!("127.0.0.1:{}", b.port)]);
+                }
             }
         }
     }

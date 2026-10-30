@@ -113,7 +113,7 @@ fn sync_vectors() {
                 "ranges_example": hx(range_example.encode()),
                 "want": hx(Message::Want { label, ids: vec![ids[0], ids[1]] }.encode()),
                 "objects": hx(objects.encode()),
-                "heads": hx(Message::Heads { space: label, ids: vec![ids[2]] }.encode()),
+                "heads": hx(Message::Heads { label, ids: vec![ids[2]] }.encode()),
                 "blob_request": hx(request.encode()),
                 "blob_reply": hx(BlobReply::encode(&reply_blob)),
             },

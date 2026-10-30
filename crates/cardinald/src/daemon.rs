@@ -167,6 +167,8 @@ pub struct Daemon {
     connecting: Mutex<HashSet<KeyId>>,
     /// Bumped on every change to the identity or a space.
     pub changed: watch::Sender<u64>,
+    /// News waiting to be passed on.
+    pub news: Mutex<crate::news::Waiting>,
     /// Pairing.
     pub pairing: Mutex<PairState>,
     /// The mount, if mounted.
@@ -295,6 +297,7 @@ impl Daemon {
             mount_lock: Mutex::new(()),
             progress: Mutex::new(Progress::default()),
             blob_stats: Mutex::new(HashMap::new()),
+            news: Mutex::new(HashMap::new()),
             copies: crate::copies::Tracker::load(copies_path, crate::copies::Rules::from_env()),
             cleanup: crate::cleanup::Cleaner::load(old_versions),
             speedtest: crate::speedtest::Limiter::default(),
@@ -461,11 +464,21 @@ impl Daemon {
         let mut core = self.core();
         if Some(label) == core.identity_label() {
             let ch = core.ingest_identity(&objects, None)?;
+            let missing_parents = core.is_waiting(&label);
             drop(core);
-            if ch.changed {
-                self.identity_changed();
+            if !ch.changed {
+                return Ok(Ingested {
+                    missing_parents,
+                    ..Ingested::default()
+                });
             }
-            return Ok(Ingested::default());
+            self.identity_changed();
+            return Ok(Ingested {
+                new: objects.len(),
+                missing_parents,
+                complete: objects.len(),
+                objects,
+            });
         }
         if let Access::Join(identity) = access {
             let ch = core.ingest_identity(&objects, Some(identity))?;
@@ -567,40 +580,18 @@ impl Daemon {
         Ok(ids)
     }
 
-    /// Sends new entries of a space to every online device.
+    /// Tells peers of new entries of a space.
     pub fn push(self: &Arc<Self>, space: &SpaceId, entries: Vec<Vec<u8>>) {
-        if entries.is_empty() {
-            return;
-        }
-        let heads = self
-            .core()
-            .spaces
-            .get(space)
-            .map(|h| h.head_ids())
-            .unwrap_or_default();
-        let entries = Arc::new(entries);
-        for s in self.own_sessions() {
-            let (space, entries, heads) = (*space, entries.clone(), heads.clone());
-            self.rt.spawn(async move {
-                if let Err(e) = net::push_space(&s, space, &entries, heads).await {
-                    tracing::debug!("push to {}: {e:#}", short(&s.peer_static()));
-                }
-            });
+        if !entries.is_empty() {
+            self.notify(*space, entries, &HashSet::new());
         }
     }
 
-    /// Sends identity entries to every online device.
+    /// Tells peers of new identity entries.
     pub fn push_identity(self: &Arc<Self>, entries: Vec<Vec<u8>>) {
-        let Some(label) = self.core().identity_label() else {
-            return;
-        };
-        for s in self.own_sessions() {
-            let e = entries.clone();
-            self.rt.spawn(async move {
-                if let Err(err) = net::push_identity(&s, label, e).await {
-                    tracing::debug!("push identity: {err:#}");
-                }
-            });
+        let label = self.core().identity_label();
+        if let Some(label) = label {
+            self.notify(label, entries, &HashSet::new());
         }
     }
 

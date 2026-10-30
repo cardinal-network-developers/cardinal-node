@@ -904,6 +904,51 @@ mod tests {
         assert_eq!(fx.shown("a.txt"), b"remote");
     }
 
+    /// An entry whose parents are missing waits, unannounced. Hearing of it
+    /// again is the cue to look for them again, and when they come, the
+    /// notice names the heads, which cover both.
+    #[test]
+    fn an_entry_waiting_for_parents_is_not_announced() {
+        let mut fx = Fx::new();
+        let dir = tempfile::tempdir().unwrap();
+        let done = std::process::Command::new("cp")
+            .args(["-a", &format!("{}/.", fx._dir.path().display())])
+            .arg(dir.path())
+            .status()
+            .unwrap();
+        assert!(done.success());
+        let (_, first) = fx
+            .core
+            .write_entry(&fx.space, vec![files::create_folder(ROOT, "a")])
+            .unwrap();
+        let (_, second) = fx
+            .core
+            .write_entry(&fx.space, vec![files::create_folder(ROOT, "b")])
+            .unwrap();
+        let paths = Paths::at(dir.path());
+        let keys = Arc::new(Keys::load_or_create(&paths.device_key()).unwrap());
+        let mut other = Core::load(&paths, keys).unwrap();
+
+        let out = other
+            .ingest_space(fx.space, std::slice::from_ref(&second))
+            .unwrap();
+        assert_eq!((out.new, out.complete), (1, 0));
+        assert!(out.missing_parents);
+
+        let out = other
+            .ingest_space(fx.space, std::slice::from_ref(&second))
+            .unwrap();
+        assert_eq!((out.new, out.complete), (0, 0));
+        assert!(out.missing_parents, "still looking");
+        assert!(other.is_waiting(&fx.space));
+
+        let out = other.ingest_space(fx.space, &[first]).unwrap();
+        assert_eq!(out.complete, 2);
+        assert_eq!(out.objects.len(), 1, "the notice names the heads");
+        assert!(!out.missing_parents);
+        assert!(!other.is_waiting(&fx.space));
+    }
+
     /// A file moved away while a commit encodes does not stop the others.
     #[test]
     fn a_file_gone_during_encoding_is_left_for_the_next_commit() {
