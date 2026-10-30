@@ -63,6 +63,16 @@ pub fn create_device(key: &KeyId, name: &str, always_on: bool, is_host: bool) ->
     )
 }
 
+/// `create` of a host node: one that keeps `grant` (`hosts.md#grants`).
+pub fn create_host(grant: &[u8]) -> SpaceOp {
+    SpaceOp::create(
+        NodeKind::Uint(HOST),
+        ROOT,
+        "host",
+        Record::new().with(1, grant.to_vec()),
+    )
+}
+
 /// `create` of a space node.
 pub fn create_space(space: &SpaceId, local_name: &str) -> SpaceOp {
     SpaceOp::create(
@@ -111,6 +121,15 @@ pub struct DeviceRecord {
     pub always_on: bool,
     /// Whether it is a host for this identity.
     pub is_host: bool,
+}
+
+/// A host node.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HostRecord {
+    /// The node.
+    pub node: NodeId,
+    /// The signed grant.
+    pub grant: Vec<u8>,
 }
 
 /// A placement: where one device keeps one space.
@@ -167,6 +186,21 @@ pub fn devices(state: &State) -> Vec<DeviceRecord> {
         .collect();
     v.sort_by_key(|a| a.key);
     v
+}
+
+/// Every host node.
+pub fn hosts(state: &State) -> Vec<HostRecord> {
+    state
+        .children(&ROOT)
+        .into_iter()
+        .filter(|n| n.kind == NodeKind::Uint(HOST) && !n.deleted)
+        .filter_map(|n| {
+            Some(HostRecord {
+                node: n.id,
+                grant: last(n, 1)?.as_bytes()?.to_vec(),
+            })
+        })
+        .collect()
 }
 
 /// The name of a device, if the account space has one.

@@ -17,6 +17,7 @@ pub mod entry;
 pub mod epoch;
 mod error;
 pub mod files;
+pub mod grant;
 pub mod membership;
 pub mod space;
 pub mod state;
