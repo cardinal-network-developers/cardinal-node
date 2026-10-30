@@ -438,7 +438,8 @@ fn human_time(ms: Option<u64>) -> String {
     let Some(ms) = ms else {
         return "unknown time".into();
     };
-    let t: libc::time_t = (ms / 1000) as libc::time_t;
+    // `time_t` as localtime_r takes it (its alias is deprecated on musl).
+    let t = (ms / 1000) as _;
     // SAFETY: localtime_r only writes into the struct we pass.
     let mut tm: libc::tm = unsafe { std::mem::zeroed() };
     if unsafe { libc::localtime_r(&t, &mut tm) }.is_null() {

@@ -40,8 +40,8 @@ work.
 
 ## Install
 
-Linux with FUSE 3 (`sudo apt install fuse3`), glibc 2.39 or later, and a
-systemd user session. No root needed:
+Linux with FUSE 3 (`sudo apt install fuse3`) and a systemd user session;
+older systems, such as a Synology NAS, get a static build. No root needed:
 
 ```sh
 curl -fsSL https://github.com/cardinal-network-developers/cardinal-node/releases/latest/download/install.sh | sh

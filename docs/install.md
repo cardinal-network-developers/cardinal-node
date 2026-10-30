@@ -14,8 +14,10 @@ service and keeps everything under your home directory.
 
 ## Requirements
 
-- Linux on x86_64 (static musl builds run on any distribution; glibc builds
-  print the minimum glibc they need when released).
+- Linux on x86_64. The installer uses the glibc build where it runs
+  (glibc 2.39 or later), and otherwise a static build that runs on any
+  distribution, such as a Synology NAS. The static build syncs more slowly
+  (musl's memory allocator), and updates to static builds.
 - FUSE 3 for mounting spaces: `/dev/fuse` and `fusermount3` (Debian/Ubuntu:
   `sudo apt install fuse3`; Fedora: `sudo dnf install fuse3`). Cardinal does
   not need `user_allow_other` in `/etc/fuse.conf`.

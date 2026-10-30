@@ -33,8 +33,9 @@ case "$(uname -m)" in
     aarch64|arm64) arch=aarch64 ;;
     *) die "unsupported architecture $(uname -m)" ;;
 esac
-# A static musl build runs anywhere; a glibc build is the fallback.
-targets="$arch-unknown-linux-musl $arch-unknown-linux-gnu"
+# The glibc build where it runs (it is faster: musl's allocator slows
+# sync); else the static musl build, which runs anywhere.
+targets="$arch-unknown-linux-gnu $arch-unknown-linux-musl"
 
 tmp="$(mktemp -d "${TMPDIR:-/tmp}/cardinal-install.XXXXXX")"
 trap 'rm -rf "$tmp"' EXIT INT TERM
@@ -76,38 +77,45 @@ fetch manifest "$tmp/manifest"
 version="$(awk -F'"' '/^version *=/ { print $2; exit }' "$tmp/manifest")"
 [ -n "$version" ] || die "the manifest has no version"
 
-file=""
+# get TARGET: downloads and checks the build for TARGET into
+# $tmp/cardinal; fails if it is missing, damaged, or does not run here.
+get() {
+    file="$(value "artifact.$1" file)"
+    [ -n "$file" ] || return 1
+    case "$file" in
+        .*|*[!A-Za-z0-9._+-]*) die "unsafe file name in manifest: $file" ;;
+    esac
+    size="$(value "artifact.$1" size)"
+    b3="$(value "artifact.$1" blake3)"
+    sha="$(value "artifact.$1" sha256)"
+    echo "Downloading cardinal $version ($1)..."
+    fetch "$file" "$tmp/cardinal"
+    actual_size="$(wc -c <"$tmp/cardinal" | tr -d ' ')"
+    [ "$actual_size" = "$size" ] || die "size mismatch: got $actual_size bytes, manifest says $size"
+    if command -v b3sum >/dev/null 2>&1 && [ -n "$b3" ]; then
+        got="$(b3sum --no-names "$tmp/cardinal")"; want="$b3"; algo=BLAKE3
+    elif [ -n "$sha" ] && command -v sha256sum >/dev/null 2>&1; then
+        got="$(sha256sum "$tmp/cardinal" | cut -d' ' -f1)"; want="$sha"; algo=SHA-256
+    elif [ -n "$sha" ] && command -v shasum >/dev/null 2>&1; then
+        got="$(shasum -a 256 "$tmp/cardinal" | cut -d' ' -f1)"; want="$sha"; algo=SHA-256
+    else
+        die "need b3sum, sha256sum, or shasum to check the download"
+    fi
+    [ "$got" = "$want" ] || die "$algo mismatch for $file; refusing to install it"
+    echo "$algo hash matches the manifest."
+    chmod 755 "$tmp/cardinal"
+    if ! "$tmp/cardinal" version >/dev/null 2>&1; then
+        echo "That build does not run on this system."
+        return 1
+    fi
+}
+
+ok=""
 for t in $targets; do
-    file="$(value "artifact.$t" file)"
-    if [ -n "$file" ]; then target="$t"; break; fi
+    if get "$t"; then ok=1; break; fi
 done
-[ -n "$file" ] || die "release $version has no build for $arch Linux"
-case "$file" in
-    ""|.*|*[!A-Za-z0-9._+-]*) die "unsafe file name in manifest: $file" ;;
-esac
-size="$(value "artifact.$target" size)"
-b3="$(value "artifact.$target" blake3)"
-sha="$(value "artifact.$target" sha256)"
-
-echo "Downloading cardinal $version ($target)..."
-fetch "$file" "$tmp/cardinal"
-
-actual_size="$(wc -c <"$tmp/cardinal" | tr -d ' ')"
-[ "$actual_size" = "$size" ] || die "size mismatch: got $actual_size bytes, manifest says $size"
-if command -v b3sum >/dev/null 2>&1 && [ -n "$b3" ]; then
-    got="$(b3sum --no-names "$tmp/cardinal")"; want="$b3"; algo=BLAKE3
-elif [ -n "$sha" ] && command -v sha256sum >/dev/null 2>&1; then
-    got="$(sha256sum "$tmp/cardinal" | cut -d' ' -f1)"; want="$sha"; algo=SHA-256
-elif [ -n "$sha" ] && command -v shasum >/dev/null 2>&1; then
-    got="$(shasum -a 256 "$tmp/cardinal" | cut -d' ' -f1)"; want="$sha"; algo=SHA-256
-else
-    die "need b3sum, sha256sum, or shasum to check the download"
-fi
-[ "$got" = "$want" ] || die "$algo mismatch for $file; refusing to install it"
-echo "$algo hash matches the manifest."
-
-chmod 755 "$tmp/cardinal"
-"$tmp/cardinal" version || die "the downloaded binary does not run on this system"
+[ -n "$ok" ] || die "release $version has no build for $arch Linux that runs on this system"
+"$tmp/cardinal" version
 "$tmp/cardinal" install "$@"
 
 echo

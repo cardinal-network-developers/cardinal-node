@@ -111,6 +111,14 @@ date="$(date -u +%Y-%m-%d)"
 export CARDINAL_VERSION="$version" CARDINAL_GIT_COMMIT="$commit" CARDINAL_BUILD_DATE="$date"
 export CARGO_PROFILE_RELEASE_STRIP=symbols
 
+# ring (TLS for update downloads) compiles C. Without a musl cross
+# compiler, the host's gcc serves: ring's C uses no libc headers.
+if [[ " ${targets[*]} " == *" x86_64-unknown-linux-musl "* ]] \
+    && [ -z "${CC_x86_64_unknown_linux_musl:-}" ] \
+    && ! command -v x86_64-linux-musl-gcc >/dev/null && ! command -v musl-gcc >/dev/null; then
+    export CC_x86_64_unknown_linux_musl=gcc
+fi
+
 rm -rf "$out"
 mkdir -p "$out"
 specs=()
@@ -118,7 +126,7 @@ for t in "${targets[@]}"; do
     say "building $package ($bin) $version for $t"
     if ! cargo build --quiet --release --locked -p "$package" --bin "$bin" --target "$t"; then
         if [ "$t" = x86_64-unknown-linux-musl ] && [ -z "${CARDINAL_RELEASE_TARGETS:-}" ]; then
-            say "warning: the musl build failed (is musl-tools installed?); skipping it"
+            say "warning: the musl build failed; skipping it"
             continue
         fi
         exit 1
@@ -141,6 +149,14 @@ for t in "${targets[@]}"; do
         exit 1
     fi
     case "$t" in
+        *-linux-musl)
+            if ! ldd "$out/$file" 2>&1 | grep -qE 'statically linked|not a dynamic executable'; then
+                echo "error: $file is not static:" >&2
+                ldd "$out/$file" >&2 || true
+                exit 1
+            fi
+            say "$file is static"
+            ;;
         *-linux-gnu)
             if command -v objdump >/dev/null; then
                 glibc="$(objdump -T "$out/$file" | grep -o 'GLIBC_[0-9.]*' | sed 's/GLIBC_//' | sort -uV | tail -n1)"

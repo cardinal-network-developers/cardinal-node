@@ -35,10 +35,12 @@ by a new key. To rotate deliberately: move the old secret key aside, set
 1. Set the version in the root `Cargo.toml` (`[workspace.package]
    version`), commit, and tag (`git tag v0.2.0`). Releases are built from a
    clean tree; a dirty one is marked `-dirty` in `cardinal version`.
-2. Optionally `rustup target add x86_64-unknown-linux-musl` (and install
-   `musl-tools`) for a static binary that runs on any distribution. Without
-   it the release is glibc-only and the script prints the minimum glibc
-   version it needs.
+2. Optionally `rustup target add x86_64-unknown-linux-musl` for a static
+   binary that runs on any distribution (the script checks it is static).
+   `musl-tools` is not needed: without a musl C compiler, the host's gcc
+   compiles `ring`'s C, which uses no libc headers. Without the target the
+   release is glibc-only, and the script prints the minimum glibc it
+   needs.
 3. Run:
 
    ```sh
