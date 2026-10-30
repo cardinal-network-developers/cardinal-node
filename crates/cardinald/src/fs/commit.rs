@@ -130,7 +130,13 @@ fn encode_all(
                         };
                         let c = encode(st, secret, store);
                         st.close();
-                        out.push((*ino, *gen, c?));
+                        match c {
+                            Ok(c) => out.push((*ino, *gen, c)),
+                            // moved or removed since it was picked: the next
+                            // commit finds it where it is now
+                            Err(_) if !st.path().exists() => {}
+                            Err(e) => return Err(e),
+                        }
                     }
                     Ok(out)
                 })
@@ -895,6 +901,31 @@ mod tests {
         assert!(!n.deleted && n.delete_conflict, "{n:?}");
         fx.refresh();
         assert_eq!(fx.shown("a.txt"), b"remote");
+    }
+
+    /// A file moved away while a commit encodes does not stop the others.
+    #[test]
+    fn a_file_gone_during_encoding_is_left_for_the_next_commit() {
+        let mut fx = Fx::new();
+        let gone = fx.t.new_staged().unwrap();
+        gone.write_all_at(b"gone", 0).unwrap();
+        gone.close();
+        std::fs::remove_file(gone.path()).unwrap();
+        let kept = fx.t.new_staged().unwrap();
+        kept.write_all_at(b"kept", 0).unwrap();
+        let secret = {
+            let sp = fx.sp();
+            let key = sp.keyring().get(&sp.current_epoch().unwrap()).unwrap();
+            ConvergenceSecret::from_epoch_key(key.bytes())
+        };
+        let store = FsStore::open(
+            fx._dir.path().join("test-blobs"),
+            cardinal_blob::Fsync::Never,
+        )
+        .unwrap();
+        let out = encode_all(vec![(1, 1, gone), (2, 1, kept)], &secret, &store).unwrap();
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].0, 2);
     }
 
     /// The same with the edit applied to the tree before the delete: the
