@@ -31,6 +31,8 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 libc = "0.2"
 # Pure-Rust mounting through fusermount3: no libfuse headers needed.
 fuser = { version = "0.15", default-features = false, features = ["abi-7-19"] }
+# gitignore syntax for `.cardinalignore` (fs/local.rs).
+ignore = "0.4"
 
 [dev-dependencies]
 tempfile.workspace = true

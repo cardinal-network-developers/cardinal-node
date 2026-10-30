@@ -40,19 +40,70 @@ pub enum Kind {
 ///
 /// The staging file is opened on demand and closed when no application
 /// has the file open, so copying many files does not hold one descriptor
-/// per file until the next commit.
+/// per file until the next commit. A local item's content
+/// ([`Staged::local`]) is its real file under `local/`, which outlives
+/// the `Staged`.
 pub struct Staged {
     file: Mutex<Option<File>>,
     path: PathBuf,
+    keep: bool,
 }
 
 impl Staged {
+    /// The content of a local item: the real file at `path`, opened when
+    /// first used.
+    pub fn local(path: PathBuf) -> Arc<Staged> {
+        Arc::new(Staged {
+            file: Mutex::new(None),
+            path,
+            keep: true,
+        })
+    }
+
+    /// Where the content is.
+    pub fn path(&self) -> &std::path::Path {
+        &self.path
+    }
+
+    /// Opens the file if it is not open, so it stays readable after its
+    /// name is removed.
+    pub fn keep_open(&self) -> io::Result<()> {
+        self.with(|_| Ok(()))
+    }
+
     fn with<R>(&self, f: impl FnOnce(&File) -> io::Result<R>) -> io::Result<R> {
         let mut g = self.file.lock().unwrap_or_else(|e| e.into_inner());
         if g.is_none() {
-            *g = Some(OpenOptions::new().read(true).write(true).open(&self.path)?);
+            let rw = OpenOptions::new().read(true).write(true).open(&self.path);
+            *g = Some(match rw {
+                // a read-only local file: the kernel refuses writes to it
+                Err(e) if self.keep && e.kind() == io::ErrorKind::PermissionDenied => {
+                    File::open(&self.path)?
+                }
+                r => r?,
+            });
         }
         f(g.as_ref().expect("opened"))
+    }
+
+    /// The content of a local item just created as `file` at `path`.
+    pub fn local_open(path: PathBuf, file: File) -> Arc<Staged> {
+        Arc::new(Staged {
+            file: Mutex::new(Some(file)),
+            path,
+            keep: true,
+        })
+    }
+
+    /// The same content, now at `path` (its file was moved there): a local
+    /// item's, keeping the open file.
+    pub fn moved(&self, path: PathBuf) -> Arc<Staged> {
+        let file = self.file.lock().unwrap_or_else(|e| e.into_inner()).take();
+        Arc::new(Staged {
+            file: Mutex::new(file),
+            path,
+            keep: true,
+        })
     }
 
     pub fn read_at(&self, buf: &mut [u8], off: u64) -> io::Result<usize> {
@@ -80,6 +131,10 @@ impl Staged {
         self.with(|f| f.sync_data())
     }
 
+    pub fn set_modified(&self, t: SystemTime) -> io::Result<()> {
+        self.with(|f| f.set_modified(t))
+    }
+
     /// Closes the staging file; the next access reopens it.
     pub fn close(&self) {
         self.file.lock().unwrap_or_else(|e| e.into_inner()).take();
@@ -88,7 +143,9 @@ impl Staged {
 
 impl Drop for Staged {
     fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.path);
+        if !self.keep {
+            let _ = std::fs::remove_file(&self.path);
+        }
     }
 }
 
@@ -109,7 +166,7 @@ impl Dirty {
     fn any(&self) -> bool {
         self.pos || self.content || self.mode || self.mtime
     }
-    fn all() -> Dirty {
+    pub(crate) fn all() -> Dirty {
         Dirty {
             pos: true,
             content: true,
@@ -163,6 +220,9 @@ pub struct Inode {
     pub write_gen: u64,
     /// Kernel lookups outstanding.
     pub nlookup: u64,
+    /// Kept on this device only (`fs/local.rs`): never committed; its
+    /// content and metadata are a real file or folder under `local/`.
+    pub local: bool,
 }
 
 impl Inode {
@@ -194,6 +254,7 @@ impl Inode {
             last_write: None,
             write_gen: 0,
             nlookup: 0,
+            local: false,
         }
     }
 
@@ -329,6 +390,13 @@ pub struct Tree {
     next_ino: u64,
     next_stage: u64,
     staging: PathBuf,
+    /// Where local items live (`fs/local.rs`).
+    pub local_dir: PathBuf,
+    /// `.cardinalignore` matchers.
+    pub ignores: super::local::Ignores,
+    /// The `.cardinalignore` files' text as last applied
+    /// ([`Tree::reevaluate`]).
+    pub ignore_seen: Option<super::local::IgnoreTexts>,
     /// Nodes to delete at the next commit.
     pub deleted: Vec<Deleted>,
     /// Conflicts to settle at the next commit: the version to keep, or
@@ -364,8 +432,9 @@ pub struct Deleted {
 }
 
 impl Tree {
-    /// An empty tree.
-    pub fn new(staging: PathBuf) -> Tree {
+    /// An empty tree, staging changes in `staging` and keeping local items
+    /// in `local_dir`.
+    pub fn new(staging: PathBuf, local_dir: PathBuf) -> Tree {
         let mut inodes = HashMap::new();
         let mut root = Inode::new(ROOT_INO, Kind::Dir);
         root.node = Some(ROOT);
@@ -380,6 +449,9 @@ impl Tree {
             next_ino: 2,
             next_stage: 1,
             staging,
+            local_dir,
+            ignores: Default::default(),
+            ignore_seen: None,
             deleted: Vec::new(),
             settle: HashMap::new(),
             first_change: None,
@@ -405,7 +477,7 @@ impl Tree {
             || self
                 .inodes
                 .values()
-                .any(|i| i.parent != 0 && (i.node.is_none() || i.dirty.any()))
+                .any(|i| i.parent != 0 && !i.local && (i.node.is_none() || i.dirty.any()))
     }
 
     /// Records a node to delete at the next commit; `seen`, for a file,
@@ -533,6 +605,19 @@ impl Tree {
         parts.join("/")
     }
 
+    /// Moves the file at `src` into staging, as staged content.
+    pub fn stage_from(&mut self, src: &std::path::Path) -> std::io::Result<Arc<Staged>> {
+        let n = self.next_stage;
+        self.next_stage += 1;
+        let path = self.staging.join(format!("{}-{n}", std::process::id()));
+        std::fs::rename(src, &path)?;
+        Ok(Arc::new(Staged {
+            file: Mutex::new(None),
+            path,
+            keep: false,
+        }))
+    }
+
     /// Creates a staging file holding `initial` bytes.
     pub fn new_staged(&mut self) -> std::io::Result<Arc<Staged>> {
         let n = self.next_stage;
@@ -547,6 +632,7 @@ impl Tree {
         Ok(Arc::new(Staged {
             file: Mutex::new(Some(file)),
             path,
+            keep: false,
         }))
     }
 
@@ -648,13 +734,21 @@ impl Tree {
 
         // Committed inodes no longer in the state were deleted elsewhere.
         // Keep those with local changes (or local changes beneath them),
-        // to be created again.
+        // to be created again. A folder with only local items beneath it
+        // (`fs/local.rs`) becomes local itself: kept here, not created
+        // again on every device.
         let mut needed: HashSet<u64> = HashSet::new();
+        let mut needed_local: HashSet<u64> = HashSet::new();
         for i in self.inodes.values() {
             if i.parent != 0 && (i.node.is_none() || i.dirty.content) {
+                let set = if i.local {
+                    &mut needed_local
+                } else {
+                    &mut needed
+                };
                 let mut p = i.ino;
                 for _ in 0..10_000 {
-                    if !needed.insert(p) || p == ROOT_INO {
+                    if !set.insert(p) || p == ROOT_INO {
                         break;
                     }
                     p = match self.inodes.get(&p) {
@@ -674,13 +768,13 @@ impl Tree {
             .map(|i| i.ino)
             .collect();
         for ino in gone {
-            let keep = needed.contains(&ino)
-                && !matches!(
-                    self.inodes.get(&ino).map(|i| i.kind),
-                    Some(Kind::Conflict(_))
-                );
+            let kind = self.inodes.get(&ino).map(|i| i.kind);
+            let conflict = matches!(kind, Some(Kind::Conflict(_)));
+            let keep = needed.contains(&ino) && !conflict;
+            let to_local = !keep && kind == Some(Kind::Dir) && needed_local.contains(&ino);
             let i = self.inodes.get_mut(&ino).expect("ino");
             let node = i.node.take().expect("committed");
+            let name = i.name.clone();
             match i.kind {
                 Kind::Conflict(v) => {
                     self.by_conflict.remove(&(node, v));
@@ -693,11 +787,18 @@ impl Tree {
             }
             if keep {
                 tracing::info!(
-                    "{} was deleted on another device while it had changes here; keeping it",
-                    i.name
+                    "{name} was deleted on another device while it had changes here; keeping it"
                 );
-                i.dirty = Dirty::all();
+                self.inodes.get_mut(&ino).expect("ino").dirty = Dirty::all();
+                self.rekey_local(&node, ino);
+            } else if to_local {
+                tracing::info!(
+                    "{name} was deleted on another device; keeping it on this device for what \
+                     it holds that is not synced"
+                );
+                self.become_local(ino, &node);
             } else {
+                let i = self.inodes.get_mut(&ino).expect("ino");
                 inval.push(Inval::Entry(i.parent, i.name.clone()));
                 inval.push(Inval::Inode(ino));
                 i.parent = 0;
@@ -734,7 +835,7 @@ impl Tree {
     /// Recomputes every folder's children from the inodes' positions. A
     /// name taken twice (a local new file and one from elsewhere) shows
     /// the later as `name (n)`.
-    fn rebuild_children(&mut self) {
+    pub(crate) fn rebuild_children(&mut self) {
         for i in self.inodes.values_mut() {
             i.children.clear();
         }

@@ -163,6 +163,7 @@ pub fn commit(d: &Arc<Daemon>, tree: &Mutex<Tree>, space: &SpaceId) -> anyhow::R
             .values()
             .filter(|i| {
                 i.parent != 0
+                    && !i.local
                     && i.kind == Kind::File
                     && (i.dirty.content || i.node.is_none())
                     && !i.busy(QUIET)
@@ -336,7 +337,8 @@ pub fn write_pending(
                 continue;
             }
             let i = &t.inodes[&ino];
-            if i.parent == 0 || matches!(i.kind, Kind::Conflict(_)) {
+            // local items are never committed (`fs/local.rs`)
+            if i.parent == 0 || i.local || matches!(i.kind, Kind::Conflict(_)) {
                 continue;
             }
             let Some(pnode) = t.inodes.get(&i.parent).and_then(|p| p.node) else {
@@ -556,6 +558,7 @@ fn finish(t: &mut Tree, eid: &EntryId, effects: &[Effect]) {
                     i.seen = vec![*eid];
                 }
                 t.by_node.insert(node, *ino);
+                t.committed_dir(*ino, &node);
             }
             Effect::Clean(ino, f) => {
                 if let Some(i) = t.inodes.get_mut(ino) {
@@ -656,7 +659,7 @@ mod tests {
             let core = Core::load(&paths, keys).unwrap();
             let space = core.files_id().unwrap();
             std::fs::create_dir_all(paths.staging()).unwrap();
-            let t = Tree::new(paths.staging());
+            let t = Tree::new(paths.staging(), paths.local());
             let mut fx = Fx {
                 _dir: dir,
                 core,

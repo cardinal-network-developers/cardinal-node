@@ -4,6 +4,7 @@
 //! libfuse headers or library are linked.
 
 pub mod commit;
+pub mod local;
 pub mod ops;
 pub mod tree;
 
@@ -117,6 +118,11 @@ pub fn refresh(
         if t.applied_version != h.version {
             let snap = Snapshot::take(sp, h.version, &core.device_names());
             invals.extend(t.apply(&snap));
+            // A `.cardinalignore` that changed elsewhere may no longer name
+            // what is local here.
+            if t.ignore_seen.as_ref() != Some(&t.ignore_texts(&d.store)) {
+                t.reevaluate(&d.store);
+            }
         }
         invals
     };
@@ -142,9 +148,17 @@ pub fn mount(d: Arc<Daemon>, space: SpaceId, path: &Path) -> anyhow::Result<Moun
             path.display()
         );
     }
-    let tree = Arc::new(Mutex::new(Tree::new(d.paths.staging())));
+    let tree = Arc::new(Mutex::new(Tree::new(d.paths.staging(), d.paths.local())));
     if let Some(s) = snapshot(&d, &space) {
         tree.lock().unwrap_or_else(|e| e.into_inner()).apply(&s);
+    }
+    // What `.cardinalignore` keeps on this device (`local.rs`).
+    {
+        let core = d.core();
+        let sp = core.spaces.get(&space).and_then(|h| h.space.as_ref());
+        let mut t = tree.lock().unwrap_or_else(|e| e.into_inner());
+        t.load_local(sp);
+        t.ignore_seen = Some(t.ignore_texts(&d.store));
     }
     let fs = ops::CardinalFs::new(d.clone(), tree.clone());
     let opts = [

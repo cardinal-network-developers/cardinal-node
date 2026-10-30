@@ -114,6 +114,10 @@ impl Paths {
     pub fn staging(&self) -> PathBuf {
         self.home.join("staging")
     }
+    /// What `.cardinalignore` keeps on this device only (`fs/local.rs`).
+    pub fn local(&self) -> PathBuf {
+        self.home.join("local")
+    }
     /// Link counters.
     pub fn link_state(&self) -> PathBuf {
         self.home.join("link.json")

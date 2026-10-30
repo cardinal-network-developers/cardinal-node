@@ -15,6 +15,7 @@ use fuser::{
 };
 use libc::{c_int, EACCES, EEXIST, EINVAL, EIO, EISDIR, ENOENT, ENOTDIR, ENOTEMPTY, EPERM, EXDEV};
 
+use super::local::IGNORE_FILE;
 use super::tree::{Kind, Staged, Tree, ROOT_INO};
 use crate::daemon::Daemon;
 use crate::fetch::{blob_ref, Fetcher};
@@ -158,6 +159,7 @@ impl CardinalFs {
         if p.children.contains_key(name) {
             return Err(EEXIST);
         }
+        let local = t.ignored(&self.d.store, parent, name, kind == Kind::Dir);
         let ino = t.alloc(kind);
         {
             let i = t.inodes.get_mut(&ino).expect("new");
@@ -166,12 +168,22 @@ impl CardinalFs {
                 i.content = Some(Content::Inline(Vec::new()));
             }
             i.nlookup = 1;
+            i.local = local;
         }
         t.attach(ino, parent, name);
+        if local {
+            if let Err(e) = make_local(&mut t, ino) {
+                t.detach(ino);
+                t.gc(ino);
+                return Err(errno("cannot keep a file on this device", e));
+            }
+        }
         if let Some(p) = t.inodes.get_mut(&parent) {
             p.mtime = SystemTime::now();
         }
-        t.touch();
+        if !local {
+            t.touch();
+        }
         let a = self.attr(&t, ino).expect("attr");
         Ok((ino, a))
     }
@@ -197,7 +209,8 @@ impl CardinalFs {
             Kind::Dir => return Err(EISDIR),
             _ => return Err(EACCES),
         }
-        let st = if size == 0 {
+        let local = t.inodes[&ino].local;
+        let st = if size == 0 && !local {
             let st = t
                 .new_staged()
                 .map_err(|e| errno("cannot stage a change", e))?;
@@ -210,12 +223,132 @@ impl CardinalFs {
             .map_err(|e| errno("cannot change a file's size", e))?;
         let i = t.inodes.get_mut(&ino).expect("ino");
         i.size = size;
-        i.dirty.content = true;
         i.write_gen += 1;
         i.mtime = SystemTime::now();
         i.ctime = i.mtime;
-        t.touch();
+        if !local {
+            i.dirty.content = true;
+            t.touch();
+        }
         Ok(())
+    }
+}
+
+/// Creates the real file or folder of a new local item
+/// (`fs/local.rs`); a link's is made once its target is known.
+fn make_local(t: &mut Tree, ino: u64) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let path = t.local_place(ino)?;
+    let (kind, perm) = {
+        let i = &t.inodes[&ino];
+        (
+            i.kind,
+            std::fs::Permissions::from_mode(t.inodes[&ino].perm.into()),
+        )
+    };
+    match kind {
+        Kind::Dir => {
+            std::fs::create_dir_all(&path)?;
+            std::fs::set_permissions(&path, perm)?;
+        }
+        Kind::File => {
+            let f = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(&path)?;
+            std::fs::set_permissions(&path, perm)?;
+            t.inodes.get_mut(&ino).expect("ino").staged = Some(Staged::local_open(path, f));
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+/// Deletes a local item's real file, link or (empty) folder. An open
+/// file stays readable until it is closed.
+fn remove_local(t: &Tree, ino: u64) -> std::io::Result<()> {
+    let i = &t.inodes[&ino];
+    let Some(path) = t.local_path(ino) else {
+        return Ok(());
+    };
+    if let (Some(st), true) = (&i.staged, i.opens > 0) {
+        st.keep_open()?;
+    }
+    let r = match i.kind {
+        Kind::Dir => std::fs::remove_dir(&path),
+        _ => std::fs::remove_file(&path),
+    };
+    match r {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        r => r?,
+    }
+    t.prune(&path);
+    Ok(())
+}
+
+/// Sets a local item's modified time on its real file.
+fn set_local_mtime(t: &Tree, ino: u64, when: SystemTime) {
+    let i = &t.inodes[&ino];
+    let r = match (i.kind, &i.staged) {
+        (Kind::File, Some(st)) => st.set_modified(when),
+        (Kind::Dir, _) => t.local_path(ino).map_or(Ok(()), |p| {
+            std::fs::File::open(p).and_then(|f| f.set_modified(when))
+        }),
+        _ => Ok(()),
+    };
+    if let Err(e) = r {
+        tracing::debug!("cannot set the time of {}: {e}", t.path(ino));
+    }
+}
+
+/// A synced file or link, just moved to a local place, becomes local: it
+/// is deleted from the space and kept here, its content in `staged`.
+fn synced_to_local(t: &mut Tree, ino: u64, staged: Option<Arc<Staged>>) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    // Local first: its real path is beneath its parent's.
+    t.inodes.get_mut(&ino).expect("ino").local = true;
+    let made = (|| {
+        let path = t.local_place(ino)?;
+        let (kind, perm, mtime, target) = {
+            let i = &t.inodes[&ino];
+            (i.kind, i.perm, i.mtime, i.target.clone())
+        };
+        match kind {
+            Kind::File => {
+                let st = staged.ok_or_else(|| std::io::Error::from_raw_os_error(EIO))?;
+                std::fs::rename(st.path(), &path)?;
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(perm.into()))?;
+                let st = st.moved(path);
+                let _ = st.set_modified(mtime);
+                t.inodes.get_mut(&ino).expect("ino").staged = Some(st);
+            }
+            Kind::Symlink => std::os::unix::fs::symlink(&target, &path)?,
+            _ => return Err(std::io::Error::from_raw_os_error(EXDEV)),
+        }
+        Ok(())
+    })();
+    if let Err(e) = made {
+        t.inodes.get_mut(&ino).expect("ino").local = false;
+        return Err(e);
+    }
+    let i = t.inodes.get_mut(&ino).expect("ino");
+    let node = i.node.take();
+    let seen = i.seen.clone();
+    i.dirty = Default::default();
+    if let Some(n) = node {
+        t.by_node.remove(&n);
+        t.delete_node(n, Some(seen));
+    }
+    Ok(())
+}
+
+impl CardinalFs {
+    /// After a `.cardinalignore` changed here: local items it no longer
+    /// names become synced.
+    fn ignores_changed(&self, t: &mut Tree) {
+        t.reevaluate(&self.d.store);
     }
 }
 
@@ -284,12 +417,22 @@ impl Filesystem for CardinalFs {
             }
         }
         if let Some(m) = mode {
-            let i = t.inodes.get_mut(&ino).expect("ino");
             let p = (m & 0o7777) as u16;
+            if t.inodes[&ino].local && t.inodes[&ino].kind != Kind::Symlink {
+                if let Some(path) = t.local_path(ino) {
+                    use std::os::unix::fs::PermissionsExt;
+                    let r =
+                        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(p.into()));
+                    if let Err(e) = r {
+                        return reply.error(errno("cannot change a file's mode", e));
+                    }
+                }
+            }
+            let i = t.inodes.get_mut(&ino).expect("ino");
             if p != i.perm {
                 i.perm = p;
                 i.ctime = SystemTime::now();
-                if i.kind == Kind::File {
+                if i.kind == Kind::File && !i.local {
                     i.dirty.mode = true;
                     t.touch();
                 }
@@ -300,10 +443,13 @@ impl Filesystem for CardinalFs {
                 TimeOrNow::Now => SystemTime::now(),
                 TimeOrNow::SpecificTime(x) => x,
             };
+            if t.inodes[&ino].local {
+                set_local_mtime(&t, ino, when);
+            }
             let i = t.inodes.get_mut(&ino).expect("ino");
             if !matches!(i.kind, Kind::Conflict(_)) && i.mtime != when {
                 i.mtime = when;
-                if i.kind == Kind::File {
+                if i.kind == Kind::File && !i.local {
                     i.dirty.mtime = true;
                     t.touch();
                 }
@@ -381,11 +527,22 @@ impl Filesystem for CardinalFs {
             }
             _ => {}
         }
+        let local = t.inodes[&ino].local;
+        if local {
+            if let Err(e) = remove_local(&t, ino) {
+                return reply.error(errno("cannot delete a file", e));
+            }
+        }
         t.remove(ino);
         if let Some(p) = t.inodes.get_mut(&parent) {
             p.mtime = SystemTime::now();
         }
-        t.touch();
+        if !local {
+            t.touch();
+        }
+        if name == IGNORE_FILE {
+            self.ignores_changed(&mut t);
+        }
         reply.ok();
     }
 
@@ -404,8 +561,16 @@ impl Filesystem for CardinalFs {
         if !i.children.is_empty() {
             return reply.error(ENOTEMPTY);
         }
+        let local = i.local;
+        if local {
+            if let Err(e) = remove_local(&t, ino) {
+                return reply.error(errno("cannot delete a folder", e));
+            }
+        }
         t.remove(ino);
-        t.touch();
+        if !local {
+            t.touch();
+        }
         reply.ok();
     }
 
@@ -423,6 +588,16 @@ impl Filesystem for CardinalFs {
         match self.new_child(parent, link_name, Kind::Symlink, 0o777) {
             Ok((ino, _)) => {
                 let mut t = lock(&self.tree);
+                if t.inodes[&ino].local {
+                    let r = t
+                        .local_place(ino)
+                        .and_then(|p| std::os::unix::fs::symlink(&target, p));
+                    if let Err(e) = r {
+                        t.detach(ino);
+                        t.gc(ino);
+                        return reply.error(errno("cannot keep a link on this device", e));
+                    }
+                }
                 let i = t.inodes.get_mut(&ino).expect("new");
                 i.size = target.len() as u64;
                 i.target = target;
@@ -483,83 +658,149 @@ impl Filesystem for CardinalFs {
         if dst == Some(src) {
             return reply.ok();
         }
+        // Where it goes: a local place or a synced one (`fs/local.rs`).
+        let store = self.d.store.clone();
+        let src_local = t.inodes[&src].local;
+        let to_local = t.ignored(&store, newparent, newname, skind == Kind::Dir);
+        if !src_local && to_local && skind == Kind::Dir {
+            // A synced folder does not become local in one step: `mv`
+            // copies it instead.
+            return reply.error(EXDEV);
+        }
         if let Some(dst) = dst {
             if flags & libc::RENAME_NOREPLACE != 0 {
                 return reply.error(EEXIST);
             }
-            let dkind = t.inodes[&dst].kind;
-            match (skind, dkind) {
+            match (skind, t.inodes[&dst].kind) {
                 (_, Kind::Conflict(_)) => return reply.error(EPERM),
-                (Kind::Dir, Kind::Dir) => {
-                    if !t.inodes[&dst].children.is_empty() {
-                        return reply.error(ENOTEMPTY);
-                    }
-                    t.remove(dst);
+                (Kind::Dir, Kind::Dir) if !t.inodes[&dst].children.is_empty() => {
+                    return reply.error(ENOTEMPTY)
                 }
+                (Kind::Dir, Kind::Dir) => {}
                 (Kind::Dir, _) => return reply.error(ENOTDIR),
                 (_, Kind::Dir) => return reply.error(EISDIR),
-                (Kind::File, Kind::File) => {
-                    // Replacing a file keeps the replaced file's identity,
-                    // so the change is an edit of it (history, conflicts):
-                    // the source inode takes over the destination's node.
-                    let dnode = t.inodes[&dst].node;
-                    let snode = t.inodes[&src].node;
-                    let ddirty = t.inodes[&dst].dirty;
-                    let dseen = t.inodes[&dst].seen.clone();
-                    if let Some(dn) = dnode {
-                        // forget the destination without deleting its node
-                        t.detach(dst);
-                        if let Some(di) = t.inodes.get_mut(&dst) {
-                            di.node = None;
-                            di.dirty = Default::default();
-                        }
-                        t.gc(dst);
-                        if let Some(sn) = snode {
-                            t.by_node.remove(&sn);
-                            t.delete_node(sn, None);
-                        }
-                        t.detach(src);
-                        t.by_node.insert(dn, src);
-                        {
-                            let s = t.inodes.get_mut(&src).expect("src");
-                            s.node = Some(dn);
-                            s.seen = dseen;
-                            s.dirty.content = true;
-                            s.dirty.mode = true;
-                            s.dirty.mtime = true;
-                            s.dirty.pos = ddirty.pos;
-                            s.write_gen += 1;
-                            if s.staged.is_none() {
-                                // the content to commit is the source's
-                                // committed content
-                            }
-                        }
-                        t.attach(src, newparent, newname);
-                        t.touch();
-                        return reply.ok();
+                _ => {}
+            }
+        }
+        let old_local = if src_local { t.local_path(src) } else { None };
+        // A synced file going local: its content first (it may be fetched).
+        let going_local = if !src_local && to_local && skind == Kind::File {
+            match self.stage(&mut t, src) {
+                Ok(st) => Some(st),
+                Err(e) => return reply.error(e),
+            }
+        } else {
+            None
+        };
+        // A local file going synced is staged in place first, so that it
+        // replaces a synced file as an edit of it.
+        if src_local && !to_local && skind != Kind::Dir {
+            let Some(old) = old_local.clone() else {
+                return reply.error(ENOENT);
+            };
+            if let Err(e) = t.local_to_synced(&store, src, old) {
+                return reply.error(errno("cannot sync a file", e));
+            }
+        }
+        // Local to local: the real file moves first (replacing a local
+        // destination), so a failure changes nothing.
+        if src_local && to_local {
+            let (Some(old), Some(new)) =
+                (old_local.clone(), t.local_child_path(newparent, newname))
+            else {
+                return reply.error(ENOENT);
+            };
+            let r = new
+                .parent()
+                .map_or(Ok(()), std::fs::create_dir_all)
+                .and_then(|()| std::fs::rename(&old, &new));
+            if let Err(e) = r {
+                return reply.error(errno("cannot move a file", e));
+            }
+            t.prune(&old);
+        }
+        let mut took_over = false;
+        if let Some(dst) = dst {
+            let dlocal = t.inodes[&dst].local;
+            if dlocal && !(src_local && to_local) {
+                if let Err(e) = remove_local(&t, dst) {
+                    return reply.error(errno("cannot replace a file", e));
+                }
+            }
+            let (dkind, dnode) = (t.inodes[&dst].kind, t.inodes[&dst].node);
+            let take_over = match dnode {
+                Some(dn) if !to_local && skind == Kind::File && dkind == Kind::File => Some(dn),
+                _ => None,
+            };
+            if let Some(dn) = take_over {
+                // Replacing a file keeps the replaced file's identity, so
+                // the change is an edit of it (history, conflicts): the
+                // source inode takes over the destination's node.
+                let snode = t.inodes[&src].node;
+                let ddirty = t.inodes[&dst].dirty;
+                let dseen = t.inodes[&dst].seen.clone();
+                // forget the destination without deleting its node
+                t.detach(dst);
+                if let Some(di) = t.inodes.get_mut(&dst) {
+                    di.node = None;
+                    di.dirty = Default::default();
+                }
+                t.gc(dst);
+                if let Some(sn) = snode {
+                    t.by_node.remove(&sn);
+                    t.delete_node(sn, None);
+                }
+                t.detach(src);
+                t.by_node.insert(dn, src);
+                let s = t.inodes.get_mut(&src).expect("src");
+                s.node = Some(dn);
+                s.seen = dseen;
+                s.dirty.content = true;
+                s.dirty.mode = true;
+                s.dirty.mtime = true;
+                s.dirty.pos = ddirty.pos;
+                s.write_gen += 1;
+                t.attach(src, newparent, newname);
+                took_over = true;
+            } else {
+                t.remove(dst);
+            }
+        }
+        if !took_over {
+            t.detach(src);
+            t.attach(src, newparent, newname);
+            if src_local && to_local {
+                t.repath_local(src);
+            } else if src_local && skind == Kind::Dir {
+                // a local folder going synced, with what is in it
+                if let Some(old) = old_local {
+                    if let Err(e) = t.local_to_synced(&store, src, old) {
+                        tracing::warn!("cannot sync {}: {e}", t.path(src));
                     }
-                    t.remove(dst);
                 }
-                _ => {
-                    t.remove(dst);
+            } else if !src_local && to_local {
+                if let Err(e) = synced_to_local(&mut t, src, going_local) {
+                    return reply.error(errno("cannot keep a file on this device", e));
+                }
+            } else if let Some(s) = t.inodes.get_mut(&src) {
+                if s.node.is_some() {
+                    s.dirty.pos = true;
                 }
             }
-        }
-        t.detach(src);
-        t.attach(src, newparent, newname);
-        if let Some(s) = t.inodes.get_mut(&src) {
-            if s.node.is_some() {
-                s.dirty.pos = true;
+            if let Some(s) = t.inodes.get_mut(&src) {
+                s.ctime = SystemTime::now();
             }
-            s.ctime = SystemTime::now();
-        }
-        let now = SystemTime::now();
-        for p in [parent, newparent] {
-            if let Some(pi) = t.inodes.get_mut(&p) {
-                pi.mtime = now;
+            let now = SystemTime::now();
+            for p in [parent, newparent] {
+                if let Some(pi) = t.inodes.get_mut(&p) {
+                    pi.mtime = now;
+                }
             }
         }
         t.touch();
+        if name == IGNORE_FILE || newname == IGNORE_FILE {
+            self.ignores_changed(&mut t);
+        }
         reply.ok();
     }
 
@@ -596,6 +837,18 @@ impl Filesystem for CardinalFs {
         i.opens += 1;
         if write {
             i.writers += 1;
+        }
+        // A local file stays readable while open, even once deleted.
+        if i.local {
+            if let Some(st) = &i.staged {
+                if let Err(e) = st.keep_open() {
+                    i.opens -= 1;
+                    if write {
+                        i.writers -= 1;
+                    }
+                    return reply.error(errno("cannot open a file", e));
+                }
+            }
         }
         drop(t);
         let fh = self.open_handle(ino, write);
@@ -721,12 +974,14 @@ impl Filesystem for CardinalFs {
         }
         let i = t.inodes.get_mut(&ino).expect("ino");
         i.size = i.size.max(offset + data.len() as u64);
-        i.dirty.content = true;
         i.write_gen += 1;
         i.last_write = Some(Instant::now());
         i.mtime = SystemTime::now();
         i.ctime = i.mtime;
-        t.touch();
+        if !i.local {
+            i.dirty.content = true;
+            t.touch();
+        }
         reply.written(data.len() as u32);
     }
 
@@ -753,13 +1008,18 @@ impl Filesystem for CardinalFs {
                     st.close();
                 }
             }
+            let mut ignores = false;
             if h.as_ref().is_some_and(|h| h.write) {
                 i.writers = i.writers.saturating_sub(1);
+                ignores = i.name == IGNORE_FILE;
                 if i.dirty.content {
                     // a closed file is quiet now
                     i.last_write = None;
                     t.touch();
                 }
+            }
+            if ignores {
+                self.ignores_changed(&mut t);
             }
         }
         t.gc(ino);
