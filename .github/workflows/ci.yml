@@ -1,0 +1,67 @@
+# Format, lint and test on every push and pull request. The end-to-end
+# tests mount through FUSE, so fuse3 is installed; the specification is
+# checked out beside this repository for the tests that compare against
+# its model (they skip without it).
+name: CI
+
+on:
+  push:
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: node
+      - uses: actions/checkout@v4
+        with:
+          repository: cardinal-network-developers/cardinal-core
+          path: core
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: node
+      - name: Install FUSE
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y fuse3
+          ls -l /dev/fuse
+      - name: Format
+        working-directory: node
+        run: cargo fmt --all --check
+      - name: Lint
+        working-directory: node
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - name: Test
+        working-directory: node
+        env:
+          CARDINAL_CORE: ${{ github.workspace }}/core
+        run: cargo test --workspace --locked
+
+  static:
+    # The static build the installer falls back to on older systems.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+      - uses: Swatinem/rust-cache@v2
+      - name: Build
+        env:
+          # ring's C needs no libc headers, so the host's gcc serves.
+          CC_x86_64_unknown_linux_musl: gcc
+        run: |
+          cargo build --release --locked --target x86_64-unknown-linux-musl -p cardinal
+          f=target/x86_64-unknown-linux-musl/release/cardinal
+          ldd "$f" 2>&1 | grep -qE 'statically linked|not a dynamic executable'
+          "$f" version
