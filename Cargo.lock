@@ -206,7 +206,7 @@ checksum = "fc652a48c352aef3ea3aed32080501cf3ef6ed5da78602a020c991775b0aff04"
 
 [[package]]
 name = "cardinal"
-version = "0.1.8"
+version = "0.1.9"
 dependencies = [
  "anyhow",
  "blake3",
@@ -222,7 +222,7 @@ dependencies = [
 
 [[package]]
 name = "cardinal-blob"
-version = "0.1.8"
+version = "0.1.9"
 dependencies = [
  "blake3",
  "cardinal-crypto",
@@ -236,7 +236,7 @@ dependencies = [
 
 [[package]]
 name = "cardinal-contact"
-version = "0.1.8"
+version = "0.1.9"
 dependencies = [
  "cardinal-crypto",
  "cardinal-encoding",
@@ -249,7 +249,7 @@ dependencies = [
 
 [[package]]
 name = "cardinal-crypto"
-version = "0.1.8"
+version = "0.1.9"
 dependencies = [
  "blake3",
  "cardinal-encoding",
@@ -270,7 +270,7 @@ dependencies = [
 
 [[package]]
 name = "cardinal-encoding"
-version = "0.1.8"
+version = "0.1.9"
 dependencies = [
  "blake3",
  "hex",
@@ -280,7 +280,7 @@ dependencies = [
 
 [[package]]
 name = "cardinal-identity"
-version = "0.1.8"
+version = "0.1.9"
 dependencies = [
  "blake3",
  "cardinal-crypto",
@@ -293,7 +293,7 @@ dependencies = [
 
 [[package]]
 name = "cardinal-link"
-version = "0.1.8"
+version = "0.1.9"
 dependencies = [
  "blake3",
  "bytes",
@@ -308,7 +308,7 @@ dependencies = [
 
 [[package]]
 name = "cardinal-space"
-version = "0.1.8"
+version = "0.1.9"
 dependencies = [
  "blake3",
  "cardinal-crypto",
@@ -320,7 +320,7 @@ dependencies = [
 
 [[package]]
 name = "cardinal-sync"
-version = "0.1.8"
+version = "0.1.9"
 dependencies = [
  "blake3",
  "cardinal-crypto",
@@ -332,7 +332,7 @@ dependencies = [
 
 [[package]]
 name = "cardinal-update"
-version = "0.1.8"
+version = "0.1.9"
 dependencies = [
  "anyhow",
  "blake3",
@@ -347,7 +347,7 @@ dependencies = [
 
 [[package]]
 name = "cardinald"
-version = "0.1.8"
+version = "0.1.9"
 dependencies = [
  "anyhow",
  "blake3",
