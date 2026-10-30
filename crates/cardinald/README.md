@@ -231,6 +231,29 @@ Copies: 3 — this device, saint-joseph, nuc (checked 4 minutes ago; files older
 - `CARDINAL_TEST_CHECK_INTERVAL_MS` and `CARDINAL_TEST_CHECK_MIN_AGE_MS`
   shorten the interval and the age (tests).
 
+## Paths kept on this device
+
+`fs/local.rs` (`profiles.md#paths-kept-on-one-device`, D47):
+
+- **What is local.** A `.cardinalignore` file (gitignore syntax; the
+  nearest file with a matching line decides) names paths in its folder
+  and below. A new item is local when its folder is local or a line names
+  it. What is already synced stays synced where it is.
+- **Where it lives.** Local items are real files, folders and links under
+  `local/` in the data directory, beneath their nearest synced folder's
+  node id in hex (`new-<inode>` until that folder is committed), so
+  renaming synced folders moves nothing. They are loaded at mount.
+- **Moving across the line.** Local to synced stages the content for the
+  next commit (onto a synced file it is an edit of it). A synced file
+  going local is deleted from the space and kept here. A synced folder
+  going local is `EXDEV`, so `mv` copies it.
+- **Changing lines.** When a `.cardinalignore` changes, here or
+  elsewhere, local items the old lines named and the new ones do not
+  become synced.
+- **Deleted elsewhere.** A synced folder deleted on another device that
+  holds local items here becomes local here, also when this device was
+  off at the time (put back where it was, from the space's state).
+
 ## Freeing space
 
 `cleanup.rs`, about every hour (the first a minute after start):
@@ -302,7 +325,6 @@ colours. `CARDINAL_LOG` or `RUST_LOG` sets the filter (`info` by default;
 
 ## Not done yet
 
-- Folder ignore patterns are not applied.
 - Hosts (mailbox, relay, storage), guardians, restoring from the phrase
   when every device is lost.
   Copies on hosts (host grants) are not counted.

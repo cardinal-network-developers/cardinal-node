@@ -1,4 +1,5 @@
-//! Paths kept on this device only.
+//! Paths kept on this device only (`profiles.md#paths-kept-on-one-device`,
+//! decision D47).
 //!
 //! A `.cardinalignore` file, in gitignore syntax, names paths in its
 //! folder and below that stay on this device: they show in the mount like

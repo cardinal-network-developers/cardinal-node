@@ -19,6 +19,9 @@ One person, several Linux devices, one folder that is the same everywhere:
   history, restore, and conflict copies labeled by device.
 - Devices on the same network find each other; others are added with
   `cardinal peer add host:7171`.
+- A `.cardinalignore` file (gitignore syntax) lists paths that stay on
+  the device where they are made, such as build output: they show in
+  your folder there and are never synced.
 - Deleted files and old versions are kept 30 days so you can restore them
   (`cardinal history`, `cardinal restore`), then freed. `cardinal
   free-space` frees them now; `cardinal keep-old 90` or `forever` changes

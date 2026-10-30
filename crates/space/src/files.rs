@@ -17,8 +17,6 @@ pub const FILE: u64 = 2;
 /// Link kind.
 pub const LINK: u64 = 3;
 
-/// Folder field 1: ignore patterns.
-pub const FOLDER_IGNORE: u64 = 1;
 /// File field 1: content.
 pub const FILE_CONTENT: u64 = 1;
 /// File field 2: mode bits.
