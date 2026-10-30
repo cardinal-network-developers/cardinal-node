@@ -54,6 +54,25 @@ pub fn word_index(word: &str) -> Option<u16> {
         .map(|i| i as u16)
 }
 
+/// The word `typed` stands for, ignoring ASCII case: itself, or the one
+/// word that starts with it when it is at least four letters long. The
+/// first four letters of every BIP-39 English word are unique, so they are
+/// enough to type a phrase.
+pub fn complete_word(typed: &str) -> Option<&'static str> {
+    if let Some(i) = word_index(typed) {
+        return Some(word(i));
+    }
+    let lower = typed.to_ascii_lowercase();
+    if lower.len() < 4 {
+        return None;
+    }
+    let mut found = wordlist().iter().filter(|w| w.starts_with(&lower));
+    match (found.next(), found.next()) {
+        (Some(w), None) => Some(w),
+        _ => None,
+    }
+}
+
 /// The 24 words for 256 bits of entropy, with BIP-39's checksum.
 pub fn entropy_to_words(entropy: &[u8; 32]) -> [&'static str; PHRASE_WORDS] {
     let checksum = Sha256::digest(entropy)[0];
@@ -180,6 +199,22 @@ mod tests {
         assert!(l.windows(2).all(|w| w[0] < w[1]));
         assert_eq!(word_index("Zoo"), Some(2047));
         assert_eq!(word_index("zzz"), None);
+    }
+
+    #[test]
+    fn completing_words() {
+        assert_eq!(complete_word("act"), Some("act"));
+        assert_eq!(complete_word("Abse"), Some("absent"));
+        assert_eq!(complete_word("absent"), Some("absent"));
+        assert_eq!(complete_word("abs"), None, "three letters are not enough");
+        assert_eq!(complete_word("absx"), None);
+        // four letters always name exactly one word
+        let mut prefixes: Vec<&str> = wordlist().iter().map(|w| &w[..w.len().min(4)]).collect();
+        prefixes.dedup();
+        assert_eq!(prefixes.len(), 2048);
+        for w in wordlist() {
+            assert_eq!(complete_word(&w[..w.len().min(4)]), Some(*w));
+        }
     }
 
     /// Entropy-to-mnemonic vectors from the BIP-39 reference test set

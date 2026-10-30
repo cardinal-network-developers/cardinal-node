@@ -124,6 +124,7 @@ pub async fn type_code(
     code: &str,
     at: Option<SocketAddr>,
     admin: bool,
+    words: Option<&str>,
 ) -> anyhow::Result<String> {
     let identity = d.core().identity.as_ref().map(|i| i.id()).ok_or_else(|| {
         anyhow::anyhow!(
@@ -131,17 +132,13 @@ pub async fn type_code(
              or run `cardinal pair` (without a code) to add this device to your others."
         )
     })?;
-    {
-        let core = d.core();
-        let st = core.identity.as_ref().expect("identity").state();
-        match st.power(&d.keys.key()) {
-            Some(p) if p >= Power::Admin => {}
-            _ => anyhow::bail!(
-                "this device cannot add devices (it is not an admin device). Type the code on \
-                 the device you set up first."
-            ),
-        }
-    }
+    // Only an admin device adds devices, or the recovery words.
+    let root = crate::recovery::signer(
+        d,
+        words,
+        |mine| mine >= Some(Power::Admin),
+        || "this device cannot add devices (it is not an admin device)".to_owned(),
+    )?;
     let code = PairingCode::parse(code).map_err(|_| {
         anyhow::anyhow!("{code:?} is not a pairing code; it looks like 4-anchor-harbor-quit")
     })?;
@@ -198,9 +195,8 @@ pub async fn type_code(
             link_key: nd.link_key.clone(),
             proof: nd.proof,
         };
-        let e = ident
-            .log
-            .add_key(&d.keys.device.signing, &req, Some(&enc))?;
+        let signer = root.as_ref().unwrap_or(&d.keys.device.signing);
+        let e = ident.log.add_key(signer, &req, Some(&enc))?;
         ident.record_own(&e)?;
         e
     };

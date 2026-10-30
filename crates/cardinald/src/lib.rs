@@ -18,6 +18,7 @@ pub mod keys;
 pub mod net;
 pub mod pair;
 pub mod paths;
+pub mod recovery;
 pub mod sched;
 pub mod setup;
 pub mod speedtest;

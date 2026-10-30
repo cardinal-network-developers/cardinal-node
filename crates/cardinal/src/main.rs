@@ -105,9 +105,16 @@ enum Cmd {
         json: bool,
     },
     /// Remove a device you no longer use (it is cut off from your files).
+    /// Removing an admin device, or removing from a device that is not an
+    /// admin, asks for your recovery words.
     RemoveDevice {
         /// The device's name or key, as `cardinal devices` shows.
         who: String,
+    },
+    /// Your 24 recovery words.
+    Recovery {
+        #[command(subcommand)]
+        cmd: RecoveryCmd,
     },
     /// Devices reached over the internet, by address.
     Peer {
@@ -167,6 +174,13 @@ enum Cmd {
     Stop,
     #[command(flatten)]
     Deploy(cardinal_update::DeployCommand),
+}
+
+#[derive(Subcommand)]
+enum RecoveryCmd {
+    /// Check the words you wrote down: type them, and this says whether
+    /// they are yours. Nothing is changed or kept.
+    Check,
 }
 
 #[derive(Subcommand)]
@@ -233,17 +247,104 @@ fn main() {
 }
 
 async fn call(paths: &Paths, req: Value) -> anyhow::Result<Value> {
-    let v = control::request(&paths.socket, &req).await.map_err(|_| {
-        anyhow::anyhow!(
-            "the cardinal daemon is not running. Start it with `cardinal daemon` (or \
-             `systemctl --user start cardinal` if you installed it with `cardinal install`)."
-        )
-    })?;
+    let v = request(paths, &req).await?;
     if v["ok"].as_bool() == Some(true) {
         Ok(v)
     } else {
         anyhow::bail!("{}", v["error"].as_str().unwrap_or("the daemon failed"))
     }
+}
+
+/// The daemon's reply, whether it succeeded or not.
+async fn request(paths: &Paths, req: &Value) -> anyhow::Result<Value> {
+    control::request(&paths.socket, req).await.map_err(|_| {
+        anyhow::anyhow!(
+            "the cardinal daemon is not running. Start it with `cardinal daemon` (or \
+             `systemctl --user start cardinal` if you installed it with `cardinal install`)."
+        )
+    })
+}
+
+/// Calls the daemon; when this device lacks the power for the action,
+/// says why, asks for the recovery words, and calls again with them.
+async fn call_with_words(paths: &Paths, mut req: Value) -> anyhow::Result<Value> {
+    let v = request(paths, &req).await?;
+    if v["ok"].as_bool() == Some(true) {
+        return Ok(v);
+    }
+    let why = v["error"].as_str().unwrap_or("the daemon failed");
+    if v["needs_words"].as_bool() != Some(true) {
+        anyhow::bail!("{why}");
+    }
+    println!("{}.", capitalized(why));
+    let words = ask_words(paths, "Your recovery words can approve it instead.").await?;
+    req["words"] = json!(words.as_str());
+    call(paths, req).await
+}
+
+fn capitalized(s: &str) -> String {
+    let mut c = s.chars();
+    c.next()
+        .map(|f| f.to_uppercase().chain(c).collect())
+        .unwrap_or_default()
+}
+
+/// Asks for the 24 recovery words (typed whole, or their first four
+/// letters), until they are valid and this identity's, three times at
+/// most. They are used once and not kept.
+async fn ask_words(
+    paths: &Paths,
+    intro: &str,
+) -> anyhow::Result<cardinal_crypto::Zeroizing<String>> {
+    println!("{intro}");
+    println!("Type them in order, separated by spaces; the first four letters of each");
+    println!("are enough. Press Enter after each line.");
+    for attempt in 0..3 {
+        let mut typed: Vec<String> = Vec::new();
+        while typed.len() < 24 {
+            print!("words {}-24: ", typed.len() + 1);
+            std::io::stdout().flush()?;
+            let mut line = cardinal_crypto::Zeroizing::new(String::new());
+            if std::io::stdin().lock().read_line(&mut line)? == 0 {
+                anyhow::bail!("stopped before all 24 words were typed");
+            }
+            typed.extend(line.split_whitespace().map(str::to_owned));
+        }
+        let mut words = cardinal_crypto::Zeroizing::new(String::new());
+        let mut bad = None;
+        for (i, w) in typed.iter().enumerate() {
+            match cardinal_crypto::bip39::complete_word(w) {
+                Some(full) => {
+                    if i > 0 {
+                        words.push(' ');
+                    }
+                    words.push_str(full);
+                }
+                None => bad = bad.or(Some(i)),
+            }
+        }
+        typed.iter_mut().for_each(cardinal_crypto::Zeroize::zeroize);
+        let problem = match bad {
+            Some(i) => format!("word {} is not a recovery word; check its spelling", i + 1),
+            None => match request(
+                paths,
+                &json!({"cmd": "recovery-check", "words": words.as_str()}),
+            )
+            .await?
+            {
+                v if v["ok"].as_bool() == Some(true) => return Ok(words),
+                v => v["error"]
+                    .as_str()
+                    .unwrap_or("the words were not accepted")
+                    .to_owned(),
+            },
+        };
+        println!("{}.", capitalized(&problem));
+        if attempt < 2 {
+            println!("Try again from the first word.");
+        }
+    }
+    anyhow::bail!("the recovery words were not accepted; nothing was changed")
 }
 
 async fn running(paths: &Paths) -> bool {
@@ -448,12 +549,22 @@ async fn pair(
     admin: bool,
 ) -> anyhow::Result<()> {
     if let Some(code) = code {
+        let mut req = json!({"cmd": "pair-type", "code": code, "at": at, "admin": admin});
+        // Only an admin device adds devices; elsewhere the recovery words
+        // approve it. Ask before the code times out on the new device.
+        let st = call(paths, json!({"cmd": "status"})).await?;
+        let mine = st["devices"]
+            .as_array()
+            .and_then(|a| a.iter().find(|x| x["this"] == true))
+            .and_then(|x| x["power"].as_str())
+            .unwrap_or("");
+        if !st["identity"].is_null() && mine != "admin" && mine != "root" {
+            println!("This device cannot add devices (it is not an admin device).");
+            let words = ask_words(paths, "Your recovery words can approve it instead.").await?;
+            req["words"] = json!(words.as_str());
+        }
         println!("Looking for the new device...");
-        let v = call(
-            paths,
-            json!({"cmd": "pair-type", "code": code, "at": at, "admin": admin}),
-        )
-        .await?;
+        let v = call(paths, req).await?;
         println!(
             "Added \"{}\". It is getting your files now; see `cardinal status`.",
             v["name"].as_str().unwrap_or("the device")
@@ -876,12 +987,34 @@ async fn client(cmd: Cmd) -> anyhow::Result<()> {
         }
         Cmd::Speedtest { device, json: raw } => speedtest(&paths, device, raw).await,
         Cmd::RemoveDevice { who } => {
-            let v = call(&paths, json!({"cmd": "remove-device", "who": who})).await?;
+            let v = call_with_words(&paths, json!({"cmd": "remove-device", "who": who})).await?;
             println!(
                 "Removed \"{}\". It can no longer read or change your files; what it already \
                  wrote is kept.",
                 v["name"].as_str().unwrap_or(&who)
             );
+            let devs = call(&paths, json!({"cmd": "devices"})).await?;
+            let admins = devs["devices"]
+                .as_array()
+                .map_or(0, |a| a.iter().filter(|d| d["power"] == "admin").count());
+            if admins == 0 {
+                println!(
+                    "None of your devices is an admin device now, so adding a device will ask for\n\
+                     your recovery words. To have one again, run `cardinal pair --admin` on a new\n\
+                     device and type its code here."
+                );
+            }
+            Ok(())
+        }
+        Cmd::Recovery {
+            cmd: RecoveryCmd::Check,
+        } => {
+            ask_words(
+                &paths,
+                "Checking your 24 recovery words; nothing is changed or kept.",
+            )
+            .await?;
+            println!("These are your recovery words. Keep them where only you can find them.");
             Ok(())
         }
         Cmd::Peer { cmd } => match cmd {

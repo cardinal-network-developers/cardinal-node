@@ -19,9 +19,16 @@ One person, several Linux devices, one folder that is the same everywhere:
   history, restore, and conflict copies labeled by device.
 - Devices on the same network find each other; others are added with
   `cardinal peer add host:7171`.
+- Lost your admin device? On any device you still have, your recovery
+  words stand in for it: `cardinal remove-device <name>` removes the lost
+  one, and `cardinal pair <code> --admin` (with `cardinal pair --admin` on
+  the new device) adds an admin device in its place. Each asks for the
+  words, uses them once, and keeps nothing. `cardinal recovery check`
+  checks the words you wrote down.
 
-Not yet: guardians, recovery from the words, sharing with other people,
-hosts, UDP, platforms other than Linux. [PLAN.md](PLAN.md) has the order of
+Not yet: guardians, restoring when every device is lost (it needs a host
+that keeps your data), sharing with other people, hosts, UDP, platforms
+other than Linux. [PLAN.md](PLAN.md) has the order of
 work.
 
 ## Install

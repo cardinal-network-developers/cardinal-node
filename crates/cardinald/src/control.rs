@@ -70,7 +70,11 @@ pub fn serve(d: Arc<Daemon>) -> anyhow::Result<tokio::task::JoinHandle<()>> {
                                 v["ok"] = json!(true);
                                 v
                             }
-                            Err(e) => json!({"ok": false, "error": format!("{e:#}")}),
+                            Err(e) => json!({
+                                "ok": false,
+                                "error": format!("{e:#}"),
+                                "needs_words": e.is::<crate::recovery::NeedsWords>(),
+                            }),
                         },
                         Err(e) => json!({"ok": false, "error": format!("bad request: {e}")}),
                     };
@@ -187,10 +191,14 @@ async fn handle(d: &Arc<Daemon>, req: &Value) -> anyhow::Result<Value> {
                 None => None,
             };
             let admin = req.get("admin").and_then(|v| v.as_bool()).unwrap_or(false);
-            let name = crate::pair::type_code(d, code, at, admin).await?;
+            let name = crate::pair::type_code(d, code, at, admin, words(req)).await?;
             Ok(json!({"name": name}))
         }
-        "remove-device" => remove_device(d, arg(req, "who")?),
+        "remove-device" => remove_device(d, arg(req, "who")?, words(req)),
+        "recovery-check" => {
+            crate::recovery::root_from_words(d, arg(req, "words")?)?;
+            Ok(json!({}))
+        }
         "peer-add" => {
             let addr = arg(req, "addr")?.trim().to_owned();
             if !addr.contains(':') {
@@ -672,7 +680,12 @@ async fn restore(d: &Arc<Daemon>, path: &str, version: u64) -> anyhow::Result<Va
     Ok(json!({"path": path, "version": version}))
 }
 
-fn remove_device(d: &Arc<Daemon>, who: &str) -> anyhow::Result<Value> {
+/// The recovery words of a request, if given ([`crate::recovery`]).
+fn words(req: &Value) -> Option<&str> {
+    req.get("words").and_then(|v| v.as_str())
+}
+
+fn remove_device(d: &Arc<Daemon>, who: &str, words: Option<&str>) -> anyhow::Result<Value> {
     let me = d.keys.key();
     let (key, name) = {
         let core = d.core();
@@ -709,6 +722,26 @@ fn remove_device(d: &Arc<Daemon>, who: &str) -> anyhow::Result<Value> {
     if key == me {
         anyhow::bail!("this is the device you are using; remove it from another of your devices");
     }
+    // Removals go strictly down in power: an admin removes devices, and
+    // only the root (the recovery words) removes an admin.
+    let target = d
+        .core()
+        .identity
+        .as_ref()
+        .and_then(|i| i.state().power(&key));
+    let root = crate::recovery::signer(
+        d,
+        words,
+        |mine| mine >= Some(Power::Admin) && mine > target,
+        || {
+            if target >= Some(Power::Admin) {
+                format!("{name} is an admin device: no device can remove it")
+            } else {
+                format!("this device cannot remove {name} (it is not an admin device)")
+            }
+        },
+    )?;
+    let signer = root.as_ref().unwrap_or(&d.keys.device.signing);
     let entries = {
         let mut core = d.core();
         let ident = core.identity.as_mut().expect("identity");
@@ -716,19 +749,16 @@ fn remove_device(d: &Arc<Daemon>, who: &str) -> anyhow::Result<Value> {
             .enc
             .first()
             .map(|k| cardinal_crypto::HybridKeyPair::from_secret_bytes(&k.secret_bytes()));
-        let e1 = ident
-            .log
-            .remove_key(&d.keys.device.signing, &key)
-            .map_err(|e| {
-                anyhow::anyhow!(
-                    "cannot remove {name}: {e} (only a device with more power can remove it)"
-                )
-            })?;
+        let e1 = ident.log.remove_key(signer, &key).map_err(|e| {
+            anyhow::anyhow!(
+                "cannot remove {name}: {e} (only a device with more power can remove it)"
+            )
+        })?;
         ident.record_own(&e1)?;
         let new = cardinal_crypto::HybridKeyPair::generate();
         let e2 = ident
             .log
-            .set_encryption_key(&d.keys.device.signing, &new, current.as_ref())?;
+            .set_encryption_key(signer, &new, current.as_ref())?;
         ident.record_own(&e2)?;
         drop(core);
         let mut core = d.core();

@@ -73,6 +73,20 @@ impl Dev {
         self.cmd().args(args).output().unwrap()
     }
 
+    /// Runs the command line with `input` on its standard input.
+    pub fn cli_input(&self, args: &[&str], input: &str) -> Output {
+        let mut c = self
+            .cmd()
+            .args(args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        std::io::Write::write_all(&mut c.stdin.take().unwrap(), input.as_bytes()).unwrap();
+        c.wait_with_output().unwrap()
+    }
+
     pub fn cli(&self, args: &[&str]) -> String {
         let o = self.try_cli(args);
         assert!(
@@ -184,9 +198,20 @@ pub fn free_port() -> u16 {
 }
 
 pub fn pair(a: &Dev, b: &Dev) {
-    let mut shower = b
-        .cmd()
-        .arg("pair")
+    let typed = pair_as(a, b, false, None);
+    assert!(typed.contains("Added"), "{typed}");
+}
+
+/// Pairs `b` to `a`: `b` shows a code (asking to be an admin device if
+/// `admin`), and `a` types it, with `stdin` as its input (the recovery
+/// words, when `a` is not an admin device). Returns what `a` printed.
+pub fn pair_as(a: &Dev, b: &Dev, admin: bool, stdin: Option<&str>) -> String {
+    let mut shower = b.cmd();
+    shower.arg("pair");
+    if admin {
+        shower.arg("--admin");
+    }
+    let mut shower = shower
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit())
         .spawn()
@@ -212,8 +237,13 @@ pub fn pair(a: &Dev, b: &Dev) {
         }
     }
     let (code, at) = (code.unwrap(), at.unwrap());
-    let typed = a.cli(&["pair", &code, "--at", &at]);
-    assert!(typed.contains("Added"), "{typed}");
+    let o = a.cli_input(&["pair", &code, "--at", &at], stdin.unwrap_or(""));
+    let typed = String::from_utf8_lossy(&o.stdout).into_owned();
+    assert!(
+        o.status.success(),
+        "{typed}{}",
+        String::from_utf8_lossy(&o.stderr)
+    );
     let mut rest = String::new();
     std::io::Read::read_to_string(&mut out, &mut rest).unwrap();
     assert!(shower.wait().unwrap().success(), "{rest}");
@@ -222,4 +252,5 @@ pub fn pair(a: &Dev, b: &Dev) {
     // files are mounted once.
     b.wait_mounted();
     assert!(!b.log().contains("cannot mount"), "{}", b.log());
+    typed
 }

@@ -81,6 +81,13 @@ cached in the session table for this reason).
   key, deletes the device node and its placements, and makes every space rotate its epoch at
   its next write. Sessions with the removed device close at once
   (`Endpoint::recheck_peers`).
+- **The recovery words in place of an admin** (`recovery.rs`,
+  `identity.md#recovery-phrase`). Adding a device and removing one are
+  signed by this device when its power allows (an admin adds devices and
+  admins and removes devices). Otherwise, and always to remove an admin,
+  the request carries the 24 words: the daemon derives the root key,
+  checks it is the identity's root, signs the entries with it, and drops
+  it. Nothing derived from the words is stored.
 - The link directory (`directory.rs`) is a snapshot of the devices in
   effect in the log; a session's peer is "own" if its static key is the
   link key of a device in effect.
@@ -248,15 +255,18 @@ network.
 ## Control socket
 
 One JSON object per line each way: `{"cmd": "status"}` →
-`{"ok": true, ...}` or `{"ok": false, "error": "..."}`. Commands: `status`,
-`devices`, `remove-device`, `peer-add/remove/list`, `mount`, `unmount`,
+`{"ok": true, ...}` or `{"ok": false, "error": "...", "needs_words":
+bool}`; `needs_words` means the recovery words, as `words`, would let the
+same request through. Commands: `status`, `devices`, `remove-device`,
+`recovery-check` (`words`; changes nothing), `peer-add/remove/list`,
+`mount`, `unmount`,
 `history`, `restore`, `conflicts`, `pin`, `unpin`, `retention`,
 `pair-show`, `pair-status`, `pair-type`, `speedtest` (one device, by
 name or key), `reload` (after `init` while the daemon runs), `flush`
 (commit now), `stop`. `status` includes `copies`: per device meant to
-keep everything, whether it counts (`state`: passed, failed, fetching,
-repeated, stale, unchecked), why not (`reason`), and the times of its
-last check, pass, failure, and fetch.
+keep everything, whether it counts (`state`: passed, failed, stale,
+unchecked), why not (`reason`), the times of its last check, pass, and
+failure, and checks it left unanswered in a row (`missed`).
 
 ## Logs
 
