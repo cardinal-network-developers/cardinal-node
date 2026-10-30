@@ -320,7 +320,9 @@ impl<'a> Files<'a> {
 
     /// The visible children of a folder, with display names: duplicates as
     /// `name (2)`, and each other version of a file in conflict as
-    /// `name (conflict, <device>).ext`.
+    /// `name (conflict, <device>).ext`. Display names are unique and
+    /// depend only on the state: a node whose own name is `name (2)` keeps
+    /// it, and a duplicate `name` then shows as `name (3)`.
     pub fn list(&self, dir: &NodeId) -> Vec<DirEntry> {
         let st = self.space.state();
         let dag = self.space.dag();
@@ -330,17 +332,40 @@ impl<'a> Files<'a> {
             .filter(|n| !n.deleted)
             .collect();
         kids.sort_by_key(|n| (n.name.clone(), dag.position(&n.created_in), n.id));
-        let mut seen: HashMap<&str, usize> = HashMap::new();
-        let mut out = Vec::new();
-        for n in kids {
-            let k = seen.entry(n.name.as_str()).or_insert(0);
+        // The first node of each name keeps it; the others take the next
+        // free `name (n)`, from n = their rank among those of that name.
+        let mut taken: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut rank: HashMap<&str, usize> = HashMap::new();
+        let mut names: Vec<Option<String>> = Vec::with_capacity(kids.len());
+        for n in &kids {
+            let k = rank.entry(n.name.as_str()).or_insert(0);
             *k += 1;
-            let name = if *k == 1 {
-                n.name.clone()
+            if *k == 1 {
+                taken.insert(n.name.clone());
+                names.push(Some(n.name.clone()));
             } else {
+                names.push(None);
+            }
+        }
+        let mut rank: HashMap<&str, usize> = HashMap::new();
+        for (n, name) in kids.iter().zip(names.iter_mut()) {
+            let k = rank.entry(n.name.as_str()).or_insert(0);
+            *k += 1;
+            if name.is_none() {
                 let (stem, ext) = split_ext(&n.name);
-                format!("{stem} ({k}){ext}")
-            };
+                let mut i = *k;
+                let mut candidate = format!("{stem} ({i}){ext}");
+                while taken.contains(&candidate) {
+                    i += 1;
+                    candidate = format!("{stem} ({i}){ext}");
+                }
+                taken.insert(candidate.clone());
+                *name = Some(candidate);
+            }
+        }
+        let mut out = Vec::new();
+        for (n, name) in kids.into_iter().zip(names) {
+            let name = name.expect("named");
             let kind = FileKind::of(n.kind);
             if kind == FileKind::File {
                 let versions = self.content(&n.id);

@@ -839,7 +839,7 @@ impl Tree {
         for i in self.inodes.values_mut() {
             i.children.clear();
         }
-        let mut items: Vec<(u64, u64, String, bool)> = self
+        let mut items: Vec<(u64, u64, String, bool, Option<NodeId>)> = self
             .inodes
             .values()
             .filter(|i| i.ino != ROOT_INO && i.parent != 0)
@@ -849,12 +849,22 @@ impl Tree {
                     i.parent,
                     i.name.clone(),
                     i.node.is_none() || i.dirty.pos,
+                    i.node,
                 )
             })
             .collect();
-        // local changes first, so they keep their names
-        items.sort_by_key(|(ino, _, _, local)| (!*local, *ino));
-        for (ino, parent, name, _) in items {
+        // Local changes first, so they keep their names; then the rest by
+        // name and node, so a name taken here makes the same choice on
+        // every device and after every restart.
+        items.sort_by(|a, b| {
+            (!a.3, if a.3 { a.0 } else { 0 }, &a.2, a.4).cmp(&(
+                !b.3,
+                if b.3 { b.0 } else { 0 },
+                &b.2,
+                b.4,
+            ))
+        });
+        for (ino, parent, name, _, _) in items {
             if !self.inodes.contains_key(&parent) {
                 if let Some(i) = self.inodes.get_mut(&ino) {
                     i.parent = 0;

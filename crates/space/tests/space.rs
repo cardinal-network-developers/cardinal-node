@@ -411,3 +411,35 @@ fn types_cross_threads() {
     send_sync::<IdentityLog>();
     send_sync::<cardinal_identity::IdentityState>();
 }
+
+#[test]
+fn display_names_are_unique() {
+    // Two folders named `c` and one named `c (2)`: the second `c` cannot
+    // show as `c (2)`, which is taken.
+    let p = person(3, 0);
+    let d0 = &p.devices[0];
+    let (mut a, _) = Space::create(
+        Profile::FILES,
+        Policy::default(),
+        &p.log,
+        &d0.signing,
+        &[p.enc.public_key()],
+        Some(1),
+    )
+    .unwrap();
+    for name in ["c", "c (2)", "c", "c.txt", "c.txt"] {
+        a.write(
+            &p.log,
+            &d0.signing,
+            vec![files::create_folder(ROOT, name)],
+            Some(2),
+        )
+        .unwrap();
+    }
+    let names: Vec<String> = Files::new(&a)
+        .list(&ROOT)
+        .into_iter()
+        .map(|e| e.name)
+        .collect();
+    assert_eq!(names, ["c", "c (2)", "c (2).txt", "c (3)", "c.txt"]);
+}
