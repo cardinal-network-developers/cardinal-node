@@ -776,6 +776,41 @@ impl Core {
         })
     }
 
+    /// Restoring (`hosts.md#restore`): the entry that adds this device, as
+    /// an admin device, to the log of `identity` collected from a host,
+    /// signed by the root key from the words. Returns it and its id.
+    pub fn add_restoring_device(
+        &self,
+        identity: &[u8; 32],
+        phrase: &cardinal_crypto::RecoveryPhrase,
+    ) -> anyhow::Result<(Vec<u8>, [u8; 32])> {
+        let entries: Vec<IdentityEntry> = self
+            .joining
+            .iter()
+            .filter_map(|b| IdentityEntry::decode(b).ok())
+            .filter(|e| e.identity() == *identity)
+            .collect();
+        let g = entries
+            .iter()
+            .find(|e| e.is_genesis())
+            .ok_or_else(|| anyhow::anyhow!("that device did not send the identity log"))?;
+        let mut log = IdentityLog::from_genesis(g.clone())?;
+        for e in entries.iter().filter(|e| !e.is_genesis()) {
+            let _ = log.insert(e.clone());
+        }
+        let root = phrase.root_signing_key();
+        if log.state().power(&root.public_key()) != Some(cardinal_identity::Power::Root) {
+            anyhow::bail!("these recovery words are not in that device's identity log");
+        }
+        let enc = log.open_with_phrase(phrase)?;
+        let request = self
+            .keys
+            .device
+            .request(identity, cardinal_identity::Power::Admin);
+        let entry = log.add_key(&root, &request, Some(&enc))?;
+        Ok((entry.encode(), entry.id()))
+    }
+
     /// Adds sealed entries of a space, creating the holder if needed.
     pub fn ingest_space(
         &mut self,

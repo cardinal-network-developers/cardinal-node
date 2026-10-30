@@ -625,6 +625,36 @@ Not implemented yet (the next milestone):
   measurement could instead be a core service, or `ping` frames with
   padding.
 
+## Hosts (`spec/hosts.md`)
+
+- **Only a person's own device is a host.** A device with `cardinal host`
+  grants itself to its own identity, the case `hosts.md#grants` calls the
+  common one. It holds spaces as any of the person's devices does, under
+  their space ids, not random labels, and it can read them. Hosts that
+  cannot read what they store, delivery tokens, and the mailbox, rendezvous
+  and relay services are not implemented.
+- **Storage ops.** Only `prove` (op 5). `drop`, `list`, `allow` and `public`
+  are answered with error 3, unknown.
+- **Restore step 5 differs.** A restoring device does not list labels and
+  open sets itself. Once it has added itself to the log it reconnects as one
+  of the person's devices, and the host's ordinary sync brings every set.
+  That needs a host that is one of those devices.
+- **A session that proves the root key** may sync only the identity log,
+  though `hosts.md#restore` calls it an owner session: that is all the steps
+  need, until the device reconnects as itself.
+- **Reading: a failed `prove`** is answered with error 1, not permitted, and
+  the session stays open until `PROVE_WITHIN` (30 seconds) passes. Any other
+  request before a proof closes it, as the spec says.
+- **Spec ambiguity: a grant with no limit.** `hosts.md#grants` does not say
+  how to state one. Chose 0 storage bytes and 0 days of retention, for a
+  person's own device, which keeps what it holds.
+- **Spec ambiguity: how the sheet writes a host's key.** It says only "the
+  address and static key". Chose lower-case Crockford base 32 of the 32-byte
+  X25519 key and the first 3 bytes of its BLAKE3 hash, in groups of 4, so
+  that a mistyped key is caught at once instead of looking like a host that
+  is down. Reading ignores case and separators, and takes `o` as 0 and `i`
+  and `l` as 1.
+
 ## Counting copies (`spec/blobs.md#counting-copies`)
 
 - **Spec ambiguity: which devices "should keep" a space.** Chosen:

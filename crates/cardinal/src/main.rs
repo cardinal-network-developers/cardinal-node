@@ -111,6 +111,17 @@ enum Cmd {
         /// The device's name or key, as `cardinal devices` shows.
         who: String,
     },
+    /// Make this device a host for your own devices: it keeps a full copy
+    /// of your files, and can bring them back if every other device is lost.
+    Host {
+        /// Where your devices can reach this one (host:port). Give it more
+        /// than once for more than one address.
+        #[arg(long = "address")]
+        addresses: Vec<String>,
+        /// Stop being a host.
+        #[arg(long)]
+        off: bool,
+    },
     /// Your 24 recovery words.
     Recovery {
         #[command(subcommand)]
@@ -195,6 +206,19 @@ enum RecoveryCmd {
     /// Check the words you wrote down: type them, and this says whether
     /// they are yours. Nothing is changed or kept.
     Check,
+    /// Show what to add to your recovery sheet: where your always-on device
+    /// is, and its key.
+    Sheet,
+    /// Lost every device: bring everything back on this one, with your 24
+    /// words and the address and key on your recovery sheet.
+    Restore {
+        /// The always-on device's address (host:port).
+        #[arg(long)]
+        host: String,
+        /// Its key.
+        #[arg(long)]
+        key: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -310,6 +334,15 @@ async fn ask_words(
     paths: &Paths,
     intro: &str,
 ) -> anyhow::Result<cardinal_crypto::Zeroizing<String>> {
+    read_words(Some(paths), intro).await
+}
+
+/// Reads the 24 words: checked against this device's identity if `paths`
+/// are given, or else only for being recovery words at all.
+async fn read_words(
+    paths: Option<&Paths>,
+    intro: &str,
+) -> anyhow::Result<cardinal_crypto::Zeroizing<String>> {
     println!("{intro}");
     println!("Type them in order, separated by spaces; the first four letters of each");
     println!("are enough. Press Enter after each line.");
@@ -340,17 +373,23 @@ async fn ask_words(
         typed.iter_mut().for_each(cardinal_crypto::Zeroize::zeroize);
         let problem = match bad {
             Some(i) => format!("word {} is not a recovery word; check its spelling", i + 1),
-            None => match request(
-                paths,
-                &json!({"cmd": "recovery-check", "words": words.as_str()}),
-            )
-            .await?
-            {
-                v if v["ok"].as_bool() == Some(true) => return Ok(words),
-                v => v["error"]
-                    .as_str()
-                    .unwrap_or("the words were not accepted")
-                    .to_owned(),
+            None => match paths {
+                Some(paths) => match request(
+                    paths,
+                    &json!({"cmd": "recovery-check", "words": words.as_str()}),
+                )
+                .await?
+                {
+                    v if v["ok"].as_bool() == Some(true) => return Ok(words),
+                    v => v["error"]
+                        .as_str()
+                        .unwrap_or("the words were not accepted")
+                        .to_owned(),
+                },
+                None => match cardinal_crypto::RecoveryPhrase::parse(&words) {
+                    Ok(_) => return Ok(words),
+                    Err(_) => "the words do not fit together: one is wrong or out of place".into(),
+                },
             },
         };
         println!("{}.", capitalized(&problem));
@@ -359,6 +398,32 @@ async fn ask_words(
         }
     }
     anyhow::bail!("the recovery words were not accepted; nothing was changed")
+}
+
+/// What belongs on the recovery sheet.
+fn print_sheet(v: &Value) {
+    let hosts = v["hosts"].as_array().cloned().unwrap_or_default();
+    if hosts.is_empty() {
+        println!();
+        println!("You have no always-on device yet, so your recovery sheet has only your");
+        println!("24 words. If every device were lost they could not bring your files back.");
+        println!("On a device that stays on, run: cardinal host --address <host:port>");
+        return;
+    }
+    println!();
+    println!("Write this on your recovery sheet, with your 24 words:");
+    for h in &hosts {
+        println!();
+        println!("  Always-on device: {}", h["name"].as_str().unwrap_or(""));
+        let key = h["key"].as_str().unwrap_or("");
+        for a in h["addresses"].as_array().into_iter().flatten() {
+            println!("  Address:          {}", a.as_str().unwrap_or(""));
+        }
+        println!("  Key:              {key}");
+    }
+    println!();
+    println!("On a new device, after installing Cardinal: cardinal recovery restore \\");
+    println!("  --host <address> --key <key>");
 }
 
 async fn running(paths: &Paths) -> bool {
@@ -729,6 +794,10 @@ fn print_status(v: &Value) {
             "everything (full)"
         }
     );
+    if v["hosts"].as_u64() == Some(0) {
+        println!("Always-on device: none yet, so your words alone could not bring your");
+        println!("  files back if every device were lost (`cardinal host` on one that stays on)");
+    }
     if let Some(line) = old_line(&v["old"]) {
         println!("{line}");
     }
@@ -1043,6 +1112,47 @@ async fn client(cmd: Cmd) -> anyhow::Result<()> {
             )
             .await?;
             println!("These are your recovery words. Keep them where only you can find them.");
+            Ok(())
+        }
+        Cmd::Recovery {
+            cmd: RecoveryCmd::Sheet,
+        } => {
+            print_sheet(&call(&paths, json!({"cmd": "recovery-sheet"})).await?);
+            Ok(())
+        }
+        Cmd::Recovery {
+            cmd: RecoveryCmd::Restore { host, key },
+        } => {
+            let words = read_words(None, "Type your 24 recovery words.").await?;
+            println!("Reaching {host}...");
+            call(
+                &paths,
+                json!({"cmd": "restore-from-host", "words": words.as_str(), "at": host, "key": key}),
+            )
+            .await?;
+            println!("Restored. Your files are coming back.");
+            println!(
+                "Your old devices are still listed under `cardinal devices`; remove any you \
+                 lost with `cardinal remove-device`."
+            );
+            Ok(())
+        }
+        Cmd::Host { addresses, off } => {
+            let req = if off {
+                json!({"cmd": "host-off"})
+            } else {
+                json!({"cmd": "host", "addresses": addresses})
+            };
+            let v = call(&paths, req).await?;
+            println!(
+                "{}",
+                if off {
+                    "This device no longer hosts your other devices."
+                } else {
+                    "This device now keeps a full copy of your files and can restore them."
+                }
+            );
+            print_sheet(&v);
             Ok(())
         }
         Cmd::Peer { cmd } => match cmd {

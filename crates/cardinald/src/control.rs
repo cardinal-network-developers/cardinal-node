@@ -199,6 +199,23 @@ async fn handle(d: &Arc<Daemon>, req: &Value) -> anyhow::Result<Value> {
             crate::recovery::root_from_words(d, arg(req, "words")?)?;
             Ok(json!({}))
         }
+        "host" => {
+            let addresses: Vec<String> = req
+                .get("addresses")
+                .and_then(|v| v.as_array())
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|v| v.as_str().map(str::to_owned))
+                        .collect()
+                })
+                .unwrap_or_default();
+            crate::host::enable(d, &addresses)
+        }
+        "host-off" => crate::host::disable(d),
+        "recovery-sheet" => crate::host::sheet(d),
+        "restore-from-host" => {
+            crate::host::restore(d, arg(req, "words")?, arg(req, "at")?, arg(req, "key")?).await
+        }
         "peer-add" => {
             let addr = arg(req, "addr")?.trim().to_owned();
             if !addr.contains(':') {
@@ -539,6 +556,7 @@ fn status(d: &Arc<Daemon>) -> Value {
         "identity": identity,
         "listen": d.endpoint.tcp_addr().map(|a| a.to_string()),
         "devices": devices(d),
+        "hosts": crate::host::sheet(d).ok().and_then(|v| v["hosts"].as_array().map(Vec::len)),
         "spaces": spaces,
         "files_ready": files.is_some(),
         "mount": cfg.mount.as_ref().map(|p| p.display().to_string()),

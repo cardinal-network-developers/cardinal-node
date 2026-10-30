@@ -35,6 +35,11 @@ pub enum PeerKind {
     /// The admin device this device is pairing with, before it belongs to
     /// the identity (the identity id).
     PairingAdmin([u8; 32]),
+    /// A device this one does not know, in a restore session, before it
+    /// proved it holds the root key (`host.rs`).
+    Restoring,
+    /// The same device after it did.
+    Proven,
     /// Anyone else.
     Stranger,
 }
@@ -169,6 +174,8 @@ pub struct Daemon {
     pub changed: watch::Sender<u64>,
     /// News waiting to be passed on.
     pub news: Mutex<crate::news::Waiting>,
+    /// Static keys of restore sessions that proved the root key.
+    proven: Mutex<HashSet<[u8; 32]>>,
     /// Pairing.
     pub pairing: Mutex<PairState>,
     /// The mount, if mounted.
@@ -246,6 +253,7 @@ impl Daemon {
             signing_key: keys.signing.clone(),
         });
         ec.connect_timeout = Duration::from_secs(5);
+        ec.allow_public = config.host;
         ec.session = SessionConfig {
             keepalive: Some(Duration::from_secs(20)),
             ..SessionConfig::default()
@@ -298,6 +306,7 @@ impl Daemon {
             progress: Mutex::new(Progress::default()),
             blob_stats: Mutex::new(HashMap::new()),
             news: Mutex::new(HashMap::new()),
+            proven: Mutex::new(HashSet::new()),
             copies: crate::copies::Tracker::load(copies_path, crate::copies::Rules::from_env()),
             cleanup: crate::cleanup::Cleaner::load(old_versions),
             speedtest: crate::speedtest::Limiter::default(),
@@ -339,6 +348,15 @@ impl Daemon {
     /// Who a session's peer is.
     pub fn classify(&self, s: &Session) -> PeerKind {
         let ps = s.peer_static();
+        if s.role() == cardinal_link::Role::Responder
+            && s.admission() == cardinal_link::Admission::Public
+        {
+            return if self.is_proven(&ps) {
+                PeerKind::Proven
+            } else {
+                PeerKind::Restoring
+            };
+        }
         if let Some(k) = self.core().is_own_device(&ps) {
             return PeerKind::Own(k);
         }
@@ -353,6 +371,16 @@ impl Daemon {
             }
         }
         PeerKind::Stranger
+    }
+
+    /// Whether a restore session with this static key proved the root key.
+    pub fn is_proven(&self, peer_static: &[u8; 32]) -> bool {
+        lock(&self.proven).contains(peer_static)
+    }
+
+    /// Records that a restore session proved the root key.
+    pub fn set_proven(&self, peer_static: [u8; 32]) {
+        lock(&self.proven).insert(peer_static);
     }
 
     /// Sessions with this person's devices.
@@ -413,6 +441,7 @@ impl Daemon {
         }
         let name = match kind {
             PeerKind::Own(k) => self.device_name(&k),
+            PeerKind::Restoring | PeerKind::Proven => "a device restoring".into(),
             _ => "the device being paired".into(),
         };
         tracing::info!(
@@ -432,6 +461,15 @@ impl Daemon {
         let s2 = s.clone();
         tokio::spawn(net::serve(d, s2, gen));
         let d = self.clone();
+        if kind == PeerKind::Restoring {
+            tokio::spawn(async move {
+                tokio::time::sleep(crate::host::PROVE_WITHIN).await;
+                if crate::host::is_unproven(&d, &s) {
+                    s.close("did not prove anything");
+                }
+            });
+            return;
+        }
         tokio::spawn(async move { net::sync_all(&d, &s).await });
     }
 
@@ -440,6 +478,7 @@ impl Daemon {
         let mut m = lock(&self.sessions);
         if m.get(peer_static).is_some_and(|c| c.gen == gen) {
             m.remove(peer_static);
+            lock(&self.proven).remove(peer_static);
             tracing::info!("disconnected from {}", short(peer_static));
         }
     }

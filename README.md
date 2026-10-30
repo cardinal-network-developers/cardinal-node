@@ -32,11 +32,16 @@ One person, several Linux devices, one folder that is the same everywhere:
   the new device) adds an admin device in its place. Each asks for the
   words, uses them once, and keeps nothing. `cardinal recovery check`
   checks the words you wrote down.
+- Lost every device? On a device that stays on, `cardinal host --address
+  <host:port>` keeps a full copy of your files and shows what to add to
+  your recovery sheet (`cardinal recovery sheet` shows it again). On a new
+  device, `cardinal recovery restore --host <address> --key <key>` asks for
+  the 24 words and brings everything back. Old versions follow that
+  device's `cardinal keep-old`. Hosts run by others are not supported yet.
 
-Not yet: guardians, restoring when every device is lost (it needs a host
-that keeps your data), sharing with other people, hosts, UDP, platforms
-other than Linux. [PLAN.md](PLAN.md) has the order of
-work.
+Not yet: guardians, mailboxes, relays and hosts run by others, sharing with
+other people, UDP, platforms other than Linux. [PLAN.md](PLAN.md) has the
+order of work.
 
 ## Install
 

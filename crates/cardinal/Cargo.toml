@@ -24,3 +24,6 @@ libc = "0.2"
 [dev-dependencies]
 tempfile.workspace = true
 blake3.workspace = true
+cardinal-encoding.workspace = true
+cardinal-link.workspace = true
+cardinal-sync.workspace = true

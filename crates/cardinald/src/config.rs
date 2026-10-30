@@ -45,6 +45,8 @@ pub struct Config {
     pub discovery: bool,
     /// The multicast DNS port (5353; tests use another).
     pub mdns_port: u16,
+    /// This device is a host for its own identity (`host.rs`).
+    pub host: bool,
 }
 
 impl Default for Config {
@@ -61,6 +63,7 @@ impl Default for Config {
             pins: Vec::new(),
             discovery: true,
             mdns_port: 5353,
+            host: false,
         }
     }
 }

@@ -15,6 +15,7 @@ pub mod daemon;
 pub mod directory;
 pub mod fetch;
 pub mod fs;
+pub mod host;
 pub mod keys;
 pub mod net;
 pub mod news;

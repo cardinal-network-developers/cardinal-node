@@ -78,7 +78,14 @@ impl Daemon {
                     Access::None
                 }
             }
-            PeerKind::Stranger => Access::None,
+            PeerKind::Proven => {
+                if self.core().identity_label() == Some(*label) {
+                    Access::Full
+                } else {
+                    Access::None
+                }
+            }
+            PeerKind::Restoring | PeerKind::Stranger => Access::None,
         }
     }
 }
@@ -124,6 +131,13 @@ pub async fn sync_all(d: &Arc<Daemon>, s: &Session) {
 }
 
 async fn handle_stream(d: &Arc<Daemon>, s: &Session, mut st: Stream) -> anyhow::Result<()> {
+    if st.service() == Service::STORAGE {
+        return crate::host::serve(d, s, st).await;
+    }
+    if crate::host::is_unproven(d, s) {
+        s.close("prove first");
+        return Ok(());
+    }
     if st.service() == Service::BLOB {
         tracing::trace!("blob stream {} accepted", st.id());
         return serve_blob(d, st).await;
@@ -351,6 +365,39 @@ pub async fn notice(
     st.send_message(&to_value(&msg)).await?;
     st.shutdown().await?;
     Ok(())
+}
+
+/// Sends one object to a peer and waits until it holds it: a peer serves
+/// only what it has stored.
+pub async fn deliver(
+    s: &Session,
+    label: Label,
+    object: Vec<u8>,
+    id: [u8; 32],
+) -> anyhow::Result<()> {
+    let msg = Message::Objects {
+        label,
+        objects: vec![object],
+    };
+    let mut st = s.open_stream(Service::SYNC, Priority::Interactive)?;
+    st.send_message(&to_value(&msg)).await?;
+    st.shutdown().await?;
+    for _ in 0..100 {
+        let mut st = s.open_stream(Service::SYNC, Priority::Interactive)?;
+        let want = Message::Want {
+            label,
+            ids: vec![id],
+        };
+        st.send_message(&to_value(&want)).await?;
+        let _ = st.shutdown().await;
+        while let Some(v) = st.recv_message_max(MAX_MESSAGE).await? {
+            if matches!(from_value(v)?, Message::Objects { objects, .. } if !objects.is_empty()) {
+                return Ok(());
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    anyhow::bail!("that device did not take the entry")
 }
 
 /// For tests: `CARDINAL_TEST_BLOB_DELAY_MS` delays every blob reply this
