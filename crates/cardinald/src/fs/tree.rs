@@ -213,6 +213,9 @@ pub struct Inode {
     pub staged: Option<Arc<Staged>>,
     /// Link target.
     pub target: String,
+    /// The name in the state, when the item came from it. [`Inode::name`]
+    /// may be the view's `name (2)`; created again, it takes this one.
+    pub stored_name: Option<String>,
     /// Uncommitted changes.
     pub dirty: Dirty,
     /// Open handles that may write.
@@ -253,6 +256,7 @@ impl Inode {
             seen: Vec::new(),
             staged: None,
             target: String::new(),
+            stored_name: None,
             dirty: Dirty::default(),
             writers: 0,
             opens: 0,
@@ -286,6 +290,8 @@ pub struct SnapEntry {
     pub parent: NodeId,
     /// The display name.
     pub name: String,
+    /// The node's own name.
+    pub stored_name: String,
     /// The node.
     pub node: NodeId,
     /// For a conflict copy, the version.
@@ -331,6 +337,7 @@ impl Snapshot {
                 let mut se = SnapEntry {
                     parent: dir,
                     name: e.name.clone(),
+                    stored_name: e.stored_name.clone(),
                     node: e.node,
                     version: e.conflict_version,
                     kind: e.kind,
@@ -513,6 +520,7 @@ impl Tree {
         if let Some(i) = self.inodes.get_mut(&ino) {
             i.parent = parent;
             i.name = name.to_owned();
+            i.stored_name = None;
         }
         if let Some(p) = self.inodes.get_mut(&parent) {
             p.children.insert(name.to_owned(), ino);
@@ -687,6 +695,7 @@ impl Tree {
             };
             seen.insert(ino);
             let inode = self.inodes.get_mut(&ino).expect("ino");
+            inode.stored_name = Some(e.stored_name.clone());
             if !inode.dirty.pos {
                 placed.push((ino, pino, e.name.clone()));
             }

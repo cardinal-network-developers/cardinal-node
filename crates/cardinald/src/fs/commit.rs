@@ -367,16 +367,17 @@ pub fn write_pending(
                     if !content_ready || (i.kind == Kind::File && i.busy(QUIET)) {
                         continue;
                     }
+                    let name = i.stored_name.as_deref().unwrap_or(&i.name);
                     let op = match i.kind {
-                        Kind::Dir => files::create_folder(pnode, &i.name),
+                        Kind::Dir => files::create_folder(pnode, name),
                         Kind::File => files::create_file(
                             pnode,
-                            &i.name,
+                            name,
                             i.content.as_ref().unwrap_or(&Content::Inline(Vec::new())),
                             i.perm as u32,
                             Some(time_to_ms(i.mtime)),
                         ),
-                        Kind::Symlink => files::create_link(pnode, &i.name, &i.target),
+                        Kind::Symlink => files::create_link(pnode, name, &i.target),
                         Kind::Conflict(_) => unreachable!(),
                     };
                     effects.push(Effect::Created(ino));
@@ -1001,6 +1002,36 @@ mod tests {
         assert_eq!(fx.t.child(again, "a.txt"), Some(file));
         let st = fx.sp().state();
         assert_eq!(st.node(&node).unwrap().parent, fx.node(again));
+    }
+
+    /// A folder shown as `d (2)`, deleted elsewhere while it holds a change
+    /// here, is created again as `d`: the number belongs to the view.
+    #[test]
+    fn a_kept_folder_is_created_again_under_its_own_name() {
+        let mut fx = Fx::new();
+        let first = fx.remote(files::create_folder(ROOT, "d"));
+        let second = fx.remote(files::create_folder(ROOT, "d"));
+        let (first, second) = (
+            files::created_node(&first, 0),
+            files::created_node(&second, 0),
+        );
+        fx.refresh();
+        assert_eq!(fx.names(), vec!["d".to_string(), "d (2)".to_string()]);
+        let shown = fx.t.child(ROOT_INO, "d (2)").unwrap();
+        assert_eq!(fx.node(shown), second);
+        fx.write_in(shown, "a.txt", b"local");
+        fx.remote(SpaceOp::delete(second));
+        fx.refresh();
+        fx.commit();
+        fx.refresh();
+        let again = fx.t.child(ROOT_INO, "d (2)").expect("shown as before");
+        let node = fx.node(again);
+        assert_ne!(node, second);
+        assert_eq!(fx.sp().state().node(&node).unwrap().name, "d");
+        // no number once the other one is gone
+        fx.remote(SpaceOp::delete(first));
+        fx.refresh();
+        assert_eq!(fx.names(), vec!["d".to_string()]);
     }
 
     /// A local edit of a file deleted elsewhere, unseen: the edit is kept.

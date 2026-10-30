@@ -203,6 +203,8 @@ pub struct Version {
 pub struct DirEntry {
     /// The name to show, disambiguated.
     pub name: String,
+    /// The node's own name, which [`DirEntry::name`] is shown for.
+    pub stored_name: String,
     /// The node.
     pub node: NodeId,
     /// Its kind.
@@ -373,6 +375,7 @@ impl<'a> Files<'a> {
                     let (stem, ext) = split_ext(&name);
                     out.push(DirEntry {
                         name: format!("{stem} (conflict, {}){ext}", (self.device_name)(&v.device)),
+                        stored_name: n.name.clone(),
                         node: n.id,
                         kind,
                         conflict_version: Some(v.entry),
@@ -381,6 +384,7 @@ impl<'a> Files<'a> {
             }
             out.push(DirEntry {
                 name,
+                stored_name: n.name.clone(),
                 node: n.id,
                 kind,
                 conflict_version: None,
