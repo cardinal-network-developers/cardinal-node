@@ -162,6 +162,16 @@ should eventually be resolved by changing either the code or the spec.
   hash ids for this reason; artificial ids that differ only in their top
   byte collide trivially.
 
+- **Notices reach only this person's devices.** `sync.md#notices` is
+  implemented for a person's own devices, which are all a device has
+  sessions with here. Neighbours (about six random sessions in a large
+  space) and deposits for offline members wait for sharing and hosts.
+  Notices that would reach a mailbox go nowhere, and a device that was
+  offline catches up by reconciling when it returns.
+- **Reading: how long news waits.** `sync.md#notices` lets a device wait a
+  moment. Chose 30 ms, long enough to gather what arrives together. A notice
+  covering news from two peers goes to both, since each lacks the other's.
+
 ## Implementation notes: blobs and sync
 
 - `FsStore` keeps objects at `objects/ab/cd/<64 hex>`, written to `tmp/`
