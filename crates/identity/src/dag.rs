@@ -43,6 +43,10 @@ pub struct Dag<T> {
     heads: BTreeSet<Id>,
     order: Vec<Id>,
     position: HashMap<Id, usize>,
+    /// By log position: how many entries from the start of the log order
+    /// are all this entry or its ancestors. Most ancestor checks are of an
+    /// old entry against a recent one, and end here without a walk.
+    prefix: Vec<usize>,
 }
 
 impl<T> Default for Dag<T> {
@@ -54,6 +58,7 @@ impl<T> Default for Dag<T> {
             heads: BTreeSet::new(),
             order: Vec::new(),
             position: HashMap::new(),
+            prefix: Vec::new(),
         }
     }
 }
@@ -185,6 +190,7 @@ impl<T> Dag<T> {
         if last {
             self.position.insert(id, self.order.len());
             self.order.push(id);
+            self.prefix.push(self.order.len());
         } else {
             self.order = self.compute_order(None);
             self.position = self
@@ -193,7 +199,28 @@ impl<T> Dag<T> {
                 .enumerate()
                 .map(|(n, x)| (*x, n))
                 .collect();
+            self.prefix = self.compute_prefix();
         }
+    }
+
+    fn compute_prefix(&self) -> Vec<usize> {
+        let mut out: Vec<usize> = Vec::with_capacity(self.order.len());
+        for (i, x) in self.order.iter().enumerate() {
+            let parents = &self.nodes[x].parents;
+            let mut n = parents
+                .iter()
+                .map(|p| out[self.position[p]])
+                .max()
+                .unwrap_or(0);
+            // one parent: what stopped its prefix stops this one too
+            if parents.len() > 1 {
+                while n < i && self.reaches(&self.order[n], x, &out) {
+                    n += 1;
+                }
+            }
+            out.push(if n == i { i + 1 } else { n });
+        }
+        out
     }
 
     /// Every present entry in log order.
@@ -204,6 +231,12 @@ impl<T> Dag<T> {
     /// The position of an entry in log order.
     pub fn position(&self, id: &Id) -> Option<usize> {
         self.position.get(id).copied()
+    }
+
+    /// By log position: how many entries from the start of the log order
+    /// are all that entry or its ancestors.
+    pub fn prefix(&self) -> &[usize] {
+        &self.prefix
     }
 
     /// Whether `a` comes before `b` in log order.
@@ -250,6 +283,11 @@ impl<T> Dag<T> {
 
     /// Whether `a` is a strict ancestor of `b`.
     pub fn is_ancestor(&self, a: &Id, b: &Id) -> bool {
+        self.reaches(a, b, &self.prefix)
+    }
+
+    /// [`Dag::is_ancestor`], with `prefix` for as far as it is known.
+    fn reaches(&self, a: &Id, b: &Id, prefix: &[usize]) -> bool {
         if a == b {
             return false;
         }
@@ -259,9 +297,13 @@ impl<T> Dag<T> {
         if na.depth >= nb.depth {
             return false;
         }
+        let at = self.position[a];
         let mut seen = HashSet::new();
         let mut todo = vec![*b];
         while let Some(x) = todo.pop() {
+            if prefix.get(self.position[&x]).is_some_and(|n| at < *n) {
+                return true;
+            }
             for p in &self.nodes[&x].parents {
                 if p == a {
                     return true;
@@ -363,5 +405,56 @@ mod tests {
             &[id(1), id(2), id(3), id(5), id(4), id(8), id(9)]
         );
         assert_eq!(d.heads(), vec![id(2), id(9)]);
+    }
+
+    #[test]
+    fn ancestor_checks_match_a_walk() {
+        let mut x = 0x9e37_79b9_7f4a_7c15u64;
+        let mut below = move |n: usize| {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            (x % n as u64) as usize
+        };
+        for round in 0..60 {
+            let size = 2 + below(30);
+            let reach = 1 + below(6);
+            // random ids, so log order is not insertion order
+            let ids: Vec<Id> = (0..size)
+                .map(|i| {
+                    let mut a = [below(256) as u8; 32];
+                    a[1] = i as u8;
+                    a
+                })
+                .collect();
+            let mut todo: Vec<(Id, Vec<Id>)> = (0..size)
+                .map(|i| {
+                    let parents = (0..=below(3))
+                        .filter(|_| i > 0)
+                        .map(|_| ids[i - 1 - below(i.min(reach))])
+                        .collect();
+                    (ids[i], parents)
+                })
+                .collect();
+            // half arrive out of order, and wait for their parents
+            if round % 2 == 1 {
+                for i in (1..todo.len()).rev() {
+                    let j = below(i + 1);
+                    todo.swap(i, j);
+                }
+            }
+            let mut d: Dag<()> = Dag::new();
+            for (n, (i, parents)) in todo.into_iter().enumerate() {
+                d.insert(i, parents, ());
+                if n % 4 == 0 || n + 1 == size {
+                    for b in d.log_order() {
+                        let walked = d.ancestors(b);
+                        for a in d.log_order() {
+                            assert_eq!(d.is_ancestor(a, b), walked.contains(a));
+                        }
+                    }
+                }
+            }
+        }
     }
 }
