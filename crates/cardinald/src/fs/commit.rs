@@ -971,6 +971,38 @@ mod tests {
         assert!(!n.deleted && n.delete_conflict, "{n:?}");
     }
 
+    /// A file moved into a folder deleted elsewhere, unseen: the folder is
+    /// created again with the file in it, and nothing stays pending.
+    #[test]
+    fn move_into_a_folder_deleted_elsewhere_is_kept() {
+        let mut fx = Fx::new();
+        let dir = fx.t.alloc(Kind::Dir);
+        fx.t.attach(dir, ROOT_INO, "d");
+        fx.t.touch();
+        let file = fx.write("a.txt", b"v1");
+        fx.commit();
+        fx.refresh();
+        let dnode = fx.node(dir);
+        let node = fx.node(file);
+        fx.t.detach(file);
+        fx.t.attach(file, dir, "a.txt");
+        fx.t.inodes.get_mut(&file).unwrap().dirty.pos = true;
+        fx.t.touch();
+        fx.remote(SpaceOp::delete(dnode));
+        fx.refresh();
+        // ...and it stays through whatever arrives before the commit
+        fx.remote(files::create_folder(ROOT, "other"));
+        fx.refresh();
+        fx.commit();
+        fx.refresh();
+        assert!(!fx.t.has_pending());
+        let again = fx.t.child(ROOT_INO, "d").expect("the folder is back");
+        assert_ne!(fx.node(again), dnode, "created again");
+        assert_eq!(fx.t.child(again, "a.txt"), Some(file));
+        let st = fx.sp().state();
+        assert_eq!(st.node(&node).unwrap().parent, fx.node(again));
+    }
+
     /// A local edit of a file deleted elsewhere, unseen: the edit is kept.
     #[test]
     fn edit_of_unseen_remote_delete_is_kept() {

@@ -739,19 +739,20 @@ impl Tree {
 
         // Committed inodes no longer in the state were deleted elsewhere.
         // Keep those with local changes (or local changes beneath them),
-        // to be created again. A folder with only local items beneath it
-        // (`fs/local.rs`) becomes local itself: kept here, not created
-        // again on every device.
+        // to be created again; the folder a move here went to is one. A
+        // folder with only local items beneath it (`fs/local.rs`) becomes
+        // local itself: kept here, not created again on every device.
         let mut needed: HashSet<u64> = HashSet::new();
         let mut needed_local: HashSet<u64> = HashSet::new();
         for i in self.inodes.values() {
-            if i.parent != 0 && (i.node.is_none() || i.dirty.content) {
+            let changed = i.node.is_none() || i.dirty.content;
+            if i.parent != 0 && (changed || i.dirty.pos) {
                 let set = if i.local {
                     &mut needed_local
                 } else {
                     &mut needed
                 };
-                let mut p = i.ino;
+                let mut p = if changed { i.ino } else { i.parent };
                 for _ in 0..10_000 {
                     if !set.insert(p) || p == ROOT_INO {
                         break;
