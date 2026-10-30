@@ -292,6 +292,7 @@ async fn handle(d: &Arc<Daemon>, req: &Value) -> anyhow::Result<Value> {
             Ok(json!({}))
         }
         "conflicts" => conflicts(d),
+        "debug-tree" => debug_tree(d),
         "free-space" => {
             let dry_run = req
                 .get("dry_run")
@@ -761,6 +762,55 @@ fn held_or_fetched(d: &Arc<Daemon>, b: cardinal_blob::BlobRef) -> anyhow::Result
         }
     }
     Ok(left)
+}
+
+/// For tests: a digest of the files space's heads, whether the mount has
+/// changes to commit, and every item the mount shows, with whether it is
+/// local (`fs/local.rs`).
+fn debug_tree(d: &Daemon) -> anyhow::Result<Value> {
+    let files = require_files(d)?;
+    let heads = {
+        let core = d.core();
+        let mut hs = core.spaces[&files]
+            .space
+            .as_ref()
+            .map(|s| s.heads())
+            .unwrap_or_default();
+        hs.sort();
+        let mut h = blake3::Hasher::new();
+        for x in &hs {
+            h.update(x);
+        }
+        hex::encode(&h.finalize().as_bytes()[..16])
+    };
+    let m = d.mount.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(m) = m.as_ref() else {
+        return Ok(json!({"heads": heads, "mounted": false}));
+    };
+    let t = m.tree().lock().unwrap_or_else(|e| e.into_inner());
+    let mut items = Vec::new();
+    let mut stack = vec![crate::fs::tree::ROOT_INO];
+    while let Some(ino) = stack.pop() {
+        let Some(i) = t.inodes.get(&ino) else {
+            continue;
+        };
+        for c in i.children.values() {
+            let Some(x) = t.inodes.get(c) else { continue };
+            let kind = match x.kind {
+                crate::fs::tree::Kind::Dir => "dir",
+                crate::fs::tree::Kind::File => "file",
+                crate::fs::tree::Kind::Symlink => "link",
+                crate::fs::tree::Kind::Conflict(_) => "conflict",
+            };
+            items.push(json!({
+                "path": t.path(*c), "kind": kind, "local": x.local, "size": x.size,
+                "node": x.node.map(|n| hex::encode(&n[..6])), "ino": x.ino,
+                "dirty": x.dirty.any_change(),
+            }));
+            stack.push(*c);
+        }
+    }
+    Ok(json!({"heads": heads, "mounted": true, "pending": t.has_pending(), "items": items}))
 }
 
 /// The recovery words of a request, if given ([`crate::recovery`]).

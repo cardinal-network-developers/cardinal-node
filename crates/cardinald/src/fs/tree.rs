@@ -163,6 +163,11 @@ pub struct Dirty {
 }
 
 impl Dirty {
+    /// Whether anything changed (for diagnostics).
+    pub fn any_change(&self) -> bool {
+        self.any()
+    }
+
     fn any(&self) -> bool {
         self.pos || self.content || self.mode || self.mtime
     }

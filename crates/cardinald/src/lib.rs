@@ -68,6 +68,13 @@ pub struct Overrides {
 
 /// Runs the daemon until it is stopped.
 pub async fn run(paths: Paths, o: Overrides) -> anyhow::Result<()> {
+    // Tests: let a debugger attach to a daemon that hangs (Yama allows only
+    // ancestors otherwise).
+    #[cfg(target_os = "linux")]
+    if std::env::var_os("CARDINAL_TEST_PTRACE").is_some() {
+        // SAFETY: prctl with these arguments only changes who may trace us.
+        unsafe { libc::prctl(libc::PR_SET_PTRACER, libc::PR_SET_PTRACER_ANY, 0, 0, 0) };
+    }
     std::fs::create_dir_all(&paths.home)?;
     let mut config = Config::load(&paths.config())?;
     let mut changed = Config::load(&paths.config()).is_ok()
