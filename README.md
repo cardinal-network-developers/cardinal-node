@@ -19,6 +19,10 @@ One person, several Linux devices, one folder that is the same everywhere:
   history, restore, and conflict copies labeled by device.
 - Devices on the same network find each other; others are added with
   `cardinal peer add host:7171`.
+- Deleted files and old versions are kept 30 days so you can restore them
+  (`cardinal history`, `cardinal restore`), then freed. `cardinal
+  free-space` frees them now; `cardinal keep-old 90` or `forever` changes
+  the period on a device.
 - Lost your admin device? On any device you still have, your recovery
   words stand in for it: `cardinal remove-device <name>` removes the lost
   one, and `cardinal pair <code> --admin` (with `cardinal pair --admin` on

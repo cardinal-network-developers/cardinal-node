@@ -292,6 +292,31 @@ async fn handle(d: &Arc<Daemon>, req: &Value) -> anyhow::Result<Value> {
             Ok(json!({}))
         }
         "conflicts" => conflicts(d),
+        "free-space" => {
+            let dry_run = req
+                .get("dry_run")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            let d2 = d.clone();
+            let f = tokio::task::spawn_blocking(move || crate::cleanup::pass(&d2, true, dry_run))
+                .await??;
+            Ok(json!({"objects": f.objects, "bytes": f.bytes, "left": f.left}))
+        }
+        "keep-old" => {
+            let keep = crate::cleanup::Keep::parse(arg(req, "keep")?)?;
+            d.config().keep_old = keep.to_string();
+            d.save_config()?;
+            // Forever is history retention: record it for the other devices.
+            d.housekeeping();
+            // A shorter period applies now, not at the next hourly pass.
+            let d2 = d.clone();
+            tokio::task::spawn_blocking(move || {
+                if let Err(e) = crate::cleanup::pass(&d2, false, false) {
+                    tracing::warn!("freeing old versions: {e:#}");
+                }
+            });
+            Ok(json!({"keep": keep.to_string()}))
+        }
         "history" => history(d, arg(req, "path")?),
         "restore" => {
             let path = arg(req, "path")?.to_owned();
@@ -523,6 +548,7 @@ fn status(d: &Arc<Daemon>) -> Value {
         "conflicts": conflicts,
         "progress": progress,
         "copies": crate::copies::status(d),
+        "old": crate::cleanup::status(d),
         "pairing": pairing,
         "peers": cfg.peers,
         "uptime_s": d.uptime().as_secs(),
@@ -635,6 +661,13 @@ fn history(d: &Daemon, path: &str) -> anyhow::Result<Value> {
                 "device": names.get(dev).cloned().unwrap_or_else(|| account::short_key(dev)),
                 "size": c.as_ref().map(|c| c.size()),
                 "current": current.contains_key(e),
+                // whether its content is on this device (`cleanup.rs`)
+                "here": match c {
+                    Some(Content::Blob(b)) => {
+                        cardinal_blob::ObjectStore::has(&*d.store, &b.id).unwrap_or(false)
+                    }
+                    _ => true,
+                },
             })
         })
         .collect();
@@ -676,8 +709,58 @@ async fn restore(d: &Arc<Daemon>, path: &str, version: u64) -> anyhow::Result<Va
             c.ok_or_else(|| anyhow::anyhow!("that version has no content"))?,
         )
     };
+    // Its content may have been freed here (`cleanup.rs`): get all of it
+    // first, or the restored file could not be read.
+    if let Content::Blob(b) = &content {
+        let (d2, b) = (d.clone(), crate::fetch::blob_ref(b));
+        let missing = tokio::task::spawn_blocking(move || held_or_fetched(&d2, b)).await??;
+        if missing > 0 {
+            anyhow::bail!(
+                "version {version} of {path} is no longer kept: this device freed it, and none \
+                 of your online devices has all of it"
+            );
+        }
+    }
     d.write_and_push(&files_id, vec![files::set_content(node, &content)])?;
     Ok(json!({"path": path, "version": version}))
+}
+
+/// Makes sure every object of `b` is on this device, fetching what is
+/// missing from the person's online devices (blocking). Returns how many
+/// objects are still missing.
+fn held_or_fetched(d: &Arc<Daemon>, b: cardinal_blob::BlobRef) -> anyhow::Result<usize> {
+    use cardinal_blob::{BlobReader, Fetch, ObjectStore};
+    let fetcher = crate::fetch::Fetcher::new(d, cardinal_link::Priority::Interactive);
+    // Listing fetches and keeps the indexes.
+    let mut chunks = Vec::new();
+    let listed = BlobReader::new(d.store.clone(), &fetcher, b).for_each_entry(|e, chunk| {
+        if chunk {
+            chunks.push(e.id)
+        }
+    });
+    if listed.is_err() {
+        return Ok(1);
+    }
+    let mut missing: Vec<[u8; 32]> = Vec::new();
+    for id in chunks {
+        if !d.store.has(&id)? {
+            missing.push(id);
+        }
+    }
+    for batch in missing.chunks(256) {
+        for (id, ct) in fetcher.fetch(batch)? {
+            if blake3::hash(&ct).as_bytes() == &id {
+                d.store.put(&id, &ct)?;
+            }
+        }
+    }
+    let mut left = 0;
+    for id in &missing {
+        if !d.store.has(id)? {
+            left += 1;
+        }
+    }
+    Ok(left)
 }
 
 /// The recovery words of a request, if given ([`crate::recovery`]).

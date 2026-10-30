@@ -130,6 +130,20 @@ enum Cmd {
     /// starts, until `cardinal mount`): for hosts without FUSE, such as
     /// containers.
     Unmount,
+    /// Free the space this device uses for deleted files and old versions
+    /// now, instead of when they are older than `keep-old` allows. They
+    /// can then be restored only from your other devices.
+    FreeSpace {
+        /// Do not ask to confirm.
+        #[arg(long)]
+        yes: bool,
+    },
+    /// How long this device keeps deleted files and old versions so you
+    /// can restore them: a number of days (30 unless set), or `forever`.
+    KeepOld {
+        /// Days, or `forever`.
+        keep: String,
+    },
     /// List the versions of a file.
     History {
         /// The file (in your Cardinal folder).
@@ -373,6 +387,16 @@ async fn mount_path(paths: &Paths) -> Option<String> {
         .await
         .ok()
         .and_then(|v| v["mount"].as_str().map(str::to_owned))
+}
+
+/// The `Old versions:` line of `cardinal status`, if any are kept.
+fn old_line(old: &Value) -> Option<String> {
+    let bytes = old["bytes"].as_u64().filter(|b| *b > 0)?;
+    let keep = old["keep"].as_str().unwrap_or("30 days");
+    Some(format!(
+        "Old versions: {}, kept {keep} (`cardinal free-space` frees them now)",
+        human_size(bytes)
+    ))
 }
 
 fn human_size(n: u64) -> String {
@@ -704,6 +728,9 @@ fn print_status(v: &Value) {
             "everything (full)"
         }
     );
+    if let Some(line) = old_line(&v["old"]) {
+        println!("{line}");
+    }
     println!("Devices:");
     print_devices(&v["devices"]);
     let p = &v["progress"];
@@ -1084,12 +1111,52 @@ async fn client(cmd: Cmd) -> anyhow::Result<()> {
                     x["size"].as_u64().map(human_size).unwrap_or_default(),
                     if x["current"].as_bool() == Some(true) {
                         "  (current)"
+                    } else if x["here"].as_bool() == Some(false) {
+                        "  (not on this device)"
                     } else {
                         ""
                     }
                 );
             }
             println!("Bring one back with: cardinal restore {p} --version N");
+            Ok(())
+        }
+        Cmd::FreeSpace { yes } => {
+            let mut v = call(&paths, json!({"cmd": "free-space", "dry_run": true})).await?;
+            let bytes = v["bytes"].as_u64().unwrap_or(0);
+            if bytes == 0 {
+                println!("Nothing to free now.");
+            } else {
+                println!(
+                    "This frees {} on this device. Deleted files and old versions can then be \
+                     restored\nonly from your other devices, for as long as they keep theirs.",
+                    human_size(bytes)
+                );
+                if !yes && !prompt("Free it? [y/N] ")?.eq_ignore_ascii_case("y") {
+                    println!("Nothing was freed.");
+                    return Ok(());
+                }
+                v = call(&paths, json!({"cmd": "free-space"})).await?;
+                println!("Freed {}.", human_size(v["bytes"].as_u64().unwrap_or(0)));
+            }
+            // What changed in the last hour is not freed yet.
+            if let Some(b) = v["left"].as_u64().filter(|b| *b > 0) {
+                println!(
+                    "{} changed in the last hour stays until it is an hour old.",
+                    human_size(b)
+                );
+            }
+            Ok(())
+        }
+        Cmd::KeepOld { keep } => {
+            let v = call(&paths, json!({"cmd": "keep-old", "keep": keep})).await?;
+            println!(
+                "This device now keeps deleted files and old versions {}.",
+                match v["keep"].as_str().unwrap_or("") {
+                    "forever" => "forever".to_owned(),
+                    k => format!("for {k}"),
+                }
+            );
             Ok(())
         }
         Cmd::Restore { path, version } => {

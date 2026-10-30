@@ -92,10 +92,16 @@ pub fn install(paths: &Paths, prepared: Prepared, config: &Config) -> anyhow::Re
     Ok(())
 }
 
-/// The retention policy a configuration asks for.
+/// The retention policy a configuration asks for: full with old
+/// versions kept forever is history (`blobs.md#retention`).
 pub fn retention(config: &Config) -> Retention {
     if config.on_demand() {
         Retention::OnDemand
+    } else if matches!(
+        crate::cleanup::Keep::parse(&config.keep_old),
+        Ok(crate::cleanup::Keep::Forever)
+    ) {
+        Retention::History
     } else {
         Retention::Full
     }

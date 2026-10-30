@@ -231,6 +231,30 @@ Copies: 3 — this device, saint-joseph, nuc (checked 4 minutes ago; files older
 - `CARDINAL_TEST_CHECK_INTERVAL_MS` and `CARDINAL_TEST_CHECK_MIN_AGE_MS`
   shorten the interval and the age (tests).
 
+## Freeing space
+
+`cleanup.rs`, about every hour (the first a minute after start):
+
+- **Old versions stay for a while.** A blob that stops being current
+  (its file replaced or deleted) is kept for `keep_old` (30 days by
+  default; `cardinal keep-old <days|forever>`), counted from when this
+  device first saw it stop being current (`old-versions.json`). Then its
+  chunks and indexes are deleted, except those a current or kept blob
+  shares (identical content deduplicates). Objects no blob names are
+  never deleted, and nothing stored or read in the last hour is.
+- **`cardinal free-space`** deletes every old version on this device now,
+  after saying how much and asking. `cardinal status` shows how much old
+  versions take (`Old versions:`), and `cardinal history` marks versions
+  not on this device.
+- **Restoring** a version first gets all of it onto this device from the
+  others, and refuses when none has it.
+- **On demand**, objects of current files that are not pinned are also
+  deleted, least recently used first, beyond `on_demand_budget` (2 GiB).
+- **Forever** is history retention: the placement says so, for the other
+  devices.
+- `CARDINAL_TEST_FREE_INTERVAL_MS` and `CARDINAL_TEST_FREE_MIN_AGE_MS`
+  shorten the hour and the age (tests).
+
 ## Speed test
 
 `cardinal speedtest [DEVICE]` measures the encrypted link to one of the
@@ -258,7 +282,8 @@ One JSON object per line each way: `{"cmd": "status"}` →
 `{"ok": true, ...}` or `{"ok": false, "error": "...", "needs_words":
 bool}`; `needs_words` means the recovery words, as `words`, would let the
 same request through. Commands: `status`, `devices`, `remove-device`,
-`recovery-check` (`words`; changes nothing), `peer-add/remove/list`,
+`recovery-check` (`words`; changes nothing), `free-space` (`dry_run`),
+`keep-old` (`keep`), `peer-add/remove/list`,
 `mount`, `unmount`,
 `history`, `restore`, `conflicts`, `pin`, `unpin`, `retention`,
 `pair-show`, `pair-status`, `pair-type`, `speedtest` (one device, by
@@ -277,10 +302,9 @@ colours. `CARDINAL_LOG` or `RUST_LOG` sets the filter (`info` by default;
 
 ## Not done yet
 
-- Retention never deletes chunks: `full` keeps old versions' chunks too
-  (as "history" would), and on-demand eviction by budget is not run.
 - Folder ignore patterns are not applied.
-- Hosts (mailbox, relay, storage), guardians, recovery from the phrase.
+- Hosts (mailbox, relay, storage), guardians, restoring from the phrase
+  when every device is lost.
   Copies on hosts (host grants) are not counted.
 - Epoch rotation after `rotate_after` entries (only after a device is
   removed).

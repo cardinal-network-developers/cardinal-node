@@ -34,6 +34,9 @@ pub struct Config {
     pub retention: String,
     /// The most bytes on-demand retention keeps of files not pinned.
     pub on_demand_budget: u64,
+    /// How long deleted files and old versions are kept after they stop
+    /// being current: a number of days, or `forever` (`cleanup.rs`).
+    pub keep_old: String,
     /// Addresses (`host:port`) of devices reached over the internet.
     pub peers: Vec<String>,
     /// Paths (inside the mount) kept local under on-demand retention.
@@ -53,6 +56,7 @@ impl Default for Config {
             mount: Some(crate::paths::home_dir().join("Cardinal")),
             retention: "full".into(),
             on_demand_budget: DEFAULT_ON_DEMAND_BUDGET,
+            keep_old: "30 days".into(),
             peers: Vec::new(),
             pins: Vec::new(),
             discovery: true,

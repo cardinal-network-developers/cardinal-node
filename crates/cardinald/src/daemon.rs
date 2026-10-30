@@ -184,6 +184,8 @@ pub struct Daemon {
     /// Copies of the files space seen on the person's devices
     /// (`copies.rs`).
     pub copies: crate::copies::Tracker,
+    /// Freeing deleted files and old versions (`cleanup.rs`).
+    pub cleanup: crate::cleanup::Cleaner,
     /// Speed tests this device serves (`speedtest.rs`).
     pub speedtest: crate::speedtest::Limiter,
     /// Held while this device's own account nodes are checked and
@@ -272,6 +274,7 @@ impl Daemon {
             .and_then(|b| serde_json::from_slice(&b).ok())
             .unwrap_or_default();
         let copies_path = paths.copies();
+        let old_versions = paths.old_versions();
         let d = Arc::new(Daemon {
             paths,
             config: Mutex::new(config),
@@ -293,6 +296,7 @@ impl Daemon {
             progress: Mutex::new(Progress::default()),
             blob_stats: Mutex::new(HashMap::new()),
             copies: crate::copies::Tracker::load(copies_path, crate::copies::Rules::from_env()),
+            cleanup: crate::cleanup::Cleaner::load(old_versions),
             speedtest: crate::speedtest::Limiter::default(),
             placement_lock: Mutex::new(()),
             stopping: watch::channel(false).0,
@@ -1076,6 +1080,7 @@ impl Daemon {
         });
         crate::fetch::start(self.clone());
         crate::copies::start(self.clone());
+        crate::cleanup::start(self.clone());
         // Report (never install) new releases, if the person allows it.
         let cfg_path = self.paths.config();
         tokio::spawn(async move {

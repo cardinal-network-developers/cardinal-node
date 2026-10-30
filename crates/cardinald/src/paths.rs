@@ -126,6 +126,10 @@ impl Paths {
     pub fn copies(&self) -> PathBuf {
         self.home.join("copies.json")
     }
+    /// When old versions stopped being current (`cleanup.rs`).
+    pub fn old_versions(&self) -> PathBuf {
+        self.home.join("old-versions.json")
+    }
 }
 
 fn absolute(p: &Path) -> PathBuf {

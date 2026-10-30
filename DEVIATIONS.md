@@ -562,8 +562,18 @@ Not implemented yet (the next milestone):
   copies (they remain in history). A `set` cannot keep two of three values.
 - **Not implemented: `rotate_after`.** Epochs rotate only when a device is
   removed.
-- **Retention.** `full` keeps every chunk ever fetched or written (no
-  garbage collection yet), which is closer to `history`.
+- **Retention: old versions for a while.** `full` keeps every chunk of
+  current state, and also the chunks of deleted files and replaced
+  versions for `keep_old` (30 days by default), so they can be restored;
+  `history` is `keep_old = forever`, and the placement records 2 then.
+  The period counts from when this device first saw a blob stop being
+  current (`old-versions.json`), not from entry times, which are other
+  devices' clocks. Only objects reachable from an expired blob and from
+  no current or kept one are deleted; objects no blob names are left
+  alone, and nothing stored or read in the last hour is deleted.
+  `cardinal free-space` deletes every old version on this device now.
+  Restoring a version first makes sure all of it is on this device,
+  fetching what is missing, and refuses when no online device has it.
 - **Spec ambiguity: what a local change has "seen".** `state.md` decides
   supersession and delete conflicts by entry ancestry, and an entry's
   parents are normally all current heads. A device that holds an entry
