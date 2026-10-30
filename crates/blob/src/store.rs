@@ -386,6 +386,10 @@ impl ObjectStore for FsStore {
     fn put(&self, id: &Id, bytes: &[u8]) -> io::Result<bool> {
         let path = self.path_of(id);
         if self.has(id)? {
+            // Stored again (identical content): as new as if just stored,
+            // so freeing old versions does not take it from under a
+            // commit that names it.
+            let _ = self.touch(id);
             return Ok(false);
         }
         check_id(id, bytes)?;
@@ -522,6 +526,27 @@ pub(crate) mod tests {
             std::env::temp_dir().join(format!("cardinal-blob-{name}-{}", u64::from_le_bytes(r)));
         fs::create_dir_all(&p).unwrap();
         p
+    }
+
+    #[test]
+    fn storing_again_refreshes() {
+        let dir = temp_dir("again");
+        let store = FsStore::open(&dir, Fsync::Never).unwrap();
+        let a = b"same content".to_vec();
+        let id = object_id(&a);
+        assert!(store.put(&id, &a).unwrap());
+        let old = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000);
+        File::options()
+            .write(true)
+            .open(store.path_of(&id))
+            .unwrap()
+            .set_modified(old)
+            .unwrap();
+        let used = |s: &FsStore| s.list().unwrap().iter().find(|o| o.id == id).unwrap().used;
+        assert_eq!(used(&store), old);
+        assert!(!store.put(&id, &a).unwrap(), "already there");
+        assert!(used(&store) > old, "as new as if just stored");
+        fs::remove_dir_all(&dir).unwrap();
     }
 
     fn exercise(store: &dyn ObjectStore) {

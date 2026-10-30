@@ -152,6 +152,14 @@ fn encode_all(
 /// One commit at a time (the scheduler and `cardinal flush`).
 static COMMITTING: Mutex<()> = Mutex::new(());
 
+/// Runs `f` while no commit runs: a commit writes chunks before the entry
+/// that names them, so freeing old versions (`cleanup.rs`) must not see
+/// one half done.
+pub fn without_commits<R>(f: impl FnOnce() -> R) -> R {
+    let _one = COMMITTING.lock().unwrap_or_else(|e| e.into_inner());
+    f()
+}
+
 /// Commits everything pending. Returns the number of entries written.
 pub fn commit(d: &Arc<Daemon>, tree: &Mutex<Tree>, space: &SpaceId) -> anyhow::Result<usize> {
     let _one = COMMITTING.lock().unwrap_or_else(|e| e.into_inner());

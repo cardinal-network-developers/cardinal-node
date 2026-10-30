@@ -345,6 +345,12 @@ impl Cleaner {
 pub fn pass(d: &Daemon, now_all: bool, dry_run: bool) -> anyhow::Result<Freed> {
     let c = &d.cleanup;
     let _one_at_a_time = lock(&c.running);
+    // From finding what is current to deleting, no commit runs.
+    crate::fs::commit::without_commits(|| pass_now(d, now_all, dry_run))
+}
+
+fn pass_now(d: &Daemon, now_all: bool, dry_run: bool) -> anyhow::Result<Freed> {
+    let c = &d.cleanup;
     let (keep, on_demand, pins, budget) = {
         let cfg = d.config();
         (
