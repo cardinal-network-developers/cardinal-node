@@ -82,11 +82,13 @@ pub fn read_small(store: &FsStore, i: &Inode) -> Vec<u8> {
     }
 }
 
-fn matcher(root: &str, text: &[u8]) -> Gitignore {
-    let mut b = GitignoreBuilder::new(root);
+fn matcher(text: &[u8], folder: &str) -> Gitignore {
+    // No root: it is given paths relative to its folder, which can be
+    // renamed while it is cached.
+    let mut b = GitignoreBuilder::new(".");
     for line in String::from_utf8_lossy(text).lines() {
         if let Err(e) = b.add_line(None, line) {
-            tracing::debug!("{IGNORE_FILE} in /{root}: {e}");
+            tracing::debug!("{IGNORE_FILE} in /{folder}: {e}");
         }
     }
     b.build().unwrap_or_else(|_| Gitignore::empty())
@@ -153,11 +155,9 @@ impl Tree {
         if self.inodes.get(&parent).is_some_and(|p| p.local) {
             return true;
         }
-        let full = match self.path(parent) {
-            p if p.is_empty() => format!("/{name}"),
-            p => format!("/{p}/{name}"),
-        };
         let mut ignores = std::mem::take(&mut self.ignores);
+        // the path below `d`, longer at each folder up
+        let mut rel = name.to_owned();
         let mut d = parent;
         let mut out = false;
         for _ in 0..10_000 {
@@ -167,8 +167,7 @@ impl Tree {
                     let gi = match ignores.by_dir.get(&(d, h)) {
                         Some(gi) => gi.clone(),
                         None => {
-                            let root = format!("/{}", self.path(d));
-                            let gi = Arc::new(matcher(&root, &text));
+                            let gi = Arc::new(matcher(&text, &self.path(d)));
                             if ignores.by_dir.len() > 4096 {
                                 ignores.by_dir.clear();
                             }
@@ -176,7 +175,7 @@ impl Tree {
                             gi
                         }
                     };
-                    match gi.matched_path_or_any_parents(&full, is_dir) {
+                    match gi.matched_path_or_any_parents(&rel, is_dir) {
                         Match::Ignore(_) => {
                             out = true;
                             break;
@@ -186,10 +185,12 @@ impl Tree {
                     }
                 }
             }
-            if d == ROOT_INO || d == 0 {
+            if d == ROOT_INO {
                 break;
             }
-            d = self.inodes.get(&d).map_or(0, |i| i.parent);
+            let Some(i) = self.inodes.get(&d) else { break };
+            rel = format!("{}/{rel}", i.name);
+            d = i.parent;
         }
         self.ignores = ignores;
         out
@@ -658,6 +659,16 @@ mod tests {
         let f = t.child(proj, IGNORE_FILE).unwrap();
         t.inodes.get_mut(&f).unwrap().content = Some(Content::Inline(b"other/\n".to_vec()));
         assert!(!t.ignored(&store, proj, "target", true));
+        // a folder renamed after its lines were read: the same lines, from
+        // its new place
+        assert!(t.ignored(&store, src, "other", true));
+        for name in ["work", "work (2)", "pro"] {
+            t.detach(proj);
+            t.attach(proj, ROOT_INO, name);
+            assert!(t.ignored(&store, src, "other", true), "{name}");
+            assert!(!t.ignored(&store, src, "another", true), "{name}");
+            assert!(t.ignored(&store, src, "x.tmp", false), "{name}");
+        }
     }
 
     #[test]
