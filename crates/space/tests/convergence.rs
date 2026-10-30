@@ -188,11 +188,17 @@ fn run(seed: u64, replicas: usize, steps: usize) -> [u64; 5] {
 
 #[test]
 fn converges_fixed_seeds() {
+    // Keys are random, so how often each case comes up varies: content
+    // conflicts are rare (2 to 7 in 8 seeds). Run 8 seeds, and more until
+    // every case has come up.
     let mut total = [0u64; 5];
-    for seed in 1..9 {
+    for seed in 1..=64 {
         let r = run(seed, 3, 50);
         for i in 0..5 {
             total[i] += r[i];
+        }
+        if seed >= 8 && total.iter().all(|&t| t > 0) {
+            break;
         }
     }
     eprintln!("conflicts, delete conflicts, deleted, appended, recomputed: {total:?}");
