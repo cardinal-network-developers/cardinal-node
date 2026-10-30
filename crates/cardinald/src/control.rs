@@ -783,6 +783,15 @@ fn debug_tree(d: &Daemon) -> anyhow::Result<Value> {
         }
         hex::encode(&h.finalize().as_bytes()[..16])
     };
+    let (state, snap) = {
+        let core = d.core();
+        let h = &core.spaces[&files];
+        let sp = h.space.as_ref();
+        (
+            sp.map(|s| hex::encode(&blake3::hash(&s.state().canonical().encode()).as_bytes()[..8])),
+            sp.map(|s| crate::fs::tree::Snapshot::take(s, h.version, &core.device_names())),
+        )
+    };
     let m = d.mount.lock().unwrap_or_else(|e| e.into_inner());
     let Some(m) = m.as_ref() else {
         return Ok(json!({"heads": heads, "mounted": false}));
@@ -810,7 +819,30 @@ fn debug_tree(d: &Daemon) -> anyhow::Result<Value> {
             stack.push(*c);
         }
     }
-    Ok(json!({"heads": heads, "mounted": true, "pending": t.has_pending(), "items": items}))
+    // What keeps a device from settling, and what its state holds that its
+    // tree does not show.
+    let stuck: Vec<Value> = t
+        .inodes
+        .values()
+        .filter(|x| x.parent != 0 && !x.local && (x.node.is_none() || x.dirty.any_change()))
+        .map(|x| {
+            json!({
+                "path": t.path(x.ino), "kind": format!("{:?}", x.kind),
+                "dirty": format!("{:?}", x.dirty), "staged": x.staged.is_some(), "opens": x.opens,
+            })
+        })
+        .collect();
+    let unshown: Vec<Value> = snap
+        .iter()
+        .flat_map(|s| s.entries.iter())
+        .filter(|e| e.version.is_none() && !t.by_node.contains_key(&e.node))
+        .map(|e| json!({"node": hex::encode(&e.node[..6]), "name": e.name}))
+        .collect();
+    Ok(json!({
+        "heads": heads, "state": state, "mounted": true, "pending": t.has_pending(),
+        "items": items, "stuck": stuck, "unshown": unshown,
+        "deleted": t.deleted.len(), "settle": t.settle.len(),
+    }))
 }
 
 /// The recovery words of a request, if given ([`crate::recovery`]).

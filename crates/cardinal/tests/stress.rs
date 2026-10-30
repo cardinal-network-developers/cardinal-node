@@ -220,6 +220,16 @@ fn quiesce(devs: &[&Dev]) -> Duration {
                 "settling {:?}: heads {heads:?} pending {pending:?}",
                 start.elapsed()
             );
+            for (d, t) in devs
+                .iter()
+                .zip(&trees)
+                .filter(|(_, t)| t["pending"] == true)
+            {
+                eprintln!(
+                    "stuck on {}: deleted {} settle {} {}",
+                    d.name, t["deleted"], t["settle"], t["stuck"]
+                );
+            }
         }
         assert!(
             start.elapsed() < Duration::from_secs(240),
@@ -330,6 +340,24 @@ fn check_storage(d: &Dev, round: usize) {
 }
 
 fn check_agree(devs: &[&Dev], round: usize) {
+    // The same heads give the same state; a mount shows all of it.
+    let trees: Vec<Value> = devs
+        .iter()
+        .map(|d| request(d, json!({"cmd": "debug-tree"})))
+        .collect();
+    for (d, t) in devs.iter().zip(&trees) {
+        assert_eq!(
+            t["state"], trees[0]["state"],
+            "round {round}: {} state differs",
+            d.name
+        );
+        assert_eq!(
+            t["unshown"],
+            json!([]),
+            "round {round}: {} does not show",
+            d.name
+        );
+    }
     let views: Vec<View> = devs.iter().map(|d| view(d)).collect();
     for (d, v) in devs.iter().zip(&views) {
         let bad: Vec<_> = v
