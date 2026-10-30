@@ -96,6 +96,12 @@ fn ignored_paths_stay_on_this_device() {
     assert!(!b.p("proj/src/main.tmp").exists());
     assert_eq!(read(&a.p("proj/src/main.tmp")).unwrap(), b"fn main() {}\n");
 
+    // Out of a local folder into a synced one: it syncs.
+    std::fs::rename(a.p("proj/target/debug/o6.o"), a.p("proj/src/o6.rs")).unwrap();
+    a.cli(&["flush"]);
+    synced(&b, "proj/src/o6.rs", b"object 6");
+    assert_eq!(read(&a.p("proj/src/o6.rs")).unwrap(), b"object 6");
+
     // An editor's save: write a local temporary, rename it over the file.
     std::fs::write(a.p("doc.txt"), "draft 1\n").unwrap();
     a.cli(&["flush"]);
@@ -130,5 +136,9 @@ fn ignored_paths_stay_on_this_device() {
     a.start();
     a.wait_mounted();
     assert_eq!(read(&a.p("proj/target/debug/o8.o")).unwrap(), b"object 8");
+    assert!(
+        !a.p("proj/target/debug/o6.o").exists(),
+        "moved out, not left behind"
+    );
     assert!(!b.p("proj").exists());
 }

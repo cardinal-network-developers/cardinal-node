@@ -344,9 +344,10 @@ impl Tree {
                 (i.parent, i.name.clone(), i.kind)
             };
             let Some(old) = paths.get(&x) else { continue };
-            // A parent that stays local keeps it local; beneath one that
-            // became synced, the lines decide.
-            if self.inodes.get(&parent).is_some_and(|p| p.local) {
+            // Beneath it, a parent that stays local keeps it local; beneath
+            // one that became synced, the lines decide. (`ino` itself may
+            // still be in a local folder, about to move out of it.)
+            if x != ino && self.inodes.get(&parent).is_some_and(|p| p.local) {
                 continue;
             }
             if x != ino && self.ignored(store, parent, &name, kind == Kind::Dir) {
