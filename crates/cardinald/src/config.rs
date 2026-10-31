@@ -26,6 +26,8 @@ pub struct ThisRun {
     pub no_discovery: bool,
     /// `--mdns-port`.
     pub mdns_port: Option<u16>,
+    /// `--no-udp`.
+    pub no_udp: bool,
 }
 
 /// Device settings.
@@ -39,7 +41,7 @@ pub struct Config {
     pub name: String,
     /// Where the link endpoint listens (TCP).
     pub listen: String,
-    /// Also listen on UDP (experimental: no congestion control yet).
+    /// Also listen on UDP.
     pub udp: bool,
     /// Where the files space is mounted; `None` (written as `""`) to not
     /// mount.
@@ -69,7 +71,7 @@ impl Default for Config {
         Config {
             name: default_name(),
             listen: format!("0.0.0.0:{DEFAULT_PORT}"),
-            udp: false,
+            udp: true,
             this_run: ThisRun::default(),
             mount: Some(crate::paths::home_dir().join("Cardinal")),
             retention: "full".into(),
@@ -163,6 +165,11 @@ impl Config {
     /// Where to mount on this run, if at all.
     pub fn mount_here(&self) -> Option<&PathBuf> {
         self.mount.as_ref().filter(|_| !self.this_run.no_mount)
+    }
+
+    /// Whether to listen on UDP on this run.
+    pub fn uses_udp(&self) -> bool {
+        self.udp && !self.this_run.no_udp
     }
 
     /// Whether to look for devices on the local network on this run.

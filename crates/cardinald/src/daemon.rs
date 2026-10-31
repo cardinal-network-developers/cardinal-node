@@ -57,6 +57,10 @@ pub struct Conn {
     pub since: Instant,
 }
 
+/// How long a device gets to answer over UDP before TCP is tried. Most of a
+/// failed attempt is an older device that does not listen there.
+const UDP_WITHIN: Duration = Duration::from_secs(2);
+
 /// Addresses of this person's devices, learned from pairing, discovery,
 /// and successful connections.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -294,7 +298,7 @@ impl Daemon {
         let endpoint = Endpoint::bind(
             ec,
             Bind {
-                udp: if config.udp { Some(listen) } else { None },
+                udp: config.uses_udp().then_some(listen),
                 tcp: Some(listen),
             },
         )
@@ -426,6 +430,17 @@ impl Daemon {
         lock(&self.sessions)
             .get(link_x25519)
             .is_some_and(|c| !c.session.is_closed())
+    }
+
+    /// What a device's session runs over.
+    pub fn session_carrier(&self, link_x25519: &[u8; 32]) -> Option<&'static str> {
+        let carrier = lock(&self.sessions)
+            .get(link_x25519)
+            .and_then(|c| c.session.carrier())?;
+        Some(match carrier {
+            CarrierKind::Udp => "UDP",
+            CarrierKind::Tcp => "TCP",
+        })
     }
 
     /// The remote address of a device's session.
@@ -830,6 +845,23 @@ impl Daemon {
         }
     }
 
+    /// Opens a session at an address, over UDP if something answers there,
+    /// and over TCP if not: an older device, or a network that blocks UDP.
+    pub async fn dial(
+        &self,
+        target: impl Fn(CarrierKind) -> Target,
+    ) -> Result<Session, cardinal_link::LinkError> {
+        if self.endpoint.udp_addr().is_some() {
+            let udp = target(CarrierKind::Udp).within(UDP_WITHIN);
+            match self.endpoint.connect(udp).await {
+                Err(e @ cardinal_link::LinkError::Closed(_)) => return Err(e),
+                Err(e) => tracing::debug!("over UDP: {e}"),
+                ok => return ok,
+            }
+        }
+        self.endpoint.connect(target(CarrierKind::Tcp)).await
+    }
+
     async fn candidate_addrs(&self, key: &KeyId) -> Vec<(SocketAddr, Option<String>)> {
         let (known, manual): (Vec<String>, Vec<(String, Option<String>)>) = {
             let book = lock(&self.book);
@@ -877,8 +909,7 @@ impl Daemon {
             if self.is_online(link.x25519()) {
                 return true;
             }
-            let t = Target::new(addr, CarrierKind::Tcp, &link);
-            match self.endpoint.connect(t).await {
+            match self.dial(|c| Target::new(addr, c, &link)).await {
                 Ok(s) => {
                     {
                         let mut book = lock(&self.book);
@@ -1013,8 +1044,7 @@ impl Daemon {
             if !lock(&self.connecting).insert(key) {
                 continue;
             }
-            let t = Target::new(addr, CarrierKind::Tcp, &link);
-            let r = self.endpoint.connect(t).await;
+            let r = self.dial(|c| Target::new(addr, c, &link)).await;
             lock(&self.connecting).remove(&key);
             if let Ok(s) = r {
                 tracing::info!(

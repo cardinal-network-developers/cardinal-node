@@ -116,6 +116,18 @@ impl Path {
         }
     }
 
+    /// The carrier, if the path has one of the kinds a peer can be asked
+    /// for.
+    pub fn carrier(&self) -> Option<CarrierKind> {
+        match self {
+            Path::Udp { .. } => Some(CarrierKind::Udp),
+            Path::Tcp(_) => Some(CarrierKind::Tcp),
+            Path::Relayed { via, .. } => via.carrier(),
+            #[cfg(test)]
+            Path::Mem(_) => None,
+        }
+    }
+
     /// The remote socket address, if the path has one.
     pub fn remote_addr(&self) -> Option<SocketAddr> {
         match self {

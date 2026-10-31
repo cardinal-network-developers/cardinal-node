@@ -12,7 +12,7 @@ use cardinal_encoding::{decode, read_varint, write_varint, Value};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::sync::mpsc;
 
-use crate::carrier::Path;
+use crate::carrier::{CarrierKind, Path};
 use crate::conn::{Admission, CloseReason, Conn, ConnEvent, Role, SessionStats, Signals};
 use crate::directory::PeerIdentity;
 use crate::endpoint::EndpointInner;
@@ -199,6 +199,11 @@ impl Session {
     /// The address of the current path, if it has one.
     pub fn remote_addr(&self) -> Option<std::net::SocketAddr> {
         self.inner.lock().path.remote_addr()
+    }
+
+    /// The carrier of the current path.
+    pub fn carrier(&self) -> Option<CarrierKind> {
+        self.inner.lock().path.carrier()
     }
 
     /// The address the peer says our packets come from (`observed

@@ -18,9 +18,7 @@ use std::time::Duration;
 use cardinal_crypto::{verify, RecoveryPhrase, SigningKey};
 use cardinal_encoding::{Record, Value};
 use cardinal_identity::Power;
-use cardinal_link::{
-    Admission, CarrierKind, LinkError, Priority, Role, Service, Session, Stream, Target,
-};
+use cardinal_link::{Admission, LinkError, Priority, Role, Service, Session, Stream, Target};
 use cardinal_space::account;
 use cardinal_space::grant::{Endpoint, Grant, STORAGE};
 use cardinal_space::SpaceOp;
@@ -394,8 +392,7 @@ pub async fn restore(d: &Arc<Daemon>, words: &str, at: &str, key: &str) -> anyho
     let mut failed = anyhow::anyhow!("cannot find {at}");
     let mut found = None;
     for addr in addrs {
-        let target = Target::public(addr, CarrierKind::Tcp, host);
-        match d.endpoint.connect(target).await {
+        match d.dial(|c| Target::public(addr, c, host)).await {
             Ok(s) => {
                 found = Some((s, addr));
                 break;

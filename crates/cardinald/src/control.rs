@@ -493,6 +493,7 @@ fn devices(d: &Daemon) -> Vec<Value> {
                 "this": k.key == me,
                 "online": online,
                 "addr": if k.key == me { None } else { addr },
+                "carrier": x.and_then(|x| d.session_carrier(&x)),
                 // what this device's fetcher thinks of it as a source
                 "fetch": x.and_then(|x| stats.get(&x)).map(|s| json!({
                     "rate": s.rate as u64,

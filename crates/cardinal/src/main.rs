@@ -68,6 +68,9 @@ enum Cmd {
         /// Multicast DNS port (for testing).
         #[arg(long, hide = true)]
         mdns_port: Option<u16>,
+        /// Do not listen on UDP this time (for testing).
+        #[arg(long, hide = true)]
+        no_udp: bool,
         /// This device's name (saved for next time).
         #[arg(long)]
         name: Option<String>,
@@ -255,6 +258,7 @@ fn main() {
             no_mount,
             no_discovery,
             mdns_port,
+            no_udp,
             name,
         } => {
             cardinald::init_logging();
@@ -270,6 +274,7 @@ fn main() {
                     no_mount,
                     no_discovery,
                     mdns_port,
+                    no_udp,
                     name,
                 },
             ))
@@ -738,6 +743,9 @@ fn print_devices(devs: &Value) {
         line.push_str(&format!("  {}", d["power"].as_str().unwrap_or("")));
         if let Some(a) = d["addr"].as_str() {
             line.push_str(&format!("  {a}"));
+        }
+        if let Some(c) = d["carrier"].as_str() {
+            line.push_str(&format!("  {c}"));
         }
         line.push_str(&format!("  [{}]", d["key"].as_str().unwrap_or("")));
         println!("{line}");

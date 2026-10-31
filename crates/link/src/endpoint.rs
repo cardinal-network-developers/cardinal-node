@@ -99,12 +99,21 @@ pub struct Target {
     pub secret: Option<Zeroizing<Vec<u8>>>,
     /// Who the peer must prove to be when its log is not known yet.
     pub expected: ExpectedPeer,
+    /// How long this attempt may take, if not the endpoint's
+    /// [`connect_timeout`](EndpointConfig::connect_timeout).
+    pub within: Option<Duration>,
     /// A public-service or restore session: nothing but the address and
     /// X25519 key is known of the peer, and this device has no secret.
     pub public: bool,
 }
 
 impl Target {
+    /// Gives this attempt its own time limit.
+    pub fn within(mut self, limit: Duration) -> Target {
+        self.within = Some(limit);
+        self
+    }
+
     /// A peer whose full link key is known.
     pub fn new(addr: SocketAddr, carrier: CarrierKind, peer: &HybridPublicKey) -> Target {
         Target {
@@ -114,6 +123,7 @@ impl Target {
             peer_kem: Some(peer.kem().clone()),
             secret: None,
             expected: ExpectedPeer::default(),
+            within: None,
             public: false,
         }
     }
@@ -129,6 +139,7 @@ impl Target {
             peer_kem: None,
             secret: None,
             expected: ExpectedPeer::default(),
+            within: None,
             public: true,
         }
     }
@@ -147,6 +158,7 @@ impl Target {
             peer_kem: None,
             secret: Some(Zeroizing::new(secret.to_vec())),
             expected: ExpectedPeer::default(),
+            within: None,
             public: false,
         }
     }
@@ -481,7 +493,8 @@ impl Endpoint {
         if ep.closed.load(Ordering::Relaxed) {
             return Err(LinkError::Closed(CloseReason::EndpointClosed));
         }
-        let deadline = tokio::time::Instant::now() + ep.config.connect_timeout;
+        let limit = target.within.unwrap_or(ep.config.connect_timeout);
+        let deadline = tokio::time::Instant::now() + limit;
         let path = match target.carrier {
             CarrierKind::Udp => {
                 let socket = ep.udp.clone().ok_or(LinkError::NoCarrier)?;

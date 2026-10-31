@@ -62,6 +62,8 @@ pub struct Overrides {
     pub no_mount: bool,
     /// `--no-discovery`.
     pub no_discovery: bool,
+    /// `--no-udp`.
+    pub no_udp: bool,
     /// `--mdns-port`.
     pub mdns_port: Option<u16>,
     /// `--name`.
@@ -95,6 +97,9 @@ pub async fn run(paths: Paths, o: Overrides) -> anyhow::Result<()> {
     }
     if let Some(p) = o.mdns_port {
         config.this_run.mdns_port = Some(p);
+    }
+    if o.no_udp {
+        config.this_run.no_udp = true;
     }
     if o.no_discovery {
         config.this_run.no_discovery = true;
