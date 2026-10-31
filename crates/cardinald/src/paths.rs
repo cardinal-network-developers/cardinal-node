@@ -126,6 +126,10 @@ impl Paths {
     pub fn others(&self) -> PathBuf {
         self.home.join("others")
     }
+    /// What this device, as a host, holds for its owner.
+    pub fn mailbox(&self) -> PathBuf {
+        self.home.join("mailbox")
+    }
     /// Known addresses of this person's devices.
     pub fn peers(&self) -> PathBuf {
         self.home.join("peers.json")

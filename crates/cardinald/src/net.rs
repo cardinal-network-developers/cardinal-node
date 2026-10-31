@@ -97,7 +97,7 @@ impl Daemon {
                     Access::None
                 }
             }
-            PeerKind::Restoring | PeerKind::Stranger => Access::None,
+            PeerKind::Restoring | PeerKind::Token(_) | PeerKind::Stranger => Access::None,
         }
     }
 }
@@ -158,6 +158,9 @@ async fn handle_stream(d: &Arc<Daemon>, s: &Session, mut st: Stream) -> anyhow::
     }
     if st.service() == Service::CONTACT {
         return crate::contacts::serve(d, s, st).await;
+    }
+    if st.service() == Service::MAILBOX {
+        return crate::mailbox::serve(d, s, st).await;
     }
     if st.service() == Service::BLOB {
         if !may_fetch_blobs(d.session_kind(&s.peer_static())) {
@@ -739,6 +742,7 @@ mod tests {
         assert!(may_fetch_blobs(Some(PeerKind::Proven)));
         assert!(!may_fetch_blobs(Some(PeerKind::Contact(someone, someone))));
         assert!(!may_fetch_blobs(Some(PeerKind::Inviting(someone))));
+        assert!(!may_fetch_blobs(Some(PeerKind::Token([1; 16]))));
         assert!(!may_fetch_blobs(Some(PeerKind::Restoring)));
         assert!(!may_fetch_blobs(Some(PeerKind::Stranger)));
         assert!(!may_fetch_blobs(None));

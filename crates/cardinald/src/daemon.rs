@@ -46,6 +46,9 @@ pub enum PeerKind {
     /// A session opened with an invitation, with the identity that used it
     /// or gave it, before they have a relationship.
     Inviting([u8; 32]),
+    /// A session opened with a delivery token, by someone this device need
+    /// not know (`hosts.md#delivery-tokens`).
+    Token(crate::mailbox::Token),
     /// Anyone else.
     Stranger,
 }
@@ -235,6 +238,8 @@ pub struct Daemon {
     saving_book: Mutex<()>,
     /// Rendezvous and relay, as a device and as a host.
     pub rendezvous: crate::rendezvous::Rendezvous,
+    /// What this device, as a host, holds for its owner.
+    pub mailbox: crate::mailbox::Mailbox,
     /// Pairing.
     pub pairing: Mutex<PairState>,
     /// The mount, if mounted.
@@ -355,6 +360,7 @@ impl Daemon {
             .unwrap_or_default();
         let copies_path = paths.copies();
         let old_versions = paths.old_versions();
+        let mailbox = crate::mailbox::Mailbox::load(paths.mailbox());
         let d = Arc::new(Daemon {
             paths,
             config: Mutex::new(config),
@@ -379,6 +385,7 @@ impl Daemon {
             proven: Mutex::new(HashSet::new()),
             saving_book: Mutex::new(()),
             rendezvous: Default::default(),
+            mailbox,
             copies: crate::copies::Tracker::load(copies_path, crate::copies::Rules::from_env()),
             cleanup: crate::cleanup::Cleaner::load(old_versions),
             speedtest: crate::speedtest::Limiter::default(),
@@ -390,6 +397,9 @@ impl Daemon {
             discovery_started: AtomicBool::new(false),
         });
         d.restore_counters();
+        if d.config().host {
+            crate::mailbox::open(&d);
+        }
         Ok(d)
     }
 
@@ -455,6 +465,9 @@ impl Daemon {
             if *admin_static == ps {
                 return PeerKind::PairingAdmin(*identity);
             }
+        }
+        if let Some(token) = self.mailbox.token_of(s) {
+            return PeerKind::Token(token);
         }
         if matches!(s.admission(), cardinal_link::Admission::Secret { .. }) {
             if let Some(p) = s.peer_identity() {
@@ -619,6 +632,7 @@ impl Daemon {
             PeerKind::Restoring | PeerKind::Proven => "a device restoring".into(),
             PeerKind::Contact(_, _) => "a contact's device".into(),
             PeerKind::Inviting(_) => "someone with an invitation".into(),
+            PeerKind::Token(_) => "someone with a token".into(),
             _ => "the device being paired".into(),
         };
         tracing::info!(
@@ -657,7 +671,7 @@ impl Daemon {
             });
             return;
         }
-        if matches!(kind, PeerKind::Inviting(_)) {
+        if matches!(kind, PeerKind::Inviting(_) | PeerKind::Token(_)) {
             return;
         }
         tokio::spawn(async move { net::sync_all(&d, &s).await });

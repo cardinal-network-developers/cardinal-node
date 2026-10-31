@@ -20,7 +20,7 @@ use cardinal_encoding::{Record, Value};
 use cardinal_identity::Power;
 use cardinal_link::{Admission, LinkError, Priority, Role, Service, Session, Stream, Target};
 use cardinal_space::account;
-use cardinal_space::grant::{Endpoint, Grant, RELAY, RENDEZVOUS, STORAGE};
+use cardinal_space::grant::{Endpoint, Grant, MAILBOX, RELAY, RENDEZVOUS, STORAGE};
 use cardinal_space::SpaceOp;
 use cardinal_sync::identity_log_label;
 use serde_json::{json, Value as Json};
@@ -126,7 +126,7 @@ pub fn enable(d: &Arc<Daemon>, addresses: &[String]) -> anyhow::Result<Json> {
     let grant = Grant {
         host: identity,
         served: identity,
-        services: vec![STORAGE, RENDEZVOUS, RELAY],
+        services: vec![MAILBOX, STORAGE, RENDEZVOUS, RELAY],
         storage_bytes: 0,
         retention_days: 0,
         endpoints,
@@ -142,6 +142,7 @@ pub fn enable(d: &Arc<Daemon>, addresses: &[String]) -> anyhow::Result<Json> {
     }
     d.save_config()?;
     d.endpoint.set_allow_public(true);
+    crate::mailbox::open(d);
     d.housekeeping();
     let mut out = sheet(d)?;
     out["warnings"] = json!(warnings);
@@ -207,7 +208,7 @@ pub fn refresh(d: &Arc<Daemon>) -> anyhow::Result<()> {
             .find(|(_, signer)| *signer == me)
             .map(|(g, _)| g)
     };
-    let Some(old) = old.filter(|g| !g.services.contains(&RENDEZVOUS)) else {
+    let Some(old) = old.filter(|g| !g.services.contains(&MAILBOX)) else {
         return Ok(());
     };
     let addresses: Vec<String> = old.endpoints.iter().map(Endpoint::to_string).collect();
@@ -222,6 +223,7 @@ pub fn disable(d: &Arc<Daemon>) -> anyhow::Result<Json> {
     d.config().host = false;
     d.save_config()?;
     d.endpoint.set_allow_public(false);
+    crate::mailbox::close(d);
     sheet(d)
 }
 

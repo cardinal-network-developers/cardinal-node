@@ -18,6 +18,7 @@ pub mod fetch;
 pub mod fs;
 pub mod host;
 pub mod keys;
+pub mod mailbox;
 pub mod net;
 pub mod news;
 pub mod pair;
