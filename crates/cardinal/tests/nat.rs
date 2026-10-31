@@ -7,6 +7,7 @@
 
 mod common;
 
+use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::{Arc, Mutex};
@@ -62,18 +63,20 @@ async fn run(inner: Arc<UdpSocket>, kind: Kind) {
         let ip = Ipv4Addr::new(buf[0], buf[1], buf[2], buf[3]);
         let to = SocketAddr::from((ip, u16::from_le_bytes([buf[4], buf[5]])));
         let key = (kind == Kind::Symmetric).then_some(to);
-        if !maps.contains_key(&key) {
-            let public = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
-            let opened: Arc<Mutex<HashSet<SocketAddr>>> = Default::default();
-            tokio::spawn(back(
-                public.clone(),
-                opened.clone(),
-                inner.clone(),
-                device.clone(),
-            ));
-            maps.insert(key, Mapping { public, opened });
-        }
-        let m = &maps[&key];
+        let m = match maps.entry(key) {
+            Entry::Occupied(m) => m.into_mut(),
+            Entry::Vacant(v) => {
+                let public = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+                let opened: Arc<Mutex<HashSet<SocketAddr>>> = Default::default();
+                tokio::spawn(back(
+                    public.clone(),
+                    opened.clone(),
+                    inner.clone(),
+                    device.clone(),
+                ));
+                v.insert(Mapping { public, opened })
+            }
+        };
         m.opened.lock().unwrap().insert(to);
         let _ = m.public.send_to(&buf[HEADER..n], to).await;
     }

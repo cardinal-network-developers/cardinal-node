@@ -18,6 +18,9 @@ use tokio::sync::Mutex;
 
 const MBIT: f64 = 1e6 / 8.0;
 
+/// Packets on their way, and when each is due.
+type Queue = VecDeque<(Instant, Vec<u8>)>;
+
 #[derive(Clone, Copy)]
 struct Link {
     /// Bytes per second, each way.
@@ -40,7 +43,7 @@ async fn pipe(
     learn: Option<Arc<Mutex<Option<SocketAddr>>>>,
     dropped: Arc<AtomicU64>,
 ) {
-    let queue: Arc<Mutex<VecDeque<(Instant, Vec<u8>)>>> = Default::default();
+    let queue: Arc<Mutex<Queue>> = Default::default();
     let q = queue.clone();
     tokio::spawn(async move {
         loop {
