@@ -529,7 +529,11 @@ impl Daemon {
         let s2 = s.clone();
         tokio::spawn(net::serve(d, s2, gen));
         if let PeerKind::Own(k) = kind {
-            tokio::spawn(crate::rendezvous::session_opened(self.clone(), s.clone(), k));
+            tokio::spawn(crate::rendezvous::session_opened(
+                self.clone(),
+                s.clone(),
+                k,
+            ));
         }
         let d = self.clone();
         if kind == PeerKind::Restoring {

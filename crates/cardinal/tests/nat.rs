@@ -160,7 +160,10 @@ fn two_devices_behind_nats_reach_each_other_directly() {
     }
     let root = tempfile::tempdir().unwrap();
     let (mut host, mut x, mut y) = three(root.path());
-    let (nx, ny) = (Nat::new(Kind::PortRestricted), Nat::new(Kind::PortRestricted));
+    let (nx, ny) = (
+        Nat::new(Kind::PortRestricted),
+        Nat::new(Kind::PortRestricted),
+    );
     put_behind(&mut x, &nx);
     put_behind(&mut y, &ny);
 
@@ -222,5 +225,8 @@ fn devices_that_cannot_punch_through_go_through_the_host() {
 
     // Without the host they have no way to each other.
     host.stop();
-    wait("x loses y", 200, || carrier(&x, "why").is_empty());
+    std::fs::write(x.p("after.txt"), "after\n").unwrap();
+    x.cli(&["flush"]);
+    std::thread::sleep(std::time::Duration::from_secs(3));
+    assert!(!y.p("after.txt").exists());
 }

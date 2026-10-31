@@ -34,6 +34,8 @@ use crate::daemon::{Daemon, PeerKind};
 const PUNCH_WITHIN: Duration = Duration::from_secs(3);
 /// How often a device asks its hosts about devices it cannot reach.
 const ASK_EVERY: Duration = Duration::from_secs(10);
+/// How often it looks for a direct way to one it reaches through a host.
+const ASK_RELAYED_EVERY: Duration = Duration::from_secs(60);
 /// The longest message here: a device's addresses, for each device present.
 const MAX_MESSAGE: usize = 64 * 1024;
 /// The most local addresses a device can report.
@@ -51,6 +53,9 @@ const NOT_PRESENT: u64 = 4;
 
 /// An endpoint's carrier: `hosts.md#grants`.
 const UDP: u64 = 1;
+/// The field of a device's local addresses, in what a host says of it. The
+/// spec passes them on but gives them no field; 3 is `incoming`'s token.
+const LOCAL: u64 = 4;
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
@@ -63,8 +68,9 @@ pub struct Rendezvous {
     present: Mutex<HashMap<[u8; 32], Presence>>,
     /// As a host: the channels it forwards, and the two devices of each.
     channels: Mutex<HashMap<u32, [[u8; 32]; 2]>>,
-    /// The devices being reached right now.
-    meeting: Mutex<HashSet<KeyId>>,
+    /// The devices being reached right now, and at what addresses. A device
+    /// that moved meanwhile has others, and those must not wait.
+    meeting: Mutex<HashSet<(KeyId, Vec<SocketAddr>)>>,
     /// When this device last asked its hosts.
     asked: Mutex<Option<Instant>>,
 }
@@ -128,15 +134,20 @@ fn read_addresses(v: Option<&Value>) -> Vec<SocketAddr> {
 fn found_record(f: &Found) -> Record {
     Record::new()
         .with(1, f.device)
-        .with_opt(2, f.observed.as_ref().map(|a| Value::Record(address_record(a))))
-        .with(3, address_list(&f.local))
+        .with_opt(
+            2,
+            f.observed
+                .as_ref()
+                .map(|a| Value::Record(address_record(a))),
+        )
+        .with(LOCAL, address_list(&f.local))
 }
 
 fn read_found(r: &Record) -> Option<Found> {
     Some(Found {
         device: r.get(1)?.as_bytes()?.try_into().ok()?,
         observed: r.get(2).and_then(read_address),
-        local: read_addresses(r.get(3)),
+        local: read_addresses(r.get(LOCAL)),
     })
 }
 
@@ -247,9 +258,20 @@ async fn call(s: &Session, service: Service, ask: Record) -> anyhow::Result<Reco
 /// Asks this person's hosts after devices this device cannot reach directly.
 /// It costs a message, so not on every pass of the reconnect loop.
 pub async fn ask_hosts(d: Arc<Daemon>) {
+    let every = {
+        let wanted = wanted(&d);
+        if wanted.is_empty() {
+            return;
+        }
+        if wanted.keys().any(|x| !d.is_online(x)) {
+            ASK_EVERY
+        } else {
+            ASK_RELAYED_EVERY
+        }
+    };
     {
         let mut asked = lock(&d.rendezvous.asked);
-        if asked.is_some_and(|t| t.elapsed() < ASK_EVERY) {
+        if asked.is_some_and(|t| t.elapsed() < every) {
             return;
         }
         *asked = Some(Instant::now());
@@ -294,7 +316,8 @@ async fn meet(
     link: HybridPublicKey,
     addresses: Vec<SocketAddr>,
 ) {
-    if !lock(&d.rendezvous.meeting).insert(device) {
+    let meeting = (device, addresses.clone());
+    if !lock(&d.rendezvous.meeting).insert(meeting.clone()) {
         return;
     }
     punch(&d, &link, addresses).await;
@@ -305,7 +328,7 @@ async fn meet(
             tracing::debug!("relaying to {}: {e:#}", short(&device));
         }
     }
-    lock(&d.rendezvous.meeting).remove(&device);
+    lock(&d.rendezvous.meeting).remove(&meeting);
 }
 
 /// Sends to every address at once. The other device is doing the same, so
@@ -414,7 +437,10 @@ fn connect(s: &Session, d: &Daemon) -> Record {
     let asker = Found {
         device: me,
         observed: observed(s),
-        local: present.get(&me).map(|p| p.local.clone()).unwrap_or_default(),
+        local: present
+            .get(&me)
+            .map(|p| p.local.clone())
+            .unwrap_or_default(),
     };
     let tell = found_record(&asker).with(0, OP_INCOMING);
     let mut found = Vec::new();
@@ -458,14 +484,11 @@ fn open_relay(d: &Daemon, s: &Session, r: &Record) -> Record {
     };
     let other = {
         let present = lock(&d.rendezvous.present);
-        present
-            .values()
-            .map(|p| p.session.clone())
-            .find(|o| {
-                !o.is_closed()
-                    && o.peer_identity()
-                        .is_some_and(|p| p.signing_key.as_slice() == device)
-            })
+        present.values().map(|p| p.session.clone()).find(|o| {
+            !o.is_closed()
+                && o.peer_identity()
+                    .is_some_and(|p| p.signing_key.as_slice() == device)
+        })
     };
     let Some(other) = other else {
         return error(NOT_PRESENT);
@@ -533,7 +556,10 @@ mod tests {
             observed: None,
             local: Vec::new(),
         };
-        assert!(read_found(&found_record(&f)).unwrap().addresses().is_empty());
+        assert!(read_found(&found_record(&f))
+            .unwrap()
+            .addresses()
+            .is_empty());
     }
 
     #[test]
