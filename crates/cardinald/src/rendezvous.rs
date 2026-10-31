@@ -194,6 +194,13 @@ fn helpers(d: &Daemon) -> Vec<Session> {
     sessions.filter(|s| !s.is_relayed()).collect()
 }
 
+/// Where this machine lists its power supplies. A test on a laptop must not
+/// depend on whether it is plugged in.
+fn power_supplies() -> PathBuf {
+    std::env::var_os("CARDINAL_TEST_POWER_SUPPLIES")
+        .map_or_else(|| PathBuf::from(POWER_SUPPLIES), PathBuf::from)
+}
+
 /// Whether this machine runs on its battery, which relaying would run down.
 fn on_battery(power_supplies: &Path) -> bool {
     let read = |p: PathBuf, f: &str| std::fs::read_to_string(p.join(f)).unwrap_or_default();
@@ -484,7 +491,7 @@ pub async fn serve(d: &Arc<Daemon>, s: &Session, mut st: Stream) -> anyhow::Resu
     } else {
         match op {
             Some(OP_RELAYED) => None,
-            Some(OP_RELAY) if on_battery(Path::new(POWER_SUPPLIES)) => Some(error(BUSY)),
+            Some(OP_RELAY) if on_battery(&power_supplies()) => Some(error(BUSY)),
             Some(OP_RELAY) => Some(open_relay(d, s, r)),
             _ => Some(error(UNKNOWN)),
         }

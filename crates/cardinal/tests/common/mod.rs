@@ -31,7 +31,11 @@ impl Dev {
             mount,
             port,
             child: None,
-            env: Vec::new(),
+            // Whether the test machine is plugged in is not under test.
+            env: vec![(
+                "CARDINAL_TEST_POWER_SUPPLIES".into(),
+                "/nothing/here".into(),
+            )],
         }
     }
 
