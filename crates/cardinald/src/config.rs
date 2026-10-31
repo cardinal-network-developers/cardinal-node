@@ -41,8 +41,9 @@ pub struct Config {
     pub name: String,
     /// Where the link endpoint listens (TCP).
     pub listen: String,
-    /// Also listen on UDP.
-    pub udp: bool,
+    /// Do not listen on UDP. This replaced a `udp` setting that was false
+    /// by default and written out by every save, so that setting is ignored.
+    pub tcp_only: bool,
     /// Where the files space is mounted; `None` (written as `""`) to not
     /// mount.
     #[serde(with = "opt_path")]
@@ -71,7 +72,7 @@ impl Default for Config {
         Config {
             name: default_name(),
             listen: format!("0.0.0.0:{DEFAULT_PORT}"),
-            udp: true,
+            tcp_only: false,
             this_run: ThisRun::default(),
             mount: Some(crate::paths::home_dir().join("Cardinal")),
             retention: "full".into(),
@@ -169,7 +170,7 @@ impl Config {
 
     /// Whether to listen on UDP on this run.
     pub fn uses_udp(&self) -> bool {
-        self.udp && !self.this_run.no_udp
+        !self.tcp_only && !self.this_run.no_udp
     }
 
     /// Whether to look for devices on the local network on this run.
@@ -185,5 +186,25 @@ impl Config {
     /// Whether retention is on demand.
     pub fn on_demand(&self) -> bool {
         self.retention == "on-demand"
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every install before UDP worked has this line, from a save.
+    #[test]
+    fn an_old_config_does_not_turn_udp_off() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "[daemon]\nname = \"old\"\nudp = false\n").unwrap();
+        let c = Config::load(&path).unwrap();
+        assert_eq!(c.name, "old");
+        assert!(c.uses_udp());
+        c.save(&path).unwrap();
+        let saved = std::fs::read_to_string(&path).unwrap();
+        assert!(!saved.contains("udp = false"), "{saved}");
+        assert!(Config::load(&path).unwrap().uses_udp());
     }
 }

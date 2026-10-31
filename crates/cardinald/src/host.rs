@@ -222,6 +222,7 @@ pub fn disable(d: &Arc<Daemon>) -> anyhow::Result<Json> {
     d.config().host = false;
     d.save_config()?;
     d.endpoint.set_allow_public(false);
+    crate::rendezvous::stop(d);
     sheet(d)
 }
 

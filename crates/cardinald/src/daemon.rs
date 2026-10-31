@@ -516,7 +516,7 @@ impl Daemon {
         );
         if let PeerKind::Own(k) = kind {
             lock(&self.backoff).remove(&k);
-            if s.role() == cardinal_link::Role::Responder {
+            if s.role() == cardinal_link::Role::Responder && !s.is_relayed() {
                 if let Some(a) = s.remote_addr() {
                     if lock(&self.book).moved(&k, a.ip()) {
                         self.save_book();
@@ -846,7 +846,7 @@ impl Daemon {
                 .collect()
         };
         for (key, link) in devices {
-            if self.is_online(link.x25519()) {
+            if self.is_direct(link.x25519()) {
                 continue;
             }
             {
@@ -946,7 +946,7 @@ impl Daemon {
         link: cardinal_crypto::HybridPublicKey,
     ) -> bool {
         for (addr, manual) in self.candidate_addrs(&key).await {
-            if self.is_online(link.x25519()) {
+            if self.is_direct(link.x25519()) {
                 return true;
             }
             match self.dial(|c| Target::new(addr, c, &link)).await {
@@ -1073,12 +1073,12 @@ impl Daemon {
         let known: Vec<String> = lock(&self.book).at(&addr).into_iter().cloned().collect();
         let taken = devices
             .iter()
-            .any(|(k, l)| known.contains(&hex::encode(k)) && self.is_online(l.x25519()));
+            .any(|(k, l)| known.contains(&hex::encode(k)) && self.is_direct(l.x25519()));
         if taken {
             return;
         }
         for (key, link) in devices {
-            if self.is_online(link.x25519()) {
+            if self.is_direct(link.x25519()) {
                 continue;
             }
             if !lock(&self.connecting).insert(key) {

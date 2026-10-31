@@ -233,3 +233,41 @@ fn devices_that_cannot_punch_through_go_through_the_host() {
     std::thread::sleep(std::time::Duration::from_secs(3));
     assert!(!y.p("after.txt").exists());
 }
+
+/// Sessions opened before a device knew the other was a host: nothing
+/// reconnects, and a device that became a host is still found and used.
+#[test]
+fn a_host_added_later_is_used_without_reconnecting() {
+    if !fuse_available() {
+        eprintln!("skipping: /dev/fuse or fusermount3 is not available");
+        return;
+    }
+    let root = tempfile::tempdir().unwrap();
+    let mut host = Dev::new(root.path(), "host", free_port());
+    let mut x = Dev::new(root.path(), "ex", free_port());
+    let mut y = Dev::new(root.path(), "why", free_port());
+    host.start();
+    host.cli(&["init", "--yes", "--name", "host"]);
+    host.wait_mounted();
+    x.start();
+    pair(&host, &x);
+    y.start();
+    pair(&host, &y);
+    x.wait_mounted();
+    y.wait_mounted();
+    let (nx, ny) = (
+        Nat::new(Kind::PortRestricted),
+        Nat::new(Kind::PortRestricted),
+    );
+    put_behind(&mut x, &nx);
+    put_behind(&mut y, &ny);
+    wait("both reach alpha", 30, || {
+        carrier(&x, "host") == "UDP" && carrier(&y, "host") == "UDP"
+    });
+    assert_eq!(carrier(&x, "why"), "", "nothing connects them yet");
+
+    host.cli(&["host", "--address", &format!("127.0.0.1:{}", host.port)]);
+    wait("they meet", 40, || {
+        carrier(&x, "why") == "UDP" && carrier(&y, "ex") == "UDP"
+    });
+}

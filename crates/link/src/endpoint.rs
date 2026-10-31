@@ -9,7 +9,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use cardinal_crypto::{random_bytes, HybridKeyPair, HybridPublicKey, KemPublicKey};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
-use tokio::sync::{broadcast, mpsc, oneshot, Notify};
+use tokio::sync::{broadcast, mpsc, oneshot, watch, Notify};
 use tokio::task::AbortHandle;
 use zeroize::Zeroizing;
 
@@ -107,6 +107,8 @@ pub struct Target {
     pub within: Option<Duration>,
     /// Go through a host: its session, and the channel it gave.
     pub through: Option<(Session, u32)>,
+    /// Stop trying when this turns true.
+    pub give_up: Option<watch::Receiver<bool>>,
     /// A public-service or restore session: nothing but the address and
     /// X25519 key is known of the peer, and this device has no secret.
     pub public: bool,
@@ -116,6 +118,12 @@ impl Target {
     /// Gives this attempt its own time limit.
     pub fn within(mut self, limit: Duration) -> Target {
         self.within = Some(limit);
+        self
+    }
+
+    /// Stops trying when `give_up` turns true: another attempt got there.
+    pub fn unless(mut self, give_up: watch::Receiver<bool>) -> Target {
+        self.give_up = Some(give_up);
         self
     }
 
@@ -136,6 +144,7 @@ impl Target {
             expected: ExpectedPeer::default(),
             within: None,
             through: None,
+            give_up: None,
             public: false,
         }
     }
@@ -153,6 +162,7 @@ impl Target {
             expected: ExpectedPeer::default(),
             within: None,
             through: None,
+            give_up: None,
             public: true,
         }
     }
@@ -173,6 +183,7 @@ impl Target {
             expected: ExpectedPeer::default(),
             within: None,
             through: None,
+            give_up: None,
             public: false,
         }
     }
@@ -291,20 +302,35 @@ pub(crate) struct EndpointInner {
     relays: Mutex<HashMap<u32, Relay>>,
 }
 
+/// Waits until an attempt should stop, if it can be told to.
+async fn given_up(give_up: &mut Option<watch::Receiver<bool>>) {
+    match give_up {
+        Some(g) => {
+            let _ = g.wait_for(|stop| *stop).await;
+        }
+        None => std::future::pending().await,
+    }
+}
+
 /// A channel a host forwards.
 struct Relay {
-    a: Path,
-    b: Path,
+    a: Session,
+    b: Session,
 }
 
 impl Relay {
-    /// Where a packet from `from` goes. Nothing goes on from a path that
+    /// Where a packet from `from` goes, by the paths the two sessions are on
+    /// now: a device behind a NAT can move. Nothing goes on from a path that
     /// does not belong to the channel.
-    fn other_side(&self, from: &Path) -> Option<&Path> {
-        if self.a.same(from) {
-            Some(&self.b)
-        } else if self.b.same(from) {
-            Some(&self.a)
+    fn other_side(&self, from: &Path) -> Option<Path> {
+        if self.a.is_closed() || self.b.is_closed() {
+            return None;
+        }
+        let (a, b) = (self.a.path(), self.b.path());
+        if a.same(from) {
+            Some(b)
+        } else if b.same(from) {
+            Some(a)
         } else {
             None
         }
@@ -533,8 +559,8 @@ impl Endpoint {
     /// it is end to end, and this device cannot read it.
     pub fn relay_open(&self, channel: u32, a: &Session, b: &Session) {
         let relay = Relay {
-            a: a.path(),
-            b: b.path(),
+            a: a.clone(),
+            b: b.clone(),
         };
         lock(&self.inner.relays).insert(channel, relay);
     }
@@ -573,6 +599,7 @@ impl Endpoint {
                 path
             }
         };
+        let mut give_up = target.give_up.clone();
         let (tx, mut rx) = oneshot::channel();
         let attempt = Arc::new(Attempt {
             target,
@@ -598,6 +625,7 @@ impl Endpoint {
             tokio::select! {
                 r = &mut rx => break r.map_err(|_| LinkError::Timeout),
                 _ = attempt.resend.notified() => continue,
+                _ = given_up(&mut give_up) => break Err(LinkError::Timeout),
                 _ = tokio::time::sleep_until(retry) => {
                     if tokio::time::Instant::now() >= deadline {
                         break Err(LinkError::Timeout);
@@ -1121,12 +1149,16 @@ impl EndpointInner {
             Role::Initiator => local_static,
             Role::Responder => s.peer_static,
         };
-        let new_at = new.lock().established_at;
+        let (new_at, new_relayed) = {
+            let c = new.lock();
+            (c.established_at, c.path.is_relayed())
+        };
         let mut survives = true;
         for o in others {
-            let (o_est, o_at) = {
+            let (o_est, o_at, o_relayed) = {
                 let c = o.lock();
-                (c.established && !c.is_closed(), c.established_at)
+                let established = c.established && !c.is_closed();
+                (established, c.established_at, c.path.is_relayed())
             };
             if !o_est {
                 continue;
@@ -1138,7 +1170,15 @@ impl EndpointInner {
                     }
                     _ => false,
                 };
-            let loser = if simultaneous {
+            let loser = if o_relayed != new_relayed {
+                // A direct session beats one through a host, whichever came
+                // first, and both ends can tell which that is.
+                if new_relayed {
+                    new.clone()
+                } else {
+                    o.clone()
+                }
+            } else if simultaneous {
                 if initiator_static(&o) < initiator_static(new) {
                     new.clone()
                 } else {

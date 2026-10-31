@@ -1634,7 +1634,13 @@ impl Conn {
                 t.push(self.last_send + k);
             }
         }
-        if self.role == Role::Initiator && self.established {
+        // Only what `handle_timeout` would act on: a time already past that
+        // does nothing would spin the driver.
+        if self.role == Role::Initiator
+            && self.established
+            && matches!(self.rekey, RekeyState::Idle)
+            && self.activity_since_rekey
+        {
             t.push(self.last_rekey + self.config.rekey_interval);
         }
         if let Some(p) = self.sent.values().next() {

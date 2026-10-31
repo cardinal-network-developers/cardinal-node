@@ -144,3 +144,46 @@ async fn a_channel_is_no_use_to_a_third_party() {
     .within(Duration::from_millis(600));
     assert!(c.endpoint.connect(t).await.is_err());
 }
+
+/// A direct session wins whichever came first: a relay is for when there is
+/// no other way, and both ends can tell which is which.
+#[tokio::test]
+async fn a_direct_session_beats_one_through_a_host() {
+    let dir = MemoryDirectory::new();
+    let host = device(1, &dir, false).await;
+    let a = device(2, &dir, false).await;
+    let b = device(3, &dir, false).await;
+    let (a_host, host_a) = to_host(&a, &host, CarrierKind::Udp).await;
+    let (_b_host, host_b) = to_host(&b, &host, CarrierKind::Udp).await;
+    host.endpoint.relay_open(5, &host_a, &host_b);
+    let relayed = |d: &Device| {
+        Target::new(
+            host_a.remote_addr().unwrap(),
+            CarrierKind::Udp,
+            d.key.public_key(),
+        )
+        .through(&a_host, 5)
+    };
+    let direct = Target::new(
+        b.endpoint.udp_addr().unwrap(),
+        CarrierKind::Udp,
+        b.key.public_key(),
+    );
+
+    // Relayed first, then direct: direct takes over.
+    let (s, r) = tokio::join!(a.endpoint.connect(relayed(&b)), b.endpoint.accept());
+    let (through, _r) = (s.unwrap(), r.unwrap());
+    let (s, r) = tokio::join!(a.endpoint.connect(direct.clone()), b.endpoint.accept());
+    let (first, _other) = (s.unwrap(), r.unwrap());
+    assert!(!first.is_relayed());
+    tokio::time::timeout(Duration::from_secs(2), through.closed())
+        .await
+        .unwrap();
+
+    // Direct first, then relayed: direct stays.
+    let (s, _r) = tokio::join!(a.endpoint.connect(relayed(&b)), async {
+        tokio::time::timeout(Duration::from_millis(500), b.endpoint.accept()).await
+    });
+    assert!(s.is_err(), "the relayed session lost");
+    assert!(!first.is_closed());
+}

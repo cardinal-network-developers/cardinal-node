@@ -248,6 +248,7 @@ impl Controller {
         if let Some(rtt) = rtt {
             self.note_rtt(rtt, now);
         }
+        self.drain(acked, now);
         // Nothing grows on what was sent before the last loss.
         if self.recovering_from.is_some_and(|r| sent <= r) {
             return;
@@ -288,7 +289,6 @@ impl Controller {
             self.background += growth(acked.background, self.background, room);
         }
         self.background = self.background.min(self.window);
-        self.drain(acked, now);
     }
 
     /// Stands background traffic back, or lets it go on again.
@@ -326,6 +326,7 @@ impl Controller {
         self.slow_start_until = (self.window / 2).max(MIN_WINDOW);
         self.window = MIN_WINDOW;
         self.background = MIN_WINDOW;
+        self.draining_until = None;
         self.recovering_from = Some(now);
     }
 }
@@ -746,6 +747,29 @@ mod tests {
         assert!(c.is_paced_now(Class::RealTime, t0));
         assert!(!c.is_paced_now(Class::Interactive, t0));
         assert!(c.next_paced().is_some_and(|t| t > t0));
+    }
+
+    #[test]
+    fn standing_back_ends_even_in_slow_start() {
+        let t0 = Instant::now();
+        let mut c = Controller::new(t0);
+        let rtt = Duration::from_millis(20);
+        let acked = Acked {
+            bytes: MSS,
+            background: MSS,
+        };
+        c.on_sent(MSS, true);
+        c.draining_until = Some(t0 + rtt);
+        c.next_drain = t0 + DRAIN_EVERY;
+        assert_eq!(c.limit(Class::Background), MIN_WINDOW);
+        c.on_ack(acked, Some(rtt), t0 + rtt / 2, t0 + rtt * 2);
+        assert!(c.draining_until.is_none());
+        assert!(c.limit(Class::Background) > MIN_WINDOW);
+
+        // A timeout in the middle of one does not leave it standing.
+        c.draining_until = Some(t0 + rtt * 100);
+        c.on_timeout(t0 + rtt * 3);
+        assert!(c.draining_until.is_none());
     }
 
     #[test]

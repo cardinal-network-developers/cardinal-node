@@ -304,6 +304,27 @@ fn replayed_packets_are_dropped() {
     assert!(!p.b.recv_packet(&mut v, &Path::Mem(2), p.now));
 }
 
+/// A timer that is past and does nothing would spin the session's driver.
+#[test]
+fn a_rekey_nobody_answers_arms_no_timer_in_the_past() {
+    let mut p = pair();
+    while p.pump() > 0 {}
+    let now = Instant::now() + p.a.config.rekey_interval + Duration::from_secs(1);
+    p.a.activity_since_rekey = true;
+    p.a.handle_timeout(now);
+    assert!(!matches!(p.a.rekey, RekeyState::Idle), "the rekey went out");
+    while p.a.poll_transmit(now).is_some() {}
+    let next = p.a.poll_timeout().unwrap();
+    assert!(next > now, "{:?} early", now.duration_since(next));
+
+    // Nor with nothing to rekey for.
+    let mut p = pair();
+    while p.pump() > 0 {}
+    let now = Instant::now() + p.a.config.rekey_interval + Duration::from_secs(1);
+    p.a.activity_since_rekey = false;
+    assert!(p.a.poll_timeout().unwrap() > now);
+}
+
 #[test]
 fn periodic_rekey_switches_phase_and_keeps_data_flowing() {
     let config = SessionConfig {

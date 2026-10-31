@@ -25,6 +25,7 @@ use cardinal_link::{CarrierKind, LinkError, Priority, Service, Session, Stream, 
 use cardinal_space::account;
 use cardinal_space::grant::{Grant, RENDEZVOUS};
 use tokio::io::AsyncWriteExt;
+use tokio::sync::watch;
 use tokio::task::JoinSet;
 
 use crate::core::short;
@@ -32,6 +33,10 @@ use crate::daemon::{Daemon, PeerKind};
 
 /// How long two devices get to reach each other before they relay.
 const PUNCH_WITHIN: Duration = Duration::from_secs(3);
+/// How long a host gets to answer.
+const CALL_WITHIN: Duration = Duration::from_secs(5);
+/// How often a device tells a host its addresses again: they can change.
+const PRESENT_EVERY: Duration = Duration::from_secs(120);
 /// How often a device asks its hosts about devices it cannot reach.
 const ASK_EVERY: Duration = Duration::from_secs(10);
 /// How often it looks for a direct way to one it reaches through a host.
@@ -67,7 +72,10 @@ pub struct Rendezvous {
     /// As a host: the devices present, by static key.
     present: Mutex<HashMap<[u8; 32], Presence>>,
     /// As a host: the channels it forwards, and the two devices of each.
+    /// One for each pair, so at most as many as a person has pairs.
     channels: Mutex<HashMap<u32, [[u8; 32]; 2]>>,
+    /// When this device last presented itself to each host.
+    presented: Mutex<HashMap<[u8; 32], Instant>>,
     /// The devices being reached right now, and at what addresses. A device
     /// that moved meanwhile has others, and those must not wait.
     meeting: Mutex<HashSet<(KeyId, Vec<SocketAddr>)>>,
@@ -221,43 +229,62 @@ fn wanted(d: &Daemon) -> HashMap<[u8; 32], (KeyId, HybridPublicKey)> {
 /// A session with one of this person's devices opened. If it is a host,
 /// this device presents itself, and asks after the ones it cannot reach.
 pub async fn session_opened(d: Arc<Daemon>, s: Session, device: KeyId) {
-    if !is_host(&d, &device) {
-        return;
+    if is_host(&d, &device) {
+        present(&d, &s).await;
+        ask_host(&d, &s).await;
     }
-    if let Err(e) = present(&d, &s).await {
-        tracing::debug!("presenting to {}: {e:#}", short(&device));
-    }
-    ask_host(&d, &s).await;
 }
 
-async fn present(d: &Daemon, s: &Session) -> anyhow::Result<()> {
+/// Tells a host this device is here, and at what addresses.
+async fn present(d: &Daemon, s: &Session) {
     let ask = Record::new()
         .with(0, OP_PRESENT)
         .with(1, address_list(&local_addresses(d)));
-    let reply = call(s, Service::RENDEZVOUS, ask).await?;
-    anyhow::ensure!(
-        reply.get(0).and_then(Value::as_uint) == Some(OP_PRESENT),
-        "not present"
-    );
-    Ok(())
+    match call(s, Service::RENDEZVOUS, ask).await {
+        Ok(r) if r.get(0).and_then(Value::as_uint) == Some(OP_PRESENT) => {
+            lock(&d.rendezvous.presented).insert(s.peer_static(), Instant::now());
+        }
+        Ok(_) => tracing::debug!("{} refused", short(&s.peer_static())),
+        Err(e) => tracing::debug!("presenting to {}: {e:#}", short(&s.peer_static())),
+    }
 }
 
+/// Presents this device where it has not lately. A session can open before
+/// this device knows the other is a host, and addresses change.
+async fn stay_present(d: &Daemon) {
+    for s in host_sessions(d) {
+        let due = lock(&d.rendezvous.presented)
+            .get(&s.peer_static())
+            .is_none_or(|t| t.elapsed() >= PRESENT_EVERY);
+        if due {
+            present(d, &s).await;
+        }
+    }
+}
+
+/// Asks a device something and waits a while for its answer.
 async fn call(s: &Session, service: Service, ask: Record) -> anyhow::Result<Record> {
-    let mut st = s.open_stream(service, Priority::Interactive)?;
-    st.send_message(&Value::Record(ask)).await?;
-    st.shutdown().await?;
-    let v = st
-        .recv_message_max(MAX_MESSAGE)
-        .await?
-        .ok_or_else(|| anyhow::anyhow!("no reply"))?;
-    v.as_record()
-        .cloned()
-        .ok_or_else(|| anyhow::anyhow!("not a record"))
+    let exchange = async {
+        let mut st = s.open_stream(service, Priority::Interactive)?;
+        st.send_message(&Value::Record(ask)).await?;
+        st.shutdown().await?;
+        let v = st
+            .recv_message_max(MAX_MESSAGE)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("no reply"))?;
+        v.as_record()
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("not a record"))
+    };
+    tokio::time::timeout(CALL_WITHIN, exchange)
+        .await
+        .map_err(|_| anyhow::anyhow!("no answer in time"))?
 }
 
 /// Asks this person's hosts after devices this device cannot reach directly.
 /// It costs a message, so not on every pass of the reconnect loop.
 pub async fn ask_hosts(d: Arc<Daemon>) {
+    stay_present(&d).await;
     let every = {
         let wanted = wanted(&d);
         if wanted.is_empty() {
@@ -334,15 +361,20 @@ async fn meet(
 /// Sends to every address at once. The other device is doing the same, so
 /// that each one's packets open its own NAT to the other's.
 async fn punch(d: &Arc<Daemon>, link: &HybridPublicKey, addresses: Vec<SocketAddr>) {
+    let (done, give_up) = watch::channel(false);
     let mut tries = JoinSet::new();
     for addr in addresses {
-        let target = Target::new(addr, CarrierKind::Udp, link).within(PUNCH_WITHIN);
+        let target = Target::new(addr, CarrierKind::Udp, link)
+            .within(PUNCH_WITHIN)
+            .unless(give_up.clone());
         let d = d.clone();
         tries.spawn(async move { d.endpoint.connect(target).await });
     }
     while let Some(tried) = tries.join_next().await {
         match tried {
+            // The first to complete wins; a later one would replace it.
             Ok(Ok(s)) => {
+                let _ = done.send(true);
                 tracing::info!("reached {} at {:?}", short(link.x25519()), s.remote_addr());
                 d.on_session(s);
             }
@@ -369,6 +401,9 @@ async fn relay(
         .and_then(Value::as_uint)
         .and_then(|c| u32::try_from(c).ok())
         .ok_or_else(|| anyhow::anyhow!("no channel"))?;
+    if d.is_online(link.x25519()) {
+        return Ok(());
+    }
     let at = host
         .remote_addr()
         .ok_or_else(|| anyhow::anyhow!("no address"))?;
@@ -490,13 +525,26 @@ fn open_relay(d: &Daemon, s: &Session, r: &Record) -> Record {
                     .is_some_and(|p| p.signing_key.as_slice() == device)
         })
     };
-    let Some(other) = other else {
+    let Some(other) = other.filter(|_| !s.is_closed()) else {
         return error(NOT_PRESENT);
     };
-    let channel = u32::from_le_bytes(random_bytes::<4>());
+    let (mine, theirs) = (s.peer_static(), other.peer_static());
+    let channel = {
+        let mut channels = lock(&d.rendezvous.channels);
+        let known = channels
+            .iter()
+            .find(|(_, v)| v.contains(&mine) && v.contains(&theirs))
+            .map(|(c, _)| *c);
+        let channel = known.unwrap_or_else(|| loop {
+            let c = u32::from_le_bytes(random_bytes::<4>());
+            if !channels.contains_key(&c) {
+                break c;
+            }
+        });
+        channels.insert(channel, [mine, theirs]);
+        channel
+    };
     d.endpoint.relay_open(channel, s, &other);
-    let devices = [s.peer_static(), other.peer_static()];
-    lock(&d.rendezvous.channels).insert(channel, devices);
     let tell = Record::new()
         .with(0, OP_RELAYED)
         .with(1, channel as u64)
@@ -513,6 +561,7 @@ fn open_relay(d: &Daemon, s: &Session, r: &Record) -> Record {
 /// A session with this host ended: what went through it is over.
 pub fn session_closed(d: &Daemon, peer_static: &[u8; 32]) {
     lock(&d.rendezvous.present).remove(peer_static);
+    lock(&d.rendezvous.presented).remove(peer_static);
     lock(&d.rendezvous.channels).retain(|channel, devices| {
         let keep = !devices.contains(peer_static);
         if !keep {
@@ -520,6 +569,14 @@ pub fn session_closed(d: &Daemon, peer_static: &[u8; 32]) {
         }
         keep
     });
+}
+
+/// This device stopped being a host.
+pub fn stop(d: &Daemon) {
+    lock(&d.rendezvous.present).clear();
+    for (channel, _) in lock(&d.rendezvous.channels).drain() {
+        d.endpoint.relay_close(channel);
+    }
 }
 
 #[cfg(test)]
