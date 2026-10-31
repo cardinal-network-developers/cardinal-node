@@ -49,6 +49,8 @@ impl Profile {
     pub const ACCOUNT: Profile = Profile::Core(1);
     /// The files profile.
     pub const FILES: Profile = Profile::Core(2);
+    /// The relationship profile.
+    pub const RELATIONSHIP: Profile = Profile::Core(3);
 
     fn to_value(self) -> Value {
         match self {

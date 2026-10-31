@@ -5,6 +5,7 @@ use cardinal_crypto::{HybridKeyPair, RecoveryPhrase};
 use cardinal_identity::{Created, DeviceKeys, IdentityLog, Power};
 use cardinal_space::account::{self, Retention};
 use cardinal_space::files::{self, Content, FileKind, Files};
+use cardinal_space::relationship;
 use cardinal_space::{Policy, Profile, SealedEntry, Space, SpaceOp, ROOT};
 
 struct Person {
@@ -449,4 +450,78 @@ fn display_names_are_unique() {
         .map(|e| e.name)
         .collect();
     assert_eq!(names, ["c", "c (2)", "c (2).txt", "c (3)", "c.txt"]);
+}
+
+#[test]
+fn a_relationship_has_two_owners_and_a_conversation() {
+    let ana = person(11, 0);
+    let bo = person(12, 0);
+    let stranger = person(13, 0);
+    let logs = [&ana.log, &bo.log];
+    let (mut a, genesis) = Space::create_with(
+        Profile::RELATIONSHIP,
+        Policy::default(),
+        &ana.log,
+        &ana.devices[0].signing,
+        &[ana.enc.public_key(), bo.enc.public_key()],
+        relationship::genesis_ops(bo.log.id()),
+        None,
+    )
+    .unwrap();
+    assert!(a.needs_full_evaluation());
+    a.evaluate_full(&logs).unwrap();
+    let c = relationship::conversation(&a).unwrap();
+
+    // Bo opens it with Bo's own key. A stranger's cannot.
+    assert!(Space::open_genesis(&genesis, &[&stranger.enc], Some(ana.log.state())).is_err());
+    let mut b = Space::open_genesis(&genesis, &[&bo.enc], Some(ana.log.state())).unwrap();
+    b.evaluate_full(&logs).unwrap();
+    assert_eq!(relationship::conversation(&b), Some(c));
+
+    // Each writes, and each reads what the other wrote, in the same order.
+    let hi = relationship::create_message(c, "hello");
+    let sealed = a
+        .write(&ana.log, &ana.devices[0].signing, vec![hi], Some(1))
+        .unwrap();
+    a.evaluate_full(&logs).unwrap();
+    b.receive(sealed, &[&bo.enc]).unwrap();
+    b.evaluate_full(&logs).unwrap();
+    let back = relationship::create_message(c, "hello yourself");
+    let sealed = b
+        .write(&bo.log, &bo.devices[0].signing, vec![back], Some(2))
+        .unwrap();
+    b.evaluate_full(&logs).unwrap();
+    a.receive(sealed, &[&ana.enc]).unwrap();
+    a.evaluate_full(&logs).unwrap();
+    let said: Vec<(_, String)> = relationship::messages(&a)
+        .into_iter()
+        .map(|m| (m.author, m.text))
+        .collect();
+    assert_eq!(
+        said,
+        [
+            (ana.log.id(), "hello".to_owned()),
+            (bo.log.id(), "hello yourself".to_owned())
+        ]
+    );
+    assert_eq!(relationship::messages(&a), relationship::messages(&b));
+
+    // An identity that is not a member writes nothing that counts, even with
+    // the key.
+    let mut c2 = Space::open_genesis(&genesis, &[&bo.enc], Some(ana.log.state())).unwrap();
+    for (_, s) in a.sealed_entries() {
+        let _ = c2.receive(s.clone(), &[&bo.enc]);
+    }
+    let all = [&ana.log, &bo.log, &stranger.log];
+    let forged = relationship::create_message(c, "from a stranger");
+    if let Ok(s) = c2.write(
+        &stranger.log,
+        &stranger.devices[0].signing,
+        vec![forged],
+        None,
+    ) {
+        a.receive(s, &[&ana.enc]).unwrap();
+    }
+    a.evaluate_full(&all).unwrap();
+    assert_eq!(relationship::messages(&a).len(), 2);
 }

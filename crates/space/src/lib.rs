@@ -19,6 +19,7 @@ mod error;
 pub mod files;
 pub mod grant;
 pub mod membership;
+pub mod relationship;
 pub mod space;
 pub mod state;
 

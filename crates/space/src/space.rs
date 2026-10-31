@@ -68,6 +68,21 @@ impl Space {
         recipients: &[&HybridPublicKey],
         time: Option<u64>,
     ) -> Result<(Space, SealedEntry), Error> {
+        let ops = Vec::new();
+        Space::create_with(profile, policy, author, device, recipients, ops, time)
+    }
+
+    /// [`create`](Self::create), with `ops` in the genesis entry as well:
+    /// those that add its other members, and what it starts out with.
+    pub fn create_with(
+        profile: Profile,
+        policy: Policy,
+        author: &IdentityLog,
+        device: &SigningKey,
+        recipients: &[&HybridPublicKey],
+        ops: Vec<SpaceOp>,
+        time: Option<u64>,
+    ) -> Result<(Space, SealedEntry), Error> {
         let epoch = EpochKey::generate();
         let wraps: Vec<_> = recipients.iter().map(|r| epoch.wrap(r)).collect();
         let mut b = SpaceEntryBuilder::genesis(
@@ -76,6 +91,7 @@ impl Space {
             epoch.id(),
         )
         .op(SpaceOp::start(profile, &policy))
+        .ops(ops)
         .wraps(&wraps);
         if let Some(t) = time {
             b = b.time(t);
@@ -230,6 +246,12 @@ impl Space {
             self.author = Some(author);
             self.recompute();
         }
+    }
+
+    /// Whether this space needs [`evaluate_full`](Self::evaluate_full),
+    /// because it has members other than its creator.
+    pub fn needs_full_evaluation(&self) -> bool {
+        self.profile == Profile::RELATIONSHIP || self.unsupported.is_some()
     }
 
     /// Re-evaluates with the normative `space` program, given the authors'
