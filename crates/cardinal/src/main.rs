@@ -1153,6 +1153,10 @@ async fn client(cmd: Cmd) -> anyhow::Result<()> {
                 }
             );
             print_sheet(&v);
+            for w in v["warnings"].as_array().into_iter().flatten() {
+                println!();
+                println!("Warning: {}", w.as_str().unwrap_or(""));
+            }
             Ok(())
         }
         Cmd::Peer { cmd } => match cmd {

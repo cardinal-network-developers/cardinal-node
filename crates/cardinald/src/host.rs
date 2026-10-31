@@ -11,19 +11,23 @@
 //! identity log, adds itself with the root key, and reconnects as one of
 //! this person's devices, and ordinary sync brings every space.
 
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 
 use cardinal_crypto::{verify, RecoveryPhrase, SigningKey};
 use cardinal_encoding::{Record, Value};
 use cardinal_identity::Power;
-use cardinal_link::{Admission, CarrierKind, Priority, Role, Service, Session, Stream, Target};
+use cardinal_link::{
+    Admission, CarrierKind, LinkError, Priority, Role, Service, Session, Stream, Target,
+};
 use cardinal_space::account;
 use cardinal_space::grant::{Endpoint, Grant, STORAGE};
 use cardinal_space::SpaceOp;
 use cardinal_sync::identity_log_label;
 use serde_json::{json, Value as Json};
 use tokio::io::AsyncWriteExt;
+use tokio::net::TcpStream;
 
 use crate::daemon::{Daemon, PairState};
 use crate::net::{self, Access};
@@ -113,6 +117,12 @@ pub fn enable(d: &Arc<Daemon>, addresses: &[String]) -> anyhow::Result<Json> {
             })
         })
         .collect::<anyhow::Result<Vec<_>>>()?;
+    let listening = d.endpoint.tcp_addr().map_or(0, |a| a.port());
+    let mut warnings: Vec<String> = endpoints
+        .iter()
+        .filter_map(|e| address_warning(e, listening))
+        .collect();
+    warnings.extend(logout_warning());
     let (space, mut ops) = own_nodes(d, true)?;
     let identity = own_identity(d)?;
     let grant = Grant {
@@ -135,7 +145,50 @@ pub fn enable(d: &Arc<Daemon>, addresses: &[String]) -> anyhow::Result<Json> {
     d.save_config()?;
     d.endpoint.set_allow_public(true);
     d.housekeeping();
-    sheet(d)
+    let mut out = sheet(d)?;
+    out["warnings"] = json!(warnings);
+    Ok(out)
+}
+
+/// Why a restore would not reach this device at `e`, as far as this device
+/// can tell. Host names and addresses that belong to a router in front of
+/// it cannot be checked from here.
+fn address_warning(e: &Endpoint, listening: u16) -> Option<String> {
+    let at = e.socket_addr()?;
+    let here = std::net::UdpSocket::bind((at.ip(), 0)).is_ok();
+    if here && e.port != listening {
+        return Some(format!(
+            "this device listens on port {listening}, so {e} will not reach it."
+        ));
+    }
+    let private = matches!(at.ip(), IpAddr::V4(ip) if ip.is_private());
+    (!here && private).then(|| {
+        format!("{e} is not an address of this device, so a restore will not reach it there.")
+    })
+}
+
+/// Whether a daemon in this control group stops at logout: a user service
+/// lasts only as long as its user manager, unless the user lingers.
+fn stops_at_logout(cgroup: &str, linger: &str) -> bool {
+    cgroup.contains("/user@") && linger.trim() == "no"
+}
+
+fn logout_warning() -> Option<String> {
+    let cgroup = std::fs::read_to_string("/proc/self/cgroup").ok()?;
+    // SAFETY: getuid has no preconditions.
+    let uid = unsafe { libc::getuid() }.to_string();
+    let linger = std::process::Command::new("loginctl")
+        .args(["show-user", &uid, "--property=Linger", "--value"])
+        .output()
+        .ok()?;
+    let linger = String::from_utf8_lossy(&linger.stdout);
+    stops_at_logout(&cgroup, &linger).then(|| {
+        let user = std::env::var("USER").unwrap_or(uid);
+        format!(
+            "this device stops when you log out of it, so it would not be there for a restore. \
+             Keep it running with: sudo loginctl enable-linger {user}"
+        )
+    })
 }
 
 /// Stops being a host: this device keeps what it has, and no longer offers
@@ -295,6 +348,30 @@ async fn send_proof(s: &Session, root: &SigningKey) -> anyhow::Result<Option<[u8
     Ok(id)
 }
 
+/// What a failed connection to a host means, as far as it can be told. A
+/// host says nothing to a key that is not its own, so a connection that
+/// opens and then stays silent is all there is to see of a wrong key.
+async fn not_reached(at: &str, addr: SocketAddr, e: LinkError) -> anyhow::Error {
+    let open = tokio::time::timeout(Duration::from_secs(3), TcpStream::connect(addr))
+        .await
+        .is_ok_and(|c| c.is_ok());
+    match e {
+        LinkError::Timeout if open => anyhow::anyhow!(
+            "a device at {at} does not answer to that key. Check the key against your recovery \
+             sheet; that device may also have stopped being a host."
+        ),
+        LinkError::Timeout => anyhow::anyhow!(
+            "no answer from {at}. Check the address against your recovery sheet, that the device \
+             is on, and that no firewall is in the way."
+        ),
+        LinkError::Io(e) => anyhow::anyhow!(
+            "nothing is listening at {at} ({e}). Check the address against your recovery sheet, \
+             and that the device is on."
+        ),
+        e => anyhow::anyhow!("could not restore from {at}: {e}"),
+    }
+}
+
 /// Restores this device from a host (`hosts.md#restore`): the recovery
 /// words and the host's address and key, from the recovery sheet.
 pub async fn restore(d: &Arc<Daemon>, words: &str, at: &str, key: &str) -> anyhow::Result<Json> {
@@ -309,21 +386,26 @@ pub async fn restore(d: &Arc<Daemon>, words: &str, at: &str, key: &str) -> anyho
     let endpoint = Endpoint::parse(at).ok_or_else(|| {
         anyhow::anyhow!("{at} is not an address; it looks like 192.168.1.20:7171")
     })?;
-    let addr = tokio::net::lookup_host((endpoint.host.as_str(), endpoint.port))
+    // A name can have several addresses, and not all of them need work.
+    let addrs = tokio::net::lookup_host((endpoint.host.as_str(), endpoint.port))
         .await
-        .ok()
-        .and_then(|mut a| a.next())
-        .ok_or_else(|| anyhow::anyhow!("cannot find {at}"))?;
-    let s = d
-        .endpoint
-        .connect(Target::public(addr, CarrierKind::Tcp, host))
-        .await
-        .map_err(|e| {
-            anyhow::anyhow!(
-                "could not reach a host at {at} with that key ({e}). Check both against your \
-                 recovery sheet, and that the device is on."
-            )
-        })?;
+        .map(|a| a.collect::<Vec<SocketAddr>>())
+        .unwrap_or_default();
+    let mut failed = anyhow::anyhow!("cannot find {at}");
+    let mut found = None;
+    for addr in addrs {
+        let target = Target::public(addr, CarrierKind::Tcp, host);
+        match d.endpoint.connect(target).await {
+            Ok(s) => {
+                found = Some((s, addr));
+                break;
+            }
+            Err(e) => failed = not_reached(at, addr, e).await,
+        }
+    }
+    let Some((s, addr)) = found else {
+        return Err(failed);
+    };
     let identity = send_proof(&s, &root).await?.ok_or_else(|| {
         anyhow::anyhow!("that device does not know these recovery words; nothing was changed")
     })?;
@@ -365,6 +447,33 @@ mod tests {
         let k = sheet_key(&[1; 32]);
         assert_eq!(read_sheet_key(&k.replace('1', "l")), Some([1; 32]));
         assert_eq!(read_sheet_key(&k.replace('0', "o")), Some([1; 32]));
+    }
+
+    #[test]
+    fn an_address_that_cannot_reach_this_device_is_pointed_out() {
+        let e = |s| Endpoint::parse(s).unwrap();
+        let warning = |s| address_warning(&e(s), 7171);
+        assert_eq!(warning("127.0.0.1:7171"), None);
+        assert!(warning("127.0.0.1:7172").unwrap().contains("port 7171"));
+        // Nothing here has this address.
+        assert!(warning("10.255.255.1:7171")
+            .unwrap()
+            .contains("not an address of this device"));
+        // A router's, or a name: only the other end could tell.
+        assert_eq!(warning("203.0.113.9:7171"), None);
+        assert_eq!(warning("home.example.org:7171"), None);
+    }
+
+    #[test]
+    fn only_a_user_service_without_linger_stops_at_logout() {
+        let user = "0::/user.slice/user-1001.slice/user@1001.service/app.slice/cardinal.service\n";
+        assert!(stops_at_logout(user, "no\n"));
+        assert!(!stops_at_logout(user, "yes\n"));
+        assert!(!stops_at_logout(
+            "0::/system.slice/cardinal.service\n",
+            "no\n"
+        ));
+        assert!(!stops_at_logout(user, ""), "no answer from loginctl");
     }
 
     #[test]

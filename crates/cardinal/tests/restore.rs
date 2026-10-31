@@ -119,6 +119,29 @@ fn a_new_device_gets_everything_back_from_the_words_and_the_sheet() {
         "{o:?}"
     );
 
+    // Someone else's key, and an address with nobody there. A person told
+    // which one it is knows what to check.
+    let other = cardinald::host::sheet_key(&[5; 32]);
+    let o = stranger.cli_input(
+        &["recovery", "restore", "--host", &at, "--key", &other],
+        &words,
+    );
+    assert!(!o.status.success(), "{o:?}");
+    assert!(
+        String::from_utf8_lossy(&o.stderr).contains("does not answer to that key"),
+        "{o:?}"
+    );
+    let nobody = format!("127.0.0.1:{}", free_port());
+    let o = stranger.cli_input(
+        &["recovery", "restore", "--host", &nobody, "--key", &key],
+        &words,
+    );
+    assert!(!o.status.success(), "{o:?}");
+    assert!(
+        String::from_utf8_lossy(&o.stderr).contains("nothing is listening"),
+        "{o:?}"
+    );
+
     // A new device, with the words and the sheet.
     let mut new = Dev::new(root.path(), "new", free_port());
     new.start();
