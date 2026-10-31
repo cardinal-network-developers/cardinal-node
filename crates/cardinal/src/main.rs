@@ -1224,7 +1224,11 @@ async fn client(cmd: Cmd) -> anyhow::Result<()> {
         Cmd::Messages { who } => {
             let v = call(&paths, json!({"cmd": "messages", "who": who})).await?;
             for m in v["messages"].as_array().into_iter().flatten() {
-                let by = if m["mine"] == true { "you" } else { who.as_str() };
+                let by = if m["mine"] == true {
+                    "you"
+                } else {
+                    who.as_str()
+                };
                 println!("{by}: {}", m["text"].as_str().unwrap_or(""));
             }
             Ok(())

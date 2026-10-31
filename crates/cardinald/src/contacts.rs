@@ -27,7 +27,6 @@ const MAX_MESSAGE: usize = 64 * 1024;
 /// How long an exchange may take.
 const EXCHANGE_WITHIN: Duration = Duration::from_secs(20);
 
-
 fn identity(d: &Daemon) -> anyhow::Result<[u8; 32]> {
     d.core()
         .identity
@@ -46,9 +45,9 @@ pub fn invite(d: &Arc<Daemon>, address: Option<&str>, name: Option<&str>) -> any
         .or(d.endpoint.tcp_addr())
         .map_or(0, |a| a.port());
     let addr: SocketAddr = match address {
-        Some(a) => a
-            .parse()
-            .map_err(|_| anyhow::anyhow!("{a} is not an address; it looks like 203.0.113.9:7171"))?,
+        Some(a) => a.parse().map_err(|_| {
+            anyhow::anyhow!("{a} is not an address; it looks like 203.0.113.9:7171")
+        })?,
         None => {
             let ip = crate::daemon::local_ips()
                 .into_iter()

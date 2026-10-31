@@ -91,9 +91,7 @@ impl Daemon {
                 let core = self.core();
                 if *label == identity_log_label(&identity) {
                     Access::Other(identity)
-                } else if Some(*label) == core.identity_label()
-                    || core.shares(&identity, label)
-                {
+                } else if Some(*label) == core.identity_label() || core.shares(&identity, label) {
                     Access::Full
                 } else {
                     Access::None
@@ -229,14 +227,15 @@ async fn handle_stream(d: &Arc<Daemon>, s: &Session, mut st: Stream) -> anyhow::
             }
         }
         Message::Heads { label, ids } => {
-            if d.access(kind, &label) == Access::Full {
+            let access = d.access(kind, &label);
+            if matches!(access, Access::Full | Access::Other(_)) {
                 let (missing, waiting): (Vec<[u8; 32]>, bool) = {
                     let core = d.core();
                     let missing = ids.into_iter().filter(|i| !core.has(&label, i)).collect();
                     (missing, core.is_waiting(&label))
                 };
                 if !missing.is_empty() {
-                    fetch_objects(d, s, label, missing, Access::Full).await?;
+                    fetch_objects(d, s, label, missing, access).await?;
                 } else if waiting {
                     // this peer may have what was missing by now
                     reconcile(d, s, label).await?;
@@ -358,6 +357,17 @@ async fn ingest(
     let d2 = d.clone();
     let outcome = tokio::task::spawn_blocking(move || d2.ingest(label, objects, access)).await??;
     d.pass_on(label, outcome.complete, outcome.objects, s.peer_static());
+    // A contact this device just learned of: it needs their log to tell
+    // which of their writes count, whatever came in the same reconcile.
+    let missing = d.core().missing_logs();
+    for label in missing {
+        let (d2, s2) = (d.clone(), s.clone());
+        tokio::spawn(async move {
+            if let Err(e) = reconcile(&d2, &s2, label).await {
+                tracing::debug!("reconcile {}: {e:#}", short(&label));
+            }
+        });
+    }
     if outcome.missing_parents {
         let d2 = d.clone();
         let s2 = s.clone();

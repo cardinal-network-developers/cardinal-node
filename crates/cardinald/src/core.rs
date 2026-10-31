@@ -758,6 +758,15 @@ impl Core {
             .unwrap_or_default()
     }
 
+    /// The labels of contacts' logs this device does not have yet.
+    pub fn missing_logs(&self) -> Vec<[u8; 32]> {
+        let contacts = self.contacts();
+        let missing = contacts
+            .iter()
+            .filter(|c| !self.others.contains_key(&c.identity));
+        missing.map(|c| identity_log_label(&c.identity)).collect()
+    }
+
     /// Whose device has the static key `peer_x25519`, among contacts.
     pub fn contact_of(&self, peer_x25519: &[u8; 32]) -> Option<([u8; 32], KeyId)> {
         self.others.values().find_map(|o| {
@@ -999,7 +1008,11 @@ impl Core {
         let mut v = Vec::new();
         if let Some(l) = self.identity_label() {
             v.push(l);
-            v.extend(self.contacts().iter().map(|c| identity_log_label(&c.identity)));
+            v.extend(
+                self.contacts()
+                    .iter()
+                    .map(|c| identity_log_label(&c.identity)),
+            );
             v.extend(self.spaces.keys().copied());
         }
         v
@@ -1044,6 +1057,9 @@ impl Core {
                 .as_ref()
                 .is_some_and(|i| i.set.contains_id(id));
         }
+        if let Some(o) = self.other(label) {
+            return o.set.contains_id(id);
+        }
         self.spaces
             .get(label)
             .is_some_and(|h| h.set.contains_id(id))
@@ -1053,6 +1069,9 @@ impl Core {
     pub fn is_waiting(&self, label: &[u8; 32]) -> bool {
         if Some(*label) == self.identity_label() {
             return self.identity.as_ref().is_some_and(|i| i.log.is_waiting());
+        }
+        if let Some(o) = self.other(label) {
+            return o.log.is_waiting();
         }
         self.spaces.get(label).is_some_and(|h| h.is_waiting())
     }
@@ -1065,6 +1084,9 @@ impl Core {
                 .as_ref()
                 .map(|i| i.log.heads())
                 .unwrap_or_default();
+        }
+        if let Some(o) = self.other(label) {
+            return o.log.heads();
         }
         self.spaces
             .get(label)

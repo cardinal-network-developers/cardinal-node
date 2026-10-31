@@ -45,8 +45,13 @@ One person, several Linux devices, one folder that is the same everywhere:
   it. For that to work from outside, forward UDP 7171 (and TCP 7171 for older
   devices) to the always-on device.
 
-Not yet: guardians, mailboxes, hosts run by others, sharing with other
-people, platforms other than Linux. [PLAN.md](PLAN.md) has the
+- Two people can connect and talk: `cardinal invite` makes an invitation and
+  `cardinal accept <invitation>` uses it, then `cardinal say <name> <text>` and
+  `cardinal messages <name>`. Both need to be online, and able to reach each
+  other, for now.
+
+Not yet: guardians, mailboxes, hosts run by others, shared folders and groups,
+platforms other than Linux. [PLAN.md](PLAN.md) has the
 order of work.
 
 ## Install

@@ -645,6 +645,36 @@ Not implemented yet (the next milestone):
   measurement could instead be a core service, or `ping` frames with
   padding.
 
+## Other people (`spec/contact.md`, `spec/profiles.md#relationship`)
+
+The first step of sharing: two people connect and talk. Much of what the spec
+asks for around that is not built yet.
+
+- **Invitations last as long as the daemon.** They are not kept in the account
+  space, so a restart loses them, and only the device that made one can be
+  reached with it. `uses` is always 1, and `for`, front doors and join requests
+  are not implemented. An invitation's endpoint is a device, not a host.
+- **Both people must be online to connect**, and a device finds a contact's
+  device only at an address it has already seen. There are no reach nodes,
+  delivery tokens or mailboxes, so rendezvous and relay do not help between two
+  people yet, and a message waits for the two to be online together.
+- **Spec gap: which identity's log comes first.** `contact.md#accepting` has
+  both sides reconcile logs before `genesis`. Here the inviter fetches the
+  invitee's log before creating the space, and the invitee fetches the
+  inviter's after receiving `genesis`.
+- **Group spaces, shared folders, roles other than owner, and `remove_member`**
+  are not implemented. A relationship space has only its conversation; messages
+  have text, and no attachments, reactions or read markers.
+- **Contacts are not told apart from members by more than this device's account
+  space.** A device opens a session with a contact's devices only for what they
+  share (`spaces.md#holding-a-space`), and notices for a set go only to contacts
+  who are entitled to it.
+- **A new epoch notices only this identity's key changes.** It is wrapped for
+  every member, but a change of another member's encryption key does not make
+  one due here, which `spaces.md#when-to-rotate` asks for.
+- **Every change to a shared space re-evaluates all of it**, which is quadratic
+  in its entries, so a very long conversation will get slow.
+
 ## Hosts (`spec/hosts.md`)
 
 - **Only a person's own device is a host.** A device with `cardinal host`

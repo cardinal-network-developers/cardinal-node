@@ -413,17 +413,11 @@ impl Daemon {
         }
         let contact = {
             let core = self.core();
-            core.contact_of(&ps).filter(|(identity, _)| {
-                core.contacts().iter().any(|c| c.identity == *identity)
-            })
+            core.contact_of(&ps)
+                .filter(|(identity, _)| core.contacts().iter().any(|c| c.identity == *identity))
         };
         if let Some((identity, key)) = contact {
             return PeerKind::Contact(identity, key);
-        }
-        if matches!(s.admission(), cardinal_link::Admission::Secret { .. }) {
-            if let Some(p) = s.peer_identity() {
-                return PeerKind::Inviting(p.identity);
-            }
         }
         if let PairState::Joining {
             identity,
@@ -433,6 +427,11 @@ impl Daemon {
         {
             if *admin_static == ps {
                 return PeerKind::PairingAdmin(*identity);
+            }
+        }
+        if matches!(s.admission(), cardinal_link::Admission::Secret { .. }) {
+            if let Some(p) = s.peer_identity() {
+                return PeerKind::Inviting(p.identity);
             }
         }
         PeerKind::Stranger
@@ -689,7 +688,10 @@ impl Daemon {
         let (st, others) = {
             let mut core = self.core();
             core.identity_updated();
-            (core.identity.as_ref().map(|i| i.state()), core.other_states())
+            (
+                core.identity.as_ref().map(|i| i.state()),
+                core.other_states(),
+            )
         };
         self.directory.update(st.as_deref(), &others);
         self.endpoint.recheck_peers();
@@ -983,9 +985,11 @@ impl Daemon {
                 .cloned()
                 .unwrap_or_default();
             // Manual peers are this person's own: no use for a contact.
-            let own = self.core().identity.as_ref().is_some_and(|i| {
-                i.state().keys.contains_key(key)
-            });
+            let own = self
+                .core()
+                .identity
+                .as_ref()
+                .is_some_and(|i| i.state().keys.contains_key(key));
             let peers = if own {
                 self.config().peers.clone()
             } else {
