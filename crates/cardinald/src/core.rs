@@ -784,10 +784,14 @@ impl Core {
         let Some(space) = self.account().and_then(|a| a.space.as_ref()) else {
             return Vec::new();
         };
+        let devices = cardinal_space::account::devices(space.state());
+        let hosting = |key: &KeyId| devices.iter().any(|d| d.key == *key && d.is_host);
         cardinal_space::account::hosts(space.state())
             .iter()
             .filter_map(|h| cardinal_space::grant::Grant::open(&h.grant))
-            .filter(|(g, _)| g.services.contains(&cardinal_space::grant::MAILBOX))
+            .filter(|(g, signer)| {
+                g.services.contains(&cardinal_space::grant::MAILBOX) && hosting(signer)
+            })
             .collect()
     }
 
@@ -834,6 +838,17 @@ impl Core {
     ) -> Option<cardinal_crypto::Zeroizing<[u8; 32]>> {
         let h = self.spaces.get(space)?.space.as_ref()?;
         Some(h.keyring().get(epoch)?.mailbox_key())
+    }
+
+    /// Whether a sealed entry of a space is held, and counts. One that does
+    /// not may be waiting for its author's log.
+    pub fn entry_counts(&self, space: &SpaceId, sealed: &[u8]) -> bool {
+        let Some(h) = self.spaces.get(space).and_then(|h| h.space.as_ref()) else {
+            return false;
+        };
+        let id = *blake3::hash(sealed).as_bytes();
+        h.sealed_entries()
+            .any(|(entry, s)| s.sealed_id() == id && h.validity().valid.contains(entry))
     }
 
     /// The entries of a space that `device` signed, sealed.

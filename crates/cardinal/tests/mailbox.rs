@@ -215,3 +215,57 @@ fn fetching_from_a_host_brings_only_what_is_shared() {
     assert_eq!(spaces, 3);
     assert!(!bo.p("private.txt").exists());
 }
+
+/// Trust runs one way. Ana trusts Bo, Bo does not trust Ana, and each still
+/// gets what the other writes. A deposit must not pass for a contact's session.
+#[test]
+fn trust_that_runs_one_way_still_delivers() {
+    if !fuse_available() {
+        eprintln!("skipping: /dev/fuse or fusermount3 is not available");
+        return;
+    }
+    let root = tempfile::tempdir().unwrap();
+    let ana = hosted(root.path(), "ana");
+    let bo = hosted(root.path(), "bo");
+    let at = format!("127.0.0.1:{}", ana.port);
+    let args = ["invite", "--address", &at, "--name", "Ana"];
+    let code = ana.cli(&args).trim().to_owned();
+    bo.cli(&["accept", &code, "--hosts-only"]);
+    wait("ana lists bo", 20, || ana.cli(&["contacts"]).contains("bo"));
+
+    for n in 0..3 {
+        let from_bo = format!("from bo {n}");
+        bo.cli(&["say", "Ana", &from_bo]);
+        wait("ana reads it", 40, || has_read(&ana, "bo", &from_bo));
+        let from_ana = format!("from ana {n}");
+        ana.cli(&["say", "bo", &from_ana]);
+        wait("bo reads it", 40, || has_read(&bo, "Ana", &from_ana));
+    }
+}
+
+/// A new epoch's key travels in an entry too long for an envelope, and what
+/// follows is sealed under it, so what arrives first has to wait for the key.
+#[test]
+fn a_new_epoch_reaches_someone_through_hosts() {
+    if !fuse_available() {
+        eprintln!("skipping: /dev/fuse or fusermount3 is not available");
+        return;
+    }
+    let root = tempfile::tempdir().unwrap();
+    let ana = hosted(root.path(), "ana");
+    let bo = hosted(root.path(), "bo");
+    let mut phone = Dev::new(root.path(), "phone", free_port());
+    phone.start();
+    pair(&ana, &phone);
+    phone.wait_mounted();
+    through_hosts(&ana, &bo);
+    bo.cli(&["say", "Ana", "before"]);
+    wait("ana reads it", 20, || has_read(&ana, "bo", "before"));
+
+    phone.stop();
+    ana.cli(&["remove-device", "phone", "--lost"]);
+    ana.cli(&["say", "bo", "after"]);
+    wait("bo reads it", 90, || has_read(&bo, "Ana", "after"));
+    bo.cli(&["say", "Ana", "and back"]);
+    wait("ana reads that", 40, || has_read(&ana, "bo", "and back"));
+}

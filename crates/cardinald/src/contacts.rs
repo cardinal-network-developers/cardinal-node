@@ -175,7 +175,10 @@ pub async fn serve(d: &Arc<Daemon>, s: &Session, mut st: Stream) -> anyhow::Resu
         s.abandon();
         return Ok(());
     }
-    let regard = d.invitation_used(s);
+    let Some(regard) = d.invitation_of(s) else {
+        st.reset(0);
+        return Ok(());
+    };
     let Some(ContactMessage::Hello { identity, name }) = receive(&mut st).await? else {
         return Ok(());
     };
@@ -190,6 +193,7 @@ pub async fn serve(d: &Arc<Daemon>, s: &Session, mut st: Stream) -> anyhow::Resu
         net::reconcile(d, s, space).await?;
         record_contact(d, &them, &name, &space, regard)?;
         mailbox::met(d, &space, &them);
+        d.invitation_finished(s);
         remember(d, s);
         d.identity_changed();
         tracing::info!("{name} ({}) is a contact now", short(&them));
@@ -224,7 +228,7 @@ fn record_contact(
 
 /// Changes how this person regards a contact. Only their own devices hear of
 /// it, and the contact is told nothing.
-pub async fn set(d: &Arc<Daemon>, who: &str, setting: &str) -> anyhow::Result<Json> {
+pub fn set(d: &Arc<Daemon>, who: &str, setting: &str) -> anyhow::Result<Json> {
     let contact = find(d, who)?;
     let (key, value) = match setting {
         "trust" => (account::TRUSTED, true),
@@ -241,11 +245,6 @@ pub async fn set(d: &Arc<Daemon>, who: &str, setting: &str) -> anyhow::Result<Js
         .ok_or_else(|| anyhow::anyhow!("the account space is not here yet"))?;
     d.write_and_push(&account, vec![account::set_field(contact.node, key, value)])?;
     d.peers_changed();
-    match setting {
-        "refuse" => mailbox::withdraw_reach(d, &contact.space).await?,
-        "unrefuse" => mailbox::renew_reach(d, &contact.space).await?,
-        _ => {}
-    }
     Ok(json!({}))
 }
 

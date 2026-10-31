@@ -690,8 +690,12 @@ asks for around that is not built yet.
 - **No introductions is kept and shown, and nothing acts on it**, since there
   are no introductions, and contacts do not help each other meet, yet.
 - **Refuse is for contacts.** `member seen` nodes do not exist yet, and there
-  are no group spaces to warn about. Refusing revokes this person's tokens in
-  the space, and taking it back writes new ones.
+  are no group spaces to warn about. A host revokes its tokens for someone
+  refused as soon as the account space reaches it, wherever the refusal was
+  made, and gives them new ones if it is taken back.
+- **A contact can fill a disk.** A device stores an entry before it judges it,
+  so a contact, or a host someone fetches from, can send junk that is kept. A
+  token holder cannot: a host takes no objects from one.
 - **A new epoch notices only this identity's key changes.** It is wrapped for
   every member, but a change of another member's encryption key does not make
   one due here, which `spaces.md#when-to-rotate` asks for.
@@ -719,6 +723,14 @@ asks for around that is not built yet.
 - **Tokens do not rotate with epochs.** A device removed from one person keeps
   the other's token, until that person refuses and restores them. A deposit is
   bounded by the token's quota, and it can open nothing.
+- **Someone with no host cannot pass on a log or a new epoch** to someone
+  through hosts only: neither fits a mailbox, and there is no host to fetch them
+  from. What they write after adding or removing a device waits for a connection.
+- **A session opened with a token is limited in the code:** four at a time for
+  one token, eight streams each, and 256 KiB for a sync message, since a holder
+  can make keys and streams without limit. An envelope that cannot be opened yet
+  waits, one at a time and up to the token's quota, and the host fetches what it
+  needs at most once a minute.
 - **A new host does not tell contacts it is there** unless a mailbox of theirs
   can carry the reach node. Someone through hosts only who had no host when
   they were invited stays out of reach of the other until then.

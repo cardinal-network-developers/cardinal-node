@@ -440,6 +440,11 @@ impl Daemon {
                 PeerKind::Restoring
             };
         }
+        // Before anything else: a session opened with a token is for that,
+        // whoever opened it.
+        if let Some(token) = self.mailbox.token_of(s) {
+            return PeerKind::Token(token);
+        }
         let known = self.core().is_own_device(&ps);
         if let Some(k) = known {
             return PeerKind::Own(k);
@@ -466,10 +471,7 @@ impl Daemon {
                 return PeerKind::PairingAdmin(*identity);
             }
         }
-        if let Some(token) = self.mailbox.token_of(s) {
-            return PeerKind::Token(token);
-        }
-        if matches!(s.admission(), cardinal_link::Admission::Secret { .. }) {
+        if self.is_invitation(s) {
             if let Some(p) = s.peer_identity() {
                 return PeerKind::Inviting(p.identity);
             }
@@ -554,13 +556,45 @@ impl Daemon {
         lock(&self.invitations).insert(secret, regard);
     }
 
-    /// How to regard whoever opened `s` with an invitation.
-    pub fn invitation_used(&self, s: &Session) -> account::Regard {
+    /// How to regard whoever opened `s` with an outstanding invitation.
+    pub fn invitation_of(&self, s: &Session) -> Option<account::Regard> {
         match s.admission() {
-            cardinal_link::Admission::Secret { id, .. } => lock(&self.invitations).remove(&id),
+            cardinal_link::Admission::Secret { id, .. } => {
+                lock(&self.invitations).get(&id).copied()
+            }
             _ => None,
         }
-        .unwrap_or_default()
+    }
+
+    /// `s` has done what its invitation was for.
+    pub fn invitation_finished(&self, s: &Session) {
+        if let cardinal_link::Admission::Secret { id, .. } = s.admission() {
+            lock(&self.invitations).remove(&id);
+        }
+    }
+
+    /// Whether `s` is an invitation's: this device used one, or one it made
+    /// is outstanding. Any other secret is no invitation, or a token that
+    /// was revoked would pass for one.
+    fn is_invitation(&self, s: &Session) -> bool {
+        match s.role() {
+            cardinal_link::Role::Initiator => {
+                matches!(s.admission(), cardinal_link::Admission::Secret { .. })
+            }
+            cardinal_link::Role::Responder => self.invitation_of(s).is_some(),
+        }
+    }
+
+    /// Ends the sessions opened with a token, without a word.
+    pub fn end_token_sessions(&self, token: &crate::mailbox::Token) {
+        let sessions: Vec<Session> = lock(&self.sessions)
+            .values()
+            .filter(|c| c.kind == PeerKind::Token(*token))
+            .map(|c| c.session.clone())
+            .collect();
+        for s in sessions {
+            s.abandon();
+        }
     }
 
     /// Whether a device has an open session.
@@ -618,6 +652,16 @@ impl Daemon {
             tracing::info!("closing a session with an unknown device");
             s.close("unknown device");
             return;
+        }
+        if let PeerKind::Token(token) = kind {
+            let open = lock(&self.sessions)
+                .values()
+                .filter(|c| c.kind == PeerKind::Token(token) && !c.session.is_closed())
+                .count();
+            if open >= crate::mailbox::TOKEN_SESSIONS {
+                s.abandon();
+                return;
+            }
         }
         let gen = self.next_gen.fetch_add(1, Ordering::Relaxed);
         let ps = s.peer_static();
@@ -801,6 +845,7 @@ impl Daemon {
             )
         };
         self.directory.update(st.as_deref(), &others);
+        crate::mailbox::revoke_refused(self);
         let conns: Vec<Conn> = lock(&self.sessions).values().cloned().collect();
         for c in conns {
             let kind = self.classify(&c.session);

@@ -6,7 +6,7 @@
 //! host reads nothing here. It learns how many envelopes arrive under each
 //! token, and when.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -19,7 +19,7 @@ use cardinal_identity::{EntryId, KeyId};
 use cardinal_link::{Admission, CarrierKind, Role, SecretEntry, Service, Session, Stream, Target};
 use cardinal_space::relationship::{self, Reach};
 use cardinal_space::{EpochId, SpaceId};
-use cardinal_sync::Message;
+use cardinal_sync::{identity_log_label, Message};
 use serde::{Deserialize, Serialize};
 use tokio::io::AsyncWriteExt;
 
@@ -52,6 +52,23 @@ const LOOK_GAP: Duration = Duration::from_millis(500);
 /// How often a person with no host looks at their contacts' hosts: nobody
 /// can tell them when there is something to fetch.
 const PULL_EVERY: Duration = Duration::from_secs(5 * 60);
+/// How long one exchange with a host may take.
+const AT_HOST_WITHIN: Duration = Duration::from_secs(30);
+/// Least time between fetches of a space for what an envelope needs.
+const PULL_GAP: Duration = Duration::from_secs(60);
+/// How many hosts of a reach node to try, and addresses of each: a contact
+/// wrote it.
+const MAX_REACH: usize = 4;
+/// Envelopes left with a host at a time.
+const LEAVE_AT_ONCE: usize = 32;
+/// Ids in a `heads` message, which must fit an envelope.
+const MAX_HEADS: usize = 16;
+/// Sessions at a time with one token. A holder can make keys without limit.
+pub const TOKEN_SESSIONS: usize = 4;
+/// Streams at a time on a session opened with a token.
+pub const TOKEN_STREAMS: usize = 8;
+/// The longest sync message on a session opened with a token.
+pub const TOKEN_MESSAGE: usize = 256 * 1024;
 /// An envelope (`hosts.md#envelopes`).
 const ENVELOPE: u64 = 11;
 /// An envelope payload.
@@ -238,6 +255,13 @@ impl Store {
         (page, next.next().is_some())
     }
 
+    /// Lets go of one envelope, on the host that took it in. One that cannot
+    /// be opened yet must not hold up those behind it, so this is not `ack`.
+    pub fn taken(&mut self, sequence: u64) {
+        self.held.remove(&sequence);
+        let _ = std::fs::remove_file(self.dir.join(sequence.to_string()));
+    }
+
     /// A device has everything up to `sequence`.
     pub fn ack(&mut self, device: &KeyId, sequence: u64, now: u64) {
         let fetcher = self.saved.fetchers.entry(hex::encode(device)).or_default();
@@ -306,6 +330,11 @@ pub struct Mailbox {
     /// and member, so that nothing is lost to being offline or restarting.
     sent: Mutex<BTreeMap<String, BTreeSet<String>>>,
     sent_path: PathBuf,
+    /// Hosts of others in use. The link keeps one session between two
+    /// devices, so a second would end the first.
+    going: Mutex<HashSet<[u8; 32]>>,
+    /// When each space was last fetched for an envelope's sake.
+    pulled: Mutex<HashMap<SpaceId, Instant>>,
 }
 
 fn sent_key(space: &SpaceId, member: &[u8; 32]) -> String {
@@ -334,11 +363,13 @@ impl Mailbox {
             secrets: Mutex::new(HashMap::new()),
             sent: Mutex::new(sent),
             sent_path,
+            going: Mutex::new(HashSet::new()),
+            pulled: Mutex::new(HashMap::new()),
         }
     }
 
     /// Notes that a member has these entries of a space.
-    fn mark_sent(&self, space: &SpaceId, member: &[u8; 32], ids: &[EntryId]) {
+    pub(crate) fn mark_sent(&self, space: &SpaceId, member: &[u8; 32], ids: &[EntryId]) {
         let mut sent = lock(&self.sent);
         let got = sent.entry(sent_key(space, member)).or_default();
         let before = got.len();
@@ -387,7 +418,7 @@ fn admit(d: &Daemon, token: &Token) {
     lock(&d.mailbox.secrets).insert(id, *token);
 }
 
-/// Stops admitting a token.
+/// Stops admitting a token, and ends what it opened.
 fn dismiss(d: &Daemon, token: &Token) {
     let mut secrets = lock(&d.mailbox.secrets);
     let ids: Vec<u64> = secrets
@@ -399,6 +430,8 @@ fn dismiss(d: &Daemon, token: &Token) {
         secrets.remove(&id);
         d.endpoint.remove_secret(id);
     }
+    drop(secrets);
+    d.end_token_sessions(token);
 }
 
 /// Admits the holders of every token, on a device that is a host.
@@ -631,88 +664,182 @@ pub async fn write_reach(d: &Arc<Daemon>, space: &SpaceId) -> anyhow::Result<()>
     Ok(())
 }
 
-/// Ends what this person's tokens in a space allow, for someone refused.
-pub async fn withdraw_reach(d: &Arc<Daemon>, space: &SpaceId) -> anyhow::Result<()> {
-    let me = d.core().identity.as_ref().map(|i| i.id());
-    let found = me.and_then(|me| d.core().reach_of(space, &me));
-    let Some((_, reach)) = found else {
-        return Ok(());
+/// This host's tokens in a space, from what its person wrote there.
+fn tokens_here(d: &Daemon, space: &SpaceId) -> Vec<Token> {
+    let here = *d.keys.link.public_key().x25519();
+    let core = d.core();
+    let Some(me) = core.identity.as_ref().map(|i| i.id()) else {
+        return Vec::new();
     };
-    for r in &reach {
-        if r.host == *d.keys.link.public_key().x25519() {
-            revoke(d, &r.token);
-            continue;
-        }
-        let at_host = |s: &Session| s.peer_static() == r.host;
-        if let Some(s) = d.own_sessions().into_iter().find(at_host) {
-            let ask = Record::new()
-                .with(0, OP_REVOKE)
-                .with(1, Value::list([Value::from(r.token)]));
-            call(&s, Service::MAILBOX, ask).await?;
-        }
-    }
-    Ok(())
+    let reach = core
+        .reach_of(space, &me)
+        .map(|(_, r)| r)
+        .unwrap_or_default();
+    let here = reach.iter().filter(|r| r.host == here);
+    here.map(|r| r.token).collect()
 }
 
-/// Gives a space fresh tokens, in place of any revoked.
-pub async fn renew_reach(d: &Arc<Daemon>, space: &SpaceId) -> anyhow::Result<()> {
-    let me = d.core().identity.as_ref().map(|i| i.id());
-    let found = me.and_then(|me| d.core().reach_of(space, &me));
-    let Some((node, _)) = found else {
-        return write_reach(d, space).await;
-    };
-    let reach = reach_here(d).await;
-    d.write_and_push(space, vec![relationship::set_reach(node, &reach)])?;
-    Ok(())
+/// On a host, ends the tokens of anyone refused. The host does this itself,
+/// from what reaches it in the account space, so that a refusal made on a
+/// device that cannot reach it still holds.
+pub fn revoke_refused(d: &Daemon) {
+    if !d.config().host {
+        return;
+    }
+    let contacts = d.core().contacts();
+    for c in contacts.iter().filter(|c| c.refused) {
+        for token in tokens_here(d, &c.space) {
+            if lock(&d.mailbox.store).is_active(&token) {
+                revoke(d, &token);
+            }
+        }
+    }
+}
+
+/// On a host, gives a fresh token to anyone whose token here has gone and who
+/// is not refused now: a revoked token never comes back.
+fn renew_reach(d: &Arc<Daemon>) {
+    if !d.config().host {
+        return;
+    }
+    let here = *d.keys.link.public_key().x25519();
+    let contacts = d.core().contacts();
+    for c in contacts.iter().filter(|c| !c.refused) {
+        let gone = tokens_here(d, &c.space)
+            .iter()
+            .any(|t| !lock(&d.mailbox.store).is_active(t));
+        let me = d.core().identity.as_ref().map(|i| i.id());
+        let found = me.and_then(|me| d.core().reach_of(&c.space, &me));
+        let (true, Some((node, mut reach))) = (gone, found) else {
+            continue;
+        };
+        for r in reach.iter_mut().filter(|r| r.host == here) {
+            r.token = random_bytes();
+            register(d, &r.token);
+        }
+        let set = relationship::set_reach(node, &reach);
+        if let Err(e) = d.write_and_push(&c.space, vec![set]) {
+            tracing::debug!("renewing a token: {e:#}");
+        }
+    }
+}
+
+/// What this device has written in a set, if it is a space.
+pub fn written_here(d: &Daemon, space: &SpaceId) -> Vec<EntryId> {
+    let mine = d.core().entries_by(space, &d.keys.key());
+    mine.into_iter().map(|(id, _)| id).collect()
 }
 
 /// Two people have just reconciled a space: what this device wrote in it so
 /// far needs no delivering.
 pub fn met(d: &Daemon, space: &SpaceId, member: &[u8; 32]) {
-    let ids: Vec<EntryId> = d
-        .core()
-        .entries_by(space, &d.keys.key())
-        .into_iter()
-        .map(|(id, _)| id)
-        .collect();
-    d.mailbox.mark_sent(space, member, &ids);
+    d.mailbox.mark_sent(space, member, &written_here(d, space));
+}
+
+/// A host in use, until this goes.
+struct Going<'a> {
+    d: &'a Daemon,
+    host: [u8; 32],
+}
+
+impl Drop for Going<'_> {
+    fn drop(&mut self) {
+        lock(&self.d.mailbox.going).remove(&self.host);
+    }
+}
+
+fn going_to(d: &Daemon, host: [u8; 32]) -> Option<Going<'_>> {
+    lock(&d.mailbox.going)
+        .insert(host)
+        .then_some(Going { d, host })
+}
+
+/// Where to try the hosts in `reach`.
+fn addresses(reach: &[Reach]) -> Vec<(&Reach, SocketAddr)> {
+    let hosts = reach.iter().take(MAX_REACH);
+    hosts
+        .flat_map(|r| {
+            let endpoints = r.endpoints.iter().take(MAX_REACH);
+            endpoints
+                .filter_map(|e| e.socket_addr())
+                .map(move |a| (r, a))
+        })
+        .collect()
 }
 
 /// Opens a session with a host of someone else's, with their token. It says
-/// nothing of who is asking, and is good for one space.
+/// nothing of who is asking, and is good for one space. A contact wrote where
+/// this goes, so it must not be this device, or one it has a session with,
+/// which this would end.
 async fn at_host(d: &Daemon, r: &Reach, addr: SocketAddr) -> Option<Session> {
+    let here = *d.keys.link.public_key().x25519();
+    if r.host == here || d.session_kind(&r.host).is_some() {
+        return None;
+    }
     let secret = derive(Purpose::Token, &r.token);
     let target = |c: CarrierKind| Target::invitation(addr, c, r.host, &secret[..]).anonymous();
     d.dial(target).await.ok()
 }
 
-/// Fetches a space from a member's host.
-async fn pull(d: &Arc<Daemon>, space: &SpaceId, reach: &[Reach]) -> bool {
-    for r in reach {
-        for addr in r.endpoints.iter().filter_map(|e| e.socket_addr()) {
-            let Some(s) = at_host(d, r, addr).await else {
-                continue;
-            };
-            let done = net::reconcile(d, &s, *space).await;
-            s.close("fetched");
-            match done {
-                Ok(()) => return true,
-                Err(e) => tracing::debug!("fetching from a host: {e:#}"),
-            }
+/// Fetches a space from a member's host, with the member's log, which what
+/// they write there is judged by. A session with a token is the only way this
+/// person hears of their devices.
+async fn pull(d: &Arc<Daemon>, space: &SpaceId, member: &[u8; 32], reach: &[Reach]) -> bool {
+    for (r, addr) in addresses(reach) {
+        let Some(_going) = going_to(d, r.host) else {
+            continue;
+        };
+        let Some(s) = at_host(d, r, addr).await else {
+            continue;
+        };
+        let fetching = async {
+            net::reconcile(d, &s, identity_log_label(member)).await?;
+            net::reconcile(d, &s, *space).await
+        };
+        let done = tokio::time::timeout(AT_HOST_WITHIN, fetching).await;
+        s.close("fetched");
+        match done {
+            Ok(Ok(())) => return true,
+            Ok(Err(e)) => tracing::debug!("fetching from a host: {e:#}"),
+            Err(_) => tracing::debug!("fetching from a host: it took too long"),
         }
     }
     false
 }
 
 /// Fetches a space from the hosts of the members with no session here.
-async fn pull_from_members(d: &Arc<Daemon>, space: &SpaceId, members: &[[u8; 32]]) {
+async fn pull_from_members(d: &Arc<Daemon>, space: &SpaceId, members: &[[u8; 32]]) -> bool {
     let in_touch = d.people_in_touch();
+    let mut fetched = false;
     for member in members.iter().filter(|m| !in_touch.contains(*m)) {
         let found = d.core().reach_of(space, member);
         if let Some((_, reach)) = found {
-            pull(d, space, &reach).await;
+            fetched |= pull(d, space, member, &reach).await;
         }
     }
+    fetched
+}
+
+/// Fetches a space for what an envelope needs, not too often: what asks for
+/// this may be a contact's doing.
+async fn pull_for(d: &Arc<Daemon>, space: &SpaceId) -> bool {
+    {
+        let mut pulled = lock(&d.mailbox.pulled);
+        if pulled.get(space).is_some_and(|t| t.elapsed() < PULL_GAP) {
+            return false;
+        }
+        pulled.insert(*space, Instant::now());
+    }
+    let shared = d.core().shared_spaces();
+    let members = shared.into_iter().find(|(id, _)| id == space);
+    let fetched = match members {
+        Some((_, members)) => pull_from_members(d, space, &members).await,
+        None => false,
+    };
+    if !fetched {
+        lock(&d.mailbox.pulled).remove(space);
+    }
+    fetched
 }
 
 /// Looks for anything new, for a person whom nobody can tell.
@@ -729,12 +856,15 @@ async fn pull_all(d: &Arc<Daemon>) {
 /// Takes `envelopes` to the first host in `reach` that will have them, and
 /// says which were left.
 async fn leave(d: &Arc<Daemon>, reach: &[Reach], envelopes: &[(EntryId, Vec<u8>)]) -> Vec<EntryId> {
-    for r in reach {
-        for addr in r.endpoints.iter().filter_map(|e| e.socket_addr()) {
-            let Some(s) = at_host(d, r, addr).await else {
-                continue;
-            };
-            let mut left = Vec::new();
+    for (r, addr) in addresses(reach) {
+        let Some(_going) = going_to(d, r.host) else {
+            continue;
+        };
+        let Some(s) = at_host(d, r, addr).await else {
+            continue;
+        };
+        let mut left = Vec::new();
+        let leaving = async {
             for (id, envelope) in envelopes {
                 let ask = Record::new()
                     .with(0, OP_DEPOSIT)
@@ -750,71 +880,66 @@ async fn leave(d: &Arc<Daemon>, reach: &[Reach], envelopes: &[(EntryId, Vec<u8>)
                     }
                 }
             }
-            s.close("delivered");
-            if !left.is_empty() {
-                return left;
-            }
+        };
+        let _ = tokio::time::timeout(AT_HOST_WITHIN, leaving).await;
+        s.close("delivered");
+        if !left.is_empty() {
+            return left;
         }
     }
     Vec::new()
 }
 
-/// Delivers what this device wrote to each member it has no session with.
-async fn deliver(d: &Arc<Daemon>) {
-    let shared = d.core().shared_spaces();
-    if shared.is_empty() {
+/// Delivers what this device wrote in a space to a member it has no session
+/// with. A member counts as having something only once a deposit or a
+/// reconcile says so: a session that merely looks open may be gone.
+async fn deliver_to(d: &Arc<Daemon>, space: &SpaceId, member: &[u8; 32]) {
+    let mine = d.core().entries_by(space, &d.keys.key());
+    let unsent = d.mailbox.unsent(space, member, mine);
+    if unsent.is_empty() || d.people_in_touch().contains(member) {
         return;
     }
-    let me = d.keys.key();
-    let connected = d.connected_people();
-    let in_touch = d.people_in_touch();
+    let found = d.core().reach_of(space, member);
+    let Some((_, reach)) = found else {
+        return;
+    };
+    let Some((epoch, key)) = d.core().envelope_key(space) else {
+        return;
+    };
+    let (fits, long): (Vec<_>, Vec<_>) = unsent
+        .iter()
+        .map(|(id, entry)| (*id, seal(&epoch, &key, &entry[..])))
+        .partition(|(_, envelope)| envelope.len() <= MAX_ENVELOPE);
+    let some = &fits[..fits.len().min(LEAVE_AT_ONCE)];
+    let left = leave(d, &reach, some).await;
+    d.mailbox.mark_sent(space, member, &left);
+    // Too long to carry, so say that it is there, if this person has a host
+    // to fetch it from.
+    let me = d.core().identity.as_ref().map(|i| i.id());
+    let hosted = me.is_some_and(|me| d.core().reach_of(space, &me).is_some());
+    if long.is_empty() || !hosted {
+        return;
+    }
+    let mut ids = d.core().heads(space);
+    ids.truncate(MAX_HEADS);
+    let heads = Message::Heads { label: *space, ids };
+    let notice = (long[0].0, seal(&epoch, &key, to_value(&heads)));
+    if !leave(d, &reach, &[notice]).await.is_empty() {
+        let long: Vec<EntryId> = long.iter().map(|(id, _)| *id).collect();
+        d.mailbox.mark_sent(space, member, &long);
+    }
+}
+
+/// Delivers what this device wrote to each member it has no session with.
+async fn deliver(d: &Arc<Daemon>) {
+    renew_reach(d);
+    let shared = d.core().shared_spaces();
     for (space, members) in shared {
         if let Err(e) = write_reach(d, &space).await {
             tracing::debug!("writing where to reach this person: {e:#}");
         }
         for member in members {
-            let mine = d.core().entries_by(&space, &me);
-            if connected.contains(&member) {
-                let ids: Vec<EntryId> = mine.iter().map(|(id, _)| *id).collect();
-                d.mailbox.mark_sent(&space, &member, &ids);
-                continue;
-            }
-            if in_touch.contains(&member) {
-                continue;
-            }
-            let unsent = d.mailbox.unsent(&space, &member, mine);
-            if unsent.is_empty() {
-                continue;
-            }
-            let found = d.core().reach_of(&space, &member);
-            let Some((_, reach)) = found else {
-                continue;
-            };
-            let Some((epoch, key)) = d.core().envelope_key(&space) else {
-                continue;
-            };
-            let (fits, long): (Vec<_>, Vec<_>) = unsent
-                .iter()
-                .map(|(id, entry)| (*id, seal(&epoch, &key, &entry[..])))
-                .partition(|(_, envelope)| envelope.len() <= MAX_ENVELOPE);
-            let left = leave(d, &reach, &fits).await;
-            d.mailbox.mark_sent(&space, &member, &left);
-            // Too long to carry, so say that it is there, if this person has
-            // a host to fetch it from.
-            let hosted = d.core().identity.as_ref().map(|i| i.id());
-            let hosted = hosted.is_some_and(|me| d.core().reach_of(&space, &me).is_some());
-            if long.is_empty() || !hosted {
-                continue;
-            }
-            let ids: Vec<EntryId> = long.iter().map(|(id, _)| *id).collect();
-            let heads = Message::Heads {
-                label: space,
-                ids: ids.clone(),
-            };
-            let notice = (ids[0], seal(&epoch, &key, to_value(&heads)));
-            if !leave(d, &reach, &[notice]).await.is_empty() {
-                d.mailbox.mark_sent(&space, &member, &ids);
-            }
+            deliver_to(d, &space, &member).await;
         }
     }
 }
@@ -834,9 +959,10 @@ async fn collect(d: &Arc<Daemon>) {
             return;
         };
         for held in &page {
-            take_in(d, held).await;
+            if take_in(d, held).await == Taken::Done {
+                lock(&d.mailbox.store).taken(held.sequence);
+            }
         }
-        lock(&d.mailbox.store).ack(&me, last, now());
         after = last;
         if !more {
             return;
@@ -844,40 +970,81 @@ async fn collect(d: &Arc<Daemon>) {
     }
 }
 
-/// Opens an envelope and takes in what it holds. One that cannot be opened is
-/// dropped: its sender gets nothing from holding the queue up.
-async fn take_in(d: &Arc<Daemon>, held: &Held) {
-    let opened = (|| {
+/// What became of an envelope.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Taken {
+    /// It is finished with.
+    Done,
+    /// Something it needs has not arrived. It waits, until retention ends.
+    NotYet,
+}
+
+/// Opens an envelope and takes in what it holds. One that can never open is
+/// dropped: its sender gets nothing from it.
+async fn take_in(d: &Arc<Daemon>, held: &Held) -> Taken {
+    let Some(epoch) = epoch_of(&held.envelope) else {
+        return Taken::Done;
+    };
+    let found = {
         let core = d.core();
-        let space = core.space_of_token(&held.token)?;
-        let key = core.envelope_key_of(&space, &epoch_of(&held.envelope)?)?;
-        Some((space, open_envelope(&held.envelope, &key)?))
-    })();
-    let Some((space, notice)) = opened else {
+        let space = core.space_of_token(&held.token);
+        space.map(|space| (space, core.envelope_key_of(&space, &epoch)))
+    };
+    // The space itself may be on its way here from another of the owner's
+    // devices.
+    let Some((space, key)) = found else {
+        return Taken::NotYet;
+    };
+    // The key may be in an entry too long for an envelope.
+    let Some(key) = key else {
+        pull_for(d, &space).await;
+        return Taken::NotYet;
+    };
+    let Some(notice) = open_envelope(&held.envelope, &key) else {
         tracing::debug!("dropping envelope {}: it does not open", held.sequence);
-        return;
+        return Taken::Done;
     };
-    let entry = match notice {
-        Notice::Entry(entry) => entry,
+    match notice {
         Notice::Heads(ids) => {
-            let missing = ids.iter().any(|id| !d.core().has(&space, id));
-            let shared = d.core().shared_spaces();
-            let members = shared.into_iter().find(|(id, _)| *id == space);
-            if let (true, Some((_, members))) = (missing, members) {
-                pull_from_members(d, &space, &members).await;
+            let lacks = |d: &Daemon| ids.iter().any(|id| !d.core().has(&space, id));
+            if lacks(d) {
+                pull_for(d, &space).await;
             }
-            return;
+            if lacks(d) {
+                Taken::NotYet
+            } else {
+                Taken::Done
+            }
         }
-    };
-    let d2 = d.clone();
-    let taken = tokio::task::spawn_blocking(move || d2.ingest(space, vec![entry], Access::Full));
-    match taken.await {
-        Ok(Ok(outcome)) => {
-            let me = *d.keys.link.public_key().x25519();
-            d.pass_on(space, outcome.complete, outcome.objects, me);
+        Notice::Entry(entry) => {
+            let d2 = d.clone();
+            let sealed = entry.clone();
+            let ingest = move || d2.ingest(space, vec![sealed], Access::Full);
+            match tokio::task::spawn_blocking(ingest).await {
+                Ok(Ok(outcome)) => {
+                    let me = *d.keys.link.public_key().x25519();
+                    let lacks_parents = outcome.missing_parents;
+                    d.pass_on(space, outcome.complete, outcome.objects, me);
+                    if lacks_parents {
+                        pull_for(d, &space).await;
+                    }
+                    // It may be from a device this person has not heard of.
+                    if !d.core().entry_counts(&space, &entry) {
+                        pull_for(d, &space).await;
+                        return Taken::NotYet;
+                    }
+                    Taken::Done
+                }
+                Ok(Err(e)) => {
+                    tracing::debug!("envelope {}: {e:#}", held.sequence);
+                    Taken::NotYet
+                }
+                Err(e) => {
+                    tracing::debug!("envelope {}: {e}", held.sequence);
+                    Taken::NotYet
+                }
+            }
         }
-        Ok(Err(e)) => tracing::debug!("envelope {}: {e:#}", held.sequence),
-        Err(e) => tracing::debug!("envelope {}: {e}", held.sequence),
     }
 }
 
@@ -889,7 +1056,22 @@ fn pull_every() -> Duration {
 }
 
 /// Keeps delivering and collecting, whenever there may be something to do.
+/// The two go separately: what comes in must not wait on a host of someone
+/// else's that does not answer.
 pub fn start(d: Arc<Daemon>) {
+    let collecting = d.clone();
+    tokio::spawn(async move {
+        let mut changed = collecting.changed.subscribe();
+        let mut every = tokio::time::interval(LOOK_EVERY);
+        loop {
+            tokio::select! {
+                _ = every.tick() => {}
+                _ = changed.changed() => {}
+            }
+            collect(&collecting).await;
+            tokio::time::sleep(LOOK_GAP).await;
+        }
+    });
     tokio::spawn(async move {
         let mut changed = d.changed.subscribe();
         let mut every = tokio::time::interval(LOOK_EVERY.min(pull_every()));
@@ -900,7 +1082,6 @@ pub fn start(d: Arc<Daemon>) {
                 _ = changed.changed() => {}
             }
             deliver(&d).await;
-            collect(&d).await;
             if pulled.is_none_or(|t| t.elapsed() >= pull_every()) {
                 pulled = Some(Instant::now());
                 pull_all(&d).await;

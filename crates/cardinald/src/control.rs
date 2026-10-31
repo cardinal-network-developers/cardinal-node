@@ -223,7 +223,7 @@ async fn handle(d: &Arc<Daemon>, req: &Value) -> anyhow::Result<Value> {
             let all = req.get("all").and_then(|v| v.as_bool()) == Some(true);
             Ok(crate::contacts::list(d, all))
         }
-        "contact" => crate::contacts::set(d, arg(req, "who")?, arg(req, "setting")?).await,
+        "contact" => crate::contacts::set(d, arg(req, "who")?, arg(req, "setting")?),
         "say" => crate::contacts::say(d, arg(req, "who")?, arg(req, "text")?),
         "messages" => crate::contacts::messages(d, arg(req, "who")?),
         "recovery-check" => {

@@ -32,6 +32,9 @@ use crate::sched::{PeerStats, Scheduler};
 const PUSH_LIMIT: usize = 900;
 /// Largest message accepted on a stream.
 const MAX_MESSAGE: usize = 48 * 1024 * 1024;
+/// The most a `fetch_objects` holds at once. What is left comes with the next
+/// reconcile.
+const MAX_FETCHED: usize = 64 * 1024 * 1024;
 /// How long one request may take.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
 /// How long one blob request (at most 4 MiB) may take before it is
@@ -59,8 +62,9 @@ pub enum Access {
     Join([u8; 32]),
     /// A contact's identity log: to be kept, not joined.
     Other([u8; 32]),
-    /// The one space a delivery token is for: to fetch, and nothing more,
-    /// since only the owner's devices may send a host objects.
+    /// What a delivery token is for, the one space and its owner's identity
+    /// log: to fetch, and nothing more, since only the owner's devices may
+    /// send a host objects.
     Read,
     /// Nothing; answer as if the set were empty.
     None,
@@ -79,9 +83,11 @@ impl Access {
 }
 
 /// What a token holder may do with `label`, if the token was given out in
-/// `space`: fetch that space, and nothing else.
-fn token_access(space: Option<SpaceId>, label: &Label) -> Access {
-    if space == Some(*label) {
+/// `space`: fetch that space, and the log of the identity it belongs to,
+/// without which what is written there cannot be judged, and which is no
+/// secret. Nothing else.
+fn token_access(space: Option<SpaceId>, owner_log: Option<Label>, label: &Label) -> Access {
+    if space == Some(*label) || owner_log == Some(*label) {
         Access::Read
     } else {
         Access::None
@@ -123,7 +129,10 @@ impl Daemon {
                     Access::None
                 }
             }
-            PeerKind::Token(token) => token_access(self.core().space_of_token(&token), label),
+            PeerKind::Token(token) => {
+                let core = self.core();
+                token_access(core.space_of_token(&token), core.identity_label(), label)
+            }
             PeerKind::Restoring | PeerKind::Stranger => Access::None,
         }
     }
@@ -133,13 +142,24 @@ impl Daemon {
 pub async fn serve(d: Arc<Daemon>, s: Session, gen: u64) {
     let mut periodic = tokio::time::interval(Duration::from_secs(180));
     periodic.tick().await;
+    let token_streams = Arc::new(tokio::sync::Semaphore::new(crate::mailbox::TOKEN_STREAMS));
     loop {
         tokio::select! {
             st = s.accept_stream() => {
-                let Some(st) = st else { break };
+                let Some(mut st) = st else { break };
+                let permit = if d.mailbox.token_of(&s).is_some() {
+                    let Ok(permit) = token_streams.clone().try_acquire_owned() else {
+                        st.reset(0);
+                        continue;
+                    };
+                    Some(permit)
+                } else {
+                    None
+                };
                 let d2 = d.clone();
                 let s2 = s.clone();
                 tokio::spawn(async move {
+                    let _permit = permit;
                     if let Err(e) = handle_stream(&d2, &s2, st).await {
                         tracing::debug!("stream from {}: {e:#}", short(&s2.peer_static()));
                     }
@@ -157,17 +177,24 @@ pub async fn serve(d: Arc<Daemon>, s: Session, gen: u64) {
 
 /// Reconciles every set with a peer: identity log first, then spaces.
 pub async fn sync_all(d: &Arc<Daemon>, s: &Session) {
-    let labels = match d.classify(s) {
-        PeerKind::Contact(identity, _) => d.core().labels_with(&identity),
-        _ => d.core().labels(),
+    let (labels, member) = match d.classify(s) {
+        PeerKind::Contact(identity, _) => (d.core().labels_with(&identity), Some(identity)),
+        PeerKind::Token(_) | PeerKind::Stranger => return,
+        _ => (d.core().labels(), None),
     };
     for label in labels {
-        if let Err(e) = reconcile(d, s, label).await {
-            tracing::debug!(
+        let mine = crate::mailbox::written_here(d, &label);
+        match reconcile(d, s, label).await {
+            Ok(()) => {
+                if let Some(member) = member {
+                    d.mailbox.mark_sent(&label, &member, &mine);
+                }
+            }
+            Err(e) => tracing::debug!(
                 "reconcile {} with {}: {e:#}",
                 short(&label),
                 short(&s.peer_static())
-            );
+            ),
         }
     }
 }
@@ -205,7 +232,13 @@ async fn handle_stream(d: &Arc<Daemon>, s: &Session, mut st: Stream) -> anyhow::
         st.reset(0);
         return Ok(());
     }
-    let Some(v) = st.recv_message_max(MAX_MESSAGE).await? else {
+    // A token's holder is not trusted with this device's memory.
+    let longest = if d.mailbox.token_of(s).is_some() {
+        crate::mailbox::TOKEN_MESSAGE
+    } else {
+        MAX_MESSAGE
+    };
+    let Some(v) = st.recv_message_max(longest).await? else {
         return Ok(());
     };
     match from_value(v)? {
@@ -224,7 +257,7 @@ async fn handle_stream(d: &Arc<Daemon>, s: &Session, mut st: Stream) -> anyhow::
                 if rec.is_done() {
                     break;
                 }
-                let Some(v) = st.recv_message_max(MAX_MESSAGE).await? else {
+                let Some(v) = st.recv_message_max(longest).await? else {
                     break;
                 };
                 match from_value(v)? {
@@ -293,7 +326,7 @@ pub fn reconcile<'a>(
 async fn reconcile_inner(d: &Arc<Daemon>, s: &Session, label: Label) -> anyhow::Result<()> {
     let kind = d.classify(s);
     let access = d.access(kind, &label);
-    if access == Access::None {
+    if !access.takes_objects() {
         return Ok(());
     }
     let set = d.core().set(&label);
@@ -342,9 +375,13 @@ pub async fn fetch_objects(
     ids: Vec<[u8; 32]>,
     access: Access,
 ) -> anyhow::Result<()> {
+    if !access.takes_objects() {
+        return Ok(());
+    }
     let wanted: HashSet<[u8; 32]> = ids.iter().copied().collect();
     let mut got: Vec<Vec<u8>> = Vec::new();
-    for msg in want_messages(label, &ids) {
+    let mut bytes = 0;
+    'asking: for msg in want_messages(label, &ids) {
         let mut st = s.open_stream(Service::SYNC, Priority::Background)?;
         st.send_message(&to_value(&msg)).await?;
         let _ = st.shutdown().await;
@@ -354,7 +391,11 @@ pub async fn fetch_objects(
                 .map_err(|_| anyhow::anyhow!("timed out"))??;
             let Some(v) = v else { break };
             if let Message::Objects { objects, .. } = from_value(v)? {
+                bytes += objects.iter().map(Vec::len).sum::<usize>();
                 got.extend(objects);
+                if bytes > MAX_FETCHED {
+                    break 'asking;
+                }
             }
         }
     }
@@ -764,17 +805,19 @@ mod tests {
 
     #[test]
     fn a_token_fetches_one_space_and_sends_nothing() {
-        let (space, private) = ([1; 32], [2; 32]);
-        let granted = token_access(Some(space), &space);
-        assert!(granted.may_fetch());
-        assert!(
-            !granted.takes_objects(),
-            "only owner devices send a host objects"
-        );
-        let elsewhere = token_access(Some(space), &private);
+        let (space, log, private) = ([1; 32], [2; 32], [3; 32]);
+        for label in [space, log] {
+            let granted = token_access(Some(space), Some(log), &label);
+            assert!(granted.may_fetch());
+            assert!(
+                !granted.takes_objects(),
+                "only owner devices send a host objects"
+            );
+        }
+        let elsewhere = token_access(Some(space), Some(log), &private);
         assert!(!elsewhere.may_fetch(), "any other set looks empty");
         assert!(!elsewhere.takes_objects());
-        assert_eq!(token_access(None, &private), Access::None);
+        assert_eq!(token_access(None, None, &private), Access::None);
     }
 
     #[test]
