@@ -413,6 +413,12 @@ Readings of ambiguous text:
   sent once when the session is established and after each move.
 - **Idle and keepalive.** The idle timeout sends a `close` frame. The
   keepalive interval is a per-endpoint setting (off by default).
+- **Unanswered pings (the spec is silent).** A session with keepalive
+  closes when something that wants an answer has gone 10 seconds with
+  nothing heard, asking again every second. The three-minute idle timeout
+  alone left a device listed as online, and stopped it being dialled, for
+  that long after a network change. Sessions without keepalive follow the
+  spec.
 - **Persistence of counters.** The initiation counter and the confirmed
   counters are kept in memory; the daemon persists them through
   `Endpoint::{last_counter, set_last_counter, confirmed_counter,

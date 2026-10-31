@@ -49,6 +49,61 @@ fn a_device_that_connects_from_a_new_address_is_listed_there() {
     wait("alpha lists beta where it came from", 30, || {
         address_of(&a, "beta") == here
     });
+    wait("and keeps the address", 10, || {
+        let text = std::fs::read_to_string(&book).unwrap_or_default();
+        matches!((text.find(&here), text.find(&gone)), (Some(h), Some(g)) if h < g)
+    });
+}
+
+/// Sends a daemon a signal.
+fn signal(d: &Dev, name: &str) {
+    let pid = d.child.as_ref().unwrap().id().to_string();
+    let done = std::process::Command::new("kill")
+        .args([name, &pid])
+        .status()
+        .unwrap();
+    assert!(done.success());
+}
+
+fn is_online(from: &Dev, name: &str) -> bool {
+    let v = from.status();
+    let d = v["devices"].as_array().unwrap();
+    d.iter().find(|d| d["name"] == name).unwrap()["online"] == true
+}
+
+/// A path that stops working gives no sign, as when a device changes
+/// networks: only the missing answers show it. Keepalive every 20 seconds
+/// and 10 more to answer, so half a minute at most.
+#[test]
+fn a_device_that_falls_silent_is_noticed_and_returns() {
+    if !fuse_available() {
+        eprintln!("skipping: /dev/fuse or fusermount3 is not available");
+        return;
+    }
+    let root = tempfile::tempdir().unwrap();
+    let mut a = Dev::new(root.path(), "alpha", free_port());
+    let mut b = Dev::new(root.path(), "beta", free_port());
+    a.start();
+    a.cli(&["init", "--yes", "--name", "alpha"]);
+    a.wait_mounted();
+    b.start();
+    pair(&a, &b);
+    b.wait_mounted();
+    wait("alpha sees beta", 20, || is_online(&a, "beta"));
+
+    signal(&b, "-STOP");
+    let took = wait("alpha notices beta has gone", 35, || !is_online(&a, "beta"));
+    signal(&b, "-CONT");
+    eprintln!("noticed in {took:?}");
+
+    wait("they find each other again", 30, || {
+        is_online(&a, "beta") && is_online(&b, "alpha")
+    });
+    std::fs::write(a.p("back.txt"), "back\n").unwrap();
+    a.cli(&["flush"]);
+    wait("beta has it", 15, || {
+        std::fs::read(b.p("back.txt")).is_ok_and(|f| f == b"back\n")
+    });
 }
 
 /// A device that knows of only one other is told where the rest are, and

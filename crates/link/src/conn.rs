@@ -45,6 +45,8 @@ const MAX_ACK_RANGES: usize = 32;
 const MAX_INCOMING_STREAMS: usize = 4096;
 /// Timeouts in a row that mean the path has stopped working.
 const PERSISTENT_PTOS: u32 = 3;
+/// How often a session asks again while nothing it sent has been answered.
+const ASK_AGAIN: Duration = Duration::from_secs(1);
 /// Queued outgoing datagrams per priority class before the oldest drop.
 const MAX_DATAGRAM_QUEUE: usize = 1024;
 /// Queued incoming datagrams per channel before new ones drop.
@@ -73,6 +75,10 @@ pub struct SessionConfig {
     /// If set, a ping is sent after this long without sending, to hold NAT
     /// mappings open (`link.md`: 25 seconds for reachability sessions).
     pub keepalive: Option<Duration>,
+    /// With `keepalive` set, how long something that wants an answer may go
+    /// with nothing heard back. A path that has stopped working says
+    /// nothing, as when a device changes networks.
+    pub answer_timeout: Duration,
     /// How long the handshake, proofs, and first rekey may take.
     pub establish_timeout: Duration,
 }
@@ -84,6 +90,7 @@ impl Default for SessionConfig {
             rekey_packets: 1 << 40,
             idle_timeout: Duration::from_secs(180),
             keepalive: None,
+            answer_timeout: Duration::from_secs(10),
             establish_timeout: Duration::from_secs(15),
         }
     }
@@ -140,7 +147,8 @@ pub enum CloseReason {
     Local(String),
     /// Closed by the peer, with its reason.
     Remote(String),
-    /// No traffic for the idle timeout.
+    /// Nothing heard for the idle timeout, or for the answer timeout with
+    /// an answer due.
     Idle,
     /// The session was not established in time.
     Timeout,
@@ -414,6 +422,10 @@ pub(crate) struct Conn {
     close_frame: Option<String>,
     last_recv: Instant,
     last_send: Instant,
+    /// Since when something sent has wanted an answer, with nothing heard.
+    unanswered: Option<Instant>,
+    /// When to ask again if there is still nothing.
+    ask_again: Instant,
     pub stats: SessionStats,
     scratch: Vec<u8>,
 }
@@ -501,6 +513,8 @@ impl Conn {
             close_frame: None,
             last_recv: now,
             last_send: now,
+            unanswered: None,
+            ask_again: now,
             stats: SessionStats::default(),
             scratch: Vec::with_capacity(packet::MAX_DATAGRAM),
         };
@@ -676,6 +690,7 @@ impl Conn {
         self.stats.packets_received += 1;
         self.stats.bytes_received += pkt.len() as u64;
         self.last_recv = now;
+        self.unanswered = None;
         self.activity_since_rekey = true;
 
         if via_next {
@@ -1626,6 +1641,10 @@ impl Conn {
             t.push(self.created + self.config.establish_timeout);
         }
         t.push(self.last_recv + self.config.idle_timeout);
+        if let Some(since) = self.waiting_since() {
+            t.push(since + self.config.answer_timeout);
+            t.push(self.ask_again);
+        }
         if let Some(a) = self.ack_due {
             t.push(a);
         }
@@ -1657,6 +1676,12 @@ impl Conn {
         t.into_iter().min()
     }
 
+    /// Since when an answer has been due, on a session that watches for one.
+    fn waiting_since(&self) -> Option<Instant> {
+        self.unanswered
+            .filter(|_| self.established && self.config.keepalive.is_some())
+    }
+
     pub fn handle_timeout(&mut self, now: Instant) {
         if self.close.is_some() {
             return;
@@ -1668,6 +1693,16 @@ impl Conn {
         if now >= self.last_recv + self.config.idle_timeout {
             self.close_local(CloseReason::Idle);
             return;
+        }
+        if let Some(since) = self.waiting_since() {
+            if now >= since + self.config.answer_timeout {
+                self.close_local(CloseReason::Idle);
+                return;
+            }
+            if now >= self.ask_again {
+                self.ask_again = now + ASK_AGAIN;
+                self.control.push_back(Frame::Ping);
+            }
         }
         if self.path.is_closed() && self.challenge.is_none() {
             self.close_silently(CloseReason::Carrier);
@@ -1912,6 +1947,10 @@ impl Conn {
         if eliciting {
             self.packets_since_rekey += 1;
             self.activity_since_rekey = true;
+            if self.unanswered.is_none() {
+                self.unanswered = Some(now);
+                self.ask_again = now + ASK_AGAIN;
+            }
         }
         self.maybe_establish(now);
         Some((self.path.clone(), pkt))

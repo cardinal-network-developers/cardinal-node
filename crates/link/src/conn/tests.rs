@@ -304,6 +304,78 @@ fn replayed_packets_are_dropped() {
     assert!(!p.b.recv_packet(&mut v, &Path::Mem(2), p.now));
 }
 
+fn kept_alive() -> Pair {
+    let (a, b) = ids();
+    let config = SessionConfig {
+        keepalive: Some(Duration::from_secs(20)),
+        ..SessionConfig::default()
+    };
+    pair_with(config, Some(a), Some(b), Admission::Known)
+}
+
+/// Lets `c` send into a path that has stopped working.
+fn send_to_nobody(c: &mut Conn, now: Instant) -> usize {
+    let mut sent = 0;
+    while c.poll_transmit(now).is_some() {
+        sent += 1;
+    }
+    sent
+}
+
+#[test]
+fn a_session_nobody_answers_closes_before_the_idle_timeout() {
+    let mut p = kept_alive();
+    while p.pump() > 0 {}
+    let mut now = p.now + Duration::from_secs(20);
+    p.a.handle_timeout(now);
+    assert!(send_to_nobody(&mut p.a, now) > 0, "no ping went out");
+    let last = now + p.a.config.answer_timeout;
+
+    let mut pings = 0;
+    while p.a.close.is_none() {
+        let next = p.a.poll_timeout().unwrap();
+        assert!(next > now, "a timer in the past would spin the driver");
+        now = next;
+        p.a.handle_timeout(now);
+        pings += send_to_nobody(&mut p.a, now);
+    }
+    assert_eq!(now, last);
+    assert!(pings >= 8, "asked again {pings} times");
+    assert!(matches!(p.a.close, Some(CloseReason::Idle)));
+}
+
+#[test]
+fn a_lost_ping_does_not_close_a_session() {
+    let mut p = kept_alive();
+    while p.pump() > 0 {}
+    p.now += Duration::from_secs(20);
+    p.a.handle_timeout(p.now);
+    send_to_nobody(&mut p.a, p.now);
+
+    p.now += ASK_AGAIN;
+    p.a.handle_timeout(p.now);
+    assert!(p.pump() > 0, "did not ask again");
+
+    p.now += p.a.config.answer_timeout;
+    p.a.handle_timeout(p.now);
+    assert!(p.a.close.is_none());
+}
+
+#[test]
+fn without_keepalive_only_the_idle_timeout_closes_a_session() {
+    let mut p = pair();
+    while p.pump() > 0 {}
+    p.a.control.push_back(Frame::Ping);
+    send_to_nobody(&mut p.a, p.now);
+
+    let silent = p.now + p.a.config.answer_timeout + Duration::from_secs(1);
+    p.a.handle_timeout(silent);
+    assert!(p.a.close.is_none());
+
+    p.a.handle_timeout(p.now + p.a.config.idle_timeout);
+    assert!(matches!(p.a.close, Some(CloseReason::Idle)));
+}
+
 /// A timer that is past and does nothing would spin the session's driver.
 #[test]
 fn a_rekey_nobody_answers_arms_no_timer_in_the_past() {
