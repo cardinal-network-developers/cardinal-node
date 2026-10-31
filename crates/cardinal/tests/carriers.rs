@@ -58,3 +58,44 @@ fn udp_where_it_works_and_tcp_where_it_does_not() {
         std::fs::read(a.p("back.txt")).is_ok_and(|x| x == b"back\n")
     });
 }
+
+/// How fast a big file gets from one device to another, on either carrier.
+/// Not a test of anything: run with `--ignored --nocapture`.
+#[test]
+#[ignore]
+fn measure_sync_speed() {
+    if !fuse_available() {
+        return;
+    }
+    for (name, args) in [("UDP", &[][..]), ("TCP", &["--no-udp"][..])] {
+        let root = tempfile::tempdir().unwrap();
+        let mut a = Dev::new(root.path(), "alpha", free_port());
+        let mut b = Dev::new(root.path(), "beta", free_port());
+        a.start_with(args);
+        a.cli(&["init", "--yes", "--name", "alpha"]);
+        a.wait_mounted();
+        b.start_with(args);
+        pair(&a, &b);
+        b.wait_mounted();
+        wait("connected", 20, || carrier(&a, "beta") == name);
+        let big: Vec<u8> = (0..300_000_000u32)
+            .map(|n| (n >> 3) as u8 ^ (n * 13) as u8)
+            .collect();
+        std::fs::write(a.p("big.bin"), &big).unwrap();
+        a.cli(&["flush"]);
+        wait("committed", 120, || {
+            a.status()["pending_changes"].as_bool() == Some(false)
+        });
+        let t0 = std::time::Instant::now();
+        wait("beta has it", 120, || {
+            let s = b.status();
+            let p = &s["progress"];
+            p["bytes_pending"].as_u64() == Some(0)
+                && p["bytes_wanted"].as_u64().unwrap_or(0) >= big.len() as u64
+        });
+        let took = t0.elapsed().as_secs_f64();
+        eprintln!("MEASURE {name}: {:.1} MiB/s over {took:.1}s", 286.1 / took);
+        let same = std::fs::read(b.p("big.bin")).is_ok_and(|x| x == big);
+        assert!(same, "{name}: the file arrived whole");
+    }
+}
