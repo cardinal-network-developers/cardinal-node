@@ -714,7 +714,7 @@ impl Daemon {
         if lock(&self.mount).is_some() || *self.stopping.borrow() {
             return;
         }
-        let Some(path) = self.config().mount.clone() else {
+        let Some(path) = self.config().mount_here().cloned() else {
             return;
         };
         let Some(files) = self.core().files_id() else {
@@ -886,7 +886,7 @@ impl Daemon {
 
     /// Starts LAN discovery once the discovery secret is known.
     pub fn start_discovery(self: &Arc<Self>) {
-        if !self.config().discovery {
+        if !self.config().discovers() {
             return;
         }
         let Some(secret) = self.core().discovery_secret() else {
@@ -945,7 +945,7 @@ impl Daemon {
     /// The multicast DNS configuration.
     pub fn mdns_config(&self) -> cardinal_contact::mdns::MdnsConfig {
         cardinal_contact::mdns::MdnsConfig {
-            port: self.config().mdns_port,
+            port: self.config().mdns(),
             ..Default::default()
         }
     }

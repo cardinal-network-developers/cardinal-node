@@ -94,16 +94,16 @@ pub async fn run(paths: Paths, o: Overrides) -> anyhow::Result<()> {
         config.name = n;
     }
     if let Some(p) = o.mdns_port {
-        config.mdns_port = p;
+        config.this_run.mdns_port = Some(p);
     }
     if o.no_discovery {
-        config.discovery = false;
+        config.this_run.no_discovery = true;
     }
     if changed {
         config.save(&paths.config())?;
     }
     if o.no_mount {
-        config.mount = None;
+        config.this_run.no_mount = true;
     }
     let d = Daemon::start(paths, config).await?;
     d.run().await

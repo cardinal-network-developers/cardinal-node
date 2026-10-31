@@ -282,7 +282,11 @@ async fn handle(d: &Arc<Daemon>, req: &Value) -> anyhow::Result<Value> {
             let p2 = path.clone();
             tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
                 d2.unmount();
-                d2.config().mount = Some(p2.clone());
+                {
+                    let mut c = d2.config();
+                    c.mount = Some(p2.clone());
+                    c.this_run.no_mount = false;
+                }
                 d2.save_config()?;
                 if d2.core().files_id().is_none() {
                     return Ok(());
@@ -442,7 +446,9 @@ fn reload(d: &Arc<Daemon>) -> anyhow::Result<()> {
         signing_key: d.keys.signing.clone(),
     }));
     d.directory.update(Some(&st));
-    *d.config() = crate::config::Config::load(&d.paths.config())?;
+    let mut config = crate::config::Config::load(&d.paths.config())?;
+    config.this_run = d.config().this_run.clone();
+    *d.config() = config;
     d.bump();
     d.housekeeping();
     Ok(())
@@ -560,7 +566,7 @@ fn status(d: &Arc<Daemon>) -> Value {
         "hosts": crate::host::sheet(d).ok().and_then(|v| v["hosts"].as_array().map(Vec::len)),
         "spaces": spaces,
         "files_ready": files.is_some(),
-        "mount": cfg.mount.as_ref().map(|p| p.display().to_string()),
+        "mount": cfg.mount_here().map(|p| p.display().to_string()),
         "mounted": mounted,
         "mount_unavailable": d.mount_unavailable.lock().unwrap_or_else(|e| e.into_inner()).clone(),
         "pending_changes": pending,

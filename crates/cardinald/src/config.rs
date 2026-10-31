@@ -16,10 +16,25 @@ pub const DEFAULT_PORT: u16 = 7171;
 /// Default budget for on-demand retention: 2 GiB.
 pub const DEFAULT_ON_DEMAND_BUDGET: u64 = 2 << 30;
 
+/// Settings from the command line for this run only. They are never saved,
+/// and last when the file is read again.
+#[derive(Clone, Debug, Default)]
+pub struct ThisRun {
+    /// `--no-mount`.
+    pub no_mount: bool,
+    /// `--no-discovery`.
+    pub no_discovery: bool,
+    /// `--mdns-port`.
+    pub mdns_port: Option<u16>,
+}
+
 /// Device settings.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
+    /// What this run was told on the command line.
+    #[serde(skip)]
+    pub this_run: ThisRun,
     /// This device's name, shown on the person's other devices.
     pub name: String,
     /// Where the link endpoint listens (TCP).
@@ -55,6 +70,7 @@ impl Default for Config {
             name: default_name(),
             listen: format!("0.0.0.0:{DEFAULT_PORT}"),
             udp: false,
+            this_run: ThisRun::default(),
             mount: Some(crate::paths::home_dir().join("Cardinal")),
             retention: "full".into(),
             on_demand_budget: DEFAULT_ON_DEMAND_BUDGET,
@@ -142,6 +158,21 @@ impl Config {
         }
         write_private(path, doc.to_string().as_bytes(), 0o600)?;
         Ok(())
+    }
+
+    /// Where to mount on this run, if at all.
+    pub fn mount_here(&self) -> Option<&PathBuf> {
+        self.mount.as_ref().filter(|_| !self.this_run.no_mount)
+    }
+
+    /// Whether to look for devices on the local network on this run.
+    pub fn discovers(&self) -> bool {
+        self.discovery && !self.this_run.no_discovery
+    }
+
+    /// The multicast DNS port on this run.
+    pub fn mdns(&self) -> u16 {
+        self.this_run.mdns_port.unwrap_or(self.mdns_port)
     }
 
     /// Whether retention is on demand.

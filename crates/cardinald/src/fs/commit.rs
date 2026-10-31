@@ -659,9 +659,9 @@ mod tests {
     use super::*;
     use crate::config::Config;
     use crate::keys::Keys;
-    use cardinal_crypto::HybridKeyPair;
     use crate::paths::Paths;
     use crate::setup;
+    use cardinal_crypto::HybridKeyPair;
 
     struct Fx {
         _dir: tempfile::TempDir,

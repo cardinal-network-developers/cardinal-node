@@ -47,6 +47,11 @@ impl Dev {
     }
 
     pub fn start(&mut self) {
+        self.start_with(&[]);
+    }
+
+    /// Starts the daemon with `args` too.
+    pub fn start_with(&mut self, args: &[&str]) {
         let log = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
@@ -59,6 +64,7 @@ impl Dev {
             .arg(format!("127.0.0.1:{}", self.port))
             .arg("--mount")
             .arg(&self.mount)
+            .args(args)
             .stdout(log.try_clone().unwrap())
             .stderr(log)
             .spawn()
