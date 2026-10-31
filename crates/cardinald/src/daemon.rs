@@ -232,6 +232,7 @@ pub struct Daemon {
     pub news: Mutex<crate::news::Waiting>,
     /// Static keys of restore sessions that proved the root key.
     proven: Mutex<HashSet<[u8; 32]>>,
+    saving_book: Mutex<()>,
     /// Rendezvous and relay, as a device and as a host.
     pub rendezvous: crate::rendezvous::Rendezvous,
     /// Pairing.
@@ -373,6 +374,7 @@ impl Daemon {
             blob_stats: Mutex::new(HashMap::new()),
             news: Mutex::new(HashMap::new()),
             proven: Mutex::new(HashSet::new()),
+            saving_book: Mutex::new(()),
             rendezvous: Default::default(),
             copies: crate::copies::Tracker::load(copies_path, crate::copies::Rules::from_env()),
             cleanup: crate::cleanup::Cleaner::load(old_versions),
@@ -1132,6 +1134,9 @@ impl Daemon {
     }
 
     fn save_book(&self) {
+        // Several addresses can answer at once, and a save goes by way of
+        // one temporary file.
+        let _one = lock(&self.saving_book);
         let b = serde_json::to_vec_pretty(&*lock(&self.book)).unwrap_or_default();
         if let Err(e) = write_private(&self.paths.peers(), &b, 0o600) {
             tracing::warn!("cannot save peers: {e}");
