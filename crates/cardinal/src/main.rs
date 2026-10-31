@@ -110,6 +110,10 @@ enum Cmd {
     RemoveDevice {
         /// The device's name or key, as `cardinal devices` shows.
         who: String,
+        /// It was lost or stolen: keep nothing of its that your other
+        /// devices have not built on. Without this, its work is kept.
+        #[arg(long)]
+        lost: bool,
     },
     /// Make this device a host for your own devices: it keeps a full copy
     /// of your files, and can bring them back if every other device is lost.
@@ -773,6 +777,9 @@ fn print_status(v: &Value) {
         return;
     }
     println!("This device: {}", v["name"].as_str().unwrap_or(""));
+    if v["removed"] == true {
+        println!("It was removed from your devices: it no longer syncs, and what is here stays.");
+    }
     match (v["mounted"].as_str(), v["mount"].as_str()) {
         (Some(m), _) => println!("Your files: {m}"),
         (None, Some(_)) if v["mount_unavailable"].is_string() => println!(
@@ -1083,13 +1090,22 @@ async fn client(cmd: Cmd) -> anyhow::Result<()> {
             Ok(())
         }
         Cmd::Speedtest { device, json: raw } => speedtest(&paths, device, raw).await,
-        Cmd::RemoveDevice { who } => {
-            let v = call_with_words(&paths, json!({"cmd": "remove-device", "who": who})).await?;
-            println!(
-                "Removed \"{}\". It can no longer read or change your files; what it already \
-                 wrote is kept.",
-                v["name"].as_str().unwrap_or(&who)
-            );
+        Cmd::RemoveDevice { who, lost } => {
+            let req = json!({"cmd": "remove-device", "who": who, "lost": lost});
+            let v = call_with_words(&paths, req).await?;
+            let name = v["name"].as_str().unwrap_or(&who);
+            if lost {
+                println!(
+                    "Removed \"{name}\". It can no longer read or change your files. Changes of \
+                     its that your other devices had not built on are not kept: {}.",
+                    v["dropped"].as_u64().unwrap_or(0)
+                );
+            } else {
+                println!(
+                    "Removed \"{name}\". It can no longer read or change your files; everything \
+                     of its that reached your other devices is kept."
+                );
+            }
             let devs = call(&paths, json!({"cmd": "devices"})).await?;
             let admins = devs["devices"]
                 .as_array()

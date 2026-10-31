@@ -572,6 +572,19 @@ Not implemented yet (the next milestone):
   copies (they remain in history). A `set` cannot keep two of three values.
 - **Not implemented: `rotate_after`.** Epochs rotate only when the identity's
   encryption key changes, which every removal does.
+- **Retired and lost devices.** `cardinal remove-device` treats a device as
+  retired (`spaces.md#authors`): it syncs with every device it can reach,
+  the one going away first, and witnesses what that device wrote. With
+  `--lost` it witnesses nothing, and the removal's parents leave out what
+  the key wrote that no other key built on (`identity.md`). Three things are
+  not implemented yet: showing the person those entries to choose from, the
+  `keep` op from the command line, and showing the keys a removed key added,
+  which identity.md requires when writing a removal.
+- **Telling a removed device.** The spec does not say. The device doing the
+  removal delivers the removal to it before closing the session, because
+  nobody answers it afterwards and until then it can pass the news on. A
+  device that hears it was removed stops writing. One that was offline at
+  the time never hears.
 - **Reading: when a rotation is due.** "A member identity's encryption key
   changed since the epoch began" is checked by trying to open the current
   epoch's wrap with the current encryption key, so it follows from the state

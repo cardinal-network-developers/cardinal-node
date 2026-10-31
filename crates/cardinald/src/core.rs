@@ -401,6 +401,21 @@ impl Holder {
         }
     }
 
+    /// Writes on every head if `key` wrote something nothing else builds
+    /// on, so that it stays when the key is removed. Returns the sealed
+    /// bytes to send to the person's other devices.
+    pub fn witness(
+        &mut self,
+        identity: &Identity,
+        keys: &Keys,
+        key: &KeyId,
+    ) -> anyhow::Result<Option<Vec<u8>>> {
+        if !self.space.as_ref().is_some_and(|s| s.has_unwitnessed(key)) {
+            return Ok(None);
+        }
+        Ok(Some(self.write_one(identity, keys, Vec::new())?.1))
+    }
+
     /// Starts a new epoch if one is due, in an entry of its own. Returns
     /// the sealed bytes to send to the person's other devices.
     pub fn rotate_if_due(
@@ -422,6 +437,9 @@ impl Holder {
         keys: &Keys,
         ops: Vec<SpaceOp>,
     ) -> anyhow::Result<(EntryId, Vec<u8>)> {
+        if identity.state().power(&keys.key()).is_none() {
+            anyhow::bail!("this device was removed");
+        }
         let rotate = self.rotation_due(identity);
         let space = self
             .space
@@ -477,6 +495,9 @@ impl Holder {
         exclude: &[EntryId],
         ops: Vec<SpaceOp>,
     ) -> anyhow::Result<(EntryId, Vec<u8>)> {
+        if identity.state().power(&keys.key()).is_none() {
+            anyhow::bail!("this device was removed");
+        }
         if self.rotation_due(identity) {
             anyhow::bail!("an epoch rotation is due");
         }
@@ -903,6 +924,35 @@ impl Core {
             .get_mut(space)
             .ok_or_else(|| anyhow::anyhow!("space not held"))?;
         h.write_one(ident, &self.keys, ops)
+    }
+
+    /// Whether this device has heard that it was removed.
+    pub fn removed(&self) -> bool {
+        self.identity
+            .as_ref()
+            .is_some_and(|i| i.state().power(&self.keys.key()).is_none())
+    }
+
+    /// How many entries by the removed `key`, in all spaces, do not count.
+    pub fn unwitnessed_by(&self, key: &KeyId) -> usize {
+        self.spaces
+            .values()
+            .filter_map(|h| h.space.as_ref())
+            .map(|s| s.unwitnessed_by(key))
+            .sum()
+    }
+
+    /// Keeps what `key` wrote in a space ([`Holder::witness`]).
+    pub fn witness(&mut self, space: &SpaceId, key: &KeyId) -> anyhow::Result<Option<Vec<u8>>> {
+        let ident = self
+            .identity
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("this device has no identity yet"))?;
+        let h = self
+            .spaces
+            .get_mut(space)
+            .ok_or_else(|| anyhow::anyhow!("space not held"))?;
+        h.witness(ident, &self.keys, key)
     }
 
     /// Starts a new epoch in a space if one is due

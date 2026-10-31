@@ -486,6 +486,45 @@ impl IdentityLog {
     /// power. Afterwards an admin MUST set a fresh encryption key
     /// ([`set_encryption_key`](Self::set_encryption_key)).
     pub fn remove_key(&mut self, author: &SigningKey, key: &KeyId) -> Result<IdentityEntry, Error> {
+        self.check_removal(author, key)?;
+        self.append(author, vec![IdentityOp::remove_key(*key)])
+    }
+
+    /// Removes a key that was lost or stolen. What the key wrote that no
+    /// other key built on is left out of the removal's parents, which
+    /// discards it; [`remove_key`](Self::remove_key) keeps it. A person
+    /// choosing to keep some of it would name those entries as parents too.
+    pub fn remove_lost_key(
+        &mut self,
+        author: &SigningKey,
+        key: &KeyId,
+    ) -> Result<IdentityEntry, Error> {
+        self.check_removal(author, key)?;
+        let mut left_out: HashSet<EntryId> = HashSet::new();
+        for id in self.dag.log_order().iter().rev() {
+            let mine = self.dag.get(id).is_some_and(|e| e.signer() == *key);
+            if mine && self.dag.children(id).iter().all(|c| left_out.contains(c)) {
+                left_out.insert(*id);
+            }
+        }
+        let parents: Vec<EntryId> = self
+            .dag
+            .log_order()
+            .iter()
+            .filter(|id| {
+                !left_out.contains(*id)
+                    && self.dag.children(id).iter().all(|c| left_out.contains(c))
+            })
+            .copied()
+            .collect();
+        let e = EntryBuilder::new(self.id, &parents)
+            .op(IdentityOp::remove_key(*key))
+            .sign(author)?;
+        self.insert(e.clone())?;
+        Ok(e)
+    }
+
+    fn check_removal(&self, author: &SigningKey, key: &KeyId) -> Result<(), Error> {
         let st = self.state();
         let target = st
             .power(key)
@@ -496,7 +535,7 @@ impl IdentityLog {
         if mine <= target || mine < Power::Admin {
             return Err(Error::NotAuthorized("removals go strictly down in power"));
         }
-        self.append(author, vec![IdentityOp::remove_key(*key)])
+        Ok(())
     }
 
     /// Sets `new` as the encryption key: wraps for every device and admin
@@ -1034,6 +1073,70 @@ mod tests {
 
     fn phrase(n: u8) -> RecoveryPhrase {
         RecoveryPhrase::from_entropy(&[n; 32])
+    }
+
+    /// An admin key that added a device, and the root that can remove it.
+    fn a_key_with_a_last_entry() -> (IdentityLog, DeviceKeys, DeviceKeys, DeviceKeys, SigningKey) {
+        let d1 = DeviceKeys::generate();
+        let Created {
+            mut log,
+            phrase,
+            encryption,
+        } = IdentityLog::create_with(phrase(3), &d1, HybridKeyPair::generate()).unwrap();
+        let root = phrase.root_signing_key();
+        let (admin, added) = (DeviceKeys::generate(), DeviceKeys::generate());
+        log.add_key(
+            &d1.signing,
+            &admin.request(&log.id(), Power::Admin),
+            Some(&encryption),
+        )
+        .unwrap();
+        log.add_key(
+            &admin.signing,
+            &added.request(&log.id(), Power::Device),
+            Some(&encryption),
+        )
+        .unwrap();
+        (log, d1, admin, added, root)
+    }
+
+    #[test]
+    fn a_retired_key_keeps_what_it_did() {
+        let (mut log, _, admin, added, root) = a_key_with_a_last_entry();
+        log.remove_key(&root, &admin.key()).unwrap();
+        let st = log.state();
+        assert_eq!(st.power(&admin.key()), None);
+        assert_eq!(st.power(&added.key()), Some(Power::Device));
+    }
+
+    #[test]
+    fn a_lost_key_keeps_nothing_no_other_key_built_on() {
+        let (mut log, d1, admin, added, root) = a_key_with_a_last_entry();
+        log.remove_lost_key(&root, &admin.key()).unwrap();
+        let st = log.state();
+        assert_eq!(st.power(&admin.key()), None);
+        assert_eq!(st.power(&added.key()), None, "not built on");
+        assert_eq!(st.power(&d1.key()), Some(Power::Admin));
+
+        // The next entry names what was left out as a parent, which brings
+        // nothing back: only a removal's own past is kept.
+        let other = DeviceKeys::generate();
+        log.add_key(&d1.signing, &other.request(&log.id(), Power::Device), None)
+            .unwrap();
+        assert_eq!(log.state().power(&added.key()), None);
+    }
+
+    #[test]
+    fn a_lost_key_keeps_what_another_key_built_on() {
+        let (mut log, d1, admin, added, root) = a_key_with_a_last_entry();
+        let other = DeviceKeys::generate();
+        log.add_key(&d1.signing, &other.request(&log.id(), Power::Device), None)
+            .unwrap();
+        log.remove_lost_key(&root, &admin.key()).unwrap();
+        let st = log.state();
+        assert_eq!(st.power(&admin.key()), None);
+        assert_eq!(st.power(&added.key()), Some(Power::Device));
+        assert_eq!(st.power(&other.key()), Some(Power::Device));
     }
 
     #[test]

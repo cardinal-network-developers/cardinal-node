@@ -170,6 +170,9 @@ pub fn without_commits<R>(f: impl FnOnce() -> R) -> R {
 pub fn commit(d: &Arc<Daemon>, tree: &Mutex<Tree>, space: &SpaceId) -> anyhow::Result<usize> {
     let _one = COMMITTING.lock().unwrap_or_else(|e| e.into_inner());
     let start = Instant::now();
+    if d.core().removed() {
+        return Ok(0);
+    }
     // Content is keyed by the epoch, so a new one must come first.
     let rotated = d.core().rotate_if_due(space)?;
     if let Some(entry) = rotated {

@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use cardinal_crypto::{HybridKeyPair, HybridPublicKey, SigningKey};
 use cardinal_identity::dag::{Dag, Inserted};
-use cardinal_identity::{EntryId, IdentityLog, IdentityState};
+use cardinal_identity::{EntryId, IdentityLog, IdentityState, KeyId};
 
 use crate::entry::{
     IdentityId, MembershipId, Policy, Profile, SealedEntry, SpaceEntry, SpaceEntryBuilder, SpaceId,
@@ -376,6 +376,27 @@ impl Space {
             Some(wraps) => EpochKey::open_wraps(wraps, &epoch, &[key]).is_some(),
             None => true,
         }
+    }
+
+    /// Whether `key` wrote something that no other key built on. Once the
+    /// key is removed such an entry counts only if witnessed
+    /// (`spaces.md#authors`), and any other key's write on the heads does
+    /// that.
+    pub fn has_unwitnessed(&self, key: &KeyId) -> bool {
+        self.dag
+            .heads()
+            .iter()
+            .any(|h| self.dag.get(h).is_some_and(|e| e.signer() == *key))
+    }
+
+    /// How many entries by the removed `key` do not count, for want of a
+    /// witness.
+    pub fn unwitnessed_by(&self, key: &KeyId) -> usize {
+        self.validity
+            .unwitnessed
+            .iter()
+            .filter(|x| self.dag.get(x).is_some_and(|e| e.signer() == *key))
+            .count()
     }
 
     /// Writes an entry with `ops` under the current epoch, with the current

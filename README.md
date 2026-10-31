@@ -27,8 +27,8 @@ One person, several Linux devices, one folder that is the same everywhere:
   free-space` frees them now; `cardinal keep-old 90` or `forever` changes
   the period on a device.
 - Lost your admin device? On any device you still have, your recovery
-  words stand in for it: `cardinal remove-device <name>` removes the lost
-  one, and `cardinal pair <code> --admin` (with `cardinal pair --admin` on
+  words stand in for it: `cardinal remove-device <name> --lost` removes the
+  lost one, and `cardinal pair <code> --admin` (with `cardinal pair --admin` on
   the new device) adds an admin device in its place. Each asks for the
   words, uses them once, and keeps nothing. `cardinal recovery check`
   checks the words you wrote down.

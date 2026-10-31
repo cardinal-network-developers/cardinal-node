@@ -283,6 +283,8 @@ fn removed_device_and_rotation() {
     .unwrap();
     let by_d1 = *a.dag().log_order().last().unwrap();
     assert!(a.validity().is_valid(&by_d1));
+    assert!(a.has_unwitnessed(&d1.key()));
+    assert!(!a.has_unwitnessed(&d0.key()));
     let epoch0 = a.current_epoch().unwrap();
 
     // the device is removed and the identity key rotated
@@ -296,6 +298,7 @@ fn removed_device_and_rotation() {
     // d1's entry was not witnessed by another device before the removal
     assert!(!a.validity().is_valid(&by_d1));
     assert!(a.validity().unwitnessed.contains(&by_d1));
+    assert_eq!(a.unwitnessed_by(&d1.key()), 1);
     // a keep op by an honest device keeps it
     a.write(
         &p.log,

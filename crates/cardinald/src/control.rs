@@ -6,6 +6,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 
 use cardinal_identity::Power;
 use cardinal_space::account;
@@ -18,6 +19,7 @@ use tokio::net::{UnixListener, UnixStream};
 
 use crate::core::short;
 use crate::daemon::{Daemon, PairState};
+use crate::net;
 
 /// Sends a request to a running daemon and returns its reply.
 pub async fn request(socket: &std::path::Path, req: &Value) -> anyhow::Result<Value> {
@@ -195,7 +197,10 @@ async fn handle(d: &Arc<Daemon>, req: &Value) -> anyhow::Result<Value> {
             let name = crate::pair::type_code(d, code, at, admin, words(req)).await?;
             Ok(json!({"name": name}))
         }
-        "remove-device" => remove_device(d, arg(req, "who")?, words(req)),
+        "remove-device" => {
+            let lost = req.get("lost").and_then(|v| v.as_bool()).unwrap_or(false);
+            remove_device(d, arg(req, "who")?, words(req), lost).await
+        }
         "recovery-check" => {
             crate::recovery::root_from_words(d, arg(req, "words")?)?;
             Ok(json!({}))
@@ -568,6 +573,7 @@ fn status(d: &Arc<Daemon>) -> Value {
         "files_ready": files.is_some(),
         "mount": cfg.mount_here().map(|p| p.display().to_string()),
         "mounted": mounted,
+        "removed": d.core().removed(),
         "mount_unavailable": d.mount_unavailable.lock().unwrap_or_else(|e| e.into_inner()).clone(),
         "pending_changes": pending,
         "retention": cfg.retention,
@@ -883,7 +889,46 @@ fn words(req: &Value) -> Option<&str> {
     req.get("words").and_then(|v| v.as_str())
 }
 
-fn remove_device(d: &Arc<Daemon>, who: &str, words: Option<&str>) -> anyhow::Result<Value> {
+/// How long a device gets to give up what it has, before its removal.
+const SYNC_WITHIN: Duration = Duration::from_secs(10);
+
+/// How long a device gets to take the news of its own removal.
+const TELL_WITHIN: Duration = Duration::from_secs(3);
+
+/// For a device that is retired rather than lost (`spaces.md#authors`): gets
+/// what can be had of its work, from it first, and builds on that, so that
+/// nothing goes with its key.
+async fn keep_work_of(d: &Arc<Daemon>, key: &[u8; 32]) -> anyhow::Result<()> {
+    let mut sessions = d.own_sessions();
+    sessions.sort_by_key(|s| s.peer_identity().map(|p| p.signing_key) != Some(*key));
+    for s in sessions {
+        if tokio::time::timeout(SYNC_WITHIN, net::sync_all(d, &s))
+            .await
+            .is_err()
+        {
+            tracing::warn!("syncing with {} took too long", short(&s.peer_static()));
+        }
+    }
+    let spaces: Vec<SpaceId> = d.core().spaces.keys().copied().collect();
+    for space in &spaces {
+        let entry = d.core().witness(space, key)?;
+        if let Some(entry) = entry {
+            d.push(space, vec![entry]);
+        }
+    }
+    Ok(())
+}
+
+/// Removes a device. A device that is `lost` or stolen gets nothing kept
+/// that no other key built on; any other keeps its work. Either way it is
+/// told first, while it still can be: nobody answers it afterwards, and until
+/// then it can pass the news to devices this one cannot reach.
+async fn remove_device(
+    d: &Arc<Daemon>,
+    who: &str,
+    words: Option<&str>,
+    lost: bool,
+) -> anyhow::Result<Value> {
     let me = d.keys.key();
     let (key, name) = {
         let core = d.core();
@@ -939,15 +984,23 @@ fn remove_device(d: &Arc<Daemon>, who: &str, words: Option<&str>) -> anyhow::Res
             }
         },
     )?;
+    if !lost {
+        keep_work_of(d, &key).await?;
+    }
     let signer = root.as_ref().unwrap_or(&d.keys.device.signing);
-    let entries = {
+    let (entries, label) = {
         let mut core = d.core();
         let ident = core.identity.as_mut().expect("identity");
         let current = ident
             .enc
             .first()
             .map(|k| cardinal_crypto::HybridKeyPair::from_secret_bytes(&k.secret_bytes()));
-        let e1 = ident.log.remove_key(signer, &key).map_err(|e| {
+        let removal = if lost {
+            ident.log.remove_lost_key(signer, &key)
+        } else {
+            ident.log.remove_key(signer, &key)
+        };
+        let e1 = removal.map_err(|e| {
             anyhow::anyhow!(
                 "cannot remove {name}: {e} (only a device with more power can remove it)"
             )
@@ -966,10 +1019,28 @@ fn remove_device(d: &Arc<Daemon>, who: &str, words: Option<&str>) -> anyhow::Res
                 i.enc = i.log.key_chain(k);
             }
         }
-        vec![e1.encode(), e2.encode()]
+        let entries = vec![(e1.encode(), e1.id()), (e2.encode(), e2.id())];
+        (entries, core.identity_label())
     };
+    let session = d
+        .own_sessions()
+        .into_iter()
+        .find(|s| s.peer_identity().map(|p| p.signing_key) == Some(key));
+    if let (Some(s), Some(label)) = (session, label) {
+        let tell = async {
+            for (entry, id) in &entries {
+                net::deliver(&s, label, entry.clone(), *id).await?;
+            }
+            anyhow::Ok(())
+        };
+        match tokio::time::timeout(TELL_WITHIN, tell).await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => tracing::debug!("telling {name} of its removal: {e:#}"),
+            Err(_) => tracing::debug!("telling {name} of its removal took too long"),
+        }
+    }
     d.identity_changed();
-    d.push_identity(entries);
+    d.push_identity(entries.into_iter().map(|(entry, _)| entry).collect());
     // Every space moves to keys it never held, now rather than at the next
     // write here. Any device's next write would do it, so one that fails
     // is not lost.
@@ -1012,5 +1083,6 @@ fn remove_device(d: &Arc<Daemon>, who: &str, words: Option<&str>) -> anyhow::Res
             d.write_and_push(&a, ops)?;
         }
     }
-    Ok(json!({"name": name}))
+    let dropped = d.core().unwitnessed_by(&key);
+    Ok(json!({"name": name, "dropped": dropped}))
 }
