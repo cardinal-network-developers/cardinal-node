@@ -57,10 +57,11 @@ pub type Waiting = HashMap<Label, News>;
 
 impl Daemon {
     /// Peers to tell, leaving out `not`: all of them, or a random few.
-    fn notice_peers(&self, not: &HashSet<[u8; 32]>) -> Vec<Session> {
+    fn notice_peers(&self, label: &Label, not: &HashSet<[u8; 32]>) -> Vec<Session> {
         let mut peers: Vec<Session> = self
             .own_sessions()
             .into_iter()
+            .chain(self.contact_sessions(label))
             .filter(|s| !not.contains(&s.peer_static()))
             .collect();
         if peers.len() > PEERS {
@@ -81,7 +82,7 @@ impl Daemon {
     /// Sends a notice about `label` to peers other than `not`: `objects`
     /// if they are all that is new and they fit, else the heads.
     pub fn notify(self: &Arc<Self>, label: Label, objects: Vec<Vec<u8>>, not: &HashSet<[u8; 32]>) {
-        let peers = self.notice_peers(not);
+        let peers = self.notice_peers(&label, not);
         if peers.is_empty() {
             return;
         }

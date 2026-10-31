@@ -3,7 +3,7 @@
 //! changes, so the link never waits on the daemon's locks.
 
 use std::collections::HashMap;
-use std::sync::RwLock;
+use std::sync::{Arc, RwLock};
 
 use cardinal_crypto::HybridPublicKey;
 use cardinal_identity::IdentityState;
@@ -14,6 +14,8 @@ struct Snapshot {
     identity: Option<[u8; 32]>,
     /// x25519 static key -> (full link key, signing key)
     devices: HashMap<[u8; 32], (HybridPublicKey, [u8; 32])>,
+    /// The same for contacts' devices, with their identities.
+    others: HashMap<[u8; 32], (HybridPublicKey, [u8; 32], [u8; 32])>,
 }
 
 /// A [`PeerDirectory`] over this person's identity log.
@@ -23,9 +25,17 @@ pub struct Directory {
 }
 
 impl Directory {
-    /// Replaces the snapshot with the devices in effect in `state`.
-    pub fn update(&self, state: Option<&IdentityState>) {
+    /// Replaces the snapshot with the devices in effect in `state`, and
+    /// those of the other logs this device keeps.
+    pub fn update(&self, state: Option<&IdentityState>, others: &[Arc<IdentityState>]) {
         let mut s = Snapshot::default();
+        for o in others {
+            for k in o.keys.values() {
+                if let Some(l) = &k.link_key {
+                    s.others.insert(*l.x25519(), (l.clone(), k.key, o.identity));
+                }
+            }
+        }
         if let Some(st) = state {
             s.identity = Some(st.identity);
             for k in st.keys.values() {
@@ -40,12 +50,11 @@ impl Directory {
 
 impl PeerDirectory for Directory {
     fn link_key(&self, static_x25519: &[u8; 32]) -> Option<HybridPublicKey> {
-        self.inner
-            .read()
-            .expect("lock")
-            .devices
+        let s = self.inner.read().expect("lock");
+        s.devices
             .get(static_x25519)
             .map(|(l, _)| l.clone())
+            .or_else(|| s.others.get(static_x25519).map(|(l, _, _)| l.clone()))
     }
 
     fn verify_device(
@@ -55,9 +64,13 @@ impl PeerDirectory for Directory {
         static_x25519: &[u8; 32],
     ) -> bool {
         let s = self.inner.read().expect("lock");
-        s.identity.as_ref() == Some(identity)
+        let own = s.identity.as_ref() == Some(identity)
             && s.devices
                 .get(static_x25519)
-                .is_some_and(|(_, k)| k == signing_key)
+                .is_some_and(|(_, k)| k == signing_key);
+        own || s
+            .others
+            .get(static_x25519)
+            .is_some_and(|(_, k, i)| k == signing_key && i == identity)
     }
 }

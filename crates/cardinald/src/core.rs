@@ -6,7 +6,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use cardinal_crypto::HybridKeyPair;
+use cardinal_crypto::{HybridKeyPair, HybridPublicKey};
 use cardinal_encoding::Record;
 use cardinal_identity::{EntryId, IdentityEntry, IdentityLog, IdentityState, Inserted, KeyId};
 use cardinal_space::account;
@@ -139,6 +139,53 @@ impl Identity {
     }
 }
 
+/// Another person's identity log (`identity.md#distribution`), kept to tell
+/// which of their writes count and how to reach their devices.
+pub struct OtherLog {
+    /// The log.
+    pub log: IdentityLog,
+    file: AppendLog,
+    locs: HashMap<EntryId, Loc>,
+    /// Entry ids held (the sync set).
+    pub set: MemSet,
+}
+
+impl OtherLog {
+    /// Adds entries. Returns whether the log changed.
+    fn ingest(&mut self, objects: &[Vec<u8>]) -> anyhow::Result<bool> {
+        let mut changed = false;
+        for bytes in objects {
+            let Ok(e) = IdentityEntry::decode(bytes) else {
+                continue;
+            };
+            if self.set.contains_id(&e.id()) || e.identity() != self.log.id() {
+                continue;
+            }
+            let id = e.id();
+            match self.log.insert(e) {
+                Ok(Inserted::Added(_)) => changed = true,
+                Ok(Inserted::Held(_)) => {}
+                Ok(Inserted::Duplicate) | Err(_) => continue,
+            }
+            self.keep(id, bytes)?;
+        }
+        Ok(changed)
+    }
+
+    fn keep(&mut self, id: EntryId, bytes: &[u8]) -> anyhow::Result<()> {
+        self.set.insert(id);
+        for loc in self.file.append_many(&[bytes])? {
+            self.locs.insert(id, loc);
+        }
+        Ok(())
+    }
+
+    /// The bytes of an entry.
+    fn get(&self, id: &EntryId) -> Option<Vec<u8>> {
+        self.locs.get(id).and_then(|l| self.file.read(*l).ok())
+    }
+}
+
 /// Helpers on [`MemSet`].
 pub trait SetExt {
     /// Whether the set holds `id`.
@@ -165,6 +212,8 @@ pub struct Holder {
     file: AppendLog,
     /// Bumped whenever the state may have changed.
     pub version: u64,
+    /// The encryption keys of the other members, for a new epoch.
+    member_keys: Vec<HybridPublicKey>,
 }
 
 /// What ingesting objects did.
@@ -204,6 +253,7 @@ impl Holder {
             pending: Vec::new(),
             file,
             version: 0,
+            member_keys: Vec::new(),
         };
         let mut sealed = Vec::new();
         for (loc, bytes) in records {
@@ -452,10 +502,12 @@ impl Holder {
                 .ok_or_else(|| anyhow::anyhow!("no encryption key"))?
                 .public_key()
                 .clone();
+            let mut recipients = vec![&pk];
+            recipients.extend(self.member_keys.iter());
             let (s, _) = space.rotate(
                 &identity.log,
                 &keys.device.signing,
-                &[&pk],
+                &recipients,
                 ops,
                 Some(now_ms()),
             )?;
@@ -470,7 +522,7 @@ impl Holder {
             // the new entry descends from every head, so it is the only one
             anyhow::bail!("unexpected heads after a write")
         };
-        if !space.validity().is_valid(&id) {
+        if !space.validity().is_valid(&id) && !space.needs_full_evaluation() {
             tracing::warn!(
                 "space {}: own entry {} is not valid",
                 short(&self.id),
@@ -565,6 +617,10 @@ pub struct Core {
     pub spaces: BTreeMap<SpaceId, Holder>,
     /// Identity entries received before this device joined the identity.
     joining: Vec<Vec<u8>>,
+    /// Other people's identity logs.
+    pub others: BTreeMap<[u8; 32], OtherLog>,
+    /// Entries of a log whose genesis has not arrived yet.
+    arriving: HashMap<[u8; 32], Vec<Vec<u8>>>,
 }
 
 /// What a change to the identity log means for the rest of the daemon.
@@ -585,12 +641,15 @@ impl Core {
             identity: None,
             spaces: BTreeMap::new(),
             joining: Vec::new(),
+            others: BTreeMap::new(),
+            arriving: HashMap::new(),
         };
         if paths.identity_log().exists() {
             let (file, records) = AppendLog::open(&paths.identity_log())?;
             core.identity = Some(Self::build_identity(file, records, &core.keys)?);
         }
         if core.identity.is_some() {
+            core.load_others()?;
             if let Ok(rd) = std::fs::read_dir(paths.spaces()) {
                 for d in rd.flatten() {
                     let name = d.file_name().to_string_lossy().into_owned();
@@ -601,8 +660,225 @@ impl Core {
                     core.open_space(id)?;
                 }
             }
+            core.settle_all();
         }
         Ok(core)
+    }
+
+    fn load_others(&mut self) -> anyhow::Result<()> {
+        let Ok(rd) = std::fs::read_dir(self.paths.others()) else {
+            return Ok(());
+        };
+        for d in rd.flatten() {
+            let (file, records) = AppendLog::open(&d.path())?;
+            let mut entries = Vec::new();
+            let mut locs = HashMap::new();
+            let mut set = MemSet::new();
+            for (loc, b) in records {
+                let e = IdentityEntry::decode(&b)?;
+                locs.insert(e.id(), loc);
+                set.insert(e.id());
+                entries.push(e);
+            }
+            let Some(at) = entries.iter().position(|e| e.is_genesis()) else {
+                continue;
+            };
+            let mut log = IdentityLog::from_genesis(entries.remove(at))?;
+            for e in entries {
+                let _ = log.insert(e);
+            }
+            let other = OtherLog {
+                log,
+                file,
+                locs,
+                set,
+            };
+            self.others.insert(other.log.id(), other);
+        }
+        Ok(())
+    }
+
+    /// Adds entries of another person's identity log, the first of which
+    /// may come in any order. Returns whether the log changed.
+    pub fn ingest_other(
+        &mut self,
+        identity: [u8; 32],
+        objects: &[Vec<u8>],
+    ) -> anyhow::Result<bool> {
+        if !self.others.contains_key(&identity) {
+            let arriving = self.arriving.entry(identity).or_default();
+            arriving.extend(objects.iter().cloned());
+            let genesis = arriving
+                .iter()
+                .filter_map(|b| IdentityEntry::decode(b).ok())
+                .find(|e| e.is_genesis() && e.identity() == identity);
+            let Some(genesis) = genesis else {
+                return Ok(false);
+            };
+            let (genesis_id, bytes) = (genesis.id(), genesis.encode());
+            std::fs::create_dir_all(self.paths.others())?;
+            let path = self.paths.others().join(hex::encode(identity));
+            let (file, _) = AppendLog::open(&path)?;
+            let mut other = OtherLog {
+                log: IdentityLog::from_genesis(genesis)?,
+                file,
+                locs: HashMap::new(),
+                set: MemSet::new(),
+            };
+            other.keep(genesis_id, &bytes)?;
+            self.others.insert(identity, other);
+            let held = self.arriving.remove(&identity).unwrap_or_default();
+            let other = self.others.get_mut(&identity).expect("inserted");
+            other.ingest(&held)?;
+            self.settle_all();
+            return Ok(true);
+        }
+        let other = self.others.get_mut(&identity).expect("checked");
+        let changed = other.ingest(objects)?;
+        if changed {
+            self.settle_all();
+        }
+        Ok(changed)
+    }
+
+    /// The identity whose log has `label`, of those this device keeps.
+    pub fn other_of_label(&self, label: &[u8; 32]) -> Option<[u8; 32]> {
+        self.contacts()
+            .into_iter()
+            .map(|c| c.identity)
+            .chain(self.others.keys().copied())
+            .find(|id| identity_log_label(id) == *label)
+    }
+
+    /// This person's contacts, from the account space.
+    pub fn contacts(&self) -> Vec<cardinal_space::account::ContactRecord> {
+        self.account()
+            .and_then(|a| a.space.as_ref())
+            .map(|s| cardinal_space::account::contacts(s.state()))
+            .unwrap_or_default()
+    }
+
+    /// Whose device has the static key `peer_x25519`, among contacts.
+    pub fn contact_of(&self, peer_x25519: &[u8; 32]) -> Option<([u8; 32], KeyId)> {
+        self.others.values().find_map(|o| {
+            let st = o.log.state();
+            let k = st
+                .keys
+                .values()
+                .find(|k| k.link_key.as_ref().map(|l| l.x25519()) == Some(peer_x25519))?;
+            Some((o.log.id(), k.key))
+        })
+    }
+
+    /// Whether `identity` is a member of the space `label`, or `label` is
+    /// this person's log, which every contact is entitled to.
+    pub fn shares(&self, identity: &[u8; 32], label: &[u8; 32]) -> bool {
+        if Some(*label) == self.identity_label() {
+            return self.others.contains_key(identity);
+        }
+        self.spaces
+            .get(label)
+            .and_then(|h| h.space.as_ref())
+            .is_some_and(|s| s.validity().members.iter().any(|m| m.identity == *identity))
+    }
+
+    /// What a session with a contact may reconcile: this person's log and
+    /// theirs, then the spaces they share (`spaces.md#holding-a-space`).
+    pub fn labels_with(&self, identity: &[u8; 32]) -> Vec<[u8; 32]> {
+        let mut v: Vec<[u8; 32]> = self.identity_label().into_iter().collect();
+        v.push(identity_log_label(identity));
+        v.extend(self.spaces.keys().filter(|l| self.shares(identity, l)));
+        v
+    }
+
+    /// The states of the other logs this device keeps.
+    pub fn other_states(&self) -> Vec<Arc<cardinal_identity::IdentityState>> {
+        self.others.values().map(|o| o.log.state()).collect()
+    }
+
+    /// Re-evaluates a space with members other than this identity, whose
+    /// entries only the logs of all its members can judge.
+    fn settle(&mut self, space: &SpaceId) {
+        let Some(ident) = self.identity.as_ref() else {
+            return;
+        };
+        let Some(h) = self.spaces.get_mut(space) else {
+            return;
+        };
+        let Some(sp) = h.space.as_mut() else {
+            return;
+        };
+        if !sp.needs_full_evaluation() {
+            return;
+        }
+        let mut logs = vec![&ident.log];
+        logs.extend(self.others.values().map(|o| &o.log));
+        if let Err(e) = sp.evaluate_full(&logs) {
+            tracing::warn!("space {}: {e}", short(space));
+        }
+        h.member_keys = sp
+            .validity()
+            .members
+            .iter()
+            .filter(|m| m.identity != ident.id())
+            .filter_map(|m| self.others.get(&m.identity))
+            .filter_map(|o| Some(o.log.state().encryption_key.as_ref()?.public.clone()))
+            .collect();
+        h.version += 1;
+    }
+
+    fn settle_all(&mut self) {
+        let spaces: Vec<SpaceId> = self.spaces.keys().copied().collect();
+        for space in &spaces {
+            self.settle(space);
+        }
+    }
+
+    /// Creates a relationship space with `other`, whose log this device must
+    /// hold: a genesis wrapped for both (`contact.md#accepting`). Returns its
+    /// id and the sealed genesis.
+    pub fn create_relationship(&mut self, other: &[u8; 32]) -> anyhow::Result<(SpaceId, Vec<u8>)> {
+        let ident = self
+            .identity
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("this device has no identity yet"))?;
+        let theirs = self
+            .others
+            .get(other)
+            .and_then(|o| o.log.state().encryption_key.clone())
+            .ok_or_else(|| anyhow::anyhow!("their identity log has no encryption key"))?;
+        let mine = ident
+            .enc
+            .first()
+            .ok_or_else(|| anyhow::anyhow!("no encryption key"))?
+            .public_key()
+            .clone();
+        let (space, sealed) = Space::create_with(
+            cardinal_space::Profile::RELATIONSHIP,
+            cardinal_space::Policy::default(),
+            &ident.log,
+            &self.keys.device.signing,
+            &[&mine, &theirs.public],
+            cardinal_space::relationship::genesis_ops(*other),
+            Some(now_ms()),
+        )?;
+        let id = space.id();
+        let bytes = sealed.encode();
+        self.ingest_space(id, std::slice::from_ref(&bytes))?;
+        Ok((id, bytes))
+    }
+
+    /// Takes a relationship space from its sealed genesis. Returns its id.
+    pub fn accept_relationship(&mut self, genesis: &[u8]) -> anyhow::Result<SpaceId> {
+        let ident = self
+            .identity
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("this device has no identity yet"))?;
+        let sealed = SealedEntry::decode(genesis)?;
+        let space = Space::open_genesis(&sealed, &ident.key_refs(), None)?;
+        let id = space.id();
+        self.ingest_space(id, &[genesis.to_vec()])?;
+        Ok(id)
     }
 
     fn build_identity(
@@ -683,6 +959,7 @@ impl Core {
                 h.rebuild(Vec::new(), &refs, Some(st.clone()));
             }
         }
+        self.settle_all();
     }
 
     /// Installs a freshly created identity (`cardinal init`).
@@ -722,15 +999,25 @@ impl Core {
         let mut v = Vec::new();
         if let Some(l) = self.identity_label() {
             v.push(l);
+            v.extend(self.contacts().iter().map(|c| identity_log_label(&c.identity)));
             v.extend(self.spaces.keys().copied());
         }
         v
+    }
+
+    fn other(&self, label: &[u8; 32]) -> Option<&OtherLog> {
+        self.others
+            .values()
+            .find(|o| identity_log_label(&o.log.id()) == *label)
     }
 
     /// The set behind a label, cloned (empty if not held).
     pub fn set(&self, label: &[u8; 32]) -> MemSet {
         if Some(*label) == self.identity_label() {
             return self.identity.as_ref().expect("identity").set.clone();
+        }
+        if let Some(o) = self.other(label) {
+            return o.set.clone();
         }
         self.spaces
             .get(label)
@@ -742,6 +1029,9 @@ impl Core {
     pub fn get(&self, label: &[u8; 32], id: &[u8; 32]) -> Option<Vec<u8>> {
         if Some(*label) == self.identity_label() {
             return self.identity.as_ref()?.get(id);
+        }
+        if let Some(o) = self.other(label) {
+            return o.get(id);
         }
         self.spaces.get(label)?.get(id)
     }
@@ -889,7 +1179,9 @@ impl Core {
         let st = ident.state();
         self.open_space(space)?;
         let h = self.spaces.get_mut(&space).expect("open");
-        h.ingest(objects, &refs, Some(st))
+        let out = h.ingest(objects, &refs, Some(st));
+        self.settle(&space);
+        out
     }
 
     /// Writes ops to a space. Returns the entries written.
@@ -906,7 +1198,9 @@ impl Core {
             .spaces
             .get_mut(space)
             .ok_or_else(|| anyhow::anyhow!("space not held"))?;
-        h.write(ident, &self.keys, ops)
+        let written = h.write(ident, &self.keys, ops);
+        self.settle(space);
+        written
     }
 
     /// Writes exactly one entry with `ops`.
@@ -923,7 +1217,9 @@ impl Core {
             .spaces
             .get_mut(space)
             .ok_or_else(|| anyhow::anyhow!("space not held"))?;
-        h.write_one(ident, &self.keys, ops)
+        let written = h.write_one(ident, &self.keys, ops);
+        self.settle(space);
+        written
     }
 
     /// The addresses a host's grant gives for a device, leaving out names.
@@ -966,7 +1262,9 @@ impl Core {
             .spaces
             .get_mut(space)
             .ok_or_else(|| anyhow::anyhow!("space not held"))?;
-        h.witness(ident, &self.keys, key)
+        let written = h.witness(ident, &self.keys, key);
+        self.settle(space);
+        written
     }
 
     /// Starts a new epoch in a space if one is due
@@ -980,7 +1278,9 @@ impl Core {
             .spaces
             .get_mut(space)
             .ok_or_else(|| anyhow::anyhow!("space not held"))?;
-        h.rotate_if_due(ident, &self.keys)
+        let written = h.rotate_if_due(ident, &self.keys);
+        self.settle(space);
+        written
     }
 
     /// Writes one entry with `ops` concurrent with `exclude`
@@ -999,7 +1299,9 @@ impl Core {
             .spaces
             .get_mut(space)
             .ok_or_else(|| anyhow::anyhow!("space not held"))?;
-        h.write_concurrent(ident, &self.keys, exclude, ops)
+        let written = h.write_concurrent(ident, &self.keys, exclude, ops);
+        self.settle(space);
+        written
     }
 
     /// The account space, once held and open.

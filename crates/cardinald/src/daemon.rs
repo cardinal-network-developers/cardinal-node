@@ -40,6 +40,12 @@ pub enum PeerKind {
     Restoring,
     /// The same device after it did.
     Proven,
+    /// A device of someone this person has a relationship with (their
+    /// identity, and the device's signing key).
+    Contact([u8; 32], KeyId),
+    /// A session opened with an invitation, with the identity that used it
+    /// or gave it, before they have a relationship.
+    Inviting([u8; 32]),
     /// Anyone else.
     Stranger,
 }
@@ -281,7 +287,10 @@ impl Daemon {
         let store = Arc::new(FsStore::open(paths.blobs(), Fsync::Deferred)?);
         std::fs::create_dir_all(paths.staging())?;
         let directory = Arc::new(Directory::default());
-        directory.update(core.identity.as_ref().map(|i| i.state()).as_deref());
+        directory.update(
+            core.identity.as_ref().map(|i| i.state()).as_deref(),
+            &core.other_states(),
+        );
         let mut ec = EndpointConfig::new(keys.link.clone(), directory.clone());
         ec.udp_gateway = std::env::var("CARDINAL_TEST_UDP_GATEWAY")
             .ok()
@@ -398,8 +407,23 @@ impl Daemon {
                 PeerKind::Restoring
             };
         }
-        if let Some(k) = self.core().is_own_device(&ps) {
+        let known = self.core().is_own_device(&ps);
+        if let Some(k) = known {
             return PeerKind::Own(k);
+        }
+        let contact = {
+            let core = self.core();
+            core.contact_of(&ps).filter(|(identity, _)| {
+                core.contacts().iter().any(|c| c.identity == *identity)
+            })
+        };
+        if let Some((identity, key)) = contact {
+            return PeerKind::Contact(identity, key);
+        }
+        if matches!(s.admission(), cardinal_link::Admission::Secret { .. }) {
+            if let Some(p) = s.peer_identity() {
+                return PeerKind::Inviting(p.identity);
+            }
         }
         if let PairState::Joining {
             identity,
@@ -434,6 +458,24 @@ impl Daemon {
             .collect();
         v.sort_by_key(|c| c.since);
         v.into_iter().map(|c| c.session).collect()
+    }
+
+    /// The sessions with contacts entitled to `label`. A contact's session
+    /// hears of nothing else (`spaces.md#holding-a-space`).
+    pub fn contact_sessions(&self, label: &[u8; 32]) -> Vec<Session> {
+        let open: Vec<([u8; 32], Session)> = lock(&self.sessions)
+            .values()
+            .filter(|c| !c.session.is_closed())
+            .filter_map(|c| match c.kind {
+                PeerKind::Contact(identity, _) => Some((identity, c.session.clone())),
+                _ => None,
+            })
+            .collect();
+        let core = self.core();
+        open.into_iter()
+            .filter(|(identity, _)| core.shares(identity, label))
+            .map(|(_, s)| s)
+            .collect()
     }
 
     /// Whether a device has an open session.
@@ -503,6 +545,8 @@ impl Daemon {
         let name = match kind {
             PeerKind::Own(k) => self.device_name(&k),
             PeerKind::Restoring | PeerKind::Proven => "a device restoring".into(),
+            PeerKind::Contact(_, _) => "a contact's device".into(),
+            PeerKind::Inviting(_) => "someone with an invitation".into(),
             _ => "the device being paired".into(),
         };
         tracing::info!(
@@ -514,7 +558,7 @@ impl Daemon {
                 "incoming"
             }
         );
-        if let PeerKind::Own(k) = kind {
+        if let PeerKind::Own(k) | PeerKind::Contact(_, k) = kind {
             lock(&self.backoff).remove(&k);
             if s.role() == cardinal_link::Role::Responder && !s.is_relayed() {
                 if let Some(a) = s.remote_addr() {
@@ -543,6 +587,9 @@ impl Daemon {
                     s.close("did not prove anything");
                 }
             });
+            return;
+        }
+        if matches!(kind, PeerKind::Inviting(_)) {
             return;
         }
         tokio::spawn(async move { net::sync_all(&d, &s).await });
@@ -577,6 +624,27 @@ impl Daemon {
         access: Access,
     ) -> anyhow::Result<Ingested> {
         let mut core = self.core();
+        let other = match access {
+            Access::Other(identity) => Some(identity),
+            _ => core.other_of_label(&label),
+        };
+        if let Some(identity) = other {
+            let changed = core.ingest_other(identity, &objects)?;
+            let states = core.other_states();
+            let own = core.identity.as_ref().map(|i| i.state());
+            drop(core);
+            if !changed {
+                return Ok(Ingested::default());
+            }
+            self.directory.update(own.as_deref(), &states);
+            self.endpoint.recheck_peers();
+            return Ok(Ingested {
+                new: objects.len(),
+                complete: objects.len(),
+                objects,
+                ..Ingested::default()
+            });
+        }
         if Some(label) == core.identity_label() {
             let ch = core.ingest_identity(&objects, None)?;
             let missing_parents = core.is_waiting(&label);
@@ -618,12 +686,12 @@ impl Daemon {
 
     /// After the identity log changed.
     pub fn identity_changed(&self) {
-        let st = {
+        let (st, others) = {
             let mut core = self.core();
             core.identity_updated();
-            core.identity.as_ref().map(|i| i.state())
+            (core.identity.as_ref().map(|i| i.state()), core.other_states())
         };
-        self.directory.update(st.as_deref());
+        self.directory.update(st.as_deref(), &others);
         self.endpoint.recheck_peers();
         let conns: Vec<Conn> = lock(&self.sessions).values().cloned().collect();
         for c in conns {
@@ -646,7 +714,7 @@ impl Daemon {
             identity: id,
             signing_key: self.keys.signing.clone(),
         }));
-        self.directory.update(Some(&st));
+        self.directory.update(Some(&st), &[]);
         let prev = std::mem::take(&mut *lock(&self.pairing));
         let admin_name = match &prev {
             PairState::Joining { admin_name, .. } => admin_name.clone(),
@@ -839,11 +907,22 @@ impl Daemon {
                 return;
             };
             let st = ident.state();
-            st.keys
-                .values()
-                .filter(|k| k.key != self.keys.key())
+            let own = st.keys.values().filter(|k| k.key != self.keys.key());
+            let mut devices: Vec<_> = own
                 .filter_map(|k| Some((k.key, k.link_key.clone()?)))
-                .collect()
+                .collect();
+            for c in core.contacts() {
+                let Some(o) = core.others.get(&c.identity) else {
+                    continue;
+                };
+                let st = o.log.state();
+                devices.extend(
+                    st.keys
+                        .values()
+                        .filter_map(|k| Some((k.key, k.link_key.clone()?))),
+                );
+            }
+            devices
         };
         for (key, link) in devices {
             if self.is_direct(link.x25519()) {
@@ -903,7 +982,15 @@ impl Daemon {
                 .get(&hex::encode(key))
                 .cloned()
                 .unwrap_or_default();
-            let peers = self.config().peers.clone();
+            // Manual peers are this person's own: no use for a contact.
+            let own = self.core().identity.as_ref().is_some_and(|i| {
+                i.state().keys.contains_key(key)
+            });
+            let peers = if own {
+                self.config().peers.clone()
+            } else {
+                Vec::new()
+            };
             let manual = peers
                 .into_iter()
                 .filter_map(|p| match book.manual.get(&p) {

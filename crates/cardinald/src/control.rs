@@ -201,6 +201,18 @@ async fn handle(d: &Arc<Daemon>, req: &Value) -> anyhow::Result<Value> {
             let lost = req.get("lost").and_then(|v| v.as_bool()).unwrap_or(false);
             remove_device(d, arg(req, "who")?, words(req), lost).await
         }
+        "invite" => {
+            let address = req.get("address").and_then(|v| v.as_str());
+            let name = req.get("name").and_then(|v| v.as_str());
+            crate::contacts::invite(d, address, name)
+        }
+        "accept" => {
+            let name = req.get("name").and_then(|v| v.as_str());
+            crate::contacts::accept(d, arg(req, "code")?, name).await
+        }
+        "contacts" => Ok(crate::contacts::list(d)),
+        "say" => crate::contacts::say(d, arg(req, "who")?, arg(req, "text")?),
+        "messages" => crate::contacts::messages(d, arg(req, "who")?),
         "recovery-check" => {
             crate::recovery::root_from_words(d, arg(req, "words")?)?;
             Ok(json!({}))
@@ -450,7 +462,7 @@ fn reload(d: &Arc<Daemon>) -> anyhow::Result<()> {
         identity: id,
         signing_key: d.keys.signing.clone(),
     }));
-    d.directory.update(Some(&st));
+    d.directory.update(Some(&st), &[]);
     let mut config = crate::config::Config::load(&d.paths.config())?;
     config.this_run = d.config().this_run.clone();
     *d.config() = config;

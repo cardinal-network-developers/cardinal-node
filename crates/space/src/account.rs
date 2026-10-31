@@ -4,7 +4,7 @@
 use cardinal_encoding::{Record, Value};
 use cardinal_identity::KeyId;
 
-use crate::entry::{NodeId, NodeKind, SpaceId, SpaceOp};
+use crate::entry::{IdentityId, NodeId, NodeKind, SpaceId, SpaceOp};
 use crate::state::{State, ROOT};
 
 /// Contact kind.
@@ -60,6 +60,19 @@ pub fn create_device(key: &KeyId, name: &str, always_on: bool, is_host: bool) ->
             .with(2, name)
             .with(3, always_on)
             .with(4, is_host),
+    )
+}
+
+/// `create` of a contact node.
+pub fn create_contact(identity: &IdentityId, petname: &str, space: &SpaceId) -> SpaceOp {
+    SpaceOp::create(
+        NodeKind::Uint(CONTACT),
+        ROOT,
+        &short_key(identity),
+        Record::new()
+            .with(1, *identity)
+            .with(2, petname)
+            .with(3, *space),
     )
 }
 
@@ -163,6 +176,33 @@ pub struct SpaceRecord {
 fn last(n: &crate::state::Node, key: u64) -> Option<&Value> {
     // the value with the greatest entry id, for display when in conflict
     n.values(key).iter().rev().find_map(|v| v.value.as_ref())
+}
+
+/// A person this identity has a relationship with.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ContactRecord {
+    /// Their identity.
+    pub identity: IdentityId,
+    /// What this person calls them.
+    pub petname: String,
+    /// The relationship space.
+    pub space: SpaceId,
+}
+
+/// Contact nodes that are not deleted.
+pub fn contacts(state: &State) -> Vec<ContactRecord> {
+    state
+        .children(&ROOT)
+        .into_iter()
+        .filter(|n| n.kind == NodeKind::Uint(CONTACT) && !n.deleted)
+        .filter_map(|n| {
+            Some(ContactRecord {
+                identity: last(n, 1)?.as_bytes()?.try_into().ok()?,
+                petname: last(n, 2)?.as_text()?.to_owned(),
+                space: last(n, 3)?.as_bytes()?.try_into().ok()?,
+            })
+        })
+        .collect()
 }
 
 /// Device nodes that are not deleted.

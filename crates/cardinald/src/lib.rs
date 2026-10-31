@@ -8,6 +8,7 @@
 pub mod applog;
 pub mod cleanup;
 pub mod config;
+pub mod contacts;
 pub mod control;
 pub mod copies;
 pub mod core;

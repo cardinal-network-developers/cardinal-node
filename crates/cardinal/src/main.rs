@@ -118,6 +118,39 @@ enum Cmd {
         #[arg(long)]
         lost: bool,
     },
+    /// Make an invitation for someone else. Send it the way you would send
+    /// a house key: whoever uses it becomes your contact.
+    Invite {
+        /// Where they can reach this device (ip:port); by default its
+        /// address on the local network.
+        #[arg(long)]
+        address: Option<String>,
+        /// The name to suggest they know you by.
+        #[arg(long)]
+        name: Option<String>,
+    },
+    /// Use an invitation someone gave you.
+    Accept {
+        /// The invitation, starting `cardinal:`.
+        code: String,
+        /// What to call them; by default the name they suggested.
+        #[arg(long)]
+        name: Option<String>,
+    },
+    /// The people you are connected to.
+    Contacts,
+    /// Send a message to a contact.
+    Say {
+        /// Who, as `cardinal contacts` shows.
+        who: String,
+        /// What to say.
+        text: String,
+    },
+    /// Your conversation with a contact.
+    Messages {
+        /// Who, as `cardinal contacts` shows.
+        who: String,
+    },
     /// Make this device a host for your own devices: it keeps a full copy
     /// of your files, and can bring them back if every other device is lost.
     Host {
@@ -1159,6 +1192,41 @@ async fn client(cmd: Cmd) -> anyhow::Result<()> {
                 "Your old devices are still listed under `cardinal devices`; remove any you \
                  lost with `cardinal remove-device`."
             );
+            Ok(())
+        }
+        Cmd::Invite { address, name } => {
+            let req = json!({"cmd": "invite", "address": address, "name": name});
+            let v = call(&paths, req).await?;
+            println!("{}", v["code"].as_str().unwrap_or(""));
+            Ok(())
+        }
+        Cmd::Accept { code, name } => {
+            let req = json!({"cmd": "accept", "code": code, "name": name});
+            let v = call(&paths, req).await?;
+            println!("Connected to {}.", v["name"].as_str().unwrap_or(""));
+            Ok(())
+        }
+        Cmd::Contacts => {
+            let v = call(&paths, json!({"cmd": "contacts"})).await?;
+            for c in v["contacts"].as_array().into_iter().flatten() {
+                println!(
+                    "{}  [{}]",
+                    c["name"].as_str().unwrap_or(""),
+                    c["identity"].as_str().unwrap_or("")
+                );
+            }
+            Ok(())
+        }
+        Cmd::Say { who, text } => {
+            call(&paths, json!({"cmd": "say", "who": who, "text": text})).await?;
+            Ok(())
+        }
+        Cmd::Messages { who } => {
+            let v = call(&paths, json!({"cmd": "messages", "who": who})).await?;
+            for m in v["messages"].as_array().into_iter().flatten() {
+                let by = if m["mine"] == true { "you" } else { who.as_str() };
+                println!("{by}: {}", m["text"].as_str().unwrap_or(""));
+            }
             Ok(())
         }
         Cmd::Host { addresses, off } => {

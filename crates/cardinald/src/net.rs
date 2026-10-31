@@ -56,6 +56,8 @@ pub enum Access {
     /// The admin device this device just paired with: only its identity
     /// log, which this device is about to join.
     Join([u8; 32]),
+    /// A contact's identity log: to be kept, not joined.
+    Other([u8; 32]),
     /// Nothing; answer as if the set were empty.
     None,
 }
@@ -80,6 +82,18 @@ impl Daemon {
             }
             PeerKind::Proven => {
                 if self.core().identity_label() == Some(*label) {
+                    Access::Full
+                } else {
+                    Access::None
+                }
+            }
+            PeerKind::Contact(identity, _) | PeerKind::Inviting(identity) => {
+                let core = self.core();
+                if *label == identity_log_label(&identity) {
+                    Access::Other(identity)
+                } else if Some(*label) == core.identity_label()
+                    || core.shares(&identity, label)
+                {
                     Access::Full
                 } else {
                     Access::None
@@ -118,7 +132,10 @@ pub async fn serve(d: Arc<Daemon>, s: Session, gen: u64) {
 
 /// Reconciles every set with a peer: identity log first, then spaces.
 pub async fn sync_all(d: &Arc<Daemon>, s: &Session) {
-    let labels = d.core().labels();
+    let labels = match d.classify(s) {
+        PeerKind::Contact(identity, _) => d.core().labels_with(&identity),
+        _ => d.core().labels(),
+    };
     for label in labels {
         if let Err(e) = reconcile(d, s, label).await {
             tracing::debug!(
@@ -140,6 +157,9 @@ async fn handle_stream(d: &Arc<Daemon>, s: &Session, mut st: Stream) -> anyhow::
     }
     if st.service() == Service::RENDEZVOUS || st.service() == Service::RELAY {
         return crate::rendezvous::serve(d, s, st).await;
+    }
+    if st.service() == Service::CONTACT {
+        return crate::contacts::serve(d, s, st).await;
     }
     if st.service() == Service::BLOB {
         tracing::trace!("blob stream {} accepted", st.id());
@@ -191,7 +211,7 @@ async fn handle_stream(d: &Arc<Daemon>, s: &Session, mut st: Stream) -> anyhow::
             }
         }
         Message::Want { label, ids } => {
-            if d.access(kind, &label) == Access::Full {
+            if matches!(d.access(kind, &label), Access::Full | Access::Other(_)) {
                 let msgs = {
                     let core = d.core();
                     cardinal_sync::answer_want(label, &ids, |id| core.get(&label, id))
@@ -306,7 +326,10 @@ pub async fn fetch_objects(
         }
     }
     // Check every object against the ids asked for.
-    let is_identity = matches!(access, Access::Join(_)) || Some(label) == d.core().identity_label();
+    let is_identity = matches!(access, Access::Join(_) | Access::Other(_)) || {
+        let core = d.core();
+        Some(label) == core.identity_label() || core.other_of_label(&label).is_some()
+    };
     got.retain(|b| {
         let id = if is_identity {
             match cardinal_identity::IdentityEntry::decode(b) {

@@ -122,6 +122,10 @@ impl Paths {
     pub fn link_state(&self) -> PathBuf {
         self.home.join("link.json")
     }
+    /// Other people's identity logs.
+    pub fn others(&self) -> PathBuf {
+        self.home.join("others")
+    }
     /// Known addresses of this person's devices.
     pub fn peers(&self) -> PathBuf {
         self.home.join("peers.json")
