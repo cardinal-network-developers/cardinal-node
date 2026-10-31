@@ -235,6 +235,8 @@ fn a_device_that_has_not_heard_goes_on_trusting_the_one_removed() {
     a.stop();
     b.start();
     c.start();
+    b.wait_mounted();
+    c.wait_mounted();
 
     std::fs::write(c.p("built-on.txt"), "1\n").unwrap();
     c.cli(&["flush"]);

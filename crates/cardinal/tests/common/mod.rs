@@ -200,11 +200,17 @@ pub fn fuse_available() -> bool {
 }
 
 pub fn free_port() -> u16 {
-    std::net::TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
+    // A daemon takes the port on both carriers, and tests run side by side.
+    static GIVEN: std::sync::Mutex<Vec<u16>> = std::sync::Mutex::new(Vec::new());
+    loop {
+        let tcp = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = tcp.local_addr().unwrap().port();
+        let mut given = GIVEN.lock().unwrap();
+        if std::net::UdpSocket::bind(("127.0.0.1", port)).is_ok() && !given.contains(&port) {
+            given.push(port);
+            return port;
+        }
+    }
 }
 
 pub fn pair(a: &Dev, b: &Dev) {
