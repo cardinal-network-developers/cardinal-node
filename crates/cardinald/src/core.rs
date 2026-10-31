@@ -926,6 +926,20 @@ impl Core {
         h.write_one(ident, &self.keys, ops)
     }
 
+    /// The addresses a host's grant gives for a device, leaving out names.
+    pub fn host_addresses(&self, device: &KeyId) -> Vec<std::net::SocketAddr> {
+        let Some(space) = self.account().and_then(|a| a.space.as_ref()) else {
+            return Vec::new();
+        };
+        cardinal_space::account::hosts(space.state())
+            .iter()
+            .filter_map(|h| cardinal_space::grant::Grant::open(&h.grant))
+            .filter(|(_, signer)| signer == device)
+            .flat_map(|(g, _)| g.endpoints)
+            .filter_map(|e| e.socket_addr())
+            .collect()
+    }
+
     /// Whether this device has heard that it was removed.
     pub fn removed(&self) -> bool {
         self.identity

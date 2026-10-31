@@ -138,6 +138,9 @@ async fn handle_stream(d: &Arc<Daemon>, s: &Session, mut st: Stream) -> anyhow::
         s.close("prove first");
         return Ok(());
     }
+    if st.service() == Service::RENDEZVOUS || st.service() == Service::RELAY {
+        return crate::rendezvous::serve(d, s, st).await;
+    }
     if st.service() == Service::BLOB {
         tracing::trace!("blob stream {} accepted", st.id());
         return serve_blob(d, st).await;

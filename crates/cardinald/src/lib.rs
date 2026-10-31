@@ -22,6 +22,7 @@ pub mod news;
 pub mod pair;
 pub mod paths;
 pub mod recovery;
+pub mod rendezvous;
 pub mod sched;
 pub mod setup;
 pub mod speedtest;

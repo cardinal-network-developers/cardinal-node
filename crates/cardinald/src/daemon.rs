@@ -209,6 +209,8 @@ pub struct Daemon {
     pub news: Mutex<crate::news::Waiting>,
     /// Static keys of restore sessions that proved the root key.
     proven: Mutex<HashSet<[u8; 32]>>,
+    /// Rendezvous and relay, as a device and as a host.
+    pub rendezvous: crate::rendezvous::Rendezvous,
     /// Pairing.
     pub pairing: Mutex<PairState>,
     /// The mount, if mounted.
@@ -281,6 +283,9 @@ impl Daemon {
         let directory = Arc::new(Directory::default());
         directory.update(core.identity.as_ref().map(|i| i.state()).as_deref());
         let mut ec = EndpointConfig::new(keys.link.clone(), directory.clone());
+        ec.udp_gateway = std::env::var("CARDINAL_TEST_UDP_GATEWAY")
+            .ok()
+            .and_then(|a| a.parse().ok());
         ec.identity = core.identity.as_ref().map(|i| LocalIdentity {
             identity: i.id(),
             signing_key: keys.signing.clone(),
@@ -298,11 +303,13 @@ impl Daemon {
                 paths.config().display()
             )
         })?;
+        // Nothing gets to a device behind a NAT, in the tests.
+        let gateway_free = ec.udp_gateway.is_none();
         let endpoint = Endpoint::bind(
             ec,
             Bind {
                 udp: config.uses_udp().then_some(listen),
-                tcp: Some(listen),
+                tcp: gateway_free.then_some(listen),
             },
         )
         .await
@@ -340,6 +347,7 @@ impl Daemon {
             blob_stats: Mutex::new(HashMap::new()),
             news: Mutex::new(HashMap::new()),
             proven: Mutex::new(HashSet::new()),
+            rendezvous: Default::default(),
             copies: crate::copies::Tracker::load(copies_path, crate::copies::Rules::from_env()),
             cleanup: crate::cleanup::Cleaner::load(old_versions),
             speedtest: crate::speedtest::Limiter::default(),
@@ -437,13 +445,22 @@ impl Daemon {
 
     /// What a device's session runs over.
     pub fn session_carrier(&self, link_x25519: &[u8; 32]) -> Option<&'static str> {
-        let carrier = lock(&self.sessions)
-            .get(link_x25519)
-            .and_then(|c| c.session.carrier())?;
-        Some(match carrier {
+        let sessions = lock(&self.sessions);
+        let s = &sessions.get(link_x25519)?.session;
+        if s.is_relayed() {
+            return Some("relay");
+        }
+        Some(match s.carrier()? {
             CarrierKind::Udp => "UDP",
             CarrierKind::Tcp => "TCP",
         })
+    }
+
+    /// Whether a device has an open session that does not go through a host.
+    pub fn is_direct(&self, link_x25519: &[u8; 32]) -> bool {
+        lock(&self.sessions)
+            .get(link_x25519)
+            .is_some_and(|c| !c.session.is_closed() && !c.session.is_relayed())
     }
 
     /// The remote address of a device's session.
@@ -511,6 +528,9 @@ impl Daemon {
         let d = self.clone();
         let s2 = s.clone();
         tokio::spawn(net::serve(d, s2, gen));
+        if let PeerKind::Own(k) = kind {
+            tokio::spawn(crate::rendezvous::session_opened(self.clone(), s.clone(), k));
+        }
         let d = self.clone();
         if kind == PeerKind::Restoring {
             tokio::spawn(async move {
@@ -531,6 +551,7 @@ impl Daemon {
             m.remove(peer_static);
             lock(&self.proven).remove(peer_static);
             tracing::info!("disconnected from {}", short(peer_static));
+            crate::rendezvous::session_closed(self, peer_static);
         }
     }
 
@@ -692,6 +713,9 @@ impl Daemon {
             if let Err(e) = d.ensure_placement() {
                 tracing::debug!("housekeeping: {e:#}");
             }
+            if let Err(e) = crate::host::refresh(&d) {
+                tracing::debug!("housekeeping: {e:#}");
+            }
             // Mounting blocks, and may wait for another mount or unmount.
             let d2 = d.clone();
             let _ = tokio::task::spawn_blocking(move || d2.ensure_mounted()).await;
@@ -846,6 +870,7 @@ impl Daemon {
                 }
             });
         }
+        tokio::spawn(crate::rendezvous::ask_hosts(self.clone()));
     }
 
     /// Opens a session at an address, over UDP if something answers there,
@@ -888,6 +913,13 @@ impl Daemon {
         let mut out: Vec<(SocketAddr, Option<String>)> = Vec::new();
         for a in known {
             if let Ok(sa) = a.parse() {
+                out.push((sa, None));
+            }
+        }
+        // What a host's grant gives, unless that is a name: names are for
+        // the recovery sheet, and nothing here should depend on a registrar.
+        for sa in self.core().host_addresses(key) {
+            if !out.iter().any(|(x, _)| *x == sa) {
                 out.push((sa, None));
             }
         }

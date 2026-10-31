@@ -20,7 +20,7 @@ use cardinal_encoding::{Record, Value};
 use cardinal_identity::Power;
 use cardinal_link::{Admission, LinkError, Priority, Role, Service, Session, Stream, Target};
 use cardinal_space::account;
-use cardinal_space::grant::{Endpoint, Grant, STORAGE};
+use cardinal_space::grant::{Endpoint, Grant, RELAY, RENDEZVOUS, STORAGE};
 use cardinal_space::SpaceOp;
 use cardinal_sync::identity_log_label;
 use serde_json::{json, Value as Json};
@@ -126,7 +126,7 @@ pub fn enable(d: &Arc<Daemon>, addresses: &[String]) -> anyhow::Result<Json> {
     let grant = Grant {
         host: identity,
         served: identity,
-        services: vec![STORAGE],
+        services: vec![STORAGE, RENDEZVOUS, RELAY],
         storage_bytes: 0,
         retention_days: 0,
         endpoints,
@@ -187,6 +187,31 @@ fn logout_warning() -> Option<String> {
              Keep it running with: sudo loginctl enable-linger {user}"
         )
     })
+}
+
+/// Offers what this version of a host offers, on a device that became one
+/// under an older version.
+pub fn refresh(d: &Arc<Daemon>) -> anyhow::Result<()> {
+    if !d.config().host {
+        return Ok(());
+    }
+    let me = d.keys.key();
+    let old = {
+        let core = d.core();
+        let Some(space) = core.account().and_then(|a| a.space.as_ref()) else {
+            return Ok(());
+        };
+        account::hosts(space.state())
+            .iter()
+            .filter_map(|h| Grant::open(&h.grant))
+            .find(|(_, signer)| *signer == me)
+            .map(|(g, _)| g)
+    };
+    let Some(old) = old.filter(|g| !g.services.contains(&RENDEZVOUS)) else {
+        return Ok(());
+    };
+    let addresses: Vec<String> = old.endpoints.iter().map(Endpoint::to_string).collect();
+    enable(d, &addresses).map(|_| ())
 }
 
 /// Stops being a host: this device keeps what it has, and no longer offers
