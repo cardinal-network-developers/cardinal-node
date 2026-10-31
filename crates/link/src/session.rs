@@ -135,6 +135,8 @@ pub(crate) async fn drive(inner: Arc<SessionInner>) {
             None => notified.await,
         }
     }
+    let path = inner.lock().path.clone();
+    path.close();
     if let Some(ep) = inner.endpoint.upgrade() {
         ep.remove_session(inner.local_index);
     }

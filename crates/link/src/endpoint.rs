@@ -358,7 +358,7 @@ impl Endpoint {
                     };
                     let Some(ep) = weak.upgrade() else { break };
                     let (_, abort) = spawn_tcp(stream, Arc::new(WeakIngress(weak.clone())));
-                    lock(&ep.tasks).push(abort);
+                    ep.track(abort);
                 }
             });
             lock(&inner.tasks).push(h.abort_handle());
@@ -495,7 +495,7 @@ impl Endpoint {
                     .await
                     .map_err(|_| LinkError::Timeout)??;
                 let (path, abort) = spawn_tcp(stream, Arc::new(WeakIngress(Arc::downgrade(ep))));
-                lock(&ep.tasks).push(abort);
+                ep.track(abort);
                 path
             }
         };
@@ -509,7 +509,10 @@ impl Endpoint {
         });
         let mut indexes = Vec::new();
         let result = loop {
-            let (index, pkt) = ep.new_initiation(&attempt)?;
+            let (index, pkt) = match ep.new_initiation(&attempt) {
+                Ok(x) => x,
+                Err(e) => break Err(e),
+            };
             indexes.push(index);
             let _ = path.send(bytes::Bytes::copy_from_slice(&pkt[..])).await;
             let retry = tokio::time::Instant::now() + ep.config.handshake_retry;
@@ -534,7 +537,13 @@ impl Endpoint {
                 s.pending.remove(&i);
             }
         }
-        let inner = result?;
+        let inner = match result {
+            Ok(inner) => inner,
+            Err(e) => {
+                path.close();
+                return Err(e);
+            }
+        };
         let session = Session { inner };
         match tokio::time::timeout_at(deadline, session.wait_admitted()).await {
             Ok(Ok(())) => Ok(session),
@@ -588,6 +597,13 @@ impl EndpointInner {
 
     /// Stops taking packets and closes every session, each sending its
     /// peer a `close` frame. False if the endpoint was closed already.
+    /// Keeps a connection's task to stop with the endpoint.
+    fn track(&self, task: AbortHandle) {
+        let mut tasks = lock(&self.tasks);
+        tasks.retain(|t| !t.is_finished());
+        tasks.push(task);
+    }
+
     fn close_sessions(&self) -> bool {
         if self.closed.swap(true, Ordering::Relaxed) {
             return false;

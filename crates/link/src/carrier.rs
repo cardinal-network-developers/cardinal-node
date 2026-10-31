@@ -17,7 +17,7 @@ use std::time::Duration;
 use bytes::{BufMut, Bytes, BytesMut};
 use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader, BufWriter};
 use tokio::net::{TcpStream, UdpSocket};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Notify};
 
 use crate::packet::{self, MAX_DATAGRAM};
 
@@ -45,6 +45,24 @@ pub(crate) struct TcpPath {
     peer: SocketAddr,
     tx: mpsc::Sender<Bytes>,
     closed: AtomicBool,
+    /// Tells the writer to send what is queued and end the connection.
+    finish: Notify,
+}
+
+impl TcpPath {
+    fn close(&self) {
+        self.closed.store(true, Ordering::Relaxed);
+        self.finish.notify_one();
+    }
+}
+
+/// Ends the connection when the reader stops, however it stops.
+struct CloseOnDrop(Arc<TcpPath>);
+
+impl Drop for CloseOnDrop {
+    fn drop(&mut self) {
+        self.0.close();
+    }
 }
 
 /// Where a packet came from, and where replies go.
@@ -127,6 +145,14 @@ impl Path {
             Path::Tcp(t) => t.closed.load(Ordering::Relaxed),
             Path::Relayed { via, .. } => via.is_closed(),
             _ => false,
+        }
+    }
+
+    /// Ends the connection under this path, if it has one of its own,
+    /// once what was sent has gone. A relay's belongs to the host's session.
+    pub fn close(&self) {
+        if let Path::Tcp(t) = self {
+            t.close();
         }
     }
 
@@ -221,6 +247,7 @@ pub(crate) fn spawn_tcp(
         peer,
         tx,
         closed: AtomicBool::new(false),
+        finish: Notify::new(),
     });
     let path = Path::Tcp(tp.clone());
 
@@ -229,7 +256,17 @@ pub(crate) fn spawn_tcp(
     let wtp = tp.clone();
     tokio::spawn(async move {
         let mut w = BufWriter::with_capacity(256 * 1024, tx_half);
-        'outer: while let Some(p) = rx.recv().await {
+        'outer: loop {
+            // The writer holds a sender itself, so the queue never ends on
+            // its own: only `finish` ends the connection.
+            let p = tokio::select! {
+                biased;
+                p = rx.recv() => p,
+                _ = wtp.finish.notified() => None,
+            };
+            let Some(p) = p else {
+                break;
+            };
             let mut next = Some(p);
             while let Some(p) = next.take() {
                 if w.write_all(&p).await.is_err() {
@@ -250,6 +287,7 @@ pub(crate) fn spawn_tcp(
     // Reader.
     let rpath = path.clone();
     let reader = tokio::spawn(async move {
+        let _close = CloseOnDrop(tp);
         let mut r = BufReader::with_capacity(256 * 1024, rx_half);
         let mut buf = vec![0u8; MAX_DATAGRAM];
         loop {
@@ -273,7 +311,6 @@ pub(crate) fn spawn_tcp(
                 ingress.flush();
             }
         }
-        tp.closed.store(true, Ordering::Relaxed);
     });
     (path, reader.abort_handle())
 }
