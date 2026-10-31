@@ -60,6 +60,9 @@ pub struct Conn {
 /// How long a device gets to answer over UDP before TCP is tried. Most of a
 /// failed attempt is an older device that does not listen there.
 const UDP_WITHIN: Duration = Duration::from_secs(2);
+/// How long it then gets over TCP. A device that does not answer is usually
+/// the wrong one, so what an address costs should stay small.
+const TCP_WITHIN: Duration = Duration::from_secs(3);
 
 /// Addresses of this person's devices, learned from pairing, discovery,
 /// and successful connections.
@@ -859,7 +862,8 @@ impl Daemon {
                 ok => return ok,
             }
         }
-        self.endpoint.connect(target(CarrierKind::Tcp)).await
+        let tcp = target(CarrierKind::Tcp).within(TCP_WITHIN);
+        self.endpoint.connect(tcp).await
     }
 
     async fn candidate_addrs(&self, key: &KeyId) -> Vec<(SocketAddr, Option<String>)> {
