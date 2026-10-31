@@ -170,6 +170,11 @@ pub fn without_commits<R>(f: impl FnOnce() -> R) -> R {
 pub fn commit(d: &Arc<Daemon>, tree: &Mutex<Tree>, space: &SpaceId) -> anyhow::Result<usize> {
     let _one = COMMITTING.lock().unwrap_or_else(|e| e.into_inner());
     let start = Instant::now();
+    // Content is keyed by the epoch, so a new one must come first.
+    let rotated = d.core().rotate_if_due(space)?;
+    if let Some(entry) = rotated {
+        d.push(space, vec![entry]);
+    }
     // A: what needs encoding.
     let to_encode: Vec<(u64, u64, Arc<Staged>)> = {
         let t = lock(tree);
@@ -654,11 +659,13 @@ mod tests {
     use super::*;
     use crate::config::Config;
     use crate::keys::Keys;
+    use cardinal_crypto::HybridKeyPair;
     use crate::paths::Paths;
     use crate::setup;
 
     struct Fx {
         _dir: tempfile::TempDir,
+        keys: Arc<Keys>,
         core: Core,
         space: SpaceId,
         t: Tree,
@@ -671,12 +678,13 @@ mod tests {
             let p = setup::prepare(&paths).unwrap();
             setup::install(&paths, p, &Config::default()).unwrap();
             let keys = Arc::new(Keys::load_or_create(&paths.device_key()).unwrap());
-            let core = Core::load(&paths, keys).unwrap();
+            let core = Core::load(&paths, keys.clone()).unwrap();
             let space = core.files_id().unwrap();
             std::fs::create_dir_all(paths.staging()).unwrap();
             let t = Tree::new(paths.staging(), paths.local());
             let mut fx = Fx {
                 _dir: dir,
+                keys,
                 core,
                 space,
                 t,
@@ -687,6 +695,30 @@ mod tests {
 
         fn sp(&self) -> &Space {
             self.core.spaces[&self.space].space.as_ref().unwrap()
+        }
+
+        /// As a removal on another device does, once its log entry
+        /// arrives: the identity moves to a new encryption key.
+        fn new_identity_key(&mut self) {
+            let keys = self.keys.clone();
+            let ident = self.core.identity.as_mut().unwrap();
+            let current = ident
+                .enc
+                .first()
+                .map(|k| HybridKeyPair::from_secret_bytes(&k.secret_bytes()));
+            let new = HybridKeyPair::generate();
+            let e = ident
+                .log
+                .set_encryption_key(&keys.device.signing, &new, current.as_ref())
+                .unwrap();
+            ident.record_own(&e).unwrap();
+            self.core.identity_updated();
+        }
+
+        /// What a restart loads from disk.
+        fn restart(&mut self) {
+            let paths = Paths::at(self._dir.path());
+            self.core = Core::load(&paths, self.keys.clone()).unwrap();
         }
 
         /// What the mount's refresh does when entries arrive.
@@ -1142,5 +1174,54 @@ mod tests {
         let f = Files::new(fx.sp());
         let list = f.list_path("d7/e").unwrap();
         assert_eq!(list.len(), 10);
+    }
+
+    /// Nothing tells this device a removal happened, and it may restart
+    /// first: the rule follows from the identity log, which every device
+    /// has (`spaces.md#when-to-rotate`).
+    #[test]
+    fn the_next_write_after_the_identity_key_changed_starts_a_new_epoch() {
+        let mut fx = Fx::new();
+        let before = fx.sp().current_epoch().unwrap();
+        fx.new_identity_key();
+        fx.restart();
+        assert_eq!(fx.sp().current_epoch(), Some(before));
+
+        fx.write_in(ROOT_INO, "a", b"a");
+        assert_eq!(fx.commit(), 1);
+        let after = fx.sp().current_epoch().unwrap();
+        assert_ne!(after, before);
+
+        // Once is enough.
+        fx.write_in(ROOT_INO, "b", b"b");
+        fx.commit();
+        assert_eq!(fx.sp().current_epoch(), Some(after));
+        assert!(fx.core.rotate_if_due(&fx.space).unwrap().is_none());
+    }
+
+    /// Content is keyed by the epoch, so a commit asks for the rotation by
+    /// itself before it encodes anything.
+    #[test]
+    fn a_rotation_due_can_be_written_on_its_own() {
+        let mut fx = Fx::new();
+        let before = fx.sp().current_epoch().unwrap();
+        assert!(fx.core.rotate_if_due(&fx.space).unwrap().is_none());
+        fx.new_identity_key();
+        assert!(fx.core.rotate_if_due(&fx.space).unwrap().is_some());
+        assert_ne!(fx.sp().current_epoch(), Some(before));
+        assert!(fx.core.rotate_if_due(&fx.space).unwrap().is_none());
+    }
+
+    /// A change made without having seen others cannot go under an epoch
+    /// that is due to end.
+    #[test]
+    fn nothing_is_written_beside_a_rotation_that_is_due() {
+        let mut fx = Fx::new();
+        let (first, _) = fx.core.write_entry(&fx.space, Vec::new()).unwrap();
+        fx.new_identity_key();
+        let refused = fx
+            .core
+            .write_entry_concurrent(&fx.space, &[first], Vec::new());
+        assert!(refused.unwrap_err().to_string().contains("rotation"));
     }
 }

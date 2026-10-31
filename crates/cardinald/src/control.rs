@@ -11,11 +11,12 @@ use cardinal_identity::Power;
 use cardinal_space::account;
 use cardinal_space::files::{self, Content, Files, FILE_CONTENT};
 use cardinal_space::state::State;
-use cardinal_space::{NodeId, SpaceOpBody, ROOT};
+use cardinal_space::{NodeId, SpaceId, SpaceOpBody, ROOT};
 use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 
+use crate::core::short;
 use crate::daemon::{Daemon, PairState};
 
 /// Sends a request to a running daemon and returns its reply.
@@ -801,6 +802,14 @@ fn debug_tree(d: &Daemon) -> anyhow::Result<Value> {
         }
         hex::encode(&h.finalize().as_bytes()[..16])
     };
+    let epoch = {
+        let core = d.core();
+        core.spaces[&files]
+            .space
+            .as_ref()
+            .and_then(|s| s.current_epoch())
+            .map(hex::encode)
+    };
     let (state, snap) = {
         let core = d.core();
         let h = &core.spaces[&files];
@@ -812,7 +821,7 @@ fn debug_tree(d: &Daemon) -> anyhow::Result<Value> {
     };
     let m = d.mount.lock().unwrap_or_else(|e| e.into_inner());
     let Some(m) = m.as_ref() else {
-        return Ok(json!({"heads": heads, "mounted": false}));
+        return Ok(json!({"heads": heads, "epoch": epoch, "mounted": false}));
     };
     let t = m.tree().lock().unwrap_or_else(|e| e.into_inner());
     let mut items = Vec::new();
@@ -857,7 +866,7 @@ fn debug_tree(d: &Daemon) -> anyhow::Result<Value> {
         .map(|e| json!({"node": hex::encode(&e.node[..6]), "name": e.name}))
         .collect();
     Ok(json!({
-        "heads": heads, "state": state, "mounted": true, "pending": t.has_pending(),
+        "heads": heads, "epoch": epoch, "state": state, "mounted": true, "pending": t.has_pending(),
         "items": items, "stuck": stuck, "unshown": unshown,
         "deleted": t.deleted.len(), "settle": t.settle.len(),
     }))
@@ -951,13 +960,22 @@ fn remove_device(d: &Arc<Daemon>, who: &str, words: Option<&str>) -> anyhow::Res
                 i.enc = i.log.key_chain(k);
             }
         }
-        for h in core.spaces.values_mut() {
-            h.needs_rotate = true;
-        }
         vec![e1.encode(), e2.encode()]
     };
     d.identity_changed();
     d.push_identity(entries);
+    // Every space moves to keys it never held, now rather than at the next
+    // write here. Any device's next write would do it, so one that fails
+    // is not lost.
+    let spaces: Vec<SpaceId> = d.core().spaces.keys().copied().collect();
+    for space in &spaces {
+        let rotated = d.core().rotate_if_due(space);
+        match rotated {
+            Ok(Some(entry)) => d.push(space, vec![entry]),
+            Ok(None) => {}
+            Err(e) => tracing::warn!("no new keys yet for {}: {e:#}", short(space)),
+        }
+    }
     // forget its device node and its placements
     let acc = {
         let core = d.core();

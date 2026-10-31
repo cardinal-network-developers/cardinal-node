@@ -364,6 +364,20 @@ impl Space {
             .map(|s| (*s, self.dag.get(s).expect("entry").epoch()))
     }
 
+    /// Whether the current epoch was wrapped for the identity encryption
+    /// key `key`. If it was not, the epoch began before the identity moved
+    /// to `key`, so a device removed since can still read it, and the next
+    /// write must start a new one (`spaces.md#when-to-rotate`).
+    pub fn epoch_wrapped_for(&self, key: &HybridKeyPair) -> bool {
+        let Some((entry, epoch)) = self.current_epoch else {
+            return true;
+        };
+        match self.sealed.get(&entry).and_then(SealedEntry::wraps) {
+            Some(wraps) => EpochKey::open_wraps(wraps, &epoch, &[key]).is_some(),
+            None => true,
+        }
+    }
+
     /// Writes an entry with `ops` under the current epoch, with the current
     /// heads as parents. Returns the sealed entry to store and sync.
     pub fn write(

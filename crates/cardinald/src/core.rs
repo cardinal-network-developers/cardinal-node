@@ -165,8 +165,6 @@ pub struct Holder {
     file: AppendLog,
     /// Bumped whenever the state may have changed.
     pub version: u64,
-    /// The next write must start a new epoch (a device was removed).
-    pub needs_rotate: bool,
 }
 
 /// What ingesting objects did.
@@ -206,7 +204,6 @@ impl Holder {
             pending: Vec::new(),
             file,
             version: 0,
-            needs_rotate: false,
         };
         let mut sealed = Vec::new();
         for (loc, bytes) in records {
@@ -354,21 +351,29 @@ impl Holder {
                     Err(e) => tracing::warn!("space {}: entry rejected: {e}", short(&self.id)),
                 }
             }
-            if !self.pending.is_empty() {
-                let pend = std::mem::take(&mut self.pending);
-                for s in pend {
-                    match space.receive(s.clone(), keys) {
-                        Ok(Inserted::Added(released)) => out.complete += released.len(),
-                        Ok(_) => {}
-                        Err(cardinal_space::Error::NoEpochKey) => self.pending.push(s),
-                        Err(_) => {}
-                    }
-                }
-            }
+            out.complete += self.open_pending(keys);
             self.version += 1;
         }
         out.missing_parents = self.is_waiting();
         Ok(out)
+    }
+
+    /// Tries again the entries no key could open yet. Returns how many
+    /// entries that completed.
+    fn open_pending(&mut self, keys: &[&HybridKeyPair]) -> usize {
+        let Some(space) = self.space.as_mut() else {
+            return 0;
+        };
+        let mut complete = 0;
+        for s in std::mem::take(&mut self.pending) {
+            match space.receive(s.clone(), keys) {
+                Ok(Inserted::Added(released)) => complete += released.len(),
+                Ok(_) => {}
+                Err(cardinal_space::Error::NoEpochKey) => self.pending.push(s),
+                Err(_) => {}
+            }
+        }
+        complete
     }
 
     /// Whether entries wait for parents this device lacks.
@@ -376,6 +381,37 @@ impl Holder {
         self.space
             .as_ref()
             .is_some_and(|sp| sp.dag().held().next().is_some())
+    }
+
+    /// Whether the next write must start a new epoch: the current one
+    /// began before the identity's encryption key changed, which a removal
+    /// always does (`spaces.md#when-to-rotate`). This follows from the
+    /// state, so it holds on every device and across restarts. A device
+    /// that cannot open the current key yet cannot tell, and waits.
+    fn rotation_due(&self, identity: &Identity) -> bool {
+        let Some(space) = &self.space else {
+            return false;
+        };
+        let st = identity.log.state();
+        match (identity.enc.first(), &st.encryption_key) {
+            (Some(k), Some(current)) if *k.public_key() == current.public => {
+                !space.epoch_wrapped_for(k)
+            }
+            _ => false,
+        }
+    }
+
+    /// Starts a new epoch if one is due, in an entry of its own. Returns
+    /// the sealed bytes to send to the person's other devices.
+    pub fn rotate_if_due(
+        &mut self,
+        identity: &Identity,
+        keys: &Keys,
+    ) -> anyhow::Result<Option<Vec<u8>>> {
+        if !self.rotation_due(identity) {
+            return Ok(None);
+        }
+        Ok(Some(self.write_one(identity, keys, Vec::new())?.1))
     }
 
     /// Writes one entry with `ops`. Returns the entry id and the sealed
@@ -386,11 +422,12 @@ impl Holder {
         keys: &Keys,
         ops: Vec<SpaceOp>,
     ) -> anyhow::Result<(EntryId, Vec<u8>)> {
+        let rotate = self.rotation_due(identity);
         let space = self
             .space
             .as_mut()
             .ok_or_else(|| anyhow::anyhow!("space not open yet"))?;
-        let sealed = if self.needs_rotate {
+        let sealed = if rotate {
             let pk = identity
                 .enc
                 .first()
@@ -404,7 +441,6 @@ impl Holder {
                 ops,
                 Some(now_ms()),
             )?;
-            self.needs_rotate = false;
             s
         } else {
             space.write(&identity.log, &keys.device.signing, ops, Some(now_ms()))?
@@ -441,7 +477,7 @@ impl Holder {
         exclude: &[EntryId],
         ops: Vec<SpaceOp>,
     ) -> anyhow::Result<(EntryId, Vec<u8>)> {
-        if self.needs_rotate {
+        if self.rotation_due(identity) {
             anyhow::bail!("an epoch rotation is due");
         }
         let space = self
@@ -619,6 +655,8 @@ impl Core {
         for h in self.spaces.values_mut() {
             if let Some(sp) = h.space.as_mut() {
                 sp.set_author(st.clone());
+                // A rotation can arrive before the key it is wrapped for.
+                h.open_pending(&refs);
                 h.version += 1;
             } else {
                 h.rebuild(Vec::new(), &refs, Some(st.clone()));
@@ -865,6 +903,20 @@ impl Core {
             .get_mut(space)
             .ok_or_else(|| anyhow::anyhow!("space not held"))?;
         h.write_one(ident, &self.keys, ops)
+    }
+
+    /// Starts a new epoch in a space if one is due
+    /// ([`Holder::rotate_if_due`]).
+    pub fn rotate_if_due(&mut self, space: &SpaceId) -> anyhow::Result<Option<Vec<u8>>> {
+        let ident = self
+            .identity
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("this device has no identity yet"))?;
+        let h = self
+            .spaces
+            .get_mut(space)
+            .ok_or_else(|| anyhow::anyhow!("space not held"))?;
+        h.rotate_if_due(ident, &self.keys)
     }
 
     /// Writes one entry with `ops` concurrent with `exclude`

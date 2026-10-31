@@ -306,6 +306,9 @@ fn removed_device_and_rotation() {
     .unwrap();
     assert!(a.validity().is_valid(&by_d1));
 
+    // the current epoch is not one the new identity key received
+    assert!(!a.epoch_wrapped_for(&p.enc));
+
     // rotation wraps the new epoch to the new identity key only, and
     // carries the old epoch's key
     let (sealed, key) = a
@@ -313,6 +316,7 @@ fn removed_device_and_rotation() {
         .unwrap();
     assert_eq!(a.current_epoch(), Some(key.id()));
     assert_ne!(key.id(), epoch0);
+    assert!(a.epoch_wrapped_for(&p.enc));
     let mut fresh = cardinal_space::Keyring::new();
     assert!(sealed.open(&fresh, &[&d1.link]).is_err());
     let (e, k) = sealed.open(&fresh, &[&p.enc]).unwrap();
