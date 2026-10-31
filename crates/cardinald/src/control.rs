@@ -486,26 +486,47 @@ fn devices(d: &Daemon) -> Vec<Value> {
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .clone();
+    let name_of = |k: &[u8; 32]| {
+        names
+            .get(k)
+            .cloned()
+            .unwrap_or_else(|| account::short_key(k))
+    };
+    let by_link: HashMap<[u8; 32], String> = st
+        .keys
+        .values()
+        .filter_map(|k| Some((*k.link_key.as_ref()?.x25519(), name_of(&k.key))))
+        .collect();
     let mut v: Vec<Value> = st
         .keys
         .values()
         .map(|k| {
             let x = k.link_key.as_ref().map(|l| *l.x25519());
             let online = k.key == me || x.is_some_and(|x| d.is_online(&x));
-            // Where it listens, if known; else where its session comes from.
-            let addr = book
-                .addrs
-                .get(&hex::encode(k.key))
-                .and_then(|v| v.first().cloned())
-                .or_else(|| x.and_then(|x| d.session_addr(&x)).map(|a| a.to_string()));
+            let carrier = x.and_then(|x| d.session_carrier(&x));
+            let through = x
+                .and_then(|x| d.relayed_through(&x))
+                .and_then(|h| by_link.get(&h));
+            // Where its session runs, or else where it was last known. A
+            // relayed session's address is the relay's.
+            let addr = x
+                .filter(|x| d.is_direct(x))
+                .and_then(|x| d.session_addr(&x))
+                .map(|a| a.to_string())
+                .or_else(|| {
+                    book.addrs
+                        .get(&hex::encode(k.key))
+                        .and_then(|v| v.first().cloned())
+                });
             json!({
-                "name": names.get(&k.key).cloned().unwrap_or_else(|| account::short_key(&k.key)),
+                "name": name_of(&k.key),
                 "key": hex::encode(&k.key[..8]),
                 "power": power_name(k.power),
                 "this": k.key == me,
                 "online": online,
-                "addr": if k.key == me { None } else { addr },
-                "carrier": x.and_then(|x| d.session_carrier(&x)),
+                "addr": if k.key == me || carrier == Some("relay") { None } else { addr },
+                "carrier": carrier,
+                "through": through,
                 // what this device's fetcher thinks of it as a source
                 "fetch": x.and_then(|x| stats.get(&x)).map(|s| json!({
                     "rate": s.rate as u64,

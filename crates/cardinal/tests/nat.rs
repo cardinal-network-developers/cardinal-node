@@ -231,6 +231,11 @@ fn devices_that_cannot_punch_through_go_through_the_host() {
     wait("they meet through the host", 40, || {
         carrier(&x, "why") == "relay" && carrier(&y, "ex") == "relay"
     });
+    let listed = x.status();
+    let devices = listed["devices"].as_array().unwrap();
+    let why = devices.iter().find(|d| d["name"] == "why").unwrap();
+    assert_eq!(why["through"], "host", "{why}");
+    assert!(why["addr"].is_null(), "{why}");
 
     // A file big enough for chunks, each way.
     let big: Vec<u8> = (0..3_000_000u32).map(|n| (n * 7 % 251) as u8).collect();

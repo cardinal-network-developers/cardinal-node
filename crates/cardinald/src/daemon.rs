@@ -523,6 +523,20 @@ impl Daemon {
             .is_some_and(|c| !c.session.is_closed() && !c.session.is_relayed())
     }
 
+    /// The device a relayed session runs through, by link key.
+    pub fn relayed_through(&self, link_x25519: &[u8; 32]) -> Option<[u8; 32]> {
+        let sessions = lock(&self.sessions);
+        let s = &sessions.get(link_x25519)?.session;
+        if !s.is_relayed() {
+            return None;
+        }
+        let at = s.remote_addr();
+        sessions
+            .iter()
+            .find(|(_, c)| !c.session.is_relayed() && c.session.remote_addr() == at)
+            .map(|(x, _)| *x)
+    }
+
     /// The remote address of a device's session.
     pub fn session_addr(&self, link_x25519: &[u8; 32]) -> Option<SocketAddr> {
         lock(&self.sessions)

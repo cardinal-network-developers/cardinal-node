@@ -780,6 +780,9 @@ fn print_devices(devs: &Value) {
         if let Some(c) = d["carrier"].as_str() {
             line.push_str(&format!("  {c}"));
         }
+        if let Some(t) = d["through"].as_str() {
+            line.push_str(&format!(" through {t}"));
+        }
         line.push_str(&format!("  [{}]", d["key"].as_str().unwrap_or("")));
         println!("{line}");
         if let Some(f) = source_line(&d["fetch"]) {
