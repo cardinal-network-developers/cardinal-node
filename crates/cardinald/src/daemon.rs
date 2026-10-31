@@ -2,7 +2,7 @@
 //! devices, syncs, serves the mount and the control socket.
 
 use std::collections::{HashMap, HashSet};
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
@@ -80,6 +80,32 @@ impl PeerBook {
         v.insert(0, a);
         v.truncate(6);
         true
+    }
+
+    /// A device connected from `ip`, so that is where it is now. It came
+    /// from a port of the moment, so this keeps the port it was last
+    /// reached at. A device never reached has none to keep.
+    fn moved(&mut self, device: &KeyId, ip: IpAddr) -> bool {
+        let port = self
+            .addrs
+            .get(&hex::encode(device))
+            .and_then(|v| v.first())
+            .and_then(|a| a.parse::<SocketAddr>().ok())
+            .map(|a| a.port());
+        match port {
+            Some(port) => self.add(device, SocketAddr::new(ip, port)),
+            None => false,
+        }
+    }
+
+    /// The devices known at `addr`, by key (hex).
+    fn at(&self, addr: &SocketAddr) -> Vec<&String> {
+        let a = addr.to_string();
+        self.addrs
+            .iter()
+            .filter(|(_, v)| v.contains(&a))
+            .map(|(k, _)| k)
+            .collect()
     }
 }
 
@@ -455,6 +481,13 @@ impl Daemon {
         );
         if let PeerKind::Own(k) = kind {
             lock(&self.backoff).remove(&k);
+            if s.role() == cardinal_link::Role::Responder {
+                if let Some(a) = s.remote_addr() {
+                    if lock(&self.book).moved(&k, a.ip()) {
+                        self.save_book();
+                    }
+                }
+            }
         }
         self.save_counters();
         let d = self.clone();
@@ -824,10 +857,10 @@ impl Daemon {
         }
         for (p, tag) in manual {
             let lookup = tokio::net::lookup_host(p.clone()).await;
-            if let Ok(mut it) = lookup {
-                if let Some(sa) = it.next() {
+            if let Ok(it) = lookup {
+                for sa in it {
                     if !out.iter().any(|(x, _)| *x == sa) {
-                        out.push((sa, tag.or(Some(p))));
+                        out.push((sa, tag.clone().or(Some(p.clone()))));
                     }
                 }
             }
@@ -964,6 +997,15 @@ impl Daemon {
                 .filter_map(|k| Some((k.key, k.link_key.clone()?)))
                 .collect()
         };
+        // A sighting does not say which device it is, so an offline one
+        // could be there, unless a device already online is.
+        let known: Vec<String> = lock(&self.book).at(&addr).into_iter().cloned().collect();
+        let taken = devices
+            .iter()
+            .any(|(k, l)| known.contains(&hex::encode(k)) && self.is_online(l.x25519()));
+        if taken {
+            return;
+        }
         for (key, link) in devices {
             if self.is_online(link.x25519()) {
                 continue;
@@ -1180,4 +1222,45 @@ pub fn local_ips() -> Vec<std::net::IpAddr> {
         }
     }
     v
+}
+
+#[cfg(test)]
+mod book_tests {
+    use super::*;
+
+    const D: KeyId = [1; 32];
+
+    fn book(addrs: &[&str]) -> PeerBook {
+        let mut b = PeerBook::default();
+        b.addrs.insert(
+            hex::encode(D),
+            addrs.iter().map(|a| (*a).to_owned()).collect(),
+        );
+        b
+    }
+
+    #[test]
+    fn a_device_that_moved_keeps_its_port_at_the_new_address() {
+        let mut b = book(&["172.20.0.240:7171", "10.0.0.1:9000"]);
+        assert!(b.moved(&D, "172.20.1.20".parse().unwrap()));
+        assert_eq!(
+            b.addrs[&hex::encode(D)],
+            ["172.20.1.20:7171", "172.20.0.240:7171", "10.0.0.1:9000"]
+        );
+        assert!(!b.moved(&D, "172.20.1.20".parse().unwrap()), "no news");
+    }
+
+    #[test]
+    fn a_device_never_reached_has_no_port_to_keep() {
+        let mut b = PeerBook::default();
+        assert!(!b.moved(&D, "172.20.1.20".parse().unwrap()));
+        assert!(b.addrs.is_empty());
+    }
+
+    #[test]
+    fn an_address_names_the_devices_known_there() {
+        let b = book(&["172.20.0.251:7171"]);
+        assert_eq!(b.at(&"172.20.0.251:7171".parse().unwrap()).len(), 1);
+        assert!(b.at(&"172.20.0.251:7172".parse().unwrap()).is_empty());
+    }
 }
