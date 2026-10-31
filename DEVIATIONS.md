@@ -419,24 +419,27 @@ Readings of ambiguous text:
   set_confirmed_counter}`.
 - **TCP framing** follows `link.md#carriers`: a 16-bit length prefix,
   little-endian like every integer in link.md.
+- **Every device listens on TCP too.** `link.md#carriers` has personal
+  devices listen only on UDP, because a TCP port shows up to scanners. Devices
+  dial UDP first and give it two seconds; TCP stays for older devices and
+  networks that block UDP.
+- **Congestion control** (`link.md#priority`, `cc.rs`). One window for the
+  session, answering to loss and to queueing delay beyond 60 ms; a LEDBAT-style
+  limit with a 25 ms target for background traffic; a token-bucket pacer,
+  because timers here are about a millisecond. Real-time traffic skips the
+  window, as "never queued behind other classes" asks. A loss with almost no
+  queue counts for less, so that a radio link is not read as a full one.
+  Background traffic stands back briefly every 30 seconds so a flow that
+  started late does not take the queue for the path. Being delay-based, a
+  session gives way to loss-based traffic sharing a deep queue.
 
 Not implemented yet (the next milestone):
 
-- **UDP congestion control.** Reliable streams over UDP are
-  **experimental**: lost frames are detected by packet threshold (3), time
-  threshold (9/8 RTT), and a probe timeout, and resent in new packets, with
-  a fixed window of 128 packets in flight. There is **no congestion
-  control, no pacing, no delay-based controller, and no LEDBAT limit for
-  background traffic**, all of which `link.md#priority` requires. Priority
-  classes are honoured only in the order packets are filled (real-time,
-  then interactive, then background).
 - Multiple simultaneous paths, choosing the path by smoothed RTT, and
   duplicating real-time traffic across paths. A session uses one validated
   path at a time.
-- Host roles: the relay service (relayed packets are parsed and answered
-  through the same relay, but hosts do not forward), delivery tokens as a
-  secret source, and the public/restore cases beyond the `allow_public`
-  switch (`prove` is not implemented).
+- Delivery tokens as a secret source, and the public and restore cases
+  beyond the `allow_public` switch (`prove` is not implemented at this layer).
 - Local radio carriers.
 
 ## Contact (`spec/contact.md`, `spec/hosts.md#local-discovery`)
@@ -550,9 +553,8 @@ Not implemented yet (the next milestone):
   `cardinal pair <code>` on the admin). The proof of possession only works
   that way round.
 - **Discovery advertises the TCP port.** `hosts.md#local-discovery`
-  advertises "this device's link endpoint"; devices listen on TCP only
-  (UDP streams have no congestion control yet), so the SRV port is the
-  TCP link port.
+  advertises "this device's link endpoint". UDP and TCP use the same port
+  here, so the SRV port is both.
 - **The pairing endpoint may be unspecified.** A device listening on
   `0.0.0.0` sends that in pairing info field 4; the typer substitutes the
   address it reached the pairing socket at.
@@ -649,8 +651,26 @@ Not implemented yet (the next milestone):
   grants itself to its own identity, the case `hosts.md#grants` calls the
   common one. It holds spaces as any of the person's devices does, under
   their space ids, not random labels, and it can read them. Hosts that
-  cannot read what they store, delivery tokens, and the mailbox, rendezvous
-  and relay services are not implemented.
+  cannot read what they store, delivery tokens, and the mailbox service are
+  not implemented.
+- **Rendezvous and relay are for a person's own devices** so far: `connect`
+  and `relay` with a token come with sharing.
+- **Spec gap: local addresses have no field.** `hosts.md#rendezvous` passes
+  them on, but neither `incoming` nor the `connect` reply has a place for
+  them. Here it is field 4 of both.
+- **Spec ambiguity: what `relay`'s device signing key names.** The session
+  already says who asks, so here it names the device to relay to.
+- **Spec ambiguity: who relays.** "The requester relays", but two devices
+  looking for each other are both requesters. The one with the smaller static
+  key asks; the other can tell.
+- **One path at a time.** A relay is meant to be another path of a session,
+  abandoned when a direct one validates. Here a direct session replaces the
+  relayed one, which `link.md#identity-binding` allows, and a device looks for
+  one once a minute.
+- **A host's address must be a literal to be used day to day.** Devices dial
+  the addresses in a grant, but never a name in one: names are for the
+  recovery sheet. A device whose only host has moved, with no other way to
+  reach it, waits to meet it on a local network.
 - **Storage ops.** Only `prove` (op 5). `drop`, `list`, `allow` and `public`
   are answered with error 3, unknown.
 - **Restore step 5 differs.** A restoring device does not list labels and
