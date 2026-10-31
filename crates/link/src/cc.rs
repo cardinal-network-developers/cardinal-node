@@ -375,7 +375,6 @@ mod tests {
     struct Flow {
         cc: Controller,
         class: Class,
-        begin: Duration,
         end: Duration,
         next: u64,
         sent: BTreeMap<u64, Duration>,
@@ -386,11 +385,10 @@ mod tests {
     }
 
     impl Flow {
-        fn new(class: Class, begin: Duration, end: Duration, t0: Instant) -> Flow {
+        fn new(class: Class, end: Duration, t0: Instant) -> Flow {
             Flow {
                 cc: Controller::new(t0),
                 class,
-                begin,
                 end,
                 next: 1,
                 sent: BTreeMap::new(),
@@ -431,7 +429,7 @@ mod tests {
         }
 
         fn add(&mut self, class: Class, begin: Duration, end: Duration) -> usize {
-            let f = Flow::new(class, begin, end, self.t0);
+            let f = Flow::new(class, end, self.t0);
             self.flows.push(f);
             let i = self.flows.len() - 1;
             self.at(begin, Event::Send(i));

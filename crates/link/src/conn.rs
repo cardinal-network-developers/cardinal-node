@@ -15,6 +15,7 @@ use tokio::sync::{mpsc, Notify};
 use zeroize::Zeroizing;
 
 use crate::carrier::Path;
+use crate::cc::{Acked, Class, Controller};
 use crate::directory::{ExpectedPeer, LocalIdentity, PeerDirectory, PeerIdentity};
 use crate::frame::{
     decode_frames, encode_stream_frame, encode_stream_frame_parts, stream_frame_overhead, AckRange,
@@ -42,9 +43,8 @@ const MAX_ACK_DELAY: Duration = Duration::from_millis(10);
 const MAX_ACK_RANGES: usize = 32;
 /// Limit on streams the peer may have open at once.
 const MAX_INCOMING_STREAMS: usize = 4096;
-/// Packets in flight on unreliable carriers (a fixed window; there is no
-/// congestion control yet).
-const MAX_IN_FLIGHT: usize = 128;
+/// Timeouts in a row that mean the path has stopped working.
+const PERSISTENT_PTOS: u32 = 3;
 /// Queued outgoing datagrams per priority class before the oldest drop.
 const MAX_DATAGRAM_QUEUE: usize = 1024;
 /// Queued incoming datagrams per channel before new ones drop.
@@ -129,6 +129,8 @@ pub struct SessionStats {
     pub key_phase: u8,
     /// Smoothed round-trip time, unreliable carriers only.
     pub srtt: Option<Duration>,
+    /// The congestion window in bytes, unreliable carriers only.
+    pub window: Option<u64>,
 }
 
 /// Why a session closed.
@@ -222,6 +224,9 @@ enum Retx {
 struct SentPacket {
     time: Instant,
     frames: Vec<Retx>,
+    bytes: u64,
+    /// Carrying only background traffic.
+    background: bool,
 }
 
 #[derive(Default)]
@@ -372,6 +377,7 @@ pub(crate) struct Conn {
     srtt: Option<Duration>,
     rttvar: Duration,
     pto_count: u32,
+    cc: Controller,
     recv_ranges: RangeSet,
     largest_recv_time: Option<Instant>,
     unacked_eliciting: u32,
@@ -469,6 +475,7 @@ impl Conn {
             srtt: None,
             rttvar: Duration::from_millis(50),
             pto_count: 0,
+            cc: Controller::new(now),
             recv_ranges: RangeSet::new(),
             largest_recv_time: None,
             unacked_eliciting: 0,
@@ -553,6 +560,7 @@ impl Conn {
         let mut s = self.stats;
         s.key_phase = self.send_key.phase;
         s.srtt = self.srtt;
+        s.window = (!self.reliable).then(|| self.cc.window());
         s
     }
 
@@ -810,6 +818,9 @@ impl Conn {
                     if c.data == d && c.path.same(path) {
                         let c = self.challenge.take().expect("challenge");
                         self.path = c.path;
+                        // Nothing learned of the old path holds on this one.
+                        self.cc = Controller::new(now);
+                        self.srtt = None;
                         if let Some(addr) = self.path.remote_addr() {
                             self.control.push_back(Frame::ObservedAddress(addr));
                         }
@@ -991,11 +1002,20 @@ impl Conn {
         if self.largest_acked.is_none_or(|l| largest > l) {
             self.largest_acked = Some(largest);
         }
+        let mut acked = Acked::default();
+        for (_, p) in &newly {
+            acked.bytes += p.bytes;
+            if p.background {
+                acked.background += p.bytes;
+            }
+        }
         if let Some((k, p)) = newly.iter().max_by_key(|(k, _)| *k) {
+            let mut rtt = None;
             if *k == largest {
                 let sample = now
                     .saturating_duration_since(p.time)
                     .saturating_sub(Duration::from_micros(delay_us.min(1_000_000)));
+                rtt = Some(sample);
                 match self.srtt {
                     None => {
                         self.srtt = Some(sample);
@@ -1008,6 +1028,7 @@ impl Conn {
                     }
                 }
             }
+            self.cc.on_ack(acked, rtt, p.time, now);
         }
         self.pto_count = 0;
         for (_, p) in newly {
@@ -1041,23 +1062,29 @@ impl Conn {
         let time_thresh = (srtt * 9 / 8).max(Duration::from_millis(1));
         let pto = self.pto();
         let largest = self.largest_acked;
+        // Packets are in the order they were sent, so what is lost comes
+        // first: the window can hold thousands, and this runs on every ack.
         let lost: Vec<u64> = self
             .sent
             .iter()
-            .filter(|(k, p)| {
+            .take_while(|(k, p)| {
                 let by_ack = largest
                     .is_some_and(|l| **k < l && (l - **k >= 3 || p.time + time_thresh <= now));
                 by_ack || p.time + pto <= now
             })
             .map(|(k, _)| *k)
             .collect();
-        let any_pto = self.sent.values().any(|p| p.time + pto <= now);
+        let any_pto = self.sent.values().next().is_some_and(|p| p.time + pto <= now);
         if any_pto {
             self.pto_count += 1;
+            if self.pto_count == PERSISTENT_PTOS {
+                self.cc.on_timeout(now);
+            }
         }
         for k in lost {
             let p = self.sent.remove(&k).expect("sent");
             self.stats.packets_lost += 1;
+            self.cc.on_lost(p.bytes, p.background, p.time, now);
             for r in p.frames {
                 self.requeue(r);
             }
@@ -1609,6 +1636,9 @@ impl Conn {
         if let Some(p) = self.sent.values().next() {
             t.push(p.time + self.pto());
         }
+        if !self.reliable && (0..3).any(|class| self.has_work_in(class)) {
+            t.extend(self.cc.next_paced());
+        }
         if let Some(c) = &self.challenge {
             if let Some(s) = c.sent_at {
                 t.push(s + Duration::from_secs(1));
@@ -1662,16 +1692,49 @@ impl Conn {
     // Sending.
 
     fn has_stream_work(&self) -> bool {
+        (0..3).any(|class| self.has_stream_work_in(class))
+    }
+
+    fn has_stream_work_in(&self, class: usize) -> bool {
         if !self.established {
             return false;
         }
         let session_credit = self.session_send_max.saturating_sub(self.session_sent);
-        self.streams.values().any(|s| {
-            !s.retx.is_empty()
-                || s.retx_fin
-                || (s.send_next < s.send_end() && s.send_next < s.send_max && session_credit > 0)
-                || (s.fin_requested && !s.fin_sent && s.send_next == s.send_end())
-        })
+        self.streams
+            .values()
+            .filter(|s| s.priority() as usize == class)
+            .any(|s| {
+                !s.retx.is_empty()
+                    || s.retx_fin
+                    || (s.send_next < s.send_end()
+                        && s.send_next < s.send_max
+                        && session_credit > 0)
+                    || (s.fin_requested && !s.fin_sent && s.send_next == s.send_end())
+            })
+    }
+
+    fn has_work_in(&self, class: usize) -> bool {
+        (self.established && !self.dgram_out[class].is_empty()) || self.has_stream_work_in(class)
+    }
+
+    /// How many of the priority classes may send now, from the highest.
+    /// Real-time traffic always may.
+    fn open_classes(&mut self, now: Instant) -> usize {
+        if self.reliable {
+            return 3;
+        }
+        let pace = if self.has_work_in(1) {
+            Class::Interactive
+        } else {
+            Class::Background
+        };
+        if !self.cc.is_paced_now(pace, now) || !self.cc.has_room(Class::Interactive) {
+            1
+        } else if !self.cc.has_room(Class::Background) {
+            2
+        } else {
+            3
+        }
     }
 
     /// Builds the next packet to send, if any.
@@ -1701,13 +1764,11 @@ impl Conn {
             return Some((path, self.seal_frames(&[Frame::PathResponse(d)], now)));
         }
 
-        let unreliable_full = !self.reliable && self.sent.len() >= MAX_IN_FLIGHT;
+        let classes = self.open_classes(now);
         let ack_wanted = self.ack_due.is_some_and(|d| d <= now);
         let other_work = !self.control.is_empty()
-            || (!unreliable_full
-                && (!self.pending_window.is_empty()
-                    || (self.established && self.dgram_out.iter().any(|q| !q.is_empty()))
-                    || self.has_stream_work()));
+            || (classes > 1 && !self.pending_window.is_empty())
+            || (0..classes).any(|class| self.has_work_in(class));
         if !ack_wanted && !other_work {
             return None;
         }
@@ -1718,6 +1779,7 @@ impl Conn {
         let mut budget = MAX_PLAINTEXT;
         let mut retx: Vec<Retx> = Vec::new();
         let mut eliciting = false;
+        let mut top_class = None;
 
         // Acknowledgement, whenever there is something to acknowledge.
         if self.unacked_eliciting > 0 || ack_wanted {
@@ -1769,9 +1831,13 @@ impl Conn {
             }
         }
 
-        if self.established && budget == MAX_PLAINTEXT && !unreliable_full {
+        if self.established && budget == MAX_PLAINTEXT {
             // Window updates.
-            let ids: Vec<u64> = self.pending_window.iter().copied().collect();
+            let ids: Vec<u64> = if classes > 1 {
+                self.pending_window.iter().copied().collect()
+            } else {
+                Vec::new()
+            };
             for id in ids {
                 let max = if id == 0 {
                     self.session_recv_max
@@ -1791,7 +1857,8 @@ impl Conn {
                 retx.push(Retx::Window(id));
             }
             // Priority classes in order: datagrams, then streams.
-            for class in 0..3 {
+            for class in 0..classes {
+                let before = buf.len();
                 while let Some((label, data)) = self.dgram_out[class].front() {
                     let f = Frame::Datagram {
                         channel: *label,
@@ -1806,6 +1873,9 @@ impl Conn {
                     eliciting = true;
                 }
                 self.fill_streams(class, &mut buf, budget, &mut retx, &mut eliciting);
+                if buf.len() > before && top_class.is_none() {
+                    top_class = Some(class);
+                }
             }
         }
 
@@ -1816,11 +1886,16 @@ impl Conn {
         let pkt = self.seal_buf(&mut buf, now);
         self.scratch = buf;
         if !self.reliable && eliciting {
+            let bytes = pkt.len() as u64;
+            let background = top_class.is_some_and(|c| Class::from_index(c) == Class::Background);
+            self.cc.on_sent(bytes, background);
             self.sent.insert(
                 self.send_counter - 1,
                 SentPacket {
                     time: now,
                     frames: retx,
+                    bytes,
+                    background,
                 },
             );
         }
