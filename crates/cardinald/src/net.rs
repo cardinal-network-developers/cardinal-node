@@ -160,6 +160,10 @@ async fn handle_stream(d: &Arc<Daemon>, s: &Session, mut st: Stream) -> anyhow::
         return crate::contacts::serve(d, s, st).await;
     }
     if st.service() == Service::BLOB {
+        if !may_fetch_blobs(d.session_kind(&s.peer_static())) {
+            st.reset(0);
+            return Ok(());
+        }
         tracing::trace!("blob stream {} accepted", st.id());
         return serve_blob(d, st).await;
     }
@@ -450,6 +454,13 @@ fn test_blob_delay() -> Option<u64> {
     })
 }
 
+/// Whether a peer may ask for objects by id. The store holds everything this
+/// device keeps, and nothing shared with anyone else has chunks yet, so only
+/// the person's own devices may.
+fn may_fetch_blobs(kind: Option<PeerKind>) -> bool {
+    matches!(kind, Some(PeerKind::Own(_) | PeerKind::Proven))
+}
+
 async fn serve_blob(d: &Arc<Daemon>, mut st: Stream) -> anyhow::Result<()> {
     let Some(v) = st.recv_message_max(1 << 20).await? else {
         return Ok(());
@@ -715,4 +726,21 @@ impl BlobFetch {
 /// Whether a set holds every id.
 pub fn holds_all(set: &MemSet, ids: &[[u8; 32]]) -> bool {
     ids.iter().all(|i| set.contains_id(i))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_a_persons_own_devices_may_fetch_blobs() {
+        let someone = [1u8; 32];
+        assert!(may_fetch_blobs(Some(PeerKind::Own(someone))));
+        assert!(may_fetch_blobs(Some(PeerKind::Proven)));
+        assert!(!may_fetch_blobs(Some(PeerKind::Contact(someone, someone))));
+        assert!(!may_fetch_blobs(Some(PeerKind::Inviting(someone))));
+        assert!(!may_fetch_blobs(Some(PeerKind::Restoring)));
+        assert!(!may_fetch_blobs(Some(PeerKind::Stranger)));
+        assert!(!may_fetch_blobs(None));
+    }
 }

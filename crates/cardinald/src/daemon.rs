@@ -504,6 +504,12 @@ impl Daemon {
             .collect()
     }
 
+    /// Who a session's peer was last found to be. Takes no lock on the core,
+    /// so it is fit for a path as busy as serving blobs.
+    pub fn session_kind(&self, peer_static: &[u8; 32]) -> Option<PeerKind> {
+        lock(&self.sessions).get(peer_static).map(|c| c.kind)
+    }
+
     /// The people with a session open to one of their devices.
     pub fn connected_people(&self) -> HashSet<[u8; 32]> {
         lock(&self.sessions)
