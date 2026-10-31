@@ -1,20 +1,23 @@
 //! Reaching a device of this person's that cannot be reached directly
-//! (`hosts.md#rendezvous`, `hosts.md#relay`).
+//! (`hosts.md#rendezvous`, `hosts.md#relay`,
+//! `hosts.md#help-from-a-persons-own-devices`).
 //!
 //! Devices are known by their keys, and any of them may move or sit behind a
-//! NAT. A host is what stays reachable: each device keeps a session with it
-//! and presents itself. A device looking for another asks the host, which
-//! tells both where it sees the other, and they send to each other at the
+//! NAT. Each one presents itself to the others it has a session with. A
+//! device looking for another asks them, and whichever has a session with
+//! both tells each where it sees the other. They send to each other at the
 //! same moment, which opens a way through most NATs. If nothing comes of that
-//! in three seconds, one of them asks the host to relay. The session is end
-//! to end either way, and a direct one takes over as soon as there is one.
+//! in three seconds, one of them asks a device to relay. The session is end to
+//! end either way, and a direct one takes over as soon as there is one.
 //!
-//! Only a host's address needs to stay put, and it is a device like the
-//! others: no name or registrar comes into this. Names stay on the recovery
-//! sheet.
+//! None of this needs a host, only a device with a session to both. A host is
+//! what is there when nothing else is, for a device with no session at all, and
+//! a device reaches one only at an address it has seen: names stay on the
+//! recovery sheet.
 
 use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, SocketAddr};
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
@@ -22,8 +25,6 @@ use cardinal_crypto::{random_bytes, HybridPublicKey};
 use cardinal_encoding::{Record, Value};
 use cardinal_identity::KeyId;
 use cardinal_link::{CarrierKind, LinkError, Priority, Service, Session, Stream, Target};
-use cardinal_space::account;
-use cardinal_space::grant::{Grant, RENDEZVOUS};
 use tokio::io::AsyncWriteExt;
 use tokio::sync::watch;
 use tokio::task::JoinSet;
@@ -45,22 +46,27 @@ const ASK_RELAYED_EVERY: Duration = Duration::from_secs(60);
 const MAX_MESSAGE: usize = 64 * 1024;
 /// The most local addresses a device can report.
 const MAX_LOCAL: usize = 8;
+/// The most devices a device can tell of in one message.
+const MAX_DEVICES: usize = 64;
 
 const OP_ERROR: u64 = 0;
 const OP_PRESENT: u64 = 1;
 const OP_CONNECT: u64 = 2;
 const OP_INCOMING: u64 = 3;
+const OP_ADDRESSES: u64 = 4;
 const OP_RELAY: u64 = 1;
 const OP_RELAYED: u64 = 2;
 const NOT_PERMITTED: u64 = 1;
 const UNKNOWN: u64 = 3;
 const NOT_PRESENT: u64 = 4;
+const BUSY: u64 = 5;
 
 /// An endpoint's carrier: `hosts.md#grants`.
 const UDP: u64 = 1;
-/// The field of a device's local addresses, in what a host says of it. The
-/// spec passes them on but gives them no field; 3 is `incoming`'s token.
+/// The field of a device's local addresses, in what is said of it.
 const LOCAL: u64 = 4;
+/// Where this kind of system lists what powers it.
+const POWER_SUPPLIES: &str = "/sys/class/power_supply";
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
@@ -74,7 +80,7 @@ pub struct Rendezvous {
     /// As a host: the channels it forwards, and the two devices of each.
     /// One for each pair, so at most as many as a person has pairs.
     channels: Mutex<HashMap<u32, [[u8; 32]; 2]>>,
-    /// When this device last presented itself to each host.
+    /// When this device last presented itself to each of its devices.
     presented: Mutex<HashMap<[u8; 32], Instant>>,
     /// The devices being reached right now, and at what addresses. A device
     /// that moved meanwhile has others, and those must not wait.
@@ -181,27 +187,29 @@ fn local_addresses(d: &Daemon) -> Vec<SocketAddr> {
     }
 }
 
-/// Whether a device of this person's offers rendezvous.
-fn is_host(d: &Daemon, device: &KeyId) -> bool {
-    let core = d.core();
-    let Some(space) = core.account().and_then(|a| a.space.as_ref()) else {
-        return false;
-    };
-    account::hosts(space.state())
-        .iter()
-        .filter_map(|h| Grant::open(&h.grant))
-        .any(|(g, signer)| signer == *device && g.services.contains(&RENDEZVOUS))
+/// The sessions with this person's devices that can help: one hop, so not
+/// one that itself goes through a device.
+fn helpers(d: &Daemon) -> Vec<Session> {
+    let sessions = d.own_sessions().into_iter();
+    sessions.filter(|s| !s.is_relayed()).collect()
 }
 
-/// The sessions with this person's hosts.
-fn host_sessions(d: &Daemon) -> Vec<Session> {
-    d.own_sessions()
+/// Whether this machine runs on its battery, which relaying would run down.
+fn on_battery(power_supplies: &Path) -> bool {
+    let read = |p: PathBuf, f: &str| std::fs::read_to_string(p.join(f)).unwrap_or_default();
+    let mut battery = false;
+    for d in std::fs::read_dir(power_supplies)
         .into_iter()
-        .filter(|s| {
-            let id = s.peer_identity();
-            id.is_some_and(|p| is_host(d, &p.signing_key))
-        })
-        .collect()
+        .flatten()
+        .flatten()
+    {
+        match read(d.path(), "type").trim() {
+            "Battery" => battery = true,
+            _ if read(d.path(), "online").trim() == "1" => return false,
+            _ => {}
+        }
+    }
+    battery
 }
 
 /// The devices of this person's with no direct session, by static key.
@@ -226,16 +234,17 @@ fn wanted(d: &Daemon) -> HashMap<[u8; 32], (KeyId, HybridPublicKey)> {
         .collect()
 }
 
-/// A session with one of this person's devices opened. If it is a host,
-/// this device presents itself, and asks after the ones it cannot reach.
-pub async fn session_opened(d: Arc<Daemon>, s: Session, device: KeyId) {
-    if is_host(&d, &device) {
+/// A session with one of this person's devices opened: this device presents
+/// itself, and asks after the ones it cannot reach.
+pub async fn session_opened(d: Arc<Daemon>, s: Session) {
+    if !s.is_relayed() {
         present(&d, &s).await;
-        ask_host(&d, &s).await;
+        ask(&d, &s).await;
     }
 }
 
-/// Tells a host this device is here, and at what addresses.
+/// Tells one of this person's devices that this one is here, at what
+/// addresses, and where the others have been reached.
 async fn present(d: &Daemon, s: &Session) {
     let ask = Record::new()
         .with(0, OP_PRESENT)
@@ -247,12 +256,34 @@ async fn present(d: &Daemon, s: &Session) {
         Ok(_) => tracing::debug!("{} refused", short(&s.peer_static())),
         Err(e) => tracing::debug!("presenting to {}: {e:#}", short(&s.peer_static())),
     }
+    let known: Vec<Value> = d
+        .addresses_to_share()
+        .iter()
+        .take(MAX_DEVICES)
+        .map(|(device, addresses)| {
+            let r = Record::new().with(1, *device);
+            Value::Record(r.with(2, address_list(addresses)))
+        })
+        .collect();
+    let tell = Record::new()
+        .with(0, OP_ADDRESSES)
+        .with(1, Value::list(known));
+    tell_device(s.clone(), Service::RENDEZVOUS, tell);
 }
 
-/// Presents this device where it has not lately. A session can open before
-/// this device knows the other is a host, and addresses change.
+/// Sends a message that has no reply.
+fn tell_device(s: Session, service: Service, message: Record) {
+    tokio::spawn(async move {
+        if let Ok(mut st) = s.open_stream(service, Priority::Interactive) {
+            let _ = st.send_message(&Value::Record(message)).await;
+            let _ = st.shutdown().await;
+        }
+    });
+}
+
+/// Presents this device where it has not lately: addresses change.
 async fn stay_present(d: &Daemon) {
-    for s in host_sessions(d) {
+    for s in helpers(d) {
         let due = lock(&d.rendezvous.presented)
             .get(&s.peer_static())
             .is_none_or(|t| t.elapsed() >= PRESENT_EVERY);
@@ -281,9 +312,9 @@ async fn call(s: &Session, service: Service, ask: Record) -> anyhow::Result<Reco
         .map_err(|_| anyhow::anyhow!("no answer in time"))?
 }
 
-/// Asks this person's hosts after devices this device cannot reach directly.
-/// It costs a message, so not on every pass of the reconnect loop.
-pub async fn ask_hosts(d: Arc<Daemon>) {
+/// Asks this person's devices after those it cannot reach directly. It costs
+/// a message each, so not on every pass of the reconnect loop.
+pub async fn ask_helpers(d: Arc<Daemon>) {
     stay_present(&d).await;
     let every = {
         let wanted = wanted(&d);
@@ -303,12 +334,12 @@ pub async fn ask_hosts(d: Arc<Daemon>) {
         }
         *asked = Some(Instant::now());
     }
-    for s in host_sessions(&d) {
-        ask_host(&d, &s).await;
+    for s in helpers(&d) {
+        ask(&d, &s).await;
     }
 }
 
-async fn ask_host(d: &Arc<Daemon>, s: &Session) {
+async fn ask(d: &Arc<Daemon>, s: &Session) {
     let wanted = wanted(d);
     if wanted.is_empty() {
         return;
@@ -326,23 +357,16 @@ async fn ask_host(d: &Arc<Daemon>, s: &Session) {
             continue;
         };
         if let Some((device, link)) = wanted.get(&found.device) {
-            let host = s.clone();
             let addresses = found.addresses();
             let (d, device, link) = (d.clone(), *device, link.clone());
-            tokio::spawn(async move { meet(d, host, device, link, addresses).await });
+            tokio::spawn(async move { meet(d, device, link, addresses).await });
         }
     }
 }
 
-/// Reaches a device through what a host said of it: directly if that can be
-/// done, and through the host if not.
-async fn meet(
-    d: Arc<Daemon>,
-    host: Session,
-    device: KeyId,
-    link: HybridPublicKey,
-    addresses: Vec<SocketAddr>,
-) {
+/// Reaches a device from what another said of it: directly if that can be
+/// done, and through one of them if not.
+async fn meet(d: Arc<Daemon>, device: KeyId, link: HybridPublicKey, addresses: Vec<SocketAddr>) {
     let meeting = (device, addresses.clone());
     if !lock(&d.rendezvous.meeting).insert(meeting.clone()) {
         return;
@@ -350,9 +374,18 @@ async fn meet(
     punch(&d, &link, addresses).await;
     // One of the two asks, and either can tell which.
     let mine = *d.keys.link.public_key().x25519();
-    if !d.is_online(link.x25519()) && mine < *link.x25519() {
-        if let Err(e) = relay(&d, &host, &device, &link).await {
-            tracing::debug!("relaying to {}: {e:#}", short(&device));
+    if mine < *link.x25519() {
+        for helper in helpers(&d) {
+            if d.is_online(link.x25519()) {
+                break;
+            }
+            if helper.peer_static() == *link.x25519() {
+                continue;
+            }
+            match relay(&d, &helper, &device, &link).await {
+                Ok(()) => break,
+                Err(e) => tracing::debug!("relaying to {}: {e:#}", short(&device)),
+            }
         }
     }
     lock(&d.rendezvous.meeting).remove(&meeting);
@@ -386,12 +419,12 @@ async fn punch(d: &Arc<Daemon>, link: &HybridPublicKey, addresses: Vec<SocketAdd
 
 async fn relay(
     d: &Arc<Daemon>,
-    host: &Session,
+    helper: &Session,
     device: &KeyId,
     link: &HybridPublicKey,
 ) -> anyhow::Result<()> {
     let ask = Record::new().with(0, OP_RELAY).with(2, *device);
-    let reply = call(host, Service::RELAY, ask).await?;
+    let reply = call(helper, Service::RELAY, ask).await?;
     anyhow::ensure!(
         reply.get(0).and_then(Value::as_uint) == Some(OP_RELAY),
         "refused"
@@ -404,14 +437,14 @@ async fn relay(
     if d.is_online(link.x25519()) {
         return Ok(());
     }
-    let at = host
+    let at = helper
         .remote_addr()
         .ok_or_else(|| anyhow::anyhow!("no address"))?;
     let target = Target::new(at, CarrierKind::Udp, link)
-        .through(host, channel)
+        .through(helper, channel)
         .within(PUNCH_WITHIN);
     let s = d.endpoint.connect(target).await?;
-    tracing::info!("reached {} through a host", short(device));
+    tracing::info!("reached {} through another device", short(device));
     d.on_session(s);
     Ok(())
 }
@@ -431,10 +464,13 @@ pub async fn serve(d: &Arc<Daemon>, s: &Session, mut st: Stream) -> anyhow::Resu
     } else if st.service() == Service::RENDEZVOUS {
         match op {
             Some(OP_INCOMING) => {
-                incoming(d, s, r);
+                incoming(d, r);
                 None
             }
-            Some(_) if !d.config().host => Some(error(NOT_PERMITTED)),
+            Some(OP_ADDRESSES) => {
+                heard_addresses(d, r);
+                None
+            }
             Some(OP_PRESENT) => {
                 let local = read_addresses(r.get(1));
                 let session = s.clone();
@@ -448,7 +484,7 @@ pub async fn serve(d: &Arc<Daemon>, s: &Session, mut st: Stream) -> anyhow::Resu
     } else {
         match op {
             Some(OP_RELAYED) => None,
-            Some(_) if !d.config().host => Some(error(NOT_PERMITTED)),
+            Some(OP_RELAY) if on_battery(Path::new(POWER_SUPPLIES)) => Some(error(BUSY)),
             Some(OP_RELAY) => Some(open_relay(d, s, r)),
             _ => Some(error(UNKNOWN)),
         }
@@ -464,7 +500,7 @@ fn error(code: u64) -> Record {
     Record::new().with(0, OP_ERROR).with(1, code)
 }
 
-/// As a host: tells every device present of `s`, and `s` of them.
+/// Tells every device present of `s`, and `s` of them.
 fn connect(s: &Session, d: &Daemon) -> Record {
     let me = s.peer_static();
     let mut present = lock(&d.rendezvous.present);
@@ -485,34 +521,43 @@ fn connect(s: &Session, d: &Daemon) -> Record {
             observed: observed(&p.session),
             local: p.local.clone(),
         })));
-        let (other, tell) = (p.session.clone(), tell.clone());
-        tokio::spawn(async move {
-            if let Ok(mut st) = other.open_stream(Service::RENDEZVOUS, Priority::Interactive) {
-                let _ = st.send_message(&Value::Record(tell)).await;
-                let _ = st.shutdown().await;
-            }
-        });
+        tell_device(p.session.clone(), Service::RENDEZVOUS, tell.clone());
     }
     Record::new()
         .with(0, OP_CONNECT)
         .with(1, Value::list(found))
 }
 
-/// A host says a device is looking for this one.
-fn incoming(d: &Arc<Daemon>, host: &Session, r: &Record) {
-    let is_from_host = host
-        .peer_identity()
-        .is_some_and(|p| is_host(d, &p.signing_key));
-    let Some(found) = read_found(r).filter(|_| is_from_host) else {
+/// Another of this person's devices says one is looking for this one.
+fn incoming(d: &Arc<Daemon>, r: &Record) {
+    let Some(found) = read_found(r) else {
         return;
     };
     if let Some((device, link)) = wanted(d).remove(&found.device) {
-        let addresses = found.addresses();
-        tokio::spawn(meet(d.clone(), host.clone(), device, link, addresses));
+        tokio::spawn(meet(d.clone(), device, link, found.addresses()));
     }
 }
 
-/// As a host: opens a channel between `s` and the device it names.
+/// Another of this person's devices says where it has reached the others.
+fn heard_addresses(d: &Daemon, r: &Record) {
+    for r in r
+        .record_list(1)
+        .unwrap_or_default()
+        .iter()
+        .take(MAX_DEVICES)
+    {
+        let device: Option<KeyId> = r
+            .get(1)
+            .and_then(Value::as_bytes)
+            .and_then(|b| b.try_into().ok());
+        if let Some(device) = device {
+            d.hear_addresses(&device, &read_addresses(r.get(2)));
+        }
+    }
+}
+
+/// Opens a channel between `s` and the device it names. Neither may itself
+/// go through a device: help goes one hop.
 fn open_relay(d: &Daemon, s: &Session, r: &Record) -> Record {
     let Some(device) = r.get(2).and_then(Value::as_bytes) else {
         return error(UNKNOWN);
@@ -525,7 +570,8 @@ fn open_relay(d: &Daemon, s: &Session, r: &Record) -> Record {
                     .is_some_and(|p| p.signing_key.as_slice() == device)
         })
     };
-    let Some(other) = other.filter(|_| !s.is_closed()) else {
+    let usable = |o: &Session| !s.is_closed() && !s.is_relayed() && !o.is_relayed();
+    let Some(other) = other.filter(usable) else {
         return error(NOT_PRESENT);
     };
     let (mine, theirs) = (s.peer_static(), other.peer_static());
@@ -549,16 +595,11 @@ fn open_relay(d: &Daemon, s: &Session, r: &Record) -> Record {
         .with(0, OP_RELAYED)
         .with(1, channel as u64)
         .with(2, s.peer_static());
-    tokio::spawn(async move {
-        if let Ok(mut st) = other.open_stream(Service::RELAY, Priority::Interactive) {
-            let _ = st.send_message(&Value::Record(tell)).await;
-            let _ = st.shutdown().await;
-        }
-    });
+    tell_device(other, Service::RELAY, tell);
     Record::new().with(0, OP_RELAY).with(1, channel as u64)
 }
 
-/// A session with this host ended: what went through it is over.
+/// A session with this device ended: what went through it is over.
 pub fn session_closed(d: &Daemon, peer_static: &[u8; 32]) {
     lock(&d.rendezvous.present).remove(peer_static);
     lock(&d.rendezvous.presented).remove(peer_static);
@@ -569,14 +610,6 @@ pub fn session_closed(d: &Daemon, peer_static: &[u8; 32]) {
         }
         keep
     });
-}
-
-/// This device stopped being a host.
-pub fn stop(d: &Daemon) {
-    lock(&d.rendezvous.present).clear();
-    for (channel, _) in lock(&d.rendezvous.channels).drain() {
-        d.endpoint.relay_close(channel);
-    }
 }
 
 #[cfg(test)]
@@ -617,6 +650,31 @@ mod tests {
             .unwrap()
             .addresses()
             .is_empty());
+    }
+
+    fn power(dir: &Path, name: &str, kind: &str, online: Option<&str>) {
+        let d = dir.join(name);
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(d.join("type"), kind).unwrap();
+        if let Some(o) = online {
+            std::fs::write(d.join("online"), o).unwrap();
+        }
+    }
+
+    #[test]
+    fn a_device_on_battery_is_told_apart() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(!on_battery(dir.path()), "a desktop has no battery");
+        assert!(!on_battery(Path::new("/nothing/here")));
+        power(dir.path(), "BAT0", "Battery\n", None);
+        power(dir.path(), "AC", "Mains\n", Some("0\n"));
+        power(dir.path(), "usb-c", "USB\n", Some("0\n"));
+        assert!(on_battery(dir.path()), "nothing plugged in");
+        power(dir.path(), "usb-c", "USB\n", Some("1\n"));
+        assert!(!on_battery(dir.path()), "charging over USB");
+        power(dir.path(), "usb-c", "USB\n", Some("0\n"));
+        power(dir.path(), "AC", "Mains\n", Some("1\n"));
+        assert!(!on_battery(dir.path()), "plugged in");
     }
 
     #[test]

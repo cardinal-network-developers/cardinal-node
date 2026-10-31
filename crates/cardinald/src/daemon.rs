@@ -70,8 +70,11 @@ const UDP_WITHIN: Duration = Duration::from_secs(2);
 /// the wrong one, so what an address costs should stay small.
 const TCP_WITHIN: Duration = Duration::from_secs(3);
 
+/// The most addresses kept for a device.
+const BOOK_LEN: usize = 6;
+
 /// Addresses of this person's devices, learned from pairing, discovery,
-/// and successful connections.
+/// successful connections, and each other.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct PeerBook {
     /// Device signing key (hex) -> addresses.
@@ -91,8 +94,22 @@ impl PeerBook {
             v.remove(i);
         }
         v.insert(0, a);
-        v.truncate(6);
+        v.truncate(BOOK_LEN);
         true
+    }
+
+    /// Keeps what another device said of `device`, after what this one
+    /// found out for itself. Returns whether that added anything.
+    fn hear(&mut self, device: &KeyId, addrs: &[SocketAddr]) -> bool {
+        let v = self.addrs.entry(hex::encode(device)).or_default();
+        let before = v.len();
+        for a in addrs {
+            let a = a.to_string();
+            if v.len() < BOOK_LEN && !v.contains(&a) {
+                v.push(a);
+            }
+        }
+        v.len() > before
     }
 
     /// A device connected from `ip`, so that is where it is now. It came
@@ -571,12 +588,8 @@ impl Daemon {
         let d = self.clone();
         let s2 = s.clone();
         tokio::spawn(net::serve(d, s2, gen));
-        if let PeerKind::Own(k) = kind {
-            tokio::spawn(crate::rendezvous::session_opened(
-                self.clone(),
-                s.clone(),
-                k,
-            ));
+        if matches!(kind, PeerKind::Own(_)) {
+            tokio::spawn(crate::rendezvous::session_opened(self.clone(), s.clone()));
         }
         let d = self.clone();
         if kind == PeerKind::Restoring {
@@ -955,7 +968,7 @@ impl Daemon {
                 }
             });
         }
-        tokio::spawn(crate::rendezvous::ask_hosts(self.clone()));
+        tokio::spawn(crate::rendezvous::ask_helpers(self.clone()));
     }
 
     /// Opens a session at an address, over UDP if something answers there,
@@ -1031,17 +1044,30 @@ impl Daemon {
         out
     }
 
+    /// Tries every known address at once: most of them are old, and each
+    /// one tried in turn would keep a returning device waiting.
     async fn try_device(
         self: &Arc<Self>,
         key: KeyId,
         link: cardinal_crypto::HybridPublicKey,
     ) -> bool {
+        let (done, give_up) = tokio::sync::watch::channel(false);
+        let mut tries = tokio::task::JoinSet::new();
         for (addr, manual) in self.candidate_addrs(&key).await {
-            if self.is_direct(link.x25519()) {
-                return true;
-            }
-            match self.dial(|c| Target::new(addr, c, &link)).await {
+            let (d, link, give_up) = (self.clone(), link.clone(), give_up.clone());
+            tries.spawn(async move {
+                let target = |c| Target::new(addr, c, &link).unless(give_up.clone());
+                (addr, manual, d.dial(target).await)
+            });
+        }
+        let mut reached = false;
+        while let Some(tried) = tries.join_next().await {
+            let Ok((addr, manual, result)) = tried else {
+                continue;
+            };
+            match result {
                 Ok(s) => {
+                    let _ = done.send(true);
                     {
                         let mut book = lock(&self.book);
                         book.add(&key, addr);
@@ -1051,18 +1077,51 @@ impl Daemon {
                     }
                     self.save_book();
                     self.on_session(s);
-                    return true;
+                    reached = true;
                 }
                 // The device's own simultaneous session won: connected.
                 Err(cardinal_link::LinkError::Closed(cardinal_link::CloseReason::Replaced)) => {
-                    return true;
+                    let _ = done.send(true);
+                    reached = true;
                 }
                 Err(e) => {
                     tracing::debug!("connect to {} at {addr}: {e}", short(&key));
                 }
             }
         }
-        false
+        reached || self.is_direct(link.x25519())
+    }
+
+    /// Where this device has reached its own devices, for the others.
+    pub fn addresses_to_share(&self) -> Vec<(KeyId, Vec<SocketAddr>)> {
+        let own: Vec<KeyId> = {
+            let core = self.core();
+            let Some(ident) = core.identity.as_ref() else {
+                return Vec::new();
+            };
+            ident.state().keys.keys().copied().collect()
+        };
+        let book = lock(&self.book);
+        own.into_iter()
+            .filter_map(|key| {
+                let known = book.addrs.get(&hex::encode(key))?;
+                let addrs = known.iter().filter_map(|a| a.parse().ok()).collect();
+                Some((key, addrs))
+            })
+            .collect()
+    }
+
+    /// Another of this person's devices says where it reached `device`.
+    pub fn hear_addresses(&self, device: &KeyId, addrs: &[SocketAddr]) {
+        let own = {
+            let core = self.core();
+            core.identity
+                .as_ref()
+                .is_some_and(|i| i.state().keys.contains_key(device))
+        };
+        if own && *device != self.keys.key() && lock(&self.book).hear(device, addrs) {
+            self.save_book();
+        }
     }
 
     /// Records where a device was seen.
@@ -1409,6 +1468,29 @@ mod book_tests {
             ["172.20.1.20:7171", "172.20.0.240:7171", "10.0.0.1:9000"]
         );
         assert!(!b.moved(&D, "172.20.1.20".parse().unwrap()), "no news");
+    }
+
+    #[test]
+    fn what_a_device_is_told_comes_after_what_it_found_out() {
+        let told: Vec<SocketAddr> = vec![
+            "10.0.0.1:1".parse().unwrap(),
+            "172.20.0.240:7171".parse().unwrap(),
+        ];
+        let mut b = book(&["172.20.0.240:7171"]);
+        assert!(b.hear(&D, &told));
+        assert_eq!(
+            b.addrs[&hex::encode(D)],
+            ["172.20.0.240:7171", "10.0.0.1:1"]
+        );
+        assert!(!b.hear(&D, &told), "no news");
+
+        // It never pushes out what is already there.
+        let many: Vec<SocketAddr> = (0..20)
+            .map(|n| SocketAddr::from(([10, 0, 1, n], 7171)))
+            .collect();
+        b.hear(&D, &many);
+        assert_eq!(b.addrs[&hex::encode(D)].len(), BOOK_LEN);
+        assert_eq!(b.addrs[&hex::encode(D)][0], "172.20.0.240:7171");
     }
 
     #[test]

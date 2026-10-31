@@ -683,24 +683,20 @@ asks for around that is not built yet.
   their space ids, not random labels, and it can read them. Hosts that
   cannot read what they store, delivery tokens, and the mailbox service are
   not implemented.
-- **Rendezvous and relay are for a person's own devices** so far: `connect`
-  and `relay` with a token come with sharing.
-- **Spec gap: local addresses have no field.** `hosts.md#rendezvous` passes
-  them on, but neither `incoming` nor the `connect` reply has a place for
-  them. Here it is field 4 of both.
-- **Spec ambiguity: what `relay`'s device signing key names.** The session
-  already says who asks, so here it names the device to relay to.
-- **Spec ambiguity: who relays.** "The requester relays", but two devices
-  looking for each other are both requesters. The one with the smaller static
-  key asks; the other can tell.
+- **Rendezvous and relay are for a person's own devices** so far, as D49
+  has it: every one of them offers both, host or not. `connect` and `relay`
+  with a token come with sharing.
+- **Which devices refuse to relay.** `hosts.md#help-from-a-persons-own-devices`
+  asks a device on battery or a metered connection to. Here one on battery
+  does. Nothing here can tell that a connection is metered.
 - **One path at a time.** A relay is meant to be another path of a session,
   abandoned when a direct one validates. Here a direct session replaces the
   relayed one, which `link.md#identity-binding` allows, and a device looks for
   one once a minute.
 - **A host's address must be a literal to be used day to day.** Devices dial
   the addresses in a grant, but never a name in one: names are for the
-  recovery sheet. A device whose only host has moved, with no other way to
-  reach it, waits to meet it on a local network.
+  recovery sheet. A device that reaches none of its own devices, because they
+  have all moved, waits to meet one on a local network.
 - **Storage ops.** Only `prove` (op 5). `drop`, `list`, `allow` and `public`
   are answered with error 3, unknown.
 - **Restore step 5 differs.** A restoring device does not list labels and

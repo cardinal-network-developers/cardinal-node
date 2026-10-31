@@ -38,12 +38,13 @@ One person, several Linux devices, one folder that is the same everywhere:
   device, `cardinal recovery restore --host <address> --key <key>` asks for
   the 24 words and brings everything back. Old versions follow that
   device's `cardinal keep-old`. Hosts run by others are not supported yet.
-- Away from home, or behind a router? Devices talk over UDP, and keep a
-  session with your always-on device, which helps them find each other even
-  when they move. Two devices usually connect straight through their routers;
-  if they cannot, it passes their traffic along, encrypted so it cannot read
-  it. For that to work from outside, forward UDP 7171 (and TCP 7171 for older
-  devices) to the always-on device.
+- Away from home, or behind a router? Devices talk over UDP, and help each
+  other: any of them connected to two others can introduce them, even when
+  they move, and they usually connect straight through their routers. If they
+  cannot, it passes their traffic along, encrypted, unless it is on battery. A
+  device coming back needs to reach just one of them, so at least one should
+  be reachable from outside: forward UDP 7171 (and TCP 7171 for older devices)
+  to your always-on device.
 
 - Two people can connect and talk: `cardinal invite` makes an invitation and
   `cardinal accept <invitation>` uses it, then `cardinal say <name> <text>` and

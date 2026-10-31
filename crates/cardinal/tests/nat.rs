@@ -25,10 +25,14 @@ enum Kind {
     /// A new public port for each address it sends to, as many carrier NATs
     /// do. What a host sees says nothing about what a peer would.
     Symmetric,
+    /// One public port, known ahead and open to anyone: a forwarded port.
+    Forwarded,
 }
 
 struct Nat {
     gateway: SocketAddr,
+    /// The public address, for a forwarded port.
+    public: Option<SocketAddr>,
     _runtime: tokio::runtime::Runtime,
 }
 
@@ -42,17 +46,29 @@ impl Nat {
         let runtime = tokio::runtime::Runtime::new().unwrap();
         let inner = runtime.block_on(UdpSocket::bind("127.0.0.1:0")).unwrap();
         let gateway = inner.local_addr().unwrap();
-        runtime.spawn(run(Arc::new(inner), kind));
+        let open = runtime
+            .block_on(UdpSocket::bind("127.0.0.1:0"))
+            .ok()
+            .filter(|_| kind == Kind::Forwarded)
+            .map(Arc::new);
+        let public = open.as_ref().map(|s| s.local_addr().unwrap());
+        runtime.spawn(run(Arc::new(inner), kind, open));
         Nat {
             gateway,
+            public,
             _runtime: runtime,
         }
     }
 }
 
-async fn run(inner: Arc<UdpSocket>, kind: Kind) {
+async fn run(inner: Arc<UdpSocket>, kind: Kind, forwarded: Option<Arc<UdpSocket>>) {
     let mut maps: HashMap<Option<SocketAddr>, Mapping> = HashMap::new();
     let device: Arc<Mutex<Option<SocketAddr>>> = Default::default();
+    if let Some(public) = forwarded {
+        let opened: Arc<Mutex<HashSet<SocketAddr>>> = Default::default();
+        tokio::spawn(back(public.clone(), None, inner.clone(), device.clone()));
+        maps.insert(None, Mapping { public, opened });
+    }
     let mut buf = vec![0u8; 4096];
     loop {
         let (n, from) = inner.recv_from(&mut buf).await.unwrap();
@@ -70,7 +86,7 @@ async fn run(inner: Arc<UdpSocket>, kind: Kind) {
                 let opened: Arc<Mutex<HashSet<SocketAddr>>> = Default::default();
                 tokio::spawn(back(
                     public.clone(),
-                    opened.clone(),
+                    Some(opened.clone()),
                     inner.clone(),
                     device.clone(),
                 ));
@@ -85,14 +101,17 @@ async fn run(inner: Arc<UdpSocket>, kind: Kind) {
 /// What comes in on a public port goes to the device, if it sent there first.
 async fn back(
     public: Arc<UdpSocket>,
-    opened: Arc<Mutex<HashSet<SocketAddr>>>,
+    opened: Option<Arc<Mutex<HashSet<SocketAddr>>>>,
     inner: Arc<UdpSocket>,
     device: Arc<Mutex<Option<SocketAddr>>>,
 ) {
     let mut buf = vec![0u8; 4096];
     loop {
         let (n, from) = public.recv_from(&mut buf[HEADER..]).await.unwrap();
-        if !opened.lock().unwrap().contains(&from) {
+        if opened
+            .as_ref()
+            .is_some_and(|o| !o.lock().unwrap().contains(&from))
+        {
             continue;
         }
         if let SocketAddr::V4(a) = from {
@@ -234,40 +253,111 @@ fn devices_that_cannot_punch_through_go_through_the_host() {
     assert!(!y.p("after.txt").exists());
 }
 
-/// Sessions opened before a device knew the other was a host: nothing
-/// reconnects, and a device that became a host is still found and used.
+/// Three devices, none of them a host.
+fn three_plain(root: &std::path::Path) -> (Dev, Dev, Dev) {
+    let mut plain = Dev::new(root, "plain", free_port());
+    let mut x = Dev::new(root, "ex", free_port());
+    let mut y = Dev::new(root, "why", free_port());
+    plain.start();
+    plain.cli(&["init", "--yes", "--name", "plain"]);
+    plain.wait_mounted();
+    x.start();
+    pair(&plain, &x);
+    y.start();
+    pair(&plain, &y);
+    x.wait_mounted();
+    y.wait_mounted();
+    assert!(plain
+        .cli(&["recovery", "sheet"])
+        .contains("no always-on device"));
+    (plain, x, y)
+}
+
+/// `hosts.md#help-from-a-persons-own-devices`: any device with a session to
+/// two others introduces them, and they stay connected when it goes.
 #[test]
-fn a_host_added_later_is_used_without_reconnecting() {
+fn a_device_that_is_no_host_introduces_two_others() {
     if !fuse_available() {
         eprintln!("skipping: /dev/fuse or fusermount3 is not available");
         return;
     }
     let root = tempfile::tempdir().unwrap();
-    let mut host = Dev::new(root.path(), "host", free_port());
-    let mut x = Dev::new(root.path(), "ex", free_port());
-    let mut y = Dev::new(root.path(), "why", free_port());
-    host.start();
-    host.cli(&["init", "--yes", "--name", "host"]);
-    host.wait_mounted();
-    x.start();
-    pair(&host, &x);
-    y.start();
-    pair(&host, &y);
-    x.wait_mounted();
-    y.wait_mounted();
+    let (mut plain, mut x, mut y) = three_plain(root.path());
     let (nx, ny) = (
         Nat::new(Kind::PortRestricted),
         Nat::new(Kind::PortRestricted),
     );
     put_behind(&mut x, &nx);
     put_behind(&mut y, &ny);
-    wait("both reach alpha", 30, || {
-        carrier(&x, "host") == "UDP" && carrier(&y, "host") == "UDP"
-    });
-    assert_eq!(carrier(&x, "why"), "", "nothing connects them yet");
-
-    host.cli(&["host", "--address", &format!("127.0.0.1:{}", host.port)]);
-    wait("they meet", 40, || {
+    wait("it introduces them", 30, || {
         carrier(&x, "why") == "UDP" && carrier(&y, "ex") == "UDP"
+    });
+    plain.stop();
+    std::fs::write(x.p("direct.txt"), "x\n").unwrap();
+    x.cli(&["flush"]);
+    wait("y has it with the other gone", 15, || {
+        std::fs::read(y.p("direct.txt")).is_ok_and(|b| b == b"x\n")
+    });
+}
+
+#[test]
+fn a_device_that_is_no_host_relays_for_two_others() {
+    if !fuse_available() {
+        eprintln!("skipping: /dev/fuse or fusermount3 is not available");
+        return;
+    }
+    let root = tempfile::tempdir().unwrap();
+    let (_plain, mut x, mut y) = three_plain(root.path());
+    let (nx, ny) = (Nat::new(Kind::Symmetric), Nat::new(Kind::Symmetric));
+    put_behind(&mut x, &nx);
+    put_behind(&mut y, &ny);
+    wait("they meet through it", 40, || {
+        carrier(&x, "why") == "relay" && carrier(&y, "ex") == "relay"
+    });
+    std::fs::write(x.p("relayed.txt"), "r\n").unwrap();
+    x.cli(&["flush"]);
+    wait("y has it", 15, || {
+        std::fs::read(y.p("relayed.txt")).is_ok_and(|b| b == b"r\n")
+    });
+}
+
+/// The helper need not be out in the open: here it too is behind a router, one
+/// with a forwarded port. And a device that comes back needs only it, not a
+/// host and not a mailbox, to catch up.
+#[test]
+fn a_device_behind_a_forwarded_port_helps_and_catches_others_up() {
+    if !fuse_available() {
+        eprintln!("skipping: /dev/fuse or fusermount3 is not available");
+        return;
+    }
+    let root = tempfile::tempdir().unwrap();
+    let (mut plain, mut x, mut y) = three_plain(root.path());
+    let forwarded = Nat::new(Kind::Forwarded);
+    let public = forwarded.public.unwrap().to_string();
+    x.cli(&["peer", "add", &public]);
+    y.cli(&["peer", "add", &public]);
+    put_behind(&mut plain, &forwarded);
+    let (nx, ny) = (
+        Nat::new(Kind::PortRestricted),
+        Nat::new(Kind::PortRestricted),
+    );
+    put_behind(&mut x, &nx);
+    put_behind(&mut y, &ny);
+    wait("it introduces them", 40, || {
+        carrier(&x, "why") == "UDP" && carrier(&y, "ex") == "UDP"
+    });
+
+    // X is away while Y writes, and comes back to find only the helper.
+    x.stop();
+    std::fs::write(y.p("while-away.txt"), "news\n").unwrap();
+    y.cli(&["flush"]);
+    wait("the helper has it", 15, || {
+        std::fs::read(plain.p("while-away.txt")).is_ok_and(|b| b == b"news\n")
+    });
+    y.stop();
+    x.start();
+    x.wait_mounted();
+    wait("x catches up from the helper", 20, || {
+        std::fs::read(x.p("while-away.txt")).is_ok_and(|b| b == b"news\n")
     });
 }
