@@ -101,7 +101,11 @@ async fn across(link: Link) -> Pair {
             identity: [0xaa; 32],
             signing_key: Arc::new(SigningKey::from_seed(&[n; 32])),
         };
-        dir.add_device(id.identity, id.signing_key.public_key(), key.public_key().clone());
+        dir.add_device(
+            id.identity,
+            id.signing_key.public_key(),
+            key.public_key().clone(),
+        );
         (key, id)
     };
     let (ka, ia) = device(1);
@@ -174,7 +178,9 @@ async fn transfer(p: &Pair, bytes: &[u8], priority: Priority) -> (Vec<u8>, Durat
 }
 
 fn pattern(n: usize) -> Vec<u8> {
-    (0..n as u32).map(|i| (i.wrapping_mul(31) >> 3) as u8).collect()
+    (0..n as u32)
+        .map(|i| (i.wrapping_mul(31) >> 3) as u8)
+        .collect()
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -235,7 +241,10 @@ async fn a_message_gets_through_beside_a_big_transfer() {
     let bulk = {
         let p = p.clone();
         tokio::spawn(async move {
-            let mut out = p.client.open_stream(Service::BLOB, Priority::Background).unwrap();
+            let mut out = p
+                .client
+                .open_stream(Service::BLOB, Priority::Background)
+                .unwrap();
             out.write_all(&big).await.unwrap();
             out.shutdown().await.unwrap();
         })
@@ -252,7 +261,10 @@ async fn a_message_gets_through_beside_a_big_transfer() {
     for _ in 0..20 {
         let (got, took) = {
             let t0 = Instant::now();
-            let mut out = p.client.open_stream(Service::SYNC, Priority::Interactive).unwrap();
+            let mut out = p
+                .client
+                .open_stream(Service::SYNC, Priority::Interactive)
+                .unwrap();
             out.write_all(b"news").await.unwrap();
             out.shutdown().await.unwrap();
             let mut rx = p.server.accept_stream().await.unwrap();
@@ -266,7 +278,10 @@ async fn a_message_gets_through_beside_a_big_transfer() {
     }
     times.sort();
     let median = times[times.len() / 2];
-    eprintln!("MEASURE beside a transfer: median {median:?}, worst {:?}", times[times.len() - 1]);
+    eprintln!(
+        "MEASURE beside a transfer: median {median:?}, worst {:?}",
+        times[times.len() - 1]
+    );
     assert!(median < Duration::from_millis(90), "median {median:?}");
     drop(bulk);
     drop(drain);
@@ -285,7 +300,11 @@ async fn measure_raw_speed() {
                 identity: [0xaa; 32],
                 signing_key: Arc::new(SigningKey::from_seed(&[n; 32])),
             };
-            dir.add_device(id.identity, id.signing_key.public_key(), key.public_key().clone());
+            dir.add_device(
+                id.identity,
+                id.signing_key.public_key(),
+                key.public_key().clone(),
+            );
             (key, id)
         };
         let (ka, ia) = device(1);

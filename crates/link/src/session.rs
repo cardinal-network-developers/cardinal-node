@@ -201,6 +201,16 @@ impl Session {
         self.inner.lock().path.remote_addr()
     }
 
+    /// The current path.
+    pub(crate) fn path(&self) -> Path {
+        self.inner.lock().path.clone()
+    }
+
+    /// Whether the session runs through a host.
+    pub fn is_relayed(&self) -> bool {
+        self.inner.lock().path.is_relayed()
+    }
+
     /// The carrier of the current path.
     pub fn carrier(&self) -> Option<CarrierKind> {
         self.inner.lock().path.carrier()

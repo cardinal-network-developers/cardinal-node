@@ -35,8 +35,12 @@ fn udp_where_it_works_and_tcp_where_it_does_not() {
     b.wait_mounted();
     c.wait_mounted();
 
-    wait("alpha reaches beta over UDP", 20, || carrier(&a, "beta") == "UDP");
-    wait("alpha reaches gamma over TCP", 20, || carrier(&a, "gamma") == "TCP");
+    wait("alpha reaches beta over UDP", 20, || {
+        carrier(&a, "beta") == "UDP"
+    });
+    wait("alpha reaches gamma over TCP", 20, || {
+        carrier(&a, "gamma") == "TCP"
+    });
 
     // A file big enough for chunks, each way.
     let big: Vec<u8> = (0..4_000_000u32).map(|n| (n * 13 % 251) as u8).collect();

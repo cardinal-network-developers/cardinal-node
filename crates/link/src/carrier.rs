@@ -69,7 +69,7 @@ impl Drop for CloseOnDrop {
 #[derive(Clone)]
 pub(crate) enum Path {
     Udp {
-        socket: Arc<UdpSocket>,
+        socket: Arc<Udp>,
         addr: SocketAddr,
     },
     Tcp(Arc<TcpPath>),
@@ -128,6 +128,11 @@ impl Path {
         }
     }
 
+    /// Whether packets go through a host.
+    pub fn is_relayed(&self) -> bool {
+        matches!(self, Path::Relayed { .. })
+    }
+
     /// The remote socket address, if the path has one.
     pub fn remote_addr(&self) -> Option<SocketAddr> {
         match self {
@@ -145,7 +150,8 @@ impl Path {
         match self {
             Path::Tcp(_) => true,
             Path::Udp { .. } => false,
-            Path::Relayed { via, .. } => via.is_reliable(),
+            // Whatever carries this leg, the host's other leg may lose it.
+            Path::Relayed { .. } => false,
             #[cfg(test)]
             Path::Mem(_) => true,
         }
@@ -171,7 +177,7 @@ impl Path {
     /// Sends a packet.
     pub async fn send(&self, packet: Bytes) -> std::io::Result<()> {
         match self {
-            Path::Udp { socket, addr } => socket.send_to(&packet, *addr).await.map(|_| ()),
+            Path::Udp { socket, addr } => socket.send_to(&packet, *addr).await,
             Path::Tcp(t) => {
                 t.tx.send(frame_tcp(&[packet]))
                     .await
@@ -208,9 +214,7 @@ impl Path {
     /// Sends without waiting; drops the packet if the carrier is busy.
     pub fn try_send(&self, packet: Bytes) {
         match self {
-            Path::Udp { socket, addr } => {
-                let _ = socket.try_send_to(&packet, *addr);
-            }
+            Path::Udp { socket, addr } => socket.try_send_to(&packet, *addr),
             Path::Tcp(t) => {
                 let _ = t.tx.try_send(frame_tcp(&[packet]));
             }
@@ -236,6 +240,72 @@ fn frame_tcp(packets: &[Bytes]) -> Bytes {
         b.put_slice(p);
     }
     b.freeze()
+}
+
+/// A UDP socket. Tests can put a simulated NAT in front of one: then all of
+/// its traffic goes through `gateway`, each datagram after the address it is
+/// to or from, and nothing else gets in, as with a device behind a router.
+pub(crate) struct Udp {
+    socket: UdpSocket,
+    gateway: Option<SocketAddr>,
+}
+
+/// An IPv4 address and a little-endian port, ahead of a datagram.
+const GATEWAY_HEADER: usize = 6;
+
+fn gateway_header(addr: SocketAddr) -> [u8; GATEWAY_HEADER] {
+    let mut h = [0u8; GATEWAY_HEADER];
+    if let SocketAddr::V4(a) = addr {
+        h[..4].copy_from_slice(&a.ip().octets());
+        h[4..].copy_from_slice(&a.port().to_le_bytes());
+    }
+    h
+}
+
+impl Udp {
+    pub(crate) fn new(socket: UdpSocket, gateway: Option<SocketAddr>) -> Udp {
+        Udp { socket, gateway }
+    }
+
+    pub(crate) fn local_addr(&self) -> std::io::Result<SocketAddr> {
+        self.socket.local_addr()
+    }
+
+    async fn send_to(&self, packet: &[u8], addr: SocketAddr) -> std::io::Result<()> {
+        match self.gateway {
+            None => self.socket.send_to(packet, addr).await.map(|_| ()),
+            Some(gateway) => {
+                let wrapped = [&gateway_header(addr)[..], packet].concat();
+                self.socket.send_to(&wrapped, gateway).await.map(|_| ())
+            }
+        }
+    }
+
+    fn try_send_to(&self, packet: &[u8], addr: SocketAddr) {
+        let _ = match self.gateway {
+            None => self.socket.try_send_to(packet, addr),
+            Some(gateway) => {
+                let wrapped = [&gateway_header(addr)[..], packet].concat();
+                self.socket.try_send_to(&wrapped, gateway)
+            }
+        };
+    }
+
+    async fn recv_from(&self, buf: &mut [u8]) -> std::io::Result<(usize, SocketAddr)> {
+        loop {
+            let (n, from) = self.socket.recv_from(buf).await?;
+            let Some(gateway) = self.gateway else {
+                return Ok((n, from));
+            };
+            if from != gateway || n < GATEWAY_HEADER {
+                continue;
+            }
+            let ip = std::net::Ipv4Addr::new(buf[0], buf[1], buf[2], buf[3]);
+            let port = u16::from_le_bytes([buf[4], buf[5]]);
+            buf.copy_within(GATEWAY_HEADER..n, 0);
+            return Ok((n - GATEWAY_HEADER, SocketAddr::from((ip, port))));
+        }
+    }
 }
 
 static NEXT_TCP_ID: AtomicU64 = AtomicU64::new(1);
@@ -329,7 +399,7 @@ pub(crate) fn spawn_tcp(
 
 /// Starts receiving packets on a UDP socket.
 pub(crate) fn spawn_udp(
-    socket: Arc<UdpSocket>,
+    socket: Arc<Udp>,
     ingress: Arc<dyn Ingress>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {

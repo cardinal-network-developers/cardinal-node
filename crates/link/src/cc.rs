@@ -470,7 +470,9 @@ mod tests {
             let f = &mut self.flows[i];
             f.cc.is_paced_now(class, now);
             if let Some(next) = f.cc.next_paced() {
-                let wake = next.duration_since(self.t0).max(t + Duration::from_micros(1));
+                let wake = next
+                    .duration_since(self.t0)
+                    .max(t + Duration::from_micros(1));
                 if f.wake.is_none_or(|w| w <= t || wake < w) {
                     f.wake = Some(wake);
                     self.at(wake, Event::Send(i));

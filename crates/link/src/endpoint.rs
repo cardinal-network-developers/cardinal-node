@@ -13,7 +13,7 @@ use tokio::sync::{broadcast, mpsc, oneshot, Notify};
 use tokio::task::AbortHandle;
 use zeroize::Zeroizing;
 
-use crate::carrier::{spawn_tcp, spawn_udp, CarrierKind, Ingress, Path};
+use crate::carrier::{spawn_tcp, spawn_udp, CarrierKind, Ingress, Path, Udp};
 use crate::conn::{
     Admission, CloseReason, Conn, ConnEvent, ConnParams, Role, SessionConfig, Signals,
 };
@@ -52,6 +52,8 @@ pub struct EndpointConfig {
     /// public label, and restore; `hosts.md`). Such sessions report
     /// [`Admission::Public`].
     pub allow_public: bool,
+    /// For tests: a simulated NAT to send all UDP through.
+    pub udp_gateway: Option<SocketAddr>,
     /// How often an unanswered initiation is resent over UDP.
     pub handshake_retry: Duration,
     /// How long [`Endpoint::connect`] tries before giving up.
@@ -68,6 +70,7 @@ impl EndpointConfig {
             session: SessionConfig::default(),
             cookies: CookiePolicy::UnderLoad(200),
             allow_public: false,
+            udp_gateway: None,
             handshake_retry: Duration::from_secs(1),
             connect_timeout: Duration::from_secs(10),
         }
@@ -102,6 +105,8 @@ pub struct Target {
     /// How long this attempt may take, if not the endpoint's
     /// [`connect_timeout`](EndpointConfig::connect_timeout).
     pub within: Option<Duration>,
+    /// Go through a host: its session, and the channel it gave.
+    pub through: Option<(Session, u32)>,
     /// A public-service or restore session: nothing but the address and
     /// X25519 key is known of the peer, and this device has no secret.
     pub public: bool,
@@ -111,6 +116,12 @@ impl Target {
     /// Gives this attempt its own time limit.
     pub fn within(mut self, limit: Duration) -> Target {
         self.within = Some(limit);
+        self
+    }
+
+    /// Goes through a host, on a channel it gave (`hosts.md#relay`).
+    pub fn through(mut self, host: &Session, channel: u32) -> Target {
+        self.through = Some((host.clone(), channel));
         self
     }
 
@@ -124,6 +135,7 @@ impl Target {
             secret: None,
             expected: ExpectedPeer::default(),
             within: None,
+            through: None,
             public: false,
         }
     }
@@ -140,6 +152,7 @@ impl Target {
             secret: None,
             expected: ExpectedPeer::default(),
             within: None,
+            through: None,
             public: true,
         }
     }
@@ -159,6 +172,7 @@ impl Target {
             secret: Some(Zeroizing::new(secret.to_vec())),
             expected: ExpectedPeer::default(),
             within: None,
+            through: None,
             public: false,
         }
     }
@@ -265,7 +279,7 @@ pub(crate) struct EndpointInner {
     accept_tx: mpsc::UnboundedSender<Session>,
     accept_rx: tokio::sync::Mutex<mpsc::UnboundedReceiver<Session>>,
     events: broadcast::Sender<EndpointEvent>,
-    udp: Option<Arc<UdpSocket>>,
+    udp: Option<Arc<Udp>>,
     udp_addr: Option<SocketAddr>,
     tcp_addr: Option<SocketAddr>,
     tasks: Mutex<Vec<AbortHandle>>,
@@ -273,6 +287,28 @@ pub(crate) struct EndpointInner {
     weak: Weak<EndpointInner>,
     /// Sessions with readers to wake at the end of a carrier batch.
     deferred: Mutex<Vec<Arc<SessionInner>>>,
+    /// The channels this device forwards, as a host.
+    relays: Mutex<HashMap<u32, Relay>>,
+}
+
+/// A channel a host forwards.
+struct Relay {
+    a: Path,
+    b: Path,
+}
+
+impl Relay {
+    /// Where a packet from `from` goes. Nothing goes on from a path that
+    /// does not belong to the channel.
+    fn other_side(&self, from: &Path) -> Option<&Path> {
+        if self.a.same(from) {
+            Some(&self.b)
+        } else if self.b.same(from) {
+            Some(&self.a)
+        } else {
+            None
+        }
+    }
 }
 
 /// Forwards carrier packets to the endpoint without keeping it alive.
@@ -318,7 +354,10 @@ impl Endpoint {
     /// Binds the carriers and starts answering handshakes.
     pub async fn bind(config: EndpointConfig, bind: Bind) -> std::io::Result<Endpoint> {
         let udp = match bind.udp {
-            Some(a) => Some(Arc::new(UdpSocket::bind(a).await?)),
+            Some(a) => Some(Arc::new(Udp::new(
+                UdpSocket::bind(a).await?,
+                config.udp_gateway,
+            ))),
             None => None,
         };
         let tcp = match bind.tcp {
@@ -355,6 +394,7 @@ impl Endpoint {
             closed: AtomicBool::new(false),
             weak: weak.clone(),
             deferred: Mutex::new(Vec::new()),
+            relays: Mutex::new(HashMap::new()),
         });
         if let Some(u) = udp {
             let h = spawn_udp(u, Arc::new(WeakIngress(Arc::downgrade(&inner))));
@@ -487,6 +527,23 @@ impl Endpoint {
         }
     }
 
+    /// As a host, forwards what arrives on `channel` from either session's
+    /// path to the other's (`hosts.md#relay`). The sessions are the two
+    /// devices' sessions with this one; what they send each other through
+    /// it is end to end, and this device cannot read it.
+    pub fn relay_open(&self, channel: u32, a: &Session, b: &Session) {
+        let relay = Relay {
+            a: a.path(),
+            b: b.path(),
+        };
+        lock(&self.inner.relays).insert(channel, relay);
+    }
+
+    /// Stops forwarding `channel`.
+    pub fn relay_close(&self, channel: u32) {
+        lock(&self.inner.relays).remove(&channel);
+    }
+
     /// Opens a session: handshake, device proofs, and the first rekey.
     pub async fn connect(&self, target: Target) -> Result<Session, LinkError> {
         let ep = &self.inner;
@@ -495,15 +552,19 @@ impl Endpoint {
         }
         let limit = target.within.unwrap_or(ep.config.connect_timeout);
         let deadline = tokio::time::Instant::now() + limit;
-        let path = match target.carrier {
-            CarrierKind::Udp => {
+        let path = match (&target.through, target.carrier) {
+            (Some((host, channel)), _) => Path::Relayed {
+                via: Box::new(host.path()),
+                channel: *channel,
+            },
+            (None, CarrierKind::Udp) => {
                 let socket = ep.udp.clone().ok_or(LinkError::NoCarrier)?;
                 Path::Udp {
                     socket,
                     addr: target.addr,
                 }
             }
-            CarrierKind::Tcp => {
+            (None, CarrierKind::Tcp) => {
                 let stream = tokio::time::timeout_at(deadline, TcpStream::connect(target.addr))
                     .await
                     .map_err(|_| LinkError::Timeout)??;
@@ -734,6 +795,13 @@ impl EndpointInner {
             packet::TYPE_COOKIE_REPLY => self.on_cookie_reply(pkt),
             packet::TYPE_RELAYED => {
                 if let Some((channel, _)) = packet::parse_relayed(pkt) {
+                    // As the host: on to the other side, as it came.
+                    if let Some(relay) = lock(&self.relays).get(&channel) {
+                        if let Some(to) = relay.other_side(path) {
+                            to.try_send(bytes::Bytes::copy_from_slice(pkt));
+                        }
+                        return;
+                    }
                     let relayed = Path::Relayed {
                         via: Box::new(path.clone()),
                         channel,

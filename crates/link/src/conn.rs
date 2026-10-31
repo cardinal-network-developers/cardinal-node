@@ -1074,7 +1074,11 @@ impl Conn {
             })
             .map(|(k, _)| *k)
             .collect();
-        let any_pto = self.sent.values().next().is_some_and(|p| p.time + pto <= now);
+        let any_pto = self
+            .sent
+            .values()
+            .next()
+            .is_some_and(|p| p.time + pto <= now);
         if any_pto {
             self.pto_count += 1;
             if self.pto_count == PERSISTENT_PTOS {
