@@ -551,14 +551,44 @@ fn uninstall_keeps_data_and_purge_needs_confirmation() {
     for answer in [None, Some("y"), Some("yes"), Some("DELETE")] {
         let p = FakePrompt(answer);
         let c = env.ctx(&runner, &p);
-        assert!(ops::uninstall(&c, true).is_err());
+        assert!(ops::uninstall(&c, ops::Data::Purge).is_err());
         assert!(env.paths.bin().exists());
         assert!(env.paths.unit_file().exists());
     }
 
-    // Plain uninstall keeps data.
+    // Asked, anything but a clear yes removes nothing, and that includes
+    // just pressing Enter.
+    for answer in [
+        None,
+        Some(""),
+        Some("n"),
+        Some("no"),
+        Some("yep"),
+        Some("delete"),
+    ] {
+        let p = FakePrompt(answer);
+        let c = env.ctx(&runner, &p);
+        assert!(ops::uninstall(&c, ops::Data::Ask).is_err());
+        assert!(env.paths.bin().exists());
+        assert!(env.paths.unit_file().exists());
+    }
+
+    // Asked and agreed: data stays. It can be installed again.
     runner.calls.borrow_mut().clear();
-    ops::uninstall(&ctx, false).unwrap();
+    let p = FakePrompt(Some("y"));
+    let c = env.ctx(&runner, &p);
+    ops::uninstall(&c, ops::Data::Ask).unwrap();
+    assert!(!env.paths.bin().exists());
+    assert!(env.paths.data_dir.join("keys").exists());
+    assert_eq!(
+        runner.systemctl_calls()[0],
+        "systemctl --user disable --now cardinal.service"
+    );
+    ops::install(&ctx, &exe, false).unwrap();
+
+    // Told to keep it, nothing needs asking.
+    runner.calls.borrow_mut().clear();
+    ops::uninstall(&ctx, ops::Data::Keep).unwrap();
     assert!(!env.paths.bin().exists());
     assert!(!env.paths.unit_file().exists());
     assert!(env.paths.data_dir.join("keys").exists());
@@ -571,7 +601,7 @@ fn uninstall_keeps_data_and_purge_needs_confirmation() {
     // Purge with the word deletes everything.
     let p = FakePrompt(Some("delete"));
     let c = env.ctx(&runner, &p);
-    ops::uninstall(&c, true).unwrap();
+    ops::uninstall(&c, ops::Data::Purge).unwrap();
     assert!(!env.paths.data_dir.exists());
     assert!(!env.paths.config_dir.exists());
 }

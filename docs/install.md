@@ -135,7 +135,9 @@ cardinal uninstall
 ```
 
 stops and disables the service and removes the unit and binaries. Your data
-and settings stay, so reinstalling picks up where you left off.
+and settings stay, so reinstalling picks up where you left off. It shows where
+they are and asks before removing anything, so you can stop and choose
+`--purge` instead. `--keep-data` skips the question, for scripts.
 
 ```sh
 cardinal uninstall --purge

@@ -483,10 +483,39 @@ pub fn update(ctx: &Ctx, from: Option<&str>, check: bool) -> anyhow::Result<Upda
 // ---------------------------------------------------------------------------
 // Uninstall.
 
+/// What `cardinal uninstall` does with this device's data and keys.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Data {
+    /// Say what stays, and ask before removing anything.
+    Ask,
+    /// Keep them, without asking (`--keep-data`).
+    Keep,
+    /// Delete them too (`--purge`), which has its own confirmation.
+    Purge,
+}
+
 /// `cardinal uninstall`.
-pub fn uninstall(ctx: &Ctx, purge: bool) -> anyhow::Result<()> {
+pub fn uninstall(ctx: &Ctx, data: Data) -> anyhow::Result<()> {
     let paths = &ctx.paths;
-    if purge {
+    if data == Data::Ask {
+        // The binary goes first, so this is the last chance to run it with
+        // another option. Only a clear yes goes on.
+        eprintln!(
+            "This removes the Cardinal service and binary. Your data and settings stay:\n  {}\n  \
+             {}\nTo delete them too, answer no and run `cardinal uninstall --purge`.",
+            paths.data_dir.display(),
+            paths.config_dir.display()
+        );
+        match ctx.prompt.ask("Continue, keeping them? [y/N] ") {
+            Some(a) if matches!(a.trim().to_lowercase().as_str(), "y" | "yes") => {}
+            Some(_) => bail!("nothing was removed"),
+            None => bail!(
+                "with no terminal to ask on, say what to do with your data: `--keep-data` or \
+                 `--purge`. Nothing was removed"
+            ),
+        }
+    }
+    if data == Data::Purge {
         eprintln!(
             "--purge permanently deletes this device's Cardinal data and keys:\n  {}\n  {}\n\
              Anything not synced to another device is lost for good. This cannot be undone.",
@@ -515,7 +544,7 @@ pub fn uninstall(ctx: &Ctx, purge: bool) -> anyhow::Result<()> {
     remove_file_if_exists(&paths.previous_bin())?;
     println!("Removed the cardinal service and binary.");
 
-    if purge {
+    if data == Data::Purge {
         for d in [&paths.data_dir, &paths.config_dir] {
             match fs::remove_dir_all(d) {
                 Ok(()) => println!("Deleted {}", d.display()),
@@ -525,7 +554,7 @@ pub fn uninstall(ctx: &Ctx, purge: bool) -> anyhow::Result<()> {
         }
     } else {
         println!(
-            "Kept your data in {} and settings in {}; `cardinal uninstall --purge` removes them.",
+            "Kept your data in {} and settings in {}. To delete them: rm -rf {0} {1}",
             paths.data_dir.display(),
             paths.config_dir.display()
         );

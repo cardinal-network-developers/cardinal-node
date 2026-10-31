@@ -570,8 +570,13 @@ Not implemented yet (the next milestone):
 - **Settling a conflict of three or more versions.** Deleting one conflict
   copy writes a `set` of the main version, which also drops the other
   copies (they remain in history). A `set` cannot keep two of three values.
-- **Not implemented: `rotate_after`.** Epochs rotate only when a device is
-  removed.
+- **Not implemented: `rotate_after`.** Epochs rotate only when the identity's
+  encryption key changes, which every removal does.
+- **Reading: when a rotation is due.** "A member identity's encryption key
+  changed since the epoch began" is checked by trying to open the current
+  epoch's wrap with the current encryption key, so it follows from the state
+  on every device. A device that cannot open the current key yet does not
+  rotate; it could not tell, and its writes are held to the epoch it knows.
 - **Retention: old versions for a while.** `full` keeps every chunk of
   current state, and also the chunks of deleted files and replaced
   versions for `keep_old` (30 days by default), so they can be restored;

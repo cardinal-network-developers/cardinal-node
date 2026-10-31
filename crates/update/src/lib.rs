@@ -50,11 +50,15 @@ pub enum DeployCommand {
         #[arg(long)]
         check: bool,
     },
-    /// Stop the service and remove the binary and unit.
+    /// Stop the service and remove the binary and unit. Without an option
+    /// this says what stays, and asks first.
     Uninstall {
         /// Also delete all local data and keys.
-        #[arg(long)]
+        #[arg(long, conflicts_with = "keep_data")]
         purge: bool,
+        /// Keep local data and keys, without asking.
+        #[arg(long)]
+        keep_data: bool,
     },
     /// Print version and build information.
     Version,
@@ -75,7 +79,14 @@ pub fn run(cmd: DeployCommand) -> anyhow::Result<()> {
         DeployCommand::Update { from, check } => {
             ops::update(&ctx, from.as_deref(), check).map(|_| ())
         }
-        DeployCommand::Uninstall { purge } => ops::uninstall(&ctx, purge),
+        DeployCommand::Uninstall { purge, keep_data } => ops::uninstall(
+            &ctx,
+            match (purge, keep_data) {
+                (true, _) => ops::Data::Purge,
+                (_, true) => ops::Data::Keep,
+                _ => ops::Data::Ask,
+            },
+        ),
         DeployCommand::Version => unreachable!(),
     }
 }

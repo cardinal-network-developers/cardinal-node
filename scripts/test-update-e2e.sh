@@ -109,18 +109,22 @@ grep -q "signature" "$t/err" || fail "no signature error"
 [ "$(installed_version)" = "cardinal $v1" ] || fail "tampering changed the binary"
 
 step "install.sh from a local directory"
-as_user cardinal uninstall
+as_user cardinal uninstall --keep-data
 as_user sh "$repo/install.sh" "$devdir" </dev/null
 [ "$(installed_version)" = "cardinal $v2" ] || fail "install.sh: got $(installed_version)"
 
-step "uninstall keeps data; purge without a terminal removes nothing"
+step "uninstall keeps data; without a terminal only --keep-data goes ahead"
 mkdir -p "$home/.local/share/cardinal"
 echo precious >"$home/.local/share/cardinal/keys"
 if as_user setsid -w cardinal uninstall --purge </dev/null 2>/dev/null; then
     fail "purge ran without confirmation"
 fi
 [ -x "$home/.local/bin/cardinal" ] || fail "refused purge removed the binary"
-as_user "$home/.local/bin/cardinal" uninstall
+if as_user setsid -w cardinal uninstall </dev/null 2>/dev/null; then
+    fail "uninstall ran without asking"
+fi
+[ -x "$home/.local/bin/cardinal" ] || fail "unanswered uninstall removed the binary"
+as_user "$home/.local/bin/cardinal" uninstall --keep-data
 [ ! -e "$home/.local/bin/cardinal" ] || fail "binary not removed"
 [ ! -e "$home/.config/systemd/user/cardinal.service" ] || fail "unit not removed"
 [ -f "$home/.local/share/cardinal/keys" ] || fail "data was removed"
