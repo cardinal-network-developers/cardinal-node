@@ -620,6 +620,11 @@ impl Conn {
         self.wake_all();
     }
 
+    /// Ends the session without telling the peer.
+    pub fn abandon(&mut self) {
+        self.close_silently(CloseReason::Local("abandoned".into()));
+    }
+
     fn maybe_establish(&mut self, now: Instant) {
         if self.established
             || self.close.is_some()

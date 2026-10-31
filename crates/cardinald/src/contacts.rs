@@ -3,8 +3,10 @@
 //!
 //! An invitation is a secret that lets one session through. The two devices
 //! say who they are, take each other's identity logs, and the inviter creates
-//! a space with both as owners. After that they are contacts: their devices
-//! may open sessions with each other, for what they share and nothing else.
+//! a space with both as owners. After that they are contacts. If each trusts
+//! the other, their devices may open sessions with each other, for what they
+//! share and nothing else. If not, the session ends there, and a device
+//! answers the other's as it answers a stranger's.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -13,7 +15,8 @@ use std::time::Duration;
 use cardinal_contact::{ContactMessage, EndpointAddr, Invitation};
 use cardinal_encoding::Value;
 use cardinal_link::{CarrierKind, Priority, SecretEntry, Service, Session, Stream, Target};
-use cardinal_space::{account, relationship, SpaceId};
+use cardinal_space::account::{self, ContactRecord, Regard};
+use cardinal_space::{relationship, SpaceId};
 use cardinal_sync::identity_log_label;
 use serde_json::{json, Value as Json};
 use tokio::io::AsyncWriteExt;
@@ -26,6 +29,9 @@ use crate::net;
 const MAX_MESSAGE: usize = 64 * 1024;
 /// How long an exchange may take.
 const EXCHANGE_WITHIN: Duration = Duration::from_secs(20);
+/// How long `done` may take to arrive, before a session that ends with it
+/// goes.
+const DONE_WITHIN: Duration = Duration::from_secs(3);
 
 fn identity(d: &Daemon) -> anyhow::Result<[u8; 32]> {
     d.core()
@@ -37,7 +43,12 @@ fn identity(d: &Daemon) -> anyhow::Result<[u8; 32]> {
 
 /// Makes an invitation to this device. `address` is where the other person
 /// can reach it, by default its address on the local network.
-pub fn invite(d: &Arc<Daemon>, address: Option<&str>, name: Option<&str>) -> anyhow::Result<Json> {
+pub fn invite(
+    d: &Arc<Daemon>,
+    address: Option<&str>,
+    name: Option<&str>,
+    regard: Regard,
+) -> anyhow::Result<Json> {
     let me = identity(d)?;
     let port = d
         .endpoint
@@ -60,16 +71,26 @@ pub fn invite(d: &Arc<Daemon>, address: Option<&str>, name: Option<&str>) -> any
     let endpoint = EndpointAddr::new(CarrierKind::Udp, addr);
     let mut invitation = Invitation::new(me, responder, endpoint);
     invitation.name = name.map(str::to_owned);
-    d.endpoint.add_secret(SecretEntry::new(&invitation.secret));
+    let secret = d.endpoint.add_secret(SecretEntry::new(&invitation.secret));
+    d.invitation_made(secret, regard);
     Ok(json!({"code": invitation.to_text()}))
 }
 
 /// Takes up an invitation, and becomes a contact of whoever gave it.
-pub async fn accept(d: &Arc<Daemon>, code: &str, name: Option<&str>) -> anyhow::Result<Json> {
+pub async fn accept(
+    d: &Arc<Daemon>,
+    code: &str,
+    name: Option<&str>,
+    regard: Regard,
+) -> anyhow::Result<Json> {
     let invitation = Invitation::from_text(code.trim())
         .map_err(|_| anyhow::anyhow!("that is not an invitation"))?;
     let me = identity(d)?;
     anyhow::ensure!(invitation.inviter != me, "that invitation is your own");
+    anyhow::ensure!(
+        !is_refused(d, &invitation.inviter),
+        "you have refused whoever made that invitation"
+    );
     let addr = invitation
         .endpoint
         .socket_addr()
@@ -83,7 +104,7 @@ pub async fn accept(d: &Arc<Daemon>, code: &str, name: Option<&str>) -> anyhow::
         .map(str::to_owned)
         .or(invitation.name.clone())
         .unwrap_or_else(|| account::short_key(&invitation.inviter));
-    let exchange = accept_exchange(d, &s, me, &invitation, &petname);
+    let exchange = accept_exchange(d, &s, me, &invitation, &petname, regard);
     tokio::time::timeout(EXCHANGE_WITHIN, exchange)
         .await
         .map_err(|_| anyhow::anyhow!("they stopped answering"))??;
@@ -96,6 +117,7 @@ async fn accept_exchange(
     me: [u8; 32],
     invitation: &Invitation,
     petname: &str,
+    regard: Regard,
 ) -> anyhow::Result<()> {
     let proven = s.peer_identity().map(|p| p.identity);
     anyhow::ensure!(
@@ -114,11 +136,15 @@ async fn accept_exchange(
     let label = identity_log_label(&invitation.inviter);
     net::reconcile(d, s, label).await?;
     let space = d.core().accept_relationship(&genesis)?;
-    record_contact(d, &invitation.inviter, petname, &space)?;
+    record_contact(d, &invitation.inviter, petname, &space, regard)?;
     send(&mut st, &ContactMessage::Done).await?;
     st.shutdown().await?;
     remember(d, s);
     d.identity_changed();
+    if !regard.trusted {
+        let _ = tokio::time::timeout(DONE_WITHIN, receive(&mut st)).await;
+        s.abandon();
+    }
     Ok(())
 }
 
@@ -139,6 +165,11 @@ pub async fn serve(d: &Arc<Daemon>, s: &Session, mut st: Stream) -> anyhow::Resu
         st.reset(0);
         return Ok(());
     };
+    if is_refused(d, &them) {
+        s.abandon();
+        return Ok(());
+    }
+    let regard = d.invitation_used(s);
     let Some(ContactMessage::Hello { identity, name }) = receive(&mut st).await? else {
         return Ok(());
     };
@@ -149,12 +180,21 @@ pub async fn serve(d: &Arc<Daemon>, s: &Session, mut st: Stream) -> anyhow::Resu
     send(&mut st, &ContactMessage::Genesis(genesis)).await?;
     let done = tokio::time::timeout(EXCHANGE_WITHIN, receive(&mut st)).await;
     if matches!(done, Ok(Ok(Some(ContactMessage::Done)))) {
-        record_contact(d, &them, &name, &space)?;
+        record_contact(d, &them, &name, &space, regard)?;
         remember(d, s);
         d.identity_changed();
         tracing::info!("{name} ({}) is a contact now", short(&them));
+        if !regard.trusted {
+            let _ = st.shutdown().await;
+            s.abandon();
+        }
     }
     Ok(())
+}
+
+fn is_refused(d: &Daemon, who: &[u8; 32]) -> bool {
+    let contacts = d.core().contacts();
+    contacts.iter().any(|c| c.identity == *who && c.refused)
 }
 
 fn record_contact(
@@ -162,14 +202,37 @@ fn record_contact(
     who: &[u8; 32],
     petname: &str,
     space: &SpaceId,
+    regard: Regard,
 ) -> anyhow::Result<()> {
     let account = d
         .core()
         .account_id()
         .ok_or_else(|| anyhow::anyhow!("the account space is not here yet"))?;
-    let op = account::create_contact(who, petname, space);
+    let op = account::create_contact(who, petname, space, regard);
     d.write_and_push(&account, vec![op])?;
     Ok(())
+}
+
+/// Changes how this person regards a contact. Only their own devices hear of
+/// it, and the contact is told nothing.
+pub fn set(d: &Arc<Daemon>, who: &str, setting: &str) -> anyhow::Result<Json> {
+    let contact = find(d, who)?;
+    let (key, value) = match setting {
+        "trust" => (account::TRUSTED, true),
+        "hosts-only" => (account::TRUSTED, false),
+        "introductions" => (account::INTRODUCTIONS, true),
+        "no-introductions" => (account::INTRODUCTIONS, false),
+        "refuse" => (account::REFUSED, true),
+        "unrefuse" => (account::REFUSED, false),
+        _ => anyhow::bail!("{setting:?} is not a setting"),
+    };
+    let account = d
+        .core()
+        .account_id()
+        .ok_or_else(|| anyhow::anyhow!("the account space is not here yet"))?;
+    d.write_and_push(&account, vec![account::set_field(contact.node, key, value)])?;
+    d.peers_changed();
+    Ok(json!({}))
 }
 
 async fn send(st: &mut Stream, m: &ContactMessage) -> anyhow::Result<()> {
@@ -189,30 +252,47 @@ async fn receive(st: &mut Stream) -> anyhow::Result<Option<ContactMessage>> {
         .map_err(|_| anyhow::anyhow!("not a contact message"))
 }
 
-/// This person's contacts.
-pub fn list(d: &Daemon) -> Json {
+/// This person's contacts, and with `all` those they have refused.
+pub fn list(d: &Daemon, all: bool) -> Json {
+    let connected = d.connected_people();
     let contacts: Vec<Json> = d
         .core()
         .contacts()
         .iter()
-        .map(|c| json!({"name": c.petname, "identity": hex::encode(&c.identity[..8])}))
+        .filter(|c| all || !c.refused)
+        .map(|c| {
+            json!({
+                "name": c.petname,
+                "identity": hex::encode(&c.identity[..8]),
+                "trusted": c.regard.trusted,
+                "introductions": c.regard.introductions,
+                "refused": c.refused,
+                "connected": connected.contains(&c.identity),
+            })
+        })
         .collect();
     json!({"contacts": contacts})
 }
 
-/// The relationship space with the contact called `who`.
-fn space_of(d: &Daemon, who: &str) -> anyhow::Result<SpaceId> {
+/// The contact called `who`.
+fn find(d: &Daemon, who: &str) -> anyhow::Result<ContactRecord> {
     let w = who.to_lowercase();
     let contacts = d.core().contacts();
-    let found = contacts.iter().find(|c| c.petname.to_lowercase() == w);
-    found
-        .map(|c| c.space)
-        .ok_or_else(|| anyhow::anyhow!("no contact called {who:?}; see `cardinal contacts`"))
+    let found = contacts.into_iter().find(|c| c.petname.to_lowercase() == w);
+    found.ok_or_else(|| anyhow::anyhow!("no contact called {who:?}; see `cardinal contacts`"))
+}
+
+/// The contact called `who`, unless this person has refused them.
+fn listed(d: &Daemon, who: &str) -> anyhow::Result<ContactRecord> {
+    let contact = find(d, who)?;
+    anyhow::ensure!(!contact.refused, "you have refused {who}");
+    Ok(contact)
 }
 
 /// Writes a message to a contact.
 pub fn say(d: &Arc<Daemon>, who: &str, text: &str) -> anyhow::Result<Json> {
-    let space = space_of(d, who)?;
+    let contact = listed(d, who)?;
+    let space = contact.space;
     let conversation = {
         let core = d.core();
         core.spaces
@@ -223,12 +303,12 @@ pub fn say(d: &Arc<Daemon>, who: &str, text: &str) -> anyhow::Result<Json> {
     let conversation = conversation.ok_or_else(|| anyhow::anyhow!("that space is not open yet"))?;
     let op = relationship::create_message(conversation, text);
     d.write_and_push(&space, vec![op])?;
-    Ok(json!({}))
+    Ok(json!({"direct": contact.connects()}))
 }
 
 /// The conversation with a contact.
 pub fn messages(d: &Daemon, who: &str) -> anyhow::Result<Json> {
-    let space = space_of(d, who)?;
+    let space = listed(d, who)?.space;
     let core = d.core();
     let me = core.identity.as_ref().map(|i| i.id());
     let open = core.spaces.get(&space).and_then(|h| h.space.as_ref());

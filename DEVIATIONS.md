@@ -660,6 +660,8 @@ asks for around that is not built yet.
   space, so a restart loses them, and only the device that made one can be
   reached with it. `uses` is always 1, and `for`, front doors and join requests
   are not implemented. An invitation's endpoint is a device, not a host.
+- **Invitations record how the person will regard whoever uses them**, in the
+  daemon's memory, so that lasts as long as the invitation does.
 - **Both people must be online to connect**, and a device finds a contact's
   device only at an address it has already seen. There are no reach nodes,
   delivery tokens or mailboxes, so rendezvous and relay do not help between two
@@ -675,6 +677,19 @@ asks for around that is not built yet.
   space.** A device opens a session with a contact's devices only for what they
   share (`spaces.md#holding-a-space`), and notices for a set go only to contacts
   who are entitled to it.
+- **Through hosts only reaches nobody yet.** D50 is followed: a device opens
+  sessions only with trusted contacts and answers others with silence. But a
+  host cannot carry anything between two people yet, so someone through hosts
+  only is cut off in practice. What is written to them is kept and goes when the
+  person trusts them, or when hosts can carry it.
+- **Silence is only as good as the carrier.** Over UDP an untrusted device hears
+  nothing, as the spec asks. A device also listening on TCP accepts the
+  connection before it can stay silent, so TCP shows that something is there,
+  though not how anyone is regarded.
+- **No introductions is kept and shown, and nothing acts on it**, since there
+  are no introductions, and contacts do not help each other meet, yet.
+- **Refuse is for contacts.** `member seen` nodes do not exist yet. There are no
+  tokens to revoke and no group spaces to warn about.
 - **A new epoch notices only this identity's key changes.** It is wrapped for
   every member, but a change of another member's encryption key does not make
   one due here, which `spaces.md#when-to-rotate` asks for.

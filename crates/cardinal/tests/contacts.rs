@@ -24,6 +24,22 @@ fn invitation(from: &Dev, name: &str) -> String {
         .to_owned()
 }
 
+/// What `from` lists for the contact called `name`.
+fn listing(from: &Dev, name: &str) -> String {
+    let all = from.cli(&["contacts", "--all"]);
+    let line = all.lines().find(|l| l.starts_with(name));
+    line.unwrap_or_default().to_owned()
+}
+
+fn connected(from: &Dev, name: &str) -> bool {
+    listing(from, name).contains("  connected")
+}
+
+/// Waits long enough that anything sent would have arrived.
+fn settle() {
+    std::thread::sleep(std::time::Duration::from_secs(3));
+}
+
 #[test]
 fn two_people_connect_and_talk() {
     if !fuse_available() {
@@ -125,5 +141,173 @@ fn a_conversation_reaches_all_of_a_persons_devices() {
     phone.cli(&["say", "bo", "from my phone"]);
     wait("bo reads it", 20, || {
         bo.cli(&["messages", "Ana"]).contains("from my phone")
+    });
+}
+
+/// Trust runs one way and is never sent, so being moved down looks like the
+/// other device being off (`contact.md#who-a-person-knows`).
+#[test]
+fn someone_no_longer_trusted_gets_silence() {
+    if !fuse_available() {
+        eprintln!("skipping: /dev/fuse or fusermount3 is not available");
+        return;
+    }
+    let root = tempfile::tempdir().unwrap();
+    let ana = person(root.path(), "ana");
+    let bo = person(root.path(), "bo");
+    let code = invitation(&ana, "Ana");
+    bo.cli(&["accept", &code]);
+    wait("they connect", 20, || {
+        connected(&ana, "bo") && connected(&bo, "Ana")
+    });
+
+    ana.cli(&["contact", "bo", "hosts-only"]);
+    assert!(listing(&ana, "bo").contains("through hosts only"));
+    assert!(!connected(&ana, "bo"));
+
+    // Bo is told nothing: a closed session would have shown at once.
+    assert!(connected(&bo, "Ana"), "bo heard about it");
+    wait("bo finds ana gone", 35, || !connected(&bo, "Ana"));
+
+    // Nothing bo sends gets through, however it tries.
+    bo.cli(&["say", "Ana", "anyone there?"]);
+    settle();
+    assert!(!connected(&bo, "Ana"));
+    assert!(!ana.cli(&["messages", "bo"]).contains("anyone there?"));
+    // Dropped at the handshake: a session that opened and was then closed
+    // would have told bo that something is there.
+    assert!(!ana.log().contains("unknown device"), "{}", ana.log());
+    let kept = ana.cli(&["say", "bo", "not yet"]);
+    assert!(kept.contains("hosts only"), "{kept}");
+
+    ana.cli(&["contact", "bo", "trust"]);
+    wait("they connect again", 30, || {
+        connected(&ana, "bo") && connected(&bo, "Ana")
+    });
+    wait("ana reads it", 20, || {
+        ana.cli(&["messages", "bo"]).contains("anyone there?")
+    });
+    wait("bo reads it", 20, || {
+        bo.cli(&["messages", "Ana"]).contains("not yet")
+    });
+}
+
+/// A connection takes both, so either can keep the other to hosts.
+#[test]
+fn either_side_of_an_invitation_can_choose_hosts_only() {
+    if !fuse_available() {
+        eprintln!("skipping: /dev/fuse or fusermount3 is not available");
+        return;
+    }
+    let root = tempfile::tempdir().unwrap();
+    let ana = person(root.path(), "ana");
+    let bo = person(root.path(), "bo");
+    let cy = person(root.path(), "cy");
+
+    // The one who invites.
+    let at = format!("127.0.0.1:{}", ana.port);
+    let args = ["invite", "--address", &at, "--name", "Ana", "--hosts-only"];
+    let code = ana.cli(&args).trim().to_owned();
+    bo.cli(&["accept", &code]);
+    wait("ana lists bo", 20, || {
+        listing(&ana, "bo").contains("hosts only")
+    });
+    assert!(listing(&bo, "Ana").contains("  trusted"));
+    wait("their session ends", 35, || {
+        !connected(&ana, "bo") && !connected(&bo, "Ana")
+    });
+
+    // The one who answers.
+    let code = invitation(&ana, "Ana");
+    cy.cli(&["accept", &code, "--hosts-only", "--no-introductions"]);
+    wait("ana lists cy", 20, || {
+        listing(&ana, "cy").contains("  trusted")
+    });
+    let theirs = listing(&cy, "Ana");
+    assert!(theirs.contains("hosts only"), "{theirs}");
+    assert!(theirs.contains("no introductions"), "{theirs}");
+    wait("their session ends", 35, || {
+        !connected(&ana, "cy") && !connected(&cy, "Ana")
+    });
+
+    // Each has the conversation, and nothing crosses.
+    bo.cli(&["say", "Ana", "hello?"]);
+    settle();
+    assert!(!ana.cli(&["messages", "bo"]).contains("hello?"));
+    assert!(!connected(&ana, "bo"));
+}
+
+/// Refusing someone ends everything with them, and a new invitation does not
+/// bring them back.
+#[test]
+fn someone_refused_is_gone_until_the_refusal_is_taken_back() {
+    if !fuse_available() {
+        eprintln!("skipping: /dev/fuse or fusermount3 is not available");
+        return;
+    }
+    let root = tempfile::tempdir().unwrap();
+    let ana = person(root.path(), "ana");
+    let bo = person(root.path(), "bo");
+    let code = invitation(&ana, "Ana");
+    bo.cli(&["accept", &code]);
+    wait("they connect", 20, || {
+        connected(&ana, "bo") && connected(&bo, "Ana")
+    });
+    bo.cli(&["say", "Ana", "before"]);
+    wait("ana reads it", 20, || {
+        ana.cli(&["messages", "bo"]).contains("before")
+    });
+
+    ana.cli(&["contact", "bo", "refuse"]);
+    assert!(!ana.cli(&["contacts"]).contains("bo"));
+    assert!(listing(&ana, "bo").contains("refused"));
+    assert!(!connected(&ana, "bo"));
+    assert!(!ana.try_cli(&["say", "bo", "no"]).status.success());
+    assert!(!ana.try_cli(&["messages", "bo"]).status.success());
+
+    let code = invitation(&ana, "Ana");
+    assert!(!bo.try_cli(&["accept", &code]).status.success());
+    assert_eq!(ana.cli(&["contacts", "--all"]).lines().count(), 1);
+
+    // As they were before.
+    ana.cli(&["contact", "bo", "unrefuse"]);
+    assert!(listing(&ana, "bo").contains("  trusted"));
+    assert!(ana.cli(&["messages", "bo"]).contains("before"));
+    wait("they connect again", 40, || {
+        connected(&ana, "bo") && connected(&bo, "Ana")
+    });
+}
+
+/// How a person regards someone holds on all of their devices.
+#[test]
+fn a_persons_other_devices_follow_how_they_regard_someone() {
+    if !fuse_available() {
+        eprintln!("skipping: /dev/fuse or fusermount3 is not available");
+        return;
+    }
+    let root = tempfile::tempdir().unwrap();
+    let ana = person(root.path(), "ana");
+    let bo = person(root.path(), "bo");
+    let code = invitation(&ana, "Ana");
+    bo.cli(&["accept", &code]);
+    wait("ana sees bo", 20, || ana.cli(&["contacts"]).contains("bo"));
+
+    let mut phone = Dev::new(root.path(), "phone", free_port());
+    phone.start();
+    pair(&ana, &phone);
+    wait("the phone knows of bo", 30, || {
+        listing(&phone, "bo").contains("trusted")
+    });
+    // Own devices share only each other's addresses, so the phone has none
+    // for bo unless it is given one.
+    phone.stop();
+    std::fs::copy(ana.home.join("peers.json"), phone.home.join("peers.json")).unwrap();
+    phone.start();
+    phone.wait_mounted();
+    wait("the phone reaches bo", 40, || connected(&phone, "bo"));
+
+    ana.cli(&["contact", "bo", "hosts-only"]);
+    wait("the phone lets go too", 20, || {
+        listing(&phone, "bo").contains("hosts only") && !connected(&phone, "bo")
     });
 }

@@ -49,7 +49,10 @@ One person, several Linux devices, one folder that is the same everywhere:
 - Two people can connect and talk: `cardinal invite` makes an invitation and
   `cardinal accept <invitation>` uses it, then `cardinal say <name> <text>` and
   `cardinal messages <name>`. Both need to be online, and able to reach each
-  other, for now.
+  other, for now. Your devices connect directly only to people you trust who
+  trust you back: `cardinal contact <name> hosts-only` stops that without
+  telling them, `--hosts-only` on `invite` or `accept` starts that way, and
+  `cardinal contact <name> refuse` ends everything with someone and hides them.
 
 Not yet: guardians, mailboxes, hosts run by others, shared folders and groups,
 platforms other than Linux. [PLAN.md](PLAN.md) has the

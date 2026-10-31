@@ -98,6 +98,15 @@ fn arg<'a>(req: &'a Value, name: &str) -> anyhow::Result<&'a str> {
         .ok_or_else(|| anyhow::anyhow!("missing argument {name}"))
 }
 
+/// How someone added by this request starts out.
+fn regard(req: &Value) -> account::Regard {
+    let says = |name| req.get(name).and_then(|v| v.as_bool()) == Some(true);
+    account::Regard {
+        trusted: !says("hosts_only"),
+        introductions: !says("no_introductions"),
+    }
+}
+
 fn power_name(p: Power) -> &'static str {
     match p {
         Power::Device => "device",
@@ -204,13 +213,17 @@ async fn handle(d: &Arc<Daemon>, req: &Value) -> anyhow::Result<Value> {
         "invite" => {
             let address = req.get("address").and_then(|v| v.as_str());
             let name = req.get("name").and_then(|v| v.as_str());
-            crate::contacts::invite(d, address, name)
+            crate::contacts::invite(d, address, name, regard(req))
         }
         "accept" => {
             let name = req.get("name").and_then(|v| v.as_str());
-            crate::contacts::accept(d, arg(req, "code")?, name).await
+            crate::contacts::accept(d, arg(req, "code")?, name, regard(req)).await
         }
-        "contacts" => Ok(crate::contacts::list(d)),
+        "contacts" => {
+            let all = req.get("all").and_then(|v| v.as_bool()) == Some(true);
+            Ok(crate::contacts::list(d, all))
+        }
+        "contact" => crate::contacts::set(d, arg(req, "who")?, arg(req, "setting")?),
         "say" => crate::contacts::say(d, arg(req, "who")?, arg(req, "text")?),
         "messages" => crate::contacts::messages(d, arg(req, "who")?),
         "recovery-check" => {

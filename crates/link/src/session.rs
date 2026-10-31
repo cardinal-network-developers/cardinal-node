@@ -310,6 +310,17 @@ impl Session {
         self.inner.handle_events(events);
     }
 
+    /// Ends the session without telling the peer, who sees what it would
+    /// see of a device that has gone.
+    pub fn abandon(&self) {
+        let events = {
+            let mut c = self.inner.lock();
+            c.abandon();
+            c.drain_events()
+        };
+        self.inner.handle_events(events);
+    }
+
     /// Whether the session has closed.
     pub fn is_closed(&self) -> bool {
         self.inner.lock().is_closed()

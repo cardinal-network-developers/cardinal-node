@@ -256,6 +256,9 @@ pub struct Daemon {
     pub cleanup: crate::cleanup::Cleaner,
     /// Speed tests this device serves (`speedtest.rs`).
     pub speedtest: crate::speedtest::Limiter,
+    /// How the person will regard whoever uses each outstanding invitation,
+    /// by its secret's id.
+    invitations: Mutex<HashMap<u64, account::Regard>>,
     /// Held while this device's own account nodes are checked and
     /// written, so concurrent housekeeping writes them once.
     placement_lock: Mutex<()>,
@@ -307,7 +310,7 @@ impl Daemon {
         let directory = Arc::new(Directory::default());
         directory.update(
             core.identity.as_ref().map(|i| i.state()).as_deref(),
-            &core.other_states(),
+            &core.connectable_states(),
         );
         let mut ec = EndpointConfig::new(keys.link.clone(), directory.clone());
         ec.udp_gateway = std::env::var("CARDINAL_TEST_UDP_GATEWAY")
@@ -379,6 +382,7 @@ impl Daemon {
             copies: crate::copies::Tracker::load(copies_path, crate::copies::Rules::from_env()),
             cleanup: crate::cleanup::Cleaner::load(old_versions),
             speedtest: crate::speedtest::Limiter::default(),
+            invitations: Mutex::new(HashMap::new()),
             placement_lock: Mutex::new(()),
             stopping: watch::channel(false).0,
             next_gen: AtomicU64::new(1),
@@ -432,8 +436,12 @@ impl Daemon {
         }
         let contact = {
             let core = self.core();
-            core.contact_of(&ps)
-                .filter(|(identity, _)| core.contacts().iter().any(|c| c.identity == *identity))
+            core.contact_of(&ps).filter(|(identity, _)| {
+                let contacts = core.contacts();
+                contacts
+                    .iter()
+                    .any(|c| c.identity == *identity && c.connects())
+            })
         };
         if let Some((identity, key)) = contact {
             return PeerKind::Contact(identity, key);
@@ -494,6 +502,32 @@ impl Daemon {
             .filter(|(identity, _)| core.shares(identity, label))
             .map(|(_, s)| s)
             .collect()
+    }
+
+    /// The people with a session open to one of their devices.
+    pub fn connected_people(&self) -> HashSet<[u8; 32]> {
+        lock(&self.sessions)
+            .values()
+            .filter(|c| !c.session.is_closed())
+            .filter_map(|c| match c.kind {
+                PeerKind::Contact(identity, _) => Some(identity),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Notes how to regard whoever uses an invitation.
+    pub fn invitation_made(&self, secret: u64, regard: account::Regard) {
+        lock(&self.invitations).insert(secret, regard);
+    }
+
+    /// How to regard whoever opened `s` with an invitation.
+    pub fn invitation_used(&self, s: &Session) -> account::Regard {
+        match s.admission() {
+            cardinal_link::Admission::Secret { id, .. } => lock(&self.invitations).remove(&id),
+            _ => None,
+        }
+        .unwrap_or_default()
     }
 
     /// Whether a device has an open session.
@@ -658,7 +692,7 @@ impl Daemon {
         };
         if let Some(identity) = other {
             let changed = core.ingest_other(identity, &objects)?;
-            let states = core.other_states();
+            let states = core.connectable_states();
             let own = core.identity.as_ref().map(|i| i.state());
             drop(core);
             if !changed {
@@ -702,10 +736,14 @@ impl Daemon {
         if core.identity.is_none() {
             return Ok(Ingested::default());
         }
+        let account = core.account_id() == Some(label);
         let out = core.ingest_space(label, &objects)?;
         drop(core);
         if out.new > 0 {
             tracing::debug!("space {}: {} new entries", short(&label), out.new);
+            if account {
+                self.peers_changed();
+            }
             self.bump();
             self.housekeeping();
         }
@@ -714,23 +752,34 @@ impl Daemon {
 
     /// After the identity log changed.
     pub fn identity_changed(&self) {
+        self.core().identity_updated();
+        self.peers_changed();
+    }
+
+    /// After who may reach this device changed: its person's devices, or how
+    /// they regard someone.
+    pub fn peers_changed(&self) {
         let (st, others) = {
-            let mut core = self.core();
-            core.identity_updated();
+            let core = self.core();
             (
                 core.identity.as_ref().map(|i| i.state()),
-                core.other_states(),
+                core.connectable_states(),
             )
         };
         self.directory.update(st.as_deref(), &others);
-        self.endpoint.recheck_peers();
         let conns: Vec<Conn> = lock(&self.sessions).values().cloned().collect();
         for c in conns {
             let kind = self.classify(&c.session);
+            // Without a word: a contact no longer trusted must not be able
+            // to tell this from a device being off.
+            if matches!(c.kind, PeerKind::Contact(..)) && !matches!(kind, PeerKind::Contact(..)) {
+                c.session.abandon();
+            }
             if let Some(x) = lock(&self.sessions).get_mut(&c.session.peer_static()) {
                 x.kind = kind;
             }
         }
+        self.endpoint.recheck_peers();
         self.bump();
     }
 
@@ -942,7 +991,7 @@ impl Daemon {
             let mut devices: Vec<_> = own
                 .filter_map(|k| Some((k.key, k.link_key.clone()?)))
                 .collect();
-            for c in core.contacts() {
+            for c in core.contacts().iter().filter(|c| c.connects()) {
                 let Some(o) = core.others.get(&c.identity) else {
                     continue;
                 };

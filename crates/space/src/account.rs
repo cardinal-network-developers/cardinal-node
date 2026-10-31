@@ -22,6 +22,33 @@ pub const SETTING: u64 = 6;
 /// Placement kind (under a space node).
 pub const PLACEMENT: u64 = 7;
 
+/// A contact's field: accept introductions from them.
+pub const INTRODUCTIONS: u64 = 6;
+/// A contact's field: they are trusted.
+pub const TRUSTED: u64 = 7;
+/// A contact's field: they are refused.
+pub const REFUSED: u64 = 8;
+
+/// How a person starts out regarding someone
+/// (`contact.md#who-a-person-knows`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Regard {
+    /// They are trusted, which a direct session needs from both sides.
+    pub trusted: bool,
+    /// Things may reach this person through them.
+    pub introductions: bool,
+}
+
+impl Default for Regard {
+    /// What an invitation makes of someone.
+    fn default() -> Regard {
+        Regard {
+            trusted: true,
+            introductions: true,
+        }
+    }
+}
+
 /// Where a device keeps a space's content (`blobs.md#retention`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Retention {
@@ -64,7 +91,12 @@ pub fn create_device(key: &KeyId, name: &str, always_on: bool, is_host: bool) ->
 }
 
 /// `create` of a contact node.
-pub fn create_contact(identity: &IdentityId, petname: &str, space: &SpaceId) -> SpaceOp {
+pub fn create_contact(
+    identity: &IdentityId,
+    petname: &str,
+    space: &SpaceId,
+    regard: Regard,
+) -> SpaceOp {
     SpaceOp::create(
         NodeKind::Uint(CONTACT),
         ROOT,
@@ -72,7 +104,9 @@ pub fn create_contact(identity: &IdentityId, petname: &str, space: &SpaceId) -> 
         Record::new()
             .with(1, *identity)
             .with(2, petname)
-            .with(3, *space),
+            .with(3, *space)
+            .with(INTRODUCTIONS, regard.introductions)
+            .with(TRUSTED, regard.trusted),
     )
 }
 
@@ -181,12 +215,26 @@ fn last(n: &crate::state::Node, key: u64) -> Option<&Value> {
 /// A person this identity has a relationship with.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ContactRecord {
+    /// The contact node.
+    pub node: NodeId,
     /// Their identity.
     pub identity: IdentityId,
     /// What this person calls them.
     pub petname: String,
     /// The relationship space.
     pub space: SpaceId,
+    /// How this person regards them.
+    pub regard: Regard,
+    /// This person wants nothing to do with them.
+    pub refused: bool,
+}
+
+impl ContactRecord {
+    /// Whether a device may open a session with theirs. Whether one opens
+    /// is up to them as well.
+    pub fn connects(&self) -> bool {
+        self.regard.trusted && !self.refused
+    }
 }
 
 /// Contact nodes that are not deleted.
@@ -196,10 +244,17 @@ pub fn contacts(state: &State) -> Vec<ContactRecord> {
         .into_iter()
         .filter(|n| n.kind == NodeKind::Uint(CONTACT) && !n.deleted)
         .filter_map(|n| {
+            let flag = |key| last(n, key).and_then(Value::as_bool);
             Some(ContactRecord {
+                node: n.id,
                 identity: last(n, 1)?.as_bytes()?.try_into().ok()?,
                 petname: last(n, 2)?.as_text()?.to_owned(),
                 space: last(n, 3)?.as_bytes()?.try_into().ok()?,
+                regard: Regard {
+                    trusted: flag(TRUSTED).unwrap_or(false),
+                    introductions: flag(INTRODUCTIONS).unwrap_or(true),
+                },
+                refused: flag(REFUSED).unwrap_or(false),
             })
         })
         .collect()

@@ -128,6 +128,14 @@ enum Cmd {
         /// The name to suggest they know you by.
         #[arg(long)]
         name: Option<String>,
+        /// Do not trust them with your devices' addresses: reach them only
+        /// through a host.
+        #[arg(long)]
+        hosts_only: bool,
+        /// Let nothing reach you through them, though you still see what
+        /// they write.
+        #[arg(long)]
+        no_introductions: bool,
     },
     /// Use an invitation someone gave you.
     Accept {
@@ -136,9 +144,33 @@ enum Cmd {
         /// What to call them; by default the name they suggested.
         #[arg(long)]
         name: Option<String>,
+        /// Do not trust them with your devices' addresses: reach them only
+        /// through a host.
+        #[arg(long)]
+        hosts_only: bool,
+        /// Let nothing reach you through them, though you still see what
+        /// they write.
+        #[arg(long)]
+        no_introductions: bool,
     },
     /// The people you are connected to.
-    Contacts,
+    Contacts {
+        /// Show those you have refused too.
+        #[arg(long)]
+        all: bool,
+    },
+    /// Change how you regard a contact. It stays on your own devices, and
+    /// they are told nothing.
+    Contact {
+        /// Who, as `cardinal contacts` shows.
+        who: String,
+        /// `trust` connects your devices directly if they trust you too.
+        /// `hosts-only` stops that. `no-introductions` lets nothing reach
+        /// you through them. `refuse` ends everything with them and hides
+        /// them.
+        #[arg(value_parser = ["trust", "hosts-only", "introductions", "no-introductions", "refuse", "unrefuse"])]
+        setting: String,
+    },
     /// Send a message to a contact.
     Say {
         /// Who, as `cardinal contacts` shows.
@@ -1197,31 +1229,75 @@ async fn client(cmd: Cmd) -> anyhow::Result<()> {
             );
             Ok(())
         }
-        Cmd::Invite { address, name } => {
-            let req = json!({"cmd": "invite", "address": address, "name": name});
+        Cmd::Invite {
+            address,
+            name,
+            hosts_only,
+            no_introductions,
+        } => {
+            let req = json!({
+                "cmd": "invite",
+                "address": address,
+                "name": name,
+                "hosts_only": hosts_only,
+                "no_introductions": no_introductions,
+            });
             let v = call(&paths, req).await?;
             println!("{}", v["code"].as_str().unwrap_or(""));
             Ok(())
         }
-        Cmd::Accept { code, name } => {
-            let req = json!({"cmd": "accept", "code": code, "name": name});
+        Cmd::Accept {
+            code,
+            name,
+            hosts_only,
+            no_introductions,
+        } => {
+            let req = json!({
+                "cmd": "accept",
+                "code": code,
+                "name": name,
+                "hosts_only": hosts_only,
+                "no_introductions": no_introductions,
+            });
             let v = call(&paths, req).await?;
             println!("Connected to {}.", v["name"].as_str().unwrap_or(""));
             Ok(())
         }
-        Cmd::Contacts => {
-            let v = call(&paths, json!({"cmd": "contacts"})).await?;
+        Cmd::Contacts { all } => {
+            let v = call(&paths, json!({"cmd": "contacts", "all": all})).await?;
             for c in v["contacts"].as_array().into_iter().flatten() {
-                println!(
-                    "{}  [{}]",
-                    c["name"].as_str().unwrap_or(""),
-                    c["identity"].as_str().unwrap_or("")
-                );
+                let mut line = c["name"].as_str().unwrap_or("").to_owned();
+                line.push_str(if c["trusted"] == true {
+                    "  trusted"
+                } else {
+                    "  through hosts only"
+                });
+                if c["connected"] == true {
+                    line.push_str("  connected");
+                }
+                if c["introductions"] == false {
+                    line.push_str("  no introductions");
+                }
+                if c["refused"] == true {
+                    line.push_str("  refused");
+                }
+                println!("{line}  [{}]", c["identity"].as_str().unwrap_or(""));
             }
             Ok(())
         }
+        Cmd::Contact { who, setting } => {
+            let req = json!({"cmd": "contact", "who": who, "setting": setting});
+            call(&paths, req).await?;
+            Ok(())
+        }
         Cmd::Say { who, text } => {
-            call(&paths, json!({"cmd": "say", "who": who, "text": text})).await?;
+            let v = call(&paths, json!({"cmd": "say", "who": who, "text": text})).await?;
+            if v["direct"] == false {
+                println!(
+                    "Kept here: {who} is through hosts only, and hosts do not carry \
+                     messages for other people yet."
+                );
+            }
             Ok(())
         }
         Cmd::Messages { who } => {

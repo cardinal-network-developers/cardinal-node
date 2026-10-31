@@ -800,9 +800,16 @@ impl Core {
         v
     }
 
-    /// The states of the other logs this device keeps.
-    pub fn other_states(&self) -> Vec<Arc<cardinal_identity::IdentityState>> {
-        self.others.values().map(|o| o.log.state()).collect()
+    /// The logs of those whose devices may reach this one. The others are
+    /// kept too, to judge what they write, but this device does not answer
+    /// them (`contact.md#who-a-person-knows`).
+    pub fn connectable_states(&self) -> Vec<Arc<cardinal_identity::IdentityState>> {
+        self.contacts()
+            .iter()
+            .filter(|c| c.connects())
+            .filter_map(|c| self.others.get(&c.identity))
+            .map(|o| o.log.state())
+            .collect()
     }
 
     /// Re-evaluates a space with members other than this identity, whose
