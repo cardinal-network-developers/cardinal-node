@@ -1292,10 +1292,10 @@ async fn client(cmd: Cmd) -> anyhow::Result<()> {
         }
         Cmd::Say { who, text } => {
             let v = call(&paths, json!({"cmd": "say", "who": who, "text": text})).await?;
-            if v["direct"] == false {
+            if v["reachable"] == false {
                 println!(
-                    "Kept here: {who} is through hosts only, and hosts do not carry \
-                     messages for other people yet."
+                    "Kept here: this cannot reach {who} through a host, so it waits \
+                     until you connect."
                 );
             }
             Ok(())

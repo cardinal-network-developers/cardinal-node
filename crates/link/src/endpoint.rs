@@ -112,6 +112,8 @@ pub struct Target {
     /// A public-service or restore session: nothing but the address and
     /// X25519 key is known of the peer, and this device has no secret.
     pub public: bool,
+    /// Do not say which identity this device belongs to.
+    pub anonymous: bool,
 }
 
 impl Target {
@@ -146,6 +148,7 @@ impl Target {
             through: None,
             give_up: None,
             public: false,
+            anonymous: false,
         }
     }
 
@@ -164,6 +167,7 @@ impl Target {
             through: None,
             give_up: None,
             public: true,
+            anonymous: false,
         }
     }
 
@@ -185,7 +189,15 @@ impl Target {
             through: None,
             give_up: None,
             public: false,
+            anonymous: false,
         }
+    }
+
+    /// Does not say which identity this device belongs to, to a peer that
+    /// asks only for a secret.
+    pub fn anonymous(mut self) -> Target {
+        self.anonymous = true;
+        self
     }
 
     /// Adds a secret.
@@ -1045,7 +1057,7 @@ impl EndpointInner {
                 keys: done.keys,
                 peer_static: t.peer_x25519,
                 peer_link_key,
-                local_identity: self.identity(),
+                local_identity: self.identity().filter(|_| !t.anonymous),
                 directory: self.config.directory.clone(),
                 admission,
                 path,

@@ -535,6 +535,20 @@ impl Daemon {
             .collect()
     }
 
+    /// The people with any session here, an invitation's included. The link
+    /// keeps one session between two devices, so nothing else may be opened
+    /// to them meanwhile, or it would end that one.
+    pub fn people_in_touch(&self) -> HashSet<[u8; 32]> {
+        lock(&self.sessions)
+            .values()
+            .filter(|c| !c.session.is_closed())
+            .filter_map(|c| match c.kind {
+                PeerKind::Contact(identity, _) | PeerKind::Inviting(identity) => Some(identity),
+                _ => None,
+            })
+            .collect()
+    }
+
     /// Notes how to regard whoever uses an invitation.
     pub fn invitation_made(&self, secret: u64, regard: account::Regard) {
         lock(&self.invitations).insert(secret, regard);
@@ -1461,6 +1475,7 @@ impl Daemon {
         crate::fetch::start(self.clone());
         crate::copies::start(self.clone());
         crate::cleanup::start(self.clone());
+        crate::mailbox::start(self.clone());
         // Report (never install) new releases, if the person allows it.
         let cfg_path = self.paths.config();
         tokio::spawn(async move {

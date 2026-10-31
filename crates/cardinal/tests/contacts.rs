@@ -178,7 +178,7 @@ fn someone_no_longer_trusted_gets_silence() {
     // would have told bo that something is there.
     assert!(!ana.log().contains("unknown device"), "{}", ana.log());
     let kept = ana.cli(&["say", "bo", "not yet"]);
-    assert!(kept.contains("hosts only"), "{kept}");
+    assert!(kept.contains("Kept here"), "{kept}");
 
     ana.cli(&["contact", "bo", "trust"]);
     wait("they connect again", 30, || {

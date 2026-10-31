@@ -18,6 +18,7 @@ use std::time::{Duration, Instant};
 
 use cardinal_encoding::Value;
 use cardinal_link::{Priority, Service, Session, Stream};
+use cardinal_space::SpaceId;
 use cardinal_sync::{
     identity_log_label, want_messages, BlobReply, BlobRequest, Label, MemSet, Message, Reconciler,
 };
@@ -37,11 +38,11 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
 /// retried.
 const BLOB_TIMEOUT: Duration = Duration::from_secs(20);
 
-fn to_value(m: &Message) -> Value {
+pub(crate) fn to_value(m: &Message) -> Value {
     Value::Record(m.to_record())
 }
 
-fn from_value(v: Value) -> anyhow::Result<Message> {
+pub(crate) fn from_value(v: Value) -> anyhow::Result<Message> {
     match v {
         Value::Record(r) => Ok(Message::from_record(&r)?),
         _ => anyhow::bail!("a sync message must be a record"),
@@ -58,8 +59,33 @@ pub enum Access {
     Join([u8; 32]),
     /// A contact's identity log: to be kept, not joined.
     Other([u8; 32]),
+    /// The one space a delivery token is for: to fetch, and nothing more,
+    /// since only the owner's devices may send a host objects.
+    Read,
     /// Nothing; answer as if the set were empty.
     None,
+}
+
+impl Access {
+    /// Whether a peer may fetch objects of the set from this device.
+    fn may_fetch(self) -> bool {
+        matches!(self, Access::Full | Access::Other(_) | Access::Read)
+    }
+
+    /// Whether this device takes objects of the set from a peer.
+    fn takes_objects(self) -> bool {
+        !matches!(self, Access::None | Access::Read)
+    }
+}
+
+/// What a token holder may do with `label`, if the token was given out in
+/// `space`: fetch that space, and nothing else.
+fn token_access(space: Option<SpaceId>, label: &Label) -> Access {
+    if space == Some(*label) {
+        Access::Read
+    } else {
+        Access::None
+    }
 }
 
 impl Daemon {
@@ -97,7 +123,8 @@ impl Daemon {
                     Access::None
                 }
             }
-            PeerKind::Restoring | PeerKind::Token(_) | PeerKind::Stranger => Access::None,
+            PeerKind::Token(token) => token_access(self.core().space_of_token(&token), label),
+            PeerKind::Restoring | PeerKind::Stranger => Access::None,
         }
     }
 }
@@ -211,12 +238,12 @@ async fn handle_stream(d: &Arc<Daemon>, s: &Session, mut st: Stream) -> anyhow::
             }
             let _ = st.shutdown().await;
             let wanted = rec.take_wanted();
-            if access != Access::None && !wanted.is_empty() {
+            if access.takes_objects() && !wanted.is_empty() {
                 fetch_objects(d, s, label, wanted, access).await?;
             }
         }
         Message::Want { label, ids } => {
-            if matches!(d.access(kind, &label), Access::Full | Access::Other(_)) {
+            if d.access(kind, &label).may_fetch() {
                 let msgs = {
                     let core = d.core();
                     cardinal_sync::answer_want(label, &ids, |id| core.get(&label, id))
@@ -229,7 +256,7 @@ async fn handle_stream(d: &Arc<Daemon>, s: &Session, mut st: Stream) -> anyhow::
         }
         Message::Objects { label, objects } => {
             let access = d.access(kind, &label);
-            if access != Access::None {
+            if access.takes_objects() {
                 ingest(d, s, label, objects, access).await?;
             }
         }
@@ -734,6 +761,21 @@ pub fn holds_all(set: &MemSet, ids: &[[u8; 32]]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_token_fetches_one_space_and_sends_nothing() {
+        let (space, private) = ([1; 32], [2; 32]);
+        let granted = token_access(Some(space), &space);
+        assert!(granted.may_fetch());
+        assert!(
+            !granted.takes_objects(),
+            "only owner devices send a host objects"
+        );
+        let elsewhere = token_access(Some(space), &private);
+        assert!(!elsewhere.may_fetch(), "any other set looks empty");
+        assert!(!elsewhere.takes_objects());
+        assert_eq!(token_access(None, &private), Access::None);
+    }
 
     #[test]
     fn only_a_persons_own_devices_may_fetch_blobs() {

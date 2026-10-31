@@ -7,19 +7,26 @@
 //! token, and when.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use cardinal_crypto::{derive, Purpose};
+use cardinal_crypto::aead::{xchacha20poly1305_decrypt, xchacha20poly1305_encrypt_random};
+use cardinal_crypto::{derive, random_bytes, Purpose};
 use cardinal_encoding::{Record, Value};
-use cardinal_identity::KeyId;
-use cardinal_link::{Admission, SecretEntry, Session, Stream};
+use cardinal_identity::{EntryId, KeyId};
+use cardinal_link::{Admission, CarrierKind, Role, SecretEntry, Service, Session, Stream, Target};
+use cardinal_space::relationship::{self, Reach};
+use cardinal_space::{EpochId, SpaceId};
+use cardinal_sync::Message;
 use serde::{Deserialize, Serialize};
 use tokio::io::AsyncWriteExt;
 
 use crate::daemon::{Daemon, PeerKind};
+use crate::net::{self, from_value, to_value, Access};
 use crate::paths::write_private;
+use crate::rendezvous::call;
 
 /// A delivery token.
 pub type Token = [u8; 16];
@@ -37,6 +44,18 @@ const PER_DAY: u32 = 1024;
 /// How long an envelope waits for its owner, in seconds.
 const RETENTION: u64 = 30 * 24 * 60 * 60;
 const DAY: u64 = 24 * 60 * 60;
+/// How often to look for something to deliver or collect, if nothing says so
+/// sooner.
+const LOOK_EVERY: Duration = Duration::from_secs(30);
+/// The least time between looks.
+const LOOK_GAP: Duration = Duration::from_millis(500);
+/// How often a person with no host looks at their contacts' hosts: nobody
+/// can tell them when there is something to fetch.
+const PULL_EVERY: Duration = Duration::from_secs(5 * 60);
+/// An envelope (`hosts.md#envelopes`).
+const ENVELOPE: u64 = 11;
+/// An envelope payload.
+const PAYLOAD: u64 = 7;
 
 const OP_ERROR: u64 = 0;
 pub(crate) const OP_DEPOSIT: u64 = 1;
@@ -283,6 +302,14 @@ pub struct Mailbox {
     store: Mutex<Store>,
     /// Tokens, by the id of their secret at the endpoint.
     secrets: Mutex<HashMap<u64, Token>>,
+    /// Which of this device's entries each member has been sent, by space
+    /// and member, so that nothing is lost to being offline or restarting.
+    sent: Mutex<BTreeMap<String, BTreeSet<String>>>,
+    sent_path: PathBuf,
+}
+
+fn sent_key(space: &SpaceId, member: &[u8; 32]) -> String {
+    format!("{}:{}", hex::encode(space), hex::encode(member))
 }
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -297,16 +324,56 @@ fn now() -> u64 {
 impl Mailbox {
     /// Opens the mailbox in `dir`.
     pub fn load(dir: PathBuf) -> Mailbox {
+        let sent_path = dir.join("sent.json");
+        let sent = std::fs::read(&sent_path)
+            .ok()
+            .and_then(|b| serde_json::from_slice(&b).ok())
+            .unwrap_or_default();
         Mailbox {
             store: Mutex::new(Store::load(dir)),
             secrets: Mutex::new(HashMap::new()),
+            sent: Mutex::new(sent),
+            sent_path,
         }
+    }
+
+    /// Notes that a member has these entries of a space.
+    fn mark_sent(&self, space: &SpaceId, member: &[u8; 32], ids: &[EntryId]) {
+        let mut sent = lock(&self.sent);
+        let got = sent.entry(sent_key(space, member)).or_default();
+        let before = got.len();
+        got.extend(ids.iter().map(hex::encode));
+        if got.len() != before {
+            let bytes = serde_json::to_vec(&*sent).unwrap_or_default();
+            let saved = self.sent_path.parent().map(std::fs::create_dir_all);
+            if !matches!(saved, Some(Ok(())))
+                || write_private(&self.sent_path, &bytes, 0o600).is_err()
+            {
+                tracing::warn!("cannot save what was delivered");
+            }
+        }
+    }
+
+    /// Those of `ids` a member has not been sent.
+    fn unsent(
+        &self,
+        space: &SpaceId,
+        member: &[u8; 32],
+        ids: Vec<(EntryId, Vec<u8>)>,
+    ) -> Vec<(EntryId, Vec<u8>)> {
+        let sent = lock(&self.sent);
+        let got = sent.get(&sent_key(space, member));
+        ids.into_iter()
+            .filter(|(id, _)| !got.is_some_and(|g| g.contains(&hex::encode(id))))
+            .collect()
     }
 
     /// The token a session was opened with, if it was.
     pub fn token_of(&self, s: &Session) -> Option<Token> {
         match s.admission() {
-            Admission::Secret { id, .. } => lock(&self.secrets).get(&id).copied(),
+            Admission::Secret { id, .. } if s.role() == Role::Responder => {
+                lock(&self.secrets).get(&id).copied()
+            }
             _ => None,
         }
     }
@@ -453,22 +520,440 @@ fn deposit(d: &Daemon, r: &Record) -> Record {
     let (Some(token), Some(envelope)) = (token, envelope) else {
         return error(MALFORMED);
     };
-    match lock(&d.mailbox.store).deposit(&token, envelope, now()) {
-        Ok(_) => Record::new().with(0, OP_DEPOSIT),
+    let left = lock(&d.mailbox.store).deposit(&token, envelope, now());
+    match left {
+        Ok(_) => {
+            d.bump();
+            Record::new().with(0, OP_DEPOSIT)
+        }
         Err(Refused::NotPermitted) => error(NOT_PERMITTED),
         Err(Refused::Full) => error(FULL),
         Err(Refused::Malformed) => error(MALFORMED),
     }
 }
 
+/// Seals one entry of a space, or a heads message, into an envelope.
+fn seal(epoch: &EpochId, key: &[u8; 32], notice: impl Into<Value>) -> Vec<u8> {
+    let payload = Record::new().with(0, PAYLOAD).with(1, notice).encode();
+    let (nonce, ciphertext) = xchacha20poly1305_encrypt_random(key, &[], &payload);
+    Record::new()
+        .with(0, ENVELOPE)
+        .with(1, *epoch)
+        .with(2, nonce)
+        .with(3, ciphertext)
+        .encode()
+}
+
+/// Which epoch an envelope is sealed under.
+fn epoch_of(envelope: &[u8]) -> Option<EpochId> {
+    let r = Record::decode(envelope).ok()?;
+    r.get(1)?.as_bytes()?.try_into().ok()
+}
+
+/// What an envelope holds.
+#[derive(Debug, PartialEq, Eq)]
+enum Notice {
+    /// An entry of the space.
+    Entry(Vec<u8>),
+    /// A heads message: what is new, to fetch from a host.
+    Heads(Vec<[u8; 32]>),
+}
+
+/// Opens an envelope.
+fn open_envelope(envelope: &[u8], key: &[u8; 32]) -> Option<Notice> {
+    let r = Record::decode(envelope).ok()?;
+    if r.get(0)?.as_uint()? != ENVELOPE {
+        return None;
+    }
+    let nonce: [u8; 24] = r.get(2)?.as_bytes()?.try_into().ok()?;
+    let plain = xchacha20poly1305_decrypt(key, &nonce, &[], r.get(3)?.as_bytes()?).ok()?;
+    let payload = Record::decode(&plain).ok()?;
+    if payload.get(0)?.as_uint()? != PAYLOAD {
+        return None;
+    }
+    let notice = payload.get(1)?;
+    if let Some(entry) = notice.as_bytes() {
+        return Some(Notice::Entry(entry.to_vec()));
+    }
+    match from_value(notice.clone()).ok()? {
+        Message::Heads { ids, .. } => Some(Notice::Heads(ids)),
+        _ => None,
+    }
+}
+
+/// Gets a token from each of this person's hosts it can reach.
+async fn reach_here(d: &Arc<Daemon>) -> Vec<Reach> {
+    let me = d.keys.key();
+    let hosts = d.core().mailboxes();
+    let mut reach = Vec::new();
+    for (grant, device) in hosts {
+        let token: Token = random_bytes();
+        if device == me {
+            register(d, &token);
+        } else {
+            let host = *grant.link_key.x25519();
+            let at_host = |s: &Session| s.peer_static() == host;
+            let Some(s) = d.own_sessions().into_iter().find(at_host) else {
+                continue;
+            };
+            let one = Value::Record(Record::new().with(1, token).with(2, 0u64));
+            let ask = Record::new()
+                .with(0, OP_REGISTER)
+                .with(1, Value::list([one]));
+            if let Err(e) = call(&s, Service::MAILBOX, ask).await {
+                tracing::debug!("registering a token: {e:#}");
+                continue;
+            }
+        }
+        reach.push(Reach {
+            endpoints: grant.endpoints,
+            host: *grant.link_key.x25519(),
+            token,
+        });
+    }
+    reach
+}
+
+/// Writes where this person can be reached about a space, if they have a
+/// host and have not said yet.
+pub async fn write_reach(d: &Arc<Daemon>, space: &SpaceId) -> anyhow::Result<()> {
+    let me = d.core().identity.as_ref().map(|i| i.id());
+    let Some(me) = me else {
+        return Ok(());
+    };
+    if d.core().reach_of(space, &me).is_some() {
+        return Ok(());
+    }
+    let reach = reach_here(d).await;
+    if !reach.is_empty() {
+        d.write_and_push(space, vec![relationship::create_reach(&me, &reach)])?;
+    }
+    Ok(())
+}
+
+/// Ends what this person's tokens in a space allow, for someone refused.
+pub async fn withdraw_reach(d: &Arc<Daemon>, space: &SpaceId) -> anyhow::Result<()> {
+    let me = d.core().identity.as_ref().map(|i| i.id());
+    let found = me.and_then(|me| d.core().reach_of(space, &me));
+    let Some((_, reach)) = found else {
+        return Ok(());
+    };
+    for r in &reach {
+        if r.host == *d.keys.link.public_key().x25519() {
+            revoke(d, &r.token);
+            continue;
+        }
+        let at_host = |s: &Session| s.peer_static() == r.host;
+        if let Some(s) = d.own_sessions().into_iter().find(at_host) {
+            let ask = Record::new()
+                .with(0, OP_REVOKE)
+                .with(1, Value::list([Value::from(r.token)]));
+            call(&s, Service::MAILBOX, ask).await?;
+        }
+    }
+    Ok(())
+}
+
+/// Gives a space fresh tokens, in place of any revoked.
+pub async fn renew_reach(d: &Arc<Daemon>, space: &SpaceId) -> anyhow::Result<()> {
+    let me = d.core().identity.as_ref().map(|i| i.id());
+    let found = me.and_then(|me| d.core().reach_of(space, &me));
+    let Some((node, _)) = found else {
+        return write_reach(d, space).await;
+    };
+    let reach = reach_here(d).await;
+    d.write_and_push(space, vec![relationship::set_reach(node, &reach)])?;
+    Ok(())
+}
+
+/// Two people have just reconciled a space: what this device wrote in it so
+/// far needs no delivering.
+pub fn met(d: &Daemon, space: &SpaceId, member: &[u8; 32]) {
+    let ids: Vec<EntryId> = d
+        .core()
+        .entries_by(space, &d.keys.key())
+        .into_iter()
+        .map(|(id, _)| id)
+        .collect();
+    d.mailbox.mark_sent(space, member, &ids);
+}
+
+/// Opens a session with a host of someone else's, with their token. It says
+/// nothing of who is asking, and is good for one space.
+async fn at_host(d: &Daemon, r: &Reach, addr: SocketAddr) -> Option<Session> {
+    let secret = derive(Purpose::Token, &r.token);
+    let target = |c: CarrierKind| Target::invitation(addr, c, r.host, &secret[..]).anonymous();
+    d.dial(target).await.ok()
+}
+
+/// Fetches a space from a member's host.
+async fn pull(d: &Arc<Daemon>, space: &SpaceId, reach: &[Reach]) -> bool {
+    for r in reach {
+        for addr in r.endpoints.iter().filter_map(|e| e.socket_addr()) {
+            let Some(s) = at_host(d, r, addr).await else {
+                continue;
+            };
+            let done = net::reconcile(d, &s, *space).await;
+            s.close("fetched");
+            match done {
+                Ok(()) => return true,
+                Err(e) => tracing::debug!("fetching from a host: {e:#}"),
+            }
+        }
+    }
+    false
+}
+
+/// Fetches a space from the hosts of the members with no session here.
+async fn pull_from_members(d: &Arc<Daemon>, space: &SpaceId, members: &[[u8; 32]]) {
+    let in_touch = d.people_in_touch();
+    for member in members.iter().filter(|m| !in_touch.contains(*m)) {
+        let found = d.core().reach_of(space, member);
+        if let Some((_, reach)) = found {
+            pull(d, space, &reach).await;
+        }
+    }
+}
+
+/// Looks for anything new, for a person whom nobody can tell.
+async fn pull_all(d: &Arc<Daemon>) {
+    if !d.core().mailboxes().is_empty() {
+        return;
+    }
+    let shared = d.core().shared_spaces();
+    for (space, members) in shared {
+        pull_from_members(d, &space, &members).await;
+    }
+}
+
+/// Takes `envelopes` to the first host in `reach` that will have them, and
+/// says which were left.
+async fn leave(d: &Arc<Daemon>, reach: &[Reach], envelopes: &[(EntryId, Vec<u8>)]) -> Vec<EntryId> {
+    for r in reach {
+        for addr in r.endpoints.iter().filter_map(|e| e.socket_addr()) {
+            let Some(s) = at_host(d, r, addr).await else {
+                continue;
+            };
+            let mut left = Vec::new();
+            for (id, envelope) in envelopes {
+                let ask = Record::new()
+                    .with(0, OP_DEPOSIT)
+                    .with(1, r.token)
+                    .with(2, envelope.clone());
+                match call(&s, Service::MAILBOX, ask).await {
+                    Ok(reply) if reply.get(0).and_then(Value::as_uint) == Some(OP_DEPOSIT) => {
+                        left.push(*id);
+                    }
+                    other => {
+                        tracing::debug!("a host took no envelope: {other:?}");
+                        break;
+                    }
+                }
+            }
+            s.close("delivered");
+            if !left.is_empty() {
+                return left;
+            }
+        }
+    }
+    Vec::new()
+}
+
+/// Delivers what this device wrote to each member it has no session with.
+async fn deliver(d: &Arc<Daemon>) {
+    let shared = d.core().shared_spaces();
+    if shared.is_empty() {
+        return;
+    }
+    let me = d.keys.key();
+    let connected = d.connected_people();
+    let in_touch = d.people_in_touch();
+    for (space, members) in shared {
+        if let Err(e) = write_reach(d, &space).await {
+            tracing::debug!("writing where to reach this person: {e:#}");
+        }
+        for member in members {
+            let mine = d.core().entries_by(&space, &me);
+            if connected.contains(&member) {
+                let ids: Vec<EntryId> = mine.iter().map(|(id, _)| *id).collect();
+                d.mailbox.mark_sent(&space, &member, &ids);
+                continue;
+            }
+            if in_touch.contains(&member) {
+                continue;
+            }
+            let unsent = d.mailbox.unsent(&space, &member, mine);
+            if unsent.is_empty() {
+                continue;
+            }
+            let found = d.core().reach_of(&space, &member);
+            let Some((_, reach)) = found else {
+                continue;
+            };
+            let Some((epoch, key)) = d.core().envelope_key(&space) else {
+                continue;
+            };
+            let (fits, long): (Vec<_>, Vec<_>) = unsent
+                .iter()
+                .map(|(id, entry)| (*id, seal(&epoch, &key, &entry[..])))
+                .partition(|(_, envelope)| envelope.len() <= MAX_ENVELOPE);
+            let left = leave(d, &reach, &fits).await;
+            d.mailbox.mark_sent(&space, &member, &left);
+            // Too long to carry, so say that it is there, if this person has
+            // a host to fetch it from.
+            let hosted = d.core().identity.as_ref().map(|i| i.id());
+            let hosted = hosted.is_some_and(|me| d.core().reach_of(&space, &me).is_some());
+            if long.is_empty() || !hosted {
+                continue;
+            }
+            let ids: Vec<EntryId> = long.iter().map(|(id, _)| *id).collect();
+            let heads = Message::Heads {
+                label: space,
+                ids: ids.clone(),
+            };
+            let notice = (ids[0], seal(&epoch, &key, to_value(&heads)));
+            if !leave(d, &reach, &[notice]).await.is_empty() {
+                d.mailbox.mark_sent(&space, &member, &ids);
+            }
+        }
+    }
+}
+
+/// Collects this host's own mailbox. The host is one of the owner's devices,
+/// and everything it takes in reaches the others by the usual sync, so they
+/// need not poll it.
+async fn collect(d: &Arc<Daemon>) {
+    if !d.config().host {
+        return;
+    }
+    let me = d.keys.key();
+    let mut after = 0;
+    loop {
+        let (page, more) = lock(&d.mailbox.store).fetch(&me, after, now());
+        let Some(last) = page.last().map(|h| h.sequence) else {
+            return;
+        };
+        for held in &page {
+            take_in(d, held).await;
+        }
+        lock(&d.mailbox.store).ack(&me, last, now());
+        after = last;
+        if !more {
+            return;
+        }
+    }
+}
+
+/// Opens an envelope and takes in what it holds. One that cannot be opened is
+/// dropped: its sender gets nothing from holding the queue up.
+async fn take_in(d: &Arc<Daemon>, held: &Held) {
+    let opened = (|| {
+        let core = d.core();
+        let space = core.space_of_token(&held.token)?;
+        let key = core.envelope_key_of(&space, &epoch_of(&held.envelope)?)?;
+        Some((space, open_envelope(&held.envelope, &key)?))
+    })();
+    let Some((space, notice)) = opened else {
+        tracing::debug!("dropping envelope {}: it does not open", held.sequence);
+        return;
+    };
+    let entry = match notice {
+        Notice::Entry(entry) => entry,
+        Notice::Heads(ids) => {
+            let missing = ids.iter().any(|id| !d.core().has(&space, id));
+            let shared = d.core().shared_spaces();
+            let members = shared.into_iter().find(|(id, _)| *id == space);
+            if let (true, Some((_, members))) = (missing, members) {
+                pull_from_members(d, &space, &members).await;
+            }
+            return;
+        }
+    };
+    let d2 = d.clone();
+    let taken = tokio::task::spawn_blocking(move || d2.ingest(space, vec![entry], Access::Full));
+    match taken.await {
+        Ok(Ok(outcome)) => {
+            let me = *d.keys.link.public_key().x25519();
+            d.pass_on(space, outcome.complete, outcome.objects, me);
+        }
+        Ok(Err(e)) => tracing::debug!("envelope {}: {e:#}", held.sequence),
+        Err(e) => tracing::debug!("envelope {}: {e}", held.sequence),
+    }
+}
+
+fn pull_every() -> Duration {
+    std::env::var("CARDINAL_TEST_PULL_SECS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .map_or(PULL_EVERY, Duration::from_secs)
+}
+
+/// Keeps delivering and collecting, whenever there may be something to do.
+pub fn start(d: Arc<Daemon>) {
+    tokio::spawn(async move {
+        let mut changed = d.changed.subscribe();
+        let mut every = tokio::time::interval(LOOK_EVERY.min(pull_every()));
+        let mut pulled: Option<Instant> = None;
+        loop {
+            tokio::select! {
+                _ = every.tick() => {}
+                _ = changed.changed() => {}
+            }
+            deliver(&d).await;
+            collect(&d).await;
+            if pulled.is_none_or(|t| t.elapsed() >= pull_every()) {
+                pulled = Some(Instant::now());
+                pull_all(&d).await;
+            }
+            tokio::time::sleep(LOOK_GAP).await;
+        }
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use cardinal_space::grant::Endpoint;
 
     const T: Token = [1; 16];
     const OTHER: Token = [2; 16];
     const PHONE: KeyId = [3; 32];
     const LAPTOP: KeyId = [4; 32];
+
+    #[test]
+    fn a_heads_message_fits_in_an_envelope_and_comes_out_whole() {
+        let ids = vec![[1; 32], [2; 32]];
+        let heads = Message::Heads {
+            label: [3; 32],
+            ids: ids.clone(),
+        };
+        let envelope = seal(&[7; 16], &[8; 32], to_value(&heads));
+        assert!(envelope.len() <= MAX_ENVELOPE);
+        assert_eq!(open_envelope(&envelope, &[8; 32]), Some(Notice::Heads(ids)));
+    }
+
+    #[test]
+    fn a_reach_node_fits_in_an_envelope() {
+        let reach = Reach {
+            endpoints: vec![Endpoint::parse("203.0.113.9:7171").unwrap(); 2],
+            host: [1; 32],
+            token: [2; 16],
+        };
+        let op = relationship::create_reach(&[3; 32], &[reach.clone(), reach]);
+        let body = op.record().encode();
+        assert!(body.len() < MAX_ENVELOPE / 2, "{} bytes", body.len());
+    }
+
+    #[test]
+    fn an_envelope_opens_only_with_its_key() {
+        let (epoch, key) = ([7; 16], [8; 32]);
+        let envelope = seal(&epoch, &key, &b"an entry"[..]);
+        assert_eq!(epoch_of(&envelope), Some(epoch));
+        let opened = open_envelope(&envelope, &key).unwrap();
+        assert_eq!(opened, Notice::Entry(b"an entry".to_vec()));
+        assert_eq!(open_envelope(&envelope, &[9; 32]), None);
+        assert_eq!(open_envelope(b"not an envelope", &key), None);
+    }
 
     fn store() -> (tempfile::TempDir, Store) {
         let dir = tempfile::tempdir().unwrap();

@@ -57,6 +57,11 @@ impl EpochKey {
         [SPACE_KEY_CONTEXT, &id[..]].concat()
     }
 
+    /// The key of envelopes in this epoch (`hosts.md#envelopes`).
+    pub fn mailbox_key(&self) -> Zeroizing<[u8; 32]> {
+        derive(Purpose::Mailbox, &self.0[..])
+    }
+
     /// Seals this key to a member identity's encryption key.
     pub fn wrap(&self, recipient: &HybridPublicKey) -> Sealed {
         seal(recipient, &self.0[..], &Self::wrap_context(&self.id()))

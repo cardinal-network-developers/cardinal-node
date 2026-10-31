@@ -23,12 +23,15 @@ use tokio::io::AsyncWriteExt;
 
 use crate::core::short;
 use crate::daemon::{Daemon, PeerKind};
-use crate::net;
+use crate::{mailbox, net};
 
 /// The longest message here: a sealed genesis wrapped for two.
 const MAX_MESSAGE: usize = 64 * 1024;
 /// How long an exchange may take.
 const EXCHANGE_WITHIN: Duration = Duration::from_secs(20);
+/// The most text that is sure to fit in an envelope, with all an entry holds
+/// besides.
+const LEFT_AT_A_HOST: usize = 400;
 /// How long `done` may take to arrive, before a session that ends with it
 /// goes.
 const DONE_WITHIN: Duration = Duration::from_secs(3);
@@ -136,7 +139,10 @@ async fn accept_exchange(
     let label = identity_log_label(&invitation.inviter);
     net::reconcile(d, s, label).await?;
     let space = d.core().accept_relationship(&genesis)?;
+    mailbox::write_reach(d, &space).await?;
+    net::reconcile(d, s, space).await?;
     record_contact(d, &invitation.inviter, petname, &space, regard)?;
+    mailbox::met(d, &space, &invitation.inviter);
     send(&mut st, &ContactMessage::Done).await?;
     st.shutdown().await?;
     remember(d, s);
@@ -177,10 +183,13 @@ pub async fn serve(d: &Arc<Daemon>, s: &Session, mut st: Stream) -> anyhow::Resu
     let label = identity_log_label(&them);
     net::reconcile(d, s, label).await?;
     let (space, genesis) = d.core().create_relationship(&them)?;
+    mailbox::write_reach(d, &space).await?;
     send(&mut st, &ContactMessage::Genesis(genesis)).await?;
     let done = tokio::time::timeout(EXCHANGE_WITHIN, receive(&mut st)).await;
     if matches!(done, Ok(Ok(Some(ContactMessage::Done)))) {
+        net::reconcile(d, s, space).await?;
         record_contact(d, &them, &name, &space, regard)?;
+        mailbox::met(d, &space, &them);
         remember(d, s);
         d.identity_changed();
         tracing::info!("{name} ({}) is a contact now", short(&them));
@@ -215,7 +224,7 @@ fn record_contact(
 
 /// Changes how this person regards a contact. Only their own devices hear of
 /// it, and the contact is told nothing.
-pub fn set(d: &Arc<Daemon>, who: &str, setting: &str) -> anyhow::Result<Json> {
+pub async fn set(d: &Arc<Daemon>, who: &str, setting: &str) -> anyhow::Result<Json> {
     let contact = find(d, who)?;
     let (key, value) = match setting {
         "trust" => (account::TRUSTED, true),
@@ -232,6 +241,11 @@ pub fn set(d: &Arc<Daemon>, who: &str, setting: &str) -> anyhow::Result<Json> {
         .ok_or_else(|| anyhow::anyhow!("the account space is not here yet"))?;
     d.write_and_push(&account, vec![account::set_field(contact.node, key, value)])?;
     d.peers_changed();
+    match setting {
+        "refuse" => mailbox::withdraw_reach(d, &contact.space).await?,
+        "unrefuse" => mailbox::renew_reach(d, &contact.space).await?,
+        _ => {}
+    }
     Ok(json!({}))
 }
 
@@ -303,7 +317,18 @@ pub fn say(d: &Arc<Daemon>, who: &str, text: &str) -> anyhow::Result<Json> {
     let conversation = conversation.ok_or_else(|| anyhow::anyhow!("that space is not open yet"))?;
     let op = relationship::create_message(conversation, text);
     d.write_and_push(&space, vec![op])?;
-    Ok(json!({"direct": contact.connects()}))
+    Ok(json!({"reachable": reachable(d, &contact, text)}))
+}
+
+/// Whether something written now can get to a contact without the two
+/// connecting: left at their host, or, if too long for that, fetched from
+/// this person's.
+fn reachable(d: &Daemon, contact: &ContactRecord, text: &str) -> bool {
+    let core = d.core();
+    let me = core.identity.as_ref().map(|i| i.id());
+    let hosted = me.is_some_and(|me| core.reach_of(&contact.space, &me).is_some());
+    let theirs = core.reach_of(&contact.space, &contact.identity).is_some();
+    contact.connects() || (theirs && (hosted || text.len() <= LEFT_AT_A_HOST))
 }
 
 /// The conversation with a contact.

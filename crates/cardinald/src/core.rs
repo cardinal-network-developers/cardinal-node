@@ -758,6 +758,95 @@ impl Core {
             .unwrap_or_default()
     }
 
+    /// The spaces shared with anyone, with the other members this person has
+    /// not refused.
+    pub fn shared_spaces(&self) -> Vec<(SpaceId, Vec<[u8; 32]>)> {
+        let me = self.identity.as_ref().map(|i| i.id());
+        let contacts = self.contacts();
+        let refused = |who: &[u8; 32]| contacts.iter().any(|c| c.identity == *who && c.refused);
+        let mut out = Vec::new();
+        for (id, h) in &self.spaces {
+            let Some(space) = h.space.as_ref() else {
+                continue;
+            };
+            let members = space.validity().members.iter().map(|m| m.identity);
+            let others: Vec<[u8; 32]> = members.filter(|m| Some(*m) != me && !refused(m)).collect();
+            if !others.is_empty() {
+                out.push((*id, others));
+            }
+        }
+        out
+    }
+
+    /// This person's hosts with a mailbox: each grant and the device serving
+    /// it.
+    pub fn mailboxes(&self) -> Vec<(cardinal_space::grant::Grant, KeyId)> {
+        let Some(space) = self.account().and_then(|a| a.space.as_ref()) else {
+            return Vec::new();
+        };
+        cardinal_space::account::hosts(space.state())
+            .iter()
+            .filter_map(|h| cardinal_space::grant::Grant::open(&h.grant))
+            .filter(|(g, _)| g.services.contains(&cardinal_space::grant::MAILBOX))
+            .collect()
+    }
+
+    /// The reach node `who` wrote in a space.
+    pub fn reach_of(
+        &self,
+        space: &SpaceId,
+        who: &[u8; 32],
+    ) -> Option<(
+        cardinal_space::NodeId,
+        Vec<cardinal_space::relationship::Reach>,
+    )> {
+        let h = self.spaces.get(space)?.space.as_ref()?;
+        cardinal_space::relationship::reach_of(h.state(), who)
+    }
+
+    /// The space this person gave out a token in.
+    pub fn space_of_token(&self, token: &[u8; 16]) -> Option<SpaceId> {
+        let me = self.identity.as_ref()?.id();
+        self.spaces.keys().copied().find(|id| {
+            self.reach_of(id, &me)
+                .is_some_and(|(_, reach)| reach.iter().any(|r| r.token == *token))
+        })
+    }
+
+    /// The current epoch of a space, and its envelope key.
+    pub fn envelope_key(
+        &self,
+        space: &SpaceId,
+    ) -> Option<(
+        cardinal_space::EpochId,
+        cardinal_crypto::Zeroizing<[u8; 32]>,
+    )> {
+        let h = self.spaces.get(space)?.space.as_ref()?;
+        let epoch = h.current_epoch()?;
+        Some((epoch, h.keyring().get(&epoch)?.mailbox_key()))
+    }
+
+    /// An epoch's envelope key.
+    pub fn envelope_key_of(
+        &self,
+        space: &SpaceId,
+        epoch: &cardinal_space::EpochId,
+    ) -> Option<cardinal_crypto::Zeroizing<[u8; 32]>> {
+        let h = self.spaces.get(space)?.space.as_ref()?;
+        Some(h.keyring().get(epoch)?.mailbox_key())
+    }
+
+    /// The entries of a space that `device` signed, sealed.
+    pub fn entries_by(&self, space: &SpaceId, device: &KeyId) -> Vec<(EntryId, Vec<u8>)> {
+        let Some(h) = self.spaces.get(space).and_then(|h| h.space.as_ref()) else {
+            return Vec::new();
+        };
+        h.sealed_entries()
+            .filter(|(id, _)| h.entry(id).is_some_and(|e| e.signer() == *device))
+            .map(|(id, sealed)| (*id, sealed.encode()))
+            .collect()
+    }
+
     /// The labels of contacts' logs this device does not have yet.
     pub fn missing_logs(&self) -> Vec<[u8; 32]> {
         let contacts = self.contacts();

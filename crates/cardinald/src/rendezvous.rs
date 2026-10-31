@@ -301,7 +301,7 @@ async fn stay_present(d: &Daemon) {
 }
 
 /// Asks a device something and waits a while for its answer.
-async fn call(s: &Session, service: Service, ask: Record) -> anyhow::Result<Record> {
+pub(crate) async fn call(s: &Session, service: Service, ask: Record) -> anyhow::Result<Record> {
     let exchange = async {
         let mut st = s.open_stream(service, Priority::Interactive)?;
         st.send_message(&Value::Record(ask)).await?;

@@ -45,7 +45,8 @@ impl Endpoint {
         })
     }
 
-    fn to_record(&self) -> Record {
+    /// The record.
+    pub fn to_record(&self) -> Record {
         let address = match self.host.parse::<IpAddr>() {
             Ok(IpAddr::V4(a)) => Value::from(a.octets().to_vec()),
             Ok(IpAddr::V6(a)) => Value::from(a.octets().to_vec()),
@@ -57,7 +58,8 @@ impl Endpoint {
             .with(3, self.port as u64)
     }
 
-    fn from_record(r: &Record) -> Option<Endpoint> {
+    /// Reads the record.
+    pub fn from_record(r: &Record) -> Option<Endpoint> {
         let v = r.get(2)?;
         let host = match (v.as_text(), v.as_bytes()) {
             (Some(t), _) => t.to_owned(),

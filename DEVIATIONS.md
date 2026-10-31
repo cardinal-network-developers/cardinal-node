@@ -663,9 +663,8 @@ asks for around that is not built yet.
 - **Invitations record how the person will regard whoever uses them**, in the
   daemon's memory, so that lasts as long as the invitation does.
 - **Both people must be online to connect**, and a device finds a contact's
-  device only at an address it has already seen. There are no reach nodes,
-  delivery tokens or mailboxes, so rendezvous and relay do not help between two
-  people yet, and a message waits for the two to be online together.
+  device only at an address it has already seen. Tokens are for the mailbox and
+  for fetching, so rendezvous and relay do not help between two people yet.
 - **Spec gap: which identity's log comes first.** `contact.md#accepting` has
   both sides reconcile logs before `genesis`. Here the inviter fetches the
   invitee's log before creating the space, and the invitee fetches the
@@ -677,19 +676,22 @@ asks for around that is not built yet.
   space.** A device opens a session with a contact's devices only for what they
   share (`spaces.md#holding-a-space`), and notices for a set go only to contacts
   who are entitled to it.
-- **Through hosts only reaches nobody yet.** D50 is followed: a device opens
-  sessions only with trusted contacts and answers others with silence. But a
-  host cannot carry anything between two people yet, so someone through hosts
-  only is cut off in practice. What is written to them is kept and goes when the
-  person trusts them, or when hosts can carry it.
+- **Through hosts only works in a relationship space, with hosts that are a
+  person's own.** Each person's reach node gives the other a token, and they
+  leave entries in each other's mailboxes. An entry too long for an envelope
+  goes as a `heads` message, and is fetched from the writer's host. Someone with
+  no host of their own cannot be told anything, so every five minutes they fetch
+  from the other's host, and what they write that is too long for an envelope
+  waits for a connection.
 - **Silence is only as good as the carrier.** Over UDP an untrusted device hears
   nothing, as the spec asks. A device also listening on TCP accepts the
   connection before it can stay silent, so TCP shows that something is there,
   though not how anyone is regarded.
 - **No introductions is kept and shown, and nothing acts on it**, since there
   are no introductions, and contacts do not help each other meet, yet.
-- **Refuse is for contacts.** `member seen` nodes do not exist yet. There are no
-  tokens to revoke and no group spaces to warn about.
+- **Refuse is for contacts.** `member seen` nodes do not exist yet, and there
+  are no group spaces to warn about. Refusing revokes this person's tokens in
+  the space, and taking it back writes new ones.
 - **A new epoch notices only this identity's key changes.** It is wrapped for
   every member, but a change of another member's encryption key does not make
   one due here, which `spaces.md#when-to-rotate` asks for.
@@ -702,8 +704,26 @@ asks for around that is not built yet.
   grants itself to its own identity, the case `hosts.md#grants` calls the
   common one. It holds spaces as any of the person's devices does, under
   their space ids, not random labels, and it can read them. Hosts that
-  cannot read what they store, delivery tokens, and the mailbox service are
-  not implemented.
+  cannot read what they store are not implemented.
+- **A host's mailbox has one quota class, set in the code:** 256 envelopes
+  waiting and 1024 deposits a day per token, kept 30 days. A grant has no
+  `classes`. `usage` is served and nothing asks for it.
+- **A host collects its own mailbox.** It is one of the owner's devices, and
+  what it takes in reaches the others by sync, so they do not poll it, which
+  costs a device on a metered connection nothing. `fetch` and `ack` are served
+  for the day a host is not its owner's, and nothing else uses them yet.
+- **An envelope says nothing of who left it, but its session has a key.** A
+  depositor sends no device proof, so a host does not learn the identity. It
+  does see the device's static key, the same each time, so a host run by
+  someone else could link deposits. This matters only once such hosts exist.
+- **Tokens do not rotate with epochs.** A device removed from one person keeps
+  the other's token, until that person refuses and restores them. A deposit is
+  bounded by the token's quota, and it can open nothing.
+- **A new host does not tell contacts it is there** unless a mailbox of theirs
+  can carry the reach node. Someone through hosts only who had no host when
+  they were invited stays out of reach of the other until then.
+- **Join requests are not implemented**, so an invitation still needs its
+  inviter online.
 - **Rendezvous and relay are for a person's own devices** so far, as D49
   has it: every one of them offers both, host or not. `connect` and `relay`
   with a token come with sharing.
