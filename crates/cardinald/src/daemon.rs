@@ -743,6 +743,9 @@ impl Daemon {
             lock(&self.proven).remove(peer_static);
             tracing::info!("disconnected from {}", short(peer_static));
             crate::rendezvous::session_closed(self, peer_static);
+            // A device has one session with another, so a fetch may have
+            // been waiting for this one to end.
+            self.bump();
         }
     }
 
