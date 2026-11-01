@@ -22,6 +22,7 @@ cardinal-crypto.workspace = true
 libc = "0.2"
 
 [dev-dependencies]
+hex.workspace = true
 tempfile.workspace = true
 blake3.workspace = true
 cardinal-contact.workspace = true

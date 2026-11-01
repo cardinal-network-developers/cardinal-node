@@ -244,6 +244,10 @@ pub struct Daemon {
     pub mailbox: crate::mailbox::Mailbox,
     /// Pairing.
     pub pairing: Mutex<PairState>,
+    /// The call under way.
+    pub call: Mutex<Option<crate::calls::Call>>,
+    /// Audio heard on the call, for a client.
+    pub call_audio: tokio::sync::broadcast::Sender<bytes::Bytes>,
     /// An identity made for a client, until its person has written the words
     /// down.
     pub setting_up: Mutex<Option<(crate::setup::Prepared, [usize; 2])>>,
@@ -405,6 +409,8 @@ impl Daemon {
             connecting: Mutex::new(HashSet::new()),
             changed: watch::channel(0).0,
             pairing: Mutex::new(PairState::Idle),
+            call: Mutex::new(None),
+            call_audio: tokio::sync::broadcast::channel(64).0,
             setting_up: Mutex::new(None),
             mount: Mutex::new(None),
             mount_unavailable: Mutex::new(None),

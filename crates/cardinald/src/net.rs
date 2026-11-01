@@ -241,6 +241,9 @@ async fn handle_stream(d: &Arc<Daemon>, s: &Session, mut st: Stream) -> anyhow::
     if st.service() == Service::CONTACT {
         return crate::contacts::serve(d, s, st).await;
     }
+    if st.service() == Service::EPHEMERAL {
+        return crate::calls::serve(d, s, st).await;
+    }
     if st.service() == Service::MAILBOX {
         return crate::mailbox::serve(d, s, st).await;
     }

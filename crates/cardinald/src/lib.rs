@@ -6,6 +6,7 @@
 //! See `README.md` in this crate for the design.
 
 pub mod applog;
+pub mod calls;
 pub mod cleanup;
 pub mod config;
 pub mod contacts;

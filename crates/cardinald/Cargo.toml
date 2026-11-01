@@ -20,6 +20,7 @@ cardinal-update.workspace = true
 toml.workspace = true
 toml_edit = "0.25"
 blake3.workspace = true
+bytes = "1"
 zeroize.workspace = true
 hex.workspace = true
 anyhow.workspace = true

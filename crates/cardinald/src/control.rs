@@ -59,6 +59,10 @@ pub fn serve(d: Arc<Daemon>) -> anyhow::Result<tokio::task::JoinHandle<()>> {
                         watch(&d, lines, w).await;
                         break;
                     }
+                    if line.contains("\"call-media\"") {
+                        crate::calls::media(&d, lines, w).await;
+                        break;
+                    }
                     let reply = match serde_json::from_str::<Value>(&line) {
                         Ok(req) => match handle(&d, &req).await {
                             Ok(mut v) => {
@@ -255,6 +259,10 @@ async fn handle(d: &Arc<Daemon>, req: &Value) -> anyhow::Result<Value> {
         }
         "contact" => crate::contacts::set(d, arg(req, "who")?, arg(req, "setting")?),
         "say" => crate::contacts::say(d, arg(req, "who")?, arg(req, "text")?),
+        "call" => Ok(crate::calls::current(d)),
+        "call-start" => crate::calls::start(d, arg(req, "who")?).await,
+        "call-answer" => crate::calls::answer(d).await,
+        "call-end" => crate::calls::end(d).await,
         "conversations" => Ok(crate::contacts::conversations(d)),
         "mark-read" => crate::contacts::mark_read(d, arg(req, "who")?),
         "files" => files_at(d, req.get("path").and_then(Value::as_str).unwrap_or("")),

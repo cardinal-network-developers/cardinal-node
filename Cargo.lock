@@ -220,6 +220,7 @@ dependencies = [
  "cardinal-update",
  "cardinald",
  "clap",
+ "hex",
  "libc",
  "serde_json",
  "tempfile",
@@ -357,6 +358,7 @@ version = "0.1.12"
 dependencies = [
  "anyhow",
  "blake3",
+ "bytes",
  "cardinal-blob",
  "cardinal-contact",
  "cardinal-crypto",

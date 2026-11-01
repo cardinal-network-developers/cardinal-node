@@ -352,7 +352,7 @@ fn find(d: &Daemon, who: &str) -> anyhow::Result<ContactRecord> {
 }
 
 /// The contact called `who`, unless this person has refused them.
-fn listed(d: &Daemon, who: &str) -> anyhow::Result<ContactRecord> {
+pub(crate) fn listed(d: &Daemon, who: &str) -> anyhow::Result<ContactRecord> {
     let contact = find(d, who)?;
     anyhow::ensure!(!contact.refused, "you have refused {who}");
     Ok(contact)

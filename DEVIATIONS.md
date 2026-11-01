@@ -656,6 +656,10 @@ Not implemented yet (the next milestone):
 The first step of sharing: two people connect and talk. Much of what the spec
 asks for around that is not built yet.
 
+- **One call at a time, between two people.** There is no call in a group space,
+  no forwarding by a participant, and a call needs a session with the other
+  person, so someone reached through hosts only cannot be called. Nothing wakes a
+  sleeping phone: `ring` goes only to devices that are online.
 - **Read markers are always written.** `profiles.md` has no setting to keep them
   back, so reading a conversation tells the other person. Every message also
   lacks the author-owned field the profile gives it.
