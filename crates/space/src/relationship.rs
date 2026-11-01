@@ -1,6 +1,8 @@
 //! The relationship profile (`profiles.md#relationship`): two identities,
 //! both owners, and a conversation between them.
 
+use std::collections::HashSet;
+
 use cardinal_encoding::{Record, Value};
 use cardinal_identity::EntryId;
 
@@ -123,36 +125,40 @@ pub fn set_read_marker(marker: NodeId, last: NodeId) -> SpaceOp {
     SpaceOp::set(marker, 1, Some(last.into()))
 }
 
-/// `who`'s read markers: each marker's node and the message it is at. Their
-/// devices may each have made one while apart.
-fn read_markers(space: &Space, who: &IdentityId) -> Vec<(NodeId, NodeId)> {
-    let Some(conversation) = conversation(space) else {
-        return Vec::new();
-    };
+fn is_marker_of<'a>(who: &'a IdentityId) -> impl Fn(&&Node) -> bool + 'a {
+    move |n| n.kind == NodeKind::Uint(READ_MARKER) && !n.deleted && n.creator == *who
+}
+
+/// A read marker of `who`'s, to move rather than make another. Their devices
+/// may each have made one while apart.
+pub fn read_marker(space: &Space, who: &IdentityId) -> Option<NodeId> {
+    let conversation = conversation(space)?;
     let state = space.state();
     let markers = state.children(&conversation).into_iter();
-    markers
-        .filter(|n| n.kind == NodeKind::Uint(READ_MARKER) && !n.deleted && n.creator == *who)
-        .filter_map(|n| {
-            let last = n.values(1).iter().rev().find_map(|v| v.value.as_ref())?;
-            Some((n.id, last.as_bytes()?.try_into().ok()?))
-        })
-        .collect()
+    let mut found: Vec<NodeId> = markers.filter(is_marker_of(who)).map(|n| n.id).collect();
+    found.sort();
+    found.first().copied()
 }
 
-/// A read marker of `who`'s, to move rather than make another.
-pub fn read_marker(space: &Space, who: &IdentityId) -> Option<NodeId> {
-    let found = read_markers(space, who);
-    found.first().map(|(marker, _)| *marker)
-}
-
-/// How many of `messages` `who` has read: all those up to the furthest of
-/// their markers.
-pub fn read_up_to(space: &Space, who: &IdentityId, messages: &[Message]) -> usize {
-    let at = |last: &NodeId| messages.iter().position(|m| m.id == *last);
-    let markers = read_markers(space, who);
-    let furthest = markers.iter().filter_map(|(_, last)| at(last)).max();
-    furthest.map_or(0, |at| at + 1)
+/// Which of `messages` `who` has read. A marker says it had read all that the
+/// entry writing it had seen, so what arrives beside it, or is deleted after it,
+/// changes nothing, and two devices moving one marker apart add up.
+pub fn read_by(space: &Space, who: &IdentityId, messages: &[Message]) -> Vec<bool> {
+    let dag = space.dag();
+    let mut seen: HashSet<EntryId> = HashSet::new();
+    if let Some(conversation) = conversation(space) {
+        let state = space.state();
+        let markers = state.children(&conversation).into_iter();
+        for marker in markers.filter(is_marker_of(who)) {
+            let mut going: Vec<EntryId> = marker.values(1).iter().map(|v| v.entry).collect();
+            while let Some(entry) = going.pop() {
+                if seen.insert(entry) {
+                    going.extend_from_slice(dag.parents(&entry));
+                }
+            }
+        }
+    }
+    messages.iter().map(|m| seen.contains(&m.entry)).collect()
 }
 
 /// A message.

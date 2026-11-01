@@ -559,8 +559,8 @@ fn setup_finish(d: &Arc<Daemon>, req: &Value) -> anyhow::Result<Value> {
     }
     let (prepared, _) = held.take().expect("checked above");
     drop(held);
-    config.save(&d.paths.config())?;
     crate::setup::install(&d.paths, prepared, &config)?;
+    config.save(&d.paths.config())?;
     reload(d)?;
     Ok(json!({"name": config.name}))
 }

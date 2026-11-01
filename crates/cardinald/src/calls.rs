@@ -14,7 +14,7 @@ use cardinal_link::{Priority, Service, Session, Stream};
 use cardinal_space::SpaceId;
 use serde_json::{json, Value as Json};
 use tokio::io::{AsyncWriteExt, BufReader};
-use tokio::sync::Notify;
+use tokio::sync::watch;
 
 use crate::contacts;
 use crate::daemon::{Daemon, PeerKind};
@@ -28,6 +28,8 @@ const END: u64 = 3;
 const MAX_SIGNAL: usize = 128;
 /// How long a call rings before it stops.
 const RINGS_FOR: Duration = Duration::from_secs(45);
+/// How often a call looks at whether its session is still there.
+const SESSION_CHECK: Duration = Duration::from_secs(5);
 
 /// Where a call stands.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -49,8 +51,38 @@ pub struct Call {
     standing: Standing,
     /// The session the audio goes on: the one that rang, or that answered.
     session: Option<Session>,
+    /// Audio is being carried.
+    carrying: bool,
     live_since: Option<Instant>,
-    over: Arc<Notify>,
+    /// True once the call is over. It holds that for whoever looks later.
+    over: watch::Sender<bool>,
+}
+
+impl Call {
+    fn new(
+        id: [u8; 16],
+        who: [u8; 32],
+        name: String,
+        space: SpaceId,
+        standing: Standing,
+        session: Option<Session>,
+    ) -> Call {
+        Call {
+            id,
+            who,
+            name,
+            space,
+            standing,
+            session,
+            carrying: false,
+            live_since: None,
+            over: watch::channel(false).0,
+        }
+    }
+
+    fn close(&self) {
+        self.over.send_replace(true);
+    }
 }
 
 fn lock(d: &Daemon) -> std::sync::MutexGuard<'_, Option<Call>> {
@@ -89,10 +121,10 @@ fn ring_out(d: &Arc<Daemon>, id: [u8; 16]) {
     });
 }
 
-/// Rings a contact.
+/// Rings a contact. Ringing here does not stop this person calling someone:
+/// a call that is only ringing gives way.
 pub async fn start(d: &Arc<Daemon>, who: &str) -> anyhow::Result<Json> {
     let contact = contacts::listed(d, who)?;
-    anyhow::ensure!(lock(d).is_none(), "you are already on a call");
     let theirs = d.sessions_of(&contact.identity);
     anyhow::ensure!(
         !theirs.is_empty(),
@@ -100,17 +132,28 @@ pub async fn start(d: &Arc<Daemon>, who: &str) -> anyhow::Result<Json> {
         contact.petname
     );
     let id: [u8; 16] = cardinal_crypto::random_bytes();
-    let over = Arc::new(Notify::new());
-    *lock(d) = Some(Call {
+    let call = Call::new(
         id,
-        who: contact.identity,
-        name: contact.petname.clone(),
-        space: contact.space,
-        standing: Standing::Calling,
-        session: None,
-        live_since: None,
-        over,
-    });
+        contact.identity,
+        contact.petname.clone(),
+        contact.space,
+        Standing::Calling,
+        None,
+    );
+    let gave_way = {
+        let mut held = lock(d);
+        let ringing = held
+            .as_ref()
+            .is_some_and(|c| c.standing == Standing::Ringing);
+        anyhow::ensure!(held.is_none() || ringing, "you are already on a call");
+        held.replace(call)
+    };
+    if let Some(old) = gave_way {
+        old.close();
+        if let Some(s) = &old.session {
+            let _ = tell(s, END, &old.space, &old.id).await;
+        }
+    }
     d.bump();
     for s in &theirs {
         if let Err(e) = tell(s, RING, &contact.space, &id).await {
@@ -124,11 +167,13 @@ pub async fn start(d: &Arc<Daemon>, who: &str) -> anyhow::Result<Json> {
 /// Takes the call that is ringing here.
 pub async fn answer(d: &Arc<Daemon>) -> anyhow::Result<Json> {
     let (s, space, id) = {
-        let call = lock(d);
+        let mut call = lock(d);
         let c = call
-            .as_ref()
+            .as_mut()
             .filter(|c| c.standing == Standing::Ringing)
             .ok_or_else(|| anyhow::anyhow!("nothing is ringing"))?;
+        // Taken now, so a second answer finds nothing ringing.
+        c.standing = Standing::Live;
         let s = c.session.clone();
         (
             s.ok_or_else(|| anyhow::anyhow!("that call has gone"))?,
@@ -136,8 +181,11 @@ pub async fn answer(d: &Arc<Daemon>) -> anyhow::Result<Json> {
             c.id,
         )
     };
-    tell(&s, ANSWER, &space, &id).await?;
-    go_live(d, &s);
+    if let Err(e) = tell(&s, ANSWER, &space, &id).await {
+        let _ = end(d).await;
+        return Err(e);
+    }
+    go_live(d, &s, id);
     Ok(json!({}))
 }
 
@@ -146,7 +194,7 @@ pub async fn end(d: &Arc<Daemon>) -> anyhow::Result<Json> {
     let Some(call) = lock(d).take() else {
         return Ok(json!({}));
     };
-    call.over.notify_waiters();
+    call.close();
     d.bump();
     let told = match call.session {
         Some(s) => vec![s],
@@ -158,38 +206,61 @@ pub async fn end(d: &Arc<Daemon>) -> anyhow::Result<Json> {
     Ok(json!({}))
 }
 
-/// Starts carrying audio on a session.
-fn go_live(d: &Arc<Daemon>, s: &Session) {
-    let (mut channel, id, over) = {
+/// Forgets a call that has ended by itself.
+fn forget(d: &Daemon, id: &[u8; 16]) {
+    let gone = {
         let mut call = lock(d);
-        let Some(c) = call.as_mut() else { return };
+        let same = call.as_ref().is_some_and(|c| c.id == *id);
+        if same {
+            call.take()
+        } else {
+            None
+        }
+    };
+    if let Some(call) = gone {
+        call.close();
+        d.bump();
+    }
+}
+
+/// Starts carrying the audio of the call `id` on a session, if that is still
+/// the call under way and nothing is carrying it.
+fn go_live(d: &Arc<Daemon>, s: &Session, id: [u8; 16]) {
+    let (mut channel, mut over) = {
+        let mut call = lock(d);
+        let Some(c) = call.as_mut().filter(|c| c.id == id && !c.carrying) else {
+            return;
+        };
         c.standing = Standing::Live;
+        c.carrying = true;
         c.session = Some(s.clone());
         c.live_since = Some(Instant::now());
         let label = channel_label(&c.space, &c.id);
-        (s.channel(label, Priority::RealTime), c.id, c.over.clone())
+        (s.channel(label, Priority::RealTime), c.over.subscribe())
     };
     d.bump();
     let d = d.clone();
+    let s = s.clone();
     tokio::spawn(async move {
+        let mut check = tokio::time::interval(SESSION_CHECK);
         loop {
             tokio::select! {
-                _ = over.notified() => return,
+                _ = over.wait_for(|over| *over) => return,
                 heard = channel.recv() => match heard {
                     Some(audio) => {
-                        let _ = d.call_audio.send(audio);
+                        let _ = d.call_audio.send((id, audio));
                     }
                     None => break,
                 },
+                _ = check.tick() => {
+                    if s.is_closed() {
+                        break;
+                    }
+                }
             }
         }
         // The session went, and the call with it.
-        let mut call = lock(&d);
-        if call.as_ref().is_some_and(|c| c.id == id) {
-            *call = None;
-            drop(call);
-            d.bump();
-        }
+        forget(&d, &id);
     });
 }
 
@@ -251,16 +322,10 @@ pub async fn serve(d: &Arc<Daemon>, s: &Session, mut st: Stream) -> anyhow::Resu
                 let mut call = lock(d);
                 let busy = call.is_some();
                 if !busy {
-                    *call = Some(Call {
-                        id,
-                        who: them,
-                        name: contact.petname.clone(),
-                        space,
-                        standing: Standing::Ringing,
-                        session: Some(s.clone()),
-                        live_since: None,
-                        over: Arc::new(Notify::new()),
-                    });
+                    let name = contact.petname.clone();
+                    let ringing = Standing::Ringing;
+                    let session = Some(s.clone());
+                    *call = Some(Call::new(id, them, name, space, ringing, session));
                 }
                 busy
             };
@@ -275,34 +340,52 @@ pub async fn serve(d: &Arc<Daemon>, s: &Session, mut st: Stream) -> anyhow::Resu
             let expected = lock(d)
                 .as_ref()
                 .is_some_and(|c| c.id == id && c.who == them && c.standing == Standing::Calling);
-            if expected {
-                go_live(d, s);
-                // Their other devices can stop ringing.
-                for other in d.sessions_of(&them) {
-                    if other.peer_static() != s.peer_static() {
-                        let _ = tell(&other, END, &space, &id).await;
-                    }
-                }
+            if !expected {
+                // Too late, or never was: they are not to think they are on a call.
+                tell(s, END, &space, &id).await?;
+                return Ok(());
             }
+            go_live(d, s, id);
+            // Their other devices can stop ringing.
+            told_the_others(d, s, &them, &space, &id).await;
         }
         END => {
             let ended = {
                 let mut call = lock(d);
                 let same = call.as_ref().is_some_and(|c| c.id == id && c.who == them);
-                if same {
+                let on_it = call.as_ref().is_some_and(|c| {
+                    let session = c.session.as_ref();
+                    session.is_some_and(|c| c.peer_static() == s.peer_static())
+                });
+                let live = call.as_ref().is_some_and(|c| c.standing == Standing::Live);
+                // A device that is not on a live call has no say in it.
+                if same && (on_it || !live) {
                     call.take()
                 } else {
                     None
                 }
             };
             if let Some(call) = ended {
-                call.over.notify_waiters();
+                call.close();
                 d.bump();
+                // A no on one device stops the others ringing.
+                if call.standing == Standing::Calling {
+                    told_the_others(d, s, &them, &space, &id).await;
+                }
             }
         }
         _ => st.reset(0),
     }
     Ok(())
+}
+
+/// Ends the ring on a person's devices other than the one that spoke.
+async fn told_the_others(d: &Daemon, s: &Session, them: &[u8; 32], space: &SpaceId, id: &[u8; 16]) {
+    for other in d.sessions_of(them) {
+        if other.peer_static() != s.peer_static() {
+            let _ = tell(&other, END, space, id).await;
+        }
+    }
 }
 
 /// Audio for and from a client, one `{"audio": hex}` line per frame, until
@@ -311,16 +394,23 @@ pub async fn media(d: &Arc<Daemon>, mut lines: tokio::io::Lines<BufReader<Reader
     let mut heard = d.call_audio.subscribe();
     let mut stopping = d.stopping.subscribe();
     let mut changed = d.changed.subscribe();
+    let Some(call) = lock(d).as_ref().map(|c| c.id) else {
+        return;
+    };
+    let current = |d: &Daemon| lock(d).as_ref().is_some_and(|c| c.id == call);
     loop {
         tokio::select! {
             _ = stopping.changed() => return,
             c = changed.changed() => {
-                if c.is_err() || lock(d).is_none() {
+                if c.is_err() || !current(d) {
                     return;
                 }
             }
             frame = heard.recv() => {
-                let Ok(frame) = frame else { continue };
+                let Ok((of, frame)) = frame else { continue };
+                if of != call {
+                    continue;
+                }
                 let mut out = json!({"audio": hex::encode(&frame)}).to_string();
                 out.push('\n');
                 if w.write_all(out.as_bytes()).await.is_err() {

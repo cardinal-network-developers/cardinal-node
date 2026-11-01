@@ -61,7 +61,12 @@ impl AppendLog {
                 path = %path.display(),
                 "cutting a torn record at the end of the log"
             );
-            file.set_len(pos as u64)?;
+            // On a handle of its own: Windows does not let one that only
+            // appends change a file's length.
+            OpenOptions::new()
+                .write(true)
+                .open(path)?
+                .set_len(pos as u64)?;
         }
         Ok((
             AppendLog {

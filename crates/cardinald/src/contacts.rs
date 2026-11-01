@@ -21,7 +21,7 @@ use cardinal_sync::identity_log_label;
 use serde_json::{json, Value as Json};
 use tokio::io::AsyncWriteExt;
 
-use crate::core::short;
+use crate::core::{now_ms, short};
 use crate::daemon::{Daemon, PeerKind};
 use crate::net::Access;
 use crate::{mailbox, net};
@@ -412,8 +412,8 @@ fn reachable(d: &Daemon, contact: &ContactRecord, text: &str) -> bool {
 /// passed it, `waiting` until a reconcile or a deposit says it got somewhere,
 /// else `sent`. Only what this device wrote can be waiting here: another
 /// device of this person's is keeping count of its own.
-fn state_of(at: usize, read: usize, waiting: bool) -> &'static str {
-    if at < read {
+fn state_of(read: bool, waiting: bool) -> &'static str {
+    if read {
         "read"
     } else if waiting {
         "waiting"
@@ -433,18 +433,18 @@ pub fn messages(d: &Daemon, who: &str) -> anyhow::Result<Json> {
     let open = core.spaces.get(&space).and_then(|h| h.space.as_ref());
     let open = open.ok_or_else(|| anyhow::anyhow!("that space is not open yet"))?;
     let all = relationship::messages(open);
-    let read = relationship::read_up_to(open, &them, &all);
+    let read = relationship::read_by(open, &them, &all);
     let said: Vec<Json> = all
         .iter()
-        .enumerate()
-        .map(|(at, m)| {
+        .zip(read)
+        .map(|(m, read)| {
             let mine = Some(m.author) == me;
             json!({
                 "id": hex::encode(m.id),
                 "mine": mine,
                 "text": m.text,
                 "time": m.time,
-                "state": mine.then(|| state_of(at, read, unsent.contains(&m.entry))),
+                "state": mine.then(|| state_of(read, unsent.contains(&m.entry))),
             })
         })
         .collect();
@@ -465,12 +465,14 @@ pub fn conversations(d: &Daemon) -> Json {
             let open = core.spaces.get(&c.space).and_then(|h| h.space.as_ref());
             let said = open.map(relationship::messages).unwrap_or_default();
             let read = match (open, me) {
-                (Some(open), Some(me)) => relationship::read_up_to(open, &me, &said),
-                _ => 0,
+                (Some(open), Some(me)) => relationship::read_by(open, &me, &said),
+                _ => vec![false; said.len()],
             };
-            let unread = said.iter().skip(read).filter(|m| Some(m.author) != me);
+            let both = said.iter().zip(read);
+            let unread = both.filter(|(m, read)| Some(m.author) != me && !read);
             let last = said.last();
-            let when = last.and_then(|m| m.time);
+            // The author's own clock: it may not pin them to the top.
+            let when = last.and_then(|m| m.time).map(|t| t.min(now_ms()));
             let conversation = json!({
                 "name": c.petname,
                 "id": hex::encode(&c.identity[..8]),
@@ -505,9 +507,14 @@ pub fn mark_read(d: &Arc<Daemon>, who: &str) -> anyhow::Result<Json> {
             .and_then(|h| h.space.as_ref());
         let open = open.ok_or_else(|| anyhow::anyhow!("that space is not open yet"))?;
         let all = relationship::messages(open);
+        let read = relationship::read_by(open, &me, &all);
+        let new = all
+            .iter()
+            .zip(&read)
+            .any(|(m, read)| m.author != me && !read);
         let theirs = all.iter().rposition(|m| m.author != me);
         match theirs {
-            Some(at) if at >= relationship::read_up_to(open, &me, &all) => {
+            Some(at) if new => {
                 let last = all[at].id;
                 match relationship::read_marker(open, &me) {
                     Some(marker) => Some(relationship::set_read_marker(marker, last)),

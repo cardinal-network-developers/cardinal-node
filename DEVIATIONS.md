@@ -660,6 +660,20 @@ asks for around that is not built yet.
   no forwarding by a participant, and a call needs a session with the other
   person, so someone reached through hosts only cannot be called. Nothing wakes a
   sleeping phone: `ring` goes only to devices that are online.
+- **A read marker covers what the device writing it had seen.** `profiles.md`
+  says field 1 is the last message read, which is still what is written, but a
+  message counts as read if the entry that wrote the marker descends from it. A
+  message that arrives in the moment between a client's last look and its
+  `mark-read` therefore counts as read.
+- **Someone can keep ringing.** A ring from a contact gives way to a call this
+  person makes, and refusing them ends it, but nothing limits how often they ring.
+  Two people ringing each other at once each find the other busy.
+- **A message can read as `sent` with a very long backlog.** A reconcile that
+  stops at its limit of wanted ids still counts as confirming.
+- **On Windows the client's pipe trusts whoever holds its name.** Another account
+  on the machine could take the name while no daemon runs, and the client would
+  talk to it, recovery words included. The cure is a pipe with its own access
+  list and a client that checks its owner, which needs a Windows machine to test.
 - **Read markers are always written.** `profiles.md` has no setting to keep them
   back, so reading a conversation tells the other person. Every message also
   lacks the author-owned field the profile gives it.

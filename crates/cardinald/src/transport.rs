@@ -106,8 +106,19 @@ mod imp {
     pub type Writer = WriteHalf<End>;
 
     pub async fn connect(path: &Path) -> std::io::Result<(Reader, Writer)> {
-        let pipe = ClientOptions::new().open(path.as_os_str())?;
-        Ok(split(End::Client(pipe)))
+        /// `ERROR_PIPE_BUSY`: the next instance is a moment away.
+        const BUSY: i32 = 231;
+        let mut tries = 0;
+        loop {
+            match ClientOptions::new().open(path.as_os_str()) {
+                Ok(pipe) => return Ok(split(End::Client(pipe))),
+                Err(e) if e.raw_os_error() == Some(BUSY) && tries < 20 => {
+                    tries += 1;
+                    tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+                }
+                Err(e) => return Err(e),
+            }
+        }
     }
 
     /// A pipe has an instance per client, so one waits for the next.
@@ -117,7 +128,10 @@ mod imp {
     }
 
     fn instance(path: &Path, first: bool) -> std::io::Result<NamedPipeServer> {
-        // The default security lets only this user and administrators write.
+        // The default security lets only this user and administrators write,
+        // and anyone read, which here only ties up an instance. It does not
+        // stop another account from taking the name while no daemon runs
+        // (DEVIATIONS.md, Clients).
         ServerOptions::new()
             .first_pipe_instance(first)
             .reject_remote_clients(true)

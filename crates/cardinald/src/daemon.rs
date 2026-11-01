@@ -246,8 +246,8 @@ pub struct Daemon {
     pub pairing: Mutex<PairState>,
     /// The call under way.
     pub call: Mutex<Option<crate::calls::Call>>,
-    /// Audio heard on the call, for a client.
-    pub call_audio: tokio::sync::broadcast::Sender<bytes::Bytes>,
+    /// Audio heard on calls, for a client, by call.
+    pub call_audio: tokio::sync::broadcast::Sender<([u8; 16], bytes::Bytes)>,
     /// An identity made for a client, until its person has written the words
     /// down.
     pub setting_up: Mutex<Option<(crate::setup::Prepared, [usize; 2])>>,
