@@ -17,12 +17,11 @@ use cardinal_space::state::State;
 use cardinal_space::{NodeId, SpaceId, SpaceOpBody, ROOT};
 use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
-use tokio::net::{UnixListener, UnixStream};
 
 use crate::core::short;
 use crate::daemon::{Daemon, PairState};
 use crate::net;
+use crate::transport::{self, Listener, Reader, Writer};
 
 /// The version of this interface. A client compares it with `hello`'s.
 const API: u64 = 1;
@@ -31,8 +30,7 @@ const NEWS_GATHERS: Duration = Duration::from_millis(100);
 
 /// Sends a request to a running daemon and returns its reply.
 pub async fn request(socket: &std::path::Path, req: &Value) -> anyhow::Result<Value> {
-    let s = UnixStream::connect(socket).await?;
-    let (r, mut w) = s.into_split();
+    let (r, mut w) = transport::connect(socket).await?;
     let mut line = serde_json::to_string(req)?;
     line.push('\n');
     w.write_all(line.as_bytes()).await?;
@@ -46,33 +44,15 @@ pub async fn request(socket: &std::path::Path, req: &Value) -> anyhow::Result<Va
 
 /// Starts serving the control socket.
 pub fn serve(d: Arc<Daemon>) -> anyhow::Result<tokio::task::JoinHandle<()>> {
-    let path = d.paths.socket.clone();
-    if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir)?;
-    }
-    if path.exists() {
-        if std::os::unix::net::UnixStream::connect(&path).is_ok() {
-            anyhow::bail!(
-                "a cardinal daemon is already running for {} (socket {})",
-                d.paths.home.display(),
-                path.display()
-            );
-        }
-        std::fs::remove_file(&path)?;
-    }
-    let listener = UnixListener::bind(&path)?;
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
-    }
+    let mut listener = Listener::bind(&d.paths.socket)
+        .map_err(|e| anyhow::anyhow!("{e:#} for {}", d.paths.home.display()))?;
     Ok(tokio::spawn(async move {
         loop {
-            let Ok((s, _)) = listener.accept().await else {
+            let Ok((r, mut w)) = listener.accept().await else {
                 continue;
             };
             let d = d.clone();
             tokio::spawn(async move {
-                let (r, mut w) = s.into_split();
                 let mut lines = BufReader::new(r).lines();
                 while let Ok(Some(line)) = lines.next_line().await {
                     if is_watch(&line) {
@@ -112,11 +92,7 @@ fn is_watch(line: &str) -> bool {
 /// Tells a client each time something changed, until it goes. An event says
 /// only that there is news, and the client asks for what it shows, so one that
 /// is missed, or two that come as one, lose nothing.
-async fn watch(
-    d: &Daemon,
-    mut lines: tokio::io::Lines<BufReader<OwnedReadHalf>>,
-    mut w: OwnedWriteHalf,
-) {
+async fn watch(d: &Daemon, mut lines: tokio::io::Lines<BufReader<Reader>>, mut w: Writer) {
     let mut changed = d.changed.subscribe();
     let mut stopping = d.stopping.subscribe();
     loop {
@@ -198,6 +174,8 @@ async fn handle(d: &Arc<Daemon>, req: &Value) -> anyhow::Result<Value> {
     let cmd = arg(req, "cmd")?;
     match cmd {
         "hello" => Ok(json!({"api": API, "version": env!("CARGO_PKG_VERSION")})),
+        "setup-begin" => setup_begin(d),
+        "setup-finish" => setup_finish(d, req),
         "status" => Ok(status(d)),
         "devices" => Ok(json!({"devices": devices(d)})),
         "stop" => {
@@ -537,6 +515,49 @@ fn reload(d: &Arc<Daemon>) -> anyhow::Result<()> {
     d.bump();
     d.housekeeping();
     Ok(())
+}
+
+/// Makes an identity for a client to set up, and says which two of its words
+/// to ask for back. Nothing is saved until [`setup_finish`].
+fn setup_begin(d: &Daemon) -> anyhow::Result<Value> {
+    let prepared = crate::setup::prepare(&d.paths)?;
+    let phrase = prepared.phrase().to_words();
+    let words: Vec<&str> = phrase.split(' ').collect();
+    let r: [u8; 2] = cardinal_crypto::random_bytes();
+    let (a, mut b) = (r[0] as usize % words.len(), r[1] as usize % words.len());
+    if b == a {
+        b = (a + 7) % words.len();
+    }
+    let ask = [a.min(b), a.max(b)];
+    let reply = json!({"words": words, "ask": ask});
+    *d.setting_up.lock().unwrap_or_else(|e| e.into_inner()) = Some((prepared, ask));
+    Ok(reply)
+}
+
+/// Saves the identity once its person has shown they have the words.
+fn setup_finish(d: &Arc<Daemon>, req: &Value) -> anyhow::Result<Value> {
+    let mut held = d.setting_up.lock().unwrap_or_else(|e| e.into_inner());
+    let (prepared, ask) = held
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("nothing is being set up"))?;
+    let words_are = prepared.phrase().to_words();
+    let words: Vec<&str> = words_are.split(' ').collect();
+    let answers = req["answers"].as_array().cloned().unwrap_or_default();
+    let matches = ask.iter().enumerate().all(|(i, at)| {
+        let answer = answers.get(i).and_then(Value::as_str).unwrap_or_default();
+        answer.trim().eq_ignore_ascii_case(words[*at])
+    });
+    anyhow::ensure!(matches, "that does not match; check what you wrote down");
+    let mut config = crate::config::Config::load(&d.paths.config())?;
+    if let Some(name) = req["name"].as_str().filter(|n| !n.trim().is_empty()) {
+        config.name = name.trim().to_owned();
+    }
+    let (prepared, _) = held.take().expect("checked above");
+    drop(held);
+    config.save(&d.paths.config())?;
+    crate::setup::install(&d.paths, prepared, &config)?;
+    reload(d)?;
+    Ok(json!({"name": config.name}))
 }
 
 fn devices(d: &Daemon) -> Vec<Value> {

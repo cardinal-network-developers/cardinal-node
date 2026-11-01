@@ -244,6 +244,9 @@ pub struct Daemon {
     pub mailbox: crate::mailbox::Mailbox,
     /// Pairing.
     pub pairing: Mutex<PairState>,
+    /// An identity made for a client, until its person has written the words
+    /// down.
+    pub setting_up: Mutex<Option<(crate::setup::Prepared, [usize; 2])>>,
     /// The mount, if mounted.
     pub mount: Mutex<Option<crate::fs::Mounted>>,
     /// Why mounting is impossible here (no FUSE), if it is.
@@ -293,8 +296,26 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// Waits for the system to ask this process to end.
+#[cfg(unix)]
+async fn asked_to_end() -> anyhow::Result<()> {
+    let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+    term.recv().await;
+    Ok(())
+}
+
+/// Windows ends a service by other means, so this never happens.
+#[cfg(not(unix))]
+async fn asked_to_end() -> anyhow::Result<()> {
+    std::future::pending().await
+}
+
+#[cfg(not(unix))]
+fn raise_fd_limit() {}
+
 /// Raises the open-file limit to the hard limit. The soft default (often
 /// 1024) is too low for a file server with many peers and open files.
+#[cfg(unix)]
 fn raise_fd_limit() {
     let mut l = libc::rlimit {
         rlim_cur: 0,
@@ -384,6 +405,7 @@ impl Daemon {
             connecting: Mutex::new(HashSet::new()),
             changed: watch::channel(0).0,
             pairing: Mutex::new(PairState::Idle),
+            setting_up: Mutex::new(None),
             mount: Mutex::new(None),
             mount_unavailable: Mutex::new(None),
             mount_lock: Mutex::new(()),
@@ -548,12 +570,18 @@ impl Daemon {
         lock(&self.sessions).get(peer_static).map(|c| c.kind)
     }
 
-    /// The open sessions with a contact's devices.
+    /// The open sessions with a contact's devices. The session an invitation
+    /// opened counts, since it carries what the two share until it ends.
     pub fn sessions_of(&self, person: &[u8; 32]) -> Vec<Session> {
+        let theirs = |kind: &PeerKind| match kind {
+            PeerKind::Contact(identity, _) | PeerKind::Inviting(identity, Some(_)) => {
+                identity == person
+            }
+            _ => false,
+        };
         lock(&self.sessions)
             .values()
-            .filter(|c| !c.session.is_closed())
-            .filter(|c| matches!(c.kind, PeerKind::Contact(identity, _) if identity == *person))
+            .filter(|c| !c.session.is_closed() && theirs(&c.kind))
             .map(|c| c.session.clone())
             .collect()
     }
@@ -1615,10 +1643,9 @@ impl Daemon {
         self.housekeeping();
 
         let mut stop = self.stopping.subscribe();
-        let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
         tokio::select! {
             _ = tokio::signal::ctrl_c() => tracing::info!("interrupted"),
-            _ = term.recv() => tracing::info!("terminated"),
+            _ = asked_to_end() => tracing::info!("terminated"),
             _ = stop.wait_for(|v| *v) => tracing::info!("stop requested"),
         }
         let _ = self.stopping.send(true);

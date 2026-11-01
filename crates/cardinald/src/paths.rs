@@ -25,9 +25,18 @@ pub struct Paths {
 }
 
 fn user_home() -> PathBuf {
-    std::env::var_os("HOME")
+    let home = if cfg!(windows) { "USERPROFILE" } else { "HOME" };
+    std::env::var_os(home)
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("/"))
+}
+
+/// Where a person's programs keep their data.
+fn user_data() -> PathBuf {
+    match std::env::var_os("LOCALAPPDATA") {
+        Some(d) if cfg!(windows) => PathBuf::from(d),
+        _ => user_home().join(".local/share"),
+    }
 }
 
 impl Paths {
@@ -49,7 +58,7 @@ impl Paths {
                 deploy
                     .as_ref()
                     .map(|p| p.data_dir.clone())
-                    .unwrap_or_else(|| user_home().join(".local/share/cardinal"))
+                    .unwrap_or_else(|| user_data().join("cardinal"))
             });
         let home = absolute(&home);
         let config_dir = match &custom {
@@ -64,6 +73,8 @@ impl Paths {
         let config_dir = absolute(&config_dir);
         let socket = if let Some(s) = std::env::var_os("CARDINAL_SOCKET") {
             PathBuf::from(s)
+        } else if cfg!(windows) {
+            PathBuf::from(format!(r"\\.\pipe\cardinal-{}", socket_name(&home)))
         } else if let Some(run) = std::env::var_os("XDG_RUNTIME_DIR") {
             let run = PathBuf::from(run);
             match &custom {
@@ -176,15 +187,15 @@ pub fn home_dir() -> PathBuf {
 /// Writes `bytes` to `path` atomically, with permissions `mode`.
 pub fn write_private(path: &Path, bytes: &[u8], mode: u32) -> std::io::Result<()> {
     use std::io::Write;
-    use std::os::unix::fs::OpenOptionsExt;
     let tmp = path.with_extension("tmp");
     {
-        let mut f = std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(mode)
-            .open(&tmp)?;
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        std::os::unix::fs::OpenOptionsExt::mode(&mut options, mode);
+        #[cfg(not(unix))]
+        let _ = mode;
+        let mut f = options.open(&tmp)?;
         f.write_all(bytes)?;
         f.sync_all()?;
     }

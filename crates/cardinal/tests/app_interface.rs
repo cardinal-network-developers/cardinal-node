@@ -164,6 +164,47 @@ fn a_message_stays_sent_after_the_session_ends() {
     assert_eq!(said(&a, &bo)[0]["state"], "sent");
 }
 
+/// A person with no command line sets up through a client: the service makes
+/// the identity, shows the words once, and saves nothing until they are
+/// proved.
+#[test]
+fn a_client_can_set_up_a_first_device() {
+    if !fuse_available() {
+        eprintln!("skipping: /dev/fuse or fusermount3 is not available");
+        return;
+    }
+    let root = tempfile::tempdir().unwrap();
+    let mut a = Dev::new(root.path(), "ana", free_port());
+    a.start();
+    assert!(a.status()["identity"].is_null());
+    let begun = ask(&a, json!({"cmd": "setup-begin"}));
+    let words: Vec<String> = serde_json::from_value(begun["words"].clone()).unwrap();
+    assert_eq!(words.len(), 24);
+    let at: Vec<usize> = serde_json::from_value(begun["ask"].clone()).unwrap();
+    assert_ne!(at[0], at[1]);
+
+    // Wrong words save nothing, and leave the same identity on offer.
+    let mut s = UnixStream::connect(socket(&a)).unwrap();
+    let wrong = json!({"cmd": "setup-finish", "name": "Ana", "answers": ["no", "no"]});
+    writeln!(s, "{wrong}").unwrap();
+    let mut line = String::new();
+    BufReader::new(s).read_line(&mut line).unwrap();
+    let reply: Value = serde_json::from_str(&line).unwrap();
+    assert_eq!(reply["ok"], false, "{reply}");
+    assert!(a.status()["identity"].is_null());
+
+    let answers = json!([words[at[0]].to_uppercase(), format!(" {} ", words[at[1]])]);
+    ask(
+        &a,
+        json!({"cmd": "setup-finish", "name": "Ana", "answers": answers}),
+    );
+    wait("set up", 20, || !a.status()["identity"].is_null());
+    assert_eq!(a.status()["name"], "Ana");
+    wait("mounted", 20, || !a.status()["mounted"].is_null());
+    std::fs::write(a.p("hello.txt"), "works").unwrap();
+    assert_eq!(read(&a.p("hello.txt")).unwrap(), "works");
+}
+
 /// A client can walk a person's files: folders first, sizes as they are.
 #[test]
 fn lists_a_folder() {

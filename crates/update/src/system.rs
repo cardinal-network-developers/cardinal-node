@@ -224,12 +224,20 @@ pub fn on_path(name: &str) -> bool {
     std::env::var_os("PATH").is_some_and(|p| {
         std::env::split_paths(&p).any(|d| {
             let f = d.join(name);
-            f.is_file()
-                && std::fs::metadata(&f)
-                    .map(|m| std::os::unix::fs::PermissionsExt::mode(&m.permissions()) & 0o111 != 0)
-                    .unwrap_or(false)
+            f.is_file() && is_executable(&f)
         })
     })
+}
+
+#[cfg(unix)]
+fn is_executable(f: &Path) -> bool {
+    let meta = std::fs::metadata(f);
+    meta.is_ok_and(|m| std::os::unix::fs::PermissionsExt::mode(&m.permissions()) & 0o111 != 0)
+}
+
+#[cfg(not(unix))]
+fn is_executable(_f: &Path) -> bool {
+    true
 }
 
 /// Whether directory `dir` is on `PATH`.

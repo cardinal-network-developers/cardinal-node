@@ -168,10 +168,17 @@ fn address_warning(e: &Endpoint, listening: u16) -> Option<String> {
 
 /// Whether a daemon in this control group stops at logout: a user service
 /// lasts only as long as its user manager, unless the user lingers.
+#[cfg(target_os = "linux")]
 fn stops_at_logout(cgroup: &str, linger: &str) -> bool {
     cgroup.contains("/user@") && linger.trim() == "no"
 }
 
+#[cfg(not(target_os = "linux"))]
+fn logout_warning() -> Option<String> {
+    None
+}
+
+#[cfg(target_os = "linux")]
 fn logout_warning() -> Option<String> {
     let cgroup = std::fs::read_to_string("/proc/self/cgroup").ok()?;
     // SAFETY: getuid has no preconditions.

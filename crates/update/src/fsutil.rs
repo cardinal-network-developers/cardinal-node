@@ -8,6 +8,7 @@
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
+#[cfg(unix)]
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -24,6 +25,22 @@ pub fn temp_path(dest: &Path) -> PathBuf {
     dest.with_file_name(format!(".{name}.tmp-{}-{n}", std::process::id()))
 }
 
+#[cfg(unix)]
+fn open_new(path: &Path, mode: u32) -> io::Result<File> {
+    let mut options = OpenOptions::new();
+    let file = options.write(true).create_new(true).mode(mode).open(path)?;
+    // The umask may have narrowed `mode`; set it exactly.
+    file.set_permissions(fs::Permissions::from_mode(mode))?;
+    Ok(file)
+}
+
+/// Windows has no modes: a file in the user's profile is private by its
+/// folder's access list.
+#[cfg(not(unix))]
+fn open_new(path: &Path, _mode: u32) -> io::Result<File> {
+    OpenOptions::new().write(true).create_new(true).open(path)
+}
+
 /// A temporary file that is deleted unless [`TempFile::persist`] is called.
 pub struct TempFile {
     path: PathBuf,
@@ -34,13 +51,7 @@ impl TempFile {
     /// Creates a new temporary file next to `dest` with permissions `mode`.
     pub fn new_for(dest: &Path, mode: u32) -> io::Result<TempFile> {
         let path = temp_path(dest);
-        let file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(mode)
-            .open(&path)?;
-        // The umask may have narrowed `mode`; set it exactly.
-        file.set_permissions(fs::Permissions::from_mode(mode))?;
+        let file = open_new(&path, mode)?;
         Ok(TempFile {
             path,
             file: Some(file),

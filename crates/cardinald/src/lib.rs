@@ -16,6 +16,7 @@ pub mod daemon;
 pub mod directory;
 pub mod fetch;
 pub mod fs;
+pub mod fsat;
 pub mod host;
 pub mod keys;
 pub mod mailbox;
@@ -28,6 +29,7 @@ pub mod rendezvous;
 pub mod sched;
 pub mod setup;
 pub mod speedtest;
+pub mod transport;
 
 pub use config::Config;
 pub use daemon::Daemon;

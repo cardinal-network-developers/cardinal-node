@@ -3,9 +3,9 @@
 //! immutable objects. A torn record at the end (a crash mid-append) is cut
 //! off when the file is opened.
 
+use crate::fsat::FileExt;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
-use std::os::unix::fs::FileExt;
 use std::path::Path;
 
 /// Where a record lives in the file.

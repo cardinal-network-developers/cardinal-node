@@ -36,6 +36,10 @@ const LEFT_AT_A_HOST: usize = 400;
 /// How long `done` may take to arrive, before a session that ends with it
 /// goes.
 const DONE_WITHIN: Duration = Duration::from_secs(3);
+/// How many times to look for a session to confirm a message on. After that
+/// the next session, or a host, does it.
+const CONFIRM_TRIES: usize = 6;
+const CONFIRM_AGAIN: Duration = Duration::from_millis(500);
 
 fn identity(d: &Daemon) -> anyhow::Result<[u8; 32]> {
     d.core()
@@ -378,14 +382,17 @@ pub fn say(d: &Arc<Daemon>, who: &str, text: &str) -> anyhow::Result<Json> {
 fn confirm(d: &Arc<Daemon>, space: SpaceId, member: [u8; 32]) {
     let d = d.clone();
     tokio::spawn(async move {
-        let theirs = d.sessions_of(&member);
-        for s in theirs {
-            let mine = mailbox::written_here(&d, &space);
-            if net::reconcile(&d, &s, space).await.is_ok() {
-                d.mailbox.mark_sent(&space, &member, &mine);
-                d.bump();
-                return;
+        // Just after two people meet, a session may still be settling.
+        for _ in 0..CONFIRM_TRIES {
+            for s in d.sessions_of(&member) {
+                let mine = mailbox::written_here(&d, &space);
+                if net::reconcile(&d, &s, space).await.is_ok() {
+                    d.mailbox.mark_sent(&space, &member, &mine);
+                    d.bump();
+                    return;
+                }
             }
+            tokio::time::sleep(CONFIRM_AGAIN).await;
         }
     });
 }

@@ -27,10 +27,11 @@
 
 use std::collections::HashMap;
 use std::io;
-use std::os::unix::fs::{MetadataExt, PermissionsExt};
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use cardinal_blob::{BlobReader, FsStore, NoFetch};
 use cardinal_space::files::Content;
@@ -103,11 +104,22 @@ fn key(i: &Inode) -> String {
 }
 
 fn mtime_of(m: &std::fs::Metadata) -> SystemTime {
-    UNIX_EPOCH
-        + Duration::new(
-            m.mtime().max(0) as u64,
-            m.mtime_nsec().clamp(0, 999_999_999) as u32,
-        )
+    m.modified().unwrap_or(UNIX_EPOCH)
+}
+
+#[cfg(unix)]
+fn mode_of(m: &std::fs::Metadata) -> u16 {
+    (m.permissions().mode() & 0o7777) as u16
+}
+
+/// Windows has no modes: a file is read and write, and a read-only one is not.
+#[cfg(not(unix))]
+fn mode_of(m: &std::fs::Metadata) -> u16 {
+    if m.permissions().readonly() {
+        0o444
+    } else {
+        0o644
+    }
 }
 
 /// The text of every `.cardinalignore` file, by the folder it is in.
@@ -571,7 +583,7 @@ impl Tree {
             {
                 let i = self.inodes.get_mut(&ino).expect("new");
                 i.local = true;
-                i.perm = (m.permissions().mode() & 0o7777) as u16;
+                i.perm = mode_of(&m);
                 i.mtime = mtime_of(&m);
                 i.ctime = i.mtime;
                 match kind {

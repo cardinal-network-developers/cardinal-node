@@ -8,10 +8,10 @@
 //! from other devices, [`Tree::apply`] brings committed inodes up to date
 //! without touching what is dirty.
 
+use crate::fsat::FileExt;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::{File, OpenOptions};
 use std::io;
-use std::os::unix::fs::FileExt;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};

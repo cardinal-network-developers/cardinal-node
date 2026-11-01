@@ -90,12 +90,12 @@ fn same_file(a: &Path, b: &Path) -> bool {
 }
 
 fn create_private_dir(p: &Path) -> anyhow::Result<()> {
-    use std::os::unix::fs::DirBuilderExt;
     if !p.exists() {
-        fs::DirBuilder::new()
-            .recursive(true)
-            .mode(0o700)
-            .create(p)
+        let mut dir = fs::DirBuilder::new();
+        dir.recursive(true);
+        #[cfg(unix)]
+        std::os::unix::fs::DirBuilderExt::mode(&mut dir, 0o700);
+        dir.create(p)
             .with_context(|| format!("creating {}", p.display()))?;
     }
     Ok(())
