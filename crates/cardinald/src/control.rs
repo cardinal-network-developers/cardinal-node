@@ -55,11 +55,13 @@ pub fn serve(d: Arc<Daemon>) -> anyhow::Result<tokio::task::JoinHandle<()>> {
             tokio::spawn(async move {
                 let mut lines = BufReader::new(r).lines();
                 while let Ok(Some(line)) = lines.next_line().await {
-                    if is_watch(&line) {
+                    let cmd = serde_json::from_str::<Value>(&line).ok();
+                    let cmd = cmd.as_ref().and_then(|r| r["cmd"].as_str());
+                    if cmd == Some("watch") {
                         watch(&d, lines, w).await;
                         break;
                     }
-                    if line.contains("\"call-media\"") {
+                    if cmd == Some("call-media") {
                         crate::calls::media(&d, lines, w).await;
                         break;
                     }
@@ -86,11 +88,6 @@ pub fn serve(d: Arc<Daemon>) -> anyhow::Result<tokio::task::JoinHandle<()>> {
             });
         }
     }))
-}
-
-fn is_watch(line: &str) -> bool {
-    let req = serde_json::from_str::<Value>(line);
-    req.is_ok_and(|r| r["cmd"] == "watch")
 }
 
 /// Tells a client each time something changed, until it goes. An event says
