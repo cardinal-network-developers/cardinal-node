@@ -1094,7 +1094,9 @@ pub fn start(d: Arc<Daemon>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use cardinal_crypto::aead::xchacha20poly1305_encrypt;
     use cardinal_space::grant::Endpoint;
+    use cardinal_space::EpochKey;
 
     const T: Token = [1; 16];
     const OTHER: Token = [2; 16];
@@ -1270,5 +1272,79 @@ mod tests {
         let (rest, more) = s.fetch(&PHONE, last, 2);
         assert_eq!(rest.len(), 1);
         assert!(!more);
+    }
+
+    /// `vectors/mailbox.json`: built by hand from `hosts.md` rather than by
+    /// `seal`, then opened by the code a device runs. Rewrite it after an
+    /// intentional change with `CARDINAL_WRITE_VECTORS=1`.
+    #[test]
+    fn mailbox_vectors() {
+        let epoch_key = EpochKey::from_bytes([0x41; 32]);
+        let (epoch, key) = (epoch_key.id(), epoch_key.mailbox_key());
+        let nonce = [0x42; 24];
+        let envelope = |notice: Value| {
+            let payload = Record::new().with(0, 7u64).with(1, notice).encode();
+            let ciphertext = xchacha20poly1305_encrypt(&key, &nonce, &[], &payload);
+            let sealed = Record::new()
+                .with(0, 11u64)
+                .with(1, epoch)
+                .with(2, nonce)
+                .with(3, ciphertext)
+                .encode();
+            (payload, sealed)
+        };
+
+        let (entry_payload, entry_sealed) = envelope(Value::from(&b"a sealed entry"[..]));
+        let opened = open_envelope(&entry_sealed, &key);
+        assert_eq!(opened, Some(Notice::Entry(b"a sealed entry".to_vec())));
+        assert_eq!(epoch_of(&entry_sealed), Some(epoch));
+
+        let ids = vec![[0x43; 32], [0x44; 32]];
+        let heads = Message::Heads {
+            label: [0x45; 32],
+            ids: ids.clone(),
+        };
+        let (heads_payload, heads_sealed) = envelope(to_value(&heads));
+        assert_eq!(open_envelope(&heads_sealed, &key), Some(Notice::Heads(ids)));
+
+        let token = [0x46; 16];
+        let reach = Reach {
+            endpoints: vec![Endpoint::parse("203.0.113.9:7171").unwrap()],
+            host: [0x47; 32],
+            token,
+        };
+        let op = relationship::create_reach(&[0x48; 32], &[reach]);
+
+        let vectors = serde_json::json!({
+            "description": "Mailbox (hosts.md#envelopes, profiles.md#reach). \
+                Envelopes use XChaCha20-Poly1305 with empty associated data. \
+                Inputs are fixed bytes, not secrets.",
+            "epoch_key": hex::encode(epoch_key.bytes()),
+            "epoch_id": hex::encode(epoch),
+            "mailbox_key": hex::encode(&key[..]),
+            "nonce": hex::encode(nonce),
+            "entry_envelope": {
+                "payload": hex::encode(entry_payload),
+                "envelope": hex::encode(entry_sealed),
+            },
+            "heads_envelope": {
+                "payload": hex::encode(heads_payload),
+                "envelope": hex::encode(heads_sealed),
+            },
+            "token_session": {
+                "token": hex::encode(token),
+                "secret": hex::encode(&derive(Purpose::Token, &token)[..]),
+            },
+            "reach_node_create": hex::encode(op.record().encode()),
+        });
+        let text = serde_json::to_string_pretty(&vectors).unwrap() + "\n";
+        let path =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../vectors/mailbox.json");
+        if std::env::var_os("CARDINAL_WRITE_VECTORS").is_some() {
+            std::fs::write(&path, text).unwrap();
+            return;
+        }
+        let existing = std::fs::read_to_string(&path).unwrap();
+        assert!(existing == text, "{} is out of date", path.display());
     }
 }

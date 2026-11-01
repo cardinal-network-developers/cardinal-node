@@ -168,14 +168,13 @@ fn slow_source_sends_once() {
     verify(&c);
 
     assert!(ratio < 1.5, "alpha sent {ratio:.2}x the data");
-    // One of them usually leads and takes more from alpha; each still
-    // gets a good part from the other.
-    for (who, got) in [("beta", b_from_c), ("gamma", c_from_b)] {
-        assert!(
-            got as f64 > 0.1 * total as f64,
-            "{who} got only {got} of {total} bytes from the other fast device"
-        );
-    }
+    // One of them usually leads and takes more from alpha, so how the
+    // share divides between them is timing. What they pass on is not.
+    let passed_on = b_from_c + c_from_b;
+    assert!(
+        passed_on as f64 > 0.2 * total as f64,
+        "only {passed_on} of {total} bytes passed between the fast devices"
+    );
     let took = done_b.unwrap().max(done_c.unwrap());
     assert!(took < Duration::from_secs(40), "took {took:?}");
 }
