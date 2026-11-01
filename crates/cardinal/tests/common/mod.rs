@@ -16,6 +16,8 @@ pub struct Dev {
     pub mount: PathBuf,
     pub port: u16,
     pub child: Option<Child>,
+    /// The binary this device runs.
+    pub bin: PathBuf,
     /// Extra environment for the daemon and the command line.
     pub env: Vec<(String, String)>,
 }
@@ -31,6 +33,7 @@ impl Dev {
             mount,
             port,
             child: None,
+            bin: BIN.into(),
             // Whether the test machine is plugged in is not under test.
             env: vec![(
                 "CARDINAL_TEST_POWER_SUPPLIES".into(),
@@ -40,7 +43,7 @@ impl Dev {
     }
 
     pub fn cmd(&self) -> Command {
-        let mut c = Command::new(BIN);
+        let mut c = Command::new(&self.bin);
         c.env("CARDINAL_HOME", &self.home)
             .env("CARDINAL_SOCKET", self.home.join("control.sock"))
             .env("CARDINAL_LOG", "info,cardinald=debug");

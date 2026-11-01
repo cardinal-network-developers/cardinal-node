@@ -147,11 +147,19 @@ async fn accept_exchange(
     st.shutdown().await?;
     remember(d, s);
     d.identity_changed();
+    catch_up(d, &space);
     if !regard.trusted {
         let _ = tokio::time::timeout(DONE_WITHIN, receive(&mut st)).await;
         s.abandon();
     }
     Ok(())
+}
+
+/// Announces a new contact's space. A session counts as a contact's only
+/// from here on, so anything written since the contact was recorded was
+/// told to no one.
+fn catch_up(d: &Arc<Daemon>, space: &SpaceId) {
+    d.notify(*space, Vec::new(), &Default::default());
 }
 
 /// Keeps where a new contact's device is. Over UDP a session's address is the
@@ -196,6 +204,7 @@ pub async fn serve(d: &Arc<Daemon>, s: &Session, mut st: Stream) -> anyhow::Resu
         d.invitation_finished(s);
         remember(d, s);
         d.identity_changed();
+        catch_up(d, &space);
         tracing::info!("{name} ({}) is a contact now", short(&them));
         if !regard.trusted {
             let _ = st.shutdown().await;

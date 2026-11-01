@@ -131,6 +131,13 @@ release of the same number, so `0.2.0` replaces any `0.2.0-dev.*`.
   `systemctl` stubbed. It uses the deployment-only front end
   `cardinal-deploy` unless `E2E_PACKAGE=cardinal E2E_BIN=cardinal`.
 
+- `CARDINAL_OLD_BIN=$PWD/dist/<previous>/cardinal-<previous>-x86_64-unknown-linux-gnu
+  cargo test -p cardinal --test versions`: this build beside the last release,
+  because a person updates one device at a time. Devices update in place,
+  pair across versions, keep syncing around contacts the old one knows nothing
+  of, and use an old host. Run it before every release. Without the variable
+  it skips.
+
 ## Files
 
 | File | Purpose |

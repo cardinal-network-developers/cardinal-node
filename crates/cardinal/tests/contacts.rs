@@ -40,6 +40,26 @@ fn settle() {
     std::thread::sleep(std::time::Duration::from_secs(3));
 }
 
+/// Whoever speaks first after an invitation is heard, on the session the
+/// invitation left open.
+#[test]
+fn the_inviter_can_speak_first() {
+    if !fuse_available() {
+        eprintln!("skipping: /dev/fuse or fusermount3 is not available");
+        return;
+    }
+    let root = tempfile::tempdir().unwrap();
+    let ana = person(root.path(), "ana");
+    let bo = person(root.path(), "bo");
+    let code = invitation(&ana, "Ana");
+    bo.cli(&["accept", &code]);
+    wait("ana sees bo", 20, || ana.cli(&["contacts"]).contains("bo"));
+    ana.cli(&["say", "bo", "welcome"]);
+    wait("bo reads it", 20, || {
+        bo.cli(&["messages", "Ana"]).contains("Ana: welcome")
+    });
+}
+
 #[test]
 fn two_people_connect_and_talk() {
     if !fuse_available() {

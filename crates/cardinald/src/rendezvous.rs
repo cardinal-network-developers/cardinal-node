@@ -256,10 +256,11 @@ async fn present(d: &Daemon, s: &Session) {
     let ask = Record::new()
         .with(0, OP_PRESENT)
         .with(1, address_list(&local_addresses(d)));
+    // Whatever the answer: a device on an older version knows nothing of
+    // this, and would be asked on every pass of the reconnect loop.
+    lock(&d.rendezvous.presented).insert(s.peer_static(), Instant::now());
     match call(s, Service::RENDEZVOUS, ask).await {
-        Ok(r) if r.get(0).and_then(Value::as_uint) == Some(OP_PRESENT) => {
-            lock(&d.rendezvous.presented).insert(s.peer_static(), Instant::now());
-        }
+        Ok(r) if r.get(0).and_then(Value::as_uint) == Some(OP_PRESENT) => {}
         Ok(_) => tracing::debug!("{} refused", short(&s.peer_static())),
         Err(e) => tracing::debug!("presenting to {}: {e:#}", short(&s.peer_static())),
     }
