@@ -138,6 +138,11 @@ release of the same number, so `0.2.0` replaces any `0.2.0-dev.*`.
   of, and use an old host. Run it before every release. Without the variable
   it skips.
 
+- `scripts/lab.sh`: real daemons behind real kernel NAT in network namespaces,
+  with no root and no way out to the real network. `punch` tries hole punching
+  through ordinary, strict and carrier-grade NAT, and `people` has two people
+  with hosts and laptops talk through hosts only while one is off and roams.
+
 ## Files
 
 | File | Purpose |
