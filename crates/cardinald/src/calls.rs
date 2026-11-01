@@ -289,8 +289,11 @@ pub async fn serve(d: &Arc<Daemon>, s: &Session, mut st: Stream) -> anyhow::Resu
             let ended = {
                 let mut call = lock(d);
                 let same = call.as_ref().is_some_and(|c| c.id == id && c.who == them);
-                let taken = if same { call.take() } else { None };
-                taken
+                if same {
+                    call.take()
+                } else {
+                    None
+                }
             };
             if let Some(call) = ended {
                 call.over.notify_waiters();
