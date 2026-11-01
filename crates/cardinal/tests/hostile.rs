@@ -388,7 +388,7 @@ impl Modified {
             tcp: None,
         };
         let endpoint = Endpoint::bind(config, bind).await.unwrap();
-        let target = Target::new(self.addr, CarrierKind::Udp, &link);
+        let target = Target::new(self.addr, CarrierKind::Udp, link);
         let session = endpoint.connect(target).await.ok()?;
         Some((endpoint, session))
     }
