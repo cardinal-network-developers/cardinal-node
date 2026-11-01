@@ -656,10 +656,6 @@ Not implemented yet (the next milestone):
 The first step of sharing: two people connect and talk. Much of what the spec
 asks for around that is not built yet.
 
-- **A message counts as sent while its contact is connected.** A notice is not
-  acknowledged, so a message pushed on a session is only recorded as delivered
-  by the next reconcile. If the session ends first it shows `waiting` until then,
-  though it did arrive.
 - **Read markers are always written.** `profiles.md` has no setting to keep them
   back, so reading a conversation tells the other person. Every message also
   lacks the author-owned field the profile gives it.

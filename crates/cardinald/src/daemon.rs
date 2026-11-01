@@ -548,6 +548,16 @@ impl Daemon {
         lock(&self.sessions).get(peer_static).map(|c| c.kind)
     }
 
+    /// The open sessions with a contact's devices.
+    pub fn sessions_of(&self, person: &[u8; 32]) -> Vec<Session> {
+        lock(&self.sessions)
+            .values()
+            .filter(|c| !c.session.is_closed())
+            .filter(|c| matches!(c.kind, PeerKind::Contact(identity, _) if identity == *person))
+            .map(|c| c.session.clone())
+            .collect()
+    }
+
     /// The people with a session open to one of their devices.
     pub fn connected_people(&self) -> HashSet<[u8; 32]> {
         lock(&self.sessions)

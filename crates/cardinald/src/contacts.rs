@@ -368,7 +368,26 @@ pub fn say(d: &Arc<Daemon>, who: &str, text: &str) -> anyhow::Result<Json> {
     let conversation = conversation.ok_or_else(|| anyhow::anyhow!("that space is not open yet"))?;
     let op = relationship::create_message(conversation, text);
     d.write_and_push(&space, vec![op])?;
+    confirm(d, space, contact.identity);
     Ok(json!({"reachable": reachable(d, &contact, text)}))
+}
+
+/// A notice is not acknowledged, and a session that looks open may be gone, so
+/// a message counts as with someone only once a reconcile with one of their
+/// devices has gone through.
+fn confirm(d: &Arc<Daemon>, space: SpaceId, member: [u8; 32]) {
+    let d = d.clone();
+    tokio::spawn(async move {
+        let theirs = d.sessions_of(&member);
+        for s in theirs {
+            let mine = mailbox::written_here(&d, &space);
+            if net::reconcile(&d, &s, space).await.is_ok() {
+                d.mailbox.mark_sent(&space, &member, &mine);
+                d.bump();
+                return;
+            }
+        }
+    });
 }
 
 /// Whether something written now can get to a contact without the two
@@ -383,9 +402,9 @@ fn reachable(d: &Daemon, contact: &ContactRecord, text: &str) -> bool {
 }
 
 /// The state of a message of this person's: `read` once their marker has
-/// passed it, `waiting` while nothing says it has got anywhere, else `sent`.
-/// Only what this device wrote can be waiting here: another device of this
-/// person's is keeping count of its own.
+/// passed it, `waiting` until a reconcile or a deposit says it got somewhere,
+/// else `sent`. Only what this device wrote can be waiting here: another
+/// device of this person's is keeping count of its own.
 fn state_of(at: usize, read: usize, waiting: bool) -> &'static str {
     if at < read {
         "read"
@@ -400,14 +419,8 @@ fn state_of(at: usize, read: usize, waiting: bool) -> &'static str {
 pub fn messages(d: &Daemon, who: &str) -> anyhow::Result<Json> {
     let contact = listed(d, who)?;
     let (space, them) = (contact.space, contact.identity);
-    let in_touch = d.connected_people().contains(&them);
-    let unsent = match in_touch {
-        true => Default::default(),
-        false => {
-            let here = mailbox::written_here(d, &space);
-            d.mailbox.not_sent(&space, &them, here)
-        }
-    };
+    let here = mailbox::written_here(d, &space);
+    let unsent = d.mailbox.not_sent(&space, &them, here);
     let core = d.core();
     let me = core.identity.as_ref().map(|i| i.id());
     let open = core.spaces.get(&space).and_then(|h| h.space.as_ref());

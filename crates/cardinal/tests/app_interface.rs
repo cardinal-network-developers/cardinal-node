@@ -101,9 +101,10 @@ fn news_comes_by_itself_and_read_travels_back() {
     assert_eq!(c["last"]["text"], "hello from bo");
     assert_eq!(c["last"]["mine"], false);
 
-    let from_bo = said(&b, "Ana");
-    assert_eq!(from_bo[0]["state"], "sent", "{from_bo:?}");
-    assert_eq!(from_bo[0]["mine"], true);
+    wait("bo hears it got there", 30, || {
+        said(&b, "Ana")[0]["state"] == "sent"
+    });
+    assert_eq!(said(&b, "Ana")[0]["mine"], true);
 
     ask(&a, json!({"cmd": "mark-read", "who": bo}));
     assert_eq!(only(&a)["unread"], 0);
@@ -142,6 +143,25 @@ fn a_message_waits_while_nobody_can_be_reached() {
     assert_eq!(said(&a, &bo)[0]["state"], "waiting");
     b.start();
     wait("it gets there", 60, || said(&a, &bo)[0]["state"] == "sent");
+}
+
+/// A message that got there stays sent, whatever happens to the session after.
+#[test]
+fn a_message_stays_sent_after_the_session_ends() {
+    if !fuse_available() {
+        eprintln!("skipping: /dev/fuse or fusermount3 is not available");
+        return;
+    }
+    let root = tempfile::tempdir().unwrap();
+    let (a, mut b) = met(root.path());
+    let bo = only(&a)["name"].as_str().unwrap().to_owned();
+    a.cli(&["say", &bo, "before you go"]);
+    wait("it is confirmed", 30, || {
+        said(&a, &bo)[0]["state"] == "sent"
+    });
+    b.stop();
+    wait("ana notices", 45, || only(&a)["connected"] == false);
+    assert_eq!(said(&a, &bo)[0]["state"], "sent");
 }
 
 /// A client can walk a person's files: folders first, sizes as they are.
