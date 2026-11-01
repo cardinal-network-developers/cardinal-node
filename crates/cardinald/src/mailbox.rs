@@ -385,6 +385,19 @@ impl Mailbox {
         }
     }
 
+    /// Those of `ids` a member has not been sent, by id.
+    pub(crate) fn not_sent(
+        &self,
+        space: &SpaceId,
+        member: &[u8; 32],
+        ids: Vec<EntryId>,
+    ) -> HashSet<EntryId> {
+        let sent = lock(&self.sent);
+        let got = sent.get(&sent_key(space, member));
+        let was_sent = |id: &EntryId| got.is_some_and(|g| g.contains(&hex::encode(id)));
+        ids.into_iter().filter(|id| !was_sent(id)).collect()
+    }
+
     /// Those of `ids` a member has not been sent.
     fn unsent(
         &self,

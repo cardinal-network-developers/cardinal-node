@@ -746,6 +746,7 @@ impl Daemon {
                 "incoming"
             }
         );
+        self.bump();
         if let PeerKind::Own(k) | PeerKind::Contact(_, k) = kind {
             lock(&self.backoff).remove(&k);
             if s.role() == cardinal_link::Role::Responder && !s.is_relayed() {

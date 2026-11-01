@@ -2,7 +2,9 @@
 //! line. Only the user who runs the daemon can connect (mode 0600).
 //!
 //! Requests are `{"cmd": "<name>", ...}`; replies are `{"ok": true, ...}`
-//! or `{"ok": false, "error": "<what to do>"}`.
+//! or `{"ok": false, "error": "<what to do>"}`. After `{"cmd": "watch"}` a
+//! connection only carries news, `{"ok": true, "event": "changed", "seq": n}`,
+//! until the client closes it (`apps.md#the-local-interface`).
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -15,11 +17,17 @@ use cardinal_space::state::State;
 use cardinal_space::{NodeId, SpaceId, SpaceOpBody, ROOT};
 use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::{UnixListener, UnixStream};
 
 use crate::core::short;
 use crate::daemon::{Daemon, PairState};
 use crate::net;
+
+/// The version of this interface. A client compares it with `hello`'s.
+const API: u64 = 1;
+/// How long news waits, so that a burst of changes is one event.
+const NEWS_GATHERS: Duration = Duration::from_millis(100);
 
 /// Sends a request to a running daemon and returns its reply.
 pub async fn request(socket: &std::path::Path, req: &Value) -> anyhow::Result<Value> {
@@ -67,6 +75,10 @@ pub fn serve(d: Arc<Daemon>) -> anyhow::Result<tokio::task::JoinHandle<()>> {
                 let (r, mut w) = s.into_split();
                 let mut lines = BufReader::new(r).lines();
                 while let Ok(Some(line)) = lines.next_line().await {
+                    if is_watch(&line) {
+                        watch(&d, lines, w).await;
+                        break;
+                    }
                     let reply = match serde_json::from_str::<Value>(&line) {
                         Ok(req) => match handle(&d, &req).await {
                             Ok(mut v) => {
@@ -90,6 +102,45 @@ pub fn serve(d: Arc<Daemon>) -> anyhow::Result<tokio::task::JoinHandle<()>> {
             });
         }
     }))
+}
+
+fn is_watch(line: &str) -> bool {
+    let req = serde_json::from_str::<Value>(line);
+    req.is_ok_and(|r| r["cmd"] == "watch")
+}
+
+/// Tells a client each time something changed, until it goes. An event says
+/// only that there is news, and the client asks for what it shows, so one that
+/// is missed, or two that come as one, lose nothing.
+async fn watch(
+    d: &Daemon,
+    mut lines: tokio::io::Lines<BufReader<OwnedReadHalf>>,
+    mut w: OwnedWriteHalf,
+) {
+    let mut changed = d.changed.subscribe();
+    let mut stopping = d.stopping.subscribe();
+    loop {
+        let seq = *changed.borrow_and_update();
+        let mut out = json!({"ok": true, "event": "changed", "seq": seq}).to_string();
+        out.push('\n');
+        if w.write_all(out.as_bytes()).await.is_err() {
+            return;
+        }
+        loop {
+            tokio::select! {
+                c = changed.changed() => match c {
+                    Ok(()) => break,
+                    Err(_) => return,
+                },
+                _ = stopping.changed() => return,
+                line = lines.next_line() => match line {
+                    Ok(Some(_)) => continue,
+                    _ => return,
+                },
+            }
+        }
+        tokio::time::sleep(NEWS_GATHERS).await;
+    }
 }
 
 fn arg<'a>(req: &'a Value, name: &str) -> anyhow::Result<&'a str> {
@@ -146,6 +197,7 @@ fn require_files(d: &Daemon) -> anyhow::Result<[u8; 32]> {
 async fn handle(d: &Arc<Daemon>, req: &Value) -> anyhow::Result<Value> {
     let cmd = arg(req, "cmd")?;
     match cmd {
+        "hello" => Ok(json!({"api": API, "version": env!("CARGO_PKG_VERSION")})),
         "status" => Ok(status(d)),
         "devices" => Ok(json!({"devices": devices(d)})),
         "stop" => {
@@ -225,6 +277,9 @@ async fn handle(d: &Arc<Daemon>, req: &Value) -> anyhow::Result<Value> {
         }
         "contact" => crate::contacts::set(d, arg(req, "who")?, arg(req, "setting")?),
         "say" => crate::contacts::say(d, arg(req, "who")?, arg(req, "text")?),
+        "conversations" => Ok(crate::contacts::conversations(d)),
+        "mark-read" => crate::contacts::mark_read(d, arg(req, "who")?),
+        "files" => files_at(d, req.get("path").and_then(Value::as_str).unwrap_or("")),
         "messages" => crate::contacts::messages(d, arg(req, "who")?),
         "recovery-check" => {
             crate::recovery::root_from_words(d, arg(req, "words")?)?;
@@ -711,6 +766,40 @@ fn versions(sp: &cardinal_space::Space, node: &NodeId) -> Vec<VersionRow> {
         out.push((h.entry, h.time, h.device, c));
     }
     out
+}
+
+/// What is in a folder of this person's files, folders first.
+fn files_at(d: &Daemon, path: &str) -> anyhow::Result<Value> {
+    let files_id = require_files(d)?;
+    let core = d.core();
+    let sp = core.spaces[&files_id]
+        .space
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("files space not open"))?;
+    let view = Files::new(sp);
+    let listed = view
+        .list_path(path)
+        .ok_or_else(|| anyhow::anyhow!("{path} is not a folder in your files"))?;
+    let mut found: Vec<(bool, Value)> = listed
+        .iter()
+        .map(|e| {
+            let is_folder = e.kind == files::FileKind::Folder;
+            let current = view.content(&e.node);
+            let shown = current.last();
+            let size = shown.and_then(|v| v.content.as_ref()).map(|c| c.size());
+            let entry = json!({
+                "name": e.name,
+                "folder": is_folder,
+                "size": size,
+                "time": shown.and_then(|v| v.time),
+                "versions": current.len(),
+            });
+            (!is_folder, entry)
+        })
+        .collect();
+    found.sort_by_key(|(is_file, e)| (*is_file, e["name"].as_str().map(str::to_lowercase)));
+    let files: Vec<Value> = found.into_iter().map(|(_, e)| e).collect();
+    Ok(json!({"path": path, "files": files}))
 }
 
 fn history(d: &Daemon, path: &str) -> anyhow::Result<Value> {

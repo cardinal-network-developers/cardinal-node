@@ -382,16 +382,124 @@ fn reachable(d: &Daemon, contact: &ContactRecord, text: &str) -> bool {
     contact.connects() || (theirs && (hosted || text.len() <= LEFT_AT_A_HOST))
 }
 
-/// The conversation with a contact.
+/// The state of a message of this person's: `read` once their marker has
+/// passed it, `waiting` while nothing says it has got anywhere, else `sent`.
+/// Only what this device wrote can be waiting here: another device of this
+/// person's is keeping count of its own.
+fn state_of(at: usize, read: usize, waiting: bool) -> &'static str {
+    if at < read {
+        "read"
+    } else if waiting {
+        "waiting"
+    } else {
+        "sent"
+    }
+}
+
+/// The conversation with a contact, oldest first.
 pub fn messages(d: &Daemon, who: &str) -> anyhow::Result<Json> {
-    let space = listed(d, who)?.space;
+    let contact = listed(d, who)?;
+    let (space, them) = (contact.space, contact.identity);
+    let in_touch = d.connected_people().contains(&them);
+    let unsent = match in_touch {
+        true => Default::default(),
+        false => {
+            let here = mailbox::written_here(d, &space);
+            d.mailbox.not_sent(&space, &them, here)
+        }
+    };
     let core = d.core();
     let me = core.identity.as_ref().map(|i| i.id());
     let open = core.spaces.get(&space).and_then(|h| h.space.as_ref());
     let open = open.ok_or_else(|| anyhow::anyhow!("that space is not open yet"))?;
-    let said: Vec<Json> = relationship::messages(open)
-        .into_iter()
-        .map(|m| json!({"mine": Some(m.author) == me, "text": m.text, "time": m.time}))
+    let all = relationship::messages(open);
+    let read = relationship::read_up_to(open, &them, &all);
+    let said: Vec<Json> = all
+        .iter()
+        .enumerate()
+        .map(|(at, m)| {
+            let mine = Some(m.author) == me;
+            json!({
+                "id": hex::encode(m.id),
+                "mine": mine,
+                "text": m.text,
+                "time": m.time,
+                "state": mine.then(|| state_of(at, read, unsent.contains(&m.entry))),
+            })
+        })
         .collect();
     Ok(json!({"messages": said}))
+}
+
+/// Everyone this person talks to, the most recent first: what they last said
+/// and how many messages from them are not yet read here.
+pub fn conversations(d: &Daemon) -> Json {
+    let connected = d.connected_people();
+    let core = d.core();
+    let me = core.identity.as_ref().map(|i| i.id());
+    let contacts = core.contacts();
+    let mut found: Vec<(Option<u64>, Json)> = contacts
+        .iter()
+        .filter(|c| !c.refused)
+        .map(|c| {
+            let open = core.spaces.get(&c.space).and_then(|h| h.space.as_ref());
+            let said = open.map(relationship::messages).unwrap_or_default();
+            let read = match (open, me) {
+                (Some(open), Some(me)) => relationship::read_up_to(open, &me, &said),
+                _ => 0,
+            };
+            let unread = said.iter().skip(read).filter(|m| Some(m.author) != me);
+            let last = said.last();
+            let when = last.and_then(|m| m.time);
+            let conversation = json!({
+                "name": c.petname,
+                "id": hex::encode(&c.identity[..8]),
+                "trusted": c.regard.trusted,
+                "introductions": c.regard.introductions,
+                "connected": connected.contains(&c.identity),
+                "unread": unread.count(),
+                "last": last.map(|m| json!({
+                    "mine": Some(m.author) == me,
+                    "text": m.text,
+                    "time": m.time,
+                })),
+            });
+            (when, conversation)
+        })
+        .collect();
+    found.sort_by_key(|(when, _)| std::cmp::Reverse(*when));
+    let conversations: Vec<Json> = found.into_iter().map(|(_, c)| c).collect();
+    json!({"conversations": conversations})
+}
+
+/// Marks a conversation read up to its last message from the contact. Their
+/// devices see the marker too (`profiles.md#relationship`).
+pub fn mark_read(d: &Arc<Daemon>, who: &str) -> anyhow::Result<Json> {
+    let contact = listed(d, who)?;
+    let me = identity(d)?;
+    let op = {
+        let core = d.core();
+        let open = core
+            .spaces
+            .get(&contact.space)
+            .and_then(|h| h.space.as_ref());
+        let open = open.ok_or_else(|| anyhow::anyhow!("that space is not open yet"))?;
+        let all = relationship::messages(open);
+        let theirs = all.iter().rposition(|m| m.author != me);
+        match theirs {
+            Some(at) if at >= relationship::read_up_to(open, &me, &all) => {
+                let last = all[at].id;
+                match relationship::read_marker(open, &me) {
+                    Some(marker) => Some(relationship::set_read_marker(marker, last)),
+                    None => relationship::conversation(open)
+                        .map(|c| relationship::create_read_marker(c, last)),
+                }
+            }
+            _ => None,
+        }
+    };
+    if let Some(op) = op {
+        d.write_and_push(&contact.space, vec![op])?;
+    }
+    Ok(json!({}))
 }

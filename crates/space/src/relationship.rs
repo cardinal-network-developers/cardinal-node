@@ -2,6 +2,7 @@
 //! both owners, and a conversation between them.
 
 use cardinal_encoding::{Record, Value};
+use cardinal_identity::EntryId;
 
 use crate::account::short_key;
 use crate::entry::{IdentityId, NodeId, NodeKind, SpaceOp};
@@ -15,6 +16,8 @@ pub const CONVERSATION: u64 = 1;
 pub const MESSAGE: u64 = 2;
 /// The owner role (`spaces.md#memberships`).
 pub const OWNER: u64 = 3;
+/// Read marker kind.
+pub const READ_MARKER: u64 = 4;
 /// Reach kind.
 pub const REACH: u64 = 9;
 
@@ -105,9 +108,60 @@ pub fn create_message(conversation: NodeId, text: &str) -> SpaceOp {
     )
 }
 
+/// `create` of a member's read marker, at the message `last`.
+pub fn create_read_marker(conversation: NodeId, last: NodeId) -> SpaceOp {
+    SpaceOp::create(
+        NodeKind::Uint(READ_MARKER),
+        conversation,
+        "read",
+        Record::new().with(1, last).with(AUTHOR_OWNED_FIELD, 1u64),
+    )
+}
+
+/// Moves a read marker to the message `last`.
+pub fn set_read_marker(marker: NodeId, last: NodeId) -> SpaceOp {
+    SpaceOp::set(marker, 1, Some(last.into()))
+}
+
+/// `who`'s read markers: each marker's node and the message it is at. Their
+/// devices may each have made one while apart.
+fn read_markers(space: &Space, who: &IdentityId) -> Vec<(NodeId, NodeId)> {
+    let Some(conversation) = conversation(space) else {
+        return Vec::new();
+    };
+    let state = space.state();
+    let markers = state.children(&conversation).into_iter();
+    markers
+        .filter(|n| n.kind == NodeKind::Uint(READ_MARKER) && !n.deleted && n.creator == *who)
+        .filter_map(|n| {
+            let last = n.values(1).iter().rev().find_map(|v| v.value.as_ref())?;
+            Some((n.id, last.as_bytes()?.try_into().ok()?))
+        })
+        .collect()
+}
+
+/// A read marker of `who`'s, to move rather than make another.
+pub fn read_marker(space: &Space, who: &IdentityId) -> Option<NodeId> {
+    let found = read_markers(space, who);
+    found.first().map(|(marker, _)| *marker)
+}
+
+/// How many of `messages` `who` has read: all those up to the furthest of
+/// their markers.
+pub fn read_up_to(space: &Space, who: &IdentityId, messages: &[Message]) -> usize {
+    let at = |last: &NodeId| messages.iter().position(|m| m.id == *last);
+    let markers = read_markers(space, who);
+    let furthest = markers.iter().filter_map(|(_, last)| at(last)).max();
+    furthest.map_or(0, |at| at + 1)
+}
+
 /// A message.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Message {
+    /// Its node.
+    pub id: NodeId,
+    /// The entry that wrote it.
+    pub entry: EntryId,
     /// Who wrote it.
     pub author: IdentityId,
     /// Its text.
@@ -142,6 +196,8 @@ pub fn messages(space: &Space) -> Vec<Message> {
             let e = space.dag().get(&n.created_in)?;
             let text = n.values(1).iter().rev().find_map(|v| v.value.as_ref())?;
             let message = Message {
+                id: n.id,
+                entry: n.created_in,
                 author: n.creator,
                 text: text.as_text()?.to_owned(),
                 time: e.time(),
