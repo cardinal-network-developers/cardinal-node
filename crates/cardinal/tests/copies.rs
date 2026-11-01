@@ -99,7 +99,7 @@ fn copies_and_speedtest() {
     let st = a.cli(&["status"]);
     eprintln!("---- alpha with beta ----\n{st}");
     assert!(
-        st.contains("Copies: 2 — this device, beta (checked "),
+        st.contains("Copies: 2 — this device, beta (files older than 2 seconds, spot-checked "),
         "{st}"
     );
     assert!(!st.contains("only on this device"), "{st}");

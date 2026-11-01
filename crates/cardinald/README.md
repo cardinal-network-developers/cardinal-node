@@ -201,7 +201,7 @@ committed. Each inode maps to a space node once created there.
 (`blobs.md#counting-copies`, D45); `cardinal status` shows the count:
 
 ```
-Copies: 3 — this device, saint-joseph, nuc (checked 4 minutes ago; files older than an hour)
+Copies: 3 — this device, saint-joseph, nuc (files older than an hour, spot-checked 4 minutes ago)
 ```
 
 - **Who should keep everything**: devices in effect whose placement of

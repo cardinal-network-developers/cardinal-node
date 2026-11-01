@@ -1000,13 +1000,15 @@ fn copies_lines(c: &Value, devices: usize) -> Vec<String> {
         let list: Vec<String> = counted
             .iter()
             .map(|h| match age(&h["last_pass"]) {
-                Some(a) if spread && !is(h, "this") => format!("{} (checked {a})", name(h)),
+                Some(a) if spread && !is(h, "this") => format!("{} (spot-checked {a})", name(h)),
                 _ => name(h),
             })
             .collect();
         let mut l = format!("Copies: {} — {}", counted.len(), list.join(", "));
         match ages.iter().max() {
-            Some(a) if !spread => l += &format!(" (checked {}; files older than {older})", ago(*a)),
+            Some(a) if !spread => {
+                l += &format!(" (files older than {older}, spot-checked {})", ago(*a))
+            }
             Some(_) => l += &format!("; files older than {older}"),
             None => l += &format!(" (files older than {older})"),
         }
@@ -1588,8 +1590,8 @@ mod tests {
         assert_eq!(
             copies_lines(&three, 3),
             vec![
-                "Copies: 3 — this device, saint-joseph, nuc (checked 4 minutes ago; files older \
-                 than an hour)"
+                "Copies: 3 — this device, saint-joseph, nuc (files older than an hour, \
+                 spot-checked 4 minutes ago)"
             ]
         );
         // One missing pieces, one offline for a day: per-device ages, and
@@ -1607,8 +1609,8 @@ mod tests {
         assert_eq!(
             copies_lines(&mixed, 4),
             vec![
-                "Copies: 3 — this device, saint-joseph (checked 1 minute ago), laptop (checked \
-                 2 hours ago); files older than an hour",
+                "Copies: 3 — this device, saint-joseph (spot-checked 1 minute ago), laptop \
+                 (spot-checked 2 hours ago); files older than an hour",
                 "  nuc: not counted — did not have 3 of the 4 pieces of your files asked for \
                  (2 minutes ago)"
             ]
