@@ -7,6 +7,7 @@
 mod common;
 
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -17,6 +18,7 @@ use cardinal_link::{
     Session, Target,
 };
 use cardinal_sync::{BlobRequest, MemSet, Message, Reconciler};
+use cardinald::keys::Keys;
 use cardinald::mailbox::TOKEN_SESSIONS;
 use common::*;
 use tokio::io::AsyncWriteExt;
@@ -330,4 +332,236 @@ fn refusing_someone_ends_what_their_token_opened() {
     });
     let contacts = ana.cli(&["contacts", "--all"]).lines().count();
     assert_eq!(contacts, contacts_before);
+}
+
+/// Someone with a real device, who invited or accepted in the ordinary way.
+fn contacts(ana: &Dev, bo: &Dev) {
+    let at = format!("127.0.0.1:{}", ana.port);
+    let code = ana.cli(&["invite", "--address", &at, "--name", "Ana"]);
+    bo.cli(&["accept", code.trim()]);
+    wait("ana lists bo", 20, || ana.cli(&["contacts"]).contains("bo"));
+}
+
+/// The identity of the one other person `d` knows.
+fn other_person(d: &Dev) -> [u8; 32] {
+    let mut names = std::fs::read_dir(d.home.join("others")).unwrap().flatten();
+    let name = names.next().unwrap().file_name();
+    let name = name.to_str().unwrap();
+    unhex(name.split('.').next().unwrap())
+}
+
+/// A client of its own holding a real contact's keys: what modified software
+/// could do with `who`'s standing. `who`'s daemon has to be stopped first.
+struct Modified {
+    keys: Keys,
+    identity: [u8; 32],
+    peer: Keys,
+    peer_identity: [u8; 32],
+    addr: SocketAddr,
+}
+
+impl Modified {
+    fn of(who: &Dev, peer: &Dev) -> Modified {
+        Modified {
+            keys: Keys::load_or_create(&who.home.join("device.key")).unwrap(),
+            identity: other_person(peer),
+            peer: Keys::load_or_create(&peer.home.join("device.key")).unwrap(),
+            peer_identity: other_person(who),
+            addr: format!("127.0.0.1:{}", peer.port).parse().unwrap(),
+        }
+    }
+
+    async fn open(&self) -> Option<(Endpoint, Session)> {
+        let directory = MemoryDirectory::new();
+        let link = self.peer.link.public_key();
+        directory.add_device(self.peer_identity, self.peer.key(), link.clone());
+        let mut config = EndpointConfig::new(self.keys.link.clone(), directory);
+        config.identity = Some(LocalIdentity {
+            identity: self.identity,
+            signing_key: self.keys.signing.clone(),
+        });
+        config.connect_timeout = Duration::from_secs(3);
+        let bind = Bind {
+            udp: Some("127.0.0.1:0".parse().unwrap()),
+            tcp: None,
+        };
+        let endpoint = Endpoint::bind(config, bind).await.unwrap();
+        let target = Target::new(self.addr, CarrierKind::Udp, &link);
+        let session = endpoint.connect(target).await.ok()?;
+        Some((endpoint, session))
+    }
+}
+
+#[test]
+fn a_contact_opens_what_they_share_and_nothing_else() {
+    if !fuse_available() {
+        eprintln!("skipping: /dev/fuse or fusermount3 is not available");
+        return;
+    }
+    let root = tempfile::tempdir().unwrap();
+    let ana = hosted(root.path(), "ana");
+    let mut bo = hosted(root.path(), "bo");
+    let private_file: Vec<u8> = (0..3_000_000u32).map(|n| (n * 7 % 251) as u8).collect();
+    std::fs::write(ana.p("private.bin"), &private_file).unwrap();
+    ana.cli(&["flush"]);
+    contacts(&ana, &bo);
+    bo.cli(&["say", "Ana", "an honest word"]);
+    wait("ana reads it", 20, || {
+        ana.cli(&["messages", "bo"]).contains("an honest word")
+    });
+
+    let chunk = a_chunk(&ana.home.join("blobs"));
+    let theirs = spaces(&bo);
+    let (shared, private): (Vec<_>, Vec<_>) =
+        spaces(&ana).into_iter().partition(|s| theirs.contains(s));
+    assert_eq!(shared.len(), 1, "one space between them");
+    assert!(!private.is_empty());
+    let shared = shared[0];
+    let bo_as_modified = Modified::of(&bo, &ana);
+    bo.stop();
+
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        let (_endpoint, s) = bo_as_modified.open().await.expect("a contact connects");
+
+        assert!(!reconcile(&s, shared, MemSet::new()).await.is_empty());
+        for label in &private {
+            let wanted = reconcile(&s, *label, MemSet::new()).await;
+            assert!(wanted.is_empty(), "read a private space");
+        }
+
+        // Nothing goes into a space they are not in, not even as far as
+        // being looked at.
+        for label in &private {
+            let push = Message::Objects {
+                label: *label,
+                objects: vec![b"not an entry".to_vec()],
+            };
+            ask(&s, Service::SYNC, push.to_record()).await;
+        }
+
+        // What only the owner may do.
+        let fetch = Record::new().with(0, FETCH).with(1, 0u64);
+        assert!(not_permitted(ask(&s, Service::MAILBOX, fetch).await));
+        let list = Value::list([Value::Record(Record::new().with(1, [5u8; 16]))]);
+        let register = Record::new().with(0, REGISTER).with(1, list);
+        assert!(not_permitted(ask(&s, Service::MAILBOX, register).await));
+        let usage = Record::new().with(0, USAGE);
+        assert!(not_permitted(ask(&s, Service::MAILBOX, usage).await));
+
+        // What only a person's own devices may ask for.
+        let rendezvous = Record::new().with(0, 2u64).with(2, [1u8; 32]);
+        assert!(not_permitted(
+            ask(&s, Service::RENDEZVOUS, rendezvous).await
+        ));
+        let relay = Record::new().with(0, 1u64).with(2, [1u8; 32]);
+        assert!(not_permitted(ask(&s, Service::RELAY, relay).await));
+        let storage = Record::new().with(0, 2u64);
+        assert!(ask(&s, Service::STORAGE, storage)
+            .await
+            .is_none_or(|r| { r.get(0).and_then(Value::as_uint) == Some(ERROR) }));
+        let wanted = BlobRequest { ids: vec![chunk] };
+        let mut blob = s.open_stream(Service::BLOB, Priority::Interactive).unwrap();
+        blob.send_message_bytes(&wanted.encode()).await.unwrap();
+        let _ = blob.shutdown().await;
+        let got = tokio::time::timeout(Duration::from_secs(3), blob.recv_message_max(1 << 24));
+        assert!(
+            !matches!(got.await, Ok(Ok(Some(_)))),
+            "read a private chunk"
+        );
+
+        // An invitation is over once it is over.
+        let hello = Record::new().with(0, 1u64).with(1, [1u8; 32]).with(2, "x");
+        assert!(ask(&s, Service::CONTACT, hello).await.is_none());
+    });
+    assert!(
+        !ana.log().contains("bad object"),
+        "a private space looked at what a contact pushed: {}",
+        ana.log()
+    );
+
+    // Being refused ends it, and nothing they hold opens it again. A host
+    // answers anyone, so that a lost device can restore, and then asks for
+    // proof before anything else.
+    ana.cli(&["contact", "bo", "refuse"]);
+    rt.block_on(async {
+        if let Some((_endpoint, s)) = bo_as_modified.open().await {
+            let usage = Record::new().with(0, USAGE);
+            assert!(ask(&s, Service::MAILBOX, usage).await.is_none());
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            assert!(s.is_closed(), "a refused contact kept a session");
+        }
+    });
+    assert!(ana.status()["devices"].is_array());
+}
+
+/// RSS of a running process.
+fn resident(pid: u32) -> u64 {
+    let status = std::fs::read_to_string(format!("/proc/{pid}/status")).unwrap();
+    let line = status.lines().find(|l| l.starts_with("VmRSS:")).unwrap();
+    let kib = line.split_whitespace().nth(1).unwrap();
+    kib.parse::<u64>().unwrap() * 1024
+}
+
+/// Writes `count` messages of `claimed` bytes, each short of its end and
+/// never let go, for as long as `within`.
+async fn leave_unfinished(s: &Session, count: usize, claimed: usize, within: Duration) {
+    let mut writers = Vec::new();
+    for _ in 0..count {
+        let mut st = s.open_stream(Service::SYNC, Priority::Interactive).unwrap();
+        writers.push(tokio::spawn(async move {
+            let mut message = Vec::new();
+            cardinal_encoding::write_varint(claimed as u64, &mut message);
+            message.resize(message.len() + claimed - 1024, 7);
+            let _ = st.write_all(&message).await;
+            std::future::pending::<()>().await;
+            drop(st);
+        }));
+    }
+    tokio::time::sleep(within).await;
+    for w in writers {
+        w.abort();
+    }
+}
+
+/// The offers are small on purpose: this runs on a machine someone is using.
+#[test]
+fn a_contact_holds_only_so_much_memory() {
+    if !fuse_available() {
+        eprintln!("skipping: /dev/fuse or fusermount3 is not available");
+        return;
+    }
+    let root = tempfile::tempdir().unwrap();
+    let ana = hosted(root.path(), "ana");
+    let mut bo = hosted(root.path(), "bo");
+    contacts(&ana, &bo);
+    let bo_as_modified = Modified::of(&bo, &ana);
+    bo.stop();
+    let pid = ana.child.as_ref().unwrap().id();
+
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        let (_endpoint, s) = bo_as_modified.open().await.expect("a contact connects");
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        let before = resident(pid);
+
+        // Too long to be read at all.
+        leave_unfinished(&s, 96, 3 << 20, Duration::from_secs(10)).await;
+        let grew = resident(pid).saturating_sub(before) >> 20;
+        eprintln!("MEASURE 96 long messages, ana grew {grew} MiB");
+        assert!(grew < 64, "a contact made a device hold {grew} MiB");
+    });
+    rt.block_on(async {
+        let (_endpoint, s) = bo_as_modified.open().await.expect("a contact connects");
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        let before = s.stats().bytes_sent;
+
+        // Short enough, on more streams than are read at once. What a device
+        // has not read holds up the session's window, so this much goes.
+        leave_unfinished(&s, 128, 200 << 10, Duration::from_secs(6)).await;
+        let went = (s.stats().bytes_sent - before) >> 20;
+        eprintln!("MEASURE 128 short messages, {went} MiB got through");
+        assert!(went < 14, "{went} MiB was read of 25 MiB");
+    });
+    assert!(ana.status()["devices"].is_array());
 }

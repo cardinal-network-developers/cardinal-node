@@ -32,6 +32,9 @@ use crate::sched::{PeerStats, Scheduler};
 const PUSH_LIMIT: usize = 900;
 /// Largest message accepted on a stream.
 const MAX_MESSAGE: usize = 48 * 1024 * 1024;
+/// How many of a contact's streams are served at once. The rest wait their
+/// turn, unread, so too many slow only that session.
+const CONTACT_STREAMS: usize = 32;
 /// The most a `fetch_objects` holds at once. What is left comes with the next
 /// reconcile.
 const MAX_FETCHED: usize = 64 * 1024 * 1024;
@@ -143,6 +146,7 @@ pub async fn serve(d: Arc<Daemon>, s: Session, gen: u64) {
     let mut periodic = tokio::time::interval(Duration::from_secs(180));
     periodic.tick().await;
     let token_streams = Arc::new(tokio::sync::Semaphore::new(crate::mailbox::TOKEN_STREAMS));
+    let contact_streams = Arc::new(tokio::sync::Semaphore::new(CONTACT_STREAMS));
     loop {
         tokio::select! {
             st = s.accept_stream() => {
@@ -156,10 +160,19 @@ pub async fn serve(d: Arc<Daemon>, s: Session, gen: u64) {
                 } else {
                     None
                 };
+                let turns = matches!(
+                    d.session_kind(&s.peer_static()),
+                    Some(PeerKind::Contact(..) | PeerKind::Inviting(_))
+                )
+                .then(|| contact_streams.clone());
                 let d2 = d.clone();
                 let s2 = s.clone();
                 tokio::spawn(async move {
                     let _permit = permit;
+                    let _turn = match turns {
+                        Some(turns) => turns.acquire_owned().await.ok(),
+                        None => None,
+                    };
                     if let Err(e) = handle_stream(&d2, &s2, st).await {
                         tracing::debug!("stream from {}: {e:#}", short(&s2.peer_static()));
                     }
@@ -232,11 +245,13 @@ async fn handle_stream(d: &Arc<Daemon>, s: &Session, mut st: Stream) -> anyhow::
         st.reset(0);
         return Ok(());
     }
-    // A token's holder is not trusted with this device's memory.
-    let longest = if d.mailbox.token_of(s).is_some() {
-        crate::mailbox::TOKEN_MESSAGE
-    } else {
-        MAX_MESSAGE
+    // Someone else is not trusted with this device's memory, and has no
+    // need to be: what opens a stream is short, a reconcile 64 KiB at most.
+    let longest = match kind {
+        PeerKind::Token(_) | PeerKind::Contact(..) | PeerKind::Inviting(_) | PeerKind::Stranger => {
+            crate::mailbox::TOKEN_MESSAGE
+        }
+        _ => MAX_MESSAGE,
     };
     let Some(v) = st.recv_message_max(longest).await? else {
         return Ok(());
