@@ -26,5 +26,7 @@ tempfile.workspace = true
 blake3.workspace = true
 cardinal-contact.workspace = true
 cardinal-encoding.workspace = true
+cardinal-identity.workspace = true
 cardinal-link.workspace = true
+cardinal-space.workspace = true
 cardinal-sync.workspace = true

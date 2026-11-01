@@ -269,6 +269,9 @@ pub struct Daemon {
     /// The space made for each invitation's session, by the peer's static
     /// key.
     invited: Mutex<HashMap<[u8; 32], SpaceId>>,
+    /// The peers, by static key, of invitation sessions that have begun
+    /// their one exchange.
+    exchanging: Mutex<HashSet<[u8; 32]>>,
     /// Held while this device's own account nodes are checked and
     /// written, so concurrent housekeeping writes them once.
     placement_lock: Mutex<()>,
@@ -396,6 +399,7 @@ impl Daemon {
             speedtest: crate::speedtest::Limiter::default(),
             invitations: Mutex::new(HashMap::new()),
             invited: Mutex::new(HashMap::new()),
+            exchanging: Mutex::new(HashSet::new()),
             placement_lock: Mutex::new(()),
             stopping: watch::channel(false).0,
             next_gen: AtomicU64::new(1),
@@ -455,15 +459,17 @@ impl Daemon {
         if let Some(k) = known {
             return PeerKind::Own(k);
         }
-        let contact = {
+        // By who proved themselves in this session. A log can name any key,
+        // so finding this one in a log says nothing.
+        let contact = s.peer_identity().and_then(|p| {
             let core = self.core();
-            core.contact_of(&ps).filter(|(identity, _)| {
-                let contacts = core.contacts();
-                contacts
-                    .iter()
-                    .any(|c| c.identity == *identity && c.connects())
-            })
-        };
+            let contacts = core.contacts();
+            let connects = contacts
+                .iter()
+                .any(|c| c.identity == p.identity && c.connects());
+            (connects && core.has_device(&p.identity, &p.signing_key, &ps))
+                .then_some((p.identity, p.signing_key))
+        });
         if let Some((identity, key)) = contact {
             return PeerKind::Contact(identity, key);
         }
@@ -562,7 +568,11 @@ impl Daemon {
             .values()
             .filter(|c| !c.session.is_closed())
             .filter_map(|c| match c.kind {
-                PeerKind::Contact(identity, _) | PeerKind::Inviting(identity, _) => Some(identity),
+                // An invitation only once proven: until then it is a claim,
+                // and a claim must not hold up delivery to the real person.
+                PeerKind::Contact(identity, _) | PeerKind::Inviting(identity, Some(_)) => {
+                    Some(identity)
+                }
                 _ => None,
             })
             .collect()
@@ -581,6 +591,12 @@ impl Daemon {
             }
             _ => None,
         }
+    }
+
+    /// Whether `s` may begin an exchange. One invitation is one contact,
+    /// however many streams ask.
+    pub fn exchange_begins(&self, s: &Session) -> bool {
+        lock(&self.exchanging).insert(s.peer_static())
     }
 
     /// `space` is what `s`'s invitation was for: all of a session it opens.
@@ -770,6 +786,7 @@ impl Daemon {
             m.remove(peer_static);
             lock(&self.proven).remove(peer_static);
             lock(&self.invited).remove(peer_static);
+            lock(&self.exchanging).remove(peer_static);
             tracing::info!("disconnected from {}", short(peer_static));
             crate::rendezvous::session_closed(self, peer_static);
             // A device has one session with another, so a fetch may have

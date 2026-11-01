@@ -135,13 +135,12 @@ impl Daemon {
                     Access::None
                 }
             }
-            // Not a contact yet, and possibly not who they say: the two
-            // logs, and the one space made for this invitation.
-            PeerKind::Inviting(identity, space) => {
+            // Not a contact yet, and possibly not who they say: this log to
+            // read, and the one space made for this invitation. Theirs this
+            // device fetches for itself, and nothing is taken unasked.
+            PeerKind::Inviting(_, space) => {
                 if Some(*label) == self.core().identity_label() {
                     Access::Read
-                } else if *label == identity_log_label(&identity) {
-                    Access::Other(identity)
                 } else if space == Some(*label) {
                     Access::Full
                 } else {

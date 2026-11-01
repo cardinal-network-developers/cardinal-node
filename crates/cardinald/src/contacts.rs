@@ -23,6 +23,7 @@ use tokio::io::AsyncWriteExt;
 
 use crate::core::short;
 use crate::daemon::{Daemon, PeerKind};
+use crate::net::Access;
 use crate::{mailbox, net};
 
 /// The longest message here: a sealed genesis wrapped for two.
@@ -94,6 +95,10 @@ pub async fn accept(
         !is_refused(d, &invitation.inviter),
         "you have refused whoever made that invitation"
     );
+    anyhow::ensure!(
+        !is_contact(d, &invitation.inviter),
+        "you already know whoever made that invitation"
+    );
     let addr = invitation
         .endpoint
         .socket_addr()
@@ -108,9 +113,14 @@ pub async fn accept(
         .or(invitation.name.clone())
         .unwrap_or_else(|| account::short_key(&invitation.inviter));
     let exchange = accept_exchange(d, &s, me, &invitation, &petname, regard);
-    tokio::time::timeout(EXCHANGE_WITHIN, exchange)
+    let done = tokio::time::timeout(EXCHANGE_WITHIN, exchange)
         .await
-        .map_err(|_| anyhow::anyhow!("they stopped answering"))??;
+        .map_err(|_| anyhow::anyhow!("they stopped answering"))
+        .and_then(|done| done);
+    if done.is_err() {
+        s.abandon();
+    }
+    done?;
     Ok(json!({"name": petname}))
 }
 
@@ -137,12 +147,14 @@ async fn accept_exchange(
         anyhow::bail!("they did not go on");
     };
     let label = identity_log_label(&invitation.inviter);
-    net::reconcile(d, s, label).await?;
+    net::reconcile_as(d, s, label, Access::Other(invitation.inviter)).await?;
     anyhow::ensure!(
         proven_by_log(d, s, &invitation.inviter),
         "the device at that address is not the one who invited you"
     );
-    let space = d.core().accept_relationship(&genesis)?;
+    let space = d
+        .core()
+        .accept_relationship(&genesis, &invitation.inviter)?;
     d.invited_to(s, space);
     mailbox::write_reach(d, &space).await?;
     net::reconcile(d, s, space).await?;
@@ -191,6 +203,10 @@ pub async fn serve(d: &Arc<Daemon>, s: &Session, mut st: Stream) -> anyhow::Resu
         st.reset(0);
         return Ok(());
     };
+    if !d.exchange_begins(s) || is_contact(d, &them) {
+        s.abandon();
+        return Ok(());
+    }
     let Some(regard) = d.invitation_of(s) else {
         st.reset(0);
         return Ok(());
@@ -200,7 +216,7 @@ pub async fn serve(d: &Arc<Daemon>, s: &Session, mut st: Stream) -> anyhow::Resu
     };
     anyhow::ensure!(identity == them, "not who the session says");
     let label = identity_log_label(&them);
-    net::reconcile(d, s, label).await?;
+    net::reconcile_as(d, s, label, Access::Other(them)).await?;
     if !proven_by_log(d, s, &them) {
         s.abandon();
         return Ok(());
@@ -225,6 +241,10 @@ pub async fn serve(d: &Arc<Daemon>, s: &Session, mut st: Stream) -> anyhow::Resu
         }
     }
     Ok(())
+}
+
+fn is_contact(d: &Daemon, who: &[u8; 32]) -> bool {
+    d.core().contacts().iter().any(|c| c.identity == *who)
 }
 
 fn is_refused(d: &Daemon, who: &[u8; 32]) -> bool {
@@ -313,8 +333,18 @@ pub fn list(d: &Daemon, all: bool) -> Json {
 fn find(d: &Daemon, who: &str) -> anyhow::Result<ContactRecord> {
     let w = who.to_lowercase();
     let contacts = d.core().contacts();
-    let found = contacts.into_iter().find(|c| c.petname.to_lowercase() == w);
-    found.ok_or_else(|| anyhow::anyhow!("no contact called {who:?}; see `cardinal contacts`"))
+    let named =
+        |c: &ContactRecord| c.petname.to_lowercase() == w || hex::encode(&c.identity[..8]) == w;
+    let mut found = contacts.into_iter().filter(named);
+    let contact = found
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("no contact called {who:?}; see `cardinal contacts`"))?;
+    // A name is what someone suggested, and it may be a name already here.
+    anyhow::ensure!(
+        found.next().is_none(),
+        "more than one contact is called {who:?}; use the id `cardinal contacts` shows"
+    );
+    Ok(contact)
 }
 
 /// The contact called `who`, unless this person has refused them.

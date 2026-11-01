@@ -695,7 +695,18 @@ asks for around that is not built yet.
   made, and gives them new ones if it is taken back.
 - **A contact can fill a disk.** A device stores an entry before it judges it,
   so a contact, or a host someone fetches from, can send junk that is kept. A
-  token holder cannot: a host takes no objects from one.
+  token holder cannot: a host takes no objects from one, and nor does a device
+  from someone using an invitation. The same goes for identity logs, and there
+  it costs more: junk in a log travels to its owner and their contacts, and
+  evaluating a log is quadratic in what it holds (a minute at 2000 entries).
+- **A log can name any link key.** `add_key` proves the signing key and not the
+  link key, so a log can list a device it does not hold. It gains nothing: a
+  handshake proves the static key and a device proof names the identity, so a
+  session is matched to the identity that proved itself, and a key can have
+  more than one claimant.
+- **A removed device can pass as itself to a stranger.** Each side of an
+  invitation checks the other's device against a log that device served, so
+  one removed from its identity can show a copy from before.
 - **A contact's memory limit is per session.** A session serves 32 of a
   contact's streams at once, each opening with at most 256 KiB, and a
   reconcile learns at most 65,536 ids before fetching them, so one holds a few

@@ -685,17 +685,18 @@ fn an_invitation_opens_nothing_else() {
     assert_eq!(log_sizes(&ana), before, "something was left in her spaces");
     assert!(!ana.log().contains("bad object"), "{}", ana.log());
 
-    // Nor is it a way back in, used as it was meant to be.
-    let spare = a_code(&ana, &[]);
-    let out = bo.try_cli(&["accept", &spare.to_text()]);
-    assert!(!out.status.success(), "a refused person was let back in");
+    // Nor is it a way back in: such a session is not even begun.
+    let seen = |d: &Dev| d.log().matches("someone with an invitation").count();
+    let before = seen(&ana);
+    attack(&rt, "someone refused", a_code(&ana, &[]), bo_id);
+    assert_eq!(seen(&ana), before, "a refused person was let back in");
     assert!(ana.cli(&["contacts", "--all"]).contains("refused"));
     assert!(!ana.cli(&["contacts"]).contains("bo"));
 }
 
 /// An invitation is also an invitation to be lied to. Someone sends Ana a
-/// code naming a person she knows. Her device opens nothing to them, and
-/// goes no further once that person's log says the device is not theirs.
+/// code naming a person she has yet to meet. Her device opens nothing to
+/// them, and goes no further when no log says the device is that person's.
 #[test]
 fn a_false_invitation_gets_nothing_from_who_accepts_it() {
     if !fuse_available() {
@@ -710,6 +711,7 @@ fn a_false_invitation_gets_nothing_from_who_accepts_it() {
     contacts(&ana, &bo);
     let all = spaces(&ana);
     let bo_id = other_person(&ana);
+    let someone = [8; 32];
     let before = log_sizes(&ana);
 
     let rt = tokio::runtime::Runtime::new().unwrap();
@@ -718,7 +720,7 @@ fn a_false_invitation_gets_nothing_from_who_accepts_it() {
     let responder = *key.public_key().x25519();
     let mut config = EndpointConfig::new(key, MemoryDirectory::new());
     config.identity = Some(LocalIdentity {
-        identity: bo_id,
+        identity: someone,
         signing_key: Arc::new(SigningKey::from_seed(&[42; 32])),
     });
     let addr: SocketAddr = format!("127.0.0.1:{}", free_port()).parse().unwrap();
@@ -728,7 +730,11 @@ fn a_false_invitation_gets_nothing_from_who_accepts_it() {
     };
     let endpoint = rt.block_on(Endpoint::bind(config, bind)).unwrap();
     let endpoint_addr = EndpointAddr::new(CarrierKind::Udp, addr);
-    let code = Invitation::new(bo_id, responder, endpoint_addr);
+    let code = Invitation::new(bo_id, responder, endpoint_addr.clone());
+    let refused = ana.try_cli(&["accept", &code.to_text()]);
+    assert!(!refused.status.success(), "a contact was made twice");
+
+    let code = Invitation::new(someone, responder, endpoint_addr);
     endpoint.add_secret(SecretEntry::new(&code.secret));
     let text = code.to_text();
 

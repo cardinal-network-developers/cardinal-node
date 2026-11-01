@@ -873,18 +873,6 @@ impl Core {
         missing.map(|c| identity_log_label(&c.identity)).collect()
     }
 
-    /// Whose device has the static key `peer_x25519`, among contacts.
-    pub fn contact_of(&self, peer_x25519: &[u8; 32]) -> Option<([u8; 32], KeyId)> {
-        self.others.values().find_map(|o| {
-            let st = o.log.state();
-            let k = st
-                .keys
-                .values()
-                .find(|k| k.link_key.as_ref().map(|l| l.x25519()) == Some(peer_x25519))?;
-            Some((o.log.id(), k.key))
-        })
-    }
-
     /// Whether `identity` is a member of the space `label`, or `label` is
     /// this person's log, which every contact is entitled to.
     pub fn shares(&self, identity: &[u8; 32], label: &[u8; 32]) -> bool {
@@ -904,7 +892,9 @@ impl Core {
         };
         let state = other.log.state();
         let mut keys = state.keys.values();
-        keys.any(|k| k.key == *key && k.link_key.as_ref().is_some_and(|l| l.x25519() == link))
+        !state.frozen
+            && keys
+                .any(|k| k.key == *key && k.link_key.as_ref().is_some_and(|l| l.x25519() == link))
     }
 
     /// What a session with a contact may reconcile: this person's log and
@@ -1000,15 +990,45 @@ impl Core {
         Ok((id, bytes))
     }
 
-    /// Takes a relationship space from its sealed genesis. Returns its id.
-    pub fn accept_relationship(&mut self, genesis: &[u8]) -> anyhow::Result<SpaceId> {
+    /// Takes a relationship space with `inviter` from its sealed genesis.
+    /// Returns its id. Anyone can seal a genesis to a public key, so what
+    /// it is has to be read off it first: taken unread, it could stand in for
+    /// the account space, or open a space this person already has.
+    pub fn accept_relationship(
+        &mut self,
+        genesis: &[u8],
+        inviter: &[u8; 32],
+    ) -> anyhow::Result<SpaceId> {
         let ident = self
             .identity
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("this device has no identity yet"))?;
+        let their_log = &self
+            .others
+            .get(inviter)
+            .ok_or_else(|| anyhow::anyhow!("their identity log is not here"))?
+            .log;
         let sealed = SealedEntry::decode(genesis)?;
-        let space = Space::open_genesis(&sealed, &ident.key_refs(), None)?;
+        let mut space = Space::open_genesis(&sealed, &ident.key_refs(), None)?;
         let id = space.id();
+        space.evaluate_full(&[&ident.log, their_log])?;
+        let mut members: Vec<[u8; 32]> = space
+            .validity()
+            .members
+            .iter()
+            .map(|m| m.identity)
+            .collect();
+        members.sort_unstable();
+        members.dedup();
+        let mut the_two = vec![ident.id(), *inviter];
+        the_two.sort_unstable();
+        anyhow::ensure!(
+            space.profile() == cardinal_space::Profile::RELATIONSHIP
+                && space.owner() == *inviter
+                && members == the_two
+                && !self.spaces.contains_key(&id),
+            "that is not a space between the two of you"
+        );
         self.ingest_space(id, &[genesis.to_vec()])?;
         Ok(id)
     }
