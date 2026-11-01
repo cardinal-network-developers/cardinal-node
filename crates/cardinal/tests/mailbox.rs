@@ -118,6 +118,55 @@ fn a_persons_other_devices_get_what_reached_their_host() {
     });
 }
 
+/// Devices are usually paired long before anyone is met, so a contact comes
+/// to them in the account space, with a space they have no log to judge.
+fn already_paired_devices_join_the_conversation(extra: &[&str]) {
+    if !fuse_available() {
+        eprintln!("skipping: /dev/fuse or fusermount3 is not available");
+        return;
+    }
+    let root = tempfile::tempdir().unwrap();
+    let ana = hosted(root.path(), "ana");
+    let bo = hosted(root.path(), "bo");
+    let mut phone = Dev::new(root.path(), "phone", free_port());
+    phone.start();
+    pair(&ana, &phone);
+    phone.wait_mounted();
+
+    let at = format!("127.0.0.1:{}", ana.port);
+    let mut invite = vec!["invite", "--address", &at, "--name", "Ana"];
+    invite.extend(extra);
+    let code = ana.cli(&invite);
+    let mut accept = vec!["accept", code.trim()];
+    accept.extend(extra);
+    bo.cli(&accept);
+    wait("ana lists bo", 20, || ana.cli(&["contacts"]).contains("bo"));
+    wait("the phone lists bo", 20, || {
+        phone.cli(&["contacts"]).contains("bo")
+    });
+    wait("the phone can speak", 20, || {
+        phone
+            .try_cli(&["say", "bo", "from my phone"])
+            .status
+            .success()
+    });
+    wait("bo reads it", 30, || has_read(&bo, "Ana", "from my phone"));
+    bo.cli(&["say", "Ana", "for all of you"]);
+    wait("the phone reads it", 30, || {
+        has_read(&phone, "bo", "for all of you")
+    });
+}
+
+#[test]
+fn an_already_paired_device_joins_a_conversation_through_hosts() {
+    already_paired_devices_join_the_conversation(&["--hosts-only"]);
+}
+
+#[test]
+fn an_already_paired_device_joins_a_conversation_with_a_contact() {
+    already_paired_devices_join_the_conversation(&[]);
+}
+
 /// Refusing someone ends their token too, and taking it back gives them a
 /// new one.
 #[test]

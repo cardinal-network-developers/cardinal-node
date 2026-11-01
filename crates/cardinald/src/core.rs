@@ -12,7 +12,7 @@ use cardinal_identity::{EntryId, IdentityEntry, IdentityLog, IdentityState, Inse
 use cardinal_space::account;
 use cardinal_space::entry::NodeKind;
 use cardinal_space::{Profile, SealedEntry, Space, SpaceId, SpaceOp, ROOT};
-use cardinal_sync::{identity_log_label, MemSet};
+use cardinal_sync::{identity_log_label, MemSet, SetStore};
 
 use crate::applog::{AppendLog, Loc};
 use crate::keys::Keys;
@@ -426,11 +426,13 @@ impl Holder {
         complete
     }
 
-    /// Whether entries wait for parents this device lacks.
+    /// Whether entries wait for parents this device lacks. A genesis is too
+    /// long to push, so what follows it can be the first to arrive.
     fn is_waiting(&self) -> bool {
-        self.space
-            .as_ref()
-            .is_some_and(|sp| sp.dag().held().next().is_some())
+        match &self.space {
+            Some(sp) => sp.dag().held().next().is_some(),
+            None => self.set.len() > 0,
+        }
     }
 
     /// Whether the next write must start a new epoch: the current one
