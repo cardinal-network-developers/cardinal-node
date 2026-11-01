@@ -134,16 +134,25 @@ fn not_permitted(reply: Option<Record>) -> bool {
     })
 }
 
-/// What a reconcile says the host has and `have` lacks.
+/// What a reconcile says the host has and `have` lacks. Silence is how a device
+/// refuses, so a wait that runs out counts as nothing.
 async fn reconcile(s: &Session, label: [u8; 32], have: MemSet) -> Vec<[u8; 32]> {
+    reconcile_within(s, label, have, Duration::from_secs(3)).await
+}
+
+/// The same, for what must be answered: a busy machine can take this long.
+async fn reconcile_within(
+    s: &Session,
+    label: [u8; 32],
+    have: MemSet,
+    wait: Duration,
+) -> Vec<[u8; 32]> {
     let mut rec = Reconciler::new(label, have);
     let mut st = s.open_stream(Service::SYNC, Priority::Interactive).unwrap();
     let first = Value::Record(rec.initiate().to_record());
     st.send_message(&first).await.unwrap();
     while !rec.is_done() {
-        let Ok(Ok(Some(v))) =
-            tokio::time::timeout(Duration::from_secs(3), st.recv_message_max(1 << 22)).await
-        else {
+        let Ok(Ok(Some(v))) = tokio::time::timeout(wait, st.recv_message_max(1 << 22)).await else {
             break;
         };
         let Some(r) = v.as_record() else { break };
@@ -187,7 +196,8 @@ fn a_token_opens_its_own_space_and_nothing_else() {
     rt.block_on(async {
         let (_endpoint, s) = open(&t, None).await.expect("a good token opens");
 
-        assert!(!reconcile(&s, shared, MemSet::new()).await.is_empty());
+        let own = reconcile_within(&s, shared, MemSet::new(), Duration::from_secs(30)).await;
+        assert!(!own.is_empty());
         for label in &private {
             let wanted = reconcile(&s, *label, MemSet::new()).await;
             assert!(wanted.is_empty(), "read a private space");

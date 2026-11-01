@@ -186,6 +186,29 @@ fn nobody_can_be_called_while_out_of_reach() {
     assert!(standing(&a).is_null());
 }
 
+/// Refusing someone ends every way they had of reaching this person, and a
+/// ring is one of them.
+#[test]
+fn someone_refused_cannot_ring() {
+    if !fuse_available() {
+        eprintln!("skipping: /dev/fuse or fusermount3 is not available");
+        return;
+    }
+    let root = tempfile::tempdir().unwrap();
+    let (a, b, bo) = met(root.path());
+    ask(
+        &a,
+        json!({"cmd": "contact", "who": bo, "setting": "refuse"}),
+    );
+    wait("bo is cut off", 30, || {
+        ask(&b, json!({"cmd": "contacts"}))["contacts"][0]["connected"] == false
+    });
+    let reply = try_ask(&b, json!({"cmd": "call-start", "who": "Ana"}));
+    assert_eq!(reply["ok"], false, "{reply}");
+    std::thread::sleep(Duration::from_secs(1));
+    assert!(standing(&a).is_null());
+}
+
 /// `experience.md`: background sync has no audible effect on a call. Frames go
 /// every 20 ms while a large file syncs beside them, and none may be late by
 /// more than a jitter buffer holds. The sync is to this person's other device,
