@@ -138,7 +138,12 @@ async fn accept_exchange(
     };
     let label = identity_log_label(&invitation.inviter);
     net::reconcile(d, s, label).await?;
+    anyhow::ensure!(
+        proven_by_log(d, s, &invitation.inviter),
+        "the device at that address is not the one who invited you"
+    );
     let space = d.core().accept_relationship(&genesis)?;
+    d.invited_to(s, space);
     mailbox::write_reach(d, &space).await?;
     net::reconcile(d, s, space).await?;
     record_contact(d, &invitation.inviter, petname, &space, regard)?;
@@ -153,6 +158,13 @@ async fn accept_exchange(
         s.abandon();
     }
     Ok(())
+}
+
+/// Whether the device at the other end of `s` is one of `who`'s, by that
+/// person's own log. Until it is, `who` is only what the device said.
+fn proven_by_log(d: &Daemon, s: &Session, who: &[u8; 32]) -> bool {
+    let key = s.peer_identity().map(|p| p.signing_key);
+    key.is_some_and(|key| d.core().has_device(who, &key, &s.peer_static()))
 }
 
 /// Announces a new contact's space. A session counts as a contact's only
@@ -175,14 +187,10 @@ fn remember(d: &Daemon, s: &Session) {
 
 /// Serves the `contact` service, for a session opened with an invitation.
 pub async fn serve(d: &Arc<Daemon>, s: &Session, mut st: Stream) -> anyhow::Result<()> {
-    let PeerKind::Inviting(them) = d.classify(s) else {
+    let PeerKind::Inviting(them, _) = d.classify(s) else {
         st.reset(0);
         return Ok(());
     };
-    if is_refused(d, &them) {
-        s.abandon();
-        return Ok(());
-    }
     let Some(regard) = d.invitation_of(s) else {
         st.reset(0);
         return Ok(());
@@ -193,7 +201,12 @@ pub async fn serve(d: &Arc<Daemon>, s: &Session, mut st: Stream) -> anyhow::Resu
     anyhow::ensure!(identity == them, "not who the session says");
     let label = identity_log_label(&them);
     net::reconcile(d, s, label).await?;
+    if !proven_by_log(d, s, &them) {
+        s.abandon();
+        return Ok(());
+    }
     let (space, genesis) = d.core().create_relationship(&them)?;
+    d.invited_to(s, space);
     mailbox::write_reach(d, &space).await?;
     send(&mut st, &ContactMessage::Genesis(genesis)).await?;
     let done = tokio::time::timeout(EXCHANGE_WITHIN, receive(&mut st)).await;

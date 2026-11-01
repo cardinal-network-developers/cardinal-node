@@ -210,6 +210,7 @@ version = "0.1.12"
 dependencies = [
  "anyhow",
  "blake3",
+ "cardinal-contact",
  "cardinal-crypto",
  "cardinal-encoding",
  "cardinal-link",

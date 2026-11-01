@@ -133,6 +133,12 @@ impl<S: SetStore> Reconciler<S> {
         self.stats
     }
 
+    /// How many ids have been learned so far, to bound what a peer can make
+    /// this side remember.
+    pub fn wanted_count(&self) -> usize {
+        self.wanted.len()
+    }
+
     /// Ids learned so far that this side lacks, sorted and deduplicated,
     /// leaving the list empty. Safe to call before the end, to start
     /// fetching early.

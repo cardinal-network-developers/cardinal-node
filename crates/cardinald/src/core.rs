@@ -895,6 +895,16 @@ impl Core {
             .is_some_and(|s| s.validity().members.iter().any(|m| m.identity == *identity))
     }
 
+    /// Whether `identity`'s log, as held here, has this device in it.
+    pub fn has_device(&self, identity: &[u8; 32], key: &[u8; 32], link: &[u8; 32]) -> bool {
+        let Some(other) = self.others.get(identity) else {
+            return false;
+        };
+        let state = other.log.state();
+        let mut keys = state.keys.values();
+        keys.any(|k| k.key == *key && k.link_key.as_ref().is_some_and(|l| l.x25519() == link))
+    }
+
     /// What a session with a contact may reconcile: this person's log and
     /// theirs, then the spaces they share (`spaces.md#holding-a-space`).
     pub fn labels_with(&self, identity: &[u8; 32]) -> Vec<[u8; 32]> {

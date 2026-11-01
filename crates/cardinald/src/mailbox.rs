@@ -793,8 +793,9 @@ async fn pull(d: &Arc<Daemon>, space: &SpaceId, member: &[u8; 32], reach: &[Reac
             continue;
         };
         let fetching = async {
-            net::reconcile(d, &s, identity_log_label(member)).await?;
-            net::reconcile(d, &s, *space).await
+            let log = identity_log_label(member);
+            net::reconcile_as(d, &s, log, Access::Other(*member)).await?;
+            net::reconcile_as(d, &s, *space, Access::Full).await
         };
         let done = tokio::time::timeout(AT_HOST_WITHIN, fetching).await;
         s.close("fetched");

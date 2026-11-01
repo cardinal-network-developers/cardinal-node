@@ -7,17 +7,17 @@
 mod common;
 
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
+use cardinal_contact::{ContactMessage, EndpointAddr, Invitation};
 use cardinal_crypto::{derive, HybridKeyPair, Purpose, SigningKey};
 use cardinal_encoding::{Record, Value};
 use cardinal_link::{
-    Bind, CarrierKind, Endpoint, EndpointConfig, LocalIdentity, MemoryDirectory, Priority, Service,
-    Session, Target,
+    Bind, CarrierKind, Endpoint, EndpointConfig, LocalIdentity, MemoryDirectory, Priority,
+    SecretEntry, Service, Session, Target,
 };
-use cardinal_sync::{BlobRequest, MemSet, Message, Reconciler};
+use cardinal_sync::{BlobRequest, MemSet, Message, Mode, Range, Reconciler};
 use cardinald::keys::Keys;
 use cardinald::mailbox::TOKEN_SESSIONS;
 use common::*;
@@ -339,7 +339,9 @@ fn contacts(ana: &Dev, bo: &Dev) {
     let at = format!("127.0.0.1:{}", ana.port);
     let code = ana.cli(&["invite", "--address", &at, "--name", "Ana"]);
     bo.cli(&["accept", code.trim()]);
-    wait("ana lists bo", 20, || ana.cli(&["contacts"]).contains("bo"));
+    wait("the inviter lists them", 20, || {
+        ana.cli(&["contacts"]).contains(bo.name)
+    });
 }
 
 /// The identity of the one other person `d` knows.
@@ -564,4 +566,301 @@ fn a_contact_holds_only_so_much_memory() {
         assert!(went < 14, "{went} MiB was read of 25 MiB");
     });
     assert!(ana.status()["devices"].is_array());
+}
+
+/// A message that wants no reply.
+async fn tell(s: &Session, service: Service, message: Record) {
+    if let Ok(mut st) = s.open_stream(service, Priority::Interactive) {
+        let _ = st.send_message(&Value::Record(message)).await;
+        let _ = st.shutdown().await;
+    }
+}
+
+fn log_sizes(d: &Dev) -> Vec<u64> {
+    let dir = std::fs::read_dir(d.home.join("spaces")).unwrap();
+    let logs = dir.flatten().map(|e| e.path().join("entries.log"));
+    let mut sizes: Vec<u64> = logs
+        .map(|p| std::fs::metadata(p).map_or(0, |m| m.len()))
+        .collect();
+    sizes.sort_unstable();
+    sizes
+}
+
+/// Opens a session with an invitation, saying it is `claim` with a key made
+/// up on the spot.
+async fn open_claiming(ana: &Dev, secret: &[u8], claim: [u8; 32]) -> Option<(Endpoint, Session)> {
+    let sheet = ana.cli(&["recovery", "sheet"]);
+    let key = sheet.lines().find(|l| l.contains("Key:")).unwrap();
+    let key = key.split_whitespace().last().unwrap();
+    let host = cardinald::host::read_sheet_key(key).unwrap();
+    let addr: SocketAddr = format!("127.0.0.1:{}", ana.port).parse().unwrap();
+
+    let mut config =
+        EndpointConfig::new(Arc::new(HybridKeyPair::generate()), MemoryDirectory::new());
+    config.identity = Some(LocalIdentity {
+        identity: claim,
+        signing_key: Arc::new(SigningKey::from_seed(&[42; 32])),
+    });
+    config.connect_timeout = Duration::from_secs(3);
+    let bind = Bind {
+        udp: Some("127.0.0.1:0".parse().unwrap()),
+        tcp: None,
+    };
+    let endpoint = Endpoint::bind(config, bind).await.unwrap();
+    let target = Target::invitation(addr, CarrierKind::Udp, host, secret);
+    let session = endpoint.connect(target).await.ok()?;
+    Some((endpoint, session))
+}
+
+fn a_code(ana: &Dev, also: &[&str]) -> Invitation {
+    let at = format!("127.0.0.1:{}", ana.port);
+    let mut args = vec!["invite", "--address", &at, "--name", "Ana"];
+    args.extend(also);
+    Invitation::from_text(ana.cli(&args).trim()).unwrap()
+}
+
+/// Who holds an invitation may become a contact. Whoever they say they are,
+/// that is all it opens: not the inviter's spaces, not a contact's, and not
+/// a place to leave anything.
+#[test]
+fn an_invitation_opens_nothing_else() {
+    if !fuse_available() {
+        eprintln!("skipping: /dev/fuse or fusermount3 is not available");
+        return;
+    }
+    let root = tempfile::tempdir().unwrap();
+    let ana = hosted(root.path(), "ana");
+    let bo = hosted(root.path(), "bo");
+    std::fs::write(ana.p("private.txt"), "ana's\n").unwrap();
+    ana.cli(&["flush"]);
+    contacts(&ana, &bo);
+    bo.cli(&["say", "Ana", "between us"]);
+    wait("ana reads it", 20, || {
+        ana.cli(&["messages", "bo"]).contains("between us")
+    });
+    let all = spaces(&ana);
+    assert!(all.len() >= 3, "her own spaces, and the one with bo");
+    let (ana_id, bo_id) = (other_person(&bo), other_person(&ana));
+    let before = log_sizes(&ana);
+
+    let attack = |rt: &tokio::runtime::Runtime, who: &str, code: Invitation, claim: [u8; 32]| {
+        rt.block_on(async {
+            let Some((_endpoint, s)) = open_claiming(&ana, &code.secret, claim).await else {
+                return;
+            };
+            for label in &all {
+                let wanted = reconcile(&s, *label, MemSet::new()).await;
+                assert!(wanted.is_empty(), "{who} read {} entries", wanted.len());
+                let junk = Message::Objects {
+                    label: *label,
+                    objects: vec![vec![7; 60_000]],
+                };
+                tell(&s, Service::SYNC, junk.to_record()).await;
+            }
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        });
+    };
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    attack(
+        &rt,
+        "someone saying they are ana",
+        a_code(&ana, &[]),
+        ana_id,
+    );
+    attack(&rt, "someone saying they are bo", a_code(&ana, &[]), bo_id);
+    attack(&rt, "someone new", a_code(&ana, &[]), [9; 32]);
+    let hosts_only = a_code(&ana, &["--hosts-only"]);
+    attack(&rt, "someone with a hosts-only code", hosts_only, ana_id);
+    assert_eq!(log_sizes(&ana), before, "something was left in her spaces");
+
+    // Refusal outlasts an invitation made before it. It is itself a write,
+    // so what counts is what comes after.
+    let spare = a_code(&ana, &[]);
+    ana.cli(&["contact", "bo", "refuse"]);
+    wait("the refusal is written", 10, || {
+        ana.cli(&["contacts", "--all"]).contains("refused")
+    });
+    let before = log_sizes(&ana);
+    attack(&rt, "someone refused", spare, bo_id);
+    assert_eq!(log_sizes(&ana), before, "something was left in her spaces");
+    assert!(!ana.log().contains("bad object"), "{}", ana.log());
+
+    // Nor is it a way back in, used as it was meant to be.
+    let spare = a_code(&ana, &[]);
+    let out = bo.try_cli(&["accept", &spare.to_text()]);
+    assert!(!out.status.success(), "a refused person was let back in");
+    assert!(ana.cli(&["contacts", "--all"]).contains("refused"));
+    assert!(!ana.cli(&["contacts"]).contains("bo"));
+}
+
+/// An invitation is also an invitation to be lied to. Someone sends Ana a
+/// code naming a person she knows. Her device opens nothing to them, and
+/// goes no further once that person's log says the device is not theirs.
+#[test]
+fn a_false_invitation_gets_nothing_from_who_accepts_it() {
+    if !fuse_available() {
+        eprintln!("skipping: /dev/fuse or fusermount3 is not available");
+        return;
+    }
+    let root = tempfile::tempdir().unwrap();
+    let ana = hosted(root.path(), "ana");
+    let bo = hosted(root.path(), "bo");
+    std::fs::write(ana.p("private.txt"), "ana's\n").unwrap();
+    ana.cli(&["flush"]);
+    contacts(&ana, &bo);
+    let all = spaces(&ana);
+    let bo_id = other_person(&ana);
+    let before = log_sizes(&ana);
+
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let _guard = rt.enter();
+    let key = Arc::new(HybridKeyPair::generate());
+    let responder = *key.public_key().x25519();
+    let mut config = EndpointConfig::new(key, MemoryDirectory::new());
+    config.identity = Some(LocalIdentity {
+        identity: bo_id,
+        signing_key: Arc::new(SigningKey::from_seed(&[42; 32])),
+    });
+    let addr: SocketAddr = format!("127.0.0.1:{}", free_port()).parse().unwrap();
+    let bind = Bind {
+        udp: Some(addr),
+        tcp: None,
+    };
+    let endpoint = rt.block_on(Endpoint::bind(config, bind)).unwrap();
+    let endpoint_addr = EndpointAddr::new(CarrierKind::Udp, addr);
+    let code = Invitation::new(bo_id, responder, endpoint_addr);
+    endpoint.add_secret(SecretEntry::new(&code.secret));
+    let text = code.to_text();
+
+    let accepted = std::thread::scope(|scope| {
+        let accepting = scope.spawn(|| ana.try_cli(&["accept", &text]));
+        rt.block_on(async {
+            let s = tokio::time::timeout(Duration::from_secs(10), endpoint.accept())
+                .await
+                .expect("ana dials")
+                .expect("a session");
+            for label in &all {
+                let wanted = reconcile(&s, *label, MemSet::new()).await;
+                assert!(wanted.is_empty(), "read {} entries", wanted.len());
+                let junk = Message::Objects {
+                    label: *label,
+                    objects: vec![vec![7; 60_000]],
+                };
+                tell(&s, Service::SYNC, junk.to_record()).await;
+            }
+
+            // Far enough along for her to look at the log she holds.
+            let mut hello = tokio::time::timeout(Duration::from_secs(10), s.accept_stream())
+                .await
+                .expect("she says hello")
+                .expect("a stream");
+            let _ = hello.recv_message_max(1 << 16).await;
+            let genesis = ContactMessage::Genesis(b"a genesis".to_vec());
+            let _ = hello
+                .send_message(&Value::Record(genesis.to_record()))
+                .await;
+            if let Ok(Some(mut log)) =
+                tokio::time::timeout(Duration::from_secs(10), s.accept_stream()).await
+            {
+                if let Ok(Some(v)) = log.recv_message_max(1 << 16).await {
+                    let label = v.as_record().and_then(|r| Message::from_record(r).ok());
+                    if let Some(Message::Reconcile { label, .. }) = label {
+                        let nothing_new = Message::Reconcile {
+                            label,
+                            ranges: vec![Range {
+                                upper: None,
+                                mode: Mode::Skip,
+                            }],
+                        };
+                        let _ = log
+                            .send_message(&Value::Record(nothing_new.to_record()))
+                            .await;
+                    }
+                }
+                let _ = log.shutdown().await;
+            }
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        });
+        accepting.join().unwrap()
+    });
+    let said = String::from_utf8_lossy(&accepted.stderr).into_owned()
+        + &String::from_utf8_lossy(&accepted.stdout);
+    assert!(!accepted.status.success(), "{said}");
+    assert!(said.contains("not the one who invited you"), "{said}");
+    assert_eq!(log_sizes(&ana), before, "something was left in her spaces");
+    assert_eq!(spaces(&ana).len(), all.len(), "a space was made");
+}
+
+/// Sends a reconcile of `rounds` lists of ids this device has never seen,
+/// and says how many were answered.
+async fn offer_ids(s: &Session, label: [u8; 32], rounds: u64) -> u64 {
+    const IDS: u64 = 7000;
+    let mut st = s.open_stream(Service::SYNC, Priority::Interactive).unwrap();
+    for round in 0..rounds {
+        let ids = (0..IDS).map(|i| {
+            let mut id = [1; 32];
+            id[..8].copy_from_slice(&(round * IDS + i).to_be_bytes());
+            id
+        });
+        let offer = Message::Reconcile {
+            label,
+            ranges: vec![Range {
+                upper: None,
+                mode: Mode::List(ids.collect()),
+            }],
+        };
+        if st
+            .send_message(&Value::Record(offer.to_record()))
+            .await
+            .is_err()
+        {
+            return round;
+        }
+        let reply = tokio::time::timeout(Duration::from_secs(3), st.recv_message_max(1 << 22));
+        if !matches!(reply.await, Ok(Ok(Some(_)))) {
+            return round;
+        }
+    }
+    rounds
+}
+
+/// A reconcile learns what the other side has. What will never be fetched
+/// is not kept, and what will be fetched is kept only so far.
+#[test]
+fn offers_of_ids_are_not_kept() {
+    if !fuse_available() {
+        eprintln!("skipping: /dev/fuse or fusermount3 is not available");
+        return;
+    }
+    let root = tempfile::tempdir().unwrap();
+    let ana = hosted(root.path(), "ana");
+    let bo = hosted(root.path(), "bo");
+    let t = given_a_token(&ana, &bo);
+    let pid = ana.child.as_ref().unwrap().id();
+
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        let (_endpoint, s) = open(&t, None).await.expect("a good token opens");
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        let before = resident(pid);
+        let answered = offer_ids(&s, [3; 32], 400).await;
+        let grew = resident(pid).saturating_sub(before) >> 20;
+        eprintln!("MEASURE {answered} rounds of ids from a token, ana grew {grew} MiB");
+        assert!(answered > 300, "stopped early at {answered}");
+        assert!(grew < 40, "a token holder made a device keep {grew} MiB");
+    });
+
+    let carol = hosted(root.path(), "carol");
+    let mut cy = hosted(root.path(), "cy");
+    contacts(&carol, &cy);
+    let theirs = spaces(&cy);
+    let shared = spaces(&carol).into_iter().find(|s| theirs.contains(s));
+    let cy_as_modified = Modified::of(&cy, &carol);
+    cy.stop();
+    rt.block_on(async {
+        let (_endpoint, s) = cy_as_modified.open().await.expect("a contact connects");
+        let answered = offer_ids(&s, shared.unwrap(), 40).await;
+        eprintln!("MEASURE a contact was answered {answered} rounds of ids");
+        assert!(answered < 20, "a contact was still heard after {answered}");
+    });
 }

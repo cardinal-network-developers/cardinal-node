@@ -32,6 +32,9 @@ use crate::sched::{PeerStats, Scheduler};
 const PUSH_LIMIT: usize = 900;
 /// Largest message accepted on a stream.
 const MAX_MESSAGE: usize = 48 * 1024 * 1024;
+/// How many ids a reconcile with someone else's device may learn before this
+/// side fetches them. The rest come with the next reconcile.
+const MAX_WANTED: usize = 64 * 1024;
 /// How many of a contact's streams are served at once. The rest wait their
 /// turn, unread, so too many slow only that session.
 const CONTACT_STREAMS: usize = 32;
@@ -122,11 +125,24 @@ impl Daemon {
                     Access::None
                 }
             }
-            PeerKind::Contact(identity, _) | PeerKind::Inviting(identity) => {
+            PeerKind::Contact(identity, _) => {
                 let core = self.core();
                 if *label == identity_log_label(&identity) {
                     Access::Other(identity)
                 } else if Some(*label) == core.identity_label() || core.shares(&identity, label) {
+                    Access::Full
+                } else {
+                    Access::None
+                }
+            }
+            // Not a contact yet, and possibly not who they say: the two
+            // logs, and the one space made for this invitation.
+            PeerKind::Inviting(identity, space) => {
+                if Some(*label) == self.core().identity_label() {
+                    Access::Read
+                } else if *label == identity_log_label(&identity) {
+                    Access::Other(identity)
+                } else if space == Some(*label) {
                     Access::Full
                 } else {
                     Access::None
@@ -162,7 +178,7 @@ pub async fn serve(d: Arc<Daemon>, s: Session, gen: u64) {
                 };
                 let turns = matches!(
                     d.session_kind(&s.peer_static()),
-                    Some(PeerKind::Contact(..) | PeerKind::Inviting(_))
+                    Some(PeerKind::Contact(..) | PeerKind::Inviting(..))
                 )
                 .then(|| contact_streams.clone());
                 let d2 = d.clone();
@@ -245,14 +261,7 @@ async fn handle_stream(d: &Arc<Daemon>, s: &Session, mut st: Stream) -> anyhow::
         st.reset(0);
         return Ok(());
     }
-    // Someone else is not trusted with this device's memory, and has no
-    // need to be: what opens a stream is short, a reconcile 64 KiB at most.
-    let longest = match kind {
-        PeerKind::Token(_) | PeerKind::Contact(..) | PeerKind::Inviting(_) | PeerKind::Stranger => {
-            crate::mailbox::TOKEN_MESSAGE
-        }
-        _ => MAX_MESSAGE,
-    };
+    let longest = longest_from(kind);
     let Some(v) = st.recv_message_max(longest).await? else {
         return Ok(());
     };
@@ -270,6 +279,12 @@ async fn handle_stream(d: &Arc<Daemon>, s: &Session, mut st: Stream) -> anyhow::
             while let Some(reply) = rec.receive(&ranges)? {
                 st.send_message(&to_value(&reply)).await?;
                 if rec.is_done() {
+                    break;
+                }
+                if !access.takes_objects() {
+                    // Nothing will be fetched, so nothing need be kept.
+                    rec.take_wanted();
+                } else if is_someone_else(kind) && rec.wanted_count() >= MAX_WANTED {
                     break;
                 }
                 let Some(v) = st.recv_message_max(longest).await? else {
@@ -328,6 +343,25 @@ async fn handle_stream(d: &Arc<Daemon>, s: &Session, mut st: Stream) -> anyhow::
     Ok(())
 }
 
+/// Whether a peer is someone else's device, and so is not trusted with this
+/// device's memory.
+fn is_someone_else(kind: PeerKind) -> bool {
+    matches!(
+        kind,
+        PeerKind::Token(_) | PeerKind::Contact(..) | PeerKind::Inviting(..) | PeerKind::Stranger
+    )
+}
+
+/// The longest message a peer may send unasked. Someone else has no need of
+/// much: what opens a stream is short, a reconcile 64 KiB at most.
+fn longest_from(kind: PeerKind) -> usize {
+    if is_someone_else(kind) {
+        crate::mailbox::TOKEN_MESSAGE
+    } else {
+        MAX_MESSAGE
+    }
+}
+
 /// Runs a reconciliation of `label` with a peer and fetches what this
 /// side lacks. (Boxed: fetching can lead to another reconciliation.)
 pub fn reconcile<'a>(
@@ -335,12 +369,31 @@ pub fn reconcile<'a>(
     s: &'a Session,
     label: Label,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<()>> + Send + 'a>> {
-    Box::pin(reconcile_inner(d, s, label))
+    Box::pin(async move {
+        let access = d.access(d.classify(s), &label);
+        reconcile_inner(d, s, label, access).await
+    })
 }
 
-async fn reconcile_inner(d: &Arc<Daemon>, s: &Session, label: Label) -> anyhow::Result<()> {
+/// [`reconcile`] on a session this device opened for one purpose, which says
+/// what it is for: the other end's say does not come into it.
+pub async fn reconcile_as(
+    d: &Arc<Daemon>,
+    s: &Session,
+    label: Label,
+    access: Access,
+) -> anyhow::Result<()> {
+    Box::pin(reconcile_inner(d, s, label, access)).await
+}
+
+async fn reconcile_inner(
+    d: &Arc<Daemon>,
+    s: &Session,
+    label: Label,
+    access: Access,
+) -> anyhow::Result<()> {
     let kind = d.classify(s);
-    let access = d.access(kind, &label);
+    let longest = longest_from(kind);
     if !access.takes_objects() {
         return Ok(());
     }
@@ -350,7 +403,7 @@ async fn reconcile_inner(d: &Arc<Daemon>, s: &Session, label: Label) -> anyhow::
     st.send_message(&to_value(&rec.initiate())).await?;
     let mut rounds = 0u32;
     while !rec.is_done() {
-        let Some(v) = tokio::time::timeout(REQUEST_TIMEOUT, st.recv_message_max(MAX_MESSAGE))
+        let Some(v) = tokio::time::timeout(REQUEST_TIMEOUT, st.recv_message_max(longest))
             .await
             .map_err(|_| anyhow::anyhow!("timed out"))??
         else {
@@ -362,6 +415,9 @@ async fn reconcile_inner(d: &Arc<Daemon>, s: &Session, label: Label) -> anyhow::
         match rec.receive(&ranges)? {
             Some(reply) => st.send_message(&to_value(&reply)).await?,
             None => break,
+        }
+        if is_someone_else(kind) && rec.wanted_count() >= MAX_WANTED {
+            break;
         }
         rounds += 1;
         if rounds > 100_000 {
@@ -841,7 +897,7 @@ mod tests {
         assert!(may_fetch_blobs(Some(PeerKind::Own(someone))));
         assert!(may_fetch_blobs(Some(PeerKind::Proven)));
         assert!(!may_fetch_blobs(Some(PeerKind::Contact(someone, someone))));
-        assert!(!may_fetch_blobs(Some(PeerKind::Inviting(someone))));
+        assert!(!may_fetch_blobs(Some(PeerKind::Inviting(someone, None))));
         assert!(!may_fetch_blobs(Some(PeerKind::Token([1; 16]))));
         assert!(!may_fetch_blobs(Some(PeerKind::Restoring)));
         assert!(!may_fetch_blobs(Some(PeerKind::Stranger)));

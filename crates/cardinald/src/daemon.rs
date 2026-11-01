@@ -43,9 +43,11 @@ pub enum PeerKind {
     /// A device of someone this person has a relationship with (their
     /// identity, and the device's signing key).
     Contact([u8; 32], KeyId),
-    /// A session opened with an invitation, with the identity that used it
-    /// or gave it, before they have a relationship.
-    Inviting([u8; 32]),
+    /// A session opened with an invitation, before they have a relationship:
+    /// the identity that used it or gave it, which is only a claim until
+    /// that person's log says otherwise, and the space made for it, once
+    /// there is one.
+    Inviting([u8; 32], Option<SpaceId>),
     /// A session opened with a delivery token, by someone this device need
     /// not know (`hosts.md#delivery-tokens`).
     Token(crate::mailbox::Token),
@@ -264,6 +266,9 @@ pub struct Daemon {
     /// How the person will regard whoever uses each outstanding invitation,
     /// by its secret's id.
     invitations: Mutex<HashMap<u64, account::Regard>>,
+    /// The space made for each invitation's session, by the peer's static
+    /// key.
+    invited: Mutex<HashMap<[u8; 32], SpaceId>>,
     /// Held while this device's own account nodes are checked and
     /// written, so concurrent housekeeping writes them once.
     placement_lock: Mutex<()>,
@@ -390,6 +395,7 @@ impl Daemon {
             cleanup: crate::cleanup::Cleaner::load(old_versions),
             speedtest: crate::speedtest::Limiter::default(),
             invitations: Mutex::new(HashMap::new()),
+            invited: Mutex::new(HashMap::new()),
             placement_lock: Mutex::new(()),
             stopping: watch::channel(false).0,
             next_gen: AtomicU64::new(1),
@@ -473,7 +479,18 @@ impl Daemon {
         }
         if self.is_invitation(s) {
             if let Some(p) = s.peer_identity() {
-                return PeerKind::Inviting(p.identity);
+                let shut_out = {
+                    let core = self.core();
+                    let contacts = core.contacts();
+                    let refused =
+                        |c: &account::ContactRecord| c.identity == p.identity && c.refused;
+                    core.identity.as_ref().map(|i| i.id()) == Some(p.identity)
+                        || contacts.iter().any(refused)
+                };
+                if !shut_out {
+                    let space = lock(&self.invited).get(&ps).copied();
+                    return PeerKind::Inviting(p.identity, space);
+                }
             }
         }
         PeerKind::Stranger
@@ -545,7 +562,7 @@ impl Daemon {
             .values()
             .filter(|c| !c.session.is_closed())
             .filter_map(|c| match c.kind {
-                PeerKind::Contact(identity, _) | PeerKind::Inviting(identity) => Some(identity),
+                PeerKind::Contact(identity, _) | PeerKind::Inviting(identity, _) => Some(identity),
                 _ => None,
             })
             .collect()
@@ -564,6 +581,11 @@ impl Daemon {
             }
             _ => None,
         }
+    }
+
+    /// `space` is what `s`'s invitation was for: all of a session it opens.
+    pub fn invited_to(&self, s: &Session, space: SpaceId) {
+        lock(&self.invited).insert(s.peer_static(), space);
     }
 
     /// `s` has done what its invitation was for.
@@ -649,6 +671,12 @@ impl Daemon {
     pub fn on_session(self: &Arc<Self>, s: Session) {
         let kind = self.classify(&s);
         if kind == PeerKind::Stranger {
+            // Someone refused may hold an invitation still. They hear what
+            // anyone hears from a device that is off.
+            if self.is_invitation(&s) {
+                s.abandon();
+                return;
+            }
             tracing::info!("closing a session with an unknown device");
             s.close("unknown device");
             return;
@@ -689,7 +717,7 @@ impl Daemon {
             PeerKind::Own(k) => self.device_name(&k),
             PeerKind::Restoring | PeerKind::Proven => "a device restoring".into(),
             PeerKind::Contact(_, _) => "a contact's device".into(),
-            PeerKind::Inviting(_) => "someone with an invitation".into(),
+            PeerKind::Inviting(..) => "someone with an invitation".into(),
             PeerKind::Token(_) => "someone with a token".into(),
             _ => "the device being paired".into(),
         };
@@ -729,7 +757,7 @@ impl Daemon {
             });
             return;
         }
-        if matches!(kind, PeerKind::Inviting(_) | PeerKind::Token(_)) {
+        if matches!(kind, PeerKind::Inviting(..) | PeerKind::Token(_)) {
             return;
         }
         tokio::spawn(async move { net::sync_all(&d, &s).await });
@@ -741,6 +769,7 @@ impl Daemon {
         if m.get(peer_static).is_some_and(|c| c.gen == gen) {
             m.remove(peer_static);
             lock(&self.proven).remove(peer_static);
+            lock(&self.invited).remove(peer_static);
             tracing::info!("disconnected from {}", short(peer_static));
             crate::rendezvous::session_closed(self, peer_static);
             // A device has one session with another, so a fetch may have
@@ -855,6 +884,13 @@ impl Daemon {
             // Without a word: a contact no longer trusted must not be able
             // to tell this from a device being off.
             if matches!(c.kind, PeerKind::Contact(..)) && !matches!(kind, PeerKind::Contact(..)) {
+                c.session.abandon();
+            }
+            // Refused while still using an invitation.
+            if matches!(c.kind, PeerKind::Inviting(..))
+                && kind == PeerKind::Stranger
+                && self.is_invitation(&c.session)
+            {
                 c.session.abandon();
             }
             if let Some(x) = lock(&self.sessions).get_mut(&c.session.peer_static()) {

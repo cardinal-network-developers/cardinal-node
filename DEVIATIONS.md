@@ -697,9 +697,14 @@ asks for around that is not built yet.
   so a contact, or a host someone fetches from, can send junk that is kept. A
   token holder cannot: a host takes no objects from one.
 - **A contact's memory limit is per session.** A session serves 32 of a
-  contact's streams at once, each opening with at most 256 KiB, so one holds
-  about 8 MiB of a device's memory. Someone can add devices to their own
-  identity, and each gets a session.
+  contact's streams at once, each opening with at most 256 KiB, and a
+  reconcile learns at most 65,536 ids before fetching them, so one holds a few
+  MiB of a device's memory for each stream. Someone can add devices to their
+  own identity, and each gets a session.
+- **A host counts itself as having fetched nothing.** Taking envelopes in
+  records the host as a fetcher that never acknowledges, so acknowledgements
+  from the owner's other devices free nothing and retention does. Nothing asks
+  a host for envelopes yet except itself, which lets go of them one by one.
 - **A new epoch notices only this identity's key changes.** It is wrapped for
   every member, but a change of another member's encryption key does not make
   one due here, which `spaces.md#when-to-rotate` asks for.
