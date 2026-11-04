@@ -1,6 +1,6 @@
 //! Random-access reading of blobs, fetching missing objects on demand.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::{self, Read, Seek, SeekFrom};
 use std::sync::Arc;
 
@@ -188,7 +188,9 @@ impl<'f, S: ObjectStore, F: Fetch + ?Sized> BlobReader<'f, S, F> {
                     if o >= hi {
                         break;
                     }
-                    if o + child.len > lo {
+                    // An entry that covers nothing holds nothing to read,
+                    // however many times it is named.
+                    if child.len > 0 && o + child.len > lo {
                         next.push((*child, o));
                     }
                     o += child.len;
@@ -306,7 +308,7 @@ impl<'f, S: ObjectStore, F: Fetch + ?Sized> BlobReader<'f, S, F> {
         Ok(())
     }
 
-    /// Calls `f` with the id of every object of the blob (indexes before
+    /// Calls `f` once with the id of every object of the blob (indexes before
     /// the chunks they name), fetching indexes as needed but not chunks.
     /// This is the set a "full" retention policy keeps for this blob.
     pub fn for_each_object(&mut self, mut f: impl FnMut(&Id)) -> Result<(), BlobError> {
@@ -324,7 +326,8 @@ impl<'f, S: ObjectStore, F: Fetch + ?Sized> BlobReader<'f, S, F> {
         level: u64,
         f: &mut impl FnMut(&Id),
     ) -> Result<(), BlobError> {
-        self.walk_entries(entry, level, &mut |e, _| f(&e.id))
+        let mut seen = HashSet::new();
+        self.walk_entries(entry, level, &mut |e, _| f(&e.id), &mut seen)
     }
 
     /// Like [`for_each_object`](Self::for_each_object), with each object's
@@ -339,22 +342,32 @@ impl<'f, S: ObjectStore, F: Fetch + ?Sized> BlobReader<'f, S, F> {
             f(&top, true);
             return Ok(());
         }
-        self.walk_entries(top, self.reference.levels - 1, &mut f)
+        let mut seen = HashSet::new();
+        self.walk_entries(top, self.reference.levels - 1, &mut f, &mut seen)
     }
 
+    /// Each object once, however many times it is named: a tree that names
+    /// one index over and over costs what is in it, not what it claims.
     fn walk_entries(
         &mut self,
         entry: IndexEntry,
         level: u64,
         f: &mut impl FnMut(&IndexEntry, bool),
+        seen: &mut HashSet<Id>,
     ) -> Result<(), BlobError> {
+        if !seen.insert(entry.id) {
+            return Ok(());
+        }
         f(&entry, false);
         let index = self.indexes(&[entry], level)?.remove(0);
         for child in &index.entries {
             if level == 0 {
-                f(child, true);
+                // Repeated content names one chunk many times: once is enough.
+                if seen.insert(child.id) {
+                    f(child, true);
+                }
             } else {
-                self.walk_entries(*child, level - 1, f)?;
+                self.walk_entries(*child, level - 1, f, seen)?;
             }
         }
         Ok(())

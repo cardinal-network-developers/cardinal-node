@@ -195,16 +195,13 @@ pub fn cancel_invitation(d: &Arc<Daemon>, id: &str) -> anyhow::Result<Json> {
 /// device as on all their others, and stops for one that is used up,
 /// cancelled or too old, wherever that happened.
 pub fn admit_invitations(d: &Daemon) {
-    let outstanding: Vec<(Invitation, Regard, u64)> = made(d)
+    let outstanding: Vec<(Invitation, Regard)> = made(d)
         .into_iter()
         .filter(Made::outstanding)
-        .map(|m| {
-            let left = m.invitation.uses - m.record.used as u64;
-            (m.invitation, m.record.regard, left)
-        })
+        .map(|m| (m.invitation, m.record.regard))
         .collect();
     let wanted: std::collections::HashSet<[u8; 16]> =
-        outstanding.iter().map(|(i, ..)| i.secret).collect();
+        outstanding.iter().map(|(i, _)| i.secret).collect();
     let mut admitted = d.admitted_invitations();
     admitted.retain(|secret, id| {
         let keep = wanted.contains(secret);
@@ -214,15 +211,15 @@ pub fn admit_invitations(d: &Daemon) {
         }
         keep
     });
-    for (invitation, regard, left) in outstanding {
+    for (invitation, regard) in outstanding {
         if admitted.contains_key(&invitation.secret) {
             continue;
         }
-        // The link counts what is left, so two people at once on one device
-        // cannot both get in. Each device counts its own, and the account
-        // counts what is done: two devices apart can let in one more each.
+        // The link would count a use for any session that confirms, though
+        // nothing came of it. The account counts what is done, and an
+        // exchange holds a use while it runs (`take_a_use`).
         let mut entry = SecretEntry::new(&invitation.secret);
-        entry.uses = Some(u32::try_from(left).unwrap_or(u32::MAX));
+        entry.uses = None;
         let id = d.endpoint.add_secret(entry);
         d.invitation_made(id, regard);
         admitted.insert(invitation.secret, id);
@@ -440,11 +437,14 @@ pub async fn serve(d: &Arc<Daemon>, s: &Session, mut st: Stream) -> anyhow::Resu
         return Ok(());
     };
     // Held until the exchange ends: two at once cannot both use one use.
-    let Some(_use) = take_a_use(d, s) else {
+    let Some(using) = take_a_use(d, s) else {
         s.abandon();
         return Ok(());
     };
-    let Some(ContactMessage::Hello { identity, name }) = receive(&mut st).await? else {
+    // A use is held only while something comes of it.
+    let hello = tokio::time::timeout(EXCHANGE_WITHIN, receive(&mut st)).await;
+    let Ok(Ok(Some(ContactMessage::Hello { identity, name }))) = hello else {
+        s.abandon();
         return Ok(());
     };
     anyhow::ensure!(identity == them, "not who the session says");
@@ -465,6 +465,8 @@ pub async fn serve(d: &Arc<Daemon>, s: &Session, mut st: Stream) -> anyhow::Resu
         if let Err(e) = invitation_used(d, s, &them) {
             tracing::debug!("counting an invitation's use: {e:#}");
         }
+        // The account counts it now.
+        drop(using);
         mailbox::met(d, &space, &them);
         d.invitation_finished(s);
         remember(d, s);
@@ -706,50 +708,87 @@ async fn encode_attachments(
     .await?
 }
 
-/// The objects of what was attached in the space shared with `who`: all a
-/// contact may fetch from here (`sync.md#blob-transfer`). Worked out again
-/// only when the space has grown.
-pub fn shared_blobs(d: &Daemon, who: &[u8; 32]) -> Arc<HashSet<[u8; 32]>> {
-    let found = {
+/// The objects of the files this person attached in the space shared with
+/// `who`: all a contact may fetch from here (`sync.md#blob-transfer`). Only
+/// this person's own: a reference the contact wrote could name anything.
+/// Worked out again only when the space has grown, and away from the runtime.
+pub async fn shared_blobs(d: &Arc<Daemon>, who: &[u8; 32]) -> Arc<HashSet<[u8; 32]>> {
+    let size = {
         let core = d.core();
         let contacts = core.contacts();
         let space = contacts
             .iter()
             .find(|c| c.identity == *who)
             .map(|c| c.space);
-        let held = space.and_then(|s| core.spaces.get(&s));
-        held.and_then(|h| {
-            let open = h.space.as_ref()?;
-            let attached: Vec<relationship::Attachment> = relationship::messages(open)
-                .into_iter()
-                .flat_map(|m| m.attachments)
-                .collect();
-            Some((h.set_len(), attached))
-        })
+        space
+            .and_then(|s| core.spaces.get(&s))
+            .map(|h| (h.id, h.set_len()))
     };
-    let Some((size, attached)) = found else {
+    let Some((space, size)) = size else {
         return Arc::default();
     };
-    let cache = d.shared_blobs.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some((_, ids)) = cache.get(who).filter(|(was, _)| *was == size) {
-        return ids.clone();
+    {
+        let cache = d.shared_blobs.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((_, ids)) = cache.get(who).filter(|(was, _)| *was == size) {
+            return ids.clone();
+        }
     }
-    drop(cache);
-    let mut ids = HashSet::new();
-    for a in &attached {
-        let Ok(blob) = BlobRef::from_record(&a.blob) else {
-            continue;
+    let (d, who) = (d.clone(), *who);
+    let worked_out = tokio::task::spawn_blocking(move || {
+        let attached: Vec<relationship::Attachment> = {
+            let core = d.core();
+            let me = core.identity.as_ref().map(|i| i.id());
+            let open = core.spaces.get(&space).and_then(|h| h.space.as_ref());
+            let all = open.map(relationship::messages).unwrap_or_default();
+            let mine = all.into_iter().filter(|m| Some(m.author) == me);
+            mine.flat_map(|m| m.attachments).collect()
         };
-        // What this device holds of it: an index it has not got names nothing.
-        let mut reader = BlobReader::new(&*d.store, &NoFetch, blob);
-        let _ = reader.for_each_object(|id| {
-            ids.insert(*id);
-        });
+        let (mut files, mut ids) = (HashSet::new(), HashSet::new());
+        for a in &attached {
+            let Ok(blob) = BlobRef::from_record(&a.blob) else {
+                continue;
+            };
+            // The same file attached again is the same objects.
+            if !files.insert(blob.id) {
+                continue;
+            }
+            // What this device holds of it: an index it has not got names nothing.
+            let mut reader = BlobReader::new(&*d.store, &NoFetch, blob);
+            let _ = reader.for_each_object(|id| {
+                ids.insert(*id);
+            });
+        }
+        let ids = Arc::new(ids);
+        let mut cache = d.shared_blobs.lock().unwrap_or_else(|e| e.into_inner());
+        cache.insert(who, (size, ids.clone()));
+        ids
+    });
+    worked_out.await.unwrap_or_default()
+}
+
+/// Writes a whole blob to `out`, and says how much.
+fn write_out<S: cardinal_blob::ObjectStore, F: cardinal_blob::Fetch>(
+    reader: &mut BlobReader<'_, S, F>,
+    out: &mut std::fs::File,
+) -> anyhow::Result<u64> {
+    use std::io::Write;
+    let size = reader.size();
+    let mut at = 0u64;
+    while at < size {
+        let piece = match reader.read_range(at, 1 << 20) {
+            Ok(p) if !p.is_empty() => p,
+            Ok(_) => {
+                anyhow::bail!("part of it could not be fetched; try again when they are online")
+            }
+            Err(e) => {
+                tracing::debug!("reading an attachment: {e}");
+                anyhow::bail!("part of it could not be fetched; try again when they are online")
+            }
+        };
+        out.write_all(&piece)?;
+        at += piece.len() as u64;
     }
-    let ids = Arc::new(ids);
-    let mut cache = d.shared_blobs.lock().unwrap_or_else(|e| e.into_inner());
-    cache.insert(*who, (size, ids.clone()));
-    ids
+    Ok(size)
 }
 
 /// Saves a file attached to a message at `to`, fetching from this person's
@@ -773,29 +812,43 @@ pub async fn save_attachment(
     let (d, them) = (d.clone(), contact.identity);
     let written = to.clone();
     let size = tokio::task::spawn_blocking(move || -> anyhow::Result<u64> {
-        use std::io::Write;
         let fetch = crate::fetch::Fetcher::from_contact(&d, Priority::Interactive, them);
         let mut reader = BlobReader::new(&*d.store, &fetch, blob);
-        let size = reader.size();
-        let part = written.with_extension("part");
-        let mut out = std::fs::File::create(&part)?;
-        let mut at = 0u64;
-        while at < size {
-            let piece = match reader.read_range(at, 1 << 20) {
-                Ok(p) if !p.is_empty() => p,
-                _ => {
-                    let _ = std::fs::remove_file(&part);
-                    anyhow::bail!(
-                        "part of it could not be fetched; try again when they are online"
-                    );
+        // Beside it, new, and gone again whatever happens: nothing that was
+        // there is touched, and nothing is followed.
+        let mut part = written.clone().into_os_string();
+        part.push(".part");
+        let part = std::path::PathBuf::from(part);
+        let mut out = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&part)?;
+        let wrote = write_out(&mut reader, &mut out).and_then(|size| {
+            out.sync_all()?;
+            // A link, unlike a rename, will not replace a file that came to
+            // be there meanwhile.
+            match std::fs::hard_link(&part, &written) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                    anyhow::bail!("{} is there already", written.display())
                 }
-            };
-            out.write_all(&piece)?;
-            at += piece.len() as u64;
-        }
-        out.sync_all()?;
-        std::fs::rename(&part, &written)?;
-        Ok(size)
+                // No hard links here (Android's app storage): a rename, if
+                // nothing is in the way.
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::Unsupported
+                    ) =>
+                {
+                    anyhow::ensure!(!written.exists(), "{} is there already", written.display());
+                    std::fs::rename(&part, &written)?;
+                }
+                Err(e) => anyhow::bail!("cannot save it at {}: {e}", written.display()),
+            }
+            Ok(size)
+        });
+        let _ = std::fs::remove_file(&part);
+        wrote
     })
     .await??;
     Ok(json!({"path": to, "size": size}))
@@ -870,15 +923,29 @@ pub fn react(d: &Arc<Daemon>, who: &str, id: &str, text: &str) -> anyhow::Result
         "that is too long for a reaction"
     );
     let me = d.core().identity.as_ref().map(|i| i.id());
-    let mine = m.reactions.iter().find(|r| Some(r.author) == me);
-    let op = match (mine, text.is_empty()) {
-        (Some(r), true) => SpaceOp::delete(r.id),
-        (Some(r), false) if r.text == text => return Ok(json!({})),
-        (Some(r), false) => relationship::set_reaction(r.id, text),
-        (None, true) => return Ok(json!({})),
-        (None, false) => relationship::create_reaction(m.id, text),
-    };
-    d.write_and_push(&contact.space, vec![op])?;
+    // The one shown is the last of this person's (`reactions_of`); any
+    // others, from devices apart, go when this one changes.
+    let mine: Vec<&relationship::Reaction> = m
+        .reactions
+        .iter()
+        .filter(|r| Some(r.author) == me)
+        .collect();
+    let mut ops: Vec<SpaceOp> = Vec::new();
+    match (mine.last(), text.is_empty()) {
+        (Some(_), true) => ops.extend(mine.iter().map(|r| SpaceOp::delete(r.id))),
+        (Some(r), false) => {
+            ops.extend(mine[..mine.len() - 1].iter().map(|r| SpaceOp::delete(r.id)));
+            if r.text != text {
+                ops.push(relationship::set_reaction(r.id, text));
+            }
+        }
+        (None, true) => {}
+        (None, false) => ops.push(relationship::create_reaction(m.id, text)),
+    }
+    if ops.is_empty() {
+        return Ok(json!({}));
+    }
+    d.write_and_push(&contact.space, ops)?;
     confirm(d, contact.space, contact.identity);
     Ok(json!({}))
 }

@@ -563,6 +563,19 @@ fn old_line(old: &Value) -> Option<String> {
     ))
 }
 
+/// Someone else's words, with nothing in them the terminal would act on.
+fn printable(s: &str) -> String {
+    s.chars()
+        .map(|c| {
+            if c.is_control() && c != '\n' {
+                '\u{fffd}'
+            } else {
+                c
+            }
+        })
+        .collect()
+}
+
 fn human_size(n: u64) -> String {
     let units = ["B", "kB", "MB", "GB", "TB"];
     let mut x = n as f64;
@@ -1389,13 +1402,13 @@ async fn client(cmd: Cmd) -> anyhow::Result<()> {
                 } else {
                     who.as_str()
                 };
-                println!("{by}: {}", m["text"].as_str().unwrap_or(""));
+                println!("{by}: {}", printable(m["text"].as_str().unwrap_or("")));
                 let files = m["attachments"].as_array().cloned().unwrap_or_default();
                 for (n, a) in files.iter().enumerate() {
                     let size = a["size"].as_u64().map(human_size).unwrap_or_default();
                     println!(
                         "    {} ({size}): cardinal save {who} {} {} PATH",
-                        a["name"].as_str().unwrap_or(""),
+                        printable(a["name"].as_str().unwrap_or("")),
                         m["id"].as_str().unwrap_or(""),
                         n + 1
                     );

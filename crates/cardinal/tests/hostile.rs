@@ -1092,3 +1092,57 @@ fn a_host_renews_each_reach_node_once() {
         "a host keeps writing"
     );
 }
+
+/// An invitation's session that ends before anything is said, as when a
+/// network drops, does not use up the invitation: the person can try again.
+#[test]
+fn a_try_that_never_got_going_leaves_the_invitation() {
+    if !fuse_available() {
+        eprintln!("skipping: /dev/fuse or fusermount3 is not available");
+        return;
+    }
+    let root = tempfile::tempdir().unwrap();
+    let ana = hosted(root.path(), "ana");
+    let bo = hosted(root.path(), "bo");
+    let at = format!("127.0.0.1:{}", ana.port);
+    let code = ana.cli(&["invite", "--address", &at, "--name", "Ana"]);
+    let code = code.trim().to_owned();
+    std::thread::sleep(Duration::from_secs(1));
+    let invitation = Invitation::from_text(&code).unwrap();
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        let key = Arc::new(HybridKeyPair::generate());
+        let mut config = EndpointConfig::new(key, MemoryDirectory::new());
+        config.connect_timeout = Duration::from_secs(3);
+        let bind = Bind {
+            udp: Some("127.0.0.1:0".parse().unwrap()),
+            tcp: None,
+        };
+        let endpoint = Endpoint::bind(config, bind).await.unwrap();
+        let target = Target::invitation(
+            at.parse().unwrap(),
+            CarrierKind::Udp,
+            invitation.responder_static,
+            &invitation.secret,
+        );
+        let s = endpoint
+            .connect(target)
+            .await
+            .expect("the invitation opens");
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        s.abandon();
+    });
+    std::thread::sleep(Duration::from_secs(1));
+    let out = bo.try_cli(&["accept", &code]);
+    eprintln!(
+        "accept: {} {} {}",
+        out.status,
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    eprintln!("ana's invitations:\n{}", ana.cli(&["invitations"]));
+    assert!(
+        out.status.success(),
+        "a try that never got going used it up"
+    );
+}

@@ -179,6 +179,21 @@ fn each_member_reacts_for_themselves() {
     assert_eq!(said(&p.a)[0].reactions.len(), 1);
 }
 
+/// A read marker stands at a message, and one naming nothing known is not
+/// taken either.
+#[test]
+fn a_marker_at_nothing_known_is_not_taken() {
+    let mut p = relationship_of(person(51, 0), person(52, 0));
+    let c = p.c;
+    p.bo_writes(vec![relationship::create_message(c, "hi")]);
+    let me = p.ana.log.id();
+    p.ana_writes(vec![relationship::create_read_marker(c, [9; 16])]);
+    assert!(relationship::read_marker(&p.b, &me).is_none());
+    let m = said(&p.b)[0].id;
+    p.ana_writes(vec![relationship::create_read_marker(c, m)]);
+    assert!(relationship::read_marker(&p.b, &me).is_some());
+}
+
 /// A reply names the message it answers, and one naming nothing known is not
 /// taken, as an op naming an unknown node is not (`state.md`).
 #[test]

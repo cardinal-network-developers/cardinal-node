@@ -366,6 +366,14 @@ impl FsStore {
     }
 }
 
+/// Whether an error says this file system does not do hard links.
+fn no_links(e: &io::Error) -> bool {
+    matches!(
+        e.kind(),
+        io::ErrorKind::PermissionDenied | io::ErrorKind::Unsupported
+    ) || e.raw_os_error() == Some(1)
+}
+
 impl ObjectStore for FsStore {
     fn has(&self, id: &Id) -> io::Result<bool> {
         match fs::symlink_metadata(self.path_of(id)) {
@@ -406,6 +414,10 @@ impl ObjectStore for FsStore {
             match fs::hard_link(&tmp, &path) {
                 Ok(()) => Ok(true),
                 Err(e) if e.kind() == io::ErrorKind::AlreadyExists => Ok(false),
+                // Some systems allow no hard links, Android's app storage
+                // among them. A rename does as well for content named by
+                // its hash: what it might replace is the same bytes.
+                Err(e) if no_links(&e) => fs::rename(&tmp, &path).map(|()| true),
                 Err(e) => Err(e),
             }
         })();

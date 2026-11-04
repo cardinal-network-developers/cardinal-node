@@ -142,9 +142,16 @@ struct Meta {
 
 /// The field of a node of `kind` that a profile declares to hold a node id,
 /// which names that node as surely as an op does (`state.md#state-tree`): a
-/// message's "in reply to".
+/// message's "in reply to", and the message a read marker stands at.
 fn node_field(profile: Profile, kind: NodeKind) -> Option<u64> {
-    (profile == Profile::RELATIONSHIP && kind == NodeKind::Uint(2)).then_some(3)
+    if profile != Profile::RELATIONSHIP {
+        return None;
+    }
+    match kind {
+        NodeKind::Uint(2) => Some(3),
+        NodeKind::Uint(4) => Some(1),
+        _ => None,
+    }
 }
 
 /// Whether a value in a field that holds a node id names a node that is known.

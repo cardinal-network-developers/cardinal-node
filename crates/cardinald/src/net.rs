@@ -249,13 +249,27 @@ async fn handle_stream(d: &Arc<Daemon>, s: &Session, mut st: Stream) -> anyhow::
     }
     if st.service() == Service::BLOB {
         let kind = d.session_kind(&s.peer_static());
-        let allowed = match kind {
-            k if may_fetch_blobs(k) => None,
-            // A contact gets what was attached in the spaces they share.
-            Some(PeerKind::Contact(who, _)) => Some(crate::contacts::shared_blobs(d, &who)),
-            _ => {
-                st.reset(0);
-                return Ok(());
+        let allowed = if may_fetch_blobs(kind) {
+            None
+        } else {
+            // Who it is now: an invitation's session is a contact's once
+            // the two have met, and goes on as theirs.
+            match d.classify(s) {
+                // A contact gets what was attached in the spaces they share.
+                PeerKind::Contact(who, _) => {
+                    let shared = crate::contacts::shared_blobs(d, &who).await;
+                    tracing::debug!(
+                        "{} may fetch {} objects of what was sent them",
+                        short(&who),
+                        shared.len()
+                    );
+                    Some(shared)
+                }
+                other => {
+                    tracing::debug!("no blobs for {} ({other:?})", short(&s.peer_static()));
+                    st.reset(0);
+                    return Ok(());
+                }
             }
         };
         tracing::trace!("blob stream {} accepted", st.id());
@@ -634,6 +648,12 @@ async fn serve_blob(
         })
     })
     .await?;
+    let held = reply
+        .items
+        .iter()
+        .filter(|i| matches!(i, cardinal_sync::BlobItem::Held { .. }))
+        .count();
+    tracing::debug!("serving {held} of {} objects asked for", reply.items.len());
     let bytes = tokio::task::spawn_blocking(move || reply.encode()).await?;
     if let Some(ms) = test_blob_delay() {
         static SLOW_LINK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
@@ -794,7 +814,13 @@ impl BlobFetch {
         self.peers_checked = Some(Instant::now());
         let mut sessions = self.d.own_sessions();
         if let Some(who) = self.from {
-            sessions.extend(self.d.sessions_of(&who));
+            let theirs = self.d.sessions_of(&who);
+            tracing::debug!(
+                "fetching from {} of {}'s devices too",
+                theirs.len(),
+                short(&who)
+            );
+            sessions.extend(theirs);
         }
         let stats = self.d.blob_stats.lock().unwrap_or_else(|e| e.into_inner());
         let peers: Vec<([u8; 32], PeerStats)> = sessions

@@ -662,3 +662,52 @@ fn the_hosts_reply_time_says_nothing_of_who_is_there() {
         "the reply time tells whether ana's laptop is present"
     );
 }
+
+/// Bo accepts Ana's invitation from behind a NAT, so the session the
+/// invitation opened stays theirs: nobody can open another to him. A file Ana
+/// sends still reaches him through it.
+#[test]
+fn a_file_comes_through_the_session_an_invitation_opened() {
+    if !fuse_available() {
+        eprintln!("skipping: /dev/fuse or fusermount3 is not available");
+        return;
+    }
+    let root = tempfile::tempdir().unwrap();
+    let mut ana = Dev::new(root.path(), "ana", free_port());
+    ana.start();
+    ana.cli(&["init", "--yes", "--name", "ana"]);
+    ana.wait_mounted();
+    let nat = Nat::new(Kind::Symmetric);
+    let mut bo = Dev::new(root.path(), "bo", free_port());
+    bo.env
+        .push(("CARDINAL_TEST_UDP_GATEWAY".into(), nat.gateway.to_string()));
+    bo.start();
+    bo.cli(&["init", "--yes", "--name", "bo"]);
+    bo.wait_mounted();
+    let at = format!("127.0.0.1:{}", ana.port);
+    let code = ana.cli(&["invite", "--address", &at, "--name", "Ana"]);
+    bo.cli(&["accept", code.trim(), "--name", "Ana"]);
+    wait("they are connected", 30, || {
+        the_contact(&bo)["connected"] == true
+    });
+
+    let photo: Vec<u8> = (0..300_000u32).map(|n| (n * 13 % 251) as u8).collect();
+    let path = root.path().join("photo.jpg");
+    std::fs::write(&path, &photo).unwrap();
+    let attach = json!([path.to_str().unwrap()]);
+    ask(
+        &ana,
+        json!({"cmd": "say", "who": "bo", "text": "a photo", "attach": attach}),
+    );
+    let said = |d: &Dev| ask(d, json!({"cmd": "messages", "who": "Ana"}))["messages"].clone();
+    wait("bo has it", 20, || {
+        said(&bo).as_array().is_some_and(|m| m.len() == 1)
+    });
+    let id = said(&bo)[0]["id"].clone();
+    let to = root.path().join("saved.jpg");
+    ask(
+        &bo,
+        json!({"cmd": "save-attachment", "who": "Ana", "id": id, "index": 0, "to": to}),
+    );
+    assert_eq!(std::fs::read(&to).unwrap(), photo);
+}
