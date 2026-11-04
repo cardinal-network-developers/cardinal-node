@@ -751,20 +751,23 @@ pub fn met(d: &Daemon, space: &SpaceId, member: &[u8; 32]) {
 
 /// A host in use, until this goes.
 struct Going<'a> {
-    d: &'a Daemon,
+    going: &'a Mutex<HashSet<[u8; 32]>>,
     host: [u8; 32],
 }
 
 impl Drop for Going<'_> {
     fn drop(&mut self) {
-        lock(&self.d.mailbox.going).remove(&self.host);
+        lock(self.going).remove(&self.host);
     }
 }
 
 fn going_to(d: &Daemon, host: [u8; 32]) -> Option<Going<'_>> {
-    lock(&d.mailbox.going)
-        .insert(host)
-        .then_some(Going { d, host })
+    claim(&d.mailbox.going, host)
+}
+
+fn claim(going: &Mutex<HashSet<[u8; 32]>>, host: [u8; 32]) -> Option<Going<'_>> {
+    // Lazily: a guard made and dropped here would take the lock held here.
+    lock(going).insert(host).then(|| Going { going, host })
 }
 
 /// Where to try the hosts in `reach`.
@@ -1108,6 +1111,24 @@ pub fn start(d: Arc<Daemon>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A second claim on a host in use once hung the thread that made it.
+    #[test]
+    fn a_host_in_use_is_refused_and_freed() {
+        let going = Arc::new(Mutex::new(HashSet::new()));
+        let g = going.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let first = claim(&g, [1; 32]);
+            let second = claim(&g, [1; 32]);
+            let other = claim(&g, [2; 32]);
+            let refused = first.is_some() && second.is_none() && other.is_some();
+            drop(first);
+            let _ = tx.send(refused && claim(&g, [1; 32]).is_some());
+        });
+        let ok = rx.recv_timeout(Duration::from_secs(5));
+        assert_eq!(ok, Ok(true), "a second claim hangs or is let through");
+    }
     use cardinal_crypto::aead::xchacha20poly1305_encrypt;
     use cardinal_space::grant::Endpoint;
     use cardinal_space::EpochKey;
