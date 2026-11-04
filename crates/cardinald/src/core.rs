@@ -814,9 +814,21 @@ impl Core {
     pub fn space_of_token(&self, token: &[u8; 16]) -> Option<SpaceId> {
         let me = self.identity.as_ref()?.id();
         self.spaces.keys().copied().find(|id| {
-            self.reach_of(id, &me)
-                .is_some_and(|(_, reach)| reach.iter().any(|r| r.token == *token))
+            let reach = self.all_reach_of(id, &me);
+            reach.iter().any(|r| r.token == *token)
         })
+    }
+
+    /// Every host and token `who` gave in a space, from all their reach nodes.
+    pub fn all_reach_of(
+        &self,
+        space: &SpaceId,
+        who: &[u8; 32],
+    ) -> Vec<cardinal_space::relationship::Reach> {
+        let Some(h) = self.spaces.get(space).and_then(|h| h.space.as_ref()) else {
+            return Vec::new();
+        };
+        cardinal_space::relationship::all_reach_of(h.state(), who)
     }
 
     /// The current epoch of a space, and its envelope key.

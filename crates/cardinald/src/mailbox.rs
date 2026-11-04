@@ -335,6 +335,8 @@ pub struct Mailbox {
     going: Mutex<HashSet<[u8; 32]>>,
     /// When each space was last fetched for an envelope's sake.
     pulled: Mutex<HashMap<SpaceId, Instant>>,
+    /// Held while this device writes where to reach its person.
+    reaching: tokio::sync::Mutex<()>,
 }
 
 fn sent_key(space: &SpaceId, member: &[u8; 32]) -> String {
@@ -365,6 +367,7 @@ impl Mailbox {
             sent_path,
             going: Mutex::new(HashSet::new()),
             pulled: Mutex::new(HashMap::new()),
+            reaching: tokio::sync::Mutex::new(()),
         }
     }
 
@@ -663,6 +666,9 @@ async fn reach_here(d: &Arc<Daemon>) -> Vec<Reach> {
 /// Writes where this person can be reached about a space, if they have a
 /// host and have not said yet.
 pub async fn write_reach(d: &Arc<Daemon>, space: &SpaceId) -> anyhow::Result<()> {
+    // One at a time: two that both found none would each register a token and
+    // write a node, and leave a token that leads nowhere.
+    let _one = d.mailbox.reaching.lock().await;
     let me = d.core().identity.as_ref().map(|i| i.id());
     let Some(me) = me else {
         return Ok(());
@@ -684,10 +690,7 @@ fn tokens_here(d: &Daemon, space: &SpaceId) -> Vec<Token> {
     let Some(me) = core.identity.as_ref().map(|i| i.id()) else {
         return Vec::new();
     };
-    let reach = core
-        .reach_of(space, &me)
-        .map(|(_, r)| r)
-        .unwrap_or_default();
+    let reach = core.all_reach_of(space, &me);
     let here = reach.iter().filter(|r| r.host == here);
     here.map(|r| r.token).collect()
 }
