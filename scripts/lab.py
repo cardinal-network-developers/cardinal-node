@@ -442,8 +442,9 @@ def talk(a, b, frames=250):
 def cousin(theirs, label):
     """Daniel and his cousin as they are: Daniel's home behind a strict router
     (pfSense-style) with only the host forwarded, and the cousin's behind
-    `theirs` with no host of his own. They met by an invitation from Daniel's
-    host, the one device of his that anyone can reach. A message, a call each
+    `theirs` with no host of his own. Daniel invites him from his laptop, as a
+    window does, and the invitation names his host, the one device of his that
+    anyone can reach. A message, a call each
     way with frames counted and timed, and Daniel's laptop going away and
     coming back."""
     net = Net()
@@ -469,7 +470,11 @@ def cousin(theirs, label):
     wait("paired", 30, lambda: laptop.online("nuc"))
     him.start()
     him.cli("init", "--yes", "--name", "cousin")
-    code = nuc.cli("invite", "--address", "198.51.100.10:7171", "--name", "Daniel").strip()
+    sheet = nuc.cli("recovery", "sheet")
+    key = next(l.split()[-1] for l in sheet.splitlines() if "Key:" in l)
+    wait("the laptop knows of its host", 30, lambda: key in laptop.cli("recovery", "sheet"))
+    code = laptop.cli("invite", "--name", "Daniel").strip()
+    wait("the host has the invitation", 10, lambda: False)
     t0 = time.monotonic()
     him.cli("accept", code, "--name", "Daniel")
     print(f"{label}:", flush=True)

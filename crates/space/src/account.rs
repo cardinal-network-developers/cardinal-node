@@ -21,6 +21,13 @@ pub const SECRET: u64 = 5;
 pub const SETTING: u64 = 6;
 /// Placement kind (under a space node).
 pub const PLACEMENT: u64 = 7;
+/// Invitation kind.
+pub const INVITATION: u64 = 10;
+/// Invitation use kind (under an invitation node).
+pub const INVITATION_USE: u64 = 11;
+
+/// An invitation's field: the inviter cancelled it.
+pub const CANCELLED: u64 = 2;
 
 /// A contact's field: what this person calls them.
 pub const PETNAME: u64 = 2;
@@ -212,6 +219,69 @@ pub struct SpaceRecord {
 fn last(n: &crate::state::Node, key: u64) -> Option<&Value> {
     // the value with the greatest entry id, for display when in conflict
     n.values(key).iter().rev().find_map(|v| v.value.as_ref())
+}
+
+/// `create` of an invitation node: the invitation record, and how its person
+/// will regard whoever uses it, in the fields a contact keeps that in.
+pub fn create_invitation(invitation: Record, regard: Regard) -> SpaceOp {
+    SpaceOp::create(
+        NodeKind::Uint(INVITATION),
+        ROOT,
+        "invitation",
+        Record::new()
+            .with(1, Value::Record(invitation))
+            .with(INTRODUCTIONS, regard.introductions)
+            .with(TRUSTED, regard.trusted),
+    )
+}
+
+/// `create` of a use of an invitation, by `who`.
+pub fn create_invitation_use(invitation: NodeId, who: &IdentityId) -> SpaceOp {
+    SpaceOp::create(
+        NodeKind::Uint(INVITATION_USE),
+        invitation,
+        &short_key(who),
+        Record::new().with(1, *who),
+    )
+}
+
+/// An invitation this person made.
+#[derive(Clone, Debug)]
+pub struct InvitationRecord {
+    /// The invitation node.
+    pub node: NodeId,
+    /// The invitation itself (`contact.md#invitations`).
+    pub invitation: Record,
+    /// How whoever uses it will be regarded.
+    pub regard: Regard,
+    /// The inviter cancelled it.
+    pub cancelled: bool,
+    /// How many times it has been used, on any device.
+    pub used: usize,
+}
+
+/// Invitation nodes that are not deleted.
+pub fn invitations(state: &State) -> Vec<InvitationRecord> {
+    let nodes = state.children(&ROOT).into_iter();
+    let made = nodes.filter(|n| n.kind == NodeKind::Uint(INVITATION) && !n.deleted);
+    made.filter_map(|n| {
+        let flag = |key| last(n, key).and_then(Value::as_bool);
+        let uses = state.children(&n.id).into_iter();
+        let used = uses
+            .filter(|u| u.kind == NodeKind::Uint(INVITATION_USE) && !u.deleted)
+            .count();
+        Some(InvitationRecord {
+            node: n.id,
+            invitation: last(n, 1)?.as_record()?.clone(),
+            regard: Regard {
+                trusted: flag(TRUSTED).unwrap_or(true),
+                introductions: flag(INTRODUCTIONS).unwrap_or(true),
+            },
+            cancelled: flag(CANCELLED).unwrap_or(false),
+            used,
+        })
+    })
+    .collect()
 }
 
 /// A person this identity has a relationship with.

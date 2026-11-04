@@ -273,6 +273,8 @@ pub struct Daemon {
     /// How the person will regard whoever uses each outstanding invitation,
     /// by its secret's id.
     invitations: Mutex<HashMap<u64, account::Regard>>,
+    /// The account's outstanding invitations this device lets in.
+    admitted: Mutex<HashMap<[u8; 16], u64>>,
     /// The space made for each invitation's session, by the peer's static
     /// key.
     invited: Mutex<HashMap<[u8; 32], SpaceId>>,
@@ -426,6 +428,7 @@ impl Daemon {
             cleanup: crate::cleanup::Cleaner::load(old_versions),
             speedtest: crate::speedtest::Limiter::default(),
             invitations: Mutex::new(HashMap::new()),
+            admitted: Mutex::new(HashMap::new()),
             invited: Mutex::new(HashMap::new()),
             exchanging: Mutex::new(HashSet::new()),
             placement_lock: Mutex::new(()),
@@ -652,6 +655,17 @@ impl Daemon {
     /// Notes how to regard whoever uses an invitation.
     pub fn invitation_made(&self, secret: u64, regard: account::Regard) {
         lock(&self.invitations).insert(secret, regard);
+    }
+
+    /// An invitation that is no longer outstanding.
+    pub fn invitation_done(&self, secret: u64) {
+        lock(&self.invitations).remove(&secret);
+    }
+
+    /// The invitations this device lets in, by their secret, with the id of
+    /// that secret at the endpoint.
+    pub fn admitted_invitations(&self) -> MutexGuard<'_, HashMap<[u8; 16], u64>> {
+        lock(&self.admitted)
     }
 
     /// How to regard whoever opened `s` with an outstanding invitation.
@@ -1075,6 +1089,7 @@ impl Daemon {
             if let Err(e) = crate::host::refresh(&d) {
                 tracing::debug!("housekeeping: {e:#}");
             }
+            crate::contacts::admit_invitations(&d);
             // Mounting blocks, and may wait for another mount or unmount.
             let d2 = d.clone();
             let _ = tokio::task::spawn_blocking(move || d2.ensure_mounted()).await;

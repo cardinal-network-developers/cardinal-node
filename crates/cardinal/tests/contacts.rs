@@ -331,3 +331,76 @@ fn a_persons_other_devices_follow_how_they_regard_someone() {
         listing(&phone, "bo").contains("hosts only") && !connected(&phone, "bo")
     });
 }
+
+/// Ana has a host. An invitation made on her laptop names the host, which
+/// answers it while the laptop is off, and the laptop knows the contact when
+/// it is back. The invitation is used once, and a restart does not lose one.
+#[test]
+fn an_invitation_made_anywhere_is_answered_by_the_host() {
+    if !fuse_available() {
+        eprintln!("skipping: /dev/fuse or fusermount3 is not available");
+        return;
+    }
+    let root = tempfile::tempdir().unwrap();
+    let mut host = person(root.path(), "host");
+    let mut laptop = Dev::new(root.path(), "laptop", free_port());
+    laptop.start();
+    pair(&host, &laptop);
+    laptop.wait_mounted();
+    let shown = host.cli(&["host", "--address", &format!("127.0.0.1:{}", host.port)]);
+    let key = shown
+        .lines()
+        .find_map(|l| l.trim().strip_prefix("Key:"))
+        .unwrap()
+        .trim()
+        .to_owned();
+    wait("the laptop knows of the host", 20, || {
+        laptop.cli(&["recovery", "sheet"]).contains(&key)
+    });
+
+    let code = laptop.cli(&["invite", "--name", "Ana"]).trim().to_owned();
+    // The same entries in the account space on both.
+    let account = |d: &Dev| {
+        let st = d.status();
+        let spaces = st["spaces"].as_array().cloned().unwrap_or_default();
+        let found = spaces.into_iter().find(|s| s["kind"] == "account");
+        found.map(|s| s["entries"].clone())
+    };
+    let synced = |a: &Dev, b: &Dev| account(a).is_some() && account(a) == account(b);
+    wait("the host has what the laptop wrote", 20, || {
+        synced(&laptop, &host)
+    });
+    laptop.stop();
+    let bo = person(root.path(), "bo");
+    // The host may still be taking the entry in: until then it answers
+    // nothing, and that uses nothing up.
+    wait("bo gets in through the host", 30, || {
+        bo.try_cli(&["accept", &code, "--name", "Ana"])
+            .status
+            .success()
+    });
+    wait("the host lists bo", 20, || !listing(&host, "bo").is_empty());
+
+    laptop.start();
+    wait("the laptop lists bo", 30, || {
+        !listing(&laptop, "bo").is_empty()
+    });
+
+    // Used once, on any device.
+    let cy = person(root.path(), "cy");
+    let again = cy.try_cli(&["accept", &code, "--name", "Ana"]);
+    assert!(!again.status.success(), "a used invitation let cy in");
+
+    // One made before a restart of the device that answers.
+    let code = laptop.cli(&["invite", "--name", "Ana"]).trim().to_owned();
+    wait("the host has it", 20, || synced(&laptop, &host));
+    host.stop();
+    host.start();
+    host.wait_mounted();
+    wait("cy gets in through the host", 30, || {
+        cy.try_cli(&["accept", &code, "--name", "Ana"])
+            .status
+            .success()
+    });
+    wait("the host lists cy", 20, || !listing(&host, "cy").is_empty());
+}

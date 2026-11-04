@@ -651,6 +651,15 @@ fn an_invitation_opens_nothing_else() {
     let all = spaces(&ana);
     assert!(all.len() >= 3, "her own spaces, and the one with bo");
     let (ana_id, bo_id) = (other_person(&bo), other_person(&ana));
+    // Making an invitation is itself a write in her account, so all of them
+    // first: what counts is what comes after.
+    let codes = [
+        a_code(&ana, &[]),
+        a_code(&ana, &[]),
+        a_code(&ana, &[]),
+        a_code(&ana, &["--hosts-only"]),
+    ];
+    std::thread::sleep(Duration::from_secs(1));
     let before = log_sizes(&ana);
 
     let attack = |rt: &tokio::runtime::Runtime, who: &str, code: Invitation, claim: [u8; 32]| {
@@ -671,15 +680,10 @@ fn an_invitation_opens_nothing_else() {
         });
     };
     let rt = tokio::runtime::Runtime::new().unwrap();
-    attack(
-        &rt,
-        "someone saying they are ana",
-        a_code(&ana, &[]),
-        ana_id,
-    );
-    attack(&rt, "someone saying they are bo", a_code(&ana, &[]), bo_id);
-    attack(&rt, "someone new", a_code(&ana, &[]), [9; 32]);
-    let hosts_only = a_code(&ana, &["--hosts-only"]);
+    let [as_ana, as_bo, new, hosts_only] = codes;
+    attack(&rt, "someone saying they are ana", as_ana, ana_id);
+    attack(&rt, "someone saying they are bo", as_bo, bo_id);
+    attack(&rt, "someone new", new, [9; 32]);
     attack(&rt, "someone with a hosts-only code", hosts_only, ana_id);
     assert_eq!(log_sizes(&ana), before, "something was left in her spaces");
 

@@ -49,8 +49,10 @@ fn identity(d: &Daemon) -> anyhow::Result<[u8; 32]> {
         .ok_or_else(|| anyhow::anyhow!("this device does not belong to anyone"))
 }
 
-/// Makes an invitation to this device. `address` is where the other person
-/// can reach it, by default its address on the local network.
+/// Makes an invitation. With `address`, it is to this device there. Without,
+/// it is to this person's host if they have one, which is always on and which
+/// anyone can reach, and to this device on its local network if not. It is
+/// kept in the account space, so every device of this person answers it.
 pub fn invite(
     d: &Arc<Daemon>,
     address: Option<&str>,
@@ -58,30 +60,126 @@ pub fn invite(
     regard: Regard,
 ) -> anyhow::Result<Json> {
     let me = identity(d)?;
+    let here = *d.keys.link.public_key().x25519();
     let port = d
         .endpoint
         .udp_addr()
         .or(d.endpoint.tcp_addr())
         .map_or(0, |a| a.port());
-    let addr: SocketAddr = match address {
-        Some(a) => a.parse().map_err(|_| {
-            anyhow::anyhow!("{a} is not an address; it looks like 203.0.113.9:7171")
-        })?,
-        None => {
-            let ip = crate::daemon::local_ips()
-                .into_iter()
-                .next()
-                .ok_or_else(|| anyhow::anyhow!("this device has no address to give"))?;
-            SocketAddr::new(ip, port)
-        }
+    let (responder, addr): ([u8; 32], SocketAddr) = match address {
+        Some(a) => (
+            here,
+            a.parse().map_err(|_| {
+                anyhow::anyhow!("{a} is not an address; it looks like 203.0.113.9:7171")
+            })?,
+        ),
+        None => match own_host(d) {
+            Some(host) => host,
+            None => {
+                let ip = crate::daemon::local_ips()
+                    .into_iter()
+                    .next()
+                    .ok_or_else(|| anyhow::anyhow!("this device has no address to give"))?;
+                (here, SocketAddr::new(ip, port))
+            }
+        },
     };
-    let responder = *d.keys.link.public_key().x25519();
     let endpoint = EndpointAddr::new(CarrierKind::Udp, addr);
     let mut invitation = Invitation::new(me, responder, endpoint);
     invitation.name = name.map(str::to_owned);
-    let secret = d.endpoint.add_secret(SecretEntry::new(&invitation.secret));
-    d.invitation_made(secret, regard);
+    let account = d
+        .core()
+        .account_id()
+        .ok_or_else(|| anyhow::anyhow!("the account space is not here yet"))?;
+    let op = account::create_invitation(invitation.to_record(), regard);
+    d.write_and_push(&account, vec![op])?;
+    admit_invitations(d);
     Ok(json!({"code": invitation.to_text()}))
+}
+
+/// This person's host, by static key, at an address that is not a name.
+fn own_host(d: &Daemon) -> Option<([u8; 32], SocketAddr)> {
+    let hosts = d.core().mailboxes();
+    hosts.iter().find_map(|(grant, _)| {
+        let at = grant.endpoints.iter().find_map(|e| e.socket_addr())?;
+        Some((*grant.link_key.x25519(), at))
+    })
+}
+
+/// Lets in whoever holds an invitation this person has outstanding, on this
+/// device as on all their others, and stops for one that is used up or
+/// cancelled, wherever that happened.
+pub fn admit_invitations(d: &Daemon) {
+    let outstanding: Vec<(Invitation, Regard)> = {
+        let core = d.core();
+        let Some(space) = core.account().and_then(|a| a.space.as_ref()) else {
+            return;
+        };
+        let made = account::invitations(space.state()).into_iter();
+        made.filter(|i| !i.cancelled)
+            .filter_map(|i| {
+                let invitation = Invitation::from_record(&i.invitation).ok()?;
+                let left = (i.used as u64) < invitation.uses;
+                left.then_some((invitation, i.regard))
+            })
+            .collect()
+    };
+    let wanted: std::collections::HashSet<[u8; 16]> =
+        outstanding.iter().map(|(i, _)| i.secret).collect();
+    let mut admitted = d.admitted_invitations();
+    admitted.retain(|secret, id| {
+        let keep = wanted.contains(secret);
+        if !keep {
+            d.endpoint.remove_secret(*id);
+            d.invitation_done(*id);
+        }
+        keep
+    });
+    for (invitation, regard) in outstanding {
+        if admitted.contains_key(&invitation.secret) {
+            continue;
+        }
+        let mut entry = SecretEntry::new(&invitation.secret);
+        entry.uses = None;
+        let id = d.endpoint.add_secret(entry);
+        d.invitation_made(id, regard);
+        admitted.insert(invitation.secret, id);
+    }
+}
+
+/// Records that `who` used the invitation that let `s` in, so that every
+/// device of this person counts it.
+fn invitation_used(d: &Arc<Daemon>, s: &Session, who: &[u8; 32]) -> anyhow::Result<()> {
+    let cardinal_link::Admission::Secret { id, .. } = s.admission() else {
+        return Ok(());
+    };
+    let secret = d
+        .admitted_invitations()
+        .iter()
+        .find(|(_, i)| **i == id)
+        .map(|(secret, _)| *secret);
+    let Some(secret) = secret else {
+        return Ok(());
+    };
+    let (account, node) = {
+        let core = d.core();
+        let Some(space) = core.account().and_then(|a| a.space.as_ref()) else {
+            return Ok(());
+        };
+        let made = account::invitations(space.state());
+        let mine = made
+            .iter()
+            .find(|i| Invitation::from_record(&i.invitation).is_ok_and(|inv| inv.secret == secret));
+        let Some(i) = mine else {
+            return Ok(());
+        };
+        (core.account_id(), i.node)
+    };
+    if let Some(account) = account {
+        d.write_and_push(&account, vec![account::create_invitation_use(node, who)])?;
+    }
+    admit_invitations(d);
+    Ok(())
 }
 
 /// Takes up an invitation, and becomes a contact of whoever gave it.
@@ -233,6 +331,9 @@ pub async fn serve(d: &Arc<Daemon>, s: &Session, mut st: Stream) -> anyhow::Resu
     if matches!(done, Ok(Ok(Some(ContactMessage::Done)))) {
         net::reconcile(d, s, space).await?;
         record_contact(d, &them, &name, &space, regard)?;
+        if let Err(e) = invitation_used(d, s, &them) {
+            tracing::debug!("counting an invitation's use: {e:#}");
+        }
         mailbox::met(d, &space, &them);
         d.invitation_finished(s);
         remember(d, s);

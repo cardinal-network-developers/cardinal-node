@@ -677,12 +677,17 @@ asks for around that is not built yet.
 - **Read markers are always written.** `profiles.md` has no setting to keep them
   back, so reading a conversation tells the other person. Every message also
   lacks the author-owned field the profile gives it.
-- **Invitations last as long as the daemon.** They are not kept in the account
-  space, so a restart loses them, and only the device that made one can be
-  reached with it. `uses` is always 1, and `for`, front doors and join requests
-  are not implemented. An invitation's endpoint is a device, not a host.
-- **Invitations record how the person will regard whoever uses them**, in the
-  daemon's memory, so that lasts as long as the invitation does.
+- **An invitation names the person's own host, which answers it as one of
+  their devices.** Invitations are kept in the account space, and every device
+  of the person lets their holders in, so the host answers one while the device
+  that made it is off, and a restart loses none. `contact.md#accepting` has an
+  invitation to a host carry a token and send the invitee on to an inviter
+  device through rendezvous. Here the host is an inviter device itself, so the
+  invitation names it as one, with no token. With no host, it names the device
+  that made it. Join requests, front doors, `for` and cancelling are not
+  implemented, and `uses` is always 1.
+- **An invitation node also says how its user will be regarded**, in fields 6
+  and 7 as a contact node does, which `profiles.md#account` does not list.
 - **Whoever invites is not asked for a petname.** `contact.md#accepting` has
   each device ask its person. The inviter's device records the name the other
   device gave in `hello`, which is that device's own name, and its person can
