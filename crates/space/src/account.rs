@@ -22,6 +22,8 @@ pub const SETTING: u64 = 6;
 /// Placement kind (under a space node).
 pub const PLACEMENT: u64 = 7;
 
+/// A contact's field: what this person calls them.
+pub const PETNAME: u64 = 2;
 /// A contact's field: accept introductions from them.
 pub const INTRODUCTIONS: u64 = 6;
 /// A contact's field: they are trusted.

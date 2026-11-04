@@ -683,6 +683,12 @@ asks for around that is not built yet.
   are not implemented. An invitation's endpoint is a device, not a host.
 - **Invitations record how the person will regard whoever uses them**, in the
   daemon's memory, so that lasts as long as the invitation does.
+- **Whoever invites is not asked for a petname.** `contact.md#accepting` has
+  each device ask its person. The inviter's device records the name the other
+  device gave in `hello`, which is that device's own name, and its person can
+  change it afterwards with `contact`. A new name another contact already has is
+  refused, where `contact.md#who-a-person-knows` asks for a warning, because the
+  command line finds people by name.
 - **Both people must be online to connect**, and a device finds a contact's
   device only at an address it has already seen. Tokens are for the mailbox and
   for fetching, so rendezvous and relay do not help between two people yet.

@@ -235,3 +235,69 @@ fn lists_a_folder() {
     assert_eq!(inside["files"][0]["size"], 5);
     assert_eq!(inside["files"][0]["folder"], false);
 }
+
+/// The reason a request was turned down.
+fn turned_down(d: &Dev, req: Value) -> String {
+    let mut s = UnixStream::connect(socket(d)).unwrap();
+    writeln!(s, "{req}").unwrap();
+    let mut line = String::new();
+    BufReader::new(s).read_line(&mut line).unwrap();
+    let reply: Value = serde_json::from_str(&line).unwrap();
+    assert_eq!(reply["ok"], false, "{req} got {reply}");
+    reply["error"].as_str().unwrap_or_default().to_owned()
+}
+
+/// Whoever invited was never asked what to call the other, so either side can
+/// change it afterwards. The other is told nothing, and no two contacts share
+/// a name.
+#[test]
+fn a_contact_can_be_renamed() {
+    if !fuse_available() {
+        eprintln!("skipping: /dev/fuse or fusermount3 is not available");
+        return;
+    }
+    let root = tempfile::tempdir().unwrap();
+    let (a, b) = met(root.path());
+    // Bo's device gave its own name, and that is all Ana has to go on.
+    assert_eq!(only(&a)["name"], "bo");
+    let bo = only(&a)["id"].as_str().unwrap().to_owned();
+
+    ask(
+        &a,
+        json!({"cmd": "contact", "who": bo, "name": " Bo Smith "}),
+    );
+    assert_eq!(only(&a)["name"], "Bo Smith");
+    let listed = ask(&a, json!({"cmd": "contacts"}));
+    assert_eq!(listed["contacts"][0]["name"], "Bo Smith");
+    ask(
+        &a,
+        json!({"cmd": "say", "who": "bo smith", "text": "found you"}),
+    );
+    assert_eq!(only(&b)["name"], "Ana");
+
+    let empty = turned_down(&a, json!({"cmd": "contact", "who": bo, "name": "  "}));
+    assert!(empty.contains("empty"), "{empty}");
+
+    let c = person(root.path(), "cy");
+    let at = format!("127.0.0.1:{}", a.port);
+    let code = a.cli(&["invite", "--address", &at]);
+    c.cli(&["accept", code.trim(), "--name", "Ana"]);
+    wait("Ana lists Cy", 30, || {
+        let listed = ask(&a, json!({"cmd": "conversations"}))["conversations"].clone();
+        listed.as_array().is_some_and(|c| c.len() == 2)
+    });
+    let taken = turned_down(
+        &a,
+        json!({"cmd": "contact", "who": "cy", "name": "bo SMITH"}),
+    );
+    assert!(taken.contains("already"), "{taken}");
+    // Changing only the case of one's own name is no clash.
+    ask(&a, json!({"cmd": "contact", "who": bo, "name": "bo smith"}));
+    assert_eq!(
+        a.cli(&["contacts"])
+            .lines()
+            .filter(|l| l.starts_with("bo smith"))
+            .count(),
+        1
+    );
+}

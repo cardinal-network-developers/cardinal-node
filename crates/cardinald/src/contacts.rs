@@ -294,6 +294,27 @@ pub fn set(d: &Arc<Daemon>, who: &str, setting: &str) -> anyhow::Result<Json> {
     Ok(json!({}))
 }
 
+/// Changes what this person calls a contact. Only their own devices hear of
+/// it, and the contact is told nothing.
+pub fn rename(d: &Arc<Daemon>, who: &str, name: &str) -> anyhow::Result<Json> {
+    let contact = find(d, who)?;
+    let name = name.trim();
+    anyhow::ensure!(!name.is_empty(), "a name cannot be empty");
+    // Two people with one name could be told apart only by their ids.
+    let taken =
+        d.core().contacts().into_iter().any(|c| {
+            c.identity != contact.identity && c.petname.to_lowercase() == name.to_lowercase()
+        });
+    anyhow::ensure!(!taken, "you already call someone else {name:?}");
+    let account = d
+        .core()
+        .account_id()
+        .ok_or_else(|| anyhow::anyhow!("the account space is not here yet"))?;
+    let op = account::set_field(contact.node, account::PETNAME, name);
+    d.write_and_push(&account, vec![op])?;
+    Ok(json!({"name": name}))
+}
+
 async fn send(st: &mut Stream, m: &ContactMessage) -> anyhow::Result<()> {
     st.send_message(&Value::Record(m.to_record())).await?;
     Ok(())

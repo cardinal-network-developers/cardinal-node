@@ -167,9 +167,11 @@ enum Cmd {
         /// `trust` connects your devices directly if they trust you too.
         /// `hosts-only` stops that. `no-introductions` lets nothing reach
         /// you through them. `refuse` ends everything with them and hides
-        /// them.
-        #[arg(value_parser = ["trust", "hosts-only", "introductions", "no-introductions", "refuse", "unrefuse"])]
+        /// them. `name` changes what you call them.
+        #[arg(value_parser = ["trust", "hosts-only", "introductions", "no-introductions", "refuse", "unrefuse", "name"])]
         setting: String,
+        /// The new name, after `name`.
+        new_name: Option<String>,
     },
     /// Send a message to a contact.
     Say {
@@ -1287,8 +1289,19 @@ async fn client(cmd: Cmd) -> anyhow::Result<()> {
             }
             Ok(())
         }
-        Cmd::Contact { who, setting } => {
-            let req = json!({"cmd": "contact", "who": who, "setting": setting});
+        Cmd::Contact {
+            who,
+            setting,
+            new_name,
+        } => {
+            let req = match (setting.as_str(), new_name) {
+                ("name", Some(name)) => json!({"cmd": "contact", "who": who, "name": name}),
+                ("name", None) => {
+                    anyhow::bail!("say what to call them: `cardinal contact {who} name NEW`")
+                }
+                (_, Some(_)) => anyhow::bail!("only `name` takes a new name"),
+                (_, None) => json!({"cmd": "contact", "who": who, "setting": setting}),
+            };
             call(&paths, req).await?;
             Ok(())
         }
