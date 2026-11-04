@@ -106,24 +106,97 @@ fn own_host(d: &Daemon) -> Option<([u8; 32], SocketAddr)> {
     })
 }
 
-/// Lets in whoever holds an invitation this person has outstanding, on this
-/// device as on all their others, and stops for one that is used up or
-/// cancelled, wherever that happened.
-pub fn admit_invitations(d: &Daemon) {
-    let outstanding: Vec<(Invitation, Regard)> = {
-        let core = d.core();
-        let Some(space) = core.account().and_then(|a| a.space.as_ref()) else {
-            return;
-        };
-        let made = account::invitations(space.state()).into_iter();
-        made.filter(|i| !i.cancelled)
-            .filter_map(|i| {
-                let invitation = Invitation::from_record(&i.invitation).ok()?;
-                let left = (i.used as u64) < invitation.uses;
-                left.then_some((invitation, i.regard))
-            })
-            .collect()
+/// How long an invitation lasts, by the clock of the device that made it:
+/// expiry is each person's own policy (`contact.md#invitations`).
+const INVITATION_LASTS: u64 = 30 * 24 * 60 * 60 * 1000;
+
+/// An invitation this person made, and where it stands.
+struct Made {
+    record: account::InvitationRecord,
+    invitation: Invitation,
+    /// When, by the clock of the device that made it.
+    at: Option<u64>,
+}
+
+impl Made {
+    fn outstanding(&self) -> bool {
+        let left = (self.record.used as u64) < self.invitation.uses;
+        !self.record.cancelled && left && !self.expired()
+    }
+
+    fn expired(&self) -> bool {
+        self.at
+            .is_some_and(|at| now_ms().saturating_sub(at) > INVITATION_LASTS)
+    }
+}
+
+/// The invitations this person made.
+fn made(d: &Daemon) -> Vec<Made> {
+    let core = d.core();
+    let Some(space) = core.account().and_then(|a| a.space.as_ref()) else {
+        return Vec::new();
     };
+    let all = account::invitations(space.state()).into_iter();
+    all.filter_map(|record| {
+        let invitation = Invitation::from_record(&record.invitation).ok()?;
+        let at = space.dag().get(&record.entry).and_then(|e| e.time());
+        Some(Made {
+            record,
+            invitation,
+            at,
+        })
+    })
+    .collect()
+}
+
+/// The invitations this person made, as a window shows them.
+pub fn invitations(d: &Daemon) -> Json {
+    let all: Vec<Json> = made(d)
+        .iter()
+        .map(|m| {
+            json!({
+                "id": hex::encode(m.record.node),
+                "name": m.invitation.name,
+                "made": m.at,
+                "used": m.record.used,
+                "uses": m.invitation.uses,
+                "hosts_only": !m.record.regard.trusted,
+                "outstanding": m.outstanding(),
+                "cancelled": m.record.cancelled,
+                "expired": m.expired(),
+            })
+        })
+        .collect();
+    json!({"invitations": all})
+}
+
+/// Cancels an invitation on every device of this person.
+pub fn cancel_invitation(d: &Arc<Daemon>, id: &str) -> anyhow::Result<Json> {
+    let node = hex::decode(id).ok();
+    let node = node.and_then(|b| <[u8; 16]>::try_from(b.as_slice()).ok());
+    let node = node.ok_or_else(|| anyhow::anyhow!("that is not an invitation"))?;
+    anyhow::ensure!(
+        made(d).iter().any(|m| m.record.node == node),
+        "there is no such invitation"
+    );
+    let account = d
+        .core()
+        .account_id()
+        .ok_or_else(|| anyhow::anyhow!("the account space is not here yet"))?;
+    d.write_and_push(&account, vec![account::cancel_invitation(node)])?;
+    admit_invitations(d);
+    Ok(json!({}))
+}
+
+/// Lets in whoever holds an invitation this person has outstanding, on this
+/// device as on all their others, and stops for one that is used up,
+/// cancelled or too old, wherever that happened.
+pub fn admit_invitations(d: &Daemon) {
+    let outstanding: Vec<(Invitation, Regard)> = made(d)
+        .into_iter()
+        .filter(Made::outstanding)
+        .map(|m| (m.invitation, m.record.regard))
+        .collect();
     let wanted: std::collections::HashSet<[u8; 16]> =
         outstanding.iter().map(|(i, _)| i.secret).collect();
     let mut admitted = d.admitted_invitations();
@@ -764,4 +837,42 @@ pub fn mark_read(d: &Arc<Daemon>, who: &str) -> anyhow::Result<Json> {
         d.write_and_push(&contact.space, vec![op])?;
     }
     Ok(json!({}))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn made(at: Option<u64>, used: usize, cancelled: bool) -> Made {
+        let addr: SocketAddr = "127.0.0.1:7171".parse().unwrap();
+        let invitation =
+            Invitation::new([1; 32], [2; 32], EndpointAddr::new(CarrierKind::Udp, addr));
+        Made {
+            record: account::InvitationRecord {
+                node: [3; 16],
+                entry: [4; 32],
+                invitation: invitation.to_record(),
+                regard: Regard::default(),
+                cancelled,
+                used,
+            },
+            invitation,
+            at,
+        }
+    }
+
+    #[test]
+    fn an_invitation_ends_when_used_cancelled_or_old() {
+        let now = now_ms();
+        assert!(made(Some(now), 0, false).outstanding());
+        assert!(
+            made(None, 0, false).outstanding(),
+            "no clock is no reason to end it"
+        );
+        assert!(!made(Some(now), 1, false).outstanding());
+        assert!(!made(Some(now), 0, true).outstanding());
+        let old = now - INVITATION_LASTS - 1000;
+        assert!(made(Some(old), 0, false).expired());
+        assert!(!made(Some(old), 0, false).outstanding());
+    }
 }

@@ -2,7 +2,7 @@
 //! milestone needs — device nodes, and space nodes with their placements.
 
 use cardinal_encoding::{Record, Value};
-use cardinal_identity::KeyId;
+use cardinal_identity::{EntryId, KeyId};
 
 use crate::entry::{IdentityId, NodeId, NodeKind, SpaceId, SpaceOp};
 use crate::state::{State, ROOT};
@@ -235,6 +235,11 @@ pub fn create_invitation(invitation: Record, regard: Regard) -> SpaceOp {
     )
 }
 
+/// Cancels an invitation, on every device.
+pub fn cancel_invitation(invitation: NodeId) -> SpaceOp {
+    set_field(invitation, CANCELLED, true)
+}
+
 /// `create` of a use of an invitation, by `who`.
 pub fn create_invitation_use(invitation: NodeId, who: &IdentityId) -> SpaceOp {
     SpaceOp::create(
@@ -250,6 +255,8 @@ pub fn create_invitation_use(invitation: NodeId, who: &IdentityId) -> SpaceOp {
 pub struct InvitationRecord {
     /// The invitation node.
     pub node: NodeId,
+    /// The entry that made it.
+    pub entry: EntryId,
     /// The invitation itself (`contact.md#invitations`).
     pub invitation: Record,
     /// How whoever uses it will be regarded.
@@ -272,6 +279,7 @@ pub fn invitations(state: &State) -> Vec<InvitationRecord> {
             .count();
         Some(InvitationRecord {
             node: n.id,
+            entry: n.created_in,
             invitation: last(n, 1)?.as_record()?.clone(),
             regard: Regard {
                 trusted: flag(TRUSTED).unwrap_or(true),

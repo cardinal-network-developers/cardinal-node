@@ -250,6 +250,8 @@ async fn handle(d: &Arc<Daemon>, req: &Value) -> anyhow::Result<Value> {
             let name = req.get("name").and_then(|v| v.as_str());
             crate::contacts::accept(d, arg(req, "code")?, name, regard(req)).await
         }
+        "invitations" => Ok(crate::contacts::invitations(d)),
+        "cancel-invitation" => crate::contacts::cancel_invitation(d, arg(req, "id")?),
         "contacts" => {
             let all = req.get("all").and_then(|v| v.as_bool()) == Some(true);
             Ok(crate::contacts::list(d, all))

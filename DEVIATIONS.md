@@ -686,8 +686,9 @@ asks for around that is not built yet.
   invitation to a host carry a token and send the invitee on to an inviter
   device through rendezvous. Here the host is an inviter device itself, so the
   invitation names it as one, with no token. With no host, it names the device
-  that made it. Join requests, front doors, `for` and cancelling are not
-  implemented, and `uses` is always 1.
+  that made it. Join requests, front doors and `for` are not implemented, and
+  `uses` is always 1. An invitation lasts 30 days, by the clock of the device
+  that made it, which is this software's local policy.
 - **An invitation node also says how its user will be regarded**, in fields 6
   and 7 as a contact node does, which `profiles.md#account` does not list.
 - **Whoever invites is not asked for a petname.** `contact.md#accepting` has

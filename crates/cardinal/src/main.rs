@@ -173,6 +173,15 @@ enum Cmd {
         /// The new name, after `name`.
         new_name: Option<String>,
     },
+    /// The invitations you made, and whether each can still be used. `cancel ID`
+    /// ends one on all your devices. An invitation lasts 30 days.
+    Invitations {
+        /// `cancel` ends the invitation given next.
+        #[arg(value_parser = ["cancel"])]
+        action: Option<String>,
+        /// The invitation, as `cardinal invitations` shows it.
+        id: Option<String>,
+    },
     /// Send a message to a contact.
     Say {
         /// Who, as `cardinal contacts` shows.
@@ -1305,6 +1314,43 @@ async fn client(cmd: Cmd) -> anyhow::Result<()> {
             call(&paths, req).await?;
             Ok(())
         }
+        Cmd::Invitations { action, id } => match (action.as_deref(), id) {
+            (Some("cancel"), Some(id)) => {
+                call(&paths, json!({"cmd": "cancel-invitation", "id": id})).await?;
+                println!("Cancelled: nobody can use it now, on any of your devices.");
+                Ok(())
+            }
+            (Some(_), None) => anyhow::bail!("say which: `cardinal invitations cancel ID`"),
+            _ => {
+                let v = call(&paths, json!({"cmd": "invitations"})).await?;
+                let all = v["invitations"].as_array().cloned().unwrap_or_default();
+                if all.is_empty() {
+                    println!("You have made no invitations.");
+                }
+                for i in all {
+                    let standing = if i["outstanding"] == true {
+                        "can be used"
+                    } else if i["cancelled"] == true {
+                        "cancelled"
+                    } else if i["expired"] == true {
+                        "expired"
+                    } else {
+                        "used"
+                    };
+                    let name = i["name"].as_str().unwrap_or("(no name)");
+                    let only = if i["hosts_only"] == true {
+                        "  through hosts only"
+                    } else {
+                        ""
+                    };
+                    println!(
+                        "{}  {name}  {standing}{only}",
+                        i["id"].as_str().unwrap_or("")
+                    );
+                }
+                Ok(())
+            }
+        },
         Cmd::Say { who, text } => {
             let v = call(&paths, json!({"cmd": "say", "who": who, "text": text})).await?;
             if v["reachable"] == false {

@@ -404,3 +404,30 @@ fn an_invitation_made_anywhere_is_answered_by_the_host() {
     });
     wait("the host lists cy", 20, || !listing(&host, "cy").is_empty());
 }
+
+/// An invitation can be listed and cancelled, and a cancelled one lets nobody
+/// in. One that was used says so.
+#[test]
+fn a_cancelled_invitation_lets_nobody_in() {
+    if !fuse_available() {
+        eprintln!("skipping: /dev/fuse or fusermount3 is not available");
+        return;
+    }
+    let root = tempfile::tempdir().unwrap();
+    let ana = person(root.path(), "ana");
+    let bo = person(root.path(), "bo");
+    let code = invitation(&ana, "Ana");
+    let listed = ana.cli(&["invitations"]);
+    assert!(listed.contains("Ana  can be used"), "{listed}");
+    let id = listed.split_whitespace().next().unwrap().to_owned();
+    ana.cli(&["invitations", "cancel", &id]);
+    assert!(ana.cli(&["invitations"]).contains("cancelled"));
+    let tried = bo.try_cli(&["accept", &code, "--name", "Ana"]);
+    assert!(!tried.status.success(), "a cancelled invitation let bo in");
+
+    let code = invitation(&ana, "Ana");
+    bo.cli(&["accept", &code, "--name", "Ana"]);
+    wait("ana lists bo", 20, || !listing(&ana, "bo").is_empty());
+    let listed = ana.cli(&["invitations"]);
+    assert!(listed.contains("Ana  used"), "{listed}");
+}
