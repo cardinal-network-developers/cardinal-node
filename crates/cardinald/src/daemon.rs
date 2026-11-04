@@ -572,6 +572,14 @@ impl Daemon {
 
     /// Who a session's peer was last found to be. Takes no lock on the core,
     /// so it is fit for a path as busy as serving blobs.
+    /// The open session with a device, by its static key.
+    pub fn session(&self, peer_static: &[u8; 32]) -> Option<Session> {
+        lock(&self.sessions)
+            .get(peer_static)
+            .map(|c| c.session.clone())
+            .filter(|s| !s.is_closed())
+    }
+
     pub fn session_kind(&self, peer_static: &[u8; 32]) -> Option<PeerKind> {
         lock(&self.sessions).get(peer_static).map(|c| c.kind)
     }
@@ -590,6 +598,25 @@ impl Daemon {
             .filter(|c| !c.session.is_closed() && theirs(&c.kind))
             .map(|c| c.session.clone())
             .collect()
+    }
+
+    /// The people reached only through a relay.
+    pub fn relayed_people(&self) -> HashSet<[u8; 32]> {
+        let sessions = lock(&self.sessions);
+        let open = sessions.values().filter(|c| !c.session.is_closed());
+        let mut relayed = HashSet::new();
+        let mut direct = HashSet::new();
+        for c in open {
+            if let PeerKind::Contact(identity, _) = c.kind {
+                if c.session.is_relayed() {
+                    relayed.insert(identity);
+                } else {
+                    direct.insert(identity);
+                }
+            }
+        }
+        relayed.retain(|i| !direct.contains(i));
+        relayed
     }
 
     /// The people with a session open to one of their devices.
@@ -1214,6 +1241,7 @@ impl Daemon {
             });
         }
         tokio::spawn(crate::rendezvous::ask_helpers(self.clone()));
+        tokio::spawn(crate::rendezvous::reach_contacts(self.clone()));
     }
 
     /// Opens a session at an address, over UDP if something answers there,

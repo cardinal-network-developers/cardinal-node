@@ -689,9 +689,12 @@ asks for around that is not built yet.
   change it afterwards with `contact`. A new name another contact already has is
   refused, where `contact.md#who-a-person-knows` asks for a warning, because the
   command line finds people by name.
-- **Both people must be online to connect**, and a device finds a contact's
-  device only at an address it has already seen. Tokens are for the mailbox and
-  for fetching, so rendezvous and relay do not help between two people yet.
+- **Both people must be online to connect.** A device finds a trusted
+  contact's devices at addresses it has seen, and through the hosts their reach
+  node names: every 30 seconds while it has no session with them, and at once,
+  for up to 12 seconds, when a call is made. Nobody can look for someone with no
+  host, so they can be rung only while one of their devices holds the session it
+  found, which their devices keep looking for.
 - **Spec gap: which identity's log comes first.** `contact.md#accepting` has
   both sides reconcile logs before `genesis`. Here the inviter fetches the
   invitee's log before creating the space, and the invitee fetches the
@@ -783,9 +786,21 @@ asks for around that is not built yet.
   they were invited stays out of reach of the other until then.
 - **Join requests are not implemented**, so an invitation still needs its
   inviter online.
-- **Rendezvous and relay are for a person's own devices** so far, as D49
-  has it: every one of them offers both, host or not. `connect` and `relay`
-  with a token come with sharing.
+- **Rendezvous and relay with a token are a host's, for its own person.**
+  Every device of a person offers both to the others, host or not, as D49 has
+  it, and a host serves trusted contacts with the token their reach node gives.
+  Trusted contacts are not hosts for each other: there are no grants to another
+  identity.
+- **Rendezvous and relay answer with codes the spec does not list.**
+  `hosts.md#service-messages` has 1 not permitted, 2 full, 3 unknown and 4
+  malformed. Here 4 means a device that is not present and 5 one that will not
+  relay (on battery), and a request missing a field is answered 3.
+- **A token's relay counts nothing.** There is one quota class, so relayed bytes
+  count against no limit. What bounds a holder is the four sessions a token may
+  hold, and a device's agreement.
+- **A trusted contact may use a token on the session it has.** The link keeps
+  one session between two devices, so a contact connected to the host directly
+  asks there, with the token in the request, instead of opening another.
 - **Which devices refuse to relay.** `hosts.md#help-from-a-persons-own-devices`
   asks a device on battery or a metered connection to. Here one on battery
   does. Nothing here can tell that a connection is metered.

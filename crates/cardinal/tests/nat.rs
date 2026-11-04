@@ -13,6 +13,10 @@ use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::{Arc, Mutex};
 
 use common::*;
+use serde_json::{json, Value};
+use std::io::{BufRead, BufReader, Write};
+use std::os::unix::net::UnixStream;
+use std::time::Duration;
 use tokio::net::UdpSocket;
 
 const HEADER: usize = 6;
@@ -364,5 +368,202 @@ fn a_device_behind_a_forwarded_port_helps_and_catches_others_up() {
     x.wait_mounted();
     wait("x catches up from the helper", 20, || {
         std::fs::read(x.p("while-away.txt")).is_ok_and(|b| b == b"news\n")
+    });
+}
+
+fn ask(d: &Dev, req: Value) -> Value {
+    let mut s = UnixStream::connect(d.home.join("control.sock")).unwrap();
+    writeln!(s, "{req}").unwrap();
+    let mut line = String::new();
+    BufReader::new(s).read_line(&mut line).unwrap();
+    let reply: Value = serde_json::from_str(&line).unwrap();
+    assert_eq!(reply["ok"], true, "{req} got {reply}");
+    reply
+}
+
+/// The one contact a device has, as it lists them.
+fn the_contact(d: &Dev) -> Value {
+    ask(d, json!({"cmd": "contacts"}))["contacts"][0].clone()
+}
+
+fn standing(d: &Dev) -> Value {
+    ask(d, json!({"cmd": "call"}))["call"]["state"].clone()
+}
+
+/// Ana, with a host and a laptop, and Bo, with a laptop and no host, who have
+/// met through an invitation from Ana's laptop. Nothing is behind anything yet.
+fn two_people(root: &std::path::Path) -> (Dev, Dev, Dev) {
+    two_people_from(root, false)
+}
+
+/// The same, with the invitation from Ana's host, the one device of hers that
+/// anyone can reach.
+fn two_people_from(root: &std::path::Path, from_host: bool) -> (Dev, Dev, Dev) {
+    let mut host = Dev::new(root, "host", free_port());
+    let mut ana = Dev::new(root, "ana", free_port());
+    let mut bo = Dev::new(root, "bo", free_port());
+    host.start();
+    host.cli(&["init", "--yes", "--name", "host"]);
+    host.wait_mounted();
+    ana.start();
+    pair(&host, &ana);
+    ana.wait_mounted();
+    let shown = host.cli(&["host", "--address", &format!("127.0.0.1:{}", host.port)]);
+    let key = shown
+        .lines()
+        .find_map(|l| l.trim().strip_prefix("Key:"))
+        .unwrap()
+        .trim()
+        .to_owned();
+    wait("ana's laptop knows of the host", 20, || {
+        ana.cli(&["recovery", "sheet"]).contains(&key)
+    });
+    bo.start();
+    bo.cli(&["init", "--yes", "--name", "bo"]);
+    bo.wait_mounted();
+    let inviter = if from_host { &host } else { &ana };
+    let at = format!("127.0.0.1:{}", inviter.port);
+    let code = inviter.cli(&["invite", "--address", &at, "--name", "Ana"]);
+    bo.cli(&["accept", code.trim(), "--name", "Ana"]);
+    wait("each lists the other", 30, || {
+        the_contact(&ana)["name"] == "bo" && the_contact(&bo)["name"] == "Ana"
+    });
+    (host, ana, bo)
+}
+
+/// The case of two people where only one has a host, and neither laptop can
+/// be reached or punched through: they meet through the one host, and can
+/// call each other.
+#[test]
+fn a_contact_behind_a_nat_is_reached_through_their_host() {
+    if !fuse_available() {
+        eprintln!("skipping: /dev/fuse or fusermount3 is not available");
+        return;
+    }
+    let root = tempfile::tempdir().unwrap();
+    let (_host, mut ana, mut bo) = two_people(root.path());
+    let (na, nb) = (Nat::new(Kind::Symmetric), Nat::new(Kind::Symmetric));
+    put_behind(&mut ana, &na);
+    put_behind(&mut bo, &nb);
+
+    wait("they meet through ana's host", 60, || {
+        let (a, b) = (the_contact(&ana), the_contact(&bo));
+        a["connected"] == true && b["connected"] == true && b["relayed"] == true
+    });
+    bo.cli(&["say", "Ana", "through your host"]);
+    wait("ana reads it", 20, || {
+        ana.cli(&["messages", "bo"]).contains("through your host")
+    });
+
+    // Ana rings Bo, who has no host: the session Bo keeps is how.
+    ask(&ana, json!({"cmd": "call-start", "who": "bo"}));
+    wait("bo's laptop rings", 15, || standing(&bo) == "ringing");
+    ask(&bo, json!({"cmd": "call-answer"}));
+    wait("ana hears the answer", 10, || standing(&ana) == "live");
+
+    let mut lines = [&ana, &bo].map(|d| {
+        let mut w = UnixStream::connect(d.home.join("control.sock")).unwrap();
+        writeln!(w, "{}", json!({"cmd": "call-media"})).unwrap();
+        w.set_read_timeout(Some(Duration::from_millis(50))).unwrap();
+        let r = BufReader::new(w.try_clone().unwrap());
+        (w, r)
+    });
+    std::thread::sleep(Duration::from_millis(300));
+    for n in 0..50u32 {
+        for (i, (w, _)) in lines.iter_mut().enumerate() {
+            let frame = hex::encode((n + 1000 * i as u32).to_be_bytes());
+            writeln!(w, "{}", json!({"audio": frame})).unwrap();
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let mut heard = [0, 0];
+    for _ in 0..100 {
+        for (i, (_, r)) in lines.iter_mut().enumerate() {
+            let mut line = String::new();
+            if r.read_line(&mut line).is_ok() && line.contains("audio") {
+                heard[i] += 1;
+            }
+        }
+        if heard == [50, 50] {
+            break;
+        }
+    }
+    assert!(heard[0] >= 45 && heard[1] >= 45, "heard {heard:?}");
+    ask(&bo, json!({"cmd": "call-end"}));
+    wait("it ends for ana", 10, || standing(&ana).is_null());
+}
+
+/// Ordinary NATs on both sides: the host introduces them, and the session is
+/// direct.
+#[test]
+fn a_contact_is_met_directly_when_their_nat_allows() {
+    if !fuse_available() {
+        eprintln!("skipping: /dev/fuse or fusermount3 is not available");
+        return;
+    }
+    let root = tempfile::tempdir().unwrap();
+    let (_host, mut ana, mut bo) = two_people(root.path());
+    let (na, nb) = (
+        Nat::new(Kind::PortRestricted),
+        Nat::new(Kind::PortRestricted),
+    );
+    put_behind(&mut ana, &na);
+    put_behind(&mut bo, &nb);
+    wait("they meet directly", 60, || {
+        let (a, b) = (the_contact(&ana), the_contact(&bo));
+        a["connected"] == true
+            && b["connected"] == true
+            && a["relayed"] == false
+            && b["relayed"] == false
+    });
+}
+
+/// Ana reaches Bo through hosts only. Bo's device still asks Ana's host, but
+/// Ana's laptop says no, so the host names nothing and relays nothing.
+#[test]
+fn a_contact_not_trusted_back_is_not_reached_through_a_host() {
+    if !fuse_available() {
+        eprintln!("skipping: /dev/fuse or fusermount3 is not available");
+        return;
+    }
+    let root = tempfile::tempdir().unwrap();
+    let (_host, mut ana, mut bo) = two_people(root.path());
+    ana.cli(&["contact", "bo", "hosts-only"]);
+    let (na, nb) = (Nat::new(Kind::Symmetric), Nat::new(Kind::Symmetric));
+    put_behind(&mut ana, &na);
+    put_behind(&mut bo, &nb);
+    wait("ana's host answers bo", 40, || {
+        bo.log().contains("host named 0 of their devices")
+    });
+    std::thread::sleep(Duration::from_secs(5));
+    assert!(
+        !bo.log().contains("host named 1"),
+        "the host named ana's laptop"
+    );
+    assert_eq!(the_contact(&bo)["connected"], false);
+    assert_eq!(the_contact(&ana)["connected"], false);
+}
+
+/// Bo met Ana through her host and keeps a session with it, but a call has to
+/// ring her laptop: Bo still looks for that, and finds it through the host.
+#[test]
+fn a_contact_with_a_session_to_the_host_still_finds_the_laptop() {
+    if !fuse_available() {
+        eprintln!("skipping: /dev/fuse or fusermount3 is not available");
+        return;
+    }
+    let root = tempfile::tempdir().unwrap();
+    let (_host, mut ana, mut bo) = two_people_from(root.path(), true);
+    let (na, nb) = (Nat::new(Kind::Symmetric), Nat::new(Kind::Symmetric));
+    put_behind(&mut ana, &na);
+    put_behind(&mut bo, &nb);
+    wait("bo reaches ana's laptop through her host", 60, || {
+        the_contact(&ana)["connected"] == true && the_contact(&ana)["relayed"] == true
+    });
+    ask(&ana, json!({"cmd": "call-start", "who": "bo"}));
+    wait("bo's laptop rings", 15, || standing(&bo) == "ringing");
+    ask(&bo, json!({"cmd": "call-answer"}));
+    wait("ana's laptop hears the answer", 10, || {
+        standing(&ana) == "live"
     });
 }

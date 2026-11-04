@@ -335,6 +335,7 @@ async fn receive(st: &mut Stream) -> anyhow::Result<Option<ContactMessage>> {
 /// This person's contacts, and with `all` those they have refused.
 pub fn list(d: &Daemon, all: bool) -> Json {
     let connected = d.connected_people();
+    let relayed = d.relayed_people();
     let contacts: Vec<Json> = d
         .core()
         .contacts()
@@ -348,6 +349,7 @@ pub fn list(d: &Daemon, all: bool) -> Json {
                 "introductions": c.regard.introductions,
                 "refused": c.refused,
                 "connected": connected.contains(&c.identity),
+                "relayed": relayed.contains(&c.identity),
             })
         })
         .collect();
@@ -476,6 +478,7 @@ pub fn messages(d: &Daemon, who: &str) -> anyhow::Result<Json> {
 /// and how many messages from them are not yet read here.
 pub fn conversations(d: &Daemon) -> Json {
     let connected = d.connected_people();
+    let relayed = d.relayed_people();
     let core = d.core();
     let me = core.identity.as_ref().map(|i| i.id());
     let contacts = core.contacts();
@@ -500,6 +503,7 @@ pub fn conversations(d: &Daemon) -> Json {
                 "trusted": c.regard.trusted,
                 "introductions": c.regard.introductions,
                 "connected": connected.contains(&c.identity),
+                "relayed": relayed.contains(&c.identity),
                 "unread": unread.count(),
                 "last": last.map(|m| json!({
                     "mine": Some(m.author) == me,

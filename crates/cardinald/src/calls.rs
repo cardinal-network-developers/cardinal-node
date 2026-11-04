@@ -125,7 +125,11 @@ fn ring_out(d: &Arc<Daemon>, id: [u8; 16]) {
 /// a call that is only ringing gives way.
 pub async fn start(d: &Arc<Daemon>, who: &str) -> anyhow::Result<Json> {
     let contact = contacts::listed(d, who)?;
-    let theirs = d.sessions_of(&contact.identity);
+    let mut theirs = d.sessions_of(&contact.identity);
+    if theirs.is_empty() && contact.connects() {
+        crate::rendezvous::reach_now(d, contact.identity, contact.space).await;
+        theirs = d.sessions_of(&contact.identity);
+    }
     anyhow::ensure!(
         !theirs.is_empty(),
         "{} cannot be reached right now",

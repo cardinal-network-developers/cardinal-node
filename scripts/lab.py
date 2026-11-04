@@ -8,6 +8,8 @@ there are to hand. Every link has a delay (LAB_DELAY_MS), because with none
 each pair of packets crosses at once and no hole can be punched.
 
     internet ── ana-home  (router, UDP 7171 forwarded to ana-host)
+             ├─ dan-home  (strict router, UDP 7171 forwarded to the nuc)
+             ├─ cousin-home (no host; or behind carrier-grade NAT)
              ├─ bo-home   (router, UDP 7171 forwarded to bo-host)
              ├─ cafe      (router, no forward)
              ├─ airport   (router, no forward)
@@ -17,8 +19,12 @@ each pair of packets crosses at once and no hole can be punched.
 import json
 import os
 import shutil
+import socket
+import statistics
+import struct
 import subprocess
 import sys
+import threading
 import time
 
 BIN, WORK = sys.argv[1], sys.argv[2]
@@ -181,6 +187,22 @@ class Dev:
 
     def status(self):
         return json.loads(self.cli("status", "--json"))
+
+    def ask(self, req):
+        """One request over the local interface, as a window makes it."""
+        with socket.socket(socket.AF_UNIX) as s:
+            s.settimeout(30)
+            s.connect(self.env["CARDINAL_SOCKET"])
+            s.sendall((json.dumps(req) + "\n").encode())
+            return json.loads(s.makefile().readline())
+
+    def contact(self):
+        """The one contact this device has, as it lists them."""
+        listed = self.ask({"cmd": "contacts"}).get("contacts") or [{}]
+        return listed[0]
+
+    def call_state(self):
+        return (self.ask({"cmd": "call"}).get("call") or {}).get("state")
 
     def log(self):
         with open(f"{self.home}/daemon.log", errors="replace") as f:
@@ -369,6 +391,129 @@ def people():
         d.stop()
 
 
+def talk(a, b, frames=250):
+    """Each side sends numbered, timestamped frames every 20 ms, as a call's
+    sound goes, and says what arrived and how late."""
+    heard = {a.name: [], b.name: []}
+    lines = {}
+    for d in (a, b):
+        s = socket.socket(socket.AF_UNIX)
+        s.connect(d.env["CARDINAL_SOCKET"])
+        s.sendall(b'{"cmd": "call-media"}\n')
+        lines[d.name] = s
+
+    def listen(name):
+        f = lines[name].makefile()
+        lines[name].settimeout(2)
+        try:
+            for line in f:
+                v = json.loads(line)
+                if "audio" in v:
+                    seq, sent = struct.unpack(">Id", bytes.fromhex(v["audio"])[:12])
+                    heard[name].append((seq, time.time() - sent))
+        except (OSError, ValueError):
+            pass
+
+    readers = [threading.Thread(target=listen, args=(n,), daemon=True) for n in heard]
+    for t in readers:
+        t.start()
+    time.sleep(0.3)
+    for n in range(frames):
+        for d in (a, b):
+            frame = struct.pack(">Id", n, time.time()) + bytes(60)
+            lines[d.name].sendall((json.dumps({"audio": frame.hex()}) + "\n").encode())
+        time.sleep(0.02)
+    time.sleep(1)
+    for s in lines.values():
+        s.close()
+    for t in readers:
+        t.join(3)
+    out = {}
+    for d, other in ((a, b), (b, a)):
+        got = heard[other.name]
+        late = sorted(x[1] * 1000 for x in got)
+        p99 = late[min(len(late) - 1, int(len(late) * 0.99))] if late else None
+        out[f"{d.name} to {other.name}"] = (len(got), frames,
+                                            late and round(statistics.median(late), 1),
+                                            p99 and round(p99, 1))
+    return out
+
+
+def cousin(theirs, label):
+    """Daniel and his cousin as they are: Daniel's home behind a strict router
+    (pfSense-style) with only the host forwarded, and the cousin's behind
+    `theirs` with no host of his own. They met by an invitation from Daniel's
+    host, the one device of his that anyone can reach. A message, a call each
+    way with frames counted and timed, and Daniel's laptop going away and
+    coming back."""
+    net = Net()
+    net.router("dan-home", "internet", "198.51.100.10", "198.51.100.1", "192.168.1", "hard",
+               forward="192.168.1.2")
+    if theirs == "cgnat":
+        net.router("carrier", "internet", "198.51.104.10", "198.51.104.1", "100.64.0", "easy")
+        net.router("cousin-home", "carrier", "100.64.1.10", "100.64.1.1", "192.168.2", "easy",
+                   up_if="to-cousin")
+        sh("ip netns exec carrier nft add rule ip filter through "
+           'iifname "to-cousin" accept')
+    else:
+        net.router("cousin-home", "internet", "198.51.101.10", "198.51.101.1", "192.168.2",
+                   theirs)
+    nuc = Dev(net, "nuc", "dan-home", 2)
+    laptop = Dev(net, "carbonite", "dan-home", 3)
+    him = Dev(net, "cousin", "cousin-home", 3)
+    nuc.start()
+    nuc.cli("init", "--yes", "--name", "nuc")
+    laptop.start()
+    pair(nuc, laptop)
+    nuc.cli("host", "--address", "198.51.100.10:7171")
+    wait("paired", 30, lambda: laptop.online("nuc"))
+    him.start()
+    him.cli("init", "--yes", "--name", "cousin")
+    code = nuc.cli("invite", "--address", "198.51.100.10:7171", "--name", "Daniel").strip()
+    t0 = time.monotonic()
+    him.cli("accept", code, "--name", "Daniel")
+    print(f"{label}:", flush=True)
+    found = wait("found", 120, lambda: laptop.contact().get("connected"))
+    print(f"    his device reached Daniel's laptop {found and round(time.monotonic() - t0)} s "
+          f"after accepting; relayed: {laptop.contact().get('relayed')}", flush=True)
+    if not found:
+        print("    log:", "\n    log: ".join(him.log().splitlines()[-12:]), flush=True)
+        for d in (him, laptop, nuc):
+            d.stop()
+        sh("for n in $(ip netns list | cut -d' ' -f1); do ip netns del $n; done", check=False)
+        return
+
+    him.cli("say", "Daniel", "can you hear me")
+    got = wait("message", 30, lambda: "can you hear me" in laptop.cli("messages", "cousin"))
+    print(f"    his message reached the laptop in {got and round(got, 1)} s", flush=True)
+
+    for caller, callee, who in ((laptop, him, "cousin"), (him, laptop, "Daniel")):
+        rung = time.monotonic()
+        r = caller.ask({"cmd": "call-start", "who": who})
+        ringing = wait("ringing", 20, lambda: callee.call_state() == "ringing")
+        if not ringing:
+            print(f"    {caller.name} calls: {r}; it never rang", flush=True)
+            continue
+        callee.ask({"cmd": "call-answer"})
+        live = wait("live", 10, lambda: caller.call_state() == "live")
+        print(f"    {caller.name} calls: rang in {round(time.monotonic() - rung, 1)} s, "
+              f"live: {live is not None}", flush=True)
+        for way, (n, sent, median, p99) in talk(caller, callee).items():
+            print(f"      {way}: {n} of {sent} frames, one-way median {median} ms, "
+                  f"p99 {p99} ms", flush=True)
+        caller.ask({"cmd": "call-end"})
+        wait("ended", 10, lambda: callee.call_state() is None)
+
+    laptop.stop()
+    time.sleep(2)
+    laptop.start()
+    back = wait("back", 120, lambda: laptop.contact().get("connected"))
+    print(f"    the laptop restarted, and he had it again in {back and round(back)} s", flush=True)
+    for d in (him, laptop, nuc):
+        d.stop()
+    sh("for n in $(ip netns list | cut -d' ' -f1); do ip netns del $n; done", check=False)
+
+
 os.makedirs(SOCKETS, exist_ok=True)
 os.makedirs(WORK, exist_ok=True)
 if "trace" in WHICH:
@@ -382,3 +527,6 @@ if "punch" in WHICH:
     punch("easy", "cgnat", "ordinary NAT at the cafe, carrier-grade NAT at the airport")
 if "people" in WHICH:
     people()
+if "cousin" in WHICH:
+    cousin("easy", "his home behind an ordinary router")
+    cousin("cgnat", "his home behind carrier-grade NAT")

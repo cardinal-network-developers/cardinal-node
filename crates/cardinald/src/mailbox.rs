@@ -416,6 +416,11 @@ impl Mailbox {
     }
 
     /// The token a session was opened with, if it was.
+    /// Whether a token is active here.
+    pub fn is_active(&self, token: &Token) -> bool {
+        lock(&self.store).is_active(token)
+    }
+
     pub fn token_of(&self, s: &Session) -> Option<Token> {
         match s.admission() {
             Admission::Secret { id, .. } if s.role() == Role::Responder => {
@@ -753,7 +758,7 @@ pub fn met(d: &Daemon, space: &SpaceId, member: &[u8; 32]) {
 }
 
 /// A host in use, until this goes.
-struct Going<'a> {
+pub(crate) struct Going<'a> {
     going: &'a Mutex<HashSet<[u8; 32]>>,
     host: [u8; 32],
 }
@@ -764,7 +769,7 @@ impl Drop for Going<'_> {
     }
 }
 
-fn going_to(d: &Daemon, host: [u8; 32]) -> Option<Going<'_>> {
+pub(crate) fn going_to(d: &Daemon, host: [u8; 32]) -> Option<Going<'_>> {
     claim(&d.mailbox.going, host)
 }
 
@@ -774,7 +779,7 @@ fn claim(going: &Mutex<HashSet<[u8; 32]>>, host: [u8; 32]) -> Option<Going<'_>> 
 }
 
 /// Where to try the hosts in `reach`.
-fn addresses(reach: &[Reach]) -> Vec<(&Reach, SocketAddr)> {
+pub(crate) fn addresses(reach: &[Reach]) -> Vec<(&Reach, SocketAddr)> {
     let hosts = reach.iter().take(MAX_REACH);
     hosts
         .flat_map(|r| {
@@ -792,7 +797,7 @@ fn addresses(reach: &[Reach]) -> Vec<(&Reach, SocketAddr)> {
 /// which this would end.
 async fn at_host(d: &Daemon, r: &Reach, addr: SocketAddr) -> Option<Session> {
     let here = *d.keys.link.public_key().x25519();
-    if r.host == here || d.session_kind(&r.host).is_some() {
+    if r.host == here || d.session_kind(&r.host).is_some() || d.rendezvous.holds(&r.host) {
         return None;
     }
     let secret = derive(Purpose::Token, &r.token);
