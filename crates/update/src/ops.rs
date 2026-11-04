@@ -470,8 +470,22 @@ pub fn update(ctx: &Ctx, from: Option<&str>, check: bool) -> anyhow::Result<Upda
              `systemctl --user start {UNIT_NAME}`.",
             m.version
         );
+    } else if paths.unit_file().exists() {
+        // As after `su`: the service may well be running, out of reach.
+        let user = std::env::var("USER").unwrap_or_else(|_| "USER".into());
+        println!(
+            "Updated cardinal {installed} -> {}. The service was not restarted, because \
+             `systemctl --user` cannot reach this user's services from here, so a daemon that \
+             is running is still {installed}. Restart it from this user's own login, or with \
+             `sudo systemctl --user -M {user}@ restart {UNIT_NAME}`.",
+            m.version
+        );
     } else {
-        println!("Updated cardinal {installed} -> {}.", m.version);
+        println!(
+            "Updated cardinal {installed} -> {}. A daemon that is running is still \
+             {installed} until it is restarted.",
+            m.version
+        );
     }
     println!(
         "The previous binary is kept at {}.",
