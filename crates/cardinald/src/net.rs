@@ -248,12 +248,18 @@ async fn handle_stream(d: &Arc<Daemon>, s: &Session, mut st: Stream) -> anyhow::
         return crate::mailbox::serve(d, s, st).await;
     }
     if st.service() == Service::BLOB {
-        if !may_fetch_blobs(d.session_kind(&s.peer_static())) {
-            st.reset(0);
-            return Ok(());
-        }
+        let kind = d.session_kind(&s.peer_static());
+        let allowed = match kind {
+            k if may_fetch_blobs(k) => None,
+            // A contact gets what was attached in the spaces they share.
+            Some(PeerKind::Contact(who, _)) => Some(crate::contacts::shared_blobs(d, &who)),
+            _ => {
+                st.reset(0);
+                return Ok(());
+            }
+        };
         tracing::trace!("blob stream {} accepted", st.id());
-        return serve_blob(d, st).await;
+        return serve_blob(d, st, allowed).await;
     }
     if st.service() == crate::speedtest::service() && crate::speedtest::offered() {
         return crate::speedtest::serve(d, s, st).await;
@@ -605,7 +611,13 @@ fn may_fetch_blobs(kind: Option<PeerKind>) -> bool {
     matches!(kind, Some(PeerKind::Own(_) | PeerKind::Proven))
 }
 
-async fn serve_blob(d: &Arc<Daemon>, mut st: Stream) -> anyhow::Result<()> {
+/// Serves blob objects: everything this device holds, or with `allowed`, only
+/// those.
+async fn serve_blob(
+    d: &Arc<Daemon>,
+    mut st: Stream,
+    allowed: Option<Arc<HashSet<[u8; 32]>>>,
+) -> anyhow::Result<()> {
     let Some(v) = st.recv_message_max(1 << 20).await? else {
         return Ok(());
     };
@@ -615,6 +627,9 @@ async fn serve_blob(d: &Arc<Daemon>, mut st: Stream) -> anyhow::Result<()> {
     let reply = tokio::task::spawn_blocking(move || {
         req.serve(|id| {
             use cardinal_blob::ObjectStore;
+            if allowed.as_ref().is_some_and(|a| !a.contains(id)) {
+                return None;
+            }
             store.get(id).ok().flatten()
         })
     })
@@ -659,7 +674,20 @@ pub async fn fetch_blobs(
     ids: &[[u8; 32]],
     priority: Priority,
 ) -> Vec<([u8; 32], Vec<u8>)> {
+    fetch_blobs_from(d, ids, priority, None).await
+}
+
+/// The same, asking a contact's devices too.
+pub async fn fetch_blobs_from(
+    d: &Arc<Daemon>,
+    ids: &[[u8; 32]],
+    priority: Priority,
+    contact: Option<[u8; 32]>,
+) -> Vec<([u8; 32], Vec<u8>)> {
     let mut f = BlobFetch::new(d.clone(), priority);
+    if let Some(who) = contact {
+        f = f.from_contact(who);
+    }
     let mut seen = HashSet::new();
     for id in ids {
         if seen.insert(*id) {
@@ -706,6 +734,8 @@ pub struct BlobFetch {
     peers_checked: Option<Instant>,
     inflight: tokio::task::JoinSet<BlobDone>,
     ready: VecDeque<BlobEvent>,
+    /// A contact whose devices may hold what is wanted too.
+    from: Option<[u8; 32]>,
 }
 
 impl BlobFetch {
@@ -719,7 +749,14 @@ impl BlobFetch {
             peers_checked: None,
             inflight: tokio::task::JoinSet::new(),
             ready: VecDeque::new(),
+            from: None,
         }
+    }
+
+    /// Asks a contact's devices as well as this person's.
+    pub fn from_contact(mut self, who: [u8; 32]) -> BlobFetch {
+        self.from = Some(who);
+        self
     }
 
     /// Adds an id to fetch, after those added before.
@@ -755,7 +792,10 @@ impl BlobFetch {
             return;
         }
         self.peers_checked = Some(Instant::now());
-        let sessions = self.d.own_sessions();
+        let mut sessions = self.d.own_sessions();
+        if let Some(who) = self.from {
+            sessions.extend(self.d.sessions_of(&who));
+        }
         let stats = self.d.blob_stats.lock().unwrap_or_else(|e| e.into_inner());
         let peers: Vec<([u8; 32], PeerStats)> = sessions
             .iter()

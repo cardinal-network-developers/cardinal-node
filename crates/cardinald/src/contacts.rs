@@ -12,6 +12,9 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
+use std::collections::HashSet;
+
+use cardinal_blob::{BlobReader, BlobRef, BlobWriter, ConvergenceSecret, NoFetch};
 use cardinal_contact::{ContactMessage, EndpointAddr, Invitation};
 use cardinal_encoding::Value;
 use cardinal_link::{CarrierKind, Priority, SecretEntry, Service, Session, Stream, Target};
@@ -611,12 +614,19 @@ pub(crate) fn listed(d: &Daemon, who: &str) -> anyhow::Result<ContactRecord> {
 }
 
 /// Writes a message to a contact.
-pub fn say(d: &Arc<Daemon>, who: &str, text: &str, reply_to: Option<&str>) -> anyhow::Result<Json> {
+pub async fn say(
+    d: &Arc<Daemon>,
+    who: &str,
+    text: &str,
+    reply_to: Option<&str>,
+    attach: &[String],
+) -> anyhow::Result<Json> {
     let contact = listed(d, who)?;
     let to = match reply_to {
         Some(id) => Some(message_in(d, &contact, id)?.id),
         None => None,
     };
+    let attachments = encode_attachments(d, &contact.space, attach).await?;
     let space = contact.space;
     let conversation = {
         let core = d.core();
@@ -626,10 +636,169 @@ pub fn say(d: &Arc<Daemon>, who: &str, text: &str, reply_to: Option<&str>) -> an
             .and_then(relationship::conversation)
     };
     let conversation = conversation.ok_or_else(|| anyhow::anyhow!("that space is not open yet"))?;
-    let op = relationship::create_reply(conversation, text, to);
+    let op = relationship::create_with(conversation, text, to, &attachments);
     d.write_and_push(&space, vec![op])?;
     confirm(d, space, contact.identity);
-    Ok(json!({"reachable": reachable(d, &contact, text)}))
+    Ok(json!({"reachable": reachable(d, &contact, text) && attachments.is_empty()}))
+}
+
+/// What kind of file a name says it is, by its ending.
+fn media_type(name: &str) -> &'static str {
+    let ending = name.rsplit_once('.').map(|(_, e)| e.to_ascii_lowercase());
+    match ending.as_deref() {
+        Some("jpg" | "jpeg") => "image/jpeg",
+        Some("png") => "image/png",
+        Some("gif") => "image/gif",
+        Some("webp") => "image/webp",
+        Some("heic") => "image/heic",
+        Some("pdf") => "application/pdf",
+        Some("txt") => "text/plain",
+        Some("mp4") => "video/mp4",
+        Some("mov") => "video/quicktime",
+        Some("mp3") => "audio/mpeg",
+        Some("m4a") => "audio/mp4",
+        Some("ogg" | "opus") => "audio/ogg",
+        Some("zip") => "application/zip",
+        _ => "application/octet-stream",
+    }
+}
+
+/// Encodes files to attach to a message, with the key of the space's current
+/// epoch, so only those in the space can read them.
+async fn encode_attachments(
+    d: &Arc<Daemon>,
+    space: &SpaceId,
+    paths: &[String],
+) -> anyhow::Result<Vec<relationship::Attachment>> {
+    if paths.is_empty() {
+        return Ok(Vec::new());
+    }
+    let secret = {
+        let core = d.core();
+        let open = core.spaces.get(space).and_then(|h| h.space.as_ref());
+        let open = open.ok_or_else(|| anyhow::anyhow!("that space is not open yet"))?;
+        let epoch = open.current_epoch();
+        let key = epoch.and_then(|e| open.keyring().get(&e));
+        let key = key.ok_or_else(|| anyhow::anyhow!("that space has no key yet"))?;
+        ConvergenceSecret::from_epoch_key(key.bytes())
+    };
+    let (d, paths) = (d.clone(), paths.to_vec());
+    tokio::task::spawn_blocking(move || {
+        let mut out = Vec::new();
+        for p in &paths {
+            let path = std::path::Path::new(p);
+            let mut file =
+                std::fs::File::open(path).map_err(|e| anyhow::anyhow!("cannot read {p}: {e}"))?;
+            anyhow::ensure!(file.metadata()?.is_file(), "{p} is not a file");
+            let name = path.file_name().map(|n| n.to_string_lossy().into_owned());
+            let name = name.ok_or_else(|| anyhow::anyhow!("{p} has no name"))?;
+            let mut w = BlobWriter::new(&secret, &*d.store);
+            std::io::copy(&mut file, &mut w)?;
+            let (blob, _) = w.finish()?;
+            out.push(relationship::Attachment {
+                media_type: media_type(&name).to_owned(),
+                name,
+                blob: blob.to_record(),
+            });
+        }
+        Ok(out)
+    })
+    .await?
+}
+
+/// The objects of what was attached in the space shared with `who`: all a
+/// contact may fetch from here (`sync.md#blob-transfer`). Worked out again
+/// only when the space has grown.
+pub fn shared_blobs(d: &Daemon, who: &[u8; 32]) -> Arc<HashSet<[u8; 32]>> {
+    let found = {
+        let core = d.core();
+        let contacts = core.contacts();
+        let space = contacts
+            .iter()
+            .find(|c| c.identity == *who)
+            .map(|c| c.space);
+        let held = space.and_then(|s| core.spaces.get(&s));
+        held.and_then(|h| {
+            let open = h.space.as_ref()?;
+            let attached: Vec<relationship::Attachment> = relationship::messages(open)
+                .into_iter()
+                .flat_map(|m| m.attachments)
+                .collect();
+            Some((h.set_len(), attached))
+        })
+    };
+    let Some((size, attached)) = found else {
+        return Arc::default();
+    };
+    let cache = d.shared_blobs.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some((_, ids)) = cache.get(who).filter(|(was, _)| *was == size) {
+        return ids.clone();
+    }
+    drop(cache);
+    let mut ids = HashSet::new();
+    for a in &attached {
+        let Ok(blob) = BlobRef::from_record(&a.blob) else {
+            continue;
+        };
+        // What this device holds of it: an index it has not got names nothing.
+        let mut reader = BlobReader::new(&*d.store, &NoFetch, blob);
+        let _ = reader.for_each_object(|id| {
+            ids.insert(*id);
+        });
+    }
+    let ids = Arc::new(ids);
+    let mut cache = d.shared_blobs.lock().unwrap_or_else(|e| e.into_inner());
+    cache.insert(*who, (size, ids.clone()));
+    ids
+}
+
+/// Saves a file attached to a message at `to`, fetching from this person's
+/// devices and the contact's whatever is not here. Nothing is left at `to`
+/// unless all of it arrived.
+pub async fn save_attachment(
+    d: &Arc<Daemon>,
+    who: &str,
+    id: &str,
+    index: usize,
+    to: &str,
+) -> anyhow::Result<Json> {
+    let contact = listed(d, who)?;
+    let m = message_in(d, &contact, id)?;
+    let a = m.attachments.get(index);
+    let a = a.ok_or_else(|| anyhow::anyhow!("that message has no such attachment"))?;
+    let blob = BlobRef::from_record(&a.blob)
+        .map_err(|_| anyhow::anyhow!("that attachment cannot be read"))?;
+    let to = std::path::PathBuf::from(to);
+    anyhow::ensure!(!to.exists(), "{} is there already", to.display());
+    let (d, them) = (d.clone(), contact.identity);
+    let written = to.clone();
+    let size = tokio::task::spawn_blocking(move || -> anyhow::Result<u64> {
+        use std::io::Write;
+        let fetch = crate::fetch::Fetcher::from_contact(&d, Priority::Interactive, them);
+        let mut reader = BlobReader::new(&*d.store, &fetch, blob);
+        let size = reader.size();
+        let part = written.with_extension("part");
+        let mut out = std::fs::File::create(&part)?;
+        let mut at = 0u64;
+        while at < size {
+            let piece = match reader.read_range(at, 1 << 20) {
+                Ok(p) if !p.is_empty() => p,
+                _ => {
+                    let _ = std::fs::remove_file(&part);
+                    anyhow::bail!(
+                        "part of it could not be fetched; try again when they are online"
+                    );
+                }
+            };
+            out.write_all(&piece)?;
+            at += piece.len() as u64;
+        }
+        out.sync_all()?;
+        std::fs::rename(&part, &written)?;
+        Ok(size)
+    })
+    .await??;
+    Ok(json!({"path": to, "size": size}))
 }
 
 /// A message in the conversation with a contact, by the id `messages` gives.
@@ -814,6 +983,11 @@ pub fn messages(d: &Daemon, who: &str) -> anyhow::Result<Json> {
                 "time": m.time,
                 "state": mine.then(|| state_of(read, unsent.contains(&m.entry))),
                 "reply_to": m.reply_to.map(hex::encode),
+                "attachments": m.attachments.iter().map(|a| json!({
+                    "name": a.name,
+                    "type": a.media_type,
+                    "size": BlobRef::from_record(&a.blob).map(|b| b.size).ok(),
+                })).collect::<Vec<_>>(),
                 "edited": m.edited,
                 "reactions": reactions_of(m, me),
             })

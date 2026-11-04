@@ -366,3 +366,49 @@ fn messages_can_be_answered_changed_and_reacted_to() {
     wait("gone for bo", 20, || said(&b, "Ana").len() == 1);
     assert_eq!(said(&b, "Ana")[0]["text"], "hi");
 }
+
+/// A file goes with a message. The other person sees what it is, and saves it
+/// whole, fetched from the sender's device, which serves it to them and
+/// nothing else of its own.
+#[test]
+fn a_file_goes_with_a_message() {
+    if !fuse_available() {
+        eprintln!("skipping: /dev/fuse or fusermount3 is not available");
+        return;
+    }
+    let root = tempfile::tempdir().unwrap();
+    let (a, b) = met(root.path());
+    let bo = only(&a)["name"].as_str().unwrap().to_owned();
+    let photo: Vec<u8> = (0..700_000u32).map(|n| (n * 31 % 251) as u8).collect();
+    let path = root.path().join("photo.jpg");
+    std::fs::write(&path, &photo).unwrap();
+    let attach = json!([path.to_str().unwrap()]);
+    ask(
+        &a,
+        json!({"cmd": "say", "who": bo, "text": "a photo", "attach": attach}),
+    );
+    wait("bo has it", 20, || said(&b, "Ana").len() == 1);
+    let m = said(&b, "Ana")[0].clone();
+    assert_eq!(m["attachments"][0]["name"], "photo.jpg");
+    assert_eq!(m["attachments"][0]["type"], "image/jpeg");
+    assert_eq!(m["attachments"][0]["size"], 700_000);
+
+    let to = root.path().join("saved.jpg");
+    let req = json!({"cmd": "save-attachment", "who": "Ana", "id": m["id"], "index": 0, "to": to});
+    ask(&b, req.clone());
+    assert_eq!(std::fs::read(&to).unwrap(), photo);
+    let again = turned_down(&b, req);
+    assert!(again.contains("already"), "{again}");
+
+    // The same from the command line.
+    let listed = b.cli(&["messages", "Ana"]);
+    let line = listed
+        .lines()
+        .find(|l| l.contains("photo.jpg"))
+        .unwrap_or_default();
+    assert!(line.contains("cardinal save Ana"), "{listed}");
+    let id = m["id"].as_str().unwrap();
+    let to = root.path().join("by-hand.jpg");
+    b.cli(&["save", "Ana", id, "1", to.to_str().unwrap()]);
+    assert_eq!(std::fs::read(&to).unwrap(), photo);
+}

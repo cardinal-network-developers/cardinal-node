@@ -188,6 +188,20 @@ enum Cmd {
         who: String,
         /// What to say.
         text: String,
+        /// A file to send with it; give it again for more.
+        #[arg(long)]
+        attach: Vec<PathBuf>,
+    },
+    /// Save a file someone sent you, as `cardinal messages` shows it.
+    Save {
+        /// Who, as `cardinal contacts` shows.
+        who: String,
+        /// The message, as `cardinal messages` shows it.
+        message: String,
+        /// Which of its files, from 1.
+        n: usize,
+        /// Where to save it.
+        to: PathBuf,
     },
     /// Your conversation with a contact.
     Messages {
@@ -1351,8 +1365,14 @@ async fn client(cmd: Cmd) -> anyhow::Result<()> {
                 Ok(())
             }
         },
-        Cmd::Say { who, text } => {
-            let v = call(&paths, json!({"cmd": "say", "who": who, "text": text})).await?;
+        Cmd::Say { who, text, attach } => {
+            // The daemon has its own working directory.
+            let attach: Vec<PathBuf> = attach
+                .iter()
+                .map(std::path::absolute)
+                .collect::<Result<_, _>>()?;
+            let req = json!({"cmd": "say", "who": who, "text": text, "attach": attach});
+            let v = call(&paths, req).await?;
             if v["reachable"] == false {
                 println!(
                     "Kept here: this cannot reach {who} through a host, so it waits \
@@ -1370,7 +1390,34 @@ async fn client(cmd: Cmd) -> anyhow::Result<()> {
                     who.as_str()
                 };
                 println!("{by}: {}", m["text"].as_str().unwrap_or(""));
+                let files = m["attachments"].as_array().cloned().unwrap_or_default();
+                for (n, a) in files.iter().enumerate() {
+                    let size = a["size"].as_u64().map(human_size).unwrap_or_default();
+                    println!(
+                        "    {} ({size}): cardinal save {who} {} {} PATH",
+                        a["name"].as_str().unwrap_or(""),
+                        m["id"].as_str().unwrap_or(""),
+                        n + 1
+                    );
+                }
             }
+            Ok(())
+        }
+        Cmd::Save {
+            who,
+            message,
+            n,
+            to,
+        } => {
+            anyhow::ensure!(n >= 1, "files are counted from 1");
+            let to = std::path::absolute(&to)?;
+            let req = json!({"cmd": "save-attachment", "who": who, "id": message, "index": n - 1, "to": to});
+            let v = call(&paths, req).await?;
+            println!(
+                "Saved {} at {}.",
+                human_size(v["size"].as_u64().unwrap_or(0)),
+                to.display()
+            );
             Ok(())
         }
         Cmd::Host { addresses, off } => {

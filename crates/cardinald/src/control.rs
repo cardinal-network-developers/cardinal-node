@@ -262,7 +262,21 @@ async fn handle(d: &Arc<Daemon>, req: &Value) -> anyhow::Result<Value> {
         },
         "say" => {
             let reply_to = req.get("reply_to").and_then(|v| v.as_str());
-            crate::contacts::say(d, arg(req, "who")?, arg(req, "text")?, reply_to)
+            let attach: Vec<String> = req
+                .get("attach")
+                .and_then(|v| v.as_array())
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|p| p.as_str().map(str::to_owned))
+                        .collect()
+                })
+                .unwrap_or_default();
+            crate::contacts::say(d, arg(req, "who")?, arg(req, "text")?, reply_to, &attach).await
+        }
+        "save-attachment" => {
+            let index = req.get("index").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+            let (who, id, to) = (arg(req, "who")?, arg(req, "id")?, arg(req, "to")?);
+            crate::contacts::save_attachment(d, who, id, index, to).await
         }
         "edit-message" => {
             crate::contacts::edit_message(d, arg(req, "who")?, arg(req, "id")?, arg(req, "text")?)

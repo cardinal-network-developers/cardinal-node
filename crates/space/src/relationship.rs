@@ -131,15 +131,61 @@ pub fn create_message(conversation: NodeId, text: &str) -> SpaceOp {
 /// `create` of a message in reply to another. A message is its author's
 /// alone: nobody else can change or delete it.
 pub fn create_reply(conversation: NodeId, text: &str, to: Option<NodeId>) -> SpaceOp {
+    create_with(conversation, text, to, &[])
+}
+
+/// `create` of a message with files attached, in reply to another if given.
+pub fn create_with(
+    conversation: NodeId,
+    text: &str,
+    to: Option<NodeId>,
+    attachments: &[Attachment],
+) -> SpaceOp {
+    let attached = (!attachments.is_empty()).then(|| {
+        Value::list(attachments.iter().map(|a| {
+            Value::Record(
+                Record::new()
+                    .with(1, a.name.as_str())
+                    .with(2, Value::Record(a.blob.clone()))
+                    .with(3, a.media_type.as_str()),
+            )
+        }))
+    });
     SpaceOp::create(
         NodeKind::Uint(MESSAGE),
         conversation,
         "message",
         Record::new()
             .with(1, text)
+            .with_opt(2, attached)
             .with_opt(3, to)
             .with(AUTHOR_OWNED_FIELD, 1u64),
     )
+}
+
+/// A file attached to a message.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Attachment {
+    /// What the sender called it.
+    pub name: String,
+    /// Its blob reference (`blobs.md#references`).
+    pub blob: Record,
+    /// What kind of file it is, such as `image/jpeg`.
+    pub media_type: String,
+}
+
+fn read_attachments(v: Option<&Value>) -> Vec<Attachment> {
+    let list = v.and_then(Value::as_list).unwrap_or_default();
+    list.iter()
+        .filter_map(|a| {
+            let r = a.as_record()?;
+            Some(Attachment {
+                name: r.get(1)?.as_text()?.to_owned(),
+                blob: r.get(2)?.as_record()?.clone(),
+                media_type: r.get(3).and_then(Value::as_text).unwrap_or("").to_owned(),
+            })
+        })
+        .collect()
 }
 
 /// Changes what a message says. Its history keeps what it said before.
@@ -214,7 +260,7 @@ pub fn read_by(space: &Space, who: &IdentityId, messages: &[Message]) -> Vec<boo
 }
 
 /// A message.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Message {
     /// Its node.
     pub id: NodeId,
@@ -232,6 +278,8 @@ pub struct Message {
     pub edited: bool,
     /// What each member reacted with.
     pub reactions: Vec<Reaction>,
+    /// Files that came with it.
+    pub attachments: Vec<Attachment>,
 }
 
 /// A member's reaction to a message.
@@ -297,6 +345,9 @@ pub fn messages(space: &Space) -> Vec<Message> {
                 reply_to: reply_to.and_then(|b| NodeId::try_from(b).ok()),
                 edited: n.values(1).iter().any(|v| v.entry != n.created_in),
                 reactions,
+                attachments: read_attachments(
+                    n.values(2).iter().rev().find_map(|v| v.value.as_ref()),
+                ),
             };
             Some((space.dag().position(&n.created_in)?, message))
         })

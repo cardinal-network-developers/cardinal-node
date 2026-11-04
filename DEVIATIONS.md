@@ -90,11 +90,17 @@ should eventually be resolved by changing either the code or the spec.
 
 ## Blobs (`spec/blobs.md`)
 
-- **Blobs are served only to a person's own devices.** `sync.md#blob-transfer`
-  serves any peer with a session, contacts included, since an id is the right
-  to fetch it. Here a contact who knew the id of a private chunk would get it,
-  and nothing shared with other people has chunks yet. Attachments will need a
-  contact served the chunks of what is shared with them, and no others.
+- **A contact is served only what is attached in what they share.**
+  `sync.md#blob-transfer` serves any peer with a session, since an id is the
+  right to fetch it. Here a person's own devices get anything, and a contact
+  only the chunks and indexes of attachments in the space shared with them, so
+  one who knew the id of a private chunk would still not get it.
+- **Attachments are fetched only from the people's own devices, while online.**
+  A host keeps no copy, and `storage` `allow` is not used, so a file sent while
+  the sender's laptop was on can be saved only while a device of theirs that
+  holds it is on. Their chunks are never freed, by `free-space` or otherwise.
+  A media type comes from the file's ending, and the windows do not offer
+  attachments yet.
 - **Spec ambiguity: the gear table's range.** "for `i` in `0..255`" reads
   as 255 entries, but the table is indexed by a byte. Chose all 256 byte
   values, `i` in `0..=255` (`vectors/blob.json`, `gear_table_blake3`).
@@ -721,8 +727,8 @@ asks for around that is not built yet.
   conversation node, so a contact can delete or move it, which hides every
   message until it is restored.
 - **Group spaces, shared folders, roles other than owner, and `remove_member`**
-  are not implemented. A relationship space has only its conversation, and
-  its messages have no attachments.
+  are not implemented. A relationship space has only its conversation, and no
+  shared files.
 - **Contacts are not told apart from members by more than this device's account
   space.** A device opens a session with a contact's devices only for what they
   share (`spaces.md#holding-a-space`), and notices for a set go only to contacts

@@ -20,6 +20,7 @@ use crate::sched::Rank;
 pub struct Fetcher {
     d: std::sync::Weak<Daemon>,
     priority: Priority,
+    contact: Option<[u8; 32]>,
 }
 
 impl Fetcher {
@@ -28,6 +29,15 @@ impl Fetcher {
         Fetcher {
             d: Arc::downgrade(d),
             priority,
+            contact: None,
+        }
+    }
+
+    /// One that asks a contact's devices too, for what they shared.
+    pub fn from_contact(d: &Arc<Daemon>, priority: Priority, who: [u8; 32]) -> Fetcher {
+        Fetcher {
+            contact: Some(who),
+            ..Fetcher::new(d, priority)
         }
     }
 }
@@ -38,7 +48,12 @@ impl Fetch for Fetcher {
             return Ok(Vec::new());
         };
         let rt = d.rt.clone();
-        let got = rt.block_on(crate::net::fetch_blobs(&d, ids, self.priority));
+        let got = rt.block_on(crate::net::fetch_blobs_from(
+            &d,
+            ids,
+            self.priority,
+            self.contact,
+        ));
         let n: usize = got.iter().map(|(_, b)| b.len()).sum();
         d.progress
             .lock()

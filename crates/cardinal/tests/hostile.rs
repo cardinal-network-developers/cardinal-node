@@ -17,7 +17,7 @@ use cardinal_link::{
     Bind, CarrierKind, Endpoint, EndpointConfig, LocalIdentity, MemoryDirectory, Priority,
     SecretEntry, Service, Session, Target,
 };
-use cardinal_sync::{BlobRequest, MemSet, Message, Mode, Range, Reconciler};
+use cardinal_sync::{BlobItem, BlobReply, BlobRequest, MemSet, Message, Mode, Range, Reconciler};
 use cardinald::keys::Keys;
 use cardinald::mailbox::TOKEN_SESSIONS;
 use common::*;
@@ -416,13 +416,19 @@ fn a_contact_opens_what_they_share_and_nothing_else() {
     let private_file: Vec<u8> = (0..3_000_000u32).map(|n| (n * 7 % 251) as u8).collect();
     std::fs::write(ana.p("private.bin"), &private_file).unwrap();
     ana.cli(&["flush"]);
+    // Taken now: one of what Ana sends bo below would be served to him.
+    let chunk = a_chunk(&ana.home.join("blobs"));
     contacts(&ana, &bo);
     bo.cli(&["say", "Ana", "an honest word"]);
     wait("ana reads it", 20, || {
         ana.cli(&["messages", "bo"]).contains("an honest word")
     });
+    // Something of hers that bo may fetch, so that what he may is not nothing.
+    let sent = root.path().join("for-bo.bin");
+    std::fs::write(&sent, vec![5u8; 300_000]).unwrap();
+    let sent = sent.to_str().unwrap();
+    ana.cli(&["say", "bo", "a file", "--attach", sent]);
 
-    let chunk = a_chunk(&ana.home.join("blobs"));
     let theirs = spaces(&bo);
     let (shared, private): (Vec<_>, Vec<_>) =
         spaces(&ana).into_iter().partition(|s| theirs.contains(s));
@@ -477,10 +483,16 @@ fn a_contact_opens_what_they_share_and_nothing_else() {
         blob.send_message_bytes(&wanted.encode()).await.unwrap();
         let _ = blob.shutdown().await;
         let got = tokio::time::timeout(Duration::from_secs(3), blob.recv_message_max(1 << 24));
-        assert!(
-            !matches!(got.await, Ok(Ok(Some(_)))),
-            "read a private chunk"
-        );
+        // A contact may be served what is attached in what they share, and is
+        // told that anything else is not held.
+        if let Ok(Ok(Some(v))) = got.await {
+            let reply = BlobReply::decode(&v.encode()).unwrap();
+            let held = reply
+                .items
+                .iter()
+                .any(|i| matches!(i, BlobItem::Held { .. }));
+            assert!(!held, "read a private chunk");
+        }
 
         // An invitation is over once it is over.
         let hello = Record::new().with(0, 1u64).with(1, [1u8; 32]).with(2, "x");

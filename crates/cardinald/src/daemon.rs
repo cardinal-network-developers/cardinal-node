@@ -27,6 +27,10 @@ use crate::keys::Keys;
 use crate::net::{self, Access};
 use crate::paths::{write_private, Paths};
 
+/// What a contact may fetch from here, and the size of the space it was
+/// worked out from.
+pub type SharedBlobs = (usize, Arc<HashSet<[u8; 32]>>);
+
 /// Who a session's peer is.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PeerKind {
@@ -248,6 +252,8 @@ pub struct Daemon {
     pub call: Mutex<Option<crate::calls::Call>>,
     /// When each contact rang lately, so they can ring only so often.
     pub rang: Mutex<HashMap<[u8; 32], std::collections::VecDeque<Instant>>>,
+    /// What each contact may fetch from here.
+    pub shared_blobs: Mutex<HashMap<[u8; 32], SharedBlobs>>,
     /// Audio heard on calls, for a client, by call.
     pub call_audio: tokio::sync::broadcast::Sender<([u8; 16], bytes::Bytes)>,
     /// An identity made for a client, until its person has written the words
@@ -417,6 +423,7 @@ impl Daemon {
             pairing: Mutex::new(PairState::Idle),
             call: Mutex::new(None),
             rang: Mutex::new(HashMap::new()),
+            shared_blobs: Mutex::new(HashMap::new()),
             call_audio: tokio::sync::broadcast::channel(64).0,
             setting_up: Mutex::new(None),
             mount: Mutex::new(None),
