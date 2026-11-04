@@ -90,6 +90,11 @@ should eventually be resolved by changing either the code or the spec.
 
 ## Blobs (`spec/blobs.md`)
 
+- **Blobs are served only to a person's own devices.** `sync.md#blob-transfer`
+  serves any peer with a session, contacts included, since an id is the right
+  to fetch it. Here a contact who knew the id of a private chunk would get it,
+  and nothing shared with other people has chunks yet. Attachments will need a
+  contact served the chunks of what is shared with them, and no others.
 - **Spec ambiguity: the gear table's range.** "for `i` in `0..255`" reads
   as 255 entries, but the table is indexed by a byte. Chose all 256 byte
   values, `i` in `0..=255` (`vectors/blob.json`, `gear_table_blake3`).
