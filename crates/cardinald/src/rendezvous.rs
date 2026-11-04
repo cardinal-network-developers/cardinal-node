@@ -66,6 +66,9 @@ const AGREED_FOR: Duration = Duration::from_secs(60);
 const TOKEN_ASK_GAP: Duration = Duration::from_secs(1);
 /// How often to look for a trusted contact this device cannot reach.
 const REACH_EVERY: Duration = Duration::from_secs(30);
+/// The most devices a contact's host may name: a log can name any number,
+/// and each one named is sent to.
+const MAX_FOUND: usize = 8;
 /// The least time between looks for one contact, when a call wants them now.
 const REACH_GAP: Duration = Duration::from_secs(5);
 /// How long a call waits for a contact to be found.
@@ -101,6 +104,9 @@ type Static = [u8; 32];
 /// What a device answered a token holder: itself, and yes or no.
 type Answer = (Static, bool);
 
+/// The asks waiting for answers, each with its number.
+type Waiting = Vec<(u64, mpsc::UnboundedSender<Answer>)>;
+
 /// What this device keeps about rendezvous, as a device and as a host.
 #[derive(Default)]
 pub struct Rendezvous {
@@ -118,11 +124,15 @@ pub struct Rendezvous {
     asked: Mutex<Option<Instant>>,
     /// As a host: the token holders waiting for a person's devices to agree,
     /// by the holder's static key, and where the answers go.
-    answers: Mutex<HashMap<Static, mpsc::UnboundedSender<Answer>>>,
+    answers: Mutex<HashMap<Static, Waiting>>,
+    /// As a host: a number for each ask, so two from one holder keep apart.
+    asks: std::sync::atomic::AtomicU64,
     /// As a host: which device agreed to which token holder, and when.
     agreed: Mutex<HashMap<(Static, Static), Instant>>,
-    /// As a host: when each token was last used to ask.
-    token_asked: Mutex<HashMap<Token, Instant>>,
+    /// As a host: when each holder last asked with each token. Per holder, so
+    /// someone else with the same token cannot keep the holder waiting; a
+    /// token holds only so many sessions at once.
+    token_asked: Mutex<HashMap<(Token, Static), Instant>>,
     /// Sessions with contacts' hosts that relays to them run through, by
     /// host, and whose host each is.
     paths: Mutex<HashMap<Static, (Static, Session)>>,
@@ -711,18 +721,16 @@ fn holder_token(d: &Daemon, kind: &PeerKind, r: &Record) -> Option<Token> {
 /// are named, so nothing tells the holder whether the others are online. The
 /// ones named are then told where the holder is, and each side tries the other.
 async fn connect_holder(d: &Arc<Daemon>, s: &Session, token: Token) -> Record {
+    let holder = s.peer_static();
     {
         let mut asked = lock(&d.rendezvous.token_asked);
-        if asked
-            .get(&token)
-            .is_some_and(|t| t.elapsed() < TOKEN_ASK_GAP)
-        {
+        let when = asked.get(&(token, holder));
+        if when.is_some_and(|t| t.elapsed() < TOKEN_ASK_GAP) {
             return error(BUSY);
         }
         asked.retain(|_, t| t.elapsed() < TOKEN_ASK_GAP);
-        asked.insert(token, Instant::now());
+        asked.insert((token, holder), Instant::now());
     }
-    let holder = s.peer_static();
     let present: Vec<([u8; 32], Session, Vec<SocketAddr>)> = {
         let mut present = lock(&d.rendezvous.present);
         present.retain(|_, p| !p.session.is_closed());
@@ -734,7 +742,14 @@ async fn connect_holder(d: &Arc<Daemon>, s: &Session, token: Token) -> Record {
     };
     tracing::debug!("a token holder looks for {} devices here", present.len());
     let (tx, mut rx) = mpsc::unbounded_channel();
-    lock(&d.rendezvous.answers).insert(holder, tx);
+    let ask_id = d
+        .rendezvous
+        .asks
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    lock(&d.rendezvous.answers)
+        .entry(holder)
+        .or_default()
+        .push((ask_id, tx));
     let ask = Record::new()
         .with(0, OP_INCOMING)
         .with(1, holder)
@@ -759,7 +774,20 @@ async fn connect_holder(d: &Arc<Daemon>, s: &Session, token: Token) -> Record {
             _ = &mut deadline => break,
         }
     }
-    lock(&d.rendezvous.answers).remove(&holder);
+    {
+        let mut answers = lock(&d.rendezvous.answers);
+        if let Some(mine) = answers.get_mut(&holder) {
+            mine.retain(|(id, _)| *id != ask_id);
+            if mine.is_empty() {
+                answers.remove(&holder);
+            }
+        }
+    }
+    // Nobody agreed: the reply comes when it would with no device here, so
+    // how long it took says nothing of who is.
+    if agreed.is_empty() {
+        deadline.await;
+    }
 
     let theirs = observed(s);
     let mut found = Vec::new();
@@ -798,8 +826,10 @@ fn answered(d: &Daemon, s: &Session, r: &Record) {
         return;
     };
     let yes = r.get(2).and_then(Value::as_bool) == Some(true);
-    if let Some(tx) = lock(&d.rendezvous.answers).get(&who) {
-        let _ = tx.send((s.peer_static(), yes));
+    if let Some(waiting) = lock(&d.rendezvous.answers).get(&who) {
+        for (_, tx) in waiting {
+            let _ = tx.send((s.peer_static(), yes));
+        }
     }
 }
 
@@ -866,6 +896,10 @@ fn trusted_holder(
             continue;
         };
         let st = o.log.state();
+        // A frozen identity's keys open nothing (`identity.md`).
+        if st.frozen {
+            continue;
+        }
         let links = st.keys.values().filter_map(|k| k.link_key.clone());
         if let Some(link) = links.into_iter().find(|l| l.x25519() == who) {
             return Some(link);
@@ -878,6 +912,9 @@ fn trusted_holder(
 fn contact_device(d: &Daemon, who: &[u8; 32], x: &[u8; 32]) -> Option<(KeyId, HybridPublicKey)> {
     let core = d.core();
     let st = core.others.get(who)?.log.state();
+    if st.frozen {
+        return None;
+    }
     let found = st.keys.values().find_map(|k| {
         let link = k.link_key.clone()?;
         (link.x25519() == x).then_some((k.key, link))
@@ -968,8 +1005,7 @@ async fn reach(d: &Arc<Daemon>, who: [u8; 32], space: SpaceId) {
     }
     let _looking = Looking { d, who };
     lock(&d.rendezvous.looked).insert(who, Instant::now());
-    let reach = d.core().reach_of(&space, &who).map(|(_, r)| r);
-    let reach = reach.unwrap_or_default();
+    let reach = d.core().all_reach_of(&space, &who);
     tracing::debug!("looking for {} at {} hosts", short(&who), reach.len());
     for (r, addr) in crate::mailbox::addresses(&reach) {
         if let Err(e) = through_host(d, &who, r, addr).await {
@@ -994,7 +1030,7 @@ async fn through_host(
         Ok(reply) if reply.get(0).and_then(Value::as_uint) == Some(OP_CONNECT) => {
             let list = reply.record_list(1).unwrap_or_default();
             list.into_iter()
-                .take(MAX_DEVICES)
+                .take(MAX_FOUND)
                 .filter_map(read_found)
                 .collect()
         }

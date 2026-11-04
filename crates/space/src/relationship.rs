@@ -81,14 +81,22 @@ pub fn set_reach(node: NodeId, reach: &[Reach]) -> SpaceOp {
 /// Every host and token in the reach nodes `who` wrote. Two devices writing at
 /// once can leave more than one, and what each gives stays good.
 pub fn all_reach_of(state: &State, who: &IdentityId) -> Vec<Reach> {
+    reach_nodes(state, who)
+        .into_iter()
+        .flat_map(|(_, reach)| reach)
+        .collect()
+}
+
+/// Each reach node `who` wrote, with what it says.
+pub fn reach_nodes(state: &State, who: &IdentityId) -> Vec<(NodeId, Vec<Reach>)> {
     let nodes = state.children(&ROOT).into_iter();
     let mine = nodes.filter(|n| n.kind == NodeKind::Uint(REACH) && !n.deleted && n.creator == *who);
-    let lists = mine.map(|n| n.field(1).and_then(Value::as_list).unwrap_or_default());
-    let mut all = Vec::new();
-    for list in lists {
-        all.extend(list.iter().filter_map(|v| read_reach(v.as_record()?)));
-    }
-    all
+    mine.map(|n| {
+        let list = n.field(1).and_then(Value::as_list).unwrap_or_default();
+        let reach = list.iter().filter_map(|v| read_reach(v.as_record()?));
+        (n.id, reach.collect())
+    })
+    .collect()
 }
 
 /// The reach node `who` wrote, with where it says they are.

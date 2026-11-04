@@ -819,6 +819,21 @@ impl Core {
         })
     }
 
+    /// Each reach node `who` wrote in a space, with what it says.
+    pub fn reach_nodes_of(
+        &self,
+        space: &SpaceId,
+        who: &[u8; 32],
+    ) -> Vec<(
+        cardinal_space::NodeId,
+        Vec<cardinal_space::relationship::Reach>,
+    )> {
+        let Some(h) = self.spaces.get(space).and_then(|h| h.space.as_ref()) else {
+            return Vec::new();
+        };
+        cardinal_space::relationship::reach_nodes(h.state(), who)
+    }
+
     /// Every host and token `who` gave in a space, from all their reach nodes.
     pub fn all_reach_of(
         &self,

@@ -140,6 +140,24 @@ struct Meta {
     author_owned: bool,
 }
 
+/// The field of a node of `kind` that a profile declares to hold a node id,
+/// which names that node as surely as an op does (`state.md#state-tree`): a
+/// message's "in reply to".
+fn node_field(profile: Profile, kind: NodeKind) -> Option<u64> {
+    (profile == Profile::RELATIONSHIP && kind == NodeKind::Uint(2)).then_some(3)
+}
+
+/// Whether a value in a field that holds a node id names a node that is known.
+fn names_known(value: Option<&Value>, known: impl Fn(&NodeId) -> bool) -> bool {
+    match value {
+        None => true,
+        Some(v) => v
+            .as_bytes()
+            .and_then(|b| NodeId::try_from(b).ok())
+            .is_some_and(|n| known(&n)),
+    }
+}
+
 /// The nodes named by an op (`state.md#operations`): target, parent, and
 /// new parent.
 pub fn named_nodes(op: &SpaceOpBody) -> Vec<NodeId> {
@@ -384,7 +402,10 @@ impl State {
                     fields,
                     ..
                 } => {
+                    let names = node_field(self.profile, *kind).map(|f| fields.get(f));
                     let ok = known(parent, &local, &self.registry)
+                        && names
+                            .is_none_or(|v| names_known(v, |n| known(n, &local, &self.registry)))
                         && may_place(
                             self.profile,
                             *kind,
@@ -406,9 +427,17 @@ impl State {
                     );
                     ok
                 }
-                SpaceOpBody::Set { node, .. }
-                | SpaceOpBody::Delete { node }
-                | SpaceOpBody::Restore { node } => {
+                SpaceOpBody::Set { node, key, value } => {
+                    let field = self
+                        .kind_of(node, &local)
+                        .and_then(|k| node_field(self.profile, k));
+                    *node != ROOT
+                        && known(node, &local, &self.registry)
+                        && owned_ok(node, &local, &self.registry)
+                        && (field != Some(*key)
+                            || names_known(value.as_ref(), |n| known(n, &local, &self.registry)))
+                }
+                SpaceOpBody::Delete { node } | SpaceOpBody::Restore { node } => {
                     *node != ROOT
                         && known(node, &local, &self.registry)
                         && owned_ok(node, &local, &self.registry)

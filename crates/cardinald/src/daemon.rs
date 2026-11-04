@@ -277,6 +277,8 @@ pub struct Daemon {
     invitations: Mutex<HashMap<u64, account::Regard>>,
     /// The account's outstanding invitations this device lets in.
     admitted: Mutex<HashMap<[u8; 16], u64>>,
+    /// Exchanges under way on each invitation's secret.
+    using: Mutex<HashMap<u64, u32>>,
     /// The space made for each invitation's session, by the peer's static
     /// key.
     invited: Mutex<HashMap<[u8; 32], SpaceId>>,
@@ -432,6 +434,7 @@ impl Daemon {
             speedtest: crate::speedtest::Limiter::default(),
             invitations: Mutex::new(HashMap::new()),
             admitted: Mutex::new(HashMap::new()),
+            using: Mutex::new(HashMap::new()),
             invited: Mutex::new(HashMap::new()),
             exchanging: Mutex::new(HashSet::new()),
             placement_lock: Mutex::new(()),
@@ -576,8 +579,6 @@ impl Daemon {
             .collect()
     }
 
-    /// Who a session's peer was last found to be. Takes no lock on the core,
-    /// so it is fit for a path as busy as serving blobs.
     /// The open session with a device, by its static key.
     pub fn session(&self, peer_static: &[u8; 32]) -> Option<Session> {
         lock(&self.sessions)
@@ -586,6 +587,8 @@ impl Daemon {
             .filter(|s| !s.is_closed())
     }
 
+    /// Who a session's peer was last found to be. Takes no lock on the core,
+    /// so it is fit for a path as busy as serving blobs.
     pub fn session_kind(&self, peer_static: &[u8; 32]) -> Option<PeerKind> {
         lock(&self.sessions).get(peer_static).map(|c| c.kind)
     }
@@ -663,6 +666,11 @@ impl Daemon {
     /// An invitation that is no longer outstanding.
     pub fn invitation_done(&self, secret: u64) {
         lock(&self.invitations).remove(&secret);
+    }
+
+    /// How many exchanges are under way on each invitation's secret.
+    pub fn invitations_using(&self) -> MutexGuard<'_, HashMap<u64, u32>> {
+        lock(&self.using)
     }
 
     /// The invitations this device lets in, by their secret, with the id of

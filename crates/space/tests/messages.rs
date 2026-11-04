@@ -178,3 +178,22 @@ fn each_member_reacts_for_themselves() {
     p.bo_writes(vec![SpaceOp::delete(bo_r)]);
     assert_eq!(said(&p.a)[0].reactions.len(), 1);
 }
+
+/// A reply names the message it answers, and one naming nothing known is not
+/// taken, as an op naming an unknown node is not (`state.md`).
+#[test]
+fn a_reply_to_nothing_known_is_not_taken() {
+    let mut p = relationship_of(person(49, 0), person(50, 0));
+    let c = p.c;
+    p.ana_writes(vec![relationship::create_reply(
+        c,
+        "to nowhere",
+        Some([9; 16]),
+    )]);
+    assert!(said(&p.a).is_empty());
+    assert!(said(&p.b).is_empty());
+    p.ana_writes(vec![relationship::create_message(c, "hi")]);
+    let m = said(&p.b)[0].id;
+    p.bo_writes(vec![relationship::create_reply(c, "back", Some(m))]);
+    assert_eq!(said(&p.a)[1].reply_to, Some(m));
+}

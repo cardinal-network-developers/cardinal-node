@@ -884,3 +884,199 @@ fn offers_of_ids_are_not_kept() {
         assert!(answered < 20, "a contact was still heard after {answered}");
     });
 }
+
+/// How long a host takes to answer a stranger's `connect` says nothing of
+/// whether any of the person's devices is there, since none agrees.
+#[test]
+fn a_token_holder_cannot_time_whether_anyone_is_there() {
+    if !fuse_available() {
+        eprintln!("skipping: /dev/fuse or fusermount3 is not available");
+        return;
+    }
+    let root = tempfile::tempdir().unwrap();
+    let ana = hosted(root.path(), "ana");
+    let mut laptop = Dev::new(root.path(), "laptop", free_port());
+    laptop.start();
+    pair(&ana, &laptop);
+    laptop.wait_mounted();
+    let bo = hosted(root.path(), "bo");
+    let t = given_a_token(&ana, &bo);
+
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let measure = |rt: &tokio::runtime::Runtime| {
+        rt.block_on(async {
+            let (_e, s) = open(&t, None).await.expect("the token opens");
+            let mut times = Vec::new();
+            for i in 0..8 {
+                tokio::time::sleep(Duration::from_millis(1100)).await;
+                let start = std::time::Instant::now();
+                let ask_ = Record::new().with(0, 2u64).with(1, t.token);
+                let r = ask(&s, Service::RENDEZVOUS, ask_).await.expect("a reply");
+                let took = start.elapsed();
+                let named = r.record_list(1).map(|l| l.len()).unwrap_or(99);
+                assert_eq!(r.get(0).and_then(Value::as_uint), Some(2), "{r:?}");
+                assert_eq!(named, 0, "a stranger was told of a device");
+                if i > 0 {
+                    times.push(took);
+                }
+            }
+            times.sort();
+            times
+        })
+    };
+    wait("the laptop is present at the host", 30, || {
+        rt.block_on(async {
+            let (_e, s) = open(&t, None).await.unwrap();
+            tokio::time::sleep(Duration::from_millis(1100)).await;
+            let ask_ = Record::new().with(0, 2u64).with(1, t.token);
+            let _ = ask(&s, Service::RENDEZVOUS, ask_).await;
+        });
+        ana.log()
+            .contains("a token holder looks for 1 devices here")
+    });
+    let present = measure(&rt);
+    laptop.stop();
+    std::thread::sleep(Duration::from_secs(2));
+    let absent = measure(&rt);
+    let log = ana.log();
+    eprintln!(
+        "present: {present:?}\nabsent: {absent:?}\nlooks for 0: {}, looks for 1: {}",
+        log.matches("looks for 0 devices").count(),
+        log.matches("looks for 1 devices").count()
+    );
+    assert!(
+        present[0] <= absent[absent.len() - 1],
+        "the reply time tells whether a device is present"
+    );
+}
+
+/// An invitation for one use, taken up by two people at once, lets in one.
+#[test]
+fn one_use_of_an_invitation_lets_one_person_in() {
+    if !fuse_available() {
+        eprintln!("skipping: /dev/fuse or fusermount3 is not available");
+        return;
+    }
+    let root = tempfile::tempdir().unwrap();
+    let ana = hosted(root.path(), "ana");
+    let bo = hosted(root.path(), "bo");
+    let cy = hosted(root.path(), "cy");
+    let at = format!("127.0.0.1:{}", ana.port);
+    let code = ana.cli(&["invite", "--address", &at, "--name", "Ana"]);
+    let code = code.trim().to_owned();
+    std::thread::sleep(Duration::from_secs(1));
+    let outs = std::thread::scope(|sc| {
+        let a = sc.spawn(|| bo.try_cli(&["accept", &code]));
+        let b = sc.spawn(|| cy.try_cli(&["accept", &code]));
+        [a.join().unwrap(), b.join().unwrap()]
+    });
+    for o in &outs {
+        eprintln!(
+            "accept: {} {} {}",
+            o.status,
+            String::from_utf8_lossy(&o.stdout),
+            String::from_utf8_lossy(&o.stderr)
+        );
+    }
+    std::thread::sleep(Duration::from_secs(3));
+    let listed = ana.cli(&["contacts"]);
+    eprintln!("ana's contacts:\n{listed}");
+    assert!(
+        !(listed.contains("bo") && listed.contains("cy")),
+        "one use made two contacts"
+    );
+}
+
+fn active_tokens(d: &Dev) -> usize {
+    std::fs::read(d.home.join("mailbox/state.json"))
+        .ok()
+        .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
+        .and_then(|v| v["active"].as_array().map(|a| a.len()))
+        .unwrap_or(0)
+}
+
+/// Two of Ana's devices became hosts apart, so each wrote a reach node in her
+/// space with Bo. Refusing Bo and taking it back renews each token once, and
+/// then the host writes nothing more.
+#[test]
+fn a_host_renews_each_reach_node_once() {
+    if !fuse_available() {
+        eprintln!("skipping: /dev/fuse or fusermount3 is not available");
+        return;
+    }
+    let root = tempfile::tempdir().unwrap();
+    let mut l1 = Dev::new(root.path(), "lone", free_port());
+    l1.start();
+    l1.cli(&["init", "--yes", "--name", "lone"]);
+    l1.wait_mounted();
+    let mut l2 = Dev::new(root.path(), "ltwo", free_port());
+    l2.start();
+    pair(&l1, &l2);
+    l2.wait_mounted();
+    let mut bo = Dev::new(root.path(), "bo", free_port());
+    bo.start();
+    bo.cli(&["init", "--yes", "--name", "bo"]);
+    bo.wait_mounted();
+    contacts(&l1, &bo);
+    wait("ltwo has the space with bo", 60, || {
+        spaces(&l2).len() == spaces(&l1).len() && l2.cli(&["contacts"]).contains("bo")
+    });
+    std::thread::sleep(Duration::from_secs(3));
+
+    l2.stop();
+    l1.cli(&["host", "--address", &format!("127.0.0.1:{}", l1.port)]);
+    wait("lone wrote where to reach it", 30, || {
+        active_tokens(&l1) >= 1
+    });
+    std::thread::sleep(Duration::from_secs(3));
+    l1.stop();
+
+    l2.start();
+    l2.wait_mounted();
+    l2.cli(&["host", "--address", &format!("127.0.0.1:{}", l2.port)]);
+    wait("ltwo wrote where to reach it", 30, || {
+        active_tokens(&l2) >= 1
+    });
+    std::thread::sleep(Duration::from_secs(3));
+    l1.start();
+    l1.wait_mounted();
+    std::thread::sleep(Duration::from_secs(15));
+    let per = |d: &Dev| -> Vec<(String, u64)> {
+        let dir = std::fs::read_dir(d.home.join("spaces")).unwrap();
+        let mut v: Vec<(String, u64)> = dir
+            .flatten()
+            .map(|e| {
+                let n = e.file_name().to_string_lossy()[..8].to_owned();
+                (
+                    n,
+                    std::fs::metadata(e.path().join("entries.log")).map_or(0, |m| m.len()),
+                )
+            })
+            .collect();
+        v.sort();
+        v
+    };
+    let b0 = per(&l1);
+    std::thread::sleep(Duration::from_secs(20));
+    eprintln!("baseline lone {b0:?} -> {:?}", per(&l1));
+
+    l1.cli(&["contact", "bo", "refuse"]);
+    std::thread::sleep(Duration::from_secs(8));
+    l1.cli(&["contact", "bo", "unrefuse"]);
+    std::thread::sleep(Duration::from_secs(15));
+    let total = |d: &Dev| log_sizes(d).iter().sum::<u64>();
+    let before = (total(&l1), total(&l2));
+    let p0 = per(&l1);
+    std::thread::sleep(Duration::from_secs(20));
+    eprintln!("after unrefuse lone {p0:?} -> {:?}", per(&l1));
+    let after = (total(&l1), total(&l2));
+    eprintln!(
+        "logs before {before:?} after {after:?}; tokens {} {}",
+        active_tokens(&l1),
+        active_tokens(&l2)
+    );
+    assert!(
+        after.0 - before.0 < 4000 && after.1 - before.1 < 4000,
+        "a host keeps writing"
+    );
+}

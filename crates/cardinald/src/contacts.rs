@@ -192,13 +192,16 @@ pub fn cancel_invitation(d: &Arc<Daemon>, id: &str) -> anyhow::Result<Json> {
 /// device as on all their others, and stops for one that is used up,
 /// cancelled or too old, wherever that happened.
 pub fn admit_invitations(d: &Daemon) {
-    let outstanding: Vec<(Invitation, Regard)> = made(d)
+    let outstanding: Vec<(Invitation, Regard, u64)> = made(d)
         .into_iter()
         .filter(Made::outstanding)
-        .map(|m| (m.invitation, m.record.regard))
+        .map(|m| {
+            let left = m.invitation.uses - m.record.used as u64;
+            (m.invitation, m.record.regard, left)
+        })
         .collect();
     let wanted: std::collections::HashSet<[u8; 16]> =
-        outstanding.iter().map(|(i, _)| i.secret).collect();
+        outstanding.iter().map(|(i, ..)| i.secret).collect();
     let mut admitted = d.admitted_invitations();
     admitted.retain(|secret, id| {
         let keep = wanted.contains(secret);
@@ -208,16 +211,63 @@ pub fn admit_invitations(d: &Daemon) {
         }
         keep
     });
-    for (invitation, regard) in outstanding {
+    for (invitation, regard, left) in outstanding {
         if admitted.contains_key(&invitation.secret) {
             continue;
         }
+        // The link counts what is left, so two people at once on one device
+        // cannot both get in. Each device counts its own, and the account
+        // counts what is done: two devices apart can let in one more each.
         let mut entry = SecretEntry::new(&invitation.secret);
-        entry.uses = None;
+        entry.uses = Some(u32::try_from(left).unwrap_or(u32::MAX));
         let id = d.endpoint.add_secret(entry);
         d.invitation_made(id, regard);
         admitted.insert(invitation.secret, id);
     }
+}
+
+/// One of an invitation's uses, held by an exchange under way on this device.
+/// It goes back when the exchange ends; if that went through, the account
+/// counts the use by then.
+struct Using<'a> {
+    d: &'a Daemon,
+    secret: u64,
+}
+
+impl Drop for Using<'_> {
+    fn drop(&mut self) {
+        let mut using = self.d.invitations_using();
+        if let Some(n) = using.get_mut(&self.secret) {
+            *n = n.saturating_sub(1);
+            if *n == 0 {
+                using.remove(&self.secret);
+            }
+        }
+    }
+}
+
+/// Takes one of the uses left on the invitation that let `s` in, if any is.
+/// The link counts a use only once a session is confirmed, so two handshakes
+/// at once would both get through to here.
+fn take_a_use<'a>(d: &'a Daemon, s: &Session) -> Option<Using<'a>> {
+    let cardinal_link::Admission::Secret { id, .. } = s.admission() else {
+        return None;
+    };
+    let admitted = d.admitted_invitations();
+    let secret = admitted.iter().find(|(_, i)| **i == id).map(|(s, _)| *s);
+    drop(admitted);
+    let secret = secret?;
+    let invitation = made(d)
+        .into_iter()
+        .find(|m| m.invitation.secret == secret && m.outstanding())?;
+    let left = invitation.invitation.uses - invitation.record.used as u64;
+    let mut using = d.invitations_using();
+    let under_way = using.entry(id).or_insert(0);
+    if u64::from(*under_way) >= left {
+        return None;
+    }
+    *under_way += 1;
+    Some(Using { d, secret: id })
 }
 
 /// Records that `who` used the invitation that let `s` in, so that every
@@ -384,6 +434,11 @@ pub async fn serve(d: &Arc<Daemon>, s: &Session, mut st: Stream) -> anyhow::Resu
     }
     let Some(regard) = d.invitation_of(s) else {
         st.reset(0);
+        return Ok(());
+    };
+    // Held until the exchange ends: two at once cannot both use one use.
+    let Some(_use) = take_a_use(d, s) else {
+        s.abandon();
         return Ok(());
     };
     let Some(ContactMessage::Hello { identity, name }) = receive(&mut st).await? else {
@@ -662,15 +717,25 @@ pub fn react(d: &Arc<Daemon>, who: &str, id: &str, text: &str) -> anyhow::Result
 /// Reactions as a window shows them: each one once, with how many gave it
 /// and whether this person did.
 fn reactions_of(m: &relationship::Message, me: Option<[u8; 32]>) -> Vec<Json> {
-    let mut shown: Vec<(String, usize, bool)> = Vec::new();
+    // One for each person, the last they gave, however many they wrote, and
+    // no longer than this software lets anyone make one.
+    let mut theirs: Vec<&relationship::Reaction> = Vec::new();
     for r in &m.reactions {
+        match theirs.iter_mut().find(|x| x.author == r.author) {
+            Some(x) => *x = r,
+            None => theirs.push(r),
+        }
+    }
+    let mut shown: Vec<(String, usize, bool)> = Vec::new();
+    for r in theirs {
         let mine = Some(r.author) == me;
-        match shown.iter_mut().find(|(t, ..)| *t == r.text) {
+        let text: String = r.text.chars().take(MAX_REACTION).collect();
+        match shown.iter_mut().find(|(t, ..)| *t == text) {
             Some((_, n, m)) => {
                 *n += 1;
                 *m |= mine;
             }
-            None => shown.push((r.text.clone(), 1, mine)),
+            None => shown.push((text, 1, mine)),
         }
     }
     shown

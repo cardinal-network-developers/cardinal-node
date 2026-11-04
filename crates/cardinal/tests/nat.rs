@@ -31,6 +31,8 @@ enum Kind {
     Symmetric,
     /// One public port, known ahead and open to anyone: a forwarded port.
     Forwarded,
+    /// As PortRestricted, with 80 ms on the way out.
+    Slow,
 }
 
 struct Nat {
@@ -98,7 +100,16 @@ async fn run(inner: Arc<UdpSocket>, kind: Kind, forwarded: Option<Arc<UdpSocket>
             }
         };
         m.opened.lock().unwrap().insert(to);
-        let _ = m.public.send_to(&buf[HEADER..n], to).await;
+        if kind == Kind::Slow {
+            let public = m.public.clone();
+            let data = buf[HEADER..n].to_vec();
+            tokio::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+                let _ = public.send_to(&data, to).await;
+            });
+        } else {
+            let _ = m.public.send_to(&buf[HEADER..n], to).await;
+        }
     }
 }
 
@@ -566,4 +577,88 @@ fn a_contact_with_a_session_to_the_host_still_finds_the_laptop() {
     wait("ana's laptop hears the answer", 10, || {
         standing(&ana) == "live"
     });
+}
+
+/// A stranger with Ana's token times the host's answer to `connect`, with her
+/// laptop far enough away that its answer would show. Nobody agrees, so nobody
+/// is named, and the answer takes as long whether the laptop is there or not.
+#[test]
+fn the_hosts_reply_time_says_nothing_of_who_is_there() {
+    use cardinal_crypto::{derive, HybridKeyPair, Purpose};
+    use cardinal_encoding::Record;
+    use cardinal_link::{
+        Bind, CarrierKind, Endpoint, EndpointConfig, MemoryDirectory, Priority, Service, Target,
+    };
+    use tokio::io::AsyncWriteExt;
+    if !fuse_available() {
+        eprintln!("skipping: /dev/fuse or fusermount3 is not available");
+        return;
+    }
+    let root = tempfile::tempdir().unwrap();
+    let (host, mut ana, _bo) = two_people(root.path());
+    ana.cli(&["contact", "bo", "hosts-only"]);
+    let na = Nat::new(Kind::Slow);
+    put_behind(&mut ana, &na);
+
+    let state = std::fs::read(host.home.join("mailbox/state.json")).unwrap();
+    let state: Value = serde_json::from_slice(&state).unwrap();
+    let token: [u8; 16] = hex::decode(state["active"][0].as_str().unwrap())
+        .unwrap()
+        .try_into()
+        .unwrap();
+    let sheet = host.cli(&["recovery", "sheet"]);
+    let key = sheet.lines().find(|l| l.contains("Key:")).unwrap();
+    let key = key.split_whitespace().last().unwrap();
+    let host_key = cardinald::host::read_sheet_key(key).unwrap();
+    let addr: SocketAddr = format!("127.0.0.1:{}", host.port).parse().unwrap();
+
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let measure = |rt: &tokio::runtime::Runtime| -> Vec<Duration> {
+        rt.block_on(async {
+            let kp = std::sync::Arc::new(HybridKeyPair::generate());
+            let mut config = EndpointConfig::new(kp, MemoryDirectory::new());
+            config.connect_timeout = Duration::from_secs(3);
+            let bind = Bind {
+                udp: Some("127.0.0.1:0".parse().unwrap()),
+                tcp: None,
+            };
+            let endpoint = Endpoint::bind(config, bind).await.unwrap();
+            let secret = derive(Purpose::Token, &token);
+            let target = Target::invitation(addr, CarrierKind::Udp, host_key, &secret[..]);
+            let s = endpoint.connect(target).await.expect("the token opens");
+            let mut times = Vec::new();
+            while times.len() < 6 {
+                tokio::time::sleep(Duration::from_millis(1100)).await;
+                let start = std::time::Instant::now();
+                let mut st = s
+                    .open_stream(Service::RENDEZVOUS, Priority::Interactive)
+                    .unwrap();
+                let ask = Record::new().with(0, 2u64).with(1, token);
+                st.send_message(&cardinal_encoding::Value::Record(ask))
+                    .await
+                    .unwrap();
+                st.shutdown().await.unwrap();
+                let v = st.recv_message_max(1 << 20).await.unwrap().unwrap();
+                let took = start.elapsed();
+                let r = v.as_record().unwrap().clone();
+                if r.get(0).and_then(|v| v.as_uint()) != Some(2) {
+                    continue; // busy: someone else asked within the second
+                }
+                assert_eq!(r.record_list(1).unwrap_or_default().len(), 0, "named");
+                times.push(took);
+            }
+            times.sort();
+            times
+        })
+    };
+    std::thread::sleep(Duration::from_secs(5));
+    let present = measure(&rt);
+    ana.stop();
+    std::thread::sleep(Duration::from_secs(3));
+    let absent = measure(&rt);
+    eprintln!("present: {present:?}\nabsent: {absent:?}");
+    assert!(
+        present[0] <= absent[absent.len() - 1],
+        "the reply time tells whether ana's laptop is present"
+    );
 }

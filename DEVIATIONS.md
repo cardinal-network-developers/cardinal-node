@@ -704,14 +704,22 @@ asks for around that is not built yet.
   command line finds people by name.
 - **Both people must be online to connect.** A device finds a trusted
   contact's devices at addresses it has seen, and through the hosts their reach
-  node names: every 30 seconds while it has no session with them, and at once,
-  for up to 12 seconds, when a call is made. Nobody can look for someone with no
-  host, so they can be rung only while one of their devices holds the session it
-  found, which their devices keep looking for.
+  nodes name: every 30 seconds while any device in their log has no session with
+  it, and at once, for up to 12 seconds, when a call is made with no session at
+  all. A device of theirs that is gone for good keeps this up, at the cost of an
+  ask to their host and a word to each of their present devices. A host names at
+  most 8 devices, each with its addresses, so a trusted contact's host could aim
+  this person's devices at that many places every 30 seconds. Nobody can look
+  for someone with no host, so they can be rung only while one of their devices
+  holds the session it found, which their devices keep looking for.
 - **Spec gap: which identity's log comes first.** `contact.md#accepting` has
   both sides reconcile logs before `genesis`. Here the inviter fetches the
   invitee's log before creating the space, and the invitee fetches the
   inviter's after receiving `genesis`.
+- **Spec gap: the conversation is not its creator's alone.** `profiles.md`
+  makes messages, reactions and read markers author-owned, but not the
+  conversation node, so a contact can delete or move it, which hides every
+  message until it is restored.
 - **Group spaces, shared folders, roles other than owner, and `remove_member`**
   are not implemented. A relationship space has only its conversation, and
   its messages have no attachments.
@@ -806,8 +814,9 @@ asks for around that is not built yet.
   identity.
 - **Rendezvous and relay answer with codes the spec does not list.**
   `hosts.md#service-messages` has 1 not permitted, 2 full, 3 unknown and 4
-  malformed. Here 4 means a device that is not present and 5 one that will not
-  relay (on battery), and a request missing a field is answered 3.
+  malformed. Here 4 means a device that is not present, and 5 one that will
+  not relay (on battery) or a token holder asking again within a second, and a
+  request missing a field is answered 3.
 - **A token's relay counts nothing.** There is one quota class, so relayed bytes
   count against no limit. What bounds a holder is the four sessions a token may
   hold, and a device's agreement.

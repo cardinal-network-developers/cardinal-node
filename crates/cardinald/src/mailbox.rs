@@ -415,12 +415,12 @@ impl Mailbox {
             .collect()
     }
 
-    /// The token a session was opened with, if it was.
     /// Whether a token is active here.
     pub fn is_active(&self, token: &Token) -> bool {
         lock(&self.store).is_active(token)
     }
 
+    /// The token a session was opened with, if it was.
     pub fn token_of(&self, s: &Session) -> Option<Token> {
         match s.admission() {
             Admission::Secret { id, .. } if s.role() == Role::Responder => {
@@ -724,23 +724,31 @@ fn renew_reach(d: &Arc<Daemon>) {
         return;
     }
     let here = *d.keys.link.public_key().x25519();
+    let Some(me) = d.core().identity.as_ref().map(|i| i.id()) else {
+        return;
+    };
     let contacts = d.core().contacts();
     for c in contacts.iter().filter(|c| !c.refused) {
-        let gone = tokens_here(d, &c.space)
-            .iter()
-            .any(|t| !lock(&d.mailbox.store).is_active(t));
-        let me = d.core().identity.as_ref().map(|i| i.id());
-        let found = me.and_then(|me| d.core().reach_of(&c.space, &me));
-        let (true, Some((node, mut reach))) = (gone, found) else {
-            continue;
-        };
-        for r in reach.iter_mut().filter(|r| r.host == here) {
-            r.token = random_bytes();
-            register(d, &r.token);
-        }
-        let set = relationship::set_reach(node, &reach);
-        if let Err(e) = d.write_and_push(&c.space, vec![set]) {
-            tracing::debug!("renewing a token: {e:#}");
+        // Every node, and only the tokens that are gone: a token still active
+        // stays, and a node renewed once is not renewed again.
+        let nodes = d.core().reach_nodes_of(&c.space, &me);
+        for (node, mut reach) in nodes {
+            let mut renewed = false;
+            for r in reach.iter_mut().filter(|r| r.host == here) {
+                if lock(&d.mailbox.store).is_active(&r.token) {
+                    continue;
+                }
+                r.token = random_bytes();
+                register(d, &r.token);
+                renewed = true;
+            }
+            if !renewed {
+                continue;
+            }
+            let set = relationship::set_reach(node, &reach);
+            if let Err(e) = d.write_and_push(&c.space, vec![set]) {
+                tracing::debug!("renewing a token: {e:#}");
+            }
         }
     }
 }
