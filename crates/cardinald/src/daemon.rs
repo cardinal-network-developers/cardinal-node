@@ -246,6 +246,8 @@ pub struct Daemon {
     pub pairing: Mutex<PairState>,
     /// The call under way.
     pub call: Mutex<Option<crate::calls::Call>>,
+    /// When each contact rang lately, so they can ring only so often.
+    pub rang: Mutex<HashMap<[u8; 32], std::collections::VecDeque<Instant>>>,
     /// Audio heard on calls, for a client, by call.
     pub call_audio: tokio::sync::broadcast::Sender<([u8; 16], bytes::Bytes)>,
     /// An identity made for a client, until its person has written the words
@@ -412,6 +414,7 @@ impl Daemon {
             changed: watch::channel(0).0,
             pairing: Mutex::new(PairState::Idle),
             call: Mutex::new(None),
+            rang: Mutex::new(HashMap::new()),
             call_audio: tokio::sync::broadcast::channel(64).0,
             setting_up: Mutex::new(None),
             mount: Mutex::new(None),

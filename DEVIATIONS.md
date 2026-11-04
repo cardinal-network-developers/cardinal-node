@@ -665,9 +665,10 @@ asks for around that is not built yet.
   message counts as read if the entry that wrote the marker descends from it. A
   message that arrives in the moment between a client's last look and its
   `mark-read` therefore counts as read.
-- **Someone can keep ringing.** A ring from a contact gives way to a call this
-  person makes, and refusing them ends it, but nothing limits how often they ring.
-  Two people ringing each other at once each find the other busy.
+- **A contact can ring five times in two minutes.** Past that a ring finds this
+  person busy, and nothing rings; `profiles.md#calls-guidance` sets no limit. A
+  ring from a contact gives way to a call this person makes, and refusing them
+  ends it. Two people ringing each other at once each find the other busy.
 - **A message can read as `sent` with a very long backlog.** A reconcile that
   stops at its limit of wanted ids still counts as confirming.
 - **On Windows the client's pipe trusts whoever holds its name.** Another account

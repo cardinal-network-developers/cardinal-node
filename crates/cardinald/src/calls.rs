@@ -30,6 +30,24 @@ const MAX_SIGNAL: usize = 128;
 const RINGS_FOR: Duration = Duration::from_secs(45);
 /// How often a call looks at whether its session is still there.
 const SESSION_CHECK: Duration = Duration::from_secs(5);
+/// How many times one person can ring in `RINGS_WITHIN`. Past that a ring
+/// finds this person busy, and nothing rings.
+const MAX_RINGS: usize = 5;
+const RINGS_WITHIN: Duration = Duration::from_secs(120);
+
+/// Whether `who` may ring now, and if so, counts it.
+fn may_ring(d: &Daemon, who: &[u8; 32]) -> bool {
+    let mut rang = d.rang.lock().unwrap_or_else(|e| e.into_inner());
+    let lately = rang.entry(*who).or_default();
+    while lately.front().is_some_and(|t| t.elapsed() > RINGS_WITHIN) {
+        lately.pop_front();
+    }
+    if lately.len() >= MAX_RINGS {
+        return false;
+    }
+    lately.push_back(Instant::now());
+    true
+}
 
 /// Where a call stands.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -321,6 +339,9 @@ pub async fn serve(d: &Arc<Daemon>, s: &Session, mut st: Stream) -> anyhow::Resu
         return Ok(());
     };
     match kind {
+        RING if !may_ring(d, &them) => {
+            tell(s, END, &space, &id).await?;
+        }
         RING => {
             let busy = {
                 let mut call = lock(d);

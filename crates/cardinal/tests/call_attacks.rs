@@ -713,3 +713,46 @@ fn a_token_cannot_ring() {
         assert!(standing(&ana).is_null(), "a token rang");
     });
 }
+
+/// A contact can ring only so often. Past five rings in two minutes, a ring
+/// finds this person busy, hears `end` at once, and nothing rings here.
+#[test]
+fn a_contact_rings_only_so_often() {
+    if !fuse_available() {
+        return;
+    }
+    let root = tempfile::tempdir().unwrap();
+    let ana = person(root.path(), "ana");
+    let mut bo = person(root.path(), "bo");
+    contacts(&ana, &bo, "Ana");
+    let theirs = spaces(&bo);
+    let space = spaces(&ana)
+        .into_iter()
+        .find(|s| theirs.contains(s))
+        .unwrap();
+    let hostile = Modified::of(&bo, &ana);
+    bo.stop();
+
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        let (_e, s) = hostile.open().await.expect("a contact connects");
+        for n in 0..5 {
+            let id: [u8; 16] = cardinal_crypto::random_bytes();
+            signal(&s, RING, space, id).await;
+            wait(&format!("ring {n} rings"), 5, || {
+                standing(&ana) == "ringing"
+            });
+            signal(&s, END, space, id).await;
+            wait(&format!("ring {n} stops"), 5, || standing(&ana).is_null());
+        }
+        let id: [u8; 16] = cardinal_crypto::random_bytes();
+        signal(&s, RING, space, id).await;
+        let told = heard(&s, Duration::from_secs(3)).await;
+        assert_eq!(
+            told,
+            Some((END, space, id)),
+            "the sixth ring is not told it is busy"
+        );
+        assert!(standing(&ana).is_null(), "the sixth ring rang");
+    });
+}
