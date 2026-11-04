@@ -301,3 +301,68 @@ fn a_contact_can_be_renamed() {
         1
     );
 }
+
+/// A conversation is more than text: a reply names what it answers, an edit
+/// and a delete reach the other side, and each person reacts for themselves.
+/// What someone else wrote is not theirs to change.
+#[test]
+fn messages_can_be_answered_changed_and_reacted_to() {
+    if !fuse_available() {
+        eprintln!("skipping: /dev/fuse or fusermount3 is not available");
+        return;
+    }
+    let root = tempfile::tempdir().unwrap();
+    let (a, b) = met(root.path());
+    let bo = only(&a)["name"].as_str().unwrap().to_owned();
+    ask(&a, json!({"cmd": "say", "who": bo, "text": "helo"}));
+    wait("bo has it", 20, || said(&b, "Ana").len() == 1);
+    let id = said(&b, "Ana")[0]["id"].as_str().unwrap().to_owned();
+
+    ask(
+        &a,
+        json!({"cmd": "edit-message", "who": bo, "id": id, "text": "hello"}),
+    );
+    wait("bo sees the edit", 20, || {
+        said(&b, "Ana")[0]["text"] == "hello"
+    });
+    assert_eq!(said(&b, "Ana")[0]["edited"], true);
+
+    ask(
+        &b,
+        json!({"cmd": "say", "who": "Ana", "text": "hi", "reply_to": id}),
+    );
+    wait("ana has the reply", 20, || said(&a, &bo).len() == 2);
+    assert_eq!(said(&a, &bo)[1]["reply_to"], id.as_str());
+
+    ask(
+        &b,
+        json!({"cmd": "react", "who": "Ana", "id": id, "text": "👍"}),
+    );
+    ask(
+        &a,
+        json!({"cmd": "react", "who": bo, "id": id, "text": "👍"}),
+    );
+    wait("both reactions", 20, || {
+        said(&a, &bo)[0]["reactions"][0]["count"] == 2
+    });
+    assert_eq!(said(&a, &bo)[0]["reactions"][0]["mine"], true);
+    ask(
+        &b,
+        json!({"cmd": "react", "who": "Ana", "id": id, "text": ""}),
+    );
+    wait("bo's is gone", 20, || {
+        said(&a, &bo)[0]["reactions"][0]["count"] == 1
+    });
+
+    let theirs = turned_down(
+        &b,
+        json!({"cmd": "edit-message", "who": "Ana", "id": id, "text": "x"}),
+    );
+    assert!(theirs.contains("only what you wrote"), "{theirs}");
+    let theirs = turned_down(&b, json!({"cmd": "delete-message", "who": "Ana", "id": id}));
+    assert!(theirs.contains("only what you wrote"), "{theirs}");
+
+    ask(&a, json!({"cmd": "delete-message", "who": bo, "id": id}));
+    wait("gone for bo", 20, || said(&b, "Ana").len() == 1);
+    assert_eq!(said(&b, "Ana")[0]["text"], "hi");
+}

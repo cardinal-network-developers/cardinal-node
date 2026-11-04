@@ -16,7 +16,7 @@ use cardinal_contact::{ContactMessage, EndpointAddr, Invitation};
 use cardinal_encoding::Value;
 use cardinal_link::{CarrierKind, Priority, SecretEntry, Service, Session, Stream, Target};
 use cardinal_space::account::{self, ContactRecord, Regard};
-use cardinal_space::{relationship, SpaceId};
+use cardinal_space::{relationship, SpaceId, SpaceOp};
 use cardinal_sync::identity_log_label;
 use serde_json::{json, Value as Json};
 use tokio::io::AsyncWriteExt;
@@ -483,8 +483,12 @@ pub(crate) fn listed(d: &Daemon, who: &str) -> anyhow::Result<ContactRecord> {
 }
 
 /// Writes a message to a contact.
-pub fn say(d: &Arc<Daemon>, who: &str, text: &str) -> anyhow::Result<Json> {
+pub fn say(d: &Arc<Daemon>, who: &str, text: &str, reply_to: Option<&str>) -> anyhow::Result<Json> {
     let contact = listed(d, who)?;
+    let to = match reply_to {
+        Some(id) => Some(message_in(d, &contact, id)?.id),
+        None => None,
+    };
     let space = contact.space;
     let conversation = {
         let core = d.core();
@@ -494,10 +498,112 @@ pub fn say(d: &Arc<Daemon>, who: &str, text: &str) -> anyhow::Result<Json> {
             .and_then(relationship::conversation)
     };
     let conversation = conversation.ok_or_else(|| anyhow::anyhow!("that space is not open yet"))?;
-    let op = relationship::create_message(conversation, text);
+    let op = relationship::create_reply(conversation, text, to);
     d.write_and_push(&space, vec![op])?;
     confirm(d, space, contact.identity);
     Ok(json!({"reachable": reachable(d, &contact, text)}))
+}
+
+/// A message in the conversation with a contact, by the id `messages` gives.
+fn message_in(
+    d: &Daemon,
+    contact: &ContactRecord,
+    id: &str,
+) -> anyhow::Result<relationship::Message> {
+    let id = hex::decode(id).ok();
+    let id = id.and_then(|b| <[u8; 16]>::try_from(b.as_slice()).ok());
+    let id = id.ok_or_else(|| anyhow::anyhow!("that is not a message"))?;
+    let core = d.core();
+    let open = core
+        .spaces
+        .get(&contact.space)
+        .and_then(|h| h.space.as_ref());
+    let open = open.ok_or_else(|| anyhow::anyhow!("that space is not open yet"))?;
+    let all = relationship::messages(open);
+    let found = all.into_iter().find(|m| m.id == id);
+    found.ok_or_else(|| anyhow::anyhow!("there is no such message"))
+}
+
+/// A message of this person's own in the conversation with `who`: only that
+/// can be changed or taken back, which the space itself holds to as well.
+fn own_message(
+    d: &Daemon,
+    who: &str,
+    id: &str,
+) -> anyhow::Result<(ContactRecord, relationship::Message)> {
+    let contact = listed(d, who)?;
+    let m = message_in(d, &contact, id)?;
+    anyhow::ensure!(
+        Some(m.author) == d.core().identity.as_ref().map(|i| i.id()),
+        "only what you wrote can be changed"
+    );
+    Ok((contact, m))
+}
+
+/// Changes what a message of this person's says.
+pub fn edit_message(d: &Arc<Daemon>, who: &str, id: &str, text: &str) -> anyhow::Result<Json> {
+    let (contact, m) = own_message(d, who, id)?;
+    anyhow::ensure!(!text.trim().is_empty(), "a message cannot be empty");
+    let op = relationship::edit_message(m.id, text);
+    d.write_and_push(&contact.space, vec![op])?;
+    confirm(d, contact.space, contact.identity);
+    Ok(json!({}))
+}
+
+/// Takes back a message of this person's. The other person may have read it
+/// already, and the space's history keeps it.
+pub fn delete_message(d: &Arc<Daemon>, who: &str, id: &str) -> anyhow::Result<Json> {
+    let (contact, m) = own_message(d, who, id)?;
+    d.write_and_push(&contact.space, vec![SpaceOp::delete(m.id)])?;
+    confirm(d, contact.space, contact.identity);
+    Ok(json!({}))
+}
+
+/// The longest reaction: an emoji, or a few of them.
+const MAX_REACTION: usize = 16;
+
+/// Reacts to a message, replacing this person's reaction, or taking it away
+/// with nothing.
+pub fn react(d: &Arc<Daemon>, who: &str, id: &str, text: &str) -> anyhow::Result<Json> {
+    let contact = listed(d, who)?;
+    let m = message_in(d, &contact, id)?;
+    let text = text.trim();
+    anyhow::ensure!(
+        text.chars().count() <= MAX_REACTION,
+        "that is too long for a reaction"
+    );
+    let me = d.core().identity.as_ref().map(|i| i.id());
+    let mine = m.reactions.iter().find(|r| Some(r.author) == me);
+    let op = match (mine, text.is_empty()) {
+        (Some(r), true) => SpaceOp::delete(r.id),
+        (Some(r), false) if r.text == text => return Ok(json!({})),
+        (Some(r), false) => relationship::set_reaction(r.id, text),
+        (None, true) => return Ok(json!({})),
+        (None, false) => relationship::create_reaction(m.id, text),
+    };
+    d.write_and_push(&contact.space, vec![op])?;
+    confirm(d, contact.space, contact.identity);
+    Ok(json!({}))
+}
+
+/// Reactions as a window shows them: each one once, with how many gave it
+/// and whether this person did.
+fn reactions_of(m: &relationship::Message, me: Option<[u8; 32]>) -> Vec<Json> {
+    let mut shown: Vec<(String, usize, bool)> = Vec::new();
+    for r in &m.reactions {
+        let mine = Some(r.author) == me;
+        match shown.iter_mut().find(|(t, ..)| *t == r.text) {
+            Some((_, n, m)) => {
+                *n += 1;
+                *m |= mine;
+            }
+            None => shown.push((r.text.clone(), 1, mine)),
+        }
+    }
+    shown
+        .into_iter()
+        .map(|(text, count, mine)| json!({"text": text, "count": count, "mine": mine}))
+        .collect()
 }
 
 /// A notice is not acknowledged, and a session that looks open may be gone, so
@@ -569,6 +675,9 @@ pub fn messages(d: &Daemon, who: &str) -> anyhow::Result<Json> {
                 "text": m.text,
                 "time": m.time,
                 "state": mine.then(|| state_of(read, unsent.contains(&m.entry))),
+                "reply_to": m.reply_to.map(hex::encode),
+                "edited": m.edited,
+                "reactions": reactions_of(m, me),
             })
         })
         .collect();

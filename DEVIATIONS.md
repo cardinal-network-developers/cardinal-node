@@ -675,8 +675,9 @@ asks for around that is not built yet.
   talk to it, recovery words included. The cure is a pipe with its own access
   list and a client that checks its owner, which needs a Windows machine to test.
 - **Read markers are always written.** `profiles.md` has no setting to keep them
-  back, so reading a conversation tells the other person. Every message also
-  lacks the author-owned field the profile gives it.
+  back, so reading a conversation tells the other person. Messages written
+  before 0.1.13 lack the author-owned field, so anyone in the space could change
+  those, though no software here offers it.
 - **An invitation names the person's own host, which answers it as one of
   their devices.** Invitations are kept in the account space, and every device
   of the person lets their holders in, so the host answers one while the device
@@ -705,8 +706,8 @@ asks for around that is not built yet.
   invitee's log before creating the space, and the invitee fetches the
   inviter's after receiving `genesis`.
 - **Group spaces, shared folders, roles other than owner, and `remove_member`**
-  are not implemented. A relationship space has only its conversation; messages
-  have text, and no attachments, reactions or read markers.
+  are not implemented. A relationship space has only its conversation, and
+  its messages have no attachments.
 - **Contacts are not told apart from members by more than this device's account
   space.** A device opens a session with a contact's devices only for what they
   share (`spaces.md#holding-a-space`), and notices for a set go only to contacts

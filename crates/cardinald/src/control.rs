@@ -258,7 +258,15 @@ async fn handle(d: &Arc<Daemon>, req: &Value) -> anyhow::Result<Value> {
             Some(name) => crate::contacts::rename(d, arg(req, "who")?, name),
             None => crate::contacts::set(d, arg(req, "who")?, arg(req, "setting")?),
         },
-        "say" => crate::contacts::say(d, arg(req, "who")?, arg(req, "text")?),
+        "say" => {
+            let reply_to = req.get("reply_to").and_then(|v| v.as_str());
+            crate::contacts::say(d, arg(req, "who")?, arg(req, "text")?, reply_to)
+        }
+        "edit-message" => {
+            crate::contacts::edit_message(d, arg(req, "who")?, arg(req, "id")?, arg(req, "text")?)
+        }
+        "delete-message" => crate::contacts::delete_message(d, arg(req, "who")?, arg(req, "id")?),
+        "react" => crate::contacts::react(d, arg(req, "who")?, arg(req, "id")?, arg(req, "text")?),
         "call" => Ok(crate::calls::current(d)),
         "call-start" => crate::calls::start(d, arg(req, "who")?).await,
         "call-answer" => crate::calls::answer(d).await,

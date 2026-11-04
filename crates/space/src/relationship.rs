@@ -20,6 +20,8 @@ pub const MESSAGE: u64 = 2;
 pub const OWNER: u64 = 3;
 /// Read marker kind.
 pub const READ_MARKER: u64 = 4;
+/// Reaction kind, under a message.
+pub const REACTION: u64 = 3;
 /// Reach kind.
 pub const REACH: u64 = 9;
 
@@ -115,12 +117,41 @@ pub fn genesis_ops(other: IdentityId) -> Vec<SpaceOp> {
 
 /// `create` of a message.
 pub fn create_message(conversation: NodeId, text: &str) -> SpaceOp {
+    create_reply(conversation, text, None)
+}
+
+/// `create` of a message in reply to another. A message is its author's
+/// alone: nobody else can change or delete it.
+pub fn create_reply(conversation: NodeId, text: &str, to: Option<NodeId>) -> SpaceOp {
     SpaceOp::create(
         NodeKind::Uint(MESSAGE),
         conversation,
         "message",
-        Record::new().with(1, text),
+        Record::new()
+            .with(1, text)
+            .with_opt(3, to)
+            .with(AUTHOR_OWNED_FIELD, 1u64),
     )
+}
+
+/// Changes what a message says. Its history keeps what it said before.
+pub fn edit_message(message: NodeId, text: &str) -> SpaceOp {
+    SpaceOp::set(message, 1, Some(Value::from(text)))
+}
+
+/// `create` of a reaction, such as an emoji, to a message.
+pub fn create_reaction(message: NodeId, text: &str) -> SpaceOp {
+    SpaceOp::create(
+        NodeKind::Uint(REACTION),
+        message,
+        "reaction",
+        Record::new().with(1, text).with(AUTHOR_OWNED_FIELD, 1u64),
+    )
+}
+
+/// Changes a reaction.
+pub fn set_reaction(reaction: NodeId, text: &str) -> SpaceOp {
+    SpaceOp::set(reaction, 1, Some(Value::from(text)))
 }
 
 /// `create` of a member's read marker, at the message `last`.
@@ -187,6 +218,29 @@ pub struct Message {
     pub text: String,
     /// The author's clock, for display only.
     pub time: Option<u64>,
+    /// The message it answers.
+    pub reply_to: Option<NodeId>,
+    /// It was changed after it was written.
+    pub edited: bool,
+    /// What each member reacted with.
+    pub reactions: Vec<Reaction>,
+}
+
+/// A member's reaction to a message.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Reaction {
+    /// Its node.
+    pub id: NodeId,
+    /// Who reacted.
+    pub author: IdentityId,
+    /// With what.
+    pub text: String,
+}
+
+/// The current text of a node's field 1, the last by entry when in conflict.
+fn text_of(n: &Node) -> Option<String> {
+    let text = n.values(1).iter().rev().find_map(|v| v.value.as_ref())?;
+    Some(text.as_text()?.to_owned())
 }
 
 /// The conversation of a relationship space.
@@ -213,13 +267,28 @@ pub fn messages(space: &Space) -> Vec<Message> {
         .filter(|n| n.kind == NodeKind::Uint(MESSAGE) && !n.deleted)
         .filter_map(|n| {
             let e = space.dag().get(&n.created_in)?;
-            let text = n.values(1).iter().rev().find_map(|v| v.value.as_ref())?;
+            let reply_to = n.values(3).iter().rev().find_map(|v| v.value.as_ref());
+            let reply_to = reply_to.and_then(Value::as_bytes);
+            let reactions = state.children(&n.id).into_iter();
+            let reactions = reactions
+                .filter(|r| r.kind == NodeKind::Uint(REACTION) && !r.deleted)
+                .filter_map(|r| {
+                    Some(Reaction {
+                        id: r.id,
+                        author: r.creator,
+                        text: text_of(r)?,
+                    })
+                })
+                .collect();
             let message = Message {
                 id: n.id,
                 entry: n.created_in,
                 author: n.creator,
-                text: text.as_text()?.to_owned(),
+                text: text_of(n)?,
                 time: e.time(),
+                reply_to: reply_to.and_then(|b| NodeId::try_from(b).ok()),
+                edited: n.values(1).iter().any(|v| v.entry != n.created_in),
+                reactions,
             };
             Some((space.dag().position(&n.created_in)?, message))
         })
