@@ -44,7 +44,7 @@ const DONE_WITHIN: Duration = Duration::from_secs(3);
 const CONFIRM_TRIES: usize = 6;
 const CONFIRM_AGAIN: Duration = Duration::from_millis(500);
 
-fn identity(d: &Daemon) -> anyhow::Result<[u8; 32]> {
+pub(crate) fn identity(d: &Daemon) -> anyhow::Result<[u8; 32]> {
     d.core()
         .identity
         .as_ref()
@@ -698,7 +698,7 @@ pub(crate) fn media_type(name: &str) -> &'static str {
 
 /// Encodes files to attach to a message, with the key of the space's current
 /// epoch, so only those in the space can read them.
-async fn encode_attachments(
+pub(crate) async fn encode_attachments(
     d: &Arc<Daemon>,
     space: &SpaceId,
     paths: &[String],
@@ -1019,7 +1019,7 @@ pub fn react(d: &Arc<Daemon>, who: &str, id: &str, text: &str) -> anyhow::Result
 
 /// Reactions as a window shows them: each one once, with how many gave it
 /// and whether this person did.
-fn reactions_of(m: &relationship::Message, me: Option<[u8; 32]>) -> Vec<Json> {
+pub(crate) fn reactions_of(m: &relationship::Message, me: Option<[u8; 32]>) -> Vec<Json> {
     // One for each person, the last they gave, however many they wrote, and
     // no longer than this software lets anyone make one.
     let mut theirs: Vec<&relationship::Reaction> = Vec::new();

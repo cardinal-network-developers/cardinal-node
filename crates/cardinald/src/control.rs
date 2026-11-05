@@ -120,6 +120,15 @@ async fn watch(d: &Daemon, mut lines: tokio::io::Lines<BufReader<Reader>>, mut w
     }
 }
 
+/// A field that is a list of text, or nothing.
+fn strings(req: &Value, name: &str) -> Vec<String> {
+    let list = req.get(name).and_then(|v| v.as_array());
+    let items = list.into_iter().flatten();
+    items
+        .filter_map(|p| p.as_str().map(str::to_owned))
+        .collect()
+}
+
 fn arg<'a>(req: &'a Value, name: &str) -> anyhow::Result<&'a str> {
     req.get(name)
         .and_then(|v| v.as_str())
@@ -267,6 +276,45 @@ async fn handle(d: &Arc<Daemon>, req: &Value) -> anyhow::Result<Value> {
             (None, Some(category)) => crate::contacts::set_category(d, arg(req, "who")?, category),
             (None, None) => crate::contacts::set(d, arg(req, "who")?, arg(req, "setting")?),
         },
+        "say" if req.get("group").is_some() => {
+            let reply_to = req.get("reply_to").and_then(|v| v.as_str());
+            let attach = strings(req, "attach");
+            crate::groups::say(d, arg(req, "group")?, arg(req, "text")?, reply_to, &attach).await
+        }
+        "messages" if req.get("group").is_some() => crate::groups::messages(d, arg(req, "group")?),
+        "mark-read" if req.get("group").is_some() => {
+            crate::groups::mark_read(d, arg(req, "group")?)
+        }
+        "react" if req.get("group").is_some() => {
+            crate::groups::react(d, arg(req, "group")?, arg(req, "id")?, arg(req, "text")?)
+        }
+        "edit-message" if req.get("group").is_some() => {
+            crate::groups::edit_message(d, arg(req, "group")?, arg(req, "id")?, arg(req, "text")?)
+        }
+        "delete-message" if req.get("group").is_some() => {
+            crate::groups::delete_message(d, arg(req, "group")?, arg(req, "id")?)
+        }
+        "groups" => Ok(crate::groups::list(d)),
+        "group-create" => crate::groups::create(d, arg(req, "name")?, &strings(req, "people")),
+        "group-add" => {
+            let shown = req.get("shown").and_then(|v| v.as_str());
+            crate::groups::add(d, arg(req, "group")?, &strings(req, "people"), shown)
+        }
+        "group-remove" => crate::groups::remove(d, arg(req, "group")?, arg(req, "who")?),
+        "group-leave" => crate::groups::leave(d, arg(req, "group")?),
+        "group-join" => crate::groups::join(d, arg(req, "group")?).await,
+        "group-decline" => crate::groups::decline(d, arg(req, "group")?),
+        "group-members" => crate::groups::members(d, arg(req, "group")?),
+        "group-set" => {
+            let name = req.get("name").and_then(|v| v.as_str());
+            let introductions = req.get("introductions").and_then(|v| v.as_bool());
+            crate::groups::set(d, arg(req, "group")?, name, introductions)
+        }
+        "group-member" => {
+            let shown = req.get("shown").and_then(|v| v.as_str());
+            let introduce = req.get("introduce").and_then(|v| v.as_bool());
+            crate::groups::set_member(d, arg(req, "group")?, arg(req, "who")?, shown, introduce)
+        }
         "say" => {
             let reply_to = req.get("reply_to").and_then(|v| v.as_str());
             let attach: Vec<String> = req

@@ -995,6 +995,10 @@ async fn deliver(d: &Arc<Daemon>) {
     renew_reach(d);
     let shared = d.core().shared_spaces();
     for (space, members) in shared {
+        // Nothing of this person's goes in a group they have not joined.
+        if crate::groups::not_joined(d, &space) {
+            continue;
+        }
         if let Err(e) = write_reach(d, &space).await {
             tracing::debug!("writing where to reach this person: {e:#}");
         }

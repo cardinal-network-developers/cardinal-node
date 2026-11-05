@@ -308,7 +308,9 @@ impl Space {
     /// Whether this space needs [`evaluate_full`](Self::evaluate_full),
     /// because it has members other than its creator.
     pub fn needs_full_evaluation(&self) -> bool {
-        self.profile == Profile::RELATIONSHIP || self.unsupported.is_some()
+        self.profile == Profile::RELATIONSHIP
+            || self.profile == crate::group::GROUP
+            || self.unsupported.is_some()
     }
 
     /// Re-evaluates with the normative `space` program, given the authors'

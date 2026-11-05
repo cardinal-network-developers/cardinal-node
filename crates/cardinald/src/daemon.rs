@@ -1738,6 +1738,7 @@ impl Daemon {
         crate::copies::start(self.clone());
         crate::cleanup::start(self.clone());
         crate::mailbox::start(self.clone());
+        crate::groups::start(self.clone());
         // Report (never install) new releases, if the person allows it.
         let cfg_path = self.paths.config();
         tokio::spawn(async move {

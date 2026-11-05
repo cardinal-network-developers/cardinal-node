@@ -729,9 +729,15 @@ asks for around that is not built yet.
   makes messages, reactions and read markers author-owned, but not the
   conversation node, so a contact can delete or move it, which hides every
   message until it is restored.
-- **Group spaces, roles other than owner, and `remove_member`** are not
-  implemented. Only a contact's category says where a relationship is listed;
-  there is no group to list.
+- **Groups are made with owner and writers only.** Nothing makes anyone an
+  admin or a reader, so the warning `spaces.md` asks for when lowering an
+  admin discards members has nothing to warn of yet. A group is offered only
+  to the creator's or an admin's contacts, since the offer goes in a
+  relationship space. Software does not warn when a refused identity is
+  added to a group with this person (`contact.md#who-a-person-knows`), and
+  members who are nobody's contact here are shown by the name the group
+  gives them, with no warning when it matches someone else's. Groups are
+  not in the one folder.
 - **Contacts are not told apart from members by more than this device's account
   space.** A device opens a session with a contact's devices only for what they
   share (`spaces.md#holding-a-space`), and notices for a set go only to contacts

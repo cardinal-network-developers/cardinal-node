@@ -143,6 +143,19 @@ pub fn create_space(space: &SpaceId, local_name: &str) -> SpaceOp {
     )
 }
 
+/// `create` of a space node for an offer this person said no to.
+pub fn create_declined(space: &SpaceId, local_name: &str) -> SpaceOp {
+    SpaceOp::create(
+        NodeKind::Uint(SPACE),
+        ROOT,
+        local_name,
+        Record::new()
+            .with(1, *space)
+            .with(2, local_name)
+            .with(3, true),
+    )
+}
+
 /// `create` of a placement under a space node.
 pub fn create_placement(
     space_node: NodeId,
@@ -218,6 +231,8 @@ pub struct SpaceRecord {
     pub name: String,
     /// Placements.
     pub placements: Vec<PlacementRecord>,
+    /// An offer of it that this person said no to (`profiles.md#group`).
+    pub declined: bool,
 }
 
 fn last(n: &crate::state::Node, key: u64) -> Option<&Value> {
@@ -427,6 +442,7 @@ pub fn spaces(state: &State) -> Vec<SpaceRecord> {
                     .unwrap_or("")
                     .to_owned(),
                 placements,
+                declined: last(n, 3).and_then(|v| v.as_bool()).unwrap_or(false),
             })
         })
         .collect()

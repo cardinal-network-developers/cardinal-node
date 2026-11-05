@@ -242,6 +242,13 @@ enum Cmd {
         /// Who, as `cardinal contacts` shows.
         who: String,
     },
+    /// The groups you are in, and those offered to you.
+    Groups,
+    /// Make, join, talk in, or change a group.
+    Group {
+        #[command(subcommand)]
+        cmd: GroupCmd,
+    },
     /// Make this device a host for your own devices: it keeps a full copy
     /// of your files, and can bring them back if every other device is lost.
     Host {
@@ -330,6 +337,66 @@ enum Cmd {
     Stop,
     #[command(flatten)]
     Deploy(cardinal_update::DeployCommand),
+}
+
+#[derive(Subcommand)]
+enum GroupCmd {
+    /// Make a group with contacts, each of whom is offered it.
+    Create {
+        /// What to call it.
+        name: String,
+        /// Who to offer it to, as `cardinal contacts` shows them.
+        people: Vec<String>,
+    },
+    /// Join a group offered to you.
+    Join {
+        /// The group, by name or id.
+        group: String,
+    },
+    /// Say no to a group offered to you.
+    Decline {
+        /// The group, by name or id.
+        group: String,
+    },
+    /// Leave a group.
+    Leave {
+        /// The group, by name or id.
+        group: String,
+    },
+    /// Add contacts to a group you are an admin of.
+    Add {
+        /// The group, by name or id.
+        group: String,
+        /// Who, as `cardinal contacts` shows them.
+        people: Vec<String>,
+        /// The name the others see, for one person: yours for them if not given.
+        #[arg(long = "as")]
+        shown: Option<String>,
+    },
+    /// Take someone out of a group you are an admin of.
+    Remove {
+        /// The group, by name or id.
+        group: String,
+        /// Who, as the group's members show them.
+        who: String,
+    },
+    /// Who is in a group.
+    Members {
+        /// The group, by name or id.
+        group: String,
+    },
+    /// Send a message to a group.
+    Say {
+        /// The group, by name or id.
+        group: String,
+        /// What to say.
+        text: String,
+    },
+    /// A group's conversation.
+    Messages {
+        /// The group, by name or id.
+        group: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1480,6 +1547,90 @@ async fn client(cmd: Cmd) -> anyhow::Result<()> {
                     "Kept here: this cannot reach {who} through a host, so it waits \
                      until you connect."
                 );
+            }
+            Ok(())
+        }
+        Cmd::Groups => {
+            let v = call(&paths, json!({"cmd": "groups"})).await?;
+            for g in v["groups"].as_array().into_iter().flatten() {
+                let unread = g["unread"].as_u64().unwrap_or(0);
+                let unread = if unread > 0 {
+                    format!(", {unread} unread")
+                } else {
+                    String::new()
+                };
+                println!(
+                    "{}  ({} members{unread})  {}",
+                    printable(g["name"].as_str().unwrap_or("")),
+                    g["members"],
+                    &g["group"].as_str().unwrap_or("")[..16]
+                );
+            }
+            for o in v["offers"].as_array().into_iter().flatten() {
+                println!(
+                    "{} added you to {}: cardinal group join {}",
+                    printable(o["from"].as_str().unwrap_or("")),
+                    printable(o["name"].as_str().unwrap_or("")),
+                    &o["group"].as_str().unwrap_or("")[..16]
+                );
+            }
+            Ok(())
+        }
+        Cmd::Group { cmd } => {
+            let req = match &cmd {
+                GroupCmd::Create { name, people } => {
+                    json!({"cmd": "group-create", "name": name, "people": people})
+                }
+                GroupCmd::Join { group } => json!({"cmd": "group-join", "group": group}),
+                GroupCmd::Decline { group } => json!({"cmd": "group-decline", "group": group}),
+                GroupCmd::Leave { group } => json!({"cmd": "group-leave", "group": group}),
+                GroupCmd::Add {
+                    group,
+                    people,
+                    shown,
+                } => {
+                    json!({"cmd": "group-add", "group": group, "people": people, "shown": shown})
+                }
+                GroupCmd::Remove { group, who } => {
+                    json!({"cmd": "group-remove", "group": group, "who": who})
+                }
+                GroupCmd::Members { group } => json!({"cmd": "group-members", "group": group}),
+                GroupCmd::Say { group, text } => {
+                    json!({"cmd": "say", "group": group, "text": text})
+                }
+                GroupCmd::Messages { group } => json!({"cmd": "messages", "group": group}),
+            };
+            let v = call(&paths, req).await?;
+            match cmd {
+                GroupCmd::Create { .. } => println!(
+                    "Made {}: {}",
+                    printable(v["name"].as_str().unwrap_or("")),
+                    v["group"].as_str().unwrap_or("")
+                ),
+                GroupCmd::Members { .. } => {
+                    for m in v["members"].as_array().into_iter().flatten() {
+                        println!(
+                            "{}  {}",
+                            printable(m["name"].as_str().unwrap_or("")),
+                            m["role"].as_str().unwrap_or("")
+                        );
+                    }
+                }
+                GroupCmd::Messages { .. } => {
+                    for m in v["messages"].as_array().into_iter().flatten() {
+                        let by = if m["mine"] == true {
+                            "you"
+                        } else {
+                            m["from"].as_str().unwrap_or("")
+                        };
+                        println!(
+                            "{}: {}",
+                            printable(by),
+                            printable(m["text"].as_str().unwrap_or(""))
+                        );
+                    }
+                }
+                _ => {}
             }
             Ok(())
         }

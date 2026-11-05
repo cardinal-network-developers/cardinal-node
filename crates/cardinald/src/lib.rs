@@ -18,6 +18,7 @@ pub mod directory;
 pub mod fetch;
 pub mod fs;
 pub mod fsat;
+pub mod groups;
 pub mod host;
 pub mod keys;
 pub mod mailbox;

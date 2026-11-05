@@ -558,6 +558,85 @@ impl Holder {
         Ok((id, bytes))
     }
 
+    /// Adds members to a group in one entry, with the current key wrapped
+    /// for them (`profiles.md#group`). Returns the sealed bytes.
+    pub fn add_members(
+        &mut self,
+        identity: &Identity,
+        keys: &Keys,
+        added: &[([u8; 32], HybridPublicKey)],
+        ops: Vec<SpaceOp>,
+    ) -> anyhow::Result<Vec<u8>> {
+        let mine = identity
+            .enc
+            .first()
+            .ok_or_else(|| anyhow::anyhow!("no encryption key"))?
+            .public_key()
+            .clone();
+        let space = self
+            .space
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("space not open yet"))?;
+        let role = cardinal_space::group::WRITER;
+        let adding: Vec<_> = added.iter().map(|(w, k)| (*w, role, k)).collect();
+        let mut everyone = vec![&mine];
+        everyone.extend(self.member_keys.iter());
+        let sealed = space.add_members(
+            &identity.log,
+            &keys.device.signing,
+            &adding,
+            &everyone,
+            ops,
+            Some(now_ms()),
+        )?;
+        let bytes = sealed.encode();
+        self.persist(&[(sealed.sealed_id(), bytes.clone())])?;
+        self.version += 1;
+        Ok(bytes)
+    }
+
+    /// Ends memberships in an entry that starts a new epoch, wrapped for
+    /// `staying` and this identity (`spaces.md#when-to-rotate`).
+    pub fn remove_members(
+        &mut self,
+        identity: &Identity,
+        keys: &Keys,
+        gone: &[[u8; 32]],
+        staying: &[HybridPublicKey],
+    ) -> anyhow::Result<Vec<u8>> {
+        let mine = identity
+            .enc
+            .first()
+            .ok_or_else(|| anyhow::anyhow!("no encryption key"))?
+            .public_key()
+            .clone();
+        let space = self
+            .space
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("space not open yet"))?;
+        let ops: Vec<SpaceOp> = space
+            .validity()
+            .members
+            .iter()
+            .filter(|m| gone.contains(&m.identity))
+            .map(|m| SpaceOp::remove_member(m.id))
+            .collect();
+        anyhow::ensure!(!ops.is_empty(), "they are not in it");
+        let mut recipients = vec![&mine];
+        recipients.extend(staying.iter());
+        let (sealed, _) = space.rotate(
+            &identity.log,
+            &keys.device.signing,
+            &recipients,
+            ops,
+            Some(now_ms()),
+        )?;
+        let bytes = sealed.encode();
+        self.persist(&[(sealed.sealed_id(), bytes.clone())])?;
+        self.version += 1;
+        Ok(bytes)
+    }
+
     /// Writes one entry with `ops` that does not descend from any of
     /// `exclude` ([`Space::write_concurrent`]): for local changes made
     /// without having seen those entries. Refused while an epoch rotation
@@ -765,10 +844,16 @@ impl Core {
 
     /// The identity whose log has `label`, of those this device keeps.
     pub fn other_of_label(&self, label: &[u8; 32]) -> Option<[u8; 32]> {
+        let members = self
+            .spaces
+            .values()
+            .filter_map(|h| h.space.as_ref())
+            .flat_map(|s| s.validity().members.iter().map(|m| m.identity));
         self.contacts()
             .into_iter()
             .map(|c| c.identity)
             .chain(self.others.keys().copied())
+            .chain(members)
             .find(|id| identity_log_label(id) == *label)
     }
 
@@ -913,11 +998,25 @@ impl Core {
 
     /// The labels of contacts' logs this device does not have yet.
     pub fn missing_logs(&self) -> Vec<[u8; 32]> {
-        let contacts = self.contacts();
-        let missing = contacts
-            .iter()
-            .filter(|c| !self.others.contains_key(&c.identity));
-        missing.map(|c| identity_log_label(&c.identity)).collect()
+        let me = self.identity.as_ref().map(|i| i.id());
+        let contacts = self.contacts().into_iter().map(|c| c.identity);
+        // And the members of the spaces here, whose writes their logs judge.
+        let members = self
+            .spaces
+            .values()
+            .filter_map(|h| h.space.as_ref())
+            .flat_map(|s| s.validity().members.iter().map(|m| m.identity));
+        let mut out: Vec<[u8; 32]> = Vec::new();
+        for who in contacts.chain(members) {
+            if Some(who) == me || self.others.contains_key(&who) {
+                continue;
+            }
+            let label = identity_log_label(&who);
+            if !out.contains(&label) {
+                out.push(label);
+            }
+        }
+        out
     }
 
     /// Whether `identity` is a member of the space `label`, or `label` is
@@ -926,10 +1025,12 @@ impl Core {
         if Some(*label) == self.identity_label() {
             return self.others.contains_key(identity);
         }
-        self.spaces
-            .get(label)
-            .and_then(|h| h.space.as_ref())
-            .is_some_and(|s| s.validity().members.iter().any(|m| m.identity == *identity))
+        let open = self.spaces.get(label).and_then(|h| h.space.as_ref());
+        if let Some(s) = open {
+            return s.validity().members.iter().any(|m| m.identity == *identity);
+        }
+        // A space they offered this person, not yet here: they bring it.
+        self.offers_from(identity).iter().any(|o| o.space == *label)
     }
 
     /// Whether `identity`'s log, as held here, has this device in it.
@@ -950,6 +1051,17 @@ impl Core {
         let mut v: Vec<[u8; 32]> = self.identity_label().into_iter().collect();
         v.push(identity_log_label(identity));
         v.extend(self.spaces.keys().filter(|l| self.shares(identity, l)));
+        for o in self.offers_from(identity) {
+            if !v.contains(&o.space) {
+                v.push(o.space);
+            }
+        }
+        // The other members' logs, for what they write to be judged.
+        v.extend(
+            self.members_shared_with(identity)
+                .iter()
+                .map(identity_log_label),
+        );
         v
     }
 
@@ -1035,6 +1147,174 @@ impl Core {
         let bytes = sealed.encode();
         self.ingest_space(id, std::slice::from_ref(&bytes))?;
         Ok((id, bytes))
+    }
+
+    /// The current encryption key of an identity whose log this device holds.
+    pub fn encryption_key_of(&self, who: &[u8; 32]) -> anyhow::Result<HybridPublicKey> {
+        let other = self.others.get(who);
+        let key = other.and_then(|o| o.log.state().encryption_key.clone());
+        Ok(key
+            .ok_or_else(|| anyhow::anyhow!("their identity log has no encryption key"))?
+            .public)
+    }
+
+    /// Makes a group of this person, as its owner, and `members`, each with
+    /// the name the others see (`profiles.md#group`). Returns its id.
+    pub fn create_group(
+        &mut self,
+        name: &str,
+        me_as: &str,
+        members: &[([u8; 32], String)],
+    ) -> anyhow::Result<SpaceId> {
+        use cardinal_space::group;
+        let ident = self
+            .identity
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("this device has no identity yet"))?;
+        let mine = ident
+            .enc
+            .first()
+            .ok_or_else(|| anyhow::anyhow!("no encryption key"))?
+            .public_key()
+            .clone();
+        let mut keys = vec![mine];
+        let mut ops = Vec::new();
+        for (who, _) in members {
+            keys.push(self.encryption_key_of(who)?);
+            ops.push(SpaceOp::add_member(*who, group::WRITER));
+        }
+        ops.extend(group::genesis_ops(name));
+        ops.push(group::create_member(&ident.id(), me_as, true));
+        for (who, shown) in members {
+            ops.push(group::create_member(who, shown, true));
+        }
+        let refs: Vec<&HybridPublicKey> = keys.iter().collect();
+        let (space, sealed) = Space::create_with(
+            group::GROUP,
+            cardinal_space::Policy::default(),
+            &ident.log,
+            &self.keys.device.signing,
+            &refs,
+            ops,
+            Some(now_ms()),
+        )?;
+        let id = space.id();
+        self.ingest_space(id, &[sealed.encode()])?;
+        Ok(id)
+    }
+
+    /// Adds `members` to a group, each with the name the others see.
+    /// Returns the sealed bytes.
+    pub fn add_to_group(
+        &mut self,
+        space: &SpaceId,
+        members: &[([u8; 32], String)],
+    ) -> anyhow::Result<Vec<u8>> {
+        let mut added = Vec::new();
+        for (who, _) in members {
+            added.push((*who, self.encryption_key_of(who)?));
+        }
+        let ops = members
+            .iter()
+            .map(|(who, shown)| cardinal_space::group::create_member(who, shown, true))
+            .collect();
+        let ident = self
+            .identity
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("this device has no identity yet"))?;
+        let h = self
+            .spaces
+            .get_mut(space)
+            .ok_or_else(|| anyhow::anyhow!("space not held"))?;
+        let bytes = h.add_members(ident, &self.keys, &added, ops)?;
+        self.settle(space);
+        Ok(bytes)
+    }
+
+    /// Ends the memberships of `gone` in a group, with a new key for the
+    /// rest. Returns the sealed bytes.
+    pub fn remove_from_group(
+        &mut self,
+        space: &SpaceId,
+        gone: &[[u8; 32]],
+    ) -> anyhow::Result<Vec<u8>> {
+        let me = self.identity.as_ref().map(|i| i.id());
+        let staying: Vec<[u8; 32]> = {
+            let h = self.spaces.get(space).and_then(|h| h.space.as_ref());
+            let h = h.ok_or_else(|| anyhow::anyhow!("space not open yet"))?;
+            let mut v: Vec<[u8; 32]> = h.validity().members.iter().map(|m| m.identity).collect();
+            v.sort_unstable();
+            v.dedup();
+            v.retain(|m| !gone.contains(m) && Some(*m) != me);
+            v
+        };
+        let keys: Vec<HybridPublicKey> = staying
+            .iter()
+            .filter_map(|m| self.encryption_key_of(m).ok())
+            .collect();
+        let ident = self
+            .identity
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("this device has no identity yet"))?;
+        let h = self
+            .spaces
+            .get_mut(space)
+            .ok_or_else(|| anyhow::anyhow!("space not held"))?;
+        let bytes = h.remove_members(ident, &self.keys, gone, &keys)?;
+        self.settle(space);
+        Ok(bytes)
+    }
+
+    /// The spaces offered to this person by `identity`, in the relationship
+    /// space with them, that they have not declined (`spaces.md#holding-a-space`).
+    pub fn offers_from(&self, identity: &[u8; 32]) -> Vec<cardinal_space::group::Offer> {
+        let contacts = self.contacts();
+        let Some(c) = contacts.iter().find(|c| c.identity == *identity) else {
+            return Vec::new();
+        };
+        let Some(open) = self.spaces.get(&c.space).and_then(|h| h.space.as_ref()) else {
+            return Vec::new();
+        };
+        let declined = self.declined();
+        cardinal_space::group::offers(open.state())
+            .into_iter()
+            .filter(|o| o.from == *identity && !declined.contains(&o.space))
+            .collect()
+    }
+
+    /// The spaces this person said no to.
+    pub fn declined(&self) -> Vec<SpaceId> {
+        let Some(acc) = self.account().and_then(|a| a.space.as_ref()) else {
+            return Vec::new();
+        };
+        account::spaces(acc.state())
+            .into_iter()
+            .filter(|s| s.declined)
+            .map(|s| s.space)
+            .collect()
+    }
+
+    /// The members of the spaces this device holds that are shared with
+    /// `identity`, other than the two of them: whose logs a member device
+    /// reconciles with whoever it is connected to (`spaces.md#holding-a-space`).
+    pub fn members_shared_with(&self, identity: &[u8; 32]) -> Vec<[u8; 32]> {
+        let me = self.identity.as_ref().map(|i| i.id());
+        let mut out: Vec<[u8; 32]> = Vec::new();
+        for h in self.spaces.values() {
+            let Some(sp) = h.space.as_ref() else {
+                continue;
+            };
+            let members = &sp.validity().members;
+            if !members.iter().any(|m| m.identity == *identity) {
+                continue;
+            }
+            for m in members {
+                if m.identity != *identity && Some(m.identity) != me && !out.contains(&m.identity) {
+                    out.push(m.identity);
+                }
+            }
+        }
+        out
     }
 
     /// Takes a relationship space with `inviter` from its sealed genesis.
@@ -1203,6 +1483,18 @@ impl Core {
                     .iter()
                     .map(|c| identity_log_label(&c.identity)),
             );
+            let me = self.identity.as_ref().map(|i| i.id());
+            let members = self
+                .spaces
+                .values()
+                .filter_map(|h| h.space.as_ref())
+                .flat_map(|s| s.validity().members.iter().map(|m| m.identity));
+            for m in members.filter(|m| Some(*m) != me) {
+                let l = identity_log_label(&m);
+                if !v.contains(&l) {
+                    v.push(l);
+                }
+            }
             v.extend(self.spaces.keys().copied());
         }
         v

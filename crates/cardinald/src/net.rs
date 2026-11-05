@@ -131,6 +131,13 @@ impl Daemon {
                     Access::Other(identity)
                 } else if Some(*label) == core.identity_label() || core.shares(&identity, label) {
                     Access::Full
+                } else if let Some(m) = core
+                    .members_shared_with(&identity)
+                    .into_iter()
+                    .find(|m| identity_log_label(m) == *label)
+                {
+                    // Another member's log, for what they write to be judged.
+                    Access::Other(m)
                 } else {
                     Access::None
                 }
