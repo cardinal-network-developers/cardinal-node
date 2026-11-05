@@ -355,6 +355,9 @@ async fn handle(d: &Arc<Daemon>, req: &Value) -> anyhow::Result<Value> {
         "delete-message" => crate::contacts::delete_message(d, arg(req, "who")?, arg(req, "id")?),
         "react" => crate::contacts::react(d, arg(req, "who")?, arg(req, "id")?, arg(req, "text")?),
         "call" => Ok(crate::calls::current(d)),
+        "call-start" if req.get("group").is_some() => {
+            crate::calls::start_group(d, arg(req, "group")?).await
+        }
         "call-start" => crate::calls::start(d, arg(req, "who")?).await,
         "call-answer" => crate::calls::answer(d).await,
         "call-end" => crate::calls::end(d).await,

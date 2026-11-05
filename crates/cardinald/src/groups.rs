@@ -679,6 +679,49 @@ pub fn set_member(
     Ok(json!({}))
 }
 
+/// A group this person is in, by id or name, with its name: for a call.
+pub(crate) fn joined_group(d: &Daemon, group: &str) -> anyhow::Result<(SpaceId, String)> {
+    let g = joined(d, group)?;
+    Ok((g.id, g.name))
+}
+
+/// The name of a group this person joined that `who` is in, if `space` is
+/// one: what a call in it is called.
+pub(crate) fn shared_group(d: &Daemon, space: &SpaceId, who: &[u8; 32]) -> Option<String> {
+    let me = identity(d).ok()?;
+    let core = d.core();
+    let sp = core.spaces.get(space)?.space.as_ref()?;
+    let ours = sp.profile() == group::GROUP
+        && group::joined(sp, &me)
+        && sp.validity().members.iter().any(|m| m.identity == *who);
+    ours.then(|| group::name(sp))
+}
+
+/// The direct sessions with the devices of a group's other members.
+pub(crate) fn member_sessions(d: &Daemon, space: &SpaceId) -> Vec<cardinal_link::Session> {
+    let members: Vec<[u8; 32]> = {
+        let core = d.core();
+        let me = core.identity.as_ref().map(|i| i.id());
+        let sp = core.spaces.get(space).and_then(|h| h.space.as_ref());
+        sp.map(|sp| {
+            sp.validity()
+                .members
+                .iter()
+                .map(|m| m.identity)
+                .filter(|m| Some(*m) != me)
+                .collect()
+        })
+        .unwrap_or_default()
+    };
+    let mut out = Vec::new();
+    for (who, s) in d.contacts_in_touch() {
+        if members.contains(&who) {
+            out.push(s);
+        }
+    }
+    out
+}
+
 /// Whether a group is one this person has not joined: nothing of theirs is
 /// written in it until they do (`spaces.md#holding-a-space`).
 pub fn not_joined(d: &Daemon, space: &SpaceId) -> bool {

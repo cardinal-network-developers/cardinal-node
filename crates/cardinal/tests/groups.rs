@@ -177,3 +177,125 @@ fn a_group_can_be_declined() {
     let no = reply(&bo, &json!({"cmd": "say", "group": g, "text": "hi"}));
     assert_eq!(no["ok"], false, "{no}");
 }
+
+fn standing(d: &Dev) -> Value {
+    ask(d, json!({"cmd": "call"}))["call"]["state"].clone()
+}
+
+/// A call's sound, as a client has it.
+struct Line {
+    w: UnixStream,
+    r: BufReader<UnixStream>,
+}
+
+impl Line {
+    fn open(d: &Dev) -> Line {
+        let mut w = UnixStream::connect(d.home.join("control.sock")).unwrap();
+        writeln!(w, "{}", json!({"cmd": "call-media"})).unwrap();
+        w.set_read_timeout(Some(std::time::Duration::from_millis(20)))
+            .unwrap();
+        let r = BufReader::new(w.try_clone().unwrap());
+        Line { w, r }
+    }
+
+    fn say(&mut self, tag: u8, n: u32) {
+        let mut frame = n.to_be_bytes().to_vec();
+        frame.extend_from_slice(&[tag; 20]);
+        writeln!(self.w, "{}", json!({"audio": hex::encode(frame)})).unwrap();
+    }
+
+    /// The voices heard so far, by who, and what each said.
+    fn heard(
+        &mut self,
+        into: &mut std::collections::HashMap<String, std::collections::HashSet<u8>>,
+    ) {
+        loop {
+            let mut line = String::new();
+            match self.r.read_line(&mut line) {
+                Ok(0) | Err(_) => return,
+                Ok(_) => {}
+            }
+            let Ok(v) = serde_json::from_str::<Value>(&line) else {
+                continue;
+            };
+            let (Some(from), Some(audio)) = (v["from"].as_str(), v["audio"].as_str()) else {
+                continue;
+            };
+            let bytes = hex::decode(audio).unwrap();
+            into.entry(from.to_owned()).or_default().insert(bytes[4]);
+        }
+    }
+}
+
+#[test]
+fn a_group_call_carries_every_voice_through_whoever_links_them() {
+    let root = tempfile::tempdir().unwrap();
+    let ana = person(root.path(), "ana");
+    let bo = person(root.path(), "bo");
+    let cy = person(root.path(), "cy");
+    meet(&ana, &bo, "Bo");
+    meet(&ana, &cy, "Cy");
+    let made = ask(
+        &ana,
+        json!({"cmd": "group-create", "name": "Family", "people": ["Bo", "Cy"]}),
+    );
+    let g = made["group"].as_str().unwrap().to_owned();
+    for d in [&bo, &cy] {
+        wait("offered", 30, || !offers(d).is_empty());
+        ask(d, json!({"cmd": "group-join", "group": g}));
+    }
+    wait("everyone sees everyone", 30, || {
+        [&ana, &bo, &cy].iter().all(|d| {
+            let m = reply(d, &json!({"cmd": "group-members", "group": g}));
+            m["members"].as_array().is_some_and(|m| m.len() == 3)
+        })
+    });
+
+    ask(&ana, json!({"cmd": "call-start", "group": g}));
+    wait("both ring", 15, || {
+        standing(&bo) == "ringing" && standing(&cy) == "ringing"
+    });
+    assert_eq!(ask(&cy, json!({"cmd": "call"}))["call"]["name"], "Family");
+    ask(&bo, json!({"cmd": "call-answer"}));
+    ask(&cy, json!({"cmd": "call-answer"}));
+    wait("all live", 15, || {
+        [&ana, &bo, &cy].iter().all(|d| standing(d) == "live")
+    });
+    // Bo and Cy have no session with each other: Ana links them.
+    wait("ana links both", 15, || {
+        ask(&ana, json!({"cmd": "call"}))["call"]["linked"] == 2
+    });
+
+    let mut lines = [Line::open(&ana), Line::open(&bo), Line::open(&cy)];
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    let mut heard: [std::collections::HashMap<String, std::collections::HashSet<u8>>; 3] =
+        Default::default();
+    for n in 0..60u32 {
+        for (i, l) in lines.iter_mut().enumerate() {
+            l.say(i as u8 + 1, n);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        for (i, l) in lines.iter_mut().enumerate() {
+            l.heard(&mut heard[i]);
+        }
+    }
+    for _ in 0..20 {
+        for (i, l) in lines.iter_mut().enumerate() {
+            l.heard(&mut heard[i]);
+        }
+    }
+    for (i, h) in heard.iter().enumerate() {
+        let mut said: Vec<u8> = h.values().flatten().copied().collect();
+        said.sort_unstable();
+        let others: Vec<u8> = (1..=3u8).filter(|t| *t != i as u8 + 1).collect();
+        assert_eq!(said, others, "device {i} heard {h:?}");
+        assert_eq!(h.len(), 2, "two voices, apart: {h:?}");
+    }
+
+    // Cy leaves; Ana and Bo go on.
+    ask(&cy, json!({"cmd": "call-end"}));
+    wait("ana links bo alone", 10, || {
+        ask(&ana, json!({"cmd": "call"}))["call"]["linked"] == 1
+    });
+    assert_eq!(standing(&bo), "live");
+}

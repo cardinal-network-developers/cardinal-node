@@ -255,7 +255,9 @@ pub struct Daemon {
     /// What each contact may fetch from here.
     pub shared_blobs: Mutex<HashMap<[u8; 32], SharedBlobs>>,
     /// Audio heard on calls, for a client, by call.
-    pub call_audio: tokio::sync::broadcast::Sender<([u8; 16], bytes::Bytes)>,
+    /// A call's audio as it comes in: the call, whose voice it is in a group
+    /// call, and the frame.
+    pub call_audio: tokio::sync::broadcast::Sender<([u8; 16], Option<[u8; 8]>, bytes::Bytes)>,
     /// An identity made for a client, until its person has written the words
     /// down.
     pub setting_up: Mutex<Option<(crate::setup::Prepared, [usize; 2])>>,
