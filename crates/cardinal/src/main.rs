@@ -167,11 +167,45 @@ enum Cmd {
         /// `trust` connects your devices directly if they trust you too.
         /// `hosts-only` stops that. `no-introductions` lets nothing reach
         /// you through them. `refuse` ends everything with them and hides
-        /// them. `name` changes what you call them.
-        #[arg(value_parser = ["trust", "hosts-only", "introductions", "no-introductions", "refuse", "unrefuse", "name"])]
+        /// them. `name` changes what you call them, and `category` the
+        /// folder they are listed in (People unless you say).
+        #[arg(value_parser = ["trust", "hosts-only", "introductions", "no-introductions", "refuse", "unrefuse", "name", "category"])]
         setting: String,
-        /// The new name, after `name`.
+        /// The new name, after `name`, or the category, after `category`.
         new_name: Option<String>,
+    },
+    /// What is in a folder of your Cardinal folder: your files, and beside
+    /// them a folder for each person you know, shared with them.
+    Files {
+        /// The folder, such as `People/Ana` (the top if left out).
+        path: Option<String>,
+    },
+    /// Put files of your Cardinal folder in the folder you share with
+    /// someone. With --message they go in a message too; without, the
+    /// conversation shows nothing.
+    Share {
+        /// Who, as `cardinal contacts` shows.
+        who: String,
+        /// What, as `cardinal files` shows it, such as `Photos/beach.jpg`.
+        #[arg(required = true)]
+        paths: Vec<String>,
+        /// A message to send them with it.
+        #[arg(long)]
+        message: Option<String>,
+    },
+    /// Copy a file or folder from this computer into your Cardinal folder.
+    Put {
+        /// The file or folder on this computer.
+        from: PathBuf,
+        /// The folder it goes in, such as `People/Ana` (the top if left out).
+        to: Option<String>,
+    },
+    /// Copy a file of your Cardinal folder onto this computer.
+    Get {
+        /// The file, as `cardinal files` shows it.
+        path: String,
+        /// Where it goes on this computer.
+        to: PathBuf,
     },
     /// The invitations you made, and whether each can still be used. `cancel ID`
     /// ends one on all your devices. An invitation lasts 30 days.
@@ -1335,7 +1369,13 @@ async fn client(cmd: Cmd) -> anyhow::Result<()> {
                 ("name", None) => {
                     anyhow::bail!("say what to call them: `cardinal contact {who} name NEW`")
                 }
-                (_, Some(_)) => anyhow::bail!("only `name` takes a new name"),
+                ("category", Some(c)) => json!({"cmd": "contact", "who": who, "category": c}),
+                ("category", None) => {
+                    anyhow::bail!(
+                        "say where to list them: `cardinal contact {who} category Family`"
+                    )
+                }
+                (_, Some(_)) => anyhow::bail!("only `name` and `category` take a value"),
                 (_, None) => json!({"cmd": "contact", "who": who, "setting": setting}),
             };
             call(&paths, req).await?;
@@ -1378,6 +1418,55 @@ async fn client(cmd: Cmd) -> anyhow::Result<()> {
                 Ok(())
             }
         },
+        Cmd::Files { path } => {
+            let path = path.unwrap_or_default();
+            let v = call(&paths, json!({"cmd": "files", "path": path})).await?;
+            if let Some(name) = v["place"]["name"]
+                .as_str()
+                .filter(|_| v["place"]["kind"] == "shared")
+            {
+                println!("Shared with {name}: you both see what is here.");
+            }
+            for f in v["files"].as_array().into_iter().flatten() {
+                let name = printable(f["name"].as_str().unwrap_or("?"));
+                if f["folder"] == true {
+                    println!("{name}/");
+                } else {
+                    let size = f["size"].as_u64().map(human_size).unwrap_or_default();
+                    println!("{name}  {size}");
+                }
+            }
+            Ok(())
+        }
+        Cmd::Share {
+            who,
+            paths: what,
+            message,
+        } => {
+            let req = json!({"cmd": "share", "who": who, "paths": what, "text": message});
+            let v = call(&paths, req).await?;
+            println!(
+                "In {}{}.",
+                v["path"].as_str().unwrap_or(""),
+                if v["message"] == true {
+                    ", with your message"
+                } else {
+                    ""
+                }
+            );
+            Ok(())
+        }
+        Cmd::Put { from, to } => {
+            let from = std::path::absolute(from)?;
+            let req = json!({"cmd": "put", "from": from, "to": to.unwrap_or_default()});
+            call(&paths, req).await?;
+            Ok(())
+        }
+        Cmd::Get { path, to } => {
+            let to = std::path::absolute(to)?;
+            call(&paths, json!({"cmd": "save", "path": path, "to": to})).await?;
+            Ok(())
+        }
         Cmd::Say { who, text, attach } => {
             // The daemon has its own working directory.
             let attach: Vec<PathBuf> = attach

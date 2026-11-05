@@ -60,10 +60,21 @@ fn name_str(name: &OsStr) -> Result<&str, c_int> {
 impl CardinalFs {
     /// A filesystem over `tree`.
     pub fn new(d: Arc<Daemon>, tree: Arc<Mutex<Tree>>) -> CardinalFs {
-        let fetcher: &'static Fetcher = Box::leak(Box::new(Fetcher::new(
-            &d,
-            cardinal_link::Priority::Interactive,
-        )));
+        CardinalFs::shared_with(d, tree, None)
+    }
+
+    /// A filesystem over `tree`, a folder shared with `contact`, whose
+    /// devices may hold what is in it too.
+    pub fn shared_with(
+        d: Arc<Daemon>,
+        tree: Arc<Mutex<Tree>>,
+        contact: Option<[u8; 32]>,
+    ) -> CardinalFs {
+        let priority = cardinal_link::Priority::Interactive;
+        let fetcher: &'static Fetcher = Box::leak(Box::new(match contact {
+            Some(who) => Fetcher::from_contact(&d, priority, who),
+            None => Fetcher::new(&d, priority),
+        }));
         CardinalFs {
             d,
             tree,
@@ -74,6 +85,24 @@ impl CardinalFs {
             uid: unsafe { libc::getuid() },
             gid: unsafe { libc::getgid() },
         }
+    }
+
+    /// Answers a lookup of this tree's root, from the folder it is listed in.
+    pub(crate) fn root_entry(&mut self, reply: ReplyEntry) {
+        let mut t = lock(&self.tree);
+        let root = t.root;
+        if let Some(i) = t.inodes.get_mut(&root) {
+            i.nlookup += 1;
+        }
+        match self.attr(&t, root) {
+            Some(a) => reply.entry(&TTL, &a, 0),
+            None => reply.error(ENOENT),
+        }
+    }
+
+    /// The owner of everything shown.
+    pub(crate) fn owner(&self) -> (u32, u32) {
+        (self.uid, self.gid)
     }
 
     fn attr(&self, t: &Tree, ino: u64) -> Option<FileAttr> {

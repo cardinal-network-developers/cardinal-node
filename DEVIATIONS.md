@@ -90,17 +90,20 @@ should eventually be resolved by changing either the code or the spec.
 
 ## Blobs (`spec/blobs.md`)
 
-- **A contact is served only what is attached in what they share.**
+- **A contact is served only what this person put in what they share.**
   `sync.md#blob-transfer` serves any peer with a session, since an id is the
   right to fetch it. Here a person's own devices get anything, and a contact
-  only the chunks and indexes of attachments in the space shared with them, so
-  one who knew the id of a private chunk would still not get it.
-- **Attachments are fetched only from the people's own devices, while online.**
-  A host keeps no copy, and `storage` `allow` is not used, so a file sent while
-  the sender's laptop was on can be saved only while a device of theirs that
-  holds it is on. Their chunks are never freed, by `free-space` or otherwise.
-  A media type comes from the file's ending, and the windows do not offer
-  attachments yet.
+  only the chunks and indexes of this person's attachments, and of content
+  this person wrote in the shared folder, in the space shared with them, so
+  one who knew the id of a private chunk would still not get it. What a
+  contact put there themselves comes from their devices.
+- **Shared files come from the two people's own devices, while online.**
+  A device with full retention keeps every file of a shared folder and every
+  attachment as they arrive, and one on demand keeps images up to 16 MiB, so
+  a person's always-on device soon holds what they were sent. A host keeps no
+  copy for someone else, and `storage` `allow` is not used. Their chunks are
+  never freed, by `free-space` or otherwise. A media type comes from the
+  file's ending.
 - **Spec ambiguity: the gear table's range.** "for `i` in `0..255`" reads
   as 255 entries, but the table is indexed by a byte. Chose all 256 byte
   values, `i` in `0..=255` (`vectors/blob.json`, `gear_table_blake3`).
@@ -726,9 +729,9 @@ asks for around that is not built yet.
   makes messages, reactions and read markers author-owned, but not the
   conversation node, so a contact can delete or move it, which hides every
   message until it is restored.
-- **Group spaces, shared folders, roles other than owner, and `remove_member`**
-  are not implemented. A relationship space has only its conversation, and no
-  shared files.
+- **Group spaces, roles other than owner, and `remove_member`** are not
+  implemented. Only a contact's category says where a relationship is listed;
+  there is no group to list.
 - **Contacts are not told apart from members by more than this device's account
   space.** A device opens a session with a contact's devices only for what they
   share (`spaces.md#holding-a-space`), and notices for a set go only to contacts

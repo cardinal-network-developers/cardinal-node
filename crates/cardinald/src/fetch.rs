@@ -9,7 +9,7 @@ use std::time::Duration;
 use cardinal_blob::{BlobReader, BlobRef, Fetch, ObjectStore};
 use cardinal_link::Priority;
 use cardinal_space::files::{Content, FileKind, Files};
-use cardinal_space::Space;
+use cardinal_space::{relationship, Space};
 
 use crate::daemon::Daemon;
 use crate::net::{BlobEvent, BlobFetch};
@@ -261,34 +261,127 @@ async fn pass(d: &Arc<Daemon>, complete: &mut HashSet<[u8; 32]>) -> anyhow::Resu
         let c = d.config();
         (c.on_demand(), c.pins.clone())
     };
-    let blobs: Vec<(String, BlobRef)> = {
-        let core = d.core();
-        let Some(files) = core.files_id() else {
-            return Ok(());
-        };
-        let Some(space) = core.spaces.get(&files).and_then(|h| h.space.as_ref()) else {
-            return Ok(());
-        };
-        current_blobs(space)
+    let pinned = |p: &str| {
+        pins.iter()
+            .any(|pin| p == pin || p.starts_with(&format!("{pin}/")))
     };
+    // What to fetch, by whose devices may hold it besides this person's:
+    // their own files, then each relationship's shared folder and the files
+    // of its messages (`profiles.md#shared-folder`). Under on-demand
+    // retention, images small enough to show are kept as they come.
+    let mut sources: Vec<Source> = Vec::new();
+    {
+        let core = d.core();
+        if let Some(space) = core
+            .files_id()
+            .and_then(|f| core.spaces.get(&f))
+            .and_then(|h| h.space.as_ref())
+        {
+            let mine = current_blobs(space)
+                .into_iter()
+                .filter(|(p, _)| !on_demand || pinned(p))
+                .collect();
+            sources.push((None, mine));
+        }
+    }
+    for s in crate::onefolder::relationships(d) {
+        let core = d.core();
+        let Some(space) = core
+            .spaces
+            .get(&s.contact.space)
+            .and_then(|h| h.space.as_ref())
+        else {
+            continue;
+        };
+        let base = s.path();
+        let keep =
+            |p: &str, b: &BlobRef| !on_demand || pinned(p) || (is_image(p) && b.size <= IMAGE_KEEP);
+        let mut theirs = Vec::new();
+        for (p, b) in current_blobs(space) {
+            let full = format!("{base}/{p}");
+            if keep(&full, &b) {
+                theirs.push((full, b));
+            }
+        }
+        for m in relationship::messages(space) {
+            for a in m.attachments {
+                let Ok(b) = BlobRef::from_record(&a.blob) else {
+                    continue;
+                };
+                let full = format!("{base}/{}", a.name);
+                if keep(&full, &b) {
+                    theirs.push((full, b));
+                }
+            }
+        }
+        sources.push((Some(s.contact.identity), theirs));
+    }
     let mut seen = HashSet::new();
-    let all: Vec<(String, BlobRef)> = blobs
-        .into_iter()
-        .filter(|(p, _)| {
-            !on_demand
-                || pins
-                    .iter()
-                    .any(|pin| p == pin || p.starts_with(&format!("{pin}/")))
-        })
-        .filter(|(_, b)| seen.insert(b.id))
-        .collect();
-    let bytes_wanted: u64 = all.iter().map(|(_, b)| b.size).sum();
+    for (_, blobs) in &mut sources {
+        blobs.retain(|(_, b)| seen.insert(b.id));
+    }
+    {
+        let mut pr = lock(&d.progress);
+        pr.bytes_wanted = sources
+            .iter()
+            .flat_map(|(_, b)| b)
+            .map(|(_, b)| b.size)
+            .sum();
+        let pending = || {
+            sources
+                .iter()
+                .flat_map(|(_, b)| b)
+                .filter(|(_, b)| !complete.contains(&b.id))
+        };
+        pr.files_pending = pending().count() as u64;
+        // Until a file is listed, all of it counts as missing.
+        pr.bytes_pending = pending().map(|(_, b)| b.size).sum();
+    }
+    let mut first_error = None;
+    for (from, wanted) in sources {
+        let got = fetch_set(d, complete, wanted, from).await;
+        match (got, from) {
+            (Err(e), None) => first_error = Some(e),
+            // A contact's devices are often off; that is no failure here.
+            (Err(e), Some(who)) => tracing::debug!("{}'s files: {e:#}", hex8(&who)),
+            (Ok(()), _) => {}
+        }
+    }
+    match first_error {
+        Some(e) => Err(e),
+        None => {
+            lock(&d.progress).last_error = None;
+            Ok(())
+        }
+    }
+}
+
+/// Whose devices may hold some files besides this person's, and the files.
+type Source = (Option<[u8; 32]>, Vec<(String, BlobRef)>);
+
+/// Images up to this size are kept as they come under on-demand retention,
+/// so that a conversation can show them.
+const IMAGE_KEEP: u64 = 16 << 20;
+
+fn is_image(path: &str) -> bool {
+    crate::contacts::media_type(path).starts_with("image/")
+}
+
+/// Fetches what `wanted` names that is not complete here, from this person's
+/// online devices and, with `from`, a contact's.
+async fn fetch_set(
+    d: &Arc<Daemon>,
+    complete: &mut HashSet<[u8; 32]>,
+    wanted: Vec<(String, BlobRef)>,
+    from: Option<[u8; 32]>,
+) -> anyhow::Result<()> {
     // Groups of small files, and larger files, listed in rank order; each
     // file with its group's rank.
     let key = d.keys.key();
     let mut groups = ranked_runs(
         &key,
-        all.into_iter()
+        wanted
+            .into_iter()
             .filter(|(_, b)| !complete.contains(&b.id))
             .collect(),
         |(_, b)| b.id,
@@ -299,15 +392,7 @@ async fn pass(d: &Arc<Daemon>, complete: &mut HashSet<[u8; 32]>) -> anyhow::Resu
         .into_iter()
         .flat_map(|(rank, files)| files.into_iter().map(move |f| (rank, f)))
         .unzip();
-    {
-        let mut pr = lock(&d.progress);
-        pr.bytes_wanted = bytes_wanted;
-        pr.files_pending = wanted.len() as u64;
-        // Until a file is listed, all of it counts as missing.
-        pr.bytes_pending = wanted.iter().map(|(_, b)| b.size).sum();
-    }
     if wanted.is_empty() {
-        lock(&d.progress).last_error = None;
         return Ok(());
     }
 
@@ -316,7 +401,10 @@ async fn pass(d: &Arc<Daemon>, complete: &mut HashSet<[u8; 32]>) -> anyhow::Resu
     let refs: Vec<(BlobRef, Rank)> = wanted.iter().map(|(_, b)| *b).zip(ranks).collect();
     let d2 = d.clone();
     let lister = tokio::task::spawn_blocking(move || {
-        let fetcher = Fetcher::new(&d2, Priority::Background);
+        let fetcher = match from {
+            Some(who) => Fetcher::from_contact(&d2, Priority::Background, who),
+            None => Fetcher::new(&d2, Priority::Background),
+        };
         for (i, (b, rank)) in refs.into_iter().enumerate() {
             if *d2.stopping.borrow() {
                 break;
@@ -366,6 +454,9 @@ async fn pass(d: &Arc<Daemon>, complete: &mut HashSet<[u8; 32]>) -> anyhow::Resu
     // Which files wait for an object, and its plaintext length.
     let mut waiting: HashMap<[u8; 32], (Vec<usize>, u64)> = HashMap::new();
     let mut fetch = BlobFetch::new(d.clone(), Priority::Background);
+    if let Some(who) = from {
+        fetch = fetch.from_contact(who);
+    }
     let mut puts: tokio::task::JoinSet<std::io::Result<Vec<[u8; 32]>>> =
         tokio::task::JoinSet::new();
     let mut to_sync: Vec<usize> = Vec::new();
@@ -514,7 +605,6 @@ async fn pass(d: &Arc<Daemon>, complete: &mut HashSet<[u8; 32]>) -> anyhow::Resu
             "{failures} files could not be fetched yet: no online device has all of them"
         );
     }
-    lock(&d.progress).last_error = None;
     Ok(())
 }
 

@@ -608,6 +608,20 @@ fn log_sizes(d: &Dev) -> Vec<u64> {
     sizes
 }
 
+/// The sizes once nothing has been written for a while.
+fn quiet_log_sizes(d: &Dev) -> Vec<u64> {
+    let mut was = log_sizes(d);
+    for _ in 0..20 {
+        std::thread::sleep(Duration::from_millis(1500));
+        let now = log_sizes(d);
+        if now == was {
+            return now;
+        }
+        was = now;
+    }
+    was
+}
+
 /// Opens a session with an invitation, saying it is `claim` with a key made
 /// up on the spot.
 async fn open_claiming(ana: &Dev, secret: &[u8], claim: [u8; 32]) -> Option<(Endpoint, Session)> {
@@ -738,7 +752,8 @@ fn a_false_invitation_gets_nothing_from_who_accepts_it() {
     let all = spaces(&ana);
     let bo_id = other_person(&ana);
     let someone = [8; 32];
-    let before = log_sizes(&ana);
+    // Meeting goes on writing a little after (her reach, for one).
+    let before = quiet_log_sizes(&ana);
 
     let rt = tokio::runtime::Runtime::new().unwrap();
     let _guard = rt.enter();

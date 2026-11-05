@@ -37,6 +37,10 @@ pub const INTRODUCTIONS: u64 = 6;
 pub const TRUSTED: u64 = 7;
 /// A contact's field: they are refused.
 pub const REFUSED: u64 = 8;
+/// A contact's field: where the relationship is listed.
+pub const CATEGORY: u64 = 9;
+/// Where a relationship is listed when nothing else is said.
+pub const PEOPLE: &str = "People";
 
 /// How a person starts out regarding someone
 /// (`contact.md#who-a-person-knows`).
@@ -307,6 +311,8 @@ pub struct ContactRecord {
     pub regard: Regard,
     /// This person wants nothing to do with them.
     pub refused: bool,
+    /// Where the relationship is listed, such as `People`.
+    pub category: String,
 }
 
 impl ContactRecord {
@@ -335,6 +341,12 @@ pub fn contacts(state: &State) -> Vec<ContactRecord> {
                     introductions: flag(INTRODUCTIONS).unwrap_or(true),
                 },
                 refused: flag(REFUSED).unwrap_or(false),
+                category: last(n, CATEGORY)
+                    .and_then(Value::as_text)
+                    .map(str::trim)
+                    .filter(|c| !c.is_empty())
+                    .unwrap_or(PEOPLE)
+                    .to_owned(),
             })
         })
         .collect()

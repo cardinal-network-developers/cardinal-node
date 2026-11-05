@@ -39,7 +39,9 @@ use cardinal_space::{NodeId, Space, ROOT};
 use ignore::gitignore::{Gitignore, GitignoreBuilder};
 use ignore::Match;
 
-use super::tree::{Dirty, Inode, Kind, Staged, Tree, ROOT_INO};
+#[cfg(test)]
+use super::tree::ROOT_INO;
+use super::tree::{Dirty, Inode, Kind, Staged, Tree};
 use crate::fetch::blob_ref;
 
 /// The name of the files that list paths to keep local.
@@ -197,7 +199,7 @@ impl Tree {
                     }
                 }
             }
-            if d == ROOT_INO {
+            if d == self.root {
                 break;
             }
             let Some(i) = self.inodes.get(&d) else { break };
@@ -504,10 +506,13 @@ impl Tree {
     /// beneath the nearest folder still here (local folders for any
     /// deleted between).
     fn place_orphan(&mut self, node: &NodeId, space: Option<&Space>) -> Option<u64> {
-        let st = space?.state();
-        if st.node(node).is_some_and(|n| {
-            n.kind != cardinal_space::NodeKind::Uint(cardinal_space::files::FOLDER)
-        }) {
+        let space = space?;
+        let folder = cardinal_space::files::Kinds::of(space.profile()).folder;
+        let st = space.state();
+        if st
+            .node(node)
+            .is_some_and(|n| n.kind != cardinal_space::NodeKind::Uint(folder))
+        {
             tracing::warn!(
                 "local items under {} are not under a folder; not shown",
                 hex::encode(node)
@@ -521,7 +526,7 @@ impl Tree {
                 break ino;
             }
             if cur == ROOT {
-                break ROOT_INO;
+                break self.root;
             }
             let n = st.node(&cur)?;
             chain.push(n.name.clone());

@@ -27,9 +27,14 @@ impl Mounted {
     /// Commits pending changes and unmounts.
     pub fn unmount(self) {}
 
-    /// The tree.
-    pub fn tree(&self) -> &Arc<Mutex<Tree>> {
-        &self.tree
+    /// The tree of the person's own files.
+    pub fn tree(&self) -> Arc<Mutex<Tree>> {
+        self.tree.clone()
+    }
+
+    /// Whether anything is waiting to be committed.
+    pub fn has_pending(&self) -> bool {
+        false
     }
 }
 

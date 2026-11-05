@@ -163,6 +163,25 @@ pub fn create_with(
     )
 }
 
+/// The files a message carries, put in the shared folder as well
+/// (`profiles.md#shared-folder`): one `create` each, under the root, for the
+/// same entry as the message.
+pub fn shared_files(attachments: &[Attachment], mtime_ms: Option<u64>) -> Vec<SpaceOp> {
+    attachments
+        .iter()
+        .filter_map(|a| {
+            let blob = crate::files::BlobRef::from_record(&a.blob)?;
+            Some(crate::files::Kinds::SHARED.create_file(
+                ROOT,
+                &a.name,
+                &crate::files::Content::Blob(blob),
+                0o644,
+                mtime_ms,
+            ))
+        })
+        .collect()
+}
+
 /// A file attached to a message.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Attachment {

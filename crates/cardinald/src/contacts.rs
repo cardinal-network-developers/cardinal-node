@@ -549,6 +549,25 @@ pub fn rename(d: &Arc<Daemon>, who: &str, name: &str) -> anyhow::Result<Json> {
     Ok(json!({"name": name}))
 }
 
+/// Lists a contact under another category, such as `Family`, which is the
+/// folder their shared folder appears in.
+pub fn set_category(d: &Arc<Daemon>, who: &str, category: &str) -> anyhow::Result<Json> {
+    let contact = find(d, who)?;
+    let category = category.trim();
+    anyhow::ensure!(!category.is_empty(), "a category cannot be empty");
+    anyhow::ensure!(
+        !category.contains('/') && category != "." && category != "..",
+        "a category is a folder's name, so it cannot be {category:?}"
+    );
+    let account = d
+        .core()
+        .account_id()
+        .ok_or_else(|| anyhow::anyhow!("the account space is not here yet"))?;
+    let op = account::set_field(contact.node, account::CATEGORY, category);
+    d.write_and_push(&account, vec![op])?;
+    Ok(json!({"category": category}))
+}
+
 async fn send(st: &mut Stream, m: &ContactMessage) -> anyhow::Result<()> {
     st.send_message(&Value::Record(m.to_record())).await?;
     Ok(())
@@ -582,6 +601,7 @@ pub fn list(d: &Daemon, all: bool) -> Json {
                 "trusted": c.regard.trusted,
                 "introductions": c.regard.introductions,
                 "refused": c.refused,
+                "category": c.category,
                 "connected": connected.contains(&c.identity),
                 "relayed": relayed.contains(&c.identity),
             })
@@ -638,14 +658,20 @@ pub async fn say(
             .and_then(relationship::conversation)
     };
     let conversation = conversation.ok_or_else(|| anyhow::anyhow!("that space is not open yet"))?;
-    let op = relationship::create_with(conversation, text, to, &attachments);
-    d.write_and_push(&space, vec![op])?;
+    let mut ops = vec![relationship::create_with(
+        conversation,
+        text,
+        to,
+        &attachments,
+    )];
+    ops.extend(relationship::shared_files(&attachments, Some(now_ms())));
+    d.write_and_push(&space, ops)?;
     confirm(d, space, contact.identity);
     Ok(json!({"reachable": reachable(d, &contact, text) && attachments.is_empty()}))
 }
 
 /// What kind of file a name says it is, by its ending.
-fn media_type(name: &str) -> &'static str {
+pub(crate) fn media_type(name: &str) -> &'static str {
     let ending = name.rsplit_once('.').map(|(_, e)| e.to_ascii_lowercase());
     match ending.as_deref() {
         Some("jpg" | "jpeg") => "image/jpeg",
@@ -735,19 +761,23 @@ pub async fn shared_blobs(d: &Arc<Daemon>, who: &[u8; 32]) -> Arc<HashSet<[u8; 3
     }
     let (d, who) = (d.clone(), *who);
     let worked_out = tokio::task::spawn_blocking(move || {
-        let attached: Vec<relationship::Attachment> = {
+        let blobs: Vec<BlobRef> = {
             let core = d.core();
             let me = core.identity.as_ref().map(|i| i.id());
             let open = core.spaces.get(&space).and_then(|h| h.space.as_ref());
             let all = open.map(relationship::messages).unwrap_or_default();
             let mine = all.into_iter().filter(|m| Some(m.author) == me);
-            mine.flat_map(|m| m.attachments).collect()
+            let attached = mine
+                .flat_map(|m| m.attachments)
+                .filter_map(|a| BlobRef::from_record(&a.blob).ok());
+            // and what this person put in the shared folder
+            let put = open
+                .map(|sp| shared_folder_content(sp, me))
+                .unwrap_or_default();
+            attached.chain(put).collect()
         };
         let (mut files, mut ids) = (HashSet::new(), HashSet::new());
-        for a in &attached {
-            let Ok(blob) = BlobRef::from_record(&a.blob) else {
-                continue;
-            };
+        for blob in blobs {
             // The same file attached again is the same objects.
             if !files.insert(blob.id) {
                 continue;
@@ -766,8 +796,32 @@ pub async fn shared_blobs(d: &Arc<Daemon>, who: &[u8; 32]) -> Arc<HashSet<[u8; 3
     worked_out.await.unwrap_or_default()
 }
 
+/// The content versions of the shared folder's files that `me` wrote.
+fn shared_folder_content(space: &cardinal_space::Space, me: Option<[u8; 32]>) -> Vec<BlobRef> {
+    use cardinal_space::files::{Content, FileKind, Files};
+    let files = Files::new(space);
+    let mut out = Vec::new();
+    let mut stack = vec![cardinal_space::ROOT];
+    while let Some(dir) = stack.pop() {
+        for e in files.list(&dir) {
+            match e.kind {
+                FileKind::Folder => stack.push(e.node),
+                FileKind::File if e.conflict_version.is_none() => {
+                    for v in files.content(&e.node) {
+                        if let (Some(Content::Blob(b)), true) = (v.content, Some(v.author) == me) {
+                            out.push(crate::fetch::blob_ref(&b));
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    out
+}
+
 /// Writes a whole blob to `out`, and says how much.
-fn write_out<S: cardinal_blob::ObjectStore, F: cardinal_blob::Fetch>(
+pub(crate) fn write_out<S: cardinal_blob::ObjectStore, F: cardinal_blob::Fetch>(
     reader: &mut BlobReader<'_, S, F>,
     out: &mut std::fs::File,
 ) -> anyhow::Result<u64> {
@@ -808,50 +862,58 @@ pub async fn save_attachment(
     let blob = BlobRef::from_record(&a.blob)
         .map_err(|_| anyhow::anyhow!("that attachment cannot be read"))?;
     let to = std::path::PathBuf::from(to);
-    anyhow::ensure!(!to.exists(), "{} is there already", to.display());
     let (d, them) = (d.clone(), contact.identity);
     let written = to.clone();
     let size = tokio::task::spawn_blocking(move || -> anyhow::Result<u64> {
         let fetch = crate::fetch::Fetcher::from_contact(&d, Priority::Interactive, them);
         let mut reader = BlobReader::new(&*d.store, &fetch, blob);
-        // Beside it, new, and gone again whatever happens: nothing that was
-        // there is touched, and nothing is followed.
-        let mut part = written.clone().into_os_string();
-        part.push(".part");
-        let part = std::path::PathBuf::from(part);
-        let mut out = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&part)?;
-        let wrote = write_out(&mut reader, &mut out).and_then(|size| {
-            out.sync_all()?;
-            // A link, unlike a rename, will not replace a file that came to
-            // be there meanwhile.
-            match std::fs::hard_link(&part, &written) {
-                Ok(()) => {}
-                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                    anyhow::bail!("{} is there already", written.display())
-                }
-                // No hard links here (Android's app storage): a rename, if
-                // nothing is in the way.
-                Err(e)
-                    if matches!(
-                        e.kind(),
-                        std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::Unsupported
-                    ) =>
-                {
-                    anyhow::ensure!(!written.exists(), "{} is there already", written.display());
-                    std::fs::rename(&part, &written)?;
-                }
-                Err(e) => anyhow::bail!("cannot save it at {}: {e}", written.display()),
-            }
-            Ok(size)
-        });
-        let _ = std::fs::remove_file(&part);
-        wrote
+        write_new(&written, |out| write_out(&mut reader, out))
     })
     .await??;
     Ok(json!({"path": to, "size": size}))
+}
+
+/// Writes a new file at `to` with what `fill` writes. It is written beside,
+/// as `to.part`, and gone again whatever happens: nothing that was there is
+/// touched, and nothing is followed.
+pub(crate) fn write_new(
+    to: &std::path::Path,
+    fill: impl FnOnce(&mut std::fs::File) -> anyhow::Result<u64>,
+) -> anyhow::Result<u64> {
+    anyhow::ensure!(!to.exists(), "{} is there already", to.display());
+    let mut part = to.to_path_buf().into_os_string();
+    part.push(".part");
+    let part = std::path::PathBuf::from(part);
+    let mut out = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&part)?;
+    let wrote = fill(&mut out).and_then(|size| {
+        out.sync_all()?;
+        // A link, unlike a rename, will not replace a file that came to
+        // be there meanwhile.
+        match std::fs::hard_link(&part, to) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                anyhow::bail!("{} is there already", to.display())
+            }
+            // No hard links here (Android's app storage): a rename, if
+            // nothing is in the way.
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::Unsupported
+                ) =>
+            {
+                anyhow::ensure!(!to.exists(), "{} is there already", to.display());
+                std::fs::rename(&part, to)?;
+            }
+            Err(e) => anyhow::bail!("cannot save it at {}: {e}", to.display()),
+        }
+        Ok(size)
+    });
+    let _ = std::fs::remove_file(&part);
+    wrote
 }
 
 /// A message in the conversation with a contact, by the id `messages` gives.

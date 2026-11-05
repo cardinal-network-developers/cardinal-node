@@ -8,6 +8,8 @@ pub mod tree;
 #[cfg(feature = "mount")]
 mod fuse;
 #[cfg(feature = "mount")]
+pub mod onefs;
+#[cfg(feature = "mount")]
 pub mod ops;
 #[cfg(feature = "mount")]
 pub use fuse::*;

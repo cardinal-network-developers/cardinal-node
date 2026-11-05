@@ -256,9 +256,13 @@ async fn handle(d: &Arc<Daemon>, req: &Value) -> anyhow::Result<Value> {
             let all = req.get("all").and_then(|v| v.as_bool()) == Some(true);
             Ok(crate::contacts::list(d, all))
         }
-        "contact" => match req.get("name").and_then(|v| v.as_str()) {
-            Some(name) => crate::contacts::rename(d, arg(req, "who")?, name),
-            None => crate::contacts::set(d, arg(req, "who")?, arg(req, "setting")?),
+        "contact" => match (
+            req.get("name").and_then(|v| v.as_str()),
+            req.get("category").and_then(|v| v.as_str()),
+        ) {
+            (Some(name), _) => crate::contacts::rename(d, arg(req, "who")?, name),
+            (None, Some(category)) => crate::contacts::set_category(d, arg(req, "who")?, category),
+            (None, None) => crate::contacts::set(d, arg(req, "who")?, arg(req, "setting")?),
         },
         "say" => {
             let reply_to = req.get("reply_to").and_then(|v| v.as_str());
@@ -289,7 +293,26 @@ async fn handle(d: &Arc<Daemon>, req: &Value) -> anyhow::Result<Value> {
         "call-end" => crate::calls::end(d).await,
         "conversations" => Ok(crate::contacts::conversations(d)),
         "mark-read" => crate::contacts::mark_read(d, arg(req, "who")?),
-        "files" => files_at(d, req.get("path").and_then(Value::as_str).unwrap_or("")),
+        "files" => crate::onefolder::list(d, req.get("path").and_then(Value::as_str).unwrap_or("")),
+        "mkdir" => crate::onefolder::mkdir(d, arg(req, "path")?),
+        "move" => crate::onefolder::move_to(d, arg(req, "from")?, arg(req, "to")?).await,
+        "remove" => crate::onefolder::remove(d, arg(req, "path")?),
+        "copy" => crate::onefolder::copy(d, arg(req, "from")?, arg(req, "to")?).await,
+        "put" => crate::onefolder::put(d, arg(req, "from")?, arg(req, "to")?).await,
+        "save" => crate::onefolder::save(d, arg(req, "path")?, arg(req, "to")?).await,
+        "share" => {
+            let paths: Vec<String> = req
+                .get("paths")
+                .and_then(|v| v.as_array())
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|p| p.as_str().map(str::to_owned))
+                        .collect()
+                })
+                .unwrap_or_default();
+            let text = req.get("text").and_then(|v| v.as_str());
+            crate::onefolder::share(d, arg(req, "who")?, &paths, text).await
+        }
         "messages" => crate::contacts::messages(d, arg(req, "who")?),
         "recovery-check" => {
             crate::recovery::root_from_words(d, arg(req, "words")?)?;
@@ -699,13 +722,7 @@ fn status(d: &Arc<Daemon>) -> Value {
     let (mounted, pending) = {
         let m = d.mount.lock().unwrap_or_else(|e| e.into_inner());
         match m.as_ref() {
-            Some(m) => (
-                Some(m.path.display().to_string()),
-                m.tree()
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .has_pending(),
-            ),
+            Some(m) => (Some(m.path.display().to_string()), m.has_pending()),
             None => (None, false),
         }
     };
@@ -822,39 +839,6 @@ fn versions(sp: &cardinal_space::Space, node: &NodeId) -> Vec<VersionRow> {
 }
 
 /// What is in a folder of this person's files, folders first.
-fn files_at(d: &Daemon, path: &str) -> anyhow::Result<Value> {
-    let files_id = require_files(d)?;
-    let core = d.core();
-    let sp = core.spaces[&files_id]
-        .space
-        .as_ref()
-        .ok_or_else(|| anyhow::anyhow!("files space not open"))?;
-    let view = Files::new(sp);
-    let listed = view
-        .list_path(path)
-        .ok_or_else(|| anyhow::anyhow!("{path} is not a folder in your files"))?;
-    let mut found: Vec<(bool, Value)> = listed
-        .iter()
-        .map(|e| {
-            let is_folder = e.kind == files::FileKind::Folder;
-            let current = view.content(&e.node);
-            let shown = current.last();
-            let size = shown.and_then(|v| v.content.as_ref()).map(|c| c.size());
-            let entry = json!({
-                "name": e.name,
-                "folder": is_folder,
-                "size": size,
-                "time": shown.and_then(|v| v.time),
-                "versions": current.len(),
-            });
-            (!is_folder, entry)
-        })
-        .collect();
-    found.sort_by_key(|(is_file, e)| (*is_file, e["name"].as_str().map(str::to_lowercase)));
-    let files: Vec<Value> = found.into_iter().map(|(_, e)| e).collect();
-    Ok(json!({"path": path, "files": files}))
-}
-
 fn history(d: &Daemon, path: &str) -> anyhow::Result<Value> {
     let files_id = require_files(d)?;
     let core = d.core();
@@ -1024,9 +1008,10 @@ fn debug_tree(d: &Daemon) -> anyhow::Result<Value> {
     let Some(m) = m.as_ref() else {
         return Ok(json!({"heads": heads, "epoch": epoch, "mounted": false}));
     };
-    let t = m.tree().lock().unwrap_or_else(|e| e.into_inner());
+    let tree = m.tree();
+    let t = tree.lock().unwrap_or_else(|e| e.into_inner());
     let mut items = Vec::new();
-    let mut stack = vec![crate::fs::tree::ROOT_INO];
+    let mut stack = vec![t.root];
     while let Some(ino) = stack.pop() {
         let Some(i) = t.inodes.get(&ino) else {
             continue;

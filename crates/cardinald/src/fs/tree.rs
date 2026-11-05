@@ -393,6 +393,10 @@ pub fn time_to_ms(t: SystemTime) -> u64 {
 
 /// The mount's tree.
 pub struct Tree {
+    /// The root's inode: [`ROOT_INO`] for the person's own files, and
+    /// above a base of its own for each shared folder beside them, so that
+    /// one mount's inodes never collide (`fs/onefs.rs`).
+    pub root: u64,
     /// Inodes.
     pub inodes: HashMap<u64, Inode>,
     /// Committed node -> inode.
@@ -447,18 +451,25 @@ impl Tree {
     /// An empty tree, staging changes in `staging` and keeping local items
     /// in `local_dir`.
     pub fn new(staging: PathBuf, local_dir: PathBuf) -> Tree {
+        Tree::with_base(staging, local_dir, 0)
+    }
+
+    /// The same, numbering its inodes from `base`.
+    pub fn with_base(staging: PathBuf, local_dir: PathBuf, base: u64) -> Tree {
+        let root_ino = base + ROOT_INO;
         let mut inodes = HashMap::new();
-        let mut root = Inode::new(ROOT_INO, Kind::Dir);
+        let mut root = Inode::new(root_ino, Kind::Dir);
         root.node = Some(ROOT);
-        root.parent = ROOT_INO;
-        inodes.insert(ROOT_INO, root);
+        root.parent = root_ino;
+        inodes.insert(root_ino, root);
         let mut by_node = HashMap::new();
-        by_node.insert(ROOT, ROOT_INO);
+        by_node.insert(ROOT, root_ino);
         Tree {
+            root: root_ino,
             inodes,
             by_node,
             by_conflict: HashMap::new(),
-            next_ino: 2,
+            next_ino: root_ino + 1,
             next_stage: 1,
             staging,
             local_dir,
@@ -569,7 +580,7 @@ impl Tree {
 
     /// Frees a detached inode nobody refers to.
     pub fn gc(&mut self, ino: u64) {
-        if ino == ROOT_INO {
+        if ino == self.root {
             return;
         }
         let free = self
@@ -593,7 +604,7 @@ impl Tree {
             if a == b {
                 return true;
             }
-            if b == ROOT_INO || b == 0 {
+            if b == self.root || b == 0 {
                 return false;
             }
             b = match self.inodes.get(&b) {
@@ -607,7 +618,7 @@ impl Tree {
     /// A path of an inode, for messages.
     pub fn path(&self, mut ino: u64) -> String {
         let mut parts = Vec::new();
-        while ino != ROOT_INO && ino != 0 {
+        while ino != self.root && ino != 0 {
             let Some(i) = self.inodes.get(&ino) else {
                 break;
             };
@@ -654,7 +665,7 @@ impl Tree {
     pub fn apply(&mut self, snap: &Snapshot) -> Vec<Inval> {
         let mut inval = Vec::new();
         let mut seen: HashSet<u64> = HashSet::new();
-        seen.insert(ROOT_INO);
+        seen.insert(self.root);
         // desired parent inode and name for each committed inode
         let mut placed: Vec<(u64, u64, String)> = Vec::new();
         // deleted here and not committed yet: stays gone
@@ -763,7 +774,7 @@ impl Tree {
                 };
                 let mut p = if changed { i.ino } else { i.parent };
                 for _ in 0..10_000 {
-                    if !set.insert(p) || p == ROOT_INO {
+                    if !set.insert(p) || p == self.root {
                         break;
                     }
                     p = match self.inodes.get(&p) {
@@ -857,7 +868,7 @@ impl Tree {
         let mut items: Vec<(u64, u64, String, bool, Option<NodeId>)> = self
             .inodes
             .values()
-            .filter(|i| i.ino != ROOT_INO && i.parent != 0)
+            .filter(|i| i.ino != self.root && i.parent != 0)
             .map(|i| {
                 (
                     i.ino,

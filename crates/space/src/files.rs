@@ -1,12 +1,14 @@
 //! The files profile (`profiles.md#files`): folders, files, and links, and
-//! the view a mount shows.
+//! the view a mount shows. A relationship's shared folder has the same
+//! nodes under other kinds (`profiles.md#shared-folder`), so all of this
+//! works on either, with the [`Kinds`] of the space's profile.
 
 use std::collections::HashMap;
 
 use cardinal_encoding::{Record, Value};
 use cardinal_identity::{EntryId, KeyId};
 
-use crate::entry::{derived_id, IdentityId, NodeId, NodeKind, SpaceOp, SpaceOpBody};
+use crate::entry::{derived_id, IdentityId, NodeId, NodeKind, Profile, SpaceOp, SpaceOpBody};
 use crate::space::Space;
 use crate::state::{Node, ROOT};
 
@@ -16,6 +18,85 @@ pub const FOLDER: u64 = 1;
 pub const FILE: u64 = 2;
 /// Link kind.
 pub const LINK: u64 = 3;
+
+/// The node kinds a profile gives folders, files and links.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Kinds {
+    /// A folder's kind.
+    pub folder: u64,
+    /// A file's kind.
+    pub file: u64,
+    /// A link's kind.
+    pub link: u64,
+}
+
+impl Kinds {
+    /// Those of a files space.
+    pub const FILES: Kinds = Kinds {
+        folder: FOLDER,
+        file: FILE,
+        link: LINK,
+    };
+    /// Those of a relationship's shared folder.
+    pub const SHARED: Kinds = Kinds {
+        folder: 5,
+        file: 6,
+        link: 7,
+    };
+
+    /// Those of a space with this profile.
+    pub fn of(profile: Profile) -> Kinds {
+        if profile == Profile::FILES {
+            Kinds::FILES
+        } else {
+            Kinds::SHARED
+        }
+    }
+
+    /// What a node of kind `k` is.
+    pub fn file_kind(&self, k: NodeKind) -> FileKind {
+        match k {
+            NodeKind::Uint(n) if n == self.folder => FileKind::Folder,
+            NodeKind::Uint(n) if n == self.file => FileKind::File,
+            NodeKind::Uint(n) if n == self.link => FileKind::Link,
+            _ => FileKind::Other,
+        }
+    }
+
+    /// `create` of a folder.
+    pub fn create_folder(&self, parent: NodeId, name: &str) -> SpaceOp {
+        SpaceOp::create(NodeKind::Uint(self.folder), parent, name, Record::new())
+    }
+
+    /// `create` of a file.
+    pub fn create_file(
+        &self,
+        parent: NodeId,
+        name: &str,
+        content: &Content,
+        mode: u32,
+        mtime_ms: Option<u64>,
+    ) -> SpaceOp {
+        let fields = Record::new()
+            .with(FILE_CONTENT, content.to_value())
+            .with(FILE_MODE, mode)
+            .with_opt(
+                FILE_MTIME,
+                mtime_ms.and_then(|t| cardinal_encoding::Int::from_u64(t).map(Value::Int)),
+            );
+        SpaceOp::create(NodeKind::Uint(self.file), parent, name, fields)
+    }
+
+    /// `create` of a symbolic link.
+    pub fn create_link(&self, parent: NodeId, name: &str, target: &str) -> SpaceOp {
+        SpaceOp::create(
+            NodeKind::Uint(self.link),
+            parent,
+            name,
+            Record::new().with(LINK_TARGET, target),
+        )
+    }
+}
 
 /// File field 1: content.
 pub const FILE_CONTENT: u64 = 1;
@@ -102,12 +183,12 @@ impl Content {
     }
 }
 
-/// `create` of a folder.
+/// `create` of a folder in a files space.
 pub fn create_folder(parent: NodeId, name: &str) -> SpaceOp {
-    SpaceOp::create(NodeKind::Uint(FOLDER), parent, name, Record::new())
+    Kinds::FILES.create_folder(parent, name)
 }
 
-/// `create` of a file.
+/// `create` of a file in a files space.
 pub fn create_file(
     parent: NodeId,
     name: &str,
@@ -115,24 +196,12 @@ pub fn create_file(
     mode: u32,
     mtime_ms: Option<u64>,
 ) -> SpaceOp {
-    let fields = Record::new()
-        .with(FILE_CONTENT, content.to_value())
-        .with(FILE_MODE, mode)
-        .with_opt(
-            FILE_MTIME,
-            mtime_ms.and_then(|t| cardinal_encoding::Int::from_u64(t).map(Value::Int)),
-        );
-    SpaceOp::create(NodeKind::Uint(FILE), parent, name, fields)
+    Kinds::FILES.create_file(parent, name, content, mode, mtime_ms)
 }
 
-/// `create` of a symbolic link.
+/// `create` of a symbolic link in a files space.
 pub fn create_link(parent: NodeId, name: &str, target: &str) -> SpaceOp {
-    SpaceOp::create(
-        NodeKind::Uint(LINK),
-        parent,
-        name,
-        Record::new().with(LINK_TARGET, target),
-    )
+    Kinds::FILES.create_link(parent, name, target)
 }
 
 /// `set` of a file's content (settling any conflict it descends from).
@@ -170,17 +239,6 @@ pub enum FileKind {
     Link,
     /// Something this profile does not define.
     Other,
-}
-
-impl FileKind {
-    fn of(k: NodeKind) -> FileKind {
-        match k {
-            NodeKind::Uint(FOLDER) => FileKind::Folder,
-            NodeKind::Uint(FILE) => FileKind::File,
-            NodeKind::Uint(LINK) => FileKind::Link,
-            _ => FileKind::Other,
-        }
-    }
 }
 
 /// One version of a field value, with who wrote it.
@@ -272,6 +330,7 @@ fn split_ext(name: &str) -> (&str, &str) {
 /// The files view of a space.
 pub struct Files<'a> {
     space: &'a Space,
+    kinds: Kinds,
     device_name: Box<dyn Fn(&KeyId) -> String + 'a>,
 }
 
@@ -280,6 +339,7 @@ impl<'a> Files<'a> {
     pub fn new(space: &'a Space) -> Files<'a> {
         Files {
             space,
+            kinds: Kinds::of(space.profile()),
             device_name: Box::new(crate::account::short_key),
         }
     }
@@ -289,6 +349,7 @@ impl<'a> Files<'a> {
     pub fn with_device_names(space: &'a Space, name: impl Fn(&KeyId) -> String + 'a) -> Files<'a> {
         Files {
             space,
+            kinds: Kinds::of(space.profile()),
             device_name: Box::new(name),
         }
     }
@@ -320,6 +381,11 @@ impl<'a> Files<'a> {
         vs
     }
 
+    /// The kinds this space gives folders, files and links.
+    pub fn kinds(&self) -> Kinds {
+        self.kinds
+    }
+
     /// The visible children of a folder, with display names: duplicates as
     /// `name (2)`, and each other version of a file in conflict as
     /// `name (conflict, <device>).ext`. Display names are unique and
@@ -328,10 +394,14 @@ impl<'a> Files<'a> {
     pub fn list(&self, dir: &NodeId) -> Vec<DirEntry> {
         let st = self.space.state();
         let dag = self.space.dag();
+        // A shared folder's root holds the conversation too, which is no
+        // file of it.
+        let shared = self.kinds != Kinds::FILES;
         let mut kids: Vec<&Node> = st
             .children(dir)
             .into_iter()
             .filter(|n| !n.deleted)
+            .filter(|n| !shared || self.kinds.file_kind(n.kind) != FileKind::Other)
             .collect();
         kids.sort_by_key(|n| (n.name.clone(), dag.position(&n.created_in), n.id));
         // The first node of each name keeps it; the others take the next
@@ -368,7 +438,7 @@ impl<'a> Files<'a> {
         let mut out = Vec::new();
         for (n, name) in kids.into_iter().zip(names) {
             let name = name.expect("named");
-            let kind = FileKind::of(n.kind);
+            let kind = self.kinds.file_kind(n.kind);
             if kind == FileKind::File {
                 let versions = self.content(&n.id);
                 for v in versions.iter().rev().skip(1) {
@@ -428,7 +498,7 @@ impl<'a> Files<'a> {
         let versions = self.content(node);
         Some(Stat {
             node: n.id,
-            kind: FileKind::of(n.kind),
+            kind: self.kinds.file_kind(n.kind),
             name: n.name.clone(),
             parent: n.parent,
             size: versions
@@ -439,7 +509,7 @@ impl<'a> Files<'a> {
             mtime: n.field(FILE_MTIME).and_then(|v| v.as_uint()),
             versions: versions.len(),
             delete_conflict: n.delete_conflict,
-            target: if n.kind == NodeKind::Uint(LINK) {
+            target: if n.kind == NodeKind::Uint(self.kinds.link) {
                 n.field(LINK_TARGET)
                     .and_then(|v| v.as_text())
                     .map(str::to_owned)

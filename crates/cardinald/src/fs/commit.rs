@@ -21,7 +21,9 @@ use cardinal_space::files::{self, Content, Files};
 use cardinal_space::state::named_nodes;
 use cardinal_space::{NodeId, Space, SpaceId, SpaceOp, ROOT};
 
-use super::tree::{time_to_ms, Kind, Snapshot, Staged, Tree, ROOT_INO};
+#[cfg(test)]
+use super::tree::ROOT_INO;
+use super::tree::{time_to_ms, Kind, Snapshot, Staged, Tree};
 use crate::core::{split_ops, Core};
 use crate::daemon::Daemon;
 
@@ -347,6 +349,8 @@ pub fn write_pending(
             .get(space)
             .and_then(|h| h.space.as_ref())
             .ok_or_else(|| anyhow::anyhow!("files space not open"))?;
+        // a shared folder's nodes have kinds of their own
+        let kinds = files::Kinds::of(sp.profile());
         // (op, what it does to which inode)
         let mut ops: Vec<SpaceOp> = Vec::new();
         let mut effects: Vec<Effect> = Vec::new();
@@ -355,7 +359,7 @@ pub fn write_pending(
         let mut inos: Vec<u64> = t.inodes.keys().copied().collect();
         inos.sort_unstable();
         for ino in inos {
-            if ino == ROOT_INO {
+            if ino == t.root {
                 continue;
             }
             let i = &t.inodes[&ino];
@@ -377,15 +381,15 @@ pub fn write_pending(
                     }
                     let name = i.stored_name.as_deref().unwrap_or(&i.name);
                     let op = match i.kind {
-                        Kind::Dir => files::create_folder(pnode, name),
-                        Kind::File => files::create_file(
+                        Kind::Dir => kinds.create_folder(pnode, name),
+                        Kind::File => kinds.create_file(
                             pnode,
                             name,
                             i.content.as_ref().unwrap_or(&Content::Inline(Vec::new())),
                             i.perm as u32,
                             Some(time_to_ms(i.mtime)),
                         ),
-                        Kind::Symlink => files::create_link(pnode, name, &i.target),
+                        Kind::Symlink => kinds.create_link(pnode, name, &i.target),
                         Kind::Conflict(_) => unreachable!(),
                     };
                     effects.push(Effect::Created(ino));

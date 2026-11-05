@@ -23,6 +23,7 @@ pub mod keys;
 pub mod mailbox;
 pub mod net;
 pub mod news;
+pub mod onefolder;
 pub mod pair;
 pub mod paths;
 pub mod recovery;

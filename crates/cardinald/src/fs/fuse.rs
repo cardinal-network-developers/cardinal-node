@@ -10,37 +10,61 @@ use std::sync::{Arc, Mutex};
 use cardinal_space::SpaceId;
 use fuser::MountOption;
 
+use super::commit;
+use super::onefs::{self, OneFs, Part, Parts};
 use super::tree::{Inval, Snapshot, Tree};
-use super::{commit, ops};
 use crate::daemon::Daemon;
 
-/// A mounted files space.
+/// The one folder, mounted (`fs/onefs.rs`).
 pub struct Mounted {
     session: Option<fuser::BackgroundSession>,
-    tree: Arc<Mutex<Tree>>,
+    parts: Arc<Mutex<Parts>>,
+    /// Stops applying changes from other devices.
     stop: Arc<AtomicBool>,
-    scheduler: Option<std::thread::JoinHandle<()>>,
     d: Arc<Daemon>,
-    space: SpaceId,
     /// Where.
     pub path: PathBuf,
 }
 
+fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 impl Mounted {
-    /// Commits what is pending now (for `cardinal flush` and shutdown).
+    /// Commits what is pending now in every space shown (for `cardinal
+    /// flush` and shutdown).
     pub fn flush(&self) -> anyhow::Result<usize> {
-        commit::commit(&self.d, &self.tree, &self.space)
+        let parts: Vec<(Arc<Mutex<Tree>>, SpaceId)> = lock(&self.parts)
+            .parts
+            .values()
+            .map(|p| (p.tree.clone(), p.space))
+            .collect();
+        let mut n = 0;
+        for (tree, space) in parts {
+            n += commit::commit(&self.d, &tree, &space)?;
+        }
+        Ok(n)
     }
 
     /// Commits pending changes and unmounts.
     pub fn unmount(mut self) {
         self.stop.store(true, Ordering::Relaxed);
-        if let Some(h) = self.scheduler.take() {
+        let schedulers: Vec<_> = {
+            let mut g = lock(&self.parts);
+            g.parts
+                .values_mut()
+                .filter_map(|p| {
+                    p.stop.store(true, Ordering::Relaxed);
+                    p.scheduler.take()
+                })
+                .collect()
+        };
+        for h in schedulers {
             let _ = h.join();
         }
         // let files still open settle
-        {
-            let mut t = self.tree.lock().unwrap_or_else(|e| e.into_inner());
+        for p in lock(&self.parts).parts.values() {
+            let mut t = lock(&p.tree);
             for i in t.inodes.values_mut() {
                 i.last_write = None;
             }
@@ -52,9 +76,17 @@ impl Mounted {
         tracing::info!("unmounted {}", self.path.display());
     }
 
-    /// The tree.
-    pub fn tree(&self) -> &Arc<Mutex<Tree>> {
-        &self.tree
+    /// The tree of the person's own files.
+    pub fn tree(&self) -> Arc<Mutex<Tree>> {
+        lock(&self.parts).parts[&0].tree.clone()
+    }
+
+    /// Whether any space shown has changes not yet committed.
+    pub fn has_pending(&self) -> bool {
+        lock(&self.parts)
+            .parts
+            .values()
+            .any(|p| lock(&p.tree).has_pending())
     }
 }
 
@@ -84,13 +116,6 @@ fn unmount_stale(path: &Path) {
                 .status();
         }
     }
-}
-
-fn snapshot(d: &Daemon, space: &SpaceId) -> Option<Snapshot> {
-    let core = d.core();
-    let h = core.spaces.get(space)?;
-    let sp = h.space.as_ref()?;
-    Some(Snapshot::take(sp, h.version, &core.device_names()))
 }
 
 /// Brings the tree up to date with the space and tells the kernel.
@@ -132,7 +157,8 @@ pub fn refresh(
     }
 }
 
-/// Mounts the files space at `path`.
+/// Mounts the one folder at `path`: the files space at its root, and each
+/// relationship's shared folder beside it (`onefolder.rs`).
 pub fn mount(d: Arc<Daemon>, space: SpaceId, path: &Path) -> anyhow::Result<Mounted> {
     available().map_err(|e| anyhow::anyhow!(e))?;
     unmount_stale(path);
@@ -144,19 +170,9 @@ pub fn mount(d: Arc<Daemon>, space: SpaceId, path: &Path) -> anyhow::Result<Moun
             path.display()
         );
     }
-    let tree = Arc::new(Mutex::new(Tree::new(d.paths.staging(), d.paths.local())));
-    if let Some(s) = snapshot(&d, &space) {
-        tree.lock().unwrap_or_else(|e| e.into_inner()).apply(&s);
-    }
-    // What `.cardinalignore` keeps on this device (`local.rs`).
-    {
-        let core = d.core();
-        let sp = core.spaces.get(&space).and_then(|h| h.space.as_ref());
-        let mut t = tree.lock().unwrap_or_else(|e| e.into_inner());
-        t.load_local(sp);
-        t.ignore_seen = Some(t.ignore_texts(&d.store));
-    }
-    let fs = ops::CardinalFs::new(d.clone(), tree.clone());
+    let parts = Arc::new(Mutex::new(Parts::new(Part::open(&d, 0, space, None))));
+    onefs::update(&d, &parts);
+    let fs = OneFs::new(d.clone(), parts.clone());
     let opts = [
         MountOption::FSName("cardinal".into()),
         MountOption::Subtype("cardinal".into()),
@@ -170,12 +186,10 @@ pub fn mount(d: Arc<Daemon>, space: SpaceId, path: &Path) -> anyhow::Result<Moun
     let notifier = session.notifier();
     let bg = session.spawn()?;
     let stop = Arc::new(AtomicBool::new(false));
-    let scheduler = commit::spawn_scheduler(d.clone(), tree.clone(), space, stop.clone());
-    // Apply changes from other devices as they arrive.
+    // Apply changes from other devices as they arrive, and show
+    // relationships as they come and change.
     {
-        let d2 = d.clone();
-        let tree2 = tree.clone();
-        let stop2 = stop.clone();
+        let (d2, parts2, stop2) = (d.clone(), parts.clone(), stop.clone());
         let mut changed = d.changed.subscribe();
         d.rt.spawn(async move {
             let notifier = Arc::new(notifier);
@@ -183,19 +197,32 @@ pub fn mount(d: Arc<Daemon>, space: SpaceId, path: &Path) -> anyhow::Result<Moun
                 if changed.changed().await.is_err() || stop2.load(Ordering::Relaxed) {
                     break;
                 }
-                let (d3, t3, n3) = (d2.clone(), tree2.clone(), notifier.clone());
-                let _ =
-                    tokio::task::spawn_blocking(move || refresh(&d3, &t3, &space, Some(&n3))).await;
+                let (d3, p3, n3) = (d2.clone(), parts2.clone(), notifier.clone());
+                let _ = tokio::task::spawn_blocking(move || {
+                    let invals = onefs::update(&d3, &p3);
+                    let each: Vec<(Arc<Mutex<Tree>>, SpaceId)> = lock(&p3)
+                        .parts
+                        .values()
+                        .map(|p| (p.tree.clone(), p.space))
+                        .collect();
+                    for (tree, space) in each {
+                        refresh(&d3, &tree, &space, Some(&n3));
+                    }
+                    for i in invals {
+                        if let Inval::Entry(p, name) = i {
+                            let _ = n3.inval_entry(p, std::ffi::OsStr::new(&name));
+                        }
+                    }
+                })
+                .await;
             }
         });
     }
     Ok(Mounted {
         session: Some(bg),
-        tree,
+        parts,
         stop,
-        scheduler: Some(scheduler),
         d,
-        space,
         path: path.to_path_buf(),
     })
 }
