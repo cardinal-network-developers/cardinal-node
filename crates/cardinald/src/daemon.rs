@@ -557,6 +557,30 @@ impl Daemon {
     }
 
     /// Sessions with this person's devices.
+    /// The device's network changed, as a phone moving off Wi-Fi does: every
+    /// session is asked for an answer, those over the old network end within
+    /// seconds, and then this device looks again for its own devices and its
+    /// contacts', through hosts where it must. Said by whatever sees the
+    /// change, since a phone asleep keeps no timers of its own running.
+    pub fn network_changed(self: &Arc<Self>, why: &str) -> serde_json::Value {
+        let sessions = self.endpoint.sessions();
+        tracing::info!(
+            "{why}: checking {} sessions, then looking again",
+            sessions.len()
+        );
+        for s in &sessions {
+            s.check();
+        }
+        let d = self.clone();
+        tokio::spawn(async move {
+            // Long enough for an answer to be missed (`answer_timeout`).
+            tokio::time::sleep(Duration::from_secs(11)).await;
+            d.connect_all().await;
+            crate::rendezvous::reach_contacts(d.clone()).await;
+        });
+        serde_json::json!({"checking": sessions.len()})
+    }
+
     pub fn own_sessions(&self) -> Vec<Session> {
         // Never locks the core: callers may hold the mount's tree.
         let mut v: Vec<Conn> = lock(&self.sessions)

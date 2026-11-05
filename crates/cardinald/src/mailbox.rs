@@ -17,6 +17,7 @@ use cardinal_crypto::{derive, random_bytes, Purpose};
 use cardinal_encoding::{Record, Value};
 use cardinal_identity::{EntryId, KeyId};
 use cardinal_link::{Admission, CarrierKind, Role, SecretEntry, Service, Session, Stream, Target};
+use cardinal_space::grant::Endpoint;
 use cardinal_space::relationship::{self, Reach};
 use cardinal_space::{EpochId, SpaceId};
 use cardinal_sync::{identity_log_label, Message};
@@ -717,8 +718,10 @@ pub fn revoke_refused(d: &Daemon) {
     }
 }
 
-/// On a host, gives a fresh token to anyone whose token here has gone and who
-/// is not refused now: a revoked token never comes back.
+/// On a host, keeps what contacts have of it current: a fresh token for anyone
+/// whose token here has gone and who is not refused now (a revoked token never
+/// comes back), and the addresses its grant gives now. A contact away from
+/// home tries only the addresses a reach node names.
 fn renew_reach(d: &Arc<Daemon>) {
     if !d.config().host {
         return;
@@ -727,22 +730,19 @@ fn renew_reach(d: &Arc<Daemon>) {
     let Some(me) = d.core().identity.as_ref().map(|i| i.id()) else {
         return;
     };
+    let endpoints = crate::host::own_grant(d).map(|g| g.endpoints);
     let contacts = d.core().contacts();
     for c in contacts.iter().filter(|c| !c.refused) {
-        // Every node, and only the tokens that are gone: a token still active
-        // stays, and a node renewed once is not renewed again.
+        // Every node; one already current is not written again.
         let nodes = d.core().reach_nodes_of(&c.space, &me);
         for (node, mut reach) in nodes {
-            let mut renewed = false;
-            for r in reach.iter_mut().filter(|r| r.host == here) {
-                if lock(&d.mailbox.store).is_active(&r.token) {
-                    continue;
-                }
-                r.token = random_bytes();
-                register(d, &r.token);
-                renewed = true;
-            }
-            if !renewed {
+            let active = |t: &Token| lock(&d.mailbox.store).is_active(t);
+            let fresh = || {
+                let t: Token = random_bytes();
+                register(d, &t);
+                t
+            };
+            if !kept_current(&mut reach, &here, endpoints.as_deref(), active, fresh) {
                 continue;
             }
             let set = relationship::set_reach(node, &reach);
@@ -751,6 +751,30 @@ fn renew_reach(d: &Arc<Daemon>) {
             }
         }
     }
+}
+
+/// Brings this host's part of a reach node up to date: a fresh token for one
+/// that has gone, and the addresses it is reached at now. Says whether
+/// anything changed.
+fn kept_current(
+    reach: &mut [Reach],
+    here: &[u8; 32],
+    endpoints: Option<&[Endpoint]>,
+    active: impl Fn(&Token) -> bool,
+    mut fresh: impl FnMut() -> Token,
+) -> bool {
+    let mut changed = false;
+    for r in reach.iter_mut().filter(|r| r.host == *here) {
+        if !active(&r.token) {
+            r.token = fresh();
+            changed = true;
+        }
+        if let Some(now) = endpoints.filter(|e| !e.is_empty() && *e != r.endpoints.as_slice()) {
+            r.endpoints = now.to_vec();
+            changed = true;
+        }
+    }
+    changed
 }
 
 /// What this device has written in a set, if it is a space.
@@ -1176,6 +1200,56 @@ mod tests {
         let op = relationship::create_reach(&[3; 32], &[reach.clone(), reach]);
         let body = op.record().encode();
         assert!(body.len() < MAX_ENVELOPE / 2, "{} bytes", body.len());
+    }
+
+    #[test]
+    fn a_reach_node_follows_where_its_host_is_now() {
+        let home = Endpoint::parse("172.20.1.20:7171").unwrap();
+        let public = Endpoint::parse("203.0.113.9:7171").unwrap();
+        let theirs = Reach {
+            endpoints: vec![home.clone()],
+            host: [9; 32],
+            token: OTHER,
+        };
+        let mut reach = vec![
+            Reach {
+                endpoints: vec![home.clone()],
+                host: [1; 32],
+                token: T,
+            },
+            theirs.clone(),
+        ];
+        let now = [home.clone(), public.clone()];
+        let never = || -> Token { panic!("an active token is kept") };
+        // Here now at home and on the internet: the node says so.
+        assert!(kept_current(
+            &mut reach,
+            &[1; 32],
+            Some(&now),
+            |_| true,
+            never
+        ));
+        assert_eq!(reach[0].endpoints, now);
+        assert_eq!(reach[0].token, T);
+        assert_eq!(reach[1], theirs, "another host's part is its own");
+        // Already current: nothing to write.
+        assert!(!kept_current(
+            &mut reach,
+            &[1; 32],
+            Some(&now),
+            |_| true,
+            never
+        ));
+        // A token gone is renewed, where it is.
+        assert!(kept_current(
+            &mut reach,
+            &[1; 32],
+            Some(&now),
+            |_| false,
+            || [5; 16]
+        ));
+        assert_eq!(reach[0].token, [5; 16]);
+        assert_eq!(reach[0].endpoints, now);
     }
 
     #[test]

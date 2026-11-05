@@ -120,6 +120,7 @@ pub fn enable(d: &Arc<Daemon>, addresses: &[String]) -> anyhow::Result<Json> {
         .iter()
         .filter_map(|e| address_warning(e, listening))
         .collect();
+    warnings.extend(away_warning(&endpoints));
     warnings.extend(logout_warning());
     let (space, mut ops) = own_nodes(d, true)?;
     let identity = own_identity(d)?;
@@ -166,6 +167,25 @@ fn address_warning(e: &Endpoint, listening: u16) -> Option<String> {
     })
 }
 
+/// Contacts' devices, and this person's own away from home, reach a host only
+/// at the addresses its grant gives: with none beyond this network, nobody
+/// elsewhere can.
+fn away_warning(endpoints: &[Endpoint]) -> Option<String> {
+    let local = |e: &Endpoint| {
+        e.socket_addr().is_some_and(|a| match a.ip() {
+            IpAddr::V4(ip) => ip.is_private() || ip.is_loopback() || ip.is_link_local(),
+            IpAddr::V6(ip) => ip.is_loopback() || (ip.segments()[0] & 0xfe00) == 0xfc00,
+        })
+    };
+    endpoints.iter().all(local).then(|| {
+        "every address given is on this network only, so devices elsewhere, yours and \
+         your contacts', cannot reach this one. Give the address the internet sees too, \
+         with the port your router forwards here: `cardinal host --address <this network> \
+         --address <public address:port>`."
+            .to_owned()
+    })
+}
+
 /// Whether a daemon in this control group stops at logout: a user service
 /// lasts only as long as its user manager, unless the user lingers.
 #[cfg(target_os = "linux")]
@@ -197,24 +217,25 @@ fn logout_warning() -> Option<String> {
     })
 }
 
+/// This device's own grant as a host, if it is one.
+pub(crate) fn own_grant(d: &Daemon) -> Option<Grant> {
+    let me = d.keys.key();
+    let core = d.core();
+    let space = core.account().and_then(|a| a.space.as_ref())?;
+    account::hosts(space.state())
+        .iter()
+        .filter_map(|h| Grant::open(&h.grant))
+        .find(|(_, signer)| *signer == me)
+        .map(|(g, _)| g)
+}
+
 /// Offers what this version of a host offers, on a device that became one
 /// under an older version.
 pub fn refresh(d: &Arc<Daemon>) -> anyhow::Result<()> {
     if !d.config().host {
         return Ok(());
     }
-    let me = d.keys.key();
-    let old = {
-        let core = d.core();
-        let Some(space) = core.account().and_then(|a| a.space.as_ref()) else {
-            return Ok(());
-        };
-        account::hosts(space.state())
-            .iter()
-            .filter_map(|h| Grant::open(&h.grant))
-            .find(|(_, signer)| *signer == me)
-            .map(|(g, _)| g)
-    };
+    let old = own_grant(d);
     let Some(old) = old.filter(|g| !g.services.contains(&MAILBOX)) else {
         return Ok(());
     };

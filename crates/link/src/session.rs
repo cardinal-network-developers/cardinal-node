@@ -300,6 +300,12 @@ impl Session {
             .send_datagram(label, priority, data.into())
     }
 
+    /// Asks the peer for an answer now; without one in time the session ends
+    /// (`Conn::check`).
+    pub fn check(&self) {
+        self.inner.lock().check();
+    }
+
     /// Closes the session with a reason the peer sees.
     pub fn close(&self, reason: &str) {
         let events = {

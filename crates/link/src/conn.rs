@@ -1637,6 +1637,17 @@ impl Conn {
     // ------------------------------------------------------------------
     // Timers.
 
+    /// Asks the peer for an answer now. On a session that watches for answers
+    /// (`keepalive`), one that does not come within `answer_timeout` ends it:
+    /// after the network changed, a session over the old one ends in seconds
+    /// rather than at the next keepalive or later.
+    pub fn check(&mut self) {
+        if self.established && self.close.is_none() {
+            self.control.push_back(Frame::Ping);
+            self.signals.driver.notify_one();
+        }
+    }
+
     pub fn poll_timeout(&self) -> Option<Instant> {
         if self.is_drained() {
             return None;
