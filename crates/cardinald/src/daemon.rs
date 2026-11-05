@@ -252,8 +252,10 @@ pub struct Daemon {
     pub call: Mutex<Option<crate::calls::Call>>,
     /// The group calls this device is on or carries, by call.
     pub group_calls: Mutex<HashMap<[u8; 16], crate::calls::Group>>,
-    /// The group calls this device rang for lately.
+    /// The group calls this device rang for lately, or its person made.
     pub rung_calls: Mutex<std::collections::VecDeque<[u8; 16]>>,
+    /// The group calls whose ring this device passed on lately.
+    pub passed_rings: Mutex<std::collections::VecDeque<[u8; 16]>>,
     /// Whether this device can help others now (`conditions.rs`).
     pub conditions: crate::conditions::Conditions,
     /// When each contact rang lately, so they can ring only so often.
@@ -433,6 +435,7 @@ impl Daemon {
             call: Mutex::new(None),
             group_calls: Mutex::new(HashMap::new()),
             rung_calls: Mutex::new(std::collections::VecDeque::new()),
+            passed_rings: Mutex::new(std::collections::VecDeque::new()),
             conditions: crate::conditions::Conditions::default(),
             rang: Mutex::new(HashMap::new()),
             shared_blobs: Mutex::new(HashMap::new()),

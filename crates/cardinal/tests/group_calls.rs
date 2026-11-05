@@ -6,11 +6,11 @@
 
 mod common;
 
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write};
 use std::net::{Ipv4Addr, SocketAddr};
 use std::os::unix::net::UnixStream;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -134,8 +134,8 @@ impl Line {
         writeln!(self.w, "{}", json!({"audio": hex::encode(frame)})).unwrap();
     }
 
-    /// The tags heard so far.
-    fn heard(&mut self, into: &mut HashSet<u8>) {
+    /// The tags heard so far, and how often.
+    fn heard(&mut self, into: &mut HashMap<u8, u32>) {
         loop {
             let mut line = String::new();
             match self.r.read_line(&mut line) {
@@ -147,16 +147,16 @@ impl Line {
             };
             if let Some(audio) = v["audio"].as_str() {
                 let bytes = hex::decode(audio).unwrap();
-                into.insert(bytes[4]);
+                *into.entry(bytes[4]).or_default() += 1;
             }
         }
     }
 }
 
 /// Those in `talking` speak for `frames` frames of 20 ms; what each line
-/// heard.
-fn talk(lines: &mut [Line], talking: &[bool], frames: u32) -> Vec<HashSet<u8>> {
-    let mut heard = vec![HashSet::new(); lines.len()];
+/// heard of each.
+fn talk(lines: &mut [Line], talking: &[bool], frames: u32) -> Vec<HashMap<u8, u32>> {
+    let mut heard = vec![HashMap::new(); lines.len()];
     for _ in 0..frames {
         for (l, t) in lines.iter_mut().zip(talking) {
             if *t {
@@ -175,6 +175,12 @@ fn talk(lines: &mut [Line], talking: &[bool], frames: u32) -> Vec<HashSet<u8>> {
         }
     }
     heard
+}
+
+/// Whether most of what `tag` said in `frames` frames was heard: a call that
+/// works loses little, and one frame getting through shows nothing.
+fn heard_most(h: &HashMap<u8, u32>, tag: u8, frames: u32) -> bool {
+    h.get(&tag).copied().unwrap_or(0) * 10 >= frames * 9
 }
 
 /// Carol made the group, and Ana and Ben do not know each other. Carol does
@@ -206,8 +212,8 @@ fn a_device_that_helps_carries_a_call_its_person_is_not_on() {
 
     let mut lines = [Line::open(&ana, 1), Line::open(&ben, 2)];
     let heard = talk(&mut lines, &[true, true], 60);
-    assert!(heard[0].contains(&2), "ana heard {:?}", heard[0]);
-    assert!(heard[1].contains(&1), "ben heard {:?}", heard[1]);
+    assert!(heard_most(&heard[0], 2, 60), "ana heard {:?}", heard[0]);
+    assert!(heard_most(&heard[1], 1, 60), "ben heard {:?}", heard[1]);
     wait("both count two", 15, || {
         call(&ana)["people"] == 2 && call(&ben)["people"] == 2
     });
@@ -215,7 +221,10 @@ fn a_device_that_helps_carries_a_call_its_person_is_not_on() {
     // Carol says no: that is hers to say, and her device carries on.
     ask(&carol, json!({"cmd": "call-end"}));
     let heard = talk(&mut lines, &[true, true], 40);
-    assert!(heard[0].contains(&2) && heard[1].contains(&1), "{heard:?}");
+    assert!(
+        heard_most(&heard[0], 2, 40) && heard_most(&heard[1], 1, 40),
+        "{heard:?}"
+    );
     assert_eq!(carrying(&carol), 1);
 
     // On battery it helps no more.
@@ -263,7 +272,7 @@ fn a_group_where_everyone_knows_everyone_settles_into_a_tree() {
     let before = call(dee)["frames"].clone();
     let heard = talk(&mut lines, &[true, false], 150);
     let after = call(dee)["frames"].clone();
-    assert!(heard[1].contains(&1), "dee heard {:?}", heard[1]);
+    assert!(heard_most(&heard[1], 1, 150), "dee heard {:?}", heard[1]);
     let n = |v: &Value, k: &str| v[k].as_u64().unwrap() as f64;
     let new = n(&after, "new") - n(&before, "new");
     let extra = n(&after, "in") - n(&before, "in") - new;
@@ -298,6 +307,11 @@ fn a_person_who_left_a_group_call_can_join_it_again() {
         ask(d, json!({"cmd": "call-answer"}));
     }
     wait("ana links both", 20, || linked(&ana) == 2);
+    {
+        let mut lines = [Line::open(&bo, 2), Line::open(&cy, 3)];
+        let heard = talk(&mut lines, &[true, true], 60);
+        assert!(heard_most(&heard[1], 2, 60), "{heard:?}");
+    }
 
     ask(&bo, json!({"cmd": "call-end"}));
     wait("ana lets bo go", 10, || linked(&ana) == 1);
@@ -309,9 +323,13 @@ fn a_person_who_left_a_group_call_can_join_it_again() {
     assert_eq!(standing(&ana), "live");
     assert_eq!(standing(&cy), "live");
 
+    // Back, Bo is heard at once, not taken for the frames he sent before.
     let mut lines = [Line::open(&bo, 2), Line::open(&cy, 3)];
     let heard = talk(&mut lines, &[true, true], 60);
-    assert!(heard[0].contains(&3) && heard[1].contains(&2), "{heard:?}");
+    assert!(
+        heard_most(&heard[0], 3, 60) && heard_most(&heard[1], 2, 60),
+        "{heard:?}"
+    );
     wait("bo counts three", 15, || call(&bo)["people"] == 3);
 }
 
@@ -319,7 +337,8 @@ fn a_person_who_left_a_group_call_can_join_it_again() {
 /// back but through here: switched off, its network is gone.
 struct Gateway {
     addr: SocketAddr,
-    down: Arc<AtomicBool>,
+    /// 0 up, 1 down both ways, 2 down only towards the device.
+    down: Arc<AtomicU8>,
     _runtime: tokio::runtime::Runtime,
 }
 
@@ -333,7 +352,7 @@ impl Gateway {
         let inner = Arc::new(runtime.block_on(UdpSocket::bind("127.0.0.1:0")).unwrap());
         let public = Arc::new(runtime.block_on(UdpSocket::bind("127.0.0.1:0")).unwrap());
         let addr = inner.local_addr().unwrap();
-        let down = Arc::new(AtomicBool::new(false));
+        let down = Arc::new(AtomicU8::new(0));
         let device: Arc<Mutex<Option<SocketAddr>>> = Default::default();
         let (i, p, dn, dv) = (inner.clone(), public.clone(), down.clone(), device.clone());
         runtime.spawn(async move {
@@ -341,7 +360,7 @@ impl Gateway {
             loop {
                 let (n, from) = i.recv_from(&mut buf).await.unwrap();
                 *dv.lock().unwrap() = Some(from);
-                if n < HEADER || dn.load(Ordering::SeqCst) {
+                if n < HEADER || dn.load(Ordering::SeqCst) == 1 {
                     continue;
                 }
                 let ip = Ipv4Addr::new(buf[0], buf[1], buf[2], buf[3]);
@@ -354,7 +373,7 @@ impl Gateway {
             let mut buf = vec![0u8; 4096];
             loop {
                 let (n, from) = p.recv_from(&mut buf[HEADER..]).await.unwrap();
-                if dn.load(Ordering::SeqCst) {
+                if dn.load(Ordering::SeqCst) != 0 {
                     continue;
                 }
                 if let SocketAddr::V4(a) = from {
@@ -375,7 +394,12 @@ impl Gateway {
     }
 
     fn set_down(&self, down: bool) {
-        self.down.store(down, Ordering::SeqCst);
+        self.down.store(u8::from(down), Ordering::SeqCst);
+    }
+
+    /// What the device sends still goes; nothing comes back.
+    fn set_deaf(&self) {
+        self.down.store(2, Ordering::SeqCst);
     }
 }
 
@@ -402,7 +426,10 @@ fn bo_behind(root: &std::path::Path, gw: &Gateway) -> (Dev, Dev, Dev, Vec<Line>)
     wait("ana links both", 20, || linked(&ana) == 2);
     let mut lines = vec![Line::open(&bo, 2), Line::open(&cy, 3)];
     let heard = talk(&mut lines, &[true, true], 50);
-    assert!(heard[0].contains(&3) && heard[1].contains(&2), "{heard:?}");
+    assert!(
+        heard_most(&heard[0], 3, 50) && heard_most(&heard[1], 2, 50),
+        "{heard:?}"
+    );
     (ana, bo, cy, lines)
 }
 
@@ -422,7 +449,10 @@ fn a_link_that_went_quiet_is_made_again_when_it_comes_back() {
         linked(&ana) == 2 && linked(&bo) == 1
     });
     let heard = talk(&mut lines, &[true, true], 50);
-    assert!(heard[0].contains(&3) && heard[1].contains(&2), "{heard:?}");
+    assert!(
+        heard_most(&heard[0], 3, 50) && heard_most(&heard[1], 2, 50),
+        "{heard:?}"
+    );
 }
 
 /// Bo's network goes for long enough that his sessions end. Back, his
@@ -443,5 +473,30 @@ fn a_device_back_after_its_sessions_ended_is_linked_again() {
     ask(&bo, json!({"cmd": "network-changed"}));
     wait("bo is linked again", 60, || linked(&ana) == 2);
     let heard = talk(&mut lines, &[true, true], 50);
-    assert!(heard[0].contains(&3) && heard[1].contains(&2), "{heard:?}");
+    assert!(
+        heard_most(&heard[0], 3, 50) && heard_most(&heard[1], 2, 50),
+        "{heard:?}"
+    );
+}
+
+/// Only Bo's way in goes. With nothing acknowledged his session soon sends
+/// nothing either, so both ends of the link fall silent and are let go, as
+/// when the network goes both ways; when it comes back they link again.
+#[test]
+fn a_link_cut_one_way_is_made_again() {
+    let root = tempfile::tempdir().unwrap();
+    let gw = Gateway::new();
+    let (ana, bo, _cy, mut lines) = bo_behind(root.path(), &gw);
+
+    gw.set_deaf();
+    wait("bo lets his link to ana go", 20, || linked(&bo) == 0);
+    gw.set_down(false);
+    wait("bo is linked again", 20, || {
+        linked(&bo) == 1 && linked(&ana) == 2
+    });
+    let heard = talk(&mut lines, &[true, true], 50);
+    assert!(
+        heard_most(&heard[0], 3, 50) && heard_most(&heard[1], 2, 50),
+        "{heard:?}"
+    );
 }

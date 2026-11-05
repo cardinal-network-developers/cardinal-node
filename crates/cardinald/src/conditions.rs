@@ -19,7 +19,13 @@ pub struct Told {
 #[derive(Default)]
 pub struct Conditions {
     told: Mutex<Option<Told>>,
+    /// What the system said lately, and when: reading a battery can take a
+    /// while, and the answer is asked for often.
+    read: Mutex<Option<(std::time::Instant, Option<bool>)>>,
 }
+
+/// How long what the system said is good for.
+const READ_FOR: std::time::Duration = std::time::Duration::from_secs(10);
 
 impl Conditions {
     pub fn tell(&self, t: Told) {
@@ -29,9 +35,17 @@ impl Conditions {
     /// Whether it is plugged in, if known, and whether metered.
     pub fn now(&self) -> (Option<bool>, bool) {
         let told = *self.told.lock().unwrap_or_else(|e| e.into_inner());
-        match told {
-            Some(t) => (Some(t.plugged_in), t.metered),
-            None => (plugged_in_here(), false),
+        if let Some(t) = told {
+            return (Some(t.plugged_in), t.metered);
+        }
+        let mut read = self.read.lock().unwrap_or_else(|e| e.into_inner());
+        match *read {
+            Some((at, plugged_in)) if at.elapsed() < READ_FOR => (plugged_in, false),
+            _ => {
+                let plugged_in = plugged_in_here();
+                *read = Some((std::time::Instant::now(), plugged_in));
+                (plugged_in, false)
+            }
         }
     }
 

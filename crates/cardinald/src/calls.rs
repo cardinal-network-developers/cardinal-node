@@ -61,6 +61,13 @@ const QUIET_FOR: Duration = Duration::from_secs(15);
 const KEYS_EVERY: Duration = Duration::from_secs(1);
 /// How long a signal on a group call's behalf may take to go.
 const SIGNAL_WITHIN: Duration = Duration::from_secs(3);
+/// The most group calls a device carries for others at once.
+const MAX_CARRIED: usize = 4;
+/// How long a device that called waits, linked to a call it was told is
+/// going on, to hear someone on it.
+const PROBE_FOR: Duration = Duration::from_secs(8);
+/// How often a device answers a `join` on a link it already has.
+const ANSWER_AGAIN: Duration = Duration::from_secs(5);
 
 /// The longest signal: a kind, a space, a call, a number and an identity.
 const MAX_SIGNAL: usize = 192;
@@ -168,8 +175,13 @@ pub struct Group {
     waiting: bool,
     /// When each session was last asked to link, by handshake.
     asked: HashMap<[u8; 32], Instant>,
+    /// When each session was last answered on a link it already had.
+    answered: HashMap<[u8; 32], Instant>,
     /// Since when, while only carrying, it has had fewer than two links.
     thin_since: Option<Instant>,
+    /// Linked only to see whether someone is on it, as another device said:
+    /// until when, and that device's voice.
+    probe: Option<(Instant, Voice)>,
     /// Frames that came on its links, and how many of them were new.
     frames_in: u64,
     frames_new: u64,
@@ -560,6 +572,7 @@ pub fn current(d: &Daemon) -> Json {
         (None, None, None)
     };
     json!({"call": {
+        "id": hex::encode(id),
         "who": hex::encode(&who[..8]),
         "name": name,
         "state": standing,
@@ -575,7 +588,7 @@ pub fn current(d: &Daemon) -> Json {
 pub fn carried(d: &Daemon) -> usize {
     groups(d)
         .values()
-        .filter(|g| g.tree.own().is_none())
+        .filter(|g| g.tree.own().is_none() && g.probe.is_none())
         .count()
 }
 
@@ -584,15 +597,36 @@ fn origin_of(d: &Daemon) -> Voice {
     mesh::voice_of(&d.keys.key())
 }
 
+/// Whether someone is on a group call, as far as this device can tell: its
+/// own person, or anyone heard lately.
+fn someone_on(g: &Group, now: Instant) -> bool {
+    g.tree.own().is_some() && !g.waiting || g.tree.others(now) >= 1
+}
+
 /// Rings a group: each member device this one has a session with, and
-/// each of those passes the ring on to theirs. If a call is going on in it
-/// already, that is the one this person joins.
+/// each of those passes the ring on to theirs. If a call with someone on it
+/// is going on in it already, that is the one this person joins.
 pub async fn start_group(d: &Arc<Daemon>, group: &str) -> anyhow::Result<Json> {
     let (space, name) = crate::groups::joined_group(d, group)?;
-    let going = groups(d)
-        .iter()
-        .find(|(_, g)| g.space == space)
-        .map(|(id, _)| *id);
+    let now = Instant::now();
+    let (going, stale) = {
+        let gs = groups(d);
+        let in_it: Vec<(&[u8; 16], &Group)> = gs.iter().filter(|(_, g)| g.space == space).collect();
+        let going = in_it
+            .iter()
+            .find(|(_, g)| g.probe.is_none() && someone_on(g, now))
+            .map(|(id, _)| **id);
+        let stale: Vec<[u8; 16]> = in_it
+            .iter()
+            .filter(|(id, _)| Some(**id) != going)
+            .map(|(id, _)| **id)
+            .collect();
+        (going, stale)
+    };
+    // A call nobody is heard on is over, whatever this device carried.
+    for old in stale {
+        leave(d, &old).await;
+    }
     let theirs = crate::groups::member_sessions(d, &space);
     anyhow::ensure!(
         going.is_some() || !theirs.is_empty(),
@@ -622,6 +656,8 @@ pub async fn start_group(d: &Arc<Daemon>, group: &str) -> anyhow::Result<Json> {
         return Ok(json!({}));
     }
     let me = contacts::identity(d).ok();
+    remember(&d.rung_calls, id);
+    remember(&d.passed_rings, id);
     for s in &theirs {
         let ring = Signal {
             kind: RING,
@@ -638,6 +674,19 @@ pub async fn start_group(d: &Arc<Daemon>, group: &str) -> anyhow::Result<Json> {
     Ok(json!({}))
 }
 
+/// Remembers a call among the last few; whether it was there already.
+fn remember(list: &std::sync::Mutex<std::collections::VecDeque<[u8; 16]>>, id: [u8; 16]) -> bool {
+    let mut l = list.lock().unwrap_or_else(|e| e.into_inner());
+    if l.contains(&id) {
+        return true;
+    }
+    l.push_back(id);
+    if l.len() > 64 {
+        l.pop_front();
+    }
+    false
+}
+
 /// This device's person is on group call `id`: its voice goes out, and it
 /// hears the others. The call's routing starts if it was not going already.
 fn take_part(d: &Arc<Daemon>, id: [u8; 16], space: SpaceId, waiting: bool) {
@@ -647,6 +696,7 @@ fn take_part(d: &Arc<Daemon>, id: [u8; 16], space: SpaceId, waiting: bool) {
         g.tree.set_own(Some(own));
         g.waiting = waiting && !g.tree.any_person();
         g.thin_since = None;
+        g.probe = None;
         return;
     }
     gs.insert(id, new_group(space, Some(own), waiting));
@@ -663,10 +713,12 @@ fn new_group(space: SpaceId, own: Option<Voice>, waiting: bool) -> Group {
         linked: 0,
         keys: HashMap::new(),
         keys_at: None,
-        next: 0,
+        next: mesh::first_number(),
         waiting,
         asked: HashMap::new(),
+        answered: HashMap::new(),
         thin_since: None,
+        probe: None,
         frames_in: 0,
         frames_new: 0,
         since: Instant::now(),
@@ -674,23 +726,51 @@ fn new_group(space: SpaceId, own: Option<Voice>, waiting: bool) -> Group {
     }
 }
 
-/// Carries group call `id` for others, if this device helps others and has
-/// sessions with two or more member devices, and does not already.
+/// Carries group call `id` for others, if this device helps others, has
+/// sessions with two or more member devices, and carries no call with
+/// anyone on it in that group already. A device carries one call in each
+/// group, and a few in all.
 async fn maybe_carry(d: &Arc<Daemon>, id: [u8; 16], space: SpaceId) {
-    if groups(d).contains_key(&id) || !d.conditions.helps() {
+    if !d.conditions.helps() || groups(d).contains_key(&id) {
         return;
     }
     if crate::groups::member_sessions(d, &space).len() < 2 {
         return;
     }
-    let over = {
+    let now = Instant::now();
+    let (over, stale) = {
         let mut gs = groups(d);
         if gs.contains_key(&id) {
             return;
         }
+        let here = gs.iter().find(|(_, g)| g.space == space);
+        let stale = match here {
+            // One nobody is heard on gives way to the new one.
+            Some((other, g))
+                if g.tree.own().is_none() && g.probe.is_none() && !someone_on(g, now) =>
+            {
+                Some(*other)
+            }
+            Some(_) => return,
+            None => None,
+        };
+        let carried = gs
+            .values()
+            .filter(|g| g.tree.own().is_none() && g.probe.is_none())
+            .count();
+        if stale.is_none() && carried >= MAX_CARRIED {
+            return;
+        }
+        let stale = stale.and_then(|s| gs.remove(&s).map(|g| (s, g)));
         gs.insert(id, new_group(space, None, false));
-        gs[&id].over.subscribe()
+        (gs[&id].over.subscribe(), stale)
     };
+    if let Some((old, g)) = stale {
+        g.over.send_replace(true);
+        for (s, _) in g.sessions.values() {
+            let _ = tokio::time::timeout(SIGNAL_WITHIN, tell(s, END, &g.space, &old)).await;
+        }
+    }
     tracing::debug!("carrying a group call for others");
     tokio::spawn(drive(d.clone(), id, over));
     relink(d, &id, &space, true).await;
@@ -728,6 +808,9 @@ async fn relink(d: &Arc<Daemon>, id: &[u8; 16], space: &SpaceId, all: bool) {
     let (ask, carrying) = {
         let mut gs = groups(d);
         let Some(g) = gs.get_mut(id) else { return };
+        if g.probe.is_some() {
+            return;
+        }
         let now = Instant::now();
         let mut ask = Vec::new();
         for s in sessions {
@@ -750,6 +833,8 @@ async fn relink(d: &Arc<Daemon>, id: &[u8; 16], space: &SpaceId, all: bool) {
         }
         g.asked
             .retain(|_, t| now.duration_since(*t) < ASK_AGAIN * 4);
+        g.answered
+            .retain(|_, t| now.duration_since(*t) < ANSWER_AGAIN);
         (ask, g.tree.own().is_none())
     };
     // Each on its own, so that a session that cannot take it now holds up
@@ -763,6 +848,16 @@ async fn relink(d: &Arc<Daemon>, id: &[u8; 16], space: &SpaceId, all: bool) {
             }
         });
     }
+}
+
+/// The identities of a group's members, this person among them.
+fn members(d: &Daemon, space: &SpaceId) -> std::collections::HashSet<[u8; 32]> {
+    let core = d.core();
+    core.spaces
+        .get(space)
+        .and_then(|h| h.space.as_ref())
+        .map(|sp| sp.validity().members.iter().map(|m| m.identity).collect())
+        .unwrap_or_default()
 }
 
 /// Runs a group call's routing here until it is over: haves and presence
@@ -781,14 +876,43 @@ async fn drive(d: Arc<Daemon>, id: [u8; 16], mut over: watch::Receiver<bool>) {
         let here = n % HERE_EVERY == 0;
         let relinking = n % RELINK_EVERY == 0;
         n += 1;
+        // Read before the call's lock: neither waits on it.
+        let helps = d.conditions.helps();
+        let on_it = lock(&d)
+            .as_ref()
+            .is_some_and(|c| c.id == id && c.group && c.standing != Standing::Ringing);
+        let space = groups(&d).get(&id).map(|g| g.space);
+        let Some(space) = space else { return };
+        let members = relinking.then(|| members(&d, &space));
         let mut out: Vec<(Session, [u8; 16], Vec<u8>)> = Vec::new();
         let mut silent = Vec::new();
         let mut done = false;
-        let space = {
+        {
             let mut gs = groups(&d);
             let Some(g) = gs.get_mut(&id) else { return };
             let label = channel_label(&g.space, &id);
             let routing = routing_label(&g.space, &id);
+            // Its person is not on it after all, as when they hung up in
+            // the moment it was joining: it says nothing for them.
+            if g.tree.own().is_some() && !on_it {
+                g.tree.set_own(None);
+            }
+            // A device no longer in the group hears no more of it.
+            if let Some(members) = &members {
+                let gone: Vec<LinkId> = g
+                    .sessions
+                    .iter()
+                    .filter(|(_, (s, _))| {
+                        s.peer_identity()
+                            .is_none_or(|p| !members.contains(&p.identity))
+                    })
+                    .map(|(l, _)| *l)
+                    .collect();
+                for l in gone {
+                    g.tree.remove_link(&l);
+                    g.sessions.remove(&l);
+                }
+            }
             for (l, w) in g.tree.haves(keepalive, now) {
                 if let Some((s, _)) = g.sessions.get(&l) {
                     out.push((s.clone(), routing, w.encode()));
@@ -804,6 +928,7 @@ async fn drive(d: Arc<Daemon>, id: [u8; 16], mut over: watch::Receiver<bool>) {
             }
             if let (true, Some(own)) = (here, g.tree.own()) {
                 let f = mesh::frame(&d.keys.signing, &id, &own, g.next, &[]);
+                g.tree.sent(g.next, now);
                 g.next = g.next.wrapping_add(1);
                 for l in g.tree.own_targets(true) {
                     if let Some((s, _)) = g.sessions.get(&l) {
@@ -811,7 +936,9 @@ async fn drive(d: Arc<Daemon>, id: [u8; 16], mut over: watch::Receiver<bool>) {
                     }
                 }
             }
-            if g.tree.own().is_none() {
+            if let Some((until, _)) = g.probe {
+                done = now >= until;
+            } else if g.tree.own().is_none() {
                 let thin = g.tree.links() < 2;
                 match (thin, g.thin_since) {
                     (true, None) => g.thin_since = Some(now),
@@ -823,10 +950,9 @@ async fn drive(d: Arc<Daemon>, id: [u8; 16], mut over: watch::Receiver<bool>) {
                     .is_some_and(|t| now.duration_since(t) >= THIN_FOR);
                 let heard = g.tree.last_fresh().unwrap_or(g.since).max(g.since);
                 let quiet = now.duration_since(heard) >= QUIET_FOR;
-                done = thin_long || quiet || !d.conditions.helps();
+                done = thin_long || quiet || !helps;
             }
-            g.space
-        };
+        }
         for (s, l, b) in out {
             let _ = s.send_datagram(l, Priority::RealTime, b);
         }
@@ -862,14 +988,26 @@ async fn group_signal(
 ) -> anyhow::Result<()> {
     let (kind, space, id) = (sig.kind, sig.space, sig.id);
     let me = contacts::identity(d).ok();
+    let own_device = Some(them) == me;
+    // A call by this id in another group is no business of this one.
+    if groups(d).get(&id).is_some_and(|g| g.space != space) {
+        return Ok(());
+    }
+    let now = Instant::now();
     match kind {
         RING => {
-            // A call already going on here in this group: the ringer joins
-            // that one instead.
+            // Rings from one member, passed on or not, only so often.
+            if !own_device && !may_ring(d, &them) {
+                return Ok(());
+            }
+            // A call with someone on it already going on here in this
+            // group: the ringer joins that one instead.
             let going = groups(d)
                 .iter()
-                .find(|(other, g)| g.space == space && **other != id)
-                .map(|(other, g)| (*other, g.tree.on_it(Instant::now()) >= 2));
+                .find(|(other, g)| {
+                    g.space == space && **other != id && g.probe.is_none() && someone_on(g, now)
+                })
+                .map(|(other, g)| (*other, g.tree.on_it(now) >= 2));
             if let Some((going, busy)) = going {
                 let says = Signal {
                     kind: ONGOING,
@@ -881,37 +1019,9 @@ async fn group_signal(
                 send(s, &says).await?;
                 return Ok(());
             }
-            // A call this person made, rung back by someone passing it on.
-            let mine = sig.caller.is_some() && sig.caller == me;
-            // Rung once for a call is enough: it can come again by another
-            // member, after this person said no.
-            let again = {
-                let mut rung = d.rung_calls.lock().unwrap_or_else(|e| e.into_inner());
-                let again = rung.contains(&id);
-                if !again {
-                    rung.push_back(id);
-                    if rung.len() > 64 {
-                        rung.pop_front();
-                    }
-                }
-                again
-            };
-            let fresh = !mine && !again && {
-                let mut call = lock(d);
-                if call.is_some() || !may_ring(d, &them) {
-                    false
-                } else {
-                    let mut c =
-                        Call::new(id, space, name, space, Standing::Ringing, Some(s.clone()));
-                    c.group = true;
-                    *call = Some(c);
-                    true
-                }
-            };
-            if fresh {
-                d.bump();
-                ring_out(d, id);
-                // The ring goes on to the members only this device reaches.
+            // Passed on once, to the members only this device reaches,
+            // whether or not it rings here.
+            if !remember(&d.passed_rings, id) {
                 for other in crate::groups::member_sessions(d, &space) {
                     if other.peer_static() != s.peer_static() {
                         let on = Signal {
@@ -921,8 +1031,38 @@ async fn group_signal(
                             flag: None,
                             caller: sig.caller,
                         };
-                        let _ = send(&other, &on).await;
+                        let _ = tokio::time::timeout(SIGNAL_WITHIN, send(&other, &on)).await;
                     }
+                }
+            }
+            // A call this person made, as one of their own devices says.
+            let mine = own_device && sig.caller.is_some() && sig.caller == me;
+            if mine {
+                remember(&d.rung_calls, id);
+            } else {
+                // Rung once for a call is enough: it can come again by
+                // another member, after this person said no.
+                let rang_before = d
+                    .rung_calls
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .contains(&id);
+                let fresh = !rang_before && {
+                    let mut call = lock(d);
+                    if call.is_some() {
+                        false
+                    } else {
+                        let mut c =
+                            Call::new(id, space, name, space, Standing::Ringing, Some(s.clone()));
+                        c.group = true;
+                        *call = Some(c);
+                        true
+                    }
+                };
+                if fresh {
+                    remember(&d.rung_calls, id);
+                    d.bump();
+                    ring_out(d, id);
                 }
             }
             maybe_carry(d, id, space).await;
@@ -932,10 +1072,9 @@ async fn group_signal(
             if !groups(d).contains_key(&id) {
                 maybe_carry(d, id, space).await;
             }
-            let now = Instant::now();
-            let (added, went_live, linked) = {
+            let (added, answer, went_live, linked) = {
                 let mut gs = groups(d);
-                let Some(g) = gs.get_mut(&id) else {
+                let Some(g) = gs.get_mut(&id).filter(|g| g.space == space) else {
                     return Ok(());
                 };
                 let ps = s.peer_static();
@@ -951,6 +1090,16 @@ async fn group_signal(
                     g.linked += 1;
                     g.sessions.insert(ps, (s.clone(), g.linked));
                 }
+                // One it has a link with already may have lost its own end
+                // of it: answered again, but not more than now and then.
+                let lately = g
+                    .answered
+                    .get(&s.handshake_hash())
+                    .is_some_and(|t| now.duration_since(*t) < ANSWER_AGAIN);
+                let answer = added || !lately;
+                if answer {
+                    g.answered.insert(s.handshake_hash(), now);
+                }
                 if carrying {
                     // Its person has left, or was never on it.
                     if let Some(p) = s.peer_identity() {
@@ -961,13 +1110,13 @@ async fn group_signal(
                 if went_live {
                     g.waiting = false;
                 }
-                (added, went_live, g.linked)
+                (added, answer, went_live, g.linked)
             };
             if went_live {
                 live_now(d, &id);
             }
             // This person answered on another of their devices.
-            if !carrying && Some(them) == me {
+            if !carrying && own_device {
                 let ringing = lock(d)
                     .as_ref()
                     .is_some_and(|c| c.id == id && c.standing == Standing::Ringing);
@@ -977,13 +1126,16 @@ async fn group_signal(
             }
             if added {
                 carry_link(d, s, space, id, linked);
+            }
+            if answer {
                 // Said back, and if its person is on it, that it is there,
                 // so the other counts it at once.
                 let here = {
                     let mut gs = groups(d);
                     gs.get_mut(&id).map(|g| {
-                        let f = g.tree.own().map(|own| {
+                        let f = g.tree.own().filter(|_| added).map(|own| {
                             let f = mesh::frame(&d.keys.signing, &id, &own, g.next, &[]);
+                            g.tree.sent(g.next, now);
                             g.next = g.next.wrapping_add(1);
                             f
                         });
@@ -1015,34 +1167,73 @@ async fn group_signal(
             d.bump();
         }
         ONGOING => {
-            // This person is calling while the group has a call going on:
-            // they join that one, if it has people on it, or if both began
-            // at once and its id is the lower.
-            let busy = sig.flag == Some(1);
-            let old = {
-                let mut call = lock(d);
-                let Some(c) = call.as_mut().filter(|c| {
-                    c.group && c.space == space && c.standing == Standing::Calling && c.id != id
-                }) else {
-                    return Ok(());
-                };
-                if !busy && id > c.id {
-                    return Ok(());
-                }
-                let old = c.id;
-                c.id = id;
-                c.standing = Standing::Live;
-                c.live_since = Some(Instant::now());
-                old
+            // This person is calling while the group has a call with people
+            // on it going on: this device links to it, and once it hears
+            // someone on it other than the device that said so, joins it.
+            if sig.flag != Some(1) {
+                return Ok(());
+            }
+            let calling = lock(d).as_ref().is_some_and(|c| {
+                c.group && c.space == space && c.standing == Standing::Calling && c.id != id
+            });
+            let Some(sender) = s.peer_identity().map(|p| mesh::voice_of(&p.signing_key)) else {
+                return Ok(());
             };
-            leave(d, &old).await;
-            take_part(d, id, space, false);
-            d.bump();
-            relink(d, &id, &space, true).await;
+            if !calling {
+                return Ok(());
+            }
+            let confirmed = {
+                let mut gs = groups(d);
+                match gs.get_mut(&id) {
+                    Some(g) if g.tree.others_but(&sender, now) >= 1 => true,
+                    Some(g) => {
+                        if g.tree.own().is_none() {
+                            g.probe = Some((now + PROBE_FOR, sender));
+                        }
+                        false
+                    }
+                    None => {
+                        let mut g = new_group(space, None, false);
+                        g.probe = Some((now + PROBE_FOR, sender));
+                        let over = g.over.subscribe();
+                        gs.insert(id, g);
+                        tokio::spawn(drive(d.clone(), id, over));
+                        false
+                    }
+                }
+            };
+            if confirmed {
+                switch_to(d.clone(), id).await;
+            } else {
+                join(s, &space, &id, true).await?;
+            }
         }
         _ => {}
     }
     Ok(())
+}
+
+/// This person, calling with nobody else on their call yet, joins call
+/// `id` in the same group instead, which has someone on it.
+async fn switch_to(d: Arc<Daemon>, id: [u8; 16]) {
+    let (old, space) = {
+        let mut call = lock(&d);
+        let Some(c) = call
+            .as_mut()
+            .filter(|c| c.group && c.standing == Standing::Calling && c.id != id)
+        else {
+            return;
+        };
+        let old = c.id;
+        c.id = id;
+        c.standing = Standing::Live;
+        c.live_since = Some(Instant::now());
+        (old, c.space)
+    };
+    leave(&d, &old).await;
+    take_part(&d, id, space, false);
+    d.bump();
+    relink(&d, &id, &space, true).await;
 }
 
 /// This person's call, which waited, has someone else on it.
@@ -1152,37 +1343,48 @@ fn device_keys(d: &Daemon, space: &SpaceId) -> HashMap<Voice, [u8; 32]> {
 }
 
 /// One frame of a group call, come on the link `from`.
-fn passed(d: &Daemon, from: &Session, id: &[u8; 16], bytes: Bytes) {
+fn passed(d: &Arc<Daemon>, from: &Session, id: &[u8; 16], bytes: Bytes) {
     let Some(f) = Frame::parse(&bytes) else {
         return;
     };
     let (voice, n, here) = (f.voice, f.n, f.here());
-    let new = groups(d).get(id).is_some_and(|g| g.tree.is_new(&voice, n));
-    // Only a frame not seen here is worth checking. One that comes from the
-    // device whose voice it is needs no signature: the session says who it
-    // is.
-    let straight = from
-        .peer_identity()
-        .is_some_and(|p| mesh::voice_of(&p.signing_key) == voice);
-    let key = (new && !straight).then(|| key_of(d, id, &voice)).flatten();
-    let genuine = new && (straight || key.is_some_and(|k| mesh::signed_by(&f, id, &k)));
+    let ps = from.peer_static();
+    let now = Instant::now();
+    let new = {
+        let mut gs = groups(d);
+        let Some(g) = gs.get_mut(id) else { return };
+        // Past its share of frames a link's are dropped unread.
+        if !g.tree.admit(&ps, now) {
+            return;
+        }
+        g.tree.is_new(&voice, n)
+    };
+    // Only a frame not seen here is worth checking, and every one that is
+    // gets checked, even one straight from the device whose voice it is,
+    // since it is passed on to devices that will check it.
+    let key = new
+        .then(|| {
+            from.peer_identity()
+                .map(|p| p.signing_key)
+                .filter(|k| mesh::voice_of(k) == voice)
+                .or_else(|| key_of(d, id, &voice))
+        })
+        .flatten();
+    let genuine = key.is_some_and(|k| mesh::signed_by(&f, id, &k));
     // A device passes on only what it checked, so a frame that fails against
     // a key known here was made up by the device that sent it: that link is
     // let go. One whose key is not known here yet only goes nowhere.
     let forged = new && !genuine && key.is_some();
-    let now = Instant::now();
-    let (got, to, hear, went_live, label, routing) = {
+    let (got, to, hear, went_live, confirmed, label, routing) = {
         let mut gs = groups(d);
         let Some(g) = gs.get_mut(id) else { return };
         if forged {
             tracing::info!("a group call's link sent a frame it made up: letting it go");
-            g.tree.remove_link(&from.peer_static());
-            g.sessions.remove(&from.peer_static());
+            g.tree.remove_link(&ps);
+            g.sessions.remove(&ps);
             return;
         }
-        let got = g
-            .tree
-            .on_frame(&from.peer_static(), voice, n, here, genuine, now);
+        let got = g.tree.on_frame(&ps, voice, n, here, genuine, now);
         g.frames_in += 1;
         g.frames_new += u64::from(got.fresh);
         let to: Vec<Session> = got
@@ -1195,9 +1397,15 @@ fn passed(d: &Daemon, from: &Session, id: &[u8; 16], bytes: Bytes) {
         if went_live {
             g.waiting = false;
         }
+        // Someone other than the device that said this call was going on
+        // is on it: this person can join it.
+        let confirmed = got.fresh && g.probe.is_some_and(|(_, sender)| sender != voice);
+        if confirmed {
+            g.probe = None;
+        }
         let label = channel_label(&g.space, id);
         let routing = routing_label(&g.space, id);
-        (got, to, hear, went_live, label, routing)
+        (got, to, hear, went_live, confirmed, label, routing)
     };
     if got.prune {
         let _ = from.send_datagram(routing, Priority::RealTime, Word::Prune(voice).encode());
@@ -1213,16 +1421,29 @@ fn passed(d: &Daemon, from: &Session, id: &[u8; 16], bytes: Bytes) {
     if went_live {
         live_now(d, id);
     }
+    if confirmed {
+        tokio::spawn(switch_to(d.clone(), *id));
+    }
 }
 
-/// A routing word on the link `from`.
+/// A routing word on the link `from`. Only words about the voices of the
+/// group's devices count.
 fn said(d: &Daemon, from: &Session, id: &[u8; 16], bytes: &[u8]) {
     let Some(word) = Word::decode(bytes) else {
         return;
     };
+    for v in word.voices() {
+        let known = groups(d).get(id).is_some_and(|g| g.keys.contains_key(&v));
+        if !known {
+            key_of(d, id, &v);
+        }
+    }
     let (graft, routing) = {
         let mut gs = groups(d);
         let Some(g) = gs.get_mut(id) else { return };
+        let Some(word) = word.only(|v| g.keys.contains_key(v)) else {
+            return;
+        };
         let graft = g.tree.on_word(&from.peer_static(), word, Instant::now());
         (graft, routing_label(&g.space, id))
     };
@@ -1419,6 +1640,7 @@ fn send_audio(d: &Daemon, frame: Vec<u8>) {
         let Some(g) = gs.get_mut(&id) else { return };
         let Some(own) = g.tree.own() else { return };
         let out = Bytes::from(mesh::frame(&d.keys.signing, &id, &own, g.next, &frame));
+        g.tree.sent(g.next, Instant::now());
         g.next = g.next.wrapping_add(1);
         let to: Vec<Session> = g
             .tree

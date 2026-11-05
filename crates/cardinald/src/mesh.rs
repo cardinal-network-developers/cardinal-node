@@ -12,7 +12,7 @@
 //! twice over, and heals when a link goes, all from what each device sees
 //! itself (Plumtree, Leitão, Pereira and Rodrigues, SRDS 2007).
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
 /// Whose a frame is: `first8(BLAKE3(device signing key))`.
@@ -28,11 +28,9 @@ pub const KEEP: usize = 2;
 pub const MOST_VOICES: usize = 6;
 /// How long a voice counts as speaking after its last frame.
 pub const VOICE_FOR: Duration = Duration::from_millis(500);
-/// How many frames a device remembers, so that one coming round another way
-/// is dropped.
-pub const SEEN: usize = 4096;
-/// A frame this far behind the newest of its voice is old, whatever it says.
-pub const STALE: u32 = 500;
+/// How many of a voice's latest numbers a device remembers having seen.
+/// A frame further behind than this is old, whatever it says.
+pub const WINDOW: u32 = 512;
 /// How far behind a link's have a device may be before it asks for the
 /// voice on that link: ten frames, a fifth of a second of sound.
 pub const LAG: u32 = 10;
@@ -41,10 +39,18 @@ pub const LAG: u32 = 10;
 pub const SILENT_FOR: Duration = Duration::from_secs(12);
 /// How long a device counts as on the call after it was last heard.
 pub const ON_IT_FOR: Duration = Duration::from_secs(12);
+/// The most frames a link may send in a second: six voices at fifty a
+/// second, and room to spare. Past that they are dropped unread.
+pub const MOST_FRAMES: u32 = 500;
 /// A prune or graft for one voice on one link is sent at most this often.
 const ASK_EVERY: Duration = Duration::from_secs(1);
 /// A voice heard this lately is told of in haves.
 const HAVE_FOR: Duration = Duration::from_millis(500);
+/// A link a voice is taken from stops counting as one after this long
+/// without bringing it.
+const PARENT_FOR: Duration = Duration::from_secs(2);
+/// A device's presence is passed on at most this often.
+const HERE_AT_MOST: Duration = Duration::from_secs(1);
 
 /// The bytes before what a frame carries: voice, number, signature.
 pub const HEADER: usize = 8 + 4 + 64;
@@ -120,6 +126,21 @@ pub fn voice_of(key: &[u8; 32]) -> Voice {
     v
 }
 
+/// The number a device's first frame on a call has: the time in fiftieths
+/// of a second, so that one who leaves and comes back goes on from past
+/// where they were, and is not taken for an old frame.
+pub fn first_number() -> u32 {
+    let ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis());
+    (ms / 20) as u32
+}
+
+/// How far `n` is past `m`, counting round: negative when behind.
+fn ahead(n: u32, m: u32) -> i64 {
+    i64::from(n.wrapping_sub(m) as i32)
+}
+
 /// Words between two devices about a call's routing, as datagrams on the
 /// call's second channel: `kind (1) || body`.
 #[derive(Debug, PartialEq, Eq)]
@@ -171,6 +192,25 @@ impl Word {
             _ => None,
         }
     }
+
+    /// The voices it speaks of.
+    pub fn voices(&self) -> Vec<Voice> {
+        match self {
+            Word::Prune(v) | Word::Graft(v) => vec![*v],
+            Word::Have(list) => list.iter().map(|(v, _)| *v).collect(),
+        }
+    }
+
+    /// The same word, speaking only of the voices `keep` keeps.
+    pub fn only(self, keep: impl Fn(&Voice) -> bool) -> Option<Word> {
+        match self {
+            Word::Prune(v) | Word::Graft(v) if !keep(&v) => None,
+            Word::Have(list) => Some(Word::Have(
+                list.into_iter().filter(|(v, _)| keep(v)).collect(),
+            )),
+            w => Some(w),
+        }
+    }
 }
 
 struct Link {
@@ -182,6 +222,9 @@ struct Link {
     heard: Instant,
     /// Its device's person is on the call; otherwise it only carries it.
     person: bool,
+    /// Frames it sent in the second that began at `since`.
+    count: u32,
+    since: Instant,
 }
 
 /// A link a voice is taken from.
@@ -189,6 +232,69 @@ struct Link {
 struct Parent {
     /// When it last brought a frame first.
     first: Option<Instant>,
+    /// When it last brought one at all.
+    last: Instant,
+}
+
+/// Which of a voice's latest numbers have been seen: the newest, when it
+/// came, and a bit for each of the `WINDOW` before it.
+#[derive(Clone)]
+struct Seen {
+    newest: u32,
+    at: Instant,
+    bits: [u64; (WINDOW / 64) as usize],
+}
+
+impl Seen {
+    fn new(n: u32, at: Instant) -> Seen {
+        let mut s = Seen {
+            newest: n,
+            at,
+            bits: [0; (WINDOW / 64) as usize],
+        };
+        s.set(0);
+        s
+    }
+
+    fn set(&mut self, back: u32) {
+        self.bits[(back / 64) as usize] |= 1 << (back % 64);
+    }
+
+    fn has(&self, back: u32) -> bool {
+        self.bits[(back / 64) as usize] & (1 << (back % 64)) != 0
+    }
+
+    /// Whether `n` is neither seen nor old.
+    fn fresh(&self, n: u32) -> bool {
+        let d = ahead(n, self.newest);
+        d > 0 || (d > -i64::from(WINDOW) && !self.has((-d) as u32))
+    }
+
+    fn mark(&mut self, n: u32, at: Instant) {
+        let d = ahead(n, self.newest);
+        if d <= 0 {
+            if d > -i64::from(WINDOW) {
+                self.set((-d) as u32);
+            }
+            return;
+        }
+        // Moves the window on by `d`.
+        let shift = d.min(i64::from(WINDOW)) as u32;
+        let words = (shift / 64) as usize;
+        let bits = shift % 64;
+        let mut next = [0u64; (WINDOW / 64) as usize];
+        for (i, slot) in next.iter_mut().enumerate().skip(words) {
+            let from = i - words;
+            *slot = self.bits[from] << bits;
+            if bits > 0 && from > 0 {
+                *slot |= self.bits[from - 1] >> (64 - bits);
+            }
+        }
+        self.bits = next;
+        self.newest = n;
+        self.at = at;
+        self.set(0);
+    }
 }
 
 /// What came of a frame.
@@ -207,14 +313,14 @@ pub struct Tree {
     /// This device's voice, while its person is on the call.
     own: Option<Voice>,
     links: HashMap<LinkId, Link>,
-    seen: HashSet<(Voice, u32)>,
-    order: VecDeque<(Voice, u32)>,
-    /// The newest number of each voice, and when it came.
-    newest: HashMap<Voice, (u32, Instant)>,
+    /// What has been seen of each voice, its own included.
+    seen: HashMap<Voice, Seen>,
     /// When each voice began speaking, and was last heard speaking.
     speaking: HashMap<Voice, (Instant, Instant)>,
     /// When each voice was last heard at all.
     heard: HashMap<Voice, Instant>,
+    /// When each voice's presence was last passed on.
+    here_at: HashMap<Voice, Instant>,
     parents: HashMap<Voice, HashMap<LinkId, Parent>>,
 }
 
@@ -223,11 +329,10 @@ impl Tree {
         Tree {
             own,
             links: HashMap::new(),
-            seen: HashSet::new(),
-            order: VecDeque::new(),
-            newest: HashMap::new(),
+            seen: HashMap::new(),
             speaking: HashMap::new(),
             heard: HashMap::new(),
+            here_at: HashMap::new(),
             parents: HashMap::new(),
         }
     }
@@ -255,6 +360,8 @@ impl Tree {
                 asked: HashMap::new(),
                 heard: now,
                 person,
+                count: 0,
+                since: now,
             },
         );
         true
@@ -280,21 +387,43 @@ impl Tree {
         self.links.values().any(|l| l.person)
     }
 
-    /// Forgets a voice, whose device left the call.
+    /// Forgets a voice, whose device left the call. What was seen of it is
+    /// kept, so its old frames stay old.
     pub fn forget(&mut self, voice: &Voice) {
         self.heard.remove(voice);
         self.speaking.remove(voice);
     }
 
+    /// Whether `link` may send another frame now; counts it.
+    pub fn admit(&mut self, link: &LinkId, now: Instant) -> bool {
+        let Some(l) = self.links.get_mut(link) else {
+            return false;
+        };
+        if now.duration_since(l.since) >= Duration::from_secs(1) {
+            l.since = now;
+            l.count = 0;
+        }
+        l.count += 1;
+        l.count <= MOST_FRAMES
+    }
+
     /// Whether this frame has not been seen here: only such a frame is worth
     /// checking the signature of.
     pub fn is_new(&self, voice: &Voice, n: u32) -> bool {
-        Some(*voice) != self.own
-            && !self.seen.contains(&(*voice, n))
-            && self
-                .newest
-                .get(voice)
-                .is_none_or(|(newest, _)| n.saturating_add(STALE) >= *newest)
+        Some(*voice) != self.own && self.seen.get(voice).is_none_or(|s| s.fresh(n))
+    }
+
+    /// This device sent frame `n` of its own voice: told in haves, so a link
+    /// that pruned it can ask for it back.
+    pub fn sent(&mut self, n: u32, now: Instant) {
+        if let Some(own) = self.own {
+            match self.seen.get_mut(&own) {
+                Some(s) => s.mark(n, now),
+                None => {
+                    self.seen.insert(own, Seen::new(n, now));
+                }
+            }
+        }
     }
 
     /// A frame came on link `from`. `genuine` says whether its signature
@@ -312,10 +441,6 @@ impl Tree {
             return Got::default();
         };
         link.heard = now;
-        let fresh = self.is_new(&voice, n);
-        if fresh && !genuine {
-            return Got::default();
-        }
         if Some(voice) == self.own {
             // Its own voice, come round: that link need not send it.
             return Got {
@@ -323,25 +448,33 @@ impl Tree {
                 ..Got::default()
             };
         }
+        let fresh = self.is_new(&voice, n);
+        if fresh && !genuine {
+            return Got::default();
+        }
         if fresh {
-            self.seen.insert((voice, n));
-            self.order.push_back((voice, n));
-            if self.order.len() > SEEN {
-                if let Some(old) = self.order.pop_front() {
-                    self.seen.remove(&old);
+            match self.seen.get_mut(&voice) {
+                Some(s) => s.mark(n, now),
+                None => {
+                    self.seen.insert(voice, Seen::new(n, now));
                 }
-            }
-            let e = self.newest.entry(voice).or_insert((n, now));
-            if n >= e.0 {
-                *e = (n, now);
             }
             self.heard.insert(voice, now);
         }
-        // Presence goes everywhere, and settles nothing.
+        // Presence goes everywhere, at most once a second for each voice,
+        // and settles nothing.
         if here {
-            if !fresh {
-                return Got::default();
+            let lately = self
+                .here_at
+                .get(&voice)
+                .is_some_and(|t| now.duration_since(*t) < HERE_AT_MOST);
+            if !fresh || lately {
+                return Got {
+                    fresh,
+                    ..Got::default()
+                };
             }
+            self.here_at.insert(voice, now);
             let forward = self.links.keys().filter(|l| *l != from).copied().collect();
             return Got {
                 fresh,
@@ -375,7 +508,11 @@ impl Tree {
     fn choose(&mut self, from: &LinkId, voice: Voice, fresh: bool, now: Instant) -> bool {
         let first = fresh.then_some(now);
         let parents = self.parents.entry(voice).or_default();
+        // One that has brought nothing lately is one no more: its place is
+        // free for whichever brings the voice now.
+        parents.retain(|_, p| now.duration_since(p.last) < PARENT_FOR);
         if let Some(p) = parents.get_mut(from) {
+            p.last = now;
             if first.is_some() {
                 p.first = first;
             }
@@ -394,7 +531,7 @@ impl Tree {
             return false;
         }
         if parents.len() < KEEP {
-            parents.insert(*from, Parent { first });
+            parents.insert(*from, Parent { first, last: now });
             return false;
         }
         if fresh {
@@ -407,7 +544,7 @@ impl Tree {
             {
                 parents.remove(&slowest);
             }
-            parents.insert(*from, Parent { first });
+            parents.insert(*from, Parent { first, last: now });
             return false;
         }
         self.may_ask(from, voice, now)
@@ -440,7 +577,8 @@ impl Tree {
     }
 
     /// A word came on link `from`. What to say back: grafts, for voices it
-    /// has further than this device does.
+    /// has further than this device does. The caller keeps only words about
+    /// voices of the call's devices.
     pub fn on_word(&mut self, from: &LinkId, word: Word, now: Instant) -> Vec<Voice> {
         let Some(link) = self.links.get_mut(from) else {
             return Vec::new();
@@ -462,14 +600,17 @@ impl Tree {
                         continue;
                     }
                     let behind = self
-                        .newest
+                        .seen
                         .get(&v)
-                        .is_none_or(|(mine, _)| n > mine.saturating_add(LAG));
+                        .is_none_or(|s| ahead(n, s.newest) > i64::from(LAG));
                     if behind && self.may_ask(from, v, now) {
-                        self.parents
-                            .entry(v)
-                            .or_default()
-                            .insert(*from, Parent { first: None });
+                        self.parents.entry(v).or_default().insert(
+                            *from,
+                            Parent {
+                                first: None,
+                                last: now,
+                            },
+                        );
                         graft.push(v);
                     }
                 }
@@ -489,16 +630,16 @@ impl Tree {
             .collect()
     }
 
-    /// The haves to send: to each link, the voices heard lately that it
-    /// asked not to be sent. With `keepalive`, an empty one to every link
-    /// with nothing else, so that a link with nothing to carry is not taken
-    /// for gone.
+    /// The haves to send: to each link, the voices heard lately, its own
+    /// among them, that it asked not to be sent. With `keepalive`, an empty
+    /// one to every link with nothing else, so that a link with nothing to
+    /// carry is not taken for gone.
     pub fn haves(&self, keepalive: bool, now: Instant) -> Vec<(LinkId, Word)> {
         let lately: Vec<(Voice, u32)> = self
-            .newest
+            .seen
             .iter()
-            .filter(|(_, (_, t))| now.duration_since(*t) < HAVE_FOR)
-            .map(|(v, (n, _))| (*v, *n))
+            .filter(|(_, s)| now.duration_since(s.at) < HAVE_FOR)
+            .map(|(v, s)| (*v, s.newest))
             .collect();
         let mut out = Vec::new();
         for (id, l) in &self.links {
@@ -523,15 +664,28 @@ impl Tree {
             .collect()
     }
 
-    /// How many are on the call, as far as this device can tell: every
-    /// voice heard lately, and its own person if on it.
-    pub fn on_it(&self, now: Instant) -> usize {
-        let others = self
-            .heard
+    /// How many others are on the call, as far as this device can tell:
+    /// every voice but its own heard lately.
+    pub fn others(&self, now: Instant) -> usize {
+        self.heard
             .iter()
             .filter(|(v, t)| Some(**v) != self.own && now.duration_since(**t) < ON_IT_FOR)
-            .count();
-        others + usize::from(self.own.is_some())
+            .count()
+    }
+
+    /// How many others than `voice` are on the call.
+    pub fn others_but(&self, voice: &Voice, now: Instant) -> usize {
+        self.heard
+            .iter()
+            .filter(|(v, t)| {
+                *v != voice && Some(**v) != self.own && now.duration_since(**t) < ON_IT_FOR
+            })
+            .count()
+    }
+
+    /// How many are on the call: the others, and its own person if on it.
+    pub fn on_it(&self, now: Instant) -> usize {
+        self.others(now) + usize::from(self.own.is_some())
     }
 
     /// When anything new last came, of any voice.
@@ -569,8 +723,50 @@ mod tests {
         let again = t.on_frame(&link(2), v, 5, false, true, now);
         assert!(!again.fresh && again.forward.is_empty(), "{again:?}");
         // Long behind the newest of its voice, it is old whatever it says.
-        t.on_frame(&link(1), v, 5 + STALE + 2, false, true, now);
-        assert!(!t.is_new(&v, 1));
+        t.on_frame(&link(1), v, 5 + WINDOW + 2, false, true, now);
+        assert!(!t.is_new(&v, 4));
+        assert!(t.is_new(&v, 5 + WINDOW));
+    }
+
+    /// However many frames of other voices go by, a voice's own recent
+    /// frames stay seen, so none of them can be played again.
+    #[test]
+    fn a_voice_cannot_be_replayed_by_flooding_others() {
+        let (mut t, now) = tree(&[1]);
+        let v = [7; 8];
+        for n in 100..140 {
+            t.on_frame(&link(1), v, n, false, true, now);
+        }
+        for n in 0..10_000 {
+            t.seen
+                .entry([9; 8])
+                .or_insert_with(|| Seen::new(0, now))
+                .mark(n, now);
+        }
+        for n in 100..140 {
+            assert!(!t.is_new(&v, n), "{n}");
+        }
+        // Out of order within the window is still new, once.
+        assert!(t.is_new(&v, 99));
+        t.on_frame(&link(1), v, 99, false, true, now);
+        assert!(!t.is_new(&v, 99));
+    }
+
+    #[test]
+    fn numbers_count_round() {
+        let now = Instant::now();
+        let mut s = Seen::new(u32::MAX - 1, now);
+        assert!(s.fresh(u32::MAX));
+        assert!(s.fresh(3), "past the top it starts again");
+        s.mark(3, now);
+        assert!(!s.fresh(3));
+        assert!(s.fresh(u32::MAX), "just behind, not seen");
+        assert!(!s.fresh(u32::MAX - 1));
+        assert!(!s.fresh(3u32.wrapping_sub(WINDOW)), "too far behind");
+        // A long jump forgets what it passed.
+        s.mark(3 + 5 * WINDOW, now);
+        assert!(!s.fresh(3));
+        assert!(s.fresh(3 + 5 * WINDOW - 1));
     }
 
     #[test]
@@ -614,8 +810,6 @@ mod tests {
             // Asked once, not with every frame.
             assert_eq!(third.prune, n == 0, "frame {n}");
         }
-        // Told, link 3 sends it no more; this device does not send it there
-        // either once 3 asks.
         t.on_word(&link(3), Word::Prune(v), now);
         let mut to = t.on_frame(&link(1), v, 10, false, true, now).forward;
         to.sort();
@@ -631,10 +825,23 @@ mod tests {
         t.on_frame(&link(1), v, 0, false, true, now);
         t.on_frame(&link(2), v, 0, false, true, now);
         let later = now + Duration::from_millis(20);
-        // Link 3 now brings frame 1 first, then 1 brings it, then 2.
         assert!(t.on_frame(&link(3), v, 1, false, true, later).fresh);
         assert!(!t.on_frame(&link(1), v, 1, false, true, later).prune);
         assert!(t.on_frame(&link(2), v, 1, false, true, later).prune);
+    }
+
+    /// A link that stopped bringing a voice is a parent no more, so one that
+    /// brings it now is kept, not told to stop.
+    #[test]
+    fn a_parent_that_went_quiet_gives_up_its_place() {
+        let (mut t, now) = tree(&[1, 2, 3]);
+        let v = [7; 8];
+        t.on_frame(&link(1), v, 0, false, true, now);
+        t.on_frame(&link(2), v, 0, false, true, now);
+        // Link 2 brings nothing more; 3 brings copies of what 1 brings.
+        let later = now + PARENT_FOR + Duration::from_millis(10);
+        t.on_frame(&link(1), v, 1, false, true, later);
+        assert!(!t.on_frame(&link(3), v, 1, false, true, later).prune);
     }
 
     /// Losing a link loses nothing, and a have from a link that was pruned
@@ -648,7 +855,6 @@ mod tests {
             t.on_frame(&link(2), v, n, false, true, now);
             t.on_frame(&link(3), v, n, false, true, now);
         }
-        // Close behind: nothing to do.
         assert!(t
             .on_word(&link(3), Word::Have(vec![(v, 4 + LAG)]), now)
             .is_empty());
@@ -659,15 +865,26 @@ mod tests {
             t.on_word(&link(3), Word::Have(vec![(v, 30)]), later),
             vec![v]
         );
-        // Asked once a second at most.
         assert!(t
             .on_word(&link(3), Word::Have(vec![(v, 31)]), later)
             .is_empty());
-        // A voice never heard here is asked for too.
         let w = [8; 8];
         assert_eq!(
             t.on_word(&link(1), Word::Have(vec![(w, 3)]), later),
             vec![w]
+        );
+    }
+
+    /// A device tells a link that pruned its own voice how far it is, so
+    /// that link can ask for it back if its other paths go.
+    #[test]
+    fn a_device_tells_of_its_own_voice_where_it_was_pruned() {
+        let (mut t, now) = tree(&[1, 2]);
+        t.on_word(&link(2), Word::Prune([0; 8]), now);
+        t.sent(77, now);
+        assert_eq!(
+            t.haves(false, now),
+            vec![(link(2), Word::Have(vec![([0; 8], 77)]))]
         );
     }
 
@@ -682,18 +899,31 @@ mod tests {
     }
 
     #[test]
-    fn presence_goes_everywhere_and_counts_who_is_on() {
+    fn presence_goes_everywhere_once_a_second_and_counts_who_is_on() {
         let (mut t, now) = tree(&[1, 2, 3]);
         t.on_word(&link(2), Word::Prune([7; 8]), now);
         let got = t.on_frame(&link(1), [7; 8], 1, true, true, now);
         let mut to = got.forward;
         to.sort();
         assert_eq!(to, vec![link(2), link(3)]);
+        // More of it within the second is heard, and goes no further.
+        let soon = t.on_frame(&link(1), [7; 8], 2, true, true, now);
+        assert!(soon.fresh && soon.forward.is_empty());
         t.on_frame(&link(2), [8; 8], 1, true, true, now);
         assert_eq!(t.on_it(now), 3);
         t.forget(&[8; 8]);
         assert_eq!(t.on_it(now), 2);
         assert_eq!(t.on_it(now + ON_IT_FOR), 1);
+    }
+
+    #[test]
+    fn a_link_may_send_only_so_many_frames_a_second() {
+        let (mut t, now) = tree(&[1]);
+        let sent = (0..MOST_FRAMES + 50)
+            .filter(|_| t.admit(&link(1), now))
+            .count();
+        assert_eq!(sent as u32, MOST_FRAMES);
+        assert!(t.admit(&link(1), now + Duration::from_secs(1)));
     }
 
     #[test]
@@ -721,7 +951,7 @@ mod tests {
     }
 
     #[test]
-    fn words_read_back_whole() {
+    fn words_read_back_whole_and_keep_only_known_voices() {
         for w in [
             Word::Prune([1; 8]),
             Word::Graft([2; 8]),
@@ -732,6 +962,12 @@ mod tests {
         }
         assert_eq!(Word::decode(&[1, 2, 3]), None);
         assert_eq!(Word::decode(&[]), None);
+        let known = |v: &Voice| *v == [3; 8];
+        assert_eq!(Word::Prune([1; 8]).only(known), None);
+        assert_eq!(
+            Word::Have(vec![([3; 8], 9), ([4; 8], 1)]).only(known),
+            Some(Word::Have(vec![([3; 8], 9)]))
+        );
     }
 
     /// However many speak at once, only the first few voices go on, until
@@ -765,7 +1001,6 @@ mod tests {
             "{going:?}"
         );
         assert!(going[0] && !going[7], "{going:?}");
-        // The first falls silent, and the next who speaks goes on.
         let later = at + VOICE_FOR + Duration::from_millis(50);
         for v in &voices[1..] {
             t.on_frame(&link(1), *v, 2, false, true, later);
