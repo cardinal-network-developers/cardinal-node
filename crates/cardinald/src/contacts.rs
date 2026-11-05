@@ -62,6 +62,20 @@ pub fn invite(
     name: Option<&str>,
     regard: Regard,
 ) -> anyhow::Result<Json> {
+    let invitation = invite_for(d, address, name, regard, None, None)?;
+    Ok(json!({"code": invitation.to_text()}))
+}
+
+/// Makes an invitation, for one identity alone if `for_identity` is given,
+/// and noting how whoever uses it will have met this person.
+pub(crate) fn invite_for(
+    d: &Arc<Daemon>,
+    address: Option<&str>,
+    name: Option<&str>,
+    regard: Regard,
+    for_identity: Option<[u8; 32]>,
+    met: Option<&account::Met>,
+) -> anyhow::Result<Invitation> {
     let me = identity(d)?;
     let here = *d.keys.link.public_key().x25519();
     let port = d
@@ -79,9 +93,12 @@ pub fn invite(
         None => match own_host(d) {
             Some(host) => host,
             None => {
-                let ip = crate::daemon::local_ips()
-                    .into_iter()
-                    .next()
+                // A device that listens on one address gives that one.
+                let bound = d.endpoint.udp_addr().or(d.endpoint.tcp_addr());
+                let ip = bound
+                    .map(|a| a.ip())
+                    .filter(|ip| !ip.is_unspecified())
+                    .or_else(|| crate::daemon::local_ips().into_iter().next())
                     .ok_or_else(|| anyhow::anyhow!("this device has no address to give"))?;
                 (here, SocketAddr::new(ip, port))
             }
@@ -90,14 +107,15 @@ pub fn invite(
     let endpoint = EndpointAddr::new(CarrierKind::Udp, addr);
     let mut invitation = Invitation::new(me, responder, endpoint);
     invitation.name = name.map(str::to_owned);
+    invitation.for_identity = for_identity;
     let account = d
         .core()
         .account_id()
         .ok_or_else(|| anyhow::anyhow!("the account space is not here yet"))?;
-    let op = account::create_invitation(invitation.to_record(), regard);
+    let op = account::create_invitation_met(invitation.to_record(), regard, met);
     d.write_and_push(&account, vec![op])?;
     admit_invitations(d);
-    Ok(json!({"code": invitation.to_text()}))
+    Ok(invitation)
 }
 
 /// This person's host, by static key, at an address that is not a name.
@@ -270,6 +288,20 @@ fn take_a_use<'a>(d: &'a Daemon, s: &Session) -> Option<Using<'a>> {
     Some(Using { d, secret: id })
 }
 
+/// The invitation of this person's that let `s` in.
+fn invitation_of_session(d: &Daemon, s: &Session) -> Option<Invitation> {
+    let cardinal_link::Admission::Secret { id, .. } = s.admission() else {
+        return None;
+    };
+    let admitted = d.admitted_invitations();
+    let secret = admitted.iter().find(|(_, i)| **i == id).map(|(s, _)| *s)?;
+    drop(admitted);
+    made(d)
+        .into_iter()
+        .map(|m| m.invitation)
+        .find(|i| i.secret == secret)
+}
+
 /// Records that `who` used the invitation that let `s` in, so that every
 /// device of this person counts it.
 fn invitation_used(d: &Arc<Daemon>, s: &Session, who: &[u8; 32]) -> anyhow::Result<()> {
@@ -311,6 +343,7 @@ pub async fn accept(
     code: &str,
     name: Option<&str>,
     regard: Regard,
+    met: account::Met,
 ) -> anyhow::Result<Json> {
     let invitation = Invitation::from_text(code.trim())
         .map_err(|_| anyhow::anyhow!("that is not an invitation"))?;
@@ -337,7 +370,7 @@ pub async fn accept(
         .map(str::to_owned)
         .or(invitation.name.clone())
         .unwrap_or_else(|| account::short_key(&invitation.inviter));
-    let exchange = accept_exchange(d, &s, me, &invitation, &petname, regard);
+    let exchange = accept_exchange(d, &s, me, &invitation, &petname, regard, &met);
     let done = tokio::time::timeout(EXCHANGE_WITHIN, exchange)
         .await
         .map_err(|_| anyhow::anyhow!("they stopped answering"))
@@ -356,6 +389,7 @@ async fn accept_exchange(
     invitation: &Invitation,
     petname: &str,
     regard: Regard,
+    met: &account::Met,
 ) -> anyhow::Result<()> {
     let proven = s.peer_identity().map(|p| p.identity);
     anyhow::ensure!(
@@ -383,7 +417,7 @@ async fn accept_exchange(
     d.invited_to(s, space);
     mailbox::write_reach(d, &space).await?;
     net::reconcile(d, s, space).await?;
-    record_contact(d, &invitation.inviter, petname, &space, regard)?;
+    record_contact(d, &invitation.inviter, petname, &space, regard, Some(met))?;
     mailbox::met(d, &space, &invitation.inviter);
     send(&mut st, &ContactMessage::Done).await?;
     st.shutdown().await?;
@@ -448,6 +482,12 @@ pub async fn serve(d: &Arc<Daemon>, s: &Session, mut st: Stream) -> anyhow::Resu
         return Ok(());
     };
     anyhow::ensure!(identity == them, "not who the session says");
+    // One made for someone, as an introduction's is, is theirs alone.
+    let bound = invitation_of_session(d, s).and_then(|i| i.for_identity);
+    if bound.is_some_and(|f| f != them) {
+        s.abandon();
+        return Ok(());
+    }
     let label = identity_log_label(&them);
     net::reconcile_as(d, s, label, Access::Other(them)).await?;
     if !proven_by_log(d, s, &them) {
@@ -461,10 +501,15 @@ pub async fn serve(d: &Arc<Daemon>, s: &Session, mut st: Stream) -> anyhow::Resu
     let done = tokio::time::timeout(EXCHANGE_WITHIN, receive(&mut st)).await;
     if matches!(done, Ok(Ok(Some(ContactMessage::Done)))) {
         net::reconcile(d, s, space).await?;
-        record_contact(d, &them, &name, &space, regard)?;
+        let met = met_by_invitation(d, s).unwrap_or(account::Met {
+            how: account::MET_MY_INVITATION,
+            ..Default::default()
+        });
+        // The use first: whoever sees them listed sees it used.
         if let Err(e) = invitation_used(d, s, &them) {
             tracing::debug!("counting an invitation's use: {e:#}");
         }
+        record_contact(d, &them, &name, &space, regard, Some(&met))?;
         // The account counts it now.
         drop(using);
         mailbox::met(d, &space, &them);
@@ -490,18 +535,32 @@ fn is_refused(d: &Daemon, who: &[u8; 32]) -> bool {
     contacts.iter().any(|c| c.identity == *who && c.refused)
 }
 
+/// How whoever used the invitation that let `s` in met this person, if the
+/// invitation says: one made for an introduction does.
+fn met_by_invitation(d: &Daemon, s: &Session) -> Option<account::Met> {
+    let inv = invitation_of_session(d, s)?;
+    let core = d.core();
+    let space = core.account().and_then(|a| a.space.as_ref())?;
+    let made = account::invitations(space.state());
+    let found = made
+        .into_iter()
+        .find(|i| Invitation::from_record(&i.invitation).is_ok_and(|x| x.secret == inv.secret));
+    found?.met
+}
+
 fn record_contact(
     d: &Arc<Daemon>,
     who: &[u8; 32],
     petname: &str,
     space: &SpaceId,
     regard: Regard,
+    met: Option<&account::Met>,
 ) -> anyhow::Result<()> {
     let account = d
         .core()
         .account_id()
         .ok_or_else(|| anyhow::anyhow!("the account space is not here yet"))?;
-    let op = account::create_contact(who, petname, space, regard);
+    let op = account::create_contact_met(who, petname, space, regard, met);
     d.write_and_push(&account, vec![op])?;
     // Just met: they will want to talk.
     d.rendezvous.use_contact(who);
@@ -591,13 +650,24 @@ async fn receive(st: &mut Stream) -> anyhow::Result<Option<ContactMessage>> {
 pub fn list(d: &Daemon, all: bool) -> Json {
     let connected = d.connected_people();
     let relayed = d.relayed_people();
-    let contacts: Vec<Json> = d
-        .core()
-        .contacts()
+    let everyone = d.core().contacts();
+    let group_names: Vec<(SpaceId, String)> = {
+        let core = d.core();
+        let spaces = core.spaces.iter();
+        spaces
+            .filter_map(|(id, h)| {
+                let sp = h.space.as_ref()?;
+                (sp.profile() == cardinal_space::group::GROUP)
+                    .then(|| (*id, cardinal_space::group::name(sp)))
+            })
+            .collect()
+    };
+    let contacts: Vec<Json> = everyone
         .iter()
         .filter(|c| all || !c.refused)
         .map(|c| {
             json!({
+                "met": c.met.as_ref().map(|m| met_json(m, &everyone, &group_names)),
                 "name": c.petname,
                 "identity": hex::encode(&c.identity[..8]),
                 "trusted": c.regard.trusted,
@@ -610,6 +680,27 @@ pub fn list(d: &Daemon, all: bool) -> Json {
         })
         .collect();
     json!({"contacts": contacts})
+}
+
+/// How two people met, as a window shows it.
+fn met_json(m: &account::Met, contacts: &[ContactRecord], groups: &[(SpaceId, String)]) -> Json {
+    let how = match m.how {
+        account::MET_THEIR_INVITATION => "their invitation",
+        account::MET_MY_INVITATION => "your invitation",
+        account::MET_INTRODUCED => "introduced",
+        _ => "their front door",
+    };
+    let by = m.introducer.map(|i| {
+        let c = contacts.iter().find(|c| c.identity == i);
+        c.map_or_else(|| account::short_key(&i), |c| c.petname.clone())
+    });
+    let group = m.group.and_then(|g| {
+        groups
+            .iter()
+            .find(|(id, _)| *id == g)
+            .map(|(_, n)| n.clone())
+    });
+    json!({"how": how, "by": by, "group": group, "via": m.via})
 }
 
 /// The contact called `who`.
@@ -1222,6 +1313,7 @@ mod tests {
             Invitation::new([1; 32], [2; 32], EndpointAddr::new(CarrierKind::Udp, addr));
         Made {
             record: account::InvitationRecord {
+                met: None,
                 node: [3; 16],
                 entry: [4; 32],
                 invitation: invitation.to_record(),

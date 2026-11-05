@@ -24,6 +24,96 @@ pub const READ_MARKER: u64 = 4;
 pub const REACTION: u64 = 3;
 /// Reach kind.
 pub const REACH: u64 = 9;
+/// Introduction kind (`contact.md#introductions`).
+pub const INTRODUCTION: u64 = 8;
+
+/// `create` of an introduction: `introducer` would like the other member of
+/// this space to meet `introduced`, by the name `name`. Made by the
+/// introducer; or, with `introducer` another, a request that they make one,
+/// by someone who would like to meet `introduced` (`profiles.md#group`).
+pub fn create_introduction(
+    introducer: &IdentityId,
+    introduced: &IdentityId,
+    name: &str,
+    note: Option<&str>,
+    group: Option<&crate::entry::SpaceId>,
+    invitation: Option<Record>,
+) -> SpaceOp {
+    SpaceOp::create(
+        NodeKind::Uint(INTRODUCTION),
+        ROOT,
+        "introduction",
+        Record::new()
+            .with(1, *introducer)
+            .with(2, *introduced)
+            .with(3, name)
+            .with_opt(4, note)
+            .with_opt(5, invitation.map(Value::Record))
+            .with_opt(6, group.copied()),
+    )
+}
+
+/// An introduction, as a relationship space holds it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Introduction {
+    /// Its node.
+    pub node: NodeId,
+    /// Who made the node.
+    pub creator: IdentityId,
+    /// Who introduces.
+    pub introducer: IdentityId,
+    /// Who is introduced.
+    pub introduced: IdentityId,
+    /// The name suggested for them.
+    pub name: String,
+    /// What the introducer says.
+    pub note: Option<String>,
+    /// The invitation, once the other side said yes.
+    pub invitation: Option<Record>,
+    /// The group it comes through.
+    pub group: Option<crate::entry::SpaceId>,
+    /// The member it was for said no.
+    pub declined: bool,
+}
+
+/// The introductions in a relationship space.
+pub fn introductions(state: &State) -> Vec<Introduction> {
+    let nodes = state.children(&ROOT).into_iter();
+    nodes
+        .filter(|n| n.kind == NodeKind::Uint(INTRODUCTION) && !n.deleted)
+        .filter_map(|n| {
+            let field = |k| n.values(k).iter().rev().find_map(|v| v.value.as_ref());
+            let id = |k| -> Option<IdentityId> { field(k)?.as_bytes()?.try_into().ok() };
+            Some(Introduction {
+                node: n.id,
+                creator: n.creator,
+                introducer: id(1)?,
+                introduced: id(2)?,
+                name: field(3).and_then(Value::as_text).unwrap_or("").to_owned(),
+                note: field(4).and_then(Value::as_text).map(str::to_owned),
+                invitation: field(5).and_then(Value::as_record).cloned(),
+                group: field(6)
+                    .and_then(Value::as_bytes)
+                    .and_then(|b| b.try_into().ok()),
+                declined: field(7).and_then(Value::as_bool).unwrap_or(false),
+            })
+        })
+        .collect()
+}
+
+/// Puts the invitation in an introduction, with the name to suggest.
+pub fn answer_introduction(node: NodeId, invitation: Record, name: Option<&str>) -> Vec<SpaceOp> {
+    let mut ops = vec![SpaceOp::set(node, 5, Some(Value::Record(invitation)))];
+    if let Some(n) = name {
+        ops.push(SpaceOp::set(node, 3, Some(Value::from(n))));
+    }
+    ops
+}
+
+/// Says no to an introduction.
+pub fn decline_introduction(node: NodeId) -> SpaceOp {
+    SpaceOp::set(node, 7, Some(Value::from(true)))
+}
 
 /// One of a member's hosts, and how anyone else uses it
 /// (`profiles.md#reach`).

@@ -39,6 +39,8 @@ pub const TRUSTED: u64 = 7;
 pub const REFUSED: u64 = 8;
 /// A contact's field: where the relationship is listed.
 pub const CATEGORY: u64 = 9;
+/// Contact field: how the two met.
+pub const MET: u64 = 10;
 /// Where a relationship is listed when nothing else is said.
 pub const PEOPLE: &str = "People";
 
@@ -110,6 +112,17 @@ pub fn create_contact(
     space: &SpaceId,
     regard: Regard,
 ) -> SpaceOp {
+    create_contact_met(identity, petname, space, regard, None)
+}
+
+/// `create` of a contact node, with how the two met.
+pub fn create_contact_met(
+    identity: &IdentityId,
+    petname: &str,
+    space: &SpaceId,
+    regard: Regard,
+    met: Option<&Met>,
+) -> SpaceOp {
     SpaceOp::create(
         NodeKind::Uint(CONTACT),
         ROOT,
@@ -119,8 +132,56 @@ pub fn create_contact(
             .with(2, petname)
             .with(3, *space)
             .with(INTRODUCTIONS, regard.introductions)
-            .with(TRUSTED, regard.trusted),
+            .with(TRUSTED, regard.trusted)
+            .with_opt(MET, met.map(|m| Value::Record(m.to_record()))),
     )
+}
+
+/// How two people met (`profiles.md#account`): kept so that if an
+/// introducer or a channel proves unreliable, everyone who came through it
+/// can be found.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Met {
+    /// 1 their invitation, 2 this person's, 3 an introduction, 4 their front door.
+    pub how: u64,
+    /// Who introduced them.
+    pub introducer: Option<IdentityId>,
+    /// The group an introduction came through.
+    pub group: Option<SpaceId>,
+    /// How an invitation travelled, as software says: a QR code, pasted.
+    pub via: Option<String>,
+}
+
+/// They gave this person an invitation, which this person used.
+pub const MET_THEIR_INVITATION: u64 = 1;
+/// This person gave them an invitation.
+pub const MET_MY_INVITATION: u64 = 2;
+/// Someone introduced them.
+pub const MET_INTRODUCED: u64 = 3;
+
+impl Met {
+    fn to_record(&self) -> Record {
+        Record::new()
+            .with(1, self.how)
+            .with_opt(2, self.introducer)
+            .with_opt(3, self.group)
+            .with_opt(4, self.via.as_deref())
+    }
+
+    fn from_record(r: &Record) -> Option<Met> {
+        Some(Met {
+            how: r.get(1)?.as_uint()?,
+            introducer: r
+                .get(2)
+                .and_then(Value::as_bytes)
+                .and_then(|b| b.try_into().ok()),
+            group: r
+                .get(3)
+                .and_then(Value::as_bytes)
+                .and_then(|b| b.try_into().ok()),
+            via: r.get(4).and_then(Value::as_text).map(str::to_owned),
+        })
+    }
 }
 
 /// `create` of a host node: one that keeps `grant` (`hosts.md#grants`).
@@ -243,6 +304,12 @@ fn last(n: &crate::state::Node, key: u64) -> Option<&Value> {
 /// `create` of an invitation node: the invitation record, and how its person
 /// will regard whoever uses it, in the fields a contact keeps that in.
 pub fn create_invitation(invitation: Record, regard: Regard) -> SpaceOp {
+    create_invitation_met(invitation, regard, None)
+}
+
+/// `create` of an invitation node that says how whoever uses it will have
+/// met this person: through an introduction, for one made for that.
+pub fn create_invitation_met(invitation: Record, regard: Regard, met: Option<&Met>) -> SpaceOp {
     SpaceOp::create(
         NodeKind::Uint(INVITATION),
         ROOT,
@@ -250,7 +317,8 @@ pub fn create_invitation(invitation: Record, regard: Regard) -> SpaceOp {
         Record::new()
             .with(1, Value::Record(invitation))
             .with(INTRODUCTIONS, regard.introductions)
-            .with(TRUSTED, regard.trusted),
+            .with(TRUSTED, regard.trusted)
+            .with_opt(MET, met.map(|m| Value::Record(m.to_record()))),
     )
 }
 
@@ -272,6 +340,8 @@ pub fn create_invitation_use(invitation: NodeId, who: &IdentityId) -> SpaceOp {
 /// An invitation this person made.
 #[derive(Clone, Debug)]
 pub struct InvitationRecord {
+    /// How whoever uses it will have met this person, if not by invitation.
+    pub met: Option<Met>,
     /// The invitation node.
     pub node: NodeId,
     /// The entry that made it.
@@ -306,6 +376,9 @@ pub fn invitations(state: &State) -> Vec<InvitationRecord> {
             },
             cancelled: flag(CANCELLED).unwrap_or(false),
             used,
+            met: last(n, MET)
+                .and_then(Value::as_record)
+                .and_then(Met::from_record),
         })
     })
     .collect()
@@ -328,6 +401,8 @@ pub struct ContactRecord {
     pub refused: bool,
     /// Where the relationship is listed, such as `People`.
     pub category: String,
+    /// How the two met, if that was kept.
+    pub met: Option<Met>,
 }
 
 impl ContactRecord {
@@ -362,6 +437,9 @@ pub fn contacts(state: &State) -> Vec<ContactRecord> {
                     .filter(|c| !c.is_empty())
                     .unwrap_or(PEOPLE)
                     .to_owned(),
+                met: last(n, MET)
+                    .and_then(Value::as_record)
+                    .and_then(Met::from_record),
             })
         })
         .collect()

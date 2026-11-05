@@ -244,6 +244,23 @@ enum Cmd {
     },
     /// The groups you are in, and those offered to you.
     Groups,
+    /// Introduce one contact to another.
+    Introduce {
+        /// Who to introduce, as `cardinal contacts` shows.
+        who: String,
+        /// To whom.
+        to: String,
+        /// Something to say to them.
+        #[arg(long)]
+        note: Option<String>,
+    },
+    /// Introductions waiting for you, or say yes or no to one.
+    Introductions {
+        /// `yes` or `no`.
+        answer: Option<String>,
+        /// The introduction, as listed.
+        id: Option<String>,
+    },
     /// Make, join, talk in, or change a group.
     Group {
         #[command(subcommand)]
@@ -1547,6 +1564,44 @@ async fn client(cmd: Cmd) -> anyhow::Result<()> {
                     "Kept here: this cannot reach {who} through a host, so it waits \
                      until you connect."
                 );
+            }
+            Ok(())
+        }
+        Cmd::Introduce { who, to, note } => {
+            call(
+                &paths,
+                json!({"cmd": "introduce", "who": who, "to": to, "note": note}),
+            )
+            .await?;
+            println!("Asked {to} whether to meet {who}.");
+            Ok(())
+        }
+        Cmd::Introductions { answer, id } => {
+            match (answer.as_deref(), id) {
+                (Some("yes"), Some(id)) => {
+                    call(&paths, json!({"cmd": "introduction-accept", "id": id})).await?;
+                }
+                (Some("no"), Some(id)) => {
+                    call(&paths, json!({"cmd": "introduction-decline", "id": id})).await?;
+                }
+                (None, _) => {
+                    let v = call(&paths, json!({"cmd": "introductions"})).await?;
+                    for i in v["introductions"].as_array().into_iter().flatten() {
+                        let (from, name) = (
+                            printable(i["from"].as_str().unwrap_or("")),
+                            printable(i["name"].as_str().unwrap_or("")),
+                        );
+                        let id = i["id"].as_str().unwrap_or("");
+                        if i["kind"] == "meet" {
+                            println!("{from} would like you to meet {name}: cardinal introductions yes {id}");
+                        } else {
+                            println!(
+                                "{from} introduced you to {name}: cardinal introductions yes {id}"
+                            );
+                        }
+                    }
+                }
+                _ => anyhow::bail!("say yes or no, and which: cardinal introductions yes ID"),
             }
             Ok(())
         }

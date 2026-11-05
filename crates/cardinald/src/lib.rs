@@ -20,6 +20,7 @@ pub mod fs;
 pub mod fsat;
 pub mod groups;
 pub mod host;
+pub mod introductions;
 pub mod keys;
 pub mod mailbox;
 pub mod net;

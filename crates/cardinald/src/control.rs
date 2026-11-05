@@ -260,7 +260,12 @@ async fn handle(d: &Arc<Daemon>, req: &Value) -> anyhow::Result<Value> {
         }
         "accept" => {
             let name = req.get("name").and_then(|v| v.as_str());
-            crate::contacts::accept(d, arg(req, "code")?, name, regard(req)).await
+            let met = cardinal_space::account::Met {
+                how: cardinal_space::account::MET_THEIR_INVITATION,
+                via: req.get("via").and_then(|v| v.as_str()).map(str::to_owned),
+                ..Default::default()
+            };
+            crate::contacts::accept(d, arg(req, "code")?, name, regard(req), met).await
         }
         "invitations" => Ok(crate::contacts::invitations(d)),
         "cancel-invitation" => crate::contacts::cancel_invitation(d, arg(req, "id")?),
@@ -295,6 +300,17 @@ async fn handle(d: &Arc<Daemon>, req: &Value) -> anyhow::Result<Value> {
             crate::groups::delete_message(d, arg(req, "group")?, arg(req, "id")?)
         }
         "groups" => Ok(crate::groups::list(d)),
+        "introductions" => Ok(crate::introductions::list(d)),
+        "introduce" => {
+            let note = req.get("note").and_then(|v| v.as_str());
+            crate::introductions::introduce(d, arg(req, "who")?, arg(req, "to")?, note)
+        }
+        "introduction-accept" => crate::introductions::accept(d, arg(req, "id")?).await,
+        "introduction-decline" => crate::introductions::decline(d, arg(req, "id")?),
+        "group-connect" => {
+            let note = req.get("note").and_then(|v| v.as_str());
+            crate::introductions::ask_in_group(d, arg(req, "group")?, arg(req, "who")?, note)
+        }
         "group-create" => crate::groups::create(d, arg(req, "name")?, &strings(req, "people")),
         "group-add" => {
             let shown = req.get("shown").and_then(|v| v.as_str());

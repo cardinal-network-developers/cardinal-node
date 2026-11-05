@@ -753,8 +753,13 @@ asks for around that is not built yet.
   nothing, as the spec asks. A device also listening on TCP accepts the
   connection before it can stay silent, so TCP shows that something is there,
   though not how anyone is regarded.
-- **No introductions is kept and shown, and nothing acts on it**, since there
-  are no introductions, and contacts do not help each other meet, yet.
+- **No introductions keeps someone out of introductions, and nothing more.**
+  Contacts do not help each other meet as hosts yet, and no application
+  passes things along over several hops, so there is nothing else for it to
+  stop. An introduction asked for outside a group waits for the introducer
+  to make one by hand; only a group's are made unasked. An introduction's
+  invitation names the introduced person's host if they have one, and the
+  device that said yes if not, which someone elsewhere cannot reach.
 - **Refuse is for contacts.** `member seen` nodes do not exist yet, and there
   are no group spaces to warn about. A host revokes its tokens for someone
   refused as soon as the account space reaches it, wherever the refusal was
