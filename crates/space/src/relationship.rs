@@ -76,14 +76,28 @@ pub struct Introduction {
     pub declined: bool,
 }
 
-/// The introductions in a relationship space.
-pub fn introductions(state: &State) -> Vec<Introduction> {
+/// The introductions in a relationship space. What one says, who
+/// introduces whom and how, counts only as its maker wrote it; saying no
+/// counts only from the other member. The invitation is whoever's: what it
+/// is good for is for the one who uses it to check (`contact.md#introductions`).
+pub fn introductions(space: &Space) -> Vec<Introduction> {
+    let state = space.state();
+    let dag = space.dag();
     let nodes = state.children(&ROOT).into_iter();
     nodes
         .filter(|n| n.kind == NodeKind::Uint(INTRODUCTION) && !n.deleted)
         .filter_map(|n| {
-            let field = |k| n.values(k).iter().rev().find_map(|v| v.value.as_ref());
+            let by = |k: u64, maker: bool| {
+                n.values(k).iter().rev().find_map(|v| {
+                    let author = dag.get(&v.entry)?.author();
+                    ((author == n.creator) == maker)
+                        .then_some(v.value.as_ref())
+                        .flatten()
+                })
+            };
+            let field = |k| by(k, true);
             let id = |k| -> Option<IdentityId> { field(k)?.as_bytes()?.try_into().ok() };
+            let invitation = n.values(5).iter().rev().find_map(|v| v.value.as_ref());
             Some(Introduction {
                 node: n.id,
                 creator: n.creator,
@@ -91,11 +105,11 @@ pub fn introductions(state: &State) -> Vec<Introduction> {
                 introduced: id(2)?,
                 name: field(3).and_then(Value::as_text).unwrap_or("").to_owned(),
                 note: field(4).and_then(Value::as_text).map(str::to_owned),
-                invitation: field(5).and_then(Value::as_record).cloned(),
+                invitation: invitation.and_then(Value::as_record).cloned(),
                 group: field(6)
                     .and_then(Value::as_bytes)
                     .and_then(|b| b.try_into().ok()),
-                declined: field(7).and_then(Value::as_bool).unwrap_or(false),
+                declined: by(7, false).and_then(Value::as_bool).unwrap_or(false),
             })
         })
         .collect()

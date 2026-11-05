@@ -30,6 +30,19 @@ fn introduces(c: &ContactRecord) -> bool {
     c.connects() && c.regard.introductions
 }
 
+/// An introduction's invitation, if it is what it must be: made by `from`,
+/// for `to` alone. Anyone in the space can write one in, so it is checked
+/// before it is passed on or used.
+fn invitation_from(
+    record: Option<&cardinal_encoding::Record>,
+    from: &[u8; 32],
+    to: &[u8; 32],
+) -> Option<cardinal_encoding::Record> {
+    let record = record?;
+    let inv = Invitation::from_record(record).ok()?;
+    (inv.inviter == *from && inv.for_identity == Some(*to)).then(|| record.clone())
+}
+
 fn met_through(introducer: [u8; 32], group: Option<SpaceId>) -> Met {
     Met {
         how: account::MET_INTRODUCED,
@@ -121,7 +134,7 @@ pub fn ask_in_group(
         let core = d.core();
         let sp = core.spaces.get(&admin.space).and_then(|h| h.space.as_ref());
         sp.is_some_and(|sp| {
-            relationship::introductions(sp.state()).iter().any(|i| {
+            relationship::introductions(sp).iter().any(|i| {
                 i.creator == me && i.introduced == them && i.group == Some(space) && !i.declined
             })
         })
@@ -155,7 +168,7 @@ fn waiting(d: &Daemon) -> Vec<Waiting> {
         let Some(sp) = core.spaces.get(&c.space).and_then(|h| h.space.as_ref()) else {
             continue;
         };
-        for i in relationship::introductions(sp.state()) {
+        for mut i in relationship::introductions(sp) {
             let theirs = i.introducer == c.identity && i.creator == c.identity;
             let known = contacts.iter().any(|k| k.identity == i.introduced);
             // One this person said yes to holds their own invitation: the
@@ -164,6 +177,8 @@ fn waiting(d: &Daemon) -> Vec<Waiting> {
                 .invitation
                 .as_ref()
                 .is_some_and(|r| Invitation::from_record(r).is_ok_and(|inv| inv.inviter == me));
+            // Only theirs, for this person, is anything to connect with.
+            i.invitation = invitation_from(i.invitation.as_ref(), &i.introduced, &me);
             if theirs && !i.declined && !known && !answered && i.introduced != me {
                 out.push(Waiting {
                     space: c.space,
@@ -269,15 +284,17 @@ async fn tend(d: &Arc<Daemon>) {
         let core = d.core();
         let intros_of = |c: &ContactRecord| -> Vec<Introduction> {
             let sp = core.spaces.get(&c.space).and_then(|h| h.space.as_ref());
-            sp.map(|sp| relationship::introductions(sp.state()))
+            sp.map(|sp| relationship::introductions(sp))
                 .unwrap_or_default()
         };
         for b in contacts.iter().filter(|c| introduces(c)) {
             for n in intros_of(b) {
                 // Ben said yes to one this person made: Ana hears of it.
                 if n.creator == me && n.introducer == me {
+                    // Only an answer: theirs, for the one introduced.
+                    let answer = invitation_from(n.invitation.as_ref(), &b.identity, &n.introduced);
                     let (Some(invitation), Some(x)) = (
-                        n.invitation.clone(),
+                        answer,
                         contacts
                             .iter()
                             .find(|c| c.identity == n.introduced && introduces(c)),
@@ -298,9 +315,7 @@ async fn tend(d: &Arc<Daemon>) {
                             && m.invitation.is_none()
                     });
                     let ops = match asked {
-                        Some(m) => {
-                            relationship::answer_introduction(m.node, invitation, Some(&b.petname))
-                        }
+                        Some(m) => relationship::answer_introduction(m.node, invitation, None),
                         None => vec![relationship::create_introduction(
                             &me,
                             &b.identity,
@@ -373,7 +388,9 @@ async fn tend(d: &Arc<Daemon>) {
                 // One this person asked for came back with an invitation.
                 if n.creator == me && n.introducer == b.identity {
                     let known = contacts.iter().any(|c| c.identity == n.introduced);
-                    if let (Some(invitation), false) = (n.invitation.clone(), known) {
+                    // Only one from whom this person asked to meet, for them.
+                    let theirs = invitation_from(n.invitation.as_ref(), &n.introduced, &me);
+                    if let (Some(invitation), false) = (theirs, known) {
                         uses.push((invitation, n.name.clone(), met_through(b.identity, n.group)));
                     }
                 }
@@ -404,4 +421,42 @@ pub fn start(d: Arc<Daemon>) {
             tend(&d).await;
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use cardinal_contact::EndpointAddr;
+    use cardinal_link::CarrierKind;
+
+    /// Only the person introduced may connect by an introduction, with an
+    /// invitation of the other's made for them: one written in by anyone else,
+    /// or for anyone else, is nothing.
+    #[test]
+    fn an_introductions_invitation_is_checked_before_use() {
+        let at = EndpointAddr::new(CarrierKind::Udp, "127.0.0.1:7171".parse().unwrap());
+        let (ben, ana, eve) = ([1u8; 32], [2u8; 32], [3u8; 32]);
+        let mut theirs = Invitation::new(ben, [9; 32], at.clone());
+        theirs.for_identity = Some(ana);
+        let r = theirs.to_record();
+        assert_eq!(invitation_from(Some(&r), &ben, &ana), Some(r.clone()));
+        assert_eq!(
+            invitation_from(Some(&r), &eve, &ana),
+            None,
+            "not from whom asked"
+        );
+        assert_eq!(
+            invitation_from(Some(&r), &ben, &eve),
+            None,
+            "not for this one"
+        );
+        let mut open = Invitation::new(ben, [9; 32], at);
+        open.for_identity = None;
+        assert_eq!(
+            invitation_from(Some(&open.to_record()), &ben, &ana),
+            None,
+            "for anyone"
+        );
+        assert_eq!(invitation_from(None, &ben, &ana), None);
+    }
 }

@@ -212,3 +212,59 @@ fn a_reply_to_nothing_known_is_not_taken() {
     p.bo_writes(vec![relationship::create_reply(c, "back", Some(m))]);
     assert_eq!(said(&p.a)[1].reply_to, Some(m));
 }
+
+/// Carol introduces someone to Bo in their space. Bo may answer it, with an
+/// invitation, or say no; who is introduced, and by whom, are Carol's alone.
+/// Written over by Bo, it is no introduction of anyone's
+/// (`contact.md#introductions`).
+#[test]
+fn an_introduction_says_only_what_its_maker_wrote_of_it() {
+    use cardinal_encoding::{Record, Value};
+    let mut p = relationship_of(person(51, 0), person(52, 0));
+    let (ana, introduced, other) = (p.ana.log.id(), [7u8; 32], [8u8; 32]);
+    let make = |name: &str| {
+        relationship::create_introduction(&ana, &introduced, name, Some("hi"), None, None)
+    };
+    p.ana_writes(vec![make("Dee")]);
+    let node = relationship::introductions(&p.b)[0].node;
+    // Bo tries to make it another's introduction, by someone else.
+    p.bo_writes(vec![
+        SpaceOp::set(node, 2, Some(Value::from(other))),
+        SpaceOp::set(node, 1, Some(Value::from([9u8; 32]))),
+    ]);
+    let left = relationship::introductions(&p.a);
+    assert!(
+        left.iter()
+            .all(|i| i.introduced == introduced && i.introducer == ana),
+        "{left:?}"
+    );
+    // His answer and his no are his to give.
+    p.ana_writes(vec![make("Dee")]);
+    let node = relationship::introductions(&p.b)[0].node;
+    let invitation = Record::new().with(1, 5u64);
+    p.bo_writes(relationship::answer_introduction(
+        node,
+        invitation.clone(),
+        None,
+    ));
+    let i = &relationship::introductions(&p.a)[0];
+    assert_eq!(
+        (i.introduced, i.invitation.clone()),
+        (introduced, Some(invitation))
+    );
+    p.bo_writes(vec![relationship::decline_introduction(node)]);
+    assert!(relationship::introductions(&p.a)[0].declined);
+    // And its maker cannot say no for him.
+    let mut q = relationship_of(person(53, 0), person(54, 0));
+    q.ana_writes(vec![relationship::create_introduction(
+        &q.ana.log.id(),
+        &introduced,
+        "Dee",
+        None,
+        None,
+        None,
+    )]);
+    let node = relationship::introductions(&q.a)[0].node;
+    q.ana_writes(vec![relationship::decline_introduction(node)]);
+    assert!(!relationship::introductions(&q.b)[0].declined);
+}
