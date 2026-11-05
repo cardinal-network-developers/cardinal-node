@@ -85,6 +85,9 @@ const MAX_FOUND: usize = 8;
 const REACH_GAP: Duration = Duration::from_secs(5);
 /// How long a call waits for a contact to be found.
 const REACH_WITHIN: Duration = Duration::from_secs(12);
+/// How lately a session must have been heard from to count as alive when
+/// someone says the device at its other end is looking for this one.
+const HEARD_LATELY: Duration = Duration::from_secs(5);
 /// How long a look waits for a host in use for something else.
 const HOST_IN_USE_FOR: Duration = Duration::from_secs(5);
 
@@ -907,9 +910,13 @@ fn contact_incoming(d: &Arc<Daemon>, who: &[u8; 32], r: &Record) {
     if !trusted {
         return;
     }
-    // They have no session with this one, whatever it looks like here: one
-    // this device has may be left on a network theirs has left.
-    if d.is_online(link.x25519()) {
+    // A session that was heard from a moment ago is alive, whatever they
+    // think: a second would only end it, and a call on it. One that has gone
+    // quiet may be left on a network theirs has left.
+    if let Some(s) = d.session(link.x25519()) {
+        if s.last_heard().elapsed() < HEARD_LATELY {
+            return;
+        }
         d.rendezvous.suspect(link.x25519());
     }
     // They turned to this person: look for them again if this goes.
@@ -1275,6 +1282,24 @@ async fn reach(d: &Arc<Daemon>, who: [u8; 32], space: SpaceId) {
 /// with, tries each directly, and relays through the helper to any that cannot
 /// be reached that way. Without a host, this is how such a contact is found.
 async fn through_helpers(d: &Arc<Daemon>, who: &[u8; 32]) {
+    // Every device of theirs reached already: nothing to ask, and asking
+    // would have theirs try this one again.
+    let missing = {
+        let core = d.core();
+        let theirs = core.others.get(who).map(|o| o.log.state());
+        let links: Vec<[u8; 32]> = theirs
+            .iter()
+            .flat_map(|st| {
+                st.keys
+                    .values()
+                    .filter_map(|k| Some(*k.link_key.as_ref()?.x25519()))
+            })
+            .collect();
+        links
+    };
+    if missing.iter().all(|x| reached(d, x)) {
+        return;
+    }
     for helper in helpers(d) {
         let ask = Record::new()
             .with(0, OP_CONNECT)

@@ -844,6 +844,9 @@ impl Core {
 
     /// The identity whose log has `label`, of those this device keeps.
     pub fn other_of_label(&self, label: &[u8; 32]) -> Option<[u8; 32]> {
+        // This person is a member of their own spaces, and their log is
+        // nobody else's.
+        let me = self.identity.as_ref().map(|i| i.id());
         let members = self
             .spaces
             .values()
@@ -854,6 +857,7 @@ impl Core {
             .map(|c| c.identity)
             .chain(self.others.keys().copied())
             .chain(members)
+            .filter(|id| Some(*id) != me)
             .find(|id| identity_log_label(id) == *label)
     }
 
