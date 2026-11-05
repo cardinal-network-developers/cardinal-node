@@ -19,6 +19,7 @@ use tokio::sync::watch;
 use crate::contacts;
 use crate::daemon::{Daemon, PeerKind};
 use crate::transport::{Reader, Writer};
+use cardinal_space::account::ContactRecord;
 
 const RING: u64 = 1;
 const ANSWER: u64 = 2;
@@ -30,6 +31,13 @@ const MAX_SIGNAL: usize = 128;
 const RINGS_FOR: Duration = Duration::from_secs(45);
 /// How often a call looks at whether its session is still there.
 const SESSION_CHECK: Duration = Duration::from_secs(5);
+/// How long sessions get to answer before a call looks past them.
+const ANSWER_WITHIN: Duration = Duration::from_millis(1500);
+/// How long a session that did not answer has to end before the call looks
+/// again: the link's answer timeout.
+const GONE_WITHIN: Duration = Duration::from_secs(12);
+/// When a call looks again, past the gap between two looks for one person.
+const LOOK_AGAIN: Duration = Duration::from_secs(6);
 /// How many times one person can ring in `RINGS_WITHIN`. Past that a ring
 /// finds this person busy, and nothing rings.
 const MAX_RINGS: usize = 5;
@@ -144,6 +152,22 @@ fn ring_out(d: &Arc<Daemon>, id: [u8; 16]) {
 pub async fn start(d: &Arc<Daemon>, who: &str) -> anyhow::Result<Json> {
     let contact = contacts::listed(d, who)?;
     let mut theirs = d.sessions_of(&contact.identity);
+    // A session that looks open may be one left on a network their device
+    // has since left (`profiles.md#calls-guidance`): each is asked for an
+    // answer, and one that gives none is looked past.
+    let asked = Instant::now();
+    for s in &theirs {
+        s.check();
+    }
+    while !theirs.is_empty()
+        && asked.elapsed() < ANSWER_WITHIN
+        && theirs.iter().any(|s| s.last_heard() < asked)
+    {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    for s in theirs.iter().filter(|s| s.last_heard() < asked) {
+        d.rendezvous.suspect(&s.peer_static());
+    }
     if theirs.is_empty() && contact.connects() {
         crate::rendezvous::reach_now(d, contact.identity, contact.space).await;
         theirs = d.sessions_of(&contact.identity);
@@ -182,8 +206,42 @@ pub async fn start(d: &Arc<Daemon>, who: &str) -> anyhow::Result<Json> {
             tracing::debug!("ringing: {e:#}");
         }
     }
+    if contact.connects() {
+        let rung: Vec<[u8; 32]> = theirs.iter().map(Session::handshake_hash).collect();
+        tokio::spawn(ring_where_found(d.clone(), contact, id, rung));
+    }
     ring_out(d, id);
     Ok(json!({}))
+}
+
+/// Looks for the person called while it rings, at once and again once any
+/// session that gave no answer has had time to end, and rings each device
+/// found that was not rung.
+async fn ring_where_found(
+    d: Arc<Daemon>,
+    contact: ContactRecord,
+    id: [u8; 16],
+    mut rung: Vec<[u8; 32]>,
+) {
+    for wait in [Duration::ZERO, LOOK_AGAIN, GONE_WITHIN - LOOK_AGAIN] {
+        tokio::time::sleep(wait).await;
+        crate::rendezvous::reach_now(&d, contact.identity, contact.space).await;
+        let calling = lock(&d)
+            .as_ref()
+            .is_some_and(|c| c.id == id && c.standing == Standing::Calling);
+        if !calling {
+            return;
+        }
+        for s in d.sessions_of(&contact.identity) {
+            if rung.contains(&s.handshake_hash()) {
+                continue;
+            }
+            rung.push(s.handshake_hash());
+            if let Err(e) = tell(&s, RING, &contact.space, &id).await {
+                tracing::debug!("ringing: {e:#}");
+            }
+        }
+    }
 }
 
 /// Takes the call that is ringing here.
@@ -343,6 +401,8 @@ pub async fn serve(d: &Arc<Daemon>, s: &Session, mut st: Stream) -> anyhow::Resu
             tell(s, END, &space, &id).await?;
         }
         RING => {
+            // They turned to this person: look for them if this session goes.
+            d.rendezvous.use_contact(&them);
             let busy = {
                 let mut call = lock(d);
                 let busy = call.is_some();

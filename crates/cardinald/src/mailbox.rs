@@ -958,6 +958,9 @@ async fn deliver_to(d: &Arc<Daemon>, space: &SpaceId, member: &[u8; 32]) {
     }
     let found = d.core().reach_of(space, member);
     let Some((_, reach)) = found else {
+        // Nowhere to leave it: they are looked for instead, through this
+        // person's devices that may be in touch with them (`sync.md#neighbours`).
+        d.rendezvous.use_contact(member);
         return;
     };
     let Some((epoch, key)) = d.core().envelope_key(space) else {

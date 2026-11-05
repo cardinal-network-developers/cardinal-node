@@ -19,6 +19,12 @@
 //! reach node names, with the token it gives. The host asks the person's
 //! devices first, and names only those that agree, so a token says nothing of
 //! who is online to anyone they would not talk to.
+//!
+//! Contacts are looked for only while in use (`sync.md#neighbours`): when
+//! this person turns to them, or has news for them, and a while after. A
+//! person's own devices help with them too, the ones they are in touch with,
+//! so someone with no host of their own stays in touch with a few contacts'
+//! always-on devices and is found through those.
 
 use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, SocketAddr};
@@ -66,6 +72,12 @@ const AGREED_FOR: Duration = Duration::from_secs(60);
 const TOKEN_ASK_GAP: Duration = Duration::from_secs(1);
 /// How often to look for a trusted contact this device cannot reach.
 const REACH_EVERY: Duration = Duration::from_secs(30);
+/// How long a contact stays in use after this person last turned to them,
+/// or they rang: while they are, their devices are looked for.
+const IN_USE_FOR: Duration = Duration::from_secs(600);
+/// How many contacts' always-on devices a person with no host of their own
+/// stays in touch with (`hosts.md#staying-reachable`).
+const STANDING: usize = 3;
 /// The most devices a contact's host may name: a log can name any number,
 /// and each one named is sent to.
 const MAX_FOUND: usize = 8;
@@ -73,6 +85,8 @@ const MAX_FOUND: usize = 8;
 const REACH_GAP: Duration = Duration::from_secs(5);
 /// How long a call waits for a contact to be found.
 const REACH_WITHIN: Duration = Duration::from_secs(12);
+/// How long a look waits for a host in use for something else.
+const HOST_IN_USE_FOR: Duration = Duration::from_secs(5);
 
 const OP_ERROR: u64 = 0;
 const OP_PRESENT: u64 = 1;
@@ -140,9 +154,147 @@ pub struct Rendezvous {
     looked: Mutex<HashMap<[u8; 32], Instant>>,
     /// The contacts being looked for right now.
     looking: Mutex<HashSet<[u8; 32]>>,
+    /// When this person last turned to each contact, and when that was last
+    /// saved, as seconds since 1970.
+    in_use: Mutex<HashMap<[u8; 32], (Instant, u64)>>,
+    /// Where that is kept, so a device restarted mid-conversation still
+    /// looks for whom it was talking to.
+    in_use_path: Option<PathBuf>,
+    /// The contacts this device has known of: one it learns of, made on
+    /// another of the person's devices or before this one joined, is in use
+    /// for a while, as one met here is.
+    known: Mutex<HashSet<[u8; 32]>>,
+    /// Contacts' devices whose session did not answer when asked, by static
+    /// key: looked for as if there were none, until a new one opens.
+    suspect: Mutex<HashSet<[u8; 32]>>,
 }
 
+fn in_use_for() -> Duration {
+    std::env::var("CARDINAL_TEST_IN_USE_SECS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .map_or(IN_USE_FOR, Duration::from_secs)
+}
+
+/// What is kept of the contacts in use, and of those this device knows.
+#[derive(Default, serde::Serialize, serde::Deserialize)]
+struct InUseFile {
+    #[serde(default)]
+    in_use: HashMap<String, u64>,
+    #[serde(default)]
+    known: Vec<String>,
+}
+
+fn unix_now() -> u64 {
+    let since = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH);
+    since.map_or(0, |t| t.as_secs())
+}
+
+/// How often one contact's use is saved: only roughly, for after a restart.
+const SAVE_USE_EVERY: u64 = 60;
+
 impl Rendezvous {
+    /// With what was saved at `path` of the contacts in use.
+    pub fn load(path: PathBuf) -> Rendezvous {
+        let file: InUseFile = std::fs::read(&path)
+            .ok()
+            .and_then(|b| serde_json::from_slice(&b).ok())
+            .unwrap_or_default();
+        let known = file
+            .known
+            .iter()
+            .filter_map(|w| hex::decode(w).ok()?.try_into().ok())
+            .collect();
+        let saved = file.in_use;
+        let (now, at) = (Instant::now(), unix_now());
+        let in_use = saved
+            .into_iter()
+            .filter_map(|(who, when)| {
+                let who: [u8; 32] = hex::decode(who).ok()?.try_into().ok()?;
+                let ago = Duration::from_secs(at.checked_sub(when)?);
+                let since = now.checked_sub(ago)?;
+                (ago < in_use_for()).then_some((who, (since, when)))
+            })
+            .collect();
+        Rendezvous {
+            in_use: Mutex::new(in_use),
+            in_use_path: Some(path),
+            known: Mutex::new(known),
+            ..Default::default()
+        }
+    }
+
+    /// Notes the contacts this device knows of now, and uses each it did
+    /// not know before.
+    pub fn knows(&self, contacts: impl IntoIterator<Item = [u8; 32]>) {
+        let new: Vec<[u8; 32]> = {
+            let mut known = lock(&self.known);
+            contacts.into_iter().filter(|c| known.insert(*c)).collect()
+        };
+        if new.is_empty() {
+            return;
+        }
+        let at = unix_now();
+        {
+            let mut used = lock(&self.in_use);
+            for who in new {
+                used.insert(who, (Instant::now(), at));
+            }
+        }
+        self.save();
+    }
+
+    /// Saves the contacts in use and those this device knows of.
+    fn save(&self) {
+        let Some(path) = &self.in_use_path else {
+            return;
+        };
+        let in_use = lock(&self.in_use)
+            .iter()
+            .filter(|(_, (t, _))| t.elapsed() < in_use_for())
+            .map(|(w, (_, s))| (hex::encode(w), *s))
+            .collect();
+        let known = lock(&self.known).iter().map(hex::encode).collect();
+        let b = serde_json::to_vec(&InUseFile { in_use, known }).unwrap_or_default();
+        if let Err(e) = crate::paths::write_private(path, &b, 0o600) {
+            tracing::debug!("saving the contacts in use: {e}");
+        }
+    }
+
+    /// This person turned to a contact: opened their conversation, wrote to
+    /// them, called, or was rung by them.
+    pub fn use_contact(&self, who: &[u8; 32]) {
+        let at = unix_now();
+        let save = {
+            let mut used = lock(&self.in_use);
+            let saved = used.get(who).map_or(0, |(_, s)| *s);
+            let save = at.saturating_sub(saved) >= SAVE_USE_EVERY;
+            used.insert(*who, (Instant::now(), if save { at } else { saved }));
+            save
+        };
+        if save {
+            self.save();
+        }
+    }
+
+    /// A contact's device whose session did not answer: it may be one left
+    /// on a network that device has since left.
+    pub fn suspect(&self, device: &[u8; 32]) {
+        lock(&self.suspect).insert(*device);
+    }
+
+    /// A session opened with a device, which answers for it now.
+    pub fn opened(&self, device: &[u8; 32]) {
+        lock(&self.suspect).remove(device);
+    }
+
+    /// Whether a contact is in use, and so to be looked for.
+    pub fn in_use(&self, who: &[u8; 32]) -> bool {
+        let used = lock(&self.in_use);
+        used.get(who)
+            .is_some_and(|(t, _)| t.elapsed() < in_use_for())
+    }
+
     /// Whether a relay to a contact runs through a session with this host,
     /// which a second session would end.
     pub fn holds(&self, host: &[u8; 32]) -> bool {
@@ -506,7 +658,7 @@ async fn relay(
         .and_then(Value::as_uint)
         .and_then(|c| u32::try_from(c).ok())
         .ok_or_else(|| anyhow::anyhow!("no channel"))?;
-    if d.is_online(link.x25519()) {
+    if reached(d, link.x25519()) {
         return Ok(());
     }
     let at = helper
@@ -515,10 +667,20 @@ async fn relay(
     let target = Target::new(at, CarrierKind::Udp, link)
         .through(helper, channel)
         .within(PUNCH_WITHIN);
-    let s = d.endpoint.connect(target).await?;
-    tracing::info!("reached {} through a relay", short(device));
-    d.on_session(s);
-    Ok(())
+    match d.endpoint.connect(target).await {
+        Ok(s) => {
+            tracing::info!("reached {} through a relay", short(device));
+            d.on_session(s);
+            Ok(())
+        }
+        // One the other device opened at the same moment won.
+        Err(LinkError::Closed(cardinal_link::CloseReason::Replaced))
+            if reached(d, link.x25519()) =>
+        {
+            Ok(())
+        }
+        Err(e) => Err(e.into()),
+    }
 }
 
 /// Serves the rendezvous and relay services on a stream from one of this
@@ -532,6 +694,17 @@ pub async fn serve(d: &Arc<Daemon>, s: &Session, mut st: Stream) -> anyhow::Resu
     };
     let op = r.get(0).and_then(Value::as_uint);
     let kind = d.classify(s);
+    if let PeerKind::Contact(who, _) = kind {
+        // One of their devices helps another of theirs to this one.
+        let rendezvous = st.service() == Service::RENDEZVOUS;
+        if rendezvous && op == Some(OP_INCOMING) && r.get(3).is_none() {
+            contact_incoming(d, &who, r);
+            return Ok(());
+        }
+        if !rendezvous && op == Some(OP_RELAYED) {
+            return Ok(());
+        }
+    }
     let reply = if !matches!(kind, PeerKind::Own(_)) {
         let rendezvous = st.service() == Service::RENDEZVOUS;
         match holder_token(d, &kind, r) {
@@ -569,7 +742,10 @@ pub async fn serve(d: &Arc<Daemon>, s: &Session, mut st: Stream) -> anyhow::Resu
                 lock(&d.rendezvous.present).insert(s.peer_static(), presence);
                 Some(Record::new().with(0, OP_PRESENT))
             }
-            Some(OP_CONNECT) => Some(connect(s, d)),
+            Some(OP_CONNECT) => Some(match identity_field(r.get(3)) {
+                Some(who) => connect_contact(s, d, &who),
+                None => connect(s, d),
+            }),
             _ => Some(error(UNKNOWN)),
         }
     } else {
@@ -658,10 +834,89 @@ fn open_relay(d: &Daemon, s: &Session, r: &Record) -> Record {
     let Some(device) = r.get(2).and_then(Value::as_bytes) else {
         return error(UNKNOWN);
     };
-    match present_device(d, device) {
+    match present_device(d, device).or_else(|| contact_session(d, device)) {
         Some(other) => open_channel(d, s, &other),
         None => error(NOT_PRESENT),
     }
+}
+
+fn identity_field(v: Option<&Value>) -> Option<[u8; 32]> {
+    v?.as_bytes()?.try_into().ok()
+}
+
+/// Whether a contact's device has a session that answers for it: one that
+/// may be left behind is no session when looking for them.
+fn reached(d: &Daemon, device: &[u8; 32]) -> bool {
+    d.is_online(device) && !lock(&d.rendezvous.suspect).contains(device)
+}
+
+/// A direct session with a trusted contact's device, by its signing key, for
+/// one of this person's own devices to be helped to.
+fn contact_session(d: &Daemon, device: &[u8]) -> Option<Session> {
+    let theirs = d.contacts_in_touch().into_iter();
+    theirs.map(|(_, s)| s).find(|o| {
+        !o.is_relayed()
+            && o.peer_identity()
+                .is_some_and(|p| p.signing_key.as_slice() == device)
+    })
+}
+
+/// One of this person's devices looks for a contact's: each of theirs in
+/// touch here is told where that one is, and that one where they are. Only
+/// devices with a direct session here: help goes one hop.
+fn connect_contact(s: &Session, d: &Daemon, who: &[u8; 32]) -> Record {
+    let asker = observed(s);
+    let mut found = Vec::new();
+    let theirs = d.contacts_in_touch().into_iter();
+    for (_, o) in theirs.filter(|(i, o)| i == who && !o.is_relayed()) {
+        found.push(Value::Record(found_record(&Found {
+            device: o.peer_static(),
+            observed: observed(&o),
+            local: Vec::new(),
+        })));
+        let mut tell = Record::new().with(0, OP_INCOMING).with(1, s.peer_static());
+        if let Some(at) = asker {
+            tell = tell.with(2, Value::Record(address_record(&at)));
+        }
+        tell_device(o, Service::RENDEZVOUS, tell);
+    }
+    tracing::debug!("helping to {} of {}'s devices", found.len(), short(who));
+    Record::new()
+        .with(0, OP_CONNECT)
+        .with(1, Value::list(found))
+}
+
+/// A trusted contact's device says another of that person's devices is
+/// looking for this one, and where it is. Only a device of the same person:
+/// nobody can aim this one at a third party.
+fn contact_incoming(d: &Arc<Daemon>, who: &[u8; 32], r: &Record) {
+    let Some(x) = identity_field(r.get(1)) else {
+        return;
+    };
+    let Some(at) = r.get(2).and_then(read_address) else {
+        return;
+    };
+    let Some((_, link)) = contact_device(d, who, &x) else {
+        return;
+    };
+    let trusted = d
+        .core()
+        .contacts()
+        .iter()
+        .any(|c| c.identity == *who && c.connects());
+    if !trusted {
+        return;
+    }
+    // They have no session with this one, whatever it looks like here: one
+    // this device has may be left on a network theirs has left.
+    if d.is_online(link.x25519()) {
+        d.rendezvous.suspect(link.x25519());
+    }
+    // They turned to this person: look for them again if this goes.
+    d.rendezvous.use_contact(who);
+    tracing::debug!("{} is looking for this device", short(&x));
+    let d = d.clone();
+    tokio::spawn(async move { punch(&d, &link, vec![at]).await });
 }
 
 /// The session of a device present here, by its signing key.
@@ -923,9 +1178,9 @@ fn contact_device(d: &Daemon, who: &[u8; 32], x: &[u8; 32]) -> Option<(KeyId, Hy
 }
 
 /// Looks, through the hosts their reach nodes name, for the trusted contacts
-/// with a device this one has no session with. A session with one device is
-/// not enough: it may be their host, and a call rings the devices a person
-/// uses. Each is looked for now and then, and a call looks at once.
+/// in use with a device this one has no session with. A session with one
+/// device is not enough: it may be their host, and a call rings the devices a
+/// person uses. Each is looked for now and then, and a call looks at once.
 pub async fn reach_contacts(d: Arc<Daemon>) {
     let wanted: Vec<([u8; 32], SpaceId)> = {
         let core = d.core();
@@ -939,6 +1194,7 @@ pub async fn reach_contacts(d: Arc<Daemon>) {
             links.into_iter().any(|l| !d.is_online(l.x25519()))
         };
         let ones = contacts.iter().filter(|c| c.connects());
+        let ones = ones.filter(|c| d.rendezvous.in_use(&c.identity));
         ones.filter(|c| missing(&c.identity))
             .map(|c| (c.identity, c.space))
             .collect()
@@ -1005,6 +1261,7 @@ async fn reach(d: &Arc<Daemon>, who: [u8; 32], space: SpaceId) {
     }
     let _looking = Looking { d, who };
     lock(&d.rendezvous.looked).insert(who, Instant::now());
+    through_helpers(d, &who).await;
     let reach = d.core().all_reach_of(&space, &who);
     tracing::debug!("looking for {} at {} hosts", short(&who), reach.len());
     for (r, addr) in crate::mailbox::addresses(&reach) {
@@ -1012,6 +1269,102 @@ async fn reach(d: &Arc<Daemon>, who: [u8; 32], space: SpaceId) {
             tracing::debug!("looking for {} at {addr}: {e:#}", short(&who));
         }
     }
+}
+
+/// Asks this person's own devices for a contact's devices they are in touch
+/// with, tries each directly, and relays through the helper to any that cannot
+/// be reached that way. Without a host, this is how such a contact is found.
+async fn through_helpers(d: &Arc<Daemon>, who: &[u8; 32]) {
+    for helper in helpers(d) {
+        let ask = Record::new()
+            .with(0, OP_CONNECT)
+            .with(2, d.keys.key())
+            .with(3, *who);
+        let found: Vec<Found> = match call(&helper, Service::RENDEZVOUS, ask).await {
+            Ok(r) if r.get(0).and_then(Value::as_uint) == Some(OP_CONNECT) => {
+                let list = r.record_list(1).unwrap_or_default();
+                list.into_iter()
+                    .take(MAX_FOUND)
+                    .filter_map(read_found)
+                    .collect()
+            }
+            Ok(_) => continue,
+            Err(e) => {
+                tracing::debug!(
+                    "asking {} for {}: {e:#}",
+                    short(&helper.peer_static()),
+                    short(who)
+                );
+                continue;
+            }
+        };
+        for f in found {
+            let Some((device, link)) = contact_device(d, who, &f.device) else {
+                continue;
+            };
+            if reached(d, link.x25519()) {
+                continue;
+            }
+            punch(d, &link, f.addresses()).await;
+            if !reached(d, link.x25519()) {
+                let ask = Record::new().with(0, OP_RELAY).with(2, device);
+                if let Err(e) = relay(d, &helper, ask, &device, &link).await {
+                    tracing::debug!("relaying to {}: {e:#}", short(&device));
+                }
+            }
+        }
+    }
+}
+
+/// The always-on devices of trusted contacts this device stays in touch with
+/// when its person has no host of their own, with where each listens: the
+/// hosts their reach nodes name that are their own devices. Those of the
+/// contacts last in use come first, and only a few (`hosts.md#staying-reachable`).
+pub fn standing(d: &Daemon) -> Vec<(KeyId, HybridPublicKey)> {
+    let core = d.core();
+    if core.identity.is_none() || !core.mailboxes().is_empty() {
+        return Vec::new();
+    }
+    let used: HashMap<[u8; 32], Instant> = lock(&d.rendezvous.in_use)
+        .iter()
+        .map(|(w, (t, _))| (*w, *t))
+        .collect();
+    let mut contacts: Vec<_> = core
+        .contacts()
+        .into_iter()
+        .filter(|c| c.connects())
+        .collect();
+    contacts.sort_by_key(|c| std::cmp::Reverse(used.get(&c.identity).copied()));
+    let mut out = Vec::new();
+    let mut kept = 0;
+    for c in contacts {
+        if kept >= STANDING {
+            break;
+        }
+        let Some(o) = core.others.get(&c.identity) else {
+            continue;
+        };
+        let st = o.log.state();
+        if st.frozen {
+            continue;
+        }
+        let hosts: Vec<[u8; 32]> = core
+            .all_reach_of(&c.space, &c.identity)
+            .iter()
+            .map(|r| r.host)
+            .collect();
+        let theirs: Vec<_> = st
+            .keys
+            .values()
+            .filter_map(|k| Some((k.key, k.link_key.clone()?)))
+            .filter(|(_, l)| hosts.contains(l.x25519()))
+            .collect();
+        if !theirs.is_empty() {
+            kept += 1;
+            out.extend(theirs);
+        }
+    }
+    out
 }
 
 /// Asks a contact's host for their devices, tries each directly, and relays
@@ -1051,11 +1404,11 @@ async fn through_host(
         let Some((device, link)) = contact_device(d, who, &f.device) else {
             continue;
         };
-        if d.is_online(link.x25519()) {
+        if reached(d, link.x25519()) {
             continue;
         }
         punch(d, &link, f.addresses()).await;
-        if !d.is_online(link.x25519()) {
+        if !reached(d, link.x25519()) {
             let ask = Record::new()
                 .with(0, OP_RELAY)
                 .with(1, r.token)
@@ -1083,22 +1436,29 @@ async fn host_session(
     r: &Reach,
     addr: SocketAddr,
 ) -> anyhow::Result<(Session, bool)> {
-    if let Some(s) = d.session(&r.host) {
-        return Ok((s, false));
-    }
-    let held = lock(&d.rendezvous.paths).get(&r.host).cloned();
-    if let Some((_, s)) = held.filter(|(_, s)| !s.is_closed()) {
-        return Ok((s, false));
-    }
     anyhow::ensure!(
         r.host != *d.keys.link.public_key().x25519(),
         "that host is this device"
     );
-    let _going = crate::mailbox::going_to(d, r.host)
-        .ok_or_else(|| anyhow::anyhow!("that host is in use"))?;
-    let secret = derive(Purpose::Token, &r.token);
-    let target = |c| Target::invitation(addr, c, r.host, &secret[..]).anonymous();
-    Ok((d.dial(target).await?, true))
+    // Another errand there, a mailbox's say, is quick: this waits for it
+    // rather than give up on a call.
+    let asked = Instant::now();
+    loop {
+        if let Some(s) = d.session(&r.host) {
+            return Ok((s, false));
+        }
+        let held = lock(&d.rendezvous.paths).get(&r.host).cloned();
+        if let Some((_, s)) = held.filter(|(_, s)| !s.is_closed()) {
+            return Ok((s, false));
+        }
+        if let Some(_going) = crate::mailbox::going_to(d, r.host) {
+            let secret = derive(Purpose::Token, &r.token);
+            let target = |c| Target::invitation(addr, c, r.host, &secret[..]).anonymous();
+            return Ok((d.dial(target).await?, true));
+        }
+        anyhow::ensure!(asked.elapsed() < HOST_IN_USE_FOR, "that host is in use");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
 }
 
 /// A session with this device ended: what went through it is over.

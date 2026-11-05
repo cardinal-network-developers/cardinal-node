@@ -306,6 +306,12 @@ impl Session {
         self.inner.lock().check();
     }
 
+    /// When an authenticated packet last came from the peer: after a
+    /// `check`, whether it answered.
+    pub fn last_heard(&self) -> std::time::Instant {
+        self.inner.lock().last_heard()
+    }
+
     /// Closes the session with a reason the peer sees.
     pub fn close(&self, reason: &str) {
         let events = {

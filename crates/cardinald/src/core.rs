@@ -291,6 +291,9 @@ impl Holder {
                 }
             }
         }
+        if space.is_none() {
+            space = Self::open_added(self.id, &all, keys);
+        }
         let Some(mut space) = space else {
             self.pending = all;
             return;
@@ -317,6 +320,23 @@ impl Holder {
         }
         self.space = Some(space);
         self.version += 1;
+    }
+
+    /// A space this identity was added to after it began: the key comes in
+    /// the entry that added them, and the earlier ones in rotations.
+    fn open_added(id: SpaceId, all: &[SealedEntry], keys: &[&HybridKeyPair]) -> Option<Space> {
+        let ring = Space::keys_in(all, keys);
+        if ring.is_empty() {
+            return None;
+        }
+        all.iter().find_map(|s| {
+            let key = ring.get(&s.epoch())?;
+            let e = s.open_with(key).ok()?;
+            if !e.is_genesis() || e.id() != id {
+                return None;
+            }
+            Space::open_genesis_with(s, ring.clone(), None).ok()
+        })
     }
 
     /// How many objects the set holds.
@@ -1426,6 +1446,28 @@ impl Core {
             .flat_map(|(g, _)| g.endpoints)
             .filter_map(|e| e.socket_addr())
             .collect()
+    }
+
+    /// Where a contact's device that is one of their hosts listens, from the
+    /// reach nodes they wrote: what a person with no host of their own stays
+    /// in touch with (`hosts.md#staying-reachable`).
+    pub fn contact_host_addresses(&self, device: &KeyId) -> Vec<std::net::SocketAddr> {
+        for c in self.contacts() {
+            let Some(o) = self.others.get(&c.identity) else {
+                continue;
+            };
+            let st = o.log.state();
+            let Some(link) = st.keys.get(device).and_then(|k| k.link_key.clone()) else {
+                continue;
+            };
+            let reach = self.all_reach_of(&c.space, &c.identity);
+            return reach
+                .iter()
+                .filter(|r| r.host == *link.x25519())
+                .flat_map(|r| r.endpoints.iter().filter_map(|e| e.socket_addr()))
+                .collect();
+        }
+        Vec::new()
     }
 
     /// Whether this device has heard that it was removed.

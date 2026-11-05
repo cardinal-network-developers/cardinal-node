@@ -410,9 +410,23 @@ fn two_people(root: &std::path::Path) -> (Dev, Dev, Dev) {
 /// The same, with the invitation from Ana's host, the one device of hers that
 /// anyone can reach.
 fn two_people_from(root: &std::path::Path, from_host: bool) -> (Dev, Dev, Dev) {
+    two_people_with(root, from_host, &[], &[])
+}
+
+/// The same again, with settings for Ana's laptop and for Bo.
+fn two_people_with(
+    root: &std::path::Path,
+    from_host: bool,
+    ana_env: &[(&str, &str)],
+    bo_env: &[(&str, &str)],
+) -> (Dev, Dev, Dev) {
     let mut host = Dev::new(root, "host", free_port());
     let mut ana = Dev::new(root, "ana", free_port());
     let mut bo = Dev::new(root, "bo", free_port());
+    for (d, env) in [(&mut ana, ana_env), (&mut bo, bo_env)] {
+        d.env
+            .extend(env.iter().map(|(k, v)| (k.to_string(), v.to_string())));
+    }
     host.start();
     host.cli(&["init", "--yes", "--name", "host"]);
     host.wait_mounted();
@@ -457,9 +471,11 @@ fn a_contact_behind_a_nat_is_reached_through_their_host() {
     put_behind(&mut ana, &na);
     put_behind(&mut bo, &nb);
 
+    // Bo has no host, so he stays in touch with Ana's, one of her own
+    // devices: to him she is connected directly, and her laptop through it.
     wait("they meet through ana's host", 60, || {
         let (a, b) = (the_contact(&ana), the_contact(&bo));
-        a["connected"] == true && b["connected"] == true && b["relayed"] == true
+        a["connected"] == true && a["relayed"] == true && b["connected"] == true
     });
     bo.cli(&["say", "Ana", "through your host"]);
     wait("ana reads it", 20, || {
@@ -710,4 +726,106 @@ fn a_file_comes_through_the_session_an_invitation_opened() {
         json!({"cmd": "save-attachment", "who": "Ana", "id": id, "index": 0, "to": to}),
     );
     assert_eq!(std::fs::read(&to).unwrap(), photo);
+}
+
+/// How long a contact stays in use in these tests, so that they can see what a
+/// device does once nobody is turning to anyone.
+const BRIEFLY: (&str, &str) = ("CARDINAL_TEST_IN_USE_SECS", "4");
+
+/// Ends a daemon without a word, as a phone that leaves a network does to
+/// the sessions it had there, and starts it again behind `nat`.
+fn moves_behind(d: &mut Dev, nat: &Nat) {
+    if let Some(mut c) = d.child.take() {
+        let _ = c.kill();
+        let _ = c.wait();
+    }
+    d.env.retain(|(k, _)| k != "CARDINAL_TEST_UDP_GATEWAY");
+    d.env
+        .push(("CARDINAL_TEST_UDP_GATEWAY".into(), nat.gateway.to_string()));
+    d.start();
+    d.wait_mounted();
+}
+
+/// The contacts a device has a session with now, as it lists them.
+fn connected(d: &Dev) -> bool {
+    the_contact(d)["connected"] == true
+}
+
+/// Bo has no host, and his one device stays in touch with Ana's host, which is
+/// one of her own. Nobody looks for anyone they are not turning to, so her
+/// laptop, which moved, does not look for Bo until she calls him: then it
+/// finds him through her host (`hosts.md#help-from-a-persons-own-devices`),
+/// rings, and a message gets through too.
+#[test]
+fn a_contact_with_no_host_is_found_through_this_persons_own_device() {
+    if !fuse_available() {
+        eprintln!("skipping: /dev/fuse or fusermount3 is not available");
+        return;
+    }
+    let root = tempfile::tempdir().unwrap();
+    let (host, mut ana, mut bo) = two_people_with(root.path(), false, &[BRIEFLY], &[BRIEFLY]);
+    let (na, nb) = (Nat::new(Kind::Symmetric), Nat::new(Kind::PortRestricted));
+    put_behind(&mut bo, &nb);
+    // Long enough that neither turns to the other any more.
+    std::thread::sleep(Duration::from_secs(5));
+    put_behind(&mut ana, &na);
+    wait("bo stays in touch with ana's host", 40, || connected(&host));
+    std::thread::sleep(Duration::from_secs(8));
+    assert!(!connected(&ana), "ana's laptop looked for bo unasked");
+
+    ask(&ana, json!({"cmd": "call-start", "who": "bo"}));
+    wait("bo rings", 20, || standing(&bo) == "ringing");
+    assert!(
+        ana.log().contains("helping to") || host.log().contains("helping to 1 of"),
+        "not found through the host as a helper"
+    );
+    ask(&bo, json!({"cmd": "call-answer"}));
+    wait("ana hears the answer", 10, || standing(&ana) == "live");
+    ask(&ana, json!({"cmd": "call-end"}));
+    wait("it ends for bo", 10, || standing(&bo).is_null());
+
+    ana.cli(&["say", "bo", "found you"]);
+    wait("bo reads it", 20, || {
+        bo.cli(&["messages", "Ana"]).contains("found you")
+    });
+}
+
+/// Ana's laptop leaves a network without a word while Bo, with no host,
+/// still has a session with it there. When Bo rings, the session that looks
+/// open does not answer, and Bo finds the laptop where it is now, through her
+/// host, without waiting for that session to end (`profiles.md#calls-guidance`).
+#[test]
+fn a_ring_finds_a_device_that_moved_while_its_old_session_looks_open() {
+    if !fuse_available() {
+        eprintln!("skipping: /dev/fuse or fusermount3 is not available");
+        return;
+    }
+    let root = tempfile::tempdir().unwrap();
+    let (_host, mut ana, mut bo) = two_people_with(root.path(), false, &[BRIEFLY], &[]);
+    let (na, nb) = (Nat::new(Kind::Symmetric), Nat::new(Kind::PortRestricted));
+    put_behind(&mut bo, &nb);
+    bo.cli(&["say", "Ana", "still here"]);
+    wait("bo and ana's laptop are in touch", 40, || {
+        connected(&ana) && connected(&bo)
+    });
+    std::thread::sleep(Duration::from_secs(5));
+
+    moves_behind(&mut ana, &na);
+    wait("the laptop is back with its host", 30, || {
+        let v = ana.status();
+        let d = v["devices"].as_array().unwrap();
+        d.iter().any(|d| d["name"] == "host" && d["online"] == true)
+    });
+    assert!(connected(&bo), "bo's old session ended already");
+    let rang = std::time::Instant::now();
+    ask(&bo, json!({"cmd": "call-start", "who": "Ana"}));
+    wait("ana's laptop rings", 20, || standing(&ana) == "ringing");
+    // The old session would take up to half a minute to end by itself.
+    assert!(
+        rang.elapsed() < Duration::from_secs(15),
+        "took {:?}",
+        rang.elapsed()
+    );
+    ask(&ana, json!({"cmd": "call-answer"}));
+    wait("bo hears the answer", 10, || standing(&bo) == "live");
 }

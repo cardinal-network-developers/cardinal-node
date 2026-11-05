@@ -62,6 +62,19 @@ fn met(root: &std::path::Path, bo_args: &[&str]) -> (Dev, Dev) {
 
 fn names(d: &Dev, path: &str) -> Vec<String> {
     let v = ask(d, json!({"cmd": "files", "path": path}));
+    listed(&v)
+}
+
+/// What a folder holds, or nothing yet if it has not arrived.
+fn names_if_any(d: &Dev, path: &str) -> Vec<String> {
+    let v = reply(d, &json!({"cmd": "files", "path": path}));
+    if v["ok"] != true {
+        return Vec::new();
+    }
+    listed(&v)
+}
+
+fn listed(v: &Value) -> Vec<String> {
     v["files"]
         .as_array()
         .unwrap()
@@ -226,7 +239,7 @@ fn a_shared_folder_is_a_folder() {
         json!({"cmd": "put", "from": root.path().join("list.txt"), "to": "People/Bo/trip"}),
     );
     wait("Bo sees the folder", 20, || {
-        names(&b, "People/Ana/trip") == ["list.txt"]
+        names_if_any(&b, "People/Ana/trip") == ["list.txt"]
     });
     ask(
         &b,

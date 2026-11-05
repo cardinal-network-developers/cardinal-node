@@ -142,6 +142,11 @@ impl Paths {
         self.home.join("mailbox")
     }
     /// Known addresses of this person's devices.
+    /// When this person last turned to each contact (`sync.md#neighbours`).
+    pub fn in_use(&self) -> PathBuf {
+        self.home.join("in-use.json")
+    }
+
     pub fn peers(&self) -> PathBuf {
         self.home.join("peers.json")
     }

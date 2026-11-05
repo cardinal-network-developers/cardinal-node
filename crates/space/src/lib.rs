@@ -18,6 +18,7 @@ pub mod epoch;
 mod error;
 pub mod files;
 pub mod grant;
+pub mod group;
 pub mod membership;
 pub mod relationship;
 pub mod space;

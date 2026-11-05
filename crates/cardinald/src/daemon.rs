@@ -406,6 +406,7 @@ impl Daemon {
         let copies_path = paths.copies();
         let old_versions = paths.old_versions();
         let mailbox = crate::mailbox::Mailbox::load(paths.mailbox());
+        let rendezvous = crate::rendezvous::Rendezvous::load(paths.in_use());
         let d = Arc::new(Daemon {
             paths,
             config: Mutex::new(config),
@@ -434,7 +435,7 @@ impl Daemon {
             news: Mutex::new(HashMap::new()),
             proven: Mutex::new(HashSet::new()),
             saving_book: Mutex::new(()),
-            rendezvous: Default::default(),
+            rendezvous,
             mailbox,
             copies: crate::copies::Tracker::load(copies_path, crate::copies::Rules::from_env()),
             cleanup: crate::cleanup::Cleaner::load(old_versions),
@@ -640,6 +641,18 @@ impl Daemon {
             .collect()
     }
 
+    /// The open sessions with contacts' devices, with whose each is.
+    pub fn contacts_in_touch(&self) -> Vec<([u8; 32], Session)> {
+        lock(&self.sessions)
+            .values()
+            .filter(|c| !c.session.is_closed())
+            .filter_map(|c| match c.kind {
+                PeerKind::Contact(identity, _) => Some((identity, c.session.clone())),
+                _ => None,
+            })
+            .collect()
+    }
+
     /// The people reached only through a relay.
     pub fn relayed_people(&self) -> HashSet<[u8; 32]> {
         let sessions = lock(&self.sessions);
@@ -812,6 +825,7 @@ impl Daemon {
 
     /// Takes on a new session: serves it and syncs everything.
     pub fn on_session(self: &Arc<Self>, s: Session) {
+        self.rendezvous.opened(&s.peer_static());
         let kind = self.classify(&s);
         if kind == PeerKind::Stranger {
             // Someone refused may hold an invitation still. They hear what
@@ -1243,8 +1257,11 @@ impl Daemon {
 
     // ---- connections ----
 
-    /// Tries to connect to every own device that is not online.
+    /// Tries to connect to every own device that is not online, and to the
+    /// devices of the contacts in use (`sync.md#neighbours`), and of those
+    /// this device stays in touch with because its person has no host.
     pub async fn connect_all(self: &Arc<Self>) {
+        let standing = crate::rendezvous::standing(self);
         let devices: Vec<(KeyId, cardinal_crypto::HybridPublicKey)> = {
             let core = self.core();
             let Some(ident) = core.identity.as_ref() else {
@@ -1255,7 +1272,10 @@ impl Daemon {
             let mut devices: Vec<_> = own
                 .filter_map(|k| Some((k.key, k.link_key.clone()?)))
                 .collect();
-            for c in core.contacts().iter().filter(|c| c.connects()) {
+            let contacts = core.contacts();
+            self.rendezvous.knows(contacts.iter().map(|c| c.identity));
+            let wanted = contacts.iter().filter(|c| c.connects());
+            for c in wanted.filter(|c| self.rendezvous.in_use(&c.identity)) {
                 let Some(o) = core.others.get(&c.identity) else {
                     continue;
                 };
@@ -1265,6 +1285,11 @@ impl Daemon {
                         .values()
                         .filter_map(|k| Some((k.key, k.link_key.clone()?))),
                 );
+            }
+            for (key, link) in standing {
+                if !devices.iter().any(|(k, _)| *k == key) {
+                    devices.push((key, link));
+                }
             }
             devices
         };
@@ -1356,7 +1381,13 @@ impl Daemon {
         }
         // What a host's grant gives, unless that is a name: names are for
         // the recovery sheet, and nothing here should depend on a registrar.
-        for sa in self.core().host_addresses(key) {
+        let hosting = {
+            let core = self.core();
+            let mut v = core.host_addresses(key);
+            v.extend(core.contact_host_addresses(key));
+            v
+        };
+        for sa in hosting {
             if !out.iter().any(|(x, _)| *x == sa) {
                 out.push((sa, None));
             }

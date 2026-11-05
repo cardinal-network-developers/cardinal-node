@@ -1648,6 +1648,11 @@ impl Conn {
         }
     }
 
+    /// When an authenticated packet last came from the peer.
+    pub fn last_heard(&self) -> Instant {
+        self.last_recv
+    }
+
     pub fn poll_timeout(&self) -> Option<Instant> {
         if self.is_drained() {
             return None;

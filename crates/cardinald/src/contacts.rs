@@ -503,6 +503,8 @@ fn record_contact(
         .ok_or_else(|| anyhow::anyhow!("the account space is not here yet"))?;
     let op = account::create_contact(who, petname, space, regard);
     d.write_and_push(&account, vec![op])?;
+    // Just met: they will want to talk.
+    d.rendezvous.use_contact(who);
     Ok(())
 }
 
@@ -629,9 +631,12 @@ fn find(d: &Daemon, who: &str) -> anyhow::Result<ContactRecord> {
 }
 
 /// The contact called `who`, unless this person has refused them.
+/// A contact this person turns to, by what they call them: they are in use
+/// from now on (`sync.md#neighbours`), and so looked for.
 pub(crate) fn listed(d: &Daemon, who: &str) -> anyhow::Result<ContactRecord> {
     let contact = find(d, who)?;
     anyhow::ensure!(!contact.refused, "you have refused {who}");
+    d.rendezvous.use_contact(&contact.identity);
     Ok(contact)
 }
 

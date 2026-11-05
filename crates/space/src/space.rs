@@ -158,6 +158,63 @@ impl Space {
         Ok(space)
     }
 
+    /// Opens a space from its sealed genesis entry with keys learned
+    /// elsewhere: a member added after it was made gets the current key in
+    /// the entry that added them, and the earlier ones from rotations.
+    pub fn open_genesis_with(
+        sealed: &SealedEntry,
+        keyring: Keyring,
+        author: Option<Arc<IdentityState>>,
+    ) -> Result<Space, Error> {
+        let key = keyring
+            .get(&sealed.epoch())
+            .cloned()
+            .ok_or(Error::NoEpochKey)?;
+        let g = sealed.open_with(&key)?;
+        let mut space = Space::from_genesis(g, keyring, author)?;
+        space.sealed.insert(space.id, sealed.clone());
+        Ok(space)
+    }
+
+    /// The epoch keys sealed entries give these identity keys: the wraps
+    /// for them, and the keys rotations carry, as far back as they go.
+    pub fn keys_in(sealed: &[SealedEntry], identity_keys: &[&HybridKeyPair]) -> Keyring {
+        let mut ring = Keyring::new();
+        for s in sealed {
+            let found = s
+                .wraps()
+                .and_then(|w| EpochKey::open_wraps(w, &s.epoch(), identity_keys));
+            if let Some(k) = found {
+                ring.add(k);
+            }
+        }
+        loop {
+            let before = ring.len();
+            for s in sealed {
+                let Some(k) = ring.get(&s.epoch()).cloned() else {
+                    continue;
+                };
+                let Ok(e) = s.open_with(&k) else {
+                    continue;
+                };
+                for op in e.ops() {
+                    if let SpaceOpBody::Rotate { previous } = op.body() {
+                        for (id, b) in previous {
+                            let key = EpochKey::from_bytes(*b);
+                            if &key.id() == id {
+                                ring.add(key);
+                            }
+                        }
+                    }
+                }
+            }
+            if ring.len() == before {
+                break;
+            }
+        }
+        ring
+    }
+
     /// The space id.
     pub fn id(&self) -> SpaceId {
         self.id
@@ -528,6 +585,53 @@ impl Space {
             .filter(|m| m.identity == identity)
             .max_by_key(|m| m.role)
             .map(|m| m.id)
+    }
+
+    /// Adds members in one entry, with the current epoch key wrapped for each
+    /// one added (`spaces.md#distribution`), together with `ops`. A space
+    /// that does not share history with new members rotates instead, for
+    /// `everyone` already in it and those added.
+    pub fn add_members(
+        &mut self,
+        author: &IdentityLog,
+        device: &SigningKey,
+        added: &[(IdentityId, u64, &HybridPublicKey)],
+        everyone: &[&HybridPublicKey],
+        ops: Vec<SpaceOp>,
+        time: Option<u64>,
+    ) -> Result<SealedEntry, Error> {
+        let mut all: Vec<SpaceOp> = added
+            .iter()
+            .map(|(id, role, _)| SpaceOp::add_member(*id, *role))
+            .collect();
+        all.extend(ops);
+        if !self.policy.history_shared {
+            let mut recipients: Vec<&HybridPublicKey> = everyone.to_vec();
+            recipients.extend(added.iter().map(|(_, _, k)| *k));
+            return Ok(self.rotate(author, device, &recipients, all, time)?.0);
+        }
+        let epoch = self.current_epoch().ok_or(Error::NoEpochKey)?;
+        let key = self.keyring.get(&epoch).cloned().ok_or(Error::NoEpochKey)?;
+        let wraps: Vec<_> = added.iter().map(|(_, _, k)| key.wrap(k)).collect();
+        let heads = self.heads();
+        let mut b = SpaceEntryBuilder::new(
+            self.id,
+            &heads,
+            author.id(),
+            author_head(author, &device.public_key()),
+            epoch,
+            self.owner_membership_for(author.id()),
+        )
+        .ops(all)
+        .wraps(&wraps);
+        if let Some(t) = time {
+            b = b.time(t);
+        }
+        let e = b.sign(device)?;
+        let sealed = SealedEntry::seal(&e, &key, Some(wraps), self.policy.public)?;
+        self.sealed.insert(e.id(), sealed.clone());
+        self.insert_entry(e);
+        Ok(sealed)
     }
 
     /// Starts a new epoch wrapped to each member identity's encryption key
