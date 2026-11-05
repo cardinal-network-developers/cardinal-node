@@ -284,8 +284,7 @@ async fn tend(d: &Arc<Daemon>) {
         let core = d.core();
         let intros_of = |c: &ContactRecord| -> Vec<Introduction> {
             let sp = core.spaces.get(&c.space).and_then(|h| h.space.as_ref());
-            sp.map(|sp| relationship::introductions(sp))
-                .unwrap_or_default()
+            sp.map(relationship::introductions).unwrap_or_default()
         };
         for b in contacts.iter().filter(|c| introduces(c)) {
             for n in intros_of(b) {
