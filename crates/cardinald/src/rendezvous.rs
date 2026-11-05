@@ -85,6 +85,9 @@ const MAX_FOUND: usize = 8;
 const REACH_GAP: Duration = Duration::from_secs(5);
 /// How long a call waits for a contact to be found.
 const REACH_WITHIN: Duration = Duration::from_secs(12);
+/// How far apart a contact's devices can have this one send to an address
+/// they name: each time is a few handshake packets to wherever they say.
+const PUNCH_FOR_CONTACT_EVERY: Duration = Duration::from_secs(5);
 /// How lately a session must have been heard from to count as alive when
 /// someone says the device at its other end is looking for this one.
 const HEARD_LATELY: Duration = Duration::from_secs(5);
@@ -170,6 +173,8 @@ pub struct Rendezvous {
     /// Contacts' devices whose session did not answer when asked, by static
     /// key: looked for as if there were none, until a new one opens.
     suspect: Mutex<HashSet<[u8; 32]>>,
+    /// When a contact's device last had this one send to an address it named.
+    punched_for: Mutex<HashMap<[u8; 32], Instant>>,
 }
 
 fn in_use_for() -> Duration {
@@ -918,6 +923,15 @@ fn contact_incoming(d: &Arc<Daemon>, who: &[u8; 32], r: &Record) {
             return;
         }
         d.rendezvous.suspect(link.x25519());
+    }
+    // Packets to an address only they vouch for: not as often as they like.
+    {
+        let mut punched = lock(&d.rendezvous.punched_for);
+        punched.retain(|_, t| t.elapsed() < PUNCH_FOR_CONTACT_EVERY);
+        if punched.contains_key(who) {
+            return;
+        }
+        punched.insert(*who, Instant::now());
     }
     // They turned to this person: look for them again if this goes.
     d.rendezvous.use_contact(who);

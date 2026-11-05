@@ -1030,11 +1030,15 @@ impl Core {
             return self.others.contains_key(identity);
         }
         let open = self.spaces.get(label).and_then(|h| h.space.as_ref());
-        if let Some(s) = open {
-            return s.validity().members.iter().any(|m| m.identity == *identity);
-        }
-        // A space they offered this person, not yet here: they bring it.
-        self.offers_from(identity).iter().any(|o| o.space == *label)
+        open.is_some_and(|s| s.validity().members.iter().any(|m| m.identity == *identity))
+    }
+
+    /// Whether `label` is a space `identity` offered this person that is not
+    /// open here yet: what they send of it is taken, so it can be opened, and
+    /// nothing of it goes back, since an offer can name any space at all.
+    pub fn offered_here(&self, identity: &[u8; 32], label: &[u8; 32]) -> bool {
+        let open = self.spaces.get(label).is_some_and(|h| h.space.is_some());
+        !open && self.offers_from(identity).iter().any(|o| o.space == *label)
     }
 
     /// Whether `identity`'s log, as held here, has this device in it.
@@ -1055,8 +1059,9 @@ impl Core {
         let mut v: Vec<[u8; 32]> = self.identity_label().into_iter().collect();
         v.push(identity_log_label(identity));
         v.extend(self.spaces.keys().filter(|l| self.shares(identity, l)));
+        // An offered space not open here yet, to fetch from them.
         for o in self.offers_from(identity) {
-            if !v.contains(&o.space) {
+            if !v.contains(&o.space) && self.offered_here(identity, &o.space) {
                 v.push(o.space);
             }
         }

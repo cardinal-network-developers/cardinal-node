@@ -72,6 +72,9 @@ pub enum Access {
     /// log: to fetch, and nothing more, since only the owner's devices may
     /// send a host objects.
     Read,
+    /// A space a contact offered this person, not open here yet: what they
+    /// send is taken, and nothing is given (`spaces.md#holding-a-space`).
+    Offered,
     /// Nothing; answer as if the set were empty.
     None,
 }
@@ -131,6 +134,8 @@ impl Daemon {
                     Access::Other(identity)
                 } else if Some(*label) == core.identity_label() || core.shares(&identity, label) {
                     Access::Full
+                } else if core.offered_here(&identity, label) {
+                    Access::Offered
                 } else if let Some(m) = core
                     .members_shared_with(&identity)
                     .into_iter()
@@ -354,7 +359,7 @@ async fn handle_stream(d: &Arc<Daemon>, s: &Session, mut st: Stream) -> anyhow::
         }
         Message::Heads { label, ids } => {
             let access = d.access(kind, &label);
-            if matches!(access, Access::Full | Access::Other(_)) {
+            if matches!(access, Access::Full | Access::Other(_) | Access::Offered) {
                 let (missing, waiting): (Vec<[u8; 32]>, bool) = {
                     let core = d.core();
                     let missing = ids.into_iter().filter(|i| !core.has(&label, i)).collect();
