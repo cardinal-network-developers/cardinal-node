@@ -40,6 +40,11 @@ const VOICE_FOR: Duration = Duration::from_millis(500);
 /// How many frames a device remembers having passed on, so that one coming
 /// round another way is dropped.
 const SEEN: usize = 4096;
+/// How often a device on a group call says it is there, speaking or not: a
+/// frame with no sound, passed on as any other, that no client hears.
+const HERE_EVERY: Duration = Duration::from_secs(5);
+/// How long a device counts as on the call after it was last heard.
+const ON_THE_CALL_FOR: Duration = Duration::from_secs(12);
 
 /// The longest signal: a kind, a space and a call.
 const MAX_SIGNAL: usize = 128;
@@ -116,6 +121,8 @@ struct Mesh {
     voices: std::collections::HashMap<[u8; 8], (Instant, Instant)>,
     /// When each voice was last heard at all, to count who is on the call.
     heard: std::collections::HashMap<[u8; 8], Instant>,
+    /// This device is saying it is there.
+    announcing: bool,
 }
 
 impl Mesh {
@@ -466,7 +473,7 @@ fn voice_of(key: &[u8; 32]) -> [u8; 8] {
 /// How many are on a group call, as far as this device can tell: itself,
 /// those it is linked with, and every voice heard lately through them.
 fn on_the_call(m: &Mesh) -> usize {
-    let lately = Duration::from_secs(30);
+    let lately = ON_THE_CALL_FOR;
     let mut voices: std::collections::HashSet<[u8; 8]> = m
         .heard
         .iter()
@@ -577,6 +584,7 @@ async fn group_signal(
             if added {
                 d.bump();
                 carry_link(d, s, space, id);
+                announce(d, id);
                 tell(s, JOIN, &space, &id).await?;
             }
         }
@@ -588,6 +596,10 @@ async fn group_signal(
                 .and_then(|c| c.group.as_mut())
             {
                 mesh.links.retain(|l| l.peer_static() != s.peer_static());
+                // That device has left.
+                if let Some(p) = s.peer_identity() {
+                    mesh.heard.remove(&voice_of(&p.signing_key));
+                }
             }
             drop(call);
             d.bump();
@@ -642,6 +654,33 @@ fn carry_link(d: &Arc<Daemon>, s: &Session, space: SpaceId, id: [u8; 16]) {
     });
 }
 
+/// Says now and then, to everyone on a group call, that this device is
+/// there, while it is: how the others count who is on it.
+fn announce(d: &Arc<Daemon>, id: [u8; 16]) {
+    let over = {
+        let mut call = lock(d);
+        let Some(c) = call.as_mut().filter(|c| c.id == id) else {
+            return;
+        };
+        let Some(mesh) = c.group.as_mut().filter(|m| !m.announcing) else {
+            return;
+        };
+        mesh.announcing = true;
+        c.over.subscribe()
+    };
+    let d = d.clone();
+    tokio::spawn(async move {
+        let mut over = over;
+        let mut every = tokio::time::interval(HERE_EVERY);
+        loop {
+            tokio::select! {
+                _ = over.wait_for(|over| *over) => return,
+                _ = every.tick() => send_audio(&d, Vec::new()),
+            }
+        }
+    });
+}
+
 /// One frame of a group call, come on the link `from`.
 fn passed(d: &Daemon, from: &Session, id: &[u8; 16], frame: Bytes) {
     if frame.len() < 12 {
@@ -664,7 +703,10 @@ fn passed(d: &Daemon, from: &Session, id: &[u8; 16], frame: Bytes) {
             return;
         }
         mesh.heard.insert(voice, Instant::now());
-        if !mesh.passes(voice) {
+        // A frame with no sound only says someone is there: passed on, never
+        // heard, and no speaking.
+        let here = frame.len() == 12;
+        if !here && !mesh.passes(voice) {
             return;
         }
         let onward: Vec<Session> = mesh
@@ -675,7 +717,9 @@ fn passed(d: &Daemon, from: &Session, id: &[u8; 16], frame: Bytes) {
             .collect();
         (onward, label)
     };
-    let _ = d.call_audio.send((*id, Some(voice), frame.slice(12..)));
+    if frame.len() > 12 {
+        let _ = d.call_audio.send((*id, Some(voice), frame.slice(12..)));
+    }
     for l in onward {
         let _ = l.send_datagram(label, Priority::RealTime, frame.clone());
     }
