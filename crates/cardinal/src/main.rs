@@ -414,6 +414,36 @@ enum GroupCmd {
         /// The group, by name or id.
         group: String,
     },
+    /// Rename a group you are an admin of.
+    Rename {
+        /// The group, by name or id.
+        group: String,
+        /// Its new name.
+        name: String,
+    },
+    /// Whether a group you are an admin of introduces its members: on or off.
+    Introductions {
+        /// The group, by name or id.
+        group: String,
+        /// `on` or `off`.
+        setting: String,
+    },
+    /// How the others see a member of a group you are an admin of.
+    Member {
+        /// The group, by name or id.
+        group: String,
+        /// Who, as the group's members show them.
+        who: String,
+        /// The name the others see.
+        #[arg(long = "as")]
+        shown: Option<String>,
+        /// Not introduced through the group.
+        #[arg(long)]
+        no_introductions: bool,
+        /// Introduced through the group again.
+        #[arg(long, conflicts_with = "no_introductions")]
+        introductions: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1654,6 +1684,31 @@ async fn client(cmd: Cmd) -> anyhow::Result<()> {
                     json!({"cmd": "say", "group": group, "text": text})
                 }
                 GroupCmd::Messages { group } => json!({"cmd": "messages", "group": group}),
+                GroupCmd::Rename { group, name } => {
+                    json!({"cmd": "group-set", "group": group, "name": name})
+                }
+                GroupCmd::Introductions { group, setting } => {
+                    let on = match setting.as_str() {
+                        "on" => true,
+                        "off" => false,
+                        _ => anyhow::bail!("say on or off"),
+                    };
+                    json!({"cmd": "group-set", "group": group, "introductions": on})
+                }
+                GroupCmd::Member {
+                    group,
+                    who,
+                    shown,
+                    no_introductions,
+                    introductions,
+                } => {
+                    let introduce = match (*no_introductions, *introductions) {
+                        (true, _) => Some(false),
+                        (_, true) => Some(true),
+                        _ => None,
+                    };
+                    json!({"cmd": "group-member", "group": group, "who": who, "shown": shown, "introduce": introduce})
+                }
             };
             let v = call(&paths, req).await?;
             match cmd {
