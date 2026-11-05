@@ -842,11 +842,38 @@ pub async fn shared_blobs(d: &Arc<Daemon>, who: &[u8; 32]) -> Arc<HashSet<[u8; 3
             .iter()
             .find(|c| c.identity == *who)
             .map(|c| c.space);
+        // And the groups the two are in: what a group's messages carry is
+        // every member's, whoever sent it, since members who do not know
+        // each other get it through one who knows both.
+        let groups: Vec<SpaceId> = core
+            .spaces
+            .iter()
+            .filter(|(_, h)| {
+                h.space.as_ref().is_some_and(|s| {
+                    s.profile() == cardinal_space::group::GROUP
+                        && s.validity().members.iter().any(|m| m.identity == *who)
+                })
+            })
+            .map(|(id, _)| *id)
+            .collect();
+        let seen: usize = groups
+            .iter()
+            .filter_map(|g| core.spaces.get(g))
+            .map(|h| h.set_len())
+            .sum();
+        // What this device holds of other members' files changes with no
+        // new entry, so with groups the answer is worked out again every few
+        // seconds.
+        let lately = if groups.is_empty() {
+            0
+        } else {
+            (crate::core::now_ms() / 5000) as usize
+        };
         space
             .and_then(|s| core.spaces.get(&s))
-            .map(|h| (h.id, h.set_len()))
+            .map(|h| (h.id, (h.set_len() + seen) ^ (lately << 24), groups))
     };
-    let Some((space, size)) = size else {
+    let Some((space, size, groups)) = size else {
         return Arc::default();
     };
     {
@@ -870,7 +897,14 @@ pub async fn shared_blobs(d: &Arc<Daemon>, who: &[u8; 32]) -> Arc<HashSet<[u8; 3
             let put = open
                 .map(|sp| shared_folder_content(sp, me))
                 .unwrap_or_default();
-            attached.chain(put).collect()
+            let in_groups: Vec<BlobRef> = groups
+                .iter()
+                .filter_map(|g| core.spaces.get(g).and_then(|h| h.space.as_ref()))
+                .flat_map(relationship::messages)
+                .flat_map(|m| m.attachments)
+                .filter_map(|a| BlobRef::from_record(&a.blob).ok())
+                .collect();
+            attached.chain(put).chain(in_groups).collect()
         };
         let (mut files, mut ids) = (HashSet::new(), HashSet::new());
         for blob in blobs {

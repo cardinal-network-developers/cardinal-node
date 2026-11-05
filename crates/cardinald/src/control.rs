@@ -344,6 +344,11 @@ async fn handle(d: &Arc<Daemon>, req: &Value) -> anyhow::Result<Value> {
                 .unwrap_or_default();
             crate::contacts::say(d, arg(req, "who")?, arg(req, "text")?, reply_to, &attach).await
         }
+        "save-attachment" if req.get("group").is_some() => {
+            let index = req.get("index").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+            let (group, id, to) = (arg(req, "group")?, arg(req, "id")?, arg(req, "to")?);
+            crate::groups::save_attachment(d, group, id, index, to).await
+        }
         "save-attachment" => {
             let index = req.get("index").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
             let (who, id, to) = (arg(req, "who")?, arg(req, "id")?, arg(req, "to")?);

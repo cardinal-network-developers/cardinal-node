@@ -11,6 +11,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use cardinal_blob::BlobRef;
+use cardinal_link::Priority;
 use cardinal_space::account::ContactRecord;
 use cardinal_space::group::{self, Member};
 use cardinal_space::{relationship, Space, SpaceId, SpaceOp};
@@ -501,6 +502,55 @@ pub fn messages(d: &Daemon, group: &str) -> anyhow::Result<Json> {
         })
         .collect();
     Ok(json!({"group": hex::encode(g.id), "name": g.name, "messages": said}))
+}
+
+/// Saves a file that came with a message in a group, fetching it from the
+/// members in touch: its sender if they are, or anyone else who has it.
+pub async fn save_attachment(
+    d: &Arc<Daemon>,
+    group: &str,
+    id: &str,
+    index: usize,
+    to: &str,
+) -> anyhow::Result<Json> {
+    let g = find(d, group)?;
+    let m = message_in(d, &g.id, id)?;
+    let a = m.attachments.get(index);
+    let a = a.ok_or_else(|| anyhow::anyhow!("that message has no such attachment"))?;
+    let blob = BlobRef::from_record(&a.blob)
+        .map_err(|_| anyhow::anyhow!("that attachment cannot be read"))?;
+    let members: Vec<[u8; 32]> = {
+        let core = d.core();
+        let sp = core.spaces.get(&g.id).and_then(|h| h.space.as_ref());
+        sp.map(|sp| sp.validity().members.iter().map(|m| m.identity).collect())
+            .unwrap_or_default()
+    };
+    let in_touch = d.people_in_touch();
+    let mut from: Vec<[u8; 32]> = members
+        .into_iter()
+        .filter(|w| in_touch.contains(w))
+        .collect();
+    // The sender first.
+    from.sort_by_key(|w| *w != m.author);
+    let to = std::path::PathBuf::from(to);
+    let mut last = anyhow::anyhow!("nobody who has it is in touch right now");
+    for who in from.into_iter().map(Some).chain([None]) {
+        let (d, written) = (d.clone(), to.clone());
+        let got = tokio::task::spawn_blocking(move || -> anyhow::Result<u64> {
+            let fetch = match who {
+                Some(w) => crate::fetch::Fetcher::from_contact(&d, Priority::Interactive, w),
+                None => crate::fetch::Fetcher::new(&d, Priority::Interactive),
+            };
+            let mut reader = cardinal_blob::BlobReader::new(&*d.store, &fetch, blob);
+            contacts::write_new(&written, |out| contacts::write_out(&mut reader, out))
+        })
+        .await?;
+        match got {
+            Ok(size) => return Ok(json!({"path": to, "size": size})),
+            Err(e) => last = e,
+        }
+    }
+    Err(last)
 }
 
 /// A message of this person's own in a group: only that can be changed or

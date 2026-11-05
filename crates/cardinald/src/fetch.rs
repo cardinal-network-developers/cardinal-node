@@ -316,6 +316,50 @@ async fn pass(d: &Arc<Daemon>, complete: &mut HashSet<[u8; 32]>) -> anyhow::Resu
         }
         sources.push((Some(s.contact.identity), theirs));
     }
+    // A group's messages: each file from whoever sent it if this person
+    // knows them, and through a member they know if not, who keeps it.
+    {
+        let core = d.core();
+        let me = core.identity.as_ref().map(|i| i.id());
+        let contacts = core.contacts();
+        let known = |w: &[u8; 32]| contacts.iter().any(|c| c.identity == *w && c.connects());
+        let mut by: HashMap<Option<[u8; 32]>, Vec<(String, BlobRef)>> = HashMap::new();
+        for h in core.spaces.values() {
+            let Some(space) = h.space.as_ref() else {
+                continue;
+            };
+            let joined = me.is_some_and(|me| cardinal_space::group::joined(space, &me));
+            if space.profile() != cardinal_space::group::GROUP || !joined {
+                continue;
+            }
+            let base = format!("Groups/{}", cardinal_space::group::name(space));
+            let through = space
+                .validity()
+                .members
+                .iter()
+                .map(|m| m.identity)
+                .find(|w| known(w));
+            for m in relationship::messages(space) {
+                let from = if known(&m.author) {
+                    Some(m.author)
+                } else {
+                    through
+                };
+                for a in m.attachments {
+                    let Ok(b) = BlobRef::from_record(&a.blob) else {
+                        continue;
+                    };
+                    let full = format!("{base}/{}", a.name);
+                    let keep =
+                        !on_demand || pinned(&full) || (is_image(&full) && b.size <= IMAGE_KEEP);
+                    if keep && Some(m.author) != me {
+                        by.entry(from).or_default().push((full, b));
+                    }
+                }
+            }
+        }
+        sources.extend(by);
+    }
     let mut seen = HashSet::new();
     for (_, blobs) in &mut sources {
         blobs.retain(|(_, b)| seen.insert(b.id));

@@ -114,8 +114,35 @@ fn a_group_is_offered_joined_and_read_by_all() {
         said(&cy, &g).contains(&"Bo: hi from bo".to_owned())
     });
     assert!(said(&ana, &g).contains(&"Bo: hi from bo".to_owned()));
+    // A file Bo sends reaches Cy through Ana, who keeps it.
+    let photo = root.path().join("photo.bin");
+    std::fs::write(&photo, vec![7u8; 300_000]).unwrap();
+    ask(
+        &bo,
+        json!({"cmd": "say", "group": g, "text": "a file", "attach": [photo]}),
+    );
+    wait("the file's message reaches cy", 30, || {
+        said(&cy, &g).contains(&"Bo: a file".to_owned())
+    });
+    let file_id = {
+        let r = ask(&cy, json!({"cmd": "messages", "group": g}));
+        let all = r["messages"].as_array().unwrap().clone();
+        all.iter().find(|m| m["text"] == "a file").unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_owned()
+    };
+    let kept = root.path().join("kept.bin");
+    wait("cy saves it", 30, || {
+        let r = reply(
+            &cy,
+            &json!({"cmd": "save-attachment", "group": g, "id": file_id, "index": 0, "to": kept}),
+        );
+        r["ok"] == true
+    });
+    assert_eq!(std::fs::read(&kept).unwrap(), vec![7u8; 300_000]);
     let unread = groups(&cy)[0]["unread"].as_u64().unwrap();
-    assert_eq!(unread, 2, "{:?}", groups(&cy));
+    assert_eq!(unread, 3, "{:?}", groups(&cy));
     ask(&cy, json!({"cmd": "mark-read", "group": g}));
     assert_eq!(groups(&cy)[0]["unread"], 0);
 
@@ -291,6 +318,10 @@ fn a_group_call_carries_every_voice_through_whoever_links_them() {
         assert_eq!(said, others, "device {i} heard {h:?}");
         assert_eq!(h.len(), 2, "two voices, apart: {h:?}");
     }
+
+    // Bo hears Cy only through Ana, and still counts three on the call.
+    assert_eq!(ask(&bo, json!({"cmd": "call"}))["call"]["people"], 3);
+    assert_eq!(ask(&ana, json!({"cmd": "call"}))["call"]["people"], 3);
 
     // Cy leaves; Ana and Bo go on.
     ask(&cy, json!({"cmd": "call-end"}));

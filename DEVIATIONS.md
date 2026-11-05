@@ -96,7 +96,10 @@ should eventually be resolved by changing either the code or the spec.
   only the chunks and indexes of this person's attachments, and of content
   this person wrote in the shared folder, in the space shared with them, so
   one who knew the id of a private chunk would still not get it. What a
-  contact put there themselves comes from their devices.
+  contact put there themselves comes from their devices. In a group, a
+  member who is a contact gets every file the group's messages carry that
+  this device holds, whoever sent it, since members who do not know each
+  other get files through one who knows both, who keeps them.
 - **Shared files come from the two people's own devices, while online.**
   A device with full retention keeps every file of a shared folder and every
   attachment as they arrive, and one on demand keeps images up to 16 MiB, so

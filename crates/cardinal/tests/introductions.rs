@@ -83,6 +83,9 @@ fn an_introduction_makes_two_contacts_of_two_strangers() {
         "ana was asked before ben said yes"
     );
     ask(&ben, json!({"cmd": "introduction-accept", "id": i["id"]}));
+    // His own yes is not his to answer again.
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    assert!(waiting(&ben).is_empty(), "{:?}", waiting(&ben));
 
     wait("ana hears ben said yes", 30, || {
         waiting(&ana)
@@ -147,6 +150,12 @@ fn a_group_introduces_its_members() {
         &ana,
         json!({"cmd": "group-connect", "group": g, "who": "Ben"}),
     );
+    // Asking again while it is under way is the same ask.
+    let again = ask(
+        &ana,
+        json!({"cmd": "group-connect", "group": g, "who": "Ben"}),
+    );
+    assert_eq!(again["asked"], true, "{again}");
     wait("ben is asked, through the group", 30, || {
         waiting(&ben)
             .iter()

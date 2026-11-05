@@ -114,6 +114,8 @@ struct Mesh {
     order: std::collections::VecDeque<([u8; 8], u32)>,
     /// When each voice began speaking, and was last heard.
     voices: std::collections::HashMap<[u8; 8], (Instant, Instant)>,
+    /// When each voice was last heard at all, to count who is on the call.
+    heard: std::collections::HashMap<[u8; 8], Instant>,
 }
 
 impl Mesh {
@@ -445,15 +447,39 @@ pub fn current(d: &Daemon) -> Json {
         "seconds": c.live_since.map(|t| t.elapsed().as_secs()),
         "group": group.map(|_| hex::encode(c.space)),
         "linked": group.map(|m| m.links.iter().filter(|s| !s.is_closed()).count()),
+        "people": group.map(on_the_call),
     }})
 }
 
 /// This device's voice in group calls: who it is, without saying.
 fn origin_of(d: &Daemon) -> [u8; 8] {
-    let h = blake3::hash(&d.keys.key());
+    voice_of(&d.keys.key())
+}
+
+fn voice_of(key: &[u8; 32]) -> [u8; 8] {
+    let h = blake3::hash(key);
     let mut o = [0; 8];
     o.copy_from_slice(&h.as_bytes()[..8]);
     o
+}
+
+/// How many are on a group call, as far as this device can tell: itself,
+/// those it is linked with, and every voice heard lately through them.
+fn on_the_call(m: &Mesh) -> usize {
+    let lately = Duration::from_secs(30);
+    let mut voices: std::collections::HashSet<[u8; 8]> = m
+        .heard
+        .iter()
+        .filter(|(_, t)| t.elapsed() < lately)
+        .map(|(v, _)| *v)
+        .collect();
+    for l in m.links.iter().filter(|l| !l.is_closed()) {
+        if let Some(p) = l.peer_identity() {
+            voices.insert(voice_of(&p.signing_key));
+        }
+    }
+    voices.remove(&m.origin);
+    voices.len() + 1
 }
 
 /// Rings a group: each member device this one has a session with, and
@@ -634,7 +660,11 @@ fn passed(d: &Daemon, from: &Session, id: &[u8; 16], frame: Bytes) {
         };
         let label = channel_label(&c.space, &c.id);
         let Some(mesh) = c.group.as_mut() else { return };
-        if voice == mesh.origin || !mesh.fresh((voice, n)) || !mesh.passes(voice) {
+        if voice == mesh.origin || !mesh.fresh((voice, n)) {
+            return;
+        }
+        mesh.heard.insert(voice, Instant::now());
+        if !mesh.passes(voice) {
             return;
         }
         let onward: Vec<Session> = mesh

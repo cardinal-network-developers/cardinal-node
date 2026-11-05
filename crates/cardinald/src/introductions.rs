@@ -116,6 +116,19 @@ pub fn ask_in_group(
         .ok_or_else(|| {
             anyhow::anyhow!("no admin of {group_name} that you know can introduce you")
         })?;
+    // Asked already, and not answered: asking again changes nothing.
+    let asked = {
+        let core = d.core();
+        let sp = core.spaces.get(&admin.space).and_then(|h| h.space.as_ref());
+        sp.is_some_and(|sp| {
+            relationship::introductions(sp.state()).iter().any(|i| {
+                i.creator == me && i.introduced == them && i.group == Some(space) && !i.declined
+            })
+        })
+    };
+    if asked {
+        return Ok(json!({"asked": true}));
+    }
     let op =
         relationship::create_introduction(&admin.identity, &them, &shown, note, Some(&space), None);
     d.write_and_push(&admin.space, vec![op])?;
@@ -145,7 +158,13 @@ fn waiting(d: &Daemon) -> Vec<Waiting> {
         for i in relationship::introductions(sp.state()) {
             let theirs = i.introducer == c.identity && i.creator == c.identity;
             let known = contacts.iter().any(|k| k.identity == i.introduced);
-            if theirs && !i.declined && !known && i.introduced != me {
+            // One this person said yes to holds their own invitation: the
+            // other side answers it, not them.
+            let answered = i
+                .invitation
+                .as_ref()
+                .is_some_and(|r| Invitation::from_record(r).is_ok_and(|inv| inv.inviter == me));
+            if theirs && !i.declined && !known && !answered && i.introduced != me {
                 out.push(Waiting {
                     space: c.space,
                     from: c.clone(),
