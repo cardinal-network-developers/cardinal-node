@@ -129,6 +129,21 @@ fn strings(req: &Value, name: &str) -> Vec<String> {
         .collect()
 }
 
+/// What a client knows of this device's power and network
+/// (`apps.md#the-local-interface`), and what the service makes of it.
+fn conditions(d: &Arc<Daemon>, req: &Value) -> anyhow::Result<Value> {
+    let flag = |name| req.get(name).and_then(|v| v.as_bool());
+    if let Some(plugged_in) = flag("plugged_in") {
+        let metered = flag("metered").unwrap_or(false);
+        d.conditions.tell(crate::conditions::Told {
+            plugged_in,
+            metered,
+        });
+        d.bump();
+    }
+    Ok(d.conditions.json())
+}
+
 fn arg<'a>(req: &'a Value, name: &str) -> anyhow::Result<&'a str> {
     req.get(name)
         .and_then(|v| v.as_str())
@@ -360,6 +375,7 @@ async fn handle(d: &Arc<Daemon>, req: &Value) -> anyhow::Result<Value> {
         "delete-message" => crate::contacts::delete_message(d, arg(req, "who")?, arg(req, "id")?),
         "react" => crate::contacts::react(d, arg(req, "who")?, arg(req, "id")?, arg(req, "text")?),
         "call" => Ok(crate::calls::current(d)),
+        "conditions" => conditions(d, req),
         "call-start" if req.get("group").is_some() => {
             crate::calls::start_group(d, arg(req, "group")?).await
         }
@@ -828,6 +844,8 @@ fn status(d: &Arc<Daemon>) -> Value {
         "conflicts": conflicts,
         "progress": progress,
         "copies": crate::copies::status(d),
+        "conditions": d.conditions.json(),
+        "carrying_calls": crate::calls::carried(d),
         "old": crate::cleanup::status(d),
         "pairing": pairing,
         "peers": cfg.peers,

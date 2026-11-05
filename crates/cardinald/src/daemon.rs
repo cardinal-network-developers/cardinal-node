@@ -250,6 +250,12 @@ pub struct Daemon {
     pub pairing: Mutex<PairState>,
     /// The call under way.
     pub call: Mutex<Option<crate::calls::Call>>,
+    /// The group calls this device is on or carries, by call.
+    pub group_calls: Mutex<HashMap<[u8; 16], crate::calls::Group>>,
+    /// The group calls this device rang for lately.
+    pub rung_calls: Mutex<std::collections::VecDeque<[u8; 16]>>,
+    /// Whether this device can help others now (`conditions.rs`).
+    pub conditions: crate::conditions::Conditions,
     /// When each contact rang lately, so they can ring only so often.
     pub rang: Mutex<HashMap<[u8; 32], std::collections::VecDeque<Instant>>>,
     /// What each contact may fetch from here.
@@ -425,6 +431,9 @@ impl Daemon {
             changed: watch::channel(0).0,
             pairing: Mutex::new(PairState::Idle),
             call: Mutex::new(None),
+            group_calls: Mutex::new(HashMap::new()),
+            rung_calls: Mutex::new(std::collections::VecDeque::new()),
+            conditions: crate::conditions::Conditions::default(),
             rang: Mutex::new(HashMap::new()),
             shared_blobs: Mutex::new(HashMap::new()),
             call_audio: tokio::sync::broadcast::channel(64).0,

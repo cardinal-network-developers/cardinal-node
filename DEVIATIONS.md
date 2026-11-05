@@ -676,10 +676,15 @@ asks for around that is not built yet.
 - **One call at a time.** A call needs a session with the other person, so
   someone reached through hosts only cannot be called, and a group call
   reaches only the members linked by sessions, through hosts never. A device
-  joins a group call on every session it has with a member, with no limit on
-  its links, which a large group of people who all know each other would
-  feel. Nothing wakes a sleeping phone: `ring` goes only to devices that are
-  online.
+  links with every member device it has a session with: the sound settles onto
+  two of them per voice, but each link still hears an empty `have` every two
+  seconds, which a group of hundreds who all know each other would feel.
+  Nothing wakes a sleeping phone: `ring` goes only to devices that are online.
+- **Whether a network is metered is known only on Android**
+  (`hosts.md#devices-that-help`). Linux takes no network to be metered, so a
+  laptop plugged in on a phone's hotspot helps others. On Windows the service
+  cannot read the power supply itself: it helps until the window says the
+  machine is on battery, and the window cannot tell it about metering.
 - **A read marker covers what the device writing it had seen.** `profiles.md`
   says field 1 is the last message read, which is still what is written, but a
   message counts as read if the entry that wrote the marker descends from it. A

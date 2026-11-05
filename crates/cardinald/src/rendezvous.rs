@@ -28,7 +28,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, SocketAddr};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
@@ -111,8 +111,6 @@ const BUSY: u64 = 5;
 const UDP: u64 = 1;
 /// The field of a device's local addresses, in what is said of it.
 const LOCAL: u64 = 4;
-/// Where this kind of system lists what powers it.
-const POWER_SUPPLIES: &str = "/sys/class/power_supply";
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
@@ -417,31 +415,6 @@ fn helpers(d: &Daemon) -> Vec<Session> {
     sessions.filter(|s| !s.is_relayed()).collect()
 }
 
-/// Where this machine lists its power supplies. A test on a laptop must not
-/// depend on whether it is plugged in.
-fn power_supplies() -> PathBuf {
-    std::env::var_os("CARDINAL_TEST_POWER_SUPPLIES")
-        .map_or_else(|| PathBuf::from(POWER_SUPPLIES), PathBuf::from)
-}
-
-/// Whether this machine runs on its battery, which relaying would run down.
-fn on_battery(power_supplies: &Path) -> bool {
-    let read = |p: PathBuf, f: &str| std::fs::read_to_string(p.join(f)).unwrap_or_default();
-    let mut battery = false;
-    for d in std::fs::read_dir(power_supplies)
-        .into_iter()
-        .flatten()
-        .flatten()
-    {
-        match read(d.path(), "type").trim() {
-            "Battery" => battery = true,
-            _ if read(d.path(), "online").trim() == "1" => return false,
-            _ => {}
-        }
-    }
-    battery
-}
-
 /// The devices of this person's with no direct session, by static key.
 fn wanted(d: &Daemon) -> HashMap<[u8; 32], (KeyId, HybridPublicKey)> {
     let devices: Vec<(KeyId, HybridPublicKey)> = {
@@ -721,7 +694,9 @@ pub async fn serve(d: &Arc<Daemon>, s: &Session, mut st: Stream) -> anyhow::Resu
                 Some(connect_holder(d, s, token).await)
             }
             Some(_) if !rendezvous && op == Some(OP_RELAY) => {
-                if on_battery(&power_supplies()) {
+                // Only a device that helps others now: plugged in, and not
+                // on a metered network (`hosts.md#relay`).
+                if !d.conditions.helps() {
                     Some(error(BUSY))
                 } else {
                     Some(relay_holder(d, s, r))
@@ -759,7 +734,7 @@ pub async fn serve(d: &Arc<Daemon>, s: &Session, mut st: Stream) -> anyhow::Resu
     } else {
         match op {
             Some(OP_RELAYED) => None,
-            Some(OP_RELAY) if on_battery(&power_supplies()) => Some(error(BUSY)),
+            Some(OP_RELAY) if !d.conditions.helps() => Some(error(BUSY)),
             Some(OP_RELAY) => Some(open_relay(d, s, r)),
             _ => Some(error(UNKNOWN)),
         }
@@ -1551,31 +1526,6 @@ mod tests {
             .unwrap()
             .addresses()
             .is_empty());
-    }
-
-    fn power(dir: &Path, name: &str, kind: &str, online: Option<&str>) {
-        let d = dir.join(name);
-        std::fs::create_dir_all(&d).unwrap();
-        std::fs::write(d.join("type"), kind).unwrap();
-        if let Some(o) = online {
-            std::fs::write(d.join("online"), o).unwrap();
-        }
-    }
-
-    #[test]
-    fn a_device_on_battery_is_told_apart() {
-        let dir = tempfile::tempdir().unwrap();
-        assert!(!on_battery(dir.path()), "a desktop has no battery");
-        assert!(!on_battery(Path::new("/nothing/here")));
-        power(dir.path(), "BAT0", "Battery\n", None);
-        power(dir.path(), "AC", "Mains\n", Some("0\n"));
-        power(dir.path(), "usb-c", "USB\n", Some("0\n"));
-        assert!(on_battery(dir.path()), "nothing plugged in");
-        power(dir.path(), "usb-c", "USB\n", Some("1\n"));
-        assert!(!on_battery(dir.path()), "charging over USB");
-        power(dir.path(), "usb-c", "USB\n", Some("0\n"));
-        power(dir.path(), "AC", "Mains\n", Some("1\n"));
-        assert!(!on_battery(dir.path()), "plugged in");
     }
 
     #[test]

@@ -396,7 +396,7 @@ pub fn members(d: &Daemon, group: &str) -> anyhow::Result<Json> {
 
 /// This person turned to a group: its members who are trusted contacts are
 /// in use, and so looked for (`sync.md#neighbours`).
-fn use_members(d: &Daemon, id: &SpaceId) {
+pub(crate) fn use_members(d: &Daemon, id: &SpaceId) {
     let core = d.core();
     let Some(sp) = core.spaces.get(id).and_then(|h| h.space.as_ref()) else {
         return;
@@ -747,7 +747,8 @@ pub(crate) fn shared_group(d: &Daemon, space: &SpaceId, who: &[u8; 32]) -> Optio
     ours.then(|| group::name(sp))
 }
 
-/// The direct sessions with the devices of a group's other members.
+/// The sessions with the devices of a group's members: the other members',
+/// and this person's own other devices.
 pub(crate) fn member_sessions(d: &Daemon, space: &SpaceId) -> Vec<cardinal_link::Session> {
     let members: Vec<[u8; 32]> = {
         let core = d.core();
@@ -763,7 +764,10 @@ pub(crate) fn member_sessions(d: &Daemon, space: &SpaceId) -> Vec<cardinal_link:
         })
         .unwrap_or_default()
     };
-    let mut out = Vec::new();
+    if members.is_empty() {
+        return Vec::new();
+    }
+    let mut out = d.own_sessions();
     for (who, s) in d.contacts_in_touch() {
         if members.contains(&who) {
             out.push(s);

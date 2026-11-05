@@ -8,6 +8,7 @@
 pub mod applog;
 pub mod calls;
 pub mod cleanup;
+pub mod conditions;
 pub mod config;
 pub mod contacts;
 pub mod control;
@@ -23,6 +24,7 @@ pub mod host;
 pub mod introductions;
 pub mod keys;
 pub mod mailbox;
+pub mod mesh;
 pub mod net;
 pub mod news;
 pub mod onefolder;
