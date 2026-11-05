@@ -742,7 +742,6 @@ fn read_local(path: &Path, name: &str) -> anyhow::Result<LocalItem> {
         let target = std::fs::read_link(path)?.to_string_lossy().into_owned();
         Ok(LocalItem::Link(name.to_owned(), target))
     } else {
-        use std::os::unix::fs::PermissionsExt;
         let mtime = meta
             .modified()
             .ok()
@@ -751,9 +750,25 @@ fn read_local(path: &Path, name: &str) -> anyhow::Result<LocalItem> {
         Ok(LocalItem::File(
             name.to_owned(),
             path.to_path_buf(),
-            meta.permissions().mode() & 0o7777,
+            mode_of(&meta),
             mtime,
         ))
+    }
+}
+
+#[cfg(unix)]
+fn mode_of(meta: &std::fs::Metadata) -> u32 {
+    use std::os::unix::fs::PermissionsExt;
+    meta.permissions().mode() & 0o7777
+}
+
+/// Windows has no mode bits: a file is read-only or not.
+#[cfg(not(unix))]
+fn mode_of(meta: &std::fs::Metadata) -> u32 {
+    if meta.permissions().readonly() {
+        0o444
+    } else {
+        0o644
     }
 }
 
