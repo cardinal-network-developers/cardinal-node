@@ -358,3 +358,35 @@ fn the_command_line_does_the_same() {
     a.cli(&["contact", &who, "category", "Family"]);
     assert!(a.cli(&["files"]).contains("Family/"));
 }
+
+/// What an application on a phone does when it saves a document it edited.
+#[test]
+fn a_file_written_again_is_a_new_version_of_it() {
+    let root = tempfile::tempdir().unwrap();
+    let (a, b) = met(root.path(), &[]);
+    let draft = root.path().join("draft.txt");
+    std::fs::write(&draft, "first").unwrap();
+    ask(
+        &a,
+        json!({"cmd": "write", "from": draft, "path": "People/Bo/notes.txt"}),
+    );
+    wait("at Bo's", 20, || names(&b, "People/Ana") == ["notes.txt"]);
+    std::fs::write(&draft, "second, longer").unwrap();
+    ask(
+        &a,
+        json!({"cmd": "write", "from": draft, "path": "People/Bo/notes.txt"}),
+    );
+    wait("the change at Bo's", 20, || {
+        entry(&b, "People/Ana", "notes.txt")["size"] == 14
+    });
+    assert_eq!(names(&b, "People/Ana"), ["notes.txt"], "one file, not two");
+    assert_eq!(
+        saved(&b, root.path(), "People/Ana/notes.txt"),
+        b"second, longer"
+    );
+    let no = refused(
+        &a,
+        json!({"cmd": "write", "from": draft, "path": "People/Bo"}),
+    );
+    assert!(!no.is_empty());
+}

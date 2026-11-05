@@ -300,6 +300,7 @@ async fn handle(d: &Arc<Daemon>, req: &Value) -> anyhow::Result<Value> {
         "copy" => crate::onefolder::copy(d, arg(req, "from")?, arg(req, "to")?).await,
         "put" => crate::onefolder::put(d, arg(req, "from")?, arg(req, "to")?).await,
         "save" => crate::onefolder::save(d, arg(req, "path")?, arg(req, "to")?).await,
+        "write" => crate::onefolder::write(d, arg(req, "from")?, arg(req, "path")?).await,
         "share" => {
             let paths: Vec<String> = req
                 .get("paths")

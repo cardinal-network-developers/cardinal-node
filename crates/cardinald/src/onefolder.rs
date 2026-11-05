@@ -812,6 +812,49 @@ fn dst_path_hint(at: &At) -> String {
     at.shared.as_ref().map(Shown::path).unwrap_or_default()
 }
 
+/// Makes the file at `path` hold what `from` on this device's disk holds: a
+/// new version of it if it is there, and a new file if not. This is how an
+/// application that edited a copy saves it back.
+pub async fn write(d: &Arc<Daemon>, from: &str, path: &str) -> anyhow::Result<Json> {
+    let (parent, name) = split_last(path)?;
+    let dst = folder(d, &parent)?;
+    let existing = {
+        let core = d.core();
+        let files = Files::new(open(&core, &dst.space)?);
+        files
+            .list(&dst.node)
+            .into_iter()
+            .find(|e| e.name == name && e.conflict_version.is_none())
+            .map(|e| (e.node, e.kind))
+    };
+    let secret = secret(d, &dst.space)?;
+    let (d2, local) = (d.clone(), PathBuf::from(from));
+    let content = tokio::task::spawn_blocking(move || -> anyhow::Result<Content> {
+        let mut f = std::fs::File::open(&local)
+            .map_err(|e| anyhow::anyhow!("cannot read {}: {e}", local.display()))?;
+        let size = f.metadata()?.len();
+        encode(&mut f, &secret, &d2, size, false)
+    })
+    .await??;
+    match existing {
+        Some((node, FileKind::File)) => {
+            let ops = vec![
+                files::set_content(node, &content),
+                files::set_mtime(node, now_ms()),
+            ];
+            d.write_and_push(&dst.space, ops)?;
+        }
+        Some(_) => anyhow::bail!("{path} is a folder"),
+        None => {
+            not_a_category(d, &dst, &name)?;
+            let op =
+                kinds(d, &dst.space)?.create_file(dst.node, &name, &content, 0o644, Some(now_ms()));
+            d.write_and_push(&dst.space, vec![op])?;
+        }
+    }
+    Ok(json!({"path": path}))
+}
+
 /// Writes a file of the one folder to `to` on this device's disk, fetching
 /// what is not here.
 pub async fn save(d: &Arc<Daemon>, path: &str, to: &str) -> anyhow::Result<Json> {
