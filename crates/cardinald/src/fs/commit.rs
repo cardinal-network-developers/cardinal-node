@@ -553,6 +553,9 @@ pub fn write_pending(
             i.staged = None;
         }
     }
+    if let Err(e) = t.journal_committed() {
+        tracing::warn!("cannot update the journal of flushed files: {e}");
+    }
     if t.has_pending() {
         // what is left (files still being written) waits for its own quiet
         t.first_change = Some(Instant::now());

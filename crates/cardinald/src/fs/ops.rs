@@ -1057,12 +1057,20 @@ impl Filesystem for CardinalFs {
     }
 
     fn fsync(&mut self, _req: &Request<'_>, ino: u64, _fh: u64, _ds: bool, reply: ReplyEmpty) {
+        // What is flushed survives a crash, as on any disk: the staging
+        // file's data, then a journal record of where it belongs, which a
+        // restart commits (`profiles.md#mapping-to-a-disk-guidance`).
         let st = lock(&self.tree)
             .inodes
             .get(&ino)
             .and_then(|i| i.staged.clone());
         if let Some(st) = st {
-            let _ = st.sync_data();
+            if let Err(e) = st.sync_data() {
+                return reply.error(errno("cannot flush a file", e));
+            }
+            if let Err(e) = lock(&self.tree).journal_flushed(ino) {
+                return reply.error(errno("cannot flush a file", e));
+            }
         }
         reply.ok();
     }

@@ -89,6 +89,11 @@ impl Part {
             // What `.cardinalignore` keeps on this device (`local.rs`).
             t.load_local(h.and_then(|h| h.space.as_ref()));
             t.ignore_seen = Some(t.ignore_texts(&d.store));
+            // What applications flushed before a crash, committed again.
+            let taken = t.replay_journal();
+            if taken > 0 {
+                tracing::info!("taking up {taken} flushed files not yet saved");
+            }
         }
         let fs = CardinalFs::shared_with(d.clone(), tree.clone(), contact);
         let stop = Arc::new(AtomicBool::new(false));
