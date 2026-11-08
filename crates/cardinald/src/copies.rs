@@ -647,6 +647,24 @@ fn plan(d: &Daemon) -> Option<Plan> {
     })
 }
 
+/// Sessions open now with this person's devices that the account space says
+/// keep the files space in full.
+pub(crate) fn full_holder_sessions(d: &Daemon) -> Vec<cardinal_link::Session> {
+    let Some(p) = plan(d) else {
+        return Vec::new();
+    };
+    let sessions: HashMap<[u8; 32], cardinal_link::Session> = d
+        .own_sessions()
+        .into_iter()
+        .map(|s| (s.peer_static(), s))
+        .collect();
+    p.view
+        .remote
+        .iter()
+        .filter_map(|(_, x)| sessions.get(x).cloned())
+        .collect()
+}
+
 /// What one round of the check loop decided, from the blocking part.
 struct Round {
     pool: Pool,

@@ -196,7 +196,10 @@ should eventually be resolved by changing either the code or the spec.
   concurrent writers never double-count). One process should own a store
   directory: opening it clears `tmp/` and recounts usage by scanning.
   `Fsync::Deferred` (the writer syncs once per blob, in parallel) is the
-  intended default for the daemon.
+  intended default for the daemon. Under it a put waits in `tmp/`,
+  readable through a pending map, until the sync flushes its data and only
+  then links it (`blobs.md#storing`). Storing an id again compares the
+  bytes held with the bytes given, a full read, and replaces a mismatch.
 - `MemSet` keeps sorted blocks of at most 512 ids with lazily rebuilt
   prefix sums, so a range fingerprint costs two binary searches and at
   most a few hundred 256-bit additions at any set size.
@@ -561,6 +564,22 @@ Not implemented yet (the next milestone):
   AEAD of blob chunks).
 
 ## Daemon, mount, and CLI (`cardinald`, `cardinal`)
+
+- **What a flush promises** (`profiles.md#mapping-to-a-disk-guidance`). An
+  `fsync` through the mount flushes the staging file and, the first time
+  or after the file moved, appends its path, staging file and mode to
+  `staging/journal`, flushed with the staging directory. A mount starting
+  up takes up every staging file the journal names (making folders that
+  are missing), and removes staging files nothing names. The path is the
+  one at the last such record: `fsyncdir` is not implemented, so a rename
+  or delete is durable at the next commit, which a disk does not promise
+  sooner either. Writes never flushed are lost in a crash, as on a disk.
+- **Dropping a chunk** (`blobs.md#dropping-a-chunk`). Only this person's own
+  devices with full retention are checked, through the copy-check sessions
+  (`copies.rs`); storage hosts are not asked yet, so a person whose only
+  full holder is a host keeps everything on an on-demand device. What could
+  not be dropped is in `cardinal status` under `old.only_here` and said by
+  `cardinal free-space`; no client shows it yet.
 
 - **Spec ambiguity: a node cannot be named in the entry that creates it.**
   `state.md` allows naming a node "in the entry itself", but a node's id is

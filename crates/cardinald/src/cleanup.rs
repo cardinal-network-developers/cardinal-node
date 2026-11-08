@@ -179,9 +179,12 @@ pub struct Plan {
     /// Bytes held only for deleted files and old versions, before
     /// deleting.
     pub old_bytes: u64,
-    /// Of those, the bytes the plan deletes (the rest of `delete` are
-    /// on-demand evictions of current files).
+    /// Of those, the bytes the plan deletes.
     pub old_deleted: u64,
+    /// Under on-demand retention, objects of current files to drop to get
+    /// within the budget, least recently used first: dropped only once a
+    /// device that keeps everything produces them (`blobs.md#dropping-a-chunk`).
+    pub evict: Vec<(Id, u64)>,
 }
 
 /// What to keep and what may go, for [`plan`].
@@ -199,8 +202,8 @@ pub struct Wanted<'a> {
 
 /// Decides what to delete: the objects of expired blobs that no current
 /// or kept blob also names (chunks are shared between files with the same
-/// content), and under on-demand retention the least recently used
-/// objects of current files that are not pinned, beyond the budget. An
+/// content); and, to evict, under on-demand retention the least recently
+/// used objects of current files that are not pinned, beyond the budget. An
 /// object no blob names is left alone: deleting only what is known to be
 /// old keeps a mistake in finding what is current from deleting it.
 /// Objects stored or read less than `min_age` before `now` stay.
@@ -253,7 +256,7 @@ pub fn plan(
                 break;
             }
             total -= o.size;
-            out.delete.push((o.id, o.size));
+            out.evict.push((o.id, o.size));
         }
     }
     Ok(out)
@@ -287,6 +290,9 @@ pub struct Seen {
     pub old_bytes: u64,
     /// When (ms since the epoch).
     pub at: u64,
+    /// Under on-demand retention: files and bytes over the budget that could
+    /// not be dropped, because no device that keeps everything produced them.
+    pub only_here: (u64, u64),
 }
 
 /// The cleaner of a daemon.
@@ -346,10 +352,88 @@ pub fn pass(d: &Daemon, now_all: bool, dry_run: bool) -> anyhow::Result<Freed> {
     let c = &d.cleanup;
     let _one_at_a_time = lock(&c.running);
     // From finding what is current to deleting, no commit runs.
-    crate::fs::commit::without_commits(|| pass_now(d, now_all, dry_run))
+    let (mut freed, evict, live) =
+        crate::fs::commit::without_commits(|| pass_now(d, now_all, dry_run))?;
+    if !evict.is_empty() {
+        let (objects, bytes, kept) = evict_checked(d, &evict, dry_run);
+        freed.objects += objects;
+        freed.bytes += bytes;
+        let mut files = 0u64;
+        let mut kept_bytes = 0u64;
+        if !kept.is_empty() {
+            let store: &dyn ObjectStore = &*d.store;
+            for b in &live {
+                let mut o = HashSet::new();
+                if held_objects(store, b, &mut o).is_ok() && !o.is_disjoint(&kept) {
+                    files += 1;
+                }
+            }
+            kept_bytes = evict.iter().filter(|(id, _)| kept.contains(id)).map(|(_, s)| s).sum();
+            tracing::warn!(
+                "over its budget: {files} files ({kept_bytes} bytes) are not on a device \
+                 that keeps everything yet, so they stay"
+            );
+        }
+        lock(&c.seen).get_or_insert_with(Seen::default).only_here = (files, kept_bytes);
+    } else {
+        lock(&c.seen).get_or_insert_with(Seen::default).only_here = (0, 0);
+    }
+    Ok(freed)
 }
 
-fn pass_now(d: &Daemon, now_all: bool, dry_run: bool) -> anyhow::Result<Freed> {
+/// Lock, Check, Delete (`blobs.md#dropping-a-chunk`): stops answering for
+/// the objects, asks devices that keep everything for them, and deletes
+/// those one of them produced. Returns the objects and bytes dropped (or
+/// that would be, in a dry run) and the objects kept.
+fn evict_checked(d: &Daemon, evict: &[(Id, u64)], dry_run: bool) -> (u64, u64, HashSet<Id>) {
+    let ids: Vec<Id> = evict.iter().map(|(id, _)| *id).collect();
+    if !dry_run {
+        lock(&d.leaving).extend(ids.iter().copied());
+    }
+    let mut produced: HashSet<Id> = HashSet::new();
+    for s in crate::copies::full_holder_sessions(d) {
+        let want: Vec<Id> = ids.iter().filter(|i| !produced.contains(*i)).copied().collect();
+        if want.is_empty() {
+            break;
+        }
+        for batch in want.chunks(64) {
+            let reply = d.rt.block_on(crate::net::blob_request(
+                &s,
+                batch.to_vec(),
+                cardinal_link::Priority::Background,
+            ));
+            let Ok(reply) = reply else { break };
+            for item in reply.items {
+                if let cardinal_sync::BlobItem::Held { id, ciphertext } = item {
+                    if cardinal_blob::object_id(&ciphertext) == id {
+                        produced.insert(id);
+                    }
+                }
+            }
+        }
+    }
+    let (mut objects, mut bytes) = (0, 0);
+    let mut kept = HashSet::new();
+    for (id, size) in evict {
+        if !produced.contains(id) {
+            kept.insert(*id);
+        } else if dry_run || d.store.delete(id).unwrap_or(false) {
+            objects += 1;
+            bytes += size;
+        }
+    }
+    if !dry_run {
+        let mut l = lock(&d.leaving);
+        for id in &ids {
+            l.remove(id);
+        }
+    }
+    (objects, bytes, kept)
+}
+
+type Passed = (Freed, Vec<(Id, u64)>, Vec<BlobRef>);
+
+fn pass_now(d: &Daemon, now_all: bool, dry_run: bool) -> anyhow::Result<Passed> {
     let c = &d.cleanup;
     let (keep, on_demand, pins, budget) = {
         let cfg = d.config();
@@ -367,7 +451,7 @@ fn pass_now(d: &Daemon, now_all: bool, dry_run: bool) -> anyhow::Result<Freed> {
             .and_then(|f| core.spaces.get(&f))
             .and_then(|h| h.space.as_ref())
         else {
-            return Ok(Freed::default());
+            return Ok((Freed::default(), Vec::new(), Vec::new()));
         };
         let current = current_blobs(sp);
         let pinned: Vec<BlobRef> = current
@@ -419,9 +503,14 @@ fn pass_now(d: &Daemon, now_all: bool, dry_run: bool) -> anyhow::Result<Freed> {
                 freed.bytes
             );
         }
-        *lock(&c.seen) = Some(Seen { old_bytes, at: now });
+        let only_here = lock(&c.seen).as_ref().map(|s| s.only_here).unwrap_or_default();
+        *lock(&c.seen) = Some(Seen {
+            old_bytes,
+            at: now,
+            only_here,
+        });
     }
-    Ok(freed)
+    Ok((freed, p.evict, live))
 }
 
 /// Starts the hourly pass (`CARDINAL_TEST_FREE_INTERVAL_MS` for tests),
@@ -460,7 +549,13 @@ pub fn start(d: std::sync::Arc<Daemon>) {
 pub fn status(d: &Daemon) -> Value {
     let keep = Keep::parse(&d.config().keep_old).unwrap_or(Keep::Days(30));
     match d.cleanup.seen() {
-        Some(s) => json!({"bytes": s.old_bytes, "at": s.at, "keep": keep.to_string()}),
+        Some(s) => json!({
+            "bytes": s.old_bytes,
+            "at": s.at,
+            "keep": keep.to_string(),
+            // over the budget, and on no device that keeps everything yet
+            "only_here": {"files": s.only_here.0, "bytes": s.only_here.1},
+        }),
         None => json!({"bytes": null, "keep": keep.to_string()}),
     }
 }
@@ -606,7 +701,8 @@ mod tests {
         let p = plan(&store, &wanted, later, Duration::from_secs(3600)).unwrap();
         let mut pin_o = HashSet::new();
         held_objects(&store, &pinned, &mut pin_o).unwrap();
-        let deleted: HashSet<Id> = p.delete.iter().map(|(id, _)| *id).collect();
+        let deleted: HashSet<Id> = p.evict.iter().map(|(id, _)| *id).collect();
+        assert!(p.delete.is_empty(), "nothing old to delete");
         assert!(deleted.is_disjoint(&pin_o));
         let mut other_o = HashSet::new();
         held_objects(&store, &other, &mut other_o).unwrap();

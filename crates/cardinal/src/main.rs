@@ -1900,6 +1900,13 @@ async fn client(cmd: Cmd) -> anyhow::Result<()> {
                 v = call(&paths, json!({"cmd": "free-space"})).await?;
                 println!("Freed {}.", human_size(v["bytes"].as_u64().unwrap_or(0)));
             }
+            // Over the budget, but on no device that keeps everything yet.
+            if let Some(n) = v["only_here"]["files"].as_u64().filter(|n| *n > 0) {
+                println!(
+                    "{n} files here are not on your other devices yet, so removing them to make \
+                     room would lose them. They stay."
+                );
+            }
             // What changed in the last hour is not freed yet.
             if let Some(b) = v["left"].as_u64().filter(|b| *b > 0) {
                 println!(

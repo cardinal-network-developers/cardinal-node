@@ -650,10 +650,15 @@ async fn serve_blob(
     let req = BlobRequest::decode(&v.encode())?;
     tracing::trace!("serving {} blob objects", req.ids.len());
     let store = d.store.clone();
+    let leaving = d.leaving.clone();
     let reply = tokio::task::spawn_blocking(move || {
         req.serve(|id| {
             use cardinal_blob::ObjectStore;
             if allowed.as_ref().is_some_and(|a| !a.contains(id)) {
+                return None;
+            }
+            // being dropped: not counted as a copy by whoever asks
+            if leaving.lock().unwrap_or_else(|e| e.into_inner()).contains(id) {
                 return None;
             }
             store.get(id).ok().flatten()

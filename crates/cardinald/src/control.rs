@@ -533,7 +533,12 @@ async fn handle(d: &Arc<Daemon>, req: &Value) -> anyhow::Result<Value> {
             let d2 = d.clone();
             let f = tokio::task::spawn_blocking(move || crate::cleanup::pass(&d2, true, dry_run))
                 .await??;
-            Ok(json!({"objects": f.objects, "bytes": f.bytes, "left": f.left}))
+            Ok(json!({
+                "objects": f.objects,
+                "bytes": f.bytes,
+                "left": f.left,
+                "only_here": crate::cleanup::status(d)["only_here"],
+            }))
         }
         "keep-old" => {
             let keep = crate::cleanup::Keep::parse(arg(req, "keep")?)?;

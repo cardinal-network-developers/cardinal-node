@@ -286,6 +286,9 @@ pub struct Daemon {
     pub copies: crate::copies::Tracker,
     /// Freeing deleted files and old versions (`cleanup.rs`).
     pub cleanup: crate::cleanup::Cleaner,
+    /// Objects being dropped: answered as not held until they are gone or
+    /// kept (`blobs.md#dropping-a-chunk`).
+    pub leaving: Arc<Mutex<HashSet<[u8; 32]>>>,
     /// Speed tests this device serves (`speedtest.rs`).
     pub speedtest: crate::speedtest::Limiter,
     /// How the person will regard whoever uses each outstanding invitation,
@@ -453,6 +456,7 @@ impl Daemon {
             mailbox,
             copies: crate::copies::Tracker::load(copies_path, crate::copies::Rules::from_env()),
             cleanup: crate::cleanup::Cleaner::load(old_versions),
+            leaving: Arc::default(),
             speedtest: crate::speedtest::Limiter::default(),
             invitations: Mutex::new(HashMap::new()),
             admitted: Mutex::new(HashMap::new()),
