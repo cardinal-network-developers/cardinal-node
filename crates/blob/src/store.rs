@@ -204,24 +204,30 @@ impl ObjectStore for MemStore {
 pub enum Fsync {
     /// Every `put` syncs the file and its directory before returning.
     Always,
-    /// `put` returns once the object is visible; [`ObjectStore::sync`]
-    /// syncs everything put since the last sync. Writers call it once at
-    /// the end of a blob, which is much faster than syncing every chunk.
+    /// `put` writes the object to a temporary file and returns; it can be
+    /// read at once. [`ObjectStore::sync`] flushes everything put since the
+    /// last sync and only then moves it under its id, so an object under its
+    /// id is always whole (`blobs.md#storing`). Writers call it once at the
+    /// end of a blob, which is much faster than syncing every chunk.
     Deferred,
     /// Never sync; leave it to the operating system. For caches and tests.
     Never,
 }
 
 /// A store in a directory: `objects/ab/cd/<64 hex digits>`, written
-/// atomically (temporary file, then a hard link that fails if the object
-/// already exists, so concurrent writers of one object never conflict and
-/// usage counts stay exact).
+/// atomically: a temporary file, flushed (except under [`Fsync::Never`]),
+/// then a hard link that fails if the object already exists, so concurrent
+/// writers of one object never conflict and usage counts stay exact. An
+/// object found under its id that is not the bytes being stored again is
+/// replaced, so a chunk truncated by a crash is never reused.
 pub struct FsStore {
     root: PathBuf,
     fsync: Fsync,
     objects: AtomicU64,
     bytes: AtomicU64,
-    dirty: Mutex<Vec<PathBuf>>,
+    /// Under [`Fsync::Deferred`], objects written but not yet flushed and
+    /// moved into place, by id: their temporary files.
+    pending: Mutex<HashMap<Id, PathBuf>>,
     tmp_counter: AtomicU64,
 }
 
@@ -292,7 +298,7 @@ impl FsStore {
             fsync,
             objects: AtomicU64::new(0),
             bytes: AtomicU64::new(0),
-            dirty: Mutex::new(Vec::new()),
+            pending: Mutex::new(HashMap::new()),
             tmp_counter: AtomicU64::new(0),
         };
         let mut objects = 0;
@@ -374,8 +380,102 @@ fn no_links(e: &io::Error) -> bool {
     ) || e.raw_os_error() == Some(1)
 }
 
+/// Puts the file at `tmp` under `path`, unless something is there already.
+fn link(tmp: &Path, path: &Path) -> io::Result<bool> {
+    match fs::hard_link(tmp, path) {
+        Ok(()) => Ok(true),
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => Ok(false),
+        // Some systems allow no hard links, Android's app storage among
+        // them. A rename does as well for content named by its hash: what it
+        // might replace is the same bytes.
+        Err(e) if no_links(&e) => fs::rename(tmp, path).map(|()| true),
+        Err(e) => Err(e),
+    }
+}
+
+/// Flushes the data of each file, or of each directory with `dir`, many at
+/// once: far faster than one at a time on SSDs. Files gone meanwhile are
+/// skipped.
+fn sync_paths(paths: &[PathBuf], dir: bool) -> io::Result<()> {
+    if paths.is_empty() {
+        return Ok(());
+    }
+    let threads = paths.len().clamp(1, 16);
+    let per = paths.len().div_ceil(threads);
+    std::thread::scope(|s| {
+        let handles: Vec<_> = paths
+            .chunks(per)
+            .map(|part| {
+                s.spawn(move || -> io::Result<()> {
+                    for p in part {
+                        match File::open(p) {
+                            Ok(f) if dir => f.sync_all()?,
+                            Ok(f) => f.sync_data()?,
+                            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                            Err(e) => return Err(e),
+                        }
+                    }
+                    Ok(())
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .try_for_each(|h| h.join().expect("fsync thread panicked"))
+    })
+}
+
+impl FsStore {
+    /// Flushes `paths` (files, or directories with `dir`): one `syncfs` of
+    /// the store's file system when there are many, which flushes them all
+    /// in one journal commit where thousands of `fsync`s cost seconds.
+    fn flush(&self, paths: &[PathBuf], dir: bool) -> io::Result<()> {
+        #[cfg(target_os = "linux")]
+        if paths.len() >= SYNCFS_FROM && syncfs(&self.root).is_ok() {
+            return Ok(());
+        }
+        sync_paths(paths, dir)
+    }
+
+    /// Writes `bytes` to a new temporary file, flushed unless `Never`.
+    fn write_tmp(&self, bytes: &[u8], flush: bool) -> io::Result<PathBuf> {
+        let tmp = self.tmp_path();
+        let r = (|| {
+            let mut f = OpenOptions::new().write(true).create_new(true).open(&tmp)?;
+            f.write_all(bytes)?;
+            if flush {
+                f.sync_data()?;
+            }
+            Ok(())
+        })();
+        match r {
+            Ok(()) => Ok(tmp),
+            Err(e) => {
+                let _ = fs::remove_file(&tmp);
+                Err(e)
+            }
+        }
+    }
+
+    /// Replaces a damaged object at `path` with `bytes`.
+    fn replace(&self, path: &Path, bytes: &[u8]) -> io::Result<()> {
+        let tmp = self.write_tmp(bytes, self.fsync != Fsync::Never)?;
+        if let Err(e) = fs::rename(&tmp, path) {
+            let _ = fs::remove_file(&tmp);
+            return Err(e);
+        }
+        if self.fsync != Fsync::Never {
+            sync_dir(path.parent().expect("object path has a parent"))?;
+        }
+        Ok(())
+    }
+}
+
 impl ObjectStore for FsStore {
     fn has(&self, id: &Id) -> io::Result<bool> {
+        if self.pending.lock().unwrap().contains_key(id) {
+            return Ok(true);
+        }
         match fs::symlink_metadata(self.path_of(id)) {
             Ok(_) => Ok(true),
             Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(false),
@@ -384,6 +484,15 @@ impl ObjectStore for FsStore {
     }
 
     fn get(&self, id: &Id) -> io::Result<Option<Vec<u8>>> {
+        let tmp = self.pending.lock().unwrap().get(id).cloned();
+        if let Some(tmp) = tmp {
+            match fs::read(tmp) {
+                Ok(b) => return Ok(Some(b)),
+                // moved into place meanwhile
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e),
+            }
+        }
         match fs::read(self.path_of(id)) {
             Ok(b) => Ok(Some(b)),
             Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
@@ -392,50 +501,66 @@ impl ObjectStore for FsStore {
     }
 
     fn put(&self, id: &Id, bytes: &[u8]) -> io::Result<bool> {
-        let path = self.path_of(id);
-        if self.has(id)? {
-            // Stored again (identical content): as new as if just stored,
-            // so freeing old versions does not take it from under a
-            // commit that names it.
-            let _ = self.touch(id);
+        check_id(id, bytes)?;
+        if self.pending.lock().unwrap().contains_key(id) {
             return Ok(false);
         }
-        check_id(id, bytes)?;
+        let path = self.path_of(id);
+        match fs::read(&path) {
+            Ok(held) if held == bytes => {
+                // Stored again (identical content): as new as if just stored,
+                // so freeing old versions does not take it from under a
+                // commit that names it.
+                let _ = self.touch(id);
+                return Ok(false);
+            }
+            Ok(held) => {
+                // Not what its id says, as a chunk cut short by a power cut
+                // under an older version would be: replaced, never reused.
+                self.replace(&path, bytes)?;
+                self.bytes.fetch_add(bytes.len() as u64, Ordering::Relaxed);
+                self.bytes.fetch_sub(held.len() as u64, Ordering::Relaxed);
+                return Ok(false);
+            }
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e),
+        }
         let dir = path.parent().expect("object path has a parent");
         fs::create_dir_all(dir)?;
-        let tmp = self.tmp_path();
-        let result = (|| {
-            let mut f = OpenOptions::new().write(true).create_new(true).open(&tmp)?;
-            f.write_all(bytes)?;
-            if self.fsync == Fsync::Always {
-                f.sync_data()?;
+        let tmp = self.write_tmp(bytes, self.fsync == Fsync::Always)?;
+        if self.fsync == Fsync::Deferred {
+            let mut pending = self.pending.lock().unwrap();
+            if pending.contains_key(id) || fs::symlink_metadata(&path).is_ok() {
+                drop(pending);
+                let _ = fs::remove_file(&tmp);
+                return Ok(false);
             }
-            drop(f);
-            match fs::hard_link(&tmp, &path) {
-                Ok(()) => Ok(true),
-                Err(e) if e.kind() == io::ErrorKind::AlreadyExists => Ok(false),
-                // Some systems allow no hard links, Android's app storage
-                // among them. A rename does as well for content named by
-                // its hash: what it might replace is the same bytes.
-                Err(e) if no_links(&e) => fs::rename(&tmp, &path).map(|()| true),
-                Err(e) => Err(e),
-            }
-        })();
+            pending.insert(*id, tmp);
+            self.objects.fetch_add(1, Ordering::Relaxed);
+            self.bytes.fetch_add(bytes.len() as u64, Ordering::Relaxed);
+            return Ok(true);
+        }
+        let added = link(&tmp, &path);
         let _ = fs::remove_file(&tmp);
-        let added = result?;
+        let added = added?;
         if added {
             self.objects.fetch_add(1, Ordering::Relaxed);
             self.bytes.fetch_add(bytes.len() as u64, Ordering::Relaxed);
-            match self.fsync {
-                Fsync::Always => sync_dir(dir)?,
-                Fsync::Deferred => self.dirty.lock().unwrap().push(path),
-                Fsync::Never => {}
+            if self.fsync == Fsync::Always {
+                sync_dir(dir)?;
             }
         }
         Ok(added)
     }
 
     fn delete(&self, id: &Id) -> io::Result<bool> {
+        if let Some(tmp) = self.pending.lock().unwrap().remove(id) {
+            let size = fs::metadata(&tmp).map(|m| m.len()).unwrap_or(0);
+            let _ = fs::remove_file(&tmp);
+            self.objects.fetch_sub(1, Ordering::Relaxed);
+            self.bytes.fetch_sub(size, Ordering::Relaxed);
+            return Ok(true);
+        }
         let path = self.path_of(id);
         let size = match fs::symlink_metadata(&path) {
             Ok(m) => m.len(),
@@ -458,7 +583,25 @@ impl ObjectStore for FsStore {
 
     fn list(&self) -> io::Result<Vec<ObjectInfo>> {
         let mut out = Vec::new();
+        let pending: Vec<(Id, PathBuf)> = self
+            .pending
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(id, tmp)| (*id, tmp.clone()))
+            .collect();
         self.walk(|i| out.push(i))?;
+        for (id, tmp) in pending {
+            if let Ok(m) = fs::metadata(&tmp) {
+                if !out.iter().any(|o| o.id == id) {
+                    out.push(ObjectInfo {
+                        id,
+                        size: m.len(),
+                        used: SystemTime::now(),
+                    });
+                }
+            }
+        }
         Ok(out)
     }
 
@@ -470,6 +613,9 @@ impl ObjectStore for FsStore {
     }
 
     fn touch(&self, id: &Id) -> io::Result<()> {
+        if self.pending.lock().unwrap().contains_key(id) {
+            return Ok(());
+        }
         match File::options().write(true).open(self.path_of(id)) {
             Ok(f) => f.set_modified(SystemTime::now()),
             Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
@@ -478,53 +624,54 @@ impl ObjectStore for FsStore {
     }
 
     fn sync(&self) -> io::Result<()> {
-        let paths = std::mem::take(&mut *self.dirty.lock().unwrap());
-        if paths.is_empty() {
+        let batch: Vec<(Id, PathBuf)> = self
+            .pending
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(id, tmp)| (*id, tmp.clone()))
+            .collect();
+        if batch.is_empty() {
             return Ok(());
         }
-        // Many objects (a burst of small files): one `syncfs` of the
-        // store's file system flushes them and their directories (new
-        // ones included) in one journal commit, where thousands of
-        // `fsync`s cost seconds.
-        #[cfg(target_os = "linux")]
-        if paths.len() >= SYNCFS_FROM && syncfs(&self.root).is_ok() {
-            return Ok(());
+        // The data first, and only then the names: an object under its id
+        // is always whole.
+        let tmps: Vec<PathBuf> = batch.iter().map(|(_, t)| t.clone()).collect();
+        self.flush(&tmps, false)?;
+        let mut placed = Vec::new();
+        {
+            let mut pending = self.pending.lock().unwrap();
+            for (id, tmp) in &batch {
+                if pending.get(id) != Some(tmp) {
+                    continue; // deleted meanwhile
+                }
+                let path = self.path_of(id);
+                match link(tmp, &path) {
+                    Ok(true) => placed.push(path),
+                    Ok(false) => {
+                        let size = fs::metadata(tmp).map(|m| m.len()).unwrap_or(0);
+                        self.objects.fetch_sub(1, Ordering::Relaxed);
+                        self.bytes.fetch_sub(size, Ordering::Relaxed);
+                    }
+                    Err(e) => return Err(e),
+                }
+                let _ = fs::remove_file(tmp);
+                pending.remove(id);
+            }
         }
-        // Many fsyncs in flight at once are far faster than one at a time
-        // on SSDs; files first, then their directories.
-        fn sync_all(paths: &[PathBuf], dir: bool) -> io::Result<()> {
-            let threads = paths.len().clamp(1, 16);
-            let per = paths.len().div_ceil(threads);
-            std::thread::scope(|s| {
-                let handles: Vec<_> = paths
-                    .chunks(per)
-                    .map(|part| {
-                        s.spawn(move || -> io::Result<()> {
-                            for p in part {
-                                match File::open(p) {
-                                    Ok(f) if dir => f.sync_all()?,
-                                    Ok(f) => f.sync_data()?,
-                                    Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-                                    Err(e) => return Err(e),
-                                }
-                            }
-                            Ok(())
-                        })
-                    })
-                    .collect();
-                handles
-                    .into_iter()
-                    .try_for_each(|h| h.join().expect("fsync thread panicked"))
-            })
-        }
-        sync_all(&paths, false)?;
-        let mut dirs: Vec<PathBuf> = paths
+        let mut dirs: Vec<PathBuf> = placed
             .iter()
             .map(|p| p.parent().unwrap().to_path_buf())
             .collect();
         dirs.sort();
         dirs.dedup();
-        sync_all(&dirs, true)
+        self.flush(&dirs, true)
+    }
+}
+
+impl Drop for FsStore {
+    fn drop(&mut self) {
+        let _ = self.sync();
     }
 }
 
@@ -624,6 +771,76 @@ pub(crate) mod tests {
             );
             fs::remove_dir_all(&dir).unwrap();
         }
+    }
+
+    #[test]
+    fn a_damaged_object_is_replaced_not_reused() {
+        // as a power cut under an older version could leave it: the name in
+        // place, the bytes cut short
+        for policy in [Fsync::Always, Fsync::Deferred, Fsync::Never] {
+            let dir = temp_dir("damaged");
+            let a = vec![9u8; 5000];
+            let id = object_id(&a);
+            {
+                let s = FsStore::open(&dir, policy).unwrap();
+                let path = s.path_of(&id);
+                fs::create_dir_all(path.parent().unwrap()).unwrap();
+                fs::write(&path, &a[..100]).unwrap();
+            }
+            let s = FsStore::open(&dir, policy).unwrap();
+            assert!(!s.put(&id, &a).unwrap(), "it was counted already");
+            s.sync().unwrap();
+            assert_eq!(s.get(&id).unwrap().unwrap(), a, "{policy:?}");
+            assert_eq!(fs::read(s.path_of(&id)).unwrap(), a);
+            assert_eq!(s.usage().bytes, 5000);
+            fs::remove_dir_all(&dir).unwrap();
+        }
+    }
+
+    #[test]
+    fn deferred_names_an_object_only_once_it_is_flushed() {
+        let dir = temp_dir("deferred");
+        let a = vec![3u8; 3000];
+        let id = object_id(&a);
+        {
+            let s = FsStore::open(&dir, Fsync::Deferred).unwrap();
+            assert!(s.put(&id, &a).unwrap());
+            assert!(!s.put(&id, &a).unwrap(), "pending counts as held");
+            assert!(s.has(&id).unwrap());
+            assert_eq!(s.get(&id).unwrap().unwrap(), a, "readable before the sync");
+            assert!(!s.path_of(&id).exists(), "not under its id before the sync");
+            s.sync().unwrap();
+            assert!(s.path_of(&id).exists());
+            assert!(s.pending.lock().unwrap().is_empty());
+            assert_eq!(s.get(&id).unwrap().unwrap(), a);
+        }
+        // a crash before the sync: what was put is missing, never wrong
+        let b = vec![4u8; 3000];
+        let idb = object_id(&b);
+        {
+            let s = FsStore::open(&dir, Fsync::Deferred).unwrap();
+            assert!(s.put(&idb, &b).unwrap());
+            std::mem::forget(s);
+        }
+        let s = FsStore::open(&dir, Fsync::Deferred).unwrap();
+        assert!(!s.has(&idb).unwrap());
+        assert!(s.has(&id).unwrap());
+        assert_eq!(
+            s.usage(),
+            Usage {
+                objects: 1,
+                bytes: 3000
+            }
+        );
+        // a pending object can be deleted
+        assert!(s.put(&idb, &b).unwrap());
+        assert!(s.delete(&idb).unwrap());
+        assert!(!s.has(&idb).unwrap());
+        s.sync().unwrap();
+        assert!(!s.path_of(&idb).exists());
+        assert_eq!(s.usage().objects, 1);
+        drop(s);
+        fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
