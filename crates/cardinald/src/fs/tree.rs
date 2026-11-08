@@ -224,8 +224,12 @@ pub struct Inode {
     pub opens: u32,
     /// When it was last written.
     pub last_write: Option<Instant>,
+    /// When the writes not yet committed began.
+    pub first_write: Option<Instant>,
     /// Bumped on every write.
     pub write_gen: u64,
+    /// The `write_gen` that [`Inode::content`] was encoded at.
+    pub content_gen: u64,
     /// Kernel lookups outstanding.
     pub nlookup: u64,
     /// Kept on this device only (`fs/local.rs`): never committed; its
@@ -261,7 +265,9 @@ impl Inode {
             writers: 0,
             opens: 0,
             last_write: None,
+            first_write: None,
             write_gen: 0,
+            content_gen: 0,
             nlookup: 0,
             local: false,
         }
@@ -271,6 +277,37 @@ impl Inode {
     /// still open for writing).
     pub fn busy(&self, quiet: Duration) -> bool {
         self.writers > 0 && self.last_write.is_some_and(|t| t.elapsed() < quiet)
+    }
+
+    /// Records a change to its content.
+    pub fn wrote(&mut self) {
+        self.write_gen += 1;
+        self.first_write.get_or_insert_with(Instant::now);
+    }
+
+    /// Whether its uncommitted writes began at least `longest` ago.
+    pub fn overdue(&self, longest: Duration) -> bool {
+        self.first_write.is_some_and(|t| t.elapsed() >= longest)
+    }
+
+    /// Whether a commit should wait for it: it is being written right now,
+    /// but not yet for `longest`. A file written continuously is committed
+    /// every `longest` as it stands, as a copy would take it
+    /// (`profiles.md#mapping-to-a-disk-guidance`).
+    pub fn held_back(&self, quiet: Duration, longest: Duration) -> bool {
+        self.busy(quiet) && !self.overdue(longest)
+    }
+
+    /// After a commit of its content: clean if nothing was written since
+    /// the content was encoded, otherwise still dirty, with a new burst.
+    pub fn content_committed(&mut self) {
+        if self.write_gen == self.content_gen {
+            self.dirty.content = false;
+            self.first_write = None;
+        } else {
+            self.dirty.content = true;
+            self.first_write = Some(Instant::now());
+        }
     }
 }
 

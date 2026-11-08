@@ -190,7 +190,7 @@ pub fn commit(d: &Arc<Daemon>, tree: &Mutex<Tree>, space: &SpaceId) -> anyhow::R
                     && !i.local
                     && i.kind == Kind::File
                     && (i.dirty.content || i.node.is_none())
-                    && !i.busy(QUIET)
+                    && !i.held_back(QUIET, MAX_BURST)
             })
             .filter_map(|i| Some((i.ino, i.write_gen, i.staged.clone()?)))
             .collect()
@@ -329,11 +329,20 @@ pub fn write_pending(
     let mut ready: HashSet<u64> = HashSet::new();
     for (ino, gen, c) in encoded {
         if let Some(i) = t.inodes.get_mut(&ino) {
-            if i.write_gen == gen {
+            // Written while it was encoded: a burst that has run its length
+            // is committed as it was read, and stays dirty for what came after.
+            if i.write_gen == gen || i.overdue(MAX_BURST) {
                 i.size = c.size();
                 i.content = Some(c);
+                i.content_gen = gen;
                 ready.insert(ino);
             }
+        }
+    }
+    // Without a staged file, the content held is the content written.
+    for i in t.inodes.values_mut() {
+        if i.staged.is_none() {
+            i.content_gen = i.write_gen;
         }
     }
     let mut written: Vec<Vec<u8>> = Vec::new();
@@ -376,7 +385,7 @@ pub fn write_pending(
                 || !(i.dirty.content || i.node.is_none());
             match i.node {
                 None => {
-                    if !content_ready || (i.kind == Kind::File && i.busy(QUIET)) {
+                    if !content_ready || (i.kind == Kind::File && i.held_back(QUIET, MAX_BURST)) {
                         continue;
                     }
                     let name = i.stored_name.as_deref().unwrap_or(&i.name);
@@ -401,8 +410,10 @@ pub fn write_pending(
                         effects.push(Effect::Clean(ino, Flag::Pos));
                     }
                     let mut own: Vec<(SpaceOp, Effect)> = Vec::new();
-                    let edit =
-                        i.kind == Kind::File && i.dirty.content && content_ready && !i.busy(QUIET);
+                    let edit = i.kind == Kind::File
+                        && i.dirty.content
+                        && content_ready
+                        && !i.held_back(QUIET, MAX_BURST);
                     if edit {
                         let c = i.content.clone().unwrap_or(Content::Inline(Vec::new()));
                         own.push((
@@ -583,6 +594,9 @@ fn finish(t: &mut Tree, eid: &EntryId, effects: &[Effect]) {
                     i.node = Some(node);
                     i.dirty = Default::default();
                     i.seen = vec![*eid];
+                    if i.kind == Kind::File {
+                        i.content_committed();
+                    }
                 }
                 t.by_node.insert(node, *ino);
                 t.committed_dir(*ino, &node);
@@ -592,7 +606,7 @@ fn finish(t: &mut Tree, eid: &EntryId, effects: &[Effect]) {
                     match f {
                         Flag::Pos => i.dirty.pos = false,
                         Flag::Content => {
-                            i.dirty.content = false;
+                            i.content_committed();
                             i.seen = vec![*eid];
                         }
                         Flag::Mode => i.dirty.mode = false,
@@ -759,7 +773,7 @@ mod tests {
             i.content = Some(Content::Inline(bytes.to_vec()));
             i.size = bytes.len() as u64;
             i.dirty.content = true;
-            i.write_gen += 1;
+            i.wrote();
             self.t.touch();
             ino
         }
@@ -1164,6 +1178,46 @@ mod tests {
 
     /// A burst of new folders and files commits, with every file under
     /// its folder.
+    #[test]
+    fn a_file_written_continuously_is_committed_once_its_burst_has_run() {
+        let mut fx = Fx::new();
+        let f = fx.write("db", b"one");
+        assert_eq!(fx.commit(), 1);
+        let node = fx.node(f);
+        // still open and written just now: it waits, while the burst is young
+        fx.write("db", b"two");
+        let i = fx.t.inodes.get_mut(&f).unwrap();
+        i.writers = 1;
+        i.last_write = Some(Instant::now());
+        assert_eq!(fx.commit(), 0, "held back for its first {MAX_BURST:?}");
+        assert!(fx.t.inodes[&f].dirty.content);
+        // written for longer than that: committed as it stands
+        let i = fx.t.inodes.get_mut(&f).unwrap();
+        i.first_write = Some(Instant::now() - MAX_BURST - Duration::from_millis(100));
+        i.last_write = Some(Instant::now());
+        assert_eq!(fx.commit(), 1);
+        assert_eq!(fx.versions(&node), vec![b"two".to_vec()]);
+        assert!(!fx.t.inodes[&f].dirty.content);
+    }
+
+    #[test]
+    fn content_written_after_it_was_read_stays_dirty() {
+        let mut i = Tree::new("/nonexistent".into(), "/nonexistent".into())
+            .inodes
+            .remove(&ROOT_INO)
+            .unwrap();
+        i.dirty.content = true;
+        i.wrote();
+        i.content_gen = i.write_gen;
+        i.wrote();
+        i.content_committed();
+        assert!(i.dirty.content, "the second write is not in what was committed");
+        assert!(i.first_write.is_some(), "and starts a burst of its own");
+        i.content_gen = i.write_gen;
+        i.content_committed();
+        assert!(!i.dirty.content && i.first_write.is_none());
+    }
+
     #[test]
     fn burst_of_nested_creates() {
         let mut fx = Fx::new();

@@ -252,7 +252,7 @@ impl CardinalFs {
             .map_err(|e| errno("cannot change a file's size", e))?;
         let i = t.inodes.get_mut(&ino).expect("ino");
         i.size = size;
-        i.write_gen += 1;
+        i.wrote();
         i.mtime = SystemTime::now();
         i.ctime = i.mtime;
         if !local {
@@ -788,7 +788,7 @@ impl Filesystem for CardinalFs {
                 s.dirty.mode = true;
                 s.dirty.mtime = true;
                 s.dirty.pos = ddirty.pos;
-                s.write_gen += 1;
+                s.wrote();
                 t.attach(src, newparent, newname);
                 took_over = true;
             } else {
@@ -1003,7 +1003,7 @@ impl Filesystem for CardinalFs {
         }
         let i = t.inodes.get_mut(&ino).expect("ino");
         i.size = i.size.max(offset + data.len() as u64);
-        i.write_gen += 1;
+        i.wrote();
         i.last_write = Some(Instant::now());
         i.mtime = SystemTime::now();
         i.ctime = i.mtime;
