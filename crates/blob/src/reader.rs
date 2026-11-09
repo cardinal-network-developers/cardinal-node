@@ -91,9 +91,15 @@ impl<'f, S: ObjectStore, F: Fetch + ?Sized> BlobReader<'f, S, F> {
                 continue;
             }
             match self.store.get(id)? {
-                Some(b) => {
+                // checked: a chunk damaged on disk is dropped, fetched
+                // again, and stored whole (`blobs.md#storing`)
+                Some(b) if object_id(&b) == *id => {
                     self.store.touch(id)?;
                     out.insert(*id, b);
+                }
+                Some(_) => {
+                    self.store.delete(id)?;
+                    missing.push(*id);
                 }
                 None => missing.push(*id),
             }

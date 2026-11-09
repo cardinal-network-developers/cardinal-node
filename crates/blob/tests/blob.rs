@@ -244,6 +244,40 @@ fn fs_store_end_to_end() {
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
+#[test]
+fn a_chunk_damaged_on_disk_is_fetched_again_and_replaced() {
+    // damage of the same length, which storing again does not see
+    let r: [u8; 8] = cardinal_crypto::random_bytes();
+    let dir = std::env::temp_dir().join(format!("cardinal-blob-dmg-{}", u64::from_le_bytes(r)));
+    let data = pseudo(300_000, 43);
+    let remote = MemStore::new();
+    let reference = encode_bytes(&data, &secret(), &remote).unwrap();
+    {
+        let local = FsStore::open(&dir, Fsync::Never).unwrap();
+        for info in remote.list().unwrap() {
+            local
+                .put(&info.id, &remote.get(&info.id).unwrap().unwrap())
+                .unwrap();
+        }
+        let victim = remote.list().unwrap()[0].id;
+        let path = local.path_of(&victim);
+        let mut bytes = std::fs::read(&path).unwrap();
+        bytes[0] ^= 1;
+        std::fs::write(&path, &bytes).unwrap();
+        let fetch = StoreFetch::new(&remote);
+        let back = BlobReader::new(&local, &fetch, reference)
+            .read_range(0, data.len())
+            .unwrap();
+        assert!(back == data);
+        assert_eq!(
+            object_id(&std::fs::read(&path).unwrap()),
+            victim,
+            "replaced whole"
+        );
+    }
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(24))]
 

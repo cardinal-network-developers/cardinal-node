@@ -652,13 +652,26 @@ async fn serve_blob(
     let store = d.store.clone();
     let leaving = d.leaving.clone();
     let reply = tokio::task::spawn_blocking(move || {
+        use cardinal_blob::ObjectStore;
+        // An answer may be counted as a copy (`blobs.md#dropping-a-chunk`):
+        // only what is flushed is given.
+        if req.ids.iter().any(|id| store.pending(id)) {
+            if let Err(e) = store.sync() {
+                tracing::warn!("cannot flush stored objects: {e}");
+                return cardinal_sync::BlobRequest { ids: Vec::new() }.serve(|_| None);
+            }
+        }
         req.serve(|id| {
             use cardinal_blob::ObjectStore;
             if allowed.as_ref().is_some_and(|a| !a.contains(id)) {
                 return None;
             }
             // being dropped: not counted as a copy by whoever asks
-            if leaving.lock().unwrap_or_else(|e| e.into_inner()).contains(id) {
+            if leaving
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .contains(id)
+            {
                 return None;
             }
             store.get(id).ok().flatten()

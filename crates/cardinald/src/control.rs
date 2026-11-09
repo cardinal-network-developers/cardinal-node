@@ -538,6 +538,7 @@ async fn handle(d: &Arc<Daemon>, req: &Value) -> anyhow::Result<Value> {
                 "bytes": f.bytes,
                 "left": f.left,
                 "only_here": crate::cleanup::status(d)["only_here"],
+                "unchecked": crate::cleanup::status(d)["unchecked"],
             }))
         }
         "keep-old" => {

@@ -66,6 +66,12 @@ pub trait ObjectStore: Send + Sync {
     fn sync(&self) -> io::Result<()> {
         Ok(())
     }
+
+    /// Whether `id` was put and is not durable yet: not to be served to a
+    /// device that may count it as a copy (`blobs.md#storing`).
+    fn pending(&self, _id: &Id) -> bool {
+        false
+    }
 }
 
 impl<S: ObjectStore + ?Sized> ObjectStore for &S {
@@ -93,6 +99,9 @@ impl<S: ObjectStore + ?Sized> ObjectStore for &S {
     fn sync(&self) -> io::Result<()> {
         (**self).sync()
     }
+    fn pending(&self, id: &Id) -> bool {
+        (**self).pending(id)
+    }
 }
 
 impl<S: ObjectStore + ?Sized> ObjectStore for std::sync::Arc<S> {
@@ -119,6 +128,9 @@ impl<S: ObjectStore + ?Sized> ObjectStore for std::sync::Arc<S> {
     }
     fn sync(&self) -> io::Result<()> {
         (**self).sync()
+    }
+    fn pending(&self, id: &Id) -> bool {
+        (**self).pending(id)
     }
 }
 
@@ -260,6 +272,9 @@ fn parse_hex_id(s: &str) -> Option<Id> {
     Some(id)
 }
 
+/// Objects that may wait to be flushed before a put flushes them all.
+const PENDING_MOST: usize = 256;
+
 /// From how many objects to sync [`FsStore::sync`] syncs the whole file
 /// system instead of each object.
 #[cfg(target_os = "linux")]
@@ -278,6 +293,11 @@ fn syncfs(path: &Path) -> io::Result<()> {
 }
 
 fn sync_dir(path: &Path) -> io::Result<()> {
+    // Windows cannot open a folder as a file, and its file systems keep
+    // names with the data they name.
+    if cfg!(windows) {
+        return Ok(());
+    }
     File::open(path)?.sync_all()
 }
 
@@ -408,6 +428,9 @@ fn sync_paths(paths: &[PathBuf], dir: bool) -> io::Result<()> {
             .map(|part| {
                 s.spawn(move || -> io::Result<()> {
                     for p in part {
+                        if dir && cfg!(windows) {
+                            continue;
+                        }
                         match File::open(p) {
                             Ok(f) if dir => f.sync_all()?,
                             Ok(f) => f.sync_data()?,
@@ -506,20 +529,21 @@ impl ObjectStore for FsStore {
             return Ok(false);
         }
         let path = self.path_of(id);
-        match fs::read(&path) {
-            Ok(held) if held == bytes => {
+        match fs::symlink_metadata(&path) {
+            Ok(m) if m.len() == bytes.len() as u64 => {
                 // Stored again (identical content): as new as if just stored,
                 // so freeing old versions does not take it from under a
-                // commit that names it.
+                // commit that names it. Damage of the same length is found
+                // when the chunk is read, which checks it against its id.
                 let _ = self.touch(id);
                 return Ok(false);
             }
-            Ok(held) => {
-                // Not what its id says, as a chunk cut short by a power cut
-                // under an older version would be: replaced, never reused.
+            Ok(m) => {
+                // Cut short, as a power cut under an older version could
+                // leave it: replaced, never reused.
                 self.replace(&path, bytes)?;
                 self.bytes.fetch_add(bytes.len() as u64, Ordering::Relaxed);
-                self.bytes.fetch_sub(held.len() as u64, Ordering::Relaxed);
+                self.bytes.fetch_sub(m.len(), Ordering::Relaxed);
                 return Ok(false);
             }
             Err(e) if e.kind() == io::ErrorKind::NotFound => {}
@@ -536,8 +560,13 @@ impl ObjectStore for FsStore {
                 return Ok(false);
             }
             pending.insert(*id, tmp);
+            let many = pending.len() >= PENDING_MOST;
+            drop(pending);
             self.objects.fetch_add(1, Ordering::Relaxed);
             self.bytes.fetch_add(bytes.len() as u64, Ordering::Relaxed);
+            if many {
+                self.sync()?;
+            }
             return Ok(true);
         }
         let added = link(&tmp, &path);
@@ -591,13 +620,14 @@ impl ObjectStore for FsStore {
             .map(|(id, tmp)| (*id, tmp.clone()))
             .collect();
         self.walk(|i| out.push(i))?;
+        let placed: std::collections::HashSet<Id> = out.iter().map(|o| o.id).collect();
         for (id, tmp) in pending {
             if let Ok(m) = fs::metadata(&tmp) {
-                if !out.iter().any(|o| o.id == id) {
+                if !placed.contains(&id) {
                     out.push(ObjectInfo {
                         id,
                         size: m.len(),
-                        used: SystemTime::now(),
+                        used: m.modified().unwrap_or_else(|_| SystemTime::now()),
                     });
                 }
             }
@@ -610,6 +640,10 @@ impl ObjectStore for FsStore {
             objects: self.objects.load(Ordering::Relaxed),
             bytes: self.bytes.load(Ordering::Relaxed),
         }
+    }
+
+    fn pending(&self, id: &Id) -> bool {
+        self.pending.lock().unwrap().contains_key(id)
     }
 
     fn touch(&self, id: &Id) -> io::Result<()> {
@@ -659,13 +693,29 @@ impl ObjectStore for FsStore {
                 pending.remove(id);
             }
         }
-        let mut dirs: Vec<PathBuf> = placed
-            .iter()
-            .map(|p| p.parent().unwrap().to_path_buf())
-            .collect();
+        // each object's folder, and the folders above it, which may be new
+        let objects = self.root.join("objects");
+        let mut dirs: Vec<PathBuf> = Vec::new();
+        for p in &placed {
+            let mut d = p.parent();
+            while let Some(x) = d {
+                dirs.push(x.to_path_buf());
+                if x == objects {
+                    break;
+                }
+                d = x.parent();
+            }
+        }
         dirs.sort();
         dirs.dedup();
         self.flush(&dirs, true)
+    }
+}
+
+impl FsStore {
+    /// Whether anything waits to be flushed.
+    pub fn has_pending(&self) -> bool {
+        !self.pending.lock().unwrap().is_empty()
     }
 }
 
@@ -807,11 +857,12 @@ pub(crate) mod tests {
             assert!(s.put(&id, &a).unwrap());
             assert!(!s.put(&id, &a).unwrap(), "pending counts as held");
             assert!(s.has(&id).unwrap());
+            assert!(s.pending(&id), "not to be served yet");
             assert_eq!(s.get(&id).unwrap().unwrap(), a, "readable before the sync");
             assert!(!s.path_of(&id).exists(), "not under its id before the sync");
             s.sync().unwrap();
             assert!(s.path_of(&id).exists());
-            assert!(s.pending.lock().unwrap().is_empty());
+            assert!(s.pending.lock().unwrap().is_empty() && !s.pending(&id));
             assert_eq!(s.get(&id).unwrap().unwrap(), a);
         }
         // a crash before the sync: what was put is missing, never wrong

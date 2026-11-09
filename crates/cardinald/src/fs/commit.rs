@@ -332,7 +332,10 @@ pub fn write_pending(
             // Written while it was encoded: a burst that has run its length
             // is committed as it was read, and stays dirty for what came after.
             if i.write_gen == gen || i.overdue(MAX_BURST) {
-                i.size = c.size();
+                if i.write_gen == gen {
+                    // later writes may have made it longer: the size stays theirs
+                    i.size = c.size();
+                }
                 i.content = Some(c);
                 i.content_gen = gen;
                 ready.insert(ino);
@@ -403,6 +406,8 @@ pub fn write_pending(
                     };
                     effects.push(Effect::Created(ino));
                     ops.push(op);
+                    // what was read is in this round's ops: once per commit
+                    ready.remove(&ino);
                 }
                 Some(node) => {
                     if i.dirty.pos {
@@ -420,6 +425,8 @@ pub fn write_pending(
                             files::set_content(node, &c),
                             Effect::Clean(ino, Flag::Content),
                         ));
+                        // what was read is in this round's ops: once per commit
+                        ready.remove(&ino);
                     }
                     if i.kind == Kind::File && i.dirty.mode {
                         own.push((
@@ -1204,6 +1211,43 @@ mod tests {
     }
 
     #[test]
+    fn a_snapshot_read_while_written_is_committed_once_and_keeps_the_size() {
+        let mut fx = Fx::new();
+        let f = fx.write("log", b"start");
+        assert_eq!(fx.commit(), 1);
+        let node = fx.node(f);
+        // staged, written for longer than a burst, read at one point and
+        // written again after, then closed before the commit is written
+        let st = fx.t.new_staged().unwrap();
+        st.write_all_at(b"0123456789abcdefghij", 0).unwrap();
+        let i = fx.t.inodes.get_mut(&f).unwrap();
+        i.staged = Some(st);
+        i.dirty.content = true;
+        i.wrote();
+        let read_at = i.write_gen;
+        i.wrote();
+        i.size = 20;
+        i.first_write = Some(Instant::now() - MAX_BURST - Duration::from_millis(100));
+        let snapshot = Content::Inline(b"0123456789a".to_vec());
+        let n = write_pending(
+            &mut fx.core,
+            &mut fx.t,
+            &fx.space,
+            vec![(f, read_at, snapshot)],
+        )
+        .unwrap()
+        .len();
+        assert_eq!(n, 1, "one entry for one snapshot");
+        assert_eq!(fx.versions(&node), vec![b"0123456789a".to_vec()]);
+        let i = &fx.t.inodes[&f];
+        assert_eq!(i.size, 20, "the size is the file's, not the snapshot's");
+        assert!(
+            i.dirty.content,
+            "what came after the read is still to commit"
+        );
+    }
+
+    #[test]
     fn content_written_after_it_was_read_stays_dirty() {
         let mut i = Tree::new("/nonexistent".into(), "/nonexistent".into())
             .inodes
@@ -1214,7 +1258,10 @@ mod tests {
         i.content_gen = i.write_gen;
         i.wrote();
         i.content_committed();
-        assert!(i.dirty.content, "the second write is not in what was committed");
+        assert!(
+            i.dirty.content,
+            "the second write is not in what was committed"
+        );
         assert!(i.first_write.is_some(), "and starts a burst of its own");
         i.content_gen = i.write_gen;
         i.content_committed();

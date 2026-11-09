@@ -52,9 +52,9 @@ fn a_device_over_its_budget_keeps_what_no_full_holder_has() {
     let blobs = b.home.join("blobs");
     let held = dir_size(&blobs);
     let out = b.cli(&["free-space", "--yes"]);
-    assert!(out.contains("1 files here are not on your other devices yet"), "{out}");
+    assert!(out.contains("cannot be reached now"), "{out}");
     assert!(dir_size(&blobs) >= held, "nothing of it was dropped");
-    assert_eq!(b.status()["old"]["only_here"]["files"], 1);
+    assert_eq!(b.status()["old"]["unchecked"], true);
 
     // Once alpha has it, beta can drop its pieces, and still read the file.
     a.start();
@@ -66,7 +66,16 @@ fn a_device_over_its_budget_keeps_what_no_full_holder_has() {
         let out = b.cli(&["free-space", "--yes"]);
         !out.contains("not on your other devices yet")
     });
-    assert!(dir_size(&blobs) + (2 << 20) < held, "{} of {held}", dir_size(&blobs));
+    assert!(
+        dir_size(&blobs) + (2 << 20) < held,
+        "{} of {held}",
+        dir_size(&blobs)
+    );
     assert_eq!(b.status()["old"]["only_here"]["files"], 0);
+    assert_eq!(b.status()["old"]["unchecked"], false);
+    // read on demand again, and flushed into place soon after, not left in tmp
     assert_eq!(std::fs::read(b.p("video.bin")).unwrap(), data);
+    wait("what was read is flushed", 10, || {
+        std::fs::read_dir(blobs.join("tmp")).is_ok_and(|d| d.count() == 0)
+    });
 }

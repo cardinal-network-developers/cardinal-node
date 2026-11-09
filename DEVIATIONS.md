@@ -198,8 +198,13 @@ should eventually be resolved by changing either the code or the spec.
   `Fsync::Deferred` (the writer syncs once per blob, in parallel) is the
   intended default for the daemon. Under it a put waits in `tmp/`,
   readable through a pending map, until the sync flushes its data and only
-  then links it (`blobs.md#storing`). Storing an id again compares the
-  bytes held with the bytes given, a full read, and replaces a mismatch.
+  then links it (`blobs.md#storing`). A put flushes everything waiting once
+  256 objects wait, and the daemon flushes what waits every second, so
+  chunks read on demand do not stay in `tmp/`. Storing an id again checks
+  the length held and replaces a chunk cut short; a reader checks every
+  chunk it reads from the store against its id, drops one that fails and
+  fetches it again. The `blob` service flushes before it answers for an
+  object still waiting.
 - `MemSet` keeps sorted blocks of at most 512 ids with lazily rebuilt
   prefix sums, so a range fingerprint costs two binary searches and at
   most a few hundred 256-bit additions at any set size.
@@ -567,19 +572,28 @@ Not implemented yet (the next milestone):
 
 - **What a flush promises** (`profiles.md#mapping-to-a-disk-guidance`). An
   `fsync` through the mount flushes the staging file and, the first time
-  or after the file moved, appends its path, staging file and mode to
-  `staging/journal`, flushed with the staging directory. A mount starting
-  up takes up every staging file the journal names (making folders that
-  are missing), and removes staging files nothing names. The path is the
-  one at the last such record: `fsyncdir` is not implemented, so a rename
-  or delete is durable at the next commit, which a disk does not promise
-  sooner either. Writes never flushed are lost in a crash, as on a disk.
+  or when anything recorded changed, appends a record to `staging/journal`
+  (the path, the staging file, the mode, the node and the versions it was
+  written over), flushed with the staging directory; `fsyncdir` writes the
+  journal again from where everything recorded is now. A mount starting up
+  takes up every staging file the journal names: as an edit of its node
+  over the recorded versions, so a version from elsewhere is kept beside
+  it, or as a new file at its path (`name (recovered)` if the name is
+  taken). It writes the journal again naming what it took up, and removes
+  staging files nothing names. An unmount that cannot commit names every
+  dirty staging file in the journal and keeps it. Staging file names carry
+  a random part, so a restart never reuses one. Writes never flushed are
+  lost in a crash, as on a disk. A crash between a commit and the journal
+  being written again can bring a new file back once more, as `name
+  (recovered)`: a duplicate, not a loss.
 - **Dropping a chunk** (`blobs.md#dropping-a-chunk`). Only this person's own
   devices with full retention are checked, through the copy-check sessions
   (`copies.rs`); storage hosts are not asked yet, so a person whose only
-  full holder is a host keeps everything on an on-demand device. What could
-  not be dropped is in `cardinal status` under `old.only_here` and said by
-  `cardinal free-space`; no client shows it yet.
+  full holder is a host keeps everything on an on-demand device. The check
+  fetches each chunk back, 16 at a time. What could not be dropped is in
+  `cardinal status` under `old.only_here`, and `old.unchecked` says no full
+  holder was reachable; `cardinal free-space` says either. No client shows
+  them yet.
 
 - **Spec ambiguity: a node cannot be named in the entry that creates it.**
   `state.md` allows naming a node "in the entry itself", but a node's id is

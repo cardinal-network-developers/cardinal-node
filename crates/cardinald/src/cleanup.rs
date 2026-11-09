@@ -181,10 +181,13 @@ pub struct Plan {
     pub old_bytes: u64,
     /// Of those, the bytes the plan deletes.
     pub old_deleted: u64,
-    /// Under on-demand retention, objects of current files to drop to get
-    /// within the budget, least recently used first: dropped only once a
-    /// device that keeps everything produces them (`blobs.md#dropping-a-chunk`).
+    /// Under on-demand retention, the objects of current files that may be
+    /// dropped, least recently used first, and how many bytes over the
+    /// budget there are: each is dropped only once a device that keeps
+    /// everything produces it (`blobs.md#dropping-a-chunk`).
     pub evict: Vec<(Id, u64)>,
+    /// Bytes to drop to get within the budget.
+    pub excess: u64,
 }
 
 /// What to keep and what may go, for [`plan`].
@@ -249,14 +252,11 @@ pub fn plan(
             held_objects(store, b, &mut pinned)?;
         }
         unpinned.retain(|o| !pinned.contains(&o.id));
-        let mut total: u64 = unpinned.iter().map(|o| o.size).sum();
-        unpinned.sort_by_key(|o| o.used);
-        for o in unpinned {
-            if total <= budget {
-                break;
-            }
-            total -= o.size;
-            out.evict.push((o.id, o.size));
+        let total: u64 = unpinned.iter().map(|o| o.size).sum();
+        if total > budget {
+            unpinned.sort_by_key(|o| o.used);
+            out.excess = total - budget;
+            out.evict = unpinned.into_iter().map(|o| (o.id, o.size)).collect();
         }
     }
     Ok(out)
@@ -293,6 +293,8 @@ pub struct Seen {
     /// Under on-demand retention: files and bytes over the budget that could
     /// not be dropped, because no device that keeps everything produced them.
     pub only_here: (u64, u64),
+    /// Over the budget, and no device that keeps everything could be asked.
+    pub unasked: bool,
 }
 
 /// The cleaner of a daemon.
@@ -352,57 +354,93 @@ pub fn pass(d: &Daemon, now_all: bool, dry_run: bool) -> anyhow::Result<Freed> {
     let c = &d.cleanup;
     let _one_at_a_time = lock(&c.running);
     // From finding what is current to deleting, no commit runs.
-    let (mut freed, evict, live) =
+    let (mut freed, evict, excess, live) =
         crate::fs::commit::without_commits(|| pass_now(d, now_all, dry_run))?;
+    let (mut files, mut kept_bytes, mut unasked) = (0u64, 0u64, false);
     if !evict.is_empty() {
-        let (objects, bytes, kept) = evict_checked(d, &evict, dry_run);
+        let (objects, bytes, kept) = evict_checked(d, &evict, excess, dry_run);
         freed.objects += objects;
         freed.bytes += bytes;
-        let mut files = 0u64;
-        let mut kept_bytes = 0u64;
-        if !kept.is_empty() {
+        unasked = kept.unasked;
+        if !kept.absent.is_empty() {
             let store: &dyn ObjectStore = &*d.store;
             for b in &live {
                 let mut o = HashSet::new();
-                if held_objects(store, b, &mut o).is_ok() && !o.is_disjoint(&kept) {
+                if held_objects(store, b, &mut o).is_ok() && !o.is_disjoint(&kept.absent) {
                     files += 1;
                 }
             }
-            kept_bytes = evict.iter().filter(|(id, _)| kept.contains(id)).map(|(_, s)| s).sum();
+            kept_bytes = evict
+                .iter()
+                .filter(|(id, _)| kept.absent.contains(id))
+                .map(|(_, s)| s)
+                .sum();
             tracing::warn!(
                 "over its budget: {files} files ({kept_bytes} bytes) are not on a device \
                  that keeps everything yet, so they stay"
             );
+        } else if unasked {
+            tracing::info!("over its budget, and no device that keeps everything is reachable");
         }
-        lock(&c.seen).get_or_insert_with(Seen::default).only_here = (files, kept_bytes);
-    } else {
-        lock(&c.seen).get_or_insert_with(Seen::default).only_here = (0, 0);
     }
+    let mut g = lock(&c.seen);
+    let s = g.get_or_insert_with(Seen::default);
+    s.only_here = (files, kept_bytes);
+    s.unasked = unasked;
     Ok(freed)
 }
 
-/// Lock, Check, Delete (`blobs.md#dropping-a-chunk`): stops answering for
-/// the objects, asks devices that keep everything for them, and deletes
-/// those one of them produced. Returns the objects and bytes dropped (or
-/// that would be, in a dry run) and the objects kept.
-fn evict_checked(d: &Daemon, evict: &[(Id, u64)], dry_run: bool) -> (u64, u64, HashSet<Id>) {
-    let ids: Vec<Id> = evict.iter().map(|(id, _)| *id).collect();
-    if !dry_run {
-        lock(&d.leaving).extend(ids.iter().copied());
+/// What dropping found it could not drop.
+struct Kept {
+    /// Objects no device that keeps everything produced.
+    absent: HashSet<Id>,
+    /// Whether no such device could be asked.
+    unasked: bool,
+}
+
+/// Lock, Check, Delete (`blobs.md#dropping-a-chunk`), down the list until
+/// `excess` bytes are dropped: stops answering for a batch of objects, asks
+/// devices that keep everything for them, and deletes those one of them
+/// produced; what none produced is kept, and the next are tried. Returns the
+/// objects and bytes dropped (or that would be, in a dry run) and what was
+/// kept.
+fn evict_checked(d: &Daemon, evict: &[(Id, u64)], excess: u64, dry_run: bool) -> (u64, u64, Kept) {
+    const BATCH: usize = 16;
+    let holders = crate::copies::full_holder_sessions(d);
+    let (mut objects, mut bytes) = (0u64, 0u64);
+    let mut kept = Kept {
+        absent: HashSet::new(),
+        unasked: holders.is_empty(),
+    };
+    if holders.is_empty() {
+        return (0, 0, kept);
     }
-    let mut produced: HashSet<Id> = HashSet::new();
-    for s in crate::copies::full_holder_sessions(d) {
-        let want: Vec<Id> = ids.iter().filter(|i| !produced.contains(*i)).copied().collect();
-        if want.is_empty() {
+    for batch in evict.chunks(BATCH) {
+        if bytes >= excess {
             break;
         }
-        for batch in want.chunks(64) {
+        let ids: Vec<Id> = batch.iter().map(|(id, _)| *id).collect();
+        if !dry_run {
+            lock(&d.leaving).extend(ids.iter().copied());
+        }
+        let mut produced: HashSet<Id> = HashSet::new();
+        for s in &holders {
+            let want: Vec<Id> = ids
+                .iter()
+                .filter(|i| !produced.contains(*i))
+                .copied()
+                .collect();
+            if want.is_empty() {
+                break;
+            }
             let reply = d.rt.block_on(crate::net::blob_request(
-                &s,
-                batch.to_vec(),
+                s,
+                want,
                 cardinal_link::Priority::Background,
             ));
-            let Ok(reply) = reply else { break };
+            // a holder that does not answer in time is not asked again for this
+            // batch; the next holder, or the next batch, is
+            let Ok(reply) = reply else { continue };
             for item in reply.items {
                 if let cardinal_sync::BlobItem::Held { id, ciphertext } = item {
                     if cardinal_blob::object_id(&ciphertext) == id {
@@ -411,27 +449,28 @@ fn evict_checked(d: &Daemon, evict: &[(Id, u64)], dry_run: bool) -> (u64, u64, H
                 }
             }
         }
-    }
-    let (mut objects, mut bytes) = (0, 0);
-    let mut kept = HashSet::new();
-    for (id, size) in evict {
-        if !produced.contains(id) {
-            kept.insert(*id);
-        } else if dry_run || d.store.delete(id).unwrap_or(false) {
-            objects += 1;
-            bytes += size;
+        for (id, size) in batch {
+            if !produced.contains(id) {
+                kept.absent.insert(*id);
+            } else if dry_run || d.store.delete(id).unwrap_or(false) {
+                objects += 1;
+                bytes += size;
+            }
+        }
+        if !dry_run {
+            let mut l = lock(&d.leaving);
+            for id in &ids {
+                l.remove(id);
+            }
         }
     }
-    if !dry_run {
-        let mut l = lock(&d.leaving);
-        for id in &ids {
-            l.remove(id);
-        }
+    if bytes >= excess {
+        kept.absent.clear(); // within the budget: what stays is not a problem
     }
     (objects, bytes, kept)
 }
 
-type Passed = (Freed, Vec<(Id, u64)>, Vec<BlobRef>);
+type Passed = (Freed, Vec<(Id, u64)>, u64, Vec<BlobRef>);
 
 fn pass_now(d: &Daemon, now_all: bool, dry_run: bool) -> anyhow::Result<Passed> {
     let c = &d.cleanup;
@@ -451,7 +490,7 @@ fn pass_now(d: &Daemon, now_all: bool, dry_run: bool) -> anyhow::Result<Passed> 
             .and_then(|f| core.spaces.get(&f))
             .and_then(|h| h.space.as_ref())
         else {
-            return Ok((Freed::default(), Vec::new(), Vec::new()));
+            return Ok((Freed::default(), Vec::new(), 0, Vec::new()));
         };
         let current = current_blobs(sp);
         let pinned: Vec<BlobRef> = current
@@ -503,14 +542,18 @@ fn pass_now(d: &Daemon, now_all: bool, dry_run: bool) -> anyhow::Result<Passed> 
                 freed.bytes
             );
         }
-        let only_here = lock(&c.seen).as_ref().map(|s| s.only_here).unwrap_or_default();
+        let (only_here, unasked) = lock(&c.seen)
+            .as_ref()
+            .map(|s| (s.only_here, s.unasked))
+            .unwrap_or_default();
         *lock(&c.seen) = Some(Seen {
             old_bytes,
             at: now,
             only_here,
+            unasked,
         });
     }
-    Ok((freed, p.evict, live))
+    Ok((freed, p.evict, p.excess, live))
 }
 
 /// Starts the hourly pass (`CARDINAL_TEST_FREE_INTERVAL_MS` for tests),
@@ -555,6 +598,8 @@ pub fn status(d: &Daemon) -> Value {
             "keep": keep.to_string(),
             // over the budget, and on no device that keeps everything yet
             "only_here": {"files": s.only_here.0, "bytes": s.only_here.1},
+            // over the budget, and no device that keeps everything reachable
+            "unchecked": s.unasked,
         }),
         None => json!({"bytes": null, "keep": keep.to_string()}),
     }
@@ -701,7 +746,16 @@ mod tests {
         let p = plan(&store, &wanted, later, Duration::from_secs(3600)).unwrap();
         let mut pin_o = HashSet::new();
         held_objects(&store, &pinned, &mut pin_o).unwrap();
-        let deleted: HashSet<Id> = p.evict.iter().map(|(id, _)| *id).collect();
+        // dropped in this order, until the excess is gone
+        let mut deleted: HashSet<Id> = HashSet::new();
+        let mut dropped = 0;
+        for (id, size) in &p.evict {
+            if dropped >= p.excess {
+                break;
+            }
+            deleted.insert(*id);
+            dropped += size;
+        }
         assert!(p.delete.is_empty(), "nothing old to delete");
         assert!(deleted.is_disjoint(&pin_o));
         let mut other_o = HashSet::new();

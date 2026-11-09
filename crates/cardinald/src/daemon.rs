@@ -1755,6 +1755,33 @@ impl Daemon {
         crate::fetch::start(self.clone());
         crate::copies::start(self.clone());
         crate::cleanup::start(self.clone());
+        // Objects put without a sync (chunks read on demand) are flushed
+        // within a second, so a killed process does not leave them in tmp.
+        {
+            let d = self.clone();
+            tokio::spawn(async move {
+                let mut stop = d.stopping.subscribe();
+                loop {
+                    tokio::select! {
+                        _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => {}
+                        _ = stop.changed() => {}
+                    }
+                    if *d.stopping.borrow() {
+                        break;
+                    }
+                    if d.store.has_pending() {
+                        let s = d.store.clone();
+                        let _ = tokio::task::spawn_blocking(move || {
+                            use cardinal_blob::ObjectStore;
+                            if let Err(e) = s.sync() {
+                                tracing::warn!("cannot flush stored objects: {e}");
+                            }
+                        })
+                        .await;
+                    }
+                }
+            });
+        }
         crate::mailbox::start(self.clone());
         crate::groups::start(self.clone());
         crate::introductions::start(self.clone());

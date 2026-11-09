@@ -72,6 +72,13 @@ impl Mounted {
         if let Err(e) = self.flush() {
             tracing::error!("could not save the last changes: {e:#}");
         }
+        // What is still not committed is kept for the next start, as a
+        // disk keeps what was written before an unmount.
+        for p in lock(&self.parts).parts.values() {
+            if let Err(e) = lock(&p.tree).journal_all_dirty() {
+                tracing::error!("could not keep the last changes for the next start: {e:#}");
+            }
+        }
         drop(self.session.take());
         tracing::info!("unmounted {}", self.path.display());
     }

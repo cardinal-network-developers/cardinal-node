@@ -90,7 +90,12 @@ impl Part {
             t.load_local(h.and_then(|h| h.space.as_ref()));
             t.ignore_seen = Some(t.ignore_texts(&d.store));
             // What applications flushed before a crash, committed again.
-            let taken = t.replay_journal();
+            let me = d.keys.key();
+            let sp = h.and_then(|h| h.space.as_ref());
+            let taken = t.replay_journal(|e| {
+                sp.and_then(|sp| sp.entry(e))
+                    .is_some_and(|x| x.signer() == me)
+            });
             if taken > 0 {
                 tracing::info!("taking up {taken} flushed files not yet saved");
             }
@@ -670,6 +675,10 @@ impl Filesystem for OneFs {
 
     fn fsync(&mut self, req: &Request<'_>, ino: u64, fh: u64, ds: bool, reply: ReplyEmpty) {
         route!(self, ino, reply, |fs| fs.fsync(req, ino, fh, ds, reply))
+    }
+
+    fn fsyncdir(&mut self, req: &Request<'_>, ino: u64, fh: u64, ds: bool, reply: ReplyEmpty) {
+        route!(self, ino, reply, |fs| fs.fsyncdir(req, ino, fh, ds, reply))
     }
 
     fn opendir(&mut self, req: &Request<'_>, ino: u64, flags: i32, reply: ReplyOpen) {

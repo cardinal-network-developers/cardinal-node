@@ -47,6 +47,8 @@ pub struct Staged {
     file: Mutex<Option<File>>,
     path: PathBuf,
     keep: bool,
+    /// Kept on disk past the drop: named in the journal for the next start.
+    retained: std::sync::atomic::AtomicBool,
 }
 
 impl Staged {
@@ -57,6 +59,7 @@ impl Staged {
             file: Mutex::new(None),
             path,
             keep: true,
+            retained: Default::default(),
         })
     }
 
@@ -92,6 +95,7 @@ impl Staged {
             file: Mutex::new(Some(file)),
             path,
             keep: true,
+            retained: Default::default(),
         })
     }
 
@@ -103,6 +107,7 @@ impl Staged {
             file: Mutex::new(file),
             path,
             keep: true,
+            retained: Default::default(),
         })
     }
 
@@ -135,6 +140,12 @@ impl Staged {
         self.with(|f| f.set_modified(t))
     }
 
+    /// Keeps the file when this is dropped: the journal names it.
+    pub fn retain(&self) {
+        self.retained
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
     /// Closes the staging file; the next access reopens it.
     pub fn close(&self) {
         self.file.lock().unwrap_or_else(|e| e.into_inner()).take();
@@ -143,18 +154,25 @@ impl Staged {
 
 impl Drop for Staged {
     fn drop(&mut self) {
-        if !self.keep {
+        if !self.keep && !self.retained.load(std::sync::atomic::Ordering::Relaxed) {
             let _ = std::fs::remove_file(&self.path);
         }
     }
 }
 
 /// A journal record: a staging file an application flushed, and where.
-#[derive(serde::Serialize, serde::Deserialize)]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 struct Flushed {
     path: Vec<String>,
     staged: String,
     perm: u16,
+    /// The node it changes, if it was committed before (hex).
+    #[serde(default)]
+    node: Option<String>,
+    /// The versions its content was written over (hex entry ids), so that
+    /// a version from elsewhere it never saw is kept beside it.
+    #[serde(default)]
+    seen: Vec<String>,
 }
 
 /// Local changes not yet committed.
@@ -541,7 +559,8 @@ impl Tree {
         self.staging.join("journal")
     }
 
-    /// The journal's record for `ino`: its path, its staging file, its mode.
+    /// The journal's record for `ino`: where it is, its staging file, its
+    /// mode, its node and the versions it was written over.
     fn journal_record(&self, ino: u64) -> Option<String> {
         let i = self.inodes.get(&ino)?;
         if i.local || i.kind != Kind::File {
@@ -555,7 +574,7 @@ impl Tree {
             if x.parent == 0 {
                 return None; // detached
             }
-            path.push(x.name.clone());
+            path.push(x.stored_name.clone().unwrap_or_else(|| x.name.clone()));
             at = x.parent;
         }
         path.reverse();
@@ -563,6 +582,8 @@ impl Tree {
             path,
             staged,
             perm: i.perm,
+            node: i.node.map(hex::encode),
+            seen: i.seen.iter().map(hex::encode).collect(),
         };
         serde_json::to_string(&rec).ok()
     }
@@ -590,19 +611,10 @@ impl Tree {
         Ok(())
     }
 
-    /// After a commit: forgets the records of what is committed now, and
-    /// writes the journal again from what is left, or empties it.
-    pub fn journal_committed(&mut self) -> io::Result<()> {
-        let mut changed = false;
-        for i in self.inodes.values_mut() {
-            if i.journaled.is_some() && (!i.dirty.content || i.staged.is_none()) {
-                i.journaled = None;
-                changed = true;
-            }
-        }
-        if !changed {
-            return Ok(());
-        }
+    /// Writes the journal again from what it should name now: every
+    /// recorded file still dirty and attached, at its current place. A
+    /// rename or delete is durable once this has run (`fsyncdir`).
+    pub fn journal_rewrite(&mut self) -> io::Result<()> {
         let inos: Vec<u64> = self
             .inodes
             .values()
@@ -611,99 +623,205 @@ impl Tree {
             .collect();
         let mut text = String::new();
         for ino in inos {
-            if let Some(rec) = self.journal_record(ino) {
-                text.push_str(&rec);
+            let i = &self.inodes[&ino];
+            let rec = (i.dirty.content || i.node.is_none())
+                .then(|| self.journal_record(ino))
+                .flatten();
+            if let Some(rec) = &rec {
+                text.push_str(rec);
                 text.push('\n');
-                self.inodes.get_mut(&ino).expect("ino").journaled = Some(rec);
             }
+            self.inodes.get_mut(&ino).expect("ino").journaled = rec;
         }
-        let tmp = self.staging.join("journal.new");
-        {
-            let mut f = File::create(&tmp)?;
-            std::io::Write::write_all(&mut f, text.as_bytes())?;
-            f.sync_data()?;
+        if text.is_empty() {
+            match std::fs::remove_file(self.journal()) {
+                Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+                r => r?,
+            }
+        } else {
+            let tmp = self.staging.join("journal.new");
+            {
+                let mut f = File::create(&tmp)?;
+                std::io::Write::write_all(&mut f, text.as_bytes())?;
+                f.sync_data()?;
+            }
+            std::fs::rename(&tmp, self.journal())?;
         }
-        std::fs::rename(&tmp, self.journal())?;
         File::open(&self.staging)?.sync_all()
     }
 
+    /// After a commit: writes the journal again if something it named is
+    /// committed now, or gone.
+    pub fn journal_committed(&mut self) -> io::Result<()> {
+        let stale = self.inodes.values().any(|i| {
+            i.journaled.is_some()
+                && ((!i.dirty.content && i.node.is_some()) || i.staged.is_none() || i.parent == 0)
+        });
+        if stale {
+            self.journal_rewrite()?;
+        }
+        Ok(())
+    }
+
+    /// Before the tree is dropped with changes it could not commit: names
+    /// every dirty staging file in the journal and keeps the files, flushed,
+    /// so the next start takes them up. An unmount keeps what was written.
+    pub fn journal_all_dirty(&mut self) -> io::Result<()> {
+        let inos: Vec<u64> = self
+            .inodes
+            .values()
+            .filter(|i| {
+                i.parent != 0
+                    && !i.local
+                    && i.kind == Kind::File
+                    && i.staged.is_some()
+                    && (i.dirty.content || i.node.is_none())
+            })
+            .map(|i| i.ino)
+            .collect();
+        for ino in &inos {
+            let i = self.inodes.get_mut(ino).expect("ino");
+            let st = i.staged.clone().expect("staged");
+            st.sync_data()?;
+            st.retain();
+            i.journaled = Some(String::new()); // written below
+        }
+        if inos.is_empty() {
+            return Ok(());
+        }
+        self.journal_rewrite()
+    }
+
     /// At start, before anything is written: takes up every staging file the
-    /// journal names, as uncommitted content at its path (making folders
-    /// that are not there), and removes the staging files nothing needs.
-    /// Returns how many it took up.
-    pub fn replay_journal(&mut self) -> usize {
+    /// journal names, as uncommitted content of the node it changes, or of
+    /// a new file at its path, and removes the staging files nothing names.
+    /// A recorded edit that `own_since` says this device committed since is
+    /// done. Returns how many it took up.
+    pub fn replay_journal(&mut self, own_since: impl Fn(&EntryId) -> bool) -> usize {
         let text = std::fs::read_to_string(self.journal()).unwrap_or_default();
-        // the last record for a path wins
+        // the last record for a staging file wins
         let mut recs: Vec<Flushed> = Vec::new();
         for line in text.lines() {
             let Ok(r) = serde_json::from_str::<Flushed>(line) else {
                 continue; // a record cut short by the crash
             };
-            recs.retain(|o| o.path != r.path);
+            recs.retain(|o| o.staged != r.staged);
             recs.push(r);
         }
+        let unhex = |h: &str| -> Option<Vec<u8>> { hex::decode(h).ok() };
         let mut taken: HashSet<String> = HashSet::new();
         for r in recs {
             let file = self.staging.join(&r.staged);
             if r.path.is_empty() || r.staged.contains('/') || !file.is_file() {
                 continue;
             }
-            let mut at = self.root;
-            let mut ok = true;
-            for (k, name) in r.path.iter().enumerate() {
-                let last = k + 1 == r.path.len();
-                at = match self.child(at, name) {
-                    Some(c) => c,
-                    None => {
-                        let n = self.alloc(if last { Kind::File } else { Kind::Dir });
-                        if !last {
-                            self.inodes.get_mut(&n).expect("new").perm = 0o755;
-                        }
-                        self.attach(n, at, name);
-                        n
-                    }
-                };
-                let kind = self.inodes[&at].kind;
-                if (last && kind != Kind::File) || (!last && kind != Kind::Dir) {
-                    ok = false;
-                    break;
+            let seen: Vec<EntryId> = r
+                .seen
+                .iter()
+                .filter_map(|h| unhex(h)?.try_into().ok())
+                .collect();
+            let node: Option<NodeId> = r.node.as_deref().and_then(|h| unhex(h)?.try_into().ok());
+            // the node it changes, if it is still there
+            let mut at = node
+                .and_then(|n| self.by_node.get(&n).copied())
+                .filter(|i| {
+                    self.inodes
+                        .get(i)
+                        .is_some_and(|x| x.kind == Kind::File && !x.local)
+                });
+            if let Some(ino) = at {
+                let since = &self.inodes[&ino].seen;
+                if since.iter().any(|e| !seen.contains(e) && own_since(e)) {
+                    continue; // committed here after the record: done
                 }
+            } else {
+                // a new file, or one deleted elsewhere: a new file at its path
+                let mut parent = self.root;
+                let (last, dirs) = r.path.split_last().expect("not empty");
+                for name in dirs {
+                    parent = match self.child(parent, name) {
+                        Some(c) if self.inodes[&c].kind == Kind::Dir => c,
+                        _ => {
+                            let n = self.alloc(Kind::Dir);
+                            self.inodes.get_mut(&n).expect("new").perm = 0o755;
+                            let shown = self.free_name(parent, name);
+                            self.attach(n, parent, &shown);
+                            if shown != *name {
+                                self.inodes.get_mut(&n).expect("new").stored_name =
+                                    Some(name.clone());
+                            }
+                            n
+                        }
+                    };
+                }
+                let n = self.alloc(Kind::File);
+                let shown = self.free_name(parent, last);
+                self.attach(n, parent, &shown);
+                if shown != *last {
+                    self.inodes.get_mut(&n).expect("new").stored_name = Some(last.clone());
+                }
+                at = Some(n);
             }
-            if !ok || self.inodes[&at].local {
-                continue;
-            }
+            let ino = at.expect("placed");
             let size = std::fs::metadata(&file).map(|m| m.len()).unwrap_or(0);
-            let i = self.inodes.get_mut(&at).expect("ino");
+            let i = self.inodes.get_mut(&ino).expect("ino");
             i.staged = Some(Arc::new(Staged {
                 file: Mutex::new(None),
                 path: file,
                 keep: false,
+                retained: Default::default(),
             }));
             i.size = size;
             i.perm = r.perm;
             i.dirty.content = true;
+            if i.node.is_some() {
+                i.seen = seen;
+            }
             i.mtime = SystemTime::now();
             i.ctime = i.mtime;
             i.wrote();
+            i.journaled = Some(String::new()); // written below
             taken.insert(r.staged);
         }
-        // staging files of earlier runs that nothing names
+        // staging files of earlier runs that nothing takes up
         if let Ok(rd) = std::fs::read_dir(&self.staging) {
             for e in rd.flatten() {
                 let name = e.file_name().to_string_lossy().into_owned();
                 if e.file_type().is_ok_and(|t| t.is_file())
-                    && name != "journal"
+                    && !name.starts_with("journal")
                     && !taken.contains(&name)
                 {
                     let _ = std::fs::remove_file(e.path());
                 }
             }
         }
-        let _ = std::fs::remove_file(self.journal());
+        // what was taken up stays named until it is committed
+        if let Err(e) = self.journal_rewrite() {
+            tracing::warn!("cannot write the journal of flushed files: {e}");
+        }
         if !taken.is_empty() {
             self.touch();
         }
         taken.len()
+    }
+
+    /// `name`, or `name (recovered)`, `name (recovered 2)` … if a child of
+    /// `parent` has it.
+    fn free_name(&self, parent: u64, name: &str) -> String {
+        if self.child(parent, name).is_none() {
+            return name.to_owned();
+        }
+        let (stem, ext) = match name.rfind('.') {
+            Some(k) if k > 0 => (&name[..k], &name[k..]),
+            _ => (name, ""),
+        };
+        (1..)
+            .map(|n| match n {
+                1 => format!("{stem} (recovered){ext}"),
+                n => format!("{stem} (recovered {n}){ext}"),
+            })
+            .find(|c| self.child(parent, c).is_none())
+            .expect("a free name")
     }
 
     /// Records a local change, for the quiet-period scheduler.
@@ -849,34 +967,45 @@ impl Tree {
         parts.join("/")
     }
 
-    /// Moves the file at `src` into staging, as staged content.
-    pub fn stage_from(&mut self, src: &std::path::Path) -> std::io::Result<Arc<Staged>> {
+    /// A name for a new staging file that no file of this or an earlier
+    /// run has: a process with the same id after a restart must not reuse
+    /// a file the journal names.
+    fn stage_name(&mut self) -> PathBuf {
         let n = self.next_stage;
         self.next_stage += 1;
-        let path = self.staging.join(format!("{}-{n}", std::process::id()));
+        let r: [u8; 8] = cardinal_crypto::random_bytes();
+        self.staging.join(format!(
+            "{}-{n}-{:016x}",
+            std::process::id(),
+            u64::from_le_bytes(r)
+        ))
+    }
+
+    /// Moves the file at `src` into staging, as staged content.
+    pub fn stage_from(&mut self, src: &std::path::Path) -> std::io::Result<Arc<Staged>> {
+        let path = self.stage_name();
         std::fs::rename(src, &path)?;
         Ok(Arc::new(Staged {
             file: Mutex::new(None),
             path,
             keep: false,
+            retained: Default::default(),
         }))
     }
 
     /// Creates a staging file holding `initial` bytes.
     pub fn new_staged(&mut self) -> std::io::Result<Arc<Staged>> {
-        let n = self.next_stage;
-        self.next_stage += 1;
-        let path = self.staging.join(format!("{}-{n}", std::process::id()));
+        let path = self.stage_name();
         let file = OpenOptions::new()
             .read(true)
             .write(true)
-            .create(true)
-            .truncate(true)
+            .create_new(true)
             .open(&path)?;
         Ok(Arc::new(Staged {
             file: Mutex::new(Some(file)),
             path,
             keep: false,
+            retained: Default::default(),
         }))
     }
 
@@ -1173,17 +1302,53 @@ mod tests {
         std::mem::forget(t);
 
         let mut t = Tree::new(staging.clone(), dir.path().join("local"));
-        assert_eq!(t.replay_journal(), 1);
+        assert_eq!(t.replay_journal(|_| false), 1);
         let folder = t.child(t.root, "notes").expect("folder made again");
         assert_eq!(t.inodes[&folder].kind, Kind::Dir);
         let f = t.child(folder, "today.md").expect("file taken up");
         let i = &t.inodes[&f];
         assert!(i.dirty.content && i.node.is_none() && i.perm == 0o600 && i.size == 7);
         let mut buf = [0u8; 7];
-        i.staged.as_ref().unwrap().read_exact_at(&mut buf, 0).unwrap();
+        i.staged
+            .as_ref()
+            .unwrap()
+            .read_exact_at(&mut buf, 0)
+            .unwrap();
         assert_eq!(&buf, b"flushed");
         assert!(!staging.join("99999-1").exists(), "a leftover is removed");
         assert!(staging.join(&staged_name).exists());
         assert!(t.has_pending() && t.first_change.is_some());
+
+        // a second crash before the commit: still there
+        std::mem::forget(t);
+        let mut t = Tree::new(staging.clone(), dir.path().join("local"));
+        assert_eq!(t.replay_journal(|_| false), 1, "the journal still names it");
+        let f = t
+            .child(t.child(t.root, "notes").unwrap(), "today.md")
+            .unwrap();
+        // a new staging file after a restart never reuses its name
+        let other = t.new_staged().unwrap();
+        other.write_all_at(b"something else", 0).unwrap();
+        let mut buf = [0u8; 7];
+        t.inodes[&f]
+            .staged
+            .as_ref()
+            .unwrap()
+            .read_exact_at(&mut buf, 0)
+            .unwrap();
+        assert_eq!(&buf, b"flushed");
+        drop(other);
+
+        // renamed, then flushed again: it comes back once, where it went
+        let notes = t.child(t.root, "notes").unwrap();
+        t.detach(f);
+        t.attach(f, notes, "final.md");
+        t.journal_flushed(f).unwrap();
+        std::mem::forget(t);
+        let mut t = Tree::new(staging.clone(), dir.path().join("local"));
+        assert_eq!(t.replay_journal(|_| false), 1);
+        let notes = t.child(t.root, "notes").unwrap();
+        assert!(t.child(notes, "final.md").is_some());
+        assert!(t.child(notes, "today.md").is_none());
     }
 }

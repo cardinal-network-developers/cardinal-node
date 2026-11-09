@@ -1075,6 +1075,15 @@ impl Filesystem for CardinalFs {
         reply.ok();
     }
 
+    fn fsyncdir(&mut self, _req: &Request<'_>, _ino: u64, _fh: u64, _ds: bool, reply: ReplyEmpty) {
+        // Renames and deletes of flushed files are durable from here: the
+        // journal names each where it is now.
+        if let Err(e) = lock(&self.tree).journal_rewrite() {
+            return reply.error(errno("cannot flush a folder", e));
+        }
+        reply.ok();
+    }
+
     fn opendir(&mut self, _req: &Request<'_>, ino: u64, _flags: i32, reply: ReplyOpen) {
         let t = lock(&self.tree);
         match t.inodes.get(&ino) {

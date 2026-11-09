@@ -1906,6 +1906,11 @@ async fn client(cmd: Cmd) -> anyhow::Result<()> {
                     "{n} files here are not on your other devices yet, so removing them to make \
                      room would lose them. They stay."
                 );
+            } else if v["unchecked"].as_bool() == Some(true) {
+                println!(
+                    "Your devices that keep everything cannot be reached now, so nothing more \
+                     was removed to make room."
+                );
             }
             // What changed in the last hour is not freed yet.
             if let Some(b) = v["left"].as_u64().filter(|b| *b > 0) {
