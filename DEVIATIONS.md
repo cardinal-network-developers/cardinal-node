@@ -383,6 +383,11 @@ follow it across two spaces. What still differs:
   the relationship table gives the kind a number (9). Chose: files, public
   and application profiles have no reach kind, so a reader there writes
   only `keep`, `leave` and entries with no ops.
+- **Spec ambiguity: who owns a personal space.** `profiles.md` says an
+  account space has "one identity: yourself" and a files space "usually
+  yourself", and gives neither a role. Chose: the genesis names its author
+  as owner, so that the person alone can add someone to a files space and
+  succeed either.
 - **Spec ambiguity: "reserved".** Entry field 9 and control op 3 are
   reserved, and nothing says what a device does on meeting one. Chose:
   field 9 is a field this implementation does not know, accepted, ignored

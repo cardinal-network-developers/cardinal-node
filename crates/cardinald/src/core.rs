@@ -1903,6 +1903,8 @@ mod tests {
     struct Person {
         _dir: tempfile::TempDir,
         core: Core,
+        /// The key of their recovery words, which nobody's device holds.
+        root: cardinal_crypto::SigningKey,
     }
 
     impl Person {
@@ -1910,10 +1912,15 @@ mod tests {
             let dir = tempfile::tempdir().unwrap();
             let paths = Paths::at(dir.path());
             let p = setup::prepare(&paths).unwrap();
+            let root = p.phrase().root_signing_key();
             setup::install(&paths, p, &Config::default()).unwrap();
             let keys = Arc::new(Keys::load_or_create(&paths.device_key()).unwrap());
             let core = Core::load(&paths, keys).unwrap();
-            Person { _dir: dir, core }
+            Person {
+                _dir: dir,
+                core,
+                root,
+            }
         }
 
         fn id(&self) -> [u8; 32] {
@@ -2236,5 +2243,97 @@ mod tests {
         ana.takes(&g, &[back]);
         assert!(group::joined(ana.space(&g), &cy.id()));
         assert!(group::joined(cy.space(&g), &cy.id()));
+    }
+
+    #[test]
+    fn someone_frozen_is_left_out_of_the_next_key() {
+        use cardinal_identity::entry::add_key_proof;
+        use cardinal_identity::{EntryBuilder, IdentityOp, Power};
+        let mut p = [Person::new(), Person::new(), Person::new()];
+        for i in 0..3 {
+            for j in 0..3 {
+                if i != j {
+                    let (log, id) = (p[j].log(), p[j].id());
+                    p[i].core.ingest_other(id, &log).unwrap();
+                }
+            }
+        }
+        let [mut ana, mut bo, mut cy] = p;
+        let both = [(bo.id(), "Bo".to_owned()), (cy.id(), "Cy".to_owned())];
+        let g = ana.core.create_group("Garden club", "Ana", &both).unwrap();
+        bo.takes(&g, &ana.all_of(&g));
+        cy.takes(&g, &ana.all_of(&g));
+        let hello = cy.says(&g, "hello");
+        ana.takes(&g, std::slice::from_ref(&hello));
+        bo.takes(&g, std::slice::from_ref(&hello));
+
+        // Cy's recovery words are used twice, each time without knowing of
+        // the other: nobody can say whose hands Cy's keys are in.
+        let id = cy.id();
+        let twice: Vec<Vec<u8>> = (0..2)
+            .map(|_| {
+                let next = cardinal_crypto::RecoveryPhrase::generate();
+                let key = next.root_signing_key();
+                let proof = add_key_proof(&key, &id, Power::Root, None);
+                let recovery = next.recovery_key_pair();
+                EntryBuilder::new(id, &[id])
+                    .op(IdentityOp::add_key(
+                        key.public_key(),
+                        Power::Root,
+                        None,
+                        Some(proof),
+                        Some(recovery.public_key()),
+                    ))
+                    .op(IdentityOp::remove_key(cy.root.public_key()))
+                    .sign(&cy.root)
+                    .unwrap()
+                    .encode()
+            })
+            .collect();
+        for who in [&mut ana, &mut bo] {
+            assert!(who.core.ingest_other(id, &twice).unwrap());
+            assert!(who.core.others[&id].log.state().frozen);
+        }
+        // Nothing Cy wrote is undone, and what Cy's keys write is judged
+        // like anyone's.
+        assert_eq!(ana.said(&g), ["hello"]);
+        let again = cy.says(&g, "still me");
+        ana.takes(&g, std::slice::from_ref(&again));
+        bo.takes(&g, std::slice::from_ref(&again));
+        assert_eq!(ana.said(&g), ["hello", "still me"]);
+
+        // Cy's device starts a new epoch, wrapped for everyone. Nobody
+        // writes under an epoch that someone frozen began: whoever writes
+        // next starts another, and Cy is left out of it.
+        let everyone = [cy.enc(), ana.enc(), bo.enc()];
+        let begun = {
+            let ident = cy.core.identity.as_ref().unwrap();
+            let h = cy.core.spaces.get_mut(&g).unwrap();
+            let to: Vec<&HybridPublicKey> = everyone.iter().collect();
+            let space = h.space.as_mut().unwrap();
+            let signing = &cy.core.keys.device.signing;
+            let (sealed, _) = space
+                .rotate(&ident.log, signing, &to, vec![], None)
+                .unwrap();
+            sealed.encode()
+        };
+        ana.takes(&g, std::slice::from_ref(&begun));
+        bo.takes(&g, std::slice::from_ref(&begun));
+        let theirs = ana.space(&g).current_epoch();
+        assert_eq!(theirs, cy.space(&g).current_epoch());
+        let after = ana.says(&g, "without cy");
+        let entry = *ana.space(&g).heads().first().unwrap();
+        assert!(ana.space(&g).entry(&entry).unwrap().starts_epoch());
+        assert_ne!(ana.space(&g).current_epoch(), theirs);
+        bo.takes(&g, std::slice::from_ref(&after));
+        assert_eq!(bo.said(&g), ["hello", "still me", "without cy"]);
+        cy.takes(&g, std::slice::from_ref(&after));
+        assert!(!cy.space(&g).dag().contains(&entry), "Cy opened it");
+        // and one new epoch is enough
+        let more = bo.says(&g, "just us");
+        let entry = *bo.space(&g).heads().first().unwrap();
+        assert!(!bo.space(&g).entry(&entry).unwrap().starts_epoch());
+        ana.takes(&g, std::slice::from_ref(&more));
+        assert_eq!(ana.said(&g).len(), 4);
     }
 }
