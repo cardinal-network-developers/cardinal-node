@@ -4,9 +4,12 @@
 //! Entries whose parents are missing are held until they arrive. Log order
 //! is a topological order in which, among entries whose parents have all
 //! been placed, the smallest id (compared as bytes) comes next. It is kept
-//! incrementally: an entry that descends from every head is last in log
-//! order, so appending one costs O(1); any other insertion recomputes the
-//! order in O(n log n).
+//! incrementally. A new entry has no descendants yet, so it moves nothing
+//! else: it goes after its last parent, before the first entry from there
+//! on with a larger id. An entry whose last parent is last in the order is
+//! appended in O(1), whatever other heads there are, and any other costs
+//! what lies after its place in the order. Heads that nothing builds on,
+//! such as entries a space holds to be invalid, therefore cost nothing.
 
 use std::collections::{BTreeSet, BinaryHeap, HashMap, HashSet};
 
@@ -167,12 +170,39 @@ impl<T> Dag<T> {
     fn place(&mut self, id: Id, mut parents: Vec<Id>, value: T) {
         parents.sort_unstable();
         parents.dedup();
-        let last = self.descends_from_all_heads(&parents);
         let depth = parents
             .iter()
             .map(|p| self.nodes[p].depth + 1)
             .max()
             .unwrap_or(0);
+        // Where it goes in log order. It is ready once its last parent is
+        // placed, and from then on is taken as soon as it is the smallest
+        // of what is ready: before the first entry after that parent with a
+        // larger id. It has no descendants, so nothing else moves.
+        let from = parents.iter().map(|p| self.position[p] + 1).max();
+        let from = from.unwrap_or(0);
+        let at = (from..self.order.len())
+            .find(|j| self.order[*j] > id)
+            .unwrap_or(self.order.len());
+        // How much of the order before it is all its ancestors: as far as a
+        // parent's reaches, and further while what follows is an ancestor.
+        let mut n = parents
+            .iter()
+            .map(|p| self.prefix[self.position[p]])
+            .max()
+            .unwrap_or(0);
+        if parents.len() > 1 {
+            // one parent: what stopped its prefix stops this one too
+            let behind = |x: &Id| {
+                parents
+                    .iter()
+                    .any(|p| p == x || self.reaches(x, p, &self.prefix))
+            };
+            while n < at && behind(&self.order[n]) {
+                n += 1;
+            }
+        }
+        let prefix = if n == at { at + 1 } else { n };
         for p in &parents {
             self.nodes.get_mut(p).expect("parent").children.push(id);
             self.heads.remove(p);
@@ -187,22 +217,22 @@ impl<T> Dag<T> {
                 value,
             },
         );
-        if last {
-            self.position.insert(id, self.order.len());
-            self.order.push(id);
-            self.prefix.push(self.order.len());
-        } else {
-            self.order = self.compute_order(None);
-            self.position = self
-                .order
-                .iter()
-                .enumerate()
-                .map(|(n, x)| (*x, n))
-                .collect();
-            self.prefix = self.compute_prefix();
+        self.order.insert(at, id);
+        self.prefix.insert(at, prefix);
+        self.position.insert(id, at);
+        // What comes after it moved up by one, and it is an ancestor of
+        // none of that.
+        for j in at + 1..self.order.len() {
+            self.position.insert(self.order[j], j);
+            if self.prefix[j] > at {
+                self.prefix[j] = at;
+            }
         }
     }
 
+    /// [`Dag::prefix`], worked out from nothing: what the tests hold the
+    /// one kept as entries arrive against.
+    #[cfg(test)]
     fn compute_prefix(&self) -> Vec<usize> {
         let mut out: Vec<usize> = Vec::with_capacity(self.order.len());
         for (i, x) in self.order.iter().enumerate() {
@@ -408,6 +438,30 @@ mod tests {
     }
 
     #[test]
+    fn an_entry_nothing_builds_on_stays_where_it_is() {
+        // A head that stays a head, as an entry held to be invalid does.
+        // With a small id it sorts early and what follows is appended; with
+        // a large one it sorts last, and each new entry goes in before it.
+        for stray in [2u8, 200] {
+            let mut d: Dag<()> = Dag::new();
+            d.insert(id(1), vec![], ());
+            d.insert(id(stray), vec![id(1)], ());
+            d.insert(id(3), vec![id(1)], ());
+            for n in 4..100u8 {
+                d.insert(id(n), vec![id(n - 1)], ());
+                assert_eq!(d.order, d.compute_order(None));
+                assert_eq!(d.prefix, d.compute_prefix());
+            }
+            assert_eq!(d.heads(), vec![id(99.min(stray)), id(99.max(stray))]);
+            let at = if stray == 2 { 1 } else { 98 };
+            assert_eq!(d.position(&id(stray)), Some(at));
+            assert!(d.is_ancestor(&id(1), &id(99)) && d.is_ancestor(&id(50), &id(99)));
+            assert!(d.concurrent(&id(stray), &id(99)));
+            assert!(!d.descends_from_all_heads(&[id(99)]));
+        }
+    }
+
+    #[test]
     fn ancestor_checks_match_a_walk() {
         let mut x = 0x9e37_79b9_7f4a_7c15u64;
         let mut below = move |n: usize| {
@@ -416,8 +470,8 @@ mod tests {
             x ^= x << 17;
             (x % n as u64) as usize
         };
-        for round in 0..60 {
-            let size = 2 + below(30);
+        for round in 0..200 {
+            let size = 2 + below(40);
             let reach = 1 + below(6);
             // random ids, so log order is not insertion order
             let ids: Vec<Id> = (0..size)
@@ -446,6 +500,13 @@ mod tests {
             let mut d: Dag<()> = Dag::new();
             for (n, (i, parents)) in todo.into_iter().enumerate() {
                 d.insert(i, parents, ());
+                // the order kept as entries arrive is the order worked out
+                // from nothing, and so is what is kept beside it
+                assert_eq!(d.order, d.compute_order(None), "round {round}");
+                assert_eq!(d.prefix, d.compute_prefix(), "round {round}");
+                for (at, x) in d.order.iter().enumerate() {
+                    assert_eq!(d.position[x], at);
+                }
                 if n % 4 == 0 || n + 1 == size {
                     for b in d.log_order() {
                         let walked = d.ancestors(b);

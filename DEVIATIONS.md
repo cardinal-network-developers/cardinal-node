@@ -333,6 +333,21 @@ follow it across two spaces. What still differs:
   way, and with identity logs arriving late and changing under entries
   already judged. Sixteen flaws put into the native evaluation one at a
   time were each caught.
+- **What an entry costs** (`tests/cost.rs`, optimized, on one laptop). In a
+  two-person space, taking an entry that builds on everything held (opening
+  it, checking its signature, judging it, applying it) took about 50 µs at
+  the 200th entry, the 2,000th and the 20,000th alike. Running the whole
+  program once, which is what every entry in a shared space cost before,
+  took 13 ms at 100 entries, 91 ms at 200, 0.4 s at 400 and 2.0 s at 800.
+  The graph keeps its log order by putting each entry in its place, where
+  it used to work the order out again whenever an entry did not descend
+  from every head. An entry held to be invalid is a head for good, since
+  nobody builds on it, so with one in the space every later entry paid
+  for that: 92 µs at the 200th and 732 µs at the 2,000th, against 62 µs
+  and 51 µs now, and 55 µs at the 20,000th. What still grows with the space
+  is an entry written at the same time as another: it recomputes the
+  state ([State](#state-specstatemd-specprofilesmd)), 0.6 ms at 200
+  entries, 9 ms at 2,000 and 127 ms at 20,000.
 - **Spec gap: an entry's id does not cover its signature.** A signed
   object's id is the hash of its body (`encoding.md#signed-objects`), so
   anyone who holds a key can sign someone's entry again: the same entry id,
