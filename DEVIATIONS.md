@@ -53,6 +53,37 @@ follow it across two spaces. What still differs:
   written with old parents appears when it arrives and not among what was
   already read. `relationship::messages` still sorts by log order.
 
+The specification then answered what building this found (decisions D59 to
+D61, and the commits beside them). Where it answered as this implementation
+had chosen, the readings recorded below are now only descriptions. Where it
+answered otherwise, the code is behind:
+
+- **An id says who signed (D59).** A signed object's id now covers its body
+  and its signing keys, and a sealed entry's nonce is derived from the
+  whole signed object. Here an id is still the hash of the body, the nonce
+  comes from the entry id, and an entry signed again under another key is
+  the same entry, judged by `Judge::key_of`. This changes every id: in
+  identity logs, spaces and grants alike. The records around a signed body
+  and a sealed entry are also closed now: a key the specification does not
+  define there is refused, where this implementation keeps it. A signing
+  key of small order is refused; here ZIP-215 alone decides.
+- **A reach node is its member's from the start (D61).** It is not created:
+  its id follows from the identity's, and a reader's `set` on it is told
+  from the op alone. Here a reach node is a node of kind 9 that its member
+  creates, and validity looks for that `create` among the author's earlier
+  entries. The state at a cut leaves out the reach nodes of those a
+  successor does not name.
+- **When to rotate (D60).** The specification kept its three reasons and
+  said by whose account: what the device held when the epoch reached it,
+  which it has to keep. Here a change of a member's key, or learning of a
+  freeze, starts no new epoch by itself. Two reasons are new and read from
+  the entries: a `leave` the epoch's first entry does not descend from,
+  which is what this implementation does, and an addition made at the same
+  time as a rotation, which it does not.
+- **Joining with no host.** Someone with no host accepts a space by
+  setting their reach node to an empty list. Here they write a read marker
+  instead, which a reader may not write.
+
 ## Encoding (`spec/encoding.md`)
 
 - **Spec ambiguity: how nesting depth is counted.** "Nesting depth MUST NOT

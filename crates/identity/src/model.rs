@@ -466,6 +466,7 @@ fn graph_facts(
     world: &World,
     ids: &BTreeSet<Sym>,
     prefix: &str,
+    only_genesis: Option<Sym>,
     f: &mut Facts,
 ) -> HashMap<Sym, HashSet<Sym>> {
     let anc = ancestry(world, ids);
@@ -478,7 +479,9 @@ fn graph_facts(
     for &x in &v {
         f.add(&entry, &[s(x)]);
         f.add(&ae, &[s(x), s(x)]);
-        if world.entries[&x].parents.is_empty() {
+        // A space has one genesis, the entry whose id is the space's; an
+        // identity log's is any entry without parents.
+        if only_genesis.map_or(world.entries[&x].parents.is_empty(), |g| g == x) {
             f.add(&genesis, &[s(x)]);
         }
         for &a in &anc[&x] {
@@ -508,7 +511,7 @@ pub fn identity_facts(world: &World, ident: Sym, ids: &BTreeSet<Sym>) -> Facts {
         .filter(|x| world.entries[x].log == ident)
         .collect();
     let mut f = Facts::new();
-    let anc = graph_facts(world, &own, "", &mut f);
+    let anc = graph_facts(world, &own, "", None, &mut f);
     let order = log_order(world, &own);
     f.declare("later");
     for (i, &a) in order.iter().enumerate() {
@@ -938,7 +941,7 @@ pub fn space_facts(world: &World, space: Sym, ids: &BTreeSet<Sym>) -> (Facts, BT
         .filter(|x| world.entries[x].log == space)
         .collect();
     let mut f = Facts::new();
-    graph_facts(world, &own, "s_", &mut f);
+    graph_facts(world, &own, "s_", Some(space), &mut f);
     for k in [
         "author",
         "skey",

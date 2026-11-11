@@ -46,7 +46,7 @@ which comes from guardians' logs.
 | `anc(A,B)`, `ae(A,B)` | A is an ancestor of B; A is B or an ancestor of B |
 | `conc(A,B)` | A and B are concurrent |
 | `later(A,B)` | B comes after A in log order |
-| `signer(E,K)` | E is signed by key K |
+| `signer(E,K)` | E is signed by key K. An entry has one signer: its id covers it ([encoding.md](../spec/encoding.md#signed-objects)) |
 | `add(E,K,P)` | E contains `add_key` of K with power P (1 device, 2 admin, 3 root) |
 | `readd(E)` | E contains `add_key` of a key already named in E's causal past, by an `add_key` or as a recovery's new root |
 | `rem(E,K)` | E contains `remove_key` of K |
@@ -299,13 +299,14 @@ its authors.
 
 | Fact | Meaning |
 |---|---|
-| `s_entry(X)`, `s_genesis(X)`, `s_anc`, `s_ae` | as for identity logs |
-| `author(X,A)`, `skey(X,K)`, `cites(X,H)` | X's author identity, signing key, and cited head of the author's log |
+| `s_entry(X)`, `s_anc`, `s_ae` | as for identity logs |
+| `s_genesis(X)` | X is the space's genesis: the entry whose id is the space's. An entry has no parents only if it is the genesis of its own space ([spaces.md](../spec/spaces.md#entries-and-sealed-entries)), so a space has one |
+| `author(X,A)`, `skey(X,K)`, `cites(X,H)` | X's author identity, signing key, and cited head of the author's log. An entry has one signing key: its id covers it ([encoding.md](../spec/encoding.md#signed-objects)) |
 | `adds(X,M,R)` | X contains `add_member` of identity M with role R (0 reader, 1 writer, 2 admin, 3 owner) |
 | `s_names(X,S)` | X contains `succeed` naming the space S |
 | `s_keep(X,K,E)` | X contains `keep` for key K, listing entry E |
 | `s_structural(X)` | X ends or begins a space: it contains a `succeed`, or it is a genesis whose `start` names a space it succeeds |
-| `s_badops(X,R)` | X contains an op that role R may not perform ([table](../spec/spaces.md#members-and-roles)). Outside a genesis, `start` and an `add_member` of an owner are allowed to no role. `succeed` is allowed to the owner, or, in a space with no owner, to every role |
+| `s_badops(X,R)` | X contains an op that role R may not perform ([table](../spec/spaces.md#members-and-roles)). Outside a genesis, `start`, and an `add_member` whose role is not 0, 1 or 2, are allowed to no role. `succeed` is allowed to the owner, or, in a space with no owner, to every role |
 | `s_badgenesis(G)` | the genesis G is not formed as [spaces.md](../spec/spaces.md#members-and-roles) requires: it does not hold exactly one `start`; it does not name its author; it names an owner who is not its author, or names an owner twice; it names a role outside 0 to 3; it names no owner and names an admin; or it holds a `succeed`, or, besides `start` and `add_member`, an op that the highest role it gives its author may not perform |
 | `decider(M)`, `quorum(N)` | who must name a successor, and how many of them: the owner the genesis names, and 1; or, when it names no owner, every identity it names, and their number |
 | `id_effective_at(A,K,H)`, `id_removed(A,K)`, `id_removed_at(A,K,H)` | `effective_at`, `removed`, `removed_at` from A's identity log |
