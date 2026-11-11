@@ -58,22 +58,27 @@ fn relationship_of(ana: Person, bo: Person) -> Pair {
         &ana.log,
         &ana.devices[0].signing,
         &[ana.enc.public_key(), bo.enc.public_key()],
-        relationship::genesis_ops(bo.log.id()),
+        relationship::genesis_ops(ana.log.id(), bo.log.id()),
         None,
     )
     .unwrap();
-    a.evaluate_full(&[&ana.log, &bo.log]).unwrap();
+    // each holds the other's identity log, which judges what they write
+    a.set_identity(bo.log.state());
     let c = relationship::conversation(&a).unwrap();
     let mut b = Space::open_genesis(&genesis, &[&bo.enc], Some(ana.log.state())).unwrap();
-    b.evaluate_full(&[&ana.log, &bo.log]).unwrap();
+    b.set_identity(bo.log.state());
     Pair { ana, bo, a, b, c }
 }
 
 impl Pair {
+    /// What each holds valid, judged as entries arrived, is what the rules
+    /// find in all of it.
     fn eval(&mut self) {
         let logs = [&self.ana.log, &self.bo.log];
-        self.a.evaluate_full(&logs).unwrap();
-        self.b.evaluate_full(&logs).unwrap();
+        for space in [&self.a, &self.b] {
+            let rules = cardinal_space::validity::by_rules(space.dag(), &logs).unwrap();
+            assert!(space.validity().valid == rules.valid);
+        }
     }
     fn ana_writes(&mut self, ops: Vec<SpaceOp>) -> SealedEntry {
         let s = self

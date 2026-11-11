@@ -38,18 +38,17 @@ fn every_reach_node_a_member_wrote_counts() {
         &ana,
         &ana_dev.signing,
         &[ana_enc.public_key(), bo_enc.public_key()],
-        relationship::genesis_ops(bo.id()),
+        relationship::genesis_ops(ana.id(), bo.id()),
         None,
     )
     .unwrap();
-    space.evaluate_full(&[&ana, &bo]).unwrap();
+    space.set_identity(bo.state());
     for token in [1, 2] {
         let op = relationship::create_reach(&ana.id(), &[reach(token)]);
         space
             .write(&ana, &ana_dev.signing, vec![op], Some(1))
             .unwrap();
     }
-    space.evaluate_full(&[&ana, &bo]).unwrap();
 
     let all = relationship::all_reach_of(space.state(), &ana.id());
     let mut tokens: Vec<u8> = all.iter().map(|r| r.token[0]).collect();

@@ -17,7 +17,7 @@ Rust workspace, one crate per spec concept. License MIT OR Apache-2.0.
 | `cardinal-encoding` | encoding.md | complete, with test vectors |
 | `cardinal-crypto` | crypto.md | suite 1 complete: derive, seal, AEADs, Ed25519 (ZIP-215), X25519, ML-KEM-768, CPace, BIP-39 |
 | `cardinal-identity` | identity.md, model/rules.md | entries, signing, log storage; validity by executing `model/rules.md` with an embedded stratified-Datalog evaluator, so the rules are never re-implemented by hand |
-| `cardinal-space` | spaces.md, state.md | sealed entries, epochs, files-profile state tree (MVR fields, moves, deletes, conflicts); membership for a single-identity space natively |
+| `cardinal-space` | spaces.md, state.md | sealed entries, epochs, files-profile state tree (MVR fields, moves, deletes, conflicts); members and validity for every space natively, one entry at a time |
 | `cardinal-blob` | blobs.md | FastCDC, convergent encryption, indexes, on-disk store |
 | `cardinal-sync` | sync.md | range-based reconciliation, want/objects/heads |
 | `cardinal-link` | link.md | handshake, keys, frames; **TCP carrier first** (a spec-listed carrier, reliable for free); UDP with loss recovery and congestion control is the next milestone |

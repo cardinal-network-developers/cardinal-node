@@ -1,7 +1,7 @@
 //! A space as one device holds it: sealed and opened entries, epoch keys,
 //! validity, and state, kept up to date as entries arrive.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 
 use cardinal_crypto::{HybridKeyPair, HybridPublicKey, SigningKey};
@@ -9,12 +9,12 @@ use cardinal_identity::dag::{Dag, Inserted};
 use cardinal_identity::{EntryId, IdentityLog, IdentityState, KeyId};
 
 use crate::entry::{
-    IdentityId, MembershipId, Policy, Profile, SealedEntry, SpaceEntry, SpaceEntryBuilder, SpaceId,
-    SpaceOp, SpaceOpBody,
+    IdentityId, Policy, Profile, SealedEntry, SpaceEntry, SpaceEntryBuilder, SpaceId, SpaceOp,
+    SpaceOpBody, OWNER,
 };
 use crate::epoch::{EpochId, EpochKey, Keyring};
-use crate::membership::{evaluate_full, evaluate_single, membership_of, Validity};
 use crate::state::State;
+use crate::validity::{Judge, Member, Validity};
 use crate::Error;
 
 /// Counters of how the state was kept up to date.
@@ -22,7 +22,7 @@ use crate::Error;
 pub struct UpdateStats {
     /// Entries applied incrementally.
     pub appended: u64,
-    /// Full recomputations.
+    /// Full recomputations of the state.
     pub recomputed: u64,
 }
 
@@ -31,14 +31,18 @@ pub struct Space {
     id: SpaceId,
     profile: Profile,
     policy: Policy,
-    owner: IdentityId,
+    creator: IdentityId,
     dag: Dag<SpaceEntry>,
     sealed: HashMap<EntryId, SealedEntry>,
+    /// Other sealed forms of entries held: the same body, and so the same
+    /// entry id, under another signature.
+    resigned: Vec<(EntryId, SealedEntry)>,
     keyring: Keyring,
-    author: Option<Arc<IdentityState>>,
-    validity: Validity,
-    unsupported: Option<&'static str>,
+    judge: Judge,
     state: State,
+    /// Each valid entry that no other valid entry descends from: the
+    /// parents of the next entry written here.
+    valid_heads: BTreeSet<EntryId>,
     current_epoch: Option<(EntryId, EpochId)>,
     stats: UpdateStats,
 }
@@ -57,9 +61,10 @@ pub fn author_head(log: &IdentityLog, device: &cardinal_identity::KeyId) -> Entr
 }
 
 impl Space {
-    /// Creates a space: a genesis entry starting epoch 0, wrapped to each
-    /// member identity's encryption key in `recipients` (for a personal
-    /// space, the author's own). Returns the space and the sealed genesis.
+    /// Creates a space its author owns alone: a genesis entry that names
+    /// the author as owner and starts epoch 0, wrapped to each identity
+    /// encryption key in `recipients` (for a personal space, the author's
+    /// own). Returns the space and the sealed genesis.
     pub fn create(
         profile: Profile,
         policy: Policy,
@@ -68,12 +73,14 @@ impl Space {
         recipients: &[&HybridPublicKey],
         time: Option<u64>,
     ) -> Result<(Space, SealedEntry), Error> {
-        let ops = Vec::new();
+        let ops = vec![SpaceOp::add_member(author.id(), OWNER)];
         Space::create_with(profile, policy, author, device, recipients, ops, time)
     }
 
-    /// [`create`](Self::create), with `ops` in the genesis entry as well:
-    /// those that add its other members, and what it starts out with.
+    /// Creates a space whose genesis entry holds `start` and then `ops`:
+    /// the `add_member` ops that name its first members, its author among
+    /// them (`spaces.md#members-and-roles`), and what it starts out with.
+    /// A genesis that does not name its own author starts nothing.
     pub fn create_with(
         profile: Profile,
         policy: Policy,
@@ -127,24 +134,28 @@ impl Space {
             id: g.id(),
             profile,
             policy,
-            owner: g.author(),
+            creator: g.author(),
             dag: Dag::new(),
             sealed: HashMap::new(),
+            resigned: Vec::new(),
             keyring,
-            author,
-            validity: Validity::default(),
-            unsupported: None,
+            judge: Judge::new(profile),
             state: State::new(profile),
+            valid_heads: BTreeSet::new(),
             current_epoch: None,
             stats: UpdateStats::default(),
         };
+        if let Some(a) = author {
+            space.judge.set_state(&space.dag, a);
+        }
         space.insert_entry(g);
         Ok(space)
     }
 
     /// Opens a space from its sealed genesis entry, with this identity's
-    /// encryption keys (to open the epoch wrap) and the creator's
-    /// evaluated identity log.
+    /// encryption keys (to open the epoch wrap) and, if it is held, the
+    /// evaluated identity log of whoever wrote the genesis. Other authors'
+    /// logs are given with [`set_identity`](Self::set_identity).
     pub fn open_genesis(
         sealed: &SealedEntry,
         identity_keys: &[&HybridKeyPair],
@@ -230,9 +241,18 @@ impl Space {
         &self.policy
     }
 
-    /// The identity that created the space.
-    pub fn owner(&self) -> IdentityId {
-        self.owner
+    /// The identity that wrote the genesis. It owns the space only if the
+    /// genesis says so ([`owner`](Self::owner)).
+    pub fn creator(&self) -> IdentityId {
+        self.creator
+    }
+
+    /// The space's one owner: the author of its genesis, if the genesis
+    /// names it as owner. A space with no owner, such as a relationship,
+    /// has the members its genesis names for good, and they decide together
+    /// what an owner would decide alone.
+    pub fn owner(&self) -> Option<IdentityId> {
+        self.judge.owner()
     }
 
     /// The opened entries.
@@ -250,14 +270,20 @@ impl Space {
         self.sealed.get(id)
     }
 
-    /// Every sealed entry held.
+    /// Every sealed entry held. An entry signed again by someone is here
+    /// once for each signature.
     pub fn sealed_entries(&self) -> impl Iterator<Item = (&EntryId, &SealedEntry)> {
-        self.sealed.iter()
+        let resigned = self.resigned.iter().map(|(id, s)| (id, s));
+        self.sealed.iter().chain(resigned)
     }
 
-    /// The current heads.
+    /// The heads of what is held to be valid: each valid entry that no
+    /// other valid entry descends from, sorted. These are the parents of a
+    /// new entry; an entry held to be invalid is never one
+    /// (`spaces.md#entries-and-sealed-entries`). The heads of everything
+    /// held, valid or not, are [`dag`](Self::dag)`().heads()`.
     pub fn heads(&self) -> Vec<EntryId> {
-        self.dag.heads()
+        self.valid_heads.iter().copied().collect()
     }
 
     /// The epoch keys held.
@@ -271,14 +297,44 @@ impl Space {
         self.current_epoch.map(|(_, e)| e)
     }
 
-    /// Validity of the entries.
+    /// Validity of the entries, and the members.
     pub fn validity(&self) -> &Validity {
-        &self.validity
+        self.judge.validity()
     }
 
-    /// Whether native evaluation refused this space, and why.
-    pub fn unsupported(&self) -> Option<&'static str> {
-        self.unsupported
+    /// The members: each identity with each role a valid entry gave it.
+    pub fn members(&self) -> &[Member] {
+        &self.judge.validity().members
+    }
+
+    /// The highest role `who` holds, if they are a member.
+    pub fn role_of(&self, who: &IdentityId) -> Option<u64> {
+        self.judge.validity().role_of(who)
+    }
+
+    /// Whether `who` has left: they wrote a valid `leave` that no valid
+    /// `add_member` of them descends from. Leaving changes nothing about
+    /// what is valid; the others stop sending to someone who left, and
+    /// leave them out when the space's keys next change.
+    pub fn has_left(&self, who: &IdentityId) -> bool {
+        self.judge.has_left(&self.dag, who)
+    }
+
+    /// The successor that stands, if the space has been succeeded
+    /// (`spaces.md#ending-a-space`).
+    pub fn successor(&self) -> Option<SpaceId> {
+        self.judge.successor(&self.dag)
+    }
+
+    /// Whether the space has ended as far as this device has seen: an entry
+    /// written now, on everything valid, would descend from the end.
+    pub fn ended(&self) -> bool {
+        self.judge.closes(&self.dag, &self.heads())
+    }
+
+    /// The judge, for what it found beyond [`validity`](Self::validity).
+    pub fn judge(&self) -> &Judge {
+        &self.judge
     }
 
     /// The state.
@@ -291,38 +347,24 @@ impl Space {
         self.stats
     }
 
-    /// The membership this space's creator writes under.
-    pub fn owner_membership(&self) -> Option<MembershipId> {
-        self.dag.get(&self.id).and_then(|g| g.genesis_membership())
+    /// Takes the evaluated identity log of an author, as this device holds
+    /// it now. The signatures of that author's entries are judged again,
+    /// and with them whatever rested on them.
+    pub fn set_identity(&mut self, state: Arc<IdentityState>) {
+        let changed = self.judge.set_state(&self.dag, state);
+        self.took(None, changed);
     }
 
-    /// Replaces the creator's evaluated identity log, re-evaluating if it
-    /// changed.
-    pub fn set_author(&mut self, author: Arc<IdentityState>) {
-        if self.author.as_deref() != Some(&*author) {
-            self.author = Some(author);
-            self.recompute();
+    /// [`set_identity`](Self::set_identity) for several authors at once,
+    /// bringing the state up to date once at the end.
+    pub fn set_identities(&mut self, states: impl IntoIterator<Item = Arc<IdentityState>>) {
+        let mut changed = false;
+        for state in states {
+            changed |= !self.judge.set_state(&self.dag, state).is_empty();
         }
-    }
-
-    /// Whether this space needs [`evaluate_full`](Self::evaluate_full),
-    /// because it has members other than its creator.
-    pub fn needs_full_evaluation(&self) -> bool {
-        self.profile == Profile::RELATIONSHIP
-            || self.profile == crate::group::GROUP
-            || self.unsupported.is_some()
-    }
-
-    /// Re-evaluates with the normative `space` program, given the authors'
-    /// identity logs. This handles spaces with several members, at a cost
-    /// quadratic in the number of entries.
-    pub fn evaluate_full(&mut self, logs: &[&IdentityLog]) -> Result<(), Error> {
-        self.validity = evaluate_full(&self.dag, logs)?;
-        self.unsupported = None;
-        self.state = State::compute(self.profile, &self.dag, &self.validity.valid);
-        self.current_epoch = self.compute_epoch();
-        self.stats.recomputed += 1;
-        Ok(())
+        if changed {
+            self.start_over();
+        }
     }
 
     /// Opens and adds a sealed entry. Returns what the graph did with it.
@@ -338,7 +380,21 @@ impl Space {
         self.keyring.add(key);
         self.learn_keys(&e);
         let id = e.id();
-        self.sealed.entry(id).or_insert(sealed);
+        if let Some(held) = self.sealed.get(&id) {
+            // The entry is here already. If this is another signed object
+            // with the same body, its signature is one more the entry may
+            // be judged by; which one does not depend on which came first.
+            let sid = sealed.sealed_id();
+            let new =
+                held.sealed_id() != sid && !self.resigned.iter().any(|(_, s)| s.sealed_id() == sid);
+            if new {
+                self.resigned.push((id, sealed));
+                let changed = self.judge.also_signed(&self.dag, &id, e.signer());
+                self.took(None, changed);
+            }
+            return Ok(Inserted::Duplicate);
+        }
+        self.sealed.insert(id, sealed);
         Ok(self.insert_entry(e))
     }
 
@@ -355,78 +411,85 @@ impl Space {
         }
     }
 
-    fn can_append(&self, e: &SpaceEntry) -> bool {
-        self.author.is_some()
-            && self.unsupported.is_none()
-            && self.validity.unwitnessed.is_empty()
-            && !self.validity.members.is_empty()
-            && self.dag.descends_from_all_heads(e.parents())
-            && e.parents().iter().all(|p| self.dag.contains(p))
-            && e.author() == self.owner
-            && e.ops().iter().all(|o| match o.body() {
-                SpaceOpBody::Rotate { .. } => true,
-                b => !b.is_control(),
-            })
-    }
-
-    /// Adds an opened entry (already checked against its sealed form).
+    /// Adds an opened entry (already checked against its sealed form). It is
+    /// judged once it and its ancestors are all here.
     pub fn insert_entry(&mut self, e: SpaceEntry) -> Inserted {
-        let fast = !self.dag.is_empty() && self.can_append(&e);
         let id = e.id();
         let r = self.dag.insert(id, e.parents().to_vec(), e);
-        match &r {
-            Inserted::Added(v) if fast && v.len() == 1 => self.append_one(&id),
-            Inserted::Added(_) => self.recompute(),
-            _ => {}
+        if let Inserted::Added(added) = &r {
+            for x in added {
+                let changed = self.judge.arrive(&self.dag, x);
+                self.took(Some(x), changed);
+            }
         }
         r
     }
 
-    fn append_one(&mut self, id: &EntryId) {
-        let e = self.dag.get(id).expect("entry");
-        let author = self.author.as_ref().expect("author");
-        let i0 = self.owner_membership();
-        let valid = !author.frozen
-            && membership_of(e) == i0
-            && author.is_effective_at(&e.signer(), &e.author_head())
-            && !author.is_removed(&e.signer());
-        if author.is_effective_at(&e.signer(), &e.author_head()) {
-            self.validity.author_ok.insert(*id);
-        }
-        if valid {
-            self.validity.valid.insert(*id);
-            self.state.append(&self.dag, e);
-            if e.starts_epoch() {
-                self.current_epoch = Some((*id, e.epoch()));
+    /// Brings the state up to date after validity changed for `changed`,
+    /// on the arrival of `new` or, without one, a change of signatures.
+    fn took(&mut self, new: Option<&EntryId>, changed: Vec<EntryId>) {
+        match (new, changed.as_slice()) {
+            // Nothing valid changed: an entry that does not count, or an
+            // identity log that grew without changing which keys do.
+            (_, []) => {}
+            // The new entry is valid and nothing else moved.
+            (Some(id), [only]) if only == id => {
+                let e = self.dag.get(id).expect("entry");
+                let behind = |h: &EntryId| e.parents().contains(h) || self.dag.is_ancestor(h, id);
+                let after_all = self.valid_heads.iter().all(behind);
+                let left: BTreeSet<EntryId> = self
+                    .valid_heads
+                    .iter()
+                    .filter(|h| !behind(h))
+                    .copied()
+                    .collect();
+                self.valid_heads = left;
+                self.valid_heads.insert(*id);
+                if after_all {
+                    // It descends from everything applied, so it comes last
+                    // in log order among what is valid.
+                    self.state.append(&self.dag, e);
+                    if e.starts_epoch() {
+                        self.current_epoch = Some((*id, e.epoch()));
+                    }
+                    self.stats.appended += 1;
+                } else {
+                    self.recompute_state();
+                }
             }
-        } else if author.is_effective_at(&e.signer(), &e.author_head()) && !author.frozen {
-            // a removed key: it may be witnessed later
-            self.validity.unwitnessed.insert(*id);
+            // Entries that were here started or stopped being valid.
+            _ => self.start_over(),
         }
-        self.stats.appended += 1;
     }
 
-    fn recompute(&mut self) {
+    fn start_over(&mut self) {
+        self.valid_heads = self.compute_valid_heads();
+        self.recompute_state();
+    }
+
+    fn recompute_state(&mut self) {
         self.stats.recomputed += 1;
-        let Some(author) = self.author.clone() else {
-            self.validity = Validity::default();
-            self.state = State::new(self.profile);
-            self.current_epoch = None;
-            return;
-        };
-        match evaluate_single(&self.dag, &author) {
-            Ok(v) => {
-                self.validity = v;
-                self.unsupported = None;
-            }
-            Err(Error::Unsupported(why)) => {
-                self.validity = Validity::default();
-                self.unsupported = Some(why);
-            }
-            Err(_) => self.validity = Validity::default(),
-        }
-        self.state = State::compute(self.profile, &self.dag, &self.validity.valid);
+        self.state = State::compute(self.profile, &self.dag, &self.validity().valid);
         self.current_epoch = self.compute_epoch();
+    }
+
+    /// Each valid entry that no other valid entry descends from.
+    fn compute_valid_heads(&self) -> BTreeSet<EntryId> {
+        let valid = &self.validity().valid;
+        let mut heads = BTreeSet::new();
+        // entries that a valid entry descends from
+        let mut behind: HashSet<EntryId> = HashSet::new();
+        for x in self.dag.log_order().iter().rev() {
+            let is_valid = valid.contains(x);
+            let covered = behind.contains(x);
+            if is_valid && !covered {
+                heads.insert(*x);
+            }
+            if is_valid || covered {
+                behind.extend(self.dag.parents(x).iter().copied());
+            }
+        }
+        heads
     }
 
     fn compute_epoch(&self) -> Option<(EntryId, EpochId)> {
@@ -435,7 +498,7 @@ impl Space {
             .log_order()
             .iter()
             .filter(|x| {
-                self.validity.is_valid(x) && self.dag.get(x).is_some_and(|e| e.starts_epoch())
+                self.validity().is_valid(x) && self.dag.get(x).is_some_and(|e| e.starts_epoch())
             })
             .copied()
             .collect();
@@ -459,28 +522,29 @@ impl Space {
         }
     }
 
-    /// Whether `key` wrote something that no other key built on. Once the
-    /// key is removed such an entry counts only if witnessed
-    /// (`spaces.md#authors`), and any other key's write on the heads does
-    /// that.
+    /// The entry that started the current epoch, and who wrote it.
+    pub fn epoch_started_by(&self) -> Option<(EntryId, IdentityId)> {
+        let (entry, _) = self.current_epoch?;
+        Some((entry, self.dag.get(&entry)?.author()))
+    }
+
+    /// Whether `key` wrote something that no other key of its identity
+    /// built on. Once the key is removed such an entry counts only if
+    /// witnessed (`spaces.md#authors`), and a write by another of the
+    /// identity's keys on the valid heads does that. Other members building
+    /// on an entry does not save it.
     pub fn has_unwitnessed(&self, key: &KeyId) -> bool {
-        self.dag
-            .heads()
-            .iter()
-            .any(|h| self.dag.get(h).is_some_and(|e| e.signer() == *key))
+        self.judge.unwitnessed_work(&self.dag, key)
     }
 
     /// How many entries by the removed `key` do not count, for want of a
     /// witness.
     pub fn unwitnessed_by(&self, key: &KeyId) -> usize {
-        self.validity
-            .unwitnessed
-            .iter()
-            .filter(|x| self.dag.get(x).is_some_and(|e| e.signer() == *key))
-            .count()
+        let by_key = |x: &&EntryId| self.judge.key_of(&self.dag, x) == Some(*key);
+        self.validity().unwitnessed.iter().filter(by_key).count()
     }
 
-    /// Writes an entry with `ops` under the current epoch, with the current
+    /// Writes an entry with `ops` under the current epoch, with the valid
     /// heads as parents. Returns the sealed entry to store and sync.
     pub fn write(
         &mut self,
@@ -489,12 +553,23 @@ impl Space {
         ops: Vec<SpaceOp>,
         time: Option<u64>,
     ) -> Result<SealedEntry, Error> {
+        Ok(self.write_entry(author, device, ops, time)?.1)
+    }
+
+    /// [`write`](Self::write), returning the new entry's id as well.
+    pub fn write_entry(
+        &mut self,
+        author: &IdentityLog,
+        device: &SigningKey,
+        ops: Vec<SpaceOp>,
+        time: Option<u64>,
+    ) -> Result<(EntryId, SealedEntry), Error> {
         let heads = self.heads();
-        Ok(self.write_on(author, device, &heads, ops, time)?.1)
+        self.write_on(author, device, &heads, ops, time)
     }
 
     /// Writes an entry with `ops` that does not descend from any of
-    /// `exclude`: its parents are the latest entries that are not
+    /// `exclude`: its parents are the latest valid entries that are not
     /// descendants of them (or them). The entry is concurrent with each
     /// of `exclude`, so its `set`s do not supersede theirs and its deletes
     /// yield to them: for a change made without having seen theirs.
@@ -526,25 +601,53 @@ impl Space {
         self.write_on(author, device, &parents, ops, time)
     }
 
-    /// The maximal entries that are neither one of `exclude` nor descend
-    /// from one: the heads of the graph with `exclude` and everything
-    /// after them removed.
+    /// The latest valid entries that are neither one of `exclude` nor
+    /// descend from one: the valid heads of the graph with `exclude` and
+    /// everything after them removed.
     pub fn latest_excluding(&self, exclude: &[EntryId]) -> Vec<EntryId> {
         let mut gone: HashSet<EntryId> = HashSet::new();
         for x in exclude.iter().filter(|x| self.dag.contains(x)) {
             gone.insert(*x);
             gone.extend(self.dag.descendants(x));
         }
-        let mut candidates: HashSet<EntryId> = self.dag.heads().into_iter().collect();
-        for g in &gone {
-            candidates.extend(self.dag.parents(g).iter().copied());
+        // Step back from the valid heads, past what is excluded and what is
+        // not valid, to the first valid entries behind them.
+        let valid = &self.validity().valid;
+        let mut kept: Vec<EntryId> = Vec::new();
+        let mut seen: HashSet<EntryId> = HashSet::new();
+        let mut todo: Vec<EntryId> = self.heads();
+        while let Some(x) = todo.pop() {
+            if !seen.insert(x) {
+                continue;
+            }
+            if gone.contains(&x) || !valid.contains(&x) {
+                todo.extend_from_slice(self.dag.parents(&x));
+            } else {
+                kept.push(x);
+            }
         }
-        let mut out: Vec<EntryId> = candidates
-            .into_iter()
-            .filter(|c| !gone.contains(c) && self.dag.children(c).iter().all(|k| gone.contains(k)))
+        let mut out: Vec<EntryId> = kept
+            .iter()
+            .filter(|c| !kept.iter().any(|k| self.dag.is_ancestor(c, k)))
+            .copied()
             .collect();
         out.sort();
         out
+    }
+
+    /// Whether a new entry on `parents` may be written: there is something
+    /// valid to build on, and the space has not ended there. Only an entry
+    /// of `keep` ops is written into a space that has ended: it counts by
+    /// its signature alone
+    /// (`spaces.md#a-succession-by-a-device-that-is-later-removed`).
+    fn may_write(&self, parents: &[EntryId], only_keeps: bool) -> Result<(), Error> {
+        if parents.is_empty() {
+            return Err(Error::NotAllowed("nothing valid here to build on"));
+        }
+        if !only_keeps && self.judge.closes(&self.dag, parents) {
+            return Err(Error::NotAllowed("the space has ended"));
+        }
+        Ok(())
     }
 
     fn write_on(
@@ -555,6 +658,8 @@ impl Space {
         ops: Vec<SpaceOp>,
         time: Option<u64>,
     ) -> Result<(EntryId, SealedEntry), Error> {
+        let keeps = |o: &SpaceOp| matches!(o.body(), SpaceOpBody::Keep { .. });
+        self.may_write(parents, !ops.is_empty() && ops.iter().all(keeps))?;
         let epoch = self.current_epoch().ok_or(Error::NoEpochKey)?;
         let key = self.keyring.get(&epoch).cloned().ok_or(Error::NoEpochKey)?;
         let mut b = SpaceEntryBuilder::new(
@@ -563,7 +668,6 @@ impl Space {
             author.id(),
             author_head(author, &device.public_key()),
             epoch,
-            self.owner_membership_for(author.id()),
         )
         .ops(ops);
         if let Some(t) = time {
@@ -575,18 +679,6 @@ impl Space {
         self.sealed.insert(id, sealed.clone());
         self.insert_entry(e);
         Ok((id, sealed))
-    }
-
-    fn owner_membership_for(&self, identity: IdentityId) -> Option<MembershipId> {
-        if identity == self.owner {
-            return self.owner_membership();
-        }
-        self.validity
-            .members
-            .iter()
-            .filter(|m| m.identity == identity)
-            .max_by_key(|m| m.role)
-            .map(|m| m.id)
     }
 
     /// Adds members in one entry, with the current epoch key wrapped for each
@@ -612,17 +704,17 @@ impl Space {
             recipients.extend(added.iter().map(|(_, _, k)| *k));
             return Ok(self.rotate(author, device, &recipients, all, time)?.0);
         }
+        let heads = self.heads();
+        self.may_write(&heads, false)?;
         let epoch = self.current_epoch().ok_or(Error::NoEpochKey)?;
         let key = self.keyring.get(&epoch).cloned().ok_or(Error::NoEpochKey)?;
         let wraps: Vec<_> = added.iter().map(|(_, _, k)| key.wrap(k)).collect();
-        let heads = self.heads();
         let mut b = SpaceEntryBuilder::new(
             self.id,
             &heads,
             author.id(),
             author_head(author, &device.public_key()),
             epoch,
-            self.owner_membership_for(author.id()),
         )
         .ops(all)
         .wraps(&wraps);
@@ -647,15 +739,29 @@ impl Space {
         ops: Vec<SpaceOp>,
         time: Option<u64>,
     ) -> Result<(SealedEntry, EpochKey), Error> {
+        let (_, sealed, key) = self.rotate_entry(author, device, recipients, ops, time)?;
+        Ok((sealed, key))
+    }
+
+    /// [`rotate`](Self::rotate), returning the new entry's id as well.
+    pub fn rotate_entry(
+        &mut self,
+        author: &IdentityLog,
+        device: &SigningKey,
+        recipients: &[&HybridPublicKey],
+        ops: Vec<SpaceOp>,
+        time: Option<u64>,
+    ) -> Result<(EntryId, SealedEntry, EpochKey), Error> {
         let new = EpochKey::generate();
         let heads = self.heads();
+        self.may_write(&heads, false)?;
         // epochs current in the causal past: starters with no starter
         // descendant among the new entry's ancestors
         let past: HashSet<EntryId> = self.dag.ancestors_of(&heads);
         let starters: Vec<EntryId> = past
             .iter()
             .filter(|x| {
-                self.validity.is_valid(x) && self.dag.get(x).is_some_and(|e| e.starts_epoch())
+                self.validity().is_valid(x) && self.dag.get(x).is_some_and(|e| e.starts_epoch())
             })
             .copied()
             .collect();
@@ -679,7 +785,6 @@ impl Space {
             author.id(),
             author_head(author, &device.public_key()),
             new.id(),
-            self.owner_membership_for(author.id()),
         )
         .op(SpaceOp::rotate(&refs))
         .ops(ops)
@@ -688,10 +793,11 @@ impl Space {
             b = b.time(t);
         }
         let e = b.sign(device)?;
+        let id = e.id();
         let sealed = SealedEntry::seal(&e, &new, Some(wraps), self.policy.public)?;
         self.keyring.add(new.clone());
-        self.sealed.insert(e.id(), sealed.clone());
+        self.sealed.insert(id, sealed.clone());
         self.insert_entry(e);
-        Ok((sealed, new))
+        Ok((id, sealed, new))
     }
 }

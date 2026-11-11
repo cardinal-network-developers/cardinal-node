@@ -1,6 +1,7 @@
-//! The group profile (`profiles.md#group`): any number of members, the
-//! relationship kinds, and a member node for each with the name the others
-//! see. The offer of a group goes in a relationship space.
+//! The group profile (`profiles.md#group`): one owner, whoever made it, and
+//! any number of members with the other roles; the relationship kinds, and
+//! a member node for each with the name the others see. The offer of a group
+//! goes in a relationship space.
 
 use cardinal_encoding::{Record, Value};
 
@@ -15,24 +16,21 @@ pub const GROUP: Profile = Profile::Core(4);
 pub const OFFER: u64 = 10;
 /// Member kind.
 pub const MEMBER: u64 = 11;
-/// The reader role.
-pub const READER: u64 = 0;
-/// The writer role: what someone added is, unless made more.
-pub const WRITER: u64 = 1;
-/// The admin role.
-pub const ADMIN: u64 = 2;
-/// The owner role.
-pub const OWNER: u64 = 3;
+pub use crate::entry::{ADMIN, OWNER, READER, WRITER};
 
-/// What a group's genesis holds besides its members: the conversation,
-/// named for the group.
-pub fn genesis_ops(name: &str) -> Vec<SpaceOp> {
-    vec![SpaceOp::create(
-        NodeKind::Uint(CONVERSATION),
-        ROOT,
-        "conversation",
-        Record::new().with(1, name),
-    )]
+/// What a group's genesis holds besides `start`: whoever makes it as its
+/// owner, the conversation, named for the group, and then the members it
+/// starts with.
+pub fn genesis_ops(owner: IdentityId, name: &str) -> Vec<SpaceOp> {
+    vec![
+        SpaceOp::add_member(owner, OWNER),
+        SpaceOp::create(
+            NodeKind::Uint(CONVERSATION),
+            ROOT,
+            "conversation",
+            Record::new().with(1, name),
+        ),
+    ]
 }
 
 /// `create` of a member node: the name the others see, and whether they are
@@ -113,19 +111,18 @@ fn last(n: &Node, key: u64) -> Option<&Value> {
     n.values(key).iter().rev().find_map(|v| v.value.as_ref())
 }
 
-/// The role of `who` in a space now: the highest of their memberships.
+/// The role of `who` in a space: the highest a valid entry gave them.
 pub fn role_of(space: &Space, who: &IdentityId) -> Option<u64> {
-    let members = space.validity().members.iter();
-    members.filter(|m| m.identity == *who).map(|m| m.role).max()
+    space.role_of(who)
 }
 
-/// A field's current value among those an admin or owner set: nobody else's
-/// say counts on a member node or the group's settings.
+/// A field's current value among those an admin or the owner set: nobody
+/// else's say counts on a member node or the group's settings.
 fn admins_value<'a>(space: &'a Space, n: &'a Node, key: u64) -> Option<&'a Value> {
     let dag = space.dag();
     n.values(key).iter().rev().find_map(|v| {
         let author = dag.get(&v.entry)?.author();
-        let counts = role_of(space, &author).is_some_and(|r| r >= ADMIN) || author == space.owner();
+        let counts = role_of(space, &author).is_some_and(|r| r >= ADMIN);
         counts.then_some(v.value.as_ref()).flatten()
     })
 }
@@ -135,8 +132,10 @@ fn admins_value<'a>(space: &'a Space, n: &'a Node, key: u64) -> Option<&'a Value
 pub struct Member {
     /// Their identity.
     pub identity: IdentityId,
-    /// Their role.
+    /// Their role: the highest they were given.
     pub role: u64,
+    /// They said they have left, and nobody has added them since.
+    pub left: bool,
     /// The name an admin gave them, if one did.
     pub name: Option<String>,
     /// Whether they are introduced through the group.
@@ -175,6 +174,7 @@ pub fn members(space: &Space) -> Vec<Member> {
         out.push(Member {
             identity: m.identity,
             role: m.role,
+            left: space.has_left(&m.identity),
             name,
             introduce,
             node: node.map(|n| n.id),
@@ -213,7 +213,7 @@ pub fn introductions(space: &Space) -> bool {
 /// Whether `who` has written anything in a space: that is joining it
 /// (`spaces.md#holding-a-space`).
 pub fn joined(space: &Space, who: &IdentityId) -> bool {
-    space.owner() == *who
+    space.creator() == *who
         || space
             .dag()
             .iter()

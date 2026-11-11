@@ -390,7 +390,8 @@ enum GroupCmd {
         #[arg(long = "as")]
         shown: Option<String>,
     },
-    /// Take someone out of a group you are an admin of.
+    /// Take someone out of a group you own. Not done yet: it means
+    /// replacing the group with one that leaves them out.
     Remove {
         /// The group, by name or id.
         group: String,

@@ -237,12 +237,13 @@ impl Holder {
         paths.spaces().join(hex::encode(id))
     }
 
-    /// Opens (or creates) the holder's storage and evaluates what it holds.
+    /// Opens (or creates) the holder's storage and judges what it holds,
+    /// with the identity logs this device has.
     fn open(
         paths: &Paths,
         id: SpaceId,
         keys: &[&HybridKeyPair],
-        author: Option<Arc<IdentityState>>,
+        logs: &[Arc<IdentityState>],
     ) -> anyhow::Result<Holder> {
         let (file, records) = AppendLog::open(&Self::dir(paths, &id).join("entries.log"))?;
         let mut h = Holder {
@@ -265,17 +266,18 @@ impl Holder {
                 Err(e) => tracing::warn!("space {}: bad stored entry: {e}", short(&id)),
             }
         }
-        h.rebuild(sealed, keys, author);
+        h.rebuild(sealed, keys, logs);
         Ok(h)
     }
 
-    /// Re-evaluates from scratch with `extra` added: opens the genesis,
-    /// adds everything without an author (cheap), then evaluates once.
+    /// Starts again from nothing with `extra` added: opens the genesis, adds
+    /// everything with no identity log at hand, so that nothing counts yet
+    /// and no state is built, then judges it all once with the logs.
     fn rebuild(
         &mut self,
         extra: Vec<SealedEntry>,
         keys: &[&HybridKeyPair],
-        author: Option<Arc<IdentityState>>,
+        logs: &[Arc<IdentityState>],
     ) {
         let mut all: Vec<SealedEntry> = std::mem::take(&mut self.pending);
         if let Some(sp) = self.space.take() {
@@ -315,9 +317,7 @@ impl Holder {
             }
         }
         self.pending = rest;
-        if let Some(a) = author {
-            space.set_author(a);
-        }
+        space.set_identities(logs.iter().cloned());
         self.space = Some(space);
         self.version += 1;
     }
@@ -354,12 +354,14 @@ impl Holder {
         self.locs.get(sid).and_then(|l| self.file.read(*l).ok())
     }
 
-    /// Sealed ids of the current heads.
+    /// Sealed ids of the heads of everything held, valid here or not: what
+    /// a `heads` notice names, for a peer to fetch what it lacks.
     pub fn head_ids(&self) -> Vec<[u8; 32]> {
         let Some(sp) = &self.space else {
             return Vec::new();
         };
-        sp.heads()
+        sp.dag()
+            .heads()
             .iter()
             .filter_map(|h| sp.sealed(h).map(|s| s.sealed_id()))
             .collect()
@@ -375,12 +377,12 @@ impl Holder {
         Ok(())
     }
 
-    /// Adds sealed entries received from one of this person's devices.
+    /// Adds sealed entries received from another device.
     fn ingest(
         &mut self,
         objects: &[Vec<u8>],
         keys: &[&HybridKeyPair],
-        author: Option<Arc<IdentityState>>,
+        logs: &[Arc<IdentityState>],
     ) -> anyhow::Result<Ingested> {
         let mut fresh = Vec::new();
         let mut items = Vec::new();
@@ -408,7 +410,7 @@ impl Holder {
         self.persist(&items)?;
         if self.space.is_none() || fresh.len() > 16 {
             out.complete = fresh.len();
-            self.rebuild(fresh, keys, author);
+            self.rebuild(fresh, keys, logs);
         } else if let Some(space) = self.space.as_mut() {
             for (s, (_, bytes)) in fresh.into_iter().zip(items) {
                 match space.receive(s.clone(), keys) {
@@ -526,25 +528,19 @@ impl Holder {
                 .clone();
             let mut recipients = vec![&pk];
             recipients.extend(self.member_keys.iter());
-            let (s, _) = space.rotate(
+            let (id, s, _) = space.rotate_entry(
                 &identity.log,
                 &keys.device.signing,
                 &recipients,
                 ops,
                 Some(now_ms()),
             )?;
-            s
+            (id, s)
         } else {
-            space.write(&identity.log, &keys.device.signing, ops, Some(now_ms()))?
+            space.write_entry(&identity.log, &keys.device.signing, ops, Some(now_ms()))?
         };
-        let heads = space.heads();
-        let id = if heads.len() == 1 {
-            heads[0]
-        } else {
-            // the new entry descends from every head, so it is the only one
-            anyhow::bail!("unexpected heads after a write")
-        };
-        if !space.validity().is_valid(&id) && !space.needs_full_evaluation() {
+        let (id, sealed) = sealed;
+        if !space.validity().is_valid(&id) {
             tracing::warn!(
                 "space {}: own entry {} is not valid",
                 short(&self.id),
@@ -586,48 +582,6 @@ impl Holder {
             &keys.device.signing,
             &adding,
             &everyone,
-            ops,
-            Some(now_ms()),
-        )?;
-        let bytes = sealed.encode();
-        self.persist(&[(sealed.sealed_id(), bytes.clone())])?;
-        self.version += 1;
-        Ok(bytes)
-    }
-
-    /// Ends memberships in an entry that starts a new epoch, wrapped for
-    /// `staying` and this identity (`spaces.md#when-to-rotate`).
-    pub fn remove_members(
-        &mut self,
-        identity: &Identity,
-        keys: &Keys,
-        gone: &[[u8; 32]],
-        staying: &[HybridPublicKey],
-    ) -> anyhow::Result<Vec<u8>> {
-        let mine = identity
-            .enc
-            .first()
-            .ok_or_else(|| anyhow::anyhow!("no encryption key"))?
-            .public_key()
-            .clone();
-        let space = self
-            .space
-            .as_mut()
-            .ok_or_else(|| anyhow::anyhow!("space not open yet"))?;
-        let ops: Vec<SpaceOp> = space
-            .validity()
-            .members
-            .iter()
-            .filter(|m| gone.contains(&m.identity))
-            .map(|m| SpaceOp::remove_member(m.id))
-            .collect();
-        anyhow::ensure!(!ops.is_empty(), "they are not in it");
-        let mut recipients = vec![&mine];
-        recipients.extend(staying.iter());
-        let (sealed, _) = space.rotate(
-            &identity.log,
-            &keys.device.signing,
-            &recipients,
             ops,
             Some(now_ms()),
         )?;
@@ -722,6 +676,10 @@ pub struct Core {
     pub others: BTreeMap<[u8; 32], OtherLog>,
     /// Entries of a log whose genesis has not arrived yet.
     arriving: HashMap<[u8; 32], Vec<Vec<u8>>>,
+    /// What every identity log held means, each evaluated with the others
+    /// at hand: what the spaces judge their authors by. Worked out again
+    /// when a log changes, and not otherwise.
+    logs: Vec<Arc<IdentityState>>,
 }
 
 /// What a change to the identity log means for the rest of the daemon.
@@ -744,6 +702,7 @@ impl Core {
             joining: Vec::new(),
             others: BTreeMap::new(),
             arriving: HashMap::new(),
+            logs: Vec::new(),
         };
         if paths.identity_log().exists() {
             let (file, records) = AppendLog::open(&paths.identity_log())?;
@@ -751,6 +710,7 @@ impl Core {
         }
         if core.identity.is_some() {
             core.load_others()?;
+            core.read_logs();
             if let Ok(rd) = std::fs::read_dir(paths.spaces()) {
                 for d in rd.flatten() {
                     let name = d.file_name().to_string_lossy().into_owned();
@@ -1086,8 +1046,27 @@ impl Core {
             .collect()
     }
 
-    /// Re-evaluates a space with members other than this identity, whose
-    /// entries only the logs of all its members can judge.
+    /// Evaluates every identity log held, each with the others at hand.
+    fn read_logs(&mut self) {
+        let Some(ident) = self.identity.as_ref() else {
+            self.logs.clear();
+            return;
+        };
+        let mut logs = vec![&ident.log];
+        logs.extend(self.others.values().map(|o| &o.log));
+        let states = cardinal_identity::log::evaluate_together(&logs);
+        self.logs = states.into_iter().map(Arc::new).collect();
+    }
+
+    /// The identity log of `who` as the spaces read it, if it is held.
+    pub fn log_of(&self, who: &[u8; 32]) -> Option<&Arc<IdentityState>> {
+        self.logs.iter().find(|st| st.identity == *who)
+    }
+
+    /// After something was written or arrived in a space: the keys of the
+    /// members a new epoch would be wrapped for. Every member but this one
+    /// who has not left, and whom this device does not know to be frozen
+    /// (`spaces.md#distribution`).
     fn settle(&mut self, space: &SpaceId) {
         let Some(ident) = self.identity.as_ref() else {
             return;
@@ -1095,31 +1074,39 @@ impl Core {
         let Some(h) = self.spaces.get_mut(space) else {
             return;
         };
-        let Some(sp) = h.space.as_mut() else {
+        let Some(sp) = h.space.as_ref() else {
             return;
         };
-        if !sp.needs_full_evaluation() {
-            return;
-        }
-        let mut logs = vec![&ident.log];
-        logs.extend(self.others.values().map(|o| &o.log));
-        if let Err(e) = sp.evaluate_full(&logs) {
-            tracing::warn!("space {}: {e}", short(space));
-        }
+        let state = |who: &[u8; 32]| self.logs.iter().find(|st| st.identity == *who);
         h.member_keys = sp
             .validity()
-            .members
+            .identities()
             .iter()
-            .filter(|m| m.identity != ident.id())
-            .filter_map(|m| self.others.get(&m.identity))
-            .filter_map(|o| Some(o.log.state().encryption_key.as_ref()?.public.clone()))
+            .filter(|who| **who != ident.id() && !sp.has_left(who))
+            .filter_map(state)
+            .filter(|st| !st.frozen)
+            .filter_map(|st| Some(st.encryption_key.as_ref()?.public.clone()))
             .collect();
-        h.version += 1;
     }
 
+    /// After an identity log changed: every space judges again the entries
+    /// of the authors whose keys count differently now, and what rests on
+    /// them. Nothing else in a space is looked at.
     fn settle_all(&mut self) {
+        self.read_logs();
+        self.judge_all();
+    }
+
+    /// Gives every space the identity logs as they are read now.
+    fn judge_all(&mut self) {
         let spaces: Vec<SpaceId> = self.spaces.keys().copied().collect();
         for space in &spaces {
+            if let Some(h) = self.spaces.get_mut(space) {
+                if let Some(sp) = h.space.as_mut() {
+                    sp.set_identities(self.logs.iter().cloned());
+                    h.version += 1;
+                }
+            }
             self.settle(space);
         }
     }
@@ -1149,7 +1136,7 @@ impl Core {
             &ident.log,
             &self.keys.device.signing,
             &[&mine, &theirs.public],
-            cardinal_space::relationship::genesis_ops(*other),
+            cardinal_space::relationship::genesis_ops(ident.id(), *other),
             Some(now_ms()),
         )?;
         let id = space.id();
@@ -1187,12 +1174,11 @@ impl Core {
             .public_key()
             .clone();
         let mut keys = vec![mine];
-        let mut ops = Vec::new();
+        let mut ops = group::genesis_ops(ident.id(), name);
         for (who, _) in members {
             keys.push(self.encryption_key_of(who)?);
             ops.push(SpaceOp::add_member(*who, group::WRITER));
         }
-        ops.extend(group::genesis_ops(name));
         ops.push(group::create_member(&ident.id(), me_as, true));
         for (who, shown) in members {
             ops.push(group::create_member(who, shown, true));
@@ -1236,40 +1222,6 @@ impl Core {
             .get_mut(space)
             .ok_or_else(|| anyhow::anyhow!("space not held"))?;
         let bytes = h.add_members(ident, &self.keys, &added, ops)?;
-        self.settle(space);
-        Ok(bytes)
-    }
-
-    /// Ends the memberships of `gone` in a group, with a new key for the
-    /// rest. Returns the sealed bytes.
-    pub fn remove_from_group(
-        &mut self,
-        space: &SpaceId,
-        gone: &[[u8; 32]],
-    ) -> anyhow::Result<Vec<u8>> {
-        let me = self.identity.as_ref().map(|i| i.id());
-        let staying: Vec<[u8; 32]> = {
-            let h = self.spaces.get(space).and_then(|h| h.space.as_ref());
-            let h = h.ok_or_else(|| anyhow::anyhow!("space not open yet"))?;
-            let mut v: Vec<[u8; 32]> = h.validity().members.iter().map(|m| m.identity).collect();
-            v.sort_unstable();
-            v.dedup();
-            v.retain(|m| !gone.contains(m) && Some(*m) != me);
-            v
-        };
-        let keys: Vec<HybridPublicKey> = staying
-            .iter()
-            .filter_map(|m| self.encryption_key_of(m).ok())
-            .collect();
-        let ident = self
-            .identity
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("this device has no identity yet"))?;
-        let h = self
-            .spaces
-            .get_mut(space)
-            .ok_or_else(|| anyhow::anyhow!("space not held"))?;
-        let bytes = h.remove_members(ident, &self.keys, gone, &keys)?;
         self.settle(space);
         Ok(bytes)
     }
@@ -1347,21 +1299,24 @@ impl Core {
         let sealed = SealedEntry::decode(genesis)?;
         let mut space = Space::open_genesis(&sealed, &ident.key_refs(), None)?;
         let id = space.id();
-        space.evaluate_full(&[&ident.log, their_log])?;
-        let mut members: Vec<[u8; 32]> = space
-            .validity()
-            .members
-            .iter()
-            .map(|m| m.identity)
-            .collect();
-        members.sort_unstable();
-        members.dedup();
-        let mut the_two = vec![ident.id(), *inviter];
-        the_two.sort_unstable();
+        space.set_identities([ident.log.state(), their_log.state()]);
+        // What the invitee must check before keeping it
+        // (`contact.md#accepting`): the relationship profile, no owner,
+        // exactly these two identities as writers, and a space it does not
+        // already hold. The members are read off a genesis that is valid,
+        // so it is the inviter's and well formed; one that is not names
+        // nobody.
+        use cardinal_space::entry::WRITER;
+        let mut the_two = [ident.id(), *inviter].map(|identity| cardinal_space::Member {
+            identity,
+            role: WRITER,
+        });
+        the_two.sort();
         anyhow::ensure!(
             space.profile() == cardinal_space::Profile::RELATIONSHIP
-                && space.owner() == *inviter
-                && members == the_two
+                && space.owner().is_none()
+                && space.creator() == *inviter
+                && space.members() == the_two
                 && !self.spaces.contains_key(&id),
             "that is not a space between the two of you"
         );
@@ -1417,37 +1372,37 @@ impl Core {
                 .identity
                 .as_ref()
                 .ok_or_else(|| anyhow::anyhow!("no identity"))?;
-            let h = Holder::open(&self.paths, id, &ident.key_refs(), Some(ident.state()))?;
+            let h = Holder::open(&self.paths, id, &ident.key_refs(), &self.logs)?;
             self.spaces.insert(id, h);
         }
         Ok(self.spaces.get_mut(&id).expect("inserted"))
     }
 
     /// After the identity log changed (received or written here): reopen
-    /// the encryption keys and re-evaluate every space with the new log.
+    /// the encryption keys, and have every space judge again what this
+    /// identity signed.
     pub fn identity_updated(&mut self) {
         let Some(ident) = self.identity.as_mut() else {
             return;
         };
         ident.refresh_keys(&self.keys);
-        let st = ident.state();
         let keys: Vec<HybridKeyPair> = ident
             .enc
             .iter()
             .map(|k| HybridKeyPair::from_secret_bytes(&k.secret_bytes()))
             .collect();
         let refs: Vec<&HybridKeyPair> = keys.iter().collect();
+        self.read_logs();
         for h in self.spaces.values_mut() {
-            if let Some(sp) = h.space.as_mut() {
-                sp.set_author(st.clone());
+            if h.space.is_some() {
                 // A rotation can arrive before the key it is wrapped for.
                 h.open_pending(&refs);
                 h.version += 1;
             } else {
-                h.rebuild(Vec::new(), &refs, Some(st.clone()));
+                h.rebuild(Vec::new(), &refs, &self.logs);
             }
         }
-        self.settle_all();
+        self.judge_all();
     }
 
     /// Installs a freshly created identity (`cardinal init`).
@@ -1462,6 +1417,7 @@ impl Core {
         }
         let (file, records) = AppendLog::open(&self.paths.identity_log())?;
         self.identity = Some(Self::build_identity(file, records, &self.keys)?);
+        self.read_logs();
         Ok(())
     }
 
@@ -1689,10 +1645,9 @@ impl Core {
             .map(|k| HybridKeyPair::from_secret_bytes(&k.secret_bytes()))
             .collect();
         let refs: Vec<&HybridKeyPair> = keys.iter().collect();
-        let st = ident.state();
         self.open_space(space)?;
         let h = self.spaces.get_mut(&space).expect("open");
-        let out = h.ingest(objects, &refs, Some(st));
+        let out = h.ingest(objects, &refs, &self.logs);
         self.settle(&space);
         out
     }

@@ -530,7 +530,7 @@ impl<'a> Files<'a> {
                     SpaceOpBody::Create { .. } => derived_id(id, i) == *node,
                     SpaceOpBody::Set { node: n, .. }
                     | SpaceOpBody::Move { node: n, .. }
-                    | SpaceOpBody::Delete { node: n }
+                    | SpaceOpBody::Delete { node: n, .. }
                     | SpaceOpBody::Restore { node: n } => n == node,
                     _ => false,
                 };

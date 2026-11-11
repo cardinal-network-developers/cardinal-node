@@ -1,5 +1,5 @@
 //! The relationship profile (`profiles.md#relationship`): two identities,
-//! both owners, and a conversation between them.
+//! both writers and neither an owner, and a conversation between them.
 
 use std::collections::HashSet;
 
@@ -7,7 +7,7 @@ use cardinal_encoding::{Record, Value};
 use cardinal_identity::EntryId;
 
 use crate::account::short_key;
-use crate::entry::{IdentityId, NodeId, NodeKind, SpaceOp};
+use crate::entry::{IdentityId, NodeId, NodeKind, SpaceOp, WRITER};
 use crate::grant::Endpoint;
 use crate::space::Space;
 use crate::state::{Node, State, AUTHOR_OWNED_FIELD, ROOT};
@@ -16,8 +16,6 @@ use crate::state::{Node, State, AUTHOR_OWNED_FIELD, ROOT};
 pub const CONVERSATION: u64 = 1;
 /// Message kind.
 pub const MESSAGE: u64 = 2;
-/// The owner role (`spaces.md#memberships`).
-pub const OWNER: u64 = 3;
 /// Read marker kind.
 pub const READ_MARKER: u64 = 4;
 /// Reaction kind, under a message.
@@ -213,11 +211,14 @@ pub fn reach_of(state: &State, who: &IdentityId) -> Option<(NodeId, Vec<Reach>)>
     Some((node.id, reach.collect()))
 }
 
-/// What a relationship's genesis entry holds besides `start`: the other
-/// identity, as an owner, and the one conversation.
-pub fn genesis_ops(other: IdentityId) -> Vec<SpaceOp> {
+/// What a relationship's genesis entry holds besides `start`: both
+/// identities as writers, and the one conversation. It names no owner, so
+/// neither can add anyone and neither can end it alone
+/// (`spaces.md#members-and-roles`).
+pub fn genesis_ops(author: IdentityId, other: IdentityId) -> Vec<SpaceOp> {
     vec![
-        SpaceOp::add_member(other, OWNER),
+        SpaceOp::add_member(author, WRITER),
+        SpaceOp::add_member(other, WRITER),
         SpaceOp::create(
             NodeKind::Uint(CONVERSATION),
             ROOT,

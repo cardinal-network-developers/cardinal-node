@@ -1,6 +1,11 @@
-//! Groups (`profiles.md#group`): a space with any number of members, each
-//! offered it through a relationship they already have, and a conversation
-//! everyone in it reads.
+//! Groups (`profiles.md#group`): a space with one owner, whoever made it,
+//! and any number of members, each offered it through a relationship they
+//! already have, and a conversation everyone in it reads.
+//!
+//! A group only grows. Its owner and its admins add people; nobody is taken
+//! out of it, and no role is lowered. Taking someone out is the owner
+//! succeeding the group with one that leaves them out, which this software
+//! cannot write or follow yet, so `group-remove` says so and does nothing.
 //!
 //! A member who is not a trusted contact of another reaches them through a
 //! member connected to both, who passes on what they write, or through their
@@ -70,9 +75,10 @@ fn joined(d: &Daemon, group: &str) -> anyhow::Result<Found> {
     Ok(g)
 }
 
-/// Whether this person may change who is in a group and what it is called.
+/// Whether this person may add to a group and change what it is called: its
+/// owner, and its admins.
 fn may_manage(sp: &Space, me: &[u8; 32]) -> bool {
-    sp.owner() == *me || group::role_of(sp, me).is_some_and(|r| r >= group::ADMIN)
+    group::role_of(sp, me).is_some_and(|r| r >= group::ADMIN)
 }
 
 /// Contacts by what this person calls them; refused ones are not offered
@@ -170,47 +176,44 @@ fn member_named(contacts: &[ContactRecord], sp: &Space, who: &str) -> anyhow::Re
     }
 }
 
-/// Takes someone out of a group. Everyone who stays gets a new key, so they
-/// read nothing written after.
+/// Taking someone out of a group. Nothing in a space removes a member: the
+/// owner succeeds the group with one that leaves them out, and the others'
+/// devices follow (`profiles.md#group`). This software cannot write or
+/// follow a succession yet, so it says so, and changes nothing.
 pub fn remove(d: &Arc<Daemon>, group: &str, who: &str) -> anyhow::Result<Json> {
     let g = joined(d, group)?;
     let me = identity(d)?;
-    let them = {
+    let (them, owner) = {
         let core = d.core();
         let contacts = core.contacts();
         let sp = core.spaces.get(&g.id).and_then(|h| h.space.as_ref());
         let sp = sp.ok_or_else(|| anyhow::anyhow!("that group is not open yet"))?;
-        anyhow::ensure!(
-            may_manage(sp, &me),
-            "only an admin of {} can take people out",
-            g.name
-        );
-        member_named(&contacts, sp, who)?
+        (member_named(&contacts, sp, who)?, sp.owner())
     };
     anyhow::ensure!(them != me, "to leave {}, leave it", g.name);
-    let bytes = d.core().remove_from_group(&g.id, &[them])?;
-    d.push(&g.id, vec![bytes]);
-    d.bump();
-    Ok(json!({}))
+    anyhow::ensure!(
+        owner == Some(me),
+        "only the owner of {} can take someone out of it",
+        g.name
+    );
+    anyhow::bail!(
+        "{who} cannot be taken out of {} yet: that is done by replacing the group with one \
+         that leaves them out, which this version cannot do",
+        g.name
+    )
 }
 
 /// Leaves a group.
 pub fn leave(d: &Arc<Daemon>, group: &str) -> anyhow::Result<Json> {
     let g = joined(d, group)?;
     let me = identity(d)?;
-    let mine: Vec<SpaceOp> = {
+    {
         let core = d.core();
         let sp = core.spaces.get(&g.id).and_then(|h| h.space.as_ref());
         let sp = sp.ok_or_else(|| anyhow::anyhow!("that group is not open yet"))?;
-        sp.validity()
-            .members
-            .iter()
-            .filter(|m| m.identity == me)
-            .map(|m| SpaceOp::remove_member(m.id))
-            .collect()
-    };
-    anyhow::ensure!(!mine.is_empty(), "you are not in {}", g.name);
-    d.write_and_push(&g.id, mine)?;
+        anyhow::ensure!(sp.role_of(&me).is_some(), "you are not in {}", g.name);
+    }
+    d.write_and_push(&g.id, vec![SpaceOp::leave()])?;
     d.bump();
     Ok(json!({}))
 }
@@ -312,7 +315,7 @@ pub fn list(d: &Daemon) -> Json {
         let name = group::name(sp);
         if !group::joined(sp, &me) {
             if in_it && !declined.contains(&id) {
-                let from = sp.owner();
+                let from = sp.creator();
                 offered.push(json!({
                     "group": hex::encode(id),
                     "name": name,

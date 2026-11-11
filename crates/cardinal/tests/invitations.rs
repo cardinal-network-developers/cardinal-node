@@ -19,7 +19,7 @@ use cardinal_link::{
     Bind, CarrierKind, Endpoint, EndpointConfig, LocalIdentity, MemoryDirectory, Priority,
     SecretEntry, Service, Session, Stream, Target,
 };
-use cardinal_space::{relationship, Profile, SealedEntry, Space, SpaceOp};
+use cardinal_space::{Profile, SealedEntry, Space, SpaceOp};
 use cardinal_sync::{answer_want, identity_log_label, want_messages, MemSet, Message, Reconciler};
 use cardinald::keys::Keys;
 use common::*;
@@ -373,7 +373,12 @@ fn a_false_genesis_is_taken_for_the_account_space() {
             let mine = mal.enc.public_key().clone();
             let (space, sealed) = (0u64..)
                 .map(|t| {
-                    let ops = vec![SpaceOp::add_member(ana_id, relationship::OWNER)];
+                    // well formed, as a relationship's is: both as writers
+                    let writer = cardinal_space::entry::WRITER;
+                    let ops = vec![
+                        SpaceOp::add_member(mal.id(), writer),
+                        SpaceOp::add_member(ana_id, writer),
+                    ];
                     Space::create_with(
                         Profile::ACCOUNT,
                         cardinal_space::Policy::default(),

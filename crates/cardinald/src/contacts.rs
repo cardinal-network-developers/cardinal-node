@@ -3,10 +3,10 @@
 //!
 //! An invitation is a secret that lets one session through. The two devices
 //! say who they are, take each other's identity logs, and the inviter creates
-//! a space with both as owners. After that they are contacts. If each trusts
-//! the other, their devices may open sessions with each other, for what they
-//! share and nothing else. If not, the session ends there, and a device
-//! answers the other's as it answers a stranger's.
+//! a space with both as writers and no owner. After that they are contacts.
+//! If each trusts the other, their devices may open sessions with each
+//! other, for what they share and nothing else. If not, the session ends
+//! there, and a device answers the other's as it answers a stranger's.
 
 use std::net::SocketAddr;
 use std::sync::Arc;

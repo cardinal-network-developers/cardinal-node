@@ -346,8 +346,7 @@ async fn tend(d: &Arc<Daemon>) {
                             let ok = |who: &[u8; 32]| {
                                 members.iter().any(|m| m.identity == *who && m.introduce)
                             };
-                            let admin = sp.owner() == me
-                                || group::role_of(sp, &me).is_some_and(|r| r >= group::ADMIN);
+                            let admin = group::role_of(sp, &me).is_some_and(|r| r >= group::ADMIN);
                             admin
                                 && group::introductions(sp)
                                 && ok(&b.identity)

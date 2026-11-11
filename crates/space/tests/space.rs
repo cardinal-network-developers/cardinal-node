@@ -124,7 +124,8 @@ fn files_space_across_two_devices() {
     )
     .unwrap();
     let notes = files::created_node(a.dag().log_order().last().unwrap(), 0);
-    assert_eq!(a.stats().recomputed, 1, "{:?}", a.stats());
+    // every entry so far was applied as it came, the genesis too
+    assert_eq!(a.stats().recomputed, 0, "{:?}", a.stats());
 
     sync(&a, &mut b, &enc1);
     assert_eq!(b.state().canonical(), a.state().canonical());
@@ -295,7 +296,7 @@ fn removed_device_and_rotation() {
         .set_encryption_key(&d0.signing, &new_enc, Some(&p.enc))
         .unwrap();
     p.enc = new_enc;
-    a.set_author(p.log.state());
+    a.set_identity(p.log.state());
     // d1's entry was not witnessed by another device before the removal
     assert!(!a.validity().is_valid(&by_d1));
     assert!(a.validity().unwitnessed.contains(&by_d1));
@@ -453,46 +454,55 @@ fn display_names_are_unique() {
 }
 
 #[test]
-fn a_relationship_has_two_owners_and_a_conversation() {
+fn a_relationship_has_two_writers_no_owner_and_a_conversation() {
     let ana = person(11, 0);
     let bo = person(12, 0);
     let stranger = person(13, 0);
-    let logs = [&ana.log, &bo.log];
     let (mut a, genesis) = Space::create_with(
         Profile::RELATIONSHIP,
         Policy::default(),
         &ana.log,
         &ana.devices[0].signing,
         &[ana.enc.public_key(), bo.enc.public_key()],
-        relationship::genesis_ops(bo.log.id()),
+        relationship::genesis_ops(ana.log.id(), bo.log.id()),
         None,
     )
     .unwrap();
-    assert!(a.needs_full_evaluation());
-    a.evaluate_full(&logs).unwrap();
     let c = relationship::conversation(&a).unwrap();
+    // Both are writers, and nobody owns it: neither can add anyone, and
+    // neither can end it alone.
+    assert_eq!(a.owner(), None);
+    assert_eq!(a.creator(), ana.log.id());
+    for who in [&ana, &bo] {
+        assert_eq!(
+            a.role_of(&who.log.id()),
+            Some(cardinal_space::entry::WRITER)
+        );
+    }
+    assert_eq!(a.members().len(), 2);
 
     // Bo opens it with Bo's own key. A stranger's cannot.
     assert!(Space::open_genesis(&genesis, &[&stranger.enc], Some(ana.log.state())).is_err());
     let mut b = Space::open_genesis(&genesis, &[&bo.enc], Some(ana.log.state())).unwrap();
-    b.evaluate_full(&logs).unwrap();
     assert_eq!(relationship::conversation(&b), Some(c));
 
     // Each writes, and each reads what the other wrote, in the same order.
+    // What Bo writes counts once his identity log is held, and not before.
     let hi = relationship::create_message(c, "hello");
     let sealed = a
         .write(&ana.log, &ana.devices[0].signing, vec![hi], Some(1))
         .unwrap();
-    a.evaluate_full(&logs).unwrap();
     b.receive(sealed, &[&bo.enc]).unwrap();
-    b.evaluate_full(&logs).unwrap();
     let back = relationship::create_message(c, "hello yourself");
     let sealed = b
         .write(&bo.log, &bo.devices[0].signing, vec![back], Some(2))
         .unwrap();
-    b.evaluate_full(&logs).unwrap();
+    assert_eq!(relationship::messages(&b).len(), 1);
+    b.set_identity(bo.log.state());
+    assert_eq!(relationship::messages(&b).len(), 2);
     a.receive(sealed, &[&ana.enc]).unwrap();
-    a.evaluate_full(&logs).unwrap();
+    assert_eq!(relationship::messages(&a).len(), 1);
+    a.set_identity(bo.log.state());
     let said: Vec<(_, String)> = relationship::messages(&a)
         .into_iter()
         .map(|m| (m.author, m.text))
@@ -512,16 +522,137 @@ fn a_relationship_has_two_owners_and_a_conversation() {
     for (_, s) in a.sealed_entries() {
         let _ = c2.receive(s.clone(), &[&bo.enc]);
     }
+    c2.set_identity(bo.log.state());
     let all = [&ana.log, &bo.log, &stranger.log];
     let forged = relationship::create_message(c, "from a stranger");
-    if let Ok(s) = c2.write(
-        &stranger.log,
-        &stranger.devices[0].signing,
-        vec![forged],
-        None,
-    ) {
-        a.receive(s, &[&ana.enc]).unwrap();
-    }
-    a.evaluate_full(&all).unwrap();
+    let (id, s) = c2
+        .write_entry(
+            &stranger.log,
+            &stranger.devices[0].signing,
+            vec![forged],
+            None,
+        )
+        .unwrap();
+    a.receive(s, &[&ana.enc]).unwrap();
+    a.set_identity(stranger.log.state());
+    // the stranger's signature is the stranger's, and nobody added them
+    assert!(a.validity().author_ok.contains(&id) && !a.validity().is_valid(&id));
     assert_eq!(relationship::messages(&a).len(), 2);
+    // nobody builds on what they hold to be invalid
+    assert!(!a.heads().contains(&id) && a.dag().heads().contains(&id));
+    let rules = cardinal_space::validity::by_rules(a.dag(), &all).unwrap();
+    assert!(a.validity().valid == rules.valid && a.validity().members == rules.members);
+
+    // Neither can add anyone, and one alone ends nothing.
+    let add = SpaceOp::add_member(stranger.log.id(), cardinal_space::entry::READER);
+    let (added, _) = a
+        .write_entry(&ana.log, &ana.devices[0].signing, vec![add], None)
+        .unwrap();
+    assert!(!a.validity().is_valid(&added));
+    let (named, sealed) = a
+        .write_entry(
+            &ana.log,
+            &ana.devices[0].signing,
+            vec![SpaceOp::succeed([5; 32])],
+            None,
+        )
+        .unwrap();
+    assert!(a.validity().is_valid(&named) && a.successor().is_none() && !a.ended());
+    // When the other names the same successor, it ends, and nothing more
+    // is written in it.
+    b.set_identity(bo.log.state());
+    for (_, s) in a.sealed_entries() {
+        let _ = b.receive(s.clone(), &[&bo.enc]);
+    }
+    let _ = sealed;
+    let agreed = b
+        .write(
+            &bo.log,
+            &bo.devices[0].signing,
+            vec![SpaceOp::succeed([5; 32])],
+            None,
+        )
+        .unwrap();
+    a.receive(agreed, &[&ana.enc]).unwrap();
+    assert_eq!(a.successor(), Some([5; 32]));
+    assert!(a.ended() && b.ended());
+    let more = relationship::create_message(c, "anyone there?");
+    assert!(a
+        .write(&ana.log, &ana.devices[0].signing, vec![more], None)
+        .is_err());
+}
+
+#[test]
+fn written_beside_supersedes_and_deletes_nothing() {
+    // `state.md`: a `set` written beside adds its value and supersedes none;
+    // a `delete` written beside deletes nothing and flags a delete conflict.
+    let p = person(21, 0);
+    let d0 = &p.devices[0];
+    let (mut a, _) = Space::create(
+        Profile::FILES,
+        Policy::default(),
+        &p.log,
+        &d0.signing,
+        &[p.enc.public_key()],
+        None,
+    )
+    .unwrap();
+    let write = |a: &mut Space, op: SpaceOp| {
+        a.write_entry(&p.log, &d0.signing, vec![op], None)
+            .unwrap()
+            .0
+    };
+    let made = write(
+        &mut a,
+        files::create_file(ROOT, "f", &file(b"v1"), 0o644, None),
+    );
+    let f = files::created_node(&made, 0);
+    let content = |text: &[u8]| Some(file(text).to_value());
+    write(&mut a, SpaceOp::set(f, files::FILE_CONTENT, content(b"v2")));
+    assert_eq!(
+        a.state()
+            .node(&f)
+            .unwrap()
+            .values(files::FILE_CONTENT)
+            .len(),
+        1
+    );
+    // it descends from v2, and still does not replace it
+    let beside = write(
+        &mut a,
+        SpaceOp::set_beside(f, files::FILE_CONTENT, content(b"v3")),
+    );
+    let values = a
+        .state()
+        .node(&f)
+        .unwrap()
+        .values(files::FILE_CONTENT)
+        .to_vec();
+    assert_eq!(values.len(), 2);
+    assert!(values.iter().any(|v| v.entry == beside));
+    assert!(a.state().node(&f).unwrap().in_conflict(files::FILE_CONTENT));
+    // and is superseded like any other
+    write(&mut a, SpaceOp::set(f, files::FILE_CONTENT, content(b"v4")));
+    assert_eq!(
+        a.state()
+            .node(&f)
+            .unwrap()
+            .values(files::FILE_CONTENT)
+            .len(),
+        1
+    );
+
+    write(&mut a, SpaceOp::delete_beside(f));
+    let n = a.state().node(&f).unwrap();
+    assert!(!n.deleted && n.delete_conflict);
+    assert_eq!(a.state().conflicts().len(), 1);
+    // worked out from nothing, the same
+    let full = cardinal_space::State::compute(Profile::FILES, a.dag(), &a.validity().valid);
+    assert_eq!(full.canonical(), a.state().canonical());
+    let plain =
+        cardinal_space::State::compute_by_definition(Profile::FILES, a.dag(), &a.validity().valid);
+    assert_eq!(plain.canonical(), a.state().canonical());
+    // a plain delete still deletes
+    write(&mut a, SpaceOp::delete(f));
+    assert!(a.state().node(&f).unwrap().deleted);
 }

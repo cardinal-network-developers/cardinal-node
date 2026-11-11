@@ -24,9 +24,6 @@ pub enum Error {
     Mismatch(&'static str),
     /// The entry belongs to another space.
     WrongSpace,
-    /// Membership evaluation of a space with more than one member identity
-    /// is not implemented natively yet; use the full rules.
-    Unsupported(&'static str),
     /// The author's identity log is not known.
     UnknownAuthor,
     /// The operation is not allowed.
@@ -47,7 +44,6 @@ impl fmt::Display for Error {
             Error::Decrypt => f.write_str("entry does not decrypt"),
             Error::Mismatch(why) => write!(f, "sealed entry does not match: {why}"),
             Error::WrongSpace => f.write_str("entry of another space"),
-            Error::Unsupported(why) => write!(f, "unsupported: {why}"),
             Error::UnknownAuthor => f.write_str("unknown author"),
             Error::NotAllowed(why) => write!(f, "not allowed: {why}"),
             Error::Identity(e) => write!(f, "identity: {e}"),

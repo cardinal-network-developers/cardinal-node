@@ -720,6 +720,16 @@ pub fn guardian_commitment(salt: &[u8; 32], guardian: &EntryId) -> [u8; 32] {
     keyed_hash_parts(salt, &[GUARDIAN_COMMITMENT, guardian])
 }
 
+/// Evaluates several identity logs together, each with the others at hand:
+/// a guardian's confirmation is an entry in the guardian's own log, so what
+/// a log means can depend on logs beside it. Returns one state for each
+/// log, in the order given. A space judges its authors by these
+/// (`spaces.md#authors`: "the whole log the verifier holds").
+pub fn evaluate_together(logs: &[&IdentityLog]) -> Vec<IdentityState> {
+    let conv = Conversion::new(logs);
+    logs.iter().map(|l| conv.state(l)).collect()
+}
+
 /// The model world of several identity logs, to which a space's entries can
 /// be added for evaluation by the `space` program. Symbols are the lowercase
 /// hex of ids and keys, so symbols compare as the bytes they stand for.

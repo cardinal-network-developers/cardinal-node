@@ -21,13 +21,21 @@ pub const MAX_SEALED_SIZE: usize = 256 * 1024;
 pub type SpaceId = [u8; 32];
 /// An identity id.
 pub type IdentityId = [u8; 32];
-/// A membership id.
-pub type MembershipId = [u8; 16];
 /// A node id.
 pub type NodeId = [u8; 16];
 
-/// The id derived from an entry and an op position, for memberships and
-/// nodes: the first 16 bytes of `BLAKE3(entry id || varint(i))`.
+/// The reader role: reads, and writes its own reach node, `keep` and `leave`.
+pub const READER: u64 = 0;
+/// The writer role: also writes application ops, and `rotate`.
+pub const WRITER: u64 = 1;
+/// The admin role: also adds readers, writers and admins.
+pub const ADMIN: u64 = 2;
+/// The owner role: also changes policy and protocol, and succeeds the space.
+/// Only a genesis gives it, and only to its own author.
+pub const OWNER: u64 = 3;
+
+/// The id of the node an entry's `create` op makes: the first 16 bytes of
+/// `BLAKE3(entry id || varint(i))`, where `i` is the op's position.
 pub fn derived_id(entry: &EntryId, index: usize) -> [u8; 16] {
     let mut h = blake3::Hasher::new();
     h.update(entry);
@@ -136,19 +144,39 @@ impl Policy {
     }
 }
 
+/// What a successor's `start` says of the space it succeeds
+/// (`spaces.md#the-successor`): fields 3, 4 and 6 to 9.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Succession {
+    /// 3: the space this one succeeds.
+    pub succeeds: Option<SpaceId>,
+    /// 4: the initial state, a blob reference to a canonical state.
+    pub initial_state: Option<Record>,
+    /// 6: the cut, entries of the space this one succeeds.
+    pub cut: Vec<EntryId>,
+    /// 7: the keys of that space's current epochs, if history is shared.
+    pub old_keys: Vec<(EpochId, [u8; 32])>,
+    /// 8: the identity logs the state at the cut was judged with: for each
+    /// identity, the heads its writer held.
+    pub judged_with: Vec<(IdentityId, Vec<EntryId>)>,
+    /// 9: a fresh start: nothing the successor does not carry is to follow.
+    pub fresh_start: bool,
+}
+
 /// The typed reading of a space op.
 #[derive(Clone, Debug, PartialEq)]
 pub enum SpaceOpBody {
-    /// 1 `start` (genesis only).
+    /// 1 `start` (genesis only, and exactly one).
     Start {
         /// The profile.
         profile: Profile,
         /// The policy.
         policy: Policy,
-        /// The space this one succeeds.
-        succeeds: Option<SpaceId>,
-        /// Initial state: a blob reference to a canonical state.
-        initial_state: Option<Record>,
+        /// 5: the protocol record
+        /// (`evolution.md#declaring-what-you-speak`).
+        protocol: Option<Record>,
+        /// Where the space comes from, if it succeeds another.
+        succession: Box<Succession>,
     },
     /// 2 `add_member`.
     AddMember {
@@ -156,12 +184,12 @@ pub enum SpaceOpBody {
         identity: IdentityId,
         /// Role 0 reader .. 3 owner.
         role: u64,
+        /// The identity this member acts for; display only.
+        agent_of: Option<IdentityId>,
     },
-    /// 4 `remove_member`.
-    RemoveMember {
-        /// The membership.
-        membership: MembershipId,
-    },
+    /// 4 `leave`: a member's own statement that it has stopped. It changes
+    /// nothing about what is valid.
+    Leave,
     /// 5 `rotate`: the keys of superseded epochs, if history is shared.
     Rotate {
         /// `(epoch id, key)` pairs.
@@ -174,7 +202,7 @@ pub enum SpaceOpBody {
     },
     /// 7 `keep`.
     Keep {
-        /// A removed signing key of the author.
+        /// A signing key of the author, removed or about to be.
         key: KeyId,
         /// Entries by that key.
         entries: Vec<EntryId>,
@@ -183,6 +211,10 @@ pub enum SpaceOpBody {
     Succeed {
         /// The successor space.
         successor: SpaceId,
+        /// The members the successor does not name; display only.
+        left_out: Vec<IdentityId>,
+        /// The successor's public address, when the space is public.
+        address: Option<Record>,
     },
     /// 9 `set_protocol`.
     SetProtocol,
@@ -196,6 +228,9 @@ pub enum SpaceOpBody {
         name: String,
         /// Initial fields.
         fields: Record,
+        /// The ids this node has had, when the op is posted again in a
+        /// successor.
+        was: Vec<NodeId>,
     },
     /// 33 `set` (value absent to clear).
     Set {
@@ -205,6 +240,9 @@ pub enum SpaceOpBody {
         key: u64,
         /// The value.
         value: Option<Value>,
+        /// Written beside: it supersedes nothing
+        /// (`state.md#fields-are-multi-value-registers`).
+        beside: bool,
     },
     /// 34 `move`.
     Move {
@@ -219,6 +257,9 @@ pub enum SpaceOpBody {
     Delete {
         /// The node.
         node: NodeId,
+        /// Written beside: it deletes nothing, and flags a delete conflict
+        /// (`state.md#deletion-yields-to-concurrent-work`).
+        beside: bool,
     },
     /// 36 `restore`.
     Restore {
@@ -263,6 +304,40 @@ fn id16(r: &Record, key: u64) -> Result<[u8; 16], Error> {
     Ok(r.bytes_n::<16>(key)?)
 }
 
+/// A list of byte strings of length `N` at `key`; absent reads as empty.
+fn ids<const N: usize>(r: &Record, key: u64, what: &'static str) -> Result<Vec<[u8; N]>, Error> {
+    r.opt_list(key)?
+        .unwrap_or(&[])
+        .iter()
+        .map(|v| {
+            v.as_bytes()
+                .and_then(|b| <[u8; N]>::try_from(b).ok())
+                .ok_or(Error::Malformed(what))
+        })
+        .collect()
+}
+
+/// A list of `{1: epoch id, 2: key}` at `key`; absent reads as empty.
+fn epoch_keys(r: &Record, key: u64) -> Result<Vec<(EpochId, [u8; 32])>, Error> {
+    let mut out = Vec::new();
+    for v in r.opt_list(key)?.unwrap_or(&[]) {
+        let e = v.as_record().ok_or(Error::Malformed("epoch keys"))?;
+        out.push((e.bytes_n::<16>(1)?, e.bytes_n::<32>(2)?));
+    }
+    Ok(out)
+}
+
+fn epoch_keys_value(keys: &[(EpochId, [u8; 32])]) -> Value {
+    Value::list(
+        keys.iter()
+            .map(|(id, k)| Record::new().with(1, *id).with(2, *k)),
+    )
+}
+
+fn id_list<const N: usize>(ids: &[[u8; N]]) -> Value {
+    Value::list(ids.iter().map(|x| Value::from(x.to_vec())))
+}
+
 impl SpaceOp {
     /// Reads an op record.
     pub fn from_record(record: Record) -> SpaceOp {
@@ -286,42 +361,43 @@ impl SpaceOp {
                     Some(p) => Policy::from_record(p)?,
                     None => Policy::default(),
                 },
-                succeeds: r.opt_bytes_n(3)?,
-                initial_state: r.opt_record(4)?.cloned(),
+                protocol: r.opt_record(5)?.cloned(),
+                succession: Box::new(Succession {
+                    succeeds: r.opt_bytes_n(3)?,
+                    initial_state: r.opt_record(4)?.cloned(),
+                    cut: ids(r, 6, "cut")?,
+                    old_keys: epoch_keys(r, 7)?,
+                    judged_with: {
+                        let mut out = Vec::new();
+                        for v in r.opt_list(8)?.unwrap_or(&[]) {
+                            let e = v.as_record().ok_or(Error::Malformed("judged with"))?;
+                            out.push((e.bytes_n::<32>(1)?, ids(e, 2, "judged with")?));
+                        }
+                        out
+                    },
+                    fresh_start: r.opt_bool(9)?.unwrap_or(false),
+                }),
             },
             2 => SpaceOpBody::AddMember {
                 identity: r.bytes_n(1)?,
                 role: r.uint(2)?,
+                agent_of: r.opt_bytes_n(3)?,
             },
-            4 => SpaceOpBody::RemoveMember {
-                membership: id16(r, 1)?,
+            4 => SpaceOpBody::Leave,
+            5 => SpaceOpBody::Rotate {
+                previous: epoch_keys(r, 1)?,
             },
-            5 => {
-                let mut previous = Vec::new();
-                for v in r.opt_list(1)?.unwrap_or(&[]) {
-                    let e = v.as_record().ok_or(Error::Malformed("rotate"))?;
-                    previous.push((e.bytes_n::<16>(1)?, e.bytes_n::<32>(2)?));
-                }
-                SpaceOpBody::Rotate { previous }
-            }
             6 => SpaceOpBody::SetPolicy {
                 policy: Policy::from_record(r.record(1)?)?,
             },
             7 => SpaceOpBody::Keep {
                 key: r.bytes_n(1)?,
-                entries: r
-                    .opt_list(2)?
-                    .unwrap_or(&[])
-                    .iter()
-                    .map(|v| {
-                        v.as_bytes()
-                            .and_then(|b| <[u8; 32]>::try_from(b).ok())
-                            .ok_or(Error::Malformed("keep"))
-                    })
-                    .collect::<Result<_, _>>()?,
+                entries: ids(r, 2, "keep")?,
             },
             8 => SpaceOpBody::Succeed {
                 successor: r.bytes_n(1)?,
+                left_out: ids(r, 2, "left out")?,
+                address: r.opt_record(3)?.cloned(),
             },
             9 => SpaceOpBody::SetProtocol,
             32 => SpaceOpBody::Create {
@@ -332,18 +408,23 @@ impl SpaceOp {
                 parent: id16(r, 2)?,
                 name: r.opt_text(3)?.unwrap_or("").to_owned(),
                 fields: r.opt_record(4)?.cloned().unwrap_or_default(),
+                was: ids(r, 5, "was")?,
             },
             33 => SpaceOpBody::Set {
                 node: id16(r, 1)?,
                 key: r.uint(2)?,
                 value: r.get(3).cloned(),
+                beside: r.opt_bool(4)?.unwrap_or(false),
             },
             34 => SpaceOpBody::Move {
                 node: id16(r, 1)?,
                 parent: id16(r, 2)?,
                 name: r.opt_text(3)?.unwrap_or("").to_owned(),
             },
-            35 => SpaceOpBody::Delete { node: id16(r, 1)? },
+            35 => SpaceOpBody::Delete {
+                node: id16(r, 1)?,
+                beside: r.opt_bool(2)?.unwrap_or(false),
+            },
             36 => SpaceOpBody::Restore { node: id16(r, 1)? },
             37 => SpaceOpBody::Checkpoint,
             n => SpaceOpBody::Unknown { number: Some(n) },
@@ -370,6 +451,41 @@ impl SpaceOp {
         )
     }
 
+    /// `start` of a space that succeeds another, or that declares its
+    /// protocol: every field of the op. Lists that are empty and a fresh
+    /// start that is not one are left out.
+    pub fn start_with(
+        profile: Profile,
+        policy: &Policy,
+        protocol: Option<Record>,
+        from: &Succession,
+    ) -> SpaceOp {
+        let judged = from.judged_with.iter().map(|(who, heads)| {
+            Record::new()
+                .with(1, *who)
+                .with(2, id_list(heads.as_slice()))
+        });
+        SpaceOp::from_record(
+            Record::new()
+                .with(0, 1u32)
+                .with(1, profile.to_value())
+                .with(2, policy.to_record())
+                .with_opt(3, from.succeeds)
+                .with_opt(4, from.initial_state.clone())
+                .with_opt(5, protocol)
+                .with_opt(6, (!from.cut.is_empty()).then(|| id_list(&from.cut)))
+                .with_opt(
+                    7,
+                    (!from.old_keys.is_empty()).then(|| epoch_keys_value(&from.old_keys)),
+                )
+                .with_opt(
+                    8,
+                    (!from.judged_with.is_empty()).then(|| Value::list(judged)),
+                )
+                .with_opt(9, from.fresh_start.then_some(true)),
+        )
+    }
+
     /// `add_member`.
     pub fn add_member(identity: IdentityId, role: u64) -> SpaceOp {
         SpaceOp::from_record(
@@ -380,9 +496,21 @@ impl SpaceOp {
         )
     }
 
-    /// `remove_member`.
-    pub fn remove_member(membership: MembershipId) -> SpaceOp {
-        SpaceOp::from_record(Record::new().with(0, 4u32).with(1, membership))
+    /// `add_member` of an agent: a member that acts for `agent_of`
+    /// (`apps.md#agents-normative-where-marked`).
+    pub fn add_agent(identity: IdentityId, role: u64, agent_of: IdentityId) -> SpaceOp {
+        SpaceOp::from_record(
+            Record::new()
+                .with(0, 2u32)
+                .with(1, identity)
+                .with(2, role as u32)
+                .with(3, agent_of),
+        )
+    }
+
+    /// `leave`.
+    pub fn leave() -> SpaceOp {
+        SpaceOp::from_record(Record::new().with(0, 4u32))
     }
 
     /// `rotate`, carrying superseded epoch keys.
@@ -399,6 +527,11 @@ impl SpaceOp {
         )
     }
 
+    /// `set_policy`.
+    pub fn set_policy(policy: &Policy) -> SpaceOp {
+        SpaceOp::from_record(Record::new().with(0, 6u32).with(1, policy.to_record()))
+    }
+
     /// `keep`.
     pub fn keep(key: KeyId, entries: &[EntryId]) -> SpaceOp {
         SpaceOp::from_record(
@@ -411,18 +544,47 @@ impl SpaceOp {
 
     /// `succeed`.
     pub fn succeed(successor: SpaceId) -> SpaceOp {
-        SpaceOp::from_record(Record::new().with(0, 8u32).with(1, successor))
+        SpaceOp::succeed_with(successor, &[], None)
+    }
+
+    /// `succeed`, saying who the successor leaves out and, for a public
+    /// space, the successor's public address.
+    pub fn succeed_with(
+        successor: SpaceId,
+        left_out: &[IdentityId],
+        address: Option<Record>,
+    ) -> SpaceOp {
+        SpaceOp::from_record(
+            Record::new()
+                .with(0, 8u32)
+                .with(1, successor)
+                .with_opt(2, (!left_out.is_empty()).then(|| id_list(left_out)))
+                .with_opt(3, address),
+        )
     }
 
     /// `create`.
     pub fn create(kind: NodeKind, parent: NodeId, name: &str, fields: Record) -> SpaceOp {
+        SpaceOp::create_was(kind, parent, name, fields, &[])
+    }
+
+    /// `create` posted again in a successor: `was` lists every id the node
+    /// has had.
+    pub fn create_was(
+        kind: NodeKind,
+        parent: NodeId,
+        name: &str,
+        fields: Record,
+        was: &[NodeId],
+    ) -> SpaceOp {
         SpaceOp::from_record(
             Record::new()
                 .with(0, 32u32)
                 .with(1, kind.to_value())
                 .with(2, parent)
                 .with(3, name)
-                .with(4, fields),
+                .with(4, fields)
+                .with_opt(5, (!was.is_empty()).then(|| id_list(was))),
         )
     }
 
@@ -434,6 +596,19 @@ impl SpaceOp {
                 .with(1, node)
                 .with(2, key as u32)
                 .with_opt(3, value),
+        )
+    }
+
+    /// `set` written beside: its value is added to the field's values and
+    /// supersedes none of them.
+    pub fn set_beside(node: NodeId, key: u64, value: Option<Value>) -> SpaceOp {
+        SpaceOp::from_record(
+            Record::new()
+                .with(0, 33u32)
+                .with(1, node)
+                .with(2, key as u32)
+                .with_opt(3, value)
+                .with(4, true),
         )
     }
 
@@ -451,6 +626,12 @@ impl SpaceOp {
     /// `delete`.
     pub fn delete(node: NodeId) -> SpaceOp {
         SpaceOp::from_record(Record::new().with(0, 35u32).with(1, node))
+    }
+
+    /// `delete` written beside: it deletes nothing and flags a delete
+    /// conflict.
+    pub fn delete_beside(node: NodeId) -> SpaceOp {
+        SpaceOp::from_record(Record::new().with(0, 35u32).with(1, node).with(2, true))
     }
 
     /// `restore`.
@@ -471,7 +652,6 @@ pub struct SpaceEntry {
     time: Option<u64>,
     epoch: EpochId,
     wraps_hash: Option<[u8; 32]>,
-    membership: Option<MembershipId>,
 }
 
 impl SpaceEntry {
@@ -529,7 +709,6 @@ impl SpaceEntry {
             time: r.opt_uint(6)?,
             epoch: r.bytes_n(7)?,
             wraps_hash: r.opt_bytes_n(8)?,
-            membership: r.opt_bytes_n(9)?,
             signed,
         })
     }
@@ -589,11 +768,6 @@ impl SpaceEntry {
         self.wraps_hash
     }
 
-    /// The membership this entry is written under.
-    pub fn membership(&self) -> Option<MembershipId> {
-        self.membership
-    }
-
     /// The signing key.
     pub fn signer(&self) -> KeyId {
         self.signed.signatures()[0].key
@@ -623,15 +797,6 @@ impl SpaceEntry {
                 .any(|o| matches!(o.body(), SpaceOpBody::Rotate { .. }))
     }
 
-    /// The membership created by the genesis `start` op.
-    pub fn genesis_membership(&self) -> Option<MembershipId> {
-        let i = self
-            .ops
-            .iter()
-            .position(|o| matches!(o.body(), SpaceOpBody::Start { .. }))?;
-        Some(derived_id(&self.id(), i))
-    }
-
     /// The profile named by the genesis `start` op.
     pub fn profile(&self) -> Option<Profile> {
         self.ops.iter().find_map(|o| match o.body() {
@@ -657,7 +822,6 @@ pub struct SpaceEntryBuilder {
     time: Option<u64>,
     epoch: EpochId,
     wraps_hash: Option<[u8; 32]>,
-    membership: Option<MembershipId>,
     extra: Record,
 }
 
@@ -673,19 +837,17 @@ impl SpaceEntryBuilder {
             time: None,
             epoch,
             wraps_hash: None,
-            membership: None,
             extra: Record::new(),
         }
     }
 
-    /// An entry of `space` after `parents`, under `membership`.
+    /// An entry of `space` after `parents`.
     pub fn new(
         space: SpaceId,
         parents: &[EntryId],
         author: IdentityId,
         author_head: EntryId,
         epoch: EpochId,
-        membership: Option<MembershipId>,
     ) -> SpaceEntryBuilder {
         let mut parents = parents.to_vec();
         parents.sort_unstable();
@@ -699,7 +861,6 @@ impl SpaceEntryBuilder {
             time: None,
             epoch,
             wraps_hash: None,
-            membership,
             extra: Record::new(),
         }
     }
@@ -754,8 +915,7 @@ impl SpaceEntryBuilder {
                     .and_then(|t| cardinal_encoding::Int::from_u64(t).map(Value::Int)),
             )
             .with(7, self.epoch)
-            .with_opt(8, self.wraps_hash)
-            .with_opt(9, self.membership);
+            .with_opt(8, self.wraps_hash);
         let mut obj = SignedObject::new(r);
         key.sign_object(&mut obj);
         SpaceEntry::from_signed(obj)
@@ -1014,8 +1174,17 @@ mod tests {
             SpaceOp::delete([1; 16]),
             SpaceOp::restore([1; 16]),
             SpaceOp::keep([4; 32], &[[5; 32]]),
-            SpaceOp::remove_member([6; 16]),
+            SpaceOp::leave(),
             SpaceOp::rotate(&[&EpochKey::from_bytes([1; 32])]),
+            SpaceOp::add_member([7; 32], WRITER),
+            SpaceOp::add_agent([7; 32], READER, [8; 32]),
+            SpaceOp::set_policy(&Policy::default()),
+            SpaceOp::succeed([9; 32]),
+            SpaceOp::succeed_with([9; 32], &[[7; 32]], Some(Record::new().with(0, 10u32))),
+            SpaceOp::start(Profile::RELATIONSHIP, &Policy::default()),
+            SpaceOp::create_was(NodeKind::Uint(2), [0; 16], "b", Record::new(), &[[3; 16]]),
+            SpaceOp::set_beside([1; 16], 1, Some(Value::from("x"))),
+            SpaceOp::delete_beside([1; 16]),
         ];
         for op in ops {
             let back = SpaceOp::from_record(Record::decode(&op.record().encode()).unwrap());
@@ -1025,5 +1194,121 @@ mod tests {
                 "{op:?}"
             );
         }
+    }
+
+    #[test]
+    fn start_says_where_a_successor_comes_from() {
+        let from = Succession {
+            succeeds: Some([1; 32]),
+            initial_state: Some(Record::new().with(1, 5u32)),
+            cut: vec![[2; 32], [3; 32]],
+            old_keys: vec![([4; 16], [5; 32])],
+            judged_with: vec![([6; 32], vec![[7; 32], [8; 32]]), ([9; 32], vec![])],
+            fresh_start: true,
+        };
+        let protocol = Record::new().with(1, [0u8; 32]);
+        let policy = Policy::default();
+        let op = SpaceOp::start_with(Profile::Core(4), &policy, Some(protocol.clone()), &from);
+        // every field is written under its own key
+        for key in 1..=9 {
+            assert!(op.record().contains(key), "field {key}");
+        }
+        let bytes = op.record().encode();
+        let back = SpaceOp::from_record(Record::decode(&bytes).unwrap());
+        assert_eq!(back.record().encode(), bytes);
+        let SpaceOpBody::Start {
+            profile,
+            protocol: p,
+            succession,
+            ..
+        } = back.body()
+        else {
+            panic!("{back:?}");
+        };
+        assert_eq!((*profile, p.as_ref()), (Profile::Core(4), Some(&protocol)));
+        assert_eq!(**succession, from);
+        // a space that succeeds nothing says none of it
+        let plain = SpaceOp::start(Profile::FILES, &policy);
+        assert!((3..=9).all(|k| !plain.record().contains(k)));
+        let SpaceOpBody::Start { succession, .. } = plain.body() else {
+            panic!("{plain:?}");
+        };
+        assert_eq!(**succession, Succession::default());
+        // a cut that is not a list of entry ids is not a `start`
+        let mut r = op.record().clone();
+        r.insert(6, Value::list([Value::from("x")]));
+        let bad = SpaceOp::from_record(r);
+        assert_eq!(*bad.body(), SpaceOpBody::Unknown { number: Some(1) });
+    }
+
+    #[test]
+    fn new_fields_are_read_and_kept() {
+        let add = SpaceOp::add_agent([1; 32], READER, [2; 32]);
+        assert_eq!(
+            *add.body(),
+            SpaceOpBody::AddMember {
+                identity: [1; 32],
+                role: READER,
+                agent_of: Some([2; 32]),
+            }
+        );
+        let address = Record::new().with(0, 10u32).with(1, [3u8; 32]);
+        let end = SpaceOp::succeed_with([4; 32], &[[5; 32], [6; 32]], Some(address.clone()));
+        assert_eq!(
+            *end.body(),
+            SpaceOpBody::Succeed {
+                successor: [4; 32],
+                left_out: vec![[5; 32], [6; 32]],
+                address: Some(address),
+            }
+        );
+        let again = SpaceOp::create_was(NodeKind::Uint(2), [0; 16], "a", Record::new(), &[[7; 16]]);
+        assert!(matches!(again.body(), SpaceOpBody::Create { was, .. } if *was == [[7u8; 16]]));
+        let plain = SpaceOp::create(NodeKind::Uint(2), [0; 16], "a", Record::new());
+        assert!(!plain.record().contains(5));
+        assert!(matches!(
+            SpaceOp::set_beside([1; 16], 1, None).body(),
+            SpaceOpBody::Set {
+                beside: true,
+                value: None,
+                ..
+            }
+        ));
+        assert!(matches!(
+            SpaceOp::set([1; 16], 1, None).body(),
+            SpaceOpBody::Set { beside: false, .. }
+        ));
+        assert!(matches!(
+            SpaceOp::delete_beside([1; 16]).body(),
+            SpaceOpBody::Delete { beside: true, .. }
+        ));
+        assert!(!SpaceOp::delete([1; 16]).record().contains(2));
+        // `leave` has no fields; one that carries some is still a `leave`,
+        // and they are kept (what used to be `remove_member` reads so)
+        let old = Record::new().with(0, 4u32).with(1, [6u8; 16]);
+        let leave = SpaceOp::from_record(old.clone());
+        assert_eq!(*leave.body(), SpaceOpBody::Leave);
+        assert_eq!(*leave.record(), old);
+        assert_eq!(SpaceOp::leave().record().len(), 1);
+    }
+
+    #[test]
+    fn field_9_is_reserved() {
+        // An entry no longer names a membership. One that carries field 9
+        // is an entry with a field this implementation does not know: read,
+        // and kept as it was signed.
+        let device = SigningKey::from_seed(&[1; 32]);
+        let with = SpaceEntryBuilder::new([1; 32], &[[2; 32]], [3; 32], [4; 32], [5; 16])
+            .extra_field(9, [6u8; 16])
+            .sign(&device)
+            .unwrap();
+        let back = SpaceEntry::decode(&with.encode()).unwrap();
+        assert_eq!(back.id(), with.id());
+        assert_eq!(back.record().bytes_n::<16>(9).unwrap(), [6; 16]);
+        let without = SpaceEntryBuilder::new([1; 32], &[[2; 32]], [3; 32], [4; 32], [5; 16])
+            .sign(&device)
+            .unwrap();
+        assert!(!without.record().contains(9));
+        assert_ne!(without.id(), with.id());
     }
 }

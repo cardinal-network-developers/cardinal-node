@@ -1,0 +1,1277 @@
+//! Which space entries are valid, and who is a member
+//! (`spaces.md#authors`, `spaces.md#which-entries-are-valid`).
+//!
+//! A space only grows: members are added and roles are given, and nothing in
+//! a space takes either away. So what an entry may do is settled by its own
+//! causal past, and only a signature reaches it from outside: an identity
+//! log that changes which keys count, a witness, or a `keep`.
+//!
+//! Two evaluations:
+//!
+//! - [`Judge`]: native, for every space. Each entry is judged once, when it
+//!   arrives, from what is kept about its causal past, and again only when a
+//!   signature it rests on starts or stops counting. An entry costs the same
+//!   at the twenty-thousandth as at the twentieth.
+//! - [`by_rules`]: the normative `space` program of `model/rules.md`,
+//!   executed by the identity crate's Datalog evaluator over facts derived
+//!   as `world.py` derives them. Its graph facts are quadratic in the number
+//!   of entries. Nothing here calls it; property tests check the native
+//!   evaluation against it on random histories.
+//!
+//! # How an entry is judged once
+//!
+//! Only two kinds of entry have anything resting on them: one that adds a
+//! member, on which what that member writes afterwards rests, and one that
+//! names a successor, on which the closing of what follows rests. Each such
+//! entry gets a number, its *mark*, and every entry keeps the set of marks
+//! in its causal past as a bit set: the union of its parents' sets, with a
+//! parent's own mark where it has one. Most entries share their parent's
+//! set outright. An author's roles in an entry's past are then the roles
+//! given by the valid additions in its set that name the author, and the
+//! space had ended there if the set holds the namings the rules ask for.
+//! Neither needs a walk of the graph.
+
+use std::collections::{BTreeSet, HashMap, HashSet};
+use std::sync::Arc;
+
+use cardinal_identity::dag::Dag;
+use cardinal_identity::datalog::Val;
+use cardinal_identity::log::model_world;
+use cardinal_identity::model::{self, hex_decode, hex_encode, Op};
+use cardinal_identity::{EntryId, IdentityLog, IdentityState, KeyId};
+
+use crate::entry::{
+    derived_id, IdentityId, NodeId, NodeKind, Profile, SpaceEntry, SpaceId, SpaceOpBody, ADMIN,
+    OWNER, READER, WRITER,
+};
+use crate::Error;
+
+/// A member: an identity, with a role a valid entry gave it. An identity
+/// holds every role it was given, and may do what the highest allows.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct Member {
+    /// The member identity.
+    pub identity: IdentityId,
+    /// Role: 0 reader, 1 writer, 2 admin, 3 owner.
+    pub role: u64,
+}
+
+/// The result of judging a space's entries.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Validity {
+    /// Valid entries.
+    pub valid: HashSet<EntryId>,
+    /// Entries whose signature counts as their author's.
+    pub author_ok: HashSet<EntryId>,
+    /// The members: each identity with each role a valid entry gave it,
+    /// sorted.
+    pub members: Vec<Member>,
+    /// Entries whose signing key was in effect at the head they cite and has
+    /// been removed since, which no witness or `keep` vouches for (yet).
+    pub unwitnessed: HashSet<EntryId>,
+}
+
+impl Validity {
+    /// Whether an entry is valid.
+    pub fn is_valid(&self, e: &EntryId) -> bool {
+        self.valid.contains(e)
+    }
+
+    /// The highest role `who` holds, if they are a member.
+    pub fn role_of(&self, who: &IdentityId) -> Option<u64> {
+        let mine = self.members.iter().filter(|m| m.identity == *who);
+        mine.map(|m| m.role).max()
+    }
+
+    /// The member identities, each once, sorted.
+    pub fn identities(&self) -> Vec<IdentityId> {
+        let mut v: Vec<IdentityId> = self.members.iter().map(|m| m.identity).collect();
+        v.dedup();
+        v
+    }
+}
+
+// ------------------------------------------------------------ reading ops
+
+/// What an op is to the rules: the op names of `world.py`, and two more for
+/// ops the model leaves out.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Class {
+    Start,
+    Add,
+    Leave,
+    Succeed,
+    Keep,
+    /// Application data, and `rotate`: writers and up.
+    App,
+    /// The author's own reach node: any role.
+    Reach,
+    /// `set_policy` and `set_protocol`: the owner only.
+    OwnerOnly,
+    /// A control op this implementation does not define, or a malformed op:
+    /// no role.
+    Invalid,
+}
+
+/// The kind of a reach node, in the profiles that define one
+/// (`profiles.md#relationship`, `profiles.md#group`).
+fn reach_kind(profile: Profile) -> Option<NodeKind> {
+    match profile {
+        Profile::Core(3) | Profile::Core(4) => Some(NodeKind::Uint(crate::relationship::REACH)),
+        _ => None,
+    }
+}
+
+/// Which ops write their author's own reach node, the one application write
+/// a reader may make. That is a `create` of the profile's reach kind, or a
+/// `set` on a node that a `create` of that kind made, in an entry of the
+/// same author in the causal past. It is read off the entries alone, never
+/// off the state, so that validity does not come to depend on itself.
+#[derive(Clone, Debug, Default)]
+struct ReachNodes {
+    kind: Option<NodeKind>,
+    /// Reach nodes by id: the entry whose `create` made each, and its author.
+    nodes: HashMap<NodeId, (EntryId, IdentityId)>,
+}
+
+impl ReachNodes {
+    fn new(profile: Profile) -> ReachNodes {
+        ReachNodes {
+            kind: reach_kind(profile),
+            nodes: HashMap::new(),
+        }
+    }
+
+    fn class(
+        &self,
+        dag: &Dag<SpaceEntry>,
+        id: &EntryId,
+        e: &SpaceEntry,
+        op: &SpaceOpBody,
+    ) -> Class {
+        match op {
+            SpaceOpBody::Start { .. } => Class::Start,
+            SpaceOpBody::AddMember { .. } => Class::Add,
+            SpaceOpBody::Leave => Class::Leave,
+            SpaceOpBody::Succeed { .. } => Class::Succeed,
+            SpaceOpBody::Keep { .. } => Class::Keep,
+            SpaceOpBody::SetPolicy { .. } | SpaceOpBody::SetProtocol => Class::OwnerOnly,
+            SpaceOpBody::Unknown { number } if number.is_none_or(|n| n < 32) => Class::Invalid,
+            SpaceOpBody::Create { kind, .. } if Some(*kind) == self.kind => Class::Reach,
+            SpaceOpBody::Set { node, .. } => match self.nodes.get(node) {
+                Some((made, by)) if *by == e.author() && dag.is_ancestor(made, id) => Class::Reach,
+                _ => Class::App,
+            },
+            _ => Class::App,
+        }
+    }
+
+    /// Notes the reach nodes an entry creates.
+    fn note(&mut self, id: &EntryId, e: &SpaceEntry) {
+        if self.kind.is_none() {
+            return;
+        }
+        for (i, op) in e.ops().iter().enumerate() {
+            if let SpaceOpBody::Create { kind, .. } = op.body() {
+                if Some(*kind) == self.kind {
+                    self.nodes.insert(derived_id(id, i), (*id, e.author()));
+                }
+            }
+        }
+    }
+}
+
+/// The least role that may perform an op of a class outside a genesis, or
+/// `None` if no role may (the roles table of `spaces.md#members-and-roles`).
+fn least_role(class: Class, op: &SpaceOpBody, has_owner: bool) -> Option<u64> {
+    match class {
+        Class::Leave | Class::Keep | Class::Reach => Some(READER),
+        Class::App => Some(WRITER),
+        // only a genesis names an owner
+        Class::Add => match op {
+            SpaceOpBody::AddMember { role, .. } if *role <= ADMIN => Some(ADMIN),
+            _ => None,
+        },
+        Class::OwnerOnly => Some(OWNER),
+        // the owner's alone; with no owner, every member's
+        Class::Succeed => Some(if has_owner { OWNER } else { READER }),
+        Class::Start | Class::Invalid => None,
+    }
+}
+
+/// What a genesis says of its space (`genesis_shape` in `world.py`).
+#[derive(Clone, Debug)]
+struct Genesis {
+    id: EntryId,
+    /// Whether it is formed as `spaces.md#members-and-roles` requires.
+    formed: bool,
+    /// The owner it names, if it names exactly its own author as one.
+    owner: Option<IdentityId>,
+    /// Who must name a successor: the owner, or with no owner everyone the
+    /// genesis names.
+    deciders: Vec<IdentityId>,
+    /// The members it names.
+    adds: Vec<(IdentityId, u64)>,
+    /// The highest role it gives each identity it names.
+    top: HashMap<IdentityId, u64>,
+}
+
+impl Genesis {
+    fn read(dag: &Dag<SpaceEntry>, reach: &ReachNodes, id: &EntryId, e: &SpaceEntry) -> Genesis {
+        let author = e.author();
+        let mut adds = Vec::new();
+        let mut starts = 0;
+        let mut others = Vec::new();
+        for op in e.ops() {
+            match (reach.class(dag, id, e, op.body()), op.body()) {
+                (Class::Start, _) => starts += 1,
+                (Class::Add, SpaceOpBody::AddMember { identity, role, .. }) => {
+                    adds.push((*identity, *role))
+                }
+                (class, body) => others.push((class, body)),
+            }
+        }
+        let mut top: HashMap<IdentityId, u64> = HashMap::new();
+        for (m, r) in &adds {
+            let t = top.entry(*m).or_insert(*r);
+            *t = (*t).max(*r);
+        }
+        let owners: BTreeSet<IdentityId> = adds
+            .iter()
+            .filter(|(_, r)| *r == OWNER)
+            .map(|(m, _)| *m)
+            .collect();
+        let owner = (owners.len() == 1 && owners.contains(&author)).then_some(author);
+        let formed = starts == 1
+            && top.contains_key(&author)
+            && owners.iter().all(|m| *m == author)
+            && adds.iter().filter(|(_, r)| *r == OWNER).count() <= 1
+            && adds.iter().all(|(_, r)| *r <= OWNER)
+            && (owner.is_some() || adds.iter().all(|(_, r)| *r < ADMIN))
+            // besides `start` and `add_member`, only what the highest role
+            // it gives its author may perform; never a `succeed`
+            && others.iter().all(|(class, body)| {
+                *class != Class::Succeed
+                    && least_role(*class, body, true).is_some_and(|need| need <= top[&author])
+            });
+        let deciders = match owner {
+            Some(o) => vec![o],
+            None => {
+                let named: BTreeSet<IdentityId> = adds.iter().map(|(m, _)| *m).collect();
+                named.into_iter().collect()
+            }
+        };
+        Genesis {
+            id: *id,
+            formed,
+            owner,
+            deciders,
+            adds,
+            top,
+        }
+    }
+}
+
+// --------------------------------------------------------------- bit sets
+
+/// A set of marks. Bits are only ever set, and the vector never ends in a
+/// zero word, so equal sets are equal vectors.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct Bits(Vec<u64>);
+
+impl Bits {
+    fn get(&self, i: u32) -> bool {
+        let w = self.0.get((i / 64) as usize);
+        w.is_some_and(|w| w >> (i % 64) & 1 == 1)
+    }
+
+    fn set(&mut self, i: u32) {
+        let at = (i / 64) as usize;
+        if self.0.len() <= at {
+            self.0.resize(at + 1, 0);
+        }
+        self.0[at] |= 1 << (i % 64);
+    }
+
+    fn union_with(&mut self, other: &Bits) {
+        if self.0.len() < other.0.len() {
+            self.0.resize(other.0.len(), 0);
+        }
+        for (a, b) in self.0.iter_mut().zip(&other.0) {
+            *a |= b;
+        }
+    }
+
+    fn intersects(&self, other: &Bits) -> bool {
+        self.0.iter().zip(&other.0).any(|(a, b)| a & b != 0)
+    }
+
+    fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}
+
+// ------------------------------------------------------------- the judge
+
+/// What an entry holds that the rules read, beyond its signature.
+#[derive(Clone, Debug, Default)]
+struct Marked {
+    /// `add_member` ops: who, and the role.
+    adds: Vec<(IdentityId, u64)>,
+    /// `succeed` ops: the successors named.
+    names: Vec<SpaceId>,
+    /// `keep` ops: the key, and the entries listed.
+    keeps: Vec<(KeyId, Vec<EntryId>)>,
+}
+
+/// What is kept about one entry.
+#[derive(Clone, Debug)]
+struct Info {
+    /// The marks in its causal past.
+    past: Arc<Bits>,
+    /// Its own mark, if it adds a member or names a successor.
+    mark: Option<u32>,
+    /// The least role that may perform all of its ops; `None` if no role
+    /// may. Not read for a genesis, which is judged by its shape.
+    need: Option<u64>,
+    /// It ends or begins a space: it holds a `succeed`, or it is a genesis
+    /// whose `start` names a space it succeeds. Kept, never witnessed.
+    structural: bool,
+    /// Its signing key was in effect at the head it cites.
+    attrib: bool,
+    /// Its signature counts as its author's.
+    ok: bool,
+    /// It is valid.
+    valid: bool,
+    /// It names a successor, and that naming counts towards the end of the
+    /// space: its author must name one, its signature counts, and a role
+    /// the genesis gave its author may perform all of its ops.
+    named: bool,
+    marked: Option<Box<Marked>>,
+}
+
+/// Judges the entries of one space as they arrive.
+///
+/// The graph is kept by the caller and passed to each call; an entry is
+/// given to [`Judge::arrive`] once it and all of its ancestors are in the
+/// graph, in the order they were added to it.
+#[derive(Clone, Debug)]
+pub struct Judge {
+    info: HashMap<EntryId, Info>,
+    /// Marked entries, by mark.
+    marks: Vec<EntryId>,
+    /// By identity: the marks of entries after the genesis that add it, and
+    /// the role each gives.
+    adds_of: HashMap<IdentityId, Vec<(u32, u64)>>,
+    /// The marks of entries that name a successor.
+    succeeds: Vec<u32>,
+    /// Entries by author.
+    by_author: HashMap<IdentityId, Vec<EntryId>>,
+    /// Entries with a `leave`, by author.
+    leaves: HashMap<IdentityId, Vec<EntryId>>,
+    /// By author and signing key: entries whose key was in effect at the
+    /// cited head and has been removed since, that nothing vouches for.
+    waiting: HashMap<IdentityId, HashMap<KeyId, HashSet<EntryId>>>,
+    /// By entry id: the entries whose `keep` ops list it, here or not yet.
+    listed: HashMap<EntryId, Vec<EntryId>>,
+    /// By entry id: the keys of other signed objects held with the same
+    /// body, and so the same id, as the one in the graph. An entry id does
+    /// not cover the signature, so anyone can sign someone's entry again
+    /// with a key of their own (see [`Judge::key_of`]).
+    also: HashMap<EntryId, Vec<KeyId>>,
+    /// The evaluated identity logs of authors, as far as they are held.
+    states: HashMap<IdentityId, Arc<IdentityState>>,
+    genesis: Option<Genesis>,
+    /// The genesis is valid: its signature counts and it is well formed.
+    root: bool,
+    reach: ReachNodes,
+    validity: Validity,
+}
+
+impl Judge {
+    /// A judge for a space of `profile` that holds no entries yet.
+    pub fn new(profile: Profile) -> Judge {
+        Judge {
+            info: HashMap::new(),
+            marks: Vec::new(),
+            adds_of: HashMap::new(),
+            succeeds: Vec::new(),
+            by_author: HashMap::new(),
+            leaves: HashMap::new(),
+            waiting: HashMap::new(),
+            listed: HashMap::new(),
+            also: HashMap::new(),
+            states: HashMap::new(),
+            genesis: None,
+            root: false,
+            reach: ReachNodes::new(profile),
+            validity: Validity::default(),
+        }
+    }
+
+    /// What has been found.
+    pub fn validity(&self) -> &Validity {
+        &self.validity
+    }
+
+    /// The owner the genesis names, if it is well formed and names one.
+    pub fn owner(&self) -> Option<IdentityId> {
+        self.genesis.as_ref().filter(|g| g.formed)?.owner
+    }
+
+    /// Who must name a successor for the space to end: its owner, or with
+    /// no owner every identity its genesis names.
+    pub fn deciders(&self) -> &[IdentityId] {
+        self.genesis.as_ref().map_or(&[], |g| &g.deciders)
+    }
+
+    /// The evaluated identity log held for `who`.
+    pub fn state_of(&self, who: &IdentityId) -> Option<&Arc<IdentityState>> {
+        self.states.get(who)
+    }
+
+    /// Every identity that wrote an entry held here, valid or not.
+    pub fn authors(&self) -> impl Iterator<Item = &IdentityId> {
+        self.by_author.keys()
+    }
+
+    fn marked(&self, id: &EntryId) -> Option<&Marked> {
+        self.info.get(id)?.marked.as_deref()
+    }
+
+    /// The key an entry is judged as signed by.
+    ///
+    /// The id of an entry is the hash of its body, so the same entry can be
+    /// held under more than one signature: its author's, and any that
+    /// someone else made over the same body with a key of their own. The
+    /// rules read one signing key for an entry. So that the answer does not
+    /// depend on which signed object arrived first, and so that nobody can
+    /// void an entry by signing it again, the key is chosen from all that
+    /// are held: one in effect at the cited head of the author's log before
+    /// one that is not, then one not removed since before one that was, then
+    /// the smallest, compared as bytes.
+    pub fn key_of(&self, dag: &Dag<SpaceEntry>, id: &EntryId) -> Option<KeyId> {
+        let e = dag.get(id)?;
+        let first = e.signer();
+        let Some(also) = self.also.get(id) else {
+            return Some(first);
+        };
+        let state = self.states.get(&e.author());
+        let head = e.author_head();
+        let rank = |k: &KeyId| {
+            let counts = state.is_some_and(|st| st.is_effective_at(k, &head));
+            let removed = state.is_some_and(|st| st.is_removed(k));
+            (!counts, removed, *k)
+        };
+        std::iter::once(first)
+            .chain(also.iter().copied())
+            .min_by_key(rank)
+    }
+
+    /// Takes the key of another signed object with the body of the entry
+    /// `id`, which may not have arrived yet. Returns the entries whose
+    /// validity changed.
+    pub fn also_signed(&mut self, dag: &Dag<SpaceEntry>, id: &EntryId, key: KeyId) -> Vec<EntryId> {
+        let known = self.also.entry(*id).or_default();
+        if known.contains(&key) {
+            return Vec::new();
+        }
+        known.push(key);
+        match dag.get(id).filter(|_| self.info.contains_key(id)) {
+            Some(e) => self.recount(dag, &e.author()),
+            None => Vec::new(),
+        }
+    }
+
+    // ---------------------------------------------------------- arrival
+
+    /// Judges an entry that has just been added to `dag`. Returns the
+    /// entries whose validity changed: the new one if it is valid, and any
+    /// that its signature, as a witness or a `keep`, made count.
+    ///
+    /// # Panics
+    ///
+    /// If the entry or one of its parents is not in `dag`, or a parent was
+    /// never given to this judge.
+    pub fn arrive(&mut self, dag: &Dag<SpaceEntry>, id: &EntryId) -> Vec<EntryId> {
+        let e = dag.get(id).expect("an entry that arrived is in the graph");
+        let key = self.key_of(dag, id).expect("it is in the graph");
+        let (author, head) = (e.author(), e.author_head());
+        // A space has one genesis: its id is the space's. A second entry
+        // without parents is nothing here, whatever it says.
+        let genesis = e.is_genesis() && self.genesis.as_ref().is_none_or(|g| g.id == *id);
+        if genesis && self.genesis.is_none() {
+            self.genesis = Some(Genesis::read(dag, &self.reach, id, e));
+        }
+        let has_owner = self.genesis.as_ref().is_some_and(|g| g.owner.is_some());
+        // what it holds
+        let mut marked = Marked::default();
+        let mut need = (genesis || !e.is_genesis()).then_some(READER);
+        let mut structural = false;
+        let mut leave = false;
+        for op in e.ops() {
+            let class = self.reach.class(dag, id, e, op.body());
+            need = match (need, least_role(class, op.body(), has_owner)) {
+                (Some(a), Some(b)) => Some(a.max(b)),
+                _ => None,
+            };
+            match op.body() {
+                SpaceOpBody::Start { succession, .. } => {
+                    structural |= genesis && succession.succeeds.is_some()
+                }
+                SpaceOpBody::AddMember { identity, role, .. } => {
+                    marked.adds.push((*identity, *role))
+                }
+                SpaceOpBody::Succeed { successor, .. } => {
+                    marked.names.push(*successor);
+                    structural = true;
+                }
+                SpaceOpBody::Keep { key, entries } => marked.keeps.push((*key, entries.clone())),
+                SpaceOpBody::Leave => leave = true,
+                _ => {}
+            }
+        }
+        self.reach.note(id, e);
+        let past = if e.is_genesis() {
+            Arc::new(Bits::default())
+        } else {
+            self.past_of(e.parents())
+        };
+        // a genesis is in every other entry's past, and needs no mark
+        let rests = !marked.adds.is_empty() || !marked.names.is_empty();
+        let mark = (rests && !genesis).then(|| {
+            self.marks.push(*id);
+            (self.marks.len() - 1) as u32
+        });
+        if let Some(m) = mark {
+            for (who, role) in &marked.adds {
+                self.adds_of.entry(*who).or_default().push((m, *role));
+            }
+            if !marked.names.is_empty() {
+                self.succeeds.push(m);
+            }
+        }
+        for (_, entries) in &marked.keeps {
+            for listed in entries {
+                self.listed.entry(*listed).or_default().push(*id);
+            }
+        }
+        self.by_author.entry(author).or_default().push(*id);
+        if leave {
+            self.leaves.entry(author).or_default().push(*id);
+        }
+        let nothing = marked.adds.is_empty() && marked.names.is_empty() && marked.keeps.is_empty();
+        self.info.insert(
+            *id,
+            Info {
+                past,
+                mark,
+                need,
+                structural,
+                attrib: false,
+                ok: false,
+                valid: false,
+                named: false,
+                marked: (!nothing).then(|| Box::new(marked)),
+            },
+        );
+
+        // whether its signature counts
+        let state = self.states.get(&author).cloned();
+        let attrib = state
+            .as_ref()
+            .is_some_and(|st| st.is_effective_at(&key, &head));
+        let removed = state.as_ref().is_some_and(|st| st.is_removed(&key));
+        let ok = attrib && (!removed || self.kept_already(dag, id, &author, &key));
+        let mut counted = Vec::new();
+        if attrib && !ok {
+            let of_author = self.waiting.entry(author).or_default();
+            of_author.entry(key).or_default().insert(*id);
+            self.validity.unwitnessed.insert(*id);
+        }
+        // a `keep` that was here first lists it: what waited on that
+        for keeper in self.listed.get(id).cloned().unwrap_or_default() {
+            if self.info.get(&keeper).is_some_and(|i| i.ok) {
+                self.keep_from(dag, &keeper, Some(id), &mut counted);
+            }
+        }
+        if ok {
+            let i = self.info.get_mut(id).expect("just added");
+            i.attrib = true;
+            i.ok = true;
+            self.validity.author_ok.insert(*id);
+            self.vouch_from(dag, *id, &mut counted);
+        } else {
+            self.info.get_mut(id).expect("just added").attrib = attrib;
+        }
+        // The new entry may have come to count through a `keep` just now,
+        // and what it rests on may have come to count through it.
+        counted.retain(|x| x != id);
+        if counted.is_empty() {
+            // nothing else moved: judge it where it stands
+            let mut changed = Vec::new();
+            if genesis {
+                self.root = self.root_now();
+            }
+            let named = self.named_now(dag, id);
+            let valid = self.valid_now(dag, id);
+            let i = self.info.get_mut(id).expect("just added");
+            i.named = named;
+            i.valid = valid;
+            if valid {
+                self.validity.valid.insert(*id);
+                changed.push(*id);
+                if mark.is_some() || genesis {
+                    self.refresh_members();
+                }
+            }
+            return changed;
+        }
+        counted.push(*id);
+        self.rejudge(dag, counted)
+    }
+
+    /// The marks in the causal past of an entry with these parents.
+    fn past_of(&self, parents: &[EntryId]) -> Arc<Bits> {
+        let of = |p: &EntryId| self.info.get(p).expect("parents arrive first");
+        if let [one] = parents {
+            let i = of(one);
+            if i.mark.is_none() {
+                return i.past.clone();
+            }
+        }
+        let mut bits = Bits::default();
+        for p in parents {
+            let i = of(p);
+            bits.union_with(&i.past);
+            if let Some(m) = i.mark {
+                bits.set(m);
+            }
+        }
+        // most merges add nothing to one side: share that side's set
+        match parents.iter().find(|p| *of(p).past == bits) {
+            Some(p) => of(p).past.clone(),
+            None => Arc::new(bits),
+        }
+    }
+
+    // ------------------------------------------------------- signatures
+
+    /// Whether a `keep` already here, whose signature counts, lists the new
+    /// entry `id` by `key`. (It has no descendants yet for one to list.)
+    fn kept_already(
+        &self,
+        dag: &Dag<SpaceEntry>,
+        id: &EntryId,
+        author: &IdentityId,
+        key: &KeyId,
+    ) -> bool {
+        let keepers = self.listed.get(id).map_or(&[][..], |v| v.as_slice());
+        keepers.iter().any(|w| {
+            let counts = self.info.get(w).is_some_and(|i| i.ok);
+            let same = dag.get(w).is_some_and(|we| we.author() == *author);
+            let keeps = self.marked(w).map_or(&[][..], |m| m.keeps.as_slice());
+            counts && same && keeps.iter().any(|(k, es)| k == key && es.contains(id))
+        })
+    }
+
+    fn count(&mut self, id: &EntryId, author: &IdentityId, key: &KeyId) {
+        if let Some(i) = self.info.get_mut(id) {
+            i.ok = true;
+        }
+        if let Some(of_author) = self.waiting.get_mut(author) {
+            if let Some(of_key) = of_author.get_mut(key) {
+                of_key.remove(id);
+                if of_key.is_empty() {
+                    of_author.remove(key);
+                }
+            }
+            if of_author.is_empty() {
+                self.waiting.remove(author);
+            }
+        }
+        self.validity.unwitnessed.remove(id);
+        self.validity.author_ok.insert(*id);
+    }
+
+    /// The entry `first` has come to count: everything that comes to count
+    /// through it, as a witness or by its `keep` ops, and through those in
+    /// turn. Adds them to `counted`.
+    fn vouch_from(&mut self, dag: &Dag<SpaceEntry>, first: EntryId, counted: &mut Vec<EntryId>) {
+        let mut todo = vec![first];
+        while let Some(w) = todo.pop() {
+            let before = counted.len();
+            self.witness_from(dag, &w, counted);
+            self.keep_from(dag, &w, None, counted);
+            todo.extend_from_slice(&counted[before..]);
+        }
+    }
+
+    /// Built on by another of the author's keys, while that key was still
+    /// trusted: the entries of `w`'s author that wait and that `w`, whose
+    /// signature counts, witnesses.
+    fn witness_from(&mut self, dag: &Dag<SpaceEntry>, w: &EntryId, counted: &mut Vec<EntryId>) {
+        let (Some(we), Some(key)) = (dag.get(w), self.key_of(dag, w)) else {
+            return;
+        };
+        let (author, head) = (we.author(), we.author_head());
+        let (Some(waiting), Some(state)) = (self.waiting.get(&author), self.states.get(&author))
+        else {
+            return;
+        };
+        let mut found = Vec::new();
+        for (k, ys) in waiting {
+            // a head that holds the removal of the key vouches for nothing
+            // that key signed
+            if *k == key || state.is_removed_at(k, &head) {
+                continue;
+            }
+            for y in ys {
+                let plain = self.info.get(y).is_some_and(|i| !i.structural);
+                if plain && dag.is_ancestor(y, w) {
+                    found.push((*y, *k));
+                }
+            }
+        }
+        for (y, k) in found {
+            self.count(&y, &author, &k);
+            counted.push(y);
+        }
+    }
+
+    /// Listed, or an ancestor of an entry listed, by a `keep` of the
+    /// author's: the entries of `w`'s author that wait and that the `keep`
+    /// ops of `w`, whose signature counts, keep. With `only`, just through
+    /// the listing of that one entry.
+    fn keep_from(
+        &mut self,
+        dag: &Dag<SpaceEntry>,
+        w: &EntryId,
+        only: Option<&EntryId>,
+        counted: &mut Vec<EntryId>,
+    ) {
+        let Some(keeps) = self.marked(w).map(|m| &m.keeps).filter(|k| !k.is_empty()) else {
+            return;
+        };
+        let Some(author) = dag.get(w).map(|we| we.author()) else {
+            return;
+        };
+        let Some(waiting) = self.waiting.get(&author) else {
+            return;
+        };
+        let mut found = Vec::new();
+        for (k, listed) in keeps {
+            let Some(ys) = waiting.get(k) else { continue };
+            let listed = listed.iter().filter(|l| only.is_none_or(|o| o == *l));
+            // an entry that is not here yet keeps nothing until it is
+            let listed: Vec<&EntryId> = listed.filter(|l| dag.contains(l)).collect();
+            for y in ys {
+                if listed.iter().any(|l| *l == y || dag.is_ancestor(y, l)) {
+                    found.push((*y, *k));
+                }
+            }
+        }
+        for (y, k) in found {
+            self.count(&y, &author, &k);
+            counted.push(y);
+        }
+    }
+
+    /// Takes the evaluated identity log of an author, as the verifier holds
+    /// it now. Returns the entries whose validity changed.
+    ///
+    /// The signatures of that author's entries are worked out again from
+    /// nothing, since a key that stops counting takes with it whatever its
+    /// entries witnessed. Nobody else's are touched, and validity is judged
+    /// again only for those entries and for what rests on them.
+    pub fn set_state(&mut self, dag: &Dag<SpaceEntry>, state: Arc<IdentityState>) -> Vec<EntryId> {
+        let author = state.identity;
+        if self.states.get(&author).is_some_and(|old| **old == *state) {
+            return Vec::new();
+        }
+        self.states.insert(author, state);
+        self.recount(dag, &author)
+    }
+
+    /// Works out again, from nothing, which of one author's entries have a
+    /// signature that counts, and judges again what changed and what rests
+    /// on it.
+    fn recount(&mut self, dag: &Dag<SpaceEntry>, author: &IdentityId) -> Vec<EntryId> {
+        let author = *author;
+        let entries = self.by_author.get(&author).cloned().unwrap_or_default();
+        let Some(state) = self.states.get(&author).cloned() else {
+            return Vec::new();
+        };
+        if entries.is_empty() {
+            return Vec::new();
+        }
+        let sig = |x: &EntryId| {
+            let e = dag.get(x).expect("entries judged are in the graph");
+            let key = self
+                .key_of(dag, x)
+                .expect("entries judged are in the graph");
+            (key, e.author_head())
+        };
+        let mut attrib: HashSet<EntryId> = HashSet::new();
+        let mut ok: HashSet<EntryId> = HashSet::new();
+        let mut waiting: HashMap<KeyId, HashSet<EntryId>> = HashMap::new();
+        for x in &entries {
+            let (key, head) = sig(x);
+            if !state.is_effective_at(&key, &head) {
+                continue;
+            }
+            attrib.insert(*x);
+            if state.is_removed(&key) {
+                waiting.entry(key).or_default().insert(*x);
+            } else {
+                ok.insert(*x);
+            }
+        }
+        // Witnesses and keeps, to a fixpoint: one walk of the graph for
+        // each key whose entries wait, and again while any came to count.
+        loop {
+            let mut grew = false;
+            let keys: Vec<KeyId> = waiting.keys().copied().collect();
+            for k in keys {
+                let mut built_on = Vec::new();
+                let mut kept = Vec::new();
+                for w in &ok {
+                    let (wkey, whead) = sig(w);
+                    if wkey != k && !state.is_removed_at(&k, &whead) {
+                        built_on.extend_from_slice(dag.parents(w));
+                    }
+                    for (key, listed) in self.marked(w).map_or(&[][..], |m| m.keeps.as_slice()) {
+                        if *key == k {
+                            kept.extend_from_slice(listed);
+                        }
+                    }
+                }
+                if built_on.is_empty() && kept.is_empty() {
+                    continue;
+                }
+                let witnessed = dag.ancestors_of(&built_on);
+                let kept = dag.ancestors_of(&kept);
+                let ys = waiting.get_mut(&k).expect("a key that waits");
+                let found: Vec<EntryId> = ys
+                    .iter()
+                    .filter(|y| {
+                        let plain = self.info.get(*y).is_some_and(|i| !i.structural);
+                        kept.contains(*y) || (plain && witnessed.contains(*y))
+                    })
+                    .copied()
+                    .collect();
+                for y in found {
+                    ys.remove(&y);
+                    ok.insert(y);
+                    grew = true;
+                }
+                if ys.is_empty() {
+                    waiting.remove(&k);
+                }
+            }
+            if !grew {
+                break;
+            }
+        }
+        let mut flipped = Vec::new();
+        for x in &entries {
+            let i = self.info.get_mut(x).expect("entries judged are known");
+            let (a, o) = (attrib.contains(x), ok.contains(x));
+            if i.ok != o {
+                flipped.push(*x);
+            }
+            i.attrib = a;
+            i.ok = o;
+            if o {
+                self.validity.author_ok.insert(*x);
+            } else {
+                self.validity.author_ok.remove(x);
+            }
+            if a && !o {
+                self.validity.unwitnessed.insert(*x);
+            } else {
+                self.validity.unwitnessed.remove(x);
+            }
+        }
+        if waiting.is_empty() {
+            self.waiting.remove(&author);
+        } else {
+            self.waiting.insert(author, waiting);
+        }
+        self.rejudge(dag, flipped)
+    }
+
+    // --------------------------------------------------------- validity
+
+    fn root_now(&self) -> bool {
+        let Some(g) = &self.genesis else { return false };
+        g.formed && self.info.get(&g.id).is_some_and(|i| i.ok)
+    }
+
+    /// Whether the space had ended in a causal past that holds these marks:
+    /// everyone who must name a successor has named the same one there.
+    fn closed_in(&self, dag: &Dag<SpaceEntry>, past: &Bits) -> bool {
+        let Some(g) = &self.genesis else { return false };
+        if !self.root || self.succeeds.is_empty() || g.deciders.is_empty() {
+            return false;
+        }
+        let behind = self.succeeds.iter().filter_map(|m| {
+            let y = &self.marks[*m as usize];
+            (past.get(*m) && self.info[y].named).then_some(y)
+        });
+        if g.deciders.len() == 1 {
+            // the owner's `succeed`, whichever successor it names
+            return behind.count() > 0;
+        }
+        let mut said: HashMap<SpaceId, HashSet<IdentityId>> = HashMap::new();
+        for y in behind {
+            let who = dag
+                .get(y)
+                .expect("marked entries are in the graph")
+                .author();
+            for s in self.marked(y).map_or(&[][..], |m| m.names.as_slice()) {
+                said.entry(*s).or_default().insert(who);
+            }
+        }
+        said.values().any(|who| who.len() >= g.deciders.len())
+    }
+
+    /// Whether `id`, which names a successor, counts towards the end of the
+    /// space (`named` in the rules).
+    fn named_now(&self, dag: &Dag<SpaceEntry>, id: &EntryId) -> bool {
+        let (Some(g), Some(i)) = (&self.genesis, self.info.get(id)) else {
+            return false;
+        };
+        let names = self.marked(id).is_some_and(|m| !m.names.is_empty());
+        if !i.ok || !names || g.id == *id {
+            return false;
+        }
+        let author = dag
+            .get(id)
+            .expect("entries judged are in the graph")
+            .author();
+        let by_genesis = g.top.get(&author);
+        g.deciders.contains(&author)
+            && i.need
+                .is_some_and(|need| by_genesis.is_some_and(|r| *r >= need))
+    }
+
+    /// Whether `id` is valid, given what is held about its causal past.
+    fn valid_now(&self, dag: &Dag<SpaceEntry>, id: &EntryId) -> bool {
+        let (Some(g), Some(i)) = (&self.genesis, self.info.get(id)) else {
+            return false;
+        };
+        if !self.root {
+            return false;
+        }
+        if g.id == *id {
+            return true;
+        }
+        let Some(need) = i.need.filter(|_| i.ok) else {
+            return false;
+        };
+        let author = dag
+            .get(id)
+            .expect("entries judged are in the graph")
+            .author();
+        // a valid entry in its causal past gave its author a role that may
+        // perform every op in it: the genesis, or an addition since
+        let given = g.top.get(&author).is_some_and(|r| *r >= need)
+            || self.adds_of.get(&author).is_some_and(|adds| {
+                adds.iter().any(|(m, r)| {
+                    *r >= need && i.past.get(*m) && self.info[&self.marks[*m as usize]].valid
+                })
+            });
+        given && !self.closed_in(dag, &i.past)
+    }
+
+    /// Judges again the entries in `dirty`, whose signatures started or
+    /// stopped counting, and whatever rests on them. Returns the entries
+    /// whose validity changed.
+    fn rejudge(&mut self, dag: &Dag<SpaceEntry>, dirty: Vec<EntryId>) -> Vec<EntryId> {
+        if dirty.is_empty() {
+            return Vec::new();
+        }
+        let mut todo: HashSet<EntryId> = dirty.into_iter().collect();
+        // If the genesis starts or stops being valid, so does everything.
+        let root = self.root_now();
+        let all = root != self.root;
+        self.root = root;
+        let order = dag.log_order();
+        let start = if all {
+            0
+        } else {
+            let at = todo.iter().filter_map(|x| dag.position(x)).min();
+            at.unwrap_or(order.len())
+        };
+        // The marks of entries that changed in what others rest on: an
+        // addition that became valid or stopped being, a naming that came
+        // to count or stopped. Log order puts them before what descends
+        // from them.
+        let mut moved = Bits::default();
+        let mut changed = Vec::new();
+        let mut members = all;
+        for z in &order[start..] {
+            // an entry the graph released with this one, and not judged
+            // yet, is judged when its turn comes
+            let Some(past) = self.info.get(z).map(|i| &i.past) else {
+                continue;
+            };
+            let hit = todo.remove(z) || all || (!moved.is_empty() && past.intersects(&moved));
+            if !hit {
+                if todo.is_empty() && moved.is_empty() {
+                    break;
+                }
+                continue;
+            }
+            let named = self.named_now(dag, z);
+            let valid = self.valid_now(dag, z);
+            let i = self.info.get_mut(z).expect("entries judged are known");
+            let (was_valid, was_named) = (i.valid, i.named);
+            i.valid = valid;
+            i.named = named;
+            if valid != was_valid {
+                changed.push(*z);
+                if valid {
+                    self.validity.valid.insert(*z);
+                } else {
+                    self.validity.valid.remove(z);
+                }
+            }
+            if let (Some(m), Some(marked)) = (i.mark, i.marked.as_deref()) {
+                let adds = !marked.adds.is_empty() && valid != was_valid;
+                let names = !marked.names.is_empty() && named != was_named;
+                if adds || names {
+                    moved.set(m);
+                }
+                members |= adds;
+            }
+        }
+        if members {
+            self.refresh_members();
+        }
+        changed
+    }
+
+    fn refresh_members(&mut self) {
+        let mut members: BTreeSet<Member> = BTreeSet::new();
+        if let Some(g) = self.genesis.as_ref().filter(|_| self.root) {
+            for (identity, role) in &g.adds {
+                members.insert(Member {
+                    identity: *identity,
+                    role: *role,
+                });
+            }
+            for (identity, adds) in &self.adds_of {
+                for (m, role) in adds {
+                    if self.info[&self.marks[*m as usize]].valid {
+                        members.insert(Member {
+                            identity: *identity,
+                            role: *role,
+                        });
+                    }
+                }
+            }
+        }
+        self.validity.members = members.into_iter().collect();
+    }
+
+    // ---------------------------------------------------------- results
+
+    /// Whether the space had ended in the causal past of the entry `id`: it
+    /// descends from the namings of one successor by everyone who must name
+    /// it (`closed` in the rules).
+    pub fn is_closed(&self, dag: &Dag<SpaceEntry>, id: &EntryId) -> bool {
+        let past = self.info.get(id).map(|i| &i.past);
+        past.is_some_and(|past| self.closed_in(dag, past))
+    }
+
+    /// Whether an entry with these parents would be written into a space
+    /// that has ended.
+    pub fn closes(&self, dag: &Dag<SpaceEntry>, parents: &[EntryId]) -> bool {
+        if self.succeeds.is_empty() || parents.iter().any(|p| !self.info.contains_key(p)) {
+            return false;
+        }
+        self.closed_in(dag, &self.past_of(parents))
+    }
+
+    /// The successors named, in valid entries, by everyone who must name
+    /// one (`candidate` in the rules).
+    pub fn candidates(&self, dag: &Dag<SpaceEntry>) -> BTreeSet<SpaceId> {
+        let Some(g) = &self.genesis else {
+            return BTreeSet::new();
+        };
+        let mut said: HashMap<SpaceId, HashSet<IdentityId>> = HashMap::new();
+        for m in &self.succeeds {
+            let y = &self.marks[*m as usize];
+            let who = dag
+                .get(y)
+                .expect("marked entries are in the graph")
+                .author();
+            if !self.info[y].valid || !g.deciders.contains(&who) {
+                continue;
+            }
+            for s in self.marked(y).map_or(&[][..], |m| m.names.as_slice()) {
+                said.entry(*s).or_default().insert(who);
+            }
+        }
+        let enough = |who: &HashSet<IdentityId>| who.len() >= g.deciders.len();
+        let named = said.into_iter().filter(|(_, who)| enough(who));
+        named.map(|(s, _)| s).collect()
+    }
+
+    /// The successor that stands: of those named, the one with the smallest
+    /// id, compared as bytes.
+    pub fn successor(&self, dag: &Dag<SpaceEntry>) -> Option<SpaceId> {
+        self.candidates(dag).into_iter().next()
+    }
+
+    /// Whether `who` has left: it has a valid `leave` that no valid
+    /// `add_member` of it descends from (`spaces.md#members-and-roles`).
+    /// This is the member's statement, and changes nothing about what is
+    /// valid.
+    pub fn has_left(&self, dag: &Dag<SpaceEntry>, who: &IdentityId) -> bool {
+        let leaves = self.leaves.get(who).map_or(&[][..], |v| v.as_slice());
+        let adds = self.adds_of.get(who).map_or(&[][..], |v| v.as_slice());
+        leaves.iter().any(|l| {
+            self.info[l].valid
+                && !adds.iter().any(|(m, _)| {
+                    let add = &self.marks[*m as usize];
+                    self.info[add].valid && dag.is_ancestor(l, add)
+                })
+        })
+    }
+
+    /// Whether `key` wrote something that would stop counting if the key
+    /// were removed now: an entry whose signature counts, that no entry of
+    /// the same author signed with another key descends from. What ends or
+    /// begins a space is left out: building on it keeps nothing.
+    pub fn unwitnessed_work(&self, dag: &Dag<SpaceEntry>, key: &KeyId) -> bool {
+        let signer = |x: &EntryId| self.key_of(dag, x);
+        let mut built_on = Vec::new();
+        let mut theirs = Vec::new();
+        for entries in self.by_author.values() {
+            let counts = entries.iter().filter(|x| self.info[*x].ok);
+            let (by_key, by_others): (Vec<&EntryId>, Vec<&EntryId>) =
+                counts.partition(|x| signer(x) == Some(*key));
+            if by_key.is_empty() {
+                continue;
+            }
+            for w in by_others {
+                built_on.extend_from_slice(dag.parents(w));
+            }
+            theirs.extend(by_key.into_iter().filter(|x| !self.info[*x].structural));
+        }
+        if theirs.is_empty() {
+            return false;
+        }
+        let witnessed = dag.ancestors_of(&built_on);
+        theirs.iter().any(|x| !witnessed.contains(*x))
+    }
+}
+
+// ------------------------------------------------------- the rules, run
+
+/// What the normative `space` program finds.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ByRules {
+    /// `valid`.
+    pub valid: HashSet<EntryId>,
+    /// `author_ok`.
+    pub author_ok: HashSet<EntryId>,
+    /// `member`, sorted.
+    pub members: Vec<Member>,
+    /// `closed`.
+    pub closed: HashSet<EntryId>,
+    /// `candidate`.
+    pub candidates: BTreeSet<SpaceId>,
+    /// `successor`.
+    pub successor: Option<SpaceId>,
+}
+
+/// Evaluates a space with the normative `space` program, given the identity
+/// logs of its authors (and any logs their guardians' confirmations need).
+/// The cost is quadratic in the number of entries: this is the reference
+/// the native evaluation is tested against, not something to run on a
+/// space of any size.
+pub fn by_rules(dag: &Dag<SpaceEntry>, logs: &[&IdentityLog]) -> Result<ByRules, Error> {
+    by_rules_as(dag, logs, &|_, e| e.signer())
+}
+
+/// [`by_rules`], with each entry read as signed by the key `signer` gives:
+/// for a history in which an entry is held under more than one signature
+/// ([`Judge::key_of`]).
+pub fn by_rules_as(
+    dag: &Dag<SpaceEntry>,
+    logs: &[&IdentityLog],
+    signer: &dyn Fn(&EntryId, &SpaceEntry) -> KeyId,
+) -> Result<ByRules, Error> {
+    let g = dag.log_order().first().and_then(|g| dag.get(g));
+    let g = g.ok_or(Error::Malformed("no genesis"))?;
+    let space = g.id();
+    // a genesis with no `start` names no profile, and starts nothing
+    let mut reach = g.profile().map(ReachNodes::new).unwrap_or_default();
+    let mut w = model_world(logs);
+    let sym = |w: &mut model::World, b: &[u8]| w.sym(&hex_encode(b));
+    let space_sym = sym(&mut w, &space);
+    for (id, e) in dag.iter() {
+        let mut ops = Vec::new();
+        for o in e.ops() {
+            ops.push(match (reach.class(dag, id, e, o.body()), o.body()) {
+                (_, SpaceOpBody::Start { succession, .. }) => Op::Start {
+                    succeeds: succession.succeeds.as_ref().map(|x| sym(&mut w, x)),
+                },
+                (_, SpaceOpBody::AddMember { identity, role, .. }) => Op::AddMember {
+                    member: sym(&mut w, identity),
+                    role: (*role).min(i64::MAX as u64) as i64,
+                },
+                (_, SpaceOpBody::Keep { key, entries }) => Op::Keep {
+                    key: sym(&mut w, key),
+                    entries: entries.iter().map(|x| sym(&mut w, x)).collect(),
+                },
+                (_, SpaceOpBody::Succeed { successor, .. }) => Op::Succeed {
+                    successor: sym(&mut w, successor),
+                },
+                (Class::Leave, _) => Op::Leave,
+                (Class::OwnerOnly, _) => Op::OwnerOnly,
+                (Class::Reach, _) => Op::Reach,
+                (Class::Invalid, _) => Op::Invalid,
+                _ => Op::App,
+            });
+        }
+        reach.note(id, e);
+        let entry = model::Entry {
+            id: sym(&mut w, id),
+            log: space_sym,
+            parents: e.parents().iter().map(|p| sym(&mut w, p)).collect(),
+            signer: sym(&mut w, &signer(id, e)),
+            ops,
+            author: Some(sym(&mut w, &e.author())),
+            head: Some(sym(&mut w, &e.author_head())),
+        };
+        w.put(entry)
+            .map_err(|_| Error::Malformed("space entries out of order"))?;
+    }
+    let ids = w.log_ids(space_sym);
+    let r = model::evaluate_space(&w, space_sym, &ids);
+    let id32 = |s: u32| -> [u8; 32] { hex_decode(w.name(s)).try_into().unwrap_or([0; 32]) };
+    let unary = |name: &str| r.unary(name).into_iter().map(id32);
+    let mut members = Vec::new();
+    for t in r.rel("member") {
+        if let [Val::Sym(m), Val::Int(role)] = t {
+            members.push(Member {
+                identity: id32(*m),
+                role: *role as u64,
+            });
+        }
+    }
+    members.sort();
+    Ok(ByRules {
+        valid: unary("valid").collect(),
+        author_ok: unary("author_ok").collect(),
+        members,
+        closed: unary("closed").collect(),
+        candidates: unary("candidate").collect(),
+        successor: unary("successor").next(),
+    })
+}

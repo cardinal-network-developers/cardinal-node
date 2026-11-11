@@ -1,7 +1,7 @@
 //! Groups (`profiles.md#group`): Ana makes one with Bo and Cy, who know her
 //! but not each other. Each is offered it through the relationship they have
 //! with her, joins, and reads what the others write, Bo and Cy through Ana,
-//! who passes it on. Cy, taken out, reads nothing written after.
+//! who passes it on. Nobody is taken out of it in place.
 
 mod common;
 
@@ -156,30 +156,39 @@ fn a_group_is_offered_joined_and_read_by_all() {
     names.sort_unstable();
     assert_eq!(names, ["Ana", "Bo", "You"], "{members}");
 
-    // Only an admin takes people out, and then the rest get a new key.
+    // Nobody is taken out of a group in place. That is its owner replacing
+    // it with one that leaves them out, which this version cannot do yet: so
+    // the command says so, to anyone and to the owner, and changes nothing.
     let no = reply(
         &bo,
         &json!({"cmd": "group-remove", "group": g, "who": "Ana"}),
     );
     assert_eq!(no["ok"], false, "{no}");
-    ask(
-        &ana,
-        json!({"cmd": "group-remove", "group": g, "who": "Cy"}),
-    );
-    wait("bo sees cy gone", 30, || {
-        let m = ask(&bo, json!({"cmd": "group-members", "group": g}));
-        m["members"].as_array().unwrap().len() == 2
-    });
-    ask(&bo, json!({"cmd": "say", "group": g, "text": "after cy"}));
-    wait("ana reads it", 30, || {
-        said(&ana, &g).contains(&"Bo: after cy".to_owned())
-    });
-    std::thread::sleep(std::time::Duration::from_secs(3));
     assert!(
-        !said(&cy, &g).iter().any(|m| m.contains("after cy")),
-        "cy read what came after: {:?}",
-        said(&cy, &g)
+        no["error"].as_str().unwrap().contains("only the owner"),
+        "{no}"
     );
+    let no = reply(
+        &ana,
+        &json!({"cmd": "group-remove", "group": g, "who": "Cy"}),
+    );
+    assert_eq!(no["ok"], false, "{no}");
+    let why = no["error"].as_str().unwrap();
+    assert!(
+        why.contains("cannot be taken out") && why.contains("Cy"),
+        "{no}"
+    );
+    ask(
+        &bo,
+        json!({"cmd": "say", "group": g, "text": "still all of us"}),
+    );
+    for d in [&ana, &cy] {
+        wait("everyone still reads it", 30, || {
+            said(d, &g).contains(&"Bo: still all of us".to_owned())
+        });
+        let m = ask(d, json!({"cmd": "group-members", "group": g}));
+        assert_eq!(m["members"].as_array().unwrap().len(), 3, "{m}");
+    }
 }
 
 #[test]

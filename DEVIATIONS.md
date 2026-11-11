@@ -7,37 +7,45 @@ should eventually be resolved by changing either the code or the spec.
 
 ## Behind the specification: a space only grows
 
-`../core` changed on its branch `grow-only-spaces` (decisions D56 to D58),
-and this implementation is catching up. The rules it runs are the current
-ones: `crates/identity/rules/rules.md` is the current program, and
-`model.rs` derives its input facts as the current `world.py` does. What
-still differs:
+`../core` changed on its branch `grow-only-spaces` (decisions D56 to D58).
+This implementation follows it as far as one space goes: the rules, the
+formats, who is a member, and which entries are valid, judged natively one
+entry at a time ([Spaces](#spaces-specspacesmd), below). It does not yet
+follow it across two spaces. What still differs:
 
-- **A space only grows.** The specification has no removal and no lowering
-  in place. This implementation still writes and judges `remove_member`
-  (op 4, which is now `leave`, a statement with no fields), still names a
-  membership in every entry (field 9, now reserved), and still judges
-  entries concurrent with the end of a membership.
-- **One owner, or none.** A relationship's genesis here names both people as
-  owners (`crates/space/src/relationship.rs`). The specification names both
-  as writers and no owner, and the invitee is to check exactly that.
-- **Formats.** The space crate still writes what the old rules judged: a
-  genesis that does not name its own author, and entries that name a
-  membership. The current program finds such a genesis badly formed, so
-  nothing in a space written here is valid until the space crate catches
-  up.
-- **Frozen authors.** The native evaluation of a space whose only member is
-  its creator still voids everything a frozen author wrote. The
-  specification now judges a frozen author's entries like anyone's, and so
-  does the program.
-- **Succession.** The daemon has never written or followed one. Removing
-  someone from a group is now a succession, so `group-remove` has no
-  conforming implementation: following a successor, the state at the cut,
-  posting work again, `beside` on `set` and `delete`, and `was` on `create`
-  are all unbuilt.
-- **Cost.** A space with more than one member still takes the full program
-  after every entry ([Spaces](#spaces-specspacesmd), below). Under the
-  current rules every entry can be judged once.
+- **No migration.** The formats changed and nothing converts what was
+  written before: a genesis now names its own author with `add_member`, an
+  entry no longer names a membership, and op 4 is `leave`. A space written
+  by 0.1.13 or earlier has a genesis the rules find badly formed, so nothing
+  in it is valid here, and a relationship made then names two owners, which
+  no space may have. Such a data directory has to be set up again.
+- **Succession.** Nothing here writes a `succeed`, makes a successor, or
+  follows one. What one space's validity needs of it is built: a `succeed`
+  that counts closes what descends from it, a space with no owner ends when
+  every member has named the same successor, the successor that stands is
+  the smallest named, and a `succeed` or a successor's genesis by a removed
+  key counts only if a `keep` lists it. The rest is not: the state at the
+  cut, the initial state of a successor, following or showing a successor
+  as an offer, posting work again, the trail, `keep` for a succession made
+  by a device that is then retired or lost, the space node's field 4 in the
+  account space, and tokens and storage labels that serve a successor. The
+  fields that exist for it are read, written and kept, and mean nothing yet:
+  fields 3, 4 and 6 to 9 of `start`, fields 2 and 3 of `succeed`, `was` on
+  `create`, and ranks and creation times in the canonical state (fields 10
+  and 11, which are not written). A device that receives a `succeed` that
+  ends a space stops writing in it, says nothing to its person, and goes
+  nowhere.
+- **Taking someone out of a group** is a succession, so `group-remove` fails
+  with a message saying that it cannot be done yet, and changes nothing.
+  Lowering an admin is the same.
+- **A member who can no longer be trusted.** A frozen identity's entries are
+  judged like anyone's, devices open no session with it, and it is left out
+  of the next epoch this device starts. Nothing offers the owner a
+  succession without it, and nothing shows the members it added.
+- **A conversation shows its messages in log order.** `profiles.md` now has
+  a device show messages in the order they became valid on it, so that one
+  written with old parents appears when it arrives and not among what was
+  already read. `relationship::messages` still sorts by log order.
 
 ## Encoding (`spec/encoding.md`)
 
@@ -262,14 +270,15 @@ still differs:
   matters less the longer the fetch.
 ## Identity (`spec/identity.md`, `model/rules.md`, `model/world.py`)
 
-- **Validity is the model, executed.** `cardinal-identity` embeds a port of
-  `model/datalog.py` (parser, stratification check, naive bottom-up
-  evaluator) and runs the `identity` and `space` programs of a vendored,
+- **An identity log's validity is the model, executed.** `cardinal-identity`
+  embeds a port of `model/datalog.py` (parser, stratification check, naive
+  bottom-up evaluator) and runs the `identity` program of a vendored,
   byte-identical copy of `model/rules.md` (`crates/identity/rules/rules.md`,
   checked by a unit test against `../core`). Input facts are derived by a
   line-by-line port of `world.py` (`model.rs`). A differential test runs
   `model/scenarios.py` and fuzzer histories through both Python and Rust
-  and compares every reported relation.
+  and compares every reported relation, for the `space` program as well,
+  which nothing but tests runs ([Spaces](#spaces-specspacesmd)).
 - **Model gaps: ops the model does not name.** `world.py`'s `ALLOWED` has
   no `wrap` or `endorse`. Chose: `wrap` may be signed by admin and root keys
   (as the op table says) and has no effect on the rules; `endorse` may be
@@ -313,20 +322,72 @@ still differs:
 
 ## Spaces (`spec/spaces.md`)
 
-- **Spec ambiguity: the genesis entry's membership.** Field 9 is absent in
-  genesis, but the `space` rules need `mem(G, I)` for the genesis to be
-  valid (`world.py` gives the genesis its own membership). Chose: the
-  genesis entry is written under the membership its `start` op creates.
-- **Model mapping of space ops.** `rotate` and every profile op (32 and up)
-  count as `app` (writers and up); `set_policy` and `set_protocol` are
-  owner-only; unknown control ops are allowed to no role. Reach nodes are
-  not distinguished yet (they would be `reach`).
-- **Membership evaluation.** Spaces whose only member identity is their
-  creator are evaluated natively (linear, incremental); a property test
-  checks this agrees with the `space` program. Any `add_member`, or an
-  entry by another identity, makes native evaluation return
-  `Error::Unsupported`; `Space::evaluate_full` runs the normative program,
-  whose graph facts are quadratic in the number of entries.
+- **Validity is judged natively, one entry at a time** (`validity.rs`).
+  Each entry is judged when it and its ancestors are all here, from what is
+  kept about its causal past, and again only when a signature it rests on
+  starts or stops counting: an identity log that changes which keys count,
+  a witness, a `keep`. The normative `space` program is run only by tests:
+  property tests compare everything it reports with the native result, on
+  random histories of several people with thieves, strangers and removed
+  devices, in the order written, in random orders with comparisons on the
+  way, and with identity logs arriving late and changing under entries
+  already judged. Sixteen flaws put into the native evaluation one at a
+  time were each caught.
+- **Spec gap: an entry's id does not cover its signature.** A signed
+  object's id is the hash of its body (`encoding.md#signed-objects`), so
+  anyone who holds a key can sign someone's entry again: the same entry id,
+  another signing key, another sealed entry with another sealed id. The
+  rules read one signing key for an entry (`skey`) and nothing says which
+  when a device holds two, so the answer would depend on which arrived
+  first, and a member could void anyone's entry on a device by getting
+  there first with a copy under a key that does not count. Chose: every
+  signed form is kept, and the entry is judged by one key chosen from all
+  of them: one in effect at the cited head of the author's log before one
+  that is not, then one not removed since before one that was, then the
+  smallest, compared as bytes (`Judge::key_of`). So a stranger's signature
+  never displaces the author's, and every device chooses the same. The
+  same gap is open in identity logs, where the first signed form to arrive
+  still stands. The specification could put the signing key in the body, as
+  the body already names the author.
+- **Spec ambiguity: which ops are a reader's "own reach node".** The roles
+  table lets a reader "write its own reach node", and the rules have an op
+  `reach` that any role may write, but nothing says how to tell that op
+  from other application ops without the state, which is computed from
+  validity. Chose, from the entries alone: a `create` of the profile's
+  reach kind, or a `set` on a node that such a `create` made in an entry of
+  the same author in the causal past. A reader's `delete`, `move` or
+  `restore` of its reach node is an application op, and invalid.
+- **Spec gap: the reach kind outside relationships and groups.** "Every
+  profile except account may contain one reach node per member", but only
+  the relationship table gives the kind a number (9). Chose: files, public
+  and application profiles have no reach kind, so a reader there writes
+  only `keep`, `leave` and entries with no ops.
+- **Spec ambiguity: "reserved".** Entry field 9 and control op 3 are
+  reserved, and nothing says what a device does on meeting one. Chose:
+  field 9 is a field this implementation does not know, accepted, ignored
+  and kept; op 3 is a control op it does not define, which no role may
+  perform, so an entry holding one is invalid.
+- **Spec ambiguity: a `leave` with fields.** `leave` has none. Chose: one
+  that carries any is still a `leave`, and they are kept like any unknown
+  field. (What 0.1.13 wrote as `remove_member` reads this way.)
+- **Model mapping of space ops.** `rotate` and every profile op (32 and up,
+  known or not) but the author's own reach node count as `app` (writers and
+  up); `set_policy` and `set_protocol` are the owner's alone, in a genesis
+  too; control ops this implementation does not define, extension ops, and
+  malformed ops are allowed to no role. An `add_member` outside a genesis
+  with a role above admin is allowed to no role, whether it names an owner
+  or a role there is not (`rules.md` says so only of an owner; `world.py`
+  of both).
+- **Spec ambiguity: writing into a space that has ended.** "Software writes
+  nothing more in it", yet a `keep` for a `succeed` is written with the
+  `succeed` as its parent. Chose: `Space::write` refuses, once the valid
+  heads descend from the end, anything but an entry of `keep` ops only. In
+  a space with no owner that is once the heads together hold every
+  member's naming of one successor, though no single head does.
+- **Parents are the valid heads.** A new entry's parents are each valid
+  entry that no other valid entry descends from, kept as entries arrive; an
+  entry held to be invalid is never one. With nothing valid to build on,
+  which is a space whose genesis does not count yet, nothing is written.
 - **Wraps hash.** `BLAKE3` of the encoding of the list value of sealed
   records, exactly as carried in sealed-entry field 4.
 - **Unknown fields of a sealed entry** (beyond 0–5) are preserved but not
@@ -334,6 +395,8 @@ still differs:
   specified.
 - **The cited author log head** written by this implementation is the last
   entry in log order at which the signing key is in effect.
+- **Not applied: `set_policy` and `set_protocol`.** They are judged, and the
+  policy a space runs under is still the one its genesis gave it.
 
 ## State (`spec/state.md`, `spec/profiles.md`)
 
@@ -359,13 +422,20 @@ still differs:
 - **File content and conflict copies.** The version "last in log order" is
   the value whose writing entry is last in log order; same-name siblings
   are ordered by the log position of their creating entry.
-- **Cost of state updates.** An entry that descends from every applied
-  entry is applied incrementally. Anything else (an entry concurrent with
-  applied ones, a control op other than `rotate`, an author's identity log
-  changing) recomputes validity and state from scratch: O(n log n) plus
-  O(n) per `delete`, since each delete replays positions in its causal past
-  and scans concurrent entries. `state.md#cost` asks for recomputation
-  "only for the nodes it touches"; that is not done yet.
+- **Cost of state updates.** A valid entry that descends from every valid
+  entry is applied incrementally, and one that is not valid changes nothing.
+  A valid entry concurrent with one already applied, and any change in
+  which entries are valid, recomputes the state from scratch: O(n log n)
+  plus O(n) per `delete`, since each delete replays positions in its causal
+  past and scans concurrent entries. `state.md#cost` asks for recomputation
+  "only for the nodes it touches"; that is not done yet. Validity itself is
+  not recomputed ([Spaces](#spaces-specspacesmd)).
+- **Written beside.** A `set` written beside adds its value and supersedes
+  none; a `delete` written beside deletes nothing and flags the node delete
+  conflict. Nothing here writes either: they belong to posting work again
+  after a succession. **Spec ambiguity:** a `delete` written beside a node
+  that another delete has already deleted. Chose: it flags nothing, since
+  the flag says a node stayed that someone meant to delete.
 ## Link (`spec/link.md`)
 
 Deviations:
@@ -807,9 +877,8 @@ asks for around that is not built yet.
   makes messages, reactions and read markers author-owned, but not the
   conversation node, so a contact can delete or move it, which hides every
   message until it is restored.
-- **Groups are made with owner and writers only.** Nothing makes anyone an
-  admin or a reader, so the warning `spaces.md` asks for when lowering an
-  admin discards members has nothing to warn of yet. A group is offered only
+- **Groups are made with an owner and writers only.** Nothing makes anyone
+  an admin or a reader. A group is offered only
   to the creator's or an admin's contacts, since the offer goes in a
   relationship space. Software does not warn when a refused identity is
   added to a group with this person (`contact.md#who-a-person-knows`), and
@@ -866,10 +935,15 @@ asks for around that is not built yet.
   from the owner's other devices free nothing and retention does. Nothing asks
   a host for envelopes yet except itself, which lets go of them one by one.
 - **A new epoch notices only this identity's key changes.** It is wrapped for
-  every member, but a change of another member's encryption key does not make
-  one due here, which `spaces.md#when-to-rotate` asks for.
-- **Every change to a shared space re-evaluates all of it**, which is quadratic
-  in its entries, so a very long conversation will get slow.
+  every member who has not left and is not known to be frozen, but a change
+  of another member's encryption key does not make one due here, and nor
+  does learning that a member is frozen, both of which
+  `spaces.md#when-to-rotate` asks for. **Spec gap:** nothing in the entries
+  says whom an epoch was wrapped for, since wraps name no recipients, so a
+  device cannot tell from what it holds whether the current epoch already
+  leaves out a member it knows to be frozen, or reaches a member's new key;
+  it would have to remember what it knew when, which another of its
+  person's devices does not share.
 
 ## Hosts (`spec/hosts.md`)
 

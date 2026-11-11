@@ -1,12 +1,12 @@
-//! Spaces, membership, epochs, and the shared state tree
+//! Spaces, members, epochs, and the shared state tree
 //! (`spec/spaces.md`, `spec/state.md`, `spec/profiles.md`).
 //!
 //! - [`entry`]: space entries (kind 4), their ops, and sealed entries
 //!   (kind 3): deterministic nonce, AAD binding, wraps hash.
 //! - [`epoch`]: epoch keys, ids, entry keys, and wraps.
-//! - [`membership`]: validity and membership — natively for spaces whose
-//!   only member is their creator, and with the normative rules for any
-//!   space.
+//! - [`validity`]: which entries are valid and who is a member. Every space
+//!   is judged natively, each entry once as it arrives; the normative rules
+//!   are run only to test that against.
 //! - [`state`]: the state tree CRDT and the canonical state.
 //! - [`space`]: a space as a device holds it, kept up to date as entries
 //!   arrive.
@@ -19,10 +19,10 @@ mod error;
 pub mod files;
 pub mod grant;
 pub mod group;
-pub mod membership;
 pub mod relationship;
 pub mod space;
 pub mod state;
+pub mod validity;
 
 pub use entry::{
     NodeId, NodeKind, Policy, Profile, SealedEntry, SpaceEntry, SpaceEntryBuilder, SpaceId,
@@ -31,6 +31,6 @@ pub use entry::{
 pub use epoch::{EpochId, EpochKey, Keyring};
 pub use error::Error;
 pub use files::Files;
-pub use membership::{Membership, Validity};
 pub use space::Space;
 pub use state::{Node, State, ROOT};
+pub use validity::{Judge, Member, Validity};

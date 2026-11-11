@@ -171,7 +171,7 @@ pub fn named_nodes(op: &SpaceOpBody) -> Vec<NodeId> {
     match op {
         SpaceOpBody::Create { parent, .. } => vec![*parent],
         SpaceOpBody::Set { node, .. }
-        | SpaceOpBody::Delete { node }
+        | SpaceOpBody::Delete { node, .. }
         | SpaceOpBody::Restore { node } => vec![*node],
         SpaceOpBody::Move { node, parent, .. } => vec![*node, *parent],
         _ => Vec::new(),
@@ -304,7 +304,11 @@ impl State {
             for x in accepted {
                 let e = dag.get(x).expect("entry");
                 for (i, op) in e.ops().iter().enumerate() {
-                    if let SpaceOpBody::Delete { node } = op.body() {
+                    if let SpaceOpBody::Delete {
+                        node,
+                        beside: false,
+                    } = op.body()
+                    {
                         effects.insert((*x, i as u32), st.delete_effect(dag, accepted, x, node));
                     }
                 }
@@ -361,7 +365,11 @@ impl State {
         // its deletes see the state of its causal past: everything so far
         let mut effects: HashMap<u32, DeleteEffect> = HashMap::new();
         for (i, op) in e.ops().iter().enumerate() {
-            if let SpaceOpBody::Delete { node } = op.body() {
+            if let SpaceOpBody::Delete {
+                node,
+                beside: false,
+            } = op.body()
+            {
                 effects.insert(
                     i as u32,
                     DeleteEffect {
@@ -434,7 +442,9 @@ impl State {
                     );
                     ok
                 }
-                SpaceOpBody::Set { node, key, value } => {
+                SpaceOpBody::Set {
+                    node, key, value, ..
+                } => {
                     let field = self
                         .kind_of(node, &local)
                         .and_then(|k| node_field(self.profile, k));
@@ -444,7 +454,7 @@ impl State {
                         && (field != Some(*key)
                             || names_known(value.as_ref(), |n| known(n, &local, &self.registry)))
                 }
-                SpaceOpBody::Delete { node } | SpaceOpBody::Restore { node } => {
+                SpaceOpBody::Delete { node, .. } | SpaceOpBody::Restore { node } => {
                     *node != ROOT
                         && known(node, &local, &self.registry)
                         && owned_ok(node, &local, &self.registry)
@@ -507,7 +517,11 @@ impl State {
                 .iter()
                 .enumerate()
                 .filter_map(|(i, op)| match op.body() {
-                    SpaceOpBody::Delete { node } => Some((i as u32, *node)),
+                    // one written beside deletes nothing
+                    SpaceOpBody::Delete {
+                        node,
+                        beside: false,
+                    } => Some((i as u32, *node)),
                     _ => None,
                 })
                 .collect()
@@ -720,6 +734,7 @@ impl State {
                     parent,
                     name,
                     fields,
+                    ..
                 } => {
                     let nid = derived_id(&id, i as usize);
                     let fields = fields
@@ -753,10 +768,19 @@ impl State {
                         },
                     );
                 }
-                SpaceOpBody::Set { node, key, value } => {
+                SpaceOpBody::Set {
+                    node,
+                    key,
+                    value,
+                    beside,
+                } => {
                     if let Some(n) = self.nodes.get_mut(node) {
                         let vals = n.fields.entry(*key).or_default();
-                        vals.retain(|v| !dag.is_ancestor_or_self(&v.entry, &id));
+                        // one written beside supersedes nothing: its value
+                        // is added, and is superseded like any other
+                        if !*beside {
+                            vals.retain(|v| !dag.is_ancestor_or_self(&v.entry, &id));
+                        }
                         vals.push(FieldValue {
                             entry: id,
                             op: i,
@@ -775,7 +799,17 @@ impl State {
                     n.name = name.clone();
                     n.position_writer = id;
                 }
-                SpaceOpBody::Delete { node } => {
+                SpaceOpBody::Delete { node, beside: true } => {
+                    // deletes nothing, and flags the node as a delete that
+                    // concurrent work had touched does
+                    if let Some(n) = self.nodes.get_mut(node).filter(|n| !n.deleted) {
+                        n.delete_conflict = true;
+                    }
+                }
+                SpaceOpBody::Delete {
+                    node,
+                    beside: false,
+                } => {
                     let eff = effect((id, i));
                     for m in eff.delete {
                         if let Some(n) = self.nodes.get_mut(&m) {
