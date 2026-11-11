@@ -1873,3 +1873,198 @@ pub fn clear_dir(p: &Path) -> std::io::Result<()> {
     }
     std::fs::create_dir_all(p)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::Config;
+    use crate::setup;
+    use cardinal_space::entry::{ADMIN, OWNER, READER, WRITER};
+    use cardinal_space::{group, relationship, Member, Policy};
+
+    /// A person with one device, as `cardinal init` leaves it.
+    struct Person {
+        _dir: tempfile::TempDir,
+        core: Core,
+    }
+
+    impl Person {
+        fn new() -> Person {
+            let dir = tempfile::tempdir().unwrap();
+            let paths = Paths::at(dir.path());
+            let p = setup::prepare(&paths).unwrap();
+            setup::install(&paths, p, &Config::default()).unwrap();
+            let keys = Arc::new(Keys::load_or_create(&paths.device_key()).unwrap());
+            let core = Core::load(&paths, keys).unwrap();
+            Person { _dir: dir, core }
+        }
+
+        fn id(&self) -> [u8; 32] {
+            self.core.identity.as_ref().unwrap().id()
+        }
+
+        fn log(&self) -> Vec<Vec<u8>> {
+            self.core.identity.as_ref().unwrap().all_entries()
+        }
+
+        fn enc(&self) -> HybridPublicKey {
+            let ident = self.core.identity.as_ref().unwrap();
+            ident.enc.first().unwrap().public_key().clone()
+        }
+
+        /// Takes another person's identity log, as an invitation does.
+        fn meets(&mut self, other: &Person) {
+            self.core.ingest_other(other.id(), &other.log()).unwrap();
+        }
+
+        /// A genesis this person writes, of `profile`, naming `members`.
+        fn genesis(&self, profile: Profile, members: &[([u8; 32], u64)], to: &Person) -> Vec<u8> {
+            let ident = self.core.identity.as_ref().unwrap();
+            let mut ops: Vec<SpaceOp> = members
+                .iter()
+                .map(|(who, role)| SpaceOp::add_member(*who, *role))
+                .collect();
+            ops.extend(relationship::genesis_ops(self.id(), to.id()).split_off(2));
+            let (_, sealed) = Space::create_with(
+                profile,
+                Policy::default(),
+                &ident.log,
+                &self.core.keys.device.signing,
+                &[&self.enc(), &to.enc()],
+                ops,
+                Some(now_ms()),
+            )
+            .unwrap();
+            sealed.encode()
+        }
+
+        fn space(&self, id: &SpaceId) -> &Space {
+            self.core.spaces[id].space.as_ref().unwrap()
+        }
+
+        fn says(&mut self, space: &SpaceId, text: &str) -> Vec<u8> {
+            let c = relationship::conversation(self.space(space)).unwrap();
+            let op = relationship::create_message(c, text);
+            self.core.write_entry(space, vec![op]).unwrap().1
+        }
+
+        fn said(&self, space: &SpaceId) -> Vec<String> {
+            let all = relationship::messages(self.space(space));
+            all.into_iter().map(|m| m.text).collect()
+        }
+    }
+
+    #[test]
+    fn a_relationship_names_both_as_writers_and_no_owner() {
+        let (mut ana, mut bo) = (Person::new(), Person::new());
+        ana.meets(&bo);
+        bo.meets(&ana);
+        let (id, genesis) = ana.core.create_relationship(&bo.id()).unwrap();
+        assert_eq!(
+            bo.core.accept_relationship(&genesis, &ana.id()).unwrap(),
+            id
+        );
+        let mut the_two = [ana.id(), bo.id()].map(|identity| Member {
+            identity,
+            role: WRITER,
+        });
+        the_two.sort();
+        for p in [&ana, &bo] {
+            let sp = p.space(&id);
+            assert_eq!(sp.profile(), Profile::RELATIONSHIP);
+            assert_eq!(sp.owner(), None);
+            assert_eq!(sp.members(), the_two);
+        }
+        // What each writes counts for the other, judged as it arrives.
+        let hello = ana.says(&id, "hello");
+        bo.core.ingest_space(id, &[hello]).unwrap();
+        let back = bo.says(&id, "hello yourself");
+        ana.core.ingest_space(id, &[back]).unwrap();
+        assert_eq!(ana.said(&id), ["hello", "hello yourself"]);
+        assert_eq!(bo.said(&id), ana.said(&id));
+        // Neither can add anyone: there is no admin, and nobody to make one.
+        let stranger = SpaceOp::add_member([7; 32], READER);
+        let (added, sealed) = ana.core.write_entry(&id, vec![stranger]).unwrap();
+        bo.core.ingest_space(id, &[sealed]).unwrap();
+        for p in [&ana, &bo] {
+            assert!(!p.space(&id).validity().is_valid(&added));
+            assert_eq!(p.space(&id).members(), the_two);
+        }
+        // And what was written beside that still reaches both.
+        let more = bo.says(&id, "still here");
+        ana.core.ingest_space(id, &[more]).unwrap();
+        assert_eq!(ana.said(&id).len(), 3);
+        // What a restart loads is what was held.
+        let paths = ana.core.paths().clone();
+        let again = Core::load(&paths, ana.core.keys.clone()).unwrap();
+        let sp = again.spaces[&id].space.as_ref().unwrap();
+        assert_eq!(sp.validity().valid, ana.space(&id).validity().valid);
+        assert_eq!(sp.members(), the_two);
+    }
+
+    #[test]
+    fn the_invitee_keeps_only_a_space_between_the_two_of_them() {
+        let (mut ana, mut bo, mut cy) = (Person::new(), Person::new(), Person::new());
+        ana.meets(&bo);
+        bo.meets(&ana);
+        bo.meets(&cy);
+        cy.meets(&bo);
+        let (a, b, c) = (ana.id(), bo.id(), cy.id());
+        let rel = Profile::RELATIONSHIP;
+        // Anyone can seal a genesis to a public key. Each of these is a
+        // space Ana could make, and none is a relationship with Bo.
+        let not_theirs: [(&str, Vec<u8>); 9] = [
+            (
+                "an owner",
+                ana.genesis(rel, &[(a, OWNER), (b, WRITER)], &bo),
+            ),
+            (
+                "someone else in it",
+                ana.genesis(rel, &[(a, WRITER), (b, WRITER), (c, READER)], &bo),
+            ),
+            (
+                "the invitee only reads",
+                ana.genesis(rel, &[(a, WRITER), (b, READER)], &bo),
+            ),
+            (
+                "the inviter only reads",
+                ana.genesis(rel, &[(a, READER), (b, WRITER)], &bo),
+            ),
+            (
+                "a second role for one of them",
+                ana.genesis(rel, &[(a, WRITER), (b, WRITER), (b, READER)], &bo),
+            ),
+            (
+                "an admin and no owner, which starts nothing",
+                ana.genesis(rel, &[(a, ADMIN), (b, WRITER)], &bo),
+            ),
+            (
+                "the invitee is not in it",
+                ana.genesis(rel, &[(a, WRITER), (c, WRITER)], &bo),
+            ),
+            (
+                "another profile",
+                ana.genesis(group::GROUP, &[(a, WRITER), (b, WRITER)], &bo),
+            ),
+            (
+                "someone else wrote it",
+                cy.genesis(rel, &[(a, WRITER), (b, WRITER)], &bo),
+            ),
+        ];
+        let before = bo.core.spaces.len();
+        for (what, genesis) in &not_theirs {
+            let got = bo.core.accept_relationship(genesis, &a);
+            assert!(got.is_err(), "kept a genesis with {what}");
+            assert_eq!(bo.core.spaces.len(), before, "{what}");
+        }
+        // The one that is, is kept; and once only.
+        let good = ana.genesis(rel, &[(a, WRITER), (b, WRITER)], &bo);
+        let id = bo.core.accept_relationship(&good, &a).unwrap();
+        assert!(bo.core.spaces.contains_key(&id));
+        assert!(bo.core.accept_relationship(&good, &a).is_err());
+        // Cy's own relationship with Bo is not Ana's to offer.
+        let theirs = cy.genesis(rel, &[(c, WRITER), (b, WRITER)], &bo);
+        assert!(bo.core.accept_relationship(&theirs, &a).is_err());
+        assert!(bo.core.accept_relationship(&theirs, &c).is_ok());
+    }
+}
