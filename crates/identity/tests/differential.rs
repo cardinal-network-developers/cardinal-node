@@ -12,9 +12,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::process::Command;
 
 use cardinal_identity::datalog::Val;
-use cardinal_identity::model::{
-    evaluate_identity, evaluate_space, intern_memberships, Entry, MembershipNames, Op, World,
-};
+use cardinal_identity::model::{evaluate_identity, evaluate_space, Entry, Op, World};
 use serde_json::Value as J;
 
 fn sym(w: &mut World, v: &J) -> u32 {
@@ -72,15 +70,20 @@ fn op(w: &mut World, v: &J) -> Op {
             name: sym(w, &a[1]),
             critical: a[2].as_bool().unwrap(),
         },
-        "create" => Op::Create,
+        "start" => Op::Start {
+            succeeds: match a.get(1) {
+                Some(old) if !old.is_null() => Some(sym(w, old)),
+                _ => None,
+            },
+        },
         "add_member" => Op::AddMember {
             member: sym(w, &a[1]),
             role: a[2].as_i64().unwrap(),
         },
-        "remove_member" => Op::RemoveMember {
-            membership: sym(w, &a[1]),
+        "leave" => Op::Leave,
+        "succeed" => Op::Succeed {
+            successor: sym(w, &a[1]),
         },
-        "succeed" => Op::Succeed,
         "keep" => Op::Keep {
             key: sym(w, &a[1]),
             entries: syms(w, &a[2]),
@@ -92,7 +95,7 @@ fn op(w: &mut World, v: &J) -> Op {
 }
 
 fn build(entries: &[J], n: usize) -> World {
-    let mut w = World::new(MembershipNames::Model);
+    let mut w = World::new();
     for e in &entries[..n] {
         let opt = |w: &mut World, k: &str| {
             let v = &e[k];
@@ -111,11 +114,9 @@ fn build(entries: &[J], n: usize) -> World {
                 .collect(),
             author: opt(&mut w, "author"),
             head: opt(&mut w, "head"),
-            membership: opt(&mut w, "membership"),
         };
         w.put(entry).expect("well-formed history");
     }
-    intern_memberships(&mut w);
     w
 }
 
@@ -150,6 +151,8 @@ struct Stats {
     contested: usize,
     stalled: usize,
     valid_tuples: usize,
+    spaces_succeeded: usize,
+    closed_tuples: usize,
 }
 
 fn run(json: &str, stats: &mut Stats) -> Vec<String> {
@@ -223,20 +226,9 @@ fn run(json: &str, stats: &mut Stats) -> Vec<String> {
                 stats.valid_tuples += r.rel("valid").count();
             } else {
                 stats.space_queries += 1;
-                let r = evaluate_space(w, log, &ids, false, None);
+                let r = evaluate_space(w, log, &ids);
                 for (k, v) in expected.as_object().unwrap() {
-                    if k == "kept_frozen" {
-                        let got: BTreeSet<String> = r
-                            .kept_frozen
-                            .iter()
-                            .map(|s| J::from(w.name(*s)).to_string())
-                            .collect();
-                        if got != expected_rel(v) {
-                            diffs.push(format!("kept_frozen: python {v}, rust {got:?}"));
-                        }
-                        continue;
-                    }
-                    let got = rel_json(w, r.rels[k.as_str()].iter().map(|t| &t[..]));
+                    let got = rel_json(w, r.rel(k));
                     let want = expected_rel(v);
                     if got != want {
                         diffs.push(format!(
@@ -247,6 +239,8 @@ fn run(json: &str, stats: &mut Stats) -> Vec<String> {
                     }
                 }
                 stats.valid_tuples += r.unary("valid").len();
+                stats.spaces_succeeded += (r.rel("successor").count() > 0) as usize;
+                stats.closed_tuples += r.rel("closed").count();
             }
             if !diffs.is_empty() {
                 failures.push(format!(

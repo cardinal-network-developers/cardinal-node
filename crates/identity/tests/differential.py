@@ -41,7 +41,7 @@ def main(argv):
             out.append({"id": e.id, "log": e.log, "kind": w._kind[e.log],
                         "parents": list(e.parents), "signer": e.signer,
                         "ops": [tup(op) for op in e.ops], "author": e.author,
-                        "head": e.head, "membership": e.membership})
+                        "head": e.head})
         return out
 
     def rel(s):
@@ -56,9 +56,7 @@ def main(argv):
         return out
 
     def space_json(r):
-        out = {k: rel(v) for k, v in r.items() if k != "kept_frozen"}
-        out["kept_frozen"] = sorted(r["kept_frozen"])
-        return out
+        return {k: rel(v) for k, v in r.items()}
 
     worlds = []
 

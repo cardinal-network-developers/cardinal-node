@@ -23,7 +23,7 @@ use crate::entry::{
     add_key_proof, check_add_key_proof, EntryBuilder, EntryId, IdentityEntry, IdentityOp, KeyId,
     OpBody, Power, Protocol, Wrap,
 };
-use crate::model::{self, hex_decode, hex_encode, MembershipNames, Op, World};
+use crate::model::{self, hex_decode, hex_encode, Op, World};
 use crate::Error;
 
 /// Context prefix of a wrap of the identity encryption key.
@@ -720,9 +720,9 @@ pub fn guardian_commitment(salt: &[u8; 32], guardian: &EntryId) -> [u8; 32] {
     keyed_hash_parts(salt, &[GUARDIAN_COMMITMENT, guardian])
 }
 
-/// The model world of several identity logs, with real membership names,
-/// to which a space's entries can be added for evaluation by the `space`
-/// program. Symbols are the lowercase hex of ids and keys.
+/// The model world of several identity logs, to which a space's entries can
+/// be added for evaluation by the `space` program. Symbols are the lowercase
+/// hex of ids and keys, so symbols compare as the bytes they stand for.
 pub fn model_world(logs: &[&IdentityLog]) -> World {
     Conversion::new(logs).world
 }
@@ -735,7 +735,7 @@ struct Conversion<'a> {
 
 impl<'a> Conversion<'a> {
     fn new(logs: &[&'a IdentityLog]) -> Conversion<'a> {
-        let mut world = World::new(MembershipNames::Real);
+        let mut world = World::new();
         let all: HashMap<EntryId, (&'a IdentityLog, &'a IdentityEntry)> = logs
             .iter()
             .flat_map(|l| l.entries().map(move |e| (e.id(), (*l, e))))
@@ -1063,7 +1063,6 @@ fn convert(
         ops,
         author: None,
         head: None,
-        membership: None,
     }
 }
 

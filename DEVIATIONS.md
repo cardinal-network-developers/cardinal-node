@@ -8,10 +8,10 @@ should eventually be resolved by changing either the code or the spec.
 ## Behind the specification: a space only grows
 
 `../core` changed on its branch `grow-only-spaces` (decisions D56 to D58),
-and this implementation has not caught up. Until it has, it implements
-`spec/spaces.md` and `model/rules.md` as they stood at core `613a47e`.
-Spaces written by it, and by an implementation of the current text, are not
-valid to each other. What differs:
+and this implementation is catching up. The rules it runs are the current
+ones: `crates/identity/rules/rules.md` is the current program, and
+`model.rs` derives its input facts as the current `world.py` does. What
+still differs:
 
 - **A space only grows.** The specification has no removal and no lowering
   in place. This implementation still writes and judges `remove_member`
@@ -21,12 +21,15 @@ valid to each other. What differs:
 - **One owner, or none.** A relationship's genesis here names both people as
   owners (`crates/space/src/relationship.rs`). The specification names both
   as writers and no owner, and the invitee is to check exactly that.
-- **The rules.** `crates/identity/rules/rules.md` is the old program, so the
-  test that it is byte-identical to `../core/model/rules.md` fails against
-  the current core, and `model.rs` derives the old input facts.
-- **Frozen authors.** A frozen author's entries are still kept only as far
-  as others built on them (`kept_frozen`). The specification now judges
-  them like anyone's.
+- **Formats.** The space crate still writes what the old rules judged: a
+  genesis that does not name its own author, and entries that name a
+  membership. The current program finds such a genesis badly formed, so
+  nothing in a space written here is valid until the space crate catches
+  up.
+- **Frozen authors.** The native evaluation of a space whose only member is
+  its creator still voids everything a frozen author wrote. The
+  specification now judges a frozen author's entries like anyone's, and so
+  does the program.
 - **Succession.** The daemon has never written or followed one. Removing
   someone from a group is now a succession, so `group-remove` has no
   conforming implementation: following a successor, the state at the cut,

@@ -15,11 +15,12 @@
 //!   so it suits small spaces and tests. A property test checks that the
 //!   two agree on single-member spaces.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeSet, HashSet};
 
 use cardinal_identity::dag::Dag;
+use cardinal_identity::datalog::Val;
 use cardinal_identity::log::model_world;
-use cardinal_identity::model::{self, hex_decode, hex_encode, intern_memberships, Op};
+use cardinal_identity::model::{self, hex_decode, hex_encode, Op};
 use cardinal_identity::{EntryId, IdentityLog, IdentityState, KeyId};
 
 use crate::entry::{IdentityId, MembershipId, SpaceEntry, SpaceOpBody};
@@ -226,19 +227,22 @@ pub fn evaluate_full(dag: &Dag<SpaceEntry>, logs: &[&IdentityLog]) -> Result<Val
             .ops()
             .iter()
             .map(|o| match o.body() {
-                SpaceOpBody::Start { .. } => Op::Create,
+                SpaceOpBody::Start { succeeds, .. } => Op::Start {
+                    succeeds: succeeds.as_ref().map(|x| sym(&mut w, x)),
+                },
                 SpaceOpBody::AddMember { identity, role } => Op::AddMember {
                     member: sym(&mut w, identity),
                     role: (*role).min(i64::MAX as u64) as i64,
                 },
-                SpaceOpBody::RemoveMember { membership } => Op::RemoveMember {
-                    membership: sym(&mut w, membership),
-                },
+                // op 4 is now `leave`, a statement
+                SpaceOpBody::RemoveMember { .. } => Op::Leave,
                 SpaceOpBody::Keep { key, entries } => Op::Keep {
                     key: sym(&mut w, key),
                     entries: entries.iter().map(|x| sym(&mut w, x)).collect(),
                 },
-                SpaceOpBody::Succeed { .. } => Op::Succeed,
+                SpaceOpBody::Succeed { successor } => Op::Succeed {
+                    successor: sym(&mut w, successor),
+                },
                 SpaceOpBody::SetPolicy { .. } | SpaceOpBody::SetProtocol => Op::OwnerOnly,
                 SpaceOpBody::Unknown { number } if number.is_none_or(|n| n < 32) => Op::Invalid,
                 _ => Op::App,
@@ -252,43 +256,24 @@ pub fn evaluate_full(dag: &Dag<SpaceEntry>, logs: &[&IdentityLog]) -> Result<Val
             ops,
             author: Some(sym(&mut w, &e.author())),
             head: Some(sym(&mut w, &e.author_head())),
-            membership: membership_of(e).map(|m| sym(&mut w, &m)),
         };
         w.put(entry)
             .map_err(|_| Error::Malformed("space entries out of order"))?;
     }
-    intern_memberships(&mut w);
     let ids = w.log_ids(space_sym);
-    let r = model::evaluate_space(&w, space_sym, &ids, false, None);
+    let r = model::evaluate_space(&w, space_sym, &ids);
     let id32 = |s: u32| -> EntryId { hex_decode(w.name(s)).try_into().unwrap_or([0; 32]) };
     let valid = r.unary("valid").into_iter().map(id32).collect();
     let author_ok: HashSet<EntryId> = r.unary("author_ok").into_iter().map(id32).collect();
-    // memberships: created by add_member or start ops
-    let mut created: BTreeMap<MembershipId, (IdentityId, u64)> = BTreeMap::new();
-    for (id, e) in dag.iter() {
-        for (n, o) in e.ops().iter().enumerate() {
-            let m = crate::entry::derived_id(id, n);
-            match o.body() {
-                SpaceOpBody::Start { .. } => {
-                    created.insert(m, (e.author(), 3));
-                }
-                SpaceOpBody::AddMember { identity, role } => {
-                    created.insert(m, (*identity, *role));
-                }
-                _ => {}
-            }
-        }
-    }
-    let by_hex: HashMap<String, MembershipId> =
-        created.keys().map(|m| (hex_encode(m), *m)).collect();
+    // members are identities with the roles valid entries gave them; the
+    // membership id is no longer anything, and goes with the next change
     let mut members = Vec::new();
-    for s in r.unary("member") {
-        if let Some(m) = by_hex.get(w.name(s)) {
-            let (identity, role) = created[m];
+    for t in r.rel("member") {
+        if let [Val::Sym(m), Val::Int(role)] = t {
             members.push(Membership {
-                id: *m,
-                identity,
-                role,
+                id: [0; 16],
+                identity: id32(*m),
+                role: *role as u64,
             });
         }
     }

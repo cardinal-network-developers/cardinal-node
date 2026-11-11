@@ -9,8 +9,9 @@
 //!
 //! Costs: the graph facts (`anc`, `conc`, `later`) are quadratic in the
 //! number of entries of a log, as in the model. That is fine for identity
-//! logs, which are small; spaces with many entries and a single member use
-//! a native evaluation in `cardinal-space` instead.
+//! logs, which are small. Spaces are judged natively in `cardinal-space`,
+//! one entry at a time; the `space` program here is what that evaluation is
+//! tested against.
 
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
@@ -86,22 +87,26 @@ pub enum Op {
     },
     /// A malformed op (not in the model): no power may sign it.
     Invalid,
-    /// Space genesis (`start`); the author becomes an owner.
-    Create,
+    /// `start`: genesis only.
+    Start {
+        /// The space this one succeeds, if it names one.
+        succeeds: Option<Sym>,
+    },
     /// `add_member`.
     AddMember {
         /// The member identity.
         member: Sym,
-        /// Role 0 reader .. 3 owner.
+        /// Role 0 reader, 1 writer, 2 admin; 3 owner, which only a genesis
+        /// gives, and only to its own author.
         role: i64,
     },
-    /// `remove_member` of a membership id.
-    RemoveMember {
-        /// The membership.
-        membership: Sym,
+    /// `leave`: a member's statement; changes no validity.
+    Leave,
+    /// `succeed`, naming the successor space.
+    Succeed {
+        /// The successor.
+        successor: Sym,
     },
-    /// `succeed`.
-    Succeed,
     /// `keep`.
     Keep {
         /// The removed key.
@@ -113,8 +118,8 @@ pub enum Op {
     App,
     /// A member's own reach node; anyone.
     Reach,
-    /// An op only owners may write (`set_policy`, `set_protocol`; not in the
-    /// model).
+    /// An op only the owner may write (`set_policy`, `set_protocol`; not in
+    /// the model).
     OwnerOnly,
 }
 
@@ -137,10 +142,10 @@ impl Op {
                 critical: false, ..
             } => "exti",
             Op::Invalid => "invalid",
-            Op::Create => "create",
+            Op::Start { .. } => "start",
             Op::AddMember { .. } => "add_member",
-            Op::RemoveMember { .. } => "remove_member",
-            Op::Succeed => "succeed",
+            Op::Leave => "leave",
+            Op::Succeed { .. } => "succeed",
             Op::Keep { .. } => "keep",
             Op::App => "app",
             Op::Reach => "reach",
@@ -184,26 +189,17 @@ fn allowed(power: i64, name: &str) -> bool {
     }
 }
 
-/// Which space ops each role may write (`ROLE_OPS`).
+/// Which space ops each role may write (`ROLE_OPS`). `start` is in none of
+/// them: only a genesis holds one, and a genesis is judged by its shape.
 fn role_allows(role: i64, name: &str) -> bool {
     match role {
         3 => matches!(
             name,
-            "create"
-                | "add_member"
-                | "remove_member"
-                | "succeed"
-                | "keep"
-                | "app"
-                | "reach"
-                | "owner"
+            "add_member" | "succeed" | "leave" | "keep" | "app" | "reach" | "owner"
         ),
-        2 => matches!(
-            name,
-            "add_member" | "remove_member" | "keep" | "app" | "reach"
-        ),
-        1 => matches!(name, "remove_member" | "keep" | "app" | "reach"),
-        0 => matches!(name, "remove_member" | "keep" | "reach"),
+        2 => matches!(name, "add_member" | "leave" | "keep" | "app" | "reach"),
+        1 => matches!(name, "leave" | "keep" | "app" | "reach"),
+        0 => matches!(name, "leave" | "keep" | "reach"),
         _ => false,
     }
 }
@@ -225,18 +221,6 @@ pub struct Entry {
     pub author: Option<Sym>,
     /// Spaces only: the cited head of the author's identity log.
     pub head: Option<Sym>,
-    /// Spaces only: the membership the entry is written under.
-    pub membership: Option<Sym>,
-}
-
-/// How memberships are named.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum MembershipNames {
-    /// `"<entry id>#<op index>"`, as in `world.py`.
-    Model,
-    /// The hex of `first16(BLAKE3(entry id || varint(i)))`, where the entry
-    /// id symbol is the hex of the id (spaces.md).
-    Real,
 }
 
 type CacheKey = (Sym, Vec<Sym>, Option<Vec<Sym>>);
@@ -246,7 +230,6 @@ pub struct World {
     symbols: Symbols,
     entries: HashMap<Sym, Entry>,
     order: Vec<Sym>,
-    names: MembershipNames,
     none: Sym,
     cache: RefCell<HashMap<CacheKey, Rc<IdentityResult>>>,
     active: RefCell<Vec<CacheKey>>,
@@ -265,14 +248,13 @@ pub enum WorldError {
 
 impl World {
     /// An empty world.
-    pub fn new(names: MembershipNames) -> World {
+    pub fn new() -> World {
         let mut symbols = Symbols::new();
         let none = symbols.intern("\u{0}None");
         World {
             symbols,
             entries: HashMap::new(),
             order: Vec::new(),
-            names,
             none,
             cache: RefCell::new(HashMap::new()),
             active: RefCell::new(Vec::new()),
@@ -369,18 +351,11 @@ impl World {
         }
         out
     }
+}
 
-    fn membership_id(&self, entry: Sym, index: usize) -> String {
-        match self.names {
-            MembershipNames::Model => format!("{}#{index}", self.name(entry)),
-            MembershipNames::Real => {
-                let id = hex_decode(self.name(entry));
-                let mut h = blake3::Hasher::new();
-                h.update(&id);
-                h.update(&cardinal_encoding::varint(index as u64));
-                hex_encode(&h.finalize().as_bytes()[..16])
-            }
-        }
+impl Default for World {
+    fn default() -> World {
+        World::new()
     }
 }
 
@@ -891,6 +866,69 @@ pub fn evaluate_identity(
 
 // ------------------------------------------------------------------ spaces
 
+/// What a genesis says of its space (`genesis_shape`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GenesisShape {
+    /// The owner it names, if it names exactly its own author as one.
+    pub owner: Option<Sym>,
+    /// The identities it names, sorted by symbol text, each once.
+    pub named: Vec<Sym>,
+    /// Whether it is formed as `spaces.md#members-and-roles` requires.
+    pub ok: bool,
+}
+
+/// The shape of the genesis `e` (`genesis_shape`).
+pub fn genesis_shape(world: &World, e: &Entry) -> GenesisShape {
+    let author = e.author.unwrap_or(world.none);
+    let named: Vec<(Sym, i64)> = e
+        .ops
+        .iter()
+        .filter_map(|op| match op {
+            Op::AddMember { member, role } => Some((*member, *role)),
+            _ => None,
+        })
+        .collect();
+    let owners: BTreeSet<Sym> = named
+        .iter()
+        .filter(|(_, r)| *r == 3)
+        .map(|(m, _)| *m)
+        .collect();
+    let owner = (owners.len() == 1 && owners.contains(&author)).then_some(author);
+    let mine: Vec<i64> = named
+        .iter()
+        .filter(|(m, _)| *m == author)
+        .map(|(_, r)| *r)
+        .collect();
+    let starts = e
+        .ops
+        .iter()
+        .filter(|op| matches!(op, Op::Start { .. }))
+        .count();
+    let ok = starts == 1
+        && !mine.is_empty()
+        && owners.iter().all(|m| *m == author)
+        && named.iter().filter(|(_, r)| *r == 3).count() <= 1
+        && named.iter().all(|(_, r)| (0..=3).contains(r))
+        && (owner.is_some() || named.iter().all(|(_, r)| *r < 2))
+        && {
+            // besides `start` and `add_member`, only what the highest role it
+            // gives its author may perform; never a `succeed`
+            let top = mine.iter().copied().max().expect("its author is named");
+            e.ops.iter().all(|op| {
+                matches!(op, Op::Start { .. } | Op::AddMember { .. })
+                    || (!matches!(op, Op::Succeed { .. }) && role_allows(top, op.name()))
+            })
+        };
+    let mut first: Vec<Sym> = named.iter().map(|(m, _)| *m).collect();
+    first.sort_by(|a, b| world.name(*a).cmp(world.name(*b)));
+    first.dedup();
+    GenesisShape {
+        owner,
+        named: first,
+        ok,
+    }
+}
+
 /// The input facts of the `space` program (`space_facts`), without the
 /// facts from identity logs.
 pub fn space_facts(world: &World, space: Sym, ids: &BTreeSet<Sym>) -> (Facts, BTreeSet<Sym>) {
@@ -905,67 +943,50 @@ pub fn space_facts(world: &World, space: Sym, ids: &BTreeSet<Sym>) -> (Facts, BT
         "author",
         "skey",
         "cites",
-        "mem",
-        "incarnation",
-        "inc_from",
         "adds",
-        "s_rem",
-        "replaces",
-        "s_succeed",
+        "s_names",
         "s_keep",
+        "s_structural",
         "s_badops",
+        "s_badgenesis",
+        "decider",
+        "quorum",
     ] {
         f.declare(k);
     }
-    // membership -> (identity, role, creating entry)
-    let mut role: BTreeMap<Sym, (Sym, i64, Sym)> = BTreeMap::new();
-    let mut mid: HashMap<(Sym, usize), Sym> = HashMap::new();
-    for &x in &own {
-        let e = &world.entries[&x];
-        for (n, op) in e.ops.iter().enumerate() {
-            let m = || {
-                world
-                    .get_sym(&world.membership_id(x, n))
-                    .expect("membership ids are interned")
-            };
-            match op {
-                Op::Create => {
-                    let i = m();
-                    mid.insert((x, n), i);
-                    role.insert(i, (e.author.unwrap_or(world.none), 3, x));
-                }
-                Op::AddMember { member, role: r } => {
-                    let i = m();
-                    mid.insert((x, n), i);
-                    role.insert(i, (*member, *r, x));
-                }
-                _ => {}
-            }
+    let mut owner = None;
+    if own.contains(&space) {
+        let shape = genesis_shape(world, &world.entries[&space]);
+        owner = shape.owner;
+        let deciders: Vec<Sym> = match owner {
+            Some(o) => vec![o],
+            None => shape.named,
+        };
+        for m in &deciders {
+            f.add("decider", &[s(*m)]);
         }
-    }
-    for (&i, &(m, r, x)) in &role {
-        f.add("incarnation", &[s(i), s(m), Val::Int(r)]);
-        f.add("inc_from", &[s(i), s(x)]);
-        f.add("adds", &[s(x), s(i)]);
+        f.add("quorum", &[Val::Int(deciders.len() as i64)]);
+        if !shape.ok {
+            f.add("s_badgenesis", &[s(space)]);
+        }
     }
     for &x in &own {
         let e = &world.entries[&x];
         f.add("author", &[s(x), s(e.author.unwrap_or(world.none))]);
         f.add("skey", &[s(x), s(e.signer)]);
         f.add("cites", &[s(x), s(e.head.unwrap_or(world.none))]);
-        if let Some(m) = e.membership {
-            f.add("mem", &[s(x), s(m)]);
-        }
-        let mut ended = Vec::new();
-        let mut made = Vec::new();
-        for (n, op) in e.ops.iter().enumerate() {
+        for op in &e.ops {
             match op {
-                Op::RemoveMember { membership } => {
-                    f.add("s_rem", &[s(x), s(*membership)]);
-                    ended.push(*membership);
+                Op::AddMember { member, role } => {
+                    f.add("adds", &[s(x), s(*member), Val::Int(*role)])
                 }
-                Op::AddMember { .. } => made.push(mid[&(x, n)]),
-                Op::Succeed => f.add("s_succeed", &[s(x)]),
+                Op::Succeed { successor } => {
+                    f.add("s_names", &[s(x), s(*successor)]);
+                    f.add("s_structural", &[s(x)]);
+                }
+                Op::Start { succeeds: Some(_) } if e.parents.is_empty() => {
+                    f.add("s_structural", &[s(x)]);
+                }
                 Op::Keep { key, entries } => {
                     for t in entries {
                         f.add("s_keep", &[s(x), s(*key), s(*t)]);
@@ -974,35 +995,20 @@ pub fn space_facts(world: &World, space: Sym, ids: &BTreeSet<Sym>) -> (Facts, BT
                 _ => {}
             }
         }
-        for i in &ended {
-            for j in &made {
-                if let (Some(ri), Some(rj)) = (role.get(i), role.get(j)) {
-                    if ri.0 == rj.0 && rj.1 < ri.1 {
-                        f.add("replaces", &[s(x), s(*i), s(*j)]);
-                    }
-                }
-            }
+        if e.parents.is_empty() {
+            continue; // a genesis is judged by its shape
         }
         for r in 0..=3 {
             let mut bad = false;
             for op in &e.ops {
-                if !role_allows(r, op.name()) {
-                    bad = true;
-                } else {
-                    match op {
-                        Op::Create if !e.parents.is_empty() => bad = true,
-                        Op::AddMember { role: q, .. } if !(*q < r || (*q == r && r >= 2)) => {
-                            bad = true
-                        }
-                        Op::RemoveMember { membership } => {
-                            let own_m = Some(*membership) == e.membership;
-                            let tgt = role.get(membership);
-                            if !own_m && tgt.is_none_or(|t| t.1 >= r) {
-                                bad = true;
-                            }
-                        }
-                        _ => {}
-                    }
+                match op {
+                    // the owner's alone; with no owner, every member's
+                    Op::Succeed { .. } => bad = bad || (owner.is_some() && r != 3),
+                    // includes a start outside a genesis
+                    _ if !role_allows(r, op.name()) => bad = true,
+                    // only a genesis names an owner
+                    Op::AddMember { role, .. } if !(0..=2).contains(role) => bad = true,
+                    _ => {}
                 }
             }
             if bad {
@@ -1013,34 +1019,15 @@ pub fn space_facts(world: &World, space: Sym, ids: &BTreeSet<Sym>) -> (Facts, BT
     (f, own)
 }
 
-/// Interns the membership ids of every `create` and `add_member` op, so
-/// that space evaluation can name them.
-pub fn intern_memberships(world: &mut World) {
-    let mut names = Vec::new();
-    for x in world.order.clone() {
-        let e = &world.entries[&x];
-        for (n, op) in e.ops.iter().enumerate() {
-            if matches!(op, Op::Create | Op::AddMember { .. }) {
-                names.push(world.membership_id(x, n));
-            }
-        }
-    }
-    for n in names {
-        world.sym(&n);
-    }
-}
-
 /// The relations a space evaluation reports.
-pub const SPACE_RESULTS: [&str; 9] = [
+pub const SPACE_RESULTS: [&str; 7] = [
     "valid",
     "member",
     "author_ok",
-    "rm2",
-    "rm1",
-    "rm0",
-    "leave",
+    "named",
     "closed",
-    "ended",
+    "candidate",
+    "successor",
 ];
 
 /// The result of evaluating a space.
@@ -1048,18 +1035,18 @@ pub const SPACE_RESULTS: [&str; 9] = [
 pub struct SpaceResult {
     /// Each relation of [`SPACE_RESULTS`].
     pub rels: BTreeMap<&'static str, HashSet<Box<[Val]>>>,
-    /// Entries of frozen authors kept because others built on them.
-    pub kept_frozen: BTreeSet<Sym>,
 }
 
 impl SpaceResult {
+    /// The tuples of a reported relation.
+    pub fn rel(&self, name: &str) -> impl Iterator<Item = &[Val]> {
+        self.rels.get(name).into_iter().flatten().map(|t| &t[..])
+    }
+
     /// The symbols of a unary relation.
     pub fn unary(&self, name: &str) -> BTreeSet<Sym> {
-        self.rels
-            .get(name)
-            .into_iter()
-            .flatten()
-            .filter_map(|t| match &t[..] {
+        self.rel(name)
+            .filter_map(|t| match t {
                 [Val::Sym(x)] => Some(*x),
                 _ => None,
             })
@@ -1069,35 +1056,19 @@ impl SpaceResult {
 
 /// Evaluates space `space` over the closure of `ids` (`evaluate_space`).
 ///
-/// A frozen author's entries count only as far as valid entries by authors
-/// who are not frozen built on them, as judged with no author frozen; so a
-/// space with a frozen author is evaluated twice. With `ignore_frozen`,
-/// every author is treated as not frozen; `kept` fixes the frozen entries
-/// kept. Membership ids must have been interned ([`intern_memberships`]).
-pub fn evaluate_space(
-    world: &World,
-    space: Sym,
-    ids: &BTreeSet<Sym>,
-    ignore_frozen: bool,
-    kept: Option<&BTreeSet<Sym>>,
-) -> SpaceResult {
+/// Whether an author is frozen is not asked: a frozen member's entries are
+/// judged like anyone's.
+pub fn evaluate_space(world: &World, space: Sym, ids: &BTreeSet<Sym>) -> SpaceResult {
     let ids = world.closure(ids.iter().copied());
     let (mut f, own) = space_facts(world, space, &ids);
     let authors: BTreeSet<Sym> = own
         .iter()
         .map(|x| world.entries[x].author.unwrap_or(world.none))
         .collect();
-    for k in [
-        "id_effective_at",
-        "id_removed",
-        "id_removed_at",
-        "id_frozen",
-        "kept_frozen",
-    ] {
+    for k in ["id_effective_at", "id_removed", "id_removed_at"] {
         f.declare(k);
     }
     let everything = world.all();
-    let mut frozen = BTreeSet::new();
     for &a in &authors {
         // the verifier's identity logs: everything it holds about the
         // author, including guardians' confirmations
@@ -1111,44 +1082,9 @@ pub fn evaluate_space(
         for t in r.rel("removed_at") {
             f.add("id_removed_at", &[s(a), t[0], t[1]]);
         }
-        if r.frozen && !ignore_frozen {
-            f.add("id_frozen", &[s(a)]);
-            frozen.insert(a);
-        }
-    }
-    let author_of = |x: &Sym| world.entries[x].author.unwrap_or(world.none);
-    let computed;
-    let kept = match kept {
-        Some(k) => Some(k),
-        None if !frozen.is_empty() => {
-            let nf = evaluate_space(world, space, &ids, true, None);
-            let anc = ancestry(world, &own);
-            let valid_nf: Vec<Sym> = nf
-                .unary("valid")
-                .into_iter()
-                .filter(|x| !frozen.contains(&author_of(x)))
-                .collect();
-            computed = nf
-                .unary("author_ok")
-                .into_iter()
-                .filter(|y| {
-                    frozen.contains(&author_of(y)) && valid_nf.iter().any(|x| anc[x].contains(y))
-                })
-                .collect::<BTreeSet<Sym>>();
-            Some(&computed)
-        }
-        None => None,
-    };
-    let mut kept_frozen = BTreeSet::new();
-    for &y in kept.into_iter().flatten() {
-        if own.contains(&y) {
-            f.add("kept_frozen", &[s(y)]);
-            kept_frozen.insert(y);
-        }
     }
     let rel = evaluate(space_program(), &f, &world.symbols);
     SpaceResult {
         rels: SPACE_RESULTS.iter().map(|&k| (k, rel.set(k))).collect(),
-        kept_frozen,
     }
 }

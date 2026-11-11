@@ -1,10 +1,11 @@
 # Authority rules
 
 Status: draft. **Normative.** These rules define which identity entries and
-which space entries are valid, which keys and memberships are in effect, and
-when an identity is frozen. [identity.md](../spec/identity.md) and
-[spaces.md](../spec/spaces.md) explain them in prose; where the prose and
-these rules disagree, these rules win.
+which space entries are valid, which keys are in effect, who is a member of
+a space, which space succeeds it, and when an identity is frozen.
+[identity.md](../spec/identity.md) and [spaces.md](../spec/spaces.md)
+explain them in prose; where the prose and these rules disagree, these rules
+win.
 
 They are written as a small logic program, so that two properties can be
 checked by machine instead of argued:
@@ -285,6 +286,12 @@ current_key(E) :- sek_ok(E), not newer_key(E).
 
 ## Spaces
 
+A space only grows ([spaces.md](../spec/spaces.md)): members are added and
+roles are given, and nothing in a space takes either away. So these rules
+have no layers by role, and no rule about what was written at the same time
+as something else. The only "not" that reaches past an entry's own author is
+the end of the space.
+
 ### Inputs
 
 Facts about the entries of one space, plus the evaluated identity logs of
@@ -292,114 +299,71 @@ its authors.
 
 | Fact | Meaning |
 |---|---|
-| `s_entry(X)`, `s_genesis(X)`, `s_anc`, `s_ae`, `s_conc` | as for identity logs |
+| `s_entry(X)`, `s_genesis(X)`, `s_anc`, `s_ae` | as for identity logs |
 | `author(X,A)`, `skey(X,K)`, `cites(X,H)` | X's author identity, signing key, and cited head of the author's log |
-| `mem(X,I)` | X names membership I as its author's ([spaces.md](../spec/spaces.md#memberships)) |
-| `incarnation(I,M,R)`, `inc_from(I,E)` | membership I is identity M with role R (0 reader … 3 owner), created by entry E |
-| `adds(X,I)` | X creates membership I (genesis creates its author's, as owner) |
-| `s_rem(X,I)` | X ends membership I |
-| `replaces(Y,I,J)` | Y ends I and creates J for the same identity with a lower role |
-| `s_succeed(X)` | X contains `succeed` |
+| `adds(X,M,R)` | X contains `add_member` of identity M with role R (0 reader, 1 writer, 2 admin, 3 owner) |
+| `s_names(X,S)` | X contains `succeed` naming the space S |
 | `s_keep(X,K,E)` | X contains `keep` for key K, listing entry E |
-| `s_badops(X,R)` | X contains an op that role R may not perform |
-| `id_effective_at(A,K,H)`, `id_removed(A,K)`, `id_removed_at(A,K,H)`, `id_frozen(A)` | `effective_at`, `removed`, `removed_at`, `frozen` from A's identity log |
-| `kept_frozen(X)` | X is by a frozen author, and when this program is evaluated with no author treated as frozen, X's signature counts and X is in the causal past of a valid entry by an author who is not frozen |
+| `s_structural(X)` | X ends or begins a space: it contains a `succeed`, or it is a genesis whose `start` names a space it succeeds |
+| `s_badops(X,R)` | X contains an op that role R may not perform ([table](../spec/spaces.md#members-and-roles)). Outside a genesis, `start` and an `add_member` of an owner are allowed to no role. `succeed` is allowed to the owner, or, in a space with no owner, to every role |
+| `s_badgenesis(G)` | the genesis G is not formed as [spaces.md](../spec/spaces.md#members-and-roles) requires: it does not hold exactly one `start`; it does not name its author; it names an owner who is not its author, or names an owner twice; it names a role outside 0 to 3; it names no owner and names an admin; or it holds a `succeed`, or, besides `start` and `add_member`, an op that the highest role it gives its author may not perform |
+| `decider(M)`, `quorum(N)` | who must name a successor, and how many of them: the owner the genesis names, and 1; or, when it names no owner, every identity it names, and their number |
+| `id_effective_at(A,K,H)`, `id_removed(A,K)`, `id_removed_at(A,K,H)` | `effective_at`, `removed`, `removed_at` from A's identity log |
+
+Whether an author is frozen is not an input. A frozen member's entries are
+judged like anyone's ([spaces.md](../spec/spaces.md#a-member-who-can-no-longer-be-trusted)).
 
 ### Rules
 
 ```datalog
 @program space
 
-@input s_entry/1 s_genesis/1 s_anc/2 s_ae/2 s_conc/2
-@input author/2 skey/2 cites/2 mem/2
-@input incarnation/3 inc_from/2 adds/2 s_rem/2 replaces/3 s_succeed/1 s_keep/3 s_badops/2
-@input id_effective_at/3 id_removed/2 id_removed_at/3 id_frozen/1 kept_frozen/1
+@input s_entry/1 s_genesis/1 s_anc/2 s_ae/2
+@input author/2 skey/2 cites/2
+@input adds/3 s_names/2 s_keep/3 s_structural/1 s_badops/2 s_badgenesis/1 decider/1 quorum/1
+@input id_effective_at/3 id_removed/2 id_removed_at/3
 
-% ---- Layer 1: authors. Depends only on identity logs, never on membership.
+% ---- Layer 1: authors. Depends only on identity logs, never on members.
 @stratum authors
-attrib(X) :- author(X,A), skey(X,K), cites(X,H), id_effective_at(A,K,H), not id_frozen(A).
+attrib(X) :- author(X,A), skey(X,K), cites(X,H), id_effective_at(A,K,H).
 author_ok(X) :- attrib(X), author(X,A), skey(X,K), not id_removed(A,K).
 author_ok(X) :- attrib(X), witnessed(X).
-% a frozen author's entries count only as far as others' valid entries built on them
-author_ok(X) :- kept_frozen(X).
-witnessed(X) :- author(X,A), skey(X,K), s_anc(X,W), author(W,A), skey(W,K2), K2 != K,
-                author_ok(W), cites(W,H), not id_removed_at(A,K,H).
+% built on by another of the author's keys, while that key was still trusted;
+% a succeed, and a successor's genesis, are never witnessed this way
+witnessed(X) :- author(X,A), skey(X,K), not s_structural(X), s_anc(X,W), author(W,A),
+                skey(W,K2), K2 != K, author_ok(W), cites(W,H), not id_removed_at(A,K,H).
+% listed, or an ancestor of an entry listed, by a keep of the author's
 witnessed(X) :- author(X,A), skey(X,K), s_keep(W,K,E), s_ae(X,E), author(W,A), author_ok(W).
-% only a membership's own identity ends it by leaving or succeeding
-own_end(Y,I) :- mem(Y,I), incarnation(I,M,R), author(Y,M), inc_from(I,E), s_ae(E,Y),
-                author_ok(Y).
-leave(Y,I) :- s_rem(Y,I), own_end(Y,I), incarnation(I,M,R), not s_badops(Y,R).
-leave(Y,I) :- s_succeed(Y), own_end(Y,I), incarnation(I,M,3), not s_badops(Y,3).
-% after leaving, nothing counts; around it, only work by the same key is void
-left_before(I,X) :- leave(Y,I), s_anc(Y,X).
-left_conc(I,X) :- leave(Y,I), s_conc(Y,X), skey(Y,K), skey(X,K).
-lowered(Y,I,X) :- replaces(Y,I,J), incarnation(J,M,R), s_entry(X), not s_badops(X,R).
+root(G) :- s_genesis(G), author_ok(G), not s_badgenesis(G).
+% who named which successor, and which entries have that naming behind them
+named(M,S,Y) :- s_names(Y,S), author(Y,M), decider(M), author_ok(Y), s_genesis(G),
+                adds(G,M,R), not s_badops(Y,R).
+namer(M,S) :- named(M,S,Y).
+named_before(M,S,X) :- named(M,S,Y), s_anc(Y,X).
 
-% ---- Layer 2: owners. Nobody can remove an owner; owners can only leave.
-@stratum owners
-inc_ok3(I) :- s_genesis(G), adds(G,I), incarnation(I,A,3).
-inc_ok3(I) :- adds(X,I), incarnation(I,M,3), v3(X).
-v3(X) :- mem(X,I), incarnation(I,A,3), author(X,A), inc_ok3(I), inc_from(I,E), s_ae(E,X),
-         author_ok(X), not left_before(I,X), not left_conc(I,X), not s_badops(X,3).
-owner_live(X) :- inc_ok3(I), inc_from(I,E), s_ae(E,X), s_entry(X), not left_before(I,X).
-closing(Y) :- s_succeed(Y), v3(Y).
+% ---- Layer 2: the end of the space. A successor is named once everyone who
+% must name it has; what descends from all of those namings is closed.
+@stratum closing
+agreed(S) :- root(G), namer(M,S), quorum(N), count{D : namer(D,S)} >= N.
+closed(X) :- agreed(S), s_entry(X), quorum(N), count{D : named_before(D,S,X)} >= N.
 
-% ---- Layer 3: admins, removed only by owners or by leaving.
-@stratum admin_removals
-closed(X) :- closing(Y), s_anc(Y,X), not owner_live(X).
-rm2(I,Y) :- s_rem(Y,I), incarnation(I,M,2), v3(Y).
-gone2(I,X) :- rm2(I,Y), s_anc(Y,X).
-clash2(I,X) :- rm2(I,Y), s_conc(Y,X), not lowered(Y,I,X).
+% ---- Layer 3: members. Roles are only given, so this layer has no "not"
+% about members: an entry is judged by what its own causal past gave its author.
+@stratum members
+valid(G) :- root(G).
+role_in(M,R,X) :- adds(E,M,R), valid(E), s_anc(E,X).
+valid(X) :- author(X,A), role_in(A,R,X), author_ok(X), not s_badops(X,R), not closed(X).
+vnamer(M,S) :- s_names(Y,S), author(Y,M), decider(M), valid(Y).
 
-@stratum admins
-inc_ok2(I) :- adds(X,I), incarnation(I,M,2), v3(X).
-inc_ok2(I) :- adds(X,I), incarnation(I,M,2), v2(X).
-v2(X) :- mem(X,I), incarnation(I,A,2), author(X,A), inc_ok2(I), inc_from(I,E), s_anc(E,X),
-         author_ok(X), not gone2(I,X), not clash2(I,X), not left_before(I,X),
-         not left_conc(I,X), not closed(X), not s_badops(X,2).
+% ---- Layer 4: which successor stands.
+@stratum successors
+candidate(S) :- vnamer(M,S), quorum(N), count{D : vnamer(D,S)} >= N.
+beaten(S) :- candidate(S), candidate(T), T < S.
 
-% ---- Layer 4: writers, removed by owners, admins, or by leaving.
-@stratum writer_removals
-rm1(I,Y) :- s_rem(Y,I), incarnation(I,M,1), v3(Y).
-rm1(I,Y) :- s_rem(Y,I), incarnation(I,M,1), v2(Y).
-gone1(I,X) :- rm1(I,Y), s_anc(Y,X).
-clash1(I,X) :- rm1(I,Y), s_conc(Y,X), not lowered(Y,I,X).
-
-@stratum writers
-inc_ok1(I) :- adds(X,I), incarnation(I,M,1), v3(X).
-inc_ok1(I) :- adds(X,I), incarnation(I,M,1), v2(X).
-v1(X) :- mem(X,I), incarnation(I,A,1), author(X,A), inc_ok1(I), inc_from(I,E), s_anc(E,X),
-         author_ok(X), not gone1(I,X), not clash1(I,X), not left_before(I,X),
-         not left_conc(I,X), not closed(X), not s_badops(X,1).
-
-% ---- Layer 5: readers.
-@stratum reader_removals
-rm0(I,Y) :- s_rem(Y,I), incarnation(I,M,0), v3(Y).
-rm0(I,Y) :- s_rem(Y,I), incarnation(I,M,0), v2(Y).
-gone0(I,X) :- rm0(I,Y), s_anc(Y,X).
-clash0(I,X) :- rm0(I,Y), s_conc(Y,X), not lowered(Y,I,X).
-ended(I) :- leave(Y,I).
-ended(I) :- rm2(I,Y).
-ended(I) :- rm1(I,Y).
-ended(I) :- rm0(I,Y).
-
-@stratum readers
-inc_ok0(I) :- adds(X,I), incarnation(I,M,0), v3(X).
-inc_ok0(I) :- adds(X,I), incarnation(I,M,0), v2(X).
-v0(X) :- mem(X,I), incarnation(I,A,0), author(X,A), inc_ok0(I), inc_from(I,E), s_anc(E,X),
-         author_ok(X), not gone0(I,X), not clash0(I,X), not left_before(I,X),
-         not left_conc(I,X), not closed(X), not s_badops(X,0).
-
-% ---- Layer 6: results.
+% ---- Layer 5: results.
 @stratum outcome
-valid(X) :- v3(X).
-valid(X) :- v2(X).
-valid(X) :- v1(X).
-valid(X) :- v0(X).
-member(I) :- inc_ok3(I), not ended(I).
-member(I) :- inc_ok2(I), not ended(I).
-member(I) :- inc_ok1(I), not ended(I).
-member(I) :- inc_ok0(I), not ended(I).
+member(M,R) :- adds(E,M,R), valid(E).
+successor(S) :- candidate(S), not beaten(S).
 ```
 
 ### Reading the rules
@@ -407,29 +371,47 @@ member(I) :- inc_ok0(I), not ended(I).
 - **Authors first.** Whether a signature counts (`author_ok`) depends only on
   the author's identity log: the key was in effect at the cited head, and
   either it is still in effect or the entry is witnessed by another of the
-  author's keys, or listed in a `keep`. Membership never enters into it, so
-  witnessing cannot loop through membership.
-- **Frozen authors** (`kept_frozen`): the program is evaluated once as if no
-  author were frozen, and a frozen author's entries then count only if they
-  are in the causal past of a valid entry by an author who is not frozen.
-  The second evaluation uses the first only as input, so it cannot loop.
-  Nobody who is not a valid member can keep a frozen author's entries.
-- **Memberships, not identities, hold roles.** Each `add_member` creates a
-  membership with a fixed role, named by its entry and the op's position,
-  and each entry names the membership it writes under. Changing a role ends
-  one membership and creates another in the same entry (`replaces`). Adding
-  someone who is already a member creates a second membership and changes
-  nothing about the first.
-- **Layers follow roles.** An entry under a membership is invalidated only by
-  an end of that membership written by a strictly higher role, or by the
-  member leaving. Entries concurrent with an end by a higher role are
-  invalid, unless the end was a lowering of role and the entry was allowed
-  under the new role (`lowered`). Entries descending from any end fail
-  authorization.
-- **Leaving** (`leave`) is written by the membership's own identity, under
-  that membership, after it was created, with a signature that counts.
-  Around a leave, only entries signed by the same key are void
-  (`left_conc`), so a stolen device cannot erase its owner's other work by
-  backdating a leave or `succeed`.
-- **Closing.** After an owner's `succeed`, entries whose past has no owner
-  left are invalid.
+  author's keys, or listed in a `keep`. Members never enter into it, so
+  witnessing cannot loop through them. A witness or a `keep` counts by its
+  own signature alone, so it works in a space that has closed.
+- **What ends or begins a space is kept, never witnessed**
+  (`s_structural`). Building on an entry is something a device does without
+  its person. So a `succeed`, and the genesis of a successor, by a key that
+  has been removed count only if a `keep` lists them, however much was
+  built on them: a succession made by a device that is later lost can
+  always be undone, and one that is to last was kept on purpose.
+- **Roles are only given** (`role_in`). An identity holds, in an entry's
+  causal past, every role a valid entry there gave it. An entry is valid if
+  one of those roles may perform all of its ops. There is no removal and no
+  lowering, so nothing written beside an entry or after it changes what its
+  author could do, and this layer needs no "not" about members.
+- **One owner, or none.** Only a genesis names an owner, and only its own
+  author (`s_badgenesis`, `s_badops`). The owner alone names a successor.
+  A genesis that names no owner names no admins either, so nobody can add
+  to it, and all of its members must name a successor (`decider`,
+  `quorum`).
+- **The end of the space** (`closed`). An entry that descends from the
+  namings of one successor by everyone who must name it is invalid. In a
+  space with an owner that is every entry that descends from the owner's
+  `succeed`. Entries that do not descend from it stay valid: their authors
+  had not seen it.
+- **Two steps, one meaning.** `closed` is worked out from namings whose
+  signatures count (`named`), before validity, and the successor from
+  namings that are valid (`vnamer`), after it. They differ only in namings
+  that are themselves closed, and a closed naming closes nothing new:
+  whatever descends from it already descends from what closed it. So an
+  invalid `succeed` names nothing, and the rules stay in layers.
+- **Which successor stands** (`successor`). Two devices of an owner can each
+  name a successor before hearing of the other. Each closes what descends
+  from it, and of the successors named the one with the smallest id stands.
+- **What can still change an entry.** Only signatures: a key removed, a
+  recovery, a witness, a `keep`. A signature that stops counting voids its
+  entry and what rested on it: the members it added, and what they wrote. A
+  `succeed` whose signature comes to count closes what descends from it.
+  Nothing else in a space reaches an entry from outside its own causal
+  past, which is what the fuzzer's property M checks.
+- **Leaving** is not in these rules. A `leave` is a member's statement and
+  changes nothing about what is valid.
+- **Across spaces.** Whether a device follows a successor, and what it
+  posts again there, is what software does with these results
+  ([spaces.md](../spec/spaces.md#succession)). The rules judge one space.

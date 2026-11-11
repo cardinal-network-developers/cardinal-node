@@ -1213,7 +1213,7 @@ mod tests {
             assert!(!p.rules.is_empty());
         }
         assert_eq!(progs["identity"].strata.len(), 13);
-        assert_eq!(progs["space"].strata.len(), 9);
+        assert_eq!(progs["space"].strata.len(), 5);
     }
 
     #[test]
