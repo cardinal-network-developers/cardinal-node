@@ -210,12 +210,10 @@ pub fn introductions(space: &Space) -> bool {
         .unwrap_or(true)
 }
 
-/// Whether `who` has written anything in a space: that is joining it
-/// (`spaces.md#holding-a-space`).
+/// Whether `who` is in a group by their own doing: they wrote something
+/// valid in it, which is joining it (`spaces.md#holding-a-space`), and have
+/// not left it since. Someone who left and was added again has been offered
+/// it again, and has not joined until they write in it again.
 pub fn joined(space: &Space, who: &IdentityId) -> bool {
-    space.creator() == *who
-        || space
-            .dag()
-            .iter()
-            .any(|(id, e)| e.author() == *who && space.validity().is_valid(id))
+    space.accepted_by(who)
 }

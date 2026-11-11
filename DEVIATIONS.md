@@ -37,7 +37,8 @@ follow it across two spaces. What still differs:
   nowhere.
 - **Taking someone out of a group** is a succession, so `group-remove` fails
   with a message saying that it cannot be done yet, and changes nothing.
-  Lowering an admin is the same.
+  Lowering an admin is the same. Nothing in the local interface makes
+  anyone an admin either, though the rules are there for one who is.
 - **A member who can no longer be trusted.** A frozen identity's entries are
   judged like anyone's, devices open no session with it, and it is left out
   of the next epoch this device starts. Nothing offers the owner a
@@ -900,6 +901,35 @@ asks for around that is not built yet.
   members who are nobody's contact here are shown by the name the group
   gives them, with no warning when it matches someone else's. Groups are
   not in the one folder.
+- **Spec ambiguity: a profile's members.** `profiles.md` gives each profile
+  a shape (a group has one owner, a relationship two writers and none), and
+  the rules judge every space alike, whatever its profile. Only the
+  relationship's shape is anyone's to check, the invitee's. Chose: a space
+  offered as a group is taken as it is. One whose genesis names no owner
+  is a group nobody can add to and that all its first members end
+  together.
+- **Leaving a group** (`spaces.md#members-and-roles`). `group-leave` writes
+  `leave`. From then on the device finds no such group and writes nothing
+  in it, and if it is a host it ends the tokens its person gave out there.
+  The others show that the member left (`left` in `group-members`), send
+  them nothing more of the group, leave them out of its calls, and whoever
+  writes next starts a new epoch in that entry, not wrapped for them. A
+  reader cannot start one, and waits for a writer.
+  - **Spec ambiguity: "drops the space's keys".** The epoch keys are in
+    wraps in sealed entries the device holds, which its identity key opens
+    again, and it must go on holding the space to learn that it was added
+    again. Chose: the device keeps what it holds and stops using it. It
+    deletes neither keys nor entries.
+  - **Spec ambiguity: added again.** "One who is added again is back", and
+    being added is an offer, accepted by writing something valid. Chose:
+    leaving takes the earlier acceptance back. Someone added again is
+    offered the group again, and is in it once they write in it again.
+  - A token ended on leaving never comes back, and joining again does not
+    write the reach node again, since one is there. So someone who left a
+    group and came back can no longer be reached about it through their
+    host, only by a session.
+  - Someone who left still asks the others for the group when they meet,
+    and is given nothing.
 - **Contacts are not told apart from members by more than this device's account
   space.** A device opens a session with a contact's devices only for what they
   share (`spaces.md#holding-a-space`), and notices for a set go only to contacts

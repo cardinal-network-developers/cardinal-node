@@ -214,6 +214,10 @@ pub struct Holder {
     pub version: u64,
     /// The encryption keys of the other members, for a new epoch.
     member_keys: Vec<HybridPublicKey>,
+    /// The next write must start a new epoch because of who is in the
+    /// space: a member left since this one began, or it was begun by one
+    /// this device would leave out (`spaces.md#when-to-rotate`).
+    leave_out: bool,
 }
 
 /// What ingesting objects did.
@@ -255,6 +259,7 @@ impl Holder {
             file,
             version: 0,
             member_keys: Vec::new(),
+            leave_out: false,
         };
         let mut sealed = Vec::new();
         for (loc, bytes) in records {
@@ -459,13 +464,23 @@ impl Holder {
 
     /// Whether the next write must start a new epoch: the current one
     /// began before the identity's encryption key changed, which a removal
-    /// always does (`spaces.md#when-to-rotate`). This follows from the
-    /// state, so it holds on every device and across restarts. A device
-    /// that cannot open the current key yet cannot tell, and waits.
+    /// always does, or before a member left, or was begun by a member this
+    /// device would leave out (`spaces.md#when-to-rotate`). All but the
+    /// last follow from the entries, so they hold on every device and
+    /// across restarts. A device that cannot open the current key yet
+    /// cannot tell, and waits. Only a writer starts an epoch.
     fn rotation_due(&self, identity: &Identity) -> bool {
         let Some(space) = &self.space else {
             return false;
         };
+        let writer = cardinal_space::entry::WRITER;
+        let me = identity.id();
+        if space.role_of(&me).is_none_or(|r| r < writer) || space.has_left(&me) {
+            return false;
+        }
+        if self.leave_out {
+            return true;
+        }
         let st = identity.log.state();
         match (identity.enc.first(), &st.encryption_key) {
             (Some(k), Some(current)) if *k.public_key() == current.public => {
@@ -829,8 +844,8 @@ impl Core {
             .unwrap_or_default()
     }
 
-    /// The spaces shared with anyone, with the other members this person has
-    /// not refused.
+    /// The spaces shared with anyone, with the other members who have not
+    /// left and whom this person has not refused.
     pub fn shared_spaces(&self) -> Vec<(SpaceId, Vec<[u8; 32]>)> {
         let me = self.identity.as_ref().map(|i| i.id());
         let contacts = self.contacts();
@@ -840,7 +855,7 @@ impl Core {
             let Some(space) = h.space.as_ref() else {
                 continue;
             };
-            let members = space.validity().members.iter().map(|m| m.identity);
+            let members = space.present().into_iter();
             let others: Vec<[u8; 32]> = members.filter(|m| Some(*m) != me && !refused(m)).collect();
             if !others.is_empty() {
                 out.push((*id, others));
@@ -983,14 +998,16 @@ impl Core {
         out
     }
 
-    /// Whether `identity` is a member of the space `label`, or `label` is
-    /// this person's log, which every contact is entitled to.
+    /// Whether `identity` is a member of the space `label` who has not left
+    /// it, or `label` is this person's log, which every contact is entitled
+    /// to. Nothing more of a space is sent to someone who left it
+    /// (`spaces.md#members-and-roles`).
     pub fn shares(&self, identity: &[u8; 32], label: &[u8; 32]) -> bool {
         if Some(*label) == self.identity_label() {
             return self.others.contains_key(identity);
         }
         let open = self.spaces.get(label).and_then(|h| h.space.as_ref());
-        open.is_some_and(|s| s.validity().members.iter().any(|m| m.identity == *identity))
+        open.is_some_and(|s| s.role_of(identity).is_some() && !s.has_left(identity))
     }
 
     /// Whether `label` is a space `identity` offered this person that is not
@@ -1058,14 +1075,10 @@ impl Core {
         self.logs = states.into_iter().map(Arc::new).collect();
     }
 
-    /// The identity log of `who` as the spaces read it, if it is held.
-    pub fn log_of(&self, who: &[u8; 32]) -> Option<&Arc<IdentityState>> {
-        self.logs.iter().find(|st| st.identity == *who)
-    }
-
     /// After something was written or arrived in a space: the keys of the
-    /// members a new epoch would be wrapped for. Every member but this one
-    /// who has not left, and whom this device does not know to be frozen
+    /// members a new epoch would be wrapped for, and whether one is due
+    /// because of them. It is wrapped for every member but this one who has
+    /// not left, and whom this device does not know to be frozen
     /// (`spaces.md#distribution`).
     fn settle(&mut self, space: &SpaceId) {
         let Some(ident) = self.identity.as_ref() else {
@@ -1087,6 +1100,11 @@ impl Core {
             .filter(|st| !st.frozen)
             .filter_map(|st| Some(st.encryption_key.as_ref()?.public.clone()))
             .collect();
+        // "A writer does not encrypt under an epoch started by a member it
+        // would leave out."
+        let out = |who: &[u8; 32]| sp.has_left(who) || state(who).is_some_and(|st| st.frozen);
+        let theirs = |(_, who): (EntryId, [u8; 32])| who != ident.id() && out(&who);
+        h.leave_out = sp.left_since_epoch() || sp.epoch_started_by().is_some_and(theirs);
     }
 
     /// After an identity log changed: every space judges again the entries
@@ -1265,13 +1283,12 @@ impl Core {
             let Some(sp) = h.space.as_ref() else {
                 continue;
             };
-            let members = &sp.validity().members;
-            if !members.iter().any(|m| m.identity == *identity) {
+            if sp.role_of(identity).is_none() || sp.has_left(identity) {
                 continue;
             }
-            for m in members {
-                if m.identity != *identity && Some(m.identity) != me && !out.contains(&m.identity) {
-                    out.push(m.identity);
+            for m in sp.validity().identities() {
+                if m != *identity && Some(m) != me && !out.contains(&m) {
+                    out.push(m);
                 }
             }
         }
@@ -2066,5 +2083,158 @@ mod tests {
         let theirs = cy.genesis(rel, &[(c, WRITER), (b, WRITER)], &bo);
         assert!(bo.core.accept_relationship(&theirs, &a).is_err());
         assert!(bo.core.accept_relationship(&theirs, &c).is_ok());
+    }
+
+    impl Person {
+        /// Everything this person holds of a space, as a device fetching it
+        /// from theirs would get it.
+        fn all_of(&self, space: &SpaceId) -> Vec<Vec<u8>> {
+            let all = self.space(space).sealed_entries();
+            all.map(|(_, s)| s.encode()).collect()
+        }
+
+        fn takes(&mut self, space: &SpaceId, entries: &[Vec<u8>]) {
+            self.core.ingest_space(*space, entries).unwrap();
+        }
+
+        fn role(&self, space: &SpaceId, who: &Person) -> Option<u64> {
+            self.space(space).role_of(&who.id())
+        }
+    }
+
+    #[test]
+    fn a_group_has_one_owner_and_its_admins_add() {
+        let mut p = [Person::new(), Person::new(), Person::new()];
+        for i in 0..3 {
+            for j in 0..3 {
+                if i != j {
+                    let (log, id) = (p[j].log(), p[j].id());
+                    p[i].core.ingest_other(id, &log).unwrap();
+                }
+            }
+        }
+        let [mut ana, mut bo, mut cy] = p;
+        let bo_shown = [(bo.id(), "Bo".to_owned())];
+        let g = ana
+            .core
+            .create_group("Garden club", "Ana", &bo_shown)
+            .unwrap();
+        bo.takes(&g, &ana.all_of(&g));
+        for who in [&ana, &bo] {
+            let sp = who.space(&g);
+            // whoever made it owns it, and nobody else ever will
+            assert_eq!(sp.owner(), Some(ana.id()));
+            assert_eq!(who.role(&g, &ana), Some(OWNER));
+            assert_eq!(who.role(&g, &bo), Some(WRITER));
+        }
+        // A writer adds nobody.
+        let cy_shown = [(cy.id(), "Cy".to_owned())];
+        let tried = bo.core.add_to_group(&g, &cy_shown).unwrap();
+        ana.takes(&g, &[tried]);
+        assert_eq!(ana.role(&g, &cy), None);
+        assert_eq!(bo.role(&g, &cy), None);
+        // The owner makes Bo an admin, and then Bo does.
+        let admin = SpaceOp::add_member(bo.id(), ADMIN);
+        let (_, made) = ana.core.write_entry(&g, vec![admin]).unwrap();
+        bo.takes(&g, &[made]);
+        let added = bo.core.add_to_group(&g, &cy_shown).unwrap();
+        ana.takes(&g, &[added]);
+        cy.takes(&g, &bo.all_of(&g));
+        for who in [&ana, &bo, &cy] {
+            assert_eq!(who.role(&g, &cy), Some(WRITER));
+            assert_eq!(who.role(&g, &bo), Some(ADMIN));
+        }
+        // Nobody makes an owner, the owner included.
+        let owner = ana.id();
+        for (who, of) in [(&mut bo, cy.id()), (&mut ana, cy.id())] {
+            let crown = SpaceOp::add_member(of, OWNER);
+            let (id, _) = who.core.write_entry(&g, vec![crown]).unwrap();
+            assert!(!who.space(&g).validity().is_valid(&id));
+            assert_eq!(who.space(&g).owner(), Some(owner));
+        }
+        assert_eq!(ana.role(&g, &cy), Some(WRITER));
+    }
+
+    #[test]
+    fn whoever_leaves_a_group_is_left_out_of_its_next_key() {
+        let mut p = [Person::new(), Person::new(), Person::new()];
+        for i in 0..3 {
+            for j in 0..3 {
+                if i != j {
+                    let (log, id) = (p[j].log(), p[j].id());
+                    p[i].core.ingest_other(id, &log).unwrap();
+                }
+            }
+        }
+        let [mut ana, mut bo, mut cy] = p;
+        let both = [(bo.id(), "Bo".to_owned()), (cy.id(), "Cy".to_owned())];
+        let g = ana.core.create_group("Garden club", "Ana", &both).unwrap();
+        bo.takes(&g, &ana.all_of(&g));
+        cy.takes(&g, &ana.all_of(&g));
+        // Being added is an offer: Cy is in it once they write in it.
+        assert!(!group::joined(cy.space(&g), &cy.id()));
+        let hello = cy.says(&g, "hello");
+        ana.takes(&g, std::slice::from_ref(&hello));
+        bo.takes(&g, &[hello]);
+        assert!(group::joined(cy.space(&g), &cy.id()));
+        assert!(ana.core.shares(&cy.id(), &g));
+
+        // Cy leaves. That is a statement: nothing stops being valid, and
+        // Cy is still among those the group's entries name.
+        let valid_before = ana.space(&g).validity().valid.len();
+        let (leave, gone) = cy.core.write_entry(&g, vec![SpaceOp::leave()]).unwrap();
+        ana.takes(&g, std::slice::from_ref(&gone));
+        bo.takes(&g, &[gone]);
+        for who in [&ana, &bo, &cy] {
+            let sp = who.space(&g);
+            assert!(sp.validity().is_valid(&leave));
+            assert!(sp.has_left(&cy.id()) && !sp.has_left(&bo.id()));
+            assert_eq!(who.role(&g, &cy), Some(WRITER));
+            assert_eq!(sp.present().len(), 2);
+            assert!(!group::joined(sp, &cy.id()));
+        }
+        assert_eq!(ana.space(&g).validity().valid.len(), valid_before + 1);
+        // The others send Cy nothing more of it.
+        assert!(!ana.core.shares(&cy.id(), &g) && !bo.core.shares(&cy.id(), &g));
+        assert!(ana.core.shares(&bo.id(), &g));
+
+        // Whoever writes next starts a new key, in that entry, and it is
+        // not wrapped for Cy.
+        let before = bo.space(&g).current_epoch();
+        let after_cy = bo.says(&g, "after cy");
+        let entry = *bo.space(&g).heads().first().unwrap();
+        assert!(bo.space(&g).entry(&entry).unwrap().starts_epoch());
+        assert_ne!(bo.space(&g).current_epoch(), before);
+        ana.takes(&g, std::slice::from_ref(&after_cy));
+        assert_eq!(ana.said(&g), ["hello", "after cy"]);
+        cy.takes(&g, &[after_cy]);
+        assert!(!cy.space(&g).dag().contains(&entry), "Cy opened it");
+        assert_eq!(cy.said(&g), ["hello"]);
+        // One new key is enough: the next entry is written under it.
+        let more = ana.says(&g, "just us");
+        let entry = *ana.space(&g).heads().first().unwrap();
+        assert!(!ana.space(&g).entry(&entry).unwrap().starts_epoch());
+        bo.takes(&g, std::slice::from_ref(&more));
+        cy.takes(&g, &[more]);
+        assert_eq!(bo.said(&g).len(), 3);
+        assert_eq!(cy.said(&g), ["hello"]);
+
+        // Added again, Cy is back: offered it again, with the key that is
+        // current now, and in it once they write in it again.
+        let again = [(cy.id(), "Cy".to_owned())];
+        let added = ana.core.add_to_group(&g, &again).unwrap();
+        bo.takes(&g, std::slice::from_ref(&added));
+        cy.takes(&g, &[added]);
+        for who in [&ana, &bo, &cy] {
+            assert!(!who.space(&g).has_left(&cy.id()));
+            assert!(!group::joined(who.space(&g), &cy.id()));
+        }
+        assert!(ana.core.shares(&cy.id(), &g));
+        // history is shared, so Cy now reads what was written meanwhile
+        assert_eq!(cy.said(&g), ["hello", "after cy", "just us"]);
+        let back = cy.says(&g, "back");
+        ana.takes(&g, &[back]);
+        assert!(group::joined(ana.space(&g), &cy.id()));
+        assert!(group::joined(cy.space(&g), &cy.id()));
     }
 }

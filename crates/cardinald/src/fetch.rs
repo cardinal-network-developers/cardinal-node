@@ -333,12 +333,7 @@ async fn pass(d: &Arc<Daemon>, complete: &mut HashSet<[u8; 32]>) -> anyhow::Resu
                 continue;
             }
             let base = format!("Groups/{}", cardinal_space::group::name(space));
-            let through = space
-                .validity()
-                .members
-                .iter()
-                .map(|m| m.identity)
-                .find(|w| known(w));
+            let through = space.present().into_iter().find(|w| known(w));
             for m in relationship::messages(space) {
                 let from = if known(&m.author) {
                     Some(m.author)

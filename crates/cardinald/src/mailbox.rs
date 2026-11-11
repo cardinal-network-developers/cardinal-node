@@ -701,6 +701,31 @@ fn tokens_here(d: &Daemon, space: &SpaceId) -> Vec<Token> {
     here.map(|r| r.token).collect()
 }
 
+/// On a host, ends the tokens this person gave out in a space they have
+/// left (`spaces.md#members-and-roles`). The host does this itself, when it
+/// leaves or when the `leave` reaches it from another of the person's
+/// devices. A token revoked never comes back, and nothing yet gives a new
+/// one to someone who is added again and joins again (DEVIATIONS.md).
+pub fn revoke_left(d: &Daemon, space: &SpaceId) {
+    if !d.config().host {
+        return;
+    }
+    let left = {
+        let core = d.core();
+        let me = core.identity.as_ref().map(|i| i.id());
+        let open = core.spaces.get(space).and_then(|h| h.space.as_ref());
+        me.is_some_and(|me| open.is_some_and(|sp| sp.has_left(&me)))
+    };
+    if !left {
+        return;
+    }
+    for token in tokens_here(d, space) {
+        if lock(&d.mailbox.store).is_active(&token) {
+            revoke(d, &token);
+        }
+    }
+}
+
 /// On a host, ends the tokens of anyone refused. The host does this itself,
 /// from what reaches it in the account space, so that a refusal made on a
 /// device that cannot reach it still holds.

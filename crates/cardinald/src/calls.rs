@@ -850,13 +850,14 @@ async fn relink(d: &Arc<Daemon>, id: &[u8; 16], space: &SpaceId, all: bool) {
     }
 }
 
-/// The identities of a group's members, this person among them.
+/// The identities of a group's members who have not left it, this person
+/// among them.
 fn members(d: &Daemon, space: &SpaceId) -> std::collections::HashSet<[u8; 32]> {
     let core = d.core();
     core.spaces
         .get(space)
         .and_then(|h| h.space.as_ref())
-        .map(|sp| sp.validity().members.iter().map(|m| m.identity).collect())
+        .map(|sp| sp.present().into_iter().collect())
         .unwrap_or_default()
 }
 
@@ -1324,10 +1325,10 @@ fn device_keys(d: &Daemon, space: &SpaceId) -> HashMap<Voice, [u8; 32]> {
     let Some(sp) = core.spaces.get(space).and_then(|h| h.space.as_ref()) else {
         return out;
     };
-    for m in &sp.validity().members {
+    for m in sp.present() {
         let state = match core.identity.as_ref() {
-            Some(i) if i.id() == m.identity => i.log.state(),
-            _ => match core.others.get(&m.identity) {
+            Some(i) if i.id() == m => i.log.state(),
+            _ => match core.others.get(&m) {
                 Some(o) => o.log.state(),
                 None => continue,
             },

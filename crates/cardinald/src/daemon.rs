@@ -1031,6 +1031,8 @@ impl Daemon {
             if account {
                 self.peers_changed();
             }
+            // this person may have left it, on another of their devices
+            crate::mailbox::revoke_left(self, &label);
             self.bump();
             self.housekeeping();
         }

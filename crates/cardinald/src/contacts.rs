@@ -851,7 +851,8 @@ pub async fn shared_blobs(d: &Arc<Daemon>, who: &[u8; 32]) -> Arc<HashSet<[u8; 3
             .filter(|(_, h)| {
                 h.space.as_ref().is_some_and(|s| {
                     s.profile() == cardinal_space::group::GROUP
-                        && s.validity().members.iter().any(|m| m.identity == *who)
+                        && s.role_of(who).is_some()
+                        && !s.has_left(who)
                 })
             })
             .map(|(id, _)| *id)

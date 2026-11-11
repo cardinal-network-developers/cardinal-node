@@ -320,6 +320,39 @@ impl Space {
         self.judge.has_left(&self.dag, who)
     }
 
+    /// The members who have not left, each once, sorted: whom this space is
+    /// still shared with.
+    pub fn present(&self) -> Vec<IdentityId> {
+        let gone: Vec<IdentityId> = self.left().into_iter().map(|(who, _)| who).collect();
+        let mut all = self.validity().identities();
+        all.retain(|who| !gone.contains(who));
+        all
+    }
+
+    /// Who has left, and the `leave` of theirs that stands.
+    pub fn left(&self) -> Vec<(IdentityId, EntryId)> {
+        self.judge.standing_leaves(&self.dag)
+    }
+
+    /// Whether `who` has accepted the space and not left it since: they
+    /// wrote something valid in it, its genesis or anything after, that no
+    /// `leave` of theirs descends from (`spaces.md#holding-a-space`).
+    pub fn accepted_by(&self, who: &IdentityId) -> bool {
+        !self.has_left(who) && self.judge.wrote_since_leaving(&self.dag, who)
+    }
+
+    /// Whether a member has left since the current epoch began, or began it
+    /// and then left: whoever writes next starts a new one, wrapped for
+    /// those who stay (`spaces.md#when-to-rotate`).
+    pub fn left_since_epoch(&self) -> bool {
+        let Some((start, _)) = self.current_epoch else {
+            return false;
+        };
+        let left = self.left();
+        left.iter()
+            .any(|(_, leave)| !self.dag.is_ancestor(leave, &start))
+    }
+
     /// The successor that stands, if the space has been succeeded
     /// (`spaces.md#ending-a-space`).
     pub fn successor(&self) -> Option<SpaceId> {

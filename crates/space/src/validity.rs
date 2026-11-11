@@ -425,16 +425,6 @@ impl Judge {
         self.genesis.as_ref().map_or(&[], |g| &g.deciders)
     }
 
-    /// The evaluated identity log held for `who`.
-    pub fn state_of(&self, who: &IdentityId) -> Option<&Arc<IdentityState>> {
-        self.states.get(who)
-    }
-
-    /// Every identity that wrote an entry held here, valid or not.
-    pub fn authors(&self) -> impl Iterator<Item = &IdentityId> {
-        self.by_author.keys()
-    }
-
     fn marked(&self, id: &EntryId) -> Option<&Marked> {
         self.info.get(id)?.marked.as_deref()
     }
@@ -1140,6 +1130,40 @@ impl Judge {
                     self.info[add].valid && dag.is_ancestor(l, add)
                 })
         })
+    }
+
+    /// Each `leave` that stands: a valid one that no valid `add_member` of
+    /// its author descends from, with who wrote it.
+    pub fn standing_leaves(&self, dag: &Dag<SpaceEntry>) -> Vec<(IdentityId, EntryId)> {
+        let mut out = Vec::new();
+        for (who, leaves) in &self.leaves {
+            let adds = self.adds_of.get(who).map_or(&[][..], |v| v.as_slice());
+            for l in leaves.iter().filter(|l| self.info[*l].valid) {
+                let back = adds.iter().any(|(m, _)| {
+                    let add = &self.marks[*m as usize];
+                    self.info[add].valid && dag.is_ancestor(l, add)
+                });
+                if !back {
+                    out.push((*who, *l));
+                }
+            }
+        }
+        out
+    }
+
+    /// Whether `who` has written something valid here that they have not
+    /// left behind: an entry that is not a `leave` of theirs and that no
+    /// valid `leave` of theirs descends from. Writing in a space is
+    /// accepting it (`spaces.md#holding-a-space`), and leaving it takes
+    /// that back: someone added again has been offered it again.
+    pub fn wrote_since_leaving(&self, dag: &Dag<SpaceEntry>, who: &IdentityId) -> bool {
+        let entries = self.by_author.get(who).map_or(&[][..], |v| v.as_slice());
+        let leaves = self.leaves.get(who).map_or(&[][..], |v| v.as_slice());
+        let leaves: Vec<&EntryId> = leaves.iter().filter(|l| self.info[*l].valid).collect();
+        entries
+            .iter()
+            .rev()
+            .any(|x| self.info[x].valid && !leaves.iter().any(|l| *l == x || dag.is_ancestor(x, l)))
     }
 
     /// Whether `key` wrote something that would stop counting if the key

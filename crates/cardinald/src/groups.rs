@@ -7,6 +7,12 @@
 //! succeeding the group with one that leaves them out, which this software
 //! cannot write or follow yet, so `group-remove` says so and does nothing.
 //!
+//! Leaving is a member's own statement (`spaces.md#members-and-roles`). It
+//! changes nothing about what is valid. Whoever left stops using the group
+//! and ends the tokens they gave out in it; the others see that they left,
+//! send them nothing more, and whoever writes next starts a new key that
+//! is not wrapped for them.
+//!
 //! A member who is not a trusted contact of another reaches them through a
 //! member connected to both, who passes on what they write, or through their
 //! hosts (`spaces.md#holding-a-space`): being in a group opens no connection.
@@ -48,7 +54,9 @@ fn find(d: &Daemon, group: &str) -> anyhow::Result<Found> {
         let Some(sp) = h.space.as_ref() else {
             continue;
         };
-        if sp.profile() != group::GROUP {
+        // A group this person left is not theirs to find, until someone
+        // adds them again.
+        if sp.profile() != group::GROUP || sp.has_left(&me) {
             continue;
         }
         let name = group::name(sp);
@@ -203,7 +211,9 @@ pub fn remove(d: &Arc<Daemon>, group: &str, who: &str) -> anyhow::Result<Json> {
     )
 }
 
-/// Leaves a group.
+/// Leaves a group: says so in it, and ends the tokens this person gave out
+/// there. From then on this device does nothing with the group, and the
+/// others send it nothing more.
 pub fn leave(d: &Arc<Daemon>, group: &str) -> anyhow::Result<Json> {
     let g = joined(d, group)?;
     let me = identity(d)?;
@@ -214,6 +224,7 @@ pub fn leave(d: &Arc<Daemon>, group: &str) -> anyhow::Result<Json> {
         anyhow::ensure!(sp.role_of(&me).is_some(), "you are not in {}", g.name);
     }
     d.write_and_push(&g.id, vec![SpaceOp::leave()])?;
+    crate::mailbox::revoke_left(d, &g.id);
     d.bump();
     Ok(json!({}))
 }
@@ -310,6 +321,9 @@ pub fn list(d: &Daemon) -> Json {
         let Some(sp) = core.spaces.get(&id).and_then(|h| h.space.as_ref()) else {
             continue;
         };
+        if sp.has_left(&me) {
+            continue;
+        }
         let members = group::members(sp);
         let in_it = members.iter().any(|m| m.identity == me);
         let name = group::name(sp);
@@ -391,6 +405,7 @@ pub fn members(d: &Daemon, group: &str) -> anyhow::Result<Json> {
                     _ => "member",
                 },
                 "introduce": m.introduce,
+                "left": m.left,
             })
         })
         .collect();
@@ -405,12 +420,9 @@ pub(crate) fn use_members(d: &Daemon, id: &SpaceId) {
         return;
     };
     let contacts = core.contacts();
-    for m in &sp.validity().members {
-        if contacts
-            .iter()
-            .any(|c| c.identity == m.identity && c.connects())
-        {
-            d.rendezvous.use_contact(&m.identity);
+    for m in sp.present() {
+        if contacts.iter().any(|c| c.identity == m && c.connects()) {
+            d.rendezvous.use_contact(&m);
         }
     }
 }
@@ -469,10 +481,11 @@ pub fn messages(d: &Daemon, group: &str) -> anyhow::Result<Json> {
     let sp = sp.ok_or_else(|| anyhow::anyhow!("that group is not open yet"))?;
     let all = relationship::messages(sp);
     let members = group::members(sp);
+    // someone who left reads nothing more, and is not waited for
     let others: Vec<[u8; 32]> = members
         .iter()
+        .filter(|m| m.identity != me && !m.left)
         .map(|m| m.identity)
-        .filter(|m| *m != me)
         .collect();
     let mut read_by: HashMap<[u8; 32], Vec<bool>> = HashMap::new();
     for m in &others {
@@ -525,8 +538,7 @@ pub async fn save_attachment(
     let members: Vec<[u8; 32]> = {
         let core = d.core();
         let sp = core.spaces.get(&g.id).and_then(|h| h.space.as_ref());
-        sp.map(|sp| sp.validity().members.iter().map(|m| m.identity).collect())
-            .unwrap_or_default()
+        sp.map(|sp| sp.present()).unwrap_or_default()
     };
     let in_touch = d.people_in_touch();
     let mut from: Vec<[u8; 32]> = members
@@ -746,7 +758,8 @@ pub(crate) fn shared_group(d: &Daemon, space: &SpaceId, who: &[u8; 32]) -> Optio
     let sp = core.spaces.get(space)?.space.as_ref()?;
     let ours = sp.profile() == group::GROUP
         && group::joined(sp, &me)
-        && sp.validity().members.iter().any(|m| m.identity == *who);
+        && sp.role_of(who).is_some()
+        && !sp.has_left(who);
     ours.then(|| group::name(sp))
 }
 
@@ -758,12 +771,8 @@ pub(crate) fn member_sessions(d: &Daemon, space: &SpaceId) -> Vec<cardinal_link:
         let me = core.identity.as_ref().map(|i| i.id());
         let sp = core.spaces.get(space).and_then(|h| h.space.as_ref());
         sp.map(|sp| {
-            sp.validity()
-                .members
-                .iter()
-                .map(|m| m.identity)
-                .filter(|m| Some(*m) != me)
-                .collect()
+            let present = sp.present().into_iter();
+            present.filter(|m| Some(*m) != me).collect()
         })
         .unwrap_or_default()
     };

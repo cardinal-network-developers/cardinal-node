@@ -1,7 +1,8 @@
 //! Groups (`profiles.md#group`): Ana makes one with Bo and Cy, who know her
 //! but not each other. Each is offered it through the relationship they have
 //! with her, joins, and reads what the others write, Bo and Cy through Ana,
-//! who passes it on. Nobody is taken out of it in place.
+//! who passes it on. Nobody is taken out of it in place. Cy leaves, reads
+//! nothing written after, and is back when added again.
 
 mod common;
 
@@ -188,6 +189,58 @@ fn a_group_is_offered_joined_and_read_by_all() {
         });
         let m = ask(d, json!({"cmd": "group-members", "group": g}));
         assert_eq!(m["members"].as_array().unwrap().len(), 3, "{m}");
+    }
+
+    // Cy leaves. The others see that, and Cy has no group any more.
+    let left = |d: &Dev| -> Vec<String> {
+        let m = ask(d, json!({"cmd": "group-members", "group": g}));
+        let all = m["members"].as_array().unwrap().clone();
+        let gone = all.iter().filter(|m| m["left"] == true);
+        gone.map(|m| m["name"].as_str().unwrap().to_owned())
+            .collect()
+    };
+    assert!(left(&ana).is_empty());
+    ask(&cy, json!({"cmd": "group-leave", "group": g}));
+    for d in [&ana, &bo] {
+        wait("the others see that cy left", 30, || left(d).len() == 1);
+    }
+    assert_eq!(left(&ana), ["Cy"]);
+    assert!(groups(&cy).is_empty() && offers(&cy).is_empty());
+    let no = reply(
+        &cy,
+        &json!({"cmd": "say", "group": g, "text": "still here?"}),
+    );
+    assert_eq!(no["ok"], false, "{no}");
+    // What is written after is under a new key and is not sent to Cy.
+    let held = |d: &Dev| {
+        let log = d.home.join("spaces").join(&g).join("entries.log");
+        std::fs::metadata(log).unwrap().len()
+    };
+    let before = held(&cy);
+    ask(&bo, json!({"cmd": "say", "group": g, "text": "after cy"}));
+    wait("ana reads it", 30, || {
+        said(&ana, &g).contains(&"Bo: after cy".to_owned())
+    });
+    std::thread::sleep(std::time::Duration::from_secs(3));
+    assert_eq!(held(&cy), before, "cy was sent what came after");
+    assert_eq!(left(&bo), ["Cy"]);
+
+    // Added again, Cy is offered it again, and on joining reads what was
+    // written meanwhile.
+    ask(
+        &ana,
+        json!({"cmd": "group-add", "group": g, "people": ["Cy"]}),
+    );
+    wait("cy is offered it again", 30, || {
+        offers(&cy).iter().any(|o| o["name"] == "Family")
+    });
+    assert!(groups(&cy).is_empty(), "back without being asked");
+    ask(&cy, json!({"cmd": "group-join", "group": g}));
+    wait("cy reads what was written meanwhile", 30, || {
+        said(&cy, &g).contains(&"Bo: after cy".to_owned())
+    });
+    for d in [&ana, &bo] {
+        wait("nobody has left any more", 30, || left(d).is_empty());
     }
 }
 
