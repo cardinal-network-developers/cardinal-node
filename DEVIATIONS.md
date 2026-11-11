@@ -5,6 +5,37 @@ place where this implementation departs from it, and every place where the
 specification was ambiguous and a reading had to be chosen. Each entry
 should eventually be resolved by changing either the code or the spec.
 
+## Behind the specification: a space only grows
+
+`../core` changed on its branch `grow-only-spaces` (decisions D56 to D58),
+and this implementation has not caught up. Until it has, it implements
+`spec/spaces.md` and `model/rules.md` as they stood at core `613a47e`.
+Spaces written by it, and by an implementation of the current text, are not
+valid to each other. What differs:
+
+- **A space only grows.** The specification has no removal and no lowering
+  in place. This implementation still writes and judges `remove_member`
+  (op 4, which is now `leave`, a statement with no fields), still names a
+  membership in every entry (field 9, now reserved), and still judges
+  entries concurrent with the end of a membership.
+- **One owner, or none.** A relationship's genesis here names both people as
+  owners (`crates/space/src/relationship.rs`). The specification names both
+  as writers and no owner, and the invitee is to check exactly that.
+- **The rules.** `crates/identity/rules/rules.md` is the old program, so the
+  test that it is byte-identical to `../core/model/rules.md` fails against
+  the current core, and `model.rs` derives the old input facts.
+- **Frozen authors.** A frozen author's entries are still kept only as far
+  as others built on them (`kept_frozen`). The specification now judges
+  them like anyone's.
+- **Succession.** The daemon has never written or followed one. Removing
+  someone from a group is now a succession, so `group-remove` has no
+  conforming implementation: following a successor, the state at the cut,
+  posting work again, `beside` on `set` and `delete`, and `was` on `create`
+  are all unbuilt.
+- **Cost.** A space with more than one member still takes the full program
+  after every entry ([Spaces](#spaces-specspacesmd), below). Under the
+  current rules every entry can be judged once.
+
 ## Encoding (`spec/encoding.md`)
 
 - **Spec ambiguity: how nesting depth is counted.** "Nesting depth MUST NOT
