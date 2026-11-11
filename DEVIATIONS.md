@@ -40,9 +40,14 @@ follow it across two spaces. What still differs:
   Lowering an admin is the same. Nothing in the local interface makes
   anyone an admin either, though the rules are there for one who is.
 - **A member who can no longer be trusted.** A frozen identity's entries are
-  judged like anyone's, devices open no session with it, and it is left out
-  of the next epoch this device starts. Nothing offers the owner a
-  succession without it, and nothing shows the members it added.
+  judged like anyone's, devices open no session with it, it is left out of
+  the next epoch this device starts, and this device starts one rather
+  than write under an epoch the frozen member began. But learning of a
+  freeze does not by itself make a new epoch due
+  ([Other people](#other-people-speccontactmd-specprofilesmdrelationship)),
+  a new epoch is still wrapped for whoever a frozen admin added, heard of
+  before the freeze or not, nothing offers the owner a succession without
+  it, and nothing shows the members it added.
 - **A conversation shows its messages in log order.** `profiles.md` now has
   a device show messages in the order they became valid on it, so that one
   written with old parents appears when it arrives and not among what was
@@ -400,6 +405,19 @@ follow it across two spaces. What still differs:
   heads descend from the end, anything but an entry of `keep` ops only. In
   a space with no owner that is once the heads together hold every
   member's naming of one successor, though no single head does.
+- **Spec ambiguity: "not yet witnessed", before a removal.** Software
+  retiring a device appends an empty entry "in each space where the device
+  wrote something not yet witnessed", but the rules say what is witnessed
+  only of a key that has been removed. Chose: an entry by that key, whose
+  signature counts, that no entry of the same author under another key
+  descends from (`Space::has_unwitnessed`). Other members building on it
+  does not count, and what ends or begins a space is left out, since
+  building on it keeps nothing.
+- **Spec ambiguity: what else changes an entry later.** "Only a signature
+  changes an entry later": an identity log, a witness, a `keep`. A `keep`
+  can also be held before an entry it lists, and then that entry arriving
+  is what makes its ancestors count. It is handled, and is one more thing
+  that reaches an entry from outside its causal past.
 - **Parents are the valid heads.** A new entry's parents are each valid
   entry that no other valid entry descends from, kept as entries arrive; an
   entry held to be invalid is never one. With nothing valid to build on,
