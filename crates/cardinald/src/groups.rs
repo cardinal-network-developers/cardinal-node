@@ -238,8 +238,11 @@ struct Telling {
     /// Whether their reach node in the group names a host now.
     shared: bool,
     /// Whether it is theirs to say before anything is set: they have a
-    /// host, someone in the group is not a contact of theirs, and their
-    /// reach node there has never been set.
+    /// host, someone in the group is not a contact of theirs, and they
+    /// have not answered for this group as it is offered now. Their reach
+    /// node there was never set, or they are not in it: an offer asks
+    /// afresh, also of someone who left and was added again, since who is
+    /// in the group may have changed and leaving took their answer back.
     ask: bool,
     /// The members who are not their contacts, as this person sees them.
     who: Vec<String>,
@@ -251,10 +254,9 @@ impl Telling {
     fn of(d: &Daemon, id: &SpaceId, me: &[u8; 32]) -> Telling {
         let core = d.core();
         let contacts = core.contacts();
-        let members = match core.spaces.get(id).and_then(|h| h.space.as_ref()) {
-            Some(sp) => group::members(sp),
-            None => Vec::new(),
-        };
+        let open = core.spaces.get(id).and_then(|h| h.space.as_ref());
+        let members = open.map(group::members).unwrap_or_default();
+        let joined = open.is_some_and(|sp| group::joined(sp, me));
         let others = core.not_contacts_in(id);
         let who: Vec<String> = others
             .iter()
@@ -265,7 +267,7 @@ impl Telling {
         let what: Vec<String> = endpoints.map(|e| e.to_string()).collect();
         Telling {
             shared: !core.reach_of(id, me).is_empty(),
-            ask: !hosts.is_empty() && !who.is_empty() && !core.reach_is_set(id, me),
+            ask: !hosts.is_empty() && !who.is_empty() && (!joined || !core.reach_is_set(id, me)),
             who,
             what,
         }

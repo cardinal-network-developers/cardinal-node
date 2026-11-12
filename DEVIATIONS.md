@@ -31,10 +31,9 @@ follow it across two spaces. What still differs:
   by a device that is then retired or lost, the space node's field 4 in the
   account space, and tokens and storage labels that serve a successor. The
   fields that exist for it are read, written and kept, and mean nothing yet:
-  fields 3, 4 and 6 to 9 of `start`, fields 2 and 3 of `succeed`, `was` on
-  `create`. A device that receives a `succeed` that
-  ends a space stops writing in it, says nothing to its person, and goes
-  nowhere.
+  fields 3, 4 and 6 to 9 of `start`, fields 2 and 3 of `succeed`, and
+  `was` on `create`. A device that receives a `succeed` that ends a space
+  stops writing in it, says nothing to its person, and goes nowhere.
 - **Taking someone out of a group** is a succession, so `group-remove` fails
   with a message saying that it cannot be done yet, and changes nothing.
   Lowering an admin is the same. Nothing in the local interface makes
@@ -367,8 +366,15 @@ below, each under its section.
   random histories of several people with thieves, strangers and removed
   devices, in the order written, in random orders with comparisons on the
   way, and with identity logs arriving late and changing under entries
-  already judged. Sixteen flaws put into the native evaluation one at a
-  time were each caught.
+  already judged. The histories include entries their author signed
+  twice, bodies signed again by another key, and `set`s on reach nodes,
+  one's own and other people's. Fifteen flaws put into the native
+  evaluation one at a time were each caught by that comparison, again
+  after ids came to cover the signer and reach nodes stopped being
+  created. (A sixteenth was in choosing among the signed forms of one
+  entry, which no longer exists.) What the comparison cannot catch is a
+  wrong reading of an op, since the rules program is given the same
+  reading: which op is a reader's is tested case by case instead.
 - **What an entry costs** (`tests/cost.rs`, optimized, on one laptop). In a
   two-person space, taking an entry that builds on everything held (opening
   it, checking its signature, judging it, applying it) took about 50 µs at
@@ -1104,11 +1110,11 @@ asks for around that is not built yet.
   them nothing more of the group, leave them out of its calls, and whoever
   writes next starts a new epoch in that entry, not wrapped for them. A
   reader cannot start one, and waits for a writer.
-  - **Spec ambiguity: "drops the space's keys".** The epoch keys are in
-    wraps in sealed entries the device holds, which its identity key opens
-    again, and it must go on holding the space to learn that it was added
-    again. Chose: the device keeps what it holds and stops using it. It
-    deletes neither keys nor entries.
+  - **What the device keeps.** The member's software "keeps or deletes
+    what it holds of it as its person chooses". Here it keeps it, and
+    nothing asks: it must go on holding the space to learn that it was
+    added again, and what it holds stays named, so `cardinal free-space
+    --unnamed` leaves it alone.
   - **Added again** (`spaces.md#holding-a-space`). Leaving takes the
     earlier acceptance back. Someone added again is offered the group
     again, and is in it once they write something valid that descends
@@ -1217,9 +1223,10 @@ asks for around that is not built yet.
     and each offer in `groups` carries `reach`: `shared` (this person's
     reach node there names a host), `ask` (it is theirs to say before
     anything is set: they have a host, someone there is not their contact,
-    and it was never set), `who` (the members who are not their contacts,
-    by the names this person sees) and `what` (the addresses of their
-    hosts). `group-join` takes `reach` (bool): the answer. Where `ask` is
+    and either it was never set or they are not in the group, so that an
+    offer always asks, also of someone who left and was added again),
+    `who` (the members who are not their contacts, by the names this
+    person sees) and `what` (the addresses of their hosts). `group-join` takes `reach` (bool): the answer. Where `ask` is
     true and there is no answer, it fails with the question in words and
     writes nothing; where nobody is to be asked it is not read. A new
     request `group-reach` `group` `share` (bool) sets or empties it later.
@@ -1229,6 +1236,11 @@ asks for around that is not built yet.
     contacts.** "It MUST ask first", yet joining is setting the reach
     node. Chose: with no host there is nothing anyone would learn, so the
     empty list is set without asking.
+  - **Spec gap: someone who gets a host later.** A member who joined with
+    no host, among people who are not all contacts, was never asked. When
+    they get a host nothing is set and nothing prompts: `reach` in
+    `groups` then shows `shared` false with someone in `who` and an
+    address in `what`, which is all a client needs to offer it.
   - **Spec gap: who joins later.** The person answered for the members
     there were. Someone who is not a contact and is added afterwards reads
     a reach node set before they came, and nothing says software should

@@ -368,6 +368,43 @@ fn nobody_learns_where_a_host_is_unasked() {
     );
     assert_eq!(no["ok"], false, "{no}");
 
+    // He shares it, leaves, and is added again. The offer is a new one and
+    // asks afresh: what he answered before does not stand for a group
+    // that may have changed while he was out of it.
+    ask(
+        &cy,
+        json!({"cmd": "group-reach", "group": g, "share": true}),
+    );
+    ask(&cy, json!({"cmd": "group-leave", "group": g}));
+    wait("ana sees that cy left", 30, || {
+        let m = ask(&ana, json!({"cmd": "group-members", "group": g}));
+        let all = m["members"].as_array().cloned().unwrap_or_default();
+        all.iter().any(|x| x["name"] == "Cy" && x["left"] == true)
+    });
+    ask(
+        &ana,
+        json!({"cmd": "group-add", "group": g, "people": ["Cy"]}),
+    );
+    wait("cy is offered it again", 30, || {
+        offers(&cy).iter().any(|o| o["name"] == "Club")
+    });
+    assert_eq!(reach_in(&cy, &g)["ask"], true);
+    let no = reply(&cy, &json!({"cmd": "group-join", "group": g}));
+    assert_eq!(no["ok"], false, "{no}");
+    ask(
+        &cy,
+        json!({"cmd": "group-join", "group": g, "reach": false}),
+    );
+    wait("cy joined again", 10, || {
+        groups(&cy).iter().any(|x| x["name"] == "Club")
+    });
+    let r = reach_in(&cy, &g);
+    assert_eq!(
+        (&r["shared"], &r["ask"]),
+        (&json!(false), &json!(false)),
+        "{r}"
+    );
+
     // Ana's contacts have a host of hers already, if she has one: nothing
     // is asked of her, and there is nothing for her to withhold.
     let r = reach_in(&ana, &g);
