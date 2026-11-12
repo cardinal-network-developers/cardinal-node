@@ -1102,7 +1102,10 @@ asks for around that is not built yet.
   `add_member` ops are exactly two, one for each of the two as a writer,
   and the space is not held already. Other ops in the genesis are not
   looked at: the conversation is one, and nothing says there may be no
-  others.
+  others. **Spec gap: the policy is not among what is checked.** A
+  genesis that passes can say the space is public, and then every entry
+  of the conversation carries its key in the clear. Chose: the check as
+  written.
 - **Leaving a group** (`spaces.md#members-and-roles`). `group-leave` writes
   `leave`. From then on the device finds no such group and writes nothing
   in it, and if it is a host it ends the tokens its person gave out there.
@@ -1127,6 +1130,14 @@ asks for around that is not built yet.
     Chose: the adding entry is its own acceptance.
   - A token ended on leaving never comes back. Joining again sets the
     reach node again, with new tokens.
+  - **Spec gap: the reach node of someone who left.** Leaving revokes the
+    tokens, and the member "stops writing" in the space, so the reach
+    node goes on saying where their hosts are, to everyone in the space
+    and to whoever is added later, for as long as the space lasts.
+    Nothing says to empty it, and after the `leave` it is too late.
+    Chose: what the specification says, and no more. A `set` that empties
+    it could go in the entry that holds the `leave`; a reader may write
+    both.
   - Someone who left still asks the others for the group when they meet,
     and is given nothing.
 - **Contacts are not told apart from members by more than this device's account
