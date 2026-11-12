@@ -32,6 +32,7 @@ impl Prepared {
 
 /// Creates an identity in memory with this device as its first admin.
 pub fn prepare(paths: &Paths) -> anyhow::Result<Prepared> {
+    crate::format::check(paths)?;
     if has_identity(paths) {
         anyhow::bail!(
             "this device already belongs to someone ({}). Nothing was changed.",
@@ -47,6 +48,7 @@ pub fn prepare(paths: &Paths) -> anyhow::Result<Prepared> {
 
 /// Saves a prepared identity and creates the account and files spaces.
 pub fn install(paths: &Paths, prepared: Prepared, config: &Config) -> anyhow::Result<()> {
+    crate::format::check(paths)?;
     let keys = Arc::new(Keys::load_or_create(&paths.device_key())?);
     let mut core = Core::load(paths, keys.clone())?;
     let created = prepared.created;

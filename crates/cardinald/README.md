@@ -18,6 +18,16 @@ devices, one synced folder).
 
 In the data directory:
 
+- `format` — which format the store is: one decimal number and a newline,
+  `2` for this version (`format.rs`). It is written when a store is made
+  (`init`, pairing in, restoring), before anything else. A directory that
+  holds an identity, a space or an object and has no marker is format 1,
+  what 0.1.13 and earlier wrote. The daemon, and `init`, refuse a store of
+  another format before reading or writing anything in it, and every
+  command then says so instead of only that no daemon is running.
+  `cardinal clear` (`clear.rs`) removes what the node wrote here, whatever
+  its format, so that `cardinal init` can start again; it leaves
+  `config.toml` and, unless told otherwise, `local/` and `local-shared/`.
 - `device.key` — the Ed25519 signing seed and the hybrid link key, JSON
   hex, **mode 0600**. Keeping them in the desktop keyring (Secret Service)
   or a TPM is future work.
@@ -26,6 +36,11 @@ In the data directory:
 - `spaces/<space id>/entries.log` — each space's sealed entries, likewise.
   On start, every space is rebuilt from its log: the genesis is opened,
   everything else added without an author (cheap), then evaluated once.
+- `spaces/<space id>/epochs.json` — for each epoch whose key this device
+  holds, what it held when the epoch reached it: each member's encryption
+  key (its fingerprint), who had left, and whom it knew to be frozen. The
+  next write starts a new epoch when one of those has changed since
+  (`spaces.md#when-to-rotate`).
 - `blobs/` — `FsStore` (chunks and indexes), `Fsync::Deferred`.
 - `staging/` — files being written through the mount, before they are
   encoded as blobs. Large files are never held in memory: writes go to
@@ -265,6 +280,15 @@ Copies: 3 — this device, saint-joseph, nuc (files older than an hour, spot-che
   chunks and indexes are deleted, except those a current or kept blob
   shares (identical content deduplicates). Objects no blob names are
   never deleted, and nothing stored or read in the last hour is.
+- **`cardinal free-space --unnamed`** is the pass for those: it marks
+  every object reachable from a blob reference in any entry of any space
+  this device holds, through indexes at every level, and counts the rest
+  (what a space it no longer holds left behind, or a save that never
+  finished). `--delete` removes them. If a space cannot be opened, entries
+  of one cannot be read, or an index it must follow is not here, what
+  that names cannot be told from what nothing names: it says so, says the
+  count may be too high, and deletes nothing. A device that keeps files
+  on demand lacks most indexes, so there it only counts.
 - **`cardinal free-space`** deletes every old version on this device now,
   after saying how much and asking. `cardinal status` shows how much old
   versions take (`Old versions:`), and `cardinal history` marks versions
@@ -305,7 +329,8 @@ One JSON object per line each way: `{"cmd": "status"}` →
 `{"ok": true, ...}` or `{"ok": false, "error": "...", "needs_words":
 bool}`; `needs_words` means the recovery words, as `words`, would let the
 same request through. Commands: `status`, `devices`, `remove-device`,
-`recovery-check` (`words`; changes nothing), `free-space` (`dry_run`),
+`recovery-check` (`words`; changes nothing), `free-space` (`dry_run`; or
+`unnamed`, with `delete`),
 `keep-old` (`keep`), `peer-add/remove/list`,
 `mount`, `unmount`,
 `history`, `restore`, `conflicts`, `pin`, `unpin`, `retention`,

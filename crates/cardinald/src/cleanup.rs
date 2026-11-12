@@ -16,6 +16,17 @@
 //! Objects stored or read in the last hour are never deleted: a commit
 //! writes its chunks before the entry that names them, and a reader may be
 //! using them.
+//!
+//! That pass deletes only what it knows to be old, so that a mistake in
+//! finding what is current deletes nothing. It therefore never frees an
+//! object that nothing names at all: what a space this device no longer
+//! holds left behind, or a commit that never finished. A second pass, run
+//! on purpose (`cardinal free-space --unnamed`), finds those: it marks
+//! every object reachable from a blob reference in any entry of any space
+//! held, and counts the rest. It deletes them only on the person's word,
+//! and only when it is sure: if a space cannot be read, or an index it has
+//! to follow is not here, what that names cannot be told from what nothing
+//! names, and nothing is deleted.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io;
@@ -169,6 +180,143 @@ pub fn held_objects(store: &dyn ObjectStore, b: &BlobRef, out: &mut HashSet<Id>)
         }
     }
     Ok(())
+}
+
+/// What blob references name, as far as this device can follow them.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct Named {
+    /// Every object they name, here or not: each top object, and below
+    /// every index held, what that index names.
+    pub objects: HashSet<Id>,
+    /// Indexes they name that are not in the store.
+    pub missing: u64,
+    /// Indexes they name that are in the store and cannot be read.
+    pub unreadable: u64,
+}
+
+/// Marks every object reachable from `roots`, through indexes at every
+/// level. An index that is missing or unreadable is counted: the objects
+/// it names cannot be told from objects nothing names.
+pub fn named_objects(store: &dyn ObjectStore, roots: &[BlobRef]) -> io::Result<Named> {
+    let mut out = Named::default();
+    let mut stack: Vec<(Id, [u8; 32], bool)> =
+        roots.iter().map(|b| (b.id, b.key, b.levels > 0)).collect();
+    // an index is followed once for each key it is named with: a key that
+    // does not open it is no reason not to try another that might
+    let mut followed: HashSet<(Id, [u8; 32])> = HashSet::new();
+    while let Some((id, key, index)) = stack.pop() {
+        out.objects.insert(id);
+        if !index || !followed.insert((id, key)) {
+            continue;
+        }
+        let Some(ct) = store.get(&id)? else {
+            out.missing += 1;
+            continue;
+        };
+        match decrypt(&key, &ct).and_then(|p| Index::decode(&p)) {
+            Ok(ix) => stack.extend(ix.entries.iter().map(|e| (e.id, e.key, ix.level > 0))),
+            Err(_) => out.unreadable += 1,
+        }
+    }
+    Ok(out)
+}
+
+/// The objects in the store that are not among `named`, with their sizes.
+/// Objects stored or read less than `min_age` before `now` are left out:
+/// a commit writes its chunks before the entry that names them.
+pub fn unnamed_objects(
+    store: &dyn ObjectStore,
+    named: &HashSet<Id>,
+    now: SystemTime,
+    min_age: Duration,
+) -> io::Result<Vec<(Id, u64)>> {
+    let young = |used: SystemTime| now.duration_since(used).unwrap_or_default() < min_age;
+    let all = store.list()?.into_iter();
+    let unnamed = all.filter(|o| !named.contains(&o.id) && !young(o.used));
+    Ok(unnamed.map(|o| (o.id, o.size)).collect())
+}
+
+/// What a pass for objects that nothing names found.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Unnamed {
+    /// How many objects nothing names, or how many were deleted.
+    pub objects: u64,
+    /// Their bytes.
+    pub bytes: u64,
+    /// Whether they were deleted.
+    pub deleted: bool,
+    /// Why the count may be too high. Nothing is deleted while there is
+    /// any reason.
+    pub unsure: Vec<String>,
+}
+
+fn unnamed_reasons(named: &Named, unsure: &mut Vec<String>) {
+    if named.missing > 0 {
+        unsure.push(format!(
+            "{} indexes that entries name are not on this device, so what they name cannot \
+             be told from what nothing names",
+            named.missing
+        ));
+    }
+    if named.unreadable > 0 {
+        unsure.push(format!(
+            "{} indexes that entries name cannot be read here, so what they name cannot be \
+             told from what nothing names",
+            named.unreadable
+        ));
+    }
+}
+
+/// Counts the objects in the store that nothing this device holds names,
+/// and with `delete` removes them (blocking). It never deletes an object a
+/// held space might name: with any reason to doubt the count it reports
+/// the reason and deletes nothing.
+pub fn unnamed(d: &Daemon, delete: bool) -> anyhow::Result<Unnamed> {
+    let c = &d.cleanup;
+    let _one_at_a_time = lock(&c.running);
+    // From finding what is named to deleting, no commit runs.
+    crate::fs::commit::without_commits(|| {
+        let store: &dyn ObjectStore = &*d.store;
+        let (roots, mut unsure) = d.core().named_blobs();
+        let mut named = named_objects(store, &roots)?;
+        let mut found = unnamed_objects(store, &named.objects, SystemTime::now(), c.min_age)?;
+        if delete && !found.is_empty() {
+            // What arrived meanwhile may name something that was here.
+            let (again, also) = d.core().named_blobs();
+            let known: HashSet<&BlobRef> = roots.iter().collect();
+            let new: Vec<BlobRef> = again.into_iter().filter(|b| !known.contains(b)).collect();
+            let more = named_objects(store, &new)?;
+            found.retain(|(id, _)| !more.objects.contains(id));
+            named.missing += more.missing;
+            named.unreadable += more.unreadable;
+            unsure = also;
+        }
+        unnamed_reasons(&named, &mut unsure);
+        let mut out = Unnamed {
+            objects: found.len() as u64,
+            bytes: found.iter().map(|(_, size)| size).sum(),
+            deleted: false,
+            unsure,
+        };
+        if delete && out.unsure.is_empty() {
+            (out.objects, out.bytes) = (0, 0);
+            for (id, size) in &found {
+                if store.delete(id)? {
+                    out.objects += 1;
+                    out.bytes += size;
+                }
+            }
+            out.deleted = true;
+            if out.objects > 0 {
+                tracing::info!(
+                    "deleted {} objects ({} bytes) that nothing named",
+                    out.objects,
+                    out.bytes
+                );
+            }
+        }
+        Ok(out)
+    })
 }
 
 /// What a pass found, and what it deletes.
@@ -653,6 +801,84 @@ mod tests {
         l.update(&[a, c].into(), &known, 40 * DAY_MS);
         l.update(&[a].into(), &known, 41 * DAY_MS);
         assert!(l.kept(&c, 70 * DAY_MS, keep));
+    }
+
+    /// The second pass: everything reachable from a blob reference is
+    /// named, through indexes at every level, and the rest is counted. An
+    /// index that is missing or cannot be read is said, since what it
+    /// names cannot be told from what nothing names.
+    #[test]
+    fn what_nothing_names_is_what_no_reference_reaches() {
+        let store = MemStore::new();
+        let secret = ConvergenceSecret::from_epoch_key(&[7u8; 32]);
+        let big = encode_bytes(&data(3 << 20, 1), &secret, &store).unwrap();
+        let small = encode_bytes(&data(2000, 2), &secret, &store).unwrap();
+        assert!(big.levels > 0 && small.levels == 0);
+        let stray = b"left over from a space this device no longer holds".to_vec();
+        let stray_id = *blake3::hash(&stray).as_bytes();
+        store.put(&stray_id, &stray).unwrap();
+        let all = store.list().unwrap().len();
+        let later = SystemTime::now() + Duration::from_secs(7200);
+        let hour = Duration::from_secs(3600);
+
+        // Both named: only the stray is not.
+        let named = named_objects(&store, &[big, small]).unwrap();
+        assert_eq!((named.missing, named.unreadable), (0, 0));
+        assert_eq!(named.objects.len(), all - 1);
+        let found = unnamed_objects(&store, &named.objects, later, hour).unwrap();
+        assert_eq!(found, [(stray_id, stray.len() as u64)]);
+        // What was stored within the hour is neither counted nor deleted:
+        // a commit writes its chunks before the entry that names them.
+        let now = SystemTime::now();
+        assert!(unnamed_objects(&store, &named.objects, now, hour)
+            .unwrap()
+            .is_empty());
+
+        // Naming is not holding: a blob that is not here names its top
+        // object, and that is all that can be said of it. If the top is an
+        // index, that is an index this device lacks.
+        let elsewhere = MemStore::new();
+        let away = encode_bytes(&data(3 << 20, 3), &secret, &elsewhere).unwrap();
+        let lone = encode_bytes(&data(2000, 4), &secret, &elsewhere).unwrap();
+        let named = named_objects(&store, &[big, small, lone]).unwrap();
+        assert_eq!((named.missing, named.unreadable), (0, 0));
+        let named = named_objects(&store, &[big, small, away, lone]).unwrap();
+        assert_eq!((named.missing, named.unreadable), (1, 0));
+
+        // With only the small file named, the big one's objects look
+        // unnamed: this is what the pass deletes when it is sure.
+        let named = named_objects(&store, &[small]).unwrap();
+        let found = unnamed_objects(&store, &named.objects, later, hour).unwrap();
+        assert_eq!(found.len(), all - 1);
+
+        // The big file's index is gone. Its chunks are still here, and
+        // nothing can say they are its: one index is missing, and the
+        // count is too high by every one of them.
+        assert!(store.delete(&big.id).unwrap());
+        let named = named_objects(&store, &[big, small]).unwrap();
+        assert_eq!((named.missing, named.unreadable), (1, 0));
+        assert!(named.objects.contains(&big.id));
+        let found = unnamed_objects(&store, &named.objects, later, hour).unwrap();
+        assert_eq!(found.len(), all - 2, "the stray, and every chunk of it");
+
+        // An index named with a key that does not open it cannot be read.
+        let other = MemStore::new();
+        let again = encode_bytes(&data(3 << 20, 1), &secret, &other).unwrap();
+        let wrong = BlobRef {
+            key: [9; 32],
+            ..again
+        };
+        let named = named_objects(&other, &[wrong]).unwrap();
+        assert_eq!((named.missing, named.unreadable), (0, 1));
+        assert_eq!(named.objects.len(), 1);
+        // The same index named again with the key that opens it is read.
+        let named = named_objects(&other, &[wrong, again]).unwrap();
+        assert_eq!((named.missing, named.unreadable), (0, 1));
+        assert_eq!(named.objects.len(), other.list().unwrap().len());
+        let mut why = Vec::new();
+        unnamed_reasons(&named, &mut why);
+        assert_eq!(why.len(), 1);
+        assert!(why[0].contains("cannot be read here"), "{why:?}");
     }
 
     #[test]

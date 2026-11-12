@@ -303,6 +303,31 @@ enum Cmd {
         /// Do not ask to confirm.
         #[arg(long)]
         yes: bool,
+        /// Instead, count what this device stores that nothing it holds
+        /// names: what a space it no longer holds left behind, or a save
+        /// that never finished.
+        #[arg(long)]
+        unnamed: bool,
+        /// With `--unnamed`: delete what it counted.
+        #[arg(long, requires = "unnamed")]
+        delete: bool,
+    },
+    /// Remove everything Cardinal keeps on this device, to start again in
+    /// the same place: this device's keys, who you are on it, your spaces
+    /// and their content. Your settings stay, and so do the files kept on
+    /// this device only. The daemon must be stopped first.
+    Clear {
+        /// Say what is there and what would go, and remove nothing.
+        #[arg(long)]
+        dry_run: bool,
+        /// Do not ask to type `clear`.
+        #[arg(long)]
+        yes: bool,
+        /// Also remove the files kept on this device only
+        /// (`.cardinalignore`). They are your own files and exist nowhere
+        /// else.
+        #[arg(long)]
+        including_local: bool,
     },
     /// How long this device keeps deleted files and old versions so you
     /// can restore them: a number of days (30 unless set), or `forever`.
@@ -557,7 +582,13 @@ async fn call(paths: &Paths, req: Value) -> anyhow::Result<Value> {
 
 /// The daemon's reply, whether it succeeded or not.
 async fn request(paths: &Paths, req: &Value) -> anyhow::Result<Value> {
-    control::request(&paths.socket, req).await.map_err(|_| {
+    let reply = control::request(&paths.socket, req).await;
+    if reply.is_err() {
+        // A daemon refuses to start on a store this version cannot read:
+        // say that, and not only that none is running.
+        cardinald::format::check(paths)?;
+    }
+    reply.map_err(|_| {
         anyhow::anyhow!(
             "the cardinal daemon is not running. Start it with `cardinal daemon` (or \
              `systemctl --user start cardinal` if you installed it with `cardinal install`)."
@@ -802,6 +833,154 @@ fn prompt(q: &str) -> anyhow::Result<String> {
     let mut s = String::new();
     std::io::stdin().lock().read_line(&mut s)?;
     Ok(s.trim().to_owned())
+}
+
+fn files(n: u64) -> String {
+    format!("{n} file{}", if n == 1 { "" } else { "s" })
+}
+
+/// `cardinal clear`: says what Cardinal keeps in the data directory, and
+/// on the person's word removes it, so that `cardinal init` can start
+/// again there. It reads none of it, so it works whatever version wrote it.
+async fn clear(
+    paths: &Paths,
+    dry_run: bool,
+    yes: bool,
+    including_local: bool,
+) -> anyhow::Result<()> {
+    let home = paths.home.display();
+    let stop_first = || {
+        anyhow::anyhow!(
+            "the cardinal daemon is running on {home}. Stop it first (`cardinal stop`, or \
+             `systemctl --user stop cardinal`), then run `cardinal clear` again. Nothing was \
+             changed."
+        )
+    };
+    if running(paths).await {
+        return Err(stop_first());
+    }
+    let found = cardinald::clear::found(paths);
+    let (local, local_bytes) = found.local;
+    // What `.cardinalignore` keeps on this device only, and where.
+    let holds = |d: &str| {
+        let dir = std::fs::read_dir(paths.home.join(d));
+        dir.is_ok_and(|mut r| r.next().is_some())
+    };
+    let places: Vec<String> = ["local", "local-shared"]
+        .into_iter()
+        .filter(|d| holds(d))
+        .map(|d| paths.home.join(d).display().to_string())
+        .collect();
+    let own = format!(
+        "what is kept on this device only, {} ({}) in {}: your own files, which exist nowhere \
+         else",
+        files(local),
+        human_size(local_bytes),
+        places.join(" and ")
+    );
+    if !found.anything(including_local) {
+        println!("There is nothing of Cardinal's to remove in {home}.");
+        if local > 0 {
+            println!("It leaves {own}. `--including-local` removes them.");
+        }
+        return Ok(());
+    }
+    println!("In {home}, Cardinal keeps:");
+    if found.identity {
+        println!("  this device's keys, and who you are on it");
+    }
+    if found.spaces > 0 {
+        let s = if found.spaces == 1 { "" } else { "s" };
+        println!(
+            "  {} space{s}: your files, your settings, and each conversation",
+            found.spaces
+        );
+    }
+    let (objects, object_bytes) = found.objects;
+    if objects > 0 {
+        let s = if objects == 1 { "" } else { "s" };
+        println!(
+            "  {objects} object{s} ({}): the content of files and attachments",
+            human_size(object_bytes)
+        );
+    }
+    let (staged, staged_bytes) = found.staged;
+    if staged > 0 {
+        println!(
+            "  {} ({}) that were being written and never saved",
+            files(staged),
+            human_size(staged_bytes)
+        );
+    }
+    if found.other {
+        println!("  what it remembers of your other devices and of other people");
+    }
+    println!("`cardinal clear` removes all of that. It leaves your settings (config.toml).");
+    if local > 0 && including_local {
+        println!("It also removes {own}.");
+    } else if local > 0 {
+        println!("It leaves {own}. `--including-local` removes them too.");
+    }
+    let mount = Config::load(&paths.config()).ok().and_then(|c| c.mount);
+    if let Some(m) = mount {
+        println!(
+            "Files shown in {} whose content is only on this device will be gone from this \
+             device.",
+            m.display()
+        );
+    }
+    if dry_run {
+        println!("Nothing was removed.");
+        return Ok(());
+    }
+    if !yes && prompt("Type clear to remove it: ")? != "clear" {
+        println!("Nothing was removed.");
+        return Ok(());
+    }
+    if running(paths).await {
+        return Err(stop_first());
+    }
+    cardinald::clear::clear(paths, including_local)?;
+    println!("Removed. `cardinal init` sets this device up again.");
+    Ok(())
+}
+
+/// `cardinal free-space --unnamed`: what the store holds that nothing this
+/// device holds names, and with `--delete` its removal.
+async fn free_unnamed(paths: &Paths, delete: bool) -> anyhow::Result<()> {
+    let req = json!({"cmd": "free-space", "unnamed": true, "delete": delete});
+    let v = call(paths, req).await?;
+    let objects = v["objects"].as_u64().unwrap_or(0);
+    let s = if objects == 1 { "" } else { "s" };
+    let size = human_size(v["bytes"].as_u64().unwrap_or(0));
+    let unsure: Vec<&str> = v["unsure"]
+        .as_array()
+        .map(|a| a.iter().filter_map(|x| x.as_str()).collect())
+        .unwrap_or_default();
+    if !unsure.is_empty() {
+        println!(
+            "{objects} object{s} ({size}) on this device look as if nothing names them. That \
+             count may be too high:"
+        );
+        for why in &unsure {
+            println!("  {}", printable(why));
+        }
+        if delete {
+            anyhow::bail!("nothing was deleted: some of them may be named after all");
+        }
+        println!("So `--delete` would delete nothing.");
+    } else if v["deleted"].as_bool() == Some(true) {
+        println!("Deleted {objects} object{s} ({size}) that nothing named.");
+    } else if objects == 0 {
+        println!("Everything this device stores is named by something it holds.");
+    } else {
+        println!(
+            "{objects} object{s} ({size}) on this device are named by nothing it holds. \
+             `cardinal free-space --unnamed --delete` deletes them."
+        );
+    }
+    println!("What was stored or read in the last hour is not counted.");
+    Ok(())
 }
 
 async fn init(
@@ -1930,7 +2109,17 @@ async fn client(cmd: Cmd) -> anyhow::Result<()> {
             println!("Bring one back with: cardinal restore {p} --version N");
             Ok(())
         }
-        Cmd::FreeSpace { yes } => {
+        Cmd::Clear {
+            dry_run,
+            yes,
+            including_local,
+        } => clear(&paths, dry_run, yes, including_local).await,
+        Cmd::FreeSpace {
+            unnamed: true,
+            delete,
+            ..
+        } => free_unnamed(&paths, delete).await,
+        Cmd::FreeSpace { yes, .. } => {
             let mut v = call(&paths, json!({"cmd": "free-space", "dry_run": true})).await?;
             let bytes = v["bytes"].as_u64().unwrap_or(0);
             if bytes == 0 {

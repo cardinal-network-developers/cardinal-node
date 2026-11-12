@@ -97,6 +97,11 @@ impl<T> Dag<T> {
         self.held.keys()
     }
 
+    /// The values of held entries.
+    pub fn held_values(&self) -> impl Iterator<Item = &T> {
+        self.held.values().map(|(_, value)| value)
+    }
+
     /// The value of a present entry.
     pub fn get(&self, id: &Id) -> Option<&T> {
         self.nodes.get(id).map(|n| &n.value)

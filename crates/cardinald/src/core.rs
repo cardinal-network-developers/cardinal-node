@@ -793,6 +793,9 @@ pub struct IdentityChange {
 impl Core {
     /// Loads everything from disk.
     pub fn load(paths: &Paths, keys: Arc<Keys>) -> anyhow::Result<Core> {
+        // Never opened as far as it goes: a store of another format is
+        // refused whole (`format.rs`).
+        crate::format::check(paths)?;
         let mut core = Core {
             paths: paths.clone(),
             keys,
@@ -983,6 +986,55 @@ impl Core {
     pub fn reach_is_set(&self, space: &SpaceId, who: &[u8; 32]) -> bool {
         let h = self.spaces.get(space).and_then(|h| h.space.as_ref());
         h.is_some_and(|h| cardinal_space::relationship::reach_is_set(h.state(), who))
+    }
+
+    /// Every blob reference in anything this device holds of any space:
+    /// in any op of any entry it could open, valid or not, waiting for its
+    /// parents or not, whatever the profile and wherever in the op it is.
+    /// Current values, values in conflict and old versions are all among
+    /// them. With that go the reasons it may not be all: a space that is
+    /// held and not open here, and entries that no key here opens.
+    pub fn named_blobs(&self) -> (Vec<cardinal_blob::BlobRef>, Vec<String>) {
+        use cardinal_encoding::Value;
+        fn refs_in(v: &Value, out: &mut std::collections::HashSet<cardinal_blob::BlobRef>) {
+            if let Some(r) = v.as_record() {
+                if let Ok(b) = cardinal_blob::BlobRef::from_record(r) {
+                    out.insert(b);
+                }
+                r.iter().for_each(|(_, x)| refs_in(x, out));
+            } else if let Some(list) = v.as_list() {
+                list.iter().for_each(|x| refs_in(x, out));
+            }
+        }
+        let mut refs = std::collections::HashSet::new();
+        let mut unsure = Vec::new();
+        for (id, h) in &self.spaces {
+            let Some(sp) = h.space.as_ref() else {
+                if h.set.len() > 0 {
+                    unsure.push(format!(
+                        "the space {} is held and cannot be opened here, so nothing says \
+                         what it names",
+                        short(id)
+                    ));
+                }
+                continue;
+            };
+            if !h.pending.is_empty() {
+                unsure.push(format!(
+                    "{} entries of the space {} cannot be opened here yet, so nothing says \
+                     what they name",
+                    h.pending.len(),
+                    short(id)
+                ));
+            }
+            let here = sp.dag().iter().map(|(_, e)| e);
+            for e in here.chain(sp.dag().held_values()) {
+                for op in e.ops() {
+                    op.record().iter().for_each(|(_, x)| refs_in(x, &mut refs));
+                }
+            }
+        }
+        (refs.into_iter().collect(), unsure)
     }
 
     /// The members of a space, this person aside, who are not their
@@ -1547,8 +1599,13 @@ impl Core {
         self.judge_all();
     }
 
-    /// Installs a freshly created identity (`cardinal init`).
+    /// Installs an identity on a device that has none: one freshly created
+    /// (`cardinal init`), or one this device was paired into or restored.
+    /// This is where a store is made, so the format marker is written here,
+    /// before anything else (`format.rs`).
     pub fn install_identity(&mut self, log_entries: &[Vec<u8>]) -> anyhow::Result<()> {
+        crate::format::check(&self.paths)?;
+        crate::format::write(&self.paths)?;
         {
             let (mut file, existing) = AppendLog::open(&self.paths.identity_log())?;
             if !existing.is_empty() {
@@ -2740,6 +2797,122 @@ mod tests {
         assert!(ana.began_an_epoch(&g));
         ana.says(&g, "and no more");
         assert!(!ana.began_an_epoch(&g));
+    }
+
+    /// A store is made with its marker, and one with another, or with
+    /// none, is never opened as far as it goes (`format.rs`).
+    #[test]
+    fn a_store_of_another_format_is_not_opened() {
+        use crate::format::{self, Store};
+        let ana = Person::new();
+        let paths = Paths::at(ana._dir.path());
+        assert_eq!(format::of(&paths), Store::Current);
+        let keys = ana.core.keys.clone();
+        assert!(Core::load(&paths, keys.clone()).is_ok());
+        // what 0.1.13 left, and what a later version would
+        for marker in [None, Some("1\n"), Some("3\n")] {
+            match marker {
+                None => std::fs::remove_file(format::marker(&paths)).unwrap(),
+                Some(text) => std::fs::write(format::marker(&paths), text).unwrap(),
+            }
+            let refused = Core::load(&paths, keys.clone()).err().expect("opened");
+            assert!(refused.to_string().contains("this version cannot read it"));
+            let refused = setup::prepare(&paths).err().expect("set up over it");
+            assert!(refused.to_string().contains("Nothing was changed"));
+        }
+        // An identity that arrives on a device with none, by pairing or by
+        // restoring, makes a store as `init` does.
+        let dir = tempfile::tempdir().unwrap();
+        let fresh = Paths::at(dir.path());
+        let keys = Arc::new(Keys::load_or_create(&fresh.device_key()).unwrap());
+        let mut core = Core::load(&fresh, keys).unwrap();
+        assert_eq!(format::of(&fresh), Store::Empty);
+        core.install_identity(&ana.log()).unwrap();
+        assert_eq!(format::of(&fresh), Store::Current);
+    }
+
+    /// What `cardinal free-space --unnamed` marks from: every blob
+    /// reference in any entry this device holds of any space, wherever in
+    /// an op it is, with the reasons that may not be all of them.
+    #[test]
+    fn every_blob_reference_in_what_is_held_is_named() {
+        use cardinal_blob::BlobRef;
+        use cardinal_encoding::Value;
+        use cardinal_space::files::{self, Content};
+        let (mut ana, mut bo) = (Person::new(), Person::new());
+        ana.meets(&bo);
+        bo.meets(&ana);
+        let blob = |n: u8| BlobRef {
+            id: [n; 32],
+            key: [n + 100; 32],
+            size: 5000,
+            levels: 1,
+        };
+        let content = |n: u8| {
+            let b = blob(n);
+            Content::Blob(files::BlobRef {
+                id: b.id,
+                key: b.key,
+                size: b.size,
+                levels: b.levels,
+            })
+        };
+        let named = |p: &Person| -> Vec<u8> {
+            let (refs, unsure) = p.core.named_blobs();
+            assert!(unsure.is_empty(), "{unsure:?}");
+            let mut ids: Vec<u8> = refs.iter().map(|b| b.id[0]).collect();
+            ids.sort();
+            ids
+        };
+        assert!(named(&ana).is_empty());
+
+        // A file, replaced: the old version is named as the current one is.
+        let filespace = ana.core.files_id().unwrap();
+        let made = files::create_file(ROOT, "a.bin", &content(1), 0o644, None);
+        let (entry, _) = ana.core.write_entry(&filespace, vec![made]).unwrap();
+        let node = files::created_node(&entry, 0);
+        let replaced = files::set_content(node, &content(2));
+        ana.core.write_entry(&filespace, vec![replaced]).unwrap();
+        assert_eq!(named(&ana), [1, 2]);
+
+        // An attachment in a conversation, deep in a list in a field, and
+        // a reference somewhere no profile puts one.
+        let (rel, genesis) = ana.core.create_relationship(&bo.id()).unwrap();
+        bo.core.accept_relationship(&genesis, &ana.id()).unwrap();
+        let c = relationship::conversation(ana.space(&rel)).unwrap();
+        let attached = Value::list([Record::new()
+            .with(1, "photo.jpg")
+            .with(2, blob(3).to_record())
+            .with(3, "image/jpeg")]);
+        let fields = Record::new().with(1, "look").with(2, attached);
+        let said = SpaceOp::create(NodeKind::Uint(2), c, "m", fields);
+        let odd = SpaceOp::set(c, 99, Some(Value::list([blob(4).to_record()])));
+        let (_, sent) = ana.core.write_entry(&rel, vec![said, odd]).unwrap();
+        assert_eq!(named(&ana), [1, 2, 3, 4]);
+        // Bo holds the conversation, and names what is in it.
+        bo.takes(&rel, std::slice::from_ref(&sent));
+        assert_eq!(named(&bo), [3, 4]);
+
+        // An entry held for want of its parent is read all the same.
+        let before = ana.says(&rel, "one");
+        let more = SpaceOp::set(c, 98, Some(Value::Record(blob(5).to_record())));
+        let (_, after) = ana.core.write_entry(&rel, vec![more]).unwrap();
+        bo.takes(&rel, std::slice::from_ref(&after));
+        assert!(bo.space(&rel).dag().held().next().is_some());
+        assert_eq!(named(&bo), [3, 4, 5]);
+        bo.takes(&rel, &[before]);
+        assert_eq!(named(&bo), [3, 4, 5]);
+
+        // An entry no key here opens says nothing of what it names, and
+        // that is a reason to doubt: Ana starts an epoch that is not
+        // wrapped for Bo.
+        let alone = [ana.enc()];
+        let begun = ana.begins_an_epoch(&rel, &alone);
+        bo.takes(&rel, &[begun]);
+        let (refs, unsure) = bo.core.named_blobs();
+        assert_eq!(refs.len(), 3);
+        assert_eq!(unsure.len(), 1, "{unsure:?}");
+        assert!(unsure[0].contains("1 entries") && unsure[0].contains("cannot be opened"));
     }
 
     /// In a space that has ended a device writes only what witnesses or

@@ -153,6 +153,8 @@ fn a_new_device_gets_everything_back_from_the_words_and_the_sheet() {
         String::from_utf8_lossy(&done.stdout).contains("Restored"),
         "{done:?}"
     );
+    // Restoring makes a store, which says which format it is.
+    assert_eq!(std::fs::read(new.home.join("format")).unwrap(), b"2\n");
     new.wait_mounted();
     wait("the new device has the files", 40, || {
         std::fs::read(new.p("notes.txt")).is_ok_and(|b| b == b"version 2\n")

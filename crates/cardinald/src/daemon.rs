@@ -365,6 +365,7 @@ impl Daemon {
     /// Loads everything and binds the link endpoint.
     pub async fn start(paths: Paths, config: Config) -> anyhow::Result<Arc<Daemon>> {
         raise_fd_limit();
+        crate::format::check(&paths)?;
         std::fs::create_dir_all(&paths.home)?;
         let keys = Arc::new(Keys::load_or_create(&paths.device_key())?);
         let core = Core::load(&paths, keys.clone())?;

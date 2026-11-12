@@ -8,6 +8,7 @@
 pub mod applog;
 pub mod calls;
 pub mod cleanup;
+pub mod clear;
 pub mod conditions;
 pub mod config;
 pub mod contacts;
@@ -17,6 +18,7 @@ pub mod core;
 pub mod daemon;
 pub mod directory;
 pub mod fetch;
+pub mod format;
 pub mod fs;
 pub mod fsat;
 pub mod groups;
@@ -90,6 +92,9 @@ pub async fn run(paths: Paths, o: Overrides) -> anyhow::Result<()> {
         // SAFETY: prctl with these arguments only changes who may trace us.
         unsafe { libc::prctl(libc::PR_SET_PTRACER, libc::PR_SET_PTRACER_ANY, 0, 0, 0) };
     }
+    // A store written under other rules is refused before anything in it
+    // is read or written.
+    format::check(&paths)?;
     std::fs::create_dir_all(&paths.home)?;
     let mut config = Config::load(&paths.config())?;
     let mut changed = Config::load(&paths.config()).is_ok()

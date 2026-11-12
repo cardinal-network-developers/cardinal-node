@@ -119,6 +119,40 @@ build (version `X.Y.Z-dev.N`) reads `~/.local/share/cardinal-dev-releases`,
 where `scripts/dev-release.sh` publishes; a regular build uses the project's
 GitHub releases, `https://github.com/cardinal-network-developers/cardinal-node/releases/latest/download`. `channel = "dev"` or `"stable"` overrides that choice.
 
+## Upgrading
+
+**This version cannot read what 0.1.13 or an earlier version stored.** What
+an id covers has changed, so nothing those versions wrote is valid by the
+rules this one follows, and nothing converts it.
+
+It does not open such a data directory, and it changes nothing in it. The
+daemon stops at once, and every command says why and what to do. If the
+service is running when you run `cardinal update`, the new version does not
+come up, so the update puts the earlier version back and you go on as
+before.
+
+To move to this version you start again, on every device: one on an
+earlier version and one on this version do not sync with each other.
+
+1. With the earlier version, copy the files you want out of your Cardinal
+   folder to somewhere else on the computer. Do it on each device that has
+   files the others do not.
+2. Stop the daemon (`systemctl --user stop cardinal`, or `cardinal stop`)
+   and install this version (`cardinal update`, or as under
+   [Install](#install)).
+3. Run `cardinal clear`. It says what is in the data directory and asks you
+   to type `clear` before it removes it. It leaves your settings, and the
+   files that `.cardinalignore` keeps on that device only.
+4. On the first device run `cardinal init`, start the daemon, and copy your
+   files back in. On each other device start the daemon and add it with
+   `cardinal pair`.
+
+`cardinal init` makes a new identity with new recovery words: write them
+down, and discard the old ones. The people you knew are invited again.
+
+A data directory says which format it is in the file `format`. One from a
+later version is refused the same way.
+
 ## Version
 
 ```sh

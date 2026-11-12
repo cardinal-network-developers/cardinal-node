@@ -533,6 +533,18 @@ async fn handle(d: &Arc<Daemon>, req: &Value) -> anyhow::Result<Value> {
         }
         "conflicts" => conflicts(d),
         "debug-tree" => debug_tree(d),
+        "free-space" if req.get("unnamed").and_then(|v| v.as_bool()) == Some(true) => {
+            let delete = req.get("delete").and_then(|v| v.as_bool()) == Some(true);
+            let d2 = d.clone();
+            let found = tokio::task::spawn_blocking(move || crate::cleanup::unnamed(&d2, delete));
+            let found = found.await??;
+            Ok(json!({
+                "objects": found.objects,
+                "bytes": found.bytes,
+                "deleted": found.deleted,
+                "unsure": found.unsure,
+            }))
+        }
         "free-space" => {
             let dry_run = req
                 .get("dry_run")

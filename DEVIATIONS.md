@@ -14,11 +14,12 @@ entry at a time ([Spaces](#spaces-specspacesmd), below). It does not yet
 follow it across two spaces. What still differs:
 
 - **No migration.** The formats changed and nothing converts what was
-  written before: a genesis now names its own author with `add_member`, an
-  entry no longer names a membership, and op 4 is `leave`. A space written
-  by 0.1.13 or earlier has a genesis the rules find badly formed, so nothing
-  in it is valid here, and a relationship made then names two owners, which
-  no space may have. Such a data directory has to be set up again.
+  written before: an id now covers who signed, a genesis names its own
+  author with `add_member`, an entry no longer names a membership, and op
+  4 is `leave`. Nothing 0.1.13 or earlier wrote is valid here. Such a data
+  directory is refused whole and left as it is, and has to be set up
+  again ([The store's format](#daemon-mount-and-cli-cardinald-cardinal),
+  `docs/install.md`, "Upgrading").
 - **Succession.** Nothing here writes a `succeed`, makes a successor, or
   follows one. What one space's validity needs of it is built: a `succeed`
   that counts closes what descends from it, a space with no owner ends when
@@ -798,6 +799,44 @@ Not implemented yet (the next milestone):
   AEAD of blob chunks).
 
 ## Daemon, mount, and CLI (`cardinald`, `cardinal`)
+
+- **The store's format** (`format.rs`; not in the specification). The data
+  directory holds `format`, one decimal number and a newline: 2. Whatever
+  makes a store writes it first: `init`, pairing in as a new device, and
+  restoring all install an identity through one function. A directory with
+  an identity, a space or an object and no marker is format 1. The daemon,
+  `init`, and anything else that opens the store refuse another format
+  before reading or writing anything in it, in words that name the
+  directory, say an earlier (or later) version wrote it, that this one
+  cannot read it and changed nothing, and what to do; every command says
+  the same when no daemon answers. A marker that is not a number is
+  another version's.
+- **`cardinal clear`** (`clear.rs`) removes what the node wrote in the
+  data directory, by name and without reading it, so it works on a store
+  of any format: the keys, the identity log, the spaces, the objects,
+  files being written, other people's logs, the mailbox, the state files
+  and the marker. It leaves `config.toml`, anything there the node did not
+  write, and the files kept on this device only, which it removes with
+  `--including-local`. Those are `local/` and also `local-shared/`, which
+  holds the same kind of file for folders shared with someone. It refuses
+  while a daemon answers on that directory, says what is there first, and
+  without `--yes` asks for the word `clear`. The marker goes first and the
+  identity log last, so that an interrupted clear leaves a directory that
+  nothing opens and that clearing again finishes.
+- **Objects that nothing names** (`cleanup.rs`, `cardinal free-space
+  --unnamed [--delete]`). An object is named if it is reachable, through
+  indexes at every level, from a blob reference anywhere in any op of any
+  entry this device could open in any space it holds: valid or not,
+  waiting for its parents or not. That takes in current values, every
+  value of a field in conflict, and every old version, kept or not: an
+  old version past its keep period is still named, and `free-space`
+  frees it, so the two passes never delete the same thing. What is being
+  written is covered as in the hourly pass: no commit runs meanwhile, and
+  nothing stored or read in the last hour is counted. The count may be
+  too high, and nothing is deleted, when a space is held and not open,
+  when entries of a space cannot be opened yet, or when an index that an
+  entry names is missing or unreadable. On a device that keeps files on
+  demand most indexes are missing, so there it can only count.
 
 - **What a flush promises** (`profiles.md#mapping-to-a-disk-guidance`). An
   `fsync` through the mount flushes the staging file and, the first time

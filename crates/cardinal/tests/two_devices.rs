@@ -30,8 +30,14 @@ fn two_devices() {
     let out = a.cli(&["init", "--yes", "--name", "alpha"]);
     assert!(out.contains("Set up"), "{out}");
     a.wait_mounted();
+    // A device with nobody on it holds no store yet, and so no marker.
+    assert!(!b.home.join("format").exists());
     pair(&a, &b);
     b.wait_mounted();
+    // Pairing in makes a store, as `init` does: each says which format it is.
+    for d in [&a, &b] {
+        assert_eq!(std::fs::read(d.home.join("format")).unwrap(), b"2\n");
+    }
     let devs = a.status()["devices"].clone();
     assert_eq!(devs.as_array().unwrap().len(), 2, "{devs}");
 
