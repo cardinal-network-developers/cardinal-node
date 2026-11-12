@@ -374,11 +374,6 @@ pub struct Judge {
     waiting: HashMap<IdentityId, HashMap<KeyId, HashSet<EntryId>>>,
     /// By entry id: the entries whose `keep` ops list it, here or not yet.
     listed: HashMap<EntryId, Vec<EntryId>>,
-    /// By entry id: the keys of other signed objects held with the same
-    /// body, and so the same id, as the one in the graph. An entry id does
-    /// not cover the signature, so anyone can sign someone's entry again
-    /// with a key of their own (see [`Judge::key_of`]).
-    also: HashMap<EntryId, Vec<KeyId>>,
     /// The evaluated identity logs of authors, as far as they are held.
     states: HashMap<IdentityId, Arc<IdentityState>>,
     genesis: Option<Genesis>,
@@ -400,7 +395,6 @@ impl Judge {
             leaves: HashMap::new(),
             waiting: HashMap::new(),
             listed: HashMap::new(),
-            also: HashMap::new(),
             states: HashMap::new(),
             genesis: None,
             root: false,
@@ -429,50 +423,6 @@ impl Judge {
         self.info.get(id)?.marked.as_deref()
     }
 
-    /// The key an entry is judged as signed by.
-    ///
-    /// The id of an entry is the hash of its body, so the same entry can be
-    /// held under more than one signature: its author's, and any that
-    /// someone else made over the same body with a key of their own. The
-    /// rules read one signing key for an entry. So that the answer does not
-    /// depend on which signed object arrived first, and so that nobody can
-    /// void an entry by signing it again, the key is chosen from all that
-    /// are held: one in effect at the cited head of the author's log before
-    /// one that is not, then one not removed since before one that was, then
-    /// the smallest, compared as bytes.
-    pub fn key_of(&self, dag: &Dag<SpaceEntry>, id: &EntryId) -> Option<KeyId> {
-        let e = dag.get(id)?;
-        let first = e.signer();
-        let Some(also) = self.also.get(id) else {
-            return Some(first);
-        };
-        let state = self.states.get(&e.author());
-        let head = e.author_head();
-        let rank = |k: &KeyId| {
-            let counts = state.is_some_and(|st| st.is_effective_at(k, &head));
-            let removed = state.is_some_and(|st| st.is_removed(k));
-            (!counts, removed, *k)
-        };
-        std::iter::once(first)
-            .chain(also.iter().copied())
-            .min_by_key(rank)
-    }
-
-    /// Takes the key of another signed object with the body of the entry
-    /// `id`, which may not have arrived yet. Returns the entries whose
-    /// validity changed.
-    pub fn also_signed(&mut self, dag: &Dag<SpaceEntry>, id: &EntryId, key: KeyId) -> Vec<EntryId> {
-        let known = self.also.entry(*id).or_default();
-        if known.contains(&key) {
-            return Vec::new();
-        }
-        known.push(key);
-        match dag.get(id).filter(|_| self.info.contains_key(id)) {
-            Some(e) => self.recount(dag, &e.author()),
-            None => Vec::new(),
-        }
-    }
-
     // ---------------------------------------------------------- arrival
 
     /// Judges an entry that has just been added to `dag`. Returns the
@@ -485,8 +435,7 @@ impl Judge {
     /// never given to this judge.
     pub fn arrive(&mut self, dag: &Dag<SpaceEntry>, id: &EntryId) -> Vec<EntryId> {
         let e = dag.get(id).expect("an entry that arrived is in the graph");
-        let key = self.key_of(dag, id).expect("it is in the graph");
-        let (author, head) = (e.author(), e.author_head());
+        let (author, key, head) = (e.author(), e.signer(), e.author_head());
         // A space has one genesis: its id is the space's. A second entry
         // without parents is nothing here, whatever it says.
         let genesis = e.is_genesis() && self.genesis.as_ref().is_none_or(|g| g.id == *id);
@@ -701,10 +650,8 @@ impl Judge {
     /// trusted: the entries of `w`'s author that wait and that `w`, whose
     /// signature counts, witnesses.
     fn witness_from(&mut self, dag: &Dag<SpaceEntry>, w: &EntryId, counted: &mut Vec<EntryId>) {
-        let (Some(we), Some(key)) = (dag.get(w), self.key_of(dag, w)) else {
-            return;
-        };
-        let (author, head) = (we.author(), we.author_head());
+        let Some(we) = dag.get(w) else { return };
+        let (author, key, head) = (we.author(), we.signer(), we.author_head());
         let (Some(waiting), Some(state)) = (self.waiting.get(&author), self.states.get(&author))
         else {
             return;
@@ -797,10 +744,7 @@ impl Judge {
         }
         let sig = |x: &EntryId| {
             let e = dag.get(x).expect("entries judged are in the graph");
-            let key = self
-                .key_of(dag, x)
-                .expect("entries judged are in the graph");
-            (key, e.author_head())
+            (e.signer(), e.author_head())
         };
         let mut attrib: HashSet<EntryId> = HashSet::new();
         let mut ok: HashSet<EntryId> = HashSet::new();
@@ -1171,7 +1115,7 @@ impl Judge {
     /// the same author signed with another key descends from. What ends or
     /// begins a space is left out: building on it keeps nothing.
     pub fn unwitnessed_work(&self, dag: &Dag<SpaceEntry>, key: &KeyId) -> bool {
-        let signer = |x: &EntryId| self.key_of(dag, x);
+        let signer = |x: &EntryId| dag.get(x).map(|e| e.signer());
         let mut built_on = Vec::new();
         let mut theirs = Vec::new();
         for entries in self.by_author.values() {
@@ -1219,17 +1163,6 @@ pub struct ByRules {
 /// the native evaluation is tested against, not something to run on a
 /// space of any size.
 pub fn by_rules(dag: &Dag<SpaceEntry>, logs: &[&IdentityLog]) -> Result<ByRules, Error> {
-    by_rules_as(dag, logs, &|_, e| e.signer())
-}
-
-/// [`by_rules`], with each entry read as signed by the key `signer` gives:
-/// for a history in which an entry is held under more than one signature
-/// ([`Judge::key_of`]).
-pub fn by_rules_as(
-    dag: &Dag<SpaceEntry>,
-    logs: &[&IdentityLog],
-    signer: &dyn Fn(&EntryId, &SpaceEntry) -> KeyId,
-) -> Result<ByRules, Error> {
     let g = dag.log_order().first().and_then(|g| dag.get(g));
     let g = g.ok_or(Error::Malformed("no genesis"))?;
     let space = g.id();
@@ -1268,7 +1201,7 @@ pub fn by_rules_as(
             id: sym(&mut w, id),
             log: space_sym,
             parents: e.parents().iter().map(|p| sym(&mut w, p)).collect(),
-            signer: sym(&mut w, &signer(id, e)),
+            signer: sym(&mut w, &e.signer()),
             ops,
             author: Some(sym(&mut w, &e.author())),
             head: Some(sym(&mut w, &e.author_head())),

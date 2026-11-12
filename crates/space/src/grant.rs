@@ -7,7 +7,7 @@ use std::net::{IpAddr, SocketAddr};
 
 use cardinal_crypto::{HybridPublicKey, SigningKey};
 use cardinal_encoding::kind::HOST_GRANT;
-use cardinal_encoding::{Kind, ObjectSignature, Record, SignedObject, Value};
+use cardinal_encoding::{Kind, Record, SignedObject, Value};
 use cardinal_identity::KeyId;
 
 /// The mailbox service.
@@ -128,8 +128,7 @@ impl Grant {
             )
             .with(8, self.link_key.to_record());
         let mut o = SignedObject::new(inner);
-        let signature = key.sign(&o.signing_message());
-        o.add_signature(ObjectSignature::new(key.public_key(), signature));
+        key.sign_object(&mut o);
         o.encode()
     }
 

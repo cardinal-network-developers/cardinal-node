@@ -40,7 +40,7 @@ pub use hybrid::{HybridKeyPair, HybridPublicKey};
 pub use kem::{KemPublicKey, KemSecretKey};
 pub use random::{fill_random, random_bytes};
 pub use seal::{open, seal, Sealed};
-pub use sign::{verify, verify_object, verify_object_signature, SigningKey};
+pub use sign::{sign_object, verify, verify_object, verify_object_signature, SigningKey};
 pub use x25519::X25519Secret;
 pub use zeroize::{Zeroize, Zeroizing};
 

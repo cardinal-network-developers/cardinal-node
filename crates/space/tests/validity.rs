@@ -2,8 +2,9 @@
 //! `space` program of `model/rules.md`, on random histories with several
 //! people, an owner or none, admins who add, removed devices, stale heads,
 //! witnesses, `keep` ops, successions, thieves who write with a device's key
-//! after it is removed, strangers who were never added, and entries that
-//! someone signed again with a key of their own.
+//! after it is removed, strangers who were never added, entries whose body
+//! someone signed with a key of their own, which are other entries, and
+//! entries their author signed twice, which are one entry in two forms.
 //!
 //! Three things are checked on each history:
 //!
@@ -22,14 +23,14 @@ use std::collections::HashSet;
 use std::sync::{Arc, OnceLock};
 
 use cardinal_crypto::{HybridKeyPair, RecoveryPhrase, SigningKey};
-use cardinal_encoding::{Record, Value};
+use cardinal_encoding::{ObjectSignature, Record, Value};
 use cardinal_identity::dag::{Dag, Inserted};
 use cardinal_identity::{
     Created, DeviceKeys, EntryBuilder, EntryId, IdentityEntry, IdentityLog, IdentityOp,
     IdentityState, Power,
 };
 use cardinal_space::entry::{derived_id, NodeId, ADMIN, OWNER, READER, WRITER};
-use cardinal_space::validity::{by_rules_as, Judge, Validity};
+use cardinal_space::validity::{by_rules, Judge, Validity};
 use cardinal_space::{
     group, EpochKey, NodeKind, Policy, Profile, SealedEntry, Space, SpaceEntry, SpaceEntryBuilder,
     SpaceOp, State, ROOT,
@@ -250,22 +251,46 @@ fn history(seed: u64, steps: usize) -> History {
             }
             continue;
         }
-        if entries.len() > 1 && rng.chance(4) {
-            // Someone signs an entry again: the same body, and so the same
-            // id, under another key. Its author's other device, or anyone.
+        if entries.len() > 1 && rng.chance(5) {
             let e = &entries[1 + rng.below(entries.len() - 1)];
+            let all_keys = people.iter().flat_map(|p| p.keys.iter());
+            let signer = all_keys.clone().find(|k| k.public_key() == e.signer());
+            if let (Some(signer), true) = (signer, rng.chance(50)) {
+                // Its author signs an entry again: the same entry, with the
+                // same id, in another signed form.
+                let mut obj = e.signed().clone();
+                let salt = [rng.below(250) as u8; 32];
+                let signature = signer.sign_salted(&obj.signing_message(), &salt);
+                obj.add_signature(ObjectSignature::new(signer.public_key(), signature));
+                let again = SpaceEntry::from_signed(obj).unwrap();
+                assert_eq!(again.id(), e.id());
+                assert_ne!(again.encode(), e.encode());
+                entries.push(again);
+                continue;
+            }
+            // Someone signs an entry's body with a key of their own: its
+            // author's other device, or anyone. That is another entry, with
+            // another id, judged on its own.
             let author = people.iter().position(|p| p.log.id() == e.author());
             let by = match author {
                 Some(a) if rng.chance(50) => a,
                 _ => rng.below(PEOPLE),
             };
-            let again =
+            let key = &people[by].keys[rng.below(3)];
+            if key.public_key() == e.signer() {
+                continue;
+            }
+            let other =
                 SpaceEntryBuilder::new(space, e.parents(), e.author(), e.author_head(), e.epoch())
                     .ops(e.ops().to_vec())
-                    .sign(&people[by].keys[rng.below(3)])
+                    .sign(key)
                     .unwrap();
-            assert_eq!(again.id(), e.id());
-            entries.push(again);
+            assert_ne!(other.id(), e.id());
+            if dag.contains(&other.id()) {
+                continue;
+            }
+            dag.insert(other.id(), other.parents().to_vec(), other.clone());
+            entries.push(other);
             continue;
         }
         // who writes, and with which key: its owner, a thief who holds it
@@ -431,9 +456,7 @@ fn same_validity(a: &Validity, b: &Validity, what: &str) {
 /// Everything the native evaluation found against everything the program
 /// finds, for what has arrived in `dag`.
 fn compare(judge: &Judge, dag: &Dag<SpaceEntry>, logs: &[&IdentityLog], what: &str) {
-    // an entry held under two signatures is read by the one the judge reads
-    let signer = |x: &EntryId, _: &SpaceEntry| judge.key_of(dag, x).unwrap();
-    let rules = by_rules_as(dag, logs, &signer).unwrap();
+    let rules = by_rules(dag, logs).unwrap();
     let found = judge.validity();
     same(
         &found.author_ok,
@@ -467,11 +490,8 @@ fn arrive(judge: &mut Judge, dag: &mut Dag<SpaceEntry>, e: &SpaceEntry) {
                 judge.arrive(dag, &x);
             }
         }
-        // the same entry under another signature
-        Inserted::Duplicate => {
-            judge.also_signed(dag, &e.id(), e.signer());
-        }
-        Inserted::Held(_) => {}
+        // the same entry, signed again by its author: judged once
+        Inserted::Duplicate | Inserted::Held(_) => {}
     }
 }
 
@@ -675,6 +695,16 @@ fn run_space(seed: u64, steps: usize) -> (u64, u64) {
     }
     space.set_identities(h.states());
     check_space(&space, &logs, &format!("space (seed {seed})"));
+    // Every sealed form it was given is kept, so that sets reconcile, and
+    // an entry signed twice by its author is one entry.
+    let forms: HashSet<[u8; 32]> = sealed.iter().map(|s| s.sealed_id()).collect();
+    let kept: HashSet<[u8; 32]> = space.sealed_entries().map(|(_, s)| s.sealed_id()).collect();
+    assert!(
+        forms.is_subset(&kept),
+        "a sealed form was dropped (seed {seed})"
+    );
+    let ids: HashSet<EntryId> = h.entries.iter().map(|e| e.id()).collect();
+    assert_eq!(space.dag().len() + space.dag().held().count(), ids.len());
 
     // A device that writes here builds on what it holds valid, and what it
     // writes is judged like anything else.
@@ -1197,40 +1227,52 @@ fn a_frozen_member_is_judged_like_anyone() {
 }
 
 #[test]
-fn an_entry_signed_twice_is_judged_by_one_key_whichever_came_first() {
-    // The id of an entry does not cover its signature. Whoever holds a key
-    // can sign someone's entry again; that must neither void it nor depend
-    // on which signed object a device saw first.
-    let people = people();
-    let (ana, eve) = (&people[ANA], &people[EVE]);
-    let head = *ana.log.dag().log_order().last().unwrap();
-    let genesis = || {
-        SpaceEntryBuilder::genesis(ana.log.id(), head, [1; 16])
-            .op(SpaceOp::start(group::GROUP, &Policy::default()))
-            .op(SpaceOp::add_member(ana.log.id(), OWNER))
-    };
-    let g = genesis().sign(&ana.keys[A]).unwrap();
+fn an_id_says_who_signed() {
+    // An entry's id covers its signing key. The same body signed by another
+    // key is another entry, judged on its own: nobody can put their own
+    // signature in place of an author's and pass it off as the same entry,
+    // and nothing depends on which arrived first.
+    let mut people = people();
+    let head = *people[ANA].log.dag().log_order().last().unwrap();
+    let ana_id = people[ANA].log.id();
+    let g = SpaceEntryBuilder::genesis(ana_id, head, [1; 16])
+        .op(SpaceOp::start(group::GROUP, &Policy::default()))
+        .op(SpaceOp::add_member(ana_id, OWNER))
+        .sign(&people[ANA].keys[A])
+        .unwrap();
     let entry = |key: &SigningKey| {
-        SpaceEntryBuilder::new(g.id(), &[g.id()], ana.log.id(), head, [1; 16])
+        SpaceEntryBuilder::new(g.id(), &[g.id()], ana_id, head, [1; 16])
             .op(folder())
             .sign(key)
             .unwrap()
     };
-    let (hers, forged, phone) = (
-        entry(&ana.keys[A]),
-        entry(&eve.keys[A]),
-        entry(&ana.keys[P]),
-    );
-    assert!(hers.id() == forged.id() && hers.id() == phone.id());
-    let mut logs = people.iter().map(|p| &p.log).collect::<Vec<_>>();
-    // of her two keys, both in effect, the smaller: never the stranger's
-    let (a, p) = (ana.keys[A].public_key(), ana.keys[P].public_key());
-    let chosen = a.min(p);
-    for order in [
-        [&hers, &forged, &phone],
-        [&forged, &phone, &hers],
-        [&phone, &hers, &forged],
-    ] {
+    let hers = entry(&people[ANA].keys[A]);
+    let forged = entry(&people[EVE].keys[A]);
+    let phone = entry(&people[ANA].keys[P]);
+    assert!(hers.id() != forged.id() && hers.id() != phone.id() && forged.id() != phone.id());
+    assert_eq!(hers.record(), forged.record());
+    // her own signature made again is the same entry
+    let again = {
+        let mut obj = hers.signed().clone();
+        let key = &people[ANA].keys[A];
+        let signature = key.sign_salted(&obj.signing_message(), &[3; 32]);
+        obj.add_signature(ObjectSignature::new(key.public_key(), signature));
+        SpaceEntry::from_signed(obj).unwrap()
+    };
+    assert_eq!(again.id(), hers.id());
+    assert_ne!(again.encode(), hers.encode());
+    // a signature moved from one to another is no signature
+    let mut moved = hers.signed().clone();
+    let theirs = forged.signed().signatures()[0].signature;
+    moved.add_signature(ObjectSignature::new(hers.signer(), theirs));
+    assert!(SpaceEntry::from_signed(moved).is_err());
+
+    let orders = [
+        [&hers, &forged, &phone, &again],
+        [&forged, &phone, &again, &hers],
+        [&phone, &again, &hers, &forged],
+    ];
+    for order in orders {
         let (mut dag, mut judge) = (Dag::new(), Judge::new(group::GROUP));
         for p in &people {
             judge.set_state(&dag, p.log.state());
@@ -1239,31 +1281,86 @@ fn an_entry_signed_twice_is_judged_by_one_key_whichever_came_first() {
         for e in order {
             arrive(&mut judge, &mut dag, e);
         }
-        compare(&judge, &dag, &logs, "signed twice");
-        assert!(judge.validity().is_valid(&hers.id()));
-        assert!(judge.key_of(&dag, &hers.id()) == Some(chosen));
+        let logs: Vec<&IdentityLog> = people.iter().map(|p| &p.log).collect();
+        compare(&judge, &dag, &logs, "signed by three keys");
+        assert_eq!(dag.len(), 4);
+        let valid = &judge.validity().valid;
+        assert!(valid.contains(&hers.id()) && valid.contains(&phone.id()));
+        assert!(!valid.contains(&forged.id()));
     }
-    // With only the phone's signature and a stranger's, the entry is the
-    // phone's, and falls with it.
-    let mut people = people;
+    // The phone's falls with the phone, and hers does not.
     let (mut dag, mut judge) = (Dag::new(), Judge::new(group::GROUP));
     for p in &people {
         judge.set_state(&dag, p.log.state());
     }
-    for e in [&g, &forged, &phone] {
+    for e in [&g, &forged, &phone, &hers] {
         arrive(&mut judge, &mut dag, e);
     }
-    assert!(judge.validity().is_valid(&hers.id()));
     let ana = &mut people[ANA];
     let key = ana.keys[P].public_key();
     ana.log.remove_key(&ana.keys[A], &key).unwrap();
     judge.set_state(&dag, ana.log.state());
-    assert!(!judge.validity().is_valid(&hers.id()));
-    logs = people.iter().map(|p| &p.log).collect();
-    compare(&judge, &dag, &logs, "signed twice, and the key removed");
-    // Her own signature, arriving last, is the one that counts.
-    arrive(&mut judge, &mut dag, &hers);
-    assert!(judge.validity().is_valid(&hers.id()));
-    assert!(judge.key_of(&dag, &hers.id()) == Some(a));
-    compare(&judge, &dag, &logs, "signed twice, and then by her");
+    let valid = &judge.validity().valid;
+    assert!(valid.contains(&hers.id()) && !valid.contains(&phone.id()));
+    let logs: Vec<&IdentityLog> = people.iter().map(|p| &p.log).collect();
+    compare(&judge, &dag, &logs, "signed by three keys, and one removed");
+}
+
+#[test]
+fn an_entry_signed_twice_has_two_sealed_forms_and_is_judged_once() {
+    let people = people();
+    let ana = &people[ANA];
+    let enc = member_key();
+    let (mut a, genesis) = Space::create(
+        group::GROUP,
+        Policy::default(),
+        &ana.log,
+        &ana.keys[A],
+        &[enc.public_key()],
+        None,
+    )
+    .unwrap();
+    let (id, first) = a
+        .write_entry(&ana.log, &ana.keys[A], vec![folder()], None)
+        .unwrap();
+    let epoch = a
+        .keyring()
+        .get(&a.current_epoch().unwrap())
+        .unwrap()
+        .clone();
+    let second = {
+        let mut obj = a.entry(&id).unwrap().signed().clone();
+        let signature = ana.keys[A].sign_salted(&obj.signing_message(), &[9; 32]);
+        obj.add_signature(ObjectSignature::new(ana.keys[A].public_key(), signature));
+        let again = SpaceEntry::from_signed(obj).unwrap();
+        assert_eq!(again.id(), id);
+        SealedEntry::seal(&again, &epoch, None, false).unwrap()
+    };
+    // two plaintexts, two nonces, two sealed ids; sealing either again
+    // gives the same bytes
+    assert_ne!(first.sealed_id(), second.sealed_id());
+    assert_ne!(first.encode(), second.encode());
+    for (one, other) in [(&first, &second), (&second, &first)] {
+        let mut b = Space::open_genesis(&genesis, &[enc], Some(ana.log.state())).unwrap();
+        assert!(matches!(
+            b.receive(one.clone(), &[enc]).unwrap(),
+            Inserted::Added(_)
+        ));
+        let state = b.state().canonical();
+        assert_eq!(
+            b.receive(other.clone(), &[enc]).unwrap(),
+            Inserted::Duplicate
+        );
+        assert_eq!(
+            b.receive(other.clone(), &[enc]).unwrap(),
+            Inserted::Duplicate
+        );
+        // one entry, applied once, and both forms kept for whoever asks
+        assert_eq!(b.dag().len(), 2);
+        assert!(b.validity().is_valid(&id));
+        assert_eq!(b.state().canonical(), state);
+        let kept: HashSet<[u8; 32]> = b.sealed_entries().map(|(_, s)| s.sealed_id()).collect();
+        assert_eq!(kept.len(), 3);
+        assert!(kept.contains(&first.sealed_id()) && kept.contains(&second.sealed_id()));
+    }
 }

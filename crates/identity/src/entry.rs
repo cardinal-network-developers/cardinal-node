@@ -733,9 +733,25 @@ mod tests {
         bytes[n - 1] ^= 1;
         assert_eq!(IdentityEntry::decode(&bytes), Err(Error::BadSignature));
         // two signatures
+        let other = SigningKey::from_seed(&[2; 32]);
         let mut obj = e.signed().clone();
-        SigningKey::from_seed(&[2; 32]).sign_object(&mut obj);
+        cardinal_crypto::sign_object(&mut obj, &[&k, &other]);
         assert!(IdentityEntry::from_signed(obj).is_err());
+        // the same body signed by another key is another entry
+        let mut obj = e.signed().clone();
+        other.sign_object(&mut obj);
+        let theirs = IdentityEntry::from_signed(obj).unwrap();
+        assert_ne!(theirs.id(), e.id());
+        assert_eq!(theirs.signer(), other.public_key());
+        // a signature made for one does not pass on the other
+        let mut obj = e.signed().clone();
+        let stolen = theirs.signed().signatures()[0].clone();
+        obj.sign_with(&[stolen.key], |_, _| stolen.signature);
+        assert_eq!(obj.id(), theirs.id());
+        let mut obj = e.signed().clone();
+        let mine = obj.signatures()[0].signature;
+        obj.sign_with(&[other.public_key()], |_, _| mine);
+        assert_eq!(IdentityEntry::from_signed(obj), Err(Error::BadSignature));
         // a non-genesis entry without parents
         assert!(EntryBuilder::new([1; 32], &[]).sign(&k).is_err());
     }

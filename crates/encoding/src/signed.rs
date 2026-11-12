@@ -2,6 +2,11 @@
 //!
 //! Producing and checking the Ed25519 signatures is the job of
 //! `cardinal-crypto`, which works on [`SignedObject::signing_message`].
+//!
+//! An id says what was signed, and by whom: it covers the body and the keys
+//! of the signatures, in order. So the same body signed by another key is
+//! another object, and a key is added to an object only by everyone signing
+//! again.
 
 use crate::kind::SIGNED_OBJECT;
 use crate::{Error, Kind, Record, SchemaError, Value};
@@ -12,54 +17,51 @@ pub const SIGNATURE_DOMAIN: &[u8; 14] = b"cardinal sig 1";
 /// The length of the message each signature covers: the domain and the id.
 pub const SIGNING_MESSAGE_LEN: usize = 46;
 
-/// One signature record `{1: key, 2: signature}`, with any unknown fields.
+/// One signature record `{1: key, 2: signature}`. It holds nothing else.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ObjectSignature {
     /// The Ed25519 public key.
     pub key: [u8; 32],
     /// The Ed25519 signature over [`SignedObject::signing_message`].
     pub signature: [u8; 64],
-    /// Fields other than 1 and 2, preserved.
-    pub extra: Record,
 }
 
 impl ObjectSignature {
-    /// A signature with no extra fields.
+    /// A signature record.
     pub fn new(key: [u8; 32], signature: [u8; 64]) -> ObjectSignature {
-        ObjectSignature {
-            key,
-            signature,
-            extra: Record::new(),
-        }
+        ObjectSignature { key, signature }
     }
 
     /// The signature record.
     pub fn to_record(&self) -> Record {
-        let mut r = self.extra.clone();
-        r.insert(1, self.key);
-        r.insert(2, self.signature);
-        r
+        Record::new().with(1, self.key).with(2, self.signature)
     }
 
-    /// Reads a signature record.
+    /// Reads a signature record. Nothing binds a key other than 1 and 2,
+    /// so one that holds any other is rejected.
     pub fn from_record(r: &Record) -> Result<ObjectSignature, SchemaError> {
+        if r.keys().any(|k| k != 1 && k != 2) {
+            return Err(SchemaError::Invalid(
+                "a signature record holds only a key and a signature",
+            ));
+        }
         Ok(ObjectSignature {
             key: r.bytes_n(1)?,
             signature: r.bytes_n(2)?,
-            extra: r.without(&[1, 2]),
         })
     }
 }
 
-/// A signed object `{0: 1, 1: body, 2: signatures}`.
+/// A signed object `{0: 1, 1: body, 2: signatures}`. It holds nothing else.
 ///
-/// The body is kept as its original bytes; the id is `BLAKE3(body)`.
+/// The body is kept as its original bytes. The id is `BLAKE3` of the
+/// encoding of `{1: body, 2: keys}`, the keys being those of the
+/// signatures, in order.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SignedObject {
     body: Vec<u8>,
     inner: Record,
     signatures: Vec<ObjectSignature>,
-    extra: Record,
 }
 
 impl SignedObject {
@@ -69,7 +71,6 @@ impl SignedObject {
             body: inner.encode(),
             inner,
             signatures: Vec::new(),
-            extra: Record::new(),
         }
     }
 
@@ -80,7 +81,6 @@ impl SignedObject {
             body,
             inner,
             signatures: Vec::new(),
-            extra: Record::new(),
         })
     }
 
@@ -94,9 +94,12 @@ impl SignedObject {
         &self.inner
     }
 
-    /// The object id, `BLAKE3(body)`.
+    /// The object id: it covers the body and the keys of the signatures
+    /// the object bears now. An object with no signature yet has the id of
+    /// the body signed by nobody.
     pub fn id(&self) -> [u8; 32] {
-        object_id(&self.body)
+        let keys: Vec<[u8; 32]> = self.signatures.iter().map(|s| s.key).collect();
+        object_id(&self.body, &keys)
     }
 
     /// The 46 bytes each signature covers: `"cardinal sig 1" || id`.
@@ -109,13 +112,30 @@ impl SignedObject {
         &self.signatures
     }
 
-    /// Fields of the outer record other than 0, 1, and 2, preserved.
-    pub fn extra(&self) -> &Record {
-        &self.extra
+    /// Signs the object by `keys`, replacing whatever signatures it bore:
+    /// `sign` is given each key and the message it signs, which names them
+    /// all. The id covers the signing keys, so a signer cannot be added to
+    /// an object afterwards without the others signing again.
+    pub fn sign_with(
+        &mut self,
+        keys: &[[u8; 32]],
+        mut sign: impl FnMut(&[u8; 32], &[u8; SIGNING_MESSAGE_LEN]) -> [u8; 64],
+    ) {
+        let mut keys = keys.to_vec();
+        keys.sort_unstable();
+        keys.dedup();
+        let message = signing_message(&object_id(&self.body, &keys));
+        self.signatures = keys
+            .iter()
+            .map(|k| ObjectSignature::new(*k, sign(k, &message)))
+            .collect();
     }
 
-    /// Adds a signature, replacing any existing one by the same key, and
-    /// keeps the list sorted. Does not check the signature.
+    /// Puts a signature record in its place, replacing any by the same
+    /// key, and keeps the list sorted. Does not check the signature. A key
+    /// that was not there changes the id, and with it what every signature
+    /// has to cover: this is for reading and for tests, and
+    /// [`sign_with`](Self::sign_with) is for signing.
     pub fn add_signature(&mut self, sig: ObjectSignature) {
         match self.signatures.binary_search_by(|s| s.key.cmp(&sig.key)) {
             Ok(i) => self.signatures[i] = sig,
@@ -125,19 +145,11 @@ impl SignedObject {
 
     /// The outer record.
     pub fn to_record(&self) -> Record {
-        let mut r = self.extra.clone();
-        r.insert(0, SIGNED_OBJECT as u32);
-        r.insert(1, self.body.clone());
-        r.insert(
-            2,
-            Value::List(
-                self.signatures
-                    .iter()
-                    .map(|s| s.to_record().into())
-                    .collect(),
-            ),
-        );
-        r
+        let signatures = self.signatures.iter().map(|s| s.to_record().into());
+        Record::new()
+            .with(0, SIGNED_OBJECT as u32)
+            .with(1, self.body.clone())
+            .with(2, Value::List(signatures.collect()))
     }
 
     /// The canonical encoding of the outer record.
@@ -146,7 +158,9 @@ impl SignedObject {
     }
 
     /// Reads a signed object, checking its structure: kind 1, a body that
-    /// is one canonical record, and signatures with unique keys in order.
+    /// is one canonical record, signatures with unique keys in order, and
+    /// no key but these three. Neither the id nor a signature covers
+    /// anything else in the record, so anyone could add to it.
     pub fn from_record(r: &Record) -> Result<SignedObject, Error> {
         let kind = r.kind()?;
         if kind != Kind::Core(SIGNED_OBJECT) {
@@ -155,6 +169,11 @@ impl SignedObject {
                 found: kind,
             }
             .into());
+        }
+        if r.keys().any(|k| k > 2) {
+            return Err(
+                SchemaError::Invalid("a signed object holds only its body and signatures").into(),
+            );
         }
         let body = r.bytes(1)?.to_vec();
         let inner = Record::decode(&body)?;
@@ -175,7 +194,6 @@ impl SignedObject {
             body,
             inner,
             signatures,
-            extra: r.without(&[0, 1, 2]),
         })
     }
 
@@ -185,9 +203,13 @@ impl SignedObject {
     }
 }
 
-/// The id of an object whose canonical body is `body`: `BLAKE3(body)`.
-pub fn object_id(body: &[u8]) -> [u8; 32] {
-    *blake3::hash(body).as_bytes()
+/// The id of an object whose canonical body is `body`, signed by `keys`,
+/// in the order its signatures are in: `BLAKE3` of the encoding of
+/// `{1: body, 2: keys}`.
+pub fn object_id(body: &[u8], keys: &[[u8; 32]]) -> [u8; 32] {
+    let keys = Value::list(keys.iter().map(|k| Value::from(*k)));
+    let covered = Record::new().with(1, body.to_vec()).with(2, keys);
+    *blake3::hash(&covered.encode()).as_bytes()
 }
 
 /// The message signed for object id `id`: `"cardinal sig 1" || id`.
@@ -217,18 +239,54 @@ mod tests {
         let back = SignedObject::decode(&bytes).unwrap();
         assert_eq!(back, obj);
         assert_eq!(back.inner(), &inner);
-        assert_eq!(back.id(), *blake3::hash(&inner.encode()).as_bytes());
+        // the id covers the body and the two keys, in order
+        let covered = Record::new()
+            .with(1, inner.encode())
+            .with(2, vec![Value::from([3u8; 32]), Value::from([9u8; 32])]);
+        assert_eq!(back.id(), *blake3::hash(&covered.encode()).as_bytes());
+        assert_eq!(back.id(), object_id(&inner.encode(), &[[3; 32], [9; 32]]));
         let m = back.signing_message();
         assert_eq!(&m[..14], b"cardinal sig 1");
         assert_eq!(m[14..], back.id());
     }
 
     #[test]
-    fn signatures_do_not_change_id() {
+    fn an_id_says_what_was_signed_and_by_whom() {
         let mut obj = SignedObject::new(Record::new().with(0, 2u32));
-        let id = obj.id();
+        let unsigned = obj.id();
         obj.add_signature(ObjectSignature::new([1; 32], [1; 64]));
-        assert_eq!(obj.id(), id);
+        let by_one = obj.id();
+        assert_ne!(by_one, unsigned);
+        // the signature's bytes are not in the id: only its key is
+        obj.add_signature(ObjectSignature::new([1; 32], [7; 64]));
+        assert_eq!(obj.id(), by_one);
+        // the same body under another key is another object
+        let mut other = SignedObject::new(Record::new().with(0, 2u32));
+        other.add_signature(ObjectSignature::new([2; 32], [1; 64]));
+        assert_ne!(other.id(), by_one);
+        // and so is the same body under both
+        obj.add_signature(ObjectSignature::new([2; 32], [1; 64]));
+        assert_ne!(obj.id(), by_one);
+        assert_ne!(obj.id(), other.id());
+    }
+
+    #[test]
+    fn signers_sign_the_id_that_names_them_all() {
+        let mut obj = SignedObject::new(Record::new().with(0, 2u32).with(1, "x"));
+        let mut seen = Vec::new();
+        obj.sign_with(&[[9; 32], [3; 32], [9; 32]], |key, message| {
+            seen.push((*key, *message));
+            [key[0]; 64]
+        });
+        let keys: Vec<u8> = obj.signatures().iter().map(|s| s.key[0]).collect();
+        assert_eq!(keys, [3, 9]);
+        // each was given the message of the object as it now is
+        assert_eq!(seen.len(), 2);
+        assert!(seen.iter().all(|(_, m)| *m == obj.signing_message()));
+        // signing again by one of them alone replaces both
+        obj.sign_with(&[[3; 32]], |_, _| [0; 64]);
+        assert_eq!(obj.signatures().len(), 1);
+        assert_ne!(obj.signing_message(), seen[0].1);
     }
 
     #[test]
@@ -258,21 +316,26 @@ mod tests {
     }
 
     #[test]
-    fn preserves_unknown_fields() {
-        let body = Record::new().with(0, 2u32).encode();
-        let r = Record::new()
+    fn rejects_keys_that_nothing_binds() {
+        // Neither the id nor a signature covers anything in the wrapper or a
+        // signature record but their own fields, so anyone could add to
+        // them: a decoder refuses.
+        let body = Record::new()
+            .with(0, 2u32)
+            .with(40, "an unknown field")
+            .encode();
+        let sig = ObjectSignature::new([1; 32], [2; 64]).to_record();
+        let good = Record::new()
             .with(0, 1u32)
             .with(1, body)
-            .with(
-                2,
-                vec![Value::from(
-                    ObjectSignature::new([1; 32], [2; 64])
-                        .to_record()
-                        .with(9, "x"),
-                )],
-            )
-            .with(5, "future");
-        let obj = SignedObject::from_record(&r).unwrap();
-        assert_eq!(obj.to_record(), r);
+            .with(2, vec![Value::from(sig.clone())]);
+        let obj = SignedObject::from_record(&good).unwrap();
+        assert_eq!(obj.to_record(), good);
+        // what an extension adds goes in the body, and is kept there
+        assert_eq!(obj.inner().text(40).unwrap(), "an unknown field");
+        let more = good.clone().with(5, "future");
+        assert!(SignedObject::from_record(&more).is_err());
+        let more = good.clone().with(2, vec![Value::from(sig.with(9, "x"))]);
+        assert!(SignedObject::from_record(&more).is_err());
     }
 }

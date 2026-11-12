@@ -16,3 +16,5 @@ zeroize.workspace = true
 
 [dev-dependencies]
 proptest.workspace = true
+# for a second signature by one key: an entry's other sealed form
+cardinal-crypto = { workspace = true, features = ["test-rng"] }

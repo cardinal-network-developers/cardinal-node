@@ -34,8 +34,10 @@ pub struct Space {
     creator: IdentityId,
     dag: Dag<SpaceEntry>,
     sealed: HashMap<EntryId, SealedEntry>,
-    /// Other sealed forms of entries held: the same body, and so the same
-    /// entry id, under another signature.
+    /// Other sealed forms of entries held. Only an entry's author can sign
+    /// it again, and each signing gives the one entry another sealed form.
+    /// Each is kept, as a host that cannot open them keeps them, so that
+    /// sets reconcile; the entry is judged and applied once.
     resigned: Vec<(EntryId, SealedEntry)>,
     keyring: Keyring,
     judge: Judge,
@@ -165,6 +167,7 @@ impl Space {
         let mut keyring = Keyring::new();
         keyring.add(key);
         let mut space = Space::from_genesis(g, keyring, author)?;
+        space.open_key_belongs(sealed)?;
         space.sealed.insert(space.id, sealed.clone());
         Ok(space)
     }
@@ -183,6 +186,7 @@ impl Space {
             .ok_or(Error::NoEpochKey)?;
         let g = sealed.open_with(&key)?;
         let mut space = Space::from_genesis(g, keyring, author)?;
+        space.open_key_belongs(sealed)?;
         space.sealed.insert(space.id, sealed.clone());
         Ok(space)
     }
@@ -270,7 +274,7 @@ impl Space {
         self.sealed.get(id)
     }
 
-    /// Every sealed entry held. An entry signed again by someone is here
+    /// Every sealed entry held. An entry its author signed again is here
     /// once for each signature.
     pub fn sealed_entries(&self) -> impl Iterator<Item = (&EntryId, &SealedEntry)> {
         let resigned = self.resigned.iter().map(|(id, s)| (id, s));
@@ -410,25 +414,37 @@ impl Space {
         if e.space() != self.id {
             return Err(Error::WrongSpace);
         }
+        self.open_key_belongs(&sealed)?;
         self.keyring.add(key);
         self.learn_keys(&e);
         let id = e.id();
         if let Some(held) = self.sealed.get(&id) {
-            // The entry is here already. If this is another signed object
-            // with the same body, its signature is one more the entry may
-            // be judged by; which one does not depend on which came first.
+            // The entry is here already, under the same key: its id says
+            // who signed it. This is its author's signature made again,
+            // which means the same. The sealed form is kept, and nothing
+            // is judged again.
             let sid = sealed.sealed_id();
             let new =
                 held.sealed_id() != sid && !self.resigned.iter().any(|(_, s)| s.sealed_id() == sid);
             if new {
                 self.resigned.push((id, sealed));
-                let changed = self.judge.also_signed(&self.dag, &id, e.signer());
-                self.took(None, changed);
             }
             return Ok(Inserted::Duplicate);
         }
         self.sealed.insert(id, sealed);
         Ok(self.insert_entry(e))
+    }
+
+    /// A member rejects a sealed entry that carries the epoch key in the
+    /// clear where the space is not public, or does not where it is
+    /// (`spaces.md#entries-and-sealed-entries`). The policy is the one the
+    /// genesis gave: `set_policy` is not applied yet (DEVIATIONS.md).
+    fn open_key_belongs(&self, sealed: &SealedEntry) -> Result<(), Error> {
+        if sealed.open_key().is_some() == self.policy.public {
+            Ok(())
+        } else {
+            Err(Error::Mismatch("open key"))
+        }
     }
 
     fn learn_keys(&mut self, e: &SpaceEntry) {
@@ -573,7 +589,7 @@ impl Space {
     /// How many entries by the removed `key` do not count, for want of a
     /// witness.
     pub fn unwitnessed_by(&self, key: &KeyId) -> usize {
-        let by_key = |x: &&EntryId| self.judge.key_of(&self.dag, x) == Some(*key);
+        let by_key = |x: &&EntryId| self.dag.get(x).is_some_and(|e| e.signer() == *key);
         self.validity().unwitnessed.iter().filter(by_key).count()
     }
 

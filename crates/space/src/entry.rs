@@ -941,10 +941,20 @@ fn aad(epoch: &EpochId, nonce: &[u8; 24]) -> Vec<u8> {
         .encode()
 }
 
-fn nonce_for(entry_key: &[u8; 32], entry: &EntryId) -> [u8; 24] {
-    keyed_hash(entry_key, entry)[..24]
+/// The nonce of a sealed entry: the first 24 bytes of
+/// `BLAKE3.keyed_hash(entry key, plaintext)`, the plaintext being the
+/// encoded signed object. So no two plaintexts are ever sealed under one
+/// nonce, and a signed entry has exactly one sealed form.
+fn nonce_for(entry_key: &[u8; 32], plaintext: &[u8]) -> [u8; 24] {
+    keyed_hash(entry_key, plaintext)[..24]
         .try_into()
         .expect("24 bytes")
+}
+
+/// The hash a sealed entry's field 4 has to answer to: of the wraps list
+/// exactly as the record carries it.
+fn carried_wraps_hash(r: &Record) -> Option<[u8; 32]> {
+    r.get(4).map(|v| *blake3::hash(&v.encode()).as_bytes())
 }
 
 impl SealedEntry {
@@ -963,9 +973,10 @@ impl SealedEntry {
             return Err(Error::Mismatch("wraps hash"));
         }
         let k = epoch.entry_key();
-        let nonce = nonce_for(&k, &entry.id());
+        let plaintext = entry.encode();
+        let nonce = nonce_for(&k, &plaintext);
         let ciphertext =
-            xchacha20poly1305_encrypt(&k, &nonce, &aad(&epoch.id(), &nonce), &entry.encode());
+            xchacha20poly1305_encrypt(&k, &nonce, &aad(&epoch.id(), &nonce), &plaintext);
         let open_key = public.then(|| *epoch.bytes());
         let record = Record::new()
             .with(0, SEALED_ENTRY as u32)
@@ -993,7 +1004,10 @@ impl SealedEntry {
         Ok(s)
     }
 
-    /// Decodes a sealed entry.
+    /// Decodes a sealed entry, as any holder does, whether or not it can
+    /// open it. A sealed entry holds only the fields of its table: nothing
+    /// would bind another, so one that has any is rejected. So is an open
+    /// key that is not the key of the epoch the entry names.
     pub fn decode(bytes: &[u8]) -> Result<SealedEntry, Error> {
         if bytes.len() > MAX_SEALED_SIZE {
             return Err(Error::TooLarge);
@@ -1001,6 +1015,14 @@ impl SealedEntry {
         let r = Record::decode(bytes)?;
         if r.kind()? != Kind::Core(SEALED_ENTRY) {
             return Err(Error::Malformed("not a sealed entry"));
+        }
+        if r.keys().any(|k| k > 5) {
+            return Err(Error::Malformed("a sealed entry holds only its six fields"));
+        }
+        let epoch: EpochId = r.bytes_n(1)?;
+        let open_key: Option<[u8; 32]> = r.opt_bytes_n(5)?;
+        if open_key.is_some_and(|k| EpochKey::from_bytes(k).id() != epoch) {
+            return Err(Error::Mismatch("open key"));
         }
         let wraps = match r.opt_list(4)? {
             Some(ws) => Some(
@@ -1015,11 +1037,11 @@ impl SealedEntry {
             None => None,
         };
         Ok(SealedEntry {
-            epoch: r.bytes_n(1)?,
+            epoch,
             nonce: r.bytes_n(2)?,
             ciphertext: r.bytes(3)?.to_vec(),
             wraps,
-            open_key: r.opt_bytes_n(5)?,
+            open_key,
             record: r,
         })
     }
@@ -1044,12 +1066,19 @@ impl SealedEntry {
         self.wraps.as_deref()
     }
 
-    /// The epoch key in the clear (public spaces).
+    /// The epoch key in the clear: on every entry of a public space, and
+    /// on no other.
     pub fn open_key(&self) -> Option<EpochKey> {
         self.open_key.map(EpochKey::from_bytes)
     }
 
-    /// Opens with `key`, checking the nonce, epoch, and wraps hash.
+    /// Opens with `key`, as a member does, and rejects what a member must:
+    /// a nonce that is not the one derived from what the entry opens to, a
+    /// signature that does not verify, an inner epoch that differs from the
+    /// sealed one, wraps without their hash in the entry or the reverse,
+    /// and wraps that are not the ones the entry binds. Whether an open key
+    /// belongs here is for whoever knows the space's policy
+    /// ([`Space::receive`](crate::Space::receive)).
     pub fn open_with(&self, key: &EpochKey) -> Result<SpaceEntry, Error> {
         if key.id() != self.epoch {
             return Err(Error::NoEpochKey);
@@ -1062,14 +1091,15 @@ impl SealedEntry {
             &self.ciphertext,
         )
         .map_err(|_| Error::Decrypt)?;
-        let entry = SpaceEntry::decode(&pt)?;
-        if nonce_for(&k, &entry.id()) != self.nonce {
+        if nonce_for(&k, &pt) != self.nonce {
             return Err(Error::Mismatch("nonce"));
         }
+        let entry = SpaceEntry::decode(&pt)?;
         if entry.epoch() != self.epoch {
             return Err(Error::Mismatch("epoch"));
         }
-        if entry.wraps_hash() != self.wraps.as_deref().map(wraps_hash) {
+        // the list as it is carried, so that nothing can be added to a wrap
+        if entry.wraps_hash() != carried_wraps_hash(&self.record) {
             return Err(Error::Mismatch("wraps hash"));
         }
         Ok(entry)
@@ -1085,7 +1115,7 @@ impl SealedEntry {
         let key = keyring
             .get(&self.epoch)
             .cloned()
-            .or_else(|| self.open_key().filter(|k| k.id() == self.epoch))
+            .or_else(|| self.open_key())
             .or_else(|| {
                 self.wraps
                     .as_deref()
@@ -1157,6 +1187,108 @@ mod tests {
             SealedEntry::decode(&r.encode()).unwrap().open(&ring, &[]),
             Err(Error::Decrypt)
         );
+        // nothing can be added to a wrap either: the entry binds the list
+        // as it is carried
+        let mut r = Record::decode(&bytes).unwrap();
+        let padded = wraps[0].to_record().with(9, "more");
+        r.insert(4, Value::list([padded]));
+        let padded = SealedEntry::decode(&r.encode()).unwrap();
+        assert_eq!(padded.open(&ring, &[]), Err(Error::Mismatch("wraps hash")));
+        // wraps with nothing in the entry to bind them, and the reverse
+        let bare = SpaceEntryBuilder::genesis([2; 32], [3; 32], epoch.id())
+            .op(SpaceOp::start(Profile::FILES, &Policy::default()))
+            .sign(&device)
+            .unwrap();
+        let bare = SealedEntry::seal(&bare, &epoch, None, false).unwrap();
+        let mut r = Record::decode(&bare.encode()).unwrap();
+        r.insert(4, Value::list([wraps[0].to_record()]));
+        let given = SealedEntry::decode(&r.encode()).unwrap();
+        assert_eq!(given.open(&ring, &[]), Err(Error::Mismatch("wraps hash")));
+        let mut r = Record::decode(&bytes).unwrap();
+        r.remove(4);
+        let taken = SealedEntry::decode(&r.encode()).unwrap();
+        assert_eq!(taken.open(&ring, &[]), Err(Error::Mismatch("wraps hash")));
+    }
+
+    #[test]
+    fn what_any_holder_rejects() {
+        // A holder that cannot open an entry still refuses one that holds a
+        // field its table does not define, since nothing would bind it, and
+        // an open key that is not the key of the epoch the entry names.
+        let device = SigningKey::from_seed(&[1; 32]);
+        let epoch = EpochKey::from_bytes([7; 32]);
+        let e = SpaceEntryBuilder::genesis([2; 32], [3; 32], epoch.id())
+            .op(SpaceOp::start(Profile::FILES, &Policy::default()))
+            .sign(&device)
+            .unwrap();
+        let public = SealedEntry::seal(&e, &epoch, None, true).unwrap();
+        assert_eq!(public.open_key(), Some(epoch.clone()));
+        let bytes = public.encode();
+        SealedEntry::decode(&bytes).unwrap();
+        let mut r = Record::decode(&bytes).unwrap();
+        r.insert(6, "nothing binds this");
+        assert_eq!(
+            SealedEntry::decode(&r.encode()),
+            Err(Error::Malformed("a sealed entry holds only its six fields"))
+        );
+        let mut r = Record::decode(&bytes).unwrap();
+        r.insert(5, [8u8; 32]);
+        assert_eq!(
+            SealedEntry::decode(&r.encode()),
+            Err(Error::Mismatch("open key"))
+        );
+        // anyone opens a public entry with the key it carries
+        let (opened, _) = public.open(&Keyring::new(), &[]).unwrap();
+        assert_eq!(opened, e);
+    }
+
+    #[test]
+    fn the_nonce_follows_from_what_is_sealed() {
+        // The nonce is derived from the whole signed object, so no two
+        // plaintexts are sealed under one nonce: the same body under
+        // another key, or the same entry signed again, gets another.
+        let (a, b) = (
+            SigningKey::from_seed(&[1; 32]),
+            SigningKey::from_seed(&[2; 32]),
+        );
+        let epoch = EpochKey::from_bytes([7; 32]);
+        let entry = |key: &SigningKey| {
+            SpaceEntryBuilder::new([9; 32], &[[8; 32]], [2; 32], [3; 32], epoch.id())
+                .op(SpaceOp::leave())
+                .sign(key)
+                .unwrap()
+        };
+        let (by_a, by_b) = (entry(&a), entry(&b));
+        assert_eq!(by_a.record(), by_b.record());
+        assert_ne!(by_a.id(), by_b.id());
+        let again = {
+            let mut obj = by_a.signed().clone();
+            let signature = a.sign_salted(&obj.signing_message(), &[4; 32]);
+            obj.add_signature(cardinal_encoding::ObjectSignature::new(
+                a.public_key(),
+                signature,
+            ));
+            SpaceEntry::from_signed(obj).unwrap()
+        };
+        assert_eq!(again.id(), by_a.id());
+        let seal = |e: &SpaceEntry| SealedEntry::seal(e, &epoch, None, false).unwrap();
+        let nonce = |s: &SealedEntry| s.record.bytes_n::<24>(2).unwrap();
+        let (sa, sb, sagain) = (seal(&by_a), seal(&by_b), seal(&again));
+        assert!(nonce(&sa) != nonce(&sb) && nonce(&sa) != nonce(&sagain));
+        assert_eq!(seal(&by_a).encode(), sa.encode());
+        assert_eq!(sagain.open_with(&epoch).unwrap().id(), by_a.id());
+        // a nonce that is not the one derived from what the entry opens to:
+        // the entry sealed properly under a nonce someone else chose
+        let k = epoch.entry_key();
+        let chosen = [5u8; 24];
+        let ct = xchacha20poly1305_encrypt(&k, &chosen, &aad(&epoch.id(), &chosen), &by_a.encode());
+        let r = Record::new()
+            .with(0, SEALED_ENTRY as u32)
+            .with(1, epoch.id())
+            .with(2, chosen)
+            .with(3, ct);
+        let forged = SealedEntry::decode(&r.encode()).unwrap();
+        assert_eq!(forged.open_with(&epoch), Err(Error::Mismatch("nonce")));
     }
 
     #[test]

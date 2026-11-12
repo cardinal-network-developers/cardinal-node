@@ -6,8 +6,10 @@
 
 use cardinal_encoding::{decode, Record, SignedObject};
 use curve25519_dalek::constants::EIGHT_TORSION;
-use curve25519_dalek::edwards::CompressedEdwardsY;
+use curve25519_dalek::edwards::{CompressedEdwardsY, EdwardsPoint};
+use curve25519_dalek::scalar::Scalar;
 use serde_json::{json, Value as Json};
+use sha2::{Digest, Sha512};
 
 use crate::aead::{chacha20poly1305_encrypt, xchacha20poly1305_encrypt};
 use crate::bip39::{entropy_to_words, RecoveryPhrase};
@@ -249,24 +251,37 @@ fn ed25519_vectors() {
         signing.push(json!({ "seed": hx(seed), "public_key": hx(sk.public_key()), "message": hx(&msg), "signature": hx(sig) }));
     }
 
-    // A signed object with two signatures.
+    // A signed object with two signatures, and the same body signed by the
+    // first key alone: another object, with another id.
     let mut obj = SignedObject::new(Record::new().with(0, 2u32).with(1, "signed body"));
     let a = SigningKey::from_seed(&fixed32("object signer a"));
     let b = SigningKey::from_seed(&fixed32("object signer b"));
-    a.sign_object(&mut obj);
-    b.sign_object(&mut obj);
+    crate::sign_object(&mut obj, &[&a, &b]);
     crate::verify_object(&obj).unwrap();
+    let mut alone = SignedObject::new(Record::new().with(0, 2u32).with(1, "signed body"));
+    a.sign_object(&mut alone);
+    crate::verify_object(&alone).unwrap();
+    assert_ne!(alone.id(), obj.id());
+    let keys: Vec<String> = obj.signatures().iter().map(|s| hx(s.key)).collect();
     let signed_object = json!({
         "signer_seeds": [hx(fixed32("object signer a")), hx(fixed32("object signer b"))],
         "body": hx(obj.body()),
+        "keys": keys,
         "id": hx(obj.id()),
         "signing_message": hx(obj.signing_message()),
         "encoding": hx(obj.encode()),
         "text": decode(&obj.encode()).unwrap().to_string(),
+        "signed_by_the_first_alone": {
+            "id": hx(alone.id()),
+            "signing_message": hx(alone.signing_message()),
+            "encoding": hx(alone.encode()),
+        },
     });
 
-    // ZIP-215 edge cases: every pair of small-order encodings (canonical and
-    // non-canonical) for A and R with S = 0 is valid under ZIP-215.
+    // ZIP-215's own edge cases: every pair of small-order encodings
+    // (canonical and non-canonical) for A and R with S = 0. ZIP-215 accepts
+    // them all. Every one has a key of small order, which signs nothing
+    // here, so every one is refused.
     let encodings: Vec<[u8; 32]> = EIGHT_TORSION
         .iter()
         .map(|p| p.compress().to_bytes())
@@ -278,10 +293,62 @@ fn ed25519_vectors() {
         for r_bytes in &encodings {
             let mut sig = [0u8; 64];
             sig[..32].copy_from_slice(r_bytes);
+            let zebra = ed25519_zebra::VerificationKey::try_from(*a_bytes).unwrap();
+            let plain = zebra.verify(&ed25519_zebra::Signature::from(sig), b"Zcash");
+            assert!(plain.is_ok(), "ZIP-215 alone accepts it");
+            assert!(crate::sign::is_small_order(a_bytes));
             let valid = verify(a_bytes, b"Zcash", &sig).is_ok();
-            assert!(valid, "ZIP-215 small-order case must verify");
-            zip215.push(json!({ "public_key": hx(a_bytes), "message": hx(b"Zcash"), "signature": hx(sig), "valid": valid }));
+            assert!(!valid, "a key of small order signs nothing");
+            zip215.push(json!({ "public_key": hx(a_bytes), "message": hx(b"Zcash"), "signature": hx(sig), "valid": valid, "zip215_alone": true }));
         }
+    }
+    // What is left of ZIP-215 once such keys are refused, made by the
+    // holder of an ordinary key. Stricter rules refuse each of these.
+    let seed = fixed32("ed25519 1");
+    let holder = SigningKey::from_seed(&seed);
+    let secret = {
+        let h = Sha512::digest(seed);
+        let mut a = [0u8; 32];
+        a.copy_from_slice(&h[..32]);
+        a[0] &= 248;
+        a[31] &= 127;
+        a[31] |= 64;
+        Scalar::from_bytes_mod_order(a)
+    };
+    let challenge = |r: &[u8; 32], a: &[u8; 32], m: &[u8]| {
+        let mut h = Sha512::new();
+        h.update(r);
+        h.update(a);
+        h.update(m);
+        let mut wide = [0u8; 64];
+        wide.copy_from_slice(&h.finalize());
+        Scalar::from_bytes_mod_order_wide(&wide)
+    };
+    // R of small order, in each of its encodings: eight times R is
+    // nothing, so S = k a satisfies the cofactored equation.
+    for r_bytes in &encodings {
+        let a_bytes = holder.public_key();
+        let s = challenge(r_bytes, &a_bytes, b"Zcash") * secret;
+        let mut sig = [0u8; 64];
+        sig[..32].copy_from_slice(r_bytes);
+        sig[32..].copy_from_slice(s.as_bytes());
+        assert!(verify(&a_bytes, b"Zcash", &sig).is_ok());
+        zip215.push(json!({ "public_key": hx(a_bytes), "message": hx(b"Zcash"), "signature": hx(sig), "valid": true, "note": "R of small order, under a key that is not" }));
+    }
+    // A key with a part of small order added to it: not of small order
+    // itself, and the equation without the cofactor would fail.
+    for torsion in EIGHT_TORSION.iter().skip(1) {
+        let a_point = EdwardsPoint::mul_base(&secret) + torsion;
+        let a_bytes = a_point.compress().to_bytes();
+        assert!(!crate::sign::is_small_order(&a_bytes));
+        let r = Scalar::from_bytes_mod_order(fixed32("ed25519 mixed-order nonce"));
+        let r_bytes = EdwardsPoint::mul_base(&r).compress().to_bytes();
+        let s = r + challenge(&r_bytes, &a_bytes, b"Zcash") * secret;
+        let mut sig = [0u8; 64];
+        sig[..32].copy_from_slice(&r_bytes);
+        sig[32..].copy_from_slice(s.as_bytes());
+        assert!(verify(&a_bytes, b"Zcash", &sig).is_ok());
+        zip215.push(json!({ "public_key": hx(a_bytes), "message": hx(b"Zcash"), "signature": hx(sig), "valid": true, "note": "a key of mixed order" }));
     }
     // Invalid: S not reduced (S = l), and S + l for a real signature.
     let l: [u8; 32] =
@@ -318,7 +385,7 @@ fn ed25519_vectors() {
     check_or_write(
         "ed25519.json",
         json!({
-            "description": "Ed25519 (RFC 8032) signing and ZIP-215 verification (crypto.md#signature-verification). 'zip215' cases MUST verify exactly as 'valid' says. The first 196 are every pair of small-order encodings (the eight canonical torsion points and six non-canonical encodings) for A and R with S = 0, message 'Zcash', all valid under ZIP-215 and many invalid under strict RFC 8032 checks. 'signed_object' shows encoding.md#signed-objects: id = BLAKE3(body), each signature over \"cardinal sig 1\" || id, sorted by key.",
+            "description": "Ed25519 (RFC 8032) signing and ZIP-215 verification with its one departure (crypto.md#signature-verification). 'zip215' cases MUST verify exactly as 'valid' says. The first 196 are ZIP-215's own edge cases: every pair of small-order encodings (the eight canonical torsion points and six non-canonical encodings) for A and R with S = 0, message 'Zcash'. ZIP-215 alone accepts them all; each has a key of small order, which signs nothing, so each is refused. The next 14 have R of small order under an ordinary key, and the 7 after them a key of mixed order: valid, and refused by stricter rules. 'signed_object' shows encoding.md#signed-objects: id = BLAKE3 of the encoding of {1: body, 2: keys}, each signature over \"cardinal sig 1\" || id, sorted by key; the same body signed by one key alone has another id.",
             "signing": signing,
             "signed_object": signed_object,
             "zip215": zip215,

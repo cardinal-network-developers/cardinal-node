@@ -656,3 +656,52 @@ fn written_beside_supersedes_and_deletes_nothing() {
     write(&mut a, SpaceOp::delete(f));
     assert!(a.state().node(&f).unwrap().deleted);
 }
+
+#[test]
+fn the_epoch_key_is_in_the_clear_in_a_public_space_and_in_no_other() {
+    // `spaces.md#entries-and-sealed-entries`: a member rejects a sealed entry
+    // that carries the epoch key where the space is not public, and one that
+    // does not where it is.
+    let p = person(22, 0);
+    let d0 = &p.devices[0];
+    for public in [false, true] {
+        let policy = Policy {
+            public,
+            ..Policy::default()
+        };
+        let (mut a, genesis) = Space::create(
+            Profile::FILES,
+            policy,
+            &p.log,
+            &d0.signing,
+            &[p.enc.public_key()],
+            None,
+        )
+        .unwrap();
+        assert_eq!(genesis.open_key().is_some(), public);
+        let (id, sealed) = a
+            .write_entry(
+                &p.log,
+                &d0.signing,
+                vec![files::create_folder(ROOT, "x")],
+                None,
+            )
+            .unwrap();
+        assert_eq!(sealed.open_key().is_some(), public);
+        let epoch = a.keyring().get(&sealed.epoch()).unwrap().clone();
+        let entry = a.entry(&id).unwrap();
+        let other = SealedEntry::seal(entry, &epoch, None, !public).unwrap();
+        let other_genesis = {
+            let g = a.entry(&a.id()).unwrap();
+            let wraps = genesis.wraps().map(|w| w.to_vec());
+            SealedEntry::seal(g, &epoch, wraps, !public).unwrap()
+        };
+        // the genesis says what the space is, and is held to it
+        assert!(Space::open_genesis(&other_genesis, &[&p.enc], Some(p.log.state())).is_err());
+        let mut b = Space::open_genesis(&genesis, &[&p.enc], Some(p.log.state())).unwrap();
+        assert!(b.receive(other, &[&p.enc]).is_err());
+        assert!(!b.dag().contains(&id));
+        b.receive(sealed, &[&p.enc]).unwrap();
+        assert!(b.validity().is_valid(&id));
+    }
+}

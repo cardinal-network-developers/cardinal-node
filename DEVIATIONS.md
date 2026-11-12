@@ -58,15 +58,6 @@ D61, and the commits beside them). Where it answered as this implementation
 had chosen, the readings recorded below are now only descriptions. Where it
 answered otherwise, the code is behind:
 
-- **An id says who signed (D59).** A signed object's id now covers its body
-  and its signing keys, and a sealed entry's nonce is derived from the
-  whole signed object. Here an id is still the hash of the body, the nonce
-  comes from the entry id, and an entry signed again under another key is
-  the same entry, judged by `Judge::key_of`. This changes every id: in
-  identity logs, spaces and grants alike. The records around a signed body
-  and a sealed entry are also closed now: a key the specification does not
-  define there is refused, where this implementation keeps it. A signing
-  key of small order is refused; here ZIP-215 alone decides.
 - **A reach node is its member's from the start (D61).** It is not created:
   its id follows from the identity's, and a reader's `set` on it is told
   from the op alone. Here a reach node is a node of kind 9 that its member
@@ -103,9 +94,19 @@ answered otherwise, the code is behind:
   inner record". Chose: reading a signed object rejects it unless the body
   decodes as exactly one canonical record. An empty signature list is
   structurally valid; whether the signers suffice is the caller's question.
-- **Spec ambiguity: unknown fields in signature records.** Chose to preserve
-  them like any other unknown field (they are outside the id, so this does
-  not affect what was signed).
+- **Spec ambiguity: an object with several signers.** A signature is made
+  over the id, and the id covers every signer's key. So all the signers
+  have to be known before any of them signs, and a signature added later
+  makes another object, on which the earlier signatures do not verify.
+  Nothing in the specification uses more than one signature, and it does
+  not say this. Chose: `SignedObject::sign_with` takes all the keys at
+  once and replaces whatever signatures were there, and there is no way to
+  add one signer to an object and keep its id.
+- **Reading: where a signature that does not verify is refused.** "A
+  device that can check it rejects it." Entries and grants are checked
+  when they are decoded, so an object with a bad signature is never held
+  as an entry. Reading a signed object alone (`SignedObject::decode`)
+  checks its shape and not its signatures.
 
 ## Cryptography (`spec/crypto.md`)
 
@@ -129,6 +130,21 @@ answered otherwise, the code is behind:
   `seal`/`open` (the ML-KEM secret and the AEAD still protect the result);
   `x25519::is_all_zero` is available for protocols that need contributory
   behaviour, such as the link handshake.
+- **Spec gap: the vectors for what is left of ZIP-215.** "The test vectors
+  MUST include ZIP-215's edge cases", and a signature under a key of small
+  order is now rejected. All 196 of ZIP-215's published cases have a key of
+  small order, so each of them is now a case that must fail, and nothing
+  published exercises what still must pass: an `R` of small order or not
+  canonically encoded under an ordinary key, and a key with a part of
+  small order, for which only the cofactored equation holds.
+  `vectors/ed25519.json` keeps the 196 as invalid, marked `zip215_alone`,
+  and adds 21 cases made here that are valid: 14 with each encoding of a
+  small-order `R` under an ordinary key, and 7 under a key of mixed order.
+- **Reading: "a point of small order".** Chose: the key is decoded as
+  ZIP-215 decodes it, so an encoding that is not canonical counts, and it
+  is of small order if eight times it is the identity. The check is in
+  `verify`, so it holds for every signature: entries, grants, device
+  proofs, proofs of possession, and release manifests.
 - **Spec ambiguity: recovery phrase input.** Chose to accept any whitespace
   between words and to ignore ASCII case when parsing a phrase; the
   checksum is still required. Output is lowercase words joined by single
@@ -385,22 +401,47 @@ answered otherwise, the code is behind:
   is an entry written at the same time as another: it recomputes the
   state ([State](#state-specstatemd-specprofilesmd)), 0.6 ms at 200
   entries, 9 ms at 2,000 and 127 ms at 20,000.
-- **Spec gap: an entry's id does not cover its signature.** A signed
-  object's id is the hash of its body (`encoding.md#signed-objects`), so
-  anyone who holds a key can sign someone's entry again: the same entry id,
-  another signing key, another sealed entry with another sealed id. The
-  rules read one signing key for an entry (`skey`) and nothing says which
-  when a device holds two, so the answer would depend on which arrived
-  first, and a member could void anyone's entry on a device by getting
-  there first with a copy under a key that does not count. Chose: every
-  signed form is kept, and the entry is judged by one key chosen from all
-  of them: one in effect at the cited head of the author's log before one
-  that is not, then one not removed since before one that was, then the
-  smallest, compared as bytes (`Judge::key_of`). So a stranger's signature
-  never displaces the author's, and every device chooses the same. The
-  same gap is open in identity logs, where the first signed form to arrive
-  still stands. The specification could put the signing key in the body, as
-  the body already names the author.
+- **An entry signed again** has the same id and another sealed form. The
+  first form to arrive is opened, judged and applied; a later one is
+  opened and checked like any sealed entry, kept, and offered in
+  reconciliation, and nothing is judged again
+  (`Space::receive`, `tests/validity.rs`).
+- **Spec ambiguity: what rejecting a sealed entry means for what is
+  stored.** "A member MUST reject" a sealed entry with a wrong nonce, a bad
+  signature, altered wraps, or an open key where none belongs, and "any
+  holder" one with a field the table does not have. A host cannot make the
+  member's checks, so it keeps what a member rejects, and reconciliation
+  compares sealed ids: a member that threw such an object away would be
+  offered it again by every host, forever. Chose: any holder refuses what
+  any holder can check, which is never stored. What only a member can
+  check is stored and reconciled like any object, and is not an entry: it
+  is not in the graph, is never judged, and nothing can name it. The
+  specification's "exactly one sealed form" is therefore true of what
+  members read and not of what holders store: whoever holds the epoch key
+  can make any number of objects that hosts keep, as it always could by
+  sealing rubbish.
+- **Spec gap: a wrap is not a closed record.** A sealed entry holds only
+  its six fields, but its wraps are sealed records (`crypto.md`), which
+  nothing says are closed. A member is protected, since the wraps hash is
+  taken over the list as it is carried, so anything added to a wrap fails
+  it (`entry.rs`, `seal_open_and_tamper`). A host cannot tell, which is
+  the case above.
+- **Spec ambiguity: a wraps list that is present and empty.** Field 4 is
+  "present only when this entry distributes an epoch key". Chose: an empty
+  list is a list, so the inner entry must carry its hash, and nothing here
+  writes one.
+- **Spec ambiguity: "the space's policy, as the entry and its causal past
+  give it".** A member rejects a sealed entry with an open key where the
+  policy is not public, and one without where it is. The policy an entry's
+  causal past gives depends on which `set_policy` entries are valid there,
+  which can change after the entry was taken; on parents that may not have
+  arrived when the sealed entry has to be accepted or rejected; and on two
+  `set_policy` entries written at the same time, for which nothing gives
+  an order. And an entry rejected for it cannot be judged again later,
+  since a rejected entry is not held. Chose: the policy is the one the
+  genesis gave, which every member knows before any other entry and which
+  never changes here, since `set_policy` is not applied
+  (`Space::open_key_belongs`). A genesis is held to its own policy.
 - **Spec ambiguity: which ops are a reader's "own reach node".** The roles
   table lets a reader "write its own reach node", and the rules have an op
   `reach` that any role may write, but nothing says how to tell that op
@@ -460,9 +501,6 @@ answered otherwise, the code is behind:
   which is a space whose genesis does not count yet, nothing is written.
 - **Wraps hash.** `BLAKE3` of the encoding of the list value of sealed
   records, exactly as carried in sealed-entry field 4.
-- **Unknown fields of a sealed entry** (beyond 0–5) are preserved but not
-  bound by the AEAD; only fields 0, 1, and 2 are associated data, as
-  specified.
 - **The cited author log head** written by this implementation is the last
   entry in log order at which the signing key is in effect.
 - **Not applied: `set_policy` and `set_protocol`.** They are judged, and the

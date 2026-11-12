@@ -1,15 +1,24 @@
 {
-  "description": "Ed25519 (RFC 8032) signing and ZIP-215 verification (crypto.md#signature-verification). 'zip215' cases MUST verify exactly as 'valid' says. The first 196 are every pair of small-order encodings (the eight canonical torsion points and six non-canonical encodings) for A and R with S = 0, message 'Zcash', all valid under ZIP-215 and many invalid under strict RFC 8032 checks. 'signed_object' shows encoding.md#signed-objects: id = BLAKE3(body), each signature over \"cardinal sig 1\" || id, sorted by key.",
+  "description": "Ed25519 (RFC 8032) signing and ZIP-215 verification with its one departure (crypto.md#signature-verification). 'zip215' cases MUST verify exactly as 'valid' says. The first 196 are ZIP-215's own edge cases: every pair of small-order encodings (the eight canonical torsion points and six non-canonical encodings) for A and R with S = 0, message 'Zcash'. ZIP-215 alone accepts them all; each has a key of small order, which signs nothing, so each is refused. The next 14 have R of small order under an ordinary key, and the 7 after them a key of mixed order: valid, and refused by stricter rules. 'signed_object' shows encoding.md#signed-objects: id = BLAKE3 of the encoding of {1: body, 2: keys}, each signature over \"cardinal sig 1\" || id, sorted by key; the same body signed by one key alone has another id.",
   "signed_object": {
     "body": "150010015b7369676e656420626f6479",
-    "encoding": "1d0008018201150010015b7369676e656420626f64790214150182021895c6c2ac24439b77c5fc018903facb407b351aed11830167e6061db307f663028204893d4e58e70e27c2b5fbee65f8a8020563da2225d0bfd24b584aea6d06d00d43527393450804b220ad02c830c6c630087f70506458d037095cb773bfac84090015018202e0bef0617e40942eaa1d641397e991e2d0896acd20b33cbdb3d4cdee470040e902820468c5a72ec589e4e22b26d83295d01445e6aee31a76652fff4e4692a9e64e2067fa405d59143496e4cd82c885454a6867b90b15fc5ab62720c87ce0730e1e350b",
-    "id": "418c648de76ec3d1b0db9bafb39a4aa4ed9ed3a21e47a6bb3fb42bd72ac138f8",
+    "encoding": "1d0008018201150010015b7369676e656420626f64790214150182021895c6c2ac24439b77c5fc018903facb407b351aed11830167e6061db307f6630282047491469c000f8a1f2cb9feefa6fec9a3e4b435c5c4529ca5d72796d9847d9541b130e4ba9763e929d399ac5e15441eefb503489a4bda2510c67949180fb2cf0615018202e0bef0617e40942eaa1d641397e991e2d0896acd20b33cbdb3d4cdee470040e90282045e8c26295ea9106d16ef714b982fc1a30aee7d30471e270bd66b289e897af1f7e40756d73df8e44cb030fce455671c27cff1f7ec8e60c3628ba6f6d62d05d809",
+    "id": "8121707ae0fd7818307a8fc1b23061ee218211dbada1965918415498994e235a",
+    "keys": [
+      "1895c6c2ac24439b77c5fc018903facb407b351aed11830167e6061db307f663",
+      "e0bef0617e40942eaa1d641397e991e2d0896acd20b33cbdb3d4cdee470040e9"
+    ],
+    "signed_by_the_first_alone": {
+      "encoding": "1d0008018201150010015b7369676e656420626f6479020c150182021895c6c2ac24439b77c5fc018903facb407b351aed11830167e6061db307f66302820472beae0970e800a9fff754780eb9d9f04c65b86492a2481245257922b6794fecede23c20d31848726c70487bb0f036c665527287901c30f92bede11a53ebc80c",
+      "id": "1ef259e93b8adfd31559ec57f460a047e83381ab41ae83b98e01229f53940b82",
+      "signing_message": "63617264696e616c2073696720311ef259e93b8adfd31559ec57f460a047e83381ab41ae83b98e01229f53940b82"
+    },
     "signer_seeds": [
       "9b3f2864c972e75f97332bdedf569b5a98c6d16d552c4a708660776d75fe8086",
       "83d56a36f72b8ae03c707382c915dc5334a1df4370d418b5a788ef138f185415"
     ],
-    "signing_message": "63617264696e616c207369672031418c648de76ec3d1b0db9bafb39a4aa4ed9ed3a21e47a6bb3fb42bd72ac138f8",
-    "text": "{0: 1, 1: h'150010015b7369676e656420626f6479', 2: [{1: h'1895c6c2ac24439b77c5fc018903facb407b351aed11830167e6061db307f663', 2: h'893d4e58e70e27c2b5fbee65f8a8020563da2225d0bfd24b584aea6d06d00d43527393450804b220ad02c830c6c630087f70506458d037095cb773bfac840900'}, {1: h'e0bef0617e40942eaa1d641397e991e2d0896acd20b33cbdb3d4cdee470040e9', 2: h'68c5a72ec589e4e22b26d83295d01445e6aee31a76652fff4e4692a9e64e2067fa405d59143496e4cd82c885454a6867b90b15fc5ab62720c87ce0730e1e350b'}]}"
+    "signing_message": "63617264696e616c2073696720318121707ae0fd7818307a8fc1b23061ee218211dbada1965918415498994e235a",
+    "text": "{0: 1, 1: h'150010015b7369676e656420626f6479', 2: [{1: h'1895c6c2ac24439b77c5fc018903facb407b351aed11830167e6061db307f663', 2: h'7491469c000f8a1f2cb9feefa6fec9a3e4b435c5c4529ca5d72796d9847d9541b130e4ba9763e929d399ac5e15441eefb503489a4bda2510c67949180fb2cf06'}, {1: h'e0bef0617e40942eaa1d641397e991e2d0896acd20b33cbdb3d4cdee470040e9', 2: h'5e8c26295ea9106d16ef714b982fc1a30aee7d30471e270bd66b289e897af1f7e40756d73df8e44cb030fce455671c27cff1f7ec8e60c3628ba6f6d62d05d809'}]}"
   },
   "signing": [
     {
@@ -30,1176 +39,1519 @@
       "message": "5a63617368",
       "public_key": "0100000000000000000000000000000000000000000000000000000000000000",
       "signature": "01000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
-      "valid": true
+      "valid": false,
+      "zip215_alone": true
     },
     {
       "message": "5a63617368",
       "public_key": "0100000000000000000000000000000000000000000000000000000000000000",
       "signature": "c7176a703d4dd84fba3c0b760d10670f2a2053fa2c39ccc64ec7fd7792ac037a0000000000000000000000000000000000000000000000000000000000000000",
-      "valid": true
+      "valid": false,
+      "zip215_alone": true
     },
     {
       "message": "5a63617368",
       "public_key": "0100000000000000000000000000000000000000000000000000000000000000",
       "signature": "00000000000000000000000000000000000000000000000000000000000000800000000000000000000000000000000000000000000000000000000000000000",
-      "valid": true
+      "valid": false,
+      "zip215_alone": true
     },
     {
       "message": "5a63617368",
       "public_key": "0100000000000000000000000000000000000000000000000000000000000000",
       "signature": "26e8958fc2b227b045c3f489f2ef98f0d5dfac05d3c63339b13802886d53fc050000000000000000000000000000000000000000000000000000000000000000",
-      "valid": true
+      "valid": false,
+      "zip215_alone": true
     },
     {
       "message": "5a63617368",
       "public_key": "0100000000000000000000000000000000000000000000000000000000000000",
       "signature": "ecffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f0000000000000000000000000000000000000000000000000000000000000000",
-      "valid": true
+      "valid": false,
+      "zip215_alone": true
     },
     {
       "message": "5a63617368",
       "public_key": "0100000000000000000000000000000000000000000000000000000000000000",
       "signature": "26e8958fc2b227b045c3f489f2ef98f0d5dfac05d3c63339b13802886d53fc850000000000000000000000000000000000000000000000000000000000000000",
-      "valid": true
+      "valid": false,
+      "zip215_alone": true
     },
     {
       "message": "5a63617368",
       "public_key": "0100000000000000000000000000000000000000000000000000000000000000",
       "signature": "00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
-      "valid": true
+      "valid": false,
+      "zip215_alone": true
     },
     {
       "message": "5a63617368",
       "public_key": "0100000000000000000000000000000000000000000000000000000000000000",
       "signature": "c7176a703d4dd84fba3c0b760d10670f2a2053fa2c39ccc64ec7fd7792ac03fa0000000000000000000000000000000000000000000000000000000000000000",
-      "valid": true
+      "valid": false,
+      "zip215_alone": true
     },
     {
       "message": "5a63617368",
       "public_key": "0100000000000000000000000000000000000000000000000000000000000000",
       "signature": "01000000000000000000000000000000000000000000000000000000000000800000000000000000000000000000000000000000000000000000000000000000",
-      "valid": true
+      "valid": false,
+      "zip215_alone": true
     },
     {
       "message": "5a63617368",
       "public_key": "0100000000000000000000000000000000000000000000000000000000000000",
       "signature": "ecffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff0000000000000000000000000000000000000000000000000000000000000000",
-      "valid": true
+      "valid": false,
+      "zip215_alone": true
     },
     {
       "message": "5a63617368",
       "public_key": "0100000000000000000000000000000000000000000000000000000000000000",
       "signature": "edffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f0000000000000000000000000000000000000000000000000000000000000000",
-      "valid": true
+      "valid": false,
+      "zip215_alone": true
     },
     {
       "message": "5a63617368",
       "public_key": "0100000000000000000000000000000000000000000000000000000000000000",
       "signature": "edffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff0000000000000000000000000000000000000000000000000000000000000000",
-      "valid": true
+      "valid": false,
+      "zip215_alone": true
     },
     {
       "message": "5a63617368",
       "public_key": "0100000000000000000000000000000000000000000000000000000000000000",
       "signature": "eeffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f0000000000000000000000000000000000000000000000000000000000000000",
-      "valid": true
+      "valid": false,
+      "zip215_alone": true
     },
     {
       "message": "5a63617368",
       "public_key": "0100000000000000000000000000000000000000000000000000000000000000",
       "signature": "eeffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff0000000000000000000000000000000000000000000000000000000000000000",
-      "valid": true
+      "valid": false,
+      "zip215_alone": true
     },
     {
       "message": "5a63617368",
       "public_key": "c7176a703d4dd84fba3c0b760d10670f2a2053fa2c39ccc64ec7fd7792ac037a",
       "signature": "01000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
-      "valid": true
+      "valid": false,
+      "zip215_alone": true
     },
     {
       "message": "5a63617368",
       "public_key": "c7176a703d4dd84fba3c0b760d10670f2a2053fa2c39ccc64ec7fd7792ac037a",
       "signature": "c7176a703d4dd84fba3c0b760d10670f2a2053fa2c39ccc64ec7fd7792ac037a0000000000000000000000000000000000000000000000000000000000000000",
-      "valid": true
+      "valid": false,
+      "zip215_alone": true
     },
     {
       "message": "5a63617368",
       "public_key": "c7176a703d4dd84fba3c0b760d10670f2a2053fa2c39ccc64ec7fd7792ac037a",
       "signature": "00000000000000000000000000000000000000000000000000000000000000800000000000000000000000000000000000000000000000000000000000000000",
-      "valid": true
+      "valid": false,
+      "zip215_alone": true
     },
     {
       "message": "5a63617368",
       "public_key": "c7176a703d4dd84fba3c0b760d10670f2a2053fa2c39ccc64ec7fd7792ac037a",
       "signature": "26e8958fc2b227b045c3f489f2ef98f0d5dfac05d3c63339b13802886d53fc050000000000000000000000000000000000000000000000000000000000000000",
-      "valid": true
+      "valid": false,
+      "zip215_alone": true
     },
     {
       "message": "5a63617368",
       "public_key": "c7176a703d4dd84fba3c0b760d10670f2a2053fa2c39ccc64ec7fd7792ac037a",
       "signature": "ecffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f0000000000000000000000000000000000000000000000000000000000000000",
-      "valid": true
+      "valid": false,
+      "zip215_alone": true
     },
     {
       "message": "5a63617368",
       "public_key": "c7176a703d4dd84fba3c0b760d10670f2a2053fa2c39ccc64ec7fd7792ac037a",
       "signature": "26e8958fc2b227b045c3f489f2ef98f0d5dfac05d3c63339b13802886d53fc850000000000000000000000000000000000000000000000000000000000000000",
-      "valid": true
+      "valid": false,
+      "zip215_alone": true
     },
     {
       "message": "5a63617368",
       "public_key": "c7176a703d4dd84fba3c0b760d10670f2a2053fa2c39ccc64ec7fd7792ac037a",
       "signature": "00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
-      "valid": true
+      "valid": false,
+      "zip215_alone": true
     },
     {
       "message": "5a63617368",
       "public_key": "c7176a703d4dd84fba3c0b760d10670f2a2053fa2c39ccc64ec7fd7792ac037a",
       "signature": "c7176a703d4dd84fba3c0b760d10670f2a2053fa2c39ccc64ec7fd7792ac03fa0000000000000000000000000000000000000000000000000000000000000000",
-      "valid": true
+      "valid": false,
+      "zip215_alone": true
     },
     {
       "message": "5a63617368",
       "public_key": "c7176a703d4dd84fba3c0b760d10670f2a2053fa2c39ccc64ec7fd7792ac037a",
       "signature": "01000000000000000000000000000000000000000000000000000000000000800000000000000000000000000000000000000000000000000000000000000000",
-      "valid": true
+      "valid": false,
+      "zip215_alone": true
     },
     {
       "message": "5a63617368",
       "public_key": "c7176a703d4dd84fba3c0b760d10670f2a2053fa2c39ccc64ec7fd7792ac037a",
       "signature": "ecffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff0000000000000000000000000000000000000000000000000000000000000000",
-      "valid": true
+      "valid": false,
+      "zip215_alone": true
     },
     {
       "message": "5a63617368",
       "public_key": "c7176a703d4dd84fba3c0b760d10670f2a2053fa2c39ccc64ec7fd7792ac037a",
       "signature": "edffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f0000000000000000000000000000000000000000000000000000000000000000",
-      "valid": true
+      "valid": false,
+      "zip215_alone": true
     },
     {
       "message": "5a63617368",
       "public_key": "c7176a703d4dd84fba3c0b760d10670f2a2053fa2c39ccc64ec7fd7792ac037a",
       "signature": "edffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff0000000000000000000000000000000000000000000000000000000000000000",
-      "valid": true
+      "valid": false,
+      "zip215_alone": true
     },
     {
       "message": "5a63617368",
       "public_key": "c7176a703d4dd84fba3c0b760d10670f2a2053fa2c39ccc64ec7fd7792ac037a",
       "signature": "eeffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f0000000000000000000000000000000000000000000000000000000000000000",
-      "valid": true
+      "valid": false,
+      "zip215_alone": true
     },
     {
       "message": "5a63617368",
       "public_key": "c7176a703d4dd84fba3c0b760d10670f2a2053fa2c39ccc64ec7fd7792ac037a",
       "signature": "eeffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff0000000000000000000000000000000000000000000000000000000000000000",
-      "valid": true
+      "valid": false,
+      "zip215_alone": true
     },
     {
       "message": "5a63617368",
       "public_key": "0000000000000000000000000000000000000000000000000000000000000080",
       "signature": "01000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
-      "valid": true
+      "valid": false,
+      "zip215_alone": true
     },
     {
       "message": "5a63617368",
       "public_key": "0000000000000000000000000000000000000000000000000000000000000080",
       "signature": "c7176a703d4dd84fba3c0b760d10670f2a2053fa2c39ccc64ec7fd7792ac037a0000000000000000000000000000000000000000000000000000000000000000",
-      "valid": true
+      "valid": false,
+      "zip215_alone": true
     },
     {
       "message": "5a63617368",
       "public_key": "0000000000000000000000000000000000000000000000000000000000000080",
       "signature": "00000000000000000000000000000000000000000000000000000000000000800000000000000000000000000000000000000000000000000000000000000000",
-      "valid": true
+      "valid": false,
+      "zip215_alone": true
     },
     {
       "message": "5a63617368",
       "public_key": "0000000000000000000000000000000000000000000000000000000000000080",
       "signature": "26e8958fc2b227b045c3f489f2ef98f0d5dfac05d3c63339b13802886d53fc050000000000000000000000000000000000000000000000000000000000000000",
-      "valid": true
+      "valid": false,
+      "zip215_alone": true
     },
     {
       "message": "5a63617368",
       "public_key": "0000000000000000000000000000000000000000000000000000000000000080",
       "signature": "ecffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f0000000000000000000000000000000000000000000000000000000000000000",
-      "valid": true
+      "valid": false,
+      "zip215_alone": true
     },
     {
       "message": "5a63617368",
       "public_key": "0000000000000000000000000000000000000000000000000000000000000080",
       "signature": "26e8958fc2b227b045c3f489f2ef98f0d5dfac05d3c63339b13802886d53fc850000000000000000000000000000000000000000000000000000000000000000",
-      "valid": true
+      "valid": false,
+      "zip215_alone": true
     },
     {
       "message": "5a63617368",
       "public_key": "0000000000000000000000000000000000000000000000000000000000000080",
       "signature": "00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
-      "valid": true
+      "valid": false,
+      "zip215_alone": true
     },
     {
       "message": "5a63617368",
       "public_key": "0000000000000000000000000000000000000000000000000000000000000080",
       "signature": "c7176a703d4dd84fba3c0b760d10670f2a2053fa2c39ccc64ec7fd7792ac03fa0000000000000000000000000000000000000000000000000000000000000000",
-      "valid": true
+      "valid": false,
+      "zip215_alone": true
     },
     {
       "message": "5a63617368",
       "public_key": "0000000000000000000000000000000000000000000000000000000000000080",
       "signature": "01000000000000000000000000000000000000000000000000000000000000800000000000000000000000000000000000000000000000000000000000000000",
-      "valid": true
+      "valid": false,
+      "zip215_alone": true
     },
     {
       "message": "5a63617368",
       "public_key": "0000000000000000000000000000000000000000000000000000000000000080",
       "signature": "ecffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff0000000000000000000000000000000000000000000000000000000000000000",
-      "valid": true
+      "valid": false,
+      "zip215_alone": true
     },
     {
       "message": "5a63617368",
       "public_key": "0000000000000000000000000000000000000000000000000000000000000080",
       "signature": "edffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f0000000000000000000000000000000000000000000000000000000000000000",
-      "valid": true
+      "valid": false,
+      "zip215_alone": true
     },
     {
       "message": "5a63617368",
       "public_key": "0000000000000000000000000000000000000000000000000000000000000080",
       "signature": "edffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff0000000000000000000000000000000000000000000000000000000000000000",
-      "valid": true
+      "valid": false,
+      "zip215_alone": true
     },
     {
       "message": "5a63617368",
       "public_key": "0000000000000000000000000000000000000000000000000000000000000080",
       "signature": "eeffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f0000000000000000000000000000000000000000000000000000000000000000",
-      "valid": true
+      "valid": false,
+      "zip215_alone": true
     },
     {
       "message": "5a63617368",
       "public_key": "0000000000000000000000000000000000000000000000000000000000000080",
       "signature": "eeffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff0000000000000000000000000000000000000000000000000000000000000000",
-      "valid": true
+      "valid": false,
+      "zip215_alone": true
     },
     {
       "message": "5a63617368",
       "public_key": "26e8958fc2b227b045c3f489f2ef98f0d5dfac05d3c63339b13802886d53fc05",
       "signature": "01000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
-      "valid": true
+      "valid": false,
+      "zip215_alone": true
     },
     {
       "message": "5a63617368",
       "public_key": "26e8958fc2b227b045c3f489f2ef98f0d5dfac05d3c63339b13802886d53fc05",
       "signature": "c7176a703d4dd84fba3c0b760d10670f2a2053fa2c39ccc64ec7fd7792ac037a0000000000000000000000000000000000000000000000000000000000000000",
-      "valid": true
+      "valid": false,
+      "zip215_alone": true
     },
     {
       "message": "5a63617368",
       "public_key": "26e8958fc2b227b045c3f489f2ef98f0d5dfac05d3c63339b13802886d53fc05",
       "signature": "00000000000000000000000000000000000000000000000000000000000000800000000000000000000000000000000000000000000000000000000000000000",
-      "valid": true
+      "valid": false,
+      "zip215_alone": true
     },
     {
       "message": "5a63617368",
       "public_key": "26e8958fc2b227b045c3f489f2ef98f0d5dfac05d3c63339b13802886d53fc05",
       "signature": "26e8958fc2b227b045c3f489f2ef98f0d5dfac05d3c63339b13802886d53fc050000000000000000000000000000000000000000000000000000000000000000",
-      "valid": true
+      "valid": false,
+      "zip215_alone": true
     },
     {
       "message": "5a63617368",
       "public_key": "26e8958fc2b227b045c3f489f2ef98f0d5dfac05d3c63339b13802886d53fc05",
       "signature": "ecffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f0000000000000000000000000000000000000000000000000000000000000000",
-      "valid": true
+      "valid": false,
+      "zip215_alone": true
     },
     {
       "message": "5a63617368",
       "public_key": "26e8958fc2b227b045c3f489f2ef98f0d5dfac05d3c63339b13802886d53fc05",
       "signature": "26e8958fc2b227b045c3f489f2ef98f0d5dfac05d3c63339b13802886d53fc850000000000000000000000000000000000000000000000000000000000000000",
-      "valid": true
+      "valid": false,
+      "zip215_alone": true
     },
     {
       "message": "5a63617368",
       "public_key": "26e8958fc2b227b045c3f489f2ef98f0d5dfac05d3c63339b13802886d53fc05",
       "signature": "00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
-      "valid": true
+      "valid": false,
+      "zip215_alone": true
     },
     {
       "message": "5a63617368",
       "public_key": "26e8958fc2b227b045c3f489f2ef98f0d5dfac05d3c63339b13802886d53fc05",
       "signature": "c7176a703d4dd84fba3c0b760d10670f2a2053fa2c39ccc64ec7fd7792ac03fa0000000000000000000000000000000000000000000000000000000000000000",
-      "valid": true
+      "valid": false,
+      "zip215_alone": true
     },
     {
       "message": "5a63617368",
       "public_key": "26e8958fc2b227b045c3f489f2ef98f0d5dfac05d3c63339b13802886d53fc05",
       "signature": "01000000000000000000000000000000000000000000000000000000000000800000000000000000000000000000000000000000000000000000000000000000",
-      "valid": true
+      "valid": false,
+      "zip215_alone": true
     },
     {
       "message": "5a63617368",
       "public_key": "26e8958fc2b227b045c3f489f2ef98f0d5dfac05d3c63339b13802886d53fc05",
       "signature": "ecffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff0000000000000000000000000000000000000000000000000000000000000000",
-      "valid": true
+      "valid": false,
+      "zip215_alone": true
     },
     {
       "message": "5a63617368",
       "public_key": "26e8958fc2b227b045c3f489f2ef98f0d5dfac05d3c63339b13802886d53fc05",
       "signature": "edffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f0000000000000000000000000000000000000000000000000000000000000000",
-      "valid": true
+      "valid": false,
+      "zip215_alone": true
     },
     {
       "message": "5a63617368",
       "public_key": "26e8958fc2b227b045c3f489f2ef98f0d5dfac05d3c63339b13802886d53fc05",
       "signature": "edffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff0000000000000000000000000000000000000000000000000000000000000000",
-      "valid": true
+      "valid": false,
+      "zip215_alone": true
     },
     {
       "message": "5a63617368",
       "public_key": "26e8958fc2b227b045c3f489f2ef98f0d5dfac05d3c63339b13802886d53fc05",
       "signature": "eeffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f0000000000000000000000000000000000000000000000000000000000000000",
-      "valid": true
+      "valid": false,
+      "zip215_alone": true
     },
     {
       "message": "5a63617368",
       "public_key": "26e8958fc2b227b045c3f489f2ef98f0d5dfac05d3c63339b13802886d53fc05",
       "signature": "eeffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff0000000000000000000000000000000000000000000000000000000000000000",
-      "valid": true
+      "valid": false,
+      "zip215_alone": true
     },
     {
       "message": "5a63617368",
       "public_key": "ecffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f",
       "signature": "01000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
-      "valid": true
+      "valid": false,
+      "zip215_alone": true
     },
     {
       "message": "5a63617368",
       "public_key": "ecffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f",
       "signature": "c7176a703d4dd84fba3c0b760d10670f2a2053fa2c39ccc64ec7fd7792ac037a0000000000000000000000000000000000000000000000000000000000000000",
-      "valid": true
+      "valid": false,
+      "zip215_alone": true
     },
     {
       "message": "5a63617368",
       "public_key": "ecffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f",
       "signature": "00000000000000000000000000000000000000000000000000000000000000800000000000000000000000000000000000000000000000000000000000000000",
-      "valid": true
+      "valid": false,
+      "zip215_alone": true
     },
     {
       "message": "5a63617368",
       "public_key": "ecffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f",
       "signature": "26e8958fc2b227b045c3f489f2ef98f0d5dfac05d3c63339b13802886d53fc050000000000000000000000000000000000000000000000000000000000000000",
-      "valid": true
+      "valid": false,
+      "zip215_alone": true
     },
     {
       "message": "5a63617368",
       "public_key": "ecffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f",
       "signature": "ecffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f0000000000000000000000000000000000000000000000000000000000000000",
-      "valid": true
+      "valid": false,
+      "zip215_alone": true
     },
     {
       "message": "5a63617368",
       "public_key": "ecffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f",
       "signature": "26e8958fc2b227b045c3f489f2ef98f0d5dfac05d3c63339b13802886d53fc850000000000000000000000000000000000000000000000000000000000000000",
-      "valid": true
+      "valid": false,
+      "zip215_alone": true
     },
     {
       "message": "5a63617368",
       "public_key": "ecffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f",
       "signature": "00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
-      "valid": true
+      "valid": false,
+      "zip215_alone": true
     },
     {
       "message": "5a63617368",
       "public_key": "ecffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f",
       "signature": "c7176a703d4dd84fba3c0b760d10670f2a2053fa2c39ccc64ec7fd7792ac03fa0000000000000000000000000000000000000000000000000000000000000000",
-      "valid": true
+      "valid": false,
+      "zip215_alone": true
     },
     {
       "message": "5a63617368",
       "public_key": "ecffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f",
       "signature": "01000000000000000000000000000000000000000000000000000000000000800000000000000000000000000000000000000000000000000000000000000000",
-      "valid": true
+      "valid": false,
+      "zip215_alone": true
     },
     {
       "message": "5a63617368",
       "public_key": "ecffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f",
       "signature": "ecffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff0000000000000000000000000000000000000000000000000000000000000000",
-      "valid": true
+      "valid": false,
+      "zip215_alone": true
     },
     {
       "message": "5a63617368",
       "public_key": "ecffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f",
       "signature": "edffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f0000000000000000000000000000000000000000000000000000000000000000",
-      "valid": true
+      "valid": false,
+      "zip215_alone": true
     },
     {
       "message": "5a63617368",
       "public_key": "ecffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f",
       "signature": "edffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff0000000000000000000000000000000000000000000000000000000000000000",
-      "valid": true
+      "valid": false,
+      "zip215_alone": true
     },
     {
       "message": "5a63617368",
       "public_key": "ecffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f",
       "signature": "eeffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f0000000000000000000000000000000000000000000000000000000000000000",
-      "valid": true
+      "valid": false,
+      "zip215_alone": true
     },
     {
       "message": "5a63617368",
       "public_key": "ecffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f",
       "signature": "eeffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff0000000000000000000000000000000000000000000000000000000000000000",
-      "valid": true
+      "valid": false,
+      "zip215_alone": true
     },
     {
       "message": "5a63617368",
       "public_key": "26e8958fc2b227b045c3f489f2ef98f0d5dfac05d3c63339b13802886d53fc85",
       "signature": "01000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
-      "valid": true
+      "valid": false,
+      "zip215_alone": true
     },
     {
       "message": "5a63617368",
       "public_key": "26e8958fc2b227b045c3f489f2ef98f0d5dfac05d3c63339b13802886d53fc85",
       "signature": "c7176a703d4dd84fba3c0b760d10670f2a2053fa2c39ccc64ec7fd7792ac037a0000000000000000000000000000000000000000000000000000000000000000",
-      "valid": true
+      "valid": false,
+      "zip215_alone": true
     },
     {
       "message": "5a63617368",
       "public_key": "26e8958fc2b227b045c3f489f2ef98f0d5dfac05d3c63339b13802886d53fc85",
       "signature": "00000000000000000000000000000000000000000000000000000000000000800000000000000000000000000000000000000000000000000000000000000000",
-      "valid": true
+      "valid": false,
+      "zip215_alone": true
     },
     {
       "message": "5a63617368",
       "public_key": "26e8958fc2b227b045c3f489f2ef98f0d5dfac05d3c63339b13802886d53fc85",
       "signature": "26e8958fc2b227b045c3f489f2ef98f0d5dfac05d3c63339b13802886d53fc050000000000000000000000000000000000000000000000000000000000000000",
-      "valid": true
+      "valid": false,
+      "zip215_alone": true
     },
     {
       "message": "5a63617368",
       "public_key": "26e8958fc2b227b045c3f489f2ef98f0d5dfac05d3c63339b13802886d53fc85",
       "signature": "ecffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f0000000000000000000000000000000000000000000000000000000000000000",
-      "valid": true
+      "valid": false,
+      "zip215_alone": true
     },
     {
       "message": "5a63617368",
       "public_key": "26e8958fc2b227b045c3f489f2ef98f0d5dfac05d3c63339b13802886d53fc85",
       "signature": "26e8958fc2b227b045c3f489f2ef98f0d5dfac05d3c63339b13802886d53fc850000000000000000000000000000000000000000000000000000000000000000",
-      "valid": true
+      "valid": false,
+      "zip215_alone": true
     },
     {
       "message": "5a63617368",
       "public_key": "26e8958fc2b227b045c3f489f2ef98f0d5dfac05d3c63339b13802886d53fc85",
       "signature": "00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
-      "valid": true
+      "valid": false,
+      "zip215_alone": true
     },
     {
       "message": "5a63617368",
       "public_key": "26e8958fc2b227b045c3f489f2ef98f0d5dfac05d3c63339b13802886d53fc85",
       "signature": "c7176a703d4dd84fba3c0b760d10670f2a2053fa2c39ccc64ec7fd7792ac03fa0000000000000000000000000000000000000000000000000000000000000000",
-      "valid": true
+      "valid": false,
+      "zip215_alone": true
     },
     {
       "message": "5a63617368",
       "public_key": "26e8958fc2b227b045c3f489f2ef98f0d5dfac05d3c63339b13802886d53fc85",
       "signature": "01000000000000000000000000000000000000000000000000000000000000800000000000000000000000000000000000000000000000000000000000000000",
-      "valid": true
+      "valid": false,
+      "zip215_alone": true
     },
     {
       "message": "5a63617368",
       "public_key": "26e8958fc2b227b045c3f489f2ef98f0d5dfac05d3c63339b13802886d53fc85",
       "signature": "ecffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff0000000000000000000000000000000000000000000000000000000000000000",
-      "valid": true
+      "valid": false,
+      "zip215_alone": true
     },
     {
       "message": "5a63617368",
       "public_key": "26e8958fc2b227b045c3f489f2ef98f0d5dfac05d3c63339b13802886d53fc85",
       "signature": "edffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f0000000000000000000000000000000000000000000000000000000000000000",
-      "valid": true
+      "valid": false,
+      "zip215_alone": true
     },
     {
       "message": "5a63617368",
       "public_key": "26e8958fc2b227b045c3f489f2ef98f0d5dfac05d3c63339b13802886d53fc85",
       "signature": "edffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff0000000000000000000000000000000000000000000000000000000000000000",
-      "valid": true
+      "valid": false,
+      "zip215_alone": true
     },
     {
       "message": "5a63617368",
       "public_key": "26e8958fc2b227b045c3f489f2ef98f0d5dfac05d3c63339b13802886d53fc85",
       "signature": "eeffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f0000000000000000000000000000000000000000000000000000000000000000",
-      "valid": true
+      "valid": false,
+      "zip215_alone": true
     },
     {
       "message": "5a63617368",
       "public_key": "26e8958fc2b227b045c3f489f2ef98f0d5dfac05d3c63339b13802886d53fc85",
       "signature": "eeffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff0000000000000000000000000000000000000000000000000000000000000000",
-      "valid": true
+      "valid": false,
+      "zip215_alone": true
     },
     {
       "message": "5a63617368",
       "public_key": "0000000000000000000000000000000000000000000000000000000000000000",
       "signature": "01000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
-      "valid": true
+      "valid": false,
+      "zip215_alone": true
     },
     {
       "message": "5a63617368",
       "public_key": "0000000000000000000000000000000000000000000000000000000000000000",
       "signature": "c7176a703d4dd84fba3c0b760d10670f2a2053fa2c39ccc64ec7fd7792ac037a0000000000000000000000000000000000000000000000000000000000000000",
-      "valid": true
+      "valid": false,
+      "zip215_alone": true
     },
     {
       "message": "5a63617368",
       "public_key": "0000000000000000000000000000000000000000000000000000000000000000",
       "signature": "00000000000000000000000000000000000000000000000000000000000000800000000000000000000000000000000000000000000000000000000000000000",
-      "valid": true
+      "valid": false,
+      "zip215_alone": true
     },
     {
       "message": "5a63617368",
       "public_key": "0000000000000000000000000000000000000000000000000000000000000000",
       "signature": "26e8958fc2b227b045c3f489f2ef98f0d5dfac05d3c63339b13802886d53fc050000000000000000000000000000000000000000000000000000000000000000",
-      "valid": true
+      "valid": false,
+      "zip215_alone": true
     },
     {
       "message": "5a63617368",
       "public_key": "0000000000000000000000000000000000000000000000000000000000000000",
       "signature": "ecffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f0000000000000000000000000000000000000000000000000000000000000000",
-      "valid": true
+      "valid": false,
+      "zip215_alone": true
     },
     {
       "message": "5a63617368",
       "public_key": "0000000000000000000000000000000000000000000000000000000000000000",
       "signature": "26e8958fc2b227b045c3f489f2ef98f0d5dfac05d3c63339b13802886d53fc850000000000000000000000000000000000000000000000000000000000000000",
-      "valid": true
+      "valid": false,
+      "zip215_alone": true
     },
     {
       "message": "5a63617368",
       "public_key": "0000000000000000000000000000000000000000000000000000000000000000",
       "signature": "00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
-      "valid": true
+      "valid": false,
+      "zip215_alone": true
     },
     {
       "message": "5a63617368",
       "public_key": "0000000000000000000000000000000000000000000000000000000000000000",
       "signature": "c7176a703d4dd84fba3c0b760d10670f2a2053fa2c39ccc64ec7fd7792ac03fa0000000000000000000000000000000000000000000000000000000000000000",
-      "valid": true
+      "valid": false,
+      "zip215_alone": true
     },
     {
       "message": "5a63617368",
       "public_key": "0000000000000000000000000000000000000000000000000000000000000000",
       "signature": "01000000000000000000000000000000000000000000000000000000000000800000000000000000000000000000000000000000000000000000000000000000",
-      "valid": true
+      "valid": false,
+      "zip215_alone": true
     },
     {
       "message": "5a63617368",
       "public_key": "0000000000000000000000000000000000000000000000000000000000000000",
       "signature": "ecffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff0000000000000000000000000000000000000000000000000000000000000000",
-      "valid": true
+      "valid": false,
+      "zip215_alone": true
     },
     {
       "message": "5a63617368",
       "public_key": "0000000000000000000000000000000000000000000000000000000000000000",
       "signature": "edffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f0000000000000000000000000000000000000000000000000000000000000000",
-      "valid": true
+      "valid": false,
+      "zip215_alone": true
     },
     {
       "message": "5a63617368",
       "public_key": "0000000000000000000000000000000000000000000000000000000000000000",
       "signature": "edffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff0000000000000000000000000000000000000000000000000000000000000000",
-      "valid": true
+      "valid": false,
+      "zip215_alone": true
     },
     {
       "message": "5a63617368",
       "public_key": "0000000000000000000000000000000000000000000000000000000000000000",
       "signature": "eeffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f0000000000000000000000000000000000000000000000000000000000000000",
-      "valid": true
+      "valid": false,
+      "zip215_alone": true
     },
     {
       "message": "5a63617368",
       "public_key": "0000000000000000000000000000000000000000000000000000000000000000",
       "signature": "eeffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff0000000000000000000000000000000000000000000000000000000000000000",
-      "valid": true
+      "valid": false,
+      "zip215_alone": true
     },
     {
       "message": "5a63617368",
       "public_key": "c7176a703d4dd84fba3c0b760d10670f2a2053fa2c39ccc64ec7fd7792ac03fa",
       "signature": "01000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
-      "valid": true
+      "valid": false,
+      "zip215_alone": true
     },
     {
       "message": "5a63617368",
       "public_key": "c7176a703d4dd84fba3c0b760d10670f2a2053fa2c39ccc64ec7fd7792ac03fa",
       "signature": "c7176a703d4dd84fba3c0b760d10670f2a2053fa2c39ccc64ec7fd7792ac037a0000000000000000000000000000000000000000000000000000000000000000",
-      "valid": true
+      "valid": false,
+      "zip215_alone": true
     },
     {
       "message": "5a63617368",
       "public_key": "c7176a703d4dd84fba3c0b760d10670f2a2053fa2c39ccc64ec7fd7792ac03fa",
       "signature": "00000000000000000000000000000000000000000000000000000000000000800000000000000000000000000000000000000000000000000000000000000000",
-      "valid": true
+      "valid": false,
+      "zip215_alone": true
     },
     {
       "message": "5a63617368",
       "public_key": "c7176a703d4dd84fba3c0b760d10670f2a2053fa2c39ccc64ec7fd7792ac03fa",
       "signature": "26e8958fc2b227b045c3f489f2ef98f0d5dfac05d3c63339b13802886d53fc050000000000000000000000000000000000000000000000000000000000000000",
-      "valid": true
+      "valid": false,
+      "zip215_alone": true
     },
     {
       "message": "5a63617368",
       "public_key": "c7176a703d4dd84fba3c0b760d10670f2a2053fa2c39ccc64ec7fd7792ac03fa",
       "signature": "ecffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f0000000000000000000000000000000000000000000000000000000000000000",
-      "valid": true
+      "valid": false,
+      "zip215_alone": true
     },
     {
       "message": "5a63617368",
       "public_key": "c7176a703d4dd84fba3c0b760d10670f2a2053fa2c39ccc64ec7fd7792ac03fa",
       "signature": "26e8958fc2b227b045c3f489f2ef98f0d5dfac05d3c63339b13802886d53fc850000000000000000000000000000000000000000000000000000000000000000",
-      "valid": true
+      "valid": false,
+      "zip215_alone": true
     },
     {
       "message": "5a63617368",
       "public_key": "c7176a703d4dd84fba3c0b760d10670f2a2053fa2c39ccc64ec7fd7792ac03fa",
       "signature": "00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
-      "valid": true
+      "valid": false,
+      "zip215_alone": true
     },
     {
       "message": "5a63617368",
       "public_key": "c7176a703d4dd84fba3c0b760d10670f2a2053fa2c39ccc64ec7fd7792ac03fa",
       "signature": "c7176a703d4dd84fba3c0b760d10670f2a2053fa2c39ccc64ec7fd7792ac03fa0000000000000000000000000000000000000000000000000000000000000000",
-      "valid": true
+      "valid": false,
+      "zip215_alone": true
     },
     {
       "message": "5a63617368",
       "public_key": "c7176a703d4dd84fba3c0b760d10670f2a2053fa2c39ccc64ec7fd7792ac03fa",
       "signature": "01000000000000000000000000000000000000000000000000000000000000800000000000000000000000000000000000000000000000000000000000000000",
-      "valid": true
+      "valid": false,
+      "zip215_alone": true
     },
     {
       "message": "5a63617368",
       "public_key": "c7176a703d4dd84fba3c0b760d10670f2a2053fa2c39ccc64ec7fd7792ac03fa",
       "signature": "ecffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff0000000000000000000000000000000000000000000000000000000000000000",
-      "valid": true
+      "valid": false,
+      "zip215_alone": true
     },
     {
       "message": "5a63617368",
       "public_key": "c7176a703d4dd84fba3c0b760d10670f2a2053fa2c39ccc64ec7fd7792ac03fa",
       "signature": "edffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f0000000000000000000000000000000000000000000000000000000000000000",
-      "valid": true
+      "valid": false,
+      "zip215_alone": true
     },
     {
       "message": "5a63617368",
       "public_key": "c7176a703d4dd84fba3c0b760d10670f2a2053fa2c39ccc64ec7fd7792ac03fa",
       "signature": "edffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff0000000000000000000000000000000000000000000000000000000000000000",
-      "valid": true
+      "valid": false,
+      "zip215_alone": true
     },
     {
       "message": "5a63617368",
       "public_key": "c7176a703d4dd84fba3c0b760d10670f2a2053fa2c39ccc64ec7fd7792ac03fa",
       "signature": "eeffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f0000000000000000000000000000000000000000000000000000000000000000",
-      "valid": true
+      "valid": false,
+      "zip215_alone": true
     },
     {
       "message": "5a63617368",
       "public_key": "c7176a703d4dd84fba3c0b760d10670f2a2053fa2c39ccc64ec7fd7792ac03fa",
       "signature": "eeffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff0000000000000000000000000000000000000000000000000000000000000000",
-      "valid": true
+      "valid": false,
+      "zip215_alone": true
     },
     {
       "message": "5a63617368",
       "public_key": "0100000000000000000000000000000000000000000000000000000000000080",
       "signature": "01000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
-      "valid": true
+      "valid": false,
+      "zip215_alone": true
     },
     {
       "message": "5a63617368",
       "public_key": "0100000000000000000000000000000000000000000000000000000000000080",
       "signature": "c7176a703d4dd84fba3c0b760d10670f2a2053fa2c39ccc64ec7fd7792ac037a0000000000000000000000000000000000000000000000000000000000000000",
-      "valid": true
+      "valid": false,
+      "zip215_alone": true
     },
     {
       "message": "5a63617368",
       "public_key": "0100000000000000000000000000000000000000000000000000000000000080",
       "signature": "00000000000000000000000000000000000000000000000000000000000000800000000000000000000000000000000000000000000000000000000000000000",
-      "valid": true
+      "valid": false,
+      "zip215_alone": true
     },
     {
       "message": "5a63617368",
       "public_key": "0100000000000000000000000000000000000000000000000000000000000080",
       "signature": "26e8958fc2b227b045c3f489f2ef98f0d5dfac05d3c63339b13802886d53fc050000000000000000000000000000000000000000000000000000000000000000",
-      "valid": true
+      "valid": false,
+      "zip215_alone": true
     },
     {
       "message": "5a63617368",
       "public_key": "0100000000000000000000000000000000000000000000000000000000000080",
       "signature": "ecffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f0000000000000000000000000000000000000000000000000000000000000000",
-      "valid": true
+      "valid": false,
+      "zip215_alone": true
     },
     {
       "message": "5a63617368",
       "public_key": "0100000000000000000000000000000000000000000000000000000000000080",
       "signature": "26e8958fc2b227b045c3f489f2ef98f0d5dfac05d3c63339b13802886d53fc850000000000000000000000000000000000000000000000000000000000000000",
-      "valid": true
+      "valid": false,
+      "zip215_alone": true
     },
     {
       "message": "5a63617368",
       "public_key": "0100000000000000000000000000000000000000000000000000000000000080",
       "signature": "00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
-      "valid": true
+      "valid": false,
+      "zip215_alone": true
     },
     {
       "message": "5a63617368",
       "public_key": "0100000000000000000000000000000000000000000000000000000000000080",
       "signature": "c7176a703d4dd84fba3c0b760d10670f2a2053fa2c39ccc64ec7fd7792ac03fa0000000000000000000000000000000000000000000000000000000000000000",
-      "valid": true
+      "valid": false,
+      "zip215_alone": true
     },
     {
       "message": "5a63617368",
       "public_key": "0100000000000000000000000000000000000000000000000000000000000080",
       "signature": "01000000000000000000000000000000000000000000000000000000000000800000000000000000000000000000000000000000000000000000000000000000",
-      "valid": true
+      "valid": false,
+      "zip215_alone": true
     },
     {
       "message": "5a63617368",
       "public_key": "0100000000000000000000000000000000000000000000000000000000000080",
       "signature": "ecffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff0000000000000000000000000000000000000000000000000000000000000000",
-      "valid": true
+      "valid": false,
+      "zip215_alone": true
     },
     {
       "message": "5a63617368",
       "public_key": "0100000000000000000000000000000000000000000000000000000000000080",
       "signature": "edffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f0000000000000000000000000000000000000000000000000000000000000000",
-      "valid": true
+      "valid": false,
+      "zip215_alone": true
     },
     {
       "message": "5a63617368",
       "public_key": "0100000000000000000000000000000000000000000000000000000000000080",
       "signature": "edffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff0000000000000000000000000000000000000000000000000000000000000000",
-      "valid": true
+      "valid": false,
+      "zip215_alone": true
     },
     {
       "message": "5a63617368",
       "public_key": "0100000000000000000000000000000000000000000000000000000000000080",
       "signature": "eeffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f0000000000000000000000000000000000000000000000000000000000000000",
-      "valid": true
+      "valid": false,
+      "zip215_alone": true
     },
     {
       "message": "5a63617368",
       "public_key": "0100000000000000000000000000000000000000000000000000000000000080",
       "signature": "eeffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff0000000000000000000000000000000000000000000000000000000000000000",
-      "valid": true
+      "valid": false,
+      "zip215_alone": true
     },
     {
       "message": "5a63617368",
       "public_key": "ecffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
       "signature": "01000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
-      "valid": true
+      "valid": false,
+      "zip215_alone": true
     },
     {
       "message": "5a63617368",
       "public_key": "ecffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
       "signature": "c7176a703d4dd84fba3c0b760d10670f2a2053fa2c39ccc64ec7fd7792ac037a0000000000000000000000000000000000000000000000000000000000000000",
-      "valid": true
+      "valid": false,
+      "zip215_alone": true
     },
     {
       "message": "5a63617368",
       "public_key": "ecffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
       "signature": "00000000000000000000000000000000000000000000000000000000000000800000000000000000000000000000000000000000000000000000000000000000",
-      "valid": true
+      "valid": false,
+      "zip215_alone": true
     },
     {
       "message": "5a63617368",
       "public_key": "ecffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
       "signature": "26e8958fc2b227b045c3f489f2ef98f0d5dfac05d3c63339b13802886d53fc050000000000000000000000000000000000000000000000000000000000000000",
-      "valid": true
+      "valid": false,
+      "zip215_alone": true
     },
     {
       "message": "5a63617368",
       "public_key": "ecffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
       "signature": "ecffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f0000000000000000000000000000000000000000000000000000000000000000",
-      "valid": true
+      "valid": false,
+      "zip215_alone": true
     },
     {
       "message": "5a63617368",
       "public_key": "ecffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
       "signature": "26e8958fc2b227b045c3f489f2ef98f0d5dfac05d3c63339b13802886d53fc850000000000000000000000000000000000000000000000000000000000000000",
-      "valid": true
+      "valid": false,
+      "zip215_alone": true
     },
     {
       "message": "5a63617368",
       "public_key": "ecffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
       "signature": "00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
-      "valid": true
+      "valid": false,
+      "zip215_alone": true
     },
     {
       "message": "5a63617368",
       "public_key": "ecffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
       "signature": "c7176a703d4dd84fba3c0b760d10670f2a2053fa2c39ccc64ec7fd7792ac03fa0000000000000000000000000000000000000000000000000000000000000000",
-      "valid": true
+      "valid": false,
+      "zip215_alone": true
     },
     {
       "message": "5a63617368",
       "public_key": "ecffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
       "signature": "01000000000000000000000000000000000000000000000000000000000000800000000000000000000000000000000000000000000000000000000000000000",
-      "valid": true
+      "valid": false,
+      "zip215_alone": true
     },
     {
       "message": "5a63617368",
       "public_key": "ecffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
       "signature": "ecffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff0000000000000000000000000000000000000000000000000000000000000000",
-      "valid": true
+      "valid": false,
+      "zip215_alone": true
     },
     {
       "message": "5a63617368",
       "public_key": "ecffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
       "signature": "edffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f0000000000000000000000000000000000000000000000000000000000000000",
-      "valid": true
+      "valid": false,
+      "zip215_alone": true
     },
     {
       "message": "5a63617368",
       "public_key": "ecffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
       "signature": "edffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff0000000000000000000000000000000000000000000000000000000000000000",
-      "valid": true
+      "valid": false,
+      "zip215_alone": true
     },
     {
       "message": "5a63617368",
       "public_key": "ecffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
       "signature": "eeffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f0000000000000000000000000000000000000000000000000000000000000000",
-      "valid": true
+      "valid": false,
+      "zip215_alone": true
     },
     {
       "message": "5a63617368",
       "public_key": "ecffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
       "signature": "eeffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff0000000000000000000000000000000000000000000000000000000000000000",
-      "valid": true
+      "valid": false,
+      "zip215_alone": true
     },
     {
       "message": "5a63617368",
       "public_key": "edffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f",
       "signature": "01000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
-      "valid": true
+      "valid": false,
+      "zip215_alone": true
     },
     {
       "message": "5a63617368",
       "public_key": "edffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f",
       "signature": "c7176a703d4dd84fba3c0b760d10670f2a2053fa2c39ccc64ec7fd7792ac037a0000000000000000000000000000000000000000000000000000000000000000",
-      "valid": true
+      "valid": false,
+      "zip215_alone": true
     },
     {
       "message": "5a63617368",
       "public_key": "edffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f",
       "signature": "00000000000000000000000000000000000000000000000000000000000000800000000000000000000000000000000000000000000000000000000000000000",
-      "valid": true
+      "valid": false,
+      "zip215_alone": true
     },
     {
       "message": "5a63617368",
       "public_key": "edffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f",
       "signature": "26e8958fc2b227b045c3f489f2ef98f0d5dfac05d3c63339b13802886d53fc050000000000000000000000000000000000000000000000000000000000000000",
-      "valid": true
+      "valid": false,
+      "zip215_alone": true
     },
     {
       "message": "5a63617368",
       "public_key": "edffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f",
       "signature": "ecffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f0000000000000000000000000000000000000000000000000000000000000000",
-      "valid": true
+      "valid": false,
+      "zip215_alone": true
     },
     {
       "message": "5a63617368",
       "public_key": "edffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f",
       "signature": "26e8958fc2b227b045c3f489f2ef98f0d5dfac05d3c63339b13802886d53fc850000000000000000000000000000000000000000000000000000000000000000",
-      "valid": true
+      "valid": false,
+      "zip215_alone": true
     },
     {
       "message": "5a63617368",
       "public_key": "edffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f",
       "signature": "00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
-      "valid": true
+      "valid": false,
+      "zip215_alone": true
     },
     {
       "message": "5a63617368",
       "public_key": "edffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f",
       "signature": "c7176a703d4dd84fba3c0b760d10670f2a2053fa2c39ccc64ec7fd7792ac03fa0000000000000000000000000000000000000000000000000000000000000000",
-      "valid": true
+      "valid": false,
+      "zip215_alone": true
     },
     {
       "message": "5a63617368",
       "public_key": "edffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f",
       "signature": "01000000000000000000000000000000000000000000000000000000000000800000000000000000000000000000000000000000000000000000000000000000",
-      "valid": true
+      "valid": false,
+      "zip215_alone": true
     },
     {
       "message": "5a63617368",
       "public_key": "edffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f",
       "signature": "ecffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff0000000000000000000000000000000000000000000000000000000000000000",
-      "valid": true
+      "valid": false,
+      "zip215_alone": true
     },
     {
       "message": "5a63617368",
       "public_key": "edffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f",
       "signature": "edffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f0000000000000000000000000000000000000000000000000000000000000000",
-      "valid": true
+      "valid": false,
+      "zip215_alone": true
     },
     {
       "message": "5a63617368",
       "public_key": "edffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f",
       "signature": "edffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff0000000000000000000000000000000000000000000000000000000000000000",
-      "valid": true
+      "valid": false,
+      "zip215_alone": true
     },
     {
       "message": "5a63617368",
       "public_key": "edffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f",
       "signature": "eeffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f0000000000000000000000000000000000000000000000000000000000000000",
-      "valid": true
+      "valid": false,
+      "zip215_alone": true
     },
     {
       "message": "5a63617368",
       "public_key": "edffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f",
       "signature": "eeffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff0000000000000000000000000000000000000000000000000000000000000000",
-      "valid": true
+      "valid": false,
+      "zip215_alone": true
     },
     {
       "message": "5a63617368",
       "public_key": "edffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
       "signature": "01000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
-      "valid": true
+      "valid": false,
+      "zip215_alone": true
     },
     {
       "message": "5a63617368",
       "public_key": "edffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
       "signature": "c7176a703d4dd84fba3c0b760d10670f2a2053fa2c39ccc64ec7fd7792ac037a0000000000000000000000000000000000000000000000000000000000000000",
-      "valid": true
+      "valid": false,
+      "zip215_alone": true
     },
     {
       "message": "5a63617368",
       "public_key": "edffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
       "signature": "00000000000000000000000000000000000000000000000000000000000000800000000000000000000000000000000000000000000000000000000000000000",
-      "valid": true
+      "valid": false,
+      "zip215_alone": true
     },
     {
       "message": "5a63617368",
       "public_key": "edffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
       "signature": "26e8958fc2b227b045c3f489f2ef98f0d5dfac05d3c63339b13802886d53fc050000000000000000000000000000000000000000000000000000000000000000",
-      "valid": true
+      "valid": false,
+      "zip215_alone": true
     },
     {
       "message": "5a63617368",
       "public_key": "edffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
       "signature": "ecffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f0000000000000000000000000000000000000000000000000000000000000000",
-      "valid": true
+      "valid": false,
+      "zip215_alone": true
     },
     {
       "message": "5a63617368",
       "public_key": "edffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
       "signature": "26e8958fc2b227b045c3f489f2ef98f0d5dfac05d3c63339b13802886d53fc850000000000000000000000000000000000000000000000000000000000000000",
-      "valid": true
+      "valid": false,
+      "zip215_alone": true
     },
     {
       "message": "5a63617368",
       "public_key": "edffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
       "signature": "00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
-      "valid": true
+      "valid": false,
+      "zip215_alone": true
     },
     {
       "message": "5a63617368",
       "public_key": "edffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
       "signature": "c7176a703d4dd84fba3c0b760d10670f2a2053fa2c39ccc64ec7fd7792ac03fa0000000000000000000000000000000000000000000000000000000000000000",
-      "valid": true
+      "valid": false,
+      "zip215_alone": true
     },
     {
       "message": "5a63617368",
       "public_key": "edffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
       "signature": "01000000000000000000000000000000000000000000000000000000000000800000000000000000000000000000000000000000000000000000000000000000",
-      "valid": true
+      "valid": false,
+      "zip215_alone": true
     },
     {
       "message": "5a63617368",
       "public_key": "edffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
       "signature": "ecffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff0000000000000000000000000000000000000000000000000000000000000000",
-      "valid": true
+      "valid": false,
+      "zip215_alone": true
     },
     {
       "message": "5a63617368",
       "public_key": "edffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
       "signature": "edffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f0000000000000000000000000000000000000000000000000000000000000000",
-      "valid": true
+      "valid": false,
+      "zip215_alone": true
     },
     {
       "message": "5a63617368",
       "public_key": "edffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
       "signature": "edffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff0000000000000000000000000000000000000000000000000000000000000000",
-      "valid": true
+      "valid": false,
+      "zip215_alone": true
     },
     {
       "message": "5a63617368",
       "public_key": "edffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
       "signature": "eeffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f0000000000000000000000000000000000000000000000000000000000000000",
-      "valid": true
+      "valid": false,
+      "zip215_alone": true
     },
     {
       "message": "5a63617368",
       "public_key": "edffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
       "signature": "eeffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff0000000000000000000000000000000000000000000000000000000000000000",
-      "valid": true
+      "valid": false,
+      "zip215_alone": true
     },
     {
       "message": "5a63617368",
       "public_key": "eeffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f",
       "signature": "01000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
-      "valid": true
+      "valid": false,
+      "zip215_alone": true
     },
     {
       "message": "5a63617368",
       "public_key": "eeffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f",
       "signature": "c7176a703d4dd84fba3c0b760d10670f2a2053fa2c39ccc64ec7fd7792ac037a0000000000000000000000000000000000000000000000000000000000000000",
-      "valid": true
+      "valid": false,
+      "zip215_alone": true
     },
     {
       "message": "5a63617368",
       "public_key": "eeffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f",
       "signature": "00000000000000000000000000000000000000000000000000000000000000800000000000000000000000000000000000000000000000000000000000000000",
-      "valid": true
+      "valid": false,
+      "zip215_alone": true
     },
     {
       "message": "5a63617368",
       "public_key": "eeffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f",
       "signature": "26e8958fc2b227b045c3f489f2ef98f0d5dfac05d3c63339b13802886d53fc050000000000000000000000000000000000000000000000000000000000000000",
-      "valid": true
+      "valid": false,
+      "zip215_alone": true
     },
     {
       "message": "5a63617368",
       "public_key": "eeffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f",
       "signature": "ecffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f0000000000000000000000000000000000000000000000000000000000000000",
-      "valid": true
+      "valid": false,
+      "zip215_alone": true
     },
     {
       "message": "5a63617368",
       "public_key": "eeffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f",
       "signature": "26e8958fc2b227b045c3f489f2ef98f0d5dfac05d3c63339b13802886d53fc850000000000000000000000000000000000000000000000000000000000000000",
-      "valid": true
+      "valid": false,
+      "zip215_alone": true
     },
     {
       "message": "5a63617368",
       "public_key": "eeffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f",
       "signature": "00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
-      "valid": true
+      "valid": false,
+      "zip215_alone": true
     },
     {
       "message": "5a63617368",
       "public_key": "eeffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f",
       "signature": "c7176a703d4dd84fba3c0b760d10670f2a2053fa2c39ccc64ec7fd7792ac03fa0000000000000000000000000000000000000000000000000000000000000000",
-      "valid": true
+      "valid": false,
+      "zip215_alone": true
     },
     {
       "message": "5a63617368",
       "public_key": "eeffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f",
       "signature": "01000000000000000000000000000000000000000000000000000000000000800000000000000000000000000000000000000000000000000000000000000000",
-      "valid": true
+      "valid": false,
+      "zip215_alone": true
     },
     {
       "message": "5a63617368",
       "public_key": "eeffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f",
       "signature": "ecffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff0000000000000000000000000000000000000000000000000000000000000000",
-      "valid": true
+      "valid": false,
+      "zip215_alone": true
     },
     {
       "message": "5a63617368",
       "public_key": "eeffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f",
       "signature": "edffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f0000000000000000000000000000000000000000000000000000000000000000",
-      "valid": true
+      "valid": false,
+      "zip215_alone": true
     },
     {
       "message": "5a63617368",
       "public_key": "eeffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f",
       "signature": "edffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff0000000000000000000000000000000000000000000000000000000000000000",
-      "valid": true
+      "valid": false,
+      "zip215_alone": true
     },
     {
       "message": "5a63617368",
       "public_key": "eeffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f",
       "signature": "eeffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f0000000000000000000000000000000000000000000000000000000000000000",
-      "valid": true
+      "valid": false,
+      "zip215_alone": true
     },
     {
       "message": "5a63617368",
       "public_key": "eeffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f",
       "signature": "eeffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff0000000000000000000000000000000000000000000000000000000000000000",
-      "valid": true
+      "valid": false,
+      "zip215_alone": true
     },
     {
       "message": "5a63617368",
       "public_key": "eeffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
       "signature": "01000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
-      "valid": true
+      "valid": false,
+      "zip215_alone": true
     },
     {
       "message": "5a63617368",
       "public_key": "eeffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
       "signature": "c7176a703d4dd84fba3c0b760d10670f2a2053fa2c39ccc64ec7fd7792ac037a0000000000000000000000000000000000000000000000000000000000000000",
-      "valid": true
+      "valid": false,
+      "zip215_alone": true
     },
     {
       "message": "5a63617368",
       "public_key": "eeffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
       "signature": "00000000000000000000000000000000000000000000000000000000000000800000000000000000000000000000000000000000000000000000000000000000",
-      "valid": true
+      "valid": false,
+      "zip215_alone": true
     },
     {
       "message": "5a63617368",
       "public_key": "eeffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
       "signature": "26e8958fc2b227b045c3f489f2ef98f0d5dfac05d3c63339b13802886d53fc050000000000000000000000000000000000000000000000000000000000000000",
-      "valid": true
+      "valid": false,
+      "zip215_alone": true
     },
     {
       "message": "5a63617368",
       "public_key": "eeffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
       "signature": "ecffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f0000000000000000000000000000000000000000000000000000000000000000",
-      "valid": true
+      "valid": false,
+      "zip215_alone": true
     },
     {
       "message": "5a63617368",
       "public_key": "eeffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
       "signature": "26e8958fc2b227b045c3f489f2ef98f0d5dfac05d3c63339b13802886d53fc850000000000000000000000000000000000000000000000000000000000000000",
-      "valid": true
+      "valid": false,
+      "zip215_alone": true
     },
     {
       "message": "5a63617368",
       "public_key": "eeffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
       "signature": "00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
-      "valid": true
+      "valid": false,
+      "zip215_alone": true
     },
     {
       "message": "5a63617368",
       "public_key": "eeffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
       "signature": "c7176a703d4dd84fba3c0b760d10670f2a2053fa2c39ccc64ec7fd7792ac03fa0000000000000000000000000000000000000000000000000000000000000000",
-      "valid": true
+      "valid": false,
+      "zip215_alone": true
     },
     {
       "message": "5a63617368",
       "public_key": "eeffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
       "signature": "01000000000000000000000000000000000000000000000000000000000000800000000000000000000000000000000000000000000000000000000000000000",
-      "valid": true
+      "valid": false,
+      "zip215_alone": true
     },
     {
       "message": "5a63617368",
       "public_key": "eeffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
       "signature": "ecffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff0000000000000000000000000000000000000000000000000000000000000000",
-      "valid": true
+      "valid": false,
+      "zip215_alone": true
     },
     {
       "message": "5a63617368",
       "public_key": "eeffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
       "signature": "edffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f0000000000000000000000000000000000000000000000000000000000000000",
-      "valid": true
+      "valid": false,
+      "zip215_alone": true
     },
     {
       "message": "5a63617368",
       "public_key": "eeffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
       "signature": "edffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff0000000000000000000000000000000000000000000000000000000000000000",
-      "valid": true
+      "valid": false,
+      "zip215_alone": true
     },
     {
       "message": "5a63617368",
       "public_key": "eeffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
       "signature": "eeffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f0000000000000000000000000000000000000000000000000000000000000000",
-      "valid": true
+      "valid": false,
+      "zip215_alone": true
     },
     {
       "message": "5a63617368",
       "public_key": "eeffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
       "signature": "eeffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff0000000000000000000000000000000000000000000000000000000000000000",
+      "valid": false,
+      "zip215_alone": true
+    },
+    {
+      "message": "5a63617368",
+      "note": "R of small order, under a key that is not",
+      "public_key": "75f98cdf4bfe21b2cd7216fd681411f19c215f77c565b58bfc085f05fd7505f9",
+      "signature": "010000000000000000000000000000000000000000000000000000000000000097704eece38a39fae006d6fb9e7c52103c34870c964460f9269a3f59d5616403",
+      "valid": true
+    },
+    {
+      "message": "5a63617368",
+      "note": "R of small order, under a key that is not",
+      "public_key": "75f98cdf4bfe21b2cd7216fd681411f19c215f77c565b58bfc085f05fd7505f9",
+      "signature": "c7176a703d4dd84fba3c0b760d10670f2a2053fa2c39ccc64ec7fd7792ac037a46e4c926f49089fe26cc5680f19d0e23e4e33cd13c130301f82bf3a62f1f1706",
+      "valid": true
+    },
+    {
+      "message": "5a63617368",
+      "note": "R of small order, under a key that is not",
+      "public_key": "75f98cdf4bfe21b2cd7216fd681411f19c215f77c565b58bfc085f05fd7505f9",
+      "signature": "000000000000000000000000000000000000000000000000000000000000008018a5e1dc05813008c1f0dc164940295814b70b0bce95dc71bba551531a8a320b",
+      "valid": true
+    },
+    {
+      "message": "5a63617368",
+      "note": "R of small order, under a key that is not",
+      "public_key": "75f98cdf4bfe21b2cd7216fd681411f19c215f77c565b58bfc085f05fd7505f9",
+      "signature": "26e8958fc2b227b045c3f489f2ef98f0d5dfac05d3c63339b13802886d53fc05a021efee513892f6e2fb26f2675beb4b656f455e2438d45fc33ff2829d6b590f",
+      "valid": true
+    },
+    {
+      "message": "5a63617368",
+      "note": "R of small order, under a key that is not",
+      "public_key": "75f98cdf4bfe21b2cd7216fd681411f19c215f77c565b58bfc085f05fd7505f9",
+      "signature": "ecffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f01947b8872144882e6c375cf061acfb4d323ca9c54d1a72f804d16862cdd6d03",
+      "valid": true
+    },
+    {
+      "message": "5a63617368",
+      "note": "R of small order, under a key that is not",
+      "public_key": "75f98cdf4bfe21b2cd7216fd681411f19c215f77c565b58bfc085f05fd7505f9",
+      "signature": "26e8958fc2b227b045c3f489f2ef98f0d5dfac05d3c63339b13802886d53fc85fb61c27935918c28d86a20ae4aafec96acf93bfb2bb3ff0a87dcaa57ed440609",
+      "valid": true
+    },
+    {
+      "message": "5a63617368",
+      "note": "R of small order, under a key that is not",
+      "public_key": "75f98cdf4bfe21b2cd7216fd681411f19c215f77c565b58bfc085f05fd7505f9",
+      "signature": "00000000000000000000000000000000000000000000000000000000000000002728cf923aaf2ed560e1585ab7ae38d192d268ffd9d68b482b3c104fe4b9ee05",
+      "valid": true
+    },
+    {
+      "message": "5a63617368",
+      "note": "R of small order, under a key that is not",
+      "public_key": "75f98cdf4bfe21b2cd7216fd681411f19c215f77c565b58bfc085f05fd7505f9",
+      "signature": "c7176a703d4dd84fba3c0b760d10670f2a2053fa2c39ccc64ec7fd7792ac03fa6a3c00110438cd783ae030858a1e149a45270e9945f3cd81d0575cdb8a85810d",
+      "valid": true
+    },
+    {
+      "message": "5a63617368",
+      "note": "R of small order, under a key that is not",
+      "public_key": "75f98cdf4bfe21b2cd7216fd681411f19c215f77c565b58bfc085f05fd7505f9",
+      "signature": "0100000000000000000000000000000000000000000000000000000000000080577ef53c59b6a61f804601b011d76ecba5119639c7809d859ddd30478d8f9e08",
+      "valid": true
+    },
+    {
+      "message": "5a63617368",
+      "note": "R of small order, under a key that is not",
+      "public_key": "75f98cdf4bfe21b2cd7216fd681411f19c215f77c565b58bfc085f05fd7505f9",
+      "signature": "ecffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffb5684e1d6807455ef4d70dea25f864236623ed64c54cb86f15efcb7c82f82b02",
+      "valid": true
+    },
+    {
+      "message": "5a63617368",
+      "note": "R of small order, under a key that is not",
+      "public_key": "75f98cdf4bfe21b2cd7216fd681411f19c215f77c565b58bfc085f05fd7505f9",
+      "signature": "edffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f2ce1fe4e8c084a5b20184b25a39ac04fc908971c2ab546eb491d7afbac548809",
+      "valid": true
+    },
+    {
+      "message": "5a63617368",
+      "note": "R of small order, under a key that is not",
+      "public_key": "75f98cdf4bfe21b2cd7216fd681411f19c215f77c565b58bfc085f05fd7505f9",
+      "signature": "edffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffc3cd19bf418592b7bef27b14af21f7149f5bb2719ee4ed86a6321311785d8e0a",
+      "valid": true
+    },
+    {
+      "message": "5a63617368",
+      "note": "R of small order, under a key that is not",
+      "public_key": "75f98cdf4bfe21b2cd7216fd681411f19c215f77c565b58bfc085f05fd7505f9",
+      "signature": "eeffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7fc96c525eed8f30c2a4d1de89b0e27c97a83a8b5630a847cbccdd1988d1ca340a",
+      "valid": true
+    },
+    {
+      "message": "5a63617368",
+      "note": "R of small order, under a key that is not",
+      "public_key": "75f98cdf4bfe21b2cd7216fd681411f19c215f77c565b58bfc085f05fd7505f9",
+      "signature": "eeffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff6b57416191ac6e5388200bfc34ffe9e7ea28d0d5846098a8deb4577a5e63010b",
+      "valid": true
+    },
+    {
+      "message": "5a63617368",
+      "note": "a key of mixed order",
+      "public_key": "cf6116a60f202cdc3c4ef7513d3f46fc812b7a167055cf947a37ecd6215c2963",
+      "signature": "0fa69267dcfdc482d9e80f4d4cbb6d96f992a5ce946a188bc22dc12c33620c4a662e5e60de824e4fd45628fe547d8def46d769bdcf15fa91e1591214cfa2ea01",
+      "valid": true
+    },
+    {
+      "message": "5a63617368",
+      "note": "a key of mixed order",
+      "public_key": "e05cb59ae764fcf26596a02e2caf13fc5db351b8f65ac35a0181e26b45c5a218",
+      "signature": "0fa69267dcfdc482d9e80f4d4cbb6d96f992a5ce946a188bc22dc12c33620c4a4ac0c85c33e9a7ee43731a4a149fcd22b93b2c43f0033fac8d5704946d310202",
+      "valid": true
+    },
+    {
+      "message": "5a63617368",
+      "note": "a key of mixed order",
+      "public_key": "a782701d4b1d0cf1abffd999bf09b028f33afb90acfdffaa1328f3c917982ce5",
+      "signature": "0fa69267dcfdc482d9e80f4d4cbb6d96f992a5ce946a188bc22dc12c33620c4aff93031882b3251131f3965ea8cd6afaca0bed087c4ea3093bdee7fe5daaa508",
+      "valid": true
+    },
+    {
+      "message": "5a63617368",
+      "note": "a key of mixed order",
+      "public_key": "78067320b401de4d328de90297ebee0e63dea0883a9a4a7403f7a0fa028afa06",
+      "signature": "0fa69267dcfdc482d9e80f4d4cbb6d96f992a5ce946a188bc22dc12c33620c4ae00f418899d31c23455de77fe4442b81fb0b17b9aad63720b674b97c1e66800b",
+      "valid": true
+    },
+    {
+      "message": "5a63617368",
+      "note": "a key of mixed order",
+      "public_key": "1e9ee959f0dfd323c3b108aec2c0b9037ed485e98faa306b85c81329dea3d69c",
+      "signature": "0fa69267dcfdc482d9e80f4d4cbb6d96f992a5ce946a188bc22dc12c33620c4a91ee69e42f5e5b1db54d5650ba8de3af5bd13d7fefd94310c62ac0e132e2fa0b",
+      "valid": true
+    },
+    {
+      "message": "5a63617368",
+      "note": "a key of mixed order",
+      "public_key": "0da34a65189b030d9a695fd1d350ec03a24cae4709a53ca5fe7e1d94ba3a5de7",
+      "signature": "0fa69267dcfdc482d9e80f4d4cbb6d96f992a5ce946a188bc22dc12c33620c4aa9f09376bfbe5c576e55d6439d30f2131cc45a773d13d5bb0f148109ea27c106",
+      "valid": true
+    },
+    {
+      "message": "5a63617368",
+      "note": "a key of mixed order",
+      "public_key": "467d8fe2b4e2f30e5400266640f64fd70cc5046f53020055ecd70c36e867d31a",
+      "signature": "0fa69267dcfdc482d9e80f4d4cbb6d96f992a5ce946a188bc22dc12c33620c4acb9996313914fb97a8854804647c1a07c3f9d02f5f678e11856c87ca4665940e",
       "valid": true
     },
     {
