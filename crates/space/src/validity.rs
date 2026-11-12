@@ -1108,15 +1108,17 @@ impl Judge {
             None => Vec::new(),
         };
         let entries = self.by_author.get(who).map_or(&[][..], |v| v.as_slice());
-        // the latest first: what answers a leave is usually the last thing
-        let wrote: Vec<&EntryId> = entries
-            .iter()
-            .rev()
-            .filter(|x| valid(x) && !leaves.contains(x))
-            .collect();
+        // Nearly always nobody has left, and anything valid will do.
         if leaves.is_empty() {
-            return !wrote.is_empty();
+            return entries.iter().any(|x| valid(&x));
         }
+        // the latest first: what answers a leave is usually the last thing
+        let wrote = || {
+            entries
+                .iter()
+                .rev()
+                .filter(|x| valid(x) && !leaves.contains(x))
+        };
         let adds = self.adds_of.get(who).map_or(&[][..], |v| v.as_slice());
         let adds: Vec<&EntryId> = adds
             .iter()
@@ -1124,9 +1126,8 @@ impl Judge {
             .filter(valid)
             .collect();
         leaves.iter().all(|l| {
-            adds.iter().any(|a| {
-                dag.is_ancestor(l, a) && wrote.iter().any(|x| dag.is_ancestor_or_self(a, x))
-            })
+            adds.iter()
+                .any(|a| dag.is_ancestor(l, a) && wrote().any(|x| dag.is_ancestor_or_self(a, x)))
         })
     }
 }
