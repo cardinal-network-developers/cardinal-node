@@ -983,6 +983,86 @@ fn leaving_is_a_statement() {
     assert!(s.none_valid(&["eve"]) && !s.judge.has_left(&s.dag, &s.id(EVE)));
 }
 
+/// `spaces.md#holding-a-space`: a member accepts a space by writing any
+/// valid entry in it. One who left has taken that back: added again, they
+/// accept by an entry that descends from that addition.
+#[test]
+fn acceptance_is_taken_back_by_leaving() {
+    let mut s = Scene::new(ANA, A, &[(ANA, OWNER)], None);
+    let cy = s.id(CY);
+    // whoever wrote the genesis accepted it there
+    assert!(s.judge.accepted(&s.dag, &s.id(ANA)));
+    s.write("e1", ANA, A, add(&s, CY, WRITER), None);
+    assert!(!s.judge.accepted(&s.dag, &cy), "being added is an offer");
+    s.write("hello", CY, P, app(), None);
+    assert!(s.judge.accepted(&s.dag, &cy));
+    s.write("bye", CY, P, vec![SpaceOp::leave()], None);
+    assert!(!s.judge.accepted(&s.dag, &cy));
+    // what another of their devices wrote without having seen the leave is
+    // no answer to an offer that had not been made yet
+    s.write("meanwhile", CY, A, app(), Some(&["hello"]));
+    assert!(!s.judge.accepted(&s.dag, &cy));
+    s.write("again", ANA, A, add(&s, CY, WRITER), Some(&["bye"]));
+    assert!(!s.judge.has_left(&s.dag, &cy));
+    assert!(
+        !s.judge.accepted(&s.dag, &cy),
+        "added again is offered again"
+    );
+    s.write("beside", CY, A, app(), Some(&["bye", "meanwhile"]));
+    assert!(
+        !s.judge.accepted(&s.dag, &cy),
+        "it had not seen the addition"
+    );
+    s.write("back", CY, P, app(), Some(&["again"]));
+    assert!(s.all_valid(&["hello", "meanwhile", "beside", "back"]));
+    assert!(s.judge.accepted(&s.dag, &cy));
+    // leaving again takes it back again, and each leave needs its answer
+    s.write("bye2", CY, P, vec![SpaceOp::leave()], None);
+    assert!(!s.judge.accepted(&s.dag, &cy));
+    s.write("again2", ANA, A, add(&s, CY, READER), None);
+    assert!(!s.judge.accepted(&s.dag, &cy));
+    s.write("back2", CY, P, vec![reach(&cy)], None);
+    assert!(s.judge.accepted(&s.dag, &cy));
+    // an entry that does not count accepts nothing
+    s.write("e2", ANA, A, add(&s, BEN, READER), None);
+    s.write("no", BEN, P, app(), None);
+    assert!(s.none_valid(&["no"]) && !s.judge.accepted(&s.dag, &s.id(BEN)));
+}
+
+/// `spaces.md#authors`: before a key is removed, an entry of it is not yet
+/// witnessed if it would not be witnessed were the key removed now: no
+/// entry of the same author under another key descends from it, and no
+/// `keep` covers it.
+#[test]
+fn not_yet_witnessed() {
+    let mut s = Scene::new(ANA, A, &[(ANA, OWNER)], None);
+    let phone = s.people[ANA].keys[P].public_key();
+    let laptop = s.people[ANA].keys[A].public_key();
+    assert!(!s.judge.unwitnessed_work(&s.dag, &phone));
+    s.write("p1", ANA, P, app(), None);
+    s.write("p2", ANA, P, app(), None);
+    assert!(s.judge.unwitnessed_work(&s.dag, &phone));
+    // the genesis is the laptop's, and the phone built on it
+    assert!(!s.judge.unwitnessed_work(&s.dag, &laptop));
+    // someone else building on it witnesses nothing
+    s.write("e1", ANA, A, add(&s, BEN, WRITER), Some(&["genesis"]));
+    s.write("b1", BEN, P, app(), Some(&["p2", "e1"]));
+    assert!(s.judge.unwitnessed_work(&s.dag, &phone));
+    // a `keep` for another key covers nothing of this one's
+    s.write("other", ANA, A, keep(&s, ANA, A, &["p2"]), Some(&["e1"]));
+    assert!(s.judge.unwitnessed_work(&s.dag, &phone));
+    // a `keep` that lists an entry covers what came before it, and not
+    // what came after
+    s.write("k1", ANA, A, keep(&s, ANA, P, &["p1"]), Some(&["e1"]));
+    assert!(s.judge.unwitnessed_work(&s.dag, &phone));
+    s.write("k2", ANA, A, keep(&s, ANA, P, &["p2"]), Some(&["e1"]));
+    assert!(!s.judge.unwitnessed_work(&s.dag, &phone));
+    // and so it is when the key is removed: nothing of the phone's is lost
+    s.remove_phone(ANA);
+    assert!(s.all_valid(&["p1", "p2"]));
+    assert!(s.judge.validity().unwitnessed.is_empty());
+}
+
 #[test]
 fn succession_closes_the_old_space() {
     let mut s = Scene::new(ANA, A, &[(ANA, OWNER)], None);

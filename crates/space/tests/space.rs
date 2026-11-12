@@ -578,8 +578,80 @@ fn a_relationship_has_two_writers_no_owner_and_a_conversation() {
     assert!(a.ended() && b.ended());
     let more = relationship::create_message(c, "anyone there?");
     assert!(a
-        .write(&ana.log, &ana.devices[0].signing, vec![more], None)
+        .write(&ana.log, &ana.devices[0].signing, vec![more.clone()], None)
         .is_err());
+    // What witnesses or keeps a person's own work is still written: an
+    // empty entry, or a `keep`. Those count without being valid there, and
+    // nothing builds on them.
+    let heads = a.heads();
+    let key = ana.devices[0].signing.public_key();
+    let kept = SpaceOp::keep(key, &[named]);
+    for ops in [vec![], vec![kept.clone()], vec![kept.clone(), kept.clone()]] {
+        let (id, _) = a
+            .write_entry(&ana.log, &ana.devices[0].signing, ops, None)
+            .unwrap();
+        assert!(a.validity().author_ok.contains(&id) && !a.validity().is_valid(&id));
+        assert_eq!(a.heads(), heads);
+    }
+    // and nothing else, beside a `keep` or not
+    assert!(a
+        .write(&ana.log, &ana.devices[0].signing, vec![kept, more], None)
+        .is_err());
+}
+
+#[test]
+fn the_canonical_state_says_in_what_order_and_when_nodes_were_made() {
+    // `state.md#canonical-state`: field 10 is a node's place in the order
+    // the nodes were created in, counting from 0: log order, and within an
+    // entry the order of its ops. Field 11 is the time of the entry that
+    // created it.
+    use cardinal_encoding::Value;
+    let p = person(23, 0);
+    let d0 = &p.devices[0];
+    let (mut a, _) = Space::create(
+        Profile::FILES,
+        Policy::default(),
+        &p.log,
+        &d0.signing,
+        &[p.enc.public_key()],
+        None,
+    )
+    .unwrap();
+    let folder = |name: &str| files::create_folder(ROOT, name);
+    let (first, _) = a
+        .write_entry(
+            &p.log,
+            &d0.signing,
+            vec![folder("b"), folder("a")],
+            Some(100),
+        )
+        .unwrap();
+    let (second, _) = a
+        .write_entry(&p.log, &d0.signing, vec![folder("c")], None)
+        .unwrap();
+    // deleted, a node keeps its place
+    let made = |e, i| cardinal_space::entry::derived_id(&e, i);
+    a.write(
+        &p.log,
+        &d0.signing,
+        vec![SpaceOp::delete(made(first, 0))],
+        Some(300),
+    )
+    .unwrap();
+    let state = a.state().canonical();
+    let records = state.get(1).and_then(Value::as_list).unwrap();
+    let of = |id: [u8; 16]| {
+        let all = records.iter().filter_map(Value::as_record);
+        let mut found = all.filter(|r| r.get(1).and_then(Value::as_bytes) == Some(&id[..]));
+        let r = found.next().unwrap();
+        let rank = r.get(10).and_then(Value::as_uint);
+        (rank, r.get(11).and_then(Value::as_uint))
+    };
+    assert_eq!(of(made(first, 0)), (Some(0), Some(100)));
+    assert_eq!(of(made(first, 1)), (Some(1), Some(100)));
+    // an entry that gives no time gives the node none
+    assert_eq!(of(made(second, 0)), (Some(2), None));
+    assert_eq!(records.len(), 3);
 }
 
 #[test]

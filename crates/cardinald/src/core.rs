@@ -2,7 +2,7 @@
 //! append-only logs of the objects that make them up, and kept evaluated
 //! in memory.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -198,6 +198,55 @@ impl SetExt for MemSet {
     }
 }
 
+/// What this device held when an epoch reached it: each member's
+/// encryption key, who had left, and whom it knew to be frozen
+/// (`spaces.md#when-to-rotate`). Nothing in a space says whom an epoch was
+/// wrapped for, or with which of a member's keys, so a device keeps its own
+/// account with each epoch, as it keeps the space, and compares.
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+struct Reached {
+    /// The fingerprint of each member's encryption key, by identity.
+    keys: BTreeMap<String, String>,
+    /// Who had left.
+    left: BTreeSet<String>,
+    /// Whom this device knew to be frozen.
+    frozen: BTreeSet<String>,
+}
+
+impl Reached {
+    /// What this device holds of a space's members now.
+    fn now(space: &Space, logs: &[Arc<IdentityState>]) -> Reached {
+        let mut now = Reached::default();
+        for who in space.validity().identities() {
+            let Some(st) = logs.iter().find(|st| st.identity == who) else {
+                continue;
+            };
+            if let Some(k) = &st.encryption_key {
+                let key = hex::encode(k.public.fingerprint());
+                now.keys.insert(hex::encode(who), key);
+            }
+            if st.frozen {
+                now.frozen.insert(hex::encode(who));
+            }
+        }
+        now.left = space.left().iter().map(|(w, _)| hex::encode(w)).collect();
+        now
+    }
+
+    /// Whether a new epoch is due for what changed since: the encryption
+    /// key of a member who would be given the next one, a member who left,
+    /// or one this device has learned is frozen.
+    fn calls_for_a_new_epoch(&self, now: &Reached) -> bool {
+        let out = |who: &String| now.left.contains(who) || now.frozen.contains(who);
+        let key = |(who, key): (&String, &String)| {
+            !out(who) && self.keys.get(who).is_some_and(|was| was != key)
+        };
+        now.keys.iter().any(key)
+            || now.left.iter().any(|who| !self.left.contains(who))
+            || now.frozen.iter().any(|who| !self.frozen.contains(who))
+    }
+}
+
 /// One space as this device holds it.
 pub struct Holder {
     /// The space id (also its sync label).
@@ -215,9 +264,13 @@ pub struct Holder {
     /// The encryption keys of the other members, for a new epoch.
     member_keys: Vec<HybridPublicKey>,
     /// The next write must start a new epoch because of who is in the
-    /// space: a member left since this one began, or it was begun by one
-    /// this device would leave out (`spaces.md#when-to-rotate`).
+    /// space (`spaces.md#when-to-rotate`): by this device's record of the
+    /// current epoch, or by the entries, or because the epoch was begun by
+    /// a member this device would leave out.
     leave_out: bool,
+    /// By epoch id: what this device held when the epoch reached it.
+    reached: BTreeMap<String, Reached>,
+    reached_at: PathBuf,
 }
 
 /// What ingesting objects did.
@@ -260,7 +313,14 @@ impl Holder {
             version: 0,
             member_keys: Vec::new(),
             leave_out: false,
+            reached: BTreeMap::new(),
+            reached_at: Self::dir(paths, &id).join("epochs.json"),
         };
+        // No record, or one that cannot be read, is an epoch that reaches
+        // this device now.
+        if let Ok(bytes) = std::fs::read(&h.reached_at) {
+            h.reached = serde_json::from_slice(&bytes).unwrap_or_default();
+        }
         let mut sealed = Vec::new();
         for (loc, bytes) in records {
             let sid = *blake3::hash(&bytes).as_bytes();
@@ -462,13 +522,15 @@ impl Holder {
         }
     }
 
-    /// Whether the next write must start a new epoch: the current one
-    /// began before the identity's encryption key changed, which a removal
-    /// always does, or before a member left, or was begun by a member this
-    /// device would leave out (`spaces.md#when-to-rotate`). All but the
-    /// last follow from the entries, so they hold on every device and
-    /// across restarts. A device that cannot open the current key yet
-    /// cannot tell, and waits. Only a writer starts an epoch.
+    /// Whether the next write must start a new epoch
+    /// (`spaces.md#when-to-rotate`): since the current one reached this
+    /// device a member's encryption key changed, a member left, or the
+    /// device learned that one is frozen ([`Reached`]); or the entries say
+    /// so, on every device alike; or the epoch was begun by a member this
+    /// device would leave out; or it is not wrapped for this identity's own
+    /// key, which a removal always changes. A device that cannot open the
+    /// current key yet cannot tell, and waits. Only a writer starts an
+    /// epoch.
     fn rotation_due(&self, identity: &Identity) -> bool {
         let Some(space) = &self.space else {
             return false;
@@ -476,6 +538,11 @@ impl Holder {
         let writer = cardinal_space::entry::WRITER;
         let me = identity.id();
         if space.role_of(&me).is_none_or(|r| r < writer) || space.has_left(&me) {
+            return false;
+        }
+        // Nothing is written in a space that has ended but what witnesses
+        // or keeps, and that starts no epoch.
+        if space.ended() {
             return false;
         }
         if self.leave_out {
@@ -584,6 +651,9 @@ impl Holder {
             .ok_or_else(|| anyhow::anyhow!("no encryption key"))?
             .public_key()
             .clone();
+        // A new epoch that is due starts in this entry, wrapped for those
+        // added too (`spaces.md#when-to-rotate`).
+        let due = self.rotation_due(identity);
         let space = self
             .space
             .as_mut()
@@ -592,14 +662,28 @@ impl Holder {
         let adding: Vec<_> = added.iter().map(|(w, k)| (*w, role, k)).collect();
         let mut everyone = vec![&mine];
         everyone.extend(self.member_keys.iter());
-        let sealed = space.add_members(
-            &identity.log,
-            &keys.device.signing,
-            &adding,
-            &everyone,
-            ops,
-            Some(now_ms()),
-        )?;
+        let sealed = if due {
+            let mut all: Vec<SpaceOp> = added
+                .iter()
+                .map(|(who, _)| SpaceOp::add_member(*who, role))
+                .collect();
+            all.extend(ops);
+            everyone.extend(added.iter().map(|(_, k)| k));
+            let signing = &keys.device.signing;
+            let time = Some(now_ms());
+            space
+                .rotate_entry(&identity.log, signing, &everyone, all, time)?
+                .1
+        } else {
+            space.add_members(
+                &identity.log,
+                &keys.device.signing,
+                &adding,
+                &everyone,
+                ops,
+                Some(now_ms()),
+            )?
+        };
         let bytes = sealed.encode();
         self.persist(&[(sealed.sealed_id(), bytes.clone())])?;
         self.version += 1;
@@ -1071,11 +1155,11 @@ impl Core {
         self.logs = states.into_iter().map(Arc::new).collect();
     }
 
-    /// After something was written or arrived in a space: the keys of the
-    /// members a new epoch would be wrapped for, and whether one is due
-    /// because of them. It is wrapped for every member but this one who has
-    /// not left, and whom this device does not know to be frozen
-    /// (`spaces.md#distribution`).
+    /// After something was written or arrived in a space, or an identity
+    /// log changed: the keys of the members a new epoch would be wrapped
+    /// for, and whether one is due because of them. It is wrapped for every
+    /// member but this one who has not left, and whom this device does not
+    /// know to be frozen (`spaces.md#distribution`).
     fn settle(&mut self, space: &SpaceId) {
         let Some(ident) = self.identity.as_ref() else {
             return;
@@ -1096,11 +1180,49 @@ impl Core {
             .filter(|st| !st.frozen)
             .filter_map(|st| Some(st.encryption_key.as_ref()?.public.clone()))
             .collect();
+        // Since the epoch reached this device: a member's key changed, a
+        // member left, or it learned that one is frozen.
+        let now = Reached::now(sp, &self.logs);
+        let mut changed = false;
+        for key in sp.keyring().iter() {
+            // An epoch with no record reaches this device now.
+            let id = hex::encode(key.id());
+            if let std::collections::btree_map::Entry::Vacant(e) = h.reached.entry(id) {
+                e.insert(now.clone());
+                changed = true;
+            }
+        }
+        let current = sp.current_epoch().map(hex::encode);
+        let by_record = match current.and_then(|id| h.reached.get_mut(&id)) {
+            Some(record) => {
+                // Someone added since, or whose log came since, has the key
+                // they had when this device first saw them with one.
+                for (who, key) in &now.keys {
+                    if !record.keys.contains_key(who) {
+                        record.keys.insert(who.clone(), key.clone());
+                        changed = true;
+                    }
+                }
+                record.calls_for_a_new_epoch(&now)
+            }
+            None => false,
+        };
+        if changed {
+            let saved = serde_json::to_vec(&h.reached)
+                .map_err(std::io::Error::other)
+                .and_then(|bytes| crate::paths::write_private(&h.reached_at, &bytes, 0o600));
+            if let Err(e) = saved {
+                tracing::warn!("space {}: keeping its epochs: {e}", short(space));
+            }
+        }
         // "A writer does not encrypt under an epoch started by a member it
         // would leave out."
         let out = |who: &[u8; 32]| sp.has_left(who) || state(who).is_some_and(|st| st.frozen);
         let theirs = |(_, who): (EntryId, [u8; 32])| who != ident.id() && out(&who);
-        h.leave_out = sp.left_since_epoch() || sp.epoch_started_by().is_some_and(theirs);
+        // Two reasons need no record, and are the same on every device
+        // that holds the same entries.
+        let by_entries = sp.left_since_epoch() || sp.added_beside_epoch();
+        h.leave_out = by_record || by_entries || sp.epoch_started_by().is_some_and(theirs);
     }
 
     /// After an identity log changed: every space judges again the entries
@@ -1314,22 +1436,29 @@ impl Core {
         let id = space.id();
         space.set_identities([ident.log.state(), their_log.state()]);
         // What the invitee must check before keeping it
-        // (`contact.md#accepting`): the relationship profile, no owner,
-        // exactly these two identities as writers, and a space it does not
-        // already hold. The members are read off a genesis that is valid,
-        // so it is the inviter's and well formed; one that is not names
-        // nobody.
+        // (`contact.md#accepting`): a genesis that is valid by the
+        // inviter's log, with the relationship profile and exactly two
+        // `add_member` ops, one naming each of these two identities as a
+        // writer; and a space it does not already hold.
         use cardinal_space::entry::WRITER;
-        let mut the_two = [ident.id(), *inviter].map(|identity| cardinal_space::Member {
-            identity,
-            role: WRITER,
-        });
+        use cardinal_space::SpaceOpBody;
+        let genesis_entry = space.entry(&id);
+        let ops = genesis_entry.map_or(&[][..], |e| e.ops());
+        let mut adds: Vec<([u8; 32], u64)> = ops
+            .iter()
+            .filter_map(|op| match op.body() {
+                SpaceOpBody::AddMember { identity, role, .. } => Some((*identity, *role)),
+                _ => None,
+            })
+            .collect();
+        adds.sort();
+        let mut the_two = [(ident.id(), WRITER), (*inviter, WRITER)];
         the_two.sort();
         anyhow::ensure!(
-            space.profile() == cardinal_space::Profile::RELATIONSHIP
-                && space.owner().is_none()
+            space.validity().is_valid(&id)
                 && space.creator() == *inviter
-                && space.members() == the_two
+                && space.profile() == cardinal_space::Profile::RELATIONSHIP
+                && adds == the_two
                 && !self.spaces.contains_key(&id),
             "that is not a space between the two of you"
         );
@@ -2033,7 +2162,7 @@ mod tests {
         let rel = Profile::RELATIONSHIP;
         // Anyone can seal a genesis to a public key. Each of these is a
         // space Ana could make, and none is a relationship with Bo.
-        let not_theirs: [(&str, Vec<u8>); 9] = [
+        let not_theirs: [(&str, Vec<u8>); 10] = [
             (
                 "an owner",
                 ana.genesis(rel, &[(a, OWNER), (b, WRITER)], &bo),
@@ -2053,6 +2182,10 @@ mod tests {
             (
                 "a second role for one of them",
                 ana.genesis(rel, &[(a, WRITER), (b, WRITER), (b, READER)], &bo),
+            ),
+            (
+                "one of them named twice, which is three additions",
+                ana.genesis(rel, &[(a, WRITER), (b, WRITER), (b, WRITER)], &bo),
             ),
             (
                 "an admin and no owner, which starts nothing",
@@ -2287,10 +2420,52 @@ mod tests {
         assert!(bo.core.not_contacts_in(&[9; 32]).is_empty());
     }
 
+    impl Person {
+        /// This person's recovery words are used twice, each time without
+        /// knowing of the other: nobody can say whose hands their keys are
+        /// in, and whoever holds both entries knows them to be frozen.
+        fn recovers_twice(&self) -> Vec<Vec<u8>> {
+            use cardinal_identity::entry::add_key_proof;
+            use cardinal_identity::{EntryBuilder, IdentityOp, Power};
+            let id = self.id();
+            (0..2)
+                .map(|_| {
+                    let next = cardinal_crypto::RecoveryPhrase::generate();
+                    let key = next.root_signing_key();
+                    let proof = add_key_proof(&key, &id, Power::Root, None);
+                    let recovery = next.recovery_key_pair();
+                    EntryBuilder::new(id, &[id])
+                        .op(IdentityOp::add_key(
+                            key.public_key(),
+                            Power::Root,
+                            None,
+                            Some(proof),
+                            Some(recovery.public_key()),
+                        ))
+                        .op(IdentityOp::remove_key(self.root.public_key()))
+                        .sign(&self.root)
+                        .unwrap()
+                        .encode()
+                })
+                .collect()
+        }
+
+        /// Starts a new epoch wrapped for `everyone`, whatever is due.
+        fn begins_an_epoch(&mut self, space: &SpaceId, everyone: &[HybridPublicKey]) -> Vec<u8> {
+            let ident = self.core.identity.as_ref().unwrap();
+            let h = self.core.spaces.get_mut(space).unwrap();
+            let to: Vec<&HybridPublicKey> = everyone.iter().collect();
+            let space = h.space.as_mut().unwrap();
+            let signing = &self.core.keys.device.signing;
+            let (sealed, _) = space
+                .rotate(&ident.log, signing, &to, vec![], Some(now_ms()))
+                .unwrap();
+            sealed.encode()
+        }
+    }
+
     #[test]
     fn someone_frozen_is_left_out_of_the_next_key() {
-        use cardinal_identity::entry::add_key_proof;
-        use cardinal_identity::{EntryBuilder, IdentityOp, Power};
         let mut p = [Person::new(), Person::new(), Person::new()];
         for i in 0..3 {
             for j in 0..3 {
@@ -2309,29 +2484,8 @@ mod tests {
         ana.takes(&g, std::slice::from_ref(&hello));
         bo.takes(&g, std::slice::from_ref(&hello));
 
-        // Cy's recovery words are used twice, each time without knowing of
-        // the other: nobody can say whose hands Cy's keys are in.
         let id = cy.id();
-        let twice: Vec<Vec<u8>> = (0..2)
-            .map(|_| {
-                let next = cardinal_crypto::RecoveryPhrase::generate();
-                let key = next.root_signing_key();
-                let proof = add_key_proof(&key, &id, Power::Root, None);
-                let recovery = next.recovery_key_pair();
-                EntryBuilder::new(id, &[id])
-                    .op(IdentityOp::add_key(
-                        key.public_key(),
-                        Power::Root,
-                        None,
-                        Some(proof),
-                        Some(recovery.public_key()),
-                    ))
-                    .op(IdentityOp::remove_key(cy.root.public_key()))
-                    .sign(&cy.root)
-                    .unwrap()
-                    .encode()
-            })
-            .collect();
+        let twice = cy.recovers_twice();
         for who in [&mut ana, &mut bo] {
             assert!(who.core.ingest_other(id, &twice).unwrap());
             assert!(who.core.others[&id].log.state().frozen);
@@ -2344,21 +2498,13 @@ mod tests {
         bo.takes(&g, std::slice::from_ref(&again));
         assert_eq!(ana.said(&g), ["hello", "still me"]);
 
-        // Cy's device starts a new epoch, wrapped for everyone. Nobody
-        // writes under an epoch that someone frozen began: whoever writes
-        // next starts another, and Cy is left out of it.
+        // Cy's device starts a new epoch, wrapped for everyone. The others
+        // knew of the freeze before it reached them, so nothing has
+        // changed since by their account. Even so nobody writes under an
+        // epoch that someone frozen began: whoever writes next starts
+        // another, and Cy is left out of it.
         let everyone = [cy.enc(), ana.enc(), bo.enc()];
-        let begun = {
-            let ident = cy.core.identity.as_ref().unwrap();
-            let h = cy.core.spaces.get_mut(&g).unwrap();
-            let to: Vec<&HybridPublicKey> = everyone.iter().collect();
-            let space = h.space.as_mut().unwrap();
-            let signing = &cy.core.keys.device.signing;
-            let (sealed, _) = space
-                .rotate(&ident.log, signing, &to, vec![], None)
-                .unwrap();
-            sealed.encode()
-        };
+        let begun = cy.begins_an_epoch(&g, &everyone);
         ana.takes(&g, std::slice::from_ref(&begun));
         bo.takes(&g, std::slice::from_ref(&begun));
         let theirs = ana.space(&g).current_epoch();
@@ -2377,5 +2523,314 @@ mod tests {
         assert!(!bo.space(&g).entry(&entry).unwrap().starts_epoch());
         ana.takes(&g, std::slice::from_ref(&more));
         assert_eq!(ana.said(&g).len(), 4);
+    }
+
+    /// `spaces.md#when-to-rotate`: a writer starts a new epoch when it has
+    /// learned that a member is frozen since the current one reached it.
+    #[test]
+    fn learning_that_someone_is_frozen_calls_for_a_new_epoch() {
+        let mut p = [Person::new(), Person::new(), Person::new()];
+        for i in 0..3 {
+            for j in 0..3 {
+                if i != j {
+                    let (log, id) = (p[j].log(), p[j].id());
+                    p[i].core.ingest_other(id, &log).unwrap();
+                }
+            }
+        }
+        let [mut ana, mut bo, mut cy] = p;
+        let both = [(bo.id(), "Bo".to_owned()), (cy.id(), "Cy".to_owned())];
+        let g = ana.core.create_group("Garden club", "Ana", &both).unwrap();
+        bo.takes(&g, &ana.all_of(&g));
+        cy.takes(&g, &ana.all_of(&g));
+        let hello = cy.says(&g, "hello");
+        ana.takes(&g, std::slice::from_ref(&hello));
+        bo.takes(&g, std::slice::from_ref(&hello));
+
+        // Ana learns that Cy is frozen, and Bo does not yet. Her next
+        // entry starts an epoch that Cy is left out of.
+        let twice = cy.recovers_twice();
+        assert!(ana.core.ingest_other(cy.id(), &twice).unwrap());
+        let known = ana.says(&g, "we know");
+        assert!(ana.began_an_epoch(&g));
+        let entry = *ana.space(&g).heads().first().unwrap();
+        cy.takes(&g, std::slice::from_ref(&known));
+        assert!(!cy.space(&g).dag().contains(&entry), "Cy opened it");
+        ana.says(&g, "one is enough");
+        assert!(!ana.began_an_epoch(&g));
+
+        // It reaches Bo, who has heard nothing, and starts none. Then he
+        // hears: by his device's account that is since the epoch reached
+        // it, and nothing in the epoch says whom it was wrapped for, so
+        // he starts another.
+        bo.takes(&g, &ana.all_of(&g));
+        bo.says(&g, "what of it");
+        assert!(!bo.began_an_epoch(&g));
+        assert!(bo.core.ingest_other(cy.id(), &twice).unwrap());
+        let also = bo.says(&g, "so we do");
+        assert!(bo.began_an_epoch(&g));
+        let entry = *bo.space(&g).heads().first().unwrap();
+        cy.takes(&g, std::slice::from_ref(&also));
+        assert!(!cy.space(&g).dag().contains(&entry), "Cy opened it");
+        // His reaches Ana with nothing new to her, and it ends there.
+        ana.takes(&g, &bo.all_of(&g));
+        ana.says(&g, "settled");
+        assert!(!ana.began_an_epoch(&g));
+    }
+
+    impl Person {
+        /// The device starts again, with what it kept on disk.
+        fn restarts(&mut self) {
+            let paths = Paths::at(self._dir.path());
+            let keys = Arc::new(Keys::load_or_create(&paths.device_key()).unwrap());
+            self.core = Core::load(&paths, keys).unwrap();
+        }
+
+        /// Whether the last thing this person wrote in a space began a new
+        /// epoch.
+        fn began_an_epoch(&self, space: &SpaceId) -> bool {
+            let sp = self.space(space);
+            let mine = sp.dag().log_order().iter().rev();
+            let mut mine = mine.filter_map(|x| sp.entry(x));
+            let last = mine.find(|e| e.author() == self.id()).unwrap();
+            last.starts_epoch()
+        }
+
+        /// This person's identity moves to a new encryption key, as it
+        /// does when one of their devices is removed. Returns the entry
+        /// for the others' copies of their log.
+        fn changes_key(&mut self) -> Vec<u8> {
+            let ident = self.core.identity.as_ref().unwrap();
+            let all = self.log();
+            let genesis = IdentityEntry::decode(&all[0]).unwrap();
+            let mut log = IdentityLog::from_genesis(genesis).unwrap();
+            for e in &all[1..] {
+                log.insert_bytes(e).unwrap();
+            }
+            let new = HybridKeyPair::generate();
+            let signing = &self.core.keys.device.signing;
+            let entry = log
+                .set_encryption_key(signing, &new, ident.enc.first())
+                .unwrap();
+            entry.encode()
+        }
+    }
+
+    /// `spaces.md#when-to-rotate`: since the epoch reached this device, by
+    /// its own account, which it keeps as it keeps the space.
+    #[test]
+    fn a_new_epoch_is_due_when_a_members_key_has_changed_since_this_one_came() {
+        let mut p = [Person::new(), Person::new(), Person::new()];
+        for i in 0..3 {
+            for j in 0..3 {
+                if i != j {
+                    let (log, id) = (p[j].log(), p[j].id());
+                    p[i].core.ingest_other(id, &log).unwrap();
+                }
+            }
+        }
+        let [mut ana, mut bo, mut cy] = p;
+        let both = [(bo.id(), "Bo".to_owned()), (cy.id(), "Cy".to_owned())];
+        let g = ana.core.create_group("Garden club", "Ana", &both).unwrap();
+        bo.takes(&g, &ana.all_of(&g));
+        cy.takes(&g, &ana.all_of(&g));
+        let hello = cy.says(&g, "hello");
+        ana.takes(&g, std::slice::from_ref(&hello));
+        bo.takes(&g, std::slice::from_ref(&hello));
+        assert!(!cy.began_an_epoch(&g));
+
+        // Bo's identity moves to a new key. Ana hears of it, and Cy does
+        // not yet.
+        let moved = bo.changes_key();
+        assert!(ana
+            .core
+            .ingest_other(bo.id(), std::slice::from_ref(&moved))
+            .unwrap());
+        let first = ana.says(&g, "new keys");
+        assert!(ana.began_an_epoch(&g));
+        // one is enough
+        let second = ana.says(&g, "same keys");
+        assert!(!ana.began_an_epoch(&g));
+
+        // Ana's epoch reaches Cy, whose device notes what it holds then:
+        // Bo's old key. Nothing says with which of Bo's keys Ana wrapped
+        // it. Cy's device starts again, and then hears of Bo's new key:
+        // by its own account that is since the epoch reached it, so it
+        // starts another. Two devices rotated for one change, which costs
+        // wraps and nothing else.
+        cy.takes(&g, &[first, second]);
+        let quiet = cy.says(&g, "nothing new");
+        assert!(!cy.began_an_epoch(&g));
+        ana.takes(&g, std::slice::from_ref(&quiet));
+        cy.restarts();
+        assert!(cy
+            .core
+            .ingest_other(bo.id(), std::slice::from_ref(&moved))
+            .unwrap());
+        cy.restarts();
+        let third = cy.says(&g, "new keys again");
+        assert!(cy.began_an_epoch(&g));
+        let fourth = cy.says(&g, "and no more");
+        assert!(!cy.began_an_epoch(&g));
+
+        // Cy's epoch reaches Ana with nothing changed since, so she starts
+        // none: it ends there.
+        ana.takes(&g, &[third, fourth]);
+        ana.says(&g, "settled");
+        assert!(!ana.began_an_epoch(&g));
+        assert_eq!(ana.said(&g).len(), 7);
+    }
+
+    /// Someone added after an epoch reached this device is held to the key
+    /// they had when the device first saw them in the space, and a new
+    /// epoch that is due starts in the entry that adds someone.
+    #[test]
+    fn a_new_epoch_starts_with_an_addition_and_counts_who_came_since() {
+        let mut p = [Person::new(), Person::new(), Person::new(), Person::new()];
+        for i in 0..4 {
+            for j in 0..4 {
+                if i != j {
+                    let (log, id) = (p[j].log(), p[j].id());
+                    p[i].core.ingest_other(id, &log).unwrap();
+                }
+            }
+        }
+        let [mut ana, mut bo, mut cy, mut dee] = p;
+        let bo_shown = [(bo.id(), "Bo".to_owned())];
+        let g = ana
+            .core
+            .create_group("Garden club", "Ana", &bo_shown)
+            .unwrap();
+        let first = ana.space(&g).current_epoch();
+        // Bo's key changes, and Ana adds Cy: the entry that adds Cy starts
+        // the new epoch, wrapped for Cy as for the others.
+        let moved = bo.changes_key();
+        assert!(ana.core.ingest_other(bo.id(), &[moved]).unwrap());
+        let cy_shown = [(cy.id(), "Cy".to_owned())];
+        ana.core.add_to_group(&g, &cy_shown).unwrap();
+        assert!(ana.began_an_epoch(&g));
+        let second = ana.space(&g).current_epoch();
+        assert_ne!(second, first);
+        assert!(!ana.space(&g).added_beside_epoch());
+        cy.takes(&g, &ana.all_of(&g));
+        assert_eq!(cy.role(&g, &cy), Some(WRITER));
+        let hello = cy.says(&g, "hello");
+        ana.takes(&g, &[hello]);
+        assert_eq!(ana.said(&g), ["hello"]);
+
+        // With nothing due, an addition is written under the epoch there
+        // is, with its key wrapped for whoever is added.
+        let dee_shown = [(dee.id(), "Dee".to_owned())];
+        ana.core.add_to_group(&g, &dee_shown).unwrap();
+        assert!(!ana.began_an_epoch(&g));
+        assert_eq!(ana.space(&g).current_epoch(), second);
+        dee.takes(&g, &ana.all_of(&g));
+        assert_eq!(dee.said(&g), ["hello"]);
+        // Dee was added under this epoch and has its key: nothing is due.
+        assert!(!ana.space(&g).added_beside_epoch());
+        ana.says(&g, "welcome");
+        assert!(!ana.began_an_epoch(&g));
+
+        // Dee came after the epoch reached Ana's device, which has held
+        // Dee to the key Dee had then. It changes, and that counts as any
+        // member's does.
+        let moved = dee.changes_key();
+        assert!(ana.core.ingest_other(dee.id(), &[moved]).unwrap());
+        ana.says(&g, "new keys");
+        assert!(ana.began_an_epoch(&g));
+        ana.says(&g, "and no more");
+        assert!(!ana.began_an_epoch(&g));
+    }
+
+    /// In a space that has ended a device writes only what witnesses or
+    /// keeps its own person's work (`spaces.md#ending-a-space`), and that
+    /// starts no epoch, whatever is due.
+    #[test]
+    fn nothing_but_a_witness_is_written_in_a_space_that_has_ended() {
+        let (mut ana, mut bo) = (Person::new(), Person::new());
+        ana.meets(&bo);
+        bo.meets(&ana);
+        let bo_shown = [(bo.id(), "Bo".to_owned())];
+        let g = ana
+            .core
+            .create_group("Garden club", "Ana", &bo_shown)
+            .unwrap();
+        ana.says(&g, "hello");
+        let end = vec![SpaceOp::succeed([7; 32])];
+        ana.core.write_entry(&g, end).unwrap();
+        assert!(ana.space(&g).ended());
+        // Bo's key changes, which would call for a new epoch.
+        let moved = bo.changes_key();
+        assert!(ana.core.ingest_other(bo.id(), &[moved]).unwrap());
+        let epoch = ana.space(&g).current_epoch();
+        let heads = ana.space(&g).heads();
+        let (id, _) = ana.core.write_entry(&g, Vec::new()).unwrap();
+        let sp = ana.space(&g);
+        assert!(!sp.entry(&id).unwrap().starts_epoch());
+        assert_eq!(sp.current_epoch(), epoch);
+        // it counts without being valid there, and nothing builds on it
+        assert!(sp.validity().author_ok.contains(&id) && !sp.validity().is_valid(&id));
+        assert_eq!(sp.heads(), heads);
+        let c = relationship::conversation(sp).unwrap();
+        let more = relationship::create_message(c, "anyone there?");
+        assert!(ana.core.write_entry(&g, vec![more]).is_err());
+    }
+
+    /// `spaces.md#when-to-rotate`: someone added at the same time as a
+    /// rotation was never given the key. Every device reads that from the
+    /// entries, and whoever writes next starts a new epoch.
+    #[test]
+    fn someone_added_beside_a_rotation_is_given_the_next_key() {
+        let mut p = [Person::new(), Person::new(), Person::new()];
+        for i in 0..3 {
+            for j in 0..3 {
+                if i != j {
+                    let (log, id) = (p[j].log(), p[j].id());
+                    p[i].core.ingest_other(id, &log).unwrap();
+                }
+            }
+        }
+        let [mut ana, mut bo, mut cy] = p;
+        let bo_shown = [(bo.id(), "Bo".to_owned())];
+        let g = ana
+            .core
+            .create_group("Garden club", "Ana", &bo_shown)
+            .unwrap();
+        bo.takes(&g, &ana.all_of(&g));
+        let hello = bo.says(&g, "hello");
+        ana.takes(&g, std::slice::from_ref(&hello));
+
+        // Ana adds Cy, under the first epoch, while Bo, who has not heard,
+        // starts a second and writes under it.
+        let cy_shown = [(cy.id(), "Cy".to_owned())];
+        let added = ana.core.add_to_group(&g, &cy_shown).unwrap();
+        let everyone = [bo.enc(), ana.enc()];
+        let begun = bo.begins_an_epoch(&g, &everyone);
+        assert!(!bo.space(&g).added_beside_epoch());
+        let secret = bo.says(&g, "under the second");
+        assert!(!bo.began_an_epoch(&g));
+        ana.takes(&g, &[begun.clone(), secret.clone()]);
+        bo.takes(&g, std::slice::from_ref(&added));
+        cy.takes(&g, &ana.all_of(&g));
+        // Cy is a member, with a key that opens nothing written now.
+        for who in [&ana, &bo] {
+            assert_eq!(who.role(&g, &cy), Some(WRITER));
+            assert!(who.space(&g).added_beside_epoch());
+        }
+        assert_eq!(cy.said(&g), ["hello"]);
+
+        // Whoever writes next starts a third, wrapped for Cy too, and it
+        // carries the keys it supersedes: Cy reads what was written under
+        // the second.
+        let third = bo.says(&g, "welcome");
+        assert!(bo.began_an_epoch(&g));
+        assert!(!bo.space(&g).added_beside_epoch());
+        ana.takes(&g, std::slice::from_ref(&third));
+        cy.takes(&g, &[third]);
+        assert_eq!(cy.said(&g), ["hello", "under the second", "welcome"]);
+        // one is enough, for Ana as for Bo
+        ana.says(&g, "hello Cy");
+        assert!(!ana.began_an_epoch(&g));
+        assert!(!ana.space(&g).added_beside_epoch());
     }
 }

@@ -339,10 +339,11 @@ impl Space {
     }
 
     /// Whether `who` has accepted the space and not left it since: they
-    /// wrote something valid in it, its genesis or anything after, that no
-    /// `leave` of theirs descends from (`spaces.md#holding-a-space`).
+    /// wrote something valid in it, its genesis or anything after. One who
+    /// left has taken that back: added again, they accept by an entry that
+    /// descends from that addition (`spaces.md#holding-a-space`).
     pub fn accepted_by(&self, who: &IdentityId) -> bool {
-        !self.has_left(who) && self.judge.wrote_since_leaving(&self.dag, who)
+        !self.has_left(who) && self.judge.accepted(&self.dag, who)
     }
 
     /// Whether a member has left since the current epoch began, or began it
@@ -355,6 +356,24 @@ impl Space {
         let left = self.left();
         left.iter()
             .any(|(_, leave)| !self.dag.is_ancestor(leave, &start))
+    }
+
+    /// Whether a member who has not left was added by an entry written
+    /// under another epoch than the current one, which the entry that
+    /// started the current epoch does not descend from: someone added at
+    /// the same time as a rotation, who was never given the key. Whoever
+    /// writes next starts a new epoch (`spaces.md#when-to-rotate`). Like
+    /// [`left_since_epoch`](Self::left_since_epoch) it is read from the
+    /// entries, and is the same on every device that holds the same ones.
+    pub fn added_beside_epoch(&self) -> bool {
+        let Some((start, epoch)) = self.current_epoch else {
+            return false;
+        };
+        let adds = self.judge.valid_adds();
+        adds.iter().any(|(who, add)| {
+            let other = self.dag.get(add).is_some_and(|e| e.epoch() != epoch);
+            other && !self.dag.is_ancestor_or_self(add, &start) && !self.has_left(who)
+        })
     }
 
     /// The successor that stands, if the space has been succeeded
@@ -685,10 +704,11 @@ impl Space {
     }
 
     /// Whether a new entry on `parents` may be written: there is something
-    /// valid to build on, and the space has not ended there. Only an entry
-    /// of `keep` ops is written into a space that has ended: it counts by
-    /// its signature alone
-    /// (`spaces.md#a-succession-by-a-device-that-is-later-removed`).
+    /// valid to build on, and the space has not ended there. Into a space
+    /// that has ended software writes only what witnesses or keeps its own
+    /// person's work, an empty entry or a `keep`: those count by their
+    /// signature alone, without being valid there
+    /// (`spaces.md#ending-a-space`).
     fn may_write(&self, parents: &[EntryId], only_keeps: bool) -> Result<(), Error> {
         if parents.is_empty() {
             return Err(Error::NotAllowed("nothing valid here to build on"));
@@ -708,7 +728,7 @@ impl Space {
         time: Option<u64>,
     ) -> Result<(EntryId, SealedEntry), Error> {
         let keeps = |o: &SpaceOp| matches!(o.body(), SpaceOpBody::Keep { .. });
-        self.may_write(parents, !ops.is_empty() && ops.iter().all(keeps))?;
+        self.may_write(parents, ops.iter().all(keeps))?;
         let epoch = self.current_epoch().ok_or(Error::NoEpochKey)?;
         let key = self.keyring.get(&epoch).cloned().ok_or(Error::NoEpochKey)?;
         let mut b = SpaceEntryBuilder::new(

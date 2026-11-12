@@ -1047,28 +1047,31 @@ impl Judge {
         out
     }
 
-    /// Whether `who` has written something valid here that they have not
-    /// left behind: an entry that is not a `leave` of theirs and that no
-    /// valid `leave` of theirs descends from. Writing in a space is
-    /// accepting it (`spaces.md#holding-a-space`), and leaving it takes
-    /// that back: someone added again has been offered it again.
-    pub fn wrote_since_leaving(&self, dag: &Dag<SpaceEntry>, who: &IdentityId) -> bool {
-        let entries = self.by_author.get(who).map_or(&[][..], |v| v.as_slice());
-        let leaves = self.leaves.get(who).map_or(&[][..], |v| v.as_slice());
-        let leaves: Vec<&EntryId> = leaves.iter().filter(|l| self.info[*l].valid).collect();
-        entries
-            .iter()
-            .rev()
-            .any(|x| self.info[x].valid && !leaves.iter().any(|l| *l == x || dag.is_ancestor(x, l)))
+    /// Each valid entry that adds a member, with whom it adds.
+    pub fn valid_adds(&self) -> Vec<(IdentityId, EntryId)> {
+        let mut out = Vec::new();
+        for (who, adds) in &self.adds_of {
+            for (m, _) in adds {
+                let add = self.marks[*m as usize];
+                if self.info[&add].valid && !out.contains(&(*who, add)) {
+                    out.push((*who, add));
+                }
+            }
+        }
+        out
     }
 
-    /// Whether `key` wrote something that would stop counting if the key
-    /// were removed now: an entry whose signature counts, that no entry of
-    /// the same author signed with another key descends from. What ends or
-    /// begins a space is left out: building on it keeps nothing.
+    /// Whether `key` wrote something **not yet witnessed**
+    /// (`spaces.md#authors`): an entry whose signature counts, that would
+    /// stop counting were the key removed now. That is one that no entry of
+    /// the same author under another key, whose signature counts, descends
+    /// from, and that no `keep` for the key in such an entry covers, by
+    /// listing it or one of its descendants. What ends or begins a space is
+    /// left out: building on it keeps nothing, so nothing a device writes
+    /// unasked would change the answer.
     pub fn unwitnessed_work(&self, dag: &Dag<SpaceEntry>, key: &KeyId) -> bool {
         let signer = |x: &EntryId| dag.get(x).map(|e| e.signer());
-        let mut built_on = Vec::new();
+        let mut covered = Vec::new();
         let mut theirs = Vec::new();
         for entries in self.by_author.values() {
             let counts = entries.iter().filter(|x| self.info[*x].ok);
@@ -1078,15 +1081,53 @@ impl Judge {
                 continue;
             }
             for w in by_others {
-                built_on.extend_from_slice(dag.parents(w));
+                covered.extend_from_slice(dag.parents(w));
+                let keeps = self.marked(w).map_or(&[][..], |m| m.keeps.as_slice());
+                for (_, listed) in keeps.iter().filter(|(k, _)| k == key) {
+                    covered.extend_from_slice(listed);
+                }
             }
             theirs.extend(by_key.into_iter().filter(|x| !self.info[*x].structural));
         }
         if theirs.is_empty() {
             return false;
         }
-        let witnessed = dag.ancestors_of(&built_on);
+        let witnessed = dag.ancestors_of(&covered);
         theirs.iter().any(|x| !witnessed.contains(*x))
+    }
+
+    /// Whether `who` has accepted the space (`spaces.md#holding-a-space`):
+    /// they wrote something valid in it, its genesis or anything after.
+    /// Leaving takes that back: for each valid `leave` of theirs they must
+    /// have been added again by an entry that descends from it, and have
+    /// written something valid that descends from that addition, or is it.
+    pub fn accepted(&self, dag: &Dag<SpaceEntry>, who: &IdentityId) -> bool {
+        let valid = |x: &&EntryId| self.info[*x].valid;
+        let leaves: Vec<&EntryId> = match self.leaves.get(who) {
+            Some(l) => l.iter().filter(valid).collect(),
+            None => Vec::new(),
+        };
+        let entries = self.by_author.get(who).map_or(&[][..], |v| v.as_slice());
+        // the latest first: what answers a leave is usually the last thing
+        let wrote: Vec<&EntryId> = entries
+            .iter()
+            .rev()
+            .filter(|x| valid(x) && !leaves.contains(x))
+            .collect();
+        if leaves.is_empty() {
+            return !wrote.is_empty();
+        }
+        let adds = self.adds_of.get(who).map_or(&[][..], |v| v.as_slice());
+        let adds: Vec<&EntryId> = adds
+            .iter()
+            .map(|(m, _)| &self.marks[*m as usize])
+            .filter(valid)
+            .collect();
+        leaves.iter().all(|l| {
+            adds.iter().any(|a| {
+                dag.is_ancestor(l, a) && wrote.iter().any(|x| dag.is_ancestor_or_self(a, x))
+            })
+        })
     }
 }
 

@@ -86,6 +86,10 @@ pub struct Node {
     pub creator: IdentityId,
     /// The entry that created it.
     pub created_in: EntryId,
+    /// The time of the entry that created it, if that entry gave one.
+    pub created: Option<u64>,
+    /// The position of its `create` in that entry.
+    created_op: u32,
     deleted_by: Option<(EntryId, u32)>,
 }
 
@@ -783,6 +787,8 @@ impl State {
                             position_writer: id,
                             creator: e.author(),
                             created_in: id,
+                            created: e.time(),
+                            created_op: i,
                             deleted_by: None,
                         },
                     );
@@ -957,7 +963,10 @@ impl State {
     /// The canonical state record `{0: 13, 1: node records}`, sorted by
     /// node id. The root has no record, and a reach node has one only while
     /// it has a field to record, holding fields 1 and 5 alone
-    /// (`state.md#canonical-state`).
+    /// (`state.md#canonical-state`). Every other node's record says where
+    /// it comes in the order the nodes were created in (field 10) and when
+    /// its creating entry says it was made (field 11), so that a device
+    /// starting from a canonical state can show them as they were made.
     pub fn canonical(&self) -> Record {
         fn fields(fields: &BTreeMap<u64, Vec<FieldValue>>) -> Value {
             let set = fields.iter().filter(|(_, vs)| !vs.is_empty());
@@ -971,6 +980,16 @@ impl State {
                 )
             }))
         }
+        // A node's rank is its place in the order the nodes were created
+        // in: log order, and within an entry the order of its ops.
+        let at: HashMap<&EntryId, usize> = self.applied.iter().zip(0..).collect();
+        let mut made: Vec<(usize, u32, NodeId)> = self
+            .nodes
+            .values()
+            .map(|n| (at[&n.created_in], n.created_op, n.id))
+            .collect();
+        made.sort_unstable();
+        let rank: HashMap<NodeId, u64> = made.iter().map(|(_, _, id)| *id).zip(0..).collect();
         let mut records: Vec<(NodeId, Record)> = Vec::new();
         for (id, n) in &self.nodes {
             let r = Record::new()
@@ -982,7 +1001,9 @@ impl State {
                 .with(6, n.deleted)
                 .with(7, n.position_writer)
                 .with(8, n.delete_conflict)
-                .with(9, n.creator);
+                .with(9, n.creator)
+                .with(10, rank[id])
+                .with_opt(11, n.created);
             records.push((*id, r));
         }
         for (id, f) in &self.reach {

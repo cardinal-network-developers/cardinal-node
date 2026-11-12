@@ -31,8 +31,7 @@ follow it across two spaces. What still differs:
   account space, and tokens and storage labels that serve a successor. The
   fields that exist for it are read, written and kept, and mean nothing yet:
   fields 3, 4 and 6 to 9 of `start`, fields 2 and 3 of `succeed`, `was` on
-  `create`, and ranks and creation times in the canonical state (fields 10
-  and 11, which are not written). A device that receives a `succeed` that
+  `create`. A device that receives a `succeed` that
   ends a space stops writing in it, says nothing to its person, and goes
   nowhere.
 - **Taking someone out of a group** is a succession, so `group-remove` fails
@@ -42,29 +41,21 @@ follow it across two spaces. What still differs:
 - **A member who can no longer be trusted.** A frozen identity's entries are
   judged like anyone's, devices open no session with it, it is left out of
   the next epoch this device starts, and this device starts one rather
-  than write under an epoch the frozen member began. But learning of a
-  freeze does not by itself make a new epoch due
-  ([Other people](#other-people-speccontactmd-specprofilesmdrelationship)),
-  a new epoch is still wrapped for whoever a frozen admin added, heard of
-  before the freeze or not, nothing offers the owner a succession without
-  it, and nothing shows the members it added.
+  than write under an epoch the frozen member began, or one that reached
+  it before it learned of the freeze. But a new epoch is still wrapped for
+  whoever a frozen admin added, heard of before the freeze or not, nothing
+  offers the owner a succession without it, and nothing shows the members
+  it added.
 - **A conversation shows its messages in log order.** `profiles.md` now has
   a device show messages in the order they became valid on it, so that one
   written with old parents appears when it arrives and not among what was
   already read. `relationship::messages` still sorts by log order.
 
 The specification then answered what building this found (decisions D59 to
-D61, and the commits beside them). Where it answered as this implementation
-had chosen, the readings recorded below are now only descriptions. Where it
-answered otherwise, the code is behind:
-
-- **When to rotate (D60).** The specification kept its three reasons and
-  said by whose account: what the device held when the epoch reached it,
-  which it has to keep. Here a change of a member's key, or learning of a
-  freeze, starts no new epoch by itself. Two reasons are new and read from
-  the entries: a `leave` the epoch's first entry does not descend from,
-  which is what this implementation does, and an addition made at the same
-  time as a rotation, which it does not.
+D61, and the commits beside them): what an id covers, a reach node that is
+never created, and when to rotate. This implementation follows those
+answers now, and the readings it had to choose in doing so are recorded
+below, each under its section.
 
 ## Encoding (`spec/encoding.md`)
 
@@ -445,11 +436,12 @@ answered otherwise, the code is behind:
   yourself", and gives neither a role. Chose: the genesis names its author
   as owner, so that the person alone can add someone to a files space and
   succeed either.
-- **Spec ambiguity: "reserved".** Entry field 9 and control op 3 are
-  reserved, and nothing says what a device does on meeting one. Chose:
-  field 9 is a field this implementation does not know, accepted, ignored
-  and kept; op 3 is a control op it does not define, which no role may
-  perform, so an entry holding one is invalid.
+- **Spec ambiguity: "reserved" and "not used".** Entry field 9 is
+  reserved and control op 3 is not used, and nothing says what a device
+  does on meeting either. Chose: field 9 is a field this implementation
+  does not know, accepted, ignored and kept; op 3 is a control op the table
+  does not define, which no role may perform, so an entry holding one is
+  invalid.
 - **Spec ambiguity: a `leave` with fields.** `leave` has none. Chose: one
   that carries any is still a `leave`, and they are kept like any unknown
   field. (What 0.1.13 wrote as `remove_member` reads this way.)
@@ -461,20 +453,27 @@ answered otherwise, the code is behind:
   with a role above admin is allowed to no role, whether it names an owner
   or a role there is not (`rules.md` says so only of an owner; `world.py`
   of both).
-- **Spec ambiguity: writing into a space that has ended.** "Software writes
-  nothing more in it", yet a `keep` for a `succeed` is written with the
-  `succeed` as its parent. Chose: `Space::write` refuses, once the valid
-  heads descend from the end, anything but an entry of `keep` ops only. In
-  a space with no owner that is once the heads together hold every
-  member's naming of one successor, though no single head does.
-- **Spec ambiguity: "not yet witnessed", before a removal.** Software
-  retiring a device appends an empty entry "in each space where the device
-  wrote something not yet witnessed", but the rules say what is witnessed
-  only of a key that has been removed. Chose: an entry by that key, whose
-  signature counts, that no entry of the same author under another key
-  descends from (`Space::has_unwitnessed`). Other members building on it
-  does not count, and what ends or begins a space is left out, since
-  building on it keeps nothing.
+- **Writing into a space that has ended** (`spaces.md#ending-a-space`).
+  Once an entry on the valid heads would be closed, `Space::write` refuses
+  anything but an entry with no ops, or with `keep` ops only: what
+  witnesses or keeps a person's own work. Such an entry counts by its
+  signature and is not valid there, so nothing builds on it. In a space
+  with no owner the end is where the heads together hold every member's
+  naming of one successor, though no single head does. No new epoch is
+  started in a space that has ended, whatever is due.
+- **Not yet witnessed** (`spaces.md#authors`, `Space::has_unwitnessed`).
+  An entry by the key, whose signature counts, that no entry of the same
+  author under another key descends from, and that no `keep` for the key
+  in such an entry covers by listing it or a descendant of it. Other
+  members building on it does not count. What ends or begins a space is
+  left out of the answer, though it too is not yet witnessed until a
+  `keep` lists it: the answer decides whether a device being retired
+  writes an empty entry, which keeps none of those, and the `keep` for
+  each succession it made is not written yet (above).
+  **Spec ambiguity: a `keep` by the key itself.** "No `keep` covers it"
+  does not say whose. A `keep` in an entry signed by the key that is to be
+  removed would need a witness of its own once the key is gone. Chose:
+  only a `keep` in an entry under another key covers.
 - **Spec ambiguity: what else changes an entry later.** "Only a signature
   changes an entry later": an identity log, a witness, a `keep`. A `keep`
   can also be held before an entry it lists, and then that entry arriving
@@ -519,11 +518,28 @@ answered otherwise, the code is behind:
   op touched; N is flagged delete conflict if touched. A `restore` of N
   clears N and the nodes beneath it that the same delete flagged. Views
   hide everything beneath a deleted node.
-- **Spec ambiguity: cleared fields.** A `set` without a value is a value
-  of the register like any other (it supersedes and can conflict). In the
-  canonical state it is `{1: entry id}` with no field 2.
-- **Spec ambiguity: the root in the canonical state.** The root node has
-  no kind, position, or creator and is omitted.
+- **Cleared fields.** A `set` without a value is a value of the register
+  like any other (it supersedes and can conflict). In the canonical state
+  it is `{1: entry id}` with no field 2, and a field with no values is left
+  out, as `state.md#canonical-state` now says.
+- **Spec gap: the root as an op's target.** The root "always exists" and
+  needs no `create`, so a `set`, `move`, `delete` or `restore` whose node
+  is the root names a node that is there; but the root has no position to
+  move, no record in the canonical state for a field or a deleted flag,
+  and nothing says what such an op does. Chose: the root can be a parent,
+  and an op whose target is the root puts its entry out of the state.
+- **Ranks and creation times** (`state.md#canonical-state`, fields 10 and
+  11). A node's rank is its place among all the state's nodes, deleted
+  ones included, by where its creating entry comes in log order and then
+  by where its `create` comes in that entry. No state here has an initial
+  state to rank first. **Spec ambiguity: a creating entry with no time.**
+  Field 6 of an entry is optional in practice (nothing says it must be
+  there, and it is "display only"). Chose: field 11 is left out then.
+- **Spec gap: a kind a profile does not define.** `state.md` says what an
+  op that a profile does not define does, and not what a `create` of a
+  kind it does not define does: kind 9 of a relationship is "not used",
+  and kinds above its table are nobody's. Chose, as before: the files
+  profile accepts only its own kinds (below), and the others accept any.
 - **Profile restrictions (a reading of "a profile may restrict").** Files:
   kinds 1–3 only, under the root or a folder. Account: placement under a
   space node, storage label and token under a host node, invitation use
@@ -543,10 +559,8 @@ answered otherwise, the code is behind:
   not recomputed ([Spaces](#spaces-specspacesmd)).
 - **Written beside.** A `set` written beside adds its value and supersedes
   none; a `delete` written beside deletes nothing and flags the node delete
-  conflict. Nothing here writes either: they belong to posting work again
-  after a succession. **Spec ambiguity:** a `delete` written beside a node
-  that another delete has already deleted. Chose: it flags nothing, since
-  the flag says a node stayed that someone meant to delete.
+  conflict, and does nothing on a node that is already deleted. Nothing here
+  writes either: they belong to posting work again after a succession.
 ## Link (`spec/link.md`)
 
 Deviations:
@@ -843,8 +857,8 @@ Not implemented yet (the next milestone):
 - **Settling a conflict of three or more versions.** Deleting one conflict
   copy writes a `set` of the main version, which also drops the other
   copies (they remain in history). A `set` cannot keep two of three values.
-- **Not implemented: `rotate_after`.** Epochs rotate only when the identity's
-  encryption key changes, which every removal does.
+- **Not implemented: `rotate_after`.** No epoch is started for the number of
+  entries written under one (`spaces.md#when-to-rotate`, a SHOULD).
 - **Retired and lost devices.** `cardinal remove-device` treats a device as
   retired (`spaces.md#authors`): it syncs with every device it can reach,
   the one going away first, and witnesses what that device wrote. With
@@ -858,11 +872,48 @@ Not implemented yet (the next milestone):
   nobody answers it afterwards and until then it can pass the news on. A
   device that hears it was removed stops writing. One that was offline at
   the time never hears.
-- **Reading: when a rotation is due.** "A member identity's encryption key
-  changed since the epoch began" is checked by trying to open the current
-  epoch's wrap with the current encryption key, so it follows from the state
-  on every device. A device that cannot open the current key yet does not
-  rotate; it could not tell, and its writes are held to the epoch it knows.
+- **When a new epoch is due** (`spaces.md#when-to-rotate`, `core.rs`,
+  `Reached`). A device keeps, with each epoch whose key it holds, what it
+  held when the epoch reached it: the fingerprint of each member's
+  encryption key, who had left, and whom it knew to be frozen, in
+  `spaces/<id>/epochs.json`. An epoch with no record there reaches the
+  device now. Its next write starts a new epoch when, against the record
+  of the current one, the key of a member who would be given the next one
+  has changed, a member has left, or it has learned that one is frozen;
+  when the entries say so (a `leave` the epoch's first entry does not
+  descend from, an `add_member` written under another epoch that it does
+  not descend from); when the epoch was begun by a member it would leave
+  out; or when the current epoch's wraps do not open with this identity's
+  own current key. A device that cannot open the current key yet does not
+  rotate; it could not tell, and its writes are held to the epoch it
+  knows. A reader starts none. An addition made while one is due starts it
+  in the same entry.
+  - **Spec ambiguity: "with each epoch".** The record is taken when the
+    device first holds an epoch's key, which is when it can first know the
+    entry started an epoch: an entry it cannot open says nothing. Only the
+    current epoch's record is ever compared.
+  - **Spec gap: a member who came after the epoch.** The record holds each
+    member's key "when the entry that started the epoch arrived". Someone
+    added later, or whose log arrived later, has no key in it, and their
+    key changing afterwards is as much a reason as anyone's. Chose: their
+    key is added to the record when the device first sees them as a
+    member with a key.
+  - **Spec observation: whoever wrapped an epoch is not the only one who
+    starts the next.** A device records what *it* holds when an epoch
+    arrives, not what the epoch's writer held. If the writer wrapped for a
+    member's new key and this device hears of that key only afterwards, it
+    starts another epoch for a change the current one already has. The
+    specification says so ("that costs wraps and nothing else"); in a
+    group, removing one device can cost a new epoch from every member's
+    device that heard in that order. It ends, since each device starts at
+    most one for each change it sees.
+  - **Spec ambiguity: an `add_member` of someone who was a member
+    already.** "A member's `add_member` was written under another epoch,
+    and the entry that started the current epoch does not descend from
+    it" is true of a second addition of someone the epoch was wrapped
+    for, made beside the rotation, though they were given the key. Chose:
+    the rule as written, for any valid `add_member` of a member who has
+    not left; it costs one epoch.
 - **Retention: old versions for a while.** `full` keeps every chunk of
   current state, and also the chunks of deleted files and replaced
   versions for `keep_old` (30 days by default), so they can be restored;
@@ -996,13 +1047,17 @@ asks for around that is not built yet.
   members who are nobody's contact here are shown by the name the group
   gives them, with no warning when it matches someone else's. Groups are
   not in the one folder.
-- **Spec ambiguity: a profile's members.** `profiles.md` gives each profile
-  a shape (a group has one owner, a relationship two writers and none), and
-  the rules judge every space alike, whatever its profile. Only the
-  relationship's shape is anyone's to check, the invitee's. Chose: a space
-  offered as a group is taken as it is. One whose genesis names no owner
-  is a group nobody can add to and that all its first members end
-  together.
+- **A profile's members.** The rules judge every space alike, whatever its
+  profile, and `profiles.md` now says so: a space offered as a group is
+  taken as it is. One whose genesis names no owner is a group nobody can
+  add to and that all its first members end together. Only a relationship
+  is checked, by whoever is invited into it (`contact.md#accepting`, step
+  4; `Core::accept_relationship`): the genesis is valid by the inviter's
+  log and written by the inviter, its profile is the relationship's, its
+  `add_member` ops are exactly two, one for each of the two as a writer,
+  and the space is not held already. Other ops in the genesis are not
+  looked at: the conversation is one, and nothing says there may be no
+  others.
 - **Leaving a group** (`spaces.md#members-and-roles`). `group-leave` writes
   `leave`. From then on the device finds no such group and writes nothing
   in it, and if it is a host it ends the tokens its person gave out there.
@@ -1015,10 +1070,16 @@ asks for around that is not built yet.
     again, and it must go on holding the space to learn that it was added
     again. Chose: the device keeps what it holds and stops using it. It
     deletes neither keys nor entries.
-  - **Spec ambiguity: added again.** "One who is added again is back", and
-    being added is an offer, accepted by writing something valid. Chose:
-    leaving takes the earlier acceptance back. Someone added again is
-    offered the group again, and is in it once they write in it again.
+  - **Added again** (`spaces.md#holding-a-space`). Leaving takes the
+    earlier acceptance back. Someone added again is offered the group
+    again, and is in it once they write something valid that descends
+    from that addition (`Judge::accepted`). What another of their devices
+    wrote meanwhile, without the addition in its past, accepts nothing.
+    **Spec ambiguity: several leaves.** Chose: each valid `leave` of
+    theirs needs an addition that descends from it and an entry of theirs
+    that descends from that addition; one entry can answer several.
+    **Spec ambiguity: a member who adds itself again**, as an admin can.
+    Chose: the adding entry is its own acceptance.
   - A token ended on leaving never comes back. Joining again sets the
     reach node again, with new tokens.
   - Someone who left still asks the others for the group when they meet,
@@ -1072,17 +1133,6 @@ asks for around that is not built yet.
   records the host as a fetcher that never acknowledges, so acknowledgements
   from the owner's other devices free nothing and retention does. Nothing asks
   a host for envelopes yet except itself, which lets go of them one by one.
-- **A new epoch notices only this identity's key changes.** It is wrapped for
-  every member who has not left and is not known to be frozen, but a change
-  of another member's encryption key does not make one due here, and nor
-  does learning that a member is frozen, both of which
-  `spaces.md#when-to-rotate` asks for. **Spec gap:** nothing in the entries
-  says whom an epoch was wrapped for, since wraps name no recipients, so a
-  device cannot tell from what it holds whether the current epoch already
-  leaves out a member it knows to be frozen, or reaches a member's new key;
-  it would have to remember what it knew when, which another of its
-  person's devices does not share.
-
 ## Hosts (`spec/hosts.md`)
 
 - **Only a person's own device is a host.** A device with `cardinal host`
