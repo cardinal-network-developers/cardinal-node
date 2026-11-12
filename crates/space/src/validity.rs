@@ -40,10 +40,8 @@ use cardinal_identity::log::model_world;
 use cardinal_identity::model::{self, hex_decode, hex_encode, Op};
 use cardinal_identity::{EntryId, IdentityLog, IdentityState, KeyId};
 
-use crate::entry::{
-    derived_id, IdentityId, NodeId, NodeKind, Profile, SpaceEntry, SpaceId, SpaceOpBody, ADMIN,
-    OWNER, READER, WRITER,
-};
+use crate::entry::{IdentityId, SpaceEntry, SpaceId, SpaceOpBody, ADMIN, OWNER, READER, WRITER};
+use crate::state::reach_node_id;
 use crate::Error;
 
 /// A member: an identity, with a role a valid entry gave it. An identity
@@ -113,71 +111,22 @@ enum Class {
     Invalid,
 }
 
-/// The kind of a reach node, in the profiles that define one
-/// (`profiles.md#relationship`, `profiles.md#group`).
-fn reach_kind(profile: Profile) -> Option<NodeKind> {
-    match profile {
-        Profile::Core(3) | Profile::Core(4) => Some(NodeKind::Uint(crate::relationship::REACH)),
-        _ => None,
-    }
-}
-
-/// Which ops write their author's own reach node, the one application write
-/// a reader may make. That is a `create` of the profile's reach kind, or a
-/// `set` on a node that a `create` of that kind made, in an entry of the
-/// same author in the causal past. It is read off the entries alone, never
-/// off the state, so that validity does not come to depend on itself.
-#[derive(Clone, Debug, Default)]
-struct ReachNodes {
-    kind: Option<NodeKind>,
-    /// Reach nodes by id: the entry whose `create` made each, and its author.
-    nodes: HashMap<NodeId, (EntryId, IdentityId)>,
-}
-
-impl ReachNodes {
-    fn new(profile: Profile) -> ReachNodes {
-        ReachNodes {
-            kind: reach_kind(profile),
-            nodes: HashMap::new(),
-        }
-    }
-
-    fn class(
-        &self,
-        dag: &Dag<SpaceEntry>,
-        id: &EntryId,
-        e: &SpaceEntry,
-        op: &SpaceOpBody,
-    ) -> Class {
-        match op {
-            SpaceOpBody::Start { .. } => Class::Start,
-            SpaceOpBody::AddMember { .. } => Class::Add,
-            SpaceOpBody::Leave => Class::Leave,
-            SpaceOpBody::Succeed { .. } => Class::Succeed,
-            SpaceOpBody::Keep { .. } => Class::Keep,
-            SpaceOpBody::SetPolicy { .. } | SpaceOpBody::SetProtocol => Class::OwnerOnly,
-            SpaceOpBody::Unknown { number } if number.is_none_or(|n| n < 32) => Class::Invalid,
-            SpaceOpBody::Create { kind, .. } if Some(*kind) == self.kind => Class::Reach,
-            SpaceOpBody::Set { node, .. } => match self.nodes.get(node) {
-                Some((made, by)) if *by == e.author() && dag.is_ancestor(made, id) => Class::Reach,
-                _ => Class::App,
-            },
-            _ => Class::App,
-        }
-    }
-
-    /// Notes the reach nodes an entry creates.
-    fn note(&mut self, id: &EntryId, e: &SpaceEntry) {
-        if self.kind.is_none() {
-            return;
-        }
-        for (i, op) in e.ops().iter().enumerate() {
-            if let SpaceOpBody::Create { kind, .. } = op.body() {
-                if Some(*kind) == self.kind {
-                    self.nodes.insert(derived_id(id, i), (*id, e.author()));
-                }
-            }
-        }
+/// What an op is to the rules, read from the entry alone
+/// (`spaces.md#members-and-roles`). A `set` on its author's own reach node,
+/// whose id follows from the author's, is the one op numbered 32 or above
+/// that a reader may write. Every other such op is an application op,
+/// whether or not the profile defines it.
+fn class(e: &SpaceEntry, op: &SpaceOpBody) -> Class {
+    match op {
+        SpaceOpBody::Start { .. } => Class::Start,
+        SpaceOpBody::AddMember { .. } => Class::Add,
+        SpaceOpBody::Leave => Class::Leave,
+        SpaceOpBody::Succeed { .. } => Class::Succeed,
+        SpaceOpBody::Keep { .. } => Class::Keep,
+        SpaceOpBody::SetPolicy { .. } | SpaceOpBody::SetProtocol => Class::OwnerOnly,
+        SpaceOpBody::Unknown { number } if number.is_none_or(|n| n < 32) => Class::Invalid,
+        SpaceOpBody::Set { node, .. } if *node == reach_node_id(&e.author()) => Class::Reach,
+        _ => Class::App,
     }
 }
 
@@ -217,13 +166,13 @@ struct Genesis {
 }
 
 impl Genesis {
-    fn read(dag: &Dag<SpaceEntry>, reach: &ReachNodes, id: &EntryId, e: &SpaceEntry) -> Genesis {
+    fn read(id: &EntryId, e: &SpaceEntry) -> Genesis {
         let author = e.author();
         let mut adds = Vec::new();
         let mut starts = 0;
         let mut others = Vec::new();
         for op in e.ops() {
-            match (reach.class(dag, id, e, op.body()), op.body()) {
+            match (class(e, op.body()), op.body()) {
                 (Class::Start, _) => starts += 1,
                 (Class::Add, SpaceOpBody::AddMember { identity, role, .. }) => {
                     adds.push((*identity, *role))
@@ -379,13 +328,18 @@ pub struct Judge {
     genesis: Option<Genesis>,
     /// The genesis is valid: its signature counts and it is well formed.
     root: bool,
-    reach: ReachNodes,
     validity: Validity,
 }
 
+impl Default for Judge {
+    fn default() -> Judge {
+        Judge::new()
+    }
+}
+
 impl Judge {
-    /// A judge for a space of `profile` that holds no entries yet.
-    pub fn new(profile: Profile) -> Judge {
+    /// A judge for a space that holds no entries yet.
+    pub fn new() -> Judge {
         Judge {
             info: HashMap::new(),
             marks: Vec::new(),
@@ -398,7 +352,6 @@ impl Judge {
             states: HashMap::new(),
             genesis: None,
             root: false,
-            reach: ReachNodes::new(profile),
             validity: Validity::default(),
         }
     }
@@ -440,7 +393,7 @@ impl Judge {
         // without parents is nothing here, whatever it says.
         let genesis = e.is_genesis() && self.genesis.as_ref().is_none_or(|g| g.id == *id);
         if genesis && self.genesis.is_none() {
-            self.genesis = Some(Genesis::read(dag, &self.reach, id, e));
+            self.genesis = Some(Genesis::read(id, e));
         }
         let has_owner = self.genesis.as_ref().is_some_and(|g| g.owner.is_some());
         // what it holds
@@ -449,7 +402,7 @@ impl Judge {
         let mut structural = false;
         let mut leave = false;
         for op in e.ops() {
-            let class = self.reach.class(dag, id, e, op.body());
+            let class = class(e, op.body());
             need = match (need, least_role(class, op.body(), has_owner)) {
                 (Some(a), Some(b)) => Some(a.max(b)),
                 _ => None,
@@ -470,7 +423,6 @@ impl Judge {
                 _ => {}
             }
         }
-        self.reach.note(id, e);
         let past = if e.is_genesis() {
             Arc::new(Bits::default())
         } else {
@@ -1166,15 +1118,13 @@ pub fn by_rules(dag: &Dag<SpaceEntry>, logs: &[&IdentityLog]) -> Result<ByRules,
     let g = dag.log_order().first().and_then(|g| dag.get(g));
     let g = g.ok_or(Error::Malformed("no genesis"))?;
     let space = g.id();
-    // a genesis with no `start` names no profile, and starts nothing
-    let mut reach = g.profile().map(ReachNodes::new).unwrap_or_default();
     let mut w = model_world(logs);
     let sym = |w: &mut model::World, b: &[u8]| w.sym(&hex_encode(b));
     let space_sym = sym(&mut w, &space);
     for (id, e) in dag.iter() {
         let mut ops = Vec::new();
         for o in e.ops() {
-            ops.push(match (reach.class(dag, id, e, o.body()), o.body()) {
+            ops.push(match (class(e, o.body()), o.body()) {
                 (_, SpaceOpBody::Start { succession, .. }) => Op::Start {
                     succeeds: succession.succeeds.as_ref().map(|x| sym(&mut w, x)),
                 },
@@ -1196,7 +1146,6 @@ pub fn by_rules(dag: &Dag<SpaceEntry>, logs: &[&IdentityLog]) -> Result<ByRules,
                 _ => Op::App,
             });
         }
-        reach.note(id, e);
         let entry = model::Entry {
             id: sym(&mut w, id),
             log: space_sym,

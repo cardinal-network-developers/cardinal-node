@@ -1138,7 +1138,7 @@ fn trusted_holder(
     let core = d.core();
     let me = core.identity.as_ref()?.id();
     for c in core.contacts().iter().filter(|c| c.connects()) {
-        let reach = core.all_reach_of(&c.space, &me);
+        let reach = core.reach_of(&c.space, &me);
         let gave = reach.iter().any(|r| r.token == *token && r.host == *host);
         if !gave {
             continue;
@@ -1258,7 +1258,7 @@ async fn reach(d: &Arc<Daemon>, who: [u8; 32], space: SpaceId) {
     let _looking = Looking { d, who };
     lock(&d.rendezvous.looked).insert(who, Instant::now());
     through_helpers(d, &who).await;
-    let reach = d.core().all_reach_of(&space, &who);
+    let reach = d.core().reach_of(&space, &who);
     tracing::debug!("looking for {} at {} hosts", short(&who), reach.len());
     for (r, addr) in crate::mailbox::addresses(&reach) {
         if let Err(e) = through_host(d, &who, r, addr).await {
@@ -1363,7 +1363,7 @@ pub fn standing(d: &Daemon) -> Vec<(KeyId, HybridPublicKey)> {
             continue;
         }
         let hosts: Vec<[u8; 32]> = core
-            .all_reach_of(&c.space, &c.identity)
+            .reach_of(&c.space, &c.identity)
             .iter()
             .map(|r| r.host)
             .collect();

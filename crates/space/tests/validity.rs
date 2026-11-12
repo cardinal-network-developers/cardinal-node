@@ -29,11 +29,11 @@ use cardinal_identity::{
     Created, DeviceKeys, EntryBuilder, EntryId, IdentityEntry, IdentityLog, IdentityOp,
     IdentityState, Power,
 };
-use cardinal_space::entry::{derived_id, NodeId, ADMIN, OWNER, READER, WRITER};
+use cardinal_space::entry::{ADMIN, OWNER, READER, WRITER};
 use cardinal_space::validity::{by_rules, Judge, Validity};
 use cardinal_space::{
-    group, EpochKey, NodeKind, Policy, Profile, SealedEntry, Space, SpaceEntry, SpaceEntryBuilder,
-    SpaceOp, State, ROOT,
+    group, reach_node_id, EpochKey, NodeKind, Policy, Profile, SealedEntry, Space, SpaceEntry,
+    SpaceEntryBuilder, SpaceOp, State, ROOT,
 };
 use proptest::prelude::*;
 
@@ -130,7 +130,6 @@ fn people() -> Vec<Person> {
 /// were written, the genesis first.
 struct History {
     people: Vec<Person>,
-    profile: Profile,
     entries: Vec<SpaceEntry>,
     epoch: EpochKey,
     enc: &'static HybridKeyPair,
@@ -146,8 +145,9 @@ fn folder() -> SpaceOp {
     SpaceOp::create(NodeKind::Uint(5), ROOT, "x", Record::new())
 }
 
-fn reach() -> SpaceOp {
-    SpaceOp::create(NodeKind::Uint(9), ROOT, "reach", Record::new())
+/// A `set` on the reach node of `who`: its own, if `who` writes it.
+fn reach(who: &[u8; 32]) -> SpaceOp {
+    SpaceOp::set(reach_node_id(who), 1, Some(Value::from("there")))
 }
 
 fn history(seed: u64, steps: usize) -> History {
@@ -205,7 +205,7 @@ fn history(seed: u64, steps: usize) -> History {
         ops[0] = SpaceOp::start_with(profile, &Policy::default(), None, &from);
     }
     if rng.chance(15) {
-        ops.push(reach());
+        ops.push(reach(&ana));
     }
     let epoch = EpochKey::generate();
     let enc = member_key();
@@ -224,8 +224,6 @@ fn history(seed: u64, steps: usize) -> History {
     dag.insert(space, vec![], g.clone());
     let mut entries = vec![g];
     let mut removed = [[false; 3]; PEOPLE];
-    // reach nodes made so far: the node, and who made it
-    let mut reach_nodes: Vec<(NodeId, usize)> = Vec::new();
     for step in 0..steps {
         if rng.chance(9) {
             // a device is removed, at the heads of its log or from an old
@@ -321,19 +319,11 @@ fn history(seed: u64, steps: usize) -> History {
         let someone = |rng: &mut Rng| people[rng.below(PEOPLE)].log.id();
         let mut ops = match rng.below(100) {
             0..=27 => vec![folder()],
-            28..=37 => vec![reach()],
-            38..=44 if !reach_nodes.is_empty() => {
-                // mostly its own reach node, sometimes another's
-                let mine: Vec<&(NodeId, usize)> =
-                    reach_nodes.iter().filter(|(_, by)| *by == who).collect();
-                let node = match mine.as_slice() {
-                    [] => rng.pick(&reach_nodes).0,
-                    some if rng.chance(80) => rng.pick(some).0,
-                    _ => rng.pick(&reach_nodes).0,
-                };
-                vec![SpaceOp::set(node, 1, Some(Value::from("there")))]
-            }
-            38..=57 => {
+            28..=39 => vec![reach(&p.log.id())],
+            // another's reach node, or its own by another op than `set`
+            40..=42 => vec![reach(&someone(&mut rng))],
+            43..=44 => vec![SpaceOp::delete(reach_node_id(&p.log.id()))],
+            45..=57 => {
                 let role = match rng.below(20) {
                     0..=5 => READER,
                     6..=12 => WRITER,
@@ -369,17 +359,16 @@ fn history(seed: u64, steps: usize) -> History {
             _ => vec![],
         };
         if rng.chance(20) {
-            ops.push(if rng.chance(50) { folder() } else { reach() });
+            ops.push(if rng.chance(50) {
+                folder()
+            } else {
+                reach(&p.log.id())
+            });
         }
         let e = SpaceEntryBuilder::new(space, &parents, p.log.id(), head, epoch.id())
             .ops(ops)
             .sign(&people[signer].keys[key])
             .unwrap();
-        for (i, op) in e.ops().iter().enumerate() {
-            if op.record() == reach().record() {
-                reach_nodes.push((derived_id(&e.id(), i), who));
-            }
-        }
         let names = |e: &SpaceEntry| e.ops().iter().any(|o| o.record().uint(0) == Ok(8));
         if names(&e) && !forged && rng.chance(40) {
             // another of their devices names a successor too, before
@@ -398,7 +387,6 @@ fn history(seed: u64, steps: usize) -> History {
     }
     History {
         people,
-        profile,
         entries,
         epoch,
         enc,
@@ -516,7 +504,7 @@ fn run(seed: u64, steps: usize, tally: &mut Tally) {
 
     // 1. In the order written, every identity log held from the start.
     let mut dag = Dag::new();
-    let mut judge = Judge::new(h.profile);
+    let mut judge = Judge::new();
     for st in h.states() {
         judge.set_state(&dag, st);
     }
@@ -538,7 +526,7 @@ fn run(seed: u64, steps: usize, tally: &mut Tally) {
 
     // 2. In a random order, compared on the way.
     let mut dag = Dag::new();
-    let mut judge = Judge::new(h.profile);
+    let mut judge = Judge::new();
     for st in h.states() {
         judge.set_state(&dag, st);
     }
@@ -554,7 +542,7 @@ fn run(seed: u64, steps: usize, tally: &mut Tally) {
     // 3. In a random order, while identity logs arrive late, and as they
     // were at some earlier time before they are as they are now.
     let mut dag = Dag::new();
-    let mut judge = Judge::new(h.profile);
+    let mut judge = Judge::new();
     for p in &h.people {
         if rng.chance(50) {
             judge.set_state(&dag, rng.pick(&p.was).clone());
@@ -796,7 +784,7 @@ impl Scene {
         let mut scene = Scene {
             people,
             dag: Dag::new(),
-            judge: Judge::new(group::GROUP),
+            judge: Judge::new(),
             named: Default::default(),
             space: g.id(),
         };
@@ -942,18 +930,34 @@ fn a_role_counts_from_the_entry_that_gave_it() {
 #[test]
 fn a_reader_writes_its_own_reach_node_and_nothing_else() {
     let mut s = Scene::new(ANA, A, &[(ANA, OWNER), (BEN, READER), (CY, READER)], None);
-    s.write("reach", BEN, P, vec![reach()], None);
+    let ben = s.id(BEN);
+    let node = reach_node_id(&ben);
+    // it is his from the start: nothing makes it first
+    s.write("reach", BEN, P, vec![reach(&ben)], Some(&["genesis"]));
     s.write("message", BEN, P, app(), None);
-    let node = derived_id(&s.named["reach"], 0);
-    let there = || vec![SpaceOp::set(node, 1, Some(Value::from("there")))];
-    s.write("moved", BEN, A, there(), None);
-    // not someone else's, and not before it was made
-    s.write("theirs", CY, P, there(), None);
-    s.write("before", BEN, P, there(), Some(&["genesis"]));
+    s.write("moved", BEN, A, vec![reach(&ben)], None);
+    // any field of it, and nothing else in the same entry
+    let other = vec![SpaceOp::set(node, 7, Some(Value::from(1u64)))];
+    s.write("other field", BEN, P, other, None);
+    let mut both = vec![reach(&ben)];
+    both.extend(app());
+    s.write("beside", BEN, P, both, None);
+    // not someone else's, and only with `set`
+    s.write("theirs", CY, P, vec![reach(&ben)], None);
+    s.write("deleted", BEN, P, vec![SpaceOp::delete(node)], None);
     s.write("empty", CY, P, vec![], None);
     assert_eq!(
-        s.valid(&["reach", "message", "moved", "theirs", "before", "empty"]),
-        [true, false, true, false, false, true]
+        s.valid(&[
+            "reach",
+            "message",
+            "moved",
+            "other field",
+            "beside",
+            "theirs",
+            "deleted",
+            "empty"
+        ]),
+        [true, false, true, true, false, false, false, true]
     );
 }
 
@@ -1036,7 +1040,7 @@ fn a_stolen_phone_s_succession_stands_or_falls_with_its_key() {
     assert_eq!(s.successor(), Some([7; 32]));
     // her laptop builds on it, as it would after following. That witnesses
     // nothing: what ends a space is kept on purpose, or not at all
-    s.write("a3", ANA, A, vec![reach()], Some(&["t"]));
+    s.write("a3", ANA, A, vec![reach(&s.id(ANA))], Some(&["t"]));
     // Ana removes the phone. The succeed is void, the space is open again,
     // and nothing honest was lost
     s.remove_phone(ANA);
@@ -1124,10 +1128,12 @@ fn a_genesis_names_one_owner_its_author_or_none() {
         assert!(s.judge.validity().members.is_empty(), "{members:?}");
     }
     // what it holds besides its members is what its author's role allows
+    let ana_id = people()[ANA].log.id();
     for (role, ops, good) in [
         (WRITER, app(), true),
         (READER, app(), false),
-        (READER, vec![reach()], true),
+        (READER, vec![reach(&ana_id)], true),
+        (READER, vec![reach(&[7; 32])], false),
         (OWNER, vec![SpaceOp::set_policy(&Policy::default())], true),
         (WRITER, vec![SpaceOp::set_policy(&Policy::default())], false),
         (OWNER, succeed(7), false),
@@ -1149,7 +1155,7 @@ fn a_genesis_names_one_owner_its_author_or_none() {
             .ops(all)
             .sign(&ana.keys[A])
             .unwrap();
-        let (mut dag, mut judge) = (Dag::new(), Judge::new(group::GROUP));
+        let (mut dag, mut judge) = (Dag::new(), Judge::new());
         judge.set_state(&dag, ana.log.state());
         arrive(&mut judge, &mut dag, &g);
         let logs: Vec<&IdentityLog> = people.iter().map(|p| &p.log).collect();
@@ -1273,7 +1279,7 @@ fn an_id_says_who_signed() {
         [&phone, &again, &hers, &forged],
     ];
     for order in orders {
-        let (mut dag, mut judge) = (Dag::new(), Judge::new(group::GROUP));
+        let (mut dag, mut judge) = (Dag::new(), Judge::new());
         for p in &people {
             judge.set_state(&dag, p.log.state());
         }
@@ -1289,7 +1295,7 @@ fn an_id_says_who_signed() {
         assert!(!valid.contains(&forged.id()));
     }
     // The phone's falls with the phone, and hers does not.
-    let (mut dag, mut judge) = (Dag::new(), Judge::new(group::GROUP));
+    let (mut dag, mut judge) = (Dag::new(), Judge::new());
     for p in &people {
         judge.set_state(&dag, p.log.state());
     }

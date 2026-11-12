@@ -43,6 +43,13 @@
       "purpose": "convergence"
     },
     {
+      "context": "cardinal 1 reach node",
+      "derive": "e6c309af56140ff1f8f360d2e745f416d3685dbe7250fb879d9a87b2dfebe257",
+      "derive_96": "e6c309af56140ff1f8f360d2e745f416d3685dbe7250fb879d9a87b2dfebe2570959030c8b834ee3ae07e22e7eb40587ffe8b6e74ba5a923e93a77931edd90e3943a2080fabeeb90d790c003dafa319e21abe3b800b1a32157255503e8efb0cb",
+      "material_hex": "63617264696e616c2074657374206d6174657269616c",
+      "purpose": "reach node"
+    },
+    {
       "context": "cardinal 1 mailbox",
       "derive": "b0b2151425b1578651d773837e8e59b73eb38f8d75620b623424df97cef92bc1",
       "derive_96": "b0b2151425b1578651d773837e8e59b73eb38f8d75620b623424df97cef92bc156bbf30e7f1ae2a47bc0cab2321cea915061a85a6334b4559f34bbd52c863c1822d3723209c2904d36b3f4600e3b0e11edf4a69bc21ef391de3f5d4a9083d54d",

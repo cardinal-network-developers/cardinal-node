@@ -881,45 +881,9 @@ impl Core {
             .collect()
     }
 
-    /// The reach node `who` wrote in a space.
+    /// Every host and token `who` gives in a space, in their reach node
+    /// (`profiles.md#reach`). Empty if they gave none, or said nowhere.
     pub fn reach_of(
-        &self,
-        space: &SpaceId,
-        who: &[u8; 32],
-    ) -> Option<(
-        cardinal_space::NodeId,
-        Vec<cardinal_space::relationship::Reach>,
-    )> {
-        let h = self.spaces.get(space)?.space.as_ref()?;
-        cardinal_space::relationship::reach_of(h.state(), who)
-    }
-
-    /// The space this person gave out a token in.
-    pub fn space_of_token(&self, token: &[u8; 16]) -> Option<SpaceId> {
-        let me = self.identity.as_ref()?.id();
-        self.spaces.keys().copied().find(|id| {
-            let reach = self.all_reach_of(id, &me);
-            reach.iter().any(|r| r.token == *token)
-        })
-    }
-
-    /// Each reach node `who` wrote in a space, with what it says.
-    pub fn reach_nodes_of(
-        &self,
-        space: &SpaceId,
-        who: &[u8; 32],
-    ) -> Vec<(
-        cardinal_space::NodeId,
-        Vec<cardinal_space::relationship::Reach>,
-    )> {
-        let Some(h) = self.spaces.get(space).and_then(|h| h.space.as_ref()) else {
-            return Vec::new();
-        };
-        cardinal_space::relationship::reach_nodes(h.state(), who)
-    }
-
-    /// Every host and token `who` gave in a space, from all their reach nodes.
-    pub fn all_reach_of(
         &self,
         space: &SpaceId,
         who: &[u8; 32],
@@ -927,7 +891,39 @@ impl Core {
         let Some(h) = self.spaces.get(space).and_then(|h| h.space.as_ref()) else {
             return Vec::new();
         };
-        cardinal_space::relationship::all_reach_of(h.state(), who)
+        cardinal_space::relationship::reach_of(h.state(), who)
+    }
+
+    /// Whether `who` has set their reach node in a space, if only to say
+    /// nowhere.
+    pub fn reach_is_set(&self, space: &SpaceId, who: &[u8; 32]) -> bool {
+        let h = self.spaces.get(space).and_then(|h| h.space.as_ref());
+        h.is_some_and(|h| cardinal_space::relationship::reach_is_set(h.state(), who))
+    }
+
+    /// The members of a space, this person aside, who are not their
+    /// contacts and have not left: whoever a reach node set there would
+    /// tell where this person's hosts are, and who has no host of theirs
+    /// already (`hosts.md#telling-others-where-to-reach-you`). Someone
+    /// refused is not a contact for this.
+    pub fn not_contacts_in(&self, space: &SpaceId) -> Vec<[u8; 32]> {
+        let me = self.identity.as_ref().map(|i| i.id());
+        let Some(sp) = self.spaces.get(space).and_then(|h| h.space.as_ref()) else {
+            return Vec::new();
+        };
+        let contacts = self.contacts();
+        let known = |who: &[u8; 32]| contacts.iter().any(|c| c.identity == *who && !c.refused);
+        let others = sp.present().into_iter();
+        others.filter(|m| Some(*m) != me && !known(m)).collect()
+    }
+
+    /// The space this person gave out a token in.
+    pub fn space_of_token(&self, token: &[u8; 16]) -> Option<SpaceId> {
+        let me = self.identity.as_ref()?.id();
+        self.spaces.keys().copied().find(|id| {
+            let reach = self.reach_of(id, &me);
+            reach.iter().any(|r| r.token == *token)
+        })
     }
 
     /// The current epoch of a space, and its envelope key.
@@ -1733,7 +1729,7 @@ impl Core {
             let Some(link) = st.keys.get(device).and_then(|k| k.link_key.clone()) else {
                 continue;
             };
-            let reach = self.all_reach_of(&c.space, &c.identity);
+            let reach = self.reach_of(&c.space, &c.identity);
             return reach
                 .iter()
                 .filter(|r| r.host == *link.x25519())
@@ -2243,6 +2239,52 @@ mod tests {
         ana.takes(&g, &[back]);
         assert!(group::joined(ana.space(&g), &cy.id()));
         assert!(group::joined(cy.space(&g), &cy.id()));
+    }
+
+    /// Whom a reach node set in a space would tell where this person's
+    /// hosts are, who has no host of theirs already: every other member
+    /// still in it who is not a contact, or is one this person refused
+    /// (`hosts.md#telling-others-where-to-reach-you`).
+    #[test]
+    fn whom_a_reach_node_would_tell() {
+        use cardinal_space::account::{self, Regard};
+        let mut p = [Person::new(), Person::new(), Person::new()];
+        for i in 0..3 {
+            for j in 0..3 {
+                if i != j {
+                    let (log, id) = (p[j].log(), p[j].id());
+                    p[i].core.ingest_other(id, &log).unwrap();
+                }
+            }
+        }
+        let [mut ana, mut bo, mut cy] = p;
+        let both = [(bo.id(), "Bo".to_owned()), (cy.id(), "Cy".to_owned())];
+        let g = ana.core.create_group("Garden club", "Ana", &both).unwrap();
+        bo.takes(&g, &ana.all_of(&g));
+        cy.takes(&g, &ana.all_of(&g));
+        // Bo knows nobody yet: both of the others would learn.
+        let mut both = vec![ana.id(), cy.id()];
+        both.sort();
+        assert_eq!(bo.core.not_contacts_in(&g), both);
+        // Ana becomes his contact. Being offered the group, and not yet
+        // in it, Cy reads it all the same.
+        let account = bo.core.account_id().unwrap();
+        let contact = account::create_contact(&ana.id(), "Ana", &[7; 32], Regard::default());
+        bo.core.write_entry(&account, vec![contact]).unwrap();
+        assert_eq!(bo.core.not_contacts_in(&g), [cy.id()]);
+        // Someone he refused is no contact for this, whatever else they are.
+        let node = bo.core.contacts()[0].node;
+        let refuse = account::set_field(node, account::REFUSED, true);
+        bo.core.write_entry(&account, vec![refuse]).unwrap();
+        assert_eq!(bo.core.not_contacts_in(&g), both);
+        let unrefuse = account::set_field(node, account::REFUSED, false);
+        bo.core.write_entry(&account, vec![unrefuse]).unwrap();
+        // Whoever left is told nothing more.
+        let (_, gone) = cy.core.write_entry(&g, vec![SpaceOp::leave()]).unwrap();
+        bo.takes(&g, &[gone]);
+        assert!(bo.core.not_contacts_in(&g).is_empty());
+        // A space that is not here tells nobody anything.
+        assert!(bo.core.not_contacts_in(&[9; 32]).is_empty());
     }
 
     #[test]

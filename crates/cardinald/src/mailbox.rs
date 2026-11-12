@@ -669,24 +669,57 @@ async fn reach_here(d: &Arc<Daemon>) -> Vec<Reach> {
     reach
 }
 
-/// Writes where this person can be reached about a space, if they have a
-/// host and have not said yet.
+/// Sets this person's reach node in a space now: to their hosts, each with
+/// a fresh token for this space, or to an empty list if they have none or
+/// `share` is false (`contact.md#accepting`, step 5; `profiles.md#group`).
+/// This is how a relationship or a group is accepted, and it is said
+/// without asking only where the caller knows it may be
+/// ([`write_reach`] has the rule).
+pub async fn say_reach(d: &Arc<Daemon>, space: &SpaceId, share: bool) -> anyhow::Result<()> {
+    let _one = d.mailbox.reaching.lock().await;
+    say_reach_locked(d, space, share).await
+}
+
+async fn say_reach_locked(d: &Arc<Daemon>, space: &SpaceId, share: bool) -> anyhow::Result<()> {
+    let me = d.core().identity.as_ref().map(|i| i.id());
+    let me = me.ok_or_else(|| anyhow::anyhow!("this device has no identity"))?;
+    let reach = if share {
+        reach_here(d).await
+    } else {
+        Vec::new()
+    };
+    d.write_and_push(space, vec![relationship::set_reach(&me, &reach)])?;
+    Ok(())
+}
+
+/// Says where this person is reached about a space, where software may say
+/// so unasked: only in a space whose other members are all this person's
+/// contacts, who have a host of theirs already
+/// (`hosts.md#telling-others-where-to-reach-you`). There it is set if it
+/// was never set, and set again once the person has a host where they had
+/// said nowhere. In any other space only the person's answer sets it
+/// (`group-join`, `group-reach`); what they chose to share is then kept
+/// current by [`renew_reach`].
 pub async fn write_reach(d: &Arc<Daemon>, space: &SpaceId) -> anyhow::Result<()> {
     // One at a time: two that both found none would each register a token and
-    // write a node, and leave a token that leads nowhere.
+    // write, and leave a token that leads nowhere.
     let _one = d.mailbox.reaching.lock().await;
-    let me = d.core().identity.as_ref().map(|i| i.id());
-    let Some(me) = me else {
-        return Ok(());
+    let (set, listed, unasked) = {
+        let core = d.core();
+        let Some(me) = core.identity.as_ref().map(|i| i.id()) else {
+            return Ok(());
+        };
+        (
+            core.reach_is_set(space, &me),
+            !core.reach_of(space, &me).is_empty(),
+            core.not_contacts_in(space).is_empty(),
+        )
     };
-    if d.core().reach_of(space, &me).is_some() {
+    let hosted = !d.core().mailboxes().is_empty();
+    if listed || !unasked || (set && !hosted) {
         return Ok(());
     }
-    let reach = reach_here(d).await;
-    if !reach.is_empty() {
-        d.write_and_push(space, vec![relationship::create_reach(&me, &reach)])?;
-    }
-    Ok(())
+    say_reach_locked(d, space, true).await
 }
 
 /// This host's tokens in a space, from what its person wrote there.
@@ -696,7 +729,7 @@ fn tokens_here(d: &Daemon, space: &SpaceId) -> Vec<Token> {
     let Some(me) = core.identity.as_ref().map(|i| i.id()) else {
         return Vec::new();
     };
-    let reach = core.all_reach_of(space, &me);
+    let reach = core.reach_of(space, &me);
     let here = reach.iter().filter(|r| r.host == here);
     here.map(|r| r.token).collect()
 }
@@ -704,8 +737,8 @@ fn tokens_here(d: &Daemon, space: &SpaceId) -> Vec<Token> {
 /// On a host, ends the tokens this person gave out in a space they have
 /// left (`spaces.md#members-and-roles`). The host does this itself, when it
 /// leaves or when the `leave` reaches it from another of the person's
-/// devices. A token revoked never comes back, and nothing yet gives a new
-/// one to someone who is added again and joins again (DEVIATIONS.md).
+/// devices. A token revoked never comes back: someone who is added again
+/// and joins again sets their reach node again, with new ones.
 pub fn revoke_left(d: &Daemon, space: &SpaceId) {
     if !d.config().host {
         return;
@@ -743,10 +776,12 @@ pub fn revoke_refused(d: &Daemon) {
     }
 }
 
-/// On a host, keeps what contacts have of it current: a fresh token for anyone
-/// whose token here has gone and who is not refused now (a revoked token never
-/// comes back), and the addresses its grant gives now. A contact away from
-/// home tries only the addresses a reach node names.
+/// On a host, keeps what others have of it current, wherever its person's
+/// reach node names it: a fresh token for anyone whose token here has gone
+/// and who is not refused now (a revoked token never comes back), and the
+/// addresses its grant gives now. A contact away from home tries only the
+/// addresses a reach node names. A reach node that names no host is left
+/// as it is: that was its person's answer, or [`write_reach`]'s to change.
 fn renew_reach(d: &Arc<Daemon>) {
     if !d.config().host {
         return;
@@ -756,26 +791,33 @@ fn renew_reach(d: &Arc<Daemon>) {
         return;
     };
     let endpoints = crate::host::own_grant(d).map(|g| g.endpoints);
-    let contacts = d.core().contacts();
-    for c in contacts.iter().filter(|c| !c.refused) {
-        // Every node; one already current is not written again.
-        let nodes = d.core().reach_nodes_of(&c.space, &me);
-        for (node, mut reach) in nodes {
-            let active = |t: &Token| lock(&d.mailbox.store).is_active(t);
-            let fresh = || {
-                let t: Token = random_bytes();
-                register(d, &t);
-                t
-            };
-            if !kept_current(&mut reach, &here, endpoints.as_deref(), active, fresh) {
-                continue;
-            }
-            let set = relationship::set_reach(node, &reach);
-            if let Err(e) = d.write_and_push(&c.space, vec![set]) {
-                tracing::debug!("renewing a token: {e:#}");
-            }
+    let shared = d.core().shared_spaces();
+    for (space, _) in shared {
+        // A space this person left has no tokens to bring back.
+        if crate::groups::not_joined(d, &space) || left(d, &space, &me) {
+            continue;
+        }
+        let mut reach = d.core().reach_of(&space, &me);
+        let active = |t: &Token| lock(&d.mailbox.store).is_active(t);
+        let fresh = || {
+            let t: Token = random_bytes();
+            register(d, &t);
+            t
+        };
+        if !kept_current(&mut reach, &here, endpoints.as_deref(), active, fresh) {
+            continue;
+        }
+        let set = relationship::set_reach(&me, &reach);
+        if let Err(e) = d.write_and_push(&space, vec![set]) {
+            tracing::debug!("renewing a token: {e:#}");
         }
     }
+}
+
+fn left(d: &Daemon, space: &SpaceId, who: &[u8; 32]) -> bool {
+    let core = d.core();
+    let open = core.spaces.get(space).and_then(|h| h.space.as_ref());
+    open.is_some_and(|sp| sp.has_left(who))
 }
 
 /// Brings this host's part of a reach node up to date: a fresh token for one
@@ -894,8 +936,8 @@ async fn pull_from_members(d: &Arc<Daemon>, space: &SpaceId, members: &[[u8; 32]
     let in_touch = d.people_in_touch();
     let mut fetched = false;
     for member in members.iter().filter(|m| !in_touch.contains(*m)) {
-        let found = d.core().reach_of(space, member);
-        if let Some((_, reach)) = found {
+        let reach = d.core().reach_of(space, member);
+        if !reach.is_empty() {
             fetched |= pull(d, space, member, &reach).await;
         }
     }
@@ -981,13 +1023,13 @@ async fn deliver_to(d: &Arc<Daemon>, space: &SpaceId, member: &[u8; 32]) {
     if unsent.is_empty() || d.people_in_touch().contains(member) {
         return;
     }
-    let found = d.core().reach_of(space, member);
-    let Some((_, reach)) = found else {
+    let reach = d.core().reach_of(space, member);
+    if reach.is_empty() {
         // Nowhere to leave it: they are looked for instead, through this
         // person's devices that may be in touch with them (`sync.md#neighbours`).
         d.rendezvous.use_contact(member);
         return;
-    };
+    }
     let Some((epoch, key)) = d.core().envelope_key(space) else {
         return;
     };
@@ -1001,7 +1043,7 @@ async fn deliver_to(d: &Arc<Daemon>, space: &SpaceId, member: &[u8; 32]) {
     // Too long to carry, so say that it is there, if this person has a host
     // to fetch it from.
     let me = d.core().identity.as_ref().map(|i| i.id());
-    let hosted = me.is_some_and(|me| d.core().reach_of(space, &me).is_some());
+    let hosted = me.is_some_and(|me| !d.core().reach_of(space, &me).is_empty());
     if long.is_empty() || !hosted {
         return;
     }
@@ -1229,7 +1271,7 @@ mod tests {
             host: [1; 32],
             token: [2; 16],
         };
-        let op = relationship::create_reach(&[3; 32], &[reach.clone(), reach]);
+        let op = relationship::set_reach(&[3; 32], &[reach.clone(), reach]);
         let body = op.record().encode();
         assert!(body.len() < MAX_ENVELOPE / 2, "{} bytes", body.len());
     }
@@ -1470,7 +1512,7 @@ mod tests {
             host: [0x47; 32],
             token,
         };
-        let op = relationship::create_reach(&[0x48; 32], &[reach]);
+        let op = relationship::set_reach(&[0x48; 32], &[reach]);
 
         let vectors = serde_json::json!({
             "description": "Mailbox (hosts.md#envelopes, profiles.md#reach). \
@@ -1492,7 +1534,8 @@ mod tests {
                 "token": hex::encode(token),
                 "secret": hex::encode(&derive(Purpose::Token, &token)[..]),
             },
-            "reach_node_create": hex::encode(op.record().encode()),
+            "reach_node": hex::encode(cardinal_space::reach_node_id(&[0x48; 32])),
+            "reach_node_set": hex::encode(op.record().encode()),
         });
         let text = serde_json::to_string_pretty(&vectors).unwrap() + "\n";
         let path =

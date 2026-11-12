@@ -58,12 +58,6 @@ D61, and the commits beside them). Where it answered as this implementation
 had chosen, the readings recorded below are now only descriptions. Where it
 answered otherwise, the code is behind:
 
-- **A reach node is its member's from the start (D61).** It is not created:
-  its id follows from the identity's, and a reader's `set` on it is told
-  from the op alone. Here a reach node is a node of kind 9 that its member
-  creates, and validity looks for that `create` among the author's earlier
-  entries. The state at a cut leaves out the reach nodes of those a
-  successor does not name.
 - **When to rotate (D60).** The specification kept its three reasons and
   said by whose account: what the device held when the epoch reached it,
   which it has to keep. Here a change of a member's key, or learning of a
@@ -71,9 +65,6 @@ answered otherwise, the code is behind:
   the entries: a `leave` the epoch's first entry does not descend from,
   which is what this implementation does, and an addition made at the same
   time as a rotation, which it does not.
-- **Joining with no host.** Someone with no host accepts a space by
-  setting their reach node to an empty list. Here they write a read marker
-  instead, which a reader may not write.
 
 ## Encoding (`spec/encoding.md`)
 
@@ -442,19 +433,13 @@ answered otherwise, the code is behind:
   genesis gave, which every member knows before any other entry and which
   never changes here, since `set_policy` is not applied
   (`Space::open_key_belongs`). A genesis is held to its own policy.
-- **Spec ambiguity: which ops are a reader's "own reach node".** The roles
-  table lets a reader "write its own reach node", and the rules have an op
-  `reach` that any role may write, but nothing says how to tell that op
-  from other application ops without the state, which is computed from
-  validity. Chose, from the entries alone: a `create` of the profile's
-  reach kind, or a `set` on a node that such a `create` made in an entry of
-  the same author in the causal past. A reader's `delete`, `move` or
-  `restore` of its reach node is an application op, and invalid.
-- **Spec gap: the reach kind outside relationships and groups.** "Every
-  profile except account may contain one reach node per member", but only
-  the relationship table gives the kind a number (9). Chose: files, public
-  and application profiles have no reach kind, so a reader there writes
-  only `keep`, `leave` and entries with no ops.
+- **A reader's one op.** A `set` whose node is `reach_node_id(author)`
+  (`validity.rs`, `class`), in any profile, an account space included.
+  **Spec ambiguity: which fields.** `profiles.md#reach` gives a reach node
+  one field, and nothing says whether a `set` of another key on it is
+  still the reader's op, or is accepted for state. Chose: any key. The
+  roles table says "set its own reach node" and names no field, and a
+  field this implementation does not know is kept like any other.
 - **Spec ambiguity: who owns a personal space.** `profiles.md` says an
   account space has "one identity: yourself" and a files space "usually
   yourself", and gives neither a role. Chose: the genesis names its author
@@ -508,9 +493,27 @@ answered otherwise, the code is behind:
 
 ## State (`spec/state.md`, `spec/profiles.md`)
 
-- **Spec ambiguity: "or in the entry itself".** A node may be named by an
-  op after its `create` in the same entry; an op before the `create`
-  rejects the entry.
+- **A node named earlier in the same entry.** A node may be named by an op
+  after its `create` in the same entry; an op before the `create` rejects
+  the entry, as `state.md#operations` now says. **Spec observation:**
+  nothing can reach this case. A node's id is derived from the id of the
+  entry that creates it, and that id covers the entry's ops, so an entry
+  that named a node it creates would have to contain a hash of itself
+  (see "a node cannot be named in the entry that creates it", under
+  Daemon). The rule is implemented, and no entry can be written that it
+  accepts.
+- **Reach nodes** (`state.md#nodes`). A reach node is in no registry of
+  created nodes, so an op that names one is refused exactly as an op that
+  names a node nobody created, with one exception: a `set` by the identity
+  whose reach node it is. Nothing here asks whether sixteen bytes are some
+  identity's reach node, which could not be answered without knowing every
+  identity; both reasons reject the entry, so the answer is never needed.
+  A `set` written beside, and a cleared field, behave as on any node. In
+  the canonical state a reach node's record is `{1: id, 5: fields}`, there
+  once any field of it has been set: a field that was cleared still has a
+  value to record, so a reach node that was ever set keeps its record.
+  **Spec ambiguity: "only while it has a field to record"** suggests a
+  record can go away again, and nothing makes a field lose every value.
 - **Spec ambiguity: what a delete deletes.** Chose: a delete of N flags N
   and every node beneath N in the delete's causal past that no concurrent
   op touched; N is flagged delete conflict if touched. A `restore` of N
@@ -1016,10 +1019,8 @@ asks for around that is not built yet.
     being added is an offer, accepted by writing something valid. Chose:
     leaving takes the earlier acceptance back. Someone added again is
     offered the group again, and is in it once they write in it again.
-  - A token ended on leaving never comes back, and joining again does not
-    write the reach node again, since one is there. So someone who left a
-    group and came back can no longer be reached about it through their
-    host, only by a session.
+  - A token ended on leaving never comes back. Joining again sets the
+    reach node again, with new tokens.
   - Someone who left still asks the others for the group when they meet,
     and is given nothing.
 - **Contacts are not told apart from members by more than this device's account
@@ -1111,6 +1112,56 @@ asks for around that is not built yet.
   can make keys and streams without limit. An envelope that cannot be opened yet
   waits, one at a time and up to the token's quota, and the host fetches what it
   needs at most once a minute.
+- **Where a reach node is set without asking**
+  (`hosts.md#telling-others-where-to-reach-you`, `mailbox.rs`,
+  `groups.rs`). A relationship's two people set theirs when it is made
+  (`contact.md#accepting`, step 5), to an empty list with no host. After
+  that the rule is one test, made each time, with nothing remembered: in a
+  space whose other members who have not left are all this person's
+  contacts, and none of them refused, the software keeps the reach node at
+  the person's hosts: it sets it if it was never set, and sets it again
+  once they have a host where it said nowhere. In any other space it
+  writes only what the person answered, and afterwards only keeps current
+  what they chose to share (a token that has gone, an address that
+  changed).
+  - **What the local interface gained, to ask and to answer.** Each group
+    and each offer in `groups` carries `reach`: `shared` (this person's
+    reach node there names a host), `ask` (it is theirs to say before
+    anything is set: they have a host, someone there is not their contact,
+    and it was never set), `who` (the members who are not their contacts,
+    by the names this person sees) and `what` (the addresses of their
+    hosts). `group-join` takes `reach` (bool): the answer. Where `ask` is
+    true and there is no answer, it fails with the question in words and
+    writes nothing; where nobody is to be asked it is not read. A new
+    request `group-reach` `group` `share` (bool) sets or empties it later.
+    `cardinal group join` has `--share-host` and `--keep-host`, and there
+    is `cardinal group reach GROUP share|keep`.
+  - **Spec ambiguity: someone with no host, among people who are not
+    contacts.** "It MUST ask first", yet joining is setting the reach
+    node. Chose: with no host there is nothing anyone would learn, so the
+    empty list is set without asking.
+  - **Spec gap: who joins later.** The person answered for the members
+    there were. Someone who is not a contact and is added afterwards reads
+    a reach node set before they came, and nothing says software should
+    empty it, ask again, or stop keeping it current. Chose: the answer
+    stands, and what was shared is kept current; `reach.who` in `groups`
+    lists whoever is not a contact, shared or not, so a client can show
+    it, and `group-reach` empties it.
+  - **Spec gap: saying no among contacts.** Where everyone else is a
+    contact the software sets the reach node unasked, so a "no" there
+    would be overwritten the next time it looked, and nothing is kept
+    that could remember it. Chose: `group-reach` refuses to empty it
+    there and says why (they have a host of this person's already), and
+    `group-join` does not read `reach` there.
+  - **Spec gap: someone refused.** A refused contact still has the
+    relationship's old token (revoked), and is "hidden wherever software
+    lists people". Chose: for this rule they are not a contact, so a
+    group they are in is one where the person is asked, and they are
+    named in `who`.
+  - **Spec ambiguity: a relationship is made before its contact is
+    recorded.** Step 5 sets the reach node; step 6 records the contact. At
+    step 5 the other is nobody's contact yet. Chose: step 5 sets it
+    without the test, since `contact.md` says to.
 - **A new host does not tell contacts it is there** unless a mailbox of theirs
   can carry the reach node. Someone through hosts only who had no host when
   they were invited stays out of reach of the other until then.

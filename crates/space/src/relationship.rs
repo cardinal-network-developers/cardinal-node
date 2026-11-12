@@ -6,11 +6,10 @@ use std::collections::HashSet;
 use cardinal_encoding::{Record, Value};
 use cardinal_identity::EntryId;
 
-use crate::account::short_key;
 use crate::entry::{IdentityId, NodeId, NodeKind, SpaceOp, WRITER};
 use crate::grant::Endpoint;
 use crate::space::Space;
-use crate::state::{Node, State, AUTHOR_OWNED_FIELD, ROOT};
+use crate::state::{reach_node_id, Node, State, AUTHOR_OWNED_FIELD, ROOT};
 
 /// Conversation kind.
 pub const CONVERSATION: u64 = 1;
@@ -20,8 +19,6 @@ pub const MESSAGE: u64 = 2;
 pub const READ_MARKER: u64 = 4;
 /// Reaction kind, under a message.
 pub const REACTION: u64 = 3;
-/// Reach kind.
-pub const REACH: u64 = 9;
 /// Introduction kind (`contact.md#introductions`).
 pub const INTRODUCTION: u64 = 8;
 
@@ -163,52 +160,38 @@ fn read_reach(r: &Record) -> Option<Reach> {
     })
 }
 
-/// `create` of this member's reach node.
-pub fn create_reach(author: &IdentityId, reach: &[Reach]) -> SpaceOp {
-    SpaceOp::create(
-        NodeKind::Uint(REACH),
-        ROOT,
-        &short_key(author),
-        Record::new()
-            .with(1, reach_list(reach))
-            .with(AUTHOR_OWNED_FIELD, 1u64),
-    )
+/// Sets where `author` is reached about this space: field 1 of their reach
+/// node, which is theirs from the start and is never created
+/// (`state.md#nodes`). An empty list says there is nowhere, or that the
+/// others are not to have it.
+pub fn set_reach(author: &IdentityId, reach: &[Reach]) -> SpaceOp {
+    SpaceOp::set(reach_node_id(author), 1, Some(reach_list(reach)))
 }
 
-/// Replaces what a reach node says.
-pub fn set_reach(node: NodeId, reach: &[Reach]) -> SpaceOp {
-    SpaceOp::set(node, 1, Some(reach_list(reach)))
+/// Whether `who` has said where they are reached, if only that it is
+/// nowhere.
+pub fn reach_is_set(state: &State, who: &IdentityId) -> bool {
+    !state.reach_values(who, 1).is_empty()
 }
 
-/// Every host and token in the reach nodes `who` wrote. Two devices writing at
-/// once can leave more than one, and what each gives stays good.
-pub fn all_reach_of(state: &State, who: &IdentityId) -> Vec<Reach> {
-    reach_nodes(state, who)
-        .into_iter()
-        .flat_map(|(_, reach)| reach)
-        .collect()
-}
-
-/// Each reach node `who` wrote, with what it says.
-pub fn reach_nodes(state: &State, who: &IdentityId) -> Vec<(NodeId, Vec<Reach>)> {
-    let nodes = state.children(&ROOT).into_iter();
-    let mine = nodes.filter(|n| n.kind == NodeKind::Uint(REACH) && !n.deleted && n.creator == *who);
-    mine.map(|n| {
-        let list = n.field(1).and_then(Value::as_list).unwrap_or_default();
-        let reach = list.iter().filter_map(|v| read_reach(v.as_record()?));
-        (n.id, reach.collect())
-    })
-    .collect()
-}
-
-/// The reach node `who` wrote, with where it says they are.
-pub fn reach_of(state: &State, who: &IdentityId) -> Option<(NodeId, Vec<Reach>)> {
-    let nodes = state.children(&ROOT).into_iter();
-    let mut mine = nodes.filter(|n| n.kind == NodeKind::Uint(REACH) && !n.deleted);
-    let node = mine.find(|n| n.creator == *who)?;
-    let list = node.field(1).and_then(Value::as_list).unwrap_or_default();
-    let reach = list.iter().filter_map(|v| read_reach(v.as_record()?));
-    Some((node.id, reach.collect()))
+/// Every host and token `who` gives in their reach node. Where two of their
+/// devices set it at the same moment it holds both lists, and both count
+/// (`profiles.md#reach`).
+pub fn reach_of(state: &State, who: &IdentityId) -> Vec<Reach> {
+    let mut all: Vec<Reach> = Vec::new();
+    for v in state.reach_values(who, 1) {
+        let list = v
+            .value
+            .as_ref()
+            .and_then(Value::as_list)
+            .unwrap_or_default();
+        for r in list.iter().filter_map(|v| read_reach(v.as_record()?)) {
+            if !all.contains(&r) {
+                all.push(r);
+            }
+        }
+    }
+    all
 }
 
 /// What a relationship's genesis entry holds besides `start`: both

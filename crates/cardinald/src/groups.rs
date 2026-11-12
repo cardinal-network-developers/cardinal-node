@@ -229,37 +229,113 @@ pub fn leave(d: &Arc<Daemon>, group: &str) -> anyhow::Result<Json> {
     Ok(json!({}))
 }
 
-/// Joins a group offered to this person: its first entry of theirs, where
-/// to reach them if they have a host, or a read marker if not.
-pub async fn join(d: &Arc<Daemon>, group: &str) -> anyhow::Result<Json> {
+/// What setting this person's reach node in a group tells, and whom
+/// (`hosts.md#telling-others-where-to-reach-you`). A reach node says where
+/// a person's hosts are, to every member, and for a host at home that is a
+/// home address. Their contacts have a host of theirs already; anyone else
+/// in the group would learn it there.
+struct Telling {
+    /// Whether their reach node in the group names a host now.
+    shared: bool,
+    /// Whether it is theirs to say before anything is set: they have a
+    /// host, someone in the group is not a contact of theirs, and their
+    /// reach node there has never been set.
+    ask: bool,
+    /// The members who are not their contacts, as this person sees them.
+    who: Vec<String>,
+    /// The addresses of their hosts.
+    what: Vec<String>,
+}
+
+impl Telling {
+    fn of(d: &Daemon, id: &SpaceId, me: &[u8; 32]) -> Telling {
+        let core = d.core();
+        let contacts = core.contacts();
+        let members = match core.spaces.get(id).and_then(|h| h.space.as_ref()) {
+            Some(sp) => group::members(sp),
+            None => Vec::new(),
+        };
+        let others = core.not_contacts_in(id);
+        let who: Vec<String> = others
+            .iter()
+            .map(|m| name_of(me, &contacts, &members, m))
+            .collect();
+        let hosts = core.mailboxes();
+        let endpoints = hosts.iter().flat_map(|(g, _)| g.endpoints.iter());
+        let what: Vec<String> = endpoints.map(|e| e.to_string()).collect();
+        Telling {
+            shared: !core.reach_of(id, me).is_empty(),
+            ask: !hosts.is_empty() && !who.is_empty() && !core.reach_is_set(id, me),
+            who,
+            what,
+        }
+    }
+
+    fn json(&self) -> Json {
+        json!({"shared": self.shared, "ask": self.ask, "who": self.who, "what": self.what})
+    }
+
+    /// What the person has to be asked, in words.
+    fn question(&self, name: &str) -> String {
+        format!(
+            "{} in {name} {} not a contact of yours, and would learn where your host is ({}). \
+             Say whether to share it there: with it they can leave you messages while you \
+             are away, and without it they reach you only through someone in touch with both",
+            self.who.join(", "),
+            if self.who.len() == 1 { "is" } else { "are" },
+            self.what.join(", "),
+        )
+    }
+}
+
+/// Joins a group offered to this person by setting their reach node in it,
+/// which is the first entry of theirs there (`profiles.md#group`): to their
+/// hosts, or to an empty list if they have none or do not want every member
+/// to have them. Where someone in the group is not a contact of theirs, and
+/// they have a host, that is theirs to say: `reach` is their answer, and
+/// without it nothing is written. Where everyone else is a contact there is
+/// nothing to ask, and `reach` is not read.
+pub async fn join(d: &Arc<Daemon>, group: &str, reach: Option<bool>) -> anyhow::Result<Json> {
     let g = find(d, group)?;
     if g.joined {
         return Ok(json!({}));
     }
     let me = identity(d)?;
-    let hosted = !d.core().mailboxes().is_empty();
-    if hosted {
-        crate::mailbox::write_reach(d, &g.id).await?;
-    }
-    let joined_now = {
-        let core = d.core();
-        let sp = core.spaces.get(&g.id).and_then(|h| h.space.as_ref());
-        sp.is_some_and(|sp| group::joined(sp, &me))
-    };
-    if !joined_now {
-        let op = {
-            let core = d.core();
-            let sp = core.spaces.get(&g.id).and_then(|h| h.space.as_ref());
-            let sp = sp.ok_or_else(|| anyhow::anyhow!("that group is not open yet"))?;
-            let c = relationship::conversation(sp)
-                .ok_or_else(|| anyhow::anyhow!("that group has no conversation"))?;
-            let last = relationship::messages(sp).last().map_or(c, |m| m.id);
-            relationship::create_read_marker(c, last)
-        };
-        d.write_and_push(&g.id, vec![op])?;
-    }
+    let telling = Telling::of(d, &g.id, &me);
+    anyhow::ensure!(
+        !telling.ask || reach.is_some(),
+        "{}",
+        telling.question(&g.name)
+    );
+    let share = telling.who.is_empty() || reach.unwrap_or(true);
+    crate::mailbox::say_reach(d, &g.id, share).await?;
     d.bump();
     Ok(json!({"group": hex::encode(g.id), "name": g.name}))
+}
+
+/// Says whether the members of a group have where this person's hosts are:
+/// sets their reach node there to their hosts, or empties it. Where
+/// everyone else in the group is a contact of theirs, it is kept set
+/// without asking, and emptying it would not last, so that is refused.
+pub async fn set_reach(d: &Arc<Daemon>, group: &str, share: bool) -> anyhow::Result<Json> {
+    let g = joined(d, group)?;
+    let me = identity(d)?;
+    let telling = Telling::of(d, &g.id, &me);
+    anyhow::ensure!(
+        share || !telling.who.is_empty(),
+        "everyone in {} is a contact of yours, and has a host of yours already",
+        g.name
+    );
+    anyhow::ensure!(
+        !share || !telling.what.is_empty(),
+        "you have no host to tell {} of",
+        g.name
+    );
+    if share != telling.shared {
+        crate::mailbox::say_reach(d, &g.id, share).await?;
+        d.bump();
+    }
+    Ok(json!({}))
 }
 
 /// Says no to a group offered to this person. Nothing is written in it, and
@@ -330,12 +406,14 @@ pub fn list(d: &Daemon) -> Json {
         if !group::joined(sp, &me) {
             if in_it && !declined.contains(&id) {
                 let from = sp.creator();
-                offered.push(json!({
+                let offer = json!({
                     "group": hex::encode(id),
                     "name": name,
                     "from": name_of(&me, &contacts, &members, &from),
                     "members": members.len(),
-                }));
+                });
+                drop(core);
+                offered.push(with_reach(d, offer, &id, &me));
             }
             continue;
         }
@@ -354,27 +432,32 @@ pub fn list(d: &Daemon) -> Json {
         let introductions = group::introductions(sp);
         drop(core);
         let when = last.as_ref().and_then(|m| m.time).map(|t| t.min(now_ms()));
-        groups.push((
-            when,
-            json!({
-                "group": hex::encode(id),
-                "name": name,
-                "members": members.len(),
-                "admin": admin,
-                "introductions": introductions,
-                "unread": unread,
-                "last": last.map(|m| json!({
-                    "mine": m.author == me,
-                    "from": name_of(&me, &contacts, &members, &m.author),
-                    "text": m.text,
-                    "time": m.time,
-                })),
-            }),
-        ));
+        let group = json!({
+            "group": hex::encode(id),
+            "name": name,
+            "members": members.len(),
+            "admin": admin,
+            "introductions": introductions,
+            "unread": unread,
+            "last": last.map(|m| json!({
+                "mine": m.author == me,
+                "from": name_of(&me, &contacts, &members, &m.author),
+                "text": m.text,
+                "time": m.time,
+            })),
+        });
+        groups.push((when, with_reach(d, group, &id, &me)));
     }
     groups.sort_by_key(|(when, _)| std::cmp::Reverse(*when));
     let groups: Vec<Json> = groups.into_iter().map(|(_, g)| g).collect();
     json!({"groups": groups, "offers": offered})
+}
+
+/// A group or an offer of one, with what this person's reach node tells
+/// there and whom.
+fn with_reach(d: &Daemon, mut group: Json, id: &SpaceId, me: &[u8; 32]) -> Json {
+    group["reach"] = Telling::of(d, id, me).json();
+    group
 }
 
 /// Who is in a group, as the others see them.

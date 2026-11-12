@@ -32,5 +32,5 @@ pub use epoch::{EpochId, EpochKey, Keyring};
 pub use error::Error;
 pub use files::Files;
 pub use space::Space;
-pub use state::{Node, State, ROOT};
+pub use state::{reach_node_id, Node, State, ROOT};
 pub use validity::{Judge, Member, Validity};

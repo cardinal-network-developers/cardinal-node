@@ -141,7 +141,7 @@ impl Space {
             sealed: HashMap::new(),
             resigned: Vec::new(),
             keyring,
-            judge: Judge::new(profile),
+            judge: Judge::new(),
             state: State::new(profile),
             valid_heads: BTreeSet::new(),
             current_epoch: None,

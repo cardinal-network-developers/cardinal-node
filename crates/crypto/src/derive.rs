@@ -20,6 +20,8 @@ pub enum Purpose {
     EpochId,
     /// `convergence`: per-epoch convergence secret for chunks (blobs.md).
     Convergence,
+    /// `reach node`: id of an identity's reach node, from its identity id (state.md).
+    ReachNode,
     /// `mailbox`: envelope key, from an epoch key (hosts.md).
     Mailbox,
     /// `discovery`: LAN discovery MAC key (hosts.md).
@@ -40,13 +42,14 @@ pub enum Purpose {
 
 impl Purpose {
     /// All purposes, in the order of the specification's table.
-    pub const ALL: [Purpose; 14] = [
+    pub const ALL: [Purpose; 15] = [
         Purpose::Seal,
         Purpose::RootKey,
         Purpose::RecoveryKey,
         Purpose::EntryKey,
         Purpose::EpochId,
         Purpose::Convergence,
+        Purpose::ReachNode,
         Purpose::Mailbox,
         Purpose::Discovery,
         Purpose::Invite,
@@ -66,6 +69,7 @@ impl Purpose {
             Purpose::EntryKey => "entry key",
             Purpose::EpochId => "epoch id",
             Purpose::Convergence => "convergence",
+            Purpose::ReachNode => "reach node",
             Purpose::Mailbox => "mailbox",
             Purpose::Discovery => "discovery",
             Purpose::Invite => "invite",
@@ -86,6 +90,7 @@ impl Purpose {
             Purpose::EntryKey => "cardinal 1 entry key",
             Purpose::EpochId => "cardinal 1 epoch id",
             Purpose::Convergence => "cardinal 1 convergence",
+            Purpose::ReachNode => "cardinal 1 reach node",
             Purpose::Mailbox => "cardinal 1 mailbox",
             Purpose::Discovery => "cardinal 1 discovery",
             Purpose::Invite => "cardinal 1 invite",

@@ -39,6 +39,15 @@ use crate::entry::{derived_id, IdentityId, NodeId, NodeKind, Profile, SpaceEntry
 /// The root node's id: sixteen zero bytes.
 pub const ROOT: NodeId = [0; 16];
 
+/// The id of an identity's reach node, in every space: the first 16 bytes
+/// of `derive("reach node", identity id)` (`state.md#nodes`). Like the root
+/// it always exists and is never created; it has no kind and no position,
+/// and only that identity writes to it, and only with `set`.
+pub fn reach_node_id(identity: &IdentityId) -> NodeId {
+    let d = cardinal_crypto::derive(cardinal_crypto::Purpose::ReachNode, identity);
+    d[..16].try_into().expect("16 bytes")
+}
+
 /// The field that marks a node author-owned (`profiles.md#shared-rules-normative`).
 pub const AUTHOR_OWNED_FIELD: u64 = 15;
 
@@ -185,6 +194,9 @@ pub struct State {
     nodes: HashMap<NodeId, Node>,
     children: HashMap<NodeId, BTreeSet<NodeId>>,
     registry: HashMap<NodeId, Meta>,
+    /// The fields of the reach nodes that have any, by node id. A reach
+    /// node is no part of the tree.
+    reach: BTreeMap<NodeId, BTreeMap<u64, Vec<FieldValue>>>,
     accepted: HashSet<EntryId>,
     rejected: HashSet<EntryId>,
     applied: Vec<EntryId>,
@@ -275,6 +287,7 @@ impl State {
             nodes: HashMap::new(),
             children: HashMap::new(),
             registry: HashMap::new(),
+            reach: BTreeMap::new(),
             accepted: HashSet::new(),
             rejected: HashSet::new(),
             applied: Vec::new(),
@@ -391,8 +404,13 @@ impl State {
     }
 
     /// Whether an entry is accepted for state; registers its nodes if so.
+    ///
+    /// A reach node is in no registry, so every op that names one is
+    /// refused as naming a node that was never created, but one: its own
+    /// identity's `set`.
     fn accept(&mut self, dag: &Dag<SpaceEntry>, e: &SpaceEntry) -> bool {
         let id = e.id();
+        let own_reach = reach_node_id(&e.author());
         let mut local: HashMap<NodeId, Meta> = HashMap::new();
         let known = |n: &NodeId, local: &HashMap<NodeId, Meta>, reg: &HashMap<NodeId, Meta>| {
             *n == ROOT
@@ -442,6 +460,7 @@ impl State {
                     );
                     ok
                 }
+                SpaceOpBody::Set { node, .. } if *node == own_reach => true,
                 SpaceOpBody::Set {
                     node, key, value, ..
                 } => {
@@ -774,8 +793,15 @@ impl State {
                     value,
                     beside,
                 } => {
-                    if let Some(n) = self.nodes.get_mut(node) {
-                        let vals = n.fields.entry(*key).or_default();
+                    let fields = match self.nodes.get_mut(node) {
+                        Some(n) => Some(&mut n.fields),
+                        None if *node == reach_node_id(&e.author()) => {
+                            Some(self.reach.entry(*node).or_default())
+                        }
+                        None => None,
+                    };
+                    if let Some(fields) = fields {
+                        let vals = fields.entry(*key).or_default();
                         // one written beside supersedes nothing: its value
                         // is added, and is superseded like any other
                         if !*beside {
@@ -845,6 +871,16 @@ impl State {
     /// A node (not the root).
     pub fn node(&self, id: &NodeId) -> Option<&Node> {
         self.nodes.get(id)
+    }
+
+    /// The values of a field of an identity's reach node: none if it never
+    /// set that field, and more than one if its devices set it at the same
+    /// moment.
+    pub fn reach_values(&self, who: &IdentityId, key: u64) -> &[FieldValue] {
+        let fields = self.reach.get(&reach_node_id(who));
+        fields
+            .and_then(|f| f.get(&key))
+            .map_or(&[], |v| v.as_slice())
     }
 
     /// Every node.
@@ -918,38 +954,46 @@ impl State {
         v
     }
 
-    /// The canonical state record `{0: 13, 1: node records}`.
+    /// The canonical state record `{0: 13, 1: node records}`, sorted by
+    /// node id. The root has no record, and a reach node has one only while
+    /// it has a field to record, holding fields 1 and 5 alone
+    /// (`state.md#canonical-state`).
     pub fn canonical(&self) -> Record {
-        let mut ids: Vec<&NodeId> = self.nodes.keys().collect();
-        ids.sort();
-        let nodes = ids.into_iter().map(|id| {
-            let n = &self.nodes[id];
-            let fields =
-                n.fields
-                    .iter()
-                    .filter(|(_, vs)| !vs.is_empty())
-                    .map(|(k, vs)| {
-                        Record::new().with(1, *k as u32).with(
-                            2,
-                            Value::list(vs.iter().map(|v| {
-                                Record::new().with(1, v.entry).with_opt(2, v.value.clone())
-                            })),
-                        )
-                    });
-            Record::new()
+        fn fields(fields: &BTreeMap<u64, Vec<FieldValue>>) -> Value {
+            let set = fields.iter().filter(|(_, vs)| !vs.is_empty());
+            Value::list(set.map(|(k, vs)| {
+                Record::new().with(1, *k).with(
+                    2,
+                    Value::list(
+                        vs.iter()
+                            .map(|v| Record::new().with(1, v.entry).with_opt(2, v.value.clone())),
+                    ),
+                )
+            }))
+        }
+        let mut records: Vec<(NodeId, Record)> = Vec::new();
+        for (id, n) in &self.nodes {
+            let r = Record::new()
                 .with(1, n.id)
                 .with(2, n.kind.to_value())
                 .with(3, n.parent)
                 .with(4, n.name.as_str())
-                .with(5, Value::list(fields))
+                .with(5, fields(&n.fields))
                 .with(6, n.deleted)
                 .with(7, n.position_writer)
                 .with(8, n.delete_conflict)
-                .with(9, n.creator)
-        });
+                .with(9, n.creator);
+            records.push((*id, r));
+        }
+        for (id, f) in &self.reach {
+            if f.values().any(|vs| !vs.is_empty()) {
+                records.push((*id, Record::new().with(1, *id).with(5, fields(f))));
+            }
+        }
+        records.sort_by_key(|(id, _)| *id);
         Record::new()
             .with(0, CANONICAL_STATE as u32)
-            .with(1, Value::list(nodes))
+            .with(1, Value::list(records.into_iter().map(|(_, r)| r)))
     }
 
     /// `BLAKE3` of the canonical state's encoding: a checkpoint's state

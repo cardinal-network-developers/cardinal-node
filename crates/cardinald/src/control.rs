@@ -333,7 +333,15 @@ async fn handle(d: &Arc<Daemon>, req: &Value) -> anyhow::Result<Value> {
         }
         "group-remove" => crate::groups::remove(d, arg(req, "group")?, arg(req, "who")?),
         "group-leave" => crate::groups::leave(d, arg(req, "group")?),
-        "group-join" => crate::groups::join(d, arg(req, "group")?).await,
+        "group-join" => {
+            let reach = req.get("reach").and_then(|v| v.as_bool());
+            crate::groups::join(d, arg(req, "group")?, reach).await
+        }
+        "group-reach" => {
+            let share = req.get("share").and_then(|v| v.as_bool());
+            let share = share.ok_or_else(|| anyhow::anyhow!("say whether to share: share"))?;
+            crate::groups::set_reach(d, arg(req, "group")?, share).await
+        }
         "group-decline" => crate::groups::decline(d, arg(req, "group")?),
         "group-members" => crate::groups::members(d, arg(req, "group")?),
         "group-set" => {

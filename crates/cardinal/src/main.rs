@@ -369,6 +369,20 @@ enum GroupCmd {
     Join {
         /// The group, by name or id.
         group: String,
+        /// Let its members have where your host is. Asked for only when
+        /// someone in the group is not a contact of yours.
+        #[arg(long, conflicts_with = "keep_host")]
+        share_host: bool,
+        /// Do not: they reach you only through someone in touch with both.
+        #[arg(long)]
+        keep_host: bool,
+    },
+    /// Whether a group's members have where your host is: `share` or `keep`.
+    Reach {
+        /// The group, by name or id.
+        group: String,
+        /// `share` or `keep`.
+        setting: String,
     },
     /// Say no to a group offered to you.
     Decline {
@@ -1659,6 +1673,20 @@ async fn client(cmd: Cmd) -> anyhow::Result<()> {
                     printable(o["name"].as_str().unwrap_or("")),
                     &o["group"].as_str().unwrap_or("")[..16]
                 );
+                if o["reach"]["ask"] == true {
+                    let list = |v: &serde_json::Value| -> String {
+                        let all = v.as_array().into_iter().flatten();
+                        let all: Vec<String> =
+                            all.map(|x| printable(x.as_str().unwrap_or(""))).collect();
+                        all.join(", ")
+                    };
+                    println!(
+                        "    Not contacts of yours in it: {}. Joining with --share-host tells \
+                         them where your host is ({}); with --keep-host it does not.",
+                        list(&o["reach"]["who"]),
+                        list(&o["reach"]["what"]),
+                    );
+                }
             }
             Ok(())
         }
@@ -1667,7 +1695,26 @@ async fn client(cmd: Cmd) -> anyhow::Result<()> {
                 GroupCmd::Create { name, people } => {
                     json!({"cmd": "group-create", "name": name, "people": people})
                 }
-                GroupCmd::Join { group } => json!({"cmd": "group-join", "group": group}),
+                GroupCmd::Join {
+                    group,
+                    share_host,
+                    keep_host,
+                } => {
+                    let reach = match (*share_host, *keep_host) {
+                        (true, _) => Some(true),
+                        (_, true) => Some(false),
+                        _ => None,
+                    };
+                    json!({"cmd": "group-join", "group": group, "reach": reach})
+                }
+                GroupCmd::Reach { group, setting } => {
+                    let share = match setting.as_str() {
+                        "share" => true,
+                        "keep" => false,
+                        _ => anyhow::bail!("say share or keep"),
+                    };
+                    json!({"cmd": "group-reach", "group": group, "share": share})
+                }
                 GroupCmd::Decline { group } => json!({"cmd": "group-decline", "group": group}),
                 GroupCmd::Leave { group } => json!({"cmd": "group-leave", "group": group}),
                 GroupCmd::Add {

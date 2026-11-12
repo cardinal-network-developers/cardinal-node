@@ -415,7 +415,7 @@ async fn accept_exchange(
         .core()
         .accept_relationship(&genesis, &invitation.inviter)?;
     d.invited_to(s, space);
-    mailbox::write_reach(d, &space).await?;
+    mailbox::say_reach(d, &space, true).await?;
     net::reconcile(d, s, space).await?;
     record_contact(d, &invitation.inviter, petname, &space, regard, Some(met))?;
     mailbox::met(d, &space, &invitation.inviter);
@@ -496,7 +496,7 @@ pub async fn serve(d: &Arc<Daemon>, s: &Session, mut st: Stream) -> anyhow::Resu
     }
     let (space, genesis) = d.core().create_relationship(&them)?;
     d.invited_to(s, space);
-    mailbox::write_reach(d, &space).await?;
+    mailbox::say_reach(d, &space, true).await?;
     send(&mut st, &ContactMessage::Genesis(genesis)).await?;
     let done = tokio::time::timeout(EXCHANGE_WITHIN, receive(&mut st)).await;
     if matches!(done, Ok(Ok(Some(ContactMessage::Done)))) {
@@ -1200,8 +1200,8 @@ fn confirm(d: &Arc<Daemon>, space: SpaceId, member: [u8; 32]) {
 fn reachable(d: &Daemon, contact: &ContactRecord, text: &str) -> bool {
     let core = d.core();
     let me = core.identity.as_ref().map(|i| i.id());
-    let hosted = me.is_some_and(|me| core.reach_of(&contact.space, &me).is_some());
-    let theirs = core.reach_of(&contact.space, &contact.identity).is_some();
+    let hosted = me.is_some_and(|me| !core.reach_of(&contact.space, &me).is_empty());
+    let theirs = !core.reach_of(&contact.space, &contact.identity).is_empty();
     contact.connects() || (theirs && (hosted || text.len() <= LEFT_AT_A_HOST))
 }
 

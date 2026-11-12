@@ -267,6 +267,118 @@ fn a_group_can_be_declined() {
     assert_eq!(no["ok"], false, "{no}");
 }
 
+/// What a group or an offer says of this person's reach node there.
+fn reach_in(d: &Dev, group: &str) -> Value {
+    let all = ask(d, json!({"cmd": "groups"}));
+    let both = ["groups", "offers"].map(|k| all[k].as_array().cloned().unwrap_or_default());
+    let found = both.iter().flatten().find(|g| g["group"] == group);
+    found.unwrap_or_else(|| panic!("no group {group} in {all}"))["reach"].clone()
+}
+
+/// A reach node tells every member where its person's hosts are
+/// (`hosts.md#telling-others-where-to-reach-you`). Ana makes a group of Bo
+/// and Cy, who are not each other's contacts. Bo has no host, so there is
+/// nothing to ask him. Cy has one: his software asks before it tells Bo
+/// where it is, and does as he says.
+#[test]
+fn nobody_learns_where_a_host_is_unasked() {
+    let root = tempfile::tempdir().unwrap();
+    let ana = person(root.path(), "ana");
+    let bo = person(root.path(), "bo");
+    let cy = person(root.path(), "cy");
+    let at = format!("127.0.0.1:{}", cy.port);
+    cy.cli(&["host", "--address", &at]);
+    meet(&ana, &bo, "Bo");
+    meet(&ana, &cy, "Cy");
+    let made = ask(
+        &ana,
+        json!({"cmd": "group-create", "name": "Club", "people": ["Bo", "Cy"]}),
+    );
+    let g = made["group"].as_str().unwrap().to_owned();
+    for d in [&bo, &cy] {
+        wait("the offer arrives", 30, || {
+            offers(d).iter().any(|o| o["name"] == "Club")
+        });
+    }
+
+    // Bo has nothing to tell: he joins, and his reach node says nowhere.
+    let r = reach_in(&bo, &g);
+    assert_eq!(r["ask"], false, "{r}");
+    assert_eq!(r["who"], json!(["Cy"]), "{r}");
+    assert_eq!(r["what"], json!([]), "{r}");
+    ask(&bo, json!({"cmd": "group-join", "group": g}));
+    wait("bo joined", 10, || {
+        groups(&bo).iter().any(|x| x["name"] == "Club")
+    });
+    assert_eq!(reach_in(&bo, &g)["shared"], false);
+
+    // Cy is asked: who would learn, and what.
+    let r = reach_in(&cy, &g);
+    assert_eq!(r["ask"], true, "{r}");
+    assert_eq!(r["who"], json!(["Bo"]), "{r}");
+    assert_eq!(r["what"], json!([at]), "{r}");
+    assert_eq!(r["shared"], false, "{r}");
+    let no = reply(&cy, &json!({"cmd": "group-join", "group": g}));
+    assert_eq!(no["ok"], false, "{no}");
+    let why = no["error"].as_str().unwrap_or("");
+    assert!(why.contains("Bo") && why.contains(&at), "{no}");
+    assert!(groups(&cy).is_empty(), "joined without an answer");
+    assert!(offers(&cy).iter().any(|o| o["name"] == "Club"));
+    // Nothing of Cy's went into it.
+    std::thread::sleep(std::time::Duration::from_secs(2));
+    assert!(groups(&cy).is_empty());
+
+    // He says no, and joins: the others have no host of his from the group.
+    ask(
+        &cy,
+        json!({"cmd": "group-join", "group": g, "reach": false}),
+    );
+    wait("cy joined", 10, || {
+        groups(&cy).iter().any(|x| x["name"] == "Club")
+    });
+    let r = reach_in(&cy, &g);
+    assert_eq!(
+        (&r["shared"], &r["ask"]),
+        (&json!(false), &json!(false)),
+        "{r}"
+    );
+    // What his devices do unasked leaves it so.
+    ask(&cy, json!({"cmd": "say", "group": g, "text": "hello"}));
+    wait("cy's message reaches bo through ana", 30, || {
+        said(&bo, &g).contains(&"Cy: hello".to_owned())
+    });
+    std::thread::sleep(std::time::Duration::from_secs(3));
+    assert_eq!(reach_in(&cy, &g)["shared"], false);
+
+    // He changes his mind, and back.
+    ask(
+        &cy,
+        json!({"cmd": "group-reach", "group": g, "share": true}),
+    );
+    assert_eq!(reach_in(&cy, &g)["shared"], true);
+    ask(
+        &cy,
+        json!({"cmd": "group-reach", "group": g, "share": false}),
+    );
+    assert_eq!(reach_in(&cy, &g)["shared"], false);
+    // Bo has no host to tell anyone of.
+    let no = reply(
+        &bo,
+        &json!({"cmd": "group-reach", "group": g, "share": true}),
+    );
+    assert_eq!(no["ok"], false, "{no}");
+
+    // Ana's contacts have a host of hers already, if she has one: nothing
+    // is asked of her, and there is nothing for her to withhold.
+    let r = reach_in(&ana, &g);
+    assert_eq!((&r["ask"], &r["who"]), (&json!(false), &json!([])), "{r}");
+    let no = reply(
+        &ana,
+        &json!({"cmd": "group-reach", "group": g, "share": false}),
+    );
+    assert_eq!(no["ok"], false, "{no}");
+}
+
 fn standing(d: &Dev) -> Value {
     ask(d, json!({"cmd": "call"}))["call"]["state"].clone()
 }

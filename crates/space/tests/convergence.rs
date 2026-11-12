@@ -3,9 +3,12 @@
 //! state as computing from scratch.
 
 use cardinal_crypto::{HybridKeyPair, RecoveryPhrase};
+use cardinal_encoding::Value;
 use cardinal_identity::{Created, DeviceKeys, IdentityLog, Power};
 use cardinal_space::files::{self, Content};
-use cardinal_space::{NodeId, NodeKind, Policy, Profile, Space, SpaceOp, State, ROOT};
+use cardinal_space::{
+    reach_node_id, NodeId, NodeKind, Policy, Profile, Space, SpaceOp, State, ROOT,
+};
 use proptest::prelude::*;
 
 struct Rng(u64);
@@ -33,7 +36,8 @@ impl Rng {
 
 const NAMES: [&str; 4] = ["a", "b", "a.txt", "c"];
 
-fn random_ops(rng: &mut Rng, st: &State) -> Vec<SpaceOp> {
+fn random_ops(rng: &mut Rng, st: &State, me: &[u8; 32]) -> Vec<SpaceOp> {
+    let reach = reach_node_id(me);
     let mut nodes: Vec<NodeId> = st.nodes().map(|n| n.id).collect();
     nodes.sort();
     let folders: Vec<NodeId> = std::iter::once(ROOT)
@@ -54,7 +58,7 @@ fn random_ops(rng: &mut Rng, st: &State) -> Vec<SpaceOp> {
         let folder = folders[rng.below(folders.len())];
         let name = NAMES[rng.below(NAMES.len())];
         let content = Content::Inline(vec![rng.below(256) as u8]);
-        let op = match rng.below(20) {
+        let op = match rng.below(23) {
             0..=4 => files::create_folder(folder, name),
             5..=8 => files::create_file(folder, name, &content, 0o644, None),
             9..=12 if !filez.is_empty() => {
@@ -65,6 +69,19 @@ fn random_ops(rng: &mut Rng, st: &State) -> Vec<SpaceOp> {
             }
             16..=17 if !nodes.is_empty() => SpaceOp::delete(nodes[rng.below(nodes.len())]),
             18 if !nodes.is_empty() => SpaceOp::restore(nodes[rng.below(nodes.len())]),
+            // this person's reach node, which every replica here writes:
+            // set, set beside, cleared, and named in a way that puts the
+            // whole entry out of the state
+            20..=22 => {
+                let key = 1 + rng.below(2) as u64;
+                let value = Some(Value::from(rng.below(256) as u64));
+                match rng.below(8) {
+                    0 => SpaceOp::set(reach, key, None),
+                    1 => SpaceOp::set_beside(reach, key, value),
+                    2 => SpaceOp::delete(reach),
+                    _ => SpaceOp::set(reach, key, value),
+                }
+            }
             _ => files::create_folder(ROOT, name),
         };
         ops.push(op);
@@ -140,7 +157,7 @@ fn run(seed: u64, replicas: usize, steps: usize) -> [u64; 5] {
                 deliver(&mut rng, a, b, &encryption);
             }
         } else {
-            let ops = random_ops(&mut rng, spaces[r].state());
+            let ops = random_ops(&mut rng, spaces[r].state(), &log.id());
             spaces[r]
                 .write(&log, &devices[r].signing, ops, None)
                 .unwrap();
@@ -177,10 +194,14 @@ fn run(seed: u64, replicas: usize, steps: usize) -> [u64; 5] {
     }
     let st = spaces[0].state();
     let stats: Vec<_> = spaces.iter().map(|s| s.stats()).collect();
+    let reach_conflicts = (1..=2)
+        .filter(|k| st.reach_values(&log.id(), *k).len() > 1)
+        .count();
     [
         st.nodes()
             .filter(|n| n.fields.values().any(|v| v.len() > 1))
-            .count() as u64,
+            .count() as u64
+            + reach_conflicts as u64,
         st.nodes().filter(|n| n.delete_conflict).count() as u64,
         st.nodes().filter(|n| n.deleted).count() as u64,
         stats.iter().map(|s| s.appended).sum(),
