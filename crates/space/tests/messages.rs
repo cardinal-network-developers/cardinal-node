@@ -259,6 +259,23 @@ fn a_reply_to_nothing_known_is_not_taken() {
     let m = said(&p.b)[0].id;
     p.bo_writes(vec![relationship::create_reply(c, "back", Some(m))]);
     assert_eq!(said(&p.a)[1].reply_to, Some(m));
+    // The root is only ever a parent: a reply to it names it otherwise,
+    // and is not taken (`state.md#nodes`). Nor is an edit that turns a
+    // reply into one.
+    p.ana_writes(vec![relationship::create_reply(
+        c,
+        "to the root",
+        Some(cardinal_space::ROOT),
+    )]);
+    let last = *p.b.dag().log_order().last().unwrap();
+    assert!(p.b.validity().is_valid(&last) && !p.b.state().is_accepted(&last));
+    let back = said(&p.a)[1].id;
+    let root = cardinal_encoding::Value::from(cardinal_space::ROOT);
+    p.bo_writes(vec![SpaceOp::set(back, 3, Some(root))]);
+    let last = *p.a.dag().log_order().last().unwrap();
+    assert!(!p.a.state().is_accepted(&last));
+    assert_eq!(said(&p.a).len(), 2);
+    assert_eq!(said(&p.a)[1].reply_to, Some(m));
 }
 
 /// Carol introduces someone to Bo in their space. Bo may answer it, with an

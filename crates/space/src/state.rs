@@ -142,14 +142,16 @@ fn node_field(profile: Profile, kind: NodeKind) -> Option<u64> {
     }
 }
 
-/// Whether a value in a field that holds a node id names a node that is known.
+/// Whether a value in a field that holds a node id names a node that is
+/// known. The root is not one to name here: it is only ever a parent
+/// (`state.md#nodes`).
 fn names_known(value: Option<&Value>, known: impl Fn(&NodeId) -> bool) -> bool {
     match value {
         None => true,
         Some(v) => v
             .as_bytes()
             .and_then(|b| NodeId::try_from(b).ok())
-            .is_some_and(|n| known(&n)),
+            .is_some_and(|n| n != ROOT && known(&n)),
     }
 }
 

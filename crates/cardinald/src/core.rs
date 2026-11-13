@@ -322,6 +322,14 @@ impl Telling {
             }
     }
 
+    /// Whether software empties the reach node now: the person said no and
+    /// it names a host all the same, as it can where another of their
+    /// devices set it before their answer reached it. Setting an empty
+    /// list tells nobody anything, and needs no asking.
+    pub fn empties_unasked(&self) -> bool {
+        self.joined && self.shared && self.answer == Some(false)
+    }
+
     /// Whether software keeps current what the reach node says: a token
     /// that has gone, an address that changed. That needs no asking where
     /// the person agreed to what is there, which they have not while
@@ -2739,7 +2747,15 @@ mod tests {
         // not even once everyone there is his contact
         bo.knows(&cy, "Cy");
         let t = bo.core.telling(&g);
-        assert!(t.who.is_empty() && !t.sets_unasked());
+        assert!(t.who.is_empty() && !t.sets_unasked() && !t.empties_unasked());
+        // Another of his devices, which had not heard his answer yet,
+        // names his host there. The answer stands: it is emptied again,
+        // by whichever device sees both.
+        bo.says_reach(&g, true);
+        let t = bo.core.telling(&g);
+        assert!(t.shared && t.empties_unasked() && !t.keeps_current());
+        bo.says_reach(&g, false);
+        assert!(!bo.core.telling(&g).empties_unasked());
         // and it survives a restart: it is in his account, not in memory
         bo.restarts();
         assert_eq!(bo.core.names_hosts(&g), Some(false));
@@ -2752,6 +2768,7 @@ mod tests {
         bo.says_reach(&g, true);
         let t = bo.core.telling(&g);
         assert!(t.shared && !t.sets_unasked() && t.keeps_current());
+        assert!(!t.empties_unasked());
 
         // Taken back, he has not been asked: among contacts software says
         // it unasked, as it does where nobody was ever asked.

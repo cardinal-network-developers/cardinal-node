@@ -369,21 +369,24 @@ below, each under its section.
   entry, which no longer exists.) What the comparison cannot catch is a
   wrong reading of an op, since the rules program is given the same
   reading: which op is a reader's is tested case by case instead.
-- **What an entry costs** (`tests/cost.rs`, optimized, on one laptop). In a
-  two-person space, taking an entry that builds on everything held (opening
-  it, checking its signature, judging it, applying it) took about 50 µs at
-  the 200th entry, the 2,000th and the 20,000th alike. Running the whole
-  program once, which is what every entry in a shared space cost before,
-  took 13 ms at 100 entries, 91 ms at 200, 0.4 s at 400 and 2.0 s at 800.
-  The graph keeps its log order by putting each entry in its place, where
-  it used to work the order out again whenever an entry did not descend
-  from every head. An entry held to be invalid is a head for good, since
-  nobody builds on it, so with one in the space every later entry paid
-  for that: 92 µs at the 200th and 732 µs at the 2,000th, against 62 µs
-  and 51 µs now, and 55 µs at the 20,000th. What still grows with the space
-  is an entry written at the same time as another: it recomputes the
-  state ([State](#state-specstatemd-specprofilesmd)), 0.6 ms at 200
-  entries, 9 ms at 2,000 and 127 ms at 20,000.
+- **What an entry costs** (`tests/cost.rs`, optimized, on one laptop, three
+  runs after ids came to cover the signer and nonces the whole signed
+  object). In a two-person space, taking an entry that builds on
+  everything held (opening it, checking its signature, judging it,
+  applying it) took 61 to 67 µs at the 200th entry, 52 to 60 µs at the
+  2,000th and 60 to 66 µs at the 20,000th: about 60 µs, and the same at
+  any size. It was about 50 µs when an id was the hash of the body alone.
+  Running the whole program once, which is what every entry in a shared
+  space cost before, took 14 ms at 100 entries, 105 ms at 200, 0.4 s at
+  400 and 1.9 s at 800. The graph keeps its log order by putting each
+  entry in its place, where it used to work the order out again whenever
+  an entry did not descend from every head. An entry held to be invalid
+  is a head for good, since nobody builds on it, so with one in the space
+  every later entry used to pay for that; now it takes 67 µs at the 200th,
+  72 µs at the 2,000th and 70 µs at the 20,000th. What still grows with
+  the space is an entry written at the same time as another: it
+  recomputes the state ([State](#state-specstatemd-specprofilesmd)),
+  0.7 ms at 200 entries, 10 ms at 2,000 and 145 ms at 20,000.
 - **An entry signed again** has the same id and another sealed form. The
   first form to arrive is opened, judged and applied; a later one is
   opened and checked like any sealed entry, kept, and offered in
@@ -1190,9 +1193,11 @@ asks for around that is not built yet.
     arrived. A device that receives the emptied reach node before it
     receives the answer, in a space where everyone is a contact and the
     person was never asked, takes it for a reach node set for want of a
-    host, and fills it in. Chose: the answer is written first; the window
-    is the time between two spaces syncing. A field of the reach node
-    itself would close it.
+    host, and fills it in. Chose: the answer is written first, and a
+    device that finds hosts named where the answer is no empties the
+    reach node again, which needs no asking. So the hosts can be named
+    for as long as two spaces take to sync, and are in the history.
+    A field of the reach node itself would close that.
   - **Spec gap: who a yes covers.** A yes given while the reach node names
     no host (there was none) is an answer for the members there were.
     Chose: once there is a host, software names it only if nobody who is

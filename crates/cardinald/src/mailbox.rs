@@ -717,7 +717,12 @@ pub async fn write_reach(d: &Arc<Daemon>, space: &SpaceId) -> anyhow::Result<()>
     // One at a time: two that both found none would each register a token and
     // write, and leave a token that leads nowhere.
     let _one = d.mailbox.reaching.lock().await;
-    if !d.core().telling(space).sets_unasked() {
+    let t = d.core().telling(space);
+    if t.empties_unasked() {
+        // The person said no, and another of their devices had not heard.
+        return say_reach_locked(d, space, false).await;
+    }
+    if !t.sets_unasked() {
         return Ok(());
     }
     say_reach_locked(d, space, true).await
