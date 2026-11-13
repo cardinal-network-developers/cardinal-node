@@ -350,6 +350,26 @@ fn ed25519_vectors() {
         assert!(verify(&a_bytes, b"Zcash", &sig).is_ok());
         zip215.push(json!({ "public_key": hx(a_bytes), "message": hx(b"Zcash"), "signature": hx(sig), "valid": true, "note": "a key of mixed order" }));
     }
+    // An R with a part of small order added to it, under an ordinary key:
+    // eight times R is eight times the honest R, so the cofactored
+    // equation holds, and the equation without the cofactor fails.
+    for torsion in EIGHT_TORSION.iter().skip(1) {
+        let a_bytes = holder.public_key();
+        let r = Scalar::from_bytes_mod_order(fixed32("ed25519 mixed-order nonce"));
+        let r_point = EdwardsPoint::mul_base(&r) + torsion;
+        assert!(!r_point.is_small_order() && !r_point.is_torsion_free());
+        let r_bytes = r_point.compress().to_bytes();
+        let s = r + challenge(&r_bytes, &a_bytes, b"Zcash") * secret;
+        let mut sig = [0u8; 64];
+        sig[..32].copy_from_slice(&r_bytes);
+        sig[32..].copy_from_slice(s.as_bytes());
+        assert!(verify(&a_bytes, b"Zcash", &sig).is_ok());
+        let a_point = EdwardsPoint::mul_base(&secret);
+        let k = challenge(&r_bytes, &a_bytes, b"Zcash");
+        let strict = EdwardsPoint::mul_base(&s) == r_point + k * a_point;
+        assert!(!strict, "only the cofactored equation accepts it");
+        zip215.push(json!({ "public_key": hx(a_bytes), "message": hx(b"Zcash"), "signature": hx(sig), "valid": true, "note": "R with a part of small order, under a key that is not of small order" }));
+    }
     // Invalid: S not reduced (S = l), and S + l for a real signature.
     let l: [u8; 32] =
         hex::decode("edd3f55c1a631258d69cf7a2def9de1400000000000000000000000000000010")
@@ -385,7 +405,7 @@ fn ed25519_vectors() {
     check_or_write(
         "ed25519.json",
         json!({
-            "description": "Ed25519 (RFC 8032) signing and ZIP-215 verification with its one departure (crypto.md#signature-verification). 'zip215' cases MUST verify exactly as 'valid' says. The first 196 are ZIP-215's own edge cases: every pair of small-order encodings (the eight canonical torsion points and six non-canonical encodings) for A and R with S = 0, message 'Zcash'. ZIP-215 alone accepts them all; each has a key of small order, which signs nothing, so each is refused. The next 14 have R of small order under an ordinary key, and the 7 after them a key of mixed order: valid, and refused by stricter rules. 'signed_object' shows encoding.md#signed-objects: id = BLAKE3 of the encoding of {1: body, 2: keys}, each signature over \"cardinal sig 1\" || id, sorted by key; the same body signed by one key alone has another id.",
+            "description": "Ed25519 (RFC 8032) signing and ZIP-215 verification with its one departure (crypto.md#signature-verification). 'zip215' cases MUST verify exactly as 'valid' says. The first 196 are ZIP-215's own edge cases: every pair of small-order encodings (the eight canonical torsion points and six non-canonical encodings) for A and R with S = 0, message 'Zcash'. ZIP-215 alone accepts them all; each has a key of small order, which signs nothing, so each is refused. The next 14 have R of small order under an ordinary key, in each of its encodings, six of them not canonical; the 7 after them a key of mixed order; and the 7 after those an R with a part of small order under an ordinary key, which only the cofactored equation accepts: all valid, and refused by stricter rules. 'signed_object' shows encoding.md#signed-objects: id = BLAKE3 of the encoding of {1: body, 2: keys}, each signature over \"cardinal sig 1\" || id, sorted by key; the same body signed by one key alone has another id.",
             "signing": signing,
             "signed_object": signed_object,
             "zip215": zip215,

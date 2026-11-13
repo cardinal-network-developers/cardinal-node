@@ -1,5 +1,5 @@
 {
-  "description": "Ed25519 (RFC 8032) signing and ZIP-215 verification with its one departure (crypto.md#signature-verification). 'zip215' cases MUST verify exactly as 'valid' says. The first 196 are ZIP-215's own edge cases: every pair of small-order encodings (the eight canonical torsion points and six non-canonical encodings) for A and R with S = 0, message 'Zcash'. ZIP-215 alone accepts them all; each has a key of small order, which signs nothing, so each is refused. The next 14 have R of small order under an ordinary key, and the 7 after them a key of mixed order: valid, and refused by stricter rules. 'signed_object' shows encoding.md#signed-objects: id = BLAKE3 of the encoding of {1: body, 2: keys}, each signature over \"cardinal sig 1\" || id, sorted by key; the same body signed by one key alone has another id.",
+  "description": "Ed25519 (RFC 8032) signing and ZIP-215 verification with its one departure (crypto.md#signature-verification). 'zip215' cases MUST verify exactly as 'valid' says. The first 196 are ZIP-215's own edge cases: every pair of small-order encodings (the eight canonical torsion points and six non-canonical encodings) for A and R with S = 0, message 'Zcash'. ZIP-215 alone accepts them all; each has a key of small order, which signs nothing, so each is refused. The next 14 have R of small order under an ordinary key, in each of its encodings, six of them not canonical; the 7 after them a key of mixed order; and the 7 after those an R with a part of small order under an ordinary key, which only the cofactored equation accepts: all valid, and refused by stricter rules. 'signed_object' shows encoding.md#signed-objects: id = BLAKE3 of the encoding of {1: body, 2: keys}, each signature over \"cardinal sig 1\" || id, sorted by key; the same body signed by one key alone has another id.",
   "signed_object": {
     "body": "150010015b7369676e656420626f6479",
     "encoding": "1d0008018201150010015b7369676e656420626f64790214150182021895c6c2ac24439b77c5fc018903facb407b351aed11830167e6061db307f6630282047491469c000f8a1f2cb9feefa6fec9a3e4b435c5c4529ca5d72796d9847d9541b130e4ba9763e929d399ac5e15441eefb503489a4bda2510c67949180fb2cf0615018202e0bef0617e40942eaa1d641397e991e2d0896acd20b33cbdb3d4cdee470040e90282045e8c26295ea9106d16ef714b982fc1a30aee7d30471e270bd66b289e897af1f7e40756d73df8e44cb030fce455671c27cff1f7ec8e60c3628ba6f6d62d05d809",
@@ -1552,6 +1552,55 @@
       "note": "a key of mixed order",
       "public_key": "467d8fe2b4e2f30e5400266640f64fd70cc5046f53020055ecd70c36e867d31a",
       "signature": "0fa69267dcfdc482d9e80f4d4cbb6d96f992a5ce946a188bc22dc12c33620c4acb9996313914fb97a8854804647c1a07c3f9d02f5f678e11856c87ca4665940e",
+      "valid": true
+    },
+    {
+      "message": "5a63617368",
+      "note": "R with a part of small order, under a key that is not of small order",
+      "public_key": "75f98cdf4bfe21b2cd7216fd681411f19c215f77c565b58bfc085f05fd7505f9",
+      "signature": "5ade8d0a3fbee50c8b44f46478cadba54a469a2e2a13a148353f0e5d039da8a930105647577264f136d08f85a0e042e4ebfa9209cb8fdd8cb3c345154e99570a",
+      "valid": true
+    },
+    {
+      "message": "5a63617368",
+      "note": "R with a part of small order, under a key that is not of small order",
+      "public_key": "75f98cdf4bfe21b2cd7216fd681411f19c215f77c565b58bfc085f05fd7505f9",
+      "signature": "bf38e04f8ec573c545f9ea95dcbb24c9ef478b4fee12921bfca8f7c6fc4fddc225ac91ea2c77eafd46bda7b39c40675a1f8a2ee229f9a6ffdf3f4d9aebc34302",
+      "valid": true
+    },
+    {
+      "message": "5a63617368",
+      "note": "R with a part of small order, under a key that is not of small order",
+      "public_key": "75f98cdf4bfe21b2cd7216fd681411f19c215f77c565b58bfc085f05fd7505f9",
+      "signature": "a9cb1f6219b46d649502bc2dddeb711d6a300de97b90359813e34b7c35a62fe43e2874bc20827ee0fb79c5114dd4239d602e967d49d387f46cd195a338f78d03",
+      "valid": true
+    },
+    {
+      "message": "5a63617368",
+      "note": "R with a part of small order, under a key that is not of small order",
+      "public_key": "75f98cdf4bfe21b2cd7216fd681411f19c215f77c565b58bfc085f05fd7505f9",
+      "signature": "de596d9823023b7d2617f0b2b3449269066d5a316b95e7743dd23ed3cc9df3b57879e73407f4e6d65653cd551386b374244b3e0c884f700cd1dc47f20a3aaf04",
+      "valid": true
+    },
+    {
+      "message": "5a63617368",
+      "note": "R with a part of small order, under a key that is not of small order",
+      "public_key": "75f98cdf4bfe21b2cd7216fd681411f19c215f77c565b58bfc085f05fd7505f9",
+      "signature": "932172f5c0411af374bb0b9b8735245ab5b965d1d5ec5eb7cac0f1a2fc625756b4e1c840e9ed6a941a6bf08573d17fc8d797833caed2d7cb4968a59c4e6aae05",
+      "valid": true
+    },
+    {
+      "message": "5a63617368",
+      "note": "R with a part of small order, under a key that is not of small order",
+      "public_key": "75f98cdf4bfe21b2cd7216fd681411f19c215f77c565b58bfc085f05fd7505f9",
+      "signature": "2ec71fb0713a8c3aba06156a2344db3610b874b011ed6de40357083903b0223dcec56616a58d75a3813c28784cd1790da259544d32cab1dabdfe94ce2023cc0b",
+      "valid": true
+    },
+    {
+      "message": "5a63617368",
+      "note": "R with a part of small order, under a key that is not of small order",
+      "public_key": "75f98cdf4bfe21b2cd7216fd681411f19c215f77c565b58bfc085f05fd7505f9",
+      "signature": "4434e09de64b929b6afd43d222148ee295cff216846fca67ec1cb483ca59d01b1df48634586fa5c44e0f8d254394245ee0d7cd579e7ad71fe591c8c0909fa200",
       "valid": true
     },
     {

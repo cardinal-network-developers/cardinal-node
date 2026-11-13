@@ -168,6 +168,14 @@ pub fn set_reach(author: &IdentityId, reach: &[Reach]) -> SpaceOp {
     SpaceOp::set(reach_node_id(author), 1, Some(reach_list(reach)))
 }
 
+/// What the entry holds by which `who` leaves a space: `leave`, and a
+/// `set` of their reach node to an empty list, so that the space stops
+/// naming their hosts to whoever is in it or comes to it later
+/// (`spaces.md#members-and-roles`). A reader may write both.
+pub fn leave_ops(who: &IdentityId) -> Vec<SpaceOp> {
+    vec![SpaceOp::leave(), set_reach(who, &[])]
+}
+
 /// Whether `who` has said where they are reached, if only that it is
 /// nowhere.
 pub fn reach_is_set(state: &State, who: &IdentityId) -> bool {

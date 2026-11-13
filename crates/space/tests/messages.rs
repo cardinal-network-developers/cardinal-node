@@ -104,6 +104,49 @@ fn said(space: &Space) -> Vec<relationship::Message> {
     relationship::messages(space)
 }
 
+/// `state.md#operations`: a node in a place where its kind means nothing
+/// is in the state and is not shown. A message that is not in the
+/// conversation is no message of it, nor is a reaction that is not under a
+/// message a reaction, nor a second conversation inside the first one a
+/// conversation.
+#[test]
+fn what_is_out_of_place_is_kept_and_not_shown() {
+    use cardinal_space::{NodeKind, ROOT};
+    let mut p = relationship_of(person(61, 0), person(62, 0));
+    let c = p.c;
+    p.ana_writes(vec![relationship::create_message(c, "in its place")]);
+    let m = said(&p.b)[0].id;
+    let record = cardinal_encoding::Record::new;
+    let odd = vec![
+        // a message at the top, and one under a message
+        relationship::create_message(ROOT, "at the top"),
+        relationship::create_message(m, "under a message"),
+        // a reaction in the conversation, not under a message
+        relationship::create_reaction(c, "!"),
+        // a conversation inside the conversation, and a kind nobody knows
+        SpaceOp::create(
+            NodeKind::Uint(relationship::CONVERSATION),
+            c,
+            "inner",
+            record(),
+        ),
+        SpaceOp::create(NodeKind::Uint(200), c, "new", record().with(1, "text")),
+    ];
+    let before = p.b.state().len();
+    p.bo_writes(odd);
+    for space in [&p.a, &p.b] {
+        let last = *space.dag().log_order().last().unwrap();
+        assert!(space.validity().is_valid(&last) && space.state().is_accepted(&last));
+        assert_eq!(space.state().len(), before + 5, "kept");
+        let all = said(space);
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].text, "in its place");
+        assert!(all[0].reactions.is_empty());
+        assert_eq!(relationship::conversation(space), Some(c));
+    }
+    assert_eq!(p.a.state().canonical(), p.b.state().canonical());
+}
+
 #[test]
 fn a_reply_names_what_it_answers() {
     let mut p = relationship_of(person(41, 0), person(42, 0));

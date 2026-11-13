@@ -391,17 +391,24 @@ impl<'a> Files<'a> {
     /// `name (conflict, <device>).ext`. Display names are unique and
     /// depend only on the state: a node whose own name is `name (2)` keeps
     /// it, and a duplicate `name` then shows as `name (3)`.
+    ///
+    /// Only folders, files and links are listed, and only in a folder: a
+    /// node of a kind this view does not know, or in a place where its
+    /// kind means nothing, such as a file inside a file, is in the state
+    /// and is stepped over here, with whatever is beneath it
+    /// (`state.md#operations`).
     pub fn list(&self, dir: &NodeId) -> Vec<DirEntry> {
         let st = self.space.state();
         let dag = self.space.dag();
-        // A shared folder's root holds the conversation too, which is no
-        // file of it.
-        let shared = self.kinds != Kinds::FILES;
+        let folder = |n: &Node| self.kinds.file_kind(n.kind) == FileKind::Folder;
+        if *dir != ROOT && !(st.node(dir).is_some_and(folder) && self.belongs(dir)) {
+            return Vec::new();
+        }
         let mut kids: Vec<&Node> = st
             .children(dir)
             .into_iter()
             .filter(|n| !n.deleted)
-            .filter(|n| !shared || self.kinds.file_kind(n.kind) != FileKind::Other)
+            .filter(|n| self.kinds.file_kind(n.kind) != FileKind::Other)
             .collect();
         kids.sort_by_key(|n| (n.name.clone(), dag.position(&n.created_in), n.id));
         // The first node of each name keeps it; the others take the next
@@ -462,6 +469,38 @@ impl<'a> Files<'a> {
         }
         out.sort_by(|a, b| a.name.cmp(&b.name));
         out
+    }
+
+    /// Whether a node belongs to this view: a folder, file or link, in the
+    /// root or in folders all the way up. Whether it is deleted is another
+    /// matter ([`shows`](Self::shows)).
+    pub fn belongs(&self, node: &NodeId) -> bool {
+        let st = self.space.state();
+        let Some(n) = st.node(node) else {
+            return false;
+        };
+        if self.kinds.file_kind(n.kind) == FileKind::Other {
+            return false;
+        }
+        let mut up = n.parent;
+        // a parent chain is no longer than the tree is large
+        for _ in 0..=st.len() {
+            if up == ROOT {
+                return true;
+            }
+            let folder = |p: &&Node| self.kinds.file_kind(p.kind) == FileKind::Folder;
+            match st.node(&up).filter(folder) {
+                Some(p) => up = p.parent,
+                None => return false,
+            }
+        }
+        false
+    }
+
+    /// Whether this view shows a node: one that belongs to it, with
+    /// neither it nor anything above it deleted.
+    pub fn shows(&self, node: &NodeId) -> bool {
+        self.belongs(node) && self.space.state().is_visible(node)
     }
 
     /// Resolves a `/`-separated path of display names.

@@ -31,6 +31,10 @@ pub struct Space {
     id: SpaceId,
     profile: Profile,
     policy: Policy,
+    /// Whether the space is public: field 2 of the policy its genesis gave
+    /// it, read once and never again. A `set_policy` does not change it,
+    /// whatever it carries there (`spaces.md#control-operations`).
+    public: bool,
     creator: IdentityId,
     dag: Dag<SpaceEntry>,
     sealed: HashMap<EntryId, SealedEntry>,
@@ -135,6 +139,7 @@ impl Space {
         let mut space = Space {
             id: g.id(),
             profile,
+            public: policy.public,
             policy,
             creator: g.author(),
             dag: Dag::new(),
@@ -243,6 +248,16 @@ impl Space {
     /// The policy from genesis.
     pub fn policy(&self) -> &Policy {
         &self.policy
+    }
+
+    /// Whether the space is public: each entry carries its epoch key in
+    /// the clear. Public is the genesis's to say, for good: this is field
+    /// 2 of the policy in the genesis's `start`, and nothing written later
+    /// changes it (`spaces.md#control-operations`). So whether an entry
+    /// must show its key never depends on which entries have arrived or
+    /// which are valid.
+    pub fn is_public(&self) -> bool {
+        self.public
     }
 
     /// The identity that wrote the genesis. It owns the space only if the
@@ -376,6 +391,15 @@ impl Space {
         })
     }
 
+    /// The members who were added only after every one of the entries
+    /// `since`, and have not left: whoever came to the space after
+    /// something was written in it, and reads it all the same.
+    pub fn added_after(&self, since: &[EntryId]) -> Vec<IdentityId> {
+        let mut late = self.judge.added_after(&self.dag, since);
+        late.retain(|who| !self.has_left(who));
+        late
+    }
+
     /// The successor that stands, if the space has been succeeded
     /// (`spaces.md#ending-a-space`).
     pub fn successor(&self) -> Option<SpaceId> {
@@ -456,10 +480,10 @@ impl Space {
 
     /// A member rejects a sealed entry that carries the epoch key in the
     /// clear where the space is not public, or does not where it is
-    /// (`spaces.md#entries-and-sealed-entries`). The policy is the one the
-    /// genesis gave: `set_policy` is not applied yet (DEVIATIONS.md).
+    /// (`spaces.md#entries-and-sealed-entries`). Public is what the
+    /// genesis said, whatever a `set_policy` has said since.
     fn open_key_belongs(&self, sealed: &SealedEntry) -> Result<(), Error> {
-        if sealed.open_key().is_some() == self.policy.public {
+        if sealed.open_key().is_some() == self.public {
             Ok(())
         } else {
             Err(Error::Mismatch("open key"))
@@ -744,7 +768,7 @@ impl Space {
         }
         let e = b.sign(device)?;
         let id = e.id();
-        let sealed = SealedEntry::seal(&e, &key, None, self.policy.public)?;
+        let sealed = SealedEntry::seal(&e, &key, None, self.public)?;
         self.sealed.insert(id, sealed.clone());
         self.insert_entry(e);
         Ok((id, sealed))
@@ -791,7 +815,7 @@ impl Space {
             b = b.time(t);
         }
         let e = b.sign(device)?;
-        let sealed = SealedEntry::seal(&e, &key, Some(wraps), self.policy.public)?;
+        let sealed = SealedEntry::seal(&e, &key, Some(wraps), self.public)?;
         self.sealed.insert(e.id(), sealed.clone());
         self.insert_entry(e);
         Ok(sealed)
@@ -863,7 +887,7 @@ impl Space {
         }
         let e = b.sign(device)?;
         let id = e.id();
-        let sealed = SealedEntry::seal(&e, &new, Some(wraps), self.policy.public)?;
+        let sealed = SealedEntry::seal(&e, &new, Some(wraps), self.public)?;
         self.keyring.add(new.clone());
         self.sealed.insert(id, sealed.clone());
         self.insert_entry(e);

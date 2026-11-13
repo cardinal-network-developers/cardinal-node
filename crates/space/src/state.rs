@@ -120,31 +120,6 @@ impl Node {
     }
 }
 
-/// What a profile allows to be created where (`profiles.md`).
-pub fn may_place(profile: Profile, kind: NodeKind, parent: Option<NodeKind>) -> bool {
-    let NodeKind::Uint(k) = kind else {
-        return !matches!(profile, Profile::Core(1) | Profile::Core(2));
-    };
-    let p = match parent {
-        None => None,
-        Some(NodeKind::Uint(p)) => Some(p),
-        Some(NodeKind::Named(_)) => Some(u64::MAX),
-    };
-    match profile {
-        // files: folders, files, links, under the root or a folder
-        Profile::Core(2) => (1..=3).contains(&k) && matches!(p, None | Some(1)),
-        // account
-        Profile::Core(1) => match k {
-            1..=6 | 10 => p.is_none(),
-            7 => p == Some(2),
-            8 | 9 => p == Some(3),
-            11 => p == Some(10),
-            _ => false,
-        },
-        _ => true,
-    }
-}
-
 #[derive(Clone, Debug)]
 struct Meta {
     kind: NodeKind,
@@ -439,19 +414,14 @@ impl State {
                     fields,
                     ..
                 } => {
+                    // A kind is not like an op: a `create` is accepted
+                    // whatever its kind and wherever it puts the node
+                    // (`state.md#operations`). What a kind means, and
+                    // where, is for whoever shows the space to say.
                     let names = node_field(self.profile, *kind).map(|f| fields.get(f));
                     let ok = known(parent, &local, &self.registry)
                         && names
-                            .is_none_or(|v| names_known(v, |n| known(n, &local, &self.registry)))
-                        && may_place(
-                            self.profile,
-                            *kind,
-                            if *parent == ROOT {
-                                None
-                            } else {
-                                self.kind_of(parent, &local)
-                            },
-                        );
+                            .is_none_or(|v| names_known(v, |n| known(n, &local, &self.registry)));
                     let owned = fields.get(AUTHOR_OWNED_FIELD).and_then(|v| v.as_uint()) == Some(1);
                     local.insert(
                         derived_id(&id, i),
@@ -487,17 +457,6 @@ impl State {
                         && known(node, &local, &self.registry)
                         && known(parent, &local, &self.registry)
                         && owned_ok(node, &local, &self.registry)
-                        && self.kind_of(node, &local).is_some_and(|k| {
-                            may_place(
-                                self.profile,
-                                k,
-                                if *parent == ROOT {
-                                    None
-                                } else {
-                                    self.kind_of(parent, &local)
-                                },
-                            )
-                        })
                 }
                 SpaceOpBody::Unknown { number } => number.is_none_or(|n| n < 32),
                 _ => true,

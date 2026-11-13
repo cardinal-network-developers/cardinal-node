@@ -1047,6 +1047,29 @@ impl Judge {
         out
     }
 
+    /// The identities added only after every one of `since`: those a valid
+    /// entry after the genesis adds, none of whose valid additions is one
+    /// of `since` or an ancestor of one, and whom the genesis does not
+    /// name. With nothing in `since`, everyone added after the genesis.
+    /// Sorted.
+    pub fn added_after(&self, dag: &Dag<SpaceEntry>, since: &[EntryId]) -> Vec<IdentityId> {
+        let genesis = self.genesis.as_ref().filter(|g| g.formed);
+        let mut out = Vec::new();
+        for (who, adds) in &self.adds_of {
+            if genesis.is_some_and(|g| g.top.contains_key(who)) {
+                continue;
+            }
+            let adds = adds.iter().map(|(m, _)| &self.marks[*m as usize]);
+            let valid: Vec<&EntryId> = adds.filter(|a| self.info[*a].valid).collect();
+            let before = |a: &&EntryId| since.iter().any(|s| dag.is_ancestor_or_self(a, s));
+            if !valid.is_empty() && !valid.iter().any(before) {
+                out.push(*who);
+            }
+        }
+        out.sort();
+        out
+    }
+
     /// Each valid entry that adds a member, with whom it adds.
     pub fn valid_adds(&self) -> Vec<(IdentityId, EntryId)> {
         let mut out = Vec::new();

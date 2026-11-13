@@ -6,7 +6,7 @@ use cardinal_identity::{Created, DeviceKeys, IdentityLog, Power};
 use cardinal_space::account::{self, Retention};
 use cardinal_space::files::{self, Content, FileKind, Files};
 use cardinal_space::relationship;
-use cardinal_space::{Policy, Profile, SealedEntry, Space, SpaceOp, ROOT};
+use cardinal_space::{NodeKind, Policy, Profile, SealedEntry, Space, SpaceOp, ROOT};
 
 struct Person {
     log: IdentityLog,
@@ -394,23 +394,206 @@ fn account_space_devices_and_placements() {
     assert_eq!(spaces[0].space, files_space);
     assert_eq!(spaces[0].placements[0].retention, Retention::OnDemand);
     assert_eq!(spaces[0].placements[0].path.as_deref(), Some("~/Cardinal"));
-    // a placement must be under a space node
-    acct.write(
+    // A placement means something under a space node. One under the root
+    // is in the state like any node, and is nobody's placement; so is a
+    // device under a space node, a space under a device, and a node of a
+    // kind the account has no table for (`state.md#operations`).
+    let before = cardinal_encoding::Value::as_list(acct.state().canonical().get(1).unwrap())
+        .unwrap()
+        .len();
+    let device_node = devs[0].node;
+    let odd = vec![
+        account::create_placement(ROOT, &d0.key(), Retention::Full, None, false),
+        account::create_device(&[7; 32], "nowhere", false, false),
+        account::create_space(&[8; 32], "under a device"),
+        SpaceOp::create(
+            NodeKind::Uint(77),
+            ROOT,
+            "new",
+            cardinal_encoding::Record::new(),
+        ),
+    ];
+    let odd: Vec<SpaceOp> = odd
+        .into_iter()
+        .zip([ROOT, space_node, device_node, ROOT])
+        .map(|(op, parent)| match op.body() {
+            cardinal_space::SpaceOpBody::Create {
+                kind, name, fields, ..
+            } => SpaceOp::create(*kind, parent, name, fields.clone()),
+            _ => unreachable!(),
+        })
+        .collect();
+    let (odd_entry, _) = acct.write_entry(&p.log, &d0.signing, odd, None).unwrap();
+    assert!(acct.state().is_accepted(&odd_entry));
+    let after = cardinal_encoding::Value::as_list(acct.state().canonical().get(1).unwrap())
+        .unwrap()
+        .len();
+    assert_eq!(after, before + 4, "kept, and in the canonical state");
+    // and none of it is shown
+    assert_eq!(account::devices(acct.state()).len(), 2);
+    let spaces = account::spaces(acct.state());
+    assert_eq!(spaces.len(), 1);
+    assert_eq!(spaces[0].placements.len(), 1);
+    assert_eq!(spaces[0].placements[0].retention, Retention::OnDemand);
+}
+
+#[test]
+fn a_node_of_any_kind_anywhere_is_kept_and_not_shown() {
+    // `state.md#operations`: a `create` is accepted whatever its kind and
+    // wherever it puts the node. A node of a kind a device does not know,
+    // or in a place where its kind means nothing, is in the state and in
+    // the canonical state, and software does not show it. Whatever maps a
+    // space to a folder steps over it, at any depth.
+    use cardinal_encoding::{Record, Value};
+    let p = person(24, 0);
+    let d0 = &p.devices[0];
+    let (mut a, genesis) = Space::create(
+        Profile::FILES,
+        Policy::default(),
         &p.log,
         &d0.signing,
-        vec![account::create_placement(
-            ROOT,
-            &d0.key(),
-            Retention::Full,
-            None,
-            false,
-        )],
+        &[p.enc.public_key()],
         None,
     )
     .unwrap();
-    assert!(!acct
-        .state()
-        .is_accepted(acct.dag().log_order().last().unwrap()));
+    let write = |a: &mut Space, ops: Vec<SpaceOp>| {
+        let (id, _) = a.write_entry(&p.log, &d0.signing, ops, None).unwrap();
+        assert!(a.validity().is_valid(&id));
+        assert!(a.state().is_accepted(&id), "not accepted for state");
+        id
+    };
+    let made = files::created_node;
+    let e = write(
+        &mut a,
+        vec![
+            files::create_folder(ROOT, "docs"),
+            files::create_file(ROOT, "notes.txt", &file(b"plain"), 0o644, None),
+        ],
+    );
+    let (docs, notes) = (made(&e, 0), made(&e, 1));
+    let inside = write(
+        &mut a,
+        vec![files::create_file(docs, "a.txt", &file(b"a"), 0o644, None)],
+    );
+    let a_txt = made(&inside, 0);
+    // what this build has no meaning for
+    let content = Record::new().with(files::FILE_CONTENT, file(b"new").to_value());
+    let e = write(
+        &mut a,
+        vec![
+            // a kind it does not know, at the top and in a folder
+            SpaceOp::create(NodeKind::Uint(77), ROOT, "seventy-seven", content.clone()),
+            SpaceOp::create(NodeKind::Uint(77), docs, "in docs", Record::new()),
+            SpaceOp::create(NodeKind::Named([5; 32]), ROOT, "named", Record::new()),
+            // kinds it knows, where they mean nothing: in a file
+            files::create_file(notes, "file in a file", &file(b"x"), 0o644, None),
+            files::create_folder(notes, "folder in a file"),
+        ],
+    );
+    let (unknown, in_docs, in_file, folder_in_file) =
+        (made(&e, 0), made(&e, 1), made(&e, 3), made(&e, 4));
+    // and beneath those, to any depth
+    let e = write(
+        &mut a,
+        vec![
+            files::create_folder(unknown, "under the unknown"),
+            files::create_file(folder_in_file, "deep.txt", &file(b"deep"), 0o644, None),
+            files::create_folder(folder_in_file, "deeper"),
+        ],
+    );
+    let (under_unknown, deep, deeper) = (made(&e, 0), made(&e, 1), made(&e, 2));
+    let e = write(
+        &mut a,
+        vec![files::create_file(
+            deeper,
+            "deepest.txt",
+            &file(b"d"),
+            0o644,
+            None,
+        )],
+    );
+    let deepest = made(&e, 0);
+
+    // All of it is in the state and the canonical state.
+    let records = |s: &Space| {
+        let c = s.state().canonical();
+        Value::as_list(c.get(1).unwrap()).unwrap().len()
+    };
+    assert_eq!(records(&a), 12);
+    for odd in [
+        unknown,
+        in_docs,
+        in_file,
+        folder_in_file,
+        under_unknown,
+        deep,
+        deeper,
+        deepest,
+    ] {
+        assert!(a.state().node(&odd).is_some());
+    }
+    // The folder shows what it showed before.
+    let names = |s: &Space, path: &str| -> Option<Vec<String>> {
+        let list = Files::new(s).list_path(path)?;
+        Some(list.into_iter().map(|e| e.name).collect())
+    };
+    assert_eq!(names(&a, "").unwrap(), ["docs", "notes.txt"]);
+    assert_eq!(names(&a, "docs").unwrap(), ["a.txt"]);
+    let f = Files::new(&a);
+    for shown in [docs, notes, a_txt] {
+        assert!(f.shows(&shown) && f.belongs(&shown));
+    }
+    for odd in [
+        unknown,
+        in_docs,
+        in_file,
+        folder_in_file,
+        under_unknown,
+        deep,
+        deeper,
+        deepest,
+    ] {
+        assert!(!f.shows(&odd) && !f.belongs(&odd));
+        assert!(f.list(&odd).is_empty(), "something is listed in it");
+    }
+    // nothing is reached through a file, by any path
+    assert!(f.resolve("notes.txt/file in a file").is_none());
+    assert!(f.resolve("notes.txt/folder in a file/deep.txt").is_none());
+    assert!(f.resolve("seventy-seven").is_none());
+    assert_eq!(f.list_path("notes.txt").unwrap(), []);
+    drop(f);
+
+    // A move is accepted wherever it puts a node, too. A folder moved into
+    // a file is not shown, with everything in it; moved back, it is.
+    write(&mut a, vec![SpaceOp::mv(docs, notes, "docs")]);
+    assert_eq!(names(&a, "").unwrap(), ["notes.txt"]);
+    let f = Files::new(&a);
+    assert!(!f.shows(&docs) && !f.shows(&a_txt));
+    assert!(f.resolve("notes.txt/docs/a.txt").is_none());
+    drop(f);
+    write(&mut a, vec![SpaceOp::mv(docs, ROOT, "docs")]);
+    assert_eq!(names(&a, "docs").unwrap(), ["a.txt"]);
+    // and something shown can be moved out of where it meant nothing
+    write(&mut a, vec![SpaceOp::mv(deep, docs, "deep.txt")]);
+    assert_eq!(names(&a, "docs").unwrap(), ["a.txt", "deep.txt"]);
+    assert_eq!(records(&a), 12);
+
+    // A device that takes it all at once computes the same state, and one
+    // that works it out from scratch does too.
+    let mut b = Space::open_genesis(&genesis, &[&p.enc], Some(p.log.state())).unwrap();
+    sync(&a, &mut b, &p.enc);
+    assert_eq!(b.state().canonical(), a.state().canonical());
+    let full = cardinal_space::State::compute(Profile::FILES, a.dag(), &a.validity().valid);
+    assert_eq!(full.canonical(), a.state().canonical());
+    assert_eq!(names(&b, "docs").unwrap(), ["a.txt", "deep.txt"]);
+
+    // An op the profile does not define is another matter: nobody can
+    // apply an op they do not know, and the entry stays out of the state.
+    let unknown_op = SpaceOp::from_record(Record::new().with(0, 40u32));
+    let (id, _) = a
+        .write_entry(&p.log, &d0.signing, vec![unknown_op], None)
+        .unwrap();
+    assert!(a.validity().is_valid(&id) && !a.state().is_accepted(&id));
 }
 
 #[test]
@@ -775,5 +958,47 @@ fn the_epoch_key_is_in_the_clear_in_a_public_space_and_in_no_other() {
         assert!(!b.dag().contains(&id));
         b.receive(sealed, &[&p.enc]).unwrap();
         assert!(b.validity().is_valid(&id));
+        assert_eq!((a.is_public(), b.is_public()), (public, public));
+
+        // Public is the genesis's to say, for good. The owner's
+        // `set_policy` saying otherwise is valid, and changes nothing
+        // about it: not what the space is, not what its entries carry,
+        // and not what a member takes.
+        let said = Policy {
+            public: !public,
+            ..Policy::default()
+        };
+        let (set, sealed_set) = a
+            .write_entry(&p.log, &d0.signing, vec![SpaceOp::set_policy(&said)], None)
+            .unwrap();
+        assert!(a.validity().is_valid(&set));
+        assert_eq!(sealed_set.open_key().is_some(), public);
+        b.receive(sealed_set, &[&p.enc]).unwrap();
+        assert!(b.validity().is_valid(&set));
+        let (after, sealed_after) = a
+            .write_entry(
+                &p.log,
+                &d0.signing,
+                vec![files::create_folder(ROOT, "y")],
+                None,
+            )
+            .unwrap();
+        assert_eq!(sealed_after.open_key().is_some(), public);
+        // one sealed as the `set_policy` would have it is refused
+        let as_said = SealedEntry::seal(a.entry(&after).unwrap(), &epoch, None, !public).unwrap();
+        assert!(b.receive(as_said, &[&p.enc]).is_err());
+        assert!(!b.dag().contains(&after));
+        b.receive(sealed_after, &[&p.enc]).unwrap();
+        assert!(b.validity().is_valid(&after));
+        assert_eq!((a.is_public(), b.is_public()), (public, public));
+        // a device that opens the space afresh, with everything at once
+        // and the `set_policy` among it, reads the same from the genesis
+        let mut c = Space::open_genesis(&genesis, &[&p.enc], Some(p.log.state())).unwrap();
+        let later: Vec<_> = a.dag().log_order().iter().rev().copied().collect();
+        for x in later.iter().filter(|x| **x != a.id()) {
+            c.receive(a.sealed(x).unwrap().clone(), &[&p.enc]).unwrap();
+        }
+        assert_eq!(c.is_public(), public);
+        assert!(c.validity().is_valid(&after));
     }
 }

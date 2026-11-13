@@ -58,7 +58,7 @@ fn random_ops(rng: &mut Rng, st: &State, me: &[u8; 32]) -> Vec<SpaceOp> {
         let folder = folders[rng.below(folders.len())];
         let name = NAMES[rng.below(NAMES.len())];
         let content = Content::Inline(vec![rng.below(256) as u8]);
-        let op = match rng.below(23) {
+        let op = match rng.below(26) {
             0..=4 => files::create_folder(folder, name),
             5..=8 => files::create_file(folder, name, &content, 0o644, None),
             9..=12 if !filez.is_empty() => {
@@ -69,6 +69,22 @@ fn random_ops(rng: &mut Rng, st: &State, me: &[u8; 32]) -> Vec<SpaceOp> {
             }
             16..=17 if !nodes.is_empty() => SpaceOp::delete(nodes[rng.below(nodes.len())]),
             18 if !nodes.is_empty() => SpaceOp::restore(nodes[rng.below(nodes.len())]),
+            // what no table gives a meaning: a kind nobody knows, and
+            // nodes put in and moved into files and into those
+            23 => SpaceOp::create(NodeKind::Uint(77), folder, name, Default::default()),
+            24 if !nodes.is_empty() => {
+                let anywhere = nodes[rng.below(nodes.len())];
+                match rng.below(3) {
+                    0 => files::create_folder(anywhere, name),
+                    1 => files::create_file(anywhere, name, &content, 0o644, None),
+                    _ => SpaceOp::create(NodeKind::Uint(77), anywhere, name, Default::default()),
+                }
+            }
+            25 if nodes.len() > 1 => SpaceOp::mv(
+                nodes[rng.below(nodes.len())],
+                nodes[rng.below(nodes.len())],
+                name,
+            ),
             // this person's reach node, which every replica here writes:
             // set, set beside, cleared, and named in a way that puts the
             // whole entry out of the state

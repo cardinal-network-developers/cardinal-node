@@ -946,6 +946,11 @@ fn a_reader_writes_its_own_reach_node_and_nothing_else() {
     s.write("theirs", CY, P, vec![reach(&ben)], None);
     s.write("deleted", BEN, P, vec![SpaceOp::delete(node)], None);
     s.write("empty", CY, P, vec![], None);
+    // leaving, which empties it in the same entry
+    let cy = s.id(CY);
+    let gone = cardinal_space::relationship::leave_ops(&cy);
+    assert_eq!(gone.len(), 2);
+    s.write("gone", CY, P, gone, None);
     assert_eq!(
         s.valid(&[
             "reach",
@@ -955,10 +960,12 @@ fn a_reader_writes_its_own_reach_node_and_nothing_else() {
             "beside",
             "theirs",
             "deleted",
-            "empty"
+            "empty",
+            "gone"
         ]),
-        [true, false, true, true, false, false, false, true]
+        [true, false, true, true, false, false, false, true, true]
     );
+    assert!(s.judge.has_left(&s.dag, &cy));
 }
 
 #[test]
