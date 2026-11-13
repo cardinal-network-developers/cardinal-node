@@ -692,31 +692,32 @@ async fn say_reach_locked(d: &Arc<Daemon>, space: &SpaceId, share: bool) -> anyh
     Ok(())
 }
 
+/// Sets this person's reach node in a space again to what it says now, so
+/// that the entry that says it descends from everyone who has been added
+/// since: the person was told of them, and keeps what is shared.
+pub async fn say_reach_again(d: &Arc<Daemon>, space: &SpaceId) -> anyhow::Result<()> {
+    let _one = d.mailbox.reaching.lock().await;
+    let me = d.core().identity.as_ref().map(|i| i.id());
+    let me = me.ok_or_else(|| anyhow::anyhow!("this device has no identity"))?;
+    let reach = d.core().reach_of(space, &me);
+    d.write_and_push(space, vec![relationship::set_reach(&me, &reach)])?;
+    Ok(())
+}
+
 /// Says where this person is reached about a space, where software may say
-/// so unasked: only in a space whose other members are all this person's
-/// contacts, who have a host of theirs already
-/// (`hosts.md#telling-others-where-to-reach-you`). There it is set if it
-/// was never set, and set again once the person has a host where they had
-/// said nowhere. In any other space only the person's answer sets it
-/// (`group-join`, `group-reach`); what they chose to share is then kept
-/// current by [`renew_reach`].
+/// so unasked (`hosts.md#telling-others-where-to-reach-you`,
+/// [`Telling::sets_unasked`](crate::core::Telling::sets_unasked)): in a
+/// space whose other members are all this person's contacts, who have a
+/// host of theirs already, and wherever the person said yes. Never where
+/// they said no: their answer is kept in their account, so that no device
+/// fills in what another emptied. In any other space only the person's
+/// answer sets it (`group-join`, `group-reach`); what they chose to share
+/// is then kept current by [`renew_reach`].
 pub async fn write_reach(d: &Arc<Daemon>, space: &SpaceId) -> anyhow::Result<()> {
     // One at a time: two that both found none would each register a token and
     // write, and leave a token that leads nowhere.
     let _one = d.mailbox.reaching.lock().await;
-    let (set, listed, unasked) = {
-        let core = d.core();
-        let Some(me) = core.identity.as_ref().map(|i| i.id()) else {
-            return Ok(());
-        };
-        (
-            core.reach_is_set(space, &me),
-            !core.reach_of(space, &me).is_empty(),
-            core.not_contacts_in(space).is_empty(),
-        )
-    };
-    let hosted = !d.core().mailboxes().is_empty();
-    if listed || !unasked || (set && !hosted) {
+    if !d.core().telling(space).sets_unasked() {
         return Ok(());
     }
     say_reach_locked(d, space, true).await
@@ -793,8 +794,13 @@ fn renew_reach(d: &Arc<Daemon>) {
     let endpoints = crate::host::own_grant(d).map(|g| g.endpoints);
     let shared = d.core().shared_spaces();
     for (space, _) in shared {
-        // A space this person left has no tokens to bring back.
+        // A space this person left has no tokens to bring back. And while
+        // someone who is not their contact has been added since they were
+        // last told, nothing new is said there.
         if crate::groups::not_joined(d, &space) || left(d, &space, &me) {
+            continue;
+        }
+        if !d.core().telling(&space).keeps_current() {
             continue;
         }
         let mut reach = d.core().reach_of(&space, &me);

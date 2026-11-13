@@ -833,7 +833,7 @@ fn status(d: &Arc<Daemon>) -> Value {
         let conflicts = files
             .and_then(|f| core.spaces.get(&f))
             .and_then(|h| h.space.as_ref())
-            .map(|s| s.state().conflicts().len())
+            .map(|s| shown_conflicts(s).len())
             .unwrap_or(0);
         (identity, spaces, conflicts, files)
     };
@@ -879,6 +879,19 @@ fn status(d: &Arc<Daemon>) -> Value {
     })
 }
 
+/// The conflicts of a files space that its folder shows: of nodes that
+/// belong to it, and are there or were deleted while someone else was
+/// changing them. A conflict in a node of a kind this build does not know,
+/// or in a place where its kind means nothing, is in the state and is
+/// nobody's to settle here.
+fn shown_conflicts(sp: &cardinal_space::Space) -> Vec<&cardinal_space::Node> {
+    let st = sp.state();
+    let f = Files::new(sp);
+    let all = st.conflicts().into_iter();
+    all.filter(|n| f.belongs(&n.id) && (st.is_visible(&n.id) || n.delete_conflict))
+        .collect()
+}
+
 fn conflicts(d: &Daemon) -> anyhow::Result<Value> {
     let files_id = require_files(d)?;
     let core = d.core();
@@ -895,10 +908,7 @@ fn conflicts(d: &Daemon) -> anyhow::Result<Value> {
     });
     let st = sp.state();
     let mut out = Vec::new();
-    for n in st.conflicts() {
-        if !st.is_visible(&n.id) && !n.delete_conflict {
-            continue;
-        }
+    for n in shown_conflicts(sp) {
         let path = node_path(st, &n.id);
         let versions: Vec<Value> = f
             .content(&n.id)

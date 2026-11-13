@@ -29,7 +29,9 @@ follow it across two spaces. What still differs:
   cut, the initial state of a successor, following or showing a successor
   as an offer, posting work again, the trail, `keep` for a succession made
   by a device that is then retired or lost, the space node's field 4 in the
-  account space, and tokens and storage labels that serve a successor. The
+  account space, tokens and storage labels that serve a successor, and what
+  a device does with a successor that is public where the old space was
+  not (Following's condition 5, "Made public"). The
   fields that exist for it are read, written and kept, and mean nothing yet:
   fields 3, 4 and 6 to 9 of `start`, fields 2 and 3 of `succeed`, and
   `was` on `create`. A device that receives a `succeed` that ends a space
@@ -76,14 +78,10 @@ below, each under its section.
   inner record". Chose: reading a signed object rejects it unless the body
   decodes as exactly one canonical record. An empty signature list is
   structurally valid; whether the signers suffice is the caller's question.
-- **Spec ambiguity: an object with several signers.** A signature is made
-  over the id, and the id covers every signer's key. So all the signers
-  have to be known before any of them signs, and a signature added later
-  makes another object, on which the earlier signatures do not verify.
-  Nothing in the specification uses more than one signature, and it does
-  not say this. Chose: `SignedObject::sign_with` takes all the keys at
-  once and replaces whatever signatures were there, and there is no way to
-  add one signer to an object and keep its id.
+- **An object with several signers.** Who signs is settled before anyone
+  does (`encoding.md#signed-objects`): `SignedObject::sign_with` takes all
+  the keys at once and replaces whatever signatures were there, and there
+  is no way to add one signer to an object and keep its id.
 - **Reading: where a signature that does not verify is refused.** "A
   device that can check it rejects it." Entries and grants are checked
   when they are decoded, so an object with a bad signature is never held
@@ -112,21 +110,17 @@ below, each under its section.
   `seal`/`open` (the ML-KEM secret and the AEAD still protect the result);
   `x25519::is_all_zero` is available for protocols that need contributory
   behaviour, such as the link handshake.
-- **Spec gap: the vectors for what is left of ZIP-215.** "The test vectors
-  MUST include ZIP-215's edge cases", and a signature under a key of small
-  order is now rejected. All 196 of ZIP-215's published cases have a key of
-  small order, so each of them is now a case that must fail, and nothing
-  published exercises what still must pass: an `R` of small order or not
-  canonically encoded under an ordinary key, and a key with a part of
-  small order, for which only the cofactored equation holds.
-  `vectors/ed25519.json` keeps the 196 as invalid, marked `zip215_alone`,
-  and adds 21 cases made here that are valid: 14 with each encoding of a
-  small-order `R` under an ordinary key, and 7 under a key of mixed order.
-- **Reading: "a point of small order".** Chose: the key is decoded as
-  ZIP-215 decodes it, so an encoding that is not canonical counts, and it
-  is of small order if eight times it is the identity. The check is in
-  `verify`, so it holds for every signature: entries, grants, device
-  proofs, proofs of possession, and release manifests.
+- **The Ed25519 vectors** (`vectors/ed25519.json`,
+  `crypto.md#signature-verification`). ZIP-215's 196 published cases are
+  kept as signatures to reject, marked `zip215_alone`: each has a key of
+  small order. What only ZIP-215's rules accept under a key that is not of
+  small order was made here, 28 cases: 14 with an `R` of small order in
+  each of its encodings, six of them not canonical; 7 with an `R` that has
+  a part of small order, which only the cofactored equation accepts; and 7
+  under a key with a part of small order, which is not a key of small
+  order. The check for a key of small order is in `verify`, so it holds
+  for every signature: entries, grants, device proofs, proofs of
+  possession, and release manifests.
 - **Spec ambiguity: recovery phrase input.** Chose to accept any whitespace
   between words and to ignore ASCII case when parsing a phrase; the
   checksum is still required. Output is lowercase words joined by single
@@ -395,60 +389,35 @@ below, each under its section.
   opened and checked like any sealed entry, kept, and offered in
   reconciliation, and nothing is judged again
   (`Space::receive`, `tests/validity.rs`).
-- **Spec ambiguity: what rejecting a sealed entry means for what is
-  stored.** "A member MUST reject" a sealed entry with a wrong nonce, a bad
-  signature, altered wraps, or an open key where none belongs, and "any
-  holder" one with a field the table does not have. A host cannot make the
-  member's checks, so it keeps what a member rejects, and reconciliation
-  compares sealed ids: a member that threw such an object away would be
-  offered it again by every host, forever. Chose: any holder refuses what
-  any holder can check, which is never stored. What only a member can
-  check is stored and reconciled like any object, and is not an entry: it
-  is not in the graph, is never judged, and nothing can name it. The
-  specification's "exactly one sealed form" is therefore true of what
-  members read and not of what holders store: whoever holds the epoch key
-  can make any number of objects that hosts keep, as it always could by
-  sealing rubbish.
-- **Spec gap: a wrap is not a closed record.** A sealed entry holds only
-  its six fields, but its wraps are sealed records (`crypto.md`), which
-  nothing says are closed. A member is protected, since the wraps hash is
-  taken over the list as it is carried, so anything added to a wrap fails
-  it (`entry.rs`, `seal_open_and_tamper`). A host cannot tell, which is
-  the case above.
-- **Spec ambiguity: a wraps list that is present and empty.** Field 4 is
-  "present only when this entry distributes an epoch key". Chose: an empty
-  list is a list, so the inner entry must carry its hash, and nothing here
-  writes one.
-- **Spec ambiguity: "the space's policy, as the entry and its causal past
-  give it".** A member rejects a sealed entry with an open key where the
-  policy is not public, and one without where it is. The policy an entry's
-  causal past gives depends on which `set_policy` entries are valid there,
-  which can change after the entry was taken; on parents that may not have
-  arrived when the sealed entry has to be accepted or rejected; and on two
-  `set_policy` entries written at the same time, for which nothing gives
-  an order. And an entry rejected for it cannot be judged again later,
-  since a rejected entry is not held. Chose: the policy is the one the
-  genesis gave, which every member knows before any other entry and which
-  never changes here, since `set_policy` is not applied
-  (`Space::open_key_belongs`). A genesis is held to its own policy.
+- **What only a member can reject, a member keeps**
+  (`spaces.md#entries-and-sealed-entries`). Any holder refuses what any
+  holder can check, which is never stored. What only a member can check
+  (the nonce, the signature, the wraps hash, the open key) is stored and
+  reconciled like any object, and is no entry: it is not in the graph, is
+  never judged, and nothing can name it. The wraps hash is taken over
+  field 4 as it came, so a wrap someone added a key to fails it, and a
+  field 4 that lists no wraps is still a field 4.
+- **Public is the genesis's to say** (`spaces.md#control-operations`,
+  `Space::is_public`). Field 2 of the policy is read once, from the
+  `start` of the genesis, and kept apart from the rest of the policy:
+  nothing written later reaches it, a valid `set_policy` of the owner's
+  included (`tests/space.rs`). A genesis is held to it like any entry.
+  **Spec ambiguity: a `set_policy` inside the genesis.** A genesis may
+  carry one, and it may say otherwise than the `start` beside it. "Read
+  from the genesis alone" does not say from which op. Chose: the `start`,
+  since a `set_policy` "does not change it, whatever it carries there".
 - **A reader's one op.** A `set` whose node is `reach_node_id(author)`
-  (`validity.rs`, `class`), in any profile, an account space included.
-  **Spec ambiguity: which fields.** `profiles.md#reach` gives a reach node
-  one field, and nothing says whether a `set` of another key on it is
-  still the reader's op, or is accepted for state. Chose: any key. The
-  roles table says "set its own reach node" and names no field, and a
-  field this implementation does not know is kept like any other.
+  (`validity.rs`, `class`), of any field, in any profile, an account space
+  included.
 - **Spec ambiguity: who owns a personal space.** `profiles.md` says an
   account space has "one identity: yourself" and a files space "usually
   yourself", and gives neither a role. Chose: the genesis names its author
   as owner, so that the person alone can add someone to a files space and
   succeed either.
-- **Spec ambiguity: "reserved" and "not used".** Entry field 9 is
-  reserved and control op 3 is not used, and nothing says what a device
-  does on meeting either. Chose: field 9 is a field this implementation
-  does not know, accepted, ignored and kept; op 3 is a control op the table
-  does not define, which no role may perform, so an entry holding one is
-  invalid.
+- **Spec ambiguity: "reserved".** Entry field 9 is reserved, and nothing
+  says what a device does on meeting one. Chose: a field this
+  implementation does not know, accepted, ignored and kept. (Control op 3,
+  "not used", is allowed to no role, as the specification now says.)
 - **Spec ambiguity: a `leave` with fields.** `leave` has none. Chose: one
   that carries any is still a `leave`, and they are kept like any unknown
   field. (What 0.1.13 wrote as `remove_member` reads this way.)
@@ -462,25 +431,14 @@ below, each under its section.
   of both).
 - **Writing into a space that has ended** (`spaces.md#ending-a-space`).
   Once an entry on the valid heads would be closed, `Space::write` refuses
-  anything but an entry with no ops, or with `keep` ops only: what
-  witnesses or keeps a person's own work. Such an entry counts by its
-  signature and is not valid there, so nothing builds on it. In a space
+  anything but an entry with no ops, or with `keep` ops only. In a space
   with no owner the end is where the heads together hold every member's
-  naming of one successor, though no single head does. No new epoch is
-  started in a space that has ended, whatever is due.
+  naming of one successor, though no single head does.
 - **Not yet witnessed** (`spaces.md#authors`, `Space::has_unwitnessed`).
-  An entry by the key, whose signature counts, that no entry of the same
-  author under another key descends from, and that no `keep` for the key
-  in such an entry covers by listing it or a descendant of it. Other
-  members building on it does not count. What ends or begins a space is
-  left out of the answer, though it too is not yet witnessed until a
-  `keep` lists it: the answer decides whether a device being retired
-  writes an empty entry, which keeps none of those, and the `keep` for
-  each succession it made is not written yet (above).
-  **Spec ambiguity: a `keep` by the key itself.** "No `keep` covers it"
-  does not say whose. A `keep` in an entry signed by the key that is to be
-  removed would need a witness of its own once the key is gone. Chose:
-  only a `keep` in an entry under another key covers.
+  What ends or begins a space is left out of the answer, though it too is
+  not yet witnessed until a `keep` lists it: the answer decides whether a
+  device being retired writes an empty entry, which keeps none of those,
+  and the `keep` for each succession it made is not written yet (above).
 - **Spec ambiguity: what else changes an entry later.** "Only a signature
   changes an entry later": an identity log, a witness, a `keep`. A `keep`
   can also be held before an entry it lists, and then that entry arriving
@@ -495,7 +453,8 @@ below, each under its section.
 - **The cited author log head** written by this implementation is the last
   entry in log order at which the signing key is in effect.
 - **Not applied: `set_policy` and `set_protocol`.** They are judged, and the
-  policy a space runs under is still the one its genesis gave it.
+  policy a space runs under is still the one its genesis gave it. Whether
+  it is public would be the genesis's to say even if they were applied.
 
 ## State (`spec/state.md`, `spec/profiles.md`)
 
@@ -514,45 +473,43 @@ below, each under its section.
   whose reach node it is. Nothing here asks whether sixteen bytes are some
   identity's reach node, which could not be answered without knowing every
   identity; both reasons reject the entry, so the answer is never needed.
-  A `set` written beside, and a cleared field, behave as on any node. In
-  the canonical state a reach node's record is `{1: id, 5: fields}`, there
-  once any field of it has been set: a field that was cleared still has a
-  value to record, so a reach node that was ever set keeps its record.
-  **Spec ambiguity: "only while it has a field to record"** suggests a
-  record can go away again, and nothing makes a field lose every value.
+  A `set` written beside, and a cleared field, behave as on any node.
 - **Spec ambiguity: what a delete deletes.** Chose: a delete of N flags N
   and every node beneath N in the delete's causal past that no concurrent
   op touched; N is flagged delete conflict if touched. A `restore` of N
   clears N and the nodes beneath it that the same delete flagged. Views
   hide everything beneath a deleted node.
-- **Cleared fields.** A `set` without a value is a value of the register
-  like any other (it supersedes and can conflict). In the canonical state
-  it is `{1: entry id}` with no field 2, and a field with no values is left
-  out, as `state.md#canonical-state` now says.
-- **Spec gap: the root as an op's target.** The root "always exists" and
-  needs no `create`, so a `set`, `move`, `delete` or `restore` whose node
-  is the root names a node that is there; but the root has no position to
-  move, no record in the canonical state for a field or a deleted flag,
-  and nothing says what such an op does. Chose: the root can be a parent,
-  and an op whose target is the root puts its entry out of the state.
-- **Ranks and creation times** (`state.md#canonical-state`, fields 10 and
-  11). A node's rank is its place among all the state's nodes, deleted
-  ones included, by where its creating entry comes in log order and then
-  by where its `create` comes in that entry. No state here has an initial
-  state to rank first. **Spec ambiguity: a creating entry with no time.**
-  Field 6 of an entry is optional in practice (nothing says it must be
-  there, and it is "display only"). Chose: field 11 is left out then.
-- **Spec gap: a kind a profile does not define.** `state.md` says what an
-  op that a profile does not define does, and not what a `create` of a
-  kind it does not define does: kind 9 of a relationship is "not used",
-  and kinds above its table are nobody's. Chose, as before: the files
-  profile accepts only its own kinds (below), and the others accept any.
-- **Profile restrictions (a reading of "a profile may restrict").** Files:
-  kinds 1–3 only, under the root or a folder. Account: placement under a
-  space node, storage label and token under a host node, invitation use
-  under an invitation node, everything else under the root. Creating or
-  moving against this, or an unknown profile op, rejects the entry for
-  state. Other profiles are unrestricted.
+- **Any kind, anywhere** (`state.md#operations`). A `create` is accepted
+  whatever its kind and wherever it puts the node, and the files and
+  account profiles reject nothing for kind or place any more. What shows a
+  space steps over what it has no meaning for, with everything beneath
+  it: the files view lists only folders, files and links, and only in the
+  root or in folders all the way up (`Files::list`, `Files::belongs`); a
+  conversation is a conversation node at the top, a message a message in
+  it, a reaction a reaction under a message; an account's devices,
+  contacts, hosts and spaces are those at the top, and a placement one
+  under a space node. An op the profile does not define still puts its
+  entry out of the state.
+  - **Spec ambiguity: a `move`.** "A `create` is accepted whatever its
+    kind and wherever it puts the node" says nothing of `move`, which can
+    put a node where its kind means nothing just as well. Chose: a `move`
+    is accepted wherever it puts a node too (a cycle aside, which the
+    merge skips). The other reading would leave the state depending on
+    which tables a device knows, which is what the paragraph is there to
+    prevent.
+  - **Spec gap: the content of what is not shown.** "Kept and synced" is
+    said of the node. `blobs.md` has a device that keeps a space in full
+    "keep every chunk referenced by current state", and which fields of a
+    kind nobody knows reference chunks is not something a device can read
+    from a table. Chose: the cleaner counts as current every blob
+    reference, found by its shape, in the current values of any node that
+    is not deleted and that the folder does not show, so that content is
+    never freed as an old version (a file someone moved into a file, and
+    moved back, is whole). Nothing fetches such content: a device fetches
+    what it shows.
+  - Conflicts in nodes the folder does not show are not listed by
+    `cardinal conflicts` or counted in `status`: nothing here could settle
+    them.
 - **File content and conflict copies.** The version "last in log order" is
   the value whose writing entry is last in log order; same-name siblings
   are ordered by the log position of their creating entry.
@@ -919,12 +876,13 @@ Not implemented yet (the next milestone):
   the time never hears.
 - **When a new epoch is due** (`spaces.md#when-to-rotate`, `core.rs`,
   `Reached`). A device keeps, with each epoch whose key it holds, what it
-  held when the epoch reached it: the fingerprint of each member's
-  encryption key, who had left, and whom it knew to be frozen, in
-  `spaces/<id>/epochs.json`. An epoch with no record there reaches the
-  device now. Its next write starts a new epoch when, against the record
-  of the current one, the key of a member who would be given the next one
-  has changed, a member has left, or it has learned that one is frozen;
+  held when it first held that key: the fingerprint of the encryption key
+  of each member who has not left, and whom it knew to be frozen, in
+  `spaces/<id>/epochs.json`. A member added afterwards joins the record
+  with the first key the device holds for them. An epoch with no record
+  there reaches the device now. Its next write starts a new epoch when,
+  against the record of the current one, the key of a member who would be
+  given the next one has changed, or it has learned that one is frozen;
   when the entries say so (a `leave` the epoch's first entry does not
   descend from, an `add_member` written under another epoch that it does
   not descend from); when the epoch was begun by a member it would leave
@@ -933,25 +891,17 @@ Not implemented yet (the next milestone):
   rotate; it could not tell, and its writes are held to the epoch it
   knows. A reader starts none. An addition made while one is due starts it
   in the same entry.
-  - **Spec ambiguity: "with each epoch".** The record is taken when the
-    device first holds an epoch's key, which is when it can first know the
-    entry started an epoch: an entry it cannot open says nothing. Only the
-    current epoch's record is ever compared.
-  - **Spec gap: a member who came after the epoch.** The record holds each
-    member's key "when the entry that started the epoch arrived". Someone
-    added later, or whose log arrived later, has no key in it, and their
-    key changing afterwards is as much a reason as anyone's. Chose: their
-    key is added to the record when the device first sees them as a
-    member with a key.
-  - **Spec observation: whoever wrapped an epoch is not the only one who
-    starts the next.** A device records what *it* holds when an epoch
-    arrives, not what the epoch's writer held. If the writer wrapped for a
-    member's new key and this device hears of that key only afterwards, it
-    starts another epoch for a change the current one already has. The
-    specification says so ("that costs wraps and nothing else"); in a
-    group, removing one device can cost a new epoch from every member's
-    device that heard in that order. It ends, since each device starts at
-    most one for each change it sees.
+  - **What one changed key costs.** A device records what *it* holds when
+    an epoch reaches it, not what the epoch's writer held. If the writer
+    wrapped for a member's new key and this device hears of that key only
+    afterwards, it starts another epoch for a change the current one
+    already has. Counted in a group of ten with one device each, where
+    one member's key changes and every device writes once after it hears
+    (`core.rs`, `what_one_changed_key_costs_in_epochs`, ignored): one
+    epoch of ten wraps where every device hears before the new epoch
+    reaches it; ten epochs, a hundred wraps, where the new epoch reaches
+    each device before it hears; and between two and eight epochs, seven
+    at the median, over twelve orders drawn at random.
   - **Spec ambiguity: an `add_member` of someone who was a member
     already.** "A member's `add_member` was written under another epoch,
     and the entry that started the current epoch does not descend from
@@ -1093,51 +1043,48 @@ asks for around that is not built yet.
   gives them, with no warning when it matches someone else's. Groups are
   not in the one folder.
 - **A profile's members.** The rules judge every space alike, whatever its
-  profile, and `profiles.md` now says so: a space offered as a group is
-  taken as it is. One whose genesis names no owner is a group nobody can
-  add to and that all its first members end together. Only a relationship
-  is checked, by whoever is invited into it (`contact.md#accepting`, step
-  4; `Core::accept_relationship`): the genesis is valid by the inviter's
-  log and written by the inviter, its profile is the relationship's, its
-  `add_member` ops are exactly two, one for each of the two as a writer,
-  and the space is not held already. Other ops in the genesis are not
-  looked at: the conversation is one, and nothing says there may be no
-  others. **Spec gap: the policy is not among what is checked.** A
-  genesis that passes can say the space is public, and then every entry
-  of the conversation carries its key in the clear. Chose: the check as
-  written.
+  profile: a space offered as a group is taken as it is. One whose genesis
+  names no owner is a group nobody can add to and that all its first
+  members end together. Only a relationship is checked, by whoever is
+  invited into it (`contact.md#accepting`, step 4;
+  `Core::accept_relationship`): the genesis is valid by the inviter's log
+  and written by the inviter, its profile is the relationship's, it is
+  not public, its `add_member` ops are exactly two, one for each of the
+  two as a writer, and the space is not held already. Other ops in the
+  genesis are not looked at: the conversation is one, and nothing says
+  there may be no others. An offer of a group says if the group is
+  public (`public` in `groups`, on each group and each offer).
 - **Leaving a group** (`spaces.md#members-and-roles`). `group-leave` writes
-  `leave`. From then on the device finds no such group and writes nothing
-  in it, and if it is a host it ends the tokens its person gave out there.
-  The others show that the member left (`left` in `group-members`), send
-  them nothing more of the group, leave them out of its calls, and whoever
-  writes next starts a new epoch in that entry, not wrapped for them. A
-  reader cannot start one, and waits for a writer.
+  `leave`, and in the same entry sets this person's reach node to an empty
+  list (`relationship::leave_ops`). From then on the device finds no such
+  group and writes nothing in it, and if it is a host it ends the tokens
+  its person gave out there. The others show that the member left (`left`
+  in `group-members`), send them nothing more of the group, leave them out
+  of its calls, and whoever writes next starts a new epoch in that entry,
+  not wrapped for them. A reader cannot start one, and waits for a writer.
   - **What the device keeps.** The member's software "keeps or deletes
     what it holds of it as its person chooses". Here it keeps it, and
     nothing asks: it must go on holding the space to learn that it was
     added again, and what it holds stays named, so `cardinal free-space
     --unnamed` leaves it alone.
-  - **Added again** (`spaces.md#holding-a-space`). Leaving takes the
-    earlier acceptance back. Someone added again is offered the group
-    again, and is in it once they write something valid that descends
-    from that addition (`Judge::accepted`). What another of their devices
-    wrote meanwhile, without the addition in its past, accepts nothing.
-    **Spec ambiguity: several leaves.** Chose: each valid `leave` of
-    theirs needs an addition that descends from it and an entry of theirs
-    that descends from that addition; one entry can answer several.
-    **Spec ambiguity: a member who adds itself again**, as an admin can.
-    Chose: the adding entry is its own acceptance.
+  - **Added again** (`spaces.md#holding-a-space`, `Judge::accepted`).
+    Someone added again is offered the group again, and is in it once
+    they write something valid that descends from that addition, once
+    more after each time they leave. What another of their devices wrote
+    meanwhile, without the addition in its past, accepts nothing.
+  - **Spec gap: the answer of someone who leaves.** The answer about
+    hosts is "kept with the space in their account", and nothing says
+    what becomes of it when they leave, or when they are offered the
+    space again with other people in it. Chose: leaving takes the answer
+    back (field 5 is cleared), and an offer always asks where there is a
+    host to name and someone who is not a contact, whatever the account
+    says.
+  - **Spec ambiguity: a `leave` whose entry does not empty the reach
+    node.** "The entry that carries it also sets..." says what a writer
+    does. Chose: one that does not is a `leave` all the same; nothing
+    about validity or about who has left looks for the `set`.
   - A token ended on leaving never comes back. Joining again sets the
     reach node again, with new tokens.
-  - **Spec gap: the reach node of someone who left.** Leaving revokes the
-    tokens, and the member "stops writing" in the space, so the reach
-    node goes on saying where their hosts are, to everyone in the space
-    and to whoever is added later, for as long as the space lasts.
-    Nothing says to empty it, and after the `leave` it is too late.
-    Chose: what the specification says, and no more. A `set` that empties
-    it could go in the entry that holds the `leave`; a reader may write
-    both.
   - Someone who left still asks the others for the group when they meet,
     and is given nothing.
 - **Contacts are not told apart from members by more than this device's account
@@ -1218,62 +1165,69 @@ asks for around that is not built yet.
   can make keys and streams without limit. An envelope that cannot be opened yet
   waits, one at a time and up to the token's quota, and the host fetches what it
   needs at most once a minute.
-- **Where a reach node is set without asking**
-  (`hosts.md#telling-others-where-to-reach-you`, `mailbox.rs`,
-  `groups.rs`). A relationship's two people set theirs when it is made
-  (`contact.md#accepting`, step 5), to an empty list with no host. After
-  that the rule is one test, made each time, with nothing remembered: in a
-  space whose other members who have not left are all this person's
-  contacts, and none of them refused, the software keeps the reach node at
-  the person's hosts: it sets it if it was never set, and sets it again
-  once they have a host where it said nowhere. In any other space it
-  writes only what the person answered, and afterwards only keeps current
-  what they chose to share (a token that has gone, an address that
-  changed).
-  - **What the local interface gained, to ask and to answer.** Each group
-    and each offer in `groups` carries `reach`: `shared` (this person's
-    reach node there names a host), `ask` (it is theirs to say before
-    anything is set: they have a host, someone there is not their contact,
-    and either it was never set or they are not in the group, so that an
-    offer always asks, also of someone who left and was added again),
-    `who` (the members who are not their contacts, by the names this
-    person sees) and `what` (the addresses of their hosts). `group-join` takes `reach` (bool): the answer. Where `ask` is
-    true and there is no answer, it fails with the question in words and
-    writes nothing; where nobody is to be asked it is not read. A new
-    request `group-reach` `group` `share` (bool) sets or empties it later.
-    `cardinal group join` has `--share-host` and `--keep-host`, and there
-    is `cardinal group reach GROUP share|keep`.
-  - **Spec ambiguity: someone with no host, among people who are not
-    contacts.** "It MUST ask first", yet joining is setting the reach
-    node. Chose: with no host there is nothing anyone would learn, so the
-    empty list is set without asking.
-  - **Spec gap: someone who gets a host later.** A member who joined with
-    no host, among people who are not all contacts, was never asked. When
-    they get a host nothing is set and nothing prompts: `reach` in
-    `groups` then shows `shared` false with someone in `who` and an
-    address in `what`, which is all a client needs to offer it.
-  - **Spec gap: who joins later.** The person answered for the members
-    there were. Someone who is not a contact and is added afterwards reads
-    a reach node set before they came, and nothing says software should
-    empty it, ask again, or stop keeping it current. Chose: the answer
-    stands, and what was shared is kept current; `reach.who` in `groups`
-    lists whoever is not a contact, shared or not, so a client can show
-    it, and `group-reach` empties it.
-  - **Spec gap: saying no among contacts.** Where everyone else is a
-    contact the software sets the reach node unasked, so a "no" there
-    would be overwritten the next time it looked, and nothing is kept
-    that could remember it. Chose: `group-reach` refuses to empty it
-    there and says why (they have a host of this person's already), and
-    `group-join` does not read `reach` there.
-  - **Spec gap: someone refused.** A refused contact still has the
-    relationship's old token (revoked), and is "hidden wherever software
-    lists people". Chose: for this rule they are not a contact, so a
-    group they are in is one where the person is asked, and they are
-    named in `who`.
-  - **Spec ambiguity: a relationship is made before its contact is
-    recorded.** Step 5 sets the reach node; step 6 records the contact. At
-    step 5 the other is nobody's contact yet. Chose: step 5 sets it
-    without the test, since `contact.md` says to.
+- **Whether a reach node names its person's hosts**
+  (`hosts.md#telling-others-where-to-reach-you`, `core.rs` `Telling`,
+  `mailbox.rs`, `groups.rs`). A relationship's two people set theirs when
+  it is made, to an empty list with no host. After that software goes by
+  the person's answer, kept with the space in their account (kind 2,
+  field 5; `account::names_hosts`):
+  - **No**: nothing names their hosts there, on this device or another.
+  - **Yes**: the reach node is kept at their hosts, also once they have a
+    host where they had none.
+  - **Not asked**: only where every other member who has not left is their
+    contact, and not refused, is it set, and set again once they have a
+    host where it said nowhere. Anywhere else it is theirs to say first:
+    `ask` in `groups`, and `group-join` fails without an answer.
+  An answer is kept whenever one is given: `reach` on `group-join`, among
+  contacts too, and `group-reach`, which no longer refuses anything.
+  - **Spec ambiguity: two answers at once.** Two of a person's devices can
+    answer differently before either hears of the other, and a field then
+    holds both; two devices can also each make a space node. Chose: no
+    wins, wherever the account says both. An answer given later is
+    written on every node the account has for the space.
+  - **Spec gap: the answer and the emptying are in two spaces.** "None
+    fills in what another emptied" holds once the account entry has
+    arrived. A device that receives the emptied reach node before it
+    receives the answer, in a space where everyone is a contact and the
+    person was never asked, takes it for a reach node set for want of a
+    host, and fills it in. Chose: the answer is written first; the window
+    is the time between two spaces syncing. A field of the reach node
+    itself would close it.
+  - **Spec gap: who a yes covers.** A yes given while the reach node names
+    no host (there was none) is an answer for the members there were.
+    Chose: once there is a host, software names it only if nobody who is
+    not a contact was added since the reach node was last set; otherwise
+    it asks again (`ask`).
+  - **Spec gap: someone who gets a host later, and was never asked.**
+    Chose: among people who are not all contacts nothing is set, and `ask`
+    turns true in `groups`, so a client can ask then.
+- **Whoever is added later** (`hosts.md`, "Whoever is added later reads
+  what is already there"). Where this person's reach node names their
+  hosts and someone who is not their contact has been added since it was
+  last set, `groups` names them in `reach.added`, and `cardinal groups`
+  says who can see what, and how to stop or go on. That is all the local
+  interface gained for it. The offer to empty it is `group-reach` with
+  `share` false. `share` true keeps it: the reach node is set again to
+  what it says, in an entry that descends from the addition, and `added`
+  is empty again.
+  - **Reading: how "told" is remembered.** Nothing is stored. Someone is
+    new to the person if no valid `add_member` of theirs is in the causal
+    past of the entry that last set the reach node; the genesis's members
+    never are. So every device of the person tells them, until one of
+    them has their answer, and then none does.
+  - **Reading: nothing new is said meanwhile.** "Keeping current what the
+    person has agreed to share" needs no asking, and the person has not
+    agreed to share with someone they have not been told of. Chose: while
+    `added` names anyone, software sets nothing in that reach node: a
+    changed address or a renewed token waits for the answer. It also keeps
+    the test above honest, since a `set` by software would descend from
+    the addition as surely as the person's.
+  - **Spec gap: only groups have a way to be told or to answer.** Any
+    other space shared with someone who is not a contact is not something
+    this build makes.
+- **A reach node is kept current by the host it names.** A token that has
+  gone, or an address that changed, is set again by the host device,
+  wherever its person's reach node names it and they have not said no.
 - **A new host does not tell contacts it is there** unless a mailbox of theirs
   can carry the reach node. Someone through hosts only who had no host when
   they were invited stays out of reach of the other until then.

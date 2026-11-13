@@ -410,6 +410,43 @@ pub fn plan(
     Ok(out)
 }
 
+/// Every blob reference in a value, at any depth: a record shaped like one
+/// (`blobs.md#references`), wherever it is. That needs no knowledge of
+/// what a profile keeps where, and errs toward finding too many.
+pub fn refs_in(v: &cardinal_encoding::Value, out: &mut HashSet<BlobRef>) {
+    if let Some(r) = v.as_record() {
+        if let Ok(b) = BlobRef::from_record(r) {
+            out.insert(b);
+        }
+        r.iter().for_each(|(_, x)| refs_in(x, out));
+    } else if let Some(list) = v.as_list() {
+        list.iter().for_each(|x| refs_in(x, out));
+    }
+}
+
+/// The blobs that the current state of a files space names in nodes its
+/// folder does not show: a node of a kind this build does not know, or in
+/// a place where its kind means nothing, such as a file that was moved
+/// into a file (`state.md#operations`). They are current, so their
+/// content is never freed as an old version: moved back, or read by
+/// software that knows the kind, the file is whole. Nothing fetches them.
+pub fn unshown_blobs(sp: &Space) -> Vec<BlobRef> {
+    let st = sp.state();
+    let files = cardinal_space::Files::new(sp);
+    let mut out = HashSet::new();
+    for n in st.nodes() {
+        if !st.is_visible(&n.id) || files.shows(&n.id) {
+            continue;
+        }
+        for v in n.fields.values().flatten() {
+            if let Some(value) = &v.value {
+                refs_in(value, &mut out);
+            }
+        }
+    }
+    out.into_iter().collect()
+}
+
 /// Every blob a files space's history names, by top id: the content of
 /// every `create` and `set` of a file, current or not.
 pub fn known_blobs(sp: &Space) -> HashMap<Id, BlobRef> {
@@ -649,7 +686,9 @@ fn pass_now(d: &Daemon, now_all: bool, dry_run: bool) -> anyhow::Result<Passed> 
             })
             .map(|(_, b)| *b)
             .collect();
-        let live: Vec<BlobRef> = current.into_iter().map(|(_, b)| b).collect();
+        let mut live: Vec<BlobRef> = current.into_iter().map(|(_, b)| b).collect();
+        // What the folder does not show is current state all the same.
+        live.extend(unshown_blobs(sp));
         (live, known_blobs(sp), pinned)
     };
     let now = now_ms();

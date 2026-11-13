@@ -198,26 +198,27 @@ impl SetExt for MemSet {
     }
 }
 
-/// What this device held when an epoch reached it: each member's
-/// encryption key, who had left, and whom it knew to be frozen
-/// (`spaces.md#when-to-rotate`). Nothing in a space says whom an epoch was
-/// wrapped for, or with which of a member's keys, so a device keeps its own
-/// account with each epoch, as it keeps the space, and compares.
+/// What this device held when an epoch reached it, which is when it first
+/// held the epoch's key: each member's encryption key, and whom it knew to
+/// be frozen (`spaces.md#when-to-rotate`). Nothing in a space says whom an
+/// epoch was wrapped for, or with which of a member's keys, so a device
+/// keeps its own account with each epoch, as it keeps the space, and
+/// compares. Who had left is not in it: the rule read from the entries
+/// covers every `leave` the epoch was started without, whenever it arrives.
 #[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 struct Reached {
     /// The fingerprint of each member's encryption key, by identity.
     keys: BTreeMap<String, String>,
-    /// Who had left.
-    left: BTreeSet<String>,
     /// Whom this device knew to be frozen.
     frozen: BTreeSet<String>,
 }
 
 impl Reached {
-    /// What this device holds of a space's members now.
+    /// What this device holds now of the members of a space who have not
+    /// left: the others are given no epoch, whatever becomes of their keys.
     fn now(space: &Space, logs: &[Arc<IdentityState>]) -> Reached {
         let mut now = Reached::default();
-        for who in space.validity().identities() {
+        for who in space.present() {
             let Some(st) = logs.iter().find(|st| st.identity == who) else {
                 continue;
             };
@@ -229,21 +230,104 @@ impl Reached {
                 now.frozen.insert(hex::encode(who));
             }
         }
-        now.left = space.left().iter().map(|(w, _)| hex::encode(w)).collect();
         now
     }
 
     /// Whether a new epoch is due for what changed since: the encryption
-    /// key of a member who would be given the next one, a member who left,
-    /// or one this device has learned is frozen.
+    /// key of a member who would be given the next one, or a member this
+    /// device has learned is frozen.
     fn calls_for_a_new_epoch(&self, now: &Reached) -> bool {
-        let out = |who: &String| now.left.contains(who) || now.frozen.contains(who);
         let key = |(who, key): (&String, &String)| {
-            !out(who) && self.keys.get(who).is_some_and(|was| was != key)
+            !now.frozen.contains(who) && self.keys.get(who).is_some_and(|was| was != key)
         };
-        now.keys.iter().any(key)
-            || now.left.iter().any(|who| !self.left.contains(who))
-            || now.frozen.iter().any(|who| !self.frozen.contains(who))
+        now.keys.iter().any(key) || now.frozen.iter().any(|who| !self.frozen.contains(who))
+    }
+}
+
+/// What this person's reach node in a space tells, whom, and what they have
+/// said of it (`hosts.md#telling-others-where-to-reach-you`). A reach node
+/// says where a person's hosts are to every member, and for a host at home
+/// that is a home address. Their contacts have a host of theirs already;
+/// anyone else in the space learns it there.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Telling {
+    /// Whether their reach node there names a host now.
+    pub shared: bool,
+    /// Whether it has ever been set, if only to an empty list.
+    pub set: bool,
+    /// Their answer to whether it names their hosts, kept with the space in
+    /// their account: `None` while they have not been asked.
+    pub answer: Option<bool>,
+    /// Whether they have a host to name.
+    pub hosted: bool,
+    /// Whether they are in the space by their own doing.
+    pub joined: bool,
+    /// The members who are not their contacts and have not left: who
+    /// learns what the reach node says and had no host of theirs already.
+    pub who: Vec<[u8; 32]>,
+    /// Those of them who were added after the reach node was last set, so
+    /// that nothing the person said or software did took them into
+    /// account.
+    pub late: Vec<[u8; 32]>,
+    /// The addresses of their hosts: what is learned.
+    pub what: Vec<String>,
+}
+
+impl Telling {
+    /// Whether the person must be asked before software names their hosts
+    /// there: they have a host, someone there is not their contact, the
+    /// hosts are not named now, and they have not answered for the space
+    /// as it is. An offer always asks: whoever left took their answer
+    /// back. So does a yes given before someone who is not a contact was
+    /// added, while the reach node named no host.
+    pub fn ask(&self) -> bool {
+        let unanswered = match self.answer {
+            None => true,
+            Some(true) => !self.late.is_empty(),
+            Some(false) => false,
+        };
+        self.hosted && !self.who.is_empty() && (!self.joined || (!self.shared && unanswered))
+    }
+
+    /// Whether joining names the person's hosts: as they say now, or as
+    /// they said before if an answer is on record, or, where nobody had to
+    /// be asked and nothing was said, yes.
+    pub fn joins_sharing(&self, reach: Option<bool>) -> bool {
+        reach.or(self.answer).unwrap_or(true)
+    }
+
+    /// Those who are not the person's contacts and were added to a space
+    /// where their reach node already named their hosts: the person MUST
+    /// be told, and offered to empty it.
+    pub fn added(&self) -> &[[u8; 32]] {
+        match self.shared && self.joined {
+            true => &self.late,
+            false => &[],
+        }
+    }
+
+    /// Whether software sets the reach node now without asking: to the
+    /// person's hosts, or to an empty list if they have none. Never where
+    /// they said no, on this device or another. Where they said yes, once
+    /// there is a host to name and nobody has been added since who is not
+    /// a contact. Where they were not asked, only where everyone else is a
+    /// contact: if it was never set, or names nothing and there is now a
+    /// host.
+    pub fn sets_unasked(&self) -> bool {
+        self.joined
+            && match self.answer {
+                Some(false) => false,
+                Some(true) => !self.shared && self.hosted && self.late.is_empty(),
+                None => self.who.is_empty() && (!self.set || (!self.shared && self.hosted)),
+            }
+    }
+
+    /// Whether software keeps current what the reach node says: a token
+    /// that has gone, an address that changed. That needs no asking where
+    /// the person agreed to what is there, which they have not while
+    /// someone they have not been told of reads it.
+    pub fn keeps_current(&self) -> bool {
+        self.shared && self.answer != Some(false) && self.added().is_empty()
     }
 }
 
@@ -995,17 +1079,7 @@ impl Core {
     /// them. With that go the reasons it may not be all: a space that is
     /// held and not open here, and entries that no key here opens.
     pub fn named_blobs(&self) -> (Vec<cardinal_blob::BlobRef>, Vec<String>) {
-        use cardinal_encoding::Value;
-        fn refs_in(v: &Value, out: &mut std::collections::HashSet<cardinal_blob::BlobRef>) {
-            if let Some(r) = v.as_record() {
-                if let Ok(b) = cardinal_blob::BlobRef::from_record(r) {
-                    out.insert(b);
-                }
-                r.iter().for_each(|(_, x)| refs_in(x, out));
-            } else if let Some(list) = v.as_list() {
-                list.iter().for_each(|x| refs_in(x, out));
-            }
-        }
+        use crate::cleanup::refs_in;
         let mut refs = std::collections::HashSet::new();
         let mut unsure = Vec::new();
         for (id, h) in &self.spaces {
@@ -1051,6 +1125,55 @@ impl Core {
         let known = |who: &[u8; 32]| contacts.iter().any(|c| c.identity == *who && !c.refused);
         let others = sp.present().into_iter();
         others.filter(|m| Some(*m) != me && !known(m)).collect()
+    }
+
+    /// This person's answer to whether their reach node in a space names
+    /// their hosts, from their account (`profiles.md#account`, kind 2,
+    /// field 5): `None` while they have not been asked.
+    pub fn names_hosts(&self, space: &SpaceId) -> Option<bool> {
+        let acc = self.account()?.space.as_ref()?;
+        account::names_hosts(acc.state(), space)
+    }
+
+    /// The account space and the ops that record this person's answer for
+    /// a space there, or with `None` take it back. Nothing to write if it
+    /// is recorded already.
+    pub fn answer_ops(
+        &self,
+        space: &SpaceId,
+        name: &str,
+        answer: Option<bool>,
+    ) -> Option<(SpaceId, Vec<SpaceOp>)> {
+        let acc = self.account()?;
+        let ops = account::answer_ops(acc.space.as_ref()?.state(), space, name, answer);
+        (!ops.is_empty()).then_some((acc.id, ops))
+    }
+
+    /// What this person's reach node in a space tells, whom, and what they
+    /// have said of it.
+    pub fn telling(&self, space: &SpaceId) -> Telling {
+        let Some(me) = self.identity.as_ref().map(|i| i.id()) else {
+            return Telling::default();
+        };
+        let Some(sp) = self.spaces.get(space).and_then(|h| h.space.as_ref()) else {
+            return Telling::default();
+        };
+        let who = self.not_contacts_in(space);
+        let values = sp.state().reach_values(&me, 1);
+        let since: Vec<EntryId> = values.iter().map(|v| v.entry).collect();
+        let after = sp.added_after(&since);
+        let hosts = self.mailboxes();
+        let endpoints = hosts.iter().flat_map(|(g, _)| g.endpoints.iter());
+        Telling {
+            shared: !self.reach_of(space, &me).is_empty(),
+            set: !since.is_empty(),
+            answer: self.names_hosts(space),
+            hosted: !hosts.is_empty(),
+            joined: sp.accepted_by(&me),
+            late: who.iter().filter(|m| after.contains(m)).copied().collect(),
+            who,
+            what: endpoints.map(|e| e.to_string()).collect(),
+        }
     }
 
     /// The space this person gave out a token in.
@@ -1489,9 +1612,11 @@ impl Core {
         space.set_identities([ident.log.state(), their_log.state()]);
         // What the invitee must check before keeping it
         // (`contact.md#accepting`): a genesis that is valid by the
-        // inviter's log, with the relationship profile and exactly two
-        // `add_member` ops, one naming each of these two identities as a
-        // writer; and a space it does not already hold.
+        // inviter's log, with the relationship profile, a policy that is
+        // not public, and exactly two `add_member` ops, one naming each of
+        // these two identities as a writer; and a space it does not
+        // already hold. A public one would carry the key of everything
+        // the two say in the clear.
         use cardinal_space::entry::WRITER;
         use cardinal_space::SpaceOpBody;
         let genesis_entry = space.entry(&id);
@@ -1510,6 +1635,7 @@ impl Core {
             space.validity().is_valid(&id)
                 && space.creator() == *inviter
                 && space.profile() == cardinal_space::Profile::RELATIONSHIP
+                && !space.is_public()
                 && adds == the_two
                 && !self.spaces.contains_key(&id),
             "that is not a space between the two of you"
@@ -2125,6 +2251,17 @@ mod tests {
 
         /// A genesis this person writes, of `profile`, naming `members`.
         fn genesis(&self, profile: Profile, members: &[([u8; 32], u64)], to: &Person) -> Vec<u8> {
+            self.genesis_with(profile, Policy::default(), members, to)
+        }
+
+        /// [`genesis`](Self::genesis), with a policy.
+        fn genesis_with(
+            &self,
+            profile: Profile,
+            policy: Policy,
+            members: &[([u8; 32], u64)],
+            to: &Person,
+        ) -> Vec<u8> {
             let ident = self.core.identity.as_ref().unwrap();
             let mut ops: Vec<SpaceOp> = members
                 .iter()
@@ -2133,7 +2270,7 @@ mod tests {
             ops.extend(relationship::genesis_ops(self.id(), to.id()).split_off(2));
             let (_, sealed) = Space::create_with(
                 profile,
-                Policy::default(),
+                policy,
                 &ident.log,
                 &self.core.keys.device.signing,
                 &[&self.enc(), &to.enc()],
@@ -2219,7 +2356,15 @@ mod tests {
         let rel = Profile::RELATIONSHIP;
         // Anyone can seal a genesis to a public key. Each of these is a
         // space Ana could make, and none is a relationship with Bo.
-        let not_theirs: [(&str, Vec<u8>); 10] = [
+        let public = Policy {
+            public: true,
+            ..Policy::default()
+        };
+        let not_theirs: [(&str, Vec<u8>); 11] = [
+            (
+                "a policy that makes it public",
+                ana.genesis_with(rel, public, &[(a, WRITER), (b, WRITER)], &bo),
+            ),
             (
                 "an owner",
                 ana.genesis(rel, &[(a, OWNER), (b, WRITER)], &bo),
@@ -2478,6 +2623,375 @@ mod tests {
     }
 
     impl Person {
+        /// Makes this person's one device a host of theirs, at `address`.
+        fn hosts_at(&mut self, address: &str) {
+            use cardinal_space::grant::{Endpoint, Grant, MAILBOX};
+            let account = self.core.account_id().unwrap();
+            let me = self.core.keys.key();
+            let grant = Grant {
+                host: self.id(),
+                served: self.id(),
+                services: vec![MAILBOX],
+                storage_bytes: 0,
+                retention_days: 0,
+                endpoints: vec![Endpoint::parse(address).unwrap()],
+                link_key: self.core.keys.link.public_key().clone(),
+            }
+            .sign(&self.core.keys.device.signing);
+            let devices = account::devices(self.space(&account).state());
+            let node = devices.iter().find(|d| d.key == me).unwrap().node;
+            let ops = vec![
+                account::set_field(node, 4, true),
+                account::create_host(&grant),
+            ];
+            self.core.write_entry(&account, ops).unwrap();
+            assert_eq!(self.core.mailboxes().len(), 1);
+        }
+
+        /// Records `other` as a contact, as accepting an invitation does.
+        fn knows(&mut self, other: &Person, name: &str) {
+            use cardinal_space::account::Regard;
+            let account = self.core.account_id().unwrap();
+            let contact = account::create_contact(&other.id(), name, &[7; 32], Regard::default());
+            self.core.write_entry(&account, vec![contact]).unwrap();
+        }
+
+        /// Sets this person's reach node in a space, to one host or none.
+        fn says_reach(&mut self, space: &SpaceId, host: bool) -> Vec<u8> {
+            let reach = relationship::Reach {
+                endpoints: Vec::new(),
+                host: [9; 32],
+                token: cardinal_crypto::random_bytes(),
+            };
+            let list = if host { vec![reach] } else { Vec::new() };
+            let op = relationship::set_reach(&self.id(), &list);
+            self.core.write_entry(space, vec![op]).unwrap().1
+        }
+
+        /// Keeps this person's answer about their hosts in a space, as
+        /// `group-join` and `group-reach` do, or takes it back.
+        fn answers(&mut self, space: &SpaceId, names_hosts: Option<bool>) {
+            let ops = self.core.answer_ops(space, "Garden club", names_hosts);
+            if let Some((account, ops)) = ops {
+                self.core.write_entry(&account, ops).unwrap();
+            }
+            assert_eq!(self.core.names_hosts(space), names_hosts);
+        }
+    }
+
+    fn four() -> [Person; 4] {
+        let mut p = [Person::new(), Person::new(), Person::new(), Person::new()];
+        for i in 0..4 {
+            for j in 0..4 {
+                if i != j {
+                    let (log, id) = (p[j].log(), p[j].id());
+                    p[i].core.ingest_other(id, &log).unwrap();
+                }
+            }
+        }
+        p
+    }
+
+    /// `hosts.md#telling-others-where-to-reach-you`: software names a
+    /// person's hosts unasked only where everyone else is their contact.
+    /// Anywhere else it asks first. The answer is the person's, is kept
+    /// with the space in their account, and no device goes against it.
+    #[test]
+    fn the_answer_about_hosts_is_the_persons_and_is_kept() {
+        let [mut ana, mut bo, cy, _] = four();
+        bo.knows(&ana, "Ana");
+        let both = [(bo.id(), "Bo".to_owned()), (cy.id(), "Cy".to_owned())];
+        let g = ana.core.create_group("Garden club", "Ana", &both).unwrap();
+        bo.takes(&g, &ana.all_of(&g));
+
+        // Offered a group with Cy in it, who is not his contact. With no
+        // host there is nothing anyone would learn, and nothing to ask.
+        let t = bo.core.telling(&g);
+        assert_eq!(
+            (t.who.as_slice(), t.hosted, t.joined),
+            (&[cy.id()][..], false, false)
+        );
+        assert!(!t.ask() && !t.sets_unasked());
+        // With a host he is asked, and told who would learn what.
+        bo.hosts_at("203.0.113.5:7171");
+        let t = bo.core.telling(&g);
+        assert!(t.ask() && !t.sets_unasked());
+        assert_eq!(t.what, ["203.0.113.5:7171"]);
+        assert_eq!(t.answer, None);
+        // Joining shares as he says; with nothing said and nothing on
+        // record, as where nobody has to be asked, it shares.
+        assert!(t.joins_sharing(None) && t.joins_sharing(Some(true)));
+        assert!(!t.joins_sharing(Some(false)));
+        // An answer on record stands for a join that says nothing, and
+        // gives way to one that does.
+        bo.answers(&g, Some(false));
+        let t = bo.core.telling(&g);
+        assert!(!t.joins_sharing(None) && t.joins_sharing(Some(true)));
+        bo.answers(&g, None);
+
+        // He joins and says no: the empty list, and the answer in his
+        // account. Nothing fills it in, here or on another of his devices.
+        bo.answers(&g, Some(false));
+        bo.says_reach(&g, false);
+        let t = bo.core.telling(&g);
+        assert!(t.joined && t.set && !t.shared);
+        assert!(!t.ask() && !t.sets_unasked() && !t.keeps_current());
+        // not even once everyone there is his contact
+        bo.knows(&cy, "Cy");
+        let t = bo.core.telling(&g);
+        assert!(t.who.is_empty() && !t.sets_unasked());
+        // and it survives a restart: it is in his account, not in memory
+        bo.restarts();
+        assert_eq!(bo.core.names_hosts(&g), Some(false));
+        assert!(!bo.core.telling(&g).sets_unasked());
+
+        // He says yes: his devices keep it at his hosts from then on.
+        bo.answers(&g, Some(true));
+        let t = bo.core.telling(&g);
+        assert!(t.sets_unasked() && !t.ask());
+        bo.says_reach(&g, true);
+        let t = bo.core.telling(&g);
+        assert!(t.shared && !t.sets_unasked() && t.keeps_current());
+
+        // Taken back, he has not been asked: among contacts software says
+        // it unasked, as it does where nobody was ever asked.
+        bo.answers(&g, None);
+        bo.says_reach(&g, false);
+        assert!(bo.core.telling(&g).sets_unasked());
+
+        // Ana made the group and knows them both, and has no host: her
+        // reach node is set unasked, to nothing, and then left alone.
+        ana.knows(&bo, "Bo");
+        ana.knows(&cy, "Cy");
+        let t = ana.core.telling(&g);
+        assert!(t.joined && !t.set && t.sets_unasked() && !t.ask());
+        ana.says_reach(&g, false);
+        assert!(!ana.core.telling(&g).sets_unasked());
+        // once she has a host it is named, since nobody said otherwise
+        ana.hosts_at("203.0.113.6:7171");
+        assert!(ana.core.telling(&g).sets_unasked());
+    }
+
+    /// Two of a person's devices answer at the same moment, one yes and
+    /// one no. No wins: a person may always say no.
+    #[test]
+    fn of_two_answers_no_wins() {
+        use cardinal_space::account as acc;
+        let ana = Person::new();
+        let space = [5; 32];
+        let account = ana.core.account_id().unwrap();
+        let mut ana = ana;
+        let yes = acc::create_answered(&space, "Club", true);
+        let (first, _) = ana.core.write_entry(&account, vec![yes]).unwrap();
+        assert_eq!(ana.core.names_hosts(&space), Some(true));
+        // another node for the same space, as a second device makes
+        // before it has heard of the first
+        let no = acc::create_answered(&space, "Club", false);
+        ana.core
+            .write_entry_concurrent(&account, &[first], vec![no])
+            .unwrap();
+        assert_eq!(ana.core.names_hosts(&space), Some(false));
+        // an answer given now is written on every node there is
+        let (_, ops) = ana.core.answer_ops(&space, "Club", Some(true)).unwrap();
+        assert_eq!(ops.len(), 1);
+        ana.core.write_entry(&account, ops).unwrap();
+        assert_eq!(ana.core.names_hosts(&space), Some(true));
+        assert!(ana.core.answer_ops(&space, "Club", Some(true)).is_none());
+        // taken back, it is absent: not asked
+        let (_, ops) = ana.core.answer_ops(&space, "Club", None).unwrap();
+        assert_eq!(ops.len(), 2);
+        ana.core.write_entry(&account, ops).unwrap();
+        assert_eq!(ana.core.names_hosts(&space), None);
+        // and a space the account has no node for was never asked about
+        assert_eq!(ana.core.names_hosts(&[6; 32]), None);
+        assert!(ana.core.answer_ops(&[6; 32], "Other", None).is_none());
+    }
+
+    /// `hosts.md`, "Whoever is added later reads what is already there":
+    /// when someone who is not the person's contact is added to a space
+    /// where their reach node names their hosts, they are told, and until
+    /// they have answered software says nothing new there.
+    #[test]
+    fn whoever_is_added_where_hosts_are_named_is_told_of() {
+        let [mut ana, mut bo, mut cy, mut dee] = four();
+        bo.knows(&ana, "Ana");
+        bo.hosts_at("203.0.113.5:7171");
+        let bo_shown = [(bo.id(), "Bo".to_owned())];
+        let g = ana
+            .core
+            .create_group("Garden club", "Ana", &bo_shown)
+            .unwrap();
+        bo.takes(&g, &ana.all_of(&g));
+        // Among contacts there is nothing to ask: joining names his host.
+        assert!(!bo.core.telling(&g).ask());
+        let said = bo.says_reach(&g, true);
+        ana.takes(&g, &[said]);
+        let t = bo.core.telling(&g);
+        assert!(t.shared && t.added().is_empty() && t.keeps_current());
+
+        // Ana adds Cy, whom Bo does not know. Cy reads what is there.
+        let cy_shown = [(cy.id(), "Cy".to_owned())];
+        let added = ana.core.add_to_group(&g, &cy_shown).unwrap();
+        bo.takes(&g, std::slice::from_ref(&added));
+        cy.takes(&g, &ana.all_of(&g));
+        assert_eq!(
+            relationship::reach_of(cy.space(&g).state(), &bo.id()).len(),
+            1
+        );
+        let t = bo.core.telling(&g);
+        assert_eq!(t.added(), [cy.id()]);
+        // Nothing new is said there until he has answered, and nothing
+        // asks him as if it were not yet shared.
+        assert!(!t.keeps_current() && !t.ask() && !t.sets_unasked());
+        let listed = crate::groups::list_of(&bo.core);
+        let reach = &listed["groups"][0]["reach"];
+        assert_eq!(reach["added"], serde_json::json!(["Cy"]), "{listed}");
+        assert_eq!(reach["shared"], true);
+
+        // He keeps it: said again, in an entry that descends from the
+        // addition, and he has been told of everyone there.
+        let again = bo.says_reach(&g, true);
+        let t = bo.core.telling(&g);
+        assert!(t.added().is_empty() && t.keeps_current());
+        assert_eq!(t.who, [cy.id()]);
+        ana.takes(&g, &[again]);
+
+        // Dee is added, and this time he empties it: nobody is left to
+        // tell of, and Dee's being there is no news.
+        let dee_shown = [(dee.id(), "Dee".to_owned())];
+        let added = ana.core.add_to_group(&g, &dee_shown).unwrap();
+        bo.takes(&g, &[added]);
+        assert_eq!(bo.core.telling(&g).added(), [dee.id()]);
+        bo.answers(&g, Some(false));
+        bo.says_reach(&g, false);
+        let t = bo.core.telling(&g);
+        assert!(t.added().is_empty() && !t.shared && !t.ask());
+        dee.takes(&g, &ana.all_of(&g));
+        dee.takes(&g, &bo.all_of(&g));
+        assert!(relationship::reach_of(dee.space(&g).state(), &bo.id()).is_empty());
+
+        // A contact who is added is nobody to tell of.
+        let [mut eve, mut fay, mut gus, _] = four();
+        fay.knows(&eve, "Eve");
+        fay.knows(&gus, "Gus");
+        fay.hosts_at("203.0.113.7:7171");
+        let fay_shown = [(fay.id(), "Fay".to_owned())];
+        let h = eve.core.create_group("Choir", "Eve", &fay_shown).unwrap();
+        fay.takes(&h, &eve.all_of(&h));
+        fay.says_reach(&h, true);
+        let gus_shown = [(gus.id(), "Gus".to_owned())];
+        let added = eve.core.add_to_group(&h, &gus_shown).unwrap();
+        fay.takes(&h, &[added]);
+        gus.takes(&h, &eve.all_of(&h));
+        let t = fay.core.telling(&h);
+        assert!(t.added().is_empty() && t.keeps_current());
+    }
+
+    /// A yes given while there was no host to name does not cover whoever
+    /// was added afterwards: once there is a host, software asks again
+    /// before it names it to them.
+    #[test]
+    fn a_yes_does_not_cover_who_came_after_it() {
+        let [mut ana, mut bo, mut cy, _] = four();
+        bo.knows(&ana, "Ana");
+        let bo_shown = [(bo.id(), "Bo".to_owned())];
+        let g = ana
+            .core
+            .create_group("Garden club", "Ana", &bo_shown)
+            .unwrap();
+        bo.takes(&g, &ana.all_of(&g));
+        bo.answers(&g, Some(true));
+        bo.says_reach(&g, false);
+        let cy_shown = [(cy.id(), "Cy".to_owned())];
+        let added = ana.core.add_to_group(&g, &cy_shown).unwrap();
+        bo.takes(&g, &[added]);
+        cy.takes(&g, &ana.all_of(&g));
+        bo.hosts_at("203.0.113.5:7171");
+        let t = bo.core.telling(&g);
+        assert_eq!(t.late, [cy.id()]);
+        assert!(t.ask() && !t.sets_unasked());
+        // answered again, with Cy there, it is named
+        bo.says_reach(&g, true);
+        let t = bo.core.telling(&g);
+        assert!(t.shared && !t.ask() && t.added().is_empty());
+    }
+
+    /// `spaces.md#members-and-roles`: the entry that carries `leave` also
+    /// sets its author's reach node to an empty list, so that the space
+    /// stops naming their hosts to whoever is in it or comes to it later.
+    #[test]
+    fn leaving_empties_the_reach_node() {
+        let [mut ana, mut bo, mut cy, _] = four();
+        let bo_shown = [(bo.id(), "Bo".to_owned())];
+        let g = ana
+            .core
+            .create_group("Garden club", "Ana", &bo_shown)
+            .unwrap();
+        bo.takes(&g, &ana.all_of(&g));
+        let said = bo.says_reach(&g, true);
+        ana.takes(&g, &[said]);
+        assert_eq!(
+            relationship::reach_of(ana.space(&g).state(), &bo.id()).len(),
+            1
+        );
+        let ops = relationship::leave_ops(&bo.id());
+        let (leave, gone) = bo.core.write_entry(&g, ops).unwrap();
+        ana.takes(&g, &[gone]);
+        for who in [&ana, &bo] {
+            let sp = who.space(&g);
+            assert!(sp.validity().is_valid(&leave) && sp.state().is_accepted(&leave));
+            assert!(sp.has_left(&bo.id()));
+            assert!(relationship::reach_of(sp.state(), &bo.id()).is_empty());
+            // it is set, to nothing: not as if it had never been
+            assert!(relationship::reach_is_set(sp.state(), &bo.id()));
+        }
+        // Someone who comes later reads no host of his in what stands.
+        let cy_shown = [(cy.id(), "Cy".to_owned())];
+        ana.core.add_to_group(&g, &cy_shown).unwrap();
+        cy.takes(&g, &ana.all_of(&g));
+        assert!(relationship::reach_of(cy.space(&g).state(), &bo.id()).is_empty());
+    }
+
+    /// An offer of a group says so if the group is public
+    /// (`profiles.md#group`).
+    #[test]
+    fn an_offer_says_if_the_group_is_public() {
+        let (ana, mut bo) = (Person::new(), Person::new());
+        let mut ana = ana;
+        ana.meets(&bo);
+        bo.meets(&ana);
+        let offered = |bo: &Person| crate::groups::list_of(&bo.core)["offers"].clone();
+        for public in [false, true] {
+            let policy = Policy {
+                public,
+                ..Policy::default()
+            };
+            let ident = ana.core.identity.as_ref().unwrap();
+            let mut ops = group::genesis_ops(ana.id(), "Notices");
+            ops.push(SpaceOp::add_member(bo.id(), WRITER));
+            ops.push(group::create_member(&ana.id(), "Ana", true));
+            ops.push(group::create_member(&bo.id(), "Bo", true));
+            let (space, sealed) = Space::create_with(
+                group::GROUP,
+                policy,
+                &ident.log,
+                &ana.core.keys.device.signing,
+                &[&ana.enc(), &bo.enc()],
+                ops,
+                Some(now_ms()),
+            )
+            .unwrap();
+            bo.takes(&space.id(), &[sealed.encode()]);
+            let all = offered(&bo);
+            let id = hex::encode(space.id());
+            let offer = all.as_array().unwrap().iter().find(|o| o["group"] == id);
+            let offer = offer.unwrap_or_else(|| panic!("no offer in {all}"));
+            assert_eq!(offer["public"], public, "{offer}");
+            assert_eq!(offer["name"], "Notices");
+        }
+    }
+
+    impl Person {
         /// This person's recovery words are used twice, each time without
         /// knowing of the other: nobody can say whose hands their keys are
         /// in, and whoever holds both entries knows them to be frozen.
@@ -2673,6 +3187,209 @@ mod tests {
         }
     }
 
+    /// The order things reach the devices of a group in, after one member's
+    /// encryption key has changed.
+    #[derive(Clone, Copy, Debug)]
+    enum Order {
+        /// Every device hears of the new key, then the member whose key it
+        /// is writes, and that reaches everyone before anyone else writes.
+        HeardFirst,
+        /// The member whose key it is writes, and that reaches everyone
+        /// before they hear of the new key. Then one device after another
+        /// hears and writes, and what it writes reaches everyone before
+        /// the next one hears.
+        EpochFirst,
+        /// Hearing, writing and delivering in an order drawn from a seed.
+        Random(u64),
+    }
+
+    /// Ten members with one device each. One member's encryption key
+    /// changes; every device hears of it and writes once after it has.
+    /// Returns how many epochs were started after the change, and how many
+    /// wraps they carried.
+    fn epochs_after_a_key_change(order: Order) -> (usize, usize) {
+        const N: usize = 10;
+        let mut p: Vec<Person> = (0..N).map(|_| Person::new()).collect();
+        for i in 0..N {
+            for j in 0..N {
+                if i != j {
+                    let (log, id) = (p[j].log(), p[j].id());
+                    p[i].core.ingest_other(id, &log).unwrap();
+                }
+            }
+        }
+        let others: Vec<([u8; 32], String)> =
+            (1..N).map(|i| (p[i].id(), format!("member {i}"))).collect();
+        let g = p[0].core.create_group("Ten", "member 0", &others).unwrap();
+        let genesis = p[0].all_of(&g);
+        for person in p.iter_mut().skip(1) {
+            person.takes(&g, &genesis);
+        }
+        // The last member's key changes: their own device has it at once.
+        let x = N - 1;
+        let x_id = p[x].id();
+        let moved = p[x].changes_key();
+        assert!(
+            p[x].core
+                .ingest_identity(std::slice::from_ref(&moved), None)
+                .unwrap()
+                .changed
+        );
+        let mut heard = vec![false; N];
+        heard[x] = true;
+        let mut wrote = vec![false; N];
+        let mut inbox: Vec<std::collections::VecDeque<Vec<u8>>> = vec![Default::default(); N];
+
+        fn hear(p: &mut [Person], heard: &mut [bool], i: usize, x_id: [u8; 32], moved: &[u8]) {
+            p[i].core.ingest_other(x_id, &[moved.to_vec()]).unwrap();
+            heard[i] = true;
+        }
+        let write = |p: &mut Vec<Person>,
+                     wrote: &mut Vec<bool>,
+                     inbox: &mut Vec<std::collections::VecDeque<Vec<u8>>>,
+                     i: usize| {
+            let bytes = p[i].says(&g, "once");
+            wrote[i] = true;
+            for (j, to) in inbox.iter_mut().enumerate() {
+                if j != i {
+                    to.push_back(bytes.clone());
+                }
+            }
+        };
+        let deliver = |p: &mut Vec<Person>,
+                       inbox: &mut Vec<std::collections::VecDeque<Vec<u8>>>,
+                       j: usize| {
+            if let Some(bytes) = inbox[j].pop_front() {
+                p[j].takes(&g, &[bytes]);
+            }
+        };
+        let deliver_all =
+            |p: &mut Vec<Person>, inbox: &mut Vec<std::collections::VecDeque<Vec<u8>>>| {
+                for j in 0..N {
+                    while !inbox[j].is_empty() {
+                        deliver(p, inbox, j);
+                    }
+                }
+            };
+        match order {
+            Order::HeardFirst => {
+                for i in 0..x {
+                    hear(&mut p, &mut heard, i, x_id, &moved);
+                }
+                write(&mut p, &mut wrote, &mut inbox, x);
+                deliver_all(&mut p, &mut inbox);
+                for i in 0..x {
+                    write(&mut p, &mut wrote, &mut inbox, i);
+                    deliver_all(&mut p, &mut inbox);
+                }
+            }
+            Order::EpochFirst => {
+                write(&mut p, &mut wrote, &mut inbox, x);
+                deliver_all(&mut p, &mut inbox);
+                for i in 0..x {
+                    hear(&mut p, &mut heard, i, x_id, &moved);
+                    write(&mut p, &mut wrote, &mut inbox, i);
+                    deliver_all(&mut p, &mut inbox);
+                }
+            }
+            Order::Random(seed) => {
+                let mut state = seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1;
+                let mut below = |n: usize| {
+                    state ^= state << 13;
+                    state ^= state >> 7;
+                    state ^= state << 17;
+                    (state % n as u64) as usize
+                };
+                loop {
+                    // what can happen next: someone hears, someone who has
+                    // heard writes, or something written reaches someone
+                    let mut can: Vec<(u8, usize)> = Vec::new();
+                    for i in 0..N {
+                        if !heard[i] {
+                            can.push((0, i));
+                        } else if !wrote[i] {
+                            can.push((1, i));
+                        }
+                        if !inbox[i].is_empty() {
+                            can.push((2, i));
+                        }
+                    }
+                    if can.is_empty() {
+                        break;
+                    }
+                    match can[below(can.len())] {
+                        (0, i) => hear(&mut p, &mut heard, i, x_id, &moved),
+                        (1, i) => write(&mut p, &mut wrote, &mut inbox, i),
+                        (_, j) => deliver(&mut p, &mut inbox, j),
+                    }
+                }
+            }
+        }
+        deliver_all(&mut p, &mut inbox);
+        assert!(heard.iter().all(|h| *h) && wrote.iter().all(|w| *w));
+        // Everyone holds the same entries. Count what started an epoch
+        // after the genesis, and the wraps those entries carry.
+        let count = |person: &Person| -> (usize, usize) {
+            let sp = person.space(&g);
+            let starts = sp
+                .dag()
+                .iter()
+                .filter(|(id, e)| **id != g && e.starts_epoch());
+            let (mut epochs, mut wraps) = (0, 0);
+            for (id, _) in starts {
+                epochs += 1;
+                wraps += sp.sealed(id).and_then(|s| s.wraps()).map_or(0, |w| w.len());
+            }
+            (epochs, wraps)
+        };
+        let counted = count(&p[0]);
+        for person in &p {
+            assert_eq!(person.space(&g).dag().len(), p[0].space(&g).dag().len());
+            assert_eq!(count(person), counted);
+            assert_eq!(person.said(&g).len(), N);
+        }
+        counted
+    }
+
+    /// What one changed key costs (`spaces.md#when-to-rotate`): each device
+    /// goes by its own account of what it held when the current epoch
+    /// reached it, so more than one device can start an epoch for the one
+    /// change. A measurement, run with
+    /// `cargo test -p cardinald --lib what_one_changed_key -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn what_one_changed_key_costs_in_epochs() {
+        let (epochs, wraps) = epochs_after_a_key_change(Order::HeardFirst);
+        eprintln!("MEASURE heard first: {epochs} epochs, {wraps} wraps");
+        assert_eq!(epochs, 1);
+        let (epochs, wraps) = epochs_after_a_key_change(Order::EpochFirst);
+        eprintln!("MEASURE epoch first: {epochs} epochs, {wraps} wraps");
+        assert_eq!(epochs, 10);
+        let mut all = Vec::new();
+        for seed in 1..=12 {
+            let (epochs, wraps) = epochs_after_a_key_change(Order::Random(seed));
+            eprintln!("MEASURE random order {seed}: {epochs} epochs, {wraps} wraps");
+            assert!((1..=10).contains(&epochs));
+            all.push(epochs);
+        }
+        all.sort();
+        eprintln!(
+            "MEASURE random orders: least {}, median {}, most {}",
+            all[0],
+            all[all.len() / 2],
+            all[all.len() - 1]
+        );
+    }
+
+    /// The two orders that bound it, as a test: one epoch where every
+    /// device hears before the new epoch reaches it, and one from every
+    /// device where each hears only after.
+    #[test]
+    fn one_changed_key_costs_between_one_epoch_and_one_from_every_device() {
+        assert_eq!(epochs_after_a_key_change(Order::HeardFirst).0, 1);
+        assert_eq!(epochs_after_a_key_change(Order::EpochFirst).0, 10);
+    }
+
     /// `spaces.md#when-to-rotate`: since the epoch reached this device, by
     /// its own account, which it keeps as it keeps the space.
     #[test]
@@ -2797,6 +3514,76 @@ mod tests {
         assert!(ana.began_an_epoch(&g));
         ana.says(&g, "and no more");
         assert!(!ana.began_an_epoch(&g));
+    }
+
+    /// A file that someone moved into a place where a file means nothing is
+    /// not shown, and is current state all the same: its content is never
+    /// freed as an old version, so that moved back it is whole
+    /// (`state.md#operations`, `cleanup.rs`).
+    #[test]
+    fn the_content_of_what_is_not_shown_is_still_current() {
+        use cardinal_blob::BlobRef;
+        use cardinal_encoding::Value;
+        use cardinal_space::files::{self, Content};
+        let mut ana = Person::new();
+        let blob = |n: u8| BlobRef {
+            id: [n; 32],
+            key: [n + 100; 32],
+            size: 5000,
+            levels: 1,
+        };
+        let content = |n: u8| {
+            let b = blob(n);
+            Content::Blob(files::BlobRef {
+                id: b.id,
+                key: b.key,
+                size: b.size,
+                levels: b.levels,
+            })
+        };
+        let space = ana.core.files_id().unwrap();
+        let ops = vec![
+            files::create_file(ROOT, "a.bin", &content(1), 0o644, None),
+            files::create_file(ROOT, "b.bin", &content(2), 0o644, None),
+        ];
+        let (entry, _) = ana.core.write_entry(&space, ops).unwrap();
+        let (a, b) = (
+            files::created_node(&entry, 0),
+            files::created_node(&entry, 1),
+        );
+        let shown = |p: &Person| -> Vec<u8> {
+            let all = crate::fetch::current_blobs(p.space(&space));
+            let mut ids: Vec<u8> = all.iter().map(|(_, b)| b.id[0]).collect();
+            ids.sort();
+            ids
+        };
+        let unshown = |p: &Person| -> Vec<u8> {
+            let all = crate::cleanup::unshown_blobs(p.space(&space));
+            let mut ids: Vec<u8> = all.iter().map(|b| b.id[0]).collect();
+            ids.sort();
+            ids
+        };
+        assert_eq!((shown(&ana), unshown(&ana)), (vec![1, 2], vec![]));
+        // Moved into a file, and beside it a node of a kind nobody here
+        // knows that names content of its own.
+        let field = Record::new().with(9, Value::list([blob(3).to_record()]));
+        let ops = vec![
+            SpaceOp::mv(a, b, "a.bin"),
+            SpaceOp::create(NodeKind::Uint(77), ROOT, "new", field),
+        ];
+        let (entry, _) = ana.core.write_entry(&space, ops).unwrap();
+        assert!(ana.space(&space).state().is_accepted(&entry));
+        assert_eq!((shown(&ana), unshown(&ana)), (vec![2], vec![1, 3]));
+        // The cleaner knows every version there has been, and what is
+        // current among them is what the folder shows and what it does not.
+        let known = crate::cleanup::known_blobs(ana.space(&space));
+        assert!(known.contains_key(&[1; 32]) && known.contains_key(&[2; 32]));
+        // Moved back, it is shown again; deleted, the other is current no
+        // longer.
+        let odd = files::created_node(&entry, 1);
+        let ops = vec![SpaceOp::mv(a, ROOT, "a.bin"), SpaceOp::delete(odd)];
+        ana.core.write_entry(&space, ops).unwrap();
+        assert_eq!((shown(&ana), unshown(&ana)), (vec![1, 2], vec![]));
     }
 
     /// A store is made with its marker, and one with another, or with

@@ -835,6 +835,13 @@ fn prompt(q: &str) -> anyhow::Result<String> {
     Ok(s.trim().to_owned())
 }
 
+/// A list of names from the daemon, for a line of output.
+fn names(v: &Value) -> String {
+    let all = v.as_array().into_iter().flatten();
+    let all: Vec<String> = all.map(|x| printable(x.as_str().unwrap_or(""))).collect();
+    all.join(", ")
+}
+
 fn files(n: u64) -> String {
     format!("{n} file{}", if n == 1 { "" } else { "s" })
 }
@@ -1838,12 +1845,32 @@ async fn client(cmd: Cmd) -> anyhow::Result<()> {
                 } else {
                     String::new()
                 };
+                let public = match g["public"] == true {
+                    true => ", public",
+                    false => "",
+                };
                 println!(
-                    "{}  ({} members{unread})  {}",
+                    "{}  ({} members{unread}{public})  {}",
                     printable(g["name"].as_str().unwrap_or("")),
                     g["members"],
                     &g["group"].as_str().unwrap_or("")[..16]
                 );
+                // Someone who is not a contact was added where this
+                // person's hosts are named: they must be told, and offered
+                // to stop.
+                let added = names(&g["reach"]["added"]);
+                if !added.is_empty() {
+                    let name = printable(g["name"].as_str().unwrap_or(""));
+                    println!(
+                        "    {added} joined, not a contact of yours, and can see where your \
+                         host is ({}).",
+                        names(&g["reach"]["what"])
+                    );
+                    println!(
+                        "    To stop naming it there: cardinal group reach {name} keep. To go \
+                         on: cardinal group reach {name} share."
+                    );
+                }
             }
             for o in v["offers"].as_array().into_iter().flatten() {
                 println!(
@@ -1852,18 +1879,17 @@ async fn client(cmd: Cmd) -> anyhow::Result<()> {
                     printable(o["name"].as_str().unwrap_or("")),
                     &o["group"].as_str().unwrap_or("")[..16]
                 );
+                if o["public"] == true {
+                    println!(
+                        "    It is public: anyone who gets what is written in it can read it."
+                    );
+                }
                 if o["reach"]["ask"] == true {
-                    let list = |v: &serde_json::Value| -> String {
-                        let all = v.as_array().into_iter().flatten();
-                        let all: Vec<String> =
-                            all.map(|x| printable(x.as_str().unwrap_or(""))).collect();
-                        all.join(", ")
-                    };
                     println!(
                         "    Not contacts of yours in it: {}. Joining with --share-host tells \
                          them where your host is ({}); with --keep-host it does not.",
-                        list(&o["reach"]["who"]),
-                        list(&o["reach"]["what"]),
+                        names(&o["reach"]["who"]),
+                        names(&o["reach"]["what"]),
                     );
                 }
             }

@@ -37,8 +37,8 @@ In the data directory:
   On start, every space is rebuilt from its log: the genesis is opened,
   everything else added without an author (cheap), then evaluated once.
 - `spaces/<space id>/epochs.json` — for each epoch whose key this device
-  holds, what it held when the epoch reached it: each member's encryption
-  key (its fingerprint), who had left, and whom it knew to be frozen. The
+  holds, what it held when it first held that key: each member's
+  encryption key (its fingerprint), and whom it knew to be frozen. The
   next write starts a new epoch when one of those has changed since
   (`spaces.md#when-to-rotate`).
 - `blobs/` — `FsStore` (chunks and indexes), `Fsync::Deferred`.
