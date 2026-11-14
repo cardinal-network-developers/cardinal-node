@@ -74,6 +74,17 @@ pub fn of(paths: &Paths) -> Store {
     }
 }
 
+/// Which version wrote a store of another format, as far as its marker
+/// says: `earlier`, `later`, or `another`. For a client that says it in
+/// its own words.
+pub fn written_by(format: Option<u64>) -> &'static str {
+    match format {
+        Some(n) if n < FORMAT => "earlier",
+        Some(_) => "later",
+        None => "another",
+    }
+}
+
 /// What to tell a person whose data directory this version cannot read:
 /// which directory, who wrote it, that nothing was changed, and the two
 /// things they can do.
@@ -199,6 +210,11 @@ mod tests {
             assert_eq!(of(&paths), found, "{text:?}");
             let said = check(&paths).unwrap_err().to_string();
             assert!(said.contains(by), "{text:?}: {said}");
+            // and a client is told the same of it
+            let Store::Other(n) = found else {
+                unreachable!()
+            };
+            assert!(by.contains(written_by(n)), "{text:?}: {by}");
         }
     }
 }

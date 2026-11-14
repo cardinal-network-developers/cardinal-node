@@ -28,6 +28,9 @@ In the data directory:
   `cardinal clear` (`clear.rs`) removes what the node wrote here, whatever
   its format, so that `cardinal init` can start again; it leaves
   `config.toml` and, unless told otherwise, `local/` and `local-shared/`.
+  A client that starts the service itself asks `cardinald --store` which
+  store is here and what it holds, and clears it with `cardinald --clear`
+  (`bin/cardinald.rs`): one line of JSON each.
 - `device.key` — the Ed25519 signing seed and the hybrid link key, JSON
   hex, **mode 0600**. Keeping them in the desktop keyring (Secret Service)
   or a TPM is future work.

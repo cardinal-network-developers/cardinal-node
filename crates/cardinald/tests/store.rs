@@ -1,0 +1,193 @@
+//! What `cardinald` tells a client that starts it and has no `cardinal`
+//! command: which store the data directory holds (`--store`), and its
+//! removal (`--clear`). Each answers in one line of JSON.
+
+use std::path::{Path, PathBuf};
+use std::process::{Command, Output, Stdio};
+use std::time::{Duration, Instant, SystemTime};
+
+use serde_json::{json, Value};
+
+const BIN: &str = env!("CARGO_BIN_EXE_cardinald");
+
+fn cmd(home: &Path) -> Command {
+    let mut c = Command::new(BIN);
+    c.env("CARDINAL_HOME", home)
+        .env("CARDINAL_SOCKET", home.join("control.sock"))
+        .env("HOME", home);
+    c
+}
+
+fn asked(home: &Path, what: &str) -> (Output, Value) {
+    let out = cmd(home).arg(what).output().unwrap();
+    let said = String::from_utf8_lossy(&out.stdout).into_owned();
+    assert_eq!(said.lines().count(), 1, "one line: {said:?}");
+    let v = serde_json::from_str(&said).unwrap_or_else(|e| panic!("{said:?}: {e}"));
+    (out, v)
+}
+
+fn put(home: &Path, rel: &str, bytes: &[u8]) {
+    let p = home.join(rel);
+    std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+    std::fs::write(p, bytes).unwrap();
+}
+
+/// A data directory with one of everything in it, of this version.
+fn full(home: &Path) {
+    put(home, "device.key", b"key");
+    put(home, "identity.log", b"log");
+    put(home, "format", b"2\n");
+    put(home, "spaces/aa/entries.log", b"entries");
+    put(home, "spaces/bb/entries.log", b"entries");
+    put(home, "blobs/objects/ab/cd/abcd", &[0; 10]);
+    put(home, "blobs/objects/ab/ce/abce", &[0; 20]);
+    put(home, "staging/1-1", &[0; 7]);
+    put(home, "others/cc", b"log");
+    put(home, "peers.json", b"{}");
+    put(home, "local/notes/draft.txt", &[0; 5]);
+    put(home, "config.toml", b"[daemon]\nname = \"here\"\n");
+    put(home, "mine.txt", b"not the service's");
+}
+
+/// Every file there: its path, its length, and when it was last written.
+fn everything(home: &Path) -> Vec<(PathBuf, u64, SystemTime)> {
+    fn walk(dir: &Path, out: &mut Vec<(PathBuf, u64, SystemTime)>) {
+        for e in std::fs::read_dir(dir).unwrap().flatten() {
+            let m = e.metadata().unwrap();
+            if m.is_dir() {
+                walk(&e.path(), out);
+            } else {
+                out.push((e.path(), m.len(), m.modified().unwrap()));
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(home, &mut out);
+    out.sort();
+    out
+}
+
+fn names(home: &Path) -> Vec<String> {
+    let mut all: Vec<String> = std::fs::read_dir(home)
+        .unwrap()
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .collect();
+    all.sort();
+    all
+}
+
+#[test]
+fn it_says_which_store_is_there_and_changes_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path();
+    let (out, v) = asked(home, "--store");
+    assert!(out.status.success());
+    assert_eq!(v["store"], "empty", "{v}");
+    assert_eq!(v["holds"]["identity"], false, "{v}");
+    assert!(v.get("refusal").is_none(), "{v}");
+    assert!(names(home).is_empty(), "asking made something");
+
+    full(home);
+    let before = everything(home);
+    let (_, v) = asked(home, "--store");
+    assert_eq!(v["store"], "current", "{v}");
+    let holds = json!({
+        "identity": true, "spaces": 2, "objects": 2, "bytes": 30, "unsaved": 1,
+        "unsaved_bytes": 7, "local": 1, "local_bytes": 5, "other": true,
+    });
+    assert_eq!(v["holds"], holds);
+    assert!(v.get("written_by").is_none(), "{v}");
+
+    // What 0.1.13 left has no marker: an earlier version's, and said so in
+    // the words the daemon refuses it with.
+    std::fs::remove_file(home.join("format")).unwrap();
+    let before_old = everything(home);
+    assert_eq!(before_old.len(), before.len() - 1);
+    for (marker, by) in [
+        (None, "earlier"),
+        (Some("1\n"), "earlier"),
+        (Some("7\n"), "later"),
+        (Some("two\n"), "another"),
+    ] {
+        if let Some(text) = marker {
+            std::fs::write(home.join("format"), text).unwrap();
+        }
+        let (out, v) = asked(home, "--store");
+        assert!(out.status.success(), "{marker:?}");
+        assert_eq!(v["store"], "other", "{marker:?}: {v}");
+        assert_eq!(v["written_by"], by, "{marker:?}: {v}");
+        assert_eq!(v["holds"], holds, "{marker:?}");
+        let said = v["refusal"].as_str().unwrap();
+        for part in [
+            &*home.display().to_string(),
+            "this version cannot read it",
+            "Nothing was changed",
+        ] {
+            assert!(said.contains(part), "{said:?} lacks {part:?}");
+        }
+        // and the service itself does not start on it
+        let run = cmd(home).arg("--no-discovery").output().unwrap();
+        assert!(!run.status.success(), "{marker:?}");
+        let why = String::from_utf8_lossy(&run.stderr);
+        assert!(why.contains("this version cannot read it"), "{why}");
+    }
+    std::fs::remove_file(home.join("format")).unwrap();
+    assert_eq!(everything(home), before_old, "something was changed");
+}
+
+#[test]
+fn it_clears_what_the_service_wrote_and_nothing_else() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path();
+    full(home);
+    std::fs::remove_file(home.join("format")).unwrap();
+    let (out, v) = asked(home, "--clear");
+    assert!(out.status.success(), "{v}");
+    assert_eq!(v, json!({"ok": true}));
+    // The settings stay, and so does what is the person's own.
+    assert_eq!(names(home), ["config.toml", "local", "mine.txt"]);
+    assert!(home.join("local/notes/draft.txt").exists());
+    let (_, v) = asked(home, "--store");
+    assert_eq!(v["store"], "empty", "{v}");
+    assert_eq!(v["holds"]["local"], 1, "{v}");
+    // Again changes nothing.
+    let (out, v) = asked(home, "--clear");
+    assert!(out.status.success(), "{v}");
+    assert_eq!(names(home).len(), 3);
+}
+
+#[test]
+fn it_clears_nothing_while_the_service_runs() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path();
+    let port = {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        l.local_addr().unwrap().port()
+    };
+    let mut child = cmd(home)
+        .args(["--no-discovery", "--listen", &format!("127.0.0.1:{port}")])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let start = Instant::now();
+    while !home.join("control.sock").exists() {
+        if start.elapsed() > Duration::from_secs(30) {
+            let _ = child.kill();
+            panic!("the service never started");
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let (out, v) = asked(home, "--clear");
+    let _ = child.kill();
+    let _ = child.wait();
+    assert!(!out.status.success(), "{v}");
+    assert_eq!(v["ok"], false, "{v}");
+    let why = v["error"].as_str().unwrap();
+    assert!(
+        why.contains("is running") && why.contains("Nothing was changed"),
+        "{why}"
+    );
+    assert!(home.join("device.key").exists(), "its keys were removed");
+}

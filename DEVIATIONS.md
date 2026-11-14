@@ -830,6 +830,17 @@ Not implemented yet (the next milestone):
   without `--yes` asks for the word `clear`. The marker goes first and the
   identity log last, so that an interrupted clear leaves a directory that
   nothing opens and that clearing again finishes.
+- **A client that starts the service itself** (`bin/cardinald.rs`; not in
+  the specification). A phone and Windows have no `cardinal` command to
+  say why the service did not start, or to clear a store. `cardinald
+  --store` answers in one line of JSON and starts nothing: `store`
+  (`empty`, `current`, `other`), what the directory `holds` as `clear`
+  counts it, and for another version's store `written_by` (`earlier`,
+  `later`, `another`) and the `refusal` in the daemon's words. `cardinald
+  --clear` removes what `cardinal clear` removes, never the files kept on
+  this device only, answers `ok` or an `error`, and refuses while a
+  service answers on that directory. The client says what will be removed
+  and asks first (`clients.md`).
 - **Objects that nothing names** (`cleanup.rs`, `cardinal free-space
   --unnamed [--delete]`). An object is named if it is reachable, through
   indexes at every level, from a blob reference anywhere in any op of any
