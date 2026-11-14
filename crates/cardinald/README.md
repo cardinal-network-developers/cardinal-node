@@ -181,9 +181,10 @@ committed. Each inode maps to a space node once created there.
 - **Commit** after 200 ms without changes, or after 2 s of continuous
   activity (`profiles.md#files`). A file still being written (open for
   writing and written in the last 200 ms) waits for its own quiet period.
-  A burst becomes one entry per level of newly created folders (a node
-  created in an entry cannot be named in the same entry), split further
-  only when an entry would get large.
+  A burst becomes one entry: what is put in a folder the same burst
+  makes names it by the place of its `create` in the entry
+  (`state.md#a-node-made-in-the-same-entry`). It is split only when an
+  entry would get large.
 - `rename` over an existing file keeps the *replaced* file's node and
   writes its content, so editors' atomic saves (write temp, rename over)
   are edits of the file, with history and conflict detection, not a

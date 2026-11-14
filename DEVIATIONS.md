@@ -31,7 +31,13 @@ follow it across two spaces. What still differs:
   by a device that is then retired or lost, the space node's field 4 in the
   account space, tokens and storage labels that serve a successor, and what
   a device does with a successor that is public where the old space was
-  not (Following's condition 5, "Made public"). The
+  not (Following's condition 5, "Made public"). With the initial state
+  go two rules of `state.md` and `spaces.md` that nothing here can reach
+  yet: the nodes a successor's initial state carried need no `create`
+  (here a node exists by its `create`, the root and the reach nodes
+  aside), and an op posted again that named its parent by index is given
+  the index its `create` has in the new entry (here nothing posts again).
+  The
   fields that exist for it are read, written and kept, and mean nothing yet:
   fields 3, 4 and 6 to 9 of `start`, fields 2 and 3 of `succeed`, and
   `was` on `create`. A device that receives a `succeed` that ends a space
@@ -171,6 +177,37 @@ below, each under its section.
   member who is a contact gets every file the group's messages carry that
   this device holds, whoever sent it, since members who do not know each
   other get files through one who knows both, who keeps them.
+- **What current state references** (`blobs.md#retention`,
+  `fetch::state_blobs`). Every blob reference, found by its shape at any
+  depth, in every value a field holds now (each of them where a field is
+  in conflict), of every node that is neither deleted nor beneath a
+  deleted one, whatever its kind and wherever it is. A device that keeps
+  everything fetches all of it: besides the files and attachments it
+  shows, the content of kinds it does not know, in its files space from
+  its own devices, in a relationship from the other person's, and in a
+  group through a member it knows (`fetch::wanted`). A device that keeps
+  on demand fetches none of that: nothing there can open it. The hourly
+  pass counts all of it as current, so none is freed as an old version,
+  and the copy checks sample it with the rest.
+  - **Reading: a deleted node.** A deleted node is still a node of the
+    state, and "a field of one of its nodes" could take it in. Chose: what
+    a deleted node holds, or one beneath it, is not current, as the
+    content of a deleted file is not. It is kept as an old version only
+    where it is a file's content; see the next.
+  - **Not done: old values of kinds nobody knows.** What such a field
+    held before is not current and is not known to the hourly pass as an
+    old version either (`known_blobs` reads file content alone), so on a
+    device that fetched it, it stays until `cardinal clear`. It is named,
+    so `free-space --unnamed` leaves it too.
+  - **Reading: a full holder.** Retention here is one setting for the
+    device (`retention` in `config.toml`), not one per space.
+  - **Reading: what a contact is served** follows what they now fetch: in
+    a relationship, also every reference in a value this person wrote
+    there, and in a group everything its state references (see the first
+    item of this section).
+  - A record that only looks like a reference is fetched like one, and
+    stays wanted for as long as nobody has it. In the account space
+    nothing is looked for.
 - **Shared files come from the two people's own devices, while online.**
   A device with full retention keeps every file of a shared folder and every
   attachment as they arrive, and one on demand keeps images up to 16 MiB, so
@@ -404,11 +441,8 @@ below, each under its section.
   `Space::is_public`). Field 2 of the policy is read once, from the
   `start` of the genesis, and kept apart from the rest of the policy:
   nothing written later reaches it, a valid `set_policy` of the owner's
-  included (`tests/space.rs`). A genesis is held to it like any entry.
-  **Spec ambiguity: a `set_policy` inside the genesis.** A genesis may
-  carry one, and it may say otherwise than the `start` beside it. "Read
-  from the genesis alone" does not say from which op. Chose: the `start`,
-  since a `set_policy` "does not change it, whatever it carries there".
+  included (`tests/space.rs`), and one in the genesis itself beside the
+  `start`. A genesis is held to it like any entry.
 - **A reader's one op.** A `set` whose node is `reach_node_id(author)`
   (`validity.rs`, `class`), of any field, in any profile, an account space
   included.
@@ -461,15 +495,39 @@ below, each under its section.
 
 ## State (`spec/state.md`, `spec/profiles.md`)
 
-- **A node named earlier in the same entry.** A node may be named by an op
-  after its `create` in the same entry; an op before the `create` rejects
-  the entry, as `state.md#operations` now says. **Spec observation:**
-  nothing can reach this case. A node's id is derived from the id of the
-  entry that creates it, and that id covers the entry's ops, so an entry
-  that named a node it creates would have to contain a hash of itself
-  (see "a node cannot be named in the entry that creates it", under
-  Daemon). The rule is implemented, and no entry can be written that it
-  accepts.
+- **A node made in the same entry** (`state.md#a-node-made-in-the-same-entry`,
+  `entry.rs`, `tests/index.rs`, `vectors/state.json`). Field 2 of `create`
+  and of `move` may hold an unsigned integer, the place of an earlier
+  `create` in the same entry. It becomes the id in the one place an entry
+  is read (`SpaceEntry::from_signed`), which a built entry goes through as
+  well, so nothing after that step holds an index: an op's parsed form has
+  the id and its record the bytes as written. An op read outside an entry
+  that holds an index names no parent (`SpaceOp::from_record`). What names
+  nothing parses as an op of that number that nobody defines: it is a
+  profile op for validity, so a writer's entry is valid and a reader's is
+  not, and it is not accepted for state.
+  - **Reading: integers.** An index is read at the full width an integer
+    has (below 2^60), and compared with the op's own place before it is
+    used for anything. A negative integer, text, a list, and bytes of any
+    length but 16 name nothing.
+  - **Reading: "at which there is no `create`".** Asked of the parsed op:
+    an op numbered 32 whose own fields are wrong is not one. Nothing can
+    tell the difference, since such an op puts its entry out of the state
+    by itself. For the same reason the test for a `create` at the index
+    changes no result: the id derived for an op that creates nothing is
+    the id of no node. It is kept because the specification states it.
+  - **Reading: a `move` under a node the entry creates, and a cycle.** A
+    `move` whose index names a node that the entry then moves under the
+    moved node is a cycle like any other: the entry is accepted, and the
+    merge skips the move that would close it.
+- **A delete reads the ops before it in its own entry**
+  (`state.md#deletion-yields-to-concurrent-work`). What is beneath the
+  deleted node is what the delete's causal past and the `create`s and
+  `move`s before it in its entry put there, in both ways the state is
+  worked out and in the definition the tests compare them with
+  (`State::compute_by_definition`). So `[move Photos under G, delete G]`
+  takes Photos, and a concurrent edit of Photos keeps G, as with two
+  entries.
 - **Reach nodes** (`state.md#nodes`). A reach node is in no registry of
   created nodes, so an op that names one is refused exactly as an op that
   names a node nobody created, with one exception: a `set` by the identity
@@ -493,26 +551,9 @@ below, each under its section.
   contacts, hosts and spaces are those at the top, and a placement one
   under a space node. An op the profile does not define still puts its
   entry out of the state.
-  - **Spec ambiguity: a `move`.** "A `create` is accepted whatever its
-    kind and wherever it puts the node" says nothing of `move`, which can
-    put a node where its kind means nothing just as well. Chose: a `move`
-    is accepted wherever it puts a node too (a cycle aside, which the
-    merge skips). The other reading would leave the state depending on
-    which tables a device knows, which is what the paragraph is there to
-    prevent.
-  - **Spec gap: the content of what is not shown.** "Kept and synced" is
-    said of the node. `blobs.md` has a device that keeps a space in full
-    "keep every chunk referenced by current state", and which fields of a
-    kind nobody knows reference chunks is not something a device can read
-    from a table. Chose: the cleaner counts as current every blob
-    reference, found by its shape, in the current values of any node that
-    is not deleted and that the folder does not show, so that content is
-    never freed as an old version (a file someone moved into a file, and
-    moved back, is whole). Nothing fetches such content: a device fetches
-    what it shows.
-  - Conflicts in nodes the folder does not show are not listed by
-    `cardinal conflicts` or counted in `status`: nothing here could settle
-    them.
+  A `move` is accepted wherever it takes a node, a cycle aside, which the
+  merge skips. Conflicts in nodes the folder does not show are not listed
+  by `cardinal conflicts` or counted in `status`.
 - **File content and conflict copies.** The version "last in log order" is
   the value whose writing entry is last in log order; same-name siblings
   are ordered by the log position of their creating entry.
@@ -829,14 +870,17 @@ Not implemented yet (the next milestone):
   holder was reachable; `cardinal free-space` says either. No client shows
   them yet.
 
-- **Spec ambiguity: a node cannot be named in the entry that creates it.**
-  `state.md` allows naming a node "in the entry itself", but a node's id is
-  `BLAKE3(entry id || i)` and the entry id covers its ops, so no op can
-  name it. A burst of changes that creates a folder and files in it is
-  therefore written as one entry per level of new folders, in quick
-  succession, rather than "one entry per burst" (`profiles.md#files`). The
-  spec could let ops name a node created earlier in the same entry by its
-  op index.
+- **A new folder and what is in it are one entry** (`fs/commit.rs`,
+  `state.md#a-node-made-in-the-same-entry`). What a burst puts in a folder
+  the same burst makes names it by the place of its `create`: new files
+  and folders, and existing ones moved in. In a round what is new is
+  written first, each in the order it was made here, and what is moved or
+  edited after. A burst too large for one entry (96 KiB of ops) is cut,
+  and what comes after a cut names by id what an earlier entry made. One
+  case still takes a second entry: something new that was put under a
+  folder made after it. Everything else that writes entries (`Core::write`
+  and its callers) cuts ops into entries without regard to indexes, and
+  none of it writes one.
 - **Spec ambiguity: which device shows the pairing code.** `contact.md`
   and `experience.md` have the new device show the code and an admin type
   it; this is what is implemented (`cardinal pair` on the new device,
@@ -1075,17 +1119,10 @@ asks for around that is not built yet.
     they write something valid that descends from that addition, once
     more after each time they leave. What another of their devices wrote
     meanwhile, without the addition in its past, accepts nothing.
-  - **Spec gap: the answer of someone who leaves.** The answer about
-    hosts is "kept with the space in their account", and nothing says
-    what becomes of it when they leave, or when they are offered the
-    space again with other people in it. Chose: leaving takes the answer
-    back (field 5 is cleared), and an offer always asks where there is a
-    host to name and someone who is not a contact, whatever the account
-    says.
-  - **Spec ambiguity: a `leave` whose entry does not empty the reach
-    node.** "The entry that carries it also sets..." says what a writer
-    does. Chose: one that does not is a `leave` all the same; nothing
-    about validity or about who has left looks for the `set`.
+  - Leaving forgets the answer about hosts (field 5 is cleared), and an
+    offer always asks where there is a host to name and someone who is not
+    a contact. A `leave` whose entry does not empty the reach node is a
+    `leave` all the same.
   - A token ended on leaving never comes back. Joining again sets the
     reach node again, with new tokens.
   - Someone who left still asks the others for the group when they meet,
@@ -1112,8 +1149,10 @@ asks for around that is not built yet.
   to make one by hand; only a group's are made unasked. An introduction's
   invitation names the introduced person's host if they have one, and the
   device that said yes if not, which someone elsewhere cannot reach.
-- **Refuse is for contacts.** `member seen` nodes do not exist yet, and there
-  are no group spaces to warn about. A host revokes its tokens for someone
+- **Refuse is for contacts.** `member seen` nodes do not exist yet. Nothing
+  warns when someone refused is added to a group with this person, except
+  where their hosts are named there ([Hosts](#hosts-spechostsmd), "Whoever
+  is added later, or refused while there"). A host revokes its tokens for someone
   refused as soon as the account space reaches it, wherever the refusal was
   made, and gives them new ones if it is taken back.
 - **A contact can fill a disk.** A device stores an entry before it judges it,
@@ -1183,50 +1222,51 @@ asks for around that is not built yet.
     `ask` in `groups`, and `group-join` fails without an answer.
   An answer is kept whenever one is given: `reach` on `group-join`, among
   contacts too, and `group-reach`, which no longer refuses anything.
-  - **Spec ambiguity: two answers at once.** Two of a person's devices can
-    answer differently before either hears of the other, and a field then
-    holds both; two devices can also each make a space node. Chose: no
-    wins, wherever the account says both. An answer given later is
-    written on every node the account has for the space.
-  - **Spec gap: the answer and the emptying are in two spaces.** "None
-    fills in what another emptied" holds once the account entry has
-    arrived. A device that receives the emptied reach node before it
-    receives the answer, in a space where everyone is a contact and the
-    person was never asked, takes it for a reach node set for want of a
-    host, and fills it in. Chose: the answer is written first, and a
-    device that finds hosts named where the answer is no empties the
-    reach node again, which needs no asking. So the hosts can be named
-    for as long as two spaces take to sync, and are in the history.
-    A field of the reach node itself would close that.
-  - **Spec gap: who a yes covers.** A yes given while the reach node names
-    no host (there was none) is an answer for the members there were.
-    Chose: once there is a host, software names it only if nobody who is
-    not a contact was added since the reach node was last set; otherwise
-    it asks again (`ask`).
-  - **Spec gap: someone who gets a host later, and was never asked.**
-    Chose: among people who are not all contacts nothing is set, and `ask`
-    turns true in `groups`, so a client can ask then.
-- **Whoever is added later** (`hosts.md`, "Whoever is added later reads
-  what is already there"). Where this person's reach node names their
-  hosts and someone who is not their contact has been added since it was
-  last set, `groups` names them in `reach.added`, and `cardinal groups`
-  says who can see what, and how to stop or go on. That is all the local
-  interface gained for it. The offer to empty it is `group-reach` with
-  `share` false. `share` true keeps it: the reach node is set again to
-  what it says, in an entry that descends from the addition, and `added`
-  is empty again.
-  - **Reading: how "told" is remembered.** Nothing is stored. Someone is
-    new to the person if no valid `add_member` of theirs is in the causal
-    past of the entry that last set the reach node; the genesis's members
-    never are. So every device of the person tells them, until one of
-    them has their answer, and then none does.
-  - **Reading: nothing new is said meanwhile.** "Keeping current what the
-    person has agreed to share" needs no asking, and the person has not
-    agreed to share with someone they have not been told of. Chose: while
-    `added` names anyone, software sets nothing in that reach node: a
-    changed address or a renewed token waits for the answer. It also keeps
-    the test above honest, since a `set` by software would descend from
-    the addition as surely as the person's.
+  - Where the account says both, no stands. Two devices can also each
+    make a space node for one space: an answer is read from all of them,
+    and one given later is written on each.
+  - The answer is written first, in the account, and the reach node after
+    it; a device that finds hosts named against a no empties the node. So
+    the hosts can be named for as long as two spaces take to sync, and are
+    in the history. A field of the reach node itself would close that.
+  - A yes covers the members there were. Once there is a host, software
+    names it only if nobody who is not a contact was added since the
+    reach node was last set, and asks again otherwise (`ask`).
+  - **Reading: someone who gets a host later, and was never asked.** Among
+    people who are not all contacts nothing is set, and `ask` turns true
+    in `groups`, so a client can ask then.
+- **Whoever is added later, or refused while there** (`hosts.md`, "Whoever
+  is added later reads what is already there"). Where this person's reach
+  node names their hosts, `groups` names in `reach.added` each member who
+  is not their contact and whom nothing they said took into account, and
+  `cardinal groups` says who can see what, and how to stop or go on. While
+  it names anyone, software sets nothing in that reach node. The offer to
+  empty it is `group-reach` with `share` false; `share` true keeps it.
+  Nothing is stored to remember who was told, so every device tells until
+  one has the answer:
+  - **Added**: no valid `add_member` of theirs is in the causal past of
+    the entry that last set the reach node. A yes sets the reach node
+    again to what it says, which puts the addition in its past.
+  - **Reading: refused** (`account::refused_since_answer`). The person
+    refused them, and no answer the account has for the space was written
+    by an entry that has the refusing entry in its past. Both are in the
+    account, so the test needs nothing from the space. For it to work,
+    `group-reach` writes the answer again even where it says what the
+    account says already, when someone refused is there unanswered. An
+    answer given on a device that had not yet heard of the refusal does
+    not count, and the person is told again. A refusal taken back leaves
+    nobody to tell of. Someone refused and then added falls under both
+    tests, and one `group-reach` answers both.
+  - **Reading: `added` for someone who did not come.** `apps.md` describes
+    `added` as members who "came since their hosts were last named
+    there". Someone refused is listed there too: it is the one place a
+    client is told, and `group-reach` is the one answer. `cardinal contact
+    NAME refuse` prints the same lines at once for each group it touches.
+  - **Reading: the relationship with the person refused.** Its reach node
+    names this person's hosts too, and the two are its only members.
+    Nothing is told and nothing is emptied there: they have the host
+    already, their token is revoked, and that reach node is not kept
+    current while they are refused.
   - **Spec gap: only groups have a way to be told or to answer.** Any
     other space shared with someone who is not a contact is not something
     this build makes.
@@ -1317,6 +1357,6 @@ asks for around that is not built yet.
   laptop), and status gives its time. Results are persisted
   (`copies.json`), so a restart neither drops offline holders nor shows
   them as unchecked.
-- **Only the files space.** It is the only space with blobs, so checks
-  sample it alone. Checks ask for chunks and indexes only: content under
+- **Only the files space.** Checks sample it alone: what its folder
+  shows, and whatever else its current state references. Checks ask for chunks and indexes only: content under
   1 KiB lives in entries, which every device holds.

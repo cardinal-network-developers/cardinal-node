@@ -2,15 +2,17 @@
 //! after writes have been quiet for 200 ms, or after 2 seconds of
 //! continuous activity, everything pending becomes one burst of entries.
 //!
-//! A node created in an entry cannot be named by a later op of the same
-//! entry (its id depends on the entry's id), so a burst that creates
-//! folders and things inside them is written as one entry per level of
-//! new folders (see DEVIATIONS.md).
+//! A new folder and what is put in it are one entry: no op can hold the
+//! id of a node its own entry creates (the id follows from the entry's),
+//! so what goes in a folder made earlier in the entry names it by the
+//! place of its `create` there (`state.md#a-node-made-in-the-same-entry`).
+//! A burst too large for one entry is cut where it has to be, and what
+//! comes after a cut names by id what an earlier entry made.
 //!
 //! A local change supersedes only what the mount had shown when it was
 //! made: see [`write_pending`].
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -366,10 +368,18 @@ pub fn write_pending(
         // (op, what it does to which inode)
         let mut ops: Vec<SpaceOp> = Vec::new();
         let mut effects: Vec<Effect> = Vec::new();
+        // By inode, the place among `ops` of the `create` this round
+        // writes for it; and by the place of an op, the place of the
+        // `create` of the parent it names, where this round makes that.
+        let mut made: HashMap<u64, usize> = HashMap::new();
+        let mut under: HashMap<usize, usize> = HashMap::new();
         // ops to write concurrent with the entries of the key
         let mut concurrent: BTreeMap<Vec<EntryId>, Concurrent> = BTreeMap::new();
+        // What is new first, so that whatever is put in a new folder
+        // finds its `create` earlier in the round; each in the order it
+        // was made here, which has a folder before what was made in it.
         let mut inos: Vec<u64> = t.inodes.keys().copied().collect();
-        inos.sort_unstable();
+        inos.sort_unstable_by_key(|ino| (t.inodes[ino].node.is_some(), *ino));
         for ino in inos {
             if ino == t.root {
                 continue;
@@ -379,8 +389,14 @@ pub fn write_pending(
             if i.parent == 0 || i.local || matches!(i.kind, Kind::Conflict(_)) {
                 continue;
             }
-            let Some(pnode) = t.inodes.get(&i.parent).and_then(|p| p.node) else {
-                continue;
+            // The parent: a node, or one an earlier op of this round
+            // makes, for which the root stands until the ops are cut into
+            // entries. One made by a later op waits for the next round.
+            let parent = t.inodes.get(&i.parent).and_then(|p| p.node);
+            let (pnode, made_at) = match (parent, made.get(&i.parent)) {
+                (Some(node), _) => (node, None),
+                (None, Some(place)) => (ROOT, Some(*place)),
+                (None, None) => continue,
             };
             let content_ready = i.kind != Kind::File
                 || i.staged.is_none()
@@ -404,6 +420,8 @@ pub fn write_pending(
                         Kind::Symlink => kinds.create_link(pnode, name, &i.target),
                         Kind::Conflict(_) => unreachable!(),
                     };
+                    made.insert(ino, ops.len());
+                    under.extend(made_at.map(|place| (ops.len(), place)));
                     effects.push(Effect::Created(ino));
                     ops.push(op);
                     // what was read is in this round's ops: once per commit
@@ -411,6 +429,7 @@ pub fn write_pending(
                 }
                 Some(node) => {
                     if i.dirty.pos {
+                        under.extend(made_at.map(|place| (ops.len(), place)));
                         ops.push(SpaceOp::mv(node, pnode, &i.name));
                         effects.push(Effect::Clean(ino, Flag::Pos));
                     }
@@ -542,10 +561,13 @@ pub fn write_pending(
         }
         // write, one entry per batch, mapping created ops to node ids
         let mut idx = 0;
-        for batch in split_ops(ops) {
+        let mut nodes: HashMap<usize, NodeId> = HashMap::new();
+        for mut batch in split_ops(ops) {
             let n = batch.len();
+            name_parents(&mut batch, idx, &under, &nodes);
             let (eid, bytes) = core.write_entry(space, batch)?;
             written.push(bytes);
+            nodes.extend((0..n).map(|k| (idx + k, files::created_node(&eid, k))));
             finish(t, &eid, &effects[idx..idx + n]);
             idx += n;
         }
@@ -571,6 +593,29 @@ pub fn write_pending(
         t.last_change = None;
     }
     Ok(written)
+}
+
+/// Gives the ops of one entry the parents their round made
+/// (`state.md#a-node-made-in-the-same-entry`). `batch` is the round's ops
+/// from place `first` on, `under` says for an op's place in the round the
+/// place of the `create` of its parent, and `nodes` what the entries
+/// written so far made, by place. A parent made in this entry is named by
+/// its index there, and one made in an earlier entry by its id.
+fn name_parents(
+    batch: &mut [SpaceOp],
+    first: usize,
+    under: &HashMap<usize, usize>,
+    nodes: &HashMap<usize, NodeId>,
+) {
+    for (k, op) in batch.iter_mut().enumerate() {
+        let Some(place) = under.get(&(first + k)) else {
+            continue;
+        };
+        *op = match place.checked_sub(first) {
+            Some(index) => op.with_parent(index as u32),
+            None => op.with_parent(nodes[place]),
+        };
+    }
 }
 
 /// Whether ops can be written in an entry concurrent with `exclude`:
@@ -693,6 +738,7 @@ mod tests {
     use crate::paths::Paths;
     use crate::setup;
     use cardinal_crypto::HybridKeyPair;
+    use cardinal_encoding::Value;
 
     struct Fx {
         _dir: tempfile::TempDir,
@@ -1280,11 +1326,106 @@ mod tests {
                 fx.write_in(e, &format!("f{j}"), format!("{k}/{j}").as_bytes());
             }
         }
-        fx.commit();
+        // New folders and what is in them are one entry.
+        assert_eq!(fx.commit(), 1);
         assert!(!fx.t.has_pending());
-        let f = Files::new(fx.sp());
-        let list = f.list_path("d7/e").unwrap();
+        let list = Files::new(fx.sp()).list_path("d7/e").unwrap();
         assert_eq!(list.len(), 10);
+        let last = *fx.sp().dag().log_order().last().unwrap();
+        assert!(fx.sp().state().is_accepted(&last));
+        let entry = fx.sp().entry(&last).unwrap();
+        assert_eq!(entry.ops().len(), 20 * 12);
+        // Each names its parent by the place of the op that made it, and
+        // is kept as it was written; the state holds ids alone.
+        let by_index = |op: &SpaceOp| op.record().get(2).and_then(|v| v.as_uint()).is_some();
+        assert_eq!(
+            entry.ops().iter().filter(|op| by_index(op)).count(),
+            20 * 11
+        );
+        let d7 = fx.t.child(ROOT_INO, "d7").unwrap();
+        let e = fx.t.child(d7, "e").unwrap();
+        let f3 = fx.t.child(e, "f3").unwrap();
+        let st = fx.sp().state();
+        assert_eq!(st.node(&fx.node(f3)).unwrap().parent, fx.node(e));
+        assert_eq!(st.node(&fx.node(e)).unwrap().parent, fx.node(d7));
+        assert_eq!(st.node(&fx.node(d7)).unwrap().parent, ROOT);
+        // Nothing is left to say: a second commit writes nothing.
+        assert_eq!(fx.commit(), 0);
+    }
+
+    /// A burst too large for one entry is cut, and what comes after a cut
+    /// names by id what an earlier entry made, and by index what its own
+    /// entry makes.
+    #[test]
+    fn a_burst_cut_into_entries_names_each_parent_where_it_was_made() {
+        let mut fx = Fx::new();
+        let top = fx.t.alloc(Kind::Dir);
+        fx.t.attach(top, ROOT_INO, "top");
+        // Enough inline content that the files do not fit one entry.
+        let body = vec![7u8; 900];
+        let count = 2 * crate::core::MAX_ENTRY_OPS_BYTES / body.len();
+        for j in 0..count {
+            fx.write_in(top, &format!("f{j}"), &body);
+        }
+        let inner = fx.t.alloc(Kind::Dir);
+        fx.t.attach(inner, top, "inner");
+        let last = fx.write_in(inner, "last", b"x");
+        let written = fx.commit();
+        assert!(written >= 2, "{written}");
+        assert!(!fx.t.has_pending());
+        let ids: Vec<EntryId> = fx.sp().dag().log_order().to_vec();
+        let ids = &ids[ids.len() - written..];
+        assert!(ids.iter().all(|id| fx.sp().state().is_accepted(id)));
+        let f = Files::new(fx.sp());
+        assert_eq!(f.list_path("top").unwrap().len(), count + 1);
+        assert_eq!(f.list_path("top/inner").unwrap().len(), 1);
+        let st = fx.sp().state();
+        assert_eq!(st.node(&fx.node(last)).unwrap().parent, fx.node(inner));
+        assert_eq!(st.node(&fx.node(inner)).unwrap().parent, fx.node(top));
+        // In the first entry the files name the folder by its place; in
+        // the last they name it by the id the first gave it, and `last`
+        // names `inner` by its place there.
+        let parents = |id: &EntryId| -> Vec<Value> {
+            let ops = fx.sp().entry(id).unwrap().ops().to_vec();
+            let all = ops.iter().filter_map(|op| op.record().get(2).cloned());
+            all.collect()
+        };
+        let first = parents(&ids[0]);
+        assert_eq!(first[0], Value::from(ROOT));
+        assert!(first[1..].iter().all(|p| *p == Value::from(0u32)));
+        let end = parents(ids.last().unwrap());
+        let n = end.len();
+        assert!(end[..n - 2].iter().all(|p| *p == Value::from(fx.node(top))));
+        assert_eq!(end[n - 1], Value::from((n - 2) as u32));
+    }
+
+    /// A new folder and what is moved into it are one entry: the move
+    /// names the folder by the place of its `create`, which comes first
+    /// whichever of the two is the older here.
+    #[test]
+    fn a_move_into_a_folder_made_in_the_same_burst_is_one_entry() {
+        let mut fx = Fx::new();
+        let file = fx.write("a.txt", b"v1");
+        fx.commit();
+        fx.refresh();
+        let dir = fx.t.alloc(Kind::Dir);
+        fx.t.attach(dir, ROOT_INO, "d");
+        fx.t.detach(file);
+        fx.t.attach(file, dir, "a.txt");
+        fx.t.inodes.get_mut(&file).unwrap().dirty.pos = true;
+        fx.t.touch();
+        assert_eq!(fx.commit(), 1);
+        let last = *fx.sp().dag().log_order().last().unwrap();
+        let ops = fx.sp().entry(&last).unwrap().ops().to_vec();
+        assert_eq!(ops.len(), 2);
+        assert_eq!(ops[1].record().get(2), Some(&Value::from(0u32)));
+        let st = fx.sp().state();
+        assert!(st.is_accepted(&last));
+        assert_eq!(st.node(&fx.node(file)).unwrap().parent, fx.node(dir));
+        fx.refresh();
+        assert_eq!(fx.t.child(dir, "a.txt"), Some(file));
+        assert!(!fx.t.has_pending());
+        assert_eq!(fx.commit(), 0);
     }
 
     /// Nothing tells this device a removal happened, and it may restart
