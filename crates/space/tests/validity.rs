@@ -946,6 +946,27 @@ fn a_reader_writes_its_own_reach_node_and_nothing_else() {
     s.write("theirs", CY, P, vec![reach(&ben)], None);
     s.write("deleted", BEN, P, vec![SpaceOp::delete(node)], None);
     s.write("empty", CY, P, vec![], None);
+    // A `set` whose field 1 is not an id is no `set` of his reach node, or
+    // of anything: it is an application op like any other numbered 32 or
+    // above, and a reader's is invalid. A writer's is valid, and what it
+    // does is for state to say (`state.md#a-node-made-in-the-same-entry`).
+    let on = |node: Value| {
+        let r = Record::new().with(0, 33u32).with(1, node);
+        vec![SpaceOp::from_record(r.with(2, 1u32).with(3, "there"))]
+    };
+    s.write("reader int", BEN, P, on(Value::from(0u32)), None);
+    s.write(
+        "reader short",
+        BEN,
+        P,
+        on(Value::from(node[..15].to_vec())),
+        None,
+    );
+    s.write("owner int", ANA, A, on(Value::from(0u32)), None);
+    assert_eq!(
+        s.valid(&["reader int", "reader short", "owner int"]),
+        [false, false, true]
+    );
     // leaving, which empties it in the same entry
     let cy = s.id(CY);
     let gone = cardinal_space::relationship::leave_ops(&cy);

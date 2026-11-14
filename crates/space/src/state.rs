@@ -204,7 +204,26 @@ impl Positions {
     /// Replays an entry's creates and moves, noting in `undo` what they
     /// replaced.
     fn replay(&mut self, x: &EntryId, e: &SpaceEntry, undo: &mut Vec<(NodeId, Option<NodeId>)>) {
-        for (i, op) in e.ops().iter().enumerate() {
+        self.replay_ops(x, e, 0..e.ops().len(), undo);
+    }
+
+    /// Replays the creates and moves among some of an entry's ops, by
+    /// their places. Says whether anything was placed.
+    fn replay_ops(
+        &mut self,
+        x: &EntryId,
+        e: &SpaceEntry,
+        places: std::ops::Range<usize>,
+        undo: &mut Vec<(NodeId, Option<NodeId>)>,
+    ) -> bool {
+        let mut placed = false;
+        for (i, op) in e
+            .ops()
+            .iter()
+            .enumerate()
+            .take(places.end)
+            .skip(places.start)
+        {
             let (n, p) = match op.body() {
                 SpaceOpBody::Create { parent, .. } => (derived_id(x, i), *parent),
                 SpaceOpBody::Move { node, parent, .. }
@@ -216,7 +235,9 @@ impl Positions {
             };
             undo.push((n, self.parent.get(&n).copied()));
             self.place(n, p);
+            placed = true;
         }
+        placed
     }
 
     /// Takes back replays noted in `undo`, newest first.
@@ -303,7 +324,7 @@ impl State {
                         beside: false,
                     } = op.body()
                     {
-                        effects.insert((*x, i as u32), st.delete_effect(dag, accepted, x, node));
+                        effects.insert((*x, i as u32), st.delete_effect(dag, accepted, x, i, node));
                     }
                 }
             }
@@ -343,7 +364,7 @@ impl State {
         // pass 3: application
         for x in &accepted {
             let e = dag.get(x).expect("entry");
-            st.apply(dag, e, &mut |k| effects.remove(&k).unwrap_or_default());
+            st.apply(dag, e, Some(&mut effects));
         }
         st
     }
@@ -356,24 +377,11 @@ impl State {
             return false;
         }
         self.accepted.insert(e.id());
-        // its deletes see the state of its causal past: everything so far
-        let mut effects: HashMap<u32, DeleteEffect> = HashMap::new();
-        for (i, op) in e.ops().iter().enumerate() {
-            if let SpaceOpBody::Delete {
-                node,
-                beside: false,
-            } = op.body()
-            {
-                effects.insert(
-                    i as u32,
-                    DeleteEffect {
-                        delete: self.subtree(node),
-                        conflict: false,
-                    },
-                );
-            }
-        }
-        self.apply(dag, e, &mut |(_, i)| effects.remove(&i).unwrap_or_default());
+        // Nothing is concurrent with it, and the state so far is the state
+        // of its causal past: each of its deletes takes what is beneath
+        // the node when its turn comes, the ops before it in the entry
+        // applied.
+        self.apply(dag, e, None);
         true
     }
 
@@ -564,31 +572,46 @@ impl State {
                 }
             }
             // Ops of concurrent entries touch what they name and everything
-            // above it, up to a deleted node.
-            let deletes = deletes_of(dag.get(x).expect("entry"));
+            // above it, up to a deleted node. What is beneath a node is
+            // read from the delete's causal past and the ops before it in
+            // its own entry, so the positions move on as the deletes are
+            // gone through, and what is touched is worked out again only
+            // when they have moved.
+            let entry = dag.get(x).expect("entry");
+            let deletes = deletes_of(entry);
             let deleted: HashSet<NodeId> = deletes.iter().map(|(_, n)| *n).collect();
             let named: HashSet<NodeId> = (start..end)
                 .filter(|y| related[*y] != mark && is_accepted[*y])
                 .flat_map(|y| dag.get(&order[y]).expect("entry").ops())
                 .flat_map(|op| named_nodes(op.body()))
                 .collect();
-            let mut touched: HashMap<NodeId, HashSet<NodeId>> = HashMap::new();
-            for z in named {
-                let mut chain = vec![z];
-                let mut cur = z;
-                loop {
-                    if deleted.contains(&cur) {
-                        touched.entry(cur).or_default().extend(&chain);
+            let touched_now = |at: &Positions| {
+                let mut touched: HashMap<NodeId, HashSet<NodeId>> = HashMap::new();
+                for z in &named {
+                    let mut chain = vec![*z];
+                    let mut cur = *z;
+                    loop {
+                        if deleted.contains(&cur) {
+                            touched.entry(cur).or_default().extend(&chain);
+                        }
+                        match at.parent.get(&cur) {
+                            Some(p) if chain.len() <= at.parent.len() => cur = *p,
+                            _ => break,
+                        }
+                        chain.push(cur);
                     }
-                    match at.parent.get(&cur) {
-                        Some(p) if chain.len() <= at.parent.len() => cur = *p,
-                        _ => break,
-                    }
-                    chain.push(cur);
                 }
-            }
+                touched
+            };
+            let mut done = 0;
+            let mut touched = None;
             for (op, n) in deletes {
-                let t = touched.get(&n);
+                let moved = at.replay_ops(x, entry, done..op as usize, &mut undo);
+                done = op as usize;
+                if moved || touched.is_none() {
+                    touched = Some(touched_now(&at));
+                }
+                let t = touched.as_ref().and_then(|t| t.get(&n));
                 effects.insert(
                     (*x, op),
                     DeleteEffect {
@@ -606,19 +629,25 @@ impl State {
         effects
     }
 
+    /// The effect of the delete of `n` that is the op at place `at` of the
+    /// entry `d`, by the definition
+    /// (`state.md#deletion-yields-to-concurrent-work`).
     fn delete_effect(
         &self,
         dag: &Dag<SpaceEntry>,
         accepted: &[EntryId],
         d: &EntryId,
+        at: usize,
         n: &NodeId,
     ) -> DeleteEffect {
-        // positions in the delete's causal past
+        // positions in the delete's causal past, and after the ops before
+        // it in its own entry
         let past = dag.ancestors(d);
         let mut parent: HashMap<NodeId, NodeId> = HashMap::new();
-        for x in accepted.iter().filter(|x| past.contains(*x)) {
+        let before = accepted.iter().filter(|x| past.contains(*x));
+        for (x, ops) in before.map(|x| (x, usize::MAX)).chain([(d, at)]) {
             let e = dag.get(x).expect("entry");
-            for (i, op) in e.ops().iter().enumerate() {
+            for (i, op) in e.ops().iter().enumerate().take(ops) {
                 match op.body() {
                     SpaceOpBody::Create { parent: p, .. } => {
                         parent.insert(derived_id(x, i), *p);
@@ -703,12 +732,11 @@ impl State {
         self.children.entry(new_parent).or_default().insert(node);
     }
 
-    fn apply(
-        &mut self,
-        dag: &Dag<SpaceEntry>,
-        e: &SpaceEntry,
-        effect: &mut dyn FnMut((EntryId, u32)) -> DeleteEffect,
-    ) {
+    /// Applies an accepted entry's ops in their order. `effects` holds what
+    /// each of its deletes does, decided against the whole set; with none,
+    /// nothing is concurrent with the entry, and a delete takes what is
+    /// beneath its node as the tree stands when its turn comes.
+    fn apply(&mut self, dag: &Dag<SpaceEntry>, e: &SpaceEntry, mut effects: Option<&mut Effects>) {
         let id = e.id();
         for (i, op) in e.ops().iter().enumerate() {
             let i = i as u32;
@@ -803,7 +831,13 @@ impl State {
                     node,
                     beside: false,
                 } => {
-                    let eff = effect((id, i));
+                    let eff = match effects.as_mut() {
+                        Some(decided) => decided.remove(&(id, i)).unwrap_or_default(),
+                        None => DeleteEffect {
+                            delete: self.subtree(node),
+                            conflict: false,
+                        },
+                    };
                     for m in eff.delete {
                         if let Some(n) = self.nodes.get_mut(&m) {
                             n.deleted = true;

@@ -338,16 +338,41 @@ fn id_list<const N: usize>(ids: &[[u8; N]]) -> Value {
     Value::list(ids.iter().map(|x| Value::from(x.to_vec())))
 }
 
+/// The parent a `create` or a `move` holds in field 2: the sixteen bytes of
+/// an id, or an unsigned integer, the **index** of a `create` earlier in
+/// the same entry (`state.md#a-node-made-in-the-same-entry`). `made` turns
+/// an index into the id of the node that `create` makes, or says that it
+/// names nothing. Anything else names no node. The integer is read at its
+/// full width, so a huge one names nothing, and does not wrap round to an
+/// op that is there.
+fn parent_of(r: &Record, made: &dyn Fn(u64) -> Option<NodeId>) -> Result<NodeId, Error> {
+    match r.get(2) {
+        Some(Value::Bytes(_)) => id16(r, 2),
+        Some(v) => v
+            .as_uint()
+            .and_then(made)
+            .ok_or(Error::Malformed("a parent that names no node")),
+        None => Err(Error::Malformed("no parent")),
+    }
+}
+
 impl SpaceOp {
-    /// Reads an op record.
+    /// Reads an op record on its own. Outside an entry an index names
+    /// nothing: [`SpaceEntry`] reads the ops of an entry in their places.
     pub fn from_record(record: Record) -> SpaceOp {
-        let body = Self::parse(&record).unwrap_or_else(|_| SpaceOpBody::Unknown {
+        SpaceOp::read(record, &|_| None)
+    }
+
+    /// Reads an op record in its place in an entry, where `made` gives the
+    /// id of the node that the `create` at an index makes.
+    fn read(record: Record, made: &dyn Fn(u64) -> Option<NodeId>) -> SpaceOp {
+        let body = Self::parse(&record, made).unwrap_or_else(|_| SpaceOpBody::Unknown {
             number: record.get(0).and_then(|v| v.as_uint()),
         });
         SpaceOp { record, body }
     }
 
-    fn parse(r: &Record) -> Result<SpaceOpBody, Error> {
+    fn parse(r: &Record, made: &dyn Fn(u64) -> Option<NodeId>) -> Result<SpaceOpBody, Error> {
         let Some(n) = r.get(0).and_then(|v| v.as_uint()) else {
             return Ok(SpaceOpBody::Unknown { number: None });
         };
@@ -405,7 +430,7 @@ impl SpaceOp {
                     .get(1)
                     .and_then(NodeKind::from_value)
                     .ok_or(Error::Malformed("kind"))?,
-                parent: id16(r, 2)?,
+                parent: parent_of(r, made)?,
                 name: r.opt_text(3)?.unwrap_or("").to_owned(),
                 fields: r.opt_record(4)?.cloned().unwrap_or_default(),
                 was: ids(r, 5, "was")?,
@@ -418,7 +443,7 @@ impl SpaceOp {
             },
             34 => SpaceOpBody::Move {
                 node: id16(r, 1)?,
-                parent: id16(r, 2)?,
+                parent: parent_of(r, made)?,
                 name: r.opt_text(3)?.unwrap_or("").to_owned(),
             },
             35 => SpaceOpBody::Delete {
@@ -588,6 +613,42 @@ impl SpaceOp {
         )
     }
 
+    /// `create` of a node under one that an earlier op of the same entry
+    /// creates: `index` is that op's place in the entry's op list, counting
+    /// every op from 0 (`state.md#a-node-made-in-the-same-entry`). The op
+    /// means nothing outside an entry: it is read, and the index turned
+    /// into the parent's id, when the entry is built or taken.
+    pub fn create_under(kind: NodeKind, index: u32, name: &str, fields: Record) -> SpaceOp {
+        SpaceOp::from_record(
+            Record::new()
+                .with(0, 32u32)
+                .with(1, kind.to_value())
+                .with(2, index)
+                .with(3, name)
+                .with(4, fields),
+        )
+    }
+
+    /// `move` of a node under one that an earlier op of the same entry
+    /// creates, by that op's index.
+    pub fn mv_under(node: NodeId, index: u32, name: &str) -> SpaceOp {
+        SpaceOp::from_record(
+            Record::new()
+                .with(0, 34u32)
+                .with(1, node)
+                .with(2, index)
+                .with(3, name),
+        )
+    }
+
+    /// This `create` or `move` with another parent: a node, or the index
+    /// of an earlier `create` in the entry the op is to go in. For a writer
+    /// that knows where an op will stand only once it has cut its ops into
+    /// entries.
+    pub fn with_parent(&self, parent: impl Into<Value>) -> SpaceOp {
+        SpaceOp::from_record(self.record().clone().with(2, parent))
+    }
+
     /// `set`; `None` clears the field.
     pub fn set(node: NodeId, key: u64, value: Option<Value>) -> SpaceOp {
         SpaceOp::from_record(
@@ -689,17 +750,26 @@ impl SpaceEntry {
         if sorted.len() != parents.len() {
             return Err(Error::Malformed("repeated parent"));
         }
-        let ops = r
-            .opt_list(5)?
-            .unwrap_or(&[])
-            .iter()
-            .map(|v| {
-                v.as_record()
-                    .cloned()
-                    .map(SpaceOp::from_record)
-                    .ok_or(Error::Malformed("an op is a record"))
-            })
-            .collect::<Result<Vec<_>, _>>()?;
+        // An index becomes an id on the way in: the entry's id is known,
+        // so each op is read in its place, and a parent given as the index
+        // of an earlier `create` is held as the id of the node it makes.
+        // Nothing after this knows an index exists. The entry keeps its
+        // bytes.
+        let id = signed.id();
+        let mut ops: Vec<SpaceOp> = Vec::new();
+        for v in r.opt_list(5)?.unwrap_or(&[]) {
+            let record = v.as_record().cloned();
+            let record = record.ok_or(Error::Malformed("an op is a record"))?;
+            let at = ops.len() as u64;
+            let made = |index: u64| {
+                // earlier, and a `create`
+                let earlier = index < at;
+                let creates = || matches!(ops[index as usize].body(), SpaceOpBody::Create { .. });
+                (earlier && creates()).then(|| derived_id(&id, index as usize))
+            };
+            let op = SpaceOp::read(record, &made);
+            ops.push(op);
+        }
         Ok(SpaceEntry {
             space,
             parents,
@@ -1289,6 +1359,33 @@ mod tests {
             .with(3, ct);
         let forged = SealedEntry::decode(&r.encode()).unwrap();
         assert_eq!(forged.open_with(&epoch), Err(Error::Mismatch("nonce")));
+    }
+
+    /// An index means something only in an entry: it is the place of an
+    /// op of that entry. An op read on its own that holds one names no
+    /// parent, and is read again in its place when the entry is built.
+    #[test]
+    fn an_index_names_nothing_outside_an_entry() {
+        let under = SpaceOp::create_under(NodeKind::Uint(1), 0, "inner", Record::new());
+        assert_eq!(*under.body(), SpaceOpBody::Unknown { number: Some(32) });
+        let moved = SpaceOp::mv_under([1; 16], 0, "moved");
+        assert_eq!(*moved.body(), SpaceOpBody::Unknown { number: Some(34) });
+        let key = SigningKey::from_seed(&[7; 32]);
+        let first = SpaceOp::create(NodeKind::Uint(1), [0; 16], "outer", Record::new());
+        let e = SpaceEntryBuilder::new([1; 32], &[[2; 32]], [3; 32], [4; 32], [5; 16])
+            .ops([first, under.clone(), moved])
+            .sign(&key)
+            .unwrap();
+        let outer = derived_id(&e.id(), 0);
+        match (e.ops()[1].body(), e.ops()[2].body()) {
+            (SpaceOpBody::Create { parent: a, .. }, SpaceOpBody::Move { parent: b, .. }) => {
+                assert_eq!((*a, *b), (outer, outer));
+            }
+            other => panic!("{other:?}"),
+        }
+        // the op's record is what was written, index and all
+        assert_eq!(e.ops()[1].record(), under.record());
+        assert_eq!(e.ops()[1].record().get(2), Some(&Value::from(0u32)));
     }
 
     #[test]

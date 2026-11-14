@@ -1,0 +1,26 @@
+{
+  "description": "A node made in the same entry (state.md#a-node-made-in-the-same-entry). One entry of a files space with two ops: a `create` of a folder under the root, and a `create` of a file whose field 2 is the integer 0, the index of the first op. A node's id is the first 16 bytes of BLAKE3(entry id || varint(index)), where the entry id is the id of the signed object (encoding.md#signed-objects). What is hashed is the varint of the index, not the integer as the op encodes it: for index 1 those are the bytes 01 and 08. The file's parent is the id of the node made at index 0. Inputs are fixed bytes, not secrets.",
+  "entry": "1d000801a20e450020018202a27b0bdf88adb0069f9b3321748fc70eef5b0fbe3877c29cad4b319d1ae76e6d020c8202d5cd7a875a5c0e95a7f3a2d96b9a966a97039af0ce49755653d326eb6d4ee82b03820263e75b517e54e8e641b09c77264994280fdb1bbcd0ee23da8d6a70b416193a1f0482029a6b8e37d211e108840db8175376e5cdb4a88d73724e5352d5ea0d6118acf8940514250080020108028201000000000000000000000000000000000323547269702d008002011002000343706c616e2e747874040d01126869068080adf9e78b030782014bece1be13ab8fcf3602f0d747dd1e02020c150182025aa3563fe67a1114f0e7c1e17916929065261af42c7d7f2a205aa281d1eb0656028204e94d1d034df2fcbcbc4b5aaab2170ca71c6bfa0ddb49dd0c5c48192df40bcf444218cfd13f359432239cd1f869acbac64d950e454c511b66202a671014ba830e",
+  "entry_id": "ed25301f875039107c311e253a08071255385a5f5ab753f68f90f945ef3eaaa3",
+  "nodes": [
+    {
+      "id": "01c6b5812d9754090d6b2f17a61ac3ba",
+      "index": 0,
+      "name": "Trip",
+      "parent": "00000000000000000000000000000000",
+      "the_index_as_an_op_would_encode_it": "00",
+      "varint_of_the_index": "00"
+    },
+    {
+      "id": "677df669e9eaa221f5c70c6b090b56a1",
+      "index": 1,
+      "name": "plan.txt",
+      "parent": "01c6b5812d9754090d6b2f17a61ac3ba",
+      "the_index_as_an_op_would_encode_it": "08",
+      "varint_of_the_index": "01"
+    }
+  ],
+  "ops": "[{0: 32, 1: 1, 2: h'00000000000000000000000000000000', 3: \"Trip\"}, {0: 32, 1: 2, 2: 0, 3: \"plan.txt\", 4: {1: h'6869'}}]",
+  "ops_encoding": "14250080020108028201000000000000000000000000000000000323547269702d008002011002000343706c616e2e747874040d01126869",
+  "signer_seed": "0b6321553a0559bbc322ec3acf6147149b511c0d9e842861fb212fac9ac1a103"
+}

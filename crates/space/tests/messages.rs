@@ -259,6 +259,33 @@ fn a_reply_to_nothing_known_is_not_taken() {
     let m = said(&p.b)[0].id;
     p.bo_writes(vec![relationship::create_reply(c, "back", Some(m))]);
     assert_eq!(said(&p.a)[1].reply_to, Some(m));
+    // A reply holds the id of what it answers, and nothing else will do
+    // (`state.md#a-node-made-in-the-same-entry`): not the index of a
+    // message made earlier in the same entry, which a reply cannot answer,
+    // nor text, nor bytes of another length. Such an entry is valid, and
+    // none of it is taken.
+    let reply_to = |to: cardinal_encoding::Value| {
+        let fields = cardinal_encoding::Record::new()
+            .with(1, "to what?")
+            .with(3, to)
+            .with(15, 1u32);
+        SpaceOp::create(cardinal_space::NodeKind::Uint(2), c, "m", fields)
+    };
+    let before = said(&p.a).len();
+    for not_an_id in [
+        cardinal_encoding::Value::from(0u32),
+        cardinal_encoding::Value::from("first"),
+        cardinal_encoding::Value::from(m[..15].to_vec()),
+        cardinal_encoding::Value::from([&m[..], &[0]].concat()),
+    ] {
+        p.ana_writes(vec![
+            relationship::create_message(c, "first"),
+            reply_to(not_an_id),
+        ]);
+        let last = *p.b.dag().log_order().last().unwrap();
+        assert!(p.b.validity().is_valid(&last) && !p.b.state().is_accepted(&last));
+        assert_eq!(said(&p.b).len(), before);
+    }
     // The root is only ever a parent: a reply to it names it otherwise,
     // and is not taken (`state.md#nodes`). Nor is an edit that turns a
     // reply into one.

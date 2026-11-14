@@ -54,11 +54,11 @@ fn random_ops(rng: &mut Rng, st: &State, me: &[u8; 32]) -> Vec<SpaceOp> {
         .filter(|n| st.node(n).unwrap().kind == NodeKind::Uint(files::FILE))
         .collect();
     let mut ops = Vec::new();
-    for _ in 0..1 + rng.below(3) {
+    for _ in 0..1 + rng.below(4) {
         let folder = folders[rng.below(folders.len())];
         let name = NAMES[rng.below(NAMES.len())];
         let content = Content::Inline(vec![rng.below(256) as u8]);
-        let op = match rng.below(26) {
+        let op = match rng.below(29) {
             0..=4 => files::create_folder(folder, name),
             5..=8 => files::create_file(folder, name, &content, 0o644, None),
             9..=12 if !filez.is_empty() => {
@@ -85,6 +85,33 @@ fn random_ops(rng: &mut Rng, st: &State, me: &[u8; 32]) -> Vec<SpaceOp> {
                 nodes[rng.below(nodes.len())],
                 name,
             ),
+            // a node under one that an earlier op of the same entry made,
+            // by its index: any place before this one, a `create` or not,
+            // and now and then this place or a later one, which names
+            // nothing and puts the whole entry out of the state
+            26..=28 => {
+                let place = ops.len() as u32;
+                let index = match rng.below(8) {
+                    0 => place + rng.below(2) as u32,
+                    _ if place > 0 => rng.below(place as usize) as u32,
+                    _ => 0,
+                };
+                match rng.below(3) {
+                    0 if !nodes.is_empty() => {
+                        SpaceOp::mv_under(nodes[rng.below(nodes.len())], index, name)
+                    }
+                    1 => SpaceOp::create_under(NodeKind::Uint(files::FILE), index, name, {
+                        let content = content.to_value();
+                        cardinal_encoding::Record::new().with(files::FILE_CONTENT, content)
+                    }),
+                    _ => SpaceOp::create_under(
+                        NodeKind::Uint(files::FOLDER),
+                        index,
+                        name,
+                        Default::default(),
+                    ),
+                }
+            }
             // this person's reach node, which every replica here writes:
             // set, set beside, cleared, and named in a way that puts the
             // whole entry out of the state

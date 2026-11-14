@@ -321,7 +321,9 @@ dependencies = [
  "cardinal-crypto",
  "cardinal-encoding",
  "cardinal-identity",
+ "hex",
  "proptest",
+ "serde_json",
  "zeroize",
 ]
 
