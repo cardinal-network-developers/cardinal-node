@@ -85,6 +85,39 @@ pub fn written_by(format: Option<u64>) -> &'static str {
     }
 }
 
+/// What a data directory holds, for a window to read when no service
+/// answers there: which `store` (`empty`, `current` or `other`), what it
+/// `holds`, counted without reading any of it, and of another version's
+/// who it was `written_by` and the `refusal` in words. `cardinal store`
+/// and `cardinald --store` both print this, as one line.
+pub fn says(paths: &Paths) -> serde_json::Value {
+    let found = crate::clear::found(paths);
+    let mut out = serde_json::json!({
+        "store": "current",
+        "holds": {
+            "identity": found.identity,
+            "spaces": found.spaces,
+            "objects": found.objects.0,
+            "bytes": found.objects.1,
+            "unsaved": found.staged.0,
+            "unsaved_bytes": found.staged.1,
+            "local": found.local.0,
+            "local_bytes": found.local.1,
+            "other": found.other,
+        },
+    });
+    match of(paths) {
+        Store::Current => {}
+        Store::Empty => out["store"] = serde_json::json!("empty"),
+        Store::Other(n) => {
+            out["store"] = serde_json::json!("other");
+            out["written_by"] = serde_json::json!(written_by(n));
+            out["refusal"] = serde_json::json!(refusal(&paths.home, n));
+        }
+    }
+    out
+}
+
 /// What to tell a person whose data directory this version cannot read:
 /// which directory, who wrote it, that nothing was changed, and the two
 /// things they can do.

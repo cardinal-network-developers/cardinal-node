@@ -377,6 +377,10 @@ enum Cmd {
     Flush,
     /// Stop the daemon.
     Stop,
+    /// Say which Cardinal data is on this device, as one line of JSON, and
+    /// change nothing. A window asks this when the daemon does not answer.
+    #[command(hide = true)]
+    Store,
     #[command(flatten)]
     Deploy(cardinal_update::DeployCommand),
 }
@@ -2294,6 +2298,10 @@ async fn client(cmd: Cmd) -> anyhow::Result<()> {
         Cmd::Flush => {
             let v = call(&paths, json!({"cmd": "flush"})).await?;
             println!("Saved ({} entries).", v["entries"]);
+            Ok(())
+        }
+        Cmd::Store => {
+            println!("{}", cardinald::format::says(&paths));
             Ok(())
         }
         Cmd::Stop => {

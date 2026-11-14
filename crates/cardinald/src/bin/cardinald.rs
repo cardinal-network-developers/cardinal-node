@@ -24,35 +24,6 @@ use cardinald::paths::Paths;
 use cardinald::Overrides;
 use serde_json::{json, Value};
 
-/// What the data directory holds, for `--store`.
-fn store(paths: &Paths) -> Value {
-    let found = cardinald::clear::found(paths);
-    let mut out = json!({
-        "store": "current",
-        "holds": {
-            "identity": found.identity,
-            "spaces": found.spaces,
-            "objects": found.objects.0,
-            "bytes": found.objects.1,
-            "unsaved": found.staged.0,
-            "unsaved_bytes": found.staged.1,
-            "local": found.local.0,
-            "local_bytes": found.local.1,
-            "other": found.other,
-        },
-    });
-    match format::of(paths) {
-        Store::Current => {}
-        Store::Empty => out["store"] = json!("empty"),
-        Store::Other(n) => {
-            out["store"] = json!("other");
-            out["written_by"] = json!(format::written_by(n));
-            out["refusal"] = json!(format::refusal(&paths.home, n));
-        }
-    }
-    out
-}
-
 /// Removes what the service wrote, for `--clear`, unless one is running.
 async fn clear(paths: &Paths) -> Value {
     let status = json!({"cmd": "status"});
@@ -98,7 +69,7 @@ fn main() -> anyhow::Result<()> {
     }
     let paths = Paths::from_env();
     if asked.as_deref() == Some("--store") {
-        println!("{}", store(&paths));
+        println!("{}", format::says(&paths));
         return Ok(());
     }
     let rt = tokio::runtime::Builder::new_multi_thread()
