@@ -205,6 +205,10 @@ fn a_group_is_offered_joined_and_read_by_all() {
         wait("the others see that cy left", 30, || left(d).len() == 1);
     }
     assert_eq!(left(&ana), ["Cy"]);
+    // Whoever has left is no longer counted among those in the group.
+    for d in [&ana, &bo] {
+        assert_eq!(groups(d)[0]["members"], 2, "{:?}", groups(d));
+    }
     assert!(groups(&cy).is_empty() && offers(&cy).is_empty());
     let no = reply(
         &cy,

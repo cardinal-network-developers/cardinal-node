@@ -397,6 +397,8 @@ pub fn list_of(core: &Core) -> Json {
         }
         let members = group::members(sp);
         let in_it = members.iter().any(|m| m.identity == me);
+        // how many are in it: someone who has left is not
+        let how_many = members.iter().filter(|m| !m.left).count();
         let name = group::name(sp);
         if !group::joined(sp, &me) {
             if in_it && !declined.contains(id) {
@@ -405,7 +407,7 @@ pub fn list_of(core: &Core) -> Json {
                     "group": hex::encode(id),
                     "name": name,
                     "from": name_of(&me, &contacts, &members, &from),
-                    "members": members.len(),
+                    "members": how_many,
                     "public": sp.is_public(),
                     "reach": telling_json(core, id, &me),
                 }));
@@ -427,7 +429,7 @@ pub fn list_of(core: &Core) -> Json {
         let group = json!({
             "group": hex::encode(id),
             "name": name,
-            "members": members.len(),
+            "members": how_many,
             "public": sp.is_public(),
             "reach": telling_json(core, id, &me),
             "admin": may_manage(sp, &me),
