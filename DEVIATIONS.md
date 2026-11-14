@@ -839,8 +839,10 @@ Not implemented yet (the next milestone):
   `later`, `another`) and the `refusal` in the daemon's words. `cardinald
   --clear` removes what `cardinal clear` removes, never the files kept on
   this device only, answers `ok` or an `error`, and refuses while a
-  service answers on that directory. The client says what will be removed
-  and asks first (`clients.md`).
+  service answers on that directory. It also refuses a store this version
+  can read: nothing in it asks the person, so it cannot remove one that
+  works. The client says what will be removed and asks first
+  (`clients.md`).
 - **Objects that nothing names** (`cleanup.rs`, `cardinal free-space
   --unnamed [--delete]`). An object is named if it is reachable, through
   indexes at every level, from a blob reference anywhere in any op of any

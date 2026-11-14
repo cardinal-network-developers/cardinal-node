@@ -157,6 +157,25 @@ fn it_clears_what_the_service_wrote_and_nothing_else() {
     assert_eq!(names(home).len(), 3);
 }
 
+/// Nothing here asks the person first, so a store this version can read is
+/// never removed this way, running or not.
+#[test]
+fn it_never_clears_a_store_that_works() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path();
+    full(home);
+    let before = everything(home);
+    let (out, v) = asked(home, "--clear");
+    assert!(!out.status.success(), "{v}");
+    assert_eq!(v["ok"], false, "{v}");
+    let why = v["error"].as_str().unwrap();
+    assert!(why.contains("Nothing was changed"), "{why}");
+    assert!(why.contains("`cardinal clear`"), "{why}");
+    assert_eq!(everything(home), before, "something was changed");
+    let (_, v) = asked(home, "--store");
+    assert_eq!(v["store"], "current", "{v}");
+}
+
 #[test]
 fn it_clears_nothing_while_the_service_runs() {
     let dir = tempfile::tempdir().unwrap();

@@ -14,7 +14,10 @@
 //!   `later` or `another` (`written_by`), and the `refusal` in words.
 //! - `cardinald --clear` removes what the service wrote there, as `cardinal
 //!   clear` does, and leaves the files kept on this device only. It
-//!   refuses while a service answers on that directory.
+//!   refuses while a service answers on that directory. It also refuses a
+//!   store this version can read: nothing here asks the person first, so
+//!   it must not be able to remove one that works. `cardinal clear` does
+//!   that, and asks.
 
 use cardinald::format::{self, Store};
 use cardinald::paths::Paths;
@@ -60,6 +63,15 @@ async fn clear(paths: &Paths) -> Value {
         return json!({
             "ok": false,
             "error": "Cardinal is running on this data. Stop it first. Nothing was changed.",
+        });
+    }
+    // Only what this version cannot read goes this way. A client offers it
+    // when the service will not start, and a store that works is never that.
+    if format::of(paths) == Store::Current {
+        return json!({
+            "ok": false,
+            "error": "This version can read the Cardinal data here, so it is not removed this \
+                      way. `cardinal clear` removes it, and asks first. Nothing was changed.",
         });
     }
     match cardinald::clear::clear(paths, false) {
