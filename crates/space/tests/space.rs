@@ -343,6 +343,94 @@ fn removed_device_and_rotation() {
     assert!(!a.validity().is_valid(&last));
 }
 
+/// `hosts.md#telling-others-where-to-reach-you`: a person who refuses
+/// someone is told where that someone reads their hosts, on each of their
+/// devices until one has their answer. The refusal and the answer are both
+/// in the account, and an answer is one to the refusal only if it was
+/// written by a device that had it.
+#[test]
+fn a_refusal_waits_for_an_answer_written_after_it() {
+    use cardinal_space::account::{refused_since_answer, Regard, NAMES_HOSTS, REFUSED};
+    let p = person(5, 1);
+    let (d0, d1) = (&p.devices[0], &p.devices[1]);
+    let (mut acct, _) = Space::create(
+        Profile::ACCOUNT,
+        Policy::default(),
+        &p.log,
+        &d0.signing,
+        &[p.enc.public_key()],
+        None,
+    )
+    .unwrap();
+    let (club, choir, cy, dee) = ([1u8; 32], [2u8; 32], [3u8; 32], [4u8; 32]);
+    let ops = vec![
+        account::create_contact(&cy, "Cy", &[7; 32], Regard::default()),
+        account::create_contact(&dee, "Dee", &[8; 32], Regard::default()),
+        account::create_answered(&club, "Garden club", true),
+        account::create_space(&choir, "Choir"),
+    ];
+    let (made, _) = acct.write_entry(&p.log, &d0.signing, ops, None).unwrap();
+    let node = |k| files::created_node(&made, k);
+    // Nobody is refused: nothing to answer, in a space with an answer or
+    // in one without.
+    assert!(refused_since_answer(&acct, &club).is_empty());
+    assert!(refused_since_answer(&acct, &choir).is_empty());
+
+    // Cy is refused. The yes on record was given before, and is no answer
+    // to that; and a space with no answer has none either.
+    let refuse = |who, yes: bool| vec![account::set_field(node(who), REFUSED, yes)];
+    let (refusal, _) = acct
+        .write_entry(&p.log, &d0.signing, refuse(0, true), None)
+        .unwrap();
+    assert_eq!(refused_since_answer(&acct, &club), [cy]);
+    assert_eq!(refused_since_answer(&acct, &choir), [cy]);
+    assert_eq!(refused_since_answer(&acct, &[9; 32]), [cy]);
+
+    // Another device answers without having the refusal: beside it, not
+    // after it. The person has not answered about Cy.
+    let yes = |space| vec![account::set_field(node(space), NAMES_HOSTS, true)];
+    let (beside, _) = acct
+        .write_concurrent(&p.log, &d1.signing, &[refusal], yes(2), None)
+        .unwrap();
+    assert!(acct.state().is_accepted(&beside));
+    assert_eq!(account::names_hosts(acct.state(), &club), Some(true));
+    assert_eq!(refused_since_answer(&acct, &club), [cy]);
+
+    // An answer from a device that has the refusal is the answer, whatever
+    // it says, and only for the space it is about.
+    let no = vec![account::set_field(node(2), NAMES_HOSTS, false)];
+    acct.write(&p.log, &d1.signing, no, None).unwrap();
+    assert!(refused_since_answer(&acct, &club).is_empty());
+    assert_eq!(refused_since_answer(&acct, &choir), [cy]);
+    // An answer that was taken back is none.
+    let ops = vec![SpaceOp::set(node(3), NAMES_HOSTS, None)];
+    acct.write(&p.log, &d0.signing, ops, None).unwrap();
+    assert_eq!(refused_since_answer(&acct, &choir), [cy]);
+    acct.write(&p.log, &d0.signing, yes(3), None).unwrap();
+    assert!(refused_since_answer(&acct, &choir).is_empty());
+
+    // Refused again after the answer, there is no answer to that; a
+    // refusal taken back needs none; and each contact is answered apart.
+    acct.write(&p.log, &d0.signing, refuse(0, false), None)
+        .unwrap();
+    acct.write(&p.log, &d0.signing, refuse(1, true), None)
+        .unwrap();
+    assert_eq!(refused_since_answer(&acct, &club), [dee]);
+    acct.write(&p.log, &d0.signing, refuse(0, true), None)
+        .unwrap();
+    let mut both = refused_since_answer(&acct, &club);
+    both.sort();
+    assert_eq!(both, [cy, dee]);
+    // Said again as it was, the answer comes after both.
+    let ops = account::answer_ops(acct.state(), &club, "Garden club", Some(false), false);
+    assert!(ops.is_empty());
+    let ops = account::answer_ops(acct.state(), &club, "Garden club", Some(false), true);
+    assert_eq!(ops.len(), 1);
+    acct.write(&p.log, &d0.signing, ops, None).unwrap();
+    assert!(refused_since_answer(&acct, &club).is_empty());
+    assert_eq!(account::names_hosts(acct.state(), &club), Some(false));
+}
+
 #[test]
 fn account_space_devices_and_placements() {
     let p = person(3, 1);
@@ -1000,5 +1088,35 @@ fn the_epoch_key_is_in_the_clear_in_a_public_space_and_in_no_other() {
         }
         assert_eq!(c.is_public(), public);
         assert!(c.validity().is_valid(&after));
+
+        // A `set_policy` in the genesis itself, beside the `start`, says
+        // no more than one written after: field 2 is read from the `start`
+        // and from nothing else.
+        let policy = Policy {
+            public,
+            ..Policy::default()
+        };
+        let (mut g, sealed_genesis) = Space::create_with(
+            Profile::FILES,
+            policy,
+            &p.log,
+            &d0.signing,
+            &[p.enc.public_key()],
+            vec![
+                SpaceOp::add_member(p.log.id(), cardinal_space::entry::OWNER),
+                SpaceOp::set_policy(&said),
+            ],
+            None,
+        )
+        .unwrap();
+        assert!(g.validity().is_valid(&g.id()));
+        assert_eq!(g.entry(&g.id()).unwrap().ops().len(), 3);
+        assert_eq!(g.is_public(), public);
+        assert_eq!(sealed_genesis.open_key().is_some(), public);
+        let opened = Space::open_genesis(&sealed_genesis, &[&p.enc], Some(p.log.state()));
+        assert_eq!(opened.unwrap().is_public(), public);
+        let folder = vec![files::create_folder(ROOT, "z")];
+        let (_, next) = g.write_entry(&p.log, &d0.signing, folder, None).unwrap();
+        assert_eq!(next.open_key().is_some(), public);
     }
 }

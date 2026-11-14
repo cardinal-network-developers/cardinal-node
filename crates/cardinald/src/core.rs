@@ -265,9 +265,10 @@ pub struct Telling {
     /// The members who are not their contacts and have not left: who
     /// learns what the reach node says and had no host of theirs already.
     pub who: Vec<[u8; 32]>,
-    /// Those of them who were added after the reach node was last set, so
-    /// that nothing the person said or software did took them into
-    /// account.
+    /// Those of them whom nothing the person said or software did took
+    /// into account: who were added after the reach node was last set, or
+    /// whom the person refused, with no answer of theirs for the space
+    /// since.
     pub late: Vec<[u8; 32]>,
     /// The addresses of their hosts: what is learned.
     pub what: Vec<String>,
@@ -297,8 +298,9 @@ impl Telling {
     }
 
     /// Those who are not the person's contacts and were added to a space
-    /// where their reach node already named their hosts: the person MUST
-    /// be told, and offered to empty it.
+    /// where their reach node already named their hosts, or were there
+    /// when the person refused them: the person MUST be told, and offered
+    /// to empty it.
     pub fn added(&self) -> &[[u8; 32]] {
         match self.shared && self.joined {
             true => &self.late,
@@ -1145,7 +1147,8 @@ impl Core {
 
     /// The account space and the ops that record this person's answer for
     /// a space there, or with `None` take it back. Nothing to write if it
-    /// is recorded already.
+    /// is recorded already, unless the person was told of someone since:
+    /// then they answer again, and the answer is written again.
     pub fn answer_ops(
         &self,
         space: &SpaceId,
@@ -1153,8 +1156,19 @@ impl Core {
         answer: Option<bool>,
     ) -> Option<(SpaceId, Vec<SpaceOp>)> {
         let acc = self.account()?;
-        let ops = account::answer_ops(acc.space.as_ref()?.state(), space, name, answer);
+        let there = self.not_contacts_in(space);
+        let refused = self.refused_unanswered(space);
+        let again = answer.is_some() && refused.iter().any(|who| there.contains(who));
+        let state = acc.space.as_ref()?.state();
+        let ops = account::answer_ops(state, space, name, answer, again);
         (!ops.is_empty()).then_some((acc.id, ops))
+    }
+
+    /// The contacts this person refused, with no answer of theirs about
+    /// their hosts in `space` since.
+    fn refused_unanswered(&self, space: &SpaceId) -> Vec<[u8; 32]> {
+        let account = self.account().and_then(|a| a.space.as_ref());
+        account.map_or_else(Vec::new, |a| account::refused_since_answer(a, space))
     }
 
     /// What this person's reach node in a space tells, whom, and what they
@@ -1170,6 +1184,8 @@ impl Core {
         let values = sp.state().reach_values(&me, 1);
         let since: Vec<EntryId> = values.iter().map(|v| v.entry).collect();
         let after = sp.added_after(&since);
+        let refused = self.refused_unanswered(space);
+        let late = |m: &&[u8; 32]| after.contains(m) || refused.contains(m);
         let hosts = self.mailboxes();
         let endpoints = hosts.iter().flat_map(|(g, _)| g.endpoints.iter());
         Telling {
@@ -1178,7 +1194,7 @@ impl Core {
             answer: self.names_hosts(space),
             hosted: !hosts.is_empty(),
             joined: sp.accepted_by(&me),
-            late: who.iter().filter(|m| after.contains(m)).copied().collect(),
+            late: who.iter().filter(late).copied().collect(),
             who,
             what: endpoints.map(|e| e.to_string()).collect(),
         }
@@ -2904,6 +2920,110 @@ mod tests {
         assert!(t.added().is_empty() && t.keeps_current());
     }
 
+    /// `hosts.md`, "The same holds when the person refuses someone who is
+    /// already a member there": they read where the person's hosts are as
+    /// someone added does, so the person is told, on each of their devices
+    /// until one has their answer, and until then nothing is set there.
+    #[test]
+    fn refusing_someone_who_is_there_is_told_of_as_an_arrival_is() {
+        use cardinal_space::account;
+        let [mut ana, mut bo, cy, dee] = four();
+        bo.knows(&ana, "Ana");
+        bo.knows(&cy, "Cy");
+        bo.hosts_at("203.0.113.5:7171");
+        let both = [(bo.id(), "Bo".to_owned()), (cy.id(), "Cy".to_owned())];
+        let g = ana.core.create_group("Garden club", "Ana", &both).unwrap();
+        bo.takes(&g, &ana.all_of(&g));
+        // Among contacts nothing is asked, and nothing is on record.
+        assert!(!bo.core.telling(&g).ask());
+        bo.says_reach(&g, true);
+        let t = bo.core.telling(&g);
+        assert!(t.shared && t.added().is_empty() && t.keeps_current());
+        assert_eq!(t.answer, None);
+
+        // He refuses Cy, who is there and reads it.
+        let account = bo.core.account_id().unwrap();
+        let node = |p: &Person, who: [u8; 32]| {
+            let all = p.core.contacts().into_iter();
+            all.filter(|c| c.identity == who)
+                .map(|c| c.node)
+                .next()
+                .unwrap()
+        };
+        let set = |p: &mut Person, who: [u8; 32], refused: bool| {
+            let op = account::set_field(node(p, who), account::REFUSED, refused);
+            p.core.write_entry(&account, vec![op]).unwrap().1
+        };
+        set(&mut bo, cy.id(), true);
+        let t = bo.core.telling(&g);
+        assert_eq!(
+            (t.who.as_slice(), t.added()),
+            (&[cy.id()][..], &[cy.id()][..])
+        );
+        // Nothing new is said there until he has answered, and nothing
+        // asks him as if it were not yet shared.
+        assert!(!t.keeps_current() && !t.ask() && !t.sets_unasked() && !t.empties_unasked());
+        let listed = crate::groups::list_of(&bo.core);
+        let reach = &listed["groups"][0]["reach"];
+        assert_eq!(reach["added"], serde_json::json!(["Cy"]), "{listed}");
+        // With no answer on record there is none to take back.
+        assert!(bo.core.answer_ops(&g, "Garden club", None).is_none());
+        // Saying the reach node again answers nothing: it was the person
+        // who was to be told, and their answer is what is waited for.
+        bo.says_reach(&g, true);
+        assert_eq!(bo.core.telling(&g).added(), [cy.id()]);
+        // Refusing someone who is not there is nothing to tell of here,
+        // and taking a refusal back leaves nobody to tell of.
+        bo.knows(&dee, "Dee");
+        set(&mut bo, dee.id(), true);
+        assert_eq!(bo.core.telling(&g).added(), [cy.id()]);
+        set(&mut bo, cy.id(), false);
+        let t = bo.core.telling(&g);
+        assert!(t.added().is_empty() && t.who.is_empty() && t.keeps_current());
+        set(&mut bo, cy.id(), true);
+        assert_eq!(bo.core.telling(&g).added(), [cy.id()]);
+
+        // He keeps it. The yes is written, in an entry that comes after
+        // the refusal, and he has been told of everyone there.
+        bo.answers(&g, Some(true));
+        let t = bo.core.telling(&g);
+        assert!(t.added().is_empty() && t.keeps_current() && t.shared);
+        assert_eq!((t.who.as_slice(), t.answer), (&[cy.id()][..], Some(true)));
+        // What he said already is not written again while there is
+        // nobody new to answer about: not for someone he refuses who is
+        // not there.
+        assert!(bo.core.answer_ops(&g, "Garden club", Some(true)).is_none());
+        set(&mut bo, dee.id(), false);
+        set(&mut bo, dee.id(), true);
+        assert!(bo.core.telling(&g).added().is_empty());
+        assert!(bo.core.answer_ops(&g, "Garden club", Some(true)).is_none());
+
+        // A second refusal, of Ana: the same yes is his answer again, and
+        // is written again so that it comes after it.
+        set(&mut bo, ana.id(), true);
+        assert_eq!(bo.core.telling(&g).added(), [ana.id()]);
+        let (_, ops) = bo.core.answer_ops(&g, "Garden club", Some(true)).unwrap();
+        assert_eq!(ops.len(), 1);
+        bo.answers(&g, Some(true));
+        assert!(bo.core.telling(&g).added().is_empty());
+        // And with a no he empties it.
+        set(&mut bo, ana.id(), false);
+        set(&mut bo, ana.id(), true);
+        assert_eq!(bo.core.telling(&g).added(), [ana.id()]);
+        bo.answers(&g, Some(false));
+        let t = bo.core.telling(&g);
+        assert!(t.added().is_empty() && t.empties_unasked() && !t.keeps_current());
+        bo.says_reach(&g, false);
+        let t = bo.core.telling(&g);
+        assert!(!t.shared && !t.ask() && !t.empties_unasked());
+        // An answer taken back, as leaving takes it, is taken back once,
+        // whoever was refused meanwhile.
+        bo.answers(&g, None);
+        let t = bo.core.telling(&g);
+        assert_eq!((t.late.len(), &t.late), (2, &t.who));
+        assert!(bo.core.answer_ops(&g, "Garden club", None).is_none());
+    }
+
     /// A yes given while there was no host to name does not cover whoever
     /// was added afterwards: once there is a host, software asks again
     /// before it names it to them.
@@ -3574,9 +3694,13 @@ mod tests {
             ids.sort();
             ids
         };
+        // what is current, shown or not, less what is shown
         let unshown = |p: &Person| -> Vec<u8> {
-            let all = crate::cleanup::unshown_blobs(p.space(&space));
+            let listed = shown(p);
+            let all = crate::fetch::current_refs(p.space(&space));
             let mut ids: Vec<u8> = all.iter().map(|b| b.id[0]).collect();
+            assert!(listed.iter().all(|id| ids.contains(id)));
+            ids.retain(|id| !listed.contains(id));
             ids.sort();
             ids
         };
@@ -3601,6 +3725,140 @@ mod tests {
         let ops = vec![SpaceOp::mv(a, ROOT, "a.bin"), SpaceOp::delete(odd)];
         ana.core.write_entry(&space, ops).unwrap();
         assert_eq!((shown(&ana), unshown(&ana)), (vec![1, 2], vec![]));
+    }
+
+    /// `blobs.md#retention`: current state references every blob reference
+    /// that a field of one of its nodes holds, whatever the node's kind,
+    /// and a device that keeps a space in full fetches all of it, the
+    /// content of a kind it does not know as much as a file's. One that
+    /// keeps on demand fetches what is pinned; what nothing shows is never
+    /// opened there.
+    #[test]
+    fn a_full_holder_fetches_the_content_of_kinds_it_does_not_know() {
+        use cardinal_blob::BlobRef;
+        use cardinal_encoding::Value;
+        use cardinal_space::files::{self, Content};
+        let [mut ana, mut bo, cy, _] = four();
+        let blob = |n: u8| BlobRef {
+            id: [n; 32],
+            key: [n + 100; 32],
+            size: 5000,
+            levels: 1,
+        };
+        let held = |n: u8| Value::from(blob(n).to_record());
+        let file = |n: u8| {
+            let b = blob(n);
+            Content::Blob(files::BlobRef {
+                id: b.id,
+                key: b.key,
+                size: b.size,
+                levels: b.levels,
+            })
+        };
+        let odd = |name: &str, parent, value: Value| {
+            let fields = Record::new().with(9, value);
+            SpaceOp::create(NodeKind::Uint(77), parent, name, fields)
+        };
+        let space = ana.core.files_id().unwrap();
+        // A file, and nodes of a kind nobody here knows: one holds a
+        // reference in a list, one a record deep, one plainly, one the
+        // file's own, and one is put in a folder made beside it.
+        let deep = Record::new()
+            .with(1, "caption")
+            .with(2, Value::list([held(4)]));
+        let beneath = Record::new().with(9, held(7));
+        let ops = vec![
+            files::create_file(ROOT, "a.bin", &file(1), 0o644, None),
+            files::create_folder(ROOT, "gone"),
+            odd("list", ROOT, Value::list([held(3)])),
+            odd("deep", ROOT, deep.into()),
+            odd("plain", ROOT, held(5)),
+            odd("deleted", ROOT, held(6)),
+            odd("same", ROOT, held(1)),
+            SpaceOp::create_under(NodeKind::Uint(77), 1, "beneath", beneath),
+        ];
+        let (entry, _) = ana.core.write_entry(&space, ops).unwrap();
+        assert!(ana.space(&space).state().is_accepted(&entry));
+        let made = |k| files::created_node(&entry, k);
+        let ids = |v: Vec<(String, BlobRef)>| {
+            let mut ids: Vec<u8> = v.iter().map(|(_, b)| b.id[0]).collect();
+            ids.sort();
+            ids
+        };
+        let wanted = |p: &Person, on_demand, keep: &dyn Fn(&str, &BlobRef) -> bool| {
+            let sp = p.space(&space);
+            let shown = crate::fetch::current_blobs(sp);
+            crate::fetch::wanted(sp, shown, on_demand, keep)
+        };
+        let nothing = |_: &str, _: &BlobRef| false;
+        // In full: the file, and all that the other nodes hold, each once.
+        let all = wanted(&ana, false, &nothing);
+        let names: std::collections::HashSet<&str> = all.iter().map(|(p, _)| p.as_str()).collect();
+        assert_eq!(names.len(), 6);
+        assert_eq!(ids(all), [1, 3, 4, 5, 6, 7]);
+        // What a field held before is not current, nor what a deleted
+        // node holds, nor what is beneath one.
+        let ops = vec![
+            SpaceOp::set(made(4), 9, Some(held(8))),
+            SpaceOp::delete(made(5)),
+            SpaceOp::delete(made(1)),
+        ];
+        ana.core.write_entry(&space, ops).unwrap();
+        assert_eq!(ids(wanted(&ana, false, &nothing)), [1, 3, 4, 8]);
+        // On demand: what is pinned, and nothing that is not shown.
+        assert_eq!(ids(wanted(&ana, true, &nothing)), [] as [u8; 0]);
+        assert_eq!(ids(wanted(&ana, true, &|p, _| p == "a.bin")), [1]);
+
+        // A group: what a kind nobody knows holds comes through a member
+        // this person knows, who keeps it, and from their own devices if
+        // they know nobody there.
+        bo.knows(&ana, "Ana");
+        let both = [(bo.id(), "Bo".to_owned()), (cy.id(), "Cy".to_owned())];
+        let g = ana.core.create_group("Garden club", "Ana", &both).unwrap();
+        let op = odd("plan", ROOT, held(9));
+        let (entry, _) = ana.core.write_entry(&g, vec![op]).unwrap();
+        bo.takes(&g, &ana.all_of(&g));
+        assert!(bo.space(&g).state().is_accepted(&entry));
+        let (a, me) = (ana.id(), Some(bo.id()));
+        let of = |known: &dyn Fn(&[u8; 32]) -> bool, on_demand| {
+            let sp = bo.space(&g);
+            let all = crate::fetch::wanted_of_group(sp, me, known, on_demand, &|_| false);
+            let from = all.into_iter().map(|(from, (_, b))| (from, b.id[0]));
+            from.collect::<Vec<_>>()
+        };
+        assert_eq!(of(&|w| *w == a, false), [(Some(a), 9)]);
+        assert_eq!(of(&|_| false, false), [(None, 9)]);
+        assert_eq!(of(&|w| *w == a, true), []);
+
+        // What one fetches another serves. Between two people each gives
+        // what they wrote there themselves, since a reference the other
+        // wrote could name anything; in a group, a member gets whatever
+        // its state holds.
+        ana.meets(&bo);
+        bo.meets(&ana);
+        let (rel, genesis) = ana.core.create_relationship(&bo.id()).unwrap();
+        bo.core.accept_relationship(&genesis, &ana.id()).unwrap();
+        let hers = odd("hers", ROOT, held(11));
+        let (_, hers) = ana.core.write_entry(&rel, vec![hers]).unwrap();
+        bo.core.ingest_space(rel, &[hers]).unwrap();
+        let his = odd("his", ROOT, held(12));
+        let (_, his) = bo.core.write_entry(&rel, vec![his]).unwrap();
+        ana.core.ingest_space(rel, &[his]).unwrap();
+        let serves = |p: &Person, groups: &[SpaceId]| {
+            let all = crate::contacts::shared_refs(&p.core, &rel, groups);
+            let mut ids: Vec<u8> = all.iter().map(|b| b.id[0]).collect();
+            ids.sort();
+            ids.dedup();
+            ids
+        };
+        assert_eq!(serves(&ana, &[]), [11]);
+        assert_eq!(serves(&bo, &[]), [12]);
+        assert_eq!(serves(&ana, &[g]), [9, 11]);
+        assert_eq!(serves(&bo, &[g]), [9, 12]);
+        // And each fetches all of it, in full.
+        let sp = bo.space(&rel);
+        let all = crate::fetch::wanted(sp, Vec::new(), false, &nothing);
+        assert_eq!(ids(all), [11, 12]);
     }
 
     /// A store is made with its marker, and one with another, or with

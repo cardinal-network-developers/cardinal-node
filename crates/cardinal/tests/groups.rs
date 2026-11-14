@@ -425,7 +425,8 @@ fn nobody_learns_where_a_host_is_unasked() {
 /// (`hosts.md#telling-others-where-to-reach-you`). Among contacts Bo's
 /// host is named without asking. He says no, and nothing fills it in
 /// again. And when Cy, whom Bo does not know, is added to a group where
-/// Bo's host is named, Bo is told, and offered to stop.
+/// Bo's host is named, Bo is told, and offered to stop. The same when he
+/// refuses Ana, who is there already.
 #[test]
 fn an_answer_about_hosts_is_kept_and_a_later_arrival_is_told_of() {
     let root = tempfile::tempdir().unwrap();
@@ -523,7 +524,7 @@ fn an_answer_about_hosts_is_kept_and_a_later_arrival_is_told_of() {
     assert_eq!(r["what"], json!([at]), "{r}");
     let listed = bo.cli(&["groups"]);
     assert!(
-        listed.contains("Cy joined, not a contact of yours"),
+        listed.contains("Cy, in Choir and not a contact of yours, can see"),
         "{listed}"
     );
     assert!(listed.contains(&at), "{listed}");
@@ -551,6 +552,52 @@ fn an_answer_about_hosts_is_kept_and_a_later_arrival_is_told_of() {
         (&json!(false), &json!([])),
         "{r}"
     );
+
+    // He names it again, and then refuses Ana, who is there and reads it.
+    // The same holds as for someone added: he is told of her, at once
+    // and wherever his groups are listed, until he has answered.
+    ask(
+        &bo,
+        json!({"cmd": "group-reach", "group": g, "share": true}),
+    );
+    let r = reach_in(&bo, &g);
+    assert_eq!(
+        (&r["shared"], &r["added"]),
+        (&json!(true), &json!([])),
+        "{r}"
+    );
+    let told = bo.cli(&["contact", "Ana", "refuse"]);
+    assert!(
+        told.contains("in Choir and not a contact of yours, can see"),
+        "{told}"
+    );
+    assert!(told.contains(&at), "{told}");
+    let r = reach_in(&bo, &g);
+    assert_eq!(r["shared"], true, "{r}");
+    assert_eq!(r["added"].as_array().map(Vec::len), Some(1), "{r}");
+    let her = r["added"][0].as_str().unwrap().to_owned();
+    assert!(told.contains(&her), "{told} {r}");
+    // Nothing answers for him.
+    std::thread::sleep(std::time::Duration::from_secs(3));
+    assert_eq!(reach_in(&bo, &g)["added"], json!([her]));
+    assert!(bo
+        .cli(&["groups"])
+        .contains("not a contact of yours, can see"));
+    // He keeps it, with the yes he had given before: said now, it is his
+    // answer about her.
+    ask(
+        &bo,
+        json!({"cmd": "group-reach", "group": g, "share": true}),
+    );
+    let r = reach_in(&bo, &g);
+    assert_eq!(
+        (&r["shared"], &r["added"]),
+        (&json!(true), &json!([])),
+        "{r}"
+    );
+    std::thread::sleep(std::time::Duration::from_secs(3));
+    assert_eq!(reach_in(&bo, &g)["added"], json!([]));
+    assert!(!bo.cli(&["groups"]).contains("not a contact of yours"));
 }
 
 fn standing(d: &Dev) -> Value {

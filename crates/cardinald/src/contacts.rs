@@ -24,7 +24,7 @@ use cardinal_sync::identity_log_label;
 use serde_json::{json, Value as Json};
 use tokio::io::AsyncWriteExt;
 
-use crate::core::{now_ms, short};
+use crate::core::{now_ms, short, Core};
 use crate::daemon::{Daemon, PeerKind};
 use crate::net::Access;
 use crate::{mailbox, net};
@@ -885,28 +885,7 @@ pub async fn shared_blobs(d: &Arc<Daemon>, who: &[u8; 32]) -> Arc<HashSet<[u8; 3
     }
     let (d, who) = (d.clone(), *who);
     let worked_out = tokio::task::spawn_blocking(move || {
-        let blobs: Vec<BlobRef> = {
-            let core = d.core();
-            let me = core.identity.as_ref().map(|i| i.id());
-            let open = core.spaces.get(&space).and_then(|h| h.space.as_ref());
-            let all = open.map(relationship::messages).unwrap_or_default();
-            let mine = all.into_iter().filter(|m| Some(m.author) == me);
-            let attached = mine
-                .flat_map(|m| m.attachments)
-                .filter_map(|a| BlobRef::from_record(&a.blob).ok());
-            // and what this person put in the shared folder
-            let put = open
-                .map(|sp| shared_folder_content(sp, me))
-                .unwrap_or_default();
-            let in_groups: Vec<BlobRef> = groups
-                .iter()
-                .filter_map(|g| core.spaces.get(g).and_then(|h| h.space.as_ref()))
-                .flat_map(relationship::messages)
-                .flat_map(|m| m.attachments)
-                .filter_map(|a| BlobRef::from_record(&a.blob).ok())
-                .collect();
-            attached.chain(put).chain(in_groups).collect()
-        };
+        let blobs = shared_refs(&d.core(), &space, &groups);
         let (mut files, mut ids) = (HashSet::new(), HashSet::new());
         for blob in blobs {
             // The same file attached again is the same objects.
@@ -925,6 +904,43 @@ pub async fn shared_blobs(d: &Arc<Daemon>, who: &[u8; 32]) -> Arc<HashSet<[u8; 3
         ids
     });
     worked_out.await.unwrap_or_default()
+}
+
+/// The blobs a contact may fetch from here: those of the files this person
+/// attached in the relationship `space`, of what they put in its shared
+/// folder, and of whatever else they wrote there that current state
+/// references, which is the content of kinds this build does not know and
+/// the other's devices fetch all the same (`blobs.md#retention`). Only
+/// this person's own: a reference the contact wrote could name anything.
+/// And of each of `groups`, everything its messages carry and its current
+/// state references, whoever wrote it.
+pub fn shared_refs(core: &Core, space: &SpaceId, groups: &[SpaceId]) -> Vec<BlobRef> {
+    let me = core.identity.as_ref().map(|i| i.id());
+    let open = core.spaces.get(space).and_then(|h| h.space.as_ref());
+    let all = open.map(relationship::messages).unwrap_or_default();
+    let mine = all.into_iter().filter(|m| Some(m.author) == me);
+    let attached = mine
+        .flat_map(|m| m.attachments)
+        .filter_map(|a| BlobRef::from_record(&a.blob).ok());
+    // and what this person put in the shared folder
+    let put = open
+        .map(|sp| shared_folder_content(sp, me))
+        .unwrap_or_default();
+    let other = match (open, me) {
+        (Some(sp), Some(me)) => crate::fetch::state_blobs_by(sp, Some(me)),
+        _ => Vec::new(),
+    };
+    let spaces = groups.iter();
+    let spaces = spaces.filter_map(|g| core.spaces.get(g).and_then(|h| h.space.as_ref()));
+    let in_groups = spaces.flat_map(|sp| {
+        let carried = relationship::messages(sp).into_iter();
+        let carried = carried
+            .flat_map(|m| m.attachments)
+            .filter_map(|a| BlobRef::from_record(&a.blob).ok());
+        carried.chain(crate::fetch::state_blobs(sp))
+    });
+    let own = attached.chain(put).chain(other);
+    own.chain(in_groups).collect()
 }
 
 /// The content versions of the shared folder's files that `me` wrote.

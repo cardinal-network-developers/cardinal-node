@@ -745,12 +745,9 @@ pub fn start(d: Arc<Daemon>) {
                         core.spaces
                             .get(&files)
                             .and_then(|h| h.space.as_ref())
-                            .map(|sp| {
-                                crate::fetch::current_blobs(sp)
-                                    .into_iter()
-                                    .map(|(_, b)| b)
-                                    .collect()
-                            })
+                            // what the folder shows, and whatever else
+                            // current state references
+                            .map(crate::fetch::current_refs)
                     };
                     if let Some(refs) = refs {
                         pool.set_refs(refs, now, |id| born(&d2.store, id));

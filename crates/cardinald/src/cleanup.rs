@@ -424,29 +424,6 @@ pub fn refs_in(v: &cardinal_encoding::Value, out: &mut HashSet<BlobRef>) {
     }
 }
 
-/// The blobs that the current state of a files space names in nodes its
-/// folder does not show: a node of a kind this build does not know, or in
-/// a place where its kind means nothing, such as a file that was moved
-/// into a file (`state.md#operations`). They are current, so their
-/// content is never freed as an old version: moved back, or read by
-/// software that knows the kind, the file is whole. Nothing fetches them.
-pub fn unshown_blobs(sp: &Space) -> Vec<BlobRef> {
-    let st = sp.state();
-    let files = cardinal_space::Files::new(sp);
-    let mut out = HashSet::new();
-    for n in st.nodes() {
-        if !st.is_visible(&n.id) || files.shows(&n.id) {
-            continue;
-        }
-        for v in n.fields.values().flatten() {
-            if let Some(value) = &v.value {
-                refs_in(value, &mut out);
-            }
-        }
-    }
-    out.into_iter().collect()
-}
-
 /// Every blob a files space's history names, by top id: the content of
 /// every `create` and `set` of a file, current or not.
 pub fn known_blobs(sp: &Space) -> HashMap<Id, BlobRef> {
@@ -686,9 +663,10 @@ fn pass_now(d: &Daemon, now_all: bool, dry_run: bool) -> anyhow::Result<Passed> 
             })
             .map(|(_, b)| *b)
             .collect();
-        let mut live: Vec<BlobRef> = current.into_iter().map(|(_, b)| b).collect();
-        // What the folder does not show is current state all the same.
-        live.extend(unshown_blobs(sp));
+        // What the folder does not show is current state all the same: a
+        // file of a kind this build does not know, or one that was moved
+        // into a file. Its content is never freed as an old version.
+        let live = crate::fetch::current_refs(sp);
         (live, known_blobs(sp), pinned)
     };
     let now = now_ms();

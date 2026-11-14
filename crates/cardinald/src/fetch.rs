@@ -102,6 +102,123 @@ pub fn current_blobs(space: &Space) -> Vec<(String, BlobRef)> {
     out
 }
 
+/// Every blob reference that a field of a node of the current state holds,
+/// whatever the node's kind and wherever it is (`blobs.md#retention`). A
+/// reference is known by its shape, so a device does not need to know a
+/// kind to keep what it holds, and one that keeps a space in full fetches
+/// and keeps the content of kinds it does not know. A node that is
+/// deleted, or beneath one that is, is not current.
+pub fn state_blobs(space: &Space) -> Vec<BlobRef> {
+    state_blobs_by(space, None)
+}
+
+/// [`state_blobs`], or with `by` only those in a value that `by` wrote:
+/// what one person put in a space, as against what the space holds.
+pub fn state_blobs_by(space: &Space, by: Option<[u8; 32]>) -> Vec<BlobRef> {
+    let st = space.state();
+    let author = |entry: &[u8; 32]| space.entry(entry).map(|e| e.author());
+    let mut out = HashSet::new();
+    for n in st.nodes().filter(|n| st.is_visible(&n.id)) {
+        for v in n.fields.values().flatten() {
+            if by.is_some() && author(&v.entry) != by {
+                continue;
+            }
+            if let Some(value) = &v.value {
+                crate::cleanup::refs_in(value, &mut out);
+            }
+        }
+    }
+    out.into_iter().collect()
+}
+
+/// Everything that is current in a files space: what the folder shows, and
+/// whatever else current state references. None of it is an old version,
+/// and all of it counts where copies are counted.
+pub fn current_refs(space: &Space) -> Vec<BlobRef> {
+    let shown = current_blobs(space).into_iter();
+    let mut refs: Vec<BlobRef> = shown.map(|(_, b)| b).collect();
+    let listed: HashSet<[u8; 32]> = refs.iter().map(|b| b.id).collect();
+    let all = state_blobs(space).into_iter();
+    refs.extend(all.filter(|b| !listed.contains(&b.id)));
+    refs
+}
+
+/// Where what is not shown is listed while it is fetched.
+const NOT_SHOWN: &str = "(not shown)";
+
+/// What the current state of a space references that `listed` does not
+/// have: content of nodes this build shows nothing of. Each under a name
+/// of its own, for the fetcher's lists.
+fn unlisted(space: &Space, listed: &HashSet<[u8; 32]>) -> Vec<(String, BlobRef)> {
+    let all = state_blobs(space).into_iter();
+    let other = all.filter(|b| !listed.contains(&b.id));
+    other
+        .map(|b| (format!("{NOT_SHOWN}/{}", hex::encode(&b.id[..8])), b))
+        .collect()
+}
+
+/// What a device fetches of a space: of what its views list (`shown`),
+/// what its retention keeps, and where it keeps the space in full also
+/// whatever else current state references, which is the content of kinds
+/// it does not know (`blobs.md#retention`). On demand, what nothing shows
+/// is never opened here, and is not fetched.
+pub fn wanted(
+    space: &Space,
+    shown: Vec<(String, BlobRef)>,
+    on_demand: bool,
+    keep: &dyn Fn(&str, &BlobRef) -> bool,
+) -> Vec<(String, BlobRef)> {
+    let listed: HashSet<[u8; 32]> = shown.iter().map(|(_, b)| b.id).collect();
+    let kept = shown.into_iter().filter(|(p, b)| !on_demand || keep(p, b));
+    let mut out: Vec<(String, BlobRef)> = kept.collect();
+    if !on_demand {
+        out.extend(unlisted(space, &listed));
+    }
+    out
+}
+
+/// Something to fetch, under the name it is listed by meanwhile.
+type Named = (String, BlobRef);
+
+/// What a device fetches of a group it has joined, and from whose
+/// devices: each file of a message from whoever sent it if this person
+/// knows them, and through a member they know if not, who keeps it. What
+/// current state references besides comes through such a member too.
+pub fn wanted_of_group(
+    space: &Space,
+    me: Option<[u8; 32]>,
+    known: &dyn Fn(&[u8; 32]) -> bool,
+    on_demand: bool,
+    pinned: &dyn Fn(&str) -> bool,
+) -> Vec<(Option<[u8; 32]>, Named)> {
+    let base = format!("Groups/{}", cardinal_space::group::name(space));
+    let through = space.present().into_iter().find(|w| known(w));
+    let mut listed: HashSet<[u8; 32]> = HashSet::new();
+    let mut out = Vec::new();
+    for m in relationship::messages(space) {
+        let from = if known(&m.author) {
+            Some(m.author)
+        } else {
+            through
+        };
+        for a in m.attachments {
+            let Ok(b) = BlobRef::from_record(&a.blob) else {
+                continue;
+            };
+            let full = format!("{base}/{}", a.name);
+            listed.insert(b.id);
+            let keep = !on_demand || pinned(&full) || (is_image(&full) && b.size <= IMAGE_KEEP);
+            if keep && Some(m.author) != me {
+                out.push((from, (full, b)));
+            }
+        }
+    }
+    if !on_demand {
+        out.extend(unlisted(space, &listed).into_iter().map(|x| (through, x)));
+    }
+    out
+}
+
 /// Starts the background fetcher, and the sampler of its rate.
 pub fn start(d: Arc<Daemon>) {
     let d2 = d.clone();
@@ -277,10 +394,8 @@ async fn pass(d: &Arc<Daemon>, complete: &mut HashSet<[u8; 32]>) -> anyhow::Resu
             .and_then(|f| core.spaces.get(&f))
             .and_then(|h| h.space.as_ref())
         {
-            let mine = current_blobs(space)
-                .into_iter()
-                .filter(|(p, _)| !on_demand || pinned(p))
-                .collect();
+            let shown = current_blobs(space);
+            let mine = wanted(space, shown, on_demand, &|p, _| pinned(p));
             sources.push((None, mine));
         }
     }
@@ -294,26 +409,20 @@ async fn pass(d: &Arc<Daemon>, complete: &mut HashSet<[u8; 32]>) -> anyhow::Resu
             continue;
         };
         let base = s.path();
-        let keep =
-            |p: &str, b: &BlobRef| !on_demand || pinned(p) || (is_image(p) && b.size <= IMAGE_KEEP);
-        let mut theirs = Vec::new();
+        let keep = |p: &str, b: &BlobRef| pinned(p) || (is_image(p) && b.size <= IMAGE_KEEP);
+        let mut shown = Vec::new();
         for (p, b) in current_blobs(space) {
-            let full = format!("{base}/{p}");
-            if keep(&full, &b) {
-                theirs.push((full, b));
-            }
+            shown.push((format!("{base}/{p}"), b));
         }
         for m in relationship::messages(space) {
             for a in m.attachments {
                 let Ok(b) = BlobRef::from_record(&a.blob) else {
                     continue;
                 };
-                let full = format!("{base}/{}", a.name);
-                if keep(&full, &b) {
-                    theirs.push((full, b));
-                }
+                shown.push((format!("{base}/{}", a.name), b));
             }
         }
+        let theirs = wanted(space, shown, on_demand, &keep);
         sources.push((Some(s.contact.identity), theirs));
     }
     // A group's messages: each file from whoever sent it if this person
@@ -332,25 +441,8 @@ async fn pass(d: &Arc<Daemon>, complete: &mut HashSet<[u8; 32]>) -> anyhow::Resu
             if space.profile() != cardinal_space::group::GROUP || !joined {
                 continue;
             }
-            let base = format!("Groups/{}", cardinal_space::group::name(space));
-            let through = space.present().into_iter().find(|w| known(w));
-            for m in relationship::messages(space) {
-                let from = if known(&m.author) {
-                    Some(m.author)
-                } else {
-                    through
-                };
-                for a in m.attachments {
-                    let Ok(b) = BlobRef::from_record(&a.blob) else {
-                        continue;
-                    };
-                    let full = format!("{base}/{}", a.name);
-                    let keep =
-                        !on_demand || pinned(&full) || (is_image(&full) && b.size <= IMAGE_KEEP);
-                    if keep && Some(m.author) != me {
-                        by.entry(from).or_default().push((full, b));
-                    }
-                }
+            for (from, x) in wanted_of_group(space, me, &known, on_demand, &pinned) {
+                by.entry(from).or_default().push(x);
             }
         }
         sources.extend(by);

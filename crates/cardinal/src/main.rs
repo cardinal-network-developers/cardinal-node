@@ -842,6 +842,26 @@ fn names(v: &Value) -> String {
     all.join(", ")
 }
 
+/// Tells the person who reads where their hosts are in a group without
+/// their having agreed to it: someone who is not their contact and was
+/// added there, or someone there whom they have refused. They must be
+/// told, and offered to stop (`hosts.md#telling-others-where-to-reach-you`).
+fn tell_who_reads_reach(g: &Value) {
+    let added = names(&g["reach"]["added"]);
+    if added.is_empty() {
+        return;
+    }
+    let name = printable(g["name"].as_str().unwrap_or(""));
+    println!(
+        "    {added}, in {name} and not a contact of yours, can see where your host is ({}).",
+        names(&g["reach"]["what"])
+    );
+    println!(
+        "    To stop naming it there: cardinal group reach {name} keep. To go on: cardinal \
+         group reach {name} share."
+    );
+}
+
 fn files(n: u64) -> String {
     format!("{n} file{}", if n == 1 { "" } else { "s" })
 }
@@ -1694,6 +1714,19 @@ async fn client(cmd: Cmd) -> anyhow::Result<()> {
                 (_, None) => json!({"cmd": "contact", "who": who, "setting": setting}),
             };
             call(&paths, req).await?;
+            // Someone refused may be in a group where this person's hosts
+            // are named: they are told at once, as `cardinal groups` tells.
+            if setting == "refuse" {
+                // The refusal is made: failing to list is no failure of it.
+                let listed = call(&paths, json!({"cmd": "groups"})).await;
+                let v = listed.unwrap_or_default();
+                for g in v["groups"].as_array().into_iter().flatten() {
+                    if !names(&g["reach"]["added"]).is_empty() {
+                        println!("{}:", printable(g["name"].as_str().unwrap_or("")));
+                        tell_who_reads_reach(g);
+                    }
+                }
+            }
             Ok(())
         }
         Cmd::Invitations { action, id } => match (action.as_deref(), id) {
@@ -1855,22 +1888,7 @@ async fn client(cmd: Cmd) -> anyhow::Result<()> {
                     g["members"],
                     &g["group"].as_str().unwrap_or("")[..16]
                 );
-                // Someone who is not a contact was added where this
-                // person's hosts are named: they must be told, and offered
-                // to stop.
-                let added = names(&g["reach"]["added"]);
-                if !added.is_empty() {
-                    let name = printable(g["name"].as_str().unwrap_or(""));
-                    println!(
-                        "    {added} joined, not a contact of yours, and can see where your \
-                         host is ({}).",
-                        names(&g["reach"]["what"])
-                    );
-                    println!(
-                        "    To stop naming it there: cardinal group reach {name} keep. To go \
-                         on: cardinal group reach {name} share."
-                    );
-                }
+                tell_who_reads_reach(g);
             }
             for o in v["offers"].as_array().into_iter().flatten() {
                 println!(
