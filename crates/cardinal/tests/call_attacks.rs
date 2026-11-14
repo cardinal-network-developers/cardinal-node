@@ -402,8 +402,16 @@ fn a_call_that_ended_stops_hearing() {
         for attempt in 0..attempts {
             // Ana calls Bo, and Bo answers: all it takes, once.
             ask(&ana, json!({"cmd": "call-start", "who": "bo"}));
-            let (kind, sp, id) = heard(&s, Duration::from_secs(5)).await.expect("a ring");
-            assert_eq!(kind, RING);
+            // The call before may still have its end to say: on a busy
+            // machine that comes after the drain below, and it is not this
+            // call's ring.
+            let (sp, id) = loop {
+                let (kind, sp, id) = heard(&s, Duration::from_secs(5)).await.expect("a ring");
+                if kind == RING {
+                    break (sp, id);
+                }
+                assert_eq!(kind, END, "neither a ring nor a late end");
+            };
             assert_eq!(sp, space);
             let label = label_of(&space, &id);
             labels.push(label);
