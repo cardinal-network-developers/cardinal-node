@@ -47,9 +47,16 @@ struct Found {
 }
 
 fn find(d: &Daemon, group: &str) -> anyhow::Result<Found> {
+    find_among(d, group, false)
+}
+
+/// [`find`], or with `in_it` among the groups this person is in alone:
+/// what they write goes to a group they joined, whatever they have been
+/// offered under the same name since.
+fn find_among(d: &Daemon, group: &str, in_it: bool) -> anyhow::Result<Found> {
     let me = identity(d)?;
     let core = d.core();
-    let mut found: Vec<Found> = Vec::new();
+    let mut all: Vec<Found> = Vec::new();
     for (id, h) in &core.spaces {
         let Some(sp) = h.space.as_ref() else {
             continue;
@@ -59,28 +66,49 @@ fn find(d: &Daemon, group: &str) -> anyhow::Result<Found> {
         if sp.profile() != group::GROUP || sp.has_left(&me) {
             continue;
         }
-        let name = group::name(sp);
-        let by_id = group.len() >= 8 && hex::encode(id).starts_with(&group.to_ascii_lowercase());
-        if by_id || name == group {
-            found.push(Found {
-                id: *id,
-                name,
-                joined: group::joined(sp, &me),
-            });
-        }
+        all.push(Found {
+            id: *id,
+            name: group::name(sp),
+            joined: group::joined(sp, &me),
+        });
     }
+    all.retain(|g| g.joined || !in_it);
+    pick(all, group, &core.declined())
+}
+
+/// Which of the groups held is meant by `asked`: its id, the start of its
+/// id in eight hex digits or more, or its name. An id is nobody's to
+/// choose and a name is its admins', so a group found by its id is that
+/// group, whatever another is called. By name, a group this person said no
+/// to is not meant.
+fn pick(all: Vec<Found>, asked: &str, declined: &[SpaceId]) -> anyhow::Result<Found> {
+    let start = asked.to_ascii_lowercase();
+    let by_id = |g: &Found| asked.len() >= 8 && hex::encode(g.id).starts_with(&start);
+    let (mut ids, named): (Vec<Found>, Vec<Found>) = all.into_iter().partition(by_id);
+    match ids.len() {
+        0 => {}
+        1 => return Ok(ids.remove(0)),
+        _ => anyhow::bail!("more than one group's id starts with {asked}: give more of it"),
+    }
+    let called = |g: &Found| g.name == asked && !declined.contains(&g.id);
+    let mut found: Vec<Found> = named.into_iter().filter(called).collect();
     match found.len() {
         1 => Ok(found.remove(0)),
-        0 => anyhow::bail!("there is no group {group}"),
-        _ => anyhow::bail!("more than one group is called {group}: use its id"),
+        0 => anyhow::bail!("there is no group {asked}"),
+        _ => anyhow::bail!("more than one group is called {asked}: use its id"),
     }
 }
 
 /// A joined group, to write in.
 fn joined(d: &Daemon, group: &str) -> anyhow::Result<Found> {
-    let g = find(d, group)?;
-    anyhow::ensure!(g.joined, "you have not joined {}", g.name);
-    Ok(g)
+    match find_among(d, group, true) {
+        Ok(g) => Ok(g),
+        // say which it is: not there at all, or there and not joined
+        Err(none) => match find(d, group) {
+            Ok(g) => anyhow::bail!("you have not joined {}", g.name),
+            Err(_) => Err(none),
+        },
+    }
 }
 
 /// Whether this person may add to a group and change what it is called: its
@@ -925,4 +953,60 @@ pub fn start(d: Arc<Daemon>) {
             }
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// P12. A group's id is nobody's to choose, and its name is its
+    /// admins'. So a group found by its id is that group, whatever another
+    /// is called: someone who offers a group named after the id of one of
+    /// this person's does not make theirs unaddressable.
+    #[test]
+    fn a_group_named_after_another_s_id_does_not_hide_it() {
+        let (mine, theirs, other) = (
+            [0xa1; 32],
+            [0xb2; 32],
+            [0xa1, 0xa1, 0xa1, 0xa1, 0xff, 0, 0, 0],
+        );
+        let mut second = [0u8; 32];
+        second[..8].copy_from_slice(&other);
+        let all = || {
+            let group = |id: SpaceId, name: &str, joined: bool| Found {
+                id,
+                name: name.to_owned(),
+                joined,
+            };
+            vec![
+                group(mine, "Choir", true),
+                group(theirs, &hex::encode(mine), false),
+                group(second, "Band", true),
+                group([0xc3; 32], "Club", false),
+            ]
+        };
+        let found = |asked: &str, declined: &[SpaceId]| pick(all(), asked, declined).map(|g| g.id);
+        let id = hex::encode(mine);
+        assert_eq!(found(&id, &[]).unwrap(), mine);
+        assert_eq!(found(&id.to_uppercase(), &[]).unwrap(), mine);
+        assert_eq!(found(&id[..16], &[]).unwrap(), mine);
+        assert_eq!(found("Choir", &[]).unwrap(), mine);
+        // theirs is still found, by its own id
+        assert_eq!(found(&hex::encode(theirs)[..8], &[]).unwrap(), theirs);
+        // a prefix that two ids share names neither
+        let why = found(&id[..8], &[]).unwrap_err().to_string();
+        assert!(
+            why.contains("more than one group's id starts with"),
+            "{why}"
+        );
+        // fewer than eight digits are a name, and nothing is called that
+        assert!(found(&id[..6], &[]).is_err());
+        // a group this person said no to is not meant by its name
+        assert_eq!(found("Club", &[]).unwrap(), [0xc3; 32]);
+        assert!(found("Club", &[[0xc3; 32]]).is_err());
+        assert_eq!(
+            found(&hex::encode([0xc3u8; 32]), &[[0xc3; 32]]).unwrap(),
+            [0xc3; 32]
+        );
+    }
 }
