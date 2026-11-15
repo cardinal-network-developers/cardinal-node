@@ -322,7 +322,7 @@ pub fn write_pending(
     if let Some(h) = core.spaces.get(space) {
         if let Some(sp) = h.space.as_ref() {
             if t.applied_version != h.version {
-                let snap = Snapshot::take(sp, h.version, &core.device_names());
+                let snap = Snapshot::take_as(sp, h.version, &core.device_names(), core.me());
                 let inval = t.apply(&snap);
                 t.pending_inval.extend(inval);
             }
@@ -387,6 +387,13 @@ pub fn write_pending(
             let i = &t.inodes[&ino];
             // local items are never committed (`fs/local.rs`)
             if i.parent == 0 || i.local || matches!(i.kind, Kind::Conflict(_)) {
+                continue;
+            }
+            // Nor is a change to what is someone else's to change: one op
+            // that is not allowed takes its whole entry with it. Nor one
+            // that an entry already carried and that was not accepted,
+            // until it changes.
+            if i.locked || t.is_refused(i) {
                 continue;
             }
             // The parent: a node, or one an earlier op of this round
@@ -483,7 +490,13 @@ pub fn write_pending(
             }
         }
         if first {
+            let me = core.me();
             for del in std::mem::take(&mut t.deleted) {
+                // not this person's to delete
+                let owner = sp.state().owner_of(&del.node);
+                if owner.is_some() && owner != me {
+                    continue;
+                }
                 let mut unseen = unseen_touching(sp, &del.base, &del.node);
                 if let Some(seen) = &del.seen {
                     for v in unseen_versions(sp, &del.node, seen) {
@@ -545,7 +558,7 @@ pub fn write_pending(
                         "a file changed here and on another device: keeping both versions"
                     );
                     written.push(bytes);
-                    finish(t, &eid, &c.effects);
+                    finish_if_accepted(core, space, t, &eid, &c.effects);
                 }
                 Err(e) => {
                     tracing::warn!(
@@ -568,7 +581,12 @@ pub fn write_pending(
             let (eid, bytes) = core.write_entry(space, batch)?;
             written.push(bytes);
             nodes.extend((0..n).map(|k| (idx + k, files::created_node(&eid, k))));
-            finish(t, &eid, &effects[idx..idx + n]);
+            // What follows may name what this entry made: if it made
+            // nothing, the rest waits for the next round, which leaves
+            // out what was refused.
+            if !finish_if_accepted(core, space, t, &eid, &effects[idx..idx + n]) {
+                break;
+            }
             idx += n;
         }
     }
@@ -585,7 +603,7 @@ pub fn write_pending(
     if let Err(e) = t.journal_committed() {
         tracing::warn!("cannot update the journal of flushed files: {e}");
     }
-    if t.has_pending() {
+    if t.has_committable() {
         // what is left (files still being written) waits for its own quiet
         t.first_change = Some(Instant::now());
     } else {
@@ -636,6 +654,43 @@ fn can_write_concurrent(sp: &Space, exclude: &[EntryId], ops: &[SpaceOp]) -> boo
                 })
         })
     })
+}
+
+/// [`finish`], once the entry is known to count: software checks that
+/// each entry it wrote for the folder was accepted for state
+/// (`profiles.md#mapping-to-a-disk-guidance`). If one was not, nothing it
+/// carried is marked as committed: what the person wrote stays on disk,
+/// dirty, and is not written again until it changes, and they are told.
+/// Says whether the entry was accepted.
+fn finish_if_accepted(
+    core: &Core,
+    space: &SpaceId,
+    t: &mut Tree,
+    eid: &EntryId,
+    effects: &[Effect],
+) -> bool {
+    let sp = core.spaces.get(space).and_then(|h| h.space.as_ref());
+    if sp.is_some_and(|sp| sp.validity().is_valid(eid) && sp.state().is_accepted(eid)) {
+        finish(t, eid, effects);
+        return true;
+    }
+    for eff in effects {
+        match eff {
+            Effect::Created(ino) | Effect::Clean(ino, _) => {
+                if let Some(i) = t.inodes.get(ino) {
+                    t.refused.insert(*ino, i.as_written());
+                }
+            }
+            Effect::None => t.refused_other += 1,
+        }
+    }
+    tracing::error!(
+        "{} changes to your files were not saved: the entry written for them ({}) was not \
+         accepted. What you wrote is kept on this device.",
+        effects.len(),
+        hex::encode(&eid[..8])
+    );
+    false
 }
 
 /// Records what an entry `eid` with these effects (one per op, in order)
@@ -801,10 +856,11 @@ mod tests {
         /// What the mount's refresh does when entries arrive.
         fn refresh(&mut self) {
             let h = &self.core.spaces[&self.space];
-            let snap = Snapshot::take(
+            let snap = Snapshot::take_as(
                 h.space.as_ref().unwrap(),
                 h.version,
                 &self.core.device_names(),
+                self.core.me(),
             );
             self.t.apply(&snap);
         }
@@ -1483,6 +1539,142 @@ mod tests {
         fx.refresh();
         assert_eq!(fx.t.child(dir, "plan.txt"), Some(file));
         assert!(!fx.t.has_pending());
+    }
+
+    /// Two people and the folder they share: `me` sees it through a tree,
+    /// and `them` has put in it a file that is theirs alone to change
+    /// (`profiles.md#shared-rules-normative`), which the folder shows like
+    /// any other file. Returns the two and that file's inode.
+    fn shared_with_a_file_of_theirs() -> (Fx, Fx, u64) {
+        let (mut me, mut them) = (Fx::new(), Fx::new());
+        let id = |fx: &Fx| fx.core.identity.as_ref().unwrap().id();
+        let log = |fx: &Fx| fx.core.identity.as_ref().unwrap().all_entries();
+        let (mine, theirs) = (id(&me), id(&them));
+        me.core.ingest_other(theirs, &log(&them)).unwrap();
+        them.core.ingest_other(mine, &log(&me)).unwrap();
+        let (rel, genesis) = them.core.create_relationship(&mine).unwrap();
+        me.core.accept_relationship(&genesis, &theirs).unwrap();
+        let kinds = files::Kinds::of(them.core.spaces[&rel].profile().unwrap());
+        let plain = kinds.create_file(
+            ROOT,
+            "hers.txt",
+            &Content::Inline(b"hers".to_vec()),
+            0o644,
+            None,
+        );
+        let fields = plain.record().get(4).and_then(|v| v.as_record()).unwrap();
+        let owned = fields
+            .clone()
+            .with(cardinal_space::state::AUTHOR_OWNED_FIELD, 1u64);
+        let op = SpaceOp::from_record(plain.record().clone().with(4, owned));
+        let (entry, sealed) = them.core.write_entry(&rel, vec![op]).unwrap();
+        assert!(them.core.spaces[&rel]
+            .space
+            .as_ref()
+            .unwrap()
+            .state()
+            .is_accepted(&entry));
+        me.core.ingest_space(rel, &[sealed]).unwrap();
+        me.space = rel;
+        let paths = Paths::at(me._dir.path());
+        me.t = Tree::new(paths.staging(), paths.local());
+        me.refresh();
+        let hers =
+            me.t.child(ROOT_INO, "hers.txt")
+                .expect("the folder shows it");
+        (me, them, hers)
+    }
+
+    /// D3 (`profiles.md#mapping-to-a-disk-guidance`). A node its person
+    /// may not change is never put in an entry: one op that is not allowed
+    /// takes the whole burst with it, and everything else the person did
+    /// in those two seconds is gone.
+    #[test]
+    fn a_change_that_is_not_allowed_does_not_take_the_burst_with_it() {
+        let (mut me, _them, hers) = shared_with_a_file_of_theirs();
+        // An edit of their file, as a view that did not refuse it would
+        // leave it, and a new file beside it.
+        let i = me.t.inodes.get_mut(&hers).unwrap();
+        i.content = Some(Content::Inline(b"mine now".to_vec()));
+        i.dirty.content = true;
+        i.wrote();
+        me.t.touch();
+        let new = me.write("new.txt", b"new");
+        me.commit();
+        me.refresh();
+        assert_eq!(
+            me.t.child(ROOT_INO, "new.txt"),
+            Some(new),
+            "the new file is gone"
+        );
+        let node = me.node(new);
+        assert!(me.sp().state().node(&node).is_some_and(|n| !n.deleted));
+        assert_eq!(me.shown("new.txt"), b"new");
+        // Their file is as they left it, in the state and in the view.
+        assert_eq!(me.versions(&me.node(hers)), [b"hers".to_vec()]);
+    }
+
+    /// D3. What only someone else may change is marked so in the view of
+    /// everyone but them, which shows it read-only and refuses a change
+    /// where it is made (`fs/ops.rs`).
+    #[test]
+    fn what_is_someone_elses_to_change_is_marked_in_the_view() {
+        let (me, mut them, hers) = shared_with_a_file_of_theirs();
+        assert!(me.t.inodes[&hers].locked);
+        assert!(me.t.inodes.values().filter(|i| i.locked).count() == 1);
+        them.space = me.space;
+        let paths = Paths::at(them._dir.path());
+        them.t = Tree::new(paths.staging(), paths.local());
+        them.refresh();
+        let own = them.t.child(ROOT_INO, "hers.txt").unwrap();
+        assert!(!them.t.inodes[&own].locked);
+    }
+
+    /// D3. Software checks that each entry it wrote for the folder was
+    /// accepted for state. If one was not, it keeps what the person wrote,
+    /// on disk and marked as not yet committed, and tells them; and it
+    /// does not write the same again each time it looks.
+    #[test]
+    fn what_an_entry_that_was_not_accepted_carried_is_kept_and_not_written_again() {
+        let (mut me, _them, hers) = shared_with_a_file_of_theirs();
+        // A view that failed to refuse: nothing else here can make this
+        // device write an entry that is not accepted.
+        let i = me.t.inodes.get_mut(&hers).unwrap();
+        i.locked = false;
+        i.content = Some(Content::Inline(b"mine now".to_vec()));
+        i.dirty.content = true;
+        i.wrote();
+        me.t.touch();
+        let new = me.write("new.txt", b"new");
+        let before = me.sp().dag().len();
+        assert_eq!(me.commit(), 1);
+        let last = *me.sp().dag().log_order().last().unwrap();
+        assert!(!me.sp().state().is_accepted(&last));
+        // Nothing it carried is taken for committed.
+        let i = &me.t.inodes[&new];
+        assert!(i.node.is_none() && i.dirty.content);
+        assert_eq!(i.content, Some(Content::Inline(b"new".to_vec())));
+        assert!(me.t.inodes[&hers].dirty.content);
+        assert!(me.t.has_pending() && !me.t.has_committable());
+        assert_eq!(me.t.refused_count(), 2);
+        assert!(
+            me.t.first_change.is_none(),
+            "nothing to commit: no commit is due"
+        );
+        // It is not written again while nothing changes.
+        assert_eq!(me.commit(), 0);
+        assert_eq!(me.sp().dag().len(), before + 1);
+        // What changes is tried again, by itself, and what was allowed is
+        // saved.
+        me.write("new.txt", b"newer");
+        assert!(me.t.has_committable());
+        assert_eq!(me.commit(), 1);
+        let last = *me.sp().dag().log_order().last().unwrap();
+        assert!(me.sp().state().is_accepted(&last));
+        assert_eq!(me.t.refused_count(), 1);
+        me.refresh();
+        assert_eq!(me.shown("new.txt"), b"newer");
+        assert_eq!(me.versions(&me.node(hers)), [b"hers".to_vec()]);
     }
 
     /// Content is keyed by the epoch, so a commit asks for the rotation by

@@ -88,6 +88,14 @@ impl Mounted {
         lock(&self.parts).parts[&0].tree.clone()
     }
 
+    /// How many changes went into entries that were not accepted, and are
+    /// kept on this device, not saved.
+    pub fn refused_count(&self) -> usize {
+        let parts = lock(&self.parts);
+        let each = parts.parts.values().map(|p| lock(&p.tree).refused_count());
+        each.sum()
+    }
+
     /// Whether any space shown has changes not yet committed.
     pub fn has_pending(&self) -> bool {
         lock(&self.parts)
@@ -144,7 +152,7 @@ pub fn refresh(
         // what the committer applied
         let mut invals = std::mem::take(&mut t.pending_inval);
         if t.applied_version != h.version {
-            let snap = Snapshot::take(sp, h.version, &core.device_names());
+            let snap = Snapshot::take_as(sp, h.version, &core.device_names(), core.me());
             invals.extend(t.apply(&snap));
             // A `.cardinalignore` that changed elsewhere may no longer name
             // what is local here.

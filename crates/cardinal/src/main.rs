@@ -1309,6 +1309,14 @@ fn print_status(v: &Value) {
     } else {
         println!("Sync: up to date");
     }
+    // What an entry that was not accepted carried is kept, and not saved.
+    let not_saved = v["not_saved"].as_u64().unwrap_or(0);
+    if not_saved > 0 {
+        println!(
+            "      {not_saved} changes to your files could not be saved. What you wrote is kept on \
+             this device; change a file again to try it again."
+        );
+    }
     for line in copies_lines(&v["copies"], v["devices"].as_array().map_or(0, |d| d.len())) {
         println!("{line}");
     }

@@ -837,11 +837,15 @@ fn status(d: &Arc<Daemon>) -> Value {
             .unwrap_or(0);
         (identity, spaces, conflicts, files)
     };
-    let (mounted, pending) = {
+    let (mounted, pending, not_saved) = {
         let m = d.mount.lock().unwrap_or_else(|e| e.into_inner());
         match m.as_ref() {
-            Some(m) => (Some(m.path.display().to_string()), m.has_pending()),
-            None => (None, false),
+            Some(m) => (
+                Some(m.path.display().to_string()),
+                m.has_pending(),
+                m.refused_count(),
+            ),
+            None => (None, false, 0),
         }
     };
     let progress = d.progress.lock().unwrap_or_else(|e| e.into_inner()).clone();
@@ -866,6 +870,7 @@ fn status(d: &Arc<Daemon>) -> Value {
         "removed": d.core().removed(),
         "mount_unavailable": d.mount_unavailable.lock().unwrap_or_else(|e| e.into_inner()).clone(),
         "pending_changes": pending,
+        "not_saved": not_saved,
         "retention": cfg.retention,
         "conflicts": conflicts,
         "progress": progress,

@@ -175,6 +175,9 @@ struct Flushed {
     seen: Vec<String>,
 }
 
+/// An inode as an entry found it: see [`Inode::as_written`].
+pub type Written = (u64, (u64, String), u16, SystemTime, Dirty);
+
 /// Local changes not yet committed.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Dirty {
@@ -263,6 +266,10 @@ pub struct Inode {
     /// Kept on this device only (`fs/local.rs`): never committed; its
     /// content and metadata are a real file or folder under `local/`.
     pub local: bool,
+    /// Someone else's alone to change: shown read-only, a change to it is
+    /// refused where it is made, and it is never put in an entry
+    /// (`profiles.md#mapping-to-a-disk-guidance`).
+    pub locked: bool,
 }
 
 impl Inode {
@@ -299,7 +306,16 @@ impl Inode {
             journaled: None,
             nlookup: 0,
             local: false,
+            locked: false,
         }
+    }
+
+    /// What the commit path holds of an inode whose changes went into an
+    /// entry that was not accepted: while nothing of this changes, it is
+    /// not written again.
+    pub fn as_written(&self) -> Written {
+        let place = (self.parent, self.name.clone());
+        (self.write_gen, place, self.perm, self.mtime, self.dirty)
     }
 
     /// Whether it is being written right now (written within `quiet` and
@@ -374,6 +390,10 @@ pub struct SnapEntry {
     pub mtime: Option<u64>,
     /// Link target.
     pub target: Option<String>,
+    /// Someone else's to change and nobody's but theirs: created
+    /// author-owned by another identity
+    /// (`profiles.md#shared-rules-normative`).
+    pub locked: bool,
 }
 
 /// The state of a files space, flattened for [`Tree::apply`].
@@ -389,6 +409,22 @@ pub struct Snapshot {
 impl Snapshot {
     /// Takes a snapshot of a space's state.
     pub fn take(space: &Space, version: u64, names: &HashMap<KeyId, String>) -> Snapshot {
+        Snapshot::take_as(space, version, names, None)
+    }
+
+    /// [`take`](Self::take), for the person `me`: what only someone else
+    /// may change is marked, so that the view shows it read-only and
+    /// refuses a change where it is made.
+    pub fn take_as(
+        space: &Space,
+        version: u64,
+        names: &HashMap<KeyId, String>,
+        me: Option<[u8; 32]>,
+    ) -> Snapshot {
+        let theirs = |n: &NodeId| {
+            let owner = space.state().owner_of(n);
+            me.is_some() && owner.is_some() && owner != me
+        };
         let files = Files::with_device_names(space, |k| {
             names
                 .get(k)
@@ -412,6 +448,7 @@ impl Snapshot {
                     mode: None,
                     mtime: None,
                     target: None,
+                    locked: theirs(&e.node),
                 };
                 match e.kind {
                     FileKind::Folder => stack.push(e.node),
@@ -481,6 +518,13 @@ pub struct Tree {
     pub ignore_seen: Option<super::local::IgnoreTexts>,
     /// Nodes to delete at the next commit.
     pub deleted: Vec<Deleted>,
+    /// Inodes whose changes were written in an entry that was not accepted
+    /// for state, as they stood then. What the person wrote is kept, on
+    /// disk and not committed; it is not written again until it changes.
+    pub refused: HashMap<u64, Written>,
+    /// Changes of other kinds (a delete, a conflict settled) that went the
+    /// same way, and are lost.
+    pub refused_other: usize,
     /// Conflicts to settle at the next commit: the version to keep, or
     /// `None` for the one shown under the file's own name.
     pub settle: HashMap<NodeId, Option<EntryId>>,
@@ -542,6 +586,8 @@ impl Tree {
             ignores: Default::default(),
             ignore_seen: None,
             deleted: Vec::new(),
+            refused: HashMap::new(),
+            refused_other: 0,
             settle: HashMap::new(),
             first_change: None,
             last_change: None,
@@ -831,6 +877,30 @@ impl Tree {
         self.last_change = Some(now);
     }
 
+    /// Whether a change of this inode's is held back: it was written in
+    /// an entry that was not accepted, and has not changed since.
+    pub fn is_refused(&self, i: &Inode) -> bool {
+        self.refused
+            .get(&i.ino)
+            .is_some_and(|w| *w == i.as_written())
+    }
+
+    /// How many changes went into entries that were not accepted.
+    pub fn refused_count(&self) -> usize {
+        let held = self.inodes.values().filter(|i| self.is_refused(i));
+        held.count() + self.refused_other
+    }
+
+    /// Whether anything waits that a commit would write: what is pending,
+    /// less what is someone else's to change and what was refused.
+    pub fn has_committable(&self) -> bool {
+        let waits = |i: &&Inode| i.parent != 0 && !i.local && (i.node.is_none() || i.dirty.any());
+        let mine = self.inodes.values().filter(waits);
+        !self.deleted.is_empty()
+            || !self.settle.is_empty()
+            || mine.into_iter().any(|i| !i.locked && !self.is_refused(i))
+    }
+
     /// Whether anything waits to be committed.
     pub fn has_pending(&self) -> bool {
         !self.deleted.is_empty()
@@ -1056,6 +1126,10 @@ impl Tree {
             seen.insert(ino);
             let inode = self.inodes.get_mut(&ino).expect("ino");
             inode.stored_name = Some(e.stored_name.clone());
+            if inode.locked != e.locked {
+                inode.locked = e.locked;
+                inval.push(Inval::Inode(ino));
+            }
             if !inode.dirty.pos {
                 placed.push((ino, pino, e.name.clone()));
             }

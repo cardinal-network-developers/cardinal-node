@@ -883,6 +883,20 @@ Not implemented yet (the next milestone):
   holder was reachable; `cardinal free-space` says either. No client shows
   them yet.
 
+- **What its person may not change** (`profiles.md#mapping-to-a-disk-guidance`,
+  `fs/tree.rs`, `fs/ops.rs`, `fs/commit.rs`). A node created author-owned
+  by someone else is shown without write permission, and writing,
+  truncating, changing its mode or time, renaming, replacing or removing
+  it fails with `EACCES`; something may still be made under it. The commit
+  path leaves such a node out of every entry. After each entry it writes
+  for a folder it checks that the entry is valid and accepted for state.
+  If it is not, nothing the entry carried is marked committed: files stay
+  dirty with their staging files, and are not written again until they
+  change. **Reading: "tells them".** The daemon logs an error, `status`
+  has the count in `not_saved`, and `cardinal status` says so. A delete or
+  a settled conflict that such an entry carried is counted and lost; and
+  every change in the entry is held back, not only the one that was at
+  fault, which the device cannot tell.
 - **A new folder and what is in it are one entry** (`fs/commit.rs`,
   `state.md#a-node-made-in-the-same-entry`). What a burst puts in a folder
   the same burst makes names it by the place of its `create`: new files

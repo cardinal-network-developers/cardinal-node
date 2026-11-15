@@ -126,7 +126,8 @@ impl CardinalFs {
             ctime: i.ctime,
             crtime: i.ctime,
             kind,
-            perm: i.perm,
+            // what is someone else's to change is shown read-only
+            perm: if i.locked { i.perm & !0o222 } else { i.perm },
             nlink: if i.kind == Kind::Dir { 2 } else { 1 },
             uid: self.uid,
             gid: self.gid,
@@ -234,6 +235,7 @@ impl CardinalFs {
     fn truncate(&self, t: &mut Tree, ino: u64, size: u64) -> Result<(), c_int> {
         let kind = t.inodes.get(&ino).ok_or(ENOENT)?.kind;
         match kind {
+            Kind::File if t.inodes[&ino].locked => return Err(EACCES),
             Kind::File => {}
             Kind::Dir => return Err(EISDIR),
             _ => return Err(EACCES),
@@ -440,6 +442,10 @@ impl Filesystem for CardinalFs {
         if matches!(kind, Kind::Conflict(_)) && (size.is_some() || mode.is_some()) {
             return reply.error(EACCES);
         }
+        // Someone else's to change: refused here, where it is made.
+        if t.inodes[&ino].locked && (size.is_some() || mode.is_some() || mtime.is_some()) {
+            return reply.error(EACCES);
+        }
         if let Some(s) = size {
             if let Err(e) = self.truncate(&mut t, ino, s) {
                 return reply.error(e);
@@ -545,6 +551,9 @@ impl Filesystem for CardinalFs {
             let i = &t.inodes[&ino];
             (i.kind, i.node)
         };
+        if t.inodes[&ino].locked {
+            return reply.error(EACCES);
+        }
         match kind {
             Kind::Dir => return reply.error(EISDIR),
             Kind::Conflict(_) => {
@@ -589,6 +598,9 @@ impl Filesystem for CardinalFs {
         }
         if !i.children.is_empty() {
             return reply.error(ENOTEMPTY);
+        }
+        if i.locked {
+            return reply.error(EACCES);
         }
         let local = i.local;
         if local {
@@ -686,6 +698,11 @@ impl Filesystem for CardinalFs {
         let dst = t.child(newparent, newname);
         if dst == Some(src) {
             return reply.ok();
+        }
+        // Neither what is moved nor what it would replace may be someone
+        // else's to change.
+        if t.inodes[&src].locked || dst.is_some_and(|d| t.inodes[&d].locked) {
+            return reply.error(EACCES);
         }
         // Where it goes: a local place or a synced one (`fs/local.rs`).
         let store = self.d.store.clone();
@@ -855,6 +872,7 @@ impl Filesystem for CardinalFs {
         match i.kind {
             Kind::Dir => return reply.error(EISDIR),
             Kind::Conflict(_) if write => return reply.error(EACCES),
+            _ if write && i.locked => return reply.error(EACCES),
             _ => {}
         }
         if write && flags & libc::O_TRUNC != 0 {
@@ -991,6 +1009,9 @@ impl Filesystem for CardinalFs {
     ) {
         let mut t = lock(&self.tree);
         if matches!(t.inodes.get(&ino).map(|i| i.kind), Some(Kind::Conflict(_))) {
+            return reply.error(EACCES);
+        }
+        if t.inodes.get(&ino).is_some_and(|i| i.locked) {
             return reply.error(EACCES);
         }
         let st = match self.stage(&mut t, ino) {

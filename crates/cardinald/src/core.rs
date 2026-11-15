@@ -2186,6 +2186,11 @@ impl Core {
         sp.creator() == me && sp.validity().is_valid(&sp.id()) && named == [(me, owner)]
     }
 
+    /// This person's identity, once the device has one.
+    pub fn me(&self) -> Option<[u8; 32]> {
+        self.identity.as_ref().map(|i| i.id())
+    }
+
     /// The account space id.
     pub fn account_id(&self) -> Option<SpaceId> {
         self.account().map(|h| h.id)

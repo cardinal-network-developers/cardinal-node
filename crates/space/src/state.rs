@@ -985,6 +985,15 @@ impl State {
         true
     }
 
+    /// The one identity that may set, move, delete or restore a node: its
+    /// creator, if it was created author-owned
+    /// (`profiles.md#shared-rules-normative`). `None` for any other node,
+    /// which whoever may write in the space may change.
+    pub fn owner_of(&self, node: &NodeId) -> Option<IdentityId> {
+        let made = self.registry.get(node).filter(|m| m.author_owned);
+        made.map(|m| m.creator)
+    }
+
     /// Whether an entry was accepted for state.
     pub fn is_accepted(&self, e: &EntryId) -> bool {
         self.accepted.contains(e)

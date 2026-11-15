@@ -82,8 +82,8 @@ impl Part {
             let h = core.spaces.get(&space);
             let mut t = lock(&tree);
             if let Some(sp) = h.and_then(|h| h.space.as_ref()) {
-                let snap =
-                    Snapshot::take(sp, h.map(|h| h.version).unwrap_or(0), &core.device_names());
+                let version = h.map(|h| h.version).unwrap_or(0);
+                let snap = Snapshot::take_as(sp, version, &core.device_names(), core.me());
                 t.apply(&snap);
             }
             // What `.cardinalignore` keeps on this device (`local.rs`).
