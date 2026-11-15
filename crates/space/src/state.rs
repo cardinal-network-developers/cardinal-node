@@ -53,6 +53,10 @@ pub fn reach_node_id(identity: &IdentityId) -> NodeId {
 /// The field that marks a node author-owned (`profiles.md#shared-rules-normative`).
 pub const AUTHOR_OWNED_FIELD: u64 = 15;
 
+/// The largest key a field may have: the largest integer
+/// (`encoding.md#values`).
+pub const MAX_FIELD_KEY: u64 = (1 << 60) - 1;
+
 /// One value of a multi-value register.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FieldValue {
@@ -623,7 +627,12 @@ impl State {
                     // (`state.md#operations`). What a kind means, and
                     // where, is for whoever shows the space to say.
                     let names = node_field(self.profile, *kind).map(|f| fields.get(f));
-                    let ok = known(parent, &local, &self.registry)
+                    // A field key is an integer, below 2^60, though a
+                    // record's own keys may be larger: a larger one
+                    // violates the profile (`state.md#nodes`).
+                    let keys = fields.iter().all(|(k, _)| *k <= MAX_FIELD_KEY);
+                    let ok = keys
+                        && known(parent, &local, &self.registry)
                         && names
                             .is_none_or(|v| names_known(v, |n| known(n, &local, &self.registry)));
                     let owned = fields.get(AUTHOR_OWNED_FIELD).and_then(|v| v.as_uint()) == Some(1);

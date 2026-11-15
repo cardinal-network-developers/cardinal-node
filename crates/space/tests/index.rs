@@ -649,3 +649,31 @@ fn a_delete_whose_past_stops_earlier_than_the_one_before_it() {
         "no try put the entries in the order the case needs"
     );
 }
+
+/// V6 (`state.md#nodes`). A field key is an integer, so it is below 2^60,
+/// though a record's own keys may be larger. An op that gives a node a
+/// field with a larger key violates the profile: its entry is not accepted
+/// for state, and the canonical state, which holds each key as an integer,
+/// can always be written.
+#[test]
+fn a_field_key_is_an_integer() {
+    let mut p = one(81);
+    let with_key = |key: u64| {
+        let fields = Record::new().with(key, Value::from("x"));
+        SpaceOp::create(NodeKind::Uint(77), ROOT, "odd", fields)
+    };
+    let most = (1u64 << 60) - 1;
+    assert!(p.accepted(vec![with_key(most)]));
+    for key in [1u64 << 60, (1 << 60) + 1, 1 << 62, (1 << 63) - 1] {
+        assert!(!p.accepted(vec![with_key(key)]), "{key}");
+        // and nothing else the entry holds is taken either
+        assert!(
+            !p.accepted(vec![folder(ROOT, "beside"), with_key(key)]),
+            "{key}"
+        );
+    }
+    assert_eq!(p.names(""), Vec::<String>::new());
+    let canonical = p.space.state().canonical();
+    assert!(!canonical.encode().is_empty());
+    p.agrees();
+}
