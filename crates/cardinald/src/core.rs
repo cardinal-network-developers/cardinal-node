@@ -299,8 +299,10 @@ pub struct Telling {
     pub shared: bool,
     /// Whether it has ever been set, if only to an empty list.
     pub set: bool,
-    /// Whether it holds two lists, set by two of their devices at the same
-    /// moment.
+    /// Whether it holds something other than its one result
+    /// ([`Core::reach_settled`]): two lists that differ, set by two of
+    /// their devices at the same moment, or a list that names a host
+    /// twice. Two lists that say the same are not split.
     pub split: bool,
     /// Whether this device keeps a yes of theirs that it could not finish:
     /// it names their hosts once one can be reached, unless the list is
@@ -400,7 +402,9 @@ impl Telling {
 
     /// Whether this device sets the one result of two lists set at the
     /// same moment, so that the next reader need not work it out
-    /// (`profiles.md#reach`).
+    /// (`profiles.md#reach`). Not where the lists say the same already:
+    /// two devices that each set the result at once leave two such lists,
+    /// and setting it again would only be answered in kind, without end.
     pub fn settles(&self) -> bool {
         self.split && (self.joined || self.left)
     }
@@ -1200,6 +1204,25 @@ impl Core {
         cardinal_space::relationship::reach_of(h, who)
     }
 
+    /// The one result of this person's reach node in a space
+    /// ([`reach_settled`](cardinal_space::relationship::reach_settled)):
+    /// each host once, in its place, with the token its own device wrote
+    /// where two lists differ. What this device starts from whenever it
+    /// writes the list, so that a host named twice is never carried on.
+    pub fn reach_settled(&self, space: &SpaceId) -> Vec<cardinal_space::relationship::Reach> {
+        let me = self.identity.as_ref().map(|i| i.id());
+        let sp = self.spaces.get(space).and_then(|h| h.space.as_ref());
+        let (Some(me), Some(sp)) = (me, sp) else {
+            return Vec::new();
+        };
+        let hosts = self.mailboxes();
+        let device_of = |host: &[u8; 32]| {
+            let mut serving = hosts.iter().filter(|(g, _)| g.link_key.x25519() == host);
+            serving.next().map(|(_, device)| *device)
+        };
+        cardinal_space::relationship::reach_settled(sp, &me, device_of)
+    }
+
     /// Whether `who` has set their reach node in a space, if only to say
     /// nowhere.
     pub fn reach_is_set(&self, space: &SpaceId, who: &[u8; 32]) -> bool {
@@ -1307,7 +1330,10 @@ impl Core {
         Telling {
             shared: !named.is_empty(),
             set: !since.is_empty(),
-            split: since.len() > 1,
+            split: {
+                let settled = self.reach_settled(space);
+                !cardinal_space::relationship::reach_is_settled(sp.state(), &me, &settled)
+            },
             waiting: stands && named.is_empty() && sp.accepted_by(&me),
             hosted: !hosts.is_empty(),
             unnamed: unnamed.count(),
@@ -1384,12 +1410,12 @@ impl Core {
     /// longer, the others in their places. `None` if none of these is
     /// due.
     pub fn reach_due(&self, space: &SpaceId) -> Option<Vec<cardinal_space::relationship::Reach>> {
-        let me = self.identity.as_ref()?.id();
+        self.identity.as_ref()?;
         let t = self.telling(space);
         if t.empties_unasked() {
             return Some(Vec::new());
         }
-        let named = self.reach_of(space, &me);
+        let named = self.reach_settled(space);
         if t.settles() {
             return Some(named);
         }
@@ -3506,6 +3532,41 @@ mod tests {
         assert_eq!(bo.space(&g).state().reach_values(&me, 1).len(), 1);
         assert_eq!(hosts(&bo), merged);
         assert!(bo.core.reach_due(&g).is_none());
+
+        // Another device set the same result at the same moment: two
+        // lists that say the same. Nothing is due, or the two would
+        // answer each other without end; and his host's part is there
+        // once, with the token it had.
+        let same = relationship::set_reach(&me, &due);
+        let last = *bo.space(&g).heads().first().unwrap();
+        bo.core
+            .write_entry_concurrent(&g, &[last], vec![same])
+            .unwrap();
+        assert_eq!(bo.space(&g).state().reach_values(&me, 1).len(), 2);
+        let t = bo.core.telling(&g);
+        assert!(!t.split && !t.settles() && t.shared);
+        assert!(bo.core.reach_due(&g).is_none());
+        assert_eq!(bo.core.reach_settled(&g), due);
+        // Two lists that each renewed one host's token: the one result
+        // has his host once, with the token his own device wrote.
+        let stale = relationship::set_reach(&me, &[one([7; 32], 1), one(own, 9)]);
+        let (stale, _) = bo.core.write_entry(&g, vec![stale]).unwrap();
+        let _ = stale;
+        let due = bo.core.reach_settled(&g);
+        assert_eq!(due.iter().filter(|r| r.host == own).count(), 1);
+        let set = relationship::set_reach(
+            &me,
+            &merged
+                .iter()
+                .map(|n| match n {
+                    1 => one([7; 32], 1),
+                    2 => one(own, 2),
+                    _ => one([8; 32], 3),
+                })
+                .collect::<Vec<_>>(),
+        );
+        bo.core.write_entry(&g, vec![set]).unwrap();
+        assert_eq!(hosts(&bo), merged);
 
         // His host stops serving: it is taken out, and the two he has
         // never heard of stay where they were.

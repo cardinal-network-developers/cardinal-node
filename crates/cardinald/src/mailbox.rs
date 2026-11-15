@@ -738,7 +738,7 @@ pub async fn share_reach(d: &Arc<Daemon>, space: &SpaceId) -> anyhow::Result<Sha
     if !t.hosted && !t.shared {
         return Ok(Shared::NoHost);
     }
-    let mut reach = d.core().reach_of(space, &me);
+    let mut reach = d.core().reach_settled(space);
     let more = reach_here(d, &reach).await;
     if reach.is_empty() && more.is_empty() {
         if !t.set {
@@ -814,7 +814,7 @@ pub async fn write_reach(d: &Arc<Daemon>, space: &SpaceId) -> anyhow::Result<()>
     if !t.sets_unasked() {
         return Ok(());
     }
-    let named = d.core().reach_of(space, &me);
+    let named = d.core().reach_settled(space);
     let more = reach_here(d, &named).await;
     // A host that cannot be reached now gives no token. The empty list
     // that leaves is said once, and not again each time this looks.
@@ -934,7 +934,11 @@ fn renew_reach(d: &Arc<Daemon>) {
         if !d.core().telling(&space).keeps_current() {
             continue;
         }
-        let mut reach = d.core().reach_of(&space, &me);
+        // The one result: each host once. Read as both lists, this
+        // host's part would be there twice where two devices set the
+        // list at the same moment, one of the two with a token that has
+        // gone, and each would be given a new one, round after round.
+        let mut reach = d.core().reach_settled(&space);
         let active = |t: &Token| lock(&d.mailbox.store).is_active(t);
         let fresh = || {
             let t: Token = random_bytes();

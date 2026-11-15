@@ -1305,6 +1305,18 @@ asks for around that is not built yet.
     sets a new token and changed addresses (`renew_reach`); any device
     takes out a host that serves no longer; and a device that sees two
     lists sets the one result.
+  - **Reading: the one result of two lists** (`relationship::reach_settled`,
+    `Core::reach_settled`) names each host once, in the place it first has
+    reading the later list first. Where the lists give one host different
+    tokens, the token is the one from the list that host's own device
+    signed, by the grants in the account; with no such list, the first.
+    Whoever looks a token up still counts both lists
+    (`relationship::reach_of`). A device sets the result only where some
+    list the node holds reads differently from it: two lists that say the
+    same are left, or two devices would answer each other without end.
+    Every write of the list starts from the result, so a host named twice
+    is not carried on. A token that drops out this way stays registered
+    at its host until the list is emptied.
   - **Reading: a host that serves no longer** (`Core::former_hosts`) is one
     whose grant this device's account held and whose key none of the
     account's hosts has now. A host the device has never heard of is left
