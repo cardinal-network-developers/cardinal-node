@@ -663,6 +663,13 @@ impl Judge {
             return;
         };
         let mut found = Vec::new();
+        // Where much waits, one walk from `w` answers for all of it.
+        let many = waiting.values().map(|ys| ys.len()).sum::<usize>() > 16;
+        let past = many.then(|| dag.ancestors(w));
+        let built_on = |y: &EntryId| match &past {
+            Some(past) => past.contains(y),
+            None => dag.is_ancestor(y, w),
+        };
         for (k, ys) in waiting {
             // a head that holds the removal of the key vouches for nothing
             // that key signed
@@ -671,7 +678,7 @@ impl Judge {
             }
             for y in ys {
                 let plain = self.info.get(y).is_some_and(|i| !i.structural);
-                if plain && dag.is_ancestor(y, w) {
+                if plain && built_on(y) {
                     found.push((*y, *k));
                 }
             }
@@ -707,9 +714,17 @@ impl Judge {
             let Some(ys) = waiting.get(k) else { continue };
             let listed = listed.iter().filter(|l| only.is_none_or(|o| o == *l));
             // an entry that is not here yet keeps nothing until it is
-            let listed: Vec<&EntryId> = listed.filter(|l| dag.contains(l)).collect();
+            let listed: Vec<EntryId> = listed.filter(|l| dag.contains(l)).copied().collect();
+            // One walk from what is listed answers for everything that
+            // waits. Asking of each waiting entry against each listed one
+            // is their product in walks, for one arriving entry.
+            if ys.len() * listed.len() > 16 {
+                let kept = dag.ancestors_of(&listed);
+                found.extend(ys.iter().filter(|y| kept.contains(*y)).map(|y| (*y, *k)));
+                continue;
+            }
             for y in ys {
-                if listed.iter().any(|l| *l == y || dag.is_ancestor(y, l)) {
+                if listed.iter().any(|l| l == y || dag.is_ancestor(y, l)) {
                     found.push((*y, *k));
                 }
             }

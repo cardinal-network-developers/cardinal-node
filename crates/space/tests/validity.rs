@@ -1325,6 +1325,78 @@ fn what_a_keep_makes_count_vouches_in_turn_whenever_it_arrives() {
     }
 }
 
+/// V4. A `keep` lists entries, and keeps what its author's removed key
+/// wrote that is one of them or in their past. Asked of each waiting entry
+/// against each listed one, that is (waiting) x (listed) walks of the
+/// graph for one arriving entry: here a few hundred of each, which took
+/// minutes. One walk from what is listed answers for all of them.
+#[test]
+fn a_keep_that_lists_much_costs_one_walk() {
+    let size = |name: &str, or: usize| {
+        let asked = std::env::var(name)
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok());
+        asked.unwrap_or(or)
+    };
+    let (waiting, chain) = (size("V4_WAITING", 300), size("V4_CHAIN", 1_500));
+    let mut s = Scene::new(ANA, A, &[(ANA, OWNER), (BEN, READER)], None);
+    let genesis = s.named["genesis"];
+    let entry =
+        |s: &Scene, who: usize, key: usize, parent: EntryId, n: usize, ops: Vec<SpaceOp>| {
+            let p = &s.people[who];
+            let head = *p.log.dag().log_order().last().unwrap();
+            SpaceEntryBuilder::new(s.space, &[parent], p.log.id(), head, [1; 16])
+                .ops(ops)
+                .time(n as u64)
+                .sign(&p.keys[key])
+                .unwrap()
+        };
+    // Ben's phone writes off the genesis, and Ana writes a long chain.
+    for n in 0..waiting {
+        let e = entry(&s, BEN, P, genesis, n, vec![reach(&s.id(BEN))]);
+        arrive(&mut s.judge, &mut s.dag, &e);
+    }
+    let mut listed = Vec::new();
+    let mut last = genesis;
+    for n in 0..chain {
+        let e = entry(&s, ANA, A, last, n, app());
+        last = e.id();
+        listed.push(last);
+        arrive(&mut s.judge, &mut s.dag, &e);
+    }
+    // The phone is removed: what it wrote waits. Then Ben keeps, for the
+    // phone, entries none of which it wrote or built on.
+    s.remove_phone(BEN);
+    assert_eq!(s.judge.validity().unwitnessed.len(), waiting);
+    let keeps = vec![SpaceOp::keep(s.people[BEN].keys[P].public_key(), &listed)];
+    let keep = entry(&s, BEN, A, genesis, waiting, keeps);
+    let began = std::time::Instant::now();
+    arrive(&mut s.judge, &mut s.dag, &keep);
+    let took = began.elapsed();
+    eprintln!(
+        "MEASURE a keep that lists {chain} entries arrived in {took:?}, with {waiting} waiting"
+    );
+    assert_eq!(s.judge.validity().unwitnessed.len(), waiting);
+    assert!(took < std::time::Duration::from_secs(5), "{took:?}");
+    // And it keeps what it should: one that lists the phone's own.
+    let own: Vec<EntryId> = s
+        .judge
+        .validity()
+        .unwitnessed
+        .iter()
+        .copied()
+        .take(7)
+        .collect();
+    let keeps = vec![SpaceOp::keep(s.people[BEN].keys[P].public_key(), &own)];
+    let keep = entry(&s, BEN, A, genesis, waiting + 1, keeps);
+    arrive(&mut s.judge, &mut s.dag, &keep);
+    assert_eq!(s.judge.validity().unwitnessed.len(), waiting - 7);
+    if waiting * chain <= 10_000 {
+        let logs: Vec<&IdentityLog> = s.people.iter().map(|p| &p.log).collect();
+        compare(&s.judge, &s.dag, &logs, "a keep that lists much");
+    }
+}
+
 #[test]
 fn removed_device_entries_need_a_witness() {
     let mut s = Scene::new(ANA, A, &[(ANA, OWNER)], None);
