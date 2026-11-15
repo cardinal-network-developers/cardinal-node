@@ -124,13 +124,21 @@ fn remove(p: &Path) -> io::Result<()> {
     }
 }
 
-/// Removes what the node wrote in a data directory. The caller has made
-/// sure that no daemon is running on it.
+/// Removes what the node wrote in a data directory, unless a service is
+/// running on it: this takes the directory as a service does
+/// ([`crate::lock`]) and holds it until it is done.
 ///
 /// The marker goes first and the identity log last. If this is interrupted
 /// the directory still holds an identity and has no marker, so nothing
 /// opens it as it is, and running this again finishes the job.
 pub fn clear(paths: &Paths, including_local: bool) -> io::Result<()> {
+    if !paths.home.is_dir() {
+        return Ok(());
+    }
+    let Some(lock) = crate::lock::take(paths)? else {
+        let running = "a Cardinal service is running on this data";
+        return Err(io::Error::new(io::ErrorKind::ResourceBusy, running));
+    };
     let home = &paths.home;
     let tmp = |p: &Path| p.with_extension("tmp");
     let marker = crate::format::marker(paths);
@@ -151,6 +159,8 @@ pub fn clear(paths: &Paths, including_local: bool) -> io::Result<()> {
         remove(&tmp(&f))?;
         remove(&f)?;
     }
+    drop(lock);
+    remove(&crate::lock::file(paths))?;
     Ok(())
 }
 

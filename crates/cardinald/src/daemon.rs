@@ -262,6 +262,8 @@ pub struct Daemon {
     pub rang: Mutex<HashMap<[u8; 32], std::collections::VecDeque<Instant>>>,
     /// What each contact may fetch from here.
     pub shared_blobs: Mutex<HashMap<[u8; 32], SharedBlobs>>,
+    /// The data directory, held for as long as the service runs.
+    _lock: crate::lock::Lock,
     /// Audio heard on calls, for a client, by call.
     /// A call's audio as it comes in: the call, whose voice it is in a group
     /// call, and the frame.
@@ -365,8 +367,16 @@ impl Daemon {
     /// Loads everything and binds the link endpoint.
     pub async fn start(paths: Paths, config: Config) -> anyhow::Result<Arc<Daemon>> {
         raise_fd_limit();
+        // The directory is this process's from here on, before anything
+        // in it is read: a second service would empty what the first is
+        // still writing, and a store must not be cleared under one.
+        let lock = crate::lock::take(&paths)?.ok_or_else(|| {
+            anyhow::anyhow!(
+                "Cardinal is already running on {}. Nothing was changed.",
+                paths.home.display()
+            )
+        })?;
         crate::format::check(&paths)?;
-        std::fs::create_dir_all(&paths.home)?;
         let keys = Arc::new(Keys::load_or_create(&paths.device_key())?);
         let core = Core::load(&paths, keys.clone())?;
         let store = Arc::new(FsStore::open(paths.blobs(), Fsync::Deferred)?);
@@ -443,6 +453,7 @@ impl Daemon {
             conditions: crate::conditions::Conditions::default(),
             rang: Mutex::new(HashMap::new()),
             shared_blobs: Mutex::new(HashMap::new()),
+            _lock: lock,
             call_audio: tokio::sync::broadcast::channel(64).0,
             setting_up: Mutex::new(None),
             mount: Mutex::new(None),

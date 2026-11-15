@@ -334,3 +334,79 @@ fn what_nothing_names_is_counted_and_deleted_only_when_that_is_sure() {
     assert!(three.exists());
     assert_eq!(objects(&ana.home).len(), held.len());
 }
+
+/// D4. `cardinal clear` never removes a store a daemon is running on,
+/// whatever the directory is called this time and wherever this command
+/// looks for the daemon's socket. Here the directory is named with a
+/// trailing slash, and the command looks under a runtime directory the
+/// daemon was not given, so nothing answers where it asks.
+#[test]
+fn clear_refuses_while_a_daemon_runs_however_the_directory_is_named() {
+    let root = tempfile::tempdir().unwrap();
+    let ana = set_up(root.path(), "ana");
+    let run = root.path().join("run");
+    std::fs::create_dir_all(&run).unwrap();
+    let before = everything(&ana.home);
+    let mut named = ana.home.clone().into_os_string();
+    named.push("/");
+    let o = ana
+        .cmd()
+        .env("CARDINAL_HOME", &named)
+        .env_remove("CARDINAL_SOCKET")
+        .env("XDG_RUNTIME_DIR", &run)
+        .args(["clear", "--yes", "--including-local"])
+        .output()
+        .unwrap();
+    let why = said(&o);
+    assert!(!o.status.success(), "cleared under a running daemon: {why}");
+    assert!(
+        why.contains("daemon is running") && why.contains("Nothing was changed"),
+        "{why}"
+    );
+    let after = everything(&ana.home);
+    assert!(after.len() >= before.len(), "{before:?} {after:?}");
+    assert!(ana.cli(&["files"]).contains("ana-film.bin"));
+    // So does the service's own `--clear`, which a client runs.
+    assert!(ana.status()["identity"].is_string());
+}
+
+/// D7. A second service started on a data directory that one is running
+/// on does not start, and touches nothing there: it would empty the
+/// place where the first keeps objects it is still writing.
+#[test]
+fn a_second_daemon_on_the_same_directory_does_not_start() {
+    let root = tempfile::tempdir().unwrap();
+    let ana = set_up(root.path(), "ana");
+    let waiting = ana.home.join("blobs/tmp/being-written");
+    std::fs::create_dir_all(waiting.parent().unwrap()).unwrap();
+    std::fs::write(&waiting, b"half an object").unwrap();
+    let mut second = ana
+        .cmd()
+        .env("CARDINAL_SOCKET", root.path().join("second.sock"))
+        .args(["daemon", "--no-discovery", "--no-mount", "--listen"])
+        .arg(format!("127.0.0.1:{}", free_port()))
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let until = Instant::now() + Duration::from_secs(10);
+    let mut status = None;
+    while status.is_none() && Instant::now() < until {
+        status = second.try_wait().unwrap();
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let _ = second.kill();
+    let out = second.wait_with_output().unwrap();
+    let why = String::from_utf8_lossy(&out.stderr).into_owned();
+    assert!(
+        waiting.exists(),
+        "the second emptied what the first was writing"
+    );
+    assert!(
+        status.is_some_and(|s| !s.success()),
+        "a second daemon ran: {why}"
+    );
+    assert!(why.contains("already running"), "{why}");
+    // The first goes on as it was.
+    assert!(ana.cli(&["files"]).contains("ana-film.bin"));
+}

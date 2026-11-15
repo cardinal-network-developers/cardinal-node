@@ -60,7 +60,11 @@ impl Paths {
                     .map(|p| p.data_dir.clone())
                     .unwrap_or_else(|| user_data().join("cardinal"))
             });
-        let home = absolute(&home);
+        // The directory by its one true name, so that whatever is derived
+        // from it, the socket's name above all, is the same however the
+        // directory was named this time: with a trailing slash, from
+        // another place, or through a link.
+        let home = canonical(&absolute(&home));
         let config_dir = match &custom {
             Some(_) => home.clone(),
             None => env_dir("CARDINAL_CONFIG_DIR").unwrap_or_else(|| {
@@ -160,6 +164,20 @@ impl Paths {
     }
 }
 
+/// A path with links resolved and nothing redundant in it, as far as it
+/// exists: what does not exist yet is kept as named, under the true name
+/// of what does.
+fn canonical(p: &Path) -> PathBuf {
+    if let Ok(c) = std::fs::canonicalize(p) {
+        return c;
+    }
+    match (p.parent(), p.file_name()) {
+        (Some(up), Some(name)) => canonical(up).join(name),
+        // ends in `..` or is a root: nothing better to say
+        _ => p.to_path_buf(),
+    }
+}
+
 fn absolute(p: &Path) -> PathBuf {
     if p.is_absolute() {
         p.to_path_buf()
@@ -205,4 +223,39 @@ pub fn write_private(path: &Path, bytes: &[u8], mode: u32) -> std::io::Result<()
         f.sync_all()?;
     }
     std::fs::rename(&tmp, path)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// D4. What is derived from the data directory's path, the socket's
+    /// name above all, is the same however the directory is named.
+    #[test]
+    fn a_directory_has_one_name_however_it_is_given() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = std::fs::canonicalize(dir.path()).unwrap().join("dev1");
+        std::fs::create_dir_all(&real).unwrap();
+        let slash = PathBuf::from(format!("{}/", real.display()));
+        let dotted = real.parent().unwrap().join("./dev1/.");
+        let around = real.join("../dev1");
+        for named in [&slash, &dotted, &around] {
+            assert_ne!(named.as_os_str(), real.as_os_str());
+            assert_eq!(canonical(named), real, "{named:?}");
+            assert_eq!(socket_name(&canonical(named)), socket_name(&real));
+        }
+        #[cfg(unix)]
+        {
+            let link = real.parent().unwrap().join("link");
+            std::os::unix::fs::symlink(&real, &link).unwrap();
+            assert_eq!(canonical(&link), real);
+        }
+        // What is not there yet keeps its name, under the true name of
+        // what is: a service names its socket before it makes the
+        // directory, and a command after.
+        let new = PathBuf::from(format!("{}/new/", slash.display()));
+        assert_eq!(canonical(&new), real.join("new"));
+        std::fs::create_dir_all(real.join("new")).unwrap();
+        assert_eq!(canonical(&new), real.join("new"));
+    }
 }

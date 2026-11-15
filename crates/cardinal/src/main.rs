@@ -723,10 +723,12 @@ fn print_sheet(v: &Value) {
     println!("  --host <address> --key <key>");
 }
 
+/// Whether a service runs on the data directory: one answers on its
+/// socket, or holds the directory, which it does from before it reads
+/// anything there and whatever name it was given for it.
 async fn running(paths: &Paths) -> bool {
-    control::request(&paths.socket, &json!({"cmd": "status"}))
-        .await
-        .is_ok()
+    let status = control::request(&paths.socket, &json!({"cmd": "status"})).await;
+    status.is_ok() || cardinald::lock::held(paths)
 }
 
 /// A path inside the mount, relative to its top.
@@ -971,7 +973,12 @@ async fn clear(
     if running(paths).await {
         return Err(stop_first());
     }
-    cardinald::clear::clear(paths, including_local)?;
+    // It takes the directory as a daemon does: one that started since is
+    // found here, where nothing can come between.
+    match cardinald::clear::clear(paths, including_local) {
+        Err(e) if e.kind() == std::io::ErrorKind::ResourceBusy => return Err(stop_first()),
+        done => done?,
+    }
     println!("Removed. `cardinal init` sets this device up again.");
     Ok(())
 }

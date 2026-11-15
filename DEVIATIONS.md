@@ -818,6 +818,16 @@ Not implemented yet (the next milestone):
   cannot read it and changed nothing, and what to do; every command says
   the same when no daemon answers. A marker that is not a number is
   another version's.
+- **One process on a data directory** (`lock.rs`; not in the
+  specification). A service holds an exclusive lock on the file `lock` in
+  its data directory from before it reads anything there until it exits,
+  and a second one on the same directory does not start. `cardinal clear`
+  and `cardinald --clear` take the same lock, so neither removes a store a
+  service is running on, whatever the directory was called this time and
+  wherever the command looks for the socket. The data directory is taken
+  by its canonical path, so the socket's name does not turn on a trailing
+  slash or a link. On Windows the lock is a file opened sharing nothing,
+  which is written and has never been run.
 - **`cardinal clear`** (`clear.rs`) removes what the node wrote in the
   data directory, by name and without reading it, so it works on a store
   of any format: the keys, the identity log, the spaces, the objects,

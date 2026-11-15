@@ -25,6 +25,7 @@ pub mod groups;
 pub mod host;
 pub mod introductions;
 pub mod keys;
+pub mod lock;
 pub mod mailbox;
 pub mod mesh;
 pub mod net;

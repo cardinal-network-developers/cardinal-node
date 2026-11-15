@@ -27,10 +27,8 @@ use serde_json::{json, Value};
 /// Removes what the service wrote, for `--clear`, unless one is running.
 async fn clear(paths: &Paths) -> Value {
     let status = json!({"cmd": "status"});
-    if cardinald::control::request(&paths.socket, &status)
-        .await
-        .is_ok()
-    {
+    let answers = cardinald::control::request(&paths.socket, &status).await;
+    if answers.is_ok() || cardinald::lock::held(paths) {
         return json!({
             "ok": false,
             "error": "Cardinal is running on this data. Stop it first. Nothing was changed.",
@@ -47,6 +45,10 @@ async fn clear(paths: &Paths) -> Value {
     }
     match cardinald::clear::clear(paths, false) {
         Ok(()) => json!({"ok": true}),
+        Err(e) if e.kind() == std::io::ErrorKind::ResourceBusy => json!({
+            "ok": false,
+            "error": "Cardinal is running on this data. Stop it first. Nothing was changed.",
+        }),
         Err(e) => json!({"ok": false, "error": format!("Not all of it could be removed: {e}")}),
     }
 }
