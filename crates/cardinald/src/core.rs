@@ -2143,11 +2143,37 @@ impl Core {
         written
     }
 
-    /// The account space, once held and open.
+    /// The account space, once held and open: the one with the account
+    /// profile that is this person's own (`profiles.md#account`, "Which
+    /// space it is"). A device holds other people's spaces too, and one of
+    /// those is never the account, whatever profile its genesis claims.
     pub fn account(&self) -> Option<&Holder> {
-        self.spaces
-            .values()
-            .find(|h| h.profile() == Some(Profile::ACCOUNT))
+        let own = |h: &&Holder| h.profile() == Some(Profile::ACCOUNT) && self.own_alone(h);
+        self.spaces.values().find(own)
+    }
+
+    /// Whether a space is this person's own and nobody else's: its genesis
+    /// was written by their identity, counts, and names that identity as
+    /// owner and nobody else. Nobody else can make such a space, since it
+    /// takes a signature by a key of the identity; so it is one this
+    /// person's devices made, however it reached this one.
+    fn own_alone(&self, h: &Holder) -> bool {
+        let me = self.identity.as_ref().map(|i| i.id());
+        let (Some(me), Some(sp)) = (me, h.space.as_ref()) else {
+            return false;
+        };
+        let Some(genesis) = sp.entry(&sp.id()) else {
+            return false;
+        };
+        let named = genesis.ops().iter().filter_map(|op| match op.body() {
+            cardinal_space::SpaceOpBody::AddMember { identity, role, .. } => {
+                Some((*identity, *role))
+            }
+            _ => None,
+        });
+        let named: Vec<([u8; 32], u64)> = named.collect();
+        let owner = cardinal_space::entry::OWNER;
+        sp.creator() == me && sp.validity().is_valid(&sp.id()) && named == [(me, owner)]
     }
 
     /// The account space id.
@@ -2170,10 +2196,9 @@ impl Core {
                 }
             }
         }
-        self.spaces
-            .values()
-            .find(|h| h.profile() == Some(Profile::FILES))
-            .map(|h| h.id)
+        // one of this person's own, never a files space someone shared
+        let own = |h: &&Holder| h.profile() == Some(Profile::FILES) && self.own_alone(h);
+        self.spaces.values().find(own).map(|h| h.id)
     }
 
     /// Device names from the account space.
@@ -2367,6 +2392,85 @@ mod tests {
         let sp = again.spaces[&id].space.as_ref().unwrap();
         assert_eq!(sp.validity().valid, ana.space(&id).validity().valid);
         assert_eq!(sp.members(), the_two);
+    }
+
+    /// P1 (`profiles.md#account`, "Which space it is"). A device's account
+    /// is the space its own identity wrote, with the account profile, that
+    /// names that identity as owner and nobody else. A space that a
+    /// contact made is never it, whatever profile its genesis claims and
+    /// whatever its id: here one that sorts before the real one, as a
+    /// contact can make by trying a few.
+    #[test]
+    fn a_space_a_contact_made_is_never_the_account() {
+        use cardinal_space::account::{self, Regard};
+        let (mut ana, mut bo) = (Person::new(), Person::new());
+        ana.meets(&bo);
+        bo.meets(&ana);
+        bo.knows(&ana, "Ana");
+        let real = bo.core.account_id().unwrap();
+        let files = bo.core.files_id().unwrap();
+        let his = bo.enc();
+        let made = |profile: Profile, roles: &[([u8; 32], u64)], below: &SpaceId| {
+            let ident = ana.core.identity.as_ref().unwrap();
+            let ops: Vec<SpaceOp> = roles
+                .iter()
+                .map(|(who, role)| SpaceOp::add_member(*who, *role))
+                .collect();
+            (0..400).find_map(|n| {
+                let (space, sealed) = Space::create_with(
+                    profile,
+                    Policy::default(),
+                    &ident.log,
+                    &ana.core.keys.device.signing,
+                    &[&ana.enc(), &his],
+                    ops.clone(),
+                    Some(now_ms() + n),
+                )
+                .unwrap();
+                (space.id() < *below).then(|| (space.id(), sealed.encode()))
+            })
+        };
+        let (a, b) = (ana.id(), bo.id());
+        // The contact owns it, and the device's person is a writer in it.
+        let (fake, genesis) = made(Profile::ACCOUNT, &[(a, OWNER), (b, WRITER)], &real).unwrap();
+        // In it, a contact record of the contact's choosing.
+        bo.core.ingest_space(fake, &[genesis]).unwrap();
+        assert!(
+            bo.core.spaces[&fake].space.is_some(),
+            "the offered space is held"
+        );
+        assert_eq!(bo.core.account_id(), Some(real));
+        let known: Vec<String> = bo.core.contacts().into_iter().map(|c| c.petname).collect();
+        assert_eq!(known, ["Ana"]);
+        // What this device writes to its account goes to its own.
+        let account = bo.core.account_id().unwrap();
+        let contact = account::create_contact(&[9; 32], "Cy", &[7; 32], Regard::default());
+        bo.core.write_entry(&account, vec![contact]).unwrap();
+        assert_eq!(bo.space(&fake).dag().len(), 1);
+        // Nor one that names the person as owner, written by the contact;
+        // nor one of their own with someone else in it.
+        let (fake, genesis) = made(Profile::ACCOUNT, &[(a, WRITER), (b, OWNER)], &real).unwrap();
+        bo.core.ingest_space(fake, &[genesis]).unwrap();
+        assert_eq!(bo.core.account_id(), Some(real));
+        // And a files space a contact made is not this person's files.
+        let (fake, genesis) = made(Profile::FILES, &[(a, OWNER), (b, WRITER)], &files).unwrap();
+        bo.core.ingest_space(fake, &[genesis]).unwrap();
+        assert_eq!(bo.core.files_id(), Some(files));
+        // An offer is never of an account or of a relationship: none of
+        // these is shown as one, and a relationship a contact sent this
+        // way is nobody's.
+        let top = [255; 32];
+        let (fake, genesis) =
+            made(Profile::RELATIONSHIP, &[(a, WRITER), (b, WRITER)], &top).unwrap();
+        bo.core.ingest_space(fake, &[genesis]).unwrap();
+        let listed = crate::groups::list_of(&bo.core);
+        assert_eq!(listed["offers"], serde_json::json!([]), "{listed}");
+        assert_eq!(listed["groups"], serde_json::json!([]), "{listed}");
+        assert_eq!(bo.core.contacts().len(), 2);
+        // A restart finds the same.
+        bo.restarts();
+        assert_eq!(bo.core.account_id(), Some(real));
+        assert_eq!(bo.core.files_id(), Some(files));
     }
 
     #[test]

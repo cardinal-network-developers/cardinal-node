@@ -1162,6 +1162,14 @@ asks for around that is not built yet.
   to make one by hand; only a group's are made unasked. An introduction's
   invitation names the introduced person's host if they have one, and the
   device that said yes if not, which someone elsewhere cannot reach.
+- **Which space is the account** (`profiles.md#account`, `Core::account`).
+  The space with the account profile whose genesis this identity wrote,
+  that counts, and that names it as owner and nobody else; the files space
+  is found the same way where the account does not name one yet. A space
+  a contact offers with the account or the relationship profile is still
+  fetched and held, as any offered space is until it is opened and its
+  profile is known. It is then never shown as an offer, cannot be joined,
+  and nothing is written in it; nothing removes it from the disk.
 - **Refuse is for contacts.** `member seen` nodes do not exist yet. Nothing
   warns when someone refused is added to a group with this person, except
   where their hosts are named there ([Hosts](#hosts-spechostsmd), "Whoever
