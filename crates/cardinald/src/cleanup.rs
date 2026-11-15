@@ -28,7 +28,7 @@
 //! to follow is not here, what that names cannot be told from what nothing
 //! names, and nothing is deleted.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard};
@@ -96,11 +96,16 @@ impl std::fmt::Display for Keep {
 #[derive(Default)]
 pub struct Ledger {
     since: HashMap<Id, u64>,
+    /// The old blobs this device has freed: what they named is gone on
+    /// purpose, and is not missing.
+    freed: HashSet<Id>,
 }
 
 #[derive(Default, Serialize, Deserialize)]
 struct Saved {
     since: BTreeMap<String, u64>,
+    #[serde(default)]
+    freed: BTreeSet<String>,
 }
 
 impl Ledger {
@@ -110,7 +115,11 @@ impl Ledger {
         let before = self.since.len();
         self.since
             .retain(|id, _| known.contains(id) && !live.contains(id));
-        let mut changed = self.since.len() != before;
+        // a version that is current again was fetched again
+        let freed = self.freed.len();
+        self.freed
+            .retain(|id| known.contains(id) && !live.contains(id));
+        let mut changed = self.since.len() != before || self.freed.len() != freed;
         for id in known.difference(live) {
             if !self.since.contains_key(id) {
                 self.since.insert(*id, now);
@@ -118,6 +127,21 @@ impl Ledger {
             }
         }
         changed
+    }
+
+    /// Notes old blobs as freed, and says whether that is news.
+    fn note_freed(&mut self, ids: impl Iterator<Item = Id>) -> bool {
+        let before = self.freed.len();
+        self.freed.extend(ids);
+        self.freed.len() != before
+    }
+
+    /// The references among `roots` that are not to a blob this device
+    /// freed: for telling what is named, where a freed blob's index is not
+    /// one that is missing.
+    pub fn not_freed(&self, roots: Vec<BlobRef>) -> Vec<BlobRef> {
+        let kept = roots.into_iter().filter(|b| !self.freed.contains(&b.id));
+        kept.collect()
     }
 
     /// Whether an old blob is still kept.
@@ -134,11 +158,13 @@ impl Ledger {
             .ok()
             .and_then(|b| serde_json::from_slice(&b).ok())
             .unwrap_or_default();
+        let id = |k: &String| -> Option<Id> { hex::decode(k).ok()?.try_into().ok() };
         Ledger {
+            freed: saved.freed.iter().filter_map(id).collect(),
             since: saved
                 .since
                 .into_iter()
-                .filter_map(|(k, t)| Some((hex::decode(k).ok()?.try_into().ok()?, t)))
+                .filter_map(|(k, t)| Some((id(&k)?, t)))
                 .collect(),
         }
     }
@@ -150,6 +176,7 @@ impl Ledger {
                 .iter()
                 .map(|(k, t)| (hex::encode(k), *t))
                 .collect(),
+            freed: self.freed.iter().map(hex::encode).collect(),
         };
         let bytes = serde_json::to_vec(&saved).unwrap_or_default();
         if let Err(e) = write_private(path, &bytes, 0o600) {
@@ -278,11 +305,15 @@ pub fn unnamed(d: &Daemon, delete: bool) -> anyhow::Result<Unnamed> {
     crate::fs::commit::without_commits(|| {
         let store: &dyn ObjectStore = &*d.store;
         let (roots, mut unsure) = d.core().named_blobs();
+        // less the old versions this device freed: their indexes are gone
+        // on purpose
+        let roots = lock(&c.ledger).not_freed(roots);
         let mut named = named_objects(store, &roots)?;
         let mut found = unnamed_objects(store, &named.objects, SystemTime::now(), c.min_age)?;
         if delete && !found.is_empty() {
             // What arrived meanwhile may name something that was here.
             let (again, also) = d.core().named_blobs();
+            let again = lock(&c.ledger).not_freed(again);
             let known: HashSet<&BlobRef> = roots.iter().collect();
             let new: Vec<BlobRef> = again.into_iter().filter(|b| !known.contains(b)).collect();
             let more = named_objects(store, &new)?;
@@ -694,6 +725,21 @@ fn pass_now(d: &Daemon, now_all: bool, dry_run: bool) -> anyhow::Result<Passed> 
         if dry_run || store.delete(id)? {
             freed.objects += 1;
             freed.bytes += size;
+        }
+    }
+    // An expired version whose top object is gone was freed, now or
+    // before: the entry that wrote it is held for good, and what it names
+    // must not count as missing (`unnamed`).
+    if !dry_run {
+        let mut gone = Vec::new();
+        for b in &expired {
+            if !store.has(&b.id)? {
+                gone.push(b.id);
+            }
+        }
+        let mut l = lock(&c.ledger);
+        if l.note_freed(gone.into_iter()) {
+            l.save(&c.path);
         }
     }
     // An object already gone counts as freed: it is not left either.

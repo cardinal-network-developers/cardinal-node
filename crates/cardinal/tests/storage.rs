@@ -410,3 +410,49 @@ fn a_second_daemon_on_the_same_directory_does_not_start() {
     // The first goes on as it was.
     assert!(ana.cli(&["files"]).contains("ana-film.bin"));
 }
+
+/// D8. An old version that was freed is gone on purpose: its index is not
+/// "missing", and what nothing names can still be told and deleted. It
+/// used to count as an index an entry names that is not here, for good,
+/// since the entry that wrote the version is always held.
+#[test]
+fn what_nothing_names_can_be_deleted_after_an_old_version_was_freed() {
+    if !fuse_available() {
+        eprintln!("skipping: /dev/fuse or fusermount3 is not available");
+        return;
+    }
+    let root = tempfile::tempdir().unwrap();
+    let mut ana = Dev::new(root.path(), "ana", free_port());
+    for (k, v) in [
+        ("CARDINAL_TEST_FREE_MIN_AGE_MS", "0"),
+        ("CARDINAL_TEST_FREE_INTERVAL_MS", "500"),
+    ] {
+        ana.env.push((k.into(), v.into()));
+    }
+    ana.start();
+    ana.cli(&["init", "--yes", "--name", "ana"]);
+    ana.wait_mounted();
+    // A file is written, and written over: its first content is an old
+    // version, of several chunks under an index.
+    let file = ana.mount.join("film.bin");
+    for seed in [7, 8] {
+        std::fs::write(&file, content(3 << 20, seed)).unwrap();
+        ana.cli(&["flush"]);
+    }
+    wait("the old version is counted", 30, || {
+        ana.cli(&["status"]).contains("Old versions: ")
+    });
+    let before = objects(&ana.home).len();
+    let out = ana.cli(&["free-space", "--yes"]);
+    assert!(
+        objects(&ana.home).len() < before,
+        "nothing was freed: {out}"
+    );
+    // Something nothing names.
+    let one = stray(&ana.home, &content(5000, 1));
+    let o = ana.try_cli(&["free-space", "--unnamed", "--delete"]);
+    assert!(o.status.success(), "{}", said(&o));
+    assert!(!one.exists(), "{}", said(&o));
+    // The file is whole.
+    assert_eq!(std::fs::read(&file).unwrap(), content(3 << 20, 8));
+}
