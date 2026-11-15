@@ -179,7 +179,13 @@ pub fn check(paths: &Paths) -> anyhow::Result<()> {
 /// Writes the marker: whatever makes a store calls this first.
 pub fn write(paths: &Paths) -> std::io::Result<()> {
     std::fs::create_dir_all(&paths.home)?;
-    crate::paths::write_private(&marker(paths), format!("{FORMAT}\n").as_bytes(), 0o600)
+    crate::paths::write_private(&marker(paths), format!("{FORMAT}\n").as_bytes(), 0o600)?;
+    // The name is as much a part of the marker as its bytes: a power cut
+    // after set-up must not keep the identity and lose the marker, which
+    // would make the store another version's.
+    #[cfg(unix)]
+    std::fs::File::open(&paths.home)?.sync_all()?;
+    Ok(())
 }
 
 #[cfg(test)]

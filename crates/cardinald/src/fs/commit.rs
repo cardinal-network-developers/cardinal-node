@@ -351,6 +351,9 @@ pub fn write_pending(
         }
     }
     let mut written: Vec<Vec<u8>> = Vec::new();
+    // The deletes this commit took up, to give back if it cannot write
+    // them: a delete written twice does nothing the second time.
+    let mut taken: Vec<super::tree::Deleted> = Vec::new();
     let mut first = true;
     let mut rounds = 0;
     loop {
@@ -379,7 +382,8 @@ pub fn write_pending(
         // finds its `create` earlier in the round; each in the order it
         // was made here, which has a folder before what was made in it.
         let mut inos: Vec<u64> = t.inodes.keys().copied().collect();
-        inos.sort_unstable_by_key(|ino| (t.inodes[ino].node.is_some(), *ino));
+        // (one look at each inode, not one for each comparison)
+        inos.sort_by_cached_key(|ino| (t.inodes[ino].node.is_some(), *ino));
         for ino in inos {
             if ino == t.root {
                 continue;
@@ -491,7 +495,8 @@ pub fn write_pending(
         }
         if first {
             let me = core.me();
-            for del in std::mem::take(&mut t.deleted) {
+            taken = std::mem::take(&mut t.deleted);
+            for del in taken.clone() {
                 // not this person's to delete
                 let owner = sp.state().owner_of(&del.node);
                 if owner.is_some() && owner != me {
@@ -578,7 +583,13 @@ pub fn write_pending(
         for mut batch in split_ops(ops) {
             let n = batch.len();
             name_parents(&mut batch, idx, &under, &nodes);
-            let (eid, bytes) = core.write_entry(space, batch)?;
+            let (eid, bytes) = match core.write_entry(space, batch) {
+                Ok(wrote) => wrote,
+                Err(e) => {
+                    t.deleted.append(&mut taken);
+                    return Err(e);
+                }
+            };
             written.push(bytes);
             nodes.extend((0..n).map(|k| (idx + k, files::created_node(&eid, k))));
             // What follows may name what this entry made: if it made
@@ -1710,6 +1721,28 @@ mod tests {
         fx.remote(SpaceOp::delete(theirs));
         fx.refresh();
         assert!(fx.t.dir_is_empty(dir));
+    }
+
+    /// D10. A commit that cannot write its entry leaves everything to be
+    /// written again: the deletes it had taken up as much as the files,
+    /// which stay dirty.
+    #[test]
+    fn a_commit_that_fails_keeps_its_deletes() {
+        let mut fx = Fx::new();
+        let file = fx.write("a.txt", b"v1");
+        fx.commit();
+        fx.refresh();
+        let node = fx.node(file);
+        fx.t.delete_node(node, None);
+        fx.t.remove(file);
+        fx.t.touch();
+        fx.core.break_log_for_test(&fx.space);
+        let failed = write_pending(&mut fx.core, &mut fx.t, &fx.space, Vec::new());
+        assert!(failed.is_err());
+        assert!(fx.t.has_pending(), "the delete is forgotten");
+        assert_eq!(fx.commit(), 1);
+        assert!(fx.sp().state().node(&node).unwrap().deleted);
+        assert!(!fx.t.has_pending());
     }
 
     /// Content is keyed by the epoch, so a commit asks for the rotation by

@@ -2284,6 +2284,16 @@ impl Core {
         sp.creator() == me && sp.validity().is_valid(&sp.id()) && named == [(me, owner)]
     }
 
+    /// Makes a space's log refuse what is appended from now on.
+    #[cfg(test)]
+    pub fn break_log_for_test(&mut self, space: &SpaceId) {
+        self.spaces
+            .get_mut(space)
+            .expect("held")
+            .file
+            .break_for_test();
+    }
+
     /// This person's identity, once the device has one.
     pub fn me(&self) -> Option<[u8; 32]> {
         self.identity.as_ref().map(|i| i.id())
