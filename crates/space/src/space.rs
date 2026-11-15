@@ -391,6 +391,27 @@ impl Space {
         })
     }
 
+    /// The members a valid entry added that started the current epoch or
+    /// descends from the entry that did: their `add_member` gave them its
+    /// key (`spaces.md#when-to-rotate`). Anyone else in the space was a
+    /// member when the epoch started, and whether it was wrapped for them
+    /// is something only the device that started it knows.
+    pub fn added_since_epoch(&self) -> Vec<IdentityId> {
+        let Some((start, _)) = self.current_epoch else {
+            return Vec::new();
+        };
+        let adds = self.judge.valid_adds().into_iter();
+        let since = adds.filter(|(_, add)| self.dag.is_ancestor_or_self(&start, add));
+        let mut who: Vec<IdentityId> = since.map(|(who, _)| who).collect();
+        // the genesis starts the first epoch, and names its members itself
+        if start == self.id {
+            who.extend(self.validity().identities());
+        }
+        who.sort();
+        who.dedup();
+        who
+    }
+
     /// The members who were added only after every one of the entries
     /// `since`, and have not left: whoever came to the space after
     /// something was written in it, and reads it all the same.

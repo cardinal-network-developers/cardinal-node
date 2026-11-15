@@ -1420,15 +1420,28 @@ impl Core {
         let current = sp.current_epoch().map(hex::encode);
         let by_record = match current.and_then(|id| h.reached.get_mut(&id)) {
             Some(record) => {
-                // Someone added since, or whose log came since, has the key
-                // they had when this device first saw them with one.
+                // Someone added since the epoch started has the key they
+                // had when this device first saw them with one: their
+                // `add_member` gave them the epoch's. Anyone else the
+                // record has no key for was a member when it started, and
+                // may not have been wrapped for: this device did not hold
+                // their identity log yet, or a `leave` of theirs has since
+                // stopped counting. The first key held for them is a
+                // change.
+                let since: Vec<String> = sp.added_since_epoch().iter().map(hex::encode).collect();
+                let mut unkeyed = false;
                 for (who, key) in &now.keys {
-                    if !record.keys.contains_key(who) {
+                    if record.keys.contains_key(who) {
+                        continue;
+                    }
+                    if since.contains(who) {
                         record.keys.insert(who.clone(), key.clone());
                         changed = true;
+                    } else {
+                        unkeyed = true;
                     }
                 }
-                record.calls_for_a_new_epoch(&now)
+                unkeyed || record.calls_for_a_new_epoch(&now)
             }
             None => false,
         };
@@ -3952,6 +3965,108 @@ mod tests {
         ana.says(&g, "new keys");
         assert!(ana.began_an_epoch(&g));
         ana.says(&g, "and no more");
+        assert!(!ana.began_an_epoch(&g));
+    }
+
+    /// P8 (`spaces.md#when-to-rotate`). A device starts an epoch wrapped
+    /// for the members whose keys it holds. One whose identity log it did
+    /// not hold yet was a member and was not wrapped for: the first key
+    /// the device holds for them is a change, and its next write starts an
+    /// epoch they can open. It used to take that first key for the key
+    /// they had been given, and they were left out for good.
+    #[test]
+    fn a_member_whose_log_came_late_is_given_the_next_epoch() {
+        let (mut ana, mut bo, mut cy) = (Person::new(), Person::new(), Person::new());
+        for (a, b) in [(0, 1), (0, 2)] {
+            let p = [&mut ana, &mut bo, &mut cy];
+            let (log, id) = (p[b].log(), p[b].id());
+            p[a].core.ingest_other(id, &log).unwrap();
+            let (log, id) = (p[a].log(), p[a].id());
+            p[b].core.ingest_other(id, &log).unwrap();
+        }
+        // Cy holds Bo's log, and Bo does not hold Cy's.
+        cy.meets(&bo);
+        let both = [(bo.id(), "Bo".to_owned()), (cy.id(), "Cy".to_owned())];
+        let g = ana.core.create_group("Choir", "Ana", &both).unwrap();
+        bo.takes(&g, &ana.all_of(&g));
+        cy.takes(&g, &ana.all_of(&g));
+        let joined = bo.says_reach(&g, false);
+        cy.takes(&g, &[joined]);
+        let first = bo.space(&g).current_epoch();
+        assert_eq!(cy.space(&g).current_epoch(), first);
+        // An epoch comes due on Bo's device, and it starts one: for Ana,
+        // whose key it holds, and not for Cy.
+        let moved = bo.changes_key();
+        assert!(
+            bo.core
+                .ingest_identity(std::slice::from_ref(&moved), None)
+                .unwrap()
+                .changed
+        );
+        cy.core.ingest_other(bo.id(), &[moved]).unwrap();
+        let second = bo.says_reach(&g, false);
+        assert!(bo.began_an_epoch(&g));
+        cy.takes(&g, &[second]);
+        assert_eq!(cy.space(&g).current_epoch(), first, "Cy was wrapped for");
+        // Cy's log reaches Bo's device. Nothing was written in the space
+        // since, and no key of Cy's has changed.
+        bo.meets(&cy);
+        let third = bo.says_reach(&g, false);
+        assert!(bo.began_an_epoch(&g), "Cy is left out for good");
+        cy.takes(&g, &[third]);
+        assert_eq!(cy.space(&g).current_epoch(), bo.space(&g).current_epoch());
+        // Once is enough.
+        bo.says_reach(&g, false);
+        assert!(!bo.began_an_epoch(&g));
+    }
+
+    /// P9 (`spaces.md#when-to-rotate`). A member whose `leave` stops
+    /// counting is a member the current epoch was started without: here a
+    /// stolen device wrote the `leave`, an epoch was started without its
+    /// person, and they then removed the device as lost. The first key a
+    /// device holds for them, now that they are in the space again, is a
+    /// change.
+    #[test]
+    fn a_member_whose_leave_stopped_counting_is_given_the_next_epoch() {
+        use cardinal_identity::{EntryBuilder, IdentityOp};
+        let [mut ana, mut bo, mut dee, _] = four();
+        let both = [(bo.id(), "Bo".to_owned()), (dee.id(), "Dee".to_owned())];
+        let g = ana.core.create_group("Choir", "Ana", &both).unwrap();
+        bo.takes(&g, &ana.all_of(&g));
+        dee.takes(&g, &ana.all_of(&g));
+        let joined = dee.says_reach(&g, false);
+        ana.takes(&g, &[joined]);
+        // Dee's device, in someone else's hands, leaves the group.
+        let (_, gone) = dee
+            .core
+            .write_entry(&g, relationship::leave_ops(&dee.id()))
+            .unwrap();
+        ana.takes(&g, &[gone]);
+        assert!(ana.space(&g).has_left(&dee.id()));
+        // Whoever writes next starts an epoch without Dee.
+        ana.says(&g, "without Dee");
+        assert!(ana.began_an_epoch(&g));
+        ana.says(&g, "and once is enough");
+        assert!(!ana.began_an_epoch(&g));
+        // Dee removes the device as lost, with their recovery words: what
+        // it wrote that nobody of theirs built on counts no longer.
+        let head = {
+            let ident = dee.core.identity.as_ref().unwrap();
+            *ident.log.dag().log_order().last().unwrap()
+        };
+        let lost = dee.core.keys.device.signing.public_key();
+        let removal = EntryBuilder::new(dee.id(), &[head])
+            .op(IdentityOp::remove_key(lost))
+            .sign(&dee.root)
+            .unwrap()
+            .encode();
+        assert!(ana.core.ingest_other(dee.id(), &[removal]).unwrap());
+        assert!(!ana.space(&g).has_left(&dee.id()), "the leave still counts");
+        // Dee is in the space, and the epoch there is was not started for
+        // them: the next write starts one that is.
+        ana.says(&g, "with Dee again");
+        assert!(ana.began_an_epoch(&g), "Dee is never given the key again");
+        ana.says(&g, "and once is enough");
         assert!(!ana.began_an_epoch(&g));
     }
 

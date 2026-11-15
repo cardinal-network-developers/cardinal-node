@@ -972,9 +972,13 @@ Not implemented yet (the next milestone):
   `Reached`). A device keeps, with each epoch whose key it holds, what it
   held when it first held that key: the fingerprint of the encryption key
   of each member who has not left, and whom it knew to be frozen, in
-  `spaces/<id>/epochs.json`. A member added afterwards joins the record
-  with the first key the device holds for them. An epoch with no record
-  there reaches the device now. Its next write starts a new epoch when,
+  `spaces/<id>/epochs.json`. A member added by an entry that descends
+  from the one that started the epoch joins the record with the first key
+  the device holds for them. Any other member the record has no key for
+  calls for a new epoch as soon as the device holds a key for them: it did
+  not hold their identity log when the epoch reached it, or a `leave` of
+  theirs has since stopped counting (`Space::added_since_epoch`). An epoch
+  with no record there reaches the device now. Its next write starts a new epoch when,
   against the record of the current one, the key of a member who would be
   given the next one has changed, or it has learned that one is frozen;
   when the entries say so (a `leave` the epoch's first entry does not
@@ -996,6 +1000,15 @@ Not implemented yet (the next milestone):
     reaches it; ten epochs, a hundred wraps, where the new epoch reaches
     each device before it hears; and between two and eight epochs, seven
     at the median, over twelve orders drawn at random.
+  - **Reading: "descends from the one that started the epoch".** An
+    `add_member` in the entry that starts the epoch counts too, since that
+    entry wraps the key for whom it adds; so does the genesis for everyone
+    it names. Read strictly, a device that joined a new group before it
+    held every other member's log would start an epoch for each log as it
+    came.
+  - **Not written down: "the record says so".** Nothing marks a member
+    the record has no key for. Having no key there and no addition since
+    the epoch started is the mark.
   - **Spec ambiguity: an `add_member` of someone who was a member
     already.** "A member's `add_member` was written under another epoch,
     and the entry that started the current epoch does not descend from
