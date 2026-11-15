@@ -725,7 +725,16 @@ pub async fn write_reach(d: &Arc<Daemon>, space: &SpaceId) -> anyhow::Result<()>
     if !t.sets_unasked() {
         return Ok(());
     }
-    say_reach_locked(d, space, true).await
+    let me = d.core().identity.as_ref().map(|i| i.id());
+    let me = me.ok_or_else(|| anyhow::anyhow!("this device has no identity"))?;
+    let reach = reach_here(d).await;
+    // A host that cannot be reached now gives no token. The empty list
+    // that leaves is said once, and not again each time this looks.
+    if !t.worth_saying(reach.len()) {
+        return Ok(());
+    }
+    d.write_and_push(space, vec![relationship::set_reach(&me, &reach)])?;
+    Ok(())
 }
 
 /// This host's tokens in a space, from what its person wrote there.

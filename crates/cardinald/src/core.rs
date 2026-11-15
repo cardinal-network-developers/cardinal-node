@@ -324,6 +324,16 @@ impl Telling {
             }
     }
 
+    /// Whether what software would set unasked is worth an entry, given
+    /// how many of the person's hosts gave this device a token: hosts to
+    /// name, or an empty list where nothing was ever set, which accepts
+    /// the space and says there is nowhere. An empty list where the node
+    /// is set and names nothing says nothing new. That is all a device has
+    /// whose person's host it cannot reach now, and it waits for the host.
+    pub fn worth_saying(&self, hosts: usize) -> bool {
+        hosts > 0 || !self.set
+    }
+
     /// Whether software empties the reach node now: the person said no and
     /// it names a host all the same, as it can where another of their
     /// devices set it before their answer reached it. Setting an empty
@@ -3126,6 +3136,27 @@ mod tests {
         let t = bo.core.telling(&g);
         assert_eq!((t.late.len(), &t.late), (2, &t.who));
         assert!(bo.core.answer_ops(&g, "Garden club", None).is_none());
+    }
+
+    /// P2. Among contacts a reach node is set unasked, to the person's
+    /// hosts. A device that cannot reach the host has only an empty list
+    /// to set: once, and then nothing until it can.
+    #[test]
+    fn an_empty_reach_node_is_not_set_again_for_want_of_the_host() {
+        let [mut ana, mut bo, _, _] = four();
+        bo.knows(&ana, "Ana");
+        bo.hosts_at("203.0.113.5:7171");
+        let bo_shown = [(bo.id(), "Bo".to_owned())];
+        let g = ana.core.create_group("Choir", "Ana", &bo_shown).unwrap();
+        bo.takes(&g, &ana.all_of(&g));
+        bo.says_reach(&g, false);
+        // Never set: an empty list accepts the space. Set and empty, with
+        // a host to name: software would set it, and has nothing to say
+        // until the host gives a token.
+        assert!(Telling::default().worth_saying(0));
+        let t = bo.core.telling(&g);
+        assert!(t.set && !t.shared && t.hosted && t.sets_unasked());
+        assert!(!t.worth_saying(0) && t.worth_saying(1));
     }
 
     /// A yes given while there was no host to name does not cover whoever

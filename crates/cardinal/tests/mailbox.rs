@@ -318,3 +318,53 @@ fn a_new_epoch_reaches_someone_through_hosts() {
     bo.cli(&["say", "Ana", "and back"]);
     wait("ana reads that", 40, || has_read(&ana, "bo", "and back"));
 }
+
+/// P2. A device whose person has a host it cannot reach now has no token
+/// to give, so all it could set in a reach node is an empty list. It says
+/// that once, where nothing was set, and then waits for the host: it does
+/// not write the same empty list again each time it looks.
+#[test]
+fn a_device_that_cannot_reach_its_host_does_not_keep_saying_so() {
+    if !fuse_available() {
+        eprintln!("skipping: /dev/fuse or fusermount3 is not available");
+        return;
+    }
+    let root = tempfile::tempdir().unwrap();
+    let mut ana = hosted(root.path(), "ana");
+    let mut phone = Dev::new(root.path(), "phone", free_port());
+    phone.start();
+    pair(&ana, &phone);
+    phone.wait_mounted();
+    let entries = |d: &Dev, kind: &str| -> u64 {
+        let status = d.status();
+        let all = status["spaces"].as_array().cloned().unwrap_or_default();
+        let of_kind = all.iter().filter(|s| s["kind"] == kind);
+        of_kind.map(|s| s["entries"].as_u64().unwrap_or(0)).sum()
+    };
+    wait(
+        "the phone has the account, which names the host",
+        30,
+        || entries(&phone, "account") > 0 && entries(&phone, "account") == entries(&ana, "account"),
+    );
+    ana.stop();
+
+    let mut cy = Dev::new(root.path(), "cy", free_port());
+    cy.start();
+    cy.cli(&["init", "--yes", "--name", "cy"]);
+    let at = format!("127.0.0.1:{}", cy.port);
+    let code = cy.cli(&["invite", "--address", &at, "--name", "Cy"]);
+    phone.cli(&["accept", code.trim()]);
+    wait("the phone lists cy", 20, || {
+        phone.cli(&["contacts"]).contains("Cy")
+    });
+    std::thread::sleep(std::time::Duration::from_secs(3));
+    let before = entries(&phone, "other");
+    std::thread::sleep(std::time::Duration::from_secs(5));
+    let after = entries(&phone, "other");
+    assert!(before > 0, "the relationship is there");
+    assert!(
+        after <= before + 1,
+        "{} entries written in five seconds with nothing to say",
+        after - before
+    );
+}
