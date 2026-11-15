@@ -157,6 +157,11 @@ fn unlisted(space: &Space, listed: &HashSet<[u8; 32]>) -> Vec<(String, BlobRef)>
         .collect()
 }
 
+/// Whether something to fetch is what no view shows.
+fn is_unshown(named: &(String, BlobRef)) -> bool {
+    named.0.starts_with(NOT_SHOWN)
+}
+
 /// What a device fetches of a space: of what its views list (`shown`),
 /// what its retention keeps, and where it keeps the space in full also
 /// whatever else current state references, which is the content of kinds
@@ -387,6 +392,8 @@ async fn pass(d: &Arc<Daemon>, complete: &mut HashSet<[u8; 32]>) -> anyhow::Resu
     // of its messages (`profiles.md#shared-folder`). Under on-demand
     // retention, images small enough to show are kept as they come.
     let mut sources: Vec<Source> = Vec::new();
+    // the place among them of what the person's own folder does not show
+    let mut quiet = usize::MAX;
     {
         let core = d.core();
         if let Some(space) = core
@@ -396,7 +403,13 @@ async fn pass(d: &Arc<Daemon>, complete: &mut HashSet<[u8; 32]>) -> anyhow::Resu
         {
             let shown = current_blobs(space);
             let mine = wanted(space, shown, on_demand, &|p, _| pinned(p));
+            // What no folder shows goes by itself: a reference there may
+            // be to nothing anyone holds, and that is no news for the
+            // person about their files.
+            let (unshown, mine): (Vec<_>, Vec<_>) = mine.into_iter().partition(is_unshown);
             sources.push((None, mine));
+            quiet = sources.len();
+            sources.push((None, unshown));
         }
     }
     for s in crate::onefolder::relationships(d) {
@@ -453,11 +466,7 @@ async fn pass(d: &Arc<Daemon>, complete: &mut HashSet<[u8; 32]>) -> anyhow::Resu
     }
     {
         let mut pr = lock(&d.progress);
-        pr.bytes_wanted = sources
-            .iter()
-            .flat_map(|(_, b)| b)
-            .map(|(_, b)| b.size)
-            .sum();
+        pr.bytes_wanted = bytes_of(sources.iter().flat_map(|(_, b)| b));
         let pending = || {
             sources
                 .iter()
@@ -466,12 +475,13 @@ async fn pass(d: &Arc<Daemon>, complete: &mut HashSet<[u8; 32]>) -> anyhow::Resu
         };
         pr.files_pending = pending().count() as u64;
         // Until a file is listed, all of it counts as missing.
-        pr.bytes_pending = pending().map(|(_, b)| b.size).sum();
+        pr.bytes_pending = bytes_of(pending());
     }
     let mut first_error = None;
-    for (from, wanted) in sources {
+    for (at, (from, wanted)) in sources.into_iter().enumerate() {
         let got = fetch_set(d, complete, wanted, from).await;
         match (got, from) {
+            (Err(e), None) if at == quiet => tracing::debug!("what is not shown: {e:#}"),
             (Err(e), None) => first_error = Some(e),
             // A contact's devices are often off; that is no failure here.
             (Err(e), Some(who)) => tracing::debug!("{}'s files: {e:#}", hex8(&who)),
@@ -485,6 +495,11 @@ async fn pass(d: &Arc<Daemon>, complete: &mut HashSet<[u8; 32]>) -> anyhow::Resu
             Ok(())
         }
     }
+}
+
+/// What some blobs come to, by the sizes their references claim.
+fn bytes_of<'a>(blobs: impl Iterator<Item = &'a (String, BlobRef)>) -> u64 {
+    blobs.fold(0u64, |all, (_, b)| all.saturating_add(b.size))
 }
 
 /// Whose devices may hold some files besides this person's, and the files.
@@ -755,6 +770,29 @@ mod tests {
 
     fn num(i: &[u8; 32]) -> u32 {
         u32::from_le_bytes(i[..4].try_into().unwrap())
+    }
+
+    /// P14. A reference says how large its blob is, and anyone who writes
+    /// in a space writes what they like there: sizes are added without
+    /// trusting that they add up.
+    #[test]
+    fn sizes_a_reference_claims_are_added_without_overflow() {
+        let claimed = |size: u64| {
+            let blob = BlobRef {
+                id: [1; 32],
+                key: [2; 32],
+                size,
+                levels: 1,
+            };
+            ("x".to_owned(), blob)
+        };
+        let all = [
+            claimed(u64::MAX / 2 + 7),
+            claimed(u64::MAX / 2 + 7),
+            claimed(5),
+        ];
+        assert_eq!(bytes_of(all.iter()), u64::MAX);
+        assert_eq!(bytes_of(all[2..].iter()), 5);
     }
 
     #[test]

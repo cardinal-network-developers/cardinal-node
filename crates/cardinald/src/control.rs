@@ -334,7 +334,7 @@ async fn handle(d: &Arc<Daemon>, req: &Value) -> anyhow::Result<Value> {
         "group-remove" => crate::groups::remove(d, arg(req, "group")?, arg(req, "who")?),
         "group-leave" => crate::groups::leave(d, arg(req, "group")?),
         "group-join" => {
-            let reach = req.get("reach").and_then(|v| v.as_bool());
+            let reach = answer_in(req, "reach")?;
             crate::groups::join(d, arg(req, "group")?, reach).await
         }
         "group-reach" => {
@@ -1394,4 +1394,43 @@ async fn remove_device(
     }
     let dropped = d.core().unwitnessed_by(&key);
     Ok(json!({"name": name, "dropped": dropped}))
+}
+
+/// A person's yes or no in a request, if it holds one.
+fn answer_in(req: &Value, key: &str) -> anyhow::Result<Option<bool>> {
+    match req.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::Bool(yes)) => Ok(Some(*yes)),
+        Some(other) => anyhow::bail!("`{key}` is true or false, not {other}"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// P14. An answer is true or false. Anything else where one belongs is
+    /// not "nothing was said": joining a group with `"reach": "no"` named
+    /// the person's hosts there.
+    #[test]
+    fn an_answer_that_is_not_yes_or_no_is_refused() {
+        let with = |v: Value| answer_in(&json!({"cmd": "group-join", "reach": v}), "reach");
+        assert_eq!(with(json!(true)).unwrap(), Some(true));
+        assert_eq!(with(json!(false)).unwrap(), Some(false));
+        assert_eq!(with(Value::Null).unwrap(), None);
+        assert_eq!(
+            answer_in(&json!({"cmd": "group-join"}), "reach").unwrap(),
+            None
+        );
+        for odd in [
+            json!("no"),
+            json!("false"),
+            json!(0),
+            json!([false]),
+            json!({}),
+        ] {
+            let why = with(odd.clone()).expect_err(&odd.to_string()).to_string();
+            assert!(why.contains("true or false"), "{why}");
+        }
+    }
 }

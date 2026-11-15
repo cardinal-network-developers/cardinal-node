@@ -757,6 +757,10 @@ impl Holder {
                 ops,
                 Some(now_ms()),
             )?;
+            // It has been started: what the same write holds besides goes
+            // under it. Whether another is due is worked out again when
+            // the write is done ([`Core::settle`]).
+            self.leave_out = false;
             (id, s)
         } else {
             space.write_entry(&identity.log, &keys.device.signing, ops, Some(now_ms()))?
@@ -1663,6 +1667,23 @@ impl Core {
             .into_iter()
             .filter(|o| o.from == *identity && !declined.contains(&o.space))
             .collect()
+    }
+
+    /// The groups whose content a contact may fetch from here: those the
+    /// two are both in. This person is in a group once they have accepted
+    /// it; one they were only offered serves nothing, since whoever made
+    /// it chose what it names.
+    pub fn groups_shared_with(&self, who: &[u8; 32]) -> Vec<SpaceId> {
+        let me = self.me();
+        let theirs = |s: &Space| {
+            s.profile() == cardinal_space::group::GROUP
+                && s.role_of(who).is_some()
+                && !s.has_left(who)
+                && me.is_some_and(|me| s.accepted_by(&me))
+        };
+        let held = self.spaces.iter();
+        let groups = held.filter(|(_, h)| h.space.as_ref().is_some_and(theirs));
+        groups.map(|(id, _)| *id).collect()
     }
 
     /// The spaces this person said no to.
@@ -3446,6 +3467,67 @@ mod tests {
         assert_eq!(bo.space(&g).added_by(&bo.id()), Some(ana.id()));
         assert_eq!(cy.space(&g).added_by(&cy.id()), Some(bo.id()));
         assert_eq!(cy.space(&g).added_by(&[9; 32]), None);
+    }
+
+    /// P14. A write too large for one entry is cut into several. Where a
+    /// new epoch is due, the first of them starts it, and the rest are
+    /// written under it: it used to be due again for each.
+    #[test]
+    fn a_write_cut_into_entries_starts_one_epoch() {
+        let [mut ana, mut bo, _, _] = four();
+        let bo_shown = [(bo.id(), "Bo".to_owned())];
+        let g = ana.core.create_group("Choir", "Ana", &bo_shown).unwrap();
+        bo.takes(&g, &ana.all_of(&g));
+        let joined = bo.says_reach(&g, false);
+        ana.takes(&g, &[joined]);
+        let (_, gone) = bo
+            .core
+            .write_entry(&g, relationship::leave_ops(&bo.id()))
+            .unwrap();
+        ana.takes(&g, &[gone]);
+        assert!(ana.space(&g).left_since_epoch());
+        let name = "n".repeat(1000);
+        let much = 3 * MAX_ENTRY_OPS_BYTES / 1000;
+        let ops: Vec<SpaceOp> = (0..much)
+            .map(|k| {
+                SpaceOp::create(
+                    NodeKind::Uint(77),
+                    ROOT,
+                    &format!("{k}{name}"),
+                    Record::new(),
+                )
+            })
+            .collect();
+        let written = ana.core.write(&g, ops).unwrap();
+        assert!(written.len() >= 3);
+        let sp = ana.space(&g);
+        let began = |id: &EntryId| sp.entry(id).is_some_and(|e| e.starts_epoch());
+        let epochs = written.iter().filter(|(id, _)| began(id)).count();
+        assert!(began(&written[0].0));
+        assert_eq!(epochs, 1, "an epoch for each of {} entries", written.len());
+        assert!(written.iter().all(|(id, _)| sp.state().is_accepted(id)));
+    }
+
+    /// P14. What a contact may fetch from here takes in the groups the two
+    /// are in. A group this person was only offered is not one: nothing in
+    /// it is theirs to serve, and whoever made it chose what it names.
+    #[test]
+    fn a_group_that_was_only_offered_serves_nothing() {
+        let [mut ana, mut bo, _, _] = four();
+        bo.knows(&ana, "Ana");
+        let bo_shown = [(bo.id(), "Bo".to_owned())];
+        let offered = ana.core.create_group("Choir", "Ana", &bo_shown).unwrap();
+        let joined = ana.core.create_group("Band", "Ana", &bo_shown).unwrap();
+        for g in [&offered, &joined] {
+            bo.takes(g, &ana.all_of(g));
+        }
+        bo.says_reach(&joined, false);
+        assert_eq!(bo.core.groups_shared_with(&ana.id()), [joined]);
+        // nor one he has left
+        bo.core
+            .write_entry(&joined, relationship::leave_ops(&bo.id()))
+            .unwrap();
+        assert!(bo.core.groups_shared_with(&ana.id()).is_empty());
     }
 
     /// P2. Among contacts a reach node is set unasked, to the person's

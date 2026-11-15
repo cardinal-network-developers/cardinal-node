@@ -238,11 +238,14 @@ const BLOCK_BITS: u32 = (BLOCK * 64) as u32;
 /// vector never ends in a block that is not there: so equal sets are equal
 /// vectors.
 #[derive(Clone, Debug, Default)]
-struct Bits(Vec<Option<Arc<[u64; BLOCK]>>>);
+struct Bits(Vec<Shared>);
+
+/// One block of a set of marks, if any of its marks is set.
+type Shared = Option<Arc<[u64; BLOCK]>>;
 
 impl PartialEq for Bits {
     fn eq(&self, other: &Bits) -> bool {
-        let same = |(a, b): (&Option<Arc<[u64; BLOCK]>>, &Option<Arc<[u64; BLOCK]>>)| match (a, b) {
+        let same = |(a, b): (&Shared, &Shared)| match (a, b) {
             (Some(a), Some(b)) => Arc::ptr_eq(a, b) || a == b,
             (None, None) => true,
             _ => false,
