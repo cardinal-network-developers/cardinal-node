@@ -187,6 +187,7 @@ pub fn reach_is_set(state: &State, who: &IdentityId) -> bool {
 /// (`profiles.md#reach`).
 pub fn reach_of(state: &State, who: &IdentityId) -> Vec<Reach> {
     let mut all: Vec<Reach> = Vec::new();
+    let mut seen: std::collections::HashMap<([u8; 32], [u8; 16]), Vec<usize>> = Default::default();
     for v in state.reach_values(who, 1) {
         let list = v
             .value
@@ -194,7 +195,12 @@ pub fn reach_of(state: &State, who: &IdentityId) -> Vec<Reach> {
             .and_then(Value::as_list)
             .unwrap_or_default();
         for r in list.iter().filter_map(|v| read_reach(v.as_record()?)) {
-            if !all.contains(&r) {
+            // Told from those taken already by looking it up: comparing
+            // with each of them is the square of a list its member, a
+            // reader as well, may make as long as an entry holds.
+            let alike = seen.entry((r.host, r.token)).or_default();
+            if !alike.iter().any(|i| all[*i] == r) {
+                alike.push(all.len());
                 all.push(r);
             }
         }

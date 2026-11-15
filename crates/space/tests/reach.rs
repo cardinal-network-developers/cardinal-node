@@ -272,3 +272,42 @@ fn the_same_from_scratch() {
     assert_eq!(relationship::reach_of(t.space.state(), &ana), [reach(1)]);
     assert_eq!(relationship::reach_of(t.space.state(), &bo), [reach(2)]);
 }
+
+/// V8. A reach node is a list its member writes, a reader as well. Taking
+/// each entry once by comparing it with every one taken so far is the
+/// square of its length, each time anyone asks where the member is
+/// reached: they are told apart by looking them up.
+#[test]
+fn a_long_reach_list_is_read_in_one_pass() {
+    let asked = std::env::var("V8_REACH")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok());
+    let many = asked.unwrap_or(1_600);
+    let mut t = two();
+    let who = t.ana.id();
+    let list: Vec<Reach> = (0..many as u32)
+        .map(|n| {
+            let mut r = reach(1);
+            r.token[..4].copy_from_slice(&n.to_le_bytes());
+            r
+        })
+        .collect();
+    // each of them twice, as two devices that set the same list
+    let mut twice = list.clone();
+    twice.extend(list.iter().cloned());
+    let set = relationship::set_reach(&who, &twice);
+    t.space
+        .write(&t.ana, &t.ana_dev.signing, vec![set], None)
+        .unwrap();
+    let began = std::time::Instant::now();
+    let read = relationship::reach_of(t.space.state(), &who);
+    let took = began.elapsed();
+    eprintln!(
+        "MEASURE a reach node of {} entries was read in {took:?}",
+        twice.len()
+    );
+    assert_eq!(read, list);
+    // a debug build took 45 ms for this by comparing, and takes 2
+    let bound = std::time::Duration::from_millis(30);
+    assert!(asked.is_some() || took < bound, "{took:?}");
+}
