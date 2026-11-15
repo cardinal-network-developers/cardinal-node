@@ -1598,3 +1598,72 @@ fn an_entry_signed_twice_has_two_sealed_forms_and_is_judged_once() {
         assert!(kept.contains(&first.sealed_id()) && kept.contains(&second.sealed_id()));
     }
 }
+
+/// V5. Each sealed form of an entry that is held already is kept, once. To
+/// tell whether a form is new it was compared with every other form kept,
+/// hashing each again: N forms cost N squared hashes, here and at every
+/// start. A form's id is now looked up.
+#[test]
+fn a_form_signed_again_is_told_from_those_kept_by_looking_it_up() {
+    let asked = std::env::var("V5_FORMS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok());
+    let forms = asked.unwrap_or(1_500);
+    let people = people();
+    let ana = &people[ANA];
+    let enc = member_key();
+    let (mut a, genesis) = Space::create(
+        group::GROUP,
+        Policy::default(),
+        &ana.log,
+        &ana.keys[A],
+        &[enc.public_key()],
+        None,
+    )
+    .unwrap();
+    let (id, first) = a
+        .write_entry(&ana.log, &ana.keys[A], vec![folder()], None)
+        .unwrap();
+    let epoch = a
+        .keyring()
+        .get(&a.current_epoch().unwrap())
+        .unwrap()
+        .clone();
+    let signed = a.entry(&id).unwrap().signed().clone();
+    let again: Vec<SealedEntry> = (0..forms as u32)
+        .map(|n| {
+            let mut obj = signed.clone();
+            let mut salt = [0u8; 32];
+            salt[..4].copy_from_slice(&n.to_le_bytes());
+            let signature = ana.keys[A].sign_salted(&obj.signing_message(), &salt);
+            obj.add_signature(ObjectSignature::new(ana.keys[A].public_key(), signature));
+            let e = SpaceEntry::from_signed(obj).unwrap();
+            SealedEntry::seal(&e, &epoch, None, false).unwrap()
+        })
+        .collect();
+    let mut b = Space::open_genesis(&genesis, &[enc], Some(ana.log.state())).unwrap();
+    b.receive(first, &[enc]).unwrap();
+    let mut took = Vec::new();
+    for part in again.chunks(100) {
+        let began = std::time::Instant::now();
+        for form in part {
+            assert_eq!(
+                b.receive(form.clone(), &[enc]).unwrap(),
+                Inserted::Duplicate
+            );
+        }
+        took.push(began.elapsed());
+    }
+    let (start, end) = (took[0], took[took.len() - 1]);
+    eprintln!("MEASURE of {forms} forms of one entry, the first hundred took {start:?} and the last {end:?}");
+    assert_eq!(b.sealed_entries().count(), forms + 2);
+    // each given again is held already
+    assert_eq!(
+        b.receive(again[7].clone(), &[enc]).unwrap(),
+        Inserted::Duplicate
+    );
+    assert_eq!(b.sealed_entries().count(), forms + 2);
+    // In a debug build a hundred take ten milliseconds, whichever hundred.
+    let bound = start * 3 + std::time::Duration::from_millis(10);
+    assert!(asked.is_some() || end < bound, "{start:?} then {end:?}");
+}

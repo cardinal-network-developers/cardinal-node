@@ -43,6 +43,8 @@ pub struct Space {
     /// Each is kept, as a host that cannot open them keeps them, so that
     /// sets reconcile; the entry is judged and applied once.
     resigned: Vec<(EntryId, SealedEntry)>,
+    /// The sealed ids of those forms, to tell a new one by looking it up.
+    resigned_ids: HashSet<[u8; 32]>,
     keyring: Keyring,
     judge: Judge,
     state: State,
@@ -145,6 +147,7 @@ impl Space {
             dag: Dag::new(),
             sealed: HashMap::new(),
             resigned: Vec::new(),
+            resigned_ids: HashSet::new(),
             keyring,
             judge: Judge::new(),
             state: State::new(profile),
@@ -488,9 +491,9 @@ impl Space {
             // which means the same. The sealed form is kept, and nothing
             // is judged again.
             let sid = sealed.sealed_id();
-            let new =
-                held.sealed_id() != sid && !self.resigned.iter().any(|(_, s)| s.sealed_id() == sid);
-            if new {
+            // Looked up, not compared with each form kept: that hashed
+            // every one of them again for every one that came.
+            if held.sealed_id() != sid && self.resigned_ids.insert(sid) {
                 self.resigned.push((id, sealed));
             }
             return Ok(Inserted::Duplicate);
