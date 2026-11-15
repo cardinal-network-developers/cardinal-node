@@ -602,3 +602,50 @@ fn a_rotation_carried_with_ops_does_not_move_them() {
     assert_eq!(p.names("Trip"), ["inner"]);
     p.agrees();
 }
+
+/// Deletes are decided one at a time, in log order, against positions that
+/// are replayed along the log as far as each delete's past is unbroken.
+/// That point can lie earlier for a later delete: here `second` comes after
+/// `first` in the log and does not have `beside` in its past, which
+/// `first` has. What `beside` put in the folder is then not beneath it for
+/// `second`, and is not deleted.
+#[test]
+fn a_delete_whose_past_stops_earlier_than_the_one_before_it() {
+    let mut tried = 0;
+    for n in 0..60 {
+        let mut p = one(100 + n);
+        let e = p.write(vec![folder(ROOT, "F"), folder(ROOT, "G")]);
+        let (f, g) = (derived_id(&e, 0), derived_id(&e, 1));
+        let beside = p.write(vec![folder(f, "made beside")]);
+        let made = derived_id(&beside, 0);
+        let first = p.write(vec![SpaceOp::delete(g)]);
+        let (second, _) = p
+            .space
+            .write_concurrent(
+                &p.log,
+                &p.device.signing,
+                &[beside],
+                vec![SpaceOp::delete(f)],
+                None,
+            )
+            .unwrap();
+        // The log takes the smallest id that is ready: the case is the one
+        // where `second` comes last.
+        let order = p.space.dag().log_order().to_vec();
+        if order[order.len() - 3..] != [beside, first, second] {
+            continue;
+        }
+        tried += 1;
+        assert!(p.space.state().is_accepted(&second));
+        assert_eq!(p.deleted(&g), (true, false));
+        // `beside` named the folder, so the delete yields; and what it
+        // made there was never beneath the folder for that delete
+        assert_eq!(p.deleted(&f), (false, true));
+        assert_eq!(p.deleted(&made), (false, false));
+        p.agrees();
+    }
+    assert!(
+        tried > 0,
+        "no try put the entries in the order the case needs"
+    );
+}
