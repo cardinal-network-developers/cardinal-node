@@ -625,6 +625,128 @@ fn an_answer_about_hosts_is_kept_and_a_later_arrival_is_told_of() {
     assert_eq!(again["reach"], json!([]), "{again}");
 }
 
+/// `hosts.md`, "An act that cannot be finished is finished later, by the
+/// same device". Bo's phone joins a group among contacts while his host is
+/// off. Naming the host takes a token registered with it, so the list is
+/// set empty and the phone keeps his yes to itself, through a restart, and
+/// names the host once it is back.
+#[test]
+fn a_yes_given_while_the_host_is_away_is_finished_when_it_is_back() {
+    // pairing waits for the new device's files to be mounted
+    if !fuse_available() {
+        eprintln!("skipping: /dev/fuse or fusermount3 is not available");
+        return;
+    }
+    let root = tempfile::tempdir().unwrap();
+    let ana = person(root.path(), "ana");
+    let mut bo = person(root.path(), "bo");
+    let at = format!("127.0.0.1:{}", bo.port);
+    bo.cli(&["host", "--address", &at]);
+    meet(&ana, &bo, "Bo");
+    let mut phone = Dev::new(root.path(), "phone", free_port());
+    phone.start();
+    pair(&bo, &phone);
+    let made = ask(
+        &ana,
+        json!({"cmd": "group-create", "name": "Choir", "people": ["Bo"]}),
+    );
+    let g = made["group"].as_str().unwrap().to_owned();
+    wait(
+        "the offer reaches the phone, with what it would share",
+        60,
+        || {
+            let all = reply(&phone, &json!({"cmd": "groups"}));
+            let offers = all["offers"].as_array().cloned().unwrap_or_default();
+            let offer = offers.iter().find(|o| o["name"] == "Choir");
+            offer.is_some_and(|o| {
+                o["reach"]["what"] == json!([at]) && o["reach"]["who"] == json!([])
+            })
+        },
+    );
+    bo.stop();
+    std::thread::sleep(std::time::Duration::from_secs(2));
+
+    // Among contacts nothing is asked, and joining shares. The host is
+    // away: nothing is named yet, and the yes waits here.
+    let joined = ask(&phone, json!({"cmd": "group-join", "group": g}));
+    assert_eq!(
+        (&joined["shared"], &joined["waiting"]),
+        (&json!(false), &json!(true)),
+        "{joined}"
+    );
+    let r = reach_in(&phone, &g);
+    assert_eq!(
+        (&r["shared"], &r["waiting"]),
+        (&json!(false), &json!(true)),
+        "{r}"
+    );
+    // Said again, it waits as before: no error, and nothing new.
+    let again = ask(
+        &phone,
+        json!({"cmd": "group-reach", "group": g, "share": true}),
+    );
+    assert_eq!(
+        (&again["shared"], &again["waiting"]),
+        (&json!(false), &json!(true)),
+        "{again}"
+    );
+    // The phone is restarted, and still knows.
+    phone.stop();
+    phone.start();
+    wait("the phone is back", 30, || {
+        reply(&phone, &json!({"cmd": "groups"}))["ok"] == true
+    });
+    let r = reach_in(&phone, &g);
+    assert_eq!(
+        (&r["shared"], &r["waiting"]),
+        (&json!(false), &json!(true)),
+        "{r}"
+    );
+    // The host comes back: the phone registers a token and names it.
+    bo.start_with(&["--no-mount"]);
+    wait("the phone names the host", 90, || {
+        let r = reach_in(&phone, &g);
+        r["shared"] == true && r["waiting"] == false
+    });
+}
+
+/// `hosts.md`, "What software does on its own": a host that serves the
+/// person no longer is taken out of the lists that name it.
+#[test]
+fn a_host_that_stops_serving_is_taken_out_of_the_list() {
+    let root = tempfile::tempdir().unwrap();
+    let ana = person(root.path(), "ana");
+    let bo = person(root.path(), "bo");
+    let at = format!("127.0.0.1:{}", bo.port);
+    bo.cli(&["host", "--address", &at]);
+    meet(&ana, &bo, "Bo");
+    let made = ask(
+        &ana,
+        json!({"cmd": "group-create", "name": "Choir", "people": ["Bo"]}),
+    );
+    let g = made["group"].as_str().unwrap().to_owned();
+    wait("the offer arrives", 30, || {
+        offers(&bo).iter().any(|o| o["name"] == "Choir")
+    });
+    let joined = ask(&bo, json!({"cmd": "group-join", "group": g}));
+    assert_eq!(
+        (&joined["shared"], &joined["waiting"]),
+        (&json!(true), &json!(false)),
+        "{joined}"
+    );
+    bo.cli(&["host", "--off"]);
+    wait("the list names it no longer", 30, || {
+        reach_in(&bo, &g)["shared"] == false
+    });
+    // With no host there is nothing to share, and nothing waits.
+    let no = reply(
+        &bo,
+        &json!({"cmd": "group-reach", "group": g, "share": true}),
+    );
+    assert_eq!(no["ok"], false, "{no}");
+    assert_eq!(reach_in(&bo, &g)["waiting"], false);
+}
+
 fn standing(d: &Dev) -> Value {
     ask(d, json!({"cmd": "call"}))["call"]["state"].clone()
 }

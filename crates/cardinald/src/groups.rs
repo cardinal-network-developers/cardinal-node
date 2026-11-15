@@ -281,6 +281,7 @@ fn telling_json(core: &Core, id: &SpaceId, me: &[u8; 32]) -> Json {
         "what": t.what,
         "added": names(t.added()),
         "public": t.public,
+        "waiting": t.waiting,
     })
 }
 
@@ -350,9 +351,17 @@ pub async fn join(d: &Arc<Daemon>, group: &str, reach: Option<bool>) -> anyhow::
         "{}",
         question(&telling, &g.name)
     );
-    let shared = crate::mailbox::say_reach(d, &g.id, t.joins_sharing(reach)).await?;
+    let share = t.joins_sharing(reach);
+    let shared = crate::mailbox::say_reach(d, &g.id, share).await?;
+    // A yes with a host that could not be reached for a token is kept on
+    // this device, against the empty list just set, and finished later.
+    let waiting = share && !shared && t.hosted;
+    if waiting {
+        d.core().keep_yes(&g.id);
+    }
     d.bump();
-    Ok(json!({"group": hex::encode(g.id), "name": g.name, "shared": shared}))
+    let (group, name) = (hex::encode(g.id), g.name);
+    Ok(json!({"group": group, "name": name, "shared": shared, "waiting": waiting}))
 }
 
 /// Says whether the members of a group have where this person's hosts are,
@@ -363,35 +372,33 @@ pub async fn join(d: &Arc<Daemon>, group: &str, reach: Option<bool>) -> anyhow::
 /// the group. Either way the person has now been told of everyone added
 /// there, and this device notes it: `added` is empty here afterwards.
 /// With no host a yes has nothing to share, and fails saying so: nothing
-/// is kept for when there is one.
+/// is kept for when there is one. With a host that cannot be reached now
+/// the yes is kept on this device, and `waiting` says so.
 pub async fn set_reach(d: &Arc<Daemon>, group: &str, share: bool) -> anyhow::Result<Json> {
     use crate::mailbox::Shared;
     let g = joined(d, group)?;
     if !share {
-        let t = d.core().telling(&g.id);
-        // An empty list that is the only one there says it already. One
-        // never set does not: there software would still set it on its
-        // own, among contacts.
-        if t.shared || t.split || !t.set {
-            crate::mailbox::say_reach(d, &g.id, false).await?;
-        }
+        // Written even where the list is empty already: a yes that
+        // another of their devices keeps for later gives way to a list
+        // set after it, and to nothing else.
+        crate::mailbox::say_reach(d, &g.id, false).await?;
+        d.core().drop_yes(&g.id);
         d.core().told_of_all(&g.id);
         d.bump();
-        return Ok(json!({"shared": false}));
+        return Ok(json!({"shared": false, "waiting": false}));
     }
-    match crate::mailbox::share_reach(d, &g.id).await? {
-        Shared::Named => d.core().told_of_all(&g.id),
+    let waiting = match crate::mailbox::share_reach(d, &g.id).await? {
+        Shared::Named => false,
+        Shared::Waiting => true,
         Shared::NoHost => anyhow::bail!(
-            "you have no always-on device, so there is nothing to share with {}. Nothing was              changed, and nothing is kept for later: say so again once you have one",
+            "you have no always-on device, so there is nothing to share with {}. Nothing was \
+             changed, and nothing is kept for later: say so again once you have one",
             g.name
         ),
-        Shared::OutOfReach => anyhow::bail!(
-            "your always-on device cannot be reached from this device now, so it cannot be              shared with {} yet. Nothing was changed: try again when it can be reached",
-            g.name
-        ),
-    }
+    };
+    d.core().told_of_all(&g.id);
     d.bump();
-    Ok(json!({"shared": true}))
+    Ok(json!({"shared": !waiting, "waiting": waiting}))
 }
 
 /// Says no to a group offered to this person. Nothing is written in it, and

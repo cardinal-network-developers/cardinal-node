@@ -1295,9 +1295,8 @@ asks for around that is not built yet.
   - **The person's act** names a host where the list is empty:
     `group-join` with `reach` true, and `group-reach` with `share` true.
     With no host `group-reach` fails and writes nothing. `share` true where
-    hosts are named keeps them, in their order, adds after them any host
-    the list does not name, and sets the list again if someone was added
-    since.
+    hosts are named keeps them, in their order, and adds after them any
+    host the list does not name.
   - **Unasked, software names a host** only when the person joins among
     contacts (`group-join` with no `reach`, or a list never set in a space
     they are in, as for whoever made it), and in a relationship, where a
@@ -1313,19 +1312,27 @@ asks for around that is not built yet.
     and started again can still be taken out by a device that has heard
     only of the stop; in a group it then stays out until the person shares
     again.
-  - **Reading: what an empty list is.** A value that is no list, or was
-    cleared, reads as an empty one, and wins like one. A list whose
-    entries cannot be read is not empty.
   - **Reading: `ask` once joined.** A list that is set, empty or not, is
     the person's answer, so `ask` is true only for an offer, or where they
     are in the space and never set it. A person who takes up a host later
     is not asked by `groups`: the client asks once, when the host is set
     up (`clients.md`), and `group-reach` is the answer.
-  - **Gap: a host that cannot be reached when the person acts.** A token
-    has to be registered at the host. `group-reach` with `share` true then
-    fails and writes nothing. `group-join` among contacts joins with an
-    empty list, says `shared` false, and nothing names the host later:
-    before D68 software filled it in once the host was in reach.
+  - **A yes that cannot be finished** (`core.rs` `KeptYes`,
+    `kept-yes.json` beside the space's entries): kept where `group-join`
+    shares, `group-reach` says yes, or whoever made a group is given
+    their first list, and no host can be reached for a token. It holds
+    the entries whose lists the reach node held then, and stands while
+    the node holds exactly those. `write_reach` names the hosts once a
+    token is registered. `groups` gives `reach.waiting` too, so that a
+    window can still say so after a restart; `apps.md` gives it only in
+    the replies.
+  - **Reading: so that a no can be later than a kept yes,** `group-reach`
+    with `share` false writes an empty list even where the list is empty
+    already. Without that entry a yes kept on another device would be
+    finished after the person said no.
+  - **Reading: whoever is added while a yes waits** is not told of when it
+    is finished: the entry that names the host has them in its past.
+  - **A yes kept for a host that then stops serving** is given up.
 - **Whoever is added later** (D69, `hosts.md`, "A yes is to the space, and
   to whoever it comes to hold"). Where this person's reach node names their
   hosts, `groups` names in `reach.added` each member who is not their
@@ -1339,13 +1346,6 @@ asks for around that is not built yet.
     (`core.rs` `Arrivals`), per device, never synced. A device set up
     later, or one whose note is lost, tells of everyone who came while the
     hosts were named.
-  - **Reading: "came while their hosts were named".** No entry that began
-    the naming as it stands has the addition in its causal past
-    (`relationship::naming_began`): a `set` to a list with a host where
-    the list before was empty or unset. So whoever was there when the
-    person shared is not told of on any device, someone added at the same
-    moment as the sharing is, and setting the list again for a token or an
-    address changes nothing.
   - **Reading: who is a contact** is judged when the device first sees the
     addition with the hosts named. Someone who was a contact then and is
     refused later is not told of as added.
@@ -1356,18 +1356,13 @@ asks for around that is not built yet.
     them. Only the device refused on asks. The relationship with the person
     refused is not among them, and its reach node is not kept current
     while they are refused.
-  - **Spec gap: `contact` has no `reach` in `apps.md`.** The text says
-    software asks as part of refusing and gives the client no field to ask
-    with; this one is the node's.
   - **Spec gap: only groups have a way to be told or to answer.** Any
     other space shared with someone who is not a contact is not something
     this build makes.
 - **An endpoint this version cannot use** (D68, `hosts.md#grants`,
   `grant.rs` `Endpoint`, contact `EndpointAddr`) is held as the record it
-  came in and written again as it is. Anything that is a record counts: a
-  carrier that is neither 1, 2 nor 8 bytes, or a port out of range, is
-  skipped like an unknown carrier, never malformed. An entry of an
-  endpoint list that is no record is dropped.
+  came in and written again as it is. An entry of an endpoint list that is
+  no record is dropped, which the text does not speak of.
   - **A host name is kept and shown, and never dialled** from a grant or a
     reach list: only `cardinal restore` resolves one.
 - **A reach node is kept current by the host it names.** A token that has

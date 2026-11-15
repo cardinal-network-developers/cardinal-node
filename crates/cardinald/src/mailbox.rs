@@ -715,8 +715,9 @@ pub enum Shared {
     /// written or kept for later.
     NoHost,
     /// They have one, and it cannot be reached from this device now to
-    /// give out a token: nothing was written.
-    OutOfReach,
+    /// give out a token: their yes is kept on this device, and finished
+    /// when the host can be reached ([`write_reach`]).
+    Waiting,
 }
 
 /// The person says, on this device, that a space's members may have where
@@ -726,7 +727,9 @@ pub enum Shared {
 /// a yes was to the space, whoever has been added to it since.
 ///
 /// With no host there is nothing to share and nothing is written: an
-/// answer is not kept for a host they may take up later
+/// answer is not kept for a host they may take up later. With a host that
+/// cannot be reached now, to register a token, the yes is kept on this
+/// device and finished later, unless the list is set meanwhile
 /// (`hosts.md#telling-others-where-to-reach-you`).
 pub async fn share_reach(d: &Arc<Daemon>, space: &SpaceId) -> anyhow::Result<Shared> {
     let _one = d.mailbox.reaching.lock().await;
@@ -738,7 +741,12 @@ pub async fn share_reach(d: &Arc<Daemon>, space: &SpaceId) -> anyhow::Result<Sha
     let mut reach = d.core().reach_of(space, &me);
     let more = reach_here(d, &reach).await;
     if reach.is_empty() && more.is_empty() {
-        return Ok(Shared::OutOfReach);
+        if !t.set {
+            // their first entry there: the yes is kept against it
+            d.write_and_push(space, vec![relationship::set_reach(&me, &[])])?;
+        }
+        d.core().keep_yes(space);
+        return Ok(Shared::Waiting);
     }
     // where it held two lists, this sets the one result
     if !more.is_empty() || t.split {
@@ -763,6 +771,9 @@ pub async fn share_reach(d: &Arc<Daemon>, space: &SpaceId) -> anyhow::Result<Sha
 /// - Among contacts, a list never set is set, which is how whoever made a
 ///   space joins it; and in a relationship a host the list does not name
 ///   is added, after those it names.
+/// - A yes the person gave on this device while no host could be reached
+///   is finished: the hosts are named once a token is registered. Only
+///   this device does that, and not once the list has been set since.
 ///
 /// A token that has gone and an address that changed are the host's own
 /// to set ([`renew_reach`]). In any other case only the person's act sets
@@ -779,35 +790,46 @@ pub async fn write_reach(d: &Arc<Daemon>, space: &SpaceId) -> anyhow::Result<()>
     let Ok(me) = me(d) else {
         return Ok(());
     };
-    let named = d.core().reach_of(space, &me);
-    if t.settles() {
-        d.write_and_push(space, vec![relationship::set_reach(&me, &named)])?;
-        if named.is_empty() {
+    let due = d.core().reach_due(space);
+    if let Some(list) = due {
+        d.write_and_push(space, vec![relationship::set_reach(&me, &list)])?;
+        if list.is_empty() {
             revoke_left(d, space);
         }
         return Ok(());
     }
-    if t.keeps_current() {
-        let former = d.core().former_hosts();
-        let serving = |r: &&Reach| !former.contains(&r.host);
-        let kept: Vec<Reach> = named.iter().filter(serving).cloned().collect();
-        if kept.len() != named.len() {
-            d.write_and_push(space, vec![relationship::set_reach(&me, &kept)])?;
+    if t.waiting {
+        if !t.hosted {
+            // the host they meant serves them no longer
+            d.core().drop_yes(space);
             return Ok(());
         }
+        let reach = reach_here(d, &[]).await;
+        if !reach.is_empty() {
+            // setting the list is what ends the wait
+            d.write_and_push(space, vec![relationship::set_reach(&me, &reach)])?;
+        }
+        return Ok(());
     }
     if !t.sets_unasked() {
         return Ok(());
     }
+    let named = d.core().reach_of(space, &me);
     let more = reach_here(d, &named).await;
     // A host that cannot be reached now gives no token. The empty list
     // that leaves is said once, and not again each time this looks.
     if !t.worth_saying(more.len()) {
         return Ok(());
     }
+    // Whoever made a space joins it here, among contacts: with a host out
+    // of reach, that yes is kept like any other.
+    let wait = !t.set && !t.relationship && t.hosted && more.is_empty();
     let mut reach = named;
     reach.extend(more);
     d.write_and_push(space, vec![relationship::set_reach(&me, &reach)])?;
+    if wait {
+        d.core().keep_yes(space);
+    }
     Ok(())
 }
 
@@ -1443,6 +1465,46 @@ mod tests {
         ));
         assert_eq!(reach[0].token, [5; 16]);
         assert_eq!(reach[0].endpoints, now);
+    }
+
+    /// D68 (`profiles.md#reach`). The order of the list is its person's.
+    /// A host that brings its own part up to date stays where it is, and
+    /// what stands before and after it is written as it was read, an
+    /// endpoint this version cannot use included.
+    #[test]
+    fn a_reach_node_kept_current_keeps_its_order() {
+        use cardinal_encoding::Record;
+        let radio = Record::new()
+            .with(1, [0x52u8; 8])
+            .with(2, "by its document");
+        let other = |n: u8| Reach {
+            endpoints: vec![Endpoint::from_record(&radio)],
+            host: [n; 32],
+            token: [n; 16],
+        };
+        let old = Endpoint::parse("172.20.1.20:7171").unwrap();
+        let now = [Endpoint::parse("203.0.113.9:7171").unwrap()];
+        let here = Reach {
+            endpoints: vec![old],
+            host: [1; 32],
+            token: T,
+        };
+        let mut reach = vec![other(7), here, other(8)];
+        assert!(kept_current(
+            &mut reach,
+            &[1; 32],
+            Some(&now),
+            |_| false,
+            || [5; 16]
+        ));
+        let hosts: Vec<u8> = reach.iter().map(|r| r.host[0]).collect();
+        assert_eq!(hosts, [7, 1, 8]);
+        assert_eq!(
+            (reach[1].token, &reach[1].endpoints[..]),
+            ([5; 16], &now[..])
+        );
+        assert_eq!((&reach[0], &reach[2]), (&other(7), &other(8)));
+        assert_eq!(reach[0].endpoints[0].to_record(), radio);
     }
 
     #[test]

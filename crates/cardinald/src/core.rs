@@ -260,6 +260,20 @@ struct Arrivals {
     due: BTreeMap<String, String>,
 }
 
+/// A yes this device keeps to itself (`hosts.md`, "An act that cannot be
+/// finished is finished later, by the same device"): its person joined
+/// among contacts, or said their hosts may be named, while no host could
+/// be reached to register a token. It is kept beside the space, not in it
+/// or in the account, and no other device sees it. It holds the entries
+/// that had set the list when it was kept: once the list is set by
+/// anything else, on any device, to anything, that is later than the yes,
+/// and the yes is given up.
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+struct KeptYes {
+    /// The entries whose lists the reach node held, in hex, sorted.
+    list_set_by: Vec<String>,
+}
+
 /// What this person's reach node in a space tells, and whom
 /// (`hosts.md#telling-others-where-to-reach-you`). A reach node says where
 /// a person's hosts are to every member, and for a host at home that is a
@@ -288,6 +302,10 @@ pub struct Telling {
     /// Whether it holds two lists, set by two of their devices at the same
     /// moment.
     pub split: bool,
+    /// Whether this device keeps a yes of theirs that it could not finish:
+    /// it names their hosts once one can be reached, unless the list is
+    /// set meanwhile.
+    pub waiting: bool,
     /// Whether they have a host to name.
     pub hosted: bool,
     /// How many of their hosts the list does not name.
@@ -396,6 +414,16 @@ impl Telling {
     }
 }
 
+/// The entries whose lists a person's reach node holds, in hex, sorted:
+/// what a [`KeptYes`] is kept against.
+fn list_set_by(space: &Space, who: &[u8; 32]) -> Vec<String> {
+    let values = space.state().reach_values(who, 1).iter();
+    let mut by: Vec<String> = values.map(|v| hex::encode(v.entry)).collect();
+    by.sort();
+    by.dedup();
+    by
+}
+
 /// One space as this device holds it.
 pub struct Holder {
     /// The space id (also its sync label).
@@ -427,6 +455,9 @@ pub struct Holder {
     /// Whom this device has told its person of, among those added.
     arrivals: Arrivals,
     arrivals_at: PathBuf,
+    /// A yes of the person's that this device has yet to finish.
+    kept_yes: Option<KeptYes>,
+    kept_yes_at: PathBuf,
 }
 
 /// What ingesting objects did.
@@ -474,7 +505,12 @@ impl Holder {
             reached_at: Self::dir(paths, &id).join("epochs.json"),
             arrivals: Arrivals::default(),
             arrivals_at: Self::dir(paths, &id).join("arrivals.json"),
+            kept_yes: None,
+            kept_yes_at: Self::dir(paths, &id).join("kept-yes.json"),
         };
+        h.kept_yes = std::fs::read(&h.kept_yes_at)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice(&bytes).ok());
         // No note, or one that cannot be read, is nobody told of yet.
         if let Ok(bytes) = std::fs::read(&h.arrivals_at) {
             h.arrivals = serde_json::from_slice(&bytes).unwrap_or_default();
@@ -1264,12 +1300,15 @@ impl Core {
         let hosts = self.mailboxes();
         let endpoints = hosts.iter().flat_map(|(g, _)| g.endpoints.iter());
         let named = self.reach_of(space, &me);
+        let kept = self.spaces.get(space).and_then(|h| h.kept_yes.as_ref());
+        let stands = kept.is_some_and(|k| k.list_set_by == list_set_by(sp, &me));
         let is_named = |key: &[u8; 32]| named.iter().any(|r| r.host == *key);
         let unnamed = hosts.iter().filter(|(g, _)| !is_named(g.link_key.x25519()));
         Telling {
             shared: !named.is_empty(),
             set: !since.is_empty(),
             split: since.len() > 1,
+            waiting: stands && named.is_empty() && sp.accepted_by(&me),
             hosted: !hosts.is_empty(),
             unnamed: unnamed.count(),
             joined: sp.accepted_by(&me),
@@ -1280,6 +1319,90 @@ impl Core {
             who,
             what: endpoints.map(|e| e.to_string()).collect(),
         }
+    }
+
+    /// Keeps the person's yes on this device, to finish when a host can
+    /// be reached: against the list as it is set now, so call it after
+    /// whatever this device wrote for the act itself.
+    pub fn keep_yes(&mut self, space: &SpaceId) {
+        let Some(me) = self.identity.as_ref().map(|i| i.id()) else {
+            return;
+        };
+        let Some(sp) = self.spaces.get(space).and_then(|h| h.space.as_ref()) else {
+            return;
+        };
+        let list_set_by = list_set_by(sp, &me);
+        self.set_kept_yes(space, Some(KeptYes { list_set_by }));
+    }
+
+    /// Gives up a yes this device kept, if it kept one.
+    pub fn drop_yes(&mut self, space: &SpaceId) {
+        self.set_kept_yes(space, None);
+    }
+
+    fn set_kept_yes(&mut self, space: &SpaceId, kept: Option<KeptYes>) {
+        let Some(h) = self.spaces.get_mut(space).filter(|h| h.kept_yes != kept) else {
+            return;
+        };
+        h.kept_yes = kept;
+        h.version += 1;
+        let saved = match &h.kept_yes {
+            Some(k) => serde_json::to_vec(k)
+                .map_err(std::io::Error::other)
+                .and_then(|bytes| crate::paths::write_private(&h.kept_yes_at, &bytes, 0o600)),
+            None => match std::fs::remove_file(&h.kept_yes_at) {
+                Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e),
+                _ => Ok(()),
+            },
+        };
+        if let Err(e) = saved {
+            tracing::warn!("space {}: keeping a yes for later: {e}", short(space));
+        }
+    }
+
+    /// Gives up a kept yes that the list has been set since, by any
+    /// device, or whose person has left the space.
+    fn judge_kept_yes(&mut self, space: &SpaceId) {
+        let Some(me) = self.identity.as_ref().map(|i| i.id()) else {
+            return;
+        };
+        let Some(h) = self.spaces.get(space) else {
+            return;
+        };
+        let (Some(kept), Some(sp)) = (h.kept_yes.as_ref(), h.space.as_ref()) else {
+            return;
+        };
+        if kept.list_set_by != list_set_by(sp, &me) || sp.has_left(&me) {
+            self.drop_yes(space);
+        }
+    }
+
+    /// What software sets this person's reach node in a space to now, on
+    /// its own and with no host's help ([`Telling`]): an empty list where
+    /// they have left and it names a host; the one result where it holds
+    /// two lists; and what it names without the hosts that serve them no
+    /// longer, the others in their places. `None` if none of these is
+    /// due.
+    pub fn reach_due(&self, space: &SpaceId) -> Option<Vec<cardinal_space::relationship::Reach>> {
+        let me = self.identity.as_ref()?.id();
+        let t = self.telling(space);
+        if t.empties_unasked() {
+            return Some(Vec::new());
+        }
+        let named = self.reach_of(space, &me);
+        if t.settles() {
+            return Some(named);
+        }
+        if !t.keeps_current() {
+            return None;
+        }
+        let former = self.former_hosts();
+        let kept: Vec<_> = named
+            .iter()
+            .filter(|r| !former.contains(&r.host))
+            .cloned()
+            .collect();
+        (kept.len() != named.len()).then_some(kept)
     }
 
     /// Notes the additions to a space this device has not looked at yet
@@ -1542,6 +1665,7 @@ impl Core {
     fn settle(&mut self, space: &SpaceId) {
         self.reload_unsaved(space);
         self.note_arrivals(space);
+        self.judge_kept_yes(space);
         let Some(ident) = self.identity.as_ref() else {
             return;
         };
@@ -3233,12 +3357,12 @@ mod tests {
             host: [n; 32],
             token: [n; 16],
         };
-        let before = bo.space(&g).heads();
         // A yes on one device, and a no on another at the same moment.
-        bo.says_reach(&g, true);
+        let yes = relationship::set_reach(&me, &[one(1)]);
+        let (yes, _) = bo.core.write_entry(&g, vec![yes]).unwrap();
         let no = relationship::set_reach(&me, &[]);
         bo.core
-            .write_entry_concurrent(&g, &before, vec![no])
+            .write_entry_concurrent(&g, &[yes], vec![no])
             .unwrap();
         let t = bo.core.telling(&g);
         assert!(t.split && t.set && !t.shared);
@@ -3250,12 +3374,11 @@ mod tests {
         assert!(!t.split && !t.shared && !t.settles() && !t.sets_unasked());
 
         // Two lists that both name hosts: both count, and are set as one.
-        let before = bo.space(&g).heads();
         let first = relationship::set_reach(&me, &[one(1)]);
-        bo.core.write_entry(&g, vec![first]).unwrap();
+        let (first, _) = bo.core.write_entry(&g, vec![first]).unwrap();
         let second = relationship::set_reach(&me, &[one(2)]);
         bo.core
-            .write_entry_concurrent(&g, &before, vec![second])
+            .write_entry_concurrent(&g, &[first], vec![second])
             .unwrap();
         let t = bo.core.telling(&g);
         assert!(t.split && t.shared && t.settles());
@@ -3269,6 +3392,139 @@ mod tests {
         let t = bo.core.telling(&g);
         assert_eq!(t.added(), [cy.id()]);
         assert!(t.split && t.settles() && t.keeps_current());
+    }
+
+    /// `hosts.md`, "An act that cannot be finished is finished later, by
+    /// the same device". A yes given while the host cannot be reached is
+    /// kept by the device it was given on, beside the space, through a
+    /// restart. Once the list is set by anything else, an empty list on
+    /// another device included, that is later than the yes: the device
+    /// gives it up, and does not name the host.
+    #[test]
+    fn a_kept_yes_gives_way_to_a_list_set_after_it() {
+        let [mut ana, mut bo, _, _] = four();
+        bo.knows(&ana, "Ana");
+        bo.hosts_at("203.0.113.5:7171");
+        let bo_shown = [(bo.id(), "Bo".to_owned())];
+        let g = ana.core.create_group("Choir", "Ana", &bo_shown).unwrap();
+        let other = ana.core.create_group("Band", "Ana", &bo_shown).unwrap();
+        for id in [&g, &other] {
+            bo.takes(id, &ana.all_of(id));
+        }
+        let kept_at = |p: &Person, id: &SpaceId| p.core.spaces[id].kept_yes_at.exists();
+        for id in [&g, &other] {
+            // He joins among contacts with the host out of reach: an
+            // empty list, and the yes kept here.
+            assert!(!bo.core.telling(id).waiting);
+            bo.says_reach(id, false);
+            bo.core.keep_yes(id);
+            let t = bo.core.telling(id);
+            assert!(t.waiting && !t.shared && t.joined && kept_at(&bo, id));
+            // nothing software does on its own is due meanwhile
+            assert!(bo.core.reach_due(id).is_none() && !t.sets_unasked());
+        }
+        // It is on the device, not in the space or the account: a restart
+        // keeps it, and nobody else has it.
+        bo.restarts();
+        assert!(bo.core.telling(&g).waiting && bo.core.telling(&other).waiting);
+        ana.takes(&g, &bo.all_of(&g));
+        assert!(!ana.core.telling(&g).waiting);
+
+        // Another of his devices says no meanwhile: an empty list, set
+        // after the yes was kept. The yes is given up, and stays so.
+        bo.says_reach(&g, false);
+        let t = bo.core.telling(&g);
+        assert!(!t.waiting && !t.shared && !t.sets_unasked());
+        assert!(!kept_at(&bo, &g), "the note is still there");
+        bo.restarts();
+        assert!(!bo.core.telling(&g).waiting);
+        // In the other group the host comes back and is named: setting
+        // the list ends the wait.
+        assert!(bo.core.telling(&other).waiting);
+        bo.says_reach(&other, true);
+        let t = bo.core.telling(&other);
+        assert!(t.shared && !t.waiting && !kept_at(&bo, &other));
+        // A yes kept and then given up by the person: no more waiting.
+        bo.says_reach(&g, false);
+        bo.core.keep_yes(&g);
+        assert!(bo.core.telling(&g).waiting);
+        bo.core.drop_yes(&g);
+        assert!(!bo.core.telling(&g).waiting && !kept_at(&bo, &g));
+        // And leaving gives it up.
+        bo.says_reach(&g, false);
+        bo.core.keep_yes(&g);
+        let ops = relationship::leave_ops(&bo.id());
+        bo.core.write_entry(&g, ops).unwrap();
+        assert!(!bo.core.telling(&g).waiting && !kept_at(&bo, &g));
+    }
+
+    /// What software sets on its own, with no host's help
+    /// (`Core::reach_due`). Two lists set at the same moment are set as
+    /// one: both count, the later first, each in its order. A host that
+    /// serves no longer is taken out, and the others keep their places,
+    /// one this device has never heard of included.
+    #[test]
+    fn what_is_set_unasked_keeps_the_order_of_the_list() {
+        let [mut ana, mut bo, _, _] = four();
+        bo.knows(&ana, "Ana");
+        bo.hosts_at("203.0.113.5:7171");
+        let own = *bo.core.keys.link.public_key().x25519();
+        let bo_shown = [(bo.id(), "Bo".to_owned())];
+        let g = ana.core.create_group("Choir", "Ana", &bo_shown).unwrap();
+        bo.takes(&g, &ana.all_of(&g));
+        let me = bo.id();
+        let one = |host: [u8; 32], n: u8| relationship::Reach {
+            endpoints: Vec::new(),
+            host,
+            token: [n; 16],
+        };
+        let hosts = |p: &Person| -> Vec<u8> {
+            let list = p.core.reach_of(&g, &me);
+            list.iter().map(|r| r.token[0]).collect()
+        };
+        // One list: nothing is due.
+        let first = relationship::set_reach(&me, &[one([7; 32], 1), one(own, 2)]);
+        let (a, _) = bo.core.write_entry(&g, vec![first]).unwrap();
+        assert!(bo.core.reach_due(&g).is_none());
+        // A second, set at the same moment on another device.
+        let second = relationship::set_reach(&me, &[one([8; 32], 3), one(own, 2)]);
+        let (b, _) = bo
+            .core
+            .write_entry_concurrent(&g, &[a], vec![second])
+            .unwrap();
+        let dag = bo.space(&g).dag();
+        let merged = match dag.position(&a) > dag.position(&b) {
+            true => vec![1, 2, 3],
+            false => vec![3, 2, 1],
+        };
+        assert_eq!(hosts(&bo), merged);
+        // The one result is due, and written, it is the one list there.
+        let due = bo.core.reach_due(&g).expect("nothing settles the two");
+        assert_eq!(due, bo.core.reach_of(&g, &me));
+        let set = relationship::set_reach(&me, &due);
+        bo.core.write_entry(&g, vec![set]).unwrap();
+        assert_eq!(bo.space(&g).state().reach_values(&me, 1).len(), 1);
+        assert_eq!(hosts(&bo), merged);
+        assert!(bo.core.reach_due(&g).is_none());
+
+        // His host stops serving: it is taken out, and the two he has
+        // never heard of stay where they were.
+        bo.hosts_no_longer();
+        let due = bo.core.reach_due(&g).expect("the host is left in");
+        let kept: Vec<u8> = merged.iter().copied().filter(|n| *n != 2).collect();
+        assert_eq!(due.iter().map(|r| r.token[0]).collect::<Vec<_>>(), kept);
+        let set = relationship::set_reach(&me, &due);
+        bo.core.write_entry(&g, vec![set]).unwrap();
+        assert_eq!(hosts(&bo), kept);
+        assert!(bo.core.reach_due(&g).is_none());
+        // Two lists of which one is empty: the empty one is due.
+        let no = relationship::set_reach(&me, &[]);
+        let (no, _) = bo.core.write_entry(&g, vec![no]).unwrap();
+        let again = relationship::set_reach(&me, &[one([7; 32], 1)]);
+        bo.core
+            .write_entry_concurrent(&g, &[no], vec![again])
+            .unwrap();
+        assert_eq!(bo.core.reach_due(&g), Some(Vec::new()));
     }
 
     /// D68 (`hosts.md#telling-others-where-to-reach-you`). The

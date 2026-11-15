@@ -2042,6 +2042,15 @@ async fn client(cmd: Cmd) -> anyhow::Result<()> {
                         );
                     }
                 }
+                GroupCmd::Join { group, .. } | GroupCmd::Reach { group, .. }
+                    if v["waiting"] == true =>
+                {
+                    println!(
+                        "Your host cannot be reached right now. It will be shared with {} when \
+                         it can.",
+                        printable(&group)
+                    );
+                }
                 _ => {}
             }
             Ok(())
