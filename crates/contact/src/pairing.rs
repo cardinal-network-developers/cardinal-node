@@ -206,13 +206,13 @@ impl Paired {
 
     /// For the typer: where and how to open the link session.
     pub fn link_target(&self) -> Result<Target, ContactError> {
-        let addr = self
-            .peer
-            .endpoint
-            .socket_addr()
-            .ok_or(ContactError::Malformed("link endpoint is a host name"))?;
+        // Not malformed: an endpoint this version cannot use, for its
+        // carrier or its address, or a host name.
+        let endpoint = &self.peer.endpoint;
+        let at = endpoint.socket_addr().zip(endpoint.carrier());
+        let (addr, carrier) = at.ok_or(ContactError::Unusable("link endpoint"))?;
         Ok(
-            Target::new(addr, self.peer.endpoint.carrier, &self.peer.link_key)
+            Target::new(addr, carrier, &self.peer.link_key)
                 .with_secret(&self.link_secret[..])
                 .expect(self.expected()),
         )
@@ -273,7 +273,7 @@ fn open_info(k: &[u8; 32], r: &Record) -> Result<PeerInfo, ContactError> {
         signing_key: p.bytes_n::<32>(2).map_err(bad)?,
         link_key: HybridPublicKey::from_record(p.record(3).map_err(bad)?)
             .map_err(|_| ContactError::Malformed("pairing link key"))?,
-        endpoint: EndpointAddr::from_record(p.record(4).map_err(bad)?)?,
+        endpoint: EndpointAddr::from_record(p.record(4).map_err(bad)?),
         name: p.opt_text(5).map_err(bad)?.unwrap_or_default().to_string(),
         proof: p.opt_bytes_n::<64>(6).map_err(bad)?,
     })

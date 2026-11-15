@@ -42,6 +42,9 @@ pub enum ContactError {
     BadProof,
     /// A malformed message or record.
     Malformed(&'static str),
+    /// Something well formed that this version cannot use, such as an
+    /// endpoint on a carrier it does not know.
+    Unusable(&'static str),
     /// An I/O error.
     Io(std::io::Error),
 }
@@ -58,6 +61,7 @@ impl std::fmt::Display for ContactError {
             ContactError::NoIdentity => f.write_str("no identity to pair into"),
             ContactError::BadProof => f.write_str("invalid proof of possession"),
             ContactError::Malformed(w) => write!(f, "malformed {w}"),
+            ContactError::Unusable(w) => write!(f, "this version cannot use the {w}"),
             ContactError::Io(e) => write!(f, "i/o: {e}"),
         }
     }

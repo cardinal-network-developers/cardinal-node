@@ -151,10 +151,9 @@ fn reach_list(reach: &[Reach]) -> Value {
 fn read_reach(r: &Record) -> Option<Reach> {
     let endpoints = r.record_list(1).ok()?;
     Some(Reach {
-        endpoints: endpoints
-            .into_iter()
-            .filter_map(Endpoint::from_record)
-            .collect(),
+        // each as it came: one this version cannot use is skipped by
+        // whoever looks for an address, and written again as it is
+        endpoints: endpoints.into_iter().map(Endpoint::from_record).collect(),
         host: r.get(2)?.as_bytes()?.try_into().ok()?,
         token: r.get(3)?.as_bytes()?.try_into().ok()?,
     })

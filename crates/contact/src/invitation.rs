@@ -72,7 +72,7 @@ impl Invitation {
         Ok(Invitation {
             inviter: r.bytes_n(1).map_err(bad)?,
             responder_static: r.bytes_n(2).map_err(bad)?,
-            endpoint: EndpointAddr::from_record(r.record(3).map_err(bad)?)?,
+            endpoint: EndpointAddr::from_record(r.record(3).map_err(bad)?),
             secret: r.bytes_n(4).map_err(bad)?,
             token: r.opt_bytes_n(5).map_err(bad)?,
             uses: r.opt_uint(6).map_err(bad)?.unwrap_or(1),
@@ -231,6 +231,31 @@ mod tests {
             ContactMessage::Done,
         ] {
             assert_eq!(ContactMessage::from_record(&m.to_record()).unwrap(), m);
+        }
+    }
+
+    /// D68 (`hosts.md#grants`). An invitation whose endpoint this version
+    /// cannot use is not malformed: it reads, says so by giving no address,
+    /// and is passed on as it came.
+    #[test]
+    fn an_endpoint_that_cannot_be_used_does_not_make_an_invitation_malformed() {
+        let radio = Record::new()
+            .with(1, [0x52u8; 8])
+            .with(2, "anything its document says");
+        let other_network = Record::new()
+            .with(1, 1u64)
+            .with(2, vec![7u8; 6])
+            .with(3, 7171u64);
+        for endpoint in [radio, other_network] {
+            let r = Record::new()
+                .with(0, KIND_INVITATION)
+                .with(1, [1u8; 32])
+                .with(2, [2u8; 32])
+                .with(3, endpoint)
+                .with(4, [4u8; 16]);
+            let inv = Invitation::from_record(&r).expect("it is taken for malformed");
+            assert_eq!(inv.endpoint.socket_addr(), None);
+            assert_eq!(inv.to_record(), r);
         }
     }
 }

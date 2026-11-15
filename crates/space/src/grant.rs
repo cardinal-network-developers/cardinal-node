@@ -19,15 +19,23 @@ pub const RELAY: u64 = 5;
 /// The storage service.
 pub const STORAGE: u64 = 6;
 
+const UDP: u64 = 1;
 const TCP: u64 = 2;
 
-/// Where a host listens.
+/// Where a host listens (`hosts.md#grants`): `{1: carrier, 2: address, 3:
+/// port}`, held as it came. The carrier is 1 for UDP, 2 for TCP, or the
+/// 8-byte name of one defined elsewhere, and only its document says what
+/// the other fields hold then. Under UDP and TCP the address is a host
+/// name as text, or bytes: 4 an IPv4 address, 16 an IPv6 address, and any
+/// other length an address of a network this version does not know.
+///
+/// An endpoint this version cannot use gives no address
+/// ([`socket_addr`](Self::socket_addr)), and is skipped by whoever looks
+/// for one. It is never a reason to take what holds it for malformed, and
+/// it is written again as it was read, field for field.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Endpoint {
-    /// An address, or a host name for one that changes.
-    pub host: String,
-    /// The TCP port.
-    pub port: u16,
+    record: Record,
 }
 
 impl Endpoint {
@@ -39,55 +47,81 @@ impl Endpoint {
         if host.is_empty() {
             return None;
         }
-        Some(Endpoint {
-            host: host.to_owned(),
-            port: port.parse().ok()?,
-        })
-    }
-
-    /// The record.
-    pub fn to_record(&self) -> Record {
-        let address = match self.host.parse::<IpAddr>() {
+        let port: u16 = port.parse().ok()?;
+        let address = match host.parse::<IpAddr>() {
             Ok(IpAddr::V4(a)) => Value::from(a.octets().to_vec()),
             Ok(IpAddr::V6(a)) => Value::from(a.octets().to_vec()),
-            Err(_) => Value::from(self.host.as_str()),
+            Err(_) => Value::from(host),
         };
-        Record::new()
+        let record = Record::new()
             .with(1, TCP)
             .with(2, address)
-            .with(3, self.port as u64)
+            .with(3, port as u64);
+        Some(Endpoint { record })
     }
 
-    /// Reads the record.
-    pub fn from_record(r: &Record) -> Option<Endpoint> {
-        let v = r.get(2)?;
-        let host = match (v.as_text(), v.as_bytes()) {
-            (Some(t), _) => t.to_owned(),
+    /// The record, as it came.
+    pub fn to_record(&self) -> Record {
+        self.record.clone()
+    }
+
+    /// Takes the record as it is. Whether it can be used is asked
+    /// afterwards: one that cannot is kept all the same.
+    pub fn from_record(r: &Record) -> Endpoint {
+        Endpoint { record: r.clone() }
+    }
+
+    /// Whether the carrier is one this version knows: UDP or TCP.
+    fn known_carrier(&self) -> bool {
+        matches!(
+            self.record.get(1).and_then(Value::as_uint),
+            Some(UDP | TCP)
+        )
+    }
+
+    /// The address or host name, if this version can use the endpoint.
+    pub fn host(&self) -> Option<String> {
+        if !self.known_carrier() {
+            return None;
+        }
+        let v = self.record.get(2)?;
+        match (v.as_text(), v.as_bytes()) {
+            (Some(t), _) => Some(t.to_owned()),
             (_, Some(b)) => match b.len() {
-                4 => IpAddr::from(<[u8; 4]>::try_from(b).ok()?).to_string(),
-                16 => IpAddr::from(<[u8; 16]>::try_from(b).ok()?).to_string(),
-                _ => return None,
+                4 => Some(IpAddr::from(<[u8; 4]>::try_from(b).ok()?).to_string()),
+                16 => Some(IpAddr::from(<[u8; 16]>::try_from(b).ok()?).to_string()),
+                _ => None,
             },
-            _ => return None,
-        };
-        Some(Endpoint {
-            host,
-            port: r.get(3)?.as_uint()?.try_into().ok()?,
-        })
+            _ => None,
+        }
     }
 
-    /// The address, if it is not a host name.
+    /// The port, if this version can use the endpoint.
+    pub fn port(&self) -> Option<u16> {
+        if !self.known_carrier() {
+            return None;
+        }
+        self.record.get(3)?.as_uint()?.try_into().ok()
+    }
+
+    /// Whether this version can use it: a carrier and an address it knows.
+    pub fn usable(&self) -> bool {
+        self.host().is_some() && self.port().is_some()
+    }
+
+    /// The address, if this version can use the endpoint and it is not a
+    /// host name.
     pub fn socket_addr(&self) -> Option<SocketAddr> {
-        Some(SocketAddr::new(self.host.parse().ok()?, self.port))
+        Some(SocketAddr::new(self.host()?.parse().ok()?, self.port()?))
     }
 }
 
 impl fmt::Display for Endpoint {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        if self.host.contains(':') {
-            write!(f, "[{}]:{}", self.host, self.port)
-        } else {
-            write!(f, "{}:{}", self.host, self.port)
+        match (self.host(), self.port()) {
+            (Some(host), Some(port)) if host.contains(':') => write!(f, "[{host}]:{port}"),
+            (Some(host), Some(port)) => write!(f, "{host}:{port}"),
+            _ => write!(f, "(an address this version cannot use)"),
         }
     }
 }
@@ -159,7 +193,7 @@ impl Grant {
                 .get(7)?
                 .as_list()?
                 .iter()
-                .filter_map(|e| Endpoint::from_record(e.as_record()?))
+                .filter_map(|e| Some(Endpoint::from_record(e.as_record()?)))
                 .collect(),
             link_key: HybridPublicKey::from_record(r.get(8)?.as_record()?).ok()?,
         };
@@ -211,9 +245,57 @@ mod tests {
     #[test]
     fn addresses_read_from_what_a_person_types() {
         let e = Endpoint::parse("nuc.lan:7171").unwrap();
-        assert_eq!((e.host.as_str(), e.port), ("nuc.lan", 7171));
+        assert_eq!((e.host().as_deref(), e.port()), (Some("nuc.lan"), Some(7171)));
+        assert!(e.usable());
         assert_eq!(Endpoint::parse("nuc.lan"), None);
         assert_eq!(Endpoint::parse(":7171"), None);
         assert_eq!(Endpoint::parse("nuc.lan:99999"), None);
+    }
+
+    /// D68 (`hosts.md#grants`). An endpoint this version cannot use, for
+    /// its carrier or for its address, does not make a grant malformed: it
+    /// is skipped where a host is looked for, and kept as it came.
+    #[test]
+    fn an_endpoint_that_cannot_be_used_is_skipped_and_kept() {
+        let key = SigningKey::from_seed(&[2; 32]);
+        let radio = Record::new()
+            .with(1, [0x52u8; 8])
+            .with(2, "anything its document says")
+            .with(7, 9u64);
+        let other_network = Record::new()
+            .with(1, 2u64)
+            .with(2, vec![7u8; 6])
+            .with(3, 7171u64);
+        let udp = Record::new()
+            .with(1, 1u64)
+            .with(2, vec![192u8, 0, 2, 1])
+            .with(3, 7171u64);
+        let given = [radio, other_network, udp];
+        let g = grant();
+        let inner = Record::new()
+            .with(0, HOST_GRANT)
+            .with(1, g.host)
+            .with(2, g.served)
+            .with(3, Value::list(g.services.iter().copied()))
+            .with(4, Value::list(Vec::<Record>::new()))
+            .with(5, 0u64)
+            .with(6, 0u64)
+            .with(7, Value::list(given.iter().cloned()))
+            .with(8, g.link_key.to_record());
+        let mut o = SignedObject::new(inner);
+        key.sign_object(&mut o);
+        let (read, _) = Grant::open(&o.encode()).expect("it is taken for malformed");
+        // each is there, in order, as it came
+        let kept: Vec<Record> = read.endpoints.iter().map(Endpoint::to_record).collect();
+        assert_eq!(kept, given);
+        // and only the one that can be used gives an address
+        let usable: Vec<SocketAddr> = read
+            .endpoints
+            .iter()
+            .filter_map(Endpoint::socket_addr)
+            .collect();
+        assert_eq!(usable, ["192.0.2.1:7171".parse().unwrap()]);
+        // signed again, the grant says what it said
+        assert_eq!(read.sign(&key), o.encode());
     }
 }

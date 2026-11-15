@@ -311,3 +311,51 @@ fn a_long_reach_list_is_read_in_one_pass() {
     let bound = std::time::Duration::from_millis(30);
     assert!(asked.is_some() || took < bound, "{took:?}");
 }
+
+/// D68 (`hosts.md#grants`). A reach list may name an endpoint this version
+/// cannot use: a carrier it does not know, or an address of a length it
+/// does not know. The host beside it is read all the same, and the list
+/// written again, as when another endpoint in it is brought up to date,
+/// holds that endpoint as it came.
+#[test]
+fn an_endpoint_that_cannot_be_used_is_kept_as_it_came() {
+    let mut t = two();
+    let who = t.ana.id();
+    let radio = Record::new()
+        .with(1, [0x52u8; 8])
+        .with(2, "anything its document says");
+    let other_network = Record::new()
+        .with(1, 1u64)
+        .with(2, vec![7u8; 6])
+        .with(3, 7171u64);
+    let tcp = Record::new()
+        .with(1, 2u64)
+        .with(2, vec![192u8, 0, 2, 1])
+        .with(3, 7171u64);
+    let host = |endpoints: Vec<Record>, n: u8| {
+        Value::Record(
+            Record::new()
+                .with(1, Value::list(endpoints))
+                .with(2, [n; 32])
+                .with(3, [n; 16]),
+        )
+    };
+    let list = Value::list([
+        host(vec![radio.clone(), tcp.clone()], 1),
+        host(vec![other_network.clone()], 2),
+    ]);
+    let set = SpaceOp::set(reach_node_id(&who), 1, Some(list.clone()));
+    t.space
+        .write(&t.ana, &t.ana_dev.signing, vec![set], None)
+        .unwrap();
+    let read = relationship::reach_of(t.space.state(), &who);
+    assert_eq!(read.len(), 2, "a host is dropped for an endpoint");
+    let addresses: Vec<std::net::SocketAddr> = read
+        .iter()
+        .flat_map(|r| r.endpoints.iter().filter_map(|e| e.socket_addr()))
+        .collect();
+    assert_eq!(addresses, ["192.0.2.1:7171".parse().unwrap()]);
+    // written again from what was read, it is the same value
+    let again = relationship::set_reach(&who, &read);
+    assert_eq!(again, SpaceOp::set(reach_node_id(&who), 1, Some(list)));
+}

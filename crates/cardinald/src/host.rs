@@ -115,6 +115,11 @@ pub fn enable(d: &Arc<Daemon>, addresses: &[String]) -> anyhow::Result<Json> {
             })
         })
         .collect::<anyhow::Result<Vec<_>>>()?;
+    enable_at(d, endpoints)
+}
+
+/// [`enable`], at endpoints already read.
+fn enable_at(d: &Arc<Daemon>, endpoints: Vec<Endpoint>) -> anyhow::Result<Json> {
     let listening = d.endpoint.tcp_addr().map_or(0, |a| a.port());
     let mut warnings: Vec<String> = endpoints
         .iter()
@@ -156,7 +161,7 @@ pub fn enable(d: &Arc<Daemon>, addresses: &[String]) -> anyhow::Result<Json> {
 fn address_warning(e: &Endpoint, listening: u16) -> Option<String> {
     let at = e.socket_addr()?;
     let here = std::net::UdpSocket::bind((at.ip(), 0)).is_ok();
-    if here && e.port != listening {
+    if here && e.port() != Some(listening) {
         return Some(format!(
             "this device listens on port {listening}, so {e} will not reach it."
         ));
@@ -239,8 +244,8 @@ pub fn refresh(d: &Arc<Daemon>) -> anyhow::Result<()> {
     let Some(old) = old.filter(|g| !g.services.contains(&MAILBOX)) else {
         return Ok(());
     };
-    let addresses: Vec<String> = old.endpoints.iter().map(Endpoint::to_string).collect();
-    enable(d, &addresses).map(|_| ())
+    // each endpoint as the grant had it, one this version cannot use too
+    enable_at(d, old.endpoints).map(|_| ())
 }
 
 /// Stops being a host: this device keeps what it has, and no longer offers
@@ -440,7 +445,9 @@ pub async fn restore(d: &Arc<Daemon>, words: &str, at: &str, key: &str) -> anyho
         anyhow::anyhow!("{at} is not an address; it looks like 192.168.1.20:7171")
     })?;
     // A name can have several addresses, and not all of them need work.
-    let addrs = tokio::net::lookup_host((endpoint.host.as_str(), endpoint.port))
+    // what a person typed parses to an address this version can use
+    let (name, port) = (endpoint.host().unwrap_or_default(), endpoint.port());
+    let addrs = tokio::net::lookup_host((name.as_str(), port.unwrap_or(0)))
         .await
         .map(|a| a.collect::<Vec<SocketAddr>>())
         .unwrap_or_default();
