@@ -686,6 +686,14 @@ impl Holder {
         if !self.rotation_due(identity) {
             return Ok(None);
         }
+        // Whatever is due, nothing is written in a space this person has
+        // not accepted, or has declined: an entry there would be their
+        // acceptance (`spaces.md#holding-a-space`). The epoch is started
+        // by the entry that accepts, if they ever do.
+        let me = identity.id();
+        if !self.space.as_ref().is_some_and(|s| s.accepted_by(&me)) {
+            return Ok(None);
+        }
         Ok(Some(self.write_one(identity, keys, Vec::new())?.1))
     }
 
@@ -3141,6 +3149,56 @@ mod tests {
         let t = bo.core.telling(&g);
         assert_eq!((t.late.len(), &t.late), (2, &t.who));
         assert!(bo.core.answer_ops(&g, "Garden club", None).is_none());
+    }
+
+    /// P4 (`spaces.md#holding-a-space`). Being added is an offer. Whatever
+    /// becomes due, a device writes nothing in a space its person has not
+    /// accepted, or has declined: an entry there would be their
+    /// acceptance. Here a new epoch is due everywhere, as it is when one
+    /// of the person's devices is removed.
+    #[test]
+    fn nothing_is_written_in_a_space_that_was_only_offered() {
+        let [mut ana, mut bo, _, _] = four();
+        bo.knows(&ana, "Ana");
+        let bo_shown = [(bo.id(), "Bo".to_owned())];
+        let offered = ana.core.create_group("Choir", "Ana", &bo_shown).unwrap();
+        let declined = ana.core.create_group("Club", "Ana", &bo_shown).unwrap();
+        let joined = ana.core.create_group("Band", "Ana", &bo_shown).unwrap();
+        for g in [&offered, &declined, &joined] {
+            bo.takes(g, &ana.all_of(g));
+        }
+        let account = bo.core.account_id().unwrap();
+        let no = cardinal_space::account::create_declined(&declined, "Club");
+        bo.core.write_entry(&account, vec![no]).unwrap();
+        bo.says_reach(&joined, false);
+        let me = bo.id();
+        let entries = |p: &Person, g: &SpaceId| p.space(g).dag().len();
+        let before = [&offered, &declined, &joined].map(|g| entries(&bo, g));
+
+        let moved = bo.changes_key();
+        let took = bo.core.ingest_identity(std::slice::from_ref(&moved), None);
+        assert!(took.unwrap().changed);
+        let spaces: Vec<SpaceId> = bo.core.spaces.keys().copied().collect();
+        for space in &spaces {
+            bo.core.rotate_if_due(space).unwrap();
+        }
+        let after = [&offered, &declined, &joined].map(|g| entries(&bo, g));
+        // A new epoch where he is, and nothing where he was only asked.
+        assert_eq!(after, [before[0], before[1], before[2] + 1]);
+        assert!(bo.began_an_epoch(&joined));
+        assert!(!bo.space(&offered).accepted_by(&me));
+        assert!(!bo.space(&declined).accepted_by(&me));
+        let listed = crate::groups::list_of(&bo.core);
+        let names = |k: &str| -> Vec<String> {
+            let all = listed[k].as_array().cloned().unwrap_or_default();
+            all.iter()
+                .map(|g| g["name"].as_str().unwrap().to_owned())
+                .collect()
+        };
+        assert_eq!(names("groups"), ["Band"], "{listed}");
+        assert_eq!(names("offers"), ["Choir"], "{listed}");
+        // His own spaces moved on with the rest.
+        assert!(bo.began_an_epoch(&account));
     }
 
     /// P2. Among contacts a reach node is set unasked, to the person's
