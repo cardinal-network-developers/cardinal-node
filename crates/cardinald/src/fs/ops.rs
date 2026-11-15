@@ -596,7 +596,7 @@ impl Filesystem for CardinalFs {
         if i.kind != Kind::Dir {
             return reply.error(ENOTDIR);
         }
-        if !i.children.is_empty() {
+        if !t.dir_is_empty(ino) {
             return reply.error(ENOTEMPTY);
         }
         if i.locked {
@@ -719,9 +719,7 @@ impl Filesystem for CardinalFs {
             }
             match (skind, t.inodes[&dst].kind) {
                 (_, Kind::Conflict(_)) => return reply.error(EPERM),
-                (Kind::Dir, Kind::Dir) if !t.inodes[&dst].children.is_empty() => {
-                    return reply.error(ENOTEMPTY)
-                }
+                (Kind::Dir, Kind::Dir) if !t.dir_is_empty(dst) => return reply.error(ENOTEMPTY),
                 (Kind::Dir, Kind::Dir) => {}
                 (Kind::Dir, _) => return reply.error(ENOTDIR),
                 (_, Kind::Dir) => return reply.error(EISDIR),

@@ -1677,6 +1677,41 @@ mod tests {
         assert_eq!(me.versions(&me.node(hers)), [b"hers".to_vec()]);
     }
 
+    /// D6 (`profiles.md#mapping-to-a-disk-guidance`). A folder is empty
+    /// only if the state holds nothing in it that is not deleted. One that
+    /// holds only what the view does not show is not: a `delete` takes
+    /// everything beneath a node with it, and removing a folder that looks
+    /// empty would delete what another application keeps there.
+    #[test]
+    fn a_folder_that_holds_what_is_not_shown_is_not_empty() {
+        use cardinal_encoding::Record;
+        use cardinal_space::NodeKind;
+        let mut fx = Fx::new();
+        let made = fx.remote(files::create_folder(ROOT, "F"));
+        let f = files::created_node(&made, 0);
+        let other = SpaceOp::create(NodeKind::Uint(99), f, "theirs", Record::new().with(1, 7u32));
+        let made = fx.remote(other);
+        let theirs = files::created_node(&made, 0);
+        fx.remote(files::create_folder(ROOT, "G"));
+        fx.refresh();
+        let (dir, plain) = (
+            fx.t.child(ROOT_INO, "F").unwrap(),
+            fx.t.child(ROOT_INO, "G").unwrap(),
+        );
+        // The view shows nothing in either.
+        assert!(fx.t.inodes[&dir].children.is_empty());
+        assert!(fx.t.inodes[&plain].children.is_empty());
+        assert!(
+            !fx.t.dir_is_empty(dir),
+            "it would be removed, and the node with it"
+        );
+        assert!(fx.t.dir_is_empty(plain));
+        // Once what it holds is deleted, it is empty.
+        fx.remote(SpaceOp::delete(theirs));
+        fx.refresh();
+        assert!(fx.t.dir_is_empty(dir));
+    }
+
     /// Content is keyed by the epoch, so a commit asks for the rotation by
     /// itself before it encodes anything.
     #[test]

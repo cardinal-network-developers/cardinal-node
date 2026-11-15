@@ -270,6 +270,9 @@ pub struct Inode {
     /// refused where it is made, and it is never put in an entry
     /// (`profiles.md#mapping-to-a-disk-guidance`).
     pub locked: bool,
+    /// A folder that holds, in the state, something not deleted that the
+    /// view does not show: it is not empty, whatever it lists.
+    pub holds_unshown: bool,
 }
 
 impl Inode {
@@ -307,6 +310,7 @@ impl Inode {
             nlookup: 0,
             local: false,
             locked: false,
+            holds_unshown: false,
         }
     }
 
@@ -394,6 +398,9 @@ pub struct SnapEntry {
     /// author-owned by another identity
     /// (`profiles.md#shared-rules-normative`).
     pub locked: bool,
+    /// For a folder: the state holds something in it that is not deleted
+    /// and that the view does not show.
+    pub holds_unshown: bool,
 }
 
 /// The state of a files space, flattened for [`Tree::apply`].
@@ -432,10 +439,22 @@ impl Snapshot {
                 .filter(|n| !n.is_empty())
                 .unwrap_or_else(|| cardinal_space::account::short_key(k))
         });
-        let mut entries = Vec::new();
+        let mut entries: Vec<SnapEntry> = Vec::new();
+        // where each folder's own entry is, for when it is listed
+        let mut folder_at: HashMap<NodeId, usize> = HashMap::new();
         let mut stack = vec![ROOT];
         while let Some(dir) = stack.pop() {
-            for e in files.list(&dir) {
+            let listed = files.list(&dir);
+            // What a folder holds in the state that its listing leaves
+            // out: a node of a kind this software does not know, or one in
+            // a place where its kind means nothing.
+            if let Some(at) = folder_at.get(&dir) {
+                let shown: HashSet<NodeId> = listed.iter().map(|e| e.node).collect();
+                let all = space.state().children(&dir).into_iter();
+                let mut held = all.filter(|n| !n.deleted);
+                entries[*at].holds_unshown = held.any(|n| !shown.contains(&n.id));
+            }
+            for e in listed {
                 let mut se = SnapEntry {
                     parent: dir,
                     name: e.name.clone(),
@@ -449,9 +468,13 @@ impl Snapshot {
                     mtime: None,
                     target: None,
                     locked: theirs(&e.node),
+                    holds_unshown: false,
                 };
                 match e.kind {
-                    FileKind::Folder => stack.push(e.node),
+                    FileKind::Folder => {
+                        stack.push(e.node);
+                        folder_at.insert(e.node, entries.len());
+                    }
                     FileKind::File => {
                         let versions = files.content(&e.node);
                         let v = match e.conflict_version {
@@ -877,6 +900,16 @@ impl Tree {
         self.last_change = Some(now);
     }
 
+    /// Whether a folder may be removed as an empty one: it lists nothing,
+    /// and the state holds nothing in it that is not deleted. A `delete`
+    /// takes everything beneath a node with it, so a folder that holds
+    /// only what the view does not show is not empty
+    /// (`profiles.md#mapping-to-a-disk-guidance`).
+    pub fn dir_is_empty(&self, ino: u64) -> bool {
+        let empty = |i: &Inode| i.children.is_empty() && !i.holds_unshown;
+        self.inodes.get(&ino).is_some_and(empty)
+    }
+
     /// Whether a change of this inode's is held back: it was written in
     /// an entry that was not accepted, and has not changed since.
     pub fn is_refused(&self, i: &Inode) -> bool {
@@ -1130,6 +1163,7 @@ impl Tree {
                 inode.locked = e.locked;
                 inval.push(Inval::Inode(ino));
             }
+            inode.holds_unshown = e.holds_unshown;
             if !inode.dirty.pos {
                 placed.push((ino, pino, e.name.clone()));
             }
