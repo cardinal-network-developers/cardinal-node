@@ -441,7 +441,7 @@ pub fn list_of(core: &Core) -> Json {
         let name = group::name(sp);
         if !group::joined(sp, &me) {
             if in_it && !declined.contains(id) {
-                let from = sp.creator();
+                let from = sp.added_by(&me).unwrap_or(sp.creator());
                 offered.push(json!({
                     "group": hex::encode(id),
                     "name": name,

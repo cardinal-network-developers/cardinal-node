@@ -394,6 +394,20 @@ impl Space {
         })
     }
 
+    /// Who added `who`: the author of the valid `add_member` of theirs that
+    /// comes last in the log, or of the genesis if that is what names
+    /// them. An offer of the space comes from this identity, not from
+    /// whoever made the space (`spaces.md#holding-a-space`).
+    pub fn added_by(&self, who: &IdentityId) -> Option<IdentityId> {
+        let adds = self.judge.valid_adds().into_iter();
+        let mine = adds.filter(|(added, _)| added == who).map(|(_, add)| add);
+        let last = mine.max_by_key(|add| self.dag.position(add));
+        match last.and_then(|add| self.dag.get(&add)) {
+            Some(entry) => Some(entry.author()),
+            None => self.role_of(who).map(|_| self.creator),
+        }
+    }
+
     /// The members a valid entry added that started the current epoch or
     /// descends from the entry that did: their `add_member` gave them its
     /// key (`spaces.md#when-to-rotate`). Anyone else in the space was a

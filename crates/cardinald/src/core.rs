@@ -3418,6 +3418,36 @@ mod tests {
         assert!(yes.sets_unasked() && !yes.ask());
     }
 
+    /// P13 (`spaces.md#holding-a-space`). An offer is shown as coming from
+    /// whoever added the person, not from whoever made the space: "Bo
+    /// added you", under the name this person has for Bo.
+    #[test]
+    fn an_offer_comes_from_whoever_added_the_person() {
+        let [ana, mut bo, mut cy, _] = four();
+        cy.knows(&bo, "Bo");
+        let roles = [(ana.id(), OWNER), (bo.id(), cardinal_space::entry::ADMIN)];
+        let genesis = ana.genesis(cardinal_space::group::GROUP, &roles, &bo);
+        let g = bo.space_of(&genesis);
+        bo.core.ingest_space(g, &[genesis]).unwrap();
+        bo.says_reach(&g, false);
+        let cy_shown = [(cy.id(), "Cy".to_owned())];
+        bo.core.add_to_group(&g, &cy_shown).unwrap();
+        cy.takes(&g, &bo.all_of(&g));
+        assert_eq!(cy.space(&g).creator(), ana.id());
+        let listed = crate::groups::list_of(&cy.core);
+        assert_eq!(listed["offers"][0]["from"], "Bo", "{listed}");
+        // Whom the genesis names, its author added.
+        let listed = crate::groups::list_of(&bo.core);
+        assert_eq!(
+            listed["groups"].as_array().map(Vec::len),
+            Some(1),
+            "{listed}"
+        );
+        assert_eq!(bo.space(&g).added_by(&bo.id()), Some(ana.id()));
+        assert_eq!(cy.space(&g).added_by(&cy.id()), Some(bo.id()));
+        assert_eq!(cy.space(&g).added_by(&[9; 32]), None);
+    }
+
     /// P2. Among contacts a reach node is set unasked, to the person's
     /// hosts. A device that cannot reach the host has only an empty list
     /// to set: once, and then nothing until it can.
