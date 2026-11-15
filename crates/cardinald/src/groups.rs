@@ -263,6 +263,7 @@ fn telling_json(core: &Core, id: &SpaceId, me: &[u8; 32]) -> Json {
         "who": names(&t.who),
         "what": t.what,
         "added": names(t.added()),
+        "public": t.public,
     })
 }
 
@@ -273,13 +274,23 @@ fn question(reach: &Json, name: &str) -> String {
         all.filter_map(|x| x.as_str().map(str::to_owned)).collect()
     };
     let who = list(&reach["who"]);
+    let what = list(&reach["what"]).join(", ");
+    // A public space is read by anyone at all, whoever is in it now, and
+    // the question says so.
+    if reach["public"] == true {
+        return format!(
+            "{name} is public: anyone at all can read it, and would learn where your host is \
+             ({what}). Say whether to share it there: with it the members can leave you \
+             messages while you are away, and without it they reach you only through someone \
+             in touch with both"
+        );
+    }
     format!(
-        "{} in {name} {} not a contact of yours, and would learn where your host is ({}). \
+        "{} in {name} {} not a contact of yours, and would learn where your host is ({what}). \
          Say whether to share it there: with it they can leave you messages while you \
          are away, and without it they reach you only through someone in touch with both",
         who.join(", "),
         if who.len() == 1 { "is" } else { "are" },
-        list(&reach["what"]).join(", "),
     )
 }
 

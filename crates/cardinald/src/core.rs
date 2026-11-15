@@ -264,6 +264,9 @@ pub struct Telling {
     pub joined: bool,
     /// Whether they have left it.
     pub left: bool,
+    /// Whether the space is public: then whoever is in it now, anyone at
+    /// all reads it, and nothing is ever set there unasked.
+    pub public: bool,
     /// The members who are not their contacts and have not left: who
     /// learns what the reach node says and had no host of theirs already.
     pub who: Vec<[u8; 32]>,
@@ -289,7 +292,9 @@ impl Telling {
             Some(true) => !self.late.is_empty(),
             Some(false) => false,
         };
-        self.hosted && !self.who.is_empty() && (!self.joined || (!self.shared && unanswered))
+        // in a public space that is anyone at all, whoever is in it now
+        let learns = self.public || !self.who.is_empty();
+        self.hosted && learns && (!self.joined || (!self.shared && unanswered))
     }
 
     /// Whether joining names the person's hosts: as they say now, or as
@@ -322,7 +327,10 @@ impl Telling {
             && match self.answer {
                 Some(false) => false,
                 Some(true) => !self.shared && self.hosted && self.late.is_empty(),
-                None => self.who.is_empty() && (!self.set || (!self.shared && self.hosted)),
+                None => {
+                    let contacts = self.who.is_empty() && !self.public;
+                    contacts && (!self.set || (!self.shared && self.hosted))
+                }
             }
     }
 
@@ -1233,6 +1241,7 @@ impl Core {
             hosted: !hosts.is_empty(),
             joined: sp.accepted_by(&me),
             left: sp.has_left(&me),
+            public: sp.is_public(),
             late: who.iter().filter(late).copied().collect(),
             who,
             what: endpoints.map(|e| e.to_string()).collect(),
@@ -2867,6 +2876,14 @@ mod tests {
             self.core.write_entry(&account, vec![contact]).unwrap();
         }
 
+        /// The id of the space a sealed genesis starts.
+        fn space_of(&self, genesis: &[u8]) -> SpaceId {
+            let sealed = cardinal_space::SealedEntry::decode(genesis).unwrap();
+            let ident = self.core.identity.as_ref().unwrap();
+            let opened = Space::open_genesis(&sealed, &ident.key_refs(), None).unwrap();
+            opened.id()
+        }
+
         /// Sets this person's reach node in a space, to one host or none.
         fn says_reach(&mut self, space: &SpaceId, host: bool) -> Vec<u8> {
             let reach = relationship::Reach {
@@ -3355,6 +3372,50 @@ mod tests {
         // His answer covers Cy from then on.
         bo.says_reach(&g, true);
         assert!(bo.core.telling(&g).added().is_empty());
+    }
+
+    /// P11 (`hosts.md#telling-others-where-to-reach-you`). A public space
+    /// is read by anyone at all, so software never sets a reach node there
+    /// unasked, whoever its members are: it asks first.
+    #[test]
+    fn nothing_is_set_unasked_in_a_public_space() {
+        let (mut ana, mut bo) = (Person::new(), Person::new());
+        ana.meets(&bo);
+        bo.meets(&ana);
+        bo.knows(&ana, "Ana");
+        bo.hosts_at("203.0.113.5:7171");
+        let roles = [(ana.id(), OWNER), (bo.id(), WRITER)];
+        let made = [false, true].map(|public| {
+            let policy = Policy {
+                public,
+                ..Policy::default()
+            };
+            ana.genesis_with(cardinal_space::group::GROUP, policy, &roles, &bo)
+        });
+        let mut tellings = Vec::new();
+        for (public, genesis) in [false, true].into_iter().zip(made) {
+            let id = bo.space_of(&genesis);
+            bo.core.ingest_space(id, &[genesis]).unwrap();
+            assert_eq!(bo.space(&id).is_public(), public);
+            // Everyone there is his contact, and he has a host.
+            let offered = bo.core.telling(&id);
+            assert!(offered.who.is_empty() && offered.hosted);
+            bo.says_reach(&id, false);
+            tellings.push((offered, bo.core.telling(&id)));
+        }
+        let (offered, joined) = &tellings[0];
+        assert!(!offered.ask() && joined.sets_unasked() && !joined.ask());
+        let (offered, joined) = &tellings[1];
+        assert!(offered.ask(), "joining a public group does not ask");
+        assert!(
+            !joined.sets_unasked(),
+            "his host is named to anyone at all, unasked"
+        );
+        assert!(joined.ask());
+        // Asked, and having said yes, it is his to share.
+        let mut yes = joined.clone();
+        yes.answer = Some(true);
+        assert!(yes.sets_unasked() && !yes.ask());
     }
 
     /// P2. Among contacts a reach node is set unasked, to the person's
