@@ -424,7 +424,11 @@ impl SpaceOp {
                 left_out: ids(r, 2, "left out")?,
                 address: r.opt_record(3)?.cloned(),
             },
-            9 => SpaceOpBody::SetProtocol,
+            9 => {
+                // its one field, which it must have: the protocol record
+                r.record(1)?;
+                SpaceOpBody::SetProtocol
+            }
             32 => SpaceOpBody::Create {
                 kind: r
                     .get(1)
@@ -1359,6 +1363,77 @@ mod tests {
             .with(3, ct);
         let forged = SealedEntry::decode(&r.encode()).unwrap();
         assert_eq!(forged.open_with(&epoch), Err(Error::Mismatch("nonce")));
+    }
+
+    /// V7 (`spaces.md#control-operations`). An op is what its table says
+    /// only if it is written as the table says: every field the table
+    /// gives it has the type the table gives, a field marked display only
+    /// included, and a field it must have is there. One that is not so is
+    /// an op nobody defined. Keys the table does not list change nothing.
+    #[test]
+    fn an_op_is_what_its_table_says_only_if_written_so() {
+        let op = |n: u32| Record::new().with(0, n);
+        let not_that_op = |r: Record, n: u64, what: &str| {
+            let body = SpaceOp::from_record(r).body().clone();
+            assert_eq!(body, SpaceOpBody::Unknown { number: Some(n) }, "{what}");
+        };
+        let who = [7u8; 32];
+        let reach = [3u8; 16];
+        let add = || op(2).with(1, who).with(2, 1u32);
+        not_that_op(add().with(3, "an agent"), 2, "add_member, agent of");
+        not_that_op(add().with(3, vec![1u8; 31]), 2, "add_member, agent of");
+        not_that_op(op(2).with(1, who), 2, "add_member with no role");
+        let succeed = || op(8).with(1, [9u8; 32]);
+        not_that_op(succeed().with(2, "left out"), 8, "succeed, left out");
+        not_that_op(
+            succeed().with(2, Value::list(["x"])),
+            8,
+            "succeed, left out",
+        );
+        not_that_op(succeed().with(3, 5u32), 8, "succeed, address");
+        let set = || op(33).with(1, reach).with(2, 1u32);
+        not_that_op(op(33).with(1, reach).with(2, "key"), 33, "set, key");
+        not_that_op(op(33).with(1, reach), 33, "set with no key");
+        not_that_op(set().with(4, 2u32), 33, "set, beside");
+        not_that_op(op(35).with(1, reach).with(2, "yes"), 35, "delete, beside");
+        let start = || op(1).with(1, 2u32);
+        not_that_op(start().with(2, "a policy"), 1, "start, policy");
+        not_that_op(start().with(5, 7u32), 1, "start, protocol");
+        not_that_op(op(1), 1, "start with no profile");
+        not_that_op(op(6), 6, "set_policy with no policy");
+        not_that_op(op(9), 9, "set_protocol with no record");
+        not_that_op(op(9).with(1, "a protocol"), 9, "set_protocol");
+        not_that_op(
+            op(7).with(2, Value::list([[1u8; 32]])),
+            7,
+            "keep with no key",
+        );
+        not_that_op(op(5).with(1, "keys"), 5, "rotate");
+        // Written as the table says, each is that op, and a key the table
+        // does not list changes nothing.
+        let is = |r: Record| !matches!(SpaceOp::from_record(r).body(), SpaceOpBody::Unknown { .. });
+        assert!(is(add()) && is(add().with(3, who)) && is(add().with(20, "more")));
+        assert!(is(succeed()) && is(succeed().with(2, Value::list([who]))));
+        assert!(is(set()) && is(set().with(4, true)) && is(set().with(3, "v").with(9, 1u32)));
+        assert!(is(start()) && is(op(9).with(1, Record::new())) && is(op(4).with(1, "x")));
+        // An entry is malformed, and rejected, if a parent is listed twice
+        // or an item of its op list is not a record.
+        let key = SigningKey::from_seed(&[7; 32]);
+        let once = SpaceEntryBuilder::new([1; 32], &[[2; 32]], [3; 32], [4; 32], [5; 16])
+            .sign(&key)
+            .unwrap();
+        let signed_with = |field: u64, v: Value| {
+            let mut body = once.record().clone();
+            body.insert(field, v);
+            let mut obj = SignedObject::new(body);
+            key.sign_object(&mut obj);
+            SpaceEntry::from_signed(obj)
+        };
+        let parent = Value::from([2u8; 32]);
+        assert!(signed_with(2, Value::list([parent.clone()])).is_ok());
+        assert!(signed_with(2, Value::list([parent.clone(), parent])).is_err());
+        assert!(signed_with(5, Value::list(["not a record"])).is_err());
+        assert!(signed_with(5, Value::list([Record::new()])).is_ok());
     }
 
     /// An index means something only in an entry: it is the place of an

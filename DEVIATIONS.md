@@ -455,6 +455,18 @@ below, each under its section.
   says what a device does on meeting one. Chose: a field this
   implementation does not know, accepted, ignored and kept. (Control op 3,
   "not used", is allowed to no role, as the specification now says.)
+- **Reading: which fields an op must have** (`spaces.md#control-operations`,
+  "An op is what its table says only if it is written as the table says").
+  The tables do not mark them. Here an op must have: `start` its profile;
+  `add_member` the identity and the role; `set_policy` the policy;
+  `set_protocol` the protocol record; `keep` the key; `succeed` the
+  successor; `create` the kind and the parent; `set` the node and the key;
+  `move`, `delete` and `restore` the node. A name that is absent is the
+  empty name, a bool that is absent is false, and a list that is absent
+  is empty. Every field that is there has its table's type, or the op is
+  one nobody defined. Where a node id belongs and something else stands,
+  the op is read as one nobody defined too: it is a writer's op either
+  way, and its entry is not accepted for state either way.
 - **Spec ambiguity: a `leave` with fields.** `leave` has none. Chose: one
   that carries any is still a `leave`, and they are kept like any unknown
   field. (What 0.1.13 wrote as `remove_member` reads this way.)
