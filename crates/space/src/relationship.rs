@@ -202,6 +202,31 @@ pub fn reach_of(state: &State, who: &IdentityId) -> Vec<Reach> {
     all
 }
 
+/// Every host and token `who` ever gave in their reach node in a space:
+/// from each value they wrote there, whatever the node says now. For a host
+/// that ends the tokens of a node that was emptied.
+pub fn reach_ever(space: &crate::Space, who: &IdentityId) -> Vec<Reach> {
+    let node = reach_node_id(who);
+    let mut all: Vec<Reach> = Vec::new();
+    for (_, e) in space.dag().iter().filter(|(_, e)| e.author() == *who) {
+        for op in e.ops() {
+            let crate::SpaceOpBody::Set {
+                node: n,
+                key: 1,
+                value: Some(v),
+                ..
+            } = op.body()
+            else {
+                continue;
+            };
+            let list = v.as_list().unwrap_or_default();
+            let given = list.iter().filter_map(|v| read_reach(v.as_record()?));
+            all.extend(given.filter(|_| *n == node));
+        }
+    }
+    all
+}
+
 /// What a relationship's genesis entry holds besides `start`: both
 /// identities as writers, and the one conversation. It names no owner, so
 /// neither can add anyone and neither can end it alone

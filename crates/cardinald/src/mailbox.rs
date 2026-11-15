@@ -689,6 +689,10 @@ async fn say_reach_locked(d: &Arc<Daemon>, space: &SpaceId, share: bool) -> anyh
         Vec::new()
     };
     d.write_and_push(space, vec![relationship::set_reach(&me, &reach)])?;
+    if reach.is_empty() {
+        // what the node named before is in use no longer
+        revoke_left(d, space);
+    }
     Ok(())
 }
 
@@ -750,25 +754,44 @@ fn tokens_here(d: &Daemon, space: &SpaceId) -> Vec<Token> {
     here.map(|r| r.token).collect()
 }
 
-/// On a host, ends the tokens this person gave out in a space they have
-/// left (`spaces.md#members-and-roles`). The host does this itself, when it
-/// leaves or when the `leave` reaches it from another of the person's
-/// devices. A token revoked never comes back: someone who is added again
-/// and joins again sets their reach node again, with new ones.
+/// On a host, ends the tokens this person gave out in a space where their
+/// reach node names this host no longer: they have left the space
+/// (`spaces.md#members-and-roles`), or emptied the node, as when they say
+/// no (`hosts.md#delivery-tokens`). The host does this itself, when it
+/// writes the entry or when the entry reaches it from another of the
+/// person's devices. A token revoked never comes back: sharing again, or
+/// joining again, sets the reach node again with new ones.
+///
+/// The node that would say which tokens were given is the one that was
+/// just emptied, so they are read from every value the person ever wrote
+/// to it. That is looked for only when this host has a token active that
+/// no reach node names.
 pub fn revoke_left(d: &Daemon, space: &SpaceId) {
     if !d.config().host {
         return;
     }
-    let left = {
+    let here = *d.keys.link.public_key().x25519();
+    let named = tokens_here(d, space);
+    // taken before the core is: never one lock inside the other
+    let active = lock(&d.mailbox.store).active();
+    let given: Vec<Token> = {
         let core = d.core();
-        let me = core.identity.as_ref().map(|i| i.id());
-        let open = core.spaces.get(space).and_then(|h| h.space.as_ref());
-        me.is_some_and(|me| open.is_some_and(|sp| sp.has_left(&me)))
+        let Some(me) = core.me() else { return };
+        let Some(sp) = core.spaces.get(space).and_then(|h| h.space.as_ref()) else {
+            return;
+        };
+        let left = sp.has_left(&me);
+        if !left && !named.is_empty() {
+            return;
+        }
+        let unnamed = |t: &Token| named.contains(t) || core.space_of_token(t).is_none();
+        if !active.iter().any(unnamed) {
+            return;
+        }
+        let ever = relationship::reach_ever(sp, &me).into_iter();
+        ever.filter(|r| r.host == here).map(|r| r.token).collect()
     };
-    if !left {
-        return;
-    }
-    for token in tokens_here(d, space) {
+    for token in given {
         if lock(&d.mailbox.store).is_active(&token) {
             revoke(d, &token);
         }

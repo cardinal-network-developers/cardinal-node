@@ -729,3 +729,57 @@ fn a_group_call_carries_every_voice_through_whoever_links_them() {
     });
     assert_eq!(standing(&bo), "live");
 }
+
+/// The tokens a host has active, from where it keeps them.
+fn active_tokens(d: &Dev) -> usize {
+    let kept = std::fs::read(d.home.join("mailbox/state.json")).unwrap_or_default();
+    let v: Value = serde_json::from_slice(&kept).unwrap_or_default();
+    v["active"].as_array().map_or(0, Vec::len)
+}
+
+/// P14 (`hosts.md#delivery-tokens`, `spaces.md#members-and-roles`). A
+/// token is what lets a space's members use a person's host. When the
+/// person stops naming the host there, by saying no or by leaving, the
+/// token they gave out there is ended, and not only left out of the node.
+#[test]
+fn a_token_ends_when_its_space_no_longer_names_the_host() {
+    let root = tempfile::tempdir().unwrap();
+    let ana = person(root.path(), "ana");
+    let bo = person(root.path(), "bo");
+    let at = format!("127.0.0.1:{}", bo.port);
+    bo.cli(&["host", "--address", &at]);
+    meet(&ana, &bo, "Bo");
+    let made = ask(
+        &ana,
+        json!({"cmd": "group-create", "name": "Choir", "people": ["Bo"]}),
+    );
+    let g = made["group"].as_str().unwrap().to_owned();
+    wait("the offer arrives", 30, || {
+        offers(&bo).iter().any(|o| o["name"] == "Choir")
+    });
+    std::thread::sleep(std::time::Duration::from_secs(2));
+    let without = active_tokens(&bo);
+    ask(&bo, json!({"cmd": "group-join", "group": g}));
+    wait("bo's host is named", 10, || {
+        groups(&bo).iter().any(|x| x["name"] == "Choir") && reach_in(&bo, &g)["shared"] == true
+    });
+    assert_eq!(active_tokens(&bo), without + 1);
+    // He says no: the node is emptied, and the token ended.
+    ask(
+        &bo,
+        json!({"cmd": "group-reach", "group": g, "share": false}),
+    );
+    wait("the token ends with the no", 10, || {
+        active_tokens(&bo) == without
+    });
+    // He shares again, with a new token, and leaves.
+    ask(
+        &bo,
+        json!({"cmd": "group-reach", "group": g, "share": true}),
+    );
+    assert_eq!(active_tokens(&bo), without + 1);
+    ask(&bo, json!({"cmd": "group-leave", "group": g}));
+    wait("the token ends with the leave", 10, || {
+        active_tokens(&bo) == without
+    });
+}
