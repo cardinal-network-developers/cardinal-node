@@ -719,7 +719,8 @@ pub async fn write_reach(d: &Arc<Daemon>, space: &SpaceId) -> anyhow::Result<()>
     let _one = d.mailbox.reaching.lock().await;
     let t = d.core().telling(space);
     if t.empties_unasked() {
-        // The person said no, and another of their devices had not heard.
+        // The person said no, or left, and another of their devices had
+        // not heard.
         return say_reach_locked(d, space, false).await;
     }
     if !t.sets_unasked() {
@@ -1082,12 +1083,16 @@ async fn deliver(d: &Arc<Daemon>) {
     renew_reach(d);
     let shared = d.core().shared_spaces();
     for (space, members) in shared {
+        // Before anything else, since it holds for a space this person
+        // has left as well: there it empties a reach node that names
+        // their hosts again, and writes nothing else. Where they were
+        // only offered the space it writes nothing at all.
+        if let Err(e) = write_reach(d, &space).await {
+            tracing::debug!("writing where to reach this person: {e:#}");
+        }
         // Nothing of this person's goes in a group they have not joined.
         if crate::groups::not_joined(d, &space) {
             continue;
-        }
-        if let Err(e) = write_reach(d, &space).await {
-            tracing::debug!("writing where to reach this person: {e:#}");
         }
         for member in members {
             deliver_to(d, &space, &member).await;

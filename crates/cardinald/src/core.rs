@@ -262,6 +262,8 @@ pub struct Telling {
     pub hosted: bool,
     /// Whether they are in the space by their own doing.
     pub joined: bool,
+    /// Whether they have left it.
+    pub left: bool,
     /// The members who are not their contacts and have not left: who
     /// learns what the reach node says and had no host of theirs already.
     pub who: Vec<[u8; 32]>,
@@ -338,8 +340,13 @@ impl Telling {
     /// it names a host all the same, as it can where another of their
     /// devices set it before their answer reached it. Setting an empty
     /// list tells nobody anything, and needs no asking.
+    ///
+    /// Or the person has left and it names a host all the same, as it can
+    /// where another of their devices set it at the moment they left:
+    /// emptying it again is the one thing a member who has left still
+    /// writes (`spaces.md#members-and-roles`).
     pub fn empties_unasked(&self) -> bool {
-        self.joined && self.shared && self.answer == Some(false)
+        self.shared && (self.left || (self.joined && self.answer == Some(false)))
     }
 
     /// Whether software keeps current what the reach node says: a token
@@ -1212,6 +1219,7 @@ impl Core {
             answer: self.names_hosts(space),
             hosted: !hosts.is_empty(),
             joined: sp.accepted_by(&me),
+            left: sp.has_left(&me),
             late: who.iter().filter(late).copied().collect(),
             who,
             what: endpoints.map(|e| e.to_string()).collect(),
@@ -3199,6 +3207,55 @@ mod tests {
         assert_eq!(names("offers"), ["Choir"], "{listed}");
         // His own spaces moved on with the rest.
         assert!(bo.began_an_epoch(&account));
+    }
+
+    /// P3 (`spaces.md#members-and-roles`). Leaving empties the reach node
+    /// in the entry that leaves. If another of the person's devices set it
+    /// at the same moment, it names hosts again: then a device of theirs
+    /// that still holds the space empties it again, the one thing a
+    /// member who has left still writes.
+    #[test]
+    fn a_reach_node_that_names_hosts_after_leaving_is_emptied_again() {
+        let [mut ana, mut bo, _, _] = four();
+        bo.knows(&ana, "Ana");
+        bo.hosts_at("203.0.113.5:7171");
+        let bo_shown = [(bo.id(), "Bo".to_owned())];
+        let g = ana.core.create_group("Choir", "Ana", &bo_shown).unwrap();
+        bo.takes(&g, &ana.all_of(&g));
+        bo.says_reach(&g, true);
+        let me = bo.id();
+        // He leaves on one device, and another, which has not heard,
+        // sets the reach node.
+        let (left, _) = bo
+            .core
+            .write_entry(&g, relationship::leave_ops(&me))
+            .unwrap();
+        let reach = relationship::Reach {
+            endpoints: Vec::new(),
+            host: [9; 32],
+            token: cardinal_crypto::random_bytes(),
+        };
+        let set = relationship::set_reach(&me, &[reach]);
+        bo.core
+            .write_entry_concurrent(&g, &[left], vec![set])
+            .unwrap();
+        ana.takes(&g, &bo.all_of(&g));
+        assert!(ana.space(&g).has_left(&me));
+        assert_eq!(relationship::reach_of(ana.space(&g).state(), &me).len(), 1);
+        // His device finds that, and empties it.
+        let t = bo.core.telling(&g);
+        assert!(t.shared && !t.joined);
+        assert!(t.empties_unasked(), "nothing empties it");
+        let emptied = bo.says_reach(&g, false);
+        ana.takes(&g, &[emptied]);
+        let sp = ana.space(&g);
+        assert!(relationship::reach_of(sp.state(), &me).is_empty());
+        let last = *sp.dag().log_order().last().unwrap();
+        assert!(sp.validity().is_valid(&last) && sp.state().is_accepted(&last));
+        // He has still left, and there is nothing more to write.
+        assert!(sp.has_left(&me) && !sp.accepted_by(&me));
+        let t = bo.core.telling(&g);
+        assert!(!t.empties_unasked() && !t.sets_unasked() && !t.keeps_current());
     }
 
     /// P2. Among contacts a reach node is set unasked, to the person's
