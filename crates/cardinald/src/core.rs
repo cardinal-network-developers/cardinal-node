@@ -370,6 +370,10 @@ pub struct Holder {
     /// Sealed entries that could not be opened yet (no epoch key).
     pending: Vec<SealedEntry>,
     file: AppendLog,
+    /// Something was taken into the space in memory and could not be
+    /// saved: what is in memory is no longer what the device holds, and
+    /// is read again from what it does ([`Core::settle`]).
+    unsaved: bool,
     /// Bumped whenever the state may have changed.
     pub version: u64,
     /// The encryption keys of the other members, for a new epoch.
@@ -421,6 +425,7 @@ impl Holder {
             locs: HashMap::new(),
             pending: Vec::new(),
             file,
+            unsaved: false,
             version: 0,
             member_keys: Vec::new(),
             leave_out: false,
@@ -545,7 +550,15 @@ impl Holder {
 
     fn persist(&mut self, items: &[([u8; 32], Vec<u8>)]) -> anyhow::Result<()> {
         let refs: Vec<&[u8]> = items.iter().map(|(_, b)| b.as_slice()).collect();
-        let locs = self.file.append_many(&refs)?;
+        let locs = match self.file.append_many(&refs) {
+            Ok(locs) => locs,
+            Err(e) => {
+                // Whatever of this is in the space in memory already must
+                // not stay: later entries would name it as a parent.
+                self.unsaved = true;
+                return Err(e.into());
+            }
+        };
         for ((sid, _), l) in items.iter().zip(locs) {
             self.locs.insert(*sid, l);
             self.set.insert(*sid);
@@ -1386,6 +1399,7 @@ impl Core {
     /// member but this one who has not left, and whom this device does not
     /// know to be frozen (`spaces.md#distribution`).
     fn settle(&mut self, space: &SpaceId) {
+        self.reload_unsaved(space);
         let Some(ident) = self.identity.as_ref() else {
             return;
         };
@@ -1461,6 +1475,31 @@ impl Core {
         // that holds the same entries.
         let by_entries = sp.left_since_epoch() || sp.added_beside_epoch();
         h.leave_out = by_record || by_entries || sp.epoch_started_by().is_some_and(theirs);
+    }
+
+    /// A space that took something in memory and could not save it is read
+    /// again from what the device holds, so that nothing written next
+    /// builds on an entry that is nowhere. If it cannot be read either it
+    /// stays as it is, and this is tried again.
+    fn reload_unsaved(&mut self, space: &SpaceId) {
+        let Some(was) = self.spaces.get(space).filter(|h| h.unsaved) else {
+            return;
+        };
+        let Some(ident) = self.identity.as_ref() else {
+            return;
+        };
+        let version = was.version + 1;
+        match Holder::open(&self.paths, *space, &ident.key_refs(), &self.logs) {
+            Ok(mut held) => {
+                held.version = version;
+                self.spaces.insert(*space, held);
+            }
+            Err(e) => tracing::error!(
+                "space {}: an entry could not be saved, and the space could not be read \
+                 again: {e:#}",
+                short(space)
+            ),
+        }
     }
 
     /// After an identity log changed: every space judges again the entries
@@ -4068,6 +4107,39 @@ mod tests {
         assert!(ana.began_an_epoch(&g), "Dee is never given the key again");
         ana.says(&g, "and once is enough");
         assert!(!ana.began_an_epoch(&g));
+    }
+
+    /// D2. An entry is taken into the space in memory and then saved. If it
+    /// cannot be saved it must not stay in memory: every later entry would
+    /// name it as a parent, and after a restart they would wait for ever
+    /// for an entry that is nowhere.
+    #[test]
+    fn an_entry_that_could_not_be_saved_is_not_kept_in_memory() {
+        use cardinal_space::files;
+        let mut ana = Person::new();
+        let space = ana.core.files_id().unwrap();
+        let a = files::create_folder(ROOT, "a");
+        ana.core.write_entry(&space, vec![a]).unwrap();
+        let held = |p: &Person| (p.space(&space).dag().len(), p.space(&space).heads());
+        let before = held(&ana);
+        ana.core
+            .spaces
+            .get_mut(&space)
+            .unwrap()
+            .file
+            .break_for_test();
+        let b = files::create_folder(ROOT, "b");
+        assert!(ana.core.write_entry(&space, vec![b]).is_err());
+        assert_eq!(held(&ana), before, "an entry that was not saved is held");
+        // What is written next is whole, here and after a restart.
+        let c = files::create_folder(ROOT, "c");
+        let (c, _) = ana.core.write_entry(&space, vec![c]).unwrap();
+        let after = held(&ana);
+        assert_eq!(after.0, before.0 + 1);
+        ana.restarts();
+        assert_eq!(held(&ana), after);
+        let sp = ana.space(&space);
+        assert!(sp.validity().is_valid(&c) && sp.state().is_accepted(&c));
     }
 
     /// A file that someone moved into a place where a file means nothing is

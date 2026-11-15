@@ -1,12 +1,13 @@
 //! An append-only file of records: `u32` little-endian length, then the
 //! bytes. Used for identity entries and sealed space entries, which are
 //! immutable objects. A torn record at the end (a crash mid-append) is cut
-//! off when the file is opened.
+//! off when the file is opened. An append that fails part way is cut off
+//! again at once, and nothing is appended behind what could not be cut.
 
 use crate::fsat::FileExt;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// Where a record lives in the file.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -23,7 +24,11 @@ pub type Records = Vec<(Loc, Vec<u8>)>;
 /// An append-only record file.
 pub struct AppendLog {
     file: File,
+    path: PathBuf,
     end: u64,
+    /// Something is at the end that is no record and could not be cut:
+    /// nothing more is appended, since its place could not be told.
+    broken: bool,
 }
 
 impl AppendLog {
@@ -71,7 +76,9 @@ impl AppendLog {
         Ok((
             AppendLog {
                 file,
+                path: path.to_path_buf(),
                 end: pos as u64,
+                broken: false,
             },
             out,
         ))
@@ -82,8 +89,7 @@ impl AppendLog {
         let mut buf = Vec::with_capacity(bytes.len() + 4);
         buf.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
         buf.extend_from_slice(bytes);
-        self.file.write_all(&buf)?;
-        self.file.sync_data()?;
+        self.write(&buf)?;
         let loc = Loc {
             offset: self.end + 4,
             len: bytes.len() as u32,
@@ -107,11 +113,50 @@ impl AppendLog {
             at += 4 + r.len() as u64;
         }
         if !buf.is_empty() {
-            self.file.write_all(&buf)?;
-            self.file.sync_data()?;
+            self.write(&buf)?;
         }
         self.end = at;
         Ok(locs)
+    }
+
+    /// Writes whole records at the end and makes them durable, or leaves
+    /// the file ending where it did. Records are found by where the log
+    /// ended when they were written, so nothing may lie between: bytes a
+    /// failed write left there are cut first, and a write that fails is
+    /// cut back. If that cannot be done the log takes nothing more.
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<()> {
+        if !self.broken && self.file.metadata()?.len() != self.end {
+            self.cut();
+        }
+        if self.broken {
+            return Err(std::io::Error::other(format!(
+                "{} ends in something that is not a record and could not be removed",
+                self.path.display()
+            )));
+        }
+        let written = self.file.write_all(buf);
+        let written = written.and_then(|()| self.file.sync_data());
+        if written.is_err() {
+            self.cut();
+        }
+        written
+    }
+
+    /// Cuts the file back to its last whole record.
+    fn cut(&mut self) {
+        tracing::warn!(path = %self.path.display(), "cutting what a failed write left in the log");
+        // On a handle of its own, as when opening.
+        let cut = OpenOptions::new().write(true).open(&self.path);
+        let cut = cut.and_then(|f| f.set_len(self.end).and_then(|()| f.sync_data()));
+        let len = self.file.metadata().map(|m| m.len());
+        self.broken = cut.is_err() || len.ok() != Some(self.end);
+    }
+
+    /// Makes the log refuse what is appended from now on, as it does once
+    /// it cannot cut what a failed write left.
+    #[cfg(test)]
+    pub fn break_for_test(&mut self) {
+        self.broken = true;
     }
 
     /// Reads a record.
@@ -150,5 +195,30 @@ mod tests {
         assert_eq!(l.read(x).unwrap(), b"z");
         let (_, recs) = AppendLog::open(&p).unwrap();
         assert_eq!(recs.len(), 4);
+    }
+
+    /// D2. An append that failed part way leaves part of a record at the
+    /// end. The next one must not land behind it: its place would be
+    /// reckoned from where the log ended before, and on opening again
+    /// everything from the torn bytes on would be cut.
+    #[test]
+    fn what_a_failed_append_left_is_cut_before_the_next() {
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path().join("x.log");
+        let (mut l, _) = AppendLog::open(&p).unwrap();
+        let a = l.append(b"first").unwrap();
+        // half a record, as a write that failed part way leaves it
+        {
+            let mut f = OpenOptions::new().append(true).open(&p).unwrap();
+            f.write_all(&[9, 0, 0, 0, b'h', b'a']).unwrap();
+        }
+        let b = l.append(b"second").unwrap();
+        let cs = l.append_many(&[b"third", b"fourth"]).unwrap();
+        assert_eq!(l.read(a).unwrap(), b"first");
+        assert_eq!(l.read(b).unwrap(), b"second");
+        assert_eq!(l.read(cs[1]).unwrap(), b"fourth");
+        let (_, recs) = AppendLog::open(&p).unwrap();
+        let all: Vec<&[u8]> = recs.iter().map(|(_, r)| r.as_slice()).collect();
+        assert_eq!(all, [&b"first"[..], b"second", b"third", b"fourth"]);
     }
 }
