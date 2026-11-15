@@ -819,8 +819,10 @@ Not implemented yet (the next milestone):
   the same when no daemon answers. A marker that is not a number is
   another version's.
 - **One process on a data directory** (`lock.rs`; not in the
-  specification). A service holds an exclusive lock on the file `lock` in
-  its data directory from before it reads anything there until it exits,
+  specification). A service holds an exclusive lock on its data directory
+  (on the directory itself, so that nothing is written to take it; on
+  Windows on a file `lock` in it) from before it reads anything there
+  until it exits,
   and a second one on the same directory does not start. `cardinal clear`
   and `cardinald --clear` take the same lock, so neither removes a store a
   service is running on, whatever the directory was called this time and

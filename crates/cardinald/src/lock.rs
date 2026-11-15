@@ -1,14 +1,19 @@
 //! One process at a time on a data directory.
 //!
-//! A service holds an exclusive lock on the file `lock` in its data
-//! directory for as long as it runs, taken before it reads anything there.
-//! Whatever removes a store takes the same lock first. So two services
-//! never run on one directory, and none is cleared from under one. It does
-//! not turn on what each was told the directory is called, or on where each
-//! looks for the other's socket, or on whether the first has bound its
-//! socket yet: a lock is held on the file, not on a name.
+//! A service holds an exclusive lock on its data directory for as long as
+//! it runs, taken before it reads anything there. Whatever removes a store
+//! takes the same lock first. So two services never run on one directory,
+//! and none is cleared from under one. It does not turn on what each was
+//! told the directory is called, or on where each looks for the other's
+//! socket, or on whether the first has bound its socket yet: the lock is
+//! held on the directory, not on a name.
+//!
+//! On Unix the lock is on the directory itself, so nothing is written
+//! there to take it: a store this version cannot read is left exactly as
+//! it was. On Windows it is a file in the directory, `lock`, opened
+//! sharing nothing.
 
-use std::fs::{File, OpenOptions};
+use std::fs::File;
 use std::io;
 use std::path::PathBuf;
 
@@ -18,19 +23,15 @@ use crate::paths::Paths;
 #[derive(Debug)]
 pub struct Lock(#[allow(dead_code)] File);
 
-/// The lock file's path.
+/// The lock file's path, where there is one.
 pub fn file(paths: &Paths) -> PathBuf {
     paths.home.join("lock")
 }
 
 #[cfg(unix)]
-fn open(path: &std::path::Path, create: bool) -> io::Result<Option<File>> {
+fn open(paths: &Paths, _create: bool) -> io::Result<Option<File>> {
     use std::os::fd::AsRawFd;
-    let f = OpenOptions::new()
-        .create(create)
-        .truncate(false)
-        .write(true)
-        .open(path)?;
+    let f = File::open(&paths.home)?;
     // SAFETY: `flock` on a descriptor this function owns.
     if unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
         return Ok(Some(f));
@@ -45,14 +46,15 @@ fn open(path: &std::path::Path, create: bool) -> io::Result<Option<File>> {
 /// On Windows a file opened sharing nothing is held: a second open fails
 /// with a sharing violation.
 #[cfg(windows)]
-fn open(path: &std::path::Path, create: bool) -> io::Result<Option<File>> {
+fn open(paths: &Paths, create: bool) -> io::Result<Option<File>> {
+    use std::fs::OpenOptions;
     use std::os::windows::fs::OpenOptionsExt;
     let opened = OpenOptions::new()
         .create(create)
         .truncate(false)
         .write(true)
         .share_mode(0)
-        .open(path);
+        .open(file(paths));
     match opened {
         Ok(f) => Ok(Some(f)),
         Err(e) if e.raw_os_error() == Some(32) => Ok(None),
@@ -60,17 +62,17 @@ fn open(path: &std::path::Path, create: bool) -> io::Result<Option<File>> {
     }
 }
 
-/// Takes the data directory for this process, making it and the lock file
-/// if they are not there. `None` if another process holds it.
+/// Takes the data directory for this process, making it if it is not
+/// there. `None` if another process holds it.
 pub fn take(paths: &Paths) -> io::Result<Option<Lock>> {
     std::fs::create_dir_all(&paths.home)?;
-    Ok(open(&file(paths), true)?.map(Lock))
+    Ok(open(paths, true)?.map(Lock))
 }
 
 /// Whether another process holds the data directory. Nothing is made
-/// there: a directory with no lock file is held by nobody.
+/// there: a directory that is not there is held by nobody.
 pub fn held(paths: &Paths) -> bool {
-    matches!(open(&file(paths), false), Ok(None))
+    matches!(open(paths, false), Ok(None))
 }
 
 #[cfg(test)]
@@ -81,11 +83,15 @@ mod tests {
     fn a_directory_is_held_by_one_at_a_time_whatever_it_is_called() {
         let dir = tempfile::tempdir().unwrap();
         let paths = Paths::at(dir.path());
-        // nothing there: held by nobody, and asking makes nothing
+        // not there: held by nobody, and asking makes nothing
+        let none = Paths::at(&dir.path().join("none"));
+        assert!(!held(&none) && !none.home.exists());
         assert!(!held(&paths));
-        assert!(!file(&paths).exists());
         let first = take(&paths).unwrap().expect("free");
         assert!(held(&paths));
+        // taking it writes nothing there
+        #[cfg(unix)]
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
         assert!(take(&paths).unwrap().is_none());
         // by another name for the same directory
         let other = Paths::at(&dir.path().join("."));
