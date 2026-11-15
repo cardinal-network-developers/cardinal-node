@@ -722,9 +722,8 @@ pub enum Shared {
 /// The person says, on this device, that a space's members may have where
 /// their hosts are (`group-reach`). What the list names already stays, in
 /// its order, and each host of theirs it does not name is added after,
-/// with a fresh token. The list is set even if nothing is added to it:
-/// said now, it is also their answer about whoever came since it was last
-/// set, and it is the one result where it held two.
+/// with a fresh token. A list that needs no change is not written again:
+/// a yes was to the space, whoever has been added to it since.
 ///
 /// With no host there is nothing to share and nothing is written: an
 /// answer is not kept for a host they may take up later
@@ -741,8 +740,8 @@ pub async fn share_reach(d: &Arc<Daemon>, space: &SpaceId) -> anyhow::Result<Sha
     if reach.is_empty() && more.is_empty() {
         return Ok(Shared::OutOfReach);
     }
-    let again = !t.added().is_empty() || t.split;
-    if !more.is_empty() || again {
+    // where it held two lists, this sets the one result
+    if !more.is_empty() || t.split {
         reach.extend(more);
         d.write_and_push(space, vec![relationship::set_reach(&me, &reach)])?;
     }

@@ -232,6 +232,65 @@ pub fn reach_is_split(state: &State, who: &IdentityId) -> bool {
     state.reach_values(who, 1).len() > 1
 }
 
+/// The entries with which `who` began naming hosts in a space, as their
+/// list stands: each `set` of a list that names a host where the list
+/// before it was empty or had never been set, and from which what the
+/// list holds now descends through lists that all named one. None if the
+/// list names no host now.
+///
+/// Setting the list again to keep it current, as for an address that
+/// changed, begins nothing: whoever came to the space while its hosts
+/// were named is whoever no such entry has in its past, however often the
+/// list was set since (`hosts.md#telling-others-where-to-reach-you`).
+pub fn naming_began(space: &crate::Space, who: &IdentityId) -> Vec<EntryId> {
+    if reach_of(space, who).is_empty() {
+        return Vec::new();
+    }
+    let (dag, state) = (space.dag(), space.state());
+    let node = reach_node_id(who);
+    // every list they set that counts, latest in log order first, and
+    // whether it was empty
+    let mut sets: Vec<(usize, EntryId, bool)> = Vec::new();
+    for (id, e) in dag.iter().filter(|(_, e)| e.author() == *who) {
+        let lists = e.ops().iter().filter_map(|op| match op.body() {
+            crate::SpaceOpBody::Set {
+                node: n,
+                key: 1,
+                value,
+                ..
+            } if *n == node => Some(value.as_ref().and_then(Value::as_list).unwrap_or_default()),
+            _ => None,
+        });
+        let Some(list) = lists.last() else { continue };
+        if let Some(at) = dag.position(id).filter(|_| state.is_accepted(id)) {
+            sets.push((at, *id, list.is_empty()));
+        }
+    }
+    sets.sort_by_key(|(at, ..)| std::cmp::Reverse(*at));
+    let mut began = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    let mut todo: Vec<EntryId> = state.reach_values(who, 1).iter().map(|v| v.entry).collect();
+    while let Some(e) = todo.pop() {
+        if !seen.insert(e) {
+            continue;
+        }
+        // the lists this one replaced: those before it that no other
+        // before it came after
+        let mut before: Vec<&(usize, EntryId, bool)> = Vec::new();
+        for s in sets.iter().filter(|(_, p, _)| dag.is_ancestor(p, &e)) {
+            if !before.iter().any(|(_, q, _)| dag.is_ancestor(&s.1, q)) {
+                before.push(s);
+            }
+        }
+        if before.is_empty() || before.iter().any(|(_, _, empty)| *empty) {
+            began.push(e);
+        } else {
+            todo.extend(before.iter().map(|(_, p, _)| *p));
+        }
+    }
+    began
+}
+
 /// Every host and token `who` ever gave in their reach node in a space:
 /// from each value they wrote there, whatever the node says now. For a host
 /// that ends the tokens of a node that was emptied.

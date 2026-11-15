@@ -849,9 +849,10 @@ fn names(v: &Value) -> String {
 }
 
 /// Tells the person who reads where their hosts are in a group without
-/// their having agreed to it: someone who is not their contact and was
-/// added there since they last said. They must be told, and offered to
-/// stop (`hosts.md#telling-others-where-to-reach-you`).
+/// their having been told: someone who is not their contact and was
+/// added there while it named them. They are told, and offered to stop
+/// (`hosts.md#telling-others-where-to-reach-you`). Nothing waits for
+/// them: a yes was to the group, whoever is added to it.
 fn tell_who_reads_reach(g: &Value) {
     let added = names(&g["reach"]["added"]);
     if added.is_empty() {
@@ -859,12 +860,13 @@ fn tell_who_reads_reach(g: &Value) {
     }
     let name = printable(g["name"].as_str().unwrap_or(""));
     println!(
-        "    {added}, in {name} and not a contact of yours, can see where your host is ({}).",
+        "    {added} was added to {name} and is not a contact of yours. They can see where \
+         your host is ({}).",
         names(&g["reach"]["what"])
     );
     println!(
-        "    To stop naming it there: cardinal group reach {name} keep. To go on: cardinal \
-         group reach {name} share."
+        "    To stop sharing it there: cardinal group reach {name} keep. To keep sharing it: \
+         cardinal group reach {name} share."
     );
 }
 
@@ -1933,7 +1935,8 @@ async fn client(cmd: Cmd) -> anyhow::Result<()> {
                 if o["reach"]["ask"] == true {
                     println!(
                         "    Not contacts of yours in it: {}. Joining with --share-host tells \
-                         them where your host is ({}); with --keep-host it does not.",
+                         them, and anyone added later, where your host is ({}); with \
+                         --keep-host it does not.",
                         names(&o["reach"]["who"]),
                         names(&o["reach"]["what"]),
                     );

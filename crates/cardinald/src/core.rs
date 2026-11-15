@@ -244,6 +244,22 @@ impl Reached {
     }
 }
 
+/// Whom this device has told its person of, among those added to a space
+/// (`hosts.md#telling-others-where-to-reach-you`, "A yes is to the
+/// space"). It is this device's own note, kept beside the space and not in
+/// it, and no other device sees it. Each addition is noted once: as one
+/// there is nothing to say of, or as one the person is still to be told
+/// of. It is not worked out from when the list was last set: the list is
+/// set again whenever an address or a token changes.
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+struct Arrivals {
+    /// The additions the person has been told of, or need not be: the
+    /// `add_member` entries, in hex.
+    told: BTreeSet<String>,
+    /// The additions they are still to be told of, and whom each added.
+    due: BTreeMap<String, String>,
+}
+
 /// What this person's reach node in a space tells, and whom
 /// (`hosts.md#telling-others-where-to-reach-you`). A reach node says where
 /// a person's hosts are to every member, and for a host at home that is a
@@ -257,7 +273,10 @@ impl Reached {
 /// none is named only when its person says so on this device, or joins
 /// among contacts, or in a relationship. Everything here is read off what
 /// the list holds now, whether there is a host, whether the space is
-/// joined and is a relationship, who is not a contact, and who came late.
+/// joined and is a relationship, and who is not a contact. Who was added
+/// while the hosts were named, and is still to be told of, changes none of
+/// it: a yes is to the space as it grows, and nothing waits for the
+/// person.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Telling {
     /// Whether their reach node there names a host now. Where two of their
@@ -287,9 +306,8 @@ pub struct Telling {
     /// The members who are not their contacts and have not left: who
     /// learns what the reach node says and had no host of theirs already.
     pub who: Vec<[u8; 32]>,
-    /// Those of them who came since the list was last set: the entry that
-    /// set it has their addition nowhere in its causal past. The person's
-    /// answer about them is the next `set` of the list.
+    /// Those of them who were added while the list named the person's
+    /// hosts, and of whom this device has not yet told its person.
     pub late: Vec<[u8; 32]>,
     /// The addresses of their hosts: what is learned.
     pub what: Vec<String>,
@@ -321,8 +339,9 @@ impl Telling {
     }
 
     /// Those who are not the person's contacts and were added to a space
-    /// where their reach node already named their hosts: the person MUST
-    /// be told, and offered to empty it.
+    /// where their reach node already named their hosts, of whom this
+    /// device has yet to tell them: it SHOULD, and offer to empty the
+    /// list. Nothing waits for that.
     pub fn added(&self) -> &[[u8; 32]] {
         match self.shared && self.joined {
             true => &self.late,
@@ -363,21 +382,17 @@ impl Telling {
 
     /// Whether this device sets the one result of two lists set at the
     /// same moment, so that the next reader need not work it out
-    /// (`profiles.md#reach`). An empty result is always set. One that
-    /// names hosts is not while someone has come whom the person has not
-    /// answered about: a `set` would be their answer.
+    /// (`profiles.md#reach`).
     pub fn settles(&self) -> bool {
-        let quiet = !self.shared || self.late.is_empty();
-        self.split && quiet && (self.joined || self.left)
+        self.split && (self.joined || self.left)
     }
 
     /// Whether software keeps current what the list names: a token that
     /// has gone, an address that changed, a host that serves the person no
-    /// longer. That needs no asking where the person agreed to what is
-    /// there, which they have not while someone they have not answered
-    /// about reads it.
+    /// longer. That needs no asking: the person agreed to the space naming
+    /// their hosts, whoever is added to it.
     pub fn keeps_current(&self) -> bool {
-        self.shared && self.joined && self.added().is_empty()
+        self.shared && self.joined
     }
 }
 
@@ -409,6 +424,9 @@ pub struct Holder {
     /// By epoch id: what this device held when the epoch reached it.
     reached: BTreeMap<String, Reached>,
     reached_at: PathBuf,
+    /// Whom this device has told its person of, among those added.
+    arrivals: Arrivals,
+    arrivals_at: PathBuf,
 }
 
 /// What ingesting objects did.
@@ -454,7 +472,13 @@ impl Holder {
             leave_out: false,
             reached: BTreeMap::new(),
             reached_at: Self::dir(paths, &id).join("epochs.json"),
+            arrivals: Arrivals::default(),
+            arrivals_at: Self::dir(paths, &id).join("arrivals.json"),
         };
+        // No note, or one that cannot be read, is nobody told of yet.
+        if let Ok(bytes) = std::fs::read(&h.arrivals_at) {
+            h.arrivals = serde_json::from_slice(&bytes).unwrap_or_default();
+        }
         // No record, or one that cannot be read, is an epoch that reaches
         // this device now.
         if let Ok(bytes) = std::fs::read(&h.reached_at) {
@@ -1235,7 +1259,8 @@ impl Core {
         let who = self.not_contacts_in(space);
         let values = sp.state().reach_values(&me, 1);
         let since: Vec<EntryId> = values.iter().map(|v| v.entry).collect();
-        let after = sp.added_after(&since);
+        let due = self.spaces.get(space).map(|h| &h.arrivals.due);
+        let due = |m: &&[u8; 32]| due.is_some_and(|d| d.values().any(|w| *w == hex::encode(m)));
         let hosts = self.mailboxes();
         let endpoints = hosts.iter().flat_map(|(g, _)| g.endpoints.iter());
         let named = self.reach_of(space, &me);
@@ -1251,9 +1276,86 @@ impl Core {
             left: sp.has_left(&me),
             public: sp.is_public(),
             relationship: sp.profile() == Profile::RELATIONSHIP,
-            late: who.iter().filter(|m| after.contains(m)).copied().collect(),
+            late: who.iter().filter(due).copied().collect(),
             who,
             what: endpoints.map(|e| e.to_string()).collect(),
+        }
+    }
+
+    /// Notes the additions to a space this device has not looked at yet
+    /// ([`Arrivals`]). While the person's list there names no host there
+    /// is nobody to tell of, and nothing is noted: whoever is there when
+    /// they next share is whom they share with. While it names one, each
+    /// new addition is noted once. The person is to be told of someone who
+    /// is not their contact and came while the hosts were named: no entry
+    /// that began the naming has their addition in its past, so someone
+    /// who left and was added again counts. Anyone else needs no telling,
+    /// someone who is a contact now included: refusing them later does
+    /// not bring them back.
+    fn note_arrivals(&mut self, space: &SpaceId) {
+        let Some(me) = self.identity.as_ref().map(|i| i.id()) else {
+            return;
+        };
+        let Some(sp) = self.spaces.get(space).and_then(|h| h.space.as_ref()) else {
+            return;
+        };
+        let was = &self.spaces[space].arrivals;
+        let mut now = was.clone();
+        if cardinal_space::relationship::reach_of(sp, &me).is_empty() {
+            now.due.clear();
+        } else {
+            let adds = sp.judge().valid_adds().into_iter();
+            let noted = |add: &EntryId| {
+                let add = hex::encode(add);
+                was.told.contains(&add) || was.due.contains_key(&add)
+            };
+            let fresh: Vec<([u8; 32], EntryId)> = adds.filter(|(_, add)| !noted(add)).collect();
+            if fresh.is_empty() {
+                return;
+            }
+            let began = cardinal_space::relationship::naming_began(sp, &me);
+            let came = sp.added_after(&began);
+            let strangers = self.not_contacts_in(space);
+            for (who, add) in fresh {
+                if came.contains(&who) && strangers.contains(&who) {
+                    now.due.insert(hex::encode(add), hex::encode(who));
+                } else {
+                    now.told.insert(hex::encode(add));
+                }
+            }
+        }
+        if now != *was {
+            self.keep_arrivals(space, now);
+        }
+    }
+
+    fn keep_arrivals(&mut self, space: &SpaceId, now: Arrivals) {
+        let Some(h) = self.spaces.get_mut(space) else {
+            return;
+        };
+        h.arrivals = now;
+        h.version += 1;
+        let saved = serde_json::to_vec(&h.arrivals)
+            .map_err(std::io::Error::other)
+            .and_then(|bytes| crate::paths::write_private(&h.arrivals_at, &bytes, 0o600));
+        if let Err(e) = saved {
+            tracing::warn!("space {}: keeping who was told of: {e}", short(space));
+        }
+    }
+
+    /// The person has been told, on this device, of everyone added to a
+    /// space so far (`group-reach`): nobody there is left to tell of here.
+    /// Another of their devices tells them in its own time.
+    pub fn told_of_all(&mut self, space: &SpaceId) {
+        let Some(sp) = self.spaces.get(space).and_then(|h| h.space.as_ref()) else {
+            return;
+        };
+        let mut now = self.spaces[space].arrivals.clone();
+        now.due.clear();
+        let adds = sp.judge().valid_adds().into_iter();
+        now.told.extend(adds.map(|(_, add)| hex::encode(add)));
+        if now != self.spaces[space].arrivals {
+            self.keep_arrivals(space, now);
         }
     }
 
@@ -1439,6 +1541,7 @@ impl Core {
     /// know to be frozen (`spaces.md#distribution`).
     fn settle(&mut self, space: &SpaceId) {
         self.reload_unsaved(space);
+        self.note_arrivals(space);
         let Some(ident) = self.identity.as_ref() else {
             return;
         };
@@ -3114,8 +3217,7 @@ mod tests {
     /// at the same moment, one to their host and one to nothing. The empty
     /// one wins wherever a host is looked up, and a device of theirs that
     /// sees both sets the one result. Two lists that both name hosts are
-    /// set as one too, unless someone has come whom the person has not
-    /// answered about: then a `set` would answer for them.
+    /// set as one too, whoever has been added meanwhile (D69).
     #[test]
     fn of_two_lists_an_empty_one_wins_and_a_device_sets_the_result() {
         let [mut ana, mut bo, mut cy, _] = four();
@@ -3158,15 +3260,15 @@ mod tests {
         let t = bo.core.telling(&g);
         assert!(t.split && t.shared && t.settles());
         assert_eq!(bo.core.reach_of(&g, &me).len(), 2);
-        // Cy, whom he does not know, is added: until he has answered,
-        // nothing is set there, the one result included.
+        // Cy, whom he does not know, is added: he is to be told, and
+        // nothing waits for that, the one result included.
         let cy_shown = [(cy.id(), "Cy".to_owned())];
         let added = ana.core.add_to_group(&g, &cy_shown).unwrap();
         bo.takes(&g, &[added]);
         cy.takes(&g, &ana.all_of(&g));
         let t = bo.core.telling(&g);
         assert_eq!(t.added(), [cy.id()]);
-        assert!(t.split && !t.settles() && !t.keeps_current());
+        assert!(t.split && t.settles() && t.keeps_current());
     }
 
     /// D68 (`hosts.md#telling-others-where-to-reach-you`). The
@@ -3241,10 +3343,13 @@ mod tests {
         assert!(bo.core.former_hosts().is_empty());
     }
 
-    /// `hosts.md`, "Whoever is added later reads what is already there":
-    /// when someone who is not the person's contact is added to a space
-    /// where their reach node names their hosts, they are told, and until
-    /// they have answered software says nothing new there.
+    /// D69 (`hosts.md`, "A yes is to the space, and to whoever it comes to
+    /// hold"). When someone who is not the person's contact is added to a
+    /// space where their reach node names their hosts, they are told, and
+    /// offered to stop. Nothing waits for them: the list is kept current
+    /// as before. Whom they have been told of is this device's own note,
+    /// and setting the list again, as for an address that changed, does
+    /// not stand for it.
     #[test]
     fn whoever_is_added_where_hosts_are_named_is_told_of() {
         let [mut ana, mut bo, mut cy, mut dee] = four();
@@ -3271,21 +3376,31 @@ mod tests {
         assert_eq!(relationship::reach_of(cy.space(&g), &bo.id()).len(), 1);
         let t = bo.core.telling(&g);
         assert_eq!(t.added(), [cy.id()]);
-        // Nothing new is said there until he has answered, and nothing
-        // asks him as if it were not yet shared.
-        assert!(!t.keeps_current() && !t.ask() && !t.sets_unasked());
+        // Nothing waits for him: what the list names is kept current,
+        // and nothing asks him as if it were not yet shared.
+        assert!(t.keeps_current() && !t.ask() && !t.sets_unasked());
         let listed = crate::groups::list_of(&bo.core);
         let reach = &listed["groups"][0]["reach"];
         assert_eq!(reach["added"], serde_json::json!(["Cy"]), "{listed}");
         assert_eq!(reach["shared"], true);
 
-        // He keeps it: said again, in an entry that descends from the
-        // addition, and he has been told of everyone there.
+        // The list is set again, as his host does for a new token. He
+        // has still not been told of Cy, here or after a restart.
         let again = bo.says_reach(&g, true);
-        let t = bo.core.telling(&g);
-        assert!(t.added().is_empty() && t.keeps_current());
-        assert_eq!(t.who, [cy.id()]);
         ana.takes(&g, &[again]);
+        assert_eq!(bo.core.telling(&g).added(), [cy.id()]);
+        bo.restarts();
+        assert_eq!(bo.core.telling(&g).added(), [cy.id()]);
+        // He is told, on this device, which notes it: beside the space,
+        // not in it.
+        let entries = bo.space(&g).dag().len();
+        bo.core.told_of_all(&g);
+        let t = bo.core.telling(&g);
+        assert!(t.added().is_empty() && t.keeps_current() && t.shared);
+        assert_eq!(t.who, [cy.id()]);
+        assert_eq!(bo.space(&g).dag().len(), entries);
+        bo.restarts();
+        assert!(bo.core.telling(&g).added().is_empty());
 
         // Dee is added, and this time he empties it: nobody is left to
         // tell of, and Dee's being there is no news.
@@ -3299,6 +3414,11 @@ mod tests {
         dee.takes(&g, &ana.all_of(&g));
         dee.takes(&g, &bo.all_of(&g));
         assert!(relationship::reach_of(dee.space(&g), &bo.id()).is_empty());
+        // He shares again, with Cy and Dee there: they did not come while
+        // it was named, on this device or any other of his.
+        bo.says_reach(&g, true);
+        let t = bo.core.telling(&g);
+        assert!(t.shared && t.added().is_empty());
 
         // A contact who is added is nobody to tell of.
         let [mut eve, mut fay, mut gus, _] = four();
@@ -3512,15 +3632,28 @@ mod tests {
         let t = bo.core.telling(&g);
         assert_eq!(t.who, [cy.id()]);
         assert_eq!(t.added(), [cy.id()], "he is not told that Cy is back");
-        assert!(!t.keeps_current());
+        assert!(t.keeps_current());
         let listed = crate::groups::list_of(&bo.core);
         assert_eq!(
             listed["groups"][0]["reach"]["added"],
             serde_json::json!(["Cy"])
         );
-        // His answer covers Cy from then on.
-        bo.says_reach(&g, true);
+        // Told of Cy, he is told again if Cy leaves and comes back.
+        bo.core.told_of_all(&g);
         assert!(bo.core.telling(&g).added().is_empty());
+        cy.takes(&g, &ana.all_of(&g));
+        cy.says_reach(&g, false);
+        let (_, gone) = cy
+            .core
+            .write_entry(&g, relationship::leave_ops(&cy.id()))
+            .unwrap();
+        ana.takes(&g, &cy.all_of(&g));
+        bo.takes(&g, &[gone]);
+        assert!(bo.core.telling(&g).added().is_empty());
+        let again = ana.core.add_to_group(&g, &cy_shown).unwrap();
+        bo.takes(&g, &ana.all_of(&g));
+        let _ = again;
+        assert_eq!(bo.core.telling(&g).added(), [cy.id()]);
     }
 
     /// P11 (`hosts.md#telling-others-where-to-reach-you`). A public space
@@ -3681,12 +3814,12 @@ mod tests {
         cy.takes(&g, &ana.all_of(&g));
         bo.hosts_at("203.0.113.5:7171");
         let t = bo.core.telling(&g);
-        assert_eq!(t.late, [cy.id()]);
-        // Cy came since the list was set, and reads no host in it: there
-        // is nobody to tell of.
-        assert!(t.added().is_empty());
+        // Cy came while the list named no host: there is nobody to tell
+        // of.
+        assert!(t.added().is_empty() && t.late.is_empty());
         assert!(!t.ask() && !t.sets_unasked() && !t.keeps_current());
-        // He says so, with Cy there: it is named, and Cy is answered for.
+        // He says so, with Cy there: it is named, and Cy did not come
+        // while it was.
         bo.says_reach(&g, true);
         let t = bo.core.telling(&g);
         assert!(t.shared && !t.ask() && t.added().is_empty() && t.late.is_empty());

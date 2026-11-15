@@ -312,14 +312,14 @@ fn question(reach: &Json, name: &str) -> String {
     if reach["public"] == true {
         return format!(
             "{name} is public: anyone at all can read it, and would learn where your host is \
-             ({what}). Say whether to share it there: with it the members can leave you \
-             messages while you are away, and without it they reach you only through someone \
+             ({what}), now and whoever joins it later. Say whether to share it there: with \
+             it the members can leave you messages while you are away, and without it they reach you only through someone \
              in touch with both"
         );
     }
     format!(
-        "{} in {name} {} not a contact of yours, and would learn where your host is ({what}). \
-         Say whether to share it there: with it they can leave you messages while you \
+        "{} in {name} {} not a contact of yours, and would learn where your host is ({what}), \
+         as would anyone added later. Say whether to share it there: with it they can leave you messages while you \
          are away, and without it they reach you only through someone in touch with both",
         who.join(", "),
         if who.len() == 1 { "is" } else { "are" },
@@ -359,10 +359,11 @@ pub async fn join(d: &Arc<Daemon>, group: &str, reach: Option<bool>) -> anyhow::
 /// by setting their reach node there: to their hosts, or to an empty list.
 /// The list is their answer, and nothing else keeps one. A person may say
 /// no anywhere, among contacts too, and no device of theirs then fills it
-/// in again. A yes where the hosts are named already sets the list again,
-/// in an entry that descends from whoever has been added since: that is
-/// their answer about them. With no host a yes has nothing to share, and
-/// fails saying so: nothing is kept for when there is one.
+/// in again. A yes where the hosts are named already writes nothing in
+/// the group. Either way the person has now been told of everyone added
+/// there, and this device notes it: `added` is empty here afterwards.
+/// With no host a yes has nothing to share, and fails saying so: nothing
+/// is kept for when there is one.
 pub async fn set_reach(d: &Arc<Daemon>, group: &str, share: bool) -> anyhow::Result<Json> {
     use crate::mailbox::Shared;
     let g = joined(d, group)?;
@@ -374,11 +375,12 @@ pub async fn set_reach(d: &Arc<Daemon>, group: &str, share: bool) -> anyhow::Res
         if t.shared || t.split || !t.set {
             crate::mailbox::say_reach(d, &g.id, false).await?;
         }
+        d.core().told_of_all(&g.id);
         d.bump();
         return Ok(json!({"shared": false}));
     }
     match crate::mailbox::share_reach(d, &g.id).await? {
-        Shared::Named => {}
+        Shared::Named => d.core().told_of_all(&g.id),
         Shared::NoHost => anyhow::bail!(
             "you have no always-on device, so there is nothing to share with {}. Nothing was              changed, and nothing is kept for later: say so again once you have one",
             g.name

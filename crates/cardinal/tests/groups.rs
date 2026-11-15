@@ -532,10 +532,13 @@ fn an_answer_about_hosts_is_kept_and_a_later_arrival_is_told_of() {
     assert_eq!(r["what"], json!([at]), "{r}");
     let listed = bo.cli(&["groups"]);
     assert!(
-        listed.contains("Cy, in Choir and not a contact of yours, can see"),
+        listed.contains("Cy was added to Choir and is not a contact of yours"),
         "{listed}"
     );
     assert!(listed.contains(&at), "{listed}");
+    // Nothing waits for him meanwhile, and nothing answers for him.
+    std::thread::sleep(std::time::Duration::from_secs(3));
+    assert_eq!(reach_in(&bo, &g)["added"], json!(["Cy"]));
     // He keeps it: told once, and not again.
     ask(
         &bo,

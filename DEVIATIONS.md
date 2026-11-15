@@ -1316,9 +1316,6 @@ asks for around that is not built yet.
   - **Reading: what an empty list is.** A value that is no list, or was
     cleared, reads as an empty one, and wins like one. A list whose
     entries cannot be read is not empty.
-  - **Reading: two lists that both name hosts, while someone is in
-    `added`.** Setting the one result would be the person's answer about
-    them, so the device waits for it.
   - **Reading: `ask` once joined.** A list that is set, empty or not, is
     the person's answer, so `ask` is true only for an offer, or where they
     are in the space and never set it. A person who takes up a host later
@@ -1329,15 +1326,29 @@ asks for around that is not built yet.
     fails and writes nothing. `group-join` among contacts joins with an
     empty list, says `shared` false, and nothing names the host later:
     before D68 software filled it in once the host was in reach.
-- **Whoever is added later** (`hosts.md`, "Whoever is added later reads
-  what is already there"). Where this person's reach node names their
+- **Whoever is added later** (D69, `hosts.md`, "A yes is to the space, and
+  to whoever it comes to hold"). Where this person's reach node names their
   hosts, `groups` names in `reach.added` each member who is not their
-  contact and has no valid `add_member` in the causal past of the entry
-  that last set the list, and `cardinal groups` says who can see what, and
-  how to stop or go on. While it names anyone, software sets nothing in
-  that reach node. The person's answer is the next `set`: `group-reach`
-  with `share` true sets the list again as it is, `share` false empties it.
-  Nothing is stored to remember who was told.
+  contact, came while the hosts were named, and of whom this device has
+  not told them; `cardinal groups` says who can see what, and how to stop.
+  Nothing waits for it: the list is kept current all the while.
+  `group-reach`, with `share` true or false, notes everyone added so far
+  as told of on this device, and with `share` true and nothing to add to
+  the list writes nothing in the group.
+  - **The note** is `arrivals.json` beside the space's entries
+    (`core.rs` `Arrivals`), per device, never synced. A device set up
+    later, or one whose note is lost, tells of everyone who came while the
+    hosts were named.
+  - **Reading: "came while their hosts were named".** No entry that began
+    the naming as it stands has the addition in its causal past
+    (`relationship::naming_began`): a `set` to a list with a host where
+    the list before was empty or unset. So whoever was there when the
+    person shared is not told of on any device, someone added at the same
+    moment as the sharing is, and setting the list again for a token or an
+    address changes nothing.
+  - **Reading: who is a contact** is judged when the device first sees the
+    addition with the hosts named. Someone who was a contact then and is
+    refused later is not told of as added.
   - **Refusing someone** is asked about as part of refusing and is not
     tracked: `contact` with `setting` `refuse` answers with `reach`, the
     groups that person is in where this person's hosts are named, each
