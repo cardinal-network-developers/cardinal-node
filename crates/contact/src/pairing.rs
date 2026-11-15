@@ -211,11 +211,9 @@ impl Paired {
         let endpoint = &self.peer.endpoint;
         let at = endpoint.socket_addr().zip(endpoint.carrier());
         let (addr, carrier) = at.ok_or(ContactError::Unusable("link endpoint"))?;
-        Ok(
-            Target::new(addr, carrier, &self.peer.link_key)
-                .with_secret(&self.link_secret[..])
-                .expect(self.expected()),
-        )
+        Ok(Target::new(addr, carrier, &self.peer.link_key)
+            .with_secret(&self.link_secret[..])
+            .expect(self.expected()))
     }
 }
 

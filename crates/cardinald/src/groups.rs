@@ -243,9 +243,10 @@ pub fn remove(d: &Arc<Daemon>, group: &str, who: &str) -> anyhow::Result<Json> {
 /// reach node to an empty list, so that the group stops naming their hosts
 /// to whoever is in it or comes to it later
 /// (`spaces.md#members-and-roles`). It ends the tokens they gave out
-/// there, and takes back their answer about their hosts: an offer of the
-/// group asks afresh. From then on this device does nothing with the
-/// group, and the others send it nothing more.
+/// there. The empty list is all that is left of what they said about
+/// their hosts there: an offer of the group asks afresh. From then on this
+/// device does nothing with the group, and the others send it nothing
+/// more.
 pub fn leave(d: &Arc<Daemon>, group: &str) -> anyhow::Result<Json> {
     let g = joined(d, group)?;
     let me = identity(d)?;
@@ -256,21 +257,9 @@ pub fn leave(d: &Arc<Daemon>, group: &str) -> anyhow::Result<Json> {
         anyhow::ensure!(sp.role_of(&me).is_some(), "you are not in {}", g.name);
     }
     d.write_and_push(&g.id, relationship::leave_ops(&me))?;
-    answer(d, &g, None)?;
     crate::mailbox::revoke_left(d, &g.id);
     d.bump();
     Ok(json!({}))
-}
-
-/// Keeps this person's answer to whether their reach node in a group names
-/// their hosts, with the space in their account, or takes it back
-/// (`profiles.md#account`). Each of their devices goes by it.
-fn answer(d: &Arc<Daemon>, g: &Found, names_hosts: Option<bool>) -> anyhow::Result<()> {
-    let ops = d.core().answer_ops(&g.id, &g.name, names_hosts);
-    if let Some((account, ops)) = ops {
-        d.write_and_push(&account, ops)?;
-    }
-    Ok(())
 }
 
 /// What is said of this person's reach node in a group, for a client to
@@ -293,6 +282,21 @@ fn telling_json(core: &Core, id: &SpaceId, me: &[u8; 32]) -> Json {
         "added": names(t.added()),
         "public": t.public,
     })
+}
+
+/// The groups where someone this person refuses still reads where their
+/// hosts are, for a client to ask about as part of refusing: each group's
+/// id and name, and what is seen there.
+pub fn naming_hosts_to(core: &Core, who: &[u8; 32]) -> Json {
+    let groups = core.groups_naming_hosts_to(who).into_iter();
+    let all: Vec<Json> = groups
+        .filter_map(|id| {
+            let sp = core.spaces.get(&id)?.space.as_ref()?;
+            let name = group::name(sp);
+            Some(json!({"group": hex::encode(id), "name": name, "what": core.telling(&id).what}))
+        })
+        .collect();
+    json!(all)
 }
 
 /// What the person has to be asked, in words.
@@ -328,8 +332,9 @@ fn question(reach: &Json, name: &str) -> String {
 /// to have them. Where someone in the group is not a contact of theirs, and
 /// they have a host, that is theirs to say: `reach` is their answer, and
 /// without it nothing is written. Anywhere, among contacts too, `reach` is
-/// their answer if they give one, and it is kept with the space in their
-/// account.
+/// their answer if they give one. The list it sets is where the answer is
+/// kept, and the only place: `shared` in what comes back says whether it
+/// names a host.
 pub async fn join(d: &Arc<Daemon>, group: &str, reach: Option<bool>) -> anyhow::Result<Json> {
     let g = find(d, group)?;
     if g.joined {
@@ -345,34 +350,46 @@ pub async fn join(d: &Arc<Daemon>, group: &str, reach: Option<bool>) -> anyhow::
         "{}",
         question(&telling, &g.name)
     );
-    if reach.is_some() {
-        answer(d, &g, reach)?;
-    }
-    crate::mailbox::say_reach(d, &g.id, t.joins_sharing(reach)).await?;
+    let shared = crate::mailbox::say_reach(d, &g.id, t.joins_sharing(reach)).await?;
     d.bump();
-    Ok(json!({"group": hex::encode(g.id), "name": g.name}))
+    Ok(json!({"group": hex::encode(g.id), "name": g.name, "shared": shared}))
 }
 
-/// Says whether the members of a group have where this person's hosts are:
-/// keeps the answer with the space in their account, and sets their reach
-/// node there to their hosts, or empties it. A person may say no anywhere,
-/// among contacts too, and no device of theirs then fills it in again. A
-/// yes where the hosts are named already says so again, in an entry that
-/// descends from whoever has been added since: the person was told of
-/// them, and keeps what is shared.
+/// Says whether the members of a group have where this person's hosts are,
+/// by setting their reach node there: to their hosts, or to an empty list.
+/// The list is their answer, and nothing else keeps one. A person may say
+/// no anywhere, among contacts too, and no device of theirs then fills it
+/// in again. A yes where the hosts are named already sets the list again,
+/// in an entry that descends from whoever has been added since: that is
+/// their answer about them. With no host a yes has nothing to share, and
+/// fails saying so: nothing is kept for when there is one.
 pub async fn set_reach(d: &Arc<Daemon>, group: &str, share: bool) -> anyhow::Result<Json> {
+    use crate::mailbox::Shared;
     let g = joined(d, group)?;
-    let t = d.core().telling(&g.id);
-    answer(d, &g, Some(share))?;
-    if share && t.shared {
-        if !t.added().is_empty() {
-            crate::mailbox::say_reach_again(d, &g.id).await?;
+    if !share {
+        let t = d.core().telling(&g.id);
+        // An empty list that is the only one there says it already. One
+        // never set does not: there software would still set it on its
+        // own, among contacts.
+        if t.shared || t.split || !t.set {
+            crate::mailbox::say_reach(d, &g.id, false).await?;
         }
-    } else if share != t.shared && (share || t.set) {
-        crate::mailbox::say_reach(d, &g.id, share).await?;
+        d.bump();
+        return Ok(json!({"shared": false}));
+    }
+    match crate::mailbox::share_reach(d, &g.id).await? {
+        Shared::Named => {}
+        Shared::NoHost => anyhow::bail!(
+            "you have no always-on device, so there is nothing to share with {}. Nothing was              changed, and nothing is kept for later: say so again once you have one",
+            g.name
+        ),
+        Shared::OutOfReach => anyhow::bail!(
+            "your always-on device cannot be reached from this device now, so it cannot be              shared with {} yet. Nothing was changed: try again when it can be reached",
+            g.name
+        ),
     }
     d.bump();
-    Ok(json!({}))
+    Ok(json!({"shared": true}))
 }
 
 /// Says no to a group offered to this person. Nothing is written in it, and

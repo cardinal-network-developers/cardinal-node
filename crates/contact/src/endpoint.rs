@@ -139,9 +139,17 @@ mod tests {
     fn what_cannot_be_used_is_kept() {
         let ip = Value::from([192u8, 0, 2, 1]);
         for r in [
-            Record::new().with(1, [0x52u8; 8]).with(2, "by its document"),
-            Record::new().with(1, 3u64).with(2, ip.clone()).with(3, 7u64),
-            Record::new().with(1, 1u64).with(2, vec![7u8; 6]).with(3, 7u64),
+            Record::new()
+                .with(1, [0x52u8; 8])
+                .with(2, "by its document"),
+            Record::new()
+                .with(1, 3u64)
+                .with(2, ip.clone())
+                .with(3, 7u64),
+            Record::new()
+                .with(1, 1u64)
+                .with(2, vec![7u8; 6])
+                .with(3, 7u64),
             Record::new().with(1, 1u64).with(2, ip).with(3, 70_000u64),
         ] {
             let e = EndpointAddr::from_record(&r);

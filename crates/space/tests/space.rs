@@ -2,6 +2,7 @@
 //! person's devices.
 
 use cardinal_crypto::{HybridKeyPair, RecoveryPhrase};
+use cardinal_encoding::Record;
 use cardinal_identity::{Created, DeviceKeys, IdentityLog, Power};
 use cardinal_space::account::{self, Retention};
 use cardinal_space::files::{self, Content, FileKind, Files};
@@ -343,16 +344,15 @@ fn removed_device_and_rotation() {
     assert!(!a.validity().is_valid(&last));
 }
 
-/// `hosts.md#telling-others-where-to-reach-you`: a person who refuses
-/// someone is told where that someone reads their hosts, on each of their
-/// devices until one has their answer. The refusal and the answer are both
-/// in the account, and an answer is one to the refusal only if it was
-/// written by a device that had it.
+/// D68 (`profiles.md#account`, kind 2). A space record no longer holds an
+/// answer about hosts: field 5, where an earlier version kept one, is not
+/// a field of it. A record that has it reads as any other, and a refusal
+/// written beside it changes nothing about the space.
 #[test]
-fn a_refusal_waits_for_an_answer_written_after_it() {
-    use cardinal_space::account::{refused_since_answer, Regard, NAMES_HOSTS, REFUSED};
+fn an_answer_an_earlier_version_kept_in_the_account_is_not_read() {
+    use cardinal_space::account::{Regard, REFUSED};
     let p = person(5, 1);
-    let (d0, d1) = (&p.devices[0], &p.devices[1]);
+    let d0 = &p.devices[0];
     let (mut acct, _) = Space::create(
         Profile::ACCOUNT,
         Policy::default(),
@@ -362,73 +362,27 @@ fn a_refusal_waits_for_an_answer_written_after_it() {
         None,
     )
     .unwrap();
-    let (club, choir, cy, dee) = ([1u8; 32], [2u8; 32], [3u8; 32], [4u8; 32]);
+    let (club, choir, cy) = ([1u8; 32], [2u8; 32], [3u8; 32]);
+    let old = |space: [u8; 32], name: &str, yes: bool| {
+        let record = Record::new().with(1, space).with(2, name).with(5, yes);
+        SpaceOp::create(NodeKind::Uint(account::SPACE), ROOT, name, record)
+    };
     let ops = vec![
         account::create_contact(&cy, "Cy", &[7; 32], Regard::default()),
-        account::create_contact(&dee, "Dee", &[8; 32], Regard::default()),
-        account::create_answered(&club, "Garden club", true),
-        account::create_space(&choir, "Choir"),
+        old(club, "Garden club", true),
+        old(choir, "Choir", false),
+        account::create_space(&[9; 32], "Band"),
     ];
     let (made, _) = acct.write_entry(&p.log, &d0.signing, ops, None).unwrap();
-    let node = |k| files::created_node(&made, k);
-    // Nobody is refused: nothing to answer, in a space with an answer or
-    // in one without.
-    assert!(refused_since_answer(&acct, &club).is_empty());
-    assert!(refused_since_answer(&acct, &choir).is_empty());
-
-    // Cy is refused. The yes on record was given before, and is no answer
-    // to that; and a space with no answer has none either.
-    let refuse = |who, yes: bool| vec![account::set_field(node(who), REFUSED, yes)];
-    let (refusal, _) = acct
-        .write_entry(&p.log, &d0.signing, refuse(0, true), None)
-        .unwrap();
-    assert_eq!(refused_since_answer(&acct, &club), [cy]);
-    assert_eq!(refused_since_answer(&acct, &choir), [cy]);
-    assert_eq!(refused_since_answer(&acct, &[9; 32]), [cy]);
-
-    // Another device answers without having the refusal: beside it, not
-    // after it. The person has not answered about Cy.
-    let yes = |space| vec![account::set_field(node(space), NAMES_HOSTS, true)];
-    let (beside, _) = acct
-        .write_concurrent(&p.log, &d1.signing, &[refusal], yes(2), None)
-        .unwrap();
-    assert!(acct.state().is_accepted(&beside));
-    assert_eq!(account::names_hosts(acct.state(), &club), Some(true));
-    assert_eq!(refused_since_answer(&acct, &club), [cy]);
-
-    // An answer from a device that has the refusal is the answer, whatever
-    // it says, and only for the space it is about.
-    let no = vec![account::set_field(node(2), NAMES_HOSTS, false)];
-    acct.write(&p.log, &d1.signing, no, None).unwrap();
-    assert!(refused_since_answer(&acct, &club).is_empty());
-    assert_eq!(refused_since_answer(&acct, &choir), [cy]);
-    // An answer that was taken back is none.
-    let ops = vec![SpaceOp::set(node(3), NAMES_HOSTS, None)];
-    acct.write(&p.log, &d0.signing, ops, None).unwrap();
-    assert_eq!(refused_since_answer(&acct, &choir), [cy]);
-    acct.write(&p.log, &d0.signing, yes(3), None).unwrap();
-    assert!(refused_since_answer(&acct, &choir).is_empty());
-
-    // Refused again after the answer, there is no answer to that; a
-    // refusal taken back needs none; and each contact is answered apart.
-    acct.write(&p.log, &d0.signing, refuse(0, false), None)
-        .unwrap();
-    acct.write(&p.log, &d0.signing, refuse(1, true), None)
-        .unwrap();
-    assert_eq!(refused_since_answer(&acct, &club), [dee]);
-    acct.write(&p.log, &d0.signing, refuse(0, true), None)
-        .unwrap();
-    let mut both = refused_since_answer(&acct, &club);
-    both.sort();
-    assert_eq!(both, [cy, dee]);
-    // Said again as it was, the answer comes after both.
-    let ops = account::answer_ops(acct.state(), &club, "Garden club", Some(false), false);
-    assert!(ops.is_empty());
-    let ops = account::answer_ops(acct.state(), &club, "Garden club", Some(false), true);
-    assert_eq!(ops.len(), 1);
-    acct.write(&p.log, &d0.signing, ops, None).unwrap();
-    assert!(refused_since_answer(&acct, &club).is_empty());
-    assert_eq!(account::names_hosts(acct.state(), &club), Some(false));
+    let refuse = account::set_field(files::created_node(&made, 0), REFUSED, true);
+    acct.write(&p.log, &d0.signing, vec![refuse], None).unwrap();
+    let mut read: Vec<(String, bool)> = account::spaces(acct.state())
+        .into_iter()
+        .map(|s| (s.name, s.declined))
+        .collect();
+    read.sort();
+    let names = ["Band", "Choir", "Garden club"];
+    assert_eq!(read, names.map(|n| (n.to_owned(), false)));
 }
 
 #[test]

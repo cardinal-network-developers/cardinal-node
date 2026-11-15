@@ -73,10 +73,7 @@ impl Endpoint {
 
     /// Whether the carrier is one this version knows: UDP or TCP.
     fn known_carrier(&self) -> bool {
-        matches!(
-            self.record.get(1).and_then(Value::as_uint),
-            Some(UDP | TCP)
-        )
+        matches!(self.record.get(1).and_then(Value::as_uint), Some(UDP | TCP))
     }
 
     /// The address or host name, if this version can use the endpoint.
@@ -245,7 +242,10 @@ mod tests {
     #[test]
     fn addresses_read_from_what_a_person_types() {
         let e = Endpoint::parse("nuc.lan:7171").unwrap();
-        assert_eq!((e.host().as_deref(), e.port()), (Some("nuc.lan"), Some(7171)));
+        assert_eq!(
+            (e.host().as_deref(), e.port()),
+            (Some("nuc.lan"), Some(7171))
+        );
         assert!(e.usable());
         assert_eq!(Endpoint::parse("nuc.lan"), None);
         assert_eq!(Endpoint::parse(":7171"), None);

@@ -636,17 +636,22 @@ fn open_envelope(envelope: &[u8], key: &[u8; 32]) -> Option<Notice> {
     }
 }
 
-/// Gets a token from each of this person's hosts it can reach.
-async fn reach_here(d: &Arc<Daemon>) -> Vec<Reach> {
+/// This person's hosts that `named` does not name, each with a fresh token
+/// registered at it, in the order the account gives them. A host that
+/// cannot be reached from here now gives no token, and is left out.
+async fn reach_here(d: &Arc<Daemon>, named: &[Reach]) -> Vec<Reach> {
     let me = d.keys.key();
     let hosts = d.core().mailboxes();
     let mut reach = Vec::new();
     for (grant, device) in hosts {
+        let host = *grant.link_key.x25519();
+        if named.iter().any(|r| r.host == host) {
+            continue;
+        }
         let token: Token = random_bytes();
         if device == me {
             register(d, &token);
         } else {
-            let host = *grant.link_key.x25519();
             let at_host = |s: &Session| s.peer_static() == host;
             let Some(s) = d.own_sessions().into_iter().find(at_host) else {
                 continue;
@@ -662,29 +667,34 @@ async fn reach_here(d: &Arc<Daemon>) -> Vec<Reach> {
         }
         reach.push(Reach {
             endpoints: grant.endpoints,
-            host: *grant.link_key.x25519(),
+            host,
             token,
         });
     }
     reach
 }
 
+fn me(d: &Daemon) -> anyhow::Result<[u8; 32]> {
+    let me = d.core().identity.as_ref().map(|i| i.id());
+    me.ok_or_else(|| anyhow::anyhow!("this device has no identity"))
+}
+
 /// Sets this person's reach node in a space now: to their hosts, each with
 /// a fresh token for this space, or to an empty list if they have none or
 /// `share` is false (`contact.md#accepting`, step 5; `profiles.md#group`).
-/// This is how a relationship or a group is accepted, and it is said
-/// without asking only where the caller knows it may be
-/// ([`write_reach`] has the rule).
-pub async fn say_reach(d: &Arc<Daemon>, space: &SpaceId, share: bool) -> anyhow::Result<()> {
+/// This is how a relationship or a group is accepted. Naming a host is the
+/// person's act, or their joining among contacts: the caller knows which
+/// ([`write_reach`] has what software does on its own). Says whether the
+/// list names a host afterwards.
+pub async fn say_reach(d: &Arc<Daemon>, space: &SpaceId, share: bool) -> anyhow::Result<bool> {
     let _one = d.mailbox.reaching.lock().await;
     say_reach_locked(d, space, share).await
 }
 
-async fn say_reach_locked(d: &Arc<Daemon>, space: &SpaceId, share: bool) -> anyhow::Result<()> {
-    let me = d.core().identity.as_ref().map(|i| i.id());
-    let me = me.ok_or_else(|| anyhow::anyhow!("this device has no identity"))?;
+async fn say_reach_locked(d: &Arc<Daemon>, space: &SpaceId, share: bool) -> anyhow::Result<bool> {
+    let me = me(d)?;
     let reach = if share {
-        reach_here(d).await
+        reach_here(d, &[]).await
     } else {
         Vec::new()
     };
@@ -693,51 +703,111 @@ async fn say_reach_locked(d: &Arc<Daemon>, space: &SpaceId, share: bool) -> anyh
         // what the node named before is in use no longer
         revoke_left(d, space);
     }
-    Ok(())
+    Ok(!reach.is_empty())
 }
 
-/// Sets this person's reach node in a space again to what it says now, so
-/// that the entry that says it descends from everyone who has been added
-/// since: the person was told of them, and keeps what is shared.
-pub async fn say_reach_again(d: &Arc<Daemon>, space: &SpaceId) -> anyhow::Result<()> {
+/// What became of the person's saying that a space's members may have
+/// where their hosts are.
+pub enum Shared {
+    /// The list names their hosts.
+    Named,
+    /// They have no host: there is nothing to share, and nothing was
+    /// written or kept for later.
+    NoHost,
+    /// They have one, and it cannot be reached from this device now to
+    /// give out a token: nothing was written.
+    OutOfReach,
+}
+
+/// The person says, on this device, that a space's members may have where
+/// their hosts are (`group-reach`). What the list names already stays, in
+/// its order, and each host of theirs it does not name is added after,
+/// with a fresh token. The list is set even if nothing is added to it:
+/// said now, it is also their answer about whoever came since it was last
+/// set, and it is the one result where it held two.
+///
+/// With no host there is nothing to share and nothing is written: an
+/// answer is not kept for a host they may take up later
+/// (`hosts.md#telling-others-where-to-reach-you`).
+pub async fn share_reach(d: &Arc<Daemon>, space: &SpaceId) -> anyhow::Result<Shared> {
     let _one = d.mailbox.reaching.lock().await;
-    let me = d.core().identity.as_ref().map(|i| i.id());
-    let me = me.ok_or_else(|| anyhow::anyhow!("this device has no identity"))?;
-    let reach = d.core().reach_of(space, &me);
-    d.write_and_push(space, vec![relationship::set_reach(&me, &reach)])?;
-    Ok(())
+    let me = me(d)?;
+    let t = d.core().telling(space);
+    if !t.hosted && !t.shared {
+        return Ok(Shared::NoHost);
+    }
+    let mut reach = d.core().reach_of(space, &me);
+    let more = reach_here(d, &reach).await;
+    if reach.is_empty() && more.is_empty() {
+        return Ok(Shared::OutOfReach);
+    }
+    let again = !t.added().is_empty() || t.split;
+    if !more.is_empty() || again {
+        reach.extend(more);
+        d.write_and_push(space, vec![relationship::set_reach(&me, &reach)])?;
+    }
+    Ok(Shared::Named)
 }
 
-/// Says where this person is reached about a space, where software may say
-/// so unasked (`hosts.md#telling-others-where-to-reach-you`,
-/// [`Telling::sets_unasked`](crate::core::Telling::sets_unasked)): in a
-/// space whose other members are all this person's contacts, who have a
-/// host of theirs already, and wherever the person said yes. Never where
-/// they said no: their answer is kept in their account, so that no device
-/// fills in what another emptied. In any other space only the person's
-/// answer sets it (`group-join`, `group-reach`); what they chose to share
-/// is then kept current by [`renew_reach`].
+/// What software does to this person's reach node in a space on its own
+/// (`hosts.md#telling-others-where-to-reach-you`,
+/// [`Telling`](crate::core::Telling)). It never names a host where the
+/// list is set and names none, among contacts either: an empty list may be
+/// the person's no, written on another of their devices, and nothing else
+/// records it.
+///
+/// - Where they have left and it names a host, it is emptied.
+/// - Where it holds two lists, set at the same moment, the one result is
+///   set: empty if either is.
+/// - A host that serves the person no longer is taken out of a list that
+///   names it.
+/// - Among contacts, a list never set is set, which is how whoever made a
+///   space joins it; and in a relationship a host the list does not name
+///   is added, after those it names.
+///
+/// A token that has gone and an address that changed are the host's own
+/// to set ([`renew_reach`]). In any other case only the person's act sets
+/// the list (`group-join`, `group-reach`).
 pub async fn write_reach(d: &Arc<Daemon>, space: &SpaceId) -> anyhow::Result<()> {
     // One at a time: two that both found none would each register a token and
     // write, and leave a token that leads nowhere.
     let _one = d.mailbox.reaching.lock().await;
     let t = d.core().telling(space);
     if t.empties_unasked() {
-        // The person said no, or left, and another of their devices had
-        // not heard.
-        return say_reach_locked(d, space, false).await;
+        // The person left, and another of their devices had not heard.
+        return say_reach_locked(d, space, false).await.map(|_| ());
+    }
+    let Ok(me) = me(d) else {
+        return Ok(());
+    };
+    let named = d.core().reach_of(space, &me);
+    if t.settles() {
+        d.write_and_push(space, vec![relationship::set_reach(&me, &named)])?;
+        if named.is_empty() {
+            revoke_left(d, space);
+        }
+        return Ok(());
+    }
+    if t.keeps_current() {
+        let former = d.core().former_hosts();
+        let serving = |r: &&Reach| !former.contains(&r.host);
+        let kept: Vec<Reach> = named.iter().filter(serving).cloned().collect();
+        if kept.len() != named.len() {
+            d.write_and_push(space, vec![relationship::set_reach(&me, &kept)])?;
+            return Ok(());
+        }
     }
     if !t.sets_unasked() {
         return Ok(());
     }
-    let me = d.core().identity.as_ref().map(|i| i.id());
-    let me = me.ok_or_else(|| anyhow::anyhow!("this device has no identity"))?;
-    let reach = reach_here(d).await;
+    let more = reach_here(d, &named).await;
     // A host that cannot be reached now gives no token. The empty list
     // that leaves is said once, and not again each time this looks.
-    if !t.worth_saying(reach.len()) {
+    if !t.worth_saying(more.len()) {
         return Ok(());
     }
+    let mut reach = named;
+    reach.extend(more);
     d.write_and_push(space, vec![relationship::set_reach(&me, &reach)])?;
     Ok(())
 }
@@ -819,8 +889,10 @@ pub fn revoke_refused(d: &Daemon) {
 /// reach node names it: a fresh token for anyone whose token here has gone
 /// and who is not refused now (a revoked token never comes back), and the
 /// addresses its grant gives now. A contact away from home tries only the
-/// addresses a reach node names. A reach node that names no host is left
-/// as it is: that was its person's answer, or [`write_reach`]'s to change.
+/// addresses a reach node names. Each host stays where it is in the list,
+/// whose order is its person's, and another host's part is written as it
+/// was read. A reach node that names no host is left as it is: that was
+/// its person's answer.
 fn renew_reach(d: &Arc<Daemon>) {
     if !d.config().host {
         return;

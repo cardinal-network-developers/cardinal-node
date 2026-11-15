@@ -5,8 +5,7 @@ use cardinal_encoding::{Record, Value};
 use cardinal_identity::{EntryId, KeyId};
 
 use crate::entry::{IdentityId, NodeId, NodeKind, SpaceId, SpaceOp};
-use crate::space::Space;
-use crate::state::{Node, State, ROOT};
+use crate::state::{State, ROOT};
 
 /// Contact kind.
 pub const CONTACT: u64 = 1;
@@ -218,99 +217,6 @@ pub fn create_declined(space: &SpaceId, local_name: &str) -> SpaceOp {
     )
 }
 
-/// The field of a space node that holds this person's answer to whether
-/// their reach node in that space names their hosts
-/// (`profiles.md#account`): absent while they have not been asked.
-pub const NAMES_HOSTS: u64 = 5;
-
-/// `create` of a space node that holds this person's answer to whether
-/// their reach node there names their hosts.
-pub fn create_answered(space: &SpaceId, local_name: &str, names_hosts: bool) -> SpaceOp {
-    SpaceOp::create(
-        NodeKind::Uint(SPACE),
-        ROOT,
-        local_name,
-        Record::new()
-            .with(1, *space)
-            .with(2, local_name)
-            .with(NAMES_HOSTS, names_hosts),
-    )
-}
-
-/// What records this person's answer for a space, or with `None` takes it
-/// back, so that they have not been asked: a `set` on every node the
-/// account has for the space, or a new node if it has none and there is an
-/// answer to keep. An answer the account has already is written only if it
-/// is given `again`: the person was told something since, and what they
-/// say now is their answer to that, which the entry's place says
-/// ([`refused_since_answer`]).
-pub fn answer_ops(
-    state: &State,
-    space: &SpaceId,
-    local_name: &str,
-    names_hosts: Option<bool>,
-    again: bool,
-) -> Vec<SpaceOp> {
-    let all = spaces(state).into_iter();
-    let nodes: Vec<SpaceRecord> = all.filter(|s| s.space == *space).collect();
-    match (nodes.is_empty(), names_hosts) {
-        (true, Some(answer)) => vec![create_answered(space, local_name, answer)],
-        (true, None) => Vec::new(),
-        (false, answer) => nodes
-            .iter()
-            .filter(|n| again || n.names_hosts != answer)
-            .map(|n| SpaceOp::set(n.node, NAMES_HOSTS, answer.map(Value::from)))
-            .collect(),
-    }
-}
-
-/// The contacts this person refused and has given no answer for `space`
-/// since: the entry that refused them is not in the past of any entry that
-/// wrote an answer the account has for the space. A person who refuses
-/// someone in a space where their hosts are named is told, as of someone
-/// added there, until a device has their answer
-/// (`hosts.md#telling-others-where-to-reach-you`). The refusal and the
-/// answer are both in the account, so each of their devices finds the same.
-pub fn refused_since_answer(account: &Space, space: &SpaceId) -> Vec<IdentityId> {
-    let (state, dag) = (account.state(), account.dag());
-    let top = state.children(&ROOT);
-    let is = |n: &Node, kind: u64| n.kind == NodeKind::Uint(kind) && !n.deleted;
-    let of_space = |n: &Node| last(n, 1).and_then(Value::as_bytes) == Some(&space[..]);
-    let records = top.iter().filter(|n| is(n, SPACE) && of_space(n));
-    let said = records.flat_map(|n| n.values(NAMES_HOSTS));
-    let answers: Vec<EntryId> = said
-        .filter(|v| v.value.as_ref().and_then(Value::as_bool).is_some())
-        .map(|v| v.entry)
-        .collect();
-    let contacts = top.iter().filter(|n| is(n, CONTACT));
-    contacts
-        .filter_map(|n| {
-            // what the contact's record says now, and the entry that said it
-            let stands = n.values(REFUSED).iter().rev().find(|v| v.value.is_some())?;
-            let refused = stands.value.as_ref().and_then(Value::as_bool) == Some(true);
-            let answered = |a: &EntryId| dag.is_ancestor_or_self(&stands.entry, a);
-            let who: IdentityId = last(n, 1)?.as_bytes()?.try_into().ok()?;
-            (refused && !answers.iter().any(answered)).then_some(who)
-        })
-        .collect()
-}
-
-/// This person's answer to whether their reach node in a space names
-/// their hosts: `None` while they have not been asked. No wins: where the
-/// account says both, as it can when two devices answered at the same
-/// moment, the hosts are not named.
-pub fn names_hosts(state: &State, space: &SpaceId) -> Option<bool> {
-    let all = spaces(state).into_iter();
-    let answers: Vec<bool> = all
-        .filter(|s| s.space == *space)
-        .filter_map(|s| s.names_hosts)
-        .collect();
-    match answers.as_slice() {
-        [] => None,
-        said => Some(said.iter().all(|yes| *yes)),
-    }
-}
-
 /// `create` of a placement under a space node.
 pub fn create_placement(
     space_node: NodeId,
@@ -388,10 +294,6 @@ pub struct SpaceRecord {
     pub placements: Vec<PlacementRecord>,
     /// An offer of it that this person said no to (`profiles.md#group`).
     pub declined: bool,
-    /// Their answer to whether their reach node there names their hosts;
-    /// `None` while they have not been asked. No wins among the values of
-    /// a field in conflict.
-    pub names_hosts: Option<bool>,
 }
 
 fn last(n: &crate::state::Node, key: u64) -> Option<&Value> {
@@ -581,6 +483,17 @@ pub fn hosts(state: &State) -> Vec<HostRecord> {
         .collect()
 }
 
+/// The grant of every host node the account ever had, deleted ones too: a
+/// host that stopped serving is told by its grant having been taken back,
+/// and one never heard of has none here.
+pub fn hosts_ever(state: &State) -> Vec<Vec<u8>> {
+    let all = state.children(&ROOT).into_iter();
+    all.filter(|n| n.kind == NodeKind::Uint(HOST))
+        .flat_map(|n| n.values(1).iter())
+        .filter_map(|v| Some(v.value.as_ref()?.as_bytes()?.to_vec()))
+        .collect()
+}
+
 /// The name of a device, if the account space has one.
 pub fn device_name(state: &State, key: &KeyId) -> Option<String> {
     devices(state)
@@ -619,13 +532,6 @@ pub fn spaces(state: &State) -> Vec<SpaceRecord> {
                     .to_owned(),
                 placements,
                 declined: last(n, 3).and_then(|v| v.as_bool()).unwrap_or(false),
-                names_hosts: {
-                    let values = n.values(NAMES_HOSTS).iter();
-                    let said: Vec<bool> = values
-                        .filter_map(|v| v.value.as_ref().and_then(Value::as_bool))
-                        .collect();
-                    (!said.is_empty()).then(|| said.iter().all(|yes| *yes))
-                },
             })
         })
         .collect()

@@ -850,8 +850,8 @@ fn names(v: &Value) -> String {
 
 /// Tells the person who reads where their hosts are in a group without
 /// their having agreed to it: someone who is not their contact and was
-/// added there, or someone there whom they have refused. They must be
-/// told, and offered to stop (`hosts.md#telling-others-where-to-reach-you`).
+/// added there since they last said. They must be told, and offered to
+/// stop (`hosts.md#telling-others-where-to-reach-you`).
 fn tell_who_reads_reach(g: &Value) {
     let added = names(&g["reach"]["added"]);
     if added.is_empty() {
@@ -866,6 +866,23 @@ fn tell_who_reads_reach(g: &Value) {
         "    To stop naming it there: cardinal group reach {name} keep. To go on: cardinal \
          group reach {name} share."
     );
+}
+
+/// Asks, as part of refusing someone, about each group they are in where
+/// this person's hosts are named: they can still see the address there.
+/// Nothing asks again afterwards.
+fn tell_where_refused_reads_reach(who: &str, refused: &Value) {
+    for g in refused["reach"].as_array().into_iter().flatten() {
+        let name = printable(g["name"].as_str().unwrap_or(""));
+        println!(
+            "{who} is in {name} and can still see your host's address there ({}).",
+            names(&g["what"])
+        );
+        println!(
+            "    To stop sharing it there: cardinal group reach {name} keep. To keep sharing \
+             it, do nothing."
+        );
+    }
 }
 
 fn files(n: u64) -> String {
@@ -1732,19 +1749,11 @@ async fn client(cmd: Cmd) -> anyhow::Result<()> {
                 (_, Some(_)) => anyhow::bail!("only `name` and `category` take a value"),
                 (_, None) => json!({"cmd": "contact", "who": who, "setting": setting}),
             };
-            call(&paths, req).await?;
+            let done = call(&paths, req).await?;
             // Someone refused may be in a group where this person's hosts
-            // are named: they are told at once, as `cardinal groups` tells.
+            // are named: they are asked about it now, and only now.
             if setting == "refuse" {
-                // The refusal is made: failing to list is no failure of it.
-                let listed = call(&paths, json!({"cmd": "groups"})).await;
-                let v = listed.unwrap_or_default();
-                for g in v["groups"].as_array().into_iter().flatten() {
-                    if !names(&g["reach"]["added"]).is_empty() {
-                        println!("{}:", printable(g["name"].as_str().unwrap_or("")));
-                        tell_who_reads_reach(g);
-                    }
-                }
+                tell_where_refused_reads_reach(&printable(&who), &done);
             }
             Ok(())
         }

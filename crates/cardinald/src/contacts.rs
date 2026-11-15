@@ -569,6 +569,13 @@ fn record_contact(
 
 /// Changes how this person regards a contact. Only their own devices hear of
 /// it, and the contact is told nothing.
+///
+/// Refusing someone answers with `reach`: the groups they are in where
+/// this person's reach node names their hosts, each with its `name` and
+/// `what` they can see there. They still read it, and software asks about
+/// that as part of refusing, on this device, and nowhere else afterwards
+/// (`hosts.md#telling-others-where-to-reach-you`): `group-reach` with
+/// `share` false stops it in a group.
 pub fn set(d: &Arc<Daemon>, who: &str, setting: &str) -> anyhow::Result<Json> {
     let contact = find(d, who)?;
     let (key, value) = match setting {
@@ -586,6 +593,10 @@ pub fn set(d: &Arc<Daemon>, who: &str, setting: &str) -> anyhow::Result<Json> {
         .ok_or_else(|| anyhow::anyhow!("the account space is not here yet"))?;
     d.write_and_push(&account, vec![account::set_field(contact.node, key, value)])?;
     d.peers_changed();
+    if setting == "refuse" {
+        let reach = crate::groups::naming_hosts_to(&d.core(), &contact.identity);
+        return Ok(json!({"reach": reach}));
+    }
     Ok(json!({}))
 }
 

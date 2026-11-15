@@ -244,22 +244,35 @@ impl Reached {
     }
 }
 
-/// What this person's reach node in a space tells, whom, and what they have
-/// said of it (`hosts.md#telling-others-where-to-reach-you`). A reach node
-/// says where a person's hosts are to every member, and for a host at home
-/// that is a home address. Their contacts have a host of theirs already;
-/// anyone else in the space learns it there.
+/// What this person's reach node in a space tells, and whom
+/// (`hosts.md#telling-others-where-to-reach-you`). A reach node says where
+/// a person's hosts are to every member, and for a host at home that is a
+/// home address. Their contacts have a host of theirs already; anyone else
+/// in the space learns it there.
+///
+/// The list is the person's answer, and nothing else records one: an empty
+/// list is their no, or their having no host, and no device can tell which.
+/// So what software may do to the list is two things kept apart. It keeps
+/// current what the list already names, on its own. It names a host where
+/// none is named only when its person says so on this device, or joins
+/// among contacts, or in a relationship. Everything here is read off what
+/// the list holds now, whether there is a host, whether the space is
+/// joined and is a relationship, who is not a contact, and who came late.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Telling {
-    /// Whether their reach node there names a host now.
+    /// Whether their reach node there names a host now. Where two of their
+    /// devices set it at the same moment and either set it empty, it names
+    /// none.
     pub shared: bool,
     /// Whether it has ever been set, if only to an empty list.
     pub set: bool,
-    /// Their answer to whether it names their hosts, kept with the space in
-    /// their account: `None` while they have not been asked.
-    pub answer: Option<bool>,
+    /// Whether it holds two lists, set by two of their devices at the same
+    /// moment.
+    pub split: bool,
     /// Whether they have a host to name.
     pub hosted: bool,
+    /// How many of their hosts the list does not name.
+    pub unnamed: usize,
     /// Whether they are in the space by their own doing.
     pub joined: bool,
     /// Whether they have left it.
@@ -267,47 +280,49 @@ pub struct Telling {
     /// Whether the space is public: then whoever is in it now, anyone at
     /// all reads it, and nothing is ever set there unasked.
     pub public: bool,
+    /// Whether the space is the relationship with a contact, whose devices
+    /// have a host of the person's from it already: there the list is kept
+    /// at the person's hosts, a new one included.
+    pub relationship: bool,
     /// The members who are not their contacts and have not left: who
     /// learns what the reach node says and had no host of theirs already.
     pub who: Vec<[u8; 32]>,
-    /// Those of them whom nothing the person said or software did took
-    /// into account: who were added after the reach node was last set, or
-    /// whom the person refused, with no answer of theirs for the space
-    /// since.
+    /// Those of them who came since the list was last set: the entry that
+    /// set it has their addition nowhere in its causal past. The person's
+    /// answer about them is the next `set` of the list.
     pub late: Vec<[u8; 32]>,
     /// The addresses of their hosts: what is learned.
     pub what: Vec<String>,
 }
 
 impl Telling {
-    /// Whether the person must be asked before software names their hosts
-    /// there: they have a host, someone there is not their contact, the
-    /// hosts are not named now, and they have not answered for the space
-    /// as it is. An offer always asks: whoever left took their answer
-    /// back. So does a yes given before someone who is not a contact was
-    /// added, while the reach node named no host.
-    pub fn ask(&self) -> bool {
-        let unanswered = match self.answer {
-            None => true,
-            Some(true) => !self.late.is_empty(),
-            Some(false) => false,
-        };
-        // in a public space that is anyone at all, whoever is in it now
-        let learns = self.public || !self.who.is_empty();
-        self.hosted && learns && (!self.joined || (!self.shared && unanswered))
+    /// Whether everyone else there has a host of the person's already:
+    /// they are all contacts, and nobody else reads the space.
+    fn among_contacts(&self) -> bool {
+        self.who.is_empty() && !self.public
     }
 
-    /// Whether joining names the person's hosts: as they say now, or as
-    /// they said before if an answer is on record, or, where nobody had to
-    /// be asked and nothing was said, yes.
+    /// Whether the person must be asked before software names their hosts
+    /// there: they have a host, someone there is not their contact, and
+    /// they have given no answer, which is a list they set. An offer always
+    /// asks: whoever left emptied the list in leaving. Once they are in
+    /// the space with a list set, empty or not, that is their answer, and
+    /// only they change it.
+    pub fn ask(&self) -> bool {
+        // in a public space that is anyone at all, whoever is in it now
+        let learns = self.public || !self.who.is_empty();
+        self.hosted && learns && (!self.joined || !self.set)
+    }
+
+    /// Whether joining names the person's hosts: as they say now, or,
+    /// where they say nothing, only among contacts.
     pub fn joins_sharing(&self, reach: Option<bool>) -> bool {
-        reach.or(self.answer).unwrap_or(true)
+        reach.unwrap_or(self.among_contacts())
     }
 
     /// Those who are not the person's contacts and were added to a space
-    /// where their reach node already named their hosts, or were there
-    /// when the person refused them: the person MUST be told, and offered
-    /// to empty it.
+    /// where their reach node already named their hosts: the person MUST
+    /// be told, and offered to empty it.
     pub fn added(&self) -> &[[u8; 32]] {
         match self.shared && self.joined {
             true => &self.late,
@@ -315,54 +330,54 @@ impl Telling {
         }
     }
 
-    /// Whether software sets the reach node now without asking: to the
-    /// person's hosts, or to an empty list if they have none. Never where
-    /// they said no, on this device or another. Where they said yes, once
-    /// there is a host to name and nobody has been added since who is not
-    /// a contact. Where they were not asked, only where everyone else is a
-    /// contact: if it was never set, or names nothing and there is now a
-    /// host.
+    /// Whether software sets the list now without asking, to more than it
+    /// names. Only among contacts, and then only in two cases. The list
+    /// was never set: the person is in the space, as whoever made it is,
+    /// and this is their joining. Or the space is a relationship and the
+    /// person has a host it does not name. Anywhere else a list that is
+    /// set stays as it is, an empty one too: another device may have
+    /// emptied it, and that was the person's no.
     pub fn sets_unasked(&self) -> bool {
-        self.joined
-            && match self.answer {
-                Some(false) => false,
-                Some(true) => !self.shared && self.hosted && self.late.is_empty(),
-                None => {
-                    let contacts = self.who.is_empty() && !self.public;
-                    contacts && (!self.set || (!self.shared && self.hosted))
-                }
-            }
+        let first = !self.set;
+        let more = self.relationship && self.unnamed > 0;
+        self.joined && self.among_contacts() && (first || more)
     }
 
     /// Whether what software would set unasked is worth an entry, given
-    /// how many of the person's hosts gave this device a token: hosts to
-    /// name, or an empty list where nothing was ever set, which accepts
-    /// the space and says there is nowhere. An empty list where the node
-    /// is set and names nothing says nothing new. That is all a device has
-    /// whose person's host it cannot reach now, and it waits for the host.
+    /// how many hosts it could add: one or more, or none where nothing was
+    /// ever set, which accepts the space and says there is nowhere. A
+    /// device that cannot reach its person's host now has none to add, and
+    /// waits for the host.
     pub fn worth_saying(&self, hosts: usize) -> bool {
         hosts > 0 || !self.set
     }
 
-    /// Whether software empties the reach node now: the person said no and
-    /// it names a host all the same, as it can where another of their
-    /// devices set it before their answer reached it. Setting an empty
-    /// list tells nobody anything, and needs no asking.
-    ///
-    /// Or the person has left and it names a host all the same, as it can
-    /// where another of their devices set it at the moment they left:
-    /// emptying it again is the one thing a member who has left still
-    /// writes (`spaces.md#members-and-roles`).
+    /// Whether software empties the reach node now: the person has left
+    /// and it names a host all the same. Emptying it again is the one
+    /// thing a member who has left still writes
+    /// (`spaces.md#members-and-roles`). Setting an empty list tells nobody
+    /// anything, and needs no asking.
     pub fn empties_unasked(&self) -> bool {
-        self.shared && (self.left || (self.joined && self.answer == Some(false)))
+        self.shared && self.left
     }
 
-    /// Whether software keeps current what the reach node says: a token
-    /// that has gone, an address that changed. That needs no asking where
-    /// the person agreed to what is there, which they have not while
-    /// someone they have not been told of reads it.
+    /// Whether this device sets the one result of two lists set at the
+    /// same moment, so that the next reader need not work it out
+    /// (`profiles.md#reach`). An empty result is always set. One that
+    /// names hosts is not while someone has come whom the person has not
+    /// answered about: a `set` would be their answer.
+    pub fn settles(&self) -> bool {
+        let quiet = !self.shared || self.late.is_empty();
+        self.split && quiet && (self.joined || self.left)
+    }
+
+    /// Whether software keeps current what the list names: a token that
+    /// has gone, an address that changed, a host that serves the person no
+    /// longer. That needs no asking where the person agreed to what is
+    /// there, which they have not while someone they have not answered
+    /// about reads it.
     pub fn keeps_current(&self) -> bool {
-        self.shared && self.answer != Some(false) && self.added().is_empty()
+        self.shared && self.joined && self.added().is_empty()
     }
 }
 
@@ -1187,42 +1202,29 @@ impl Core {
         others.filter(|m| Some(*m) != me && !known(m)).collect()
     }
 
-    /// This person's answer to whether their reach node in a space names
-    /// their hosts, from their account (`profiles.md#account`, kind 2,
-    /// field 5): `None` while they have not been asked.
-    pub fn names_hosts(&self, space: &SpaceId) -> Option<bool> {
-        let acc = self.account()?.space.as_ref()?;
-        account::names_hosts(acc.state(), space)
+    /// The static keys of hosts that served this person and do so no
+    /// longer, as far as this device's account says: a grant it holds
+    /// names the key, and no host the account has now does. A host this
+    /// device has never heard of is not among them: a list that names one
+    /// was set by a device that knows more.
+    pub fn former_hosts(&self) -> Vec<[u8; 32]> {
+        let Some(space) = self.account().and_then(|a| a.space.as_ref()) else {
+            return Vec::new();
+        };
+        let now = self.mailboxes();
+        let serves = |key: &[u8; 32]| now.iter().any(|(g, _)| g.link_key.x25519() == key);
+        let mut out: Vec<[u8; 32]> = account::hosts_ever(space.state())
+            .iter()
+            .filter_map(|grant| cardinal_space::grant::Grant::open(grant))
+            .map(|(g, _)| *g.link_key.x25519())
+            .filter(|key| !serves(key))
+            .collect();
+        out.sort();
+        out.dedup();
+        out
     }
 
-    /// The account space and the ops that record this person's answer for
-    /// a space there, or with `None` take it back. Nothing to write if it
-    /// is recorded already, unless the person was told of someone since:
-    /// then they answer again, and the answer is written again.
-    pub fn answer_ops(
-        &self,
-        space: &SpaceId,
-        name: &str,
-        answer: Option<bool>,
-    ) -> Option<(SpaceId, Vec<SpaceOp>)> {
-        let acc = self.account()?;
-        let there = self.not_contacts_in(space);
-        let refused = self.refused_unanswered(space);
-        let again = answer.is_some() && refused.iter().any(|who| there.contains(who));
-        let state = acc.space.as_ref()?.state();
-        let ops = account::answer_ops(state, space, name, answer, again);
-        (!ops.is_empty()).then_some((acc.id, ops))
-    }
-
-    /// The contacts this person refused, with no answer of theirs about
-    /// their hosts in `space` since.
-    fn refused_unanswered(&self, space: &SpaceId) -> Vec<[u8; 32]> {
-        let account = self.account().and_then(|a| a.space.as_ref());
-        account.map_or_else(Vec::new, |a| account::refused_since_answer(a, space))
-    }
-
-    /// What this person's reach node in a space tells, whom, and what they
-    /// have said of it.
+    /// What this person's reach node in a space tells, and whom.
     pub fn telling(&self, space: &SpaceId) -> Telling {
         let Some(me) = self.identity.as_ref().map(|i| i.id()) else {
             return Telling::default();
@@ -1234,22 +1236,46 @@ impl Core {
         let values = sp.state().reach_values(&me, 1);
         let since: Vec<EntryId> = values.iter().map(|v| v.entry).collect();
         let after = sp.added_after(&since);
-        let refused = self.refused_unanswered(space);
-        let late = |m: &&[u8; 32]| after.contains(m) || refused.contains(m);
         let hosts = self.mailboxes();
         let endpoints = hosts.iter().flat_map(|(g, _)| g.endpoints.iter());
+        let named = self.reach_of(space, &me);
+        let is_named = |key: &[u8; 32]| named.iter().any(|r| r.host == *key);
+        let unnamed = hosts.iter().filter(|(g, _)| !is_named(g.link_key.x25519()));
         Telling {
-            shared: !self.reach_of(space, &me).is_empty(),
+            shared: !named.is_empty(),
             set: !since.is_empty(),
-            answer: self.names_hosts(space),
+            split: since.len() > 1,
             hosted: !hosts.is_empty(),
+            unnamed: unnamed.count(),
             joined: sp.accepted_by(&me),
             left: sp.has_left(&me),
             public: sp.is_public(),
-            late: who.iter().filter(late).copied().collect(),
+            relationship: sp.profile() == Profile::RELATIONSHIP,
+            late: who.iter().filter(|m| after.contains(m)).copied().collect(),
             who,
             what: endpoints.map(|e| e.to_string()).collect(),
         }
+    }
+
+    /// The groups this person is in where their reach node names their
+    /// hosts and `who` is a member who has not left: where someone they
+    /// refuse still reads the address. Software asks about these as part
+    /// of refusing, on the device refused on
+    /// (`hosts.md#telling-others-where-to-reach-you`); the relationship
+    /// with that person is not among them.
+    pub fn groups_naming_hosts_to(&self, who: &[u8; 32]) -> Vec<SpaceId> {
+        let mut out = Vec::new();
+        for (id, h) in &self.spaces {
+            let Some(sp) = h.space.as_ref() else { continue };
+            if sp.profile() != cardinal_space::group::GROUP || !sp.present().contains(who) {
+                continue;
+            }
+            let t = self.telling(id);
+            if t.shared && t.joined {
+                out.push(*id);
+            }
+        }
+        out
     }
 
     /// The space this person gave out a token in.
@@ -2915,11 +2941,14 @@ mod tests {
             opened.id()
         }
 
-        /// Sets this person's reach node in a space, to one host or none.
+        /// Sets this person's reach node in a space, to one host or none:
+        /// the host they have, if they have one.
         fn says_reach(&mut self, space: &SpaceId, host: bool) -> Vec<u8> {
+            let hosts = self.core.mailboxes();
+            let key = hosts.first().map(|(g, _)| *g.link_key.x25519());
             let reach = relationship::Reach {
                 endpoints: Vec::new(),
-                host: [9; 32],
+                host: key.unwrap_or([9; 32]),
                 token: cardinal_crypto::random_bytes(),
             };
             let list = if host { vec![reach] } else { Vec::new() };
@@ -2927,14 +2956,17 @@ mod tests {
             self.core.write_entry(space, vec![op]).unwrap().1
         }
 
-        /// Keeps this person's answer about their hosts in a space, as
-        /// `group-join` and `group-reach` do, or takes it back.
-        fn answers(&mut self, space: &SpaceId, names_hosts: Option<bool>) {
-            let ops = self.core.answer_ops(space, "Garden club", names_hosts);
-            if let Some((account, ops)) = ops {
-                self.core.write_entry(&account, ops).unwrap();
-            }
-            assert_eq!(self.core.names_hosts(space), names_hosts);
+        /// Stops this person's device being a host, as `host --off` does.
+        fn hosts_no_longer(&mut self) {
+            let account = self.core.account_id().unwrap();
+            let me = self.core.keys.key();
+            let state = self.space(&account).state();
+            let device = account::devices(state).into_iter().find(|d| d.key == me);
+            let mut ops = vec![account::set_field(device.unwrap().node, 4, false)];
+            let hosts = account::hosts(state).into_iter();
+            ops.extend(hosts.map(|h| SpaceOp::delete(h.node)));
+            self.core.write_entry(&account, ops).unwrap();
+            assert!(self.core.mailboxes().is_empty());
         }
     }
 
@@ -2952,11 +2984,12 @@ mod tests {
     }
 
     /// `hosts.md#telling-others-where-to-reach-you`: software names a
-    /// person's hosts unasked only where everyone else is their contact.
-    /// Anywhere else it asks first. The answer is the person's, is kept
-    /// with the space in their account, and no device goes against it.
+    /// person's hosts unasked only when they join where everyone else is
+    /// their contact. Anywhere else it asks first. The answer is the
+    /// person's, the list is where it is kept, and no device goes against
+    /// it: an empty list stays empty until they say otherwise.
     #[test]
-    fn the_answer_about_hosts_is_the_persons_and_is_kept() {
+    fn the_list_of_hosts_is_the_persons_answer() {
         let [mut ana, mut bo, cy, _] = four();
         bo.knows(&ana, "Ana");
         let both = [(bo.id(), "Bo".to_owned()), (cy.id(), "Cy".to_owned())];
@@ -2976,21 +3009,13 @@ mod tests {
         let t = bo.core.telling(&g);
         assert!(t.ask() && !t.sets_unasked());
         assert_eq!(t.what, ["203.0.113.5:7171"]);
-        assert_eq!(t.answer, None);
-        // Joining shares as he says; with nothing said and nothing on
-        // record, as where nobody has to be asked, it shares.
-        assert!(t.joins_sharing(None) && t.joins_sharing(Some(true)));
-        assert!(!t.joins_sharing(Some(false)));
-        // An answer on record stands for a join that says nothing, and
-        // gives way to one that does.
-        bo.answers(&g, Some(false));
-        let t = bo.core.telling(&g);
-        assert!(!t.joins_sharing(None) && t.joins_sharing(Some(true)));
-        bo.answers(&g, None);
+        // Joining shares as he says. With nothing said it shares only
+        // among contacts, which these are not.
+        assert!(t.joins_sharing(Some(true)) && !t.joins_sharing(Some(false)));
+        assert!(!t.joins_sharing(None));
 
-        // He joins and says no: the empty list, and the answer in his
-        // account. Nothing fills it in, here or on another of his devices.
-        bo.answers(&g, Some(false));
+        // He joins and says no: the empty list, and nothing else. Nothing
+        // fills it in, here or on another of his devices.
         bo.says_reach(&g, false);
         let t = bo.core.telling(&g);
         assert!(t.joined && t.set && !t.shared);
@@ -2999,80 +3024,221 @@ mod tests {
         bo.knows(&cy, "Cy");
         let t = bo.core.telling(&g);
         assert!(t.who.is_empty() && !t.sets_unasked() && !t.empties_unasked());
-        // Another of his devices, which had not heard his answer yet,
-        // names his host there. The answer stands: it is emptied again,
-        // by whichever device sees both.
-        bo.says_reach(&g, true);
-        let t = bo.core.telling(&g);
-        assert!(t.shared && t.empties_unasked() && !t.keeps_current());
-        bo.says_reach(&g, false);
-        assert!(!bo.core.telling(&g).empties_unasked());
-        // and it survives a restart: it is in his account, not in memory
+        // and it survives a restart: it is in the space
         bo.restarts();
-        assert_eq!(bo.core.names_hosts(&g), Some(false));
-        assert!(!bo.core.telling(&g).sets_unasked());
-
-        // He says yes: his devices keep it at his hosts from then on.
-        bo.answers(&g, Some(true));
         let t = bo.core.telling(&g);
-        assert!(t.sets_unasked() && !t.ask());
+        assert!(t.set && !t.shared && !t.sets_unasked() && !t.ask());
+
+        // He says yes, on this device: named, and kept current from then
+        // on. Nothing empties it.
         bo.says_reach(&g, true);
         let t = bo.core.telling(&g);
         assert!(t.shared && !t.sets_unasked() && t.keeps_current());
-        assert!(!t.empties_unasked());
-
-        // Taken back, he has not been asked: among contacts software says
-        // it unasked, as it does where nobody was ever asked.
-        bo.answers(&g, None);
+        assert!(!t.empties_unasked() && !t.settles() && t.unnamed == 0);
+        // And no again: as it was.
         bo.says_reach(&g, false);
-        assert!(bo.core.telling(&g).sets_unasked());
+        let t = bo.core.telling(&g);
+        assert!(!t.shared && !t.sets_unasked() && !t.ask());
 
-        // Ana made the group and knows them both, and has no host: her
-        // reach node is set unasked, to nothing, and then left alone.
+        // Ana made the group and knows them both: she is in it, and her
+        // list was never set. That is her joining, among contacts: it is
+        // set unasked, to her hosts, or to nothing as here, and then left
+        // alone.
         ana.knows(&bo, "Bo");
         ana.knows(&cy, "Cy");
         let t = ana.core.telling(&g);
         assert!(t.joined && !t.set && t.sets_unasked() && !t.ask());
+        assert!(t.joins_sharing(None));
         ana.says_reach(&g, false);
         assert!(!ana.core.telling(&g).sets_unasked());
-        // once she has a host it is named, since nobody said otherwise
+        // A host she takes up later is named in no group until she says
+        // where: nobody can tell her empty list from a no.
         ana.hosts_at("203.0.113.6:7171");
-        assert!(ana.core.telling(&g).sets_unasked());
+        let t = ana.core.telling(&g);
+        assert!(t.hosted && t.unnamed == 1);
+        assert!(!t.sets_unasked() && !t.ask());
     }
 
-    /// Two of a person's devices answer at the same moment, one yes and
-    /// one no. No wins: a person may always say no.
+    /// P10, D68 (`hosts.md#telling-others-where-to-reach-you`, "The list
+    /// is the answer"). One of a person's devices empties the list: their
+    /// no. Another of their devices has the space's news and nothing else
+    /// that is new: an account an earlier version wrote a yes in, a host
+    /// to name, and nobody there but contacts. It must not name the hosts
+    /// again. Naming a host where the list is empty is the person's act.
     #[test]
-    fn of_two_answers_no_wins() {
-        use cardinal_space::account as acc;
-        let ana = Person::new();
-        let space = [5; 32];
-        let account = ana.core.account_id().unwrap();
-        let mut ana = ana;
-        let yes = acc::create_answered(&space, "Club", true);
-        let (first, _) = ana.core.write_entry(&account, vec![yes]).unwrap();
-        assert_eq!(ana.core.names_hosts(&space), Some(true));
-        // another node for the same space, as a second device makes
-        // before it has heard of the first
-        let no = acc::create_answered(&space, "Club", false);
-        ana.core
-            .write_entry_concurrent(&account, &[first], vec![no])
+    fn a_device_does_not_fill_in_a_list_another_emptied() {
+        let [mut ana, mut bo, cy, _] = four();
+        bo.knows(&ana, "Ana");
+        bo.hosts_at("203.0.113.5:7171");
+        let both = [(bo.id(), "Bo".to_owned()), (cy.id(), "Cy".to_owned())];
+        let club = ana.core.create_group("Garden club", "Ana", &both).unwrap();
+        let bo_shown = [(bo.id(), "Bo".to_owned())];
+        let choir = ana.core.create_group("Choir", "Ana", &bo_shown).unwrap();
+        for g in [&club, &choir] {
+            bo.takes(g, &ana.all_of(g));
+        }
+        // What an earlier version kept in the account for the club: a yes
+        // (kind 2, field 5). Nothing reads it now.
+        let account = bo.core.account_id().unwrap();
+        let record = Record::new()
+            .with(1, club)
+            .with(2, "Garden club")
+            .with(5, true);
+        let old_yes = SpaceOp::create(NodeKind::Uint(2), ROOT, "Garden club", record);
+        bo.core.write_entry(&account, vec![old_yes]).unwrap();
+        for g in [&club, &choir] {
+            // He shared his host there, and then, on another device,
+            // stopped. This device has that entry of the space.
+            bo.says_reach(g, true);
+            assert!(bo.core.telling(g).shared);
+            bo.says_reach(g, false);
+            let t = bo.core.telling(g);
+            assert!(t.joined && t.set && !t.shared && t.hosted);
+            assert!(!t.sets_unasked(), "it names the hosts again");
+            assert!(!t.keeps_current() && !t.ask());
+            // and so it stays, through a restart
+            bo.restarts();
+            assert!(!bo.core.telling(g).sets_unasked());
+        }
+        // The same for a host he takes up later: among contacts too, it is
+        // named in no group until he says so.
+        ana.knows(&bo, "Bo");
+        ana.says_reach(&choir, false);
+        ana.hosts_at("203.0.113.6:7171");
+        let t = ana.core.telling(&choir);
+        assert!(t.who.is_empty() && t.hosted && !t.shared);
+        assert!(!t.sets_unasked(), "a new host is named unasked");
+    }
+
+    /// D68 (`profiles.md#reach`). Two of a person's devices set the list
+    /// at the same moment, one to their host and one to nothing. The empty
+    /// one wins wherever a host is looked up, and a device of theirs that
+    /// sees both sets the one result. Two lists that both name hosts are
+    /// set as one too, unless someone has come whom the person has not
+    /// answered about: then a `set` would answer for them.
+    #[test]
+    fn of_two_lists_an_empty_one_wins_and_a_device_sets_the_result() {
+        let [mut ana, mut bo, mut cy, _] = four();
+        bo.knows(&ana, "Ana");
+        bo.hosts_at("203.0.113.5:7171");
+        let bo_shown = [(bo.id(), "Bo".to_owned())];
+        let g = ana.core.create_group("Choir", "Ana", &bo_shown).unwrap();
+        bo.takes(&g, &ana.all_of(&g));
+        bo.says_reach(&g, true);
+        let me = bo.id();
+        let one = |n: u8| relationship::Reach {
+            endpoints: Vec::new(),
+            host: [n; 32],
+            token: [n; 16],
+        };
+        let before = bo.space(&g).heads();
+        // A yes on one device, and a no on another at the same moment.
+        bo.says_reach(&g, true);
+        let no = relationship::set_reach(&me, &[]);
+        bo.core
+            .write_entry_concurrent(&g, &before, vec![no])
             .unwrap();
-        assert_eq!(ana.core.names_hosts(&space), Some(false));
-        // an answer given now is written on every node there is
-        let (_, ops) = ana.core.answer_ops(&space, "Club", Some(true)).unwrap();
-        assert_eq!(ops.len(), 1);
-        ana.core.write_entry(&account, ops).unwrap();
-        assert_eq!(ana.core.names_hosts(&space), Some(true));
-        assert!(ana.core.answer_ops(&space, "Club", Some(true)).is_none());
-        // taken back, it is absent: not asked
-        let (_, ops) = ana.core.answer_ops(&space, "Club", None).unwrap();
-        assert_eq!(ops.len(), 2);
-        ana.core.write_entry(&account, ops).unwrap();
-        assert_eq!(ana.core.names_hosts(&space), None);
-        // and a space the account has no node for was never asked about
-        assert_eq!(ana.core.names_hosts(&[6; 32]), None);
-        assert!(ana.core.answer_ops(&[6; 32], "Other", None).is_none());
+        let t = bo.core.telling(&g);
+        assert!(t.split && t.set && !t.shared);
+        assert!(bo.core.reach_of(&g, &me).is_empty());
+        assert!(t.settles() && !t.sets_unasked() && !t.keeps_current());
+        // The one result is the empty list, and then there is one list.
+        bo.says_reach(&g, false);
+        let t = bo.core.telling(&g);
+        assert!(!t.split && !t.shared && !t.settles() && !t.sets_unasked());
+
+        // Two lists that both name hosts: both count, and are set as one.
+        let before = bo.space(&g).heads();
+        let first = relationship::set_reach(&me, &[one(1)]);
+        bo.core.write_entry(&g, vec![first]).unwrap();
+        let second = relationship::set_reach(&me, &[one(2)]);
+        bo.core
+            .write_entry_concurrent(&g, &before, vec![second])
+            .unwrap();
+        let t = bo.core.telling(&g);
+        assert!(t.split && t.shared && t.settles());
+        assert_eq!(bo.core.reach_of(&g, &me).len(), 2);
+        // Cy, whom he does not know, is added: until he has answered,
+        // nothing is set there, the one result included.
+        let cy_shown = [(cy.id(), "Cy".to_owned())];
+        let added = ana.core.add_to_group(&g, &cy_shown).unwrap();
+        bo.takes(&g, &[added]);
+        cy.takes(&g, &ana.all_of(&g));
+        let t = bo.core.telling(&g);
+        assert_eq!(t.added(), [cy.id()]);
+        assert!(t.split && !t.settles() && !t.keeps_current());
+    }
+
+    /// D68 (`hosts.md#telling-others-where-to-reach-you`). The
+    /// relationship with a contact is the exception: their devices have a
+    /// host of the person's from it already, so the list there is kept at
+    /// the person's hosts, a new one included. Not while the contact is
+    /// refused.
+    #[test]
+    fn a_relationship_names_a_host_taken_up_later() {
+        let (mut ana, mut bo) = (Person::new(), Person::new());
+        ana.meets(&bo);
+        bo.meets(&ana);
+        let (rel, genesis) = ana.core.create_relationship(&bo.id()).unwrap();
+        bo.core.accept_relationship(&genesis, &ana.id()).unwrap();
+        // Until the contact is on record there is nobody known to be one.
+        bo.says_reach(&rel, false);
+        assert!(!bo.core.telling(&rel).sets_unasked());
+        use cardinal_space::account::Regard;
+        let account = bo.core.account_id().unwrap();
+        let contact = account::create_contact(&ana.id(), "Ana", &rel, Regard::default());
+        bo.core.write_entry(&account, vec![contact]).unwrap();
+        // With no host the empty list says all there is to say.
+        let t = bo.core.telling(&rel);
+        assert!(t.relationship && t.joined && t.set && t.who.is_empty());
+        assert!(!t.sets_unasked() && !t.ask());
+        // He takes up a host: it is named there, unasked. P2: a device
+        // that cannot reach the host has nothing to add, and waits.
+        bo.hosts_at("203.0.113.5:7171");
+        let t = bo.core.telling(&rel);
+        assert!(t.unnamed == 1 && t.sets_unasked() && !t.ask());
+        assert!(!t.worth_saying(0) && t.worth_saying(1));
+        assert!(Telling::default().worth_saying(0));
+        bo.says_reach(&rel, true);
+        let t = bo.core.telling(&rel);
+        assert!(t.shared && t.unnamed == 0 && !t.sets_unasked() && t.keeps_current());
+        // A group is no relationship, whoever is in it.
+        bo.hosts_no_longer();
+        let bo_shown = [(bo.id(), "Bo".to_owned())];
+        let g = ana.core.create_group("Choir", "Ana", &bo_shown).unwrap();
+        bo.takes(&g, &ana.all_of(&g));
+        bo.says_reach(&g, false);
+        bo.hosts_at("203.0.113.5:7171");
+        let t = bo.core.telling(&g);
+        assert!(!t.relationship && t.who.is_empty() && t.unnamed == 1);
+        assert!(!t.sets_unasked());
+        // Refused, Ana is no contact: nothing is set for her.
+        bo.says_reach(&rel, false);
+        assert!(bo.core.telling(&rel).sets_unasked());
+        let node = bo.core.contacts()[0].node;
+        let refuse = account::set_field(node, account::REFUSED, true);
+        bo.core.write_entry(&account, vec![refuse]).unwrap();
+        assert!(!bo.core.telling(&rel).sets_unasked());
+    }
+
+    /// D68 ("What software does on its own"). A host that serves the
+    /// person no longer is taken out of the lists that name it. A device
+    /// knows one by a grant its account held and holds no longer; a host
+    /// it never heard of is not one.
+    #[test]
+    fn a_host_that_serves_no_longer_is_known_by_its_grant() {
+        let mut bo = Person::new();
+        assert!(bo.core.former_hosts().is_empty());
+        bo.hosts_at("203.0.113.5:7171");
+        let key = *bo.core.keys.link.public_key().x25519();
+        assert!(bo.core.former_hosts().is_empty());
+        bo.hosts_no_longer();
+        assert_eq!(bo.core.former_hosts(), [key]);
+        bo.restarts();
+        assert_eq!(bo.core.former_hosts(), [key]);
+        // It serves again: one of his hosts, and no former one.
+        bo.hosts_at("203.0.113.5:7171");
+        assert!(bo.core.former_hosts().is_empty());
     }
 
     /// `hosts.md`, "Whoever is added later reads what is already there":
@@ -3102,10 +3268,7 @@ mod tests {
         let added = ana.core.add_to_group(&g, &cy_shown).unwrap();
         bo.takes(&g, std::slice::from_ref(&added));
         cy.takes(&g, &ana.all_of(&g));
-        assert_eq!(
-            relationship::reach_of(cy.space(&g), &bo.id()).len(),
-            1
-        );
+        assert_eq!(relationship::reach_of(cy.space(&g), &bo.id()).len(), 1);
         let t = bo.core.telling(&g);
         assert_eq!(t.added(), [cy.id()]);
         // Nothing new is said there until he has answered, and nothing
@@ -3130,7 +3293,6 @@ mod tests {
         let added = ana.core.add_to_group(&g, &dee_shown).unwrap();
         bo.takes(&g, &[added]);
         assert_eq!(bo.core.telling(&g).added(), [dee.id()]);
-        bo.answers(&g, Some(false));
         bo.says_reach(&g, false);
         let t = bo.core.telling(&g);
         assert!(t.added().is_empty() && !t.shared && !t.ask());
@@ -3155,12 +3317,13 @@ mod tests {
         assert!(t.added().is_empty() && t.keeps_current());
     }
 
-    /// `hosts.md`, "The same holds when the person refuses someone who is
-    /// already a member there": they read where the person's hosts are as
-    /// someone added does, so the person is told, on each of their devices
-    /// until one has their answer, and until then nothing is set there.
+    /// D68 (`hosts.md`, "When the person refuses someone who is already a
+    /// member of such a space"). Software asks as part of refusing, on the
+    /// device they refuse on, and nothing tracks it afterwards: whoever is
+    /// refused is not listed as someone added, and what the list names is
+    /// still kept current. The relationship with them is not asked about.
     #[test]
-    fn refusing_someone_who_is_there_is_told_of_as_an_arrival_is() {
+    fn refusing_someone_who_is_there_is_asked_about_then_and_not_tracked() {
         use cardinal_space::account;
         let [mut ana, mut bo, cy, dee] = four();
         bo.knows(&ana, "Ana");
@@ -3168,13 +3331,23 @@ mod tests {
         bo.hosts_at("203.0.113.5:7171");
         let both = [(bo.id(), "Bo".to_owned()), (cy.id(), "Cy".to_owned())];
         let g = ana.core.create_group("Garden club", "Ana", &both).unwrap();
-        bo.takes(&g, &ana.all_of(&g));
-        // Among contacts nothing is asked, and nothing is on record.
+        let bo_shown = [(bo.id(), "Bo".to_owned())];
+        let quiet = ana.core.create_group("Choir", "Ana", &bo_shown).unwrap();
+        let kept = ana.core.create_group("Band", "Ana", &both).unwrap();
+        for id in [&g, &quiet, &kept] {
+            bo.takes(id, &ana.all_of(id));
+        }
+        // Among contacts nothing is asked. He shares in two of the three.
         assert!(!bo.core.telling(&g).ask());
         bo.says_reach(&g, true);
+        bo.says_reach(&quiet, true);
+        bo.says_reach(&kept, false);
         let t = bo.core.telling(&g);
         assert!(t.shared && t.added().is_empty() && t.keeps_current());
-        assert_eq!(t.answer, None);
+        // What refusing Cy asks about: the group Cy is in where the host
+        // is named. Not the one Cy is not in, nor the one that names none.
+        assert_eq!(bo.core.groups_naming_hosts_to(&cy.id()), [g]);
+        assert!(bo.core.groups_naming_hosts_to(&dee.id()).is_empty());
 
         // He refuses Cy, who is there and reads it.
         let account = bo.core.account_id().unwrap();
@@ -3185,78 +3358,33 @@ mod tests {
                 .next()
                 .unwrap()
         };
-        let set = |p: &mut Person, who: [u8; 32], refused: bool| {
-            let op = account::set_field(node(p, who), account::REFUSED, refused);
-            p.core.write_entry(&account, vec![op]).unwrap().1
-        };
-        set(&mut bo, cy.id(), true);
+        let refuse = account::set_field(node(&bo, cy.id()), account::REFUSED, true);
+        bo.core.write_entry(&account, vec![refuse]).unwrap();
+        // Cy is no contact now, and learns what the list says. Nobody
+        // came, so nobody is listed as added, and nothing waits.
         let t = bo.core.telling(&g);
-        assert_eq!(
-            (t.who.as_slice(), t.added()),
-            (&[cy.id()][..], &[cy.id()][..])
-        );
-        // Nothing new is said there until he has answered, and nothing
-        // asks him as if it were not yet shared.
-        assert!(!t.keeps_current() && !t.ask() && !t.sets_unasked() && !t.empties_unasked());
+        assert_eq!(t.who, [cy.id()]);
+        assert!(t.added().is_empty() && t.late.is_empty());
+        assert!(t.keeps_current() && !t.ask() && !t.sets_unasked() && !t.empties_unasked());
         let listed = crate::groups::list_of(&bo.core);
-        let reach = &listed["groups"][0]["reach"];
-        assert_eq!(reach["added"], serde_json::json!(["Cy"]), "{listed}");
-        // With no answer on record there is none to take back.
-        assert!(bo.core.answer_ops(&g, "Garden club", None).is_none());
-        // Saying the reach node again answers nothing: it was the person
-        // who was to be told, and their answer is what is waited for.
-        bo.says_reach(&g, true);
-        assert_eq!(bo.core.telling(&g).added(), [cy.id()]);
-        // Refusing someone who is not there is nothing to tell of here,
-        // and taking a refusal back leaves nobody to tell of.
-        bo.knows(&dee, "Dee");
-        set(&mut bo, dee.id(), true);
-        assert_eq!(bo.core.telling(&g).added(), [cy.id()]);
-        set(&mut bo, cy.id(), false);
-        let t = bo.core.telling(&g);
-        assert!(t.added().is_empty() && t.who.is_empty() && t.keeps_current());
-        set(&mut bo, cy.id(), true);
-        assert_eq!(bo.core.telling(&g).added(), [cy.id()]);
-
-        // He keeps it. The yes is written, in an entry that comes after
-        // the refusal, and he has been told of everyone there.
-        bo.answers(&g, Some(true));
-        let t = bo.core.telling(&g);
-        assert!(t.added().is_empty() && t.keeps_current() && t.shared);
-        assert_eq!((t.who.as_slice(), t.answer), (&[cy.id()][..], Some(true)));
-        // What he said already is not written again while there is
-        // nobody new to answer about: not for someone he refuses who is
-        // not there.
-        assert!(bo.core.answer_ops(&g, "Garden club", Some(true)).is_none());
-        set(&mut bo, dee.id(), false);
-        set(&mut bo, dee.id(), true);
-        assert!(bo.core.telling(&g).added().is_empty());
-        assert!(bo.core.answer_ops(&g, "Garden club", Some(true)).is_none());
-
-        // A second refusal, of Ana: the same yes is his answer again, and
-        // is written again so that it comes after it.
-        set(&mut bo, ana.id(), true);
-        assert_eq!(bo.core.telling(&g).added(), [ana.id()]);
-        let (_, ops) = bo.core.answer_ops(&g, "Garden club", Some(true)).unwrap();
-        assert_eq!(ops.len(), 1);
-        bo.answers(&g, Some(true));
-        assert!(bo.core.telling(&g).added().is_empty());
-        // And with a no he empties it.
-        set(&mut bo, ana.id(), false);
-        set(&mut bo, ana.id(), true);
-        assert_eq!(bo.core.telling(&g).added(), [ana.id()]);
-        bo.answers(&g, Some(false));
-        let t = bo.core.telling(&g);
-        assert!(t.added().is_empty() && t.empties_unasked() && !t.keeps_current());
+        let of = |name: &str| {
+            let all = listed["groups"].as_array().unwrap().iter();
+            let found = all
+                .filter(|x| x["name"] == name)
+                .map(|x| x["reach"].clone());
+            found.last().unwrap()
+        };
+        assert_eq!(
+            of("Garden club")["added"],
+            serde_json::json!([]),
+            "{listed}"
+        );
+        assert_eq!(of("Garden club")["shared"], true);
+        assert_eq!(bo.core.groups_naming_hosts_to(&cy.id()), [g]);
+        // His answer, as for anyone: the list, as it was or empty.
         bo.says_reach(&g, false);
-        let t = bo.core.telling(&g);
-        assert!(!t.shared && !t.ask() && !t.empties_unasked());
-        // An answer taken back, as leaving takes it, is taken back once,
-        // whoever was refused meanwhile.
-        bo.answers(&g, None);
-        let t = bo.core.telling(&g);
-        assert_eq!((t.late.len(), &t.late), (2, &t.who));
-        assert!(bo.core.answer_ops(&g, "Garden club", None).is_none());
+        assert!(bo.core.groups_naming_hosts_to(&cy.id()).is_empty());
+        assert!(!bo.core.telling(&g).shared);
     }
 
     /// P4 (`spaces.md#holding-a-space`). Being added is an offer. Whatever
@@ -3425,18 +3553,18 @@ mod tests {
             tellings.push((offered, bo.core.telling(&id)));
         }
         let (offered, joined) = &tellings[0];
-        assert!(!offered.ask() && joined.sets_unasked() && !joined.ask());
+        assert!(!offered.ask() && offered.joins_sharing(None));
+        assert!(!joined.sets_unasked() && !joined.ask());
         let (offered, joined) = &tellings[1];
         assert!(offered.ask(), "joining a public group does not ask");
+        assert!(!offered.joins_sharing(None));
         assert!(
             !joined.sets_unasked(),
             "his host is named to anyone at all, unasked"
         );
-        assert!(joined.ask());
-        // Asked, and having said yes, it is his to share.
-        let mut yes = joined.clone();
-        yes.answer = Some(true);
-        assert!(yes.sets_unasked() && !yes.ask());
+        // He joined with an empty list: that is his answer, and only he
+        // changes it.
+        assert!(!joined.ask());
     }
 
     /// P13 (`spaces.md#holding-a-space`). An offer is shown as coming from
@@ -3530,32 +3658,12 @@ mod tests {
         assert!(bo.core.groups_shared_with(&ana.id()).is_empty());
     }
 
-    /// P2. Among contacts a reach node is set unasked, to the person's
-    /// hosts. A device that cannot reach the host has only an empty list
-    /// to set: once, and then nothing until it can.
+    /// D68 (`apps.md`, `group-reach`). A yes given while there was no host
+    /// to name is not kept: nothing records it. Once there is a host it is
+    /// named nowhere until the person says where, and nothing asks as if
+    /// they had not answered: their list is set, and empty.
     #[test]
-    fn an_empty_reach_node_is_not_set_again_for_want_of_the_host() {
-        let [mut ana, mut bo, _, _] = four();
-        bo.knows(&ana, "Ana");
-        bo.hosts_at("203.0.113.5:7171");
-        let bo_shown = [(bo.id(), "Bo".to_owned())];
-        let g = ana.core.create_group("Choir", "Ana", &bo_shown).unwrap();
-        bo.takes(&g, &ana.all_of(&g));
-        bo.says_reach(&g, false);
-        // Never set: an empty list accepts the space. Set and empty, with
-        // a host to name: software would set it, and has nothing to say
-        // until the host gives a token.
-        assert!(Telling::default().worth_saying(0));
-        let t = bo.core.telling(&g);
-        assert!(t.set && !t.shared && t.hosted && t.sets_unasked());
-        assert!(!t.worth_saying(0) && t.worth_saying(1));
-    }
-
-    /// A yes given while there was no host to name does not cover whoever
-    /// was added afterwards: once there is a host, software asks again
-    /// before it names it to them.
-    #[test]
-    fn a_yes_does_not_cover_who_came_after_it() {
+    fn a_yes_with_no_host_is_not_kept() {
         let [mut ana, mut bo, mut cy, _] = four();
         bo.knows(&ana, "Ana");
         let bo_shown = [(bo.id(), "Bo".to_owned())];
@@ -3564,7 +3672,8 @@ mod tests {
             .create_group("Garden club", "Ana", &bo_shown)
             .unwrap();
         bo.takes(&g, &ana.all_of(&g));
-        bo.answers(&g, Some(true));
+        // He joins among contacts with no host: an empty list.
+        assert!(bo.core.telling(&g).joins_sharing(None));
         bo.says_reach(&g, false);
         let cy_shown = [(cy.id(), "Cy".to_owned())];
         let added = ana.core.add_to_group(&g, &cy_shown).unwrap();
@@ -3573,11 +3682,14 @@ mod tests {
         bo.hosts_at("203.0.113.5:7171");
         let t = bo.core.telling(&g);
         assert_eq!(t.late, [cy.id()]);
-        assert!(t.ask() && !t.sets_unasked());
-        // answered again, with Cy there, it is named
+        // Cy came since the list was set, and reads no host in it: there
+        // is nobody to tell of.
+        assert!(t.added().is_empty());
+        assert!(!t.ask() && !t.sets_unasked() && !t.keeps_current());
+        // He says so, with Cy there: it is named, and Cy is answered for.
         bo.says_reach(&g, true);
         let t = bo.core.telling(&g);
-        assert!(t.shared && !t.ask() && t.added().is_empty());
+        assert!(t.shared && !t.ask() && t.added().is_empty() && t.late.is_empty());
     }
 
     /// `spaces.md#members-and-roles`: the entry that carries `leave` also
@@ -3594,10 +3706,7 @@ mod tests {
         bo.takes(&g, &ana.all_of(&g));
         let said = bo.says_reach(&g, true);
         ana.takes(&g, &[said]);
-        assert_eq!(
-            relationship::reach_of(ana.space(&g), &bo.id()).len(),
-            1
-        );
+        assert_eq!(relationship::reach_of(ana.space(&g), &bo.id()).len(), 1);
         let ops = relationship::leave_ops(&bo.id());
         let (leave, gone) = bo.core.write_entry(&g, ops).unwrap();
         ana.takes(&g, &[gone]);
