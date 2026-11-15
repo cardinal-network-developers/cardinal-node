@@ -9,15 +9,18 @@
 //! options answer in one line of JSON, and start nothing:
 //!
 //! - `cardinald --store` says which store the data directory holds
-//!   (`empty`, `current` or `other`) and what it `holds`, counted without
-//!   reading any of it; of another version's, whether that was `earlier`,
-//!   `later` or `another` (`written_by`), and the `refusal` in words.
+//!   (`empty`, `current`, `other`, or `unreadable` if its marker is there
+//!   and cannot be read) and what it `holds`, counted without reading any
+//!   of it; of another version's, whether that was `earlier`, `later` or
+//!   `another` (`written_by`), and the `refusal` in words.
 //! - `cardinald --clear` removes what the service wrote there, as `cardinal
 //!   clear` does, and leaves the files kept on this device only. It
-//!   refuses while a service answers on that directory. It also refuses a
-//!   store this version can read: nothing here asks the person first, so
-//!   it must not be able to remove one that works. `cardinal clear` does
-//!   that, and asks.
+//!   refuses while a service runs on that directory. It removes only a
+//!   store of another version's, one with an identity, a space or an
+//!   object in it: nothing here asks the person first, so it must not be
+//!   able to remove a store that works, or one whose marker cannot be
+//!   read, or what lies in a directory that holds no store. `cardinal
+//!   clear` does that, and asks.
 
 use cardinald::format::{self, Store};
 use cardinald::paths::Paths;
@@ -35,13 +38,27 @@ async fn clear(paths: &Paths) -> Value {
         });
     }
     // Only what this version cannot read goes this way. A client offers it
-    // when the service will not start, and a store that works is never that.
-    if format::of(paths) == Store::Current {
-        return json!({
-            "ok": false,
-            "error": "This version can read the Cardinal data here, so it is not removed this \
-                      way. `cardinal clear` removes it, and asks first. Nothing was changed.",
-        });
+    // when the service will not start, and a store that works is never
+    // that. Nor is a directory with no store in it, or one whose marker
+    // cannot be read.
+    let refuse = |why: String| json!({"ok": false, "error": why});
+    match format::of(paths) {
+        Store::Current => {
+            return refuse(
+                "This version can read the Cardinal data here, so it is not removed this way. \
+                 `cardinal clear` removes it, and asks first. Nothing was changed."
+                    .into(),
+            );
+        }
+        Store::Unreadable => return refuse(format::cannot_tell(&paths.home)),
+        _ if !format::removable_unasked(paths) => {
+            return refuse(
+                "There is no Cardinal data here that this version cannot read. Nothing was \
+                 changed."
+                    .into(),
+            );
+        }
+        _ => {}
     }
     match cardinald::clear::clear(paths, false) {
         Ok(()) => json!({"ok": true}),

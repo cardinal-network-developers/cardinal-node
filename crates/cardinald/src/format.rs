@@ -27,6 +27,10 @@ pub enum Store {
     Current,
     /// A store of another format: its number, if the marker gives one.
     Other(Option<u64>),
+    /// A marker is there and cannot be read, so nothing says which format
+    /// the store is. It may be one that works: nothing opens it, and
+    /// nothing removes it without asking.
+    Unreadable,
 }
 
 /// The marker's path.
@@ -47,7 +51,7 @@ fn holds_a_file(dir: &Path) -> bool {
 }
 
 /// Whether a data directory holds an identity, a space or an object.
-fn holds_something(paths: &Paths) -> bool {
+pub fn holds_something(paths: &Paths) -> bool {
     let identity = std::fs::metadata(paths.identity_log()).is_ok_and(|m| m.len() > 0);
     let space = std::fs::read_dir(paths.spaces()).is_ok_and(|mut rd| rd.next().is_some());
     identity || space || holds_a_file(&paths.blobs().join("objects"))
@@ -69,9 +73,30 @@ pub fn of(paths: &Paths) -> Store {
                 Store::Empty
             }
         }
-        // a marker that is there and cannot be read says nothing good
-        Err(_) => Store::Other(None),
+        // a marker that is there and cannot be read says nothing at all
+        Err(_) => Store::Unreadable,
     }
+}
+
+/// Whether a data directory holds what the service's program may remove
+/// without asking anyone: a store of another format, with an identity, a
+/// space or an object to show that it is one. Not an empty directory,
+/// where whatever has a name the service would use is somebody else's;
+/// not a store this version reads; and not one whose marker cannot be
+/// read, which may be either.
+pub fn removable_unasked(paths: &Paths) -> bool {
+    matches!(of(paths), Store::Other(_)) && holds_something(paths)
+}
+
+/// What to tell a person whose data directory has a marker that cannot be
+/// read.
+pub fn cannot_tell(home: &Path) -> String {
+    format!(
+        "Cardinal cannot tell which version wrote the data in {}: its `format` file is there \
+         and cannot be read. Nothing was changed. Look at that file; `cardinal clear` removes \
+         the data, and asks first.",
+        home.display()
+    )
 }
 
 /// Which version wrote a store of another format, as far as its marker
@@ -86,7 +111,8 @@ pub fn written_by(format: Option<u64>) -> &'static str {
 }
 
 /// What a data directory holds, for a window to read when no service
-/// answers there: which `store` (`empty`, `current` or `other`), what it
+/// answers there: which `store` (`empty`, `current`, `other`, or
+/// `unreadable` where a marker is there and cannot be read), what it
 /// `holds`, counted without reading any of it, and of another version's
 /// who it was `written_by` and the `refusal` in words. `cardinal store`
 /// and `cardinald --store` both print this, as one line.
@@ -113,6 +139,10 @@ pub fn says(paths: &Paths) -> serde_json::Value {
             out["store"] = serde_json::json!("other");
             out["written_by"] = serde_json::json!(written_by(n));
             out["refusal"] = serde_json::json!(refusal(&paths.home, n));
+        }
+        Store::Unreadable => {
+            out["store"] = serde_json::json!("unreadable");
+            out["refusal"] = serde_json::json!(cannot_tell(&paths.home));
         }
     }
     out
@@ -142,6 +172,7 @@ pub fn check(paths: &Paths) -> anyhow::Result<()> {
     match of(paths) {
         Store::Empty | Store::Current => Ok(()),
         Store::Other(format) => anyhow::bail!("{}", refusal(&paths.home, format)),
+        Store::Unreadable => anyhow::bail!("{}", cannot_tell(&paths.home)),
     }
 }
 

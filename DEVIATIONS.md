@@ -817,7 +817,15 @@ Not implemented yet (the next milestone):
   directory, say an earlier (or later) version wrote it, that this one
   cannot read it and changed nothing, and what to do; every command says
   the same when no daemon answers. A marker that is not a number is
-  another version's.
+  another version's. **Reading: a marker that cannot be read** (it is a
+  directory, or may not be opened) says nothing, and the store may be one
+  that works: nothing starts on it, `--store` says `unreadable` with the
+  reason in words, and `cardinald --clear` refuses it. `apps.md` gives
+  the service's program "data this version cannot read" to remove: here
+  that is a store of another format with an identity, a space or an
+  object in it, and never a directory that holds no store, whatever in
+  it has a name the service would use. `cardinal clear` removes any of
+  these, and asks first.
 - **One process on a data directory** (`lock.rs`; not in the
   specification). A service holds an exclusive lock on its data directory
   (on the directory itself, so that nothing is written to take it; on

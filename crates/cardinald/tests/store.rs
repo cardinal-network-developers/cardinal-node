@@ -151,9 +151,11 @@ fn it_clears_what_the_service_wrote_and_nothing_else() {
     let (_, v) = asked(home, "--store");
     assert_eq!(v["store"], "empty", "{v}");
     assert_eq!(v["holds"]["local"], 1, "{v}");
-    // Again changes nothing.
+    // Again, there is nothing of another version's to remove: it says
+    // so, and changes nothing.
     let (out, v) = asked(home, "--clear");
-    assert!(out.status.success(), "{v}");
+    assert!(!out.status.success(), "{v}");
+    assert!(v["error"].as_str().unwrap().contains("Nothing was changed"));
     assert_eq!(names(home).len(), 3);
 }
 
@@ -209,4 +211,64 @@ fn it_clears_nothing_while_the_service_runs() {
         "{why}"
     );
     assert!(home.join("device.key").exists(), "its keys were removed");
+}
+
+/// D5. `--clear` removes data this version cannot read, and nothing else:
+/// nobody is asked first. A directory with no sign of Cardinal in it is
+/// not that, whatever in it has a name the service would use.
+#[test]
+fn it_clears_nothing_where_there_is_no_store() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path();
+    put(home, "mailbox/x", b"someone's own");
+    put(home, "staging/y", b"someone's own");
+    put(home, "peers.json", b"someone's own");
+    put(home, "blobs/tmp/z", b"someone's own");
+    let before = everything(home);
+    let (_, v) = asked(home, "--store");
+    assert_eq!(v["store"], "empty", "{v}");
+    let (out, v) = asked(home, "--clear");
+    assert!(!out.status.success(), "{v}");
+    assert_eq!(v["ok"], false, "{v}");
+    let why = v["error"].as_str().unwrap();
+    assert!(why.contains("Nothing was changed"), "{why}");
+    assert_eq!(everything(home), before, "something was removed");
+    // Nor in a directory that is not there, which stays not there.
+    let none = home.join("none");
+    let (out, v) = asked(&none, "--clear");
+    assert!(!out.status.success(), "{v}");
+    assert!(!none.exists());
+}
+
+/// D5. A marker that is there and cannot be read says nothing of which
+/// version wrote the store. That is not "another version": the store may
+/// be one that works. The service does not start on it, says that it
+/// cannot tell, and does not clear it.
+#[test]
+fn a_marker_that_cannot_be_read_is_not_another_versions() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path();
+    full(home);
+    std::fs::remove_file(home.join("format")).unwrap();
+    std::fs::create_dir(home.join("format")).unwrap();
+    let before = everything(home);
+    let (out, v) = asked(home, "--store");
+    assert!(out.status.success(), "{v}");
+    assert_eq!(v["store"], "unreadable", "{v}");
+    assert!(v.get("written_by").is_none(), "{v}");
+    let why = v["refusal"].as_str().unwrap();
+    assert!(
+        why.contains("cannot tell") && why.contains("Nothing was changed"),
+        "{why}"
+    );
+    assert!(why.contains(&*home.display().to_string()), "{why}");
+    let (out, v) = asked(home, "--clear");
+    assert!(!out.status.success(), "{v}");
+    assert_eq!(v["ok"], false, "{v}");
+    assert!(v["error"].as_str().unwrap().contains("cannot tell"), "{v}");
+    let run = cmd(home).arg("--no-discovery").output().unwrap();
+    assert!(!run.status.success());
+    let why = String::from_utf8_lossy(&run.stderr);
+    assert!(why.contains("cannot tell"), "{why}");
+    assert_eq!(everything(home), before, "something was changed");
 }
