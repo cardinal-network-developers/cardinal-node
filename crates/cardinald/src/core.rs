@@ -3258,6 +3258,53 @@ mod tests {
         assert!(!t.empties_unasked() && !t.sets_unasked() && !t.keeps_current());
     }
 
+    /// P5 (`hosts.md`, "Whoever is added later"). Someone who had left and
+    /// is added again has been added: they read where the person's hosts
+    /// are from then on, and the person is told of them, though an earlier
+    /// addition of theirs came before the reach node was set.
+    #[test]
+    fn someone_who_left_and_is_added_again_is_told_of() {
+        let [mut ana, mut bo, mut cy, _] = four();
+        bo.knows(&ana, "Ana");
+        bo.hosts_at("203.0.113.5:7171");
+        // Cy, whom Bo does not know, is in the group, and leaves it.
+        let cy_shown = [(cy.id(), "Cy".to_owned())];
+        let g = ana.core.create_group("Choir", "Ana", &cy_shown).unwrap();
+        cy.takes(&g, &ana.all_of(&g));
+        let joined = cy.says_reach(&g, false);
+        ana.takes(&g, &[joined]);
+        let (_, gone) = cy
+            .core
+            .write_entry(&g, relationship::leave_ops(&cy.id()))
+            .unwrap();
+        ana.takes(&g, &[gone]);
+        // Bo is added. Everyone there is his contact, and his host is
+        // named without asking.
+        let bo_shown = [(bo.id(), "Bo".to_owned())];
+        ana.core.add_to_group(&g, &bo_shown).unwrap();
+        bo.takes(&g, &ana.all_of(&g));
+        let t = bo.core.telling(&g);
+        assert!(t.who.is_empty() && !t.ask());
+        let said = bo.says_reach(&g, true);
+        ana.takes(&g, &[said]);
+        assert!(bo.core.telling(&g).added().is_empty());
+        // Cy is added again, and reads it.
+        let again = ana.core.add_to_group(&g, &cy_shown).unwrap();
+        bo.takes(&g, &[again]);
+        let t = bo.core.telling(&g);
+        assert_eq!(t.who, [cy.id()]);
+        assert_eq!(t.added(), [cy.id()], "he is not told that Cy is back");
+        assert!(!t.keeps_current());
+        let listed = crate::groups::list_of(&bo.core);
+        assert_eq!(
+            listed["groups"][0]["reach"]["added"],
+            serde_json::json!(["Cy"])
+        );
+        // His answer covers Cy from then on.
+        bo.says_reach(&g, true);
+        assert!(bo.core.telling(&g).added().is_empty());
+    }
+
     /// P2. Among contacts a reach node is set unasked, to the person's
     /// hosts. A device that cannot reach the host has only an empty list
     /// to set: once, and then nothing until it can.

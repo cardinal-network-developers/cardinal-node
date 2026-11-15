@@ -1053,22 +1053,30 @@ impl Judge {
         out
     }
 
-    /// The identities added only after every one of `since`: those a valid
-    /// entry after the genesis adds, none of whose valid additions is one
-    /// of `since` or an ancestor of one, and whom the genesis does not
-    /// name. With nothing in `since`, everyone added after the genesis.
-    /// Sorted.
+    /// The identities added only after every one of `since`: those whom a
+    /// valid entry after the genesis adds, where no addition that still
+    /// brings them in is one of `since` or an ancestor of one. An addition
+    /// that its member left after brings them in no longer, so someone who
+    /// left and was added again has been added by the later entry
+    /// (`hosts.md#telling-others-where-to-reach-you`); and whom the genesis
+    /// names was there from the start, unless they left since. With
+    /// nothing in `since`, everyone added after the genesis. Sorted.
     pub fn added_after(&self, dag: &Dag<SpaceEntry>, since: &[EntryId]) -> Vec<IdentityId> {
         let genesis = self.genesis.as_ref().filter(|g| g.formed);
         let mut out = Vec::new();
         for (who, adds) in &self.adds_of {
-            if genesis.is_some_and(|g| g.top.contains_key(who)) {
+            let leaves = self.leaves.get(who).map_or(&[][..], |v| v.as_slice());
+            let leaves: Vec<&EntryId> = leaves.iter().filter(|l| self.info[*l].valid).collect();
+            if leaves.is_empty() && genesis.is_some_and(|g| g.top.contains_key(who)) {
                 continue;
             }
             let adds = adds.iter().map(|(m, _)| &self.marks[*m as usize]);
-            let valid: Vec<&EntryId> = adds.filter(|a| self.info[*a].valid).collect();
+            let left_after = |a: &&EntryId| leaves.iter().any(|l| dag.is_ancestor(a, l));
+            let brings: Vec<&EntryId> = adds
+                .filter(|a| self.info[*a].valid && !left_after(a))
+                .collect();
             let before = |a: &&EntryId| since.iter().any(|s| dag.is_ancestor_or_self(a, s));
-            if !valid.is_empty() && !valid.iter().any(before) {
+            if !brings.is_empty() && !brings.iter().any(before) {
                 out.push(*who);
             }
         }
