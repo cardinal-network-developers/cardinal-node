@@ -879,8 +879,12 @@ impl Space {
             author_head(author, &device.public_key()),
             new.id(),
         )
-        .op(SpaceOp::rotate(&refs))
+        // The `rotate` goes after the ops it was asked to carry: their
+        // writer numbered them, and worked out the ids of the nodes they
+        // make, from the first of them. An op put in front would move
+        // every index and every node id by one.
         .ops(ops)
+        .op(SpaceOp::rotate(&refs))
         .wraps(&wraps);
         if let Some(t) = time {
             b = b.time(t);

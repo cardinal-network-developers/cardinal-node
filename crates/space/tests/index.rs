@@ -578,3 +578,27 @@ fn values_one_entry_wrote_are_in_the_order_of_its_ops() {
         .all(|v| v.get(1).and_then(Value::as_bytes) == Some(&e[..])));
     p.agrees();
 }
+
+/// A `rotate` that is written with other ops goes after them. Their writer
+/// numbered them, and worked out the ids of the nodes they make, from the
+/// first of them, before it knew a rotation was due: an op put in front
+/// would move every index and every node id by one (review finding D1).
+#[test]
+fn a_rotation_carried_with_ops_does_not_move_them() {
+    let mut p = one(80);
+    let ops = vec![folder(ROOT, "Trip"), folder_under(0, "inner")];
+    let recipients = [p.enc.public_key()];
+    let (id, _, _) = p
+        .space
+        .rotate_entry(&p.log, &p.device.signing, &recipients, ops, None)
+        .unwrap();
+    let entry = p.space.entry(&id).unwrap();
+    assert!(entry.starts_epoch());
+    assert!(p.space.validity().is_valid(&id));
+    assert!(p.space.state().is_accepted(&id));
+    let (trip, inner) = (derived_id(&id, 0), derived_id(&id, 1));
+    assert_eq!(p.parent_of(&trip), ROOT);
+    assert_eq!(p.parent_of(&inner), trip);
+    assert_eq!(p.names("Trip"), ["inner"]);
+    p.agrees();
+}

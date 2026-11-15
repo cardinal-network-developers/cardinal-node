@@ -1451,6 +1451,40 @@ mod tests {
         assert!(fx.core.rotate_if_due(&fx.space).unwrap().is_none());
     }
 
+    /// D1. A rotation that comes due and is started in the entry a burst
+    /// goes in takes no place in front of the burst's ops: each index was
+    /// numbered, and each node's id worked out, from the burst's own first
+    /// op (`state.md#a-node-made-in-the-same-entry`).
+    #[test]
+    fn a_rotation_started_with_a_burst_leaves_its_ops_where_they_were_numbered() {
+        let mut fx = Fx::new();
+        let before = fx.sp().current_epoch().unwrap();
+        fx.new_identity_key();
+        let dir = fx.t.alloc(Kind::Dir);
+        fx.t.attach(dir, ROOT_INO, "Trip");
+        let file = fx.write_in(dir, "plan.txt", b"hi");
+        // `write_pending` is what a commit runs once it has encoded: by
+        // then a rotation may have come due that was not when it began.
+        assert_eq!(fx.commit(), 1);
+        assert_ne!(fx.sp().current_epoch(), Some(before));
+        let last = *fx.sp().dag().log_order().last().unwrap();
+        let entry = fx.sp().entry(&last).unwrap();
+        assert!(entry.starts_epoch());
+        assert!(
+            fx.sp().state().is_accepted(&last),
+            "the burst is not in the state"
+        );
+        let st = fx.sp().state();
+        let (d, f) = (fx.node(dir), fx.node(file));
+        assert_eq!(st.node(&d).map(|n| n.parent), Some(ROOT));
+        assert_eq!(st.node(&f).map(|n| n.parent), Some(d));
+        let list = Files::new(fx.sp()).list_path("Trip").unwrap();
+        assert_eq!(list.len(), 1);
+        fx.refresh();
+        assert_eq!(fx.t.child(dir, "plan.txt"), Some(file));
+        assert!(!fx.t.has_pending());
+    }
+
     /// Content is keyed by the epoch, so a commit asks for the rotation by
     /// itself before it encodes anything.
     #[test]
