@@ -223,36 +223,84 @@ impl Genesis {
 
 // --------------------------------------------------------------- bit sets
 
-/// A set of marks. Bits are only ever set, and the vector never ends in a
-/// zero word, so equal sets are equal vectors.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-struct Bits(Vec<u64>);
+/// How many words a block of a set of marks holds.
+const BLOCK: usize = 16;
+/// How many marks that is.
+const BLOCK_BITS: u32 = (BLOCK * 64) as u32;
+
+/// A set of marks, in blocks that sets share. Every entry keeps the set of
+/// marks in its causal past, and along a chain each differs from the one
+/// before by a mark or two: kept flat, a chain of N marked entries held N
+/// squared over sixteen bytes of them. Here a set that is made from
+/// another holds the same blocks and its own copy of those that differ.
+///
+/// Bits are only ever set, a block that is there has a bit set, and the
+/// vector never ends in a block that is not there: so equal sets are equal
+/// vectors.
+#[derive(Clone, Debug, Default)]
+struct Bits(Vec<Option<Arc<[u64; BLOCK]>>>);
+
+impl PartialEq for Bits {
+    fn eq(&self, other: &Bits) -> bool {
+        let same = |(a, b): (&Option<Arc<[u64; BLOCK]>>, &Option<Arc<[u64; BLOCK]>>)| match (a, b) {
+            (Some(a), Some(b)) => Arc::ptr_eq(a, b) || a == b,
+            (None, None) => true,
+            _ => false,
+        };
+        self.0.len() == other.0.len() && self.0.iter().zip(&other.0).all(same)
+    }
+}
+
+impl Eq for Bits {}
 
 impl Bits {
     fn get(&self, i: u32) -> bool {
-        let w = self.0.get((i / 64) as usize);
-        w.is_some_and(|w| w >> (i % 64) & 1 == 1)
+        let block = self.0.get((i / BLOCK_BITS) as usize);
+        let word = block
+            .and_then(|b| b.as_ref())
+            .map(|b| b[(i % BLOCK_BITS / 64) as usize]);
+        word.is_some_and(|w| w >> (i % 64) & 1 == 1)
     }
 
     fn set(&mut self, i: u32) {
-        let at = (i / 64) as usize;
-        if self.0.len() <= at {
-            self.0.resize(at + 1, 0);
+        if self.get(i) {
+            return;
         }
-        self.0[at] |= 1 << (i % 64);
+        let at = (i / BLOCK_BITS) as usize;
+        if self.0.len() <= at {
+            self.0.resize(at + 1, None);
+        }
+        let block = self.0[at].get_or_insert_with(|| Arc::new([0; BLOCK]));
+        // its own copy, if another set holds this block too
+        Arc::make_mut(block)[(i % BLOCK_BITS / 64) as usize] |= 1 << (i % 64);
     }
 
     fn union_with(&mut self, other: &Bits) {
         if self.0.len() < other.0.len() {
-            self.0.resize(other.0.len(), 0);
+            self.0.resize(other.0.len(), None);
         }
-        for (a, b) in self.0.iter_mut().zip(&other.0) {
-            *a |= b;
+        for (mine, theirs) in self.0.iter_mut().zip(&other.0) {
+            let Some(theirs) = theirs else { continue };
+            match mine {
+                // the same block, shared
+                None => *mine = Some(theirs.clone()),
+                Some(mine) if Arc::ptr_eq(mine, theirs) => {}
+                Some(mine) => {
+                    // a copy only if it brings something
+                    if mine.iter().zip(theirs.iter()).any(|(a, b)| b & !a != 0) {
+                        for (a, b) in Arc::make_mut(mine).iter_mut().zip(theirs.iter()) {
+                            *a |= b;
+                        }
+                    }
+                }
+            }
         }
     }
 
     fn intersects(&self, other: &Bits) -> bool {
-        self.0.iter().zip(&other.0).any(|(a, b)| a & b != 0)
+        let both = self.0.iter().zip(&other.0);
+        let mut blocks = both.filter_map(|(a, b)| Some((a.as_ref()?, b.as_ref()?)));
+        blocks.any(|(a, b)| a.iter().zip(b.iter()).any(|(a, b)| a & b != 0))
     }
 
     fn is_empty(&self) -> bool {
