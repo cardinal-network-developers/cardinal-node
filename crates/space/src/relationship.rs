@@ -252,7 +252,7 @@ pub fn naming_began(space: &crate::Space, who: &IdentityId) -> Vec<EntryId> {
     // whether it was empty
     let mut sets: Vec<(usize, EntryId, bool)> = Vec::new();
     for (id, e) in dag.iter().filter(|(_, e)| e.author() == *who) {
-        let lists = e.ops().iter().filter_map(|op| match op.body() {
+        let mut lists = e.ops().iter().filter_map(|op| match op.body() {
             crate::SpaceOpBody::Set {
                 node: n,
                 key: 1,
@@ -261,7 +261,9 @@ pub fn naming_began(space: &crate::Space, who: &IdentityId) -> Vec<EntryId> {
             } if *n == node => Some(value.as_ref().and_then(Value::as_list).unwrap_or_default()),
             _ => None,
         });
-        let Some(list) = lists.last() else { continue };
+        let Some(list) = lists.next_back() else {
+            continue;
+        };
         if let Some(at) = dag.position(id).filter(|_| state.is_accepted(id)) {
             sets.push((at, *id, list.is_empty()));
         }

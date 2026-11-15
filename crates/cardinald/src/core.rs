@@ -3489,10 +3489,10 @@ mod tests {
         let listed = crate::groups::list_of(&bo.core);
         let of = |name: &str| {
             let all = listed["groups"].as_array().unwrap().iter();
-            let found = all
+            let mut found = all
                 .filter(|x| x["name"] == name)
                 .map(|x| x["reach"].clone());
-            found.last().unwrap()
+            found.next().unwrap()
         };
         assert_eq!(
             of("Garden club")["added"],
