@@ -1122,7 +1122,7 @@ impl Core {
         let Some(h) = self.spaces.get(space).and_then(|h| h.space.as_ref()) else {
             return Vec::new();
         };
-        cardinal_space::relationship::reach_of(h.state(), who)
+        cardinal_space::relationship::reach_of(h, who)
     }
 
     /// Whether `who` has set their reach node in a space, if only to say
@@ -3103,7 +3103,7 @@ mod tests {
         bo.takes(&g, std::slice::from_ref(&added));
         cy.takes(&g, &ana.all_of(&g));
         assert_eq!(
-            relationship::reach_of(cy.space(&g).state(), &bo.id()).len(),
+            relationship::reach_of(cy.space(&g), &bo.id()).len(),
             1
         );
         let t = bo.core.telling(&g);
@@ -3136,7 +3136,7 @@ mod tests {
         assert!(t.added().is_empty() && !t.shared && !t.ask());
         dee.takes(&g, &ana.all_of(&g));
         dee.takes(&g, &bo.all_of(&g));
-        assert!(relationship::reach_of(dee.space(&g).state(), &bo.id()).is_empty());
+        assert!(relationship::reach_of(dee.space(&g), &bo.id()).is_empty());
 
         // A contact who is added is nobody to tell of.
         let [mut eve, mut fay, mut gus, _] = four();
@@ -3309,13 +3309,13 @@ mod tests {
         assert!(bo.began_an_epoch(&account));
     }
 
-    /// P3 (`spaces.md#members-and-roles`). Leaving empties the reach node
-    /// in the entry that leaves. If another of the person's devices set it
-    /// at the same moment, it names hosts again: then a device of theirs
-    /// that still holds the space empties it again, the one thing a
-    /// member who has left still writes.
+    /// P3 (`spaces.md#members-and-roles`), D68 (`profiles.md#reach`).
+    /// Leaving empties the reach node in the entry that leaves. If another
+    /// of the person's devices set it at the same moment, the node holds
+    /// both lists, and the empty one wins: nobody reads a host from it,
+    /// with nothing more written.
     #[test]
-    fn a_reach_node_that_names_hosts_after_leaving_is_emptied_again() {
+    fn a_reach_node_set_beside_leaving_names_no_host() {
         let [mut ana, mut bo, _, _] = four();
         bo.knows(&ana, "Ana");
         bo.hosts_at("203.0.113.5:7171");
@@ -3341,21 +3341,11 @@ mod tests {
             .unwrap();
         ana.takes(&g, &bo.all_of(&g));
         assert!(ana.space(&g).has_left(&me));
-        assert_eq!(relationship::reach_of(ana.space(&g).state(), &me).len(), 1);
-        // His device finds that, and empties it.
+        assert_eq!(ana.space(&g).state().reach_values(&me, 1).len(), 2);
+        assert!(relationship::reach_of(ana.space(&g), &me).is_empty());
         let t = bo.core.telling(&g);
-        assert!(t.shared && !t.joined);
-        assert!(t.empties_unasked(), "nothing empties it");
-        let emptied = bo.says_reach(&g, false);
-        ana.takes(&g, &[emptied]);
-        let sp = ana.space(&g);
-        assert!(relationship::reach_of(sp.state(), &me).is_empty());
-        let last = *sp.dag().log_order().last().unwrap();
-        assert!(sp.validity().is_valid(&last) && sp.state().is_accepted(&last));
-        // He has still left, and there is nothing more to write.
-        assert!(sp.has_left(&me) && !sp.accepted_by(&me));
-        let t = bo.core.telling(&g);
-        assert!(!t.empties_unasked() && !t.sets_unasked() && !t.keeps_current());
+        assert!(!t.shared && !t.joined);
+        assert!(!t.sets_unasked() && !t.keeps_current());
     }
 
     /// P5 (`hosts.md`, "Whoever is added later"). Someone who had left and
@@ -3605,7 +3595,7 @@ mod tests {
         let said = bo.says_reach(&g, true);
         ana.takes(&g, &[said]);
         assert_eq!(
-            relationship::reach_of(ana.space(&g).state(), &bo.id()).len(),
+            relationship::reach_of(ana.space(&g), &bo.id()).len(),
             1
         );
         let ops = relationship::leave_ops(&bo.id());
@@ -3615,7 +3605,7 @@ mod tests {
             let sp = who.space(&g);
             assert!(sp.validity().is_valid(&leave) && sp.state().is_accepted(&leave));
             assert!(sp.has_left(&bo.id()));
-            assert!(relationship::reach_of(sp.state(), &bo.id()).is_empty());
+            assert!(relationship::reach_of(sp, &bo.id()).is_empty());
             // it is set, to nothing: not as if it had never been
             assert!(relationship::reach_is_set(sp.state(), &bo.id()));
         }
@@ -3623,7 +3613,7 @@ mod tests {
         let cy_shown = [(cy.id(), "Cy".to_owned())];
         ana.core.add_to_group(&g, &cy_shown).unwrap();
         cy.takes(&g, &ana.all_of(&g));
-        assert!(relationship::reach_of(cy.space(&g).state(), &bo.id()).is_empty());
+        assert!(relationship::reach_of(cy.space(&g), &bo.id()).is_empty());
     }
 
     /// An offer of a group says so if the group is public

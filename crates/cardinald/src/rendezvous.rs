@@ -109,6 +109,7 @@ const BUSY: u64 = 5;
 
 /// An endpoint's carrier: `hosts.md#grants`.
 const UDP: u64 = 1;
+const TCP: u64 = 2;
 /// The field of a device's local addresses, in what is said of it.
 const LOCAL: u64 = 4;
 
@@ -344,6 +345,11 @@ fn address_record(a: &SocketAddr) -> Record {
 
 fn read_address(v: &Value) -> Option<SocketAddr> {
     let r = v.as_record()?;
+    // A carrier this version does not know says itself what its other
+    // fields hold: such an address is skipped (`hosts.md#grants`).
+    if !matches!(r.get(1)?.as_uint()?, UDP | TCP) {
+        return None;
+    }
     let ip: IpAddr = match r.get(2)?.as_bytes()?.len() {
         4 => <[u8; 4]>::try_from(r.get(2)?.as_bytes()?).ok()?.into(),
         16 => <[u8; 16]>::try_from(r.get(2)?.as_bytes()?).ok()?.into(),

@@ -181,18 +181,35 @@ pub fn reach_is_set(state: &State, who: &IdentityId) -> bool {
     !state.reach_values(who, 1).is_empty()
 }
 
-/// Every host and token `who` gives in their reach node. Where two of their
-/// devices set it at the same moment it holds both lists, and both count
-/// (`profiles.md#reach`).
-pub fn reach_of(state: &State, who: &IdentityId) -> Vec<Reach> {
-    let mut all: Vec<Reach> = Vec::new();
-    let mut seen: std::collections::HashMap<([u8; 32], [u8; 16]), Vec<usize>> = Default::default();
-    for v in state.reach_values(who, 1) {
+/// Every host and token `who` gives in their reach node, those their
+/// person prefers first (`profiles.md#reach`). Where two of their devices
+/// set it at the same moment it holds both lists:
+///
+/// - if either is empty, it is empty. An empty list is how a person says
+///   no, and a no stands against whatever was set beside it
+///   (`hosts.md#telling-others-where-to-reach-you`);
+/// - otherwise both count, the one set later in log order first.
+///
+/// This is the one reading of a reach node: whoever looks up a host of
+/// someone's goes through it, as does whatever shows the list.
+pub fn reach_of(space: &crate::Space, who: &IdentityId) -> Vec<Reach> {
+    let dag = space.dag();
+    let mut lists: Vec<_> = Vec::new();
+    for v in space.state().reach_values(who, 1) {
         let list = v
             .value
             .as_ref()
             .and_then(Value::as_list)
             .unwrap_or_default();
+        if list.is_empty() {
+            return Vec::new();
+        }
+        lists.push((dag.position(&v.entry), v.op, list));
+    }
+    lists.sort_by_key(|(at, op, _)| std::cmp::Reverse((*at, *op)));
+    let mut all: Vec<Reach> = Vec::new();
+    let mut seen: std::collections::HashMap<([u8; 32], [u8; 16]), Vec<usize>> = Default::default();
+    for (_, _, list) in lists {
         for r in list.iter().filter_map(|v| read_reach(v.as_record()?)) {
             // Told from those taken already by looking it up: comparing
             // with each of them is the square of a list its member, a
@@ -205,6 +222,14 @@ pub fn reach_of(state: &State, who: &IdentityId) -> Vec<Reach> {
         }
     }
     all
+}
+
+/// Whether `who`'s reach node holds more than one list: two of their
+/// devices set it at the same moment. A device of theirs that sees this
+/// SHOULD set the one result ([`reach_of`]), so that the next reader need
+/// not work it out (`profiles.md#reach`).
+pub fn reach_is_split(state: &State, who: &IdentityId) -> bool {
+    state.reach_values(who, 1).len() > 1
 }
 
 /// Every host and token `who` ever gave in their reach node in a space:

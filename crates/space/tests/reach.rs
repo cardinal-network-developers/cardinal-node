@@ -81,37 +81,81 @@ fn its_id_follows_from_the_identitys() {
 
 /// Two of Ana's devices set it at the same moment, and each registered a
 /// token. It holds both lists, and both count: a host maps either token to
-/// the space. One that has seen both replaces both.
+/// the space. The list set later in log order comes first, and within a
+/// list the order is its person's. One that has seen both replaces both.
 #[test]
 fn two_lists_set_at_once_both_count() {
     let mut t = two();
     let (ana, bo) = (t.ana.id(), t.bo.id());
     assert!(!relationship::reach_is_set(t.space.state(), &ana));
-    let op = relationship::set_reach(&ana, &[reach(1)]);
+    let op = relationship::set_reach(&ana, &[reach(1), reach(5)]);
     let (first, _) = t
         .space
         .write_entry(&t.ana, &t.ana_dev.signing, vec![op], Some(1))
         .unwrap();
-    let op = relationship::set_reach(&ana, &[reach(2)]);
-    t.space
+    let op = relationship::set_reach(&ana, &[reach(7), reach(2), reach(5)]);
+    let (second, _) = t
+        .space
         .write_concurrent(&t.ana, &t.ana_dev.signing, &[first], vec![op], Some(2))
         .unwrap();
 
-    let all = relationship::reach_of(t.space.state(), &ana);
-    let mut tokens: Vec<u8> = all.iter().map(|r| r.token[0]).collect();
-    tokens.sort();
-    assert_eq!(tokens, [1, 2]);
+    let all = relationship::reach_of(&t.space, &ana);
+    let tokens: Vec<u8> = all.iter().map(|r| r.token[0]).collect();
+    let dag = t.space.dag();
+    let later_first = match dag.position(&first) > dag.position(&second) {
+        true => [1, 5, 7, 2],
+        false => [7, 2, 5, 1],
+    };
+    assert_eq!(tokens, later_first);
     assert_eq!(t.space.state().reach_values(&ana, 1).len(), 2);
     assert!(relationship::reach_is_set(t.space.state(), &ana));
-    assert!(relationship::reach_of(t.space.state(), &bo).is_empty());
+    assert!(relationship::reach_of(&t.space, &bo).is_empty());
     assert!(!relationship::reach_is_set(t.space.state(), &bo));
 
     let op = relationship::set_reach(&ana, &[reach(3)]);
     t.space
         .write(&t.ana, &t.ana_dev.signing, vec![op], Some(3))
         .unwrap();
-    let all = relationship::reach_of(t.space.state(), &ana);
+    let all = relationship::reach_of(&t.space, &ana);
     assert_eq!(all, [reach(3)]);
+}
+
+/// D68 (`profiles.md#reach`). An empty list is how a person says no. Where
+/// two of their devices set the list at the same moment and either set it
+/// empty, it is empty for whoever looks a host up, whichever came first:
+/// no host and no token is read from it.
+#[test]
+fn of_two_lists_set_at_once_an_empty_one_wins() {
+    for emptied_first in [true, false] {
+        let mut t = two();
+        let ana = t.ana.id();
+        let lists: [&[Reach]; 2] = match emptied_first {
+            true => [&[], &[reach(1)]],
+            false => [&[reach(1)], &[]],
+        };
+        let op = relationship::set_reach(&ana, lists[0]);
+        let (first, _) = t
+            .space
+            .write_entry(&t.ana, &t.ana_dev.signing, vec![op], Some(1))
+            .unwrap();
+        let op = relationship::set_reach(&ana, lists[1]);
+        t.space
+            .write_concurrent(&t.ana, &t.ana_dev.signing, &[first], vec![op], Some(2))
+            .unwrap();
+        assert_eq!(t.space.state().reach_values(&ana, 1).len(), 2);
+        assert!(
+            relationship::reach_of(&t.space, &ana).is_empty(),
+            "a host is read beside a no (emptied first: {emptied_first})"
+        );
+        assert!(relationship::reach_is_set(t.space.state(), &ana));
+        // The one result, set by a device that has seen both, stands.
+        let op = relationship::set_reach(&ana, &[]);
+        t.space
+            .write(&t.ana, &t.ana_dev.signing, vec![op], Some(3))
+            .unwrap();
+        assert_eq!(t.space.state().reach_values(&ana, 1).len(), 1);
+        assert!(relationship::reach_of(&t.space, &ana).is_empty());
+    }
 }
 
 /// Someone with no host sets an empty list (`contact.md#accepting`, step
@@ -128,7 +172,7 @@ fn an_empty_list_is_an_answer() {
     assert!(t.space.validity().is_valid(&id));
     assert!(t.space.state().is_accepted(&id));
     assert!(relationship::reach_is_set(t.space.state(), &bo));
-    assert!(relationship::reach_of(t.space.state(), &bo).is_empty());
+    assert!(relationship::reach_of(&t.space, &bo).is_empty());
     // it is their first entry here, which is how a space is accepted
     assert!(t.space.accepted_by(&bo));
 }
@@ -184,7 +228,7 @@ fn nothing_else_names_a_reach_node() {
         .write_entry(&t.ana, &t.ana_dev.signing, ops, None)
         .unwrap();
     assert!(t.space.state().is_accepted(&id));
-    assert_eq!(relationship::reach_of(t.space.state(), &ana), [reach(1)]);
+    assert_eq!(relationship::reach_of(&t.space, &ana), [reach(1)]);
 }
 
 /// A reach node has a record in the canonical state only while it has a
@@ -242,7 +286,7 @@ fn in_the_canonical_state() {
     let field = Record::new().with(1, 1u64).with(2, Value::list([one]));
     let expected = Record::new().with(1, node).with(5, Value::list([field]));
     assert_eq!(of_reach(&t.space), [expected]);
-    assert!(relationship::reach_of(t.space.state(), &ana).is_empty());
+    assert!(relationship::reach_of(&t.space, &ana).is_empty());
     assert!(relationship::reach_is_set(t.space.state(), &ana));
 }
 
@@ -269,8 +313,8 @@ fn the_same_from_scratch() {
     let again =
         cardinal_space::State::compute(Profile::RELATIONSHIP, t.space.dag(), &valid).root_hash();
     assert_eq!(t.space.state().root_hash(), again);
-    assert_eq!(relationship::reach_of(t.space.state(), &ana), [reach(1)]);
-    assert_eq!(relationship::reach_of(t.space.state(), &bo), [reach(2)]);
+    assert_eq!(relationship::reach_of(&t.space, &ana), [reach(1)]);
+    assert_eq!(relationship::reach_of(&t.space, &bo), [reach(2)]);
 }
 
 /// V8. A reach node is a list its member writes, a reader as well. Taking
@@ -300,7 +344,7 @@ fn a_long_reach_list_is_read_in_one_pass() {
         .write(&t.ana, &t.ana_dev.signing, vec![set], None)
         .unwrap();
     let began = std::time::Instant::now();
-    let read = relationship::reach_of(t.space.state(), &who);
+    let read = relationship::reach_of(&t.space, &who);
     let took = began.elapsed();
     eprintln!(
         "MEASURE a reach node of {} entries was read in {took:?}",
@@ -348,7 +392,7 @@ fn an_endpoint_that_cannot_be_used_is_kept_as_it_came() {
     t.space
         .write(&t.ana, &t.ana_dev.signing, vec![set], None)
         .unwrap();
-    let read = relationship::reach_of(t.space.state(), &who);
+    let read = relationship::reach_of(&t.space, &who);
     assert_eq!(read.len(), 2, "a host is dropped for an endpoint");
     let addresses: Vec<std::net::SocketAddr> = read
         .iter()
