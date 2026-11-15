@@ -486,6 +486,12 @@ impl Judge {
                 self.keep_from(dag, &keeper, Some(id), &mut counted);
             }
         }
+        // What that has made count vouches in turn, as a witness and by
+        // its own `keep` ops, exactly as it would had the `keep` come
+        // last: validity does not turn on the order of arrival.
+        for kept in counted.clone() {
+            self.vouch_from(dag, kept, &mut counted);
+        }
         if ok {
             let i = self.info.get_mut(id).expect("just added");
             i.attrib = true;

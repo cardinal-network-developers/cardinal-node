@@ -1277,6 +1277,54 @@ fn a_genesis_names_one_owner_its_author_or_none() {
     }
 }
 
+/// V2. Validity does not turn on the order entries arrive in. Ana's phone
+/// wrote `x1`, her laptop built `y` on it, Ben built `z` on that, and both
+/// her devices were then removed. Her `keep` lists `z` for the laptop: so
+/// `y` counts, and `y`, counting, witnesses `x1`. That holds wherever the
+/// `keep` comes among the others, and it used to fail where it came first:
+/// what the `keep` made count when `z` arrived vouched for nothing in turn.
+#[test]
+fn what_a_keep_makes_count_vouches_in_turn_whenever_it_arrives() {
+    const L: usize = 2; // the laptop, another device key
+    let mut s = Scene::new(ANA, A, &[(ANA, OWNER), (BEN, WRITER)], None);
+    s.write("x1", ANA, P, app(), Some(&["genesis"]));
+    s.write("y", ANA, L, app(), Some(&["x1"]));
+    s.write("z", BEN, P, app(), Some(&["y"]));
+    s.write("w", ANA, A, keep(&s, ANA, L, &["z"]), Some(&["genesis"]));
+    for device in [P, L] {
+        let p = &mut s.people[ANA];
+        let key = p.keys[device].public_key();
+        p.log.remove_key(&p.keys[A], &key).unwrap();
+    }
+    s.judge.set_state(&s.dag, s.people[ANA].log.state());
+    let all = ["x1", "y", "z", "w"];
+    assert!(s.all_valid(&all));
+    let logs: Vec<&IdentityLog> = s.people.iter().map(|p| &p.log).collect();
+    let orders = [
+        ["genesis", "x1", "y", "z", "w"],
+        ["genesis", "x1", "y", "w", "z"],
+        ["genesis", "x1", "w", "y", "z"],
+        ["genesis", "w", "x1", "y", "z"],
+    ];
+    for order in orders {
+        let (mut dag, mut judge) = (Dag::new(), Judge::new());
+        for p in &s.people {
+            judge.set_state(&dag, p.log.state());
+        }
+        for name in order {
+            let e = s.dag.get(&s.named[name]).unwrap().clone();
+            arrive(&mut judge, &mut dag, &e);
+        }
+        let valid: Vec<bool> = all
+            .iter()
+            .map(|n| judge.validity().valid.contains(&s.named[n]))
+            .collect();
+        assert_eq!(valid, [true; 4], "arriving as {order:?}");
+        compare(&judge, &dag, &logs, &format!("arriving as {order:?}"));
+        assert!(judge.validity().unwitnessed.is_empty(), "{order:?}");
+    }
+}
+
 #[test]
 fn removed_device_entries_need_a_witness() {
     let mut s = Scene::new(ANA, A, &[(ANA, OWNER)], None);
