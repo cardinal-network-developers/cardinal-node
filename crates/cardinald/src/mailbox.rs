@@ -338,7 +338,24 @@ pub struct Mailbox {
     pulled: Mutex<HashMap<SpaceId, Instant>>,
     /// Held while this device writes where to reach its person.
     reaching: tokio::sync::Mutex<()>,
+    /// The spaces where what this device set about on its own failed, as
+    /// for a log that cannot be written, and when it tries again.
+    put_off: Mutex<HashMap<SpaceId, PutOff>>,
+    /// Tests: run once a token is registered and before the list is
+    /// written, where an entry may arrive.
+    #[cfg(test)]
+    before_write: Mutex<Option<Box<dyn FnOnce() + Send>>>,
 }
+
+/// An attempt put off, and for how long the next one will be.
+struct PutOff {
+    until: Instant,
+    wait: Duration,
+}
+
+/// How long a write of the list that failed waits before it is tried
+/// again, at first and at most: each failure doubles it.
+const PUT_OFF: (Duration, Duration) = (Duration::from_secs(60), Duration::from_secs(3600));
 
 fn sent_key(space: &SpaceId, member: &[u8; 32]) -> String {
     format!("{}:{}", hex::encode(space), hex::encode(member))
@@ -369,6 +386,9 @@ impl Mailbox {
             going: Mutex::new(HashSet::new()),
             pulled: Mutex::new(HashMap::new()),
             reaching: tokio::sync::Mutex::new(()),
+            put_off: Mutex::new(HashMap::new()),
+            #[cfg(test)]
+            before_write: Mutex::new(None),
         }
     }
 
@@ -645,22 +665,32 @@ enum Add {
     Own,
 }
 
+/// Hosts to name, and which of their tokens were registered for it.
+#[derive(Default)]
+struct Given {
+    /// Each host, with a token for the space.
+    reach: Vec<Reach>,
+    /// Those whose token was made and registered now: what is taken back
+    /// if the list is not written after all.
+    new: Vec<Reach>,
+}
+
 /// This person's hosts that `named` does not name, each with a token for
 /// `space` registered at it, in the order the account gives them. A host
 /// that cannot be reached from here now gives no token, and is left out.
 /// This device, as a host, gives a token it gave for the space before if
 /// one is still active, and a new one only if none is: every token given
 /// serves until revoked, so a second would only be one more to keep.
-async fn reach_here(d: &Arc<Daemon>, space: &SpaceId, named: &[Reach], add: Add) -> Vec<Reach> {
+async fn reach_here(d: &Arc<Daemon>, space: &SpaceId, named: &[Reach], add: Add) -> Given {
     let me = d.keys.key();
     let hosts = d.core().mailboxes();
-    let mut reach = Vec::new();
+    let mut given = Given::default();
     for (grant, device) in hosts {
         let host = *grant.link_key.x25519();
         if named.iter().any(|r| r.host == host) || (add == Add::Own && device != me) {
             continue;
         }
-        let token = if device == me {
+        let (token, new) = if device == me {
             own_token(d, space)
         } else {
             let token: Token = random_bytes();
@@ -676,30 +706,138 @@ async fn reach_here(d: &Arc<Daemon>, space: &SpaceId, named: &[Reach], add: Add)
                 tracing::debug!("registering a token: {e:#}");
                 continue;
             }
-            token
+            (token, true)
         };
-        reach.push(Reach {
+        let reach = Reach {
             endpoints: grant.endpoints,
             host,
             token,
-        });
+        };
+        if new {
+            given.new.push(reach.clone());
+        }
+        given.reach.push(reach);
     }
-    reach
+    #[cfg(test)]
+    if let Some(arrives) = lock(&d.mailbox.before_write).take() {
+        arrives();
+    }
+    given
 }
 
 /// A token of this host's for a space: one it gave there before that is
-/// still active, or a new one, registered.
-fn own_token(d: &Daemon, space: &SpaceId) -> Token {
+/// still active, or a new one, registered. Says whether it is new.
+fn own_token(d: &Daemon, space: &SpaceId) -> (Token, bool) {
     let here = *d.keys.link.public_key().x25519();
     let given = d.core().tokens_given(space, &here);
     let store = lock(&d.mailbox.store);
     let active = given.into_iter().find(|t| store.is_active(t));
     drop(store);
-    active.unwrap_or_else(|| {
-        let token: Token = random_bytes();
-        register(d, &token);
-        token
-    })
+    match active {
+        Some(token) => (token, false),
+        None => {
+            let token: Token = random_bytes();
+            register(d, &token);
+            (token, true)
+        }
+    }
+}
+
+/// Takes back tokens registered for a list that was then not written
+/// (R1, R5): each is revoked at its host, here or over the session it was
+/// registered on. A host that cannot be reached now keeps a token nothing
+/// names; nothing was told of it, so nobody holds it.
+async fn take_back(d: &Arc<Daemon>, new: &[Reach]) {
+    let here = *d.keys.link.public_key().x25519();
+    for r in new {
+        if r.host == here {
+            revoke(d, &r.token);
+            continue;
+        }
+        let at_host = |s: &Session| s.peer_static() == r.host;
+        let Some(s) = d.own_sessions().into_iter().find(at_host) else {
+            continue;
+        };
+        let ask = Record::new()
+            .with(0, OP_REVOKE)
+            .with(1, Value::list([Value::from(r.token)]));
+        if let Err(e) = call(&s, Service::MAILBOX, ask).await {
+            tracing::debug!("taking back a token: {e:#}");
+        }
+    }
+}
+
+/// What a write of the list that software makes on its own was decided
+/// on: looked at again, under the core's lock, at the moment of writing.
+/// While a token was being registered an entry may have arrived, and one
+/// that set the list, an empty list above all, is later than the
+/// decision (R1): a no must not be written over.
+struct Decided {
+    telling: crate::core::Telling,
+    set_by: Vec<String>,
+}
+
+impl Decided {
+    fn now(core: &crate::core::Core, space: &SpaceId) -> Decided {
+        Decided {
+            telling: core.telling(space),
+            set_by: core.list_set_by(space),
+        }
+    }
+
+    fn still(&self, core: &crate::core::Core, space: &SpaceId) -> bool {
+        core.list_set_by(space) == self.set_by && core.telling(space) == self.telling
+    }
+}
+
+/// Sets the list as software decided on its own, if nothing that the
+/// decision rests on has changed since; and takes back the tokens
+/// registered for it if it has, or if the write fails. A write that fails
+/// is put off, longer each time, and not tried at every look (R5). Says
+/// whether the list was written.
+async fn set_as_decided(
+    d: &Arc<Daemon>,
+    space: &SpaceId,
+    decided: &Decided,
+    reach: &[Reach],
+    new: &[Reach],
+) -> anyhow::Result<bool> {
+    let me = me(d)?;
+    let set = relationship::set_reach(&me, reach);
+    let written = d.write_and_push_if(space, vec![set], |core| decided.still(core, space));
+    match written {
+        Ok(Some(_)) => {
+            lock(&d.mailbox.put_off).remove(space);
+            Ok(true)
+        }
+        Ok(None) => {
+            tracing::debug!("the list was set meanwhile: it is looked at again");
+            take_back(d, new).await;
+            Ok(false)
+        }
+        Err(e) => {
+            take_back(d, new).await;
+            put_off(d, space);
+            Err(e)
+        }
+    }
+}
+
+/// Notes that what software set about on its own in a space failed.
+fn put_off(d: &Daemon, space: &SpaceId) {
+    let mut all = lock(&d.mailbox.put_off);
+    let wait = match all.get(space) {
+        Some(was) => (was.wait * 2).min(PUT_OFF.1),
+        None => PUT_OFF.0,
+    };
+    let until = Instant::now() + wait;
+    all.insert(*space, PutOff { until, wait });
+}
+
+/// Whether an attempt in a space is put off for now.
+fn is_put_off(d: &Daemon, space: &SpaceId) -> bool {
+    let all = lock(&d.mailbox.put_off);
+    all.get(space).is_some_and(|p| Instant::now() < p.until)
 }
 
 fn me(d: &Daemon) -> anyhow::Result<[u8; 32]> {
@@ -721,12 +859,17 @@ pub async fn say_reach(d: &Arc<Daemon>, space: &SpaceId, share: bool) -> anyhow:
 
 async fn say_reach_locked(d: &Arc<Daemon>, space: &SpaceId, share: bool) -> anyhow::Result<bool> {
     let me = me(d)?;
-    let reach = if share {
+    let given = if share {
         reach_here(d, space, &[], Add::Every).await
     } else {
-        Vec::new()
+        Given::default()
     };
-    d.write_and_push(space, vec![relationship::set_reach(&me, &reach)])?;
+    let reach = given.reach;
+    let set = relationship::set_reach(&me, &reach);
+    if let Err(e) = d.write_and_push(space, vec![set]) {
+        take_back(d, &given.new).await;
+        return Err(e);
+    }
     if reach.is_empty() {
         // what the node named before is in use no longer
         revoke_left(d, space);
@@ -767,7 +910,8 @@ pub async fn share_reach(d: &Arc<Daemon>, space: &SpaceId) -> anyhow::Result<Sha
         return Ok(Shared::NoHost);
     }
     let mut reach = d.core().reach_of(space, &me);
-    let more = reach_here(d, space, &reach, Add::Every).await;
+    let given = reach_here(d, space, &reach, Add::Every).await;
+    let more = given.reach;
     if reach.is_empty() && more.is_empty() {
         if !t.set {
             // their first entry there: the yes is kept against it
@@ -779,7 +923,11 @@ pub async fn share_reach(d: &Arc<Daemon>, space: &SpaceId) -> anyhow::Result<Sha
     // where it held two lists, the person's yes makes them one
     if !more.is_empty() || t.two {
         reach.extend(more);
-        d.write_and_push(space, vec![relationship::set_reach(&me, &reach)])?;
+        let set = relationship::set_reach(&me, &reach);
+        if let Err(e) = d.write_and_push(space, vec![set]) {
+            take_back(d, &given.new).await;
+            return Err(e);
+        }
     }
     Ok(Shared::Named)
 }
@@ -808,36 +956,48 @@ pub async fn write_reach(d: &Arc<Daemon>, space: &SpaceId) -> anyhow::Result<()>
     // One at a time: two that both found none would each register a token and
     // write, and leave a token that leads nowhere.
     let _one = d.mailbox.reaching.lock().await;
-    let t = d.core().telling(space);
+    if is_put_off(d, space) {
+        return Ok(());
+    }
+    let (decided, named) = {
+        let core = d.core();
+        let Some(me) = core.me() else {
+            return Ok(());
+        };
+        (Decided::now(&core, space), core.reach_of(space, &me))
+    };
+    let t = &decided.telling;
     if t.empties_unasked() {
         // The person left, and another of their devices had not heard.
-        return say_reach_locked(d, space, false).await.map(|_| ());
+        let emptied = say_reach_locked(d, space, false).await;
+        if emptied.is_err() {
+            put_off(d, space);
+        }
+        return emptied.map(|_| ());
     }
-    let Ok(me) = me(d) else {
-        return Ok(());
-    };
     if t.waiting {
         if !t.hosted {
             // the host they meant serves them no longer
             d.core().drop_yes(space);
             return Ok(());
         }
-        let reach = reach_here(d, space, &[], Add::Every).await;
-        if !reach.is_empty() {
-            // setting the list is what ends the wait
-            d.write_and_push(space, vec![relationship::set_reach(&me, &reach)])?;
+        let given = reach_here(d, space, &[], Add::Every).await;
+        if !given.reach.is_empty() {
+            // setting the list is what ends the wait; a list set while
+            // the token was registered ended it already
+            set_as_decided(d, space, &decided, &given.reach, &given.new).await?;
         }
         return Ok(());
     }
     if !t.sets_unasked() {
         return Ok(());
     }
-    // The others as they read, each host once, unchanged.
-    let named = d.core().reach_of(space, &me);
-    // A list never set is the person's joining, and names every host of
-    // theirs; to one that is set a device adds only itself.
+    // The others as they read, each host once, unchanged. A list never
+    // set is the person's joining, and names every host of theirs; to one
+    // that is set a device adds only itself.
     let add = if t.set { Add::Own } else { Add::Every };
-    let more = reach_here(d, space, &named, add).await;
+    let given = reach_here(d, space, &named, add).await;
+    let more = given.reach;
     // A host that cannot be reached now gives no token. The empty list
     // that leaves is said once, and not again each time this looks.
     if !t.worth_saying(more.len()) {
@@ -848,8 +1008,8 @@ pub async fn write_reach(d: &Arc<Daemon>, space: &SpaceId) -> anyhow::Result<()>
     let wait = !t.set && !t.relationship && t.hosted && more.is_empty();
     let mut reach = named;
     reach.extend(more);
-    d.write_and_push(space, vec![relationship::set_reach(&me, &reach)])?;
-    if wait {
+    let written = set_as_decided(d, space, &decided, &reach, &given.new).await?;
+    if wait && written {
         d.core().keep_yes(space);
     }
     Ok(())
@@ -951,10 +1111,13 @@ pub fn keep_own_entry(d: &Arc<Daemon>) {
         if host && !shared.contains(&space) {
             continue;
         }
+        if is_put_off(d, &space) {
+            continue;
+        }
         // taken before the core is: never one lock inside the other
         let active: HashSet<Token> = lock(&d.mailbox.store).active().into_iter().collect();
         let mut new = Vec::new();
-        let due = {
+        let (due, decided) = {
             let core = d.core();
             let given = core.tokens_given(&space, &here);
             // One it gave here before and still honours, before a new
@@ -968,7 +1131,8 @@ pub fn keep_own_entry(d: &Arc<Daemon>) {
                 })
             };
             let active = |t: &Token| active.contains(t);
-            core.own_entry_due(&space, host, endpoints.as_deref(), active, fresh)
+            let due = core.own_entry_due(&space, host, endpoints.as_deref(), active, fresh);
+            (due, Decided::now(&core, &space))
         };
         let Some(reach) = due else {
             continue;
@@ -976,11 +1140,32 @@ pub fn keep_own_entry(d: &Arc<Daemon>) {
         for token in &new {
             register(d, token);
         }
+        #[cfg(test)]
+        if let Some(arrives) = lock(&d.mailbox.before_write).take() {
+            arrives();
+        }
+        // A no that arrived since, and ended the token this renews, is
+        // not written over (R1); a token made for a write that is not
+        // made is ended (R5).
         let set = relationship::set_reach(&me, &reach);
-        if let Err(e) = d.write_and_push(&space, vec![set]) {
-            tracing::debug!("keeping this device's entry among its person's hosts: {e:#}");
-        } else if reach.is_empty() {
-            revoke_left(d, &space);
+        let written = d.write_and_push_if(&space, vec![set], |core| decided.still(core, &space));
+        if !matches!(written, Ok(Some(_))) {
+            for token in &new {
+                revoke(d, token);
+            }
+        }
+        match written {
+            Ok(Some(_)) => {
+                lock(&d.mailbox.put_off).remove(&space);
+                if reach.is_empty() {
+                    revoke_left(d, &space);
+                }
+            }
+            Ok(None) => {}
+            Err(e) => {
+                put_off(d, &space);
+                tracing::debug!("keeping this device's entry among its person's hosts: {e:#}");
+            }
         }
     }
 }
@@ -1989,5 +2174,134 @@ mod tests {
         let named = h.named(&h.rel);
         assert_eq!(named.len(), 1);
         assert_eq!(h.active(), vec![named[0].token]);
+    }
+
+    impl Home {
+        /// A group this person made with Bo in it, who is their contact:
+        /// they are in it, and their list there was never set.
+        fn group(&self) -> SpaceId {
+            let them = self.bo.me().unwrap();
+            let shown = [(them, "Bo".to_owned())];
+            let mut core = self.d.core();
+            core.create_group("Choir", "Ana", &shown).unwrap()
+        }
+
+        /// While this device next registers a token, an entry arrives
+        /// from another of its person's devices that sets the list of a
+        /// space empty: their no.
+        fn a_no_arrives_meanwhile(&self, space: SpaceId) {
+            let (d, me) = (self.d.clone(), self.me);
+            let arrives = move || {
+                let no = relationship::set_reach(&me, &[]);
+                d.core().write(&space, vec![no]).unwrap();
+                revoke_left(&d, &space);
+            };
+            *lock(&self.d.mailbox.before_write) = Some(Box::new(arrives));
+        }
+
+        fn revoked(&self) -> usize {
+            lock(&self.d.mailbox.store).saved.revoked.len()
+        }
+    }
+
+    /// R1. A yes kept for a host out of reach is finished once a token is
+    /// registered. A no that arrives while it is being registered is later
+    /// than the yes: the list stays empty, and the token is ended.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_no_that_arrives_while_a_kept_yes_is_finished_stands() {
+        let h = Home::new().await;
+        h.hosts();
+        let g = h.group();
+        // the yes, kept against an empty list
+        say_reach(&h.d, &g, false).await.unwrap();
+        h.d.core().keep_yes(&g);
+        assert!(h.d.core().telling(&g).waiting);
+        h.a_no_arrives_meanwhile(g);
+        write_reach(&h.d, &g).await.unwrap();
+        assert!(h.named(&g).is_empty(), "the no was written over");
+        assert_eq!(h.active(), Vec::<Token>::new(), "its token is left");
+        assert!(!h.d.core().telling(&g).waiting);
+        // and it stays so
+        write_reach(&h.d, &g).await.unwrap();
+        assert!(h.named(&g).is_empty());
+
+        // With nothing arriving, the yes is finished.
+        let h = Home::new().await;
+        h.hosts();
+        let g = h.group();
+        say_reach(&h.d, &g, false).await.unwrap();
+        h.d.core().keep_yes(&g);
+        write_reach(&h.d, &g).await.unwrap();
+        assert_eq!(h.named(&g).len(), 1);
+        assert!(!h.d.core().telling(&g).waiting);
+    }
+
+    /// R1, the host's side. Its token in a list has gone, and it sets
+    /// about giving the entry another. A no arrives first: nothing is
+    /// written on top of it, and no token is left.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_no_that_arrives_while_a_host_renews_its_token_stands() {
+        let h = Home::new().await;
+        h.hosts();
+        let g = h.group();
+        write_reach(&h.d, &g).await.unwrap();
+        let named = h.named(&g);
+        assert_eq!(named.len(), 1);
+        revoke(&h.d, &named[0].token);
+        h.a_no_arrives_meanwhile(g);
+        keep_own_entry(&h.d);
+        assert!(h.named(&g).is_empty(), "the no was written over");
+        assert_eq!(h.active(), Vec::<Token>::new(), "its token is left");
+        keep_own_entry(&h.d);
+        write_reach(&h.d, &g).await.unwrap();
+        assert!(h.named(&g).is_empty());
+
+        // With nothing arriving, the entry gets a new token.
+        let h = Home::new().await;
+        h.hosts();
+        let g = h.group();
+        write_reach(&h.d, &g).await.unwrap();
+        let was = h.named(&g)[0].token;
+        revoke(&h.d, &was);
+        keep_own_entry(&h.d);
+        let now = h.named(&g)[0].token;
+        assert!(now != was && h.active() == vec![now]);
+    }
+
+    /// R5. A token is registered before the write that would name it. A
+    /// write that fails, as on a full disk, ends the token again, and the
+    /// attempt is put off: it is not made at every look, each with a new
+    /// token.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_token_registered_for_a_write_that_fails_is_ended() {
+        let h = Home::new().await;
+        h.hosts();
+        for _ in 0..5 {
+            h.d.core().break_log_for_test(&h.rel);
+            assert!(h.named(&h.rel).is_empty());
+            let _ = write_reach(&h.d, &h.rel).await;
+        }
+        assert_eq!(h.active(), Vec::<Token>::new(), "tokens nothing names");
+        assert_eq!(h.revoked(), 1, "it was tried at every look");
+        // Once the wait is over it is tried again: the log is still as
+        // the test left it, and then it is not.
+        lock(&h.d.mailbox.put_off).clear();
+        assert!(write_reach(&h.d, &h.rel).await.is_err());
+        assert_eq!((h.active().len(), h.revoked()), (0, 2));
+        lock(&h.d.mailbox.put_off).clear();
+        write_reach(&h.d, &h.rel).await.unwrap();
+        assert_eq!(h.named(&h.rel).len(), 1);
+        assert_eq!(h.active().len(), 1);
+
+        // The same for the host's own entry.
+        let named = h.named(&h.rel);
+        revoke(&h.d, &named[0].token);
+        let revoked = h.revoked();
+        for _ in 0..5 {
+            h.d.core().break_log_for_test(&h.rel);
+            keep_own_entry(&h.d);
+        }
+        assert_eq!(h.active(), Vec::<Token>::new(), "tokens nothing names");
+        assert_eq!(h.revoked(), revoked + 1, "it was tried at every look");
     }
 }

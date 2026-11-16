@@ -1305,6 +1305,18 @@ impl Core {
         }
     }
 
+    /// The entries whose lists this person's reach node in a space holds,
+    /// in hex, sorted: with [`telling`](Self::telling), what a write of
+    /// the list is decided on, and looked at again before it is made.
+    pub fn list_set_by(&self, space: &SpaceId) -> Vec<String> {
+        let me = self.identity.as_ref().map(|i| i.id());
+        let sp = self.spaces.get(space).and_then(|h| h.space.as_ref());
+        match (me, sp) {
+            (Some(me), Some(sp)) => list_set_by(sp, &me),
+            _ => Vec::new(),
+        }
+    }
+
     /// Keeps the person's yes on this device, to finish when a host can
     /// be reached: against the list as it is set now, so call it after
     /// whatever this device wrote for the act itself.

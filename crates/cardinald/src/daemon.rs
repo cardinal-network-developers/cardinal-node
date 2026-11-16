@@ -1152,6 +1152,29 @@ impl Daemon {
         Ok(ids)
     }
 
+    /// [`write_and_push`](Self::write_and_push), if `still` holds of the
+    /// core at the moment of writing: for what was decided before waiting
+    /// on something else, as on a host for a token, while entries kept
+    /// arriving. `None` if it holds no longer, and nothing is written.
+    pub fn write_and_push_if(
+        self: &Arc<Self>,
+        space: &SpaceId,
+        ops: Vec<cardinal_space::SpaceOp>,
+        still: impl FnOnce(&Core) -> bool,
+    ) -> anyhow::Result<Option<Vec<cardinal_identity::EntryId>>> {
+        let written = {
+            let mut core = self.core();
+            if !still(&core) {
+                return Ok(None);
+            }
+            core.write(space, ops)?
+        };
+        let ids: Vec<_> = written.iter().map(|(i, _)| *i).collect();
+        self.push(space, written.into_iter().map(|(_, b)| b).collect());
+        self.bump();
+        Ok(Some(ids))
+    }
+
     /// Tells peers of new entries of a space.
     pub fn push(self: &Arc<Self>, space: &SpaceId, entries: Vec<Vec<u8>>) {
         if !entries.is_empty() {

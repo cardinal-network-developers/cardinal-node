@@ -1335,6 +1335,18 @@ asks for around that is not built yet.
     the node holds two lists writes the list as read, once, even with no
     host to add: the text has them become one when "the person says yes
     or no".
+  - **A write decided before a wait is looked at again** (`mailbox.rs`
+    `Decided`, `set_as_decided`; not in the text). What software sets on
+    its own is decided, then a token is registered, which may wait on
+    another device, then the list is written. If the entries that set the
+    list, or anything `Telling` reads, changed meanwhile, nothing is
+    written, the token is revoked, and the next look decides afresh. The
+    person's own act (`group-join`, `group-reach`) is not checked this
+    way: it is the later act.
+  - **A write of the list that fails** (a log that cannot be written, a
+    space that has ended) revokes the tokens registered for it and is put
+    off for that space: a minute, doubling to an hour, until one works.
+    Not saved: a restart tries again at once.
   - **Reading: `ask` once joined.** A list that is set, empty or not, is
     the person's answer, so `ask` is true only for an offer, or where they
     are in the space and never set it. A person who takes up a host later
