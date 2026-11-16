@@ -683,6 +683,11 @@ impl Filesystem for CardinalFs {
             if Some(newparent) == main.map(|m| t.inodes[&m].parent)
                 && main.is_some_and(|m| t.inodes[&m].name == newname)
             {
+                // Which version stands is for whoever may change the file
+                // to say, as deleting the copy is (S6).
+                if t.inodes[&src].locked || main.is_some_and(|m| t.inodes[&m].locked) {
+                    return reply.error(EACCES);
+                }
                 if let Some(n) = node {
                     t.settle.insert(n, Some(v));
                 }

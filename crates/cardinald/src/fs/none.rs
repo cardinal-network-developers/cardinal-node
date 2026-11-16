@@ -38,6 +38,11 @@ impl Mounted {
         0
     }
 
+    /// How many of those were undone: none.
+    pub fn undone_count(&self) -> usize {
+        0
+    }
+
     /// Whether anything is waiting to be committed.
     pub fn has_pending(&self) -> bool {
         false

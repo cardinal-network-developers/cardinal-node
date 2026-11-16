@@ -925,10 +925,25 @@ Not implemented yet (the next milestone):
   If it is not, nothing the entry carried is marked committed: files stay
   dirty with their staging files, and are not written again until they
   change. **Reading: "tells them".** The daemon logs an error, `status`
-  has the count in `not_saved`, and `cardinal status` says so. A delete or
-  a settled conflict that such an entry carried is counted and lost; and
-  every change in the entry is held back, not only the one that was at
-  fault, which the device cannot tell.
+  has the count in `not_saved`, and `cardinal status` says so. Every
+  change in the entry is held back, not only the one that was at fault,
+  which the device cannot tell.
+  - **What waits with it.** A file or folder put in a new folder that is
+    held back has nowhere to go: it is held back too, counted, and neither
+    written nor encoded until the folder changes (a rename), when the
+    folder and everything held back beneath it are tried again.
+  - **A delete or a settled conflict** that such an entry carried is
+    undone, since nothing of it is kept: the file is back at the next
+    refresh. `status` counts these in `not_saved` and by themselves in
+    `not_saved_undone`, until a commit goes through with nothing refused.
+    One that was behind such an entry and was not written, or in a commit
+    that failed, stays and is written by the next.
+  - **A conflict in a file that is someone else's to change** is not
+    settled from here: renaming the copy onto the file fails with
+    `EACCES`, as deleting the copy does, and the commit path leaves such a
+    settle out.
+  - **Not kept across a restart:** the count starts at zero, and what was
+    flushed is written once more.
 - **A new folder and what is in it are one entry** (`fs/commit.rs`,
   `state.md#a-node-made-in-the-same-entry`). What a burst puts in a folder
   the same burst makes names it by the place of its `create`: new files

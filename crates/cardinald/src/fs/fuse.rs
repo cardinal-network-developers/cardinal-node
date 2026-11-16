@@ -88,11 +88,19 @@ impl Mounted {
         lock(&self.parts).parts[&0].tree.clone()
     }
 
-    /// How many changes went into entries that were not accepted, and are
-    /// kept on this device, not saved.
+    /// How many changes are not saved because an entry was not accepted:
+    /// what is kept on this device and waits, and what was undone.
     pub fn refused_count(&self) -> usize {
         let parts = lock(&self.parts);
         let each = parts.parts.values().map(|p| lock(&p.tree).refused_count());
+        each.sum()
+    }
+
+    /// How many of those were deletions or choices between two versions,
+    /// which are undone: nothing of them is kept.
+    pub fn undone_count(&self) -> usize {
+        let parts = lock(&self.parts);
+        let each = parts.parts.values().map(|p| lock(&p.tree).undone);
         each.sum()
     }
 

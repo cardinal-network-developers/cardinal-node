@@ -1336,11 +1336,22 @@ fn print_status(v: &Value) {
         println!("Sync: up to date");
     }
     // What an entry that was not accepted carried is kept, and not saved.
+    // What was deleted, or chosen between two versions, in such an entry
+    // is undone: there is nothing of it to keep.
     let not_saved = v["not_saved"].as_u64().unwrap_or(0);
-    if not_saved > 0 {
+    let undone = v["not_saved_undone"].as_u64().unwrap_or(0).min(not_saved);
+    let kept = not_saved - undone;
+    if kept > 0 {
         println!(
-            "      {not_saved} changes to your files could not be saved. What you wrote is kept on \
-             this device; change a file again to try it again."
+            "      {kept} changes to your files could not be saved. What you wrote is kept on \
+             this device; change a file again to try it again (for what is in a new folder, \
+             rename the folder)."
+        );
+    }
+    if undone > 0 {
+        println!(
+            "      {undone} deletions or choices between two versions could not be saved, and \
+             are undone: those files are as they were."
         );
     }
     for line in copies_lines(&v["copies"], v["devices"].as_array().map_or(0, |d| d.len())) {

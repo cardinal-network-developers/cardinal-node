@@ -25,7 +25,7 @@ use cardinal_space::{NodeId, Space, SpaceId, SpaceOp, ROOT};
 
 #[cfg(test)]
 use super::tree::ROOT_INO;
-use super::tree::{time_to_ms, Kind, Snapshot, Staged, Tree};
+use super::tree::{time_to_ms, Inode, Kind, Snapshot, Staged, Tree};
 use crate::core::{split_ops, Core};
 use crate::daemon::Daemon;
 
@@ -185,15 +185,8 @@ pub fn commit(d: &Arc<Daemon>, tree: &Mutex<Tree>, space: &SpaceId) -> anyhow::R
     // A: what needs encoding.
     let to_encode: Vec<(u64, u64, Arc<Staged>)> = {
         let t = lock(tree);
-        t.inodes
-            .values()
-            .filter(|i| {
-                i.parent != 0
-                    && !i.local
-                    && i.kind == Kind::File
-                    && (i.dirty.content || i.node.is_none())
-                    && !i.held_back(QUIET, MAX_BURST)
-            })
+        let wanted = t.inodes.values().filter(|i| wants_encoding(&t, i));
+        wanted
             .filter_map(|i| Some((i.ino, i.write_gen, i.staged.clone()?)))
             .collect()
     };
@@ -238,6 +231,19 @@ pub fn commit(d: &Arc<Daemon>, tree: &Mutex<Tree>, space: &SpaceId) -> anyhow::R
         d.bump();
     }
     Ok(n)
+}
+
+/// Whether a commit reads and stores a file's content now: it has content
+/// to write, its burst is over, and it does not wait behind an entry that
+/// was not accepted, which would have it read, encrypted and stored again
+/// at every commit for nothing (S4).
+fn wants_encoding(t: &Tree, i: &Inode) -> bool {
+    i.parent != 0
+        && !i.local
+        && i.kind == Kind::File
+        && (i.dirty.content || i.node.is_none())
+        && !i.held_back(QUIET, MAX_BURST)
+        && !t.is_held(i)
 }
 
 /// Ops that must not descend from some entries: local changes made
@@ -350,11 +356,28 @@ pub fn write_pending(
             i.content_gen = i.write_gen;
         }
     }
+    // A new folder that was held back and has changed is tried again, and
+    // with it what was held back beneath it: none of that could be saved
+    // without the folder, whatever it was that the entry was refused for.
+    let again: Vec<u64> = t
+        .inodes
+        .values()
+        .filter(|i| i.kind == Kind::Dir && i.node.is_none())
+        .filter(|i| t.refused.contains_key(&i.ino) && !t.is_refused(i))
+        .map(|i| i.ino)
+        .collect();
+    for dir in again {
+        let mut beneath = vec![dir];
+        while let Some(ino) = beneath.pop() {
+            t.refused.remove(&ino);
+            if let Some(i) = t.inodes.get(&ino) {
+                beneath.extend(i.children.values().copied());
+            }
+        }
+    }
     let mut written: Vec<Vec<u8>> = Vec::new();
-    // The deletes this commit took up, to give back if it cannot write
-    // them: a delete written twice does nothing the second time.
-    let mut taken: Vec<super::tree::Deleted> = Vec::new();
-    let mut first = true;
+    // Whether any entry written here was accepted, and whether any was not.
+    let (mut accepted, mut refused) = (false, false);
     let mut rounds = 0;
     loop {
         rounds += 1;
@@ -396,8 +419,8 @@ pub fn write_pending(
             // Nor is a change to what is someone else's to change: one op
             // that is not allowed takes its whole entry with it. Nor one
             // that an entry already carried and that was not accepted,
-            // until it changes.
-            if i.locked || t.is_refused(i) {
+            // until it changes, nor what is in a new folder that waits so.
+            if i.locked || t.is_held(i) {
                 continue;
             }
             // The parent: a node, or one an earlier op of this round
@@ -493,52 +516,58 @@ pub fn write_pending(
                 }
             }
         }
-        if first {
-            let me = core.me();
-            taken = std::mem::take(&mut t.deleted);
-            for del in taken.clone() {
-                // not this person's to delete
-                let owner = sp.state().owner_of(&del.node);
-                if owner.is_some() && owner != me {
-                    continue;
-                }
-                let mut unseen = unseen_touching(sp, &del.base, &del.node);
-                if let Some(seen) = &del.seen {
-                    for v in unseen_versions(sp, &del.node, seen) {
-                        if !unseen.contains(&v) {
-                            unseen.push(v);
-                        }
+        // The deletes and the settled conflicts that wait. Each stays in
+        // the tree until an entry that carries it is written, so that one
+        // behind an entry that was not accepted, or in a commit that
+        // failed, is written by the next round or the next commit (S5).
+        let me = core.me();
+        // not this person's to delete, or to settle: one op that is not
+        // allowed takes its whole entry with it
+        let theirs = |node: &NodeId| {
+            let owner = sp.state().owner_of(node);
+            owner.is_some() && owner != me
+        };
+        for del in t.deleted.clone() {
+            if theirs(&del.node) {
+                drop_delete(t, &del.node);
+                continue;
+            }
+            let mut unseen = unseen_touching(sp, &del.base, &del.node);
+            if let Some(seen) = &del.seen {
+                for v in unseen_versions(sp, &del.node, seen) {
+                    if !unseen.contains(&v) {
+                        unseen.push(v);
                     }
-                }
-                unseen.sort();
-                if unseen.is_empty() {
-                    ops.push(SpaceOp::delete(del.node));
-                    effects.push(Effect::None);
-                } else {
-                    let c = concurrent.entry(unseen).or_default();
-                    c.ops.push(SpaceOp::delete(del.node));
-                    c.effects.push(Effect::None);
                 }
             }
-            let settle: Vec<_> = t.settle.drain().collect();
-            if !settle.is_empty() {
-                let f = Files::new(sp);
-                for (node, version) in settle {
-                    let vs = f.content(&node);
-                    if vs.len() < 2 {
-                        continue;
-                    }
-                    let pick = match version {
-                        Some(v) => vs.iter().find(|x| x.entry == v),
-                        None => vs.last(),
-                    };
-                    if let Some(c) = pick.and_then(|p| p.content.clone()) {
+            unseen.sort();
+            if unseen.is_empty() {
+                ops.push(SpaceOp::delete(del.node));
+                effects.push(Effect::Deleted(del.node));
+            } else {
+                let c = concurrent.entry(unseen).or_default();
+                c.ops.push(SpaceOp::delete(del.node));
+                c.effects.push(Effect::Deleted(del.node));
+            }
+        }
+        if !t.settle.is_empty() {
+            let f = Files::new(sp);
+            for (node, version) in t.settle.clone() {
+                let vs = f.content(&node);
+                let pick = match version {
+                    Some(v) => vs.iter().find(|x| x.entry == v),
+                    None => vs.last(),
+                };
+                let content = pick.and_then(|p| p.content.clone());
+                match content.filter(|_| vs.len() >= 2 && !theirs(&node)) {
+                    Some(c) => {
                         ops.push(files::set_content(node, &c));
-                        effects.push(Effect::None);
+                        effects.push(Effect::Settled(node));
                     }
+                    // nothing to settle, or not this person's to
+                    None => drop(t.settle.remove(&node)),
                 }
             }
-            first = false;
         }
         // Concurrent entries first, so the ordinary ones after them
         // descend from everything again.
@@ -563,7 +592,10 @@ pub fn write_pending(
                         "a file changed here and on another device: keeping both versions"
                     );
                     written.push(bytes);
-                    finish_if_accepted(core, space, t, &eid, &c.effects);
+                    match finish_if_accepted(core, space, t, &eid, &c.effects) {
+                        true => accepted = true,
+                        false => refused = true,
+                    }
                 }
                 Err(e) => {
                     tracing::warn!(
@@ -583,21 +615,20 @@ pub fn write_pending(
         for mut batch in split_ops(ops) {
             let n = batch.len();
             name_parents(&mut batch, idx, &under, &nodes);
-            let (eid, bytes) = match core.write_entry(space, batch) {
-                Ok(wrote) => wrote,
-                Err(e) => {
-                    t.deleted.append(&mut taken);
-                    return Err(e);
-                }
-            };
+            // If this fails, what was not written is all still in the
+            // tree: the files dirty, the deletes and what was settled
+            // where they were.
+            let (eid, bytes) = core.write_entry(space, batch)?;
             written.push(bytes);
             nodes.extend((0..n).map(|k| (idx + k, files::created_node(&eid, k))));
             // What follows may name what this entry made: if it made
             // nothing, the rest waits for the next round, which leaves
             // out what was refused.
             if !finish_if_accepted(core, space, t, &eid, &effects[idx..idx + n]) {
+                refused = true;
                 break;
             }
+            accepted = true;
             idx += n;
         }
     }
@@ -611,6 +642,13 @@ pub fn write_pending(
             i.staged = None;
         }
     }
+    // What was undone is said until a commit goes through whole; and no
+    // note is kept of what is gone.
+    if accepted && !refused {
+        t.undone = 0;
+    }
+    let here: HashSet<u64> = t.inodes.keys().copied().collect();
+    t.refused.retain(|ino, _| here.contains(ino));
     if let Err(e) = t.journal_committed() {
         tracing::warn!("cannot update the journal of flushed files: {e}");
     }
@@ -685,6 +723,7 @@ fn finish_if_accepted(
         finish(t, eid, effects);
         return true;
     }
+    let mut undone = 0;
     for eff in effects {
         match eff {
             Effect::Created(ino) | Effect::Clean(ino, _) => {
@@ -692,12 +731,23 @@ fn finish_if_accepted(
                     t.refused.insert(*ino, i.as_written());
                 }
             }
-            Effect::None => t.refused_other += 1,
+            // There is nothing of these to keep: they are undone, and
+            // not tried again.
+            Effect::Deleted(node) => {
+                drop_delete(t, node);
+                undone += 1;
+            }
+            Effect::Settled(node) => {
+                t.settle.remove(node);
+                undone += 1;
+            }
         }
     }
+    t.undone += undone;
     tracing::error!(
         "{} changes to your files were not saved: the entry written for them ({}) was not \
-         accepted. What you wrote is kept on this device.",
+         accepted. What you wrote is kept on this device; {undone} of them were deletions or \
+         choices between two versions, which are undone.",
         effects.len(),
         hex::encode(&eid[..8])
     );
@@ -735,8 +785,16 @@ fn finish(t: &mut Tree, eid: &EntryId, effects: &[Effect]) {
                     }
                 }
             }
-            Effect::None => {}
+            Effect::Deleted(node) => drop_delete(t, node),
+            Effect::Settled(node) => drop(t.settle.remove(node)),
         }
+    }
+}
+
+/// Takes one delete of `node` off those that wait: an entry carries it.
+fn drop_delete(t: &mut Tree, node: &NodeId) {
+    if let Some(at) = t.deleted.iter().position(|d| d.node == *node) {
+        t.deleted.remove(at);
     }
 }
 
@@ -747,10 +805,16 @@ enum Flag {
     Mtime,
 }
 
+/// What an op does to the tree once its entry is written.
 enum Effect {
+    /// The inode has its node.
     Created(u64),
+    /// One of the inode's changes is saved.
     Clean(u64, Flag),
-    None,
+    /// A delete of the node waits no longer.
+    Deleted(NodeId),
+    /// The node's conflict waits to be settled no longer.
+    Settled(NodeId),
 }
 
 /// Commits after each quiet period until `stop` is set.
@@ -1686,6 +1750,224 @@ mod tests {
         me.refresh();
         assert_eq!(me.shown("new.txt"), b"newer");
         assert_eq!(me.versions(&me.node(hers)), [b"hers".to_vec()]);
+    }
+
+    /// What `shared_with_a_file_of_theirs` gives, with an edit of their
+    /// file pending as a view that failed to refuse it would leave it:
+    /// whatever entry carries it is not accepted.
+    fn with_an_edit_that_is_not_allowed() -> (Fx, Fx, u64) {
+        let (mut me, them, hers) = shared_with_a_file_of_theirs();
+        let i = me.t.inodes.get_mut(&hers).unwrap();
+        i.locked = false;
+        i.content = Some(Content::Inline(b"mine now".to_vec()));
+        i.dirty.content = true;
+        i.wrote();
+        me.t.touch();
+        (me, them, hers)
+    }
+
+    impl Fx {
+        fn mkdir(&mut self, parent: u64, name: &str) -> u64 {
+            let dir = self.t.alloc(Kind::Dir);
+            self.t.attach(dir, parent, name);
+            self.t.touch();
+            dir
+        }
+
+        fn last_accepted(&self) -> bool {
+            let last = *self.sp().dag().log_order().last().unwrap();
+            self.sp().state().is_accepted(&last)
+        }
+    }
+
+    /// S4. A new folder went in an entry that was not accepted, and is
+    /// held back. A file put in it afterwards, as by a copy still running,
+    /// has no node and no parent to be made under: it waits with the
+    /// folder, is counted as not saved, calls for no commit, and is not
+    /// encoded again, and nor is what was held back already. Once the
+    /// folder changes, it is all tried again.
+    #[test]
+    fn what_is_put_in_a_folder_that_was_not_accepted_waits_with_it() {
+        let (mut me, _them, _hers) = with_an_edit_that_is_not_allowed();
+        let dir = me.mkdir(ROOT_INO, "D");
+        let first = me.write_in(dir, "a.txt", b"a");
+        assert_eq!(me.commit(), 1);
+        assert!(!me.last_accepted());
+        assert_eq!(me.t.refused_count(), 3);
+        let late = me.write_in(dir, "late.txt", b"late");
+        let inner = me.mkdir(dir, "inner");
+        let deep = me.write_in(inner, "deep.txt", b"deep");
+        assert_eq!(me.commit(), 0);
+        assert_eq!(me.t.refused_count(), 6, "what waits is not counted");
+        assert!(!me.t.has_committable(), "a commit is due for good");
+        assert!(me.t.first_change.is_none());
+        for ino in [first, late, deep] {
+            assert!(!wants_encoding(&me.t, &me.t.inodes[&ino]), "encoded again");
+        }
+        assert_eq!(me.commit(), 0);
+        // The folder is renamed: it and what is in it are tried again,
+        // without what was not allowed, and saved.
+        me.t.inodes.get_mut(&dir).unwrap().name = "E".into();
+        me.t.touch();
+        assert!(me.t.has_committable());
+        assert!(wants_encoding(&me.t, &me.t.inodes[&late]));
+        assert!(me.commit() >= 1);
+        assert!(me.last_accepted());
+        assert_eq!(me.t.refused_count(), 1);
+        let st = me.sp().state();
+        for ino in [first, late, deep] {
+            assert!(st.node(&me.node(ino)).is_some_and(|n| !n.deleted));
+        }
+        assert!(!me.t.has_committable() && me.t.first_change.is_none());
+    }
+
+    /// S5. A burst too long for one entry, whose first entry is not
+    /// accepted. The delete the person made went in a later entry that
+    /// was then not written: it was dropped, uncounted, and the file was
+    /// back at the next refresh. A delete goes only when an entry that
+    /// carries it is written.
+    #[test]
+    fn a_delete_behind_an_entry_that_was_not_accepted_is_still_written() {
+        let (mut me, _them, hers) = with_an_edit_that_is_not_allowed();
+        // Files enough for two entries, saved on their own.
+        let old = me.write("old.txt", b"old");
+        let body = vec![7u8; 900];
+        let count = 2 * crate::core::MAX_ENTRY_OPS_BYTES / body.len();
+        for j in 0..count {
+            me.write(&format!("f{j}"), &body);
+        }
+        me.t.inodes.get_mut(&hers).unwrap().locked = true;
+        assert!(me.commit() >= 2);
+        assert!(me.last_accepted());
+        me.refresh();
+        let node = me.node(old);
+        // The burst: the edit that is not allowed, which comes first; an
+        // edit of each file; and the delete, which comes last.
+        let i = me.t.inodes.get_mut(&hers).unwrap();
+        i.locked = false;
+        i.content = Some(Content::Inline(b"mine now".to_vec()));
+        i.dirty.content = true;
+        i.wrote();
+        let body = vec![8u8; 900];
+        for j in 0..count {
+            me.write(&format!("f{j}"), &body);
+        }
+        me.t.remove(old);
+        me.t.touch();
+        let before = me.sp().dag().len();
+        assert!(me.commit() >= 2);
+        let ids = me.sp().dag().log_order()[before..].to_vec();
+        let first = ids.first().unwrap();
+        assert!(!me.sp().state().is_accepted(first), "nothing was refused");
+        assert!(me.t.deleted.is_empty());
+        assert!(
+            me.sp().state().node(&node).unwrap().deleted,
+            "the delete was dropped"
+        );
+        assert_eq!(me.t.undone, 0);
+        assert!(!me.t.has_committable());
+    }
+
+    /// S5. A commit that cannot write its entry leaves a settled conflict
+    /// to be written again, as it leaves a delete.
+    #[test]
+    fn a_commit_that_fails_keeps_what_it_settled() {
+        let mut fx = Fx::new();
+        let ino = fx.write("a.txt", b"v1");
+        fx.commit();
+        fx.refresh();
+        let node = fx.node(ino);
+        fx.remote(files::set_content(
+            node,
+            &Content::Inline(b"remote".to_vec()),
+        ));
+        fx.write("a.txt", b"local");
+        fx.commit();
+        fx.refresh();
+        assert_eq!(fx.versions(&node).len(), 2);
+        // The person removes the conflict copy: the version shown stays.
+        fx.t.settle.insert(node, None);
+        fx.t.touch();
+        fx.core.break_log_for_test(&fx.space);
+        let failed = write_pending(&mut fx.core, &mut fx.t, &fx.space, Vec::new());
+        assert!(failed.is_err());
+        assert!(fx.t.has_pending(), "what was settled is forgotten");
+        assert_eq!(fx.commit(), 1);
+        assert_eq!(fx.versions(&node).len(), 1);
+        assert!(!fx.t.has_pending());
+    }
+
+    /// S6. A conflict in a file that is someone else's to change is not
+    /// this person's to settle: the `set` would not be allowed, and would
+    /// take the burst's entry with it. It is left out, as a delete of
+    /// such a file is.
+    #[test]
+    fn a_conflict_in_someone_elses_file_is_not_settled_here() {
+        let (mut me, mut them, hers) = shared_with_a_file_of_theirs();
+        let node = me.node(hers);
+        // Their two devices wrote at the same moment.
+        let rel = me.space;
+        let one = files::set_content(node, &Content::Inline(b"one".to_vec()));
+        let two = files::set_content(node, &Content::Inline(b"two".to_vec()));
+        let (first, a) = them.core.write_entry(&rel, vec![one]).unwrap();
+        let b = them.core.write_entry_concurrent(&rel, &[first], vec![two]);
+        let (_, b) = b.unwrap();
+        me.core.ingest_space(rel, &[a, b]).unwrap();
+        me.refresh();
+        assert_eq!(me.versions(&node).len(), 2);
+        // What a rename of the copy onto the file would leave, had the
+        // view not refused it, and a new file in the same burst.
+        me.t.settle.insert(node, None);
+        let new = me.write("new.txt", b"new");
+        let before = me.sp().dag().len();
+        assert_eq!(me.commit(), 1);
+        assert!(me.last_accepted(), "the burst went with the settle");
+        assert_eq!(me.sp().dag().len(), before + 1);
+        assert!(me.t.inodes[&new].node.is_some());
+        assert_eq!(me.versions(&node).len(), 2, "their conflict was settled");
+        assert!(me.t.settle.is_empty() && !me.t.has_committable());
+        assert_eq!(me.t.refused_count(), 0);
+    }
+
+    /// S7. A delete or a settled conflict that went in an entry that was
+    /// not accepted is undone, and said so, apart from what is kept. It
+    /// is said until the next commit that goes through, not for as long
+    /// as the service runs; and no note is kept of files that are gone.
+    #[test]
+    fn what_was_undone_is_counted_until_a_commit_goes_through() {
+        let (mut me, _them, hers) = with_an_edit_that_is_not_allowed();
+        me.t.inodes.get_mut(&hers).unwrap().locked = true;
+        let old = me.write("old.txt", b"old");
+        assert_eq!(me.commit(), 1);
+        me.refresh();
+        me.t.inodes.get_mut(&hers).unwrap().locked = false;
+        me.t.remove(old);
+        me.t.touch();
+        assert_eq!(me.commit(), 1);
+        assert!(!me.last_accepted());
+        assert_eq!((me.t.refused_count(), me.t.undone), (2, 1));
+        assert!(!me.t.has_committable() && me.t.deleted.is_empty());
+        // The file is back.
+        me.refresh();
+        assert!(me.t.child(ROOT_INO, "old.txt").is_some());
+        // Something else is saved: nothing is undone any more, and what
+        // is kept still counts.
+        me.write("new.txt", b"new");
+        assert_eq!(me.commit(), 1);
+        assert!(me.last_accepted());
+        assert_eq!((me.t.refused_count(), me.t.undone), (1, 0));
+        // A file that was held back and is removed is forgotten.
+        me.refresh();
+        let gone = me.write("gone.txt", b"x");
+        let i = me.t.inodes.get_mut(&hers).unwrap();
+        i.locked = false;
+        i.dirty.content = true;
+        i.wrote();
+        assert_eq!(me.commit(), 1);
+        assert!(!me.last_accepted() && me.t.refused.contains_key(&gone));
+        me.t.remove(gone);
+        me.commit();
+        assert!(!me.t.refused.contains_key(&gone));
     }
 
     /// D6 (`profiles.md#mapping-to-a-disk-guidance`). A folder is empty

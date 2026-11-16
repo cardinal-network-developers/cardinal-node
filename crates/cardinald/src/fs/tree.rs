@@ -546,8 +546,9 @@ pub struct Tree {
     /// disk and not committed; it is not written again until it changes.
     pub refused: HashMap<u64, Written>,
     /// Changes of other kinds (a delete, a conflict settled) that went the
-    /// same way, and are lost.
-    pub refused_other: usize,
+    /// same way, and are undone: there is nothing of them to keep. Counted
+    /// until a commit goes through with nothing refused.
+    pub undone: usize,
     /// Conflicts to settle at the next commit: the version to keep, or
     /// `None` for the one shown under the file's own name.
     pub settle: HashMap<NodeId, Option<EntryId>>,
@@ -610,7 +611,7 @@ impl Tree {
             ignore_seen: None,
             deleted: Vec::new(),
             refused: HashMap::new(),
-            refused_other: 0,
+            undone: 0,
             settle: HashMap::new(),
             first_change: None,
             last_change: None,
@@ -918,10 +919,39 @@ impl Tree {
             .is_some_and(|w| *w == i.as_written())
     }
 
-    /// How many changes went into entries that were not accepted.
+    /// Whether an inode waits behind an entry that was not accepted: its
+    /// own change was in one ([`is_refused`](Self::is_refused)), or it has
+    /// no node yet and is in a new folder that was. Such a folder is not
+    /// made again until it changes, so what is put in it has nowhere to
+    /// go: it is neither written nor encoded, and is counted as not saved.
+    pub fn is_held(&self, i: &Inode) -> bool {
+        if self.is_refused(i) {
+            return true;
+        }
+        let mut cur = i;
+        // (a tree has no cycles; the bound is for one that is damaged)
+        for _ in 0..self.inodes.len() {
+            let Some(parent) = self.inodes.get(&cur.parent) else {
+                return false;
+            };
+            if parent.node.is_some() {
+                return false;
+            }
+            if self.is_refused(parent) {
+                return true;
+            }
+            cur = parent;
+        }
+        false
+    }
+
+    /// How many changes are not saved because an entry was not accepted:
+    /// what is kept on this device and waits, and what was undone
+    /// ([`undone`](Self::undone)).
     pub fn refused_count(&self) -> usize {
-        let held = self.inodes.values().filter(|i| self.is_refused(i));
-        held.count() + self.refused_other
+        let waits = |i: &&Inode| i.parent != 0 && !i.local && (i.node.is_none() || i.dirty.any());
+        let held = self.inodes.values().filter(waits);
+        held.filter(|i| self.is_held(i)).count() + self.undone
     }
 
     /// Whether anything waits that a commit would write: what is pending,
@@ -931,7 +961,7 @@ impl Tree {
         let mine = self.inodes.values().filter(waits);
         !self.deleted.is_empty()
             || !self.settle.is_empty()
-            || mine.into_iter().any(|i| !i.locked && !self.is_refused(i))
+            || mine.into_iter().any(|i| !i.locked && !self.is_held(i))
     }
 
     /// Whether anything waits to be committed.
