@@ -188,3 +188,136 @@ fn the_marks_in_a_long_chain_s_past_are_shared() {
         "{once} and {twice} bytes an entry"
     );
 }
+
+/// A files space of one person's, and what writes for them.
+fn files_space(seed: u8) -> (Space, IdentityLog, DeviceKeys) {
+    let device = DeviceKeys::generate();
+    let Created {
+        log, encryption, ..
+    } = IdentityLog::create_with(
+        RecoveryPhrase::from_entropy(&[seed; 32]),
+        &device,
+        HybridKeyPair::generate(),
+    )
+    .unwrap();
+    let (space, _) = Space::create(
+        Profile::FILES,
+        Policy::default(),
+        &log,
+        &device.signing,
+        &[encryption.public_key()],
+        None,
+    )
+    .unwrap();
+    (space, log, device)
+}
+
+/// S3. Three entries: a chain of folders each in the one before, a delete
+/// of every one of them, and beside the deletes one op that names the
+/// deepest. What that op touches is the whole path, under every deleted
+/// node on it. Kept as a chain for each deleted node that is the square of
+/// the depth over two in node ids: gigabytes at the eleven thousand an
+/// entry holds. Twice the depth must cost about twice the memory.
+#[test]
+fn what_is_touched_on_a_deep_deleted_path_is_held_once() {
+    let _one = ONE.lock().unwrap_or_else(|e| e.into_inner());
+    let peak_for = |depth: u32| {
+        let (mut space, log, device) = files_space(84);
+        let write = |space: &mut Space, ops: Vec<SpaceOp>| {
+            let (id, _) = space.write_entry(&log, &device.signing, ops, None).unwrap();
+            id
+        };
+        let folder = NodeKind::Uint(files::FOLDER);
+        let mut ops = vec![files::create_folder(ROOT, "F")];
+        ops.extend((1..depth).map(|k| SpaceOp::create_under(folder, k - 1, "d", Record::new())));
+        let a = write(&mut space, ops);
+        let node = |k: u32| derived_id(&a, k as usize);
+        let b = write(
+            &mut space,
+            (0..depth).rev().map(|k| SpaceOp::delete(node(k))).collect(),
+        );
+        let beside = vec![files::create_folder(node(depth - 1), "late")];
+        let (c, _) = space
+            .write_concurrent(&log, &device.signing, &[b], beside, None)
+            .unwrap();
+        for id in [a, b, c] {
+            assert!(space.state().is_accepted(&id));
+        }
+        let before = NOW.load(Ordering::Relaxed);
+        PEAK.store(before, Ordering::Relaxed);
+        let state = State::compute(Profile::FILES, space.dag(), &space.validity().valid);
+        let peak = PEAK.load(Ordering::Relaxed) - before;
+        eprintln!(
+            "MEASURE a deleted path {depth} deep, touched at its end: {} KiB at the peak",
+            peak >> 10
+        );
+        // every delete was touched, so nothing on the path is gone
+        assert!(state.node(&node(0)).unwrap().delete_conflict);
+        assert!(!state.node(&node(depth - 1)).unwrap().deleted);
+        assert_eq!(state.canonical(), space.state().canonical());
+        peak
+    };
+    let (once, twice) = (peak_for(1_000), peak_for(2_000));
+    // As chains, 2,000 deep is 2,000^2 / 2 ids of 16 bytes, 32 MiB and
+    // four times the 1,000.
+    assert!(twice < 3 * once, "{} and {} KiB", once >> 10, twice >> 10);
+    assert!(twice < 8 << 20, "{} KiB", twice >> 10);
+}
+
+/// S2. Two entries beside each other. Each sets one field many times
+/// beside, so that every value stands, and then the field the other set so
+/// as many times plain (whichever comes first in log order, the other's
+/// plain sets find its values standing). Each plain set asks of every
+/// standing value whether it is in the entry's past, which is the product
+/// of the two in walks of the graph. An entry's past does not change
+/// between its ops: asked once for each field, three times the sets take
+/// about three times as long.
+#[test]
+fn many_sets_of_one_field_ask_of_each_standing_value_once() {
+    let _one = ONE.lock().unwrap_or_else(|e| e.into_inner());
+    let time_for = |sets: u64| {
+        let (mut space, log, device) = files_space(85);
+        let (g, _) = space
+            .write_entry(
+                &log,
+                &device.signing,
+                vec![files::create_folder(ROOT, "F")],
+                None,
+            )
+            .unwrap();
+        let f = derived_id(&g, 0);
+        let ops = |beside: u64, plain: u64| {
+            let mut ops: Vec<SpaceOp> = (0..sets)
+                .map(|k| SpaceOp::set_beside(f, beside, Some(k.into())))
+                .collect();
+            ops.extend((0..sets).map(|k| SpaceOp::set(f, plain, Some(k.into()))));
+            ops
+        };
+        let (a, _) = space
+            .write_entry(&log, &device.signing, ops(900, 901), None)
+            .unwrap();
+        let (b, _) = space
+            .write_concurrent(&log, &device.signing, &[a], ops(901, 900), None)
+            .unwrap();
+        for id in [a, b] {
+            assert!(space.state().is_accepted(&id));
+        }
+        let mut best = std::time::Duration::MAX;
+        for _ in 0..5 {
+            let start = std::time::Instant::now();
+            let state = State::compute(Profile::FILES, space.dag(), &space.validity().valid);
+            best = best.min(start.elapsed());
+            // every value written beside stands, and the last plain one
+            let node = state.node(&f).unwrap();
+            assert_eq!(node.values(900).len() as u64, sets + 1);
+            assert_eq!(node.values(901).len() as u64, sets + 1);
+            assert_eq!(state.canonical(), space.state().canonical());
+        }
+        eprintln!("MEASURE {sets} sets beside {sets} sets of one field: {best:?}");
+        best
+    };
+    let (once, thrice) = (time_for(1_000), time_for(3_000));
+    // The product grows nine times, the sum three.
+    assert!(thrice < 5 * once, "{once:?} and {thrice:?}");
+    assert!(thrice < std::time::Duration::from_secs(2), "{thrice:?}");
+}

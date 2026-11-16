@@ -323,7 +323,12 @@ pub fn unnamed(d: &Daemon, delete: bool) -> anyhow::Result<Unnamed> {
             let files = core.files_id().and_then(|f| core.spaces.get(&f));
             let live: HashSet<Id> = files
                 .and_then(|h| h.space.as_ref())
-                .map(|sp| crate::fetch::current_refs(sp).iter().map(|b| b.id).collect())
+                .map(|sp| {
+                    crate::fetch::current_refs(sp)
+                        .iter()
+                        .map(|b| b.id)
+                        .collect()
+                })
                 .unwrap_or_default();
             (roots, unsure, live)
         };

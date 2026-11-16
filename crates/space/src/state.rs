@@ -328,7 +328,7 @@ struct Deletes<'a> {
     /// How many of its ops have been replayed, and what was touched as the
     /// positions stood then.
     done: usize,
-    touched: Option<HashMap<NodeId, HashSet<NodeId>>>,
+    touched: Option<HashSet<NodeId>>,
 }
 
 impl<'a> Deletes<'a> {
@@ -425,22 +425,22 @@ impl<'a> Deletes<'a> {
         self.touched = None;
     }
 
-    /// What concurrent entries touch, as the positions stand.
-    fn touched_now(&self) -> HashMap<NodeId, HashSet<NodeId>> {
+    /// What concurrent entries touch, as the positions stand: every node
+    /// they name and every node above one. A node of it that is beneath a
+    /// deleted node, or is that node, is what the delete leaves, so one set
+    /// answers for every delete of the entry; a chain kept for each deleted
+    /// node on a path is the square of the path's length.
+    fn touched_now(&self) -> HashSet<NodeId> {
         let at = &self.at;
-        let mut touched: HashMap<NodeId, HashSet<NodeId>> = HashMap::new();
+        let mut touched: HashSet<NodeId> = HashSet::new();
         for z in &self.named {
-            let mut chain = vec![*z];
             let mut cur = *z;
-            loop {
-                if self.deleted.contains(&cur) {
-                    touched.entry(cur).or_default().extend(&chain);
-                }
+            // what is above a node already in is in: a path is walked once
+            while touched.insert(cur) {
                 match at.parent.get(&cur) {
-                    Some(p) if chain.len() <= at.parent.len() => cur = *p,
-                    _ => break,
+                    Some(p) => cur = *p,
+                    None => break,
                 }
-                chain.push(cur);
             }
         }
         touched
@@ -459,13 +459,11 @@ impl<'a> Deletes<'a> {
         if moved || self.touched.is_none() {
             self.touched = Some(self.touched_now());
         }
-        let t = self.touched.as_ref().and_then(|t| t.get(n));
+        let t = self.touched.as_ref().expect("worked out above");
         let beneath = self.at.subtree(n).into_iter();
         DeleteEffect {
-            delete: beneath
-                .filter(|m| !t.is_some_and(|t| t.contains(m)))
-                .collect(),
-            conflict: t.is_some(),
+            delete: beneath.filter(|m| !t.contains(m)).collect(),
+            conflict: t.contains(n),
         }
     }
 
@@ -803,6 +801,14 @@ impl State {
     /// delete takes what is beneath its node as the tree stands then.
     fn apply(&mut self, dag: &Dag<SpaceEntry>, e: &SpaceEntry, mut effects: Option<Decide<'_>>) {
         let id = e.id();
+        // The entry's past is the same for all its ops. Whether an entry
+        // that left a value is in it is asked once; a field's standing
+        // values are gone through at its first plain `set` here, after
+        // which only this entry's own values, at the end, are superseded;
+        // and a field is put in order once, when the ops are done.
+        let mut in_past: HashMap<EntryId, bool> = HashMap::new();
+        let mut settled: HashMap<(NodeId, u64), usize> = HashMap::new();
+        let mut set: HashSet<(NodeId, u64)> = HashSet::new();
         for (i, op) in e.ops().iter().enumerate() {
             let i = i as u32;
             match op.body() {
@@ -865,14 +871,25 @@ impl State {
                         // one written beside supersedes nothing: its value
                         // is added, and is superseded like any other
                         if !*beside {
-                            vals.retain(|v| !dag.is_ancestor_or_self(&v.entry, &id));
+                            match settled.get(&(*node, *key)) {
+                                // what this entry added since is its own
+                                Some(others) => vals.truncate(*others),
+                                None => {
+                                    vals.retain(|v| {
+                                        !*in_past.entry(v.entry).or_insert_with(|| {
+                                            dag.is_ancestor_or_self(&v.entry, &id)
+                                        })
+                                    });
+                                    settled.insert((*node, *key), vals.len());
+                                }
+                            }
                         }
+                        set.insert((*node, *key));
                         vals.push(FieldValue {
                             entry: id,
                             op: i,
                             value: value.clone(),
                         });
-                        vals.sort_by_key(|a| (a.entry, a.op));
                     }
                 }
                 SpaceOpBody::Move { node, parent, name } => {
@@ -929,6 +946,15 @@ impl State {
                     }
                 }
                 _ => {}
+            }
+        }
+        for (node, key) in set {
+            let fields = match self.nodes.get_mut(&node) {
+                Some(n) => Some(&mut n.fields),
+                None => self.reach.get_mut(&node),
+            };
+            if let Some(vals) = fields.and_then(|f| f.get_mut(&key)) {
+                vals.sort_by_key(|a| (a.entry, a.op));
             }
         }
         self.applied.push(id);
