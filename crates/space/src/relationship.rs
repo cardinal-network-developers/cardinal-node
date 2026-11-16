@@ -181,17 +181,23 @@ pub fn reach_is_set(state: &State, who: &IdentityId) -> bool {
     !state.reach_values(who, 1).is_empty()
 }
 
-/// Every host and token `who` gives in their reach node, those their
-/// person prefers first (`profiles.md#reach`). Where two of their devices
-/// set it at the same moment it holds both lists:
+/// The hosts `who` gives in their reach node, those their person prefers
+/// first (`profiles.md#reach`). Where two of their devices set it at the
+/// same moment it holds both lists:
 ///
-/// - if either is empty, it is empty. An empty list is how a person says
-///   no, and a no stands against whatever was set beside it
-///   (`hosts.md#telling-others-where-to-reach-you`);
-/// - otherwise both count, the one set later in log order first.
+/// - if either is empty, cleared or not a list, it is empty. An empty
+///   list is how a person says no, and a no stands against whatever was
+///   set beside it (`hosts.md#telling-others-where-to-reach-you`);
+/// - otherwise both count, the one set later in log order first. A host
+///   named in both, with one token or two, is one host: it is given once,
+///   where it first stands, with the token it has there. Every token it
+///   was given for the space serves until revoked ([`reach_ever`]), so
+///   whichever is read is good.
 ///
-/// This is the one reading of a reach node: whoever looks up a host of
-/// someone's goes through it, as does whatever shows the list.
+/// Nobody writes only to make two lists one. This is the one reading of a
+/// reach node: whoever looks up a host of someone's goes through it, as
+/// does whatever shows the list, and a device that writes its own entry
+/// writes the others as this gives them.
 pub fn reach_of(space: &crate::Space, who: &IdentityId) -> Vec<Reach> {
     let dag = space.dag();
     let mut lists: Vec<_> = Vec::new();
@@ -208,90 +214,18 @@ pub fn reach_of(space: &crate::Space, who: &IdentityId) -> Vec<Reach> {
     }
     lists.sort_by_key(|(at, op, _)| std::cmp::Reverse((*at, *op)));
     let mut all: Vec<Reach> = Vec::new();
-    let mut seen: std::collections::HashMap<([u8; 32], [u8; 16]), Vec<usize>> = Default::default();
+    // Told from those taken already by looking it up: comparing with each
+    // of them is the square of a list its member, a reader as well, may
+    // make as long as an entry holds.
+    let mut seen: std::collections::HashSet<[u8; 32]> = Default::default();
     for (_, _, list) in lists {
         for r in list.iter().filter_map(|v| read_reach(v.as_record()?)) {
-            // Told from those taken already by looking it up: comparing
-            // with each of them is the square of a list its member, a
-            // reader as well, may make as long as an entry holds.
-            let alike = seen.entry((r.host, r.token)).or_default();
-            if !alike.iter().any(|i| all[*i] == r) {
-                alike.push(all.len());
+            if seen.insert(r.host) {
                 all.push(r);
             }
         }
     }
     all
-}
-
-/// The one result of `who`'s reach node (`profiles.md#reach`): what a
-/// device of theirs sets where the node holds two lists, and what it
-/// starts from whenever it writes the list. [`reach_of`], with each host
-/// once, in the place it first has there.
-///
-/// Where two lists name one host with different tokens, as when two
-/// devices each set the list again at the same moment, the token kept is
-/// the one from the list that host's own device signed: `device_of` gives
-/// the device behind a host's static key, where it is known. A host
-/// registers its own tokens, so that is the one it stands by; the other
-/// list only repeated what it had read. With no such list, the first in
-/// reading order is kept.
-///
-/// Every device that holds the same lists and knows the same hosts gives
-/// the same result, so two that set it at the same moment write the same
-/// list, and [`reach_is_settled`] then holds for both.
-pub fn reach_settled(
-    space: &crate::Space,
-    who: &IdentityId,
-    device_of: impl Fn(&[u8; 32]) -> Option<cardinal_identity::KeyId>,
-) -> Vec<Reach> {
-    let dag = space.dag();
-    let mut lists: Vec<_> = Vec::new();
-    for v in space.state().reach_values(who, 1) {
-        let list = v
-            .value
-            .as_ref()
-            .and_then(Value::as_list)
-            .unwrap_or_default();
-        if list.is_empty() {
-            return Vec::new();
-        }
-        let signer = space.entry(&v.entry).map(|e| e.signer());
-        lists.push((dag.position(&v.entry), v.op, signer, list));
-    }
-    lists.sort_by_key(|(at, op, ..)| std::cmp::Reverse((*at, *op)));
-    let mut all: Vec<(Reach, bool)> = Vec::new();
-    let mut place: std::collections::HashMap<[u8; 32], usize> = Default::default();
-    for (_, _, signer, list) in lists {
-        for r in list.iter().filter_map(|v| read_reach(v.as_record()?)) {
-            let own = signer.is_some() && signer == device_of(&r.host);
-            match place.get(&r.host) {
-                None => {
-                    place.insert(r.host, all.len());
-                    all.push((r, own));
-                }
-                Some(i) if own && !all[*i].1 => all[*i] = (r, true),
-                Some(_) => {}
-            }
-        }
-    }
-    all.into_iter().map(|(r, _)| r).collect()
-}
-
-/// Whether `who`'s reach node holds nothing but `settled`, its one result
-/// ([`reach_settled`]): it was never set, or every list it holds reads as
-/// that. Two lists that say the same are settled: a device that set the
-/// list again for it would only be answered in kind.
-pub fn reach_is_settled(state: &State, who: &IdentityId, settled: &[Reach]) -> bool {
-    state.reach_values(who, 1).iter().all(|v| {
-        let list = v
-            .value
-            .as_ref()
-            .and_then(Value::as_list)
-            .unwrap_or_default();
-        let read = list.iter().filter_map(|v| read_reach(v.as_record()?));
-        read.eq(settled.iter().cloned())
-    })
 }
 
 /// The entries with which `who` began naming hosts in a space, as their
@@ -356,8 +290,11 @@ pub fn naming_began(space: &crate::Space, who: &IdentityId) -> Vec<EntryId> {
 }
 
 /// Every host and token `who` ever gave in their reach node in a space:
-/// from each value they wrote there, whatever the node says now. For a host
-/// that ends the tokens of a node that was emptied.
+/// from each value they wrote there, whatever the node says now. A token
+/// serves until it is revoked, named in the current list or not
+/// (`profiles.md#reach`): this is where a host finds the space of a token
+/// something was left under, and the tokens to end when the list is
+/// emptied or a contact refused.
 pub fn reach_ever(space: &crate::Space, who: &IdentityId) -> Vec<Reach> {
     let node = reach_node_id(who);
     let mut all: Vec<Reach> = Vec::new();

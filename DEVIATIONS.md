@@ -1300,30 +1300,41 @@ asks for around that is not built yet.
   - **Unasked, software names a host** only when the person joins among
     contacts (`group-join` with no `reach`, or a list never set in a space
     they are in, as for whoever made it), and in a relationship, where a
-    host the list does not name is added after those it names.
-  - **Unasked, software keeps current** what a list names: the host itself
-    sets a new token and changed addresses (`renew_reach`); any device
-    takes out a host that serves no longer; and a device that sees two
-    lists sets the one result.
-  - **Reading: the one result of two lists** (`relationship::reach_settled`,
-    `Core::reach_settled`) names each host once, in the place it first has
-    reading the later list first. Where the lists give one host different
-    tokens, the token is the one from the list that host's own device
-    signed, by the grants in the account; with no such list, the first.
-    Whoever looks a token up still counts both lists
-    (`relationship::reach_of`). A device sets the result only where some
-    list the node holds reads differently from it: two lists that say the
-    same are left, or two devices would answer each other without end.
-    Every write of the list starts from the result, so a host named twice
-    is not carried on. A token that drops out this way stays registered
-    at its host until the list is emptied.
-  - **Reading: a host that serves no longer** (`Core::former_hosts`) is one
-    whose grant this device's account held and whose key none of the
-    account's hosts has now. A host the device has never heard of is left
-    in the list: a device that knows more named it. A host that stopped
-    and started again can still be taken out by a device that has heard
-    only of the stop; in a group it then stays out until the person shares
-    again.
+    device that is a host and is not named adds itself after those the
+    list names. No device adds another to a list that is set.
+  - **On its own, a device changes only its own entry** (D70,
+    `mailbox.rs` `keep_own_entry`, `Core::own_entry_due`): a host sets a
+    token where the one its entry has is not active, and changed
+    addresses; a device that is a host no longer takes itself out, when
+    `host --off` is said on it and at every look after. Nothing takes out
+    another device's entry, and nothing writes only to make two lists
+    one: `former_hosts`, `reach_due`, `reach_settled` and
+    `reach_is_settled` are gone. Whoever writes starts from the list as
+    read, each host once, the others unchanged.
+  - **Reading: one host in two lists** (`relationship::reach_of`). A host
+    is told by its static key. Named in both lists, or twice in one, it is
+    read once, where it first stands reading the later list first, with
+    the endpoints and token it has there. The text says a host named in
+    both "is one host" and not which entry is read.
+  - **Reading: every token serves** (`Core::space_of_token`,
+    `Core::tokens_given`, `relationship::reach_ever`). The space of a
+    token is looked for in the list as read and then in every value the
+    person ever set there, so what is left under a token the list names
+    no longer is opened. A no, leaving, and refusing a contact revoke
+    every token this host ever gave in that space, whether hosting is on
+    at that moment or not. A host that needs a token for a space gives
+    one it gave there before that is still active, and makes a new one
+    only if none is.
+  - **Reading: "takes itself out when it stops serving"** is done when
+    both the device's own setting and its own account say it is no host;
+    while only one does (the moment `host` or `host --off` is being
+    carried out) it waits. A device whose grant another device removed,
+    and whose own setting still says host, keeps its entry: nothing here
+    lets one device stop another being a host.
+  - **Reading: a yes to two lists.** `group-reach` with `share` true where
+    the node holds two lists writes the list as read, once, even with no
+    host to add: the text has them become one when "the person says yes
+    or no".
   - **Reading: `ask` once joined.** A list that is set, empty or not, is
     the person's answer, so `ask` is true only for an offer, or where they
     are in the space and never set it. A person who takes up a host later
@@ -1377,9 +1388,6 @@ asks for around that is not built yet.
   no record is dropped, which the text does not speak of.
   - **A host name is kept and shown, and never dialled** from a grant or a
     reach list: only `cardinal restore` resolves one.
-- **A reach node is kept current by the host it names.** A token that has
-  gone, or an address that changed, is set again by the host device,
-  wherever its person's reach node names it, in its place in the list.
 - **A new host does not tell contacts it is there** unless a mailbox of theirs
   can carry the reach node. Someone through hosts only who had no host when
   they were invited stays out of reach of the other until then.

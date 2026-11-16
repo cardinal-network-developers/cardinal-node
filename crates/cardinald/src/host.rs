@@ -257,6 +257,9 @@ pub fn disable(d: &Arc<Daemon>) -> anyhow::Result<Json> {
     d.save_config()?;
     d.endpoint.set_allow_public(false);
     crate::mailbox::close(d);
+    // It serves no longer, and takes itself out of the lists that name it.
+    // Nobody else does: whether a device still serves is its own to know.
+    crate::mailbox::keep_own_entry(d);
     sheet(d)
 }
 

@@ -483,17 +483,6 @@ pub fn hosts(state: &State) -> Vec<HostRecord> {
         .collect()
 }
 
-/// The grant of every host node the account ever had, deleted ones too: a
-/// host that stopped serving is told by its grant having been taken back,
-/// and one never heard of has none here.
-pub fn hosts_ever(state: &State) -> Vec<Vec<u8>> {
-    let all = state.children(&ROOT).into_iter();
-    all.filter(|n| n.kind == NodeKind::Uint(HOST))
-        .flat_map(|n| n.values(1).iter())
-        .filter_map(|v| Some(v.value.as_ref()?.as_bytes()?.to_vec()))
-        .collect()
-}
-
 /// The name of a device, if the account space has one.
 pub fn device_name(state: &State, key: &KeyId) -> Option<String> {
     devices(state)

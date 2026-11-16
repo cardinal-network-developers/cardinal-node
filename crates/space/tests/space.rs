@@ -1075,17 +1075,19 @@ fn the_epoch_key_is_in_the_clear_in_a_public_space_and_in_no_other() {
     }
 }
 
-/// Two of a person's devices are both hosts, and each sets the reach list
-/// again at the same moment, with a new token for itself and the token it
-/// had read for the other (as after a refusal is taken back). The node
-/// then holds two lists that name each host twice. Its one result names
-/// each host once, with the token that host's own device wrote; both
-/// devices setting it at the same moment write the same list, and after
-/// that neither has anything to write. It once grew without end: each
-/// device took the other's stale token for its own to renew.
+/// D70 (`profiles.md#reach`). Two of a person's devices are both hosts,
+/// and each sets the reach list again at the same moment, with a new token
+/// for itself and the token it had read for the other. The node then
+/// holds two lists that name each host, with two tokens each. Read, each
+/// host is there once, where it first stands; every token either was
+/// given is still known as given; and nothing in the reading depends on
+/// which device is which host, so no device has a result to set that
+/// another would set differently. It once grew without end: each device
+/// took the other's stale token for its own to renew, and then each set
+/// "the one result" by its own view of the account.
 #[test]
-fn two_hosts_setting_the_reach_list_at_once_come_to_rest() {
-    use cardinal_space::relationship::{reach_is_settled, reach_of, reach_settled, Reach};
+fn two_hosts_setting_the_reach_list_at_once_are_each_one_host() {
+    use cardinal_space::relationship::{reach_ever, reach_of, Reach};
     let p = person(7, 1);
     let (d0, d1) = (&p.devices[0], &p.devices[1]);
     let other = person(8, 0);
@@ -1101,11 +1103,6 @@ fn two_hosts_setting_the_reach_list_at_once_come_to_rest() {
     )
     .unwrap();
     let (host0, host1) = ([0xa0u8; 32], [0xa1u8; 32]);
-    let device_of = |host: &[u8; 32]| match *host {
-        h if h == host0 => Some(d0.signing.public_key()),
-        h if h == host1 => Some(d1.signing.public_key()),
-        _ => None,
-    };
     let one = |host: [u8; 32], token: u8| Reach {
         endpoints: Vec::new(),
         host,
@@ -1114,56 +1111,37 @@ fn two_hosts_setting_the_reach_list_at_once_come_to_rest() {
     // What both had read: each host with an old token.
     let old = relationship::set_reach(&me, &[one(host0, 1), one(host1, 2)]);
     space.write(&p.log, &d0.signing, vec![old], None).unwrap();
-    let settled = reach_settled(&space, &me, device_of);
-    assert!(reach_is_settled(space.state(), &me, &settled));
     // Each renews its own at the same moment.
     let by0 = relationship::set_reach(&me, &[one(host0, 11), one(host1, 2)]);
     let (first, _) = space
         .write_entry(&p.log, &d0.signing, vec![by0], None)
         .unwrap();
     let by1 = relationship::set_reach(&me, &[one(host0, 1), one(host1, 12)]);
-    space
+    let (second, _) = space
         .write_concurrent(&p.log, &d1.signing, &[first], vec![by1], None)
         .unwrap();
-    // Both lists count for whoever looks a token up.
-    assert_eq!(reach_of(&space, &me).len(), 4);
-    // The one result: each host once, with its own device's token.
-    let settled = reach_settled(&space, &me, device_of);
-    assert_eq!(settled, [one(host0, 11), one(host1, 12)]);
-    assert!(!reach_is_settled(space.state(), &me, &settled));
-
-    // Both devices set it, at the same moment, round after round, for as
-    // long as either finds something to write. One round is all it takes,
-    // and no round changes a token.
-    let mut rounds = 0;
-    for _ in 0..5 {
-        let settled = reach_settled(&space, &me, device_of);
-        assert_eq!(settled, [one(host0, 11), one(host1, 12)]);
-        if reach_is_settled(space.state(), &me, &settled) {
-            break;
-        }
-        rounds += 1;
-        let set = relationship::set_reach(&me, &settled);
-        let (a, _) = space
-            .write_entry(&p.log, &d0.signing, vec![set.clone()], None)
-            .unwrap();
-        space
-            .write_concurrent(&p.log, &d1.signing, &[a], vec![set], None)
-            .unwrap();
-    }
-    assert_eq!(rounds, 1, "the two devices keep answering each other");
     assert_eq!(space.state().reach_values(&me, 1).len(), 2);
-    assert_eq!(reach_of(&space, &me), [one(host0, 11), one(host1, 12)]);
+    // Each host once, as the list later in log order has it.
+    let dag = space.dag();
+    let read = match dag.position(&first) > dag.position(&second) {
+        true => [one(host0, 11), one(host1, 2)],
+        false => [one(host0, 1), one(host1, 12)],
+    };
+    assert_eq!(reach_of(&space, &me), read);
+    // Every token given is known, read now or not: each serves until it
+    // is revoked.
+    let ever: Vec<u8> = reach_ever(&space, &me).iter().map(|r| r.token[0]).collect();
+    for token in [1, 2, 11, 12] {
+        assert!(ever.contains(&token), "{token} is forgotten");
+    }
 
-    // A list that names a host twice, as an earlier version left them, is
-    // not settled either, and its result names it once.
+    // A list that names a host twice, as an earlier version left them,
+    // names it once, where it first stands.
     let twice = [one(host0, 11), one(host1, 12), one(host0, 3), one(host0, 4)];
     let set = relationship::set_reach(&me, &twice);
     space.write(&p.log, &d0.signing, vec![set], None).unwrap();
-    let settled = reach_settled(&space, &me, device_of);
-    assert_eq!(settled, [one(host0, 11), one(host1, 12)]);
-    assert!(!reach_is_settled(space.state(), &me, &settled));
-    // An empty list beside one that names a host settles as empty.
+    assert_eq!(reach_of(&space, &me), [one(host0, 11), one(host1, 12)]);
+    // An empty list beside one that names a host reads as empty.
     let no = relationship::set_reach(&me, &[]);
     let (no, _) = space
         .write_entry(&p.log, &d0.signing, vec![no], None)
@@ -1172,6 +1150,5 @@ fn two_hosts_setting_the_reach_list_at_once_come_to_rest() {
     space
         .write_concurrent(&p.log, &d1.signing, &[no], vec![yes], None)
         .unwrap();
-    let settled = reach_settled(&space, &me, device_of);
-    assert!(settled.is_empty() && !reach_is_settled(space.state(), &me, &settled));
+    assert!(reach_of(&space, &me).is_empty());
 }

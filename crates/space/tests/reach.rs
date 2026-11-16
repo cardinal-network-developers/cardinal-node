@@ -25,7 +25,7 @@ fn person(n: u8) -> (IdentityLog, HybridKeyPair, DeviceKeys) {
 fn reach(token: u8) -> Reach {
     Reach {
         endpoints: Vec::new(),
-        host: [9; 32],
+        host: [token; 32],
         token: [token; 16],
     }
 }
@@ -333,6 +333,7 @@ fn a_long_reach_list_is_read_in_one_pass() {
         .map(|n| {
             let mut r = reach(1);
             r.token[..4].copy_from_slice(&n.to_le_bytes());
+            r.host[..4].copy_from_slice(&n.to_le_bytes());
             r
         })
         .collect();
