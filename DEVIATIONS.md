@@ -1508,14 +1508,32 @@ asks for around that is not built yet.
   the current state (every version of a file in conflict), weighted by
   size, then down the indexes this device holds in proportion to the
   bytes beneath, sometimes stopping at an index (indexes are kept too),
-  else the top id. Only blobs this device first saw more than an hour
-  ago are sampled: first seen is the birth time of the top object in the
-  store (its modification time where the file system has no birth time;
-  reads touch that, which only delays sampling), or when this run first
-  saw the reference. So the count is of copies of everything older than
-  an hour, and status says so; newer content is still being copied.
-- **Readings: failing, "recently".** A check fails when a piece comes
-  back "not held" or does not hash to its id. A check with no answer
+  else the top id. All current content is sampled, whatever its age.
+- **Reading: "once the checker has had it for a while".** A piece is old
+  when this device first saw its blob more than an hour ago: first seen
+  is the birth time of the top object in the store (its modification
+  time where the file system has no birth time; reads touch that, which
+  only delays it), or when this run first saw the reference. The age is
+  the blob's, not the chunk's: a chunk an old file and a new file share
+  is old if either is. So the count is still of copies of everything
+  older than an hour, and status says so.
+- **Reading: what a check comes to.** A piece that comes back and hashes
+  to its id counts for the holder at any age. One "not held" counts
+  against it only if it is old; one that does not hash to its id always
+  does. With nothing against it, a check passes if every old piece asked
+  for came, or, where none asked for was old, if every piece came.
+  Otherwise it is neither a pass nor a failure: the holder lacks only
+  what is new, and stands as it stood. The text does not say what a
+  check of new pieces alone, some of them not held, comes to.
+- **Reading: "still copying" and "missing pieces".** `state` is `copying`
+  for a holder that has answered a check and never passed one, whether
+  its last check found old pieces missing, damaged ones, or only new
+  ones not there yet; `missing` for one that passed and whose last check
+  then found pieces missing or damaged. `failed` is now only a holder
+  that left two checks in a row unanswered, which the text keeps apart
+  ("better asked again than failed at once"), and `unchecked` one that
+  has answered none. This device says the same of itself.
+- **Readings: failing, "recently".** A check with no answer
   (timed out; a closed session is not a check) fails only when it is
   the second in a row: the spec suggests asking again rather than
   failing at once, and leaves how often to each device. A passed check

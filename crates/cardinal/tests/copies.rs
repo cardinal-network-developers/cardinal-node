@@ -154,11 +154,14 @@ fn copies_and_speedtest() {
     for round in 0..2 {
         lose_disk(&mut b);
         wait("alpha finds pieces missing on beta", 40, || {
-            state_of(&a, "beta") == "failed"
+            state_of(&a, "beta") == "missing"
         });
         let st = a.cli(&["status"]);
         eprintln!("---- beta rebuilding ({round}) ----\n{st}");
-        assert!(st.contains("beta: not counted — did not have "), "{st}");
+        assert!(
+            st.contains("beta: not counted — missing pieces: did not have "),
+            "{st}"
+        );
         assert!(
             st.contains(
                 "Your files are only on this device until another device passes its checks."
@@ -180,4 +183,59 @@ fn copies_and_speedtest() {
     });
     let out = a.cli(&["speedtest"]);
     assert_eq!(out.trim(), "beta runs an older version without speedtest");
+}
+
+/// `blobs.md#counting-copies`: "A chunk produced counts for its holder
+/// whatever its age". With the usual hour before a piece not held counts
+/// against anyone, a second device that has fetched a new file is counted
+/// as soon as a check finds the file there. It used to be left out until
+/// the file was an hour old, with nothing to check before that.
+#[test]
+fn a_copy_of_new_files_is_counted_once_it_is_there() {
+    if !fuse_available() {
+        eprintln!("skipping: /dev/fuse or fusermount3 is not available");
+        return;
+    }
+    let root = tempfile::tempdir().unwrap();
+    let mut a = Dev::new(root.path(), "alpha", free_port());
+    let mut b = Dev::new(root.path(), "beta", free_port());
+    for d in [&mut a, &mut b] {
+        // the hour is left as it is
+        d.env
+            .push(("CARDINAL_TEST_CHECK_INTERVAL_MS".into(), "1500".into()));
+    }
+    a.start();
+    a.cli(&["init", "--yes", "--name", "alpha"]);
+    a.wait_mounted();
+    std::fs::write(a.p("photo.bin"), content(2 << 20, 1)).unwrap();
+    a.cli(&["flush"]);
+    wait("alpha counts itself", 20, || {
+        let c = copies(&a);
+        c["count"] == 1 && c["blobs"] == 1
+    });
+    b.start();
+    pair(&a, &b);
+    wait("alpha counts beta", 60, || copies(&a)["count"] == 2);
+    wait("beta counts alpha", 60, || copies(&b)["count"] == 2);
+    let c = copies(&a);
+    assert_eq!(c["eligible"], 0, "nothing is an hour old: {c}");
+    assert_eq!(state_of(&a, "beta"), "passed");
+    let st = a.cli(&["status"]);
+    assert!(st.contains("Copies: 2 — this device, beta"), "{st}");
+
+    // Beta loses its disk. Nothing alpha asks for is an hour old, so
+    // what beta does not have yet is not held against it: it is not
+    // "missing pieces", and it still counts on the pass it had.
+    b.stop();
+    std::fs::remove_dir_all(b.home.join("blobs")).unwrap();
+    b.start();
+    wait("alpha checks beta again", 40, || {
+        let all = copies(&a)["holders"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        let beta = all.iter().find(|h| h["name"] == "beta").cloned();
+        beta.is_some_and(|h| h["online"] == true && h["last_check"].as_u64() > c["now"].as_u64())
+    });
+    assert_ne!(state_of(&a, "beta"), "missing");
 }

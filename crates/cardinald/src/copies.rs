@@ -8,18 +8,23 @@
 //!
 //! - **Checks.** About every 10 minutes, each online device meant to keep
 //!   everything is asked for a few objects (chunks or indexes) chosen at
-//!   random among content this device first saw more than an hour ago,
-//!   through the ordinary `blob` service, the same request a fetch sends.
-//!   The answers are verified by hash and dropped. Content younger than
-//!   that is left out, so a device still copying new files is not counted
-//!   as failing: the count is of copies of everything older than an hour.
+//!   random among all current content, through the ordinary `blob`
+//!   service, the same request a fetch sends. The answers are verified by
+//!   hash and dropped.
+//! - **A piece produced counts for its holder at once, whatever its age.**
+//!   A piece "not held" counts against it only where this device has had
+//!   the content for an hour: a device still copying new files is not
+//!   failing. So the count is of copies of everything older than an hour.
 //! - **Only a missing or damaged piece fails.** A device that answers
-//!   "not held" for a piece it should keep, or sends one that does not
-//!   hash to its id, stops counting until it passes a check. One that does
-//!   not answer is asked again at its next check, and fails when it misses
-//!   two in a row. What devices fetch is not watched: one rebuilding after
-//!   a lost disk fails checks while pieces are missing and passes once it
-//!   has them again.
+//!   "not held" for such a piece, or sends one that does not hash to its
+//!   id, stops counting until it passes a check. One that does not answer
+//!   is asked again at its next check, and fails when it misses two in a
+//!   row. What devices fetch is not watched: one rebuilding after a lost
+//!   disk fails checks while pieces are missing and passes once it has
+//!   them again.
+//! - **Still copying, or missing pieces.** A device that has never passed
+//!   a check is still copying, and is said to be; one that passed and now
+//!   does not is missing pieces.
 //!
 //! This device counts itself when it keeps everything, unless its own
 //! check (a sample drawn the same way, read from its store) found pieces
@@ -52,8 +57,9 @@ use crate::paths::write_private;
 pub struct Rules {
     /// Between two checks of one device: 10 minutes.
     pub interval_ms: u64,
-    /// Content this device first saw less than this long ago is neither
-    /// checked nor counted: an hour.
+    /// Content this device first saw less than this long ago is asked
+    /// for like any other, and a holder that does not have it yet is not
+    /// failing: an hour.
     pub min_age_ms: u64,
     /// Objects asked for per check.
     pub sample: usize,
@@ -106,6 +112,10 @@ pub enum Outcome {
     Passed,
     /// Something was missing or wrong, in plain words.
     Failed(String),
+    /// Nothing was wrong, and it does not have yet what this device has
+    /// had for less than the minimum age: it is still copying. Neither a
+    /// pass nor a failure.
+    Copying(String),
     /// No answer (timed out, or the service failed), in plain words.
     Unanswered(String),
 }
@@ -124,6 +134,11 @@ pub struct Holder {
     pub fail_reason: Option<String>,
     /// Checks it left unanswered since it last answered one.
     pub missed: u8,
+    /// When the last check it answered started, pass or not.
+    pub last_answer: Option<u64>,
+    /// Whether the last failure was for not answering, and not for a
+    /// piece that was missing or damaged.
+    pub unanswered: bool,
 }
 
 /// Whether a device counts as a copy now, and if not, why.
@@ -134,11 +149,24 @@ pub enum Verdict {
         /// When.
         checked: u64,
     },
-    /// Its last check failed.
+    /// It did not answer its last checks.
     Failed {
         /// When the check started.
         at: u64,
         /// Why.
+        reason: String,
+    },
+    /// It passed a check once, and its last one found pieces missing or
+    /// damaged.
+    Missing {
+        /// When the check started.
+        at: u64,
+        /// Why.
+        reason: String,
+    },
+    /// It has answered and never yet passed: it is still copying.
+    Copying {
+        /// What the last check found.
         reason: String,
     },
     /// Its last pass is older than the horizon.
@@ -161,6 +189,8 @@ impl Verdict {
         match self {
             Verdict::Counted { .. } => "passed",
             Verdict::Failed { .. } => "failed",
+            Verdict::Missing { .. } => "missing",
+            Verdict::Copying { .. } => "copying",
             Verdict::Stale { .. } => "stale",
             Verdict::Unchecked => "unchecked",
         }
@@ -172,28 +202,43 @@ impl Holder {
     /// fails only when it is the [`MISSES`]th in a row.
     pub fn checked(&mut self, started: u64, outcome: Outcome) {
         self.last_check = Some(self.last_check.map_or(started, |t| t.max(started)));
+        if !matches!(outcome, Outcome::Unanswered(_)) {
+            self.last_answer = Some(started);
+            self.missed = 0;
+        }
         match outcome {
-            Outcome::Passed => {
-                self.last_pass = Some(started);
-                self.missed = 0;
-            }
-            Outcome::Failed(why) => {
-                self.fail(started, why);
-                self.missed = 0;
-            }
+            Outcome::Passed => self.last_pass = Some(started),
+            Outcome::Failed(why) => self.fail(started, why, false),
+            // It stands as it stood: a pass still counts, and a failure
+            // is not mended by what it does not have yet.
+            Outcome::Copying(_) => {}
             Outcome::Unanswered(why) => {
                 self.missed = self.missed.saturating_add(1);
                 if self.missed >= MISSES {
                     let why = format!("did not answer {} checks in a row ({why})", self.missed);
-                    self.fail(started, why);
+                    self.fail(started, why, true);
                 }
             }
         }
     }
 
-    fn fail(&mut self, started: u64, why: String) {
+    fn fail(&mut self, started: u64, why: String, unanswered: bool) {
         self.last_fail = Some(started);
         self.fail_reason = Some(why);
+        self.unanswered = unanswered;
+    }
+
+    /// What a check that did not pass makes of a device: one that did not
+    /// answer failed; one that has passed before is missing pieces; one
+    /// that never has is still copying (`blobs.md#counting-copies`).
+    fn failing(&self, at: u64) -> Verdict {
+        let reason = self.fail_reason.clone();
+        let reason = reason.unwrap_or_else(|| "failed a check".into());
+        match (self.unanswered, self.last_pass) {
+            (true, _) => Verdict::Failed { at, reason },
+            (false, Some(_)) => Verdict::Missing { at, reason },
+            (false, None) => Verdict::Copying { reason },
+        }
     }
 
     /// Whether it counts now.
@@ -203,17 +248,15 @@ impl Holder {
             .last_fail
             .filter(|f| self.last_pass.is_none_or(|p| p <= *f))
         {
-            return Verdict::Failed {
-                at: f,
-                reason: self
-                    .fail_reason
-                    .clone()
-                    .unwrap_or_else(|| "failed a check".into()),
-            };
+            return self.failing(f);
         }
         match self.last_pass {
             Some(p) if now.saturating_sub(p) <= r.horizon_ms => Verdict::Counted { checked: p },
             Some(p) => Verdict::Stale { checked: p },
+            // answered, with nothing wrong and nothing to count yet
+            None if self.last_answer.is_some() => Verdict::Copying {
+                reason: "does not have the newest of your files yet".into(),
+            },
             None => Verdict::Unchecked,
         }
     }
@@ -222,13 +265,7 @@ impl Holder {
     /// unless its latest own check found something missing.
     pub fn own_verdict(&self) -> Verdict {
         match (self.last_fail, self.last_pass) {
-            (Some(f), p) if p.is_none_or(|p| p < f) => Verdict::Failed {
-                at: f,
-                reason: self
-                    .fail_reason
-                    .clone()
-                    .unwrap_or_else(|| "failed a check".into()),
-            },
+            (Some(f), p) if p.is_none_or(|p| p < f) => self.failing(f),
             (_, p) => Verdict::Counted {
                 checked: p.unwrap_or(0),
             },
@@ -243,25 +280,53 @@ impl Holder {
     }
 }
 
-/// Judges a reply to a check of `ids`. `local` words it for this
+/// An object a check asks for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Asked {
+    /// Its id.
+    pub id: [u8; 32],
+    /// Whether this device has had its content for the minimum age: only
+    /// then does a holder that lacks it fail.
+    pub old: bool,
+}
+
+/// Judges a reply to a check of `asked`. `local` words it for this
 /// device's own store.
-pub fn judge(ids: &[[u8; 32]], reply: &BlobReply, local: bool) -> Outcome {
-    let (mut missing, mut damaged) = (0, 0);
-    for id in ids {
+///
+/// A piece produced counts for the holder whatever its age. One "not
+/// held" counts against it only if it is old; a damaged one always does.
+/// With nothing against it, it passes if every old piece asked for came,
+/// or, where none was old, every piece did. Otherwise it is still
+/// copying: it has produced nothing wrong and lacks only what is new.
+pub fn judge(asked: &[Asked], reply: &BlobReply, local: bool) -> Outcome {
+    let (mut missing, mut damaged, mut not_yet, mut produced) = (0, 0, 0, 0);
+    for a in asked {
         let item = reply.items.iter().find(|i| match i {
-            BlobItem::Held { id: x, .. } | BlobItem::NotHeld(x) => x == id,
+            BlobItem::Held { id: x, .. } | BlobItem::NotHeld(x) => *x == a.id,
         });
         match item {
             Some(BlobItem::Held { ciphertext, .. })
-                if blake3::hash(ciphertext).as_bytes() == id => {}
+                if *blake3::hash(ciphertext).as_bytes() == a.id =>
+            {
+                produced += 1
+            }
             Some(BlobItem::Held { .. }) => damaged += 1,
-            _ => missing += 1,
+            _ if a.old => missing += 1,
+            _ => not_yet += 1,
         }
     }
+    let n = asked.len();
     if missing == 0 && damaged == 0 {
-        return Outcome::Passed;
+        let old = asked.iter().filter(|a| a.old).count();
+        return match not_yet == 0 || (old > 0 && produced > 0) {
+            true => Outcome::Passed,
+            false => Outcome::Copying(if local {
+                format!("{not_yet} of the {n} pieces checked are of new files not here yet")
+            } else {
+                format!("does not have {not_yet} of the {n} pieces asked for yet, of new files")
+            }),
+        };
     }
-    let n = ids.len();
     let mut parts = Vec::new();
     if missing > 0 {
         parts.push(if local {
@@ -332,8 +397,9 @@ pub fn born(store: &FsStore, id: &[u8; 32]) -> Option<u64> {
     Some(t.duration_since(std::time::UNIX_EPOCH).ok()?.as_millis() as u64)
 }
 
-/// What can be checked: blobs of the current files state that this
-/// device first saw long enough ago.
+/// What can be checked: every blob of the current files state, each
+/// with whether this device first saw it long enough ago for a holder
+/// that lacks it to fail.
 #[derive(Default)]
 pub struct Pool {
     version: Option<(SpaceId, u64)>,
@@ -341,8 +407,9 @@ pub struct Pool {
     /// Top id -> when first seen here: the top object's birth here, or
     /// when this run first saw the reference.
     first_seen: HashMap<[u8; 32], u64>,
-    /// Cumulative weight (about the chunk count), index into `refs`.
-    eligible: Vec<(u64, usize)>,
+    /// Cumulative weight (about the chunk count), index into `refs`, and
+    /// whether the blob is old enough.
+    weighed: Vec<(u64, usize, bool)>,
 }
 
 impl Pool {
@@ -367,19 +434,16 @@ impl Pool {
         self.first_seen = first;
     }
 
-    /// Recomputes which blobs are old enough to check.
+    /// Weighs every blob for sampling, and notes which are old enough
+    /// that a holder without them fails.
     pub fn select(&mut self, now: u64, min_age: u64) {
-        self.eligible.clear();
+        self.weighed.clear();
         let mut total = 0u64;
         for (i, r) in self.refs.iter().enumerate() {
-            if self
-                .first_seen
-                .get(&r.id)
-                .is_some_and(|t| now.saturating_sub(*t) >= min_age)
-            {
-                total += 1 + r.size / AVG_CHUNK;
-                self.eligible.push((total, i));
-            }
+            let first = self.first_seen.get(&r.id);
+            let old = first.is_some_and(|t| now.saturating_sub(*t) >= min_age);
+            total += 1 + r.size / AVG_CHUNK;
+            self.weighed.push((total, i, old));
         }
     }
 
@@ -388,34 +452,37 @@ impl Pool {
         self.refs.len()
     }
 
-    /// Blobs old enough to check.
+    /// Blobs old enough that a holder without them fails.
     pub fn eligible(&self) -> usize {
-        self.eligible.len()
+        self.weighed.iter().filter(|(_, _, old)| *old).count()
     }
 
     /// Up to `n` distinct objects at random, about uniformly over the
-    /// chunks of eligible blobs. Indexes this device holds are descended
-    /// through `get`; where it holds none, the blob's top id is asked.
+    /// chunks of all current blobs, each with whether its blob is old
+    /// enough. Indexes this device holds are descended through `get`;
+    /// where it holds none, the blob's top id is asked.
     pub fn sample(
         &self,
         n: usize,
         rng: &mut Rng,
         get: impl Fn(&[u8; 32]) -> Option<Vec<u8>>,
-    ) -> Vec<[u8; 32]> {
-        let Some(&(total, _)) = self.eligible.last() else {
+    ) -> Vec<Asked> {
+        let Some(&(total, ..)) = self.weighed.last() else {
             return Vec::new();
         };
-        let mut out: Vec<[u8; 32]> = Vec::new();
+        let mut out: Vec<Asked> = Vec::new();
         for _ in 0..n * 4 {
             if out.len() >= n {
                 break;
             }
             let x = rng.below(total);
-            let pos = self.eligible.partition_point(|(c, _)| *c <= x);
-            let r = &self.refs[self.eligible[pos.min(self.eligible.len() - 1)].1];
-            let id = pick(r, rng, &get);
-            if !out.contains(&id) {
-                out.push(id);
+            let pos = self.weighed.partition_point(|(c, ..)| *c <= x);
+            let (_, at, old) = self.weighed[pos.min(self.weighed.len() - 1)];
+            let id = pick(&self.refs[at], rng, &get);
+            match out.iter_mut().find(|a| a.id == id) {
+                // the same content in an old file and a new one is old
+                Some(a) => a.old |= old,
+                None => out.push(Asked { id, old }),
             }
         }
         out
@@ -583,7 +650,7 @@ impl Tracker {
         let before = verdict(h).counted();
         h.checked(started, outcome);
         match (before, verdict(h)) {
-            (true, Verdict::Failed { reason, .. }) => {
+            (true, Verdict::Failed { reason, .. } | Verdict::Missing { reason, .. }) => {
                 tracing::warn!("not counting {name} as a copy of your files: {reason}")
             }
             (false, v) if v.counted() => tracing::info!("{name} counts as a copy of your files"),
@@ -669,7 +736,7 @@ pub(crate) fn full_holder_sessions(d: &Daemon) -> Vec<cardinal_link::Session> {
 struct Round {
     pool: Pool,
     rng: Rng,
-    samples: Vec<(KeyId, Vec<[u8; 32]>)>,
+    samples: Vec<(KeyId, Vec<Asked>)>,
     own: Option<Outcome>,
 }
 
@@ -756,18 +823,19 @@ pub fn start(d: Arc<Daemon>) {
                 }
                 pool.select(now, rules.min_age_ms);
                 let get = |id: &[u8; 32]| d2.store.get(id).ok().flatten();
-                let samples: Vec<(KeyId, Vec<[u8; 32]>)> = keys
+                let samples: Vec<(KeyId, Vec<Asked>)> = keys
                     .into_iter()
                     .map(|k| (k, pool.sample(rules.sample, &mut rng, get)))
                     .filter(|(_, s)| !s.is_empty())
                     .collect();
                 let own = if own {
-                    let ids = pool.sample(rules.sample, &mut rng, get);
-                    if ids.is_empty() {
+                    let asked = pool.sample(rules.sample, &mut rng, get);
+                    if asked.is_empty() {
                         None
                     } else {
-                        let reply = cardinal_sync::BlobRequest { ids: ids.clone() }.serve(get);
-                        Some(judge(&ids, &reply, true))
+                        let ids = asked.iter().map(|a| a.id).collect();
+                        let reply = cardinal_sync::BlobRequest { ids }.serve(get);
+                        Some(judge(&asked, &reply, true))
                     }
                 } else {
                     None
@@ -801,7 +869,7 @@ pub fn start(d: Arc<Daemon>) {
                 own_due = now + rules.interval_ms;
             }
             // Ask the others, through the ordinary blob service.
-            for (key, ids) in round.samples {
+            for (key, asked) in round.samples {
                 let Some((_, s)) = due.iter().find(|(k, _)| *k == key) else {
                     continue;
                 };
@@ -810,10 +878,10 @@ pub fn start(d: Arc<Daemon>) {
                 d.copies.begin(key);
                 checks.spawn(async move {
                     let started = now_ms();
+                    let ids: Vec<[u8; 32]> = asked.iter().map(|a| a.id).collect();
                     let outcome =
-                        match crate::net::blob_request(&s, ids.clone(), Priority::Background).await
-                        {
-                            Ok(reply) => Some(judge(&ids, &reply, false)),
+                        match crate::net::blob_request(&s, ids, Priority::Background).await {
+                            Ok(reply) => Some(judge(&asked, &reply, false)),
                             Err(_) if s.is_closed() => None,
                             Err(e) => Some(Outcome::Unanswered(format!("{e:#}"))),
                         };
@@ -856,7 +924,9 @@ pub fn status(d: &Daemon) -> Value {
         };
         let reason = match &verdict {
             Verdict::Counted { .. } => None,
-            Verdict::Failed { reason, .. } => Some(reason.clone()),
+            Verdict::Failed { reason, .. }
+            | Verdict::Missing { reason, .. }
+            | Verdict::Copying { reason } => Some(reason.clone()),
             Verdict::Stale { .. } => Some("not checked recently".to_owned()),
             Verdict::Unchecked => Some("not checked yet".to_owned()),
         };
@@ -906,7 +976,7 @@ mod tests {
     }
 
     #[test]
-    fn unchecked_then_passed_then_failed() {
+    fn unchecked_then_passed_then_missing() {
         let r = rules();
         let mut h = Holder::default();
         assert_eq!(h.verdict(&r, 0), Verdict::Unchecked);
@@ -915,7 +985,7 @@ mod tests {
         h.checked(1000 + 10 * MIN, Outcome::Failed("did not answer".into()));
         assert!(matches!(
             h.verdict(&r, 1000 + 11 * MIN),
-            Verdict::Failed { .. }
+            Verdict::Missing { .. }
         ));
         // passing again counts again
         h.checked(1000 + 20 * MIN, Outcome::Passed);
@@ -1042,8 +1112,11 @@ mod tests {
         }
     }
 
+    /// `blobs.md#counting-copies`: the sample is drawn from all current
+    /// content, whatever its age, and says of each piece whether this
+    /// device has had it for the minimum age.
     #[test]
-    fn sampling_window() {
+    fn everything_current_is_sampled_and_its_age_noted() {
         let mut p = Pool::default();
         let now = 10 * 3_600_000;
         // blob 1 was stored here two hours ago, blob 2 ten minutes ago,
@@ -1057,8 +1130,14 @@ mod tests {
         p.select(now, 3_600_000);
         assert_eq!((p.blobs(), p.eligible()), (3, 1));
         let mut rng = Rng::seeded(1);
-        let s = p.sample(4, &mut rng, |_| None);
-        assert_eq!(s, vec![[1; 32]], "only content older than an hour");
+        let mut s = p.sample(3, &mut rng, |_| None);
+        s.sort_by_key(|a| a.id);
+        let asked = |n: u8, old: bool| Asked { id: [n; 32], old };
+        assert_eq!(
+            s,
+            [asked(1, true), asked(2, false), asked(3, false)],
+            "new content is left out, or taken for old"
+        );
         // an hour later the others are old enough too; blob 3 counts from
         // when this run first saw it, even once fetched since
         let later = now + 3_600_000;
@@ -1070,8 +1149,113 @@ mod tests {
         p.select(later, 3_600_000);
         assert_eq!(p.eligible(), 3);
         let mut s = p.sample(3, &mut rng, |_| None);
-        s.sort();
-        assert_eq!(s, vec![[1; 32], [2; 32], [3; 32]]);
+        s.sort_by_key(|a| a.id);
+        assert_eq!(s, [asked(1, true), asked(2, true), asked(3, true)]);
+    }
+
+    /// A piece produced counts for its holder at once, whatever its age;
+    /// "not held" counts against it only for what this device has had
+    /// for the minimum age; a damaged piece always does.
+    #[test]
+    fn a_piece_not_held_fails_only_if_it_is_old() {
+        let piece = |n: u8| {
+            let bytes = vec![n; 9];
+            (*blake3::hash(&bytes).as_bytes(), bytes)
+        };
+        let ((a, a_bytes), (b, b_bytes), (c, _)) = (piece(1), piece(2), piece(3));
+        let held = |id, ciphertext: &Vec<u8>| BlobItem::Held {
+            id,
+            ciphertext: ciphertext.clone(),
+        };
+        let asked = |id, old| Asked { id, old };
+        let reply = |items| BlobReply { items };
+        // New content it has already: a pass, at once.
+        let both = reply(vec![held(a, &a_bytes), held(b, &b_bytes)]);
+        let new = [asked(a, false), asked(b, false)];
+        assert_eq!(judge(&new, &both, false), Outcome::Passed);
+        // New content it does not have yet: no pass, and no failure.
+        let none = reply(vec![BlobItem::NotHeld(a), BlobItem::NotHeld(b)]);
+        let copying = judge(&new, &none, false);
+        assert!(matches!(copying, Outcome::Copying(_)), "{copying:?}");
+        let some = reply(vec![held(a, &a_bytes), BlobItem::NotHeld(b)]);
+        let copying = judge(&new, &some, false);
+        assert!(matches!(copying, Outcome::Copying(_)), "{copying:?}");
+        // The old piece it has and a new one it has not: everything
+        // older than the minimum age is there, which is what is counted.
+        let mixed = [asked(a, true), asked(b, false)];
+        assert_eq!(judge(&mixed, &some, false), Outcome::Passed);
+        // An old piece it does not have fails, whatever else it has.
+        let old = [asked(a, false), asked(b, true)];
+        assert_eq!(
+            judge(&old, &some, false),
+            Outcome::Failed("did not have 1 of the 2 pieces of your files asked for".into())
+        );
+        // No word of a piece is "not held".
+        let silent = [asked(a, false), asked(c, true)];
+        assert!(matches!(judge(&silent, &some, false), Outcome::Failed(_)));
+        // A damaged piece fails at any age.
+        let bad = reply(vec![held(a, &b_bytes)]);
+        assert_eq!(
+            judge(&[asked(a, false)], &bad, false),
+            Outcome::Failed("sent 1 of the 1 pieces damaged".into())
+        );
+    }
+
+    /// A holder that has never passed is still copying; one that passed
+    /// and now misses pieces is missing them; one that does not answer
+    /// failed. None of them counts.
+    #[test]
+    fn still_copying_is_told_from_missing_pieces() {
+        let r = rules();
+        let missing = || Outcome::Failed("did not have 2 of the 4 pieces".into());
+        let not_yet = || Outcome::Copying("does not have 4 of the 4 pieces yet".into());
+        let state = |h: &Holder, now| h.verdict(&r, now).state();
+        // Never passed.
+        let mut h = Holder::default();
+        assert_eq!(state(&h, 0), "unchecked");
+        h.checked(MIN, not_yet());
+        assert_eq!(state(&h, 2 * MIN), "copying");
+        h.checked(10 * MIN, missing());
+        assert_eq!(state(&h, 11 * MIN), "copying");
+        assert!(!h.verdict(&r, 11 * MIN).counted());
+        // new content it lacks does not mend that, and a pass does
+        h.checked(20 * MIN, not_yet());
+        assert_eq!(state(&h, 21 * MIN), "copying");
+        h.checked(30 * MIN, Outcome::Passed);
+        assert_eq!(state(&h, 31 * MIN), "passed");
+        // Passed, and new content it does not have yet: it still counts.
+        h.checked(40 * MIN, not_yet());
+        assert!(h.verdict(&r, 41 * MIN).counted());
+        // Passed, and now pieces are missing.
+        h.checked(50 * MIN, missing());
+        assert_eq!(state(&h, 51 * MIN), "missing");
+        assert!(!h.verdict(&r, 51 * MIN).counted());
+        h.checked(60 * MIN, Outcome::Passed);
+        assert_eq!(state(&h, 61 * MIN), "passed");
+        // Not answering is neither.
+        let timed_out = || Outcome::Unanswered("timed out".into());
+        h.checked(70 * MIN, timed_out());
+        h.checked(80 * MIN, timed_out());
+        assert_eq!(state(&h, 81 * MIN), "failed");
+        let mut never = Holder::default();
+        never.checked(MIN, timed_out());
+        assert_eq!(state(&never, 2 * MIN), "unchecked");
+        never.checked(2 * MIN, timed_out());
+        assert_eq!(state(&never, 3 * MIN), "failed");
+        // This device, for itself.
+        let mut own = Holder::default();
+        assert_eq!(own.own_verdict().state(), "passed");
+        own.checked(MIN, missing());
+        assert_eq!(own.own_verdict().state(), "copying");
+        own.checked(2 * MIN, Outcome::Passed);
+        own.checked(3 * MIN, missing());
+        assert_eq!(own.own_verdict().state(), "missing");
+        // What 0.1.13 saved of a failure has neither new field: read as a
+        // piece missing, until the next check says.
+        let saved = r#"{"last_check": 9, "last_pass": 5, "last_fail": 9,
+            "fail_reason": "did not have 1 of the 4 pieces", "missed": 0}"#;
+        let old: Holder = serde_json::from_str(saved).unwrap();
+        assert_eq!(old.verdict(&r, 10).state(), "missing");
     }
 
     #[test]
@@ -1096,11 +1280,17 @@ mod tests {
         let get = |id: &[u8; 32]| store.get(id).ok().flatten();
         let s = p.sample(4, &mut rng, get);
         assert_eq!(s.len(), 4);
-        assert!(s.iter().all(|id| store.has(id).unwrap()));
-        assert!(s.iter().any(|id| *id != r.id), "chunks, not only the top");
+        assert!(s.iter().all(|a| a.old && store.has(&a.id).unwrap()));
+        assert!(s.iter().any(|a| a.id != r.id), "chunks, not only the top");
         // without the indexes, only the top can be asked
         let s = p.sample(4, &mut rng, |_| None);
-        assert_eq!(s, vec![r.id]);
+        assert_eq!(
+            s,
+            vec![Asked {
+                id: r.id,
+                old: true
+            }]
+        );
     }
 
     #[test]
@@ -1117,6 +1307,8 @@ mod tests {
                 BlobItem::NotHeld(other),
             ],
         };
+        let old = |id| Asked { id, old: true };
+        let (id, other) = (old(id), old(other));
         assert_eq!(judge(&[id], &reply, false), Outcome::Passed);
         assert_eq!(
             judge(&[id, other], &reply, false),
@@ -1124,7 +1316,7 @@ mod tests {
         );
         let bad = BlobReply {
             items: vec![BlobItem::Held {
-                id,
+                id: id.id,
                 ciphertext: b"other".to_vec(),
             }],
         };

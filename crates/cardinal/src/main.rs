@@ -1546,6 +1546,17 @@ fn copies_lines(c: &Value, devices: usize) -> Vec<String> {
                 h["reason"].as_str().unwrap_or("failed a check"),
                 when("last_fail")
             ),
+            // passed once, and its last check found pieces gone
+            "missing" => format!(
+                "missing pieces: {}{}",
+                h["reason"].as_str().unwrap_or("failed a check"),
+                when("last_fail")
+            ),
+            // never passed yet
+            "copying" => match h["reason"].as_str() {
+                Some(why) => format!("still copying: {why}"),
+                None => "still copying".to_owned(),
+            },
             "stale" => {
                 let mut w = format!("last checked {}", age(&h["last_pass"]).unwrap_or_default());
                 if !is(h, "online") {
