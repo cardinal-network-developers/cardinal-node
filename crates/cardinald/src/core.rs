@@ -3526,6 +3526,23 @@ mod tests {
             // nothing software does on its own is due meanwhile
             assert!(bo.nothing_due(id, true) && !t.sets_unasked());
         }
+        // T2. A no set on another device at the same moment as the list
+        // the yes was kept against, and not after it: the node holds two
+        // lists, which is not what the yes was kept against, and one of
+        // them is empty. The yes gives way, and the host is not named.
+        let band = ana.core.create_group("Trio", "Ana", &bo_shown).unwrap();
+        bo.takes(&band, &ana.all_of(&band));
+        bo.says_reach(&band, false);
+        bo.core.keep_yes(&band);
+        assert!(bo.core.telling(&band).waiting);
+        let against = bo.space(&band).heads();
+        let no = relationship::set_reach(&bo.id(), &[]);
+        bo.core
+            .write_entry_concurrent(&band, &against, vec![no])
+            .unwrap();
+        let t = bo.core.telling(&band);
+        assert!(t.two && !t.waiting && !t.shared && !t.sets_unasked());
+        assert!(!kept_at(&bo, &band), "the note is still there");
         // It is on the device, not in the space or the account: a restart
         // keeps it, and nobody else has it.
         bo.restarts();

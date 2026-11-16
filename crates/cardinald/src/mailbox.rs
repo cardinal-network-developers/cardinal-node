@@ -1954,27 +1954,13 @@ mod tests {
         _dirs: [tempfile::TempDir; 2],
     }
 
-    fn set_up(dir: &std::path::Path) -> (crate::paths::Paths, crate::config::Config) {
-        let paths = crate::paths::Paths::at(dir);
-        let mut config = crate::config::Config {
-            listen: "127.0.0.1:0".into(),
-            ..Default::default()
-        };
-        config.this_run.no_mount = true;
-        config.this_run.no_discovery = true;
-        config.this_run.no_udp = true;
-        let p = crate::setup::prepare(&paths).unwrap();
-        crate::setup::install(&paths, p, &config).unwrap();
-        (paths, config)
-    }
-
     impl Home {
         async fn new() -> Home {
             use cardinal_space::account::{self, Regard};
             let dirs = [tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap()];
-            let (paths, config) = set_up(dirs[0].path());
+            let (paths, config) = crate::testing::set_up(dirs[0].path());
             let d = Daemon::start(paths, config).await.unwrap();
-            let (paths, _) = set_up(dirs[1].path());
+            let (paths, _) = crate::testing::set_up(dirs[1].path());
             let keys = crate::keys::Keys::load_or_create(&paths.device_key()).unwrap();
             let mut bo = crate::core::Core::load(&paths, Arc::new(keys)).unwrap();
             let me = d.core().me().unwrap();

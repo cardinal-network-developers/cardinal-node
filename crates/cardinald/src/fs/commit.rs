@@ -1616,6 +1616,69 @@ mod tests {
         assert!(!fx.t.has_pending());
     }
 
+    /// D1, on two devices. The entry a burst goes in also starts an epoch:
+    /// its ops come first and `rotate` after them, and it is sealed under
+    /// the epoch it starts. Someone else's device opens it with the key
+    /// the entry itself wraps for them, and comes to the same nodes: the
+    /// folder and the file in it, with the ids the writer worked out.
+    #[test]
+    fn a_rotation_started_with_a_burst_is_read_the_same_on_another_device() {
+        let (mut me, mut them, _hers) = shared_with_a_file_of_theirs();
+        let rel = me.space;
+        let sealed = |fx: &Fx| -> Vec<Vec<u8>> {
+            let sp = fx.core.spaces[&rel].space.as_ref().unwrap();
+            sp.sealed_entries().map(|(_, s)| s.encode()).collect()
+        };
+        let before = me.sp().current_epoch().unwrap();
+        me.new_identity_key();
+        let dir = me.mkdir(ROOT_INO, "Trip");
+        let file = me.write_in(dir, "plan.txt", b"hi");
+        assert_eq!(me.commit(), 1);
+        let last = *me.sp().dag().log_order().last().unwrap();
+        let entry = me.sp().entry(&last).unwrap();
+        assert!(entry.starts_epoch() && me.sp().state().is_accepted(&last));
+        assert_ne!(me.sp().current_epoch(), Some(before));
+        // The ops, then `rotate`: nothing in front of what was numbered.
+        let ops = entry.ops();
+        assert!(matches!(
+            ops[0].body(),
+            cardinal_space::SpaceOpBody::Create { .. }
+        ));
+        let rotate = |op: &SpaceOp| matches!(op.body(), cardinal_space::SpaceOpBody::Rotate { .. });
+        assert!(rotate(ops.last().unwrap()));
+        let (d, f) = (me.node(dir), me.node(file));
+
+        // The other person's device: their log of me, then the space.
+        let mine = me.core.identity.as_ref().unwrap();
+        let (my_id, my_log) = (mine.id(), mine.all_entries());
+        them.core.ingest_other(my_id, &my_log).unwrap();
+        them.core.ingest_space(rel, &sealed(&me)).unwrap();
+        them.space = rel;
+        let theirs = them.sp();
+        assert_eq!(theirs.current_epoch(), me.sp().current_epoch());
+        assert!(theirs.state().is_accepted(&last), "they do not accept it");
+        let st = theirs.state();
+        assert_eq!(
+            st.node(&d).map(|n| (n.parent, n.name.as_str())),
+            Some((ROOT, "Trip"))
+        );
+        assert_eq!(st.node(&f).map(|n| n.parent), Some(d));
+        assert_eq!(st.canonical(), me.sp().state().canonical());
+        let list = Files::new(theirs).list_path("Trip").unwrap();
+        assert_eq!(list.len(), 1);
+        // And they write under the epoch it started.
+        let (reply, _) = them
+            .core
+            .write_entry(&rel, vec![files::create_folder(d, "theirs")])
+            .unwrap();
+        assert!(theirs_accepts(&them, &rel, &reply));
+    }
+
+    fn theirs_accepts(fx: &Fx, space: &SpaceId, entry: &EntryId) -> bool {
+        let sp = fx.core.spaces[space].space.as_ref().unwrap();
+        sp.state().is_accepted(entry) && !sp.entry(entry).unwrap().starts_epoch()
+    }
+
     /// Two people and the folder they share: `me` sees it through a tree,
     /// and `them` has put in it a file that is theirs alone to change
     /// (`profiles.md#shared-rules-normative`), which the folder shows like
@@ -2007,23 +2070,35 @@ mod tests {
 
     /// D10. A commit that cannot write its entry leaves everything to be
     /// written again: the deletes it had taken up as much as the files,
-    /// which stay dirty.
+    /// which stay dirty. A log that stays broken fails the next commit
+    /// the same way, and loses nothing either.
     #[test]
     fn a_commit_that_fails_keeps_its_deletes() {
         let mut fx = Fx::new();
         let file = fx.write("a.txt", b"v1");
+        let kept = fx.write("b.txt", b"v1");
         fx.commit();
         fx.refresh();
         let node = fx.node(file);
-        fx.t.delete_node(node, None);
         fx.t.remove(file);
+        // an edit and a new file in the same commit
+        fx.write("b.txt", b"v2");
+        let new = fx.write("c.txt", b"new");
         fx.t.touch();
-        fx.core.break_log_for_test(&fx.space);
-        let failed = write_pending(&mut fx.core, &mut fx.t, &fx.space, Vec::new());
-        assert!(failed.is_err());
-        assert!(fx.t.has_pending(), "the delete is forgotten");
+        for _ in 0..2 {
+            fx.core.break_log_for_test(&fx.space);
+            let failed = write_pending(&mut fx.core, &mut fx.t, &fx.space, Vec::new());
+            assert!(failed.is_err());
+            assert_eq!(fx.t.deleted.len(), 1, "the delete is forgotten, or doubled");
+            assert!(fx.t.inodes[&kept].dirty.content, "the edit is forgotten");
+            assert!(fx.t.inodes[&new].node.is_none());
+            assert!(fx.t.has_committable());
+            assert_eq!(fx.t.refused_count(), 0, "a failure is not a refusal");
+        }
         assert_eq!(fx.commit(), 1);
         assert!(fx.sp().state().node(&node).unwrap().deleted);
+        assert_eq!(fx.versions(&fx.node(kept)), [b"v2".to_vec()]);
+        assert!(fx.t.inodes[&new].node.is_some());
         assert!(!fx.t.has_pending());
     }
 

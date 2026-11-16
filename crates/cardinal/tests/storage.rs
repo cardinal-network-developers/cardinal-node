@@ -363,10 +363,20 @@ fn clear_refuses_while_a_daemon_runs_however_the_directory_is_named() {
         why.contains("daemon is running") && why.contains("Nothing was changed"),
         "{why}"
     );
+    // Every file that was there is there, and none of them shorter: a
+    // running service may have written more, and nothing was removed or
+    // put in another's place. (The service's own `--clear`, which a
+    // client runs, is tried the same way in `cardinald/tests/store.rs`.)
     let after = everything(&ana.home);
-    assert!(after.len() >= before.len(), "{before:?} {after:?}");
+    for (path, len, _) in &before {
+        let now = after.iter().find(|(p, ..)| p == path);
+        assert!(
+            now.is_some_and(|(_, n, _)| n >= len),
+            "{} was removed or cut",
+            path.display()
+        );
+    }
     assert!(ana.cli(&["files"]).contains("ana-film.bin"));
-    // So does the service's own `--clear`, which a client runs.
     assert!(ana.status()["identity"].is_string());
 }
 

@@ -1106,6 +1106,16 @@ fn a_host_renews_each_reach_node_once() {
         after.0 - before.0 < 4000 && after.1 - before.1 < 4000,
         "a host keeps writing"
     );
+    // T3. That bound catches a fast storm. A slow one, an entry or two at
+    // each look (R2), stays under it: once the two are at rest, nothing
+    // at all is written through more than one look (30 seconds), in any
+    // space on either host, and no token is made.
+    let rest = (quiet_log_sizes(&l1), quiet_log_sizes(&l2));
+    let tokens = (active_tokens(&l1), active_tokens(&l2));
+    std::thread::sleep(Duration::from_secs(40));
+    let later = (log_sizes(&l1), log_sizes(&l2));
+    assert_eq!(later, rest, "a host writes at every look");
+    assert_eq!((active_tokens(&l1), active_tokens(&l2)), tokens);
 }
 
 /// An invitation's session that ends before anything is said, as when a

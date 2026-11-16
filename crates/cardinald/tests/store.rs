@@ -201,6 +201,27 @@ fn it_clears_nothing_while_the_service_runs() {
         std::thread::sleep(Duration::from_millis(20));
     }
     let (out, v) = asked(home, "--clear");
+    // S11. And under another name for the directory, looking for the
+    // socket where the service does not listen, so that nothing answers:
+    // the directory is held, whatever it is called.
+    let mut named = home.as_os_str().to_owned();
+    named.push("/");
+    let elsewhere = dir.path().join("elsewhere.sock");
+    let kept = |home: &Path| -> Vec<(PathBuf, u64)> {
+        let all = everything(home).into_iter();
+        let stays = |p: &PathBuf| !p.ends_with("control.sock");
+        all.filter(|(p, ..)| stays(p))
+            .map(|(p, len, _)| (p, len))
+            .collect()
+    };
+    let before = kept(home);
+    let other = cmd(home)
+        .env("CARDINAL_HOME", &named)
+        .env("CARDINAL_SOCKET", &elsewhere)
+        .arg("--clear")
+        .output()
+        .unwrap();
+    let after = kept(home);
     let _ = child.kill();
     let _ = child.wait();
     assert!(!out.status.success(), "{v}");
@@ -211,6 +232,25 @@ fn it_clears_nothing_while_the_service_runs() {
         "{why}"
     );
     assert!(home.join("device.key").exists(), "its keys were removed");
+    let said = String::from_utf8_lossy(&other.stdout).into_owned();
+    let v: Value = serde_json::from_str(said.trim()).unwrap_or_else(|e| panic!("{said:?}: {e}"));
+    assert!(!other.status.success(), "{v}");
+    assert_eq!(v["ok"], false, "{v}");
+    let why = v["error"].as_str().unwrap();
+    assert!(
+        why.contains("is running") && why.contains("Nothing was changed"),
+        "{why}"
+    );
+    // Every file that was there is there, none shorter: the service may
+    // have written more meanwhile, and nothing was removed or replaced.
+    for (path, len) in &before {
+        let now = after.iter().find(|(p, _)| p == path);
+        assert!(
+            now.is_some_and(|(_, n)| n >= len),
+            "{} went",
+            path.display()
+        );
+    }
 }
 
 /// D5. `--clear` removes data this version cannot read, and nothing else:

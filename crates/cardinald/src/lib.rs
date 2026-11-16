@@ -40,6 +40,30 @@ pub mod setup;
 pub mod speedtest;
 pub mod transport;
 
+/// What tests in several modules set up alike.
+#[cfg(test)]
+pub(crate) mod testing {
+    use crate::config::Config;
+    use crate::paths::Paths;
+
+    /// A device set up in `dir` as `cardinal init` leaves it, and the
+    /// settings for a service on it that listens on a port of its own
+    /// and does nothing else by itself: start it with `Daemon::start`.
+    pub fn set_up(dir: &std::path::Path) -> (Paths, Config) {
+        let paths = Paths::at(dir);
+        let mut config = Config {
+            listen: "127.0.0.1:0".into(),
+            ..Default::default()
+        };
+        config.this_run.no_mount = true;
+        config.this_run.no_discovery = true;
+        config.this_run.no_udp = true;
+        let p = crate::setup::prepare(&paths).unwrap();
+        crate::setup::install(&paths, p, &config).unwrap();
+        (paths, config)
+    }
+}
+
 pub use config::Config;
 pub use daemon::Daemon;
 pub use paths::Paths;

@@ -87,6 +87,293 @@ impl CardinalFs {
         }
     }
 
+    /// Removes a file, a link, or a conflict copy (which settles the conflict).
+    /// What the operation of that name does, apart from the reply: done,
+    /// or an errno.
+    pub(crate) fn do_unlink(&mut self, parent: u64, name: &OsStr) -> Result<(), c_int> {
+        let Ok(name) = name_str(name) else {
+            return Err(ENOENT);
+        };
+        let mut t = lock(&self.tree);
+        let Some(ino) = t.child(parent, name) else {
+            return Err(ENOENT);
+        };
+        let (kind, node) = {
+            let i = &t.inodes[&ino];
+            (i.kind, i.node)
+        };
+        if t.inodes[&ino].locked {
+            return Err(EACCES);
+        }
+        match kind {
+            Kind::Dir => return Err(EISDIR),
+            Kind::Conflict(_) => {
+                // Deleting a conflict copy keeps the version shown under
+                // the file's own name.
+                if let Some(n) = node {
+                    t.settle.insert(n, None);
+                }
+            }
+            _ => {}
+        }
+        let local = t.inodes[&ino].local;
+        if local {
+            if let Err(e) = remove_local(&t, ino) {
+                return Err(errno("cannot delete a file", e));
+            }
+        }
+        t.remove(ino);
+        if let Some(p) = t.inodes.get_mut(&parent) {
+            p.mtime = SystemTime::now();
+        }
+        if !local {
+            t.touch();
+        }
+        if name == IGNORE_FILE {
+            self.ignores_changed(&mut t);
+        }
+        Ok(())
+    }
+
+    /// Removes an empty folder.
+    /// What the operation of that name does, apart from the reply: done,
+    /// or an errno.
+    pub(crate) fn do_rmdir(&mut self, parent: u64, name: &OsStr) -> Result<(), c_int> {
+        let Ok(name) = name_str(name) else {
+            return Err(ENOENT);
+        };
+        let mut t = lock(&self.tree);
+        let Some(ino) = t.child(parent, name) else {
+            return Err(ENOENT);
+        };
+        let i = &t.inodes[&ino];
+        if i.kind != Kind::Dir {
+            return Err(ENOTDIR);
+        }
+        if !t.dir_is_empty(ino) {
+            return Err(ENOTEMPTY);
+        }
+        if i.locked {
+            return Err(EACCES);
+        }
+        let local = i.local;
+        if local {
+            if let Err(e) = remove_local(&t, ino) {
+                return Err(errno("cannot delete a folder", e));
+            }
+        }
+        t.remove(ino);
+        if !local {
+            t.touch();
+        }
+        Ok(())
+    }
+
+    /// Moves or renames, replacing what is there if that is allowed.
+    /// What the operation of that name does, apart from the reply: done,
+    /// or an errno.
+    pub(crate) fn do_rename(
+        &mut self,
+        parent: u64,
+        name: &OsStr,
+        newparent: u64,
+        newname: &OsStr,
+        flags: u32,
+    ) -> Result<(), c_int> {
+        let (Ok(name), Ok(newname)) = (name_str(name), name_str(newname)) else {
+            return Err(EINVAL);
+        };
+        if flags & libc::RENAME_EXCHANGE != 0 {
+            return Err(EINVAL);
+        }
+        let mut t = lock(&self.tree);
+        let Some(src) = t.child(parent, name) else {
+            return Err(ENOENT);
+        };
+        match t.inodes.get(&newparent) {
+            Some(p) if p.kind == Kind::Dir && p.parent != 0 => {}
+            Some(_) => return Err(ENOTDIR),
+            None => return Err(ENOENT),
+        }
+        let skind = t.inodes[&src].kind;
+        if let Kind::Conflict(v) = skind {
+            // Renaming a conflict copy onto the file's own name picks that
+            // version; anything else is a copy (EXDEV makes `mv` copy).
+            let node = t.inodes[&src].node;
+            let main = node.and_then(|n| t.by_node.get(&n).copied());
+            if Some(newparent) == main.map(|m| t.inodes[&m].parent)
+                && main.is_some_and(|m| t.inodes[&m].name == newname)
+            {
+                // Which version stands is for whoever may change the file
+                // to say, as deleting the copy is (S6).
+                if t.inodes[&src].locked || main.is_some_and(|m| t.inodes[&m].locked) {
+                    return Err(EACCES);
+                }
+                if let Some(n) = node {
+                    t.settle.insert(n, Some(v));
+                }
+                t.remove(src);
+                t.touch();
+                return Ok(());
+            }
+            return Err(EXDEV);
+        }
+        if skind == Kind::Dir && t.is_ancestor(src, newparent) {
+            return Err(EINVAL);
+        }
+        let dst = t.child(newparent, newname);
+        if dst == Some(src) {
+            return Ok(());
+        }
+        // Neither what is moved nor what it would replace may be someone
+        // else's to change.
+        if t.inodes[&src].locked || dst.is_some_and(|d| t.inodes[&d].locked) {
+            return Err(EACCES);
+        }
+        // Where it goes: a local place or a synced one (`fs/local.rs`).
+        let store = self.d.store.clone();
+        let src_local = t.inodes[&src].local;
+        let to_local = t.ignored(&store, newparent, newname, skind == Kind::Dir);
+        if !src_local && to_local && skind == Kind::Dir {
+            // A synced folder does not become local in one step: `mv`
+            // copies it instead.
+            return Err(EXDEV);
+        }
+        if let Some(dst) = dst {
+            if flags & libc::RENAME_NOREPLACE != 0 {
+                return Err(EEXIST);
+            }
+            match (skind, t.inodes[&dst].kind) {
+                (_, Kind::Conflict(_)) => return Err(EPERM),
+                (Kind::Dir, Kind::Dir) if !t.dir_is_empty(dst) => return Err(ENOTEMPTY),
+                (Kind::Dir, Kind::Dir) => {}
+                (Kind::Dir, _) => return Err(ENOTDIR),
+                (_, Kind::Dir) => return Err(EISDIR),
+                _ => {}
+            }
+        }
+        let old_local = if src_local { t.local_path(src) } else { None };
+        // A synced file going local: its content first (it may be fetched).
+        let going_local = if !src_local && to_local && skind == Kind::File {
+            match self.stage(&mut t, src) {
+                Ok(st) => Some(st),
+                Err(e) => return Err(e),
+            }
+        } else {
+            None
+        };
+        // A local file going synced is staged in place first, so that it
+        // replaces a synced file as an edit of it.
+        if src_local && !to_local && skind != Kind::Dir {
+            let Some(old) = old_local.clone() else {
+                return Err(ENOENT);
+            };
+            if let Err(e) = t.local_to_synced(&store, src, old) {
+                return Err(errno("cannot sync a file", e));
+            }
+        }
+        // Local to local: the real file moves first (replacing a local
+        // destination), so a failure changes nothing.
+        if src_local && to_local {
+            let (Some(old), Some(new)) =
+                (old_local.clone(), t.local_child_path(newparent, newname))
+            else {
+                return Err(ENOENT);
+            };
+            let r = new
+                .parent()
+                .map_or(Ok(()), std::fs::create_dir_all)
+                .and_then(|()| std::fs::rename(&old, &new));
+            if let Err(e) = r {
+                return Err(errno("cannot move a file", e));
+            }
+            t.prune(&old);
+        }
+        let mut took_over = false;
+        if let Some(dst) = dst {
+            let dlocal = t.inodes[&dst].local;
+            if dlocal && !(src_local && to_local) {
+                if let Err(e) = remove_local(&t, dst) {
+                    return Err(errno("cannot replace a file", e));
+                }
+            }
+            let (dkind, dnode) = (t.inodes[&dst].kind, t.inodes[&dst].node);
+            let take_over = match dnode {
+                Some(dn) if !to_local && skind == Kind::File && dkind == Kind::File => Some(dn),
+                _ => None,
+            };
+            if let Some(dn) = take_over {
+                // Replacing a file keeps the replaced file's identity, so
+                // the change is an edit of it (history, conflicts): the
+                // source inode takes over the destination's node.
+                let snode = t.inodes[&src].node;
+                let ddirty = t.inodes[&dst].dirty;
+                let dseen = t.inodes[&dst].seen.clone();
+                // forget the destination without deleting its node
+                t.detach(dst);
+                if let Some(di) = t.inodes.get_mut(&dst) {
+                    di.node = None;
+                    di.dirty = Default::default();
+                }
+                t.gc(dst);
+                if let Some(sn) = snode {
+                    t.by_node.remove(&sn);
+                    t.delete_node(sn, None);
+                }
+                t.detach(src);
+                t.by_node.insert(dn, src);
+                let s = t.inodes.get_mut(&src).expect("src");
+                s.node = Some(dn);
+                s.seen = dseen;
+                s.dirty.content = true;
+                s.dirty.mode = true;
+                s.dirty.mtime = true;
+                s.dirty.pos = ddirty.pos;
+                s.wrote();
+                t.attach(src, newparent, newname);
+                took_over = true;
+            } else {
+                t.remove(dst);
+            }
+        }
+        if !took_over {
+            t.detach(src);
+            t.attach(src, newparent, newname);
+            if src_local && to_local {
+                t.repath_local(src);
+            } else if src_local && skind == Kind::Dir {
+                // a local folder going synced, with what is in it
+                if let Some(old) = old_local {
+                    if let Err(e) = t.local_to_synced(&store, src, old) {
+                        tracing::warn!("cannot sync {}: {e}", t.path(src));
+                    }
+                }
+            } else if !src_local && to_local {
+                if let Err(e) = synced_to_local(&mut t, src, going_local) {
+                    return Err(errno("cannot keep a file on this device", e));
+                }
+            } else if let Some(s) = t.inodes.get_mut(&src) {
+                if s.node.is_some() {
+                    s.dirty.pos = true;
+                }
+            }
+            if let Some(s) = t.inodes.get_mut(&src) {
+                s.ctime = SystemTime::now();
+            }
+            let now = SystemTime::now();
+            for p in [parent, newparent] {
+                if let Some(pi) = t.inodes.get_mut(&p) {
+                    pi.mtime = now;
+                }
+            }
+        }
+        t.touch();
+        if name == IGNORE_FILE || newname == IGNORE_FILE {
+            self.ignores_changed(&mut t);
+        }
+        Ok(())
+    }
+
     /// Answers a lookup of this tree's root, from the folder it is listed in.
     pub(crate) fn root_entry(&mut self, reply: ReplyEntry) {
         let mut t = lock(&self.tree);
@@ -540,79 +827,17 @@ impl Filesystem for CardinalFs {
     }
 
     fn unlink(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEmpty) {
-        let Ok(name) = name_str(name) else {
-            return reply.error(ENOENT);
-        };
-        let mut t = lock(&self.tree);
-        let Some(ino) = t.child(parent, name) else {
-            return reply.error(ENOENT);
-        };
-        let (kind, node) = {
-            let i = &t.inodes[&ino];
-            (i.kind, i.node)
-        };
-        if t.inodes[&ino].locked {
-            return reply.error(EACCES);
+        match self.do_unlink(parent, name) {
+            Ok(()) => reply.ok(),
+            Err(e) => reply.error(e),
         }
-        match kind {
-            Kind::Dir => return reply.error(EISDIR),
-            Kind::Conflict(_) => {
-                // Deleting a conflict copy keeps the version shown under
-                // the file's own name.
-                if let Some(n) = node {
-                    t.settle.insert(n, None);
-                }
-            }
-            _ => {}
-        }
-        let local = t.inodes[&ino].local;
-        if local {
-            if let Err(e) = remove_local(&t, ino) {
-                return reply.error(errno("cannot delete a file", e));
-            }
-        }
-        t.remove(ino);
-        if let Some(p) = t.inodes.get_mut(&parent) {
-            p.mtime = SystemTime::now();
-        }
-        if !local {
-            t.touch();
-        }
-        if name == IGNORE_FILE {
-            self.ignores_changed(&mut t);
-        }
-        reply.ok();
     }
 
     fn rmdir(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEmpty) {
-        let Ok(name) = name_str(name) else {
-            return reply.error(ENOENT);
-        };
-        let mut t = lock(&self.tree);
-        let Some(ino) = t.child(parent, name) else {
-            return reply.error(ENOENT);
-        };
-        let i = &t.inodes[&ino];
-        if i.kind != Kind::Dir {
-            return reply.error(ENOTDIR);
+        match self.do_rmdir(parent, name) {
+            Ok(()) => reply.ok(),
+            Err(e) => reply.error(e),
         }
-        if !t.dir_is_empty(ino) {
-            return reply.error(ENOTEMPTY);
-        }
-        if i.locked {
-            return reply.error(EACCES);
-        }
-        let local = i.local;
-        if local {
-            if let Err(e) = remove_local(&t, ino) {
-                return reply.error(errno("cannot delete a folder", e));
-            }
-        }
-        t.remove(ino);
-        if !local {
-            t.touch();
-        }
-        reply.ok();
     }
 
     fn symlink(
@@ -659,198 +884,10 @@ impl Filesystem for CardinalFs {
         flags: u32,
         reply: ReplyEmpty,
     ) {
-        let (Ok(name), Ok(newname)) = (name_str(name), name_str(newname)) else {
-            return reply.error(EINVAL);
-        };
-        if flags & libc::RENAME_EXCHANGE != 0 {
-            return reply.error(EINVAL);
+        match self.do_rename(parent, name, newparent, newname, flags) {
+            Ok(()) => reply.ok(),
+            Err(e) => reply.error(e),
         }
-        let mut t = lock(&self.tree);
-        let Some(src) = t.child(parent, name) else {
-            return reply.error(ENOENT);
-        };
-        match t.inodes.get(&newparent) {
-            Some(p) if p.kind == Kind::Dir && p.parent != 0 => {}
-            Some(_) => return reply.error(ENOTDIR),
-            None => return reply.error(ENOENT),
-        }
-        let skind = t.inodes[&src].kind;
-        if let Kind::Conflict(v) = skind {
-            // Renaming a conflict copy onto the file's own name picks that
-            // version; anything else is a copy (EXDEV makes `mv` copy).
-            let node = t.inodes[&src].node;
-            let main = node.and_then(|n| t.by_node.get(&n).copied());
-            if Some(newparent) == main.map(|m| t.inodes[&m].parent)
-                && main.is_some_and(|m| t.inodes[&m].name == newname)
-            {
-                // Which version stands is for whoever may change the file
-                // to say, as deleting the copy is (S6).
-                if t.inodes[&src].locked || main.is_some_and(|m| t.inodes[&m].locked) {
-                    return reply.error(EACCES);
-                }
-                if let Some(n) = node {
-                    t.settle.insert(n, Some(v));
-                }
-                t.remove(src);
-                t.touch();
-                return reply.ok();
-            }
-            return reply.error(EXDEV);
-        }
-        if skind == Kind::Dir && t.is_ancestor(src, newparent) {
-            return reply.error(EINVAL);
-        }
-        let dst = t.child(newparent, newname);
-        if dst == Some(src) {
-            return reply.ok();
-        }
-        // Neither what is moved nor what it would replace may be someone
-        // else's to change.
-        if t.inodes[&src].locked || dst.is_some_and(|d| t.inodes[&d].locked) {
-            return reply.error(EACCES);
-        }
-        // Where it goes: a local place or a synced one (`fs/local.rs`).
-        let store = self.d.store.clone();
-        let src_local = t.inodes[&src].local;
-        let to_local = t.ignored(&store, newparent, newname, skind == Kind::Dir);
-        if !src_local && to_local && skind == Kind::Dir {
-            // A synced folder does not become local in one step: `mv`
-            // copies it instead.
-            return reply.error(EXDEV);
-        }
-        if let Some(dst) = dst {
-            if flags & libc::RENAME_NOREPLACE != 0 {
-                return reply.error(EEXIST);
-            }
-            match (skind, t.inodes[&dst].kind) {
-                (_, Kind::Conflict(_)) => return reply.error(EPERM),
-                (Kind::Dir, Kind::Dir) if !t.dir_is_empty(dst) => return reply.error(ENOTEMPTY),
-                (Kind::Dir, Kind::Dir) => {}
-                (Kind::Dir, _) => return reply.error(ENOTDIR),
-                (_, Kind::Dir) => return reply.error(EISDIR),
-                _ => {}
-            }
-        }
-        let old_local = if src_local { t.local_path(src) } else { None };
-        // A synced file going local: its content first (it may be fetched).
-        let going_local = if !src_local && to_local && skind == Kind::File {
-            match self.stage(&mut t, src) {
-                Ok(st) => Some(st),
-                Err(e) => return reply.error(e),
-            }
-        } else {
-            None
-        };
-        // A local file going synced is staged in place first, so that it
-        // replaces a synced file as an edit of it.
-        if src_local && !to_local && skind != Kind::Dir {
-            let Some(old) = old_local.clone() else {
-                return reply.error(ENOENT);
-            };
-            if let Err(e) = t.local_to_synced(&store, src, old) {
-                return reply.error(errno("cannot sync a file", e));
-            }
-        }
-        // Local to local: the real file moves first (replacing a local
-        // destination), so a failure changes nothing.
-        if src_local && to_local {
-            let (Some(old), Some(new)) =
-                (old_local.clone(), t.local_child_path(newparent, newname))
-            else {
-                return reply.error(ENOENT);
-            };
-            let r = new
-                .parent()
-                .map_or(Ok(()), std::fs::create_dir_all)
-                .and_then(|()| std::fs::rename(&old, &new));
-            if let Err(e) = r {
-                return reply.error(errno("cannot move a file", e));
-            }
-            t.prune(&old);
-        }
-        let mut took_over = false;
-        if let Some(dst) = dst {
-            let dlocal = t.inodes[&dst].local;
-            if dlocal && !(src_local && to_local) {
-                if let Err(e) = remove_local(&t, dst) {
-                    return reply.error(errno("cannot replace a file", e));
-                }
-            }
-            let (dkind, dnode) = (t.inodes[&dst].kind, t.inodes[&dst].node);
-            let take_over = match dnode {
-                Some(dn) if !to_local && skind == Kind::File && dkind == Kind::File => Some(dn),
-                _ => None,
-            };
-            if let Some(dn) = take_over {
-                // Replacing a file keeps the replaced file's identity, so
-                // the change is an edit of it (history, conflicts): the
-                // source inode takes over the destination's node.
-                let snode = t.inodes[&src].node;
-                let ddirty = t.inodes[&dst].dirty;
-                let dseen = t.inodes[&dst].seen.clone();
-                // forget the destination without deleting its node
-                t.detach(dst);
-                if let Some(di) = t.inodes.get_mut(&dst) {
-                    di.node = None;
-                    di.dirty = Default::default();
-                }
-                t.gc(dst);
-                if let Some(sn) = snode {
-                    t.by_node.remove(&sn);
-                    t.delete_node(sn, None);
-                }
-                t.detach(src);
-                t.by_node.insert(dn, src);
-                let s = t.inodes.get_mut(&src).expect("src");
-                s.node = Some(dn);
-                s.seen = dseen;
-                s.dirty.content = true;
-                s.dirty.mode = true;
-                s.dirty.mtime = true;
-                s.dirty.pos = ddirty.pos;
-                s.wrote();
-                t.attach(src, newparent, newname);
-                took_over = true;
-            } else {
-                t.remove(dst);
-            }
-        }
-        if !took_over {
-            t.detach(src);
-            t.attach(src, newparent, newname);
-            if src_local && to_local {
-                t.repath_local(src);
-            } else if src_local && skind == Kind::Dir {
-                // a local folder going synced, with what is in it
-                if let Some(old) = old_local {
-                    if let Err(e) = t.local_to_synced(&store, src, old) {
-                        tracing::warn!("cannot sync {}: {e}", t.path(src));
-                    }
-                }
-            } else if !src_local && to_local {
-                if let Err(e) = synced_to_local(&mut t, src, going_local) {
-                    return reply.error(errno("cannot keep a file on this device", e));
-                }
-            } else if let Some(s) = t.inodes.get_mut(&src) {
-                if s.node.is_some() {
-                    s.dirty.pos = true;
-                }
-            }
-            if let Some(s) = t.inodes.get_mut(&src) {
-                s.ctime = SystemTime::now();
-            }
-            let now = SystemTime::now();
-            for p in [parent, newparent] {
-                if let Some(pi) = t.inodes.get_mut(&p) {
-                    pi.mtime = now;
-                }
-            }
-        }
-        t.touch();
-        if name == IGNORE_FILE || newname == IGNORE_FILE {
-            self.ignores_changed(&mut t);
-        }
-        reply.ok();
     }
 
     fn link(
@@ -1188,3 +1225,180 @@ impl Filesystem for CardinalFs {
 
 /// The inode of the root, for tests.
 pub const ROOT: u64 = ROOT_INO;
+
+#[cfg(test)]
+mod tests {
+    //! What the operations answer, called as the kernel's requests call
+    //! them (`do_unlink`, `do_rmdir`, `do_rename` are the whole of each
+    //! but the reply): what is someone else's to change is refused with
+    //! `EACCES`, and a folder that holds something is `ENOTEMPTY`, in the
+    //! order the checks are made (S6, S11).
+
+    use super::*;
+    use crate::core::Core;
+    use crate::fs::tree::Snapshot;
+    use cardinal_encoding::Record;
+    use cardinal_space::files;
+    use cardinal_space::{NodeKind, SpaceId, SpaceOp};
+
+    /// A folder shared by two people, as the first sees it through a
+    /// service in this process. The other has put in it `hers.txt`, which
+    /// is theirs alone to change and has two versions (their two devices
+    /// wrote at once), so a conflict copy is shown beside it. There is a
+    /// folder `F` that holds only a node the view does not show, an empty
+    /// folder `G`, and a file `mine.txt` anyone may change.
+    struct Shared {
+        fs: CardinalFs,
+        d: Arc<Daemon>,
+        rel: SpaceId,
+        _dirs: [tempfile::TempDir; 2],
+    }
+
+    impl Shared {
+        async fn new() -> Shared {
+            let dirs = [tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap()];
+            let (paths, config) = crate::testing::set_up(dirs[0].path());
+            let d = Daemon::start(paths.clone(), config).await.unwrap();
+            let (theirs_at, _) = crate::testing::set_up(dirs[1].path());
+            let keys = crate::keys::Keys::load_or_create(&theirs_at.device_key()).unwrap();
+            let mut them = Core::load(&theirs_at, Arc::new(keys)).unwrap();
+            let (mine, theirs) = (d.core().me().unwrap(), them.me().unwrap());
+            let log = |c: &Core| c.identity.as_ref().unwrap().all_entries();
+            let (my_log, their_log) = (log(&d.core()), log(&them));
+            d.core().ingest_other(theirs, &their_log).unwrap();
+            them.ingest_other(mine, &my_log).unwrap();
+            let (rel, genesis) = them.create_relationship(&mine).unwrap();
+            d.core().accept_relationship(&genesis, &theirs).unwrap();
+            let kinds = files::Kinds::of(them.spaces[&rel].profile().unwrap());
+            let file = |name: &str, bytes: &[u8]| {
+                kinds.create_file(
+                    ROOT_NODE,
+                    name,
+                    &Content::Inline(bytes.to_vec()),
+                    0o644,
+                    None,
+                )
+            };
+            let plain = file("hers.txt", b"hers");
+            let fields = plain.record().get(4).and_then(|v| v.as_record()).unwrap();
+            let owned = fields
+                .clone()
+                .with(cardinal_space::state::AUTHOR_OWNED_FIELD, 1u64);
+            let hers = SpaceOp::from_record(plain.record().clone().with(4, owned));
+            let ops = vec![
+                hers,
+                file("mine.txt", b"mine"),
+                kinds.create_folder(ROOT_NODE, "F"),
+                kinds.create_folder(ROOT_NODE, "G"),
+            ];
+            let (made, _) = them.write_entry(&rel, ops).unwrap();
+            let (hers, f) = (files::created_node(&made, 0), files::created_node(&made, 2));
+            let other =
+                SpaceOp::create(NodeKind::Uint(99), f, "theirs", Record::new().with(1, 7u32));
+            them.write_entry(&rel, vec![other]).unwrap();
+            let one = files::set_content(hers, &Content::Inline(b"one".to_vec()));
+            let two = files::set_content(hers, &Content::Inline(b"two".to_vec()));
+            let (first, _) = them.write_entry(&rel, vec![one]).unwrap();
+            them.write_entry_concurrent(&rel, &[first], vec![two])
+                .unwrap();
+            let all: Vec<Vec<u8>> = {
+                let sp = them.spaces[&rel].space.as_ref().unwrap();
+                sp.sealed_entries().map(|(_, s)| s.encode()).collect()
+            };
+            d.core().ingest_space(rel, &all).unwrap();
+            std::fs::create_dir_all(paths.staging()).unwrap();
+            let mut tree = Tree::new(paths.staging(), paths.local());
+            {
+                let core = d.core();
+                let h = &core.spaces[&rel];
+                let sp = h.space.as_ref().unwrap();
+                let snap = Snapshot::take_as(sp, h.version, &core.device_names(), core.me());
+                tree.apply(&snap);
+            }
+            let fs = CardinalFs::new(d.clone(), Arc::new(Mutex::new(tree)));
+            Shared {
+                fs,
+                d,
+                rel,
+                _dirs: dirs,
+            }
+        }
+
+        /// The name of the conflict copy shown beside `hers.txt`.
+        fn copy(&self) -> String {
+            let t = lock(&self.fs.tree);
+            let root = &t.inodes[&ROOT_INO];
+            let mut copies = root.children.iter();
+            let copy = copies.find(|(_, ino)| matches!(t.inodes[*ino].kind, Kind::Conflict(_)));
+            copy.expect("a conflict copy is shown").0.clone()
+        }
+
+        fn names(&self) -> Vec<String> {
+            let t = lock(&self.fs.tree);
+            t.inodes[&ROOT_INO].children.keys().cloned().collect()
+        }
+
+        fn unlink(&mut self, name: &str) -> Result<(), c_int> {
+            self.fs.do_unlink(ROOT_INO, OsStr::new(name))
+        }
+
+        fn rmdir(&mut self, name: &str) -> Result<(), c_int> {
+            self.fs.do_rmdir(ROOT_INO, OsStr::new(name))
+        }
+
+        fn rename(&mut self, from: &str, to: &str) -> Result<(), c_int> {
+            let (from, to) = (OsStr::new(from), OsStr::new(to));
+            self.fs.do_rename(ROOT_INO, from, ROOT_INO, to, 0)
+        }
+
+        /// Whether anything waits to be written for what was done.
+        fn pending(&self) -> bool {
+            let t = lock(&self.fs.tree);
+            !t.deleted.is_empty() || !t.settle.is_empty() || t.has_committable()
+        }
+    }
+
+    const ROOT_NODE: cardinal_space::NodeId = cardinal_space::ROOT;
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn what_is_someone_elses_to_change_is_refused_where_it_is_asked() {
+        let mut s = Shared::new().await;
+        let copy = s.copy();
+        let before = s.names();
+        // Removing their file, or the copy of it, which would settle
+        // their conflict.
+        assert_eq!(s.unlink("hers.txt"), Err(EACCES));
+        assert_eq!(s.unlink(&copy), Err(EACCES));
+        // Moving it, or putting something in its place.
+        assert_eq!(s.rename("hers.txt", "ours.txt"), Err(EACCES));
+        assert_eq!(s.rename("mine.txt", "hers.txt"), Err(EACCES));
+        // S6. Renaming the copy onto the file picks that version: the
+        // check that the file is theirs came after this was taken.
+        assert_eq!(s.rename(&copy, "hers.txt"), Err(EACCES));
+        // The copy may still be copied out: `mv` does that on EXDEV.
+        assert_eq!(s.rename(&copy, "a copy.txt"), Err(EXDEV));
+        assert_eq!(s.names(), before);
+        assert!(!s.pending(), "something of it was taken up");
+        // What anyone may change is changed.
+        assert_eq!(s.rename("mine.txt", "ours.txt"), Ok(()));
+        assert_eq!(s.unlink("ours.txt"), Ok(()));
+        assert!(s.pending());
+        let _ = (&s.d, s.rel);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_folder_that_holds_something_is_not_removed_or_replaced() {
+        let mut s = Shared::new().await;
+        // `F` lists nothing, and holds a node of a kind not shown.
+        assert_eq!(s.rmdir("F"), Err(ENOTEMPTY));
+        assert_eq!(s.rename("G", "F"), Err(ENOTEMPTY));
+        assert_eq!(s.rmdir("hers.txt"), Err(ENOTDIR));
+        assert_eq!(s.unlink("F"), Err(EISDIR));
+        assert_eq!(s.rmdir("nothing"), Err(ENOENT));
+        assert!(!s.pending());
+        // An empty one is replaced, and removed.
+        assert_eq!(s.rename("F", "G"), Ok(()));
+        assert_eq!(s.rmdir("G"), Err(ENOTEMPTY));
+        assert!(s.names().contains(&"G".to_owned()) && !s.names().contains(&"F".to_owned()));
+    }
+}
