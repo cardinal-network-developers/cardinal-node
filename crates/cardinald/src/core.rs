@@ -272,6 +272,13 @@ struct Arrivals {
 struct KeptYes {
     /// The entries whose lists the reach node held, in hex, sorted.
     list_set_by: Vec<String>,
+    /// The additions that counted when it was kept, in hex: who the yes
+    /// was said among. Whoever is added before it is finished came after
+    /// it, though the entry that names the hosts will have their addition
+    /// in its past (R6). `None` in a note an earlier version kept, which
+    /// is finished as that version would have.
+    #[serde(default)]
+    present: Option<BTreeSet<String>>,
 }
 
 /// What this person's reach node in a space tells, and whom
@@ -1328,7 +1335,13 @@ impl Core {
             return;
         };
         let list_set_by = list_set_by(sp, &me);
-        self.set_kept_yes(space, Some(KeptYes { list_set_by }));
+        let adds = sp.judge().valid_adds().into_iter();
+        let present = Some(adds.map(|(_, add)| hex::encode(add)).collect());
+        let kept = KeptYes {
+            list_set_by,
+            present,
+        };
+        self.set_kept_yes(space, Some(kept));
     }
 
     /// Gives up a yes this device kept, if it kept one.
@@ -1451,7 +1464,8 @@ impl Core {
     /// Notes the additions to a space this device has not looked at yet
     /// ([`Arrivals`]). While the person's list there names no host there
     /// is nobody to tell of, and nothing is noted: whoever is there when
-    /// they next share is whom they share with. While it names one, each
+    /// they next share is whom they share with, unless the sharing is a
+    /// yes this device kept from before they came ([`KeptYes`]). While it names one, each
     /// new addition is noted once. The person is to be told of someone who
     /// is not their contact and came while the hosts were named: no entry
     /// that began the naming has their addition in its past, so someone
@@ -1482,8 +1496,18 @@ impl Core {
             let began = cardinal_space::relationship::naming_began(sp, &me);
             let came = sp.added_after(&began);
             let strangers = self.not_contacts_in(space);
+            // A yes this device kept, finished by it just now: whoever
+            // was added since it was kept came after the yes, and was not
+            // there when it was given.
+            let here = self.keys.key();
+            let by_this_device = |e: &EntryId| sp.entry(e).is_some_and(|e| e.signer() == here);
+            let kept = self.spaces[space].kept_yes.as_ref();
+            let kept = kept.filter(|_| began.iter().all(by_this_device));
+            let present = kept.and_then(|k| k.present.as_ref());
+            let after_yes = |add: &EntryId| present.is_some_and(|p| !p.contains(&hex::encode(add)));
             for (who, add) in fresh {
-                if came.contains(&who) && strangers.contains(&who) {
+                let late = came.contains(&who) || after_yes(&add);
+                if late && strangers.contains(&who) {
                     now.due.insert(hex::encode(add), hex::encode(who));
                 } else {
                     now.told.insert(hex::encode(add));
@@ -3831,6 +3855,56 @@ mod tests {
             let named: Vec<[u8; 32]> = p.core.reach_of(&rel, &me).iter().map(|r| r.host).collect();
             assert_eq!(named, [own]);
         }
+    }
+
+    /// R6 (`hosts.md`, "An act that cannot be finished is finished later";
+    /// D69). A yes is kept while the host is out of reach: here the yes
+    /// nobody was asked for, of whoever made a group among contacts.
+    /// Someone who is not a contact is added before it is finished. The
+    /// entry that names the hosts has their addition in its past, and
+    /// they were taken for present at the yes: nobody asked the person,
+    /// and nobody told them. Whoever came since the yes was kept and is
+    /// no contact is told of.
+    #[test]
+    fn whoever_came_while_a_yes_was_kept_is_told_of() {
+        let [mut ana, bo, cy, dee] = four();
+        ana.knows(&bo, "Bo");
+        ana.knows(&dee, "Dee");
+        ana.hosts_at("203.0.113.5:7171");
+        let bo_shown = [(bo.id(), "Bo".to_owned())];
+        let g = ana.core.create_group("Choir", "Ana", &bo_shown).unwrap();
+        // Her joining, among contacts, with the host out of reach.
+        ana.says_reach(&g, false);
+        ana.core.keep_yes(&g);
+        assert!(ana.core.telling(&g).waiting);
+        // Cy, a stranger, and Dee, a contact, are added meanwhile.
+        let more = [(cy.id(), "Cy".to_owned()), (dee.id(), "Dee".to_owned())];
+        ana.core.add_to_group(&g, &more).unwrap();
+        let t = ana.core.telling(&g);
+        assert!(t.waiting && t.added().is_empty());
+        // The host is back, and the yes is finished.
+        ana.says_reach(&g, true);
+        let t = ana.core.telling(&g);
+        assert!(t.shared && !t.waiting);
+        assert_eq!(t.added(), [cy.id()], "a stranger is not told of");
+        // It is this device's note, and a restart keeps it.
+        ana.restarts();
+        assert_eq!(ana.core.telling(&g).added(), [cy.id()]);
+        // Told, she is told no more.
+        ana.core.told_of_all(&g);
+        assert!(ana.core.telling(&g).added().is_empty());
+
+        // A yes the person gave at once, with the same people there, has
+        // nobody to tell of: whoever was there is whom they said it to.
+        let [mut ana, bo, cy, _] = four();
+        ana.knows(&bo, "Bo");
+        ana.hosts_at("203.0.113.5:7171");
+        let both = [(bo.id(), "Bo".to_owned()), (cy.id(), "Cy".to_owned())];
+        let g = ana.core.create_group("Choir", "Ana", &both).unwrap();
+        ana.says_reach(&g, false);
+        ana.core.keep_yes(&g);
+        ana.says_reach(&g, true);
+        assert!(ana.core.telling(&g).added().is_empty());
     }
 
     /// D69 (`hosts.md`, "A yes is to the space, and to whoever it comes to

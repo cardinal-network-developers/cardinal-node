@@ -1365,8 +1365,11 @@ asks for around that is not built yet.
     with `share` false writes an empty list even where the list is empty
     already. Without that entry a yes kept on another device would be
     finished after the person said no.
-  - **Reading: whoever is added while a yes waits** is not told of when it
-    is finished: the entry that names the host has them in its past.
+  - **Whoever is added while a yes waits** is told of when it is finished
+    (R6): the kept yes notes the additions that counted when it was kept,
+    and anyone added since who is not a contact goes in `reach.added`,
+    though the entry that names the host has their addition in its past.
+    A note kept by 0.1.13 has no such list and is finished as before.
   - **A yes kept for a host that then stops serving** is given up.
 - **Whoever is added later** (D69, `hosts.md`, "A yes is to the space, and
   to whoever it comes to hold"). Where this person's reach node names their
