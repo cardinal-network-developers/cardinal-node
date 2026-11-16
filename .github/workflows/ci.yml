@@ -40,6 +40,11 @@ jobs:
       - name: Lint
         working-directory: node
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - name: Build without a folder
+        # What a phone or another client builds: no FUSE, so `fs/none.rs`
+        # stands in for `fs/fuse.rs` and has to keep up with it.
+        working-directory: node
+        run: cargo check -p cardinald --no-default-features --bin cardinald --locked
       - name: Test
         working-directory: node
         env:

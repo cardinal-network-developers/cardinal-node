@@ -32,6 +32,12 @@ impl Mounted {
         self.tree.clone()
     }
 
+    /// How many changes went into entries that were not accepted: none,
+    /// since nothing is written through a folder here.
+    pub fn refused_count(&self) -> usize {
+        0
+    }
+
     /// Whether anything is waiting to be committed.
     pub fn has_pending(&self) -> bool {
         false

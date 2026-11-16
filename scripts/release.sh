@@ -119,6 +119,13 @@ if [[ " ${targets[*]} " == *" x86_64-unknown-linux-musl "* ]] \
     export CC_x86_64_unknown_linux_musl=gcc
 fi
 
+# The build with no folder, which other clients use and no target below
+# covers. A release (not a dev build) does not go out without it.
+if [ "$package" = cardinal ] && [[ "$version" != *-dev.* ]]; then
+    say "checking the build without the mount feature"
+    cargo check --quiet --locked -p cardinald --no-default-features --bin cardinald
+fi
+
 rm -rf "$out"
 mkdir -p "$out"
 specs=()

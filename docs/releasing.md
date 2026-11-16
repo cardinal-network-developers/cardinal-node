@@ -131,6 +131,12 @@ release of the same number, so `0.2.0` replaces any `0.2.0-dev.*`.
   `systemctl` stubbed. It uses the deployment-only front end
   `cardinal-deploy` unless `E2E_PACKAGE=cardinal E2E_BIN=cardinal`.
 
+- `cargo check -p cardinald --no-default-features --bin cardinald --locked`:
+  the build with no folder (no `mount` feature), which phones and other
+  clients use. `fs/none.rs` stands in for `fs/fuse.rs` there, and 0.1.13
+  shipped with the two apart. CI and `scripts/release.sh` both run it; run
+  it before every release.
+
 - `CARDINAL_OLD_BIN=$PWD/dist/<previous>/cardinal-<previous>-x86_64-unknown-linux-gnu
   cargo test -p cardinal --test versions`: this build beside the last release,
   because a person updates one device at a time. Devices update in place,
