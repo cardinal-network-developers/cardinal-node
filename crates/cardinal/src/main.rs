@@ -591,6 +591,11 @@ async fn request(paths: &Paths, req: &Value) -> anyhow::Result<Value> {
         // A daemon refuses to start on a store this version cannot read:
         // say that, and not only that none is running.
         cardinald::format::check(paths)?;
+        // One that holds the data and does not answer is not "not
+        // running": it has not bound its socket yet, or listens elsewhere.
+        if held(paths)? {
+            return Err(starting(paths));
+        }
     }
     reply.map_err(|_| {
         anyhow::anyhow!(
@@ -726,9 +731,53 @@ fn print_sheet(v: &Value) {
 /// Whether a service runs on the data directory: one answers on its
 /// socket, or holds the directory, which it does from before it reads
 /// anything there and whatever name it was given for it.
-async fn running(paths: &Paths) -> bool {
+async fn running(paths: &Paths) -> anyhow::Result<bool> {
+    Ok(answers(paths).await || held(paths)?)
+}
+
+/// Whether a service answers on the socket.
+async fn answers(paths: &Paths) -> bool {
     let status = control::request(&paths.socket, &json!({"cmd": "status"})).await;
-    status.is_ok() || cardinald::lock::held(paths)
+    status.is_ok()
+}
+
+/// Whether a process holds the data directory. A directory that cannot be
+/// looked at is an error: "no service" would be a guess.
+fn held(paths: &Paths) -> anyhow::Result<bool> {
+    cardinald::lock::held(paths)
+        .map_err(|e| anyhow::anyhow!("{}", cardinald::lock::cannot(paths, &e)))
+}
+
+/// What to say of a service that holds the data and does not answer.
+fn starting(paths: &Paths) -> anyhow::Error {
+    anyhow::anyhow!(
+        "a Cardinal service is starting on {}, or listens somewhere other than {}: it holds \
+         the data and does not answer here yet. Try again in a moment. Nothing was changed.",
+        paths.home.display(),
+        paths.socket.display()
+    )
+}
+
+/// Whether a service answers, waiting a while for one that holds the data
+/// and has not bound its socket yet (it holds the directory from before
+/// it reads anything, which for a large store takes time). An error if it
+/// still does not answer: nothing is to be set up or changed beside it.
+async fn service(paths: &Paths) -> anyhow::Result<bool> {
+    let wait = std::env::var("CARDINAL_TEST_STARTING_WAIT_MS").ok();
+    let wait = wait.and_then(|ms| ms.parse().ok()).unwrap_or(15_000);
+    let until = std::time::Instant::now() + std::time::Duration::from_millis(wait);
+    loop {
+        if answers(paths).await {
+            return Ok(true);
+        }
+        if !held(paths)? {
+            return Ok(false);
+        }
+        if std::time::Instant::now() >= until {
+            return Err(starting(paths));
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
 }
 
 /// A path inside the mount, relative to its top.
@@ -908,7 +957,7 @@ async fn clear(
              changed."
         )
     };
-    if running(paths).await {
+    if running(paths).await? {
         return Err(stop_first());
     }
     let found = cardinald::clear::found(paths);
@@ -989,7 +1038,7 @@ async fn clear(
         println!("Nothing was removed.");
         return Ok(());
     }
-    if running(paths).await {
+    if running(paths).await? {
         return Err(stop_first());
     }
     // It takes the directory as a daemon does: one that started since is
@@ -1047,7 +1096,7 @@ async fn init(
     on_demand: bool,
     mount: Option<PathBuf>,
 ) -> anyhow::Result<()> {
-    let daemon = running(paths).await;
+    let daemon = service(paths).await?;
     if daemon {
         let st = call(paths, json!({"cmd": "status"})).await?;
         if !st["identity"].is_null() {
@@ -1117,9 +1166,22 @@ async fn init(
             std::env::current_dir()?.join(m)
         });
     }
-    std::fs::create_dir_all(&paths.home)?;
+    // With no service, this takes the directory as one would, for as long
+    // as it writes: a `cardinal clear` or a service starting at the same
+    // moment finds it held, and leaves no half of an identity behind. A
+    // running service holds it already, and is told to load what is new.
+    let lock = match daemon {
+        true => None,
+        false => {
+            let taken = cardinald::lock::take(paths);
+            let taken =
+                taken.map_err(|e| anyhow::anyhow!("{}", cardinald::lock::cannot(paths, &e)))?;
+            Some(taken.ok_or_else(|| starting(paths))?)
+        }
+    };
     config.save(&paths.config())?;
     setup::install(paths, prepared, &config)?;
+    drop(lock);
     println!("Set up. This device is \"{}\".", config.name);
     if daemon {
         call(paths, json!({"cmd": "reload"})).await?;

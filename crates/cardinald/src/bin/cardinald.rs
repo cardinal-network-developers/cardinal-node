@@ -31,7 +31,11 @@ use serde_json::{json, Value};
 async fn clear(paths: &Paths) -> Value {
     let status = json!({"cmd": "status"});
     let answers = cardinald::control::request(&paths.socket, &status).await;
-    if answers.is_ok() || cardinald::lock::held(paths) {
+    let held = match cardinald::lock::held(paths) {
+        Ok(held) => held,
+        Err(e) => return json!({"ok": false, "error": cardinald::lock::cannot(paths, &e)}),
+    };
+    if answers.is_ok() || held {
         return json!({
             "ok": false,
             "error": "Cardinal is running on this data. Stop it first. Nothing was changed.",

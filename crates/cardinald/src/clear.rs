@@ -160,6 +160,9 @@ pub fn clear(paths: &Paths, including_local: bool) -> io::Result<()> {
         remove(&f)?;
     }
     drop(lock);
+    // The lock is a file only on Windows. On Unix the directory itself was
+    // held and nothing called `lock` is the node's: it stays (S8).
+    #[cfg(windows)]
     remove(&crate::lock::file(paths))?;
     Ok(())
 }
@@ -261,6 +264,27 @@ mod tests {
         // again changes nothing
         clear(&paths, false).unwrap();
         assert_eq!(names(&paths.home).len(), 4);
+    }
+
+    /// S8. On Unix the directory itself is held and no `lock` file is ever
+    /// made: something called `lock` there is not the node's, and stays.
+    #[cfg(unix)]
+    #[test]
+    fn something_called_lock_is_not_the_nodes_here() {
+        let (_dir, paths) = full();
+        let kept = paths.home.join("lock/keep.txt");
+        std::fs::create_dir_all(kept.parent().unwrap()).unwrap();
+        std::fs::write(&kept, b"mine").unwrap();
+        clear(&paths, true).unwrap();
+        assert!(kept.exists(), "a folder called lock was removed");
+        assert_eq!(names(&paths.home), ["config.toml", "lock", "mine.txt"]);
+        let (_dir, paths) = full();
+        std::fs::write(paths.home.join("lock"), b"mine").unwrap();
+        clear(&paths, true).unwrap();
+        assert!(
+            paths.home.join("lock").exists(),
+            "a file called lock was removed"
+        );
     }
 
     #[test]

@@ -455,7 +455,19 @@ impl SpaceOp {
                 beside: r.opt_bool(2)?.unwrap_or(false),
             },
             36 => SpaceOpBody::Restore { node: id16(r, 1)? },
-            37 => SpaceOpBody::Checkpoint,
+            37 => {
+                // Nothing here reads a checkpoint yet, but it is that op
+                // only if each field it has is as its table types it
+                // (`state.md#checkpoints`): the frontier, the state root
+                // and the blob reference to the state.
+                ids::<32>(r, 1, "frontier")?;
+                r.opt_bytes_n::<32>(2)?;
+                if let Some(blob) = r.opt_record(3)? {
+                    crate::files::BlobRef::from_record(blob)
+                        .ok_or(Error::Malformed("state blob"))?;
+                }
+                SpaceOpBody::Checkpoint
+            }
             n => SpaceOpBody::Unknown { number: Some(n) },
         })
     }
@@ -1396,6 +1408,25 @@ mod tests {
         not_that_op(op(33).with(1, reach), 33, "set with no key");
         not_that_op(set().with(4, 2u32), 33, "set, beside");
         not_that_op(op(35).with(1, reach).with(2, "yes"), 35, "delete, beside");
+        // S10: `checkpoint` has three fields, typed like any other's.
+        let ids = Value::list([Value::from([1u8; 32])]);
+        let blob = Record::new()
+            .with(1, [2u8; 32])
+            .with(2, [3u8; 32])
+            .with(3, 10u32)
+            .with(4, 0u32);
+        let whole = op(37).with(1, ids).with(2, [4u8; 32]).with(3, blob);
+        for r in [op(37), whole] {
+            assert_eq!(*SpaceOp::from_record(r).body(), SpaceOpBody::Checkpoint);
+        }
+        not_that_op(op(37).with(1, "x"), 37, "checkpoint, frontier");
+        let short = Value::list([Value::from([1u8; 31])]);
+        not_that_op(op(37).with(1, short), 37, "checkpoint, frontier");
+        not_that_op(op(37).with(2, [4u8; 31]), 37, "checkpoint, state root");
+        not_that_op(op(37).with(2, 4u32), 37, "checkpoint, state root");
+        not_that_op(op(37).with(3, "a blob"), 37, "checkpoint, state blob");
+        let no_key = Record::new().with(1, [2u8; 32]).with(3, 10u32);
+        not_that_op(op(37).with(3, no_key), 37, "checkpoint, state blob");
         let start = || op(1).with(1, 2u32);
         not_that_op(start().with(2, "a policy"), 1, "start, policy");
         not_that_op(start().with(5, 7u32), 1, "start, protocol");

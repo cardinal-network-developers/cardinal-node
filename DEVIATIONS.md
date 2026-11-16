@@ -464,7 +464,9 @@ below, each under its section.
   `move`, `delete` and `restore` the node. A name that is absent is the
   empty name, a bool that is absent is false, and a list that is absent
   is empty. Every field that is there has its table's type, or the op is
-  one nobody defined. Where a node id belongs and something else stands,
+  one nobody defined; `checkpoint` (37), which nothing here writes or
+  reads, has none it must have, and its frontier, state root and state
+  blob are typed like the rest. Where a node id belongs and something else stands,
   the op is read as one nobody defined too: it is a writer's op either
   way, and its entry is not accepted for state either way.
 - **Spec ambiguity: a `leave` with fields.** `leave` has none. Chose: one
@@ -850,6 +852,23 @@ Not implemented yet (the next milestone):
   by its canonical path, so the socket's name does not turn on a trailing
   slash or a link. On Windows the lock is a file opened sharing nothing,
   which is written and has never been run.
+  - **Limit: a data directory on a network file system.** The lock is
+    `flock` on the directory. On Linux NFS a directory's `flock` is, as
+    far as its documentation says, local to the machine (not checked
+    against a kernel here), so two machines that share a home over NFS
+    can each run a service on the same data, and each would empty
+    `blobs/tmp` and cut log tails under the other. Nothing here detects
+    that. Where a file system refuses the lock instead (some FUSE, 9p and
+    CIFS mounts), the service does not start and says that the directory
+    cannot be locked and to keep the data on a local disk.
+  - **Who takes it, and when.** The service takes it before it reads or
+    saves its settings. `cardinal init` with no service running holds it
+    while it writes the identity and the first spaces; with one running
+    it writes under that service's hold and tells it to load, as before.
+    A command that finds the directory held and nothing answering on the
+    socket says a service is starting (or listens elsewhere), and `init`
+    waits up to 15 seconds for it. A directory that cannot be opened to
+    look is an error, not "no service".
 - **`cardinal clear`** (`clear.rs`) removes what the node wrote in the
   data directory, by name and without reading it, so it works on a store
   of any format: the keys, the identity log, the spaces, the objects,
@@ -862,6 +881,8 @@ Not implemented yet (the next milestone):
   without `--yes` asks for the word `clear`. The marker goes first and the
   identity log last, so that an interrupted clear leaves a directory that
   nothing opens and that clearing again finishes.
+  On Unix it leaves anything called `lock` there: the node never writes
+  one (0.1.13 removed it, a folder too).
 - **A client that starts the service itself** (`bin/cardinald.rs`; not in
   the specification). A phone and Windows have no `cardinal` command to
   say why the service did not start, or to clear a store. `cardinald

@@ -366,16 +366,33 @@ fn raise_fd_limit() {
 impl Daemon {
     /// Loads everything and binds the link endpoint.
     pub async fn start(paths: Paths, config: Config) -> anyhow::Result<Arc<Daemon>> {
-        raise_fd_limit();
-        // The directory is this process's from here on, before anything
-        // in it is read: a second service would empty what the first is
-        // still writing, and a store must not be cleared under one.
-        let lock = crate::lock::take(&paths)?.ok_or_else(|| {
+        let lock = Self::take(&paths)?;
+        Self::start_holding(paths, config, lock).await
+    }
+
+    /// Takes the data directory for a service. It is this process's from
+    /// here on, before anything in it is read or written, its settings
+    /// too: a second service would empty what the first is still writing
+    /// and save its own settings over the first's, and a store must not
+    /// be cleared under one.
+    pub fn take(paths: &Paths) -> anyhow::Result<crate::lock::Lock> {
+        let taken = crate::lock::take(paths);
+        let taken = taken.map_err(|e| anyhow::anyhow!("{}", crate::lock::cannot(paths, &e)))?;
+        taken.ok_or_else(|| {
             anyhow::anyhow!(
                 "Cardinal is already running on {}. Nothing was changed.",
                 paths.home.display()
             )
-        })?;
+        })
+    }
+
+    /// [`start`](Self::start), on a directory already taken.
+    pub async fn start_holding(
+        paths: Paths,
+        config: Config,
+        lock: crate::lock::Lock,
+    ) -> anyhow::Result<Arc<Daemon>> {
+        raise_fd_limit();
         crate::format::check(&paths)?;
         let keys = Arc::new(Keys::load_or_create(&paths.device_key())?);
         let core = Core::load(&paths, keys.clone())?;

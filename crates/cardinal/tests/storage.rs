@@ -380,11 +380,14 @@ fn a_second_daemon_on_the_same_directory_does_not_start() {
     let waiting = ana.home.join("blobs/tmp/being-written");
     std::fs::create_dir_all(waiting.parent().unwrap()).unwrap();
     std::fs::write(&waiting, b"half an object").unwrap();
+    // S9: nor does it write its own settings over the first one's.
+    let settings = std::fs::read(ana.home.join("config.toml")).unwrap();
     let mut second = ana
         .cmd()
         .env("CARDINAL_SOCKET", root.path().join("second.sock"))
         .args(["daemon", "--no-discovery", "--no-mount", "--listen"])
         .arg(format!("127.0.0.1:{}", free_port()))
+        .args(["--name", "other"])
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::piped())
         .spawn()
@@ -407,6 +410,10 @@ fn a_second_daemon_on_the_same_directory_does_not_start() {
         "a second daemon ran: {why}"
     );
     assert!(why.contains("already running"), "{why}");
+    assert!(
+        std::fs::read(ana.home.join("config.toml")).unwrap() == settings,
+        "the second wrote its settings over the first's"
+    );
     // The first goes on as it was.
     assert!(ana.cli(&["files"]).contains("ana-film.bin"));
 }
@@ -506,4 +513,34 @@ fn content_that_is_current_again_after_it_was_freed_is_named() {
     let back = root.path().join("back.bin");
     ana.cli(&["get", "film.bin", &back.display().to_string()]);
     assert_eq!(std::fs::read(&back).unwrap(), content(3 << 20, 7));
+}
+
+/// S9. A service holds its data directory from before it reads anything
+/// there, and answers on its socket only once it has loaded. In between,
+/// a command is told that it is starting, not that none is running; and
+/// `cardinal init` sets nothing up beside it, on a directory another
+/// process holds.
+#[test]
+fn a_service_that_is_still_starting_is_said_to_be_starting() {
+    let root = tempfile::tempdir().unwrap();
+    let mut ana = Dev::new(root.path(), "ana", free_port());
+    ana.env
+        .push(("CARDINAL_TEST_STARTING_WAIT_MS".into(), "300".into()));
+    // What a service that has not bound its socket yet looks like.
+    let paths = cardinald::paths::Paths::at(&ana.home);
+    let held = cardinald::lock::take(&paths).unwrap().expect("free");
+    for command in [&["status"][..], &["init", "--yes", "--name", "ana"]] {
+        let o = ana.try_cli(command);
+        let why = said(&o);
+        let flat = why.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(!o.status.success(), "{command:?}: {flat}");
+        assert!(flat.contains("is starting"), "{command:?}: {flat}");
+        assert!(!flat.contains("is not running"), "{command:?}: {flat}");
+        assert!(!flat.contains("recovery words"), "{command:?}: {flat}");
+    }
+    assert_eq!(names(&ana.home), Vec::<String>::new());
+    // Once nothing holds it, the same command sets the device up.
+    drop(held);
+    ana.cli(&["init", "--yes", "--name", "ana"]);
+    assert!(ana.home.join("identity.log").exists());
 }

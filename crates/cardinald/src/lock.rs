@@ -23,7 +23,8 @@ use crate::paths::Paths;
 #[derive(Debug)]
 pub struct Lock(#[allow(dead_code)] File);
 
-/// The lock file's path, where there is one.
+/// The lock file's path, where there is one: on Unix nothing is ever
+/// written to take the directory, and a `lock` there is not the node's.
 pub fn file(paths: &Paths) -> PathBuf {
     paths.home.join("lock")
 }
@@ -70,9 +71,26 @@ pub fn take(paths: &Paths) -> io::Result<Option<Lock>> {
 }
 
 /// Whether another process holds the data directory. Nothing is made
-/// there: a directory that is not there is held by nobody.
-pub fn held(paths: &Paths) -> bool {
-    matches!(open(paths, false), Ok(None))
+/// there: a directory that is not there is held by nobody. One that is
+/// there and cannot be looked at is an error, not "nobody": whoever asks
+/// would otherwise be told that no service runs on data it never saw.
+pub fn held(paths: &Paths) -> io::Result<bool> {
+    match open(paths, false) {
+        Ok(lock) => Ok(lock.is_none()),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(e),
+    }
+}
+
+/// Why a directory could not be taken or looked at, for a person: the
+/// error alone ("No locks available") says nothing of what to do.
+pub fn cannot(paths: &Paths, e: &io::Error) -> String {
+    format!(
+        "Cardinal cannot lock its data directory {} ({e}), which is how it keeps two services \
+         off the same data. Some file systems do not allow it, network ones among them: keep \
+         the data on a local disk (`CARDINAL_HOME`). Nothing was changed.",
+        paths.home.display()
+    )
 }
 
 #[cfg(test)]
@@ -85,6 +103,7 @@ mod tests {
         let paths = Paths::at(dir.path());
         // not there: held by nobody, and asking makes nothing
         let none = Paths::at(&dir.path().join("none"));
+        let held = |p: &Paths| held(p).unwrap();
         assert!(!held(&none) && !none.home.exists());
         assert!(!held(&paths));
         let first = take(&paths).unwrap().expect("free");
@@ -99,5 +118,28 @@ mod tests {
         drop(first);
         assert!(!held(&paths));
         assert!(take(&paths).unwrap().is_some());
+    }
+
+    /// S9. A directory that cannot be looked at is not "held by nobody":
+    /// whoever asks is told that it could not be told.
+    #[cfg(unix)]
+    #[test]
+    fn a_directory_that_cannot_be_opened_is_not_free() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("home");
+        std::fs::create_dir(&home).unwrap();
+        let mode = |m| std::fs::set_permissions(&home, std::fs::Permissions::from_mode(m));
+        mode(0o000).unwrap();
+        if std::fs::read_dir(&home).is_ok() {
+            // whoever runs this may open anything
+            mode(0o700).unwrap();
+            return;
+        }
+        let paths = Paths::at(&home);
+        let asked = held(&paths);
+        mode(0o700).unwrap();
+        assert!(asked.is_err(), "{asked:?}");
+        assert!(matches!(held(&paths), Ok(false)));
     }
 }

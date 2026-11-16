@@ -93,10 +93,13 @@ pub async fn run(paths: Paths, o: Overrides) -> anyhow::Result<()> {
         // SAFETY: prctl with these arguments only changes who may trace us.
         unsafe { libc::prctl(libc::PR_SET_PTRACER, libc::PR_SET_PTRACER_ANY, 0, 0, 0) };
     }
+    // The directory is taken before anything in it is read or written:
+    // a service that is refused because one runs there already must not
+    // have saved its settings over that one's (S9).
+    let lock = Daemon::take(&paths)?;
     // A store written under other rules is refused before anything in it
     // is read or written.
     format::check(&paths)?;
-    std::fs::create_dir_all(&paths.home)?;
     let mut config = Config::load(&paths.config())?;
     let mut changed = Config::load(&paths.config()).is_ok()
         && !std::fs::read_to_string(paths.config()).is_ok_and(|t| t.contains("[daemon]"));
@@ -127,6 +130,6 @@ pub async fn run(paths: Paths, o: Overrides) -> anyhow::Result<()> {
     if o.no_mount {
         config.this_run.no_mount = true;
     }
-    let d = Daemon::start(paths, config).await?;
+    let d = Daemon::start_holding(paths, config, lock).await?;
     d.run().await
 }
