@@ -138,9 +138,19 @@ impl Ledger {
 
     /// The references among `roots` that are not to a blob this device
     /// freed: for telling what is named, where a freed blob's index is not
-    /// one that is missing.
-    pub fn not_freed(&self, roots: Vec<BlobRef>) -> Vec<BlobRef> {
-        let kept = roots.into_iter().filter(|b| !self.freed.contains(&b.id));
+    /// one that is missing. A blob that is `live` (current content), or
+    /// whose top object is `here` again, was stored or fetched again since
+    /// it was freed, and names what it names: only `update`, on the hourly
+    /// pass, takes it off the list, and that may be long after.
+    pub fn not_freed(
+        &self,
+        roots: Vec<BlobRef>,
+        live: &HashSet<Id>,
+        here: impl Fn(&Id) -> bool,
+    ) -> Vec<BlobRef> {
+        let kept = roots
+            .into_iter()
+            .filter(|b| !self.freed.contains(&b.id) || live.contains(&b.id) || here(&b.id));
         kept.collect()
     }
 
@@ -304,16 +314,29 @@ pub fn unnamed(d: &Daemon, delete: bool) -> anyhow::Result<Unnamed> {
     // From finding what is named to deleting, no commit runs.
     crate::fs::commit::without_commits(|| {
         let store: &dyn ObjectStore = &*d.store;
-        let (roots, mut unsure) = d.core().named_blobs();
+        // A read that fails is "here": nothing is left out as freed on a
+        // guess.
+        let here = |id: &Id| store.has(id).unwrap_or(true);
+        let named_now = || {
+            let core = d.core();
+            let (roots, unsure) = core.named_blobs();
+            let files = core.files_id().and_then(|f| core.spaces.get(&f));
+            let live: HashSet<Id> = files
+                .and_then(|h| h.space.as_ref())
+                .map(|sp| crate::fetch::current_refs(sp).iter().map(|b| b.id).collect())
+                .unwrap_or_default();
+            (roots, unsure, live)
+        };
+        let (roots, mut unsure, live) = named_now();
         // less the old versions this device freed: their indexes are gone
         // on purpose
-        let roots = lock(&c.ledger).not_freed(roots);
+        let roots = lock(&c.ledger).not_freed(roots, &live, here);
         let mut named = named_objects(store, &roots)?;
         let mut found = unnamed_objects(store, &named.objects, SystemTime::now(), c.min_age)?;
         if delete && !found.is_empty() {
             // What arrived meanwhile may name something that was here.
-            let (again, also) = d.core().named_blobs();
-            let again = lock(&c.ledger).not_freed(again);
+            let (again, also, live) = named_now();
+            let again = lock(&c.ledger).not_freed(again, &live, here);
             let known: HashSet<&BlobRef> = roots.iter().collect();
             let new: Vec<BlobRef> = again.into_iter().filter(|b| !known.contains(b)).collect();
             let more = named_objects(store, &new)?;

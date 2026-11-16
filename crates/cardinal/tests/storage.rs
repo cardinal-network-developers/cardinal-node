@@ -456,3 +456,54 @@ fn what_nothing_names_can_be_deleted_after_an_old_version_was_freed() {
     // The file is whole.
     assert_eq!(std::fs::read(&file).unwrap(), content(3 << 20, 8));
 }
+
+/// S1. A file that goes back to content this device freed as an old
+/// version holds that content as its current one. Until the next hourly
+/// pass the device still has it noted as freed, and what nothing names is
+/// counted and deleted without it all the same. The pass is an hour away
+/// here, as it is after a suspend.
+#[test]
+fn content_that_is_current_again_after_it_was_freed_is_named() {
+    if !fuse_available() {
+        eprintln!("skipping: /dev/fuse or fusermount3 is not available");
+        return;
+    }
+    let root = tempfile::tempdir().unwrap();
+    let mut ana = Dev::new(root.path(), "ana", free_port());
+    for (k, v) in [
+        ("CARDINAL_TEST_FREE_MIN_AGE_MS", "0"),
+        ("CARDINAL_TEST_FREE_INTERVAL_MS", "3600000"),
+    ] {
+        ana.env.push((k.into(), v.into()));
+    }
+    ana.start();
+    ana.cli(&["init", "--yes", "--name", "ana"]);
+    ana.wait_mounted();
+    let file = ana.mount.join("film.bin");
+    let put = |seed: u64| {
+        std::fs::write(&file, content(3 << 20, seed)).unwrap();
+        ana.cli(&["flush"]);
+    };
+    // A, then B over it; A is freed as an old version.
+    put(7);
+    let first = objects(&ana.home).len();
+    put(8);
+    let both = objects(&ana.home).len();
+    let out = ana.cli(&["free-space", "--yes"]);
+    assert!(objects(&ana.home).len() < both, "nothing was freed: {out}");
+    // The file goes back to A.
+    put(7);
+    let held = objects(&ana.home);
+    assert!(held.len() >= first, "A is stored again");
+    let out = ana.cli(&["free-space", "--unnamed"]);
+    assert!(
+        out.contains("Everything this device stores is named"),
+        "the current content counts as named by nothing: {out}"
+    );
+    let o = ana.try_cli(&["free-space", "--unnamed", "--delete"]);
+    assert!(o.status.success(), "{}", said(&o));
+    assert_eq!(objects(&ana.home), held, "{}", said(&o));
+    let back = root.path().join("back.bin");
+    ana.cli(&["get", "film.bin", &back.display().to_string()]);
+    assert_eq!(std::fs::read(&back).unwrap(), content(3 << 20, 7));
+}
