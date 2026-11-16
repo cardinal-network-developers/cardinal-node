@@ -1352,6 +1352,12 @@ asks for around that is not built yet.
     read once, where it first stands reading the later list first, with
     the endpoints and token it has there. The text says a host named in
     both "is one host" and not which entry is read.
+  - **Not quite "unchanged".** What a device writes of another's entry
+    is the endpoints, the key and the token as it read them. A field of a
+    host record beyond those three is not carried on, and a host whose
+    endpoint list holds something that is no record, or whose key or
+    token is not of its length, is not read and so not written again.
+    This version writes neither.
   - **Reading: every token serves** (`Core::space_of_token`,
     `Core::tokens_given`, `relationship::reach_ever`). The space of a
     token is looked for in the list as read and then in every value the

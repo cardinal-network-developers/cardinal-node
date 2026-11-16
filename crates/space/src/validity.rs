@@ -1153,10 +1153,14 @@ impl Judge {
     /// Each valid entry that adds a member, with whom it adds.
     pub fn valid_adds(&self) -> Vec<(IdentityId, EntryId)> {
         let mut out = Vec::new();
+        // told from those taken already by looking it up: an admin sets
+        // how many additions there are, and this runs whenever a space
+        // where hosts are named is settled
+        let mut seen = HashSet::new();
         for (who, adds) in &self.adds_of {
             for (m, _) in adds {
                 let add = self.marks[*m as usize];
-                if self.info[&add].valid && !out.contains(&(*who, add)) {
+                if self.info[&add].valid && seen.insert((*who, add)) {
                     out.push((*who, add));
                 }
             }
