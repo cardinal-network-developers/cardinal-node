@@ -87,12 +87,21 @@ impl Default for Config {
     }
 }
 
-/// The machine's host name, as a default device name.
+/// The machine's name, as a default device name: Linux keeps it in
+/// /etc/hostname, Windows in COMPUTERNAME. The person can rename the device.
 pub fn default_name() -> String {
-    std::fs::read_to_string("/etc/hostname")
-        .ok()
+    pick_name(
+        std::fs::read_to_string("/etc/hostname").ok(),
+        std::env::var("COMPUTERNAME").ok(),
+    )
+}
+
+fn pick_name(hostname: Option<String>, computer_name: Option<String>) -> String {
+    [hostname, computer_name]
+        .into_iter()
+        .flatten()
         .map(|s| s.trim().to_owned())
-        .filter(|s| !s.is_empty())
+        .find(|s| !s.is_empty())
         .unwrap_or_else(|| "this device".into())
 }
 
@@ -192,6 +201,19 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Linux names the machine in /etc/hostname, Windows in COMPUTERNAME;
+    /// "this device" is the last resort, since it means nothing on the
+    /// person's other devices.
+    #[test]
+    fn a_device_is_named_after_its_machine() {
+        let s = |t: &str| Some(t.to_owned());
+        assert_eq!(pick_name(s("laptop\n"), s("DESK")), "laptop");
+        assert_eq!(pick_name(None, s("DESK")), "DESK");
+        assert_eq!(pick_name(s(" \n"), s(" DESK ")), "DESK");
+        assert_eq!(pick_name(None, s("")), "this device");
+        assert_eq!(pick_name(None, None), "this device");
+    }
 
     /// Every install before UDP worked has this line, from a save.
     #[test]

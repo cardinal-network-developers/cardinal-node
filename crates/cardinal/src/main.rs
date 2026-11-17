@@ -107,6 +107,14 @@ enum Cmd {
         #[arg(long)]
         json: bool,
     },
+    /// Rename one of your devices. Your other devices show the new name;
+    /// what your contacts call you does not change.
+    RenameDevice {
+        /// The device's name or key, as `cardinal devices` shows.
+        device: String,
+        /// Its new name.
+        name: String,
+    },
     /// Remove a device you no longer use (it is cut off from your files).
     /// Removing an admin device, or removing from a device that is not an
     /// admin, asks for your recovery words.
@@ -1153,6 +1161,7 @@ async fn init(
         }
     }
     let mut config = Config::load(&paths.config())?;
+    let named = name.is_some();
     if let Some(n) = name {
         config.name = n;
     }
@@ -1183,6 +1192,12 @@ async fn init(
     setup::install(paths, prepared, &config)?;
     drop(lock);
     println!("Set up. This device is \"{}\".", config.name);
+    if !named {
+        println!(
+            "To call it something else: cardinal rename-device \"{}\" <name>",
+            config.name
+        );
+    }
     if daemon {
         call(paths, json!({"cmd": "reload"})).await?;
         if let Some(m) = &config.mount {
@@ -1697,6 +1712,18 @@ async fn client(cmd: Cmd) -> anyhow::Result<()> {
             Ok(())
         }
         Cmd::Speedtest { device, json: raw } => speedtest(&paths, device, raw).await,
+        Cmd::RenameDevice { device, name } => {
+            let v = call(
+                &paths,
+                json!({"cmd": "device-rename", "device": device, "name": name}),
+            )
+            .await?;
+            println!(
+                "Renamed {device} to {}.",
+                v["name"].as_str().unwrap_or(&name)
+            );
+            Ok(())
+        }
         Cmd::RemoveDevice { who, lost } => {
             let req = json!({"cmd": "remove-device", "who": who, "lost": lost});
             let v = call_with_words(&paths, req).await?;

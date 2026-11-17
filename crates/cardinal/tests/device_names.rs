@@ -155,3 +155,23 @@ fn a_device_is_renamed_from_any_of_the_persons_devices() {
     // are given stays.
     assert_eq!(a.status()["name"], "Ana");
 }
+
+/// A machine set up without `--name` is named after its host; the command
+/// line renames it, by its current name, and says what it is called now.
+#[test]
+fn the_command_line_renames_a_device() {
+    if !fuse_available() {
+        eprintln!("skipping: /dev/fuse or fusermount3 is not available");
+        return;
+    }
+    let root = tempfile::tempdir().unwrap();
+    let mut a = Dev::new(root.path(), "alpha", free_port());
+    a.start();
+    a.cli(&["init", "--yes", "--name", "Ana"]);
+    a.wait_mounted();
+    let out = a.cli(&["rename-device", "Ana", "Kitchen laptop"]);
+    assert!(out.contains("Kitchen laptop"), "{out}");
+    assert_eq!(names(&a), ["Kitchen laptop"]);
+    let devices = a.cli(&["devices"]);
+    assert!(devices.contains("Kitchen laptop"), "{devices}");
+}
