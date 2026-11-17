@@ -288,6 +288,15 @@ pub fn list(d: &Daemon, path: &str) -> anyhow::Result<Json> {
             let core = d.core();
             let me = core.identity.as_ref().map(|i| i.id());
             let files = Files::new(open(&core, &at.space)?);
+            // Who added a file, where it was someone else: by what this
+            // person calls them.
+            let called = |who: &[u8; 32]| {
+                core.contacts()
+                    .into_iter()
+                    .find(|c| &c.identity == who)
+                    .map(|c| c.petname)
+                    .unwrap_or_else(|| cardinal_space::account::short_key(who))
+            };
             let at_root = at.shared.is_none() && at.node == ROOT;
             if at_root {
                 for c in &cats {
@@ -319,6 +328,9 @@ pub fn list(d: &Daemon, path: &str) -> anyhow::Result<Json> {
                 });
                 if at.shared.is_some() {
                     entry["mine"] = json!(shown.is_some_and(|v| Some(v.author) == me));
+                }
+                if let Some(first) = versions.first().filter(|v| Some(v.author) != me) {
+                    entry["added_by"] = json!(called(&first.author));
                 }
                 found.push((!is_folder, entry));
             }

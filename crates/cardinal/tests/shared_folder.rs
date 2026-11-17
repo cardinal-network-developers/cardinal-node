@@ -139,6 +139,12 @@ fn a_file_sent_is_in_the_folder_both_share() {
     assert_eq!(entry(&a, "People/Bo", "photo.jpg")["mine"], true);
     assert_eq!(entry(&b, "People/Ana", "photo.jpg")["mine"], false);
     assert_eq!(entry(&b, "People/Ana", "photo.jpg")["size"], 700_000);
+    // Who added it, where it was someone else, by what this person calls them.
+    assert_eq!(entry(&b, "People/Ana", "photo.jpg")["added_by"], "Ana");
+    assert!(entry(&a, "People/Bo", "photo.jpg")
+        .get("added_by")
+        .is_none());
+    assert!(entry(&a, "People/Bo", "photo.jpg")["time"].is_u64());
     // stored once: the message and the folder name the same content
     assert_eq!(saved(&b, root.path(), "People/Ana/photo.jpg"), photo);
 }

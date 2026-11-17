@@ -91,6 +91,9 @@ pub fn short_key(k: &KeyId) -> String {
     k[..4].iter().map(|b| format!("{b:02x}")).collect()
 }
 
+/// A device node's name (field 2).
+pub const DEVICE_NAME: u64 = 2;
+
 /// `create` of a device node.
 pub fn create_device(key: &KeyId, name: &str, always_on: bool, is_host: bool) -> SpaceOp {
     SpaceOp::create(

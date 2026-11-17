@@ -1116,6 +1116,20 @@ Not implemented yet (the next milestone):
   reply, and devices without the service reset the stream. A link-level
   measurement could instead be a core service, or `ping` frames with
   padding.
+- **Beyond `apps.md`: renaming a device, and who added a file.** The
+  local interface has `device-rename` `device` `name`: `device` is one of
+  the person's devices, by its name or the start of its key, as
+  `remove-device` takes it, and `name` its new name, trimmed, one line,
+  not empty. It sets field 2 of every device node in the account space
+  that names that key (`profiles.md#account`; any of the person's devices
+  may, since only they read it), and answers with `name` and `key`. It
+  refuses a name another of the person's devices has, ignoring case,
+  since a device is also found by its name, and a device with no node in
+  the account yet. The person's own name, which the first device is
+  named after, does not change. `files` gives each file `added_by`, what
+  this person calls whoever wrote its first version, where that was
+  someone else. `api` stays 1: both are additions a client can do
+  without.
 
 ## Other people (`spec/contact.md`, `spec/profiles.md#relationship`)
 

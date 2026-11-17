@@ -264,6 +264,7 @@ async fn handle(d: &Arc<Daemon>, req: &Value) -> anyhow::Result<Value> {
             let name = crate::pair::type_code(d, code, at, admin, words(req)).await?;
             Ok(json!({"name": name}))
         }
+        "device-rename" => rename_device(d, arg(req, "device")?, arg(req, "name")?),
         "remove-device" => {
             let lost = req.get("lost").and_then(|v| v.as_bool()).unwrap_or(false);
             remove_device(d, arg(req, "who")?, words(req), lost).await
@@ -1234,6 +1235,85 @@ async fn keep_work_of(d: &Arc<Daemon>, key: &[u8; 32]) -> anyhow::Result<()> {
 /// that no other key built on; any other keeps its work. Either way it is
 /// told first, while it still can be: nobody answers it afterwards, and until
 /// then it can pass the news to devices this one cannot reach.
+/// One of this person's devices, by its name or the start of its key, and
+/// what it is called.
+fn find_device(d: &Daemon, who: &str) -> anyhow::Result<([u8; 32], String)> {
+    let core = d.core();
+    let ident = core
+        .identity
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("this device does not belong to anyone"))?;
+    let names = core.device_names();
+    let st = ident.state();
+    let w = who.trim().to_lowercase();
+    let matches: Vec<[u8; 32]> = st
+        .keys
+        .keys()
+        .filter(|k| {
+            names.get(*k).is_some_and(|n| n.to_lowercase() == w)
+                || (!w.is_empty() && hex::encode(k).starts_with(&w))
+        })
+        .copied()
+        .collect();
+    match matches.as_slice() {
+        [] => anyhow::bail!("no device called {who:?}; see `cardinal devices`"),
+        [k] => Ok((
+            *k,
+            names
+                .get(k)
+                .cloned()
+                .unwrap_or_else(|| account::short_key(k)),
+        )),
+        _ => {
+            anyhow::bail!("several devices match {who:?}; use the key shown by `cardinal devices`")
+        }
+    }
+}
+
+/// Renames one of this person's devices: the name in its device node in the
+/// account space (`profiles.md#account`, kind 4, field 2), which only the
+/// person's own devices read and any of them may set. Every node naming the
+/// device is set, should two have been made at once. No two of a person's
+/// devices share a name, since a device is also found by its name.
+fn rename_device(d: &Arc<Daemon>, which: &str, name: &str) -> anyhow::Result<Value> {
+    let name = name.trim();
+    anyhow::ensure!(!name.is_empty(), "a name cannot be empty");
+    anyhow::ensure!(
+        !name.chars().any(char::is_control),
+        "a device's name is one line"
+    );
+    let (key, _) = find_device(d, which)?;
+    let (acc, nodes, taken) = {
+        let core = d.core();
+        let acc = core
+            .account_id()
+            .ok_or_else(|| anyhow::anyhow!("the account space is not here yet"))?;
+        let held = core.account().and_then(|h| h.space.as_ref());
+        let held = held.ok_or_else(|| anyhow::anyhow!("the account space is not here yet"))?;
+        let all = account::devices(held.state());
+        let nodes: Vec<_> = all
+            .iter()
+            .filter(|r| r.key == key)
+            .map(|r| r.node)
+            .collect();
+        let taken = all
+            .iter()
+            .any(|r| r.key != key && r.name.to_lowercase() == name.to_lowercase());
+        (acc, nodes, taken)
+    };
+    anyhow::ensure!(!taken, "another of your devices is called {name:?}");
+    anyhow::ensure!(
+        !nodes.is_empty(),
+        "that device is not named in your account yet; try again once it has synced"
+    );
+    let ops = nodes
+        .into_iter()
+        .map(|n| account::set_field(n, account::DEVICE_NAME, name))
+        .collect();
+    d.write_and_push(&acc, ops)?;
+    Ok(json!({"name": name, "key": hex::encode(&key[..8])}))
+}
+
 async fn remove_device(
     d: &Arc<Daemon>,
     who: &str,
@@ -1241,38 +1321,7 @@ async fn remove_device(
     lost: bool,
 ) -> anyhow::Result<Value> {
     let me = d.keys.key();
-    let (key, name) = {
-        let core = d.core();
-        let ident = core
-            .identity
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("this device does not belong to anyone"))?;
-        let names = core.device_names();
-        let st = ident.state();
-        let w = who.to_lowercase();
-        let matches: Vec<[u8; 32]> = st
-            .keys
-            .keys()
-            .filter(|k| {
-                names.get(*k).is_some_and(|n| n.to_lowercase() == w)
-                    || hex::encode(k).starts_with(&w)
-            })
-            .copied()
-            .collect();
-        match matches.as_slice() {
-            [] => anyhow::bail!("no device called {who:?}; see `cardinal devices`"),
-            [k] => (
-                *k,
-                names
-                    .get(k)
-                    .cloned()
-                    .unwrap_or_else(|| account::short_key(k)),
-            ),
-            _ => anyhow::bail!(
-                "several devices match {who:?}; use the key shown by `cardinal devices`"
-            ),
-        }
-    };
+    let (key, name) = find_device(d, who)?;
     if key == me {
         anyhow::bail!("this is the device you are using; remove it from another of your devices");
     }
