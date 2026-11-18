@@ -221,6 +221,16 @@ fn control(d: &Dev, req: serde_json::Value) -> serde_json::Value {
 #[test]
 fn an_old_account_gets_a_name_of_its_own() {
     let Some(old) = old_bin() else { return };
+    // Only a version from before D71 (0.1.15 and earlier) makes an account
+    // with no name of its own; one that has `cardinal me` already names it.
+    let knows_names = std::process::Command::new(&old)
+        .args(["me", "--help"])
+        .output()
+        .is_ok_and(|o| o.status.success());
+    if knows_names {
+        eprintln!("skipping: the old version already keeps the person's name");
+        return;
+    }
     let root = tempfile::tempdir().unwrap();
     let mut ana = old_device(root.path(), "ana-laptop", &old);
     let mut phone = old_device(root.path(), "ana-phone", &old);
