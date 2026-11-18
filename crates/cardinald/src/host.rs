@@ -102,10 +102,8 @@ pub fn is_unproven(d: &Daemon, s: &Session) -> bool {
 /// Makes this device a host for its own identity, at `addresses`.
 pub fn enable(d: &Arc<Daemon>, addresses: &[String]) -> anyhow::Result<Json> {
     if addresses.is_empty() {
-        anyhow::bail!(
-            "give an address other devices can reach this one at: \
-             `cardinal host --address <host:port>`"
-        );
+        let port = d.endpoint.tcp_addr().map_or(0, |a| a.port());
+        anyhow::bail!("{}", no_address(port, &crate::daemon::local_ips()));
     }
     let endpoints = addresses
         .iter()
@@ -116,6 +114,22 @@ pub fn enable(d: &Arc<Daemon>, addresses: &[String]) -> anyhow::Result<Json> {
         })
         .collect::<anyhow::Result<Vec<_>>>()?;
     enable_at(d, endpoints)
+}
+
+/// What to say when no address is given: the address this device has on
+/// its network, with the port it listens on, ready to copy.
+fn no_address(port: u16, ips: &[IpAddr]) -> String {
+    let here = ips.iter().find(|ip| !ip.is_loopback());
+    let example = match here {
+        Some(ip) => format!("{}", std::net::SocketAddr::new(*ip, port)),
+        None => format!("<this device's address>:{port}"),
+    };
+    format!(
+        "give the address other devices reach this one at, with the port it listens on \
+         ({port}): for this network, `cardinal host --address {example}`. For devices \
+         elsewhere, add the internet's address and the port your router forwards here as \
+         another `--address`."
+    )
 }
 
 /// [`enable`], at endpoints already read.
@@ -246,6 +260,67 @@ pub fn refresh(d: &Arc<Daemon>) -> anyhow::Result<()> {
     };
     // each endpoint as the grant had it, one this version cannot use too
     enable_at(d, old.endpoints).map(|_| ())
+}
+
+/// After the device moved off a port that was taken, the addresses in its
+/// grant that reach this device itself follow it to the new port. One that
+/// reaches it some other way, a router's forward, cannot, and is shown in
+/// the status until the person changes it.
+pub fn follow_port(d: &Arc<Daemon>) -> anyhow::Result<()> {
+    let Some(old) = d.config().this_run.moved_from else {
+        return Ok(());
+    };
+    if !d.config().host {
+        return Ok(());
+    }
+    let Some(grant) = own_grant(d) else {
+        return Ok(());
+    };
+    let now = d.endpoint.tcp_addr().map_or(0, |a| a.port());
+    let mut changed = false;
+    let mut left_behind = Vec::new();
+    let endpoints = grant
+        .endpoints
+        .into_iter()
+        .map(|e| match (e.port(), e.host()) {
+            (Some(p), Some(host)) if p == old && is_this_device(&host) => {
+                let at = if host.contains(':') {
+                    format!("[{host}]:{now}")
+                } else {
+                    format!("{host}:{now}")
+                };
+                match Endpoint::parse(&at) {
+                    Some(moved) => {
+                        changed = true;
+                        moved
+                    }
+                    None => e,
+                }
+            }
+            (Some(p), Some(_)) if p == old => {
+                left_behind.push(e.to_string());
+                e
+            }
+            _ => e,
+        })
+        .collect();
+    d.config().this_run.left_behind = left_behind;
+    if changed {
+        enable_at(d, endpoints)?;
+    }
+    Ok(())
+}
+
+/// Whether `host` (an address or a name) is this machine.
+fn is_this_device(host: &str) -> bool {
+    use std::net::ToSocketAddrs;
+    let mine = |ip: IpAddr| ip.is_loopback() || std::net::UdpSocket::bind((ip, 0)).is_ok();
+    match host.parse::<IpAddr>() {
+        Ok(ip) => mine(ip),
+        Err(_) => (host, 0)
+            .to_socket_addrs()
+            .is_ok_and(|mut a| a.any(|a| mine(a.ip()))),
+    }
 }
 
 /// Stops being a host: this device keeps what it has, and no longer offers
@@ -514,6 +589,12 @@ mod tests {
     #[test]
     fn an_address_that_cannot_reach_this_device_is_pointed_out() {
         let e = |s| Endpoint::parse(s).unwrap();
+        let said = no_address(47555, &["172.20.0.251".parse().unwrap()]);
+        assert!(
+            said.contains("`cardinal host --address 172.20.0.251:47555`"),
+            "{said}"
+        );
+        assert!(no_address(7171, &[]).contains("<this device's address>:7171"));
         let warning = |s| address_warning(&e(s), 7171);
         assert_eq!(warning("127.0.0.1:7171"), None);
         assert!(warning("127.0.0.1:7172").unwrap().contains("port 7171"));

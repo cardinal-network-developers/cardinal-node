@@ -110,6 +110,9 @@ impl Runner for FakeRunner {
                 }
             }
             Some("loginctl") => ok("no\n"),
+            Some("journalctl") => ok("Started cardinal.service.\n\
+                 cardinal: cannot listen on 0.0.0.0:7171: another program uses port 7171\n\
+                 cardinal.service: Main process exited, code=exited, status=1/FAILURE\n"),
             _ => {
                 // Retry "text file busy": another test thread may briefly
                 // hold a write descriptor to a script across its fork.
@@ -520,6 +523,22 @@ fn install_is_idempotent_and_asks_before_replacing() {
         .systemctl_calls()
         .contains(&"systemctl --user restart cardinal.service".to_string()));
     env.assert_clean();
+}
+
+#[test]
+fn install_says_when_the_service_does_not_stay_running() {
+    let env = Env::new();
+    let exe = env.root.join("exe");
+    write_exe(&exe, &script("0.2.0", "BROKEN"));
+    let runner = FakeRunner::new(&env.paths);
+    *runner.running.borrow_mut() = false;
+    let prompt = FakePrompt(None);
+    let ctx = env.ctx(&runner, &prompt);
+    let e = format!("{:#}", ops::install(&ctx, &exe, false).unwrap_err());
+    assert!(e.contains("does not stay running (state: failed)"), "{e}");
+    assert!(e.contains("cardinal: cannot listen on 0.0.0.0:7171"), "{e}");
+    // The binary is installed all the same.
+    assert_eq!(env.installed(), script("0.2.0", "BROKEN"));
 }
 
 #[test]

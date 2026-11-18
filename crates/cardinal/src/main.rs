@@ -10,6 +10,8 @@ use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+mod overview;
+
 use cardinald::{control, setup, Config, Paths};
 use clap::{Parser, Subcommand};
 use serde_json::{json, Value};
@@ -24,7 +26,8 @@ use serde_json::{json, Value};
 )]
 struct Cli {
     /// Use this data directory instead of ~/.local/share/cardinal (also
-    /// CARDINAL_HOME). Lets two devices run on one machine.
+    /// CARDINAL_HOME). Lets two devices run on one machine, each on its own
+    /// port.
     #[arg(long, global = true, value_name = "DIR")]
     home: Option<PathBuf>,
     #[command(subcommand)]
@@ -88,6 +91,7 @@ enum Cmd {
     },
     /// Add a device. On the NEW device run `cardinal pair` and it shows a
     /// code; on a device you already use, run `cardinal pair <code>`.
+    #[command(visible_alias = "add-device")]
     Pair {
         /// The code the new device shows (type it on an existing device).
         code: Option<String>,
@@ -265,10 +269,12 @@ enum Cmd {
         /// Where to save it.
         to: PathBuf,
     },
-    /// Your conversation with a contact.
+    /// Your conversation with a contact; with nobody named, all of them:
+    /// what is new, newest first.
     Messages {
-        /// Who, as `cardinal contacts` shows.
-        who: String,
+        /// Who, as `cardinal contacts` shows. Without it: every conversation,
+        /// newest first, with what is new.
+        who: Option<String>,
     },
     /// The groups you are in, and those offered to you.
     Groups,
@@ -297,8 +303,9 @@ enum Cmd {
     /// Make this device a host for your own devices: it keeps a full copy
     /// of your files, and can bring them back if every other device is lost.
     Host {
-        /// Where your devices can reach this one (host:port). Give it more
-        /// than once for more than one address.
+        /// Where your devices can reach this one (host:port, the port this
+        /// device listens on). Needed to become a host. Give it more than
+        /// once for more than one address.
         #[arg(long = "address")]
         addresses: Vec<String>,
         /// Stop being a host.
@@ -1450,6 +1457,20 @@ fn print_status(v: &Value) {
     if let Some(line) = old_line(&v["old"]) {
         println!("{line}");
     }
+    if let Some(old) = v["moved_from"].as_u64() {
+        let now = v["listen"].as_str().unwrap_or("");
+        let port = now.rsplit(':').next().unwrap_or(now);
+        println!(
+            "Port: {old} was in use by another program, so this device listens on {port} now."
+        );
+        for a in v["left_behind"].as_array().into_iter().flatten() {
+            println!(
+                "  {} still names port {old}: point your router's forward at {port}, then give the \
+                 addresses again with `cardinal host --address`.",
+                a.as_str().unwrap_or("")
+            );
+        }
+    }
     println!("Devices:");
     print_devices(&v["devices"]);
     let p = &v["progress"];
@@ -2255,7 +2276,16 @@ async fn client(cmd: Cmd) -> anyhow::Result<()> {
             }
             Ok(())
         }
-        Cmd::Messages { who } => {
+        Cmd::Messages { who: None } => {
+            let conversations = call(&paths, json!({"cmd": "conversations"})).await?;
+            let groups = call(&paths, json!({"cmd": "groups"})).await?;
+            print!(
+                "{}",
+                overview::render(&conversations, &groups, &overview::Style::here())
+            );
+            Ok(())
+        }
+        Cmd::Messages { who: Some(who) } => {
             let v = call(&paths, json!({"cmd": "messages", "who": who})).await?;
             for m in v["messages"].as_array().into_iter().flatten() {
                 let by = if m["mine"] == true {
@@ -2275,6 +2305,8 @@ async fn client(cmd: Cmd) -> anyhow::Result<()> {
                     );
                 }
             }
+            // Shown is read, as in a window; their devices see it too.
+            call(&paths, json!({"cmd": "mark-read", "who": who})).await?;
             Ok(())
         }
         Cmd::Save {

@@ -363,6 +363,24 @@ fn raise_fd_limit() {
     }
 }
 
+/// Why the daemon cannot listen, and how to choose another port. The
+/// service reads its port from the settings, so the hint is the setting,
+/// not a flag only a daemon started by hand would see.
+fn cannot_listen(paths: &Paths, listen: SocketAddr, e: &std::io::Error) -> anyhow::Error {
+    if e.kind() == std::io::ErrorKind::AddrInUse {
+        anyhow::anyhow!(
+            "cannot listen on {listen}: another program uses port {port}, perhaps another \
+             person's Cardinal on this machine. Choose another port: set `listen = \
+             \"0.0.0.0:PORT\"` under [daemon] in {config} and start again (or, by hand, \
+             `cardinal daemon --listen 0.0.0.0:PORT`).",
+            port = listen.port(),
+            config = paths.config().display()
+        )
+    } else {
+        anyhow::anyhow!("cannot listen on {listen}: {e}")
+    }
+}
+
 impl Daemon {
     /// Loads everything and binds the link endpoint.
     pub async fn start(paths: Paths, config: Config) -> anyhow::Result<Arc<Daemon>> {
@@ -389,7 +407,7 @@ impl Daemon {
     /// [`start`](Self::start), on a directory already taken.
     pub async fn start_holding(
         paths: Paths,
-        config: Config,
+        mut config: Config,
         lock: crate::lock::Lock,
     ) -> anyhow::Result<Arc<Daemon>> {
         raise_fd_limit();
@@ -426,20 +444,40 @@ impl Daemon {
         })?;
         // Nothing gets to a device behind a NAT, in the tests.
         let gateway_free = ec.udp_gateway.is_none();
-        let endpoint = Endpoint::bind(
-            ec,
-            Bind {
-                udp: config.uses_udp().then_some(listen),
-                tcp: gateway_free.then_some(listen),
-            },
-        )
-        .await
-        .map_err(|e| {
-            anyhow::anyhow!(
-                "cannot listen on {listen}: {e}. Is another cardinal daemon running? \
-                 Set another port with `cardinal daemon --listen 0.0.0.0:PORT`."
-            )
-        })?;
+        let bind = |at: SocketAddr| Bind {
+            udp: config.uses_udp().then_some(at),
+            tcp: gateway_free.then_some(at),
+        };
+        let endpoint = match Endpoint::bind(ec.clone(), bind(listen)).await {
+            Ok(e) => e,
+            // The port is taken, by another person's Cardinal on this
+            // machine or any other program: the device moves to the next
+            // free one and keeps it, and tells its devices and contacts as
+            // it reaches them (a host also rewrites its grant). Only a port
+            // asked for on the command line is held to.
+            Err(e)
+                if e.kind() == std::io::ErrorKind::AddrInUse && !config.this_run.listen_given =>
+            {
+                let mut found = None;
+                for port in listen.port().saturating_add(1)..listen.port().saturating_add(100) {
+                    let at = SocketAddr::new(listen.ip(), port);
+                    if let Ok(e) = Endpoint::bind(ec.clone(), bind(at)).await {
+                        found = Some((e, at));
+                        break;
+                    }
+                }
+                let (endpoint, at) = found.ok_or_else(|| cannot_listen(&paths, listen, &e))?;
+                tracing::warn!(
+                    "port {} is in use; listening on {at} instead",
+                    listen.port()
+                );
+                config.listen = at.to_string();
+                config.save(&paths.config())?;
+                config.this_run.moved_from = Some(listen.port());
+                endpoint
+            }
+            Err(e) => return Err(cannot_listen(&paths, listen, &e)),
+        };
         let book: PeerBook = std::fs::read(paths.peers())
             .ok()
             .and_then(|b| serde_json::from_slice(&b).ok())
@@ -1216,6 +1254,9 @@ impl Daemon {
             }
             if let Err(e) = crate::host::refresh(&d) {
                 tracing::debug!("housekeeping: {e:#}");
+            }
+            if let Err(e) = crate::host::follow_port(&d) {
+                tracing::warn!("cannot give the new port in the grant: {e:#}");
             }
             crate::contacts::admit_invitations(&d);
             // Mounting blocks, and may wait for another mount or unmount.

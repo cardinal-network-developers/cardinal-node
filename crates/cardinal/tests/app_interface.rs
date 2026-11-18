@@ -126,6 +126,36 @@ fn news_comes_by_itself_and_read_travels_back() {
     });
 }
 
+/// At the command line: `cardinal messages` alone shows what is new, and
+/// reading a conversation marks it read.
+#[test]
+fn the_command_line_shows_what_is_new_and_reading_marks_it_read() {
+    if !fuse_available() {
+        eprintln!("skipping: /dev/fuse or fusermount3 is not available");
+        return;
+    }
+    let root = tempfile::tempdir().unwrap();
+    let (a, b) = met(root.path());
+    let bo = only(&a)["name"].as_str().unwrap().to_owned();
+    assert!(a.cli(&["messages"]).contains("nothing said yet"));
+
+    b.cli(&["say", "Ana", "hello from bo"]);
+    wait("the message arrives", 30, || only(&a)["unread"] == 1);
+    let all = a.cli(&["messages"]);
+    assert!(all.contains(&format!("● {bo}")), "{all}");
+    assert!(all.contains("1 new"), "{all}");
+    assert!(all.contains("hello from bo"), "{all}");
+    assert!(all.contains(&format!("1 new message from {bo}.")), "{all}");
+    assert!(!all.contains('\x1b'), "no color when not a terminal: {all}");
+
+    assert!(a.cli(&["messages", &bo]).contains("hello from bo"));
+    assert_eq!(only(&a)["unread"], 0);
+    wait("bo sees it was read", 30, || {
+        said(&b, "Ana")[0]["state"] == "read"
+    });
+    assert!(a.cli(&["messages"]).contains("Nothing new."));
+}
+
 /// With no way to reach someone, a message says so, and stops saying so once
 /// it has got there.
 #[test]

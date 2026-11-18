@@ -186,10 +186,20 @@ pub fn install(ctx: &Ctx, exe: &Path, force: bool) -> anyhow::Result<()> {
         } else if state != "active" {
             ctx.systemctl_ok(&["start", UNIT_NAME])?;
         }
-        println!(
-            "Service {UNIT_NAME} enabled; state: {} (logs: journalctl --user -u cardinal)",
-            ctx.service_state()
-        );
+        // A service that fails at once is restarted every few seconds and
+        // looks, for a moment, as if it runs: say so now, with its reason,
+        // instead of leaving it to be found in the log.
+        if let Err(state) = ctx.wait_service_healthy() {
+            let why = last_service_error(ctx)
+                .map(|l| format!("\n  {l}"))
+                .unwrap_or_default();
+            bail!(
+                "installed, but the service does not stay running (state: {state}).{why}\n\
+                 Once that is fixed: systemctl --user restart {UNIT_NAME} \
+                 (logs: journalctl --user -u cardinal)"
+            );
+        }
+        println!("Service {UNIT_NAME} enabled and running (logs: journalctl --user -u cardinal)");
         linger_hint(ctx);
     } else {
         eprintln!(
@@ -210,6 +220,40 @@ pub fn install(ctx: &Ctx, exe: &Path, force: bool) -> anyhow::Result<()> {
         );
     }
     Ok(())
+}
+
+/// The last thing the service said before it stopped, from its log.
+fn last_service_error(ctx: &Ctx) -> Option<String> {
+    let args = [
+        "--user",
+        "-u",
+        UNIT_NAME,
+        "-n",
+        "30",
+        "-o",
+        "cat",
+        "--no-pager",
+    ];
+    let args: Vec<&std::ffi::OsStr> = args.iter().map(std::ffi::OsStr::new).collect();
+    let o = ctx
+        .runner
+        .run(
+            "journalctl".as_ref(),
+            &args,
+            std::time::Duration::from_secs(10),
+        )
+        .ok()?;
+    let lines: Vec<&str> = o
+        .stdout
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .collect();
+    lines
+        .iter()
+        .rev()
+        .find(|l| l.starts_with("cardinal:"))
+        .map(|l| (*l).to_owned())
 }
 
 fn linger_hint(ctx: &Ctx) {

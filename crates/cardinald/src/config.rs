@@ -28,6 +28,14 @@ pub struct ThisRun {
     pub mdns_port: Option<u16>,
     /// `--no-udp`.
     pub no_udp: bool,
+    /// `--listen`: this run must have that port, or not run.
+    pub listen_given: bool,
+    /// The port this device had, when it was taken at start and the device
+    /// moved to another.
+    pub moved_from: Option<u16>,
+    /// Addresses given for this device that still name the port it left,
+    /// and cannot be made to follow it: a router's forward.
+    pub left_behind: Vec<String>,
 }
 
 /// Device settings.

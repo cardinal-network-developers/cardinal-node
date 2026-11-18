@@ -131,6 +131,7 @@ pub async fn run(paths: Paths, o: Overrides) -> anyhow::Result<()> {
     if let Some(l) = o.listen {
         changed |= config.listen != l;
         config.listen = l;
+        config.this_run.listen_given = true;
     }
     if let Some(m) = o.mount {
         changed |= config.mount.as_ref() != Some(&m);
