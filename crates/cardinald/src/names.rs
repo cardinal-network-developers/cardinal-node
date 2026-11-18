@@ -127,6 +127,9 @@ fn write_cache<F: cardinal_blob::Fetch>(d: &Daemon, b: BlobRef, fetch: &F) -> an
     let mut out = std::fs::File::create(&part)?;
     let mut reader = BlobReader::new(&*d.store, fetch, b);
     let wrote = crate::contacts::write_out(&mut reader, &mut out);
+    // On disk before it takes its name: after a crash a file under the
+    // final name is whole, since it is never fetched again (review L1).
+    let wrote = wrote.and_then(|w| out.sync_all().map(|()| w).map_err(Into::into));
     drop(out);
     if let Err(e) = wrote {
         let _ = std::fs::remove_file(&part);
@@ -199,11 +202,36 @@ pub async fn set_picture(d: &Arc<Daemon>, who: &str, from: &str) -> anyhow::Resu
     Ok(Json::Object(shown(d, &c)))
 }
 
+/// When to ask again for a picture that could not be had: 10 s after the
+/// first failure, twice as long after each one after, never more than 10
+/// minutes (review L2: it was asked for at every change, several times a
+/// second during a busy sync).
+#[derive(Default)]
+struct Backoff(std::collections::HashMap<[u8; 32], (std::time::Instant, Duration)>);
+
+impl Backoff {
+    fn due(&self, id: &[u8; 32], now: std::time::Instant) -> bool {
+        self.0.get(id).is_none_or(|(next, _)| now >= *next)
+    }
+
+    fn failed(&mut self, id: [u8; 32], now: std::time::Instant) {
+        let wait = self.0.get(&id).map_or(Duration::from_secs(10), |(_, w)| {
+            (*w * 2).min(Duration::from_secs(600))
+        });
+        self.0.insert(id, (now + wait, wait));
+    }
+
+    fn got(&mut self, id: &[u8; 32]) {
+        self.0.remove(id);
+    }
+}
+
 /// Keeps a file on this device for each contact's picture, fetching it
 /// from this person's other devices, and tells windows when one arrives.
 pub fn start(d: Arc<Daemon>) {
     tokio::spawn(async move {
         let mut changed = d.changed.subscribe();
+        let mut backoff = Backoff::default();
         loop {
             let missing: Vec<BlobRef> = {
                 let contacts = d.core().contacts();
@@ -212,10 +240,12 @@ pub fn start(d: Arc<Daemon>) {
                     .filter_map(|c| c.picture.as_ref())
                     .filter(|r| cached(&d, r).is_none())
                     .filter_map(|r| BlobRef::from_record(r).ok())
+                    .filter(|b| backoff.due(&b.id, std::time::Instant::now()))
                     .collect()
             };
             let mut got = false;
             for b in missing {
+                let id = b.id;
                 let d2 = d.clone();
                 let done = tokio::task::spawn_blocking(move || {
                     let fetcher = Fetcher::new(&d2, Priority::Interactive);
@@ -223,9 +253,18 @@ pub fn start(d: Arc<Daemon>) {
                 })
                 .await;
                 match done {
-                    Ok(Ok(())) => got = true,
-                    Ok(Err(e)) => tracing::debug!("fetching a picture: {e:#}"),
-                    Err(e) => tracing::debug!("fetching a picture: {e}"),
+                    Ok(Ok(())) => {
+                        got = true;
+                        backoff.got(&id);
+                    }
+                    Ok(Err(e)) => {
+                        tracing::debug!("fetching a picture: {e:#}");
+                        backoff.failed(id, std::time::Instant::now());
+                    }
+                    Err(e) => {
+                        tracing::debug!("fetching a picture: {e}");
+                        backoff.failed(id, std::time::Instant::now());
+                    }
                 }
             }
             if got {
@@ -244,4 +283,38 @@ pub fn start(d: Arc<Daemon>) {
             tokio::time::sleep(Duration::from_millis(300)).await;
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Instant;
+
+    /// A picture no device can give is asked for again later and later, not
+    /// at every change: 10 s, then twice as long each time, up to 10 min;
+    /// one that arrives is forgotten.
+    #[test]
+    fn a_picture_nobody_has_is_asked_for_less_and_less() {
+        let mut b = Backoff::default();
+        let id = [7u8; 32];
+        let t0 = Instant::now();
+        assert!(b.due(&id, t0));
+        b.failed(id, t0);
+        assert!(!b.due(&id, t0 + Duration::from_secs(9)));
+        assert!(b.due(&id, t0 + Duration::from_secs(10)));
+        let t1 = t0 + Duration::from_secs(10);
+        b.failed(id, t1);
+        assert!(!b.due(&id, t1 + Duration::from_secs(19)));
+        assert!(b.due(&id, t1 + Duration::from_secs(20)));
+        let mut t = t1;
+        for _ in 0..20 {
+            b.failed(id, t);
+            t += Duration::from_secs(600);
+        }
+        assert!(b.due(&id, t));
+        b.failed(id, t);
+        assert!(!b.due(&id, t + Duration::from_secs(599)));
+        b.got(&id);
+        assert!(b.due(&id, t));
+    }
 }

@@ -1091,6 +1091,39 @@ pub fn revoke_refused(d: &Daemon) {
 /// where it is in the list, whose order is its person's, and another
 /// host's entry is written as it was read. A reach node that names no host
 /// is left as it is: that was its person's answer.
+/// Takes a device the person removed out of every list that names it
+/// (`hosts.md`: an entry stays "until that device, or the person, takes it
+/// out"). A lost host never takes itself out, and while it is named,
+/// contacts go on leaving messages with whoever holds it. Each list is
+/// written as it reads, without that entry, if nothing it rests on has
+/// changed since; one left empty is a no, as any empty list is.
+pub fn take_out_removed(d: &Arc<Daemon>, gone: &[u8; 32]) {
+    let Some(me) = d.core().identity.as_ref().map(|i| i.id()) else {
+        return;
+    };
+    let named: Vec<SpaceId> = {
+        let core = d.core();
+        let names = |id: &&SpaceId| core.reach_of(id, &me).iter().any(|r| r.host == *gone);
+        core.spaces.keys().filter(names).copied().collect()
+    };
+    for space in named {
+        let (reach, decided) = {
+            let core = d.core();
+            let mut reach = core.reach_of(&space, &me);
+            reach.retain(|r| r.host != *gone);
+            (reach, Decided::now(&core, &space))
+        };
+        let set = relationship::set_reach(&me, &reach);
+        let written = d.write_and_push_if(&space, vec![set], |core| decided.still(core, &space));
+        if !matches!(written, Ok(Some(_))) {
+            tracing::warn!(
+                "{} still names a removed device",
+                crate::core::short(&space)
+            );
+        }
+    }
+}
+
 pub fn keep_own_entry(d: &Arc<Daemon>) {
     let host = d.config().host;
     let here = *d.keys.link.public_key().x25519();

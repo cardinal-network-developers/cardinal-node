@@ -752,6 +752,60 @@ fn a_host_that_stops_serving_is_taken_out_of_the_list() {
     assert_eq!(reach_in(&bo, &g)["waiting"], false);
 }
 
+/// `hosts.md`: an entry stays "until that device, or the person, takes it
+/// out". Removing a device is the person saying so: a host that was lost,
+/// and so never takes itself out, leaves every list when it is removed, or
+/// contacts would go on leaving messages with whoever holds it.
+#[test]
+fn a_removed_host_leaves_the_lists_that_name_it() {
+    if !fuse_available() {
+        eprintln!("skipping: /dev/fuse or fusermount3 is not available");
+        return;
+    }
+    let root = tempfile::tempdir().unwrap();
+    let ana = person(root.path(), "ana");
+    let mut bo = Dev::new(root.path(), "bo", free_port());
+    bo.start();
+    bo.cli(&["init", "--yes", "--name", "Bo"]);
+    bo.wait_mounted();
+    let mut shelf = Dev::new(root.path(), "shelf", free_port());
+    shelf.start();
+    pair(&bo, &shelf);
+    shelf.wait_mounted();
+    let at = format!("127.0.0.1:{}", shelf.port);
+    shelf.cli(&["host", "--address", &at]);
+    wait("bo knows of his host", 30, || {
+        ask(&bo, json!({"cmd": "status"}))["hosts"] == 1
+    });
+    meet(&ana, &bo, "Bo");
+    let made = ask(
+        &ana,
+        json!({"cmd": "group-create", "name": "Choir", "people": ["Bo"]}),
+    );
+    let g = made["group"].as_str().unwrap().to_owned();
+    wait("the offer arrives", 30, || {
+        offers(&bo).iter().any(|o| o["name"] == "Choir")
+    });
+    let joined = ask(&bo, json!({"cmd": "group-join", "group": g}));
+    assert_eq!(joined["shared"], true, "{joined}");
+    let shared_at = |d: &Dev| {
+        ask(d, json!({"cmd": "groups"}))["groups"]
+            .as_array()
+            .and_then(|all| all.iter().find(|x| x["group"] == g.as_str()).cloned())
+            .is_some_and(|x| x["reach"]["shared"] == true)
+    };
+    wait("the host names itself there", 30, || {
+        shared_at(&bo) && shared_at(&shelf)
+    });
+
+    // The shelf is lost: it never takes itself out.
+    shelf.stop();
+    bo.cli(&["remove-device", "shelf", "--lost"]);
+    wait("the list names it no longer", 30, || {
+        reach_in(&bo, &g)["shared"] == false
+    });
+}
+
 fn standing(d: &Dev) -> Value {
     ask(d, json!({"cmd": "call"}))["call"]["state"].clone()
 }

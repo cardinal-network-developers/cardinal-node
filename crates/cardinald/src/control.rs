@@ -1370,6 +1370,13 @@ async fn remove_device(
     if key == me {
         anyhow::bail!("this is the device you are using; remove it from another of your devices");
     }
+    // Its link key, which is what a list of hosts names it by, while the
+    // log still has it.
+    let link = d.core().identity.as_ref().and_then(|i| {
+        let st = i.state();
+        let k = st.keys.values().find(|k| k.key == key)?;
+        k.link_key.as_ref().map(|l| *l.x25519())
+    });
     // Removals go strictly down in power: an admin removes devices, and
     // only the root (the recovery words) removes an admin.
     let target = d
@@ -1487,6 +1494,10 @@ async fn remove_device(
                 .collect();
             d.write_and_push(&a, ops)?;
         }
+    }
+    // The person removed it: it leaves the lists that name it.
+    if let Some(link) = link {
+        crate::mailbox::take_out_removed(d, &link);
     }
     let dropped = d.core().unwitnessed_by(&key);
     Ok(json!({"name": name, "dropped": dropped}))
