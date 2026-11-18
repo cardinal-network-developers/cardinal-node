@@ -65,7 +65,9 @@ pub fn introduce(d: &Arc<Daemon>, who: &str, to: &str, note: Option<&str>) -> an
             c.petname
         );
     }
-    let op = relationship::create_introduction(&me, &x.identity, &x.petname, note, None, None);
+    // the name they suggest, never this person's own for them
+    let suggested = x.suggested.as_deref().unwrap_or(&x.petname);
+    let op = relationship::create_introduction(&me, &x.identity, suggested, note, None, None);
     d.write_and_push(&b.space, vec![op])?;
     Ok(json!({}))
 }
@@ -231,7 +233,7 @@ pub async fn accept(d: &Arc<Daemon>, id: &str) -> anyhow::Result<Json> {
     let met = met_through(w.from.identity, w.intro.group);
     match &w.intro.invitation {
         None => {
-            let me_as = d.config().name.clone();
+            let me_as = crate::names::my_name(d);
             let invitation = contacts::invite_for(
                 d,
                 None,
@@ -318,7 +320,7 @@ async fn tend(d: &Arc<Daemon>) {
                         None => vec![relationship::create_introduction(
                             &me,
                             &b.identity,
-                            &b.petname,
+                            b.suggested.as_deref().unwrap_or(&b.petname),
                             n.note.as_deref(),
                             n.group.as_ref(),
                             Some(invitation),
@@ -371,6 +373,7 @@ async fn tend(d: &Arc<Daemon>) {
                                     .find(|m| m.identity == b.identity)
                             })
                             .and_then(|m| m.name)
+                            .or_else(|| b.suggested.clone())
                             .unwrap_or_else(|| b.petname.clone());
                         let op = relationship::create_introduction(
                             &me,

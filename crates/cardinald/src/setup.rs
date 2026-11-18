@@ -3,7 +3,8 @@
 //! The identity is created in memory first, so the person can write the
 //! recovery phrase down before anything is saved; [`install`] then writes
 //! the identity log, the account space (this device, the discovery secret,
-//! the files space and where this device shows it) and the files space.
+//! the files space and where this device shows it, and the name the person
+//! suggests for themselves) and the files space.
 
 use std::sync::Arc;
 
@@ -47,7 +48,14 @@ pub fn prepare(paths: &Paths) -> anyhow::Result<Prepared> {
 }
 
 /// Saves a prepared identity and creates the account and files spaces.
-pub fn install(paths: &Paths, prepared: Prepared, config: &Config) -> anyhow::Result<()> {
+/// `person` is the name the person suggests for themselves, kept in the
+/// account's self node; the device is named `config.name`.
+pub fn install(
+    paths: &Paths,
+    prepared: Prepared,
+    config: &Config,
+    person: &str,
+) -> anyhow::Result<()> {
     crate::format::check(paths)?;
     let keys = Arc::new(Keys::load_or_create(&paths.device_key())?);
     let mut core = Core::load(paths, keys.clone())?;
@@ -87,6 +95,7 @@ pub fn install(paths: &Paths, prepared: Prepared, config: &Config) -> anyhow::Re
             account::create_device(&keys.key(), &config.name, false, false),
             create_secret(DISCOVERY_PURPOSE, &secret),
             account::create_space(&files_id, "Cardinal"),
+            account::create_self(person),
         ],
     )?;
     let space_node = created_node(&written[0].0, 2);

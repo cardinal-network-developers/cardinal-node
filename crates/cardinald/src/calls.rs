@@ -571,10 +571,17 @@ pub fn current(d: &Daemon) -> Json {
     } else {
         (None, None, None)
     };
+    // the picture this person sees for them, if any
+    let picture = {
+        let contacts = d.core().contacts();
+        let c = contacts.into_iter().find(|c| c.identity == who);
+        c.and_then(|c| crate::names::shown(d, &c).remove("picture"))
+    };
     json!({"call": {
         "id": hex::encode(id),
         "who": hex::encode(&who[..8]),
         "name": name,
+        "picture": picture,
         "state": standing,
         "seconds": seconds,
         "group": group.then(|| hex::encode(space)),

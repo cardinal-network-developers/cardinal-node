@@ -36,9 +36,14 @@ enum Cmd {
     /// Set up this device as your first device: creates who you are, shows
     /// your 24 recovery words, and creates your synced folder.
     Init {
-        /// This device's name, shown on your other devices.
+        /// Your name: the one you suggest to the people you invite. Asked
+        /// for if not given (with --yes, your login's name).
         #[arg(long)]
         name: Option<String>,
+        /// This device's name, shown on your other devices (default: the
+        /// machine's name).
+        #[arg(long, value_name = "NAME")]
+        device_name: Option<String>,
         /// Do not ask to confirm the recovery words were written down.
         #[arg(long)]
         yes: bool,
@@ -94,6 +99,17 @@ enum Cmd {
         /// devices). Give it on both devices.
         #[arg(long)]
         admin: bool,
+        /// What to call the new device (default: its machine's name). Your
+        /// own name stays as it is.
+        #[arg(long, value_name = "NAME")]
+        device_name: Option<String>,
+    },
+    /// The name you suggest for yourself to the people you invite, and to
+    /// groups; with NAME, change it, on all your devices. Your devices'
+    /// names are separate (`cardinal rename-device`).
+    Me {
+        /// Your new name.
+        name: Option<String>,
     },
     /// List your devices.
     Devices,
@@ -108,7 +124,7 @@ enum Cmd {
         json: bool,
     },
     /// Rename one of your devices. Your other devices show the new name;
-    /// what your contacts call you does not change.
+    /// the name you suggest for yourself (`cardinal me`) does not change.
     RenameDevice {
         /// The device's name or key, as `cardinal devices` shows.
         device: String,
@@ -133,7 +149,8 @@ enum Cmd {
         /// address on the local network.
         #[arg(long)]
         address: Option<String>,
-        /// The name to suggest they know you by.
+        /// The name to suggest they know you by, this once (default: yours,
+        /// as `cardinal me` shows).
         #[arg(long)]
         name: Option<String>,
         /// Do not trust them with your devices' addresses: reach them only
@@ -175,11 +192,14 @@ enum Cmd {
         /// `trust` connects your devices directly if they trust you too.
         /// `hosts-only` stops that. `no-introductions` lets nothing reach
         /// you through them. `refuse` ends everything with them and hides
-        /// them. `name` changes what you call them, and `category` the
-        /// folder they are listed in (People unless you say).
-        #[arg(value_parser = ["trust", "hosts-only", "introductions", "no-introductions", "refuse", "unrefuse", "name", "category"])]
+        /// them. `name` changes what you call them ("" goes back to the name
+        /// they suggest), `picture` the picture you see for them (a file in
+        /// your Cardinal folder or on this computer; "" clears it), and
+        /// `category` the folder they are listed in (People unless you say).
+        #[arg(value_parser = ["trust", "hosts-only", "introductions", "no-introductions", "refuse", "unrefuse", "name", "picture", "category"])]
         setting: String,
-        /// The new name, after `name`, or the category, after `category`.
+        /// The new name, after `name`; the picture, after `picture`; or the
+        /// category, after `category`.
         new_name: Option<String>,
     },
     /// What is in a folder of your Cardinal folder: your files, and beside
@@ -1100,6 +1120,7 @@ async fn free_unnamed(paths: &Paths, delete: bool) -> anyhow::Result<()> {
 async fn init(
     paths: &Paths,
     name: Option<String>,
+    device_name: Option<String>,
     yes: bool,
     on_demand: bool,
     mount: Option<PathBuf>,
@@ -1161,10 +1182,30 @@ async fn init(
         }
     }
     let mut config = Config::load(&paths.config())?;
-    let named = name.is_some();
-    if let Some(n) = name {
+    let named = device_name.is_some();
+    if let Some(n) = device_name
+        .map(|n| n.trim().to_owned())
+        .filter(|n| !n.is_empty())
+    {
         config.name = n;
     }
+    // the person's name, which is not this device's
+    let person = match name.map(|n| n.trim().to_owned()).filter(|n| !n.is_empty()) {
+        Some(n) => n,
+        None if yes => cardinald::config::default_person(),
+        None => {
+            let guess = cardinald::config::default_person();
+            let said = prompt(&format!(
+                "What should people call you? It is the name you suggest to those you \
+                 invite. [{guess}] "
+            ))?;
+            if said.is_empty() {
+                guess
+            } else {
+                said
+            }
+        }
+    };
     if on_demand {
         config.retention = "on-demand".into();
     }
@@ -1189,9 +1230,12 @@ async fn init(
         }
     };
     config.save(&paths.config())?;
-    setup::install(paths, prepared, &config)?;
+    setup::install(paths, prepared, &config, &person)?;
     drop(lock);
-    println!("Set up. This device is \"{}\".", config.name);
+    println!(
+        "Set up. You are \"{person}\" to the people you invite, and this device is \"{}\".",
+        config.name
+    );
     if !named {
         println!(
             "To call it something else: cardinal rename-device \"{}\" <name>",
@@ -1225,9 +1269,13 @@ async fn pair(
     code: Option<String>,
     at: Option<String>,
     admin: bool,
+    device: Option<String>,
 ) -> anyhow::Result<()> {
     if let Some(code) = code {
         let mut req = json!({"cmd": "pair-type", "code": code, "at": at, "admin": admin});
+        if let Some(d) = &device {
+            req["device"] = json!(d);
+        }
         // Only an admin device adds devices; elsewhere the recovery words
         // approve it. Ask before the code times out on the new device.
         let st = call(paths, json!({"cmd": "status"})).await?;
@@ -1249,7 +1297,11 @@ async fn pair(
         );
         return Ok(());
     }
-    let v = call(paths, json!({"cmd": "pair-show", "admin": admin})).await?;
+    let mut req = json!({"cmd": "pair-show", "admin": admin});
+    if let Some(d) = &device {
+        req["device"] = json!(d);
+    }
+    let v = call(paths, req).await?;
     let code = v["code"].as_str().unwrap_or("?");
     println!();
     println!("    {code}");
@@ -1692,10 +1744,21 @@ async fn client(cmd: Cmd) -> anyhow::Result<()> {
     match cmd {
         Cmd::Init {
             name,
+            device_name,
             yes,
             on_demand,
             mount,
-        } => init(&paths, name, yes, on_demand, mount).await,
+        } => init(&paths, name, device_name, yes, on_demand, mount).await,
+        Cmd::Me { name } => {
+            let v = call(&paths, json!({"cmd": "me", "name": name})).await?;
+            let shown = printable(v["name"].as_str().unwrap_or(""));
+            if name.is_some() {
+                println!("You are \"{shown}\" to the people you invite from now on.");
+            } else {
+                println!("{shown}");
+            }
+            Ok(())
+        }
         Cmd::Status { json: raw } => {
             let v = call(&paths, json!({"cmd": "status"})).await?;
             if raw {
@@ -1705,7 +1768,12 @@ async fn client(cmd: Cmd) -> anyhow::Result<()> {
             }
             Ok(())
         }
-        Cmd::Pair { code, at, admin } => pair(&paths, code, at, admin).await,
+        Cmd::Pair {
+            code,
+            at,
+            admin,
+            device_name,
+        } => pair(&paths, code, at, admin, device_name).await,
         Cmd::Devices => {
             let v = call(&paths, json!({"cmd": "devices"})).await?;
             print_devices(&v["devices"]);
@@ -1825,6 +1893,12 @@ async fn client(cmd: Cmd) -> anyhow::Result<()> {
             let v = call(&paths, json!({"cmd": "contacts", "all": all})).await?;
             for c in v["contacts"].as_array().into_iter().flatten() {
                 let mut line = c["name"].as_str().unwrap_or("").to_owned();
+                if c["own"] == false {
+                    line.push_str(" (their name)");
+                }
+                if c["picture"].is_string() {
+                    line.push_str("  picture");
+                }
                 line.push_str(if c["trusted"] == true {
                     "  trusted"
                 } else {
@@ -1850,6 +1924,21 @@ async fn client(cmd: Cmd) -> anyhow::Result<()> {
         } => {
             let req = match (setting.as_str(), new_name) {
                 ("name", Some(name)) => json!({"cmd": "contact", "who": who, "name": name}),
+                ("picture", Some(p)) => {
+                    // a file on this computer, as the service sees it
+                    let here = std::path::Path::new(&p);
+                    let p = match std::env::current_dir() {
+                        Ok(cwd) if !p.is_empty() && !here.is_absolute() && here.is_file() => {
+                            cwd.join(here).display().to_string()
+                        }
+                        _ => p,
+                    };
+                    json!({"cmd": "contact", "who": who, "picture": p})
+                }
+                ("picture", None) => anyhow::bail!(
+                    "say which file: `cardinal contact {who} picture People/{who}/photo.jpg`, \
+                     or \"\" to clear it"
+                ),
                 ("name", None) => {
                     anyhow::bail!("say what to call them: `cardinal contact {who} name NEW`")
                 }
@@ -1859,7 +1948,7 @@ async fn client(cmd: Cmd) -> anyhow::Result<()> {
                         "say where to list them: `cardinal contact {who} category Family`"
                     )
                 }
-                (_, Some(_)) => anyhow::bail!("only `name` and `category` take a value"),
+                (_, Some(_)) => anyhow::bail!("only `name`, `picture` and `category` take a value"),
                 (_, None) => json!({"cmd": "contact", "who": who, "setting": setting}),
             };
             let done = call(&paths, req).await?;

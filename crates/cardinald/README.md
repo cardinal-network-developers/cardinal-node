@@ -339,7 +339,11 @@ same request through. Commands: `status`, `devices`, `remove-device`,
 `keep-old` (`keep`), `peer-add/remove/list`,
 `mount`, `unmount`,
 `history`, `restore`, `conflicts`, `pin`, `unpin`, `retention`,
-`pair-show`, `pair-status`, `pair-type`, `speedtest` (one device, by
+`pair-show`, `pair-status`, `pair-type` (both take `device`, a name for
+the device being added), `setup-finish` (`name`, the person's; `device`),
+`me` (`name` sets the name the person suggests for themselves),
+`contact` (`name`, empty to clear; `picture`, a file, empty to clear),
+`speedtest` (one device, by
 name or key), `reload` (after `init` while the daemon runs), `flush`
 (commit now), `stop`. `status` includes `copies`: per device meant to
 keep everything, whether it counts (`state`: passed, failed, stale,

@@ -105,6 +105,31 @@ fn pick_name(hostname: Option<String>, computer_name: Option<String>) -> String 
         .unwrap_or_else(|| "this device".into())
 }
 
+/// A name for the person, where they were not asked for one: the full name
+/// their login has on this machine, or else the login itself, or else the
+/// machine's name. Only a default: the person changes it with `me`.
+pub fn default_person() -> String {
+    let login = ["USER", "USERNAME", "LOGNAME"]
+        .iter()
+        .filter_map(|v| std::env::var(v).ok())
+        .map(|s| s.trim().to_owned())
+        .find(|s| !s.is_empty());
+    let passwd = std::fs::read_to_string("/etc/passwd").ok();
+    pick_person(login, passwd.as_deref()).unwrap_or_else(default_name)
+}
+
+fn pick_person(login: Option<String>, passwd: Option<&str>) -> Option<String> {
+    let login = login?;
+    // name:x:uid:gid:Full Name,room,phone:home:shell
+    let full = passwd.and_then(|p| {
+        p.lines()
+            .map(|l| l.split(':').collect::<Vec<_>>())
+            .find(|f| f.len() > 4 && f[0] == login)
+            .map(|f| f[4].split(',').next().unwrap_or("").trim().to_owned())
+    });
+    Some(full.filter(|f| !f.is_empty()).unwrap_or(login))
+}
+
 mod opt_path {
     use serde::{Deserialize, Deserializer, Serializer};
     use std::path::PathBuf;
@@ -213,6 +238,18 @@ mod tests {
         assert_eq!(pick_name(s(" \n"), s(" DESK ")), "DESK");
         assert_eq!(pick_name(None, s("")), "this device");
         assert_eq!(pick_name(None, None), "this device");
+    }
+
+    /// A person not asked for their name is given their login's full
+    /// name, or the login, never the machine's name while there is one.
+    #[test]
+    fn a_person_is_named_after_their_login() {
+        let passwd = "root:x:0:0:root:/root:/bin/sh\nana:x:1000:1000:Ana Lima,,,:/home/ana:/bin/sh\nbo:x:1001:1001::/home/bo:/bin/sh\n";
+        let s = |t: &str| Some(t.to_owned());
+        assert_eq!(pick_person(s("ana"), Some(passwd)), s("Ana Lima"));
+        assert_eq!(pick_person(s("bo"), Some(passwd)), s("bo"));
+        assert_eq!(pick_person(s("cy"), None), s("cy"));
+        assert_eq!(pick_person(None, Some(passwd)), None);
     }
 
     /// Every install before UDP worked has this line, from a save.

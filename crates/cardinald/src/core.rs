@@ -2656,6 +2656,14 @@ impl Core {
         self.spaces.values().find(own).map(|h| h.id)
     }
 
+    /// The name the person suggests for themselves, from the account's
+    /// self node, if it has one with a name in it.
+    pub fn self_name(&self) -> Option<String> {
+        let acc = self.account()?.space.as_ref()?;
+        let (_, name) = account::self_node(acc.state())?;
+        (!name.is_empty()).then_some(name)
+    }
+
     /// Device names from the account space.
     pub fn device_names(&self) -> HashMap<KeyId, String> {
         let mut m = HashMap::new();
@@ -2725,7 +2733,7 @@ mod tests {
             let paths = Paths::at(dir.path());
             let p = setup::prepare(&paths).unwrap();
             let root = p.phrase().root_signing_key();
-            setup::install(&paths, p, &Config::default()).unwrap();
+            setup::install(&paths, p, &Config::default(), "Me").unwrap();
             let keys = Arc::new(Keys::load_or_create(&paths.device_key()).unwrap());
             let core = Core::load(&paths, keys).unwrap();
             Person {

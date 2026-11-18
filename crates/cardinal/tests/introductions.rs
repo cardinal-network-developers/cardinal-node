@@ -24,10 +24,15 @@ fn ask(d: &Dev, req: Value) -> Value {
     r
 }
 
+/// Someone whose device is `name`, and who calls themselves the same with a
+/// capital: what an introduction says they are called (D71: a petname is
+/// its person's own, and never passed on).
 fn person(root: &std::path::Path, name: &'static str) -> Dev {
     let mut d = Dev::new(root, name, free_port());
     d.start_with(&["--no-mount"]);
-    d.cli(&["init", "--yes", "--name", name]);
+    let mut called = name.to_owned();
+    called[..1].make_ascii_uppercase();
+    d.cli(&["init", "--yes", "--name", &called]);
     d
 }
 
@@ -37,7 +42,7 @@ fn meet(carol: &Dev, them: &Dev, called: &str) {
     let code = carol.cli(&["invite", "--address", &at, "--name", "Carol"]);
     them.cli(&["accept", code.trim(), "--name", "Carol"]);
     wait("carol lists them", 30, || {
-        carol.cli(&["contacts"]).contains(them.name)
+        carol.cli(&["contacts"]).to_lowercase().contains(them.name)
     });
     ask(
         carol,
@@ -94,11 +99,11 @@ fn an_introduction_makes_two_contacts_of_two_strangers() {
     });
     let i = waiting(&ana)[0].clone();
     ask(&ana, json!({"cmd": "introduction-accept", "id": i["id"]}));
-    wait("ben lists ana", 30, || contact(&ben, "ana").is_some());
+    wait("ben lists ana", 30, || contact(&ben, "Ana").is_some());
     let b = contact(&ana, "Ben").expect("ana lists ben");
     assert_eq!(b["met"]["how"], "introduced", "{b}");
     assert_eq!(b["met"]["by"], "Carol", "{b}");
-    let a = contact(&ben, "ana").unwrap();
+    let a = contact(&ben, "Ana").unwrap();
     assert_eq!(a["met"]["how"], "introduced", "{a}");
     assert_eq!(a["met"]["by"], "Carol", "{a}");
     // Those met by invitation say so.
@@ -165,7 +170,7 @@ fn a_group_introduces_its_members() {
     ask(&ben, json!({"cmd": "introduction-accept", "id": i["id"]}));
     // Ana asked, so her device connects of itself.
     wait("they are contacts", 30, || {
-        contact(&ana, "Ben").is_some() && contact(&ben, "ana").is_some()
+        contact(&ana, "Ben").is_some() && contact(&ben, "Ana").is_some()
     });
     let b = contact(&ana, "Ben").unwrap();
     assert_eq!(b["met"]["group"], "Garden", "{b}");

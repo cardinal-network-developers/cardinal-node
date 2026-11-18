@@ -883,7 +883,7 @@ mod tests {
             let dir = tempfile::tempdir().unwrap();
             let paths = Paths::at(dir.path());
             let p = setup::prepare(&paths).unwrap();
-            setup::install(&paths, p, &Config::default()).unwrap();
+            setup::install(&paths, p, &Config::default(), "Me").unwrap();
             let keys = Arc::new(Keys::load_or_create(&paths.device_key()).unwrap());
             let core = Core::load(&paths, keys.clone()).unwrap();
             let space = core.files_id().unwrap();

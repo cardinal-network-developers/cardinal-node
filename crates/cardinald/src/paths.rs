@@ -162,6 +162,10 @@ impl Paths {
     pub fn old_versions(&self) -> PathBuf {
         self.home.join("old-versions.json")
     }
+    /// Contacts' pictures, as files windows can open (`names.rs`).
+    pub fn pictures(&self) -> PathBuf {
+        self.home.join("pictures")
+    }
 }
 
 /// A path with links resolved and nothing redundant in it, as far as it

@@ -25,10 +25,15 @@ fn ask(d: &Dev, req: Value) -> Value {
     r
 }
 
+/// Someone whose device is `name`, and who calls themselves the same with a
+/// capital: what a group is shown for them, unless whoever adds them says
+/// otherwise (D71: a petname is its person's own).
 fn person(root: &std::path::Path, name: &'static str) -> Dev {
     let mut d = Dev::new(root, name, free_port());
     d.start_with(&["--no-mount"]);
-    d.cli(&["init", "--yes", "--name", name]);
+    let mut called = name.to_owned();
+    called[..1].make_ascii_uppercase();
+    d.cli(&["init", "--yes", "--name", &called]);
     d
 }
 
@@ -38,7 +43,7 @@ fn meet(ana: &Dev, them: &Dev, called: &str) {
     let code = ana.cli(&["invite", "--address", &at, "--name", "Ana"]);
     them.cli(&["accept", code.trim(), "--name", "Ana"]);
     wait("ana lists them", 30, || {
-        ana.cli(&["contacts"]).contains(them.name)
+        ana.cli(&["contacts"]).to_lowercase().contains(them.name)
     });
     ask(
         ana,

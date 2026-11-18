@@ -28,6 +28,7 @@ pub mod keys;
 pub mod lock;
 pub mod mailbox;
 pub mod mesh;
+pub mod names;
 pub mod net;
 pub mod news;
 pub mod onefolder;
@@ -59,7 +60,7 @@ pub(crate) mod testing {
         config.this_run.no_discovery = true;
         config.this_run.no_udp = true;
         let p = crate::setup::prepare(&paths).unwrap();
-        crate::setup::install(&paths, p, &config).unwrap();
+        crate::setup::install(&paths, p, &config, "Me").unwrap();
         (paths, config)
     }
 }

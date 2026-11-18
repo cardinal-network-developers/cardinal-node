@@ -106,7 +106,8 @@ pub(crate) fn invite_for(
     };
     let endpoint = EndpointAddr::new(CarrierKind::Udp, addr);
     let mut invitation = Invitation::new(me, responder, endpoint);
-    invitation.name = name.map(str::to_owned);
+    // the name this person suggests for themselves, unless told another
+    invitation.name = Some(name.map_or_else(|| crate::names::my_name(d), str::to_owned));
     invitation.for_identity = for_identity;
     let account = d
         .core()
@@ -399,7 +400,7 @@ async fn accept_exchange(
     let mut st = s.open_stream(Service::CONTACT, Priority::Interactive)?;
     let hello = ContactMessage::Hello {
         identity: me,
-        name: d.config().name.clone(),
+        name: crate::names::my_name(d),
     };
     send(&mut st, &hello).await?;
     let Some(ContactMessage::Genesis(genesis)) = receive(&mut st).await? else {
@@ -417,7 +418,16 @@ async fn accept_exchange(
     d.invited_to(s, space);
     mailbox::say_reach(d, &space, true).await?;
     net::reconcile(d, s, space).await?;
-    record_contact(d, &invitation.inviter, petname, &space, regard, Some(met))?;
+    let suggested = invitation.name.as_deref();
+    record_contact(
+        d,
+        &invitation.inviter,
+        petname,
+        suggested,
+        &space,
+        regard,
+        Some(met),
+    )?;
     mailbox::met(d, &space, &invitation.inviter);
     send(&mut st, &ContactMessage::Done).await?;
     st.shutdown().await?;
@@ -509,7 +519,7 @@ pub async fn serve(d: &Arc<Daemon>, s: &Session, mut st: Stream) -> anyhow::Resu
         if let Err(e) = invitation_used(d, s, &them) {
             tracing::debug!("counting an invitation's use: {e:#}");
         }
-        record_contact(d, &them, &name, &space, regard, Some(&met))?;
+        record_contact(d, &them, &name, Some(&name), &space, regard, Some(&met))?;
         // The account counts it now.
         drop(using);
         mailbox::met(d, &space, &them);
@@ -552,6 +562,7 @@ fn record_contact(
     d: &Arc<Daemon>,
     who: &[u8; 32],
     petname: &str,
+    suggested: Option<&str>,
     space: &SpaceId,
     regard: Regard,
     met: Option<&account::Met>,
@@ -560,7 +571,7 @@ fn record_contact(
         .core()
         .account_id()
         .ok_or_else(|| anyhow::anyhow!("the account space is not here yet"))?;
-    let op = account::create_contact_met(who, petname, space, regard, met);
+    let op = account::create_contact_suggesting(who, petname, suggested, space, regard, met);
     d.write_and_push(&account, vec![op])?;
     // Just met: they will want to talk.
     d.rendezvous.use_contact(who);
@@ -601,11 +612,24 @@ pub fn set(d: &Arc<Daemon>, who: &str, setting: &str) -> anyhow::Result<Json> {
 }
 
 /// Changes what this person calls a contact. Only their own devices hear of
-/// it, and the contact is told nothing.
+/// it, and the contact is told nothing. An empty name clears the petname:
+/// the contact is then shown by the name they suggest, as theirs.
 pub fn rename(d: &Arc<Daemon>, who: &str, name: &str) -> anyhow::Result<Json> {
     let contact = find(d, who)?;
     let name = name.trim();
-    anyhow::ensure!(!name.is_empty(), "a name cannot be empty");
+    if name.is_empty() {
+        let account = d
+            .core()
+            .account_id()
+            .ok_or_else(|| anyhow::anyhow!("the account space is not here yet"))?;
+        // Empty, not absent: a release before this one reads a contact
+        // without a petname as no contact at all.
+        let op = account::set_field(contact.node, account::PETNAME, "");
+        d.write_and_push(&account, vec![op])?;
+        let c = find(d, &hex::encode(&contact.identity[..8]))?;
+        return Ok(Json::Object(crate::names::shown(d, &c)));
+    }
+    anyhow::ensure!(!name.contains('\n'), "a name is one line");
     // Two people with one name could be told apart only by their ids.
     let taken =
         d.core().contacts().into_iter().any(|c| {
@@ -677,9 +701,8 @@ pub fn list(d: &Daemon, all: bool) -> Json {
         .iter()
         .filter(|c| all || !c.refused)
         .map(|c| {
-            json!({
+            let v = json!({
                 "met": c.met.as_ref().map(|m| met_json(m, &everyone, &group_names)),
-                "name": c.petname,
                 "identity": hex::encode(&c.identity[..8]),
                 "trusted": c.regard.trusted,
                 "introductions": c.regard.introductions,
@@ -687,7 +710,8 @@ pub fn list(d: &Daemon, all: bool) -> Json {
                 "category": c.category,
                 "connected": connected.contains(&c.identity),
                 "relayed": relayed.contains(&c.identity),
-            })
+            });
+            crate::names::with_shown(d, c, v)
         })
         .collect();
     json!({"contacts": contacts})
@@ -715,7 +739,7 @@ fn met_json(m: &account::Met, contacts: &[ContactRecord], groups: &[(SpaceId, St
 }
 
 /// The contact called `who`.
-fn find(d: &Daemon, who: &str) -> anyhow::Result<ContactRecord> {
+pub(crate) fn find(d: &Daemon, who: &str) -> anyhow::Result<ContactRecord> {
     let w = who.to_lowercase();
     let contacts = d.core().contacts();
     let named =
@@ -1296,7 +1320,6 @@ pub fn conversations(d: &Daemon) -> Json {
             // The author's own clock: it may not pin them to the top.
             let when = last.and_then(|m| m.time).map(|t| t.min(now_ms()));
             let conversation = json!({
-                "name": c.petname,
                 "id": hex::encode(&c.identity[..8]),
                 "trusted": c.regard.trusted,
                 "introductions": c.regard.introductions,
@@ -1309,7 +1332,7 @@ pub fn conversations(d: &Daemon) -> Json {
                     "time": m.time,
                 })),
             });
-            (when, conversation)
+            (when, crate::names::with_shown(d, c, conversation))
         })
         .collect();
     found.sort_by_key(|(when, _)| std::cmp::Reverse(*when));

@@ -199,7 +199,9 @@ fn a_client_can_set_up_a_first_device() {
         json!({"cmd": "setup-finish", "name": "Ana", "answers": answers}),
     );
     wait("set up", 20, || !a.status()["identity"].is_null());
-    assert_eq!(a.status()["name"], "Ana");
+    // `name` is the person's; the device keeps its own (D71).
+    assert_eq!(ask(&a, json!({"cmd": "me"}))["name"], "Ana");
+    assert_eq!(a.status()["name"], "ana");
     wait("mounted", 20, || !a.status()["mounted"].is_null());
     std::fs::write(a.p("hello.txt"), "works").unwrap();
     assert_eq!(read(&a.p("hello.txt")).unwrap(), "works");
@@ -258,7 +260,8 @@ fn a_contact_can_be_renamed() {
     }
     let root = tempfile::tempdir().unwrap();
     let (a, b) = met(root.path());
-    // Bo's device gave its own name, and that is all Ana has to go on.
+    // Bo gave the name he suggests for himself, and that is all Ana has to
+    // go on.
     assert_eq!(only(&a)["name"], "bo");
     let bo = only(&a)["id"].as_str().unwrap().to_owned();
 
@@ -275,8 +278,14 @@ fn a_contact_can_be_renamed() {
     );
     assert_eq!(only(&b)["name"], "Ana");
 
-    let empty = turned_down(&a, json!({"cmd": "contact", "who": bo, "name": "  "}));
-    assert!(empty.contains("empty"), "{empty}");
+    // An empty name is no name: Ana sees what Bo calls himself, as his.
+    let cleared = ask(&a, json!({"cmd": "contact", "who": bo, "name": "  "}));
+    assert_eq!(
+        (&cleared["name"], &cleared["own"]),
+        (&json!("bo"), &json!(false))
+    );
+    assert_eq!(only(&a)["own"], false);
+    ask(&a, json!({"cmd": "contact", "who": bo, "name": "Bo Smith"}));
 
     let c = person(root.path(), "cy");
     let at = format!("127.0.0.1:{}", a.port);

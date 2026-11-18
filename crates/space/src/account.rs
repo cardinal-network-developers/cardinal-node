@@ -25,6 +25,8 @@ pub const PLACEMENT: u64 = 7;
 pub const INVITATION: u64 = 10;
 /// Invitation use kind (under an invitation node).
 pub const INVITATION_USE: u64 = 11;
+/// Self kind: the name this person suggests for themselves.
+pub const SELF: u64 = 13;
 
 /// An invitation's field: the inviter cancelled it.
 pub const CANCELLED: u64 = 2;
@@ -41,6 +43,10 @@ pub const REFUSED: u64 = 8;
 pub const CATEGORY: u64 = 9;
 /// Contact field: how the two met.
 pub const MET: u64 = 10;
+/// Contact field: this person's own picture for them (a blob reference).
+pub const PICTURE: u64 = 11;
+/// Contact field: the name they suggest for themselves, as last heard.
+pub const SUGGESTED: u64 = 12;
 /// Where a relationship is listed when nothing else is said.
 pub const PEOPLE: &str = "People";
 
@@ -126,6 +132,19 @@ pub fn create_contact_met(
     regard: Regard,
     met: Option<&Met>,
 ) -> SpaceOp {
+    create_contact_suggesting(identity, petname, None, space, regard, met)
+}
+
+/// `create` of a contact node, with how the two met and the name they
+/// suggested for themselves (field 12).
+pub fn create_contact_suggesting(
+    identity: &IdentityId,
+    petname: &str,
+    suggested: Option<&str>,
+    space: &SpaceId,
+    regard: Regard,
+    met: Option<&Met>,
+) -> SpaceOp {
     SpaceOp::create(
         NodeKind::Uint(CONTACT),
         ROOT,
@@ -136,8 +155,34 @@ pub fn create_contact_met(
             .with(3, *space)
             .with(INTRODUCTIONS, regard.introductions)
             .with(TRUSTED, regard.trusted)
-            .with_opt(MET, met.map(|m| Value::Record(m.to_record()))),
+            .with_opt(MET, met.map(|m| Value::Record(m.to_record())))
+            .with_opt(SUGGESTED, suggested.filter(|s| !s.trim().is_empty())),
     )
+}
+
+/// `create` of the self node (`profiles.md#account`): the name this
+/// person suggests for themselves.
+pub fn create_self(name: &str) -> SpaceOp {
+    SpaceOp::create(
+        NodeKind::Uint(SELF),
+        ROOT,
+        "self",
+        Record::new().with(1, name),
+    )
+}
+
+/// The self node, and the name it holds: where there are two, made at
+/// once, the one with the lowest node id.
+pub fn self_node(state: &State) -> Option<(NodeId, String)> {
+    let mut all: Vec<_> = state
+        .children(&ROOT)
+        .into_iter()
+        .filter(|n| n.kind == NodeKind::Uint(SELF) && !n.deleted)
+        .collect();
+    all.sort_by_key(|n| n.id);
+    let n = all.first()?;
+    let name = last(n, 1).and_then(Value::as_text).unwrap_or("").trim();
+    Some((n.id, name.to_owned()))
 }
 
 /// How two people met (`profiles.md#account`): kept so that if an
@@ -394,8 +439,16 @@ pub struct ContactRecord {
     pub node: NodeId,
     /// Their identity.
     pub identity: IdentityId,
-    /// What this person calls them.
+    /// What this person sees them as: their petname, or where they have
+    /// none the name they suggest, or else the start of their id.
     pub petname: String,
+    /// Whether `petname` is this person's own (field 2), and not the name
+    /// they suggest for themselves.
+    pub own: bool,
+    /// The name they suggest for themselves, as last heard (field 12).
+    pub suggested: Option<String>,
+    /// This person's own picture for them (field 11): a blob reference.
+    pub picture: Option<Record>,
     /// The relationship space.
     pub space: SpaceId,
     /// How this person regards them.
@@ -424,10 +477,25 @@ pub fn contacts(state: &State) -> Vec<ContactRecord> {
         .filter(|n| n.kind == NodeKind::Uint(CONTACT) && !n.deleted)
         .filter_map(|n| {
             let flag = |key| last(n, key).and_then(Value::as_bool);
+            let text = |key| {
+                last(n, key)
+                    .and_then(Value::as_text)
+                    .map(str::trim)
+                    .filter(|t| !t.is_empty())
+                    .map(str::to_owned)
+            };
+            let identity: IdentityId = last(n, 1)?.as_bytes()?.try_into().ok()?;
+            let own = text(PETNAME);
+            let suggested = text(SUGGESTED);
             Some(ContactRecord {
                 node: n.id,
-                identity: last(n, 1)?.as_bytes()?.try_into().ok()?,
-                petname: last(n, 2)?.as_text()?.to_owned(),
+                identity,
+                own: own.is_some(),
+                petname: own
+                    .or_else(|| suggested.clone())
+                    .unwrap_or_else(|| short_key(&identity)),
+                suggested,
+                picture: last(n, PICTURE).and_then(Value::as_record).cloned(),
                 space: last(n, 3)?.as_bytes()?.try_into().ok()?,
                 regard: Regard {
                     trusted: flag(TRUSTED).unwrap_or(false),

@@ -84,13 +84,14 @@ fn a_device_is_renamed_from_any_of_the_persons_devices() {
             && names(&a).len() == 2
             && names(&b).len() == 2
     });
-    // The first device is named after its person until renamed.
-    assert_eq!(names(&a)[0], "Ana");
+    // The first device is named after its machine (here, the name it runs
+    // with), not after its person, until renamed.
+    assert_eq!(names(&a)[0], "alpha");
 
     // This device, by its own name.
     let r = ask(
         &a,
-        json!({"cmd": "device-rename", "device": "Ana", "name": " Laptop "}),
+        json!({"cmd": "device-rename", "device": "alpha", "name": " Laptop "}),
     );
     assert_eq!(r["name"], "Laptop");
     assert_eq!(names(&a)[0], "Laptop");
@@ -153,11 +154,12 @@ fn a_device_is_renamed_from_any_of_the_persons_devices() {
     assert!(missing.contains("name"), "{missing}");
     // Renaming a device writes nothing about the person: the name others
     // are given stays.
-    assert_eq!(a.status()["name"], "Ana");
+    assert_eq!(ask(&a, json!({"cmd": "me"}))["name"], "Ana");
 }
 
-/// A machine set up without `--name` is named after its host; the command
-/// line renames it, by its current name, and says what it is called now.
+/// A machine is named after its host, whatever its person is called; the
+/// command line renames it, by its current name, and says what it is
+/// called now.
 #[test]
 fn the_command_line_renames_a_device() {
     if !fuse_available() {
@@ -169,7 +171,7 @@ fn the_command_line_renames_a_device() {
     a.start();
     a.cli(&["init", "--yes", "--name", "Ana"]);
     a.wait_mounted();
-    let out = a.cli(&["rename-device", "Ana", "Kitchen laptop"]);
+    let out = a.cli(&["rename-device", "alpha", "Kitchen laptop"]);
     assert!(out.contains("Kitchen laptop"), "{out}");
     assert_eq!(names(&a), ["Kitchen laptop"]);
     let devices = a.cli(&["devices"]);

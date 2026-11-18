@@ -123,6 +123,14 @@ fn people(d: &Daemon, who: &[String]) -> anyhow::Result<Vec<ContactRecord>> {
     who.iter().map(|w| contacts::listed(d, w)).collect()
 }
 
+/// The name the others in a group are shown for a contact, unless the adder
+/// says another: the one they suggest for themselves, since a petname is
+/// this person's own (`profiles.md#account`). A contact recorded before
+/// that was kept is shown by the petname, which began as the same.
+fn offered_as(c: &ContactRecord) -> &str {
+    c.suggested.as_deref().unwrap_or(&c.petname)
+}
+
 /// Puts an offer of a group in the relationship space with each of `to`.
 fn offer(d: &Arc<Daemon>, id: &SpaceId, name: &str, to: &[ContactRecord]) -> anyhow::Result<()> {
     for c in to {
@@ -137,10 +145,10 @@ pub fn create(d: &Arc<Daemon>, name: &str, who: &[String]) -> anyhow::Result<Jso
     let name = name.trim();
     anyhow::ensure!(!name.is_empty(), "a group needs a name");
     let theirs = people(d, who)?;
-    let me_as = d.config().name.clone();
+    let me_as = crate::names::my_name(d);
     let members: Vec<([u8; 32], String)> = theirs
         .iter()
-        .map(|c| (c.identity, c.petname.clone()))
+        .map(|c| (c.identity, offered_as(c).to_owned()))
         .collect();
     let id = d.core().create_group(name, &me_as, &members)?;
     let genesis = {
@@ -180,7 +188,7 @@ pub fn add(
     let members: Vec<([u8; 32], String)> = theirs
         .iter()
         .map(|c| {
-            let name = shown.filter(|_| theirs.len() == 1).unwrap_or(&c.petname);
+            let name = shown.filter(|_| theirs.len() == 1).unwrap_or(offered_as(c));
             (c.identity, name.to_owned())
         })
         .collect();
@@ -526,10 +534,11 @@ pub fn members(d: &Daemon, group: &str) -> anyhow::Result<Json> {
     let out: Vec<Json> = members
         .iter()
         .map(|m| {
-            let contact = contacts
+            let known = contacts
                 .iter()
-                .any(|c| c.identity == m.identity && !c.refused);
-            json!({
+                .find(|c| c.identity == m.identity && !c.refused);
+            let contact = known.is_some();
+            let v = json!({
                 "name": name_of(&me, &contacts, &members, &m.identity),
                 "shown": m.name,
                 "id": hex::encode(&m.identity[..8]),
@@ -543,7 +552,16 @@ pub fn members(d: &Daemon, group: &str) -> anyhow::Result<Json> {
                 },
                 "introduce": m.introduce,
                 "left": m.left,
-            })
+            });
+            // a contact's as this person sees them: own name, picture
+            match known {
+                Some(c) => {
+                    let mut v = crate::names::with_shown(d, c, v);
+                    v["name"] = json!(name_of(&me, &contacts, &members, &m.identity));
+                    v
+                }
+                None => v,
+            }
         })
         .collect();
     Ok(json!({"group": hex::encode(g.id), "name": g.name, "members": out}))
@@ -635,7 +653,12 @@ pub fn messages(d: &Daemon, group: &str) -> anyhow::Result<Json> {
         .map(|(i, m)| {
             let mine = m.author == me;
             let read = others.iter().filter(|o| read_by[*o][i]).count();
+            let picture = contacts
+                .iter()
+                .find(|c| c.identity == m.author && !c.refused && !mine)
+                .and_then(|c| crate::names::shown(d, c).remove("picture"));
             json!({
+                "picture": picture,
                 "id": hex::encode(m.id),
                 "mine": mine,
                 "from": name_of(&me, &contacts, &members, &m.author),

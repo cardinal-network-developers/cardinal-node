@@ -1152,3 +1152,86 @@ fn two_hosts_setting_the_reach_list_at_once_are_each_one_host() {
         .unwrap();
     assert!(reach_of(&space, &me).is_empty());
 }
+
+/// D71 (`profiles.md#account`, kind 13). Where two self nodes were made at
+/// once, every device reads the one with the lowest node id, whichever
+/// came first. A contact's petname absent or empty is none: the name they
+/// suggest is shown, marked as theirs.
+#[test]
+fn the_lowest_self_node_counts_and_a_petname_may_be_none() {
+    use cardinal_space::account::{Regard, PETNAME};
+    let p = person(6, 1);
+    let d0 = &p.devices[0];
+    let (mut acct, _) = Space::create(
+        Profile::ACCOUNT,
+        Policy::default(),
+        &p.log,
+        &d0.signing,
+        &[p.enc.public_key()],
+        None,
+    )
+    .unwrap();
+    assert_eq!(account::self_node(acct.state()), None);
+    let (first, _) = acct
+        .write_entry(&p.log, &d0.signing, vec![account::create_self("Ana")], None)
+        .unwrap();
+    let (second, _) = acct
+        .write_entry(
+            &p.log,
+            &d0.signing,
+            vec![account::create_self("Ana L")],
+            None,
+        )
+        .unwrap();
+    let (a, b) = (
+        files::created_node(&first, 0),
+        files::created_node(&second, 0),
+    );
+    let lowest = if a < b { (a, "Ana") } else { (b, "Ana L") };
+    assert_eq!(
+        account::self_node(acct.state()),
+        Some((lowest.0, lowest.1.to_owned()))
+    );
+
+    let (cy, bo) = ([3u8; 32], [4u8; 32]);
+    let ops = vec![
+        account::create_contact_suggesting(
+            &cy,
+            "Cousin",
+            Some("Cy"),
+            &[7; 32],
+            Regard::default(),
+            None,
+        ),
+        // as a release before kept it: no suggested name
+        account::create_contact(&bo, "Bo", &[8; 32], Regard::default()),
+    ];
+    let (made, _) = acct.write_entry(&p.log, &d0.signing, ops, None).unwrap();
+    let shown = |st: &cardinal_space::State| {
+        let mut v: Vec<(String, bool, Option<String>)> = account::contacts(st)
+            .into_iter()
+            .map(|c| (c.petname, c.own, c.suggested))
+            .collect();
+        v.sort();
+        v
+    };
+    assert_eq!(
+        shown(acct.state()),
+        [
+            ("Bo".to_owned(), true, None),
+            ("Cousin".to_owned(), true, Some("Cy".to_owned()))
+        ]
+    );
+    let clear = account::set_field(files::created_node(&made, 0), PETNAME, "");
+    let absent = SpaceOp::set(files::created_node(&made, 1), PETNAME, None);
+    acct.write(&p.log, &d0.signing, vec![clear, absent], None)
+        .unwrap();
+    // Bo suggested nothing that was kept: the start of their id.
+    assert_eq!(
+        shown(acct.state()),
+        [
+            ("04040404".to_owned(), false, None),
+            ("Cy".to_owned(), false, Some("Cy".to_owned()))
+        ]
+    );
+}

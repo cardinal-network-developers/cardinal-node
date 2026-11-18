@@ -25,8 +25,15 @@ fn old_bin() -> Option<PathBuf> {
 fn old_device(root: &Path, name: &'static str, old: &Path) -> Dev {
     let mut d = Dev::new(root, name, free_port());
     d.bin = old.to_owned();
+    // Another build: a release, or the one before, while the version is
+    // not yet raised.
     let version = d.cli(&["version"]);
-    assert!(!version.contains(env!("CARGO_PKG_VERSION")), "{version}");
+    let this = std::process::Command::new(BIN)
+        .arg("version")
+        .output()
+        .unwrap();
+    let this = String::from_utf8_lossy(&this.stdout).into_owned();
+    assert_ne!(version, this, "the old binary is this one");
     d
 }
 
@@ -188,5 +195,64 @@ fn a_new_device_with_an_old_host() {
     eprintln!("say: {said}");
     both_ways(&ana, &host, "after-a-hosts-only-contact");
     no_panic(&host);
+    no_panic(&ana);
+}
+
+/// What `contacts` on `d` lists for the one contact it has, as JSON.
+fn only_contact(d: &Dev) -> serde_json::Value {
+    let v = control(d, serde_json::json!({"cmd": "contacts"}));
+    v["contacts"][0].clone()
+}
+
+fn control(d: &Dev, req: serde_json::Value) -> serde_json::Value {
+    use std::io::{BufRead, BufReader, Write};
+    let mut s = std::os::unix::net::UnixStream::connect(d.home.join("control.sock")).unwrap();
+    writeln!(s, "{req}").unwrap();
+    let mut line = String::new();
+    BufReader::new(s).read_line(&mut line).unwrap();
+    let v: serde_json::Value = serde_json::from_str(&line).unwrap();
+    assert_eq!(v["ok"], true, "{req} got {v}");
+    v
+}
+
+/// An account made before the self node (D71) has none: its person is
+/// suggested by the device's name until they set theirs, and `me` then
+/// makes the node, on any of their devices, old or new.
+#[test]
+fn an_old_account_gets_a_name_of_its_own() {
+    let Some(old) = old_bin() else { return };
+    let root = tempfile::tempdir().unwrap();
+    let mut ana = old_device(root.path(), "ana-laptop", &old);
+    let mut phone = old_device(root.path(), "ana-phone", &old);
+    first(&mut ana);
+    phone.start();
+    pair(&ana, &phone);
+    update(&mut ana);
+    let me = control(&ana, serde_json::json!({"cmd": "me"}));
+    assert_eq!(me["name"], "ana-laptop", "{me}");
+    assert_eq!(me["set"], false, "{me}");
+
+    let mut bo = Dev::new(root.path(), "bo", free_port());
+    first(&mut bo);
+    let at = format!("127.0.0.1:{}", ana.port);
+    let code = ana.cli(&["invite", "--address", &at]);
+    bo.cli(&["accept", code.trim()]);
+    assert_eq!(only_contact(&bo)["suggested"], "ana-laptop");
+
+    // Set on the updated device: the old one keeps syncing beside it.
+    let set = control(&ana, serde_json::json!({"cmd": "me", "name": "Ana"}));
+    assert_eq!(set["set"], true);
+    both_ways(&ana, &phone, "after-a-self-node");
+    let mut cy = Dev::new(root.path(), "cy", free_port());
+    first(&mut cy);
+    let code = ana.cli(&["invite", "--address", &at]);
+    cy.cli(&["accept", code.trim()]);
+    assert_eq!(only_contact(&cy)["suggested"], "Ana");
+    // The phone, updated, has it from the account.
+    update(&mut phone);
+    wait("the phone has the name", 30, || {
+        control(&phone, serde_json::json!({"cmd": "me"}))["name"] == "Ana"
+    });
+    no_panic(&phone);
     no_panic(&ana);
 }

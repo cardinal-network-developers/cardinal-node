@@ -201,6 +201,7 @@ async fn handle(d: &Arc<Daemon>, req: &Value) -> anyhow::Result<Value> {
         "hello" => Ok(json!({"api": API, "version": env!("CARGO_PKG_VERSION")})),
         "setup-begin" => setup_begin(d),
         "setup-finish" => setup_finish(d, req),
+        "me" => crate::names::me(d, req.get("name").and_then(|v| v.as_str())),
         "status" => Ok(status(d)),
         "devices" => Ok(json!({"devices": devices(d)})),
         "stop" => {
@@ -228,6 +229,10 @@ async fn handle(d: &Arc<Daemon>, req: &Value) -> anyhow::Result<Value> {
         }
         "pair-show" => {
             let admin = req.get("admin").and_then(|v| v.as_bool()).unwrap_or(false);
+            // what to call this device, where the window knows better
+            if let Some(name) = device_name(req)? {
+                rename_this_device(d, &name)?;
+            }
             let s = crate::pair::show(d, admin).await?;
             Ok(
                 json!({"code": s.code, "addrs": s.addrs.iter().map(|a| a.to_string()).collect::<Vec<_>>() }),
@@ -261,7 +266,9 @@ async fn handle(d: &Arc<Daemon>, req: &Value) -> anyhow::Result<Value> {
                 None => None,
             };
             let admin = req.get("admin").and_then(|v| v.as_bool()).unwrap_or(false);
-            let name = crate::pair::type_code(d, code, at, admin, words(req)).await?;
+            let device = device_name(req)?;
+            let name =
+                crate::pair::type_code(d, code, at, admin, words(req), device.as_deref()).await?;
             Ok(json!({"name": name}))
         }
         "device-rename" => rename_device(d, arg(req, "device")?, arg(req, "name")?),
@@ -294,6 +301,10 @@ async fn handle(d: &Arc<Daemon>, req: &Value) -> anyhow::Result<Value> {
             req.get("category").and_then(|v| v.as_str()),
         ) {
             (Some(name), _) => crate::contacts::rename(d, arg(req, "who")?, name),
+            (None, _) if req.get("picture").is_some() => {
+                let from = req.get("picture").and_then(|v| v.as_str()).unwrap_or("");
+                crate::names::set_picture(d, arg(req, "who")?, from).await
+            }
             (None, Some(category)) => crate::contacts::set_category(d, arg(req, "who")?, category),
             (None, None) => crate::contacts::set(d, arg(req, "who")?, arg(req, "setting")?),
         },
@@ -723,15 +734,49 @@ fn setup_finish(d: &Arc<Daemon>, req: &Value) -> anyhow::Result<Value> {
     });
     anyhow::ensure!(matches, "that does not match; check what you wrote down");
     let mut config = crate::config::Config::load(&d.paths.config())?;
-    if let Some(name) = req["name"].as_str().filter(|n| !n.trim().is_empty()) {
-        config.name = name.trim().to_owned();
+    // `name` is the person's, the name they suggest for themselves; the
+    // device keeps its machine's name unless the window knows a better one.
+    if let Some(device) = device_name(req)? {
+        config.name = device;
     }
+    let person = req["name"]
+        .as_str()
+        .map(str::trim)
+        .filter(|n| !n.is_empty())
+        .map(str::to_owned)
+        .unwrap_or_else(crate::config::default_person);
+    anyhow::ensure!(!person.contains('\n'), "a name is one line");
     let (prepared, _) = held.take().expect("checked above");
     drop(held);
-    crate::setup::install(&d.paths, prepared, &config)?;
+    crate::setup::install(&d.paths, prepared, &config, &person)?;
     config.save(&d.paths.config())?;
     reload(d)?;
-    Ok(json!({"name": config.name}))
+    Ok(json!({"name": person, "device": config.name}))
+}
+
+/// The `device` a window gives, the name it knows this device by: one
+/// line, and not empty if given.
+fn device_name(req: &Value) -> anyhow::Result<Option<String>> {
+    let Some(name) = req.get("device").and_then(|v| v.as_str()) else {
+        return Ok(None);
+    };
+    let name = name.trim();
+    if name.is_empty() {
+        return Ok(None);
+    }
+    anyhow::ensure!(!name.contains('\n'), "a device's name is one line");
+    Ok(Some(name.to_owned()))
+}
+
+/// Names this device, before it belongs to anyone: in its settings, which
+/// is what it says it is when it is paired.
+fn rename_this_device(d: &Daemon, name: &str) -> anyhow::Result<()> {
+    let mut config = crate::config::Config::load(&d.paths.config())?;
+    config.name = name.to_owned();
+    config.this_run = d.config().this_run.clone();
+    config.save(&d.paths.config())?;
+    d.config().name = name.to_owned();
+    Ok(())
 }
 
 fn devices(d: &Daemon) -> Vec<Value> {

@@ -117,14 +117,16 @@ pub async fn show(d: &Arc<Daemon>, admin: bool) -> anyhow::Result<Shown> {
     })
 }
 
-/// Types a code shown by a new device and adds that device. Returns the
-/// new device's name.
+/// Types a code shown by a new device and adds that device, named `device`
+/// if given and else as it names itself. Returns the new device's name.
+/// Neither changes the name the person suggests for themselves.
 pub async fn type_code(
     d: &Arc<Daemon>,
     code: &str,
     at: Option<SocketAddr>,
     admin: bool,
     words: Option<&str>,
+    device: Option<&str>,
 ) -> anyhow::Result<String> {
     let identity = d.core().identity.as_ref().map(|i| i.id()).ok_or_else(|| {
         anyhow::anyhow!(
@@ -166,9 +168,12 @@ pub async fn type_code(
             }
             e => anyhow::anyhow!("pairing failed: {e}"),
         })?;
-    let nd = paired.new_device.clone().ok_or_else(|| {
+    let mut nd = paired.new_device.clone().ok_or_else(|| {
         anyhow::anyhow!("that device already belongs to someone; it cannot be added")
     })?;
+    if let Some(name) = device {
+        nd.name = name.to_owned();
+    }
     let power = if admin {
         Power::Admin
     } else {

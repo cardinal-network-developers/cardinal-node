@@ -225,8 +225,21 @@ pub fn pair(a: &Dev, b: &Dev) {
 /// `admin`), and `a` types it, with `stdin` as its input (the recovery
 /// words, when `a` is not an admin device). Returns what `a` printed.
 pub fn pair_as(a: &Dev, b: &Dev, admin: bool, stdin: Option<&str>) -> String {
+    pair_with(a, b, admin, stdin, &[], &[])
+}
+
+/// [`pair_as`], with more arguments for the device that shows the code
+/// (`shows`) and the one that types it (`types`).
+pub fn pair_with(
+    a: &Dev,
+    b: &Dev,
+    admin: bool,
+    stdin: Option<&str>,
+    shows: &[&str],
+    types: &[&str],
+) -> String {
     let mut shower = b.cmd();
-    shower.arg("pair");
+    shower.arg("pair").args(shows);
     if admin {
         shower.arg("--admin");
     }
@@ -256,7 +269,9 @@ pub fn pair_as(a: &Dev, b: &Dev, admin: bool, stdin: Option<&str>) -> String {
         }
     }
     let (code, at) = (code.unwrap(), at.unwrap());
-    let o = a.cli_input(&["pair", &code, "--at", &at], stdin.unwrap_or(""));
+    let mut typing = vec!["pair", &code, "--at", &at];
+    typing.extend_from_slice(types);
+    let o = a.cli_input(&typing, stdin.unwrap_or(""));
     let typed = String::from_utf8_lossy(&o.stdout).into_owned();
     assert!(
         o.status.success(),
