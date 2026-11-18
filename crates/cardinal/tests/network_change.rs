@@ -40,6 +40,20 @@ fn signal(d: &Dev, sig: &str) {
     assert!(ok.success());
 }
 
+/// Whether every thread of `d`'s daemon is stopped, as the kernel says.
+fn all_stopped(d: &Dev) -> bool {
+    let pid = d.child.as_ref().unwrap().id();
+    let Ok(tasks) = std::fs::read_dir(format!("/proc/{pid}/task")) else {
+        return false;
+    };
+    tasks.flatten().all(|t| {
+        let stat = std::fs::read_to_string(t.path().join("stat")).unwrap_or_default();
+        // The state follows the command name, which is in parentheses.
+        let state = stat.rsplit_once(") ").map(|(_, rest)| rest.chars().next());
+        state == Some(Some('T'))
+    })
+}
+
 #[test]
 fn a_changed_network_finds_dead_sessions_in_seconds() {
     let root = tempfile::tempdir().unwrap();
@@ -51,7 +65,10 @@ fn a_changed_network_finds_dead_sessions_in_seconds() {
     wait("connected", 30, || connected(&a));
 
     // Bo's device stops answering, as one left behind on the old network does.
+    // `kill` returns before every thread of it has stopped, and one still
+    // running could answer what Ana asks next.
     signal(&b, "-STOP");
+    wait("bo's device has stopped", 5, || all_stopped(&b));
     let r = ask(&a, json!({"cmd": "network-changed"}));
     assert!(r["checking"].as_u64().unwrap() >= 1, "{r}");
     let t = Instant::now();

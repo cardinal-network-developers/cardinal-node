@@ -344,6 +344,37 @@ fn a_session_nobody_answers_closes_before_the_idle_timeout() {
     assert!(matches!(p.a.close, Some(CloseReason::Idle)));
 }
 
+/// The peer stops just as it is asked, with a packet of its own still on the
+/// way: that packet, sent before the asking, is no answer, and the session
+/// closes as one nobody answers.
+#[test]
+fn a_packet_sent_before_the_asking_does_not_answer_it() {
+    let mut p = kept_alive();
+    // As over UDP, where packets are acknowledged; a memory path is not.
+    p.a.reliable = false;
+    p.b.reliable = false;
+    while p.pump() > 0 {}
+    p.b.control.push_back(Frame::Ping);
+    let (_, old) = p.b.poll_transmit(p.now).expect("b's packet");
+    let old = old.to_vec();
+
+    let mut now = p.now + Duration::from_millis(1);
+    p.a.check();
+    assert!(send_to_nobody(&mut p.a, now) > 0, "no ping went out");
+    let last = now + p.a.config.answer_timeout;
+    now += Duration::from_millis(1);
+    let mut v = old;
+    assert!(p.a.recv_packet(&mut v, &Path::Mem(1), now));
+
+    while p.a.close.is_none() {
+        now = p.a.poll_timeout().unwrap();
+        p.a.handle_timeout(now);
+        send_to_nobody(&mut p.a, now);
+    }
+    assert_eq!(now, last, "closed {:?} late", now.duration_since(last));
+    assert!(matches!(p.a.close, Some(CloseReason::Idle)));
+}
+
 #[test]
 fn a_lost_ping_does_not_close_a_session() {
     let mut p = kept_alive();

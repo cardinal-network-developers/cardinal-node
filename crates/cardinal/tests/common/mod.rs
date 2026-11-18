@@ -124,6 +124,13 @@ impl Dev {
     }
 
     pub fn stop(&mut self) {
+        // A test may have paused it (SIGSTOP) and failed before going on:
+        // a paused daemon never answers `stop`, and the test would hang.
+        if let Some(c) = &self.child {
+            let _ = Command::new("kill")
+                .args(["-CONT", &c.id().to_string()])
+                .status();
+        }
         let _ = self.try_cli(&["stop"]);
         if let Some(mut c) = self.child.take() {
             let start = Instant::now();

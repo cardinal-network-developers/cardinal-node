@@ -422,7 +422,7 @@ pub(crate) struct Conn {
     close_frame: Option<String>,
     last_recv: Instant,
     last_send: Instant,
-    /// Since when something sent has wanted an answer, with nothing heard.
+    /// Since when something sent has wanted an answer, with none come.
     unanswered: Option<Instant>,
     /// When to ask again if there is still nothing.
     ask_again: Instant,
@@ -695,7 +695,13 @@ impl Conn {
         self.stats.packets_received += 1;
         self.stats.bytes_received += pkt.len() as u64;
         self.last_recv = now;
-        self.unanswered = None;
+        // Over a carrier with acknowledgements, only one of a packet sent
+        // since the asking answers it (`on_ack`): a packet the peer sent
+        // before then, still on its way, says nothing of whether it is there
+        // now. A reliable carrier has none, and any packet does.
+        if self.reliable {
+            self.unanswered = None;
+        }
         self.activity_since_rekey = true;
 
         if via_next {
@@ -1018,6 +1024,11 @@ impl Conn {
         }
         if newly.is_empty() {
             return;
+        }
+        if let Some(since) = self.unanswered {
+            if newly.iter().any(|(_, p)| p.time >= since) {
+                self.unanswered = None;
+            }
         }
         if self.largest_acked.is_none_or(|l| largest > l) {
             self.largest_acked = Some(largest);

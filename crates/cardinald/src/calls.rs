@@ -80,6 +80,12 @@ const ANSWER_WITHIN: Duration = Duration::from_millis(1500);
 /// How long a session that did not answer has to end before the call looks
 /// again: the link's answer timeout.
 const GONE_WITHIN: Duration = Duration::from_secs(12);
+/// On an `end` a caller sends the called person's other devices, `3:`
+/// says why their ringing stops: another of their devices answered the call,
+/// or said no to it. Without it, nobody answered.
+const ANSWERED_ELSEWHERE: u64 = 1;
+const DECLINED_ELSEWHERE: u64 = 2;
+
 /// When a call looks again, past the gap between two looks for one person.
 const LOOK_AGAIN: Duration = Duration::from_secs(6);
 /// How many times one person can ring in `RINGS_WITHIN`. Past that a ring
@@ -110,6 +116,44 @@ pub enum Standing {
     Ringing,
     /// They are talking.
     Live,
+}
+
+/// How a call ended here, as the service tells whoever looks after it has
+/// gone: so a window can tell a call missed from one taken on another of
+/// its person's devices.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Ending {
+    /// It rang here, and nobody answered it anywhere.
+    Missed,
+    /// Another of this person's devices answered it.
+    AnsweredElsewhere,
+    /// Another of this person's devices said no to it.
+    DeclinedElsewhere,
+    /// This person said no to it here.
+    Declined,
+    /// It was live, and is over.
+    Over,
+    /// This person called, and nobody answered.
+    NotAnswered,
+    /// This person called, and they said no.
+    TheyDeclined,
+    /// This person called, and hung up before anyone answered.
+    Cancelled,
+}
+
+impl Ending {
+    pub fn name(self) -> &'static str {
+        match self {
+            Ending::Missed => "missed",
+            Ending::AnsweredElsewhere => "answered_elsewhere",
+            Ending::DeclinedElsewhere => "declined_elsewhere",
+            Ending::Declined => "declined",
+            Ending::Over => "over",
+            Ending::NotAnswered => "not_answered",
+            Ending::TheyDeclined => "they_declined",
+            Ending::Cancelled => "cancelled",
+        }
+    }
 }
 
 /// The call this person is on.
@@ -155,6 +199,31 @@ impl Call {
 
     fn close(&self) {
         self.over.send_replace(true);
+    }
+}
+
+/// A call that has left this device: over for whoever waits on it, and how
+/// it ended kept for whoever looks.
+fn finished(d: &Daemon, call: &Call, how: Ending) {
+    call.close();
+    let ended = json!({
+        "id": hex::encode(call.id),
+        "who": hex::encode(&call.who[..8]),
+        "name": call.name,
+        "group": call.group.then(|| hex::encode(call.space)),
+        "how": how.name(),
+    });
+    *d.call_ended.lock().unwrap_or_else(|e| e.into_inner()) = Some(ended);
+    d.bump();
+}
+
+/// How a call that was ringing here ends when it gives way to one this
+/// person makes, or the like: unanswered, so missed.
+fn gave_way(call: &Call) -> Ending {
+    match call.standing {
+        Standing::Ringing => Ending::Missed,
+        Standing::Calling => Ending::Cancelled,
+        Standing::Live => Ending::Over,
     }
 }
 
@@ -288,7 +357,7 @@ fn ring_out(d: &Arc<Daemon>, id: [u8; 16]) {
             .as_ref()
             .is_some_and(|c| c.id == id && c.standing != Standing::Live);
         if unanswered {
-            let _ = end_call(&d, false).await;
+            let _ = end_call(&d, false, true).await;
         }
     });
 }
@@ -341,7 +410,7 @@ pub async fn start(d: &Arc<Daemon>, who: &str) -> anyhow::Result<Json> {
         held.replace(call)
     };
     if let Some(old) = gave_way {
-        old.close();
+        finished(d, &old, self::gave_way(&old));
         if let Some(s) = &old.session {
             let _ = tell(s, END, &old.space, &old.id).await;
         }
@@ -431,18 +500,25 @@ pub async fn answer(d: &Arc<Daemon>) -> anyhow::Result<Json> {
 
 /// Hangs up, or says no.
 pub async fn end(d: &Arc<Daemon>) -> anyhow::Result<Json> {
-    end_call(d, true).await
+    end_call(d, true, false).await
 }
 
 /// Hangs up. In a group this device leaves, and the others go on; with
 /// `may_carry`, a device that helps others goes on carrying the call for
-/// them while it joins two or more of them.
-async fn end_call(d: &Arc<Daemon>, may_carry: bool) -> anyhow::Result<Json> {
+/// them while it joins two or more of them. With `timed_out`, it rang or
+/// called for as long as a call rings, unanswered.
+async fn end_call(d: &Arc<Daemon>, may_carry: bool, timed_out: bool) -> anyhow::Result<Json> {
     let Some(call) = lock(d).take() else {
         return Ok(json!({}));
     };
-    call.close();
-    d.bump();
+    let how = match (call.standing, timed_out) {
+        (Standing::Ringing, true) => Ending::Missed,
+        (Standing::Ringing, false) => Ending::Declined,
+        (Standing::Calling, true) => Ending::NotAnswered,
+        (Standing::Calling, false) => Ending::Cancelled,
+        (Standing::Live, _) => Ending::Over,
+    };
+    finished(d, &call, how);
     if call.group {
         // Saying no to a ring is this person's: what the device carries
         // goes on.
@@ -481,7 +557,7 @@ async fn end_call(d: &Arc<Daemon>, may_carry: bool) -> anyhow::Result<Json> {
 }
 
 /// Forgets a call that has ended by itself.
-fn forget(d: &Daemon, id: &[u8; 16]) {
+fn forget(d: &Daemon, id: &[u8; 16], how: Ending) {
     let gone = {
         let mut call = lock(d);
         let same = call.as_ref().is_some_and(|c| c.id == *id);
@@ -492,8 +568,7 @@ fn forget(d: &Daemon, id: &[u8; 16]) {
         }
     };
     if let Some(call) = gone {
-        call.close();
-        d.bump();
+        finished(d, &call, how);
     }
 }
 
@@ -534,16 +609,21 @@ fn go_live(d: &Arc<Daemon>, s: &Session, id: [u8; 16]) {
             }
         }
         // The session went, and the call with it.
-        forget(&d, &id);
+        forget(&d, &id, Ending::Over);
     });
 }
 
 /// What is known of the call under way.
 pub fn current(d: &Daemon) -> Json {
+    let ended = d
+        .call_ended
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
     let (who, name, standing, seconds, space, group, id) = {
         let call = lock(d);
         let Some(c) = call.as_ref() else {
-            return json!({"call": null});
+            return json!({"call": null, "ended": ended});
         };
         let standing = match c.standing {
             Standing::Calling => "calling",
@@ -588,7 +668,7 @@ pub fn current(d: &Daemon) -> Json {
         "linked": linked,
         "people": people,
         "frames": frames,
-    }})
+    }, "ended": ended})
 }
 
 /// How many group calls this device carries for others, without its person.
@@ -653,7 +733,7 @@ pub async fn start_group(d: &Arc<Daemon>, group: &str) -> anyhow::Result<Json> {
             .is_some_and(|c| c.standing == Standing::Ringing);
         anyhow::ensure!(held.is_none() || ringing, "you are already on a call");
         if let Some(old) = held.replace(call) {
-            old.close();
+            finished(d, &old, gave_way(&old));
         }
     }
     take_part(d, id, space, going.is_none());
@@ -1077,6 +1157,16 @@ async fn group_signal(
         }
         JOIN => {
             let carrying = sig.flag == Some(1);
+            // This person answered on another of their devices: this one
+            // stops ringing, whether or not it carries the call.
+            if !carrying && own_device {
+                let ringing = lock(d).as_ref().is_some_and(|c| {
+                    c.id == id && c.space == space && c.standing == Standing::Ringing
+                });
+                if ringing {
+                    forget(d, &id, Ending::AnsweredElsewhere);
+                }
+            }
             if !groups(d).contains_key(&id) {
                 maybe_carry(d, id, space).await;
             }
@@ -1122,15 +1212,6 @@ async fn group_signal(
             };
             if went_live {
                 live_now(d, &id);
-            }
-            // This person answered on another of their devices.
-            if !carrying && own_device {
-                let ringing = lock(d)
-                    .as_ref()
-                    .is_some_and(|c| c.id == id && c.standing == Standing::Ringing);
-                if ringing {
-                    forget(d, &id);
-                }
             }
             if added {
                 carry_link(d, s, space, id, linked);
@@ -1533,7 +1614,7 @@ pub async fn serve(d: &Arc<Daemon>, s: &Session, mut st: Stream) -> anyhow::Resu
             }
             go_live(d, s, id);
             // Their other devices can stop ringing.
-            told_the_others(d, s, &them, &space, &id).await;
+            told_the_others(d, s, &them, &space, &id, ANSWERED_ELSEWHERE).await;
         }
         END => {
             let ended = {
@@ -1552,11 +1633,17 @@ pub async fn serve(d: &Arc<Daemon>, s: &Session, mut st: Stream) -> anyhow::Resu
                 }
             };
             if let Some(call) = ended {
-                call.close();
-                d.bump();
+                let how = match (call.standing, sig.flag) {
+                    (Standing::Ringing, Some(ANSWERED_ELSEWHERE)) => Ending::AnsweredElsewhere,
+                    (Standing::Ringing, Some(DECLINED_ELSEWHERE)) => Ending::DeclinedElsewhere,
+                    (Standing::Ringing, _) => Ending::Missed,
+                    (Standing::Calling, _) => Ending::TheyDeclined,
+                    (Standing::Live, _) => Ending::Over,
+                };
+                finished(d, &call, how);
                 // A no on one device stops the others ringing.
                 if call.standing == Standing::Calling {
-                    told_the_others(d, s, &them, &space, &id).await;
+                    told_the_others(d, s, &them, &space, &id, DECLINED_ELSEWHERE).await;
                 }
             }
         }
@@ -1565,11 +1652,26 @@ pub async fn serve(d: &Arc<Daemon>, s: &Session, mut st: Stream) -> anyhow::Resu
     Ok(())
 }
 
-/// Ends the ring on a person's devices other than the one that spoke.
-async fn told_the_others(d: &Daemon, s: &Session, them: &[u8; 32], space: &SpaceId, id: &[u8; 16]) {
+/// Ends the ring on a person's devices other than the one that spoke,
+/// saying why (`ANSWERED_ELSEWHERE` or `DECLINED_ELSEWHERE`).
+async fn told_the_others(
+    d: &Daemon,
+    s: &Session,
+    them: &[u8; 32],
+    space: &SpaceId,
+    id: &[u8; 16],
+    why: u64,
+) {
+    let end = Signal {
+        kind: END,
+        space: *space,
+        id: *id,
+        flag: Some(why),
+        caller: None,
+    };
     for other in d.sessions_of(them) {
         if other.peer_static() != s.peer_static() {
-            let _ = tell(&other, END, space, id).await;
+            let _ = send(&other, &end).await;
         }
     }
 }

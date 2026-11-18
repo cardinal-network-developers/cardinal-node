@@ -235,6 +235,55 @@ fn a_device_that_helps_carries_a_call_its_person_is_not_on() {
     assert_eq!(carrying(&carol), 0);
 }
 
+/// A person with two devices rung for a group call: answered on one, it is
+/// not missed on the other.
+#[test]
+fn a_group_call_answered_on_another_device_is_not_missed() {
+    if !fuse_available() {
+        eprintln!("skipping: /dev/fuse or fusermount3 is not available");
+        return;
+    }
+    let root = tempfile::tempdir().unwrap();
+    let ana = person(root.path(), "ana");
+    let ben = person(root.path(), "ben");
+    plugged_in(&ana, false);
+    plugged_in(&ben, false);
+    meet(&ana, &ben);
+    let g = group(&ana, &[&ben]);
+    let phone = start_paired(root.path(), &ben);
+    plugged_in(&phone, false);
+    wait("ben's phone has the group", 60, || {
+        let v = reply(&phone, &json!({"cmd": "groups"}));
+        v["groups"].as_array().is_some_and(|g| !g.is_empty())
+    });
+    wait("ben's phone reaches ana", 60, || {
+        reply(&phone, &json!({"cmd": "contacts"}))["contacts"][0]["connected"] == true
+    });
+
+    ask(&ana, json!({"cmd": "call-start", "group": g}));
+    wait("both of ben's devices ring", 20, || {
+        standing(&ben) == "ringing" && standing(&phone) == "ringing"
+    });
+    let id = call(&ben)["id"].clone();
+    ask(&ben, json!({"cmd": "call-answer"}));
+    wait("the phone stops ringing", 20, || {
+        standing(&phone).is_empty()
+    });
+    let e = ask(&phone, json!({"cmd": "call"}))["ended"].clone();
+    assert_eq!(e["id"], id, "{e}");
+    assert_eq!(e["how"], "answered_elsewhere", "{e}");
+    assert_eq!(e["group"], g, "{e}");
+}
+
+/// A device of `of`'s, paired to it. (Pairing waits for its files to be
+/// mounted.)
+fn start_paired(root: &std::path::Path, of: &Dev) -> Dev {
+    let mut d = Dev::new(root, "phone", free_port());
+    d.start();
+    pair(of, &d);
+    d
+}
+
 /// Four who all know each other: each frame at first comes to a device on
 /// every link, and once each takes a voice from two links only, every frame
 /// comes about twice.

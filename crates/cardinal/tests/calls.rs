@@ -161,6 +161,75 @@ fn a_call_can_be_declined() {
     assert!(standing(&b).is_null());
 }
 
+fn ended(d: &Dev) -> Value {
+    ask(d, json!({"cmd": "call"}))["ended"].clone()
+}
+
+/// A person with two devices: a call answered, or said no to, on one is not
+/// missed on the other, and the service says how each call ended, so a
+/// window need not guess.
+#[test]
+fn a_call_taken_on_another_device_is_not_missed() {
+    if !fuse_available() {
+        eprintln!("skipping: /dev/fuse or fusermount3 is not available");
+        return;
+    }
+    let root = tempfile::tempdir().unwrap();
+    let (a, b, bo) = met(root.path());
+    let mut b2 = Dev::new(root.path(), "bo-phone", free_port());
+    b2.start();
+    pair(&b, &b2);
+    wait("bo's phone reaches ana", 60, || {
+        let c = try_ask(&b2, json!({"cmd": "contacts"}));
+        c["contacts"][0]["connected"] == true
+    });
+    let both_ring = |a: &Dev| {
+        ask(a, json!({"cmd": "call-start", "who": bo}));
+        wait("both of bo's devices ring", 20, || {
+            standing(&b) == "ringing" && standing(&b2) == "ringing"
+        });
+        ask(&b, json!({"cmd": "call"}))["call"]["id"].clone()
+    };
+
+    // Answered on one: the other stops ringing, and it was not missed.
+    let id = both_ring(&a);
+    ask(&b, json!({"cmd": "call-answer"}));
+    wait("the phone stops ringing", 10, || standing(&b2).is_null());
+    let e = ended(&b2);
+    assert_eq!(e["id"], id, "{e}");
+    assert_eq!(e["how"], "answered_elsewhere", "{e}");
+    assert_eq!(e["name"], "Ana", "{e}");
+    wait("ana is on it", 10, || standing(&a) == "live");
+    ask(&a, json!({"cmd": "call-end"}));
+    wait("bo hears the end", 10, || standing(&b).is_null());
+    assert_eq!(ended(&b)["how"], "over");
+    assert_eq!(ended(&a)["how"], "over");
+
+    // Said no to on one: not missed on the other either.
+    let id = both_ring(&a);
+    ask(&b2, json!({"cmd": "call-end"}));
+    wait("the other stops ringing", 10, || standing(&b).is_null());
+    let e = ended(&b);
+    assert_eq!(e["id"], id, "{e}");
+    assert_eq!(e["how"], "declined_elsewhere", "{e}");
+    assert_eq!(ended(&b2)["how"], "declined");
+    wait("ana hears no", 10, || standing(&a).is_null());
+    assert_eq!(ended(&a)["how"], "they_declined");
+
+    // Nobody answers before the caller gives up: missed on both.
+    let id = both_ring(&a);
+    ask(&a, json!({"cmd": "call-end"}));
+    wait("both stop ringing", 10, || {
+        standing(&b).is_null() && standing(&b2).is_null()
+    });
+    for d in [&b, &b2] {
+        let e = ended(d);
+        assert_eq!(e["id"], id, "{e}");
+        assert_eq!(e["how"], "missed", "{e}");
+    }
+    assert_eq!(ended(&a)["how"], "cancelled");
+}
+
 /// Someone not trusted has no session, so a call says so, and asks no one.
 #[test]
 fn nobody_can_be_called_while_out_of_reach() {
