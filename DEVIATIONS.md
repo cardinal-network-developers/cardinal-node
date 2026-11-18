@@ -1134,26 +1134,13 @@ asks for around that is not built yet.
   neither, the machine's name. `cardinal init` without `--yes` asks. The
   device is named after its machine (`/etc/hostname`, `COMPUTERNAME`), or
   `device` / `--device-name`.
-- **`pair-show` takes `device` too.** `apps.md` gives `device` to
-  `pair-type`, typed on a device already in use, where it names the device
-  being added in its device node instead of the name that device gave. The
-  new device's own window knows its name better (a phone's), so `pair-show`
-  also takes `device` and saves it as this device's name before the code
-  is shown; the pairing message's field 5 carries it. Field 5 is called the
-  suggested name in `contact.md#pairing`; for a person's own device it is
-  that device's name, never the person's.
-- **A cleared petname is written empty, not removed.** 0.1.15 and earlier
-  read a contact without field 2 as no contact at all; with it empty they
-  list the contact with no name. This software reads both as none.
 - **Field 12 is recorded when the contact is made**, from the invitation or
   the hello (an introduction's invitation carries the introduced person's
   own name), and is not kept up to date afterwards from what is heard.
   Contacts made by 0.1.15 and earlier have none: they show the petname, or
   the start of the id where it is cleared.
-- **What others are given of a contact is the name the contact suggests.**
-  An introduction's field 3 and the member name a group is offered for a
-  contact (unless the adder gives `shown`) are field 12, or, for a contact
-  made before field 12 was kept, the petname, which began as the same.
+- **A contact made before field 12 was kept** is introduced, and offered to
+  a group, under the petname, which began as the name they suggested.
 - **A picture is copied whole, not made smaller,** and at most 16 MiB. It is
   encoded with the account space's current epoch key, as an attachment is
   in its space, and the reference is field 11. Each device keeps a copy as

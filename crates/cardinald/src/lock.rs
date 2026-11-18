@@ -65,9 +65,23 @@ fn open(paths: &Paths, create: bool) -> io::Result<Option<File>> {
 
 /// Takes the data directory for this process, making it if it is not
 /// there. `None` if another process holds it.
+///
+/// [`held`] takes the lock for an instant to answer, so a directory found
+/// held is tried again for two seconds before it counts as another
+/// process's: one asking is done long before then, and a service holds it
+/// for as long as it runs.
 pub fn take(paths: &Paths) -> io::Result<Option<Lock>> {
     std::fs::create_dir_all(&paths.home)?;
-    Ok(open(paths, true)?.map(Lock))
+    let until = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    loop {
+        if let Some(f) = open(paths, true)? {
+            return Ok(Some(Lock(f)));
+        }
+        if std::time::Instant::now() >= until {
+            return Ok(None);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
 }
 
 /// Whether another process holds the data directory. Nothing is made
@@ -118,6 +132,22 @@ mod tests {
         drop(first);
         assert!(!held(&paths));
         assert!(take(&paths).unwrap().is_some());
+    }
+
+    /// Asking whether a directory is held takes its lock for an instant. A
+    /// service starting in that instant waits it out, instead of saying
+    /// another is running: a window asks every few seconds while one starts.
+    #[test]
+    fn a_service_starting_while_someone_asks_waits_for_the_answer() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::at(dir.path());
+        let asking = open(&paths, false).unwrap().expect("free");
+        let answered = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            drop(asking);
+        });
+        assert!(take(&paths).unwrap().is_some());
+        answered.join().unwrap();
     }
 
     /// S9. A directory that cannot be looked at is not "held by nobody":
