@@ -674,7 +674,7 @@ impl Tree {
         std::io::Write::write_all(&mut f, format!("{rec}\n").as_bytes())?;
         f.sync_data()?;
         // the staging file's own name, and the journal's
-        File::open(&self.staging)?.sync_all()?;
+        crate::paths::flush_dir(&self.staging)?;
         if let Some(i) = self.inodes.get_mut(&ino) {
             i.journaled = Some(rec);
         }
@@ -717,7 +717,7 @@ impl Tree {
             }
             std::fs::rename(&tmp, self.journal())?;
         }
-        File::open(&self.staging)?.sync_all()
+        crate::paths::flush_dir(&self.staging)
     }
 
     /// After a commit: writes the journal again if something it named is

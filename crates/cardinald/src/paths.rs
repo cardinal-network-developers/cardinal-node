@@ -5,7 +5,8 @@
 //!   `~/.local/share/cardinal`.
 //! - Settings: `config.toml` (table `[daemon]`; `[update]` belongs to
 //!   `cardinal-update`) in `$CARDINAL_HOME`, else `$CARDINAL_CONFIG_DIR`,
-//!   else `$XDG_CONFIG_HOME/cardinal`, else `~/.config/cardinal`.
+//!   else `$XDG_CONFIG_HOME/cardinal`, else `~/.config/cardinal`
+//!   (`%APPDATA%\cardinal` on Windows, beside data in `%LOCALAPPDATA%`).
 //! - Control socket: `$CARDINAL_SOCKET`, else
 //!   `$XDG_RUNTIME_DIR/cardinal.sock` for the default data directory and
 //!   `$XDG_RUNTIME_DIR/cardinal-<name>.sock` when `CARDINAL_HOME` is set
@@ -31,6 +32,27 @@ fn user_home() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("/"))
 }
 
+/// Where a person's programs keep their settings.
+fn user_config() -> PathBuf {
+    match std::env::var_os("APPDATA") {
+        Some(d) if cfg!(windows) => PathBuf::from(d),
+        _ => std::env::var_os("XDG_CONFIG_HOME")
+            .filter(|d| !d.is_empty())
+            .map(PathBuf::from)
+            .unwrap_or_else(|| user_home().join(".config")),
+    }
+}
+
+/// Makes the names in a directory as lasting as the files they name. Windows
+/// cannot open a folder as a file, and its file systems keep names with the
+/// data they name, so there it is nothing.
+pub fn flush_dir(dir: &Path) -> std::io::Result<()> {
+    if cfg!(windows) {
+        return Ok(());
+    }
+    std::fs::File::open(dir)?.sync_all()
+}
+
 /// Where a person's programs keep their data.
 fn user_data() -> PathBuf {
     match std::env::var_os("LOCALAPPDATA") {
@@ -45,7 +67,13 @@ impl Paths {
         let custom = std::env::var_os("CARDINAL_HOME")
             .filter(|h| !h.is_empty())
             .map(PathBuf::from);
-        let deploy = cardinal_update::Paths::from_env().ok();
+        // Where `cardinal-update` installs (systemd, so not on Windows,
+        // where a HOME set by a Unix-like shell would otherwise win).
+        let deploy = if cfg!(windows) {
+            None
+        } else {
+            cardinal_update::Paths::from_env().ok()
+        };
         let env_dir = |v: &str| {
             std::env::var_os(v)
                 .filter(|h| !h.is_empty())
@@ -71,7 +99,7 @@ impl Paths {
                 deploy
                     .as_ref()
                     .map(|p| p.config_dir.clone())
-                    .unwrap_or_else(|| user_home().join(".config/cardinal"))
+                    .unwrap_or_else(|| user_config().join("cardinal"))
             }),
         };
         let config_dir = absolute(&config_dir);

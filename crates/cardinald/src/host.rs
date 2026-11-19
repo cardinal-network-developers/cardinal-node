@@ -608,6 +608,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "linux")]
     fn only_a_user_service_without_linger_stops_at_logout() {
         let user = "0::/user.slice/user-1001.slice/user@1001.service/app.slice/cardinal.service\n";
         assert!(stops_at_logout(user, "no\n"));
