@@ -1965,8 +1965,14 @@ mod tests {
             "reach_node_set": hex::encode(op.record().encode()),
         });
         let text = serde_json::to_string_pretty(&vectors).unwrap() + "\n";
-        let path =
-            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../vectors/mailbox.json");
+        // CARDINAL_VECTORS names the folder where a test runs away from
+        // the source (on another system).
+        let path = std::env::var_os("CARDINAL_VECTORS")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| {
+                std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../vectors")
+            })
+            .join("mailbox.json");
         if std::env::var_os("CARDINAL_WRITE_VECTORS").is_some() {
             std::fs::write(&path, text).unwrap();
             return;

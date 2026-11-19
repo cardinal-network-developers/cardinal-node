@@ -863,6 +863,21 @@ mod tests {
     //! descends from everything, and the tree has not applied it.
 
     use super::*;
+
+    /// Everything under `from`, copied under `to` (`cp -a from/. to`, but
+    /// on every system the tests run on).
+    fn copy_tree(from: &std::path::Path, to: &std::path::Path) {
+        std::fs::create_dir_all(to).unwrap();
+        for e in std::fs::read_dir(from).unwrap() {
+            let e = e.unwrap();
+            let there = to.join(e.file_name());
+            if e.file_type().unwrap().is_dir() {
+                copy_tree(&e.path(), &there);
+            } else {
+                std::fs::copy(e.path(), &there).unwrap();
+            }
+        }
+    }
     use crate::config::Config;
     use crate::keys::Keys;
     use crate::paths::Paths;
@@ -1151,12 +1166,7 @@ mod tests {
     fn an_entry_waiting_for_parents_is_not_announced() {
         let mut fx = Fx::new();
         let dir = tempfile::tempdir().unwrap();
-        let done = std::process::Command::new("cp")
-            .args(["-a", &format!("{}/.", fx._dir.path().display())])
-            .arg(dir.path())
-            .status()
-            .unwrap();
-        assert!(done.success());
+        copy_tree(fx._dir.path(), dir.path());
         let (_, first) = fx
             .core
             .write_entry(&fx.space, vec![files::create_folder(ROOT, "a")])

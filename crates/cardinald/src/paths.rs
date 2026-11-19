@@ -286,7 +286,7 @@ mod tests {
     #[test]
     fn a_directory_has_one_name_however_it_is_given() {
         let dir = tempfile::tempdir().unwrap();
-        let real = std::fs::canonicalize(dir.path()).unwrap().join("dev1");
+        let real = plain(std::fs::canonicalize(dir.path()).unwrap()).join("dev1");
         std::fs::create_dir_all(&real).unwrap();
         let slash = PathBuf::from(format!("{}/", real.display()));
         let dotted = real.parent().unwrap().join("./dev1/.");

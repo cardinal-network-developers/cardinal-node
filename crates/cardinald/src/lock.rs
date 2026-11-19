@@ -141,7 +141,8 @@ mod tests {
     fn a_service_starting_while_someone_asks_waits_for_the_answer() {
         let dir = tempfile::tempdir().unwrap();
         let paths = Paths::at(dir.path());
-        let asking = open(&paths, false).unwrap().expect("free");
+        // Made as a service would have made it (on Windows the lock is a file).
+        let asking = open(&paths, true).unwrap().expect("free");
         let answered = std::thread::spawn(move || {
             std::thread::sleep(std::time::Duration::from_millis(200));
             drop(asking);
