@@ -43,6 +43,24 @@ fn user_config() -> PathBuf {
     }
 }
 
+/// Settings a Windows service kept before they moved to `%APPDATA%`, in
+/// `%USERPROFILE%\.config\cardinal`: moved to `to`, once, if nothing is
+/// there yet. Elsewhere, nothing moved.
+fn moved_from_before(to: &Path) {
+    if !cfg!(windows) || to.exists() {
+        return;
+    }
+    let before = user_home().join(".config").join("cardinal");
+    if before.join("config.toml").exists() {
+        if let Some(up) = to.parent() {
+            let _ = std::fs::create_dir_all(up);
+        }
+        if let Err(e) = std::fs::rename(&before, to) {
+            tracing::warn!("the settings in {} stay there: {e}", before.display());
+        }
+    }
+}
+
 /// Makes the names in a directory as lasting as the files they name. Windows
 /// cannot open a folder as a file, and its file systems keep names with the
 /// data they name, so there it is nothing.
@@ -99,7 +117,11 @@ impl Paths {
                 deploy
                     .as_ref()
                     .map(|p| p.config_dir.clone())
-                    .unwrap_or_else(|| user_config().join("cardinal"))
+                    .unwrap_or_else(|| {
+                        let dir = user_config().join("cardinal");
+                        moved_from_before(&dir);
+                        dir
+                    })
             }),
         };
         let config_dir = absolute(&config_dir);
