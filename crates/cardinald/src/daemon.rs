@@ -252,6 +252,8 @@ pub struct Daemon {
     pub call: Mutex<Option<crate::calls::Call>>,
     /// How the last call here ended, for whoever looks after it has gone.
     pub call_ended: Mutex<Option<serde_json::Value>>,
+    /// The last thing copied on any of this person's devices (`clipboard.rs`).
+    pub clip: Mutex<Option<crate::clipboard::Clip>>,
     /// The group calls this device is on or carries, by call.
     pub group_calls: Mutex<HashMap<[u8; 16], crate::calls::Group>>,
     /// The group calls this device rang for lately, or its person made.
@@ -505,6 +507,7 @@ impl Daemon {
             pairing: Mutex::new(PairState::Idle),
             call: Mutex::new(None),
             call_ended: Mutex::new(None),
+            clip: Mutex::new(None),
             group_calls: Mutex::new(HashMap::new()),
             rung_calls: Mutex::new(std::collections::VecDeque::new()),
             passed_rings: Mutex::new(std::collections::VecDeque::new()),

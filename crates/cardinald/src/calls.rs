@@ -1544,7 +1544,7 @@ fn said(d: &Daemon, from: &Session, id: &[u8; 16], bytes: &[u8]) {
 /// Serves the `ephemeral` service. Only someone this person shares the space
 /// with may ring them in it (`spaces.md#ephemeral-messages`); this person's
 /// own devices speak only of group calls.
-pub async fn serve(d: &Arc<Daemon>, s: &Session, mut st: Stream) -> anyhow::Result<()> {
+pub async fn serve(d: &Arc<Daemon>, s: &Session, mut st: Stream, v: Value) -> anyhow::Result<()> {
     let them = match d.classify(s) {
         PeerKind::Contact(them, _) | PeerKind::Inviting(them, Some(_)) => them,
         PeerKind::Own(_) => match contacts::identity(d) {
@@ -1559,9 +1559,11 @@ pub async fn serve(d: &Arc<Daemon>, s: &Session, mut st: Stream) -> anyhow::Resu
             return Ok(());
         }
     };
-    let Some(v) = st.recv_message_max(MAX_SIGNAL).await? else {
+    // A call's signal is small; the service reads larger messages for others.
+    if v.encode().len() > MAX_SIGNAL {
+        st.reset(0);
         return Ok(());
-    };
+    }
     let Some(sig) = Signal::of(&v) else {
         st.reset(0);
         return Ok(());

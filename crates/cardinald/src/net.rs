@@ -254,7 +254,18 @@ async fn handle_stream(d: &Arc<Daemon>, s: &Session, mut st: Stream) -> anyhow::
         return crate::contacts::serve(d, s, st).await;
     }
     if st.service() == Service::EPHEMERAL {
-        return crate::calls::serve(d, s, st).await;
+        // One message: a clipboard's, named by its first field, or a call's.
+        let Some(v) = st
+            .recv_message_max(crate::clipboard::MAX_TEXT + 256)
+            .await?
+        else {
+            return Ok(());
+        };
+        if crate::clipboard::is_clip(&v) {
+            crate::clipboard::take(d, s, &v);
+            return Ok(());
+        }
+        return crate::calls::serve(d, s, st, v).await;
     }
     if st.service() == Service::MAILBOX {
         return crate::mailbox::serve(d, s, st).await;

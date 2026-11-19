@@ -9,6 +9,7 @@ pub mod applog;
 pub mod calls;
 pub mod cleanup;
 pub mod clear;
+pub mod clipboard;
 pub mod conditions;
 pub mod config;
 pub mod contacts;

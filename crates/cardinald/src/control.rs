@@ -400,6 +400,8 @@ async fn handle(d: &Arc<Daemon>, req: &Value) -> anyhow::Result<Value> {
             crate::calls::start_group(d, arg(req, "group")?).await
         }
         "call-start" => crate::calls::start(d, arg(req, "who")?).await,
+        "clip-copy" => crate::clipboard::copy(d, arg(req, "text")?).await,
+        "clip" => Ok(crate::clipboard::paste(d)),
         "call-answer" => crate::calls::answer(d).await,
         "call-end" => crate::calls::end(d).await,
         "conversations" => Ok(crate::contacts::conversations(d)),

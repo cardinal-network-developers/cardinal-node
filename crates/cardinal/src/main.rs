@@ -300,6 +300,12 @@ enum Cmd {
         #[command(subcommand)]
         cmd: GroupCmd,
     },
+    /// A clipboard shared by your own devices: copy on one, paste on
+    /// another, for ten minutes. Nobody else is sent it, and it is not kept.
+    Clip {
+        #[command(subcommand)]
+        cmd: ClipCmd,
+    },
     /// Make this device a host for your own devices: it keeps a full copy
     /// of your files, and can bring them back if every other device is lost.
     Host {
@@ -418,6 +424,15 @@ enum Cmd {
     Store,
     #[command(flatten)]
     Deploy(cardinal_update::DeployCommand),
+}
+
+#[derive(Subcommand)]
+enum ClipCmd {
+    /// Copy text to your other devices: the text given, or what comes on
+    /// standard input (`some-command | cardinal clip copy`).
+    Copy { text: Option<String> },
+    /// Print what was last copied on any of your devices.
+    Paste,
 }
 
 #[derive(Subcommand)]
@@ -2165,6 +2180,44 @@ async fn client(cmd: Cmd) -> anyhow::Result<()> {
             }
             Ok(())
         }
+        Cmd::Clip { cmd } => match cmd {
+            ClipCmd::Copy { text } => {
+                let text = match text {
+                    Some(t) => t,
+                    None => {
+                        let mut t = String::new();
+                        std::io::Read::read_to_string(&mut std::io::stdin(), &mut t)
+                            .map_err(|e| anyhow::anyhow!("reading what to copy: {e}"))?;
+                        t
+                    }
+                };
+                let v = call(&paths, json!({"cmd": "clip-copy", "text": text})).await?;
+                match v["devices"].as_u64().unwrap_or(0) {
+                    0 => eprintln!(
+                        "Copied here. None of your other devices is online; \
+                         one that comes online within ten minutes does not get it."
+                    ),
+                    1 => eprintln!("Copied to 1 other device."),
+                    n => eprintln!("Copied to {n} other devices."),
+                }
+                Ok(())
+            }
+            ClipCmd::Paste => {
+                let v = call(&paths, json!({"cmd": "clip"})).await?;
+                match v["text"].as_str() {
+                    Some(text) => {
+                        print!("{text}");
+                        if std::io::IsTerminal::is_terminal(&std::io::stdout())
+                            && !text.ends_with('\n')
+                        {
+                            println!();
+                        }
+                        Ok(())
+                    }
+                    None => anyhow::bail!("nothing copied on your devices in the last ten minutes"),
+                }
+            }
+        },
         Cmd::Group { cmd } => {
             let req = match &cmd {
                 GroupCmd::Create { name, people } => {
