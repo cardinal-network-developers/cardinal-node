@@ -71,6 +71,9 @@ pub use paths::Paths;
 
 /// Logs to stderr, which journald collects when run as a systemd service.
 /// `RUST_LOG` (or `CARDINAL_LOG`) sets the filter; the default is `info`.
+/// `CARDINAL_LOG_FILE` names a file to append to instead, for a service a
+/// window starts where nothing collects what it says (Windows): the one
+/// before is kept beside it, `.old`, once it passes a mebibyte.
 pub fn init_logging() {
     use tracing_subscriber::EnvFilter;
     let filter = std::env::var("CARDINAL_LOG")
@@ -83,11 +86,34 @@ pub fn init_logging() {
         .with_env_filter(EnvFilter::new(filter))
         .with_writer(std::io::stderr)
         .with_target(false);
-    if journal {
+    if let Some(file) = std::env::var_os("CARDINAL_LOG_FILE").and_then(|p| log_file(p.as_ref())) {
+        let _ = b
+            .with_ansi(false)
+            .with_writer(std::sync::Mutex::new(file))
+            .try_init();
+    } else if journal {
         let _ = b.without_time().with_ansi(false).try_init();
     } else {
         let _ = b.try_init();
     }
+}
+
+/// The log file at `path`, to append to; the old one moved aside if large.
+fn log_file(path: &std::path::Path) -> Option<std::fs::File> {
+    const KEEP: u64 = 1 << 20;
+    if std::fs::metadata(path).is_ok_and(|m| m.len() > KEEP) {
+        let mut old = path.as_os_str().to_owned();
+        old.push(".old");
+        let _ = std::fs::rename(path, old);
+    }
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .ok()
 }
 
 /// Settings given on the command line, overriding the saved ones.
