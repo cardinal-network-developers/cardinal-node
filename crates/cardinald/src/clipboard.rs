@@ -37,6 +37,8 @@ pub struct Clip {
     /// The device it was copied on.
     pub from: String,
     pub at: u64,
+    /// Copied on this device.
+    pub here: bool,
 }
 
 fn now_ms() -> u64 {
@@ -92,6 +94,7 @@ pub async fn copy(d: &Arc<Daemon>, text: &str) -> anyhow::Result<Json> {
         text: text.to_owned(),
         from: this_device(d),
         at,
+        here: true,
     });
     let message = Record::new()
         .with(0, draft_name())
@@ -120,7 +123,8 @@ pub fn paste(d: &Daemon) -> Json {
     let now = now_ms();
     match clip.filter(|c| now.saturating_sub(c.at) <= KEEP.as_millis() as u64) {
         Some(c) => {
-            json!({"text": c.text, "from": c.from, "seconds": now.saturating_sub(c.at) / 1000})
+            let seconds = now.saturating_sub(c.at) / 1000;
+            json!({"text": c.text, "from": c.from, "here": c.here, "seconds": seconds})
         }
         None => json!({"text": null}),
     }
@@ -155,7 +159,12 @@ pub fn take(d: &Daemon, s: &Session, v: &Value) {
     if clip.as_ref().is_some_and(|c| c.at > at) {
         return;
     }
-    *clip = Some(Clip { text, from, at });
+    *clip = Some(Clip {
+        text,
+        from,
+        at,
+        here: false,
+    });
     drop(clip);
     d.bump();
 }
