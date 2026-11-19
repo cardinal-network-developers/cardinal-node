@@ -55,8 +55,21 @@ fn moved_from_before(to: &Path) {
         if let Some(up) = to.parent() {
             let _ = std::fs::create_dir_all(up);
         }
-        if let Err(e) = std::fs::rename(&before, to) {
-            tracing::warn!("the settings in {} stay there: {e}", before.display());
+        if std::fs::rename(&before, to).is_err() {
+            // Elsewhere on another volume (a roaming profile): copied, the
+            // old left as it was.
+            let copied = std::fs::create_dir_all(to).and_then(|()| {
+                for e in std::fs::read_dir(&before)? {
+                    let e = e?;
+                    if e.file_type()?.is_file() {
+                        std::fs::copy(e.path(), to.join(e.file_name()))?;
+                    }
+                }
+                Ok(())
+            });
+            if let Err(e) = copied {
+                tracing::warn!("the settings in {} stay there: {e}", before.display());
+            }
         }
     }
 }
