@@ -36,6 +36,7 @@ const UDP: u8 = 17;
 pub enum Protocol {
     Pcp,
     NatPmp,
+    Upnp,
 }
 
 impl Protocol {
@@ -43,6 +44,7 @@ impl Protocol {
         match self {
             Protocol::Pcp => "PCP",
             Protocol::NatPmp => "NAT-PMP",
+            Protocol::Upnp => "UPnP",
         }
     }
 }
@@ -265,7 +267,7 @@ pub async fn map(gateway: SocketAddr, port: u16, lifetime: u32) -> Result<Mappin
         Some(Answer::TryNatPmp) | None => {}
     }
     let Some(address) = ask(&sock, &natpmp_address_request(), natpmp_address).await else {
-        return Err("the router does not give ports (no answer to PCP or NAT-PMP)".into());
+        return upnp(gateway, client, port, lifetime).await;
     };
     let address = address.map_err(|c| format!("the router said no (NAT-PMP result {c})"))?;
     let request = natpmp_map_request(port, lifetime);
@@ -276,6 +278,37 @@ pub async fn map(gateway: SocketAddr, port: u16, lifetime: u32) -> Result<Mappin
     Ok(Mapping {
         protocol: Protocol::NatPmp,
         external: SocketAddr::new(IpAddr::V4(address), external),
+        internal_port: port,
+        lifetime,
+    })
+}
+
+/// UPnP, last: finding the router by SSDP goes to the whole network, so
+/// it is tried only for a real gateway, or one a test names.
+async fn upnp(
+    gateway: SocketAddr,
+    client: IpAddr,
+    port: u16,
+    lifetime: u32,
+) -> Result<Mapping, String> {
+    const NONE: &str = "the router does not give ports (no answer to PCP, NAT-PMP or UPnP)";
+    let described = std::env::var("CARDINAL_TEST_UPNP").ok();
+    if gateway.ip().is_loopback() && described.is_none() {
+        return Err(NONE.into());
+    }
+    let g = crate::upnp::find(Some(gateway.ip()), described)
+        .await
+        .map_err(|e| {
+            if e.starts_with("no UPnP router") {
+                NONE.to_owned()
+            } else {
+                e
+            }
+        })?;
+    let (ip, lifetime) = crate::upnp::map(&g, client, port, lifetime).await?;
+    Ok(Mapping {
+        protocol: Protocol::Upnp,
+        external: SocketAddr::new(ip, port),
         internal_port: port,
         lifetime,
     })

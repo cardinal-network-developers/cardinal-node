@@ -74,3 +74,78 @@ fn a_device_asks_its_router_for_a_port_and_says_what_it_got() {
     let _ = d.try_cli(&["stop"]);
     let _ = child.wait();
 }
+
+/// A UPnP router: its description, and a port for anyone who asks.
+fn upnp_router() -> String {
+    use std::io::{Read, Write};
+    let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let at = l.local_addr().unwrap();
+    std::thread::spawn(move || {
+        for s in l.incoming() {
+            let Ok(mut s) = s else { return };
+            let mut got = Vec::new();
+            let mut buf = [0u8; 4096];
+            s.set_read_timeout(Some(std::time::Duration::from_millis(300)))
+                .unwrap();
+            while let Ok(n) = s.read(&mut buf) {
+                if n == 0 {
+                    break;
+                }
+                got.extend_from_slice(&buf[..n]);
+                let t = String::from_utf8_lossy(&got);
+                if t.starts_with("GET ") && t.contains("\r\n\r\n") || t.ends_with("</s:Envelope>") {
+                    break;
+                }
+            }
+            let t = String::from_utf8_lossy(&got);
+            let body = if t.starts_with("GET ") {
+                "<root><device><serviceList><service>\
+                 <serviceType>urn:schemas-upnp-org:service:WANIPConnection:1</serviceType>\
+                 <controlURL>/ctl/IPConn</controlURL></service></serviceList></device></root>"
+            } else if t.contains("#GetExternalIPAddress") {
+                "<s:Envelope><s:Body><NewExternalIPAddress>198.51.100.7</NewExternalIPAddress></s:Body></s:Envelope>"
+            } else {
+                "<s:Envelope><s:Body></s:Body></s:Envelope>"
+            };
+            let _ = write!(
+                s,
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+        }
+    });
+    format!("http://{at}/rootDesc.xml")
+}
+
+#[test]
+fn a_router_that_speaks_only_upnp_gives_a_port_too() {
+    let root = tempfile::tempdir().unwrap();
+    // Says nothing to PCP or NAT-PMP, as most home routers.
+    let silent = UdpSocket::bind("127.0.0.1:0").unwrap();
+    let mut d = Dev::new(root.path(), "ana", free_port());
+    d.env.push((
+        "CARDINAL_TEST_GATEWAY".into(),
+        silent.local_addr().unwrap().to_string(),
+    ));
+    d.env.push(("CARDINAL_TEST_UPNP".into(), upnp_router()));
+    let log = std::fs::File::create(d.home.join("daemon.log")).unwrap();
+    let mut child = d
+        .cmd()
+        .args(["daemon", "--no-discovery", "--no-mount", "--listen"])
+        .arg(format!("0.0.0.0:{}", d.port))
+        .stdout(Stdio::null())
+        .stderr(log)
+        .spawn()
+        .unwrap();
+    wait("the service up", 20, || {
+        d.try_cli(&["status", "--json"]).status.success()
+    });
+    let want = format!("198.51.100.7:{}", d.port);
+    wait("a port by UPnP", 30, || {
+        d.status()["router"]["external"] == want.as_str()
+    });
+    assert_eq!(d.status()["router"]["protocol"], "UPnP");
+    let _ = d.try_cli(&["stop"]);
+    let _ = child.wait();
+    drop(silent);
+}
