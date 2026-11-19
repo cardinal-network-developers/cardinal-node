@@ -1085,6 +1085,69 @@ fn the_epoch_key_is_in_the_clear_in_a_public_space_and_in_no_other() {
 /// another would set differently. It once grew without end: each device
 /// took the other's stale token for its own to renew, and then each set
 /// "the one result" by its own view of the account.
+/// The tokens a person ever gave in a space are known from the entries
+/// present, however they arrived: one held for its parent counts once the
+/// parent comes, and not before. (They are kept as entries arrive, since a
+/// host asks at every batch, and going through the history each time was
+/// quadratic over a large first sync.)
+#[test]
+fn every_token_given_is_known_however_the_entries_arrive() {
+    use cardinal_space::relationship::{reach_ever, Reach};
+    let p = person(9, 0);
+    let other = person(10, 0);
+    let me = p.log.id();
+    let (mut a, genesis) = Space::create_with(
+        Profile::RELATIONSHIP,
+        Policy::default(),
+        &p.log,
+        &p.devices[0].signing,
+        &[p.enc.public_key(), other.enc.public_key()],
+        relationship::genesis_ops(me, other.log.id()),
+        None,
+    )
+    .unwrap();
+    let one = |token: u8| Reach {
+        endpoints: Vec::new(),
+        host: [0xa0; 32],
+        token: [token; 16],
+    };
+    let first = a
+        .write(
+            &p.log,
+            &p.devices[0].signing,
+            vec![relationship::set_reach(&me, &[one(1)])],
+            None,
+        )
+        .unwrap();
+    let second = a
+        .write(
+            &p.log,
+            &p.devices[0].signing,
+            vec![relationship::set_reach(&me, &[one(2)])],
+            None,
+        )
+        .unwrap();
+    let tokens = |s: &Space| {
+        let mut t: Vec<u8> = reach_ever(s, &me).iter().map(|r| r.token[0]).collect();
+        t.sort();
+        t
+    };
+    assert_eq!(tokens(&a), [1, 2]);
+
+    let mut b = Space::open_genesis(&genesis, &[&p.enc], Some(p.log.state())).unwrap();
+    b.receive(second, &[&p.enc]).unwrap();
+    assert_eq!(
+        tokens(&b),
+        Vec::<u8>::new(),
+        "held for its parent, it is not here yet"
+    );
+    b.receive(first.clone(), &[&p.enc]).unwrap();
+    assert_eq!(tokens(&b), [1, 2]);
+    // The same entry again changes nothing.
+    b.receive(first, &[&p.enc]).unwrap();
+    assert_eq!(tokens(&b), [1, 2]);
+}
+
 #[test]
 fn two_hosts_setting_the_reach_list_at_once_are_each_one_host() {
     use cardinal_space::relationship::{reach_ever, reach_of, Reach};

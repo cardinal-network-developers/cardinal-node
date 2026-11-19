@@ -296,23 +296,29 @@ pub fn naming_began(space: &crate::Space, who: &IdentityId) -> Vec<EntryId> {
 /// something was left under, and the tokens to end when the list is
 /// emptied or a contact refused.
 pub fn reach_ever(space: &crate::Space, who: &IdentityId) -> Vec<Reach> {
-    let node = reach_node_id(who);
+    space.reach_written_by(who).to_vec()
+}
+
+/// The reach lists one entry writes in its author's reach node: what the
+/// space keeps for [`reach_ever`] as entries arrive.
+pub fn reach_written(e: &crate::SpaceEntry) -> Vec<Reach> {
+    let node = reach_node_id(&e.author());
     let mut all: Vec<Reach> = Vec::new();
-    for (_, e) in space.dag().iter().filter(|(_, e)| e.author() == *who) {
-        for op in e.ops() {
-            let crate::SpaceOpBody::Set {
-                node: n,
-                key: 1,
-                value: Some(v),
-                ..
-            } = op.body()
-            else {
-                continue;
-            };
-            let list = v.as_list().unwrap_or_default();
-            let given = list.iter().filter_map(|v| read_reach(v.as_record()?));
-            all.extend(given.filter(|_| *n == node));
+    for op in e.ops() {
+        let crate::SpaceOpBody::Set {
+            node: n,
+            key: 1,
+            value: Some(v),
+            ..
+        } = op.body()
+        else {
+            continue;
+        };
+        if *n != node {
+            continue;
         }
+        let list = v.as_list().unwrap_or_default();
+        all.extend(list.iter().filter_map(|v| read_reach(v.as_record()?)));
     }
     all
 }

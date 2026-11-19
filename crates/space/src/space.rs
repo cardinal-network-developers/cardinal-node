@@ -53,6 +53,11 @@ pub struct Space {
     valid_heads: BTreeSet<EntryId>,
     current_epoch: Option<(EntryId, EpochId)>,
     stats: UpdateStats,
+    /// Every reach list each member ever wrote in their reach node, valid
+    /// or not, as entries arrive: what [`crate::relationship::reach_ever`]
+    /// gives, without going through the whole history each time a host
+    /// asks which tokens it gave here.
+    reach_written: HashMap<IdentityId, Vec<crate::relationship::Reach>>,
 }
 
 /// The cited head for a new entry by `device`: the last entry in log order
@@ -154,6 +159,7 @@ impl Space {
             valid_heads: BTreeSet::new(),
             current_epoch: None,
             stats: UpdateStats::default(),
+            reach_written: HashMap::new(),
         };
         if let Some(a) = author {
             space.judge.set_state(&space.dag, a);
@@ -278,6 +284,14 @@ impl Space {
     }
 
     /// The opened entries.
+    /// Every reach list `who` ever wrote here, as [`crate::relationship::reach_ever`].
+    pub fn reach_written_by(&self, who: &IdentityId) -> &[crate::relationship::Reach] {
+        self.reach_written
+            .get(who)
+            .map(Vec::as_slice)
+            .unwrap_or_default()
+    }
+
     pub fn dag(&self) -> &Dag<SpaceEntry> {
         &self.dag
     }
@@ -547,6 +561,16 @@ impl Space {
         let id = e.id();
         let r = self.dag.insert(id, e.parents().to_vec(), e);
         if let Inserted::Added(added) = &r {
+            for x in added {
+                let e = self.dag.get(x).expect("added");
+                let given = crate::relationship::reach_written(e);
+                if !given.is_empty() {
+                    self.reach_written
+                        .entry(e.author())
+                        .or_default()
+                        .extend(given);
+                }
+            }
             for x in added {
                 let changed = self.judge.arrive(&self.dag, x);
                 self.took(Some(x), changed);
