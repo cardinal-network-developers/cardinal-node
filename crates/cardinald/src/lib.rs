@@ -35,6 +35,7 @@ pub mod news;
 pub mod onefolder;
 pub mod pair;
 pub mod paths;
+pub mod portmap;
 pub mod recovery;
 pub mod rendezvous;
 pub mod sched;

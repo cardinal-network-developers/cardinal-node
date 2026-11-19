@@ -254,6 +254,8 @@ pub struct Daemon {
     pub call_ended: Mutex<Option<serde_json::Value>>,
     /// The last thing copied on any of this person's devices (`clipboard.rs`).
     pub clip: Mutex<Option<crate::clipboard::Clip>>,
+    /// The port the router gave, if it gave one (`portmap.rs`).
+    pub portmap: Mutex<crate::portmap::State>,
     /// The group calls this device is on or carries, by call.
     pub group_calls: Mutex<HashMap<[u8; 16], crate::calls::Group>>,
     /// The group calls this device rang for lately, or its person made.
@@ -508,6 +510,7 @@ impl Daemon {
             call: Mutex::new(None),
             call_ended: Mutex::new(None),
             clip: Mutex::new(None),
+            portmap: Mutex::new(crate::portmap::State::default()),
             group_calls: Mutex::new(HashMap::new()),
             rung_calls: Mutex::new(std::collections::VecDeque::new()),
             passed_rings: Mutex::new(std::collections::VecDeque::new()),
@@ -1912,6 +1915,9 @@ impl Daemon {
             }
         });
         self.housekeeping();
+        if self.config().port_mapping {
+            tokio::spawn(crate::portmap::keep(self.clone()));
+        }
 
         let mut stop = self.stopping.subscribe();
         tokio::select! {

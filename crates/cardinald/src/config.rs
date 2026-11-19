@@ -69,6 +69,8 @@ pub struct Config {
     pub pins: Vec<String>,
     /// LAN discovery by multicast DNS.
     pub discovery: bool,
+    /// Ask the router for a port, by PCP or NAT-PMP (`portmap.rs`).
+    pub port_mapping: bool,
     /// The multicast DNS port (5353; tests use another).
     pub mdns_port: u16,
     /// This device is a host for its own identity (`host.rs`).
@@ -89,6 +91,7 @@ impl Default for Config {
             peers: Vec::new(),
             pins: Vec::new(),
             discovery: true,
+            port_mapping: true,
             mdns_port: 5353,
             host: false,
         }

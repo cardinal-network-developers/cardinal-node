@@ -399,19 +399,22 @@ fn observed(s: &Session) -> Option<SocketAddr> {
     s.remote_addr().filter(|_| udp)
 }
 
-/// The addresses this device has on its own networks.
+/// The addresses this device has on its own networks, and the one its
+/// router gave it outside, if it gave one.
 fn local_addresses(d: &Daemon) -> Vec<SocketAddr> {
     let Some(udp) = d.endpoint.udp_addr() else {
         return Vec::new();
     };
-    if udp.ip().is_unspecified() {
+    let mut all: Vec<SocketAddr> = if udp.ip().is_unspecified() {
         let ips = crate::daemon::local_ips();
         ips.into_iter()
             .map(|ip| SocketAddr::new(ip, udp.port()))
             .collect()
     } else {
         vec![udp]
-    }
+    };
+    all.extend(crate::portmap::external(d).filter(|e| !all.contains(e)));
+    all
 }
 
 /// The sessions with this person's devices that can help: one hop, so not

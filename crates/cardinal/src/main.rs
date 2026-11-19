@@ -1486,6 +1486,18 @@ fn print_status(v: &Value) {
             );
         }
     }
+    // What the router gave, or why it gave nothing.
+    let router = &v["router"];
+    if let Some(at) = router["external"].as_str() {
+        println!(
+            "Router: reaches this device from outside at {at} ({}).",
+            router["protocol"].as_str().unwrap_or("")
+        );
+    } else if let Some(why) = router["error"].as_str() {
+        println!(
+            "Router: gives no port: {why}. A forward set up by hand, or a host, does instead."
+        );
+    }
     println!("Devices:");
     print_devices(&v["devices"]);
     let p = &v["progress"];

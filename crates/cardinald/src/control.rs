@@ -907,6 +907,7 @@ fn status(d: &Arc<Daemon>) -> Value {
     };
     json!({
         "name": cfg.name,
+        "router": d.portmap.lock().unwrap_or_else(|e| e.into_inner()).status(),
         "home": d.paths.home.display().to_string(),
         "identity": identity,
         "listen": d.endpoint.tcp_addr().map(|a| a.to_string()),
