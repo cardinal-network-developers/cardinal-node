@@ -149,3 +149,31 @@ fn a_router_that_speaks_only_upnp_gives_a_port_too() {
     let _ = child.wait();
     drop(silent);
 }
+
+/// Where the system does not say which is the gateway (Windows, Android),
+/// UPnP finds the router itself.
+#[test]
+fn a_device_that_cannot_name_its_gateway_finds_a_upnp_router() {
+    let root = tempfile::tempdir().unwrap();
+    let mut d = Dev::new(root.path(), "ana", free_port());
+    d.env.push(("CARDINAL_TEST_GATEWAY".into(), "none".into()));
+    d.env.push(("CARDINAL_TEST_UPNP".into(), upnp_router()));
+    let log = std::fs::File::create(d.home.join("daemon.log")).unwrap();
+    let mut child = d
+        .cmd()
+        .args(["daemon", "--no-discovery", "--no-mount", "--listen"])
+        .arg(format!("0.0.0.0:{}", d.port))
+        .stdout(Stdio::null())
+        .stderr(log)
+        .spawn()
+        .unwrap();
+    wait("the service up", 20, || {
+        d.try_cli(&["status", "--json"]).status.success()
+    });
+    let want = format!("198.51.100.7:{}", d.port);
+    wait("a port by UPnP", 20, || {
+        d.status()["router"]["external"] == want.as_str()
+    });
+    let _ = d.try_cli(&["stop"]);
+    let _ = child.wait();
+}

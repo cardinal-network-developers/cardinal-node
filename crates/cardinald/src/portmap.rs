@@ -196,14 +196,14 @@ pub fn natpmp_mapped(b: &[u8], port: u16) -> Option<Result<(u16, u32), u16>> {
     Some(Ok((external, lifetime)))
 }
 
-/// The default gateway: `CARDINAL_TEST_GATEWAY` (an address and port, for
-/// tests), or on Linux the default route's.
+/// The default gateway: `CARDINAL_TEST_GATEWAY` (an address and port, or
+/// `none`, for tests), or on Linux the default route's.
 pub fn gateway() -> Option<SocketAddr> {
-    if let Some(at) = std::env::var("CARDINAL_TEST_GATEWAY")
-        .ok()
-        .and_then(|a| a.parse().ok())
-    {
-        return Some(at);
+    match std::env::var("CARDINAL_TEST_GATEWAY").ok().as_deref() {
+        // as on a system that does not say which is the gateway
+        Some("none") => return None,
+        Some(at) => return at.parse().ok(),
+        None => {}
     }
     let routes = std::fs::read_to_string("/proc/net/route").ok()?;
     default_gateway(&routes).map(|ip| SocketAddr::new(IpAddr::V4(ip), PORT))
@@ -314,6 +314,36 @@ async fn upnp(
     })
 }
 
+/// UPnP alone, from the address this device faces its network with.
+async fn upnp_only(port: u16, lifetime: u32) -> Result<Mapping, String> {
+    let probe = UdpSocket::bind("0.0.0.0:0")
+        .await
+        .map_err(|e| e.to_string())?;
+    // A connected socket says which address it would send from; nothing is sent.
+    probe
+        .connect("239.255.255.250:1900")
+        .await
+        .map_err(|e| e.to_string())?;
+    let client = probe.local_addr().map_err(|e| e.to_string())?.ip();
+    let g = crate::upnp::find(None, std::env::var("CARDINAL_TEST_UPNP").ok())
+        .await
+        .map_err(|e| {
+            if e.starts_with("no UPnP router") {
+                "the router does not give ports by UPnP, and this system does not say which is the gateway"
+                    .to_owned()
+            } else {
+                e
+            }
+        })?;
+    let (ip, lifetime) = crate::upnp::map(&g, client, port, lifetime).await?;
+    Ok(Mapping {
+        protocol: Protocol::Upnp,
+        external: SocketAddr::new(ip, port),
+        internal_port: port,
+        lifetime,
+    })
+}
+
 /// The external address the router gave this device, while it holds.
 pub fn external(d: &Daemon) -> Option<SocketAddr> {
     let st = d.portmap.lock().unwrap_or_else(|e| e.into_inner());
@@ -332,8 +362,15 @@ pub async fn keep(d: Arc<Daemon>) {
         // reach it: no router is asked.
         let udp = d.endpoint.udp_addr().filter(|a| !a.ip().is_loopback());
         let port = udp.map(|a| a.port());
-        let wait = match (gateway(), port) {
-            (Some(gw), Some(port)) => match map(gw, port, LIFETIME).await {
+        let asked = match (gateway(), port) {
+            (Some(gw), Some(port)) => Some(map(gw, port, LIFETIME).await),
+            // Where the gateway cannot be read (Windows, Android), UPnP
+            // finds the router itself.
+            (None, Some(port)) => Some(upnp_only(port, LIFETIME).await),
+            _ => None,
+        };
+        let wait = match asked {
+            Some(asked) => match asked {
                 Ok(m) => {
                     let half = Duration::from_secs(u64::from(m.lifetime.max(120)) / 2);
                     let fresh = external(&d) != Some(m.external);
