@@ -25,6 +25,8 @@ const SERVICES: [&str; 3] = [
 const WAIT: Duration = Duration::from_secs(3);
 /// The UPnP error for a router that keeps only mappings with no end.
 const ONLY_PERMANENT: &str = "725";
+/// The UPnP error for a port outside that another mapping has.
+const CONFLICT: &str = "718";
 
 /// The router's service that maps ports.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -45,6 +47,31 @@ pub fn location(answer: &str) -> Option<String> {
     })
 }
 
+/// Whether a path can go into a request line as it is: a router's
+/// description is anyone's on the network, and a space or a line break in
+/// it would write the rest of the request.
+fn safe_path(path: &str) -> bool {
+    path.starts_with('/') && path.bytes().all(|b| b > 0x20 && b != 0x7f)
+}
+
+/// Whether an address can be a router on this device's own network: not
+/// this device itself, nor anything beyond the network.
+fn on_the_network(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => v4.is_private() || v4.is_link_local(),
+        IpAddr::V6(v6) => {
+            let first = v6.segments()[0];
+            (first & 0xfe00) == 0xfc00 || (first & 0xffc0) == 0xfe80
+        }
+    }
+}
+
+/// Whether an SSDP answer from `from` naming `url` can be taken: the
+/// description is on the machine that answered, which is on this network.
+pub fn trusted_location(url: &str, from: IpAddr) -> bool {
+    split_url(url).is_some_and(|(at, _)| at.ip() == from && on_the_network(from))
+}
+
 /// An `http://host:port/path` address, as an address and a path.
 pub fn split_url(url: &str) -> Option<(SocketAddr, String)> {
     let rest = url.strip_prefix("http://")?;
@@ -57,7 +84,7 @@ pub fn split_url(url: &str) -> Option<(SocketAddr, String)> {
     } else {
         SocketAddr::new(host.parse().ok()?, 80)
     };
-    Some((at, path))
+    safe_path(&path).then_some((at, path))
 }
 
 /// What one tag holds, the first time it comes in `xml`.
@@ -72,9 +99,12 @@ fn tag<'a>(xml: &'a str, name: &str) -> Option<&'a str> {
 /// address made whole from where the description came from.
 pub fn gateway_in(description: &str, from: &str) -> Option<Gateway> {
     let (from_at, _) = split_url(from)?;
+    // Only the host the description came from: a description could name
+    // any address, this device's own services or one beyond the network.
     let base = tag(description, "URLBase")
         .and_then(split_url)
-        .map(|(at, _)| at);
+        .map(|(at, _)| at)
+        .filter(|at| at.ip() == from_at.ip());
     for wanted in SERVICES {
         let mut rest = description;
         while let Some(i) = rest.find("<service>") {
@@ -88,16 +118,18 @@ pub fn gateway_in(description: &str, from: &str) -> Option<Gateway> {
                 continue;
             }
             let control = tag(service, "controlURL")?;
-            let (at, path) = match split_url(control) {
-                Some(whole) => whole,
-                None => {
-                    let path = if control.starts_with('/') {
-                        control.to_owned()
-                    } else {
-                        format!("/{control}")
-                    };
-                    (base.unwrap_or(from_at), path)
+            let (at, path) = if control.starts_with("http://") {
+                split_url(control).filter(|(at, _)| at.ip() == from_at.ip())?
+            } else {
+                let path = if control.starts_with('/') {
+                    control.to_owned()
+                } else {
+                    format!("/{control}")
+                };
+                if !safe_path(&path) {
+                    return None;
                 }
+                (base.unwrap_or(from_at), path)
             };
             return Some(Gateway {
                 at,
@@ -173,6 +205,9 @@ async fn search(gateway_ip: Option<IpAddr>) -> Option<String> {
         let Some(url) = location(&String::from_utf8_lossy(&buf[..n])) else {
             continue;
         };
+        if !trusted_location(&url, from.ip()) {
+            continue;
+        }
         if Some(from.ip()) == gateway_ip {
             return Some(url);
         }
@@ -210,15 +245,19 @@ pub async fn map(
     client: IpAddr,
     port: u16,
     lifetime: u32,
-) -> Result<(IpAddr, u32), String> {
+) -> Result<(IpAddr, u16, u32), String> {
     let mut lease = lifetime;
+    // Another device behind the same router may hold the port outside:
+    // then the next few are asked for.
+    let mut external = port;
+    let mut taken = 0;
     loop {
         let add = soap(
             g,
             "AddPortMapping",
             &[
                 ("NewRemoteHost", String::new()),
-                ("NewExternalPort", port.to_string()),
+                ("NewExternalPort", external.to_string()),
                 ("NewProtocol", "UDP".into()),
                 ("NewInternalPort", port.to_string()),
                 ("NewInternalClient", client.to_string()),
@@ -236,16 +275,22 @@ pub async fn map(
             lease = 0;
             continue;
         }
+        if code == CONFLICT && taken < 10 {
+            taken += 1;
+            external = external.checked_add(1).unwrap_or(1024);
+            continue;
+        }
         let what = tag(&body, "errorDescription").unwrap_or("");
         return Err(format!("the router said no (UPnP {code} {what})").replace("  ", " "));
     }
     let (status, body) = exchange(g.at, &soap(g, "GetExternalIPAddress", &[])).await?;
     let ip = tag(&body, "NewExternalIPAddress")
-        .and_then(|a| a.parse().ok())
+        .and_then(|a| a.parse::<IpAddr>().ok())
+        .filter(|ip| !ip.is_loopback() && !ip.is_unspecified() && !ip.is_multicast())
         .filter(|_| status == 200)
         .ok_or("the router mapped the port but did not say its own address")?;
     // No end: asked again as often as one that has one, to stay mapped.
-    Ok((ip, if lease == 0 { lifetime } else { lease }))
+    Ok((ip, external, if lease == 0 { lifetime } else { lease }))
 }
 
 #[cfg(test)]
@@ -291,6 +336,33 @@ pub(crate) mod tests {
         assert_eq!(g.path, "/ctl/IPConn");
         assert_eq!(g.service, "urn:schemas-upnp-org:service:WANIPConnection:1");
         assert_eq!(gateway_in("<root></root>", "http://172.20.0.1/x"), None);
+    }
+
+    #[test]
+    fn what_the_network_says_cannot_steer_the_requests_elsewhere() {
+        let from = "http://172.20.0.1:2189/rootDesc.xml";
+        let with = |control: &str| {
+            let tag = format!("<controlURL>{control}</controlURL>");
+            DESCRIPTION.replace("<controlURL>/ctl/IPConn</controlURL>", &tag)
+        };
+        // a line break or a space would write the rest of the request
+        let injected = "/x HTTP/1.1\r\nHost: evil\r\n\r\nDELETE /admin";
+        assert_eq!(gateway_in(&with(injected), from), None);
+        assert_eq!(gateway_in(&with("http://172.20.0.1:5000/x y"), from), None);
+        // another host, this device's own services among them
+        assert_eq!(gateway_in(&with("http://127.0.0.1:631/x"), from), None);
+        assert_eq!(gateway_in(&with("http://203.0.113.9/ctl"), from), None);
+        // the same host, another port, is a router's own
+        let g = gateway_in(&with("http://172.20.0.1:5000/ctl"), from).unwrap();
+        assert_eq!(g.at.to_string(), "172.20.0.1:5000");
+        // an answer to the search is taken only from the machine it names, on this network
+        let lan: IpAddr = "172.20.0.1".parse().unwrap();
+        assert!(trusted_location(from, lan));
+        assert!(!trusted_location(from, "172.20.0.9".parse().unwrap()));
+        let local: IpAddr = "127.0.0.1".parse().unwrap();
+        assert!(!trusted_location("http://127.0.0.1:2189/d.xml", local));
+        let far: IpAddr = "203.0.113.9".parse().unwrap();
+        assert!(!trusted_location("http://203.0.113.9/d.xml", far));
     }
 
     #[test]
@@ -357,6 +429,13 @@ pub(crate) mod tests {
                                      <errorDescription>OnlyPermanentLeasesSupported</errorDescription>\
                                      </UPnPError></detail></s:Fault></s:Body></s:Envelope>";
                         ("500 Internal Server Error", fault.to_owned())
+                    } else if text.contains("#AddPortMapping")
+                        && text.contains("<NewExternalPort>47555<")
+                    {
+                        // another device has that port outside
+                        let fault = "<s:Envelope><s:Body><s:Fault><detail><UPnPError>\
+                                     <errorCode>718</errorCode></UPnPError></detail></s:Fault></s:Body></s:Envelope>";
+                        ("500 Internal Server Error", fault.to_owned())
                     } else if text.contains("#AddPortMapping") {
                         (
                             "200 OK",
@@ -385,16 +464,25 @@ pub(crate) mod tests {
         let (url, asked) = router().await;
         let g = find(None, Some(url)).await.unwrap();
         let client: IpAddr = "192.168.1.20".parse().unwrap();
-        let (ip, lifetime) = map(&g, client, 47555, 7200).await.unwrap();
+        let (ip, external, lifetime) = map(&g, client, 47555, 7200).await.unwrap();
         assert_eq!(ip.to_string(), "198.51.100.7");
+        assert_eq!(
+            external, 47556,
+            "the port outside another device has is passed over"
+        );
         assert_eq!(lifetime, 7200, "renewed as often as one with an end");
         let asked = asked.lock().unwrap();
         let adds: Vec<&String> = asked
             .iter()
             .filter(|r| r.contains("#AddPortMapping"))
             .collect();
-        assert_eq!(adds.len(), 2, "with an end, then with none");
-        assert!(adds[1].contains("<NewInternalClient>192.168.1.20</NewInternalClient>"));
-        assert!(adds[1].contains("<NewProtocol>UDP</NewProtocol>"));
+        assert_eq!(
+            adds.len(),
+            3,
+            "with an end, then with none, then the next port"
+        );
+        assert!(adds[2].contains("<NewInternalClient>192.168.1.20</NewInternalClient>"));
+        assert!(adds[2].contains("<NewInternalPort>47555</NewInternalPort>"));
+        assert!(adds[2].contains("<NewProtocol>UDP</NewProtocol>"));
     }
 }

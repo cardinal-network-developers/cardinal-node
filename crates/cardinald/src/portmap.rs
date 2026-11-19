@@ -205,6 +205,18 @@ pub fn gateway() -> Option<SocketAddr> {
         Some(at) => return at.parse().ok(),
         None => {}
     }
+    system_gateway()
+}
+
+/// Whether a test named a gateway it did not mean: then no router is asked,
+/// rather than the real one by way of UPnP.
+fn test_gateway_mistyped() -> bool {
+    std::env::var("CARDINAL_TEST_GATEWAY")
+        .is_ok_and(|g| g != "none" && g.parse::<SocketAddr>().is_err())
+}
+
+/// The default route's gateway, on Linux.
+fn system_gateway() -> Option<SocketAddr> {
     let routes = std::fs::read_to_string("/proc/net/route").ok()?;
     default_gateway(&routes).map(|ip| SocketAddr::new(IpAddr::V4(ip), PORT))
 }
@@ -249,7 +261,19 @@ async fn ask<T>(sock: &UdpSocket, request: &[u8], read: impl Fn(&[u8]) -> Option
 }
 
 /// Asks the router at `gateway` for UDP `port`: PCP, then NAT-PMP.
-pub async fn map(gateway: SocketAddr, port: u16, lifetime: u32) -> Result<Mapping, String> {
+/// The nonce of this device's PCP mapping of `port`: the same each time,
+/// renewals and restarts included, as RFC 6887 (11.2) asks of a renewal.
+pub fn nonce_for(device: &[u8], port: u16) -> [u8; 12] {
+    let h = cardinal_crypto::hash(&[device, b"cardinal pcp nonce", &port.to_be_bytes()].concat());
+    h[..12].try_into().expect("12 bytes")
+}
+
+pub async fn map(
+    gateway: SocketAddr,
+    port: u16,
+    lifetime: u32,
+    nonce: [u8; 12],
+) -> Result<Mapping, String> {
     let bind: SocketAddr = match gateway {
         SocketAddr::V4(_) => "0.0.0.0:0".parse().expect("address"),
         SocketAddr::V6(_) => "[::]:0".parse().expect("address"),
@@ -257,7 +281,6 @@ pub async fn map(gateway: SocketAddr, port: u16, lifetime: u32) -> Result<Mappin
     let sock = UdpSocket::bind(bind).await.map_err(|e| e.to_string())?;
     sock.connect(gateway).await.map_err(|e| e.to_string())?;
     let client = sock.local_addr().map_err(|e| e.to_string())?.ip();
-    let nonce: [u8; 12] = cardinal_crypto::random_bytes();
     let request = pcp_request(client, port, lifetime, nonce);
     match ask(&sock, &request, |b| pcp_answer(b, port, nonce)).await {
         Some(Answer::Mapped(m)) => return Ok(m),
@@ -305,10 +328,10 @@ async fn upnp(
                 e
             }
         })?;
-    let (ip, lifetime) = crate::upnp::map(&g, client, port, lifetime).await?;
+    let (ip, external, lifetime) = crate::upnp::map(&g, client, port, lifetime).await?;
     Ok(Mapping {
         protocol: Protocol::Upnp,
-        external: SocketAddr::new(ip, port),
+        external: SocketAddr::new(ip, external),
         internal_port: port,
         lifetime,
     })
@@ -335,10 +358,10 @@ async fn upnp_only(port: u16, lifetime: u32) -> Result<Mapping, String> {
                 e
             }
         })?;
-    let (ip, lifetime) = crate::upnp::map(&g, client, port, lifetime).await?;
+    let (ip, external, lifetime) = crate::upnp::map(&g, client, port, lifetime).await?;
     Ok(Mapping {
         protocol: Protocol::Upnp,
-        external: SocketAddr::new(ip, port),
+        external: SocketAddr::new(ip, external),
         internal_port: port,
         lifetime,
     })
@@ -362,8 +385,10 @@ pub async fn keep(d: Arc<Daemon>) {
         // reach it: no router is asked.
         let udp = d.endpoint.udp_addr().filter(|a| !a.ip().is_loopback());
         let port = udp.map(|a| a.port());
+        let device = d.keys.link.public_key().x25519().to_vec();
         let asked = match (gateway(), port) {
-            (Some(gw), Some(port)) => Some(map(gw, port, LIFETIME).await),
+            _ if test_gateway_mistyped() => None,
+            (Some(gw), Some(port)) => Some(map(gw, port, LIFETIME, nonce_for(&device, port)).await),
             // Where the gateway cannot be read (Windows, Android), UPnP
             // finds the router itself.
             (None, Some(port)) => Some(upnp_only(port, LIFETIME).await),
@@ -498,6 +523,13 @@ mod tests {
     }
 
     #[test]
+    fn a_mapping_keeps_its_nonce_and_each_port_and_device_has_its_own() {
+        assert_eq!(nonce_for(b"device", 47555), nonce_for(b"device", 47555));
+        assert_ne!(nonce_for(b"device", 47555), nonce_for(b"device", 47556));
+        assert_ne!(nonce_for(b"device", 47555), nonce_for(b"other", 47555));
+    }
+
+    #[test]
     fn the_default_gateway_is_read_from_the_routing_table() {
         let routes = "Iface\tDestination\tGateway \tFlags\tRefCnt\tUse\tMetric\tMask\n\
                       wlp0s20f3\t00000000\t011414AC\t0003\t0\t0\t600\t00000000\n\
@@ -542,12 +574,14 @@ mod tests {
 
     #[tokio::test]
     async fn a_router_that_speaks_pcp_gives_a_port_and_one_that_speaks_nat_pmp_too() {
-        let m = map(router(true).await, 47555, 7200).await.unwrap();
+        let m = map(router(true).await, 47555, 7200, [7; 12]).await.unwrap();
         assert_eq!(
             (m.protocol, m.external),
             (Protocol::Pcp, "203.0.113.5:60001".parse().unwrap())
         );
-        let m = map(router(false).await, 47555, 7200).await.unwrap();
+        let m = map(router(false).await, 47555, 7200, [7; 12])
+            .await
+            .unwrap();
         assert_eq!(
             (m.protocol, m.external),
             (Protocol::NatPmp, "203.0.113.6:60002".parse().unwrap())
@@ -560,7 +594,7 @@ mod tests {
         let silent = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let at = silent.local_addr().unwrap();
         let t = Instant::now();
-        let e = map(at, 47555, 7200).await.unwrap_err();
+        let e = map(at, 47555, 7200, [7; 12]).await.unwrap_err();
         assert!(e.contains("does not give ports"), "{e}");
         assert!(t.elapsed() < Duration::from_secs(10), "{:?}", t.elapsed());
         drop(silent);

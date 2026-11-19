@@ -255,10 +255,18 @@ async fn handle_stream(d: &Arc<Daemon>, s: &Session, mut st: Stream) -> anyhow::
     }
     if st.service() == Service::EPHEMERAL {
         // One message: a clipboard's, named by its first field, or a call's.
-        let Some(v) = st
-            .recv_message_max(crate::clipboard::MAX_TEXT + 256)
-            .await?
-        else {
+        // Who sends it decides how much is read, before any of it is: only
+        // this person's own devices may send a copy, and to anyone else a
+        // call's signal is all there is. A stranger's is not read at all.
+        let most = match d.classify(s) {
+            PeerKind::Own(_) => crate::clipboard::MAX_TEXT + 256,
+            PeerKind::Contact(..) | PeerKind::Inviting(_, Some(_)) => crate::calls::MAX_SIGNAL,
+            _ => {
+                st.reset(0);
+                return Ok(());
+            }
+        };
+        let Some(v) = st.recv_message_max(most).await? else {
             return Ok(());
         };
         if crate::clipboard::is_clip(&v) {

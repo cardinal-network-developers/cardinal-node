@@ -70,7 +70,7 @@ const PROBE_FOR: Duration = Duration::from_secs(8);
 const ANSWER_AGAIN: Duration = Duration::from_secs(5);
 
 /// The longest signal: a kind, a space, a call, a number and an identity.
-const MAX_SIGNAL: usize = 192;
+pub const MAX_SIGNAL: usize = 192;
 /// How long a call rings before it stops.
 const RINGS_FOR: Duration = Duration::from_secs(45);
 /// How often a call looks at whether its session is still there.
@@ -85,6 +85,22 @@ const GONE_WITHIN: Duration = Duration::from_secs(12);
 /// or said no to it. Without it, nobody answered.
 const ANSWERED_ELSEWHERE: u64 = 1;
 const DECLINED_ELSEWHERE: u64 = 2;
+/// On an `end` a device sends a caller as it turns a ring away, `3:` 3 says
+/// it was busy (on another call, or rung too often), not that its person
+/// said no: their other devices' ringing then ends as unanswered.
+const BUSY: u64 = 3;
+
+/// Turns a ring away as busy.
+async fn busy(s: &Session, space: &SpaceId, id: &[u8; 16]) -> anyhow::Result<()> {
+    let end = Signal {
+        kind: END,
+        space: *space,
+        id: *id,
+        flag: Some(BUSY),
+        caller: None,
+    };
+    send(s, &end).await
+}
 
 /// When a call looks again, past the gap between two looks for one person.
 const LOOK_AGAIN: Duration = Duration::from_secs(6);
@@ -137,6 +153,8 @@ pub enum Ending {
     NotAnswered,
     /// This person called, and they said no.
     TheyDeclined,
+    /// This person called, and they were busy.
+    Busy,
     /// This person called, and hung up before anyone answered.
     Cancelled,
 }
@@ -151,6 +169,7 @@ impl Ending {
             Ending::Over => "over",
             Ending::NotAnswered => "not_answered",
             Ending::TheyDeclined => "they_declined",
+            Ending::Busy => "busy",
             Ending::Cancelled => "cancelled",
         }
     }
@@ -1582,7 +1601,7 @@ pub async fn serve(d: &Arc<Daemon>, s: &Session, mut st: Stream, v: Value) -> an
     };
     match kind {
         RING if !may_ring(d, &them) => {
-            tell(s, END, &space, &id).await?;
+            busy(s, &space, &id).await?;
         }
         RING => {
             // They turned to this person: look for them if this session goes.
@@ -1599,7 +1618,7 @@ pub async fn serve(d: &Arc<Daemon>, s: &Session, mut st: Stream, v: Value) -> an
                 busy
             };
             if busy {
-                tell(s, END, &space, &id).await?;
+                self::busy(s, &space, &id).await?;
             } else {
                 d.bump();
                 ring_out(d, id);
@@ -1616,7 +1635,7 @@ pub async fn serve(d: &Arc<Daemon>, s: &Session, mut st: Stream, v: Value) -> an
             }
             go_live(d, s, id);
             // Their other devices can stop ringing.
-            told_the_others(d, s, &them, &space, &id, ANSWERED_ELSEWHERE).await;
+            told_the_others(d, s, &them, &space, &id, Some(ANSWERED_ELSEWHERE)).await;
         }
         END => {
             let ended = {
@@ -1639,13 +1658,16 @@ pub async fn serve(d: &Arc<Daemon>, s: &Session, mut st: Stream, v: Value) -> an
                     (Standing::Ringing, Some(ANSWERED_ELSEWHERE)) => Ending::AnsweredElsewhere,
                     (Standing::Ringing, Some(DECLINED_ELSEWHERE)) => Ending::DeclinedElsewhere,
                     (Standing::Ringing, _) => Ending::Missed,
+                    (Standing::Calling, Some(BUSY)) => Ending::Busy,
                     (Standing::Calling, _) => Ending::TheyDeclined,
                     (Standing::Live, _) => Ending::Over,
                 };
                 finished(d, &call, how);
                 // A no on one device stops the others ringing.
                 if call.standing == Standing::Calling {
-                    told_the_others(d, s, &them, &space, &id, DECLINED_ELSEWHERE).await;
+                    // busy is not a no: to their other devices, it went unanswered
+                    let why = (sig.flag != Some(BUSY)).then_some(DECLINED_ELSEWHERE);
+                    told_the_others(d, s, &them, &space, &id, why).await;
                 }
             }
         }
@@ -1655,20 +1677,21 @@ pub async fn serve(d: &Arc<Daemon>, s: &Session, mut st: Stream, v: Value) -> an
 }
 
 /// Ends the ring on a person's devices other than the one that spoke,
-/// saying why (`ANSWERED_ELSEWHERE` or `DECLINED_ELSEWHERE`).
+/// saying why (`ANSWERED_ELSEWHERE` or `DECLINED_ELSEWHERE`), or nothing:
+/// nobody answered.
 async fn told_the_others(
     d: &Daemon,
     s: &Session,
     them: &[u8; 32],
     space: &SpaceId,
     id: &[u8; 16],
-    why: u64,
+    why: Option<u64>,
 ) {
     let end = Signal {
         kind: END,
         space: *space,
         id: *id,
-        flag: Some(why),
+        flag: why,
         caller: None,
     };
     for other in d.sessions_of(them) {

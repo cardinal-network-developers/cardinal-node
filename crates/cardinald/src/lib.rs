@@ -101,22 +101,86 @@ pub fn init_logging() {
     }
 }
 
-/// The log file at `path`, to append to; the old one moved aside if large.
-fn log_file(path: &std::path::Path) -> Option<std::fs::File> {
-    const KEEP: u64 = 1 << 20;
-    if std::fs::metadata(path).is_ok_and(|m| m.len() > KEEP) {
-        let mut old = path.as_os_str().to_owned();
-        old.push(".old");
-        let _ = std::fs::rename(path, old);
-    }
+/// The log file at `path`, appended to; moved aside to `.old` whenever it
+/// passes a mebibyte, at start or while running.
+fn log_file(path: &std::path::Path) -> Option<LogFile> {
     if let Some(dir) = path.parent() {
         let _ = std::fs::create_dir_all(dir);
     }
-    std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)
-        .ok()
+    let mut log = LogFile {
+        path: path.to_owned(),
+        file: None,
+        written: 0,
+    };
+    log.open();
+    log.file.is_some().then_some(log)
+}
+
+/// A log file that keeps itself to about a mebibyte, with one before it.
+struct LogFile {
+    path: std::path::PathBuf,
+    file: Option<std::fs::File>,
+    written: u64,
+}
+
+impl LogFile {
+    const KEEP: u64 = 1 << 20;
+
+    fn open(&mut self) {
+        let size = std::fs::metadata(&self.path).map(|m| m.len()).unwrap_or(0);
+        if size > Self::KEEP {
+            self.file = None;
+            let mut old = self.path.as_os_str().to_owned();
+            old.push(".old");
+            let _ = std::fs::rename(&self.path, old);
+        }
+        self.file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.path)
+            .ok();
+        self.written = std::fs::metadata(&self.path).map(|m| m.len()).unwrap_or(0);
+    }
+}
+
+impl std::io::Write for LogFile {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        if self.written > Self::KEEP {
+            self.open();
+        }
+        let Some(f) = self.file.as_mut() else {
+            return Ok(buf.len());
+        };
+        let n = f.write(buf)?;
+        self.written += n as u64;
+        Ok(n)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.file.as_mut().map_or(Ok(()), |f| f.flush())
+    }
+}
+
+#[cfg(test)]
+mod log_tests {
+    use std::io::Write;
+
+    #[test]
+    fn a_long_running_log_is_moved_aside_and_begun_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("service.log");
+        let mut log = super::log_file(&path).unwrap();
+        let line = [b'x'; 1000];
+        for _ in 0..2200 {
+            log.write_all(&line).unwrap();
+        }
+        let now = std::fs::metadata(&path).unwrap().len();
+        let old = std::fs::metadata(dir.path().join("service.log.old"))
+            .unwrap()
+            .len();
+        assert!(now <= (1 << 20) + 1000, "{now}");
+        assert!(old > 1 << 20, "{old}");
+    }
 }
 
 /// Settings given on the command line, overriding the saved ones.

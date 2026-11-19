@@ -424,6 +424,9 @@ pub(crate) struct Conn {
     last_send: Instant,
     /// Since when something sent has wanted an answer, with none come.
     unanswered: Option<Instant>,
+    /// The number of the first packet sent since then: an ack of it or a
+    /// later one answers, even of a packet already taken for lost.
+    unanswered_from: u64,
     /// When to ask again if there is still nothing.
     ask_again: Instant,
     pub stats: SessionStats,
@@ -514,6 +517,7 @@ impl Conn {
             last_recv: now,
             last_send: now,
             unanswered: None,
+            unanswered_from: 0,
             ask_again: now,
             stats: SessionStats::default(),
             scratch: Vec::with_capacity(packet::MAX_DATAGRAM),
@@ -695,7 +699,7 @@ impl Conn {
         self.stats.packets_received += 1;
         self.stats.bytes_received += pkt.len() as u64;
         self.last_recv = now;
-        // Over a carrier with acknowledgements, only one of a packet sent
+        // Over a carrier with acknowledgements, only an ack of a packet sent
         // since the asking answers it (`on_ack`): a packet the peer sent
         // before then, still on its way, says nothing of whether it is there
         // now. A reliable carrier has none, and any packet does.
@@ -994,7 +998,16 @@ impl Conn {
     }
 
     fn on_ack(&mut self, largest: u64, delay_us: u64, ranges: &[AckRange], now: Instant) {
-        if self.reliable || self.sent.is_empty() {
+        if self.reliable {
+            return;
+        }
+        // The peer acked something sent since the asking: it is there. A
+        // packet given up for lost while the round trip grew still counts
+        // when its ack comes, so the number decides, not what is in `sent`.
+        if self.unanswered.is_some() && largest >= self.unanswered_from {
+            self.unanswered = None;
+        }
+        if self.sent.is_empty() {
             return;
         }
         // Expand ranges.
@@ -1024,11 +1037,6 @@ impl Conn {
         }
         if newly.is_empty() {
             return;
-        }
-        if let Some(since) = self.unanswered {
-            if newly.iter().any(|(_, p)| p.time >= since) {
-                self.unanswered = None;
-            }
         }
         if self.largest_acked.is_none_or(|l| largest > l) {
             self.largest_acked = Some(largest);
@@ -1981,6 +1989,7 @@ impl Conn {
             self.activity_since_rekey = true;
             if self.unanswered.is_none() {
                 self.unanswered = Some(now);
+                self.unanswered_from = self.send_counter - 1;
                 self.ask_again = now + ASK_AGAIN;
             }
         }

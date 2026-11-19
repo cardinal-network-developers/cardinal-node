@@ -375,6 +375,83 @@ fn a_packet_sent_before_the_asking_does_not_answer_it() {
     assert!(matches!(p.a.close, Some(CloseReason::Idle)));
 }
 
+/// Two sessions over UDP whose round trip jumps from a few milliseconds to
+/// `one_way` each way after `after`, with a check at the start: when, if
+/// ever within `secs`, either closes.
+fn slow_path(one_way: Duration, after: Duration, secs: u64) -> Option<Duration> {
+    let mut p = kept_alive();
+    p.a.reliable = false;
+    p.b.reliable = false;
+    while p.pump() > 0 {}
+    let start = p.now;
+    let mut now = start;
+    let mut q: Vec<(Instant, bool, Vec<u8>)> = Vec::new();
+    p.a.check();
+    while now < start + Duration::from_secs(secs) {
+        if p.a.close.is_some() || p.b.close.is_some() {
+            return Some(now - start);
+        }
+        q.sort_by_key(|x| x.0);
+        while q.first().is_some_and(|x| x.0 <= now) {
+            let (_, to_b, mut v) = q.remove(0);
+            if to_b {
+                p.b.recv_packet(&mut v, &Path::Mem(2), now);
+            } else {
+                p.a.recv_packet(&mut v, &Path::Mem(1), now);
+            }
+        }
+        p.a.handle_timeout(now);
+        p.b.handle_timeout(now);
+        let delay = if now < start + after {
+            Duration::from_millis(5)
+        } else {
+            one_way
+        };
+        while let Some((_, pk)) = p.a.poll_transmit(now) {
+            q.push((now + delay, true, pk.to_vec()));
+        }
+        while let Some((_, pk)) = p.b.poll_transmit(now) {
+            q.push((now + delay, false, pk.to_vec()));
+        }
+        let mut next: Vec<Instant> =
+            p.a.poll_timeout()
+                .into_iter()
+                .chain(p.b.poll_timeout())
+                .collect();
+        next.extend(q.iter().map(|x| x.0));
+        let n = next
+            .into_iter()
+            .filter(|t| *t > now)
+            .min()
+            .unwrap_or(now + Duration::from_millis(10));
+        now = n
+            .min(now + Duration::from_millis(50))
+            .max(now + Duration::from_millis(1));
+    }
+    None
+}
+
+/// A round trip that grows past what the session learnt (a stalled Wi-Fi, a
+/// full uplink) has packets taken for lost before their acks come: those
+/// acks still answer, and a peer that answers everything is not dropped.
+#[test]
+fn a_round_trip_that_grows_does_not_close_a_session_that_answers() {
+    for one_way in [500u64, 1500] {
+        let after = Duration::from_millis(1);
+        assert_eq!(
+            slow_path(Duration::from_millis(one_way), after, 60),
+            None,
+            "{one_way} ms from the start"
+        );
+        let later = Duration::from_secs(25);
+        assert_eq!(
+            slow_path(Duration::from_millis(one_way), later, 60),
+            None,
+            "{one_way} ms after 25 s"
+        );
+    }
+}
+
 #[test]
 fn a_lost_ping_does_not_close_a_session() {
     let mut p = kept_alive();
