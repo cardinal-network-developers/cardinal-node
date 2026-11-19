@@ -1281,7 +1281,7 @@ impl Daemon {
     /// (`blobs.md#counting-copies`).
     fn ensure_placement(self: &Arc<Self>) -> anyhow::Result<()> {
         let _one = lock(&self.placement_lock);
-        let (acc, files, has_device, space_node, mine) = {
+        let (acc, files, has_device, space_node, mine, others, named) = {
             let core = self.core();
             let (Some(acc), Some(files)) = (core.account_id(), core.files_id()) else {
                 return Ok(());
@@ -1289,6 +1289,16 @@ impl Daemon {
             let st = core.spaces[&acc].space.as_ref().expect("open").state();
             let me = self.keys.key();
             let has_device = account::devices(st).iter().any(|d| d.key == me);
+            // What the person's devices call this one, renamed from any of them.
+            let named = account::devices(st)
+                .into_iter()
+                .find(|d| d.key == me)
+                .map(|d| d.name);
+            let others: Vec<String> = account::devices(st)
+                .into_iter()
+                .filter(|d| d.key != me)
+                .map(|d| d.name)
+                .collect();
             let rec = account::spaces(st).into_iter().find(|r| r.space == files);
             let space_node = rec.as_ref().map(|r| r.node);
             let mine: Vec<account::PlacementRecord> = rec
@@ -1299,13 +1309,33 @@ impl Daemon {
                         .collect()
                 })
                 .unwrap_or_default();
-            (acc, files, has_device, space_node, mine)
+            (acc, files, has_device, space_node, mine, others, named)
         };
+        if let Some(named) = named.filter(|n| !n.is_empty() && *n != self.config().name) {
+            tracing::info!("this device is called {named:?} now");
+            let mut saved = crate::config::Config::load(&self.paths.config())?;
+            saved.name = named.clone();
+            saved.save(&self.paths.config())?;
+            self.config().name = named;
+        }
         let me = self.keys.key();
         let cfg = self.config().clone();
         let mut ops = Vec::new();
         if !has_device {
-            ops.push(account::create_device(&me, &cfg.name, false, false));
+            // A device is also found by its name, so no two of a person's
+            // share one: a second "carbonite" becomes "carbonite 2".
+            let name = unique_name(&cfg.name, &others);
+            if name != cfg.name {
+                tracing::info!(
+                    "another of your devices is called {:?}: this one is {name:?}",
+                    cfg.name
+                );
+                let mut saved = crate::config::Config::load(&self.paths.config())?;
+                saved.name = name.clone();
+                saved.save(&self.paths.config())?;
+                self.config().name = name.clone();
+            }
+            ops.push(account::create_device(&me, &name, false, false));
         }
         match space_node {
             Some(node) if mine.is_empty() => {
@@ -2024,5 +2054,29 @@ mod book_tests {
         let b = book(&["172.20.0.251:7171"]);
         assert_eq!(b.at(&"172.20.0.251:7171".parse().unwrap()).len(), 1);
         assert!(b.at(&"172.20.0.251:7172".parse().unwrap()).is_empty());
+    }
+}
+
+/// `name`, or the first of "name 2", "name 3", ... that none of `others`
+/// is called, ignoring case.
+pub fn unique_name(name: &str, others: &[String]) -> String {
+    let taken = |n: &str| others.iter().any(|o| o.to_lowercase() == n.to_lowercase());
+    if !taken(name) {
+        return name.to_owned();
+    }
+    (2..)
+        .map(|i| format!("{name} {i}"))
+        .find(|n| !taken(n))
+        .expect("some number is free")
+}
+
+#[cfg(test)]
+mod unique_name_tests {
+    #[test]
+    fn a_name_another_device_has_gets_the_next_number() {
+        let others = vec!["Carbonite".to_owned(), "carbonite 2".to_owned()];
+        assert_eq!(super::unique_name("desk", &others), "desk");
+        assert_eq!(super::unique_name("carbonite", &others), "carbonite 3");
+        assert_eq!(super::unique_name("CARBONITE", &[]), "CARBONITE");
     }
 }

@@ -207,17 +207,27 @@ pub async fn type_code(
     };
     d.identity_changed();
     d.push_identity(vec![entry.encode()]);
-    // Name it in the account space.
-    let acc = d.core().account_id();
+    // Name it in the account space, by a name none of the person's other
+    // devices has: a device is also found by its name.
+    let (acc, others) = {
+        let core = d.core();
+        let others: Vec<String> = core
+            .account()
+            .and_then(|h| h.space.as_ref())
+            .map(|sp| {
+                account::devices(sp.state())
+                    .into_iter()
+                    .map(|r| r.name)
+                    .collect()
+            })
+            .unwrap_or_default();
+        (core.account_id(), others)
+    };
     if let Some(acc) = acc {
+        let name = crate::daemon::unique_name(&nd.name, &others);
         d.write_and_push(
             &acc,
-            vec![account::create_device(
-                &nd.signing_key,
-                &nd.name,
-                false,
-                false,
-            )],
+            vec![account::create_device(&nd.signing_key, &name, false, false)],
         )?;
     }
     // Where it listens: its advertised endpoint, at the address we reached.

@@ -177,3 +177,36 @@ fn the_command_line_renames_a_device() {
     let devices = a.cli(&["devices"]);
     assert!(devices.contains("Kitchen laptop"), "{devices}");
 }
+
+/// No two of a person's devices share a name, since a device is also found
+/// by it: one added under a name another has takes the next number.
+#[test]
+fn a_device_added_under_a_name_another_has_takes_the_next_number() {
+    if !fuse_available() {
+        eprintln!("skipping: /dev/fuse or fusermount3 is not available");
+        return;
+    }
+    let root = tempfile::tempdir().unwrap();
+    let mut a = Dev::new(root.path(), "alpha", free_port());
+    let mut b = Dev::new(root.path(), "beta", free_port());
+    a.start();
+    b.start();
+    a.cli(&["init", "--yes", "--name", "Ana"]);
+    a.wait_mounted();
+    pair_with(&a, &b, false, None, &["--device-name", "Alpha"], &[]);
+    wait("both listed", 60, || {
+        names(&a).len() == 2 && names(&b).len() == 2
+    });
+    assert_eq!(names(&a), ["alpha", "Alpha 2"]);
+    assert_eq!(names(&b), ["Alpha 2", "alpha"]);
+    let st = b.status();
+    let mine = st["devices"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|x| x["this"] == true)
+        .cloned();
+    assert_eq!(mine.unwrap()["name"], "Alpha 2");
+    // And it calls itself so too.
+    wait("it takes its name", 30, || b.status()["name"] == "Alpha 2");
+}
