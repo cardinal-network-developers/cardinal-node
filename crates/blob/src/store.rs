@@ -413,6 +413,16 @@ fn link(tmp: &Path, path: &Path) -> io::Result<bool> {
     }
 }
 
+/// Opens a file to flush it. Windows flushes only a file opened for writing,
+/// and says "access is denied" of one opened only to read.
+fn open_to_flush(p: &Path) -> io::Result<File> {
+    if cfg!(windows) {
+        OpenOptions::new().write(true).open(p)
+    } else {
+        File::open(p)
+    }
+}
+
 /// Flushes the data of each file, or of each directory with `dir`, many at
 /// once: far faster than one at a time on SSDs. Files gone meanwhile are
 /// skipped.
@@ -431,7 +441,7 @@ fn sync_paths(paths: &[PathBuf], dir: bool) -> io::Result<()> {
                         if dir && cfg!(windows) {
                             continue;
                         }
-                        match File::open(p) {
+                        match open_to_flush(p) {
                             Ok(f) if dir => f.sync_all()?,
                             Ok(f) => f.sync_data()?,
                             Err(e) if e.kind() == io::ErrorKind::NotFound => {}

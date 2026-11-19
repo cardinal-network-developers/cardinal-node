@@ -34,8 +34,11 @@ fn hx(b: impl AsRef<[u8]>) -> String {
 
 fn check_or_write(name: &str, value: Json) {
     let text = serde_json::to_string_pretty(&value).unwrap() + "\n";
-    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../vectors")
+    let path = // CARDINAL_VECTORS names the folder where a test runs away from
+        // the source, as on another system.
+        std::env::var_os("CARDINAL_VECTORS")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../vectors"))
         .join(name);
     if std::env::var_os("CARDINAL_WRITE_VECTORS").is_some() {
         std::fs::write(&path, text).unwrap();

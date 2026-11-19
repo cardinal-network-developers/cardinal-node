@@ -173,13 +173,33 @@ impl Paths {
 /// of what does.
 fn canonical(p: &Path) -> PathBuf {
     if let Ok(c) = std::fs::canonicalize(p) {
-        return c;
+        return plain(c);
     }
     match (p.parent(), p.file_name()) {
         (Some(up), Some(name)) => canonical(up).join(name),
         // ends in `..` or is a root: nothing better to say
         _ => p.to_path_buf(),
     }
+}
+
+/// The name other programs understand. On Windows `canonicalize` gives the
+/// extended form, `\\?\C:\...`, which many cannot use (a .NET `Uri` among
+/// them), and every path the service hands a window starts from this one.
+/// Rust adds the extended form itself where a path is too long without it.
+fn plain(c: PathBuf) -> PathBuf {
+    #[cfg(windows)]
+    {
+        use std::path::{Component, Prefix};
+        if let Some(Component::Prefix(p)) = c.components().next() {
+            let s = c.to_string_lossy();
+            match p.kind() {
+                Prefix::VerbatimDisk(_) => return PathBuf::from(&s[4..]),
+                Prefix::VerbatimUNC(..) => return PathBuf::from(format!(r"\\{}", &s[8..])),
+                _ => {}
+            }
+        }
+    }
+    c
 }
 
 fn absolute(p: &Path) -> PathBuf {
