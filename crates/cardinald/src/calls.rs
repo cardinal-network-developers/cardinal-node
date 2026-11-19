@@ -1600,6 +1600,14 @@ pub async fn serve(d: &Arc<Daemon>, s: &Session, mut st: Stream, v: Value) -> an
         return Ok(());
     };
     match kind {
+        // The call already ringing here, rung again over another session
+        // (one made since, or another found): not busy, and not another
+        // ring. The newer session is the one to answer on.
+        RING if again(d, &id, &them) => {
+            if let Some(c) = lock(d).as_mut().filter(|c| c.id == id && c.who == them) {
+                c.session = Some(s.clone());
+            }
+        }
         RING if !may_ring(d, &them) => {
             busy(s, &space, &id).await?;
         }
@@ -1674,6 +1682,13 @@ pub async fn serve(d: &Arc<Daemon>, s: &Session, mut st: Stream, v: Value) -> an
         _ => st.reset(0),
     }
     Ok(())
+}
+
+/// Whether `id` from `them` is the call already ringing here.
+fn again(d: &Daemon, id: &[u8; 16], them: &[u8; 32]) -> bool {
+    lock(d)
+        .as_ref()
+        .is_some_and(|c| c.id == *id && c.who == *them && c.standing == Standing::Ringing)
 }
 
 /// Ends the ring on a person's devices other than the one that spoke,

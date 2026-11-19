@@ -245,11 +245,13 @@ pub async fn map(
     client: IpAddr,
     port: u16,
     lifetime: u32,
+    held: Option<u16>,
 ) -> Result<(IpAddr, u16, u32), String> {
     let mut lease = lifetime;
     // Another device behind the same router may hold the port outside:
-    // then the next few are asked for.
-    let mut external = port;
+    // then the next few are asked for. What this device holds already is
+    // asked for first, so a renewal renews it.
+    let mut external = held.unwrap_or(port);
     let mut taken = 0;
     loop {
         let add = soap(
@@ -283,14 +285,59 @@ pub async fn map(
         let what = tag(&body, "errorDescription").unwrap_or("");
         return Err(format!("the router said no (UPnP {code} {what})").replace("  ", " "));
     }
+    // A mapping of another port outside, held before, would otherwise stay
+    // on a router that keeps mappings with no end.
+    if let Some(old) = held.filter(|h| *h != external) {
+        let delete = soap(
+            g,
+            "DeletePortMapping",
+            &[
+                ("NewRemoteHost", String::new()),
+                ("NewExternalPort", old.to_string()),
+                ("NewProtocol", "UDP".into()),
+            ],
+        );
+        let _ = exchange(g.at, &delete).await;
+    }
     let (status, body) = exchange(g.at, &soap(g, "GetExternalIPAddress", &[])).await?;
     let ip = tag(&body, "NewExternalIPAddress")
         .and_then(|a| a.parse::<IpAddr>().ok())
-        .filter(|ip| !ip.is_loopback() && !ip.is_unspecified() && !ip.is_multicast())
         .filter(|_| status == 200)
         .ok_or("the router mapped the port but did not say its own address")?;
+    // Behind another router, its address is a private one, of no use to
+    // anyone outside.
+    if !public(ip) {
+        return Err(format!(
+            "the router is behind another one (its address is {ip})"
+        ));
+    }
     // No end: asked again as often as one that has one, to stay mapped.
     Ok((ip, external, if lease == 0 { lifetime } else { lease }))
+}
+
+/// Whether others on the internet could reach `ip`.
+fn public(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v) => {
+            let o = v.octets();
+            let shared = o[0] == 100 && (o[1] & 0xc0) == 64; // 100.64.0.0/10
+            !(v.is_private()
+                || v.is_loopback()
+                || v.is_link_local()
+                || v.is_broadcast()
+                || v.is_unspecified()
+                || v.is_multicast()
+                || shared)
+        }
+        IpAddr::V6(v) => {
+            let s = v.segments();
+            !(v.is_loopback()
+                || v.is_unspecified()
+                || v.is_multicast()
+                || (s[0] & 0xffc0) == 0xfe80
+                || (s[0] & 0xfe00) == 0xfc00)
+        }
+    }
 }
 
 #[cfg(test)]
@@ -464,7 +511,7 @@ pub(crate) mod tests {
         let (url, asked) = router().await;
         let g = find(None, Some(url)).await.unwrap();
         let client: IpAddr = "192.168.1.20".parse().unwrap();
-        let (ip, external, lifetime) = map(&g, client, 47555, 7200).await.unwrap();
+        let (ip, external, lifetime) = map(&g, client, 47555, 7200, None).await.unwrap();
         assert_eq!(ip.to_string(), "198.51.100.7");
         assert_eq!(
             external, 47556,
@@ -484,5 +531,56 @@ pub(crate) mod tests {
         assert!(adds[2].contains("<NewInternalClient>192.168.1.20</NewInternalClient>"));
         assert!(adds[2].contains("<NewInternalPort>47555</NewInternalPort>"));
         assert!(adds[2].contains("<NewProtocol>UDP</NewProtocol>"));
+    }
+
+    /// Renewing asks for the port outside it holds, not the one it first
+    /// wanted; one it no longer holds is taken away, not left for good.
+    #[tokio::test]
+    async fn a_renewal_keeps_the_port_it_holds_and_lets_go_of_one_it_does_not() {
+        let (url, asked) = router().await;
+        let g = find(None, Some(url)).await.unwrap();
+        let client: IpAddr = "192.168.1.20".parse().unwrap();
+        let (_, external, _) = map(&g, client, 47555, 7200, Some(47556)).await.unwrap();
+        assert_eq!(external, 47556);
+        {
+            let asked = asked.lock().unwrap();
+            let adds = asked
+                .iter()
+                .filter(|r| r.contains("#AddPortMapping"))
+                .count();
+            assert_eq!(adds, 2, "the held port, with an end and then without");
+            assert!(!asked.iter().any(|r| r.contains("#DeletePortMapping")));
+        }
+        // Held 47555, which another device has now: moved, and let go of.
+        let (_, external, _) = map(&g, client, 47555, 7200, Some(47555)).await.unwrap();
+        assert_eq!(external, 47556);
+        let asked = asked.lock().unwrap();
+        let deleted: Vec<&String> = asked
+            .iter()
+            .filter(|r| r.contains("#DeletePortMapping"))
+            .collect();
+        assert_eq!(deleted.len(), 1);
+        assert!(deleted[0].contains("<NewExternalPort>47555</NewExternalPort>"));
+    }
+
+    #[test]
+    fn only_an_address_others_could_reach_is_the_routers_own() {
+        for a in ["198.51.100.7", "8.8.8.8", "2001:db8::1"] {
+            assert!(public(a.parse().unwrap()), "{a}");
+        }
+        for a in [
+            "192.168.1.1",
+            "10.0.0.1",
+            "172.16.0.1",
+            "100.64.0.1",
+            "169.254.1.1",
+            "255.255.255.255",
+            "0.0.0.0",
+            "127.0.0.1",
+            "fe80::1",
+            "fd00::1",
+        ] {
+            assert!(!public(a.parse().unwrap()), "{a}");
+        }
     }
 }

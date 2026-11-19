@@ -304,6 +304,47 @@ fn a_ring_gives_way_to_a_call_this_person_makes() {
     });
 }
 
+/// The call already ringing, rung again over another session (one made
+/// since, or another found): it goes on ringing, nobody is told it is busy,
+/// and it is answered on the newer session.
+#[test]
+fn a_ring_rung_again_over_another_session_is_the_same_call() {
+    if !fuse_available() {
+        return;
+    }
+    let root = tempfile::tempdir().unwrap();
+    let ana = person(root.path(), "ana");
+    let mut bo = person(root.path(), "bo");
+    contacts(&ana, &bo, "Ana");
+    let theirs = spaces(&bo);
+    let space = spaces(&ana)
+        .into_iter()
+        .find(|s| theirs.contains(s))
+        .unwrap();
+    let caller = Modified::of(&bo, &ana);
+    bo.stop();
+
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        let (_e1, first) = caller.open().await.expect("a contact connects");
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let id = [7u8; 16];
+        signal(&first, RING, space, id).await;
+        wait("ana rings", 10, || standing(&ana) == "ringing");
+        let (_e2, second) = caller.open().await.expect("and again");
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        signal(&second, RING, space, id).await;
+        let said = heard(&second, Duration::from_secs(2)).await;
+        assert!(said.is_none(), "the same call was answered {said:?}");
+        assert_eq!(standing(&ana), "ringing");
+        ask(&ana, json!({"cmd": "call-answer"}));
+        let (kind, _, got) = heard(&second, Duration::from_secs(5))
+            .await
+            .expect("an answer");
+        assert_eq!((kind, got), (ANSWER, id), "answered on the newer session");
+    });
+}
+
 /// A contact rings and hangs up as fast as a session lets them. Each ring
 /// leaves a task asleep for 45 seconds.
 #[test]

@@ -111,6 +111,7 @@ fn log_file(path: &std::path::Path) -> Option<LogFile> {
         path: path.to_owned(),
         file: None,
         written: 0,
+        look_at: 0,
     };
     log.open();
     log.file.is_some().then_some(log)
@@ -120,11 +121,15 @@ fn log_file(path: &std::path::Path) -> Option<LogFile> {
 struct LogFile {
     path: std::path::PathBuf,
     file: Option<std::fs::File>,
+    /// What is in it, or was offered to it while it could not be opened.
     written: u64,
+    /// When it is looked at again.
+    look_at: u64,
 }
 
 impl LogFile {
     const KEEP: u64 = 1 << 20;
+    const AGAIN: u64 = 64 << 10;
 
     fn open(&mut self) {
         let size = std::fs::metadata(&self.path).map(|m| m.len()).unwrap_or(0);
@@ -140,15 +145,24 @@ impl LogFile {
             .open(&self.path)
             .ok();
         self.written = std::fs::metadata(&self.path).map(|m| m.len()).unwrap_or(0);
+        // Past a mebibyte it is moved aside. A file that could not be
+        // opened, or moved aside (on Windows another program may hold it),
+        // is tried again after a little more, not on every line.
+        self.look_at = if self.file.is_none() || self.written > Self::KEEP {
+            self.written + Self::AGAIN
+        } else {
+            Self::KEEP + 1
+        };
     }
 }
 
 impl std::io::Write for LogFile {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        if self.written > Self::KEEP {
+        if self.written >= self.look_at {
             self.open();
         }
         let Some(f) = self.file.as_mut() else {
+            self.written += buf.len() as u64;
             return Ok(buf.len());
         };
         let n = f.write(buf)?;
@@ -164,6 +178,28 @@ impl std::io::Write for LogFile {
 #[cfg(test)]
 mod log_tests {
     use std::io::Write;
+
+    #[test]
+    fn a_log_that_could_not_be_opened_is_tried_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("logs").join("service.log");
+        let mut log = super::LogFile {
+            path: path.clone(),
+            file: None,
+            written: 0,
+            look_at: 0,
+        };
+        // The folder is not there yet: nothing can be opened.
+        log.write_all(b"lost\n").unwrap();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        for _ in 0..100 {
+            log.write_all(&[b'y'; 1000]).unwrap();
+        }
+        assert!(
+            std::fs::metadata(&path).is_ok_and(|m| m.len() > 0),
+            "opened once it could be"
+        );
+    }
 
     #[test]
     fn a_long_running_log_is_moved_aside_and_begun_again() {

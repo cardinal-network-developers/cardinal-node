@@ -263,8 +263,9 @@ async fn ask<T>(sock: &UdpSocket, request: &[u8], read: impl Fn(&[u8]) -> Option
 /// Asks the router at `gateway` for UDP `port`: PCP, then NAT-PMP.
 /// The nonce of this device's PCP mapping of `port`: the same each time,
 /// renewals and restarts included, as RFC 6887 (11.2) asks of a renewal.
-pub fn nonce_for(device: &[u8], port: u16) -> [u8; 12] {
-    let h = cardinal_crypto::hash(&[device, b"cardinal pcp nonce", &port.to_be_bytes()].concat());
+pub fn nonce_for(secret: &[u8; 32], port: u16) -> [u8; 12] {
+    let h =
+        cardinal_crypto::keyed_hash_parts(secret, &[b"cardinal pcp nonce", &port.to_be_bytes()]);
     h[..12].try_into().expect("12 bytes")
 }
 
@@ -273,6 +274,7 @@ pub async fn map(
     port: u16,
     lifetime: u32,
     nonce: [u8; 12],
+    held: Option<u16>,
 ) -> Result<Mapping, String> {
     let bind: SocketAddr = match gateway {
         SocketAddr::V4(_) => "0.0.0.0:0".parse().expect("address"),
@@ -290,7 +292,7 @@ pub async fn map(
         Some(Answer::TryNatPmp) | None => {}
     }
     let Some(address) = ask(&sock, &natpmp_address_request(), natpmp_address).await else {
-        return upnp(gateway, client, port, lifetime).await;
+        return upnp(gateway, client, port, lifetime, held).await;
     };
     let address = address.map_err(|c| format!("the router said no (NAT-PMP result {c})"))?;
     let request = natpmp_map_request(port, lifetime);
@@ -313,6 +315,7 @@ async fn upnp(
     client: IpAddr,
     port: u16,
     lifetime: u32,
+    held: Option<u16>,
 ) -> Result<Mapping, String> {
     const NONE: &str = "the router does not give ports (no answer to PCP, NAT-PMP or UPnP)";
     let described = std::env::var("CARDINAL_TEST_UPNP").ok();
@@ -328,7 +331,7 @@ async fn upnp(
                 e
             }
         })?;
-    let (ip, external, lifetime) = crate::upnp::map(&g, client, port, lifetime).await?;
+    let (ip, external, lifetime) = crate::upnp::map(&g, client, port, lifetime, held).await?;
     Ok(Mapping {
         protocol: Protocol::Upnp,
         external: SocketAddr::new(ip, external),
@@ -338,7 +341,7 @@ async fn upnp(
 }
 
 /// UPnP alone, from the address this device faces its network with.
-async fn upnp_only(port: u16, lifetime: u32) -> Result<Mapping, String> {
+async fn upnp_only(port: u16, lifetime: u32, held: Option<u16>) -> Result<Mapping, String> {
     let probe = UdpSocket::bind("0.0.0.0:0")
         .await
         .map_err(|e| e.to_string())?;
@@ -358,7 +361,7 @@ async fn upnp_only(port: u16, lifetime: u32) -> Result<Mapping, String> {
                 e
             }
         })?;
-    let (ip, external, lifetime) = crate::upnp::map(&g, client, port, lifetime).await?;
+    let (ip, external, lifetime) = crate::upnp::map(&g, client, port, lifetime, held).await?;
     Ok(Mapping {
         protocol: Protocol::Upnp,
         external: SocketAddr::new(ip, external),
@@ -385,13 +388,25 @@ pub async fn keep(d: Arc<Daemon>) {
         // reach it: no router is asked.
         let udp = d.endpoint.udp_addr().filter(|a| !a.ip().is_loopback());
         let port = udp.map(|a| a.port());
-        let device = d.keys.link.public_key().x25519().to_vec();
+        // Keyed by a secret of the device's, so nobody who has seen its
+        // public keys can compute it (RFC 6887 11.1).
+        let device = d.keys.signing.seed();
+        // The port outside a UPnP router gave this one, to renew.
+        let held = {
+            let st = d.portmap.lock().unwrap_or_else(|e| e.into_inner());
+            st.mapping
+                .as_ref()
+                .filter(|(m, _)| m.protocol == Protocol::Upnp && Some(m.internal_port) == port)
+                .map(|(m, _)| m.external.port())
+        };
         let asked = match (gateway(), port) {
             _ if test_gateway_mistyped() => None,
-            (Some(gw), Some(port)) => Some(map(gw, port, LIFETIME, nonce_for(&device, port)).await),
+            (Some(gw), Some(port)) => {
+                Some(map(gw, port, LIFETIME, nonce_for(&device, port), held).await)
+            }
             // Where the gateway cannot be read (Windows, Android), UPnP
             // finds the router itself.
-            (None, Some(port)) => Some(upnp_only(port, LIFETIME).await),
+            (None, Some(port)) => Some(upnp_only(port, LIFETIME, held).await),
             _ => None,
         };
         let wait = match asked {
@@ -524,9 +539,9 @@ mod tests {
 
     #[test]
     fn a_mapping_keeps_its_nonce_and_each_port_and_device_has_its_own() {
-        assert_eq!(nonce_for(b"device", 47555), nonce_for(b"device", 47555));
-        assert_ne!(nonce_for(b"device", 47555), nonce_for(b"device", 47556));
-        assert_ne!(nonce_for(b"device", 47555), nonce_for(b"other", 47555));
+        assert_eq!(nonce_for(&[1; 32], 47555), nonce_for(&[1; 32], 47555));
+        assert_ne!(nonce_for(&[1; 32], 47555), nonce_for(&[1; 32], 47556));
+        assert_ne!(nonce_for(&[1; 32], 47555), nonce_for(&[2; 32], 47555));
     }
 
     #[test]
@@ -574,12 +589,14 @@ mod tests {
 
     #[tokio::test]
     async fn a_router_that_speaks_pcp_gives_a_port_and_one_that_speaks_nat_pmp_too() {
-        let m = map(router(true).await, 47555, 7200, [7; 12]).await.unwrap();
+        let m = map(router(true).await, 47555, 7200, [7; 12], None)
+            .await
+            .unwrap();
         assert_eq!(
             (m.protocol, m.external),
             (Protocol::Pcp, "203.0.113.5:60001".parse().unwrap())
         );
-        let m = map(router(false).await, 47555, 7200, [7; 12])
+        let m = map(router(false).await, 47555, 7200, [7; 12], None)
             .await
             .unwrap();
         assert_eq!(
@@ -594,7 +611,7 @@ mod tests {
         let silent = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let at = silent.local_addr().unwrap();
         let t = Instant::now();
-        let e = map(at, 47555, 7200, [7; 12]).await.unwrap_err();
+        let e = map(at, 47555, 7200, [7; 12], None).await.unwrap_err();
         assert!(e.contains("does not give ports"), "{e}");
         assert!(t.elapsed() < Duration::from_secs(10), "{:?}", t.elapsed());
         drop(silent);
