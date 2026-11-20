@@ -326,6 +326,13 @@ pub struct Telling {
     /// Whether this device is one of them: a host of theirs, by its own
     /// account, that the list does not name.
     pub own_unnamed: bool,
+    /// Whether this device is a host of theirs because it named itself,
+    /// having an address outside (D72), and not by the person's act.
+    pub own_self_named: bool,
+    /// Whether every other member is a trusted contact, none refused, and
+    /// the space is not public: where a device that named itself names
+    /// itself unasked (D72).
+    pub trusted_only: bool,
     /// Whether they are in the space by their own doing.
     pub joined: bool,
     /// Whether they have left it.
@@ -391,10 +398,24 @@ impl Telling {
     /// that becomes a host adds itself, and no device adds another.
     /// Anywhere else a list that is set stays as it is, an empty one too:
     /// another device may have emptied it, and that was the person's no.
+    ///
+    /// A device that named itself (D72) adds itself where every other
+    /// member is a trusted contact, in a group too, but never where the
+    /// list is empty: only the joining sets a list that was never set.
     pub fn sets_unasked(&self) -> bool {
-        let first = !self.set;
-        let more = self.relationship && self.own_unnamed;
-        self.joined && self.among_contacts() && (first || more)
+        if !self.joined || !self.among_contacts() {
+            return false;
+        }
+        if !self.set {
+            return true;
+        }
+        if !self.own_unnamed {
+            return false;
+        }
+        match self.own_self_named {
+            true => self.trusted_only && self.shared,
+            false => self.relationship,
+        }
     }
 
     /// Whether what software would set unasked is worth an entry, given
@@ -1272,6 +1293,25 @@ impl Core {
         others.filter(|m| Some(*m) != me && !known(m)).collect()
     }
 
+    /// Whether every other member of a space who has not left is a
+    /// trusted contact of this person's, refused by none, and the space is
+    /// not public: where a device that named itself as a host names itself
+    /// unasked (D72). The other members' trust is not asked: only the
+    /// person's.
+    pub fn among_trusted(&self, space: &SpaceId) -> bool {
+        let me = self.identity.as_ref().map(|i| i.id());
+        let Some(sp) = self.spaces.get(space).and_then(|h| h.space.as_ref()) else {
+            return false;
+        };
+        if sp.is_public() {
+            return false;
+        }
+        let contacts = self.contacts();
+        let trusted = |who: &[u8; 32]| contacts.iter().any(|c| c.identity == *who && c.connects());
+        let mut others = sp.present().into_iter().filter(|m| Some(*m) != me);
+        others.all(|m| trusted(&m))
+    }
+
     /// What this person's reach node in a space tells, and whom.
     pub fn telling(&self, space: &SpaceId) -> Telling {
         let Some(me) = self.identity.as_ref().map(|i| i.id()) else {
@@ -1294,6 +1334,9 @@ impl Core {
         let unnamed = hosts.iter().filter(|(g, _)| !is_named(g.link_key.x25519()));
         let here = self.keys.key();
         let own_unnamed = unnamed.clone().any(|(_, device)| *device == here);
+        let own_self_named = hosts
+            .iter()
+            .any(|(g, device)| *device == here && crate::outside::is_self_named(g));
         Telling {
             shared: !named.is_empty(),
             set: !since.is_empty(),
@@ -1302,6 +1345,8 @@ impl Core {
             hosted: !hosts.is_empty(),
             unnamed: unnamed.count(),
             own_unnamed,
+            own_self_named,
+            trusted_only: self.among_trusted(space),
             joined: sp.accepted_by(&me),
             left: sp.has_left(&me),
             public: sp.is_public(),
@@ -3216,13 +3261,15 @@ mod tests {
     impl Person {
         /// Makes this person's one device a host of theirs, at `address`.
         fn hosts_at(&mut self, address: &str) {
-            use cardinal_space::grant::{Endpoint, Grant, MAILBOX};
+            use cardinal_space::grant::{Endpoint, Grant, MAILBOX, STORAGE};
             let account = self.core.account_id().unwrap();
             let me = self.core.keys.key();
             let grant = Grant {
                 host: self.id(),
                 served: self.id(),
-                services: vec![MAILBOX],
+                // as `cardinal host` makes one: storage too, so it is no
+                // device that named itself (D72)
+                services: vec![MAILBOX, STORAGE],
                 storage_bytes: 0,
                 retention_days: 0,
                 endpoints: vec![Endpoint::parse(address).unwrap()],

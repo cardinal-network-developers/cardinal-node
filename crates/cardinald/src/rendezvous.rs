@@ -832,6 +832,9 @@ pub async fn serve(d: &Arc<Daemon>, s: &Session, mut st: Stream) -> anyhow::Resu
             }
             Some(OP_PRESENT) => {
                 let local = read_addresses(r.get(1));
+                if let PeerKind::Own(device) = &kind {
+                    d.keep_outside(device, &local);
+                }
                 let session = s.clone();
                 let presence = Presence { session, local };
                 lock(&d.rendezvous.present).insert(s.peer_static(), presence);
@@ -1385,6 +1388,27 @@ async fn reach(d: &Arc<Daemon>, who: [u8; 32], space: SpaceId) {
     for (r, addr) in usable {
         if all_reached(d, &who) {
             break;
+        }
+        // A host that is a device of theirs, as one that named itself
+        // (D72), is theirs to reach directly, as a trusted contact's.
+        if let Some((_, link)) = contact_device(d, &who, &r.host) {
+            if !reached(d, link.x25519()) {
+                match d.dial(|c| Target::new(addr, c, &link)).await {
+                    Ok(s) => {
+                        d.on_session(s);
+                        d.rendezvous.step(
+                            &who,
+                            Some(true),
+                            format!("their device at {addr}, named as their host: reached"),
+                        );
+                    }
+                    Err(e) => d.rendezvous.step(
+                        &who,
+                        Some(false),
+                        format!("their device at {addr}, named as their host: {e}"),
+                    ),
+                }
+            }
         }
         if let Err(e) = through_host(d, &who, r, addr).await {
             d.rendezvous

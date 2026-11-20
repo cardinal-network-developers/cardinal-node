@@ -1,6 +1,7 @@
 #!/bin/sh
 # Runs the network lab (lab.py) on a debug build. With no arguments it runs
-# `punch` and `people`; `trace` adds a packet capture of the easiest case, and
+# `punch` and `people`; `trace` adds a packet capture of the easiest case,
+# `mapped` a device named only by the port its router gave it (D72), and
 # `cousin` is two people where only one has a host, who call each other.
 #
 #   cargo build -p cardinal && scripts/lab.sh people

@@ -322,6 +322,13 @@ enum Cmd {
         #[command(subcommand)]
         cmd: ClipCmd,
     },
+    /// Whether this device asks your router for a port (PCP, NAT-PMP or
+    /// UPnP), and names itself where your trusted contacts can find it at
+    /// the address the router gives. With nothing, says what it does now.
+    Router {
+        #[arg(value_parser = ["on", "off"])]
+        setting: Option<String>,
+    },
     /// Make this device a host for your own devices: it keeps a full copy
     /// of your files, and can bring them back if every other device is lost.
     Host {
@@ -769,6 +776,36 @@ async fn read_words(
 }
 
 /// What belongs on the recovery sheet.
+/// What the router gave, or why it gave nothing, whether it is asked at
+/// all, and where this device names itself.
+fn print_router(router: &Value) {
+    if router["on"] == json!(false) {
+        println!("Router: not asked for a port (`cardinal router on` asks it).");
+    } else if let Some(at) = router["external"].as_str() {
+        println!(
+            "Router: reaches this device from outside at {at} ({}).",
+            router["protocol"].as_str().unwrap_or("")
+        );
+    } else if let Some(why) = router["error"].as_str() {
+        println!(
+            "Router: gives no port: {why}. A forward set up by hand, or a host, does instead."
+        );
+    }
+    let named: Vec<&str> = router["named"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .collect();
+    if !named.is_empty() {
+        println!(
+            "        named as a host at {}, for your trusted contacts (`cardinal router off` \
+             stops it).",
+            named.join(", ")
+        );
+    }
+}
+
 fn print_sheet(v: &Value) {
     let hosts = v["hosts"].as_array().cloned().unwrap_or_default();
     if hosts.is_empty() {
@@ -1502,18 +1539,7 @@ fn print_status(v: &Value) {
             );
         }
     }
-    // What the router gave, or why it gave nothing.
-    let router = &v["router"];
-    if let Some(at) = router["external"].as_str() {
-        println!(
-            "Router: reaches this device from outside at {at} ({}).",
-            router["protocol"].as_str().unwrap_or("")
-        );
-    } else if let Some(why) = router["error"].as_str() {
-        println!(
-            "Router: gives no port: {why}. A forward set up by hand, or a host, does instead."
-        );
-    }
+    print_router(&v["router"]);
     println!("Devices:");
     print_devices(&v["devices"]);
     let p = &v["progress"];
@@ -2434,6 +2460,26 @@ async fn client(cmd: Cmd) -> anyhow::Result<()> {
                 human_size(v["size"].as_u64().unwrap_or(0)),
                 to.display()
             );
+            Ok(())
+        }
+        Cmd::Router { setting } => {
+            let mut req = json!({"cmd": "router"});
+            if let Some(s) = &setting {
+                req["on"] = json!(s == "on");
+            }
+            let v = call(&paths, req).await?;
+            match setting.as_deref() {
+                Some("off") => println!(
+                    "This device no longer asks your router for a port, and no longer names \
+                     itself as a host where it was named at one."
+                ),
+                Some(_) => println!(
+                    "This device asks your router for a port, and names itself as a host at \
+                     the address it gives, where every other member is a trusted contact."
+                ),
+                None => {}
+            }
+            print_router(&v);
             Ok(())
         }
         Cmd::Host { addresses, off } => {

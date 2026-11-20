@@ -139,6 +139,7 @@ fn enable_at(d: &Arc<Daemon>, endpoints: Vec<Endpoint>) -> anyhow::Result<Json> 
         .iter()
         .filter_map(|e| address_warning(e, listening))
         .collect();
+    warnings.extend(names_warning(&endpoints, listening));
     warnings.extend(away_warning(&endpoints));
     warnings.extend(logout_warning());
     let (space, mut ops) = own_nodes(d, true)?;
@@ -184,6 +185,27 @@ fn address_warning(e: &Endpoint, listening: u16) -> Option<String> {
     (!here && private).then(|| {
         format!("{e} is not an address of this device, so a restore will not reach it there.")
     })
+}
+
+/// Devices look up no names: a name is for the recovery sheet, and nothing
+/// may depend on a registrar (`hosts.md#grants`). So a host given only
+/// names is found by nobody, until a restore types one.
+fn names_warning(endpoints: &[Endpoint], listening: u16) -> Option<String> {
+    let names: Vec<String> = endpoints
+        .iter()
+        .filter(|e| e.usable() && e.socket_addr().is_none())
+        .map(Endpoint::to_string)
+        .collect();
+    if names.is_empty() || endpoints.iter().any(|e| e.socket_addr().is_some()) {
+        return None;
+    }
+    let given: Vec<String> = names.iter().map(|n| format!("--address {n}")).collect();
+    Some(format!(
+        "{} {} a name, and your devices and your contacts' look up no names, so they will          not find this host there; it goes on the recovery sheet as it is. Give the address          too, with the port {listening}: `cardinal host {} --address <address>:{listening}`.",
+        names.join(", "),
+        if names.len() == 1 { "is" } else { "are" },
+        given.join(" "),
+    ))
 }
 
 /// Contacts' devices, and this person's own away from home, reach a host only
@@ -332,6 +354,10 @@ pub fn disable(d: &Arc<Daemon>) -> anyhow::Result<Json> {
     d.save_config()?;
     d.endpoint.set_allow_public(false);
     crate::mailbox::close(d);
+    // Nor is it named as a device that named itself (D72) where it was
+    // named as the person's host: that starts again, with the next address
+    // the router gives, and only where every other member is trusted.
+    crate::outside::forget(d);
     // It serves no longer, and takes itself out of the lists that name it.
     // Nobody else does: whether a device still serves is its own to know.
     crate::mailbox::keep_own_entry(d);
@@ -605,6 +631,17 @@ mod tests {
         // A router's, or a name: only the other end could tell.
         assert_eq!(warning("203.0.113.9:7171"), None);
         assert_eq!(warning("home.example.org:7171"), None);
+        // A name alone is found by nobody.
+        let said = names_warning(&[e("saint-joseph.home:47555")], 47555).unwrap();
+        assert!(said.contains("saint-joseph.home:47555 is a name"), "{said}");
+        assert!(
+            said.contains(
+                "`cardinal host --address saint-joseph.home:47555 --address <address>:47555`"
+            ),
+            "{said}"
+        );
+        let both = [e("saint-joseph.home:47555"), e("172.20.1.20:47555")];
+        assert_eq!(names_warning(&both, 47555), None);
     }
 
     #[test]

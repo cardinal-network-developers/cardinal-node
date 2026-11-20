@@ -121,6 +121,23 @@ impl PeerBook {
         v.len() > before
     }
 
+    /// Keeps the outside address a device says its router gave it, after
+    /// the one this device last reached it at: a device that leaves home
+    /// takes it along, to reach the other from elsewhere. Returns whether
+    /// that changed anything.
+    fn keep_outside(&mut self, device: &KeyId, addr: SocketAddr) -> bool {
+        let v = self.addrs.entry(hex::encode(device)).or_default();
+        let a = addr.to_string();
+        let at = v.len().min(1);
+        if v.iter().position(|x| *x == a).is_some_and(|i| i <= at) {
+            return false;
+        }
+        v.retain(|x| *x != a);
+        v.insert(at.min(v.len()), a);
+        v.truncate(BOOK_LEN);
+        true
+    }
+
     /// A device connected from `ip`, so that is where it is now. It came
     /// from a port of the moment, so this keeps the port it was last
     /// reached at. A device never reached has none to keep.
@@ -256,6 +273,8 @@ pub struct Daemon {
     pub clip: Mutex<Option<crate::clipboard::Clip>>,
     /// The port the router gave, if it gave one (`portmap.rs`).
     pub portmap: Mutex<crate::portmap::State>,
+    /// The outside addresses this device names itself at (`outside.rs`).
+    pub outside: Mutex<Vec<crate::outside::Named>>,
     /// The group calls this device is on or carries, by call.
     pub group_calls: Mutex<HashMap<[u8; 16], crate::calls::Group>>,
     /// The group calls this device rang for lately, or its person made.
@@ -513,6 +532,7 @@ impl Daemon {
             call_ended: Mutex::new(None),
             clip: Mutex::new(None),
             portmap: Mutex::new(crate::portmap::State::default()),
+            outside: Mutex::new(Vec::new()),
             group_calls: Mutex::new(HashMap::new()),
             rung_calls: Mutex::new(std::collections::VecDeque::new()),
             passed_rings: Mutex::new(std::collections::VecDeque::new()),
@@ -549,7 +569,8 @@ impl Daemon {
             discovery_started: AtomicBool::new(false),
         });
         d.restore_counters();
-        if d.config().host {
+        crate::outside::load(&d);
+        if crate::outside::serving(&d) {
             crate::mailbox::open(&d);
         }
         Ok(d)
@@ -1308,6 +1329,9 @@ impl Daemon {
             if let Err(e) = crate::host::follow_port(&d) {
                 tracing::warn!("cannot give the new port in the grant: {e:#}");
             }
+            // A month without any address it names, or port mapping
+            // turned off while it was not running, is acted on.
+            crate::outside::tick(&d);
             crate::contacts::admit_invitations(&d);
             // Mounting blocks, and may wait for another mount or unmount.
             let d2 = d.clone();
@@ -1674,6 +1698,37 @@ impl Daemon {
                 .is_some_and(|i| i.state().keys.contains_key(device))
         };
         if own && *device != self.keys.key() && lock(&self.book).hear(device, addrs) {
+            self.save_book();
+        }
+    }
+
+    /// Where this device knows another of its person's to be reached.
+    pub fn known_addrs(&self, device: &KeyId) -> Vec<SocketAddr> {
+        let book = lock(&self.book);
+        let known = book.addrs.get(&hex::encode(device));
+        known
+            .into_iter()
+            .flatten()
+            .filter_map(|a| a.parse().ok())
+            .collect()
+    }
+
+    /// One of this person's devices presented an outside address, one its
+    /// router gave it: it is kept with what this device saves of it
+    /// (`later.md`: a device leaving home took nothing of what was only
+    /// presented).
+    pub fn keep_outside(&self, device: &KeyId, addrs: &[SocketAddr]) {
+        if *device == self.keys.key() {
+            return;
+        }
+        let mut changed = false;
+        {
+            let mut book = lock(&self.book);
+            for a in addrs.iter().filter(|a| crate::outside::is_outside(a.ip())) {
+                changed |= book.keep_outside(device, *a);
+            }
+        }
+        if changed {
             self.save_book();
         }
     }

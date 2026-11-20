@@ -236,14 +236,15 @@ pub async fn find(
     gateway_in(&body, &url).ok_or_else(|| "the UPnP router maps no ports".to_owned())
 }
 
-/// Asks the router's service for UDP `port`, the same outside, for this
-/// device at `client`, and for the router's external address. A router
+/// Asks the router's service for UDP `port`, `outside` outside (or the
+/// next free one, or `held`, to renew it), for this device at `client`, and for the router's external address. A router
 /// that keeps only mappings with no end is asked for one: renewing it
 /// changes nothing.
 pub async fn map(
     g: &Gateway,
     client: IpAddr,
     port: u16,
+    outside: u16,
     lifetime: u32,
     held: Option<u16>,
 ) -> Result<(IpAddr, u16, u32), String> {
@@ -251,7 +252,7 @@ pub async fn map(
     // Another device behind the same router may hold the port outside:
     // then the next few are asked for. What this device holds already is
     // asked for first, so a renewal renews it.
-    let mut external = held.unwrap_or(port);
+    let mut external = held.unwrap_or(outside);
     let mut taken = 0;
     loop {
         let add = soap(
@@ -317,27 +318,21 @@ pub async fn map(
 
 /// Whether others on the internet could reach `ip`.
 fn public(ip: IpAddr) -> bool {
-    match ip {
-        IpAddr::V4(v) => {
-            let o = v.octets();
-            let shared = o[0] == 100 && (o[1] & 0xc0) == 64; // 100.64.0.0/10
-            !(v.is_private()
-                || v.is_loopback()
-                || v.is_link_local()
-                || v.is_broadcast()
-                || v.is_unspecified()
-                || v.is_multicast()
-                || shared)
-        }
-        IpAddr::V6(v) => {
-            let s = v.segments();
-            !(v.is_loopback()
-                || v.is_unspecified()
-                || v.is_multicast()
-                || (s[0] & 0xffc0) == 0xfe80
-                || (s[0] & 0xfe00) == 0xfc00)
-        }
-    }
+    crate::outside::is_outside(ip)
+}
+
+/// Gives back the mapping of UDP port `external` outside.
+pub async fn unmap(g: &Gateway, external: u16) {
+    let delete = soap(
+        g,
+        "DeletePortMapping",
+        &[
+            ("NewRemoteHost", String::new()),
+            ("NewExternalPort", external.to_string()),
+            ("NewProtocol", "UDP".into()),
+        ],
+    );
+    let _ = exchange(g.at, &delete).await;
 }
 
 #[cfg(test)]
@@ -511,7 +506,7 @@ pub(crate) mod tests {
         let (url, asked) = router().await;
         let g = find(None, Some(url)).await.unwrap();
         let client: IpAddr = "192.168.1.20".parse().unwrap();
-        let (ip, external, lifetime) = map(&g, client, 47555, 7200, None).await.unwrap();
+        let (ip, external, lifetime) = map(&g, client, 47555, 47555, 7200, None).await.unwrap();
         assert_eq!(ip.to_string(), "198.51.100.7");
         assert_eq!(
             external, 47556,
@@ -540,7 +535,9 @@ pub(crate) mod tests {
         let (url, asked) = router().await;
         let g = find(None, Some(url)).await.unwrap();
         let client: IpAddr = "192.168.1.20".parse().unwrap();
-        let (_, external, _) = map(&g, client, 47555, 7200, Some(47556)).await.unwrap();
+        let (_, external, _) = map(&g, client, 47555, 47555, 7200, Some(47556))
+            .await
+            .unwrap();
         assert_eq!(external, 47556);
         {
             let asked = asked.lock().unwrap();
@@ -552,7 +549,9 @@ pub(crate) mod tests {
             assert!(!asked.iter().any(|r| r.contains("#DeletePortMapping")));
         }
         // Held 47555, which another device has now: moved, and let go of.
-        let (_, external, _) = map(&g, client, 47555, 7200, Some(47555)).await.unwrap();
+        let (_, external, _) = map(&g, client, 47555, 47555, 7200, Some(47555))
+            .await
+            .unwrap();
         assert_eq!(external, 47556);
         let asked = asked.lock().unwrap();
         let deleted: Vec<&String> = asked

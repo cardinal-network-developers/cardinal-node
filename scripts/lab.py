@@ -12,6 +12,7 @@ each pair of packets crosses at once and no hole can be punched.
              ├─ cousin-home (no host; or behind carrier-grade NAT)
              ├─ bo-home   (router, UDP 7171 forwarded to bo-host)
              ├─ cafe      (router, no forward)
+             ├─ dan-home  (`mapped`: a strict router that answers PCP, no forward)
              ├─ airport   (router, no forward)
              └─ carrier ── tower (a second NAT: carrier-grade NAT)
 """
@@ -519,6 +520,98 @@ def cousin(theirs, label):
     sh("for n in $(ip netns list | cut -d' ' -f1); do ip netns del $n; done", check=False)
 
 
+PCP_ROUTER = r"""
+import socket, struct, subprocess, sys
+wan = socket.inet_aton(sys.argv[1])
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+s.bind(("0.0.0.0", 5351))
+held = {}
+while True:
+    b, addr = s.recvfrom(1100)
+    if len(b) < 60 or b[0] != 2 or b[1] != 1:
+        continue
+    lifetime = struct.unpack(">I", b[4:8])[0]
+    internal, wanted = struct.unpack(">HH", b[40:44])
+    key = (addr[0], internal)
+    if lifetime and key not in held:
+        # a port outside another device holds is not given twice
+        while wanted in held.values():
+            wanted += 1
+        held[key] = wanted
+        subprocess.run(["nft", "add", "rule", "ip", "nat", "pre", "iifname", "wan", "udp",
+                        "dport", str(wanted), "dnat", "to", f"{addr[0]}:{internal}"], check=True)
+        print(f"pcp: {addr[0]}:{internal} mapped to {wanted} outside", flush=True)
+    outside = held.get(key, wanted)
+    r = bytes([2, 0x81, 0, 0]) + struct.pack(">I", min(lifetime, 3600)) + bytes(16)
+    r += b[24:36] + bytes([17, 0, 0, 0]) + struct.pack(">HH", internal, outside)
+    r += bytes(10) + b"\xff\xff" + wan
+    s.sendto(r, addr)
+"""
+
+
+def mapped():
+    """D72, end to end. Daniel's laptop at home behind a strict router that
+    answers PCP, with no forward and no host; his cousin visits, they meet
+    on the home network, and the cousin goes home behind a strict router of
+    his own. All his device has of the laptop is the reach node of their
+    relationship, which names the laptop at the port the router gave it.
+    It reaches the laptop directly, no relay."""
+    net = Net()
+    net.router("dan-home", "internet", "198.51.100.10", "198.51.100.1", "192.168.1", "hard")
+    net.router("cousin-home", "internet", "198.51.101.10", "198.51.101.1", "192.168.2", "hard")
+    pcp_log = open(f"{WORK}/pcp.log", "w")
+    pcp = subprocess.Popen(["ip", "netns", "exec", "dan-home", "python3", "-I", "-c", PCP_ROUTER,
+                            "198.51.100.10"], stdout=pcp_log, stderr=pcp_log)
+    laptop = Dev(net, "carbonite", "dan-home", 3)
+    him = Dev(net, "cousin", "dan-home", 4)
+    laptop.start()
+    laptop.cli("init", "--yes", "--name", "Daniel")
+    got = wait("a port", 30, lambda: laptop.status()["router"].get("external"))
+    print(f"mapped:\n    the router gave the laptop {laptop.status()['router'].get('external')} "
+          f"after {got and round(got, 1)} s", flush=True)
+    named = wait("named", 30, lambda: laptop.status()["router"].get("named"))
+    print(f"    it names itself at {laptop.status()['router'].get('named')}", flush=True)
+    him.start()
+    him.cli("init", "--yes", "--name", "cousin")
+    code = laptop.cli("invite", "--address", f"{laptop.ip}:7171", "--name", "Daniel").strip()
+    him.cli("accept", code, "--name", "Daniel")
+
+    def reach_named():
+        v = him.ask({"cmd": "contact-status", "who": "Daniel"})
+        eps = [e["endpoint"] for r in v.get("their_reach") or [] for e in r["endpoints"]]
+        return eps or None
+
+    told = wait("told", 60, reach_named)
+    print(f"    his device read the laptop's reach node after {told and round(told, 1)} s: "
+          f"{reach_named()}", flush=True)
+    him.stop()
+    him.roam("cousin-home", 4)
+    him.start()
+    t0 = time.monotonic()
+    him.run("say", "Daniel", "home again")
+
+    def daniel():
+        v = him.ask({"cmd": "contact-status", "who": "Daniel"})
+        return next((d for d in v.get("devices") or [] if d.get("online")), None)
+
+    found = wait("reached", 90, daniel)
+    d = daniel() or {}
+    print(f"    back home, his device reached the laptop after "
+          f"{found and round(time.monotonic() - t0)} s: route {d.get('route')}, "
+          f"at {d.get('addr')}, opened by {d.get('opened_by')}", flush=True)
+    got = wait("message", 30, lambda: "home again" in laptop.cli("messages", "cousin"))
+    print(f"    the laptop has his message: {got is not None}", flush=True)
+    if not found:
+        print("    log:", "\n    log: ".join(him.log().splitlines()[-15:]), flush=True)
+    for x in (him, laptop):
+        x.stop()
+    pcp.kill()
+    pcp_log.close()
+    print("    router:", open(f"{WORK}/pcp.log").read().strip().replace("\n", "\n    router: "),
+          flush=True)
+    sh("for n in $(ip netns list | cut -d' ' -f1); do ip netns del $n; done", check=False)
+
+
 os.makedirs(SOCKETS, exist_ok=True)
 os.makedirs(WORK, exist_ok=True)
 if "trace" in WHICH:
@@ -532,6 +625,8 @@ if "punch" in WHICH:
     punch("easy", "cgnat", "ordinary NAT at the cafe, carrier-grade NAT at the airport")
 if "people" in WHICH:
     people()
+if "mapped" in WHICH:
+    mapped()
 if "cousin" in WHICH:
     cousin("easy", "his home behind an ordinary router")
     cousin("cgnat", "his home behind carrier-grade NAT")

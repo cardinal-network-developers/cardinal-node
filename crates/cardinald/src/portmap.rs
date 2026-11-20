@@ -65,6 +65,8 @@ pub struct State {
     pub mapping: Option<(Mapping, Instant)>,
     /// Why there is none, in words.
     pub why_not: Option<String>,
+    /// Whether [`keep`] is running.
+    pub running: bool,
 }
 
 impl State {
@@ -97,8 +99,15 @@ fn unmapped(b: &[u8]) -> IpAddr {
     }
 }
 
-/// A PCP MAP request for UDP `port` from `client` (RFC 6887 7.1, 11.1).
-pub fn pcp_request(client: IpAddr, port: u16, lifetime: u32, nonce: [u8; 12]) -> Vec<u8> {
+/// A PCP MAP request for UDP `port` from `client` (RFC 6887 7.1, 11.1),
+/// suggesting `outside` as the port outside.
+pub fn pcp_request(
+    client: IpAddr,
+    port: u16,
+    outside: u16,
+    lifetime: u32,
+    nonce: [u8; 12],
+) -> Vec<u8> {
     let mut m = Vec::with_capacity(60);
     m.extend([PCP_VERSION, PCP_MAP, 0, 0]);
     m.extend(lifetime.to_be_bytes());
@@ -106,8 +115,8 @@ pub fn pcp_request(client: IpAddr, port: u16, lifetime: u32, nonce: [u8; 12]) ->
     m.extend(nonce);
     m.extend([UDP, 0, 0, 0]);
     m.extend(port.to_be_bytes());
-    // the same port outside, if it is free
-    m.extend(port.to_be_bytes());
+    // the port outside it would like, if it is free
+    m.extend(outside.to_be_bytes());
     m.extend(mapped(IpAddr::V4(Ipv4Addr::UNSPECIFIED)));
     m
 }
@@ -159,10 +168,10 @@ pub fn natpmp_address_request() -> Vec<u8> {
     vec![0, 0]
 }
 
-pub fn natpmp_map_request(port: u16, lifetime: u32) -> Vec<u8> {
+pub fn natpmp_map_request(port: u16, outside: u16, lifetime: u32) -> Vec<u8> {
     let mut m = vec![0, 1, 0, 0];
     m.extend(port.to_be_bytes());
-    m.extend(port.to_be_bytes());
+    m.extend(outside.to_be_bytes());
     m.extend(lifetime.to_be_bytes());
     m
 }
@@ -269,9 +278,11 @@ pub fn nonce_for(secret: &[u8; 32], port: u16) -> [u8; 12] {
     h[..12].try_into().expect("12 bytes")
 }
 
+/// `outside` is the port outside asked for, which the router may not give.
 pub async fn map(
     gateway: SocketAddr,
     port: u16,
+    outside: u16,
     lifetime: u32,
     nonce: [u8; 12],
     held: Option<u16>,
@@ -283,7 +294,7 @@ pub async fn map(
     let sock = UdpSocket::bind(bind).await.map_err(|e| e.to_string())?;
     sock.connect(gateway).await.map_err(|e| e.to_string())?;
     let client = sock.local_addr().map_err(|e| e.to_string())?.ip();
-    let request = pcp_request(client, port, lifetime, nonce);
+    let request = pcp_request(client, port, outside, lifetime, nonce);
     match ask(&sock, &request, |b| pcp_answer(b, port, nonce)).await {
         Some(Answer::Mapped(m)) => return Ok(m),
         Some(Answer::Refused(code)) => {
@@ -292,10 +303,10 @@ pub async fn map(
         Some(Answer::TryNatPmp) | None => {}
     }
     let Some(address) = ask(&sock, &natpmp_address_request(), natpmp_address).await else {
-        return upnp(gateway, client, port, lifetime, held).await;
+        return upnp(gateway, client, port, outside, lifetime, held).await;
     };
     let address = address.map_err(|c| format!("the router said no (NAT-PMP result {c})"))?;
-    let request = natpmp_map_request(port, lifetime);
+    let request = natpmp_map_request(port, outside, lifetime);
     let mapped = ask(&sock, &request, |b| natpmp_mapped(b, port)).await;
     let (external, lifetime) = mapped
         .ok_or("the router gave its address but no port")?
@@ -314,6 +325,7 @@ async fn upnp(
     gateway: SocketAddr,
     client: IpAddr,
     port: u16,
+    outside: u16,
     lifetime: u32,
     held: Option<u16>,
 ) -> Result<Mapping, String> {
@@ -331,7 +343,8 @@ async fn upnp(
                 e
             }
         })?;
-    let (ip, external, lifetime) = crate::upnp::map(&g, client, port, lifetime, held).await?;
+    let (ip, external, lifetime) =
+        crate::upnp::map(&g, client, port, outside, lifetime, held).await?;
     Ok(Mapping {
         protocol: Protocol::Upnp,
         external: SocketAddr::new(ip, external),
@@ -341,7 +354,12 @@ async fn upnp(
 }
 
 /// UPnP alone, from the address this device faces its network with.
-async fn upnp_only(port: u16, lifetime: u32, held: Option<u16>) -> Result<Mapping, String> {
+async fn upnp_only(
+    port: u16,
+    outside: u16,
+    lifetime: u32,
+    held: Option<u16>,
+) -> Result<Mapping, String> {
     let probe = UdpSocket::bind("0.0.0.0:0")
         .await
         .map_err(|e| e.to_string())?;
@@ -361,7 +379,8 @@ async fn upnp_only(port: u16, lifetime: u32, held: Option<u16>) -> Result<Mappin
                 e
             }
         })?;
-    let (ip, external, lifetime) = crate::upnp::map(&g, client, port, lifetime, held).await?;
+    let (ip, external, lifetime) =
+        crate::upnp::map(&g, client, port, outside, lifetime, held).await?;
     Ok(Mapping {
         protocol: Protocol::Upnp,
         external: SocketAddr::new(ip, external),
@@ -379,35 +398,213 @@ pub fn external(d: &Daemon) -> Option<SocketAddr> {
         .map(|(m, _)| m.external)
 }
 
-/// Keeps a port from the router for as long as the service runs: asked at
-/// start, renewed at half its lifetime, asked again for a new port if the
-/// device's moved, and asked now and then of a router that gave nothing.
+/// Everything `status` says of the router: whether this device asks it
+/// (`cardinal router on|off`), what it gave or why it gave nothing, and the
+/// outside addresses this device names itself at (D72).
+pub fn status(d: &Daemon) -> Json {
+    let on = d.config().port_mapping;
+    let mut v = d.portmap.lock().unwrap_or_else(|e| e.into_inner()).status();
+    if !v.is_object() {
+        v = json!({});
+    }
+    v["on"] = json!(on);
+    v["named"] = crate::outside::status(d);
+    v
+}
+
+/// Turns port mapping, and with it naming this device as a host at the
+/// address the router gives (D72), on or off, for good. Off, the port is
+/// given back and the device takes itself out of the lists that name it.
+pub fn set_on(d: &Arc<Daemon>, on: bool) -> anyhow::Result<()> {
+    d.config().port_mapping = on;
+    d.save_config()?;
+    if on {
+        tokio::spawn(keep(d.clone()));
+    } else if !d.portmap.lock().unwrap_or_else(|e| e.into_inner()).running {
+        crate::outside::tick(d);
+    }
+    Ok(())
+}
+
+/// Another of this person's devices that is reached at `at`: a host whose
+/// grant gives it, or one whose address this device knows. A mapping there
+/// would lead to that device, not this one, as a router's forward set up
+/// by hand wins over it.
+fn reached_there(d: &Daemon, at: SocketAddr) -> Option<String> {
+    let me = d.keys.key();
+    let others: Vec<[u8; 32]> = {
+        let core = d.core();
+        let ident = core.identity.as_ref()?;
+        ident
+            .state()
+            .keys
+            .keys()
+            .copied()
+            .filter(|k| *k != me)
+            .collect()
+    };
+    let found = others.into_iter().find(|k| {
+        let granted = d.core().host_addresses(k).contains(&at);
+        granted || d.known_addrs(k).contains(&at)
+    })?;
+    Some(d.device_name(&found))
+}
+
+/// Where to ask for a port outside other than the one the router gave:
+/// the same each time for a device and port, so a renewal asks for it.
+fn another_port(nonce: [u8; 12]) -> u16 {
+    1024 + u16::from_be_bytes([nonce[0], nonce[1]]) % (65535 - 1024)
+}
+
+/// Asks whichever router there is for UDP `port`, with `outside` the port
+/// outside asked for. `None` where nobody is to be asked.
+async fn ask_router(
+    port: u16,
+    outside: u16,
+    nonce: [u8; 12],
+    held: Option<u16>,
+) -> Option<Result<Mapping, String>> {
+    match gateway() {
+        _ if test_gateway_mistyped() => None,
+        Some(gw) => Some(map(gw, port, outside, LIFETIME, nonce, held).await),
+        // Where the gateway cannot be read (Windows, Android), UPnP
+        // finds the router itself.
+        None => Some(upnp_only(port, outside, LIFETIME, held).await),
+    }
+}
+
+/// Gives a mapping back: asks for it again with no lifetime.
+async fn release(m: &Mapping, nonce: [u8; 12]) {
+    let gw = gateway();
+    match (m.protocol, gw) {
+        (Protocol::Pcp | Protocol::NatPmp, Some(gw)) => {
+            let bind = if gw.is_ipv4() { "0.0.0.0:0" } else { "[::]:0" };
+            let Ok(sock) = UdpSocket::bind(bind).await else {
+                return;
+            };
+            if sock.connect(gw).await.is_err() {
+                return;
+            }
+            let Ok(client) = sock.local_addr().map(|a| a.ip()) else {
+                return;
+            };
+            let port = m.internal_port;
+            if m.protocol == Protocol::Pcp {
+                let request = pcp_request(client, port, m.external.port(), 0, nonce);
+                let _ = ask(&sock, &request, |b| pcp_answer(b, port, nonce)).await;
+            } else {
+                let request = natpmp_map_request(port, 0, 0);
+                let _ = ask(&sock, &request, |b| natpmp_mapped(b, port)).await;
+            }
+        }
+        (Protocol::Upnp, gw) => {
+            let described = std::env::var("CARDINAL_TEST_UPNP").ok();
+            if let Ok(g) = crate::upnp::find(gw.map(|g| g.ip()), described).await {
+                crate::upnp::unmap(&g, m.external.port()).await;
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Asks for a port, and gives back one whose outside address is where
+/// another of this person's devices is reached, asking once for another
+/// port outside (`later.md`, found on the home pfSense: a forward set up
+/// by hand to the host won over the mapping of the same port).
+async fn ask_mine(
+    d: &Daemon,
+    port: u16,
+    nonce: [u8; 12],
+    held: Option<u16>,
+    outside: u16,
+) -> Option<Result<Mapping, String>> {
+    let first = ask_router(port, outside, nonce, held).await?;
+    let Ok(m) = first else {
+        return Some(first);
+    };
+    let Some(who) = reached_there(d, m.external) else {
+        return Some(Ok(m));
+    };
+    tracing::info!(
+        "the router gives {}, where your {who} is reached: giving it back",
+        m.external
+    );
+    release(&m, nonce).await;
+    let other = another_port(nonce);
+    let second = ask_router(port, other, nonce, None).await?;
+    let Ok(m) = second else {
+        return Some(second);
+    };
+    match reached_there(d, m.external) {
+        None => Some(Ok(m)),
+        Some(who) => {
+            release(&m, nonce).await;
+            Some(Err(format!(
+                "the router gives {}, where your {who} is reached, and no other port",
+                m.external
+            )))
+        }
+    }
+}
+
+/// Keeps a port from the router for as long as the service runs and
+/// port mapping is on: asked at start, renewed at half its lifetime, asked
+/// again for a new port if the device's moved, and asked now and then of a
+/// router that gave nothing. Turned off, it gives the port back and ends.
 pub async fn keep(d: Arc<Daemon>) {
+    {
+        let mut st = d.portmap.lock().unwrap_or_else(|e| e.into_inner());
+        if st.running {
+            return;
+        }
+        st.running = true;
+    }
+    // Keyed by a secret of the device's, so nobody who has seen its
+    // public keys can compute it (RFC 6887 11.1).
+    let device = d.keys.signing.seed();
     loop {
         // Listening on loopback alone, as tests do, nothing outside can
         // reach it: no router is asked.
         let udp = d.endpoint.udp_addr().filter(|a| !a.ip().is_loopback());
         let port = udp.map(|a| a.port());
-        // Keyed by a secret of the device's, so nobody who has seen its
-        // public keys can compute it (RFC 6887 11.1).
-        let device = d.keys.signing.seed();
-        // The port outside a UPnP router gave this one, to renew.
-        let held = {
+        let held_now = {
             let st = d.portmap.lock().unwrap_or_else(|e| e.into_inner());
             st.mapping
                 .as_ref()
-                .filter(|(m, _)| m.protocol == Protocol::Upnp && Some(m.internal_port) == port)
-                .map(|(m, _)| m.external.port())
+                .filter(|(m, _)| Some(m.internal_port) == port)
+                .map(|(m, _)| (m.protocol, m.external.port()))
         };
-        let asked = match (gateway(), port) {
-            _ if test_gateway_mistyped() => None,
-            (Some(gw), Some(port)) => {
-                Some(map(gw, port, LIFETIME, nonce_for(&device, port), held).await)
+        if !d.config().port_mapping {
+            let held = d
+                .portmap
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .mapping
+                .take();
+            if let Some((m, _)) = held {
+                release(&m, nonce_for(&device, m.internal_port)).await;
+                d.bump();
             }
-            // Where the gateway cannot be read (Windows, Android), UPnP
-            // finds the router itself.
-            (None, Some(port)) => Some(upnp_only(port, LIFETIME, held).await),
-            _ => None,
+            {
+                let mut st = d.portmap.lock().unwrap_or_else(|e| e.into_inner());
+                st.why_not = None;
+                st.running = false;
+            }
+            crate::outside::tick(&d);
+            return;
+        }
+        // The port outside a UPnP router gave this one, to renew; and the
+        // one to ask any router for, which it gives again on a renewal.
+        let held = held_now
+            .filter(|(p, _)| *p == Protocol::Upnp)
+            .map(|(_, e)| e);
+        let asked = match port {
+            Some(port) => {
+                let nonce = nonce_for(&device, port);
+                let outside = held_now.map_or(port, |(_, e)| e);
+                ask_mine(&d, port, nonce, held, outside).await
+            }
+            None => None,
         };
         let wait = match asked {
             Some(asked) => match asked {
@@ -415,10 +612,11 @@ pub async fn keep(d: Arc<Daemon>) {
                     let half = Duration::from_secs(u64::from(m.lifetime.max(120)) / 2);
                     let fresh = external(&d) != Some(m.external);
                     tracing::info!("the router gives {} ({})", m.external, m.protocol.name());
-                    *d.portmap.lock().unwrap_or_else(|e| e.into_inner()) = State {
-                        mapping: Some((m, Instant::now())),
-                        why_not: None,
-                    };
+                    {
+                        let mut st = d.portmap.lock().unwrap_or_else(|e| e.into_inner());
+                        st.mapping = Some((m, Instant::now()));
+                        st.why_not = None;
+                    }
                     if fresh {
                         // Where this device is to be found has changed.
                         d.bump();
@@ -427,25 +625,26 @@ pub async fn keep(d: Arc<Daemon>) {
                 }
                 Err(why) => {
                     tracing::debug!("port from the router: {why}");
-                    *d.portmap.lock().unwrap_or_else(|e| e.into_inner()) = State {
-                        mapping: None,
-                        why_not: Some(why),
-                    };
+                    let mut st = d.portmap.lock().unwrap_or_else(|e| e.into_inner());
+                    st.mapping = None;
+                    st.why_not = Some(why);
                     AGAIN
                 }
             },
             _ => AGAIN,
         };
-        // A port that moved is asked for again at once.
+        crate::outside::tick(&d);
+        // A port that moved is asked for again at once, and port mapping
+        // turned off is acted on.
         let until = Instant::now() + wait;
         while Instant::now() < until {
-            tokio::time::sleep(Duration::from_secs(5).min(wait)).await;
+            tokio::time::sleep(Duration::from_secs(1).min(wait)).await;
             let now = d
                 .endpoint
                 .udp_addr()
                 .filter(|a| !a.ip().is_loopback())
                 .map(|a| a.port());
-            if now != port {
+            if now != port || !d.config().port_mapping {
                 break;
             }
         }
@@ -459,7 +658,7 @@ mod tests {
     #[test]
     fn a_pcp_map_request_is_as_rfc_6887_lays_it_out() {
         let client: IpAddr = "192.168.1.20".parse().unwrap();
-        let m = pcp_request(client, 47555, 7200, [7; 12]);
+        let m = pcp_request(client, 47555, 47555, 7200, [7; 12]);
         assert_eq!(m.len(), 60);
         assert_eq!(&m[..4], &[2, 1, 0, 0]);
         assert_eq!(&m[4..8], &7200u32.to_be_bytes());
@@ -521,7 +720,7 @@ mod tests {
     fn nat_pmp_is_as_rfc_6886_lays_it_out() {
         assert_eq!(natpmp_address_request(), [0, 0]);
         assert_eq!(
-            natpmp_map_request(47555, 7200),
+            natpmp_map_request(47555, 47555, 7200),
             [0, 1, 0, 0, 0xb9, 0xc3, 0xb9, 0xc3, 0, 0, 0x1c, 0x20]
         );
         let addr = [0, 128, 0, 0, 0, 0, 0, 5, 203, 0, 113, 5];
@@ -589,14 +788,14 @@ mod tests {
 
     #[tokio::test]
     async fn a_router_that_speaks_pcp_gives_a_port_and_one_that_speaks_nat_pmp_too() {
-        let m = map(router(true).await, 47555, 7200, [7; 12], None)
+        let m = map(router(true).await, 47555, 47555, 7200, [7; 12], None)
             .await
             .unwrap();
         assert_eq!(
             (m.protocol, m.external),
             (Protocol::Pcp, "203.0.113.5:60001".parse().unwrap())
         );
-        let m = map(router(false).await, 47555, 7200, [7; 12], None)
+        let m = map(router(false).await, 47555, 47555, 7200, [7; 12], None)
             .await
             .unwrap();
         assert_eq!(
@@ -611,7 +810,9 @@ mod tests {
         let silent = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let at = silent.local_addr().unwrap();
         let t = Instant::now();
-        let e = map(at, 47555, 7200, [7; 12], None).await.unwrap_err();
+        let e = map(at, 47555, 47555, 7200, [7; 12], None)
+            .await
+            .unwrap_err();
         assert!(e.contains("does not give ports"), "{e}");
         assert!(t.elapsed() < Duration::from_secs(10), "{:?}", t.elapsed());
         drop(silent);
