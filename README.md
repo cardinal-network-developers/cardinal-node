@@ -58,7 +58,7 @@ One person, several Linux devices, one folder that is the same everywhere:
   their own fetches from the other's every few minutes, and can send up to about
   400 characters that way.
 
-Not yet: guardians, hosts run by others, shared folders and groups,
+Not yet: hosts run by others, shared folders and groups,
 platforms other than Linux. [PLAN.md](PLAN.md) has the
 order of work.
 

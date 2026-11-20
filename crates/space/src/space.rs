@@ -722,6 +722,54 @@ impl Space {
         self.write_on(author, device, &heads, ops, time)
     }
 
+    /// Writes `keep` ops (`spaces.md#authors`) on every head of the graph,
+    /// valid or set aside: what a person keeps of a removed device's work
+    /// may be all there is, the genesis included, as after a recovery that
+    /// kept none of their keys. It is sealed under the epoch of a head
+    /// whose key is held, the current one if there is one.
+    pub fn write_keeps(
+        &mut self,
+        author: &IdentityLog,
+        device: &SigningKey,
+        ops: Vec<SpaceOp>,
+    ) -> Result<(EntryId, SealedEntry), Error> {
+        if !ops
+            .iter()
+            .all(|o| matches!(o.body(), SpaceOpBody::Keep { .. }))
+        {
+            return Err(Error::NotAllowed("only keeps"));
+        }
+        let parents = self.dag.heads();
+        if parents.is_empty() {
+            return Err(Error::NotAllowed("nothing here to build on"));
+        }
+        let epoch = self
+            .current_epoch()
+            .filter(|e| self.keyring.get(e).is_some())
+            .or_else(|| {
+                parents
+                    .iter()
+                    .filter_map(|p| self.dag.get(p).map(|e| e.epoch()))
+                    .find(|e| self.keyring.get(e).is_some())
+            })
+            .ok_or(Error::NoEpochKey)?;
+        let key = self.keyring.get(&epoch).cloned().ok_or(Error::NoEpochKey)?;
+        let e = SpaceEntryBuilder::new(
+            self.id,
+            &parents,
+            author.id(),
+            author_head(author, &device.public_key()),
+            epoch,
+        )
+        .ops(ops)
+        .sign(device)?;
+        let id = e.id();
+        let sealed = SealedEntry::seal(&e, &key, None, self.public)?;
+        self.sealed.insert(id, sealed.clone());
+        self.insert_entry(e);
+        Ok((id, sealed))
+    }
+
     /// Writes an entry with `ops` that does not descend from any of
     /// `exclude`: its parents are the latest valid entries that are not
     /// descendants of them (or them). The entry is concurrent with each

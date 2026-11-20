@@ -386,6 +386,105 @@ below, each under its section.
 - **Parents of a new entry are sorted** by id; received entries may list
   them in any order but not twice.
 
+## Guardians (`spec/identity.md#recovery`, `spec/hosts.md#restore`)
+
+`cardinal guardians set`, `cardinal guarding`, and `cardinal recover`
+(`cardinald/src/guardians.rs`, `recovering.rs`, `identity/src/guardians.rs`).
+What is built: naming the first guardians, a guardian finding its own
+record, a recovery proposed by a guardian's device and signed by the new
+device, endorsements, the wait, confirmations with shares, and the new
+device joining through a host with the guardian key rebuilt from the
+shares. What differs or was read:
+
+- **Not built: changing guardians.** Only the first guardians, under a
+  policy naming none, can be named. A `set_recovery` under a policy naming
+  guardians is a decision the guardians confirm; guardian software here
+  confirms recoveries only, so `cardinal guardians set` refuses once there
+  are guardians. With it go the "dead" part of the chain rule (which only
+  concerns changes), asking a new guardian to accept the role
+  ("SHOULD still ask"), and the `set_recovery` with a new guardian key and
+  shares that the new root SHOULD append after a recovery.
+- **Not built: alerts.** "Each guardian's software alerts the person's
+  devices" is not a message of its own: the person's devices hold the
+  `recover` and the guardians' acts in their own log's set, and
+  `cardinal guardians` shows a recovery under way as a warning, with how
+  many endorsed and confirmed. Contacts are not shown it.
+- **Reading: how the new device and a guardian's device meet.** The spec
+  has the guardian's device propose parents and the new device sign, but
+  not how they talk. Chose: the guardian gives a code
+  (`cardinal guarding code NAME`: the device's addresses, its X25519 key,
+  and a 16-byte secret, base32, good for a day and not kept across a
+  restart), the new device opens a link session with that secret, and the
+  two speak a node-specific app service, `"cardinal-node recovery help 1"`:
+  ask; propose (identity, parents, policy, and the person's device and
+  admin keys in effect with their link keys); the signed `recover`; taken.
+  The same `recover` is given to every guardian whose code the person
+  brings.
+- **Reading: which keys a recovery keeps.** The premise is that every
+  admin device is lost. Chose: none, except the host whose sheet key the
+  person gives (`--key`), found among the proposed keys by its link key;
+  without it the host is removed too and nothing can come back from it.
+- **Reading: the fingerprint.** "A short fingerprint of `recover` fields 1
+  and 3": `BLAKE3("cardinal recovery fingerprint" || root || encoding of
+  the link key)`, its first 50 bits as ten characters of Crockford's base
+  32, `XXXXX-XXXXX`. The guardian types what the person reads; case,
+  dashes, and letters that look like digits do not matter.
+- **Reading: what is sealed in a record and in a confirmation.** The
+  guardian record `{1: i, 2: salt, 3: {1: i, 2: 32 bytes}}` is sealed as
+  its encoding; `confirm` field 4 seals the share record `{1: i, 2: 32
+  bytes}` alone, to the `recover`'s link key, with the context
+  `"recovery share" || identity id`. Shamir shares split `g` itself; the
+  guardian key is the hybrid key pair from the seed `g`.
+- **Reading: "with the guardian's log up to it".** The guardian sends the
+  causal past of its act, genesis first, in one `objects` message under the
+  guarded identity's label to that person's devices in touch (and its own
+  devices), and keeps it under that label itself. Receivers hold other
+  identities' entries under a label as attached logs
+  (`IdentityLog::attach`), evaluate the log with them, serve them with the
+  set, and name their heads in notices, so that another guardian, who need
+  not know this one, gets them from the person's host. Anyone who may send
+  objects of the label may attach entries of any identity; they are kept,
+  without a bound.
+- **Reading: the delay's clock.** A guardian's wait starts when its own
+  device first saw a threshold of endorsements (kept in `guarding.json`),
+  and doubles if a valid `object` naming the recovery is in the log by the
+  time it confirms. Seeing endorsements needs the person's host, or
+  another device holding the person's log, to pass them on: guardians who
+  are strangers to each other have no other way. A person with no host
+  and no surviving device cannot be recovered here.
+- **Reading: syncing the guardian's own log before confirming.** Each own
+  device in touch is reconciled, ten seconds at most each; a device that is
+  not in touch is not waited for.
+- **Reading: the new device's root key meanwhile.** The new phrase is
+  generated when the first code is used and kept, with the signed
+  `recover`, in `recovering.json` (mode 0600) until `cardinal recover
+  finish` succeeds, which shows the words; the spec says nothing about
+  keeping it.
+- **Reading: what the new device does on finishing.** As `hosts.md#restore`
+  says: `prove` with the new root; fetch the log; rebuild `g` from the
+  shares; open the newest recovery wrap to the guardian key (the current
+  key's, else the policy's field 6); then, signed by the new root, one
+  entry adding this device as admin with a wrap, and one
+  `set_encryption_key` with a fresh key whose chain carries the current
+  one. The words for the new root are shown then.
+- **Reading: keeping a lost device's work after a recovery.** A recovery
+  that kept none of the old keys leaves everything they wrote unwitnessed,
+  every space's genesis included; the spec lets the person keep it with
+  `keep`. `cardinal keep-work [DEVICE]` writes, in every space held, a
+  `keep` per removed key listing its latest unwitnessed entries, on every
+  head of the graph, valid or set aside (with nothing valid there is
+  nothing else to build on), sealed under the current epoch or a head's.
+  It keeps all of it: choosing "up to the point they choose" is not
+  offered. `cardinal status --json` gives per space how many entries are
+  valid and set aside.
+- **Fixed on the way: a contact's log arriving as heads only.** A notice
+  too big to carry its entries names heads; a contact's log whose new
+  head's parents were missing was left waiting. Such a log now reports
+  missing parents, and the rest is reconciled.
+- **Decisions are not `valid`.** The rules judge `set_recovery` and
+  `recover` only as decisions, so `IdentityState` now also reports
+  `in_effect`, and proposals and wrap lookups use it.
+
 ## Spaces (`spec/spaces.md`)
 
 - **Validity is judged natively, one entry at a time** (`validity.rs`).

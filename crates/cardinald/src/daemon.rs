@@ -55,6 +55,10 @@ pub enum PeerKind {
     /// A session opened with a delivery token, by someone this device need
     /// not know (`hosts.md#delivery-tokens`).
     Token(crate::mailbox::Token),
+    /// A new device of someone this person guards, in a session opened with
+    /// a help code this device gave (`guardians.rs`): the person's
+    /// identity, which the device cannot prove yet.
+    Helped([u8; 32]),
     /// Anyone else.
     Stranger,
 }
@@ -241,6 +245,9 @@ pub struct Daemon {
     pub news: Mutex<crate::news::Waiting>,
     /// Static keys of restore sessions that proved the root key.
     proven: Mutex<HashSet<[u8; 32]>>,
+    /// Secrets of help codes this device gave as a guardian, and whom each
+    /// helps recover (`guardians.rs`).
+    pub helping: Mutex<HashMap<u64, [u8; 32]>>,
     saving_book: Mutex<()>,
     /// Rendezvous and relay, as a device and as a host.
     pub rendezvous: crate::rendezvous::Rendezvous,
@@ -329,7 +336,7 @@ struct LinkState {
     confirmed: HashMap<String, u64>,
 }
 
-fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+pub(crate) fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
@@ -527,6 +534,7 @@ impl Daemon {
             blob_stats: Mutex::new(HashMap::new()),
             news: Mutex::new(HashMap::new()),
             proven: Mutex::new(HashSet::new()),
+            helping: Mutex::new(HashMap::new()),
             saving_book: Mutex::new(()),
             rendezvous,
             mailbox,
@@ -620,6 +628,11 @@ impl Daemon {
         {
             if *admin_static == ps {
                 return PeerKind::PairingAdmin(*identity);
+            }
+        }
+        if s.role() == cardinal_link::Role::Responder {
+            if let Some(who) = crate::guardians::helping(self, s) {
+                return PeerKind::Helped(who);
             }
         }
         if self.is_invitation(s) {
@@ -1025,7 +1038,10 @@ impl Daemon {
             });
             return;
         }
-        if matches!(kind, PeerKind::Inviting(..) | PeerKind::Token(_)) {
+        if matches!(
+            kind,
+            PeerKind::Inviting(..) | PeerKind::Token(_) | PeerKind::Helped(_)
+        ) {
             return;
         }
         tokio::spawn(async move { net::sync_all(&d, &s).await });
@@ -1084,19 +1100,27 @@ impl Daemon {
         };
         if let Some(identity) = other {
             let changed = core.ingest_other(identity, &objects)?;
+            // Entries whose parents are not here yet, as a notice that named
+            // only the heads brings: the rest is asked for.
+            let missing_parents = core.is_waiting(&label);
             let states = core.connectable_states();
             let own = core.identity.as_ref().map(|i| i.state());
             drop(core);
             if !changed {
-                return Ok(Ingested::default());
+                return Ok(Ingested {
+                    missing_parents,
+                    ..Ingested::default()
+                });
             }
+            // a recovery of someone this person guards may be pending now
+            crate::guardians::observe(self);
             self.directory.update(own.as_deref(), &states);
             self.endpoint.recheck_peers();
             return Ok(Ingested {
                 new: objects.len(),
                 complete: objects.len(),
                 objects,
-                ..Ingested::default()
+                missing_parents,
             });
         }
         if Some(label) == core.identity_label() {

@@ -35,6 +35,8 @@ pub const CANCELLED: u64 = 2;
 pub const PETNAME: u64 = 2;
 /// A contact's field: accept introductions from them.
 pub const INTRODUCTIONS: u64 = 6;
+/// Contact field: this person named them a guardian (`identity.md#hidden-guardians`).
+pub const GUARDIAN: u64 = 5;
 /// A contact's field: they are trusted.
 pub const TRUSTED: u64 = 7;
 /// A contact's field: they are refused.
@@ -459,6 +461,8 @@ pub struct ContactRecord {
     pub category: String,
     /// How the two met, if that was kept.
     pub met: Option<Met>,
+    /// This person named them a guardian (field 5).
+    pub guardian: bool,
 }
 
 impl ContactRecord {
@@ -511,6 +515,7 @@ pub fn contacts(state: &State) -> Vec<ContactRecord> {
                 met: last(n, MET)
                     .and_then(Value::as_record)
                     .and_then(Met::from_record),
+                guardian: flag(GUARDIAN).unwrap_or(false),
             })
         })
         .collect()
