@@ -316,7 +316,11 @@ async fn handle(d: &Arc<Daemon>, req: &Value) -> anyhow::Result<Value> {
                 crate::names::set_picture(d, arg(req, "who")?, from).await
             }
             (None, Some(category)) => crate::contacts::set_category(d, arg(req, "who")?, category),
-            (None, None) => crate::contacts::set(d, arg(req, "who")?, arg(req, "setting")?),
+            (None, None) => match arg(req, "setting")? {
+                "name-hosts" => crate::contacts::name_hosts(d, arg(req, "who")?, true).await,
+                "no-hosts" => crate::contacts::name_hosts(d, arg(req, "who")?, false).await,
+                setting => crate::contacts::set(d, arg(req, "who")?, setting),
+            },
         },
         "say" if req.get("group").is_some() => {
             let reply_to = req.get("reply_to").and_then(|v| v.as_str());

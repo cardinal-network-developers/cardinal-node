@@ -416,7 +416,7 @@ async fn accept_exchange(
         .core()
         .accept_relationship(&genesis, &invitation.inviter)?;
     d.invited_to(s, space);
-    mailbox::say_reach(d, &space, true).await?;
+    mailbox::on_meeting(d, &space).await?;
     net::reconcile(d, s, space).await?;
     let suggested = invitation.name.as_deref();
     record_contact(
@@ -506,7 +506,7 @@ pub async fn serve(d: &Arc<Daemon>, s: &Session, mut st: Stream) -> anyhow::Resu
     }
     let (space, genesis) = d.core().create_relationship(&them)?;
     d.invited_to(s, space);
-    mailbox::say_reach(d, &space, true).await?;
+    mailbox::on_meeting(d, &space).await?;
     send(&mut st, &ContactMessage::Genesis(genesis)).await?;
     let done = tokio::time::timeout(EXCHANGE_WITHIN, receive(&mut st)).await;
     if matches!(done, Ok(Ok(Some(ContactMessage::Done)))) {
@@ -609,6 +609,26 @@ pub fn set(d: &Arc<Daemon>, who: &str, setting: &str) -> anyhow::Result<Json> {
         return Ok(json!({"reach": reach}));
     }
     Ok(json!({}))
+}
+
+/// The person says, in their relationship with a contact, whether the
+/// contact may have where their hosts are: `name-hosts` names each host
+/// of theirs (a host that cannot be reached now is named once it can),
+/// and `no-hosts` empties the list. Nothing else writes a yes where the
+/// list is empty, so this is how a list emptied before is filled.
+pub async fn name_hosts(d: &Arc<Daemon>, who: &str, share: bool) -> anyhow::Result<Json> {
+    let contact = find(d, who)?;
+    anyhow::ensure!(!contact.refused, "you have refused {who}");
+    if !share {
+        mailbox::say_reach(d, &contact.space, false).await?;
+        return Ok(json!({"named": "none"}));
+    }
+    let shared = mailbox::share_reach(d, &contact.space).await?;
+    Ok(json!({"named": match shared {
+        mailbox::Shared::Named => "named",
+        mailbox::Shared::NoHost => "no host",
+        mailbox::Shared::Waiting => "waiting",
+    }}))
 }
 
 /// Changes what this person calls a contact. Only their own devices hear of

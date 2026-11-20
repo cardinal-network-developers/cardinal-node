@@ -214,7 +214,9 @@ enum Cmd {
         /// they suggest), `picture` the picture you see for them (a file in
         /// your Cardinal folder or on this computer; "" clears it), and
         /// `category` the folder they are listed in (People unless you say).
-        #[arg(value_parser = ["trust", "hosts-only", "introductions", "no-introductions", "refuse", "unrefuse", "name", "picture", "category"])]
+        /// `name-hosts` lets them have where your hosts are, so their
+        /// devices can find yours; `no-hosts` takes that back.
+        #[arg(value_parser = ["trust", "hosts-only", "introductions", "no-introductions", "refuse", "unrefuse", "name", "picture", "category", "name-hosts", "no-hosts"])]
         setting: String,
         /// The new name, after `name`; the picture, after `picture`; or the
         /// category, after `category`.
@@ -2037,6 +2039,16 @@ async fn client(cmd: Cmd) -> anyhow::Result<()> {
             // are named: they are asked about it now, and only now.
             if setting == "refuse" {
                 tell_where_refused_reads_reach(&printable(&who), &done);
+            }
+            let who = printable(&who);
+            match done["named"].as_str() {
+                Some("named") => println!("{who} can now find your devices through your hosts."),
+                Some("waiting") => println!(
+                    "Your host cannot be reached from here now. It is named for {who} as soon as it can be."
+                ),
+                Some("no host") => println!("You have no host to name."),
+                Some("none") => println!("{who} is no longer told where your hosts are."),
+                _ => {}
             }
             Ok(())
         }

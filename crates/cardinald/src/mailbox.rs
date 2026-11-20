@@ -877,6 +877,27 @@ async fn say_reach_locked(d: &Arc<Daemon>, space: &SpaceId, share: bool) -> anyh
     Ok(!reach.is_empty())
 }
 
+/// Two people have just met: the relationship names this person's hosts
+/// that can be named now. With none (no host, or none reachable from here
+/// to register a token), nothing is written: the list stays unset, and is
+/// set to the person's hosts once one can be named ([`write_reach`]). An
+/// empty list would be their no, which nothing fills in
+/// (`hosts.md#telling-others-where-to-reach-you`).
+pub async fn on_meeting(d: &Arc<Daemon>, space: &SpaceId) -> anyhow::Result<()> {
+    let _one = d.mailbox.reaching.lock().await;
+    let me = me(d)?;
+    let given = reach_here(d, space, &[], Add::Every).await;
+    if given.reach.is_empty() {
+        return Ok(());
+    }
+    let set = relationship::set_reach(&me, &given.reach);
+    if let Err(e) = d.write_and_push(space, vec![set]) {
+        take_back(d, &given.new).await;
+        return Err(e);
+    }
+    Ok(())
+}
+
 /// What became of the person's saying that a space's members may have
 /// where their hosts are.
 pub enum Shared {
@@ -2077,6 +2098,43 @@ mod tests {
             self.d.write_and_push(&account, vec![refuse]).unwrap();
             self.d.peers_changed();
         }
+    }
+
+    /// Meeting someone with no host to name leaves the list unset, not
+    /// empty: an empty list is a no, which nothing fills in. Found on the
+    /// home network, 2026-11-19: a relationship made while no host could be
+    /// named never named the host the person had.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn meeting_with_no_host_to_name_leaves_the_list_for_later() {
+        let h = Home::new().await;
+        on_meeting(&h.d, &h.rel).await.unwrap();
+        assert!(
+            !h.d.core().reach_is_set(&h.rel, &h.me),
+            "an empty list was written"
+        );
+        h.hosts();
+        write_reach(&h.d, &h.rel).await.unwrap();
+        let named = h.named(&h.rel);
+        assert_eq!(named.len(), 1, "the host is named once there is one");
+        assert_eq!(named[0].host, h.here);
+
+        // In a relationship, a host adds itself even to a list emptied
+        // before; and the person's yes names every host of theirs.
+        let h2 = Home::new().await;
+        say_reach(&h2.d, &h2.rel, true).await.unwrap();
+        h2.hosts();
+        write_reach(&h2.d, &h2.rel).await.unwrap();
+        assert_eq!(h2.named(&h2.rel).len(), 1, "the host adds itself");
+        say_reach(&h2.d, &h2.rel, false).await.unwrap();
+        assert!(h2.named(&h2.rel).is_empty());
+        assert!(matches!(share_reach(&h2.d, &h2.rel).await.unwrap(), Shared::Named));
+        assert_eq!(h2.named(&h2.rel).len(), 1, "a yes names it");
+
+        // With a host already, meeting names it at once.
+        let h = Home::new().await;
+        h.hosts();
+        on_meeting(&h.d, &h.rel).await.unwrap();
+        assert_eq!(h.named(&h.rel).len(), 1);
     }
 
     /// D70. On a host, a relationship names it unasked; with two lists
