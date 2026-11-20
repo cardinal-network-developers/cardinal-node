@@ -342,6 +342,30 @@ pub fn voice() -> Format {
     draft_format("voice 1")
 }
 
+/// Formats in their order, each once.
+fn dedup(formats: impl IntoIterator<Item = Format>) -> Vec<Format> {
+    let mut out: Vec<Format> = Vec::new();
+    for f in formats {
+        if !out.contains(&f) {
+            out.push(f);
+        }
+    }
+    out
+}
+
+/// What an answer takes of what was offered: those it names, in the order
+/// offered; naming none, as software from before formats does, voice only.
+fn taking(offered: &[Format], named: Option<&[Format]>) -> Vec<Format> {
+    match named {
+        Some(named) => offered
+            .iter()
+            .filter(|f| named.contains(f))
+            .copied()
+            .collect(),
+        None => offered.iter().filter(|f| **f == voice()).copied().collect(),
+    }
+}
+
 /// The most formats a ring offers, so that it stays small enough for the
 /// software before this, which takes a signal of at most 192 bytes.
 const MAX_FORMATS: usize = 2;
@@ -398,10 +422,11 @@ impl Signal {
                     .and_then(|f| r.get(f))
                     .and_then(|l| l.as_list())
                     .map(|l| {
-                        l.iter()
-                            .filter_map(|f| f.as_bytes()?.try_into().ok())
-                            .take(8)
-                            .collect()
+                        dedup(
+                            l.iter()
+                                .filter_map(|f| f.as_bytes()?.try_into().ok())
+                                .take(8),
+                        )
                     })
             },
         })
@@ -467,6 +492,7 @@ pub async fn start(
     who: &str,
     formats: Option<Vec<Format>>,
 ) -> anyhow::Result<Json> {
+    let formats = formats.map(dedup);
     if let Some(f) = &formats {
         anyhow::ensure!(!f.is_empty(), "a call offers at least one format");
         anyhow::ensure!(
@@ -586,7 +612,7 @@ pub async fn answer(d: &Arc<Daemon>, formats: Option<Vec<Format>>) -> anyhow::Re
         relink(d, &id, &space, true).await;
         return Ok(json!({}));
     }
-    let (s, space, id) = {
+    let (s, space, id, taken) = {
         let mut call = lock(d);
         let c = call
             .as_mut()
@@ -596,25 +622,18 @@ pub async fn answer(d: &Arc<Daemon>, formats: Option<Vec<Format>>) -> anyhow::Re
         c.standing = Standing::Live;
         // Only what was offered can be taken; a ring that named nothing is
         // voice, and its answer names nothing either.
-        c.taken = match (&c.offered, formats) {
-            (Some(offered), Some(want)) => Some(
-                offered
-                    .iter()
-                    .filter(|f| want.contains(f))
-                    .copied()
-                    .collect(),
-            ),
-            (Some(offered), None) => Some(offered.clone()),
-            (None, _) => None,
-        };
+        c.taken = c
+            .offered
+            .as_deref()
+            .map(|offered| taking(offered, formats.as_deref()));
         let s = c.session.clone();
         (
             s.ok_or_else(|| anyhow::anyhow!("that call has gone"))?,
             c.space,
             c.id,
+            c.taken.clone(),
         )
     };
-    let taken = lock(d).as_ref().and_then(|c| c.taken.clone());
     if let Err(e) = tell_formats(&s, ANSWER, &space, &id, taken.as_deref()).await {
         let _ = end(d).await;
         return Err(e);
@@ -1784,27 +1803,26 @@ pub async fn serve(d: &Arc<Daemon>, s: &Session, mut st: Stream, v: Value) -> an
             }
         }
         ANSWER => {
-            let expected = lock(d)
-                .as_ref()
-                .is_some_and(|c| c.id == id && c.who == them && c.standing == Standing::Calling);
+            // Checked and taken at once: the call may end, and another
+            // begin, between two looks.
+            let expected = {
+                let mut call = lock(d);
+                let found = call
+                    .as_mut()
+                    .filter(|c| c.id == id && c.who == them && c.standing == Standing::Calling);
+                found.is_some_and(|c| {
+                    // Only what was offered counts as taken.
+                    c.taken = c
+                        .offered
+                        .as_deref()
+                        .map(|offered| taking(offered, sig.formats.as_deref()));
+                    true
+                })
+            };
             if !expected {
                 // Too late, or never was: they are not to think they are on a call.
                 tell(s, END, &space, &id).await?;
                 return Ok(());
-            }
-            if let Some(c) = lock(d).as_mut() {
-                // Only what was offered counts as taken.
-                c.taken = match (&c.offered, &sig.formats) {
-                    (Some(offered), Some(took)) => Some(
-                        offered
-                            .iter()
-                            .filter(|f| took.contains(f))
-                            .copied()
-                            .collect(),
-                    ),
-                    (Some(_), None) => Some(vec![voice()]),
-                    (None, _) => None,
-                };
             }
             go_live(d, s, id);
             // Their other devices can stop ringing.
@@ -2028,6 +2046,16 @@ fn send_audio(d: &Daemon, frame: Vec<u8>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_answer_naming_nothing_takes_voice_only_and_formats_come_once() {
+        let video = draft_format("video vp8 1");
+        let offered = [voice(), video];
+        assert_eq!(taking(&offered, None), vec![voice()]);
+        assert_eq!(taking(&[video], None), Vec::<Format>::new());
+        assert_eq!(taking(&offered, Some(&[video, [9; 32]])), vec![video]);
+        assert_eq!(dedup([video, voice(), video]), vec![video, voice()]);
+    }
 
     /// A ring offering the most formats, from a group, still fits what the
     /// software before formats takes, and reads back with them.

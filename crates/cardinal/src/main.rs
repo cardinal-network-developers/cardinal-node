@@ -2715,7 +2715,7 @@ fn steps(out: &mut String, list: &serde_json::Value) {
         out.push_str(&format!(
             "  {}  {mark}{}\n",
             clock(s["at"].as_u64().unwrap_or(0)),
-            s["text"].as_str().unwrap_or("")
+            printable(s["text"].as_str().unwrap_or(""))
         ));
     }
 }
@@ -2746,7 +2746,7 @@ fn reach_lines(out: &mut String, list: &serde_json::Value, whose: &str) {
         };
         out.push_str(&format!("  {who}{key}{session}\n"));
         for e in r["endpoints"].as_array().into_iter().flatten() {
-            let ep = e["endpoint"].as_str().unwrap_or("");
+            let ep = printable(e["endpoint"].as_str().unwrap_or(""));
             let note = match e["why_not"].as_str() {
                 Some(w) => format!("not tried: {w}"),
                 None if e["local"] == true => {
@@ -2762,7 +2762,7 @@ fn reach_lines(out: &mut String, list: &serde_json::Value, whose: &str) {
 /// `cardinal contacts NAME`, in words.
 fn contact_status(v: &serde_json::Value) -> String {
     let mut out = String::new();
-    let mut head = v["name"].as_str().unwrap_or("").to_owned();
+    let mut head = printable(v["name"].as_str().unwrap_or(""));
     head.push_str(if v["trusted"] == true {
         "  trusted"
     } else {

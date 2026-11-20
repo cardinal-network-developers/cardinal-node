@@ -1024,6 +1024,12 @@ pub async fn write_reach(d: &Arc<Daemon>, space: &SpaceId) -> anyhow::Result<()>
     if !t.worth_saying(more.len()) {
         return Ok(());
     }
+    // In a relationship, a list with nothing to name stays unset: written
+    // empty, it would be a no that nothing fills in, and the contact has a
+    // host of the person's from it once there is one to name.
+    if t.relationship && !t.set && more.is_empty() {
+        return Ok(());
+    }
     // Whoever made a space joins it here, among contacts: with a host out
     // of reach, that yes is kept like any other.
     let wait = !t.set && !t.relationship && t.hosted && more.is_empty();
@@ -2111,6 +2117,12 @@ mod tests {
         assert!(
             !h.d.core().reach_is_set(&h.rel, &h.me),
             "an empty list was written"
+        );
+        // Nor by the delivery pass after, with still nothing to name.
+        write_reach(&h.d, &h.rel).await.unwrap();
+        assert!(
+            !h.d.core().reach_is_set(&h.rel, &h.me),
+            "a pass wrote an empty list"
         );
         h.hosts();
         write_reach(&h.d, &h.rel).await.unwrap();

@@ -186,7 +186,8 @@ fn voice_only_answers_get_no_video() {
     let video = offered[1].as_str().unwrap().to_owned();
     ask(
         &b,
-        json!({"cmd": "call-answer", "format_names": ["voice 1"]}),
+        // A window that names nothing, as one from before formats: voice only.
+        json!({"cmd": "call-answer"}),
     );
     wait("ana hears the answer", 10, || standing(&a) == "live");
     let taken = ask(&a, json!({"cmd": "call"}))["call"]["taken"].clone();

@@ -1571,9 +1571,6 @@ pub fn standing(d: &Daemon) -> Vec<(KeyId, HybridPublicKey)> {
     out
 }
 
-/// Asks a contact's host for their devices, tries each directly, and relays
-/// to any that cannot be reached that way. The session with the host stays
-/// open while a relay runs through it.
 /// Tries each of a trusted contact's devices at an address the person
 /// gives, as a step of a look: the way out when neither side names anything
 /// the other can use.
@@ -1589,6 +1586,11 @@ pub async fn try_at(d: &Arc<Daemon>, who: [u8; 32], addr: SocketAddr) {
             .filter_map(|k| Some((k.key, k.link_key.clone()?)))
             .collect()
     };
+    // One look at a time, as for any other.
+    if !lock(&d.rendezvous.looking).insert(who) {
+        return;
+    }
+    let _looking = Looking { d, who };
     d.rendezvous.look_begins(
         &who,
         format!("trying their devices at {addr}, as you asked"),
@@ -1671,6 +1673,9 @@ async fn try_found(
     }
 }
 
+/// Asks a contact's host for their devices, tries each directly, and relays
+/// to any that cannot be reached that way. The session with the host stays
+/// open while a relay runs through it.
 async fn through_host(
     d: &Arc<Daemon>,
     who: &[u8; 32],
