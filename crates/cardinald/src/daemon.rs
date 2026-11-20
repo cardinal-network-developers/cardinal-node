@@ -294,6 +294,9 @@ pub struct Daemon {
     pub rang: Mutex<HashMap<[u8; 32], std::collections::VecDeque<Instant>>>,
     /// What each contact may fetch from here.
     pub shared_blobs: Mutex<HashMap<[u8; 32], SharedBlobs>>,
+    /// The person's grant to inspect what this device holds, if any
+    /// (`inspect.rs`): in memory only, so a restart ends it.
+    pub inspection: crate::inspect::Inspection,
     /// The data directory, held for as long as the service runs.
     _lock: crate::lock::Lock,
     /// Audio heard on calls, for a client, by call.
@@ -546,6 +549,7 @@ impl Daemon {
             conditions: crate::conditions::Conditions::default(),
             rang: Mutex::new(HashMap::new()),
             shared_blobs: Mutex::new(HashMap::new()),
+            inspection: Default::default(),
             _lock: lock,
             call_audio: tokio::sync::broadcast::channel(64).0,
             call_video: tokio::sync::broadcast::channel(512).0,

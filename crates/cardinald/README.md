@@ -350,6 +350,30 @@ keep everything, whether it counts (`state`: passed, failed, stale,
 unchecked), why not (`reason`), the times of its last check, pass, and
 failure, and checks it left unanswered in a row (`missed`).
 
+## Inspection
+
+For designing the data structures, not for applications: a read-only
+look at everything the device holds, which `apps.md` says an application
+never sees. Off until the person turns it on, on this device:
+`cardinal inspect on [--minutes N]` (`inspect-on`, at most a day; it asks
+first unless `--yes`) prints a token, `cardinal inspect off`
+(`inspect-off`) ends it, and `status` says `inspection: {on, until}`. A
+new grant ends the old token; the grant lives in memory only, so a
+restart ends it too. Every request is `{"cmd": "inspect", "token": ...,
+"what": ...}`, with `what` one of `overview`, `identity` (`who`, `entry`,
+`path`), `space` (`space`), `entries` (`space`, `view`: `sealed` or
+`opened`, `offset`, `count`), `entry` (`space`, `entry` or `sealed_id`,
+`path` from `sealed`, `signed` or `entry`), `nodes` (`space`, `kind`,
+`parent`), `node` (`space`, `node`, `path`); `limit` and `items` say how
+much of each value to send (48 bytes and 24 items unless asked). Values
+come typed with their encoded length; no private key is ever sent: an
+epoch key, a blob reference's key, a secret node's value and an
+invitation's secret come as `{"t": "secret", "what", "len"}`, bytes that
+encode one are withheld, and no `path` leads to one. The space explorer
+(a separate program) draws all this. On a desktop without a sandbox this
+guards against accident, not against a program running as the person
+(`apps.md#the-limit`).
+
 ## Logs
 
 `tracing` to stderr; under systemd (journald) without timestamps or

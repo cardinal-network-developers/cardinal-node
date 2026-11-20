@@ -725,6 +725,12 @@ impl Holder {
         self.space.as_ref().map(|s| s.profile())
     }
 
+    /// Sealed entries held that could not be opened yet, for want of an
+    /// epoch key.
+    pub fn pending(&self) -> &[SealedEntry] {
+        &self.pending
+    }
+
     /// The bytes of a sealed entry.
     pub fn get(&self, sid: &[u8; 32]) -> Option<Vec<u8>> {
         self.locs.get(sid).and_then(|l| self.file.read(*l).ok())

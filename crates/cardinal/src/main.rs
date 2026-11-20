@@ -469,6 +469,13 @@ enum Cmd {
     /// Save pending changes in the folder now.
     #[command(hide = true)]
     Flush,
+    /// Let a program you choose look at everything this device holds, keys
+    /// aside, for designing Cardinal's data structures: `on` prints a token
+    /// to give it, `off` ends it at once.
+    Inspect {
+        #[command(subcommand)]
+        cmd: InspectCmd,
+    },
     /// Stop the daemon.
     Stop,
     /// Say which Cardinal data is on this device, as one line of JSON, and
@@ -477,6 +484,26 @@ enum Cmd {
     Store,
     #[command(flatten)]
     Deploy(cardinal_update::DeployCommand),
+}
+
+#[derive(Subcommand)]
+enum InspectCmd {
+    /// Turn inspection on, and print the token a program needs for it.
+    On {
+        /// For how long, in minutes (at most a day).
+        #[arg(long, default_value_t = 60)]
+        minutes: u64,
+        /// Do not ask first.
+        #[arg(long)]
+        yes: bool,
+        /// Print the token alone, for a script.
+        #[arg(long)]
+        quiet: bool,
+    },
+    /// Turn inspection off: the token stops working.
+    Off,
+    /// Say whether inspection is on.
+    Status,
 }
 
 #[derive(Subcommand)]
@@ -3108,6 +3135,58 @@ async fn client(cmd: Cmd) -> anyhow::Result<()> {
             println!("{}", cardinald::format::says(&paths));
             Ok(())
         }
+        Cmd::Inspect { cmd } => match cmd {
+            InspectCmd::On {
+                minutes,
+                yes,
+                quiet,
+            } => {
+                if !yes {
+                    eprintln!(
+                        "Whoever has the token can read everything this device holds for the \n\
+                         next {minutes} minutes: your identity log, your account, every space, \n\
+                         the addresses and tokens in them. Never your keys. Nothing can be \n\
+                         changed through it. Give it only to a program you chose, such as \n\
+                         the space explorer. Type yes to turn inspection on:"
+                    );
+                    let mut answer = String::new();
+                    std::io::stdin().read_line(&mut answer)?;
+                    if answer.trim() != "yes" {
+                        anyhow::bail!("inspection stays off");
+                    }
+                }
+                let v = call(&paths, json!({"cmd": "inspect-on", "minutes": minutes})).await?;
+                let token = v["token"].as_str().unwrap_or_default();
+                if quiet {
+                    println!("{token}");
+                } else {
+                    println!(
+                        "Inspection is on until {}.",
+                        clock(v["until"].as_u64().unwrap_or(0))
+                    );
+                    println!("Token: {token}");
+                    println!("`cardinal inspect off` ends it.");
+                }
+                Ok(())
+            }
+            InspectCmd::Off => {
+                let v = call(&paths, json!({"cmd": "inspect-off"})).await?;
+                if v["was_on"] == true {
+                    println!("Inspection is off.");
+                } else {
+                    println!("Inspection was not on.");
+                }
+                Ok(())
+            }
+            InspectCmd::Status => {
+                let v = call(&paths, json!({"cmd": "status"})).await?;
+                match v["inspection"]["until"].as_u64() {
+                    Some(until) => println!("Inspection is on until {}.", clock(until)),
+                    None => println!("Inspection is off."),
+                }
+                Ok(())
+            }
+        },
         Cmd::Stop => {
             call(&paths, json!({"cmd": "stop"})).await?;
             println!("Stopping the daemon.");

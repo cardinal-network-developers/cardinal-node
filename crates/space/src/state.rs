@@ -975,6 +975,12 @@ impl State {
             .map_or(&[], |v| v.as_slice())
     }
 
+    /// The reach nodes that have any field set, by node id, with their
+    /// fields: for looking at what a space holds (`cardinald` inspection).
+    pub fn reach_nodes(&self) -> impl Iterator<Item = (&NodeId, &BTreeMap<u64, Vec<FieldValue>>)> {
+        self.reach.iter()
+    }
+
     /// Every node.
     pub fn nodes(&self) -> impl Iterator<Item = &Node> {
         self.nodes.values()

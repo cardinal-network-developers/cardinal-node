@@ -224,6 +224,26 @@ async fn handle(d: &Arc<Daemon>, req: &Value) -> anyhow::Result<Value> {
         "setup-finish" => setup_finish(d, req),
         "me" => crate::names::me(d, req.get("name").and_then(|v| v.as_str())),
         "status" => Ok(status(d)),
+        // Inspection (`inspect.rs`): the person turns it on, on this
+        // device, and only whoever holds the token it gives may look.
+        "inspect-on" => {
+            let minutes = req.get("minutes").and_then(Value::as_u64);
+            let (token, until) = d
+                .inspection
+                .grant(minutes.unwrap_or(crate::inspect::DEFAULT_MINUTES))?;
+            d.bump();
+            Ok(json!({"token": token, "until": until}))
+        }
+        "inspect-off" => {
+            let was = d.inspection.revoke();
+            d.bump();
+            Ok(json!({"was_on": was}))
+        }
+        "inspect" => {
+            d.inspection
+                .check(req.get("token").and_then(Value::as_str))?;
+            crate::inspect::handle(d, req)
+        }
         "devices" => Ok(json!({"devices": devices(d)})),
         "stop" => {
             let _ = d.stopping.send(true);
@@ -989,6 +1009,8 @@ fn status(d: &Arc<Daemon>) -> Value {
         "hosts": crate::host::sheet(d).ok().and_then(|v| v["hosts"].as_array().map(Vec::len)),
         "spaces": spaces,
         "files_ready": files.is_some(),
+        // whether this device may be inspected now, and until when
+        "inspection": d.inspection.status(),
         "mount": cfg.mount_here().map(|p| p.display().to_string()),
         "mounted": mounted,
         "removed": d.core().removed(),
