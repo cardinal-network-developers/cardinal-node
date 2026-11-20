@@ -144,6 +144,27 @@ fn conditions(d: &Arc<Daemon>, req: &Value) -> anyhow::Result<Value> {
     Ok(d.conditions.json())
 }
 
+/// The formats a window offers or takes, as hex names (`formats`), or by
+/// their draft short names (`format_names`, such as "video vp8 1").
+fn formats(req: &Value) -> anyhow::Result<Option<Vec<crate::calls::Format>>> {
+    if let Some(names) = req.get("format_names").and_then(|v| v.as_array()) {
+        let names = names.iter().filter_map(|n| n.as_str());
+        return Ok(Some(names.map(crate::calls::draft_format).collect()));
+    }
+    let Some(list) = req.get("formats").and_then(|v| v.as_array()) else {
+        return Ok(None);
+    };
+    list.iter()
+        .map(|f| {
+            let bytes = f.as_str().and_then(|h| hex::decode(h).ok());
+            bytes
+                .and_then(|b| b.try_into().ok())
+                .ok_or_else(|| anyhow::anyhow!("a format is 32 bytes of hex"))
+        })
+        .collect::<anyhow::Result<Vec<_>>>()
+        .map(Some)
+}
+
 fn arg<'a>(req: &'a Value, name: &str) -> anyhow::Result<&'a str> {
     req.get(name)
         .and_then(|v| v.as_str())
@@ -413,10 +434,10 @@ async fn handle(d: &Arc<Daemon>, req: &Value) -> anyhow::Result<Value> {
         "call-start" if req.get("group").is_some() => {
             crate::calls::start_group(d, arg(req, "group")?).await
         }
-        "call-start" => crate::calls::start(d, arg(req, "who")?).await,
+        "call-start" => crate::calls::start(d, arg(req, "who")?, formats(req)?).await,
         "clip-copy" => crate::clipboard::copy(d, arg(req, "text")?).await,
         "clip" => Ok(crate::clipboard::paste(d)),
-        "call-answer" => crate::calls::answer(d).await,
+        "call-answer" => crate::calls::answer(d, formats(req)?).await,
         "call-end" => crate::calls::end(d).await,
         "conversations" => Ok(crate::contacts::conversations(d)),
         "mark-read" => crate::contacts::mark_read(d, arg(req, "who")?),

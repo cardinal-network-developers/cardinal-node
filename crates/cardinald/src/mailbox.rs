@@ -2127,7 +2127,10 @@ mod tests {
         assert_eq!(h2.named(&h2.rel).len(), 1, "the host adds itself");
         say_reach(&h2.d, &h2.rel, false).await.unwrap();
         assert!(h2.named(&h2.rel).is_empty());
-        assert!(matches!(share_reach(&h2.d, &h2.rel).await.unwrap(), Shared::Named));
+        assert!(matches!(
+            share_reach(&h2.d, &h2.rel).await.unwrap(),
+            Shared::Named
+        ));
         assert_eq!(h2.named(&h2.rel).len(), 1, "a yes names it");
 
         // With a host already, meeting names it at once.

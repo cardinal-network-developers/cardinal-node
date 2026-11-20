@@ -98,6 +98,7 @@ async fn busy(s: &Session, space: &SpaceId, id: &[u8; 16]) -> anyhow::Result<()>
         id: *id,
         flag: Some(BUSY),
         caller: None,
+        formats: None,
     };
     send(s, &end).await
 }
@@ -191,6 +192,10 @@ pub struct Call {
     over: watch::Sender<bool>,
     /// A call in a group, whose sound goes through its [`Group`].
     group: bool,
+    /// What the ring offered, if it named formats.
+    offered: Option<Vec<Format>>,
+    /// What the answer took, if it named formats.
+    taken: Option<Vec<Format>>,
 }
 
 impl Call {
@@ -213,6 +218,8 @@ impl Call {
             live_since: None,
             over: watch::channel(false).0,
             group: false,
+            offered: None,
+            taken: None,
         }
     }
 
@@ -317,6 +324,37 @@ struct Signal {
     id: [u8; 16],
     flag: Option<u64>,
     caller: Option<[u8; 32]>,
+    /// The formats a `ring` offers (field 5) or an `answer` takes (field 4),
+    /// each by its document's name. None: software from before, voice only.
+    formats: Option<Vec<Format>>,
+}
+
+/// A call's format: the name of the document that says what its frames hold.
+pub type Format = [u8; 32];
+
+/// The provisional name of a draft format, until its document is published.
+pub fn draft_format(short: &str) -> Format {
+    *blake3::hash(format!("cardinal draft format: {short}").as_bytes()).as_bytes()
+}
+
+/// Voice (`basics/voice.md`): its frames keep the call's first channel.
+pub fn voice() -> Format {
+    draft_format("voice 1")
+}
+
+/// The most formats a ring offers, so that it stays small enough for the
+/// software before this, which takes a signal of at most 192 bytes.
+const MAX_FORMATS: usize = 2;
+
+/// The datagram channel of one of a call's formats other than voice.
+fn format_label(space: &SpaceId, id: &[u8; 16], format: &Format) -> [u8; 16] {
+    let mut h = blake3::Hasher::new();
+    h.update(space);
+    h.update(id);
+    h.update(format);
+    let mut label = [0; 16];
+    label.copy_from_slice(&h.finalize().as_bytes()[..16]);
+    label
 }
 
 impl Signal {
@@ -330,6 +368,10 @@ impl Signal {
         }
         if let Some(c) = self.caller {
             r = r.with(4, c);
+        }
+        if let Some(f) = &self.formats {
+            let field = if self.kind == RING { 5 } else { 4 };
+            r = r.with(field, Value::list(f.iter().map(|f| Value::from(*f))));
         }
         r
     }
@@ -345,6 +387,23 @@ impl Signal {
                 .get(4)
                 .and_then(|c| c.as_bytes())
                 .and_then(|c| c.try_into().ok()),
+            formats: {
+                let kind = r.get(0)?.as_uint()?;
+                let field = match kind {
+                    RING => Some(5),
+                    ANSWER => Some(4),
+                    _ => None,
+                };
+                field
+                    .and_then(|f| r.get(f))
+                    .and_then(|l| l.as_list())
+                    .map(|l| {
+                        l.iter()
+                            .filter_map(|f| f.as_bytes()?.try_into().ok())
+                            .take(8)
+                            .collect()
+                    })
+            },
         })
     }
 }
@@ -356,6 +415,26 @@ async fn tell(s: &Session, kind: u64, space: &SpaceId, id: &[u8; 16]) -> anyhow:
         id: *id,
         flag: None,
         caller: None,
+        formats: None,
+    };
+    send(s, &signal).await
+}
+
+/// A `ring` or `answer` that names formats.
+async fn tell_formats(
+    s: &Session,
+    kind: u64,
+    space: &SpaceId,
+    id: &[u8; 16],
+    formats: Option<&[Format]>,
+) -> anyhow::Result<()> {
+    let signal = Signal {
+        kind,
+        space: *space,
+        id: *id,
+        flag: None,
+        caller: None,
+        formats: formats.map(<[Format]>::to_vec),
     };
     send(s, &signal).await
 }
@@ -383,7 +462,18 @@ fn ring_out(d: &Arc<Daemon>, id: [u8; 16]) {
 
 /// Rings a contact. Ringing here does not stop this person calling someone:
 /// a call that is only ringing gives way.
-pub async fn start(d: &Arc<Daemon>, who: &str) -> anyhow::Result<Json> {
+pub async fn start(
+    d: &Arc<Daemon>,
+    who: &str,
+    formats: Option<Vec<Format>>,
+) -> anyhow::Result<Json> {
+    if let Some(f) = &formats {
+        anyhow::ensure!(!f.is_empty(), "a call offers at least one format");
+        anyhow::ensure!(
+            f.len() <= MAX_FORMATS,
+            "a call offers at most {MAX_FORMATS} formats"
+        );
+    }
     let contact = contacts::listed(d, who)?;
     let mut theirs = d.sessions_of(&contact.identity);
     // A session that looks open may be one left on a network their device
@@ -412,7 +502,7 @@ pub async fn start(d: &Arc<Daemon>, who: &str) -> anyhow::Result<Json> {
         contact.petname
     );
     let id: [u8; 16] = cardinal_crypto::random_bytes();
-    let call = Call::new(
+    let mut call = Call::new(
         id,
         contact.identity,
         contact.petname.clone(),
@@ -420,6 +510,7 @@ pub async fn start(d: &Arc<Daemon>, who: &str) -> anyhow::Result<Json> {
         Standing::Calling,
         None,
     );
+    call.offered = formats.clone();
     let gave_way = {
         let mut held = lock(d);
         let ringing = held
@@ -436,13 +527,13 @@ pub async fn start(d: &Arc<Daemon>, who: &str) -> anyhow::Result<Json> {
     }
     d.bump();
     for s in &theirs {
-        if let Err(e) = tell(s, RING, &contact.space, &id).await {
+        if let Err(e) = tell_formats(s, RING, &contact.space, &id, formats.as_deref()).await {
             tracing::debug!("ringing: {e:#}");
         }
     }
     if contact.connects() {
         let rung: Vec<[u8; 32]> = theirs.iter().map(Session::handshake_hash).collect();
-        tokio::spawn(ring_where_found(d.clone(), contact, id, rung));
+        tokio::spawn(ring_where_found(d.clone(), contact, id, rung, formats));
     }
     ring_out(d, id);
     Ok(json!({}))
@@ -456,6 +547,7 @@ async fn ring_where_found(
     contact: ContactRecord,
     id: [u8; 16],
     mut rung: Vec<[u8; 32]>,
+    formats: Option<Vec<Format>>,
 ) {
     for wait in [Duration::ZERO, LOOK_AGAIN, GONE_WITHIN - LOOK_AGAIN] {
         tokio::time::sleep(wait).await;
@@ -471,7 +563,7 @@ async fn ring_where_found(
                 continue;
             }
             rung.push(s.handshake_hash());
-            if let Err(e) = tell(&s, RING, &contact.space, &id).await {
+            if let Err(e) = tell_formats(&s, RING, &contact.space, &id, formats.as_deref()).await {
                 tracing::debug!("ringing: {e:#}");
             }
         }
@@ -479,7 +571,7 @@ async fn ring_where_found(
 }
 
 /// Takes the call that is ringing here.
-pub async fn answer(d: &Arc<Daemon>) -> anyhow::Result<Json> {
+pub async fn answer(d: &Arc<Daemon>, formats: Option<Vec<Format>>) -> anyhow::Result<Json> {
     let group = lock(d)
         .as_ref()
         .filter(|c| c.standing == Standing::Ringing && c.group)
@@ -502,6 +594,19 @@ pub async fn answer(d: &Arc<Daemon>) -> anyhow::Result<Json> {
             .ok_or_else(|| anyhow::anyhow!("nothing is ringing"))?;
         // Taken now, so a second answer finds nothing ringing.
         c.standing = Standing::Live;
+        // Only what was offered can be taken; a ring that named nothing is
+        // voice, and its answer names nothing either.
+        c.taken = match (&c.offered, formats) {
+            (Some(offered), Some(want)) => Some(
+                offered
+                    .iter()
+                    .filter(|f| want.contains(f))
+                    .copied()
+                    .collect(),
+            ),
+            (Some(offered), None) => Some(offered.clone()),
+            (None, _) => None,
+        };
         let s = c.session.clone();
         (
             s.ok_or_else(|| anyhow::anyhow!("that call has gone"))?,
@@ -509,7 +614,8 @@ pub async fn answer(d: &Arc<Daemon>) -> anyhow::Result<Json> {
             c.id,
         )
     };
-    if let Err(e) = tell(&s, ANSWER, &space, &id).await {
+    let taken = lock(d).as_ref().and_then(|c| c.taken.clone());
+    if let Err(e) = tell_formats(&s, ANSWER, &space, &id, taken.as_deref()).await {
         let _ = end(d).await;
         return Err(e);
     }
@@ -604,6 +710,34 @@ fn go_live(d: &Arc<Daemon>, s: &Session, id: [u8; 16]) {
         c.session = Some(s.clone());
         c.live_since = Some(Instant::now());
         let label = channel_label(&c.space, &c.id);
+        let others: Vec<Format> = c
+            .taken
+            .iter()
+            .flatten()
+            .filter(|f| **f != voice())
+            .copied()
+            .collect();
+        for format in others {
+            let mut ch = s.channel(
+                format_label(&c.space, &c.id, &format),
+                Priority::Interactive,
+            );
+            let mut over = c.over.subscribe();
+            let d = d.clone();
+            tokio::spawn(async move {
+                loop {
+                    tokio::select! {
+                        _ = over.wait_for(|over| *over) => return,
+                        heard = ch.recv() => match heard {
+                            Some(frame) => {
+                                let _ = d.call_video.send((id, format, frame));
+                            }
+                            None => return,
+                        },
+                    }
+                }
+            });
+        }
         (s.channel(label, Priority::RealTime), c.over.subscribe())
     };
     d.bump();
@@ -639,6 +773,15 @@ pub fn current(d: &Daemon) -> Json {
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .clone();
+    let (offered, taken) = {
+        let call = lock(d);
+        let hexes = |l: &Option<Vec<Format>>| {
+            l.as_ref()
+                .map(|l| l.iter().map(hex::encode).collect::<Vec<_>>())
+        };
+        call.as_ref()
+            .map_or((None, None), |c| (hexes(&c.offered), hexes(&c.taken)))
+    };
     let (who, name, standing, seconds, space, group, id) = {
         let call = lock(d);
         let Some(c) = call.as_ref() else {
@@ -687,6 +830,8 @@ pub fn current(d: &Daemon) -> Json {
         "linked": linked,
         "people": people,
         "frames": frames,
+        "offered": offered,
+        "taken": taken,
     }, "ended": ended})
 }
 
@@ -771,6 +916,7 @@ pub async fn start_group(d: &Arc<Daemon>, group: &str) -> anyhow::Result<Json> {
             id,
             flag: None,
             caller: me,
+            formats: None,
         };
         if let Err(e) = send(s, &ring).await {
             tracing::debug!("ringing: {e:#}");
@@ -902,6 +1048,7 @@ async fn join(s: &Session, space: &SpaceId, id: &[u8; 16], carrying: bool) -> an
         id: *id,
         flag: Some(u64::from(carrying)),
         caller: None,
+        formats: None,
     };
     send(s, &signal).await
 }
@@ -1122,6 +1269,7 @@ async fn group_signal(
                     id: going,
                     flag: Some(u64::from(busy)),
                     caller: None,
+                    formats: None,
                 };
                 send(s, &says).await?;
                 return Ok(());
@@ -1137,6 +1285,7 @@ async fn group_signal(
                             id,
                             flag: None,
                             caller: sig.caller,
+                            formats: None,
                         };
                         let _ = tokio::time::timeout(SIGNAL_WITHIN, send(&other, &on)).await;
                     }
@@ -1621,7 +1770,9 @@ pub async fn serve(d: &Arc<Daemon>, s: &Session, mut st: Stream, v: Value) -> an
                     let name = contact.petname.clone();
                     let ringing = Standing::Ringing;
                     let session = Some(s.clone());
-                    *call = Some(Call::new(id, them, name, space, ringing, session));
+                    let mut c = Call::new(id, them, name, space, ringing, session);
+                    c.offered = sig.formats.clone();
+                    *call = Some(c);
                 }
                 busy
             };
@@ -1640,6 +1791,20 @@ pub async fn serve(d: &Arc<Daemon>, s: &Session, mut st: Stream, v: Value) -> an
                 // Too late, or never was: they are not to think they are on a call.
                 tell(s, END, &space, &id).await?;
                 return Ok(());
+            }
+            if let Some(c) = lock(d).as_mut() {
+                // Only what was offered counts as taken.
+                c.taken = match (&c.offered, &sig.formats) {
+                    (Some(offered), Some(took)) => Some(
+                        offered
+                            .iter()
+                            .filter(|f| took.contains(f))
+                            .copied()
+                            .collect(),
+                    ),
+                    (Some(_), None) => Some(vec![voice()]),
+                    (None, _) => None,
+                };
             }
             go_live(d, s, id);
             // Their other devices can stop ringing.
@@ -1708,6 +1873,7 @@ async fn told_the_others(
         id: *id,
         flag: why,
         caller: None,
+        formats: None,
     };
     for other in d.sessions_of(them) {
         if other.peer_static() != s.peer_static() {
@@ -1720,6 +1886,7 @@ async fn told_the_others(
 /// the client goes or the call does.
 pub async fn media(d: &Arc<Daemon>, mut lines: tokio::io::Lines<BufReader<Reader>>, mut w: Writer) {
     let mut heard = d.call_audio.subscribe();
+    let mut seen = d.call_video.subscribe();
     let mut stopping = d.stopping.subscribe();
     let mut changed = d.changed.subscribe();
     let Some(call) = lock(d).as_ref().map(|c| c.id) else {
@@ -1749,15 +1916,66 @@ pub async fn media(d: &Arc<Daemon>, mut lines: tokio::io::Lines<BufReader<Reader
                     return;
                 }
             }
+            frame = seen.recv() => {
+                let Ok((of, format, frame)) = frame else { continue };
+                if of != call {
+                    continue;
+                }
+                let mut out = json!({"frame": hex::encode(&frame), "format": hex::encode(format)})
+                    .to_string();
+                out.push('\n');
+                if w.write_all(out.as_bytes()).await.is_err() {
+                    return;
+                }
+            }
             line = lines.next_line() => {
                 let Ok(Some(line)) = line else { return };
                 let Ok(v) = serde_json::from_str::<Json>(&line) else { continue };
+                if let Some(frame) = v["frame"].as_str().and_then(|h| hex::decode(h).ok()) {
+                    let format = v["format"]
+                        .as_str()
+                        .and_then(|h| hex::decode(h).ok())
+                        .and_then(|f| <Format>::try_from(f.as_slice()).ok());
+                    if let Some(format) = format {
+                        send_frame(d, format, frame);
+                    }
+                    continue;
+                }
                 let Some(frame) = v["audio"].as_str().and_then(|h| hex::decode(h).ok()) else {
                     continue;
                 };
                 send_audio(d, frame);
             }
         }
+    }
+}
+
+/// A frame of one of the call's formats other than voice, between two people:
+/// sent on that format's channel, if the call took it.
+fn send_frame(d: &Daemon, format: Format, frame: Vec<u8>) {
+    if format == voice() {
+        send_audio(d, frame);
+        return;
+    }
+    let (session, label) = {
+        let call = lock(d);
+        let Some(c) = call
+            .as_ref()
+            .filter(|c| c.standing == Standing::Live && !c.group)
+        else {
+            return;
+        };
+        if !c.taken.as_ref().is_some_and(|t| t.contains(&format)) {
+            return;
+        }
+        (c.session.clone(), format_label(&c.space, &c.id, &format))
+    };
+    let Some(s) = session else { return };
+    if frame.len() > cardinal_link::MAX_DATAGRAM_PAYLOAD {
+        return;
+    }
+    if let Err(e) = s.send_datagram(label, Priority::Interactive, Bytes::from(frame)) {
+        tracing::trace!("frame: {e}");
     }
 }
 
@@ -1811,6 +2029,33 @@ fn send_audio(d: &Daemon, frame: Vec<u8>) {
 mod tests {
     use super::*;
 
+    /// A ring offering the most formats, from a group, still fits what the
+    /// software before formats takes, and reads back with them.
+    #[test]
+    fn a_ring_with_formats_fits_the_old_limit() {
+        let s = Signal {
+            kind: RING,
+            space: [1; 32],
+            id: [2; 16],
+            flag: None,
+            caller: Some([3; 32]),
+            formats: Some(vec![voice(), draft_format("video vp8 1")]),
+        };
+        let v = Value::Record(s.record());
+        assert!(v.encode().len() <= MAX_SIGNAL, "{}", v.encode().len());
+        assert_eq!(Signal::of(&v), Some(s));
+        let answer = Signal {
+            kind: ANSWER,
+            space: [1; 32],
+            id: [2; 16],
+            flag: None,
+            caller: None,
+            formats: Some(vec![voice()]),
+        };
+        let v = Value::Record(answer.record());
+        assert_eq!(Signal::of(&v), Some(answer));
+    }
+
     #[test]
     fn signals_read_back_whole_and_old_ones_still_read() {
         let s = Signal {
@@ -1819,6 +2064,7 @@ mod tests {
             id: [2; 16],
             flag: Some(1),
             caller: Some([3; 32]),
+            formats: None,
         };
         let v = Value::Record(s.record());
         assert!(v.encode().len() <= MAX_SIGNAL, "{}", v.encode().len());

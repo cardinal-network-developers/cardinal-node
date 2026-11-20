@@ -274,6 +274,8 @@ pub struct Daemon {
     /// A call's audio as it comes in: the call, whose voice it is in a group
     /// call, and the frame.
     pub call_audio: tokio::sync::broadcast::Sender<([u8; 16], Option<[u8; 8]>, bytes::Bytes)>,
+    /// Frames of a call's other formats, such as video, for clients.
+    pub call_video: tokio::sync::broadcast::Sender<([u8; 16], crate::calls::Format, bytes::Bytes)>,
     /// An identity made for a client, until its person has written the words
     /// down.
     pub setting_up: Mutex<Option<(crate::setup::Prepared, [usize; 2])>>,
@@ -519,6 +521,7 @@ impl Daemon {
             shared_blobs: Mutex::new(HashMap::new()),
             _lock: lock,
             call_audio: tokio::sync::broadcast::channel(64).0,
+            call_video: tokio::sync::broadcast::channel(512).0,
             setting_up: Mutex::new(None),
             mount: Mutex::new(None),
             mount_unavailable: Mutex::new(None),
