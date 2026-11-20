@@ -890,7 +890,9 @@ fn fields_json(r: &Render, fields: &BTreeMap<u64, Vec<FieldValue>>, hidden: &Has
                 .map(|fv| {
                     let v = match &fv.value {
                         None => json!({"t": "cleared"}),
-                        Some(v) if hidden.contains(k) => secret("secret", v.encoded_len()),
+                        Some(v) if hidden.contains(k) => {
+                            secret("secret", v.as_bytes().map_or(v.encoded_len(), <[u8]>::len))
+                        }
                         Some(v) => r.value(v, 0),
                     };
                     json!({"entry": h(&fv.entry), "op": fv.op, "v": v})
