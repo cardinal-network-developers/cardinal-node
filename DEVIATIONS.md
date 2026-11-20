@@ -1513,6 +1513,17 @@ asks for around that is not built yet.
     there, as for any host, and it is not named there again unasked.
   - **The month is kept on the device** (`outside.json`): the addresses it
     names and when each was last its own, saved at most hourly.
+  - **Not in the text: an address is named only once it has held, and
+    seldom.** The router must have given it for ten minutes, and after
+    the first, at most one new address is named a day (the newest waits
+    till then). A device on the network answering as a router, or a
+    router giving a new address at each short renewal, would otherwise
+    have it write in the account and in every space where it is named,
+    every renewal, and send trusted contacts to addresses it chose.
+    Where the gateway is known, UPnP is taken only from it; where it is
+    not (Windows, Android), from the first device to answer, and only
+    the hold and the day bound what that can do. What a router says of
+    its own address outside is believed.
   - **A mapping where another of the person's devices is reached** (a
     host's grant endpoints, or an address in the peer book) is given back
     with lifetime 0, and one other port outside is asked for, the same

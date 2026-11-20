@@ -274,7 +274,7 @@ pub struct Daemon {
     /// The port the router gave, if it gave one (`portmap.rs`).
     pub portmap: Mutex<crate::portmap::State>,
     /// The outside addresses this device names itself at (`outside.rs`).
-    pub outside: Mutex<Vec<crate::outside::Named>>,
+    pub outside: Mutex<crate::outside::Outside>,
     /// The group calls this device is on or carries, by call.
     pub group_calls: Mutex<HashMap<[u8; 16], crate::calls::Group>>,
     /// The group calls this device rang for lately, or its person made.
@@ -530,7 +530,7 @@ impl Daemon {
             call_ended: Mutex::new(None),
             clip: Mutex::new(None),
             portmap: Mutex::new(crate::portmap::State::default()),
-            outside: Mutex::new(Vec::new()),
+            outside: Mutex::new(crate::outside::Outside::default()),
             group_calls: Mutex::new(HashMap::new()),
             rung_calls: Mutex::new(std::collections::VecDeque::new()),
             passed_rings: Mutex::new(std::collections::VecDeque::new()),

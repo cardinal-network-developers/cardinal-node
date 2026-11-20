@@ -2079,6 +2079,12 @@ mod tests {
                 lifetime: 7200,
             };
             lock(&self.d.portmap).mapping = Some((m, Instant::now()));
+            // held long enough, and a day after the last new one
+            {
+                let mut o = lock(&self.d.outside);
+                o.seen = Some((at.parse().unwrap(), 0));
+                o.last_new = 0;
+            }
             crate::outside::tick(&self.d);
         }
 

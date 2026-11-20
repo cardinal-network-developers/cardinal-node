@@ -69,6 +69,8 @@ fn start_behind(d: &mut Dev, router: u16) {
         "CARDINAL_TEST_GATEWAY".into(),
         format!("127.0.0.1:{router}"),
     ));
+    // An address is named once the router has given it this long.
+    d.env.push(("CARDINAL_TEST_HOLD_SECS".into(), "2".into()));
     let log = std::fs::File::create(d.home.join("daemon.log")).unwrap();
     let child = d
         .cmd()
