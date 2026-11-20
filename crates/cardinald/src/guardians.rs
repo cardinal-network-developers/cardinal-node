@@ -92,12 +92,13 @@ fn save_seen(d: &Daemon, seen: &Seen) {
 }
 
 fn delay_text(secs: u64) -> String {
-    match secs {
-        s if s % 86_400 == 0 && s > 0 => format!("{} days", s / 86_400),
-        s if s % 3600 == 0 && s > 0 => format!("{} hours", s / 3600),
-        s if s % 60 == 0 && s > 0 => format!("{} minutes", s / 60),
-        s => format!("{s} seconds"),
-    }
+    let (n, unit) = match secs {
+        s if s % 86_400 == 0 && s > 0 => (s / 86_400, "day"),
+        s if s % 3600 == 0 && s > 0 => (s / 3600, "hour"),
+        s if s % 60 == 0 && s > 0 => (s / 60, "minute"),
+        s => (s, "second"),
+    };
+    format!("{n} {unit}{}", if n == 1 { "" } else { "s" })
 }
 
 fn my_id(d: &Daemon) -> anyhow::Result<EntryId> {
