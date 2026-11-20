@@ -193,6 +193,11 @@ enum Cmd {
         /// With a name: look for them now (up to 12 s), then show.
         #[arg(long)]
         look: bool,
+        /// With a name: try each of their devices at this address
+        /// (ip:port) first, for when neither of you names anything the
+        /// other can use.
+        #[arg(long, value_name = "ADDRESS")]
+        at: Option<String>,
         /// With a name: print it as JSON.
         #[arg(long)]
         json: bool,
@@ -1949,12 +1954,13 @@ async fn client(cmd: Cmd) -> anyhow::Result<()> {
         Cmd::Contacts {
             who: Some(who),
             look,
+            at,
             json,
             ..
         } => {
             let v = call(
                 &paths,
-                json!({"cmd": "contact-status", "who": who, "look": look}),
+                json!({"cmd": "contact-status", "who": who, "look": look, "at": at}),
             )
             .await?;
             if json {

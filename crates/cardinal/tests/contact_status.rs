@@ -154,3 +154,48 @@ fn a_contact_shows_its_route_its_reach_and_how_it_was_looked_for() {
     assert!(text.contains("not tried: a name"), "{text}");
     assert!(text.contains("closed after"), "{text}");
 }
+
+/// Neither names a host, so after a restart neither can find the other,
+/// until one is told an address to try.
+#[test]
+fn at_an_address_reaches_a_contact_neither_side_could_find() {
+    if !fuse_available() {
+        eprintln!("skipped: no FUSE");
+        return;
+    }
+    let root = tempfile::tempdir().unwrap();
+    let (mut a, b) = (person(root.path(), "ana"), person(root.path(), "bo"));
+    let at = format!("127.0.0.1:{}", a.port);
+    let code = a.cli(&["invite", "--address", &at, "--name", "Ana"]);
+    b.cli(&["accept", code.trim(), "--name", "Ana"]);
+    wait("they are connected", 30, || {
+        let c = ask(&b, json!({"cmd": "contacts"}));
+        c["contacts"][0]["connected"] == true
+    });
+    a.stop();
+    wait("Bo sees Ana gone", 240, || {
+        let v = ask(&b, json!({"cmd": "contact-status", "who": "Ana"}));
+        v["devices"][0]["online"] == false
+    });
+    a.start();
+    let v = ask(&b, json!({"cmd": "contact-status", "who": "Ana", "at": at}));
+    assert_eq!(v["devices"][0]["online"], true, "{v:#}");
+    let look = v["last_look"].as_array().unwrap();
+    assert!(
+        look[0]["text"].as_str().unwrap().contains("as you asked"),
+        "{v:#}"
+    );
+    let bad = try_status(
+        &b,
+        json!({"cmd": "contact-status", "who": "Ana", "at": "nowhere"}),
+    );
+    assert_eq!(bad["ok"], false, "{bad}");
+}
+
+fn try_status(d: &Dev, req: Value) -> Value {
+    let mut s = UnixStream::connect(d.home.join("control.sock")).unwrap();
+    writeln!(s, "{req}").unwrap();
+    let mut line = String::new();
+    BufReader::new(s).read_line(&mut line).unwrap();
+    serde_json::from_str(&line).unwrap()
+}

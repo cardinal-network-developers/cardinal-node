@@ -1461,9 +1461,20 @@ fn step_json(s: &crate::rendezvous::Step) -> Json {
 /// the sessions with them, what their reach node says and what became of
 /// each address, how they were last looked for, and what this person's own
 /// reach node tells them. With `look`, looks for them first.
-pub async fn status(d: &Arc<Daemon>, who: &str, look: bool) -> anyhow::Result<Json> {
+pub async fn status(
+    d: &Arc<Daemon>,
+    who: &str,
+    look: bool,
+    at: Option<SocketAddr>,
+) -> anyhow::Result<Json> {
     let c = find(d, who)?;
-    if look && c.connects() {
+    if let Some(addr) = at {
+        anyhow::ensure!(
+            c.connects(),
+            "you do not trust {who}, so your devices do not connect to theirs"
+        );
+        crate::rendezvous::try_at(d, c.identity, addr).await;
+    } else if look && c.connects() {
         crate::rendezvous::reach_now(d, c.identity, c.space).await;
     }
     let (theirs, reach, mine, name_of) = {

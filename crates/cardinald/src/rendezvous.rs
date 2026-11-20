@@ -1574,6 +1574,46 @@ pub fn standing(d: &Daemon) -> Vec<(KeyId, HybridPublicKey)> {
 /// Asks a contact's host for their devices, tries each directly, and relays
 /// to any that cannot be reached that way. The session with the host stays
 /// open while a relay runs through it.
+/// Tries each of a trusted contact's devices at an address the person
+/// gives, as a step of a look: the way out when neither side names anything
+/// the other can use.
+pub async fn try_at(d: &Arc<Daemon>, who: [u8; 32], addr: SocketAddr) {
+    let theirs: Vec<(KeyId, HybridPublicKey)> = {
+        let core = d.core();
+        let Some(o) = core.others.get(&who) else {
+            return;
+        };
+        let st = o.log.state();
+        st.keys
+            .values()
+            .filter_map(|k| Some((k.key, k.link_key.clone()?)))
+            .collect()
+    };
+    d.rendezvous.look_begins(
+        &who,
+        format!("trying their devices at {addr}, as you asked"),
+    );
+    for (device, link) in theirs {
+        if reached(d, link.x25519()) {
+            continue;
+        }
+        punch(d, &link, vec![addr]).await;
+        if reached(d, link.x25519()) {
+            d.rendezvous.step(
+                &who,
+                Some(true),
+                format!("their {}: reached at {addr}", device_label(&device)),
+            );
+            return;
+        }
+    }
+    d.rendezvous.step(
+        &who,
+        Some(false),
+        format!("none of their devices answered at {addr}"),
+    );
+}
+
 /// Tries a contact's device where a helper says it is, and else relays
 /// through the helper, noting each step.
 #[allow(clippy::too_many_arguments)]

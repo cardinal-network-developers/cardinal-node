@@ -294,7 +294,13 @@ async fn handle(d: &Arc<Daemon>, req: &Value) -> anyhow::Result<Value> {
         "cancel-invitation" => crate::contacts::cancel_invitation(d, arg(req, "id")?),
         "contact-status" => {
             let look = req.get("look").and_then(|v| v.as_bool()) == Some(true);
-            crate::contacts::status(d, arg(req, "who")?, look).await
+            let at = match req.get("at").and_then(|v| v.as_str()) {
+                Some(a) => Some(a.parse().map_err(|_| {
+                    anyhow::anyhow!("{a} is not an address; it looks like 192.168.1.20:7171")
+                })?),
+                None => None,
+            };
+            crate::contacts::status(d, arg(req, "who")?, look, at).await
         }
         "contacts" => {
             let all = req.get("all").and_then(|v| v.as_bool()) == Some(true);
