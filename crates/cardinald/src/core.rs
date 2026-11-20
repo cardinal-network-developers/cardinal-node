@@ -188,6 +188,56 @@ impl OtherLog {
     }
 }
 
+/// Restoring through guardians (`hosts.md#restore`): with `root`, the
+/// new root a recovery in effect named, the entries that add this
+/// device as an admin device to the log collected from a host, and then
+/// set a fresh encryption key whose chain carries the earlier ones
+/// (`identity.md#what-a-recovery-does`). The current key comes from the
+/// guardian key, rebuilt from the shares in the guardians'
+/// confirmations, sealed to this device's link key.
+///
+/// `log` is [`Core::joining_log`]; this takes no lock, since rebuilding
+/// the key may take a while.
+pub fn recovered_entries(
+    mut log: IdentityLog,
+    keys: &Keys,
+    root: &cardinal_crypto::SigningKey,
+) -> anyhow::Result<Vec<(Vec<u8>, [u8; 32])>> {
+    let identity = log.id();
+    let identity = &identity;
+    let st = log.state();
+    if st.power(&root.public_key()) != Some(cardinal_identity::Power::Root) {
+        anyhow::bail!(
+            "the recovery is not in effect on that device yet: your guardians have not all \
+             confirmed it, or their confirmations have not reached it"
+        );
+    }
+    let recovery = log
+        .recoveries()
+        .into_iter()
+        .find(|r| r.root == root.public_key() && st.in_effect.contains(&r.entry))
+        .ok_or_else(|| anyhow::anyhow!("no recovery in that log names this device's root"))?;
+    let guardian_key = log
+        .rebuild_guardian_key(&recovery, &keys.device.link)
+        .map_err(|e| anyhow::anyhow!("cannot rebuild the guardian key from the shares: {e}"))?;
+    let enc = log.open_with_guardian_key(&guardian_key, &recovery.policy)?;
+    let current = log
+        .key_chain(enc)
+        .into_iter()
+        .next()
+        .expect("the key itself");
+    let request = keys
+        .device
+        .request(identity, cardinal_identity::Power::Admin);
+    let added = log.add_key(root, &request, Some(&current))?;
+    let fresh = HybridKeyPair::generate();
+    let rotated = log.set_encryption_key(root, &fresh, Some(&current))?;
+    Ok(vec![
+        (added.encode(), added.id()),
+        (rotated.encode(), rotated.id()),
+    ])
+}
+
 /// Sealed entries written, by space.
 pub type Written = Vec<(SpaceId, Vec<u8>)>;
 
@@ -2457,55 +2507,6 @@ impl Core {
             .request(identity, cardinal_identity::Power::Admin);
         let entry = log.add_key(&root, &request, Some(&enc))?;
         Ok((entry.encode(), entry.id()))
-    }
-
-    /// Restoring through guardians (`hosts.md#restore`): with `root`, the
-    /// new root a recovery in effect named, the entries that add this
-    /// device as an admin device to the log collected from a host, and then
-    /// set a fresh encryption key whose chain carries the earlier ones
-    /// (`identity.md#what-a-recovery-does`). The current key comes from the
-    /// guardian key, rebuilt from the shares in the guardians'
-    /// confirmations, sealed to this device's link key.
-    pub fn add_recovered_device(
-        &self,
-        identity: &[u8; 32],
-        root: &cardinal_crypto::SigningKey,
-    ) -> anyhow::Result<Vec<(Vec<u8>, [u8; 32])>> {
-        let mut log = self
-            .joining_log(identity)
-            .ok_or_else(|| anyhow::anyhow!("that device did not send the identity log"))?;
-        let st = log.state();
-        if st.power(&root.public_key()) != Some(cardinal_identity::Power::Root) {
-            anyhow::bail!(
-                "the recovery is not in effect on that device yet: your guardians have not all \
-                 confirmed it, or their confirmations have not reached it"
-            );
-        }
-        let recovery = log
-            .recoveries()
-            .into_iter()
-            .find(|r| r.root == root.public_key() && st.in_effect.contains(&r.entry))
-            .ok_or_else(|| anyhow::anyhow!("no recovery in that log names this device's root"))?;
-        let guardian_key = log
-            .rebuild_guardian_key(&recovery, &self.keys.device.link)
-            .map_err(|e| anyhow::anyhow!("cannot rebuild the guardian key from the shares: {e}"))?;
-        let enc = log.open_with_guardian_key(&guardian_key, &recovery.policy)?;
-        let current = log
-            .key_chain(enc)
-            .into_iter()
-            .next()
-            .expect("the key itself");
-        let request = self
-            .keys
-            .device
-            .request(identity, cardinal_identity::Power::Admin);
-        let added = log.add_key(root, &request, Some(&current))?;
-        let fresh = HybridKeyPair::generate();
-        let rotated = log.set_encryption_key(root, &fresh, Some(&current))?;
-        Ok(vec![
-            (added.encode(), added.id()),
-            (rotated.encode(), rotated.id()),
-        ])
     }
 
     /// Adds sealed entries of a space, creating the holder if needed.

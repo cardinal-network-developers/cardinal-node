@@ -271,7 +271,14 @@ pub async fn finish(d: &Arc<Daemon>, at: &str, key: &str) -> anyhow::Result<Json
     d.on_session(s.clone());
     let label = identity_log_label(&identity);
     net::reconcile(d, &s, label).await?;
-    let entries = d.core().add_recovered_device(&identity, &root)?;
+    let log = d
+        .core()
+        .joining_log(&identity)
+        .ok_or_else(|| anyhow::anyhow!("that device did not send the identity log"))?;
+    let keys = d.keys.clone();
+    let entries =
+        tokio::task::spawn_blocking(move || crate::core::recovered_entries(log, &keys, &root))
+            .await??;
     for (entry, id) in &entries {
         net::deliver(&s, label, entry.clone(), *id).await?;
     }
