@@ -133,6 +133,9 @@ pub struct IdentityState {
     pub encryption_key: Option<EncryptionKeyInfo>,
     /// Recovery policies in effect and not replaced.
     pub current_policies: Vec<EntryId>,
+    /// Guardian decisions in effect: policies and recoveries. They are
+    /// judged only as decisions, so they are not in `valid`.
+    pub in_effect: HashSet<EntryId>,
     effective_at: HashSet<(KeyId, EntryId)>,
     removed: HashSet<KeyId>,
     removed_at: HashSet<(KeyId, EntryId)>,
@@ -190,6 +193,13 @@ pub struct IdentityLog {
     root0: KeyId,
     dag: Dag<IdentityEntry>,
     state: Mutex<Option<Arc<IdentityState>>>,
+    /// Other identities' logs held under this one's label: guardians'
+    /// entries, up to their `endorse` and `confirm`, which guardian
+    /// software delivers to the guarded identity
+    /// (`identity.md#distribution`). Evaluating this log reads them.
+    attached: BTreeMap<EntryId, IdentityLog>,
+    /// Attached entries whose log's genesis has not arrived.
+    unattached: Vec<IdentityEntry>,
 }
 
 /// The result of creating an identity.
@@ -249,6 +259,8 @@ impl IdentityLog {
             root0,
             dag,
             state: Mutex::new(None),
+            attached: BTreeMap::new(),
+            unattached: Vec::new(),
         })
     }
 
@@ -347,9 +359,22 @@ impl IdentityLog {
         self.dag.heads()
     }
 
-    /// Whether entries are waiting for parents.
+    /// Whether entries are waiting for parents, here or in a log held
+    /// under this one's label.
     pub fn is_waiting(&self) -> bool {
         self.dag.held().next().is_some()
+            || !self.unattached.is_empty()
+            || self.attached.values().any(|l| l.is_waiting())
+    }
+
+    /// The heads of this log, then of each log held under its label: what
+    /// a notice of the label names.
+    pub fn all_heads(&self) -> Vec<EntryId> {
+        let mut v = self.heads();
+        for l in self.attached.values() {
+            v.extend(l.heads());
+        }
+        v
     }
 
     /// The number of entries held (not counting those waiting for
@@ -393,6 +418,76 @@ impl IdentityLog {
         self.insert(IdentityEntry::decode(bytes)?)
     }
 
+    /// Adds an entry of this log, or of another identity's log held under
+    /// this one's label ([`attach`](Self::attach)).
+    pub fn insert_any(&mut self, entry: IdentityEntry) -> Result<Inserted, Error> {
+        if entry.identity() == self.id {
+            self.insert(entry)
+        } else {
+            self.attach(entry)
+        }
+    }
+
+    /// Adds an entry of another identity's log, held under this one's
+    /// label: a guardian's, delivered with its `endorse` or `confirm`.
+    /// Entries that come before their log's genesis wait for it.
+    pub fn attach(&mut self, entry: IdentityEntry) -> Result<Inserted, Error> {
+        let of = entry.identity();
+        if of == self.id {
+            return Err(Error::WrongIdentity);
+        }
+        let r = match self.attached.get_mut(&of) {
+            Some(log) => log.insert(entry)?,
+            None if entry.is_genesis() => {
+                let id = entry.id();
+                let mut log = IdentityLog::from_genesis(entry)?;
+                let (mine, rest): (Vec<IdentityEntry>, Vec<IdentityEntry>) =
+                    std::mem::take(&mut self.unattached)
+                        .into_iter()
+                        .partition(|e| e.identity() == of);
+                self.unattached = rest;
+                let mut added = vec![id];
+                for e in mine {
+                    if let Ok(Inserted::Added(ids)) = log.insert(e) {
+                        added.extend(ids);
+                    }
+                }
+                self.attached.insert(of, log);
+                Inserted::Added(added)
+            }
+            None => {
+                if self.unattached.iter().any(|e| e.id() == entry.id()) {
+                    return Ok(Inserted::Duplicate);
+                }
+                let id = entry.id();
+                self.unattached.push(entry);
+                Inserted::Held(vec![id])
+            }
+        };
+        if matches!(r, Inserted::Added(_)) {
+            *self.state.get_mut().expect("lock") = None;
+        }
+        Ok(r)
+    }
+
+    /// The other identities' logs held under this one's label.
+    pub fn attached(&self) -> impl Iterator<Item = &IdentityLog> {
+        self.attached.values()
+    }
+
+    /// One of them.
+    pub fn attached_log(&self, identity: &EntryId) -> Option<&IdentityLog> {
+        self.attached.get(identity)
+    }
+
+    /// Whether an attached entry is held (or waits for its genesis).
+    pub fn has_attached(&self, id: &EntryId) -> bool {
+        self.attached
+            .values()
+            .any(|l| l.dag.contains(id) || l.dag.is_held(id))
+            || self.unattached.iter().any(|e| e.id() == *id)
+    }
+
     /// The evaluated state of this log alone.
     pub fn state(&self) -> Arc<IdentityState> {
         let mut cache = self.state.lock().expect("state lock");
@@ -409,8 +504,11 @@ impl IdentityLog {
     pub fn evaluate(&self, others: &[&IdentityLog]) -> IdentityState {
         let mut logs: Vec<&IdentityLog> = vec![self];
         logs.extend(others.iter().copied().filter(|l| l.id != self.id));
-        let conv = Conversion::new(&logs);
-        conv.state(self)
+        let plan = gather(&logs);
+        let owned = plan.owned();
+        let refs = plan.refs(&owned);
+        let conv = Conversion::new(&refs);
+        conv.state(refs[0])
     }
 
     /// Appends an entry signed by `author`, with the current heads as
@@ -560,6 +658,16 @@ impl IdentityLog {
             if let Some(rk) = &r.recovery_key {
                 recovery_wraps.push(seal(
                     rk,
+                    &new.secret_bytes()[..],
+                    &context(RECOVERY_WRAP_CONTEXT, &self.id),
+                ));
+            }
+        }
+        // and to the guardian key of the policy in effect
+        for p in &st.current_policies {
+            if let Some(gk) = self.policy(p).and_then(|p| p.guardian_key) {
+                recovery_wraps.push(seal(
+                    &gk,
                     &new.secret_bytes()[..],
                     &context(RECOVERY_WRAP_CONTEXT, &self.id),
                 ));
@@ -726,15 +834,98 @@ pub fn guardian_commitment(salt: &[u8; 32], guardian: &EntryId) -> [u8; 32] {
 /// log, in the order given. A space judges its authors by these
 /// (`spaces.md#authors`: "the whole log the verifier holds").
 pub fn evaluate_together(logs: &[&IdentityLog]) -> Vec<IdentityState> {
-    let conv = Conversion::new(logs);
-    logs.iter().map(|l| conv.state(l)).collect()
+    let plan = gather(logs);
+    let owned = plan.owned();
+    let refs = plan.refs(&owned);
+    let conv = Conversion::new(&refs);
+    refs[..plan.given].iter().map(|l| conv.state(l)).collect()
 }
 
 /// The model world of several identity logs, to which a space's entries can
 /// be added for evaluation by the `space` program. Symbols are the lowercase
 /// hex of ids and keys, so symbols compare as the bytes they stand for.
 pub fn model_world(logs: &[&IdentityLog]) -> World {
-    Conversion::new(logs).world
+    let plan = gather(logs);
+    let owned = plan.owned();
+    let refs = plan.refs(&owned);
+    Conversion::new(&refs).world
+}
+
+/// Logs to evaluate together: those given, then the logs attached to them,
+/// each identity once. Where one identity's entries come from more than
+/// one place, they are merged into a log of their own.
+struct Gathered<'a> {
+    /// Each identity's sources, in order: the given logs first.
+    sources: Vec<Vec<&'a IdentityLog>>,
+    /// How many of them were given (deduplicated).
+    given: usize,
+}
+
+fn gather<'a>(logs: &[&'a IdentityLog]) -> Gathered<'a> {
+    let mut order: Vec<EntryId> = Vec::new();
+    let mut sources: HashMap<EntryId, Vec<&'a IdentityLog>> = HashMap::new();
+    let mut add = |l: &'a IdentityLog, order: &mut Vec<EntryId>| {
+        let v = sources.entry(l.id).or_insert_with(|| {
+            order.push(l.id);
+            Vec::new()
+        });
+        v.push(l);
+    };
+    for l in logs {
+        add(l, &mut order);
+    }
+    let given = order.len();
+    for l in logs {
+        for a in l.attached.values() {
+            add(a, &mut order);
+        }
+    }
+    Gathered {
+        sources: order
+            .iter()
+            .map(|id| sources.remove(id).expect("added"))
+            .collect(),
+        given,
+    }
+}
+
+impl<'a> Gathered<'a> {
+    /// The merged logs, for identities with more than one source, in order.
+    fn owned(&self) -> Vec<IdentityLog> {
+        self.sources
+            .iter()
+            .filter(|s| s.len() > 1)
+            .map(|s| {
+                let first = s[0];
+                let genesis = first.get(&first.id).expect("genesis").clone();
+                let mut log = IdentityLog::from_genesis(genesis).expect("a checked genesis");
+                for l in s {
+                    for e in l.entries().chain(l.dag.held_values()) {
+                        let _ = log.insert(e.clone());
+                    }
+                }
+                log
+            })
+            .collect()
+    }
+
+    fn refs<'b>(&self, owned: &'b [IdentityLog]) -> Vec<&'b IdentityLog>
+    where
+        'a: 'b,
+    {
+        let mut next = 0;
+        self.sources
+            .iter()
+            .map(|s| {
+                if s.len() > 1 {
+                    next += 1;
+                    &owned[next - 1]
+                } else {
+                    s[0]
+                }
+            })
+            .collect()
+    }
 }
 
 /// Real entries of several logs, converted to the model's world.
@@ -959,6 +1150,11 @@ impl<'a> Conversion<'a> {
             encryption_key,
             current_policies: r
                 .unary("current_policy")
+                .iter()
+                .map(|s| self.id_of(*s))
+                .collect(),
+            in_effect: r
+                .unary("in_effect")
                 .iter()
                 .map(|s| self.id_of(*s))
                 .collect(),

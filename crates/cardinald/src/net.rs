@@ -163,7 +163,7 @@ impl Daemon {
                 let core = self.core();
                 token_access(core.space_of_token(&token), core.identity_label(), label)
             }
-            PeerKind::Restoring | PeerKind::Stranger => Access::None,
+            PeerKind::Restoring | PeerKind::Helped(_) | PeerKind::Stranger => Access::None,
         }
     }
 }
@@ -219,7 +219,7 @@ pub async fn serve(d: Arc<Daemon>, s: Session, gen: u64) {
 pub async fn sync_all(d: &Arc<Daemon>, s: &Session) {
     let (labels, member) = match d.classify(s) {
         PeerKind::Contact(identity, _) => (d.core().labels_with(&identity), Some(identity)),
-        PeerKind::Token(_) | PeerKind::Stranger => return,
+        PeerKind::Token(_) | PeerKind::Helped(_) | PeerKind::Stranger => return,
         _ => (d.core().labels(), None),
     };
     for label in labels {
@@ -305,6 +305,9 @@ async fn handle_stream(d: &Arc<Daemon>, s: &Session, mut st: Stream) -> anyhow::
         };
         tracing::trace!("blob stream {} accepted", st.id());
         return serve_blob(d, st, allowed).await;
+    }
+    if st.service() == crate::guardians::service() {
+        return crate::guardians::serve(d, s, st).await;
     }
     if st.service() == crate::speedtest::service() && crate::speedtest::offered() {
         return crate::speedtest::serve(d, s, st).await;
@@ -401,7 +404,11 @@ async fn handle_stream(d: &Arc<Daemon>, s: &Session, mut st: Stream) -> anyhow::
 fn is_someone_else(kind: PeerKind) -> bool {
     matches!(
         kind,
-        PeerKind::Token(_) | PeerKind::Contact(..) | PeerKind::Inviting(..) | PeerKind::Stranger
+        PeerKind::Token(_)
+            | PeerKind::Contact(..)
+            | PeerKind::Inviting(..)
+            | PeerKind::Helped(_)
+            | PeerKind::Stranger
     )
 }
 
@@ -596,6 +603,17 @@ pub async fn notice(
     } else {
         Message::Heads { label, ids: heads }
     };
+    let mut st = s.open_stream(Service::SYNC, Priority::Interactive)?;
+    st.send_message(&to_value(&msg)).await?;
+    st.shutdown().await?;
+    Ok(())
+}
+
+/// Sends objects of a set to a peer unasked, in one message, in the order
+/// given: entries that belong together, such as a guardian's log up to what
+/// it did (`identity.md#distribution`).
+pub async fn send_objects(s: &Session, label: Label, objects: Vec<Vec<u8>>) -> anyhow::Result<()> {
+    let msg = Message::Objects { label, objects };
     let mut st = s.open_stream(Service::SYNC, Priority::Interactive)?;
     st.send_message(&to_value(&msg)).await?;
     st.shutdown().await?;

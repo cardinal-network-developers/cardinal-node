@@ -229,6 +229,16 @@ impl Paths {
     pub fn old_versions(&self) -> PathBuf {
         self.home.join("old-versions.json")
     }
+    /// When this device, as a guardian, saw what it waits from
+    /// (`guardians.rs`).
+    pub fn guarding(&self) -> PathBuf {
+        self.home.join("guarding.json")
+    }
+    /// A recovery through guardians under way on this new device, with the
+    /// new recovery words (`recovering.rs`).
+    pub fn recovering(&self) -> PathBuf {
+        self.home.join("recovering.json")
+    }
     /// Contacts' pictures, as files windows can open (`names.rs`).
     pub fn pictures(&self) -> PathBuf {
         self.home.join("pictures")

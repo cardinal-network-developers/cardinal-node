@@ -487,6 +487,32 @@ async fn handle(d: &Arc<Daemon>, req: &Value) -> anyhow::Result<Value> {
             Ok(crate::portmap::status(d))
         }
         "recovery-sheet" => crate::host::sheet(d),
+        "guardians" => crate::guardians::show(d),
+        "guardians-set" => crate::guardians::set(
+            d,
+            &strings(req, "who"),
+            req.get("threshold").and_then(Value::as_u64),
+            req.get("delay").and_then(Value::as_u64),
+            words(req),
+        ),
+        "guardians-object" => {
+            crate::guardians::object(d, req.get("fingerprint").and_then(Value::as_str))
+        }
+        "guarding" => Ok(crate::guardians::list(d)),
+        "guarding-help" => crate::guardians::help(d, arg(req, "who")?, &strings(req, "at")),
+        "guarding-endorse" => {
+            crate::guardians::endorse(d, arg(req, "who")?, arg(req, "fingerprint")?).await
+        }
+        "guarding-confirm" => {
+            crate::guardians::confirm(d, arg(req, "who")?, arg(req, "fingerprint")?).await
+        }
+        "recover" => crate::recovering::status(d),
+        "keep-work" => crate::recovering::keep_work(d, req.get("name").and_then(Value::as_str)),
+        "recover-via" => {
+            crate::recovering::via(d, arg(req, "code")?, req.get("key").and_then(Value::as_str))
+                .await
+        }
+        "recover-finish" => crate::recovering::finish(d, arg(req, "at")?, arg(req, "key")?).await,
         "restore-from-host" => {
             crate::host::restore(d, arg(req, "words")?, arg(req, "at")?, arg(req, "key")?).await
         }
@@ -916,6 +942,9 @@ fn status(d: &Arc<Daemon>) -> Value {
                         None => "arriving",
                     },
                     "entries": h.set_len(),
+                    // set aside for want of a witness (`spaces.md#authors`)
+                    "set_aside": h.space.as_ref().map_or(0, |s| s.validity().unwitnessed.len()),
+                    "valid": h.space.as_ref().map_or(0, |s| s.validity().valid.len()),
                 })
             })
             .collect();

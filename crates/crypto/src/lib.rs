@@ -26,6 +26,7 @@ pub mod hybrid;
 pub mod kem;
 mod random;
 pub mod seal;
+pub mod shamir;
 pub mod sign;
 pub mod x25519;
 

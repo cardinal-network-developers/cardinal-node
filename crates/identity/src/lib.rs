@@ -18,6 +18,7 @@ pub mod dag;
 pub mod datalog;
 pub mod entry;
 mod error;
+pub mod guardians;
 pub mod log;
 pub mod model;
 
@@ -27,6 +28,7 @@ pub mod testutil;
 pub use dag::{Dag, Inserted};
 pub use entry::{EntryBuilder, EntryId, IdentityEntry, IdentityOp, KeyId, OpBody, Power, Protocol};
 pub use error::Error;
+pub use guardians::{GuardianRecord, Policy, Recovery};
 pub use log::{
     Created, DeviceKeys, EncryptionKeyInfo, IdentityLog, IdentityState, KeyInfo, KeyRequest,
 };

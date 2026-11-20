@@ -486,7 +486,7 @@ fn proof_message(s: &Session) -> Vec<u8> {
     msg
 }
 
-async fn send_proof(s: &Session, root: &SigningKey) -> anyhow::Result<Option<[u8; 32]>> {
+pub(crate) async fn send_proof(s: &Session, root: &SigningKey) -> anyhow::Result<Option<[u8; 32]>> {
     let mut st = s.open_stream(Service::STORAGE, Priority::Interactive)?;
     let request = Record::new()
         .with(0, OP_PROVE)
@@ -542,6 +542,35 @@ pub async fn restore(d: &Arc<Daemon>, words: &str, at: &str, key: &str) -> anyho
     }
     let phrase = RecoveryPhrase::parse(words).map_err(|e| anyhow::anyhow!("{e}"))?;
     let root = phrase.root_signing_key();
+    let (s, addr, host, host_key) = open_restore(d, at, key).await?;
+    let identity = send_proof(&s, &root).await?.ok_or_else(|| {
+        anyhow::anyhow!("that device does not know these recovery words; nothing was changed")
+    })?;
+    *d.pairing.lock().unwrap_or_else(|e| e.into_inner()) = PairState::Joining {
+        identity,
+        admin_static: host,
+        admin_name: at.to_owned(),
+        admin_key: host_key,
+        admin_addr: Some(addr),
+    };
+    d.on_session(s.clone());
+    // The log, then this device in it, signed by the root.
+    let label = identity_log_label(&identity);
+    net::reconcile(d, &s, label).await?;
+    let (entry, id) = d.core().add_restoring_device(&identity, &phrase)?;
+    net::deliver(&s, label, entry.clone(), id).await?;
+    d.ingest(label, vec![entry], Access::Join(identity))?;
+    Ok(json!({"at": at}))
+}
+
+/// A restore session with the host at `at` whose sheet key is `key`: the
+/// session, the address it reached, the host's static key, and its
+/// signing key.
+pub(crate) async fn open_restore(
+    d: &Arc<Daemon>,
+    at: &str,
+    key: &str,
+) -> anyhow::Result<(Session, SocketAddr, [u8; 32], [u8; 32])> {
     let host = read_sheet_key(key).ok_or_else(|| {
         anyhow::anyhow!("that key does not check out; a character was probably mistyped")
     })?;
@@ -569,28 +598,11 @@ pub async fn restore(d: &Arc<Daemon>, words: &str, at: &str, key: &str) -> anyho
     let Some((s, addr)) = found else {
         return Err(failed);
     };
-    let identity = send_proof(&s, &root).await?.ok_or_else(|| {
-        anyhow::anyhow!("that device does not know these recovery words; nothing was changed")
-    })?;
     let host_key = s
         .peer_identity()
         .ok_or_else(|| anyhow::anyhow!("that device did not say who it is"))?
         .signing_key;
-    *d.pairing.lock().unwrap_or_else(|e| e.into_inner()) = PairState::Joining {
-        identity,
-        admin_static: host,
-        admin_name: at.to_owned(),
-        admin_key: host_key,
-        admin_addr: Some(addr),
-    };
-    d.on_session(s.clone());
-    // The log, then this device in it, signed by the root.
-    let label = identity_log_label(&identity);
-    net::reconcile(d, &s, label).await?;
-    let (entry, id) = d.core().add_restoring_device(&identity, &phrase)?;
-    net::deliver(&s, label, entry.clone(), id).await?;
-    d.ingest(label, vec![entry], Access::Join(identity))?;
-    Ok(json!({"at": at}))
+    Ok((s, addr, host, host_key))
 }
 
 #[cfg(test)]

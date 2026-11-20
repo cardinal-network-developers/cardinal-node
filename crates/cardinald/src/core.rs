@@ -102,11 +102,13 @@ impl Identity {
                     continue;
                 }
             };
-            if self.set.contains_id(&e.id()) || e.identity() != self.log.id() {
+            if self.set.contains_id(&e.id()) {
                 continue;
             }
             let id = e.id();
-            match self.log.insert(e) {
+            // Another identity's entries, held under this one's label: a
+            // guardian's, up to what it did (`identity.md#distribution`).
+            match self.log.insert_any(e) {
                 Ok(Inserted::Duplicate) => continue,
                 Ok(Inserted::Added(_)) => changed = true,
                 Ok(Inserted::Held(_)) => {}
@@ -158,11 +160,11 @@ impl OtherLog {
             let Ok(e) = IdentityEntry::decode(bytes) else {
                 continue;
             };
-            if self.set.contains_id(&e.id()) || e.identity() != self.log.id() {
+            if self.set.contains_id(&e.id()) {
                 continue;
             }
             let id = e.id();
-            match self.log.insert(e) {
+            match self.log.insert_any(e) {
                 Ok(Inserted::Added(_)) => changed = true,
                 Ok(Inserted::Held(_)) => {}
                 Ok(Inserted::Duplicate) | Err(_) => continue,
@@ -184,6 +186,19 @@ impl OtherLog {
     fn get(&self, id: &EntryId) -> Option<Vec<u8>> {
         self.locs.get(id).and_then(|l| self.file.read(*l).ok())
     }
+}
+
+/// Sealed entries written, by space.
+pub type Written = Vec<(SpaceId, Vec<u8>)>;
+
+/// Every entry of a log, its own first in log order, then those of the
+/// logs held under its label: what an identity log file holds.
+pub fn log_bytes(log: &IdentityLog) -> Vec<Vec<u8>> {
+    let mut out: Vec<Vec<u8>> = log.entries().map(|e| e.encode()).collect();
+    for a in log.attached() {
+        out.extend(a.entries().map(|e| e.encode()));
+    }
+    out
 }
 
 /// Helpers on [`MemSet`].
@@ -886,6 +901,28 @@ impl Holder {
         Ok((id, bytes))
     }
 
+    /// Writes `keep` ops on every head, set aside or not
+    /// ([`Space::write_keeps`]). Returns the sealed bytes.
+    pub fn write_keeps(
+        &mut self,
+        identity: &Identity,
+        keys: &Keys,
+        ops: Vec<SpaceOp>,
+    ) -> anyhow::Result<Vec<u8>> {
+        if identity.state().power(&keys.key()).is_none() {
+            anyhow::bail!("this device was removed");
+        }
+        let space = self
+            .space
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("space not open yet"))?;
+        let (_, sealed) = space.write_keeps(&identity.log, &keys.device.signing, ops)?;
+        let bytes = sealed.encode();
+        self.persist(&[(sealed.sealed_id(), bytes.clone())])?;
+        self.version += 1;
+        Ok(bytes)
+    }
+
     /// Adds members to a group in one entry, with the current key wrapped
     /// for them (`profiles.md#group`). Returns the sealed bytes.
     pub fn add_members(
@@ -1093,12 +1130,17 @@ impl Core {
                 set.insert(e.id());
                 entries.push(e);
             }
-            let Some(at) = entries.iter().position(|e| e.is_genesis()) else {
+            let named = d.file_name().to_string_lossy().into_owned();
+            let at = entries
+                .iter()
+                .position(|e| e.is_genesis() && hex::encode(e.id()) == named)
+                .or_else(|| entries.iter().position(|e| e.is_genesis()));
+            let Some(at) = at else {
                 continue;
             };
             let mut log = IdentityLog::from_genesis(entries.remove(at))?;
             for e in entries {
-                let _ = log.insert(e);
+                let _ = log.insert_any(e);
             }
             let other = OtherLog {
                 log,
@@ -2165,6 +2207,8 @@ impl Core {
             locs.insert(e.id(), loc);
             entries.push(e);
         }
+        // The first genesis is this identity's: guardians' logs held under
+        // its label come after it.
         let gi = entries
             .iter()
             .position(|e| e.is_genesis())
@@ -2172,7 +2216,7 @@ impl Core {
         let g = entries.remove(gi);
         let mut log = IdentityLog::from_genesis(g)?;
         for e in entries {
-            let _ = log.insert(e);
+            let _ = log.insert_any(e);
         }
         let mut set = MemSet::new();
         for id in locs.keys() {
@@ -2363,11 +2407,11 @@ impl Core {
             return self
                 .identity
                 .as_ref()
-                .map(|i| i.log.heads())
+                .map(|i| i.log.all_heads())
                 .unwrap_or_default();
         }
         if let Some(o) = self.other(label) {
-            return o.log.heads();
+            return o.log.all_heads();
         }
         self.spaces
             .get(label)
@@ -2397,25 +2441,13 @@ impl Core {
             return Ok(IdentityChange::default());
         };
         self.joining.extend(objects.iter().cloned());
-        let entries: Vec<IdentityEntry> = self
-            .joining
-            .iter()
-            .filter_map(|b| IdentityEntry::decode(b).ok())
-            .filter(|e| e.identity() == expected)
-            .collect();
-        let Some(g) = entries.iter().find(|e| e.is_genesis()) else {
+        let Some(log) = self.joining_log(&expected) else {
             return Ok(IdentityChange::default());
         };
-        let mut log = IdentityLog::from_genesis(g.clone())?;
-        for e in &entries {
-            if !e.is_genesis() {
-                let _ = log.insert(e.clone());
-            }
-        }
         if !log.state().keys.contains_key(&self.keys.key()) {
             return Ok(IdentityChange::default());
         }
-        let bytes: Vec<Vec<u8>> = log.entries().map(|e| e.encode()).collect();
+        let bytes = log_bytes(&log);
         self.install_identity(&bytes)?;
         self.joining.clear();
         tracing::info!(
@@ -2428,6 +2460,26 @@ impl Core {
         })
     }
 
+    /// The log of `identity` collected while joining it, with the
+    /// guardians' logs that came under its label.
+    pub fn joining_log(&self, identity: &[u8; 32]) -> Option<IdentityLog> {
+        let entries: Vec<IdentityEntry> = self
+            .joining
+            .iter()
+            .filter_map(|b| IdentityEntry::decode(b).ok())
+            .collect();
+        let g = entries
+            .iter()
+            .find(|e| e.is_genesis() && e.id() == *identity)?;
+        let mut log = IdentityLog::from_genesis(g.clone()).ok()?;
+        for e in &entries {
+            if e.id() != *identity {
+                let _ = log.insert_any(e.clone());
+            }
+        }
+        Some(log)
+    }
+
     /// Restoring (`hosts.md#restore`): the entry that adds this device, as
     /// an admin device, to the log of `identity` collected from a host,
     /// signed by the root key from the words. Returns it and its id.
@@ -2436,20 +2488,9 @@ impl Core {
         identity: &[u8; 32],
         phrase: &cardinal_crypto::RecoveryPhrase,
     ) -> anyhow::Result<(Vec<u8>, [u8; 32])> {
-        let entries: Vec<IdentityEntry> = self
-            .joining
-            .iter()
-            .filter_map(|b| IdentityEntry::decode(b).ok())
-            .filter(|e| e.identity() == *identity)
-            .collect();
-        let g = entries
-            .iter()
-            .find(|e| e.is_genesis())
+        let mut log = self
+            .joining_log(identity)
             .ok_or_else(|| anyhow::anyhow!("that device did not send the identity log"))?;
-        let mut log = IdentityLog::from_genesis(g.clone())?;
-        for e in entries.iter().filter(|e| !e.is_genesis()) {
-            let _ = log.insert(e.clone());
-        }
         let root = phrase.root_signing_key();
         if log.state().power(&root.public_key()) != Some(cardinal_identity::Power::Root) {
             anyhow::bail!("these recovery words are not in that device's identity log");
@@ -2461,6 +2502,55 @@ impl Core {
             .request(identity, cardinal_identity::Power::Admin);
         let entry = log.add_key(&root, &request, Some(&enc))?;
         Ok((entry.encode(), entry.id()))
+    }
+
+    /// Restoring through guardians (`hosts.md#restore`): with `root`, the
+    /// new root a recovery in effect named, the entries that add this
+    /// device as an admin device to the log collected from a host, and then
+    /// set a fresh encryption key whose chain carries the earlier ones
+    /// (`identity.md#what-a-recovery-does`). The current key comes from the
+    /// guardian key, rebuilt from the shares in the guardians'
+    /// confirmations, sealed to this device's link key.
+    pub fn add_recovered_device(
+        &self,
+        identity: &[u8; 32],
+        root: &cardinal_crypto::SigningKey,
+    ) -> anyhow::Result<Vec<(Vec<u8>, [u8; 32])>> {
+        let mut log = self
+            .joining_log(identity)
+            .ok_or_else(|| anyhow::anyhow!("that device did not send the identity log"))?;
+        let st = log.state();
+        if st.power(&root.public_key()) != Some(cardinal_identity::Power::Root) {
+            anyhow::bail!(
+                "the recovery is not in effect on that device yet: your guardians have not all \
+                 confirmed it, or their confirmations have not reached it"
+            );
+        }
+        let recovery = log
+            .recoveries()
+            .into_iter()
+            .find(|r| r.root == root.public_key() && st.in_effect.contains(&r.entry))
+            .ok_or_else(|| anyhow::anyhow!("no recovery in that log names this device's root"))?;
+        let guardian_key = log
+            .rebuild_guardian_key(&recovery, &self.keys.device.link)
+            .map_err(|e| anyhow::anyhow!("cannot rebuild the guardian key from the shares: {e}"))?;
+        let enc = log.open_with_guardian_key(&guardian_key, &recovery.policy)?;
+        let current = log
+            .key_chain(enc)
+            .into_iter()
+            .next()
+            .expect("the key itself");
+        let request = self
+            .keys
+            .device
+            .request(identity, cardinal_identity::Power::Admin);
+        let added = log.add_key(root, &request, Some(&current))?;
+        let fresh = HybridKeyPair::generate();
+        let rotated = log.set_encryption_key(root, &fresh, Some(&current))?;
+        Ok(vec![
+            (added.encode(), added.id()),
+            (rotated.encode(), rotated.id()),
+        ])
     }
 
     /// Adds sealed entries of a space, creating the holder if needed.
@@ -2574,6 +2664,65 @@ impl Core {
             .filter_map(|h| h.space.as_ref())
             .map(|s| s.unwitnessed_by(key))
             .sum()
+    }
+
+    /// Keeps the work of removed keys that nothing witnessed, in every
+    /// space held (`spaces.md#members-and-roles`: "a person can keep their
+    /// old work ... after a recovery that kept none of their keys"): a
+    /// `keep` op listing, for each such key, its latest unwitnessed
+    /// entries, which covers those before them. `only` limits it to some
+    /// keys. Returns what was written, by space, and how many entries are
+    /// kept.
+    pub fn keep_work(
+        &mut self,
+        only: Option<&[KeyId]>,
+    ) -> anyhow::Result<(Written, usize)> {
+        let ident = self
+            .identity
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("this device has no identity yet"))?;
+        let st = ident.state();
+        let mut written = Vec::new();
+        let mut kept = 0;
+        let ids: Vec<SpaceId> = self.spaces.keys().copied().collect();
+        for id in ids {
+            let h = self.spaces.get_mut(&id).expect("held");
+            let Some(space) = h.space.as_ref() else {
+                continue;
+            };
+            let dag = space.dag();
+            let unwitnessed = &space.validity().unwitnessed;
+            let mut by_key: BTreeMap<KeyId, Vec<EntryId>> = BTreeMap::new();
+            for x in unwitnessed {
+                let Some(e) = dag.get(x) else { continue };
+                let k = e.signer();
+                if st.power(&k).is_some() || only.is_some_and(|o| !o.contains(&k)) {
+                    continue;
+                }
+                by_key.entry(k).or_default().push(*x);
+            }
+            if by_key.is_empty() {
+                continue;
+            }
+            let mut ops = Vec::new();
+            for (k, xs) in by_key {
+                kept += xs.len();
+                let mut latest: Vec<EntryId> = xs
+                    .iter()
+                    .filter(|x| !xs.iter().any(|y| y != *x && dag.is_ancestor(x, y)))
+                    .copied()
+                    .collect();
+                latest.sort();
+                ops.push(SpaceOp::keep(k, &latest));
+            }
+            let bytes = h.write_keeps(ident, &self.keys, ops)?;
+            written.push((id, bytes));
+        }
+        let ids: Vec<SpaceId> = written.iter().map(|(id, _)| *id).collect();
+        for id in ids {
+            self.settle(&id);
+        }
+        Ok((written, kept))
     }
 
     /// Keeps what `key` wrote in a space ([`Holder::witness`]).

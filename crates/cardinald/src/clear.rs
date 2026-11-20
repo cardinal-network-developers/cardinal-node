@@ -25,8 +25,10 @@ const LOCAL: [&str; 2] = ["local", "local-shared"];
 
 /// The files the node writes there. Each may have a `.tmp` beside it, left
 /// by a write that was interrupted.
-const STATE: [&str; 6] = [
+const STATE: [&str; 8] = [
     "link.json",
+    "guarding.json",
+    "recovering.json",
     "in-use.json",
     "peers.json",
     "copies.json",
