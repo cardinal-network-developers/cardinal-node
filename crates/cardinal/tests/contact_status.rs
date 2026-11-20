@@ -199,3 +199,44 @@ fn try_status(d: &Dev, req: Value) -> Value {
     BufReader::new(s).read_line(&mut line).unwrap();
     serde_json::from_str(&line).unwrap()
 }
+
+/// Daniel's case, 2026-11-19: a person with a host device and a laptop meets
+/// someone from the laptop while the host is away. The list is left unset
+/// (an empty one was a no, which 0.1.17 wrote), and once the host is back it
+/// is named (`hosts.md#telling-others-where-to-reach-you`), so the contact
+/// can find the person from anywhere.
+#[test]
+fn a_host_away_when_its_person_met_someone_names_itself_after() {
+    if !fuse_available() {
+        eprintln!("skipped: no FUSE");
+        return;
+    }
+    let root = tempfile::tempdir().unwrap();
+    let mut host = person(root.path(), "ana");
+    let at_host = format!("127.0.0.1:{}", host.port);
+    host.cli(&["host", "--address", &at_host]);
+    let mut laptop = Dev::new(root.path(), "laptop", free_port());
+    laptop.start();
+    pair(&host, &laptop);
+    laptop.wait_mounted();
+    let bo = person(root.path(), "bo");
+
+    host.stop();
+    let at = format!("127.0.0.1:{}", laptop.port);
+    let code = laptop.cli(&["invite", "--address", &at, "--name", "Ana"]);
+    bo.cli(&["accept", code.trim(), "--name", "Ana"]);
+    wait("they are connected", 30, || {
+        let c = ask(&bo, json!({"cmd": "contacts"}));
+        c["contacts"][0]["connected"] == true
+    });
+    let v = ask(&bo, json!({"cmd": "contact-status", "who": "Ana"}));
+    assert_eq!(v["their_reach"], json!([]), "nothing to name yet: {v:#}");
+    host.start();
+    let mut v = Value::Null;
+    let named = (0..90).any(|_| {
+        std::thread::sleep(std::time::Duration::from_secs(1));
+        v = ask(&bo, json!({"cmd": "contact-status", "who": "Ana"}));
+        v["their_reach"].as_array().is_some_and(|r| !r.is_empty())
+    });
+    assert!(named, "the host never named itself: {v:#}");
+}
