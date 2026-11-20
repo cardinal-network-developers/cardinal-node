@@ -292,6 +292,10 @@ async fn handle(d: &Arc<Daemon>, req: &Value) -> anyhow::Result<Value> {
         }
         "invitations" => Ok(crate::contacts::invitations(d)),
         "cancel-invitation" => crate::contacts::cancel_invitation(d, arg(req, "id")?),
+        "contact-status" => {
+            let look = req.get("look").and_then(|v| v.as_bool()) == Some(true);
+            crate::contacts::status(d, arg(req, "who")?, look).await
+        }
         "contacts" => {
             let all = req.get("all").and_then(|v| v.as_bool()) == Some(true);
             Ok(crate::contacts::list(d, all))

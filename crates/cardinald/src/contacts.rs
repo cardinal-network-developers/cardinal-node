@@ -1377,6 +1377,199 @@ pub fn mark_read(d: &Arc<Daemon>, who: &str) -> anyhow::Result<Json> {
     Ok(json!({}))
 }
 
+/// A length of time in words, to the largest unit that matters.
+pub(crate) fn span(t: Duration) -> String {
+    let s = t.as_secs();
+    match s {
+        0..=59 => format!("{s} s"),
+        60..=3599 => format!("{} min", s / 60),
+        3600..=86_399 => format!("{} h {} min", s / 3600, s % 3600 / 60),
+        _ => format!("{} days", s / 86_400),
+    }
+}
+
+/// What a reach node entry's endpoint is good for here: `None` if it is
+/// tried, or else why not.
+fn not_tried(e: &cardinal_space::grant::Endpoint) -> Option<&'static str> {
+    match e.socket_addr() {
+        Some(_) => None,
+        None if e
+            .host()
+            .is_some_and(|h| h.parse::<std::net::IpAddr>().is_err()) =>
+        {
+            Some("a name: names are for the recovery sheet, and are not looked up")
+        }
+        None => Some("an address this version cannot use"),
+    }
+}
+
+/// Whether an address works only on the network it belongs to.
+fn local_only(a: &SocketAddr) -> bool {
+    match a.ip() {
+        std::net::IpAddr::V4(ip) => ip.is_private() || ip.is_loopback() || ip.is_link_local(),
+        std::net::IpAddr::V6(ip) => {
+            ip.is_loopback()
+                || (ip.segments()[0] & 0xfe00) == 0xfc00
+                || (ip.segments()[0] & 0xffc0) == 0xfe80
+        }
+    }
+}
+
+fn reach_json(
+    d: &Daemon,
+    reach: &[relationship::Reach],
+    theirs: &[([u8; 32], [u8; 32])],
+) -> Vec<Json> {
+    let me = *d.keys.link.public_key().x25519();
+    reach
+        .iter()
+        .map(|r| {
+            let device = theirs
+                .iter()
+                .find(|(x, _)| *x == r.host)
+                .map(|(_, k)| hex::encode(&k[..8]));
+            let endpoints: Vec<Json> = r
+                .endpoints
+                .iter()
+                .map(|e| {
+                    let why = not_tried(e);
+                    let local = e.socket_addr().is_some_and(|a| local_only(&a));
+                    json!({
+                        "endpoint": e.to_string(),
+                        "tried": why.is_none(),
+                        "why_not": why,
+                        "local": local,
+                    })
+                })
+                .collect();
+            json!({
+                "host": hex::encode(&r.host[..8]),
+                "device": device,
+                "this_device": r.host == me,
+                "session": d.session_kind(&r.host).is_some(),
+                "endpoints": endpoints,
+            })
+        })
+        .collect()
+}
+
+fn step_json(s: &crate::rendezvous::Step) -> Json {
+    json!({"at": s.at, "ok": s.ok, "text": s.text})
+}
+
+/// Everything this device knows of reaching one contact: their devices and
+/// the sessions with them, what their reach node says and what became of
+/// each address, how they were last looked for, and what this person's own
+/// reach node tells them. With `look`, looks for them first.
+pub async fn status(d: &Arc<Daemon>, who: &str, look: bool) -> anyhow::Result<Json> {
+    let c = find(d, who)?;
+    if look && c.connects() {
+        crate::rendezvous::reach_now(d, c.identity, c.space).await;
+    }
+    let (theirs, reach, mine, name_of) = {
+        let core = d.core();
+        let theirs: Vec<([u8; 32], [u8; 32])> = core
+            .others
+            .get(&c.identity)
+            .map(|o| {
+                let st = o.log.state();
+                st.keys
+                    .values()
+                    .filter_map(|k| Some((*k.link_key.as_ref()?.x25519(), k.key)))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let reach = core.reach_of(&c.space, &c.identity);
+        let mine = core
+            .me()
+            .map(|me| core.reach_of(&c.space, &me))
+            .unwrap_or_default();
+        (theirs, reach, mine, core.device_names())
+    };
+    let label = |x: &[u8; 32]| -> String {
+        if let Some(k) = d.core().is_own_device(x) {
+            return format!(
+                "your {}",
+                name_of
+                    .get(&k)
+                    .cloned()
+                    .unwrap_or_else(|| account::short_key(&k))
+            );
+        }
+        if reach.iter().any(|r| r.host == *x) {
+            return "their host".into();
+        }
+        short(x)
+    };
+    let standing: HashSet<[u8; 32]> = crate::rendezvous::standing(d)
+        .into_iter()
+        .map(|(k, _)| k)
+        .collect();
+    let devices: Vec<Json> = theirs
+        .iter()
+        .map(|(x, k)| {
+            let Some((s, open_for)) = d.session_since(x) else {
+                return json!({
+                    "key": hex::encode(&k[..8]),
+                    "online": false,
+                    "kept_in_touch": standing.contains(k),
+                });
+            };
+            let st = s.stats();
+            let relayed = s.is_relayed();
+            json!({
+                "key": hex::encode(&k[..8]),
+                "online": true,
+                "kept_in_touch": standing.contains(k),
+                "route": if relayed { "relay" } else { "direct" },
+                "carrier": d.session_carrier(x),
+                "addr": (!relayed).then(|| s.remote_addr()).flatten().map(|a| a.to_string()),
+                "through": d.relayed_through(x).map(|h| label(&h)),
+                "opened_by": if s.role() == cardinal_link::Role::Initiator { "you" } else { "them" },
+                "open_for_s": open_for.as_secs(),
+                "heard_ms_ago": s.last_heard().elapsed().as_millis() as u64,
+                "rtt_ms": st.srtt.map(|t| t.as_millis() as u64),
+                "bytes_sent": st.bytes_sent,
+                "bytes_received": st.bytes_received,
+                "packets_lost": st.packets_lost,
+                "packets_dropped": st.packets_dropped,
+                "they_see_you_at": s.observed_addr().map(|a| a.to_string()),
+            })
+        })
+        .collect();
+    let (looked, looking) = d.rendezvous.looked(&c.identity);
+    let trail = d.rendezvous.trail(&c.identity);
+    let in_use = d.rendezvous.in_use_left(&c.identity);
+    let looked_for = if !c.connects() {
+        "never: you do not trust them, so your devices reach them only through hosts"
+    } else if in_use.is_some() {
+        "while in use, every 30 s, until each of their devices has a session"
+    } else {
+        "only when you message or call them, until you do"
+    };
+    let v = json!({
+        "identity": hex::encode(&c.identity[..8]),
+        "trusted": c.regard.trusted,
+        "introductions": c.regard.introductions,
+        "refused": c.refused,
+        "direct_sessions": c.connects(),
+        "devices": devices,
+        "their_reach": reach_json(d, &reach, &theirs),
+        "your_reach": reach_json(d, &mine, &[]),
+        "in_use_for_s": in_use.map(|t| t.as_secs()),
+        "looked_for": looked_for,
+        "look_every_s": crate::rendezvous::Rendezvous::look_every().as_secs(),
+        "looked_s_ago": looked.map(|t| t.as_secs()),
+        "looking": looking,
+        "looks_without_session": trail.looks,
+        "looking_since": trail.looking_since,
+        "last_look": trail.look.iter().map(step_json).collect::<Vec<_>>(),
+        "sessions": trail.events.iter().map(step_json).collect::<Vec<_>>(),
+        "router": d.portmap.lock().unwrap_or_else(|e| e.into_inner()).status(),
+    });
+    Ok(crate::names::with_shown(d, &c, v))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

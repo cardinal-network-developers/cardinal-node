@@ -182,11 +182,20 @@ enum Cmd {
         #[arg(long)]
         no_introductions: bool,
     },
-    /// The people you are connected to.
+    /// The people you are connected to. With a name: how your devices reach
+    /// theirs, what each address did, and what you tell them
     Contacts {
+        /// One contact to show in detail, as the list names them.
+        who: Option<String>,
         /// Show those you have refused too.
         #[arg(long)]
         all: bool,
+        /// With a name: look for them now (up to 12 s), then show.
+        #[arg(long)]
+        look: bool,
+        /// With a name: print it as JSON.
+        #[arg(long)]
+        json: bool,
     },
     /// Change how you regard a contact. It stays on your own devices, and
     /// they are told nothing.
@@ -1937,7 +1946,25 @@ async fn client(cmd: Cmd) -> anyhow::Result<()> {
             println!("Connected to {}.", v["name"].as_str().unwrap_or(""));
             Ok(())
         }
-        Cmd::Contacts { all } => {
+        Cmd::Contacts {
+            who: Some(who),
+            look,
+            json,
+            ..
+        } => {
+            let v = call(
+                &paths,
+                json!({"cmd": "contact-status", "who": who, "look": look}),
+            )
+            .await?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&v)?);
+            } else {
+                print!("{}", contact_status(&v));
+            }
+            Ok(())
+        }
+        Cmd::Contacts { all, .. } => {
             let v = call(&paths, json!({"cmd": "contacts", "all": all})).await?;
             for c in v["contacts"].as_array().into_iter().flatten() {
                 let mut line = c["name"].as_str().unwrap_or("").to_owned();
@@ -2644,6 +2671,183 @@ async fn client(cmd: Cmd) -> anyhow::Result<()> {
         }
         Cmd::Daemon { .. } | Cmd::Deploy(_) => unreachable!("handled in main"),
     }
+}
+
+/// The time of day of a moment, in milliseconds since 1970.
+fn clock(ms: u64) -> String {
+    let t = human_time(Some(ms));
+    t.get(11..).map_or(t.clone(), str::to_owned)
+}
+
+fn secs_ago(s: u64) -> String {
+    match s {
+        0..=59 => format!("{s} s ago"),
+        60..=3599 => format!("{} min ago", s / 60),
+        _ => format!("{} h {} min ago", s / 3600, s % 3600 / 60),
+    }
+}
+
+fn steps(out: &mut String, list: &serde_json::Value) {
+    for s in list.as_array().into_iter().flatten() {
+        let mark = match s["ok"].as_bool() {
+            Some(true) => "ok  ",
+            Some(false) => "no  ",
+            None => "    ",
+        };
+        out.push_str(&format!(
+            "  {}  {mark}{}\n",
+            clock(s["at"].as_u64().unwrap_or(0)),
+            s["text"].as_str().unwrap_or("")
+        ));
+    }
+}
+
+fn reach_lines(out: &mut String, list: &serde_json::Value, whose: &str) {
+    let list = list.as_array().cloned().unwrap_or_default();
+    if list.is_empty() {
+        out.push_str("  nothing: no host named, which says nothing either way\n");
+        return;
+    }
+    for r in &list {
+        let who = if r["this_device"] == true {
+            "this device".to_owned()
+        } else if let Some(k) = r["device"].as_str() {
+            format!("{whose} device {k}")
+        } else {
+            "a host that is not one of their devices".to_owned()
+        };
+        let session = if r["session"] == true {
+            ", in touch now"
+        } else {
+            ""
+        };
+        let key = if r["device"].is_string() {
+            String::new()
+        } else {
+            format!("  [{}]", r["host"].as_str().unwrap_or(""))
+        };
+        out.push_str(&format!("  {who}{key}{session}\n"));
+        for e in r["endpoints"].as_array().into_iter().flatten() {
+            let ep = e["endpoint"].as_str().unwrap_or("");
+            let note = match e["why_not"].as_str() {
+                Some(w) => format!("not tried: {w}"),
+                None if e["local"] == true => {
+                    "used when looking; local, so it works only on that network".into()
+                }
+                None => "used when looking".into(),
+            };
+            out.push_str(&format!("      {ep:<28} {note}\n"));
+        }
+    }
+}
+
+/// `cardinal contacts NAME`, in words.
+fn contact_status(v: &serde_json::Value) -> String {
+    let mut out = String::new();
+    let mut head = v["name"].as_str().unwrap_or("").to_owned();
+    head.push_str(if v["trusted"] == true {
+        "  trusted"
+    } else {
+        "  through hosts only"
+    });
+    if v["introductions"] == false {
+        head.push_str("  no introductions");
+    }
+    if v["refused"] == true {
+        head.push_str("  refused");
+    }
+    out.push_str(&format!(
+        "{head}  [{}]\n",
+        v["identity"].as_str().unwrap_or("")
+    ));
+    out.push_str("Their devices:\n");
+    let devices = v["devices"].as_array().cloned().unwrap_or_default();
+    if devices.is_empty() {
+        out.push_str("  none known yet\n");
+    }
+    for dv in &devices {
+        let key = dv["key"].as_str().unwrap_or("");
+        let kept = if dv["kept_in_touch"] == true {
+            "  (kept in touch: you have no host)"
+        } else {
+            ""
+        };
+        if dv["online"] != true {
+            out.push_str(&format!("  ○ {key}  no session{kept}\n"));
+            continue;
+        }
+        let route = match (
+            dv["route"].as_str(),
+            dv["addr"].as_str(),
+            dv["through"].as_str(),
+        ) {
+            (Some("relay"), _, Some(t)) => format!("relayed through {t}"),
+            (Some("relay"), _, None) => "relayed".to_owned(),
+            (_, Some(a), _) => format!("direct  {a}  {}", dv["carrier"].as_str().unwrap_or("")),
+            _ => "direct".to_owned(),
+        };
+        let rtt = dv["rtt_ms"]
+            .as_u64()
+            .map(|r| format!(", {r} ms"))
+            .unwrap_or_default();
+        out.push_str(&format!("  ● {key}  {route}{rtt}{kept}\n"));
+        out.push_str(&format!(
+            "      opened by {} {} ago, heard {} ms ago; sent {}, received {}",
+            dv["opened_by"].as_str().unwrap_or("?"),
+            secs_ago(dv["open_for_s"].as_u64().unwrap_or(0)).trim_end_matches(" ago"),
+            dv["heard_ms_ago"].as_u64().unwrap_or(0),
+            human_size(dv["bytes_sent"].as_u64().unwrap_or(0)),
+            human_size(dv["bytes_received"].as_u64().unwrap_or(0)),
+        ));
+        let lost = dv["packets_lost"].as_u64().unwrap_or(0);
+        if lost > 0 {
+            out.push_str(&format!(", {lost} packets lost"));
+        }
+        out.push('\n');
+        if let Some(a) = dv["they_see_you_at"].as_str() {
+            out.push_str(&format!("      they see you at {a}\n"));
+        }
+    }
+    out.push_str("Where they say to find them, in the space you share:\n");
+    reach_lines(&mut out, &v["their_reach"], "their");
+    out.push_str(&format!(
+        "Looked for: {}\n",
+        v["looked_for"].as_str().unwrap_or("")
+    ));
+    if let Some(s) = v["in_use_for_s"].as_u64() {
+        out.push_str(&format!(
+            "  in use for {} more\n",
+            secs_ago(s).trim_end_matches(" ago")
+        ));
+    }
+    match (v["looked_s_ago"].as_u64(), v["looking"] == true) {
+        (_, true) => out.push_str("  looking now\n"),
+        (Some(s), _) => out.push_str(&format!("  last looked {}\n", secs_ago(s))),
+        (None, _) => out.push_str("  not looked for since this service started\n"),
+    }
+    let looks = v["looks_without_session"].as_u64().unwrap_or(0);
+    if looks > 1 {
+        if let Some(since) = v["looking_since"].as_u64() {
+            out.push_str(&format!(
+                "  {looks} looks since {} without a new session\n",
+                clock(since)
+            ));
+        }
+    }
+    if v["last_look"].as_array().is_some_and(|a| !a.is_empty()) {
+        out.push_str("The last look:\n");
+        steps(&mut out, &v["last_look"]);
+    }
+    if v["sessions"].as_array().is_some_and(|a| !a.is_empty()) {
+        out.push_str("Sessions with them since this service started:\n");
+        steps(&mut out, &v["sessions"]);
+    }
+    out.push_str("Where you tell them to find you:\n");
+    reach_lines(&mut out, &v["your_reach"], "your");
+    if let Some(e) = v["router"]["external"].as_str() {
+        out.push_str(&format!("  (your router gives this device {e})\n"));
+    }
+    out
 }
 
 #[cfg(test)]

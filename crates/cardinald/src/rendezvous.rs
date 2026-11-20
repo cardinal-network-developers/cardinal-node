@@ -174,6 +174,43 @@ pub struct Rendezvous {
     suspect: Mutex<HashSet<[u8; 32]>>,
     /// When a contact's device last had this one send to an address it named.
     punched_for: Mutex<HashMap<[u8; 32], Instant>>,
+    /// How each contact was last looked for, and their sessions coming and
+    /// going: what `contact-status` shows.
+    trails: Mutex<HashMap<[u8; 32], Trail>>,
+}
+
+/// The most sessions opening and closing kept for each contact.
+const EVENTS: usize = 20;
+/// The most steps kept of one look.
+const STEPS: usize = 40;
+
+/// One thing that happened in reaching a contact.
+#[derive(Clone, Debug)]
+pub struct Step {
+    /// When, in milliseconds since 1970.
+    pub at: u64,
+    /// Whether it worked, where that means anything.
+    pub ok: Option<bool>,
+    /// What happened, in words.
+    pub text: String,
+}
+
+/// What is kept of reaching one contact.
+#[derive(Clone, Debug, Default)]
+pub struct Trail {
+    /// The steps of the latest look, in order.
+    pub look: Vec<Step>,
+    /// How many looks since a session with them last opened.
+    pub looks: u64,
+    /// When the first of those was, in milliseconds since 1970.
+    pub looking_since: Option<u64>,
+    /// Their sessions opening and closing, the newest last.
+    pub events: std::collections::VecDeque<Step>,
+}
+
+fn unix_ms() -> u64 {
+    let since = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH);
+    since.map_or(0, |t| t.as_millis() as u64)
 }
 
 fn in_use_for() -> Duration {
@@ -293,6 +330,72 @@ impl Rendezvous {
     /// A session opened with a device, which answers for it now.
     pub fn opened(&self, device: &[u8; 32]) {
         lock(&self.suspect).remove(device);
+    }
+
+    /// Starts a new look for a contact, forgetting the steps of the last.
+    fn look_begins(&self, who: &[u8; 32], text: String) {
+        let mut trails = lock(&self.trails);
+        let t = trails.entry(*who).or_default();
+        let at = unix_ms();
+        t.look = vec![Step { at, ok: None, text }];
+        t.looks += 1;
+        t.looking_since.get_or_insert(at);
+    }
+
+    /// A step of the look for a contact under way.
+    fn step(&self, who: &[u8; 32], ok: Option<bool>, text: String) {
+        let mut trails = lock(&self.trails);
+        let t = trails.entry(*who).or_default();
+        if t.look.len() < STEPS {
+            t.look.push(Step {
+                at: unix_ms(),
+                ok,
+                text,
+            });
+        }
+    }
+
+    /// A session with one of a contact's devices opened or closed.
+    pub fn event(&self, who: &[u8; 32], opened: bool, text: String) {
+        let mut trails = lock(&self.trails);
+        let t = trails.entry(*who).or_default();
+        if opened {
+            t.looks = 0;
+            t.looking_since = None;
+        }
+        t.events.push_back(Step {
+            at: unix_ms(),
+            ok: Some(opened),
+            text,
+        });
+        while t.events.len() > EVENTS {
+            t.events.pop_front();
+        }
+    }
+
+    /// What is kept of reaching a contact.
+    pub fn trail(&self, who: &[u8; 32]) -> Trail {
+        lock(&self.trails).get(who).cloned().unwrap_or_default()
+    }
+
+    /// How long ago a contact was last looked for, and whether a look is
+    /// under way.
+    pub fn looked(&self, who: &[u8; 32]) -> (Option<Duration>, bool) {
+        let ago = lock(&self.looked).get(who).map(Instant::elapsed);
+        (ago, lock(&self.looking).contains(who))
+    }
+
+    /// How much longer a contact stays in use, if they are.
+    pub fn in_use_left(&self, who: &[u8; 32]) -> Option<Duration> {
+        let used = lock(&self.in_use);
+        let (t, _) = used.get(who)?;
+        in_use_for().checked_sub(t.elapsed())
+    }
+
+    /// How often a contact in use is looked for, while no session with each
+    /// of their devices is open.
+    pub fn look_every() -> Duration {
+        REACH_EVERY
     }
 
     /// Whether a contact is in use, and so to be looked for.
@@ -1266,14 +1369,70 @@ async fn reach(d: &Arc<Daemon>, who: [u8; 32], space: SpaceId) {
     }
     let _looking = Looking { d, who };
     lock(&d.rendezvous.looked).insert(who, Instant::now());
-    through_helpers(d, &who).await;
     let reach = d.core().reach_of(&space, &who);
+    let usable = crate::mailbox::addresses(&reach);
+    d.rendezvous.look_begins(
+        &who,
+        format!(
+            "looking for them: {} named in your space, {} address{} to try",
+            plural(reach.len(), "host"),
+            usable.len(),
+            if usable.len() == 1 { "" } else { "es" }
+        ),
+    );
+    through_helpers(d, &who).await;
     tracing::debug!("looking for {} at {} hosts", short(&who), reach.len());
-    for (r, addr) in crate::mailbox::addresses(&reach) {
+    for (r, addr) in usable {
+        if all_reached(d, &who) {
+            break;
+        }
         if let Err(e) = through_host(d, &who, r, addr).await {
+            d.rendezvous
+                .step(&who, Some(false), format!("their host at {addr}: {e:#}"));
             tracing::debug!("looking for {} at {addr}: {e:#}", short(&who));
         }
     }
+}
+
+fn plural(n: usize, what: &str) -> String {
+    format!("{n} {what}{}", if n == 1 { "" } else { "s" })
+}
+
+/// Whether every device of a contact's has a session here.
+fn all_reached(d: &Daemon, who: &[u8; 32]) -> bool {
+    let core = d.core();
+    let Some(o) = core.others.get(who) else {
+        return false;
+    };
+    let st = o.log.state();
+    let links: Vec<[u8; 32]> = st
+        .keys
+        .values()
+        .filter_map(|k| Some(*k.link_key.as_ref()?.x25519()))
+        .collect();
+    drop(core);
+    links.iter().all(|x| reached(d, x))
+}
+
+/// A contact's device as `contact-status` names it: the start of its key.
+fn device_label(device: &KeyId) -> String {
+    hex::encode(&device[..8])
+}
+
+/// One of this person's devices, by its session, as a person names it.
+fn own_label(d: &Daemon, s: &Session) -> String {
+    let own = d.core().is_own_device(&s.peer_static());
+    own.map_or_else(|| short(&s.peer_static()), |k| d.device_name(&k))
+}
+
+fn addr_list(a: &[SocketAddr]) -> String {
+    if a.is_empty() {
+        return "no address".into();
+    }
+    a.iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// Asks this person's own devices for a contact's devices they are in touch
@@ -1296,9 +1455,23 @@ async fn through_helpers(d: &Arc<Daemon>, who: &[u8; 32]) {
         links
     };
     if missing.iter().all(|x| reached(d, x)) {
+        d.rendezvous.step(
+            who,
+            Some(true),
+            "every device of theirs reached already".into(),
+        );
         return;
     }
-    for helper in helpers(d) {
+    let helpers = helpers(d);
+    if helpers.is_empty() {
+        d.rendezvous.step(
+            who,
+            None,
+            "no other device of yours to ask: none has a direct session here".into(),
+        );
+    }
+    for helper in helpers {
+        let name = own_label(d, &helper);
         let ask = Record::new()
             .with(0, OP_CONNECT)
             .with(2, d.keys.key())
@@ -1311,8 +1484,14 @@ async fn through_helpers(d: &Arc<Daemon>, who: &[u8; 32]) {
                     .filter_map(read_found)
                     .collect()
             }
-            Ok(_) => continue,
+            Ok(_) => {
+                d.rendezvous
+                    .step(who, Some(false), format!("asked your {name}: it refused"));
+                continue;
+            }
             Err(e) => {
+                d.rendezvous
+                    .step(who, Some(false), format!("asked your {name}: {e:#}"));
                 tracing::debug!(
                     "asking {} for {}: {e:#}",
                     short(&helper.peer_static()),
@@ -1321,6 +1500,14 @@ async fn through_helpers(d: &Arc<Daemon>, who: &[u8; 32]) {
                 continue;
             }
         };
+        d.rendezvous.step(
+            who,
+            Some(!found.is_empty()),
+            format!(
+                "asked your {name}: in touch with {} of their devices",
+                found.len()
+            ),
+        );
         for f in found {
             let Some((device, link)) = contact_device(d, who, &f.device) else {
                 continue;
@@ -1328,13 +1515,7 @@ async fn through_helpers(d: &Arc<Daemon>, who: &[u8; 32]) {
             if reached(d, link.x25519()) {
                 continue;
             }
-            punch(d, &link, f.addresses()).await;
-            if !reached(d, link.x25519()) {
-                let ask = Record::new().with(0, OP_RELAY).with(2, device);
-                if let Err(e) = relay(d, &helper, ask, &device, &link).await {
-                    tracing::debug!("relaying to {}: {e:#}", short(&device));
-                }
-            }
+            try_found(d, who, &device, &link, &f, &helper, &name, None).await;
         }
     }
 }
@@ -1393,6 +1574,63 @@ pub fn standing(d: &Daemon) -> Vec<(KeyId, HybridPublicKey)> {
 /// Asks a contact's host for their devices, tries each directly, and relays
 /// to any that cannot be reached that way. The session with the host stays
 /// open while a relay runs through it.
+/// Tries a contact's device where a helper says it is, and else relays
+/// through the helper, noting each step.
+#[allow(clippy::too_many_arguments)]
+async fn try_found(
+    d: &Arc<Daemon>,
+    who: &[u8; 32],
+    device: &KeyId,
+    link: &HybridPublicKey,
+    f: &Found,
+    helper: &Session,
+    helper_name: &str,
+    token: Option<[u8; 16]>,
+) {
+    let addresses = f.addresses();
+    let label = device_label(device);
+    punch(d, link, addresses.clone()).await;
+    if reached(d, link.x25519()) {
+        d.rendezvous.step(
+            who,
+            Some(true),
+            format!(
+                "their {label}: reached directly, tried {}",
+                addr_list(&addresses)
+            ),
+        );
+        return;
+    }
+    d.rendezvous.step(
+        who,
+        Some(false),
+        format!(
+            "their {label}: no answer directly at {}",
+            addr_list(&addresses)
+        ),
+    );
+    let mut ask = Record::new().with(0, OP_RELAY);
+    if let Some(t) = token {
+        ask = ask.with(1, t);
+    }
+    let ask = ask.with(2, *device);
+    match relay(d, helper, ask, device, link).await {
+        Ok(()) => d.rendezvous.step(
+            who,
+            Some(true),
+            format!("their {label}: relayed through {helper_name}"),
+        ),
+        Err(e) => {
+            d.rendezvous.step(
+                who,
+                Some(false),
+                format!("their {label}: relay through {helper_name}: {e:#}"),
+            );
+            tracing::debug!("relaying to {}: {e:#}", short(device));
+        }
+    }
+}
+
 async fn through_host(
     d: &Arc<Daemon>,
     who: &[u8; 32],
@@ -1423,6 +1661,14 @@ async fn through_host(
         short(who),
         found.len()
     );
+    d.rendezvous.step(
+        who,
+        Some(!found.is_empty()),
+        format!(
+            "their host at {addr}: {} of their devices there, and agreeing",
+            found.len()
+        ),
+    );
     for f in found {
         let Some((device, link)) = contact_device(d, who, &f.device) else {
             continue;
@@ -1430,16 +1676,8 @@ async fn through_host(
         if reached(d, link.x25519()) {
             continue;
         }
-        punch(d, &link, f.addresses()).await;
-        if !reached(d, link.x25519()) {
-            let ask = Record::new()
-                .with(0, OP_RELAY)
-                .with(1, r.token)
-                .with(2, device);
-            if let Err(e) = relay(d, &host, ask, &device, &link).await {
-                tracing::debug!("relaying to {}: {e:#}", short(&device));
-            }
-        }
+        let name = format!("their host at {addr}");
+        try_found(d, who, &device, &link, &f, &host, &name, Some(r.token)).await;
     }
     let relayed = d.sessions_of(who).iter().any(Session::is_relayed);
     if opened {

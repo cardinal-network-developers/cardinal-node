@@ -876,6 +876,15 @@ impl Daemon {
             .is_some_and(|c| !c.session.is_closed())
     }
 
+    /// A device's open session, and how long it has been open.
+    pub fn session_since(&self, link_x25519: &[u8; 32]) -> Option<(Session, Duration)> {
+        let sessions = lock(&self.sessions);
+        let c = sessions
+            .get(link_x25519)
+            .filter(|c| !c.session.is_closed())?;
+        Some((c.session.clone(), c.since.elapsed()))
+    }
+
     /// What a device's session runs over.
     pub fn session_carrier(&self, link_x25519: &[u8; 32]) -> Option<&'static str> {
         let sessions = lock(&self.sessions);
@@ -982,6 +991,13 @@ impl Daemon {
             }
         );
         self.bump();
+        if let PeerKind::Contact(who, k) = kind {
+            self.rendezvous.event(
+                &who,
+                true,
+                format!("{} opened: {}", hex::encode(&k[..8]), route(&s)),
+            );
+        }
         if let PeerKind::Own(k) | PeerKind::Contact(_, k) = kind {
             lock(&self.backoff).remove(&k);
             if s.role() == cardinal_link::Role::Responder && !s.is_relayed() {
@@ -1019,7 +1035,20 @@ impl Daemon {
     pub fn session_closed(&self, peer_static: &[u8; 32], gen: u64) {
         let mut m = lock(&self.sessions);
         if m.get(peer_static).is_some_and(|c| c.gen == gen) {
-            m.remove(peer_static);
+            if let Some(c) = m.remove(peer_static) {
+                if let PeerKind::Contact(who, k) = c.kind {
+                    let why = c
+                        .session
+                        .close_reason()
+                        .map_or_else(|| "closed".to_owned(), |r| closed_why(&r));
+                    let lasted = crate::contacts::span(c.since.elapsed());
+                    self.rendezvous.event(
+                        &who,
+                        false,
+                        format!("{} closed after {lasted}: {why}", hex::encode(&k[..8])),
+                    );
+                }
+            }
             lock(&self.proven).remove(peer_static);
             lock(&self.invited).remove(peer_static);
             lock(&self.exchanging).remove(peer_static);
@@ -1147,6 +1176,15 @@ impl Daemon {
                 && self.is_invitation(&c.session)
             {
                 c.session.abandon();
+            }
+            if let (PeerKind::Contact(who, k), false) =
+                (kind, matches!(c.kind, PeerKind::Contact(..)))
+            {
+                if !c.session.is_closed() {
+                    let how = route(&c.session);
+                    let text = format!("{} opened: {how}", hex::encode(&k[..8]));
+                    self.rendezvous.event(&who, true, text);
+                }
             }
             if let Some(x) = lock(&self.sessions).get_mut(&c.session.peer_static()) {
                 x.kind = kind;
@@ -2078,5 +2116,38 @@ mod unique_name_tests {
         assert_eq!(super::unique_name("desk", &others), "desk");
         assert_eq!(super::unique_name("carbonite", &others), "carbonite 3");
         assert_eq!(super::unique_name("CARBONITE", &[]), "CARBONITE");
+    }
+}
+
+/// How a session runs, and who opened it, in words.
+fn route(s: &Session) -> String {
+    let by = if s.role() == cardinal_link::Role::Initiator {
+        "you reached them"
+    } else {
+        "they reached you"
+    };
+    match (s.is_relayed(), s.remote_addr(), s.carrier()) {
+        (true, _, _) => format!("relayed, {by}"),
+        (false, Some(a), Some(CarrierKind::Tcp)) => format!("direct at {a} over TCP, {by}"),
+        (false, Some(a), _) => format!("direct at {a}, {by}"),
+        (false, None, _) => by.to_owned(),
+    }
+}
+
+/// Why a session closed, in words.
+pub(crate) fn closed_why(r: &cardinal_link::CloseReason) -> String {
+    use cardinal_link::CloseReason as R;
+    match r {
+        R::Local(w) => format!("closed here ({w})"),
+        R::Remote(w) => format!("closed by them ({w})"),
+        R::Idle => "nothing heard from them for too long".into(),
+        R::Timeout => "not set up in time".into(),
+        R::Protocol(w) => format!("broke the protocol ({w})"),
+        R::Carrier => "the network failed".into(),
+        R::Identity => "their device's proof no longer counts".into(),
+        R::Replaced => "replaced by a newer session".into(),
+        R::EndpointClosed => "this service stopped".into(),
+        #[allow(unreachable_patterns)]
+        _ => format!("{r:?}"),
     }
 }
