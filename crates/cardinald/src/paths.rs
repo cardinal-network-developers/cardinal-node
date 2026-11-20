@@ -217,6 +217,10 @@ impl Paths {
     pub fn peers(&self) -> PathBuf {
         self.home.join("peers.json")
     }
+    /// The outside addresses this device names itself at (`outside.rs`).
+    pub fn outside(&self) -> PathBuf {
+        self.home.join("outside.json")
+    }
     /// What copy checks saw of this person's devices.
     pub fn copies(&self) -> PathBuf {
         self.home.join("copies.json")

@@ -33,6 +33,7 @@ pub mod names;
 pub mod net;
 pub mod news;
 pub mod onefolder;
+pub mod outside;
 pub mod pair;
 pub mod paths;
 pub mod portmap;

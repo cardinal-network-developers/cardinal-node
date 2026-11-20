@@ -529,7 +529,7 @@ pub async fn serve(d: &Arc<Daemon>, s: &Session, mut st: Stream) -> anyhow::Resu
 }
 
 fn answer(d: &Daemon, s: &Session, r: &Record) -> Record {
-    if !d.config().host {
+    if !crate::outside::serving(d) {
         return error(NOT_PERMITTED);
     }
     let op = r.get(0).and_then(Value::as_uint);
@@ -681,13 +681,27 @@ struct Given {
 /// This device, as a host, gives a token it gave for the space before if
 /// one is still active, and a new one only if none is: every token given
 /// serves until revoked, so a second would only be one more to keep.
-async fn reach_here(d: &Arc<Daemon>, space: &SpaceId, named: &[Reach], add: Add) -> Given {
+///
+/// What software does `unasked` names a device that named itself as a
+/// host (D72) only where every other member is a trusted contact: its
+/// address is a home address, and only they get a session with it.
+async fn reach_here(
+    d: &Arc<Daemon>,
+    space: &SpaceId,
+    named: &[Reach],
+    add: Add,
+    unasked: bool,
+) -> Given {
     let me = d.keys.key();
     let hosts = d.core().mailboxes();
+    let trusted = !unasked || d.core().among_trusted(space);
     let mut given = Given::default();
     for (grant, device) in hosts {
         let host = *grant.link_key.x25519();
         if named.iter().any(|r| r.host == host) || (add == Add::Own && device != me) {
+            continue;
+        }
+        if crate::outside::is_self_named(&grant) && !trusted {
             continue;
         }
         let (token, new) = if device == me {
@@ -860,7 +874,7 @@ pub async fn say_reach(d: &Arc<Daemon>, space: &SpaceId, share: bool) -> anyhow:
 async fn say_reach_locked(d: &Arc<Daemon>, space: &SpaceId, share: bool) -> anyhow::Result<bool> {
     let me = me(d)?;
     let given = if share {
-        reach_here(d, space, &[], Add::Every).await
+        reach_here(d, space, &[], Add::Every, false).await
     } else {
         Given::default()
     };
@@ -886,7 +900,7 @@ async fn say_reach_locked(d: &Arc<Daemon>, space: &SpaceId, share: bool) -> anyh
 pub async fn on_meeting(d: &Arc<Daemon>, space: &SpaceId) -> anyhow::Result<()> {
     let _one = d.mailbox.reaching.lock().await;
     let me = me(d)?;
-    let given = reach_here(d, space, &[], Add::Every).await;
+    let given = reach_here(d, space, &[], Add::Every, true).await;
     if given.reach.is_empty() {
         return Ok(());
     }
@@ -931,7 +945,7 @@ pub async fn share_reach(d: &Arc<Daemon>, space: &SpaceId) -> anyhow::Result<Sha
         return Ok(Shared::NoHost);
     }
     let mut reach = d.core().reach_of(space, &me);
-    let given = reach_here(d, space, &reach, Add::Every).await;
+    let given = reach_here(d, space, &reach, Add::Every, false).await;
     let more = given.reach;
     if reach.is_empty() && more.is_empty() {
         if !t.set {
@@ -1002,7 +1016,7 @@ pub async fn write_reach(d: &Arc<Daemon>, space: &SpaceId) -> anyhow::Result<()>
             d.core().drop_yes(space);
             return Ok(());
         }
-        let given = reach_here(d, space, &[], Add::Every).await;
+        let given = reach_here(d, space, &[], Add::Every, true).await;
         if !given.reach.is_empty() {
             // setting the list is what ends the wait; a list set while
             // the token was registered ended it already
@@ -1017,7 +1031,7 @@ pub async fn write_reach(d: &Arc<Daemon>, space: &SpaceId) -> anyhow::Result<()>
     // set is the person's joining, and names every host of theirs; to one
     // that is set a device adds only itself.
     let add = if t.set { Add::Own } else { Add::Every };
-    let given = reach_here(d, space, &named, add).await;
+    let given = reach_here(d, space, &named, add, true).await;
     let more = given.reach;
     // A host that cannot be reached now gives no token. The empty list
     // that leaves is said once, and not again each time this looks.
@@ -1152,7 +1166,7 @@ pub fn take_out_removed(d: &Arc<Daemon>, gone: &[u8; 32]) {
 }
 
 pub fn keep_own_entry(d: &Arc<Daemon>) {
-    let host = d.config().host;
+    let host = crate::outside::serving(d);
     let here = *d.keys.link.public_key().x25519();
     let Some(me) = d.core().identity.as_ref().map(|i| i.id()) else {
         return;
@@ -1493,7 +1507,7 @@ async fn deliver(d: &Arc<Daemon>) {
 /// and everything it takes in reaches the others by the usual sync, so they
 /// need not poll it.
 async fn collect(d: &Arc<Daemon>) {
-    if !d.config().host {
+    if !crate::outside::serving(d) {
         return;
     }
     let me = d.keys.key();
@@ -2055,6 +2069,38 @@ mod tests {
             crate::host::enable(&self.d, &["203.0.113.5:7171".to_owned()]).unwrap();
         }
 
+        /// The router gives this device `at` outside, and it names itself
+        /// there (D72), as the port mapping loop has it do.
+        fn router_gives(&self, at: &str) {
+            let m = crate::portmap::Mapping {
+                protocol: crate::portmap::Protocol::Pcp,
+                external: at.parse().unwrap(),
+                internal_port: 7171,
+                lifetime: 7200,
+            };
+            lock(&self.d.portmap).mapping = Some((m, Instant::now()));
+            crate::outside::tick(&self.d);
+        }
+
+        fn trusts_bo(&self, trusted: bool) {
+            use cardinal_space::account;
+            let account = self.d.core().account_id().unwrap();
+            let node = self.d.core().contacts()[0].node;
+            let set = account::set_field(node, account::TRUSTED, trusted);
+            self.d.write_and_push(&account, vec![set]).unwrap();
+        }
+
+        fn entries(&self, space: &SpaceId) -> usize {
+            self.d.core().entries_by(space, &self.d.keys.key()).len()
+        }
+
+        fn endpoints(&self, space: &SpaceId) -> Vec<String> {
+            let named = self.named(space);
+            let here = named.iter().find(|r| r.host == self.here);
+            here.map(|r| r.endpoints.iter().map(|e| e.to_string()).collect())
+                .unwrap_or_default()
+        }
+
         fn active(&self) -> Vec<Token> {
             let mut all = lock(&self.d.mailbox.store).active();
             all.sort();
@@ -2106,6 +2152,116 @@ mod tests {
         }
     }
 
+    /// D72. A device the router gives an address outside names itself in
+    /// a relationship with a trusted contact, and not with one who is
+    /// not; with no host to name, the list stays unset, not empty.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_device_that_can_be_reached_names_itself_only_among_the_trusted() {
+        let h = Home::new().await;
+        h.trusts_bo(false);
+        // no host at all: an empty list would be a no
+        write_reach(&h.d, &h.rel).await.unwrap();
+        assert!(
+            !h.d.core().reach_is_set(&h.rel, &h.me),
+            "an empty list was written"
+        );
+        // a LAN address is never named
+        h.router_gives("192.168.1.5:7171");
+        assert!(crate::outside::named(&h.d).is_empty());
+        h.router_gives("203.0.113.5:60001");
+        assert!(crate::outside::serving(&h.d));
+        let grant = crate::host::own_grant(&h.d).unwrap();
+        assert!(crate::outside::is_self_named(&grant), "it offers storage");
+        on_meeting(&h.d, &h.rel).await.unwrap();
+        write_reach(&h.d, &h.rel).await.unwrap();
+        assert!(
+            h.named(&h.rel).is_empty(),
+            "named for a contact not trusted"
+        );
+        assert!(!h.d.core().reach_is_set(&h.rel, &h.me));
+        h.trusts_bo(true);
+        write_reach(&h.d, &h.rel).await.unwrap();
+        assert_eq!(h.endpoints(&h.rel), ["203.0.113.5:60001"]);
+        // It is not on the recovery sheet: no restore comes from it.
+        assert_eq!(
+            crate::host::sheet(&h.d).unwrap()["hosts"],
+            serde_json::json!([])
+        );
+    }
+
+    /// D72. Where the list is empty, it was the person's no: a device that
+    /// named itself does not add itself there, in a relationship either.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_device_that_named_itself_leaves_an_empty_list_alone() {
+        let h = Home::new().await;
+        say_reach(&h.d, &h.rel, false).await.unwrap();
+        h.router_gives("203.0.113.5:60001");
+        write_reach(&h.d, &h.rel).await.unwrap();
+        assert!(h.named(&h.rel).is_empty(), "it filled in a no");
+        keep_own_entry(&h.d);
+        assert!(h.named(&h.rel).is_empty());
+        // the person's yes names it
+        assert!(matches!(
+            share_reach(&h.d, &h.rel).await.unwrap(),
+            Shared::Named
+        ));
+        assert_eq!(h.endpoints(&h.rel), ["203.0.113.5:60001"]);
+
+        // In a group of trusted contacts it joins a list that names a host,
+        // and not one that names none.
+        let h = Home::new().await;
+        let g = h.group();
+        say_reach(&h.d, &g, false).await.unwrap();
+        h.router_gives("203.0.113.5:60001");
+        write_reach(&h.d, &g).await.unwrap();
+        assert!(h.named(&g).is_empty(), "it filled in a no");
+        let g2 = h.group();
+        write_reach(&h.d, &g2).await.unwrap();
+        assert_eq!(h.endpoints(&g2), ["203.0.113.5:60001"], "joining names it");
+        // and not where someone is not trusted
+        let h = Home::new().await;
+        h.trusts_bo(false);
+        h.router_gives("203.0.113.5:60001");
+        let g = h.group();
+        write_reach(&h.d, &g).await.unwrap();
+        assert!(h.named(&g).is_empty(), "named among the untrusted");
+    }
+
+    /// D72. A new address is written where the device is named, newest
+    /// first and three at most; a renewal, or an address that comes back,
+    /// writes nothing; turned off, it takes itself out.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_device_that_named_itself_writes_only_for_a_new_address() {
+        let h = Home::new().await;
+        h.router_gives("203.0.113.5:60001");
+        write_reach(&h.d, &h.rel).await.unwrap();
+        assert_eq!(h.endpoints(&h.rel), ["203.0.113.5:60001"]);
+        let account = h.d.core().account_id().unwrap();
+        let (rel, acc) = (h.entries(&h.rel), h.entries(&account));
+        h.router_gives("203.0.113.5:60001");
+        write_reach(&h.d, &h.rel).await.unwrap();
+        keep_own_entry(&h.d);
+        assert_eq!(h.entries(&h.rel), rel, "a renewal was written");
+        assert_eq!(h.entries(&account), acc);
+        for at in ["198.51.100.7:7171", "192.0.2.9:4000", "203.0.113.77:1"] {
+            h.router_gives(at);
+        }
+        assert_eq!(
+            h.endpoints(&h.rel),
+            ["203.0.113.77:1", "192.0.2.9:4000", "198.51.100.7:7171"]
+        );
+        let rel = h.entries(&h.rel);
+        h.router_gives("198.51.100.7:7171");
+        assert_eq!(h.entries(&h.rel), rel, "written to reorder");
+        // turned off: out of the list, and no host
+        h.d.config().port_mapping = false;
+        crate::outside::tick(&h.d);
+        assert!(h.named(&h.rel).is_empty());
+        assert!(!crate::outside::serving(&h.d));
+        assert!(crate::host::own_grant(&h.d).is_none());
+        assert!(h.active().is_empty(), "its token is left");
+    }
+
     /// Meeting someone with no host to name leaves the list unset, not
     /// empty: an empty list is a no, which nothing fills in. Found on the
     /// home network, 2026-11-19: a relationship made while no host could be
@@ -2139,7 +2295,10 @@ mod tests {
         assert_eq!(h2.named(&h2.rel).len(), 1, "the host adds itself");
         say_reach(&h2.d, &h2.rel, false).await.unwrap();
         assert!(h2.named(&h2.rel).is_empty());
-        assert!(matches!(share_reach(&h2.d, &h2.rel).await.unwrap(), Shared::Named));
+        assert!(matches!(
+            share_reach(&h2.d, &h2.rel).await.unwrap(),
+            Shared::Named
+        ));
         assert_eq!(h2.named(&h2.rel).len(), 1, "a yes names it");
 
         // With a host already, meeting names it at once.

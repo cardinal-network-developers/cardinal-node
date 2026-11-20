@@ -459,6 +459,12 @@ async fn handle(d: &Arc<Daemon>, req: &Value) -> anyhow::Result<Value> {
             crate::host::enable(d, &addresses)
         }
         "host-off" => crate::host::disable(d),
+        "router" => {
+            if let Some(on) = req.get("on").and_then(|v| v.as_bool()) {
+                crate::portmap::set_on(d, on)?;
+            }
+            Ok(crate::portmap::status(d))
+        }
         "recovery-sheet" => crate::host::sheet(d),
         "restore-from-host" => {
             crate::host::restore(d, arg(req, "words")?, arg(req, "at")?, arg(req, "key")?).await
@@ -921,7 +927,7 @@ fn status(d: &Arc<Daemon>) -> Value {
     };
     json!({
         "name": cfg.name,
-        "router": d.portmap.lock().unwrap_or_else(|e| e.into_inner()).status(),
+        "router": crate::portmap::status(d),
         "home": d.paths.home.display().to_string(),
         "identity": identity,
         "listen": d.endpoint.tcp_addr().map(|a| a.to_string()),

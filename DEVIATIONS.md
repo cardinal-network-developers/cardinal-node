@@ -1475,6 +1475,54 @@ asks for around that is not built yet.
   - **Spec gap: only groups have a way to be told or to answer.** Any
     other space shared with someone who is not a contact is not something
     this build makes.
+- **A device that can be reached names itself** (D72,
+  `hosts.md#a-device-that-can-be-reached-names-itself`, `outside.rs`).
+  - **Only the router's address counts as outside.** The address a
+    router gives by PCP, NAT-PMP or UPnP is named; a forwarded port or a
+    public address is named only by `cardinal host --address`, which makes
+    an explicit host, whose endpoints stay what the person gave and to
+    which none of this applies. Addresses on the device's own interfaces
+    are not looked at: a global IPv6 address behind a firewall would name
+    a device nobody reaches.
+  - **Turned off is `cardinal router off`** (`config.port_mapping`
+    false): it stops asking the router, gives the port back, and the
+    device takes itself out. There is no separate switch for asking
+    without naming. `cardinal host --off` also forgets what the device
+    named itself at, so it names itself again only from the next address,
+    and only where every other member is trusted.
+  - **Told apart by what it serves.** Its grant offers mailbox,
+    rendezvous and relay, and no storage; an explicit host's always
+    offers storage. Every device of the person reads it that way, since
+    the format has nothing else to say it: a grant without storage is
+    named unasked only among trusted contacts, by whichever device sets
+    the list. It is not on the recovery sheet. Its mailbox has the one
+    quota class there is (above), not a smaller one.
+  - **Reading: "never where the list is empty".** A device that named
+    itself adds itself unasked, in a relationship or a group, only where
+    the list names a host already and every other member is trusted, or
+    where the list was never set and this is the joining. An explicit
+    host still adds itself in a relationship to a list emptied before
+    (D70 as read before D72).
+  - **A relationship's list is not set empty for want of a host**
+    (`write_reach`, as on branch `video`, 69f8738): as on meeting, it is
+    left unset, so that a host that comes later, or a device that names
+    itself, is named there. A group's list is still set empty on joining
+    with no host, and a device that names itself is then never named there
+    unasked.
+  - **When it takes itself out** of a list it leaves empty, that is a no
+    there, as for any host, and it is not named there again unasked.
+  - **The month is kept on the device** (`outside.json`): the addresses it
+    names and when each was last its own, saved at most hourly.
+  - **A mapping where another of the person's devices is reached** (a
+    host's grant endpoints, or an address in the peer book) is given back
+    with lifetime 0, and one other port outside is asked for, the same
+    each time for a device and port; if that clashes too, there is no
+    mapping, and status says why.
+  - **The outside address an own device presents** is kept in the peer
+    book after the address it was last reached at.
+  - **Deposited reach nodes.** Nothing here deposits the reach node for a
+    new address on its own: the entry that writes it goes to contacts'
+    mailboxes as every entry does.
 - **An endpoint this version cannot use** (D68, `hosts.md#grants`,
   `grant.rs` `Endpoint`, contact `EndpointAddr`) is held as the record it
   came in and written again as it is. An entry of an endpoint list that is

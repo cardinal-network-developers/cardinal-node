@@ -354,6 +354,10 @@ pub fn disable(d: &Arc<Daemon>) -> anyhow::Result<Json> {
     d.save_config()?;
     d.endpoint.set_allow_public(false);
     crate::mailbox::close(d);
+    // Nor is it named as a device that named itself (D72) where it was
+    // named as the person's host: that starts again, with the next address
+    // the router gives, and only where every other member is trusted.
+    crate::outside::forget(d);
     // It serves no longer, and takes itself out of the lists that name it.
     // Nobody else does: whether a device still serves is its own to know.
     crate::mailbox::keep_own_entry(d);
