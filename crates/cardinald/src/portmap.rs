@@ -647,6 +647,11 @@ pub async fn keep(d: Arc<Daemon>) {
             if now != port || !d.config().port_mapping {
                 break;
             }
+            // An address held long enough is named without waiting for
+            // the next renewal.
+            if crate::outside::due(&d) {
+                crate::outside::tick(&d);
+            }
         }
     }
 }

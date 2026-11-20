@@ -36,6 +36,34 @@ use crate::daemon::Daemon;
 pub const KEEP: usize = 3;
 /// How long an address it names may go without being its own.
 pub const MONTH: u64 = 30 * 24 * 60 * 60;
+/// How long the router must have given an address before it is named: a
+/// device on the network that answers as a router, or a router that
+/// gives a new address at each renewal, makes no write.
+pub const HOLD: u64 = 10 * 60;
+/// After the first, at most one new address is named in this time.
+pub const DAY: u64 = 24 * 60 * 60;
+
+/// [`HOLD`], or `CARDINAL_TEST_HOLD_SECS` in tests.
+pub fn hold() -> u64 {
+    std::env::var("CARDINAL_TEST_HOLD_SECS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(HOLD)
+}
+
+/// What this device names itself at, and what that rests on.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Outside {
+    /// The addresses it names, newest first.
+    pub named: Vec<Named>,
+    /// When it last named a new one (seconds since the epoch).
+    #[serde(default)]
+    pub last_new: u64,
+    /// The address the router gives now, and since when, while it is not
+    /// named yet. Not saved: after a restart it is held again first.
+    #[serde(skip)]
+    pub seen: Option<(SocketAddr, u64)>,
+}
 
 /// An address this device names, and when it last held it.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -46,13 +74,20 @@ pub struct Named {
 }
 
 /// Whether an address can be reached from outside the network it is on:
-/// not a private, shared (carrier-grade NAT), link-local or loopback one.
-/// Only such an address is ever named.
+/// not a private, shared (carrier-grade NAT), link-local, loopback,
+/// benchmarking, protocol-assignment or reserved one, and not one of the
+/// IPv6 ranges that carry an IPv4 address (NAT64) or are for
+/// documentation. Only such an address is ever named. The IPv4
+/// documentation ranges are left in: the tests here stand for the
+/// internet with them, as RFC 5737 means them to.
 pub fn is_outside(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(v4) => {
             let o = v4.octets();
             let shared = o[0] == 100 && (o[1] & 0xc0) == 64;
+            let benchmarking = o[0] == 198 && (o[1] & 0xfe) == 18;
+            let protocol = o[0] == 192 && o[1] == 0 && o[2] == 0;
+            let reserved = o[0] >= 240;
             !(v4.is_private()
                 || v4.is_loopback()
                 || v4.is_link_local()
@@ -60,48 +95,94 @@ pub fn is_outside(ip: IpAddr) -> bool {
                 || v4.is_broadcast()
                 || v4.is_multicast()
                 || shared
+                || benchmarking
+                || protocol
+                || reserved
                 || o[0] == 0)
         }
         IpAddr::V6(v6) => {
             if let Some(v4) = v6.to_ipv4_mapped() {
                 return is_outside(IpAddr::V4(v4));
             }
-            let s = v6.segments()[0];
+            let g = v6.segments();
+            let nat64 = g[0] == 0x64 && g[1] == 0xff9b;
+            let documentation = g[0] == 0x2001 && g[1] == 0x0db8;
             !(v6.is_loopback()
                 || v6.is_unspecified()
                 || v6.is_multicast()
-                || (s & 0xfe00) == 0xfc00
-                || (s & 0xffc0) == 0xfe80)
+                || (g[0] & 0xfe00) == 0xfc00
+                || (g[0] & 0xffc0) == 0xfe80
+                || nat64
+                || documentation)
         }
     }
 }
 
 /// What this device names next, from what it names, whether naming is on,
-/// the outside address it holds now (if any), and the time. Says whether
-/// the grant is to be written: only for an address not named already, or
-/// to take itself out.
-pub fn next(named: &[Named], on: bool, have: Option<SocketAddr>, now: u64) -> (Vec<Named>, bool) {
+/// the outside address the router gives now (if any), the time, and how
+/// long an address must be held first. Says whether the grant is to be
+/// written: only for an address not named already, which the router has
+/// given for `hold` seconds, and no sooner than a [`DAY`] after the last
+/// new one unless none is named; or to take itself out.
+pub fn next(
+    was: &Outside,
+    on: bool,
+    have: Option<SocketAddr>,
+    now: u64,
+    hold: u64,
+) -> (Outside, bool) {
     if !on {
-        return (Vec::new(), !named.is_empty());
+        let out = Outside {
+            last_new: was.last_new,
+            ..Outside::default()
+        };
+        return (out, !was.named.is_empty());
     }
-    let mut list = named.to_vec();
+    let mut out = was.clone();
     let mut write = false;
-    if let Some(addr) = have.filter(|a| is_outside(a.ip())) {
-        match list.iter_mut().find(|n| n.addr == addr) {
+    let have = have.filter(|a| is_outside(a.ip()));
+    match have {
+        Some(addr) => match out.named.iter_mut().find(|n| n.addr == addr) {
             // renewed, or back: nothing to write, and the order stays
-            Some(n) => n.own_at = now,
-            None => {
-                list.insert(0, Named { addr, own_at: now });
-                list.truncate(KEEP);
-                write = true;
+            Some(n) => {
+                n.own_at = now;
+                out.seen = None;
             }
-        }
+            None => {
+                let since = match out.seen {
+                    Some((a, t)) if a == addr => t,
+                    _ => now,
+                };
+                out.seen = Some((addr, since));
+                let held = now.saturating_sub(since) >= hold;
+                let due = out.named.is_empty() || now.saturating_sub(out.last_new) >= DAY;
+                if held && due {
+                    out.named.insert(0, Named { addr, own_at: now });
+                    out.named.truncate(KEEP);
+                    out.last_new = now;
+                    out.seen = None;
+                    write = true;
+                }
+            }
+        },
+        None => out.seen = None,
     }
     let stale = |n: &Named| now.saturating_sub(n.own_at) >= MONTH;
-    if !list.is_empty() && list.iter().all(stale) {
-        return (Vec::new(), true);
+    if !out.named.is_empty() && out.named.iter().all(stale) {
+        out.named.clear();
+        return (out, true);
     }
-    (list, write)
+    (out, write)
+}
+
+/// Whether the address the router gives is due to be named now: the
+/// port mapping loop looks often, and [`tick`] is called only then.
+pub fn due(d: &Daemon) -> bool {
+    let o = d.outside.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    let have = crate::portmap::external(d);
+    let on = d.config().port_mapping;
+    let (_, write) = next(&o, on, have, now(), hold());
+    write
 }
 
 /// The endpoints a grant gives for `named`: UDP, which is what a router
@@ -138,7 +219,11 @@ pub fn serving(d: &Daemon) -> bool {
 
 /// What this device names now.
 pub fn named(d: &Daemon) -> Vec<Named> {
-    d.outside.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    d.outside
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .named
+        .clone()
 }
 
 fn now() -> u64 {
@@ -149,15 +234,15 @@ fn now() -> u64 {
 
 /// Reads what was named before; called once, at start.
 pub fn load(d: &Daemon) {
-    let saved: Vec<Named> = std::fs::read(d.paths.outside())
+    let saved: Outside = std::fs::read(d.paths.outside())
         .ok()
         .and_then(|b| serde_json::from_slice(&b).ok())
         .unwrap_or_default();
     *d.outside.lock().unwrap_or_else(|e| e.into_inner()) = saved;
 }
 
-fn save(d: &Daemon, list: &[Named]) {
-    let bytes = serde_json::to_vec_pretty(list).unwrap_or_default();
+fn save(d: &Daemon, o: &Outside) {
+    let bytes = serde_json::to_vec_pretty(o).unwrap_or_default();
     if let Err(e) = crate::paths::write_private(&d.paths.outside(), &bytes, 0o600) {
         tracing::warn!("cannot save the outside addresses this device names: {e}");
     }
@@ -166,8 +251,12 @@ fn save(d: &Daemon, list: &[Named]) {
 /// Forgets what this device names, as when it stops being an explicit
 /// host: it names itself again from the next address the router gives.
 pub fn forget(d: &Daemon) {
-    d.outside.lock().unwrap_or_else(|e| e.into_inner()).clear();
-    save(d, &[]);
+    let o = {
+        let mut o = d.outside.lock().unwrap_or_else(|e| e.into_inner());
+        o.named.clear();
+        o.clone()
+    };
+    save(d, &o);
 }
 
 /// This device's own grant as one that names itself, if it has one.
@@ -188,8 +277,10 @@ pub fn tick(d: &Arc<Daemon>) {
     }
     let on = d.config().port_mapping;
     let have = crate::portmap::external(d);
-    let was = named(d);
-    let (list, _) = next(&was, on, have, now());
+    let all = d.outside.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    let was = all.named.clone();
+    let (out, _) = next(&all, on, have, now(), hold());
+    let list = out.named.clone();
     // What the grant gives is what decides: a crash between the two
     // writes, or a grant another version wrote, is put right here.
     let given = own_self_grant(d).map(|g| g.endpoints).unwrap_or_default();
@@ -209,10 +300,10 @@ pub fn tick(d: &Arc<Daemon>) {
             .iter()
             .zip(&list)
             .any(|(a, b)| a.addr != b.addr || b.own_at.saturating_sub(a.own_at) >= 3600);
-    if moved {
-        save(d, &list);
+    if moved || out.last_new != all.last_new {
+        save(d, &out);
     }
-    *d.outside.lock().unwrap_or_else(|e| e.into_inner()) = list;
+    *d.outside.lock().unwrap_or_else(|e| e.into_inner()) = out;
 }
 
 /// Writes this device's grant for `named` in the account space, or takes
@@ -264,7 +355,7 @@ fn write_grant(d: &Arc<Daemon>, named: &[Named]) -> anyhow::Result<()> {
     }
     d.write_and_push(&space, ops)?;
     // The list is in place before the entries that name it are kept.
-    *d.outside.lock().unwrap_or_else(|e| e.into_inner()) = named.to_vec();
+    d.outside.lock().unwrap_or_else(|e| e.into_inner()).named = named.to_vec();
     if named.is_empty() {
         crate::mailbox::close(d);
     } else {
@@ -290,12 +381,21 @@ mod tests {
         s.parse().unwrap()
     }
 
-    fn addrs(l: &[Named]) -> Vec<String> {
-        l.iter().map(|n| n.addr.to_string()).collect()
+    fn addrs(o: &Outside) -> Vec<String> {
+        o.named.iter().map(|n| n.addr.to_string()).collect()
+    }
+
+    /// The router gives `at` at `now`, held long enough, and a day after
+    /// the last new one: as if nothing held it back.
+    fn given(o: &Outside, at: &str, now: u64) -> (Outside, bool) {
+        let mut o = o.clone();
+        o.last_new = o.last_new.min(now.saturating_sub(DAY));
+        o.seen = Some((a(at), 0));
+        next(&o, true, Some(a(at)), now, HOLD)
     }
 
     #[test]
-    fn a_lan_address_is_never_outside() {
+    fn only_an_address_outside_is_named() {
         for s in [
             "192.168.1.5",
             "10.0.0.1",
@@ -303,23 +403,79 @@ mod tests {
             "100.64.1.10",
             "127.0.0.1",
             "169.254.3.4",
+            "198.18.0.1",
+            "198.19.255.1",
+            "192.0.0.8",
+            "240.0.0.1",
+            "255.255.255.255",
+            "0.1.2.3",
             "fd00::1",
             "fe80::1",
             "::1",
             "::ffff:192.168.1.5",
+            "64:ff9b::c0a8:105",
+            "2001:db8::1",
         ] {
             assert!(!is_outside(s.parse().unwrap()), "{s}");
         }
-        for s in ["203.0.113.5", "198.51.100.10", "8.8.8.8", "2001:db8::1"] {
+        for s in [
+            "203.0.113.5",
+            "198.51.100.10",
+            "8.8.8.8",
+            "198.20.0.1",
+            "2a00:1450::1",
+        ] {
             assert!(is_outside(s.parse().unwrap()), "{s}");
         }
-        let (l, write) = next(&[], true, Some(a("192.168.1.5:7171")), 100);
-        assert!(l.is_empty() && !write, "a LAN address was named");
+        let (o, write) = given(&Outside::default(), "192.168.1.5:7171", 10 * DAY);
+        assert!(o.named.is_empty() && !write, "a LAN address was named");
+    }
+
+    #[test]
+    fn an_address_is_named_only_once_it_has_held() {
+        let t = 10 * DAY;
+        let o = Outside::default();
+        let (o, write) = next(&o, true, Some(a("203.0.113.1:1")), t, HOLD);
+        assert!(!write && o.named.is_empty(), "named at once");
+        // another address meanwhile starts the wait again
+        let (o, write) = next(&o, true, Some(a("203.0.113.2:2")), t + HOLD, HOLD);
+        assert!(!write && o.named.is_empty());
+        let (o, write) = next(&o, true, Some(a("203.0.113.2:2")), t + 2 * HOLD - 1, HOLD);
+        assert!(!write && o.named.is_empty());
+        let (o, write) = next(&o, true, Some(a("203.0.113.2:2")), t + 2 * HOLD, HOLD);
+        assert!(write && addrs(&o) == ["203.0.113.2:2"]);
+        // none at all, and the wait is forgotten
+        let (o, _) = next(&o, true, Some(a("203.0.113.3:3")), t + 3 * HOLD, HOLD);
+        let (o, _) = next(&o, true, None, t + 4 * HOLD, HOLD);
+        assert_eq!(o.seen, None);
+    }
+
+    #[test]
+    fn after_the_first_at_most_one_new_address_a_day() {
+        let t = 10 * DAY;
+        let (o, write) = given(&Outside::default(), "203.0.113.1:1", t);
+        assert!(write);
+        // held, but within the day: waits
+        let mut held = o.clone();
+        held.seen = Some((a("203.0.113.2:2"), 0));
+        let (o2, write) = next(&held, true, Some(a("203.0.113.2:2")), t + HOLD, HOLD);
+        assert!(
+            !write && addrs(&o2) == ["203.0.113.1:1"],
+            "a second the same day"
+        );
+        let (o3, write) = next(&o2, true, Some(a("203.0.113.2:2")), t + DAY, HOLD);
+        assert!(write && addrs(&o3) == ["203.0.113.2:2", "203.0.113.1:1"]);
+        // turned off and on: the first is named at once again
+        let (off, _) = next(&o3, false, None, t + DAY + 1, HOLD);
+        let mut on = off.clone();
+        on.seen = Some((a("203.0.113.9:9"), 0));
+        let (on, write) = next(&on, true, Some(a("203.0.113.9:9")), t + DAY + 2, HOLD);
+        assert!(write && addrs(&on) == ["203.0.113.9:9"]);
     }
 
     #[test]
     fn up_to_three_addresses_newest_first() {
-        let mut l = Vec::new();
+        let mut o = Outside::default();
         for (i, s) in [
             "203.0.113.1:1",
             "203.0.113.2:2",
@@ -329,12 +485,12 @@ mod tests {
         .iter()
         .enumerate()
         {
-            let (n, write) = next(&l, true, Some(a(s)), 100 + i as u64);
+            let (n, write) = given(&o, s, (10 + i as u64) * DAY);
             assert!(write, "a new address is written");
-            l = n;
+            o = n;
         }
         assert_eq!(
-            addrs(&l),
+            addrs(&o),
             ["203.0.113.4:4", "203.0.113.3:3", "203.0.113.2:2"],
             "the oldest is left out"
         );
@@ -342,37 +498,41 @@ mod tests {
 
     #[test]
     fn a_renewal_or_an_address_that_comes_back_writes_nothing() {
-        let (l, _) = next(&[], true, Some(a("203.0.113.1:1")), 100);
-        let (l, _) = next(&l, true, Some(a("203.0.113.2:2")), 200);
-        let (l2, write) = next(&l, true, Some(a("203.0.113.2:2")), 300);
+        let t = 10 * DAY;
+        let (o, _) = given(&Outside::default(), "203.0.113.1:1", t);
+        let (o, _) = given(&o, "203.0.113.2:2", t + DAY);
+        let (o2, write) = next(&o, true, Some(a("203.0.113.2:2")), t + DAY + 300, HOLD);
         assert!(!write, "a renewal was written");
-        assert_eq!(l2[0].own_at, 300, "but it is noted");
+        assert_eq!(o2.named[0].own_at, t + DAY + 300, "but it is noted");
         // the first comes back: not moved to the front
-        let (l3, write) = next(&l2, true, Some(a("203.0.113.1:1")), 400);
+        let (o3, write) = next(&o2, true, Some(a("203.0.113.1:1")), t + DAY + 400, HOLD);
         assert!(!write, "written only to reorder");
-        assert_eq!(addrs(&l3), ["203.0.113.2:2", "203.0.113.1:1"]);
+        assert_eq!(addrs(&o3), ["203.0.113.2:2", "203.0.113.1:1"]);
         // away, with no address: nothing changes
-        let (l4, write) = next(&l3, true, None, 500);
+        let (o4, write) = next(&o3, true, None, t + DAY + 500, HOLD);
         assert!(!write);
-        assert_eq!(l4, l3);
+        assert_eq!(o4.named, o3.named);
     }
 
     #[test]
     fn it_takes_itself_out_when_turned_off_or_after_a_month_without_any() {
-        let (l, _) = next(&[], true, Some(a("203.0.113.1:1")), 100);
-        assert_eq!(next(&l, false, None, 200), (Vec::new(), true));
-        assert_eq!(next(&[], false, None, 200), (Vec::new(), false));
-        let (l, _) = next(&l, true, Some(a("203.0.113.2:2")), 100 + MONTH - 10);
+        let t = 10 * DAY;
+        let (o, _) = given(&Outside::default(), "203.0.113.1:1", t);
+        let (off, write) = next(&o, false, None, t + 1, HOLD);
+        assert!(write && off.named.is_empty());
+        assert!(!next(&Outside::default(), false, None, t, HOLD).1);
+        let (o, _) = given(&o, "203.0.113.2:2", t + MONTH - 10);
         // one of them was its own within the month
-        let (kept, write) = next(&l, true, None, 100 + MONTH + 5);
-        assert!(!write && kept.len() == 2);
-        assert_eq!(next(&l, true, None, 100 + 2 * MONTH), (Vec::new(), true));
+        let (kept, write) = next(&o, true, None, t + MONTH + 5, HOLD);
+        assert!(!write && kept.named.len() == 2);
+        let (gone, write) = next(&o, true, None, t + 2 * MONTH, HOLD);
+        assert!(write && gone.named.is_empty());
     }
 
     #[test]
     fn its_endpoints_are_udp_at_its_addresses() {
-        let (l, _) = next(&[], true, Some(a("203.0.113.1:60001")), 100);
-        let e = endpoints(&l);
+        let (o, _) = given(&Outside::default(), "203.0.113.1:60001", 10 * DAY);
+        let e = endpoints(&o.named);
         assert_eq!(e[0].socket_addr(), Some(a("203.0.113.1:60001")));
         assert_eq!(e[0].to_record().get(1).and_then(Value::as_uint), Some(1));
     }

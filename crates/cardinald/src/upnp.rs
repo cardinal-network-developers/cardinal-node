@@ -191,7 +191,16 @@ async fn exchange(at: SocketAddr, request: &[u8]) -> Result<(u16, String), Strin
         .map_err(|_| "the router did not answer".to_owned())?
 }
 
-/// Finds the router's description by SSDP, preferring the gateway's own.
+/// Whether an SSDP answer from `from` naming `url` is taken: from this
+/// network, and from the gateway itself when this device knows which that
+/// is. Any device on the network can answer, and what a router says of
+/// its address outside is named in the person's reach nodes (D72).
+pub fn takes(url: &str, from: IpAddr, gateway_ip: Option<IpAddr>) -> bool {
+    trusted_location(url, from) && gateway_ip.is_none_or(|g| g == from)
+}
+
+/// Finds the router's description by SSDP: the gateway's own where this
+/// device knows which is the gateway, and otherwise the first to answer.
 async fn search(gateway_ip: Option<IpAddr>) -> Option<String> {
     let sock = UdpSocket::bind("0.0.0.0:0").await.ok()?;
     let ask = format!(
@@ -205,10 +214,10 @@ async fn search(gateway_ip: Option<IpAddr>) -> Option<String> {
         let Some(url) = location(&String::from_utf8_lossy(&buf[..n])) else {
             continue;
         };
-        if !trusted_location(&url, from.ip()) {
+        if !takes(&url, from.ip(), gateway_ip) {
             continue;
         }
-        if Some(from.ip()) == gateway_ip {
+        if gateway_ip.is_some() {
             return Some(url);
         }
         found.get_or_insert(url);
@@ -405,6 +414,13 @@ pub(crate) mod tests {
         assert!(!trusted_location("http://127.0.0.1:2189/d.xml", local));
         let far: IpAddr = "203.0.113.9".parse().unwrap();
         assert!(!trusted_location("http://203.0.113.9/d.xml", far));
+        // Where the gateway is known, only it is taken: another device on
+        // the network answering as a router is not.
+        let guest = "http://172.20.0.9:5000/d.xml";
+        let guest_ip: IpAddr = "172.20.0.9".parse().unwrap();
+        assert!(takes(from, lan, Some(lan)));
+        assert!(!takes(guest, guest_ip, Some(lan)));
+        assert!(takes(guest, guest_ip, None), "with no gateway to go by");
     }
 
     #[test]
@@ -564,7 +580,7 @@ pub(crate) mod tests {
 
     #[test]
     fn only_an_address_others_could_reach_is_the_routers_own() {
-        for a in ["198.51.100.7", "8.8.8.8", "2001:db8::1"] {
+        for a in ["198.51.100.7", "8.8.8.8", "2a00:1450::1"] {
             assert!(public(a.parse().unwrap()), "{a}");
         }
         for a in [

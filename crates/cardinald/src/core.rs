@@ -1506,8 +1506,23 @@ impl Core {
             return None;
         }
         if host {
-            let changed = crate::mailbox::kept_current(&mut reach, &here, endpoints, active, fresh);
-            return changed.then_some(reach);
+            let mut kept = reach.clone();
+            let changed = crate::mailbox::kept_current(&mut kept, &here, endpoints, active, fresh);
+            if !changed {
+                return None;
+            }
+            // A device that named itself (D72) gives a new address or
+            // token only where every other member is still a trusted
+            // contact; anywhere else it takes itself out instead.
+            let self_named = self
+                .mailboxes()
+                .iter()
+                .any(|(g, device)| *device == self.keys.key() && crate::outside::is_self_named(g));
+            if self_named && !self.among_trusted(space) {
+                reach.retain(|r| r.host != here);
+                return Some(reach);
+            }
+            return Some(kept);
         }
         if self.hosts_here() {
             // between the two: turning hosting on or off writes the

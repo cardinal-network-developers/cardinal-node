@@ -564,6 +564,9 @@ def mapped():
                             "198.51.100.10"], stdout=pcp_log, stderr=pcp_log)
     laptop = Dev(net, "carbonite", "dan-home", 3)
     him = Dev(net, "cousin", "dan-home", 4)
+    for d in (laptop, him):
+        # named once held this long, not ten minutes
+        d.env["CARDINAL_TEST_HOLD_SECS"] = "3"
     laptop.start()
     laptop.cli("init", "--yes", "--name", "Daniel")
     got = wait("a port", 30, lambda: laptop.status()["router"].get("external"))
