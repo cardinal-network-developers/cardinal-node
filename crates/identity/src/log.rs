@@ -198,9 +198,20 @@ pub struct IdentityLog {
     /// software delivers to the guarded identity
     /// (`identity.md#distribution`). Evaluating this log reads them.
     attached: BTreeMap<EntryId, IdentityLog>,
-    /// Attached entries whose log's genesis has not arrived.
-    unattached: Vec<IdentityEntry>,
+    /// Other identities' entries not (yet) part of a guardian's act on
+    /// this log: held until an act makes them its past, at most
+    /// [`MAX_PENDING`], the oldest dropped first. Never evaluated or
+    /// served.
+    unattached: std::collections::VecDeque<IdentityEntry>,
+    unattached_ids: HashSet<EntryId>,
+    /// Entries of other identities newly kept, until taken
+    /// ([`take_attached`](IdentityLog::take_attached)).
+    promoted: Vec<EntryId>,
 }
+
+/// The most entries of other identities held while nothing shows them to
+/// be a guardian's act on a log.
+pub const MAX_PENDING: usize = 512;
 
 /// The result of creating an identity.
 pub struct Created {
@@ -260,7 +271,9 @@ impl IdentityLog {
             dag,
             state: Mutex::new(None),
             attached: BTreeMap::new(),
-            unattached: Vec::new(),
+            unattached: std::collections::VecDeque::new(),
+            unattached_ids: HashSet::new(),
+            promoted: Vec::new(),
         })
     }
 
@@ -362,9 +375,12 @@ impl IdentityLog {
     /// Whether entries are waiting for parents, here or in a log held
     /// under this one's label.
     pub fn is_waiting(&self) -> bool {
+        // and an act on this log whose past is not all here
         self.dag.held().next().is_some()
-            || !self.unattached.is_empty()
-            || self.attached.values().any(|l| l.is_waiting())
+            || self
+                .unattached
+                .iter()
+                .any(|e| self.is_act_here(&e.identity(), e))
     }
 
     /// The heads of this log, then of each log held under its label: what
@@ -409,8 +425,26 @@ impl IdentityLog {
         let r = self.dag.insert(entry.id(), entry.parents().to_vec(), entry);
         if matches!(r, Inserted::Added(_)) {
             *self.state.get_mut().expect("lock") = None;
+            // a decision arriving after the acts on it
+            if !self.unattached.is_empty() {
+                let waiting: BTreeSet<EntryId> =
+                    self.unattached.iter().map(|e| e.identity()).collect();
+                for of in waiting {
+                    self.promote(&of);
+                }
+            }
         }
         Ok(r)
+    }
+
+    /// The entries of other identities kept since this was last asked, in
+    /// the order they were kept: what to store and serve under this log's
+    /// label.
+    pub fn take_attached(&mut self) -> Vec<IdentityEntry> {
+        let ids = std::mem::take(&mut self.promoted);
+        ids.iter()
+            .filter_map(|id| self.attached.values().find_map(|l| l.get(id)).cloned())
+            .collect()
     }
 
     /// Decodes and adds an entry.
@@ -430,44 +464,151 @@ impl IdentityLog {
 
     /// Adds an entry of another identity's log, held under this one's
     /// label: a guardian's, delivered with its `endorse` or `confirm`.
-    /// Entries that come before their log's genesis wait for it.
+    ///
+    /// Only the causal past of an act of a guardian on this log is kept: an
+    /// `endorse` or `confirm` naming a decision here, whose position and
+    /// salt open a commitment of that decision's policy for the identity
+    /// that wrote it. Anything else waits, bounded, for such an act, and is
+    /// not evaluated or served. `Added` lists every entry newly kept.
     pub fn attach(&mut self, entry: IdentityEntry) -> Result<Inserted, Error> {
         let of = entry.identity();
         if of == self.id {
             return Err(Error::WrongIdentity);
         }
-        let r = match self.attached.get_mut(&of) {
-            Some(log) => log.insert(entry)?,
-            None if entry.is_genesis() => {
-                let id = entry.id();
-                let mut log = IdentityLog::from_genesis(entry)?;
-                let (mine, rest): (Vec<IdentityEntry>, Vec<IdentityEntry>) =
-                    std::mem::take(&mut self.unattached)
-                        .into_iter()
-                        .partition(|e| e.identity() == of);
-                self.unattached = rest;
-                let mut added = vec![id];
-                for e in mine {
-                    if let Ok(Inserted::Added(ids)) = log.insert(e) {
-                        added.extend(ids);
-                    }
-                }
-                self.attached.insert(of, log);
-                Inserted::Added(added)
+        let id = entry.id();
+        if self.unattached_ids.contains(&id)
+            || self
+                .attached
+                .get(&of)
+                .is_some_and(|l| l.dag.contains(&id) || l.dag.is_held(&id))
+        {
+            return Ok(Inserted::Duplicate);
+        }
+        self.unattached_ids.insert(id);
+        self.unattached.push_back(entry);
+        while self.unattached.len() > MAX_PENDING {
+            if let Some(old) = self.unattached.pop_front() {
+                self.unattached_ids.remove(&old.id());
             }
-            None => {
-                if self.unattached.iter().any(|e| e.id() == entry.id()) {
-                    return Ok(Inserted::Duplicate);
+        }
+        let added = self.promote(&of);
+        if added.is_empty() {
+            return Ok(Inserted::Held(vec![id]));
+        }
+        *self.state.get_mut().expect("lock") = None;
+        Ok(Inserted::Added(added))
+    }
+
+    /// Whether `e`, of identity `of`, is a guardian's act on this log.
+    fn is_act_here(&self, of: &EntryId, e: &IdentityEntry) -> bool {
+        e.ops().iter().any(|op| {
+            let (d, pos, salt) = match op.body() {
+                OpBody::Endorse {
+                    decision,
+                    position,
+                    salt,
                 }
-                let id = entry.id();
-                self.unattached.push(entry);
-                Inserted::Held(vec![id])
+                | OpBody::Confirm {
+                    decision,
+                    position,
+                    salt,
+                    ..
+                } => (decision, *position, salt),
+                _ => return false,
+            };
+            let Some(de) = self.dag.get(d) else {
+                return false;
+            };
+            let policy = de.ops().iter().find_map(|o| match o.body() {
+                OpBody::Recover { policy, .. } => Some(*policy),
+                OpBody::SetRecovery {
+                    changes: Some(p), ..
+                } => Some(*p),
+                _ => None,
+            });
+            let Some(commitments) = policy.and_then(|p| self.dag.get(&p)).and_then(|pe| {
+                pe.ops().iter().find_map(|o| match o.body() {
+                    OpBody::SetRecovery { commitments, .. } => Some(commitments.clone()),
+                    _ => None,
+                })
+            }) else {
+                return false;
+            };
+            pos >= 1
+                && (pos as usize) <= commitments.len()
+                && commitments[pos as usize - 1] == guardian_commitment(salt, of)
+        })
+    }
+
+    /// Moves `of`'s waiting entries that are the past of an act on this
+    /// log into its attached log. Returns the ids moved.
+    fn promote(&mut self, of: &EntryId) -> Vec<EntryId> {
+        let mine: Vec<IdentityEntry> = self
+            .unattached
+            .iter()
+            .filter(|e| e.identity() == *of)
+            .cloned()
+            .collect();
+        let genesis = self
+            .attached
+            .get(of)
+            .and_then(|l| l.get(&l.id).cloned())
+            .or_else(|| mine.iter().find(|e| e.is_genesis()).cloned());
+        let Some(genesis) = genesis else {
+            return Vec::new();
+        };
+        let Ok(mut all) = IdentityLog::from_genesis(genesis) else {
+            return Vec::new();
+        };
+        if let Some(l) = self.attached.get(of) {
+            for e in l.entries() {
+                let _ = all.insert(e.clone());
+            }
+        }
+        for e in &mine {
+            if !e.is_genesis() {
+                let _ = all.insert(e.clone());
+            }
+        }
+        let acts: Vec<EntryId> = all
+            .entries()
+            .filter(|e| self.is_act_here(of, e))
+            .map(|e| e.id())
+            .collect();
+        let mut keep: HashSet<EntryId> = all.dag.ancestors_of(&acts);
+        keep.extend(acts.iter().copied());
+        let have = |id: &EntryId| self.attached.get(of).is_some_and(|l| l.dag.contains(id));
+        let new: Vec<EntryId> = all
+            .dag
+            .log_order()
+            .iter()
+            .filter(|id| keep.contains(*id) && !have(id))
+            .copied()
+            .collect();
+        if new.is_empty() {
+            return Vec::new();
+        }
+        let target = match self.attached.remove(of) {
+            Some(l) => l,
+            None => {
+                let g = all.get(&all.id).expect("genesis").clone();
+                IdentityLog::from_genesis(g).expect("checked")
             }
         };
-        if matches!(r, Inserted::Added(_)) {
-            *self.state.get_mut().expect("lock") = None;
+        let mut target = target;
+        for id in &new {
+            let e = all.get(id).expect("held").clone();
+            let _ = target.insert(e);
         }
-        Ok(r)
+        self.attached.insert(*of, target);
+        let moved: HashSet<EntryId> = new.iter().copied().collect();
+        self.unattached.retain(|e| !moved.contains(&e.id()));
+        for id in &new {
+            self.unattached_ids.remove(id);
+        }
+        self.promoted.extend(new.iter().copied());
+        *self.state.get_mut().expect("lock") = None;
+        new
     }
 
     /// The other identities' logs held under this one's label.
@@ -480,12 +621,9 @@ impl IdentityLog {
         self.attached.get(identity)
     }
 
-    /// Whether an attached entry is held (or waits for its genesis).
+    /// Whether an attached entry is held.
     pub fn has_attached(&self, id: &EntryId) -> bool {
-        self.attached
-            .values()
-            .any(|l| l.dag.contains(id) || l.dag.is_held(id))
-            || self.unattached.iter().any(|e| e.id() == *id)
+        self.attached.values().any(|l| l.dag.contains(id))
     }
 
     /// The evaluated state of this log alone.

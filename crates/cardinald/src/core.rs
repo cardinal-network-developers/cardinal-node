@@ -106,8 +106,10 @@ impl Identity {
                 continue;
             }
             let id = e.id();
+            let own = e.identity() == self.log.id();
             // Another identity's entries, held under this one's label: a
             // guardian's, up to what it did (`identity.md#distribution`).
+            // They are kept only once an act shows them to be that.
             match self.log.insert_any(e) {
                 Ok(Inserted::Duplicate) => continue,
                 Ok(Inserted::Added(_)) => changed = true,
@@ -117,8 +119,15 @@ impl Identity {
                     continue;
                 }
             }
-            self.set.insert(id);
-            to_store.push(bytes.clone());
+            if own {
+                self.set.insert(id);
+                to_store.push(bytes.clone());
+            }
+            for a in self.log.take_attached() {
+                changed = true;
+                self.set.insert(a.id());
+                to_store.push(a.encode());
+            }
         }
         self.store(&to_store)?;
         Ok(changed)
@@ -164,12 +173,19 @@ impl OtherLog {
                 continue;
             }
             let id = e.id();
+            let own = e.identity() == self.log.id();
             match self.log.insert_any(e) {
                 Ok(Inserted::Added(_)) => changed = true,
                 Ok(Inserted::Held(_)) => {}
                 Ok(Inserted::Duplicate) | Err(_) => continue,
             }
-            self.keep(id, bytes)?;
+            if own {
+                self.keep(id, bytes)?;
+            }
+            for a in self.log.take_attached() {
+                changed = true;
+                self.keep(a.id(), &a.encode())?;
+            }
         }
         Ok(changed)
     }
@@ -1171,6 +1187,8 @@ impl Core {
             for e in entries {
                 let _ = log.insert_any(e);
             }
+            // already stored
+            let _ = log.take_attached();
             let other = OtherLog {
                 log,
                 file,
@@ -2223,6 +2241,8 @@ impl Core {
         for e in entries {
             let _ = log.insert_any(e);
         }
+        // already stored
+        let _ = log.take_attached();
         let mut set = MemSet::new();
         for id in locs.keys() {
             set.insert(*id);

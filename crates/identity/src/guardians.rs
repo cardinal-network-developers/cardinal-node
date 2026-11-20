@@ -657,6 +657,7 @@ fn recovery_of(e: &IdentityEntry) -> Option<Recovery> {
 mod tests {
     use super::*;
     use crate::log::{evaluate_together, Created, DeviceKeys};
+    use crate::Inserted;
     use crate::Power;
     use cardinal_crypto::RecoveryPhrase;
 
@@ -951,6 +952,63 @@ mod tests {
         let gk = p.log.rebuild_guardian_key(&r, &link).unwrap();
         let enc = p.log.open_with_guardian_key(&gk, &policy.entry).unwrap();
         assert_eq!(enc.public_key(), &enc_public);
+    }
+
+    /// Other identities' entries are kept under a log's label only as the
+    /// past of a guardian's act on it: unrelated logs, and acts of those
+    /// who are not guardians, are not kept, evaluated, or waited for, and
+    /// what waits is bounded.
+    #[test]
+    fn only_a_guardians_act_and_its_past_are_kept() {
+        let (mut p, mut gs) = guarded();
+        let before = p.log.state();
+        for n in 10..40u8 {
+            let mut x = person(n);
+            x.log
+                .append(&x.device.signing, vec![IdentityOp::wrap(&[])])
+                .unwrap();
+            for e in x.log.entries().cloned().collect::<Vec<_>>() {
+                assert!(matches!(p.log.attach(e), Ok(Inserted::Held(_))));
+            }
+        }
+        // entries whose genesis never comes
+        let mut far = person(50);
+        for _ in 0..(crate::log::MAX_PENDING + 10) {
+            far.log
+                .append(&far.device.signing, vec![IdentityOp::wrap(&[])])
+                .unwrap();
+        }
+        for e in far.log.entries().skip(1).cloned().collect::<Vec<_>>() {
+            let _ = p.log.attach(e);
+        }
+        assert_eq!(p.log.attached().count(), 0);
+        assert!(!p.log.is_waiting());
+        assert_eq!(p.log.state().keys, before.keys);
+        assert!(p.log.take_attached().is_empty());
+        // a guardian's endorsement, its genesis last, is kept with its past
+        let phrase = RecoveryPhrase::from_entropy(&[42; 32]);
+        let policy = p.log.current_policy().unwrap();
+        let rec = p
+            .log
+            .recover_entry(
+                &p.log.recovery_parents(),
+                &phrase.root_signing_key(),
+                &[],
+                HybridKeyPair::generate().public_key(),
+                policy.entry,
+                phrase.recovery_key_pair().public_key(),
+            )
+            .unwrap();
+        let decision = rec.id();
+        p.log.insert(rec).unwrap();
+        let mut entries = act(&mut gs[0], &p.log, &decision, false);
+        entries.reverse();
+        for e in entries {
+            let _ = p.log.attach(e);
+        }
+        assert_eq!(p.log.attached().count(), 1);
+        assert_eq!(p.log.take_attached().len(), gs[0].log.len());
+        assert!(!p.log.is_waiting());
     }
 
     #[test]

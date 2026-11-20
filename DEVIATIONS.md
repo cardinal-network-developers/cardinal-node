@@ -442,9 +442,13 @@ shares. What differs or was read:
   identities' entries under a label as attached logs
   (`IdentityLog::attach`), evaluate the log with them, serve them with the
   set, and name their heads in notices, so that another guardian, who need
-  not know this one, gets them from the person's host. Anyone who may send
-  objects of the label may attach entries of any identity; they are kept,
-  without a bound.
+  not know this one, gets them from the person's host. Only the causal
+  past of an `endorse` or `confirm` naming a decision in the log, whose
+  position and salt open that decision's policy's commitment for its
+  writer, is kept; other identities' entries wait for such an act, at
+  most 512, the oldest dropped, and are neither evaluated, stored nor
+  served. A confirmation makes evaluation wait only for a decision of
+  another log, and only when its signer is a key its own log names.
 - **Reading: the delay's clock.** A guardian's wait starts when its own
   device first saw a threshold of endorsements (kept in `guarding.json`),
   and doubles if a valid `object` naming the recovery is in the log by the
