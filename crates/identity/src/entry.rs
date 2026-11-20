@@ -426,6 +426,80 @@ impl IdentityOp {
         IdentityOp::from_record(r)
     }
 
+    /// `set_recovery` naming guardians by their commitments, with their
+    /// sealed records, and, for data recovery, the guardian key and a
+    /// recovery wrap of the current encryption key to it.
+    #[allow(clippy::too_many_arguments)]
+    pub fn set_recovery(
+        commitments: &[[u8; 32]],
+        threshold: u64,
+        delay: u64,
+        guardian_records: &[Sealed],
+        guardian_key: Option<&HybridPublicKey>,
+        recovery_wraps: &[Sealed],
+        changes: Option<EntryId>,
+        controller: Option<KeyId>,
+    ) -> IdentityOp {
+        let r = Record::new()
+            .with(0, 5u32)
+            .with(1, Value::list(commitments.iter().map(|c| Value::from(*c))))
+            .with(2, threshold)
+            .with(3, delay)
+            .with(
+                4,
+                Value::list(guardian_records.iter().map(Sealed::to_record)),
+            )
+            .with_opt(5, guardian_key.map(|k| k.to_record()))
+            .with(6, Value::list(recovery_wraps.iter().map(Sealed::to_record)))
+            .with_opt(7, changes)
+            .with_opt(8, controller);
+        IdentityOp::from_record(r)
+    }
+
+    /// `recover`.
+    pub fn recover(
+        root: KeyId,
+        keep: &[KeyId],
+        link_key: &HybridPublicKey,
+        policy: EntryId,
+        recovery_key: &HybridPublicKey,
+    ) -> IdentityOp {
+        let r = Record::new()
+            .with(0, 6u32)
+            .with(1, root)
+            .with(2, Value::list(keep.iter().map(|k| Value::from(*k))))
+            .with(3, link_key.to_record())
+            .with(4, policy)
+            .with(5, recovery_key.to_record());
+        IdentityOp::from_record(r)
+    }
+
+    /// `endorse`, for the guardian's own log.
+    pub fn endorse(decision: EntryId, position: u64, salt: [u8; 32]) -> IdentityOp {
+        let r = Record::new()
+            .with(0, 7u32)
+            .with(1, decision)
+            .with(2, position)
+            .with(3, salt);
+        IdentityOp::from_record(r)
+    }
+
+    /// `confirm`, for the guardian's own log; `share` for recoveries only.
+    pub fn confirm(
+        decision: EntryId,
+        position: u64,
+        salt: [u8; 32],
+        share: Option<&Sealed>,
+    ) -> IdentityOp {
+        let r = Record::new()
+            .with(0, 8u32)
+            .with(1, decision)
+            .with(2, position)
+            .with(3, salt)
+            .with_opt(4, share.map(Sealed::to_record));
+        IdentityOp::from_record(r)
+    }
+
     /// `object`.
     pub fn object(decision: EntryId) -> IdentityOp {
         IdentityOp::from_record(Record::new().with(0, 9u32).with(1, decision))
