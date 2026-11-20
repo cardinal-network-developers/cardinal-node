@@ -106,8 +106,10 @@ impl Identity {
                 continue;
             }
             let id = e.id();
+            let own = e.identity() == self.log.id();
             // Another identity's entries, held under this one's label: a
             // guardian's, up to what it did (`identity.md#distribution`).
+            // They are kept only once an act shows them to be that.
             match self.log.insert_any(e) {
                 Ok(Inserted::Duplicate) => continue,
                 Ok(Inserted::Added(_)) => changed = true,
@@ -117,8 +119,15 @@ impl Identity {
                     continue;
                 }
             }
-            self.set.insert(id);
-            to_store.push(bytes.clone());
+            if own {
+                self.set.insert(id);
+                to_store.push(bytes.clone());
+            }
+            for a in self.log.take_attached() {
+                changed = true;
+                self.set.insert(a.id());
+                to_store.push(a.encode());
+            }
         }
         self.store(&to_store)?;
         Ok(changed)
@@ -164,12 +173,19 @@ impl OtherLog {
                 continue;
             }
             let id = e.id();
+            let own = e.identity() == self.log.id();
             match self.log.insert_any(e) {
                 Ok(Inserted::Added(_)) => changed = true,
                 Ok(Inserted::Held(_)) => {}
                 Ok(Inserted::Duplicate) | Err(_) => continue,
             }
-            self.keep(id, bytes)?;
+            if own {
+                self.keep(id, bytes)?;
+            }
+            for a in self.log.take_attached() {
+                changed = true;
+                self.keep(a.id(), &a.encode())?;
+            }
         }
         Ok(changed)
     }
@@ -186,6 +202,56 @@ impl OtherLog {
     fn get(&self, id: &EntryId) -> Option<Vec<u8>> {
         self.locs.get(id).and_then(|l| self.file.read(*l).ok())
     }
+}
+
+/// Restoring through guardians (`hosts.md#restore`): with `root`, the
+/// new root a recovery in effect named, the entries that add this
+/// device as an admin device to the log collected from a host, and then
+/// set a fresh encryption key whose chain carries the earlier ones
+/// (`identity.md#what-a-recovery-does`). The current key comes from the
+/// guardian key, rebuilt from the shares in the guardians'
+/// confirmations, sealed to this device's link key.
+///
+/// `log` is [`Core::joining_log`]; this takes no lock, since rebuilding
+/// the key may take a while.
+pub fn recovered_entries(
+    mut log: IdentityLog,
+    keys: &Keys,
+    root: &cardinal_crypto::SigningKey,
+) -> anyhow::Result<Vec<(Vec<u8>, [u8; 32])>> {
+    let identity = log.id();
+    let identity = &identity;
+    let st = log.state();
+    if st.power(&root.public_key()) != Some(cardinal_identity::Power::Root) {
+        anyhow::bail!(
+            "the recovery is not in effect on that device yet: your guardians have not all \
+             confirmed it, or their confirmations have not reached it"
+        );
+    }
+    let recovery = log
+        .recoveries()
+        .into_iter()
+        .find(|r| r.root == root.public_key() && st.in_effect.contains(&r.entry))
+        .ok_or_else(|| anyhow::anyhow!("no recovery in that log names this device's root"))?;
+    let guardian_key = log
+        .rebuild_guardian_key(&recovery, &keys.device.link)
+        .map_err(|e| anyhow::anyhow!("cannot rebuild the guardian key from the shares: {e}"))?;
+    let enc = log.open_with_guardian_key(&guardian_key, &recovery.policy)?;
+    let current = log
+        .key_chain(enc)
+        .into_iter()
+        .next()
+        .expect("the key itself");
+    let request = keys
+        .device
+        .request(identity, cardinal_identity::Power::Admin);
+    let added = log.add_key(root, &request, Some(&current))?;
+    let fresh = HybridKeyPair::generate();
+    let rotated = log.set_encryption_key(root, &fresh, Some(&current))?;
+    Ok(vec![
+        (added.encode(), added.id()),
+        (rotated.encode(), rotated.id()),
+    ])
 }
 
 /// Sealed entries written, by space.
@@ -1142,6 +1208,8 @@ impl Core {
             for e in entries {
                 let _ = log.insert_any(e);
             }
+            // already stored
+            let _ = log.take_attached();
             let other = OtherLog {
                 log,
                 file,
@@ -2233,6 +2301,8 @@ impl Core {
         for e in entries {
             let _ = log.insert_any(e);
         }
+        // already stored
+        let _ = log.take_attached();
         let mut set = MemSet::new();
         for id in locs.keys() {
             set.insert(*id);
@@ -2519,55 +2589,6 @@ impl Core {
         Ok((entry.encode(), entry.id()))
     }
 
-    /// Restoring through guardians (`hosts.md#restore`): with `root`, the
-    /// new root a recovery in effect named, the entries that add this
-    /// device as an admin device to the log collected from a host, and then
-    /// set a fresh encryption key whose chain carries the earlier ones
-    /// (`identity.md#what-a-recovery-does`). The current key comes from the
-    /// guardian key, rebuilt from the shares in the guardians'
-    /// confirmations, sealed to this device's link key.
-    pub fn add_recovered_device(
-        &self,
-        identity: &[u8; 32],
-        root: &cardinal_crypto::SigningKey,
-    ) -> anyhow::Result<Vec<(Vec<u8>, [u8; 32])>> {
-        let mut log = self
-            .joining_log(identity)
-            .ok_or_else(|| anyhow::anyhow!("that device did not send the identity log"))?;
-        let st = log.state();
-        if st.power(&root.public_key()) != Some(cardinal_identity::Power::Root) {
-            anyhow::bail!(
-                "the recovery is not in effect on that device yet: your guardians have not all \
-                 confirmed it, or their confirmations have not reached it"
-            );
-        }
-        let recovery = log
-            .recoveries()
-            .into_iter()
-            .find(|r| r.root == root.public_key() && st.in_effect.contains(&r.entry))
-            .ok_or_else(|| anyhow::anyhow!("no recovery in that log names this device's root"))?;
-        let guardian_key = log
-            .rebuild_guardian_key(&recovery, &self.keys.device.link)
-            .map_err(|e| anyhow::anyhow!("cannot rebuild the guardian key from the shares: {e}"))?;
-        let enc = log.open_with_guardian_key(&guardian_key, &recovery.policy)?;
-        let current = log
-            .key_chain(enc)
-            .into_iter()
-            .next()
-            .expect("the key itself");
-        let request = self
-            .keys
-            .device
-            .request(identity, cardinal_identity::Power::Admin);
-        let added = log.add_key(root, &request, Some(&current))?;
-        let fresh = HybridKeyPair::generate();
-        let rotated = log.set_encryption_key(root, &fresh, Some(&current))?;
-        Ok(vec![
-            (added.encode(), added.id()),
-            (rotated.encode(), rotated.id()),
-        ])
-    }
-
     /// Adds sealed entries of a space, creating the holder if needed.
     pub fn ingest_space(
         &mut self,
@@ -2681,56 +2702,89 @@ impl Core {
             .sum()
     }
 
-    /// Keeps the work of removed keys that nothing witnessed, in every
-    /// space held (`spaces.md#members-and-roles`: "a person can keep their
-    /// old work ... after a recovery that kept none of their keys"): a
-    /// `keep` op listing, for each such key, its latest unwitnessed
-    /// entries, which covers those before them. `only` limits it to some
-    /// keys. Returns what was written, by space, and how many entries are
-    /// kept.
-    pub fn keep_work(
-        &mut self,
-        only: Option<&[KeyId]>,
-    ) -> anyhow::Result<(Written, usize)> {
+    /// The work of `key`, a device or admin key this person's log once
+    /// named and has since removed, that nothing witnessed: in each space
+    /// held, its own entries set aside, with the time each says it was
+    /// written (`spaces.md#authors`). Other members' keys are not this
+    /// person's to keep.
+    pub fn unwitnessed_work(
+        &self,
+        key: &KeyId,
+    ) -> anyhow::Result<Vec<(SpaceId, EntryId, Option<u64>)>> {
         let ident = self
             .identity
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("this device has no identity yet"))?;
-        let st = ident.state();
-        let mut written = Vec::new();
-        let mut kept = 0;
-        let ids: Vec<SpaceId> = self.spaces.keys().copied().collect();
-        for id in ids {
-            let h = self.spaces.get_mut(&id).expect("held");
+        let me = ident.id();
+        let named = ident.log.entries().any(|e| {
+            e.ops().iter().any(|o| {
+                matches!(o.body(), cardinal_identity::OpBody::AddKey { key: k, power, .. }
+                    if k == key && *power < 3)
+            })
+        });
+        anyhow::ensure!(named, "that is not one of your devices");
+        anyhow::ensure!(
+            ident.state().power(key).is_none(),
+            "that device is still one of yours: its work counts as it is"
+        );
+        let mut out = Vec::new();
+        for (id, h) in &self.spaces {
             let Some(space) = h.space.as_ref() else {
                 continue;
             };
-            let dag = space.dag();
-            let unwitnessed = &space.validity().unwitnessed;
-            let mut by_key: BTreeMap<KeyId, Vec<EntryId>> = BTreeMap::new();
-            for x in unwitnessed {
-                let Some(e) = dag.get(x) else { continue };
-                let k = e.signer();
-                if st.power(&k).is_some() || only.is_some_and(|o| !o.contains(&k)) {
+            for x in &space.validity().unwitnessed {
+                let Some(e) = space.dag().get(x) else {
                     continue;
+                };
+                if e.signer() == *key && e.author() == me {
+                    out.push((*id, *x, e.time()));
                 }
-                by_key.entry(k).or_default().push(*x);
             }
-            if by_key.is_empty() {
-                continue;
+        }
+        out.sort_by_key(|(s, x, t)| (*t, *s, *x));
+        Ok(out)
+    }
+
+    /// Keeps the work of `key` that nothing witnessed, written up to
+    /// `up_to` (milliseconds since the epoch, by the device's own clock;
+    /// everything if `None`), in every space held: a `keep` op listing
+    /// the latest of those entries, which covers the ones before them.
+    /// What the person does not recognize, after the point they choose,
+    /// stays set aside (`spaces.md#authors`). Returns what was written, by
+    /// space, and how many entries are kept.
+    pub fn keep_work(
+        &mut self,
+        key: &KeyId,
+        up_to: Option<u64>,
+    ) -> anyhow::Result<(Written, usize)> {
+        let work = self.unwitnessed_work(key)?;
+        let mut by_space: BTreeMap<SpaceId, Vec<EntryId>> = BTreeMap::new();
+        for (space, x, t) in work {
+            let wanted = match (up_to, t) {
+                (None, _) => true,
+                (Some(u), Some(t)) => t <= u,
+                (Some(_), None) => false,
+            };
+            if wanted {
+                by_space.entry(space).or_default().push(x);
             }
-            let mut ops = Vec::new();
-            for (k, xs) in by_key {
-                kept += xs.len();
-                let mut latest: Vec<EntryId> = xs
-                    .iter()
-                    .filter(|x| !xs.iter().any(|y| y != *x && dag.is_ancestor(x, y)))
-                    .copied()
-                    .collect();
-                latest.sort();
-                ops.push(SpaceOp::keep(k, &latest));
-            }
-            let bytes = h.write_keeps(ident, &self.keys, ops)?;
+        }
+        let ident = self.identity.as_ref().expect("checked");
+        let mut written = Vec::new();
+        let mut kept = 0;
+        for (id, xs) in by_space {
+            let h = self.spaces.get_mut(&id).expect("held");
+            let dag = h.space.as_ref().expect("open").dag();
+            // An entry kept keeps its ancestors, so a later one past the
+            // point must not be listed: only the latest within it are.
+            let mut latest: Vec<EntryId> = xs
+                .iter()
+                .filter(|x| !xs.iter().any(|y| y != *x && dag.is_ancestor(x, y)))
+                .copied()
+                .collect();
+            latest.sort();
+            kept += xs.len();
+            let bytes = h.write_keeps(ident, &self.keys, vec![SpaceOp::keep(*key, &latest)])?;
             written.push((id, bytes));
         }
         let ids: Vec<SpaceId> = written.iter().map(|(id, _)| *id).collect();

@@ -507,7 +507,11 @@ async fn handle(d: &Arc<Daemon>, req: &Value) -> anyhow::Result<Value> {
             crate::guardians::confirm(d, arg(req, "who")?, arg(req, "fingerprint")?).await
         }
         "recover" => crate::recovering::status(d),
-        "keep-work" => crate::recovering::keep_work(d, req.get("name").and_then(Value::as_str)),
+        "keep-work" => crate::recovering::keep_work(
+            d,
+            arg(req, "name")?,
+            req.get("up_to").and_then(Value::as_str),
+        ),
         "recover-via" => {
             crate::recovering::via(d, arg(req, "code")?, req.get("key").and_then(Value::as_str))
                 .await

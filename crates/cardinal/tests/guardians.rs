@@ -208,7 +208,20 @@ fn guardians_give_an_identity_back() {
         nuc.cli(&["guardians"]).contains("2 of your 3 guardians")
     });
 
-    // The laptop is lost, and the words with it.
+    // The laptop is stolen: what is written on it after this point is not
+    // the person's.
+    std::thread::sleep(Duration::from_millis(1100));
+    let stolen_at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis()
+        .to_string();
+    std::thread::sleep(Duration::from_millis(1100));
+    std::fs::write(laptop.p("notes.txt"), "the thief's\n").unwrap();
+    laptop.cli(&["flush"]);
+    wait("the host holds the thief's change", 30, || {
+        read(&nuc.p("notes.txt")).as_deref() == Some("the thief's\n")
+    });
     laptop.stop();
     drop(laptop);
     wait("bo reaches ana's host", 60, || {
@@ -300,9 +313,17 @@ fn guardians_give_an_identity_back() {
     let new_words = words_from(&finished);
     assert_ne!(new_words, words);
     new.wait_mounted();
-    // What the lost laptop wrote is set aside until the person keeps it.
+    // What the lost laptop wrote is set aside until the person keeps it,
+    // up to the point they choose: not what the thief wrote.
+    wait("the laptop's work is listed", 40, || {
+        new.cli(&["keep-work", "laptop"])
+            .contains("changes of laptop are set aside")
+            && !new.cli(&["keep-work", "laptop"]).starts_with("0 ")
+    });
+    let o = new.try_cli(&["keep-work", "bo", "--up-to", "all"]);
+    assert!(!o.status.success(), "{}", out(&o));
     wait("the new device has the file", 40, || {
-        new.cli(&["keep-work", "laptop"]);
+        new.cli(&["keep-work", "laptop", "--up-to", &stolen_at]);
         read(&new.p("notes.txt")).as_deref() == Some("before the loss\n")
     });
     // It works: changes go both ways.

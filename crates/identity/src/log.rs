@@ -198,9 +198,20 @@ pub struct IdentityLog {
     /// software delivers to the guarded identity
     /// (`identity.md#distribution`). Evaluating this log reads them.
     attached: BTreeMap<EntryId, IdentityLog>,
-    /// Attached entries whose log's genesis has not arrived.
-    unattached: Vec<IdentityEntry>,
+    /// Other identities' entries not (yet) part of a guardian's act on
+    /// this log: held until an act makes them its past, at most
+    /// [`MAX_PENDING`], the oldest dropped first. Never evaluated or
+    /// served.
+    unattached: std::collections::VecDeque<IdentityEntry>,
+    unattached_ids: HashSet<EntryId>,
+    /// Entries of other identities newly kept, until taken
+    /// ([`take_attached`](IdentityLog::take_attached)).
+    promoted: Vec<EntryId>,
 }
+
+/// The most entries of other identities held while nothing shows them to
+/// be a guardian's act on a log.
+pub const MAX_PENDING: usize = 512;
 
 /// The result of creating an identity.
 pub struct Created {
@@ -260,7 +271,9 @@ impl IdentityLog {
             dag,
             state: Mutex::new(None),
             attached: BTreeMap::new(),
-            unattached: Vec::new(),
+            unattached: std::collections::VecDeque::new(),
+            unattached_ids: HashSet::new(),
+            promoted: Vec::new(),
         })
     }
 
@@ -362,9 +375,12 @@ impl IdentityLog {
     /// Whether entries are waiting for parents, here or in a log held
     /// under this one's label.
     pub fn is_waiting(&self) -> bool {
+        // and an act on this log whose past is not all here
         self.dag.held().next().is_some()
-            || !self.unattached.is_empty()
-            || self.attached.values().any(|l| l.is_waiting())
+            || self
+                .unattached
+                .iter()
+                .any(|e| self.is_act_here(&e.identity(), e))
     }
 
     /// The heads of this log, then of each log held under its label: what
@@ -409,8 +425,26 @@ impl IdentityLog {
         let r = self.dag.insert(entry.id(), entry.parents().to_vec(), entry);
         if matches!(r, Inserted::Added(_)) {
             *self.state.get_mut().expect("lock") = None;
+            // a decision arriving after the acts on it
+            if !self.unattached.is_empty() {
+                let waiting: BTreeSet<EntryId> =
+                    self.unattached.iter().map(|e| e.identity()).collect();
+                for of in waiting {
+                    self.promote(&of);
+                }
+            }
         }
         Ok(r)
+    }
+
+    /// The entries of other identities kept since this was last asked, in
+    /// the order they were kept: what to store and serve under this log's
+    /// label.
+    pub fn take_attached(&mut self) -> Vec<IdentityEntry> {
+        let ids = std::mem::take(&mut self.promoted);
+        ids.iter()
+            .filter_map(|id| self.attached.values().find_map(|l| l.get(id)).cloned())
+            .collect()
     }
 
     /// Decodes and adds an entry.
@@ -430,44 +464,151 @@ impl IdentityLog {
 
     /// Adds an entry of another identity's log, held under this one's
     /// label: a guardian's, delivered with its `endorse` or `confirm`.
-    /// Entries that come before their log's genesis wait for it.
+    ///
+    /// Only the causal past of an act of a guardian on this log is kept: an
+    /// `endorse` or `confirm` naming a decision here, whose position and
+    /// salt open a commitment of that decision's policy for the identity
+    /// that wrote it. Anything else waits, bounded, for such an act, and is
+    /// not evaluated or served. `Added` lists every entry newly kept.
     pub fn attach(&mut self, entry: IdentityEntry) -> Result<Inserted, Error> {
         let of = entry.identity();
         if of == self.id {
             return Err(Error::WrongIdentity);
         }
-        let r = match self.attached.get_mut(&of) {
-            Some(log) => log.insert(entry)?,
-            None if entry.is_genesis() => {
-                let id = entry.id();
-                let mut log = IdentityLog::from_genesis(entry)?;
-                let (mine, rest): (Vec<IdentityEntry>, Vec<IdentityEntry>) =
-                    std::mem::take(&mut self.unattached)
-                        .into_iter()
-                        .partition(|e| e.identity() == of);
-                self.unattached = rest;
-                let mut added = vec![id];
-                for e in mine {
-                    if let Ok(Inserted::Added(ids)) = log.insert(e) {
-                        added.extend(ids);
-                    }
-                }
-                self.attached.insert(of, log);
-                Inserted::Added(added)
+        let id = entry.id();
+        if self.unattached_ids.contains(&id)
+            || self
+                .attached
+                .get(&of)
+                .is_some_and(|l| l.dag.contains(&id) || l.dag.is_held(&id))
+        {
+            return Ok(Inserted::Duplicate);
+        }
+        self.unattached_ids.insert(id);
+        self.unattached.push_back(entry);
+        while self.unattached.len() > MAX_PENDING {
+            if let Some(old) = self.unattached.pop_front() {
+                self.unattached_ids.remove(&old.id());
             }
-            None => {
-                if self.unattached.iter().any(|e| e.id() == entry.id()) {
-                    return Ok(Inserted::Duplicate);
+        }
+        let added = self.promote(&of);
+        if added.is_empty() {
+            return Ok(Inserted::Held(vec![id]));
+        }
+        *self.state.get_mut().expect("lock") = None;
+        Ok(Inserted::Added(added))
+    }
+
+    /// Whether `e`, of identity `of`, is a guardian's act on this log.
+    fn is_act_here(&self, of: &EntryId, e: &IdentityEntry) -> bool {
+        e.ops().iter().any(|op| {
+            let (d, pos, salt) = match op.body() {
+                OpBody::Endorse {
+                    decision,
+                    position,
+                    salt,
                 }
-                let id = entry.id();
-                self.unattached.push(entry);
-                Inserted::Held(vec![id])
+                | OpBody::Confirm {
+                    decision,
+                    position,
+                    salt,
+                    ..
+                } => (decision, *position, salt),
+                _ => return false,
+            };
+            let Some(de) = self.dag.get(d) else {
+                return false;
+            };
+            let policy = de.ops().iter().find_map(|o| match o.body() {
+                OpBody::Recover { policy, .. } => Some(*policy),
+                OpBody::SetRecovery {
+                    changes: Some(p), ..
+                } => Some(*p),
+                _ => None,
+            });
+            let Some(commitments) = policy.and_then(|p| self.dag.get(&p)).and_then(|pe| {
+                pe.ops().iter().find_map(|o| match o.body() {
+                    OpBody::SetRecovery { commitments, .. } => Some(commitments.clone()),
+                    _ => None,
+                })
+            }) else {
+                return false;
+            };
+            pos >= 1
+                && (pos as usize) <= commitments.len()
+                && commitments[pos as usize - 1] == guardian_commitment(salt, of)
+        })
+    }
+
+    /// Moves `of`'s waiting entries that are the past of an act on this
+    /// log into its attached log. Returns the ids moved.
+    fn promote(&mut self, of: &EntryId) -> Vec<EntryId> {
+        let mine: Vec<IdentityEntry> = self
+            .unattached
+            .iter()
+            .filter(|e| e.identity() == *of)
+            .cloned()
+            .collect();
+        let genesis = self
+            .attached
+            .get(of)
+            .and_then(|l| l.get(&l.id).cloned())
+            .or_else(|| mine.iter().find(|e| e.is_genesis()).cloned());
+        let Some(genesis) = genesis else {
+            return Vec::new();
+        };
+        let Ok(mut all) = IdentityLog::from_genesis(genesis) else {
+            return Vec::new();
+        };
+        if let Some(l) = self.attached.get(of) {
+            for e in l.entries() {
+                let _ = all.insert(e.clone());
+            }
+        }
+        for e in &mine {
+            if !e.is_genesis() {
+                let _ = all.insert(e.clone());
+            }
+        }
+        let acts: Vec<EntryId> = all
+            .entries()
+            .filter(|e| self.is_act_here(of, e))
+            .map(|e| e.id())
+            .collect();
+        let mut keep: HashSet<EntryId> = all.dag.ancestors_of(&acts);
+        keep.extend(acts.iter().copied());
+        let have = |id: &EntryId| self.attached.get(of).is_some_and(|l| l.dag.contains(id));
+        let new: Vec<EntryId> = all
+            .dag
+            .log_order()
+            .iter()
+            .filter(|id| keep.contains(*id) && !have(id))
+            .copied()
+            .collect();
+        if new.is_empty() {
+            return Vec::new();
+        }
+        let target = match self.attached.remove(of) {
+            Some(l) => l,
+            None => {
+                let g = all.get(&all.id).expect("genesis").clone();
+                IdentityLog::from_genesis(g).expect("checked")
             }
         };
-        if matches!(r, Inserted::Added(_)) {
-            *self.state.get_mut().expect("lock") = None;
+        let mut target = target;
+        for id in &new {
+            let e = all.get(id).expect("held").clone();
+            let _ = target.insert(e);
         }
-        Ok(r)
+        self.attached.insert(*of, target);
+        let moved: HashSet<EntryId> = new.iter().copied().collect();
+        self.unattached.retain(|e| !moved.contains(&e.id()));
+        for id in &new {
+            self.unattached_ids.remove(id);
+        }
+        self.promoted.extend(new.iter().copied());
+        *self.state.get_mut().expect("lock") = None;
+        new
     }
 
     /// The other identities' logs held under this one's label.
@@ -480,12 +621,9 @@ impl IdentityLog {
         self.attached.get(identity)
     }
 
-    /// Whether an attached entry is held (or waits for its genesis).
+    /// Whether an attached entry is held.
     pub fn has_attached(&self, id: &EntryId) -> bool {
-        self.attached
-            .values()
-            .any(|l| l.dag.contains(id) || l.dag.is_held(id))
-            || self.unattached.iter().any(|e| e.id() == *id)
+        self.attached.values().any(|l| l.dag.contains(id))
     }
 
     /// The evaluated state of this log alone.
@@ -993,6 +1131,31 @@ impl<'a> Conversion<'a> {
                 }
             }
         }
+        // A confirmation is a reference to another log's entry only where
+        // it can count: it names a decision (a `recover`, or a
+        // `set_recovery` after genesis) of another log, and its signer is a
+        // key its own log names. Anything else reads as an endorsement, so
+        // that no entry can make others wait on what it names.
+        let decisions: HashSet<EntryId> = under.keys().copied().collect();
+        let mut named: HashMap<EntryId, HashSet<KeyId>> = HashMap::new();
+        for (l, e) in all.values() {
+            for op in e.ops() {
+                match op.body() {
+                    OpBody::AddKey { key, .. } => {
+                        named.entry(l.id).or_default().insert(*key);
+                    }
+                    OpBody::Recover { root, .. } => {
+                        named.entry(l.id).or_default().insert(*root);
+                    }
+                    _ => {}
+                }
+            }
+        }
+        let refers = |l: &IdentityLog, e: &IdentityEntry, d: &EntryId| {
+            decisions.contains(d)
+                && all.get(d).is_some_and(|(dl, _)| dl.id != l.id)
+                && named.get(&l.id).is_some_and(|k| k.contains(&e.signer()))
+        };
         // insert in an order that puts parents and confirmed decisions
         // first
         let mut queues: Vec<Vec<&IdentityEntry>> = logs
@@ -1010,7 +1173,7 @@ impl<'a> Conversion<'a> {
                 while let Some(e) = q.last() {
                     let waits = e.ops().iter().any(|o| match o.body() {
                         OpBody::Confirm { decision, .. } => {
-                            all.contains_key(decision) && !placed.contains(decision)
+                            refers(logs[li], e, decision) && !placed.contains(decision)
                         }
                         _ => false,
                     });
@@ -1018,7 +1181,8 @@ impl<'a> Conversion<'a> {
                         break;
                     }
                     let e = q.pop().expect("entry");
-                    let entry = convert(&mut world, logs[li], e, &all, &revealed);
+                    let ok = |d: &EntryId| refers(logs[li], e, d);
+                    let entry = convert(&mut world, logs[li], e, &ok, &revealed);
                     world
                         .put(entry)
                         .expect("parents and decisions are placed first");
@@ -1026,9 +1190,19 @@ impl<'a> Conversion<'a> {
                     progress = true;
                 }
             }
-            if !progress {
-                break;
+            if progress {
+                continue;
             }
+            // Confirmations waiting on each other in a cycle: the first one
+            // blocked is placed with its confirmations read as endorsements,
+            // rather than leaving it and everything after it out.
+            let Some(li) = queues.iter().position(|q| !q.is_empty()) else {
+                break;
+            };
+            let e = queues[li].pop().expect("entry");
+            let entry = convert(&mut world, logs[li], e, &|_| false, &revealed);
+            world.put(entry).expect("parents are placed first");
+            placed.insert(e.id());
         }
         Conversion {
             world,
@@ -1169,7 +1343,7 @@ fn convert(
     w: &mut World,
     log: &IdentityLog,
     e: &IdentityEntry,
-    all: &HashMap<EntryId, (&IdentityLog, &IdentityEntry)>,
+    refers: &dyn Fn(&EntryId) -> bool,
     revealed: &HashMap<EntryId, BTreeSet<EntryId>>,
 ) -> model::Entry {
     let mut sym = |b: &[u8; 32]| w.sym(&hex_encode(b));
@@ -1234,7 +1408,7 @@ fn convert(
             },
             OpBody::Endorse { .. } => Op::Endorse,
             OpBody::Confirm { decision, .. } => {
-                if all.contains_key(decision) {
+                if refers(decision) {
                     Op::Confirm {
                         decision: sym(decision),
                     }
@@ -1342,6 +1516,63 @@ mod tests {
         assert_eq!(st.power(&admin.key()), None);
         assert_eq!(st.power(&added.key()), Some(Power::Device));
         assert_eq!(st.power(&other.key()), Some(Power::Device));
+    }
+
+    /// Confirmations that name what is not a decision, from anyone, cannot
+    /// make the person's own entries wait: an attacker who may send
+    /// entries under the person's label attaches A1 = confirm(P_x) and A2,
+    /// and pushes junk J beside P_x, sorting before it, holding
+    /// confirm(A2). Before, J waited on A2, A2 on A1, A1 on P_x, and P_x and
+    /// everything after it were never placed.
+    #[test]
+    fn confirmations_of_anything_cannot_stall_a_log() {
+        let d1 = DeviceKeys::generate();
+        let Created {
+            mut log,
+            encryption,
+            ..
+        } = IdentityLog::create_with(phrase(5), &d1, HybridKeyPair::generate()).unwrap();
+        let admin = DeviceKeys::generate();
+        let parents = log.heads();
+        let px = log
+            .add_key(
+                &d1.signing,
+                &admin.request(&log.id(), Power::Admin),
+                Some(&encryption),
+            )
+            .unwrap();
+        assert_eq!(log.state().power(&admin.key()), Some(Power::Admin));
+        // the attacker's own identity
+        let a = DeviceKeys::generate();
+        let Created { log: mut alog, .. } =
+            IdentityLog::create_with(phrase(6), &a, HybridKeyPair::generate()).unwrap();
+        let a1 = alog
+            .append(
+                &a.signing,
+                vec![IdentityOp::confirm(px.id(), 1, [0; 32], None)],
+            )
+            .unwrap();
+        let a2 = alog
+            .append(&a.signing, vec![IdentityOp::endorse(a1.id(), 1, [0; 32])])
+            .unwrap();
+        // junk beside P_x, ground to sort before it
+        let j = loop {
+            let k = SigningKey::generate();
+            let j = EntryBuilder::new(log.id(), &parents)
+                .op(IdentityOp::confirm(a2.id(), 1, [0; 32], None))
+                .sign(&k)
+                .unwrap();
+            if j.id() < px.id() {
+                break j;
+            }
+        };
+        log.insert(j).unwrap();
+        for e in alog.entries().cloned().collect::<Vec<_>>() {
+            let _ = log.attach(e);
+        }
+        assert_eq!(log.state().power(&admin.key()), Some(Power::Admin));
+        let together = evaluate_together(&[&log, &alog]);
+        assert_eq!(together[0].power(&admin.key()), Some(Power::Admin));
     }
 
     #[test]

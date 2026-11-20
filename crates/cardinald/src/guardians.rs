@@ -508,17 +508,30 @@ fn find_guarded(d: &Daemon, who: &str) -> anyhow::Result<Guarded> {
 fn find_wanted(d: &Daemon, g: &Guarded, fingerprint: &str) -> anyhow::Result<Wanted> {
     let mut all = wanted(d, g);
     anyhow::ensure!(!all.is_empty(), "nobody has asked to recover {}", g.name);
-    let at = all
-        .iter()
-        .position(|w| same_fingerprint(fingerprint, &w.recovery.fingerprint()))
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                "that is not the fingerprint of a recovery of {}: check it with them again. \
-                 Someone else may be trying to take their identity.",
-                g.name
-            )
-        })?;
+    let shown: Vec<String> = all.iter().map(|w| w.recovery.fingerprint()).collect();
+    let at = pick_fingerprint(&shown, fingerprint, &g.name)?;
     Ok(all.swap_remove(at))
+}
+
+/// Which of the recoveries `shown` the person read out: exactly one must
+/// match. Two that match are refused, since the fingerprint cannot tell
+/// them apart: someone may have made one to look like the other.
+fn pick_fingerprint(shown: &[String], typed: &str, name: &str) -> anyhow::Result<usize> {
+    let matching: Vec<usize> = (0..shown.len())
+        .filter(|i| same_fingerprint(typed, &shown[*i]))
+        .collect();
+    match matching.as_slice() {
+        [i] => Ok(*i),
+        [] => anyhow::bail!(
+            "that is not the fingerprint of a recovery of {name}: check it with them again. \
+             Someone else may be trying to take their identity."
+        ),
+        _ => anyhow::bail!(
+            "more than one recovery of {name} has that fingerprint, so it cannot tell them \
+             apart: someone else may be trying to take their identity. Do not endorse or \
+             confirm either until you know which is theirs."
+        ),
+    }
 }
 
 /// `cardinal guarding endorse NAME FINGERPRINT`: after checking with the
@@ -601,24 +614,41 @@ fn check_chain(d: &Daemon, g: &Guarded, recovery: &Recovery) -> anyhow::Result<(
     let core = d.core();
     let ident = core.identity.as_ref().expect("identity");
     let other = core.others.get(&g.identity).expect("guarded");
-    for e in ident.log.entries() {
+    chain_allows(&ident.log, &other.log, &g.salt, recovery, &g.name)
+}
+
+/// The chain rule, on this guardian's own log `mine` and the guarded log
+/// `theirs`. A confirmation is under this policy if it carries this
+/// guardian's salt for it, which is never used for another; one whose
+/// decision is not held here is refused too, since it cannot be shown to
+/// be in the new decision's past.
+fn chain_allows(
+    mine: &IdentityLog,
+    theirs: &IdentityLog,
+    salt: &[u8; 32],
+    recovery: &Recovery,
+    name: &str,
+) -> anyhow::Result<()> {
+    for e in mine.entries() {
         for op in e.ops() {
-            let OpBody::Confirm { decision, .. } = op.body() else {
+            let OpBody::Confirm {
+                decision, salt: s, ..
+            } = op.body()
+            else {
                 continue;
             };
-            let under = other
-                .log
-                .recovery(decision)
-                .map(|r| r.policy)
-                .or_else(|| other.log.policy(decision).and_then(|p| p.changes));
-            if under != Some(g.policy.entry) || *decision == recovery.entry {
+            if s != salt || *decision == recovery.entry {
                 continue;
             }
             anyhow::ensure!(
-                other.log.dag().is_ancestor(decision, &recovery.entry),
-                "you confirmed another decision about {} that this recovery does not know of; \
-                 confirming both would freeze their identity",
-                g.name
+                theirs.get(decision).is_some(),
+                "you confirmed a decision about {name} that this device does not hold; wait \
+                 until it has their whole log"
+            );
+            anyhow::ensure!(
+                theirs.dag().is_ancestor(decision, &recovery.entry),
+                "you confirmed another decision about {name} that this recovery does not know \
+                 of; confirming both would freeze their identity"
             );
         }
     }
@@ -898,4 +928,63 @@ async fn take_recover(d: &Arc<Daemon>, identity: &EntryId, bytes: &[u8]) -> anyh
     );
     deliver(d, identity, vec![bytes.to_vec()]).await;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use cardinal_crypto::RecoveryPhrase;
+    use cardinal_identity::{Created, DeviceKeys};
+
+    #[test]
+    fn a_fingerprint_two_recoveries_share_is_refused() {
+        let shown = vec!["ABCDE-FGHJK".to_owned(), "ZZZZZ-00000".to_owned()];
+        assert_eq!(pick_fingerprint(&shown, "abcde fghjk", "Ana").unwrap(), 0);
+        assert!(pick_fingerprint(&shown, "QQQQQ-QQQQQ", "Ana").is_err());
+        let twice = vec!["ABCDE-FGHJK".to_owned(), "ABCDE-FGHJK".to_owned()];
+        let e = pick_fingerprint(&twice, "ABCDE-FGHJK", "Ana").unwrap_err();
+        assert!(e.to_string().contains("more than one"), "{e}");
+    }
+
+    fn log(n: u8) -> (IdentityLog, DeviceKeys) {
+        let d = DeviceKeys::generate();
+        let Created { log, .. } = IdentityLog::create_with(
+            RecoveryPhrase::from_entropy(&[n; 32]),
+            &d,
+            HybridKeyPair::generate(),
+        )
+        .unwrap();
+        (log, d)
+    }
+
+    #[test]
+    fn a_confirmation_of_a_decision_not_held_stops_the_chain() {
+        let (theirs, _) = log(1);
+        let (mut mine, me) = log(2);
+        let salt = [7; 32];
+        let recovery = Recovery {
+            entry: [1; 32],
+            root: [2; 32],
+            keep: Vec::new(),
+            link_key: None,
+            policy: theirs.id(),
+        };
+        // nothing confirmed yet
+        assert!(chain_allows(&mine, &theirs, &salt, &recovery, "Ana").is_ok());
+        // a confirmation under another salt is another policy's
+        mine.append(
+            &me.signing,
+            vec![IdentityOp::confirm([9; 32], 1, [8; 32], None)],
+        )
+        .unwrap();
+        assert!(chain_allows(&mine, &theirs, &salt, &recovery, "Ana").is_ok());
+        // one under this policy, of a decision this device does not hold
+        mine.append(
+            &me.signing,
+            vec![IdentityOp::confirm([9; 32], 1, salt, None)],
+        )
+        .unwrap();
+        let e = chain_allows(&mine, &theirs, &salt, &recovery, "Ana").unwrap_err();
+        assert!(e.to_string().contains("does not hold"), "{e}");
+    }
 }

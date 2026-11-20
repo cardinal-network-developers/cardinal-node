@@ -442,9 +442,13 @@ shares. What differs or was read:
   identities' entries under a label as attached logs
   (`IdentityLog::attach`), evaluate the log with them, serve them with the
   set, and name their heads in notices, so that another guardian, who need
-  not know this one, gets them from the person's host. Anyone who may send
-  objects of the label may attach entries of any identity; they are kept,
-  without a bound.
+  not know this one, gets them from the person's host. Only the causal
+  past of an `endorse` or `confirm` naming a decision in the log, whose
+  position and salt open that decision's policy's commitment for its
+  writer, is kept; other identities' entries wait for such an act, at
+  most 512, the oldest dropped, and are neither evaluated, stored nor
+  served. A confirmation makes evaluation wait only for a decision of
+  another log, and only when its signer is a key its own log names.
 - **Reading: the delay's clock.** A guardian's wait starts when its own
   device first saw a threshold of endorsements (kept in `guarding.json`),
   and doubles if a valid `object` naming the recovery is in the log by the
@@ -469,14 +473,18 @@ shares. What differs or was read:
   one. The words for the new root are shown then.
 - **Reading: keeping a lost device's work after a recovery.** A recovery
   that kept none of the old keys leaves everything they wrote unwitnessed,
-  every space's genesis included; the spec lets the person keep it with
-  `keep`. `cardinal keep-work [DEVICE]` writes, in every space held, a
-  `keep` per removed key listing its latest unwitnessed entries, on every
-  head of the graph, valid or set aside (with nothing valid there is
-  nothing else to build on), sealed under the current epoch or a head's.
-  It keeps all of it: choosing "up to the point they choose" is not
-  offered. `cardinal status --json` gives per space how many entries are
-  valid and set aside.
+  every space's genesis included; the spec lets the person keep "those
+  the person recognizes, up to the point they choose". `cardinal
+  keep-work DEVICE` lists that device's set-aside entries with the time
+  each says it was written, and `--up-to TIME|all` writes, in each space,
+  a `keep` listing the latest of those written by then, on every head of
+  the graph, valid or set aside (with nothing valid there is nothing else
+  to build on), sealed under the current epoch or a head's. Only a device
+  or admin key the person's own log named and has removed, and only the
+  person's own entries, can be kept. The point is the device's own clock,
+  which a thief controls: entries with no time are kept only with `all`.
+  `cardinal status --json` gives per space how many entries are valid and
+  set aside.
 - **Fixed on the way: a contact's log arriving as heads only.** A notice
   too big to carry its entries names heads; a contact's log whose new
   head's parents were missing was left waiting. Such a log now reports

@@ -28,6 +28,9 @@ pub const DEFAULT_DELAY: u64 = 7 * 24 * 60 * 60;
 /// The most guardians a policy may name: a share's x is one byte.
 pub const MAX_GUARDIANS: usize = 32;
 
+/// The most sets of shares tried when rebuilding a guardian key.
+pub const MAX_COMBINATIONS: usize = 20_000;
+
 fn context(prefix: &[u8], binding: &[u8; 32]) -> Vec<u8> {
     [prefix, binding].concat()
 }
@@ -524,16 +527,26 @@ impl IdentityLog {
             .ok_or(Error::Malformed("the policy is not here"))?;
         let want = policy.guardian_key.clone().ok_or(Error::NoEncryptionKey)?;
         let ctx = context(RECOVERY_SHARE_CONTEXT, &self.id());
+        // One share per guardian, at the guardian's own position: a share
+        // claiming another position is not theirs to give. Shares come
+        // only from confirmations; an endorsement carries none.
         let mut by_x: BTreeMap<u8, Share> = BTreeMap::new();
+        let mut guardians: BTreeSet<EntryId> = BTreeSet::new();
         for act in self.acts(&recovery.entry, &policy, &[]) {
+            if !act.confirm || guardians.contains(&act.guardian) {
+                continue;
+            }
             let Some(sealed) = act.share else { continue };
             let Ok(pt) = open(link, &sealed, &ctx) else {
                 continue;
             };
             let Ok(r) = Record::decode(&pt) else { continue };
-            if let Ok(s) = share_from(&r) {
-                by_x.entry(s.x).or_insert(s);
+            let Ok(s) = share_from(&r) else { continue };
+            if s.x as u64 != act.position || by_x.contains_key(&s.x) {
+                continue;
             }
+            guardians.insert(act.guardian);
+            by_x.insert(s.x, s);
         }
         let shares: Vec<Share> = by_x.into_values().collect();
         let t = policy.threshold as usize;
@@ -541,9 +554,15 @@ impl IdentityLog {
             return Err(Error::NoEncryptionKey);
         }
         // Any threshold of them rebuilds it; a wrong share spoils only the
-        // sets it is in.
+        // sets it is in. With one share per guardian there are at most
+        // C(n, t) sets; the search stops after MAX_COMBINATIONS anyway.
         let mut pick: Vec<usize> = (0..t).collect();
+        let mut tried = 0usize;
         loop {
+            tried += 1;
+            if tried > MAX_COMBINATIONS {
+                return Err(Error::WrongKey);
+            }
             let chosen: Vec<Share> = pick.iter().map(|i| shares[*i].clone()).collect();
             if let Some(g) = shamir::combine(&chosen) {
                 let kp = HybridKeyPair::from_seed(&g[..]);
@@ -638,6 +657,7 @@ fn recovery_of(e: &IdentityEntry) -> Option<Recovery> {
 mod tests {
     use super::*;
     use crate::log::{evaluate_together, Created, DeviceKeys};
+    use crate::Inserted;
     use crate::Power;
     use cardinal_crypto::RecoveryPhrase;
 
@@ -870,6 +890,125 @@ mod tests {
         let together = evaluate_together(&logs);
         assert_eq!(together[0].roots, p.log.state().roots);
         assert_eq!(together[0].keys, p.log.state().keys);
+    }
+
+    /// A guardian who confirms with shares at other guardians' positions
+    /// spoils nothing: only the share at its own position is its own.
+    #[test]
+    fn a_share_at_another_guardians_position_is_not_taken() {
+        let (mut p, mut gs) = guarded();
+        // the bad one is the guardian whose log is read first
+        gs.sort_by_key(|g| g.log.id());
+        let enc_public = p.log.state().encryption_key.clone().unwrap().public;
+        let phrase = RecoveryPhrase::from_entropy(&[42; 32]);
+        let link = HybridKeyPair::generate();
+        let policy = p.log.current_policy().unwrap();
+        let rec = p
+            .log
+            .recover_entry(
+                &p.log.recovery_parents(),
+                &phrase.root_signing_key(),
+                &[],
+                link.public_key(),
+                policy.entry,
+                phrase.recovery_key_pair().public_key(),
+            )
+            .unwrap();
+        let decision = rec.id();
+        p.log.insert(rec).unwrap();
+        let r = p.log.recovery(&decision).unwrap();
+        let mut positions = Vec::new();
+        for g in &gs {
+            let rec = p
+                .log
+                .guardian_record(&policy, &g.log.id(), std::slice::from_ref(&g.enc))
+                .unwrap();
+            positions.push((rec.position, rec.salt));
+        }
+        // the bad guardian: junk at each honest guardian's position
+        let (own, salt) = positions[0];
+        let mut ops = Vec::new();
+        for (x, _) in &positions[1..] {
+            let junk = Share {
+                x: *x as u8,
+                y: Zeroizing::new([9; 32]),
+            };
+            let sealed = p.log.seal_share(&r, &junk).unwrap();
+            ops.push(IdentityOp::confirm(decision, own, salt, Some(&sealed)));
+        }
+        let bad = &mut gs[0];
+        for op in ops {
+            bad.log.append(&bad.device.signing, vec![op]).unwrap();
+        }
+        for e in gs[0].log.entries().cloned().collect::<Vec<_>>() {
+            let _ = p.log.attach(e);
+        }
+        for g in gs.iter_mut().skip(1) {
+            for e in act(g, &p.log, &decision, true) {
+                let _ = p.log.attach(e);
+            }
+        }
+        assert!(p.log.state().in_effect.contains(&decision));
+        let gk = p.log.rebuild_guardian_key(&r, &link).unwrap();
+        let enc = p.log.open_with_guardian_key(&gk, &policy.entry).unwrap();
+        assert_eq!(enc.public_key(), &enc_public);
+    }
+
+    /// Other identities' entries are kept under a log's label only as the
+    /// past of a guardian's act on it: unrelated logs, and acts of those
+    /// who are not guardians, are not kept, evaluated, or waited for, and
+    /// what waits is bounded.
+    #[test]
+    fn only_a_guardians_act_and_its_past_are_kept() {
+        let (mut p, mut gs) = guarded();
+        let before = p.log.state();
+        for n in 10..40u8 {
+            let mut x = person(n);
+            x.log
+                .append(&x.device.signing, vec![IdentityOp::wrap(&[])])
+                .unwrap();
+            for e in x.log.entries().cloned().collect::<Vec<_>>() {
+                assert!(matches!(p.log.attach(e), Ok(Inserted::Held(_))));
+            }
+        }
+        // entries whose genesis never comes
+        let mut far = person(50);
+        for _ in 0..(crate::log::MAX_PENDING + 10) {
+            far.log
+                .append(&far.device.signing, vec![IdentityOp::wrap(&[])])
+                .unwrap();
+        }
+        for e in far.log.entries().skip(1).cloned().collect::<Vec<_>>() {
+            let _ = p.log.attach(e);
+        }
+        assert_eq!(p.log.attached().count(), 0);
+        assert!(!p.log.is_waiting());
+        assert_eq!(p.log.state().keys, before.keys);
+        assert!(p.log.take_attached().is_empty());
+        // a guardian's endorsement, its genesis last, is kept with its past
+        let phrase = RecoveryPhrase::from_entropy(&[42; 32]);
+        let policy = p.log.current_policy().unwrap();
+        let rec = p
+            .log
+            .recover_entry(
+                &p.log.recovery_parents(),
+                &phrase.root_signing_key(),
+                &[],
+                HybridKeyPair::generate().public_key(),
+                policy.entry,
+                phrase.recovery_key_pair().public_key(),
+            )
+            .unwrap();
+        let decision = rec.id();
+        p.log.insert(rec).unwrap();
+        let mut entries = act(&mut gs[0], &p.log, &decision, false);
+        entries.reverse();
+        for e in entries {
+            let _ = p.log.attach(e);
+        }
+        assert_eq!(p.log.attached().count(), 1);
+        assert_eq!(p.log.take_attached().len(), gs[0].log.len());
+        assert!(!p.log.is_waiting());
     }
 
     #[test]

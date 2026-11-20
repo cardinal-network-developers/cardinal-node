@@ -352,12 +352,18 @@ enum Cmd {
         #[command(subcommand)]
         cmd: Option<GuardiansCmd>,
     },
-    /// Keep what a removed device wrote that your other devices had not
-    /// built on before it was removed, as after a recovery that kept none
-    /// of your old devices. Only for work you recognize as yours.
+    /// What a removed device of yours wrote that your other devices had
+    /// not built on before it was removed, as after a recovery that kept
+    /// none of your old devices: listed, and with --up-to, kept. Keep only
+    /// what you recognize: a thief's changes with a stolen device are
+    /// among them.
     KeepWork {
-        /// The device, by the name it had; every removed one if not given.
-        name: Option<String>,
+        /// The device, by the name it had.
+        name: String,
+        /// Keep what it wrote up to this time, as listed (milliseconds), or
+        /// "all".
+        #[arg(long)]
+        up_to: Option<String>,
     },
     /// The people you guard, and any recovery of theirs under way.
     Guarding {
@@ -2205,9 +2211,27 @@ async fn client(cmd: Cmd) -> anyhow::Result<()> {
             println!("Objected. Your guardians now wait twice as long; tell them it is not you.");
             Ok(())
         }
-        Cmd::KeepWork { name } => {
-            let v = call(&paths, json!({"cmd": "keep-work", "name": name})).await?;
-            println!("Kept {} changes.", v["kept"]);
+        Cmd::KeepWork { name, up_to } => {
+            let v = call(
+                &paths,
+                json!({"cmd": "keep-work", "name": name, "up_to": up_to}),
+            )
+            .await?;
+            if up_to.is_some() {
+                println!("Kept {} changes.", v["kept"]);
+            } else {
+                let listed = v["set_aside"].as_array().cloned().unwrap_or_default();
+                println!("{} changes of {name} are set aside:", listed.len());
+                for e in listed {
+                    println!(
+                        "  {}  in space {}  written at {}",
+                        e["entry"].as_str().unwrap_or(""),
+                        e["space"].as_str().unwrap_or(""),
+                        e["time_ms"]
+                    );
+                }
+                println!("Keep those you recognize, up to a time: cardinal keep-work {name} --up-to TIME (or all)");
+            }
             Ok(())
         }
         Cmd::Guarding { cmd: None } => {
@@ -2292,7 +2316,7 @@ async fn client(cmd: Cmd) -> anyhow::Result<()> {
             .await?;
             println!("Recovered. Your files are coming back.");
             println!("What your lost devices wrote is set aside: once it has arrived, keep what");
-            println!("you recognize with `cardinal keep-work`.");
+            println!("you recognize with `cardinal keep-work DEVICE`.");
             println!();
             println!("Your new recovery words. Write them down, in order, and keep them safe:");
             println!("the old ones no longer work.");
