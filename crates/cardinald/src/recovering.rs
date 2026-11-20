@@ -291,30 +291,46 @@ pub async fn finish(d: &Arc<Daemon>, at: &str, key: &str) -> anyhow::Result<Json
     Ok(json!({"at": at, "words": under.words}))
 }
 
-/// `cardinal keep-work [NAME]`: keeps what removed devices wrote that no
-/// device of this person built on before the removal, as after a recovery
-/// that kept none of their keys. NAME, as the account space names the
-/// device, limits it to that one.
-pub fn keep_work(d: &Arc<Daemon>, name: Option<&str>) -> anyhow::Result<Json> {
-    let only: Option<Vec<KeyId>> = match name {
-        None => None,
-        Some(n) => {
-            let w = n.trim().to_lowercase();
-            let keys: Vec<KeyId> = d
-                .core()
-                .device_names()
-                .into_iter()
-                .filter(|(k, v)| v.to_lowercase() == w || hex::encode(k).starts_with(&w))
-                .map(|(k, _)| k)
-                .collect();
-            anyhow::ensure!(!keys.is_empty(), "no device was called {n:?}");
-            Some(keys)
-        }
+/// `cardinal keep-work DEVICE [--up-to all|TIME]`: what a removed device
+/// of this person's wrote that nothing witnessed, with when it says it
+/// wrote each; with `up_to`, keeps it up to that point (milliseconds since
+/// the epoch, or "all"), as after a recovery that kept none of the old
+/// keys. Only what the person recognizes should be kept: a thief's writes
+/// with a stolen device are among them (`spaces.md#authors`).
+pub fn keep_work(d: &Arc<Daemon>, name: &str, up_to: Option<&str>) -> anyhow::Result<Json> {
+    let w = name.trim().to_lowercase();
+    let keys: Vec<KeyId> = d
+        .core()
+        .device_names()
+        .into_iter()
+        .filter(|(k, v)| v.to_lowercase() == w || (!w.is_empty() && hex::encode(k).starts_with(&w)))
+        .map(|(k, _)| k)
+        .collect();
+    let key = match keys.as_slice() {
+        [] => anyhow::bail!("no device was called {name:?}"),
+        [k] => *k,
+        _ => anyhow::bail!("more than one device was called {name:?}; give the start of its key"),
     };
-    let (written, kept) = d.core().keep_work(only.as_deref())?;
+    let work = d.core().unwitnessed_work(&key)?;
+    let listed: Vec<Json> = work
+        .iter()
+        .map(|(s, x, t)| {
+            json!({"space": hex::encode(&s[..8]), "entry": hex::encode(&x[..8]), "time_ms": t})
+        })
+        .collect();
+    let Some(up_to) = up_to else {
+        return Ok(json!({"kept": 0, "set_aside": listed}));
+    };
+    let up_to = match up_to.trim() {
+        "all" => None,
+        t => Some(t.parse::<u64>().map_err(|_| {
+            anyhow::anyhow!("give the point as \"all\" or as a time in milliseconds, as listed")
+        })?),
+    };
+    let (written, kept) = d.core().keep_work(&key, up_to)?;
     for (space, bytes) in written {
         d.push(&space, vec![bytes]);
     }
     d.bump();
-    Ok(json!({"kept": kept}))
+    Ok(json!({"kept": kept, "set_aside": listed}))
 }

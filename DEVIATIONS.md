@@ -473,14 +473,18 @@ shares. What differs or was read:
   one. The words for the new root are shown then.
 - **Reading: keeping a lost device's work after a recovery.** A recovery
   that kept none of the old keys leaves everything they wrote unwitnessed,
-  every space's genesis included; the spec lets the person keep it with
-  `keep`. `cardinal keep-work [DEVICE]` writes, in every space held, a
-  `keep` per removed key listing its latest unwitnessed entries, on every
-  head of the graph, valid or set aside (with nothing valid there is
-  nothing else to build on), sealed under the current epoch or a head's.
-  It keeps all of it: choosing "up to the point they choose" is not
-  offered. `cardinal status --json` gives per space how many entries are
-  valid and set aside.
+  every space's genesis included; the spec lets the person keep "those
+  the person recognizes, up to the point they choose". `cardinal
+  keep-work DEVICE` lists that device's set-aside entries with the time
+  each says it was written, and `--up-to TIME|all` writes, in each space,
+  a `keep` listing the latest of those written by then, on every head of
+  the graph, valid or set aside (with nothing valid there is nothing else
+  to build on), sealed under the current epoch or a head's. Only a device
+  or admin key the person's own log named and has removed, and only the
+  person's own entries, can be kept. The point is the device's own clock,
+  which a thief controls: entries with no time are kept only with `all`.
+  `cardinal status --json` gives per space how many entries are valid and
+  set aside.
 - **Fixed on the way: a contact's log arriving as heads only.** A notice
   too big to carry its entries names heads; a contact's log whose new
   head's parents were missing was left waiting. Such a log now reports
