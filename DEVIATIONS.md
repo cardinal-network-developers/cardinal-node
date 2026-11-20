@@ -1524,6 +1524,10 @@ asks for around that is not built yet.
     not (Windows, Android), from the first device to answer, and only
     the hold and the day bound what that can do. What a router says of
     its own address outside is believed.
+  - **Not in the text: where a member stops being trusted,** a device that
+    named itself gives that space no new address or token: where it
+    would, it takes itself out instead. While nothing changes its entry
+    stays, as the person's agreement does.
   - **A mapping where another of the person's devices is reached** (a
     host's grant endpoints, or an address in the peer book) is given back
     with lifetime 0, and one other port outside is asked for, the same

@@ -1211,6 +1211,8 @@ pub fn keep_own_entry(d: &Arc<Daemon>) {
         let Some(reach) = due else {
             continue;
         };
+        // one made for an entry that is taken out instead is not given
+        new.retain(|t| reach.iter().any(|r| r.token == *t));
         for token in &new {
             register(d, token);
         }
@@ -2231,6 +2233,26 @@ mod tests {
         let g = h.group();
         write_reach(&h.d, &g).await.unwrap();
         assert!(h.named(&g).is_empty(), "named among the untrusted");
+    }
+
+    /// D72. Where a member stops being trusted, a device that named
+    /// itself gives no new address there: it takes itself out instead.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_device_that_named_itself_leaves_a_space_no_longer_trusted() {
+        let h = Home::new().await;
+        h.router_gives("203.0.113.5:60001");
+        write_reach(&h.d, &h.rel).await.unwrap();
+        assert_eq!(h.endpoints(&h.rel), ["203.0.113.5:60001"]);
+        h.trusts_bo(false);
+        // nothing new: the entry stays, the person's agreement stands
+        keep_own_entry(&h.d);
+        assert_eq!(h.endpoints(&h.rel), ["203.0.113.5:60001"]);
+        h.router_gives("198.51.100.7:7171");
+        assert!(
+            h.named(&h.rel).is_empty(),
+            "a new address went to the untrusted"
+        );
+        assert!(h.active().is_empty(), "a token is left");
     }
 
     /// D72. A new address is written where the device is named, newest
