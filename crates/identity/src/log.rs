@@ -993,6 +993,31 @@ impl<'a> Conversion<'a> {
                 }
             }
         }
+        // A confirmation is a reference to another log's entry only where
+        // it can count: it names a decision (a `recover`, or a
+        // `set_recovery` after genesis) of another log, and its signer is a
+        // key its own log names. Anything else reads as an endorsement, so
+        // that no entry can make others wait on what it names.
+        let decisions: HashSet<EntryId> = under.keys().copied().collect();
+        let mut named: HashMap<EntryId, HashSet<KeyId>> = HashMap::new();
+        for (l, e) in all.values() {
+            for op in e.ops() {
+                match op.body() {
+                    OpBody::AddKey { key, .. } => {
+                        named.entry(l.id).or_default().insert(*key);
+                    }
+                    OpBody::Recover { root, .. } => {
+                        named.entry(l.id).or_default().insert(*root);
+                    }
+                    _ => {}
+                }
+            }
+        }
+        let refers = |l: &IdentityLog, e: &IdentityEntry, d: &EntryId| {
+            decisions.contains(d)
+                && all.get(d).is_some_and(|(dl, _)| dl.id != l.id)
+                && named.get(&l.id).is_some_and(|k| k.contains(&e.signer()))
+        };
         // insert in an order that puts parents and confirmed decisions
         // first
         let mut queues: Vec<Vec<&IdentityEntry>> = logs
@@ -1010,7 +1035,7 @@ impl<'a> Conversion<'a> {
                 while let Some(e) = q.last() {
                     let waits = e.ops().iter().any(|o| match o.body() {
                         OpBody::Confirm { decision, .. } => {
-                            all.contains_key(decision) && !placed.contains(decision)
+                            refers(logs[li], e, decision) && !placed.contains(decision)
                         }
                         _ => false,
                     });
@@ -1018,7 +1043,8 @@ impl<'a> Conversion<'a> {
                         break;
                     }
                     let e = q.pop().expect("entry");
-                    let entry = convert(&mut world, logs[li], e, &all, &revealed);
+                    let ok = |d: &EntryId| refers(logs[li], e, d);
+                    let entry = convert(&mut world, logs[li], e, &ok, &revealed);
                     world
                         .put(entry)
                         .expect("parents and decisions are placed first");
@@ -1026,9 +1052,19 @@ impl<'a> Conversion<'a> {
                     progress = true;
                 }
             }
-            if !progress {
-                break;
+            if progress {
+                continue;
             }
+            // Confirmations waiting on each other in a cycle: the first one
+            // blocked is placed with its confirmations read as endorsements,
+            // rather than leaving it and everything after it out.
+            let Some(li) = queues.iter().position(|q| !q.is_empty()) else {
+                break;
+            };
+            let e = queues[li].pop().expect("entry");
+            let entry = convert(&mut world, logs[li], e, &|_| false, &revealed);
+            world.put(entry).expect("parents are placed first");
+            placed.insert(e.id());
         }
         Conversion {
             world,
@@ -1169,7 +1205,7 @@ fn convert(
     w: &mut World,
     log: &IdentityLog,
     e: &IdentityEntry,
-    all: &HashMap<EntryId, (&IdentityLog, &IdentityEntry)>,
+    refers: &dyn Fn(&EntryId) -> bool,
     revealed: &HashMap<EntryId, BTreeSet<EntryId>>,
 ) -> model::Entry {
     let mut sym = |b: &[u8; 32]| w.sym(&hex_encode(b));
@@ -1234,7 +1270,7 @@ fn convert(
             },
             OpBody::Endorse { .. } => Op::Endorse,
             OpBody::Confirm { decision, .. } => {
-                if all.contains_key(decision) {
+                if refers(decision) {
                     Op::Confirm {
                         decision: sym(decision),
                     }
@@ -1342,6 +1378,63 @@ mod tests {
         assert_eq!(st.power(&admin.key()), None);
         assert_eq!(st.power(&added.key()), Some(Power::Device));
         assert_eq!(st.power(&other.key()), Some(Power::Device));
+    }
+
+    /// Confirmations that name what is not a decision, from anyone, cannot
+    /// make the person's own entries wait: an attacker who may send
+    /// entries under the person's label attaches A1 = confirm(P_x) and A2,
+    /// and pushes junk J beside P_x, sorting before it, holding
+    /// confirm(A2). Before, J waited on A2, A2 on A1, A1 on P_x, and P_x and
+    /// everything after it were never placed.
+    #[test]
+    fn confirmations_of_anything_cannot_stall_a_log() {
+        let d1 = DeviceKeys::generate();
+        let Created {
+            mut log,
+            encryption,
+            ..
+        } = IdentityLog::create_with(phrase(5), &d1, HybridKeyPair::generate()).unwrap();
+        let admin = DeviceKeys::generate();
+        let parents = log.heads();
+        let px = log
+            .add_key(
+                &d1.signing,
+                &admin.request(&log.id(), Power::Admin),
+                Some(&encryption),
+            )
+            .unwrap();
+        assert_eq!(log.state().power(&admin.key()), Some(Power::Admin));
+        // the attacker's own identity
+        let a = DeviceKeys::generate();
+        let Created { log: mut alog, .. } =
+            IdentityLog::create_with(phrase(6), &a, HybridKeyPair::generate()).unwrap();
+        let a1 = alog
+            .append(
+                &a.signing,
+                vec![IdentityOp::confirm(px.id(), 1, [0; 32], None)],
+            )
+            .unwrap();
+        let a2 = alog
+            .append(&a.signing, vec![IdentityOp::endorse(a1.id(), 1, [0; 32])])
+            .unwrap();
+        // junk beside P_x, ground to sort before it
+        let j = loop {
+            let k = SigningKey::generate();
+            let j = EntryBuilder::new(log.id(), &parents)
+                .op(IdentityOp::confirm(a2.id(), 1, [0; 32], None))
+                .sign(&k)
+                .unwrap();
+            if j.id() < px.id() {
+                break j;
+            }
+        };
+        log.insert(j).unwrap();
+        for e in alog.entries().cloned().collect::<Vec<_>>() {
+            let _ = log.attach(e);
+        }
+        assert_eq!(log.state().power(&admin.key()), Some(Power::Admin));
+        let together = evaluate_together(&[&log, &alog]);
+        assert_eq!(together[0].power(&admin.key()), Some(Power::Admin));
     }
 
     #[test]

@@ -2628,10 +2628,7 @@ impl Core {
     /// entries, which covers those before them. `only` limits it to some
     /// keys. Returns what was written, by space, and how many entries are
     /// kept.
-    pub fn keep_work(
-        &mut self,
-        only: Option<&[KeyId]>,
-    ) -> anyhow::Result<(Written, usize)> {
+    pub fn keep_work(&mut self, only: Option<&[KeyId]>) -> anyhow::Result<(Written, usize)> {
         let ident = self
             .identity
             .as_ref()
