@@ -28,6 +28,9 @@ pub struct Invitation {
     pub name: Option<String>,
     /// Only this identity may use it.
     pub for_identity: Option<[u8; 32]>,
+    /// The invitation is between a recovery helper and a guardian of this
+    /// identity (`identity.md#how-guardians-act`).
+    pub recovery_of: Option<[u8; 32]>,
 }
 
 impl Invitation {
@@ -46,6 +49,7 @@ impl Invitation {
             uses: 1,
             name: None,
             for_identity: None,
+            recovery_of: None,
         }
     }
 
@@ -61,6 +65,7 @@ impl Invitation {
             .with_opt(6, (self.uses != 1).then_some(self.uses))
             .with_opt(7, self.name.as_deref())
             .with_opt(8, self.for_identity)
+            .with_opt(9, self.recovery_of)
     }
 
     /// Reads the record.
@@ -78,6 +83,7 @@ impl Invitation {
             uses: r.opt_uint(6).map_err(bad)?.unwrap_or(1),
             name: r.opt_text(7).map_err(bad)?.map(str::to_string),
             for_identity: r.opt_bytes_n(8).map_err(bad)?,
+            recovery_of: r.opt_bytes_n(9).map_err(bad)?,
         })
     }
 
@@ -218,9 +224,10 @@ mod tests {
         );
         inv.name = Some("Ana".into());
         inv.for_identity = Some([3; 32]);
+        inv.recovery_of = Some([5; 32]);
         let t = inv.to_text();
         assert!(t.starts_with("cardinal:"));
-        assert!(t.len() < 260, "{}", t.len());
+        assert!(t.len() < 320, "{}", t.len());
         assert_eq!(Invitation::from_text(&t).unwrap(), inv);
         for m in [
             ContactMessage::Hello {
