@@ -11,6 +11,7 @@ use cardinal_encoding::Record;
 use cardinal_identity::{EntryId, IdentityEntry, IdentityLog, IdentityState, Inserted, KeyId};
 use cardinal_space::account;
 use cardinal_space::entry::NodeKind;
+use cardinal_space::relationship;
 use cardinal_space::{Profile, SealedEntry, Space, SpaceId, SpaceOp, ROOT};
 use cardinal_sync::{identity_log_label, MemSet, SetStore};
 
@@ -1499,6 +1500,34 @@ impl Core {
             who,
             what: endpoints.map(|e| e.to_string()).collect(),
         }
+    }
+
+    /// Which of `messages` in a space this person has read, as their own
+    /// devices know it: those their read marker comes after, and those the
+    /// read position the account keeps while read markers are off comes
+    /// after (`profiles.md#relationship`).
+    pub fn read_here(&self, space: &SpaceId, messages: &[relationship::Message]) -> Vec<bool> {
+        let (Some(me), Some(sp)) = (
+            self.me(),
+            self.spaces.get(space).and_then(|h| h.space.as_ref()),
+        ) else {
+            return vec![false; messages.len()];
+        };
+        let mut read = relationship::read_by(sp, &me, messages);
+        let acc = self.account().and_then(|a| a.space.as_ref());
+        let at = acc
+            .map(|a| account::read_up_to(a.state(), space))
+            .unwrap_or_default();
+        let dag = sp.dag();
+        for pos in at {
+            let Some(upto) = messages.iter().find(|m| m.id == pos) else {
+                continue;
+            };
+            for (m, r) in messages.iter().zip(read.iter_mut()) {
+                *r |= dag.is_ancestor_or_self(&m.entry, &upto.entry);
+            }
+        }
+        read
     }
 
     /// A number that changes whenever any space held may have: for what

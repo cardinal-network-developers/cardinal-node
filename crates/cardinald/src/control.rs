@@ -471,6 +471,10 @@ async fn handle(d: &Arc<Daemon>, req: &Value) -> anyhow::Result<Value> {
         "call-end" => crate::calls::end(d).await,
         "conversations" => Ok(crate::contacts::conversations(d)),
         "mark-read" => crate::contacts::mark_read(d, arg(req, "who")?),
+        "read-markers" => {
+            let on = req.get("on").and_then(|v| v.as_bool());
+            crate::settings::read_markers(d, on)
+        }
         "files" => crate::onefolder::list(d, req.get("path").and_then(Value::as_str).unwrap_or("")),
         "mkdir" => crate::onefolder::mkdir(d, arg(req, "path")?),
         "move" => crate::onefolder::move_to(d, arg(req, "from")?, arg(req, "to")?).await,
@@ -1030,6 +1034,7 @@ fn status(d: &Arc<Daemon>) -> Value {
         "router": crate::portmap::status(d),
         "bluetooth": crate::bluetooth::status(d),
         "network": crate::networks::status(d),
+        "read_markers": crate::settings::read_markers_on(&d.core()),
         "home": d.paths.home.display().to_string(),
         "identity": identity,
         "listen": d.endpoint.tcp_addr().map(|a| a.to_string()),

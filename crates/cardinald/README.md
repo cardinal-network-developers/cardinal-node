@@ -379,6 +379,15 @@ with `mine` true or false, and `name`, the person's answer to "Is this
 your network?" for it, kept in the account for all their devices, D76;
 `ask` true is when a client shows that question, quietly; `status` gives
 the same as `network`),
+`read-markers` (with nothing: `{on}`, whether others see what this
+person has read; with `on`, sets it in the account for every device of
+theirs; `status` gives it as `read_markers`. Off, `mark-read` moves no
+marker, keeps the position privately in the account instead and answers
+`{marked: false, kept, why}`; on, it answers `{marked, kept: false}`.
+`unread` counts from both), `conversations` and `contacts` (each person
+with `nearby`: a direct session with one of their devices on the local
+network, never from a tag; and in `conversations` `reach`: `{shared,
+waiting, said_no, named}`, `named` by the device names `no-host` takes),
 `speedtest` (one device, by
 name or key), `reload` (after `init` while the daemon runs), `flush`
 (commit now), `stop`. `status` includes `copies`: per device meant to

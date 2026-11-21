@@ -36,6 +36,51 @@ pub const NETWORK: u64 = 15;
 /// it, "no hosts here" (D75, `hosts.md#telling-others-where-to-reach-you`).
 pub const NO_HOSTS: u64 = 5;
 
+/// A space node's field: the last message this person read there, kept
+/// while read markers are off (`profiles.md#relationship`), seen only by
+/// their own devices.
+pub const READ_UP_TO: u64 = 6;
+
+/// The read positions the account keeps for `space`: every value of field
+/// 6 on every node for it.
+pub fn read_up_to(state: &State, space: &SpaceId) -> Vec<NodeId> {
+    let nodes = state.children(&ROOT).into_iter().filter(|n| {
+        n.kind == NodeKind::Uint(SPACE)
+            && !n.deleted
+            && last(n, 1).and_then(Value::as_bytes) == Some(&space[..])
+    });
+    nodes
+        .flat_map(|n| n.values(READ_UP_TO).iter())
+        .filter_map(|v| v.value.as_ref()?.as_bytes()?.try_into().ok())
+        .collect()
+}
+
+/// What keeps `message` as the last read in `space`: a `set` on each node
+/// the account has for it, or a new node.
+pub fn read_up_to_ops(
+    state: &State,
+    space: &SpaceId,
+    local_name: &str,
+    message: &NodeId,
+) -> Vec<SpaceOp> {
+    let was = hosts_no(state, space);
+    if was.nodes.is_empty() {
+        return vec![SpaceOp::create(
+            NodeKind::Uint(SPACE),
+            ROOT,
+            local_name,
+            Record::new()
+                .with(1, *space)
+                .with(2, local_name)
+                .with(READ_UP_TO, *message),
+        )];
+    }
+    was.nodes
+        .iter()
+        .map(|n| set_field(*n, READ_UP_TO, *message))
+        .collect()
+}
+
 /// An invitation's field: the inviter cancelled it.
 pub const CANCELLED: u64 = 2;
 

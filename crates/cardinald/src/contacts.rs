@@ -744,6 +744,7 @@ async fn receive(st: &mut Stream) -> anyhow::Result<Option<ContactMessage>> {
 pub fn list(d: &Daemon, all: bool) -> Json {
     let connected = d.connected_people();
     let relayed = d.relayed_people();
+    let near: HashSet<[u8; 32]> = connected.iter().copied().filter(|w| nearby(d, w)).collect();
     let everyone = d.core().contacts();
     let group_names: Vec<(SpaceId, String)> = {
         let core = d.core();
@@ -769,6 +770,7 @@ pub fn list(d: &Daemon, all: bool) -> Json {
                 "category": c.category,
                 "connected": connected.contains(&c.identity),
                 "relayed": relayed.contains(&c.identity),
+                "nearby": near.contains(&c.identity),
             });
             crate::names::with_shown(d, c, v)
         })
@@ -1355,11 +1357,54 @@ pub fn messages(d: &Daemon, who: &str) -> anyhow::Result<Json> {
     Ok(json!({"messages": said}))
 }
 
+/// Whether one of a contact's devices is nearby: a direct session with it
+/// runs on the local network now (D74). Never from a tag alone.
+pub(crate) fn nearby(d: &Daemon, who: &[u8; 32]) -> bool {
+    d.sessions_of(who).iter().any(|s| {
+        !s.is_relayed()
+            && s.remote_addr()
+                .is_some_and(|a| crate::networks::on_local_link(a.ip()))
+    })
+}
+
+/// What a relationship's reach node says of this person's hosts, shaped as
+/// a group's `reach`: `shared`, `waiting`, `said_no`, and `named`, the
+/// hosts it names by the device names `no-host` takes.
+fn reach_summary(core: &Core, space: &SpaceId) -> Json {
+    let t = core.telling(space);
+    let names = core.device_names();
+    let hosts = core.mailboxes();
+    let named: Vec<String> = core
+        .me()
+        .map(|me| core.reach_of(space, &me))
+        .unwrap_or_default()
+        .iter()
+        .map(|r| {
+            let device = hosts.iter().find(|(g, _)| *g.link_key.x25519() == r.host);
+            match device {
+                Some((_, key)) => names
+                    .get(key)
+                    .cloned()
+                    .filter(|n| !n.is_empty())
+                    .unwrap_or_else(|| account::short_key(key)),
+                None => hex::encode(&r.host[..4]),
+            }
+        })
+        .collect();
+    json!({
+        "shared": t.shared,
+        "waiting": t.waiting,
+        "said_no": t.said_no,
+        "named": named,
+    })
+}
+
 /// Everyone this person talks to, the most recent first: what they last said
 /// and how many messages from them are not yet read here.
 pub fn conversations(d: &Daemon) -> Json {
     let connected = d.connected_people();
     let relayed = d.relayed_people();
+    let near: HashSet<[u8; 32]> = connected.iter().copied().filter(|w| nearby(d, w)).collect();
     let core = d.core();
     let me = core.identity.as_ref().map(|i| i.id());
     let contacts = core.contacts();
@@ -1369,10 +1414,7 @@ pub fn conversations(d: &Daemon) -> Json {
         .map(|c| {
             let open = core.spaces.get(&c.space).and_then(|h| h.space.as_ref());
             let said = open.map(relationship::messages).unwrap_or_default();
-            let read = match (open, me) {
-                (Some(open), Some(me)) => relationship::read_by(open, &me, &said),
-                _ => vec![false; said.len()],
-            };
+            let read = core.read_here(&c.space, &said);
             let both = said.iter().zip(read);
             let unread = both.filter(|(m, read)| Some(m.author) != me && !read);
             let last = said.last();
@@ -1384,6 +1426,8 @@ pub fn conversations(d: &Daemon) -> Json {
                 "introductions": c.regard.introductions,
                 "connected": connected.contains(&c.identity),
                 "relayed": relayed.contains(&c.identity),
+                "nearby": near.contains(&c.identity),
+                "reach": reach_summary(&core, &c.space),
                 "unread": unread.count(),
                 "last": last.map(|m| json!({
                     "mine": Some(m.author) == me,
@@ -1400,40 +1444,64 @@ pub fn conversations(d: &Daemon) -> Json {
 }
 
 /// Marks a conversation read up to its last message from the contact. Their
-/// devices see the marker too (`profiles.md#relationship`).
+/// devices see the marker too (`profiles.md#relationship`), unless read
+/// markers are off.
 pub fn mark_read(d: &Arc<Daemon>, who: &str) -> anyhow::Result<Json> {
     let contact = listed(d, who)?;
+    mark_read_in(d, &contact.space, &contact.petname)
+}
+
+/// Marks a space's conversation read up to its last message from anyone
+/// else. With read markers on, that moves this person's marker, which
+/// every member sees; off, it moves the position the account keeps,
+/// which only their own devices see. Answers `marked` (a marker moved)
+/// and `kept` (the private position moved).
+pub(crate) fn mark_read_in(d: &Arc<Daemon>, space: &SpaceId, name: &str) -> anyhow::Result<Json> {
     let me = identity(d)?;
-    let op = {
+    let markers = crate::settings::read_markers_on(&d.core());
+    let (op, account) = {
         let core = d.core();
-        let open = core
-            .spaces
-            .get(&contact.space)
-            .and_then(|h| h.space.as_ref());
+        let open = core.spaces.get(space).and_then(|h| h.space.as_ref());
         let open = open.ok_or_else(|| anyhow::anyhow!("that space is not open yet"))?;
         let all = relationship::messages(open);
-        let read = relationship::read_by(open, &me, &all);
+        let read = core.read_here(space, &all);
         let new = all
             .iter()
             .zip(&read)
             .any(|(m, read)| m.author != me && !read);
         let theirs = all.iter().rposition(|m| m.author != me);
         match theirs {
-            Some(at) if new => {
+            Some(at) if new && markers => {
                 let last = all[at].id;
-                match relationship::read_marker(open, &me) {
+                let op = match relationship::read_marker(open, &me) {
                     Some(marker) => Some(relationship::set_read_marker(marker, last)),
                     None => relationship::conversation(open)
                         .map(|c| relationship::create_read_marker(c, last)),
-                }
+                };
+                (op.map(|op| (*space, vec![op])), false)
             }
-            _ => None,
+            Some(at) if new => {
+                let acc = core.account();
+                let st = acc.and_then(|a| Some((a.id, a.space.as_ref()?.state())));
+                let ops =
+                    st.map(|(id, st)| (id, account::read_up_to_ops(st, space, name, &all[at].id)));
+                (ops, true)
+            }
+            _ => (None, !markers),
         }
     };
-    if let Some(op) = op {
-        d.write_and_push(&contact.space, vec![op])?;
+    let moved = op.is_some();
+    if let Some((target, ops)) = op {
+        d.write_and_push(&target, ops)?;
     }
-    Ok(json!({}))
+    if account {
+        return Ok(json!({
+            "marked": false,
+            "kept": moved,
+            "why": "read markers are off: others do not see what you have read",
+        }));
+    }
+    Ok(json!({"marked": moved, "kept": false}))
 }
 
 /// A length of time in words, to the largest unit that matters.

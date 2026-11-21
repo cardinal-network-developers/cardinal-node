@@ -176,6 +176,14 @@ fn a_device_the_router_gives_a_port_names_itself_to_a_trusted_contact() {
     wait("Bo reads the address in Ana's reach node", 60, || {
         their_reach(&b) == [want.clone()]
     });
+    // Her conversation with Bo says which of her devices it names, by the
+    // name `no-host` takes.
+    let c = ask(&a, json!({"cmd": "conversations"}))["conversations"][0].clone();
+    assert_eq!(
+        c["reach"],
+        json!({"shared": true, "waiting": false, "said_no": false, "named": ["ana"]}),
+        "{c}"
+    );
 
     // Turned off, it takes itself out, and says so.
     let said = a.cli(&["router", "off"]);

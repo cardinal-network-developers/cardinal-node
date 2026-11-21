@@ -251,39 +251,12 @@ pub fn mark_ops(
 /// Whether the account's switch lets this person's devices ask routers:
 /// on unless a setting node named [`ROUTERS`] says false, in any value.
 pub fn account_allows(state: &cardinal_space::State) -> bool {
-    let off = state
-        .children(&ROOT)
-        .into_iter()
-        .filter(|n| n.kind == NodeKind::Uint(account::SETTING) && !n.deleted)
-        .filter(|n| n.field(1).and_then(Value::as_text) == Some(ROUTERS))
-        .flat_map(|n| n.values(2).iter())
-        .any(|v| v.value.as_ref().and_then(Value::as_bool) == Some(false));
-    !off
+    crate::settings::on(state, ROUTERS)
 }
 
-/// What sets the account's switch: the setting node's value, made if
-/// there is none.
+/// What sets the account's switch.
 fn switch_ops(state: &cardinal_space::State, on: bool) -> Vec<SpaceOp> {
-    let nodes: Vec<_> = state
-        .children(&ROOT)
-        .into_iter()
-        .filter(|n| n.kind == NodeKind::Uint(account::SETTING) && !n.deleted)
-        .filter(|n| n.field(1).and_then(Value::as_text) == Some(ROUTERS))
-        .map(|n| n.id)
-        .collect();
-    if nodes.is_empty() {
-        let fields = Record::new().with(1, ROUTERS).with(2, on);
-        return vec![SpaceOp::create(
-            NodeKind::Uint(account::SETTING),
-            ROOT,
-            ROUTERS,
-            fields,
-        )];
-    }
-    nodes
-        .into_iter()
-        .map(|n| account::set_field(n, 2, on))
-        .collect()
+    crate::settings::set_ops(state, ROUTERS, on)
 }
 
 /// Whether this device may ask routers at all: its own switch and the

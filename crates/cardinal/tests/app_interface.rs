@@ -126,6 +126,76 @@ fn news_comes_by_itself_and_read_travels_back() {
     });
 }
 
+/// Read markers are the person's to give (`profiles.md#relationship`):
+/// turned off, in the account, `mark-read` moves no marker and says so,
+/// and the other side sees the message as sent and no more. What was
+/// read is kept privately in the account instead (field 6 of the space's
+/// node), so another device of the person's counts it read too. Turned
+/// on again, reading marks it read.
+#[test]
+fn read_markers_turned_off_tell_nobody_what_was_read() {
+    if !fuse_available() {
+        eprintln!("skipping: /dev/fuse or fusermount3 is not available");
+        return;
+    }
+    let root = tempfile::tempdir().unwrap();
+    let (a, b) = met(root.path());
+    let mut phone = Dev::new(root.path(), "phone", free_port());
+    phone.start();
+    pair(&a, &phone);
+    wait("her phone has the conversation", 60, || {
+        ask(&phone, json!({"cmd": "conversations"}))["conversations"]
+            .as_array()
+            .is_some_and(|c| c.len() == 1)
+    });
+    let bo = only(&a)["name"].as_str().unwrap().to_owned();
+    assert_eq!(ask(&a, json!({"cmd": "read-markers"}))["on"], true);
+    assert_eq!(a.status()["read_markers"], true);
+    assert_eq!(
+        ask(&a, json!({"cmd": "read-markers", "on": false}))["on"],
+        false
+    );
+    assert_eq!(ask(&a, json!({"cmd": "read-markers"}))["on"], false);
+    assert_eq!(a.status()["read_markers"], false);
+    wait("off on her phone too", 30, || {
+        phone.status()["read_markers"] == false
+    });
+    b.cli(&["say", "Ana", "do you read me"]);
+    wait("the message arrives", 30, || only(&a)["unread"] == 1);
+    wait("and on her phone", 30, || only(&phone)["unread"] == 1);
+    wait("bo hears it got there", 30, || {
+        said(&b, "Ana")[0]["state"] == "sent"
+    });
+    let r = ask(&a, json!({"cmd": "mark-read", "who": bo}));
+    assert_eq!(
+        (&r["marked"], &r["kept"]),
+        (&json!(false), &json!(true)),
+        "{r}"
+    );
+    assert!(r["why"].as_str().unwrap_or("").contains("off"), "{r}");
+    assert_eq!(only(&a)["unread"], 0);
+    wait("her phone counts it read", 30, || {
+        only(&phone)["unread"] == 0
+    });
+    // Reading again keeps nothing more.
+    let r = ask(&a, json!({"cmd": "mark-read", "who": bo}));
+    assert_eq!(r["kept"], false, "{r}");
+    std::thread::sleep(Duration::from_secs(3));
+    assert_eq!(
+        said(&b, "Ana")[0]["state"],
+        "sent",
+        "bo learned it was read"
+    );
+    ask(&a, json!({"cmd": "read-markers", "on": true}));
+    b.cli(&["say", "Ana", "and now?"]);
+    wait("the second arrives", 30, || only(&a)["unread"] == 1);
+    let r = ask(&a, json!({"cmd": "mark-read", "who": bo}));
+    assert_eq!(r["marked"], true, "{r}");
+    wait("bo sees it was read", 30, || {
+        said(&b, "Ana").iter().any(|m| m["state"] == "read")
+    });
+}
+
 /// At the command line: `cardinal messages` alone shows what is new, and
 /// reading a conversation marks it read.
 #[test]

@@ -1397,6 +1397,22 @@ Not implemented yet (the next milestone):
 The first step of sharing: two people connect and talk. Much of what the spec
 asks for around that is not built yet.
 
+### Read markers are the person's to give (`profiles.md#relationship`)
+
+- **The setting** is a setting node (kind 6) named `read markers`, value
+  false when off (`settings.rs`, request `read-markers`). It is off if any
+  value of any node of that name says false. Off, no device of the
+  person's creates or moves a marker, in a relationship or a group, and
+  `mark-read` says why it wrote nothing. Markers written before stay.
+- **The private read position** (core 1a6f754): with markers off,
+  `mark-read` sets field 6 of the account's node for the space (made if
+  there is none) to the last message read, and answers `{marked: false,
+  kept, why}`. `unread`, in `conversations` and `groups`, counts from the
+  marker and from every value of field 6 together: a message is read if
+  either comes after it. A client withdraws a notice when another device
+  of the person's moves it, from the `changed` event and the new count.
+- The command line has no switch for it yet; clients set it.
+
 ### Names and pictures (D71, `profiles.md#account`)
 
 - **An account made before the self node** has none. Until its person sets
@@ -1705,6 +1721,13 @@ asks for around that is not built yet.
     unreadable, and the field 5 that versions before D68 wrote (their
     yes as true) is from before that.
   - **What `groups` gives** in `reach` also has `said_no`.
+- **`conversations` gives `reach` for each person** too, shaped as a
+  group's: `shared`, `waiting`, `said_no`, and `named`, the hosts the
+  relationship's list names by the device names `no-host` takes (or the
+  start of the key in hex, for a host that is no longer the person's).
+- **`nearby`** in `conversations` and `contacts` (D74): a session with
+  one of their devices that is direct and whose address is on the local
+  link, now. Never from a tag.
   - **On its own, a device changes only its own entry** (D70,
     `mailbox.rs` `keep_own_entry`, `Core::own_entry_due`): a host sets a
     token where the one its entry has is not active, and changed
