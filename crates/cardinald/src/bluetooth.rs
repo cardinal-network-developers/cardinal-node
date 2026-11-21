@@ -92,8 +92,9 @@ const CHANNEL_WITHIN: Duration = Duration::from_secs(10);
 const HANDSHAKE_WITHIN: Duration = Duration::from_secs(8);
 /// How long someone accepting an invitation looks for its tag.
 const INVITATION_WITHIN: Duration = Duration::from_secs(30);
-/// How long to wait before trying the radio again when it failed.
-const RETRY_EVERY: Duration = Duration::from_secs(30);
+/// How long to wait before trying the radio again when it failed: the
+/// app that drives it on Android connects a moment after the service starts.
+const RETRY_EVERY: Duration = Duration::from_secs(5);
 /// The most channels others may have open to this device at once.
 const MAX_INCOMING: usize = 16;
 
@@ -333,7 +334,13 @@ fn same(a: &Keys, b: &Keys) -> bool {
 /// Advertises, scans and listens until aborted, or until the radio fails.
 async fn on(d: Arc<Daemon>) {
     if let Err(e) = run(&d).await {
-        tracing::warn!("Bluetooth: {e}");
+        // Said once, not at every try.
+        let again = lock(&d.bluetooth.shown).error.as_ref() == Some(&e);
+        if again {
+            tracing::debug!("Bluetooth: {e}");
+        } else {
+            tracing::warn!("Bluetooth: {e}");
+        }
         lock(&d.bluetooth.shown).error = Some(e.clone());
         off(&d);
         // The controller tries again after this.
