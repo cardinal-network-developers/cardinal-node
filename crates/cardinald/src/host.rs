@@ -429,6 +429,10 @@ pub fn sheet(d: &Daemon) -> anyhow::Result<Json> {
     Ok(json!({"hosts": hosts}))
 }
 
+/// Why a host closes a session from a device it does not know, until it
+/// proves it holds the recovery words.
+pub const PROVE_FIRST: &str = "prove first";
+
 /// Serves a stream of the storage service.
 pub async fn serve(d: &Arc<Daemon>, s: &Session, mut st: Stream) -> anyhow::Result<()> {
     let Some(v) = st.recv_message_max(4096).await? else {
@@ -447,7 +451,7 @@ pub async fn serve(d: &Arc<Daemon>, s: &Session, mut st: Stream) -> anyhow::Resu
             None => error(NOT_PERMITTED),
         },
         _ if is_unproven(d, s) => {
-            s.close("prove first");
+            s.close(PROVE_FIRST);
             return Ok(());
         }
         _ => error(UNKNOWN),

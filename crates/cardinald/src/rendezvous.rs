@@ -1970,18 +1970,16 @@ async fn through_host(
     r: &Reach,
     addr: SocketAddr,
 ) -> anyhow::Result<()> {
-    let (mut host, mut opened) = host_session(d, r, addr).await?;
+    let (mut host, mut opened) = host_session(d, r, addr, false).await?;
     let ask = Record::new().with(0, OP_CONNECT).with(1, r.token);
     let mut reply = call(&host, Service::RENDEZVOUS, ask.clone()).await;
     if reply.is_err() && !opened {
         // The session it found may have been one the host was ending, as
         // a direct one from someone it does not take for a trusted
-        // contact: once more, on a session of its own with the token.
-        tokio::time::sleep(Duration::from_millis(200)).await;
-        if host.is_closed() {
-            (host, opened) = host_session(d, r, addr).await?;
-            reply = call(&host, Service::RENDEZVOUS, ask).await;
-        }
+        // contact ("prove first"), and another such may be open by now:
+        // once more, on a session of its own with the token.
+        (host, opened) = host_session(d, r, addr, true).await?;
+        reply = call(&host, Service::RENDEZVOUS, ask).await;
     }
     let found = match reply {
         Ok(reply) if reply.get(0).and_then(Value::as_uint) == Some(OP_CONNECT) => {
@@ -2034,11 +2032,13 @@ async fn through_host(
 }
 
 /// A session with a contact's host: one already open, or a new one opened
-/// with the token, which says nothing of who is asking. Says whether it is new.
+/// with the token, which says nothing of who is asking. Says whether it is
+/// new. With `fresh`, always a new one.
 async fn host_session(
     d: &Arc<Daemon>,
     r: &Reach,
     addr: SocketAddr,
+    fresh: bool,
 ) -> anyhow::Result<(Session, bool)> {
     anyhow::ensure!(
         r.host != *d.keys.link.public_key().x25519(),
@@ -2048,11 +2048,11 @@ async fn host_session(
     // rather than give up on a call.
     let asked = Instant::now();
     loop {
-        if let Some(s) = d.session(&r.host) {
+        if let Some(s) = d.session(&r.host).filter(|_| !fresh) {
             return Ok((s, false));
         }
         let held = lock(&d.rendezvous.paths).get(&r.host).cloned();
-        if let Some((_, s)) = held.filter(|(_, s)| !s.is_closed()) {
+        if let Some((_, s)) = held.filter(|(_, s)| !s.is_closed() && !fresh) {
             return Ok((s, false));
         }
         if let Some(_going) = crate::mailbox::going_to(d, r.host) {

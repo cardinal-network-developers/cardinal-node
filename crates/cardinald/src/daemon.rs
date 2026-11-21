@@ -1139,7 +1139,13 @@ impl Daemon {
     pub fn session_closed(&self, peer_static: &[u8; 32], gen: u64) {
         let mut m = lock(&self.sessions);
         if m.get(peer_static).is_some_and(|c| c.gen == gen) {
+            let mut refused = None;
             if let Some(c) = m.remove(peer_static) {
+                if let PeerKind::Own(k) | PeerKind::Contact(_, k) = c.kind {
+                    if is_prove_first(c.session.close_reason().as_ref()) {
+                        refused = Some(k);
+                    }
+                }
                 if let PeerKind::Contact(who, k) = c.kind {
                     let why = c
                         .session
@@ -1152,6 +1158,15 @@ impl Daemon {
                         format!("{} closed after {lasted}: {why}", hex::encode(&k[..8])),
                     );
                 }
+            }
+            drop(m);
+            // A host of theirs that does not take this device for anyone
+            // it serves answers every session so, at once: dialling again
+            // each round would only be told the same (connecting cleared
+            // the backoff).
+            if let Some(k) = refused {
+                let next = Instant::now() + PROVE_FIRST_BACKOFF;
+                lock(&self.backoff).insert(k, (next, PROVE_FIRST_BACKOFF));
             }
             lock(&self.proven).remove(peer_static);
             lock(&self.invited).remove(peer_static);
@@ -2385,6 +2400,16 @@ fn route(s: &Session) -> String {
 }
 
 /// Why a session closed, in words.
+/// How long a device that closed a session with "prove first" is left
+/// before it is dialled again.
+const PROVE_FIRST_BACKOFF: Duration = Duration::from_secs(60);
+
+/// Whether a session was closed by the other end because this device is
+/// not one it serves (`host.rs`).
+fn is_prove_first(r: Option<&cardinal_link::CloseReason>) -> bool {
+    matches!(r, Some(cardinal_link::CloseReason::Remote(w)) if w == crate::host::PROVE_FIRST)
+}
+
 pub(crate) fn closed_why(r: &cardinal_link::CloseReason) -> String {
     use cardinal_link::CloseReason as R;
     match r {

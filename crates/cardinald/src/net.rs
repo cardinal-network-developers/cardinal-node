@@ -250,7 +250,7 @@ async fn handle_stream(d: &Arc<Daemon>, s: &Session, mut st: Stream) -> anyhow::
         return crate::host::serve(d, s, st).await;
     }
     if crate::host::is_unproven(d, s) {
-        s.close("prove first");
+        s.close(crate::host::PROVE_FIRST);
         return Ok(());
     }
     if st.service() == Service::RENDEZVOUS || st.service() == Service::RELAY {
