@@ -66,7 +66,8 @@ pub fn relationships(d: &Daemon) -> Vec<Shown> {
         .core()
         .contacts()
         .into_iter()
-        .filter(|c| !c.refused)
+        // a recovery's relationship is no contact (`guardians.rs`)
+        .filter(|c| !c.refused && c.recovery_of.is_none())
         .collect();
     let key = |c: &ContactRecord| {
         (

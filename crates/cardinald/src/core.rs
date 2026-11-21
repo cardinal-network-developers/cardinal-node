@@ -1159,7 +1159,14 @@ pub struct Core {
     /// at hand: what the spaces judge their authors by. Worked out again
     /// when a log changes, and not otherwise.
     logs: Vec<Arc<IdentityState>>,
+    /// This is a recovery helper's: it holds what guardians' personas give
+    /// it for the recovery (D80).
+    pub takes_recovery_copies: bool,
 }
+
+/// The most a copy held for someone takes on this device: past it, nothing
+/// more of it is taken (D80: about the size of their account).
+pub const HELD_CAP: u64 = 64 << 20;
 
 /// What a change to the identity log means for the rest of the daemon.
 #[derive(Debug, Default)]
@@ -1185,6 +1192,7 @@ impl Core {
             others: BTreeMap::new(),
             arriving: HashMap::new(),
             logs: Vec::new(),
+            takes_recovery_copies: false,
         };
         if paths.identity_log().exists() {
             let (file, records) = AppendLog::open(&paths.identity_log())?;
@@ -1940,6 +1948,105 @@ impl Core {
         open.is_some_and(|s| s.role_of(identity).is_some() && !s.has_left(identity))
     }
 
+    /// The held copy nodes this person and `who` wrote in their relationship
+    /// (`relationship::held`): (this person's, theirs).
+    fn held_nodes(&self, who: &[u8; 32]) -> (Vec<[u8; 32]>, Vec<[u8; 32]>) {
+        let me = self.me();
+        let Some(c) = self.contacts().into_iter().find(|c| c.identity == *who) else {
+            return (Vec::new(), Vec::new());
+        };
+        let Some(sp) = self.spaces.get(&c.space).and_then(|h| h.space.as_ref()) else {
+            return (Vec::new(), Vec::new());
+        };
+        let all = cardinal_space::relationship::held(sp);
+        let mine = all
+            .iter()
+            .filter(|(a, _)| Some(*a) == me)
+            .map(|(_, l)| *l)
+            .collect();
+        let theirs = all
+            .iter()
+            .filter(|(a, _)| a == who)
+            .map(|(_, l)| *l)
+            .collect();
+        (mine, theirs)
+    }
+
+    /// The sets this person gives `who` to hold for them, sealed (D80): its
+    /// account, to a guardian; what a guardian holds, from their persona to
+    /// a recovery helper. `who` may fetch them.
+    pub fn held_given(&self, who: &[u8; 32]) -> Vec<[u8; 32]> {
+        // to a guardian only while they are one, as the account marks them;
+        // to a recovery helper, from a persona
+        let contact = self.contacts().into_iter().find(|c| c.identity == *who);
+        if !contact.is_some_and(|c| c.guardian || c.recovery_of.is_some()) {
+            return Vec::new();
+        }
+        let (mine, _) = self.held_nodes(who);
+        mine.into_iter()
+            .filter(|l| self.spaces.contains_key(l))
+            .collect()
+    }
+
+    /// Takes a copy held for someone off this device.
+    pub fn drop_held(&mut self, label: &[u8; 32]) {
+        if self.spaces.remove(label).is_some() {
+            let dir = Holder::dir(&self.paths, label);
+            if let Err(e) = std::fs::remove_dir_all(&dir) {
+                tracing::warn!("cannot remove {}: {e}", dir.display());
+            }
+        }
+    }
+
+    /// Whether a copy held for someone grew past [`HELD_CAP`].
+    fn held_full(&self, label: &[u8; 32]) -> bool {
+        let file = Holder::dir(&self.paths, label).join("entries.log");
+        std::fs::metadata(file).is_ok_and(|m| m.len() > HELD_CAP)
+    }
+
+    /// The sets `who` gives this person to hold, which it takes: a person's
+    /// account, where this person guards them through a persona; what a
+    /// guardian's persona gives, on a recovery helper.
+    pub fn held_taken(&self, who: &[u8; 32]) -> Vec<[u8; 32]> {
+        let contact = self.contacts().into_iter().find(|c| c.identity == *who);
+        let takes = contact.is_some_and(|c| {
+            (self.takes_recovery_copies && c.recovery_of.is_some())
+                || (c.recovery_of.is_none() && self.guards_through_persona(who))
+        });
+        if !takes {
+            return Vec::new();
+        }
+        // A guardian holds one set for a person, the first they named: the
+        // account. A helper holds at most two from each persona: the
+        // account and that guardian's relationship with the person. No
+        // more, whoever names more (a thief with a stolen device among
+        // them).
+        let most = if self.takes_recovery_copies { 2 } else { 1 };
+        let mut out: Vec<[u8; 32]> = Vec::new();
+        for l in self.held_nodes(who).1 {
+            if !out.contains(&l) && out.len() < most {
+                out.push(l);
+            }
+        }
+        // and none past the cap, whatever is sent
+        out.retain(|l| !self.held_full(l));
+        out
+    }
+
+    /// Whether this person holds a guardian persona for `who`, not burned.
+    pub fn guards_through_persona(&self, who: &[u8; 32]) -> bool {
+        let Some(acc) = self.account().and_then(|a| a.space.as_ref()) else {
+            return false;
+        };
+        cardinal_space::account::personas(acc.state())
+            .iter()
+            .any(|p| {
+                p.purpose == cardinal_space::account::GUARDIAN_PURPOSE
+                    && p.for_identity == Some(*who)
+                    && !p.burned
+            })
+    }
+
     /// Whether `label` is a space `identity` offered this person that is not
     /// open here yet: what they send of it is taken, so it can be opened, and
     /// nothing of it goes back, since an offer can name any space at all.
@@ -1964,6 +2071,16 @@ impl Core {
     /// theirs, then the spaces they share (`spaces.md#holding-a-space`).
     pub fn labels_with(&self, identity: &[u8; 32]) -> Vec<[u8; 32]> {
         let mut v: Vec<[u8; 32]> = self.identity_label().into_iter().collect();
+        // copies held for one or the other (D80)
+        for l in self
+            .held_given(identity)
+            .into_iter()
+            .chain(self.held_taken(identity))
+        {
+            if !v.contains(&l) {
+                v.push(l);
+            }
+        }
         v.push(identity_log_label(identity));
         v.extend(self.spaces.keys().filter(|l| self.shares(identity, l)));
         // An offered space not open here yet, to fetch from them.
@@ -2892,6 +3009,53 @@ impl Core {
             self.settle(&id);
         }
         Ok((written, kept))
+    }
+
+    /// Keeps, in each of `spaces`, everything this person's removed devices
+    /// wrote that nothing witnessed: the account and relationships the
+    /// guardians gave back after a recovery that kept no old key (D80),
+    /// whose every entry is such work. Returns the entries written.
+    pub fn keep_given_back(&mut self, spaces: &[SpaceId]) -> anyhow::Result<Written> {
+        let ident = self
+            .identity
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("this device has no identity yet"))?;
+        let me = ident.id();
+        let st = ident.state();
+        let mut written = Vec::new();
+        for id in spaces {
+            let Some(h) = self.spaces.get_mut(id) else {
+                continue;
+            };
+            let Some(space) = h.space.as_ref() else {
+                continue;
+            };
+            let dag = space.dag();
+            let mut by_key: BTreeMap<KeyId, Vec<EntryId>> = BTreeMap::new();
+            for x in &space.validity().unwitnessed {
+                let Some(e) = dag.get(x) else { continue };
+                if e.author() == me && st.power(&e.signer()).is_none() {
+                    by_key.entry(e.signer()).or_default().push(*x);
+                }
+            }
+            for (key, xs) in by_key {
+                let dag = h.space.as_ref().expect("open").dag();
+                let mut latest: Vec<EntryId> = xs
+                    .iter()
+                    .filter(|x| !xs.iter().any(|y| y != *x && dag.is_ancestor(x, y)))
+                    .copied()
+                    .collect();
+                latest.sort();
+                let bytes = h.write_keeps(ident, &self.keys, vec![SpaceOp::keep(key, &latest)])?;
+                written.push((*id, bytes));
+            }
+        }
+        for id in spaces {
+            if self.spaces.contains_key(id) {
+                self.settle(id);
+            }
+        }
+        Ok(written)
     }
 
     /// Keeps what `key` wrote in a space ([`Holder::witness`]).

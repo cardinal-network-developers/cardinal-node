@@ -68,7 +68,8 @@ pub fn by_identity(core: &Core) -> BTreeMap<[u8; 32], (bool, Vec<SpaceId>)> {
     let mut all: BTreeMap<[u8; 32], (bool, Vec<SpaceId>)> = BTreeMap::new();
     for c in core.contacts() {
         let e = all.entry(c.identity).or_insert((true, Vec::new()));
-        e.0 &= c.connects();
+        // a recovery's relationship is no contact (`guardians.rs`)
+        e.0 &= c.connects() && c.recovery_of.is_none();
         if !e.1.contains(&c.space) {
             e.1.push(c.space);
         }
@@ -200,6 +201,10 @@ pub fn due(core: &Core, fresh: impl FnOnce() -> [u8; 32]) -> Due {
 
 /// Keeps the presence secret, and gives it where it is due (D74).
 pub fn keep(d: &Arc<Daemon>) {
+    // A persona has no presence secret (`identity.md#personas`).
+    if d.config().this_run.inside() {
+        return;
+    }
     let (due, account) = {
         let core = d.core();
         (due(&core, random_bytes), core.account_id())

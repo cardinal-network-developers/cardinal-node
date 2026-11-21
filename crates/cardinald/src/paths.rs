@@ -239,6 +239,16 @@ impl Paths {
     pub fn recovering(&self) -> PathBuf {
         self.home.join("recovering.json")
     }
+    /// The devices a recovery through guardians removed, to pair again
+    /// (`recovering.rs`).
+    pub fn recovered(&self) -> PathBuf {
+        self.home.join("recovered.json")
+    }
+    /// The data directory of the recovery helper of a recovery through
+    /// guardians under way (`helper.rs`), removed when it ends.
+    pub fn recovery_helper(&self) -> PathBuf {
+        self.home.join("recovery-helper")
+    }
     /// Contacts' pictures, as files windows can open (`names.rs`).
     pub fn pictures(&self) -> PathBuf {
         self.home.join("pictures")

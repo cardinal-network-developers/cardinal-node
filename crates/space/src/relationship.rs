@@ -655,3 +655,283 @@ pub fn messages(space: &Space) -> Vec<Message> {
     found.sort_by_key(|(at, _)| *at);
     found.into_iter().map(|(_, m)| m).collect()
 }
+
+// ---- Recovery (`identity.md#how-guardians-act`) ---------------------------
+//
+// A relationship between a recovery helper and a guardian carries the
+// recovery: what the guardian's device proposes, and identity entries each
+// side carries to the other. The specification says they travel through the
+// relationship, not how; these two node kinds are this implementation's
+// (DEVIATIONS.md, Guardians).
+
+/// Recovery proposal kind: what a guardian's persona proposes for a
+/// `recover`. Not in the specification, which numbers relationship kinds
+/// up to 11; numbered well past them (DEVIATIONS.md).
+pub const RECOVERY_PROPOSAL: u64 = 64;
+/// Carried entry kind: one identity entry, carried for a recovery. Not in
+/// the specification.
+pub const CARRIED: u64 = 65;
+/// Held copy kind: a set its author gives the other member to hold for
+/// them, sealed, as a person gives their guardians a copy of their account
+/// and a guardian's persona gives a recovery helper what it holds. Not in
+/// the specification, which says only that these are given and kept
+/// current through the relationship (D80).
+pub const HELD_COPY: u64 = 66;
+/// Guardian persona kind (`profiles.md#relationship`, D79): the persona
+/// its author guards the other member through, and that persona's log.
+pub const GUARDIAN_PERSONA: u64 = 11;
+
+/// A guardian's proposal, as a relationship space holds it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Proposal {
+    /// Its node.
+    pub node: NodeId,
+    /// Who wrote it.
+    pub author: IdentityId,
+    /// The identity being recovered.
+    pub identity: IdentityId,
+    /// The parents of the `recover`.
+    pub parents: Vec<EntryId>,
+    /// The policy it acts under.
+    pub policy: EntryId,
+}
+
+/// `create` of a recovery proposal, its author's alone. A `recover` keeps
+/// no old key, so it proposes no hosts.
+pub fn create_proposal(identity: &IdentityId, parents: &[EntryId], policy: &EntryId) -> SpaceOp {
+    SpaceOp::create(
+        NodeKind::Uint(RECOVERY_PROPOSAL),
+        ROOT,
+        "recovery",
+        Record::new()
+            .with(1, *identity)
+            .with(2, Value::list(parents.iter().map(|p| Value::from(*p))))
+            .with(3, *policy)
+            .with(AUTHOR_OWNED_FIELD, 1u64),
+    )
+}
+
+/// A field of a node as its creator wrote it when creating it.
+fn as_created(n: &Node, key: u64) -> Option<&Value> {
+    n.values(key)
+        .iter()
+        .find(|v| v.entry == n.created_in)
+        .and_then(|v| v.value.as_ref())
+}
+
+/// The recovery proposals in a relationship space, as their authors wrote
+/// them, in the order they were made.
+pub fn proposals(space: &Space) -> Vec<Proposal> {
+    let dag = space.dag();
+    let mut found: Vec<(Option<usize>, Proposal)> = space
+        .state()
+        .children(&ROOT)
+        .into_iter()
+        .filter(|n| n.kind == NodeKind::Uint(RECOVERY_PROPOSAL) && !n.deleted)
+        .filter_map(|n| {
+            let id = |k| -> Option<[u8; 32]> { as_created(n, k)?.as_bytes()?.try_into().ok() };
+            let list = |k| {
+                as_created(n, k)
+                    .and_then(Value::as_list)
+                    .unwrap_or_default()
+            };
+            let p = Proposal {
+                node: n.id,
+                author: n.creator,
+                identity: id(1)?,
+                parents: list(2)
+                    .iter()
+                    .filter_map(|v| v.as_bytes()?.try_into().ok())
+                    .collect(),
+                policy: id(3)?,
+            };
+            Some((dag.position(&n.created_in), p))
+        })
+        .collect();
+    found.sort_by_key(|(at, _)| *at);
+    found.into_iter().map(|(_, p)| p).collect()
+}
+
+/// `create` of a carried identity entry, its author's alone.
+pub fn create_carried(identity: &IdentityId, entry: &[u8]) -> SpaceOp {
+    SpaceOp::create(
+        NodeKind::Uint(CARRIED),
+        ROOT,
+        "carried",
+        Record::new()
+            .with(1, *identity)
+            .with(2, entry.to_vec())
+            .with(AUTHOR_OWNED_FIELD, 1u64),
+    )
+}
+
+/// An identity entry carried for a recovery.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Carried {
+    /// Who carried it.
+    pub author: IdentityId,
+    /// The identity recovered.
+    pub identity: IdentityId,
+    /// The entry, encoded.
+    pub entry: Vec<u8>,
+}
+
+/// The identity entries carried in a relationship space, in the order
+/// they were carried.
+pub fn carried(space: &Space) -> Vec<Carried> {
+    let dag = space.dag();
+    let mut found: Vec<(Option<usize>, Carried)> = space
+        .state()
+        .children(&ROOT)
+        .into_iter()
+        .filter(|n| n.kind == NodeKind::Uint(CARRIED) && !n.deleted)
+        .filter_map(|n| {
+            let c = Carried {
+                author: n.creator,
+                identity: as_created(n, 1)?.as_bytes()?.try_into().ok()?,
+                entry: as_created(n, 2)?.as_bytes()?.to_vec(),
+            };
+            Some((dag.position(&n.created_in), c))
+        })
+        .collect();
+    found.sort_by_key(|(at, _)| *at);
+    found.into_iter().map(|(_, c)| c).collect()
+}
+
+/// `create` of a guardian persona node, its author's alone: the persona
+/// they guard the other member through, and its log from genesis.
+pub fn create_guardian_persona(persona: &IdentityId, log: &[Vec<u8>]) -> SpaceOp {
+    SpaceOp::create(
+        NodeKind::Uint(GUARDIAN_PERSONA),
+        ROOT,
+        "guardian persona",
+        Record::new()
+            .with(1, *persona)
+            .with(2, Value::list(log.iter().map(|b| Value::from(b.clone()))))
+            .with(AUTHOR_OWNED_FIELD, 1u64),
+    )
+}
+
+/// A guardian persona node, as its author wrote it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GuardianPersona {
+    /// Who wrote it: the guardian.
+    pub author: IdentityId,
+    /// The persona.
+    pub persona: IdentityId,
+    /// Its log, from genesis, as of writing.
+    pub log: Vec<Vec<u8>>,
+}
+
+/// The guardian persona nodes in a relationship space, the latest first.
+pub fn guardian_personas(space: &Space) -> Vec<GuardianPersona> {
+    let dag = space.dag();
+    let mut found: Vec<(Option<usize>, GuardianPersona)> = space
+        .state()
+        .children(&ROOT)
+        .into_iter()
+        .filter(|n| n.kind == NodeKind::Uint(GUARDIAN_PERSONA) && !n.deleted)
+        .filter_map(|n| {
+            let p = GuardianPersona {
+                author: n.creator,
+                persona: as_created(n, 1)?.as_bytes()?.try_into().ok()?,
+                log: as_created(n, 2)?
+                    .as_list()?
+                    .iter()
+                    .filter_map(|v| v.as_bytes().map(<[u8]>::to_vec))
+                    .collect(),
+            };
+            Some((dag.position(&n.created_in), p))
+        })
+        .collect();
+    found.sort_by_key(|(at, _)| std::cmp::Reverse(*at));
+    found.into_iter().map(|(_, p)| p).collect()
+}
+
+/// `create` of a held copy node: its author gives the other member the set
+/// `label` to hold for them.
+pub fn create_held(label: &[u8; 32]) -> SpaceOp {
+    SpaceOp::create(
+        NodeKind::Uint(HELD_COPY),
+        ROOT,
+        "held copy",
+        Record::new().with(1, *label).with(AUTHOR_OWNED_FIELD, 1u64),
+    )
+}
+
+/// Who gives which set to hold.
+pub type Held = (IdentityId, [u8; 32]);
+
+/// The held copy nodes in a relationship space: who gives which set, in
+/// the order they were made.
+pub fn held(space: &Space) -> Vec<Held> {
+    let dag = space.dag();
+    let mut found: Vec<(Option<usize>, Held)> = space
+        .state()
+        .children(&ROOT)
+        .into_iter()
+        .filter(|n| n.kind == NodeKind::Uint(HELD_COPY) && !n.deleted)
+        .filter_map(|n| {
+            let l: [u8; 32] = as_created(n, 1)?.as_bytes()?.try_into().ok()?;
+            Some((dag.position(&n.created_in), (n.creator, l)))
+        })
+        .collect();
+    found.sort_by_key(|(at, _)| *at);
+    found.into_iter().map(|(_, h)| h).collect()
+}
+
+/// The node by which `author` gives the set `label` to hold, if any.
+pub fn held_node(space: &Space, author: &IdentityId, label: &[u8; 32]) -> Option<NodeId> {
+    space
+        .state()
+        .children(&ROOT)
+        .into_iter()
+        .filter(|n| n.kind == NodeKind::Uint(HELD_COPY) && !n.deleted && n.creator == *author)
+        .find(|n| as_created(n, 1).and_then(Value::as_bytes) == Some(label.as_slice()))
+        .map(|n| n.id)
+}
+
+/// Guardian request kind: "would you guard me?". Not in the specification,
+/// which says only that the person asks.
+pub const GUARDIAN_REQUEST: u64 = 67;
+
+/// `create` of a guardian request: its author asks the other member to
+/// guard them.
+pub fn create_guardian_request() -> SpaceOp {
+    SpaceOp::create(
+        NodeKind::Uint(GUARDIAN_REQUEST),
+        ROOT,
+        "guardian request",
+        Record::new().with(1, true).with(AUTHOR_OWNED_FIELD, 1u64),
+    )
+}
+
+/// The guardian requests in a relationship space, by author, with the
+/// position of the entry that made each, the latest last.
+pub fn guardian_requests(space: &Space) -> Vec<(IdentityId, Option<usize>)> {
+    let dag = space.dag();
+    let mut found: Vec<(IdentityId, Option<usize>)> = space
+        .state()
+        .children(&ROOT)
+        .into_iter()
+        .filter(|n| n.kind == NodeKind::Uint(GUARDIAN_REQUEST) && !n.deleted)
+        .map(|n| (n.creator, dag.position(&n.created_in)))
+        .collect();
+    found.sort_by_key(|(_, at)| *at);
+    found
+}
+
+/// The position of the entry that made the latest guardian persona node
+/// `author` wrote, if any.
+pub fn guardian_persona_at(space: &Space, author: &IdentityId) -> Option<usize> {
+    let dag = space.dag();
+    space
+        .state()
+        .children(&ROOT)
+        .into_iter()
+        .filter(|n| {
+            n.kind == NodeKind::Uint(GUARDIAN_PERSONA) && !n.deleted && n.creator == *author
+        })
+        .filter_map(|n| dag.position(&n.created_in))
+        .max()
+}

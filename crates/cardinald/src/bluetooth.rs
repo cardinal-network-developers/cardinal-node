@@ -288,6 +288,11 @@ fn system_radio(d: &Daemon) -> Result<Arc<dyn Radio>, String> {
 /// Starts the controller once: it turns the radio on and off as the
 /// setting and the windows say.
 pub fn start(d: &Arc<Daemon>) {
+    // A persona's devices advertise nothing for it (`identity.md#personas`),
+    // and the radio is its device's service's.
+    if d.config().this_run.inside() {
+        return;
+    }
     if d.bluetooth.started.swap(true, Ordering::SeqCst) {
         return;
     }

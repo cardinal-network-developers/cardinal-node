@@ -134,6 +134,12 @@ impl Daemon {
                     Access::Other(identity)
                 } else if Some(*label) == core.identity_label() || core.shares(&identity, label) {
                     Access::Full
+                } else if core.held_given(&identity).contains(label) {
+                    // a copy this person gives them to hold (D80)
+                    Access::Read
+                } else if core.held_taken(&identity).contains(label) {
+                    // one they give this person to hold
+                    Access::Offered
                 } else if core.offered_here(&identity, label) {
                     Access::Offered
                 } else if let Some(m) = core
@@ -163,7 +169,7 @@ impl Daemon {
                 let core = self.core();
                 token_access(core.space_of_token(&token), core.identity_label(), label)
             }
-            PeerKind::Restoring | PeerKind::Helped(_) | PeerKind::Stranger => Access::None,
+            PeerKind::Restoring | PeerKind::Stranger => Access::None,
         }
     }
 }
@@ -219,7 +225,7 @@ pub async fn serve(d: Arc<Daemon>, s: Session, gen: u64) {
 pub async fn sync_all(d: &Arc<Daemon>, s: &Session) {
     let (labels, member) = match d.classify(s) {
         PeerKind::Contact(identity, _) => (d.core().labels_with(&identity), Some(identity)),
-        PeerKind::Token(_) | PeerKind::Helped(_) | PeerKind::Stranger => return,
+        PeerKind::Token(_) | PeerKind::Stranger => return,
         _ => (d.core().labels(), None),
     };
     for label in labels {
@@ -305,9 +311,6 @@ async fn handle_stream(d: &Arc<Daemon>, s: &Session, mut st: Stream) -> anyhow::
         };
         tracing::trace!("blob stream {} accepted", st.id());
         return serve_blob(d, st, allowed).await;
-    }
-    if st.service() == crate::guardians::service() {
-        return crate::guardians::serve(d, s, st).await;
     }
     if st.service() == crate::speedtest::service() && crate::speedtest::offered() {
         return crate::speedtest::serve(d, s, st).await;
@@ -404,11 +407,7 @@ async fn handle_stream(d: &Arc<Daemon>, s: &Session, mut st: Stream) -> anyhow::
 fn is_someone_else(kind: PeerKind) -> bool {
     matches!(
         kind,
-        PeerKind::Token(_)
-            | PeerKind::Contact(..)
-            | PeerKind::Inviting(..)
-            | PeerKind::Helped(_)
-            | PeerKind::Stranger
+        PeerKind::Token(_) | PeerKind::Contact(..) | PeerKind::Inviting(..) | PeerKind::Stranger
     )
 }
 

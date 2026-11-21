@@ -27,6 +27,7 @@ pub mod fs;
 pub mod fsat;
 pub mod groups;
 pub mod guardians;
+pub mod helper;
 pub mod host;
 pub mod inspect;
 pub mod introductions;

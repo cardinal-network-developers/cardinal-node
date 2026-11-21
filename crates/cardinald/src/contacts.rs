@@ -76,6 +76,34 @@ pub(crate) fn invite_for(
     for_identity: Option<[u8; 32]>,
     met: Option<&account::Met>,
 ) -> anyhow::Result<Invitation> {
+    invite_with(d, address, name, regard, for_identity, met, None)
+}
+
+/// An invitation between a recovery helper and a guardian of
+/// `recovery_of` (`contact.md#invitations`, field 9), made by either. The
+/// two trust each other for as long as the recovery takes, and introduce
+/// nobody.
+pub(crate) fn invite_recovery(
+    d: &Arc<Daemon>,
+    address: Option<&str>,
+    recovery_of: [u8; 32],
+) -> anyhow::Result<Invitation> {
+    let regard = Regard {
+        trusted: true,
+        introductions: false,
+    };
+    invite_with(d, address, None, regard, None, None, Some(recovery_of))
+}
+
+fn invite_with(
+    d: &Arc<Daemon>,
+    address: Option<&str>,
+    name: Option<&str>,
+    regard: Regard,
+    for_identity: Option<[u8; 32]>,
+    met: Option<&account::Met>,
+    recovery_of: Option<[u8; 32]>,
+) -> anyhow::Result<Invitation> {
     let me = identity(d)?;
     let here = *d.keys.link.public_key().x25519();
     let port = d
@@ -109,6 +137,7 @@ pub(crate) fn invite_for(
     // the name this person suggests for themselves, unless told another
     invitation.name = Some(name.map_or_else(|| crate::names::my_name(d), str::to_owned));
     invitation.for_identity = for_identity;
+    invitation.recovery_of = recovery_of;
     let account = d
         .core()
         .account_id()
@@ -351,17 +380,53 @@ fn invitation_used(d: &Arc<Daemon>, s: &Session, who: &[u8; 32]) -> anyhow::Resu
     Ok(())
 }
 
-/// Takes up an invitation, and becomes a contact of whoever gave it.
+/// Takes up an invitation, and becomes a contact of whoever gave it. A
+/// recovery invitation (field 9) is taken only with `recovery`, which only
+/// the person's own `accept` and a recovery helper set: nothing that runs
+/// unasked, such as an introduction, ever uses one.
 pub async fn accept(
     d: &Arc<Daemon>,
     code: &str,
     name: Option<&str>,
     regard: Regard,
     met: account::Met,
+    recovery: bool,
 ) -> anyhow::Result<Json> {
     let invitation = Invitation::from_text(code.trim())
         .map_err(|_| anyhow::anyhow!("that is not an invitation"))?;
     let me = identity(d)?;
+    anyhow::ensure!(
+        invitation.recovery_of.is_none() || recovery,
+        "that is an invitation to help someone recover their identity; only you, using it \
+         yourself, can take it up. Nothing was sent."
+    );
+    // Neither side of a recovery's relationship is the person recovered.
+    anyhow::ensure!(
+        invitation.recovery_of != Some(invitation.inviter) && invitation.recovery_of != Some(me),
+        "that recovery invitation names its own maker or you; nothing was sent"
+    );
+    // A recovery invitation is answered only by a guardian of whoever it
+    // names, or by a recovery helper; anyone else's device tells its
+    // person so and sends nothing back (`identity.md#how-guardians-act`).
+    // A guardian answers through their persona for that person (D79),
+    // whose service takes it up from here.
+    let inside = d.config().this_run.inside();
+    match invitation.recovery_of {
+        Some(p) if !inside => {
+            crate::guardians::may_answer(d, &p)?;
+            return crate::guardians::accept_recovery(d, code, &p).await;
+        }
+        None if inside => anyhow::bail!("that is not a recovery invitation"),
+        _ => {}
+    }
+    // A helper and a guardian trust each other for the recovery's sake.
+    let regard = match invitation.recovery_of {
+        Some(_) => Regard {
+            trusted: true,
+            introductions: false,
+        },
+        None => regard,
+    };
     anyhow::ensure!(invitation.inviter != me, "that invitation is your own");
     anyhow::ensure!(
         !is_refused(d, &invitation.inviter),
@@ -396,10 +461,13 @@ pub async fn accept(
         },
     };
     d.on_session(s.clone());
-    let petname = name
-        .map(str::to_owned)
-        .or(invitation.name.clone())
-        .unwrap_or_else(|| account::short_key(&invitation.inviter));
+    let petname = match invitation.recovery_of {
+        Some(p) if !inside => crate::guardians::helper_petname(d, &p),
+        _ => name
+            .map(str::to_owned)
+            .or(invitation.name.clone())
+            .unwrap_or_else(|| account::short_key(&invitation.inviter)),
+    };
     let exchange = accept_exchange(d, &s, me, &invitation, &petname, regard, &met);
     let done = tokio::time::timeout(EXCHANGE_WITHIN, exchange)
         .await
@@ -409,7 +477,10 @@ pub async fn accept(
         s.abandon();
     }
     done?;
-    Ok(json!({"name": petname}))
+    Ok(json!({
+        "name": petname,
+        "recovery_of": invitation.recovery_of.map(hex::encode),
+    }))
 }
 
 async fn accept_exchange(
@@ -456,6 +527,7 @@ async fn accept_exchange(
         &space,
         regard,
         Some(met),
+        invitation.recovery_of.as_ref(),
     )?;
     mailbox::met(d, &space, &invitation.inviter);
     send(&mut st, &ContactMessage::Done).await?;
@@ -522,7 +594,14 @@ pub async fn serve(d: &Arc<Daemon>, s: &Session, mut st: Stream) -> anyhow::Resu
     };
     anyhow::ensure!(identity == them, "not who the session says");
     // One made for someone, as an introduction's is, is theirs alone.
-    let bound = invitation_of_session(d, s).and_then(|i| i.for_identity);
+    let made_for = invitation_of_session(d, s);
+    let bound = made_for.as_ref().and_then(|i| i.for_identity);
+    let recovery_of = made_for.as_ref().and_then(|i| i.recovery_of);
+    // Neither side of a recovery's relationship is the person recovered.
+    if recovery_of == Some(them) {
+        s.abandon();
+        return Ok(());
+    }
     if bound.is_some_and(|f| f != them) {
         s.abandon();
         return Ok(());
@@ -548,7 +627,17 @@ pub async fn serve(d: &Arc<Daemon>, s: &Session, mut st: Stream) -> anyhow::Resu
         if let Err(e) = invitation_used(d, s, &them) {
             tracing::debug!("counting an invitation's use: {e:#}");
         }
-        record_contact(d, &them, &name, Some(&name), &space, regard, Some(&met))?;
+        let petname = name.clone();
+        record_contact(
+            d,
+            &them,
+            &petname,
+            Some(&name),
+            &space,
+            regard,
+            Some(&met),
+            recovery_of.as_ref(),
+        )?;
         // The account counts it now.
         drop(using);
         mailbox::met(d, &space, &them);
@@ -587,6 +676,7 @@ fn met_by_invitation(d: &Daemon, s: &Session) -> Option<account::Met> {
     found?.met
 }
 
+#[allow(clippy::too_many_arguments)]
 fn record_contact(
     d: &Arc<Daemon>,
     who: &[u8; 32],
@@ -595,12 +685,13 @@ fn record_contact(
     space: &SpaceId,
     regard: Regard,
     met: Option<&account::Met>,
+    recovery_of: Option<&[u8; 32]>,
 ) -> anyhow::Result<()> {
     let account = d
         .core()
         .account_id()
         .ok_or_else(|| anyhow::anyhow!("the account space is not here yet"))?;
-    let op = account::create_contact_suggesting(who, petname, suggested, space, regard, met);
+    let op = account::create_contact_for(who, petname, suggested, space, regard, met, recovery_of);
     d.write_and_push(&account, vec![op])?;
     // Just met: they will want to talk.
     d.rendezvous.use_contact(who);
@@ -759,9 +850,13 @@ pub fn list(d: &Daemon, all: bool) -> Json {
     };
     let contacts: Vec<Json> = everyone
         .iter()
+        // a recovery's relationship is no contact (`guardians.rs`)
+        .filter(|c| c.recovery_of.is_none())
         .filter(|c| all || !c.refused)
         .map(|c| {
+            let recovered = recovered_note(d, &c.identity);
             let v = json!({
+                "recovered": recovered,
                 "met": c.met.as_ref().map(|m| met_json(m, &everyone, &group_names)),
                 "identity": hex::encode(&c.identity[..8]),
                 "trusted": c.regard.trusted,
@@ -776,6 +871,26 @@ pub fn list(d: &Daemon, all: bool) -> Json {
         })
         .collect();
     json!({"contacts": contacts})
+}
+
+/// What a contact's software says of someone recovered by guardians
+/// (`identity.md#what-a-recovery-does`, D79), if their log shows a recovery
+/// in effect. Identity entries carry no time, so the date of the policy is
+/// not given (DEVIATIONS.md).
+fn recovered_note(d: &Daemon, who: &[u8; 32]) -> Option<String> {
+    let core = d.core();
+    let log = &core.others.get(who)?.log;
+    let st = log.state();
+    let r = log
+        .recoveries()
+        .into_iter()
+        .find(|r| st.in_effect.contains(&r.entry))?;
+    let p = log.policy(&r.policy)?;
+    Some(format!(
+        "was recovered by guardians they chose, after {}. If in doubt, check with them in \
+         person.",
+        crate::guardians::delay_text(p.delay)
+    ))
 }
 
 /// How two people met, as a window shows it.
@@ -802,7 +917,9 @@ fn met_json(m: &account::Met, contacts: &[ContactRecord], groups: &[(SpaceId, St
 /// The contact called `who`.
 pub(crate) fn find(d: &Daemon, who: &str) -> anyhow::Result<ContactRecord> {
     let w = who.to_lowercase();
-    let contacts = d.core().contacts();
+    let mut contacts = d.core().contacts();
+    // a recovery's relationship is no contact (`guardians.rs`)
+    contacts.retain(|c| c.recovery_of.is_none());
     let named =
         |c: &ContactRecord| c.petname.to_lowercase() == w || hex::encode(&c.identity[..8]) == w;
     let mut found = contacts.into_iter().filter(named);
@@ -1410,7 +1527,7 @@ pub fn conversations(d: &Daemon) -> Json {
     let contacts = core.contacts();
     let mut found: Vec<(Option<u64>, Json)> = contacts
         .iter()
-        .filter(|c| !c.refused)
+        .filter(|c| !c.refused && c.recovery_of.is_none())
         .map(|c| {
             let open = core.spaces.get(&c.space).and_then(|h| h.space.as_ref());
             let said = open.map(relationship::messages).unwrap_or_default();

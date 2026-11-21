@@ -55,10 +55,6 @@ pub enum PeerKind {
     /// A session opened with a delivery token, by someone this device need
     /// not know (`hosts.md#delivery-tokens`).
     Token(crate::mailbox::Token),
-    /// A new device of someone this person guards, in a session opened with
-    /// a help code this device gave (`guardians.rs`): the person's
-    /// identity, which the device cannot prove yet.
-    Helped([u8; 32]),
     /// Anyone else.
     Stranger,
 }
@@ -271,9 +267,12 @@ pub struct Daemon {
     pub news: Mutex<crate::news::Waiting>,
     /// Static keys of restore sessions that proved the root key.
     proven: Mutex<HashSet<[u8; 32]>>,
-    /// Secrets of help codes this device gave as a guardian, and whom each
-    /// helps recover (`guardians.rs`).
-    pub helping: Mutex<HashMap<u64, [u8; 32]>>,
+    /// The recovery helper of a recovery through guardians under way on
+    /// this new device (`helper.rs`).
+    pub helper: Mutex<Option<Arc<crate::helper::Helper>>>,
+    /// The services of this person's personas this device acts as
+    /// (`helper.rs`), by persona id.
+    pub personas: Mutex<HashMap<[u8; 32], Arc<crate::helper::Helper>>>,
     saving_book: Mutex<()>,
     /// Rendezvous and relay, as a device and as a host.
     pub rendezvous: crate::rendezvous::Rendezvous,
@@ -461,7 +460,8 @@ impl Daemon {
         raise_fd_limit();
         crate::format::check(&paths)?;
         let keys = Arc::new(Keys::load_or_create(&paths.device_key())?);
-        let core = Core::load(&paths, keys.clone())?;
+        let mut core = Core::load(&paths, keys.clone())?;
+        core.takes_recovery_copies = config.this_run.helper;
         let store = Arc::new(FsStore::open(paths.blobs(), Fsync::Deferred)?);
         std::fs::create_dir_all(paths.staging())?;
         let directory = Arc::new(Directory::default());
@@ -572,7 +572,8 @@ impl Daemon {
             blob_stats: Mutex::new(HashMap::new()),
             news: Mutex::new(HashMap::new()),
             proven: Mutex::new(HashSet::new()),
-            helping: Mutex::new(HashMap::new()),
+            helper: Mutex::new(None),
+            personas: Mutex::new(HashMap::new()),
             saving_book: Mutex::new(()),
             rendezvous,
             mailbox,
@@ -670,11 +671,6 @@ impl Daemon {
                 return PeerKind::PairingAdmin(*identity);
             }
         }
-        if s.role() == cardinal_link::Role::Responder {
-            if let Some(who) = crate::guardians::helping(self, s) {
-                return PeerKind::Helped(who);
-            }
-        }
         if self.is_invitation(s) {
             if let Some(p) = s.peer_identity() {
                 let shut_out = {
@@ -753,7 +749,10 @@ impl Daemon {
             .collect();
         let core = self.core();
         open.into_iter()
-            .filter(|(identity, _)| core.shares(identity, label))
+            // and a copy given them to hold (D80)
+            .filter(|(identity, _)| {
+                core.shares(identity, label) || core.held_given(identity).contains(label)
+            })
             .map(|(_, s)| s)
             .collect()
     }
@@ -770,6 +769,28 @@ impl Daemon {
     /// so it is fit for a path as busy as serving blobs.
     pub fn session_kind(&self, peer_static: &[u8; 32]) -> Option<PeerKind> {
         lock(&self.sessions).get(peer_static).map(|c| c.kind)
+    }
+
+    /// The open sessions with `person`'s devices that are contacts' sessions,
+    /// and those still an invitation's, which reach nothing but the log and
+    /// the relationship (`contact.md#accepting`).
+    pub fn contact_and_inviting(&self, person: &[u8; 32]) -> (Vec<Session>, Vec<Session>) {
+        let (mut contact, mut inviting) = (Vec::new(), Vec::new());
+        for c in lock(&self.sessions)
+            .values()
+            .filter(|c| !c.session.is_closed())
+        {
+            match c.kind {
+                PeerKind::Contact(identity, _) if identity == *person => {
+                    contact.push(c.session.clone())
+                }
+                PeerKind::Inviting(identity, _) if identity == *person => {
+                    inviting.push(c.session.clone())
+                }
+                _ => {}
+            }
+        }
+        (contact, inviting)
     }
 
     /// The open sessions with a contact's devices. The session an invitation
@@ -1108,10 +1129,7 @@ impl Daemon {
             });
             return;
         }
-        if matches!(
-            kind,
-            PeerKind::Inviting(..) | PeerKind::Token(_) | PeerKind::Helped(_)
-        ) {
+        if matches!(kind, PeerKind::Inviting(..) | PeerKind::Token(_)) {
             return;
         }
         tokio::spawn(async move { net::sync_all(&d, &s).await });
@@ -1232,6 +1250,8 @@ impl Daemon {
             }
             // this person may have left it, on another of their devices
             crate::mailbox::revoke_left(self, &label);
+            // a copy given this person to hold may be named in it (D80)
+            crate::guardians::held_named(self, &label);
             self.bump();
             self.housekeeping();
         }
@@ -2041,7 +2061,12 @@ impl Daemon {
 
     /// Runs until stopped.
     pub async fn run(self: Arc<Self>) -> anyhow::Result<()> {
-        let control = crate::control::serve(self.clone())?;
+        // A recovery helper is driven by the service it runs in.
+        let helper = self.config().this_run.inside();
+        let control = match helper {
+            true => None,
+            false => Some(crate::control::serve(self.clone())?),
+        };
         tracing::info!(
             "cardinal {} daemon started: data in {}, listening on {}, control socket {}",
             cardinal_update::VERSION,
@@ -2052,7 +2077,7 @@ impl Daemon {
                 .unwrap_or_default(),
             self.paths.socket.display()
         );
-        if self.core().identity.is_none() {
+        if self.core().identity.is_none() && !helper {
             tracing::info!(
                 "this device does not belong to anyone yet: run `cardinal init` (first device) \
                  or `cardinal pair` (to add it to your other devices)"
@@ -2146,7 +2171,11 @@ impl Daemon {
         crate::names::start(self.clone());
         // Report (never install) new releases, if the person allows it.
         let cfg_path = self.paths.config();
+        let looks = !helper;
         tokio::spawn(async move {
+            if !looks {
+                return;
+            }
             loop {
                 let p = cfg_path.clone();
                 let r = tokio::task::spawn_blocking(move || -> anyhow::Result<Option<String>> {
@@ -2169,8 +2198,15 @@ impl Daemon {
             }
         });
         self.housekeeping();
-        // Always: switched off now, on another device it may be turned on.
-        tokio::spawn(crate::portmap::keep(self.clone()));
+        if !helper {
+            // Always, but for a helper: switched off now, on another
+            // device it may be turned on.
+            tokio::spawn(crate::portmap::keep(self.clone()));
+            // a recovery through guardians under way goes on
+            crate::recovering::resume(&self);
+            // and this person's guardian personas act
+            crate::guardians::start_personas(&self);
+        }
 
         let mut stop = self.stopping.subscribe();
         tokio::select! {
@@ -2187,8 +2223,13 @@ impl Daemon {
         self.endpoint
             .close_gracefully(Duration::from_millis(500))
             .await;
-        drop(control);
-        let _ = std::fs::remove_file(&self.paths.socket);
+        if control.is_some() {
+            drop(control);
+            let _ = std::fs::remove_file(&self.paths.socket);
+        }
+        if !helper {
+            crate::helper::stop_all(&self).await;
+        }
         tracing::info!("stopped");
         Ok(())
     }

@@ -56,17 +56,75 @@ pub fn install(
     config: &Config,
     person: &str,
 ) -> anyhow::Result<()> {
+    let created = prepared.created;
+    let entries: Vec<Vec<u8>> = created.log.entries().map(|e| e.encode()).collect();
+    install_entries(paths, &entries, config, person)
+}
+
+/// Saves an identity log, `entries` (its own first, then any held under
+/// its label), and creates new account and files spaces for it: for a
+/// new identity, or one taken up again through guardians with nothing
+/// left of its spaces (`hosts.md#restore`). This device must be one of
+/// its devices, and the log must open its encryption key.
+pub fn install_entries(
+    paths: &Paths,
+    entries: &[Vec<u8>],
+    config: &Config,
+    person: &str,
+) -> anyhow::Result<()> {
     crate::format::check(paths)?;
     let keys = Arc::new(Keys::load_or_create(&paths.device_key())?);
     let mut core = Core::load(paths, keys.clone())?;
-    let created = prepared.created;
-    let entries: Vec<Vec<u8>> = created.log.entries().map(|e| e.encode()).collect();
-    core.install_identity(&entries)?;
-    let ident = core.identity.as_ref().expect("installed");
-    if ident.enc.is_empty() {
-        anyhow::bail!("could not open the new identity's encryption key");
+    core.install_identity(entries)?;
+    create_spaces(&mut core, &keys, config, person)
+}
+
+/// Saves an identity log taken up again through guardians, with the sets
+/// they gave back (D80): the sealed account and the relationship spaces,
+/// by label. With no account among them, new account and files spaces are
+/// made. Returns whether the account came back.
+pub fn install_recovered(
+    paths: &Paths,
+    entries: &[Vec<u8>],
+    copies: &[([u8; 32], Vec<Vec<u8>>)],
+    config: &Config,
+    person: &str,
+) -> anyhow::Result<bool> {
+    crate::format::check(paths)?;
+    let keys = Arc::new(Keys::load_or_create(&paths.device_key())?);
+    let mut core = Core::load(paths, keys.clone())?;
+    core.install_identity(entries)?;
+    core.identity_updated();
+    for (label, sealed) in copies {
+        if let Err(e) = core.ingest_space(*label, sealed) {
+            tracing::warn!("a set a guardian gave back: {e:#}");
+        }
     }
-    let pk = created.encryption.public_key().clone();
+    // Every entry of them is the removed devices' work, set aside until
+    // kept: the person's account and relationships, kept whole.
+    let labels: Vec<[u8; 32]> = copies.iter().map(|(l, _)| *l).collect();
+    if let Err(e) = core.keep_given_back(&labels) {
+        tracing::warn!("keeping what the guardians gave back: {e:#}");
+    }
+    if core.account_id().is_some() {
+        return Ok(true);
+    }
+    create_spaces(&mut core, &keys, config, person)?;
+    Ok(false)
+}
+
+/// Creates the account and files spaces of an identity just installed.
+pub(crate) fn create_spaces(
+    core: &mut Core,
+    keys: &Arc<Keys>,
+    config: &Config,
+    person: &str,
+) -> anyhow::Result<()> {
+    let ident = core.identity.as_ref().expect("installed");
+    let Some(enc) = ident.enc.first() else {
+        anyhow::bail!("could not open the identity's encryption key");
+    };
+    let pk = enc.public_key().clone();
 
     let (account, acc_genesis) = Space::create(
         Profile::ACCOUNT,

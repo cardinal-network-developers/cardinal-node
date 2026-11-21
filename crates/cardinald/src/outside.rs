@@ -268,6 +268,11 @@ fn own_self_grant(d: &Daemon) -> Option<Grant> {
 /// gives it now, and the grant with it. Call it whenever the router gives
 /// an address, renewals included, and now and then besides.
 pub fn tick(d: &Arc<Daemon>) {
+    // A persona's service never names itself: it shares no hosts or reach
+    // nodes with anyone (`identity.md#personas`).
+    if d.config().this_run.inside() {
+        return;
+    }
     if d.config().host {
         // An explicit host's endpoints are its person's.
         return;

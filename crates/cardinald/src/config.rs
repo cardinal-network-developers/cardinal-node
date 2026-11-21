@@ -36,6 +36,22 @@ pub struct ThisRun {
     /// Addresses given for this device that still name the port it left,
     /// and cannot be made to follow it: a router's forward.
     pub left_behind: Vec<String>,
+    /// This is a recovery helper's service, run inside a new device's for
+    /// as long as a recovery through guardians is under way
+    /// (`helper.rs`): no control socket, no mount, no discovery, no port
+    /// mapping, no looking for releases.
+    pub helper: bool,
+    /// This is the service of a guardian's persona, run inside the
+    /// guardian's device's for as long as the persona is not burned
+    /// (`helper.rs`), with the same things left out.
+    pub guardian_persona: bool,
+}
+
+impl ThisRun {
+    /// Whether this is a persona's service run inside another's.
+    pub fn inside(&self) -> bool {
+        self.helper || self.guardian_persona
+    }
 }
 
 /// Device settings.

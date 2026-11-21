@@ -395,6 +395,98 @@ keep everything, whether it counts (`state`: passed, failed, stale,
 unchecked), why not (`reason`), the times of its last check, pass, and
 failure, and checks it left unanswered in a row (`missed`).
 
+### Guardians and recovery
+
+A fingerprint is five words from the BIP-39 English list, separated by
+single spaces, as `"wealth above drive initial couple"`; a request that
+takes one reads it however it was typed (any case, any separator, four
+letters a word suffice). The person: `guardians` → `{guardians,
+threshold, delay, delay_text, data, names, recoveries: [{fingerprint,
+endorsed, confirmed, in_effect, objected, id}], frozen}`; `guardians-set`
+(`who`, `threshold`, `delay`; the words); `guardians-object`
+(`fingerprint`, needed only when more than one is under way).
+
+The person asks with `guardians-ask` (`who`) → `{name}`. A guardian acts
+through a persona per person guarded and per policy (D79), made by
+`guarding-accept` (`who`) → `{name, persona (64 hex), already}`, which the
+person then names with `guardians-set` (it fails, saying so, for a
+contact with no persona not named before). With guardians in office,
+`guardians-set` asks no words and replies `pending: true`: the change
+takes effect once they confirm it. `guarding` → `{guarding: [{name, id (64
+hex), persona, guardians, threshold, delay, delay_text, recoveries,
+waiting, warning, never, helpers, account_copy, changes}], accepted:
+[names], asked: [names], now_ms}`; `asked` lists those who asked this
+person to guard them, unanswered; `accepted`, those this person accepted
+to guard who have not named them yet; `changes`, each change of the
+person's guardians under way, `{id, guardians, threshold, delay_text,
+confirmed, confirmed_by_me, in_effect, objected, confirm_from_ms,
+caution}`, which `guarding-confirm-change` (`who`, `understood`)
+confirms, after the wait from when this device saw it; `account_copy`, whether this device holds the
+person's sealed account (D80). `recoveries` holds at most one: the one recovery of
+that person shown at a time, `{fingerprint, endorsed, confirmed,
+endorsed_by_me, confirmed_by_me, pending, confirm_from_ms, objected,
+in_effect, keeps_keys, caution}` (`keeps_keys`: the `recover` keeps an
+old key, and endorsing or confirming it fails). `caution` is the warning to show, in plain words,
+before endorsing and again before confirming; a client shows it and asks
+the guardian to go on. `waiting` counts other recoveries of that person
+under way, which are not shown; `warning` is the text to show then, or
+null. `never` lists the fingerprints the guardian said never to confirm;
+`helpers`, the recovery relationships for that person.
+`guarding-invite` (`who`, `at`: host:port, optional) → `{code, name}`:
+an invitation for the person's new device, naming them in field 9.
+`guarding-caution` (`who`) → `{name, caution}`: the warning to show before
+endorsing or confirming, however `who` names the person.
+`guarding-endorse` and `guarding-confirm` (`who`, `fingerprint`,
+`understood`) → as `guarding`; both fail unless `understood` is true (the
+guardian was shown `caution` and went on), and fail for a recovery that
+waits behind the one shown, or that the guardian said never to. `guarding-never` (`who`,
+`fingerprint`) → as `guarding`: never endorse or confirm it, on any of
+the guardian's devices (an account setting); the recovery relationship
+for it is retired (refused), as is any for another recovery once one is
+in effect. `accept` of an invitation
+that names someone in field 9 fails, with nothing sent, unless this
+person guards them; for a guardian it replies `{name, recovery_of}`, and
+the relationship is listed nowhere as a contact (`contacts`,
+`conversations`, the one folder).
+
+The new device: `recover` → `{under_way: true, identity, fingerprint,
+helper, guardians, proposed, asked, endorsed, confirmed, threshold,
+in_effect, held}` while one is under way (`held`: how many sets the
+guardians gave back so far, the account among them); `{under_way: false, finished: true,
+words, pair_again}` once, when `recover-finish` made the device the
+person's but stopped before the end (show the words; the next `recover`
+no longer has them); else `{under_way: false, pair_again}`. A recovery
+keeps none of the old devices: `pair_again` lists them, `[{key, name}]`
+(`key` the first 16 hex digits, `name` null unless the account remembers
+one), to show under "pair them again". `recover-start` (`code`: a
+guardian's recovery invitation, `identity`: 64 hex; both optional) →
+`{fingerprint, identity}`: starts one if none is under way, and meets
+that guardian. `recover-invite` (`at`, optional) → `{code, fingerprint}`:
+an invitation for a guardian who is present to `accept`.
+`recover-cancel` → `{fingerprint}` (null if nothing was under way).
+`recover-finish` (`without_account`, `lost_at`: ms, both optional) →
+`{words, account, pair_again, lost_devices}`: refuses while no guardian
+has given the account back, unless `without_account`; `lost_devices`
+lists each removed device `{key, name, set_aside}` with how many of its
+entries are set aside, to keep up to a time with `keep-work` (or now,
+with `lost_at`, by those devices' own clocks). It takes the identity up
+from what the guardians carried, and the account and relationships they
+held (`account` true), or with new account and files spaces when none
+held one; `words` are the new recovery words, to show once, and
+`pair_again` the devices the account remembers, under "Pair your other
+devices again".
+
+`contacts` gives each contact `recovered`: the text to show when their log
+has a recovery in effect ("was recovered by guardians they chose, after
+7 days. If in doubt, check with them in person."), else null.
+
+`accept` is the only request that takes a recovery invitation; an
+introduction never uses one.
+
+Removed (D77): `guarding-help` and `recover-via`, with the
+`cardinal-help:` code they used; `recover-start` takes no `key` and
+`recover-finish` no `at`, `key` or `without_hosts`.
+
 ## Inspection
 
 For designing the data structures, not for applications: a read-only

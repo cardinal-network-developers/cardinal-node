@@ -334,7 +334,8 @@ async fn handle(d: &Arc<Daemon>, req: &Value) -> anyhow::Result<Value> {
                 via: req.get("via").and_then(|v| v.as_str()).map(str::to_owned),
                 ..Default::default()
             };
-            crate::contacts::accept(d, arg(req, "code")?, name, regard(req), met).await
+            // the person's own accept: the only one that takes a recovery's
+            crate::contacts::accept(d, arg(req, "code")?, name, regard(req), met, true).await
         }
         "invitations" => Ok(crate::contacts::invitations(d)),
         "cancel-invitation" => crate::contacts::cancel_invitation(d, arg(req, "id")?),
@@ -549,12 +550,27 @@ async fn handle(d: &Arc<Daemon>, req: &Value) -> anyhow::Result<Value> {
             crate::guardians::object(d, req.get("fingerprint").and_then(Value::as_str))
         }
         "guarding" => Ok(crate::guardians::list(d)),
-        "guarding-help" => crate::guardians::help(d, arg(req, "who")?, &strings(req, "at")),
+        "guarding-invite" => {
+            crate::guardians::invite(d, arg(req, "who")?, req.get("at").and_then(Value::as_str))
+                .await
+        }
+        "guarding-accept" => crate::guardians::accept_role(d, arg(req, "who")?).await,
+        "guardians-ask" => crate::guardians::ask(d, arg(req, "who")?),
+        "guarding-confirm-change" => {
+            let understood = req.get("understood").and_then(Value::as_bool) == Some(true);
+            crate::guardians::confirm_change(d, arg(req, "who")?, understood).await
+        }
+        "guarding-never" => crate::guardians::never(d, arg(req, "who")?, arg(req, "fingerprint")?),
+        "guarding-caution" => crate::guardians::caution_for(d, arg(req, "who")?),
         "guarding-endorse" => {
-            crate::guardians::endorse(d, arg(req, "who")?, arg(req, "fingerprint")?).await
+            let understood = req.get("understood").and_then(Value::as_bool) == Some(true);
+            crate::guardians::endorse(d, arg(req, "who")?, arg(req, "fingerprint")?, understood)
+                .await
         }
         "guarding-confirm" => {
-            crate::guardians::confirm(d, arg(req, "who")?, arg(req, "fingerprint")?).await
+            let understood = req.get("understood").and_then(Value::as_bool) == Some(true);
+            crate::guardians::confirm(d, arg(req, "who")?, arg(req, "fingerprint")?, understood)
+                .await
         }
         "recover" => crate::recovering::status(d),
         "keep-work" => crate::recovering::keep_work(
@@ -562,11 +578,19 @@ async fn handle(d: &Arc<Daemon>, req: &Value) -> anyhow::Result<Value> {
             arg(req, "name")?,
             req.get("up_to").and_then(Value::as_str),
         ),
-        "recover-via" => {
-            crate::recovering::via(d, arg(req, "code")?, req.get("key").and_then(Value::as_str))
-                .await
+        "recover-start" => {
+            let opt = |k: &str| req.get(k).and_then(Value::as_str);
+            crate::recovering::start(d, opt("code"), opt("identity")).await
         }
-        "recover-finish" => crate::recovering::finish(d, arg(req, "at")?, arg(req, "key")?).await,
+        "recover-invite" => {
+            crate::recovering::invite(d, req.get("at").and_then(Value::as_str)).await
+        }
+        "recover-cancel" => crate::recovering::cancel(d).await,
+        "recover-finish" => {
+            let without = req.get("without_account").and_then(Value::as_bool) == Some(true);
+            let lost_at = req.get("lost_at").and_then(Value::as_u64);
+            crate::recovering::finish(d, without, lost_at).await
+        }
         "restore-from-host" => {
             crate::host::restore(d, arg(req, "words")?, arg(req, "at")?, arg(req, "key")?).await
         }
@@ -797,7 +821,7 @@ async fn speedtest(d: &Arc<Daemon>, who: &str) -> anyhow::Result<Value> {
     Ok(v)
 }
 
-fn reload(d: &Arc<Daemon>) -> anyhow::Result<()> {
+pub(crate) fn reload(d: &Arc<Daemon>) -> anyhow::Result<()> {
     {
         let mut core = d.core();
         if core.identity.is_some() {
