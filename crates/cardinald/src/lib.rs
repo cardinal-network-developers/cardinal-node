@@ -45,6 +45,7 @@ pub mod recovering;
 pub mod recovery;
 pub mod rendezvous;
 pub mod sched;
+pub mod settings;
 pub mod setup;
 pub mod speedtest;
 pub mod transport;

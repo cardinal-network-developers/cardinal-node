@@ -363,6 +363,10 @@ with `mine` true or false, and `name`, the person's answer to "Is this
 your network?" for it, kept in the account for all their devices, D76;
 `ask` true is when a client shows that question, quietly; `status` gives
 the same as `network`),
+`read-markers` (with nothing: `{on}`, whether others see what this
+person has read; with `on`, sets it in the account for every device of
+theirs; off, `mark-read` writes no marker and answers `{marked: false,
+why}`; on, `mark-read` answers `{marked}`),
 `speedtest` (one device, by
 name or key), `reload` (after `init` while the daemon runs), `flush`
 (commit now), `stop`. `status` includes `copies`: per device meant to

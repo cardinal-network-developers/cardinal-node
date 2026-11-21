@@ -1291,6 +1291,19 @@ Not implemented yet (the next milestone):
 The first step of sharing: two people connect and talk. Much of what the spec
 asks for around that is not built yet.
 
+### Read markers are the person's to give (`profiles.md#relationship`)
+
+- **The setting** is a setting node (kind 6) named `read markers`, value
+  false when off (`settings.rs`, request `read-markers`). It is off if any
+  value of any node of that name says false. Off, no device of the
+  person's creates or moves a marker, in a relationship or a group, and
+  `mark-read` says why it wrote nothing. Markers written before stay.
+- **Spec question: what this device then counts as unread.** The unread
+  count is read from the person's own marker, so with markers off a
+  conversation stays unread here after it is read. A device-local mark
+  would fix that; the text does not say whether there should be one.
+- The command line has no switch for it yet; clients set it.
+
 ### Names and pictures (D71, `profiles.md#account`)
 
 - **An account made before the self node** has none. Until its person sets

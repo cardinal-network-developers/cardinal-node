@@ -838,6 +838,9 @@ pub fn react(d: &Arc<Daemon>, group: &str, id: &str, text: &str) -> anyhow::Resu
 /// Marks a group's conversation read up to its last message from anyone else.
 pub fn mark_read(d: &Arc<Daemon>, group: &str) -> anyhow::Result<Json> {
     let g = joined(d, group)?;
+    if !crate::settings::read_markers_on(&d.core()) {
+        return Ok(crate::settings::markers_off());
+    }
     let me = identity(d)?;
     let op = {
         let core = d.core();
@@ -862,10 +865,11 @@ pub fn mark_read(d: &Arc<Daemon>, group: &str) -> anyhow::Result<Json> {
             _ => None,
         }
     };
+    let marked = op.is_some();
     if let Some(op) = op {
         d.write_and_push(&g.id, vec![op])?;
     }
-    Ok(json!({}))
+    Ok(json!({"marked": marked}))
 }
 
 /// Renames a group, or says whether its members are introduced through it.

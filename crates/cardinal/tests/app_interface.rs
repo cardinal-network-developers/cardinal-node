@@ -126,6 +126,49 @@ fn news_comes_by_itself_and_read_travels_back() {
     });
 }
 
+/// Read markers are the person's to give (`profiles.md#relationship`):
+/// turned off, in the account, `mark-read` writes nothing and says so,
+/// and the other side sees the message as sent and no more. Turned on
+/// again, reading marks it read.
+#[test]
+fn read_markers_turned_off_tell_nobody_what_was_read() {
+    if !fuse_available() {
+        eprintln!("skipping: /dev/fuse or fusermount3 is not available");
+        return;
+    }
+    let root = tempfile::tempdir().unwrap();
+    let (a, b) = met(root.path());
+    let bo = only(&a)["name"].as_str().unwrap().to_owned();
+    assert_eq!(ask(&a, json!({"cmd": "read-markers"}))["on"], true);
+    assert_eq!(
+        ask(&a, json!({"cmd": "read-markers", "on": false}))["on"],
+        false
+    );
+    assert_eq!(ask(&a, json!({"cmd": "read-markers"}))["on"], false);
+    b.cli(&["say", "Ana", "do you read me"]);
+    wait("the message arrives", 30, || only(&a)["unread"] == 1);
+    wait("bo hears it got there", 30, || {
+        said(&b, "Ana")[0]["state"] == "sent"
+    });
+    let before = a.status()["spaces"].to_string();
+    let r = ask(&a, json!({"cmd": "mark-read", "who": bo}));
+    assert_eq!(r["marked"], false, "{r}");
+    assert!(r["why"].as_str().unwrap_or("").contains("off"), "{r}");
+    assert_eq!(
+        a.status()["spaces"].to_string(),
+        before,
+        "a marker was written"
+    );
+    std::thread::sleep(Duration::from_secs(3));
+    assert_eq!(said(&b, "Ana")[0]["state"], "sent");
+    ask(&a, json!({"cmd": "read-markers", "on": true}));
+    let r = ask(&a, json!({"cmd": "mark-read", "who": bo}));
+    assert_eq!(r["marked"], true, "{r}");
+    wait("bo sees it was read", 30, || {
+        said(&b, "Ana")[0]["state"] == "read"
+    });
+}
+
 /// At the command line: `cardinal messages` alone shows what is new, and
 /// reading a conversation marks it read.
 #[test]

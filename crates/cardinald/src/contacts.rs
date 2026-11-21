@@ -1374,6 +1374,9 @@ pub fn conversations(d: &Daemon) -> Json {
 /// devices see the marker too (`profiles.md#relationship`).
 pub fn mark_read(d: &Arc<Daemon>, who: &str) -> anyhow::Result<Json> {
     let contact = listed(d, who)?;
+    if !crate::settings::read_markers_on(&d.core()) {
+        return Ok(crate::settings::markers_off());
+    }
     let me = identity(d)?;
     let op = {
         let core = d.core();
@@ -1401,10 +1404,11 @@ pub fn mark_read(d: &Arc<Daemon>, who: &str) -> anyhow::Result<Json> {
             _ => None,
         }
     };
+    let marked = op.is_some();
     if let Some(op) = op {
         d.write_and_push(&contact.space, vec![op])?;
     }
-    Ok(json!({}))
+    Ok(json!({"marked": marked}))
 }
 
 /// A length of time in words, to the largest unit that matters.
