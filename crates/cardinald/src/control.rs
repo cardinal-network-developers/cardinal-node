@@ -80,6 +80,7 @@ pub fn serve(d: Arc<Daemon>) -> anyhow::Result<tokio::task::JoinHandle<()>> {
                                 "ok": false,
                                 "error": format!("{e:#}"),
                                 "needs_words": e.is::<crate::recovery::NeedsWords>(),
+                                "needs_for": e.is::<crate::contacts::NeedsFor>(),
                             }),
                         },
                         Err(e) => json!({"ok": false, "error": format!("bad request: {e}")}),
@@ -1061,6 +1062,8 @@ fn status(d: &Arc<Daemon>) -> Value {
             .unwrap_or(0);
         (identity, spaces, conflicts, files)
     };
+    // the whole id, beside the short one shown
+    let identity_id = d.core().identity.as_ref().map(|i| hex::encode(i.id()));
     let (mounted, pending, not_saved, undone) = {
         let m = d.mount.lock().unwrap_or_else(|e| e.into_inner());
         match m.as_ref() {
@@ -1089,6 +1092,7 @@ fn status(d: &Arc<Daemon>) -> Value {
         "read_markers": crate::settings::read_markers_on(&d.core()),
         "home": d.paths.home.display().to_string(),
         "identity": identity,
+        "identity_id": identity_id,
         "listen": d.endpoint.tcp_addr().map(|a| a.to_string()),
         "devices": devices(d),
         "hosts": crate::host::sheet(d).ok().and_then(|v| v["hosts"].as_array().map(Vec::len)),

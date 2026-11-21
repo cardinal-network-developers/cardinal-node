@@ -898,10 +898,11 @@ fn print_guardians(v: &Value) {
     for c in v["changes"].as_array().into_iter().flatten() {
         let fp = c["fingerprint"].as_str().unwrap_or("");
         println!(
-            "A change of your guardians is under way (fingerprint \"{fp}\"): {} of them, {} \
-             confirmed{}. If it is not yours, or you gave it up, run `cardinal guardians \
-             object {fp}`.",
+            "A change of your guardians is under way (fingerprint \"{fp}\"): {} of them, \
+             recovering after {}; {} confirmed{}. If it is not yours, or you gave it up, run \
+             `cardinal guardians object {fp}`.",
             c["guardians"],
+            c["delay_text"].as_str().unwrap_or(""),
             c["confirmed"],
             if c["objected"] == true {
                 "; you objected"

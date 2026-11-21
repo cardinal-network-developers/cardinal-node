@@ -354,7 +354,8 @@ network.
 One JSON object per line each way: `{"cmd": "status"}` →
 `{"ok": true, ...}` or `{"ok": false, "error": "...", "needs_words":
 bool}`; `needs_words` means the recovery words, as `words`, would let the
-same request through. Commands: `status`, `devices`, `remove-device`,
+same request through; `needs_for`, that an `accept` of a recovery
+invitation made for whomever the guardian names needs `for`. Commands: `status`, `devices`, `remove-device`,
 `recovery-check` (`words`; changes nothing), `free-space` (`dry_run`; or
 `unnamed`, with `delete`),
 `keep-old` (`keep`), `peer-add/remove/list`,
@@ -390,7 +391,7 @@ network, never from a tag; and in `conversations` `reach`: `{shared,
 waiting, said_no, named}`, `named` by the device names `no-host` takes),
 `speedtest` (one device, by
 name or key), `reload` (after `init` while the daemon runs), `flush`
-(commit now), `stop`. `status` includes `copies`: per device meant to
+(commit now), `stop`. `status` includes `identity` (its first 16 hex digits, to show) and `identity_id` (all 64), and `copies`: per device meant to
 keep everything, whether it counts (`state`: passed, failed, stale,
 unchecked), why not (`reason`), the times of its last check, pass, and
 failure, and checks it left unanswered in a row (`missed`).
@@ -409,7 +410,10 @@ recovery or a change of guardians. `guardians` also gives `asked` (those
 asked to be guardians who have not answered), `ready` (those who
 accepted with a persona not named before, ready to be named), `changes`,
 each change under way `{fingerprint, names, guardians, threshold, delay,
-delay_text, confirmed, needed, waits_until_ms, objected, id}`
+delay_text, confirm_delay, confirm_delay_text, confirmed, needed,
+waits_until_ms, objected, id}` (`delay`: the change's own, for
+recoveries under it; `confirm_delay`: the wait before the guardians in
+office confirm it, the current policy's, doubled after an objection)
 (`waits_until_ms`: when it was made, by this person's clock, plus the
 wait; each guardian waits from when their device saw it, so it is a
 guide), and `copy_full`, the guardians whose copy of the account reached
@@ -485,7 +489,7 @@ that guardian. `recover-invite` (`at`, optional) → `{code, fingerprint}`:
 an invitation for a guardian who is present to `accept`. Before any
 guardian's invitation was used it is for whomever the guardian names:
 `accept` then takes `for`, the person as the guardian's contacts call
-them, and the new device learns whom it recovers from that guardian's
+them (without it, it fails with `needs_for`), and the new device learns whom it recovers from that guardian's
 proposal.
 `recover-cancel` → `{fingerprint}` (null if nothing was under way).
 `recover-finish` (`without_account`, `lost_at`: ms, both optional) →

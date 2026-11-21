@@ -480,6 +480,20 @@ mod tests {
         .await
         .unwrap_err();
         assert!(e.to_string().contains("only you"), "{e}");
+        // one for whomever the guardian names, taken up without saying whom
+        let mut anyone = inv.clone();
+        anyone.recovery_of = Some(crate::recovering::ANYONE);
+        let e = contacts::accept(
+            &d,
+            &anyone.to_text(),
+            None,
+            Regard::default(),
+            Met::default(),
+            true,
+        )
+        .await
+        .unwrap_err();
+        assert!(e.is::<contacts::NeedsFor>(), "{e}");
         // asked, but this person guards nobody
         let e = contacts::accept(&d, &inv.to_text(), None, Regard::default(), met, true)
             .await

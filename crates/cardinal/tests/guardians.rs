@@ -541,6 +541,12 @@ fn strangers_recover_a_person_with_no_host() {
     assert!(!new.home.join("recovery-helper").exists());
     // The same identity, on this device, with new words.
     assert_eq!(new.status()["identity"].as_str(), Some(id.as_str()));
+    // and the whole id, beside the short one
+    let full = new.status()["identity_id"]
+        .as_str()
+        .unwrap_or("")
+        .to_owned();
+    assert!(full.len() == 64 && full.starts_with(&id), "{full}");
     let o = new.cli_input(&["recovery", "check"], &new_words);
     assert!(o.status.success(), "{}", out(&o));
     let o = new.cli_input(&["recovery", "check"], &words);
@@ -675,7 +681,7 @@ fn guardians_change_with_the_guardians_consent() {
     ask_and_accept(&ana, &[&bo, &di]);
     hold_account(&ana, &[&bo, &cy]);
     // No words: the guardians in office decide.
-    let o = name_accepted(&ana, "", &["bo", "di", "--delay", "4s"]);
+    let o = name_accepted(&ana, "", &["bo", "di", "--delay", "6s"]);
     assert!(
         out(&o).contains("Asked your guardians to confirm"),
         "{}",
@@ -691,6 +697,8 @@ fn guardians_change_with_the_guardians_consent() {
             Some(rest.split('"').next()?.to_owned())
         })
         .unwrap_or_else(|| panic!("no change shown in {shown}"));
+    // the change's own delay, not the policy's in office
+    assert!(shown.contains("recovering after 6 seconds"), "{shown}");
     let o = name_guardians(&ana, "", &["bo", "di"]);
     assert!(
         !o.status.success() && out(&o).contains("is under way"),
@@ -909,7 +917,9 @@ fn a_guardian_names_whom_an_invitation_is_for() {
         new.cli(&["recover"]).contains("in touch:")
     });
     let fp = fingerprint_from(&new.cli(&["recover", "start"]));
-    wait("bo sees the recovery", 30, || bo.cli(&["guarding"]).contains(&fp));
+    wait("bo sees the recovery", 30, || {
+        bo.cli(&["guarding"]).contains(&fp)
+    });
     endorse_and_confirm(&[&bo], &fp);
     wait("the new device sees it in effect", 60, || {
         new.cli(&["recover"]).contains("have confirmed")

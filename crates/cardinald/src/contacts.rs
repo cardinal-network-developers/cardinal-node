@@ -380,6 +380,19 @@ fn invitation_used(d: &Arc<Daemon>, s: &Session, who: &[u8; 32]) -> anyhow::Resu
     Ok(())
 }
 
+/// A recovery invitation made for whomever the guardian names was taken up
+/// without saying whom: the request is asked again with `for`.
+#[derive(Debug)]
+pub struct NeedsFor(pub String);
+
+impl std::fmt::Display for NeedsFor {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for NeedsFor {}
+
 /// Takes up an invitation, and becomes a contact of whoever gave it. A
 /// recovery invitation (field 9) is taken only with `recovery`, which only
 /// the person's own `accept` and a recovery helper set: nothing that runs
@@ -411,10 +424,11 @@ pub async fn accept_for(
         .map_err(|_| anyhow::anyhow!("that is not an invitation"))?;
     if invitation.recovery_of == Some(crate::recovering::ANYONE) {
         let whom = whom.ok_or_else(|| {
-            anyhow::anyhow!(
+            anyhow::Error::new(NeedsFor(
                 "that invitation is to help someone recover their identity: say whom, of \
                  those you guard"
-            )
+                    .to_owned(),
+            ))
         })?;
         invitation.recovery_of = Some(whom);
     }
