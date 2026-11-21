@@ -10,8 +10,8 @@ should eventually be resolved by changing either the code or the spec.
 `../core` changed on its branch `grow-only-spaces` (decisions D56 to D58).
 This implementation follows it as far as one space goes: the rules, the
 formats, who is a member, and which entries are valid, judged natively one
-entry at a time ([Spaces](#spaces-specspacesmd), below). It does not yet
-follow it across two spaces. What still differs:
+entry at a time ([Spaces](#spaces-specspacesmd), below), and across two
+spaces as far as a group's succession goes. What still differs:
 
 - **No migration.** The formats changed and nothing converts what was
   written before: an id now covers who signed, a genesis names its own
@@ -20,40 +20,21 @@ follow it across two spaces. What still differs:
   directory is refused whole and left as it is, and has to be set up
   again ([The store's format](#daemon-mount-and-cli-cardinald-cardinal),
   `docs/install.md`, "Upgrading").
-- **Succession.** Nothing here writes a `succeed`, makes a successor, or
-  follows one. What one space's validity needs of it is built: a `succeed`
-  that counts closes what descends from it, a space with no owner ends when
-  every member has named the same successor, the successor that stands is
-  the smallest named, and a `succeed` or a successor's genesis by a removed
-  key counts only if a `keep` lists it. The rest is not: the state at the
-  cut, the initial state of a successor, following or showing a successor
-  as an offer, posting work again, the trail, `keep` for a succession made
-  by a device that is then retired or lost, the space node's field 4 in the
-  account space, tokens and storage labels that serve a successor, and what
-  a device does with a successor that is public where the old space was
-  not (Following's condition 5, "Made public"). With the initial state
-  go two rules of `state.md` and `spaces.md` that nothing here can reach
-  yet: the nodes a successor's initial state carried need no `create`
-  (here a node exists by its `create`, the root and the reach nodes
-  aside), and an op posted again that named its parent by index is given
-  the index its `create` has in the new entry (here nothing posts again).
-  The
-  fields that exist for it are read, written and kept, and mean nothing yet:
-  fields 3, 4 and 6 to 9 of `start`, fields 2 and 3 of `succeed`, and
-  `was` on `create`. A device that receives a `succeed` that ends a space
-  stops writing in it, says nothing to its person, and goes nowhere.
-- **Taking someone out of a group** is a succession, so `group-remove` fails
-  with a message saying that it cannot be done yet, and changes nothing.
-  Lowering an admin is the same. Nothing in the local interface makes
-  anyone an admin either, though the rules are there for one who is.
+- **Succession** is built for groups: the owner writes one to take
+  someone out or lower a role, members' devices follow it, post again
+  what it did not carry, and move to the successor that stands when two
+  conflict ([Succession](#succession-specspacesmdsuccession), below,
+  which says what is still missing: above all, nothing keeps a
+  succession made by a device that is then removed, and a relationship
+  is never succeeded).
 - **A member who can no longer be trusted.** A frozen identity's entries are
   judged like anyone's, devices open no session with it, it is left out of
   the next epoch this device starts, and this device starts one rather
   than write under an epoch the frozen member began, or one that reached
   it before it learned of the freeze. But a new epoch is still wrapped for
   whoever a frozen admin added, heard of before the freeze or not, nothing
-  offers the owner a succession without it, and nothing shows the members
-  it added.
+  offers the owner a succession without it (`group-remove` writes one when
+  asked), and nothing shows the members it added.
 - **A conversation shows its messages in log order.** `profiles.md` now has
   a device show messages in the order they became valid on it, so that one
   written with old parents appears when it arrives and not among what was
@@ -596,7 +577,8 @@ shares. What differs or was read:
   What ends or begins a space is left out of the answer, though it too is
   not yet witnessed until a `keep` lists it: the answer decides whether a
   device being retired writes an empty entry, which keeps none of those,
-  and the `keep` for each succession it made is not written yet (above).
+  and the `keep` for each succession it made is not written yet
+  ([Succession](#succession-specspacesmdsuccession)).
 - **Spec ambiguity: what else changes an entry later.** "Only a signature
   changes an entry later": an identity log, a witness, a `keep`. A `keep`
   can also be held before an entry it lists, and then that entry arriving
@@ -613,6 +595,178 @@ shares. What differs or was read:
 - **Not applied: `set_policy` and `set_protocol`.** They are judged, and the
   policy a space runs under is still the one its genesis gave it. Whether
   it is public would be the genesis's to say even if they were applied.
+
+## Succession (`spec/spaces.md#succession`)
+
+Built for groups (`space::succession`, `space::Space::state_at` and
+`create_successor`, `state::State::from_canonical`; `cardinald`
+`core/succession.rs` and `following.rs`; `group-remove`, `group-role`,
+`group-post-again`). Tested in `space/tests/succession.rs`, in the
+`core.rs` tests (a removal followed, a role lowered, a member away who
+follows later and posts again, two successions of which one stands,
+tokens), and end to end in `cardinal/tests/groups.rs`
+(`taking_someone_out_replaces_the_group_for_everyone_else`: a removal, a
+member away during it, a file and the conversation carried, a lowering,
+and a member added to the successor afterwards).
+
+What is not built:
+
+- **A succession by a device that is later removed**
+  (`spaces.md#a-succession-by-a-device-that-is-later-removed`). Nothing
+  writes a `keep` for a `succeed` or a successor's genesis: not when the
+  person confirms it on another device, not when a device is retired,
+  and not when one is lost (nothing shows the person what that device's
+  successions did). Validity already says that an unkept one by a removed
+  key does not count; a device then finds that no successor stands, takes
+  the old space for current again and posts there what it wrote in the
+  successor. That return is written and not tested, since nothing here
+  removes a key under a succession in a test.
+- **Relationships, and spaces with no owner.** Nothing here writes a
+  `succeed` in one, and no request asks to: a relationship is never
+  started afresh. A device that holds one whose members all named one
+  successor follows nothing, and notes "its members proposed to start it
+  afresh"; a proposal by the other member alone is not shown at all
+  (`spaces.md#following`, "No owner").
+- **Offers.** A successor handed on, made public, written by an owner
+  this device knows to be frozen, or that does not match the space it
+  ends is not followed, as the specification says, and is shown only as
+  the group's `ended` reason: not as an offer that can be accepted.
+- **Fresh starts and public spaces.** Nothing writes a successor marked
+  a fresh start (one that arrives is followed, and nothing is posted
+  again into it), nor fills in a `succeed`'s public address (field 3);
+  public spaces' readers follow nothing.
+- **History** (`spaces.md#what-comes-across`, "History"). The old space
+  is kept as any space is; nothing keeps it until every member named has
+  written in the successor, or drops it after, and the old history is not
+  shown behind the successor's (what the cut carried is in the
+  successor's state, which is what clients show). `start` field 7 is
+  written, with the key of the old space's current epoch, and not read:
+  a member added to a successor later reads its initial state and
+  nothing of the history before.
+- **Light holders** ask nobody for the state at a cut, and **storage
+  labels** at hosts are not carried (the old space's chunks stay under
+  its label; the successor's entries get one as any space does).
+- **Carried over** is not shown: what a member who holds no space before
+  sees of a successor's initial state is shown as anything else is.
+
+Readings:
+
+- **The cut** is the valid heads the writing device holds. **Field 8**
+  pins, for each author of an entry in the cut's causal past whose log
+  that device holds, that log's heads and those of every log held under
+  its label, as `IdentityLog::all_heads` gives them, sorted. An author
+  whose log it does not hold is not pinned, and is judged with none.
+- **A pinned log** is the log's genesis and its own entries that are a
+  pinned head or in a pinned head's causal past; what is held under its
+  label for other identities (a guardian's entries) is kept whole,
+  pinned or not (`space::succession::pinned_log`). The pinned logs are
+  evaluated together, with each other and nothing else. A device that
+  lacks a pinned head of its own copy of a log cannot work out the state
+  at the cut yet, and says so ("it cannot be checked yet").
+- **The initial state** (`start` field 4) is one blob of the canonical
+  state's encoding, encrypted with the convergence secret of the
+  successor's first epoch. Encryption being convergent and chunking
+  content-defined, a member that works out the state at the cut makes
+  the same blob: condition 3 of following is that the reference it makes
+  is the one the genesis gives, as encoded. It fetches nothing, and keeps
+  the chunks. The writer and every follower keep the canonical state in
+  `initial-state.bin` beside the successor, and open the successor on it
+  when they start; until it is there, nothing of a successor is opened.
+- **A member who holds no space before** (one added to a successor, or a
+  device of theirs) fetches the blob the genesis names, from this
+  person's devices or any contact in touch, who serves it as part of the
+  groups the two share, and opens the successor on it unchecked: there is
+  nothing to check it against (`spaces.md#what-comes-across`, "State").
+- **Reading a canonical state back** (`State::from_canonical`). It does
+  not record the place of the op that wrote each value: values of one
+  entry keep the order they are listed in. Nor does it record the entry
+  that created a node: a carried node is taken to have been made by the
+  entry that set its position (field 7), which is the one that created
+  it unless it was moved since. Carried nodes need no `create`, rank
+  first, and every entry of the successor descends from the entries that
+  wrote their values and positions; a carried value counts on a group's
+  name and member names whoever wrote it, since it was judged where it
+  was written. A carried read marker reads every carried message up to
+  the one it stands at, by rank.
+- **Whom a successor names.** Every member of the group who has not
+  left, with the highest role they hold, but whoever is taken out, and
+  with the lower role for whoever is lowered. A member who had left is
+  not named, and is among those field 2 of the `succeed` lists as left
+  out: the next key would not have been theirs either.
+- **What else the genesis says.** The policy of the old space's genesis,
+  public or not as it was; no protocol record; `start` field 7 with the
+  key of the old space's current epoch, where history is shared.
+- **Not sent until the space is known to be open**
+  (`spaces.md#ending-a-space`). The space is reconciled with every peer
+  in touch that holds it before the `succeed` is written, not before it is
+  sent: where it had ended meanwhile, this device follows, and does what
+  was asked in the space that stands. Where the owner has no other device,
+  no rival can have been named, and nobody in touch is no reason to
+  refuse; where they have one, nobody in touch is, and the request fails
+  saying so.
+- **The trail.** A successor's sealed genesis is kept in the old space's
+  set, so that reconciling the old space gives it. A `succeed` that came
+  in a notice, without the genesis, which is too long for one, makes the
+  device reconcile the old space with its peers. The trail's `keep` ops
+  are not written (above).
+- **Following** checks conditions 1 to 5 in this order: the genesis names
+  the old space and its cut is behind every valid `succeed` naming it;
+  its writer is the old owner and it names them as owner; that owner is
+  not known here to be frozen; it is not public where the old space was
+  not; it names this member; its initial state is the state at the cut. A
+  member that can open no wrap of the genesis is left out whatever the
+  `succeed` says, but is told so only when field 2 names it: otherwise it
+  cannot tell a genesis it cannot open from one that has not come.
+- **The account.** A device that follows writes a space node for the
+  successor, with field 4 naming the old space, and copies into it what
+  the account had recorded for the old space: its local name, "no hosts
+  here", where the person had read up to, every placement and every "not
+  this host here" (`account::successor_ops`). Only where the person had
+  joined the old space: following joins nothing that was not joined. Two
+  devices that follow at once write two nodes, which say the same.
+- **Ids.** Whatever named the old group, a request with its id, an
+  offer, a token, names the successor that stands here
+  (`Core::current`). A successor this device followed that no longer
+  stands names the one that does, or the old space if none does.
+- **Posting again** (`spaces.md#what-the-successor-does-not-carry`).
+  - What is posted is each valid entry of the old space, accepted for
+    state, that this identity wrote with this device's key and the
+    state at the cut did not accept; and each one it wrote in a
+    successor that no longer stands, but its genesis and what was itself
+    posted again, whose origin is posted instead. Into a fresh start,
+    nothing.
+  - In log order, each in one entry, up to the first that has to wait;
+    what holds nothing to post again is noted and not looked at again.
+    Which entry stands for which is kept in `succession.json` beside the
+    successor: a crash between writing an entry and noting it would post
+    that work twice.
+  - "All were members of the space the work was written in" is read as:
+    every member of the space that stands was ever a member of that space.
+    Otherwise the work is held back, `groups` says how much, and
+    `group-post-again` posts it.
+  - A `delete` is posted beside where any node at or beneath it has a
+    value, or a position, written by an entry the original had not seen.
+    A carried node whose position was never moved is not counted by its
+    position.
+  - A field that holds a node id is remapped where the profile declares
+    one, which is the relationship profile alone: a group's "in reply to"
+    keeps the id it had, which names the message if the cut carried it.
+- **Two successions** (`spaces.md#ending-a-space`, "One successor
+  stands"). A device that followed one that no longer stands follows the
+  one that does, and posts again there what it wrote in the other; the
+  owner's devices note each successor of theirs that did not stand, which
+  `groups` gives as `did_not_stand`, for the person to do again what it
+  was for. Nothing asks before following, so a member left out of the one
+  that stands is told so, and keeps the old group.
+- **Tokens** (`hosts.md#delivery-tokens`, "A successor"). They do not
+  rotate with epochs here ([Hosts](#hosts-spechostsmd)), so none is
+  replaced on following either: the reach nodes the successor carried,
+  and with them the tokens, serve it until each member sets its own
+  afresh. A token given in an old space is taken for the space that
+  stands in its place; an envelope left under one opens with whichever
+  space of the succession holds the epoch it names, so that a member who
+  followed first reaches one who has not yet; and a session opened with
+  one may reconcile the old space and the one in its place.
 
 ## State (`spec/state.md`, `spec/profiles.md`)
 
