@@ -69,6 +69,31 @@ fn accept_guarding(gs: &[&Dev]) {
     }
 }
 
+/// `who` asks each of `gs` to guard them, and each, shown the request,
+/// accepts it.
+fn ask_and_accept(who: &Dev, gs: &[&Dev]) {
+    for g in gs {
+        who.cli(&["guardians", "ask", g.name]);
+        wait("the request is shown", 30, || {
+            g.cli(&["guarding"])
+                .contains("asked you to be their guardian")
+        });
+    }
+    accept_guarding(gs);
+}
+
+/// `who`'s guardians `gs`, in touch with them as contacts, hold their
+/// account, sealed.
+fn hold_account(who: &Dev, gs: &[&Dev]) {
+    for g in gs {
+        who.cli(&["say", g.name, "you guard me now"]);
+        wait("the guardian holds the account", 60, || {
+            g.cli(&["guarding"])
+                .contains("sealed copy of their account")
+        });
+    }
+}
+
 /// Names guardians on `who`, once each has accepted and their persona has
 /// reached `who`, with the words on standard input.
 fn name_accepted(who: &Dev, words: &str, args: &[&str]) -> std::process::Output {
@@ -201,7 +226,8 @@ fn guardians_are_named_and_only_they_know() {
         "{}",
         out(&o)
     );
-    accept_guarding(&[&bo, &cy]);
+    ask_and_accept(&ana, &[&bo, &cy]);
+    assert!(!bo.cli(&["guarding"]).contains("asked you to be"));
     wait("bo shows the acceptance", 10, || {
         bo.cli(&["guarding"]).contains("accepted guarding Ana")
     });
@@ -297,6 +323,7 @@ fn guardians_give_an_identity_back() {
     wait("the host has the guardians' policy", 30, || {
         nuc.cli(&["guardians"]).contains("2 of your 3 guardians")
     });
+    hold_account(&laptop, &[&bo, &cy]);
     laptop.stop();
     drop(laptop);
 
@@ -513,12 +540,12 @@ fn strangers_recover_a_person_with_no_host() {
     });
     // and the old laptop is listed, to pair again, by the name she gave it
     assert!(finished.contains("laptop"), "{finished}");
-    // Each guardian's persona is burned: its purpose is over.
+    // The guardians see it done; their personas stay to confirm the
+    // change of guardians that follows.
     for g in [&bo, &cy] {
-        wait("the persona is burned", 30, || {
-            g.log().contains("burned persona")
+        wait("the guardian sees it done", 30, || {
+            g.cli(&["guarding"]).contains(": done")
         });
-        assert!(g.cli(&["guarding"]).contains("You guard nobody"));
     }
 }
 
@@ -543,13 +570,14 @@ fn a_recovery_invitation_to_someone_who_is_not_a_guardian_gets_nothing_back() {
         meet(&laptop, g, "Ana");
     }
     accept_guarding(&[&bo, &cy]);
-    let o = name_accepted(&laptop, &words, &["bo", "cy", "--delay", "1d"]);
+    let o = name_accepted(&laptop, &words, &["bo", "cy", "--delay", "4s"]);
     assert!(o.status.success(), "{}", out(&o));
     for g in [&bo, &cy] {
         wait("the guardian knows", 30, || {
             g.cli(&["guarding"]).contains("Ana: one of 2 guardians")
         });
     }
+    hold_account(&laptop, &[&bo, &cy]);
     laptop.stop();
     drop(laptop);
 
@@ -584,6 +612,88 @@ fn a_recovery_invitation_to_someone_who_is_not_a_guardian_gets_nothing_back() {
     wait("cy sees the recovery", 30, || {
         cy.cli(&["guarding"]).contains(&fp)
     });
+    // Through to the end, cy over the new device's invitation alone.
+    endorse_and_confirm(&[&bo, &cy], &fp);
+    wait("the account is given back", 60, || {
+        new.cli(&["recover"]).contains("your account among it")
+    });
+    let o = new.try_cli(&["recover", "finish"]);
+    assert!(o.status.success(), "{}", out(&o));
+    assert!(out(&o).contains("your account, contacts"), "{}", out(&o));
+}
+
+/// A person changes their guardians: each new one, asked, accepts with a
+/// fresh persona; the guardians in office confirm the change after the
+/// wait; then the new ones hold the account, and the personas no policy
+/// names are burned.
+#[test]
+fn guardians_change_with_the_guardians_consent() {
+    if !fuse_available() {
+        eprintln!("skipping: /dev/fuse or fusermount3 is not available");
+        return;
+    }
+    let root = tempfile::tempdir().unwrap();
+    let mut ana = Dev::new(root.path(), "ana", free_port());
+    ana.start();
+    let words = words_from(&ana.cli(&["init", "--yes", "--name", "ana"]));
+    ana.wait_mounted();
+    let bo = person(root.path(), "bo");
+    let cy = person(root.path(), "cy");
+    let di = person(root.path(), "di");
+    for g in [&bo, &cy, &di] {
+        meet(&ana, g, "Ana");
+    }
+    ask_and_accept(&ana, &[&bo, &cy]);
+    let o = name_accepted(&ana, &words, &["bo", "cy", "--delay", "4s"]);
+    assert!(o.status.success(), "{}", out(&o));
+    for g in [&bo, &cy] {
+        wait("the guardian knows", 30, || {
+            g.cli(&["guarding"]).contains("Ana: one of 2 guardians")
+        });
+    }
+    // A persona named before is never named again.
+    let o = name_guardians(&ana, "", &["bo", "di"]);
+    assert!(
+        !o.status.success() && out(&o).contains("has not accepted"),
+        "{}",
+        out(&o)
+    );
+    ask_and_accept(&ana, &[&bo, &di]);
+    // No words: the guardians in office decide.
+    let o = name_accepted(&ana, "", &["bo", "di", "--delay", "4s"]);
+    assert!(
+        out(&o).contains("Asked your guardians to confirm"),
+        "{}",
+        out(&o)
+    );
+    for g in [&bo, &cy] {
+        wait("the guardian sees the change", 30, || {
+            g.cli(&["guarding"]).contains("change of guardians")
+        });
+    }
+    // after the wait, from when each saw it
+    for g in [&bo, &cy] {
+        wait("the guardian confirms", 60, || {
+            g.try_cli(&["guarding", "confirm-change", "Ana", "--yes"])
+                .status
+                .success()
+        });
+    }
+    wait("the change is in effect", 60, || {
+        di.cli(&["guarding"]).contains("Ana: one of 2 guardians")
+    });
+    wait("ana sees her new guardians", 30, || {
+        ana.cli(&["guardians"]).contains("Guardians: bo, di")
+    });
+    // Cy's persona, no longer named, is burned, and what it held goes.
+    wait("cy's persona is burned", 60, || {
+        cy.log().contains("burned persona")
+    });
+    wait("cy guards nobody", 30, || {
+        cy.cli(&["guarding"]).contains("You guard nobody")
+    });
+    // Di holds the account now; cy may no longer fetch it.
+    hold_account(&ana, &[&di]);
 }
 
 /// A new device lost before the recovery is in effect is started over on
@@ -669,8 +779,20 @@ fn a_second_recovery_is_warned_of_and_starting_over_works() {
         );
     }
     endorse_and_confirm(&[&bo, &cy], &fp);
+    // No guardian holds her account here: finish says so, and goes on
+    // only when told to.
     wait("the second device recovers", 60, || {
-        second.try_cli(&["recover", "finish"]).status.success()
+        let o = second.try_cli(&["recover", "finish"]);
+        if o.status.success() {
+            return true;
+        }
+        if out(&o).contains("not given back your account") {
+            return second
+                .try_cli(&["recover", "finish", "--without-account"])
+                .status
+                .success();
+        }
+        false
     });
     // The old one can never take effect now.
     let o = guarding(&cy, "confirm", &old);

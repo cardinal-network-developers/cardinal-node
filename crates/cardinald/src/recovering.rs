@@ -455,6 +455,9 @@ pub fn status(d: &Arc<Daemon>) -> anyhow::Result<Json> {
     // when the service stopped: the words are shown this once, and what was
     // kept for the recovery goes.
     if d.core().identity.is_some() {
+        // what the guardians gave back is taken up first: the helper's store
+        // goes only after
+        complete_install(d, &u)?;
         let _ = std::fs::remove_file(d.paths.recovering());
         let d2 = d.clone();
         tokio::spawn(async move {
@@ -612,7 +615,11 @@ pub async fn cancel(d: &Arc<Daemon>) -> anyhow::Result<Json> {
 /// recovery is in effect, from the log the guardians carried, with new
 /// account and files spaces. The recovery kept none of the old devices:
 /// they are listed, to pair again.
-pub async fn finish(d: &Arc<Daemon>) -> anyhow::Result<Json> {
+pub async fn finish(
+    d: &Arc<Daemon>,
+    without_account: bool,
+    lost_at: Option<u64>,
+) -> anyhow::Result<Json> {
     not_set_up(d)?;
     let mut u = load(d).ok_or_else(|| {
         anyhow::anyhow!("no recovery is under way here; start one with a guardian's invitation")
@@ -650,6 +657,15 @@ pub async fn finish(d: &Arc<Daemon>) -> anyhow::Result<Json> {
         given.len(),
         given.iter().map(|(_, e)| e.len()).sum::<usize>()
     );
+    // Without the account the person starts with an empty one, for good:
+    // only on their word.
+    anyhow::ensure!(
+        without_account || given.iter().any(|(_, e)| !e.is_empty()),
+        "your guardians have not given back your account yet: it comes once one of them and \
+         this device are in touch. Try again in a moment. If none of them holds it, go on \
+         without it, and start with an empty account: `cardinal recover finish \
+         --without-account`."
+    );
     // From here this device may become the person's at any moment: if it
     // stops before the end, `cardinal recover` shows the words.
     u.finishing = true;
@@ -672,6 +688,36 @@ pub async fn finish(d: &Arc<Daemon>) -> anyhow::Result<Json> {
             pair_again: pair_again.clone(),
         },
     );
+    // What the removed devices wrote elsewhere is set aside, as after any
+    // recovery that kept none of them: kept up to when they were lost, if
+    // the person says (by those devices' own clocks), with `keep-work`
+    // (`spaces.md#authors`). The account and relationships given back are
+    // kept whole.
+    let mut set_aside = Vec::new();
+    for k in u
+        .forgotten
+        .iter()
+        .filter_map(|k| hex::decode(k).ok()?.try_into().ok())
+    {
+        let k: KeyId = k;
+        if let Some(up_to) = lost_at {
+            let written = d.core().keep_work(&k, Some(up_to));
+            match written {
+                Ok((written, _)) => {
+                    for (space, bytes) in written {
+                        d.push(&space, vec![bytes]);
+                    }
+                }
+                Err(e) => tracing::debug!("keeping what a lost device wrote: {e:#}"),
+            }
+        }
+        let left = d.core().unwitnessed_work(&k).map(|w| w.len()).unwrap_or(0);
+        set_aside.push(json!({
+            "key": hex::encode(&k[..8]),
+            "name": d.core().device_names().get(&k).cloned(),
+            "set_aside": left,
+        }));
+    }
     // The guardians see each other's confirmations before the helper goes.
     last_carry(d).await;
     crate::helper::stop(d).await?;
@@ -681,7 +727,54 @@ pub async fn finish(d: &Arc<Daemon>) -> anyhow::Result<Json> {
         "words": u.words,
         "account": back,
         "pair_again": pair_again_json(d, &pair_again),
+        "lost_devices": set_aside,
     }))
+}
+
+/// After a `finish` cut short once the device became the person's: takes
+/// up what the guardians gave back, from the helper's store, as `finish`
+/// would have, before the helper goes. Each step is idempotent.
+fn complete_install(d: &Arc<Daemon>, u: &Under) -> anyhow::Result<()> {
+    let Some(who) = identity_of(u) else {
+        return Ok(());
+    };
+    let running = d.helper.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    let given = match running {
+        Some(h) => copies(&h, &who),
+        None => {
+            let hp = crate::helper::paths(&d.paths);
+            if !crate::core::has_identity(&hp) {
+                return Ok(());
+            }
+            let keys = Arc::new(crate::keys::Keys::load_or_create(&hp.device_key())?);
+            let mut hc = crate::core::Core::load(&hp, keys)?;
+            hc.takes_recovery_copies = true;
+            copies_in(&hc, &who)
+        }
+    };
+    let labels: Vec<[u8; 32]> = given.iter().map(|(l, _)| *l).collect();
+    {
+        let mut core = d.core();
+        for (label, sealed) in &given {
+            if let Err(e) = core.ingest_space(*label, sealed) {
+                tracing::warn!("a set a guardian gave back: {e:#}");
+            }
+        }
+        core.keep_given_back(&labels)?;
+        if core.account_id().is_none() {
+            let config = crate::config::Config::load(&d.paths.config())?;
+            let keys = d.keys.clone();
+            crate::setup::create_spaces(
+                &mut core,
+                &keys,
+                &config,
+                &crate::config::default_person(),
+            )?;
+        }
+    }
+    d.identity_changed();
+    d.housekeeping();
+    Ok(())
 }
 
 /// Whether an entry is not a `recover` (which the new root signs too).
@@ -746,8 +839,17 @@ async fn last_carry(d: &Arc<Daemon>) {
 /// sealed account and each one's relationship space with the person, by
 /// label, with every sealed entry of each.
 fn copies(h: &Helper, who: &EntryId) -> Vec<([u8; 32], Vec<Vec<u8>>)> {
-    let rels = relationships(&h.d, who);
-    let core = h.d.core();
+    copies_in(&h.d.core(), who)
+}
+
+/// [`copies`], from a helper's core, running or not.
+fn copies_in(core: &crate::core::Core, who: &EntryId) -> Vec<([u8; 32], Vec<Vec<u8>>)> {
+    let rels: Vec<([u8; 32], SpaceId)> = core
+        .contacts()
+        .into_iter()
+        .filter(|c| c.recovery_of == Some(*who))
+        .map(|c| (c.identity, c.space))
+        .collect();
     let mut labels: Vec<[u8; 32]> = Vec::new();
     for (persona, _) in rels {
         for l in core.held_taken(&persona) {

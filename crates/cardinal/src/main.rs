@@ -642,6 +642,12 @@ enum RecoveryCmd {
 
 #[derive(Subcommand)]
 enum GuardiansCmd {
+    /// Ask a contact you trust to be your guardian. Their device shows it,
+    /// and they answer with `cardinal guarding accept YOUR-NAME`.
+    Ask {
+        /// Whom.
+        who: String,
+    },
     /// Name your guardians, from the people you trust. Your first
     /// guardians are named with your recovery words.
     Set {
@@ -667,6 +673,15 @@ enum GuardiansCmd {
 
 #[derive(Subcommand)]
 enum GuardingCmd {
+    /// After the wait, and checking with them: confirm the change of
+    /// guardians that someone you guard asked for.
+    ConfirmChange {
+        /// Whom.
+        who: String,
+        /// Do not ask again: you have read the warning.
+        #[arg(long)]
+        yes: bool,
+    },
     /// Accept being someone's guardian, when they ask: your device makes a
     /// persona for guarding them alone, which they then name.
     Accept {
@@ -750,7 +765,16 @@ enum RecoverCmd {
     /// Once your guardians have confirmed: become your identity's device,
     /// from what your guardians hold. The recovery keeps none of your old
     /// devices; pair them again afterwards.
-    Finish,
+    Finish {
+        /// Go on without your account, if no guardian holds it: you start
+        /// with an empty one, for good.
+        #[arg(long)]
+        without_account: bool,
+        /// When you lost your devices (milliseconds since the epoch, by
+        /// their own clocks): what they wrote up to then is kept.
+        #[arg(long)]
+        lost_at: Option<u64>,
+    },
 }
 
 /// A delay as typed: 7d, 12h, 30m, 45s, or seconds.
@@ -887,6 +911,10 @@ fn print_recover(v: &Value) {
 
 fn print_guarding(v: &Value) {
     let people = v["guarding"].as_array().cloned().unwrap_or_default();
+    for a in v["asked"].as_array().into_iter().flatten() {
+        let n = a.as_str().unwrap_or("");
+        println!("{n} asked you to be their guardian: `cardinal guarding accept {n}`.");
+    }
     for a in v["accepted"].as_array().into_iter().flatten() {
         println!(
             "You accepted guarding {}; they have not named you yet.",
@@ -928,6 +956,27 @@ fn print_guarding(v: &Value) {
                 )
             };
             println!("  recovery \"{fp}\": {state}");
+        }
+        for ch in p["changes"].as_array().into_iter().flatten() {
+            let state = if ch["in_effect"] == true {
+                "in effect".to_owned()
+            } else if ch["confirmed_by_me"] == true {
+                format!("you confirmed; {} have", ch["confirmed"])
+            } else {
+                match ch["confirm_from_ms"].as_u64() {
+                    Some(t) if t > now => {
+                        format!("you can confirm in {} s", (t - now).div_ceil(1000))
+                    }
+                    _ => "you can confirm now, after checking with them".to_owned(),
+                }
+            };
+            println!(
+                "  change of guardians {} ({} of {}, after {}): {state}",
+                ch["id"].as_str().unwrap_or(""),
+                ch["threshold"],
+                ch["guardians"],
+                ch["delay_text"].as_str().unwrap_or("")
+            );
         }
         if p["account_copy"] == true {
             println!("  You hold a sealed copy of their account, which you cannot read.");
@@ -2345,6 +2394,14 @@ async fn client(cmd: Cmd) -> anyhow::Result<()> {
                 .flatten()
                 .filter_map(Value::as_str)
                 .collect();
+            if v["pending"] == true {
+                println!(
+                    "Asked your guardians to confirm the change to {}: once enough of them \
+                     have, after the wait, they are your guardians.",
+                    names.join(", ")
+                );
+                return Ok(());
+            }
             println!(
                 "Your guardians are {}. {} of them together can give your identity back, after {}.",
                 names.join(", "),
@@ -2390,6 +2447,37 @@ async fn client(cmd: Cmd) -> anyhow::Result<()> {
         }
         Cmd::Guarding { cmd: None } => {
             print_guarding(&call(&paths, json!({"cmd": "guarding"})).await?);
+            Ok(())
+        }
+        Cmd::Guardians {
+            cmd: Some(GuardiansCmd::Ask { who }),
+        } => {
+            let v = call(&paths, json!({"cmd": "guardians-ask", "who": who})).await?;
+            println!(
+                "Asked {} to be your guardian. Once they accept, name them with \
+                 `cardinal guardians set`.",
+                v["name"].as_str().unwrap_or(&who)
+            );
+            Ok(())
+        }
+        Cmd::Guarding {
+            cmd: Some(GuardingCmd::ConfirmChange { who, yes }),
+        } => {
+            if !yes {
+                println!(
+                    "Before you go on: this changes who can give {who}'s identity back. Check \
+                     with {who}, in person if you can, that they asked for it."
+                );
+                let said = prompt("Go on? Type yes: ")?;
+                anyhow::ensure!(said.eq_ignore_ascii_case("yes"), "nothing was done");
+            }
+            let v = call(
+                &paths,
+                json!({"cmd": "guarding-confirm-change", "who": who, "understood": true}),
+            )
+            .await?;
+            println!("Confirmed the change.");
+            print_guarding(&v);
             Ok(())
         }
         Cmd::Guarding {
@@ -2522,9 +2610,17 @@ async fn client(cmd: Cmd) -> anyhow::Result<()> {
             Ok(())
         }
         Cmd::Recover {
-            cmd: Some(RecoverCmd::Finish),
+            cmd:
+                Some(RecoverCmd::Finish {
+                    without_account,
+                    lost_at,
+                }),
         } => {
-            let v = call(&paths, json!({"cmd": "recover-finish"})).await?;
+            let v = call(
+                &paths,
+                json!({"cmd": "recover-finish", "without_account": without_account, "lost_at": lost_at}),
+            )
+            .await?;
             if v["account"] == true {
                 println!("Recovered, from what your guardians hold: your account, contacts and");
                 println!(
@@ -2535,6 +2631,27 @@ async fn client(cmd: Cmd) -> anyhow::Result<()> {
                 println!("account, so this device starts with an empty one.");
             }
             print_pair_again(&v);
+            let lost: Vec<&Value> = v["lost_devices"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter(|l| l["set_aside"].as_u64().unwrap_or(0) > 0)
+                .collect();
+            if !lost.is_empty() {
+                println!();
+                println!("When did you lose your devices? What they wrote is set aside, since a");
+                println!("thief may have written with them. Keep what they wrote up to then:");
+                for l in lost {
+                    let name = l["name"]
+                        .as_str()
+                        .unwrap_or_else(|| l["key"].as_str().unwrap_or(""));
+                    println!(
+                        "  cardinal keep-work {name} --up-to TIME   ({} set aside)",
+                        l["set_aside"]
+                    );
+                }
+                println!("The time is each device's own clock, which a thief can set.");
+            }
             println!();
             println!("Your new recovery words. Write them down, in order, and keep them safe:");
             println!("the old ones no longer work.");

@@ -1143,6 +1143,10 @@ pub struct Core {
     pub takes_recovery_copies: bool,
 }
 
+/// The most a copy held for someone takes on this device: past it, nothing
+/// more of it is taken (D80: about the size of their account).
+pub const HELD_CAP: u64 = 64 << 20;
+
 /// What a change to the identity log means for the rest of the daemon.
 #[derive(Debug, Default)]
 pub struct IdentityChange {
@@ -1879,10 +1883,32 @@ impl Core {
     /// account, to a guardian; what a guardian holds, from their persona to
     /// a recovery helper. `who` may fetch them.
     pub fn held_given(&self, who: &[u8; 32]) -> Vec<[u8; 32]> {
+        // to a guardian only while they are one, as the account marks them;
+        // to a recovery helper, from a persona
+        let contact = self.contacts().into_iter().find(|c| c.identity == *who);
+        if !contact.is_some_and(|c| c.guardian || c.recovery_of.is_some()) {
+            return Vec::new();
+        }
         let (mine, _) = self.held_nodes(who);
         mine.into_iter()
             .filter(|l| self.spaces.contains_key(l))
             .collect()
+    }
+
+    /// Takes a copy held for someone off this device.
+    pub fn drop_held(&mut self, label: &[u8; 32]) {
+        if self.spaces.remove(label).is_some() {
+            let dir = Holder::dir(&self.paths, label);
+            if let Err(e) = std::fs::remove_dir_all(&dir) {
+                tracing::warn!("cannot remove {}: {e}", dir.display());
+            }
+        }
+    }
+
+    /// Whether a copy held for someone grew past [`HELD_CAP`].
+    fn held_full(&self, label: &[u8; 32]) -> bool {
+        let file = Holder::dir(&self.paths, label).join("entries.log");
+        std::fs::metadata(file).is_ok_and(|m| m.len() > HELD_CAP)
     }
 
     /// The sets `who` gives this person to hold, which it takes: a person's
@@ -1909,6 +1935,8 @@ impl Core {
                 out.push(l);
             }
         }
+        // and none past the cap, whatever is sent
+        out.retain(|l| !self.held_full(l));
         out
     }
 

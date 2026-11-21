@@ -361,14 +361,22 @@ endorsed, confirmed, in_effect, objected, id}], frozen}`; `guardians-set`
 (`who`, `threshold`, `delay`; the words); `guardians-object`
 (`fingerprint`, needed only when more than one is under way).
 
-A guardian acts through a persona per person guarded (D79), made by
+The person asks with `guardians-ask` (`who`) → `{name}`. A guardian acts
+through a persona per person guarded and per policy (D79), made by
 `guarding-accept` (`who`) → `{name, persona (64 hex), already}`, which the
 person then names with `guardians-set` (it fails, saying so, for a
-contact who has not accepted). `guarding` → `{guarding: [{name, id (64
+contact with no persona not named before). With guardians in office,
+`guardians-set` asks no words and replies `pending: true`: the change
+takes effect once they confirm it. `guarding` → `{guarding: [{name, id (64
 hex), persona, guardians, threshold, delay, delay_text, recoveries,
-waiting, warning, never, helpers, account_copy}], accepted: [names],
-now_ms}`; `accepted` lists those this person accepted to guard who have
-not named them yet; `account_copy`, whether this device holds the
+waiting, warning, never, helpers, account_copy, changes}], accepted:
+[names], asked: [names], now_ms}`; `asked` lists those who asked this
+person to guard them, unanswered; `accepted`, those this person accepted
+to guard who have not named them yet; `changes`, each change of the
+person's guardians under way, `{id, guardians, threshold, delay_text,
+confirmed, confirmed_by_me, in_effect, objected, confirm_from_ms,
+caution}`, which `guarding-confirm-change` (`who`, `understood`)
+confirms, after the wait from when this device saw it; `account_copy`, whether this device holds the
 person's sealed account (D80). `recoveries` holds at most one: the one recovery of
 that person shown at a time, `{fingerprint, endorsed, confirmed,
 endorsed_by_me, confirmed_by_me, pending, confirm_from_ms, objected,
@@ -411,7 +419,12 @@ guardian's recovery invitation, `identity`: 64 hex; both optional) →
 that guardian. `recover-invite` (`at`, optional) → `{code, fingerprint}`:
 an invitation for a guardian who is present to `accept`.
 `recover-cancel` → `{fingerprint}` (null if nothing was under way).
-`recover-finish` → `{words, account, pair_again}`: takes the identity up
+`recover-finish` (`without_account`, `lost_at`: ms, both optional) →
+`{words, account, pair_again, lost_devices}`: refuses while no guardian
+has given the account back, unless `without_account`; `lost_devices`
+lists each removed device `{key, name, set_aside}` with how many of its
+entries are set aside, to keep up to a time with `keep-work` (or now,
+with `lost_at`, by those devices' own clocks). It takes the identity up
 from what the guardians carried, and the account and relationships they
 held (`account` true), or with new account and files spaces when none
 held one; `words` are the new recovery words, to show once, and

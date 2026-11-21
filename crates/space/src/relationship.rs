@@ -815,3 +815,59 @@ pub fn held(space: &Space) -> Vec<Held> {
     found.sort_by_key(|(at, _)| *at);
     found.into_iter().map(|(_, h)| h).collect()
 }
+
+/// The node by which `author` gives the set `label` to hold, if any.
+pub fn held_node(space: &Space, author: &IdentityId, label: &[u8; 32]) -> Option<NodeId> {
+    space
+        .state()
+        .children(&ROOT)
+        .into_iter()
+        .filter(|n| n.kind == NodeKind::Uint(HELD_COPY) && !n.deleted && n.creator == *author)
+        .find(|n| as_created(n, 1).and_then(Value::as_bytes) == Some(label.as_slice()))
+        .map(|n| n.id)
+}
+
+/// Guardian request kind: "would you guard me?". Not in the specification,
+/// which says only that the person asks.
+pub const GUARDIAN_REQUEST: u64 = 67;
+
+/// `create` of a guardian request: its author asks the other member to
+/// guard them.
+pub fn create_guardian_request() -> SpaceOp {
+    SpaceOp::create(
+        NodeKind::Uint(GUARDIAN_REQUEST),
+        ROOT,
+        "guardian request",
+        Record::new().with(1, true).with(AUTHOR_OWNED_FIELD, 1u64),
+    )
+}
+
+/// The guardian requests in a relationship space, by author, with the
+/// position of the entry that made each, the latest last.
+pub fn guardian_requests(space: &Space) -> Vec<(IdentityId, Option<usize>)> {
+    let dag = space.dag();
+    let mut found: Vec<(IdentityId, Option<usize>)> = space
+        .state()
+        .children(&ROOT)
+        .into_iter()
+        .filter(|n| n.kind == NodeKind::Uint(GUARDIAN_REQUEST) && !n.deleted)
+        .map(|n| (n.creator, dag.position(&n.created_in)))
+        .collect();
+    found.sort_by_key(|(_, at)| *at);
+    found
+}
+
+/// The position of the entry that made the latest guardian persona node
+/// `author` wrote, if any.
+pub fn guardian_persona_at(space: &Space, author: &IdentityId) -> Option<usize> {
+    let dag = space.dag();
+    space
+        .state()
+        .children(&ROOT)
+        .into_iter()
+        .filter(|n| {
+            n.kind == NodeKind::Uint(GUARDIAN_PERSONA) && !n.deleted && n.creator == *author
+        })
+        .filter_map(|n| dag.position(&n.created_in))
+        .max()
+}

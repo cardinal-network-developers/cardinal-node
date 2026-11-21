@@ -114,7 +114,7 @@ pub fn install_recovered(
 }
 
 /// Creates the account and files spaces of an identity just installed.
-fn create_spaces(
+pub(crate) fn create_spaces(
     core: &mut Core,
     keys: &Arc<Keys>,
     config: &Config,

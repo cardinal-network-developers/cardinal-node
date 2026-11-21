@@ -228,65 +228,229 @@ pub fn set(
         for c in &chosen {
             named.push(persona_of(&core, c).ok_or_else(|| {
                 anyhow::anyhow!(
-                    "{name} has not accepted being your guardian yet: ask them to run \
-                     `cardinal guarding accept YOUR-NAME` on their device, and try again once \
-                     you have been in touch",
+                    "{name} has not accepted being your guardian yet, with a persona you have \
+                     not named before: ask them (`cardinal guardians ask {name}`), and try \
+                     again once they accepted and you have been in touch",
                     name = c.petname
                 )
             })?);
         }
         (!policy.guarded(), named)
     };
-    anyhow::ensure!(
-        unguarded,
-        "you have guardians already. Changing them needs your guardians to confirm the \
-         change, which this version cannot ask of them yet."
-    );
-    // The first guardians are named by the policy's controller, the root.
-    let root = crate::recovery::signer(
-        d,
-        words,
-        |_| false,
-        || "your first guardians are named with your recovery words".to_owned(),
-    )?
-    .expect("asked for the words");
-    let entries = {
+    // The first guardians are named by the policy's controller, the root;
+    // a change, by any key of this person's, and the guardians in office
+    // decide it (`identity.md#guardian-decisions`).
+    let root = match unguarded {
+        true => Some(
+            crate::recovery::signer(
+                d,
+                words,
+                |_| false,
+                || "your first guardians are named with your recovery words".to_owned(),
+            )?
+            .expect("asked for the words"),
+        ),
+        false => None,
+    };
+    let (entries, policy_entry) = {
         let mut core = d.core();
         let ident = core.identity.as_mut().expect("identity");
         let current = ident
             .enc
             .first()
             .map(|k| HybridKeyPair::from_secret_bytes(&k.secret_bytes()));
+        let author = root.as_ref().unwrap_or(&d.keys.device.signing);
         let e1 = ident
             .log
-            .set_guardians(&root, &named, threshold, delay, true, current.as_ref())
+            .set_guardians(author, &named, threshold, delay, true, current.as_ref())
             .map_err(|e| anyhow::anyhow!("cannot name these guardians: {e}"))?;
         ident.record_own(&e1)?;
-        // After a change of guardians, a fresh encryption key, wrapped to
-        // the new guardian key (`identity.md#the-identity-encryption-key`).
-        let mine = ident.state().power(&d.keys.key());
-        let signer = if mine >= Some(Power::Admin) {
-            &d.keys.device.signing
+        if let Some(root) = &root {
+            // After a change of guardians, a fresh encryption key, wrapped to
+            // the new guardian key (`identity.md#the-identity-encryption-key`).
+            let mine = ident.state().power(&d.keys.key());
+            let signer = if mine >= Some(Power::Admin) {
+                &d.keys.device.signing
+            } else {
+                root
+            };
+            let fresh = HybridKeyPair::generate();
+            let e2 = ident
+                .log
+                .set_encryption_key(signer, &fresh, current.as_ref())?;
+            ident.record_own(&e2)?;
+            let id = e1.id();
+            (vec![e1.encode(), e2.encode()], id)
         } else {
-            &root
-        };
-        let fresh = HybridKeyPair::generate();
-        let e2 = ident
-            .log
-            .set_encryption_key(signer, &fresh, current.as_ref())?;
-        ident.record_own(&e2)?;
-        vec![e1.encode(), e2.encode()]
+            // A change takes effect once the guardians confirm it; the rest
+            // follows then ([`tend_person`]).
+            let id = e1.id();
+            (vec![e1.encode()], id)
+        }
     };
     d.identity_changed();
     d.push_identity(entries);
-    mark_guardians(d, &chosen)?;
-    give_account(d, &chosen)?;
+    // Which contact each persona named is, for this person's devices.
+    let acc = d
+        .core()
+        .account_id()
+        .ok_or_else(|| anyhow::anyhow!("the account space is not here yet"))?;
+    let pairs: Vec<String> = chosen
+        .iter()
+        .zip(&named)
+        .map(|(c, (p, _))| format!("{}:{}", hex::encode(c.identity), hex::encode(p)))
+        .collect();
+    let mut ops = vec![account::create_setting(
+        &format!("{NAMED_SETTING}{}", hex::encode(policy_entry)),
+        pairs.join(","),
+    )];
+    if unguarded {
+        ops.push(account::create_setting(
+            &format!("{APPLIED_SETTING}{}", hex::encode(policy_entry)),
+            true,
+        ));
+    }
+    d.write_and_push(&acc, ops)?;
+    if unguarded {
+        mark_guardians(d, &chosen)?;
+        give_account(d, &chosen)?;
+    }
     Ok(json!({
         "names": chosen.iter().map(|c| c.petname.clone()).collect::<Vec<_>>(),
         "threshold": threshold,
         "delay": delay,
         "delay_text": delay_text(delay),
+        "pending": !unguarded,
     }))
+}
+
+/// The account setting naming, for the policy that this then the policy's
+/// id in hex names, the contacts and the personas it names, as
+/// `contact:persona,...` in hex. Not in the specification.
+pub const NAMED_SETTING: &str = "guardians: named ";
+/// The account setting by which a person's devices say a policy's
+/// guardians were marked and given the account, and the key rotated.
+pub const APPLIED_SETTING: &str = "guardians: applied ";
+
+/// The policies this person named, by entry, with the contact and persona
+/// of each guardian.
+fn named_policies(core: &crate::core::Core) -> Vec<(EntryId, Vec<(EntryId, EntryId)>)> {
+    let Some(acc) = core.account().and_then(|a| a.space.as_ref()) else {
+        return Vec::new();
+    };
+    account::settings(acc.state())
+        .into_iter()
+        .filter_map(|(name, v)| {
+            let policy: EntryId = hex::decode(name.strip_prefix(NAMED_SETTING)?)
+                .ok()?
+                .try_into()
+                .ok()?;
+            let pairs = v
+                .as_text()?
+                .split(',')
+                .filter_map(|p| {
+                    let (c, q) = p.split_once(':')?;
+                    Some((
+                        hex::decode(c).ok()?.try_into().ok()?,
+                        hex::decode(q).ok()?.try_into().ok()?,
+                    ))
+                })
+                .collect();
+            Some((policy, pairs))
+        })
+        .collect()
+}
+
+/// After this person's policy changed: once a change they made is in
+/// effect, marks its guardians in the account, gives them the account,
+/// takes it back from the others, and sets a fresh encryption key wrapped
+/// to the new guardian key (`identity.md#the-identity-encryption-key`).
+async fn tend_person(d: &Arc<Daemon>) {
+    let (current, named, applied, acc) = {
+        let core = d.core();
+        let Some(ident) = core.identity.as_ref() else {
+            return;
+        };
+        let Some(current) = ident.log.current_policy().map(|p| p.entry) else {
+            return;
+        };
+        let named = named_policies(&core)
+            .into_iter()
+            .find(|(p, _)| *p == current)
+            .map(|(_, v)| v);
+        let applied = core
+            .account()
+            .and_then(|a| a.space.as_ref())
+            .is_some_and(|sp| {
+                account::settings(sp.state()).iter().any(|(n, _)| {
+                    n.strip_prefix(APPLIED_SETTING) == Some(hex::encode(current).as_str())
+                })
+            });
+        (current, named, applied, core.account_id())
+    };
+    let (Some(named), false, Some(acc)) = (named, applied, acc) else {
+        return;
+    };
+    let chosen: Vec<account::ContactRecord> = {
+        let contacts = d.core().contacts();
+        contacts
+            .into_iter()
+            .filter(|c| named.iter().any(|(id, _)| *id == c.identity))
+            .collect()
+    };
+    let rotated = {
+        let mut core = d.core();
+        let Some(ident) = core.identity.as_mut() else {
+            return;
+        };
+        let current_key = ident
+            .enc
+            .first()
+            .map(|k| HybridKeyPair::from_secret_bytes(&k.secret_bytes()));
+        let fresh = HybridKeyPair::generate();
+        match ident
+            .log
+            .set_encryption_key(&d.keys.device.signing, &fresh, current_key.as_ref())
+            .map_err(anyhow::Error::from)
+            .and_then(|e| ident.record_own(&e).map(|()| e))
+        {
+            Ok(e) => e.encode(),
+            Err(e) => {
+                tracing::warn!("cannot set a fresh key for the new guardians: {e:#}");
+                return;
+            }
+        }
+    };
+    d.identity_changed();
+    d.push_identity(vec![rotated]);
+    let r = mark_guardians(d, &chosen).and_then(|()| give_account(d, &chosen));
+    if let Err(e) = r {
+        tracing::warn!("giving the new guardians the account: {e:#}");
+        return;
+    }
+    let _ = d.write_and_push(
+        &acc,
+        vec![account::create_setting(
+            &format!("{APPLIED_SETTING}{}", hex::encode(current)),
+            true,
+        )],
+    );
+    tracing::info!("the new guardians are in office");
+}
+
+/// `cardinal guardians ask NAME`: asks a contact to guard this person, in
+/// the relationship the two share. Their device shows it, and their
+/// `guarding accept` answers it with a fresh persona.
+pub fn ask(d: &Arc<Daemon>, who: &str) -> anyhow::Result<Json> {
+    let c = crate::contacts::find(d, who)?;
+    anyhow::ensure!(
+        c.connects(),
+        "{} is not someone you trust; a guardian must be (`cardinal contacts {} trust`)",
+        c.petname,
+        c.petname
+    );
+    d.write_and_push(&c.space, vec![relationship::create_guardian_request()])?;
+    Ok(json!({"name": c.petname}))
 }
 
 /// The persona `c` guards this person through, from the guardian persona
@@ -297,9 +461,14 @@ fn persona_of(
     c: &account::ContactRecord,
 ) -> Option<(EntryId, cardinal_crypto::HybridPublicKey)> {
     let sp = core.spaces.get(&c.space)?.space.as_ref()?;
+    // a fresh one: never named before, by any policy of this person's
+    let used: HashSet<EntryId> = named_policies(core)
+        .into_iter()
+        .flat_map(|(_, v)| v.into_iter().map(|(_, p)| p))
+        .collect();
     let p = relationship::guardian_personas(sp)
         .into_iter()
-        .find(|p| p.author == c.identity)?;
+        .find(|p| p.author == c.identity && !used.contains(&p.persona))?;
     let log = log_from(&p.log, &p.persona)?;
     let key = log.state().encryption_key.as_ref()?.public.clone();
     Some((p.persona, key))
@@ -365,18 +534,47 @@ pub fn held_named(d: &Arc<Daemon>, space: &SpaceId) {
         return;
     }
     // Over a session as contacts: one an invitation opened reaches only the
-    // relationship (`contact.md#accepting`). It goes, so that one as
-    // contacts replaces it, and that one syncs the copies.
+    // relationship (`contact.md#accepting`). A session as contacts is
+    // opened to the same device, which replaces it once it is up, and syncs
+    // the copies; until then the invitation's stays.
     let (contact, inviting) = d.contact_and_inviting(&who);
     if contact.is_empty() {
         for s in inviting {
-            s.close("in touch as contacts now");
+            let d2 = d.clone();
+            d.rt.spawn(async move { replace_session(&d2, &who, s).await });
         }
         return;
     }
     for l in labels {
         let d2 = d.clone();
         d.rt.spawn(async move { sync_label(&d2, &who, &l).await });
+    }
+}
+
+/// Opens a session as contacts with the device at the other end of `old`,
+/// one of `who`'s, at the address it was reached at, and lets it replace
+/// `old` once it is up. `old` stays if it cannot be opened.
+async fn replace_session(d: &Arc<Daemon>, who: &EntryId, old: Session) {
+    let static_key = old.peer_static();
+    let Some(addr) = old.remote_addr() else {
+        return;
+    };
+    let key = {
+        let core = d.core();
+        core.others.get(who).and_then(|o| {
+            o.log
+                .state()
+                .keys
+                .values()
+                .find_map(|k| k.link_key.clone().filter(|l| *l.x25519() == static_key))
+        })
+    };
+    let Some(key) = key else {
+        return;
+    };
+    match d.dial(|c| cardinal_link::Target::new(addr, c, &key)).await {
+        Ok(s) => d.on_session(s),
+        Err(e) => tracing::debug!("a session as contacts with {}: {e}", short(who)),
     }
 }
 
@@ -407,6 +605,31 @@ fn mark_guardians(d: &Arc<Daemon>, chosen: &[account::ContactRecord]) -> anyhow:
         .collect();
     if !ops.is_empty() {
         d.write_and_push(&acc, ops)?;
+    }
+    // and the copy of the account, from those no longer guardians
+    let (me, former): (Option<EntryId>, Vec<account::ContactRecord>) = {
+        let core = d.core();
+        let former = core
+            .contacts()
+            .into_iter()
+            .filter(|c| c.recovery_of.is_none() && !chosen.iter().any(|x| x.identity == c.identity))
+            .collect();
+        (core.me(), former)
+    };
+    let Some(me) = me else {
+        return Ok(());
+    };
+    for c in former {
+        let node = {
+            let core = d.core();
+            core.spaces
+                .get(&c.space)
+                .and_then(|h| h.space.as_ref())
+                .and_then(|sp| relationship::held_node(sp, &me, &acc))
+        };
+        if let Some(node) = node {
+            d.write_and_push(&c.space, vec![cardinal_space::SpaceOp::delete(node)])?;
+        }
     }
     Ok(())
 }
@@ -636,10 +859,42 @@ pub async fn accept_role(d: &Arc<Daemon>, who: &str) -> anyhow::Result<Json> {
         c.petname,
         c.petname
     );
-    if let Some(p) = my_personas(d)
-        .into_iter()
-        .find(|p| p.for_identity == Some(c.identity))
-    {
+    // One not named by any policy yet serves; a persona named before is
+    // never offered again, so each change of guardians gets a fresh one.
+    let seen = load_seen(d);
+    let fresh = my_personas(d).into_iter().find(|p| {
+        p.for_identity == Some(c.identity)
+            && !seen
+                .named
+                .iter()
+                .any(|n| n.starts_with(&format!("{}:", hex::encode(p.identity))))
+    });
+    if let Some(p) = fresh {
+        // repaired, if the relationship lacks its node (a crash, or a write
+        // that failed, between the two)
+        let (me, written) = {
+            let core = d.core();
+            let me = core.me();
+            let written = core
+                .spaces
+                .get(&c.space)
+                .and_then(|h| h.space.as_ref())
+                .is_some_and(|sp| {
+                    relationship::guardian_personas(sp)
+                        .iter()
+                        .any(|n| Some(n.author) == me && n.persona == p.identity)
+                });
+            (me, written)
+        };
+        if !written && me.is_some() {
+            if let Some(log) = persona_log(d, &p) {
+                let bytes = crate::core::log_bytes(&log);
+                d.write_and_push(
+                    &c.space,
+                    vec![relationship::create_guardian_persona(&p.identity, &bytes)],
+                )?;
+            }
+        }
         return Ok(json!({"name": c.petname, "persona": hex::encode(p.identity), "already": true}));
     }
     let d2 = d.clone();
@@ -697,6 +952,135 @@ fn wanted(d: &Daemon, g: &Guarded) -> Vec<Wanted> {
             recovery: r,
         })
         .collect()
+}
+
+/// A change of `g`'s person's policy, under the policy this person guards
+/// them through: a decision the guardians confirm, without endorsing
+/// (`identity.md#how-guardians-act`).
+struct Change {
+    entry: EntryId,
+    policy: Policy,
+    confirmed: BTreeSet<EntryId>,
+    in_effect: bool,
+    objected: bool,
+}
+
+fn changes(d: &Daemon, g: &Guarded) -> Vec<Change> {
+    let plog = persona_log(d, &g.persona);
+    let core = d.core();
+    let Some(other) = core.others.get(&g.identity) else {
+        return Vec::new();
+    };
+    let mine: Vec<&IdentityLog> = plog.iter().collect();
+    let st = other.log.state();
+    other
+        .log
+        .entries()
+        .filter(|e| {
+            e.ops().iter().any(|o| {
+                matches!(o.body(), OpBody::SetRecovery { changes: Some(c), .. } if *c == g.policy.entry)
+            })
+        })
+        .filter_map(|e| {
+            let policy = other.log.policy(&e.id())?;
+            Some(Change {
+                entry: e.id(),
+                confirmed: other.log.confirmed_by(&e.id(), &g.policy, &mine),
+                in_effect: st.in_effect.contains(&e.id()),
+                objected: objected(&other.log, &e.id()),
+                policy,
+            })
+        })
+        .collect()
+}
+
+/// What a guardian is told before confirming a change of guardians.
+pub fn change_caution(name: &str) -> String {
+    format!(
+        "Before you go on: this changes who can give {name}'s identity back. Check with \
+         {name}, in person if you can, that they asked for it. Someone hurrying you is a \
+         reason to wait."
+    )
+}
+
+/// `cardinal guarding confirm-change NAME`: after the wait from when this
+/// device saw it, and checking with the person, confirms the change of
+/// their guardians under way (the first this device saw).
+pub async fn confirm_change(d: &Arc<Daemon>, who: &str, understood: bool) -> anyhow::Result<Json> {
+    let c = crate::contacts::find(d, who)?;
+    let current = {
+        let core = d.core();
+        core.others
+            .get(&c.identity)
+            .and_then(|o| o.log.current_policy())
+            .map(|p| p.entry)
+    };
+    let g = guarded(d)
+        .into_iter()
+        .find(|g| g.identity == c.identity && Some(g.policy.entry) == current)
+        .ok_or_else(|| anyhow::anyhow!("you do not guard {} under their policy now", c.petname))?;
+    anyhow::ensure!(
+        understood,
+        "{} (Ask again saying you understood.)",
+        change_caution(&g.name)
+    );
+    sync_own_log(d).await;
+    observe(d);
+    let seen = load_seen(d);
+    let mut all: Vec<Change> = changes(d, &g)
+        .into_iter()
+        .filter(|x| !x.in_effect)
+        .collect();
+    all.sort_by_key(|x| {
+        (
+            seen.first
+                .get(&hex::encode(x.entry))
+                .copied()
+                .unwrap_or(u64::MAX),
+            x.entry,
+        )
+    });
+    let ch = all
+        .into_iter()
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("no change of {}'s guardians is under way", g.name))?;
+    if ch.confirmed.contains(&g.persona.identity) {
+        return Ok(list(d));
+    }
+    let since = seen
+        .first
+        .get(&hex::encode(ch.entry))
+        .copied()
+        .unwrap_or(u64::MAX);
+    let wait = g
+        .policy
+        .delay
+        .saturating_mul(if ch.objected { 2 } else { 1 });
+    let from = since.saturating_add(wait.saturating_mul(1000));
+    let now = now_ms();
+    anyhow::ensure!(
+        now >= from,
+        "the wait is not over: you can confirm in {}",
+        delay_text(from.saturating_sub(now).div_ceil(1000))
+    );
+    // the chain rule, as for a recovery: and, more strictly, never a second
+    // change under the same policy (DEVIATIONS.md)
+    let r = Recovery {
+        entry: ch.entry,
+        root: [0; 32],
+        keep: Vec::new(),
+        link_key: None,
+        policy: g.policy.entry,
+    };
+    check_chain(d, &g, &r)?;
+    act(
+        d,
+        &g,
+        ch.entry,
+        IdentityOp::confirm(ch.entry, g.position, g.salt, None),
+    )
+    .await?;
+    Ok(list(d))
 }
 
 /// The recoveries this person said never to confirm, on any of their
@@ -762,6 +1146,15 @@ pub fn observe(d: &Daemon) {
     let mut seen = load_seen(d);
     let mut changed = false;
     for g in guarded(d) {
+        for ch in changes(d, &g) {
+            if let std::collections::btree_map::Entry::Vacant(v) =
+                seen.first.entry(hex::encode(ch.entry))
+            {
+                tracing::info!("a change of {}'s guardians was asked for", g.name);
+                v.insert(now_ms());
+                changed = true;
+            }
+        }
         let pair = format!(
             "{}:{}",
             hex::encode(g.persona.identity),
@@ -890,6 +1283,7 @@ pub fn list(d: &Daemon) -> Json {
                 "never": never,
                 "helpers": helpers,
                 "account_copy": account_copy,
+                "changes": changes_json(d, &seen, g),
             })
         })
         .collect();
@@ -910,7 +1304,58 @@ pub fn list(d: &Daemon) -> Json {
             })
             .collect()
     };
-    json!({"guarding": people, "accepted": accepted, "now_ms": now_ms()})
+    json!({"guarding": people, "accepted": accepted, "asked": asked(d), "now_ms": now_ms()})
+}
+
+/// The changes of `g`'s person's guardians, as a guardian is shown them.
+fn changes_json(d: &Daemon, seen: &Seen, g: &Guarded) -> Vec<Json> {
+    changes(d, g)
+        .iter()
+        .map(|ch| {
+            let since = seen.first.get(&hex::encode(ch.entry)).copied();
+            let wait = g
+                .policy
+                .delay
+                .saturating_mul(if ch.objected { 2 } else { 1 });
+            json!({
+                "id": hex::encode(&ch.entry[..8]),
+                "guardians": ch.policy.commitments.len(),
+                "threshold": ch.policy.threshold,
+                "delay_text": delay_text(ch.policy.delay),
+                "confirmed": ch.confirmed.len(),
+                "confirmed_by_me": ch.confirmed.contains(&g.persona.identity),
+                "in_effect": ch.in_effect,
+                "objected": ch.objected,
+                "confirm_from_ms": since.map(|t| t.saturating_add(wait.saturating_mul(1000))),
+                "caution": (!ch.in_effect).then(|| change_caution(&g.name)),
+            })
+        })
+        .collect()
+}
+
+/// Those who asked this person to guard them, and have no answer yet: a
+/// guardian request in the relationship newer than this person's last
+/// guardian persona node there.
+fn asked(d: &Daemon) -> Vec<String> {
+    let core = d.core();
+    let me = core.me();
+    core.contacts()
+        .into_iter()
+        .filter(|c| c.recovery_of.is_none() && !c.refused)
+        .filter(|c| {
+            let Some(sp) = core.spaces.get(&c.space).and_then(|h| h.space.as_ref()) else {
+                return false;
+            };
+            let asked = relationship::guardian_requests(sp)
+                .into_iter()
+                .filter(|(a, _)| *a == c.identity)
+                .map(|(_, at)| at)
+                .max();
+            let answered = me.and_then(|me| relationship::guardian_persona_at(sp, &me));
+            matches!(asked, Some(a) if a > answered)
+        })
+        .map(|c| c.petname)
+        .collect()
 }
 
 fn find_guarded(d: &Daemon, who: &str) -> anyhow::Result<Guarded> {
@@ -1566,6 +2011,9 @@ fn acts_on(log: &IdentityLog, decision: &EntryId) -> Vec<Vec<u8>> {
         .collect()
 }
 
+/// A persona and a set it gives helpers.
+type GivenKey = (EntryId, [u8; 32]);
+
 /// A set held for someone: its label and every sealed entry of it.
 type HeldSet = ([u8; 32], Vec<Vec<u8>>);
 
@@ -1585,14 +2033,25 @@ async fn give_held(d: &Arc<Daemon>, h: &Arc<Helper>, g: &Guarded) {
         };
         let mut labels = core.held_taken(&g.identity);
         labels.push(c.space);
-        let sets = labels
-            .iter()
-            .filter(|l| core.spaces.contains_key(*l))
-            .map(|l| {
-                let ids: Vec<[u8; 32]> = core.set(l).iter().copied().collect();
-                (*l, ids.iter().filter_map(|id| core.get(l, id)).collect())
-            })
-            .collect();
+        // Rebuilt only when what is held, or whom it goes to, changed: the
+        // count of each set, and of the helpers, as last given.
+        static GIVEN: std::sync::Mutex<BTreeMap<GivenKey, (usize, usize)>> =
+            std::sync::Mutex::new(BTreeMap::new());
+        let helpers = helpers_of(&h.d, &g.identity).len();
+        let mut given = GIVEN.lock().unwrap_or_else(|e| e.into_inner());
+        let mut sets = Vec::new();
+        for l in labels.iter().filter(|l| core.spaces.contains_key(*l)) {
+            let ids: Vec<[u8; 32]> = core.set(l).iter().copied().collect();
+            let now = (ids.len(), helpers);
+            if given.get(&(g.persona.identity, *l)) == Some(&now) {
+                continue;
+            }
+            given.insert((g.persona.identity, *l), now);
+            sets.push((*l, ids.iter().filter_map(|id| core.get(l, id)).collect()));
+        }
+        if sets.is_empty() {
+            return;
+        }
         (labels, sets)
     };
     let who = g.identity;
@@ -1777,11 +2236,15 @@ async fn burn_spent(d: &Arc<Daemon>) {
                 .get(&hex::encode(w.recovery.entry))
                 .is_some_and(|t| now_ms().saturating_sub(*t) > SPENT_AFTER_MS)
         };
+        // The guardians who acted confirm the `set_recovery` that follows
+        // (`identity.md#what-a-recovery-does`): a persona that acted stays
+        // until a policy no longer names it, or until long after.
         let spent = mine.iter().any(|g| {
             wanted(d, g).iter().any(|w| {
                 w.in_effect
                     && (w.endorsed.contains(&p.identity) || w.confirmed.contains(&p.identity))
-                    && (finished(w) || long_ago(w))
+                    && finished(w)
+                    && long_ago(w)
             })
         });
         // A later policy, in effect, that no longer names it: known only
@@ -1821,7 +2284,40 @@ async fn burn_spent(d: &Arc<Daemon>) {
             tracing::warn!("cannot burn a persona: {e:#}");
             continue;
         }
+        // It leaves its spaces, and what was held for the person goes.
+        if let Some(h) = service(d, &p.identity) {
+            let r = h
+                .on(|pd| async move {
+                    let (me, rels) = {
+                        let pc = pd.core();
+                        let rels: Vec<SpaceId> = pc
+                            .contacts()
+                            .into_iter()
+                            .filter(|c| c.recovery_of.is_some())
+                            .map(|c| c.space)
+                            .collect();
+                        (pc.me(), rels)
+                    };
+                    if let Some(me) = me {
+                        for sp in rels {
+                            pd.write_and_push(&sp, relationship::leave_ops(&me))?;
+                        }
+                    }
+                    Ok(())
+                })
+                .await;
+            if let Err(e) = r {
+                tracing::debug!("a burned persona leaving its spaces: {e:#}");
+            }
+        }
+        let held = d.core().held_taken(&who);
         crate::helper::stop_persona(d, &p.identity, true).await;
+        {
+            let mut core = d.core();
+            for l in held {
+                core.drop_held(&l);
+            }
+        }
         tracing::info!("burned persona {}", short(&p.identity));
     }
 }
@@ -1863,12 +2359,17 @@ async fn tend(d: &Arc<Daemon>) {
         let Some(h) = service(d, &g.persona.identity) else {
             continue;
         };
-        for c in helpers_of(&h.d, &g.identity) {
+        let helpers = helpers_of(&h.d, &g.identity);
+        for c in &helpers {
             met_helper(d, &h, c.space, g).await;
-            take(d, &h, &c, g).await;
+            take(d, &h, c, g).await;
         }
-        give_held(d, &h, g).await;
+        // copies only for helpers, and only when they changed
+        if !helpers.is_empty() {
+            give_held(d, &h, g).await;
+        }
     }
+    tend_person(d).await;
     if !all.is_empty() {
         retire_moot(d);
     }
