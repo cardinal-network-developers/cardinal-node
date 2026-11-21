@@ -1512,21 +1512,63 @@ asks for around that is not built yet.
   can make keys and streams without limit. An envelope that cannot be opened yet
   waits, one at a time and up to the token's quota, and the host fetches what it
   needs at most once a minute.
-- **Whether a reach node names its person's hosts** (D68,
+- **Whether a reach node names its person's hosts** (D68, D75,
   `hosts.md#telling-others-where-to-reach-you`, `core.rs` `Telling`,
-  `mailbox.rs` `write_reach`, `groups.rs`). The list is the answer, and
-  nothing else keeps one: the account's kind 2 field 5 is neither written
-  nor read, and one an earlier version wrote is ignored.
-  - **The person's act** names a host where the list is empty:
-    `group-join` with `reach` true, and `group-reach` with `share` true.
-    With no host `group-reach` fails and writes nothing. `share` true where
-    hosts are named keeps them, in their order, and adds after them any
-    host the list does not name.
-  - **Unasked, software names a host** only when the person joins among
-    contacts (`group-join` with no `reach`, or a list never set in a space
-    they are in, as for whoever made it), and in a relationship, where a
-    device that is a host and is not named adds itself after those the
-    list names. No device adds another to a list that is set.
+  `mailbox.rs` `write_reach`, `say_reach`, `share_reach`,
+  `take_out_host`, `groups.rs`, `account.rs` `hosts_no`). To everyone
+  else the list is the answer; the person's own devices also read the
+  account: kind 2 field 5, "no hosts here", and kind 14, "not this host
+  here", under the space's node.
+  - **The person's no** (`contact NAME no-hosts`, `group-reach` with
+    `share` false, `group-join` with `reach` false, or joining with a
+    host and no yes) writes the record first, then the empty list: a
+    crash between leaves a host out, never a no filled in. Where the
+    account has no node for the space (a relationship or group, which
+    this version did not give one before) one is made, named after the
+    contact or the group.
+  - **The person's yes** (`contact NAME name-hosts`, `group-reach` with
+    `share` true, `group-join` with a yes) takes out "no hosts here" and
+    every "not this host here" for the space, then names every host it
+    can. Reading: a yes names all the person's hosts, so it clears the
+    record for all of them, those it cannot reach now included.
+  - **Taking one host out by hand** (`contact NAME no-host DEVICE`,
+    `group-reach` with `share` false and `host`; `cardinal group reach G
+    keep --host DEVICE`) records "not this host here" for its static key
+    and writes the list without it. A list left empty that way is not a
+    no: the person's other hosts still name themselves there.
+  - **Reading: a record in conflict.** "No hosts here" counts if any
+    value of field 5 on any node for the space is true: a no is never
+    overridden. A yes clears the field on every node.
+  - **Unasked, a host names itself** where the person is in the space,
+    every other member is a contact (a trusted one, for a device that
+    named itself, D72), and the account says neither "no hosts here" nor
+    "not this host here" for it: in a relationship or a group alike, and
+    to an empty list too. A list never set is the joining, and names
+    every host of theirs not recorded as a no. No device adds another to
+    a list already set.
+  - **Not in the text: an empty list is filled in only once it has
+    stood two minutes** on the device (`mailbox.rs` `FILL_AFTER`, kept in
+    memory, so a restart starts it again). The device that says no writes
+    the record and then the list, but they are two spaces and may arrive
+    in either order: a host that had the list and not yet the record
+    would otherwise fill in a no. The spec's cost says the two "can be
+    left apart" by devices acting at once; this is the same gap from
+    sync order alone.
+  - **A device writes the list when it has something to say.** Joining
+    with nothing to name, on meeting, at a look, or by `group-join`, writes
+    no list: a group is joined with an empty entry (no ops), which makes
+    the person a member who has written. **Spec ambiguity:**
+    `profiles.md#group` still says joining "sets their reach node, which
+    is the first entry of theirs ... The list is empty if they have no
+    host"; D75 has it left unset, and the empty entry is the reading. A
+    yes by hand with no host reachable is kept on the device as before,
+    against the list as it is, unset or not, and writes nothing.
+  - **Lists emptied before D75** have no record, so a host fills them in.
+    A no said with 0.1.17 or earlier is not kept: say it again. There
+    are no users whose data that touches: 0.1.13 made older data
+    unreadable, and the field 5 that versions before D68 wrote (their
+    yes as true) is from before that.
+  - **What `groups` gives** in `reach` also has `said_no`.
   - **On its own, a device changes only its own entry** (D70,
     `mailbox.rs` `keep_own_entry`, `Core::own_entry_due`): a host sets a
     token where the one its entry has is not active, and changed
@@ -1584,17 +1626,18 @@ asks for around that is not built yet.
     up (`clients.md`), and `group-reach` is the answer.
   - **A yes that cannot be finished** (`core.rs` `KeptYes`,
     `kept-yes.json` beside the space's entries): kept where `group-join`
-    shares, `group-reach` says yes, or whoever made a group is given
-    their first list, and no host can be reached for a token. It holds
+    shares, or `group-reach` or `name-hosts` says yes, and no host can be
+    reached for a token. Whoever made a group among contacts keeps none:
+    their hosts name themselves there once they can (D75). It holds
     the entries whose lists the reach node held then, and stands while
     the node holds exactly those. `write_reach` names the hosts once a
     token is registered. `groups` gives `reach.waiting` too, so that a
     window can still say so after a restart; `apps.md` gives it only in
     the replies.
-  - **Reading: so that a no can be later than a kept yes,** `group-reach`
-    with `share` false writes an empty list even where the list is empty
-    already. Without that entry a yes kept on another device would be
-    finished after the person said no.
+  - **Reading: so that a no can be later than a kept yes,** a no writes
+    an empty list even where the list is empty already. Without that
+    entry a yes kept on another device would be finished after the person
+    said no.
   - **Whoever is added while a yes waits** is told of when it is finished
     (R6): the kept yes notes the additions that counted when it was kept,
     and anyone added since who is not a contact goes in `reach.added`,
@@ -1649,20 +1692,11 @@ asks for around that is not built yet.
     named unasked only among trusted contacts, by whichever device sets
     the list. It is not on the recovery sheet. Its mailbox has the one
     quota class there is (above), not a smaller one.
-  - **Reading: "never where the list is empty".** A device that named
-    itself adds itself unasked, in a relationship or a group, only where
-    the list names a host already and every other member is trusted, or
-    where the list was never set and this is the joining. An explicit
-    host still adds itself in a relationship to a list emptied before
-    (D70 as read before D72).
-  - **A relationship's list is not set empty for want of a host**
-    (`write_reach`, as on branch `video`, 69f8738): as on meeting, it is
-    left unset, so that a host that comes later, or a device that names
-    itself, is named there. A group's list is still set empty on joining
-    with no host, and a device that names itself is then never named there
-    unasked.
-  - **When it takes itself out** of a list it leaves empty, that is a no
-    there, as for any host, and it is not named there again unasked.
+  - **"Never where its person said no"** (D75) is the account's record:
+    a device that named itself adds itself unasked wherever every other
+    member is trusted and the record says no no, to an empty list too.
+  - **When it takes itself out** of a list it leaves empty, that is no
+    no: named again, it names itself there again.
   - **The month is kept on the device** (`outside.json`): the addresses it
     names and when each was last its own, saved at most hourly.
   - **Not in the text: an address is named only once it has held, and

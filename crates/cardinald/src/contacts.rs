@@ -631,6 +631,16 @@ pub async fn name_hosts(d: &Arc<Daemon>, who: &str, share: bool) -> anyhow::Resu
     }}))
 }
 
+/// The person takes one host of theirs out of the relationship with a
+/// contact (`no-host`, D75): the account records "not this host here",
+/// so it does not name itself there again until they say `name-hosts`.
+pub async fn no_host(d: &Arc<Daemon>, who: &str, host: &str) -> anyhow::Result<Json> {
+    let contact = find(d, who)?;
+    let key = mailbox::host_by_name(d, host)?;
+    let named = mailbox::take_out_host(d, &contact.space, &key).await?;
+    Ok(json!({"named": if named { "taken out" } else { "not named" }}))
+}
+
 /// Changes what this person calls a contact. Only their own devices hear of
 /// it, and the contact is told nothing. An empty name clears the petname:
 /// the contact is then shown by the name they suggest, as theirs.

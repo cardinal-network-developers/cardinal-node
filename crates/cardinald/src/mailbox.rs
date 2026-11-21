@@ -17,6 +17,7 @@ use cardinal_crypto::{derive, random_bytes, Purpose};
 use cardinal_encoding::{Record, Value};
 use cardinal_identity::{EntryId, KeyId};
 use cardinal_link::{Admission, CarrierKind, Role, SecretEntry, Service, Session, Stream, Target};
+use cardinal_space::account;
 use cardinal_space::grant::Endpoint;
 use cardinal_space::relationship::{self, Reach};
 use cardinal_space::{EpochId, SpaceId};
@@ -341,6 +342,14 @@ pub struct Mailbox {
     /// The spaces where what this device set about on its own failed, as
     /// for a log that cannot be written, and when it tries again.
     put_off: Mutex<HashMap<SpaceId, PutOff>>,
+    /// Where this person's list names no host and a host of theirs could
+    /// fill it in (D75): the entries that set it, and when this device
+    /// first saw it so. It fills it in only [`Mailbox::fill_after`] later,
+    /// so that a no's record in the account, written just before the
+    /// empty list on the device that said it, has come too.
+    empty_seen: Mutex<HashMap<SpaceId, (Vec<String>, Instant)>>,
+    /// [`FILL_AFTER`]; none in tests.
+    pub(crate) fill_after: Mutex<Duration>,
     /// Tests: run once a token is registered and before the list is
     /// written, where an entry may arrive.
     #[cfg(test)]
@@ -356,6 +365,10 @@ struct PutOff {
 /// How long a write of the list that failed waits before it is tried
 /// again, at first and at most: each failure doubles it.
 const PUT_OFF: (Duration, Duration) = (Duration::from_secs(60), Duration::from_secs(3600));
+
+/// How long an empty list the person did not say no to stands, as this
+/// device has seen it, before a host fills it in (D75).
+const FILL_AFTER: Duration = Duration::from_secs(120);
 
 fn sent_key(space: &SpaceId, member: &[u8; 32]) -> String {
     format!("{}:{}", hex::encode(space), hex::encode(member))
@@ -387,6 +400,8 @@ impl Mailbox {
             pulled: Mutex::new(HashMap::new()),
             reaching: tokio::sync::Mutex::new(()),
             put_off: Mutex::new(HashMap::new()),
+            empty_seen: Mutex::new(HashMap::new()),
+            fill_after: Mutex::new(FILL_AFTER),
             #[cfg(test)]
             before_write: Mutex::new(None),
         }
@@ -695,10 +710,21 @@ async fn reach_here(
     let me = d.keys.key();
     let hosts = d.core().mailboxes();
     let trusted = !unasked || d.core().among_trusted(space);
+    // What the person said no to is not named unasked (D75).
+    let no = match unasked {
+        true => d.core().hosts_no(space),
+        false => Default::default(),
+    };
     let mut given = Given::default();
+    if no.no_hosts {
+        return given;
+    }
     for (grant, device) in hosts {
         let host = *grant.link_key.x25519();
         if named.iter().any(|r| r.host == host) || (add == Add::Own && device != me) {
+            continue;
+        }
+        if no.not_this(&host) {
             continue;
         }
         if crate::outside::is_self_named(&grant) && !trusted {
@@ -860,15 +886,25 @@ fn me(d: &Daemon) -> anyhow::Result<[u8; 32]> {
     me.ok_or_else(|| anyhow::anyhow!("this device has no identity"))
 }
 
-/// Sets this person's reach node in a space now: to their hosts, each with
-/// a fresh token for this space, or to an empty list if they have none or
-/// `share` is false (`contact.md#accepting`, step 5; `profiles.md#group`).
-/// This is how a relationship or a group is accepted. Naming a host is the
-/// person's act, or their joining among contacts: the caller knows which
-/// ([`write_reach`] has what software does on its own). Says whether the
-/// list names a host afterwards.
+/// The person's answer, on this device, to whether a space's members have
+/// where their hosts are (`contact.md#accepting`, step 5;
+/// `profiles.md#group`; D75). With `share` false it is their no: the
+/// account records "no hosts here" for the space, so that no device of
+/// theirs names a host there, and the list is set empty, even where it is
+/// empty already. With `share` true it is their yes: the record is taken
+/// out, and the list names every host of theirs that can be named now,
+/// each with a token for this space; with none, nothing is written in the
+/// space, and the list stays as it was, unset too. Says whether the list
+/// names a host afterwards.
 pub async fn say_reach(d: &Arc<Daemon>, space: &SpaceId, share: bool) -> anyhow::Result<bool> {
     let _one = d.mailbox.reaching.lock().await;
+    if share {
+        let hosts = all_hosts(d);
+        record(d, |st| account::yes_ops(st, space, &hosts))?;
+    } else {
+        let name = local_name(d, space);
+        record(d, |st| account::say_no_ops(st, space, &name))?;
+    }
     say_reach_locked(d, space, share).await
 }
 
@@ -880,6 +916,10 @@ async fn say_reach_locked(d: &Arc<Daemon>, space: &SpaceId, share: bool) -> anyh
         Given::default()
     };
     let reach = given.reach;
+    if share && reach.is_empty() {
+        // a device writes the list when it has something to say (D75)
+        return Ok(false);
+    }
     let set = relationship::set_reach(&me, &reach);
     if let Err(e) = d.write_and_push(space, vec![set]) {
         take_back(d, &given.new).await;
@@ -890,6 +930,88 @@ async fn say_reach_locked(d: &Arc<Daemon>, space: &SpaceId, share: bool) -> anyh
         revoke_left(d, space);
     }
     Ok(!reach.is_empty())
+}
+
+/// Every host of this person's, by static key.
+fn all_hosts(d: &Daemon) -> Vec<[u8; 32]> {
+    let hosts = d.core().mailboxes();
+    hosts.iter().map(|(g, _)| *g.link_key.x25519()).collect()
+}
+
+/// What the account space node for a space is called, if one is made for
+/// a no: the group's name, or the contact's petname.
+fn local_name(d: &Daemon, space: &SpaceId) -> String {
+    let core = d.core();
+    if let Some(c) = core.contacts().into_iter().find(|c| c.space == *space) {
+        return c.petname;
+    }
+    let sp = core.spaces.get(space).and_then(|h| h.space.as_ref());
+    sp.map(cardinal_space::group::name).unwrap_or_default()
+}
+
+/// Writes in the account what `ops` makes of its state, if anything:
+/// the person's record of a no (D75). `ops` runs under the core's lock.
+fn record(
+    d: &Arc<Daemon>,
+    ops: impl FnOnce(&cardinal_space::State) -> Vec<cardinal_space::SpaceOp>,
+) -> anyhow::Result<()> {
+    let (account, ops) = {
+        let core = d.core();
+        let acc = core
+            .account()
+            .ok_or_else(|| anyhow::anyhow!("the account space is not here yet"))?;
+        let st = acc
+            .space
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("the account space is not open yet"))?
+            .state();
+        (acc.id, ops(st))
+    };
+    if !ops.is_empty() {
+        d.write_and_push(&account, ops)?;
+    }
+    Ok(())
+}
+
+/// One of this person's hosts, by its device's name or the start of its
+/// key in hex: its static key.
+pub fn host_by_name(d: &Daemon, name: &str) -> anyhow::Result<[u8; 32]> {
+    let hosts = d.core().mailboxes();
+    let want = name.trim().to_lowercase();
+    let found = hosts.iter().find(|(_, device)| {
+        d.device_name(device).to_lowercase() == want
+            || (want.len() >= 4 && hex::encode(device).starts_with(&want))
+    });
+    match found {
+        Some((g, _)) => Ok(*g.link_key.x25519()),
+        None => anyhow::bail!("{name} is not a host of yours"),
+    }
+}
+
+/// The person takes one host out of a space's list by hand (D75): the
+/// account records "not this host here" for it, so that it does not name
+/// itself there again, and the list is written without it, the others as
+/// they read. Says whether the list named it.
+pub async fn take_out_host(
+    d: &Arc<Daemon>,
+    space: &SpaceId,
+    host: &[u8; 32],
+) -> anyhow::Result<bool> {
+    let _one = d.mailbox.reaching.lock().await;
+    let name = local_name(d, space);
+    record(d, |st| account::not_this_host_ops(st, space, &name, host))?;
+    let me = me(d)?;
+    let mut reach = d.core().reach_of(space, &me);
+    let before = reach.len();
+    reach.retain(|r| r.host != *host);
+    if reach.len() == before {
+        return Ok(false);
+    }
+    d.write_and_push(space, vec![relationship::set_reach(&me, &reach)])?;
+    if reach.is_empty() {
+        revoke_left(d, space);
+    }
+    Ok(true)
 }
 
 /// Two people have just met: the relationship names this person's hosts
@@ -945,14 +1067,15 @@ pub async fn share_reach(d: &Arc<Daemon>, space: &SpaceId) -> anyhow::Result<Sha
     if !t.hosted && !t.shared {
         return Ok(Shared::NoHost);
     }
+    // A yes by hand clears the record of a no (D75).
+    let hosts = all_hosts(d);
+    record(d, |st| account::yes_ops(st, space, &hosts))?;
     let mut reach = d.core().reach_of(space, &me);
     let given = reach_here(d, space, &reach, Add::Every, false).await;
     let more = given.reach;
     if reach.is_empty() && more.is_empty() {
-        if !t.set {
-            // their first entry there: the yes is kept against it
-            d.write_and_push(space, vec![relationship::set_reach(&me, &[])])?;
-        }
+        // kept against the list as it is, unset too: a device writes the
+        // list when it has something to say
         d.core().keep_yes(space);
         return Ok(Shared::Waiting);
     }
@@ -970,17 +1093,17 @@ pub async fn share_reach(d: &Arc<Daemon>, space: &SpaceId) -> anyhow::Result<Sha
 
 /// What software does to this person's reach node in a space on its own,
 /// its own entry aside (`hosts.md#telling-others-where-to-reach-you`,
-/// [`Telling`](crate::core::Telling)). It never names a host where the
-/// list is set and names none, among contacts either: an empty list may be
-/// the person's no, written on another of their devices, and nothing else
-/// records it. It never takes out a host, and never writes only to make
-/// two lists one (D70).
+/// [`Telling`](crate::core::Telling), D75). It never names a host where
+/// the person's account says "no hosts here", nor one it says "not this
+/// host here" for. It never takes out a host, and never writes only to
+/// make two lists one (D70).
 ///
 /// - Where they have left and it names a host, it is emptied.
 /// - Among contacts, a list never set is set, to the person's hosts,
-///   which is how whoever made a space joins it; and in a relationship a
-///   device that has become a host adds itself, after those the list
-///   names.
+///   which is how whoever made a space joins it; with none to name it
+///   stays unset. To a list that is set, empty or not, a host adds
+///   itself, after those it names: a host names itself wherever the
+///   person has not said no.
 /// - A yes the person gave on this device while no host could be reached
 ///   is finished: the hosts are named once a token is registered. Only
 ///   this device does that, and not once the list has been set since.
@@ -1028,33 +1151,42 @@ pub async fn write_reach(d: &Arc<Daemon>, space: &SpaceId) -> anyhow::Result<()>
     if !t.sets_unasked() {
         return Ok(());
     }
+    if t.set && !t.shared && !empty_long_enough(d, space, &decided.set_by) {
+        return Ok(());
+    }
     // The others as they read, each host once, unchanged. A list never
     // set is the person's joining, and names every host of theirs; to one
     // that is set a device adds only itself.
     let add = if t.set { Add::Own } else { Add::Every };
     let given = reach_here(d, space, &named, add, true).await;
     let more = given.reach;
-    // A host that cannot be reached now gives no token. The empty list
-    // that leaves is said once, and not again each time this looks.
+    // A host that cannot be reached now gives no token, and with nothing
+    // to add nothing is written: an empty list written for want of a host
+    // would look like a no. Whoever made a space and has a host out of
+    // reach is named once it can be, at a later look.
     if !t.worth_saying(more.len()) {
         return Ok(());
     }
-    // In a relationship, a list with nothing to name stays unset: written
-    // empty, it would be a no that nothing fills in, and the contact has a
-    // host of the person's from it once there is one to name.
-    if t.relationship && !t.set && more.is_empty() {
-        return Ok(());
-    }
-    // Whoever made a space joins it here, among contacts: with a host out
-    // of reach, that yes is kept like any other.
-    let wait = !t.set && !t.relationship && t.hosted && more.is_empty();
     let mut reach = named;
     reach.extend(more);
-    let written = set_as_decided(d, space, &decided, &reach, &given.new).await?;
-    if wait && written {
-        d.core().keep_yes(space);
-    }
+    set_as_decided(d, space, &decided, &reach, &given.new).await?;
     Ok(())
+}
+
+/// Whether an empty list the person did not say no to has stood long
+/// enough, as this device has seen it, to be filled in: a no's record may
+/// still be on its way through the account space.
+fn empty_long_enough(d: &Daemon, space: &SpaceId, set_by: &[String]) -> bool {
+    let after = *lock(&d.mailbox.fill_after);
+    let mut seen = lock(&d.mailbox.empty_seen);
+    let since = match seen.get(space) {
+        Some((by, at)) if by.as_slice() == set_by => *at,
+        _ => {
+            seen.insert(*space, (set_by.to_vec(), Instant::now()));
+            Instant::now()
+        }
+    };
+    since.elapsed() >= after
 }
 
 /// Ends every token this device ever gave out as a host in a space where
@@ -2050,6 +2182,7 @@ mod tests {
             let dirs = [tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap()];
             let (paths, config) = crate::testing::set_up(dirs[0].path());
             let d = Daemon::start(paths, config).await.unwrap();
+            *lock(&d.mailbox.fill_after) = Duration::ZERO;
             let (paths, _) = crate::testing::set_up(dirs[1].path());
             let keys = crate::keys::Keys::load_or_create(&paths.device_key()).unwrap();
             let mut bo = crate::core::Core::load(&paths, Arc::new(keys)).unwrap();
@@ -2482,6 +2615,14 @@ mod tests {
         fn a_no_arrives_meanwhile(&self, space: SpaceId) {
             let (d, me) = (self.d.clone(), self.me);
             let arrives = move || {
+                // as a no is said (D75): the record, then the list
+                let account = d.core().account_id().unwrap();
+                let record = {
+                    let core = d.core();
+                    let st = core.account().unwrap().space.as_ref().unwrap().state();
+                    account::say_no_ops(st, &space, "a space")
+                };
+                d.core().write(&account, record).unwrap();
                 let no = relationship::set_reach(&me, &[]);
                 d.core().write(&space, vec![no]).unwrap();
                 revoke_left(&d, &space);
@@ -2503,7 +2644,8 @@ mod tests {
         h.hosts();
         let g = h.group();
         // the yes, kept against an empty list
-        say_reach(&h.d, &g, false).await.unwrap();
+        let empty = relationship::set_reach(&h.me, &[]);
+        h.d.write_and_push(&g, vec![empty]).unwrap();
         h.d.core().keep_yes(&g);
         assert!(h.d.core().telling(&g).waiting);
         h.a_no_arrives_meanwhile(g);
@@ -2519,7 +2661,8 @@ mod tests {
         let h = Home::new().await;
         h.hosts();
         let g = h.group();
-        say_reach(&h.d, &g, false).await.unwrap();
+        let empty = relationship::set_reach(&h.me, &[]);
+        h.d.write_and_push(&g, vec![empty]).unwrap();
         h.d.core().keep_yes(&g);
         write_reach(&h.d, &g).await.unwrap();
         assert_eq!(h.named(&g).len(), 1);
@@ -2671,5 +2814,106 @@ mod tests {
         let entry = list[0].as_record().unwrap();
         assert_eq!(entry.get(9).and_then(Value::as_text), Some("from later"));
         assert_eq!(entry.get(2).and_then(Value::as_bytes), Some(&[4u8; 32][..]));
+    }
+
+    impl Home {
+        fn record(&self, space: &SpaceId) -> account::HostsNo {
+            self.d.core().hosts_no(space)
+        }
+    }
+
+    /// D75. A no is recorded in the account, and an explicit host does not
+    /// name itself over it, at any look; a yes by hand takes it out.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_no_stands_against_an_explicit_host() {
+        let h = Home::new().await;
+        h.hosts();
+        say_reach(&h.d, &h.rel, false).await.unwrap();
+        assert!(h.record(&h.rel).no_hosts, "the no is not recorded");
+        assert!(h.d.core().reach_is_set(&h.rel, &h.me));
+        for _ in 0..2 {
+            write_reach(&h.d, &h.rel).await.unwrap();
+            keep_own_entry(&h.d);
+            assert!(h.named(&h.rel).is_empty(), "a host named itself over a no");
+        }
+        assert!(matches!(
+            share_reach(&h.d, &h.rel).await.unwrap(),
+            Shared::Named
+        ));
+        assert_eq!(h.named(&h.rel).len(), 1);
+        assert!(!h.record(&h.rel).no_hosts, "a yes leaves the no");
+    }
+
+    /// D75. A list emptied with no no recorded, as by the bug of
+    /// 2026-11-19, is not a no: a host fills it in itself.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_emptied_list_with_no_record_is_filled_by_a_host() {
+        let h = Home::new().await;
+        h.hosts();
+        let empty = relationship::set_reach(&h.me, &[]);
+        h.d.write_and_push(&h.rel, vec![empty]).unwrap();
+        assert!(h.d.core().reach_is_set(&h.rel, &h.me));
+        assert!(!h.record(&h.rel).no_hosts);
+        write_reach(&h.d, &h.rel).await.unwrap();
+        let named = h.named(&h.rel);
+        assert_eq!(named.len(), 1, "the host did not name itself");
+        assert_eq!(named[0].host, h.here);
+        // In a group too, where the person made it among contacts.
+        let g = h.group();
+        let empty = relationship::set_reach(&h.me, &[]);
+        h.d.write_and_push(&g, vec![empty]).unwrap();
+        write_reach(&h.d, &g).await.unwrap();
+        assert_eq!(h.named(&g).len(), 1);
+    }
+
+    /// D75. A host taken out by hand stays out: the account says "not
+    /// this host here" for it, until the person says yes.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_host_taken_out_by_hand_stays_out() {
+        let h = Home::new().await;
+        h.hosts();
+        write_reach(&h.d, &h.rel).await.unwrap();
+        assert_eq!(h.named(&h.rel).len(), 1);
+        let here = h.here;
+        assert!(take_out_host(&h.d, &h.rel, &here).await.unwrap());
+        assert!(h.record(&h.rel).not_this(&here));
+        assert!(!h.record(&h.rel).no_hosts, "not a no to every host");
+        for _ in 0..2 {
+            write_reach(&h.d, &h.rel).await.unwrap();
+            keep_own_entry(&h.d);
+            assert!(h.named(&h.rel).is_empty(), "it named itself again");
+        }
+        // Taken out again, nothing more is recorded.
+        let account = h.d.core().account_id().unwrap();
+        let n = h.entries(&account);
+        assert!(!take_out_host(&h.d, &h.rel, &here).await.unwrap());
+        assert_eq!(h.entries(&account), n);
+        assert!(matches!(
+            share_reach(&h.d, &h.rel).await.unwrap(),
+            Shared::Named
+        ));
+        assert_eq!(h.named(&h.rel).len(), 1);
+        assert!(!h.record(&h.rel).not_this(&here), "a yes leaves it out");
+        // A device not a host of theirs cannot be taken out by name.
+        assert!(host_by_name(&h.d, "nobody").is_err());
+    }
+
+    /// D75. Whoever made a group, with no host to name, leaves the list
+    /// unset, not empty; a host they take up later names itself there.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_group_with_no_host_to_name_is_left_unset() {
+        let h = Home::new().await;
+        let g = h.group();
+        write_reach(&h.d, &g).await.unwrap();
+        assert!(
+            !h.d.core().reach_is_set(&g, &h.me),
+            "an empty list was written"
+        );
+        // A yes by hand with no host to reach writes no empty list either.
+        say_reach(&h.d, &g, true).await.unwrap();
+        assert!(!h.d.core().reach_is_set(&g, &h.me));
+        h.hosts();
+        write_reach(&h.d, &g).await.unwrap();
+        assert_eq!(h.named(&g).len(), 1);
     }
 }

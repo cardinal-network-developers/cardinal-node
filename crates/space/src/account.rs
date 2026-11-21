@@ -27,6 +27,14 @@ pub const INVITATION: u64 = 10;
 pub const INVITATION_USE: u64 = 11;
 /// Self kind: the name this person suggests for themselves.
 pub const SELF: u64 = 13;
+/// "Not this host here" kind, under a space node (D75).
+pub const NOT_THIS_HOST: u64 = 14;
+/// Network kind (D76).
+pub const NETWORK: u64 = 15;
+
+/// A space node's field: this person said no to naming their hosts in
+/// it, "no hosts here" (D75, `hosts.md#telling-others-where-to-reach-you`).
+pub const NO_HOSTS: u64 = 5;
 
 /// An invitation's field: the inviter cancelled it.
 pub const CANCELLED: u64 = 2;
@@ -290,6 +298,138 @@ pub fn create_placement(
 /// `set` of a field of an account node.
 pub fn set_field(node: NodeId, key: u64, value: impl Into<Value>) -> SpaceOp {
     SpaceOp::set(node, key, Some(value.into()))
+}
+
+/// What this person's account records of their no to naming their hosts
+/// in one space (D75): seen only by their own devices, which it stops
+/// from naming themselves there.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct HostsNo {
+    /// The space nodes the account has for the space.
+    pub nodes: Vec<NodeId>,
+    /// "No hosts here": any of them says so, in any of its values. A no
+    /// is never overridden, so where two devices set it at once, one yes
+    /// and one no, it is a no.
+    pub no_hosts: bool,
+    /// "Not this host here", by the host's static X25519 key, with the
+    /// node that records it.
+    pub not_these: Vec<(NodeId, [u8; 32])>,
+}
+
+impl HostsNo {
+    /// Whether the person took this host out of the space by hand.
+    pub fn not_this(&self, host: &[u8; 32]) -> bool {
+        self.not_these.iter().any(|(_, h)| h == host)
+    }
+}
+
+/// What the account records of a no to naming hosts in `space`.
+pub fn hosts_no(state: &State, space: &SpaceId) -> HostsNo {
+    let mut out = HostsNo::default();
+    let nodes = state.children(&ROOT).into_iter().filter(|n| {
+        n.kind == NodeKind::Uint(SPACE)
+            && !n.deleted
+            && last(n, 1).and_then(Value::as_bytes) == Some(&space[..])
+    });
+    for n in nodes {
+        out.nodes.push(n.id);
+        let no = n.values(NO_HOSTS).iter();
+        out.no_hosts |= no.filter_map(|v| v.value.as_ref()?.as_bool()).any(|b| b);
+        for c in state.children(&n.id) {
+            if c.kind != NodeKind::Uint(NOT_THIS_HOST) || c.deleted {
+                continue;
+            }
+            if let Some(host) = last(c, 1).and_then(Value::as_bytes) {
+                if let Ok(host) = host.try_into() {
+                    out.not_these.push((c.id, host));
+                }
+            }
+        }
+    }
+    out.nodes.sort();
+    out
+}
+
+/// What records the person's no to naming any host of theirs in `space`
+/// ("no hosts here"): a `set` on each node the account has for it, or a
+/// new node if it has none.
+pub fn say_no_ops(state: &State, space: &SpaceId, local_name: &str) -> Vec<SpaceOp> {
+    let was = hosts_no(state, space);
+    if was.nodes.is_empty() {
+        return vec![SpaceOp::create(
+            NodeKind::Uint(SPACE),
+            ROOT,
+            local_name,
+            Record::new()
+                .with(1, *space)
+                .with(2, local_name)
+                .with(NO_HOSTS, true),
+        )];
+    }
+    was.nodes
+        .iter()
+        .map(|n| set_field(*n, NO_HOSTS, true))
+        .collect()
+}
+
+/// What records that the person took `host` out of `space` by hand ("not
+/// this host here"), under the space's node, made if there is none.
+/// Nothing where it is recorded already.
+pub fn not_this_host_ops(
+    state: &State,
+    space: &SpaceId,
+    local_name: &str,
+    host: &[u8; 32],
+) -> Vec<SpaceOp> {
+    let was = hosts_no(state, space);
+    if was.not_this(host) {
+        return Vec::new();
+    }
+    let fields = Record::new().with(1, *host);
+    let name = hex_of(&host[..4]);
+    match was.nodes.first() {
+        Some(node) => vec![SpaceOp::create(
+            NodeKind::Uint(NOT_THIS_HOST),
+            *node,
+            &name,
+            fields,
+        )],
+        None => vec![
+            SpaceOp::create(
+                NodeKind::Uint(SPACE),
+                ROOT,
+                local_name,
+                Record::new().with(1, *space).with(2, local_name),
+            ),
+            SpaceOp::create(NodeKind::Uint(NOT_THIS_HOST), ROOT, &name, fields).with_parent(0u32),
+        ],
+    }
+}
+
+/// What a yes by hand takes out of the record (D75): "no hosts here" on
+/// every node the account has for `space`, and "not this host here" for
+/// each of `hosts`.
+pub fn yes_ops(state: &State, space: &SpaceId, hosts: &[[u8; 32]]) -> Vec<SpaceOp> {
+    let was = hosts_no(state, space);
+    let mut ops = Vec::new();
+    for n in &was.nodes {
+        let has = state
+            .node(n)
+            .is_some_and(|n| !n.values(NO_HOSTS).is_empty());
+        if has {
+            ops.push(SpaceOp::set(*n, NO_HOSTS, None));
+        }
+    }
+    for (node, host) in &was.not_these {
+        if hosts.contains(host) {
+            ops.push(SpaceOp::delete(*node));
+        }
+    }
+    ops
+}
+
+fn hex_of(b: &[u8]) -> String {
+    b.iter().map(|x| format!("{x:02x}")).collect()
 }
 
 /// A device node.

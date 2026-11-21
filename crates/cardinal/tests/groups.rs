@@ -310,7 +310,7 @@ fn nobody_learns_where_a_host_is_unasked() {
         });
     }
 
-    // Bo has nothing to tell: he joins, and his reach node says nowhere.
+    // Bo has nothing to tell: he joins, and his list is left unset (D75).
     let r = reach_in(&bo, &g);
     assert_eq!(r["ask"], false, "{r}");
     assert_eq!(r["who"], json!(["Cy"]), "{r}");
@@ -319,7 +319,13 @@ fn nobody_learns_where_a_host_is_unasked() {
     wait("bo joined", 10, || {
         groups(&bo).iter().any(|x| x["name"] == "Club")
     });
-    assert_eq!(reach_in(&bo, &g)["shared"], false);
+    let r = reach_in(&bo, &g);
+    assert_eq!(
+        (&r["shared"], &r["set"]),
+        (&json!(false), &json!(false)),
+        "{r}"
+    );
+    assert_eq!(r["said_no"], false, "{r}");
 
     // Cy is asked: who would learn, and what.
     let r = reach_in(&cy, &g);
@@ -349,6 +355,11 @@ fn nobody_learns_where_a_host_is_unasked() {
     assert_eq!(
         (&r["shared"], &r["ask"]),
         (&json!(false), &json!(false)),
+        "{r}"
+    );
+    assert_eq!(
+        (&r["set"], &r["said_no"]),
+        (&json!(true), &json!(true)),
         "{r}"
     );
     // What his devices do unasked leaves it so.

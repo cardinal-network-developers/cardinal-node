@@ -215,11 +215,13 @@ enum Cmd {
         /// your Cardinal folder or on this computer; "" clears it), and
         /// `category` the folder they are listed in (People unless you say).
         /// `name-hosts` lets them have where your hosts are, so their
-        /// devices can find yours; `no-hosts` takes that back.
-        #[arg(value_parser = ["trust", "hosts-only", "introductions", "no-introductions", "refuse", "unrefuse", "name", "picture", "category", "name-hosts", "no-hosts"])]
+        /// devices can find yours; `no-hosts` takes that back, and your
+        /// hosts stay out until you say `name-hosts` again; `no-host
+        /// DEVICE` takes out one host of yours, which stays out likewise.
+        #[arg(value_parser = ["trust", "hosts-only", "introductions", "no-introductions", "refuse", "unrefuse", "name", "picture", "category", "name-hosts", "no-hosts", "no-host"])]
         setting: String,
-        /// The new name, after `name`; the picture, after `picture`; or the
-        /// category, after `category`.
+        /// The new name, after `name`; the picture, after `picture`; the
+        /// category, after `category`; or the host, after `no-host`.
         new_name: Option<String>,
     },
     /// What is in a folder of your Cardinal folder: your files, and beside
@@ -537,11 +539,15 @@ enum GroupCmd {
         keep_host: bool,
     },
     /// Whether a group's members have where your host is: `share` or `keep`.
+    /// `keep` stays until you say `share` again.
     Reach {
         /// The group, by name or id.
         group: String,
         /// `share` or `keep`.
         setting: String,
+        /// With `keep`: only this host of yours, by device name.
+        #[arg(long, value_name = "DEVICE")]
+        host: Option<String>,
     },
     /// Say no to a group offered to you.
     Decline {
@@ -2464,7 +2470,15 @@ async fn client(cmd: Cmd) -> anyhow::Result<()> {
                         "say where to list them: `cardinal contact {who} category Family`"
                     )
                 }
-                (_, Some(_)) => anyhow::bail!("only `name`, `picture` and `category` take a value"),
+                ("no-host", Some(h)) => {
+                    json!({"cmd": "contact", "who": who, "setting": "no-host", "host": h})
+                }
+                ("no-host", None) => {
+                    anyhow::bail!("say which host: `cardinal contact {who} no-host DEVICE`")
+                }
+                (_, Some(_)) => {
+                    anyhow::bail!("only `name`, `picture`, `category` and `no-host` take a value")
+                }
                 (_, None) => json!({"cmd": "contact", "who": who, "setting": setting}),
             };
             let done = call(&paths, req).await?;
@@ -2480,7 +2494,18 @@ async fn client(cmd: Cmd) -> anyhow::Result<()> {
                     "Your host cannot be reached from here now. It is named for {who} as soon as it can be."
                 ),
                 Some("no host") => println!("You have no host to name."),
-                Some("none") => println!("{who} is no longer told where your hosts are."),
+                Some("none") => println!(
+                    "{who} is no longer told where your hosts are. Your hosts stay out until \
+                     you say `cardinal contact {who} name-hosts`."
+                ),
+                Some("taken out") => println!(
+                    "That host is no longer named for {who}, and stays out until you say \
+                     `cardinal contact {who} name-hosts`."
+                ),
+                Some("not named") => println!(
+                    "That host was not named for {who}. It stays out until you say \
+                     `cardinal contact {who} name-hosts`."
+                ),
                 _ => {}
             }
             Ok(())
@@ -2725,13 +2750,25 @@ async fn client(cmd: Cmd) -> anyhow::Result<()> {
                     };
                     json!({"cmd": "group-join", "group": group, "reach": reach})
                 }
-                GroupCmd::Reach { group, setting } => {
+                GroupCmd::Reach {
+                    group,
+                    setting,
+                    host,
+                } => {
                     let share = match setting.as_str() {
                         "share" => true,
                         "keep" => false,
                         _ => anyhow::bail!("say share or keep"),
                     };
-                    json!({"cmd": "group-reach", "group": group, "share": share})
+                    anyhow::ensure!(
+                        !(share && host.is_some()),
+                        "`--host` goes with keep: share names every host of yours"
+                    );
+                    let mut req = json!({"cmd": "group-reach", "group": group, "share": share});
+                    if let Some(h) = host {
+                        req["host"] = json!(h);
+                    }
+                    req
                 }
                 GroupCmd::Decline { group } => json!({"cmd": "group-decline", "group": group}),
                 GroupCmd::Leave { group } => json!({"cmd": "group-leave", "group": group}),

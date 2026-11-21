@@ -360,6 +360,7 @@ async fn handle(d: &Arc<Daemon>, req: &Value) -> anyhow::Result<Value> {
             (None, None) => match arg(req, "setting")? {
                 "name-hosts" => crate::contacts::name_hosts(d, arg(req, "who")?, true).await,
                 "no-hosts" => crate::contacts::name_hosts(d, arg(req, "who")?, false).await,
+                "no-host" => crate::contacts::no_host(d, arg(req, "who")?, arg(req, "host")?).await,
                 setting => crate::contacts::set(d, arg(req, "who")?, setting),
             },
         },
@@ -407,7 +408,11 @@ async fn handle(d: &Arc<Daemon>, req: &Value) -> anyhow::Result<Value> {
         "group-reach" => {
             let share = req.get("share").and_then(|v| v.as_bool());
             let share = share.ok_or_else(|| anyhow::anyhow!("say whether to share: share"))?;
-            crate::groups::set_reach(d, arg(req, "group")?, share).await
+            match req.get("host").and_then(|v| v.as_str()) {
+                Some(host) if !share => crate::groups::no_host(d, arg(req, "group")?, host).await,
+                Some(_) => anyhow::bail!("a host is taken out with share false"),
+                None => crate::groups::set_reach(d, arg(req, "group")?, share).await,
+            }
         }
         "group-decline" => crate::groups::decline(d, arg(req, "group")?),
         "group-members" => crate::groups::members(d, arg(req, "group")?),

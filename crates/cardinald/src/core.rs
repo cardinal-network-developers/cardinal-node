@@ -414,6 +414,13 @@ pub struct Telling {
     /// the space is not public: where a device that named itself names
     /// itself unasked (D72).
     pub trusted_only: bool,
+    /// Whether the person's account records "no hosts here" for the space
+    /// (D75): no host names itself there.
+    pub said_no: bool,
+    /// Whether it records "not this host here" for this device (D75).
+    pub own_not_here: bool,
+    /// The hosts it records "not this host here" for, by static key.
+    pub not_here: Vec<[u8; 32]>,
     /// Whether they are in the space by their own doing.
     pub joined: bool,
     /// Whether they have left it.
@@ -472,40 +479,38 @@ impl Telling {
     }
 
     /// Whether software sets the list now without asking, to more than it
-    /// names. Only among contacts, and then only in two cases. The list
-    /// was never set: the person is in the space, as whoever made it is,
-    /// and this is their joining. Or the space is a relationship and this
-    /// device is a host of the person's that it does not name: a device
-    /// that becomes a host adds itself, and no device adds another.
-    /// Anywhere else a list that is set stays as it is, an empty one too:
-    /// another device may have emptied it, and that was the person's no.
+    /// names (D75, `hosts.md#telling-others-where-to-reach-you`). Only
+    /// among contacts, and never where the person's account says "no
+    /// hosts here". Where the list was never set, the person is in the
+    /// space, as whoever made it is, and this is their joining: every host
+    /// of theirs that may be named unasked is. Where it is set, empty or
+    /// not, a host names itself, and no device adds another: this device,
+    /// where the list does not name it and the account does not say "not
+    /// this host here" for it. A list emptied by mistake fills itself
+    /// again that way.
     ///
-    /// A device that named itself (D72) adds itself where every other
-    /// member is a trusted contact, in a group too, but never where the
-    /// list is empty: only the joining sets a list that was never set.
+    /// A device that named itself (D72) names itself unasked only where
+    /// every other member is a trusted contact.
     pub fn sets_unasked(&self) -> bool {
-        if !self.joined || !self.among_contacts() {
+        if !self.joined || !self.among_contacts() || self.said_no {
             return false;
         }
         if !self.set {
             return true;
         }
-        if !self.own_unnamed {
+        if !self.own_unnamed || self.own_not_here {
             return false;
         }
-        match self.own_self_named {
-            true => self.trusted_only && self.shared,
-            false => self.relationship,
-        }
+        !self.own_self_named || self.trusted_only
     }
 
     /// Whether what software would set unasked is worth an entry, given
-    /// how many hosts it could add: one or more, or none where nothing was
-    /// ever set, which accepts the space and says there is nowhere. A
-    /// device that cannot reach its person's host now has none to add, and
-    /// waits for the host.
+    /// how many hosts it could add: one or more. A device writes the list
+    /// when it has something to say (D75): with none to add it leaves the
+    /// list as it is, unset too, and a device that cannot reach its
+    /// person's host now waits for the host.
     pub fn worth_saying(&self, hosts: usize) -> bool {
-        hosts > 0 || !self.set
+        hosts > 0
     }
 
     /// Whether software empties the reach node now: the person has left
@@ -1453,7 +1458,14 @@ impl Core {
         let own_self_named = hosts
             .iter()
             .any(|(g, device)| *device == here && crate::outside::is_self_named(g));
+        let no = self.hosts_no(space);
+        let own_not_here = hosts
+            .iter()
+            .any(|(g, device)| *device == here && no.not_this(g.link_key.x25519()));
         Telling {
+            said_no: no.no_hosts,
+            own_not_here,
+            not_here: no.not_these.iter().map(|(_, h)| *h).collect(),
             shared: !named.is_empty(),
             set: !since.is_empty(),
             two: since.len() > 1,
@@ -1470,6 +1482,15 @@ impl Core {
             late: who.iter().filter(due).copied().collect(),
             who,
             what: endpoints.map(|e| e.to_string()).collect(),
+        }
+    }
+
+    /// What this person's account records of a no to naming their hosts
+    /// in a space (D75).
+    pub fn hosts_no(&self, space: &SpaceId) -> account::HostsNo {
+        match self.account().and_then(|h| h.space.as_ref()) {
+            Some(acc) => account::hosts_no(acc.state(), space),
+            None => account::HostsNo::default(),
         }
     }
 
@@ -3538,6 +3559,16 @@ mod tests {
                 extra: Default::default(),
             };
             let list = if host { vec![reach] } else { Vec::new() };
+            // the person's answer, recorded in the account first (D75)
+            let account = self.core.account_id().unwrap();
+            let st = self.space(&account).state();
+            let record = match host {
+                true => account::yes_ops(st, space, &key.into_iter().collect::<Vec<_>>()),
+                false => account::say_no_ops(st, space, "a space"),
+            };
+            if !record.is_empty() {
+                self.core.write_entry(&account, record).unwrap();
+            }
             let op = relationship::set_reach(&self.id(), &list);
             self.core.write_entry(space, vec![op]).unwrap().1
         }
@@ -3645,12 +3676,11 @@ mod tests {
         assert!(!t.sets_unasked() && !t.ask());
     }
 
-    /// P10, D68 (`hosts.md#telling-others-where-to-reach-you`, "The list
-    /// is the answer"). One of a person's devices empties the list: their
-    /// no. Another of their devices has the space's news and nothing else
-    /// that is new: an account an earlier version wrote a yes in, a host
-    /// to name, and nobody there but contacts. It must not name the hosts
-    /// again. Naming a host where the list is empty is the person's act.
+    /// P10, D68, D75 (`hosts.md#telling-others-where-to-reach-you`). One
+    /// of a person's devices says no: the record in the account, and the
+    /// empty list. Another of their devices has both, a host to name, and
+    /// nobody there but contacts. It must not name the hosts again, nor a
+    /// host taken up later: only a yes takes the no out.
     #[test]
     fn a_device_does_not_fill_in_a_list_another_emptied() {
         let [mut ana, mut bo, cy, _] = four();
@@ -3663,15 +3693,6 @@ mod tests {
         for g in [&club, &choir] {
             bo.takes(g, &ana.all_of(g));
         }
-        // What an earlier version kept in the account for the club: a yes
-        // (kind 2, field 5). Nothing reads it now.
-        let account = bo.core.account_id().unwrap();
-        let record = Record::new()
-            .with(1, club)
-            .with(2, "Garden club")
-            .with(5, true);
-        let old_yes = SpaceOp::create(NodeKind::Uint(2), ROOT, "Garden club", record);
-        bo.core.write_entry(&account, vec![old_yes]).unwrap();
         for g in [&club, &choir] {
             // He shared his host there, and then, on another device,
             // stopped. This device has that entry of the space.
@@ -3720,9 +3741,13 @@ mod tests {
             token: [n; 16],
             extra: Default::default(),
         };
-        // A yes on one device, and a no on another at the same moment.
+        // A yes on one device, and a no on another at the same moment,
+        // with the no in the account too (D75).
         let yes = relationship::set_reach(&me, &[one(own, 1)]);
         let (yes, _) = bo.core.write_entry(&g, vec![yes]).unwrap();
+        let account = bo.core.account_id().unwrap();
+        let record = account::say_no_ops(bo.space(&account).state(), &g, "Choir");
+        bo.core.write_entry(&account, record).unwrap();
         let no = relationship::set_reach(&me, &[]);
         bo.core
             .write_entry_concurrent(&g, &[yes], vec![no])
@@ -3955,11 +3980,11 @@ mod tests {
         assert!(bo.nothing_due(&g, true));
     }
 
-    /// D68 (`hosts.md#telling-others-where-to-reach-you`). The
-    /// relationship with a contact is the exception: their devices have a
-    /// host of the person's from it already, so the list there is kept at
-    /// the person's hosts, a new one included. Not while the contact is
-    /// refused.
+    /// D68, D75 (`hosts.md#telling-others-where-to-reach-you`). Among
+    /// contacts a host names itself wherever the person has not said no:
+    /// in a relationship, to a list never set, or emptied with no no
+    /// recorded, as by mistake; and in a group of contacts alike. A no in
+    /// the account stops it. Not while the contact is refused.
     #[test]
     fn a_relationship_names_a_host_taken_up_later() {
         let (mut ana, mut bo) = (Person::new(), Person::new());
@@ -3967,39 +3992,49 @@ mod tests {
         bo.meets(&ana);
         let (rel, genesis) = ana.core.create_relationship(&bo.id()).unwrap();
         bo.core.accept_relationship(&genesis, &ana.id()).unwrap();
+        bo.says(&rel, "hello");
         // Until the contact is on record there is nobody known to be one.
-        bo.says_reach(&rel, false);
         assert!(!bo.core.telling(&rel).sets_unasked());
         use cardinal_space::account::Regard;
         let account = bo.core.account_id().unwrap();
         let contact = account::create_contact(&ana.id(), "Ana", &rel, Regard::default());
         bo.core.write_entry(&account, vec![contact]).unwrap();
-        // With no host the empty list says all there is to say.
+        // With no host there is nothing to say, and nothing is written.
         let t = bo.core.telling(&rel);
-        assert!(t.relationship && t.joined && t.set && t.who.is_empty());
-        assert!(!t.sets_unasked() && !t.ask());
+        assert!(t.relationship && t.joined && !t.set && t.who.is_empty());
+        assert!(t.sets_unasked() && !t.worth_saying(0) && !t.ask());
         // He takes up a host: it is named there, unasked. P2: a device
         // that cannot reach the host has nothing to add, and waits.
         bo.hosts_at("203.0.113.5:7171");
         let t = bo.core.telling(&rel);
         assert!(t.unnamed == 1 && t.sets_unasked() && !t.ask());
         assert!(!t.worth_saying(0) && t.worth_saying(1));
-        assert!(Telling::default().worth_saying(0));
         bo.says_reach(&rel, true);
         let t = bo.core.telling(&rel);
         assert!(t.shared && t.unnamed == 0 && !t.sets_unasked() && t.keeps_current());
-        // A group is no relationship, whoever is in it.
-        bo.hosts_no_longer();
+        // A list emptied with no no recorded fills itself again.
+        let empty = relationship::set_reach(&bo.id(), &[]);
+        bo.core.write_entry(&rel, vec![empty]).unwrap();
+        assert!(bo.core.telling(&rel).sets_unasked());
+        // A no recorded stops it.
+        bo.says_reach(&rel, false);
+        let t = bo.core.telling(&rel);
+        assert!(t.said_no && !t.sets_unasked());
+        // In a group of contacts alike, with the same no.
         let bo_shown = [(bo.id(), "Bo".to_owned())];
         let g = ana.core.create_group("Choir", "Ana", &bo_shown).unwrap();
         bo.takes(&g, &ana.all_of(&g));
-        bo.says_reach(&g, false);
-        bo.hosts_at("203.0.113.5:7171");
+        let empty = relationship::set_reach(&bo.id(), &[]);
+        bo.core.write_entry(&g, vec![empty]).unwrap();
         let t = bo.core.telling(&g);
         assert!(!t.relationship && t.who.is_empty() && t.unnamed == 1);
-        assert!(!t.sets_unasked());
+        assert!(t.sets_unasked());
+        bo.says_reach(&g, false);
+        assert!(!bo.core.telling(&g).sets_unasked());
         // Refused, Ana is no contact: nothing is set for her.
-        bo.says_reach(&rel, false);
+        bo.says_reach(&rel, true);
+        let empty = relationship::set_reach(&bo.id(), &[]);
+        bo.core.write_entry(&rel, vec![empty]).unwrap();
         assert!(bo.core.telling(&rel).sets_unasked());
         let node = bo.core.contacts()[0].node;
         let refuse = account::set_field(node, account::REFUSED, true);

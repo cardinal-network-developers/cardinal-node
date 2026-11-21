@@ -290,6 +290,8 @@ fn telling_json(core: &Core, id: &SpaceId, me: &[u8; 32]) -> Json {
         "added": names(t.added()),
         "public": t.public,
         "waiting": t.waiting,
+        "said_no": t.said_no,
+        "set": t.set,
     })
 }
 
@@ -335,15 +337,15 @@ fn question(reach: &Json, name: &str) -> String {
     )
 }
 
-/// Joins a group offered to this person by setting their reach node in it,
-/// which is the first entry of theirs there (`profiles.md#group`): to their
-/// hosts, or to an empty list if they have none or do not want every member
-/// to have them. Where someone in the group is not a contact of theirs, and
-/// they have a host, that is theirs to say: `reach` is their answer, and
-/// without it nothing is written. Anywhere, among contacts too, `reach` is
-/// their answer if they give one. The list it sets is where the answer is
-/// kept, and the only place: `shared` in what comes back says whether it
-/// names a host.
+/// Joins a group offered to this person with a first entry of theirs there
+/// (`profiles.md#group`): their reach node set to their hosts, or to an
+/// empty list where they do not want every member to have them, which the
+/// account records as their no (D75). With no host to name, and no no,
+/// the list is left unset and the entry is empty. Where someone in the
+/// group is not a contact of theirs, and they have a host, that is theirs
+/// to say: `reach` is their answer, and without it nothing is written.
+/// Anywhere, among contacts too, `reach` is their answer if they give one.
+/// `shared` in what comes back says whether the list names a host.
 pub async fn join(d: &Arc<Daemon>, group: &str, reach: Option<bool>) -> anyhow::Result<Json> {
     let g = find(d, group)?;
     if g.joined {
@@ -360,9 +362,21 @@ pub async fn join(d: &Arc<Daemon>, group: &str, reach: Option<bool>) -> anyhow::
         question(&telling, &g.name)
     );
     let share = t.joins_sharing(reach);
-    let shared = crate::mailbox::say_reach(d, &g.id, share).await?;
+    // A no is the person's to say: with no host and nothing said, there is
+    // nothing to say, and joining leaves the list unset (D75).
+    let no = !share && (t.hosted || reach == Some(false));
+    let shared = match share || no {
+        true => crate::mailbox::say_reach(d, &g.id, share).await?,
+        false => false,
+    };
+    if !d.core().telling(&g.id).joined {
+        // Joining is a first entry of theirs, and with no list to set it
+        // is an empty one.
+        let (_, sealed) = d.core().write_entry(&g.id, Vec::new())?;
+        d.push(&g.id, vec![sealed]);
+    }
     // A yes with a host that could not be reached for a token is kept on
-    // this device, against the empty list just set, and finished later.
+    // this device, against the list as it is, and finished later.
     let waiting = share && !shared && t.hosted;
     if waiting {
         d.core().keep_yes(&g.id);
@@ -407,6 +421,17 @@ pub async fn set_reach(d: &Arc<Daemon>, group: &str, share: bool) -> anyhow::Res
     d.core().told_of_all(&g.id);
     d.bump();
     Ok(json!({"shared": !waiting, "waiting": waiting}))
+}
+
+/// The person takes one host of theirs out of a group's list (D75): the
+/// account records "not this host here", so it does not name itself there
+/// again until they say `share`.
+pub async fn no_host(d: &Arc<Daemon>, group: &str, host: &str) -> anyhow::Result<Json> {
+    let g = joined(d, group)?;
+    let key = crate::mailbox::host_by_name(d, host)?;
+    let named = crate::mailbox::take_out_host(d, &g.id, &key).await?;
+    d.bump();
+    Ok(json!({"taken_out": named}))
 }
 
 /// Says no to a group offered to this person. Nothing is written in it, and

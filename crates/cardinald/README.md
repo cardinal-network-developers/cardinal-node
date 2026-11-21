@@ -347,7 +347,14 @@ same request through. Commands: `status`, `devices`, `remove-device`,
 `pair-show`, `pair-status`, `pair-type` (both take `device`, a name for
 the device being added), `setup-finish` (`name`, the person's; `device`),
 `me` (`name` sets the name the person suggests for themselves),
-`contact` (`name`, empty to clear; `picture`, a file, empty to clear),
+`contact` (`name`, empty to clear; `picture`, a file, empty to clear;
+`setting` `name-hosts` or `no-hosts`, or `no-host` with `host`, a device
+name, which takes that one host out of the relationship's list and
+records "not this host here" in the account, D75; answers `named`:
+`named`, `waiting`, `no host`, `none`, `taken out` or `not named`),
+`group-reach` (`share`; with `share` false, `host` takes out that one
+host, answering `taken_out`; `groups` gives each group's `reach` with
+`set` and `said_no`),
 `speedtest` (one device, by
 name or key), `reload` (after `init` while the daemon runs), `flush`
 (commit now), `stop`. `status` includes `copies`: per device meant to
