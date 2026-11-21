@@ -1,9 +1,10 @@
 //! Which network this device is on, and whether its person said it is
 //! theirs (D76, `hosts.md#a-device-that-can-be-reached-names-itself`).
 //!
-//! A network is known by its router's hardware address: on Linux, the
-//! default route's gateway (`/proc/net/route`) looked up in the neighbour
-//! table (`/proc/net/arp`). The person's answer to "Is this your network?"
+//! A network is known by its router's hardware address: the default
+//! route's gateway looked up in the neighbour table. On Linux both are
+//! read from `/proc/net/route` and `/proc/net/arp`; on Windows from
+//! `GetIpForwardTable2` and `GetIpNetTable2`. The person's answer to "Is this your network?"
 //! is kept in their account as a network node (kind 15), so a yes on one
 //! device holds on all of them. No is the default, and a question not
 //! answered is a no: only on a network marked as theirs does a device ask
@@ -78,9 +79,202 @@ fn test_router() -> Option<Option<Router>> {
 }
 
 /// The gateway's IPv4 address, from the default route.
-fn gateway_ip() -> Option<Ipv4Addr> {
-    let routes = std::fs::read_to_string("/proc/net/route").ok()?;
-    crate::portmap::default_gateway(&routes)
+pub fn gateway_ip() -> Option<Ipv4Addr> {
+    #[cfg(windows)]
+    {
+        default_route(&system::routes()?)
+    }
+    #[cfg(not(windows))]
+    {
+        let routes = std::fs::read_to_string("/proc/net/route").ok()?;
+        crate::portmap::default_gateway(&routes)
+    }
+}
+
+/// The hardware address the neighbour table holds for `ip`, if complete.
+fn neighbour(ip: Ipv4Addr) -> Option<Router> {
+    #[cfg(windows)]
+    {
+        system::neighbours()?
+            .into_iter()
+            .find_map(|(at, r)| (at == ip).then_some(r))
+    }
+    #[cfg(not(windows))]
+    {
+        let table = std::fs::read_to_string("/proc/net/arp").ok()?;
+        arp_lookup(&table, ip)
+    }
+}
+
+/// The subnets this device is on directly, or `None` where the routes
+/// cannot be read.
+fn link_subnets() -> Option<Vec<(Ipv4Addr, Ipv4Addr)>> {
+    #[cfg(windows)]
+    {
+        Some(subnets_of(&system::routes()?))
+    }
+    #[cfg(not(windows))]
+    {
+        let routes = std::fs::read_to_string("/proc/net/route").ok()?;
+        Some(on_link_subnets(&routes))
+    }
+}
+
+/// One IPv4 route as Windows gives it (`MIB_IPFORWARD_ROW2`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Route {
+    pub destination: Ipv4Addr,
+    pub prefix: u8,
+    /// `None` for a route on the link (next hop 0.0.0.0).
+    pub next_hop: Option<Ipv4Addr>,
+    pub metric: u32,
+}
+
+/// A route from a row's fields: `None` for one that is not IPv4, for a
+/// loopback route, or for a prefix longer than 32.
+pub fn route_from_row(
+    family: u16,
+    destination: [u8; 4],
+    prefix: u8,
+    hop_family: u16,
+    hop: [u8; 4],
+    metric: u32,
+    loopback: bool,
+) -> Option<Route> {
+    const AF_INET: u16 = 2;
+    if family != AF_INET || prefix > 32 || loopback {
+        return None;
+    }
+    let hop = Ipv4Addr::from(hop);
+    let next_hop = (hop_family == AF_INET && !hop.is_unspecified()).then_some(hop);
+    Some(Route {
+        destination: Ipv4Addr::from(destination),
+        prefix,
+        next_hop,
+        metric,
+    })
+}
+
+/// The gateway of the default route with the lowest metric. (Windows adds
+/// the interface's metric when it chooses; the route's own is used here.)
+pub fn default_route(routes: &[Route]) -> Option<Ipv4Addr> {
+    routes
+        .iter()
+        .filter(|r| r.prefix == 0)
+        .filter_map(|r| Some((r.metric, r.next_hop?)))
+        .min_by_key(|(m, _)| *m)
+        .map(|(_, g)| g)
+}
+
+/// The subnets on the link: routes with no next hop, as (network, mask),
+/// leaving out the default route, host routes and multicast.
+pub fn subnets_of(routes: &[Route]) -> Vec<(Ipv4Addr, Ipv4Addr)> {
+    routes
+        .iter()
+        .filter(|r| r.next_hop.is_none() && (1..32).contains(&r.prefix))
+        .filter(|r| !r.destination.is_multicast())
+        .map(|r| {
+            let mask = u32::MAX << (32 - r.prefix);
+            (
+                Ipv4Addr::from(u32::from(r.destination) & mask),
+                Ipv4Addr::from(mask),
+            )
+        })
+        .collect()
+}
+
+/// A neighbour from a `MIB_IPNET_ROW2`'s fields: its address and hardware
+/// address, where the entry is IPv4, has a six-byte address that is not
+/// zero, and is resolved (stale, probing or better: not unreachable or
+/// incomplete).
+pub fn neighbour_from_row(
+    family: u16,
+    address: [u8; 4],
+    physical: &[u8],
+    state: i32,
+) -> Option<(Ipv4Addr, Router)> {
+    const AF_INET: u16 = 2;
+    // NL_NEIGHBOR_STATE: 0 unreachable, 1 incomplete, 2 probe, 3 delay,
+    // 4 stale, 5 reachable, 6 permanent
+    if family != AF_INET || !(2..=6).contains(&state) {
+        return None;
+    }
+    let mac: Router = physical.try_into().ok()?;
+    (mac != [0; 6]).then_some((Ipv4Addr::from(address), mac))
+}
+
+#[cfg(windows)]
+mod system {
+    //! The IP Helper API's IPv4 tables.
+
+    use std::net::Ipv4Addr;
+
+    use windows_sys::Win32::Foundation::NO_ERROR;
+    use windows_sys::Win32::NetworkManagement::IpHelper::{
+        FreeMibTable, GetIpForwardTable2, GetIpNetTable2, MIB_IPFORWARD_TABLE2, MIB_IPNET_TABLE2,
+    };
+    use windows_sys::Win32::Networking::WinSock::{AF_INET, SOCKADDR_INET};
+
+    use super::{neighbour_from_row, route_from_row, Route, Router};
+
+    fn v4(a: &SOCKADDR_INET) -> (u16, [u8; 4]) {
+        // SAFETY: every member starts with the family; the IPv4 member is
+        // read only for its address bytes, which any family has room for.
+        unsafe { (a.si_family, a.Ipv4.sin_addr.S_un.S_addr.to_ne_bytes()) }
+    }
+
+    pub fn routes() -> Option<Vec<Route>> {
+        let mut table: *mut MIB_IPFORWARD_TABLE2 = std::ptr::null_mut();
+        // SAFETY: the table is allocated by the call, read within its
+        // NumEntries and freed once.
+        unsafe {
+            if GetIpForwardTable2(AF_INET, &mut table) != NO_ERROR || table.is_null() {
+                return None;
+            }
+            let n = (*table).NumEntries as usize;
+            let rows = std::slice::from_raw_parts((*table).Table.as_ptr(), n);
+            let out = rows
+                .iter()
+                .filter_map(|r| {
+                    let (family, dest) = v4(&r.DestinationPrefix.Prefix);
+                    let (hop_family, hop) = v4(&r.NextHop);
+                    route_from_row(
+                        family,
+                        dest,
+                        r.DestinationPrefix.PrefixLength,
+                        hop_family,
+                        hop,
+                        r.Metric,
+                        r.Loopback,
+                    )
+                })
+                .collect();
+            FreeMibTable(table as *const _);
+            Some(out)
+        }
+    }
+
+    pub fn neighbours() -> Option<Vec<(Ipv4Addr, Router)>> {
+        let mut table: *mut MIB_IPNET_TABLE2 = std::ptr::null_mut();
+        // SAFETY: as for routes.
+        unsafe {
+            if GetIpNetTable2(AF_INET, &mut table) != NO_ERROR || table.is_null() {
+                return None;
+            }
+            let n = (*table).NumEntries as usize;
+            let rows = std::slice::from_raw_parts((*table).Table.as_ptr(), n);
+            let out = rows
+                .iter()
+                .filter_map(|r| {
+                    let (family, addr) = v4(&r.Address);
+                    let len = (r.PhysicalAddressLength as usize).min(r.PhysicalAddress.len());
+                    neighbour_from_row(family, addr, &r.PhysicalAddress[..len], r.State)
+                })
+                .collect();
+            FreeMibTable(table as *const _);
+            Some(out)
+        }
+    }
 }
 
 /// The router of the network this device is on now, as far as can be
@@ -89,9 +283,7 @@ pub fn router_now() -> Option<Router> {
     if let Some(r) = test_router() {
         return r;
     }
-    let ip = gateway_ip()?;
-    let table = std::fs::read_to_string("/proc/net/arp").ok()?;
-    arp_lookup(&table, ip)
+    neighbour(gateway_ip()?)
 }
 
 /// [`router_now`], and where the neighbour table has no complete entry
@@ -159,11 +351,11 @@ pub fn on_local_link(ip: std::net::IpAddr) -> bool {
     if v4.is_link_local() {
         return true;
     }
-    match std::fs::read_to_string("/proc/net/route") {
-        Ok(routes) => on_link_subnets(&routes)
+    match link_subnets() {
+        Some(nets) => nets
             .iter()
             .any(|(net, mask)| u32::from(v4) & u32::from(*mask) == u32::from(*net)),
-        Err(_) => v4.is_private(),
+        None => v4.is_private(),
     }
 }
 
@@ -411,5 +603,63 @@ mod tests {
         let r = parse_router("D6-A5-7F-9D-79-29").unwrap();
         assert_eq!(router_text(&r), "d6:a5:7f:9d:79:29");
         assert!(parse_router("d6:a5:7f").is_none());
+    }
+
+    /// The table QEMU's user network gives a Windows guest, as
+    /// `GetIpForwardTable2` rows: the default route through 10.0.2.2, the
+    /// 10.0.2.0/24 subnet, the guest's own and broadcast host routes,
+    /// loopback and multicast.
+    fn qemu_routes() -> Vec<Route> {
+        // family, destination, prefix, next hop's family, next hop,
+        // metric, loopback
+        type Row = (u16, [u8; 4], u8, u16, [u8; 4], u32, bool);
+        let rows: [Row; 8] = [
+            (2, [0, 0, 0, 0], 0, 2, [10, 0, 2, 2], 0, false),
+            (2, [10, 0, 2, 0], 24, 2, [0, 0, 0, 0], 256, false),
+            (2, [10, 0, 2, 15], 32, 2, [0, 0, 0, 0], 256, false),
+            (2, [10, 0, 2, 255], 32, 2, [0, 0, 0, 0], 256, false),
+            (2, [127, 0, 0, 0], 8, 2, [0, 0, 0, 0], 256, true),
+            (2, [224, 0, 0, 0], 4, 2, [0, 0, 0, 0], 256, false),
+            // a second default route, worse, as a VPN or second card gives
+            (2, [0, 0, 0, 0], 0, 2, [192, 168, 9, 1], 50, false),
+            // not IPv4
+            (23, [0, 0, 0, 0], 0, 23, [0, 0, 0, 0], 0, false),
+        ];
+        rows.iter()
+            .filter_map(|&(f, d, p, hf, h, m, l)| route_from_row(f, d, p, hf, h, m, l))
+            .collect()
+    }
+
+    #[test]
+    fn the_windows_routing_table_gives_the_gateway_and_the_subnets() {
+        let routes = qemu_routes();
+        assert_eq!(routes.len(), 6, "loopback and IPv6 are left out");
+        assert_eq!(default_route(&routes), Some(Ipv4Addr::new(10, 0, 2, 2)));
+        assert_eq!(
+            subnets_of(&routes),
+            [(Ipv4Addr::new(10, 0, 2, 0), Ipv4Addr::new(255, 255, 255, 0))]
+        );
+        let on_link_only = &routes[1..2];
+        assert_eq!(default_route(on_link_only), None);
+        assert!(route_from_row(2, [0; 4], 33, 2, [0; 4], 0, false).is_none());
+    }
+
+    #[test]
+    fn a_windows_neighbour_counts_only_when_resolved() {
+        let mac = [0x52, 0x55, 0x0a, 0x00, 0x02, 0x02];
+        let gw = [10, 0, 2, 2];
+        // reachable, stale, permanent
+        for state in [5, 4, 6] {
+            assert_eq!(
+                neighbour_from_row(2, gw, &mac, state),
+                Some((Ipv4Addr::new(10, 0, 2, 2), mac))
+            );
+        }
+        // unreachable, incomplete
+        assert_eq!(neighbour_from_row(2, gw, &mac, 0), None);
+        assert_eq!(neighbour_from_row(2, gw, &mac, 1), None);
+        assert_eq!(neighbour_from_row(2, gw, &[0; 6], 5), None);
+        assert_eq!(neighbour_from_row(2, gw, &mac[..4], 5), None);
+        assert_eq!(neighbour_from_row(23, gw, &mac, 5), None);
     }
 }
