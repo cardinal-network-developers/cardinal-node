@@ -1791,9 +1791,19 @@ async fn through_host(
     r: &Reach,
     addr: SocketAddr,
 ) -> anyhow::Result<()> {
-    let (host, opened) = host_session(d, r, addr).await?;
+    let (mut host, mut opened) = host_session(d, r, addr).await?;
     let ask = Record::new().with(0, OP_CONNECT).with(1, r.token);
-    let reply = call(&host, Service::RENDEZVOUS, ask).await;
+    let mut reply = call(&host, Service::RENDEZVOUS, ask.clone()).await;
+    if reply.is_err() && !opened {
+        // The session it found may have been one the host was ending, as
+        // a direct one from someone it does not take for a trusted
+        // contact: once more, on a session of its own with the token.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        if host.is_closed() {
+            (host, opened) = host_session(d, r, addr).await?;
+            reply = call(&host, Service::RENDEZVOUS, ask).await;
+        }
+    }
     let found = match reply {
         Ok(reply) if reply.get(0).and_then(Value::as_uint) == Some(OP_CONNECT) => {
             let list = reply.record_list(1).unwrap_or_default();
