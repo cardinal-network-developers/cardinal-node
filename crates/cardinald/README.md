@@ -436,8 +436,11 @@ through a persona per person guarded and per policy (D79), made by
 person then names with `guardians-set` (it fails, saying so, for a
 contact with no persona not named before). With guardians in office,
 `guardians-set` asks no words and replies `pending: true`: the change
-takes effect once they confirm it. Errors of the guardians' and recovery requests start with a capital
-letter and name no command: they are shown as they come.
+takes effect once they confirm it. Errors of the guardians' and recovery requests, and of `accept`, start
+with a capital letter and name no command: they are shown as they come.
+Each person in `guarding` gives `persona_at`, where the persona's own
+service listens (`ip:port`, null if it does not run on this device), for
+`guarding-invite`'s `at`.
 
 `guarding` → `{guarding: [{name, id (64
 hex), persona, guardians, threshold, delay, delay_text, recoveries,

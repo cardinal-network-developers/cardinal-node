@@ -104,8 +104,9 @@ fn capitalized(req: &Value, e: anyhow::Error) -> anyhow::Error {
     let ours = cmd.starts_with("guardians")
         || cmd.starts_with("guarding")
         || cmd.starts_with("recover-")
-        || cmd == "recover";
-    if !ours || e.is::<crate::recovery::NeedsWords>() {
+        || cmd == "recover"
+        || cmd == "accept";
+    if !ours || e.is::<crate::recovery::NeedsWords>() || e.is::<crate::contacts::NeedsFor>() {
         return e;
     }
     let text = format!("{e:#}");

@@ -425,7 +425,7 @@ pub async fn accept_for(
     if invitation.recovery_of == Some(crate::recovering::ANYONE) {
         let whom = whom.ok_or_else(|| {
             anyhow::Error::new(NeedsFor(
-                "that invitation is to help someone recover their identity: say whom, of \
+                "That invitation is to help someone recover their identity: say whom, of \
                  those you guard"
                     .to_owned(),
             ))

@@ -516,7 +516,9 @@ differs or was read:
   only where its writer has not carried the same entry there already (what
   the other side carried counts as theirs). On meeting a helper, the
   guardian's device writes its proposal (once per space) and carries the
-  person's own log, which the new device signs against and takes the
+  person's own log, with the guardians' personas' logs held under its
+  label (without their confirmations a change of guardians in effect
+  looks not in effect, and the new device would sign under no policy), which the new device signs against and takes the
   identity up from. On a guardian's side all of this is the persona's,
   in its service's relationships, tended every second by the guardian's
   own service, which holds the person's log and decides. A relationship is for one `recover`: the first its
