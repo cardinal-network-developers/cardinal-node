@@ -290,6 +290,7 @@ dependencies = [
  "cardinal-encoding",
  "cardinal-link",
  "hex",
+ "serde_json",
  "socket2",
  "tokio",
  "zeroize",

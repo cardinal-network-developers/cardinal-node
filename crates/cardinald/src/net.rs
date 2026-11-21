@@ -161,7 +161,12 @@ impl Daemon {
             }
             PeerKind::Token(token) => {
                 let core = self.core();
-                token_access(core.space_of_token(&token), core.identity_label(), label)
+                // a token serves what stands in place of its space, and
+                // the space it was given in
+                let space = core.space_of_token(&token);
+                let serves = space.is_some_and(|s| core.current(label) == s);
+                let space = if serves { Some(*label) } else { space };
+                token_access(space, core.identity_label(), label)
             }
             PeerKind::Restoring | PeerKind::Helped(_) | PeerKind::Stranger => Access::None,
         }

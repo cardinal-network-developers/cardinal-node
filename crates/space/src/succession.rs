@@ -381,7 +381,7 @@ pub fn plan_repost(
                 };
                 let mut fields = fields.clone();
                 if let Some(f) = node_field(profile, *kind) {
-                    if let Some(id) = fields.get(f).and_then(|v| node_of(v)) {
+                    if let Some(id) = fields.get(f).and_then(node_of) {
                         match name(&id, &made_here) {
                             Named::Is(v) if v.as_bytes().is_some() => fields = fields.with(f, v),
                             Named::Wait => return Plan::Wait,

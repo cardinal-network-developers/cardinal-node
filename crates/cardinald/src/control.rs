@@ -404,7 +404,12 @@ async fn handle(d: &Arc<Daemon>, req: &Value) -> anyhow::Result<Value> {
             let shown = req.get("shown").and_then(|v| v.as_str());
             crate::groups::add(d, arg(req, "group")?, &strings(req, "people"), shown)
         }
-        "group-remove" => crate::groups::remove(d, arg(req, "group")?, arg(req, "who")?),
+        "group-remove" => crate::groups::remove(d, arg(req, "group")?, arg(req, "who")?).await,
+        "group-role" => {
+            let (group, who) = (arg(req, "group")?, arg(req, "who")?);
+            crate::groups::set_role(d, group, who, arg(req, "role")?).await
+        }
+        "group-post-again" => crate::groups::post_again(d, arg(req, "group")?),
         "group-leave" => crate::groups::leave(d, arg(req, "group")?),
         "group-join" => {
             let reach = answer_in(req, "reach")?;

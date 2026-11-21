@@ -36,6 +36,14 @@ pub const NETWORK: u64 = 15;
 /// it, "no hosts here" (D75, `hosts.md#telling-others-where-to-reach-you`).
 pub const NO_HOSTS: u64 = 5;
 
+/// A space node's field: the space this one succeeded, written by the
+/// device that followed it (`profiles.md#account`).
+pub const SUCCEEDED: u64 = 4;
+
+/// A space node's field: the last message this person read there, kept
+/// while read markers are off.
+pub const READ_UP_TO: u64 = 6;
+
 /// An invitation's field: the inviter cancelled it.
 pub const CANCELLED: u64 = 2;
 
@@ -262,6 +270,76 @@ pub fn create_space(space: &SpaceId, local_name: &str) -> SpaceOp {
     )
 }
 
+/// What a device writes in the account when it follows a successor
+/// (`profiles.md#account`, "A successor takes its place"): a space node
+/// for it, whose field 4 names the space it succeeded, with what was
+/// recorded for that space: its local name, "no hosts here", where the
+/// person had read up to, each placement and each "not this host here".
+/// Nothing where a node for the successor is there already.
+pub fn successor_ops(
+    state: &State,
+    old: &SpaceId,
+    new: &SpaceId,
+    local_name: &str,
+) -> Vec<SpaceOp> {
+    let named = |n: &crate::state::Node, s: &SpaceId| {
+        n.kind == NodeKind::Uint(SPACE)
+            && !n.deleted
+            && last(n, 1).and_then(Value::as_bytes) == Some(&s[..])
+    };
+    let roots = state.children(&ROOT);
+    if roots.iter().any(|n| named(n, new)) {
+        return Vec::new();
+    }
+    let was: Vec<&crate::state::Node> = roots.into_iter().filter(|n| named(n, old)).collect();
+    let name = was
+        .iter()
+        .find_map(|n| last(n, 2).and_then(Value::as_text))
+        .unwrap_or(local_name);
+    let mut fields = Record::new()
+        .with(1, *new)
+        .with(2, name)
+        .with(SUCCEEDED, *old);
+    let no = was.iter().flat_map(|n| n.values(NO_HOSTS).iter());
+    if no.filter_map(|v| v.value.as_ref()?.as_bool()).any(|b| b) {
+        fields = fields.with(NO_HOSTS, true);
+    }
+    if let Some(read) = was.iter().find_map(|n| last(n, READ_UP_TO)) {
+        fields = fields.with(READ_UP_TO, read.clone());
+    }
+    let mut ops = vec![SpaceOp::create(NodeKind::Uint(SPACE), ROOT, name, fields)];
+    for n in &was {
+        for c in state.children(&n.id) {
+            let kept =
+                c.kind == NodeKind::Uint(PLACEMENT) || c.kind == NodeKind::Uint(NOT_THIS_HOST);
+            if !kept || c.deleted {
+                continue;
+            }
+            let mut f = Record::new();
+            for (k, vs) in &c.fields {
+                if let Some(v) = vs.iter().rev().find_map(|v| v.value.as_ref()) {
+                    f = f.with(*k, v.clone());
+                }
+            }
+            ops.push(SpaceOp::create(c.kind, ROOT, &c.name, f).with_parent(0u32));
+        }
+    }
+    ops
+}
+
+/// The successor this person's devices followed from `space`, by the
+/// account: a space node whose field 4 names it.
+pub fn followed_from(state: &State, space: &SpaceId) -> Vec<SpaceId> {
+    let mut out: Vec<SpaceId> = spaces(state)
+        .into_iter()
+        .filter(|r| r.succeeded == Some(*space))
+        .map(|r| r.space)
+        .collect();
+    out.sort();
+    out.dedup();
+    out
+}
+
 /// `create` of a space node for an offer this person said no to.
 pub fn create_declined(space: &SpaceId, local_name: &str) -> SpaceOp {
     SpaceOp::create(
@@ -484,6 +562,9 @@ pub struct SpaceRecord {
     pub placements: Vec<PlacementRecord>,
     /// An offer of it that this person said no to (`profiles.md#group`).
     pub declined: bool,
+    /// The space it succeeded, if it is a successor this person's device
+    /// followed (field 4).
+    pub succeeded: Option<SpaceId>,
 }
 
 fn last(n: &crate::state::Node, key: u64) -> Option<&Value> {
@@ -737,6 +818,9 @@ pub fn spaces(state: &State) -> Vec<SpaceRecord> {
                     .to_owned(),
                 placements,
                 declined: last(n, 3).and_then(|v| v.as_bool()).unwrap_or(false),
+                succeeded: last(n, SUCCEEDED)
+                    .and_then(Value::as_bytes)
+                    .and_then(|b| b.try_into().ok()),
             })
         })
         .collect()

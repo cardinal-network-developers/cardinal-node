@@ -1184,6 +1184,8 @@ impl Daemon {
             }
             // a recovery of someone this person guards may be pending now
             crate::guardians::observe(self);
+            // and a succession judged with this log may be checked now
+            crate::following::follow(self);
             self.directory.update(own.as_deref(), &states);
             self.endpoint.recheck_peers();
             return Ok(Ingested {
@@ -1232,6 +1234,8 @@ impl Daemon {
             }
             // this person may have left it, on another of their devices
             crate::mailbox::revoke_left(self, &label);
+            // it may have ended, or brought what stands in its place
+            crate::following::follow(self);
             self.bump();
             self.housekeeping();
         }
@@ -2058,6 +2062,9 @@ impl Daemon {
                  or `cardinal pair` (to add it to your other devices)"
             );
         }
+        // what stopped half way: a successor not followed yet, work not
+        // posted again yet
+        crate::following::follow(&self);
         // accept sessions
         let d = self.clone();
         tokio::spawn(async move {

@@ -518,7 +518,7 @@ impl State {
     /// fails the whole.
     pub fn from_canonical(profile: Profile, canonical: &Record) -> Result<State, crate::Error> {
         let bad = crate::Error::Malformed("canonical state");
-        if canonical.opt_uint(0)? != Some(CANONICAL_STATE as u64) {
+        if canonical.opt_uint(0)? != Some(CANONICAL_STATE) {
             return Err(bad);
         }
         let mut st = State::new(profile);
@@ -1240,6 +1240,11 @@ impl State {
     /// Whether an entry was accepted for state.
     pub fn is_accepted(&self, e: &EntryId) -> bool {
         self.accepted.contains(e)
+    }
+
+    /// The entries accepted for state.
+    pub fn accepted(&self) -> impl Iterator<Item = &EntryId> {
+        self.accepted.iter()
     }
 
     /// Valid entries that were not accepted for state.
