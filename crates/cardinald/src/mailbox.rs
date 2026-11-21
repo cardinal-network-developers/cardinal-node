@@ -342,14 +342,11 @@ pub struct Mailbox {
     /// The spaces where what this device set about on its own failed, as
     /// for a log that cannot be written, and when it tries again.
     put_off: Mutex<HashMap<SpaceId, PutOff>>,
-    /// Where this person's list names no host and a host of theirs could
-    /// fill it in (D75): the entries that set it, and when this device
-    /// first saw it so. It fills it in only [`Mailbox::fill_after`] later,
-    /// so that a no's record in the account, written just before the
-    /// empty list on the device that said it, has come too.
-    empty_seen: Mutex<HashMap<SpaceId, (Vec<String>, Instant)>>,
-    /// [`FILL_AFTER`]; none in tests.
-    pub(crate) fill_after: Mutex<Duration>,
+    /// The spaces where this device set about writing the person's no and
+    /// has not yet written the empty list (D75): finished at the next look,
+    /// after a failed write or a crash. Kept in `pending-no.json`.
+    pending_no: Mutex<BTreeSet<SpaceId>>,
+    pending_no_path: PathBuf,
     /// Tests: run once a token is registered and before the list is
     /// written, where an entry may arrive.
     #[cfg(test)]
@@ -365,10 +362,6 @@ struct PutOff {
 /// How long a write of the list that failed waits before it is tried
 /// again, at first and at most: each failure doubles it.
 const PUT_OFF: (Duration, Duration) = (Duration::from_secs(60), Duration::from_secs(3600));
-
-/// How long an empty list the person did not say no to stands, as this
-/// device has seen it, before a host fills it in (D75).
-const FILL_AFTER: Duration = Duration::from_secs(120);
 
 fn sent_key(space: &SpaceId, member: &[u8; 32]) -> String {
     format!("{}:{}", hex::encode(space), hex::encode(member))
@@ -387,6 +380,14 @@ impl Mailbox {
     /// Opens the mailbox in `dir`.
     pub fn load(dir: PathBuf) -> Mailbox {
         let sent_path = dir.join("sent.json");
+        let pending_no_path = dir.join("pending-no.json");
+        let pending_no: BTreeSet<SpaceId> = std::fs::read(&pending_no_path)
+            .ok()
+            .and_then(|b| serde_json::from_slice::<Vec<String>>(&b).ok())
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|h| hex::decode(h).ok()?.try_into().ok())
+            .collect();
         let sent = std::fs::read(&sent_path)
             .ok()
             .and_then(|b| serde_json::from_slice(&b).ok())
@@ -400,8 +401,8 @@ impl Mailbox {
             pulled: Mutex::new(HashMap::new()),
             reaching: tokio::sync::Mutex::new(()),
             put_off: Mutex::new(HashMap::new()),
-            empty_seen: Mutex::new(HashMap::new()),
-            fill_after: Mutex::new(FILL_AFTER),
+            pending_no: Mutex::new(pending_no),
+            pending_no_path,
             #[cfg(test)]
             before_write: Mutex::new(None),
         }
@@ -898,14 +899,70 @@ fn me(d: &Daemon) -> anyhow::Result<[u8; 32]> {
 /// names a host afterwards.
 pub async fn say_reach(d: &Arc<Daemon>, space: &SpaceId, share: bool) -> anyhow::Result<bool> {
     let _one = d.mailbox.reaching.lock().await;
-    if share {
-        let hosts = all_hosts(d);
-        record(d, |st| account::yes_ops(st, space, &hosts))?;
-    } else {
-        let name = local_name(d, space);
-        record(d, |st| account::say_no_ops(st, space, &name))?;
+    if !share {
+        say_no_locked(d, space).await?;
+        return Ok(false);
     }
+    let hosts = all_hosts(d);
+    record(d, |st| account::yes_ops(st, space, &hosts))?;
+    pending_no(d, space, false);
     say_reach_locked(d, space, share).await
+}
+
+/// The person's no (D75): noted on this device first, then recorded in
+/// the account, then the empty list written with, beside it, the account
+/// entry it rests on (`relationship::set_rests_on`), so that a host of
+/// theirs that has the list before the record waits for the record; and
+/// the note taken out. A note left by a write that failed or a crash is
+/// finished at the next look ([`write_reach`]).
+async fn say_no_locked(d: &Arc<Daemon>, space: &SpaceId) -> anyhow::Result<()> {
+    pending_no(d, space, true);
+    let name = local_name(d, space);
+    let ids = record(d, |st| account::say_no_ops(st, space, &name))?;
+    let me = me(d)?;
+    let mut ops = vec![relationship::set_reach(&me, &[])];
+    ops.extend(ids.last().map(|a| relationship::set_rests_on(&me, a)));
+    d.write_and_push(space, ops)?;
+    revoke_left(d, space);
+    pending_no(d, space, false);
+    Ok(())
+}
+
+/// Notes, or takes out the note, that this device is writing a no in
+/// `space`.
+fn pending_no(d: &Daemon, space: &SpaceId, pending: bool) {
+    let mut all = lock(&d.mailbox.pending_no);
+    let changed = match pending {
+        true => all.insert(*space),
+        false => all.remove(space),
+    };
+    if changed {
+        let list: Vec<String> = all.iter().map(hex::encode).collect();
+        let bytes = serde_json::to_vec(&list).unwrap_or_default();
+        if let Err(e) = write_private(&d.mailbox.pending_no_path, &bytes, 0o600) {
+            tracing::warn!("cannot keep a no to finish later: {e}");
+        }
+    }
+}
+
+/// Whether every account entry the person's lists in `space` rest on is
+/// held here (`relationship::rests_on`): until then a no the list was
+/// written for may not have arrived, and no host names itself there.
+fn record_here(core: &crate::core::Core, space: &SpaceId) -> bool {
+    let (Some(me), Some(sp)) = (
+        core.me(),
+        core.spaces.get(space).and_then(|h| h.space.as_ref()),
+    ) else {
+        return false;
+    };
+    let wanted = relationship::rests_on(sp.state(), &me);
+    if wanted.is_empty() {
+        return true;
+    }
+    let Some(acc) = core.account().and_then(|a| a.space.as_ref()) else {
+        return false;
+    };
+    wanted.iter().all(|e| acc.entry(e).is_some())
 }
 
 async fn say_reach_locked(d: &Arc<Daemon>, space: &SpaceId, share: bool) -> anyhow::Result<bool> {
@@ -954,7 +1011,7 @@ fn local_name(d: &Daemon, space: &SpaceId) -> String {
 fn record(
     d: &Arc<Daemon>,
     ops: impl FnOnce(&cardinal_space::State) -> Vec<cardinal_space::SpaceOp>,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<Vec<EntryId>> {
     let (account, ops) = {
         let core = d.core();
         let acc = core
@@ -967,10 +1024,10 @@ fn record(
             .state();
         (acc.id, ops(st))
     };
-    if !ops.is_empty() {
-        d.write_and_push(&account, ops)?;
+    if ops.is_empty() {
+        return Ok(Vec::new());
     }
-    Ok(())
+    d.write_and_push(&account, ops)
 }
 
 /// One of this person's hosts, by its device's name or the start of its
@@ -999,7 +1056,19 @@ pub async fn take_out_host(
 ) -> anyhow::Result<bool> {
     let _one = d.mailbox.reaching.lock().await;
     let name = local_name(d, space);
-    record(d, |st| account::not_this_host_ops(st, space, &name, host))?;
+    let mut ids = record(d, |st| account::not_this_host_ops(st, space, &name, host))?;
+    if ids.is_empty() {
+        // recorded before: the list rests on the entry that recorded it
+        let core = d.core();
+        let no = core.hosts_no(space);
+        let acc = core.account().and_then(|a| a.space.as_ref());
+        let made = no
+            .not_these
+            .iter()
+            .filter(|(_, h)| h == host)
+            .find_map(|(n, _)| acc.and_then(|a| a.state().node(n)).map(|n| n.created_in));
+        ids.extend(made);
+    }
     let me = me(d)?;
     let mut reach = d.core().reach_of(space, &me);
     let before = reach.len();
@@ -1007,7 +1076,9 @@ pub async fn take_out_host(
     if reach.len() == before {
         return Ok(false);
     }
-    d.write_and_push(space, vec![relationship::set_reach(&me, &reach)])?;
+    let mut ops = vec![relationship::set_reach(&me, &reach)];
+    ops.extend(ids.last().map(|a| relationship::set_rests_on(&me, a)));
+    d.write_and_push(space, ops)?;
     if reach.is_empty() {
         revoke_left(d, space);
     }
@@ -1118,6 +1189,14 @@ pub async fn write_reach(d: &Arc<Daemon>, space: &SpaceId) -> anyhow::Result<()>
     if is_put_off(d, space) {
         return Ok(());
     }
+    if lock(&d.mailbox.pending_no).contains(space) {
+        // a no this device began and did not finish
+        let finished = say_no_locked(d, space).await;
+        if finished.is_err() {
+            put_off(d, space);
+        }
+        return finished;
+    }
     let (decided, named) = {
         let core = d.core();
         let Some(me) = core.me() else {
@@ -1151,7 +1230,10 @@ pub async fn write_reach(d: &Arc<Daemon>, space: &SpaceId) -> anyhow::Result<()>
     if !t.sets_unasked() {
         return Ok(());
     }
-    if t.set && !t.shared && !empty_long_enough(d, space, &decided.set_by) {
+    // A host names itself to a list that is set only once the account
+    // holds whatever no that list rests on (D75): the two spaces may
+    // arrive in either order.
+    if t.set && !record_here(&d.core(), space) {
         return Ok(());
     }
     // The others as they read, each host once, unchanged. A list never
@@ -1171,22 +1253,6 @@ pub async fn write_reach(d: &Arc<Daemon>, space: &SpaceId) -> anyhow::Result<()>
     reach.extend(more);
     set_as_decided(d, space, &decided, &reach, &given.new).await?;
     Ok(())
-}
-
-/// Whether an empty list the person did not say no to has stood long
-/// enough, as this device has seen it, to be filled in: a no's record may
-/// still be on its way through the account space.
-fn empty_long_enough(d: &Daemon, space: &SpaceId, set_by: &[String]) -> bool {
-    let after = *lock(&d.mailbox.fill_after);
-    let mut seen = lock(&d.mailbox.empty_seen);
-    let since = match seen.get(space) {
-        Some((by, at)) if by.as_slice() == set_by => *at,
-        _ => {
-            seen.insert(*space, (set_by.to_vec(), Instant::now()));
-            Instant::now()
-        }
-    };
-    since.elapsed() >= after
 }
 
 /// Ends every token this device ever gave out as a host in a space where
@@ -2183,7 +2249,6 @@ mod tests {
             let dirs = [tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap()];
             let (paths, config) = crate::testing::set_up(dirs[0].path());
             let d = Daemon::start(paths, config).await.unwrap();
-            *lock(&d.mailbox.fill_after) = Duration::ZERO;
             let (paths, _) = crate::testing::set_up(dirs[1].path());
             let keys = crate::keys::Keys::load_or_create(&paths.device_key()).unwrap();
             let mut bo = crate::core::Core::load(&paths, Arc::new(keys)).unwrap();
@@ -2765,7 +2830,7 @@ mod tests {
         let second = crate::presence::current(&h.d.core()).unwrap();
         assert_ne!(second, first);
         assert_eq!(crate::presence::secrets(&h.d.core()).len(), 1);
-        assert_eq!(given(&h), [first], "nothing new is written to him");
+        assert!(given(&h).is_empty(), "the one he had is not taken back");
         assert_eq!(crate::presence::advertised(&h.d.core()), None);
         // The old one he has is not in use: no new one at every look.
         crate::presence::keep(&h.d);
@@ -2786,6 +2851,47 @@ mod tests {
         crate::presence::keep(&h.d);
         assert_eq!(crate::presence::current(&h.d.core()), Some(lowest));
         assert_eq!(given(&h), [lowest]);
+    }
+
+    /// Review L3. Someone given the secret in a relationship that can no
+    /// longer be written in (left, here) and then trusted no longer: the
+    /// secret they hold is renewed all the same.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_secret_given_where_nothing_more_is_written_is_still_renewed() {
+        let h = Home::new().await;
+        crate::presence::keep(&h.d);
+        let first = crate::presence::current(&h.d.core()).unwrap();
+        h.d.write_and_push(&h.rel, vec![cardinal_space::SpaceOp::leave()])
+            .unwrap();
+        h.trusts_bo(false);
+        crate::presence::keep(&h.d);
+        assert_ne!(crate::presence::current(&h.d.core()), Some(first));
+        assert_eq!(given(&h), [first], "nothing is written where they left");
+    }
+
+    /// Review L4. Two contact nodes for one person, made at once on two
+    /// devices, one of them no longer trusting him: he is not trusted, and
+    /// is not given the secret.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn two_nodes_for_one_contact_are_one_contact() {
+        use cardinal_space::account::{self, Regard};
+        let h = Home::new().await;
+        crate::presence::keep(&h.d);
+        let first = crate::presence::current(&h.d.core()).unwrap();
+        assert_eq!(given(&h), [first]);
+        let account = h.d.core().account_id().unwrap();
+        let them = h.bo.me().unwrap();
+        let hosts_only = Regard {
+            trusted: false,
+            introductions: true,
+        };
+        let twin = account::create_contact(&them, "Bo", &h.rel, hosts_only);
+        h.d.write_and_push(&account, vec![twin]).unwrap();
+        assert_eq!(h.d.core().contacts().len(), 2);
+        crate::presence::keep(&h.d);
+        assert_ne!(crate::presence::current(&h.d.core()), Some(first));
+        assert!(given(&h).is_empty());
+        assert!(crate::presence::of_contacts(&h.d.core()).is_empty());
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -2916,5 +3022,93 @@ mod tests {
         h.hosts();
         write_reach(&h.d, &g).await.unwrap();
         assert_eq!(h.named(&g).len(), 1);
+    }
+
+    /// D75, review H1. Another of the person's devices says no: its empty
+    /// list reaches this host before the account entry that records the
+    /// no (as through a contact, while the host and the phone are not
+    /// connected). The list says what it rests on, and the host waits for
+    /// that entry, however long; with it here and no no in it, it names
+    /// itself.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_no_whose_record_is_still_on_its_way_is_not_filled_in() {
+        let h = Home::new().await;
+        h.hosts();
+        let elsewhere = [9u8; 32];
+        let ops = vec![
+            relationship::set_reach(&h.me, &[]),
+            relationship::set_rests_on(&h.me, &elsewhere),
+        ];
+        h.d.write_and_push(&h.rel, ops).unwrap();
+        for _ in 0..3 {
+            write_reach(&h.d, &h.rel).await.unwrap();
+            assert!(h.named(&h.rel).is_empty(), "filled in before the record");
+        }
+        // The entry it rests on is here, and records no no: then the list
+        // was emptied by mistake, and fills itself again.
+        let account = h.d.core().account_id().unwrap();
+        let node = h.d.core().contacts()[0].node;
+        let here =
+            h.d.write_and_push(
+                &account,
+                vec![account::set_field(node, account::CATEGORY, "Family")],
+            )
+            .unwrap();
+        let ops = vec![relationship::set_rests_on(&h.me, &here[0])];
+        h.d.write_and_push(&h.rel, ops).unwrap();
+        write_reach(&h.d, &h.rel).await.unwrap();
+        assert_eq!(h.named(&h.rel).len(), 1);
+        // A no said here rests on its own record, which is here at once.
+        say_reach(&h.d, &h.rel, false).await.unwrap();
+        let core = h.d.core();
+        let sp = core.spaces[&h.rel].space.as_ref().unwrap();
+        let on = relationship::rests_on(sp.state(), &h.me);
+        assert_eq!(on.len(), 1);
+        assert!(core
+            .account()
+            .unwrap()
+            .space
+            .as_ref()
+            .unwrap()
+            .entry(&on[0])
+            .is_some());
+    }
+
+    /// D75, review L5. A no this device began and could not finish (the
+    /// list was not written) is finished at the next look.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_no_left_unfinished_is_finished_at_the_next_look() {
+        let h = Home::new().await;
+        h.hosts();
+        write_reach(&h.d, &h.rel).await.unwrap();
+        assert_eq!(h.named(&h.rel).len(), 1);
+        pending_no(&h.d, &h.rel, true);
+        write_reach(&h.d, &h.rel).await.unwrap();
+        assert!(h.named(&h.rel).is_empty(), "the no was not finished");
+        assert!(h.record(&h.rel).no_hosts);
+        assert!(lock(&h.d.mailbox.pending_no).is_empty());
+        // and the note survives a restart: it is kept beside the mailbox
+        pending_no(&h.d, &h.rel, true);
+        let saved = std::fs::read(&h.d.mailbox.pending_no_path).unwrap();
+        assert!(String::from_utf8_lossy(&saved).contains(&hex::encode(h.rel)));
+        pending_no(&h.d, &h.rel, false);
+    }
+
+    /// Review M1. A contact's tag replayed at many addresses costs a few
+    /// tries a minute and no more: the looks through hosts are left free,
+    /// and their trail is not overwritten.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_replayed_tag_costs_a_few_tries_and_no_look() {
+        let h = Home::new().await;
+        let bo = h.bo.me().unwrap();
+        for port in 1..=6u16 {
+            let at: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+            crate::rendezvous::found_nearby(&h.d, bo, at).await;
+        }
+        let trail = h.d.rendezvous.trail(&bo);
+        assert_eq!(trail.nearby.len(), 3, "{:?}", trail.nearby);
+        assert!(trail.look.is_empty(), "a look was overwritten");
+        assert_eq!(trail.looks, 0);
+        assert!(!h.d.rendezvous.looked(&bo).1, "the look slot was taken");
     }
 }

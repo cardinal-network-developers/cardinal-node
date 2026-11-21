@@ -17,11 +17,14 @@
 //!   trusted contact, set to the secret advertised with: of two made at
 //!   the same moment, the one whose account node has the lowest id.
 //!
-//! Where a contact is no longer trusted, field 2 of the relationship with
-//! them is left as it was: it holds a secret no longer in use, and writing
-//! there tells them nothing new.
+//! Where a contact is refused or no longer trusted, field 2 of the
+//! relationship with them is cleared as well as the secret renewed.
+//!
+//! A person may have two contact nodes for one identity, made at once on
+//! two devices: they are one contact here, trusted only if every node says
+//! so and none refuses them.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
 use cardinal_crypto::random_bytes;
@@ -58,19 +61,31 @@ pub fn current(core: &Core) -> Option<[u8; 32]> {
     secrets(core).first().map(|(_, s)| *s)
 }
 
+/// Each contact once, by identity: whether this person trusts them (every
+/// node for them trusted, none refused), and every relationship space
+/// their nodes name.
+pub fn by_identity(core: &Core) -> BTreeMap<[u8; 32], (bool, Vec<SpaceId>)> {
+    let mut all: BTreeMap<[u8; 32], (bool, Vec<SpaceId>)> = BTreeMap::new();
+    for c in core.contacts() {
+        let e = all.entry(c.identity).or_insert((true, Vec::new()));
+        e.0 &= c.connects();
+        if !e.1.contains(&c.space) {
+            e.1.push(c.space);
+        }
+    }
+    all
+}
+
 /// The secret to put in `c=`, if the person has given it to anyone: a
 /// device whose person has given it to nobody leaves `c=` out.
 pub fn advertised(core: &Core) -> Option<[u8; 32]> {
     let secret = current(core)?;
     let me = core.me()?;
-    let given = core
-        .contacts()
-        .into_iter()
-        .filter(|c| c.connects())
-        .any(|c| {
-            let st = core.spaces.get(&c.space).and_then(|h| h.space.as_ref());
-            st.is_some_and(|sp| relationship::presence_of(sp.state(), &me).contains(&secret))
-        });
+    let trusted = by_identity(core).into_values().filter(|(t, _)| *t);
+    let given = trusted.flat_map(|(_, spaces)| spaces).any(|space| {
+        let st = core.spaces.get(&space).and_then(|h| h.space.as_ref());
+        st.is_some_and(|sp| relationship::presence_of(sp.state(), &me).contains(&secret))
+    });
     given.then_some(secret)
 }
 
@@ -78,12 +93,19 @@ pub fn advertised(core: &Core) -> Option<[u8; 32]> {
 /// contact: what a `c=` tag is checked against, one keyed hash each.
 pub fn of_contacts(core: &Core) -> Vec<([u8; 32], [u8; 32])> {
     let mut all = Vec::new();
-    for c in core.contacts().into_iter().filter(|c| c.connects()) {
-        let Some(sp) = core.spaces.get(&c.space).and_then(|h| h.space.as_ref()) else {
+    for (who, (trusted, spaces)) in by_identity(core) {
+        if !trusted {
             continue;
-        };
-        for s in relationship::presence_of(sp.state(), &c.identity) {
-            all.push((c.identity, s));
+        }
+        for space in spaces {
+            let Some(sp) = core.spaces.get(&space).and_then(|h| h.space.as_ref()) else {
+                continue;
+            };
+            for s in relationship::presence_of(sp.state(), &who) {
+                if !all.contains(&(who, s)) {
+                    all.push((who, s));
+                }
+            }
         }
     }
     all
@@ -98,6 +120,9 @@ pub struct Due {
     pub renew: Option<(Vec<NodeId>, [u8; 32])>,
     /// Relationships to set field 2 in, with the secret to set.
     pub give: Vec<(SpaceId, [u8; 32])>,
+    /// Relationships with someone refused or no longer trusted, where
+    /// field 2 is to be cleared.
+    pub clear: Vec<SpaceId>,
 }
 
 /// What is due now, with `fresh` making a new secret if one is.
@@ -110,30 +135,51 @@ pub fn due(core: &Core, fresh: impl FnOnce() -> [u8; 32]) -> Due {
     }
     let held = secrets(core);
     let in_use: Vec<[u8; 32]> = held.iter().map(|(_, s)| *s).collect();
-    // field 2 of this person's reach node in each relationship that is open
-    let mut given: HashMap<SpaceId, Vec<[u8; 32]>> = HashMap::new();
-    let contacts = core.contacts();
-    for c in &contacts {
-        let Some(sp) = core.spaces.get(&c.space).and_then(|h| h.space.as_ref()) else {
-            continue;
-        };
-        if sp.ended() || sp.has_left(&me) {
-            continue;
+    let contacts = by_identity(core);
+    // field 2 of this person's reach node in every relationship held,
+    // ended or left too, and whether it can still be written in
+    let mut given: HashMap<SpaceId, (Vec<[u8; 32]>, bool)> = HashMap::new();
+    for (_, spaces) in contacts.values() {
+        for space in spaces {
+            let Some(sp) = core.spaces.get(space).and_then(|h| h.space.as_ref()) else {
+                continue;
+            };
+            let open = !sp.ended() && !sp.has_left(&me);
+            given.insert(*space, (relationship::presence_of(sp.state(), &me), open));
         }
-        given.insert(c.space, relationship::presence_of(sp.state(), &me));
     }
+    let open = |space: &SpaceId| given.get(space).is_some_and(|(_, o)| *o);
     let trusted: Vec<SpaceId> = contacts
-        .iter()
-        .filter(|c| c.connects() && given.contains_key(&c.space))
-        .map(|c| c.space)
+        .values()
+        .filter(|(t, _)| *t)
+        .flat_map(|(_, spaces)| spaces.iter().copied())
+        .filter(|s| open(s))
         .collect();
     // Someone refused, or trusted no longer, who was given a secret still
-    // in use: a new one, which they are not given.
-    let lost = contacts.iter().filter(|c| !c.connects()).any(|c| {
-        let had = given.get(&c.space).into_iter().flatten();
-        had.into_iter().any(|s| in_use.contains(s))
+    // in use, anywhere: a new one, which they are not given.
+    let untrusted: Vec<SpaceId> = contacts
+        .values()
+        .filter(|(t, _)| !*t)
+        .flat_map(|(_, spaces)| spaces.iter().copied())
+        .collect();
+    let lost = untrusted.iter().any(|space| {
+        let had = given
+            .get(space)
+            .map(|(v, _)| v.as_slice())
+            .unwrap_or_default();
+        had.iter().any(|s| in_use.contains(s))
     });
-    let mut out = Due::default();
+    let mut clear: Vec<SpaceId> = Vec::new();
+    for space in &untrusted {
+        let set = given.get(space).is_some_and(|(v, o)| *o && !v.is_empty());
+        if set && !clear.contains(space) {
+            clear.push(*space);
+        }
+    }
+    let mut out = Due {
+        clear,
+        ..Due::default()
+    };
     let secret = if lost || (held.is_empty() && !trusted.is_empty()) {
         let new = fresh();
         out.renew = Some((held.iter().map(|(n, _)| *n).collect(), new));
@@ -145,7 +191,7 @@ pub fn due(core: &Core, fresh: impl FnOnce() -> [u8; 32]) -> Due {
         }
     };
     for space in trusted {
-        if given.get(&space).map(Vec::as_slice) != Some(&[secret][..]) {
+        if given.get(&space).map(|(v, _)| v.as_slice()) != Some(&[secret][..]) {
             out.give.push((space, secret));
         }
     }
@@ -173,6 +219,15 @@ pub fn keep(d: &Arc<Daemon>) {
             return;
         }
         tracing::info!("a new presence secret, for the contacts you trust");
+    }
+    for space in due.clear {
+        let op = relationship::set_presence(&me, None);
+        if let Err(e) = d.write_and_push(&space, vec![op]) {
+            tracing::debug!(
+                "taking the presence secret back in {}: {e:#}",
+                crate::core::short(&space)
+            );
+        }
     }
     for (space, secret) in due.give {
         let op = relationship::set_presence(&me, Some(secret));

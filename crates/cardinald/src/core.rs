@@ -531,6 +531,21 @@ impl Telling {
     }
 }
 
+/// [`Core::is_joined`], from the account and the space.
+pub fn joined_in(account: Option<&Space>, sp: &Space, space: &SpaceId, me: &[u8; 32]) -> bool {
+    if sp.accepted_by(me) {
+        return true;
+    }
+    if sp.has_left(me) || sp.role_of(me).is_none() {
+        return false;
+    }
+    account.is_some_and(|a| {
+        account::spaces(a.state())
+            .iter()
+            .any(|r| r.space == *space && !r.declined)
+    })
+}
+
 /// The entries whose lists a person's reach node holds, in hex, sorted:
 /// what a [`KeptYes`] is kept against.
 fn list_set_by(space: &Space, who: &[u8; 32]) -> Vec<String> {
@@ -1459,6 +1474,7 @@ impl Core {
             .iter()
             .any(|(g, device)| *device == here && crate::outside::is_self_named(g));
         let no = self.hosts_no(space);
+        let joined = self.is_joined(space);
         let own_not_here = hosts
             .iter()
             .any(|(g, device)| *device == here && no.not_this(g.link_key.x25519()));
@@ -1469,13 +1485,13 @@ impl Core {
             shared: !named.is_empty(),
             set: !since.is_empty(),
             two: since.len() > 1,
-            waiting: stands && named.is_empty() && sp.accepted_by(&me),
+            waiting: stands && named.is_empty() && joined,
             hosted: !hosts.is_empty(),
             unnamed: unnamed.count(),
             own_unnamed,
             own_self_named,
             trusted_only: self.among_trusted(space),
-            joined: sp.accepted_by(&me),
+            joined,
             left: sp.has_left(&me),
             public: sp.is_public(),
             relationship: sp.profile() == Profile::RELATIONSHIP,
@@ -1483,6 +1499,33 @@ impl Core {
             who,
             what: endpoints.map(|e| e.to_string()).collect(),
         }
+    }
+
+    /// A number that changes whenever any space held may have: for what
+    /// is worked out from them and kept, as the keys of contacts' tags.
+    pub fn state_version(&self) -> u64 {
+        let all = self.spaces.values().map(|h| h.version);
+        all.fold(self.spaces.len() as u64, |a, v| {
+            a.wrapping_mul(31).wrapping_add(v)
+        })
+    }
+
+    /// Whether this person is in a space: they accepted it by an entry of
+    /// theirs there, or, having joined with nothing to say there, their
+    /// account has a node for it that is not a decline (D75: a device
+    /// writes when it has something to say), and they have not left it.
+    /// Leaving deletes that node, so an offer made again asks afresh.
+    pub fn is_joined(&self, space: &SpaceId) -> bool {
+        let Some(me) = self.me() else { return false };
+        let Some(sp) = self.spaces.get(space).and_then(|h| h.space.as_ref()) else {
+            return false;
+        };
+        joined_in(
+            self.account().and_then(|a| a.space.as_ref()),
+            sp,
+            space,
+            &me,
+        )
     }
 
     /// What this person's account records of a no to naming their hosts
@@ -2208,10 +2251,11 @@ impl Core {
             s.profile() == cardinal_space::group::GROUP
                 && s.role_of(who).is_some()
                 && !s.has_left(who)
-                && me.is_some_and(|me| s.accepted_by(&me))
         };
         let held = self.spaces.iter();
-        let groups = held.filter(|(_, h)| h.space.as_ref().is_some_and(theirs));
+        let groups = held.filter(|(id, h)| {
+            h.space.as_ref().is_some_and(theirs) && me.is_some() && self.is_joined(id)
+        });
         groups.map(|(id, _)| *id).collect()
     }
 

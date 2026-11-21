@@ -671,7 +671,7 @@ impl SpaceOp {
             Record::new()
                 .with(0, 33u32)
                 .with(1, node)
-                .with(2, key as u32)
+                .with(2, key)
                 .with_opt(3, value),
         )
     }
@@ -683,7 +683,7 @@ impl SpaceOp {
             Record::new()
                 .with(0, 33u32)
                 .with(1, node)
-                .with(2, key as u32)
+                .with(2, key)
                 .with_opt(3, value)
                 .with(4, true),
         )

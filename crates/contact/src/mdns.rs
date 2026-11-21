@@ -95,7 +95,13 @@ pub struct Found {
     pub addr: SocketAddr,
     /// TXT strings.
     pub txt: Vec<String>,
+    /// Where the packet came from, whatever its records say.
+    pub from: IpAddr,
 }
+
+/// The most instances taken from one packet: a packet naming more is
+/// someone's flood, not a network's devices.
+pub const MAX_INSTANCES: usize = 4;
 
 fn write_name(out: &mut Vec<u8>, name: &str) {
     for label in name.split('.').filter(|l| !l.is_empty()) {
@@ -241,11 +247,20 @@ pub fn parse_response(msg: &[u8], source: IpAddr, service: &str) -> Vec<Found> {
         return Vec::new();
     };
     let service = format!("{service}.local").to_ascii_lowercase();
-    let mut out = Vec::new();
+    let mut out: Vec<Found> = Vec::new();
+    let mut seen: Vec<String> = Vec::new();
     for ptr in rrs.iter().filter(|r| r.ty == TYPE_PTR && r.name == service) {
+        if out.len() >= MAX_INSTANCES {
+            break;
+        }
         let Some((instance_name, _)) = read_name(msg, ptr.rdata_at) else {
             continue;
         };
+        // each instance once per packet
+        if seen.contains(&instance_name) {
+            continue;
+        }
+        seen.push(instance_name.clone());
         let mut port = None;
         let mut host = None;
         let mut txt = Vec::new();
@@ -290,6 +305,7 @@ pub fn parse_response(msg: &[u8], source: IpAddr, service: &str) -> Vec<Found> {
             instance,
             addr: SocketAddr::new(ip, port),
             txt,
+            from: source,
         });
     }
     out
@@ -397,6 +413,7 @@ mod tests {
                 instance: "a1b2c3".into(),
                 addr: "192.0.2.5:4242".parse().unwrap(),
                 txt: vec!["t=00ff".into()],
+                from: "10.0.0.1".parse().unwrap(),
             }]
         );
         assert!(parse_response(&pkt, "10.0.0.1".parse().unwrap(), "_other._udp").is_empty());
@@ -435,5 +452,38 @@ mod tests {
             read_name(&m, rrs[0].rdata_at).unwrap().0,
             "ins._x._udp.local"
         );
+    }
+
+    /// One packet that names an instance twice, and more instances than
+    /// any network's devices would put in one: each is taken once, and no
+    /// more than [`MAX_INSTANCES`].
+    #[test]
+    fn a_flooding_packet_gives_few_instances_once_each() {
+        let one = |i: usize| ServiceInfo {
+            service: "_cardinal._udp".into(),
+            instance: format!("i{i}"),
+            port: 4000 + i as u16,
+            txt: vec!["t=00ff".into()],
+            host: format!("h{i}"),
+            addrs: Vec::new(),
+        };
+        let mut body = Vec::new();
+        let mut answers = 0u16;
+        for i in [0, 0, 1, 2, 3, 4, 5, 6] {
+            let pkt = build_announcement(&one(i));
+            answers += u16::from_be_bytes([pkt[6], pkt[7]]);
+            body.extend_from_slice(&pkt[12..]);
+        }
+        let mut pkt = vec![0, 0, 0x84, 0, 0, 0];
+        pkt.extend_from_slice(&answers.to_be_bytes());
+        pkt.extend_from_slice(&[0, 0, 0, 0]);
+        pkt.extend_from_slice(&body);
+        let found = parse_response(&pkt, "10.0.0.9".parse().unwrap(), "_cardinal._udp");
+        assert_eq!(found.len(), MAX_INSTANCES);
+        let names: Vec<&str> = found.iter().map(|f| f.instance.as_str()).collect();
+        assert_eq!(names, ["i0", "i1", "i2", "i3"]);
+        assert!(found
+            .iter()
+            .all(|f| f.from == "10.0.0.9".parse::<IpAddr>().unwrap()));
     }
 }

@@ -306,3 +306,38 @@ fn a_host_given_only_a_name_is_warned_that_contacts_cannot_use_it() {
         let _ = c.wait();
     }
 }
+
+/// Review L2. `cardinal router off` on one device is the person's switch:
+/// another device of theirs gives its port back, and asks again once it
+/// is turned on, from any device.
+#[test]
+fn the_router_switch_set_on_one_device_holds_on_another() {
+    if !fuse_available() {
+        eprintln!("skipped: no FUSE");
+        return;
+    }
+    let root = tempfile::tempdir().unwrap();
+    let (at, _) = router();
+    let mut desk = Dev::new(root.path(), "desk", free_port());
+    desk.start();
+    desk.cli(&["init", "--yes", "--name", "Ana"]);
+    let mut laptop = Dev::new(root.path(), "laptop", free_port());
+    laptop.start();
+    pair(&desk, &laptop);
+    laptop.stop();
+    start_behind(&mut laptop, at);
+    mine(&laptop);
+    let given = |d: &Dev| !d.status()["router"]["external"].is_null();
+    wait("a port from the router", 30, || given(&laptop));
+    desk.cli(&["router", "off"]);
+    wait("the laptop gives its port back", 60, || !given(&laptop));
+    assert_eq!(laptop.status()["router"]["on"], false);
+    desk.cli(&["router", "on"]);
+    wait("the laptop asks again", 60, || given(&laptop));
+    for d in [&mut desk, &mut laptop] {
+        let _ = d.try_cli(&["stop"]);
+        if let Some(mut c) = d.child.take() {
+            let _ = c.wait();
+        }
+    }
+}

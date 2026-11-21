@@ -162,7 +162,7 @@ fn trusted_contacts_with_no_host_find_each_other_on_the_local_network() {
     // Whoever dialled says so in the trail.
     let said = |d: &Dev, who: &str| {
         let v = status_of(d, who);
-        v["last_look"]
+        v["nearby_tries"]
             .to_string()
             .contains("found on the local network")
     };

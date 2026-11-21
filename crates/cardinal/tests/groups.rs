@@ -205,6 +205,12 @@ fn a_group_is_offered_joined_and_read_by_all() {
             .collect()
     };
     assert!(left(&ana).is_empty());
+    // and says no again before he goes: leaving takes his no with it
+    ask(
+        &cy,
+        json!({"cmd": "group-reach", "group": g, "share": false}),
+    );
+    assert_eq!(reach_in(&cy, &g)["said_no"], true);
     ask(&cy, json!({"cmd": "group-leave", "group": g}));
     for d in [&ana, &bo] {
         wait("the others see that cy left", 30, || left(d).len() == 1);
@@ -315,10 +321,20 @@ fn nobody_learns_where_a_host_is_unasked() {
     assert_eq!(r["ask"], false, "{r}");
     assert_eq!(r["who"], json!(["Cy"]), "{r}");
     assert_eq!(r["what"], json!([]), "{r}");
+    // Joining with nothing to say writes nothing in the group: it is kept
+    // in his account (D75).
+    let held = |d: &Dev| {
+        let at = d.home.join("spaces").join(&g).join("entries.log");
+        std::fs::metadata(at).map_or(0, |m| m.len())
+    };
+    std::thread::sleep(std::time::Duration::from_secs(2));
+    let before = held(&bo);
     ask(&bo, json!({"cmd": "group-join", "group": g}));
     wait("bo joined", 10, || {
         groups(&bo).iter().any(|x| x["name"] == "Club")
     });
+    std::thread::sleep(std::time::Duration::from_secs(2));
+    assert_eq!(held(&bo), before, "joining wrote in the group");
     let r = reach_in(&bo, &g);
     assert_eq!(
         (&r["shared"], &r["set"]),
@@ -413,6 +429,11 @@ fn nobody_learns_where_a_host_is_unasked() {
         offers(&cy).iter().any(|o| o["name"] == "Club")
     });
     assert_eq!(reach_in(&cy, &g)["ask"], true);
+    assert_eq!(
+        reach_in(&cy, &g)["said_no"],
+        false,
+        "the no outlived leaving"
+    );
     let no = reply(&cy, &json!({"cmd": "group-join", "group": g}));
     assert_eq!(no["ok"], false, "{no}");
     ask(

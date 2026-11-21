@@ -85,6 +85,13 @@ const TCP_WITHIN: Duration = Duration::from_secs(3);
 
 /// The most addresses kept for a device.
 const BOOK_LEN: usize = 6;
+/// A trusted contact, and the key their `c=` tags are made with.
+type TagKey = ([u8; 32], zeroize::Zeroizing<[u8; 32]>);
+/// The window for [`NEARBY_PER_SOURCE`].
+const NEARBY_WINDOW: Duration = Duration::from_secs(10);
+/// How many `c=` tags from one address are checked in a window: a device
+/// refreshes every 30 s, and a flood is not worth a keyed hash each.
+const NEARBY_PER_SOURCE: u32 = 8;
 /// How often the LAN advertisement is made again, with fresh nonces.
 const ADVERTISE_EVERY: Duration = Duration::from_secs(30);
 
@@ -1824,31 +1831,53 @@ impl Daemon {
             };
             let mut stop = d.stopping.subscribe();
             let mut look = tokio::time::interval(Duration::from_secs(2));
+            // The keys of the contacts' tags, derived once for the state
+            // they were read from (review M3).
+            let mut keys: (u64, Vec<TagKey>) = (u64::MAX, Vec::new());
+            // c= work per source, at most so much in a window (M3).
+            let mut by_source: HashMap<std::net::IpAddr, (Instant, u32)> = HashMap::new();
             loop {
                 tokio::select! {
                     f = browser.next() => {
                         let Some(f) = f else { break };
-                        if Some(f.addr.port()) == d.endpoint.tcp_addr().map(|a| a.port())
-                            && is_local_ip(&f.addr.ip()) {
+                        // Only from the local link, and only its source is
+                        // dialled, whatever its records say (L1).
+                        if !crate::networks::on_local_link(f.from) {
                             continue;
                         }
+                        let at = SocketAddr::new(f.from, f.addr.port());
+                        if Some(at.port()) == d.endpoint.tcp_addr().map(|a| a.port())
+                            && is_local_ip(&at.ip()) {
+                            continue;
+                        }
+                        // Own devices first: one hash, never held up by
+                        // the work for contacts.
                         if f.txt.iter().any(|t| disc::check_device_txt(&own, t)) {
-                            d.discovered(f.addr).await;
+                            d.discovered(at).await;
                             continue;
                         }
-                        // One keyed hash per trusted contact per advertisement.
-                        let theirs = crate::presence::of_contacts(&d.core());
-                        let keys = theirs.iter().map(|(who, s)| (who, disc::presence_key(s)));
-                        let mut found: Vec<[u8; 32]> = Vec::new();
-                        for (who, k) in keys {
-                            if !found.contains(who) && f.txt.iter().any(|t| check_tag_txt(CONTACTS, &k, t)) {
-                                found.push(*who);
-                            }
+                        // Only the first c= is looked at.
+                        let Some(tag) = f.txt.iter().find(|t| t.starts_with(CONTACTS)) else {
+                            continue;
+                        };
+                        let now = Instant::now();
+                        by_source.retain(|_, (since, _)| now.duration_since(*since) < NEARBY_WINDOW);
+                        let seen = by_source.entry(f.from).or_insert((now, 0));
+                        seen.1 += 1;
+                        if seen.1 > NEARBY_PER_SOURCE {
+                            continue;
                         }
-                        for who in found {
-                            let d = d.clone();
+                        let version = d.core().state_version();
+                        if keys.0 != version {
+                            let theirs = crate::presence::of_contacts(&d.core());
+                            let derived = theirs.iter().map(|(who, s)| (*who, disc::presence_key(s)));
+                            keys = (version, derived.collect());
+                        }
+                        let found = keys.1.iter().find(|(_, k)| check_tag_txt(CONTACTS, k, tag));
+                        if let Some((who, _)) = found {
+                            let (d, who) = (d.clone(), *who);
                             tokio::spawn(async move {
-                                crate::rendezvous::found_nearby(&d, who, f.addr).await
+                                crate::rendezvous::found_nearby(&d, who, at).await
                             });
                         }
                     }
@@ -2106,9 +2135,8 @@ impl Daemon {
             }
         });
         self.housekeeping();
-        if crate::networks::routers_on(&self) {
-            tokio::spawn(crate::portmap::keep(self.clone()));
-        }
+        // Always: switched off now, on another device it may be turned on.
+        tokio::spawn(crate::portmap::keep(self.clone()));
 
         let mut stop = self.stopping.subscribe();
         tokio::select! {

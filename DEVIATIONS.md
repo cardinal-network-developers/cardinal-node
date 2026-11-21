@@ -896,24 +896,40 @@ Not implemented yet (the next milestone):
     one, in one entry. Each device does this on its own at its next look
     (the delivery loop), so two that act at once leave two, as the text
     allows.
-  - **Reading: the one taken back is not cleared.** Field 2 in the
-    relationship with someone no longer trusted is left as it was: it
-    holds a secret no longer used, and writing there would only be an
-    entry they read. Trusted again, they are given the one in use.
+  - **Taken back.** Field 2 in the relationship with someone refused or
+    no longer trusted is cleared (a `set` with no value), as well as the
+    secret renewed. Whether someone holds a secret still in use is read
+    from field 2 in every relationship with them held here, ended or
+    left too, where nothing more is written. Trusted again, they are
+    given the one in use.
+  - **Reading: two contact nodes for one identity** (made at once on two
+    devices) are one contact: trusted only if every node says trusted
+    and none refused.
   - **Reading: "accept every value a contact gave"** is every value field
     2 of their reach node holds now in the relationship, two where two of
     their devices set it at the same moment; not values set before.
   - **`c=` is left out** until the person has given the secret to a
     trusted contact, and the advertisement is made again within two
     seconds of that changing.
+  - **What is taken from the network.** Only a packet from the local
+    link counts (link-local, or a subnet the device has a route to with
+    no gateway; loopback only where a test runs discovery there), and
+    only its source address is dialled, whatever its records name. At
+    most four instances are read from one packet, each once. Own devices'
+    `t=` is checked first, always; only the first `c=` of an instance is
+    checked, and at most eight from one source in ten seconds. The keys
+    of the contacts' tags are derived once for the state they come from.
   - **What a match does.** Each of the contact's devices with no session
-    is dialled at the advertised address and port (the TCP link port, as
-    for own devices), UDP first, as `reach` dials a device that is named
-    as a host. An address is tried at most once in 10 seconds for one
-    contact, and the look is a look like any other: `contact-status`
-    `last_look` and `cardinal contacts NAME` say "their tag seen on the
-    local network at ..." and "found on the local network" only once a
-    session opened. Nothing anywhere says a contact is nearby from a tag.
+    is dialled at that address and the advertised port (the TCP link
+    port, as for own devices), UDP first, until the first answers. A
+    contact is tried at one address at most once in 10 seconds, at most
+    three times a minute at any addresses, and one try at a time, apart
+    from the looks through hosts: a replayed tag costs a try and no
+    more. Tries are kept apart from the looks too: `contact-status`
+    `nearby_tries`, and in `cardinal contacts NAME` "Where their tag was
+    seen on the local network", say "found on the local network" only
+    once a session opened. Nothing anywhere says a contact is nearby
+    from a tag.
   - **`contact-status` gives `nearby`**: `you_give_secret` and
     `they_give_secret`, whether each reach node in the relationship holds
     one.
@@ -1416,9 +1432,10 @@ asks for around that is not built yet.
     they write something valid that descends from that addition, once
     more after each time they leave. What another of their devices wrote
     meanwhile, without the addition in its past, accepts nothing.
-  - Leaving forgets the answer about hosts (field 5 is cleared), and an
-    offer always asks where there is a host to name and someone who is not
-    a contact. A `leave` whose entry does not empty the reach node is a
+  - Leaving forgets the answer about hosts: the account's node for the
+    group goes, "no hosts here" and "not this host here" with it (D75),
+    and an offer always asks where there is a host to name and someone
+    who is not a contact. A `leave` whose entry does not empty the reach node is a
     `leave` all the same.
   - A token ended on leaving never comes back. Joining again sets the
     reach node again, with new tokens.
@@ -1521,8 +1538,10 @@ asks for around that is not built yet.
   here", under the space's node.
   - **The person's no** (`contact NAME no-hosts`, `group-reach` with
     `share` false, `group-join` with `reach` false, or joining with a
-    host and no yes) writes the record first, then the empty list: a
-    crash between leaves a host out, never a no filled in. Where the
+    host and no yes) is noted on the device (`pending-no.json` beside
+    the mailbox), then recorded in the account, then the empty list
+    written, and the note taken out. A write that fails, or a crash,
+    leaves the note, and the next look finishes the no. Where the
     account has no node for the space (a relationship or group, which
     this version did not give one before) one is made, named after the
     contact or the group.
@@ -1546,21 +1565,32 @@ asks for around that is not built yet.
     to an empty list too. A list never set is the joining, and names
     every host of theirs not recorded as a no. No device adds another to
     a list already set.
-  - **Not in the text: an empty list is filled in only once it has
-    stood two minutes** on the device (`mailbox.rs` `FILL_AFTER`, kept in
-    memory, so a restart starts it again). The device that says no writes
-    the record and then the list, but they are two spaces and may arrive
-    in either order: a host that had the list and not yet the record
-    would otherwise fill in a no. The spec's cost says the two "can be
-    left apart" by devices acting at once; this is the same gap from
-    sync order alone.
+  - **The list says which record it rests on** (not in the text). The
+    list a no writes, and the one taking a host out writes, carry beside
+    them in the reach node an extension field `no-record` (key: the
+    first 7 bytes of the name, `evolution.md#fields-in-a-base-node`),
+    `{1: the id of the account entry that records the no}`. A host names
+    itself to a list that is set only once its account holds every entry
+    that field names; then it goes by the record. The two are in two
+    spaces and may arrive in either order, through different devices: a
+    host that had the list and not the record would otherwise fill in a
+    no, for good. A list emptied with no such field (by mistake, or
+    before this) is filled at once. The field names an account entry to
+    every member, which says nothing of what is in it. **Spec question:**
+    should the spec carry this, or tie the list to the record otherwise?
+  - **A `set` key wider than 32 bits** was written cut down to 32 bits by
+    `SpaceOp::set`, which an extension's key (56 bits) is. It is written
+    whole now.
   - **A device writes the list when it has something to say.** Joining
     with nothing to name, on meeting, at a look, or by `group-join`, writes
-    no list: a group is joined with an empty entry (no ops), which makes
-    the person a member who has written. **Spec ambiguity:**
+    nothing in the space at all (Daniel: "a device writes when it has
+    something useful to say"). A group joined so is kept as joined in
+    the account: a space node for it that is not a decline
+    (`Core::is_joined`), until the person writes there, which accepts it
+    as before. Leaving deletes that node, and with it any "no hosts here"
+    and "not this host here", so an offer made again asks afresh.
     `profiles.md#group` still says joining "sets their reach node, which
-    is the first entry of theirs ... The list is empty if they have no
-    host"; D75 has it left unset, and the empty entry is the reading. A
+    is the first entry of theirs"; that line is to be fixed in core. A
     yes by hand with no host reachable is kept on the device as before,
     against the list as it is, unset or not, and writes nothing.
   - **Lists emptied before D75** have no record, so a host fills them in.
@@ -1705,8 +1735,20 @@ asks for around that is not built yet.
       answered, which is a no too.
     - **Where the router cannot be told** (no default route, or a system
       that does not say which is the gateway: Windows, Android), no
-      network can be marked, so no router is asked there. Before D76 UPnP
-      found one by itself on such systems.
+      network can be marked, so no router is asked there, ever (Daniel,
+      2026-11-21). Before D76 UPnP found one by itself on such systems.
+      Where no complete neighbour entry is there, an empty datagram to
+      the gateway's port 9 is sent, and the table read again, three
+      times, waiting longer each time.
+    - **A network is its gateway's hardware address alone** (Daniel,
+      2026-11-21). One that copies it passes for the person's network:
+      the device asks that router for a port and names the address it
+      gives, so the person's trusted contacts dial an address the copier
+      holds. That gains metadata (their addresses as they dial), and no
+      more: the session proves the device's key. Accepted.
+    - **The switches are looked at every second** by the port-mapping
+      loop, which runs as long as the service does: turned off on another
+      device, it gives its port back; turned on there, it asks again.
     - **Off the person's networks** the device asks nothing and sends the
       router nothing. A mapping it held on its own network is let go
       without a word (it lapses at the old router), the addresses it named

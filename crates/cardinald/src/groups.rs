@@ -69,7 +69,7 @@ fn find_among(d: &Daemon, group: &str, in_it: bool) -> anyhow::Result<Found> {
         all.push(Found {
             id: *id,
             name: group::name(sp),
-            joined: group::joined(sp, &me),
+            joined: core.is_joined(id),
         });
     }
     all.retain(|g| g.joined || !in_it);
@@ -265,6 +265,25 @@ pub fn leave(d: &Arc<Daemon>, group: &str) -> anyhow::Result<Json> {
         anyhow::ensure!(sp.role_of(&me).is_some(), "you are not in {}", g.name);
     }
     d.write_and_push(&g.id, relationship::leave_ops(&me))?;
+    // The account's node for it goes, and with it any "no hosts here" or
+    // "not this host here": an offer made again asks afresh (D75).
+    let gone = {
+        let core = d.core();
+        let acc = core
+            .account()
+            .and_then(|a| a.space.as_ref().map(|s| (a.id, s)));
+        acc.map(|(id, st)| {
+            let nodes = cardinal_space::account::spaces(st.state()).into_iter();
+            let ops: Vec<_> = nodes
+                .filter(|r| r.space == g.id && !r.declined)
+                .map(|r| SpaceOp::delete(r.node))
+                .collect();
+            (id, ops)
+        })
+    };
+    if let Some((account, ops)) = gone.filter(|(_, ops)| !ops.is_empty()) {
+        d.write_and_push(&account, ops)?;
+    }
     crate::mailbox::revoke_left(d, &g.id);
     d.bump();
     Ok(json!({}))
@@ -369,11 +388,15 @@ pub async fn join(d: &Arc<Daemon>, group: &str, reach: Option<bool>) -> anyhow::
         true => crate::mailbox::say_reach(d, &g.id, share).await?,
         false => false,
     };
-    if !d.core().telling(&g.id).joined {
-        // Joining is a first entry of theirs, and with no list to set it
-        // is an empty one.
-        let (_, sealed) = d.core().write_entry(&g.id, Vec::new())?;
-        d.push(&g.id, vec![sealed]);
+    if !d.core().is_joined(&g.id) {
+        // With nothing to say in the group, nothing is written there: the
+        // joining is kept in the account, as a node for the space (D75).
+        let account = d
+            .core()
+            .account_id()
+            .ok_or_else(|| anyhow::anyhow!("the account space is not here yet"))?;
+        let op = cardinal_space::account::create_space(&g.id, &g.name);
+        d.write_and_push(&account, vec![op])?;
     }
     // A yes with a host that could not be reached for a token is kept on
     // this device, against the list as it is, and finished later.
@@ -498,7 +521,7 @@ pub fn list_of(core: &Core) -> Json {
         // how many are in it: someone who has left is not
         let how_many = members.iter().filter(|m| !m.left).count();
         let name = group::name(sp);
-        if !group::joined(sp, &me) {
+        if !core.is_joined(id) {
             if in_it && !declined.contains(id) {
                 let from = sp.added_by(&me).unwrap_or(sp.creator());
                 offered.push(json!({
@@ -938,11 +961,11 @@ pub(crate) fn joined_group(d: &Daemon, group: &str) -> anyhow::Result<(SpaceId, 
 /// The name of a group this person joined that `who` is in, if `space` is
 /// one: what a call in it is called.
 pub(crate) fn shared_group(d: &Daemon, space: &SpaceId, who: &[u8; 32]) -> Option<String> {
-    let me = identity(d).ok()?;
+    identity(d).ok()?;
     let core = d.core();
     let sp = core.spaces.get(space)?.space.as_ref()?;
     let ours = sp.profile() == group::GROUP
-        && group::joined(sp, &me)
+        && core.is_joined(space)
         && sp.role_of(who).is_some()
         && !sp.has_left(who);
     ours.then(|| group::name(sp))
@@ -980,7 +1003,7 @@ pub fn not_joined(d: &Daemon, space: &SpaceId) -> bool {
     let me = core.identity.as_ref().map(|i| i.id());
     let sp = core.spaces.get(space).and_then(|h| h.space.as_ref());
     match (sp, me) {
-        (Some(sp), Some(me)) => sp.profile() == group::GROUP && !group::joined(sp, &me),
+        (Some(sp), Some(_)) => sp.profile() == group::GROUP && !core.is_joined(space),
         _ => false,
     }
 }

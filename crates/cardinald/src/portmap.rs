@@ -554,8 +554,9 @@ async fn ask_mine(
     }
 }
 
-/// Keeps a port from the router for as long as the service runs and
-/// port mapping is on: asked at start, renewed at half its lifetime, asked
+/// Keeps a port from the router for as long as the service runs, while
+/// port mapping is on (it waits while it is off, set here or on another
+/// device): asked at start, renewed at half its lifetime, asked
 /// again for a new port if the device's moved, and asked now and then of a
 /// router that gave nothing. Turned off, it gives the port back and ends.
 pub async fn keep(d: Arc<Daemon>) {
@@ -592,13 +593,14 @@ pub async fn keep(d: Arc<Daemon>) {
                 release(&m, nonce_for(&device, m.internal_port)).await;
                 d.bump();
             }
-            {
-                let mut st = d.portmap.lock().unwrap_or_else(|e| e.into_inner());
-                st.why_not = None;
-                st.running = false;
-            }
+            d.portmap.lock().unwrap_or_else(|e| e.into_inner()).why_not = None;
             crate::outside::tick(&d);
-            return;
+            // Turned off here or on another device (the account's
+            // switch): the loop stays, and asks again once it is on.
+            while !crate::networks::routers_on(&d) {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
+            continue;
         }
         // Only on a network the person said is theirs (D76). Anywhere
         // else nothing is asked of the router, and nothing sent to it: a

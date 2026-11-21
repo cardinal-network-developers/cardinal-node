@@ -94,9 +94,12 @@ pub fn router_now() -> Option<Router> {
     arp_lookup(&table, ip)
 }
 
-/// [`router_now`], and where the neighbour table has no entry for the
-/// gateway yet, one datagram to it (the discard port) so that it does,
-/// and a look again. Nothing is asked of the router.
+/// [`router_now`], and where the neighbour table has no complete entry
+/// for the gateway, an empty datagram to its discard port (9): sending it
+/// makes the system ask for the gateway's hardware address, which the
+/// table then holds. It is looked at again after a wait, and the datagram
+/// sent again, up to three times, waiting longer each time. Nothing is
+/// asked of the router.
 pub async fn find_router() -> Option<Router> {
     if let Some(r) = router_now() {
         return Some(r);
@@ -105,11 +108,63 @@ pub async fn find_router() -> Option<Router> {
         return None;
     }
     let ip = gateway_ip()?;
-    if let Ok(s) = tokio::net::UdpSocket::bind("0.0.0.0:0").await {
-        let _ = s.send_to(&[], SocketAddr::from((ip, 9))).await;
+    let sock = tokio::net::UdpSocket::bind("0.0.0.0:0").await.ok()?;
+    let mut wait = Duration::from_millis(200);
+    for _ in 0..3 {
+        let _ = sock.send_to(&[], SocketAddr::from((ip, 9))).await;
+        tokio::time::sleep(wait).await;
+        if let Some(r) = router_now() {
+            return Some(r);
+        }
+        wait *= 2;
     }
-    tokio::time::sleep(Duration::from_millis(300)).await;
-    router_now()
+    None
+}
+
+/// The subnets this device is on directly, from `/proc/net/route`: each
+/// route with no gateway other than the default, as (network, mask).
+pub fn on_link_subnets(routes: &str) -> Vec<(Ipv4Addr, Ipv4Addr)> {
+    let le = |h: &str| {
+        u32::from_str_radix(h, 16)
+            .ok()
+            .map(|v| Ipv4Addr::from(v.to_le_bytes()))
+    };
+    routes
+        .lines()
+        .skip(1)
+        .filter_map(|l| {
+            let f: Vec<&str> = l.split_whitespace().collect();
+            if f.len() < 8 || f[2] != "00000000" || f[1] == "00000000" {
+                return None;
+            }
+            Some((le(f[1])?, le(f[7])?))
+        })
+        .collect()
+}
+
+/// Whether an address is on the local link: link-local, or in a subnet
+/// this device is on directly. Where the routes cannot be read, a private
+/// address counts. Loopback counts only where a test runs discovery on it
+/// (`CARDINAL_TEST_MDNS_INTERFACE` names a loopback address).
+pub fn on_local_link(ip: std::net::IpAddr) -> bool {
+    let std::net::IpAddr::V4(v4) = ip else {
+        return false;
+    };
+    if v4.is_loopback() {
+        let test = std::env::var("CARDINAL_TEST_MDNS_INTERFACE").ok();
+        return test
+            .and_then(|t| t.parse::<Ipv4Addr>().ok())
+            .is_some_and(|t| t.is_loopback());
+    }
+    if v4.is_link_local() {
+        return true;
+    }
+    match std::fs::read_to_string("/proc/net/route") {
+        Ok(routes) => on_link_subnets(&routes)
+            .iter()
+            .any(|(net, mask)| u32::from(v4) & u32::from(*mask) == u32::from(*net)),
+        Err(_) => v4.is_private(),
+    }
 }
 
 /// What the account says of one network.
@@ -349,6 +404,24 @@ fn changed(d: &Arc<Daemon>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_subnets_on_the_link_are_read_from_the_routes() {
+        let routes =
+            "Iface\tDestination\tGateway \tFlags\tRefCnt\tUse\tMetric\tMask\t\tMTU\tWindow\tIRTT\n\
+                      wlan0\t00000000\t0101A8C0\t0003\t0\t0\t600\t00000000\t0\t0\t0\n\
+                      wlan0\t0001A8C0\t00000000\t0001\t0\t0\t600\t00FFFFFF\t0\t0\t0\n";
+        let nets = on_link_subnets(routes);
+        assert_eq!(
+            nets,
+            [(
+                "192.168.1.0".parse().unwrap(),
+                "255.255.255.0".parse().unwrap()
+            )]
+        );
+        assert!(!on_local_link("8.8.8.8".parse().unwrap()));
+        assert!(on_local_link("169.254.7.7".parse().unwrap()));
+    }
 
     #[test]
     fn a_router_is_read_from_the_neighbour_table_only_when_complete() {

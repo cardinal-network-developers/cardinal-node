@@ -3477,6 +3477,10 @@ fn contact_status(v: &serde_json::Value) -> String {
         out.push_str("The last look:\n");
         steps(&mut out, &v["last_look"]);
     }
+    if v["nearby_tries"].as_array().is_some_and(|a| !a.is_empty()) {
+        out.push_str("Where their tag was seen on the local network:\n");
+        steps(&mut out, &v["nearby_tries"]);
+    }
     if v["sessions"].as_array().is_some_and(|a| !a.is_empty()) {
         out.push_str("Sessions with them since this service started:\n");
         steps(&mut out, &v["sessions"]);

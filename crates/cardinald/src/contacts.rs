@@ -1616,6 +1616,7 @@ pub async fn status(
         "looking_since": trail.looking_since,
         "last_look": trail.look.iter().map(step_json).collect::<Vec<_>>(),
         "sessions": trail.events.iter().map(step_json).collect::<Vec<_>>(),
+        "nearby_tries": trail.nearby.iter().map(step_json).collect::<Vec<_>>(),
         "router": crate::portmap::status(d),
     });
     Ok(crate::names::with_shown(d, &c, v))

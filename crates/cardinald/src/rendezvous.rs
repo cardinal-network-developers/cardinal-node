@@ -93,6 +93,10 @@ const PUNCH_FOR_CONTACT_EVERY: Duration = Duration::from_secs(5);
 const HEARD_LATELY: Duration = Duration::from_secs(5);
 /// How often a contact is tried at one address their tag was seen at.
 const NEARBY_EVERY: Duration = Duration::from_secs(10);
+/// How many tries nearby one contact gets in a minute, at any addresses.
+const NEARBY_PER_MINUTE: usize = 3;
+/// The most nearby tries kept for each contact's trail.
+const NEARBY_KEPT: usize = 20;
 /// How long a look waits for a host in use for something else.
 const HOST_IN_USE_FOR: Duration = Duration::from_secs(5);
 
@@ -182,6 +186,13 @@ pub struct Rendezvous {
     /// When each contact was last tried at an address whose advertisement
     /// carried their tag (D74): at most once in [`NEARBY_EVERY`].
     nearby: Mutex<HashMap<([u8; 32], SocketAddr), Instant>>,
+    /// When each contact was tried nearby in the last minute, whatever the
+    /// address: at most [`NEARBY_PER_MINUTE`]. A tag can be replayed
+    /// anywhere, and that is to cost a try and no more.
+    nearby_tries: Mutex<HashMap<[u8; 32], std::collections::VecDeque<Instant>>>,
+    /// The contacts being tried nearby right now: apart from the looks
+    /// through hosts, which a replayed tag must not keep from running.
+    nearby_going: Mutex<HashSet<[u8; 32]>>,
 }
 
 /// The most sessions opening and closing kept for each contact.
@@ -211,6 +222,10 @@ pub struct Trail {
     pub looking_since: Option<u64>,
     /// Their sessions opening and closing, the newest last.
     pub events: std::collections::VecDeque<Step>,
+    /// Tries at an address where their tag was seen on the local network
+    /// (D74), the newest last: apart from the looks, which a tag seen does
+    /// not overwrite.
+    pub nearby: std::collections::VecDeque<Step>,
 }
 
 fn unix_ms() -> u64 {
@@ -375,6 +390,20 @@ impl Rendezvous {
         });
         while t.events.len() > EVENTS {
             t.events.pop_front();
+        }
+    }
+
+    /// A try at an address where a contact's tag was seen.
+    fn nearby_step(&self, who: &[u8; 32], ok: Option<bool>, text: String) {
+        let mut trails = lock(&self.trails);
+        let t = trails.entry(*who).or_default();
+        t.nearby.push_back(Step {
+            at: unix_ms(),
+            ok,
+            text,
+        });
+        while t.nearby.len() > NEARBY_KEPT {
+            t.nearby.pop_front();
         }
     }
 
@@ -1652,12 +1681,10 @@ pub async fn try_at(d: &Arc<Daemon>, who: [u8; 32], addr: SocketAddr) {
 /// the trail says which. Each address is tried at most once in
 /// [`NEARBY_EVERY`].
 pub async fn found_nearby(d: &Arc<Daemon>, who: [u8; 32], addr: SocketAddr) {
-    let connects = d
-        .core()
-        .contacts()
-        .iter()
-        .any(|c| c.identity == who && c.connects());
-    if !connects {
+    let trusted = crate::presence::by_identity(&d.core())
+        .get(&who)
+        .is_some_and(|(t, _)| *t);
+    if !trusted {
         return;
     }
     let theirs: Vec<(KeyId, HybridPublicKey)> = {
@@ -1685,18 +1712,32 @@ pub async fn found_nearby(d: &Arc<Daemon>, who: [u8; 32], addr: SocketAddr) {
         if recent {
             return;
         }
+        let mut tries = lock(&d.rendezvous.nearby_tries);
+        let mine = tries.entry(who).or_default();
+        while mine
+            .front()
+            .is_some_and(|t| t.elapsed() >= Duration::from_secs(60))
+        {
+            mine.pop_front();
+        }
+        if mine.len() >= NEARBY_PER_MINUTE {
+            return;
+        }
+        mine.push_back(Instant::now());
         tried.retain(|_, t| t.elapsed() < NEARBY_EVERY);
         tried.insert((who, addr), Instant::now());
     }
-    // One look at a time, as for any other.
-    if !lock(&d.rendezvous.looking).insert(who) {
+    // One try at a time for a contact, apart from the looks through hosts.
+    if !lock(&d.rendezvous.nearby_going).insert(who) {
         return;
     }
-    let _looking = Looking { d, who };
-    d.rendezvous.look_begins(
-        &who,
-        format!("their tag seen on the local network at {addr}: trying their devices there"),
-    );
+    struct Going<'a>(&'a Daemon, [u8; 32]);
+    impl Drop for Going<'_> {
+        fn drop(&mut self) {
+            lock(&self.0.rendezvous.nearby_going).remove(&self.1);
+        }
+    }
+    let _going = Going(d, who);
     for (device, link) in theirs {
         if reached(d, link.x25519()) {
             continue;
@@ -1704,7 +1745,7 @@ pub async fn found_nearby(d: &Arc<Daemon>, who: [u8; 32], addr: SocketAddr) {
         match d.dial(|c| Target::new(addr, c, &link)).await {
             Ok(s) => {
                 d.on_session(s);
-                d.rendezvous.step(
+                d.rendezvous.nearby_step(
                     &who,
                     Some(true),
                     format!(
@@ -1713,15 +1754,16 @@ pub async fn found_nearby(d: &Arc<Daemon>, who: [u8; 32], addr: SocketAddr) {
                     ),
                 );
                 tracing::info!("found {} on the local network at {addr}", short(&who));
+                // the first that answers: the tag was one device's
                 return;
             }
             Err(e) => tracing::debug!("{} at {addr}: {e}", short(&device)),
         }
     }
-    d.rendezvous.step(
+    d.rendezvous.nearby_step(
         &who,
         Some(false),
-        format!("none of their devices answered at {addr}"),
+        format!("their tag seen on the local network at {addr}: none of their devices answered"),
     );
 }
 
