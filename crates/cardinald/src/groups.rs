@@ -539,7 +539,7 @@ pub fn list_of(core: &Core) -> Json {
             continue;
         }
         let said = relationship::messages(sp);
-        let read = relationship::read_by(sp, &me, &said);
+        let read = core.read_here(id, &said);
         let unread = said
             .iter()
             .zip(read)
@@ -838,38 +838,7 @@ pub fn react(d: &Arc<Daemon>, group: &str, id: &str, text: &str) -> anyhow::Resu
 /// Marks a group's conversation read up to its last message from anyone else.
 pub fn mark_read(d: &Arc<Daemon>, group: &str) -> anyhow::Result<Json> {
     let g = joined(d, group)?;
-    if !crate::settings::read_markers_on(&d.core()) {
-        return Ok(crate::settings::markers_off());
-    }
-    let me = identity(d)?;
-    let op = {
-        let core = d.core();
-        let sp = core.spaces.get(&g.id).and_then(|h| h.space.as_ref());
-        let sp = sp.ok_or_else(|| anyhow::anyhow!("that group is not open yet"))?;
-        let all = relationship::messages(sp);
-        let read = relationship::read_by(sp, &me, &all);
-        let new = all
-            .iter()
-            .zip(&read)
-            .any(|(m, read)| m.author != me && !read);
-        let theirs = all.iter().rposition(|m| m.author != me);
-        match theirs {
-            Some(at) if new => {
-                let last = all[at].id;
-                match relationship::read_marker(sp, &me) {
-                    Some(marker) => Some(relationship::set_read_marker(marker, last)),
-                    None => relationship::conversation(sp)
-                        .map(|c| relationship::create_read_marker(c, last)),
-                }
-            }
-            _ => None,
-        }
-    };
-    let marked = op.is_some();
-    if let Some(op) = op {
-        d.write_and_push(&g.id, vec![op])?;
-    }
-    Ok(json!({"marked": marked}))
+    contacts::mark_read_in(d, &g.id, &g.name)
 }
 
 /// Renames a group, or says whether its members are introduced through it.

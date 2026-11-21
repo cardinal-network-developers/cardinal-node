@@ -83,12 +83,3 @@ pub fn read_markers(d: &Arc<Daemon>, set: Option<bool>) -> anyhow::Result<Json> 
     }
     Ok(json!({"on": read_markers_on(&d.core())}))
 }
-
-/// What `mark-read` answers where read markers are off: nothing written,
-/// and why.
-pub fn markers_off() -> Json {
-    json!({
-        "marked": false,
-        "why": "read markers are off: others do not see what you have read",
-    })
-}

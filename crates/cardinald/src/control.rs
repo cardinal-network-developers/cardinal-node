@@ -1020,6 +1020,7 @@ fn status(d: &Arc<Daemon>) -> Value {
         "name": cfg.name,
         "router": crate::portmap::status(d),
         "network": crate::networks::status(d),
+        "read_markers": crate::settings::read_markers_on(&d.core()),
         "home": d.paths.home.display().to_string(),
         "identity": identity,
         "listen": d.endpoint.tcp_addr().map(|a| a.to_string()),

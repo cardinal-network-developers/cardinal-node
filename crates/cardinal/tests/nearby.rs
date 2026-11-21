@@ -151,6 +151,8 @@ fn trusted_contacts_with_no_host_find_each_other_on_the_local_network() {
         !online(&ana, "Bo") && !online(&bo, "Ana"),
         "they met without discovery: the test shows nothing"
     );
+    let c = ask(&bo, json!({"cmd": "conversations"}))["conversations"][0].clone();
+    assert_eq!(c["nearby"], false, "{c}");
     // Both come back with local discovery.
     stop(&mut ana);
     stop(&mut bo);
@@ -178,6 +180,24 @@ fn trusted_contacts_with_no_host_find_each_other_on_the_local_network() {
         shown.contains("found on the local network")
             || shown2.contains("found on the local network"),
         "{shown}\n{shown2}"
+    );
+    // Now, and only now, each is nearby to the other: a direct session on
+    // the local network. Neither names a host.
+    let near = |d: &Dev| {
+        let c = ask(d, json!({"cmd": "conversations"}))["conversations"][0].clone();
+        let l = ask(d, json!({"cmd": "contacts"}))["contacts"][0].clone();
+        (c, l)
+    };
+    let (c, l) = near(&bo);
+    assert_eq!(
+        (&c["nearby"], &l["nearby"]),
+        (&json!(true), &json!(true)),
+        "{c}\n{l}"
+    );
+    assert_eq!(
+        c["reach"],
+        json!({"shared": false, "waiting": false, "said_no": false, "named": []}),
+        "{c}"
     );
     // And they talk.
     bo.cli(&["say", "Ana", "found you"]);
