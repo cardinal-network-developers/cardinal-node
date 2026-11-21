@@ -595,6 +595,85 @@ pub fn decline(d: &Arc<Daemon>, group: &str) -> anyhow::Result<Json> {
 
 /// What this person calls a member: themselves, a contact's petname, or the
 /// name the group shows.
+/// The members of a group and those taken out of it, for naming whoever
+/// wrote what is there: someone taken out is still shown by the name the
+/// others saw (`group::taken_out`).
+fn named_in(sp: &Space) -> Vec<Member> {
+    let mut all = group::members(sp);
+    all.extend(group::taken_out(sp));
+    all
+}
+
+/// How a client names a role.
+fn role_name(role: u64) -> &'static str {
+    match role {
+        group::OWNER => "owner",
+        group::ADMIN => "admin",
+        group::READER => "reader",
+        _ => "member",
+    }
+}
+
+/// What a successor changed, as this person names those it concerns:
+/// `taken_out`, names, and `roles`, each `{name, from, to}`.
+fn change_json(
+    core: &Core,
+    me: &[u8; 32],
+    contacts: &[ContactRecord],
+    named: &[Member],
+    succ: &SpaceId,
+) -> Json {
+    let Some((out, roles)) = core.changes_of(succ) else {
+        return json!({"taken_out": [], "roles": []});
+    };
+    // the old space knows them all by name
+    let old = core
+        .spaces
+        .get(succ)
+        .and_then(|h| h.space.as_ref()?.succeeds());
+    let old = old.and_then(|o| core.spaces.get(&o)?.space.as_ref());
+    let mut all: Vec<Member> = named.to_vec();
+    if let Some(o) = old {
+        all.extend(named_in(o));
+    }
+    let name = |w: &[u8; 32]| name_of(me, contacts, &all, w);
+    json!({
+        "taken_out": out.iter().map(name).collect::<Vec<_>>(),
+        "roles": roles.iter().map(|(w, from, to)| json!({
+            "name": name(w),
+            "from": role_name(*from),
+            "to": role_name(*to),
+        })).collect::<Vec<_>>(),
+    })
+}
+
+/// How long the note of how a group moved stays, unless cleared first.
+const MOVED_FOR_MS: u64 = 7 * 24 * 3600 * 1000;
+
+/// That this person may write in a group: a writer, an admin or its owner.
+/// A reader reads.
+fn may_write_in(d: &Daemon, g: &Found) -> anyhow::Result<()> {
+    let me = identity(d)?;
+    let core = d.core();
+    let sp = core.spaces.get(&g.id).and_then(|h| h.space.as_ref());
+    let sp = sp.ok_or_else(|| anyhow::anyhow!("that group is not open yet"))?;
+    let role = sp.role_of(&me);
+    anyhow::ensure!(
+        role.is_some_and(|r| r >= group::WRITER),
+        "you can read {} but not write in it: its owner made you a reader",
+        g.name
+    );
+    Ok(())
+}
+
+/// The person cleared the note of how a group moved.
+pub fn moved_seen(d: &Daemon, group: &str) -> anyhow::Result<Json> {
+    let g = find(d, group)?;
+    d.core().moved_seen(&g.id);
+    d.bump();
+    Ok(json!({}))
+}
+
 fn name_of(
     me: &[u8; 32],
     contacts: &[ContactRecord],
@@ -639,6 +718,7 @@ pub fn list_of(core: &Core) -> Json {
             continue;
         }
         let members = group::members(sp);
+        let named = named_in(sp);
         let in_it = members.iter().any(|m| m.identity == me);
         // how many are in it: someone who has left is not
         let how_many = members.iter().filter(|m| !m.left).count();
@@ -669,10 +749,35 @@ pub fn list_of(core: &Core) -> Json {
             .count();
         let last = said.last().cloned();
         let when = last.as_ref().and_then(|m| m.time).map(|t| t.min(now_ms()));
-        let (ended, lost) = core.succession_news(id);
+        let (ended, mut lost) = core.succession_news(id);
+        // what did not stand is noted in the space it would have succeeded
+        if let Some(o) = sp.succeeds() {
+            lost.extend(core.succession_news(&o).1);
+        }
+        // who moved it here, and what that changed, until it is cleared or
+        // a week has gone
+        let notes = core.spaces.get(id).map(|h| h.notes());
+        let at = sp.entry(id).and_then(|g| g.time());
+        let fresh = at.is_some_and(|t| now_ms().saturating_sub(t) < MOVED_FOR_MS);
+        let moved = (sp.succeeds().is_some() && fresh && !notes.is_some_and(|n| n.moved_seen))
+            .then(|| {
+                let mut c = change_json(core, &me, &contacts, &named, id);
+                c["by"] = json!(name_of(&me, &contacts, &named, &sp.creator()));
+                c["at"] = json!(at);
+                c
+            });
+        let lost: Vec<Json> = lost
+            .iter()
+            .map(|l| {
+                let mut c = change_json(core, &me, &contacts, &named, l);
+                c["group"] = json!(hex::encode(l));
+                c
+            })
+            .collect();
         let group = json!({
             "ended": ended,
-            "did_not_stand": lost.iter().map(hex::encode).collect::<Vec<_>>(),
+            "moved": moved,
+            "did_not_stand": lost,
             "held_back": core.held_back(id),
             "not_posted": core.spaces.get(id).map_or(0, |h| h.notes().not_posted),
             "was": sp.succeeds().map(hex::encode),
@@ -686,7 +791,7 @@ pub fn list_of(core: &Core) -> Json {
             "unread": unread,
             "last": last.map(|m| json!({
                 "mine": m.author == me,
-                "from": name_of(&me, &contacts, &members, &m.author),
+                "from": name_of(&me, &contacts, &named, &m.author),
                 "text": m.text,
                 "time": m.time,
             })),
@@ -740,6 +845,23 @@ pub fn members(d: &Daemon, group: &str) -> anyhow::Result<Json> {
             }
         })
         .collect();
+    // and whoever was taken out when it moved, marked: by the name the
+    // others saw
+    let named = named_in(sp);
+    let mut out = out;
+    for m in group::taken_out(sp) {
+        out.push(json!({
+            "name": name_of(&me, &contacts, &named, &m.identity),
+            "shown": m.name,
+            "id": hex::encode(&m.identity[..8]),
+            "you": m.identity == me,
+            "contact": contacts.iter().any(|c| c.identity == m.identity && !c.refused),
+            "role": "taken out",
+            "taken_out": true,
+            "introduce": false,
+            "left": true,
+        }));
+    }
     Ok(json!({"group": hex::encode(g.id), "name": g.name, "members": out}))
 }
 
@@ -767,6 +889,7 @@ pub async fn say(
     attach: &[String],
 ) -> anyhow::Result<Json> {
     let g = joined(d, group)?;
+    may_write_in(d, &g)?;
     use_members(d, &g.id);
     let to = match reply_to {
         Some(id) => Some(message_in(d, &g.id, id)?.id),
@@ -814,6 +937,7 @@ pub fn messages(d: &Daemon, group: &str) -> anyhow::Result<Json> {
     let sp = sp.ok_or_else(|| anyhow::anyhow!("that group is not open yet"))?;
     let all = relationship::messages(sp);
     let members = group::members(sp);
+    let named = named_in(sp);
     // someone who left reads nothing more, and is not waited for
     let others: Vec<[u8; 32]> = members
         .iter()
@@ -839,7 +963,7 @@ pub fn messages(d: &Daemon, group: &str) -> anyhow::Result<Json> {
                 "picture": picture,
                 "id": hex::encode(m.id),
                 "mine": mine,
-                "from": name_of(&me, &contacts, &members, &m.author),
+                "from": name_of(&me, &contacts, &named, &m.author),
                 "text": m.text,
                 "time": m.time,
                 "state": mine.then_some(if read == others.len() && !others.is_empty() { "read" } else { "sent" }),
@@ -920,6 +1044,7 @@ fn own_message(d: &Daemon, space: &SpaceId, id: &str) -> anyhow::Result<relation
 /// Changes what a message of this person's in a group says.
 pub fn edit_message(d: &Arc<Daemon>, group: &str, id: &str, text: &str) -> anyhow::Result<Json> {
     let g = joined(d, group)?;
+    may_write_in(d, &g)?;
     let m = own_message(d, &g.id, id)?;
     anyhow::ensure!(!text.trim().is_empty(), "a message cannot be empty");
     d.write_and_push(&g.id, vec![relationship::edit_message(m.id, text)])?;
@@ -929,6 +1054,7 @@ pub fn edit_message(d: &Arc<Daemon>, group: &str, id: &str, text: &str) -> anyho
 /// Takes back a message of this person's in a group.
 pub fn delete_message(d: &Arc<Daemon>, group: &str, id: &str) -> anyhow::Result<Json> {
     let g = joined(d, group)?;
+    may_write_in(d, &g)?;
     let m = own_message(d, &g.id, id)?;
     d.write_and_push(&g.id, vec![SpaceOp::delete(m.id)])?;
     Ok(json!({}))
@@ -938,6 +1064,7 @@ pub fn delete_message(d: &Arc<Daemon>, group: &str, id: &str) -> anyhow::Result<
 /// taking it away with nothing.
 pub fn react(d: &Arc<Daemon>, group: &str, id: &str, text: &str) -> anyhow::Result<Json> {
     let g = joined(d, group)?;
+    may_write_in(d, &g)?;
     let m = message_in(d, &g.id, id)?;
     let text = text.trim();
     anyhow::ensure!(

@@ -230,6 +230,39 @@ pub fn members(space: &Space) -> Vec<Member> {
     out
 }
 
+/// Those a group has a member node for who are not its members: people
+/// taken out of it when it was succeeded, whose node the successor carried
+/// (`spaces.md#what-comes-across`). Display only: the name the others saw,
+/// so that what they wrote before still shows who wrote it. Their role is
+/// none here, and is given as a reader's.
+pub fn taken_out(space: &Space) -> Vec<Member> {
+    let state = space.state();
+    let mut out: Vec<Member> = Vec::new();
+    for n in state.children(&ROOT) {
+        if n.kind != NodeKind::Uint(MEMBER) || n.deleted {
+            continue;
+        }
+        let who = admins_value(space, n, 1).and_then(Value::as_bytes);
+        let Some(who) = who.and_then(|b| IdentityId::try_from(b).ok()) else {
+            continue;
+        };
+        if space.role_of(&who).is_some() || out.iter().any(|m| m.identity == who) {
+            continue;
+        }
+        out.push(Member {
+            identity: who,
+            role: READER,
+            left: true,
+            name: admins_value(space, n, 2)
+                .and_then(Value::as_text)
+                .map(str::to_owned),
+            introduce: false,
+            node: Some(n.id),
+        });
+    }
+    out
+}
+
 /// A group's name.
 pub fn name(space: &Space) -> String {
     let Some(c) = conversation(space) else {

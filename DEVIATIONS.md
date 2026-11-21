@@ -907,6 +907,9 @@ What is not built:
 - **Light holders** ask nobody for the state at a cut, and **storage
   labels** at hosts are not carried (the old space's chunks stay under
   its label; the successor's entries get one as any space does).
+- **Who was taken out** stays named: a group's member nodes are carried,
+  so those taken out are listed (`group::taken_out`) by the name the
+  others saw, and what they wrote before shows them by it. Display only.
 - **Carried over** is not shown: what a member who holds no space before
   sees of a successor's initial state is shown as anything else is.
 - **What is not posted again is not shown.** An addition the cut did not
@@ -1041,6 +1044,12 @@ Readings:
     is taken for it, and the work is not posted twice.
   - Work not posted because the person's role there no longer allows it
     is counted, and `groups` gives the count as `not_posted`.
+  - Nothing is posted again into a successor until this device has
+    reconciled it with a peer that holds it since it followed, or since
+    it started: who is there is known only then, since someone added
+    after the genesis may not have come with it. Entries of control ops
+    alone (a `succeed`, a `rotate`) and the owner's first entry in a
+    successor are nobody's work, and are neither posted nor held back.
   - "All were members of the space the work was written in" is read as:
     every member of the space that stands was ever a member of that space.
     Otherwise the work is held back, `groups` says how much, and

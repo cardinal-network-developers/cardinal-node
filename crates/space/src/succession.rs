@@ -518,7 +518,41 @@ fn without(r: Record, key: u64) -> Record {
     out
 }
 
+/// Whether an entry holds any work to post again: an application op that
+/// is not a `checkpoint` nor a `set` of its author's own reach node. An
+/// entry of control ops alone, such as a `succeed`, holds none.
+pub fn has_work(e: &crate::entry::SpaceEntry) -> bool {
+    let own_reach = reach_node_id(&e.author());
+    e.ops().iter().any(|op| {
+        let n = op.record().get(0).and_then(|v| v.as_uint()).unwrap_or(0);
+        let reach = matches!(op.body(), SpaceOpBody::Set { node, .. } if *node == own_reach);
+        n >= 32 && n != 37 && !reach
+    })
+}
+
 /// Whether `who` may post work again in `into`: a writer or above there.
 pub fn may_post(into: &Space, who: &IdentityId) -> bool {
     into.role_of(who).is_some_and(|r| r >= WRITER)
+}
+
+/// Who a successor leaves out, and whose role it changes, from what to
+/// what.
+pub type Changes = (Vec<IdentityId>, Vec<(IdentityId, u64, u64)>);
+
+/// What a successor changed of who is in the space it succeeds: who it
+/// leaves out, of those who had not left, and whose role it gives as
+/// another, with the role before and after, each sorted.
+pub fn changes(old: &Space, new: &Space) -> Changes {
+    let named = genesis_members(new);
+    let mut out = Vec::new();
+    let mut roles = Vec::new();
+    for who in old.present() {
+        let before = old.role_of(&who).unwrap_or(0);
+        match named.iter().find(|(w, _)| *w == who) {
+            None => out.push(who),
+            Some((_, after)) if *after != before => roles.push((who, before, *after)),
+            Some(_) => {}
+        }
+    }
+    (out, roles)
 }

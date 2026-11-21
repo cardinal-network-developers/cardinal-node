@@ -1279,6 +1279,9 @@ pub struct Core {
     /// This is a recovery helper's: it holds what guardians' personas give
     /// it for the recovery (D80).
     pub takes_recovery_copies: bool,
+    /// The spaces reconciled with a peer that holds them since this device
+    /// started: a successor is posted again into only once it is.
+    pub synced: std::collections::HashSet<SpaceId>,
 }
 
 /// The most a copy held for someone takes on this device: past it, nothing
@@ -1310,6 +1313,7 @@ impl Core {
             arriving: HashMap::new(),
             logs: Vec::new(),
             takes_recovery_copies: false,
+            synced: Default::default(),
         };
         if paths.identity_log().exists() {
             let (file, records) = AppendLog::open(&paths.identity_log())?;
@@ -6363,6 +6367,11 @@ mod tests {
                 self.core.ingest_space(*space, &all).unwrap();
             }
             self.core.follow(store);
+            // as reconciling with `from` does, which a device does with a
+            // successor before it posts again there
+            let held: Vec<SpaceId> = self.core.spaces.keys().copied().collect();
+            self.core.synced.extend(held);
+            self.core.follow(store);
         }
 
         fn holds(&self, space: &SpaceId) -> bool {
@@ -6639,6 +6648,14 @@ mod tests {
         };
         assert!(!writer.said(&win).contains(&lost_text.to_owned()));
         assert_eq!(writer.core.held_back(&win), 1);
+        // and the owner is told what the one that did not stand changed
+        let listed = crate::groups::list_of(&writer.core);
+        let lost = listed["groups"][0]["did_not_stand"].clone();
+        assert_eq!(
+            lost[0]["taken_out"].as_array().unwrap().len(),
+            1,
+            "{listed}"
+        );
         let posted = writer.core.post_again_all(true);
         assert!(!posted.is_empty());
         assert!(writer.said(&win).contains(&lost_text.to_owned()));
@@ -6862,5 +6879,44 @@ mod tests {
         assert!(why.unwrap().contains("does not match"));
         // and it is not taken on anyone's word again
         assert!(dan.core.take_initial(&s, &canonical).is_err());
+    }
+
+    #[test]
+    fn work_is_held_back_until_the_successor_is_heard_from() {
+        let ([mut ana, bo, mut cy], g) = family();
+        let stores = [(); 3].map(|_| cardinal_blob::MemStore::new());
+        let mut dee = Person::new();
+        dee.meets(&ana);
+        ana.meets(&dee);
+        // Cy writes while everyone is away.
+        cy.says(&g, "cy, unheard");
+        // Ana takes Bo out, and adds Dee to what is in its place.
+        let s = ana
+            .core
+            .succeed(&stores[0], &g, &[(cy.id(), WRITER)])
+            .unwrap()
+            .new;
+        let _ = bo;
+        let dee_shown = [(dee.id(), "Dee".to_owned())];
+        ana.core.add_to_group(&s, &dee_shown).unwrap();
+        // Cy hears of the end and follows, with the genesis alone: nothing
+        // is posted again before he has heard from someone holding it.
+        cy.core.ingest_space(g, &ana.set_of(&g)).unwrap();
+        cy.core.follow(&stores[2]);
+        assert!(cy.holds(&s));
+        assert!(!cy.said(&s).contains(&"cy, unheard".to_owned()));
+        assert_eq!(cy.core.held_back(&s), 0);
+        assert_eq!(cy.core.unsynced_successors(), [s]);
+        // Then he does, and Dee is there: his work waits for him.
+        cy.takes(&s, &ana.set_of(&s));
+        cy.core.mark_synced(&s);
+        cy.core.follow(&stores[2]);
+        assert!(!cy.said(&s).contains(&"cy, unheard".to_owned()));
+        assert_eq!(cy.core.held_back(&s), 1);
+        // The owner has nothing of hers held back: her `succeed` is no
+        // work of anyone's.
+        ana.core.mark_synced(&s);
+        ana.core.follow(&stores[0]);
+        assert_eq!(ana.core.held_back(&s), 0);
     }
 }

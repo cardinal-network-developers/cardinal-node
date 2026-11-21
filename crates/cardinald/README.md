@@ -378,7 +378,8 @@ host, answering `taken_out`; `groups` gives each group's `reach` with
 `admin`; a higher role is given in place by an admin or the owner and
 answers `group` as it was, a lower one is the owner's and answers like
 `group-remove`), `group-post-again` (`group`: posts what this device
-held back from the group, answering `posted`),
+held back from the group, answering `posted`), `group-moved-seen`
+(`group`: clears the group's `moved` note),
 `router` (`on`, with `this_device` true for this device alone, else
 for every device of the person's: the account's switch; answers what
 `status` gives as `router`), `network` (with nothing: the network this
@@ -548,11 +549,21 @@ put something in its place that does not match it), `held_back` (how
 much of what this device wrote before the group moved on waits for
 `group-post-again`, since someone is in it now that it was written
 without), `not_posted` (how much was not posted again because this
-person's role there no longer allows it) and `did_not_stand` (successors this person's devices made that
-another took the place of: they do again what each was for).
+person's role there no longer allows it), `moved` (until cleared with
+`group-moved-seen`, or a week after: `{by, at, taken_out: [names],
+roles: [{name, from, to}]}`, who moved the group here, when by their
+clock, and what that changed; null otherwise) and `did_not_stand`
+(successors this person's devices made that another took the place of,
+each `{group, taken_out, roles}`, as `moved` says them: they do again
+what each was for). `group-members` lists whoever was taken out too, by
+the name the others saw, with `taken_out` true and `role` `taken out`;
+what they wrote before shows them by that name. A reader's `say`,
+`edit-message`, `delete-message` and `react` in a group fail, saying so.
 
 A device posts again, in the group that stands, what it wrote that the
-new group did not carry: a message written before it heard. Only
+new group did not carry: a message written before it heard. It does so
+only once it has reconciled the new group with someone who holds it,
+so that it knows who is there. Only
 application ops are posted again, by the device that wrote them, once.
 A change made without seeing another stands beside it, in conflict.
 

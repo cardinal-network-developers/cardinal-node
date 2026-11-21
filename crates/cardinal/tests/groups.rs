@@ -1103,6 +1103,20 @@ fn taking_someone_out_replaces_the_group_for_everyone_else() {
         said(&bo, &g2).contains(&"Ana: without cy".to_owned())
     });
     assert!(said(&bo, &g2).contains(&"Ana: hello all".to_owned()));
+    // Bo does not know Cy: what Cy wrote is still his, by the name Ana
+    // gave him, and the members list him as taken out.
+    assert!(said(&bo, &g2).contains(&"Cy: a photo".to_owned()));
+    let m = ask(&bo, json!({"cmd": "group-members", "group": g2}));
+    let all = m["members"].as_array().unwrap().clone();
+    let out: Vec<&Value> = all.iter().filter(|m| m["taken_out"] == true).collect();
+    assert_eq!(out.len(), 1, "{m}");
+    assert_eq!(out[0]["name"], "Cy");
+    // His groups say who moved it and what changed, until he clears it.
+    let moved = listed(&bo, "Family").unwrap()["moved"].clone();
+    assert_eq!(moved["by"], "Ana", "{moved}");
+    assert_eq!(moved["taken_out"], json!(["Cy"]), "{moved}");
+    ask(&bo, json!({"cmd": "group-moved-seen", "group": g2}));
+    assert!(listed(&bo, "Family").unwrap()["moved"].is_null());
     ask(&bo, json!({"cmd": "say", "group": g, "text": "just us"}));
     wait("ana reads bo", 30, || {
         said(&ana, &g2).contains(&"Bo: just us".to_owned())
@@ -1135,19 +1149,29 @@ fn taking_someone_out_replaces_the_group_for_everyone_else() {
         "{theirs:?}"
     );
 
-    // Ana makes Bo an ordinary member again: another replacement.
+    // Ana makes Bo a reader: another replacement.
     let lowered = ask(
         &ana,
-        json!({"cmd": "group-role", "group": g2, "who": "Bo", "role": "member"}),
+        json!({"cmd": "group-role", "group": g2, "who": "Bo", "role": "reader"}),
     );
     let g3 = lowered["group"].as_str().unwrap().to_owned();
     assert_ne!(g3, g2);
     wait("bo follows again", 30, || {
         listed(&bo, "Family").is_some_and(|x| x["group"] == g3.as_str())
     });
-    assert_eq!(role(&bo, &g3, "You"), "member");
-    assert_eq!(role(&ana, &g, "Bo"), "member");
+    assert_eq!(role(&bo, &g3, "You"), "reader");
+    assert_eq!(role(&ana, &g, "Bo"), "reader");
     assert!(said(&bo, &g3).contains(&"You: just us".to_owned()));
+    let moved = listed(&bo, "Family").unwrap()["moved"].clone();
+    assert_eq!(
+        moved["roles"],
+        json!([{"name": "You", "from": "admin", "to": "reader"}]),
+        "{moved}"
+    );
+    // A reader reads, and writes nothing.
+    let no = reply(&bo, &json!({"cmd": "say", "group": g3, "text": "can I?"}));
+    assert_eq!(no["ok"], false, "{no}");
+    assert!(no["error"].as_str().unwrap().contains("reader"), "{no}");
 
     // Someone added since holds none of the groups before: the group
     // starts, for them, from what Ana put in its place.

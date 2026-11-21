@@ -72,6 +72,10 @@ pub struct Notes {
     /// resolved, and concerned the succession alone.
     #[serde(default)]
     pub not_work: BTreeSet<String>,
+    /// The person was shown how the group moved to this successor, and
+    /// cleared the note.
+    #[serde(default)]
+    pub moved_seen: bool,
 }
 
 /// What [`Core::succeed`] wrote, to send.
@@ -297,6 +301,43 @@ impl Core {
         h.rebuild(Vec::new(), &keys, &logs);
         self.settle(space);
         Ok(())
+    }
+
+    /// The successors that stand here and have not been reconciled with a
+    /// peer since this device started, or followed them: nothing is posted
+    /// again into them until they are.
+    pub fn unsynced_successors(&self) -> Vec<SpaceId> {
+        let mut out = Vec::new();
+        for (id, h) in &self.spaces {
+            let Some(sp) = h.space.as_ref() else { continue };
+            if sp.succeeds().is_some() && !self.synced.contains(id) && !self.is_superseded(id) {
+                out.push(*id);
+            }
+        }
+        out
+    }
+
+    /// `space` was reconciled with a peer that holds it.
+    pub fn mark_synced(&mut self, space: &SpaceId) {
+        self.synced.insert(*space);
+    }
+
+    /// What the successor `new` changed of who is in the space it
+    /// succeeds, where that space is held here.
+    pub fn changes_of(&self, new: &SpaceId) -> Option<plan::Changes> {
+        let sp = self.spaces.get(new)?.space.as_ref()?;
+        let old = self.spaces.get(&sp.succeeds()?)?.space.as_ref()?;
+        Some(plan::changes(old, sp))
+    }
+
+    /// The person cleared the note of how the group moved to `space`.
+    pub fn moved_seen(&mut self, space: &SpaceId) {
+        if let Some(h) = self.spaces.get_mut(space) {
+            if !h.notes.moved_seen {
+                h.notes.moved_seen = true;
+                h.save_notes();
+            }
+        }
     }
 
     /// How much work of this device's is held back from `space`, until its
@@ -936,6 +977,13 @@ impl Core {
         if !asked && self.spaces[into].post_marks.get(from) == Some(&mark) {
             return Ok(out);
         }
+        // Who is there is known only once the space was reconciled with
+        // someone who holds it, since this device followed: an addition
+        // after its genesis may not have come yet, and work would go
+        // where someone is that it was written without.
+        if !asked && !self.synced.contains(into) {
+            return Ok(out);
+        }
         let (Some(fh), Some(ih)) = (self.spaces.get(from), self.spaces.get(into)) else {
             return Ok(out);
         };
@@ -967,6 +1015,8 @@ impl Core {
                     .is_some_and(|e| e.author() == me && e.signer() == here && !e.is_genesis())
             })
             .filter(|x| fs.state().is_accepted(x) && !fh.notes.not_work.contains(&hex::encode(x)))
+            // control ops alone, a `succeed` among them, are nobody's work
+            .filter(|x| fs.entry(x).is_some_and(plan::has_work))
             // what `into` holds itself, as when everyone returns to the old
             // space, or carried, or had posted again already
             .filter(|x| {

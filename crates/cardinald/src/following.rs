@@ -56,10 +56,38 @@ pub fn follow(d: &Arc<Daemon>) {
             }
         });
     }
+    // A successor is reconciled with a peer before anything is posted
+    // again there: who is in it is known only then.
+    let unsynced = d.core().unsynced_successors();
+    for space in unsynced {
+        {
+            let mut busy = SYNCING.lock().unwrap_or_else(|e| e.into_inner());
+            if busy.contains(&space) {
+                continue;
+            }
+            busy.push(space);
+        }
+        let d2 = d.clone();
+        d.rt.spawn(async move {
+            let heard = reconcile_with_peers(&d2, &space).await;
+            SYNCING
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .retain(|s| *s != space);
+            if heard {
+                d2.core().mark_synced(&space);
+                let d3 = d2.clone();
+                let _ = tokio::task::spawn_blocking(move || follow(&d3)).await;
+            }
+        });
+    }
     if any {
         d.bump();
     }
 }
+
+/// The successors being reconciled before posting again.
+static SYNCING: std::sync::Mutex<Vec<SpaceId>> = std::sync::Mutex::new(Vec::new());
 
 /// The successors whose initial state is being fetched.
 static FETCHING: std::sync::Mutex<Vec<SpaceId>> = std::sync::Mutex::new(Vec::new());
