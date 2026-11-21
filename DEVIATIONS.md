@@ -1679,12 +1679,49 @@ asks for around that is not built yet.
     which none of this applies. Addresses on the device's own interfaces
     are not looked at: a global IPv6 address behind a firewall would name
     a device nobody reaches.
-  - **Turned off is `cardinal router off`** (`config.port_mapping`
-    false): it stops asking the router, gives the port back, and the
-    device takes itself out. There is no separate switch for asking
-    without naming. `cardinal host --off` also forgets what the device
-    named itself at, so it names itself again only from the next address,
-    and only where every other member is trusted.
+  - **Turned off** stops asking the router, gives the port back, and the
+    device takes itself out. Two switches (D76): `cardinal router off`
+    (`router` with `on` false) writes a setting node (kind 6, name `ask
+    routers`, value false) in the account, for every device of the
+    person's; `cardinal router off --this-device` (`this_device` true)
+    sets this device's `port_mapping`. Asking needs both on. **Reading:**
+    the text's "each device has its own setting ... and one switch turns
+    off asking any router" is read as one switch for all the person's
+    devices; a setting that any value says false is off. `router on`
+    turns the account's switch on and this device's too. There is no
+    separate switch for asking without naming. `cardinal host --off`
+    also forgets what the device named itself at, so it names itself
+    again only from the next address, and only where every other member
+    is trusted.
+  - **Only on the person's networks** (D76, `networks.rs`). A network is
+    its default gateway's hardware address, read from `/proc/net/route`
+    and `/proc/net/arp`; where the neighbour table has no complete entry
+    yet, one empty datagram to the gateway's discard port (9) makes one,
+    and nothing is asked of the router. The account keeps a network node
+    (kind 15): field 1 the six bytes of the address, field 2 mine, field
+    3 the name the person gave (`--name`), else none.
+    - **Reading: two answers at once** for one network, a yes and a no,
+      are a no, as no is the default. A network with no node is not
+      answered, which is a no too.
+    - **Where the router cannot be told** (no default route, or a system
+      that does not say which is the gateway: Windows, Android), no
+      network can be marked, so no router is asked there. Before D76 UPnP
+      found one by itself on such systems.
+    - **Off the person's networks** the device asks nothing and sends the
+      router nothing. A mapping it held on its own network is let go
+      without a word (it lapses at the old router), the addresses it named
+      stay named, and it names no new one. The loop looks every second for
+      another network, or a mark, and asks at once on one marked as theirs.
+    - **For clients**: `status` and `network` give `network`: `known`,
+      `router`, `name`, `answered`, `mine`, `ask` (a known network not
+      answered for, on a device whose switches are on: show the quiet
+      "Is this your network?") and `routers`. `network` with `mine` true
+      or false (and `name`) answers for the network the device is on now.
+      `router` in `status` gives `this_device`, `everywhere` and `network`
+      too.
+    - **Tests** name the router's address with
+      `CARDINAL_TEST_ROUTER_MAC` (or `none`), beside
+      `CARDINAL_TEST_GATEWAY`.
   - **Told apart by what it serves.** Its grant offers mailbox,
     rendezvous and relay, and no storage; an explicit host's always
     offers storage. Every device of the person reads it that way, since

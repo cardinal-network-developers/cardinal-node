@@ -530,6 +530,7 @@ while True:
     b, addr = s.recvfrom(1100)
     if len(b) < 60 or b[0] != 2 or b[1] != 1:
         continue
+    print(f"pcp: asked by {addr[0]}", flush=True)
     lifetime = struct.unpack(">I", b[4:8])[0]
     internal, wanted = struct.unpack(">HH", b[40:44])
     key = (addr[0], internal)
@@ -569,6 +570,8 @@ def mapped():
         d.env["CARDINAL_TEST_HOLD_SECS"] = "3"
     laptop.start()
     laptop.cli("init", "--yes", "--name", "Daniel")
+    # D76: only on a network Daniel said is his is the router asked.
+    laptop.cli("network", "mine", "--name", "dan-home")
     got = wait("a port", 30, lambda: laptop.status()["router"].get("external"))
     print(f"mapped:\n    the router gave the laptop {laptop.status()['router'].get('external')} "
           f"after {got and round(got, 1)} s", flush=True)
@@ -615,6 +618,41 @@ def mapped():
     sh("for n in $(ip netns list | cut -d' ' -f1); do ip netns del $n; done", check=False)
 
 
+def unmarked():
+    """D76. The same laptop at his cousin's, whose router answers PCP. Nobody
+    said this network is Daniel's: the laptop sends the router no request,
+    is given no port, and names itself nowhere, and status asks whether
+    this is his network. Then it is marked, as at home, and asked."""
+    net = Net()
+    net.router("cousin-home", "internet", "198.51.101.10", "198.51.101.1", "192.168.2", "hard")
+    pcp_log = open(f"{WORK}/pcp-cousin.log", "w")
+    pcp = subprocess.Popen(["ip", "netns", "exec", "cousin-home", "python3", "-I", "-c",
+                            PCP_ROUTER, "198.51.101.10"], stdout=pcp_log, stderr=pcp_log)
+    laptop = Dev(net, "carbonite", "cousin-home", 3)
+    laptop.env["CARDINAL_TEST_HOLD_SECS"] = "3"
+    laptop.start()
+    laptop.cli("init", "--yes", "--name", "Daniel")
+    time.sleep(15)
+    st = laptop.status()
+    r, n = st["router"], st["network"]
+    asked = open(f"{WORK}/pcp-cousin.log").read().count("asked by")
+    print("unmarked:", flush=True)
+    print(f"    the network is known by its router {n.get('router')}, marked: {n.get('mine')}, "
+          f"ask the person: {n.get('ask')}", flush=True)
+    print(f"    after 15 s the router was asked {asked} times; port: {r.get('external')}, "
+          f"named at: {r.get('named')}", flush=True)
+    ok = asked == 0 and not r.get("external") and not r.get("named") and n.get("ask") is True
+    laptop.cli("network", "mine")
+    got = wait("a port", 30, lambda: laptop.status()["router"].get("external"))
+    print(f"    marked as his, the router gave {laptop.status()['router'].get('external')} "
+          f"after {got and round(got, 1)} s", flush=True)
+    print(f"    {'PASS' if ok and got else 'FAIL'}", flush=True)
+    laptop.stop()
+    pcp.kill()
+    pcp_log.close()
+    sh("for n in $(ip netns list | cut -d' ' -f1); do ip netns del $n; done", check=False)
+
+
 os.makedirs(SOCKETS, exist_ok=True)
 os.makedirs(WORK, exist_ok=True)
 if "trace" in WHICH:
@@ -630,6 +668,8 @@ if "people" in WHICH:
     people()
 if "mapped" in WHICH:
     mapped()
+if "unmarked" in WHICH:
+    unmarked()
 if "cousin" in WHICH:
     cousin("easy", "his home behind an ordinary router")
     cousin("cgnat", "his home behind carrier-grade NAT")

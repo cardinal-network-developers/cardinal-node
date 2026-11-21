@@ -180,7 +180,7 @@ pub fn next(
 pub fn due(d: &Daemon) -> bool {
     let o = d.outside.lock().unwrap_or_else(|e| e.into_inner()).clone();
     let have = crate::portmap::external(d);
-    let on = d.config().port_mapping;
+    let on = crate::networks::routers_on(d);
     let (_, write) = next(&o, on, have, now(), hold());
     write
 }
@@ -275,7 +275,7 @@ pub fn tick(d: &Arc<Daemon>) {
     if d.core().account().and_then(|a| a.space.as_ref()).is_none() {
         return;
     }
-    let on = d.config().port_mapping;
+    let on = crate::networks::routers_on(d);
     let have = crate::portmap::external(d);
     let all = d.outside.lock().unwrap_or_else(|e| e.into_inner()).clone();
     let was = all.named.clone();

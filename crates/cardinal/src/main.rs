@@ -324,12 +324,31 @@ enum Cmd {
         #[command(subcommand)]
         cmd: ClipCmd,
     },
-    /// Whether this device asks your router for a port (PCP, NAT-PMP or
-    /// UPnP), and names itself where your trusted contacts can find it at
-    /// the address the router gives. With nothing, says what it does now.
+    /// Whether your devices ask the router for a port (PCP, NAT-PMP or
+    /// UPnP), and name themselves where your trusted contacts can find
+    /// them at the address it gives. They do so only on networks you said
+    /// are yours (`cardinal network`). `off` turns it off on every device
+    /// of yours; with `--this-device`, on this one alone. With nothing,
+    /// says what this device does now.
     Router {
         #[arg(value_parser = ["on", "off"])]
         setting: Option<String>,
+        /// Only this device.
+        #[arg(long)]
+        this_device: bool,
+    },
+    /// Which network this device is on, known by its router, and whether
+    /// it is yours. Only on your own networks do your devices ask the
+    /// router for a port and name themselves at the address it gives: a
+    /// router at someone else's house is left alone. Your answer holds on
+    /// all your devices.
+    Network {
+        /// `mine` or `not-mine`.
+        #[arg(value_parser = ["mine", "not-mine"])]
+        setting: Option<String>,
+        /// What to call it, such as its Wi-Fi name.
+        #[arg(long)]
+        name: Option<String>,
     },
     /// Make this device a host for your own devices: it keeps a full copy
     /// of your files, and can bring them back if every other device is lost.
@@ -1039,6 +1058,11 @@ async fn read_words(
 fn print_router(router: &Value) {
     if router["on"] == json!(false) {
         println!("Router: not asked for a port (`cardinal router on` asks it).");
+    } else if router["network"]["mine"] != json!(true) {
+        println!(
+            "Router: not asked for a port: this is not a network you said is yours \
+             (`cardinal network mine` if it is)."
+        );
     } else if let Some(at) = router["external"].as_str() {
         println!(
             "Router: reaches this device from outside at {at} ({}).",
@@ -1061,6 +1085,33 @@ fn print_router(router: &Value) {
              stops it).",
             named.join(", ")
         );
+    }
+}
+
+/// The network this device is on, and whether it is the person's.
+fn print_network(v: &Value) {
+    if v["known"] != json!(true) {
+        println!("This device cannot tell which network it is on: it sees no router.");
+        return;
+    }
+    let router = v["router"].as_str().unwrap_or("");
+    let called = v["name"]
+        .as_str()
+        .map(|n| format!(" ({n})"))
+        .unwrap_or_default();
+    match (v["answered"] == json!(true), v["mine"] == json!(true)) {
+        (_, true) => println!(
+            "This network{called}, router {router}, is yours: your devices ask its router for \
+             a port here."
+        ),
+        (true, false) => println!(
+            "This network{called}, router {router}, is not yours: your devices leave its \
+             router alone."
+        ),
+        (false, _) => println!(
+            "Is this your network? Router {router}. Until you say so, your devices leave its \
+             router alone: `cardinal network mine` or `cardinal network not-mine`."
+        ),
     }
 }
 
@@ -1798,6 +1849,12 @@ fn print_status(v: &Value) {
         }
     }
     print_router(&v["router"]);
+    if v["network"]["ask"] == json!(true) {
+        println!(
+            "Network: is this your network? `cardinal network mine` lets your devices ask its \
+             router for a port; until then they leave it alone."
+        );
+    }
     println!("Devices:");
     print_devices(&v["devices"]);
     let p = &v["progress"];
@@ -2906,24 +2963,46 @@ async fn client(cmd: Cmd) -> anyhow::Result<()> {
             );
             Ok(())
         }
-        Cmd::Router { setting } => {
+        Cmd::Router {
+            setting,
+            this_device,
+        } => {
             let mut req = json!({"cmd": "router"});
             if let Some(s) = &setting {
                 req["on"] = json!(s == "on");
+                req["this_device"] = json!(this_device);
             }
             let v = call(&paths, req).await?;
+            let which = if this_device {
+                "This device"
+            } else {
+                "Your devices"
+            };
             match setting.as_deref() {
                 Some("off") => println!(
-                    "This device no longer asks your router for a port, and no longer names \
-                     itself as a host where it was named at one."
+                    "{which} no longer ask a router for a port, and no longer name \
+                     themselves as a host where they were named at one."
                 ),
                 Some(_) => println!(
-                    "This device asks your router for a port, and names itself as a host at \
-                     the address it gives, where every other member is a trusted contact."
+                    "{which} ask the router for a port on networks you said are yours, and \
+                     name themselves as a host at the address it gives, where every other \
+                     member is a trusted contact."
                 ),
                 None => {}
             }
             print_router(&v);
+            Ok(())
+        }
+        Cmd::Network { setting, name } => {
+            let mut req = json!({"cmd": "network"});
+            if let Some(s) = &setting {
+                req["mine"] = json!(s == "mine");
+            }
+            if let Some(n) = &name {
+                req["name"] = json!(n);
+            }
+            let v = call(&paths, req).await?;
+            print_network(&v);
             Ok(())
         }
         Cmd::Host { addresses, off } => {

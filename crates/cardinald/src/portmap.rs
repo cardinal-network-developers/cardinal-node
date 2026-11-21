@@ -401,29 +401,36 @@ pub fn external(d: &Daemon) -> Option<SocketAddr> {
 /// Everything `status` says of the router: whether this device asks it
 /// (`cardinal router on|off`), what it gave or why it gave nothing, and the
 /// outside addresses this device names itself at (D72).
+///
+/// `on` is whether this device asks routers at all: its own switch
+/// (`this_device`) and the account's, for every device (`everywhere`),
+/// both on. It asks only on a network its person said is theirs (D76):
+/// `network` says which this is.
 pub fn status(d: &Daemon) -> Json {
-    let on = d.config().port_mapping;
+    let on = crate::networks::routers_on(d);
     let mut v = d.portmap.lock().unwrap_or_else(|e| e.into_inner()).status();
     if !v.is_object() {
         v = json!({});
     }
     v["on"] = json!(on);
+    v["this_device"] = json!(d.config().port_mapping);
+    let everywhere = {
+        let core = d.core();
+        let acc = core.account().and_then(|a| a.space.as_ref());
+        acc.is_none_or(|a| crate::networks::account_allows(a.state()))
+    };
+    v["everywhere"] = json!(everywhere);
     v["named"] = crate::outside::status(d);
+    v["network"] = crate::networks::status(d);
     v
 }
 
 /// Turns port mapping, and with it naming this device as a host at the
-/// address the router gives (D72), on or off, for good. Off, the port is
-/// given back and the device takes itself out of the lists that name it.
-pub fn set_on(d: &Arc<Daemon>, on: bool) -> anyhow::Result<()> {
-    d.config().port_mapping = on;
-    d.save_config()?;
-    if on {
-        tokio::spawn(keep(d.clone()));
-    } else if !d.portmap.lock().unwrap_or_else(|e| e.into_inner()).running {
-        crate::outside::tick(d);
-    }
-    Ok(())
+/// address the router gives (D72), on or off, for good: on this device
+/// alone, or on every device of the person's. Off, the port is given back
+/// and the device takes itself out of the lists that name it.
+pub fn set_on(d: &Arc<Daemon>, on: bool, this_device: bool) -> anyhow::Result<()> {
+    crate::networks::set_routers(d, on, this_device)
 }
 
 /// Another of this person's devices that is reached at `at`: a host whose
@@ -574,7 +581,7 @@ pub async fn keep(d: Arc<Daemon>) {
                 .filter(|(m, _)| Some(m.internal_port) == port)
                 .map(|(m, _)| (m.protocol, m.external.port()))
         };
-        if !d.config().port_mapping {
+        if !crate::networks::routers_on(&d) {
             let held = d
                 .portmap
                 .lock()
@@ -592,6 +599,33 @@ pub async fn keep(d: Arc<Daemon>) {
             }
             crate::outside::tick(&d);
             return;
+        }
+        // Only on a network the person said is theirs (D76). Anywhere
+        // else nothing is asked of the router, and nothing sent to it: a
+        // mapping held on another network is let go without a word to
+        // this one's router, and lapses there.
+        let router = crate::networks::find_router().await;
+        if !router.is_some_and(|_| crate::networks::on_mine(&d)) {
+            let dropped = {
+                let mut st = d.portmap.lock().unwrap_or_else(|e| e.into_inner());
+                st.why_not = Some(match router {
+                    Some(_) => "not asked: this is not a network you said is yours".to_owned(),
+                    None => "not asked: this device cannot tell which network it is on".to_owned(),
+                });
+                st.mapping.take().is_some()
+            };
+            if dropped {
+                d.bump();
+            }
+            crate::outside::tick(&d);
+            loop {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                let moved = crate::networks::router_now() != router;
+                if moved || !crate::networks::routers_on(&d) || crate::networks::on_mine(&d) {
+                    break;
+                }
+            }
+            continue;
         }
         // The port outside a UPnP router gave this one, to renew; and the
         // one to ask any router for, which it gives again on a renewal.
@@ -644,7 +678,11 @@ pub async fn keep(d: Arc<Daemon>) {
                 .udp_addr()
                 .filter(|a| !a.ip().is_loopback())
                 .map(|a| a.port());
-            if now != port || !d.config().port_mapping {
+            if now != port || !crate::networks::routers_on(&d) {
+                break;
+            }
+            // Moved to another network, or this one is no longer marked.
+            if crate::networks::router_now() != router || !crate::networks::on_mine(&d) {
                 break;
             }
             // An address held long enough is named without waiting for

@@ -62,6 +62,16 @@ fn router() -> (u16, Asked) {
     (port, asked)
 }
 
+/// The stand-in router's hardware address.
+const ROUTER_MAC: &str = "02:00:5e:10:00:01";
+
+/// The person says this is their network: only there is the router asked
+/// (D76).
+fn mine(d: &Dev) {
+    let said = d.cli(&["network", "mine", "--name", "Home"]);
+    assert!(said.contains("is yours"), "{said}");
+}
+
 /// A device on every interface, as a device is (on loopback alone no
 /// router is asked), with the stand-in router as its gateway.
 fn start_behind(d: &mut Dev, router: u16) {
@@ -71,6 +81,9 @@ fn start_behind(d: &mut Dev, router: u16) {
     ));
     // An address is named once the router has given it this long.
     d.env.push(("CARDINAL_TEST_HOLD_SECS".into(), "2".into()));
+    // The router's hardware address, which knows the network (D76).
+    d.env
+        .push(("CARDINAL_TEST_ROUTER_MAC".into(), ROUTER_MAC.into()));
     let log = std::fs::File::create(d.home.join("daemon.log")).unwrap();
     let child = d
         .cmd()
@@ -133,6 +146,7 @@ fn a_device_the_router_gives_a_port_names_itself_to_a_trusted_contact() {
     let mut a = Dev::new(root.path(), "ana", free_port());
     start_behind(&mut a, at);
     a.cli(&["init", "--yes", "--name", "Ana"]);
+    mine(&a);
     let want = format!("203.0.113.5:{}", a.port);
     wait("a port from the router", 20, || {
         a.status()["router"]["external"] == want.as_str()
@@ -170,7 +184,10 @@ fn a_device_the_router_gives_a_port_names_itself_to_a_trusted_contact() {
     let r = &a.status()["router"];
     assert_eq!(r["on"], false, "{r}");
     assert_eq!(r["named"], json!([]), "{r}");
-    assert!(r["external"].is_null(), "the port was not given back: {r}");
+    // The port is given back at the loop's next look, within a second.
+    wait("the port is given back", 10, || {
+        a.status()["router"]["external"].is_null()
+    });
     let said = a.cli(&["router"]);
     assert!(said.contains("`cardinal router on`"), "{said}");
     let _ = a.try_cli(&["stop"]);
@@ -190,6 +207,7 @@ fn a_contact_who_is_not_trusted_is_not_told() {
     let mut a = Dev::new(root.path(), "ana", free_port());
     start_behind(&mut a, at);
     a.cli(&["init", "--yes", "--name", "Ana"]);
+    mine(&a);
     let want = format!("203.0.113.5:{}", a.port);
     wait("it names itself", 20, || {
         a.status()["router"]["named"] == json!([want])
@@ -249,6 +267,7 @@ fn a_mapping_where_another_device_is_reached_is_given_back() {
     });
     laptop.stop();
     start_behind(&mut laptop, at);
+    mine(&laptop);
     let mut external = String::new();
     wait("a port from the router", 30, || {
         external = laptop.status()["router"]["external"]

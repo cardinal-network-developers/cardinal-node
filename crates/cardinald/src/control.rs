@@ -507,10 +507,18 @@ async fn handle(d: &Arc<Daemon>, req: &Value) -> anyhow::Result<Value> {
         "host-off" => crate::host::disable(d),
         "router" => {
             if let Some(on) = req.get("on").and_then(|v| v.as_bool()) {
-                crate::portmap::set_on(d, on)?;
+                let here = req.get("this_device").and_then(|v| v.as_bool()) == Some(true);
+                crate::portmap::set_on(d, on, here)?;
             }
             Ok(crate::portmap::status(d))
         }
+        "network" => match req.get("mine").and_then(|v| v.as_bool()) {
+            Some(mine) => {
+                let name = req.get("name").and_then(|v| v.as_str());
+                crate::networks::mark(d, mine, name)
+            }
+            None => Ok(crate::networks::status(d)),
+        },
         "recovery-sheet" => crate::host::sheet(d),
         "guardians" => crate::guardians::show(d),
         "guardians-set" => crate::guardians::set(
@@ -1007,6 +1015,7 @@ fn status(d: &Arc<Daemon>) -> Value {
     json!({
         "name": cfg.name,
         "router": crate::portmap::status(d),
+        "network": crate::networks::status(d),
         "home": d.paths.home.display().to_string(),
         "identity": identity,
         "listen": d.endpoint.tcp_addr().map(|a| a.to_string()),

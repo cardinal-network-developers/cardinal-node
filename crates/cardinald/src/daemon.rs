@@ -2106,7 +2106,7 @@ impl Daemon {
             }
         });
         self.housekeeping();
-        if self.config().port_mapping {
+        if crate::networks::routers_on(&self) {
             tokio::spawn(crate::portmap::keep(self.clone()));
         }
 

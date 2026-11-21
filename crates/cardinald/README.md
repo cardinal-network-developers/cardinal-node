@@ -355,6 +355,14 @@ records "not this host here" in the account, D75; answers `named`:
 `group-reach` (`share`; with `share` false, `host` takes out that one
 host, answering `taken_out`; `groups` gives each group's `reach` with
 `set` and `said_no`),
+`router` (`on`, with `this_device` true for this device alone, else
+for every device of the person's: the account's switch; answers what
+`status` gives as `router`), `network` (with nothing: the network this
+device is on, `{known, router, name, answered, mine, ask, routers}`;
+with `mine` true or false, and `name`, the person's answer to "Is this
+your network?" for it, kept in the account for all their devices, D76;
+`ask` true is when a client shows that question, quietly; `status` gives
+the same as `network`),
 `speedtest` (one device, by
 name or key), `reload` (after `init` while the daemon runs), `flush`
 (commit now), `stop`. `status` includes `copies`: per device meant to
