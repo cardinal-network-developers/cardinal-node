@@ -416,7 +416,8 @@ place: its owner left this person out, handed it on, made it public, or
 put something in its place that does not match it), `held_back` (how
 much of what this device wrote before the group moved on waits for
 `group-post-again`, since someone is in it now that it was written
-without) and `did_not_stand` (successors this person's devices made that
+without), `not_posted` (how much was not posted again because this
+person's role there no longer allows it) and `did_not_stand` (successors this person's devices made that
 another took the place of: they do again what each was for).
 
 A device posts again, in the group that stands, what it wrote that the
