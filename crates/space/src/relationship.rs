@@ -871,3 +871,54 @@ pub fn guardian_persona_at(space: &Space, author: &IdentityId) -> Option<usize> 
         .filter_map(|n| dag.position(&n.created_in))
         .max()
 }
+
+/// `create` of a held copy node naming the set as the account of whom a
+/// recovery is of (field 2): the one a new device must have back (D80).
+pub fn create_held_account(label: &[u8; 32]) -> SpaceOp {
+    SpaceOp::create(
+        NodeKind::Uint(HELD_COPY),
+        ROOT,
+        "held copy",
+        Record::new()
+            .with(1, *label)
+            .with(2, true)
+            .with(AUTHOR_OWNED_FIELD, 1u64),
+    )
+}
+
+/// The set `author` names as the account, in held copy nodes.
+pub fn held_account(space: &Space, author: &IdentityId) -> Option<[u8; 32]> {
+    space
+        .state()
+        .children(&ROOT)
+        .into_iter()
+        .filter(|n| n.kind == NodeKind::Uint(HELD_COPY) && !n.deleted && n.creator == *author)
+        .find(|n| as_created(n, 2).and_then(Value::as_bool) == Some(true))
+        .and_then(|n| as_created(n, 1)?.as_bytes()?.try_into().ok())
+}
+
+/// Held copy full kind: the author holds the set `1` for the other member,
+/// and it reached their cap: it no longer updates. Not in the
+/// specification.
+pub const HELD_FULL: u64 = 68;
+
+/// `create` of a held copy full node.
+pub fn create_held_full(label: &[u8; 32]) -> SpaceOp {
+    SpaceOp::create(
+        NodeKind::Uint(HELD_FULL),
+        ROOT,
+        "held copy full",
+        Record::new().with(1, *label).with(AUTHOR_OWNED_FIELD, 1u64),
+    )
+}
+
+/// Who says, in a relationship space, that a copy they hold is full.
+pub fn held_full(space: &Space) -> Vec<(IdentityId, [u8; 32])> {
+    space
+        .state()
+        .children(&ROOT)
+        .into_iter()
+        .filter(|n| n.kind == NodeKind::Uint(HELD_FULL) && !n.deleted)
+        .filter_map(|n| Some((n.creator, as_created(n, 1)?.as_bytes()?.try_into().ok()?)))
+        .collect()
+}
