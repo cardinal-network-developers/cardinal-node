@@ -2024,6 +2024,7 @@ async fn act(
             g.name
         )
     })?;
+    let confirms = matches!(op.body(), OpBody::Confirm { .. });
     let log: Vec<Vec<u8>> = h
         .on(move |pd| async move {
             let (entry, log) = {
@@ -2054,6 +2055,11 @@ async fn act(
     for (c, r) in helpers_with_recover(&h.d, &g.identity) {
         if r != Some(decision) {
             continue;
+        }
+        // with a confirm, this person's own log first, so that it is
+        // there when the recovery is in effect for the new device
+        if confirms {
+            carry_own_log(d, &h, c.space).await;
         }
         let (space, who, log) = (c.space, g.identity, log.clone());
         if let Err(e) = h
@@ -2296,9 +2302,14 @@ async fn met_helper(d: &Arc<Daemon>, h: &Arc<Helper>, space: SpaceId, g: &Guarde
     let confirmed = wanted(d, g)
         .iter()
         .any(|w| w.confirmed.contains(&g.persona.identity));
-    if !confirmed {
-        return;
+    if confirmed {
+        carry_own_log(d, h, space).await;
     }
+}
+
+/// Carries this person's own log, under their own id, to a recovery
+/// helper in `space`: once this guardian has confirmed.
+async fn carry_own_log(d: &Arc<Daemon>, h: &Arc<Helper>, space: SpaceId) {
     let mine: Option<([u8; 32], Vec<Vec<u8>>)> = {
         let core = d.core();
         core.identity
