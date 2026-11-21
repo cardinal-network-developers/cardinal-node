@@ -10,12 +10,19 @@
 //!   cannot hold it all (`SupportedCapabilities`' `MaxAdvLen`), or refuses
 //!   it, the advertisement has the UUID and the scan response one short tag
 //!   (`ScanResponseServiceData`, which BlueZ has only when run with
-//!   `--experimental`).
+//!   `--experimental`). Where the adapter takes a second advertisement, the
+//!   legacy one goes beside the full one, for scanners that see only
+//!   legacy advertisements.
 //! - **Scanning**: `SetDiscoveryFilter` (LE, the service UUID, duplicates
 //!   reported) and `StartDiscovery`; each `org.bluez.Device1` whose
 //!   `ServiceData` has the UUID is a sighting, again at each change of its
 //!   properties, its signal strength included. BlueZ stops the discovery
 //!   when this process leaves the bus.
+//! - **Privacy**: only with the controller's privacy on (BlueZ's
+//!   `Privacy = device`), read from the kernel's management interface or,
+//!   where that cannot be read, from `/etc/bluetooth/main.conf`. Without it
+//!   the adapter advertises and connects from its fixed public address, by
+//!   which anyone could follow the computer, and the radio is not used.
 //! - **Channels**: `AF_BLUETOOTH`, `SOCK_STREAM`, `BTPROTO_L2CAP` sockets
 //!   bound to an LE address type, so the kernel makes LE credit-based
 //!   channels, at security level low: no Bluetooth pairing, since the link
@@ -51,8 +58,10 @@ pub struct BlueZ {
     bus: Mutex<Option<Connection>>,
     /// Another bus than the system's, for tests.
     address: Option<String>,
-    /// Refreshes of the advertisement, for object paths and legacy turns.
+    /// Advertisements registered, for their object paths.
     made: AtomicU64,
+    /// Refreshes of the advertisement: whose turn a legacy one is.
+    turn: AtomicU64,
 }
 
 impl Default for BlueZ {
@@ -73,6 +82,7 @@ impl BlueZ {
             bus: Mutex::new(None),
             address: std::env::var("CARDINAL_TEST_BLUEZ_BUS").ok(),
             made: AtomicU64::new(0),
+            turn: AtomicU64::new(0),
         }
     }
 
@@ -173,6 +183,57 @@ impl Known {
             addr: self.addr?,
             data: self.data.clone()?,
         })
+    }
+}
+
+/// The most devices whose properties are kept.
+const DEVICES_MAX: usize = 300;
+
+/// What is known of devices, by object path, at most [`DEVICES_MAX`]: the
+/// one heard from longest ago goes first.
+#[derive(Default)]
+struct Devices {
+    by_path: HashMap<OwnedObjectPath, (Known, u64)>,
+    next: u64,
+}
+
+impl Devices {
+    fn update(&mut self, path: OwnedObjectPath, props: &Props) -> &Known {
+        if !self.by_path.contains_key(&path) && self.by_path.len() >= DEVICES_MAX {
+            let oldest = self
+                .by_path
+                .iter()
+                .min_by_key(|(_, (_, n))| *n)
+                .map(|(p, _)| p.clone());
+            if let Some(p) = oldest {
+                self.by_path.remove(&p);
+            }
+        }
+        self.next += 1;
+        let n = self.next;
+        let (k, at) = self.by_path.entry(path).or_insert((
+            Known {
+                addr: None,
+                data: None,
+            },
+            n,
+        ));
+        *at = n;
+        k.update(props);
+        k
+    }
+
+    fn remove(&mut self, path: &OwnedObjectPath) {
+        self.by_path.remove(path);
+    }
+
+    fn all(&self) -> impl Iterator<Item = &Known> {
+        self.by_path.values().map(|(k, _)| k)
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.by_path.len()
     }
 }
 
@@ -290,6 +351,149 @@ impl BlueZ {
 }
 
 // ---------------------------------------------------------------------
+// Privacy.
+
+/// Why a radio without privacy is not used, and what to do.
+pub const NO_PRIVACY: &str = "this computer's Bluetooth would send its fixed address, by which \
+     anyone could follow it: set `Privacy = device` under [General] in /etc/bluetooth/main.conf \
+     and restart Bluetooth (`systemctl restart bluetooth`)";
+
+/// The adapter's index, from its object path (`/org/bluez/hci0`).
+fn adapter_index(path: &str) -> Option<u16> {
+    path.rsplit('/').next()?.strip_prefix("hci")?.parse().ok()
+}
+
+/// Whether BlueZ's settings turn privacy on: `Privacy` under `[General]`,
+/// anything but `off` (the default).
+fn privacy_in_conf(conf: &str) -> bool {
+    let mut general = false;
+    for line in conf.lines() {
+        let line = line.trim();
+        if line.starts_with('#') || line.is_empty() {
+            continue;
+        }
+        if line.starts_with('[') {
+            general = line.eq_ignore_ascii_case("[general]");
+            continue;
+        }
+        if let Some((k, v)) = line.split_once('=') {
+            if general && k.trim() == "Privacy" {
+                return !v.trim().eq_ignore_ascii_case("off");
+            }
+        }
+    }
+    false
+}
+
+/// The kernel's management interface, for what BlueZ's D-Bus does not
+/// say: whether the controller uses resolvable private addresses.
+pub mod mgmt {
+    use super::*;
+
+    const AF_BLUETOOTH: libc::c_int = 31;
+    const BTPROTO_HCI: libc::c_int = 1;
+    const HCI_CHANNEL_CONTROL: u16 = 3;
+    const HCI_DEV_NONE: u16 = 0xffff;
+    /// Read Controller Information.
+    const READ_INFO: u16 = 0x0004;
+    /// Command Complete.
+    const COMPLETE: u16 = 0x0001;
+    /// The Privacy bit of the current settings.
+    const PRIVACY: u32 = 1 << 13;
+
+    #[repr(C)]
+    struct SockaddrHci {
+        family: libc::sa_family_t,
+        dev: u16,
+        channel: u16,
+    }
+
+    /// Whether controller `index` has privacy on, if the kernel says.
+    /// Reading controller information needs no privilege.
+    pub fn privacy(index: u16) -> Option<bool> {
+        // SAFETY: plain socket calls on a descriptor this function owns.
+        let fd = unsafe {
+            libc::socket(
+                AF_BLUETOOTH,
+                libc::SOCK_RAW | libc::SOCK_CLOEXEC,
+                BTPROTO_HCI,
+            )
+        };
+        if fd < 0 {
+            return None;
+        }
+        // SAFETY: `fd` is a new descriptor, owned from here.
+        let fd = unsafe { OwnedFd::from_raw_fd(fd) };
+        let addr = SockaddrHci {
+            family: AF_BLUETOOTH as libc::sa_family_t,
+            dev: HCI_DEV_NONE,
+            channel: HCI_CHANNEL_CONTROL,
+        };
+        // SAFETY: `addr` is a valid `sockaddr_hci` of the length given.
+        let r = unsafe {
+            libc::bind(
+                fd.as_raw_fd(),
+                &addr as *const SockaddrHci as *const libc::sockaddr,
+                std::mem::size_of::<SockaddrHci>() as libc::socklen_t,
+            )
+        };
+        if r < 0 {
+            return None;
+        }
+        let mut cmd = Vec::with_capacity(6);
+        cmd.extend_from_slice(&READ_INFO.to_le_bytes());
+        cmd.extend_from_slice(&index.to_le_bytes());
+        cmd.extend_from_slice(&0u16.to_le_bytes());
+        // SAFETY: writes `cmd.len()` bytes from `cmd`.
+        let n = unsafe { libc::write(fd.as_raw_fd(), cmd.as_ptr().cast(), cmd.len()) };
+        if n != cmd.len() as isize {
+            return None;
+        }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        let mut buf = vec![0u8; 1024];
+        while let Some(left) = deadline.checked_duration_since(std::time::Instant::now()) {
+            let mut p = libc::pollfd {
+                fd: fd.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            // SAFETY: one valid `pollfd`.
+            let r = unsafe { libc::poll(&mut p, 1, left.as_millis().max(1) as libc::c_int) };
+            if r <= 0 {
+                return None;
+            }
+            // SAFETY: reads at most `buf.len()` bytes into `buf`.
+            let n = unsafe { libc::read(fd.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len()) };
+            if n <= 0 {
+                return None;
+            }
+            if let Some(p) = privacy_in_reply(&buf[..n as usize], index) {
+                return p;
+            }
+        }
+        None
+    }
+
+    /// What an event on the control channel says of privacy:
+    /// `Some(Some(on))` for the answer to Read Controller Information for
+    /// `index`, `Some(None)` where that failed, `None` for another event.
+    pub fn privacy_in_reply(ev: &[u8], index: u16) -> Option<Option<bool>> {
+        let u16_at = |i: usize| Some(u16::from_le_bytes(ev.get(i..i + 2)?.try_into().ok()?));
+        if u16_at(0)? != COMPLETE || u16_at(2)? != index || u16_at(6)? != READ_INFO {
+            return None;
+        }
+        if *ev.get(8)? != 0 {
+            return Some(None);
+        }
+        // Address (6), version (1), manufacturer (2), supported (4), then
+        // the current settings.
+        let at = 9 + 6 + 1 + 2 + 4;
+        let current = u32::from_le_bytes(ev.get(at..at + 4)?.try_into().ok()?);
+        Some(Some(current & PRIVACY != 0))
+    }
+}
+
+// ---------------------------------------------------------------------
 // The radio.
 
 impl Radio for BlueZ {
@@ -316,6 +520,23 @@ impl Radio for BlueZ {
                     "Bluetooth is off on this computer ({})",
                     path.as_str()
                 )));
+            }
+            // Without privacy, the adapter advertises and connects from its
+            // fixed address, and anyone could follow this computer by it.
+            let index = adapter_index(path.as_str());
+            let private = match index {
+                Some(i) => tokio::task::spawn_blocking(move || mgmt::privacy(i))
+                    .await
+                    .ok()
+                    .flatten(),
+                None => None,
+            };
+            let private = private.or_else(|| {
+                let conf = std::fs::read_to_string("/etc/bluetooth/main.conf").ok()?;
+                Some(privacy_in_conf(&conf))
+            });
+            if private != Some(true) {
+                return Ok(Err(NO_PRIVACY.into()));
             }
             Ok(Ok(()))
         })
@@ -351,7 +572,7 @@ impl Radio for BlueZ {
 
     fn advertise(&self, keys: &Keys, psm: u16) -> RadioFuture<'_, Box<dyn Send>> {
         let full = keys.advert(psm).encode();
-        let n = self.made.load(Ordering::Relaxed) as usize;
+        let n = self.turn.fetch_add(1, Ordering::Relaxed) as usize;
         let legacy = keys.legacy(psm, n).and_then(|a| a.encode_legacy());
         Box::pin(async move {
             let bus = self.bus().await?;
@@ -359,21 +580,32 @@ impl Radio for BlueZ {
             let fits = max_adv_len(&bus, &adapter)
                 .await
                 .is_none_or(|max| full_len(&full) <= max);
+            let legacy_ad = || Advertisement {
+                data: None,
+                scan_response: legacy.clone(),
+            };
             if fits {
                 let ad = Advertisement {
                     data: Some(full),
                     scan_response: None,
                 };
                 match self.register(&bus, &adapter, ad).await {
-                    Ok(a) => return Ok(Box::new(a) as Box<dyn Send>),
+                    Ok(a) => {
+                        // A legacy one beside it, where the adapter has room,
+                        // for scanners that see no extended advertisement.
+                        let beside = match self.register(&bus, &adapter, legacy_ad()).await {
+                            Ok(b) => Some(b),
+                            Err(e) => {
+                                tracing::debug!("Bluetooth: no legacy advertisement beside: {e}");
+                                None
+                            }
+                        };
+                        return Ok(Box::new((a, beside)) as Box<dyn Send>);
+                    }
                     Err(e) => tracing::debug!("Bluetooth: a full advertisement: {e}"),
                 }
             }
-            let ad = Advertisement {
-                data: None,
-                scan_response: legacy,
-            };
-            let a = self.register(&bus, &adapter, ad).await?;
+            let a = self.register(&bus, &adapter, legacy_ad()).await?;
             Ok(Box::new(a) as Box<dyn Send>)
         })
     }
@@ -389,31 +621,45 @@ impl Radio for BlueZ {
             filter.insert("DuplicateData", Value::from(true));
             let r: Result<(), zbus::Error> = a.call("SetDiscoveryFilter", &(filter,)).await;
             r.map_err(dbus)?;
-            let rule = zbus::MatchRule::builder()
+            // Only what is said of devices: their properties changing, and
+            // their coming and going.
+            let changes = zbus::MatchRule::builder()
                 .msg_type(zbus::message::Type::Signal)
                 .sender(BLUEZ)
                 .map_err(dbus)?
+                .interface("org.freedesktop.DBus.Properties")
+                .map_err(dbus)?
+                .member("PropertiesChanged")
+                .map_err(dbus)?
+                .arg(0, DEVICE)
+                .map_err(dbus)?
                 .build();
-            let mut signals = zbus::MessageStream::for_match_rule(rule, &bus, Some(256))
+            let comings = zbus::MatchRule::builder()
+                .msg_type(zbus::message::Type::Signal)
+                .sender(BLUEZ)
+                .map_err(dbus)?
+                .interface("org.freedesktop.DBus.ObjectManager")
+                .map_err(dbus)?
+                .build();
+            let changes = zbus::MessageStream::for_match_rule(changes, &bus, Some(256))
                 .await
                 .map_err(dbus)?;
+            let comings = zbus::MessageStream::for_match_rule(comings, &bus, Some(64))
+                .await
+                .map_err(dbus)?;
+            let mut signals = futures_util::stream::select(changes, comings);
             let r: Result<(), zbus::Error> = a.call("StartDiscovery", &()).await;
             r.map_err(dbus)?;
             let (tx, rx) = mpsc::channel(64);
-            let mut known: HashMap<OwnedObjectPath, Known> = HashMap::new();
+            let mut known = Devices::default();
             for (path, ifaces) in all {
                 if let Some(props) = ifaces.get(DEVICE) {
-                    let mut k = Known {
-                        addr: None,
-                        data: None,
-                    };
-                    k.update(props);
-                    known.insert(path, k);
+                    known.update(path, props);
                 }
             }
             drop(a);
             tokio::spawn(async move {
-                for k in known.values() {
+                for k in known.all() {
                     if let Some(s) = k.sighting() {
                         let _ = tx.try_send(s);
                     }
@@ -427,6 +673,18 @@ impl Radio for BlueZ {
                     let header = msg.header();
                     let member = header.member().map(|m| m.as_str().to_owned());
                     let changed: Option<(OwnedObjectPath, Props)> = match member.as_deref() {
+                        Some("InterfacesRemoved") => {
+                            let gone = msg
+                                .body()
+                                .deserialize::<(OwnedObjectPath, Vec<String>)>()
+                                .ok();
+                            if let Some((p, ifaces)) = gone {
+                                if ifaces.iter().any(|i| i == DEVICE) {
+                                    known.remove(&p);
+                                }
+                            }
+                            None
+                        }
                         Some("InterfacesAdded") => msg
                             .body()
                             .deserialize::<(OwnedObjectPath, HashMap<String, Props>)>()
@@ -448,11 +706,7 @@ impl Radio for BlueZ {
                     let Some((path, props)) = changed else {
                         continue;
                     };
-                    let k = known.entry(path).or_insert(Known {
-                        addr: None,
-                        data: None,
-                    });
-                    k.update(&props);
+                    let k = known.update(path, &props);
                     if let Some(s) = k.sighting() {
                         if tx.send(s).await.is_err() {
                             break;
@@ -863,6 +1117,54 @@ mod tests {
             tags: vec![Tag::make(TagType::Own, &k, [1; 8]); 3],
         };
         assert!(full_len(&three.encode()) > 31);
+    }
+
+    #[test]
+    fn privacy_is_read_from_the_kernel_or_the_settings() {
+        // Command Complete for Read Controller Information on hci0.
+        let mut ev = vec![];
+        ev.extend_from_slice(&1u16.to_le_bytes());
+        ev.extend_from_slice(&0u16.to_le_bytes());
+        ev.extend_from_slice(&0u16.to_le_bytes()); // length, unread
+        ev.extend_from_slice(&4u16.to_le_bytes());
+        ev.push(0); // status
+        ev.extend_from_slice(&[0; 6 + 1 + 2 + 4]);
+        let mut on = ev.clone();
+        on.extend_from_slice(&(1u32 << 13 | 1).to_le_bytes());
+        let mut off = ev.clone();
+        off.extend_from_slice(&1u32.to_le_bytes());
+        assert_eq!(mgmt::privacy_in_reply(&on, 0), Some(Some(true)));
+        assert_eq!(mgmt::privacy_in_reply(&off, 0), Some(Some(false)));
+        assert_eq!(mgmt::privacy_in_reply(&on, 1), None, "another adapter's");
+        let mut failed = ev[..8].to_vec();
+        failed.push(0x0d);
+        assert_eq!(mgmt::privacy_in_reply(&failed, 0), Some(None));
+        assert_eq!(mgmt::privacy_in_reply(&[6, 0, 0, 0], 0), None);
+
+        assert!(!privacy_in_conf(""));
+        assert!(!privacy_in_conf("[General]\n#Privacy = device\n"));
+        assert!(privacy_in_conf("[General]\nName = x\nPrivacy = device\n"));
+        assert!(!privacy_in_conf("[General]\nPrivacy=off\n"));
+        assert!(!privacy_in_conf("[Policy]\nPrivacy = device\n"));
+        assert_eq!(adapter_index("/org/bluez/hci1"), Some(1));
+        assert_eq!(adapter_index("/org/bluez"), None);
+    }
+
+    #[test]
+    fn a_bounded_number_of_devices_is_kept() {
+        let mut devices = Devices::default();
+        let props: Props = HashMap::new();
+        for i in 0..DEVICES_MAX + 50 {
+            let p = OwnedObjectPath::try_from(format!("/org/bluez/hci0/dev_{i}")).unwrap();
+            devices.update(p, &props);
+        }
+        assert_eq!(devices.len(), DEVICES_MAX);
+        let first = OwnedObjectPath::try_from("/org/bluez/hci0/dev_0").unwrap();
+        assert!(!devices.by_path.contains_key(&first), "the oldest went");
+        let last =
+            OwnedObjectPath::try_from(format!("/org/bluez/hci0/dev_{}", DEVICES_MAX + 49)).unwrap();
+        devices.remove(&last);
+        assert_eq!(devices.len(), DEVICES_MAX - 1);
     }
 
     #[test]
