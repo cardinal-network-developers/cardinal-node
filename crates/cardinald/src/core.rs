@@ -1728,6 +1728,12 @@ impl Core {
         if !self.telling(space).keeps_current() {
             return None;
         }
+        // Nothing is written in a space that has ended: its successor
+        // carried the entry, and it is kept there.
+        let open = self.spaces.get(space).and_then(|h| h.space.as_ref());
+        if open.is_none_or(|s| s.ended()) {
+            return None;
+        }
         let here = *self.keys.link.public_key().x25519();
         let mut reach = self.reach_of(space, &me);
         if !reach.iter().any(|r| r.host == here) {
