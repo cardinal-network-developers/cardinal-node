@@ -656,15 +656,19 @@ What is not built:
 
 Readings:
 
-- **The cut** is the valid heads the writing device holds. **Field 8**
+- **The cut** is the valid heads the writing device holds. The owner's
+  device refuses to succeed a space while the identity log of anyone who
+  wrote in the cut's past is not here. **Field 8**
   pins, for each author of an entry in the cut's causal past whose log
   that device holds, that log's heads and those of every log held under
   its label, as `IdentityLog::all_heads` gives them, sorted. An author
   whose log it does not hold is not pinned, and is judged with none.
 - **A pinned log** is the log's genesis and its own entries that are a
-  pinned head or in a pinned head's causal past; what is held under its
-  label for other identities (a guardian's entries) is kept whole,
-  pinned or not (`space::succession::pinned_log`). The pinned logs are
+  pinned head or in a pinned head's causal past, and of each log held
+  under its label for another identity (a guardian's), the entries in
+  the causal past of its pinned heads (`space::succession::pinned_log`).
+  This last is not tested: nothing here sets up a guardian's log under a
+  succession. The pinned logs are
   evaluated together, with each other and nothing else. A device that
   lacks a pinned head of its own copy of a log cannot work out the state
   at the cut yet, and says so ("it cannot be checked yet").
@@ -677,11 +681,21 @@ Readings:
   the chunks. The writer and every follower keep the canonical state in
   `initial-state.bin` beside the successor, and open the successor on it
   when they start; until it is there, nothing of a successor is opened.
+  A successor whose `start` has no field 4 starts from an empty state,
+  and is followed only where the state at the cut is empty. What a
+  device made of a successor is not worked out again while nothing it
+  rests on changed: what the old space holds, the geneses here, the
+  identity logs. Geneses in the trail are kept once each, and each is
+  opened once.
 - **A member who holds no space before** (one added to a successor, or a
   device of theirs) fetches the blob the genesis names, from this
   person's devices or any contact in touch, who serves it as part of the
   groups the two share, and opens the successor on it unchecked: there is
   nothing to check it against (`spaces.md#what-comes-across`, "State").
+  Where the old space is held by the time the blob comes, it is refused,
+  and the successor is followed by checking instead. Where the old space
+  comes later, the successor is checked then, and left, with the person
+  told, if it does not match.
 - **Reading a canonical state back** (`State::from_canonical`). It does
   not record the place of the op that wrote each value: values of one
   entry keep the order they are listed in. Nor does it record the entry
@@ -689,10 +703,20 @@ Readings:
   entry that set its position (field 7), which is the one that created
   it unless it was moved since. Carried nodes need no `create`, rank
   first, and every entry of the successor descends from the entries that
-  wrote their values and positions; a carried value counts on a group's
-  name and member names whoever wrote it, since it was judged where it
-  was written. A carried read marker reads every carried message up to
-  the one it stands at, by rank.
+  wrote their values and positions. A carried read marker reads every
+  carried message up to the one it stands at, by rank. A canonical state
+  in which a parent is not a node it records, or a node is its own
+  ancestor, is refused.
+- **Spec question: who wrote a carried value.** A group counts only an
+  admin's say on its name, its introductions and its member nodes, and
+  a canonical state does not say who wrote a value, so a value a writer
+  set on one of those, which counted for nothing, would count after any
+  succession. Here a carried value counts for nothing there by itself:
+  the owner's first entry in the successor sets each of those fields
+  again to what the old space resolved (`group::reassert_ops`), and that
+  entry is nobody's work to post again. Until it arrives a follower shows
+  no group name. The specification could instead say that the state at a
+  cut leaves out what does not count, or record each value's author.
 - **Whom a successor names.** Every member of the group who has not
   left, with the highest role they hold, but whoever is taken out, and
   with the lower role for whoever is lowered. A member who had left is
@@ -740,11 +764,22 @@ Readings:
     successor that no longer stands, but its genesis and what was itself
     posted again, whose origin is posted instead. Into a fresh start,
     nothing.
-  - In log order, each in one entry, up to the first that has to wait;
-    what holds nothing to post again is noted and not looked at again.
-    Which entry stands for which is kept in `succession.json` beside the
-    successor: a crash between writing an entry and noting it would post
-    that work twice.
+  - Never what the space it goes into carried, by the entry the work was
+    first written as, from wherever it comes: work a device posted again
+    in a successor that did not stand is not posted again where the one
+    that stands carried it. A successor whose cut cannot be worked out
+    here (a pinned log missing) has nothing posted into it.
+  - In log order, each in one entry; one that has to wait waits, and the
+    rest go on. A node made by someone who is in the successor and may no
+    longer write there counts as gone, and is not waited for. What holds
+    nothing to post again is noted and not looked at again, and nothing
+    is gone through again while neither space changed.
+  - Which entry stands for which is kept in `succession.json` beside the
+    successor, and before an entry is written, the hash of its ops is
+    noted there: after a crash, an entry of this device's with those ops
+    is taken for it, and the work is not posted twice.
+  - Work not posted because the person's role there no longer allows it
+    is counted, and `groups` gives the count as `not_posted`.
   - "All were members of the space the work was written in" is read as:
     every member of the space that stands was ever a member of that space.
     Otherwise the work is held back, `groups` says how much, and
@@ -767,7 +802,11 @@ Readings:
   rotate with epochs here ([Hosts](#hosts-spechostsmd)), so none is
   replaced on following either: the reach nodes the successor carried,
   and with them the tokens, serve it until each member sets its own
-  afresh. A token given in an old space is taken for the space that
+  afresh. Where the succession left someone out, a host gives the
+  successor a token of its own in place of each one of its person's that
+  the successor carried (`Core::own_entry_due`); the old one stays active,
+  for those who have not followed, and nothing revokes it once everyone
+  has (step 3). A token given in an old space is taken for the space that
   stands in its place; an envelope left under one opens with whichever
   space of the succession holds the epoch it names, so that a member who
   followed first reaches one who has not yet; and a session opened with
