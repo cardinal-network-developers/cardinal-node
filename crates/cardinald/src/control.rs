@@ -71,7 +71,7 @@ pub fn serve(d: Arc<Daemon>) -> anyhow::Result<tokio::task::JoinHandle<()>> {
                         break;
                     }
                     let reply = match serde_json::from_str::<Value>(&line) {
-                        Ok(req) => match handle(&d, &req).await {
+                        Ok(req) => match handle(&d, &req).await.map_err(|e| capitalized(&req, e)) {
                             Ok(mut v) => {
                                 v["ok"] = json!(true);
                                 v
@@ -93,6 +93,26 @@ pub fn serve(d: Arc<Daemon>) -> anyhow::Result<tokio::task::JoinHandle<()>> {
             });
         }
     }))
+}
+
+/// An error of the guardians' and recovery requests, starting with a
+/// capital letter, as a window shows it word for word. Others are as
+/// they were.
+fn capitalized(req: &Value, e: anyhow::Error) -> anyhow::Error {
+    let cmd = req["cmd"].as_str().unwrap_or("");
+    let ours = cmd.starts_with("guardians")
+        || cmd.starts_with("guarding")
+        || cmd.starts_with("recover-")
+        || cmd == "recover";
+    if !ours || e.is::<crate::recovery::NeedsWords>() {
+        return e;
+    }
+    let text = format!("{e:#}");
+    let mut c = text.chars();
+    match c.next() {
+        Some(f) if f.is_lowercase() => anyhow::anyhow!("{}{}", f.to_uppercase(), c.as_str()),
+        _ => e,
+    }
 }
 
 /// Tells a client each time something changed, until it goes. An event says
@@ -334,8 +354,15 @@ async fn handle(d: &Arc<Daemon>, req: &Value) -> anyhow::Result<Value> {
                 via: req.get("via").and_then(|v| v.as_str()).map(str::to_owned),
                 ..Default::default()
             };
-            // the person's own accept: the only one that takes a recovery's
-            crate::contacts::accept(d, arg(req, "code")?, name, regard(req), met, true).await
+            // the person's own accept: the only one that takes a recovery's;
+            // `for`, whom a recovery invitation made for whomever this
+            // guardian names is for, as their contacts call them
+            let whom = match req.get("for").and_then(Value::as_str) {
+                Some(w) => Some(crate::contacts::find(d, w)?.identity),
+                None => None,
+            };
+            crate::contacts::accept_for(d, arg(req, "code")?, name, regard(req), met, true, whom)
+                .await
         }
         "invitations" => Ok(crate::contacts::invitations(d)),
         "cancel-invitation" => crate::contacts::cancel_invitation(d, arg(req, "id")?),

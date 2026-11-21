@@ -70,8 +70,7 @@ fn second_warning(name: &str, waiting: usize) -> String {
     format!(
         "{} recovery of {name} arrived while this one is under way. Someone else may be \
          trying to take their identity. Ask {name}, in person if you can, which is theirs; \
-         only this one is shown until you tell this device never to confirm it \
-         (`cardinal guarding never`).",
+         only this one is shown until you say never to confirm it.",
         if waiting == 1 {
             "Another"
         } else {
@@ -134,6 +133,25 @@ pub(crate) fn delay_text(secs: u64) -> String {
 /// `cardinal guardians`: who guards this person, as their own devices know
 /// it from the account space, and the policy as everyone sees it.
 pub fn show(d: &Daemon) -> anyhow::Result<Json> {
+    // whom this person asked, and who accepted, ready to be named
+    let (asked, ready) = {
+        let contacts: Vec<account::ContactRecord> = d
+            .core()
+            .contacts()
+            .into_iter()
+            .filter(|c| c.recovery_of.is_none() && !c.refused)
+            .collect();
+        let mut asked = Vec::new();
+        let mut ready = Vec::new();
+        for c in contacts {
+            if persona_of(&d.core(), &c).is_some() {
+                ready.push(c.petname.clone());
+            } else if asked_already(d, &c) {
+                asked.push(c.petname.clone());
+            }
+        }
+        (asked, ready)
+    };
     let core = d.core();
     let ident = core
         .identity
@@ -165,6 +183,18 @@ pub fn show(d: &Daemon) -> anyhow::Result<Json> {
             }))
         })
         .collect();
+    // whom each change names, and when this person made it
+    let made: Vec<(String, Json, Option<u64>)> = core
+        .account()
+        .and_then(|a| a.space.as_ref())
+        .map(|sp| {
+            account::settings_made(sp.state())
+                .into_iter()
+                .map(|(n, v, t)| (n, json!(v.as_text()), t))
+                .collect()
+        })
+        .unwrap_or_default();
+    let contacts = core.contacts();
     let changes: Vec<Json> = policy
         .as_ref()
         .map(|cur| {
@@ -172,12 +202,42 @@ pub fn show(d: &Daemon) -> anyhow::Result<Json> {
                 .into_iter()
                 .filter(|(id, _)| !st.in_effect.contains(id))
                 .map(|(id, p)| {
+                    let key = format!("{NAMED_SETTING}{}", hex::encode(id));
+                    let (names, since) = made
+                        .iter()
+                        .find(|(n, _, _)| *n == key)
+                        .map(|(_, v, t)| {
+                            let names: Vec<String> = v
+                                .as_str()
+                                .unwrap_or("")
+                                .split(',')
+                                .filter_map(|pair| {
+                                    let c: [u8; 32] =
+                                        hex::decode(pair.split_once(':')?.0).ok()?.try_into().ok()?;
+                                    contacts
+                                        .iter()
+                                        .find(|x| x.identity == c)
+                                        .map(|x| x.petname.clone())
+                                })
+                                .collect();
+                            (names, *t)
+                        })
+                        .unwrap_or_default();
+                    let objected = objected(&ident.log, &id);
+                    let wait = cur.delay.saturating_mul(if objected { 2 } else { 1 });
                     json!({
                         "fingerprint": change_fingerprint(&p),
+                        "names": names,
                         "guardians": p.commitments.len(),
                         "threshold": p.threshold,
+                        "delay": cur.delay,
+                        "delay_text": delay_text(cur.delay),
                         "confirmed": ident.log.confirmed_by(&id, cur, &others).len(),
-                        "objected": objected(&ident.log, &id),
+                        "needed": cur.threshold,
+                        // when this person made it, plus the wait: each
+                        // guardian waits from when their device saw it
+                        "waits_until_ms": since.map(|t| t.saturating_add(wait.saturating_mul(1000))),
+                        "objected": objected,
                         "id": hex::encode(id),
                     })
                 })
@@ -201,6 +261,8 @@ pub fn show(d: &Daemon) -> anyhow::Result<Json> {
         .map(|c| c.petname)
         .collect();
     Ok(json!({
+        "asked": asked,
+        "ready": ready,
         "copy_full": full,
         "changes": changes,
         "guardians": policy.as_ref().map_or(0, |p| p.commitments.len()),
@@ -239,8 +301,7 @@ pub fn set(
             if let Some((_, p)) = pending {
                 anyhow::bail!(
                     "a change of your guardians is under way (fingerprint \"{fp}\"): it must \
-                     take effect first, or you give it up by objecting to it (`cardinal \
-                     guardians object {fp}`)",
+                     take effect first, or you give it up by objecting to it",
                     fp = change_fingerprint(&p)
                 );
             }
@@ -251,8 +312,7 @@ pub fn set(
         let c = crate::contacts::find(d, w)?;
         anyhow::ensure!(
             c.connects(),
-            "{} is not someone you trust; a guardian must be (`cardinal contacts {} trust`)",
-            c.petname,
+            "{} is not someone you trust: a guardian must be",
             c.petname
         );
         anyhow::ensure!(
@@ -272,7 +332,7 @@ pub fn set(
         n / 2 + 1
     );
     let delay = delay.unwrap_or(DEFAULT_DELAY);
-    let (unguarded, named) = {
+    let (unguarded, named, missing) = {
         let core = d.core();
         let ident = core
             .identity
@@ -285,18 +345,31 @@ pub fn set(
         // Each guardian is named by the persona they made for guarding this
         // person, in the relationship the two share (D79).
         let mut named = Vec::new();
+        let mut missing = Vec::new();
         for c in &chosen {
-            named.push(persona_of(&core, c).ok_or_else(|| {
-                anyhow::anyhow!(
-                    "{name} has not accepted being your guardian yet, with a persona you have \
-                     not named before: ask them (`cardinal guardians ask {name}`), and try \
-                     again once they accepted and you have been in touch",
-                    name = c.petname
-                )
-            })?);
+            match persona_of(&core, c) {
+                Some(p) => named.push(p),
+                None => missing.push(c.clone()),
+            }
         }
-        (!policy.guarded(), named)
+        (!policy.guarded(), named, missing)
     };
+    if !missing.is_empty() {
+        // Each who has no persona to be named with is asked, now: a
+        // guardian named again accepts again, with a fresh one.
+        for c in &missing {
+            if !asked_already(d, c) {
+                d.write_and_push(&c.space, vec![relationship::create_guardian_request()])?;
+            }
+        }
+        let names: Vec<String> = missing.iter().map(|c| c.petname.clone()).collect();
+        anyhow::bail!(
+            "{} must accept being your guardian{} first. They have been asked; once they \
+             have accepted, and your devices have been in touch with theirs, try again.",
+            names.join(", "),
+            if names.len() > 1 { "s" } else { "" }
+        );
+    }
     // The first guardians are named by the policy's controller, the root;
     // a change, by any key of this person's, and the guardians in office
     // decide it (`identity.md#guardian-decisions`).
@@ -569,6 +642,24 @@ fn tell_full(d: &Arc<Daemon>) {
     }
 }
 
+/// Whether this person's request that `c` guard them waits for an answer:
+/// newer than the last guardian persona node `c` wrote.
+fn asked_already(d: &Daemon, c: &account::ContactRecord) -> bool {
+    let core = d.core();
+    let me = core.me();
+    core.spaces
+        .get(&c.space)
+        .and_then(|h| h.space.as_ref())
+        .is_some_and(|sp| {
+            let asked = relationship::guardian_requests(sp)
+                .into_iter()
+                .filter(|(a, _)| Some(*a) == me)
+                .map(|(_, at)| at)
+                .max();
+            matches!(asked, Some(a) if a > relationship::guardian_persona_at(sp, &c.identity))
+        })
+}
+
 /// `cardinal guardians ask NAME`: asks a contact to guard this person, in
 /// the relationship the two share. Their device shows it, and their
 /// `guarding accept` answers it with a fresh persona.
@@ -576,8 +667,7 @@ pub fn ask(d: &Arc<Daemon>, who: &str) -> anyhow::Result<Json> {
     let c = crate::contacts::find(d, who)?;
     anyhow::ensure!(
         c.connects(),
-        "{} is not someone you trust; a guardian must be (`cardinal contacts {} trust`)",
-        c.petname,
+        "{} is not someone you trust: a guardian must be",
         c.petname
     );
     d.write_and_push(&c.space, vec![relationship::create_guardian_request()])?;
@@ -1020,8 +1110,7 @@ pub async fn accept_role(d: &Arc<Daemon>, who: &str) -> anyhow::Result<Json> {
     let c = crate::contacts::find(d, who)?;
     anyhow::ensure!(
         c.connects(),
-        "{} is not someone you trust; trust them first (`cardinal contacts {} trust`)",
-        c.petname,
+        "{} is not someone you trust: trust them first",
         c.petname
     );
     // One not named by any policy yet serves; a persona named before is
@@ -1507,24 +1596,61 @@ pub fn list(d: &Daemon) -> Json {
             })
         })
         .collect();
-    let accepted: Vec<String> = {
+    let (accepted, in_change): (Vec<String>, Vec<String>) = {
         let named: HashSet<EntryId> = all.iter().map(|g| g.persona.identity).collect();
         let personas = my_personas(d);
-        let core = d.core();
-        let contacts = core.contacts();
-        personas
-            .iter()
-            .filter(|p| !named.contains(&p.identity))
-            .filter_map(|p| {
-                let who = p.for_identity?;
-                contacts
-                    .iter()
-                    .find(|c| c.identity == who && c.recovery_of.is_none())
-                    .map(|c| c.petname.clone())
-            })
-            .collect()
+        let mut accepted = Vec::new();
+        let mut in_change = Vec::new();
+        for p in personas.iter().filter(|p| !named.contains(&p.identity)) {
+            let Some(who) = p.for_identity else { continue };
+            let waiting = named_in_change(d, p);
+            let core = d.core();
+            let Some(c) = core
+                .contacts()
+                .into_iter()
+                .find(|c| c.identity == who && c.recovery_of.is_none())
+            else {
+                continue;
+            };
+            if waiting {
+                in_change.push(c.petname);
+            } else {
+                accepted.push(c.petname);
+            }
+        }
+        (accepted, in_change)
     };
-    json!({"guarding": people, "accepted": accepted, "asked": asked(d), "now_ms": now_ms()})
+    json!({
+        "guarding": people,
+        "accepted": accepted,
+        "named_in_change": in_change,
+        "asked": asked(d),
+        "now_ms": now_ms(),
+    })
+}
+
+/// Whether a change of the person's guardians under way names persona `p`:
+/// its record for `p` opens.
+fn named_in_change(d: &Daemon, p: &account::PersonaRecord) -> bool {
+    let Some(who) = p.for_identity else {
+        return false;
+    };
+    let Some(plog) = persona_log(d, p) else {
+        return false;
+    };
+    let keys = persona_keys(p, &plog);
+    let core = d.core();
+    let Some(other) = core.others.get(&who) else {
+        return false;
+    };
+    let Some(cur) = other.log.current_policy() else {
+        return false;
+    };
+    let st = other.log.state();
+    changes_of(&other.log, &cur.entry)
+        .iter()
+        .filter(|(id, _)| !st.in_effect.contains(id))
+        .any(|(_, q)| other.log.guardian_record(q, &p.identity, &keys).is_some())
 }
 
 /// The changes of `g`'s person's guardians, as a guardian is shown them.
@@ -1612,8 +1738,7 @@ fn find_wanted(d: &Daemon, g: &Guarded, fingerprint: &str) -> anyhow::Result<Wan
     anyhow::ensure!(
         !matches(&s.waiting),
         "that is another recovery of {name}, which waits while one is under way. If the one \
-         under way is not theirs, tell this device never to confirm it (`cardinal guarding \
-         never {name} FINGERPRINT`).",
+         under way is not theirs, say never to confirm it, and this one is shown.",
         name = g.name
     );
     let mut shown: Vec<Wanted> = s.shown.into_iter().collect();
@@ -2050,8 +2175,18 @@ async fn accept_recovery_now(d: &Arc<Daemon>, code: &str, who: &EntryId) -> anyh
         how: account::MET_THEIR_INVITATION,
         ..Default::default()
     };
+    let whom = *who;
     h.on(move |pd| async move {
-        crate::contacts::accept(&pd, &code, None, account::Regard::default(), met, true).await
+        crate::contacts::accept_for(
+            &pd,
+            &code,
+            None,
+            account::Regard::default(),
+            met,
+            true,
+            Some(whom),
+        )
+        .await
     })
     .await?;
     Ok(json!({"name": helper_petname(d, who), "recovery_of": hex::encode(who)}))
@@ -2272,7 +2407,14 @@ async fn give_held(d: &Arc<Daemon>, h: &Arc<Helper>, g: &Guarded) {
         else {
             return;
         };
-        let account = core.held_taken(&g.identity).into_iter().next();
+        // Tests: a guardian who gives back no account.
+        let none =
+            cfg!(debug_assertions) && std::env::var_os("CARDINAL_TEST_GIVE_NO_ACCOUNT").is_some();
+        let account = core
+            .held_taken(&g.identity)
+            .into_iter()
+            .next()
+            .filter(|_| !none);
         let labels: Vec<[u8; 32]> = account.into_iter().chain([c.space]).collect();
         let given = GIVEN.lock().unwrap_or_else(|e| e.into_inner());
         let mut sets = Vec::new();

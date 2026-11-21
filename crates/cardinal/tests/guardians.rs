@@ -209,7 +209,7 @@ fn guardians_are_named_and_only_they_know() {
     // A guardian is a contact; and a majority must agree.
     let o = name_guardians(&ana, &words, &["bo", "nobody"]);
     assert!(
-        !o.status.success() && out(&o).contains("no contact"),
+        !o.status.success() && out(&o).contains("No contact"),
         "{}",
         out(&o)
     );
@@ -222,12 +222,20 @@ fn guardians_are_named_and_only_they_know() {
     // A guardian is named only once they accepted, through a persona.
     let o = name_guardians(&ana, &words, &["bo", "cy"]);
     assert!(
-        !o.status.success() && out(&o).contains("has not accepted"),
+        !o.status.success() && out(&o).contains("must accept being your guardian"),
         "{}",
         out(&o)
     );
     ask_and_accept(&ana, &[&bo, &cy]);
     assert!(!bo.cli(&["guarding"]).contains("asked you to be"));
+    // ana sees who is ready to be named
+    wait("ana sees them ready", 60, || {
+        let shown = ana.cli(&["guardians"]);
+        shown
+            .lines()
+            .find(|l| l.starts_with("Ready to be named"))
+            .is_some_and(|l| l.contains("bo") && l.contains("cy"))
+    });
     wait("bo shows the acceptance", 10, || {
         bo.cli(&["guarding"]).contains("accepted guarding Ana")
     });
@@ -331,7 +339,7 @@ fn guardians_give_an_identity_back() {
     let new = new_device(root.path(), "new");
     let o = new.try_cli(&["recover", "finish"]);
     assert!(
-        !o.status.success() && out(&o).contains("no recovery is under way"),
+        !o.status.success() && out(&o).contains("No recovery is under way"),
         "{}",
         out(&o)
     );
@@ -345,6 +353,12 @@ fn guardians_give_an_identity_back() {
         new.log().contains("removing all 2 of the person's devices"),
         "{}",
         new.log()
+    );
+    assert!(
+        new.cli(&["recover"])
+            .contains("removes your 2 other device(s)"),
+        "{}",
+        new.cli(&["recover"])
     );
     let again = new.cli(&["recover", "start", &recovery_invitation(&cy, "Ana")]);
     assert_eq!(fingerprint_from(&again), fp);
@@ -654,7 +668,7 @@ fn guardians_change_with_the_guardians_consent() {
     // A persona named before is never named again.
     let o = name_guardians(&ana, "", &["bo", "di"]);
     assert!(
-        !o.status.success() && out(&o).contains("has not accepted"),
+        !o.status.success() && out(&o).contains("must accept being your guardian"),
         "{}",
         out(&o)
     );
@@ -683,6 +697,11 @@ fn guardians_change_with_the_guardians_consent() {
         "{}",
         out(&o)
     );
+    // bo's fresh persona is named in the change: not shown as unnamed
+    wait("bo sees he is named in the change", 30, || {
+        let shown = bo.cli(&["guarding"]);
+        shown.contains("named you in a change") && !shown.contains("they have not named you")
+    });
     for g in [&bo, &cy] {
         wait("the guardian sees the change", 30, || {
             g.cli(&["guarding"])
@@ -836,4 +855,72 @@ fn a_second_recovery_is_warned_of_and_starting_over_works() {
     // The old one can never take effect now.
     let o = guarding(&cy, "confirm", &old);
     assert!(!o.status.success(), "{}", out(&o));
+}
+
+/// A new device that knows nobody's invitation yet makes one for whomever
+/// the guardian names; the guardian, taking it up, says it is for Ana. And
+/// a guardian that gives back no account: finish says so, and goes on only
+/// when told to.
+#[test]
+fn a_guardian_names_whom_an_invitation_is_for() {
+    if !fuse_available() {
+        eprintln!("skipping: /dev/fuse or fusermount3 is not available");
+        return;
+    }
+    let root = tempfile::tempdir().unwrap();
+    let mut laptop = Dev::new(root.path(), "laptop", free_port());
+    laptop.start();
+    let words = words_from(&laptop.cli(&["init", "--yes", "--name", "ana"]));
+    laptop.wait_mounted();
+    let bo = person_with(root.path(), "bo", &[("CARDINAL_TEST_GIVE_NO_ACCOUNT", "1")]);
+    let di = person(root.path(), "di");
+    meet(&laptop, &bo, "Ana");
+    meet(&laptop, &di, "Ana");
+    accept_guarding(&[&bo]);
+    let o = name_accepted(&laptop, &words, &["bo", "--delay", "4s"]);
+    assert!(o.status.success(), "{}", out(&o));
+    wait("the guardian knows", 30, || {
+        bo.cli(&["guarding"]).contains("Ana: one of 1 guardians")
+    });
+    laptop.stop();
+    drop(laptop);
+
+    let new = new_device(root.path(), "new");
+    new.cli(&["recover", "start"]);
+    let code = code_in(&new.cli(&["recover", "invite"]));
+    // Taken up without saying whom: nothing is sent.
+    let o = bo.try_cli(&["accept", &code]);
+    assert!(
+        !o.status.success() && out(&o).contains("say whom"),
+        "{}",
+        out(&o)
+    );
+    // Di guards nobody: naming Ana sends nothing either.
+    let o = di.try_cli(&["accept", &code, "--for", "Ana"]);
+    assert!(
+        !o.status.success() && out(&o).contains("not one of their guardians"),
+        "{}",
+        out(&o)
+    );
+    let o = bo.try_cli(&["accept", &code, "--for", "Ana"]);
+    assert!(o.status.success(), "{}", out(&o));
+    // The new device learns whom it recovers from bo's persona.
+    wait("the recovery is asked for", 30, || {
+        new.cli(&["recover"]).contains("in touch:")
+    });
+    let fp = fingerprint_from(&new.cli(&["recover", "start"]));
+    wait("bo sees the recovery", 30, || bo.cli(&["guarding"]).contains(&fp));
+    endorse_and_confirm(&[&bo], &fp);
+    wait("the new device sees it in effect", 60, || {
+        new.cli(&["recover"]).contains("have confirmed")
+    });
+    let o = new.try_cli(&["recover", "finish"]);
+    assert!(
+        !o.status.success() && out(&o).contains("not given back your account"),
+        "{}",
+        out(&o)
+    );
+    let o = new.try_cli(&["recover", "finish", "--without-account"]);
+    assert!(o.status.success(), "{}", out(&o));
+    assert!(out(&o).contains("They held no copy"), "{}", out(&o));
 }

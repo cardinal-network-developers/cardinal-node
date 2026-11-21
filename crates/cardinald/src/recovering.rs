@@ -44,6 +44,17 @@ use crate::daemon::Daemon;
 use crate::helper::Helper;
 use crate::net;
 
+/// Field 9 of an invitation a new device makes before it knows whom it
+/// recovers: the guardian who takes it up names the person, from their own
+/// contacts (DEVIATIONS.md).
+pub const ANYONE: [u8; 32] = [0; 32];
+
+/// Whether a helper's contact is a recovery relationship for `who`: made
+/// for them, or for whomever the guardian named.
+fn for_recovery(c: &account::ContactRecord, who: &EntryId) -> bool {
+    c.recovery_of == Some(*who) || c.recovery_of == Some(ANYONE)
+}
+
 /// A recovery under way on this device.
 #[derive(Serialize, Deserialize)]
 struct Under {
@@ -114,7 +125,7 @@ fn the_fingerprint(d: &Daemon, phrase: &RecoveryPhrase) -> String {
 fn not_set_up(d: &Daemon) -> anyhow::Result<()> {
     anyhow::ensure!(
         d.core().identity.is_none() || load(d).is_none(),
-        "this device was recovered; run `cardinal recover` to see your new recovery words"
+        "this device was recovered: look at the recovery to see your new recovery words"
     );
     anyhow::ensure!(
         d.core().identity.is_none(),
@@ -182,7 +193,7 @@ fn relationships(h: &Daemon, who: &EntryId) -> Vec<([u8; 32], SpaceId)> {
     h.core()
         .contacts()
         .into_iter()
-        .filter(|c| c.recovery_of == Some(*who))
+        .filter(|c| for_recovery(c, who))
         .map(|c| (c.identity, c.space))
         .collect()
 }
@@ -283,6 +294,32 @@ async fn carry_round(d: &Arc<Daemon>, h: &Arc<Helper>) -> anyhow::Result<()> {
     let Some(mut u) = load(d) else {
         return Ok(());
     };
+    // Whom it recovers, if this device does not know yet: as the first
+    // guardian to propose, through an invitation for whomever they named,
+    // says.
+    if identity_of(&u).is_none() {
+        let named = {
+            let hc = h.d.core();
+            hc.contacts()
+                .into_iter()
+                .filter(|c| c.recovery_of == Some(ANYONE))
+                .find_map(|c| {
+                    let sp = hc.spaces.get(&c.space)?.space.as_ref()?;
+                    relationship::proposals(sp)
+                        .into_iter()
+                        .find(|p| p.author == c.identity)
+                        .map(|p| p.identity)
+                })
+        };
+        if let Some(who) = named {
+            u.identity = Some(hex::encode(who));
+            save(d, &u)?;
+            tracing::info!(
+                "the guardian said whom this recovers: {}",
+                crate::core::short(&who)
+            );
+        }
+    }
     let Some(who) = identity_of(&u) else {
         return Ok(());
     };
@@ -494,6 +531,12 @@ pub fn status(d: &Arc<Daemon>) -> anyhow::Result<Json> {
         "threshold": s.as_ref().map_or(0, |s| s.threshold),
         "in_effect": s.as_ref().is_some_and(|s| s.in_effect),
         "held": held,
+        // the devices the recovery removes: before finishing, by key alone
+        "lost_devices": u
+            .forgotten
+            .iter()
+            .map(|k| json!({"key": k.get(..16).unwrap_or(k), "name": null}))
+            .collect::<Vec<_>>(),
     }))
 }
 
@@ -513,8 +556,8 @@ pub async fn start(
                 .map_err(|_| anyhow::anyhow!("that is not an invitation"))?;
             anyhow::ensure!(
                 inv.recovery_of.is_some(),
-                "that is not a recovery invitation. Ask a guardian for one: `cardinal guarding \
-                 invite NAME` on their device."
+                "that is not a recovery invitation. Ask a guardian for one: their device \
+                 makes it."
             );
             Some(inv)
         }
@@ -576,15 +619,11 @@ pub async fn start(
 /// it.
 pub async fn invite(d: &Arc<Daemon>, at: Option<&str>) -> anyhow::Result<Json> {
     not_set_up(d)?;
-    let u = load(d).ok_or_else(|| {
-        anyhow::anyhow!("no recovery is under way here; start one with `cardinal recover start`")
-    })?;
-    let who = identity_of(&u).ok_or_else(|| {
-        anyhow::anyhow!(
-            "this device does not know whom it recovers yet: use a guardian's invitation \
-             first, or give the identity (`cardinal recover start --identity ID`)"
-        )
-    })?;
+    let u =
+        load(d).ok_or_else(|| anyhow::anyhow!("no recovery is under way here: start one first"))?;
+    // With no identity known yet, the invitation is for whomever the
+    // guardian who takes it up says (DEVIATIONS.md).
+    let who = identity_of(&u).unwrap_or(ANYONE);
     let h = helper(d).await?;
     let at = at.map(str::to_owned);
     let code = h
@@ -666,9 +705,8 @@ pub async fn finish(
     anyhow::ensure!(
         without_account || back,
         "your guardians have not given back your account yet: it comes once one of them and \
-         this device are in touch. Try again in a moment. If none of them holds it, go on \
-         without it, and start with an empty account: `cardinal recover finish \
-         --without-account`."
+         this device are in touch. Try again in a moment. If none of them holds it, you can \
+         go on without it, and start with an empty account."
     );
     // From here this device may become the person's at any moment: if it
     // stops before the end, `cardinal recover` shows the words.
@@ -851,7 +889,7 @@ fn copies(h: &Helper, who: &EntryId) -> Vec<([u8; 32], Vec<Vec<u8>>)> {
 fn account_labels(core: &crate::core::Core, who: &EntryId) -> Vec<[u8; 32]> {
     core.contacts()
         .into_iter()
-        .filter(|c| c.recovery_of == Some(*who))
+        .filter(|c| for_recovery(c, who))
         .filter_map(|c| {
             let sp = core.spaces.get(&c.space)?.space.as_ref()?;
             relationship::held_account(sp, &c.identity)
@@ -871,7 +909,7 @@ fn copies_in(core: &crate::core::Core, who: &EntryId) -> Vec<([u8; 32], Vec<Vec<
     let rels: Vec<([u8; 32], SpaceId)> = core
         .contacts()
         .into_iter()
-        .filter(|c| c.recovery_of == Some(*who))
+        .filter(|c| for_recovery(c, who))
         .map(|c| (c.identity, c.space))
         .collect();
     let mut labels: Vec<[u8; 32]> = Vec::new();

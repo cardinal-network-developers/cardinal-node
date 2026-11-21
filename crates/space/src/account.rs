@@ -260,6 +260,19 @@ pub fn settings(state: &State) -> Vec<(String, Value)> {
         .collect()
 }
 
+/// [`settings`], each with when the node was made, by its writer's clock.
+pub fn settings_made(state: &State) -> Vec<(String, Value, Option<u64>)> {
+    state
+        .children(&ROOT)
+        .into_iter()
+        .filter(|n| n.kind == NodeKind::Uint(SETTING) && !n.deleted)
+        .filter_map(|n| {
+            let name = last(n, 1)?.as_text()?.to_owned();
+            Some((name, last(n, 2)?.clone(), n.created))
+        })
+        .collect()
+}
+
 /// `create` of the self node (`profiles.md#account`): the name this
 /// person suggests for themselves.
 pub fn create_self(name: &str) -> SpaceOp {

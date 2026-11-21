@@ -181,6 +181,10 @@ enum Cmd {
         /// they write.
         #[arg(long)]
         no_introductions: bool,
+        /// For a recovery invitation made for whomever you name: whom it
+        /// is for, of those you guard.
+        #[arg(long = "for")]
+        for_whom: Option<String>,
     },
     /// The people you are connected to. With a name: how your devices reach
     /// theirs, what each address did, and what you tell them
@@ -869,6 +873,22 @@ fn print_guardians(v: &Value) {
             println!("Guardians: {}", names.join(", "));
         }
     }
+    let list = |k: &str| -> Vec<String> {
+        v[k].as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|x| x.as_str().map(str::to_owned))
+            .collect()
+    };
+    if !list("asked").is_empty() {
+        println!("Asked to be your guardian: {}.", list("asked").join(", "));
+    }
+    if !list("ready").is_empty() {
+        println!(
+            "Ready to be named (`cardinal guardians set`): {}.",
+            list("ready").join(", ")
+        );
+    }
     for n in v["copy_full"].as_array().into_iter().flatten() {
         println!(
             "{} holds as much of your account as a guardian takes: their copy no longer updates.",
@@ -948,6 +968,10 @@ fn print_recover(v: &Value) {
         "Recovering. Read each guardian this fingerprint: {}",
         v["fingerprint"].as_str().unwrap_or("")
     );
+    let lost = v["lost_devices"].as_array().map_or(0, Vec::len);
+    if lost > 0 {
+        println!("The recovery removes your {lost} other device(s); you pair them again after.");
+    }
     let met = v["guardians"].as_u64().unwrap_or(0);
     if met == 0 {
         println!("No guardian is in touch yet: use a guardian's invitation (`cardinal recover start CODE`).");
@@ -972,6 +996,12 @@ fn print_guarding(v: &Value) {
     for a in v["asked"].as_array().into_iter().flatten() {
         let n = a.as_str().unwrap_or("");
         println!("{n} asked you to be their guardian: `cardinal guarding accept {n}`.");
+    }
+    for a in v["named_in_change"].as_array().into_iter().flatten() {
+        println!(
+            "{} named you in a change of guardians, waiting for their guardians to confirm it.",
+            a.as_str().unwrap_or("")
+        );
     }
     for a in v["accepted"].as_array().into_iter().flatten() {
         println!(
@@ -2832,10 +2862,12 @@ async fn client(cmd: Cmd) -> anyhow::Result<()> {
             name,
             hosts_only,
             no_introductions,
+            for_whom,
         } => {
             let req = json!({
                 "cmd": "accept",
                 "code": code,
+                "for": for_whom,
                 "name": name,
                 "hosts_only": hosts_only,
                 "no_introductions": no_introductions,

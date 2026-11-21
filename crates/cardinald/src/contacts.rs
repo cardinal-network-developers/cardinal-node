@@ -392,8 +392,32 @@ pub async fn accept(
     met: account::Met,
     recovery: bool,
 ) -> anyhow::Result<Json> {
-    let invitation = Invitation::from_text(code.trim())
+    accept_for(d, code, name, regard, met, recovery, None).await
+}
+
+/// [`accept`], for a recovery invitation made for whomever the guardian
+/// names: `whom` is the person, as this person's contacts know them
+/// (`recovering::ANYONE`).
+pub async fn accept_for(
+    d: &Arc<Daemon>,
+    code: &str,
+    name: Option<&str>,
+    regard: Regard,
+    met: account::Met,
+    recovery: bool,
+    whom: Option<[u8; 32]>,
+) -> anyhow::Result<Json> {
+    let mut invitation = Invitation::from_text(code.trim())
         .map_err(|_| anyhow::anyhow!("that is not an invitation"))?;
+    if invitation.recovery_of == Some(crate::recovering::ANYONE) {
+        let whom = whom.ok_or_else(|| {
+            anyhow::anyhow!(
+                "that invitation is to help someone recover their identity: say whom, of \
+                 those you guard"
+            )
+        })?;
+        invitation.recovery_of = Some(whom);
+    }
     let me = identity(d)?;
     anyhow::ensure!(
         invitation.recovery_of.is_none() || recovery,
@@ -886,11 +910,79 @@ fn recovered_note(d: &Daemon, who: &[u8; 32]) -> Option<String> {
         .into_iter()
         .find(|r| st.in_effect.contains(&r.entry))?;
     let p = log.policy(&r.policy)?;
-    Some(format!(
-        "was recovered by guardians they chose, after {}. If in doubt, check with them in \
-         person.",
-        crate::guardians::delay_text(p.delay)
-    ))
+    // The date the policy was chosen on, as this device first saw it.
+    let on = first_seen(d, &r.policy).map(day_text);
+    Some(match on {
+        Some(day) => format!(
+            "was recovered by guardians they chose on {day}, after {}. If in doubt, check \
+             with them in person.",
+            crate::guardians::delay_text(p.delay)
+        ),
+        None => format!(
+            "was recovered by guardians they chose, after {}. If in doubt, check with them \
+             in person.",
+            crate::guardians::delay_text(p.delay)
+        ),
+    })
+}
+
+/// When this device first saw each recovery policy of its contacts
+/// (`seen-policies.json`): identity entries carry no time, so this is the
+/// date a contact's software can give for one (DEVIATIONS.md).
+fn first_seen(d: &Daemon, policy: &[u8; 32]) -> Option<u64> {
+    let b = std::fs::read(d.paths.home.join("seen-policies.json")).ok()?;
+    let m: std::collections::BTreeMap<String, u64> = serde_json::from_slice(&b).ok()?;
+    m.get(&hex::encode(policy)).copied()
+}
+
+/// Notes when this device first saw `who`'s current recovery policy, and
+/// those their recoveries act under.
+pub(crate) fn note_policies(d: &Daemon, who: &[u8; 32]) {
+    let path = d.paths.home.join("seen-policies.json");
+    let mut m: std::collections::BTreeMap<String, u64> = std::fs::read(&path)
+        .ok()
+        .and_then(|b| serde_json::from_slice(&b).ok())
+        .unwrap_or_default();
+    let policies: Vec<[u8; 32]> = {
+        let core = d.core();
+        let Some(o) = core.others.get(who) else {
+            return;
+        };
+        o.log
+            .current_policy()
+            .map(|p| p.entry)
+            .into_iter()
+            .chain(o.log.recoveries().into_iter().map(|r| r.policy))
+            .collect()
+    };
+    let mut changed = false;
+    for p in policies {
+        if let std::collections::btree_map::Entry::Vacant(v) = m.entry(hex::encode(p)) {
+            v.insert(now_ms());
+            changed = true;
+        }
+    }
+    if changed {
+        let bytes = serde_json::to_vec(&m).unwrap_or_default();
+        let _ = crate::paths::write_private(&path, &bytes, 0o600);
+    }
+}
+
+/// A day, as `2026-11-21`, in UTC.
+fn day_text(ms: u64) -> String {
+    let days = (ms / 86_400_000) as i64;
+    // civil from days (Howard Hinnant)
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = if month <= 2 { y + 1 } else { y };
+    format!("{year:04}-{month:02}-{day:02}")
 }
 
 /// How two people met, as a window shows it.
@@ -925,11 +1017,11 @@ pub(crate) fn find(d: &Daemon, who: &str) -> anyhow::Result<ContactRecord> {
     let mut found = contacts.into_iter().filter(named);
     let contact = found
         .next()
-        .ok_or_else(|| anyhow::anyhow!("no contact called {who:?}; see `cardinal contacts`"))?;
+        .ok_or_else(|| anyhow::anyhow!("no contact called {who:?}"))?;
     // A name is what someone suggested, and it may be a name already here.
     anyhow::ensure!(
         found.next().is_none(),
-        "more than one contact is called {who:?}; use the id `cardinal contacts` shows"
+        "more than one contact is called {who:?}: give their id instead"
     );
     Ok(contact)
 }

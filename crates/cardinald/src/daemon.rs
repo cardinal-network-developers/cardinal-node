@@ -1217,6 +1217,8 @@ impl Daemon {
             }
             // a recovery of someone this person guards may be pending now
             crate::guardians::observe(self);
+            // and when their policy was first seen here, for the date shown
+            crate::contacts::note_policies(self, &identity);
             self.directory.update(own.as_deref(), &states);
             self.endpoint.recheck_peers();
             return Ok(Ingested {
