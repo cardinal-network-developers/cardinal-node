@@ -36,6 +36,11 @@ pub struct ThisRun {
     /// Addresses given for this device that still name the port it left,
     /// and cannot be made to follow it: a router's forward.
     pub left_behind: Vec<String>,
+    /// This is a recovery helper's service, run inside a new device's for
+    /// as long as a recovery through guardians is under way
+    /// (`helper.rs`): no control socket, no mount, no discovery, no port
+    /// mapping, no looking for releases.
+    pub helper: bool,
 }
 
 /// Device settings.

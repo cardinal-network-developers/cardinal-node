@@ -49,6 +49,11 @@ pub const MET: u64 = 10;
 pub const PICTURE: u64 = 11;
 /// Contact field: the name they suggest for themselves, as last heard.
 pub const SUGGESTED: u64 = 12;
+/// Contact field: the identity this relationship is a recovery of. Not in
+/// the specification, which says only that guardian software shows such a
+/// relationship as "recovery for" the person, never as a contact
+/// (`identity.md#how-guardians-act`; DEVIATIONS.md, Guardians).
+pub const RECOVERY_OF: u64 = 13;
 /// Where a relationship is listed when nothing else is said.
 pub const PEOPLE: &str = "People";
 
@@ -147,6 +152,20 @@ pub fn create_contact_suggesting(
     regard: Regard,
     met: Option<&Met>,
 ) -> SpaceOp {
+    create_contact_for(identity, petname, suggested, space, regard, met, None)
+}
+
+/// [`create_contact_suggesting`], for a relationship that is a recovery of
+/// `recovery_of` if given.
+pub fn create_contact_for(
+    identity: &IdentityId,
+    petname: &str,
+    suggested: Option<&str>,
+    space: &SpaceId,
+    regard: Regard,
+    met: Option<&Met>,
+    recovery_of: Option<&IdentityId>,
+) -> SpaceOp {
     SpaceOp::create(
         NodeKind::Uint(CONTACT),
         ROOT,
@@ -158,8 +177,32 @@ pub fn create_contact_suggesting(
             .with(INTRODUCTIONS, regard.introductions)
             .with(TRUSTED, regard.trusted)
             .with_opt(MET, met.map(|m| Value::Record(m.to_record())))
-            .with_opt(SUGGESTED, suggested.filter(|s| !s.trim().is_empty())),
+            .with_opt(SUGGESTED, suggested.filter(|s| !s.trim().is_empty()))
+            .with_opt(RECOVERY_OF, recovery_of.copied()),
     )
+}
+
+/// `create` of a setting node (`profiles.md#account`, kind 6).
+pub fn create_setting(name: &str, value: impl Into<Value>) -> SpaceOp {
+    SpaceOp::create(
+        NodeKind::Uint(SETTING),
+        ROOT,
+        "setting",
+        Record::new().with(1, name).with(2, value.into()),
+    )
+}
+
+/// The settings that are not deleted, by name, each with its value.
+pub fn settings(state: &State) -> Vec<(String, Value)> {
+    state
+        .children(&ROOT)
+        .into_iter()
+        .filter(|n| n.kind == NodeKind::Uint(SETTING) && !n.deleted)
+        .filter_map(|n| {
+            let name = last(n, 1)?.as_text()?.to_owned();
+            Some((name, last(n, 2)?.clone()))
+        })
+        .collect()
 }
 
 /// `create` of the self node (`profiles.md#account`): the name this
@@ -463,6 +506,9 @@ pub struct ContactRecord {
     pub met: Option<Met>,
     /// This person named them a guardian (field 5).
     pub guardian: bool,
+    /// The relationship is between a recovery helper and a guardian of
+    /// this identity, and is no contact (field [`RECOVERY_OF`]).
+    pub recovery_of: Option<IdentityId>,
 }
 
 impl ContactRecord {
@@ -516,6 +562,9 @@ pub fn contacts(state: &State) -> Vec<ContactRecord> {
                     .and_then(Value::as_record)
                     .and_then(Met::from_record),
                 guardian: flag(GUARDIAN).unwrap_or(false),
+                recovery_of: last(n, RECOVERY_OF)
+                    .and_then(Value::as_bytes)
+                    .and_then(|b| b.try_into().ok()),
             })
         })
         .collect()

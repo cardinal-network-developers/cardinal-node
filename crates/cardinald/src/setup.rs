@@ -56,17 +56,31 @@ pub fn install(
     config: &Config,
     person: &str,
 ) -> anyhow::Result<()> {
+    let created = prepared.created;
+    let entries: Vec<Vec<u8>> = created.log.entries().map(|e| e.encode()).collect();
+    install_entries(paths, &entries, config, person)
+}
+
+/// Saves an identity log, `entries` (its own first, then any held under
+/// its label), and creates new account and files spaces for it: for a
+/// new identity, or one taken up again through guardians with nothing
+/// left of its spaces (`hosts.md#restore`). This device must be one of
+/// its devices, and the log must open its encryption key.
+pub fn install_entries(
+    paths: &Paths,
+    entries: &[Vec<u8>],
+    config: &Config,
+    person: &str,
+) -> anyhow::Result<()> {
     crate::format::check(paths)?;
     let keys = Arc::new(Keys::load_or_create(&paths.device_key())?);
     let mut core = Core::load(paths, keys.clone())?;
-    let created = prepared.created;
-    let entries: Vec<Vec<u8>> = created.log.entries().map(|e| e.encode()).collect();
-    core.install_identity(&entries)?;
+    core.install_identity(entries)?;
     let ident = core.identity.as_ref().expect("installed");
-    if ident.enc.is_empty() {
-        anyhow::bail!("could not open the new identity's encryption key");
-    }
-    let pk = created.encryption.public_key().clone();
+    let Some(enc) = ident.enc.first() else {
+        anyhow::bail!("could not open the identity's encryption key");
+    };
+    let pk = enc.public_key().clone();
 
     let (account, acc_genesis) = Space::create(
         Profile::ACCOUNT,

@@ -350,6 +350,59 @@ keep everything, whether it counts (`state`: passed, failed, stale,
 unchecked), why not (`reason`), the times of its last check, pass, and
 failure, and checks it left unanswered in a row (`missed`).
 
+### Guardians and recovery
+
+A fingerprint is five words from the BIP-39 English list, separated by
+single spaces, as `"wealth above drive initial couple"`; a request that
+takes one reads it however it was typed (any case, any separator, four
+letters a word suffice). The person: `guardians` → `{guardians,
+threshold, delay, delay_text, data, names, recoveries: [{fingerprint,
+endorsed, confirmed, in_effect, objected, id}], frozen}`; `guardians-set`
+(`who`, `threshold`, `delay`; the words); `guardians-object`
+(`fingerprint`, needed only when more than one is under way).
+
+A guardian: `guarding` → `{guarding: [{name, id (64 hex), guardians,
+threshold, delay, delay_text, recoveries, waiting, warning, never,
+helpers}], now_ms}`. `recoveries` holds at most one: the one recovery of
+that person shown at a time, `{fingerprint, endorsed, confirmed,
+endorsed_by_me, confirmed_by_me, pending, confirm_from_ms, objected,
+in_effect, caution}`. `caution` is the warning to show, in plain words,
+before endorsing and again before confirming; a client shows it and asks
+the guardian to go on. `waiting` counts other recoveries of that person
+under way, which are not shown; `warning` is the text to show then, or
+null. `never` lists the fingerprints the guardian said never to confirm;
+`helpers`, the recovery relationships for that person.
+`guarding-invite` (`who`, `at`: host:port, optional) → `{code, name}`:
+an invitation for the person's new device, naming them in field 9.
+`guarding-endorse` and `guarding-confirm` (`who`, `fingerprint`) → as
+`guarding`; either fails for a recovery that waits behind the one shown,
+or that the guardian said never to. `guarding-never` (`who`,
+`fingerprint`) → as `guarding`: never endorse or confirm it, on any of
+the guardian's devices (an account setting). `accept` of an invitation
+that names someone in field 9 fails, with nothing sent, unless this
+person guards them; for a guardian it replies `{name, recovery_of}`, and
+the relationship is listed nowhere as a contact (`contacts`,
+`conversations`, the one folder).
+
+The new device: `recover` → `{under_way: true, identity, fingerprint,
+helper, guardians, proposed, asked, endorsed, confirmed, threshold,
+in_effect, kept, now_ms}` while one is under way, else `{under_way:
+false, kept, now_ms}` with the hosts the last recovery kept; each of
+`kept` is `{key, name, online, heard_ms}`, `heard_ms` when this device
+last heard from it since the recovery (null if never). `recover-start`
+(`code`: a guardian's recovery invitation, `key`: a sheet key,
+`identity`: 64 hex; all optional) → `{fingerprint, identity}`: starts
+one if none is under way, and meets that guardian. `recover-invite`
+(`at`, optional) → `{code, fingerprint}`: an invitation for a guardian
+who is present to `accept`. `recover-cancel` → `{fingerprint}` (null if
+nothing was under way). `recover-finish` (`at` and `key` together, or
+neither; `without_hosts`) → `{at, words, kept, now_ms}`: `at` is the
+host it went through, null when it took the identity up from what the
+guardians hold; `words` are the new recovery words, to show once.
+
+Removed (D77): `guarding-help` and `recover-via`, with the
+`cardinal-help:` code they used.
+
 ## Inspection
 
 For designing the data structures, not for applications: a read-only

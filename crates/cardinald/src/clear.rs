@@ -17,7 +17,14 @@ use crate::paths::Paths;
 
 /// The directories the node writes in a data directory, the two kept on
 /// this device only aside.
-const DIRS: [&str; 5] = ["spaces", "blobs", "staging", "others", "mailbox"];
+const DIRS: [&str; 6] = [
+    "spaces",
+    "blobs",
+    "staging",
+    "others",
+    "mailbox",
+    "recovery-helper",
+];
 
 /// What `.cardinalignore` keeps on this device only: the person's own
 /// files, which exist nowhere else.
@@ -25,10 +32,11 @@ const LOCAL: [&str; 2] = ["local", "local-shared"];
 
 /// The files the node writes there. Each may have a `.tmp` beside it, left
 /// by a write that was interrupted.
-const STATE: [&str; 8] = [
+const STATE: [&str; 9] = [
     "link.json",
     "guarding.json",
     "recovering.json",
+    "recovered.json",
     "in-use.json",
     "peers.json",
     "copies.json",

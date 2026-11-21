@@ -660,22 +660,23 @@ enum GuardiansCmd {
     /// Object to a recovery of your identity under way that is not yours:
     /// your guardians then wait twice as long.
     Object {
-        /// Its fingerprint, if more than one is under way.
-        fingerprint: Option<String>,
+        /// Its fingerprint, five words, if more than one is under way.
+        fingerprint: Vec<String>,
     },
 }
 
 #[derive(Subcommand)]
 enum GuardingCmd {
-    /// A code for the new device of someone you guard, who lost every
-    /// device: they type it there, and their device reaches yours.
-    Code {
+    /// An invitation for the new device of someone you guard, who lost
+    /// every device: they use it there (`cardinal recover start CODE`),
+    /// and their device meets yours for the recovery alone.
+    Invite {
         /// Whom it is for.
         who: String,
-        /// Where their device can reach yours (host:port), if not this
-        /// network. Give it more than once for more than one address.
+        /// Where their device can reach yours (host:port), if not your
+        /// host or this network.
         #[arg(long = "address")]
-        addresses: Vec<String>,
+        address: Option<String>,
     },
     /// Say that someone you guard really is asking for their identity
     /// back, after checking with them the fingerprint their new device
@@ -683,40 +684,81 @@ enum GuardingCmd {
     Endorse {
         /// Whom.
         who: String,
-        /// The fingerprint they read you from their new device.
-        fingerprint: String,
+        /// The fingerprint they read you from their new device: five words.
+        #[arg(num_args = 1.., required = true)]
+        fingerprint: Vec<String>,
+        /// Do not ask again: you have read the warning.
+        #[arg(long)]
+        yes: bool,
     },
     /// After the wait, and checking the fingerprint with them again: give
     /// their identity back to their new device.
     Confirm {
         /// Whom.
         who: String,
-        /// The fingerprint they read you from their new device.
-        fingerprint: String,
+        /// The fingerprint they read you from their new device: five words.
+        #[arg(num_args = 1.., required = true)]
+        fingerprint: Vec<String>,
+        /// Do not ask again: you have read the warning.
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Never endorse or confirm this recovery, on any of your devices: the
+    /// person started over, because the new device was lost, or it is not
+    /// theirs.
+    Never {
+        /// Whom.
+        who: String,
+        /// The fingerprint of the recovery: five words.
+        #[arg(num_args = 1.., required = true)]
+        fingerprint: Vec<String>,
     },
 }
 
 #[derive(Subcommand)]
 enum RecoverCmd {
-    /// Ask a guardian, with the code they gave you, to put your recovery
-    /// to the others. Then read each guardian the fingerprint shown.
+    /// Start getting your identity back on this device, and with a
+    /// guardian's invitation meet that guardian. Bring each guardian's
+    /// invitation the same way, and read each of them the fingerprint
+    /// shown.
     Start {
-        /// The code from `cardinal guarding code` on the guardian's device.
-        code: String,
-        /// The key of a host on your recovery sheet, which stays yours and
-        /// brings your files back.
+        /// The invitation from `cardinal guarding invite` on the guardian's
+        /// device.
+        code: Option<String>,
+        /// The key of a host on your recovery sheet, if you still have it,
+        /// kept beside the hosts your guardians know of.
         #[arg(long)]
         key: Option<String>,
-    },
-    /// Once your guardians have confirmed: become your identity's device,
-    /// through the host on your recovery sheet.
-    Finish {
-        /// The host's address (host:port).
+        /// Whom you recover (the id a guardian's device shows), to make an
+        /// invitation for a guardian before using any of theirs.
         #[arg(long)]
-        host: String,
+        identity: Option<String>,
+    },
+    /// An invitation for a guardian who is with you to take up on their
+    /// device (`cardinal accept CODE`).
+    Invite {
+        /// Where their device can reach this one (host:port), if not this
+        /// network.
+        #[arg(long)]
+        address: Option<String>,
+    },
+    /// Give up the recovery under way on this device. Tell each guardian
+    /// not to confirm it (`cardinal guarding never`).
+    Cancel,
+    /// Once your guardians have confirmed: become your identity's device,
+    /// through a host the recovery kept, or from what your guardians hold
+    /// if there is none.
+    Finish {
+        /// A host's address (host:port), from your recovery sheet.
+        #[arg(long)]
+        host: Option<String>,
         /// Its key.
         #[arg(long)]
-        key: String,
+        key: Option<String>,
+        /// Finish without the hosts the recovery kept, which cannot be
+        /// reached: they were lost too.
+        #[arg(long)]
+        without_hosts: bool,
     },
 }
 
@@ -778,10 +820,12 @@ fn print_guardians(v: &Value) {
     for r in v["recoveries"].as_array().into_iter().flatten() {
         let fp = r["fingerprint"].as_str().unwrap_or("");
         if r["in_effect"] == true {
-            println!("Recovered to the device with fingerprint {fp}.");
+            println!("Recovered to the device with fingerprint \"{fp}\".");
         } else {
             println!(
-                "WARNING: someone asked your guardians to recover your identity (fingerprint {fp}):                  {} endorsed, {} confirmed{}. If it is not you, tell your guardians, and run                  `cardinal guardians object`.",
+                "WARNING: someone asked your guardians to recover your identity (fingerprint \"{fp}\"): \
+                 {} endorsed, {} confirmed{}. If it is not you, tell your guardians, and run \
+                 `cardinal guardians object`.",
                 r["endorsed"],
                 r["confirmed"],
                 if r["objected"] == true {
@@ -792,6 +836,70 @@ fn print_guardians(v: &Value) {
             );
         }
     }
+}
+
+/// The hosts a recovery kept, with when each was last heard from.
+fn print_kept(v: &Value) {
+    let kept = v["kept"].as_array().cloned().unwrap_or_default();
+    if kept.is_empty() {
+        return;
+    }
+    let now = v["now_ms"].as_u64().unwrap_or(0);
+    println!("Hosts your recovery kept; remove any that was lost too (`cardinal remove-device`):");
+    for k in kept {
+        let name = k["name"]
+            .as_str()
+            .map(str::to_owned)
+            .unwrap_or_else(|| k["key"].as_str().unwrap_or("").to_owned());
+        let heard = if k["online"] == true {
+            "in touch now".to_owned()
+        } else {
+            match k["heard_ms"].as_u64() {
+                Some(t) => format!(
+                    "last heard from {} ago",
+                    span_text(now.saturating_sub(t) / 1000)
+                ),
+                None => "not heard from since the recovery".to_owned(),
+            }
+        };
+        println!("  {name}: {heard}");
+    }
+}
+
+/// Seconds as a person reads them.
+fn span_text(secs: u64) -> String {
+    match secs {
+        s if s < 120 => format!("{s} seconds"),
+        s if s < 7200 => format!("{} minutes", s / 60),
+        s if s < 172_800 => format!("{} hours", s / 3600),
+        s => format!("{} days", s / 86_400),
+    }
+}
+
+fn print_recover(v: &Value) {
+    if v["under_way"] != true {
+        println!("No recovery is under way. Ask a guardian for an invitation (`cardinal guarding invite`).");
+        print_kept(v);
+        return;
+    }
+    println!(
+        "Recovering. Read each guardian this fingerprint: {}",
+        v["fingerprint"].as_str().unwrap_or("")
+    );
+    let met = v["guardians"].as_u64().unwrap_or(0);
+    if met == 0 {
+        println!("No guardian is in touch yet: use a guardian's invitation (`cardinal recover start CODE`).");
+    } else if v["asked"] != true {
+        println!("{met} guardian(s) in touch; waiting for one to propose the recovery.");
+    } else if v["in_effect"] == true {
+        println!("Your guardians have confirmed. Run `cardinal recover finish`.");
+    } else {
+        println!(
+            "{met} guardian(s) in touch: {} endorsed, {} confirmed, of {} needed.",
+            v["endorsed"], v["confirmed"], v["threshold"]
+        );
+    }
+    print_kept(v);
 }
 
 fn print_guarding(v: &Value) {
@@ -830,9 +938,49 @@ fn print_guarding(v: &Value) {
                     r["endorsed"]
                 )
             };
-            println!("  recovery {fp}: {state}");
+            println!("  recovery \"{fp}\": {state}");
+        }
+        if let Some(w) = p["warning"].as_str() {
+            println!("  WARNING: {w}");
+        }
+        for fp in p["never"].as_array().into_iter().flatten() {
+            println!(
+                "  recovery \"{}\": you said never to confirm it",
+                fp.as_str().unwrap_or("")
+            );
         }
     }
+}
+
+/// The fingerprint as typed, its words joined.
+fn typed_fingerprint(words: &[String]) -> String {
+    words.join(" ")
+}
+
+/// Shows a guardian the warning before they endorse or confirm, and asks
+/// them to go on, unless they said so already.
+fn cautioned(paths: &Paths, v: &Value, who: &str, yes: bool) -> anyhow::Result<()> {
+    let _ = paths;
+    let people = v["guarding"].as_array().cloned().unwrap_or_default();
+    let caution = people
+        .iter()
+        .filter(|p| {
+            p["name"]
+                .as_str()
+                .is_some_and(|n| n.eq_ignore_ascii_case(who))
+        })
+        .flat_map(|p| p["recoveries"].as_array().cloned().unwrap_or_default())
+        .find_map(|r| r["caution"].as_str().map(str::to_owned));
+    let Some(caution) = caution else {
+        return Ok(());
+    };
+    println!("{caution}");
+    if yes {
+        return Ok(());
+    }
+    let said = prompt("Go on? Type yes: ")?;
+    anyhow::ensure!(said.eq_ignore_ascii_case("yes"), "nothing was done");
+    Ok(())
 }
 
 #[derive(Subcommand)]
@@ -2232,7 +2380,7 @@ async fn client(cmd: Cmd) -> anyhow::Result<()> {
         } => {
             call(
                 &paths,
-                json!({"cmd": "guardians-object", "fingerprint": fingerprint}),
+                json!({"cmd": "guardians-object", "fingerprint": (!fingerprint.is_empty()).then(|| typed_fingerprint(&fingerprint))}),
             )
             .await?;
             println!("Objected. Your guardians now wait twice as long; tell them it is not you.");
@@ -2266,27 +2414,38 @@ async fn client(cmd: Cmd) -> anyhow::Result<()> {
             Ok(())
         }
         Cmd::Guarding {
-            cmd: Some(GuardingCmd::Code { who, addresses }),
+            cmd: Some(GuardingCmd::Invite { who, address }),
         } => {
             let v = call(
                 &paths,
-                json!({"cmd": "guarding-help", "who": who, "at": addresses}),
+                json!({"cmd": "guarding-invite", "who": who, "at": address}),
             )
             .await?;
             println!(
-                "Give {} this code, for their new device (`cardinal recover start CODE`). It is \
-                 good for a day:",
+                "Give {} this invitation, for their new device (`cardinal recover start CODE`). \
+                 It meets your device for their recovery alone:",
                 v["name"].as_str().unwrap_or(&who)
             );
             println!("{}", v["code"].as_str().unwrap_or(""));
             Ok(())
         }
         Cmd::Guarding {
-            cmd: Some(GuardingCmd::Endorse { who, fingerprint }),
+            cmd:
+                Some(GuardingCmd::Endorse {
+                    who,
+                    fingerprint,
+                    yes,
+                }),
         } => {
+            cautioned(
+                &paths,
+                &call(&paths, json!({"cmd": "guarding"})).await?,
+                &who,
+                yes,
+            )?;
             let v = call(
                 &paths,
-                json!({"cmd": "guarding-endorse", "who": who, "fingerprint": fingerprint}),
+                json!({"cmd": "guarding-endorse", "who": who, "fingerprint": typed_fingerprint(&fingerprint)}),
             )
             .await?;
             println!("Endorsed. Once enough guardians have, everyone waits, and then confirms.");
@@ -2294,56 +2453,122 @@ async fn client(cmd: Cmd) -> anyhow::Result<()> {
             Ok(())
         }
         Cmd::Guarding {
-            cmd: Some(GuardingCmd::Confirm { who, fingerprint }),
+            cmd:
+                Some(GuardingCmd::Confirm {
+                    who,
+                    fingerprint,
+                    yes,
+                }),
         } => {
+            cautioned(
+                &paths,
+                &call(&paths, json!({"cmd": "guarding"})).await?,
+                &who,
+                yes,
+            )?;
             let v = call(
                 &paths,
-                json!({"cmd": "guarding-confirm", "who": who, "fingerprint": fingerprint}),
+                json!({"cmd": "guarding-confirm", "who": who, "fingerprint": typed_fingerprint(&fingerprint)}),
             )
             .await?;
             println!("Confirmed.");
             print_guarding(&v);
             Ok(())
         }
+        Cmd::Guarding {
+            cmd: Some(GuardingCmd::Never { who, fingerprint }),
+        } => {
+            let v = call(
+                &paths,
+                json!({"cmd": "guarding-never", "who": who, "fingerprint": typed_fingerprint(&fingerprint)}),
+            )
+            .await?;
+            println!("You will never endorse or confirm that recovery, on any of your devices.");
+            print_guarding(&v);
+            Ok(())
+        }
         Cmd::Recover { cmd: None } => {
             let v = call(&paths, json!({"cmd": "recover"})).await?;
-            if v["under_way"] == true {
+            print_recover(&v);
+            Ok(())
+        }
+        Cmd::Recover {
+            cmd:
+                Some(RecoverCmd::Start {
+                    code,
+                    key,
+                    identity,
+                }),
+        } => {
+            let v = call(
+                &paths,
+                json!({"cmd": "recover-start", "code": code, "key": key, "identity": identity}),
+            )
+            .await?;
+            if code.is_some() {
                 println!(
-                    "Recovering. Read your guardians this fingerprint: {}",
-                    v["fingerprint"].as_str().unwrap_or("")
+                    "You are in touch with that guardian. Read each guardian this fingerprint:"
                 );
             } else {
-                println!("No recovery is under way. Ask a guardian for a code (`cardinal guarding code`).");
+                println!("Recovering. Read each guardian this fingerprint:");
+            }
+            println!("    {}", v["fingerprint"].as_str().unwrap_or(""));
+            println!("Bring each guardian's invitation the same way. Once enough have confirmed,");
+            println!("run `cardinal recover finish`.");
+            Ok(())
+        }
+        Cmd::Recover {
+            cmd: Some(RecoverCmd::Invite { address }),
+        } => {
+            let v = call(&paths, json!({"cmd": "recover-invite", "at": address})).await?;
+            println!("Have your guardian use this on their device (`cardinal accept CODE`):");
+            println!("{}", v["code"].as_str().unwrap_or(""));
+            println!(
+                "Then read them this fingerprint: {}",
+                v["fingerprint"].as_str().unwrap_or("")
+            );
+            Ok(())
+        }
+        Cmd::Recover {
+            cmd: Some(RecoverCmd::Cancel),
+        } => {
+            let v = call(&paths, json!({"cmd": "recover-cancel"})).await?;
+            match v["fingerprint"].as_str() {
+                Some(fp) => println!(
+                    "Given up. Tell each guardian never to confirm the recovery \"{fp}\" \
+                     (`cardinal guarding never`)."
+                ),
+                None => println!("No recovery was under way."),
             }
             Ok(())
         }
         Cmd::Recover {
-            cmd: Some(RecoverCmd::Start { code, key }),
+            cmd:
+                Some(RecoverCmd::Finish {
+                    host,
+                    key,
+                    without_hosts,
+                }),
         } => {
             let v = call(
                 &paths,
-                json!({"cmd": "recover-via", "code": code, "key": key}),
+                json!({"cmd": "recover-finish", "at": host, "key": key, "without_hosts": without_hosts}),
             )
             .await?;
-            println!("Your guardians have been asked. Read each of them this fingerprint:");
-            println!("    {}", v["fingerprint"].as_str().unwrap_or(""));
-            println!(
-                "Once they have confirmed, run `cardinal recover finish --host ADDR --key KEY`"
-            );
-            println!("with the host on your recovery sheet.");
-            Ok(())
-        }
-        Cmd::Recover {
-            cmd: Some(RecoverCmd::Finish { host, key }),
-        } => {
-            let v = call(
-                &paths,
-                json!({"cmd": "recover-finish", "at": host, "key": key}),
-            )
-            .await?;
-            println!("Recovered. Your files are coming back.");
-            println!("What your lost devices wrote is set aside: once it has arrived, keep what");
-            println!("you recognize with `cardinal keep-work DEVICE`.");
+            match v["at"].as_str() {
+                Some(at) => {
+                    println!("Recovered, through {at}. Your files are coming back.");
+                    println!(
+                        "What your lost devices wrote is set aside: once it has arrived, keep what"
+                    );
+                    println!("you recognize with `cardinal keep-work DEVICE`.");
+                }
+                None => {
+                    println!("Recovered, from what your guardians hold. No host of yours could");
+                    println!("bring your files back, so this device starts with empty ones.");
+                }
+            }
+            print_kept(&v);
             println!();
             println!("Your new recovery words. Write them down, in order, and keep them safe:");
             println!("the old ones no longer work.");
@@ -2383,7 +2608,15 @@ async fn client(cmd: Cmd) -> anyhow::Result<()> {
                 "no_introductions": no_introductions,
             });
             let v = call(&paths, req).await?;
-            println!("Connected to {}.", v["name"].as_str().unwrap_or(""));
+            if v["recovery_of"].is_string() {
+                println!(
+                    "In touch, as {}. It is no contact: see it with `cardinal guarding`, \
+                     and check the fingerprint with them before you endorse.",
+                    v["name"].as_str().unwrap_or("")
+                );
+            } else {
+                println!("Connected to {}.", v["name"].as_str().unwrap_or(""));
+            }
             Ok(())
         }
         Cmd::Contacts {

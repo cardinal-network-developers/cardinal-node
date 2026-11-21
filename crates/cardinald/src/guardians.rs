@@ -10,71 +10,91 @@
 //!
 //! **A guardian.** Every guardian holds the person's log, as a contact, and
 //! finds its own record by opening the sealed ones: that is how it is
-//! told. `cardinal guarding` lists whom this person guards and any
-//! recovery wanted. A guardian gives the person's new device a code
-//! (`cardinal guarding code NAME`), over which that device signs a
-//! `recover` the guardian's device proposes and appends; then each
-//! guardian, after checking the fingerprint with the person, endorses,
-//! waits the delay from when it saw a threshold endorse, and confirms with
-//! its share sealed to the new device. Endorsements and confirmations are
-//! entries in the guardian's own log, delivered with that log to the
-//! person's devices and hosts under the person's label
-//! (`identity.md#distribution`).
+//! told. `cardinal guarding` lists whom this person guards and the one
+//! recovery of each it shows at a time. The person's new device makes a
+//! recovery helper, an identity of its own (`helper.rs`), and meets each
+//! guardian through an ordinary invitation naming, in field 9, whom it
+//! recovers (`contact.md#invitations`): usually one the guardian makes
+//! (`cardinal guarding invite NAME`), or one the new device makes, which
+//! only a guardian's person can answer. That gives a relationship of its
+//! own with each guardian, shown as "recovery for" the person and never as a
+//! contact. Through it the guardian's device proposes the `recover`
+//! (parents, policy, and the hosts the person's reach node names in the
+//! guardian's relationship with them, each a device key of the person's
+//! log) and carries the person's log; the helper carries back the signed
+//! `recover` and the other guardians' acts, so that guardians who are
+//! strangers see each other's endorsements without learning who the
+//! others are. Each guardian, after checking the five-word fingerprint
+//! with the person and being warned in plain words, endorses, waits the
+//! delay from when it saw a threshold endorse, and confirms with its share
+//! sealed to the new device. Endorsements and confirmations are entries in
+//! the guardian's own log, delivered with that log to the person's devices
+//! and hosts under the person's label (`identity.md#distribution`), and
+//! carried to every helper of the recovery.
 //!
 //! The new device's side is `recovering.rs`.
 
-use std::collections::{BTreeMap, BTreeSet};
-use std::net::SocketAddr;
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
 use cardinal_crypto::HybridKeyPair;
-use cardinal_encoding::{Record, Value};
 use cardinal_identity::guardians::{same_fingerprint, Policy, Recovery, DEFAULT_DELAY};
 use cardinal_identity::{EntryId, IdentityEntry, IdentityLog, IdentityOp, OpBody, Power};
-use cardinal_link::{Service, Session, Stream};
+use cardinal_link::Session;
 use cardinal_space::account;
+use cardinal_space::relationship::{self, ProposedHost};
+use cardinal_space::{SpaceId, SpaceOp};
 use cardinal_sync::identity_log_label;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value as Json};
-use tokio::io::AsyncWriteExt;
 
 use crate::core::{now_ms, short};
-use crate::daemon::{lock, Daemon, PeerKind};
+use crate::daemon::Daemon;
 use crate::net;
 
-/// The link service a new device and a guardian's device speak over a
-/// help code's session. The spec leaves how they meet to software
-/// (DEVIATIONS.md).
-pub const SERVICE_NAME: &str = "cardinal-node recovery help 1";
-
-/// The link service.
-pub fn service() -> Service {
-    Service::App(*blake3::hash(SERVICE_NAME.as_bytes()).as_bytes())
+/// What software tells a guardian, in plain words, before they endorse
+/// and again before they confirm (`identity.md#how-guardians-act`, step 2).
+pub fn caution(name: &str) -> String {
+    format!(
+        "Before you go on: this gives whoever holds that new device {name}'s whole identity. \
+         It is safest done in person. Over the phone or a video call, go ahead only when you \
+         are sure of the voice and the face, and after asking something only {name} would \
+         know. Someone hurrying you is a reason to wait."
+    )
 }
 
-/// Messages of the help service: the new device asks, the guardian's
-/// device proposes, the new device sends the signed `recover`, the
-/// guardian's device says it took it.
-pub(crate) const ASK: u64 = 1;
-pub(crate) const PROPOSAL: u64 = 2;
-pub(crate) const RECOVER: u64 = 3;
-pub(crate) const TAKEN: u64 = 4;
-pub(crate) const REFUSED: u64 = 0;
+/// What a second recovery of someone shows, while another is under way.
+fn second_warning(name: &str, waiting: usize) -> String {
+    format!(
+        "{} recovery of {name} arrived while this one is under way. Someone else may be \
+         trying to take their identity. Ask {name}, in person if you can, which is theirs; \
+         only this one is shown until you tell this device never to confirm it \
+         (`cardinal guarding never`).",
+        if waiting == 1 {
+            "Another"
+        } else {
+            "More than one other"
+        }
+    )
+}
 
-/// The prefix of a help code.
-pub const HELP_PREFIX: &str = "cardinal-help:";
-
-/// How long a help code is good for.
-pub const HELP_FOR: Duration = Duration::from_secs(24 * 60 * 60);
+/// The account setting by which a guardian says never to confirm a
+/// recovery, on every device of theirs: this, then the decision's id in
+/// hex (`profiles.md#account`, kind 6).
+pub const NEVER_SETTING: &str = "guardians: never confirm ";
 
 /// What this device has seen as a guardian, kept across restarts: when
 /// it first saw a threshold of guardians endorse each recovery, which is
-/// when its wait starts (`identity.md#how-guardians-act`, step 3).
+/// when its wait starts (`identity.md#how-guardians-act`, step 3), and
+/// when it first saw each recovery, which is the order they are shown in.
 #[derive(Default, Serialize, Deserialize)]
 struct Seen {
     /// Decision (hex) to milliseconds since the epoch.
     threshold: BTreeMap<String, u64>,
+    /// Decision (hex) to milliseconds since the epoch.
+    #[serde(default)]
+    first: BTreeMap<String, u64>,
 }
 
 fn load_seen(d: &Daemon) -> Seen {
@@ -359,6 +379,9 @@ pub(crate) fn guarded(d: &Daemon) -> Vec<Guarded> {
         .collect();
     let mut out = Vec::new();
     for c in core.contacts() {
+        if c.recovery_of.is_some() {
+            continue;
+        }
         let Some(other) = core.others.get(&c.identity) else {
             continue;
         };
@@ -384,6 +407,38 @@ pub(crate) fn guarded(d: &Daemon) -> Vec<Guarded> {
         }
     }
     out
+}
+
+/// Whether this person guards `who`.
+pub(crate) fn guards(d: &Daemon, who: &EntryId) -> bool {
+    guarded(d).iter().any(|g| g.identity == *who)
+}
+
+/// A recovery invitation naming `who` is answered here only if this person
+/// guards them. Anyone else's device tells its person so, and sends
+/// nothing back: guardians and others look alike from outside
+/// (`identity.md#how-guardians-act`).
+pub(crate) fn may_answer(d: &Daemon, who: &EntryId) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        guards(d, who),
+        "that is an invitation to help someone recover their identity, and you are not one \
+         of their guardians (or this device does not know you are yet). Nothing was sent \
+         back. If someone asked you to use it, they may be trying to find out who guards \
+         that person."
+    );
+    Ok(())
+}
+
+/// What a recovery's relationship is called on a guardian's devices: never
+/// the helper's own name, nor a contact's.
+pub(crate) fn helper_petname(d: &Daemon, who: &EntryId) -> String {
+    let core = d.core();
+    let name = core
+        .contacts()
+        .into_iter()
+        .find(|c| c.identity == *who && c.recovery_of.is_none())
+        .map_or_else(|| account::short_key(who), |c| c.petname);
+    format!("recovery for {name}")
 }
 
 /// A recovery of someone this person guards, as this device sees it.
@@ -417,8 +472,62 @@ fn wanted(d: &Daemon, g: &Guarded) -> Vec<Wanted> {
         .collect()
 }
 
-/// Notes when a threshold of guardians was first seen to endorse each
-/// recovery of someone this person guards. Called whenever a log changes.
+/// The recoveries this person said never to confirm, on any of their
+/// devices.
+fn nevers(d: &Daemon) -> HashSet<EntryId> {
+    let core = d.core();
+    let Some(acc) = core.account().and_then(|a| a.space.as_ref()) else {
+        return HashSet::new();
+    };
+    account::settings(acc.state())
+        .into_iter()
+        .filter(|(_, v)| v.as_bool() == Some(true))
+        .filter_map(|(name, _)| {
+            let hex = name.strip_prefix(NEVER_SETTING)?;
+            hex::decode(hex).ok()?.try_into().ok()
+        })
+        .collect()
+}
+
+/// The recoveries of `g`, as a guardian is shown them: the one shown, the
+/// others under way that wait behind it, and those said never to. One
+/// recovery of a person is shown at a time: one in effect, else the first
+/// this device saw of those not said never to
+/// (`identity.md#how-guardians-act`).
+struct Shown {
+    shown: Option<Wanted>,
+    waiting: Vec<Wanted>,
+    never: Vec<Wanted>,
+}
+
+fn shown(d: &Daemon, seen: &Seen, g: &Guarded) -> Shown {
+    let never = nevers(d);
+    let mut all = wanted(d, g);
+    let first = |w: &Wanted| {
+        seen.first
+            .get(&hex::encode(w.recovery.entry))
+            .copied()
+            .unwrap_or(u64::MAX)
+    };
+    all.sort_by_key(|w| (!w.in_effect, first(w), w.recovery.entry));
+    let (never, mut rest): (Vec<Wanted>, Vec<Wanted>) = all
+        .into_iter()
+        .partition(|w| never.contains(&w.recovery.entry) && !w.in_effect);
+    let shown = (!rest.is_empty()).then(|| rest.remove(0));
+    // once one is in effect, the others can no longer be
+    if shown.as_ref().is_some_and(|w| w.in_effect) {
+        rest.clear();
+    }
+    Shown {
+        shown,
+        waiting: rest,
+        never,
+    }
+}
+
+/// Notes when each recovery of someone this person guards was first seen,
+/// and when a threshold of guardians was first seen to endorse it. Called
+/// whenever a log changes.
 pub fn observe(d: &Daemon) {
     // one at a time: what is seen is read, added to, and written back
     static ONE: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -426,8 +535,25 @@ pub fn observe(d: &Daemon) {
     let mut seen = load_seen(d);
     let mut changed = false;
     for g in guarded(d) {
-        for w in wanted(d, &g) {
+        let all = wanted(d, &g);
+        let under_way = |seen: &Seen| {
+            all.iter()
+                .filter(|w| !w.in_effect && seen.first.contains_key(&hex::encode(w.recovery.entry)))
+                .count()
+        };
+        for w in &all {
             let key = hex::encode(w.recovery.entry);
+            if !seen.first.contains_key(&key) {
+                if under_way(&seen) > 0 && !w.in_effect {
+                    tracing::warn!(
+                        "a second recovery of {} arrived (fingerprint {}) while one is under way",
+                        g.name,
+                        w.recovery.fingerprint()
+                    );
+                }
+                seen.first.insert(key.clone(), now_ms());
+                changed = true;
+            }
             if w.endorsed.len() as u64 >= g.policy.threshold && !seen.threshold.contains_key(&key) {
                 tracing::info!(
                     "a recovery of {} is pending: {} of {} guardians endorsed it",
@@ -442,6 +568,7 @@ pub fn observe(d: &Daemon) {
     }
     if changed {
         save_seen(d, &seen);
+        d.bump();
     }
 }
 
@@ -456,7 +583,21 @@ fn confirm_from(seen: &Seen, g: &Guarded, w: &Wanted) -> Option<u64> {
     Some(since.saturating_add(wait.saturating_mul(1000)))
 }
 
-/// `cardinal guarding`: whom this person guards, and recoveries wanted.
+/// The recovery relationships for `who`: contacts that are a recovery
+/// helper of theirs, in this person's account.
+fn helpers_of(d: &Daemon, who: &EntryId) -> Vec<account::ContactRecord> {
+    let core = d.core();
+    let mut v: Vec<_> = core
+        .contacts()
+        .into_iter()
+        .filter(|c| c.recovery_of == Some(*who) && !c.refused)
+        .collect();
+    v.sort_by_key(|c| c.space);
+    v
+}
+
+/// `cardinal guarding`: whom this person guards, and the recovery of each
+/// shown, with any others that wait behind it.
 pub fn list(d: &Daemon) -> Json {
     observe(d);
     let seen = load_seen(d);
@@ -464,10 +605,12 @@ pub fn list(d: &Daemon) -> Json {
     let people: Vec<Json> = guarded(d)
         .iter()
         .map(|g| {
-            let recoveries: Vec<Json> = wanted(d, g)
+            let s = shown(d, &seen, g);
+            let mine = |set: &BTreeSet<EntryId>| me.is_some_and(|m| set.contains(&m));
+            let recoveries: Vec<Json> = s
+                .shown
                 .iter()
                 .map(|w| {
-                    let mine = |s: &BTreeSet<EntryId>| me.is_some_and(|m| s.contains(&m));
                     json!({
                         "fingerprint": w.recovery.fingerprint(),
                         "endorsed": w.endorsed.len(),
@@ -478,17 +621,23 @@ pub fn list(d: &Daemon) -> Json {
                         "confirm_from_ms": confirm_from(&seen, g, w),
                         "objected": w.objected,
                         "in_effect": w.in_effect,
+                        "caution": (!w.in_effect).then(|| caution(&g.name)),
                     })
                 })
                 .collect();
+            let never: Vec<String> = s.never.iter().map(|w| w.recovery.fingerprint()).collect();
             json!({
                 "name": g.name,
-                "id": hex::encode(&g.identity[..8]),
+                "id": hex::encode(g.identity),
                 "guardians": g.policy.commitments.len(),
                 "threshold": g.policy.threshold,
                 "delay": g.policy.delay,
                 "delay_text": delay_text(g.policy.delay),
                 "recoveries": recoveries,
+                "waiting": s.waiting.len(),
+                "warning": (!s.waiting.is_empty()).then(|| second_warning(&g.name, s.waiting.len())),
+                "never": never,
+                "helpers": helpers_of(d, &g.identity).len(),
             })
         })
         .collect();
@@ -505,13 +654,36 @@ fn find_guarded(d: &Daemon, who: &str) -> anyhow::Result<Guarded> {
     Ok(all.swap_remove(at))
 }
 
-/// The one recovery of `g` the person means, by the fingerprint they read.
+/// The recovery of `g` the person means, by the fingerprint they read: the
+/// one shown. One that waits behind it, or one said never to, is refused,
+/// with why.
 fn find_wanted(d: &Daemon, g: &Guarded, fingerprint: &str) -> anyhow::Result<Wanted> {
-    let mut all = wanted(d, g);
-    anyhow::ensure!(!all.is_empty(), "nobody has asked to recover {}", g.name);
-    let shown: Vec<String> = all.iter().map(|w| w.recovery.fingerprint()).collect();
-    let at = pick_fingerprint(&shown, fingerprint, &g.name)?;
-    Ok(all.swap_remove(at))
+    let s = shown(d, &load_seen(d), g);
+    anyhow::ensure!(
+        s.shown.is_some() || !s.never.is_empty(),
+        "nobody has asked to recover {}",
+        g.name
+    );
+    let matches = |ws: &[Wanted]| {
+        ws.iter()
+            .any(|w| same_fingerprint(fingerprint, &w.recovery.fingerprint()))
+    };
+    anyhow::ensure!(
+        !matches(&s.never),
+        "you told this device never to confirm that recovery of {}",
+        g.name
+    );
+    anyhow::ensure!(
+        !matches(&s.waiting),
+        "that is another recovery of {name}, which waits while one is under way. If the one \
+         under way is not theirs, tell this device never to confirm it (`cardinal guarding \
+         never {name} FINGERPRINT`).",
+        name = g.name
+    );
+    let mut shown: Vec<Wanted> = s.shown.into_iter().collect();
+    let fps: Vec<String> = shown.iter().map(|w| w.recovery.fingerprint()).collect();
+    let at = pick_fingerprint(&fps, fingerprint, &g.name)?;
+    Ok(shown.swap_remove(at))
 }
 
 /// Which of the recoveries `shown` the person read out: exactly one must
@@ -563,7 +735,7 @@ pub async fn endorse(d: &Arc<Daemon>, who: &str, fingerprint: &str) -> anyhow::R
 pub async fn confirm(d: &Arc<Daemon>, who: &str, fingerprint: &str) -> anyhow::Result<Json> {
     let g = find_guarded(d, who)?;
     // Own devices first, so this person's phone and laptop do not confirm
-    // opposite decisions unawares.
+    // opposite decisions unawares, nor one said never to on the other.
     sync_own_log(d).await;
     observe(d);
     let w = find_wanted(d, &g, fingerprint)?;
@@ -606,6 +778,31 @@ pub async fn confirm(d: &Arc<Daemon>, who: &str, fingerprint: &str) -> anyhow::R
         IdentityOp::confirm(w.recovery.entry, g.position, g.salt, Some(&sealed)),
     )
     .await?;
+    Ok(list(d))
+}
+
+/// `cardinal guarding never NAME FINGERPRINT`: the person asked that a
+/// recovery be started over (their new device was lost before it took
+/// effect), so this guardian never endorses or confirms the old one, on
+/// any of their devices (`identity.md#how-guardians-act`).
+pub fn never(d: &Arc<Daemon>, who: &str, fingerprint: &str) -> anyhow::Result<Json> {
+    let g = find_guarded(d, who)?;
+    let all = wanted(d, &g);
+    let fps: Vec<String> = all.iter().map(|w| w.recovery.fingerprint()).collect();
+    let w = &all[pick_fingerprint(&fps, fingerprint, &g.name)?];
+    anyhow::ensure!(
+        !w.in_effect,
+        "that recovery of {} is in effect already; nothing undoes it",
+        g.name
+    );
+    if !nevers(d).contains(&w.recovery.entry) {
+        let acc = d
+            .core()
+            .account_id()
+            .ok_or_else(|| anyhow::anyhow!("the account space is not here yet"))?;
+        let name = format!("{NEVER_SETTING}{}", hex::encode(w.recovery.entry));
+        d.write_and_push(&acc, vec![account::create_setting(&name, true)])?;
+    }
     Ok(list(d))
 }
 
@@ -656,24 +853,30 @@ fn chain_allows(
     Ok(())
 }
 
-/// Reconciles this person's own log with their devices in touch.
+/// Reconciles this person's own log, and their account, with their devices
+/// in touch.
 async fn sync_own_log(d: &Arc<Daemon>) {
-    let Some(label) = d.core().identity_label() else {
-        return;
+    let labels: Vec<[u8; 32]> = {
+        let core = d.core();
+        core.identity_label()
+            .into_iter()
+            .chain(core.account_id())
+            .collect()
     };
     for s in d.own_sessions() {
-        let r = tokio::time::timeout(Duration::from_secs(10), net::reconcile(d, &s, label)).await;
-        if !matches!(r, Ok(Ok(()))) {
-            tracing::debug!(
-                "syncing the log with {} before confirming",
-                short(&s.peer_static())
-            );
+        for label in &labels {
+            let r =
+                tokio::time::timeout(Duration::from_secs(10), net::reconcile(d, &s, *label)).await;
+            if !matches!(r, Ok(Ok(()))) {
+                tracing::debug!("syncing with {} before confirming", short(&s.peer_static()));
+            }
         }
     }
 }
 
 /// Writes `op` in this guardian's own log, and delivers that log up to it
-/// to the guarded person's devices and hosts, under the person's label.
+/// to the guarded person's devices and hosts, under the person's label,
+/// and to every recovery helper of theirs.
 async fn act(d: &Arc<Daemon>, g: &Guarded, op: IdentityOp) -> anyhow::Result<()> {
     let (entry, log) = {
         let mut core = d.core();
@@ -697,6 +900,11 @@ async fn act(d: &Arc<Daemon>, g: &Guarded, op: IdentityOp) -> anyhow::Result<()>
     // Held here under their label too, so that whoever syncs it with this
     // device gets it.
     d.core().ingest_other(g.identity, &log)?;
+    for c in helpers_of(d, &g.identity) {
+        if let Err(e) = carry(d, &c.space, &g.identity, &log) {
+            tracing::debug!("carrying to a recovery helper: {e:#}");
+        }
+    }
     deliver(d, &g.identity, log).await;
     observe(d);
     Ok(())
@@ -723,212 +931,275 @@ pub(crate) async fn deliver(d: &Arc<Daemon>, guarded: &EntryId, objects: Vec<Vec
     }
 }
 
-// ---- Help codes ----------------------------------------------------------
+// ---- Recovery relationships ---------------------------------------------
 
-/// A help code: where this guardian's device is, and a secret that opens a
-/// session with it for one recovery of one person.
-pub struct HelpCode {
-    /// Whom it helps recover.
-    pub identity: EntryId,
-    /// This device's X25519 static key.
-    pub static_key: [u8; 32],
-    /// The secret.
-    pub secret: [u8; 16],
-    /// Addresses to try.
-    pub addrs: Vec<SocketAddr>,
-}
+/// The most an entry written to carry identity entries holds, so that a
+/// contact's device takes it whole (`mailbox::TOKEN_MESSAGE`).
+const CARRY_BATCH: usize = 32 * 1024;
 
-impl HelpCode {
-    /// The text form.
-    pub fn to_text(&self) -> String {
-        let r = Record::new()
-            .with(1, self.identity)
-            .with(2, self.static_key)
-            .with(3, self.secret)
-            .with(
-                4,
-                Value::list(self.addrs.iter().map(|a| Value::from(a.to_string()))),
-            );
-        format!(
-            "{HELP_PREFIX}{}",
-            cardinal_contact::invitation::base32_encode(&r.encode())
-        )
-    }
-
-    /// Reads one, however it was pasted.
-    pub fn from_text(s: &str) -> Option<HelpCode> {
-        let body: String = s
-            .trim()
-            .strip_prefix(HELP_PREFIX)?
-            .split_whitespace()
-            .collect();
-        let bytes = cardinal_contact::invitation::base32_decode(&body)?;
-        let r = Record::decode(&bytes).ok()?;
-        Some(HelpCode {
-            identity: r.bytes_n(1).ok()?,
-            static_key: r.bytes_n(2).ok()?,
-            secret: r.bytes_n(3).ok()?,
-            addrs: r
-                .list(4)
-                .ok()?
-                .iter()
-                .filter_map(|v| v.as_text()?.parse().ok())
-                .collect(),
-        })
-    }
-}
-
-/// `cardinal guarding code NAME`: a code for NAME's new device, which it
-/// uses to reach this device and ask it to propose their recovery.
-pub fn help(d: &Arc<Daemon>, who: &str, at: &[String]) -> anyhow::Result<Json> {
-    let g = find_guarded(d, who)?;
-    let secret: [u8; 16] = cardinal_crypto::random_bytes();
-    let mut entry = cardinal_link::SecretEntry::new(&secret);
-    entry.uses = None;
-    let id = d.endpoint.add_secret(entry);
-    lock(&d.helping).insert(id, g.identity);
-    let d2 = d.clone();
-    d.rt.spawn(async move {
-        tokio::time::sleep(HELP_FOR).await;
-        d2.endpoint.remove_secret(id);
-        lock(&d2.helping).remove(&id);
-    });
-    let mut addrs: Vec<SocketAddr> = Vec::new();
-    for a in at {
-        addrs.push(a.parse().map_err(|_| {
-            anyhow::anyhow!("{a} is not an address; it looks like 192.168.1.20:7171")
-        })?);
-    }
-    if addrs.is_empty() {
-        let port = d.endpoint.tcp_addr().map_or(0, |a| a.port());
-        addrs.extend(
-            crate::daemon::local_ips()
-                .into_iter()
-                .map(|ip| SocketAddr::new(ip, port)),
-        );
-        addrs.push(SocketAddr::from(([127, 0, 0, 1], port)));
-    }
-    let code = HelpCode {
-        identity: g.identity,
-        static_key: *d.keys.link.public_key().x25519(),
-        secret,
-        addrs,
-    };
-    Ok(json!({"code": code.to_text(), "name": g.name}))
-}
-
-/// Who a help code's session is for, if it was opened with one.
-pub fn helping(d: &Daemon, s: &Session) -> Option<EntryId> {
-    match s.admission() {
-        cardinal_link::Admission::Secret { id, .. } => lock(&d.helping).get(&id).copied(),
-        _ => None,
-    }
-}
-
-fn refused(why: &str) -> Value {
-    Value::Record(Record::new().with(0, REFUSED).with(1, why))
-}
-
-/// Serves the help service on a help code's session: proposes a recovery,
-/// and takes the `recover` the new device signed.
-pub async fn serve(d: &Arc<Daemon>, s: &Session, mut st: Stream) -> anyhow::Result<()> {
-    let PeerKind::Helped(identity) = d.classify(s) else {
-        st.reset(0);
-        return Ok(());
-    };
-    while let Some(v) = st.recv_message_max(64 * 1024).await? {
-        let r = v
-            .as_record()
-            .ok_or_else(|| anyhow::anyhow!("not a record"))?;
-        let reply = match r.get(0).and_then(Value::as_uint) {
-            Some(ASK) => proposal(d, &identity).unwrap_or_else(|e| refused(&e.to_string())),
-            Some(RECOVER) => {
-                let bytes = r.bytes(1).unwrap_or_default().to_vec();
-                match take_recover(d, &identity, &bytes).await {
-                    Ok(()) => Value::Record(Record::new().with(0, TAKEN)),
-                    Err(e) => refused(&e.to_string()),
-                }
-            }
-            _ => break,
+/// Writes in a relationship space, as `carried` nodes, each of `entries`
+/// that is not there yet, whoever carried it. `recovered` is whom the
+/// recovery is of.
+pub(crate) fn carry(
+    d: &Arc<Daemon>,
+    space: &SpaceId,
+    recovered: &EntryId,
+    entries: &[Vec<u8>],
+) -> anyhow::Result<usize> {
+    let ops: Vec<SpaceOp> = {
+        let core = d.core();
+        let Some(sp) = core.spaces.get(space).and_then(|h| h.space.as_ref()) else {
+            return Ok(0);
         };
-        st.send_message(&reply).await?;
+        let mut there: HashSet<EntryId> = relationship::carried(sp)
+            .iter()
+            .filter_map(|c| IdentityEntry::decode(&c.entry).ok())
+            .map(|e| e.id())
+            .collect();
+        entries
+            .iter()
+            .filter_map(|b| {
+                let id = IdentityEntry::decode(b).ok()?.id();
+                there
+                    .insert(id)
+                    .then(|| relationship::create_carried(recovered, b))
+            })
+            .collect()
+    };
+    let n = ops.len();
+    let mut batch = Vec::new();
+    let mut size = 0;
+    for op in ops {
+        let len = op.record().encode().len();
+        if !batch.is_empty() && size + len > CARRY_BATCH {
+            d.write_and_push(space, std::mem::take(&mut batch))?;
+            size = 0;
+        }
+        size += len;
+        batch.push(op);
     }
-    let _ = st.shutdown().await;
-    Ok(())
+    if !batch.is_empty() {
+        d.write_and_push(space, batch)?;
+    }
+    Ok(n)
 }
 
-/// What the new device needs to sign a `recover`: the parents, the policy,
-/// and the person's keys in effect, of which it may keep some.
-fn proposal(d: &Daemon, identity: &EntryId) -> anyhow::Result<Value> {
-    let g = guarded(d)
-        .into_iter()
-        .find(|g| g.identity == *identity)
-        .ok_or_else(|| anyhow::anyhow!("this device no longer guards them"))?;
+/// `cardinal guarding invite NAME [--address ADDR]`: an invitation for
+/// NAME's new device, naming NAME in field 9, so that it meets this
+/// guardian in a relationship of its own. Like any invitation, it is kept
+/// in the account space, so every device of this person answers it.
+pub fn invite(d: &Arc<Daemon>, who: &str, at: Option<&str>) -> anyhow::Result<Json> {
+    let g = find_guarded(d, who)?;
+    let invitation = crate::contacts::invite_recovery(d, at, g.identity)?;
+    Ok(json!({"code": invitation.to_text(), "name": g.name}))
+}
+
+/// The proposal this guardian's device makes for a recovery of `g`
+/// (`identity.md#how-guardians-act`, step 1): parents the person
+/// recognizes, the policy, and the person's hosts, those the person's
+/// reach node names in this person's relationship with them, each matched
+/// by its static key to a device key their log names. A host their log
+/// does not name is left out.
+fn proposal(d: &Daemon, g: &Guarded) -> anyhow::Result<SpaceOp> {
     let core = d.core();
-    let other = core.others.get(identity).expect("guarded");
+    let other = core
+        .others
+        .get(&g.identity)
+        .ok_or_else(|| anyhow::anyhow!("their log is not here"))?;
     let current = other.log.current_policy();
     anyhow::ensure!(
         current.as_ref().map(|p| p.entry) == Some(g.policy.entry),
         "their guardians have changed"
     );
     let st = other.log.state();
-    let keys = st.keys.values().map(|k| {
-        Value::Record(
-            Record::new()
-                .with(1, k.key)
-                .with_opt(2, k.link_key.as_ref().map(|l| *l.x25519()))
-                .with(3, k.power.value()),
-        )
-    });
-    Ok(Value::Record(
-        Record::new()
-            .with(0, PROPOSAL)
-            .with(1, *identity)
-            .with(
-                2,
-                Value::list(other.log.recovery_parents().into_iter().map(Value::from)),
-            )
-            .with(3, g.policy.entry)
-            .with(4, Value::list(keys)),
+    let space = core
+        .contacts()
+        .into_iter()
+        .find(|c| c.identity == g.identity && c.recovery_of.is_none())
+        .map(|c| c.space);
+    let reach = space
+        .map(|s| core.reach_of(&s, &g.identity))
+        .unwrap_or_default();
+    let mut hosts: Vec<ProposedHost> = reach
+        .into_iter()
+        .filter_map(|r| {
+            let k = st
+                .keys
+                .values()
+                .find(|k| k.link_key.as_ref().map(|l| *l.x25519()) == Some(r.host))?;
+            Some(ProposedHost {
+                key: k.key,
+                host: r.host,
+                endpoints: r.endpoints,
+            })
+        })
+        .collect();
+    // Tests: a guardian who tries to bring in a device of their own.
+    if std::env::var_os("CARDINAL_TEST_PROPOSE_OWN_DEVICE").is_some() {
+        let at = d
+            .endpoint
+            .udp_addr()
+            .or(d.endpoint.tcp_addr())
+            .and_then(|a| cardinal_space::grant::Endpoint::parse(&a.to_string()));
+        hosts.push(ProposedHost {
+            key: d.keys.key(),
+            host: *d.keys.link.public_key().x25519(),
+            endpoints: at.into_iter().collect(),
+        });
+    }
+    Ok(relationship::create_proposal(
+        &g.identity,
+        &other.log.recovery_parents(),
+        &g.policy.entry,
+        &hosts,
     ))
 }
 
-/// Takes a `recover` of `identity` from its new device: appends it to the
-/// log here and passes it on to the person's devices and hosts.
-async fn take_recover(d: &Arc<Daemon>, identity: &EntryId, bytes: &[u8]) -> anyhow::Result<()> {
-    let e = IdentityEntry::decode(bytes)?;
-    anyhow::ensure!(e.identity() == *identity, "that is someone else's");
-    let [op] = e.ops() else {
-        anyhow::bail!("a recover is alone in its entry");
+/// After a recovery relationship for `who` was made, on a guardian's
+/// device: proposes the recovery in it, unless this person proposed one
+/// there already, and carries the person's log, so that the new device
+/// can check what it signs and, with no host, take the identity up from
+/// it.
+pub(crate) fn met_helper(d: &Arc<Daemon>, space: &SpaceId, who: &EntryId) {
+    let Some(g) = guarded(d).into_iter().rev().find(|g| g.identity == *who) else {
+        return;
     };
-    let OpBody::Recover { root, policy, .. } = op.body() else {
-        anyhow::bail!("that is not a recover");
+    let me = d.core().me();
+    let proposed = {
+        let core = d.core();
+        core.spaces
+            .get(space)
+            .and_then(|h| h.space.as_ref())
+            .is_some_and(|sp| {
+                relationship::proposals(sp)
+                    .iter()
+                    .any(|p| Some(p.author) == me && p.identity == *who)
+            })
     };
-    anyhow::ensure!(e.signer() == *root, "a recover is signed by its new root");
-    {
-        let g = guarded(d)
-            .into_iter()
-            .find(|g| g.identity == *identity)
-            .ok_or_else(|| anyhow::anyhow!("this device no longer guards them"))?;
-        anyhow::ensure!(
-            *policy == g.policy.entry,
-            "that recovery acts under another policy"
-        );
-    }
-    d.core().ingest_other(*identity, &[bytes.to_vec()])?;
-    tracing::info!(
-        "a recovery of {} was asked for; fingerprint {}",
-        short(identity),
-        cardinal_identity::guardians::fingerprint(
-            root,
-            match op.body() {
-                OpBody::Recover { link_key, .. } => link_key.as_ref(),
-                _ => None,
+    if !proposed {
+        match proposal(d, &g) {
+            Ok(op) => {
+                if let Err(e) = d.write_and_push(space, vec![op]) {
+                    tracing::warn!("cannot propose the recovery of {}: {e:#}", g.name);
+                }
             }
-        )
-    );
-    deliver(d, identity, vec![bytes.to_vec()]).await;
-    Ok(())
+            Err(e) => tracing::warn!("cannot propose the recovery of {}: {e:#}", g.name),
+        }
+    }
+    let log: Vec<Vec<u8>> = {
+        let core = d.core();
+        core.others
+            .get(who)
+            .map(|o| o.log.entries().map(IdentityEntry::encode).collect())
+            .unwrap_or_default()
+    };
+    if let Err(e) = carry(d, space, who, &log) {
+        tracing::warn!("cannot carry {}'s log to their new device: {e:#}", g.name);
+    }
+    tracing::info!("a recovery helper of {} is in touch", g.name);
+}
+
+/// After entries of a space arrived: if it is a recovery relationship for
+/// someone this person guards, takes what the helper carried. Of the
+/// person's own log only a `recover` is taken, alone in its entry, signed
+/// by its new root, under the policy this person guards; of anyone else's,
+/// what [`crate::core::Core::ingest_other`] keeps, the causal past of
+/// another guardian's act. What is new here goes on to the person's
+/// devices and hosts, as a guardian's act does.
+pub fn on_space(d: &Arc<Daemon>, space: &SpaceId) {
+    let (helper, who) = {
+        let core = d.core();
+        let Some(c) = core
+            .contacts()
+            .into_iter()
+            .find(|c| c.space == *space && c.recovery_of.is_some())
+        else {
+            return;
+        };
+        (c.identity, c.recovery_of.expect("checked"))
+    };
+    let Some(g) = guarded(d).into_iter().rev().find(|g| g.identity == who) else {
+        return;
+    };
+    let label = identity_log_label(&who);
+    let new: Vec<Vec<u8>> = {
+        let core = d.core();
+        let Some(sp) = core.spaces.get(space).and_then(|h| h.space.as_ref()) else {
+            return;
+        };
+        relationship::carried(sp)
+            .into_iter()
+            .filter(|c| c.author == helper && c.identity == who)
+            .filter_map(|c| {
+                let e = IdentityEntry::decode(&c.entry).ok()?;
+                if core.has(&label, &e.id()) {
+                    return None;
+                }
+                (e.identity() != who || is_recover_under(&e, &g.policy.entry)).then_some(c.entry)
+            })
+            .collect()
+    };
+    if new.is_empty() {
+        return;
+    }
+    let taken: Vec<Vec<u8>> = {
+        let mut core = d.core();
+        if let Err(e) = core.ingest_other(who, &new) {
+            tracing::debug!("what a recovery helper carried: {e:#}");
+            return;
+        }
+        new.into_iter()
+            .filter(|b| IdentityEntry::decode(b).is_ok_and(|e| core.has(&label, &e.id())))
+            .collect()
+    };
+    if taken.is_empty() {
+        return;
+    }
+    for b in &taken {
+        if let Some(r) = IdentityEntry::decode(b)
+            .ok()
+            .filter(|e| e.identity() == who)
+            .and_then(|e| recovery_of_entry(&e))
+        {
+            tracing::info!(
+                "a recovery of {} was asked for; fingerprint {}",
+                g.name,
+                r.fingerprint()
+            );
+        }
+    }
+    observe(d);
+    d.bump();
+    let d2 = d.clone();
+    d.rt.spawn(async move { deliver(&d2, &who, taken).await });
+}
+
+/// The `recover` an entry is, if it is one alone, signed by its new root.
+fn recovery_of_entry(e: &IdentityEntry) -> Option<Recovery> {
+    let [op] = e.ops() else {
+        return None;
+    };
+    let OpBody::Recover {
+        root,
+        keep,
+        link_key,
+        policy,
+        ..
+    } = op.body()
+    else {
+        return None;
+    };
+    (e.signer() == *root).then(|| Recovery {
+        entry: e.id(),
+        root: *root,
+        keep: keep.clone(),
+        link_key: link_key.clone(),
+        policy: *policy,
+    })
+}
+
+fn is_recover_under(e: &IdentityEntry, policy: &EntryId) -> bool {
+    recovery_of_entry(e).is_some_and(|r| r.policy == *policy)
 }
 
 #[cfg(test)]
@@ -939,11 +1210,15 @@ mod tests {
 
     #[test]
     fn a_fingerprint_two_recoveries_share_is_refused() {
-        let shown = vec!["ABCDE-FGHJK".to_owned(), "ZZZZZ-00000".to_owned()];
-        assert_eq!(pick_fingerprint(&shown, "abcde fghjk", "Ana").unwrap(), 0);
-        assert!(pick_fingerprint(&shown, "QQQQQ-QQQQQ", "Ana").is_err());
-        let twice = vec!["ABCDE-FGHJK".to_owned(), "ABCDE-FGHJK".to_owned()];
-        let e = pick_fingerprint(&twice, "ABCDE-FGHJK", "Ana").unwrap_err();
+        let one = "abandon ability able about above";
+        let shown = vec![one.to_owned(), "zoo zone wrist youth young".to_owned()];
+        assert_eq!(
+            pick_fingerprint(&shown, "ABAN abil ABLE abou abov", "Ana").unwrap(),
+            0
+        );
+        assert!(pick_fingerprint(&shown, "abandon ability able about absent", "Ana").is_err());
+        let twice = vec![one.to_owned(), one.to_owned()];
+        let e = pick_fingerprint(&twice, one, "Ana").unwrap_err();
         assert!(e.to_string().contains("more than one"), "{e}");
     }
 

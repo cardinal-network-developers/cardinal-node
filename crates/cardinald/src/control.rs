@@ -519,7 +519,10 @@ async fn handle(d: &Arc<Daemon>, req: &Value) -> anyhow::Result<Value> {
             crate::guardians::object(d, req.get("fingerprint").and_then(Value::as_str))
         }
         "guarding" => Ok(crate::guardians::list(d)),
-        "guarding-help" => crate::guardians::help(d, arg(req, "who")?, &strings(req, "at")),
+        "guarding-invite" => {
+            crate::guardians::invite(d, arg(req, "who")?, req.get("at").and_then(Value::as_str))
+        }
+        "guarding-never" => crate::guardians::never(d, arg(req, "who")?, arg(req, "fingerprint")?),
         "guarding-endorse" => {
             crate::guardians::endorse(d, arg(req, "who")?, arg(req, "fingerprint")?).await
         }
@@ -532,11 +535,19 @@ async fn handle(d: &Arc<Daemon>, req: &Value) -> anyhow::Result<Value> {
             arg(req, "name")?,
             req.get("up_to").and_then(Value::as_str),
         ),
-        "recover-via" => {
-            crate::recovering::via(d, arg(req, "code")?, req.get("key").and_then(Value::as_str))
-                .await
+        "recover-start" => {
+            let opt = |k: &str| req.get(k).and_then(Value::as_str);
+            crate::recovering::start(d, opt("code"), opt("key"), opt("identity")).await
         }
-        "recover-finish" => crate::recovering::finish(d, arg(req, "at")?, arg(req, "key")?).await,
+        "recover-invite" => {
+            crate::recovering::invite(d, req.get("at").and_then(Value::as_str)).await
+        }
+        "recover-cancel" => crate::recovering::cancel(d).await,
+        "recover-finish" => {
+            let opt = |k: &str| req.get(k).and_then(Value::as_str);
+            let without = req.get("without_hosts").and_then(Value::as_bool) == Some(true);
+            crate::recovering::finish(d, opt("at"), opt("key"), without).await
+        }
         "restore-from-host" => {
             crate::host::restore(d, arg(req, "words")?, arg(req, "at")?, arg(req, "key")?).await
         }
@@ -767,7 +778,7 @@ async fn speedtest(d: &Arc<Daemon>, who: &str) -> anyhow::Result<Value> {
     Ok(v)
 }
 
-fn reload(d: &Arc<Daemon>) -> anyhow::Result<()> {
+pub(crate) fn reload(d: &Arc<Daemon>) -> anyhow::Result<()> {
     {
         let mut core = d.core();
         if core.identity.is_some() {
