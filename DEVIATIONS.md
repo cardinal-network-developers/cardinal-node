@@ -1910,6 +1910,18 @@ Not implemented yet (the next milestone):
 The first step of sharing: two people connect and talk. Much of what the spec
 asks for around that is not built yet.
 
+### Accepting an invitation (`contact.md#accepting`)
+
+- **Who records whom first.** The one who accepts records the contact,
+  then says it is done; the inviter records them once it hears that,
+  after reconciling the new relationship, a moment later. **Fixed on the
+  way (D81):** a reconcile that failed there (the session gone, say) left
+  the inviter without the contact while the other side had it; the
+  contact is now recorded whatever that reconcile gives, and the rest
+  comes with the next sync. The test that failed about half the time
+  ("no contact called bo", `nat.rs`) asked the inviter within that
+  moment: it waits now until each side lists the other.
+
 ### Read markers are the person's to give (`profiles.md#relationship`)
 
 - **The setting** is a setting node (kind 6) named `read markers`, value

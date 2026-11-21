@@ -656,7 +656,13 @@ pub async fn serve(d: &Arc<Daemon>, s: &Session, mut st: Stream) -> anyhow::Resu
     send(&mut st, &ContactMessage::Genesis(genesis)).await?;
     let done = tokio::time::timeout(EXCHANGE_WITHIN, receive(&mut st)).await;
     if matches!(done, Ok(Ok(Some(ContactMessage::Done)))) {
-        net::reconcile(d, s, space).await?;
+        // They have recorded this person by now: whatever becomes of this
+        // reconcile, they are recorded here too, or one side would know the
+        // other and not the other way round. What it misses comes with the
+        // next sync.
+        if let Err(e) = net::reconcile(d, s, space).await {
+            tracing::debug!("reconciling a new relationship: {e:#}");
+        }
         let met = met_by_invitation(d, s).unwrap_or(account::Met {
             how: account::MET_MY_INVITATION,
             ..Default::default()

@@ -703,8 +703,10 @@ fn a_file_comes_through_the_session_an_invitation_opened() {
     let at = format!("127.0.0.1:{}", ana.port);
     let code = ana.cli(&["invite", "--address", &at, "--name", "Ana"]);
     bo.cli(&["accept", code.trim(), "--name", "Ana"]);
-    wait("they are connected", 30, || {
-        the_contact(&bo)["connected"] == true
+    // Bo has recorded Ana before he says he is done; Ana records him once
+    // she has heard it, a moment later.
+    wait("each lists the other, connected", 30, || {
+        the_contact(&bo)["connected"] == true && the_contact(&ana)["name"] == "bo"
     });
 
     let photo: Vec<u8> = (0..300_000u32).map(|n| (n * 13 % 251) as u8).collect();
