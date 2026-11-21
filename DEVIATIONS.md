@@ -1018,7 +1018,15 @@ Readings:
   here", where the person had read up to, every placement and every "not
   this host here" (`account::successor_ops`). Only where the person had
   joined the old space: following joins nothing that was not joined. Two
-  devices that follow at once write two nodes, which say the same.
+  devices that follow at once write two nodes, which say the same. Where
+  the successor's node is there already, a device that follows sets on
+  it what it lacks of the no ([Hosts](#hosts-spechostsmd), "Under a
+  succession").
+- **A declined offer** (`Core::is_declined`, `Core::declined`). A space
+  the person said no to is not followed: following it would offer it
+  again, since nothing in the account says no to the successor. A space
+  held here, or known to the account by field 4, that succeeds one they
+  said no to, and that they have not joined, is declined with it.
 - **Ids.** Whatever named the old group, a request with its id, an
   offer, a token, names the successor that stands here
   (`Core::current`). A successor this device followed that no longer
@@ -1374,7 +1382,15 @@ Not implemented yet (the next milestone):
     given the one in use.
   - **Reading: two contact nodes for one identity** (made at once on two
     devices) are one contact: trusted only if every node says trusted
-    and none refused.
+    and none refused. The same rule decides elsewhere: whether a session
+    is a contact's (`Daemon::classify`, `account::connects`), and
+    whether a guardian or a recovery helper is given sets to hold
+    (`Core::held_given`, `core::holds_for`: every node names them so,
+    and none refuses them). A setting (`contact-set`: trust, hosts only,
+    introductions, refuse) is written on every node for the identity
+    but a recovery's, so that such a contact can be refused, and
+    refused no longer; and finding a contact by name takes two nodes
+    for one identity for one contact, not two of that name.
   - **Reading: "accept every value a contact gave"** is every value field
     2 of their reach node holds now in the relationship, two where two of
     their devices set it at the same moment; not values set before.
@@ -2150,6 +2166,32 @@ asks for around that is not built yet.
   - **Reading: a record in conflict.** "No hosts here" counts if any
     value of field 5 on any node for the space is true: a no is never
     overridden. A yes clears the field on every node.
+  - **Under a succession** (`profiles.md#account`, "from then on
+    everything recorded for the old space holds for the successor").
+    The record for a space is read with the record for every space it
+    succeeds (`Core::chain`: what each space held here says it succeeds,
+    else field 4 of the account's node for it; `account::hosts_no_in`),
+    so a no said in the old space after the successor's node was
+    written still counts there. A yes clears "no hosts here" and the
+    host's "not this host here" along the whole chain; taking a host out
+    that a space before recorded is nothing more. A device that follows
+    where another of the person's wrote the successor's node first sets
+    on it what it lacks: field 4, "no hosts here", and each "not this
+    host here" (`account::successor_ops`).
+  - **Reading: a no said after the cut** (`core/succession.rs`
+    `say_no_again`). The successor carries the list as it was at the
+    cut, and no `set` of a reach node is posted again, so a no said in
+    the old space on a device that had not followed yet would leave the
+    successor naming the hosts. Where the person's list in the old space
+    was set after the cut and the record still says the no, their device
+    sets the successor's list to it: empty, where the old list is empty
+    and the record says "no hosts here"; without each host the record
+    takes out that the old list does not name, otherwise. The `no-record`
+    the old list rested on goes beside it. Nothing is written where the
+    successor's list says so already, and a yes clears the record, so a
+    list set since by a yes is never emptied. This is the record emptying
+    a list, which it otherwise never does, read as the person's own no
+    carried across.
   - **Unasked, a host names itself** where the person is in the space,
     every other member is a contact (a trusted one, for a device that
     named itself, D72), and the account says neither "no hosts here" nor

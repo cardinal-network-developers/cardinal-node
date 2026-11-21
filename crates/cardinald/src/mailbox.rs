@@ -904,7 +904,8 @@ pub async fn say_reach(d: &Arc<Daemon>, space: &SpaceId, share: bool) -> anyhow:
         return Ok(false);
     }
     let hosts = all_hosts(d);
-    record(d, |st| account::yes_ops(st, space, &hosts))?;
+    let chain = d.core().chain(space);
+    record(d, |st| account::yes_ops(st, &chain, &hosts))?;
     pending_no(d, space, false);
     say_reach_locked(d, space, share).await
 }
@@ -1056,7 +1057,8 @@ pub async fn take_out_host(
 ) -> anyhow::Result<bool> {
     let _one = d.mailbox.reaching.lock().await;
     let name = local_name(d, space);
-    let mut ids = record(d, |st| account::not_this_host_ops(st, space, &name, host))?;
+    let chain = d.core().chain(space);
+    let mut ids = record(d, |st| account::not_this_host_ops(st, &chain, &name, host))?;
     if ids.is_empty() {
         // recorded before: the list rests on the entry that recorded it
         let core = d.core();
@@ -1140,7 +1142,8 @@ pub async fn share_reach(d: &Arc<Daemon>, space: &SpaceId) -> anyhow::Result<Sha
     }
     // A yes by hand clears the record of a no (D75).
     let hosts = all_hosts(d);
-    record(d, |st| account::yes_ops(st, space, &hosts))?;
+    let chain = d.core().chain(space);
+    record(d, |st| account::yes_ops(st, &chain, &hosts))?;
     let mut reach = d.core().reach_of(space, &me);
     let given = reach_here(d, space, &reach, Add::Every, false).await;
     let more = given.reach;

@@ -537,6 +537,17 @@ impl Telling {
     }
 }
 
+/// Whether `who` is given sets of this person's to hold
+/// ([`Core::held_given`]): every node this person has for them names them
+/// a guardian, or is a recovery's relationship, and none refuses them.
+/// Two nodes for one contact, made at once on two devices, are one
+/// contact (`presence.rs`).
+pub fn holds_for(contacts: &[account::ContactRecord], who: &[u8; 32]) -> bool {
+    let nodes = account::nodes_of(contacts, who);
+    let says = |c: &&account::ContactRecord| (c.guardian || c.recovery_of.is_some()) && !c.refused;
+    !nodes.is_empty() && nodes.iter().all(says)
+}
+
 /// [`Core::is_joined`], from the account and the space.
 pub fn joined_in(account: Option<&Space>, sp: &Space, space: &SpaceId, me: &[u8; 32]) -> bool {
     if sp.accepted_by(me) {
@@ -1688,9 +1699,11 @@ impl Core {
 
     /// What this person's account records of a no to naming their hosts
     /// in a space (D75).
+    /// What is recorded for a space it succeeds holds for it
+    /// (`profiles.md#account`, "A successor takes its place").
     pub fn hosts_no(&self, space: &SpaceId) -> account::HostsNo {
         match self.account().and_then(|h| h.space.as_ref()) {
-            Some(acc) => account::hosts_no(acc.state(), space),
+            Some(acc) => account::hosts_no_in(acc.state(), &self.chain(space)),
             None => account::HostsNo::default(),
         }
     }
@@ -2208,9 +2221,10 @@ impl Core {
     /// a recovery helper. `who` may fetch them.
     pub fn held_given(&self, who: &[u8; 32]) -> Vec<[u8; 32]> {
         // to a guardian only while they are one, as the account marks them;
-        // to a recovery helper, from a persona
-        let contact = self.contacts().into_iter().find(|c| c.identity == *who);
-        if !contact.is_some_and(|c| c.guardian || c.recovery_of.is_some()) {
+        // to a recovery helper, from a persona. Two nodes for one contact,
+        // made at once on two devices, are one contact: given to only where
+        // every node says so and none refuses them (`presence.rs`).
+        if !holds_for(&self.contacts(), who) {
             return Vec::new();
         }
         let (mine, _) = self.held_nodes(who);
@@ -2641,8 +2655,30 @@ impl Core {
         groups.map(|(id, _)| *id).collect()
     }
 
-    /// The spaces this person said no to.
+    /// The spaces this person said no to, and each held here that they
+    /// have not joined and that succeeds one they said no to: an offer
+    /// declined is not made again by a succession of it.
     pub fn declined(&self) -> Vec<SpaceId> {
+        let said = self.declined_by_hand();
+        let mut out = said.clone();
+        for id in self.spaces.keys() {
+            let succeeds_one = || self.chain(id).iter().any(|s| said.contains(s));
+            if !out.contains(id) && succeeds_one() && !self.is_joined(id) {
+                out.push(*id);
+            }
+        }
+        out
+    }
+
+    /// Whether this person said no to `space`, or to a space it succeeds,
+    /// and has not joined it.
+    pub fn is_declined(&self, space: &SpaceId) -> bool {
+        let said = self.declined_by_hand();
+        self.chain(space).iter().any(|s| said.contains(s)) && !self.is_joined(space)
+    }
+
+    /// The spaces the account says this person said no to.
+    fn declined_by_hand(&self) -> Vec<SpaceId> {
         let Some(acc) = self.account().and_then(|a| a.space.as_ref()) else {
             return Vec::new();
         };
@@ -4036,7 +4072,7 @@ mod tests {
             let account = self.core.account_id().unwrap();
             let st = self.space(&account).state();
             let record = match host {
-                true => account::yes_ops(st, space, &key.into_iter().collect::<Vec<_>>()),
+                true => account::yes_ops(st, &[*space], &key.into_iter().collect::<Vec<_>>()),
                 false => account::say_no_ops(st, space, "a space"),
             };
             if !record.is_empty() {
@@ -6939,5 +6975,150 @@ mod tests {
         let h = bo.core.spaces.get_mut(&s).unwrap();
         h.notes.first_seen_ms = Some(now_ms() - 8 * 24 * 3600 * 1000);
         assert!(moved(&bo).is_null());
+    }
+
+    /// D75 under a succession (`profiles.md#account`, "A successor takes
+    /// its place"). Bo says no to naming his host in the group on a device
+    /// that has not followed yet, after the cut: the successor carried his
+    /// list as it was, and no `set` of a reach node is posted again. His
+    /// device says the no again there when it follows, and the record for
+    /// the old space holds for the successor until a yes clears it.
+    #[test]
+    fn a_no_said_after_the_cut_is_said_again_in_the_successor() {
+        let ([mut ana, mut bo, _cy], g) = family();
+        let store = cardinal_blob::MemStore::new();
+        bo.hosts_at("127.0.0.1:7171");
+        let named = bo.says_reach(&g, true);
+        ana.takes(&g, &[named]);
+        let s = ana
+            .core
+            .succeed(&store, &g, &[(bo.id(), WRITER)])
+            .unwrap()
+            .new;
+        // after the cut, before the `succeed` reached him
+        bo.says_reach(&g, false);
+        assert!(bo.core.hosts_no(&g).no_hosts);
+        bo.syncs(&ana, &g, &store);
+        assert!(bo.holds(&s));
+        let me = bo.id();
+        assert!(bo.core.reach_is_set(&s, &me));
+        assert!(bo.core.reach_of(&s, &me).is_empty(), "the no stands");
+        let no = bo.core.hosts_no(&s);
+        assert!(no.no_hosts);
+        // said once
+        let n = bo.space(&s).dag().len();
+        bo.core.follow(&store);
+        assert_eq!(bo.space(&s).dag().len(), n);
+        // A yes in the successor clears the record, there and before it.
+        let acc = bo.core.account_id().unwrap();
+        let chain = bo.core.chain(&s);
+        assert_eq!(chain, [s, g]);
+        let host = *bo.core.mailboxes()[0].0.link_key.x25519();
+        let yes = account::yes_ops(bo.space(&acc).state(), &chain, &[host]);
+        bo.core.write_entry(&acc, yes).unwrap();
+        assert!(!bo.core.hosts_no(&s).no_hosts);
+        assert!(!bo.core.hosts_no(&g).no_hosts);
+    }
+
+    /// The same for one host taken out by hand ("not this host here").
+    #[test]
+    fn a_host_taken_out_after_the_cut_is_taken_out_of_the_successor() {
+        let ([mut ana, mut bo, _cy], g) = family();
+        let store = cardinal_blob::MemStore::new();
+        bo.hosts_at("127.0.0.1:7171");
+        let named = bo.says_reach(&g, true);
+        ana.takes(&g, &[named]);
+        let s = ana
+            .core
+            .succeed(&store, &g, &[(bo.id(), WRITER)])
+            .unwrap()
+            .new;
+        let me = bo.id();
+        let host = *bo.core.mailboxes()[0].0.link_key.x25519();
+        let acc = bo.core.account_id().unwrap();
+        let ops = account::not_this_host_ops(bo.space(&acc).state(), &[g], "Family", &host);
+        let (made, _) = bo.core.write_entry(&acc, ops).unwrap();
+        let ops = vec![
+            relationship::set_reach(&me, &[]),
+            relationship::set_rests_on(&me, &made),
+        ];
+        bo.core.write_entry(&g, ops).unwrap();
+        bo.syncs(&ana, &g, &store);
+        assert!(bo.holds(&s));
+        assert!(bo.core.reach_of(&s, &me).is_empty());
+        assert!(bo.core.hosts_no(&s).not_this(&host));
+        assert!(!bo.core.hosts_no(&s).no_hosts);
+        assert_eq!(
+            relationship::rests_on(bo.space(&s).state(), &me),
+            [made],
+            "the list rests on the record"
+        );
+    }
+
+    /// An offer the person said no to is not followed, and is not offered
+    /// again by its successor; a successor the account knows of by field
+    /// 4 alone is declined with it.
+    #[test]
+    fn a_declined_group_is_not_offered_again_by_its_successor() {
+        let [mut ana, mut bo, _, _] = four();
+        bo.knows(&ana, "Ana");
+        let bo_shown = [(bo.id(), "Bo".to_owned())];
+        let g = ana.core.create_group("Club", "Ana", &bo_shown).unwrap();
+        bo.takes(&g, &ana.all_of(&g));
+        let acc = bo.core.account_id().unwrap();
+        let no = account::create_declined(&g, "Club");
+        bo.core.write_entry(&acc, vec![no]).unwrap();
+        let store = cardinal_blob::MemStore::new();
+        let s = ana
+            .core
+            .succeed(&store, &g, &[(bo.id(), WRITER)])
+            .unwrap()
+            .new;
+        bo.syncs(&ana, &g, &store);
+        assert!(!bo.holds(&s), "a declined offer is not followed");
+        let listed = crate::groups::list_of(&bo.core);
+        assert_eq!(listed["offers"].as_array().unwrap().len(), 0, "{listed}");
+        assert!(bo.core.is_declined(&g));
+        // known by the account alone, as another device's node says
+        let rec = Record::new().with(1, s).with(2, "Club").with(4, g);
+        let op = SpaceOp::create(NodeKind::Uint(account::SPACE), ROOT, "Club", rec);
+        bo.core.write_entry(&acc, vec![op]).unwrap();
+        assert_eq!(bo.core.chain(&s), [s, g]);
+        assert!(bo.core.is_declined(&s));
+    }
+
+    /// Two contact nodes for one identity, made at once on two devices,
+    /// are one contact: a guardian is given the account only where every
+    /// node says so and none refuses them (`presence.rs`).
+    #[test]
+    fn a_guardian_refused_on_one_of_two_nodes_is_given_nothing() {
+        let [ana, mut bo, _, _] = four();
+        bo.knows(&ana, "Ana");
+        bo.knows(&ana, "Ana");
+        let acc = bo.core.account_id().unwrap();
+        let nodes: Vec<_> = bo.core.contacts().into_iter().map(|c| c.node).collect();
+        assert_eq!(nodes.len(), 2);
+        let marks: Vec<_> = nodes
+            .iter()
+            .map(|n| account::set_field(*n, account::GUARDIAN, true))
+            .collect();
+        bo.core.write_entry(&acc, marks).unwrap();
+        let all = account::contacts(bo.space(&acc).state());
+        assert!(account::connects(&all, &ana.id()));
+        assert!(holds_for(&all, &ana.id()));
+        // the other node says nothing of guarding: not given
+        let unmark = account::set_field(nodes[1], account::GUARDIAN, false);
+        bo.core.write_entry(&acc, vec![unmark]).unwrap();
+        let all = account::contacts(bo.space(&acc).state());
+        assert!(!holds_for(&all, &ana.id()));
+        let mark = account::set_field(nodes[1], account::GUARDIAN, true);
+        bo.core.write_entry(&acc, vec![mark]).unwrap();
+        // refused on one node of the two: refused
+        let refuse = account::set_field(nodes[1], account::REFUSED, true);
+        bo.core.write_entry(&acc, vec![refuse]).unwrap();
+        let all = account::contacts(bo.space(&acc).state());
+        assert!(!account::connects(&all, &ana.id()));
+        assert!(account::refused(&all, &ana.id()));
+        assert!(!holds_for(&all, &ana.id()));
     }
 }

@@ -1300,3 +1300,95 @@ fn the_lowest_self_node_counts_and_a_petname_may_be_none() {
         ]
     );
 }
+
+/// D75 under a succession (`profiles.md#account`, "A successor takes its
+/// place"). What the account records of a no for a space holds for the
+/// space that succeeded it, by field 4; a device that follows where
+/// another of the person's wrote the successor's node first sets on it
+/// what it lacks of the no; and a yes clears the no along the chain.
+#[test]
+fn a_no_for_a_space_holds_for_its_successor() {
+    let p = person(6, 0);
+    let d0 = &p.devices[0];
+    let (mut acct, _) = Space::create(
+        Profile::ACCOUNT,
+        Policy::default(),
+        &p.log,
+        &d0.signing,
+        &[p.enc.public_key()],
+        None,
+    )
+    .unwrap();
+    let (old, new, host) = ([1u8; 32], [2u8; 32], [3u8; 32]);
+    let write = |acct: &mut Space, ops: Vec<SpaceOp>| {
+        if !ops.is_empty() {
+            acct.write(&p.log, &d0.signing, ops, None).unwrap();
+        }
+    };
+    // the successor's node, as a device that followed first wrote it
+    let there = account::successor_ops(acct.state(), &old, &new, "Club");
+    write(&mut acct, there);
+    // and the no, said for the old space afterwards on another device
+    let no = account::say_no_ops(acct.state(), &old, "Club");
+    write(&mut acct, no);
+    let out = account::not_this_host_ops(acct.state(), &[old], "Club", &host);
+    write(&mut acct, out);
+    assert_eq!(account::succeeded_chain(acct.state(), &new), [new, old]);
+    let both = account::hosts_no(acct.state(), &new);
+    assert!(both.no_hosts && both.not_this(&host));
+    assert_eq!((both.nodes.len(), both.before.len()), (1, 1));
+    // The device that follows now writes the no on the successor's node.
+    let missing = account::successor_ops(acct.state(), &old, &new, "Club");
+    assert_eq!(missing.len(), 2, "{missing:?}");
+    write(&mut acct, missing);
+    let own = account::hosts_no_in(acct.state(), &[new]);
+    assert!(own.no_hosts && own.not_this(&host));
+    assert!(account::successor_ops(acct.state(), &old, &new, "Club").is_empty());
+    // Taking out a host recorded before is nothing more.
+    assert!(account::not_this_host_ops(acct.state(), &[new, old], "Club", &host).is_empty());
+    // A yes in the successor clears the no for it and before it.
+    let yes = account::yes_ops(acct.state(), &[new, old], &[host]);
+    write(&mut acct, yes);
+    let after = account::hosts_no(acct.state(), &new);
+    assert!(!after.no_hosts && !after.not_this(&host));
+}
+
+/// Two contact nodes for one identity, made at once on two devices, are
+/// one contact: trusted only where every node says so and none refuses.
+#[test]
+fn two_nodes_for_one_contact_are_judged_together() {
+    use account::{Regard, REFUSED, TRUSTED};
+    let p = person(7, 0);
+    let d0 = &p.devices[0];
+    let (mut acct, _) = Space::create(
+        Profile::ACCOUNT,
+        Policy::default(),
+        &p.log,
+        &d0.signing,
+        &[p.enc.public_key()],
+        None,
+    )
+    .unwrap();
+    let cy = [3u8; 32];
+    let ops = vec![
+        account::create_contact(&cy, "Cy", &[7; 32], Regard::default()),
+        account::create_contact(&cy, "Cy", &[8; 32], Regard::default()),
+    ];
+    acct.write(&p.log, &d0.signing, ops, None).unwrap();
+    let all = account::contacts(acct.state());
+    assert_eq!(account::nodes_of(&all, &cy).len(), 2);
+    assert!(account::connects(&all, &cy));
+    assert!(
+        !account::connects(&all, &[4; 32]),
+        "nobody's node is no contact"
+    );
+    let one = all[1].node;
+    let hosts_only = account::set_field(one, TRUSTED, false);
+    acct.write(&p.log, &d0.signing, vec![hosts_only], None)
+        .unwrap();
+    let all = account::contacts(acct.state());
+    assert!(!account::connects(&all, &cy) && !account::refused(&all, &cy));
+    let refuse = account::set_field(one, REFUSED, true);
+    acct.write(&p.log, &d0.signing, vec![refuse], None).unwrap();
+    assert!(account::refused(&account::contacts(acct.state()), &cy));
+}

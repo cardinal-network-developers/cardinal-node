@@ -374,7 +374,12 @@ pub fn create_space(space: &SpaceId, local_name: &str) -> SpaceOp {
 /// for it, whose field 4 names the space it succeeded, with what was
 /// recorded for that space: its local name, "no hosts here", where the
 /// person had read up to, each placement and each "not this host here".
-/// Nothing where a node for the successor is there already.
+///
+/// Where a node for the successor is there already, written by another
+/// device of the person's that followed first, what it lacks of the
+/// person's no is set on it: field 4, "no hosts here", and each "not this
+/// host here" (D75). A no said in the old space after that device
+/// followed is not lost.
 pub fn successor_ops(
     state: &State,
     old: &SpaceId,
@@ -387,8 +392,9 @@ pub fn successor_ops(
             && last(n, 1).and_then(Value::as_bytes) == Some(&s[..])
     };
     let roots = state.children(&ROOT);
-    if roots.iter().any(|n| named(n, new)) {
-        return Vec::new();
+    let there: Vec<&crate::state::Node> = roots.iter().copied().filter(|n| named(n, new)).collect();
+    if !there.is_empty() {
+        return successor_missing(state, &there, old);
     }
     let was: Vec<&crate::state::Node> = roots.into_iter().filter(|n| named(n, old)).collect();
     let name = was
@@ -424,6 +430,84 @@ pub fn successor_ops(
         }
     }
     ops
+}
+
+/// What the successor's nodes `there` lack of what the account records
+/// for `old`: field 4 on each node without it, "no hosts here" on each
+/// where none of them says it and `old` does, and under the first, each
+/// "not this host here" of `old`'s that none of them has.
+fn successor_missing(state: &State, there: &[&crate::state::Node], old: &SpaceId) -> Vec<SpaceOp> {
+    let mut ops = Vec::new();
+    for n in there {
+        if n.values(SUCCEEDED).is_empty() {
+            ops.push(set_field(n.id, SUCCEEDED, *old));
+        }
+    }
+    let said = |nodes: &[NodeId]| {
+        nodes.iter().filter_map(|n| state.node(n)).any(|n| {
+            let no = n.values(NO_HOSTS).iter();
+            no.filter_map(|v| v.value.as_ref()?.as_bool()).any(|b| b)
+        })
+    };
+    let ids: Vec<NodeId> = there.iter().map(|n| n.id).collect();
+    let was = hosts_no(state, old);
+    if was.no_hosts && !said(&ids) {
+        ops.extend(ids.iter().map(|n| set_field(*n, NO_HOSTS, true)));
+    }
+    let mut has: Vec<[u8; 32]> = Vec::new();
+    for n in &ids {
+        has.extend(not_these_under(state, n).into_iter().map(|(_, h)| h));
+    }
+    let first = ids.iter().min().expect("a node");
+    for (_, host) in was.not_these {
+        if !has.contains(&host) {
+            has.push(host);
+            let fields = Record::new().with(1, host);
+            let name = hex_of(&host[..4]);
+            ops.push(SpaceOp::create(
+                NodeKind::Uint(NOT_THIS_HOST),
+                *first,
+                &name,
+                fields,
+            ));
+        }
+    }
+    ops
+}
+
+/// The "not this host here" nodes under one space node, with their hosts.
+fn not_these_under(state: &State, node: &NodeId) -> Vec<(NodeId, [u8; 32])> {
+    let mut out = Vec::new();
+    for c in state.children(node) {
+        if c.kind != NodeKind::Uint(NOT_THIS_HOST) || c.deleted {
+            continue;
+        }
+        if let Some(host) = last(c, 1).and_then(Value::as_bytes) {
+            if let Ok(host) = host.try_into() {
+                out.push((c.id, host));
+            }
+        }
+    }
+    out
+}
+
+/// `space`, then the space it succeeded, and so on, as the account
+/// records it: field 4 of a space node for each (`profiles.md#account`).
+pub fn succeeded_chain(state: &State, space: &SpaceId) -> Vec<SpaceId> {
+    let all = spaces(state);
+    let mut out = vec![*space];
+    while out.len() < 64 {
+        let at = out.last().expect("one");
+        let next = all
+            .iter()
+            .filter(|r| r.space == *at)
+            .find_map(|r| r.succeeded);
+        match next {
+            Some(n) if !out.contains(&n) => out.push(n),
+            _ => break,
+        }
+    }
+    out
 }
 
 /// The successor this person's devices followed from `space`, by the
@@ -479,11 +563,15 @@ pub fn set_field(node: NodeId, key: u64, value: impl Into<Value>) -> SpaceOp {
 
 /// What this person's account records of their no to naming their hosts
 /// in one space (D75): seen only by their own devices, which it stops
-/// from naming themselves there.
+/// from naming themselves there. What was recorded for a space it
+/// succeeded holds for it too (`profiles.md#account`, "A successor takes
+/// its place").
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct HostsNo {
     /// The space nodes the account has for the space.
     pub nodes: Vec<NodeId>,
+    /// The space nodes the account has for the spaces it succeeds.
+    pub before: Vec<NodeId>,
     /// "No hosts here": any of them says so, in any of its values. A no
     /// is never overridden, so where two devices set it at once, one yes
     /// and one no, it is a no.
@@ -500,30 +588,34 @@ impl HostsNo {
     }
 }
 
-/// What the account records of a no to naming hosts in `space`.
+/// What the account records of a no to naming hosts in `space`, and in
+/// the spaces it succeeds as the account records them.
 pub fn hosts_no(state: &State, space: &SpaceId) -> HostsNo {
+    hosts_no_in(state, &succeeded_chain(state, space))
+}
+
+/// What the account records of a no to naming hosts in `chain[0]`, and in
+/// the rest of `chain`: the spaces it succeeds, the nearest first.
+pub fn hosts_no_in(state: &State, chain: &[SpaceId]) -> HostsNo {
     let mut out = HostsNo::default();
-    let nodes = state.children(&ROOT).into_iter().filter(|n| {
-        n.kind == NodeKind::Uint(SPACE)
-            && !n.deleted
-            && last(n, 1).and_then(Value::as_bytes) == Some(&space[..])
-    });
-    for n in nodes {
-        out.nodes.push(n.id);
-        let no = n.values(NO_HOSTS).iter();
-        out.no_hosts |= no.filter_map(|v| v.value.as_ref()?.as_bool()).any(|b| b);
-        for c in state.children(&n.id) {
-            if c.kind != NodeKind::Uint(NOT_THIS_HOST) || c.deleted {
-                continue;
+    for (i, space) in chain.iter().enumerate() {
+        let nodes = state.children(&ROOT).into_iter().filter(|n| {
+            n.kind == NodeKind::Uint(SPACE)
+                && !n.deleted
+                && last(n, 1).and_then(Value::as_bytes) == Some(&space[..])
+        });
+        for n in nodes {
+            match i {
+                0 => out.nodes.push(n.id),
+                _ => out.before.push(n.id),
             }
-            if let Some(host) = last(c, 1).and_then(Value::as_bytes) {
-                if let Ok(host) = host.try_into() {
-                    out.not_these.push((c.id, host));
-                }
-            }
+            let no = n.values(NO_HOSTS).iter();
+            out.no_hosts |= no.filter_map(|v| v.value.as_ref()?.as_bool()).any(|b| b);
+            out.not_these.extend(not_these_under(state, &n.id));
         }
     }
     out.nodes.sort();
+    out.before.sort();
     out
 }
 
@@ -549,16 +641,17 @@ pub fn say_no_ops(state: &State, space: &SpaceId, local_name: &str) -> Vec<Space
         .collect()
 }
 
-/// What records that the person took `host` out of `space` by hand ("not
-/// this host here"), under the space's node, made if there is none.
-/// Nothing where it is recorded already.
+/// What records that the person took `host` out of `chain[0]` by hand
+/// ("not this host here"), under the space's node, made if there is none.
+/// Nothing where it is recorded already, for it or for a space it
+/// succeeds (the rest of `chain`).
 pub fn not_this_host_ops(
     state: &State,
-    space: &SpaceId,
+    chain: &[SpaceId],
     local_name: &str,
     host: &[u8; 32],
 ) -> Vec<SpaceOp> {
-    let was = hosts_no(state, space);
+    let was = hosts_no_in(state, chain);
     if was.not_this(host) {
         return Vec::new();
     }
@@ -576,7 +669,7 @@ pub fn not_this_host_ops(
                 NodeKind::Uint(SPACE),
                 ROOT,
                 local_name,
-                Record::new().with(1, *space).with(2, local_name),
+                Record::new().with(1, chain[0]).with(2, local_name),
             ),
             SpaceOp::create(NodeKind::Uint(NOT_THIS_HOST), ROOT, &name, fields).with_parent(0u32),
         ],
@@ -584,12 +677,14 @@ pub fn not_this_host_ops(
 }
 
 /// What a yes by hand takes out of the record (D75): "no hosts here" on
-/// every node the account has for `space`, and "not this host here" for
-/// each of `hosts`.
-pub fn yes_ops(state: &State, space: &SpaceId, hosts: &[[u8; 32]]) -> Vec<SpaceOp> {
-    let was = hosts_no(state, space);
+/// every node the account has for `chain[0]` and for the spaces it
+/// succeeds (the rest of `chain`), and "not this host here" for each of
+/// `hosts`, wherever in the chain it is: what is recorded for a space it
+/// succeeds holds for it, and would hold the no up otherwise.
+pub fn yes_ops(state: &State, chain: &[SpaceId], hosts: &[[u8; 32]]) -> Vec<SpaceOp> {
+    let was = hosts_no_in(state, chain);
     let mut ops = Vec::new();
-    for n in &was.nodes {
+    for n in was.nodes.iter().chain(&was.before) {
         let has = state
             .node(n)
             .is_some_and(|n| !n.values(NO_HOSTS).is_empty());
@@ -794,6 +889,25 @@ impl ContactRecord {
     pub fn connects(&self) -> bool {
         self.regard.trusted && !self.refused
     }
+}
+
+/// The contact nodes this person has for `who`. Two devices that made one
+/// at the same moment made two: they are one contact.
+pub fn nodes_of<'a>(contacts: &'a [ContactRecord], who: &IdentityId) -> Vec<&'a ContactRecord> {
+    contacts.iter().filter(|c| c.identity == *who).collect()
+}
+
+/// Whether a device may open a session with `who`'s, judged by every
+/// node this person has for them: each says they are trusted, and none
+/// refuses them. With none, they are no contact.
+pub fn connects(contacts: &[ContactRecord], who: &IdentityId) -> bool {
+    let nodes = nodes_of(contacts, who);
+    !nodes.is_empty() && nodes.iter().all(|c| c.connects())
+}
+
+/// Whether any node this person has for `who` refuses them.
+pub fn refused(contacts: &[ContactRecord], who: &IdentityId) -> bool {
+    nodes_of(contacts, who).iter().any(|c| c.refused)
 }
 
 /// Contact nodes that are not deleted.

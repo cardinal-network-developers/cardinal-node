@@ -24,6 +24,7 @@ use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 use cardinal_blob::{ConvergenceSecret, ObjectStore};
 use cardinal_space::entry::{Succession, OWNER};
+use cardinal_space::relationship::{self, Reach};
 use cardinal_space::succession::{self as plan, Plan, Verdict};
 use cardinal_space::{EpochKey, SpaceOpBody, State};
 
@@ -206,6 +207,30 @@ impl Core {
             }
         }
         id
+    }
+
+    /// `space`, then the space it succeeds, and so on, the nearest first:
+    /// by what each says it succeeds, where it is open here, and else by
+    /// field 4 of the account's node for it.
+    pub fn chain(&self, space: &SpaceId) -> Vec<SpaceId> {
+        let acc = self.account().and_then(|a| a.space.as_ref());
+        let recorded = acc.map(|a| account::spaces(a.state())).unwrap_or_default();
+        let mut out = vec![*space];
+        while out.len() < 64 {
+            let at = *out.last().expect("one");
+            let held = self.spaces.get(&at).and_then(|h| h.space.as_ref());
+            let next = held.and_then(|s| s.succeeds()).or_else(|| {
+                recorded
+                    .iter()
+                    .filter(|r| r.space == at)
+                    .find_map(|r| r.succeeded)
+            });
+            match next {
+                Some(n) if !out.contains(&n) => out.push(n),
+                _ => break,
+            }
+        }
+        out
     }
 
     /// Whether another space stands in the place of `space` here: it was
@@ -542,6 +567,7 @@ impl Core {
         self.check_unchecked(store);
         self.note_first_seen();
         out.extend(self.account_for_followed());
+        out.extend(self.say_no_again());
         self.note_did_not_stand();
         out.extend(self.post_again_all(false));
         out
@@ -570,6 +596,82 @@ impl Core {
                 Ok(Some(w)) => out.push(w),
                 Ok(None) => {}
                 Err(e) => tracing::debug!("space {}: the account: {e:#}", short(&s)),
+            }
+        }
+        out
+    }
+
+    /// The person's no to naming their hosts, said in a space after its
+    /// cut, said again in the successor that stands in its place: a `set`
+    /// of a reach node is not posted again
+    /// (`spaces.md#what-the-successor-does-not-carry`), so a device that
+    /// said no where it had not yet followed would leave the successor
+    /// naming what the person took out (D75). Where this person's list in
+    /// the old space was set after the cut, and the account still records
+    /// the no, for the successor or a space it succeeds: an emptied list,
+    /// with "no hosts here", empties the successor's; a host taken out,
+    /// with "not this host here", is taken out of it. Nothing is written
+    /// where the successor's list says so already, and a yes clears the
+    /// record, so nothing is said again over it.
+    fn say_no_again(&mut self) -> Vec<Written> {
+        let Some(me) = self.me() else {
+            return Vec::new();
+        };
+        let mut pairs: Vec<(SpaceId, SpaceId)> = Vec::new();
+        for (id, h) in &self.spaces {
+            let Some(sp) = h.space.as_ref() else { continue };
+            let Some(o) = sp.succeeds() else { continue };
+            let old = self.spaces.get(&o).and_then(|h| h.space.as_ref());
+            if old.is_some() && self.current(&o) == *id && self.is_joined(id) {
+                pairs.push((o, *id));
+            }
+        }
+        let mut out = Vec::new();
+        for (o, s) in pairs {
+            let Some(carried) = self.carried_into(&s) else {
+                continue;
+            };
+            let old = self.spaces[&o].space.as_ref().expect("open");
+            let after = |key: u64| {
+                let values = old.state().reach_values(&me, key).iter();
+                values
+                    .filter(|v| !carried.contains(&v.entry))
+                    .collect::<Vec<_>>()
+            };
+            if after(1).is_empty() {
+                continue;
+            }
+            let was = relationship::reach_of(old, &me);
+            let rests: Option<EntryId> = after(relationship::no_record_key())
+                .into_iter()
+                .filter_map(|v| {
+                    v.value
+                        .as_ref()?
+                        .as_record()?
+                        .get(1)?
+                        .as_bytes()?
+                        .try_into()
+                        .ok()
+                })
+                .next_back();
+            let no = self.hosts_no(&s);
+            let now = self.reach_of(&s, &me);
+            let kept: Vec<Reach> = match no.no_hosts && was.is_empty() {
+                true => Vec::new(),
+                false => {
+                    let out =
+                        |r: &&Reach| no.not_this(&r.host) && !was.iter().any(|w| w.host == r.host);
+                    now.iter().filter(|r| !out(r)).cloned().collect()
+                }
+            };
+            if kept.len() == now.len() {
+                continue;
+            }
+            let mut ops = vec![relationship::set_reach(&me, &kept)];
+            ops.extend(rests.map(|e| relationship::set_rests_on(&me, &e)));
+            match self.write(&s, ops) {
+                Ok(w) => out.push((s, w.into_iter().map(|(_, b)| b).collect())),
+                Err(e) => tracing::debug!("space {}: the no again: {e:#}", short(&s)),
             }
         }
         out
@@ -725,6 +827,11 @@ impl Core {
         // here succeeds them, and a device keeps which space is its
         // account (D67), and the copies it holds for others beside it.
         if Some(*old) == self.account_id() || Some(*old) == self.files_id() {
+            return Ok(None);
+        }
+        // Nor is an offer the person said no to: following it would offer
+        // it again.
+        if self.is_declined(old) {
             return Ok(None);
         }
         if self.spaces.get(&s).is_some_and(|x| x.space.is_some()) {

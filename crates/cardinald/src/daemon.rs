@@ -648,13 +648,13 @@ impl Daemon {
             return PeerKind::Own(k);
         }
         // By who proved themselves in this session. A log can name any key,
-        // so finding this one in a log says nothing.
+        // so finding this one in a log says nothing. Two nodes for one
+        // contact, made at once on two devices, are one contact: trusted
+        // only where every one says so and none refuses them (`presence.rs`).
         let contact = s.peer_identity().and_then(|p| {
             let core = self.core();
             let contacts = core.contacts();
-            let connects = contacts
-                .iter()
-                .any(|c| c.identity == p.identity && c.connects());
+            let connects = account::connects(&contacts, &p.identity);
             (connects && core.has_device(&p.identity, &p.signing_key, &ps))
                 .then_some((p.identity, p.signing_key))
         });
@@ -676,10 +676,8 @@ impl Daemon {
                 let shut_out = {
                     let core = self.core();
                     let contacts = core.contacts();
-                    let refused =
-                        |c: &account::ContactRecord| c.identity == p.identity && c.refused;
                     core.identity.as_ref().map(|i| i.id()) == Some(p.identity)
-                        || contacts.iter().any(refused)
+                        || account::refused(&contacts, &p.identity)
                 };
                 if !shut_out {
                     let space = lock(&self.invited).get(&ps).copied();
