@@ -758,12 +758,15 @@ pub fn list_of(core: &Core) -> Json {
         // a week has gone
         let notes = core.spaces.get(id).map(|h| h.notes());
         let at = sp.entry(id).and_then(|g| g.time());
-        let fresh = at.is_some_and(|t| now_ms().saturating_sub(t) < MOVED_FOR_MS);
+        // aged from when this device first held it, not by the mover's clock
+        let seen = notes.and_then(|n| n.first_seen_ms);
+        let fresh = seen.is_none_or(|t| now_ms().saturating_sub(t) < MOVED_FOR_MS);
         let moved = (sp.succeeds().is_some() && fresh && !notes.is_some_and(|n| n.moved_seen))
             .then(|| {
                 let mut c = change_json(core, &me, &contacts, &named, id);
                 c["by"] = json!(name_of(&me, &contacts, &named, &sp.creator()));
                 c["at"] = json!(at);
+                c["seen"] = json!(seen);
                 c
             });
         let lost_ids: Vec<String> = lost.iter().map(hex::encode).collect();
@@ -789,6 +792,7 @@ pub fn list_of(core: &Core) -> Json {
             "public": sp.is_public(),
             "reach": telling_json(core, id, &me),
             "admin": may_manage(sp, &me),
+            "role": sp.role_of(&me).map(role_name),
             "introductions": group::introductions(sp),
             "unread": unread,
             "last": last.map(|m| json!({
@@ -861,7 +865,7 @@ pub fn members(d: &Daemon, group: &str) -> anyhow::Result<Json> {
             "role": "taken out",
             "taken_out": true,
             "introduce": false,
-            "left": true,
+            "left": false,
         }));
     }
     Ok(json!({"group": hex::encode(g.id), "name": g.name, "members": out}))

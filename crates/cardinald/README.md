@@ -552,14 +552,17 @@ put something in its place that does not match it), `held_back` (how
 much of what this device wrote before the group moved on waits for
 `group-post-again`, since someone is in it now that it was written
 without), `not_posted` (how much was not posted again because this
-person's role there no longer allows it), `moved` (until cleared with
-`group-moved-seen`, or a week after: `{by, at, taken_out: [names],
-roles: [{name, from, to}]}`, who moved the group here, when by their
-clock, and what that changed; null otherwise), `did_not_stand`
+person's role there no longer allows it), `role` (this person's
+there: `owner`, `admin`, `member` or `reader`), `moved` (until cleared
+with `group-moved-seen`, or a week after this device first held the
+group here: `{by, at, seen, taken_out: [names], roles: [{name, from,
+to}]}`, who moved the group here, when by their clock, when this device
+first held it, and what that changed; null otherwise), `did_not_stand`
 (successors this person's devices made that another took the place of,
 by id: they do again what each was for) and `did_not_stand_changes`
 (the same, each `{group, taken_out, roles}`, as `moved` says them). `group-members` lists whoever was taken out too, by
-the name the others saw, with `taken_out` true and `role` `taken out`;
+the name the others saw, with `taken_out` true, `role` `taken out` and
+`left` false (they did not leave);
 what they wrote before shows them by that name. A reader's `say`,
 `edit-message`, `delete-message` and `react` in a group fail, saying so.
 

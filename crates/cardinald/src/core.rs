@@ -6919,4 +6919,25 @@ mod tests {
         ana.core.follow(&stores[0]);
         assert_eq!(ana.core.held_back(&s), 0);
     }
+
+    #[test]
+    fn how_a_group_moved_is_told_for_a_week_from_when_it_came() {
+        let ([mut ana, mut bo, _cy], g) = family();
+        let store = cardinal_blob::MemStore::new();
+        let s = ana
+            .core
+            .succeed(&store, &g, &[(bo.id(), WRITER)])
+            .unwrap()
+            .new;
+        bo.syncs(&ana, &g, &store);
+        let moved = |p: &Person| crate::groups::list_of(&p.core)["groups"][0]["moved"].clone();
+        let now = moved(&bo);
+        assert_eq!(now["taken_out"].as_array().unwrap().len(), 1, "{now}");
+        assert!(now["seen"].as_u64().is_some());
+        // Whatever the mover's clock said, it ages from when this device
+        // first held it.
+        let h = bo.core.spaces.get_mut(&s).unwrap();
+        h.notes.first_seen_ms = Some(now_ms() - 8 * 24 * 3600 * 1000);
+        assert!(moved(&bo).is_null());
+    }
 }

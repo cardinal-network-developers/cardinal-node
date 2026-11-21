@@ -1111,6 +1111,7 @@ fn taking_someone_out_replaces_the_group_for_everyone_else() {
     let out: Vec<&Value> = all.iter().filter(|m| m["taken_out"] == true).collect();
     assert_eq!(out.len(), 1, "{m}");
     assert_eq!(out[0]["name"], "Cy");
+    assert_eq!(out[0]["left"], false, "taken out is not left: {m}");
     // His groups say who moved it and what changed, until he clears it.
     let moved = listed(&bo, "Family").unwrap()["moved"].clone();
     assert_eq!(moved["by"], "Ana", "{moved}");
@@ -1168,6 +1169,8 @@ fn taking_someone_out_replaces_the_group_for_everyone_else() {
         json!([{"name": "You", "from": "admin", "to": "reader"}]),
         "{moved}"
     );
+    assert_eq!(listed(&bo, "Family").unwrap()["role"], "reader");
+    assert_eq!(listed(&ana, "Family").unwrap()["role"], "owner");
     // A reader reads, and writes nothing.
     let no = reply(&bo, &json!({"cmd": "say", "group": g3, "text": "can I?"}));
     assert_eq!(no["ok"], false, "{no}");

@@ -234,7 +234,8 @@ pub fn members(space: &Space) -> Vec<Member> {
 /// taken out of it when it was succeeded, whose node the successor carried
 /// (`spaces.md#what-comes-across`). Display only: the name the others saw,
 /// so that what they wrote before still shows who wrote it. Their role is
-/// none here, and is given as a reader's.
+/// none here, and is given as a reader's; they have not left, they were
+/// taken out.
 pub fn taken_out(space: &Space) -> Vec<Member> {
     let state = space.state();
     let mut out: Vec<Member> = Vec::new();
@@ -252,7 +253,7 @@ pub fn taken_out(space: &Space) -> Vec<Member> {
         out.push(Member {
             identity: who,
             role: READER,
-            left: true,
+            left: false,
             name: admins_value(space, n, 2)
                 .and_then(Value::as_text)
                 .map(str::to_owned),

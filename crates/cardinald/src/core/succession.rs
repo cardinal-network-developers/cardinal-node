@@ -76,6 +76,10 @@ pub struct Notes {
     /// cleared the note.
     #[serde(default)]
     pub moved_seen: bool,
+    /// When this device first held this successor, by its own clock: what
+    /// the note of how the group moved is aged from.
+    #[serde(default)]
+    pub first_seen_ms: Option<u64>,
 }
 
 /// What [`Core::succeed`] wrote, to send.
@@ -536,6 +540,7 @@ impl Core {
             }
         }
         self.check_unchecked(store);
+        self.note_first_seen();
         out.extend(self.account_for_followed());
         self.note_did_not_stand();
         out.extend(self.post_again_all(false));
@@ -652,6 +657,18 @@ impl Core {
             return Err("its initial state is not the state at its cut".to_owned());
         }
         Ok((canonical, carried))
+    }
+
+    /// Notes when this device first held each successor it holds.
+    fn note_first_seen(&mut self) {
+        let now = now_ms();
+        for h in self.spaces.values_mut() {
+            let succ = h.space.as_ref().is_some_and(|s| s.succeeds().is_some());
+            if succ && h.notes.first_seen_ms.is_none() {
+                h.notes.first_seen_ms = Some(now);
+                h.save_notes();
+            }
+        }
     }
 
     /// Notes, in the old space, each succession this person made of it
