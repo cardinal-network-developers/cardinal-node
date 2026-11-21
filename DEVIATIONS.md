@@ -648,6 +648,11 @@ What is not built:
   its label; the successor's entries get one as any space does).
 - **Carried over** is not shown: what a member who holds no space before
   sees of a successor's initial state is shown as anything else is.
+- **What is not posted again is not shown.** An addition the cut did not
+  carry is not shown to whoever made it, nor a `rotate`, `keep` or change
+  of policy left in the old space; and when a key is removed, nothing
+  shows the person what that device wrote that a successor carried, or
+  offers to delete it there.
 
 Readings:
 
