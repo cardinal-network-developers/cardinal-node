@@ -405,10 +405,17 @@ threshold, delay, delay_text, data, names, recoveries: [{fingerprint,
 endorsed, confirmed, in_effect, objected, id}], frozen}`; `guardians-set`
 (`who`, `threshold`, `delay`; the words); `guardians-object`
 (`fingerprint`, needed only when more than one is under way), for a
-recovery or a change of guardians. `guardians` also gives `changes`, each
-change under way `{fingerprint, guardians, threshold, confirmed,
-objected, id}`, and `copy_full`, the guardians whose copy of the account
-reached its cap. `guardians-set` refuses while a change is under way that
+recovery or a change of guardians. `guardians` also gives `asked` (those
+asked to be guardians who have not answered), `ready` (those who
+accepted with a persona not named before, ready to be named), `changes`,
+each change under way `{fingerprint, names, guardians, threshold, delay,
+delay_text, confirmed, needed, waits_until_ms, objected, id}`
+(`waits_until_ms`: when it was made, by this person's clock, plus the
+wait; each guardian waits from when their device saw it, so it is a
+guide), and `copy_full`, the guardians whose copy of the account reached
+its cap. `guardians-set` naming someone with no fresh persona fails, and
+asks them for one at once: an existing guardian kept in a change accepts
+again. `guardians-set` refuses while a change is under way that
 the person has not objected to.
 
 The person asks with `guardians-ask` (`who`) → `{name}`. A guardian acts
@@ -417,12 +424,16 @@ through a persona per person guarded and per policy (D79), made by
 person then names with `guardians-set` (it fails, saying so, for a
 contact with no persona not named before). With guardians in office,
 `guardians-set` asks no words and replies `pending: true`: the change
-takes effect once they confirm it. `guarding` → `{guarding: [{name, id (64
+takes effect once they confirm it. Errors of the guardians' and recovery requests start with a capital
+letter and name no command: they are shown as they come.
+
+`guarding` → `{guarding: [{name, id (64
 hex), persona, guardians, threshold, delay, delay_text, recoveries,
 waiting, warning, never, helpers, account_copy, changes}], accepted:
 [names], asked: [names], now_ms}`; `asked` lists those who asked this
 person to guard them, unanswered; `accepted`, those this person accepted
-to guard who have not named them yet; `changes`, each change of the
+to guard who have not named them yet; `named_in_change`, those who named
+this person's persona in a change waiting for confirmation; `changes`, each change of the
 person's guardians under way, `{id, guardians, threshold, delay_text,
 confirmed, confirmed_by_me, in_effect, objected, confirm_from_ms,
 caution, fingerprint, never}`, which `guarding-confirm-change` (`who`,
@@ -458,8 +469,10 @@ the relationship is listed nowhere as a contact (`contacts`,
 
 The new device: `recover` → `{under_way: true, identity, fingerprint,
 helper, guardians, proposed, asked, endorsed, confirmed, threshold,
-in_effect, held}` while one is under way (`held`: 1 once the account is
-among what the guardians gave back); `{under_way: false, finished: true,
+in_effect, held, lost_devices}` while one is under way (`held`: 1 once
+the account is among what the guardians gave back; `lost_devices`, the
+devices the recovery removes, `[{key, name: null}]`, so a window asks
+when they were lost only if there are any); `{under_way: false, finished: true,
 words, pair_again}` once, when `recover-finish` made the device the
 person's but stopped before the end (show the words; the next `recover`
 no longer has them); else `{under_way: false, pair_again}`. A recovery
@@ -469,7 +482,11 @@ one), to show under "pair them again". `recover-start` (`code`: a
 guardian's recovery invitation, `identity`: 64 hex; both optional) →
 `{fingerprint, identity}`: starts one if none is under way, and meets
 that guardian. `recover-invite` (`at`, optional) → `{code, fingerprint}`:
-an invitation for a guardian who is present to `accept`.
+an invitation for a guardian who is present to `accept`. Before any
+guardian's invitation was used it is for whomever the guardian names:
+`accept` then takes `for`, the person as the guardian's contacts call
+them, and the new device learns whom it recovers from that guardian's
+proposal.
 `recover-cancel` → `{fingerprint}` (null if nothing was under way).
 `recover-finish` (`without_account`, `lost_at`: ms, both optional) →
 `{words, account, pair_again, lost_devices}`: refuses while no guardian
@@ -484,8 +501,10 @@ held one; `words` are the new recovery words, to show once, and
 devices again".
 
 `contacts` gives each contact `recovered`: the text to show when their log
-has a recovery in effect ("was recovered by guardians they chose, after
-7 days. If in doubt, check with them in person."), else null.
+has a recovery in effect ("was recovered by guardians they chose on
+2026-11-21, after 7 days. If in doubt, check with them in person.", the
+date being when this device first saw the policy, left out if it never
+did), else null.
 
 `accept` is the only request that takes a recovery invitation; an
 introduction never uses one.

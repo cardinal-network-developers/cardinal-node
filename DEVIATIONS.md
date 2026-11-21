@@ -563,6 +563,27 @@ differs or was read:
   the identity id, which the new device learns from a guardian's
   invitation used first, or from `--identity ID` (a guardian's `guarding`
   shows it).
+- **Reading: an invitation before the identity is known.** A new device
+  that has used no guardian's invitation yet can still make one (`cardinal
+  recover invite`): field 9 then holds 32 zero bytes, "for whomever the
+  guardian names", and the guardian, taking it up, names the person from
+  their own contacts (`cardinal accept CODE --for NAME`); their device
+  checks it guards them, as for any recovery invitation, and the persona
+  meets the helper as usual. The new device learns whom it recovers from
+  that persona's proposal (field 1). The spec gives field 9 as the
+  identity; the person rarely knows it, and the sheet does not hold it.
+- **Reading: what a window is shown.** Errors of the guardians' and
+  recovery requests start with a capital letter and name no command; the
+  CLI adds its own. `guardians` lists who was asked and who is ready to be
+  named; a change under way shows whom it names and roughly until when the
+  guardians wait (when it was made plus the delay; each waits from when
+  their own device saw it). A guardian kept in a change accepts again with
+  a fresh persona: `guardians set` asks them at once and says so; their
+  `guarding` shows them named in the change, not "not named yet". The
+  `recovered` text carries the date this device first saw the policy
+  (`seen-policies.json`), since identity entries carry no time.
+  `CARDINAL_TEST_GIVE_NO_ACCOUNT`, in debug builds only, makes a guardian
+  give back no account, to test going on without it.
 - **Reading: no probing.** Only the person's own `accept` (and a helper,
   for a guardian's invitation) takes an invitation with field 9; an
   introduction never does, whether tended unasked or said yes to. A device
