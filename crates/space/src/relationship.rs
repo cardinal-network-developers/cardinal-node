@@ -708,7 +708,7 @@ pub const CARRIED: u64 = 65;
 pub const HELD_COPY: u64 = 66;
 /// Guardian persona kind (`profiles.md#relationship`, D79): the persona
 /// its author guards the other member through, and that persona's log.
-pub const GUARDIAN_PERSONA: u64 = 11;
+pub const GUARDIAN_PERSONA: u64 = 12;
 
 /// A guardian's proposal, as a relationship space holds it.
 #[derive(Clone, Debug, PartialEq, Eq)]

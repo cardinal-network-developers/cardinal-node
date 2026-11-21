@@ -463,7 +463,7 @@ differs or was read:
   its root made from them as a recovery phrase's, a log whose first device
   key is the service's, under `personas/<id>`; the account keeps a persona
   node (kind 16: purpose `guardian`, the entropy, the id, `for` NAME), and
-  the relationship with NAME a guardian persona node (kind 11: the id and
+  the relationship with NAME a guardian persona node (kind 12: the id and
   the log). **Not built:** a guardian's other devices running the persona.
   Only the device that accepted runs it, and endorsing, confirming and
   inviting are refused elsewhere, saying so; the spec has each device add
