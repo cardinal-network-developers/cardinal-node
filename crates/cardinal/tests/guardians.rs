@@ -768,6 +768,30 @@ fn guardians_change_with_the_guardians_consent() {
     assert!(bo
         .cli(&["guarding"])
         .contains("sealed copy of their account"));
+
+    // And the new guardians recover her: the new device sees the new
+    // policy in office, by the old guardians' confirmations their personas
+    // carried, and the recovery is asked for, endorsed and confirmed.
+    ana.stop();
+    drop(ana);
+    let new = new_device(root.path(), "new");
+    let fp = fingerprint_from(&new.cli(&["recover", "start", &recovery_invitation(&bo, "Ana")]));
+    new.cli(&["recover", "start", &recovery_invitation(&di, "Ana")]);
+    wait("the recovery is asked for", 30, || {
+        new.cli(&["recover"]).contains("in touch:")
+    });
+    for g in [&bo, &di] {
+        wait("the new guardian sees the recovery", 30, || {
+            g.cli(&["guarding"]).contains(&fp)
+        });
+    }
+    endorse_and_confirm(&[&bo, &di], &fp);
+    wait("the account is given back", 60, || {
+        new.cli(&["recover"]).contains("your account among it")
+    });
+    let o = new.try_cli(&["recover", "finish"]);
+    assert!(o.status.success(), "{}", out(&o));
+    assert!(out(&o).contains("your account, contacts"), "{}", out(&o));
 }
 
 /// A new device lost before the recovery is in effect is started over on

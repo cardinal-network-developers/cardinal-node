@@ -1577,6 +1577,17 @@ pub fn list(d: &Daemon) -> Json {
             let never: Vec<String> = s.never.iter().map(|w| w.recovery.fingerprint()).collect();
             let helpers = service(d, &g.persona.identity)
                 .map_or(0, |h| helpers_of(&h.d, &g.identity).len());
+            // where the persona's own service listens, for an invitation
+            // to name (`guarding-invite` `at`): null if it does not run here
+            let persona_at = service(d, &g.persona.identity).and_then(|h| {
+                let a = h.d.endpoint.udp_addr().or(h.d.endpoint.tcp_addr())?;
+                let ip = if a.ip().is_unspecified() {
+                    crate::daemon::local_ips().into_iter().next()?
+                } else {
+                    a.ip()
+                };
+                Some(std::net::SocketAddr::new(ip, a.port()).to_string())
+            });
             let account_copy = {
                 let core = d.core();
                 core.held_taken(&g.identity)
@@ -1596,6 +1607,7 @@ pub fn list(d: &Daemon) -> Json {
                 "warning": (!s.waiting.is_empty()).then(|| second_warning(&g.name, s.waiting.len())),
                 "never": never,
                 "helpers": helpers,
+                "persona_at": persona_at,
                 "account_copy": account_copy,
                 "changes": changes_json(d, &seen, g),
             })
@@ -2258,11 +2270,15 @@ async fn met_helper(d: &Arc<Daemon>, h: &Arc<Helper>, space: SpaceId, g: &Guarde
             }
         }
     }
+    // With the logs held under its label: the confirmations by which a
+    // change of guardians is in effect are entries of the guardians'
+    // personas' logs, and without them the new device sees the old
+    // policy in office, and no proposal under the current one would do.
     let log: Vec<Vec<u8>> = {
         let core = d.core();
         core.others
             .get(&who)
-            .map(|o| o.log.entries().map(IdentityEntry::encode).collect())
+            .map(|o| crate::core::log_bytes(&o.log))
             .unwrap_or_default()
     };
     let r = h
