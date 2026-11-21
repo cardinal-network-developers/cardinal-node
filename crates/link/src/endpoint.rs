@@ -388,6 +388,11 @@ impl Attached {
     pub fn is_closed(&self) -> bool {
         self.path.is_closed()
     }
+
+    /// Whether `s` runs over this stream now.
+    pub fn carries(&self, s: &Session) -> bool {
+        s.path().same(&self.path)
+    }
 }
 
 /// A link endpoint: one device's listening and connecting point.
@@ -1232,16 +1237,27 @@ impl EndpointInner {
             Role::Initiator => local_static,
             Role::Responder => s.peer_static,
         };
-        let (new_at, new_relayed) = {
+        // Through a host, over Bluetooth (which holds only while the two
+        // are in range), direct over IP: the better wins.
+        let rank = |p: &Path| {
+            if p.is_relayed() {
+                0
+            } else if p.carrier() == Some(CarrierKind::Ble) {
+                1
+            } else {
+                2
+            }
+        };
+        let (new_at, new_rank) = {
             let c = new.lock();
-            (c.established_at, c.path.is_relayed())
+            (c.established_at, rank(&c.path))
         };
         let mut survives = true;
         for o in others {
-            let (o_est, o_at, o_relayed) = {
+            let (o_est, o_at, o_rank) = {
                 let c = o.lock();
                 let established = c.established && !c.is_closed();
-                (established, c.established_at, c.path.is_relayed())
+                (established, c.established_at, rank(&c.path))
             };
             if !o_est {
                 continue;
@@ -1253,10 +1269,11 @@ impl EndpointInner {
                     }
                     _ => false,
                 };
-            let loser = if o_relayed != new_relayed {
-                // A direct session beats one through a host, whichever came
-                // first, and both ends can tell which that is.
-                if new_relayed {
+            let loser = if o_rank != new_rank {
+                // A direct session beats one through a host, and one over IP
+                // one over Bluetooth, whichever came first, and both ends can
+                // tell which that is.
+                if new_rank < o_rank {
                     new.clone()
                 } else {
                     o.clone()

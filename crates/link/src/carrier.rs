@@ -333,6 +333,9 @@ static NEXT_TCP_ID: AtomicU64 = AtomicU64::new(1);
 
 /// How long a TCP connection may stay silent before it is dropped.
 pub(crate) const TCP_IDLE: Duration = Duration::from_secs(200);
+/// How long the rest of a packet may take once its length came: a peer
+/// that sends a length and nothing more does not hold the stream.
+pub(crate) const BODY_WITHIN: Duration = Duration::from_secs(20);
 
 /// Starts reading and writing packets on a TCP connection.
 pub(crate) fn spawn_tcp(
@@ -434,8 +437,9 @@ where
             if n == 0 || n > MAX_DATAGRAM {
                 break;
             }
-            if r.read_exact(&mut buf[..n]).await.is_err() {
-                break;
+            match tokio::time::timeout(BODY_WITHIN, r.read_exact(&mut buf[..n])).await {
+                Ok(Ok(_)) => {}
+                _ => break,
             }
             ingress.ingress(&mut buf[..n], &rpath);
             // Wake deferred readers unless another whole packet is
