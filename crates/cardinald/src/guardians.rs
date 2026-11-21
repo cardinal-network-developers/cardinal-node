@@ -96,10 +96,13 @@ struct Seen {
     /// Decision (hex) to milliseconds since the epoch.
     #[serde(default)]
     first: BTreeMap<String, u64>,
-    /// The personas (hex) a policy named, so that one no longer named is
-    /// burned.
+    /// The personas a policy named, as `persona:policy` (hex), so that one
+    /// a later policy no longer names is burned.
     #[serde(default)]
     named: BTreeSet<String>,
+    /// Decision (hex) to when this device first saw it in effect.
+    #[serde(default)]
+    effect: BTreeMap<String, u64>,
 }
 
 fn load_seen(d: &Daemon) -> Seen {
@@ -759,7 +762,12 @@ pub fn observe(d: &Daemon) {
     let mut seen = load_seen(d);
     let mut changed = false;
     for g in guarded(d) {
-        if seen.named.insert(hex::encode(g.persona.identity)) {
+        let pair = format!(
+            "{}:{}",
+            hex::encode(g.persona.identity),
+            hex::encode(g.policy.entry)
+        );
+        if seen.named.insert(pair) {
             changed = true;
         }
         let all = wanted(d, &g);
@@ -770,6 +778,10 @@ pub fn observe(d: &Daemon) {
         };
         for w in &all {
             let key = hex::encode(w.recovery.entry);
+            if w.in_effect && !seen.effect.contains_key(&key) {
+                seen.effect.insert(key.clone(), now_ms());
+                changed = true;
+            }
             if !seen.first.contains_key(&key) {
                 if under_way(&seen) > 0 && !w.in_effect {
                     tracing::warn!(
@@ -1465,8 +1477,11 @@ async fn take(d: &Arc<Daemon>, h: &Arc<Helper>, c: &account::ContactRecord, g: &
         .filter(|x| x.author == helper && x.identity == who)
         .filter_map(|x| IdentityEntry::decode(&x.entry).ok())
         .find(|e| e.identity() == who && recovery_of_entry(e).is_some())
-        .filter(|e| is_recover_under(e, &g.policy.entry))
-        .map(|e| e.id());
+        .filter(|e| is_recover_under(e, &g.policy.entry));
+    // and what its new root wrote after it, once in effect: the new device
+    // taking the identity up, by which the guardian knows it is done
+    let new_root = first.as_ref().and_then(recovery_of_entry).map(|r| r.root);
+    let first = first.map(|e| e.id());
     if let Some(r) = first {
         let plog = persona_log(d, &g.persona);
         let mine = plog.map(|l| acts_on(&l, &r)).unwrap_or_default();
@@ -1489,7 +1504,8 @@ async fn take(d: &Arc<Daemon>, h: &Arc<Helper>, c: &account::ContactRecord, g: &
                 if core.has(&label, &e.id()) {
                     return None;
                 }
-                (e.identity() != who || Some(e.id()) == first).then_some(x.entry)
+                let by_new_root = new_root.is_some_and(|root| e.signer() == root);
+                (e.identity() != who || Some(e.id()) == first || by_new_root).then_some(x.entry)
             })
             .collect()
     };
@@ -1721,6 +1737,10 @@ fn retire_moot(d: &Arc<Daemon>) {
     }
 }
 
+/// How long a persona waits, after a recovery it acted in took effect, for
+/// the new device to take it up, before it is burned anyway.
+const SPENT_AFTER_MS: u64 = 30 * 24 * 60 * 60 * 1000;
+
 /// Burns the guardian personas whose purpose is over (D79): one that
 /// acted in a recovery now in effect, and one a policy named that the
 /// current policy no longer names. Its service stops and goes; the account
@@ -1736,23 +1756,59 @@ async fn burn_spent(d: &Arc<Daemon>) {
             .iter()
             .filter(|g| g.persona.identity == p.identity)
             .collect();
-        let acted_in_effect = mine.iter().any(|g| {
+        // A recovery it acted in is in effect, and the new device has
+        // taken it up (the new root wrote again in the log), or a month has
+        // passed: until then the persona's relationships may still hold
+        // what the new device needs, its last confirmation among them.
+        let finished = |w: &Wanted| {
+            let core = d.core();
+            let found = core.others.get(&who).is_some_and(|o| {
+                let st = o.log.state();
+                o.log.entries().any(|e| {
+                    e.signer() == w.recovery.root
+                        && e.id() != w.recovery.entry
+                        && st.is_valid(&e.id())
+                })
+            });
+            found
+        };
+        let long_ago = |w: &Wanted| {
+            seen.effect
+                .get(&hex::encode(w.recovery.entry))
+                .is_some_and(|t| now_ms().saturating_sub(*t) > SPENT_AFTER_MS)
+        };
+        let spent = mine.iter().any(|g| {
             wanted(d, g).iter().any(|w| {
                 w.in_effect
                     && (w.endorsed.contains(&p.identity) || w.confirmed.contains(&p.identity))
+                    && (finished(w) || long_ago(w))
             })
         });
-        let current = {
+        // A later policy, in effect, that no longer names it: known only
+        // when that policy descends from one that named it, never from a
+        // record that failed to open for another reason.
+        let dropped = {
             let core = d.core();
-            core.others
-                .get(&who)
-                .and_then(|o| o.log.current_policy())
-                .map(|q| q.entry)
+            core.others.get(&who).is_some_and(|o| {
+                let Some(current) = o.log.current_policy().map(|q| q.entry) else {
+                    return false;
+                };
+                let was: Vec<EntryId> = seen
+                    .named
+                    .iter()
+                    .filter_map(|n| {
+                        let (per, pol) = n.split_once(':')?;
+                        (per == hex::encode(p.identity)).then_some(())?;
+                        hex::decode(pol).ok()?.try_into().ok()
+                    })
+                    .collect();
+                !was.is_empty()
+                    && !was.contains(&current)
+                    && was.iter().any(|w| o.log.dag().is_ancestor(w, &current))
+                    && !mine.iter().any(|g| g.policy.entry == current)
+            })
         };
-        let named_now = mine.iter().any(|g| Some(g.policy.entry) == current);
-        let dropped =
-            seen.named.contains(&hex::encode(p.identity)) && !named_now && current.is_some();
-        if !(acted_in_effect || dropped) {
+        if !(spent || dropped) {
             continue;
         }
         let Some(acc) = d.core().account_id() else {

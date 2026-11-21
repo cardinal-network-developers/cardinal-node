@@ -441,12 +441,19 @@ differs or was read:
   with no guardian persona node for this person ("has not accepted"). The
   person is asked out of band. `cardinal guarding` lists those accepted
   but not named yet.
-- **Reading: burning a persona.** A guardian persona is burned once a
-  recovery it endorsed or confirmed is in effect, or once the person's
-  current policy no longer names a persona a policy had named (this device
-  remembers which in `guarding.json`): account persona field 5 is set, and
-  its service stops and its directory goes. **Not built:** writing `leave`
-  in its spaces, and asking for fresh personas for the `set_recovery` that
+- **Reading: burning a persona.** "Burned once a recovery it acted in is
+  in effect": once such a recovery is in effect **and** the new device has
+  taken it up (the person's log shows a valid entry by the new root other
+  than the `recover`, which the helper carries to the guardians before it
+  goes), or 30 days after this device saw it in effect; burning at once
+  could take away the last confirmation, and its share, before the new
+  device got it. "When the policy no longer names it": only when the
+  current policy descends from one that named it (this device remembers
+  which, `persona:policy`, in `guarding.json`) and does not, never from a
+  record that failed to open for another reason. Burning sets account
+  persona field 5, stops the service and removes its directory. **Not
+  built:** writing `leave` in its spaces, dropping the copies held for the
+  person, and asking for fresh personas for the `set_recovery` that
   follows a recovery (changing guardians is not built).
 - **Reading: how a relationship is marked "recovery for" the person.**
   The spec says guardian software shows it so, never as a contact, but
@@ -530,7 +537,10 @@ differs or was read:
   relationship, and is closed so that one as contacts replaces it). The
   person's devices let a guardian fetch the account only where they named
   it so; a guardian's devices take it only from someone they guard through
-  a persona. Chunks are left out. In a recovery the persona's service is
+  a persona, and only the first set that person named (a stolen device
+  naming more gets nothing more); a helper takes at most two from each
+  persona, the account and that guardian's relationship. Chunks are left
+  out. In a recovery the persona's service is
   given copies of the sealed account and of the relationship space the
   guardian shares with the person, names both in held copy nodes in each
   helper's relationship, and lets the helper fetch them; the helper takes

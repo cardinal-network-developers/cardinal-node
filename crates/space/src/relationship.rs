@@ -795,13 +795,23 @@ pub fn create_held(label: &[u8; 32]) -> SpaceOp {
     )
 }
 
-/// The held copy nodes in a relationship space: who gives which set.
-pub fn held(space: &Space) -> Vec<(IdentityId, [u8; 32])> {
-    space
+/// Who gives which set to hold.
+pub type Held = (IdentityId, [u8; 32]);
+
+/// The held copy nodes in a relationship space: who gives which set, in
+/// the order they were made.
+pub fn held(space: &Space) -> Vec<Held> {
+    let dag = space.dag();
+    let mut found: Vec<(Option<usize>, Held)> = space
         .state()
         .children(&ROOT)
         .into_iter()
         .filter(|n| n.kind == NodeKind::Uint(HELD_COPY) && !n.deleted)
-        .filter_map(|n| Some((n.creator, as_created(n, 1)?.as_bytes()?.try_into().ok()?)))
-        .collect()
+        .filter_map(|n| {
+            let l: [u8; 32] = as_created(n, 1)?.as_bytes()?.try_into().ok()?;
+            Some((dag.position(&n.created_in), (n.creator, l)))
+        })
+        .collect();
+    found.sort_by_key(|(at, _)| *at);
+    found.into_iter().map(|(_, h)| h).collect()
 }

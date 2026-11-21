@@ -684,6 +684,13 @@ pub async fn finish(d: &Arc<Daemon>) -> anyhow::Result<Json> {
     }))
 }
 
+/// Whether an entry is not a `recover` (which the new root signs too).
+fn recovery_entry_not(e: &IdentityEntry) -> bool {
+    !e.ops()
+        .iter()
+        .any(|o| matches!(o.body(), cardinal_identity::OpBody::Recover { .. }))
+}
+
 /// Syncs a recovery relationship with the guardian's devices in touch, ten
 /// seconds at most each.
 async fn sync_with(hd: &Arc<Daemon>, guardian: &[u8; 32], space: &SpaceId) {
@@ -706,9 +713,28 @@ async fn last_carry(d: &Arc<Daemon>) {
     if let Err(e) = carry_round(d, &h).await {
         tracing::debug!("carrying the recovery: {e:#}");
     }
+    // What the new root wrote, taking the identity up: the guardians know
+    // this device by it, and that their personas' purpose is over.
+    let root = load(d).as_ref().and_then(entry_of).map(|e| e.signer());
+    let mine: Vec<Vec<u8>> = {
+        let core = d.core();
+        core.identity
+            .as_ref()
+            .map(|i| {
+                i.log
+                    .entries()
+                    .filter(|e| Some(e.signer()) == root && recovery_entry_not(e))
+                    .map(IdentityEntry::encode)
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
     let _ = h
         .on(move |hd| async move {
             for (guardian, space) in relationships(&hd, &who) {
+                if let Err(e) = crate::guardians::carry(&hd, &space, &who, &mine) {
+                    tracing::debug!("carrying the new device's entries: {e:#}");
+                }
                 sync_with(&hd, &guardian, &space).await;
             }
             Ok(())

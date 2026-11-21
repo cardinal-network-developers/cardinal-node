@@ -1897,7 +1897,19 @@ impl Core {
         if !takes {
             return Vec::new();
         }
-        self.held_nodes(who).1
+        // A guardian holds one set for a person, the first they named: the
+        // account. A helper holds at most two from each persona: the
+        // account and that guardian's relationship with the person. No
+        // more, whoever names more (a thief with a stolen device among
+        // them).
+        let most = if self.takes_recovery_copies { 2 } else { 1 };
+        let mut out: Vec<[u8; 32]> = Vec::new();
+        for l in self.held_nodes(who).1 {
+            if !out.contains(&l) && out.len() < most {
+                out.push(l);
+            }
+        }
+        out
     }
 
     /// Whether this person holds a guardian persona for `who`, not burned.
