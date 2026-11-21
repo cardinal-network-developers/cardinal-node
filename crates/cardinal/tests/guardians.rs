@@ -60,6 +60,28 @@ fn meet(from: &Dev, to: &Dev, as_name: &str) {
     });
 }
 
+/// Each of `gs` accepts guarding `who`'s person, Ana: their device makes a
+/// persona for it (D79), and writes it in the relationship.
+fn accept_guarding(gs: &[&Dev]) {
+    for g in gs {
+        let o = g.cli(&["guarding", "accept", "Ana"]);
+        assert!(o.contains("accepted"), "{o}");
+    }
+}
+
+/// Names guardians on `who`, once each has accepted and their persona has
+/// reached `who`, with the words on standard input.
+fn name_accepted(who: &Dev, words: &str, args: &[&str]) -> std::process::Output {
+    let mut last = None;
+    wait("the guardians' personas reach the person", 30, || {
+        let o = name_guardians(who, words, args);
+        let ok = o.status.success();
+        last = Some(o);
+        ok
+    });
+    last.unwrap()
+}
+
 /// Names guardians on `who`, with the words on standard input.
 fn name_guardians(who: &Dev, words: &str, args: &[&str]) -> std::process::Output {
     let mut a = vec!["guardians", "set"];
@@ -99,8 +121,8 @@ fn code_in(o: &str) -> String {
 
 /// The recovery invitation `g` makes for `who`'s new device.
 fn recovery_invitation(g: &Dev, who: &str) -> String {
-    let at = format!("127.0.0.1:{}", g.port);
-    code_in(&g.cli(&["guarding", "invite", who, "--address", &at]))
+    // the persona's, at the address its own service listens on
+    code_in(&g.cli(&["guarding", "invite", who]))
 }
 
 /// `cardinal guarding VERB Ana FINGERPRINT --yes` on `g`.
@@ -172,10 +194,21 @@ fn guardians_are_named_and_only_they_know() {
         "{}",
         out(&o)
     );
+    // A guardian is named only once they accepted, through a persona.
+    let o = name_guardians(&ana, &words, &["bo", "cy"]);
+    assert!(
+        !o.status.success() && out(&o).contains("has not accepted"),
+        "{}",
+        out(&o)
+    );
+    accept_guarding(&[&bo, &cy]);
+    wait("bo shows the acceptance", 10, || {
+        bo.cli(&["guarding"]).contains("accepted guarding Ana")
+    });
     // The first guardians take the words.
     let o = name_guardians(&ana, "", &["bo", "cy"]);
     assert!(!o.status.success(), "{}", out(&o));
-    let o = name_guardians(&ana, &words, &["bo", "cy", "--delay", "3d"]);
+    let o = name_accepted(&ana, &words, &["bo", "cy", "--delay", "3d"]);
     assert!(o.status.success(), "{}", out(&o));
     assert!(out(&o).contains("Your guardians are bo, cy"), "{}", out(&o));
 
@@ -249,7 +282,8 @@ fn guardians_give_an_identity_back() {
     for g in [&bo, &cy, &di] {
         meet(&laptop, g, "Ana");
     }
-    let o = name_guardians(
+    accept_guarding(&[&bo, &cy, &di]);
+    let o = name_accepted(
         &laptop,
         &words,
         &["bo", "cy", "di", "--threshold", "2", "--delay", "6s"],
@@ -377,14 +411,16 @@ fn guardians_give_an_identity_back() {
         "{finished}"
     );
     // Every old device is to be paired again, the host too.
-    assert!(finished.contains("Pair them again"), "{finished}");
+    assert!(
+        finished.contains("Pair your other devices again"),
+        "{finished}"
+    );
     for k in [&laptop_key, &nuc_key] {
         assert!(finished.contains(k.as_str()), "{k} in {finished}");
     }
     let new_words = words_from(&finished);
     assert_ne!(new_words, words);
     assert!(!new.home.join("recovery-helper").exists());
-    new.wait_mounted();
     assert_eq!(new.status()["identity"].as_str(), Some(id.as_str()));
     // None of the old devices is the identity's now.
     let devices = new.cli(&["devices"]);
@@ -418,11 +454,19 @@ fn strangers_recover_a_person_with_no_host() {
     let cy = person(root.path(), "cy");
     meet(&laptop, &bo, "Ana");
     meet(&laptop, &cy, "Ana");
-    let o = name_guardians(&laptop, &words, &["bo", "cy", "--delay", "4s"]);
+    accept_guarding(&[&bo, &cy]);
+    let o = name_accepted(&laptop, &words, &["bo", "cy", "--delay", "4s"]);
     assert!(o.status.success(), "{}", out(&o));
     for g in [&bo, &cy] {
         wait("the guardian knows", 30, || {
             g.cli(&["guarding"]).contains("Ana: one of 2 guardians")
+        });
+        // and, once the two are in touch as contacts, holds her account,
+        // sealed
+        laptop.cli(&["say", g.name, "you guard me now"]);
+        wait("the guardian holds her account", 60, || {
+            g.cli(&["guarding"])
+                .contains("sealed copy of their account")
         });
     }
     laptop.stop();
@@ -440,9 +484,11 @@ fn strangers_recover_a_person_with_no_host() {
     assert!(!bo.cli(&["contacts"]).contains("cy"));
     assert!(!cy.cli(&["contacts"]).contains("bo"));
     endorse_and_confirm(&[&bo, &cy], &fp);
-    wait("the new device sees it in effect", 60, || {
-        new.cli(&["recover"]).contains("have confirmed")
-    });
+    wait(
+        "the new device sees it in effect, its account given back",
+        60,
+        || new.cli(&["recover"]).contains("your account among it"),
+    );
     let o = new.try_cli(&["recover", "finish"]);
     assert!(o.status.success(), "{}", out(&o));
     let finished = String::from_utf8_lossy(&o.stdout).into_owned();
@@ -453,19 +499,26 @@ fn strangers_recover_a_person_with_no_host() {
     let new_words = words_from(&finished);
     assert!(!new.home.join("recovery-helper").exists());
     // The same identity, on this device, with new words.
-    new.wait_mounted();
     assert_eq!(new.status()["identity"].as_str(), Some(id.as_str()));
     let o = new.cli_input(&["recovery", "check"], &new_words);
     assert!(o.status.success(), "{}", out(&o));
     let o = new.cli_input(&["recovery", "check"], &words);
     assert!(!o.status.success(), "{}", out(&o));
-    std::fs::write(new.p("again.txt"), "again\n").unwrap();
-    new.cli(&["flush"]);
-    // The guardians see it done.
+    // The account came back from the guardians, sealed, with no host: her
+    // contacts are hers again, and so are her relationships with them.
+    assert!(finished.contains("your account, contacts"), "{finished}");
+    wait("her contacts are back", 30, || {
+        let c = new.cli(&["contacts"]);
+        c.contains("bo") && c.contains("cy")
+    });
+    // and the old laptop is listed, to pair again, by the name she gave it
+    assert!(finished.contains("laptop"), "{finished}");
+    // Each guardian's persona is burned: its purpose is over.
     for g in [&bo, &cy] {
-        wait("the guardian sees it done", 30, || {
-            g.cli(&["guarding"]).contains(": done")
+        wait("the persona is burned", 30, || {
+            g.log().contains("burned persona")
         });
+        assert!(g.cli(&["guarding"]).contains("You guard nobody"));
     }
 }
 
@@ -489,7 +542,8 @@ fn a_recovery_invitation_to_someone_who_is_not_a_guardian_gets_nothing_back() {
     for g in [&bo, &cy, &di] {
         meet(&laptop, g, "Ana");
     }
-    let o = name_guardians(&laptop, &words, &["bo", "cy", "--delay", "1d"]);
+    accept_guarding(&[&bo, &cy]);
+    let o = name_accepted(&laptop, &words, &["bo", "cy", "--delay", "1d"]);
     assert!(o.status.success(), "{}", out(&o));
     for g in [&bo, &cy] {
         wait("the guardian knows", 30, || {
@@ -551,7 +605,8 @@ fn a_second_recovery_is_warned_of_and_starting_over_works() {
     let cy = person(root.path(), "cy");
     meet(&laptop, &bo, "Ana");
     meet(&laptop, &cy, "Ana");
-    let o = name_guardians(&laptop, &words, &["bo", "cy", "--delay", "4s"]);
+    accept_guarding(&[&bo, &cy]);
+    let o = name_accepted(&laptop, &words, &["bo", "cy", "--delay", "4s"]);
     assert!(o.status.success(), "{}", out(&o));
     for g in [&bo, &cy] {
         wait("the guardian knows", 30, || {
@@ -597,7 +652,7 @@ fn a_second_recovery_is_warned_of_and_starting_over_works() {
         assert!(o.status.success(), "{}", out(&o));
         // and its relationship with the lost device's helper is retired
         wait("the old helper is retired", 30, || {
-            g.log().contains("retired the recovery for Ana")
+            g.log().contains("retired a recovery relationship")
         });
         let shown = g.cli(&["guarding"]);
         assert!(shown.contains(&fp), "{shown}");
@@ -617,7 +672,6 @@ fn a_second_recovery_is_warned_of_and_starting_over_works() {
     wait("the second device recovers", 60, || {
         second.try_cli(&["recover", "finish"]).status.success()
     });
-    second.wait_mounted();
     // The old one can never take effect now.
     let o = guarding(&cy, "confirm", &old);
     assert!(!o.status.success(), "{}", out(&o));

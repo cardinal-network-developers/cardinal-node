@@ -395,10 +395,15 @@ pub async fn accept(
     // A recovery invitation is answered only by a guardian of whoever it
     // names, or by a recovery helper; anyone else's device tells its
     // person so and sends nothing back (`identity.md#how-guardians-act`).
-    let helper = d.config().this_run.helper;
+    // A guardian answers through their persona for that person (D79),
+    // whose service takes it up from here.
+    let inside = d.config().this_run.inside();
     match invitation.recovery_of {
-        Some(p) if !helper => crate::guardians::may_answer(d, &p)?,
-        None if helper => anyhow::bail!("that is not a guardian's recovery invitation"),
+        Some(p) if !inside => {
+            crate::guardians::may_answer(d, &p)?;
+            return crate::guardians::accept_recovery(d, code, &p).await;
+        }
+        None if inside => anyhow::bail!("that is not a recovery invitation"),
         _ => {}
     }
     // A helper and a guardian trust each other for the recovery's sake.
@@ -428,7 +433,7 @@ pub async fn accept(
         .map_err(|e| anyhow::anyhow!("could not reach them at {addr} ({e})"))?;
     d.on_session(s.clone());
     let petname = match invitation.recovery_of {
-        Some(p) if !helper => crate::guardians::helper_petname(d, &p),
+        Some(p) if !inside => crate::guardians::helper_petname(d, &p),
         _ => name
             .map(str::to_owned)
             .or(invitation.name.clone())
@@ -496,11 +501,6 @@ async fn accept_exchange(
         invitation.recovery_of.as_ref(),
     )?;
     mailbox::met(d, &space, &invitation.inviter);
-    if let Some(p) = invitation.recovery_of {
-        if !d.config().this_run.helper {
-            crate::guardians::met_helper(d, &space, &p);
-        }
-    }
     send(&mut st, &ContactMessage::Done).await?;
     st.shutdown().await?;
     remember(d, s);
@@ -598,11 +598,7 @@ pub async fn serve(d: &Arc<Daemon>, s: &Session, mut st: Stream) -> anyhow::Resu
         if let Err(e) = invitation_used(d, s, &them) {
             tracing::debug!("counting an invitation's use: {e:#}");
         }
-        let helper = d.config().this_run.helper;
-        let petname = match recovery_of {
-            Some(p) if !helper => crate::guardians::helper_petname(d, &p),
-            _ => name.clone(),
-        };
+        let petname = name.clone();
         record_contact(
             d,
             &them,
@@ -613,9 +609,6 @@ pub async fn serve(d: &Arc<Daemon>, s: &Session, mut st: Stream) -> anyhow::Resu
             Some(&met),
             recovery_of.as_ref(),
         )?;
-        if let Some(p) = recovery_of.filter(|_| !helper) {
-            crate::guardians::met_helper(d, &space, &p);
-        }
         // The account counts it now.
         drop(using);
         mailbox::met(d, &space, &them);
@@ -821,7 +814,9 @@ pub fn list(d: &Daemon, all: bool) -> Json {
         .filter(|c| c.recovery_of.is_none())
         .filter(|c| all || !c.refused)
         .map(|c| {
+            let recovered = recovered_note(d, &c.identity);
             let v = json!({
+                "recovered": recovered,
                 "met": c.met.as_ref().map(|m| met_json(m, &everyone, &group_names)),
                 "identity": hex::encode(&c.identity[..8]),
                 "trusted": c.regard.trusted,
@@ -835,6 +830,26 @@ pub fn list(d: &Daemon, all: bool) -> Json {
         })
         .collect();
     json!({"contacts": contacts})
+}
+
+/// What a contact's software says of someone recovered by guardians
+/// (`identity.md#what-a-recovery-does`, D79), if their log shows a recovery
+/// in effect. Identity entries carry no time, so the date of the policy is
+/// not given (DEVIATIONS.md).
+fn recovered_note(d: &Daemon, who: &[u8; 32]) -> Option<String> {
+    let core = d.core();
+    let log = &core.others.get(who)?.log;
+    let st = log.state();
+    let r = log
+        .recoveries()
+        .into_iter()
+        .find(|r| st.in_effect.contains(&r.entry))?;
+    let p = log.policy(&r.policy)?;
+    Some(format!(
+        "was recovered by guardians they chose, after {}. If in doubt, check with them in \
+         person.",
+        crate::guardians::delay_text(p.delay)
+    ))
 }
 
 /// How two people met, as a window shows it.

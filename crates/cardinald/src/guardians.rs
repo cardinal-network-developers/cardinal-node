@@ -51,6 +51,7 @@ use serde_json::{json, Value as Json};
 
 use crate::core::{now_ms, short};
 use crate::daemon::Daemon;
+use crate::helper::Helper;
 use crate::net;
 
 /// What software tells a guardian, in plain words, before they endorse
@@ -95,6 +96,10 @@ struct Seen {
     /// Decision (hex) to milliseconds since the epoch.
     #[serde(default)]
     first: BTreeMap<String, u64>,
+    /// The personas (hex) a policy named, so that one no longer named is
+    /// burned.
+    #[serde(default)]
+    named: BTreeSet<String>,
 }
 
 fn load_seen(d: &Daemon) -> Seen {
@@ -111,7 +116,7 @@ fn save_seen(d: &Daemon, seen: &Seen) {
     }
 }
 
-fn delay_text(secs: u64) -> String {
+pub(crate) fn delay_text(secs: u64) -> String {
     let (n, unit) = match secs {
         s if s % 86_400 == 0 && s > 0 => (s / 86_400, "day"),
         s if s % 3600 == 0 && s > 0 => (s / 3600, "hour"),
@@ -119,14 +124,6 @@ fn delay_text(secs: u64) -> String {
         s => (s, "second"),
     };
     format!("{n} {unit}{}", if n == 1 { "" } else { "s" })
-}
-
-fn my_id(d: &Daemon) -> anyhow::Result<EntryId> {
-    d.core()
-        .identity
-        .as_ref()
-        .map(|i| i.id())
-        .ok_or_else(|| anyhow::anyhow!("this device does not belong to anyone"))
 }
 
 // ---- The person ----------------------------------------------------------
@@ -222,15 +219,18 @@ pub fn set(
             .log
             .current_policy()
             .ok_or_else(|| anyhow::anyhow!("your identity has no recovery policy in effect"))?;
+        // Each guardian is named by the persona they made for guarding this
+        // person, in the relationship the two share (D79).
         let mut named = Vec::new();
         for c in &chosen {
-            let key = core.encryption_key_of(&c.identity).map_err(|_| {
+            named.push(persona_of(&core, c).ok_or_else(|| {
                 anyhow::anyhow!(
-                    "{}'s identity log is not here yet; try again once you have been in touch",
-                    c.petname
+                    "{name} has not accepted being your guardian yet: ask them to run \
+                     `cardinal guarding accept YOUR-NAME` on their device, and try again once \
+                     you have been in touch",
+                    name = c.petname
                 )
-            })?;
-            named.push((c.identity, key));
+            })?);
         }
         (!policy.guarded(), named)
     };
@@ -277,12 +277,115 @@ pub fn set(
     d.identity_changed();
     d.push_identity(entries);
     mark_guardians(d, &chosen)?;
+    give_account(d, &chosen)?;
     Ok(json!({
         "names": chosen.iter().map(|c| c.petname.clone()).collect::<Vec<_>>(),
         "threshold": threshold,
         "delay": delay,
         "delay_text": delay_text(delay),
     }))
+}
+
+/// The persona `c` guards this person through, from the guardian persona
+/// node they wrote in the relationship the two share, and its encryption
+/// key, from the log it carries.
+fn persona_of(
+    core: &crate::core::Core,
+    c: &account::ContactRecord,
+) -> Option<(EntryId, cardinal_crypto::HybridPublicKey)> {
+    let sp = core.spaces.get(&c.space)?.space.as_ref()?;
+    let p = relationship::guardian_personas(sp)
+        .into_iter()
+        .find(|p| p.author == c.identity)?;
+    let log = log_from(&p.log, &p.persona)?;
+    let key = log.state().encryption_key.as_ref()?.public.clone();
+    Some((p.persona, key))
+}
+
+/// A log from its entries, in any order.
+pub(crate) fn log_from(entries: &[Vec<u8>], id: &EntryId) -> Option<IdentityLog> {
+    let decoded: Vec<IdentityEntry> = entries
+        .iter()
+        .filter_map(|b| IdentityEntry::decode(b).ok())
+        .collect();
+    let genesis = decoded.iter().find(|e| e.is_genesis() && e.id() == *id)?;
+    let mut log = IdentityLog::from_genesis(genesis.clone()).ok()?;
+    for e in &decoded {
+        if e.id() != *id {
+            let _ = log.insert_any(e.clone());
+        }
+    }
+    Some(log)
+}
+
+/// Gives each guardian a sealed copy of the account, which they cannot
+/// read (D80): a held copy node naming it in the relationship the two
+/// share, once; their devices then keep it current as the two sync.
+fn give_account(d: &Arc<Daemon>, chosen: &[account::ContactRecord]) -> anyhow::Result<()> {
+    let (acc, me) = {
+        let core = d.core();
+        (core.account_id(), core.me())
+    };
+    let (Some(acc), Some(me)) = (acc, me) else {
+        return Ok(());
+    };
+    for c in chosen {
+        let given = {
+            let core = d.core();
+            core.spaces
+                .get(&c.space)
+                .and_then(|h| h.space.as_ref())
+                .is_some_and(|sp| relationship::held(sp).contains(&(me, acc)))
+        };
+        if !given {
+            d.write_and_push(&c.space, vec![relationship::create_held(&acc)])?;
+        }
+        // and the copy itself, now, to whichever of their devices is in touch
+        let (d2, who) = (d.clone(), c.identity);
+        d.rt.spawn(async move { sync_label(&d2, &who, &acc).await });
+    }
+    Ok(())
+}
+
+/// After entries of a relationship space arrived: fetches the copies the
+/// other member gives this person to hold there, if this person takes
+/// them (a guardian through a persona, or a recovery helper).
+pub fn held_named(d: &Arc<Daemon>, space: &SpaceId) {
+    let (who, labels) = {
+        let core = d.core();
+        let Some(c) = core.contacts().into_iter().find(|c| c.space == *space) else {
+            return;
+        };
+        (c.identity, core.held_taken(&c.identity))
+    };
+    if labels.is_empty() {
+        return;
+    }
+    // Over a session as contacts: one an invitation opened reaches only the
+    // relationship (`contact.md#accepting`). It goes, so that one as
+    // contacts replaces it, and that one syncs the copies.
+    let (contact, inviting) = d.contact_and_inviting(&who);
+    if contact.is_empty() {
+        for s in inviting {
+            s.close("in touch as contacts now");
+        }
+        return;
+    }
+    for l in labels {
+        let d2 = d.clone();
+        d.rt.spawn(async move { sync_label(&d2, &who, &l).await });
+    }
+}
+
+/// Reconciles a set with `who`'s devices in touch, ten seconds at most
+/// each.
+async fn sync_label(d: &Arc<Daemon>, who: &EntryId, label: &[u8; 32]) {
+    for s in d.sessions_of(who) {
+        let r = tokio::time::timeout(Duration::from_secs(10), net::reconcile(d, &s, *label)).await;
+        if !matches!(r, Ok(Ok(()))) {
+            tracing::debug!("syncing a held copy with {}", short(&s.peer_static()));
+        }
+    }
 }
 
 /// Marks the guardians in the account space, and nobody else.
@@ -353,51 +456,129 @@ fn objected(log: &IdentityLog, decision: &EntryId) -> bool {
 }
 
 // ---- A guardian ----------------------------------------------------------
+//
+// A guardian acts through a persona (D79): an identity made for guarding
+// one person, kept in the guardian's account (`identity.md#personas`), and
+// run on the device that made it as a service of its own (`helper.rs`).
+// This service, the guardian's own device's, decides; the persona's signs,
+// and meets recovery helpers.
 
-/// Someone this person guards, as this device sees it.
+/// Someone this person guards, as this device sees it: through which
+/// persona, under which policy.
 pub(crate) struct Guarded {
     pub identity: EntryId,
     pub name: String,
+    pub persona: account::PersonaRecord,
     pub policy: Policy,
     pub position: u64,
     pub salt: [u8; 32],
     pub share: Option<cardinal_crypto::shamir::Share>,
 }
 
-/// Whom this person guards: every contact whose current policy holds a
-/// record sealed to this identity that opens its commitment.
-pub(crate) fn guarded(d: &Daemon) -> Vec<Guarded> {
+/// This person's guardian personas that are not burned.
+fn my_personas(d: &Daemon) -> Vec<account::PersonaRecord> {
     let core = d.core();
-    let Some(ident) = core.identity.as_ref() else {
+    let Some(acc) = core.account().and_then(|a| a.space.as_ref()) else {
         return Vec::new();
     };
-    let me = ident.id();
-    let keys: Vec<HybridKeyPair> = ident
-        .enc
-        .iter()
-        .map(|k| HybridKeyPair::from_secret_bytes(&k.secret_bytes()))
-        .collect();
-    let mut out = Vec::new();
-    for c in core.contacts() {
-        if c.recovery_of.is_some() {
-            continue;
+    account::personas(acc.state())
+        .into_iter()
+        .filter(|p| p.purpose == account::GUARDIAN_PURPOSE && !p.burned)
+        .collect()
+}
+
+/// The service of persona `id`, if this device runs it.
+fn service(d: &Daemon, id: &EntryId) -> Option<Arc<Helper>> {
+    d.personas
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(id)
+        .cloned()
+}
+
+/// The persona's log: as its service here holds it, or else as this person
+/// wrote it in the relationship with whom it guards.
+fn persona_log(d: &Daemon, p: &account::PersonaRecord) -> Option<IdentityLog> {
+    if let Some(h) = service(d, &p.identity) {
+        let bytes = {
+            let pc = h.d.core();
+            pc.identity.as_ref().map(|i| crate::core::log_bytes(&i.log))
+        };
+        if let Some(bytes) = bytes {
+            return log_from(&bytes, &p.identity);
         }
-        let Some(other) = core.others.get(&c.identity) else {
+    }
+    let core = d.core();
+    let me = core.me()?;
+    let who = p.for_identity?;
+    let c = core
+        .contacts()
+        .into_iter()
+        .find(|c| c.identity == who && c.recovery_of.is_none())?;
+    let sp = core.spaces.get(&c.space)?.space.as_ref()?;
+    let node = relationship::guardian_personas(sp)
+        .into_iter()
+        .find(|n| n.author == me && n.persona == p.identity)?;
+    log_from(&node.log, &p.identity)
+}
+
+/// The persona's encryption keys, opened with its root's entropy.
+fn persona_keys(p: &account::PersonaRecord, log: &IdentityLog) -> Vec<HybridKeyPair> {
+    static OPENED: std::sync::Mutex<BTreeMap<EntryId, Vec<u8>>> =
+        std::sync::Mutex::new(BTreeMap::new());
+    let mut opened = OPENED.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(secret) = opened.get(&p.identity) {
+        if let Ok(b) = <[u8; 96]>::try_from(secret.as_slice()) {
+            return vec![HybridKeyPair::from_secret_bytes(&b)];
+        }
+    }
+    let phrase = cardinal_crypto::RecoveryPhrase::from_entropy(&p.entropy);
+    match log.open_with_phrase(&phrase) {
+        Ok(k) => {
+            opened.insert(p.identity, k.secret_bytes().to_vec());
+            log.key_chain(k)
+        }
+        Err(_) => Vec::new(),
+    }
+}
+
+/// Whom this person guards: every contact whose policy holds a record,
+/// sealed to this person's persona for them, that opens its commitment.
+pub(crate) fn guarded(d: &Daemon) -> Vec<Guarded> {
+    let mut out = Vec::new();
+    for p in my_personas(d) {
+        let Some(who) = p.for_identity else {
+            continue;
+        };
+        let Some(plog) = persona_log(d, &p) else {
+            continue;
+        };
+        let keys = persona_keys(&p, &plog);
+        let core = d.core();
+        let Some(c) = core
+            .contacts()
+            .into_iter()
+            .find(|c| c.identity == who && c.recovery_of.is_none())
+        else {
+            continue;
+        };
+        let Some(other) = core.others.get(&who) else {
             continue;
         };
         let mut policies: Vec<Policy> = other.log.current_policy().into_iter().collect();
         // and the policy any recovery acts under, which a later change
         // may have replaced
         for r in other.log.recoveries() {
-            if !policies.iter().any(|p| p.entry == r.policy) {
+            if !policies.iter().any(|q| q.entry == r.policy) {
                 policies.extend(other.log.policy(&r.policy));
             }
         }
         for policy in policies {
-            if let Some(rec) = other.log.guardian_record(&policy, &me, &keys) {
+            if let Some(rec) = other.log.guardian_record(&policy, &p.identity, &keys) {
                 out.push(Guarded {
-                    identity: c.identity,
+                    identity: who,
                     name: c.petname.clone(),
+                    persona: p.clone(),
                     policy,
                     position: rec.position,
                     salt: rec.salt,
@@ -441,6 +622,48 @@ pub(crate) fn helper_petname(d: &Daemon, who: &EntryId) -> String {
     format!("recovery for {name}")
 }
 
+/// `cardinal guarding accept NAME`: accepts being NAME's guardian. Makes a
+/// persona for guarding them alone (D79), keeps it in the account, writes
+/// its id and log in the relationship the two share, and runs it here.
+pub async fn accept_role(d: &Arc<Daemon>, who: &str) -> anyhow::Result<Json> {
+    let c = crate::contacts::find(d, who)?;
+    anyhow::ensure!(
+        c.connects(),
+        "{} is not someone you trust; trust them first (`cardinal contacts {} trust`)",
+        c.petname,
+        c.petname
+    );
+    if let Some(p) = my_personas(d)
+        .into_iter()
+        .find(|p| p.for_identity == Some(c.identity))
+    {
+        return Ok(json!({"name": c.petname, "persona": hex::encode(p.identity), "already": true}));
+    }
+    let d2 = d.clone();
+    let (entropy, id, log) =
+        tokio::task::spawn_blocking(move || crate::helper::make_persona(&d2)).await??;
+    let acc = d
+        .core()
+        .account_id()
+        .ok_or_else(|| anyhow::anyhow!("the account space is not here yet"))?;
+    d.write_and_push(
+        &acc,
+        vec![account::create_persona(
+            account::GUARDIAN_PURPOSE,
+            &entropy,
+            &id,
+            Some(&c.identity),
+        )],
+    )?;
+    d.write_and_push(
+        &c.space,
+        vec![relationship::create_guardian_persona(&id, &log)],
+    )?;
+    crate::helper::start_persona(d, &id).await?;
+    tracing::info!("guarding {} through persona {}", c.petname, short(&id));
+    Ok(json!({"name": c.petname, "persona": hex::encode(id), "already": false}))
+}
+
 /// A recovery of someone this person guards, as this device sees it.
 struct Wanted {
     recovery: Recovery,
@@ -451,11 +674,12 @@ struct Wanted {
 }
 
 fn wanted(d: &Daemon, g: &Guarded) -> Vec<Wanted> {
+    let plog = persona_log(d, &g.persona);
     let core = d.core();
     let Some(other) = core.others.get(&g.identity) else {
         return Vec::new();
     };
-    let mine: Vec<&IdentityLog> = core.identity.as_ref().map(|i| &i.log).into_iter().collect();
+    let mine: Vec<&IdentityLog> = plog.iter().collect();
     let st = other.log.state();
     other
         .log
@@ -526,8 +750,8 @@ fn shown(d: &Daemon, seen: &Seen, g: &Guarded) -> Shown {
 }
 
 /// Notes when each recovery of someone this person guards was first seen,
-/// and when a threshold of guardians was first seen to endorse it. Called
-/// whenever a log changes.
+/// and when a threshold of guardians was first seen to endorse it, and
+/// which personas a policy has named. Called whenever a log changes.
 pub fn observe(d: &Daemon) {
     // one at a time: what is seen is read, added to, and written back
     static ONE: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -535,6 +759,9 @@ pub fn observe(d: &Daemon) {
     let mut seen = load_seen(d);
     let mut changed = false;
     for g in guarded(d) {
+        if seen.named.insert(hex::encode(g.persona.identity)) {
+            changed = true;
+        }
         let all = wanted(d, &g);
         let under_way = |seen: &Seen| {
             all.iter()
@@ -583,10 +810,10 @@ fn confirm_from(seen: &Seen, g: &Guarded, w: &Wanted) -> Option<u64> {
     Some(since.saturating_add(wait.saturating_mul(1000)))
 }
 
-/// The recovery relationships for `who`: contacts that are a recovery
-/// helper of theirs, in this person's account.
-fn helpers_of(d: &Daemon, who: &EntryId) -> Vec<account::ContactRecord> {
-    let core = d.core();
+/// The recovery relationships for `who` a persona's service holds:
+/// contacts there that are a recovery helper of theirs.
+fn helpers_of(pd: &Daemon, who: &EntryId) -> Vec<account::ContactRecord> {
+    let core = pd.core();
     let mut v: Vec<_> = core
         .contacts()
         .into_iter()
@@ -597,16 +824,18 @@ fn helpers_of(d: &Daemon, who: &EntryId) -> Vec<account::ContactRecord> {
 }
 
 /// `cardinal guarding`: whom this person guards, and the recovery of each
-/// shown, with any others that wait behind it.
+/// shown, with any others that wait behind it; and those this person
+/// accepted to guard who have not named them yet.
 pub fn list(d: &Daemon) -> Json {
     observe(d);
     let seen = load_seen(d);
-    let me = d.core().identity.as_ref().map(|i| i.id());
-    let people: Vec<Json> = guarded(d)
+    let all = guarded(d);
+    let people: Vec<Json> = all
         .iter()
         .map(|g| {
             let s = shown(d, &seen, g);
-            let mine = |set: &BTreeSet<EntryId>| me.is_some_and(|m| set.contains(&m));
+            let me = g.persona.identity;
+            let mine = |set: &BTreeSet<EntryId>| set.contains(&me);
             let recoveries: Vec<Json> = s
                 .shown
                 .iter()
@@ -621,14 +850,24 @@ pub fn list(d: &Daemon) -> Json {
                         "confirm_from_ms": confirm_from(&seen, g, w),
                         "objected": w.objected,
                         "in_effect": w.in_effect,
+                        "keeps_keys": !w.recovery.keep.is_empty(),
                         "caution": (!w.in_effect).then(|| caution(&g.name)),
                     })
                 })
                 .collect();
             let never: Vec<String> = s.never.iter().map(|w| w.recovery.fingerprint()).collect();
+            let helpers = service(d, &g.persona.identity)
+                .map_or(0, |h| helpers_of(&h.d, &g.identity).len());
+            let account_copy = {
+                let core = d.core();
+                core.held_taken(&g.identity)
+                    .iter()
+                    .any(|l| core.set(l).iter().next().is_some())
+            };
             json!({
                 "name": g.name,
                 "id": hex::encode(g.identity),
+                "persona": hex::encode(g.persona.identity),
                 "guardians": g.policy.commitments.len(),
                 "threshold": g.policy.threshold,
                 "delay": g.policy.delay,
@@ -637,11 +876,29 @@ pub fn list(d: &Daemon) -> Json {
                 "waiting": s.waiting.len(),
                 "warning": (!s.waiting.is_empty()).then(|| second_warning(&g.name, s.waiting.len())),
                 "never": never,
-                "helpers": helpers_of(d, &g.identity).len(),
+                "helpers": helpers,
+                "account_copy": account_copy,
             })
         })
         .collect();
-    json!({"guarding": people, "now_ms": now_ms()})
+    let accepted: Vec<String> = {
+        let named: HashSet<EntryId> = all.iter().map(|g| g.persona.identity).collect();
+        let personas = my_personas(d);
+        let core = d.core();
+        let contacts = core.contacts();
+        personas
+            .iter()
+            .filter(|p| !named.contains(&p.identity))
+            .filter_map(|p| {
+                let who = p.for_identity?;
+                contacts
+                    .iter()
+                    .find(|c| c.identity == who && c.recovery_of.is_none())
+                    .map(|c| c.petname.clone())
+            })
+            .collect()
+    };
+    json!({"guarding": people, "accepted": accepted, "now_ms": now_ms()})
 }
 
 fn find_guarded(d: &Daemon, who: &str) -> anyhow::Result<Guarded> {
@@ -683,7 +940,21 @@ fn find_wanted(d: &Daemon, g: &Guarded, fingerprint: &str) -> anyhow::Result<Wan
     let mut shown: Vec<Wanted> = s.shown.into_iter().collect();
     let fps: Vec<String> = shown.iter().map(|w| w.recovery.fingerprint()).collect();
     let at = pick_fingerprint(&fps, fingerprint, &g.name)?;
-    Ok(shown.swap_remove(at))
+    let w = shown.swap_remove(at);
+    keeps_nothing(&w.recovery, &g.name)?;
+    Ok(w)
+}
+
+/// Guardian software MUST NOT endorse or confirm a `recover` that keeps
+/// any key (D80).
+fn keeps_nothing(r: &Recovery, name: &str) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        r.keep.is_empty(),
+        "that recovery of {name} keeps some of their old devices, which a thief may hold; \
+         guardians never endorse or confirm one that does. Someone else may be trying to \
+         take their identity."
+    );
+    Ok(())
 }
 
 /// Which of the recoveries `shown` the person read out: exactly one must
@@ -736,12 +1007,7 @@ pub async fn endorse(
     let g = find_guarded(d, who)?;
     heeded(&g, understood)?;
     let w = find_wanted(d, &g, fingerprint)?;
-    if !d
-        .core()
-        .identity
-        .as_ref()
-        .is_some_and(|i| w.endorsed.contains(&i.id()))
-    {
+    if !w.endorsed.contains(&g.persona.identity) {
         act(
             d,
             &g,
@@ -770,8 +1036,7 @@ pub async fn confirm(
     sync_own_log(d).await;
     observe(d);
     let w = find_wanted(d, &g, fingerprint)?;
-    let me = my_id(d)?;
-    if w.confirmed.contains(&me) {
+    if w.confirmed.contains(&g.persona.identity) {
         return Ok(list(d));
     }
     anyhow::ensure!(
@@ -840,16 +1105,18 @@ pub fn never(d: &Arc<Daemon>, who: &str, fingerprint: &str) -> anyhow::Result<Js
 }
 
 /// The chain rule (`identity.md#guardian-decisions`): every decision under
-/// the policy this guardian confirmed before is in the new one's past.
+/// the policy this guardian's persona confirmed before is in the new one's
+/// past.
 fn check_chain(d: &Daemon, g: &Guarded, recovery: &Recovery) -> anyhow::Result<()> {
+    let plog = persona_log(d, &g.persona)
+        .ok_or_else(|| anyhow::anyhow!("your persona for {} is not here", g.name))?;
     let core = d.core();
-    let ident = core.identity.as_ref().expect("identity");
     let other = core.others.get(&g.identity).expect("guarded");
-    chain_allows(&ident.log, &other.log, &g.salt, recovery, &g.name)
+    chain_allows(&plog, &other.log, &g.salt, recovery, &g.name)
 }
 
-/// The chain rule, on this guardian's own log `mine` and the guarded log
-/// `theirs`. A confirmation is under this policy if it carries this
+/// The chain rule, on this guardian's persona's log `mine` and the guarded
+/// log `theirs`. A confirmation is under this policy if it carries this
 /// guardian's salt for it, which is never used for another; one whose
 /// decision is not held here is refused too, since it cannot be shown to
 /// be in the new decision's past.
@@ -907,43 +1174,58 @@ async fn sync_own_log(d: &Arc<Daemon>) {
     }
 }
 
-/// Writes `op` in this guardian's own log, and delivers that log up to it
-/// to the guarded person's devices and hosts, under the person's label,
-/// and to every recovery helper of theirs.
+/// Writes `op` in the persona's log, through its service, and delivers that
+/// log up to it to the guarded person's devices and hosts, under the
+/// person's label, and to every recovery helper of that recovery.
 async fn act(
     d: &Arc<Daemon>,
     g: &Guarded,
     decision: EntryId,
     op: IdentityOp,
 ) -> anyhow::Result<()> {
-    let (entry, log) = {
-        let mut core = d.core();
-        let ident = core
-            .identity
-            .as_mut()
-            .ok_or_else(|| anyhow::anyhow!("this device does not belong to anyone"))?;
-        let e = ident.log.append(&d.keys.device.signing, vec![op])?;
-        ident.record_own(&e)?;
-        let past = ident.log.dag().ancestors(&e.id());
-        let log: Vec<Vec<u8>> = ident
-            .log
-            .entries()
-            .filter(|x| past.contains(&x.id()) || x.id() == e.id())
-            .map(IdentityEntry::encode)
-            .collect();
-        (e, log)
-    };
-    d.identity_changed();
-    d.push_identity(vec![entry.encode()]);
+    let h = service(d, &g.persona.identity).ok_or_else(|| {
+        anyhow::anyhow!(
+            "your persona for {} acts from the device on which you accepted being their \
+             guardian; use that one",
+            g.name
+        )
+    })?;
+    let log: Vec<Vec<u8>> = h
+        .on(move |pd| async move {
+            let (entry, log) = {
+                let mut core = pd.core();
+                let ident = core
+                    .identity
+                    .as_mut()
+                    .ok_or_else(|| anyhow::anyhow!("the persona has no identity"))?;
+                let e = ident.log.append(&pd.keys.device.signing, vec![op])?;
+                ident.record_own(&e)?;
+                let past = ident.log.dag().ancestors(&e.id());
+                let log: Vec<Vec<u8>> = ident
+                    .log
+                    .entries()
+                    .filter(|x| past.contains(&x.id()) || x.id() == e.id())
+                    .map(IdentityEntry::encode)
+                    .collect();
+                (e, log)
+            };
+            pd.identity_changed();
+            pd.push_identity(vec![entry.encode()]);
+            Ok(log)
+        })
+        .await?;
     // Held here under their label too, so that whoever syncs it with this
     // device gets it.
     d.core().ingest_other(g.identity, &log)?;
-    // only to the helpers of that recovery
-    for (c, r) in helpers_with_recover(d, &g.identity) {
+    for (c, r) in helpers_with_recover(&h.d, &g.identity) {
         if r != Some(decision) {
             continue;
         }
-        if let Err(e) = carry(d, &c.space, &g.identity, &log) {
+        let (space, who, log) = (c.space, g.identity, log.clone());
+        if let Err(e) = h
+            .on(move |pd| async move { carry(&pd, &space, &who, &log) })
+            .await
+        {
             tracing::debug!("carrying to a recovery helper: {e:#}");
         }
     }
@@ -953,8 +1235,8 @@ async fn act(
     Ok(())
 }
 
-/// Sends a guardian's log, or a `recover`, under `guarded`'s label to that
-/// person's devices in touch and this person's own.
+/// Sends a guardian's persona's log, or a `recover`, under `guarded`'s
+/// label to that person's devices in touch and this person's own.
 pub(crate) async fn deliver(d: &Arc<Daemon>, guarded: &EntryId, objects: Vec<Vec<u8>>) {
     let label = identity_log_label(guarded);
     let sessions: Vec<Session> = d
@@ -1032,19 +1314,65 @@ pub(crate) fn carry(
 }
 
 /// `cardinal guarding invite NAME [--address ADDR]`: an invitation for
-/// NAME's new device, naming NAME in field 9, so that it meets this
-/// guardian in a relationship of its own. Like any invitation, it is kept
-/// in the account space, so every device of this person answers it.
-pub fn invite(d: &Arc<Daemon>, who: &str, at: Option<&str>) -> anyhow::Result<Json> {
+/// NAME's new device, made by this person's persona for NAME and naming
+/// NAME in field 9, so that it meets the persona in a relationship of its
+/// own. It is the persona's: neither side learns the other's identity.
+pub async fn invite(d: &Arc<Daemon>, who: &str, at: Option<&str>) -> anyhow::Result<Json> {
     let g = find_guarded(d, who)?;
-    let invitation = crate::contacts::invite_recovery(d, at, g.identity)?;
-    Ok(json!({"code": invitation.to_text(), "name": g.name}))
+    let h = service(d, &g.persona.identity).ok_or_else(|| {
+        anyhow::anyhow!(
+            "your persona for {} acts from the device on which you accepted being their \
+             guardian; use that one",
+            g.name
+        )
+    })?;
+    let (at, recovered) = (at.map(str::to_owned), g.identity);
+    let code = h
+        .on(move |pd| async move {
+            crate::contacts::invite_recovery(&pd, at.as_deref(), recovered).map(|i| i.to_text())
+        })
+        .await?;
+    Ok(json!({"code": code, "name": g.name}))
 }
 
-/// The proposal this guardian's device makes for a recovery of `g`
+/// `accept` of a helper's recovery invitation, on a guardian's device: the
+/// persona for that person takes it up, through its service.
+pub(crate) fn accept_recovery<'a>(
+    d: &'a Arc<Daemon>,
+    code: &'a str,
+    who: &'a EntryId,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<Json>> + Send + 'a>> {
+    Box::pin(accept_recovery_now(d, code, who))
+}
+
+async fn accept_recovery_now(d: &Arc<Daemon>, code: &str, who: &EntryId) -> anyhow::Result<Json> {
+    let g = guarded(d)
+        .into_iter()
+        .find(|g| g.identity == *who)
+        .ok_or_else(|| anyhow::anyhow!("you do not guard them"))?;
+    let h = service(d, &g.persona.identity).ok_or_else(|| {
+        anyhow::anyhow!(
+            "your persona for {} acts from the device on which you accepted being their \
+             guardian; use that one",
+            g.name
+        )
+    })?;
+    let code = code.to_owned();
+    let met = account::Met {
+        how: account::MET_THEIR_INVITATION,
+        ..Default::default()
+    };
+    h.on(move |pd| async move {
+        crate::contacts::accept(&pd, &code, None, account::Regard::default(), met, true).await
+    })
+    .await?;
+    Ok(json!({"name": helper_petname(d, who), "recovery_of": hex::encode(who)}))
+}
+
+/// The proposal this guardian's persona makes for a recovery of `g`
 /// (`identity.md#how-guardians-act`, step 1): parents the person
-/// recognizes, and the policy. A `recover` keeps no old key (Daniel,
-/// 2026-11-20), so no host is proposed.
+/// recognizes, and the policy. A `recover` keeps no old key (D80), so no
+/// key is proposed.
 fn proposal(d: &Daemon, g: &Guarded) -> anyhow::Result<SpaceOp> {
     let core = d.core();
     let other = core
@@ -1063,112 +1391,108 @@ fn proposal(d: &Daemon, g: &Guarded) -> anyhow::Result<SpaceOp> {
     ))
 }
 
-/// After a recovery relationship for `who` was made, on a guardian's
-/// device: proposes the recovery in it, unless this person proposed one
-/// there already, and carries the person's log, so that the new device
-/// can check what it signs and, with no host, take the identity up from
-/// it.
-pub(crate) fn met_helper(d: &Arc<Daemon>, space: &SpaceId, who: &EntryId) {
-    let Some(g) = guarded(d).into_iter().rev().find(|g| g.identity == *who) else {
-        return;
-    };
-    let me = d.core().me();
+/// After the persona met a recovery helper of `g`'s person: proposes the
+/// recovery in that relationship, unless it proposed one there already,
+/// and carries the person's log, which the new device signs against and
+/// takes the identity up from.
+async fn met_helper(d: &Arc<Daemon>, h: &Arc<Helper>, space: SpaceId, g: &Guarded) {
+    let who = g.identity;
     let proposed = {
-        let core = d.core();
-        core.spaces
-            .get(space)
-            .and_then(|h| h.space.as_ref())
+        let pc = h.d.core();
+        let me = pc.me();
+        pc.spaces
+            .get(&space)
+            .and_then(|x| x.space.as_ref())
             .is_some_and(|sp| {
                 relationship::proposals(sp)
                     .iter()
-                    .any(|p| Some(p.author) == me && p.identity == *who)
+                    .any(|p| Some(p.author) == me && p.identity == who)
             })
     };
     if !proposed {
-        match proposal(d, &g) {
+        match proposal(d, g) {
             Ok(op) => {
-                if let Err(e) = d.write_and_push(space, vec![op]) {
+                let r = h
+                    .on(move |pd| async move { pd.write_and_push(&space, vec![op]).map(|_| ()) })
+                    .await;
+                if let Err(e) = r {
                     tracing::warn!("cannot propose the recovery of {}: {e:#}", g.name);
+                    return;
                 }
+                tracing::info!("a recovery helper of {} is in touch", g.name);
             }
-            Err(e) => tracing::warn!("cannot propose the recovery of {}: {e:#}", g.name),
+            Err(e) => {
+                tracing::warn!("cannot propose the recovery of {}: {e:#}", g.name);
+                return;
+            }
         }
     }
     let log: Vec<Vec<u8>> = {
         let core = d.core();
         core.others
-            .get(who)
+            .get(&who)
             .map(|o| o.log.entries().map(IdentityEntry::encode).collect())
             .unwrap_or_default()
     };
-    if let Err(e) = carry(d, space, who, &log) {
+    let r = h
+        .on(move |pd| async move { carry(&pd, &space, &who, &log) })
+        .await;
+    if let Err(e) = r {
         tracing::warn!("cannot carry {}'s log to their new device: {e:#}", g.name);
     }
-    tracing::info!("a recovery helper of {} is in touch", g.name);
 }
 
-/// After entries of a space arrived: if it is a recovery relationship for
-/// someone this person guards, takes what the helper carried. Of the
-/// person's own log only a `recover` is taken, alone in its entry, signed
-/// by its new root, under the policy this person guards; of anyone else's,
-/// what [`crate::core::Core::ingest_other`] keeps, the causal past of
-/// another guardian's act. What is new here goes on to the person's
-/// devices and hosts, as a guardian's act does.
-pub fn on_space(d: &Arc<Daemon>, space: &SpaceId) {
-    let (helper, who) = {
-        let core = d.core();
-        let Some(c) = core
-            .contacts()
-            .into_iter()
-            .find(|c| c.space == *space && c.recovery_of.is_some() && !c.refused)
-        else {
-            return;
-        };
-        (c.identity, c.recovery_of.expect("checked"))
-    };
-    let Some(g) = guarded(d).into_iter().rev().find(|g| g.identity == who) else {
-        return;
-    };
+/// What a helper carried in a recovery relationship, taken: of the
+/// person's own log, its first `recover` alone, signed by its new root,
+/// under the policy this person guards; of anyone else's, what
+/// [`crate::core::Core::ingest_other`] keeps, the causal past of another
+/// guardian's persona's act. What is new here goes on to the person's
+/// devices and hosts, as an act does. The persona's acts on that recovery,
+/// done before it reached the relationship, are carried into it now.
+async fn take(d: &Arc<Daemon>, h: &Arc<Helper>, c: &account::ContactRecord, g: &Guarded) {
+    let (helper, who, space) = (c.identity, g.identity, c.space);
     let label = identity_log_label(&who);
-    let first_recover: Option<EntryId> = {
-        let core = d.core();
-        core.spaces
-            .get(space)
-            .and_then(|h| h.space.as_ref())
-            .and_then(|sp| relationship_recover(sp, &helper, &who))
-            .filter(|e| is_recover_under(e, &g.policy.entry))
-            .map(|e| e.id())
+    let carried: Vec<relationship::Carried> = {
+        let pc = h.d.core();
+        pc.spaces
+            .get(&space)
+            .and_then(|x| x.space.as_ref())
+            .map(relationship::carried)
+            .unwrap_or_default()
     };
-    let new: Vec<Vec<u8>> = {
-        let core = d.core();
-        let Some(sp) = core.spaces.get(space).and_then(|h| h.space.as_ref()) else {
-            return;
-        };
-        // Of the person's own log, the helper's first `recover` alone, so
-        // that a helper cannot bring in more than one.
-        let first = first_recover;
-        relationship::carried(sp)
-            .into_iter()
-            .filter(|c| c.author == helper && c.identity == who)
-            .filter_map(|c| {
-                let e = IdentityEntry::decode(&c.entry).ok()?;
-                if core.has(&label, &e.id()) {
-                    return None;
-                }
-                (e.identity() != who || Some(e.id()) == first).then_some(c.entry)
-            })
-            .collect()
-    };
-    // This person's acts on that recovery, done before it was carried here
-    // (it may have come from the person's host first), go into it now.
-    if let Some(r) = first_recover {
-        let mine = my_acts_on(d, &r);
+    let first = carried
+        .iter()
+        .filter(|x| x.author == helper && x.identity == who)
+        .filter_map(|x| IdentityEntry::decode(&x.entry).ok())
+        .find(|e| e.identity() == who && recovery_of_entry(e).is_some())
+        .filter(|e| is_recover_under(e, &g.policy.entry))
+        .map(|e| e.id());
+    if let Some(r) = first {
+        let plog = persona_log(d, &g.persona);
+        let mine = plog.map(|l| acts_on(&l, &r)).unwrap_or_default();
         if !mine.is_empty() {
-            if let Err(e) = carry(d, space, &who, &mine) {
+            let r = h
+                .on(move |pd| async move { carry(&pd, &space, &who, &mine) })
+                .await;
+            if let Err(e) = r {
                 tracing::debug!("carrying to a recovery helper: {e:#}");
             }
         }
     }
+    let new: Vec<Vec<u8>> = {
+        let core = d.core();
+        carried
+            .into_iter()
+            .filter(|x| x.author == helper && x.identity == who)
+            .filter_map(|x| {
+                let e = IdentityEntry::decode(&x.entry).ok()?;
+                if core.has(&label, &e.id()) {
+                    return None;
+                }
+                (e.identity() != who || Some(e.id()) == first).then_some(x.entry)
+            })
+            .collect()
+    };
     if new.is_empty() {
         return;
     }
@@ -1199,21 +1523,13 @@ pub fn on_space(d: &Arc<Daemon>, space: &SpaceId) {
         }
     }
     observe(d);
-    retire_moot(d);
     d.bump();
-    let d2 = d.clone();
-    d.rt.spawn(async move { deliver(&d2, &who, taken).await });
+    deliver(d, &who, taken).await;
 }
 
-/// This person's acts on `decision`, with their causal past in this
-/// person's own log, as [`act`] carries them.
-fn my_acts_on(d: &Daemon, decision: &EntryId) -> Vec<Vec<u8>> {
-    let core = d.core();
-    let Some(ident) = core.identity.as_ref() else {
-        return Vec::new();
-    };
-    let acts: Vec<EntryId> = ident
-        .log
+/// The persona's acts on `decision`, with their causal past in its log.
+fn acts_on(log: &IdentityLog, decision: &EntryId) -> Vec<Vec<u8>> {
+    let acts: Vec<EntryId> = log
         .entries()
         .filter(|e| {
             e.ops().iter().any(|o| {
@@ -1226,14 +1542,107 @@ fn my_acts_on(d: &Daemon, decision: &EntryId) -> Vec<Vec<u8>> {
     if acts.is_empty() {
         return Vec::new();
     }
-    let mut past = ident.log.dag().ancestors_of(&acts);
+    let mut past = log.dag().ancestors_of(&acts);
     past.extend(acts);
-    ident
-        .log
-        .entries()
+    log.entries()
         .filter(|e| past.contains(&e.id()))
         .map(IdentityEntry::encode)
         .collect()
+}
+
+/// A set held for someone: its label and every sealed entry of it.
+type HeldSet = ([u8; 32], Vec<Vec<u8>>);
+
+/// Gives each recovery helper of `g`'s person what this guardian holds for
+/// them (D80): the sealed account they gave, and the relationship space the
+/// two share, copied into the persona's service and named there in a held
+/// copy node, so that the helper fetches them as they change.
+async fn give_held(d: &Arc<Daemon>, h: &Arc<Helper>, g: &Guarded) {
+    let (labels, sets): (Vec<[u8; 32]>, Vec<HeldSet>) = {
+        let core = d.core();
+        let Some(c) = core
+            .contacts()
+            .into_iter()
+            .find(|c| c.identity == g.identity && c.recovery_of.is_none())
+        else {
+            return;
+        };
+        let mut labels = core.held_taken(&g.identity);
+        labels.push(c.space);
+        let sets = labels
+            .iter()
+            .filter(|l| core.spaces.contains_key(*l))
+            .map(|l| {
+                let ids: Vec<[u8; 32]> = core.set(l).iter().copied().collect();
+                (*l, ids.iter().filter_map(|id| core.get(l, id)).collect())
+            })
+            .collect();
+        (labels, sets)
+    };
+    let who = g.identity;
+    let r = h
+        .on(move |pd| async move {
+            let mut changed = false;
+            for (label, entries) in sets {
+                let missing: Vec<Vec<u8>> = {
+                    let pc = pd.core();
+                    entries
+                        .into_iter()
+                        .filter(|b| {
+                            cardinal_space::SealedEntry::decode(b)
+                                .is_ok_and(|e| !pc.has(&label, &e.sealed_id()))
+                        })
+                        .collect()
+                };
+                if !missing.is_empty() {
+                    tracing::debug!(
+                        "the persona holds {} more of {}",
+                        missing.len(),
+                        short(&label)
+                    );
+                    pd.core().ingest_space(label, &missing)?;
+                    pd.bump();
+                    changed = true;
+                }
+            }
+            let me = pd.core().me();
+            for c in helpers_of(&pd, &who) {
+                let named: Vec<[u8; 32]> = {
+                    let pc = pd.core();
+                    pc.spaces
+                        .get(&c.space)
+                        .and_then(|x| x.space.as_ref())
+                        .map(|sp| {
+                            relationship::held(sp)
+                                .into_iter()
+                                .filter(|(a, _)| Some(*a) == me)
+                                .map(|(_, l)| l)
+                                .collect()
+                        })
+                        .unwrap_or_default()
+                };
+                let ops: Vec<SpaceOp> = labels
+                    .iter()
+                    .filter(|l| !named.contains(*l) && pd.core().spaces.contains_key(*l))
+                    .map(relationship::create_held)
+                    .collect();
+                let wrote = !ops.is_empty();
+                if wrote {
+                    pd.write_and_push(&c.space, ops)?;
+                }
+                if changed || wrote {
+                    for l in &labels {
+                        let (pd2, who2, l) = (pd.clone(), c.identity, *l);
+                        tokio::spawn(async move { sync_label(&pd2, &who2, &l).await });
+                    }
+                }
+            }
+            Ok(())
+        })
+        .await;
+    if let Err(e) = r {
+        tracing::debug!("giving a recovery helper what is held: {e:#}");
+    }
 }
 
 /// The `recover` a recovery relationship is for: the first its helper
@@ -1250,13 +1659,14 @@ pub(crate) fn relationship_recover(
         .find(|e| e.identity() == *who && recovery_of_entry(e).is_some())
 }
 
-/// The recovery relationships for `who` with the `recover` each is for.
+/// The recovery relationships for `who` a persona's service holds, with the
+/// `recover` each is for.
 fn helpers_with_recover(
-    d: &Daemon,
+    pd: &Daemon,
     who: &EntryId,
 ) -> Vec<(account::ContactRecord, Option<EntryId>)> {
-    let rels = helpers_of(d, who);
-    let core = d.core();
+    let rels = helpers_of(pd, who);
+    let core = pd.core();
     rels.into_iter()
         .map(|c| {
             let r = core
@@ -1270,20 +1680,20 @@ fn helpers_with_recover(
         .collect()
 }
 
-/// Retires a recovery relationship: this person refuses its helper, so
+/// Retires a recovery relationship: the persona refuses its helper, so
 /// nothing is carried into it, and it is trusted for nothing (sessions,
 /// calls, delivery tokens) from now on.
-fn retire(d: &Arc<Daemon>, c: &account::ContactRecord) {
-    let Some(acc) = d.core().account_id() else {
+fn retire(pd: &Arc<Daemon>, c: &account::ContactRecord) {
+    let Some(acc) = pd.core().account_id() else {
         return;
     };
     let ops = vec![
         account::set_field(c.node, account::REFUSED, true),
         account::set_field(c.node, account::TRUSTED, false),
     ];
-    match d.write_and_push(&acc, ops) {
-        Ok(_) => tracing::info!("retired the {}", c.petname),
-        Err(e) => tracing::warn!("cannot retire the {}: {e:#}", c.petname),
+    match pd.write_and_push(&acc, ops) {
+        Ok(_) => tracing::info!("retired a recovery relationship"),
+        Err(e) => tracing::warn!("cannot retire a recovery relationship: {e:#}"),
     }
 }
 
@@ -1293,18 +1703,120 @@ fn retire(d: &Arc<Daemon>, c: &account::ContactRecord) {
 fn retire_moot(d: &Arc<Daemon>) {
     let never = nevers(d);
     for g in guarded(d) {
+        let Some(h) = service(d, &g.persona.identity) else {
+            continue;
+        };
         let done: Option<EntryId> = wanted(d, &g)
             .iter()
             .find(|w| w.in_effect)
             .map(|w| w.recovery.entry);
-        for (c, r) in helpers_with_recover(d, &g.identity) {
+        for (c, r) in helpers_with_recover(&h.d, &g.identity) {
             // one whose `recover` has not arrived yet may be the one in effect
             let moot = r.is_some_and(|r| never.contains(&r) || done.is_some_and(|d| d != r));
             if moot {
-                retire(d, &c);
+                let (pd, c) = (h.d.clone(), c.clone());
+                drop(h.d.rt.spawn(async move { retire(&pd, &c) }));
             }
         }
     }
+}
+
+/// Burns the guardian personas whose purpose is over (D79): one that
+/// acted in a recovery now in effect, and one a policy named that the
+/// current policy no longer names. Its service stops and goes; the account
+/// keeps it, burned, and its id is never used again.
+async fn burn_spent(d: &Arc<Daemon>) {
+    let seen = load_seen(d);
+    let all = guarded(d);
+    for p in my_personas(d) {
+        let Some(who) = p.for_identity else {
+            continue;
+        };
+        let mine: Vec<&Guarded> = all
+            .iter()
+            .filter(|g| g.persona.identity == p.identity)
+            .collect();
+        let acted_in_effect = mine.iter().any(|g| {
+            wanted(d, g).iter().any(|w| {
+                w.in_effect
+                    && (w.endorsed.contains(&p.identity) || w.confirmed.contains(&p.identity))
+            })
+        });
+        let current = {
+            let core = d.core();
+            core.others
+                .get(&who)
+                .and_then(|o| o.log.current_policy())
+                .map(|q| q.entry)
+        };
+        let named_now = mine.iter().any(|g| Some(g.policy.entry) == current);
+        let dropped =
+            seen.named.contains(&hex::encode(p.identity)) && !named_now && current.is_some();
+        if !(acted_in_effect || dropped) {
+            continue;
+        }
+        let Some(acc) = d.core().account_id() else {
+            return;
+        };
+        if let Err(e) = d.write_and_push(
+            &acc,
+            vec![account::set_field(p.node, account::BURNED, true)],
+        ) {
+            tracing::warn!("cannot burn a persona: {e:#}");
+            continue;
+        }
+        crate::helper::stop_persona(d, &p.identity, true).await;
+        tracing::info!("burned persona {}", short(&p.identity));
+    }
+}
+
+/// Starts the services of this person's guardian personas that this
+/// device acts as, and tends them from then on: meets helpers, takes
+/// what they carry, gives what is held, retires what is moot, and burns
+/// what is spent.
+pub fn start_personas(d: &Arc<Daemon>) {
+    let d = d.clone();
+    tokio::spawn(async move {
+        loop {
+            for p in my_personas(&d) {
+                let here =
+                    crate::core::has_identity(&crate::helper::persona_paths(&d.paths, &p.identity));
+                if here && service(&d, &p.identity).is_none() {
+                    if let Err(e) = crate::helper::start_persona(&d, &p.identity).await {
+                        tracing::warn!("cannot start persona {}: {e:#}", short(&p.identity));
+                    }
+                }
+            }
+            tend(&d).await;
+            if *d.stopping.borrow() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+    });
+}
+
+/// One round of tending this person's personas.
+async fn tend(d: &Arc<Daemon>) {
+    let all = guarded(d);
+    let mut done: HashSet<EntryId> = HashSet::new();
+    for g in &all {
+        if !done.insert(g.persona.identity) {
+            continue;
+        }
+        let Some(h) = service(d, &g.persona.identity) else {
+            continue;
+        };
+        for c in helpers_of(&h.d, &g.identity) {
+            met_helper(d, &h, c.space, g).await;
+            take(d, &h, &c, g).await;
+        }
+        give_held(d, &h, g).await;
+    }
+    if !all.is_empty() {
+        retire_moot(d);
+    }
+    burn_spent(d).await;
 }
 
 /// The `recover` an entry is, if it is one alone, signed by its new root.
@@ -1385,6 +1897,26 @@ mod tests {
         assert_eq!(found.id(), first.id());
         // and only what that member carried counts
         assert!(relationship_recover(sp, &them, &ana.id()).is_none());
+    }
+
+    /// Guardian software never endorses or confirms a `recover` that keeps
+    /// a key (D80).
+    #[test]
+    fn a_recover_that_keeps_a_key_is_refused() {
+        let mut r = Recovery {
+            entry: [1; 32],
+            root: [2; 32],
+            keep: Vec::new(),
+            link_key: None,
+            policy: [3; 32],
+        };
+        assert!(keeps_nothing(&r, "Ana").is_ok());
+        r.keep.push([4; 32]);
+        let e = keeps_nothing(&r, "Ana").unwrap_err();
+        assert!(
+            e.to_string().contains("keeps some of their old devices"),
+            "{e}"
+        );
     }
 
     #[test]

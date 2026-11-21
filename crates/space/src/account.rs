@@ -27,6 +27,8 @@ pub const INVITATION: u64 = 10;
 pub const INVITATION_USE: u64 = 11;
 /// Self kind: the name this person suggests for themselves.
 pub const SELF: u64 = 13;
+/// Persona kind (`profiles.md#account`, D78).
+pub const PERSONA: u64 = 16;
 
 /// An invitation's field: the inviter cancelled it.
 pub const CANCELLED: u64 = 2;
@@ -646,6 +648,68 @@ pub fn spaces(state: &State) -> Vec<SpaceRecord> {
                     .to_owned(),
                 placements,
                 declined: last(n, 3).and_then(|v| v.as_bool()).unwrap_or(false),
+            })
+        })
+        .collect()
+}
+
+/// A persona this person holds (`identity.md#personas`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PersonaRecord {
+    /// The persona node.
+    pub node: NodeId,
+    /// Its purpose: `guardian`, `agent`, or another.
+    pub purpose: String,
+    /// The entropy its root is made from.
+    pub entropy: [u8; 32],
+    /// Its identity id.
+    pub identity: IdentityId,
+    /// The identity it serves, such as the person it guards.
+    pub for_identity: Option<IdentityId>,
+    /// It was burned: its purpose is over.
+    pub burned: bool,
+}
+
+/// The persona purpose of guarding one person.
+pub const GUARDIAN_PURPOSE: &str = "guardian";
+/// Persona field 5: burned.
+pub const BURNED: u64 = 5;
+
+/// `create` of a persona node.
+pub fn create_persona(
+    purpose: &str,
+    entropy: &[u8; 32],
+    identity: &IdentityId,
+    for_identity: Option<&IdentityId>,
+) -> SpaceOp {
+    SpaceOp::create(
+        NodeKind::Uint(PERSONA),
+        ROOT,
+        &short_key(identity),
+        Record::new()
+            .with(1, purpose)
+            .with(2, entropy.to_vec())
+            .with(3, *identity)
+            .with_opt(4, for_identity.copied()),
+    )
+}
+
+/// The persona nodes that are not deleted.
+pub fn personas(state: &State) -> Vec<PersonaRecord> {
+    state
+        .children(&ROOT)
+        .into_iter()
+        .filter(|n| n.kind == NodeKind::Uint(PERSONA) && !n.deleted)
+        .filter_map(|n| {
+            Some(PersonaRecord {
+                node: n.id,
+                purpose: last(n, 1)?.as_text()?.to_owned(),
+                entropy: last(n, 2)?.as_bytes()?.try_into().ok()?,
+                identity: last(n, 3)?.as_bytes()?.try_into().ok()?,
+                for_identity: last(n, 4)
+                    .and_then(Value::as_bytes)
+                    .and_then(|b| b.try_into().ok()),
+                burned: last(n, BURNED).and_then(Value::as_bool).unwrap_or(false),
             })
         })
         .collect()

@@ -667,6 +667,12 @@ enum GuardiansCmd {
 
 #[derive(Subcommand)]
 enum GuardingCmd {
+    /// Accept being someone's guardian, when they ask: your device makes a
+    /// persona for guarding them alone, which they then name.
+    Accept {
+        /// Whom.
+        who: String,
+    },
     /// An invitation for the new device of someone you guard, who lost
     /// every device: they use it there (`cardinal recover start CODE`),
     /// and their device meets yours for the recovery alone.
@@ -829,8 +835,8 @@ fn print_pair_again(v: &Value) {
     if again.is_empty() {
         return;
     }
-    println!("The recovery kept none of your old devices. Pair them again (`cardinal pair`)");
-    println!("once you have them, and forget any that was lost:");
+    println!("Pair your other devices again (`cardinal pair`): the recovery kept none of");
+    println!("them, hosts included. Forget any that was lost:");
     for k in again {
         let key = k["key"].as_str().unwrap_or("");
         match k["name"].as_str() {
@@ -867,6 +873,9 @@ fn print_recover(v: &Value) {
         println!("{met} guardian(s) in touch; waiting for one to propose the recovery.");
     } else if v["in_effect"] == true {
         println!("Your guardians have confirmed. Run `cardinal recover finish`.");
+        if v["held"].as_u64().unwrap_or(0) > 0 {
+            println!("They gave back what they hold of yours, your account among it.");
+        }
     } else {
         println!(
             "{met} guardian(s) in touch: {} endorsed, {} confirmed, of {} needed.",
@@ -878,6 +887,12 @@ fn print_recover(v: &Value) {
 
 fn print_guarding(v: &Value) {
     let people = v["guarding"].as_array().cloned().unwrap_or_default();
+    for a in v["accepted"].as_array().into_iter().flatten() {
+        println!(
+            "You accepted guarding {}; they have not named you yet.",
+            a.as_str().unwrap_or("")
+        );
+    }
     if people.is_empty() {
         println!("You guard nobody.");
         return;
@@ -913,6 +928,9 @@ fn print_guarding(v: &Value) {
                 )
             };
             println!("  recovery \"{fp}\": {state}");
+        }
+        if p["account_copy"] == true {
+            println!("  You hold a sealed copy of their account, which you cannot read.");
         }
         if let Some(w) = p["warning"].as_str() {
             println!("  WARNING: {w}");
@@ -2375,6 +2393,21 @@ async fn client(cmd: Cmd) -> anyhow::Result<()> {
             Ok(())
         }
         Cmd::Guarding {
+            cmd: Some(GuardingCmd::Accept { who }),
+        } => {
+            let v = call(&paths, json!({"cmd": "guarding-accept", "who": who})).await?;
+            let name = v["name"].as_str().unwrap_or(&who);
+            if v["already"] == true {
+                println!("You had accepted already: {name} can name you a guardian.");
+            } else {
+                println!(
+                    "You accepted guarding {name}. Your device made a persona for it, which {name} \
+                     can now name (`cardinal guardians set`)."
+                );
+            }
+            Ok(())
+        }
+        Cmd::Guarding {
             cmd: Some(GuardingCmd::Invite { who, address }),
         } => {
             let v = call(
@@ -2492,8 +2525,15 @@ async fn client(cmd: Cmd) -> anyhow::Result<()> {
             cmd: Some(RecoverCmd::Finish),
         } => {
             let v = call(&paths, json!({"cmd": "recover-finish"})).await?;
-            println!("Recovered, from what your guardians hold. This device starts with empty");
-            println!("files: nothing of your old ones comes back this way yet.");
+            if v["account"] == true {
+                println!("Recovered, from what your guardians hold: your account, contacts and");
+                println!(
+                    "settings are back. Your other spaces come back as their holders are reached."
+                );
+            } else {
+                println!("Recovered, from what your guardians hold. They held no copy of your");
+                println!("account, so this device starts with an empty one.");
+            }
             print_pair_again(&v);
             println!();
             println!("Your new recovery words. Write them down, in order, and keep them safe:");
@@ -2589,6 +2629,9 @@ async fn client(cmd: Cmd) -> anyhow::Result<()> {
                     line.push_str("  refused");
                 }
                 println!("{line}  [{}]", c["identity"].as_str().unwrap_or(""));
+                if let Some(r) = c["recovered"].as_str() {
+                    println!("  {} {r}", c["name"].as_str().unwrap_or(""));
+                }
             }
             Ok(())
         }

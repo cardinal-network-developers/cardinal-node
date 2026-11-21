@@ -386,7 +386,7 @@ below, each under its section.
 - **Parents of a new entry are sorted** by id; received entries may list
   them in any order but not twice.
 
-## Guardians (`spec/identity.md#recovery`, `spec/hosts.md#restore`)
+## Guardians (`spec/identity.md#recovery`, `#personas`, `spec/hosts.md#restore`)
 
 `cardinal guardians set`, `cardinal guarding`, and `cardinal recover`
 (`cardinald/src/guardians.rs`, `recovering.rs`, `helper.rs`,
@@ -398,7 +398,10 @@ device, the `recover` and every guardian's acts carried between the
 guardians by the new device, endorsements, the wait, confirmations with
 shares, one recovery of a person shown at a time, starting over, and the
 new device taking the identity up from what the guardians hold, keeping
-none of the old devices. What differs or was read:
+none of the old devices; guardians acting through personas (D78, D79),
+burned once spent; and the guardians keeping a sealed copy of the
+account, given back in a recovery with their relationships (D80). What
+differs or was read:
 
 - **Not built: changing guardians.** Only the first guardians, under a
   policy naming none, can be named. A `set_recovery` under a policy naming
@@ -413,46 +416,70 @@ none of the old devices. What differs or was read:
   `recover` and the guardians' acts in their own log's set, and
   `cardinal guardians` shows a recovery under way as a warning, with how
   many endorsed and confirmed. Contacts are not shown it.
-- **Reading: the recovery helper (D77).** "An identity of its own ...
-  with no words of its own and nothing it would ever need to merge": a
-  second service inside the new device's, with its own data directory
-  (`recovery-helper` in the new device's), its own device keys and an
-  identity made as `cardinal init` makes one, whose words are never shown
-  or kept. It runs on a runtime of its own, with no control socket, mount,
-  discovery, port mapping or release check, and listens on the new
-  device's address at a port of its own; the new device's service drives
-  it. It starts with `cardinal recover start`, again after a restart while
-  a recovery is under way, and is stopped and its directory removed when
-  `cardinal recover finish` succeeds or `cardinal recover cancel` gives
-  the recovery up. Its relationships are ordinary ones (invitation, space,
-  reach node, mailbox): the spec says only that they exist.
+- **Reading: personas and their services (D78, D79).** A persona's
+  service is a second service inside the device's, with its own data
+  directory, its own device keys and an identity, on a runtime of its own,
+  with no control socket, mount, discovery, port mapping or release check,
+  listening on the device's address at a port of its own; the device's own
+  service drives it. It has account and files spaces of its own, which it
+  shares with nobody: the invitation and relationship machinery needs an
+  account (the spec says a persona "is in no space but those its purpose
+  makes"). A new device's **recovery helper** is one, held alone in
+  `recovery-helper` with no words, started by `cardinal recover start` and
+  dropped when the recovery is finished or given up. A **guardian
+  persona** is made by `cardinal guarding accept NAME`: 32 random bytes,
+  its root made from them as a recovery phrase's, a log whose first device
+  key is the service's, under `personas/<id>`; the account keeps a persona
+  node (kind 16: purpose `guardian`, the entropy, the id, `for` NAME), and
+  the relationship with NAME a guardian persona node (kind 11: the id and
+  the log). **Not built:** a guardian's other devices running the persona.
+  Only the device that accepted runs it, and endorsing, confirming and
+  inviting are refused elsewhere, saying so; the spec has each device add
+  a device key of its own to the persona's log. Its encryption key is
+  opened with the root's entropy. The policy's commitments and sealed
+  records name the persona; `cardinal guardians set` refuses a contact
+  with no guardian persona node for this person ("has not accepted"). The
+  person is asked out of band. `cardinal guarding` lists those accepted
+  but not named yet.
+- **Reading: burning a persona.** A guardian persona is burned once a
+  recovery it endorsed or confirmed is in effect, or once the person's
+  current policy no longer names a persona a policy had named (this device
+  remembers which in `guarding.json`): account persona field 5 is set, and
+  its service stops and its directory goes. **Not built:** writing `leave`
+  in its spaces, and asking for fresh personas for the `set_recovery` that
+  follows a recovery (changing guardians is not built).
 - **Reading: how a relationship is marked "recovery for" the person.**
   The spec says guardian software shows it so, never as a contact, but
   gives the account's contact node no field for it. Chose: contact field
   13, the identity recovered (32 bytes), written by both sides when the
-  contact is recorded from an invitation with field 9. Such a contact is
-  trusted (sessions open) and takes no introductions, and is left out of
-  `contacts`, `conversations`, lookups by name, the one folder and calls.
-  Its petname on a guardian's devices is "recovery for NAME". Neither side
-  may be the person recovered, nor already a contact. A guardian's device
-  **retires** a relationship (refuses its helper: no sessions, no calls,
-  its delivery tokens revoked, nothing carried into it) once the guardian
-  said never to its `recover`, or once another recovery of that person is
-  in effect; one whose `recover` has not arrived yet is not retired, since
-  it may be the one in effect.
+  contact is recorded from an invitation with field 9; on a guardian's
+  side the contact is in the persona's service, never the guardian's own
+  account. Such a contact is trusted (sessions open) and takes no
+  introductions, and is left out of `contacts`, `conversations`, lookups by
+  name, the one folder and calls. Neither side may be the person
+  recovered, nor already a contact. The persona **retires** a relationship
+  (refuses its helper: no sessions, no calls, its delivery tokens revoked,
+  nothing carried into it) once the guardian said never to its `recover`,
+  or once another recovery of that person is in effect; one whose
+  `recover` has not arrived yet is not retired, since it may be the one in
+  effect.
 - **Reading: what travels through a recovery relationship.** The spec
   says the `recover` and the endorsements travel through the
   relationships, not how. Chose two relationship node kinds of this
   implementation's, both author-owned and read as their author created
-  them: 16, a **recovery proposal** by the guardian's device (`1:
-  identity recovered; 2: parents; 3: policy`), and 17, a **carried
-  entry** (`1: identity recovered; 2: an identity entry`), one identity
+  them, numbered past the spec's relationship kinds (which reach 11) and
+  apart from the account's (which reach 16): 64, a **recovery proposal**
+  by the guardian's persona (`1: identity recovered; 2: parents; 3:
+  policy`), and 65, a **carried entry** (`1: identity recovered; 2: an
+  identity entry`), one identity
   entry each, written by either side, in entries of at most 32 KiB, and
   only where its writer has not carried the same entry there already (what
   the other side carried counts as theirs). On meeting a helper, the
   guardian's device writes its proposal (once per space) and carries the
   person's own log, which the new device signs against and takes the
-  identity up from. A relationship is for one `recover`: the first its
+  identity up from. On a guardian's side all of this is the persona's,
+  in its service's relationships, tended every second by the guardian's
+  own service, which holds the person's log and decides. A relationship is for one `recover`: the first its
   helper carried there; a guardian's device takes no other from it. The
   new device carries its `recover`, and of anyone else's log only what the
   carried log keeps attached (the causal pasts of acts on the person's
@@ -468,30 +495,49 @@ none of the old devices. What differs or was read:
   `ingest_other` keeps; and delivers what is new to the person's devices
   and hosts, as its own acts.
 - **Reading: who makes the invitation.** `cardinal guarding invite NAME`
-  makes one on a guardian's device (trusted, no introductions, kept in the
-  account like any invitation, so any device of the guardian answers it),
-  and its use proposes at once: the guardian acted by making it. `cardinal
-  recover invite` makes one on the new device, which a guardian takes up
-  with `cardinal accept`; the guardian's device proposes once the
-  relationship is made. That invitation needs field 9, the identity id,
-  which the new device learns from a guardian's invitation used first, or
-  from `--identity ID` (a guardian's `guarding` shows it).
+  makes one through the persona's service (its identity, its address,
+  kept in its account; trusted, no introductions), and its use proposes:
+  the guardian acted by making it. `cardinal recover invite` makes one on
+  the new device, which a guardian takes up with `cardinal accept`; their
+  own service checks they guard that person and hands it to the persona's
+  service, whose relationship it becomes. That invitation needs field 9,
+  the identity id, which the new device learns from a guardian's
+  invitation used first, or from `--identity ID` (a guardian's `guarding`
+  shows it).
 - **Reading: no probing.** Only the person's own `accept` (and a helper,
   for a guardian's invitation) takes an invitation with field 9; an
   introduction never does, whether tended unasked or said yes to. A device
   asked to `accept` one that does not guard that identity (by the records
   it holds now) refuses, tells its person why, and dials nothing. A
   helper's service refuses an invitation without field 9.
-- **Decision (Daniel, 2026-11-20, replacing D77's kept hosts): a
-  recovery keeps no old key.** The `recover` names no key to keep, hosts
-  included, and the sheet's key keeps nothing; guardians' proposals carry
-  no hosts. The new device signs on the first proposal (in the order it
-  met the guardians) that acts under the carried log's current policy and
-  whose parents the carried log holds, all valid or in effect and
-  descending from that policy; any other is passed over. The device and
-  admin keys in effect as of those parents are the devices to pair again.
-  A sealed copy of the account space held by guardians is to bring the
-  data back later; it is not specified, and not built.
+- **A recovery keeps no old key (D80).** The `recover` names no key to
+  keep, hosts included, and guardian software refuses to endorse or
+  confirm one that keeps any (`keeps_keys` in `guarding`). The new device
+  signs on the first proposal (in the order it met the guardians) that
+  acts under the carried log's current policy and whose parents the
+  carried log holds, all valid or in effect and descending from that
+  policy; any other is passed over. The device and admin keys in effect as
+  of those parents are the devices to pair again when no account comes
+  back.
+- **Reading: the sealed account copy (D80).** "Give each guardian's
+  persona a sealed copy of the account space ... keep it current through
+  the relationship": the person's devices write, in the relationship with
+  each guardian named, a **held copy** node (relationship kind 66, this
+  implementation's: `1: label`, author-owned), naming the account space;
+  the guardian's own devices then hold that space's sealed entries, never
+  opened, as a space they cannot open, synced with the person over
+  sessions as contacts (an invitation's session reaches only the
+  relationship, and is closed so that one as contacts replaces it). The
+  person's devices let a guardian fetch the account only where they named
+  it so; a guardian's devices take it only from someone they guard through
+  a persona. Chunks are left out. In a recovery the persona's service is
+  given copies of the sealed account and of the relationship space the
+  guardian shares with the person, names both in held copy nodes in each
+  helper's relationship, and lets the helper fetch them; the helper takes
+  what a persona names. **Readings:** the account copy is held by the
+  guardian's own devices for the persona, as the spec says, but synced
+  over the guardian's own relationship with the person; the copy is as
+  fresh as the last sync.
 - **Reading: the fingerprint.** "Five words from the BIP-39 English list,
   the first 55 bits of `BLAKE3("cardinal recovery fingerprint" || field 1
   || field 3)`": field 1 is the root's 32 bytes; field 3, a hybrid public
@@ -567,12 +613,24 @@ none of the old devices. What differs or was read:
   with a wrap (the current key opened from the newest recovery wrap to the
   guardian key rebuilt from the shares, the current key's, else the
   policy's field 6) and one `set_encryption_key` with a fresh key whose
-  chain carries the current one, and makes new account and files spaces,
-  as `cardinal init` makes them (the person's suggested name is lost with
-  the account, so the default is used): nothing of the old spaces comes
-  back this way. The words for the new root are shown then, and the
-  devices to pair again, by key (and by name where the account remembers
-  one), which `cardinal recover` keeps showing from `recovered.json`.
+  chain carries the current one, and takes up the sets the guardians gave
+  back: the account and their relationships with the person, opened with
+  that chain. Every entry of them was written by keys the recovery
+  removed, so all of it is set aside until kept: the device keeps it whole
+  (a `keep` per removed key, of all it wrote there), since the spec says
+  contacts, spaces and settings come back; what a thief wrote with a
+  stolen device before the copy was last synced comes back with it. With
+  no account among them, new account and files spaces are made, as
+  `cardinal init` makes them. The words for the new root are shown, and
+  "Pair your other devices again" with the devices the account remembers
+  (else the keys removed), which `cardinal recover` keeps showing from
+  `recovered.json`. Other spaces, the files space among them, come back
+  only as their other holders are reached.
+- **Reading: what contacts are told.** `contacts` says, for a contact
+  whose log shows a recovery in effect, "was recovered by guardians they
+  chose, after DELAY. If in doubt, check with them in person." whenever it
+  lists them, not once. The spec gives "on" the date of the policy, but an
+  identity entry carries no time, so no date is given.
 - **Reading: keeping a lost device's work after a recovery.** A recovery
   that kept none of the old keys leaves everything they wrote unwitnessed,
   every space's genesis included; the spec lets the person keep "those

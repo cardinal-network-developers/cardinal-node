@@ -522,7 +522,9 @@ async fn handle(d: &Arc<Daemon>, req: &Value) -> anyhow::Result<Value> {
         "guarding" => Ok(crate::guardians::list(d)),
         "guarding-invite" => {
             crate::guardians::invite(d, arg(req, "who")?, req.get("at").and_then(Value::as_str))
+                .await
         }
+        "guarding-accept" => crate::guardians::accept_role(d, arg(req, "who")?).await,
         "guarding-never" => crate::guardians::never(d, arg(req, "who")?, arg(req, "fingerprint")?),
         "guarding-caution" => crate::guardians::caution_for(d, arg(req, "who")?),
         "guarding-endorse" => {

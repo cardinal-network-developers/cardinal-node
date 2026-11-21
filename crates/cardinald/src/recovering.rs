@@ -471,6 +471,13 @@ pub fn status(d: &Arc<Daemon>) -> anyhow::Result<Json> {
     let phrase = phrase_of(&u)?;
     let h = d.helper.lock().unwrap_or_else(|e| e.into_inner()).clone();
     let s = standing(h.as_ref(), &u).map(|(s, _)| s);
+    let held = match (h.as_ref(), identity_of(&u)) {
+        (Some(h), Some(who)) => copies(h, &who)
+            .iter()
+            .filter(|(_, e)| !e.is_empty())
+            .count(),
+        _ => 0,
+    };
     Ok(json!({
         "under_way": true,
         "identity": u.identity,
@@ -483,6 +490,7 @@ pub fn status(d: &Arc<Daemon>) -> anyhow::Result<Json> {
         "confirmed": s.as_ref().map_or(0, |s| s.confirmed),
         "threshold": s.as_ref().map_or(0, |s| s.threshold),
         "in_effect": s.as_ref().is_some_and(|s| s.in_effect),
+        "held": held,
     }))
 }
 
@@ -633,6 +641,15 @@ pub async fn finish(d: &Arc<Daemon>) -> anyhow::Result<Json> {
         );
     }
     let log = log.expect("in effect");
+    let given = copies(
+        h.as_ref().expect("running"),
+        &identity_of(&u).expect("checked"),
+    );
+    tracing::info!(
+        "the guardians gave back {} sets, {} entries",
+        given.len(),
+        given.iter().map(|(_, e)| e.len()).sum::<usize>()
+    );
     // From here this device may become the person's at any moment: if it
     // stops before the end, `cardinal recover` shows the words.
     u.finishing = true;
@@ -643,7 +660,18 @@ pub async fn finish(d: &Arc<Daemon>) -> anyhow::Result<Json> {
             pair_again: u.forgotten.clone(),
         },
     );
-    from_guardians(d, log, &u.words).await?;
+    let back = from_guardians(d, log, &u.words, given).await?;
+    // What the account remembers, if it came back; else the keys removed.
+    let pair_again = match back {
+        true => remembered(d),
+        false => u.forgotten.clone(),
+    };
+    save_recovered(
+        d,
+        &Recovered {
+            pair_again: pair_again.clone(),
+        },
+    );
     // The guardians see each other's confirmations before the helper goes.
     last_carry(d).await;
     crate::helper::stop(d).await?;
@@ -651,7 +679,8 @@ pub async fn finish(d: &Arc<Daemon>) -> anyhow::Result<Json> {
     crate::helper::remove_left(d);
     Ok(json!({
         "words": u.words,
-        "pair_again": pair_again_json(d, &u.forgotten),
+        "account": back,
+        "pair_again": pair_again_json(d, &pair_again),
     }))
 }
 
@@ -687,12 +716,42 @@ async fn last_carry(d: &Arc<Daemon>) {
         .await;
 }
 
-/// Becomes the person's device from the log the guardians carried: adds
-/// this device with the root, sets a fresh encryption key, and makes new
-/// account and files spaces. Nothing of the old spaces comes back this
-/// way; a sealed copy of the account that guardians hold is to bring it
-/// later, and is not specified yet.
-async fn from_guardians(d: &Arc<Daemon>, log: IdentityLog, words: &str) -> anyhow::Result<()> {
+/// The sets the guardians' personas gave the helper to hold (D80): the
+/// sealed account and each one's relationship space with the person, by
+/// label, with every sealed entry of each.
+fn copies(h: &Helper, who: &EntryId) -> Vec<([u8; 32], Vec<Vec<u8>>)> {
+    let rels = relationships(&h.d, who);
+    let core = h.d.core();
+    let mut labels: Vec<[u8; 32]> = Vec::new();
+    for (persona, _) in rels {
+        for l in core.held_taken(&persona) {
+            if !labels.contains(&l) {
+                labels.push(l);
+            }
+        }
+    }
+    labels
+        .into_iter()
+        .map(|l| {
+            let ids: Vec<[u8; 32]> = core.set(&l).iter().copied().collect();
+            let all = ids.iter().filter_map(|id| core.get(&l, id)).collect();
+            (l, all)
+        })
+        .collect()
+}
+
+/// Becomes the person's device from what the guardians carried: adds this
+/// device with the root, sets a fresh encryption key, and takes up the
+/// account and the guardians' relationships they held, sealed, opened now
+/// with the encryption key the guardian key opened (D80). With no account
+/// among them, new account and files spaces are made. Returns whether the
+/// account came back.
+async fn from_guardians(
+    d: &Arc<Daemon>,
+    log: IdentityLog,
+    words: &str,
+    copies: Vec<([u8; 32], Vec<Vec<u8>>)>,
+) -> anyhow::Result<bool> {
     let keys = d.keys.clone();
     let root = RecoveryPhrase::parse(words)?.root_signing_key();
     let mut all = crate::core::log_bytes(&log);
@@ -703,13 +762,30 @@ async fn from_guardians(d: &Arc<Daemon>, log: IdentityLog, words: &str) -> anyho
     let config = crate::config::Config::load(&d.paths.config())?;
     let person = crate::config::default_person();
     let paths = d.paths.clone();
-    tokio::task::spawn_blocking(move || {
-        crate::setup::install_entries(&paths, &all, &config, &person)
+    let back = tokio::task::spawn_blocking(move || {
+        crate::setup::install_recovered(&paths, &all, &copies, &config, &person)
     })
     .await??;
     crate::control::reload(d)?;
     d.identity_changed();
-    Ok(())
+    // this device in the account, and its placement, as for any device
+    d.housekeeping();
+    Ok(back)
+}
+
+/// The devices the account remembers, but this one: the person's other
+/// devices and hosts, which the recovery removed, to pair again.
+fn remembered(d: &Daemon) -> Vec<String> {
+    let core = d.core();
+    let me = d.keys.key();
+    let Some(acc) = core.account().and_then(|a| a.space.as_ref()) else {
+        return Vec::new();
+    };
+    account::devices(acc.state())
+        .into_iter()
+        .filter(|x| x.key != me)
+        .map(|x| hex::encode(x.key))
+        .collect()
 }
 
 /// `cardinal keep-work DEVICE [--up-to all|TIME]`: what a removed device

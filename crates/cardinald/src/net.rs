@@ -134,6 +134,12 @@ impl Daemon {
                     Access::Other(identity)
                 } else if Some(*label) == core.identity_label() || core.shares(&identity, label) {
                     Access::Full
+                } else if core.held_given(&identity).contains(label) {
+                    // a copy this person gives them to hold (D80)
+                    Access::Read
+                } else if core.held_taken(&identity).contains(label) {
+                    // one they give this person to hold
+                    Access::Offered
                 } else if core.offered_here(&identity, label) {
                     Access::Offered
                 } else if let Some(m) = core

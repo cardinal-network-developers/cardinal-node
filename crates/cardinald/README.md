@@ -361,12 +361,19 @@ endorsed, confirmed, in_effect, objected, id}], frozen}`; `guardians-set`
 (`who`, `threshold`, `delay`; the words); `guardians-object`
 (`fingerprint`, needed only when more than one is under way).
 
-A guardian: `guarding` → `{guarding: [{name, id (64 hex), guardians,
-threshold, delay, delay_text, recoveries, waiting, warning, never,
-helpers}], now_ms}`. `recoveries` holds at most one: the one recovery of
+A guardian acts through a persona per person guarded (D79), made by
+`guarding-accept` (`who`) → `{name, persona (64 hex), already}`, which the
+person then names with `guardians-set` (it fails, saying so, for a
+contact who has not accepted). `guarding` → `{guarding: [{name, id (64
+hex), persona, guardians, threshold, delay, delay_text, recoveries,
+waiting, warning, never, helpers, account_copy}], accepted: [names],
+now_ms}`; `accepted` lists those this person accepted to guard who have
+not named them yet; `account_copy`, whether this device holds the
+person's sealed account (D80). `recoveries` holds at most one: the one recovery of
 that person shown at a time, `{fingerprint, endorsed, confirmed,
 endorsed_by_me, confirmed_by_me, pending, confirm_from_ms, objected,
-in_effect, caution}`. `caution` is the warning to show, in plain words,
+in_effect, keeps_keys, caution}` (`keeps_keys`: the `recover` keeps an
+old key, and endorsing or confirming it fails). `caution` is the warning to show, in plain words,
 before endorsing and again before confirming; a client shows it and asks
 the guardian to go on. `waiting` counts other recoveries of that person
 under way, which are not shown; `warning` is the text to show then, or
@@ -391,7 +398,8 @@ the relationship is listed nowhere as a contact (`contacts`,
 
 The new device: `recover` → `{under_way: true, identity, fingerprint,
 helper, guardians, proposed, asked, endorsed, confirmed, threshold,
-in_effect}` while one is under way; `{under_way: false, finished: true,
+in_effect, held}` while one is under way (`held`: how many sets the
+guardians gave back so far, the account among them); `{under_way: false, finished: true,
 words, pair_again}` once, when `recover-finish` made the device the
 person's but stopped before the end (show the words; the next `recover`
 no longer has them); else `{under_way: false, pair_again}`. A recovery
@@ -403,9 +411,16 @@ guardian's recovery invitation, `identity`: 64 hex; both optional) →
 that guardian. `recover-invite` (`at`, optional) → `{code, fingerprint}`:
 an invitation for a guardian who is present to `accept`.
 `recover-cancel` → `{fingerprint}` (null if nothing was under way).
-`recover-finish` → `{words, pair_again}`: takes the identity up from what
-the guardians carried, with new account and files spaces; `words` are
-the new recovery words, to show once.
+`recover-finish` → `{words, account, pair_again}`: takes the identity up
+from what the guardians carried, and the account and relationships they
+held (`account` true), or with new account and files spaces when none
+held one; `words` are the new recovery words, to show once, and
+`pair_again` the devices the account remembers, under "Pair your other
+devices again".
+
+`contacts` gives each contact `recovered`: the text to show when their log
+has a recovery in effect ("was recovered by guardians they chose, after
+7 days. If in doubt, check with them in person."), else null.
 
 `accept` is the only request that takes a recovery invitation; an
 introduction never uses one.

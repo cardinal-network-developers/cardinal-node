@@ -600,12 +600,22 @@ pub fn messages(space: &Space) -> Vec<Message> {
 // relationship, not how; these two node kinds are this implementation's
 // (DEVIATIONS.md, Guardians).
 
-/// Recovery proposal kind: what a guardian's device proposes for a
-/// `recover`. Not in the specification.
-pub const RECOVERY_PROPOSAL: u64 = 16;
+/// Recovery proposal kind: what a guardian's persona proposes for a
+/// `recover`. Not in the specification, which numbers relationship kinds
+/// up to 11; numbered well past them (DEVIATIONS.md).
+pub const RECOVERY_PROPOSAL: u64 = 64;
 /// Carried entry kind: one identity entry, carried for a recovery. Not in
 /// the specification.
-pub const CARRIED: u64 = 17;
+pub const CARRIED: u64 = 65;
+/// Held copy kind: a set its author gives the other member to hold for
+/// them, sealed, as a person gives their guardians a copy of their account
+/// and a guardian's persona gives a recovery helper what it holds. Not in
+/// the specification, which says only that these are given and kept
+/// current through the relationship (D80).
+pub const HELD_COPY: u64 = 66;
+/// Guardian persona kind (`profiles.md#relationship`, D79): the persona
+/// its author guards the other member through, and that persona's log.
+pub const GUARDIAN_PERSONA: u64 = 11;
 
 /// A guardian's proposal, as a relationship space holds it.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -722,4 +732,76 @@ pub fn carried(space: &Space) -> Vec<Carried> {
         .collect();
     found.sort_by_key(|(at, _)| *at);
     found.into_iter().map(|(_, c)| c).collect()
+}
+
+/// `create` of a guardian persona node, its author's alone: the persona
+/// they guard the other member through, and its log from genesis.
+pub fn create_guardian_persona(persona: &IdentityId, log: &[Vec<u8>]) -> SpaceOp {
+    SpaceOp::create(
+        NodeKind::Uint(GUARDIAN_PERSONA),
+        ROOT,
+        "guardian persona",
+        Record::new()
+            .with(1, *persona)
+            .with(2, Value::list(log.iter().map(|b| Value::from(b.clone()))))
+            .with(AUTHOR_OWNED_FIELD, 1u64),
+    )
+}
+
+/// A guardian persona node, as its author wrote it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GuardianPersona {
+    /// Who wrote it: the guardian.
+    pub author: IdentityId,
+    /// The persona.
+    pub persona: IdentityId,
+    /// Its log, from genesis, as of writing.
+    pub log: Vec<Vec<u8>>,
+}
+
+/// The guardian persona nodes in a relationship space, the latest first.
+pub fn guardian_personas(space: &Space) -> Vec<GuardianPersona> {
+    let dag = space.dag();
+    let mut found: Vec<(Option<usize>, GuardianPersona)> = space
+        .state()
+        .children(&ROOT)
+        .into_iter()
+        .filter(|n| n.kind == NodeKind::Uint(GUARDIAN_PERSONA) && !n.deleted)
+        .filter_map(|n| {
+            let p = GuardianPersona {
+                author: n.creator,
+                persona: as_created(n, 1)?.as_bytes()?.try_into().ok()?,
+                log: as_created(n, 2)?
+                    .as_list()?
+                    .iter()
+                    .filter_map(|v| v.as_bytes().map(<[u8]>::to_vec))
+                    .collect(),
+            };
+            Some((dag.position(&n.created_in), p))
+        })
+        .collect();
+    found.sort_by_key(|(at, _)| std::cmp::Reverse(*at));
+    found.into_iter().map(|(_, p)| p).collect()
+}
+
+/// `create` of a held copy node: its author gives the other member the set
+/// `label` to hold for them.
+pub fn create_held(label: &[u8; 32]) -> SpaceOp {
+    SpaceOp::create(
+        NodeKind::Uint(HELD_COPY),
+        ROOT,
+        "held copy",
+        Record::new().with(1, *label).with(AUTHOR_OWNED_FIELD, 1u64),
+    )
+}
+
+/// The held copy nodes in a relationship space: who gives which set.
+pub fn held(space: &Space) -> Vec<(IdentityId, [u8; 32])> {
+    space
+        .state()
+        .children(&ROOT)
+        .into_iter()
+        .filter(|n| n.kind == NodeKind::Uint(HELD_COPY) && !n.deleted)
+        .filter_map(|n| Some((n.creator, as_created(n, 1)?.as_bytes()?.try_into().ok()?)))
+        .collect()
 }
