@@ -607,19 +607,6 @@ pub const RECOVERY_PROPOSAL: u64 = 16;
 /// the specification.
 pub const CARRIED: u64 = 17;
 
-/// A host a guardian's device proposes to keep: one the person named in
-/// their reach node in the guardian's relationship with them, matched to a
-/// device key their log names.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ProposedHost {
-    /// The device key the person's log names for it.
-    pub key: [u8; 32],
-    /// Its X25519 static key.
-    pub host: [u8; 32],
-    /// Where it listens, as the reach node gives it.
-    pub endpoints: Vec<Endpoint>,
-}
-
 /// A guardian's proposal, as a relationship space holds it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Proposal {
@@ -633,23 +620,11 @@ pub struct Proposal {
     pub parents: Vec<EntryId>,
     /// The policy it acts under.
     pub policy: EntryId,
-    /// The hosts to keep.
-    pub hosts: Vec<ProposedHost>,
 }
 
-/// `create` of a recovery proposal, its author's alone.
-pub fn create_proposal(
-    identity: &IdentityId,
-    parents: &[EntryId],
-    policy: &EntryId,
-    hosts: &[ProposedHost],
-) -> SpaceOp {
-    let hosts = hosts.iter().map(|h| {
-        Value::Record(Record::new().with(1, h.key).with(2, h.host).with(
-            3,
-            Value::list(h.endpoints.iter().map(|e| Value::Record(e.to_record()))),
-        ))
-    });
+/// `create` of a recovery proposal, its author's alone. A `recover` keeps
+/// no old key, so it proposes no hosts.
+pub fn create_proposal(identity: &IdentityId, parents: &[EntryId], policy: &EntryId) -> SpaceOp {
     SpaceOp::create(
         NodeKind::Uint(RECOVERY_PROPOSAL),
         ROOT,
@@ -658,7 +633,6 @@ pub fn create_proposal(
             .with(1, *identity)
             .with(2, Value::list(parents.iter().map(|p| Value::from(*p))))
             .with(3, *policy)
-            .with(4, Value::list(hosts))
             .with(AUTHOR_OWNED_FIELD, 1u64),
     )
 }
@@ -687,22 +661,6 @@ pub fn proposals(space: &Space) -> Vec<Proposal> {
                     .and_then(Value::as_list)
                     .unwrap_or_default()
             };
-            let hosts = list(4)
-                .iter()
-                .filter_map(|v| {
-                    let r = v.as_record()?;
-                    Some(ProposedHost {
-                        key: r.get(1)?.as_bytes()?.try_into().ok()?,
-                        host: r.get(2)?.as_bytes()?.try_into().ok()?,
-                        endpoints: r
-                            .record_list(3)
-                            .ok()?
-                            .into_iter()
-                            .map(Endpoint::from_record)
-                            .collect(),
-                    })
-                })
-                .collect();
             let p = Proposal {
                 node: n.id,
                 author: n.creator,
@@ -712,7 +670,6 @@ pub fn proposals(space: &Space) -> Vec<Proposal> {
                     .filter_map(|v| v.as_bytes()?.try_into().ok())
                     .collect(),
                 policy: id(3)?,
-                hosts,
             };
             Some((dag.position(&n.created_in), p))
         })

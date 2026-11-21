@@ -43,7 +43,7 @@ use cardinal_identity::guardians::{same_fingerprint, Policy, Recovery, DEFAULT_D
 use cardinal_identity::{EntryId, IdentityEntry, IdentityLog, IdentityOp, OpBody, Power};
 use cardinal_link::Session;
 use cardinal_space::account;
-use cardinal_space::relationship::{self, ProposedHost};
+use cardinal_space::relationship;
 use cardinal_space::{SpaceId, SpaceOp};
 use cardinal_sync::identity_log_label;
 use serde::{Deserialize, Serialize};
@@ -707,10 +707,34 @@ fn pick_fingerprint(shown: &[String], typed: &str, name: &str) -> anyhow::Result
     }
 }
 
+/// Endorsing and confirming wait until the guardian was shown
+/// [`caution`] and said to go on (`understood`), whatever names them.
+fn heeded(g: &Guarded, understood: bool) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        understood,
+        "{} (Ask again saying you understood.)",
+        caution(&g.name)
+    );
+    Ok(())
+}
+
+/// `guarding-caution`: what to show a guardian before they endorse or
+/// confirm a recovery of `who`, however `who` is named.
+pub fn caution_for(d: &Daemon, who: &str) -> anyhow::Result<Json> {
+    let g = find_guarded(d, who)?;
+    Ok(json!({"name": g.name, "caution": caution(&g.name)}))
+}
+
 /// `cardinal guarding endorse NAME FINGERPRINT`: after checking with the
 /// person by whatever means they trust, says a recovery is wanted.
-pub async fn endorse(d: &Arc<Daemon>, who: &str, fingerprint: &str) -> anyhow::Result<Json> {
+pub async fn endorse(
+    d: &Arc<Daemon>,
+    who: &str,
+    fingerprint: &str,
+    understood: bool,
+) -> anyhow::Result<Json> {
     let g = find_guarded(d, who)?;
+    heeded(&g, understood)?;
     let w = find_wanted(d, &g, fingerprint)?;
     if !d
         .core()
@@ -721,6 +745,7 @@ pub async fn endorse(d: &Arc<Daemon>, who: &str, fingerprint: &str) -> anyhow::R
         act(
             d,
             &g,
+            w.recovery.entry,
             IdentityOp::endorse(w.recovery.entry, g.position, g.salt),
         )
         .await?;
@@ -732,8 +757,14 @@ pub async fn endorse(d: &Arc<Daemon>, who: &str, fingerprint: &str) -> anyhow::R
 /// `cardinal guarding confirm NAME FINGERPRINT`: after the wait, and after
 /// checking the fingerprint again with the person, confirms the recovery,
 /// with this guardian's share sealed to the new device.
-pub async fn confirm(d: &Arc<Daemon>, who: &str, fingerprint: &str) -> anyhow::Result<Json> {
+pub async fn confirm(
+    d: &Arc<Daemon>,
+    who: &str,
+    fingerprint: &str,
+    understood: bool,
+) -> anyhow::Result<Json> {
     let g = find_guarded(d, who)?;
+    heeded(&g, understood)?;
     // Own devices first, so this person's phone and laptop do not confirm
     // opposite decisions unawares, nor one said never to on the other.
     sync_own_log(d).await;
@@ -775,6 +806,7 @@ pub async fn confirm(d: &Arc<Daemon>, who: &str, fingerprint: &str) -> anyhow::R
     act(
         d,
         &g,
+        w.recovery.entry,
         IdentityOp::confirm(w.recovery.entry, g.position, g.salt, Some(&sealed)),
     )
     .await?;
@@ -803,6 +835,7 @@ pub fn never(d: &Arc<Daemon>, who: &str, fingerprint: &str) -> anyhow::Result<Js
         let name = format!("{NEVER_SETTING}{}", hex::encode(w.recovery.entry));
         d.write_and_push(&acc, vec![account::create_setting(&name, true)])?;
     }
+    retire_moot(d);
     Ok(list(d))
 }
 
@@ -877,7 +910,12 @@ async fn sync_own_log(d: &Arc<Daemon>) {
 /// Writes `op` in this guardian's own log, and delivers that log up to it
 /// to the guarded person's devices and hosts, under the person's label,
 /// and to every recovery helper of theirs.
-async fn act(d: &Arc<Daemon>, g: &Guarded, op: IdentityOp) -> anyhow::Result<()> {
+async fn act(
+    d: &Arc<Daemon>,
+    g: &Guarded,
+    decision: EntryId,
+    op: IdentityOp,
+) -> anyhow::Result<()> {
     let (entry, log) = {
         let mut core = d.core();
         let ident = core
@@ -900,13 +938,18 @@ async fn act(d: &Arc<Daemon>, g: &Guarded, op: IdentityOp) -> anyhow::Result<()>
     // Held here under their label too, so that whoever syncs it with this
     // device gets it.
     d.core().ingest_other(g.identity, &log)?;
-    for c in helpers_of(d, &g.identity) {
+    // only to the helpers of that recovery
+    for (c, r) in helpers_with_recover(d, &g.identity) {
+        if r != Some(decision) {
+            continue;
+        }
         if let Err(e) = carry(d, &c.space, &g.identity, &log) {
             tracing::debug!("carrying to a recovery helper: {e:#}");
         }
     }
     deliver(d, &g.identity, log).await;
     observe(d);
+    retire_moot(d);
     Ok(())
 }
 
@@ -938,7 +981,7 @@ pub(crate) async fn deliver(d: &Arc<Daemon>, guarded: &EntryId, objects: Vec<Vec
 const CARRY_BATCH: usize = 32 * 1024;
 
 /// Writes in a relationship space, as `carried` nodes, each of `entries`
-/// that is not there yet, whoever carried it. `recovered` is whom the
+/// that this person has not carried there yet. `recovered` is whom the
 /// recovery is of.
 pub(crate) fn carry(
     d: &Arc<Daemon>,
@@ -951,8 +994,12 @@ pub(crate) fn carry(
         let Some(sp) = core.spaces.get(space).and_then(|h| h.space.as_ref()) else {
             return Ok(0);
         };
+        // what this person carried there already: what the other carried
+        // counts as theirs, as a helper's `recover` must be its own
+        let me = core.me();
         let mut there: HashSet<EntryId> = relationship::carried(sp)
             .iter()
+            .filter(|c| Some(c.author) == me)
             .filter_map(|c| IdentityEntry::decode(&c.entry).ok())
             .map(|e| e.id())
             .collect();
@@ -996,10 +1043,8 @@ pub fn invite(d: &Arc<Daemon>, who: &str, at: Option<&str>) -> anyhow::Result<Js
 
 /// The proposal this guardian's device makes for a recovery of `g`
 /// (`identity.md#how-guardians-act`, step 1): parents the person
-/// recognizes, the policy, and the person's hosts, those the person's
-/// reach node names in this person's relationship with them, each matched
-/// by its static key to a device key their log names. A host their log
-/// does not name is left out.
+/// recognizes, and the policy. A `recover` keeps no old key (Daniel,
+/// 2026-11-20), so no host is proposed.
 fn proposal(d: &Daemon, g: &Guarded) -> anyhow::Result<SpaceOp> {
     let core = d.core();
     let other = core
@@ -1011,47 +1056,10 @@ fn proposal(d: &Daemon, g: &Guarded) -> anyhow::Result<SpaceOp> {
         current.as_ref().map(|p| p.entry) == Some(g.policy.entry),
         "their guardians have changed"
     );
-    let st = other.log.state();
-    let space = core
-        .contacts()
-        .into_iter()
-        .find(|c| c.identity == g.identity && c.recovery_of.is_none())
-        .map(|c| c.space);
-    let reach = space
-        .map(|s| core.reach_of(&s, &g.identity))
-        .unwrap_or_default();
-    let mut hosts: Vec<ProposedHost> = reach
-        .into_iter()
-        .filter_map(|r| {
-            let k = st
-                .keys
-                .values()
-                .find(|k| k.link_key.as_ref().map(|l| *l.x25519()) == Some(r.host))?;
-            Some(ProposedHost {
-                key: k.key,
-                host: r.host,
-                endpoints: r.endpoints,
-            })
-        })
-        .collect();
-    // Tests: a guardian who tries to bring in a device of their own.
-    if std::env::var_os("CARDINAL_TEST_PROPOSE_OWN_DEVICE").is_some() {
-        let at = d
-            .endpoint
-            .udp_addr()
-            .or(d.endpoint.tcp_addr())
-            .and_then(|a| cardinal_space::grant::Endpoint::parse(&a.to_string()));
-        hosts.push(ProposedHost {
-            key: d.keys.key(),
-            host: *d.keys.link.public_key().x25519(),
-            endpoints: at.into_iter().collect(),
-        });
-    }
     Ok(relationship::create_proposal(
         &g.identity,
         &other.log.recovery_parents(),
         &g.policy.entry,
-        &hosts,
     ))
 }
 
@@ -1112,7 +1120,7 @@ pub fn on_space(d: &Arc<Daemon>, space: &SpaceId) {
         let Some(c) = core
             .contacts()
             .into_iter()
-            .find(|c| c.space == *space && c.recovery_of.is_some())
+            .find(|c| c.space == *space && c.recovery_of.is_some() && !c.refused)
         else {
             return;
         };
@@ -1122,11 +1130,23 @@ pub fn on_space(d: &Arc<Daemon>, space: &SpaceId) {
         return;
     };
     let label = identity_log_label(&who);
+    let first_recover: Option<EntryId> = {
+        let core = d.core();
+        core.spaces
+            .get(space)
+            .and_then(|h| h.space.as_ref())
+            .and_then(|sp| relationship_recover(sp, &helper, &who))
+            .filter(|e| is_recover_under(e, &g.policy.entry))
+            .map(|e| e.id())
+    };
     let new: Vec<Vec<u8>> = {
         let core = d.core();
         let Some(sp) = core.spaces.get(space).and_then(|h| h.space.as_ref()) else {
             return;
         };
+        // Of the person's own log, the helper's first `recover` alone, so
+        // that a helper cannot bring in more than one.
+        let first = first_recover;
         relationship::carried(sp)
             .into_iter()
             .filter(|c| c.author == helper && c.identity == who)
@@ -1135,10 +1155,20 @@ pub fn on_space(d: &Arc<Daemon>, space: &SpaceId) {
                 if core.has(&label, &e.id()) {
                     return None;
                 }
-                (e.identity() != who || is_recover_under(&e, &g.policy.entry)).then_some(c.entry)
+                (e.identity() != who || Some(e.id()) == first).then_some(c.entry)
             })
             .collect()
     };
+    // This person's acts on that recovery, done before it was carried here
+    // (it may have come from the person's host first), go into it now.
+    if let Some(r) = first_recover {
+        let mine = my_acts_on(d, &r);
+        if !mine.is_empty() {
+            if let Err(e) = carry(d, space, &who, &mine) {
+                tracing::debug!("carrying to a recovery helper: {e:#}");
+            }
+        }
+    }
     if new.is_empty() {
         return;
     }
@@ -1169,9 +1199,112 @@ pub fn on_space(d: &Arc<Daemon>, space: &SpaceId) {
         }
     }
     observe(d);
+    retire_moot(d);
     d.bump();
     let d2 = d.clone();
     d.rt.spawn(async move { deliver(&d2, &who, taken).await });
+}
+
+/// This person's acts on `decision`, with their causal past in this
+/// person's own log, as [`act`] carries them.
+fn my_acts_on(d: &Daemon, decision: &EntryId) -> Vec<Vec<u8>> {
+    let core = d.core();
+    let Some(ident) = core.identity.as_ref() else {
+        return Vec::new();
+    };
+    let acts: Vec<EntryId> = ident
+        .log
+        .entries()
+        .filter(|e| {
+            e.ops().iter().any(|o| {
+                matches!(o.body(), OpBody::Endorse { decision: x, .. }
+                    | OpBody::Confirm { decision: x, .. } if x == decision)
+            })
+        })
+        .map(|e| e.id())
+        .collect();
+    if acts.is_empty() {
+        return Vec::new();
+    }
+    let mut past = ident.log.dag().ancestors_of(&acts);
+    past.extend(acts);
+    ident
+        .log
+        .entries()
+        .filter(|e| past.contains(&e.id()))
+        .map(IdentityEntry::encode)
+        .collect()
+}
+
+/// The `recover` a recovery relationship is for: the first its helper
+/// carried there. Any later one is not taken.
+pub(crate) fn relationship_recover(
+    sp: &cardinal_space::Space,
+    helper: &EntryId,
+    who: &EntryId,
+) -> Option<IdentityEntry> {
+    relationship::carried(sp)
+        .into_iter()
+        .filter(|c| c.author == *helper && c.identity == *who)
+        .filter_map(|c| IdentityEntry::decode(&c.entry).ok())
+        .find(|e| e.identity() == *who && recovery_of_entry(e).is_some())
+}
+
+/// The recovery relationships for `who` with the `recover` each is for.
+fn helpers_with_recover(
+    d: &Daemon,
+    who: &EntryId,
+) -> Vec<(account::ContactRecord, Option<EntryId>)> {
+    let rels = helpers_of(d, who);
+    let core = d.core();
+    rels.into_iter()
+        .map(|c| {
+            let r = core
+                .spaces
+                .get(&c.space)
+                .and_then(|h| h.space.as_ref())
+                .and_then(|sp| relationship_recover(sp, &c.identity, who))
+                .map(|e| e.id());
+            (c, r)
+        })
+        .collect()
+}
+
+/// Retires a recovery relationship: this person refuses its helper, so
+/// nothing is carried into it, and it is trusted for nothing (sessions,
+/// calls, delivery tokens) from now on.
+fn retire(d: &Arc<Daemon>, c: &account::ContactRecord) {
+    let Some(acc) = d.core().account_id() else {
+        return;
+    };
+    let ops = vec![
+        account::set_field(c.node, account::REFUSED, true),
+        account::set_field(c.node, account::TRUSTED, false),
+    ];
+    match d.write_and_push(&acc, ops) {
+        Ok(_) => tracing::info!("retired the {}", c.petname),
+        Err(e) => tracing::warn!("cannot retire the {}: {e:#}", c.petname),
+    }
+}
+
+/// Retires the recovery relationships that can serve no more: those for a
+/// recovery this person said never to, and, once a recovery of someone is
+/// in effect, those for any other.
+fn retire_moot(d: &Arc<Daemon>) {
+    let never = nevers(d);
+    for g in guarded(d) {
+        let done: Option<EntryId> = wanted(d, &g)
+            .iter()
+            .find(|w| w.in_effect)
+            .map(|w| w.recovery.entry);
+        for (c, r) in helpers_with_recover(d, &g.identity) {
+            // one whose `recover` has not arrived yet may be the one in effect
+            let moot = r.is_some_and(|r| never.contains(&r) || done.is_some_and(|d| d != r));
+            if moot {
+                retire(d, &c);
+            }
+        }
+    }
 }
 
 /// The `recover` an entry is, if it is one alone, signed by its new root.
@@ -1207,6 +1340,52 @@ mod tests {
     use super::*;
     use cardinal_crypto::RecoveryPhrase;
     use cardinal_identity::{Created, DeviceKeys};
+
+    /// A helper carries two `recover`s in one relationship: the first is
+    /// the one the relationship is for, and the second is never taken.
+    #[tokio::test]
+    async fn a_relationship_is_for_its_helpers_first_recover_alone() {
+        let dirs = [tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap()];
+        let (paths, config) = crate::testing::set_up(dirs[0].path());
+        let d = Daemon::start(paths, config).await.unwrap();
+        let (paths, _) = crate::testing::set_up(dirs[1].path());
+        let keys = crate::keys::Keys::load_or_create(&paths.device_key()).unwrap();
+        let mut bo = crate::core::Core::load(&paths, Arc::new(keys)).unwrap();
+        let (me, them) = (d.core().me().unwrap(), bo.me().unwrap());
+        let all = |c: &crate::core::Core| c.identity.as_ref().unwrap().all_entries();
+        let (mine, theirs) = (all(&d.core()), all(&bo));
+        d.core().ingest_other(them, &theirs).unwrap();
+        bo.ingest_other(me, &mine).unwrap();
+        let (rel, _) = d.core().create_relationship(&them).unwrap();
+        // whom the recovery is of
+        let (ana, _) = log(5);
+        let recover = |n: u8| {
+            let phrase = RecoveryPhrase::from_entropy(&[n; 32]);
+            crate::recovering::recover_entry(
+                &ana.id(),
+                &[ana.id()],
+                &phrase.root_signing_key(),
+                &[],
+                d.keys.link.public_key(),
+                ana.id(),
+                phrase.recovery_key_pair().public_key(),
+            )
+            .unwrap()
+        };
+        let (first, second) = (recover(6), recover(7));
+        // the first in a batch with someone else's entry, as a helper does
+        let (other, _) = log(8);
+        let with: Vec<Vec<u8>> = vec![first.encode(), other.entries().next().unwrap().encode()];
+        carry(&d, &rel, &ana.id(), &with).unwrap();
+        carry(&d, &rel, &ana.id(), &[second.encode()]).unwrap();
+        let core = d.core();
+        let sp = core.spaces[&rel].space.as_ref().unwrap();
+        assert_eq!(relationship::carried(sp).len(), 3);
+        let found = relationship_recover(sp, &me, &ana.id()).unwrap();
+        assert_eq!(found.id(), first.id());
+        // and only what that member carried counts
+        assert!(relationship_recover(sp, &them, &ana.id()).is_none());
+    }
 
     #[test]
     fn a_fingerprint_two_recoveries_share_is_refused() {

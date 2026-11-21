@@ -367,17 +367,31 @@ fn invitation_used(d: &Arc<Daemon>, s: &Session, who: &[u8; 32]) -> anyhow::Resu
     Ok(())
 }
 
-/// Takes up an invitation, and becomes a contact of whoever gave it.
+/// Takes up an invitation, and becomes a contact of whoever gave it. A
+/// recovery invitation (field 9) is taken only with `recovery`, which only
+/// the person's own `accept` and a recovery helper set: nothing that runs
+/// unasked, such as an introduction, ever uses one.
 pub async fn accept(
     d: &Arc<Daemon>,
     code: &str,
     name: Option<&str>,
     regard: Regard,
     met: account::Met,
+    recovery: bool,
 ) -> anyhow::Result<Json> {
     let invitation = Invitation::from_text(code.trim())
         .map_err(|_| anyhow::anyhow!("that is not an invitation"))?;
     let me = identity(d)?;
+    anyhow::ensure!(
+        invitation.recovery_of.is_none() || recovery,
+        "that is an invitation to help someone recover their identity; only you, using it \
+         yourself, can take it up. Nothing was sent."
+    );
+    // Neither side of a recovery's relationship is the person recovered.
+    anyhow::ensure!(
+        invitation.recovery_of != Some(invitation.inviter) && invitation.recovery_of != Some(me),
+        "that recovery invitation names its own maker or you; nothing was sent"
+    );
     // A recovery invitation is answered only by a guardian of whoever it
     // names, or by a recovery helper; anyone else's device tells its
     // person so and sends nothing back (`identity.md#how-guardians-act`).
@@ -554,6 +568,11 @@ pub async fn serve(d: &Arc<Daemon>, s: &Session, mut st: Stream) -> anyhow::Resu
     let made_for = invitation_of_session(d, s);
     let bound = made_for.as_ref().and_then(|i| i.for_identity);
     let recovery_of = made_for.as_ref().and_then(|i| i.recovery_of);
+    // Neither side of a recovery's relationship is the person recovered.
+    if recovery_of == Some(them) {
+        s.abandon();
+        return Ok(());
+    }
     if bound.is_some_and(|f| f != them) {
         s.abandon();
         return Ok(());

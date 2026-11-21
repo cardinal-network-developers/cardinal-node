@@ -40,7 +40,9 @@ fn invitation_from(
 ) -> Option<cardinal_encoding::Record> {
     let record = record?;
     let inv = Invitation::from_record(record).ok()?;
-    (inv.inviter == *from && inv.for_identity == Some(*to)).then(|| record.clone())
+    // never a recovery's (`guardians.rs`)
+    (inv.inviter == *from && inv.for_identity == Some(*to) && inv.recovery_of.is_none())
+        .then(|| record.clone())
 }
 
 fn met_through(introducer: [u8; 32], group: Option<SpaceId>) -> Met {
@@ -258,8 +260,21 @@ async fn use_invitation(
 ) -> anyhow::Result<Json> {
     let invitation = Invitation::from_record(record)
         .map_err(|_| anyhow::anyhow!("that invitation cannot be read"))?;
+    // A recovery's invitation is never an introduction's (`guardians.rs`).
+    anyhow::ensure!(
+        invitation.recovery_of.is_none(),
+        "that introduction carries a recovery invitation, which is never used for one"
+    );
     let name = (!name.is_empty()).then_some(name);
-    contacts::accept(d, &invitation.to_text(), name, Regard::default(), met).await
+    contacts::accept(
+        d,
+        &invitation.to_text(),
+        name,
+        Regard::default(),
+        met,
+        false,
+    )
+    .await
 }
 
 /// Says no to an introduction. The introducer sees that.
@@ -433,6 +448,45 @@ mod tests {
     /// Only the person introduced may connect by an introduction, with an
     /// invitation of the other's made for them: one written in by anyone else,
     /// or for anyone else, is nothing.
+    /// A recovery invitation is never used for an introduction, by the
+    /// person's tending or by their saying yes, and `accept` takes one only
+    /// when asked to, and then only as a guardian: nothing is dialled.
+    #[tokio::test]
+    async fn a_recovery_invitation_is_never_an_introductions() {
+        let at = EndpointAddr::new(CarrierKind::Udp, "127.0.0.1:1".parse().unwrap());
+        let dir = tempfile::tempdir().unwrap();
+        let (paths, config) = crate::testing::set_up(dir.path());
+        let d = Daemon::start(paths, config).await.unwrap();
+        let me = d.core().me().unwrap();
+        let (ben, ana) = ([1u8; 32], [2u8; 32]);
+        let mut inv = Invitation::new(ben, [9; 32], at);
+        inv.for_identity = Some(me);
+        inv.recovery_of = Some(ana);
+        let r = inv.to_record();
+        assert_eq!(invitation_from(Some(&r), &ben, &me), None);
+        let e = use_invitation(&d, &r, "Ben", met_through(ben, None))
+            .await
+            .unwrap_err();
+        assert!(e.to_string().contains("never used"), "{e}");
+        let met = Met::default();
+        let e = contacts::accept(
+            &d,
+            &inv.to_text(),
+            None,
+            Regard::default(),
+            met.clone(),
+            false,
+        )
+        .await
+        .unwrap_err();
+        assert!(e.to_string().contains("only you"), "{e}");
+        // asked, but this person guards nobody
+        let e = contacts::accept(&d, &inv.to_text(), None, Regard::default(), met, true)
+            .await
+            .unwrap_err();
+        assert!(e.to_string().contains("not one of their guardians"), "{e}");
+    }
+
     #[test]
     fn an_introductions_invitation_is_checked_before_use() {
         let at = EndpointAddr::new(CarrierKind::Udp, "127.0.0.1:7171".parse().unwrap());

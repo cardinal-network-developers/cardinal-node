@@ -1030,10 +1030,6 @@ impl Daemon {
                 format!("{} opened: {}", hex::encode(&k[..8]), route(&s)),
             );
         }
-        if let PeerKind::Own(k) = kind {
-            // a host a recovery kept is heard from
-            crate::recovering::heard(self, &k);
-        }
         if let PeerKind::Own(k) | PeerKind::Contact(_, k) = kind {
             lock(&self.backoff).remove(&k);
             if s.role() == cardinal_link::Role::Responder && !s.is_relayed() {

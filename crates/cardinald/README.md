@@ -374,11 +374,16 @@ null. `never` lists the fingerprints the guardian said never to confirm;
 `helpers`, the recovery relationships for that person.
 `guarding-invite` (`who`, `at`: host:port, optional) → `{code, name}`:
 an invitation for the person's new device, naming them in field 9.
-`guarding-endorse` and `guarding-confirm` (`who`, `fingerprint`) → as
-`guarding`; either fails for a recovery that waits behind the one shown,
-or that the guardian said never to. `guarding-never` (`who`,
+`guarding-caution` (`who`) → `{name, caution}`: the warning to show before
+endorsing or confirming, however `who` names the person.
+`guarding-endorse` and `guarding-confirm` (`who`, `fingerprint`,
+`understood`) → as `guarding`; both fail unless `understood` is true (the
+guardian was shown `caution` and went on), and fail for a recovery that
+waits behind the one shown, or that the guardian said never to. `guarding-never` (`who`,
 `fingerprint`) → as `guarding`: never endorse or confirm it, on any of
-the guardian's devices (an account setting). `accept` of an invitation
+the guardian's devices (an account setting); the recovery relationship
+for it is retired (refused), as is any for another recovery once one is
+in effect. `accept` of an invitation
 that names someone in field 9 fails, with nothing sent, unless this
 person guards them; for a guardian it replies `{name, recovery_of}`, and
 the relationship is listed nowhere as a contact (`contacts`,
@@ -386,22 +391,28 @@ the relationship is listed nowhere as a contact (`contacts`,
 
 The new device: `recover` → `{under_way: true, identity, fingerprint,
 helper, guardians, proposed, asked, endorsed, confirmed, threshold,
-in_effect, kept, now_ms}` while one is under way, else `{under_way:
-false, kept, now_ms}` with the hosts the last recovery kept; each of
-`kept` is `{key, name, online, heard_ms}`, `heard_ms` when this device
-last heard from it since the recovery (null if never). `recover-start`
-(`code`: a guardian's recovery invitation, `key`: a sheet key,
-`identity`: 64 hex; all optional) → `{fingerprint, identity}`: starts
-one if none is under way, and meets that guardian. `recover-invite`
-(`at`, optional) → `{code, fingerprint}`: an invitation for a guardian
-who is present to `accept`. `recover-cancel` → `{fingerprint}` (null if
-nothing was under way). `recover-finish` (`at` and `key` together, or
-neither; `without_hosts`) → `{at, words, kept, now_ms}`: `at` is the
-host it went through, null when it took the identity up from what the
-guardians hold; `words` are the new recovery words, to show once.
+in_effect}` while one is under way; `{under_way: false, finished: true,
+words, pair_again}` once, when `recover-finish` made the device the
+person's but stopped before the end (show the words; the next `recover`
+no longer has them); else `{under_way: false, pair_again}`. A recovery
+keeps none of the old devices: `pair_again` lists them, `[{key, name}]`
+(`key` the first 16 hex digits, `name` null unless the account remembers
+one), to show under "pair them again". `recover-start` (`code`: a
+guardian's recovery invitation, `identity`: 64 hex; both optional) →
+`{fingerprint, identity}`: starts one if none is under way, and meets
+that guardian. `recover-invite` (`at`, optional) → `{code, fingerprint}`:
+an invitation for a guardian who is present to `accept`.
+`recover-cancel` → `{fingerprint}` (null if nothing was under way).
+`recover-finish` → `{words, pair_again}`: takes the identity up from what
+the guardians carried, with new account and files spaces; `words` are
+the new recovery words, to show once.
+
+`accept` is the only request that takes a recovery invitation; an
+introduction never uses one.
 
 Removed (D77): `guarding-help` and `recover-via`, with the
-`cardinal-help:` code they used.
+`cardinal-help:` code they used; `recover-start` takes no `key` and
+`recover-finish` no `at`, `key` or `without_hosts`.
 
 ## Inspection
 

@@ -329,7 +329,8 @@ async fn handle(d: &Arc<Daemon>, req: &Value) -> anyhow::Result<Value> {
                 via: req.get("via").and_then(|v| v.as_str()).map(str::to_owned),
                 ..Default::default()
             };
-            crate::contacts::accept(d, arg(req, "code")?, name, regard(req), met).await
+            // the person's own accept: the only one that takes a recovery's
+            crate::contacts::accept(d, arg(req, "code")?, name, regard(req), met, true).await
         }
         "invitations" => Ok(crate::contacts::invitations(d)),
         "cancel-invitation" => crate::contacts::cancel_invitation(d, arg(req, "id")?),
@@ -523,11 +524,16 @@ async fn handle(d: &Arc<Daemon>, req: &Value) -> anyhow::Result<Value> {
             crate::guardians::invite(d, arg(req, "who")?, req.get("at").and_then(Value::as_str))
         }
         "guarding-never" => crate::guardians::never(d, arg(req, "who")?, arg(req, "fingerprint")?),
+        "guarding-caution" => crate::guardians::caution_for(d, arg(req, "who")?),
         "guarding-endorse" => {
-            crate::guardians::endorse(d, arg(req, "who")?, arg(req, "fingerprint")?).await
+            let understood = req.get("understood").and_then(Value::as_bool) == Some(true);
+            crate::guardians::endorse(d, arg(req, "who")?, arg(req, "fingerprint")?, understood)
+                .await
         }
         "guarding-confirm" => {
-            crate::guardians::confirm(d, arg(req, "who")?, arg(req, "fingerprint")?).await
+            let understood = req.get("understood").and_then(Value::as_bool) == Some(true);
+            crate::guardians::confirm(d, arg(req, "who")?, arg(req, "fingerprint")?, understood)
+                .await
         }
         "recover" => crate::recovering::status(d),
         "keep-work" => crate::recovering::keep_work(
@@ -537,17 +543,13 @@ async fn handle(d: &Arc<Daemon>, req: &Value) -> anyhow::Result<Value> {
         ),
         "recover-start" => {
             let opt = |k: &str| req.get(k).and_then(Value::as_str);
-            crate::recovering::start(d, opt("code"), opt("key"), opt("identity")).await
+            crate::recovering::start(d, opt("code"), opt("identity")).await
         }
         "recover-invite" => {
             crate::recovering::invite(d, req.get("at").and_then(Value::as_str)).await
         }
         "recover-cancel" => crate::recovering::cancel(d).await,
-        "recover-finish" => {
-            let opt = |k: &str| req.get(k).and_then(Value::as_str);
-            let without = req.get("without_hosts").and_then(Value::as_bool) == Some(true);
-            crate::recovering::finish(d, opt("at"), opt("key"), without).await
-        }
+        "recover-finish" => crate::recovering::finish(d).await,
         "restore-from-host" => {
             crate::host::restore(d, arg(req, "words")?, arg(req, "at")?, arg(req, "key")?).await
         }

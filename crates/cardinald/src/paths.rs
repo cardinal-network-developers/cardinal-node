@@ -239,8 +239,8 @@ impl Paths {
     pub fn recovering(&self) -> PathBuf {
         self.home.join("recovering.json")
     }
-    /// The hosts a recovery through guardians kept, and when each was last
-    /// heard from since (`recovering.rs`).
+    /// The devices a recovery through guardians removed, to pair again
+    /// (`recovering.rs`).
     pub fn recovered(&self) -> PathBuf {
         self.home.join("recovered.json")
     }

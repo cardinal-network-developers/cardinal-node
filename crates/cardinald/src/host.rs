@@ -563,24 +563,6 @@ pub async fn restore(d: &Arc<Daemon>, words: &str, at: &str, key: &str) -> anyho
     Ok(json!({"at": at}))
 }
 
-/// A restore session with the host whose static key is `host`, at `addr`:
-/// the session and the host's signing key.
-pub(crate) async fn open_restore_at(
-    d: &Arc<Daemon>,
-    addr: SocketAddr,
-    host: [u8; 32],
-) -> anyhow::Result<(Session, [u8; 32])> {
-    let s = d
-        .dial(|c| Target::public(addr, c, host))
-        .await
-        .map_err(|e| anyhow::anyhow!("could not reach {addr} ({e})"))?;
-    let host_key = s
-        .peer_identity()
-        .ok_or_else(|| anyhow::anyhow!("that device did not say who it is"))?
-        .signing_key;
-    Ok((s, host_key))
-}
-
 /// A restore session with the host at `at` whose sheet key is `key`: the
 /// session, the address it reached, the host's static key, and its
 /// signing key.

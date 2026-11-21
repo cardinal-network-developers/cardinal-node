@@ -725,10 +725,6 @@ enum RecoverCmd {
         /// The invitation from `cardinal guarding invite` on the guardian's
         /// device.
         code: Option<String>,
-        /// The key of a host on your recovery sheet, if you still have it,
-        /// kept beside the hosts your guardians know of.
-        #[arg(long)]
-        key: Option<String>,
         /// Whom you recover (the id a guardian's device shows), to make an
         /// invitation for a guardian before using any of theirs.
         #[arg(long)]
@@ -746,20 +742,9 @@ enum RecoverCmd {
     /// not to confirm it (`cardinal guarding never`).
     Cancel,
     /// Once your guardians have confirmed: become your identity's device,
-    /// through a host the recovery kept, or from what your guardians hold
-    /// if there is none.
-    Finish {
-        /// A host's address (host:port), from your recovery sheet.
-        #[arg(long)]
-        host: Option<String>,
-        /// Its key.
-        #[arg(long)]
-        key: Option<String>,
-        /// Finish without the hosts the recovery kept, which cannot be
-        /// reached: they were lost too.
-        #[arg(long)]
-        without_hosts: bool,
-    },
+    /// from what your guardians hold. The recovery keeps none of your old
+    /// devices; pair them again afterwards.
+    Finish,
 }
 
 /// A delay as typed: 7d, 12h, 30m, 45s, or seconds.
@@ -838,48 +823,37 @@ fn print_guardians(v: &Value) {
     }
 }
 
-/// The hosts a recovery kept, with when each was last heard from.
-fn print_kept(v: &Value) {
-    let kept = v["kept"].as_array().cloned().unwrap_or_default();
-    if kept.is_empty() {
+/// The devices a recovery removed, to pair again.
+fn print_pair_again(v: &Value) {
+    let again = v["pair_again"].as_array().cloned().unwrap_or_default();
+    if again.is_empty() {
         return;
     }
-    let now = v["now_ms"].as_u64().unwrap_or(0);
-    println!("Hosts your recovery kept; remove any that was lost too (`cardinal remove-device`):");
-    for k in kept {
-        let name = k["name"]
-            .as_str()
-            .map(str::to_owned)
-            .unwrap_or_else(|| k["key"].as_str().unwrap_or("").to_owned());
-        let heard = if k["online"] == true {
-            "in touch now".to_owned()
-        } else {
-            match k["heard_ms"].as_u64() {
-                Some(t) => format!(
-                    "last heard from {} ago",
-                    span_text(now.saturating_sub(t) / 1000)
-                ),
-                None => "not heard from since the recovery".to_owned(),
-            }
-        };
-        println!("  {name}: {heard}");
-    }
-}
-
-/// Seconds as a person reads them.
-fn span_text(secs: u64) -> String {
-    match secs {
-        s if s < 120 => format!("{s} seconds"),
-        s if s < 7200 => format!("{} minutes", s / 60),
-        s if s < 172_800 => format!("{} hours", s / 3600),
-        s => format!("{} days", s / 86_400),
+    println!("The recovery kept none of your old devices. Pair them again (`cardinal pair`)");
+    println!("once you have them, and forget any that was lost:");
+    for k in again {
+        let key = k["key"].as_str().unwrap_or("");
+        match k["name"].as_str() {
+            Some(name) => println!("  {name}  [{key}]"),
+            None => println!("  [{key}]"),
+        }
     }
 }
 
 fn print_recover(v: &Value) {
+    if v["finished"] == true {
+        println!("Recovered. This device became yours before the recovery could finish tidying");
+        println!("up. Your new recovery words, shown this once: write them down, in order, and");
+        println!("keep them safe. The old ones no longer work.");
+        println!();
+        show_words(v["words"].as_str().unwrap_or(""));
+        println!();
+        print_pair_again(v);
+        return;
+    }
     if v["under_way"] != true {
         println!("No recovery is under way. Ask a guardian for an invitation (`cardinal guarding invite`).");
-        print_kept(v);
+        print_pair_again(v);
         return;
     }
     println!(
@@ -899,7 +873,7 @@ fn print_recover(v: &Value) {
             v["endorsed"], v["confirmed"], v["threshold"]
         );
     }
-    print_kept(v);
+    print_pair_again(v);
 }
 
 fn print_guarding(v: &Value) {
@@ -959,22 +933,9 @@ fn typed_fingerprint(words: &[String]) -> String {
 
 /// Shows a guardian the warning before they endorse or confirm, and asks
 /// them to go on, unless they said so already.
-fn cautioned(paths: &Paths, v: &Value, who: &str, yes: bool) -> anyhow::Result<()> {
-    let _ = paths;
-    let people = v["guarding"].as_array().cloned().unwrap_or_default();
-    let caution = people
-        .iter()
-        .filter(|p| {
-            p["name"]
-                .as_str()
-                .is_some_and(|n| n.eq_ignore_ascii_case(who))
-        })
-        .flat_map(|p| p["recoveries"].as_array().cloned().unwrap_or_default())
-        .find_map(|r| r["caution"].as_str().map(str::to_owned));
-    let Some(caution) = caution else {
-        return Ok(());
-    };
-    println!("{caution}");
+async fn cautioned(paths: &Paths, who: &str, yes: bool) -> anyhow::Result<()> {
+    let v = call(paths, json!({"cmd": "guarding-caution", "who": who})).await?;
+    println!("{}", v["caution"].as_str().unwrap_or(""));
     if yes {
         return Ok(());
     }
@@ -2437,15 +2398,10 @@ async fn client(cmd: Cmd) -> anyhow::Result<()> {
                     yes,
                 }),
         } => {
-            cautioned(
-                &paths,
-                &call(&paths, json!({"cmd": "guarding"})).await?,
-                &who,
-                yes,
-            )?;
+            cautioned(&paths, &who, yes).await?;
             let v = call(
                 &paths,
-                json!({"cmd": "guarding-endorse", "who": who, "fingerprint": typed_fingerprint(&fingerprint)}),
+                json!({"cmd": "guarding-endorse", "who": who, "fingerprint": typed_fingerprint(&fingerprint), "understood": true}),
             )
             .await?;
             println!("Endorsed. Once enough guardians have, everyone waits, and then confirms.");
@@ -2460,15 +2416,10 @@ async fn client(cmd: Cmd) -> anyhow::Result<()> {
                     yes,
                 }),
         } => {
-            cautioned(
-                &paths,
-                &call(&paths, json!({"cmd": "guarding"})).await?,
-                &who,
-                yes,
-            )?;
+            cautioned(&paths, &who, yes).await?;
             let v = call(
                 &paths,
-                json!({"cmd": "guarding-confirm", "who": who, "fingerprint": typed_fingerprint(&fingerprint)}),
+                json!({"cmd": "guarding-confirm", "who": who, "fingerprint": typed_fingerprint(&fingerprint), "understood": true}),
             )
             .await?;
             println!("Confirmed.");
@@ -2493,16 +2444,11 @@ async fn client(cmd: Cmd) -> anyhow::Result<()> {
             Ok(())
         }
         Cmd::Recover {
-            cmd:
-                Some(RecoverCmd::Start {
-                    code,
-                    key,
-                    identity,
-                }),
+            cmd: Some(RecoverCmd::Start { code, identity }),
         } => {
             let v = call(
                 &paths,
-                json!({"cmd": "recover-start", "code": code, "key": key, "identity": identity}),
+                json!({"cmd": "recover-start", "code": code, "identity": identity}),
             )
             .await?;
             if code.is_some() {
@@ -2543,32 +2489,12 @@ async fn client(cmd: Cmd) -> anyhow::Result<()> {
             Ok(())
         }
         Cmd::Recover {
-            cmd:
-                Some(RecoverCmd::Finish {
-                    host,
-                    key,
-                    without_hosts,
-                }),
+            cmd: Some(RecoverCmd::Finish),
         } => {
-            let v = call(
-                &paths,
-                json!({"cmd": "recover-finish", "at": host, "key": key, "without_hosts": without_hosts}),
-            )
-            .await?;
-            match v["at"].as_str() {
-                Some(at) => {
-                    println!("Recovered, through {at}. Your files are coming back.");
-                    println!(
-                        "What your lost devices wrote is set aside: once it has arrived, keep what"
-                    );
-                    println!("you recognize with `cardinal keep-work DEVICE`.");
-                }
-                None => {
-                    println!("Recovered, from what your guardians hold. No host of yours could");
-                    println!("bring your files back, so this device starts with empty ones.");
-                }
-            }
-            print_kept(&v);
+            let v = call(&paths, json!({"cmd": "recover-finish"})).await?;
+            println!("Recovered, from what your guardians hold. This device starts with empty");
+            println!("files: nothing of your old ones comes back this way yet.");
+            print_pair_again(&v);
             println!();
             println!("Your new recovery words. Write them down, in order, and keep them safe:");
             println!("the old ones no longer work.");

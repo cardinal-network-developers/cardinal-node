@@ -28,6 +28,13 @@ pub struct Helper {
     /// Its service.
     pub d: Arc<Daemon>,
     thread: std::sync::Mutex<Option<std::thread::JoinHandle<()>>>,
+    /// The identity entries carried into each relationship by this run, so
+    /// that each is looked at once (`recovering.rs`).
+    pub carried: std::sync::Mutex<
+        std::collections::HashMap<cardinal_space::SpaceId, std::collections::HashSet<[u8; 32]>>,
+    >,
+    /// The helper's change count when the new device last carried.
+    pub seen: std::sync::atomic::AtomicU64,
 }
 
 impl Helper {
@@ -148,6 +155,8 @@ pub async fn start(main: &Arc<Daemon>) -> anyhow::Result<Arc<Helper>> {
     let h = Arc::new(Helper {
         d,
         thread: std::sync::Mutex::new(Some(thread)),
+        carried: Default::default(),
+        seen: std::sync::atomic::AtomicU64::new(u64::MAX),
     });
     *main.helper.lock().unwrap_or_else(|e| e.into_inner()) = Some(h.clone());
     tracing::info!(

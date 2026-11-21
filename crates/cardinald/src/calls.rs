@@ -1763,7 +1763,8 @@ pub async fn serve(d: &Arc<Daemon>, s: &Session, mut st: Stream, v: Value) -> an
     let found = contacts
         .iter()
         .find(|c| c.identity == them && c.space == space);
-    let Some(contact) = found.filter(|c| !c.refused) else {
+    // a recovery's relationship is for the recovery alone (`guardians.rs`)
+    let Some(contact) = found.filter(|c| !c.refused && c.recovery_of.is_none()) else {
         st.reset(0);
         return Ok(());
     };
