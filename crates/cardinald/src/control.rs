@@ -558,7 +558,8 @@ async fn handle(d: &Arc<Daemon>, req: &Value) -> anyhow::Result<Value> {
         "guardians-ask" => crate::guardians::ask(d, arg(req, "who")?),
         "guarding-confirm-change" => {
             let understood = req.get("understood").and_then(Value::as_bool) == Some(true);
-            crate::guardians::confirm_change(d, arg(req, "who")?, understood).await
+            let fp = req.get("fingerprint").and_then(Value::as_str);
+            crate::guardians::confirm_change(d, arg(req, "who")?, fp, understood).await
         }
         "guarding-never" => crate::guardians::never(d, arg(req, "who")?, arg(req, "fingerprint")?),
         "guarding-caution" => crate::guardians::caution_for(d, arg(req, "who")?),

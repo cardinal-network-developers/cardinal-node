@@ -404,7 +404,12 @@ letters a word suffice). The person: `guardians` → `{guardians,
 threshold, delay, delay_text, data, names, recoveries: [{fingerprint,
 endorsed, confirmed, in_effect, objected, id}], frozen}`; `guardians-set`
 (`who`, `threshold`, `delay`; the words); `guardians-object`
-(`fingerprint`, needed only when more than one is under way).
+(`fingerprint`, needed only when more than one is under way), for a
+recovery or a change of guardians. `guardians` also gives `changes`, each
+change under way `{fingerprint, guardians, threshold, confirmed,
+objected, id}`, and `copy_full`, the guardians whose copy of the account
+reached its cap. `guardians-set` refuses while a change is under way that
+the person has not objected to.
 
 The person asks with `guardians-ask` (`who`) → `{name}`. A guardian acts
 through a persona per person guarded and per policy (D79), made by
@@ -420,8 +425,10 @@ person to guard them, unanswered; `accepted`, those this person accepted
 to guard who have not named them yet; `changes`, each change of the
 person's guardians under way, `{id, guardians, threshold, delay_text,
 confirmed, confirmed_by_me, in_effect, objected, confirm_from_ms,
-caution}`, which `guarding-confirm-change` (`who`, `understood`)
-confirms, after the wait from when this device saw it; `account_copy`, whether this device holds the
+caution, fingerprint, never}`, which `guarding-confirm-change` (`who`,
+`understood`, `fingerprint`: needed when more than one is under way)
+confirms, after the wait from when this device saw it; `guarding-never`
+takes a change's fingerprint as well as a recovery's; `account_copy`, whether this device holds the
 person's sealed account (D80). `recoveries` holds at most one: the one recovery of
 that person shown at a time, `{fingerprint, endorsed, confirmed,
 endorsed_by_me, confirmed_by_me, pending, confirm_from_ms, objected,
@@ -451,8 +458,8 @@ the relationship is listed nowhere as a contact (`contacts`,
 
 The new device: `recover` → `{under_way: true, identity, fingerprint,
 helper, guardians, proposed, asked, endorsed, confirmed, threshold,
-in_effect, held}` while one is under way (`held`: how many sets the
-guardians gave back so far, the account among them); `{under_way: false, finished: true,
+in_effect, held}` while one is under way (`held`: 1 once the account is
+among what the guardians gave back); `{under_way: false, finished: true,
 words, pair_again}` once, when `recover-finish` made the device the
 person's but stopped before the end (show the words; the next `recover`
 no longer has them); else `{under_way: false, pair_again}`. A recovery

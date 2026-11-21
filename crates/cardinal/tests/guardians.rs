@@ -659,6 +659,7 @@ fn guardians_change_with_the_guardians_consent() {
         out(&o)
     );
     ask_and_accept(&ana, &[&bo, &di]);
+    hold_account(&ana, &[&bo, &cy]);
     // No words: the guardians in office decide.
     let o = name_accepted(&ana, "", &["bo", "di", "--delay", "4s"]);
     assert!(
@@ -666,19 +667,58 @@ fn guardians_change_with_the_guardians_consent() {
         "{}",
         out(&o)
     );
+    // Ana sees it under way, with its fingerprint, and makes no other
+    // meanwhile.
+    let shown = ana.cli(&["guardians"]);
+    let fp: String = shown
+        .lines()
+        .find_map(|l| {
+            let rest = l.strip_prefix("A change of your guardians is under way (fingerprint \"")?;
+            Some(rest.split('"').next()?.to_owned())
+        })
+        .unwrap_or_else(|| panic!("no change shown in {shown}"));
+    let o = name_guardians(&ana, "", &["bo", "di"]);
+    assert!(
+        !o.status.success() && out(&o).contains("is under way"),
+        "{}",
+        out(&o)
+    );
     for g in [&bo, &cy] {
         wait("the guardian sees the change", 30, || {
-            g.cli(&["guarding"]).contains("change of guardians")
+            g.cli(&["guarding"])
+                .contains(&format!("change of guardians \"{fp}\""))
         });
     }
-    // after the wait, from when each saw it
-    for g in [&bo, &cy] {
-        wait("the guardian confirms", 60, || {
-            g.try_cli(&["guarding", "confirm-change", "Ana", "--yes"])
-                .status
-                .success()
-        });
-    }
+    // after the wait, from when each saw it: bo by the fingerprint ana read
+    // him, cy with the one under way; a wrong one is refused
+    wait("bo confirms", 60, || {
+        let mut a = vec!["guarding", "confirm-change", "Ana"];
+        a.extend(fp.split(' '));
+        a.push("--yes");
+        bo.try_cli(&a).status.success()
+    });
+    let wrong = [
+        "guarding",
+        "confirm-change",
+        "Ana",
+        "abandon",
+        "ability",
+        "able",
+        "about",
+        "above",
+        "--yes",
+    ];
+    let o = cy.try_cli(&wrong);
+    assert!(
+        !o.status.success() && out(&o).contains("not the fingerprint"),
+        "{}",
+        out(&o)
+    );
+    wait("cy confirms", 60, || {
+        cy.try_cli(&["guarding", "confirm-change", "Ana", "--yes"])
+            .status
+            .success()
+    });
     wait("the change is in effect", 60, || {
         di.cli(&["guarding"]).contains("Ana: one of 2 guardians")
     });
@@ -692,8 +732,15 @@ fn guardians_change_with_the_guardians_consent() {
     wait("cy guards nobody", 30, || {
         cy.cli(&["guarding"]).contains("You guard nobody")
     });
-    // Di holds the account now; cy may no longer fetch it.
+    // Di holds the account now; cy may no longer fetch it; bo, named
+    // again, keeps the copy his burned persona held.
     hold_account(&ana, &[&di]);
+    wait("bo's old persona is burned too", 60, || {
+        bo.log().contains("burned persona")
+    });
+    assert!(bo
+        .cli(&["guarding"])
+        .contains("sealed copy of their account"));
 }
 
 /// A new device lost before the recovery is in effect is started over on
@@ -723,6 +770,7 @@ fn a_second_recovery_is_warned_of_and_starting_over_works() {
             g.cli(&["guarding"]).contains("Ana: one of 2 guardians")
         });
     }
+    hold_account(&laptop, &[&bo, &cy]);
     laptop.stop();
     drop(laptop);
 
@@ -779,20 +827,11 @@ fn a_second_recovery_is_warned_of_and_starting_over_works() {
         );
     }
     endorse_and_confirm(&[&bo, &cy], &fp);
-    // No guardian holds her account here: finish says so, and goes on
-    // only when told to.
-    wait("the second device recovers", 60, || {
+    // The second device's helper is given the account as the first one's
+    // was, by each guardian it met.
+    wait("the second device recovers, its account back", 60, || {
         let o = second.try_cli(&["recover", "finish"]);
-        if o.status.success() {
-            return true;
-        }
-        if out(&o).contains("not given back your account") {
-            return second
-                .try_cli(&["recover", "finish", "--without-account"])
-                .status
-                .success();
-        }
-        false
+        o.status.success() && out(&o).contains("your account, contacts")
     });
     // The old one can never take effect now.
     let o = guarding(&cy, "confirm", &old);

@@ -457,7 +457,10 @@ pub fn status(d: &Arc<Daemon>) -> anyhow::Result<Json> {
     if d.core().identity.is_some() {
         // what the guardians gave back is taken up first: the helper's store
         // goes only after
-        complete_install(d, &u)?;
+        // the words are shown whatever happens here
+        if let Err(e) = complete_install(d, &u) {
+            tracing::warn!("taking up what the guardians gave back: {e:#}");
+        }
         let _ = std::fs::remove_file(d.paths.recovering());
         let d2 = d.clone();
         tokio::spawn(async move {
@@ -475,10 +478,7 @@ pub fn status(d: &Arc<Daemon>) -> anyhow::Result<Json> {
     let h = d.helper.lock().unwrap_or_else(|e| e.into_inner()).clone();
     let s = standing(h.as_ref(), &u).map(|(s, _)| s);
     let held = match (h.as_ref(), identity_of(&u)) {
-        (Some(h), Some(who)) => copies(h, &who)
-            .iter()
-            .filter(|(_, e)| !e.is_empty())
-            .count(),
+        (Some(h), Some(who)) => usize::from(account_back(&h.d.core(), &who)),
         _ => 0,
     };
     Ok(json!({
@@ -659,8 +659,12 @@ pub async fn finish(
     );
     // Without the account the person starts with an empty one, for good:
     // only on their word.
+    let back = account_back(
+        &h.as_ref().expect("running").d.core(),
+        &identity_of(&u).expect("checked"),
+    );
     anyhow::ensure!(
-        without_account || given.iter().any(|(_, e)| !e.is_empty()),
+        without_account || back,
         "your guardians have not given back your account yet: it comes once one of them and \
          this device are in touch. Try again in a moment. If none of them holds it, go on \
          without it, and start with an empty account: `cardinal recover finish \
@@ -840,6 +844,26 @@ async fn last_carry(d: &Arc<Daemon>) {
 /// label, with every sealed entry of each.
 fn copies(h: &Helper, who: &EntryId) -> Vec<([u8; 32], Vec<Vec<u8>>)> {
     copies_in(&h.d.core(), who)
+}
+
+/// The sets the guardians' personas name as the account: the one a new
+/// device must have back.
+fn account_labels(core: &crate::core::Core, who: &EntryId) -> Vec<[u8; 32]> {
+    core.contacts()
+        .into_iter()
+        .filter(|c| c.recovery_of == Some(*who))
+        .filter_map(|c| {
+            let sp = core.spaces.get(&c.space)?.space.as_ref()?;
+            relationship::held_account(sp, &c.identity)
+        })
+        .collect()
+}
+
+/// Whether the account is among what the guardians gave back.
+fn account_back(core: &crate::core::Core, who: &EntryId) -> bool {
+    account_labels(core, who)
+        .iter()
+        .any(|l| core.set(l).iter().next().is_some())
 }
 
 /// [`copies`], from a helper's core, running or not.

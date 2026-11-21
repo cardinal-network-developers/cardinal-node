@@ -1999,7 +1999,7 @@ impl Core {
     }
 
     /// Whether a copy held for someone grew past [`HELD_CAP`].
-    fn held_full(&self, label: &[u8; 32]) -> bool {
+    pub fn held_full(&self, label: &[u8; 32]) -> bool {
         let file = Holder::dir(&self.paths, label).join("entries.log");
         std::fs::metadata(file).is_ok_and(|m| m.len() > HELD_CAP)
     }
@@ -2007,6 +2007,11 @@ impl Core {
     /// The sets `who` gives this person to hold, which it takes: a person's
     /// account, where this person guards them through a persona; what a
     /// guardian's persona gives, on a recovery helper.
+    /// The sets `who` names for this person to hold, past the cap or not.
+    pub fn held_named_by(&self, who: &[u8; 32]) -> Vec<[u8; 32]> {
+        self.held_nodes(who).1
+    }
+
     pub fn held_taken(&self, who: &[u8; 32]) -> Vec<[u8; 32]> {
         let contact = self.contacts().into_iter().find(|c| c.identity == *who);
         let takes = contact.is_some_and(|c| {

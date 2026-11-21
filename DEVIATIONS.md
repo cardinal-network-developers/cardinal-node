@@ -406,25 +406,44 @@ differs or was read:
 - **Reading: changing guardians.** `cardinal guardians set` under a
   policy naming guardians writes a `set_recovery` signed by this device's
   key, naming fresh personas (each guardian, asked again, accepts with a
-  persona no policy of this person's named: the person's devices keep
-  which contact each policy named in an account setting, `"guardians:
-  named "` and the policy's id, `contact:persona,...`). The guardians in
-  office confirm it with `cardinal guarding confirm-change NAME`, after the
-  policy's delay from when their device first saw it (doubled after an
-  objection), and with no share. Once it is in effect the person's devices
-  mark the new guardians, give them the account, take it back from the
-  others (deleting their held copy node), and set a fresh encryption key
-  wrapped to the new guardian key (`"guardians: applied "` notes it); the
+  persona not named by a policy of this person's that is in effect or still
+  under way; one named only by a change given up serves again). Which
+  contact each policy named is kept in an account setting, `"guardians:
+  named "` and the policy's id, `contact:persona,...`, written before the
+  `set_recovery` itself. One change at a time: `set` refuses while a change
+  is under way that the person has not objected to; an `object` on a
+  change is how the person tells their guardians it is given up. The
+  person's `cardinal guardians` shows each change under way with a
+  **five-word fingerprint** (this implementation's: BIP-39 words from
+  `BLAKE3("cardinal change fingerprint" || entry id || commitments)`, the
+  spec has one for `recover` only), and `cardinal guardians object FP`
+  objects to it. Only well-formed changes signed by a key in effect are
+  shown or counted, eight at most. The guardians in office confirm with
+  `cardinal guarding confirm-change NAME [FINGERPRINT]` (needed when more
+  than one is under way), after the policy's delay from when their device
+  first saw it (doubled after an objection), with no share; `cardinal
+  guarding never NAME FP` works on changes too. Once it is in effect an
+  admin device of the person's sets a fresh encryption key wrapped to the
+  new guardian key, unless one valid already descends from the new policy,
+  marks the new guardians (those named whose relationship holds the
+  persona they gave), gives them the account, takes it back from the
+  others (deleting their held copy node), and only then notes it done
+  (`"guardians: applied "`); each step is done again harmlessly after a
+  stop. The first guardians go through the same steps at once. The
   personas the new policy no longer names are burned. The same serves for
   the new root's first `set_recovery` after a recovery: the personas that
-  acted are not burned until a policy no longer names them (or 30 days
-  after the recovery took effect and the new device took it up), since
-  "the guardians who just acted confirm it". **Reading of the chain
-  rule:** a guardian confirms no decision under a policy unless every
-  decision it confirmed under it is in the new one's past; the "dead"
-  part, which lets a guardian move on from a split vote between two
-  changes, is not built, so such a guardian waits. **Not built:** a change
-  back to naming no guardians, and the alerts.
+  acted are never burned while the policy naming them is the current one,
+  since "the guardians who just acted confirm it", and `finish` asks the
+  person to name guardians again. **Reading of the chain rule:** a
+  guardian confirms no decision under a policy unless every decision it
+  confirmed under it is in the new one's past, and once it confirmed a
+  change not in effect it confirms no other change under that policy; the
+  "dead" part, which lets a guardian move on from a split vote, is not
+  built. So a guardian who confirmed a change that stalls (given up, or
+  short of its threshold) can confirm no recovery that does not descend
+  from it either, and guardians' proposals leave changes not in effect out
+  of a recovery's parents: such a guardian sits the recovery out. **Not
+  built:** a change back to naming no guardians, and the alerts.
 - **Reading: asking someone to be a guardian.** `cardinal guardians ask
   NAME` writes a guardian request in the relationship (kind 67, this
   implementation's); `cardinal guarding` shows it until a guardian persona
@@ -473,20 +492,21 @@ differs or was read:
   with no guardian persona node for this person ("has not accepted"). The
   person is asked out of band. `cardinal guarding` lists those accepted
   but not named yet.
-- **Reading: burning a persona (and see changing guardians, above).** "Burned once a recovery it acted in is
-  in effect": once such a recovery is in effect **and** the new device has
-  taken it up (the person's log shows a valid entry by the new root other
-  than the `recover`, which the helper carries to the guardians before it
-  goes), or 30 days after this device saw it in effect; burning at once
-  could take away the last confirmation, and its share, before the new
-  device got it. "When the policy no longer names it": only when the
-  current policy descends from one that named it (this device remembers
-  which, `persona:policy`, in `guarding.json`) and does not, never from a
-  record that failed to open for another reason. Burning writes `leave`
-  in the persona's recovery relationships, sets account persona field 5,
-  stops the service and removes its directory, and drops the copies held
-  for the person. `cardinal guarding accept` repairs a relationship that
-  lacks the persona's node (a crash between the two writes).
+- **Reading: burning a persona (and see changing guardians, above).**
+  "Burned once a recovery it acted in is in effect, and when a change of
+  policy no longer names it": a persona is burned once the person's
+  current policy no longer names it, and that policy descends from one
+  that did (this device remembers which, `persona:policy`, in
+  `guarding.json`), never from a record that failed to open for another
+  reason. A persona that acted in a recovery stays while the policy
+  naming it is current, to confirm the change that follows; after that,
+  30 days after the recovery took effect and the new device took it up
+  (the new root wrote again), it is burned in any case. Burning reads what
+  is held for the person first, writes `leave` in the persona's recovery
+  relationships, sets account persona field 5, stops the service and
+  removes its directory, and drops the copies held for the person, unless
+  another persona of this person's still guards them. `cardinal guarding
+  accept` repairs a relationship that lacks the persona's node.
 - **Reading: how a relationship is marked "recovery for" the person.**
   The spec says guardian software shows it so, never as a contact, but
   gives the account's contact node no field for it. Chose: contact field
@@ -573,9 +593,14 @@ differs or was read:
   naming more gets nothing more), at most 64 MiB of it; a helper takes at
   most two from each persona, the account and that guardian's
   relationship. A person's devices give the account only to contacts the
-  account marks as guardians now. Chunks are left out. The persona's
-  service is given fresh copies only while it has helpers, and only when a
-  set grew. In a recovery the persona's service is
+  account marks as guardians now. Chunks are left out. A guardian whose
+  copy reaches the cap says so once in the relationship (a held copy full
+  node, kind 68, this implementation's), and the person's `cardinal
+  guardians` names them. The persona's service is given fresh copies only
+  while it has helpers, and only when a set changed since it was last
+  given to each helper relationship; every helper is told of every set
+  (the account's held copy node marked so, field 2), and `finish` checks
+  that set came back, not merely some set. In a recovery the persona's service is
   given copies of the sealed account and of the relationship space the
   guardian shares with the person, names both in held copy nodes in each
   helper's relationship, and lets the helper fetch them; the helper takes

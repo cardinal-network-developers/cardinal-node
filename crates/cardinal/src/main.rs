@@ -712,6 +712,9 @@ enum GuardingCmd {
     ConfirmChange {
         /// Whom.
         who: String,
+        /// The change's fingerprint they read you: five words. Needed when
+        /// more than one is under way.
+        fingerprint: Vec<String>,
         /// Do not ask again: you have read the warning.
         #[arg(long)]
         yes: bool,
@@ -866,6 +869,27 @@ fn print_guardians(v: &Value) {
             println!("Guardians: {}", names.join(", "));
         }
     }
+    for n in v["copy_full"].as_array().into_iter().flatten() {
+        println!(
+            "{} holds as much of your account as a guardian takes: their copy no longer updates.",
+            n.as_str().unwrap_or("")
+        );
+    }
+    for c in v["changes"].as_array().into_iter().flatten() {
+        let fp = c["fingerprint"].as_str().unwrap_or("");
+        println!(
+            "A change of your guardians is under way (fingerprint \"{fp}\"): {} of them, {} \
+             confirmed{}. If it is not yours, or you gave it up, run `cardinal guardians \
+             object {fp}`.",
+            c["guardians"],
+            c["confirmed"],
+            if c["objected"] == true {
+                "; you objected"
+            } else {
+                ""
+            }
+        );
+    }
     for r in v["recoveries"].as_array().into_iter().flatten() {
         let fp = r["fingerprint"].as_str().unwrap_or("");
         if r["in_effect"] == true {
@@ -1005,8 +1029,8 @@ fn print_guarding(v: &Value) {
                 }
             };
             println!(
-                "  change of guardians {} ({} of {}, after {}): {state}",
-                ch["id"].as_str().unwrap_or(""),
+                "  change of guardians \"{}\" ({} of {}, after {}): {state}",
+                ch["fingerprint"].as_str().unwrap_or(""),
                 ch["threshold"],
                 ch["guardians"],
                 ch["delay_text"].as_str().unwrap_or("")
@@ -2575,7 +2599,12 @@ async fn client(cmd: Cmd) -> anyhow::Result<()> {
             Ok(())
         }
         Cmd::Guarding {
-            cmd: Some(GuardingCmd::ConfirmChange { who, yes }),
+            cmd:
+                Some(GuardingCmd::ConfirmChange {
+                    who,
+                    fingerprint,
+                    yes,
+                }),
         } => {
             if !yes {
                 println!(
@@ -2587,7 +2616,8 @@ async fn client(cmd: Cmd) -> anyhow::Result<()> {
             }
             let v = call(
                 &paths,
-                json!({"cmd": "guarding-confirm-change", "who": who, "understood": true}),
+                json!({"cmd": "guarding-confirm-change", "who": who, "understood": true,
+                    "fingerprint": (!fingerprint.is_empty()).then(|| typed_fingerprint(&fingerprint))}),
             )
             .await?;
             println!("Confirmed the change.");
@@ -2766,6 +2796,12 @@ async fn client(cmd: Cmd) -> anyhow::Result<()> {
                 }
                 println!("The time is each device's own clock, which a thief can set.");
             }
+            println!();
+            println!("Name your guardians again: ask each (`cardinal guardians ask NAME`), then");
+            println!(
+                "`cardinal guardians set`. Those who just acted keep the role until then, and"
+            );
+            println!("confirm the change.");
             println!();
             println!("Your new recovery words. Write them down, in order, and keep them safe:");
             println!("the old ones no longer work.");
