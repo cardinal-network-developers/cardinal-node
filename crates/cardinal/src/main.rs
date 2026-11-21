@@ -601,13 +601,30 @@ enum GroupCmd {
         #[arg(long = "as")]
         shown: Option<String>,
     },
-    /// Take someone out of a group you own. Not done yet: it means
-    /// replacing the group with one that leaves them out.
+    /// Take someone out of a group you own: the group is replaced by one
+    /// that leaves them out, and everyone else's devices move to it.
     Remove {
         /// The group, by name or id.
         group: String,
         /// Who, as the group's members show them.
         who: String,
+    },
+    /// Give someone in a group a role: reader, member or admin. A higher
+    /// one is given by an admin; a lower one replaces the group with one
+    /// that names them with it, and only its owner does that.
+    Role {
+        /// The group, by name or id.
+        group: String,
+        /// Who, as the group's members show them.
+        who: String,
+        /// reader, member or admin.
+        role: String,
+    },
+    /// Post in a group what you wrote before it moved on and was held
+    /// back, because someone is there now it was written without.
+    PostAgain {
+        /// The group, by name or id.
+        group: String,
     },
     /// Who is in a group.
     Members {
@@ -3277,6 +3294,12 @@ async fn client(cmd: Cmd) -> anyhow::Result<()> {
                 }
                 GroupCmd::Remove { group, who } => {
                     json!({"cmd": "group-remove", "group": group, "who": who})
+                }
+                GroupCmd::Role { group, who, role } => {
+                    json!({"cmd": "group-role", "group": group, "who": who, "role": role})
+                }
+                GroupCmd::PostAgain { group } => {
+                    json!({"cmd": "group-post-again", "group": group})
                 }
                 GroupCmd::Members { group } => json!({"cmd": "group-members", "group": group}),
                 GroupCmd::Say { group, text } => {

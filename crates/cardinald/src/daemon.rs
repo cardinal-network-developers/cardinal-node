@@ -1219,6 +1219,8 @@ impl Daemon {
             crate::guardians::observe(self);
             // and when their policy was first seen here, for the date shown
             crate::contacts::note_policies(self, &identity);
+            // and a succession judged with this log may be checked now
+            crate::following::follow(self);
             self.directory.update(own.as_deref(), &states);
             self.endpoint.recheck_peers();
             return Ok(Ingested {
@@ -1269,6 +1271,8 @@ impl Daemon {
             crate::mailbox::revoke_left(self, &label);
             // a copy given this person to hold may be named in it (D80)
             crate::guardians::held_named(self, &label);
+            // it may have ended, or brought what stands in its place
+            crate::following::follow(self);
             self.bump();
             self.housekeeping();
         }
@@ -2100,6 +2104,9 @@ impl Daemon {
                  or `cardinal pair` (to add it to your other devices)"
             );
         }
+        // what stopped half way: a successor not followed yet, work not
+        // posted again yet
+        crate::following::follow(&self);
         // accept sessions
         let d = self.clone();
         tokio::spawn(async move {

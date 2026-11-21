@@ -2,7 +2,9 @@
 //! but not each other. Each is offered it through the relationship they have
 //! with her, joins, and reads what the others write, Bo and Cy through Ana,
 //! who passes it on. Nobody is taken out of it in place. Cy leaves, reads
-//! nothing written after, and is back when added again.
+//! nothing written after, and is back when added again. Ana takes Cy out:
+//! the group is replaced by one without him, which the others' devices
+//! follow, Bo's when he is back from being away.
 
 mod common;
 
@@ -162,9 +164,8 @@ fn a_group_is_offered_joined_and_read_by_all() {
     names.sort_unstable();
     assert_eq!(names, ["Ana", "Bo", "You"], "{members}");
 
-    // Nobody is taken out of a group in place. That is its owner replacing
-    // it with one that leaves them out, which this version cannot do yet: so
-    // the command says so, to anyone and to the owner, and changes nothing.
+    // Nobody but the owner takes anyone out, and that is replacing the
+    // group (`taking_someone_out_replaces_the_group_for_everyone_else`).
     let no = reply(
         &bo,
         &json!({"cmd": "group-remove", "group": g, "who": "Ana"}),
@@ -175,15 +176,10 @@ fn a_group_is_offered_joined_and_read_by_all() {
         "{no}"
     );
     let no = reply(
-        &ana,
-        &json!({"cmd": "group-remove", "group": g, "who": "Cy"}),
+        &bo,
+        &json!({"cmd": "group-role", "group": g, "who": "Cy", "role": "admin"}),
     );
     assert_eq!(no["ok"], false, "{no}");
-    let why = no["error"].as_str().unwrap();
-    assert!(
-        why.contains("cannot be taken out") && why.contains("Cy"),
-        "{no}"
-    );
     ask(
         &bo,
         json!({"cmd": "say", "group": g, "text": "still all of us"}),
@@ -1015,5 +1011,158 @@ fn a_token_ends_when_its_space_no_longer_names_the_host() {
     ask(&bo, json!({"cmd": "group-leave", "group": g}));
     wait("the token ends with the leave", 10, || {
         active_tokens(&bo) == without
+    });
+}
+
+/// The id of the group called `name` that `d` lists, if it lists one.
+fn listed(d: &Dev, name: &str) -> Option<Value> {
+    groups(d).into_iter().find(|x| x["name"] == name)
+}
+
+#[test]
+fn taking_someone_out_replaces_the_group_for_everyone_else() {
+    let root = tempfile::tempdir().unwrap();
+    let ana = person(root.path(), "ana");
+    let mut bo = person(root.path(), "bo");
+    let cy = person(root.path(), "cy");
+    meet(&ana, &bo, "Bo");
+    meet(&ana, &cy, "Cy");
+    let made = ask(
+        &ana,
+        json!({"cmd": "group-create", "name": "Family", "people": ["Bo", "Cy"]}),
+    );
+    let g = made["group"].as_str().unwrap().to_owned();
+    for d in [&bo, &cy] {
+        wait("the offer arrives", 30, || {
+            offers(d).iter().any(|o| o["name"] == "Family")
+        });
+        ask(d, json!({"cmd": "group-join", "group": g}));
+    }
+    ask(&ana, json!({"cmd": "say", "group": g, "text": "hello all"}));
+    // Cy sends a file, which Ana keeps.
+    let photo = root.path().join("photo.bin");
+    std::fs::write(&photo, vec![9u8; 200_000]).unwrap();
+    ask(
+        &cy,
+        json!({"cmd": "say", "group": g, "text": "a photo", "attach": [photo]}),
+    );
+    for d in [&ana, &bo] {
+        wait("cy's photo arrives", 30, || {
+            said(d, &g).contains(&"Cy: a photo".to_owned())
+        });
+    }
+    // Ana makes Bo an admin, which is given in place.
+    ask(
+        &ana,
+        json!({"cmd": "group-role", "group": g, "who": "Bo", "role": "admin"}),
+    );
+    let role = |d: &Dev, group: &str, who: &str| -> String {
+        let m = ask(d, json!({"cmd": "group-members", "group": group}));
+        let all = m["members"].as_array().unwrap().clone();
+        let found = all.iter().find(|m| m["name"] == who);
+        found.map_or(String::new(), |m| m["role"].as_str().unwrap().to_owned())
+    };
+    wait("bo is an admin", 30, || role(&bo, &g, "You") == "admin");
+
+    // Bo is away. Ana takes Cy out.
+    bo.stop();
+    let out = ask(
+        &ana,
+        json!({"cmd": "group-remove", "group": g, "who": "Cy"}),
+    );
+    let g2 = out["group"].as_str().unwrap().to_owned();
+    assert_ne!(g2, g);
+    assert_eq!(out["was"], g.as_str());
+    // Hers lists the one group, under its new id, with all that was said.
+    let mine = listed(&ana, "Family").unwrap();
+    assert_eq!(mine["group"], g2.as_str());
+    assert_eq!(mine["was"], g.as_str());
+    assert_eq!(groups(&ana).len(), 1);
+    assert!(said(&ana, &g2).contains(&"You: hello all".to_owned()));
+    // and the old id finds it
+    assert!(said(&ana, &g).contains(&"Cy: a photo".to_owned()));
+    ask(
+        &ana,
+        json!({"cmd": "say", "group": g2, "text": "without cy"}),
+    );
+
+    // Cy is told, and writes nothing more there.
+    wait("cy is told he was left out", 30, || {
+        listed(&cy, "Family")
+            .is_some_and(|x| x["ended"].as_str().is_some_and(|w| w.contains("left out")))
+    });
+    let no = reply(&cy, &json!({"cmd": "say", "group": g, "text": "hello?"}));
+    assert_eq!(no["ok"], false, "{no}");
+
+    // Bo comes back, and his device follows on its own.
+    bo.start_with(&["--no-mount"]);
+    wait("bo follows", 60, || {
+        listed(&bo, "Family").is_some_and(|x| x["group"] == g2.as_str())
+    });
+    wait("bo reads what ana wrote meanwhile", 30, || {
+        said(&bo, &g2).contains(&"Ana: without cy".to_owned())
+    });
+    assert!(said(&bo, &g2).contains(&"Ana: hello all".to_owned()));
+    ask(&bo, json!({"cmd": "say", "group": g, "text": "just us"}));
+    wait("ana reads bo", 30, || {
+        said(&ana, &g2).contains(&"Bo: just us".to_owned())
+    });
+    // The photo came across, and Bo still gets it, from Ana.
+    let file_id = {
+        let r = ask(&bo, json!({"cmd": "messages", "group": g2}));
+        let all = r["messages"].as_array().unwrap().clone();
+        all.iter().find(|m| m["text"] == "a photo").unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_owned()
+    };
+    let kept = root.path().join("kept.bin");
+    wait("bo saves it", 30, || {
+        let r = reply(
+            &bo,
+            &json!({"cmd": "save-attachment", "group": g2, "id": file_id, "index": 0, "to": kept}),
+        );
+        r["ok"] == true
+    });
+    assert_eq!(std::fs::read(&kept).unwrap(), vec![9u8; 200_000]);
+    // Cy reads none of it.
+    std::thread::sleep(std::time::Duration::from_secs(3));
+    let theirs = said(&cy, &g);
+    assert!(
+        !theirs
+            .iter()
+            .any(|m| m.contains("without cy") || m.contains("just us")),
+        "{theirs:?}"
+    );
+
+    // Ana makes Bo an ordinary member again: another replacement.
+    let lowered = ask(
+        &ana,
+        json!({"cmd": "group-role", "group": g2, "who": "Bo", "role": "member"}),
+    );
+    let g3 = lowered["group"].as_str().unwrap().to_owned();
+    assert_ne!(g3, g2);
+    wait("bo follows again", 30, || {
+        listed(&bo, "Family").is_some_and(|x| x["group"] == g3.as_str())
+    });
+    assert_eq!(role(&bo, &g3, "You"), "member");
+    assert_eq!(role(&ana, &g, "Bo"), "member");
+    assert!(said(&bo, &g3).contains(&"You: just us".to_owned()));
+
+    // Someone added since holds none of the groups before: the group
+    // starts, for them, from what Ana put in its place.
+    let dan = person(root.path(), "dan");
+    meet(&ana, &dan, "Dan");
+    ask(
+        &ana,
+        json!({"cmd": "group-add", "group": g3, "people": ["Dan"]}),
+    );
+    wait("dan is offered it", 30, || {
+        offers(&dan).iter().any(|o| o["name"] == "Family")
+    });
+    ask(&dan, json!({"cmd": "group-join", "group": g3}));
+    wait("dan reads what was said before he came", 60, || {
+        let all = said(&dan, &g3);
+        all.contains(&"Ana: hello all".to_owned()) && all.contains(&"Bo: just us".to_owned())
     });
 }

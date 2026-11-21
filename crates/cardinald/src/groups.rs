@@ -3,9 +3,12 @@
 //! already have, and a conversation everyone in it reads.
 //!
 //! A group only grows. Its owner and its admins add people; nobody is taken
-//! out of it, and no role is lowered. Taking someone out is the owner
-//! succeeding the group with one that leaves them out, which this software
-//! cannot write or follow yet, so `group-remove` says so and does nothing.
+//! out of it in place, and no role is lowered in place. Taking someone out,
+//! or making an admin an ordinary member again, is the owner succeeding the
+//! group with one whose genesis says so (`spaces.md#succession`): everyone
+//! else's devices follow, and the group goes on under another id. A group
+//! is found by any id it has had: the old one names the group that stands
+//! in its place.
 //!
 //! Leaving is a member's own statement (`spaces.md#members-and-roles`). It
 //! changes nothing about what is valid. Whoever left stops using the group
@@ -40,6 +43,7 @@ fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 }
 
 /// A group this device holds, by its id, a prefix of it, or its name.
+#[derive(Clone)]
 struct Found {
     id: SpaceId,
     name: String,
@@ -57,6 +61,8 @@ fn find_among(d: &Daemon, group: &str, in_it: bool) -> anyhow::Result<Found> {
     let me = identity(d)?;
     let core = d.core();
     let mut all: Vec<Found> = Vec::new();
+    // what an id this group had before stands for
+    let mut was: Vec<(SpaceId, SpaceId)> = Vec::new();
     for (id, h) in &core.spaces {
         let Some(sp) = h.space.as_ref() else {
             continue;
@@ -66,6 +72,10 @@ fn find_among(d: &Daemon, group: &str, in_it: bool) -> anyhow::Result<Found> {
         if sp.profile() != group::GROUP || sp.has_left(&me) {
             continue;
         }
+        if core.is_superseded(id) {
+            was.push((*id, core.current(id)));
+            continue;
+        }
         all.push(Found {
             id: *id,
             name: group::name(sp),
@@ -73,6 +83,16 @@ fn find_among(d: &Daemon, group: &str, in_it: bool) -> anyhow::Result<Found> {
         });
     }
     all.retain(|g| g.joined || !in_it);
+    let start = group.to_ascii_lowercase();
+    if group.len() >= 8 {
+        let now = was
+            .iter()
+            .filter(|(old, _)| hex::encode(old).starts_with(&start));
+        let now: Vec<SpaceId> = now.map(|(_, now)| *now).collect();
+        if let Some(g) = now.first().and_then(|n| all.iter().find(|g| g.id == *n)) {
+            return Ok(g.clone());
+        }
+    }
     pick(all, group, &core.declined())
 }
 
@@ -102,7 +122,13 @@ fn pick(all: Vec<Found>, asked: &str, declined: &[SpaceId]) -> anyhow::Result<Fo
 /// A joined group, to write in.
 fn joined(d: &Daemon, group: &str) -> anyhow::Result<Found> {
     match find_among(d, group, true) {
-        Ok(g) => Ok(g),
+        Ok(g) => {
+            // one that ended and has nothing here in its place
+            if let (Some(why), _) = d.core().succession_news(&g.id) {
+                anyhow::bail!("{} has ended: {why}", g.name);
+            }
+            Ok(g)
+        }
         // say which it is: not there at all, or there and not joined
         Err(none) => match find(d, group) {
             Ok(g) => anyhow::bail!("you have not joined {}", g.name),
@@ -220,11 +246,34 @@ fn member_named(contacts: &[ContactRecord], sp: &Space, who: &str) -> anyhow::Re
     }
 }
 
-/// Taking someone out of a group. Nothing in a space removes a member: the
+/// The members a successor of a group names when it is to leave `out` out
+/// and give `lowered` the role with it: everyone else in it who has not
+/// left, each with the highest role they hold. Someone who left is not
+/// named: the next key is not theirs either (`spaces.md#members-and-roles`).
+fn staying(
+    sp: &Space,
+    out: Option<&[u8; 32]>,
+    lowered: Option<(&[u8; 32], u64)>,
+) -> Vec<([u8; 32], u64)> {
+    let mut named = Vec::new();
+    for m in group::members(sp) {
+        if Some(&m.identity) == out || m.left {
+            continue;
+        }
+        let role = match lowered {
+            Some((who, role)) if *who == m.identity => role,
+            _ => m.role,
+        };
+        named.push((m.identity, role));
+    }
+    named
+}
+
+/// Takes someone out of a group. Nothing in a space removes a member: the
 /// owner succeeds the group with one that leaves them out, and the others'
-/// devices follow (`profiles.md#group`). This software cannot write or
-/// follow a succession yet, so it says so, and changes nothing.
-pub fn remove(d: &Arc<Daemon>, group: &str, who: &str) -> anyhow::Result<Json> {
+/// devices follow (`profiles.md#group`). The group goes on under a new id;
+/// the old one still finds it here.
+pub async fn remove(d: &Arc<Daemon>, group: &str, who: &str) -> anyhow::Result<Json> {
     let g = joined(d, group)?;
     let me = identity(d)?;
     let (them, owner) = {
@@ -240,11 +289,83 @@ pub fn remove(d: &Arc<Daemon>, group: &str, who: &str) -> anyhow::Result<Json> {
         "only the owner of {} can take someone out of it",
         g.name
     );
-    anyhow::bail!(
-        "{who} cannot be taken out of {} yet: that is done by replacing the group with one \
-         that leaves them out, which this version cannot do",
+    let done = crate::following::succeed(d, &g.id, |sp| {
+        anyhow::ensure!(
+            sp.role_of(&them).is_some(),
+            "{who} is not in {} any more",
+            g.name
+        );
+        Ok(staying(sp, Some(&them), None))
+    })
+    .await?;
+    Ok(json!({
+        "group": hex::encode(done.new),
+        "was": hex::encode(g.id),
+        "left_out": done.left_out.iter().map(hex::encode).collect::<Vec<_>>(),
+    }))
+}
+
+/// The role a client names: `reader`, `member` (a writer), or `admin`.
+fn role_named(role: &str) -> anyhow::Result<u64> {
+    match role {
+        "reader" => Ok(group::READER),
+        "member" | "writer" => Ok(group::WRITER),
+        "admin" => Ok(group::ADMIN),
+        "owner" => anyhow::bail!("a group has one owner, whoever made it, for good"),
+        _ => anyhow::bail!("a role is reader, member or admin"),
+    }
+}
+
+/// Gives a member of a group a role. A higher one is given in place, by an
+/// admin or the owner, as an addition is: roles are only given. A lower one
+/// is the owner succeeding the group with one that names them with it
+/// (`profiles.md#group`, "Making an admin an ordinary member again").
+pub async fn set_role(d: &Arc<Daemon>, group: &str, who: &str, role: &str) -> anyhow::Result<Json> {
+    let role = role_named(role)?;
+    let g = joined(d, group)?;
+    let me = identity(d)?;
+    let (them, now, owner, mine) = {
+        let core = d.core();
+        let contacts = core.contacts();
+        let sp = core.spaces.get(&g.id).and_then(|h| h.space.as_ref());
+        let sp = sp.ok_or_else(|| anyhow::anyhow!("that group is not open yet"))?;
+        let them = member_named(&contacts, sp, who)?;
+        (them, sp.role_of(&them), sp.owner(), sp.role_of(&me))
+    };
+    anyhow::ensure!(them != me, "you cannot change your own role");
+    let now = now.ok_or_else(|| anyhow::anyhow!("{who} is not in {}", g.name))?;
+    if role == now {
+        return Ok(json!({"group": hex::encode(g.id)}));
+    }
+    if role > now {
+        anyhow::ensure!(
+            mine.is_some_and(|r| r >= group::ADMIN),
+            "only an admin of {} can give someone a role",
+            g.name
+        );
+        d.write_and_push(&g.id, vec![SpaceOp::add_member(them, role)])?;
+        d.bump();
+        return Ok(json!({"group": hex::encode(g.id)}));
+    }
+    anyhow::ensure!(
+        owner == Some(me),
+        "only the owner of {} can lower someone's role",
         g.name
-    )
+    );
+    let done = crate::following::succeed(d, &g.id, |sp| Ok(staying(sp, None, Some((&them, role)))))
+        .await?;
+    Ok(json!({"group": hex::encode(done.new), "was": hex::encode(g.id)}))
+}
+
+/// Posts again in a group what this device wrote before it moved on and
+/// held back, because someone is there it was written without: its person
+/// says to (`spaces.md#what-the-successor-does-not-carry`).
+pub fn post_again(d: &Arc<Daemon>, group: &str) -> anyhow::Result<Json> {
+    let g = joined(d, group)?;
+    let held = d.core().held_back(&g.id);
+    anyhow::ensure!(held > 0, "nothing of yours is held back from {}", g.name);
+    let n = crate::following::post_held_back(d, &g.id);
+    Ok(json!({"posted": n}))
 }
 
 /// Leaves a group: says so in it, and in the same entry sets this person's
@@ -513,7 +634,8 @@ pub fn list_of(core: &Core) -> Json {
         let Some(sp) = h.space.as_ref().filter(|s| s.profile() == group::GROUP) else {
             continue;
         };
-        if sp.has_left(&me) {
+        // Another stands in its place, and is listed instead.
+        if sp.has_left(&me) || core.is_superseded(id) {
             continue;
         }
         let members = group::members(sp);
@@ -547,7 +669,13 @@ pub fn list_of(core: &Core) -> Json {
             .count();
         let last = said.last().cloned();
         let when = last.as_ref().and_then(|m| m.time).map(|t| t.min(now_ms()));
+        let (ended, lost) = core.succession_news(id);
         let group = json!({
+            "ended": ended,
+            "did_not_stand": lost.iter().map(hex::encode).collect::<Vec<_>>(),
+            "held_back": core.held_back(id),
+            "not_posted": core.spaces.get(id).map_or(0, |h| h.notes().not_posted),
+            "was": sp.succeeds().map(hex::encode),
             "group": hex::encode(id),
             "name": name,
             "members": how_many,
@@ -669,7 +797,9 @@ fn message_in(d: &Daemon, space: &SpaceId, id: &str) -> anyhow::Result<relations
     let core = d.core();
     let sp = core.spaces.get(space).and_then(|h| h.space.as_ref());
     let sp = sp.ok_or_else(|| anyhow::anyhow!("that group is not open yet"))?;
-    let found = relationship::messages(sp).into_iter().find(|m| m.id == id);
+    // a message posted again has a new id, and the old one names it
+    let now = sp.state().now_called(&id).unwrap_or(id);
+    let found = relationship::messages(sp).into_iter().find(|m| m.id == now);
     found.ok_or_else(|| anyhow::anyhow!("there is no such message"))
 }
 

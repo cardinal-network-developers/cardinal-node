@@ -95,7 +95,7 @@ impl NodeKind {
         }
     }
 
-    fn from_value(v: &Value) -> Option<NodeKind> {
+    pub(crate) fn from_value(v: &Value) -> Option<NodeKind> {
         match Kind::from_value(v)? {
             Kind::Core(n) => Some(NodeKind::Uint(n)),
             Kind::Named(h) => Some(NodeKind::Named(h)),

@@ -10,7 +10,7 @@ use cardinal_identity::{EntryId, IdentityLog, IdentityState, KeyId};
 
 use crate::entry::{
     IdentityId, Policy, Profile, SealedEntry, SpaceEntry, SpaceEntryBuilder, SpaceId, SpaceOp,
-    SpaceOpBody, OWNER,
+    SpaceOpBody, Succession, OWNER,
 };
 use crate::epoch::{EpochId, EpochKey, Keyring};
 use crate::state::State;
@@ -58,6 +58,13 @@ pub struct Space {
     /// gives, without going through the whole history each time a host
     /// asks which tokens it gave here.
     reach_written: HashMap<IdentityId, Vec<crate::relationship::Reach>>,
+    /// What the genesis says of the space this one succeeds, if it
+    /// succeeds one (`spaces.md#the-successor`).
+    succession: Option<Succession>,
+    /// The state a successor starts from: the old space's state at the
+    /// cut, which its genesis names (`start` field 4). The state of this
+    /// space is computed on it.
+    initial: Option<Arc<State>>,
 }
 
 /// The cited head for a new entry by `device`: the last entry in log order
@@ -90,6 +97,32 @@ impl Space {
         Space::create_with(profile, policy, author, device, recipients, ops, time)
     }
 
+    /// Creates a successor of a space (`spaces.md#the-successor`): a
+    /// genesis whose `start` says where it comes from (`from`), starting
+    /// the epoch `epoch`, wrapped to each of `recipients`, with `ops` (the
+    /// `add_member` ops that name its members). Its state starts from
+    /// `initial`, the state at the cut, which `from` names by its blob
+    /// reference: the caller encodes it under `epoch`, so that the key
+    /// must be chosen first.
+    #[allow(clippy::too_many_arguments)]
+    pub fn create_successor(
+        profile: Profile,
+        policy: Policy,
+        from: &Succession,
+        epoch: EpochKey,
+        initial: State,
+        author: &IdentityLog,
+        device: &SigningKey,
+        recipients: &[&HybridPublicKey],
+        ops: Vec<SpaceOp>,
+        time: Option<u64>,
+    ) -> Result<(Space, SealedEntry), Error> {
+        let start = SpaceOp::start_with(profile, &policy, None, from);
+        let initial = Some(Arc::new(initial));
+        let made = (start, epoch, initial);
+        Space::create_full(made, policy, author, device, recipients, ops, time)
+    }
+
     /// Creates a space whose genesis entry holds `start` and then `ops`:
     /// the `add_member` ops that name its first members, its author among
     /// them (`spaces.md#members-and-roles`), and what it starts out with.
@@ -103,14 +136,26 @@ impl Space {
         ops: Vec<SpaceOp>,
         time: Option<u64>,
     ) -> Result<(Space, SealedEntry), Error> {
-        let epoch = EpochKey::generate();
+        let made = (SpaceOp::start(profile, &policy), EpochKey::generate(), None);
+        Space::create_full(made, policy, author, device, recipients, ops, time)
+    }
+
+    fn create_full(
+        (start, epoch, initial): (SpaceOp, EpochKey, Option<Arc<State>>),
+        policy: Policy,
+        author: &IdentityLog,
+        device: &SigningKey,
+        recipients: &[&HybridPublicKey],
+        ops: Vec<SpaceOp>,
+        time: Option<u64>,
+    ) -> Result<(Space, SealedEntry), Error> {
         let wraps: Vec<_> = recipients.iter().map(|r| epoch.wrap(r)).collect();
         let mut b = SpaceEntryBuilder::genesis(
             author.id(),
             author_head(author, &device.public_key()),
             epoch.id(),
         )
-        .op(SpaceOp::start(profile, &policy))
+        .op(start)
         .ops(ops)
         .wraps(&wraps);
         if let Some(t) = time {
@@ -120,7 +165,7 @@ impl Space {
         let sealed = SealedEntry::seal(&g, &epoch, Some(wraps), policy.public)?;
         let mut keyring = Keyring::new();
         keyring.add(epoch);
-        let mut space = Space::from_genesis(g, keyring, Some(author.state()))?;
+        let mut space = Space::from_genesis(g, keyring, Some(author.state()), initial)?;
         space.sealed.insert(space.id, sealed.clone());
         Ok((space, sealed))
     }
@@ -129,20 +174,32 @@ impl Space {
         g: SpaceEntry,
         keyring: Keyring,
         author: Option<Arc<IdentityState>>,
+        initial: Option<Arc<State>>,
     ) -> Result<Space, Error> {
         if !g.is_genesis() {
             return Err(Error::Malformed("not a genesis entry"));
         }
-        let (profile, policy) = g
+        let (profile, policy, succession) = g
             .ops()
             .iter()
             .find_map(|o| match o.body() {
                 SpaceOpBody::Start {
-                    profile, policy, ..
-                } => Some((*profile, policy.clone())),
+                    profile,
+                    policy,
+                    succession,
+                    ..
+                } => Some((*profile, policy.clone(), succession)),
                 _ => None,
             })
             .ok_or(Error::Malformed("genesis without start"))?;
+        let succession = succession
+            .succeeds
+            .is_some()
+            .then(|| (**succession).clone());
+        let state = match &initial {
+            Some(i) => State::compute_from(profile, Some(i), &Dag::new(), &HashSet::new()),
+            None => State::new(profile),
+        };
         let mut space = Space {
             id: g.id(),
             profile,
@@ -155,11 +212,13 @@ impl Space {
             resigned_ids: HashSet::new(),
             keyring,
             judge: Judge::new(),
-            state: State::new(profile),
+            state,
             valid_heads: BTreeSet::new(),
             current_epoch: None,
             stats: UpdateStats::default(),
             reach_written: HashMap::new(),
+            succession,
+            initial,
         };
         if let Some(a) = author {
             space.judge.set_state(&space.dag, a);
@@ -180,7 +239,7 @@ impl Space {
         let (g, key) = sealed.open(&Keyring::new(), identity_keys)?;
         let mut keyring = Keyring::new();
         keyring.add(key);
-        let mut space = Space::from_genesis(g, keyring, author)?;
+        let mut space = Space::from_genesis(g, keyring, author, None)?;
         space.open_key_belongs(sealed)?;
         space.sealed.insert(space.id, sealed.clone());
         Ok(space)
@@ -199,7 +258,7 @@ impl Space {
             .cloned()
             .ok_or(Error::NoEpochKey)?;
         let g = sealed.open_with(&key)?;
-        let mut space = Space::from_genesis(g, keyring, author)?;
+        let mut space = Space::from_genesis(g, keyring, author, None)?;
         space.open_key_belongs(sealed)?;
         space.sealed.insert(space.id, sealed.clone());
         Ok(space)
@@ -464,6 +523,103 @@ impl Space {
         self.judge.closes(&self.dag, &self.heads())
     }
 
+    /// What the genesis says of the space this one succeeds, if it
+    /// succeeds one: fields 3, 4 and 6 to 9 of its `start`.
+    pub fn succession(&self) -> Option<&Succession> {
+        self.succession.as_ref()
+    }
+
+    /// The space this one succeeds, if any.
+    pub fn succeeds(&self) -> Option<SpaceId> {
+        self.succession.as_ref().and_then(|s| s.succeeds)
+    }
+
+    /// The state this space started from, if it is a successor.
+    pub fn initial_state(&self) -> Option<&State> {
+        self.initial.as_deref()
+    }
+
+    /// Starts the state from a successor's initial state, the old space's
+    /// state at the cut: everything held is applied on it again.
+    pub fn set_initial_state(&mut self, initial: State) {
+        self.initial = Some(Arc::new(initial));
+        self.start_over();
+    }
+
+    /// The valid entries that name `successor` in a `succeed`.
+    pub fn succeeds_naming(&self, successor: &SpaceId) -> Vec<EntryId> {
+        let names = |e: &SpaceEntry| {
+            e.ops().iter().any(
+                |o| matches!(o.body(), SpaceOpBody::Succeed { successor: s, .. } if s == successor),
+            )
+        };
+        let valid = &self.validity().valid;
+        let mut out: Vec<EntryId> = self
+            .dag
+            .iter()
+            .filter(|(id, e)| valid.contains(*id) && names(e))
+            .map(|(id, _)| *id)
+            .collect();
+        out.sort();
+        out
+    }
+
+    /// Every successor named in a valid `succeed`, whether it stands or
+    /// not, sorted.
+    pub fn successors_named(&self) -> Vec<SpaceId> {
+        let valid = &self.validity().valid;
+        let mut out: Vec<SpaceId> = Vec::new();
+        for (id, e) in self.dag.iter() {
+            if !valid.contains(id) {
+                continue;
+            }
+            for o in e.ops() {
+                if let SpaceOpBody::Succeed { successor, .. } = o.body() {
+                    out.push(*successor);
+                }
+            }
+        }
+        out.sort();
+        out.dedup();
+        out
+    }
+
+    /// The state at a cut (`spaces.md#the-successor`): the state of the
+    /// entries of `cut` and their causal past, and of nothing else here,
+    /// judged with `judged_with`, each identity's log as the successor's
+    /// genesis pins it. An author with no log among them is judged with
+    /// none, and none of its entries count. The reach node of every
+    /// identity but `named`, those the successor's genesis names, is left
+    /// out. It is the same on every device that holds the cut, whenever
+    /// it is worked out. Refused if an entry of the cut is not here.
+    pub fn state_at(
+        &self,
+        cut: &[EntryId],
+        judged_with: Vec<Arc<IdentityState>>,
+        named: &[IdentityId],
+    ) -> Result<State, Error> {
+        if cut.iter().any(|x| !self.dag.contains(x)) {
+            return Err(Error::NotAllowed("the cut is not all here"));
+        }
+        let mut past = self.dag.ancestors_of(cut);
+        past.extend(cut.iter().copied());
+        let g = self
+            .dag
+            .get(&self.id)
+            .ok_or(Error::NotAllowed("no genesis"))?;
+        let mut sub = Space::from_genesis(g.clone(), Keyring::new(), None, self.initial.clone())?;
+        for x in self.dag.log_order() {
+            if *x != self.id && past.contains(x) {
+                let e = self.dag.get(x).expect("held");
+                sub.insert_entry(e.clone());
+            }
+        }
+        sub.set_identities(judged_with);
+        let mut st = sub.state;
+        st.keep_reach_of(named);
+        Ok(st)
+    }
+
     /// The judge, for what it found beyond [`validity`](Self::validity).
     pub fn judge(&self) -> &Judge {
         &self.judge
@@ -623,7 +779,8 @@ impl Space {
 
     fn recompute_state(&mut self) {
         self.stats.recomputed += 1;
-        self.state = State::compute(self.profile, &self.dag, &self.validity().valid);
+        let initial = self.initial.as_deref();
+        self.state = State::compute_from(self.profile, initial, &self.dag, &self.validity().valid);
         self.current_epoch = self.compute_epoch();
     }
 

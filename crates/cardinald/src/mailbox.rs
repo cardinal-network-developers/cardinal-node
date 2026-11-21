@@ -1747,11 +1747,7 @@ async fn take_in(d: &Arc<Daemon>, held: &Held) -> Taken {
     let Some(epoch) = epoch_of(&held.envelope) else {
         return Taken::Done;
     };
-    let found = {
-        let core = d.core();
-        let space = core.space_of_token(&held.token);
-        space.map(|space| (space, core.envelope_key_of(&space, &epoch)))
-    };
+    let found = d.core().envelope_space(&held.token, &epoch);
     // The space itself may be on its way here from another of the owner's
     // devices.
     let Some((space, key)) = found else {

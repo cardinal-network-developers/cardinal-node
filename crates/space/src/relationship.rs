@@ -543,12 +543,27 @@ pub fn read_marker(space: &Space, who: &IdentityId) -> Option<NodeId> {
 /// changes nothing, and two devices moving one marker apart add up.
 pub fn read_by(space: &Space, who: &IdentityId, messages: &[Message]) -> Vec<bool> {
     let dag = space.dag();
+    let state = space.state();
     let mut seen: HashSet<EntryId> = HashSet::new();
+    // A marker a successor carried, set where its past is not here: it
+    // read every carried message up to the one it stands at, in the order
+    // the initial state ranks them.
+    let mut carried_upto: Option<u64> = None;
     if let Some(conversation) = conversation(space) {
-        let state = space.state();
         let markers = state.children(&conversation).into_iter();
         for marker in markers.filter(is_marker_of(who)) {
-            let mut going: Vec<EntryId> = marker.values(1).iter().map(|v| v.entry).collect();
+            let mut going: Vec<EntryId> = Vec::new();
+            for v in marker.values(1) {
+                if dag.contains(&v.entry) {
+                    going.push(v.entry);
+                    continue;
+                }
+                let at = v.value.as_ref().and_then(Value::as_bytes);
+                let at = at.and_then(|b| NodeId::try_from(b).ok());
+                if let Some(rank) = at.and_then(|n| state.carried_rank(&n)) {
+                    carried_upto = carried_upto.max(Some(rank));
+                }
+            }
             while let Some(entry) = going.pop() {
                 if seen.insert(entry) {
                     going.extend_from_slice(dag.parents(&entry));
@@ -556,7 +571,15 @@ pub fn read_by(space: &Space, who: &IdentityId, messages: &[Message]) -> Vec<boo
             }
         }
     }
-    messages.iter().map(|m| seen.contains(&m.entry)).collect()
+    // Everything here descends from the genesis, which carried them all.
+    let genesis_seen = seen.contains(&space.id());
+    messages
+        .iter()
+        .map(|m| match state.carried_rank(&m.id) {
+            Some(rank) => genesis_seen || carried_upto.is_some_and(|r| rank <= r),
+            None => seen.contains(&m.entry),
+        })
+        .collect()
 }
 
 /// A message.
@@ -617,12 +640,18 @@ pub fn messages(space: &Space) -> Vec<Message> {
         return Vec::new();
     };
     let state = space.state();
-    let mut found: Vec<(usize, Message)> = state
+    let mut found: Vec<((u8, usize), Message)> = state
         .children(&conversation)
         .into_iter()
         .filter(|n| n.kind == NodeKind::Uint(MESSAGE) && !n.deleted)
         .filter_map(|n| {
-            let e = space.dag().get(&n.created_in)?;
+            // A message a successor carried comes first, where the
+            // initial state ranks it, with the time it was written
+            // (`state.md#canonical-state`).
+            let at = match state.carried_rank(&n.id) {
+                Some(rank) => (0, rank as usize),
+                None => (1, space.dag().position(&n.created_in)?),
+            };
             let reply_to = n.values(3).iter().rev().find_map(|v| v.value.as_ref());
             let reply_to = reply_to.and_then(Value::as_bytes);
             let reactions = state.children(&n.id).into_iter();
@@ -641,7 +670,7 @@ pub fn messages(space: &Space) -> Vec<Message> {
                 entry: n.created_in,
                 author: n.creator,
                 text: text_of(n)?,
-                time: e.time(),
+                time: n.created,
                 reply_to: reply_to.and_then(|b| NodeId::try_from(b).ok()),
                 edited: n.values(1).iter().any(|v| v.entry != n.created_in),
                 reactions,
@@ -649,7 +678,7 @@ pub fn messages(space: &Space) -> Vec<Message> {
                     n.values(2).iter().rev().find_map(|v| v.value.as_ref()),
                 ),
             };
-            Some((space.dag().position(&n.created_in)?, message))
+            Some((at, message))
         })
         .collect();
     found.sort_by_key(|(at, _)| *at);

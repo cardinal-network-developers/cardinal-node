@@ -22,6 +22,7 @@ pub mod group;
 pub mod relationship;
 pub mod space;
 pub mod state;
+pub mod succession;
 pub mod validity;
 
 pub use entry::{
