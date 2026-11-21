@@ -387,8 +387,8 @@ restart ends it too. Every request is `{"cmd": "inspect", "token": ...,
 `parent`), `node` (`space`, `node`, `path`); `limit` and `items` say how
 much of each value to send (48 bytes and 24 items unless asked). Values
 come typed with their encoded length; no private key is ever sent: an
-epoch key, a blob reference's key, a secret node's value and an
-invitation's secret come as `{"t": "secret", "what", "len"}`, bytes that
+epoch key, a blob reference's key, a secret node's value, a reach
+node's presence secret (field 2, D74) and an invitation's secret come as `{"t": "secret", "what", "len"}`, bytes that
 encode one are withheld, and no `path` leads to one. The space explorer
 (a separate program) draws all this. On a desktop without a sandbox this
 guards against accident, not against a program running as the person

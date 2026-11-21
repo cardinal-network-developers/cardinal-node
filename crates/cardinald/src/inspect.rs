@@ -10,7 +10,8 @@
 //! The grant lives in this service's memory alone: it is never written down,
 //! a restart ends it, and `cardinal inspect off` ends it at once. Nothing
 //! here writes anything, and no private key leaves the service: an epoch
-//! key, a blob key, a secret node's value or an invitation's secret is shown
+//! key, a blob key, a secret node's value, a reach node's presence secret
+//! or an invitation's secret is shown
 //! as what it is and how long, never as its bytes.
 //!
 //! On a desktop without a sandbox this guards against accident, not against
@@ -354,18 +355,18 @@ fn at(v: &Value, path: &[Json]) -> anyhow::Result<Value> {
     Ok(cur)
 }
 
-/// The secret nodes of the account space: kind 5, whose field 2 is a secret
-/// (`profiles.md#account`).
+/// The nodes whose field 2 is a secret: in the account space the secret
+/// nodes, kind 5 (`profiles.md#account`); and in any space every reach
+/// node, whose field 2 is a presence secret (`profiles.md#reach`, D74).
 fn secret_nodes(sp: &Space) -> HashSet<NodeId> {
-    if sp.profile() != Profile::ACCOUNT {
-        return HashSet::new();
+    let st = sp.state();
+    let mut out: HashSet<NodeId> = st.reach_nodes().map(|(n, _)| *n).collect();
+    out.extend(sp.members().iter().map(|m| reach_node_id(&m.identity)));
+    if sp.profile() == Profile::ACCOUNT {
+        let secret = NodeKind::Uint(account::SECRET);
+        out.extend(st.nodes().filter(|n| n.kind == secret).map(|n| n.id));
     }
-    let secret = NodeKind::Uint(account::SECRET);
-    sp.state()
-        .nodes()
-        .filter(|n| n.kind == secret)
-        .map(|n| n.id)
-        .collect()
+    out
 }
 
 /// An op, rendered, with what is secret in it hidden.
@@ -398,14 +399,15 @@ fn render_op(
 /// of the fields a `create` of a secret gives, and the value of a `set` of
 /// field 2 of one.
 fn secret_positions(sp: &Space, e: &SpaceEntry) -> Vec<Vec<Json>> {
-    if sp.profile() != Profile::ACCOUNT {
-        return Vec::new();
-    }
-    let secrets = secret_nodes(sp);
+    let account = sp.profile() == Profile::ACCOUNT;
+    let mut secrets = secret_nodes(sp);
+    secrets.insert(reach_node_id(&e.author()));
     let mut out = Vec::new();
     for (i, op) in e.ops().iter().enumerate() {
         match op.body() {
-            SpaceOpBody::Create { kind, .. } if *kind == NodeKind::Uint(account::SECRET) => {
+            SpaceOpBody::Create { kind, .. }
+                if account && *kind == NodeKind::Uint(account::SECRET) =>
+            {
                 out.push(vec![json!(5), json!(i), json!(4), json!(2)]);
             }
             SpaceOpBody::Set { node, key: 2, .. } if secrets.contains(node) => {
