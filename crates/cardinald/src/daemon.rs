@@ -2100,7 +2100,7 @@ impl Daemon {
             let _ = std::fs::remove_file(&self.paths.socket);
         }
         if !helper {
-            let _ = crate::helper::stop(&self, false).await;
+            let _ = crate::helper::stop(&self).await;
         }
         tracing::info!("stopped");
         Ok(())

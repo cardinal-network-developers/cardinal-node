@@ -159,9 +159,9 @@ pub async fn start(main: &Arc<Daemon>) -> anyhow::Result<Arc<Helper>> {
     Ok(h)
 }
 
-/// Stops the helper of `main`, and with `remove` drops it: its directory
-/// goes, and with it its identity and every relationship it had.
-pub async fn stop(main: &Arc<Daemon>, remove: bool) -> anyhow::Result<()> {
+/// Stops the helper of `main`. [`remove_left`] then drops it: its
+/// directory goes, and with it its identity and every relationship it had.
+pub async fn stop(main: &Arc<Daemon>) -> anyhow::Result<()> {
     let h = main.helper.lock().unwrap_or_else(|e| e.into_inner()).take();
     if let Some(h) = h {
         let _ = h.d.stopping.send(true);
@@ -174,14 +174,21 @@ pub async fn stop(main: &Arc<Daemon>, remove: bool) -> anyhow::Result<()> {
             .await?;
         }
     }
-    if remove {
-        let home = main.paths.recovery_helper();
-        match std::fs::remove_dir_all(&home) {
-            Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
-                return Err(anyhow::anyhow!("cannot remove {}: {e}", home.display()));
-            }
-            _ => {}
-        }
-    }
     Ok(())
+}
+
+/// Removes a helper's directory, if there is one and no recovery is under
+/// way. What cannot be removed now (a file still open, on Windows) is
+/// removed when the service starts next.
+pub fn remove_left(main: &Daemon) {
+    let home = main.paths.recovery_helper();
+    if main.paths.recovering().exists() || !home.exists() {
+        return;
+    }
+    if let Err(e) = std::fs::remove_dir_all(&home) {
+        tracing::warn!(
+            "cannot remove the recovery helper's {} yet: {e}",
+            home.display()
+        );
+    }
 }

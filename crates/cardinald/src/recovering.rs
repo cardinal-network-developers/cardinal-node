@@ -167,6 +167,8 @@ async fn helper(d: &Arc<Daemon>) -> anyhow::Result<Arc<Helper>> {
 
 /// Goes on with a recovery under way, after a restart.
 pub fn resume(d: &Arc<Daemon>) {
+    // a helper whose recovery ended, but whose directory could not go
+    crate::helper::remove_left(d);
     if load(d).is_none() || d.core().identity.is_some() {
         return;
     }
@@ -590,8 +592,9 @@ pub async fn cancel(d: &Arc<Daemon>) -> anyhow::Result<Json> {
         .as_ref()
         .and_then(|u| phrase_of(u).ok())
         .map(|p| the_fingerprint(d, &p));
-    crate::helper::stop(d, true).await?;
+    crate::helper::stop(d).await?;
     let _ = std::fs::remove_file(d.paths.recovering());
+    crate::helper::remove_left(d);
     Ok(json!({"fingerprint": fp}))
 }
 
@@ -690,8 +693,9 @@ pub async fn finish(
     };
     // The guardians see each other's confirmations before the helper goes.
     last_carry(d).await;
-    crate::helper::stop(d, true).await?;
+    crate::helper::stop(d).await?;
     let _ = std::fs::remove_file(d.paths.recovering());
+    crate::helper::remove_left(d);
     save_recovered(d, &Recovered { kept: kept.clone() });
     Ok(json!({
         "at": through,
