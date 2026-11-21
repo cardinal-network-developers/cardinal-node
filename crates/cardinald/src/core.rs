@@ -2192,37 +2192,6 @@ impl Core {
         open.is_some_and(|s| s.role_of(identity).is_some() && !s.has_left(identity))
     }
 
-    /// The spaces `identity` is known to share with this person, by an
-    /// offer either made in their relationship, that this device does not
-    /// hold or cannot open yet, and that this person has not declined: what
-    /// a device taken up from the account alone, after a recovery, asks
-    /// that contact for (`hosts.md#restore`, D80). An owner's own groups
-    /// are not in the account; the offers name them.
-    pub fn unheld_shared_with(&self, identity: &[u8; 32]) -> Vec<SpaceId> {
-        let Some(c) = self
-            .contacts()
-            .into_iter()
-            .find(|c| c.identity == *identity && !c.refused)
-        else {
-            return Vec::new();
-        };
-        let Some(rel) = self.spaces.get(&c.space).and_then(|h| h.space.as_ref()) else {
-            return Vec::new();
-        };
-        let declined = self.declined();
-        let mut out: Vec<SpaceId> = Vec::new();
-        for o in cardinal_space::group::offers(rel.state()) {
-            let s = o.space;
-            if self.spaces.get(&s).is_none_or(|h| h.space.is_none())
-                && !declined.contains(&s)
-                && !out.contains(&s)
-            {
-                out.push(s);
-            }
-        }
-        out
-    }
-
     /// The held copy nodes this person and `who` wrote in their relationship
     /// (`relationship::held`): (this person's, theirs).
     fn held_nodes(&self, who: &[u8; 32]) -> (Vec<[u8; 32]>, Vec<[u8; 32]>) {
@@ -2336,95 +2305,45 @@ impl Core {
         !open && self.offers_from(identity).iter().any(|o| o.space == *label)
     }
 
-    /// The keys `identity`'s recovery removed, as their log held here says,
-    /// when one is in effect and `device` is a key its new root added: a
-    /// device of the person after their recovery, and nobody else.
-    pub fn recovered_device(
+    /// Whether `device` is a key the new root of a recovery in effect in
+    /// `identity`'s log, as held here, added: a device of the person after
+    /// their recovery, and nobody else.
+    fn recovered_device(&self, identity: &[u8; 32], device: &KeyId) -> bool {
+        let Some(other) = self.others.get(identity) else {
+            return false;
+        };
+        let (log, st) = (&other.log, other.log.state());
+        let Some(r) = log
+            .recoveries()
+            .into_iter()
+            .rfind(|r| st.in_effect.contains(&r.entry))
+        else {
+            return false;
+        };
+        st.keys
+            .get(device)
+            .and_then(|info| log.get(&info.added_in))
+            .is_some_and(|added| added.signer() == r.root)
+    }
+
+    /// Whether `label` is this person's relationship with `identity`, and
+    /// `device` one their recovery's new root added: after a recovery that
+    /// kept no old key, nothing they wrote in it counts here until their
+    /// keeps arrive, which it carries (`hosts.md#restore`, D80). Nothing
+    /// else is given beyond what a space's members allow: no offer, and no
+    /// space they started, which falls with what else they wrote until
+    /// whoever holds it as a member is reached.
+    pub fn recovered_relationship(
         &self,
         identity: &[u8; 32],
         device: &KeyId,
-    ) -> Option<std::collections::HashSet<KeyId>> {
-        let log = &self.others.get(identity)?.log;
-        let st = log.state();
-        let r = log
-            .recoveries()
-            .into_iter()
-            .rfind(|r| st.in_effect.contains(&r.entry))?;
-        let info = st.keys.get(device)?;
-        let added = log.get(&info.added_in)?;
-        if added.signer() != r.root {
-            return None;
-        }
-        Some(st.removed().copied().collect())
-    }
-
-    /// Whether a recovered person's device `device` may sync `label` with
-    /// this device although nothing in it counts for them yet
-    /// (`hosts.md#restore`, D78): their relationship with this person, or
-    /// a space they started (its genesis theirs, signed by a key the
-    /// recovery removed, and set aside) that they offered this person, or a
-    /// successor of one that they started the same way, named by a
-    /// `succeed` of theirs, signed so too, in a space they have not left.
-    /// Anything else is theirs only as the space's own members say.
-    pub fn recovered_owns(&self, identity: &[u8; 32], device: &KeyId, label: &[u8; 32]) -> bool {
-        let Some(removed) = self.recovered_device(identity, device) else {
-            return false;
-        };
-        if self
-            .contacts()
-            .iter()
-            .any(|c| c.identity == *identity && c.space == *label && !c.refused)
-        {
-            return true;
-        }
-        // started by them with a removed key, and set aside
-        let theirs = |id: &SpaceId| -> Option<&cardinal_space::Space> {
-            let sp = self.spaces.get(id)?.space.as_ref()?;
-            let g = sp.dag().get(id)?;
-            let ok = g.author() == *identity
-                && removed.contains(&g.signer())
-                && sp.validity().unwitnessed.contains(id);
-            ok.then_some(sp)
-        };
-        let offers = self.offers_from(identity);
-        let mut at = *label;
-        for _ in 0..16 {
-            let Some(sp) = theirs(&at) else {
-                return false;
-            };
-            if offers.iter().any(|o| o.space == at) {
-                return true;
-            }
-            let Some(before) = sp.succeeds() else {
-                return false;
-            };
-            // ended by them, with a removed key, while still in it
-            let Some(old) = theirs(&before) else {
-                return false;
-            };
-            let named = old.succeeds_naming(&at);
-            let by_them = !named.is_empty()
-                && named.iter().all(|x| {
-                    old.dag()
-                        .get(x)
-                        .is_some_and(|e| e.author() == *identity && removed.contains(&e.signer()))
-                });
-            if !by_them || old.has_left(identity) {
-                return false;
-            }
-            at = before;
-        }
-        false
-    }
-
-    /// The name a space was offered under, in any relationship here.
-    pub fn offered_name(&self, space: &SpaceId) -> Option<String> {
-        self.contacts()
-            .iter()
-            .filter_map(|c| self.spaces.get(&c.space)?.space.as_ref())
-            .flat_map(|sp| cardinal_space::group::offers(sp.state()))
-            .find(|o| o.space == *space && !o.name.is_empty())
-            .map(|o| o.name)
+        label: &[u8; 32],
+    ) -> bool {
+        self.recovered_device(identity, device)
+            && self
+                .contacts()
+                .iter()
+                .any(|c| c.identity == *identity && c.space == *label && !c.refused)
     }
 
     /// Whether `identity`'s log, as held here, has this device in it.
@@ -3361,8 +3280,12 @@ impl Core {
     /// everything if `None`), in every space held: a `keep` op listing
     /// the latest of those entries, which covers the ones before them.
     /// What the person does not recognize, after the point they choose,
-    /// stays set aside (`spaces.md#authors`). Returns what was written, by
-    /// space, and how many entries are kept.
+    /// stays set aside (`spaces.md#authors`). Its successions are left
+    /// out, whenever written: a `succeed`, and a successor it started with
+    /// everything in it, count only if a keep lists them, and after the
+    /// removal none does, so they fall
+    /// (`spaces.md#a-succession-by-a-device-that-is-later-removed`).
+    /// Returns what was written, by space, and how many entries are kept.
     pub fn keep_work(
         &mut self,
         key: &KeyId,
@@ -3376,7 +3299,7 @@ impl Core {
                 (Some(u), Some(t)) => t <= u,
                 (Some(_), None) => false,
             };
-            if wanted {
+            if wanted && !self.ends_or_begins(&space, &x, key) {
                 by_space.entry(space).or_default().push(x);
             }
         }
@@ -3403,6 +3326,24 @@ impl Core {
             self.settle(&id);
         }
         Ok((written, kept))
+    }
+
+    /// Whether `x`, in `space`, is part of a succession the removed `key`
+    /// made: a `succeed`, or anything in a successor whose genesis that key
+    /// signed and nothing keeps.
+    fn ends_or_begins(&self, space: &SpaceId, x: &EntryId, key: &KeyId) -> bool {
+        let Some(sp) = self.spaces.get(space).and_then(|h| h.space.as_ref()) else {
+            return false;
+        };
+        let succeeds = sp.dag().get(x).is_some_and(|e| {
+            e.ops()
+                .iter()
+                .any(|o| matches!(o.body(), cardinal_space::SpaceOpBody::Succeed { .. }))
+        });
+        let begun = sp.succeeds().is_some()
+            && sp.validity().unwitnessed.contains(space)
+            && sp.dag().get(space).is_some_and(|g| g.signer() == *key);
+        succeeds || begun
     }
 
     /// Keeps, in each of `spaces`, everything this person's removed devices
@@ -3448,130 +3389,6 @@ impl Core {
             if self.spaces.contains_key(id) {
                 self.settle(id);
             }
-        }
-        Ok(written)
-    }
-
-    /// The successions this person's removed device `key` wrote that
-    /// nothing witnessed (`spaces.md#a-succession-by-a-device-that-is-later-removed`):
-    /// each a `succeed` in a space it ends, or a successor's genesis, as
-    /// (space, entry, time), written up to `up_to` (by that device's
-    /// clock; all if `None`).
-    pub fn unkept_successions(
-        &self,
-        key: &KeyId,
-        up_to: Option<u64>,
-    ) -> Vec<(SpaceId, EntryId, Option<u64>)> {
-        let Some(me) = self.me() else {
-            return Vec::new();
-        };
-        let mut out = Vec::new();
-        for (id, h) in &self.spaces {
-            let Some(space) = h.space.as_ref() else {
-                continue;
-            };
-            for x in &space.validity().unwitnessed {
-                let Some(e) = space.dag().get(x) else {
-                    continue;
-                };
-                if e.signer() != *key || e.author() != me {
-                    continue;
-                }
-                let succeeds = e
-                    .ops()
-                    .iter()
-                    .any(|o| matches!(o.body(), cardinal_space::SpaceOpBody::Succeed { .. }));
-                let successor_genesis = *x == *id && space.succeeds().is_some();
-                let in_time = match (up_to, e.time()) {
-                    (None, _) => true,
-                    (Some(u), Some(t)) => t <= u,
-                    (Some(_), None) => false,
-                };
-                if (succeeds || successor_genesis) && in_time {
-                    out.push((*id, *x, e.time()));
-                }
-            }
-        }
-        out
-    }
-
-    /// Keeps, in `space`, the entries `xs` that this person's removed
-    /// device `key` wrote. Returns the entry written.
-    pub fn keep_these(
-        &mut self,
-        space: &SpaceId,
-        key: &KeyId,
-        xs: &[EntryId],
-    ) -> anyhow::Result<Vec<u8>> {
-        let ident = self
-            .identity
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("this device has no identity yet"))?;
-        let h = self
-            .spaces
-            .get_mut(space)
-            .ok_or_else(|| anyhow::anyhow!("that space is not here"))?;
-        // with what they build on that the same device wrote and is set
-        // aside too, such as the space's own start: kept alone, they would
-        // stand on nothing
-        let mut all: Vec<EntryId> = Vec::new();
-        if let Some(sp) = h.space.as_ref() {
-            let unwitnessed = &sp.validity().unwitnessed;
-            let mut todo: Vec<EntryId> = xs.to_vec();
-            while let Some(x) = todo.pop() {
-                if all.contains(&x) {
-                    continue;
-                }
-                all.push(x);
-                if let Some(e) = sp.dag().get(&x) {
-                    todo.extend(e.parents().iter().filter(|p| {
-                        unwitnessed.contains(*p)
-                            && sp.dag().get(p).is_some_and(|pe| pe.signer() == *key)
-                    }));
-                }
-            }
-        } else {
-            all = xs.to_vec();
-        }
-        let bytes = h.write_keeps(ident, &self.keys, vec![SpaceOp::keep(*key, &all)])?;
-        self.settle(space);
-        Ok(bytes)
-    }
-
-    /// Keeps the work of `key` that nothing witnessed, written up to
-    /// `up_to`, in every space held, leaving out its successions, which
-    /// the person is asked about one by one.
-    pub fn keep_work_but_successions(
-        &mut self,
-        key: &KeyId,
-        up_to: u64,
-    ) -> anyhow::Result<Written> {
-        let skip: std::collections::HashSet<EntryId> = self
-            .unkept_successions(key, None)
-            .into_iter()
-            .map(|(_, x, _)| x)
-            .collect();
-        let work = self.unwitnessed_work(key)?;
-        let mut by_space: BTreeMap<SpaceId, Vec<EntryId>> = BTreeMap::new();
-        for (space, x, t) in work {
-            if t.is_some_and(|t| t <= up_to) && !skip.contains(&x) {
-                by_space.entry(space).or_default().push(x);
-            }
-        }
-        let mut written = Vec::new();
-        for (id, xs) in by_space {
-            let latest: Vec<EntryId> = {
-                let h = &self.spaces[&id];
-                let dag = h.space.as_ref().expect("open").dag();
-                let mut l: Vec<EntryId> = xs
-                    .iter()
-                    .filter(|x| !xs.iter().any(|y| y != *x && dag.is_ancestor(x, y)))
-                    .copied()
-                    .collect();
-                l.sort();
-                l
-            };
-            written.push((id, self.keep_these(&id, key, &latest)?));
         }
         Ok(written)
     }

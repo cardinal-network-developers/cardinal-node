@@ -134,7 +134,7 @@ impl Daemon {
                     Access::Other(identity)
                 } else if Some(*label) == core.identity_label()
                     || core.shares(&identity, label)
-                    || core.recovered_owns(&identity, &device, label)
+                    || core.recovered_relationship(&identity, &device, label)
                 {
                     Access::Full
                 } else if core.held_given(&identity).contains(label) {
@@ -235,11 +235,13 @@ pub async fn sync_all(d: &Arc<Daemon>, s: &Session) {
         PeerKind::Contact(identity, device) => {
             let core = d.core();
             let mut labels = core.labels_with(&identity);
-            // after their recovery, what they started, for their keeps
+            // after their recovery, their relationship, for their keeps
             let theirs: Vec<Label> = core
                 .spaces
                 .keys()
-                .filter(|l| !labels.contains(*l) && core.recovered_owns(&identity, &device, l))
+                .filter(|l| {
+                    !labels.contains(*l) && core.recovered_relationship(&identity, &device, l)
+                })
                 .copied()
                 .collect();
             labels.extend(theirs);
@@ -248,50 +250,6 @@ pub async fn sync_all(d: &Arc<Daemon>, s: &Session) {
         PeerKind::Token(_) | PeerKind::Stranger => return,
         _ => (d.core().labels(), None),
     };
-    tracing::debug!(
-        "syncing {} sets with {}{}",
-        labels.len(),
-        short(&s.peer_static()),
-        if member.is_some() { " (a contact)" } else { "" }
-    );
-    sync_these(d, s, labels, member).await;
-    let Some(member) = member else {
-        return;
-    };
-    // After this person's recovery, for a while: the spaces this contact is
-    // known to share and that are not here, asked of them alone, taken
-    // only in answer, never served (`hosts.md#restore`, D80).
-    let asks = crate::recovering::asks_of(d, &member);
-    if asks.is_empty() {
-        return;
-    }
-    ask_for(d, s, &asks).await;
-    // The contact may give them only once the keeps just sent have reached
-    // them: asked once more, a moment later, once per recovery.
-    if crate::recovering::ask_again_once(d, &member) {
-        tokio::time::sleep(AGAIN_AFTER).await;
-        let asks = crate::recovering::asks_of(d, &member);
-        ask_for(d, s, &asks).await;
-    }
-}
-
-/// How long after a contact's first round the spaces still missing after a
-/// recovery are asked for again.
-const AGAIN_AFTER: Duration = Duration::from_secs(2);
-
-async fn ask_for(d: &Arc<Daemon>, s: &Session, labels: &[Label]) {
-    for label in labels {
-        if let Err(e) = reconcile_as(d, s, *label, Access::Offered).await {
-            tracing::debug!(
-                "asking {} for {}: {e:#}",
-                short(&s.peer_static()),
-                short(label)
-            );
-        }
-    }
-}
-
-async fn sync_these(d: &Arc<Daemon>, s: &Session, labels: Vec<Label>, member: Option<[u8; 32]>) {
     for label in labels {
         let mine = crate::mailbox::written_here(d, &label);
         match reconcile(d, s, label).await {

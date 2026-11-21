@@ -1285,7 +1285,7 @@ impl Daemon {
             // it may have ended, or brought what stands in its place
             crate::following::follow(self);
             // after a recovery, what the removed devices wrote in it: kept
-            // up to the time lost, its successions asked about
+            // up to the time lost, but for their successions, which fall
             crate::recovering::tend_recovered(self);
             self.bump();
             self.housekeeping();

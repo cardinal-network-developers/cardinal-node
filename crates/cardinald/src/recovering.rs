@@ -87,26 +87,16 @@ struct Recovered {
     /// When the person said they lost them, by those devices' clocks.
     #[serde(default)]
     lost_at: Option<u64>,
-    /// Successions those devices made, waiting for the person's yes or no,
-    /// as `space:entry:key` (hex).
-    #[serde(default)]
-    asked: Vec<String>,
-    /// Those answered, kept or not, never asked again.
-    #[serde(default)]
-    answered: Vec<String>,
-    /// When the recovery finished, by this device's clock (ms): the spaces
-    /// missing are asked of contacts, and a lost device's work kept as it
-    /// arrives, for [`AFTER_FINISH`] from then. None in a file from before.
+    /// When the recovery finished, by this device's clock (ms): a lost
+    /// device's work is kept as it arrives for [`AFTER_FINISH`] from then.
+    /// None in a file from before.
     #[serde(default)]
     finished_ms: Option<u64>,
-    /// The contacts (hex) asked a second time, once per recovery.
-    #[serde(default)]
-    asked_again: Vec<String>,
 }
 
-/// How long after a recovery finished the spaces missing are asked of
-/// contacts, and what a lost device wrote is kept as each space arrives.
-/// After that, only the person's own `keep-work` keeps more.
+/// How long after a recovery finished what a lost device wrote is kept as
+/// each space arrives. After that, only the person's own `keep-work` keeps
+/// more.
 pub const AFTER_FINISH: std::time::Duration = std::time::Duration::from_secs(7 * 24 * 3600);
 
 impl Recovered {
@@ -115,29 +105,6 @@ impl Recovered {
             crate::core::now_ms() < f.saturating_add(AFTER_FINISH.as_millis() as u64)
         })
     }
-}
-
-/// The spaces to ask `who` for, after this person's recovery and for a
-/// while: those they are known to share and that are not here.
-pub fn asks_of(d: &Daemon, who: &[u8; 32]) -> Vec<SpaceId> {
-    match load_recovered(d) {
-        Some(r) if r.fresh() => d.core().unheld_shared_with(who),
-        _ => Vec::new(),
-    }
-}
-
-/// Whether `who` is to be asked a second time, which is once per recovery.
-pub fn ask_again_once(d: &Daemon, who: &[u8; 32]) -> bool {
-    let Some(mut r) = load_recovered(d) else {
-        return false;
-    };
-    let h = hex::encode(who);
-    if !r.fresh() || r.asked_again.contains(&h) {
-        return false;
-    }
-    r.asked_again.push(h);
-    save_recovered(d, &r);
-    true
 }
 
 fn load(d: &Daemon) -> Option<Under> {
@@ -551,7 +518,6 @@ pub fn status(d: &Arc<Daemon>) -> anyhow::Result<Json> {
             // as the spaces arrive, after the finish
             "lost_devices": lost_json(d),
             "lost_at": r.lost_at,
-            "successions": successions_json(d, &r),
         }));
     };
     // `finish` made this device the person's but did not get to the end, as
@@ -785,7 +751,6 @@ pub async fn finish(
             forgotten: u.forgotten.clone(),
             lost_at,
             finished_ms: Some(crate::core::now_ms()),
-            ..Recovered::default()
         },
     );
     // the link keys the removed devices had, by their keys
@@ -818,7 +783,6 @@ pub async fn finish(
             forgotten: u.forgotten.clone(),
             lost_at,
             finished_ms: Some(crate::core::now_ms()),
-            ..Recovered::default()
         },
     );
     // The removed devices' hosts leave the lists that name them, and the
@@ -962,142 +926,39 @@ fn after_removal(d: &Arc<Daemon>, links: &[[u8; 32]]) {
 }
 
 /// What the recovery's removed devices wrote, as spaces arrive after the
-/// finish: kept up to when the person said they were lost (but for their
-/// successions); and their successions, which the person is asked about,
-/// one by one, never dropped unasked
+/// finish: kept up to when the person said they were lost, but for their
+/// successions, which no keep lists and which so fall: the old space stands
+/// again, and whoever followed returns to it
 /// (`spaces.md#a-succession-by-a-device-that-is-later-removed`).
 pub fn tend_recovered(d: &Arc<Daemon>) {
-    let Some(mut r) = load_recovered(d) else {
+    let Some(r) = load_recovered(d) else {
+        return;
+    };
+    // kept as spaces arrive only for a while after the finish: then by the
+    // person's own `keep-work` (a thief sets the clock those entries give)
+    let Some(up_to) = r.lost_at.filter(|_| r.fresh()) else {
         return;
     };
     if r.forgotten.is_empty() || d.core().identity.is_none() {
         return;
     }
-    let keys: Vec<KeyId> = r
+    for k in r
         .forgotten
         .iter()
         .filter_map(|k| hex::decode(k).ok()?.try_into().ok())
-        .collect();
-    let mut changed = false;
-    // kept as spaces arrive only for a while after the finish: then by the
-    // person's own `keep-work` (a thief sets the clock those entries give)
-    let fresh = r.fresh();
-    for k in &keys {
-        if let (true, Some(up_to)) = (fresh, r.lost_at) {
-            let written = d.core().keep_work_but_successions(k, up_to);
-            match written {
-                Ok(written) => {
-                    for (space, bytes) in written {
-                        d.push(&space, vec![bytes]);
-                    }
+    {
+        let k: KeyId = k;
+        // the core is let go before what was written is pushed
+        let kept = d.core().keep_work(&k, Some(up_to));
+        match kept {
+            Ok((written, _)) => {
+                for (space, bytes) in written {
+                    d.push(&space, vec![bytes]);
                 }
-                Err(e) => tracing::debug!("keeping what a lost device wrote: {e:#}"),
             }
-        }
-        for (space, x, _) in d.core().unkept_successions(k, r.lost_at) {
-            let item = format!(
-                "{}:{}:{}",
-                hex::encode(space),
-                hex::encode(x),
-                hex::encode(k)
-            );
-            if !r.asked.contains(&item) && !r.answered.contains(&item) {
-                r.asked.push(item);
-                changed = true;
-            }
+            Err(e) => tracing::debug!("keeping what a lost device wrote: {e:#}"),
         }
     }
-    if changed {
-        save_recovered(d, &r);
-        d.bump();
-    }
-}
-
-/// The successions waiting for the person's answer, as a window shows
-/// them: "Your earlier changes to Garden club: keep?".
-fn successions_json(d: &Daemon, r: &Recovered) -> Vec<Json> {
-    let core = d.core();
-    r.asked
-        .iter()
-        .filter_map(|item| {
-            let mut parts = item.split(':');
-            let space: SpaceId = hex::decode(parts.next()?).ok()?.try_into().ok()?;
-            let sp = core.spaces.get(&space)?.space.as_ref()?;
-            // a successor's genesis is shown under the space it ends
-            let ends = sp.succeeds().unwrap_or(space);
-            let name = core
-                .spaces
-                .get(&ends)
-                .and_then(|h| h.space.as_ref())
-                .map(cardinal_space::group::name)
-                .unwrap_or_else(|| cardinal_space::group::name(sp));
-            // its own name may be in what is set aside: then as offered
-            let name = if name.is_empty() {
-                core.offered_name(&ends).unwrap_or_default()
-            } else {
-                name
-            };
-            Some(json!({"id": item, "space": name}))
-        })
-        .collect()
-}
-
-/// `recover-keep-succession` (`id`, `keep`): the person's answer about a
-/// succession a removed device made. With a yes, a `keep` of it is
-/// written, and of the successor's genesis beside it if that is
-/// waiting too.
-pub fn keep_succession(d: &Arc<Daemon>, id: &str, keep: bool) -> anyhow::Result<Json> {
-    let mut r = load_recovered(d).ok_or_else(|| anyhow::anyhow!("nothing is waiting"))?;
-    anyhow::ensure!(
-        r.asked.iter().any(|x| x == id),
-        "that is not waiting for an answer"
-    );
-    // the succeed and the successor's genesis go together
-    let parse = |item: &str| -> Option<(SpaceId, EntryId, KeyId)> {
-        let mut parts = item.split(':');
-        Some((
-            hex::decode(parts.next()?).ok()?.try_into().ok()?,
-            hex::decode(parts.next()?).ok()?.try_into().ok()?,
-            hex::decode(parts.next()?).ok()?.try_into().ok()?,
-        ))
-    };
-    let (space, _, _) = parse(id).ok_or_else(|| anyhow::anyhow!("that is not an answer's id"))?;
-    let together: Vec<String> = {
-        let core = d.core();
-        let ends = core
-            .spaces
-            .get(&space)
-            .and_then(|h| h.space.as_ref())
-            .and_then(|sp| sp.succeeds());
-        r.asked
-            .iter()
-            .filter(|item| {
-                parse(item).is_some_and(|(s, _, _)| {
-                    s == space
-                        || Some(s) == ends
-                        || core
-                            .spaces
-                            .get(&s)
-                            .and_then(|h| h.space.as_ref())
-                            .and_then(|sp| sp.succeeds())
-                            == Some(space)
-                })
-            })
-            .cloned()
-            .collect()
-    };
-    for item in &together {
-        if keep {
-            let (s, x, k) = parse(item).expect("parsed");
-            let bytes = d.core().keep_these(&s, &k, &[x])?;
-            d.push(&s, vec![bytes]);
-        }
-        r.asked.retain(|a| a != item);
-        r.answered.push(item.clone());
-    }
-    save_recovered(d, &r);
-    d.bump();
-    Ok(json!({"kept": keep, "answered": together.len()}))
 }
 
 /// `recover-lost-at` (`lost_at`): when the person lost the devices the
@@ -1349,7 +1210,7 @@ mod tests {
     use cardinal_identity::{Created, DeviceKeys, Power};
 
     #[test]
-    fn after_the_window_nothing_more_is_asked_or_kept() {
+    fn after_the_window_nothing_more_is_kept() {
         let now = crate::core::now_ms();
         let at = |f: Option<u64>| Recovered {
             finished_ms: f,
@@ -1358,7 +1219,7 @@ mod tests {
         assert!(at(Some(now)).fresh());
         let past = AFTER_FINISH.as_millis() as u64 + 1000;
         assert!(!at(Some(now - past)).fresh());
-        // a file from before the window was kept asks nothing
+        // a file from before the window was kept keeps nothing
         assert!(!at(None).fresh());
     }
 
