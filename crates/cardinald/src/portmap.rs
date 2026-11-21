@@ -224,10 +224,9 @@ fn test_gateway_mistyped() -> bool {
         .is_ok_and(|g| g != "none" && g.parse::<SocketAddr>().is_err())
 }
 
-/// The default route's gateway, on Linux.
+/// The default route's gateway.
 fn system_gateway() -> Option<SocketAddr> {
-    let routes = std::fs::read_to_string("/proc/net/route").ok()?;
-    default_gateway(&routes).map(|ip| SocketAddr::new(IpAddr::V4(ip), PORT))
+    crate::networks::gateway_ip().map(|ip| SocketAddr::new(IpAddr::V4(ip), PORT))
 }
 
 /// The gateway of the default route in `/proc/net/route`.

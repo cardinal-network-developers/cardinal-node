@@ -35,6 +35,15 @@ fuser = { version = "0.15", default-features = false, features = ["abi-7-19"], o
 # gitignore syntax for `.cardinalignore` (fs/local.rs).
 ignore = "0.4"
 
+[target.'cfg(windows)'.dependencies]
+# The routing and neighbour tables (networks.rs), from the IP Helper API.
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_NetworkManagement_IpHelper",
+    "Win32_NetworkManagement_Ndis",
+    "Win32_Networking_WinSock",
+] }
+
 [features]
 default = ["mount"]
 # Show the files space as a folder, through FUSE.

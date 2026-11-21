@@ -1937,3 +1937,12 @@ asks for around that is not built yet.
 - **Only the files space.** Checks sample it alone: what its folder
   shows, and whatever else its current state references. Checks ask for chunks and indexes only: content under
   1 KiB lives in entries, which every device holds.
+
+- **Which network, on Windows** (`networks.rs`): the default route is
+  read from `GetIpForwardTable2` and the router's hardware address from
+  `GetIpNetTable2`; on Linux, as before, from `/proc/net/route` and
+  `/proc/net/arp`. Where Windows has more than one default route, the one
+  with the lowest route metric is taken (Windows itself also adds the
+  interface's metric). A neighbour counts from probing to permanent, not
+  while incomplete or unreachable. The subnets on the link, for nearby
+  discovery, come from the same table.
