@@ -716,11 +716,18 @@ fn an_invitation_opens_nothing_else() {
     // Refusal outlasts an invitation made before it. It is itself a write,
     // so what counts is what comes after.
     let spare = a_code(&ana, &[]);
+    let renewed = |d: &Dev| d.log().matches("a new presence secret").count();
+    let secrets = renewed(&ana);
     ana.cli(&["contact", "bo", "refuse"]);
     wait("the refusal is written", 10, || {
         ana.cli(&["contacts", "--all"]).contains("refused")
     });
-    let before = log_sizes(&ana);
+    // Refusing makes a new presence secret (D74), written in her account
+    // at the next look: that settles first.
+    wait("the presence secret renewed", 20, || {
+        renewed(&ana) > secrets
+    });
+    let before = quiet_log_sizes(&ana);
     attack(&rt, "someone refused", spare, bo_id);
     assert_eq!(log_sizes(&ana), before, "something was left in her spaces");
     assert!(!ana.log().contains("bad object"), "{}", ana.log());

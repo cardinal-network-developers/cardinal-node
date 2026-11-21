@@ -1270,7 +1270,8 @@ pub fn revoke_refused(d: &Daemon) {
 /// out"). A lost host never takes itself out, and while it is named,
 /// contacts go on leaving messages with whoever holds it. Each list is
 /// written as it reads, without that entry, if nothing it rests on has
-/// changed since; one left empty is a no, as any empty list is.
+/// changed since. One left empty is no no (D75): the account records
+/// none, and another host of the person's may name itself there.
 pub fn take_out_removed(d: &Arc<Daemon>, gone: &[u8; 32]) {
     let Some(me) = d.core().identity.as_ref().map(|i| i.id()) else {
         return;
