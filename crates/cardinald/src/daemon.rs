@@ -85,6 +85,8 @@ const TCP_WITHIN: Duration = Duration::from_secs(3);
 
 /// The most addresses kept for a device.
 const BOOK_LEN: usize = 6;
+/// How often the LAN advertisement is made again, with fresh nonces.
+const ADVERTISE_EVERY: Duration = Duration::from_secs(30);
 
 /// Addresses of this person's devices, learned from pairing, discovery,
 /// successful connections, and each other.
@@ -1778,7 +1780,9 @@ impl Daemon {
         }
     }
 
-    /// Starts LAN discovery once the discovery secret is known.
+    /// Starts LAN discovery once the discovery secret is known: `t=` for
+    /// this person's own devices, and `c=` for their trusted contacts
+    /// (D74, `hosts.md#local-discovery`).
     pub fn start_discovery(self: &Arc<Self>) {
         if !self.config().discovers() {
             return;
@@ -1795,24 +1799,23 @@ impl Daemon {
         let cfg = self.mdns_config();
         let d = self.clone();
         tokio::spawn(async move {
-            // The advertised port is the TCP link port (see README).
-            let _ad = match cardinal_contact::discovery::advertise_device(
-                cfg,
-                &secret,
-                port,
-                Duration::from_secs(30),
-            ) {
-                Ok(a) => Some(a),
-                Err(e) => {
-                    tracing::warn!("LAN discovery: cannot advertise: {e}");
-                    None
+            use cardinal_contact::discovery::{self as disc, check_tag_txt, CONTACTS};
+            let own = disc::discovery_key(&secret);
+            // The advertisement is made again when the presence secret
+            // given changes, so `c=` follows it within a few seconds.
+            let advertise = |presence: Option<[u8; 32]>| {
+                // The advertised port is the TCP link port (see README).
+                match disc::advertise_tags(cfg, &secret, presence.as_ref(), port, ADVERTISE_EVERY) {
+                    Ok(a) => Some(a),
+                    Err(e) => {
+                        tracing::warn!("LAN discovery: cannot advertise: {e}");
+                        None
+                    }
                 }
             };
-            let mut browser = match cardinal_contact::discovery::DeviceBrowser::start(
-                cfg,
-                &[secret],
-                Duration::from_secs(15),
-            ) {
+            let mut presence = crate::presence::advertised(&d.core());
+            let mut _ad = advertise(presence);
+            let mut browser = match disc::browse_devices(cfg, Duration::from_secs(15)) {
                 Ok(b) => b,
                 Err(e) => {
                     tracing::warn!("LAN discovery: cannot browse: {e}");
@@ -1820,6 +1823,7 @@ impl Daemon {
                 }
             };
             let mut stop = d.stopping.subscribe();
+            let mut look = tokio::time::interval(Duration::from_secs(2));
             loop {
                 tokio::select! {
                     f = browser.next() => {
@@ -1828,7 +1832,33 @@ impl Daemon {
                             && is_local_ip(&f.addr.ip()) {
                             continue;
                         }
-                        d.discovered(f.addr).await;
+                        if f.txt.iter().any(|t| disc::check_device_txt(&own, t)) {
+                            d.discovered(f.addr).await;
+                            continue;
+                        }
+                        // One keyed hash per trusted contact per advertisement.
+                        let theirs = crate::presence::of_contacts(&d.core());
+                        let keys = theirs.iter().map(|(who, s)| (who, disc::presence_key(s)));
+                        let mut found: Vec<[u8; 32]> = Vec::new();
+                        for (who, k) in keys {
+                            if !found.contains(who) && f.txt.iter().any(|t| check_tag_txt(CONTACTS, &k, t)) {
+                                found.push(*who);
+                            }
+                        }
+                        for who in found {
+                            let d = d.clone();
+                            tokio::spawn(async move {
+                                crate::rendezvous::found_nearby(&d, who, f.addr).await
+                            });
+                        }
+                    }
+                    _ = look.tick() => {
+                        let now = crate::presence::advertised(&d.core());
+                        if now != presence {
+                            presence = now;
+                            _ad = None;
+                            _ad = advertise(presence);
+                        }
                     }
                     _ = stop.changed() => break,
                 }
@@ -1837,11 +1867,18 @@ impl Daemon {
     }
 
     /// The multicast DNS configuration.
+    /// `CARDINAL_TEST_MDNS_INTERFACE` names the interface address to use,
+    /// as tests on loopback do.
     pub fn mdns_config(&self) -> cardinal_contact::mdns::MdnsConfig {
-        cardinal_contact::mdns::MdnsConfig {
+        let mut cfg = cardinal_contact::mdns::MdnsConfig {
             port: self.config().mdns(),
             ..Default::default()
+        };
+        let named = std::env::var("CARDINAL_TEST_MDNS_INTERFACE").ok();
+        if let Some(ip) = named.and_then(|i| i.parse().ok()) {
+            cfg.interface = ip;
         }
+        cfg
     }
 
     async fn discovered(self: &Arc<Self>, addr: SocketAddr) {

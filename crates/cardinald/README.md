@@ -168,10 +168,15 @@ host:port` adds an address (a server over the internet); it is tried for
 every unconnected device until one answers there, and then remembered as
 that device's.
 
-LAN discovery advertises `_cardinal._udp` with the rotating tag of
-`hosts.md#local-discovery`, keyed by the discovery secret from the
-account space. The advertised port is the **TCP** link port (the link
-listens on TCP only by default; UDP is experimental and off).
+LAN discovery advertises `_cardinal._udp` with the rotating tags of
+`hosts.md#local-discovery`: `t=`, keyed by the discovery secret from the
+account space, for the person's own devices, and `c=`, keyed by their
+presence secret, for trusted contacts who were given it in the
+relationship's reach node (D74, `presence.rs`). The advertised port is
+the **TCP** link port (the link listens on TCP only by default; UDP is
+experimental and off). A `c=` that matches a trusted contact's secret
+has each of their devices dialled at that address; `cardinal contacts
+NAME` shows the look.
 
 ## The mount
 

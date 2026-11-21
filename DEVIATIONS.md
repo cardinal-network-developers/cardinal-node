@@ -877,6 +877,52 @@ Not implemented yet (the next milestone):
   suppression, or IPv6. Instance and host names are random and, for
   device discovery, change with every refresh along with the nonce. A
   browser uses the packet's source address when there is no A record.
+- **Trusted contacts find each other nearby** (D74,
+  `hosts.md#local-discovery`, `presence.rs`, `daemon.rs`
+  `start_discovery`, `rendezvous.rs` `found_nearby`). LAN only: there is
+  no Bluetooth carrier here.
+  - **Spec gap: the purpose `presence`** is not in `crypto.md`'s table of
+    derivation purposes. It is used as `hosts.md` writes it,
+    `derive("presence", secret)`, context `cardinal 1 presence`, and is
+    left out of `Purpose::ALL` and the derivation vectors until the table
+    has it.
+  - **Reading: the secret node's purpose** is the text `presence`, as the
+    discovery secret's is `discovery`.
+  - **When a secret is made.** When the person first has a trusted
+    contact whose relationship is open on the device, and again when
+    someone refused or no longer trusted holds, in field 2 of the
+    person's reach node in their relationship, a secret still in the
+    account. A new one deletes every presence secret node and creates
+    one, in one entry. Each device does this on its own at its next look
+    (the delivery loop), so two that act at once leave two, as the text
+    allows.
+  - **Reading: the one taken back is not cleared.** Field 2 in the
+    relationship with someone no longer trusted is left as it was: it
+    holds a secret no longer used, and writing there would only be an
+    entry they read. Trusted again, they are given the one in use.
+  - **Reading: "accept every value a contact gave"** is every value field
+    2 of their reach node holds now in the relationship, two where two of
+    their devices set it at the same moment; not values set before.
+  - **`c=` is left out** until the person has given the secret to a
+    trusted contact, and the advertisement is made again within two
+    seconds of that changing.
+  - **What a match does.** Each of the contact's devices with no session
+    is dialled at the advertised address and port (the TCP link port, as
+    for own devices), UDP first, as `reach` dials a device that is named
+    as a host. An address is tried at most once in 10 seconds for one
+    contact, and the look is a look like any other: `contact-status`
+    `last_look` and `cardinal contacts NAME` say "their tag seen on the
+    local network at ..." and "found on the local network" only once a
+    session opened. Nothing anywhere says a contact is nearby from a tag.
+  - **`contact-status` gives `nearby`**: `you_give_secret` and
+    `they_give_secret`, whether each reach node in the relationship holds
+    one.
+- **Reach: what goes where** (`profiles.md#reach`, `relationship.rs`).
+  Field 1 holds host entries; field 2 the presence secret, only in a
+  relationship; any other field of the node is untouched by a `set` of
+  one field, as state keeps fields apart. A host entry's fields beyond
+  1, 2 and 3 are kept as they came (`Reach::extra`) and written again
+  with the entry.
 - **Invitations.** The `uses` field is omitted when it is 1 (the default).
   Base32 is RFC 4648 lowercase without padding; decoding accepts any case
   and rejects non-zero trailing bits.
@@ -1496,11 +1542,10 @@ asks for around that is not built yet.
     the endpoints and token it has there. The text says a host named in
     both "is one host" and not which entry is read.
   - **Not quite "unchanged".** What a device writes of another's entry
-    is the endpoints, the key and the token as it read them. A field of a
-    host record beyond those three is not carried on, and a host whose
-    endpoint list holds something that is no record, or whose key or
-    token is not of its length, is not read and so not written again.
-    This version writes neither.
+    is the endpoints, the key, the token and any other fields as it read
+    them (D74). A host whose endpoint list holds something that is no
+    record, or whose key or token is not of its length, is not read and
+    so not written again.
   - **Reading: every token serves** (`Core::space_of_token`,
     `Core::tokens_given`, `relationship::reach_ever`). The space of a
     token is looked for in the list as read and then in every value the

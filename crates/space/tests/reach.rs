@@ -27,6 +27,7 @@ fn reach(token: u8) -> Reach {
         endpoints: Vec::new(),
         host: [token; 32],
         token: [token; 16],
+        extra: Default::default(),
     }
 }
 

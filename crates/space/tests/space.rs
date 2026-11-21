@@ -1110,6 +1110,7 @@ fn every_token_given_is_known_however_the_entries_arrive() {
         endpoints: Vec::new(),
         host: [0xa0; 32],
         token: [token; 16],
+        extra: Default::default(),
     };
     let first = a
         .write(
@@ -1170,6 +1171,7 @@ fn two_hosts_setting_the_reach_list_at_once_are_each_one_host() {
         endpoints: Vec::new(),
         host,
         token: [token; 16],
+        extra: Default::default(),
     };
     // What both had read: each host with an old token.
     let old = relationship::set_reach(&me, &[one(host0, 1), one(host1, 2)]);

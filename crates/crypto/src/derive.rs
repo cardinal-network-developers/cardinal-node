@@ -26,6 +26,10 @@ pub enum Purpose {
     Mailbox,
     /// `discovery`: LAN discovery MAC key (hosts.md).
     Discovery,
+    /// `presence`: the key of a `c=` tag, from a presence secret
+    /// (hosts.md#local-discovery, D74). Not in crypto.md's table yet, so
+    /// not in [`Purpose::ALL`] or its vectors.
+    Presence,
     /// `invite`: invitation keys (contact.md).
     Invite,
     /// `token`: link secret from a delivery token (link.md).
@@ -72,6 +76,7 @@ impl Purpose {
             Purpose::ReachNode => "reach node",
             Purpose::Mailbox => "mailbox",
             Purpose::Discovery => "discovery",
+            Purpose::Presence => "presence",
             Purpose::Invite => "invite",
             Purpose::Token => "token",
             Purpose::Pair => "pair",
@@ -93,6 +98,7 @@ impl Purpose {
             Purpose::ReachNode => "cardinal 1 reach node",
             Purpose::Mailbox => "cardinal 1 mailbox",
             Purpose::Discovery => "cardinal 1 discovery",
+            Purpose::Presence => "cardinal 1 presence",
             Purpose::Invite => "cardinal 1 invite",
             Purpose::Token => "cardinal 1 token",
             Purpose::Pair => "cardinal 1 pair",
@@ -172,7 +178,7 @@ mod tests {
 
     #[test]
     fn contexts_match_strings() {
-        for p in Purpose::ALL {
+        for p in Purpose::ALL.into_iter().chain([Purpose::Presence]) {
             assert_eq!(p.context(), format!("cardinal 1 {}", p.as_str()));
         }
     }

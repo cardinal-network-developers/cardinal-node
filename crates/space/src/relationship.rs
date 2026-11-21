@@ -134,17 +134,20 @@ pub struct Reach {
     pub host: [u8; 32],
     /// A delivery token for this space.
     pub token: [u8; 16],
+    /// The host entry's other fields, which this version does not know:
+    /// kept as they came and written again with the entry
+    /// (`profiles.md#reach`, `encoding.md#unknown-fields`).
+    pub extra: Record,
 }
 
 fn reach_list(reach: &[Reach]) -> Value {
     Value::list(reach.iter().map(|r| {
         let endpoints = r.endpoints.iter().map(|e| Value::Record(e.to_record()));
-        Value::Record(
-            Record::new()
-                .with(1, Value::list(endpoints))
-                .with(2, r.host)
-                .with(3, r.token),
-        )
+        let mut entry = r.extra.without(&[1, 2, 3]);
+        entry.insert(1, Value::list(endpoints));
+        entry.insert(2, r.host);
+        entry.insert(3, r.token);
+        Value::Record(entry)
     }))
 }
 
@@ -156,6 +159,7 @@ fn read_reach(r: &Record) -> Option<Reach> {
         endpoints: endpoints.into_iter().map(Endpoint::from_record).collect(),
         host: r.get(2)?.as_bytes()?.try_into().ok()?,
         token: r.get(3)?.as_bytes()?.try_into().ok()?,
+        extra: r.without(&[1, 2, 3]),
     })
 }
 
@@ -165,6 +169,30 @@ fn read_reach(r: &Record) -> Option<Reach> {
 /// others are not to have it.
 pub fn set_reach(author: &IdentityId, reach: &[Reach]) -> SpaceOp {
     SpaceOp::set(reach_node_id(author), 1, Some(reach_list(reach)))
+}
+
+/// The reach node's field for the presence secret (`profiles.md#reach`,
+/// `hosts.md#local-discovery`, D74): set only in a relationship, and only
+/// where the other is a trusted contact.
+pub const PRESENCE: u64 = 2;
+
+/// Sets, or with `None` clears, the presence secret `author` gives the
+/// other in a relationship: field 2 of their reach node. Field 1, and any
+/// other field, stays as it is.
+pub fn set_presence(author: &IdentityId, secret: Option<[u8; 32]>) -> SpaceOp {
+    SpaceOp::set(reach_node_id(author), PRESENCE, secret.map(Value::from))
+}
+
+/// Every presence secret `who` gives in their reach node here: each value
+/// field 2 holds now, where two of their devices set it at the same
+/// moment more than one. A value that is not 32 bytes is no secret.
+pub fn presence_of(state: &State, who: &IdentityId) -> Vec<[u8; 32]> {
+    let values = state.reach_values(who, PRESENCE).iter();
+    let secrets = values.filter_map(|v| v.value.as_ref()?.as_bytes()?.try_into().ok());
+    let mut all: Vec<[u8; 32]> = secrets.collect();
+    all.sort();
+    all.dedup();
+    all
 }
 
 /// What the entry holds by which `who` leaves a space: `leave`, and a

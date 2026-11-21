@@ -91,6 +91,8 @@ const PUNCH_FOR_CONTACT_EVERY: Duration = Duration::from_secs(5);
 /// How lately a session must have been heard from to count as alive when
 /// someone says the device at its other end is looking for this one.
 const HEARD_LATELY: Duration = Duration::from_secs(5);
+/// How often a contact is tried at one address their tag was seen at.
+const NEARBY_EVERY: Duration = Duration::from_secs(10);
 /// How long a look waits for a host in use for something else.
 const HOST_IN_USE_FOR: Duration = Duration::from_secs(5);
 
@@ -177,6 +179,9 @@ pub struct Rendezvous {
     /// How each contact was last looked for, and their sessions coming and
     /// going: what `contact-status` shows.
     trails: Mutex<HashMap<[u8; 32], Trail>>,
+    /// When each contact was last tried at an address whose advertisement
+    /// carried their tag (D74): at most once in [`NEARBY_EVERY`].
+    nearby: Mutex<HashMap<([u8; 32], SocketAddr), Instant>>,
 }
 
 /// The most sessions opening and closing kept for each contact.
@@ -1631,6 +1636,86 @@ pub async fn try_at(d: &Arc<Daemon>, who: [u8; 32], addr: SocketAddr) {
                 format!("their {}: reached at {addr}", device_label(&device)),
             );
             return;
+        }
+    }
+    d.rendezvous.step(
+        &who,
+        Some(false),
+        format!("none of their devices answered at {addr}"),
+    );
+}
+
+/// An advertisement on the local network carried a trusted contact's tag
+/// (D74, `hosts.md#local-discovery`): each of their devices without a
+/// session is tried at its address, as at one their host named. A tag is a
+/// hint to try and nothing more: only a session says they are near, and
+/// the trail says which. Each address is tried at most once in
+/// [`NEARBY_EVERY`].
+pub async fn found_nearby(d: &Arc<Daemon>, who: [u8; 32], addr: SocketAddr) {
+    let connects = d
+        .core()
+        .contacts()
+        .iter()
+        .any(|c| c.identity == who && c.connects());
+    if !connects {
+        return;
+    }
+    let theirs: Vec<(KeyId, HybridPublicKey)> = {
+        let core = d.core();
+        let Some(o) = core.others.get(&who) else {
+            return;
+        };
+        let st = o.log.state();
+        if st.frozen {
+            return;
+        }
+        st.keys
+            .values()
+            .filter_map(|k| Some((k.key, k.link_key.clone()?)))
+            .collect()
+    };
+    if theirs.iter().all(|(_, l)| reached(d, l.x25519())) {
+        return;
+    }
+    {
+        let mut tried = lock(&d.rendezvous.nearby);
+        let recent = tried
+            .get(&(who, addr))
+            .is_some_and(|t| t.elapsed() < NEARBY_EVERY);
+        if recent {
+            return;
+        }
+        tried.retain(|_, t| t.elapsed() < NEARBY_EVERY);
+        tried.insert((who, addr), Instant::now());
+    }
+    // One look at a time, as for any other.
+    if !lock(&d.rendezvous.looking).insert(who) {
+        return;
+    }
+    let _looking = Looking { d, who };
+    d.rendezvous.look_begins(
+        &who,
+        format!("their tag seen on the local network at {addr}: trying their devices there"),
+    );
+    for (device, link) in theirs {
+        if reached(d, link.x25519()) {
+            continue;
+        }
+        match d.dial(|c| Target::new(addr, c, &link)).await {
+            Ok(s) => {
+                d.on_session(s);
+                d.rendezvous.step(
+                    &who,
+                    Some(true),
+                    format!(
+                        "their {}: found on the local network at {addr}",
+                        device_label(&device)
+                    ),
+                );
+                tracing::info!("found {} on the local network at {addr}", short(&who));
+                return;
+            }
+            Err(e) => tracing::debug!("{} at {addr}: {e}", short(&device)),
         }
     }
     d.rendezvous.step(

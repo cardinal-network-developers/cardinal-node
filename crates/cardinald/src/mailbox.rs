@@ -726,6 +726,7 @@ async fn reach_here(
             endpoints: grant.endpoints,
             host,
             token,
+            extra: Default::default(),
         };
         if new {
             given.new.push(reach.clone());
@@ -1486,6 +1487,7 @@ async fn deliver_to(d: &Arc<Daemon>, space: &SpaceId, member: &[u8; 32]) {
 /// Delivers what this device wrote to each member it has no session with.
 async fn deliver(d: &Arc<Daemon>) {
     keep_own_entry(d);
+    crate::presence::keep(d);
     let shared = d.core().shared_spaces();
     for (space, members) in shared {
         // Before anything else, since it holds for a space this person
@@ -1700,6 +1702,7 @@ mod tests {
             endpoints: vec![Endpoint::parse("203.0.113.9:7171").unwrap(); 2],
             host: [1; 32],
             token: [2; 16],
+            extra: Default::default(),
         };
         let op = relationship::set_reach(&[3; 32], &[reach.clone(), reach]);
         let body = op.record().encode();
@@ -1714,12 +1717,14 @@ mod tests {
             endpoints: vec![home.clone()],
             host: [9; 32],
             token: OTHER,
+            extra: Default::default(),
         };
         let mut reach = vec![
             Reach {
                 endpoints: vec![home.clone()],
                 host: [1; 32],
                 token: T,
+                extra: Default::default(),
             },
             theirs.clone(),
         ];
@@ -1770,6 +1775,7 @@ mod tests {
             endpoints: vec![Endpoint::from_record(&radio)],
             host: [n; 32],
             token: [n; 16],
+            extra: Default::default(),
         };
         let old = Endpoint::parse("172.20.1.20:7171").unwrap();
         let now = [Endpoint::parse("203.0.113.9:7171").unwrap()];
@@ -1777,6 +1783,7 @@ mod tests {
             endpoints: vec![old],
             host: [1; 32],
             token: T,
+            extra: Default::default(),
         };
         let mut reach = vec![other(7), here, other(8)];
         assert!(kept_current(
@@ -1981,6 +1988,7 @@ mod tests {
             endpoints: vec![Endpoint::parse("203.0.113.9:7171").unwrap()],
             host: [0x47; 32],
             token,
+            extra: Default::default(),
         };
         let op = relationship::set_reach(&[0x48; 32], &[reach]);
 
@@ -2585,5 +2593,83 @@ mod tests {
         }
         assert_eq!(h.active(), Vec::<Token>::new(), "tokens nothing names");
         assert_eq!(h.revoked(), revoked + 1, "it was tried at every look");
+    }
+
+    /// The presence secret this person gives Bo, as his device reads it.
+    fn given(h: &Home) -> Vec<[u8; 32]> {
+        let core = h.d.core();
+        let sp = core.spaces[&h.rel].space.as_ref().unwrap();
+        relationship::presence_of(sp.state(), &h.me)
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_trusted_contact_is_given_the_presence_secret_and_one_trusted_no_longer_is_not() {
+        let h = Home::new().await;
+        assert!(crate::presence::current(&h.d.core()).is_none());
+        crate::presence::keep(&h.d);
+        let first = crate::presence::current(&h.d.core()).expect("made for Bo");
+        assert_eq!(given(&h), [first]);
+        assert_eq!(crate::presence::advertised(&h.d.core()), Some(first));
+        // Nothing more to do.
+        let n = h.entries(&h.rel);
+        crate::presence::keep(&h.d);
+        assert_eq!(h.entries(&h.rel), n);
+        // Trusted no longer: a new secret, which he is not given; and with
+        // nobody trusted, nothing is advertised.
+        h.trusts_bo(false);
+        crate::presence::keep(&h.d);
+        let second = crate::presence::current(&h.d.core()).unwrap();
+        assert_ne!(second, first);
+        assert_eq!(crate::presence::secrets(&h.d.core()).len(), 1);
+        assert_eq!(given(&h), [first], "nothing new is written to him");
+        assert_eq!(crate::presence::advertised(&h.d.core()), None);
+        // The old one he has is not in use: no new one at every look.
+        crate::presence::keep(&h.d);
+        assert_eq!(crate::presence::current(&h.d.core()), Some(second));
+        // Trusted again, he is given the one in use.
+        h.trusts_bo(true);
+        crate::presence::keep(&h.d);
+        assert_eq!(given(&h), [second]);
+        assert_eq!(crate::presence::current(&h.d.core()), Some(second));
+        // Of two made at once, the one with the lowest node id is used,
+        // and given where the other was.
+        let account = h.d.core().account_id().unwrap();
+        let op = crate::core::create_secret(crate::presence::PURPOSE, &[9; 32]);
+        h.d.write_and_push(&account, vec![op]).unwrap();
+        let all = crate::presence::secrets(&h.d.core());
+        assert_eq!(all.len(), 2);
+        let lowest = all.iter().min().unwrap().1;
+        crate::presence::keep(&h.d);
+        assert_eq!(crate::presence::current(&h.d.core()), Some(lowest));
+        assert_eq!(given(&h), [lowest]);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_presence_secret_leaves_the_list_of_hosts_as_it_is() {
+        let h = Home::new().await;
+        assert!(!h.d.core().reach_is_set(&h.rel, &h.me));
+        crate::presence::keep(&h.d);
+        assert_eq!(given(&h).len(), 1);
+        assert!(
+            !h.d.core().reach_is_set(&h.rel, &h.me),
+            "field 2 is not field 1"
+        );
+    }
+
+    #[test]
+    fn a_host_entry_keeps_fields_this_version_does_not_know() {
+        let mut extra = Record::new();
+        extra.insert(9, "from later");
+        let reach = Reach {
+            endpoints: vec![Endpoint::parse("203.0.113.9:7171").unwrap()],
+            host: [4; 32],
+            token: [5; 16],
+            extra,
+        };
+        let op = relationship::set_reach(&[6; 32], std::slice::from_ref(&reach));
+        let list = op.record().get(3).unwrap().as_list().unwrap();
+        let entry = list[0].as_record().unwrap();
+        assert_eq!(entry.get(9).and_then(Value::as_text), Some("from later"));
+        assert_eq!(entry.get(2).and_then(Value::as_bytes), Some(&[4u8; 32][..]));
     }
 }

@@ -39,6 +39,7 @@ pub mod outside;
 pub mod pair;
 pub mod paths;
 pub mod portmap;
+pub mod presence;
 pub mod recovering;
 pub mod recovery;
 pub mod rendezvous;

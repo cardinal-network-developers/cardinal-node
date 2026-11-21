@@ -3535,6 +3535,7 @@ mod tests {
                 endpoints: Vec::new(),
                 host: key.unwrap_or([9; 32]),
                 token: cardinal_crypto::random_bytes(),
+                extra: Default::default(),
             };
             let list = if host { vec![reach] } else { Vec::new() };
             let op = relationship::set_reach(&self.id(), &list);
@@ -3717,6 +3718,7 @@ mod tests {
             endpoints: Vec::new(),
             host,
             token: [n; 16],
+            extra: Default::default(),
         };
         // A yes on one device, and a no on another at the same moment.
         let yes = relationship::set_reach(&me, &[one(own, 1)]);
@@ -3878,6 +3880,7 @@ mod tests {
             endpoints: Vec::new(),
             host,
             token: [n; 16],
+            extra: Default::default(),
         };
         let tokens =
             |list: &[relationship::Reach]| -> Vec<u8> { list.iter().map(|r| r.token[0]).collect() };
@@ -4083,6 +4086,7 @@ mod tests {
                     endpoints: grant.endpoints,
                     host: *grant.link_key.x25519(),
                     token: cardinal_crypto::random_bytes(),
+                    extra: Default::default(),
                 });
                 let set = relationship::set_reach(&me, &list);
                 self.core.write_entry(space, vec![set]).unwrap();
@@ -4442,6 +4446,7 @@ mod tests {
             endpoints: Vec::new(),
             host: [9; 32],
             token: cardinal_crypto::random_bytes(),
+            extra: Default::default(),
         };
         let set = relationship::set_reach(&me, &[reach]);
         bo.core

@@ -1497,7 +1497,7 @@ pub async fn status(
     } else if look && c.connects() {
         crate::rendezvous::reach_now(d, c.identity, c.space).await;
     }
-    let (theirs, reach, mine, name_of) = {
+    let (theirs, reach, mine, name_of, nearby) = {
         let core = d.core();
         let theirs: Vec<([u8; 32], [u8; 32])> = core
             .others
@@ -1515,7 +1515,16 @@ pub async fn status(
             .me()
             .map(|me| core.reach_of(&c.space, &me))
             .unwrap_or_default();
-        (theirs, reach, mine, core.device_names())
+        // Whether each gave the other a presence secret here (D74).
+        let sp = core.spaces.get(&c.space).and_then(|h| h.space.as_ref());
+        let gives = |who: &[u8; 32]| {
+            sp.is_some_and(|sp| !relationship::presence_of(sp.state(), who).is_empty())
+        };
+        let nearby = json!({
+            "they_give_secret": gives(&c.identity),
+            "you_give_secret": core.me().is_some_and(|me| gives(&me)),
+        });
+        (theirs, reach, mine, core.device_names(), nearby)
     };
     let label = |x: &[u8; 32]| -> String {
         if let Some(k) = d.core().is_own_device(x) {
@@ -1586,6 +1595,7 @@ pub async fn status(
         "direct_sessions": c.connects(),
         "devices": devices,
         "their_reach": reach_json(d, &reach, &theirs),
+        "nearby": nearby,
         "your_reach": reach_json(d, &mine, &[]),
         "in_use_for_s": in_use.map(|t| t.as_secs()),
         "looked_for": looked_for,
