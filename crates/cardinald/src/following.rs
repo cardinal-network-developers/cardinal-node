@@ -12,7 +12,7 @@ use std::sync::Arc;
 
 use cardinal_space::SpaceId;
 
-use crate::core::Succeeded;
+use crate::core::{short, Succeeded};
 use crate::daemon::Daemon;
 
 /// Follows every successor that stands and can be checked, posts again
@@ -34,6 +34,7 @@ pub fn follow(d: &Arc<Daemon>) {
     for (space, entries) in written {
         d.push(&space, entries);
     }
+    fetch_initial(d);
     let mut new: Vec<SpaceId> = open(d)
         .into_iter()
         .filter(|s| !before.contains(s))
@@ -51,6 +52,60 @@ pub fn follow(d: &Arc<Daemon>) {
     if any {
         d.bump();
     }
+}
+
+/// The successors whose initial state is being fetched.
+static FETCHING: std::sync::Mutex<Vec<SpaceId>> = std::sync::Mutex::new(Vec::new());
+
+/// Fetches the initial state of each successor held here that waits for
+/// it and whose old space is not held, from whoever has it in touch, and
+/// opens the successor on it.
+fn fetch_initial(d: &Arc<Daemon>) {
+    let wanted = d.core().initial_wanted();
+    for (space, reference) in wanted {
+        {
+            let mut busy = FETCHING.lock().unwrap_or_else(|e| e.into_inner());
+            if busy.contains(&space) {
+                continue;
+            }
+            busy.push(space);
+        }
+        let d2 = d.clone();
+        d.rt.spawn_blocking(move || {
+            let got = fetch_blob(&d2, &reference);
+            match got.and_then(|bytes| d2.core().take_initial(&space, &bytes)) {
+                Ok(()) => {
+                    tracing::info!("space {}: opened on its initial state", short(&space));
+                    d2.bump();
+                }
+                Err(e) => tracing::debug!("space {}: its initial state: {e:#}", short(&space)),
+            }
+            let mut busy = FETCHING.lock().unwrap_or_else(|e| e.into_inner());
+            busy.retain(|s| *s != space);
+        });
+    }
+}
+
+/// A whole blob, from this person's devices or a contact's in touch.
+fn fetch_blob(d: &Arc<Daemon>, reference: &cardinal_encoding::Record) -> anyhow::Result<Vec<u8>> {
+    use cardinal_link::Priority;
+    let blob = cardinal_blob::BlobRef::from_record(reference)
+        .map_err(|e| anyhow::anyhow!("not a blob reference: {e}"))?;
+    let contacts: Vec<[u8; 32]> = d.contacts_in_touch().into_iter().map(|(w, _)| w).collect();
+    let mut last = anyhow::anyhow!("nobody who has it is in touch");
+    for who in [None].into_iter().chain(contacts.into_iter().map(Some)) {
+        let fetch = match who {
+            Some(w) => crate::fetch::Fetcher::from_contact(d, Priority::Background, w),
+            None => crate::fetch::Fetcher::new(d, Priority::Background),
+        };
+        let mut reader = cardinal_blob::BlobReader::new(&*d.store, &fetch, blob);
+        let mut out = Vec::new();
+        match std::io::copy(&mut reader, &mut out) {
+            Ok(_) => return Ok(out),
+            Err(e) => last = e.into(),
+        }
+    }
+    Err(last)
 }
 
 /// Posts again the work held back from `space`, its person having said so.

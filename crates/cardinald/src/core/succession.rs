@@ -205,6 +205,52 @@ impl Core {
         out
     }
 
+    /// The successors held here that wait for their initial state, with
+    /// its blob reference, where the space each succeeds is not held: a
+    /// member added to a successor, or a device of theirs, starts from
+    /// what its creator put there (`spaces.md#what-comes-across`).
+    pub fn initial_wanted(&self) -> Vec<(SpaceId, Record)> {
+        let mut out = Vec::new();
+        for (id, h) in &self.spaces {
+            let Some((_, old, r)) = h.wants_initial.as_ref().filter(|_| h.space.is_none()) else {
+                continue;
+            };
+            let held = old
+                .and_then(|o| self.spaces.get(&o))
+                .is_some_and(|o| o.space.is_some());
+            if !held {
+                out.push((*id, r.clone()));
+            }
+        }
+        out
+    }
+
+    /// Takes the initial state of a successor held here, fetched as the
+    /// blob its genesis names: it must read as a canonical state, and the
+    /// successor opens on it.
+    pub fn take_initial(&mut self, space: &SpaceId, canonical: &[u8]) -> anyhow::Result<()> {
+        let logs = self.logs.clone();
+        let ident = self
+            .identity
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("no identity"))?;
+        let keys = ident.key_refs();
+        let h = self
+            .spaces
+            .get_mut(space)
+            .ok_or_else(|| anyhow::anyhow!("not held"))?;
+        let r = Record::decode(canonical)?;
+        let Some((profile, _, _)) = h.wants_initial.as_ref() else {
+            anyhow::bail!("it waits for no initial state");
+        };
+        State::from_canonical(*profile, &r)?;
+        std::fs::create_dir_all(Holder::dir(&self.paths, space))?;
+        crate::paths::write_private(&h.initial_at, canonical, 0o600)?;
+        h.rebuild(Vec::new(), &keys, &logs);
+        self.settle(space);
+        Ok(())
+    }
+
     /// How much work of this device's is held back from `space`, until its
     /// person says to post it there.
     pub fn held_back(&self, space: &SpaceId) -> usize {

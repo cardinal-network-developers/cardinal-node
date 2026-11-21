@@ -1020,7 +1020,11 @@ pub fn shared_refs(core: &Core, space: &SpaceId, groups: &[SpaceId]) -> Vec<Blob
         let carried = carried
             .flat_map(|m| m.attachments)
             .filter_map(|a| BlobRef::from_record(&a.blob).ok());
-        carried.chain(crate::fetch::state_blobs(sp))
+        // and a successor's initial state, for a member added to it since,
+        // who holds no space it could work it out from
+        let initial = sp.succession().and_then(|s| s.initial_state.as_ref());
+        let initial = initial.and_then(|r| BlobRef::from_record(r).ok());
+        carried.chain(crate::fetch::state_blobs(sp)).chain(initial)
     });
     let own = attached.chain(put).chain(other);
     own.chain(in_groups).collect()

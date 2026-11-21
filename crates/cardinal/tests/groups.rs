@@ -1148,4 +1148,21 @@ fn taking_someone_out_replaces_the_group_for_everyone_else() {
     assert_eq!(role(&bo, &g3, "You"), "member");
     assert_eq!(role(&ana, &g, "Bo"), "member");
     assert!(said(&bo, &g3).contains(&"You: just us".to_owned()));
+
+    // Someone added since holds none of the groups before: the group
+    // starts, for them, from what Ana put in its place.
+    let dan = person(root.path(), "dan");
+    meet(&ana, &dan, "Dan");
+    ask(
+        &ana,
+        json!({"cmd": "group-add", "group": g3, "people": ["Dan"]}),
+    );
+    wait("dan is offered it", 30, || {
+        offers(&dan).iter().any(|o| o["name"] == "Family")
+    });
+    ask(&dan, json!({"cmd": "group-join", "group": g3}));
+    wait("dan reads what was said before he came", 60, || {
+        let all = said(&dan, &g3);
+        all.contains(&"Ana: hello all".to_owned()) && all.contains(&"Bo: just us".to_owned())
+    });
 }

@@ -371,6 +371,13 @@ records "not this host here" in the account, D75; answers `named`:
 `group-reach` (`share`; with `share` false, `host` takes out that one
 host, answering `taken_out`; `groups` gives each group's `reach` with
 `set` and `said_no`),
+`group-remove` (`group`, `who`: the owner takes someone out, answering
+`group`, the id the group has from then on, `was`, the one it had, and
+`left_out`), `group-role` (`group`, `who`, `role`: `reader`, `member` or
+`admin`; a higher role is given in place by an admin or the owner and
+answers `group` as it was, a lower one is the owner's and answers like
+`group-remove`), `group-post-again` (`group`: posts what this device
+held back from the group, answering `posted`),
 `router` (`on`, with `this_device` true for this device alone, else
 for every device of the person's: the account's switch; answers what
 `status` gives as `router`), `network` (with nothing: the network this
@@ -385,6 +392,37 @@ name or key), `reload` (after `init` while the daemon runs), `flush`
 keep everything, whether it counts (`state`: passed, failed, stale,
 unchecked), why not (`reason`), the times of its last check, pass, and
 failure, and checks it left unanswered in a row (`missed`).
+
+## Groups that move on
+
+Nobody is taken out of a space, and no role is lowered in it
+(`spaces.md#members-and-roles`). `group-remove`, and `group-role` with a
+lower role, have the owner's device succeed the group: a new group whose
+genesis names who stays, with what role, and starts from the old group's
+state, its conversation, files and member names under the ids they had.
+The old group ends. Everyone else's devices follow on their own, once
+they have checked it, and from then on the group has the new id;
+whatever named the old one (a request, an offer, a token) finds the new
+one. Whoever was left out is told, keeps the old group as it was, and
+can open nothing of the new one.
+
+A request that changes who is in a group reconciles it with a member
+in touch first, where the owner has another device that could have
+moved it already: with nobody in touch it fails, and changes nothing.
+
+`groups` gives each group `was` (the id of the group it took the place
+of, or null), `ended` (why, where a group ended and nothing here took its
+place: its owner left this person out, handed it on, made it public, or
+put something in its place that does not match it), `held_back` (how
+much of what this device wrote before the group moved on waits for
+`group-post-again`, since someone is in it now that it was written
+without) and `did_not_stand` (successors this person's devices made that
+another took the place of: they do again what each was for).
+
+A device posts again, in the group that stands, what it wrote that the
+new group did not carry: a message written before it heard. Only
+application ops are posted again, by the device that wrote them, once.
+A change made without seeing another stands beside it, in conflict.
 
 ## Inspection
 

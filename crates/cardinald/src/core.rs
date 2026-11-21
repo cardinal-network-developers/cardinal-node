@@ -606,6 +606,9 @@ pub struct Holder {
     /// The entries of the space this one succeeds that its initial state
     /// carried, worked out when first asked.
     carried: Option<std::collections::HashSet<EntryId>>,
+    /// The initial state this successor waits for while it is not here:
+    /// its profile, the space it succeeds, and the blob reference.
+    wants_initial: Option<(Profile, Option<SpaceId>, Record)>,
 }
 
 /// What ingesting objects did.
@@ -660,6 +663,7 @@ impl Holder {
             notes: Notes::default(),
             notes_at: Self::dir(paths, &id).join("succession.json"),
             carried: None,
+            wants_initial: None,
         };
         if let Ok(bytes) = std::fs::read(&h.notes_at) {
             h.notes = serde_json::from_slice(&bytes).unwrap_or_default();
@@ -724,15 +728,19 @@ impl Holder {
         // A successor starts from its initial state, checked against the
         // space it succeeds or written here: until it is, nothing of it
         // is opened (`spaces.md#following`).
-        if space.succession().is_some() {
+        if let Some(from) = space.succession() {
             match self.initial(space.profile()) {
                 Some(st) => space.set_initial_state(st),
                 None => {
+                    let r = from.initial_state.clone();
+                    let wants = r.map(|r| (space.profile(), from.succeeds, r));
+                    self.wants_initial = wants;
                     self.pending = all;
                     return;
                 }
             }
         }
+        self.wants_initial = None;
         let mut rest = all;
         loop {
             let mut progress = false;
