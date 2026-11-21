@@ -126,14 +126,22 @@ pub struct Recovery {
 impl Recovery {
     /// The short fingerprint a guardian checks with the person before
     /// endorsing and confirming: of `recover` fields 1 and 3
-    /// (`identity.md#how-guardians-act`). Ten characters of Crockford's
-    /// base 32, in two groups.
+    /// (`identity.md#how-guardians-act`). Five words from the BIP-39
+    /// English list.
     pub fn fingerprint(&self) -> String {
         fingerprint(&self.root, self.link_key.as_ref())
     }
 }
 
-/// The fingerprint of a new root and the link key that receives shares.
+/// How many words a fingerprint has.
+pub const FINGERPRINT_WORDS: usize = 5;
+
+/// The fingerprint of a new root and the link key that receives shares:
+/// the first 55 bits of `BLAKE3("cardinal recovery fingerprint" || field 1
+/// || field 3)`, most significant bit first, as five 11-bit indexes into
+/// the BIP-39 English list, in order, joined by single spaces. Field 1 is
+/// the root's 32 bytes; field 3, a hybrid public key record, is its
+/// canonical encoding, and nothing when it is absent (DEVIATIONS.md).
 pub fn fingerprint(root: &KeyId, link: Option<&HybridPublicKey>) -> String {
     let mut h = blake3::Hasher::new();
     h.update(b"cardinal recovery fingerprint");
@@ -142,38 +150,35 @@ pub fn fingerprint(root: &KeyId, link: Option<&HybridPublicKey>) -> String {
         h.update(&l.encode());
     }
     let d = h.finalize();
-    const ALPHABET: &[u8; 32] = b"0123456789ABCDEFGHJKMNPQRSTVWXYZ";
-    let bytes = &d.as_bytes()[..7];
-    let (mut acc, mut bits) = (0u64, 0);
-    let mut out = String::new();
-    for b in bytes {
-        acc = (acc << 8) | *b as u64;
-        bits += 8;
-        while bits >= 5 && out.replace('-', "").len() < 10 {
-            bits -= 5;
-            if out.len() == 5 {
-                out.push('-');
-            }
-            out.push(ALPHABET[((acc >> bits) & 31) as usize] as char);
-        }
-    }
-    out
+    let first: [u8; 8] = d.as_bytes()[..8].try_into().expect("eight bytes");
+    let bits = u64::from_be_bytes(first);
+    (0..FINGERPRINT_WORDS)
+        .map(|i| {
+            let at = 64 - 11 * (i + 1);
+            cardinal_crypto::bip39::word(((bits >> at) & 0x7ff) as u16)
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
-/// Reads a fingerprint however it was typed: case, spaces and dashes do
-/// not matter, nor letters that read like digits.
+/// Reads a fingerprint however it was typed: case does not matter, words
+/// may be split by spaces, dashes or anything else that is not a letter,
+/// and a word may be given by its first four letters or more, which tell
+/// every BIP-39 word apart.
 pub fn same_fingerprint(typed: &str, shown: &str) -> bool {
-    let norm = |s: &str| -> String {
-        s.chars()
-            .filter(|c| c.is_ascii_alphanumeric())
-            .map(|c| match c.to_ascii_uppercase() {
-                'O' => '0',
-                'I' | 'L' => '1',
-                c => c,
-            })
+    let words = |s: &str| -> Vec<String> {
+        s.split(|c: char| !c.is_ascii_alphabetic())
+            .filter(|w| !w.is_empty())
+            .map(str::to_ascii_lowercase)
             .collect()
     };
-    !typed.trim().is_empty() && norm(typed) == norm(shown)
+    let (typed, shown) = (words(typed), words(shown));
+    typed.len() == FINGERPRINT_WORDS
+        && typed.len() == shown.len()
+        && typed
+            .iter()
+            .zip(&shown)
+            .all(|(t, s)| t == s || (t.len() >= 4 && s.starts_with(t.as_str())))
 }
 
 /// A guardian's act about a decision, found in their log.
@@ -661,6 +666,49 @@ mod tests {
     use crate::Power;
     use cardinal_crypto::RecoveryPhrase;
 
+    /// Five words, read off the digest's first 55 bits as a string of
+    /// bits, eleven at a time, with no link key and with one.
+    #[test]
+    fn a_fingerprint_is_five_words_of_the_first_55_bits() {
+        let root = [7u8; 32];
+        let link = HybridKeyPair::generate();
+        for link in [None, Some(link.public_key())] {
+            let mut input = b"cardinal recovery fingerprint".to_vec();
+            input.extend_from_slice(&root);
+            if let Some(l) = link {
+                input.extend_from_slice(&l.encode());
+            }
+            let digest = blake3::hash(&input);
+            let bits: String = digest.as_bytes()[..7]
+                .iter()
+                .map(|b| format!("{b:08b}"))
+                .collect();
+            let words: Vec<&str> = (0..5)
+                .map(|i| {
+                    let n = u16::from_str_radix(&bits[i * 11..(i + 1) * 11], 2).unwrap();
+                    cardinal_crypto::bip39::word(n)
+                })
+                .collect();
+            let shown = fingerprint(&root, link);
+            assert_eq!(shown, words.join(" "));
+            // typed as it is read out
+            let typed: Vec<String> = words
+                .iter()
+                .map(|w| w[..w.len().min(4)].to_uppercase())
+                .collect();
+            assert!(same_fingerprint(&typed.join("-"), &shown));
+            assert!(!same_fingerprint(&words[..4].join(" "), &shown));
+            assert!(!same_fingerprint(
+                &words[..4].join(" ").replace(' ', ""),
+                &shown
+            ));
+        }
+        assert_ne!(
+            fingerprint(&root, None),
+            fingerprint(&root, Some(link.public_key()))
+        );
+    }
+
     struct Person {
         log: IdentityLog,
         device: DeviceKeys,
@@ -835,9 +883,9 @@ mod tests {
         let decision = rec.id();
         p.log.insert(rec).unwrap();
         let r = p.log.recovery(&decision).unwrap();
-        assert_eq!(r.fingerprint().len(), 11);
+        assert_eq!(r.fingerprint().split(' ').count(), FINGERPRINT_WORDS);
         assert!(same_fingerprint(
-            &r.fingerprint().to_lowercase(),
+            &r.fingerprint().to_uppercase(),
             &r.fingerprint()
         ));
         // nothing happens until a threshold confirms
