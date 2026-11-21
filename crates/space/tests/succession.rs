@@ -183,6 +183,12 @@ fn succeed(
     )
     .unwrap();
     s.set_identities([t.ana.log.state(), t.bo.log.state(), t.cy.log.state()]);
+    // The owner sets again what only an admin's say counts on.
+    let again = group::reassert_ops(a, &at_cut);
+    if !again.is_empty() {
+        s.write(&t.ana.log, &t.ana.device.signing, again, Some(3))
+            .unwrap();
+    }
     (s, g, at_cut)
 }
 
@@ -218,7 +224,7 @@ fn removing_someone_carries_the_group_and_leaves_them_out() {
         said(&s),
         ["hello from ana", "hello from bo", "hello from cy"]
     );
-    assert_eq!(s.state().canonical(), at_cut.canonical());
+    assert_eq!(s.initial_state().unwrap().canonical(), at_cut.canonical());
     assert_eq!(s.owner(), Some(t.ana.id()));
     assert_eq!(s.role_of(&t.cy.id()), None);
     // Cy's reach node is not carried: nobody there could empty it.
@@ -407,4 +413,132 @@ fn a_delete_of_a_carried_node_yields_to_work_beside_it() {
         assert!(!said(sp).contains(&"hello from cy".to_owned()));
     }
     assert_eq!(s.state().canonical(), theirs.state().canonical());
+}
+
+#[test]
+fn what_a_writer_set_where_only_an_admin_counts_does_not_count_after() {
+    let mut t = three();
+    // Bo, a writer, renames the group and himself; neither counts.
+    {
+        let b = &mut t.spaces[1];
+        let c = relationship::conversation(b).unwrap();
+        let me = group::members(b)
+            .into_iter()
+            .find(|m| m.identity == t.bo.id())
+            .unwrap()
+            .node
+            .unwrap();
+        b.write(
+            &t.bo.log,
+            &t.bo.device.signing,
+            vec![
+                group::rename(c, "Bo's club"),
+                group::set_member_name(me, "Boss"),
+            ],
+            Some(4),
+        )
+        .unwrap();
+    }
+    {
+        let [a, b, _] = &mut t.spaces;
+        sync(b, a, &t.ana.enc);
+    }
+    let name_of = |sp: &Space, who: [u8; 32]| {
+        group::members(sp)
+            .into_iter()
+            .find(|m| m.identity == who)
+            .and_then(|m| m.name)
+    };
+    let was_name = group::name(&t.spaces[0]);
+    let was_bo = name_of(&t.spaces[0], t.bo.id());
+    assert_ne!(was_name, "Bo's club");
+    assert_ne!(was_bo.as_deref(), Some("Boss"));
+    let named = [(t.ana.id(), OWNER), (t.bo.id(), WRITER)];
+    let keys = [
+        t.ana.enc.public_key().clone(),
+        t.bo.enc.public_key().clone(),
+    ];
+    let refs: Vec<_> = keys.iter().collect();
+    let (s, g, at_cut) = succeed(&mut t, &named, &refs);
+    // Carried, his values are there; what stands is what Ana's group said.
+    assert_eq!(group::name(&s), was_name);
+    assert_eq!(name_of(&s, t.bo.id()), was_bo);
+    // and before the owner's first entry comes, carried values say nothing
+    let mut bare = Space::open_genesis(&g, &[&t.bo.enc], None).unwrap();
+    bare.set_initial_state(State::from_canonical(group::GROUP, &at_cut.canonical()).unwrap());
+    bare.set_identities([t.ana.log.state(), t.bo.log.state()]);
+    assert_ne!(group::name(&bare), "Bo's club");
+    assert_ne!(name_of(&bare, t.bo.id()).as_deref(), Some("Boss"));
+}
+
+#[test]
+fn a_canonical_state_that_is_no_tree_is_refused() {
+    let t = three();
+    let canonical = t.spaces[0].state().canonical();
+    // a node whose parent is nowhere in it
+    let mut records: Vec<cardinal_encoding::Value> = canonical.list(1).unwrap().to_vec();
+    let first = records
+        .iter()
+        .position(|r| r.as_record().unwrap().get(2).is_some())
+        .unwrap();
+    let r = records[first]
+        .as_record()
+        .unwrap()
+        .clone()
+        .with(3, [9u8; 16]);
+    records[first] = r.into();
+    let broken = canonical
+        .clone()
+        .with(1, cardinal_encoding::Value::list(records));
+    assert!(State::from_canonical(group::GROUP, &broken).is_err());
+}
+
+#[test]
+fn a_node_whose_maker_can_no_longer_write_is_not_waited_for() {
+    let mut t = three();
+    // Cy writes, Bo reacts to it, and neither reaches Ana before she
+    // makes Cy a reader.
+    let cy_said = t.cy.says(&mut t.spaces[2], "cy, unheard");
+    let reaction = {
+        let [_, b, c] = &mut t.spaces;
+        sync(c, b, &t.bo.enc);
+        let m = relationship::messages(b)
+            .into_iter()
+            .find(|m| m.text == "cy, unheard")
+            .unwrap();
+        let (id, _) = b
+            .write_entry(
+                &t.bo.log,
+                &t.bo.device.signing,
+                vec![relationship::create_reaction(m.id, "+1")],
+                Some(5),
+            )
+            .unwrap();
+        id
+    };
+    let _ = cy_said;
+    let named = [
+        (t.ana.id(), OWNER),
+        (t.bo.id(), WRITER),
+        (t.cy.id(), group::READER),
+    ];
+    let keys = [
+        t.ana.enc.public_key().clone(),
+        t.bo.enc.public_key().clone(),
+        t.cy.enc.public_key().clone(),
+    ];
+    let refs: Vec<_> = keys.iter().collect();
+    let (s, _, _) = succeed(&mut t, &named, &refs);
+    // Cy cannot post his message again there: Bo's reaction goes ahead
+    // without it, at the nearest node the successor has.
+    let none = |_: &EntryId| None;
+    let plan = succession::plan_repost(&t.spaces[1], &reaction, &s, &none);
+    let Plan::Post(r) = plan else {
+        panic!("{plan:?}")
+    };
+    let c = relationship::conversation(&s).unwrap();
+    assert_eq!(
+        r.ops[0].record().get(2).and_then(|v| v.as_bytes()),
+        Some(&c[..])
+    );
 }

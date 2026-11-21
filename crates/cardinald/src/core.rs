@@ -19,6 +19,8 @@ use crate::keys::Keys;
 use crate::paths::Paths;
 
 mod succession;
+#[cfg(test)]
+use succession::ops_hash;
 pub use succession::{Notes, Succeeded};
 
 /// The account-space secret holding the discovery secret.
@@ -597,6 +599,17 @@ pub struct Holder {
     /// (`spaces.md#following`, the trail), as this device's keys opened
     /// them.
     foreign: Vec<SealedEntry>,
+    /// Their sealed ids, to tell one held already by looking it up.
+    foreign_ids: std::collections::HashSet<[u8; 32]>,
+    /// The space each one is the genesis of, by sealed id, once opened
+    /// here (`None`: no key here opens it).
+    pub(crate) foreign_opened: HashMap<[u8; 32], Option<SpaceId>>,
+    /// What following was last judged on here, while nothing it rests on
+    /// has changed: the verdict noted stands.
+    pub(crate) follow_checked: Option<[u8; 32]>,
+    /// By source space: how things stood when this device last posted
+    /// again from it into this one, and found nothing more to do.
+    pub(crate) post_marks: HashMap<SpaceId, [u64; 4]>,
     /// Where the initial state of a successor is kept, as its canonical
     /// state, once it was checked or written here.
     initial_at: PathBuf,
@@ -659,6 +672,10 @@ impl Holder {
             kept_yes: None,
             kept_yes_at: Self::dir(paths, &id).join("kept-yes.json"),
             foreign: Vec::new(),
+            foreign_ids: Default::default(),
+            foreign_opened: HashMap::new(),
+            follow_checked: None,
+            post_marks: HashMap::new(),
             initial_at: Self::dir(paths, &id).join("initial-state.bin"),
             notes: Notes::default(),
             notes_at: Self::dir(paths, &id).join("succession.json"),
@@ -705,6 +722,7 @@ impl Holder {
     ) {
         let mut all: Vec<SealedEntry> = std::mem::take(&mut self.pending);
         all.extend(std::mem::take(&mut self.foreign));
+        self.foreign_ids.clear();
         if let Some(sp) = self.space.take() {
             all.extend(sp.sealed_entries().map(|(_, s)| s.clone()));
         }
@@ -728,7 +746,8 @@ impl Holder {
         // A successor starts from its initial state, checked against the
         // space it succeeds or written here: until it is, nothing of it
         // is opened (`spaces.md#following`).
-        if let Some(from) = space.succession() {
+        // One whose genesis gives no initial state starts from an empty one.
+        if let Some(from) = space.succession().filter(|f| f.initial_state.is_some()) {
             match self.initial(space.profile()) {
                 Some(st) => space.set_initial_state(st),
                 None => {
@@ -785,7 +804,7 @@ impl Holder {
     /// a successor's genesis, which the trail gives with the old space's
     /// set. Anything else of another space is no part of this one.
     fn keep_foreign(&mut self, s: SealedEntry) {
-        keep_foreign_in(&mut self.foreign, s);
+        keep_foreign_in(&mut self.foreign, &mut self.foreign_ids, s);
     }
 
     /// The initial state kept here, if this is a successor whose initial
@@ -911,7 +930,9 @@ impl Holder {
                     }
                     Ok(_) => {}
                     Err(cardinal_space::Error::NoEpochKey) => self.pending.push(s),
-                    Err(cardinal_space::Error::WrongSpace) => keep_foreign_in(&mut self.foreign, s),
+                    Err(cardinal_space::Error::WrongSpace) => {
+                        keep_foreign_in(&mut self.foreign, &mut self.foreign_ids, s)
+                    }
                     Err(e) => tracing::warn!("space {}: entry rejected: {e}", short(&self.id)),
                 }
             }
@@ -934,7 +955,9 @@ impl Holder {
                 Ok(Inserted::Added(released)) => complete += released.len(),
                 Ok(_) => {}
                 Err(cardinal_space::Error::NoEpochKey) => self.pending.push(s),
-                Err(cardinal_space::Error::WrongSpace) => keep_foreign_in(&mut self.foreign, s),
+                Err(cardinal_space::Error::WrongSpace) => {
+                    keep_foreign_in(&mut self.foreign, &mut self.foreign_ids, s)
+                }
                 Err(_) => {}
             }
         }
@@ -1203,8 +1226,12 @@ impl Holder {
 }
 
 /// [`Holder::keep_foreign`], on the list alone.
-fn keep_foreign_in(foreign: &mut Vec<SealedEntry>, s: SealedEntry) {
-    if s.wraps().is_some() && !foreign.iter().any(|f| f.sealed_id() == s.sealed_id()) {
+fn keep_foreign_in(
+    foreign: &mut Vec<SealedEntry>,
+    ids: &mut std::collections::HashSet<[u8; 32]>,
+    s: SealedEntry,
+) {
+    if s.wraps().is_some() && ids.insert(s.sealed_id()) {
         foreign.push(s);
     }
 }
@@ -1739,6 +1766,13 @@ impl Core {
         if !reach.iter().any(|r| r.host == here) {
             return None;
         }
+        // A succession that left someone out is a change of epoch for
+        // everyone at once: a host gives the successor a token of its own
+        // in place of the one it carried, which whoever was left out knew
+        // (`hosts.md#delivery-tokens`, "A successor"). The old one still
+        // serves whoever has not followed yet.
+        let replaced = self.carried_tokens_to_replace(space, &me);
+        let active = |t: &[u8; 16]| active(t) && !replaced.contains(t);
         if host {
             let mut kept = reach.clone();
             let changed = crate::mailbox::kept_current(&mut kept, &here, endpoints, active, fresh);
@@ -1765,6 +1799,37 @@ impl Core {
         }
         reach.retain(|r| r.host != here);
         Some(reach)
+    }
+
+    /// The tokens of `me`'s that a successor carried from a space it left
+    /// someone out of, and that `me` has not given in the successor itself:
+    /// to be replaced there.
+    fn carried_tokens_to_replace(&self, space: &SpaceId, me: &[u8; 32]) -> Vec<[u8; 16]> {
+        let Some(sp) = self.spaces.get(space).and_then(|h| h.space.as_ref()) else {
+            return Vec::new();
+        };
+        let Some(old) = sp.succeeds() else {
+            return Vec::new();
+        };
+        let named: Vec<[u8; 32]> = cardinal_space::succession::genesis_members(sp)
+            .into_iter()
+            .map(|(w, _)| w)
+            .collect();
+        let was = self.spaces.get(&old).and_then(|h| h.space.as_ref());
+        let left_out =
+            was.is_some_and(|o| o.validity().identities().iter().any(|w| !named.contains(w)));
+        if !left_out {
+            return Vec::new();
+        }
+        let given: Vec<[u8; 16]> = cardinal_space::relationship::reach_ever(sp, me)
+            .into_iter()
+            .map(|r| r.token)
+            .collect();
+        let carried = cardinal_space::relationship::reach_of(sp, me).into_iter();
+        carried
+            .map(|r| r.token)
+            .filter(|t| !given.contains(t))
+            .collect()
     }
 
     /// Whether this device is a host of its person's with a mailbox, by
@@ -6414,5 +6479,190 @@ mod tests {
         let (found, key) = bo.core.envelope_space(&[4; 16], &epoch).unwrap();
         assert_eq!(found, s);
         assert!(key.is_some());
+        // Cy, left out, knew it: Bo's device, his host, gives the successor
+        // one of its own, and the old one still serves.
+        let due = bo.core.own_entry_due(&s, true, None, |_| true, || [5; 16]);
+        let due = due.expect("a new token is due");
+        assert_eq!(due.iter().map(|r| r.token).collect::<Vec<_>>(), [[5; 16]]);
+        assert!(bo.core.tokens_given(&s, &own).contains(&[4; 16]));
+    }
+
+    #[test]
+    fn work_the_standing_cut_carried_is_not_posted_again_from_a_rival() {
+        // Two of Ana's devices each take Cy out; one held Bo's message,
+        // the other did not. Bo follows the one without it and posts it
+        // there; when the one with it stands, it is not posted again.
+        for _ in 0..40 {
+            let ([mut ana, mut bo, _cy], g) = family();
+            let stores = [(); 3].map(|_| cardinal_blob::MemStore::new());
+            let other_dir = tempfile::tempdir().unwrap();
+            let copy = std::process::Command::new("cp")
+                .arg("-a")
+                .arg(format!("{}/.", ana._dir.path().display()))
+                .arg(other_dir.path())
+                .status()
+                .unwrap();
+            assert!(copy.success());
+            let paths = Paths::at(other_dir.path());
+            let keys = Arc::new(Keys::load_or_create(&paths.device_key()).unwrap());
+            let mut ana2 = Person {
+                _dir: other_dir,
+                core: Core::load(&paths, keys).unwrap(),
+                root: cardinal_crypto::SigningKey::generate(),
+            };
+            let said = bo.says(&g, "bo's before");
+            ana2.takes(&g, &[said]);
+            let s1 = ana
+                .core
+                .succeed(&stores[0], &g, &[(bo.id(), WRITER)])
+                .unwrap()
+                .new;
+            let s2 = ana2
+                .core
+                .succeed(&stores[2], &g, &[(bo.id(), WRITER)])
+                .unwrap()
+                .new;
+            if s2 > s1 {
+                continue;
+            }
+            bo.syncs(&ana, &g, &stores[1]);
+            assert!(bo.holds(&s1));
+            let n = |p: &Person, sp: &SpaceId| {
+                p.said(sp).iter().filter(|m| *m == "bo's before").count()
+            };
+            assert_eq!(n(&bo, &s1), 1, "posted again where it was not carried");
+            let later = bo.says(&s1, "bo's in the first");
+            let _ = later;
+            bo.syncs(&ana2, &g, &stores[1]);
+            assert_eq!(bo.core.current(&g), s2);
+            assert!(bo.holds(&s2));
+            bo.core.follow(&stores[1]);
+            assert_eq!(n(&bo, &s2), 1, "{:?}", bo.said(&s2));
+            assert!(bo.said(&s2).contains(&"bo's in the first".to_owned()));
+            return;
+        }
+        panic!("the second succession never had the smaller id");
+    }
+
+    #[test]
+    fn a_posting_again_written_before_a_crash_is_not_written_twice() {
+        let ([mut ana, mut bo, _cy], g) = family();
+        let store = cardinal_blob::MemStore::new();
+        bo.says(&g, "unheard");
+        let s = ana
+            .core
+            .succeed(&store, &g, &[(bo.id(), WRITER)])
+            .unwrap()
+            .new;
+        bo.syncs(&ana, &g, &store);
+        let n = |p: &Person| p.said(&s).iter().filter(|m| *m == "unheard").count();
+        assert_eq!(n(&bo), 1);
+        // As if it stopped after writing and before noting it.
+        let h = bo.core.spaces.get_mut(&s).unwrap();
+        let (new, origin) = h.notes.posted.pop_first().unwrap();
+        let written = hex::decode(&new).unwrap();
+        let written: EntryId = written.try_into().unwrap();
+        let ops = h
+            .space
+            .as_ref()
+            .unwrap()
+            .entry(&written)
+            .unwrap()
+            .ops()
+            .to_vec();
+        h.notes.pending.insert(origin, ops_hash(&ops));
+        h.post_marks.clear();
+        bo.core.follow(&store);
+        assert_eq!(n(&bo), 1);
+        let h = &bo.core.spaces[&s];
+        assert!(h.notes.pending.is_empty());
+        assert_eq!(h.notes.posted.len(), 1);
+    }
+
+    #[test]
+    fn a_device_that_stopped_while_following_writes_the_account_after() {
+        let ([mut ana, mut bo, _cy], g) = family();
+        let store = cardinal_blob::MemStore::new();
+        let s = ana
+            .core
+            .succeed(&store, &g, &[(bo.id(), WRITER)])
+            .unwrap()
+            .new;
+        bo.syncs(&ana, &g, &store);
+        assert!(bo.core.is_joined(&s));
+        // its node for the successor never written
+        let acc = bo.core.account_id().unwrap();
+        let st = bo.space(&acc).state();
+        let gone: Vec<SpaceOp> = account::spaces(st)
+            .into_iter()
+            .filter(|r| r.space == s)
+            .map(|r| SpaceOp::delete(r.node))
+            .collect();
+        bo.core.write_entry(&acc, gone).unwrap();
+        bo.core.follow(&store);
+        assert!(bo.core.is_joined(&s));
+    }
+
+    #[test]
+    fn a_successor_opened_unchecked_is_left_when_it_does_not_match() {
+        let ([mut ana, _bo, _cy], g) = family();
+        let mut dan = Person::new();
+        dan.meets(&ana);
+        ana.meets(&dan);
+        let dan_shown = [(dan.id(), "Dan".to_owned())];
+        let added = ana.core.add_to_group(&g, &dan_shown).unwrap();
+        let _ = added;
+        // Ana's device writes a successor whose initial state is not the
+        // state at its cut: it pins no log, so nothing counts there, and
+        // it claims the whole group.
+        let store = cardinal_blob::MemStore::new();
+        let ident = ana.core.identity.as_ref().unwrap();
+        let sp = ana.space(&g);
+        let epoch = cardinal_space::EpochKey::generate();
+        let claimed = sp.state().canonical();
+        let empty = cardinal_space::State::from_canonical(group::GROUP, &claimed).unwrap();
+        let (initial, canonical) = super::succession::initial_ref_for_test(&store, &epoch, &empty);
+        let from = cardinal_space::entry::Succession {
+            succeeds: Some(g),
+            initial_state: Some(initial),
+            cut: sp.heads(),
+            ..Default::default()
+        };
+        let (forged, genesis) = Space::create_successor(
+            group::GROUP,
+            sp.policy().clone(),
+            &from,
+            epoch,
+            empty,
+            &ident.log,
+            &ana.core.keys.device.signing,
+            &[&ana.enc(), &dan.enc()],
+            vec![
+                SpaceOp::add_member(ana.id(), OWNER),
+                SpaceOp::add_member(dan.id(), WRITER),
+            ],
+            Some(now_ms()),
+        )
+        .unwrap();
+        let s = forged.id();
+        let (_, end) = ana.core.write_entry(&g, vec![SpaceOp::succeed(s)]).unwrap();
+        // Dan has the successor alone, and opens it on what he is given.
+        dan.takes(&s, &[genesis.encode()]);
+        assert!(!dan.holds(&s));
+        assert_eq!(dan.core.initial_wanted().len(), 1);
+        dan.core.take_initial(&s, &canonical).unwrap();
+        assert!(dan.holds(&s));
+        // Then the group comes, with its end: checked now, it fails, and
+        // he leaves the successor.
+        let mut all = ana.all_of(&g);
+        all.push(end);
+        all.push(genesis.encode());
+        dan.takes(&g, &all);
+        dan.core.follow(&store);
+        assert!(!dan.holds(&s));
+        let (why, _) = dan.core.succession_news(&g);
+        assert!(why.unwrap().contains("does not match"));
+        // and it is not taken on anyone's word again
+        assert!(dan.core.take_initial(&s, &canonical).is_err());
     }
 }

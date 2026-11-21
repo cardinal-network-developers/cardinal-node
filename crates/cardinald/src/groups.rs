@@ -674,6 +674,7 @@ pub fn list_of(core: &Core) -> Json {
             "ended": ended,
             "did_not_stand": lost.iter().map(hex::encode).collect::<Vec<_>>(),
             "held_back": core.held_back(id),
+            "not_posted": core.spaces.get(id).map_or(0, |h| h.notes().not_posted),
             "was": sp.succeeds().map(hex::encode),
             "group": hex::encode(id),
             "name": name,

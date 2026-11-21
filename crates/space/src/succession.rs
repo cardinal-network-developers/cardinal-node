@@ -20,9 +20,10 @@ use crate::state::{node_field, reach_node_id, State, ROOT};
 use crate::SpaceOp;
 
 /// `log` as it was at `heads`: its genesis and every entry of its own that
-/// is one of them or in their causal past. Heads it does not hold, and the
-/// heads of other identities' logs held under its label, are passed over;
-/// what is held under its label (a guardian's entries) is kept whole.
+/// is one of them or in their causal past, and of each other identity's
+/// log held under its label (a guardian's entries), the entries that are
+/// one of its heads among `heads` or in their causal past. Heads it does
+/// not hold are passed over.
 pub fn pinned_log(log: &IdentityLog, heads: &[EntryId]) -> IdentityLog {
     let dag = log.dag();
     let own: Vec<EntryId> = heads.iter().filter(|h| dag.contains(h)).copied().collect();
@@ -36,8 +37,14 @@ pub fn pinned_log(log: &IdentityLog, heads: &[EntryId]) -> IdentityLog {
         }
     }
     for other in log.attached() {
-        for e in other.entries() {
-            let _ = pinned.attach(e.clone());
+        let odag = other.dag();
+        let theirs: Vec<EntryId> = heads.iter().filter(|h| odag.contains(h)).copied().collect();
+        let mut past = odag.ancestors_of(&theirs);
+        past.extend(theirs.iter().copied());
+        for x in odag.log_order() {
+            if past.contains(x) {
+                let _ = pinned.attach(odag.get(x).expect("held").clone());
+            }
         }
     }
     pinned
@@ -280,12 +287,18 @@ pub fn plan_repost(
             seen_in_from(x)
         }
     };
-    let members: HashSet<IdentityId> = into.validity().identities().into_iter().collect();
-    let in_into: HashSet<IdentityId> = genesis_members(into)
+    // Who in `into` may write a `create`: whoever is there but cannot will
+    // never post theirs again, and counts as gone.
+    let mut writers: HashSet<IdentityId> = genesis_members(into)
         .into_iter()
+        .filter(|(_, r)| *r >= WRITER)
         .map(|(w, _)| w)
-        .chain(members)
         .collect();
+    for m in &into.validity().members {
+        if m.role >= WRITER {
+            writers.insert(m.identity);
+        }
+    }
     let target = into.state();
     let source = from.state();
     let profile = into.profile();
@@ -309,7 +322,8 @@ pub fn plan_repost(
         }
         let creator = source.node(n).map(|x| x.creator);
         match creator {
-            Some(c) if in_into.contains(&c) => Named::Wait,
+            // someone there who can still write it: it comes
+            Some(c) if writers.contains(&c) => Named::Wait,
             Some(_) => Named::Gone,
             None => Named::Gone,
         }

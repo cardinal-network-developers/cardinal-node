@@ -124,12 +124,54 @@ fn admins_value<'a>(space: &'a Space, n: &'a Node, key: u64) -> Option<&'a Value
         // A value a successor carried was judged where it was written,
         // and the owner, who wrote the successor, stands behind it
         // (`spaces.md#what-comes-across`).
+        // A value a successor carried counts for nothing by itself: who
+        // wrote it is not here to judge. The owner sets these fields again,
+        // as the old space resolved them, in the successor's first entry
+        // ([`reassert_ops`]).
         let counts = match dag.get(&v.entry) {
             Some(e) => role_of(space, &e.author()).is_some_and(|r| r >= ADMIN),
-            None => space.state().is_carried(&n.id),
+            None => false,
         };
         counts.then_some(v.value.as_ref()).flatten()
     })
+}
+
+/// What the owner writes first in a successor of the group `old`, whose
+/// initial state is `carried`: each field on which only an admin's say
+/// counts (the group's name and introductions, and each member node's
+/// identity, name and introduction), set to what `old` resolves it to, or
+/// cleared where nothing an admin said stands. A value the successor
+/// carried counts for nothing by itself, since who wrote it cannot be told
+/// there; without this, what a writer set on those fields would count
+/// after any succession.
+pub fn reassert_ops(old: &Space, carried: &State) -> Vec<SpaceOp> {
+    let state = old.state();
+    let mut fields: Vec<(&Node, &[u64])> = Vec::new();
+    if let Some(c) = conversation(old).and_then(|c| state.node(&c)) {
+        fields.push((c, &[1, 2]));
+    }
+    for n in state.children(&ROOT) {
+        if n.kind == NodeKind::Uint(MEMBER) && !n.deleted {
+            fields.push((n, &[1, 2, 3]));
+        }
+    }
+    let mut ops = Vec::new();
+    for (n, keys) in fields {
+        let Some(there) = carried.node(&n.id) else {
+            continue;
+        };
+        for key in keys {
+            if there.values(*key).is_empty() {
+                continue;
+            }
+            ops.push(SpaceOp::set(
+                n.id,
+                *key,
+                admins_value(old, n, *key).cloned(),
+            ));
+        }
+    }
+    ops
 }
 
 /// A member of a group, as the others see them.

@@ -52,6 +52,26 @@ pub struct Notes {
     /// stand, in hex: shown to them, who do again what each was for.
     #[serde(default)]
     pub did_not_stand: BTreeSet<String>,
+    /// Work being posted again here, by the entry it stands for (hex),
+    /// with the hash of the ops written for it: noted before the entry is
+    /// written, so that one written just before a crash is found and not
+    /// posted twice.
+    #[serde(default)]
+    pub pending: BTreeMap<String, String>,
+    /// Work of this device's not posted here because its person's role
+    /// here no longer allows it: shown to them.
+    #[serde(default)]
+    pub not_posted: usize,
+    /// A successor opened on an initial state fetched from someone, which
+    /// this device had nothing to check against: checked as soon as the
+    /// space it succeeds is held here.
+    #[serde(default)]
+    pub unchecked: bool,
+    /// Entries here that are nobody's work to post again: the owner's
+    /// first entry in a successor, which sets again what the old space
+    /// resolved, and concerned the succession alone.
+    #[serde(default)]
+    pub not_work: BTreeSet<String>,
 }
 
 /// What [`Core::succeed`] wrote, to send.
@@ -72,6 +92,15 @@ pub struct Succeeded {
 /// Entries written in one space, to send.
 type Written = (SpaceId, Vec<Vec<u8>>);
 
+/// What identifies the ops of a posting again: the hash of their records.
+pub(crate) fn ops_hash(ops: &[SpaceOp]) -> String {
+    let mut h = blake3::Hasher::new();
+    for op in ops {
+        h.update(&op.record().encode());
+    }
+    hex::encode(h.finalize().as_bytes())
+}
+
 fn hex32(s: &str) -> Option<[u8; 32]> {
     hex::decode(s).ok()?.try_into().ok()
 }
@@ -88,6 +117,16 @@ fn initial_ref<S: ObjectStore>(
     let secret = ConvergenceSecret::from_epoch_key(epoch.bytes());
     let blob = cardinal_blob::encode_bytes(&bytes, &secret, store)?;
     Ok((blob.to_record(), bytes))
+}
+
+/// [`initial_ref`], for tests that write a successor of their own.
+#[cfg(test)]
+pub(crate) fn initial_ref_for_test<S: ObjectStore>(
+    store: &S,
+    epoch: &EpochKey,
+    state: &State,
+) -> (Record, Vec<u8>) {
+    initial_ref(store, epoch, state).expect("encoded")
 }
 
 impl Holder {
@@ -237,15 +276,24 @@ impl Core {
         let keys = ident.key_refs();
         let h = self
             .spaces
-            .get_mut(space)
+            .get(space)
             .ok_or_else(|| anyhow::anyhow!("not held"))?;
         let r = Record::decode(canonical)?;
-        let Some((profile, _, _)) = h.wants_initial.as_ref() else {
+        let Some((profile, old, _)) = h.wants_initial.clone() else {
             anyhow::bail!("it waits for no initial state");
         };
-        State::from_canonical(*profile, &r)?;
+        // The space it succeeds came here meanwhile: it is checked against
+        // that, by following, and not taken on anyone's word.
+        let old_held = old
+            .and_then(|o| self.spaces.get(&o))
+            .is_some_and(|o| o.space.is_some());
+        anyhow::ensure!(!old_held, "the space it succeeds is held here now");
+        let h = self.spaces.get_mut(space).expect("held");
+        State::from_canonical(profile, &r)?;
         std::fs::create_dir_all(Holder::dir(&self.paths, space))?;
         crate::paths::write_private(&h.initial_at, canonical, 0o600)?;
+        h.notes.unchecked = true;
+        h.save_notes();
         h.rebuild(Vec::new(), &keys, &logs);
         self.settle(space);
         Ok(())
@@ -287,6 +335,15 @@ impl Core {
         let ids: Vec<[u8; 32]> = named.iter().map(|(w, _)| *w).collect();
         let cut = sp.heads();
         anyhow::ensure!(!cut.is_empty(), "nothing valid here to succeed");
+        // Every author's log, or the state at the cut would leave out what
+        // they wrote.
+        let missing = plan::authors_at(sp, &cut)
+            .into_iter()
+            .find(|w| self.log_of(w).is_none());
+        anyhow::ensure!(
+            missing.is_none(),
+            "the identity log of someone who wrote in it is not here"
+        );
         let judged = plan::judged_with(sp, &cut, |w| self.log_of(w));
         let states = plan::pinned_states(&judged, |w| self.log_of(w))
             .ok_or_else(|| anyhow::anyhow!("an identity log it needs is not here"))?;
@@ -346,12 +403,29 @@ impl Core {
             .filter(|w| !ids.contains(w))
             .collect();
         let local_name = cardinal_space::group::name(sp);
+        let reassert = match profile {
+            cardinal_space::group::GROUP => {
+                let carried = State::from_canonical(profile, &Record::decode(&canonical)?)?;
+                cardinal_space::group::reassert_ops(sp, &carried)
+            }
+            _ => Vec::new(),
+        };
         // The successor first, so that nothing names what is not here.
         let dir = Holder::dir(&self.paths, &new_id);
         std::fs::create_dir_all(&dir)?;
         crate::paths::write_private(&dir.join("initial-state.bin"), &canonical, 0o600)?;
         let genesis_bytes = genesis.encode();
         self.ingest_space(new_id, std::slice::from_ref(&genesis_bytes))?;
+        let mut new_entries = vec![genesis_bytes.clone()];
+        if !reassert.is_empty() {
+            let ident = self.identity.as_ref().expect("checked above");
+            let h = self.spaces.get_mut(&new_id).expect("held");
+            let (id, bytes) = h.write_one(ident, &self.keys, reassert)?;
+            h.notes.not_work.insert(hex::encode(id));
+            h.save_notes();
+            new_entries.push(bytes);
+            self.settle(&new_id);
+        }
         let ident = self.identity.as_ref().expect("checked above");
         let h = self.spaces.get_mut(space).expect("held");
         let succeed = SpaceOp::succeed_with(new_id, &left_out, None);
@@ -361,8 +435,8 @@ impl Core {
         let account = self.follow_in_account(space, &new_id, &local_name)?;
         Ok(Succeeded {
             new: new_id,
-            old_entries: vec![written, genesis_bytes.clone()],
-            new_entries: vec![genesis_bytes],
+            old_entries: vec![written, genesis_bytes],
+            new_entries,
             account,
             left_out,
         })
@@ -420,9 +494,123 @@ impl Core {
                 break;
             }
         }
+        self.check_unchecked(store);
+        out.extend(self.account_for_followed());
         self.note_did_not_stand();
         out.extend(self.post_again_all(false));
         out
+    }
+
+    /// The space node of every successor that stands here in place of a
+    /// space this person had joined, written again where it is missing:
+    /// a device that stopped between following and writing it would
+    /// otherwise not show the group.
+    fn account_for_followed(&mut self) -> Vec<Written> {
+        let mut pairs: Vec<(SpaceId, SpaceId, String)> = Vec::new();
+        for (id, h) in &self.spaces {
+            let Some(sp) = h.space.as_ref() else { continue };
+            let Some(o) = sp.succeeds() else { continue };
+            if self.current(&o) != *id || self.is_joined(id) {
+                continue;
+            }
+            let old = self.spaces.get(&o).and_then(|h| h.space.as_ref());
+            if let Some(old) = old {
+                pairs.push((o, *id, cardinal_space::group::name(old)));
+            }
+        }
+        let mut out = Vec::new();
+        for (o, s, name) in pairs {
+            match self.follow_in_account(&o, &s, &name) {
+                Ok(Some(w)) => out.push(w),
+                Ok(None) => {}
+                Err(e) => tracing::debug!("space {}: the account: {e:#}", short(&s)),
+            }
+        }
+        out
+    }
+
+    /// Checks each successor opened unchecked, on an initial state fetched
+    /// from someone, once the space it succeeds is held here: one that
+    /// fails is left, and the person told, as for one that fails when it
+    /// is followed.
+    fn check_unchecked<S: ObjectStore>(&mut self, store: &S) {
+        let todo: Vec<(SpaceId, SpaceId)> = self
+            .spaces
+            .iter()
+            .filter(|(_, h)| h.notes.unchecked)
+            .filter_map(|(id, h)| Some((*id, h.space.as_ref()?.succeeds()?)))
+            .filter(|(_, o)| self.spaces.get(o).is_some_and(|h| h.space.is_some()))
+            .collect();
+        for (s, o) in todo {
+            let me = self.me().expect("an identity");
+            let old = self.spaces[&o].space.as_ref().expect("open");
+            let new = self.spaces[&s].space.as_ref().expect("open");
+            let ok = match plan::verdict(old, new, &me, false) {
+                // one this member is not named in is not theirs to check
+                Verdict::Follow | Verdict::LeftOut => self.check_cut(store, old, new),
+                _ => Err("it does not succeed the space it names".to_owned()),
+            };
+            match ok {
+                Ok(_) => {
+                    let h = self.spaces.get_mut(&s).expect("held");
+                    h.notes.unchecked = false;
+                    h.save_notes();
+                }
+                Err(why) => {
+                    tracing::warn!("space {}: left: {why}", short(&s));
+                    let h = self.spaces.get_mut(&s).expect("held");
+                    let _ = std::fs::remove_file(&h.initial_at);
+                    h.space = None;
+                    h.notes.unchecked = false;
+                    h.save_notes();
+                    let v = format!(
+                        "it has ended, and what was put in its place does not match it: {why}"
+                    );
+                    self.note_verdict(&o, Some(v));
+                }
+            }
+        }
+    }
+
+    /// The third condition of following (`spaces.md#following`): the
+    /// initial state of `new` is the state of `old` at its cut, as this
+    /// device works it out with the logs it pins. Gives the canonical state
+    /// and the entries it carried, or why not.
+    fn check_cut<S: ObjectStore>(
+        &self,
+        store: &S,
+        old: &Space,
+        new: &Space,
+    ) -> Result<(Vec<u8>, HashSet<EntryId>), String> {
+        let from = new.succession().ok_or("it succeeds nothing")?;
+        let states = plan::pinned_states(&from.judged_with, |w| self.log_of(w))
+            .ok_or("it cannot be checked yet: an identity log it was judged with is not here")?;
+        let named: Vec<[u8; 32]> = plan::genesis_members(new)
+            .into_iter()
+            .map(|(w, _)| w)
+            .collect();
+        let at_cut = old
+            .state_at(&from.cut, states, &named)
+            .map_err(|_| "it cannot be checked yet: the entries it was cut at are not all here")?;
+        let carried: HashSet<EntryId> = at_cut.accepted().copied().collect();
+        let Some(claimed) = from.initial_state.as_ref() else {
+            // no initial state is an empty one
+            let empty = at_cut.is_empty() && at_cut.reach_nodes().next().is_none();
+            return match empty {
+                true => Ok((at_cut.canonical().encode(), carried)),
+                false => Err("its initial state is not the state at its cut".to_owned()),
+            };
+        };
+        let epoch = new
+            .current_epoch()
+            .and_then(|e| new.keyring().get(&e).cloned())
+            .ok_or("no key for its first epoch")?;
+        let (reference, canonical) =
+            initial_ref(store, &epoch, &at_cut).map_err(|e| format!("{e:#}"))?;
+        if claimed.encode() != reference.encode() {
+            return Err("its initial state is not the state at its cut".to_owned());
+        }
+        Ok((canonical, carried))
     }
 
     /// Notes, in the old space, each succession this person made of it
@@ -478,12 +666,38 @@ impl Core {
         if self.spaces.get(&s).is_some_and(|x| x.space.is_some()) {
             return Ok(None);
         }
-        // Its genesis: in the trail, or held for itself already.
+        // Judged already, on just what is here now: the verdict noted
+        // stands.
+        let key = self.follow_key(old, &s);
+        if h.follow_checked == Some(key) {
+            return Ok(None);
+        }
+        // Its genesis: in the trail, or held for itself already. Each is
+        // opened once, and only the successor that stands is looked for.
         let held = self.spaces.get(&s).map(|x| x.pending()).unwrap_or(&[]);
-        let found = h.foreign.iter().chain(held).find_map(|f| {
-            let open = Space::open_genesis(f, &keys, None).ok()?;
-            (open.id() == s).then(|| (f.clone(), open))
-        });
+        let mut opened: Vec<([u8; 32], Option<SpaceId>)> = Vec::new();
+        let mut found = None;
+        for f in h.foreign.iter().chain(held) {
+            let sid = f.sealed_id();
+            let id = match h.foreign_opened.get(&sid) {
+                Some(id) => *id,
+                None => {
+                    let id = Space::open_genesis(f, &keys, None).ok().map(|o| o.id());
+                    opened.push((sid, id));
+                    id
+                }
+            };
+            if id == Some(s) {
+                found = Space::open_genesis(f, &keys, None)
+                    .ok()
+                    .map(|o| (f.clone(), o));
+                break;
+            }
+        }
+        let h = self.spaces.get_mut(old).expect("held");
+        h.foreign_opened.extend(opened);
+        let h = self.spaces.get(old).expect("held");
+        let sp = h.space.as_ref().expect("open");
         let Some((sealed, mut new)) = found else {
             // A member who can open no wrap of it has been left out,
             // whatever the `succeed` says; one it names as left out is.
@@ -497,6 +711,7 @@ impl Core {
             });
             let v = named_out.then(|| "you were left out of what took its place".to_owned());
             self.note_verdict(old, v);
+            self.spaces.get_mut(old).expect("held").follow_checked = Some(key);
             return Ok(None);
         };
         new.set_identities(self.logs.iter().cloned());
@@ -518,47 +733,33 @@ impl Core {
         };
         if why.is_some() {
             self.note_verdict(old, why);
+            self.spaces.get_mut(old).expect("held").follow_checked = Some(key);
             return Ok(None);
         }
         // The third condition: its initial state is the state at the cut,
         // as this device works it out.
-        let from = new.succession().cloned().expect("it succeeds");
-        let Some(states) = plan::pinned_states(&from.judged_with, |w| self.log_of(w)) else {
-            let v = "it cannot be checked yet: an identity log it was judged with is not here";
-            self.note_verdict(old, Some(v.to_owned()));
-            return Ok(None);
-        };
-        let named: Vec<[u8; 32]> = plan::genesis_members(&new)
-            .into_iter()
-            .map(|(w, _)| w)
-            .collect();
-        let at_cut = match sp.state_at(&from.cut, states, &named) {
-            Ok(st) => st,
-            Err(_) => {
-                let v = "it cannot be checked yet: the entries it was cut at are not all here";
-                self.note_verdict(old, Some(v.to_owned()));
+        let (canonical, carried) = match self.check_cut(store, sp, &new) {
+            Ok(done) => done,
+            Err(why) => {
+                let v = match why.starts_with("it cannot be checked yet") {
+                    true => why,
+                    false => format!(
+                        "it has ended, and what was put in its place does not match it: {why}"
+                    ),
+                };
+                self.note_verdict(old, Some(v));
+                self.spaces.get_mut(old).expect("held").follow_checked = Some(key);
                 return Ok(None);
             }
         };
-        let epoch = new
-            .current_epoch()
-            .and_then(|e| new.keyring().get(&e).cloned());
-        let epoch = epoch.ok_or_else(|| anyhow::anyhow!("no key for its first epoch"))?;
-        let (reference, canonical) = initial_ref(store, &epoch, &at_cut)?;
-        let claimed = from.initial_state.as_ref().map(|r| r.encode());
-        if claimed != Some(reference.encode()) {
-            let v = "it has ended, and what was put in its place does not match it: its \
-                     initial state is not the state at its cut";
-            self.note_verdict(old, Some(v.to_owned()));
-            return Ok(None);
-        }
-        let carried: HashSet<EntryId> = at_cut.accepted().copied().collect();
         let local_name = cardinal_space::group::name(sp);
         self.note_verdict(old, None);
         // Hold it, from its initial state.
         let dir = Holder::dir(&self.paths, &s);
         std::fs::create_dir_all(&dir)?;
-        crate::paths::write_private(&dir.join("initial-state.bin"), &canonical, 0o600)?;
+        if new.succession().is_some_and(|f| f.initial_state.is_some()) {
+            crate::paths::write_private(&dir.join("initial-state.bin"), &canonical, 0o600)?;
+        }
         let bytes = sealed.encode();
         let had = self.spaces.contains_key(&s);
         self.open_space(s)?;
@@ -579,6 +780,28 @@ impl Core {
             out.push(written);
         }
         Ok(Some(out))
+    }
+
+    /// What a verdict on following `s` from `old` rests on: what `old`
+    /// holds, the geneses here, and every identity log held.
+    fn follow_key(&self, old: &SpaceId, s: &SpaceId) -> [u8; 32] {
+        let mut k = blake3::Hasher::new();
+        k.update(s);
+        if let Some(h) = self.spaces.get(old) {
+            k.update(&(h.set_len() as u64).to_le_bytes());
+        }
+        if let Some(h) = self.spaces.get(s) {
+            k.update(&(h.set_len() as u64).to_le_bytes());
+        }
+        if let Some(i) = self.identity.as_ref() {
+            k.update(&(i.log.len() as u64).to_le_bytes());
+        }
+        for (who, o) in &self.others {
+            k.update(who);
+            k.update(&(o.log.len() as u64).to_le_bytes());
+            k.update(&(o.log.all_heads().len() as u64).to_le_bytes());
+        }
+        *k.finalize().as_bytes()
     }
 
     /// The entries of `old` that the initial state of `new` carried.
@@ -624,11 +847,10 @@ impl Core {
         out
     }
 
-    /// The spaces whose work posts again into `into`, each with what of it
-    /// `into` carried: the space it succeeds, unless it is a fresh start,
-    /// and every successor of that space, or of `into` itself, that no
-    /// longer stands.
-    fn sources_of(&mut self, into: &SpaceId) -> Vec<(SpaceId, HashSet<EntryId>)> {
+    /// The spaces whose work posts again into `into`: the space it
+    /// succeeds, unless it is a fresh start, and every successor of that
+    /// space, or of `into` itself, that no longer stands.
+    fn sources_of(&self, into: &SpaceId) -> Vec<SpaceId> {
         let Some(sp) = self.spaces.get(into).and_then(|h| h.space.as_ref()) else {
             return Vec::new();
         };
@@ -637,8 +859,7 @@ impl Core {
         let mut out = Vec::new();
         if let Some(o) = old.filter(|_| !fresh) {
             if self.spaces.get(&o).is_some_and(|h| h.space.is_some()) {
-                let carried = self.carried_into(into).unwrap_or_default();
-                out.push((o, carried));
+                out.push(o);
             }
         }
         for (id, h) in &self.spaces {
@@ -646,7 +867,7 @@ impl Core {
             let sibling = old.is_some() && x.succeeds() == old;
             let returned = x.succeeds() == Some(*into);
             if *id != *into && (sibling || returned) && self.current(id) == *into {
-                out.push((*id, HashSet::new()));
+                out.push(*id);
             }
         }
         out
@@ -655,15 +876,46 @@ impl Core {
     fn post_again_into(&mut self, into: &SpaceId, asked: bool) -> anyhow::Result<Vec<Vec<u8>>> {
         let mut written = Vec::new();
         let sources = self.sources_of(into);
-        for (from, carried) in sources {
+        if sources.is_empty() {
+            return Ok(written);
+        }
+        // What `into` carried, by the entry it was first written as: never
+        // posted again, from wherever it comes. A successor whose cut
+        // cannot be worked out here posts nothing: what it carried would
+        // be posted twice.
+        let is_successor = self.spaces[into]
+            .space
+            .as_ref()
+            .is_some_and(|s| s.succeeds().is_some());
+        let carried = match self.carried_into(into) {
+            Some(c) => c,
+            None if is_successor => return Ok(written),
+            None => HashSet::new(),
+        };
+        for from in sources {
             written.extend(self.post_again_from(&from, into, &carried, asked)?);
         }
         Ok(written)
     }
 
+    /// How `from` and `into` stand for posting again: when this is what
+    /// it was the last time nothing was left to do, nothing is.
+    fn post_mark(&self, from: &SpaceId, into: &SpaceId) -> [u64; 4] {
+        let f = &self.spaces[from];
+        let i = &self.spaces[into];
+        let n = &i.notes;
+        let notes = (n.posted.len() + n.held_back.len() + n.nothing.len()) as u64;
+        [
+            f.set_len() as u64,
+            i.set_len() as u64,
+            notes,
+            f.notes.posted.len() as u64,
+        ]
+    }
+
     /// Posts again into `into` what this device wrote in `from` and `into`
-    /// does not hold: in log order, each entry whole, up to the first that
-    /// has to wait.
+    /// neither holds nor carried: in log order, each entry whole; one that
+    /// has to wait waits, and the rest go on.
     fn post_again_from(
         &mut self,
         from: &SpaceId,
@@ -674,6 +926,10 @@ impl Core {
         let me = self.me().ok_or_else(|| anyhow::anyhow!("no identity"))?;
         let here = self.keys.key();
         let mut out = Vec::new();
+        let mark = self.post_mark(from, into);
+        if !asked && self.spaces[into].post_marks.get(from) == Some(&mark) {
+            return Ok(out);
+        }
         let (Some(fh), Some(ih)) = (self.spaces.get(from), self.spaces.get(into)) else {
             return Ok(out);
         };
@@ -699,17 +955,17 @@ impl Core {
             .dag()
             .log_order()
             .iter()
-            .filter(|x| **x != fs.id() && valid.contains(*x) && !carried.contains(*x))
+            .filter(|x| **x != fs.id() && valid.contains(*x))
             .filter(|x| {
                 fs.entry(x)
                     .is_some_and(|e| e.author() == me && e.signer() == here && !e.is_genesis())
             })
-            .filter(|x| fs.state().is_accepted(x))
-            // a posting again whose origin `into` holds itself, as when
-            // everyone returns to the old space
+            .filter(|x| fs.state().is_accepted(x) && !fh.notes.not_work.contains(&hex::encode(x)))
+            // what `into` holds itself, as when everyone returns to the old
+            // space, or carried, or had posted again already
             .filter(|x| {
                 let o = origin_in(&fh.notes, x);
-                !is.dag().contains(&o) && !done.contains(&hex::encode(o))
+                !is.dag().contains(&o) && !carried.contains(&o) && !done.contains(&hex::encode(o))
             })
             .filter(|x| {
                 let o = hex::encode(origin_in(&fh.notes, x));
@@ -718,11 +974,23 @@ impl Core {
             .copied()
             .collect();
         if candidates.is_empty() {
+            self.spaces
+                .get_mut(into)
+                .expect("held")
+                .post_marks
+                .insert(*from, mark);
             return Ok(out);
         }
         if !plan::may_post(is, &me) {
+            // the person is told: their role there no longer allows it
+            let h = self.spaces.get_mut(into).expect("held");
+            if h.notes.not_posted != candidates.len() {
+                h.notes.not_posted = candidates.len();
+                h.save_notes();
+            }
             return Ok(out);
         }
+        let mut waiting = false;
         for x in candidates {
             let (fh, ih) = (&self.spaces[from], &self.spaces[into]);
             let (fs, is) = (fh.space.as_ref().unwrap(), ih.space.as_ref().unwrap());
@@ -739,10 +1007,28 @@ impl Core {
                 }
                 continue;
             }
+            // One written just before this device stopped, and not noted.
+            if let Some(hash) = ih.notes.pending.get(&origin_hex) {
+                let mine = is.dag().iter().find(|(_, e)| {
+                    let ops = e.ops();
+                    e.author() == me
+                        && e.signer() == here
+                        && (0..=ops.len()).any(|n| ops_hash(&ops[..n]) == *hash)
+                });
+                if let Some((id, _)) = mine {
+                    let id = *id;
+                    let h = self.spaces.get_mut(into).expect("held");
+                    h.notes.posted.insert(hex::encode(id), origin_hex.clone());
+                    h.notes.pending.remove(&origin_hex);
+                    h.notes.held_back.remove(&hex::encode(x));
+                    h.save_notes();
+                    continue;
+                }
+            }
             let notes = &ih.notes;
             let origin_of = |e: &EntryId| notes.posted.get(&hex::encode(e)).and_then(|o| hex32(o));
             match plan::plan_repost(fs, &x, is, &origin_of) {
-                Plan::Wait => break,
+                Plan::Wait => waiting = true,
                 Plan::Nothing => {
                     let h = self.spaces.get_mut(into).expect("held");
                     h.notes.nothing.insert(origin_hex);
@@ -751,14 +1037,25 @@ impl Core {
                 Plan::Post(r) => {
                     let ident = self.identity.as_ref().expect("an identity");
                     let h = self.spaces.get_mut(into).expect("held");
+                    h.notes.pending.insert(origin_hex.clone(), ops_hash(&r.ops));
+                    h.save_notes();
                     let (id, bytes) = h.write_one(ident, &self.keys, r.ops)?;
-                    h.notes.posted.insert(hex::encode(id), origin_hex);
+                    h.notes.posted.insert(hex::encode(id), origin_hex.clone());
+                    h.notes.pending.remove(&origin_hex);
                     h.notes.held_back.remove(&hex::encode(x));
                     h.save_notes();
                     self.settle(into);
                     out.push(bytes);
                 }
             }
+        }
+        if !waiting && out.is_empty() {
+            let mark = self.post_mark(from, into);
+            self.spaces
+                .get_mut(into)
+                .expect("held")
+                .post_marks
+                .insert(*from, mark);
         }
         Ok(out)
     }

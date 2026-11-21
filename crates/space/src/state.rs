@@ -601,6 +601,22 @@ impl State {
             );
             st.carried.insert(id, rank);
         }
+        // Every parent is a node it records, or the root, and no node is
+        // its own ancestor: what a tree computed from entries always is.
+        for n in st.nodes.values() {
+            let mut cur = n.parent;
+            let mut steps = 0;
+            while cur != ROOT {
+                let Some(p) = st.nodes.get(&cur) else {
+                    return Err(bad);
+                };
+                steps += 1;
+                if cur == n.id || steps > st.nodes.len() {
+                    return Err(bad);
+                }
+                cur = p.parent;
+            }
+        }
         Ok(st)
     }
 
