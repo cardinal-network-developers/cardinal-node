@@ -953,9 +953,27 @@ Not implemented yet (the next milestone):
     carries the UUID and no tag, and nobody finds the device. Used where
     the adapter's `SupportedCapabilities` `MaxAdvLen` is too short for
     the full form, or the full one is refused.
+  - **Both forms at once where the radio has room** (spec question): a
+    device that sends the extended form sends the legacy one beside it,
+    as a second advertising set (BlueZ: a second registration; Android: a
+    second `AdvertisingSet`), so that a phone whose scanner sees only
+    legacy advertisements still finds it. Where the second is refused,
+    only the extended one goes. The draft says which form to use, not
+    whether both.
   - **Which tag in a legacy advertisement:** the keys take turns, one per
-    refresh (every 30 s, or at once when what is advertised changes):
-    own devices, contacts, then each one-time secret.
+    refresh (each counted apart from anything else the radio numbers).
+    While there is a one-time tag, one has every other turn, since whoever
+    holds the invitation is looking now; and the advertisement is made
+    again every 10 s instead of 30 s. Someone accepting looks for 60 s.
+  - **BlueZ only with privacy on.** Without the controller's privacy
+    (`Privacy = device` in `/etc/bluetooth/main.conf`), BlueZ advertises
+    and opens channels from the adapter's fixed public address, which
+    would let anyone follow the computer whatever the tags do. Privacy is
+    read from the kernel's management interface (Read Controller
+    Information, current settings bit 13; no privilege needed), and where
+    that cannot be read, from `main.conf`; without it the radio is not
+    used, and `why_not` says how to turn it on. Android advertises and
+    connects from resolvable private addresses already.
   - **Reading: tag types are bytes.** An unknown type is kept and matches
     nothing; a short tag matches only `keyed_hash(k, nonce4)[..6]`.
   - **One channel, every key at once.** A tag says whose device, not
@@ -964,11 +982,33 @@ Not implemented yet (the next milestone):
     person's devices without a session at once on it
     (`Endpoint::connect_on`); only the one at the other end can answer,
     and the others give up. Over a LAN each is dialled in turn instead.
-  - **Limits as on a LAN**: a contact at one address once in 10 s, three
-    times a minute; own devices' tag at one address once in 10 s; the
-    same advertisement from one address is looked at again only after
-    2 s (a radio reports it many times a second); at most 16 channels
-    others opened at once.
+  - **Limits.** A contact at one place once in 10 s, and three times a
+    minute on each carrier: a tag replayed over Bluetooth does not use up
+    the tries on the LAN, nor the other way, and each carrier has its own
+    one-try-at-a-time. A place where a contact's tag led to a session
+    before (the last 64 kept), or a LAN address the peer book has for one
+    of their devices, does not count against the minute. Own devices'
+    tag: at one address once in 10 s, and three times a minute at all
+    addresses, since a recorded tag can be played again from a new
+    address each time. Bluetooth tries of own devices are counted apart
+    from the tries over IP, and never hold those up. The same
+    advertisement from one address is looked at again only after 2 s (a
+    radio reports it many times a second), of at most 512 addresses kept;
+    at most 50 advertisements are looked at a second, whoever sends them;
+    the keys they are checked against are derived once for the state they
+    come from, as on the LAN.
+  - **Channels others open:** at most 16 at once and 2 from one address;
+    when all are taken, the oldest with no session over it gives way. A
+    channel with no session over it for 10 s is closed, from its start or
+    after its session ended or moved. Over any stream carrier (TCP too),
+    the rest of a packet must come within 20 s of its length.
+  - **Reading: a session over Bluetooth is not direct enough.** It holds
+    only while the two are in range, so own devices and contacts reached
+    over Bluetooth alone go on being looked for over IP, and a direct
+    session over IP replaces one over Bluetooth whichever came first, as
+    a direct session replaces one through a host
+    (`link.md#identity-binding`, extended: relayed, then Bluetooth, then
+    direct over IP). Both ends can tell which a session is.
   - **Type 3 is advertised only by the device an invitation names**
     (`responder_static`), and only while it is outstanding. An invitation
     naming the person's host leads to the host's key, which no device in
@@ -991,6 +1031,9 @@ Not implemented yet (the next milestone):
     `{"cmd": "watch", "window": true}`; a watch without it does not count
     (Android's service watches with no window open). With `open` and no
     window, a CLI-only device has Bluetooth off.
+  - **Android's bridge socket** (`CARDINAL_BLE_BRIDGE`) is mode 0600, each
+    connection's peer must be of the service's user, and the connection
+    that drives the radio says so in its first line (`{"control": true}`).
   - **Channels are opened at security level low**, with no Bluetooth
     pairing (Android: the insecure L2CAP calls): the link session proves
     and encrypts.

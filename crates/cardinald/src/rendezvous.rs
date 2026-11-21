@@ -187,13 +187,32 @@ pub struct Rendezvous {
     /// carried their tag (D74): at most once in [`NEARBY_EVERY`].
     nearby: Mutex<HashMap<([u8; 32], String), Instant>>,
     /// When each contact was tried nearby in the last minute, whatever the
-    /// address: at most [`NEARBY_PER_MINUTE`]. A tag can be replayed
-    /// anywhere, and that is to cost a try and no more.
-    nearby_tries: Mutex<HashMap<[u8; 32], std::collections::VecDeque<Instant>>>,
-    /// The contacts being tried nearby right now: apart from the looks
-    /// through hosts, which a replayed tag must not keep from running.
-    nearby_going: Mutex<HashSet<[u8; 32]>>,
+    /// address, by carrier: at most [`NEARBY_PER_MINUTE`] on each. A tag can
+    /// be replayed anywhere, and that is to cost a try and no more, and a
+    /// tag replayed over Bluetooth does not use up the tries on the LAN.
+    nearby_tries: Mutex<HashMap<([u8; 32], Carrier), Tries>>,
+    /// The contacts being tried nearby right now, by carrier: apart from the
+    /// looks through hosts, which a replayed tag must not keep from running.
+    nearby_going: Mutex<HashSet<([u8; 32], Carrier)>>,
+    /// Places where a contact's tag led to a session: tried again there
+    /// whatever the minute's tries, at most [`NEARBY_REACHED`] kept.
+    nearby_reached: Mutex<std::collections::VecDeque<([u8; 32], String)>>,
 }
+
+/// When something was tried in the last minute.
+type Tries = std::collections::VecDeque<Instant>;
+
+/// Which way a contact's tag was seen: each has its own tries.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Carrier {
+    /// The local network.
+    Lan,
+    /// Bluetooth.
+    Ble,
+}
+
+/// The most places kept where a tag led to a session.
+const NEARBY_REACHED: usize = 64;
 
 /// The most sessions opening and closing kept for each contact.
 const EVENTS: usize = 20;
@@ -258,6 +277,41 @@ fn unix_now() -> u64 {
 const SAVE_USE_EVERY: u64 = 60;
 
 impl Rendezvous {
+    /// Whether a contact may be tried where their tag was seen, noting the
+    /// try: once in [`NEARBY_EVERY`] at one place, and, at places not
+    /// `known` (where no session was reached before), [`NEARBY_PER_MINUTE`]
+    /// times a minute on each carrier.
+    fn may_try_nearby(&self, who: [u8; 32], carrier: Carrier, place: &str, known: bool) -> bool {
+        let mut tried = lock(&self.nearby);
+        let recent = tried
+            .get(&(who, place.to_owned()))
+            .is_some_and(|t| t.elapsed() < NEARBY_EVERY);
+        if recent {
+            return false;
+        }
+        if !known {
+            let mut tries = lock(&self.nearby_tries);
+            tries.retain(|_, q| {
+                q.back()
+                    .is_some_and(|t| t.elapsed() < Duration::from_secs(60))
+            });
+            let mine = tries.entry((who, carrier)).or_default();
+            while mine
+                .front()
+                .is_some_and(|t| t.elapsed() >= Duration::from_secs(60))
+            {
+                mine.pop_front();
+            }
+            if mine.len() >= NEARBY_PER_MINUTE {
+                return false;
+            }
+            mine.push_back(Instant::now());
+        }
+        tried.retain(|_, t| t.elapsed() < NEARBY_EVERY);
+        tried.insert((who, place.to_owned()), Instant::now());
+        true
+    }
+
     /// With what was saved at `path` of the contacts in use.
     pub fn load(path: PathBuf) -> Rendezvous {
         let file: InUseFile = std::fs::read(&path)
@@ -578,7 +632,7 @@ fn wanted(d: &Daemon) -> HashMap<[u8; 32], (KeyId, HybridPublicKey)> {
     };
     devices
         .into_iter()
-        .filter(|(_, link)| !d.is_direct(link.x25519()))
+        .filter(|(_, link)| !d.is_direct_ip(link.x25519()))
         .map(|(key, link)| (*link.x25519(), (key, link)))
         .collect()
 }
@@ -978,8 +1032,14 @@ fn identity_field(v: Option<&Value>) -> Option<[u8; 32]> {
 
 /// Whether a contact's device has a session that answers for it: one that
 /// may be left behind is no session when looking for them.
+///
+/// A session over Bluetooth alone is not: it holds while the two are in
+/// range, and the looks go on for a way that does not end there; one found
+/// replaces it (`Endpoint` prefers a direct session over IP).
 fn reached(d: &Daemon, device: &[u8; 32]) -> bool {
-    d.is_online(device) && !lock(&d.rendezvous.suspect).contains(device)
+    d.is_online(device)
+        && !d.is_bluetooth_only(device)
+        && !lock(&d.rendezvous.suspect).contains(device)
 }
 
 /// A direct session with a trusted contact's device, by its signing key, for
@@ -1268,7 +1328,7 @@ fn holder_incoming(d: &Arc<Daemon>, s: &Session, r: &Record, token: &Token) {
             tell_device(s.clone(), Service::RENDEZVOUS, answer);
         }
         Some(at) => {
-            if let Some(link) = theirs.filter(|l| !d.is_direct(l.x25519())) {
+            if let Some(link) = theirs.filter(|l| !d.is_direct_ip(l.x25519())) {
                 let d = d.clone();
                 tokio::spawn(async move { punch(&d, &link, vec![at]).await });
             }
@@ -1684,6 +1744,13 @@ pub enum Near {
 }
 
 impl Near {
+    fn carrier(&self) -> Carrier {
+        match self {
+            Near::Lan(_) => Carrier::Lan,
+            Near::Ble(_) => Carrier::Ble,
+        }
+    }
+
     fn key(&self) -> String {
         match self {
             Near::Lan(a) => a.to_string(),
@@ -1732,44 +1799,57 @@ pub async fn found_near(d: &Arc<Daemon>, who: [u8; 32], near: Near) {
             .filter_map(|k| Some((k.key, k.link_key.clone()?)))
             .collect()
     };
-    if theirs.iter().all(|(_, l)| reached(d, l.x25519())) {
+    // Over Bluetooth a device with any session is left alone; on the LAN
+    // one reached only over Bluetooth is tried, for something better.
+    let carrier = near.carrier();
+    let have = |l: &HybridPublicKey| match carrier {
+        Carrier::Lan => reached(d, l.x25519()),
+        Carrier::Ble => d.is_online(l.x25519()),
+    };
+    if theirs.iter().all(|(_, l)| have(l)) {
         return;
     }
     let place = near.key();
+    // Where a session was reached before, or an address the book has for
+    // one of their devices, the minute's tries are not spent.
+    let known_place = lock(&d.rendezvous.nearby_reached).contains(&(who, place.clone()))
+        || match &near {
+            Near::Lan(addr) => {
+                let book = lock(&d.book);
+                let there = book.at(addr);
+                theirs
+                    .iter()
+                    .any(|(k, _)| there.iter().any(|x| **x == hex::encode(k)))
+            }
+            Near::Ble(_) => false,
+        };
+    if !d
+        .rendezvous
+        .may_try_nearby(who, carrier, &place, known_place)
     {
-        let mut tried = lock(&d.rendezvous.nearby);
-        let recent = tried
-            .get(&(who, place.clone()))
-            .is_some_and(|t| t.elapsed() < NEARBY_EVERY);
-        if recent {
-            return;
-        }
-        let mut tries = lock(&d.rendezvous.nearby_tries);
-        let mine = tries.entry(who).or_default();
-        while mine
-            .front()
-            .is_some_and(|t| t.elapsed() >= Duration::from_secs(60))
-        {
-            mine.pop_front();
-        }
-        if mine.len() >= NEARBY_PER_MINUTE {
-            return;
-        }
-        mine.push_back(Instant::now());
-        tried.retain(|_, t| t.elapsed() < NEARBY_EVERY);
-        tried.insert((who, place), Instant::now());
-    }
-    // One try at a time for a contact, apart from the looks through hosts.
-    if !lock(&d.rendezvous.nearby_going).insert(who) {
         return;
     }
-    struct Going<'a>(&'a Daemon, [u8; 32]);
+    // One try at a time for a contact on each carrier, apart from the
+    // looks through hosts.
+    if !lock(&d.rendezvous.nearby_going).insert((who, carrier)) {
+        return;
+    }
+    struct Going<'a>(&'a Daemon, ([u8; 32], Carrier));
     impl Drop for Going<'_> {
         fn drop(&mut self) {
             lock(&self.0.rendezvous.nearby_going).remove(&self.1);
         }
     }
-    let _going = Going(d, who);
+    let _going = Going(d, (who, carrier));
+    let remember = || {
+        let mut held = lock(&d.rendezvous.nearby_reached);
+        if !held.contains(&(who, place.clone())) {
+            if held.len() >= NEARBY_REACHED {
+                held.pop_front();
+            }
+            held.push_back((who, place.clone()));
+        }
+    };
     let at = near.said();
     let found = |device: &KeyId| {
         d.rendezvous.nearby_step(
@@ -1779,19 +1859,18 @@ pub async fn found_near(d: &Arc<Daemon>, who: [u8; 32], near: Near) {
         );
         tracing::info!("found {} {at}", short(&who));
     };
-    let theirs: Vec<(KeyId, HybridPublicKey)> = theirs
-        .into_iter()
-        .filter(|(_, l)| !reached(d, l.x25519()))
-        .collect();
+    let theirs: Vec<(KeyId, HybridPublicKey)> =
+        theirs.into_iter().filter(|(_, l)| !have(l)).collect();
     match &near {
         Near::Lan(addr) => {
             for (device, link) in theirs {
-                if reached(d, link.x25519()) {
+                if have(&link) {
                     continue;
                 }
                 match d.dial(|c| Target::new(*addr, c, &link)).await {
                     Ok(s) => {
                         d.on_session(s);
+                        remember();
                         found(&device);
                         // the first that answers: the tag was one device's
                         return;
@@ -1808,6 +1887,7 @@ pub async fn found_near(d: &Arc<Daemon>, who: [u8; 32], near: Near) {
                 Ok(s) => {
                     let ps = s.peer_static();
                     d.on_session(s);
+                    remember();
                     if let Some((device, _)) = theirs.iter().find(|(_, l)| *l.x25519() == ps) {
                         found(device);
                     }
@@ -1996,6 +2076,30 @@ pub fn session_closed(d: &Daemon, peer_static: &[u8; 32]) {
         }
         keep
     });
+}
+
+#[cfg(test)]
+mod nearby_tests {
+    use super::*;
+
+    #[test]
+    fn tags_replayed_over_bluetooth_leave_the_lan_its_tries() {
+        let r = Rendezvous::default();
+        let who = [7u8; 32];
+        // Played again from address after address over Bluetooth.
+        let ble: Vec<bool> = (0..6)
+            .map(|i| r.may_try_nearby(who, Carrier::Ble, &format!("bluetooth {i}"), false))
+            .collect();
+        assert_eq!(ble.iter().filter(|x| **x).count(), NEARBY_PER_MINUTE);
+        // The local network has its own.
+        assert!(r.may_try_nearby(who, Carrier::Lan, "192.168.1.9:7171", false));
+        // A place a session was reached is tried whatever the minute's
+        // tries, but not twice in ten seconds.
+        assert!(r.may_try_nearby(who, Carrier::Ble, "bluetooth known", true));
+        assert!(!r.may_try_nearby(who, Carrier::Ble, "bluetooth known", true));
+        // Someone else's tries are theirs.
+        assert!(r.may_try_nearby([8; 32], Carrier::Ble, "bluetooth 0", false));
+    }
 }
 
 #[cfg(test)]

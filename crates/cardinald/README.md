@@ -186,7 +186,10 @@ off|open|always` (`{"cmd": "bluetooth", "mode": ...}`; without `mode` it
 asks the radio whether it can be used and says where it stands, as
 `status` does under `bluetooth`). `open` is on while a client watches with
 `{"cmd": "watch", "window": true}`. On Linux the radio is BlueZ over
-D-Bus (`bluez.rs`, through zbus) and the kernel's L2CAP sockets; on
+D-Bus (`bluez.rs`, through zbus) and the kernel's L2CAP sockets, used
+only with the controller's privacy on (`Privacy = device` under
+`[General]` in `/etc/bluetooth/main.conf`, then restart bluetoothd):
+without it the computer would send its fixed address. On
 Android the app drives it, over the socket `CARDINAL_BLE_BRIDGE` names
 (`contact/src/ble/bridge.rs`); tests set `CARDINAL_TEST_BLE_ETHER` to a
 directory where simulated radios meet.

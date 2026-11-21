@@ -168,7 +168,7 @@ impl PeerBook {
     }
 
     /// The devices known at `addr`, by key (hex).
-    fn at(&self, addr: &SocketAddr) -> Vec<&String> {
+    pub(crate) fn at(&self, addr: &SocketAddr) -> Vec<&String> {
         let a = addr.to_string();
         self.addrs
             .iter()
@@ -959,6 +959,31 @@ impl Daemon {
             .is_some_and(|c| !c.session.is_closed() && !c.session.is_relayed())
     }
 
+    /// Whether a device has an open session over IP that does not go
+    /// through a host: what is tried for while it has none, even with a
+    /// session over Bluetooth, which holds only while the two are in range.
+    pub fn is_direct_ip(&self, link_x25519: &[u8; 32]) -> bool {
+        lock(&self.sessions).get(link_x25519).is_some_and(|c| {
+            !c.session.is_closed()
+                && !c.session.is_relayed()
+                && c.session.carrier() != Some(CarrierKind::Ble)
+        })
+    }
+
+    /// Whether an open session runs over `on`.
+    pub fn carried_on(&self, on: &cardinal_link::Attached) -> bool {
+        lock(&self.sessions)
+            .values()
+            .any(|c| !c.session.is_closed() && on.carries(&c.session))
+    }
+
+    /// Whether a device's only session is over Bluetooth.
+    pub fn is_bluetooth_only(&self, link_x25519: &[u8; 32]) -> bool {
+        lock(&self.sessions).get(link_x25519).is_some_and(|c| {
+            !c.session.is_closed() && c.session.carrier() == Some(CarrierKind::Ble)
+        })
+    }
+
     /// The device a relayed session runs through, by link key.
     pub fn relayed_through(&self, link_x25519: &[u8; 32]) -> Option<[u8; 32]> {
         let sessions = lock(&self.sessions);
@@ -966,11 +991,15 @@ impl Daemon {
         if !s.is_relayed() {
             return None;
         }
-        let at = s.remote_addr();
-        sessions
-            .iter()
-            .find(|(_, c)| !c.session.is_relayed() && c.session.remote_addr() == at)
-            .map(|(x, _)| *x)
+        // A path with no address, as over Bluetooth, is nobody's relay.
+        let at = s.remote_addr()?;
+        relay_of(
+            sessions
+                .iter()
+                .filter(|(_, c)| !c.session.is_relayed())
+                .map(|(x, c)| (*x, c.session.remote_addr())),
+            at,
+        )
     }
 
     /// The remote address of a device's session.
@@ -1553,7 +1582,7 @@ impl Daemon {
             devices
         };
         for (key, link) in devices {
-            if self.is_direct(link.x25519()) {
+            if self.is_direct_ip(link.x25519()) {
                 continue;
             }
             {
@@ -1709,7 +1738,7 @@ impl Daemon {
                 }
             }
         }
-        reached || self.is_direct(link.x25519())
+        reached || self.is_direct_ip(link.x25519())
     }
 
     /// Where this device has reached its own devices, for the others.
@@ -1934,12 +1963,12 @@ impl Daemon {
         let known: Vec<String> = lock(&self.book).at(&addr).into_iter().cloned().collect();
         let taken = devices
             .iter()
-            .any(|(k, l)| known.contains(&hex::encode(k)) && self.is_direct(l.x25519()));
+            .any(|(k, l)| known.contains(&hex::encode(k)) && self.is_direct_ip(l.x25519()));
         if taken {
             return;
         }
         for (key, link) in devices {
-            if self.is_direct(link.x25519()) {
+            if self.is_direct_ip(link.x25519()) {
                 continue;
             }
             if !lock(&self.connecting).insert(key) {
@@ -2267,12 +2296,35 @@ pub fn unique_name(name: &str, others: &[String]) -> String {
 #[cfg(test)]
 mod unique_name_tests {
     #[test]
+    fn a_path_with_no_address_is_nobodys_relay() {
+        let host: std::net::SocketAddr = "192.0.2.1:7171".parse().unwrap();
+        let direct = vec![([1u8; 32], None), ([2u8; 32], Some(host))];
+        assert_eq!(
+            super::relay_of(direct.clone().into_iter(), host),
+            Some([2; 32])
+        );
+        let only_radio = vec![([1u8; 32], None)];
+        assert_eq!(super::relay_of(only_radio.into_iter(), host), None);
+    }
+
+    #[test]
     fn a_name_another_device_has_gets_the_next_number() {
         let others = vec!["Carbonite".to_owned(), "carbonite 2".to_owned()];
         assert_eq!(super::unique_name("desk", &others), "desk");
         assert_eq!(super::unique_name("carbonite", &others), "carbonite 3");
         assert_eq!(super::unique_name("CARBONITE", &[]), "CARBONITE");
     }
+}
+
+/// Of direct sessions, by link key and remote address, the one at `at`.
+fn relay_of(
+    direct: impl Iterator<Item = ([u8; 32], Option<SocketAddr>)>,
+    at: SocketAddr,
+) -> Option<[u8; 32]> {
+    direct
+        .filter(|(_, a)| *a == Some(at))
+        .map(|(x, _)| x)
+        .next()
 }
 
 /// How a session runs, and who opened it, in words.

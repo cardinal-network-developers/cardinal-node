@@ -209,9 +209,25 @@ impl Keys {
     }
 
     /// The one short tag a legacy advertisement holds at refresh `n`: the
-    /// keys take turns.
+    /// keys take turns, and while there are one-time keys, one of them has
+    /// every other turn, since someone holding an invitation is looking for
+    /// it now.
     pub fn legacy(&self, psm: u16, n: usize) -> Option<Advert> {
-        let (t, k) = self.keys.get(n % self.keys.len().max(1))?;
+        let (once, rest): (Vec<_>, Vec<_>) =
+            self.keys.iter().partition(|(t, _)| *t == TagType::OneTime);
+        fn pick<'a>(
+            of: &[&'a (TagType, Zeroizing<[u8; 32]>)],
+            i: usize,
+        ) -> Option<&'a (TagType, Zeroizing<[u8; 32]>)> {
+            of.get(i % of.len().max(1)).copied()
+        }
+        let chosen = match (once.is_empty(), rest.is_empty()) {
+            (true, _) => pick(&rest, n),
+            (false, true) => pick(&once, n),
+            (false, false) if n % 2 == 0 => pick(&once, n / 2),
+            (false, false) => pick(&rest, n / 2),
+        };
+        let (t, k) = chosen?;
         Some(Advert {
             psm,
             tags: vec![Tag::shorten(*t, k, random_bytes())],
@@ -414,6 +430,12 @@ pub trait Radio: Send + Sync + 'static {
 
     /// Opens an L2CAP channel to `to` on `psm`.
     fn connect(&self, to: BleAddr, psm: u16) -> RadioFuture<'_, BoxChannel>;
+
+    /// What the radio last said went wrong, where it says: why a scan
+    /// stopped, say.
+    fn failure(&self) -> Option<String> {
+        None
+    }
 
     /// This radio's own address, where it knows it: what it skips when it
     /// sees its own advertisement.
@@ -872,6 +894,30 @@ mod tests {
         let back = Advert::decode(&second.encode_legacy().unwrap()).unwrap();
         assert!(back.has(TagType::Contacts, &theirs));
         assert!(Keys::default().legacy(1, 0).is_none());
+        // With an invitation outstanding, its tag is in every other one.
+        let once = cardinal_crypto::derive(Purpose::OneTime, &[3; 16]);
+        let with = Keys {
+            keys: vec![
+                (TagType::Own, own.clone()),
+                (TagType::Contacts, theirs.clone()),
+                (TagType::OneTime, once.clone()),
+            ],
+        };
+        let carried: Vec<[bool; 3]> = (0..6)
+            .map(|n| {
+                let ad =
+                    Advert::decode(&with.legacy(1, n).unwrap().encode_legacy().unwrap()).unwrap();
+                [
+                    ad.has(TagType::Own, &own),
+                    ad.has(TagType::Contacts, &theirs),
+                    ad.has(TagType::OneTime, &once),
+                ]
+            })
+            .collect();
+        for (n, c) in carried.iter().enumerate() {
+            assert_eq!(c[2], n % 2 == 0, "turn {n}: {c:?}");
+        }
+        assert!(carried.iter().any(|c| c[0]) && carried.iter().any(|c| c[1]));
         // A full advertisement has no legacy form.
         assert!(keys.advert(1).encode_legacy().is_none());
     }

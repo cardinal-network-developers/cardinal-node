@@ -27,7 +27,7 @@
 //! ([`crate::bluez`]), and, for tests, radios meeting in the directory
 //! `CARDINAL_TEST_BLE_ETHER` names.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -37,7 +37,8 @@ use cardinal_contact::ble::{self, Advert, BleAddr, Keys, Radio, Sighting, TagTyp
 use cardinal_contact::discovery::{discovery_key, presence_key};
 use cardinal_contact::Invitation;
 use cardinal_crypto::HybridPublicKey;
-use cardinal_link::{CarrierKind, Session, Target};
+use cardinal_identity::KeyId;
+use cardinal_link::{Attached, CarrierKind, Session, Target};
 use serde_json::{json, Value};
 use tokio::sync::{mpsc, watch, Notify};
 use zeroize::Zeroizing;
@@ -86,12 +87,30 @@ const LOOK_EVERY: Duration = Duration::from_secs(2);
 const SEEN_AGAIN: Duration = Duration::from_secs(2);
 /// How often an own device's tag at one address is tried.
 const OWN_EVERY: Duration = Duration::from_secs(10);
+/// How often an own device's tag is tried in a minute, at any addresses: a
+/// tag recorded and played again from address after address costs this.
+const OWN_PER_MINUTE: usize = 3;
+/// The most advertisements looked at in a second, whoever sends them: each
+/// costs a keyed hash per key.
+const SIGHTINGS_PER_SECOND: u32 = 50;
+/// The most devices whose last advertisement is kept.
+const LAST_MAX: usize = 512;
+/// How long a channel someone opened may go with no session over it.
+const UNPROVEN_WITHIN: Duration = Duration::from_secs(10);
+/// The most channels one address may have open to this device.
+const MAX_PER_ADDR: usize = 2;
 /// How long opening a channel may take.
 const CHANNEL_WITHIN: Duration = Duration::from_secs(10);
 /// How long a handshake over a channel may take.
 const HANDSHAKE_WITHIN: Duration = Duration::from_secs(8);
-/// How long someone accepting an invitation looks for its tag.
-const INVITATION_WITHIN: Duration = Duration::from_secs(30);
+/// How long someone accepting an invitation looks for its tag: where the
+/// other device has only a legacy advertisement, one tag a time, its
+/// one-time tag is in every other one ([`Keys::legacy`]), and those come
+/// every [`ADVERTISE_FAST`].
+const INVITATION_WITHIN: Duration = Duration::from_secs(60);
+/// How often the advertisement is made again while it has a one-time tag,
+/// so that a legacy one gets round its tags soon.
+const ADVERTISE_FAST: Duration = Duration::from_secs(10);
 /// How long to wait before trying the radio again when it failed: the
 /// app that drives it on Android connects a moment after the service starts.
 const RETRY_EVERY: Duration = Duration::from_secs(5);
@@ -149,12 +168,24 @@ pub struct Bluetooth {
     wanted: Mutex<Vec<Wanted>>,
     /// When an own device's tag at each address was last tried.
     tried: Mutex<HashMap<BleAddr, Instant>>,
+    /// When an own device's tag was tried in the last minute, anywhere.
+    own_tries: Mutex<VecDeque<Instant>>,
+    /// Own devices being tried over Bluetooth now: apart from the tries
+    /// over IP, which a tag seen here must never hold up.
+    dialling: Mutex<HashSet<KeyId>>,
     /// Advertisements under the service UUID seen since start.
     seen: AtomicU64,
     /// Of those, the ones with a tag this device recognized.
     recognized: AtomicU64,
     /// Channels others have open to this device.
-    incoming: Arc<AtomicUsize>,
+    incoming: Mutex<Vec<Incoming>>,
+}
+
+/// A channel someone opened to this device.
+struct Incoming {
+    from: BleAddr,
+    at: Instant,
+    on: Attached,
 }
 
 /// A window, while it watches the service.
@@ -305,8 +336,14 @@ fn off(d: &Daemon) {
 /// What this device advertises now: its own devices' tag, its trusted
 /// contacts' tag where it gives the secret to anyone, and a one-time tag for
 /// each outstanding invitation it answers for.
+///
+/// The one-time tags come first: someone holding an invitation is looking
+/// for this device now, and is to find it soonest.
 fn keys(d: &Daemon) -> Keys {
     let mut keys = Vec::new();
+    for secret in crate::contacts::answered_here(d) {
+        keys.push((TagType::OneTime, ble::one_time_key(&secret)));
+    }
     let (own, presence) = {
         let core = d.core();
         (core.discovery_secret(), crate::presence::advertised(&core))
@@ -317,10 +354,93 @@ fn keys(d: &Daemon) -> Keys {
     if let Some(s) = presence {
         keys.push((TagType::Contacts, presence_key(&s)));
     }
-    for secret in crate::contacts::answered_here(d) {
-        keys.push((TagType::OneTime, ble::one_time_key(&secret)));
-    }
     Keys { keys }
+}
+
+/// The keys tags seen are checked against, derived once for the state they
+/// come from.
+#[derive(Default)]
+struct Known {
+    version: Option<u64>,
+    own: Option<Zeroizing<[u8; 32]>>,
+    contacts: Vec<([u8; 32], Zeroizing<[u8; 32]>)>,
+}
+
+impl Known {
+    fn fresh(&mut self, d: &Daemon) -> &Known {
+        let core = d.core();
+        let version = core.state_version();
+        if self.version != Some(version) {
+            self.own = core.discovery_secret().map(|s| discovery_key(&s));
+            self.contacts = crate::presence::of_contacts(&core)
+                .iter()
+                .map(|(who, s)| (*who, presence_key(s)))
+                .collect();
+            self.version = Some(version);
+        }
+        self
+    }
+}
+
+/// So many in a second at most.
+struct Budget {
+    since: Instant,
+    used: u32,
+    per_second: u32,
+}
+
+impl Budget {
+    fn new(per_second: u32) -> Budget {
+        Budget {
+            since: Instant::now(),
+            used: 0,
+            per_second,
+        }
+    }
+
+    fn take(&mut self) -> bool {
+        if self.since.elapsed() >= Duration::from_secs(1) {
+            self.since = Instant::now();
+            self.used = 0;
+        }
+        self.used += 1;
+        self.used <= self.per_second
+    }
+}
+
+/// What was last seen of each device, at most [`LAST_MAX`] of them: a
+/// sighting is looked at again only when it changed, or after
+/// [`SEEN_AGAIN`].
+#[derive(Default)]
+struct Last(HashMap<BleAddr, (Vec<u8>, Instant)>);
+
+impl Last {
+    /// Whether `s` is to be looked at, noting it if so.
+    fn fresh(&mut self, s: &Sighting) -> bool {
+        let fresh = self
+            .0
+            .get(&s.addr)
+            .is_none_or(|(data, at)| *data != s.data || at.elapsed() >= SEEN_AGAIN);
+        if fresh {
+            if self.0.len() >= LAST_MAX && !self.0.contains_key(&s.addr) {
+                let oldest = self
+                    .0
+                    .iter()
+                    .min_by_key(|(_, (_, at))| *at)
+                    .map(|(a, _)| *a);
+                if let Some(a) = oldest {
+                    self.0.remove(&a);
+                }
+            }
+            self.0.insert(s.addr, (s.data.clone(), Instant::now()));
+        }
+        fresh
+    }
+
+    fn prune(&mut self) {
+        self.0
+            .retain(|_, (_, at)| at.elapsed() < Duration::from_secs(60));
+    }
 }
 
 fn same(a: &Keys, b: &Keys) -> bool {
@@ -383,7 +503,9 @@ async fn run(d: &Arc<Daemon>) -> Result<(), String> {
     tracing::info!("Bluetooth on: {}, PSM {psm}", radio.describe());
     let mut look = tokio::time::interval(LOOK_EVERY);
     let mut made = Instant::now();
-    let mut last: HashMap<BleAddr, (Vec<u8>, Instant)> = HashMap::new();
+    let mut last = Last::default();
+    let mut known = Known::default();
+    let mut budget = Budget::new(SIGHTINGS_PER_SECOND);
     loop {
         tokio::select! {
             ch = listening.incoming.recv() => {
@@ -394,20 +516,24 @@ async fn run(d: &Arc<Daemon>) -> Result<(), String> {
             }
             s = seen.recv() => {
                 let Some(s) = s else {
-                    return Err("the radio stopped scanning".into());
+                    return Err(match radio.failure() {
+                        Some(why) => format!("the radio stopped scanning: {why}"),
+                        None => "the radio stopped scanning".into(),
+                    });
                 };
-                let fresh = last.get(&s.addr).is_none_or(|(data, at)| {
-                    *data != s.data || at.elapsed() >= SEEN_AGAIN
-                });
-                if fresh {
-                    last.retain(|_, (_, at)| at.elapsed() < Duration::from_secs(60));
-                    last.insert(s.addr, (s.data.clone(), Instant::now()));
-                    sighted(d, &radio, s);
+                if last.fresh(&s) && budget.take() {
+                    sighted(d, &radio, s, known.fresh(d));
                 }
             }
             _ = look.tick() => {
+                last.prune();
                 let now = keys(d);
-                if !same(&now, &advertised) || made.elapsed() >= ADVERTISE_EVERY {
+                let every = if now.keys.iter().any(|(t, _)| *t == TagType::OneTime) {
+                    ADVERTISE_FAST
+                } else {
+                    ADVERTISE_EVERY
+                };
+                if !same(&now, &advertised) || made.elapsed() >= every {
                     // The old one goes first: an adapter holds few.
                     _ad = None;
                     if !now.is_empty() {
@@ -425,27 +551,67 @@ async fn run(d: &Arc<Daemon>) -> Result<(), String> {
 }
 
 /// A channel someone opened to this device: carried for the link, which
-/// answers only a handshake it can check.
+/// answers only a handshake it can check. At most [`MAX_INCOMING`] at once
+/// and [`MAX_PER_ADDR`] from one address; when all are taken, the oldest
+/// with no session over it gives way.
 fn take_channel(d: &Arc<Daemon>, from: BleAddr, ch: ble::BoxChannel) {
-    let incoming = d.bluetooth.incoming.clone();
-    if incoming.load(Ordering::SeqCst) >= MAX_INCOMING {
-        tracing::debug!("Bluetooth: too many channels open; one from {from} is refused");
-        return;
-    }
-    incoming.fetch_add(1, Ordering::SeqCst);
-    let on = d
-        .endpoint
-        .attach(ch, CarrierKind::Ble, format!("bluetooth {from}"));
-    tokio::spawn(async move {
-        while !on.is_closed() {
-            tokio::time::sleep(Duration::from_secs(1)).await;
+    {
+        let mut held = lock(&d.bluetooth.incoming);
+        held.retain(|c| !c.on.is_closed());
+        if held.iter().filter(|c| c.from == from).count() >= MAX_PER_ADDR {
+            tracing::debug!("Bluetooth: {from} has channels open already; one more is refused");
+            return;
         }
-        incoming.fetch_sub(1, Ordering::SeqCst);
-    });
+        if held.len() >= MAX_INCOMING {
+            let oldest = held
+                .iter()
+                .enumerate()
+                .filter(|(_, c)| !d.carried_on(&c.on))
+                .min_by_key(|(_, c)| c.at)
+                .map(|(i, _)| i);
+            match oldest {
+                Some(i) => {
+                    let c = held.remove(i);
+                    tracing::debug!("Bluetooth: a channel from {} gives way", c.from);
+                    c.on.close();
+                }
+                None => {
+                    tracing::debug!(
+                        "Bluetooth: too many channels open; one from {from} is refused"
+                    );
+                    return;
+                }
+            }
+        }
+        let on = d
+            .endpoint
+            .attach(ch, CarrierKind::Ble, format!("bluetooth {from}"));
+        held.push(Incoming {
+            from,
+            at: Instant::now(),
+            on: on.clone(),
+        });
+        tokio::spawn(keep_while_used(d.clone(), on));
+    }
+}
+
+/// Closes a channel once no session has run over it for
+/// [`UNPROVEN_WITHIN`]: from the start, for one nobody proved anything on,
+/// and after its session ended or moved to a better path.
+async fn keep_while_used(d: Arc<Daemon>, on: Attached) {
+    let mut used = Instant::now();
+    while !on.is_closed() {
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        if d.carried_on(&on) {
+            used = Instant::now();
+        } else if used.elapsed() >= UNPROVEN_WITHIN {
+            on.close();
+        }
+    }
 }
 
 /// An advertisement under the service UUID: what its tags say to try.
-fn sighted(d: &Arc<Daemon>, radio: &Arc<dyn Radio>, s: Sighting) {
+fn sighted(d: &Arc<Daemon>, radio: &Arc<dyn Radio>, s: Sighting, known: &Known) {
     if radio.own_addr() == Some(s.addr) {
         return;
     }
@@ -470,18 +636,16 @@ fn sighted(d: &Arc<Daemon>, radio: &Arc<dyn Radio>, s: Sighting) {
             }
         }
     }
-    let own = d.core().discovery_secret().map(|s| discovery_key(&s));
-    if own.is_some_and(|k| ad.has(TagType::Own, &k)) {
+    if known.own.as_ref().is_some_and(|k| ad.has(TagType::Own, k)) {
         recognized = true;
         let d = d.clone();
         let seen = seen.clone();
         tokio::spawn(async move { found_own(&d, seen).await });
     }
     // One keyed hash per trusted contact per advertisement.
-    let theirs = crate::presence::of_contacts(&d.core());
     let mut found: Vec<[u8; 32]> = Vec::new();
-    for (who, secret) in &theirs {
-        if !found.contains(who) && ad.has(TagType::Contacts, &presence_key(secret)) {
+    for (who, k) in &known.contacts {
+        if !found.contains(who) && ad.has(TagType::Contacts, k) {
             found.push(*who);
         }
     }
@@ -499,18 +663,10 @@ fn sighted(d: &Arc<Daemon>, radio: &Arc<dyn Radio>, s: Sighting) {
 /// One of the person's own devices advertises: each of theirs this device
 /// has no session with is tried, at once, on one channel.
 async fn found_own(d: &Arc<Daemon>, seen: Seen) {
-    {
-        let mut tried = lock(&d.bluetooth.tried);
-        if tried
-            .get(&seen.addr)
-            .is_some_and(|t| t.elapsed() < OWN_EVERY)
-        {
-            return;
-        }
-        tried.retain(|_, t| t.elapsed() < OWN_EVERY);
-        tried.insert(seen.addr, Instant::now());
+    if !own_try(&d.bluetooth, seen.addr) {
+        return;
     }
-    let devices: Vec<(cardinal_identity::KeyId, HybridPublicKey)> = {
+    let devices: Vec<(KeyId, HybridPublicKey)> = {
         let core = d.core();
         let Some(ident) = core.identity.as_ref() else {
             return;
@@ -524,12 +680,13 @@ async fn found_own(d: &Arc<Daemon>, seen: Seen) {
             .filter(|(_, l)| !d.is_direct(l.x25519()))
             .collect()
     };
-    // Not those another way is trying now.
+    // Not those a Bluetooth try is on now. The tries over IP keep their own
+    // count (`Daemon::connecting`), and this one never holds them up.
     let devices: Vec<_> = {
-        let mut connecting = lock(&d.connecting);
+        let mut dialling = lock(&d.bluetooth.dialling);
         devices
             .into_iter()
-            .filter(|(k, _)| connecting.insert(*k))
+            .filter(|(k, _)| dialling.insert(*k))
             .collect()
     };
     if devices.is_empty() {
@@ -538,9 +695,9 @@ async fn found_own(d: &Arc<Daemon>, seen: Seen) {
     let links: Vec<HybridPublicKey> = devices.iter().map(|(_, l)| l.clone()).collect();
     let r = dial(d, &seen, &links).await;
     {
-        let mut connecting = lock(&d.connecting);
+        let mut dialling = lock(&d.bluetooth.dialling);
         for (k, _) in &devices {
-            connecting.remove(k);
+            dialling.remove(k);
         }
     }
     match r {
@@ -559,9 +716,38 @@ async fn found_own(d: &Arc<Daemon>, seen: Seen) {
     }
 }
 
+/// Whether an own device's tag seen at `addr` may be tried now: once in
+/// [`OWN_EVERY`] at one address, and [`OWN_PER_MINUTE`] times a minute at
+/// all of them, so that a tag played again from new addresses costs no
+/// more.
+fn own_try(b: &Bluetooth, addr: BleAddr) -> bool {
+    let mut tried = lock(&b.tried);
+    if tried.get(&addr).is_some_and(|t| t.elapsed() < OWN_EVERY) {
+        return false;
+    }
+    let mut minute = lock(&b.own_tries);
+    while minute
+        .front()
+        .is_some_and(|t| t.elapsed() >= Duration::from_secs(60))
+    {
+        minute.pop_front();
+    }
+    if minute.len() >= OWN_PER_MINUTE {
+        return false;
+    }
+    minute.push_back(Instant::now());
+    tried.retain(|_, t| t.elapsed() < OWN_EVERY);
+    tried.insert(addr, Instant::now());
+    true
+}
+
 /// Opens a channel to a device seen, and a session over it with whichever
 /// of `links` is at the other end.
-pub async fn dial(d: &Daemon, seen: &Seen, links: &[HybridPublicKey]) -> anyhow::Result<Session> {
+pub async fn dial(
+    d: &Arc<Daemon>,
+    seen: &Seen,
+    links: &[HybridPublicKey],
+) -> anyhow::Result<Session> {
     let targets = links
         .iter()
         .map(|l| Target::new(NOWHERE, CarrierKind::Ble, l))
@@ -570,7 +756,11 @@ pub async fn dial(d: &Daemon, seen: &Seen, links: &[HybridPublicKey]) -> anyhow:
 }
 
 /// Opens a channel to a device seen, and tries every target on it at once.
-async fn dial_targets(d: &Daemon, seen: &Seen, targets: Vec<Target>) -> anyhow::Result<Session> {
+async fn dial_targets(
+    d: &Arc<Daemon>,
+    seen: &Seen,
+    targets: Vec<Target>,
+) -> anyhow::Result<Session> {
     anyhow::ensure!(!targets.is_empty(), "nobody to try");
     let ch = tokio::time::timeout(CHANNEL_WITHIN, seen.radio.connect(seen.addr, seen.psm))
         .await
@@ -579,6 +769,7 @@ async fn dial_targets(d: &Daemon, seen: &Seen, targets: Vec<Target>) -> anyhow::
     let on = d
         .endpoint
         .attach(ch, CarrierKind::Ble, format!("bluetooth {}", seen.addr));
+    let watched = on.clone();
     let (done, give_up) = watch::channel(false);
     let mut tries = tokio::task::JoinSet::new();
     for t in targets {
@@ -593,6 +784,7 @@ async fn dial_targets(d: &Daemon, seen: &Seen, targets: Vec<Target>) -> anyhow::
                 // The others stop, and clean up after themselves.
                 let _ = done.send(true);
                 tries.detach_all();
+                tokio::spawn(keep_while_used(d.clone(), watched));
                 return Ok(s);
             }
             Ok(Err(e)) => last = Some(e.to_string()),
@@ -611,7 +803,7 @@ async fn dial_targets(d: &Daemon, seen: &Seen, targets: Vec<Target>) -> anyhow::
 /// its secret makes, and opens the invitation's session with it. `None`
 /// where Bluetooth is off, or nobody advertising it was found in time.
 pub async fn find_invitation(
-    d: &Daemon,
+    d: &Arc<Daemon>,
     invitation: &Invitation,
 ) -> Option<anyhow::Result<Session>> {
     lock(&d.bluetooth.running).as_ref()?;
@@ -655,7 +847,7 @@ pub fn status(d: &Daemon) -> Value {
         "psm": shown.psm,
         "seen": b.seen.load(Ordering::Relaxed),
         "recognized": b.recognized.load(Ordering::Relaxed),
-        "channels_in": b.incoming.load(Ordering::SeqCst),
+        "channels_in": lock(&b.incoming).iter().filter(|c| !c.on.is_closed()).count(),
     })
 }
 
@@ -679,6 +871,41 @@ pub async fn check(d: &Daemon) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_own_tag_played_again_from_new_addresses_costs_three_tries_a_minute() {
+        let b = Bluetooth::default();
+        let at = |i: u8| BleAddr::parse(&format!("C0:00:00:00:00:{i:02X}"), true).unwrap();
+        let tried: Vec<bool> = (0..10).map(|i| own_try(&b, at(i))).collect();
+        assert_eq!(tried.iter().filter(|x| **x).count(), OWN_PER_MINUTE);
+        assert!(tried[..OWN_PER_MINUTE].iter().all(|x| *x));
+        // Bluetooth's tries are its own: the set the tries over IP use is
+        // not touched (review H1).
+        assert!(lock(&b.dialling).is_empty());
+    }
+
+    #[test]
+    fn what_was_seen_is_kept_bounded_and_looked_at_again_only_when_changed() {
+        let mut last = Last::default();
+        let at = |i: u16| BleAddr {
+            bytes: [0xc0, 0, 0, 0, (i >> 8) as u8, i as u8],
+            random: true,
+        };
+        let s = |i: u16, d: u8| Sighting {
+            addr: at(i),
+            data: vec![d],
+        };
+        assert!(last.fresh(&s(1, 1)));
+        assert!(!last.fresh(&s(1, 1)), "the same, again at once");
+        assert!(last.fresh(&s(1, 2)), "changed");
+        for i in 2..(LAST_MAX as u16 + 100) {
+            last.fresh(&s(i, 0));
+        }
+        assert_eq!(last.0.len(), LAST_MAX);
+        let mut budget = Budget::new(SIGHTINGS_PER_SECOND);
+        let taken = (0..200).filter(|_| budget.take()).count();
+        assert_eq!(taken, SIGHTINGS_PER_SECOND as usize);
+    }
 
     #[test]
     fn modes_read_and_write() {

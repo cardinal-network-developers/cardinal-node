@@ -2,10 +2,13 @@
 //! whose Kotlin has the Bluetooth APIs, while this service is a program of
 //! its own that cannot reach them.
 //!
-//! The service listens on the socket. The app opens one **control**
-//! connection, a JSON object per line each way, and one connection more
-//! for each **channel**, whose first line says which, after which the bytes
-//! are the channel's.
+//! The service listens on the socket, which only its own user may open
+//! (mode 0600, and each connection's peer is checked to be of the same
+//! user). The app opens one **control** connection, whose first line is
+//! `{"control": true}`, then a JSON object per line each way, and one
+//! connection more for each **channel**, whose first line says which, after
+//! which the bytes are the channel's. Any other first line, or none within
+//! five seconds, ends the connection.
 //!
 //! The service asks, on the control connection:
 //!
@@ -26,7 +29,9 @@
 //! - `{"op": "seen", "addr": "...", "random": bool, "data": hex}` for each
 //!   advertisement under the service UUID;
 //! - `{"op": "connect-failed", "id": n, "error": "..."}`;
-//! - `{"op": "advertise-failed", "error": "..."}`.
+//! - `{"op": "advertise-failed", "error": "..."}`;
+//! - `{"op": "scan-failed", "error": "..."}`: scanning stopped, and the
+//!   service says why and starts again.
 //!
 //! A channel connection begins `{"channel": n}` for the channel `connect`
 //! asked for, or `{"incoming": true, "addr": "...", "random": bool}` for one
@@ -59,14 +64,29 @@ struct Shared {
     psm: Option<oneshot::Sender<io::Result<u16>>>,
     scanning: Option<mpsc::Sender<Sighting>>,
     connecting: HashMap<u64, oneshot::Sender<io::Result<BoxChannel>>>,
+    /// Which control connection is the app's now: a later one replaces it.
+    control: u64,
+    /// What the app last said went wrong.
+    failure: Option<String>,
 }
 
 /// A radio the app drives (see the module's documentation).
 #[derive(Clone)]
 pub struct BridgeRadio {
     shared: Arc<Mutex<Shared>>,
+    /// Channels asked for, by number.
     next: Arc<AtomicU64>,
+    /// Refreshes of the advertisement: whose turn a legacy one is.
+    turn: Arc<AtomicU64>,
     path: PathBuf,
+}
+
+/// How long a connection may take to say what it is.
+const FIRST_LINE_WITHIN: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Whether the other end of `s` runs as `uid`.
+fn same_user(s: &UnixStream, uid: u32) -> bool {
+    s.peer_cred().is_ok_and(|c| c.uid() == uid)
 }
 
 fn hex(b: &[u8]) -> String {
@@ -109,14 +129,22 @@ impl BridgeRadio {
         let path = path.as_ref().to_path_buf();
         let _ = std::fs::remove_file(&path);
         let listener = UnixListener::bind(&path)?;
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
+        // The socket is this process's user's: only they may use it.
+        let uid = std::fs::metadata(&path)?.uid();
         let r = BridgeRadio {
             shared: Arc::default(),
             next: Arc::new(AtomicU64::new(1)),
+            turn: Arc::new(AtomicU64::new(0)),
             path,
         };
         let shared = r.shared.clone();
         tokio::spawn(async move {
             while let Ok((s, _)) = listener.accept().await {
+                if !same_user(&s, uid) {
+                    continue;
+                }
                 let shared = shared.clone();
                 tokio::spawn(async move {
                     let _ = serve(shared, s).await;
@@ -148,7 +176,9 @@ impl BridgeRadio {
 }
 
 async fn serve(shared: Arc<Mutex<Shared>>, mut s: UnixStream) -> io::Result<()> {
-    let first = first_line(&mut s).await?;
+    let first = tokio::time::timeout(FIRST_LINE_WITHIN, first_line(&mut s))
+        .await
+        .map_err(|_| io::Error::from(io::ErrorKind::TimedOut))??;
     let v: Value =
         serde_json::from_str(&first).map_err(|_| io::Error::from(io::ErrorKind::InvalidData))?;
     if let Some(id) = v["channel"].as_u64() {
@@ -168,10 +198,16 @@ async fn serve(shared: Arc<Mutex<Shared>>, mut s: UnixStream) -> io::Result<()> 
         }
         return Ok(());
     }
-    // The control connection: the first line is the app's state.
+    if v["control"] != json!(true) {
+        return Ok(());
+    }
     let (tx, mut rx) = mpsc::unbounded_channel::<String>();
-    lock(&shared).to_app = Some(tx);
-    on_event(&shared, &v);
+    let me = {
+        let mut held = lock(&shared);
+        held.control += 1;
+        held.to_app = Some(tx);
+        held.control
+    };
     let (r, mut w) = s.into_split();
     let writer = tokio::spawn(async move {
         while let Some(mut line) = rx.recv().await {
@@ -189,6 +225,10 @@ async fn serve(shared: Arc<Mutex<Shared>>, mut s: UnixStream) -> io::Result<()> 
     }
     writer.abort();
     let mut held = lock(&shared);
+    if held.control != me {
+        // Another took its place.
+        return Ok(());
+    }
     held.to_app = None;
     held.state = Some(Err("the app's Bluetooth went away".into()));
     // What was under way ends with it.
@@ -224,6 +264,19 @@ fn on_event(shared: &Mutex<Shared>, v: &Value) {
                 let _ = tx.try_send(Sighting { addr, data });
             }
         }
+        Some("scan-failed") | Some("advertise-failed") => {
+            let e = v["error"].as_str().unwrap_or("it failed");
+            let what = if v["op"] == "scan-failed" {
+                "scanning"
+            } else {
+                "advertising"
+            };
+            held.failure = Some(format!("{what} failed: {e}"));
+            if what == "scanning" {
+                // The scan ends; the service starts again and says why.
+                held.scanning = None;
+            }
+        }
         Some("connect-failed") => {
             if let Some(tx) = v["id"].as_u64().and_then(|id| held.connecting.remove(&id)) {
                 let e = v["error"].as_str().unwrap_or("no channel").to_owned();
@@ -237,6 +290,10 @@ fn on_event(shared: &Mutex<Shared>, v: &Value) {
 impl Radio for BridgeRadio {
     fn describe(&self) -> String {
         format!("the app's Bluetooth, through {}", self.path.display())
+    }
+
+    fn failure(&self) -> Option<String> {
+        lock(&self.shared).failure.clone()
     }
 
     fn available(&self) -> RadioFuture<'_, Result<(), String>> {
@@ -274,7 +331,7 @@ impl Radio for BridgeRadio {
 
     fn advertise(&self, keys: &Keys, psm: u16) -> RadioFuture<'_, Box<dyn Send>> {
         let data = keys.advert(psm).encode();
-        let n = self.next.fetch_add(1, Ordering::Relaxed) as usize;
+        let n = self.turn.fetch_add(1, Ordering::Relaxed) as usize;
         let legacy = keys
             .legacy(psm, n)
             .and_then(|a| a.encode_legacy())
@@ -288,12 +345,24 @@ impl Radio for BridgeRadio {
     fn scan(&self) -> RadioFuture<'_, mpsc::Receiver<Sighting>> {
         Box::pin(async move {
             let (tx, rx) = mpsc::channel(64);
-            lock(&self.shared).scanning = Some(tx.clone());
+            // Only the shared state holds the sender, so that the scan ends
+            // when the app says it failed.
+            let weak = tx.downgrade();
+            lock(&self.shared).scanning = Some(tx);
             self.tell(json!({"op": "scan"}))?;
             let me = self.clone();
             tokio::spawn(async move {
-                tx.closed().await;
-                let _ = me.tell(json!({"op": "unscan"}));
+                loop {
+                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                    match weak.upgrade() {
+                        None => break,
+                        Some(t) if t.is_closed() => {
+                            let _ = me.tell(json!({"op": "unscan"}));
+                            break;
+                        }
+                        Some(_) => {}
+                    }
+                }
             });
             Ok(rx)
         })
@@ -304,13 +373,17 @@ impl Radio for BridgeRadio {
             let id = self.next.fetch_add(1, Ordering::Relaxed);
             let (tx, rx) = oneshot::channel();
             lock(&self.shared).connecting.insert(id, tx);
-            let asked = self.tell(json!({
-                "op": "connect", "id": id, "addr": to.to_string(), "random": to.random, "psm": psm,
-            }));
-            if let Err(e) = asked {
-                lock(&self.shared).connecting.remove(&id);
-                return Err(e);
+            // However this ends, given up on included, nothing waits for it.
+            struct Forget(Arc<Mutex<Shared>>, u64);
+            impl Drop for Forget {
+                fn drop(&mut self) {
+                    lock(&self.0).connecting.remove(&self.1);
+                }
             }
+            let _forget = Forget(self.shared.clone(), id);
+            self.tell(json!({
+                "op": "connect", "id": id, "addr": to.to_string(), "random": to.random, "psm": psm,
+            }))?;
             rx.await
                 .map_err(|_| io::Error::other("the app's Bluetooth went away"))?
         })
@@ -326,7 +399,7 @@ mod tests {
     async fn app(path: PathBuf, radio: crate::ble::MemoryRadio) {
         let s = UnixStream::connect(&path).await.unwrap();
         let (r, mut w) = s.into_split();
-        w.write_all(b"{\"op\":\"state\",\"available\":true}\n")
+        w.write_all(b"{\"control\":true}\n{\"op\":\"state\",\"available\":true}\n")
             .await
             .unwrap();
         let (out, mut out_rx) = mpsc::unbounded_channel::<String>();
@@ -401,6 +474,73 @@ mod tests {
                 _ => {}
             }
         }
+    }
+
+    #[tokio::test]
+    async fn only_an_explicit_control_connection_drives_the_radio() {
+        let dir = std::env::temp_dir().join(format!(
+            "cardinal-bridge-{}",
+            hex(&cardinal_crypto::random_bytes::<6>())
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("b");
+        let bridge = BridgeRadio::bind(&path).unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600, "only this user may connect");
+        // A state line with no control line first is not the app.
+        let mut s = UnixStream::connect(&path).await.unwrap();
+        s.write_all(b"{\"op\":\"state\",\"available\":true}\n")
+            .await
+            .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert!(bridge.available().await.unwrap().is_err());
+        // A connection that says nothing is let go.
+        let mut quiet = UnixStream::connect(&path).await.unwrap();
+        let mut b = [0u8; 1];
+        let ended = tokio::time::timeout(
+            FIRST_LINE_WITHIN + std::time::Duration::from_secs(2),
+            quiet.read(&mut b),
+        )
+        .await;
+        assert!(matches!(ended, Ok(Ok(0)) | Ok(Err(_))), "{ended:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn a_connect_given_up_on_is_forgotten() {
+        let dir = std::env::temp_dir().join(format!(
+            "cardinal-bridge-{}",
+            hex(&cardinal_crypto::random_bytes::<6>())
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("b");
+        let bridge = BridgeRadio::bind(&path).unwrap();
+        // An app that takes the control connection and never answers.
+        let mut app = UnixStream::connect(&path).await.unwrap();
+        app.write_all(b"{\"control\":true}\n{\"op\":\"state\",\"available\":true}\n")
+            .await
+            .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let to = BleAddr::parse("C0:00:00:00:00:01", true).unwrap();
+        let tried = tokio::time::timeout(
+            std::time::Duration::from_millis(200),
+            bridge.connect(to, 0x80),
+        )
+        .await;
+        assert!(tried.is_err(), "nobody answered");
+        assert!(lock(&bridge.shared).connecting.is_empty());
+        // A scan the app says failed ends, and says why.
+        let mut seen = bridge.scan().await.unwrap();
+        app.write_all(b"{\"op\":\"scan-failed\",\"error\":\"status 2\"}\n")
+            .await
+            .unwrap();
+        assert!(seen.recv().await.is_none());
+        assert_eq!(
+            bridge.failure().as_deref(),
+            Some("scanning failed: status 2")
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]
