@@ -185,7 +185,7 @@ pub struct Rendezvous {
     trails: Mutex<HashMap<[u8; 32], Trail>>,
     /// When each contact was last tried at an address whose advertisement
     /// carried their tag (D74): at most once in [`NEARBY_EVERY`].
-    nearby: Mutex<HashMap<([u8; 32], SocketAddr), Instant>>,
+    nearby: Mutex<HashMap<([u8; 32], String), Instant>>,
     /// When each contact was tried nearby in the last minute, whatever the
     /// address: at most [`NEARBY_PER_MINUTE`]. A tag can be replayed
     /// anywhere, and that is to cost a try and no more.
@@ -1674,6 +1674,31 @@ pub async fn try_at(d: &Arc<Daemon>, who: [u8; 32], addr: SocketAddr) {
     );
 }
 
+/// Where a trusted contact's tag was seen (D74).
+#[derive(Clone)]
+pub enum Near {
+    /// On the local network, in an advertisement for this address.
+    Lan(SocketAddr),
+    /// Over Bluetooth (`carriers/ble.md`), from this device.
+    Ble(crate::bluetooth::Seen),
+}
+
+impl Near {
+    fn key(&self) -> String {
+        match self {
+            Near::Lan(a) => a.to_string(),
+            Near::Ble(s) => format!("bluetooth {}", s.addr),
+        }
+    }
+
+    fn said(&self) -> String {
+        match self {
+            Near::Lan(a) => format!("on the local network at {a}"),
+            Near::Ble(s) => format!("over Bluetooth, at {}", s.addr),
+        }
+    }
+}
+
 /// An advertisement on the local network carried a trusted contact's tag
 /// (D74, `hosts.md#local-discovery`): each of their devices without a
 /// session is tried at its address, as at one their host named. A tag is a
@@ -1681,6 +1706,12 @@ pub async fn try_at(d: &Arc<Daemon>, who: [u8; 32], addr: SocketAddr) {
 /// the trail says which. Each address is tried at most once in
 /// [`NEARBY_EVERY`].
 pub async fn found_nearby(d: &Arc<Daemon>, who: [u8; 32], addr: SocketAddr) {
+    found_near(d, who, Near::Lan(addr)).await
+}
+
+/// A trusted contact's tag was seen, on the local network or over
+/// Bluetooth: [`found_nearby`], wherever it was.
+pub async fn found_near(d: &Arc<Daemon>, who: [u8; 32], near: Near) {
     let trusted = crate::presence::by_identity(&d.core())
         .get(&who)
         .is_some_and(|(t, _)| *t);
@@ -1704,10 +1735,11 @@ pub async fn found_nearby(d: &Arc<Daemon>, who: [u8; 32], addr: SocketAddr) {
     if theirs.iter().all(|(_, l)| reached(d, l.x25519())) {
         return;
     }
+    let place = near.key();
     {
         let mut tried = lock(&d.rendezvous.nearby);
         let recent = tried
-            .get(&(who, addr))
+            .get(&(who, place.clone()))
             .is_some_and(|t| t.elapsed() < NEARBY_EVERY);
         if recent {
             return;
@@ -1725,7 +1757,7 @@ pub async fn found_nearby(d: &Arc<Daemon>, who: [u8; 32], addr: SocketAddr) {
         }
         mine.push_back(Instant::now());
         tried.retain(|_, t| t.elapsed() < NEARBY_EVERY);
-        tried.insert((who, addr), Instant::now());
+        tried.insert((who, place), Instant::now());
     }
     // One try at a time for a contact, apart from the looks through hosts.
     if !lock(&d.rendezvous.nearby_going).insert(who) {
@@ -1738,32 +1770,57 @@ pub async fn found_nearby(d: &Arc<Daemon>, who: [u8; 32], addr: SocketAddr) {
         }
     }
     let _going = Going(d, who);
-    for (device, link) in theirs {
-        if reached(d, link.x25519()) {
-            continue;
-        }
-        match d.dial(|c| Target::new(addr, c, &link)).await {
-            Ok(s) => {
-                d.on_session(s);
-                d.rendezvous.nearby_step(
-                    &who,
-                    Some(true),
-                    format!(
-                        "their {}: found on the local network at {addr}",
-                        device_label(&device)
-                    ),
-                );
-                tracing::info!("found {} on the local network at {addr}", short(&who));
-                // the first that answers: the tag was one device's
-                return;
+    let at = near.said();
+    let found = |device: &KeyId| {
+        d.rendezvous.nearby_step(
+            &who,
+            Some(true),
+            format!("their {}: found {at}", device_label(device)),
+        );
+        tracing::info!("found {} {at}", short(&who));
+    };
+    let theirs: Vec<(KeyId, HybridPublicKey)> = theirs
+        .into_iter()
+        .filter(|(_, l)| !reached(d, l.x25519()))
+        .collect();
+    match &near {
+        Near::Lan(addr) => {
+            for (device, link) in theirs {
+                if reached(d, link.x25519()) {
+                    continue;
+                }
+                match d.dial(|c| Target::new(*addr, c, &link)).await {
+                    Ok(s) => {
+                        d.on_session(s);
+                        found(&device);
+                        // the first that answers: the tag was one device's
+                        return;
+                    }
+                    Err(e) => tracing::debug!("{} at {addr}: {e}", short(&device)),
+                }
             }
-            Err(e) => tracing::debug!("{} at {addr}: {e}", short(&device)),
+        }
+        // One channel, and every device of theirs tried on it at once:
+        // only the one at the other end answers.
+        Near::Ble(seen) => {
+            let links: Vec<HybridPublicKey> = theirs.iter().map(|(_, l)| l.clone()).collect();
+            match crate::bluetooth::dial(d, seen, &links).await {
+                Ok(s) => {
+                    let ps = s.peer_static();
+                    d.on_session(s);
+                    if let Some((device, _)) = theirs.iter().find(|(_, l)| *l.x25519() == ps) {
+                        found(device);
+                    }
+                    return;
+                }
+                Err(e) => tracing::debug!("{} {at}: {e:#}", short(&who)),
+            }
         }
     }
     d.rendezvous.nearby_step(
         &who,
         Some(false),
-        format!("their tag seen on the local network at {addr}: none of their devices answered"),
+        format!("their tag seen {at}: none of their devices answered"),
     );
 }
 

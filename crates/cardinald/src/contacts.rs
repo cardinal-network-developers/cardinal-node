@@ -171,6 +171,19 @@ fn made(d: &Daemon) -> Vec<Made> {
     .collect()
 }
 
+/// The secrets of this person's outstanding invitations that this device
+/// answers for, since it is the device they name: what it advertises as
+/// one-time tags over Bluetooth (`carriers/ble.md`). An invitation naming
+/// a host leads to the host, and a tag for it nearby would lead nowhere.
+pub fn answered_here(d: &Daemon) -> Vec<[u8; 16]> {
+    let here = *d.keys.link.public_key().x25519();
+    made(d)
+        .into_iter()
+        .filter(|m| m.outstanding() && m.invitation.responder_static == here)
+        .map(|m| m.invitation.secret)
+        .collect()
+}
+
 /// The invitations this person made, as a window shows them.
 pub fn invitations(d: &Daemon) -> Json {
     let all: Vec<Json> = made(d)
@@ -358,14 +371,30 @@ pub async fn accept(
         !is_contact(d, &invitation.inviter),
         "you already know whoever made that invitation"
     );
-    let addr = invitation
-        .endpoint
-        .socket_addr()
-        .ok_or_else(|| anyhow::anyhow!("that invitation has no address this version can use"))?;
-    let s = d
-        .dial(|c| Target::invitation(addr, c, invitation.responder_static, &invitation.secret))
-        .await
-        .map_err(|e| anyhow::anyhow!("could not reach them at {addr} ({e})"))?;
+    let dialled = match invitation.endpoint.socket_addr() {
+        Some(addr) => d
+            .dial(|c| Target::invitation(addr, c, invitation.responder_static, &invitation.secret))
+            .await
+            .map_err(|e| anyhow::anyhow!("could not reach them at {addr} ({e})")),
+        None => Err(anyhow::anyhow!(
+            "that invitation has no address this version can use"
+        )),
+    };
+    // Nobody at the address: they may be in Bluetooth range, advertising
+    // the tag the invitation's secret makes (`carriers/ble.md`).
+    let s = match dialled {
+        Ok(s) => s,
+        Err(e) => match crate::bluetooth::find_invitation(d, &invitation).await {
+            Some(Ok(s)) => s,
+            Some(Err(b)) => anyhow::bail!("{e:#}, nor over Bluetooth ({b:#})"),
+            None if crate::bluetooth::mode(d) != crate::bluetooth::Mode::Off
+                && d.bluetooth.is_on() =>
+            {
+                anyhow::bail!("{e:#}, nor anyone nearby over Bluetooth")
+            }
+            None => return Err(e),
+        },
+    };
     d.on_session(s.clone());
     let petname = name
         .map(str::to_owned)

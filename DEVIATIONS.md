@@ -879,8 +879,8 @@ Not implemented yet (the next milestone):
   browser uses the packet's source address when there is no A record.
 - **Trusted contacts find each other nearby** (D74,
   `hosts.md#local-discovery`, `presence.rs`, `daemon.rs`
-  `start_discovery`, `rendezvous.rs` `found_nearby`). LAN only: there is
-  no Bluetooth carrier here.
+  `start_discovery`, `rendezvous.rs` `found_nearby`). On the LAN here;
+  over Bluetooth in the next entry.
   - **Spec gap: the purpose `presence`** is not in `crypto.md`'s table of
     derivation purposes. It is used as `hosts.md` writes it,
     `derive("presence", secret)`, context `cardinal 1 presence`, and is
@@ -933,6 +933,69 @@ Not implemented yet (the next milestone):
   - **`contact-status` gives `nearby`**: `you_give_secret` and
     `they_give_secret`, whether each reach node in the relationship holds
     one.
+- **Bluetooth Low Energy** (`carriers/ble.md`, D74; `contact/src/ble.rs`,
+  `cardinald/src/bluetooth.rs`, `bluez.rs`, `link` `Endpoint::attach`). The
+  draft as written: the UUID, service data of the PSM (little-endian) and
+  17-byte tags of types 1, 2 and 3, a legacy form of PSM, type, `nonce (4)
+  || first6`, L2CAP LE credit-based channels with packets length-prefixed
+  as over TCP, and the person's three states. Readings:
+  - **Purpose `one-time`** is used as `crypto.md` (draft) lists it,
+    context `cardinal 1 one-time`, and like `presence` kept out of
+    `Purpose::ALL` and its vectors until published.
+  - **The service UUID is in the advertisement too**, as a 128-bit UUID
+    list, in the extended form as in the legacy one: scanners filter on
+    it (BlueZ's discovery filter and Android's `ScanFilter` match the UUID
+    list, not service data keys). The extended form is then flags, the
+    UUID list and the service data: 3 + 18 + 18 + 2 + 17n bytes, 92 with
+    three tags. At most eight tags (`MAX_TAGS`).
+  - **Legacy form on BlueZ** goes in `ScanResponseServiceData`, which
+    BlueZ has only with `--experimental`; without it the advertisement
+    carries the UUID and no tag, and nobody finds the device. Used where
+    the adapter's `SupportedCapabilities` `MaxAdvLen` is too short for
+    the full form, or the full one is refused.
+  - **Which tag in a legacy advertisement:** the keys take turns, one per
+    refresh (every 30 s, or at once when what is advertised changes):
+    own devices, contacts, then each one-time secret.
+  - **Reading: tag types are bytes.** An unknown type is kept and matches
+    nothing; a short tag matches only `keyed_hash(k, nonce4)[..6]`.
+  - **One channel, every key at once.** A tag says whose device, not
+    which: own devices' (type 1) or a contact's (type 2) device is dialled
+    by opening one channel and starting a handshake to each of the
+    person's devices without a session at once on it
+    (`Endpoint::connect_on`); only the one at the other end can answer,
+    and the others give up. Over a LAN each is dialled in turn instead.
+  - **Limits as on a LAN**: a contact at one address once in 10 s, three
+    times a minute; own devices' tag at one address once in 10 s; the
+    same advertisement from one address is looked at again only after
+    2 s (a radio reports it many times a second); at most 16 channels
+    others opened at once.
+  - **Type 3 is advertised only by the device an invitation names**
+    (`responder_static`), and only while it is outstanding. An invitation
+    naming the person's host leads to the host's key, which no device in
+    range has, so nothing advertises it (spec question).
+  - **Accepting an invitation** dials its address first, as before; when
+    that fails, or the invitation has no IP address, and Bluetooth is on,
+    it looks for the type-3 tag for 30 s and runs the invitation's
+    handshake over a channel to the device that has it. The invitation's
+    endpoint is left as it was; with no address at all `invite` still
+    fails ("no address to give").
+  - **Pairing codes carry no one-time secret** (33 bits, for CPace), so
+    no type-3 tag is made from one: offline, 2^33 keyed hashes recover
+    the code from the tag, and whoever has it can pair. Pairing over
+    Bluetooth is not done (spec question).
+  - **Endpoints**: carrier the 8-byte name, address the 6 bytes, port the
+    PSM (`EndpointAddr::ble`). The record does not say random or public;
+    read as random. Never written in a reach node, and not yet passed in
+    rendezvous.
+  - **"On while open"** is while a client watches with
+    `{"cmd": "watch", "window": true}`; a watch without it does not count
+    (Android's service watches with no window open). With `open` and no
+    window, a CLI-only device has Bluetooth off.
+  - **Channels are opened at security level low**, with no Bluetooth
+    pairing (Android: the insecure L2CAP calls): the link session proves
+    and encrypts.
+  - **The setting is this device's** (`config.toml` `bluetooth`), not the
+    account's: each device has its own radio and battery.
 - **Reach: what goes where** (`profiles.md#reach`, `relationship.rs`).
   Field 1 holds host entries; field 2 the presence secret, only in a
   relationship; any other field of the node is untouched by a `set` of

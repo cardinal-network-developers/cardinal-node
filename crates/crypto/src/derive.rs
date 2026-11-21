@@ -30,6 +30,11 @@ pub enum Purpose {
     /// (hosts.md#local-discovery, D74). Not in crypto.md's table yet, so
     /// not in [`Purpose::ALL`] or its vectors.
     Presence,
+    /// `one-time`: the key of a Bluetooth tag from an invitation's or
+    /// pairing's one-time secret (carriers/ble.md). In crypto.md's table on
+    /// the draft, but kept out of [`Purpose::ALL`] and its vectors with
+    /// `presence` until those are published.
+    OneTime,
     /// `invite`: invitation keys (contact.md).
     Invite,
     /// `token`: link secret from a delivery token (link.md).
@@ -77,6 +82,7 @@ impl Purpose {
             Purpose::Mailbox => "mailbox",
             Purpose::Discovery => "discovery",
             Purpose::Presence => "presence",
+            Purpose::OneTime => "one-time",
             Purpose::Invite => "invite",
             Purpose::Token => "token",
             Purpose::Pair => "pair",
@@ -99,6 +105,7 @@ impl Purpose {
             Purpose::Mailbox => "cardinal 1 mailbox",
             Purpose::Discovery => "cardinal 1 discovery",
             Purpose::Presence => "cardinal 1 presence",
+            Purpose::OneTime => "cardinal 1 one-time",
             Purpose::Invite => "cardinal 1 invite",
             Purpose::Token => "cardinal 1 token",
             Purpose::Pair => "cardinal 1 pair",

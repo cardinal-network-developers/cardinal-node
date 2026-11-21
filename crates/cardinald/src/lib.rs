@@ -6,6 +6,9 @@
 //! See `README.md` in this crate for the design.
 
 pub mod applog;
+pub mod bluetooth;
+#[cfg(target_os = "linux")]
+pub mod bluez;
 pub mod calls;
 pub mod cleanup;
 pub mod clear;

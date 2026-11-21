@@ -264,7 +264,7 @@ pub struct Daemon {
     /// Addresses of devices.
     pub book: Mutex<PeerBook>,
     backoff: Mutex<HashMap<KeyId, (Instant, Duration)>>,
-    connecting: Mutex<HashSet<KeyId>>,
+    pub(crate) connecting: Mutex<HashSet<KeyId>>,
     /// Bumped on every change to the identity or a space.
     pub changed: watch::Sender<u64>,
     /// News waiting to be passed on.
@@ -339,6 +339,8 @@ pub struct Daemon {
     pub leaving: Arc<Mutex<HashSet<[u8; 32]>>>,
     /// Speed tests this device serves (`speedtest.rs`).
     pub speedtest: crate::speedtest::Limiter,
+    /// Bluetooth Low Energy (`bluetooth.rs`).
+    pub bluetooth: crate::bluetooth::Bluetooth,
     /// How the person will regard whoever uses each outstanding invitation,
     /// by its secret's id.
     invitations: Mutex<HashMap<u64, account::Regard>>,
@@ -578,6 +580,7 @@ impl Daemon {
             cleanup: crate::cleanup::Cleaner::load(old_versions),
             leaving: Arc::default(),
             speedtest: crate::speedtest::Limiter::default(),
+            bluetooth: crate::bluetooth::Bluetooth::default(),
             invitations: Mutex::new(HashMap::new()),
             admitted: Mutex::new(HashMap::new()),
             using: Mutex::new(HashMap::new()),
@@ -945,6 +948,7 @@ impl Daemon {
         Some(match s.carrier()? {
             CarrierKind::Udp => "UDP",
             CarrierKind::Tcp => "TCP",
+            CarrierKind::Ble => "Bluetooth",
         })
     }
 
@@ -1374,6 +1378,7 @@ impl Daemon {
             let d2 = d.clone();
             let _ = tokio::task::spawn_blocking(move || d2.ensure_mounted()).await;
             d.start_discovery();
+            crate::bluetooth::start(&d);
         });
     }
 
@@ -2280,6 +2285,7 @@ fn route(s: &Session) -> String {
     match (s.is_relayed(), s.remote_addr(), s.carrier()) {
         (true, _, _) => format!("relayed, {by}"),
         (false, Some(a), Some(CarrierKind::Tcp)) => format!("direct at {a} over TCP, {by}"),
+        (false, None, Some(CarrierKind::Ble)) => format!("direct over Bluetooth, {by}"),
         (false, Some(a), _) => format!("direct at {a}, {by}"),
         (false, None, _) => by.to_owned(),
     }

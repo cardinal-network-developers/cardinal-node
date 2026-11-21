@@ -75,6 +75,9 @@ pub struct Config {
     pub mdns_port: u16,
     /// This device is a host for its own identity (`host.rs`).
     pub host: bool,
+    /// Bluetooth Low Energy (`bluetooth.rs`): `off`, `open` (while a window
+    /// is) or `always`.
+    pub bluetooth: String,
 }
 
 impl Default for Config {
@@ -94,6 +97,7 @@ impl Default for Config {
             port_mapping: true,
             mdns_port: 5353,
             host: false,
+            bluetooth: "off".into(),
         }
     }
 }

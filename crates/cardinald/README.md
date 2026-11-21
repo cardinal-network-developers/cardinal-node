@@ -178,6 +178,19 @@ experimental and off). A `c=` that matches a trusted contact's secret
 has each of their devices dialled at that address; `cardinal contacts
 NAME` shows the look.
 
+Bluetooth Low Energy (`bluetooth.rs`, `carriers/ble.md`) carries the same
+tags, and a one-time tag for each outstanding invitation this device
+answers for, in an advertisement under the service UUID, and link packets
+over L2CAP channels. It is off by default: `cardinal bluetooth
+off|open|always` (`{"cmd": "bluetooth", "mode": ...}`; without `mode` it
+asks the radio whether it can be used and says where it stands, as
+`status` does under `bluetooth`). `open` is on while a client watches with
+`{"cmd": "watch", "window": true}`. On Linux the radio is BlueZ over
+D-Bus (`bluez.rs`, through zbus) and the kernel's L2CAP sockets; on
+Android the app drives it, over the socket `CARDINAL_BLE_BRIDGE` names
+(`contact/src/ble/bridge.rs`); tests set `CARDINAL_TEST_BLE_ETHER` to a
+directory where simulated radios meet.
+
 ## The mount
 
 `fs/tree.rs` is the tree the kernel sees: the files space's state

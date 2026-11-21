@@ -44,8 +44,9 @@ impl EndpointAddr {
 
     fn of(carrier: CarrierKind, address: Value, port: u16) -> EndpointAddr {
         let carrier = match carrier {
-            CarrierKind::Udp => 1u64,
-            CarrierKind::Tcp => 2,
+            CarrierKind::Udp => Value::from(1u64),
+            CarrierKind::Tcp => Value::from(2u64),
+            CarrierKind::Ble => Value::from(crate::ble::carrier_name()),
         };
         let record = Record::new()
             .with(1, carrier)
@@ -54,19 +55,48 @@ impl EndpointAddr {
         EndpointAddr { record }
     }
 
+    /// A Bluetooth endpoint (`carriers/ble.md`): the 6-byte address and the
+    /// PSM as its port. Addresses rotate, so it is of use only to a device
+    /// in range now, and never named in a reach node.
+    pub fn ble(addr: crate::ble::BleAddr, psm: u16) -> EndpointAddr {
+        EndpointAddr::of(CarrierKind::Ble, Value::from(addr.bytes), psm)
+    }
+
     /// The carrier, if it is one this version knows.
     pub fn carrier(&self) -> Option<CarrierKind> {
-        match self.record.get(1).and_then(Value::as_uint) {
+        let carrier = self.record.get(1)?;
+        match carrier.as_uint() {
             Some(1) => Some(CarrierKind::Udp),
             Some(2) => Some(CarrierKind::Tcp),
-            _ => None,
+            Some(_) => None,
+            None => (carrier.as_bytes()? == crate::ble::carrier_name()).then_some(CarrierKind::Ble),
         }
     }
 
-    /// The address, if the carrier is known and the address is one this
-    /// version can use.
+    /// The Bluetooth address and PSM, for a Bluetooth endpoint. The
+    /// endpoint does not say whether the address is random or public, so
+    /// it is taken for random, as a phone's is.
+    pub fn ble_addr(&self) -> Option<(crate::ble::BleAddr, u16)> {
+        if self.carrier()? != CarrierKind::Ble {
+            return None;
+        }
+        let bytes = self.record.get(2)?.as_bytes()?.try_into().ok()?;
+        let psm = u16::try_from(self.record.get(3)?.as_uint()?).ok()?;
+        Some((
+            crate::ble::BleAddr {
+                bytes,
+                random: true,
+            },
+            psm,
+        ))
+    }
+
+    /// The address, if the carrier is one over IP that this version knows
+    /// and the address is one it can use.
     pub fn address(&self) -> Option<Address> {
-        self.carrier()?;
+        if !matches!(self.carrier()?, CarrierKind::Udp | CarrierKind::Tcp) {
+            return None;
+        }
         match self.record.get(2)? {
             Value::Bytes(b) if b.len() == 4 => {
                 let b = <[u8; 4]>::try_from(&b[..]).ok()?;
@@ -130,6 +160,25 @@ mod tests {
         let e = EndpointAddr::named(CarrierKind::Tcp, "host.example", 443);
         assert_eq!(e.address(), Some(Address::Name("host.example".into())));
         assert_eq!((e.port(), e.socket_addr()), (Some(443), None));
+    }
+
+    /// Bluetooth is a carrier named by hash, with a 6-byte address: known,
+    /// but nothing to dial over IP.
+    #[test]
+    fn a_bluetooth_endpoint_has_no_ip_address() {
+        let addr = crate::ble::BleAddr::parse("C0:01:02:03:04:05", true).unwrap();
+        let e = EndpointAddr::ble(addr, 0x81);
+        let r = Record::decode(&e.encode()).unwrap();
+        assert_eq!(r.get(1).and_then(Value::as_bytes).map(<[u8]>::len), Some(8));
+        let back = EndpointAddr::from_record(&r);
+        assert_eq!(back.carrier(), Some(CarrierKind::Ble));
+        assert_eq!(back.ble_addr(), Some((addr, 0x81)));
+        assert_eq!(
+            (back.address(), back.port(), back.socket_addr()),
+            (None, Some(0x81), None)
+        );
+        let udp = EndpointAddr::new(CarrierKind::Udp, "192.0.2.1:7000".parse().unwrap());
+        assert_eq!(udp.ble_addr(), None);
     }
 
     /// D68. A carrier named by hash, a carrier number nobody set aside, an

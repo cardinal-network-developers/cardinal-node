@@ -9,8 +9,11 @@
 //!   [`pairing::NewDevice`] an admin device adds with `add_key`.
 //! - [`discovery`] over a minimal [`mdns`]: rotating, unlinkable tags only
 //!   holders of the discovery secret recognize.
+//! - [`ble`]: the same tags in a Bluetooth Low Energy advertisement, and
+//!   the [`ble::Radio`] that carries them.
 //! - [`invitation`]: the invitation record and its `cardinal:` text form,
 //!   and `contact` service messages.
+pub mod ble;
 pub mod code;
 pub mod discovery;
 pub mod endpoint;

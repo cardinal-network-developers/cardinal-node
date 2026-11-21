@@ -4,7 +4,9 @@
 //! Requests are `{"cmd": "<name>", ...}`; replies are `{"ok": true, ...}`
 //! or `{"ok": false, "error": "<what to do>"}`. After `{"cmd": "watch"}` a
 //! connection only carries news, `{"ok": true, "event": "changed", "seq": n}`,
-//! until the client closes it (`apps.md#the-local-interface`).
+//! until the client closes it (`apps.md#the-local-interface`). A window
+//! says `"window": true` with it: while one watches, Cardinal is open, and
+//! Bluetooth set to `open` is on (`bluetooth.rs`).
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -55,9 +57,12 @@ pub fn serve(d: Arc<Daemon>) -> anyhow::Result<tokio::task::JoinHandle<()>> {
             tokio::spawn(async move {
                 let mut lines = BufReader::new(r).lines();
                 while let Ok(Some(line)) = lines.next_line().await {
-                    let cmd = serde_json::from_str::<Value>(&line).ok();
-                    let cmd = cmd.as_ref().and_then(|r| r["cmd"].as_str());
+                    let req = serde_json::from_str::<Value>(&line).ok();
+                    let cmd = req.as_ref().and_then(|r| r["cmd"].as_str());
                     if cmd == Some("watch") {
+                        // A window watching: "on while open" is on while it does.
+                        let window = req.as_ref().and_then(|r| r["window"].as_bool());
+                        let _window = (window == Some(true)).then(|| crate::bluetooth::window(&d));
                         watch(&d, lines, w).await;
                         break;
                     }
@@ -512,6 +517,14 @@ async fn handle(d: &Arc<Daemon>, req: &Value) -> anyhow::Result<Value> {
             }
             Ok(crate::portmap::status(d))
         }
+        "bluetooth" => match req.get("mode").and_then(|v| v.as_str()) {
+            Some(m) => {
+                let m = crate::bluetooth::Mode::parse(m)
+                    .ok_or_else(|| anyhow::anyhow!("Bluetooth is `off`, `open` or `always`"))?;
+                crate::bluetooth::set(d, m)
+            }
+            None => Ok(crate::bluetooth::check(d).await),
+        },
         "network" => match req.get("mine").and_then(|v| v.as_bool()) {
             Some(mine) => {
                 let name = req.get("name").and_then(|v| v.as_str());
@@ -1015,6 +1028,7 @@ fn status(d: &Arc<Daemon>) -> Value {
     json!({
         "name": cfg.name,
         "router": crate::portmap::status(d),
+        "bluetooth": crate::bluetooth::status(d),
         "network": crate::networks::status(d),
         "home": d.paths.home.display().to_string(),
         "identity": identity,

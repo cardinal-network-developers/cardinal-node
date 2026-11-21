@@ -35,6 +35,12 @@ fuser = { version = "0.15", default-features = false, features = ["abi-7-19"], o
 # gitignore syntax for `.cardinalignore` (fs/local.rs).
 ignore = "0.4"
 
+# BlueZ over D-Bus for Bluetooth Low Energy (`bluez.rs`): pure Rust, no
+# libdbus or libbluetooth.
+[target.'cfg(target_os = "linux")'.dependencies]
+zbus = { version = "5.13", default-features = false, features = ["tokio"] }
+futures-util = { version = "0.3", default-features = false }
+
 [features]
 default = ["mount"]
 # Show the files space as a folder, through FUSE.

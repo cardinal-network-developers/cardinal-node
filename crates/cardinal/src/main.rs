@@ -337,6 +337,15 @@ enum Cmd {
         #[arg(long)]
         this_device: bool,
     },
+    /// Bluetooth on this device, so that people in range find each other
+    /// with no network at all: your own devices, your trusted contacts, and
+    /// whoever holds an invitation you made. `off` (the default), `open`
+    /// (while a Cardinal window is open) or `always` (while it is closed
+    /// too). With nothing, says where it stands.
+    Bluetooth {
+        #[arg(value_parser = ["off", "open", "always"])]
+        setting: Option<String>,
+    },
     /// Which network this device is on, known by its router, and whether
     /// it is yours. Only on your own networks do your devices ask the
     /// router for a port and name themselves at the address it gives: a
@@ -1053,6 +1062,45 @@ async fn read_words(
 }
 
 /// What belongs on the recovery sheet.
+/// Where Bluetooth stands on this device.
+fn print_bluetooth(b: &Value) {
+    let mode = b["mode"].as_str().unwrap_or("off");
+    let when = match mode {
+        "open" => "on while a window is open",
+        "always" => "on, open or closed",
+        _ => "off",
+    };
+    let now = if b["on"] == json!(true) {
+        let psm = b["psm"]
+            .as_u64()
+            .map(|p| format!(", PSM {p}"))
+            .unwrap_or_default();
+        format!("on now{psm}")
+    } else {
+        "not on now".to_owned()
+    };
+    println!("Bluetooth: {when} (`cardinal bluetooth off|open|always`); {now}.");
+    match (&b["available"], b["why_not"].as_str()) {
+        (Value::Bool(true), _) => {
+            let radio = b["radio"].as_str().unwrap_or("a radio");
+            println!("  Available: {radio}.");
+        }
+        (_, Some(why)) => println!("  Not available: {why}."),
+        _ => {}
+    }
+    if let Some(e) = b["error"].as_str() {
+        println!("  Last problem: {e}.");
+    }
+    let seen = b["seen"].as_u64().unwrap_or(0);
+    if seen > 0 {
+        println!(
+            "  Seen {seen} advertisements of Cardinal devices, {} of them yours or your trusted \
+             contacts'.",
+            b["recognized"].as_u64().unwrap_or(0)
+        );
+    }
+}
+
 /// What the router gave, or why it gave nothing, whether it is asked at
 /// all, and where this device names itself.
 fn print_router(router: &Value) {
@@ -1849,6 +1897,9 @@ fn print_status(v: &Value) {
         }
     }
     print_router(&v["router"]);
+    if v["bluetooth"]["mode"].as_str().is_some_and(|m| m != "off") {
+        print_bluetooth(&v["bluetooth"]);
+    }
     if v["network"]["ask"] == json!(true) {
         println!(
             "Network: is this your network? `cardinal network mine` lets your devices ask its \
@@ -2961,6 +3012,26 @@ async fn client(cmd: Cmd) -> anyhow::Result<()> {
                 human_size(v["size"].as_u64().unwrap_or(0)),
                 to.display()
             );
+            Ok(())
+        }
+        Cmd::Bluetooth { setting } => {
+            let mut req = json!({"cmd": "bluetooth"});
+            if let Some(s) = &setting {
+                req["mode"] = json!(s);
+            }
+            let v = call(&paths, req).await?;
+            match setting.as_deref() {
+                Some("off") => println!("Bluetooth is off on this device."),
+                Some("open") => {
+                    println!("Bluetooth is on on this device while a Cardinal window is open.")
+                }
+                Some(_) => println!(
+                    "Bluetooth is on on this device, while Cardinal is open and while it is \
+                     closed."
+                ),
+                None => {}
+            }
+            print_bluetooth(&v);
             Ok(())
         }
         Cmd::Router {
