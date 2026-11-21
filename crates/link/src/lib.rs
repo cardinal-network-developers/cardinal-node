@@ -32,7 +32,9 @@
 //!   interactive, then background, in scheduling order), acknowledgements,
 //!   path challenge/response and roaming, observed address, keepalive and
 //!   idle timeout, simultaneous-session resolution.
-//! - Carriers: TCP (length-prefixed packets, `link.md#carriers`) and UDP.
+//! - Carriers: TCP (length-prefixed packets, `link.md#carriers`) and UDP,
+//!   and streams another carrier opened ([`Endpoint::attach`]), such as a
+//!   Bluetooth L2CAP channel.
 //!
 //! # Experimental: reliable streams over UDP
 //!
@@ -57,13 +59,13 @@ mod session;
 #[cfg(test)]
 mod vectors;
 
-pub use carrier::CarrierKind;
+pub use carrier::{CarrierKind, CarrierStream};
 pub use conn::{
     Admission, CloseReason, Role, SessionConfig, SessionStats, SESSION_WINDOW, STREAM_WINDOW,
 };
 pub use directory::{ExpectedPeer, LocalIdentity, MemoryDirectory, PeerDirectory, PeerIdentity};
 pub use endpoint::{
-    Bind, CookiePolicy, Endpoint, EndpointConfig, EndpointEvent, SecretEntry, Target,
+    Attached, Bind, CookiePolicy, Endpoint, EndpointConfig, EndpointEvent, SecretEntry, Target,
 };
 pub use frame::{Priority, Service};
 pub use session::{Channel, Session, Stream, DEFAULT_MAX_MESSAGE};

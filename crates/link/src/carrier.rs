@@ -8,6 +8,9 @@
 //!   crate documentation.
 //! - **Relay**: packets wrapped in the 8-byte relay header and sent to a
 //!   host over another carrier.
+//! - **Streams opened elsewhere**: a connection-oriented channel some other
+//!   code opened, a Bluetooth L2CAP channel (`carriers/ble.md`), framed as
+//!   over TCP.
 
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -28,7 +31,17 @@ pub enum CarrierKind {
     Udp,
     /// TCP (endpoint carrier 2).
     Tcp,
+    /// Bluetooth Low Energy, an L2CAP connection-oriented channel
+    /// (`carriers/ble.md`): a stream like TCP, but opened outside this
+    /// crate and handed to [`Endpoint::attach`](crate::Endpoint::attach).
+    Ble,
 }
+
+/// Something a stream carrier reads and writes: an L2CAP channel, or in
+/// tests one end of an in-memory pipe.
+pub trait CarrierStream: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + 'static {}
+
+impl<T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + 'static> CarrierStream for T {}
 
 /// Something that consumes packets arriving on a carrier.
 pub(crate) trait Ingress: Send + Sync + 'static {
@@ -39,10 +52,15 @@ pub(crate) trait Ingress: Send + Sync + 'static {
     fn flush(&self) {}
 }
 
-/// A TCP connection carrying packets.
+/// A TCP connection, or another stream, carrying packets.
 pub(crate) struct TcpPath {
     id: u64,
-    peer: SocketAddr,
+    /// The address, for TCP.
+    peer: Option<SocketAddr>,
+    /// TCP, or the carrier that opened the stream.
+    carrier: CarrierKind,
+    /// What to call the other end, for a stream with no socket address.
+    label: String,
     tx: mpsc::Sender<Bytes>,
     closed: AtomicBool,
     /// Tells the writer to send what is queued and end the connection.
@@ -86,7 +104,10 @@ impl std::fmt::Debug for Path {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Path::Udp { addr, .. } => write!(f, "udp:{addr}"),
-            Path::Tcp(t) => write!(f, "tcp#{}:{}", t.id, t.peer),
+            Path::Tcp(t) => match t.peer {
+                Some(peer) => write!(f, "tcp#{}:{peer}", t.id),
+                None => write!(f, "{:?}#{}:{}", t.carrier, t.id, t.label),
+            },
             Path::Relayed { via, channel } => write!(f, "relay#{channel} via {via:?}"),
             #[cfg(test)]
             Path::Mem(i) => write!(f, "mem#{i}"),
@@ -121,7 +142,7 @@ impl Path {
     pub fn carrier(&self) -> Option<CarrierKind> {
         match self {
             Path::Udp { .. } => Some(CarrierKind::Udp),
-            Path::Tcp(_) => Some(CarrierKind::Tcp),
+            Path::Tcp(t) => Some(t.carrier),
             Path::Relayed { via, .. } => via.carrier(),
             #[cfg(test)]
             Path::Mem(_) => None,
@@ -137,7 +158,7 @@ impl Path {
     pub fn remote_addr(&self) -> Option<SocketAddr> {
         match self {
             Path::Udp { addr, .. } => Some(*addr),
-            Path::Tcp(t) => Some(t.peer),
+            Path::Tcp(t) => t.peer,
             Path::Relayed { via, .. } => via.remote_addr(),
             #[cfg(test)]
             Path::Mem(_) => None,
@@ -322,11 +343,42 @@ pub(crate) fn spawn_tcp(
     let peer = stream
         .peer_addr()
         .unwrap_or_else(|_| SocketAddr::from(([0, 0, 0, 0], 0)));
-    let (rx_half, tx_half) = stream.into_split();
+    let label = peer.to_string();
+    let (r, w) = stream.into_split();
+    spawn_halves(r, w, Some(peer), CarrierKind::Tcp, label, ingress)
+}
+
+/// Starts reading and writing packets on any stream, each prefixed by its
+/// length as over TCP.
+pub(crate) fn spawn_stream<S: CarrierStream>(
+    stream: S,
+    peer: Option<SocketAddr>,
+    carrier: CarrierKind,
+    label: String,
+    ingress: Arc<dyn Ingress>,
+) -> (Path, tokio::task::AbortHandle) {
+    let (r, w) = tokio::io::split(stream);
+    spawn_halves(r, w, peer, carrier, label, ingress)
+}
+
+fn spawn_halves<R, W>(
+    rx_half: R,
+    tx_half: W,
+    peer: Option<SocketAddr>,
+    carrier: CarrierKind,
+    label: String,
+    ingress: Arc<dyn Ingress>,
+) -> (Path, tokio::task::AbortHandle)
+where
+    R: tokio::io::AsyncRead + Send + Unpin + 'static,
+    W: tokio::io::AsyncWrite + Send + Unpin + 'static,
+{
     let (tx, mut rx) = mpsc::channel::<Bytes>(64);
     let tp = Arc::new(TcpPath {
         id: NEXT_TCP_ID.fetch_add(1, Ordering::Relaxed),
         peer,
+        carrier,
+        label,
         tx,
         closed: AtomicBool::new(false),
         finish: Notify::new(),

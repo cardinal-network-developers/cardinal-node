@@ -49,7 +49,7 @@ async fn device(n: u8, dir: &Arc<MemoryDirectory>, tcp: bool) -> Device {
 async fn to_host(d: &Device, host: &Device, carrier: CarrierKind) -> (Session, Session) {
     let at = match carrier {
         CarrierKind::Udp => host.endpoint.udp_addr().unwrap(),
-        CarrierKind::Tcp => host.endpoint.tcp_addr().unwrap(),
+        _ => host.endpoint.tcp_addr().unwrap(),
     };
     let t = Target::new(at, carrier, host.key.public_key());
     let (a, b) = tokio::join!(d.endpoint.connect(t), host.endpoint.accept());

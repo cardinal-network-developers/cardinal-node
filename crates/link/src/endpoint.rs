@@ -13,7 +13,9 @@ use tokio::sync::{broadcast, mpsc, oneshot, watch, Notify};
 use tokio::task::AbortHandle;
 use zeroize::Zeroizing;
 
-use crate::carrier::{spawn_tcp, spawn_udp, CarrierKind, Ingress, Path, Udp};
+use crate::carrier::{
+    spawn_stream, spawn_tcp, spawn_udp, CarrierKind, CarrierStream, Ingress, Path, Udp,
+};
 use crate::conn::{
     Admission, CloseReason, Conn, ConnEvent, ConnParams, Role, SessionConfig, Signals,
 };
@@ -369,6 +371,25 @@ impl Ingress for WeakIngress {
     }
 }
 
+/// A stream another carrier opened, carrying packets for an endpoint
+/// ([`Endpoint::attach`]).
+#[derive(Clone)]
+pub struct Attached {
+    path: Path,
+}
+
+impl Attached {
+    /// Ends the stream, once what was sent has gone.
+    pub fn close(&self) {
+        self.path.close();
+    }
+
+    /// Whether the stream has ended.
+    pub fn is_closed(&self) -> bool {
+        self.path.is_closed()
+    }
+}
+
 /// A link endpoint: one device's listening and connecting point.
 #[derive(Clone)]
 pub struct Endpoint {
@@ -610,7 +631,55 @@ impl Endpoint {
                 ep.track(abort);
                 path
             }
+            // A stream another carrier opened goes through `connect_on`.
+            (None, CarrierKind::Ble) => return Err(LinkError::NoCarrier),
         };
+        self.handshake_on(path, target, deadline, true).await
+    }
+
+    /// Starts carrying packets on a stream another carrier opened, an
+    /// L2CAP channel (`carriers/ble.md`), each prefixed by its length as
+    /// over TCP. A peer may open a session over it, as over any carrier,
+    /// and this device may with [`connect_on`](Self::connect_on).
+    /// `label` names the other end in logs.
+    pub fn attach<S: CarrierStream>(
+        &self,
+        stream: S,
+        carrier: CarrierKind,
+        label: impl Into<String>,
+    ) -> Attached {
+        let ingress = Arc::new(WeakIngress(Arc::downgrade(&self.inner)));
+        let (path, abort) = spawn_stream(stream, None, carrier, label.into(), ingress);
+        self.inner.track(abort);
+        Attached { path }
+    }
+
+    /// Opens a session over a stream [`attach`](Self::attach)ed: the
+    /// target's address and carrier are not used. Several attempts may
+    /// share one stream, to devices whose keys are known but not which of
+    /// them is at the other end: only the one whose key it is answers. A
+    /// failure leaves the stream open, for the others.
+    pub async fn connect_on(&self, on: &Attached, target: Target) -> Result<Session, LinkError> {
+        if self.inner.closed.load(Ordering::Relaxed) {
+            return Err(LinkError::Closed(CloseReason::EndpointClosed));
+        }
+        if on.path.is_closed() {
+            return Err(LinkError::Closed(CloseReason::Carrier));
+        }
+        let limit = target.within.unwrap_or(self.inner.config.connect_timeout);
+        let deadline = tokio::time::Instant::now() + limit;
+        self.handshake_on(on.path.clone(), target, deadline, false)
+            .await
+    }
+
+    async fn handshake_on(
+        &self,
+        path: Path,
+        target: Target,
+        deadline: tokio::time::Instant,
+        own_path: bool,
+    ) -> Result<Session, LinkError> {
+        let ep = &self.inner;
         let mut give_up = target.give_up.clone();
         let (tx, mut rx) = oneshot::channel();
         let attempt = Arc::new(Attempt {
@@ -654,7 +723,9 @@ impl Endpoint {
         let inner = match result {
             Ok(inner) => inner,
             Err(e) => {
-                path.close();
+                if own_path {
+                    path.close();
+                }
                 return Err(e);
             }
         };

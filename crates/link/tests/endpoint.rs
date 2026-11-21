@@ -373,7 +373,7 @@ async fn cookie_reply_then_mac2() {
     for carrier in [CarrierKind::Udp, CarrierKind::Tcp] {
         let addr = match carrier {
             CarrierKind::Udp => eb.udp_addr().unwrap(),
-            CarrierKind::Tcp => eb.tcp_addr().unwrap(),
+            _ => eb.tcp_addr().unwrap(),
         };
         let target = Target::new(addr, carrier, b.key.public_key());
         let (sa, sb) = tokio::join!(ea.connect(target), eb.accept());
