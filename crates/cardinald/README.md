@@ -552,10 +552,10 @@ without), `not_posted` (how much was not posted again because this
 person's role there no longer allows it), `moved` (until cleared with
 `group-moved-seen`, or a week after: `{by, at, taken_out: [names],
 roles: [{name, from, to}]}`, who moved the group here, when by their
-clock, and what that changed; null otherwise) and `did_not_stand`
+clock, and what that changed; null otherwise), `did_not_stand`
 (successors this person's devices made that another took the place of,
-each `{group, taken_out, roles}`, as `moved` says them: they do again
-what each was for). `group-members` lists whoever was taken out too, by
+by id: they do again what each was for) and `did_not_stand_changes`
+(the same, each `{group, taken_out, roles}`, as `moved` says them). `group-members` lists whoever was taken out too, by
 the name the others saw, with `taken_out` true and `role` `taken out`;
 what they wrote before shows them by that name. A reader's `say`,
 `edit-message`, `delete-message` and `react` in a group fail, saying so.

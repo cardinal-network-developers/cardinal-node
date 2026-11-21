@@ -6650,7 +6650,7 @@ mod tests {
         assert_eq!(writer.core.held_back(&win), 1);
         // and the owner is told what the one that did not stand changed
         let listed = crate::groups::list_of(&writer.core);
-        let lost = listed["groups"][0]["did_not_stand"].clone();
+        let lost = listed["groups"][0]["did_not_stand_changes"].clone();
         assert_eq!(
             lost[0]["taken_out"].as_array().unwrap().len(),
             1,

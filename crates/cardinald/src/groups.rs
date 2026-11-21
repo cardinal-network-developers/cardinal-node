@@ -766,6 +766,7 @@ pub fn list_of(core: &Core) -> Json {
                 c["at"] = json!(at);
                 c
             });
+        let lost_ids: Vec<String> = lost.iter().map(hex::encode).collect();
         let lost: Vec<Json> = lost
             .iter()
             .map(|l| {
@@ -777,7 +778,8 @@ pub fn list_of(core: &Core) -> Json {
         let group = json!({
             "ended": ended,
             "moved": moved,
-            "did_not_stand": lost,
+            "did_not_stand": lost_ids,
+            "did_not_stand_changes": lost,
             "held_back": core.held_back(id),
             "not_posted": core.spaces.get(id).map_or(0, |h| h.notes().not_posted),
             "was": sp.succeeds().map(hex::encode),
