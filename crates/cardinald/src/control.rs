@@ -621,6 +621,13 @@ async fn handle(d: &Arc<Daemon>, req: &Value) -> anyhow::Result<Value> {
         "recover-invite" => {
             crate::recovering::invite(d, req.get("at").and_then(Value::as_str)).await
         }
+        "recover-keep-succession" => {
+            let keep = req.get("keep").and_then(Value::as_bool) == Some(true);
+            crate::recovering::keep_succession(d, arg(req, "id")?, keep)
+        }
+        "recover-lost-at" => {
+            crate::recovering::set_lost_at(d, req.get("lost_at").and_then(Value::as_u64))
+        }
         "recover-cancel" => crate::recovering::cancel(d).await,
         "recover-finish" => {
             let without = req.get("without_account").and_then(Value::as_bool) == Some(true);

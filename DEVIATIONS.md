@@ -729,6 +729,37 @@ differs or was read:
   which a thief controls: entries with no time are kept only with `all`.
   `cardinal status --json` gives per space how many entries are valid and
   set aside.
+- **After a recovery, as each space arrives** (`recovering.rs`,
+  `recovered.json`). The keys the recovery removed, and the time lost if
+  given, are kept past `finish`; each time new entries arrive, a lost
+  device's work up to that time is kept there too, not only in the
+  spaces held at the moment it was said (`recover-lost-at` sets it later).
+  **Successions are asked about, never kept silently:** a `succeed`, or a
+  successor's genesis, that a removed key wrote by then (or at all, with
+  no time) is left out of that keep and listed by `cardinal recover`
+  (status `successions`: "Your earlier changes to NAME: keep?", the name
+  taken from the offer when the space's own is set aside), and
+  `recover-keep-succession` keeps it with what it stands on that the same
+  device wrote and is set aside (the space's genesis, else the keep would
+  stand on nothing), the successor's genesis beside it. The spec says to
+  write keeps "before the removal"; a lost device cannot, so they are
+  written after, on the person's word. **Not yet:** the successor itself
+  opening on the new device: its first epoch's key was given the removed
+  device's link key only, so it stays "arriving" ("no key for its first
+  epoch") until a member who holds it gives it again; a spec question.
+  **Spaces fetched from contacts:** the account's spaces and the groups
+  this person offered in their relationships, not held here, are asked of
+  every contact, once more two seconds after the first round (the keeps
+  just sent may be what lets the contact give them); a contact gives its
+  relationship with that person, the spaces that person offered it and
+  their successors, even while nothing in them counts for that person
+  (their genesis was the removed key's), so the person's keeps can reach
+  it. **Also after `finish`:** the removed devices' link keys are taken out
+  of every mailbox, the discovery and presence secrets are made new (the
+  presence secret given to each trusted contact again, nearby
+  advertisements restarted with the new one), and the guardians' own logs
+  come back with the copies, so the new device knows its contacts'
+  devices at once.
 - **Fixed on the way: a contact's log arriving as heads only.** A notice
   too big to carry its entries names heads; a contact's log whose new
   head's parents were missing was left waiting. Such a log now reports

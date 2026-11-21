@@ -132,13 +132,20 @@ impl Daemon {
                 let core = self.core();
                 if *label == identity_log_label(&identity) {
                     Access::Other(identity)
-                } else if Some(*label) == core.identity_label() || core.shares(&identity, label) {
+                } else if Some(*label) == core.identity_label()
+                    || core.shares(&identity, label)
+                    || core.offered_by_them(&identity, label)
+                {
                     Access::Full
                 } else if core.held_given(&identity).contains(label) {
                     // a copy this person gives them to hold (D80)
                     Access::Read
                 } else if core.held_taken(&identity).contains(label) {
                     // one they give this person to hold
+                    Access::Offered
+                } else if core.listed_unheld().contains(label) {
+                    // one of this person's own, not here yet: taken from a
+                    // member, which opening it checks
                     Access::Offered
                 } else if core.offered_here(&identity, label) {
                     Access::Offered
@@ -233,6 +240,30 @@ pub async fn sync_all(d: &Arc<Daemon>, s: &Session) {
         PeerKind::Token(_) | PeerKind::Stranger => return,
         _ => (d.core().labels(), None),
     };
+    tracing::debug!(
+        "syncing {} sets with {}{}",
+        labels.len(),
+        short(&s.peer_static()),
+        if member.is_some() { " (a contact)" } else { "" }
+    );
+    sync_these(d, s, labels, member).await;
+    // After a recovery the contact may give this person's own spaces only
+    // once the keeps just sent have reached them: asked once more, a moment
+    // later, rather than at the next round (`hosts.md#restore`, D78).
+    if member.is_some() {
+        let unheld = d.core().listed_unheld();
+        if !unheld.is_empty() {
+            tokio::time::sleep(AGAIN_AFTER).await;
+            sync_these(d, s, unheld, member).await;
+        }
+    }
+}
+
+/// How long after a contact's first round the spaces still missing after a
+/// recovery are asked for again.
+const AGAIN_AFTER: Duration = Duration::from_secs(2);
+
+async fn sync_these(d: &Arc<Daemon>, s: &Session, labels: Vec<Label>, member: Option<[u8; 32]>) {
     for label in labels {
         let mine = crate::mailbox::written_here(d, &label);
         match reconcile(d, s, label).await {

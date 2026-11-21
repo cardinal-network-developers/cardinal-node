@@ -450,6 +450,7 @@ pub fn set(
     // account, the same way a change's are once it is in effect.
     tend_person(d);
     tell_full(d);
+    crate::recovering::tend_recovered(d);
     Ok(json!({
         "names": chosen.iter().map(|c| c.petname.clone()).collect::<Vec<_>>(),
         "threshold": threshold,
@@ -2287,6 +2288,23 @@ async fn met_helper(d: &Arc<Daemon>, h: &Arc<Helper>, space: SpaceId, g: &Guarde
     if let Err(e) = r {
         tracing::warn!("cannot carry {}'s log to their new device: {e:#}", g.name);
     }
+    // And this person's own log, under their own id, so that the new
+    // device, taking the person's relationships up, knows this person's
+    // devices: it is the person's own device, who knows whom they asked.
+    let mine: Option<([u8; 32], Vec<Vec<u8>>)> = {
+        let core = d.core();
+        core.identity
+            .as_ref()
+            .map(|i| (i.id(), i.log.entries().map(IdentityEntry::encode).collect()))
+    };
+    if let Some((me, mine)) = mine {
+        let r = h
+            .on(move |pd| async move { carry(&pd, &space, &me, &mine) })
+            .await;
+        if let Err(e) = r {
+            tracing::debug!("carrying this person's log to a helper: {e:#}");
+        }
+    }
 }
 
 /// What a helper carried in a recovery relationship, taken: of the
@@ -2374,6 +2392,16 @@ async fn take(d: &Arc<Daemon>, h: &Arc<Helper>, c: &account::ContactRecord, g: &
         }
     }
     observe(d);
+    // the person's devices as the log now names them: a new device after a
+    // recovery is let in, as when the log comes by sync
+    {
+        let core = d.core();
+        let states = core.connectable_states();
+        let own = core.identity.as_ref().map(|i| i.state());
+        drop(core);
+        d.directory.update(own.as_deref(), &states);
+        d.endpoint.recheck_peers();
+    }
     d.bump();
     deliver(d, &who, taken).await;
 }

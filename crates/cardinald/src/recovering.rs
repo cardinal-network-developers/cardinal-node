@@ -28,6 +28,7 @@
 //! `recovering.json`, readable by this user only, until it is done.
 //! Afterwards `recovered.json` keeps the devices to pair again.
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -79,6 +80,20 @@ struct Under {
 #[derive(Default, Serialize, Deserialize)]
 struct Recovered {
     pair_again: Vec<String>,
+    /// The device and admin keys the recovery removed (hex): what they
+    /// wrote is looked at as each space arrives, after the finish too.
+    #[serde(default)]
+    forgotten: Vec<String>,
+    /// When the person said they lost them, by those devices' clocks.
+    #[serde(default)]
+    lost_at: Option<u64>,
+    /// Successions those devices made, waiting for the person's yes or no,
+    /// as `space:entry:key` (hex).
+    #[serde(default)]
+    asked: Vec<String>,
+    /// Those answered, kept or not, never asked again.
+    #[serde(default)]
+    answered: Vec<String>,
 }
 
 fn load(d: &Daemon) -> Option<Under> {
@@ -485,8 +500,15 @@ fn pair_again_json(d: &Daemon, keys: &[String]) -> Vec<Json> {
 /// the last recovery left to pair again.
 pub fn status(d: &Arc<Daemon>) -> anyhow::Result<Json> {
     let Some(u) = load(d) else {
-        let again = load_recovered(d).map(|r| r.pair_again).unwrap_or_default();
-        return Ok(json!({"under_way": false, "pair_again": pair_again_json(d, &again)}));
+        let r = load_recovered(d).unwrap_or_default();
+        return Ok(json!({
+            "under_way": false,
+            "pair_again": pair_again_json(d, &r.pair_again),
+            // as the spaces arrive, after the finish
+            "lost_devices": lost_json(d),
+            "lost_at": r.lost_at,
+            "successions": successions_json(d, &r),
+        }));
     };
     // `finish` made this device the person's but did not get to the end, as
     // when the service stopped: the words are shown this once, and what was
@@ -716,9 +738,29 @@ pub async fn finish(
         d,
         &Recovered {
             pair_again: u.forgotten.clone(),
+            forgotten: u.forgotten.clone(),
+            lost_at,
+            ..Recovered::default()
         },
     );
-    let back = from_guardians(d, log, &u.words, given).await?;
+    // the link keys the removed devices had, by their keys
+    let log_links: Vec<(KeyId, [u8; 32])> = log
+        .entries()
+        .flat_map(|e| e.ops().to_vec())
+        .filter_map(|o| match o.body() {
+            cardinal_identity::OpBody::AddKey {
+                key,
+                link_key: Some(l),
+                ..
+            } => Some((*key, *l.x25519())),
+            _ => None,
+        })
+        .collect();
+    let logs = guardians_logs(
+        h.as_ref().expect("running"),
+        &identity_of(&u).expect("checked"),
+    );
+    let back = from_guardians(d, log, &u.words, given, logs).await?;
     // What the account remembers, if it came back; else the keys removed.
     let pair_again = match back {
         true => remembered(d),
@@ -728,38 +770,19 @@ pub async fn finish(
         d,
         &Recovered {
             pair_again: pair_again.clone(),
+            forgotten: u.forgotten.clone(),
+            lost_at,
+            ..Recovered::default()
         },
     );
-    // What the removed devices wrote elsewhere is set aside, as after any
-    // recovery that kept none of them: kept up to when they were lost, if
-    // the person says (by those devices' own clocks), with `keep-work`
-    // (`spaces.md#authors`). The account and relationships given back are
-    // kept whole.
-    let mut set_aside = Vec::new();
-    for k in u
-        .forgotten
-        .iter()
-        .filter_map(|k| hex::decode(k).ok()?.try_into().ok())
-    {
-        let k: KeyId = k;
-        if let Some(up_to) = lost_at {
-            let written = d.core().keep_work(&k, Some(up_to));
-            match written {
-                Ok((written, _)) => {
-                    for (space, bytes) in written {
-                        d.push(&space, vec![bytes]);
-                    }
-                }
-                Err(e) => tracing::debug!("keeping what a lost device wrote: {e:#}"),
-            }
-        }
-        let left = d.core().unwitnessed_work(&k).map(|w| w.len()).unwrap_or(0);
-        set_aside.push(json!({
-            "key": hex::encode(&k[..8]),
-            "name": d.core().device_names().get(&k).cloned(),
-            "set_aside": left,
-        }));
-    }
+    // The removed devices' hosts leave the lists that name them, and the
+    // secrets they held are made anew (`hosts.md#local-discovery`).
+    after_removal(d, &forgotten_links(&log_links, &u.forgotten));
+    // What the removed devices wrote is set aside, as after any recovery
+    // that kept none of them: kept up to when they were lost, if the
+    // person says, as each space arrives ([`tend_recovered`]).
+    tend_recovered(d);
+    let set_aside = lost_json(d);
     // The guardians see each other's confirmations before the helper goes.
     last_carry(d).await;
     crate::helper::stop(d).await?;
@@ -837,6 +860,228 @@ async fn sync_with(hd: &Arc<Daemon>, guardian: &[u8; 32], space: &SpaceId) {
     }
 }
 
+/// The link keys of the removed devices `forgotten` (hex), from what
+/// the log said of them.
+fn forgotten_links(links: &[(KeyId, [u8; 32])], forgotten: &[String]) -> Vec<[u8; 32]> {
+    links
+        .iter()
+        .filter(|(k, _)| forgotten.contains(&hex::encode(k)))
+        .map(|(_, l)| *l)
+        .collect()
+}
+
+/// After a recovery removed every old device: each that was a host leaves
+/// the reach lists that name it, with its tokens, as when the person
+/// removes one; and the discovery and presence secrets, which those
+/// devices held, are made anew, the presence secret given again to each
+/// trusted contact, and the advertisements follow (`hosts.md#local-discovery`).
+fn after_removal(d: &Arc<Daemon>, links: &[[u8; 32]]) {
+    for l in links {
+        crate::mailbox::take_out_removed(d, l);
+    }
+    let ops: Vec<cardinal_space::SpaceOp> = {
+        let core = d.core();
+        let Some(acc) = core.account().and_then(|a| a.space.as_ref()) else {
+            return;
+        };
+        acc.state()
+            .children(&cardinal_space::ROOT)
+            .into_iter()
+            .filter(|n| {
+                n.kind == cardinal_space::entry::NodeKind::Uint(account::SECRET) && !n.deleted
+            })
+            .filter(|n| {
+                let p = n.field(1).and_then(|v| v.as_text());
+                p == Some(crate::core::DISCOVERY_PURPOSE) || p == Some(crate::presence::PURPOSE)
+            })
+            .map(|n| cardinal_space::SpaceOp::delete(n.id))
+            .collect()
+    };
+    let Some(acc) = d.core().account_id() else {
+        return;
+    };
+    let mut ops = ops;
+    let fresh: [u8; 32] = cardinal_crypto::random_bytes();
+    ops.push(crate::core::create_secret(
+        crate::core::DISCOVERY_PURPOSE,
+        &fresh,
+    ));
+    if let Err(e) = d.write_and_push(&acc, ops) {
+        tracing::warn!("cannot renew the discovery secrets after the recovery: {e:#}");
+        return;
+    }
+    // a new presence secret, given where it is due
+    crate::presence::keep(d);
+    tracing::info!("new discovery and presence secrets, after the recovery");
+}
+
+/// What the recovery's removed devices wrote, as spaces arrive after the
+/// finish: kept up to when the person said they were lost (but for their
+/// successions); and their successions, which the person is asked about,
+/// one by one, never dropped unasked
+/// (`spaces.md#a-succession-by-a-device-that-is-later-removed`).
+pub fn tend_recovered(d: &Arc<Daemon>) {
+    let Some(mut r) = load_recovered(d) else {
+        return;
+    };
+    if r.forgotten.is_empty() || d.core().identity.is_none() {
+        return;
+    }
+    let keys: Vec<KeyId> = r
+        .forgotten
+        .iter()
+        .filter_map(|k| hex::decode(k).ok()?.try_into().ok())
+        .collect();
+    let mut changed = false;
+    for k in &keys {
+        if let Some(up_to) = r.lost_at {
+            let written = d.core().keep_work_but_successions(k, up_to);
+            match written {
+                Ok(written) => {
+                    for (space, bytes) in written {
+                        d.push(&space, vec![bytes]);
+                    }
+                }
+                Err(e) => tracing::debug!("keeping what a lost device wrote: {e:#}"),
+            }
+        }
+        for (space, x, _) in d.core().unkept_successions(k, r.lost_at) {
+            let item = format!(
+                "{}:{}:{}",
+                hex::encode(space),
+                hex::encode(x),
+                hex::encode(k)
+            );
+            if !r.asked.contains(&item) && !r.answered.contains(&item) {
+                r.asked.push(item);
+                changed = true;
+            }
+        }
+    }
+    if changed {
+        save_recovered(d, &r);
+        d.bump();
+    }
+}
+
+/// The successions waiting for the person's answer, as a window shows
+/// them: "Your earlier changes to Garden club: keep?".
+fn successions_json(d: &Daemon, r: &Recovered) -> Vec<Json> {
+    let core = d.core();
+    r.asked
+        .iter()
+        .filter_map(|item| {
+            let mut parts = item.split(':');
+            let space: SpaceId = hex::decode(parts.next()?).ok()?.try_into().ok()?;
+            let sp = core.spaces.get(&space)?.space.as_ref()?;
+            // a successor's genesis is shown under the space it ends
+            let ends = sp.succeeds().unwrap_or(space);
+            let name = core
+                .spaces
+                .get(&ends)
+                .and_then(|h| h.space.as_ref())
+                .map(cardinal_space::group::name)
+                .unwrap_or_else(|| cardinal_space::group::name(sp));
+            // its own name may be in what is set aside: then as offered
+            let name = if name.is_empty() {
+                core.offered_name(&ends).unwrap_or_default()
+            } else {
+                name
+            };
+            Some(json!({"id": item, "space": name}))
+        })
+        .collect()
+}
+
+/// `recover-keep-succession` (`id`, `keep`): the person's answer about a
+/// succession a removed device made. With a yes, a `keep` of it is
+/// written, and of the successor's genesis beside it if that is
+/// waiting too.
+pub fn keep_succession(d: &Arc<Daemon>, id: &str, keep: bool) -> anyhow::Result<Json> {
+    let mut r = load_recovered(d).ok_or_else(|| anyhow::anyhow!("nothing is waiting"))?;
+    anyhow::ensure!(
+        r.asked.iter().any(|x| x == id),
+        "that is not waiting for an answer"
+    );
+    // the succeed and the successor's genesis go together
+    let parse = |item: &str| -> Option<(SpaceId, EntryId, KeyId)> {
+        let mut parts = item.split(':');
+        Some((
+            hex::decode(parts.next()?).ok()?.try_into().ok()?,
+            hex::decode(parts.next()?).ok()?.try_into().ok()?,
+            hex::decode(parts.next()?).ok()?.try_into().ok()?,
+        ))
+    };
+    let (space, _, _) = parse(id).ok_or_else(|| anyhow::anyhow!("that is not an answer's id"))?;
+    let together: Vec<String> = {
+        let core = d.core();
+        let ends = core
+            .spaces
+            .get(&space)
+            .and_then(|h| h.space.as_ref())
+            .and_then(|sp| sp.succeeds());
+        r.asked
+            .iter()
+            .filter(|item| {
+                parse(item).is_some_and(|(s, _, _)| {
+                    s == space
+                        || Some(s) == ends
+                        || core
+                            .spaces
+                            .get(&s)
+                            .and_then(|h| h.space.as_ref())
+                            .and_then(|sp| sp.succeeds())
+                            == Some(space)
+                })
+            })
+            .cloned()
+            .collect()
+    };
+    for item in &together {
+        if keep {
+            let (s, x, k) = parse(item).expect("parsed");
+            let bytes = d.core().keep_these(&s, &k, &[x])?;
+            d.push(&s, vec![bytes]);
+        }
+        r.asked.retain(|a| a != item);
+        r.answered.push(item.clone());
+    }
+    save_recovered(d, &r);
+    d.bump();
+    Ok(json!({"kept": keep, "answered": together.len()}))
+}
+
+/// `recover-lost-at` (`lost_at`): when the person lost the devices the
+/// recovery removed, said after the finish: what they wrote up to then is
+/// kept, as each space arrives.
+pub fn set_lost_at(d: &Arc<Daemon>, lost_at: Option<u64>) -> anyhow::Result<Json> {
+    let mut r = load_recovered(d).ok_or_else(|| anyhow::anyhow!("no recovery took place here"))?;
+    r.lost_at = lost_at;
+    save_recovered(d, &r);
+    tend_recovered(d);
+    Ok(json!({"lost_devices": lost_json(d)}))
+}
+
+/// The devices the recovery removed, with how much of what each wrote is
+/// set aside in the spaces held now.
+fn lost_json(d: &Daemon) -> Vec<Json> {
+    let Some(r) = load_recovered(d) else {
+        return Vec::new();
+    };
+    r.forgotten
+        .iter()
+        .filter_map(|k| hex::decode(k).ok()?.try_into().ok())
+        .map(|k: KeyId| {
+            let left = d.core().unwitnessed_work(&k).map(|w| w.len()).unwrap_or(0);
+            json!({
+                "key": hex::encode(&k[..8]),
+                "name": d.core().device_names().get(&k).cloned(),
+                "set_aside": left,
+            })
+        })
+        .collect()
+}
+
 /// Carries what is left to carry, and syncs each relationship with the
 /// guardian's devices in touch, ten seconds at most each, so that every
 /// guardian sees the recovery in effect.
@@ -904,6 +1149,25 @@ fn account_back(core: &crate::core::Core, who: &EntryId) -> bool {
         .any(|l| core.set(l).iter().next().is_some())
 }
 
+/// The guardians' own logs, which each guardian's persona carried under
+/// the guardian's own id: the person's contacts, whose devices the new
+/// device knows by them.
+fn guardians_logs(h: &Helper, who: &EntryId) -> Vec<([u8; 32], Vec<Vec<u8>>)> {
+    let core = h.d.core();
+    let mut by: BTreeMap<[u8; 32], Vec<Vec<u8>>> = BTreeMap::new();
+    for c in core.contacts().into_iter().filter(|c| for_recovery(c, who)) {
+        let Some(sp) = core.spaces.get(&c.space).and_then(|x| x.space.as_ref()) else {
+            continue;
+        };
+        for x in relationship::carried(sp) {
+            if x.author == c.identity && x.identity != *who {
+                by.entry(x.identity).or_default().push(x.entry);
+            }
+        }
+    }
+    by.into_iter().collect()
+}
+
 /// [`copies`], from a helper's core, running or not.
 fn copies_in(core: &crate::core::Core, who: &EntryId) -> Vec<([u8; 32], Vec<Vec<u8>>)> {
     let rels: Vec<([u8; 32], SpaceId)> = core
@@ -941,6 +1205,7 @@ async fn from_guardians(
     log: IdentityLog,
     words: &str,
     copies: Vec<([u8; 32], Vec<Vec<u8>>)>,
+    logs: Vec<([u8; 32], Vec<Vec<u8>>)>,
 ) -> anyhow::Result<bool> {
     let keys = d.keys.clone();
     let root = RecoveryPhrase::parse(words)?.root_signing_key();
@@ -953,7 +1218,7 @@ async fn from_guardians(
     let person = crate::config::default_person();
     let paths = d.paths.clone();
     let back = tokio::task::spawn_blocking(move || {
-        crate::setup::install_recovered(&paths, &all, &copies, &config, &person)
+        crate::setup::install_recovered(&paths, &all, &copies, &logs, &config, &person)
     })
     .await??;
     crate::control::reload(d)?;

@@ -713,6 +713,19 @@ impl Daemon {
         for s in &sessions {
             s.check();
         }
+        // and the services of the personas this device acts as, which
+        // listen on the same network
+        let inside: Vec<Arc<crate::helper::Helper>> = lock(&self.helper)
+            .iter()
+            .cloned()
+            .chain(lock(&self.personas).values().cloned())
+            .collect();
+        for h in inside {
+            let (hd, why) = (h.d.clone(), why.to_owned());
+            h.d.rt.spawn(async move {
+                hd.network_changed(&why);
+            });
+        }
         let d = self.clone();
         tokio::spawn(async move {
             // Long enough for an answer to be missed (`answer_timeout`).
@@ -1271,6 +1284,9 @@ impl Daemon {
             crate::guardians::held_named(self, &label);
             // it may have ended, or brought what stands in its place
             crate::following::follow(self);
+            // after a recovery, what the removed devices wrote in it: kept
+            // up to the time lost, its successions asked about
+            crate::recovering::tend_recovered(self);
             self.bump();
             self.housekeeping();
         }
@@ -1880,12 +1896,14 @@ impl Daemon {
         let d = self.clone();
         tokio::spawn(async move {
             use cardinal_contact::discovery::{self as disc, check_tag_txt, CONTACTS};
-            let own = disc::discovery_key(&secret);
+            let mut secret = secret;
+            let mut own = disc::discovery_key(&secret);
             // The advertisement is made again when the presence secret
-            // given changes, so `c=` follows it within a few seconds.
-            let advertise = |presence: Option<[u8; 32]>| {
+            // given changes, so `c=` follows it within a few seconds; and
+            // when the discovery secret does (renewed after a recovery).
+            let advertise = |secret: &[u8; 32], presence: Option<[u8; 32]>| {
                 // The advertised port is the TCP link port (see README).
-                match disc::advertise_tags(cfg, &secret, presence.as_ref(), port, ADVERTISE_EVERY) {
+                match disc::advertise_tags(cfg, secret, presence.as_ref(), port, ADVERTISE_EVERY) {
                     Ok(a) => Some(a),
                     Err(e) => {
                         tracing::warn!("LAN discovery: cannot advertise: {e}");
@@ -1894,7 +1912,7 @@ impl Daemon {
                 }
             };
             let mut presence = crate::presence::advertised(&d.core());
-            let mut _ad = advertise(presence);
+            let mut _ad = advertise(&secret, presence);
             let mut browser = match disc::browse_devices(cfg, Duration::from_secs(15)) {
                 Ok(b) => b,
                 Err(e) => {
@@ -1956,10 +1974,16 @@ impl Daemon {
                     }
                     _ = look.tick() => {
                         let now = crate::presence::advertised(&d.core());
-                        if now != presence {
+                        let mine = d.core().discovery_secret();
+                        let renewed = mine.is_some_and(|m| m != secret);
+                        if now != presence || renewed {
+                            if let Some(m) = mine.filter(|_| renewed) {
+                                secret = m;
+                                own = disc::discovery_key(&secret);
+                            }
                             presence = now;
                             _ad = None;
-                            _ad = advertise(presence);
+                            _ad = advertise(&secret, presence);
                         }
                     }
                     _ = stop.changed() => break,
