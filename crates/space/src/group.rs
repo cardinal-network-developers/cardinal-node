@@ -121,8 +121,13 @@ pub fn role_of(space: &Space, who: &IdentityId) -> Option<u64> {
 fn admins_value<'a>(space: &'a Space, n: &'a Node, key: u64) -> Option<&'a Value> {
     let dag = space.dag();
     n.values(key).iter().rev().find_map(|v| {
-        let author = dag.get(&v.entry)?.author();
-        let counts = role_of(space, &author).is_some_and(|r| r >= ADMIN);
+        // A value a successor carried was judged where it was written,
+        // and the owner, who wrote the successor, stands behind it
+        // (`spaces.md#what-comes-across`).
+        let counts = match dag.get(&v.entry) {
+            Some(e) => role_of(space, &e.author()).is_some_and(|r| r >= ADMIN),
+            None => space.state().is_carried(&n.id),
+        };
         counts.then_some(v.value.as_ref()).flatten()
     })
 }

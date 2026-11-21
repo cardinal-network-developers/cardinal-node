@@ -137,7 +137,7 @@ struct Meta {
 /// The field of a node of `kind` that a profile declares to hold a node id,
 /// which names that node as surely as an op does (`state.md#state-tree`): a
 /// message's "in reply to", and the message a read marker stands at.
-fn node_field(profile: Profile, kind: NodeKind) -> Option<u64> {
+pub(crate) fn node_field(profile: Profile, kind: NodeKind) -> Option<u64> {
     if profile != Profile::RELATIONSHIP {
         return None;
     }
@@ -187,6 +187,18 @@ pub struct State {
     accepted: HashSet<EntryId>,
     rejected: HashSet<EntryId>,
     applied: Vec<EntryId>,
+    /// The nodes a successor's initial state carried, with the rank each
+    /// had there (`state.md#canonical-state`, field 10). They need no
+    /// `create`, come first in the order nodes were made in, and the
+    /// entries that wrote their values and positions are not in this
+    /// space: the genesis counts as descending from each of them
+    /// (`spaces.md#the-successor`).
+    carried: HashMap<NodeId, u64>,
+    /// Each earlier id a node posted again has had (`create` field 5), and
+    /// the node that has it now: what a device posting again an op that
+    /// named the node by one of them writes in its place
+    /// (`spaces.md#what-the-successor-does-not-carry`).
+    was: HashMap<NodeId, NodeId>,
 }
 
 /// The effect of one delete op, decided against the whole set.
@@ -332,7 +344,11 @@ struct Deletes<'a> {
 }
 
 impl<'a> Deletes<'a> {
-    fn new(dag: &'a Dag<SpaceEntry>, accepted: &[EntryId]) -> Deletes<'a> {
+    fn new(
+        dag: &'a Dag<SpaceEntry>,
+        accepted: &[EntryId],
+        base: &[(NodeId, NodeId)],
+    ) -> Deletes<'a> {
         let order = dag.log_order();
         let mut is_accepted = vec![false; order.len()];
         for x in accepted {
@@ -342,13 +358,17 @@ impl<'a> Deletes<'a> {
         for j in (1..least.len()).rev() {
             least[j - 1] = least[j - 1].min(least[j]);
         }
+        let mut at = Positions::default();
+        for (n, p) in base {
+            at.place(*n, *p);
+        }
         Deletes {
             dag,
             is_accepted,
             least,
             related: vec![usize::MAX; order.len()],
             mark: 0,
-            at: Positions::default(),
+            at,
             prefix: Vec::new(),
             prefix_marks: Vec::new(),
             undo: Vec::new(),
@@ -486,7 +506,160 @@ impl State {
             accepted: HashSet::new(),
             rejected: HashSet::new(),
             applied: Vec::new(),
+            carried: HashMap::new(),
+            was: HashMap::new(),
         }
+    }
+
+    /// The state a successor starts from: a canonical state
+    /// (`state.md#canonical-state`), read back. Every node it records is
+    /// carried, under the id, creator, position, values and rank it had,
+    /// and so is every reach node it records. A record that cannot be read
+    /// fails the whole.
+    pub fn from_canonical(profile: Profile, canonical: &Record) -> Result<State, crate::Error> {
+        let bad = crate::Error::Malformed("canonical state");
+        if canonical.opt_uint(0)? != Some(CANONICAL_STATE as u64) {
+            return Err(bad);
+        }
+        let mut st = State::new(profile);
+        let id16 = |v: &Value| -> Option<NodeId> { v.as_bytes()?.try_into().ok() };
+        let id32 = |v: &Value| -> Option<EntryId> { v.as_bytes()?.try_into().ok() };
+        let fields_of = |r: &Record| -> Result<BTreeMap<u64, Vec<FieldValue>>, crate::Error> {
+            let mut out = BTreeMap::new();
+            for f in r.opt_list(5)?.unwrap_or(&[]) {
+                let f = f.as_record().ok_or(bad.clone())?;
+                let key = f.uint(1)?;
+                let mut vals: Vec<FieldValue> = Vec::new();
+                for v in f.list(2)? {
+                    let v = v.as_record().ok_or(bad.clone())?;
+                    let entry = v.get(1).and_then(id32).ok_or(bad.clone())?;
+                    // The place of the op that wrote it is not recorded:
+                    // values of one entry keep the order they are listed in.
+                    let op = vals.iter().filter(|x| x.entry == entry).count() as u32;
+                    vals.push(FieldValue {
+                        entry,
+                        op,
+                        value: v.get(2).cloned(),
+                    });
+                }
+                out.insert(key, vals);
+            }
+            Ok(out)
+        };
+        let mut seen: HashSet<NodeId> = HashSet::new();
+        for r in canonical.opt_list(1)?.unwrap_or(&[]) {
+            let r = r.as_record().ok_or(bad.clone())?;
+            let id = r.get(1).and_then(id16).ok_or(bad.clone())?;
+            if id == ROOT || !seen.insert(id) {
+                return Err(bad);
+            }
+            let fields = fields_of(r)?;
+            let Some(kind) = r.get(2) else {
+                // a reach node: fields 1 and 5 alone
+                st.reach.insert(id, fields);
+                continue;
+            };
+            let kind = NodeKind::from_value(kind).ok_or(bad.clone())?;
+            let parent = r.get(3).and_then(id16).ok_or(bad.clone())?;
+            let writer = r.get(7).and_then(id32).ok_or(bad.clone())?;
+            let creator = r.get(9).and_then(id32).ok_or(bad.clone())?;
+            let rank = r.uint(10)?;
+            let author_owned = fields.get(&AUTHOR_OWNED_FIELD).is_some_and(|vs| {
+                vs.iter()
+                    .any(|v| v.value.as_ref().and_then(|x| x.as_uint()) == Some(1))
+            });
+            st.registry.insert(
+                id,
+                Meta {
+                    kind,
+                    created_in: writer,
+                    creator,
+                    author_owned,
+                },
+            );
+            st.children.entry(parent).or_default().insert(id);
+            st.nodes.insert(
+                id,
+                Node {
+                    id,
+                    kind,
+                    parent,
+                    name: r.opt_text(4)?.unwrap_or("").to_owned(),
+                    fields,
+                    deleted: r.opt_bool(6)?.unwrap_or(false),
+                    delete_conflict: r.opt_bool(8)?.unwrap_or(false),
+                    position_writer: writer,
+                    creator,
+                    // Carried: the entry that made it is in an earlier
+                    // space. Nothing here names it, and its rank says
+                    // where it comes.
+                    created_in: writer,
+                    created: r.opt_uint(11)?,
+                    created_op: 0,
+                    deleted_by: None,
+                },
+            );
+            st.carried.insert(id, rank);
+        }
+        Ok(st)
+    }
+
+    /// The same state with no entry of this space applied yet: what a
+    /// successor starts from, as [`State::from_canonical`] reads it.
+    fn initial_copy(&self) -> State {
+        State {
+            profile: self.profile,
+            nodes: self.nodes.clone(),
+            children: self.children.clone(),
+            registry: self.registry.clone(),
+            reach: self.reach.clone(),
+            accepted: HashSet::new(),
+            rejected: HashSet::new(),
+            applied: Vec::new(),
+            carried: self.carried.clone(),
+            was: self.was.clone(),
+        }
+    }
+
+    /// Leaves out the reach node of every identity but `named`: what the
+    /// state at a cut does for those a successor's genesis does not name,
+    /// since someone who is not there could never empty it
+    /// (`spaces.md#the-successor`).
+    pub fn keep_reach_of(&mut self, named: &[IdentityId]) {
+        let keep: HashSet<NodeId> = named.iter().map(reach_node_id).collect();
+        self.reach.retain(|id, _| keep.contains(id));
+    }
+
+    /// Whether a node came with the space's initial state.
+    pub fn is_carried(&self, node: &NodeId) -> bool {
+        self.carried.contains_key(node)
+    }
+
+    /// Where the initial state ranked a node it carried.
+    pub fn carried_rank(&self, node: &NodeId) -> Option<u64> {
+        self.carried.get(node).copied()
+    }
+
+    /// The node that has, or has had, the id `id`: itself, or one posted
+    /// again whose `create` lists it as an id it had
+    /// (`spaces.md#what-the-successor-does-not-carry`).
+    pub fn now_called(&self, id: &NodeId) -> Option<NodeId> {
+        if self.nodes.contains_key(id) {
+            return Some(*id);
+        }
+        self.was.get(id).copied()
+    }
+
+    /// The ids a node has had before this one, when it was posted again.
+    pub fn was_of(&self, node: &NodeId) -> Vec<NodeId> {
+        let mut out: Vec<NodeId> = self
+            .was
+            .iter()
+            .filter(|(_, now)| *now == node)
+            .map(|(was, _)| *was)
+            .collect();
+        out.sort();
+        out
     }
 
     /// The profile.
@@ -496,7 +669,19 @@ impl State {
 
     /// Computes the state of the `valid` entries of `dag`.
     pub fn compute(profile: Profile, dag: &Dag<SpaceEntry>, valid: &HashSet<EntryId>) -> State {
-        State::compute_with(profile, dag, valid, false)
+        State::compute_with(profile, None, dag, valid, false)
+    }
+
+    /// Computes the state of the `valid` entries of `dag`, starting from
+    /// `initial`: a successor's initial state, whose nodes need no
+    /// `create` and whose values every entry here descends from.
+    pub fn compute_from(
+        profile: Profile,
+        initial: Option<&State>,
+        dag: &Dag<SpaceEntry>,
+        valid: &HashSet<EntryId>,
+    ) -> State {
+        State::compute_with(profile, initial, dag, valid, false)
     }
 
     /// [`State::compute`] with each delete decided on its own by the
@@ -507,16 +692,22 @@ impl State {
         dag: &Dag<SpaceEntry>,
         valid: &HashSet<EntryId>,
     ) -> State {
-        State::compute_with(profile, dag, valid, true)
+        State::compute_with(profile, None, dag, valid, true)
     }
 
     fn compute_with(
         profile: Profile,
+        initial: Option<&State>,
         dag: &Dag<SpaceEntry>,
         valid: &HashSet<EntryId>,
         by_definition: bool,
     ) -> State {
-        let mut st = State::new(profile);
+        let mut st = match initial {
+            Some(i) => i.initial_copy(),
+            None => State::new(profile),
+        };
+        // where the carried nodes are before anything here moves them
+        let base: Vec<(NodeId, NodeId)> = st.nodes.values().map(|n| (n.id, n.parent)).collect();
         let order: Vec<EntryId> = dag
             .log_order()
             .iter()
@@ -539,7 +730,7 @@ impl State {
             .collect();
         // pass 2: application, each delete decided as its turn comes, so
         // that what one takes is let go before the next is worked out
-        let mut shared = (!by_definition).then(|| Deletes::new(dag, &accepted));
+        let mut shared = (!by_definition).then(|| Deletes::new(dag, &accepted, &base));
         for x in &accepted {
             let e = dag.get(x).expect("entry");
             let deletes =
@@ -556,7 +747,7 @@ impl State {
                 }
                 None => {
                     let mut decide = |op: u32, n: &NodeId| {
-                        State::delete_effect(dag, &accepted, x, op as usize, n)
+                        State::delete_effect(dag, &accepted, &base, x, op as usize, n)
                     };
                     st.apply(dag, e, Some(&mut decide));
                 }
@@ -600,9 +791,11 @@ impl State {
         let known = |n: &NodeId, local: &HashMap<NodeId, Meta>, reg: &HashMap<NodeId, Meta>| {
             *n == ROOT
                 || local.contains_key(n)
-                || reg
-                    .get(n)
-                    .is_some_and(|m| dag.is_ancestor_or_self(&m.created_in, &id))
+                || reg.get(n).is_some_and(|m| {
+                    // a carried node's maker is in an earlier space, and
+                    // everything here descends from it
+                    !dag.contains(&m.created_in) || dag.is_ancestor_or_self(&m.created_in, &id)
+                })
         };
         let owned_ok =
             |n: &NodeId, local: &HashMap<NodeId, Meta>, reg: &HashMap<NodeId, Meta>| match local
@@ -699,14 +892,15 @@ impl State {
     fn delete_effect(
         dag: &Dag<SpaceEntry>,
         accepted: &[EntryId],
+        base: &[(NodeId, NodeId)],
         d: &EntryId,
         at: usize,
         n: &NodeId,
     ) -> DeleteEffect {
         // positions in the delete's causal past, and after the ops before
-        // it in its own entry
+        // it in its own entry, from where the carried nodes were
         let past = dag.ancestors(d);
-        let mut parent: HashMap<NodeId, NodeId> = HashMap::new();
+        let mut parent: HashMap<NodeId, NodeId> = base.iter().copied().collect();
         let before = accepted.iter().filter(|x| past.contains(*x));
         for (x, ops) in before.map(|x| (x, usize::MAX)).chain([(d, at)]) {
             let e = dag.get(x).expect("entry");
@@ -817,9 +1011,13 @@ impl State {
                     parent,
                     name,
                     fields,
-                    ..
+                    was,
                 } => {
                     let nid = derived_id(&id, i as usize);
+                    for w in was {
+                        // the first node to say it had an id keeps it
+                        self.was.entry(*w).or_insert(nid);
+                    }
                     let fields = fields
                         .iter()
                         .map(|(k, v)| {
@@ -877,7 +1075,11 @@ impl State {
                                 None => {
                                     vals.retain(|v| {
                                         !*in_past.entry(v.entry).or_insert_with(|| {
-                                            dag.is_ancestor_or_self(&v.entry, &id)
+                                            // a carried value's entry is in
+                                            // an earlier space, and the
+                                            // genesis descends from it
+                                            !dag.contains(&v.entry)
+                                                || dag.is_ancestor_or_self(&v.entry, &id)
                                         })
                                     });
                                     settled.insert((*node, *key), vals.len());
@@ -1083,14 +1285,19 @@ impl State {
         }
         // A node's rank is its place in the order the nodes were created
         // in: log order, and within an entry the order of its ops.
+        // The nodes an initial state carried come first, in the order it
+        // ranked them.
         let at: HashMap<&EntryId, usize> = self.applied.iter().zip(0..).collect();
-        let mut made: Vec<(usize, u32, NodeId)> = self
+        let mut made: Vec<(usize, usize, u32, NodeId)> = self
             .nodes
             .values()
-            .map(|n| (at[&n.created_in], n.created_op, n.id))
+            .map(|n| match self.carried.get(&n.id) {
+                Some(r) => (0, *r as usize, 0, n.id),
+                None => (1, at[&n.created_in], n.created_op, n.id),
+            })
             .collect();
         made.sort_unstable();
-        let rank: HashMap<NodeId, u64> = made.iter().map(|(_, _, id)| *id).zip(0..).collect();
+        let rank: HashMap<NodeId, u64> = made.iter().map(|(_, _, _, id)| *id).zip(0..).collect();
         let mut records: Vec<(NodeId, Record)> = Vec::new();
         for (id, n) in &self.nodes {
             let r = Record::new()
