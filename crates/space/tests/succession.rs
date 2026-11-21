@@ -371,3 +371,40 @@ fn what_the_cut_left_behind_is_posted_again_beside_what_its_writer_had_not_seen(
         .unwrap();
     assert_eq!(s.state().now_called(&was.id), Some(again.id));
 }
+
+#[test]
+fn a_delete_of_a_carried_node_yields_to_work_beside_it() {
+    let mut t = three();
+    let named = [(t.ana.id(), OWNER), (t.bo.id(), WRITER)];
+    let keys = [
+        t.ana.enc.public_key().clone(),
+        t.bo.enc.public_key().clone(),
+    ];
+    let refs: Vec<_> = keys.iter().collect();
+    let (mut s, g, at_cut) = succeed(&mut t, &named, &refs);
+    let mut theirs = Space::open_genesis(&g, &[&t.bo.enc], None).unwrap();
+    theirs.set_initial_state(State::from_canonical(group::GROUP, &at_cut.canonical()).unwrap());
+    theirs.set_identities([t.ana.log.state(), t.bo.log.state(), t.cy.log.state()]);
+    assert_eq!(said(&theirs), said(&s));
+    // Ana deletes the conversation the successor carried, while Bo writes
+    // in it, neither having seen the other.
+    let c = relationship::conversation(&s).unwrap();
+    s.write(
+        &t.ana.log,
+        &t.ana.device.signing,
+        vec![SpaceOp::delete(c)],
+        Some(5),
+    )
+    .unwrap();
+    t.bo.says(&mut theirs, "still talking");
+    sync(&s, &mut theirs, &t.bo.enc);
+    sync(&theirs, &mut s, &t.ana.enc);
+    for sp in [&s, &theirs] {
+        let n = sp.state().node(&c).unwrap();
+        assert!(!n.deleted && n.delete_conflict, "{n:?}");
+        assert!(said(sp).contains(&"still talking".to_owned()));
+        // and the old messages, untouched, went with the delete
+        assert!(!said(sp).contains(&"hello from cy".to_owned()));
+    }
+    assert_eq!(s.state().canonical(), theirs.state().canonical());
+}
