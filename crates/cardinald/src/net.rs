@@ -128,13 +128,13 @@ impl Daemon {
                     Access::None
                 }
             }
-            PeerKind::Contact(identity, _) => {
+            PeerKind::Contact(identity, device) => {
                 let core = self.core();
                 if *label == identity_log_label(&identity) {
                     Access::Other(identity)
                 } else if Some(*label) == core.identity_label()
                     || core.shares(&identity, label)
-                    || core.offered_by_them(&identity, label)
+                    || core.recovered_owns(&identity, &device, label)
                 {
                     Access::Full
                 } else if core.held_given(&identity).contains(label) {
@@ -142,10 +142,6 @@ impl Daemon {
                     Access::Read
                 } else if core.held_taken(&identity).contains(label) {
                     // one they give this person to hold
-                    Access::Offered
-                } else if core.listed_unheld().contains(label) {
-                    // one of this person's own, not here yet: taken from a
-                    // member, which opening it checks
                     Access::Offered
                 } else if core.offered_here(&identity, label) {
                     Access::Offered
@@ -236,7 +232,19 @@ pub async fn serve(d: Arc<Daemon>, s: Session, gen: u64) {
 /// Reconciles every set with a peer: identity log first, then spaces.
 pub async fn sync_all(d: &Arc<Daemon>, s: &Session) {
     let (labels, member) = match d.classify(s) {
-        PeerKind::Contact(identity, _) => (d.core().labels_with(&identity), Some(identity)),
+        PeerKind::Contact(identity, device) => {
+            let core = d.core();
+            let mut labels = core.labels_with(&identity);
+            // after their recovery, what they started, for their keeps
+            let theirs: Vec<Label> = core
+                .spaces
+                .keys()
+                .filter(|l| !labels.contains(*l) && core.recovered_owns(&identity, &device, l))
+                .copied()
+                .collect();
+            labels.extend(theirs);
+            (labels, Some(identity))
+        }
         PeerKind::Token(_) | PeerKind::Stranger => return,
         _ => (d.core().labels(), None),
     };
@@ -247,21 +255,41 @@ pub async fn sync_all(d: &Arc<Daemon>, s: &Session) {
         if member.is_some() { " (a contact)" } else { "" }
     );
     sync_these(d, s, labels, member).await;
-    // After a recovery the contact may give this person's own spaces only
-    // once the keeps just sent have reached them: asked once more, a moment
-    // later, rather than at the next round (`hosts.md#restore`, D78).
-    if member.is_some() {
-        let unheld = d.core().listed_unheld();
-        if !unheld.is_empty() {
-            tokio::time::sleep(AGAIN_AFTER).await;
-            sync_these(d, s, unheld, member).await;
-        }
+    let Some(member) = member else {
+        return;
+    };
+    // After this person's recovery, for a while: the spaces this contact is
+    // known to share and that are not here, asked of them alone, taken
+    // only in answer, never served (`hosts.md#restore`, D80).
+    let asks = crate::recovering::asks_of(d, &member);
+    if asks.is_empty() {
+        return;
+    }
+    ask_for(d, s, &asks).await;
+    // The contact may give them only once the keeps just sent have reached
+    // them: asked once more, a moment later, once per recovery.
+    if crate::recovering::ask_again_once(d, &member) {
+        tokio::time::sleep(AGAIN_AFTER).await;
+        let asks = crate::recovering::asks_of(d, &member);
+        ask_for(d, s, &asks).await;
     }
 }
 
 /// How long after a contact's first round the spaces still missing after a
 /// recovery are asked for again.
 const AGAIN_AFTER: Duration = Duration::from_secs(2);
+
+async fn ask_for(d: &Arc<Daemon>, s: &Session, labels: &[Label]) {
+    for label in labels {
+        if let Err(e) = reconcile_as(d, s, *label, Access::Offered).await {
+            tracing::debug!(
+                "asking {} for {}: {e:#}",
+                short(&s.peer_static()),
+                short(label)
+            );
+        }
+    }
+}
 
 async fn sync_these(d: &Arc<Daemon>, s: &Session, labels: Vec<Label>, member: Option<[u8; 32]>) {
     for label in labels {

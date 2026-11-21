@@ -95,12 +95,6 @@ pub fn install_recovered(
     let keys = Arc::new(Keys::load_or_create(&paths.device_key())?);
     let mut core = Core::load(paths, keys.clone())?;
     core.install_identity(entries)?;
-    // the guardians' own logs, so their devices are known again
-    for (who, log) in logs {
-        if let Err(e) = core.ingest_other(*who, log) {
-            tracing::warn!("a guardian's log: {e:#}");
-        }
-    }
     core.identity_updated();
     for (label, sealed) in copies {
         if let Err(e) = core.ingest_space(*label, sealed) {
@@ -112,6 +106,17 @@ pub fn install_recovered(
     let labels: Vec<[u8; 32]> = copies.iter().map(|(l, _)| *l).collect();
     if let Err(e) = core.keep_given_back(&labels) {
         tracing::warn!("keeping what the guardians gave back: {e:#}");
+    }
+    // the guardians' own logs, so their devices are known again: only of
+    // those the account given back lists as contacts
+    let contacts: Vec<[u8; 32]> = core.contacts().iter().map(|c| c.identity).collect();
+    for (who, log) in logs.iter().filter(|(w, _)| contacts.contains(w)) {
+        if let Err(e) = core.ingest_other(*who, log) {
+            tracing::warn!("a guardian's log: {e:#}");
+        }
+    }
+    if !logs.is_empty() {
+        core.identity_updated();
     }
     if core.account_id().is_some() {
         return Ok(true);

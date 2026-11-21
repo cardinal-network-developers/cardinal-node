@@ -2290,7 +2290,15 @@ async fn met_helper(d: &Arc<Daemon>, h: &Arc<Helper>, space: SpaceId, g: &Guarde
     }
     // And this person's own log, under their own id, so that the new
     // device, taking the person's relationships up, knows this person's
-    // devices: it is the person's own device, who knows whom they asked.
+    // devices: only once this guardian confirmed the recovery, which it
+    // does at the end of the delay, so that a helper it did not confirm
+    // learns nothing of the guardian.
+    let confirmed = wanted(d, g)
+        .iter()
+        .any(|w| w.confirmed.contains(&g.persona.identity));
+    if !confirmed {
+        return;
+    }
     let mine: Option<([u8; 32], Vec<Vec<u8>>)> = {
         let core = d.core();
         core.identity

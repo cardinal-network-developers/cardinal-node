@@ -747,19 +747,31 @@ differs or was read:
   opening on the new device: its first epoch's key was given the removed
   device's link key only, so it stays "arriving" ("no key for its first
   epoch") until a member who holds it gives it again; a spec question.
-  **Spaces fetched from contacts:** the account's spaces and the groups
-  this person offered in their relationships, not held here, are asked of
-  every contact, once more two seconds after the first round (the keeps
-  just sent may be what lets the contact give them); a contact gives its
-  relationship with that person, the spaces that person offered it and
-  their successors, even while nothing in them counts for that person
-  (their genesis was the removed key's), so the person's keeps can reach
-  it. **Also after `finish`:** the removed devices' link keys are taken out
-  of every mailbox, the discovery and presence secrets are made new (the
-  presence secret given to each trusted contact again, nearby
-  advertisements restarted with the new one), and the guardians' own logs
-  come back with the copies, so the new device knows its contacts'
-  devices at once.
+  **Spaces fetched from contacts:** for a week after the finish
+  (`AFTER_FINISH`, `finished_ms` in `recovered.json`), each contact is
+  asked for the spaces an offer in the relationship with them names, that
+  are not here and not declined, and for nothing else; asked with
+  reconciles this device starts, which take what comes and serve nothing
+  (a contact asking these sets of this device gets none), and once more
+  two seconds after the first round, once per contact per recovery (the
+  keeps just sent may be what lets the contact give them). Account spaces
+  no offer names are not asked: no contact is known to share them. **What
+  a contact gives a recovered person:** only to a device the new root of
+  a recovery in effect in that person's log (as held here) added, and
+  besides what the space's members allow: their relationship, a space
+  whose genesis they wrote with a key the recovery removed, set aside,
+  that they offered this person, and its successors started the same
+  way, each named by a `succeed` of theirs signed by a removed key, in a
+  space they have not left; so their keeps can reach it. An offer alone
+  gives nothing. **Also after `finish`:** the removed devices' link keys
+  are taken out of every mailbox, the discovery and presence secrets are
+  made new (the presence secret given to each trusted contact again,
+  nearby advertisements restarted with the new one), and each guardian's
+  persona, once it has confirmed the recovery, carries its guardian's own
+  log (one a persona), taken up only for those the account given back
+  lists as contacts, so the new device knows its contacts' devices at
+  once. A lost device's work is kept as spaces arrive only within the
+  same week; after it only `keep-work` keeps more.
 - **Fixed on the way: a contact's log arriving as heads only.** A notice
   too big to carry its entries names heads; a contact's log whose new
   head's parents were missing was left waiting. Such a log now reports

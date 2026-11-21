@@ -2192,31 +2192,31 @@ impl Core {
         open.is_some_and(|s| s.role_of(identity).is_some() && !s.has_left(identity))
     }
 
-    /// The spaces this person's account lists that this device does not
-    /// hold, or holds and cannot open yet: what a device taken up from the
-    /// account alone, after a recovery, fetches from the contacts who share
-    /// them (`hosts.md#restore`, D80).
-    pub fn listed_unheld(&self) -> Vec<SpaceId> {
-        let Some(acc) = self.account().and_then(|a| a.space.as_ref()) else {
-            return Vec::new();
-        };
-        let me = self.me();
-        // and the groups this person offered others, in the relationships
-        // they share: an owner's own groups are not in the account
-        let offered = self
+    /// The spaces `identity` is known to share with this person, by an
+    /// offer either made in their relationship, that this device does not
+    /// hold or cannot open yet, and that this person has not declined: what
+    /// a device taken up from the account alone, after a recovery, asks
+    /// that contact for (`hosts.md#restore`, D80). An owner's own groups
+    /// are not in the account; the offers name them.
+    pub fn unheld_shared_with(&self, identity: &[u8; 32]) -> Vec<SpaceId> {
+        let Some(c) = self
             .contacts()
             .into_iter()
-            .filter_map(|c| self.spaces.get(&c.space)?.space.as_ref())
-            .flat_map(|sp| cardinal_space::group::offers(sp.state()))
-            .filter(|o| Some(o.from) == me)
-            .map(|o| o.space);
+            .find(|c| c.identity == *identity && !c.refused)
+        else {
+            return Vec::new();
+        };
+        let Some(rel) = self.spaces.get(&c.space).and_then(|h| h.space.as_ref()) else {
+            return Vec::new();
+        };
+        let declined = self.declined();
         let mut out: Vec<SpaceId> = Vec::new();
-        for s in cardinal_space::account::spaces(acc.state())
-            .into_iter()
-            .map(|r| r.space)
-            .chain(offered)
-        {
-            if self.spaces.get(&s).is_none_or(|h| h.space.is_none()) && !out.contains(&s) {
+        for o in cardinal_space::group::offers(rel.state()) {
+            let s = o.space;
+            if self.spaces.get(&s).is_none_or(|h| h.space.is_none())
+                && !declined.contains(&s)
+                && !out.contains(&s)
+            {
                 out.push(s);
             }
         }
@@ -2336,33 +2336,83 @@ impl Core {
         !open && self.offers_from(identity).iter().any(|o| o.space == *label)
     }
 
-    /// Whether `label` is this person's relationship with `identity`, or a
-    /// space they offered this person, open here: theirs, even while what made them a member is set aside after
-    /// their recovery and waits for them to keep it (D78).
-    pub fn offered_by_them(&self, identity: &[u8; 32], label: &[u8; 32]) -> bool {
-        // the relationship itself first: after their recovery nothing in it
-        // may count here until their keeps arrive, which it carries
+    /// The keys `identity`'s recovery removed, as their log held here says,
+    /// when one is in effect and `device` is a key its new root added: a
+    /// device of the person after their recovery, and nobody else.
+    pub fn recovered_device(
+        &self,
+        identity: &[u8; 32],
+        device: &KeyId,
+    ) -> Option<std::collections::HashSet<KeyId>> {
+        let log = &self.others.get(identity)?.log;
+        let st = log.state();
+        let r = log
+            .recoveries()
+            .into_iter()
+            .rfind(|r| st.in_effect.contains(&r.entry))?;
+        let info = st.keys.get(device)?;
+        let added = log.get(&info.added_in)?;
+        if added.signer() != r.root {
+            return None;
+        }
+        Some(st.removed().copied().collect())
+    }
+
+    /// Whether a recovered person's device `device` may sync `label` with
+    /// this device although nothing in it counts for them yet
+    /// (`hosts.md#restore`, D78): their relationship with this person, or
+    /// a space they started (its genesis theirs, signed by a key the
+    /// recovery removed, and set aside) that they offered this person, or a
+    /// successor of one that they started the same way, named by a
+    /// `succeed` of theirs, signed so too, in a space they have not left.
+    /// Anything else is theirs only as the space's own members say.
+    pub fn recovered_owns(&self, identity: &[u8; 32], device: &KeyId, label: &[u8; 32]) -> bool {
+        let Some(removed) = self.recovered_device(identity, device) else {
+            return false;
+        };
         if self
             .contacts()
             .iter()
-            .any(|c| c.identity == *identity && c.space == *label)
+            .any(|c| c.identity == *identity && c.space == *label && !c.refused)
         {
             return true;
         }
+        // started by them with a removed key, and set aside
+        let theirs = |id: &SpaceId| -> Option<&cardinal_space::Space> {
+            let sp = self.spaces.get(id)?.space.as_ref()?;
+            let g = sp.dag().get(id)?;
+            let ok = g.author() == *identity
+                && removed.contains(&g.signer())
+                && sp.validity().unwitnessed.contains(id);
+            ok.then_some(sp)
+        };
         let offers = self.offers_from(identity);
-        // or a successor of one, which they wrote ending it
         let mut at = *label;
         for _ in 0..16 {
-            let Some(open) = self.spaces.get(&at).and_then(|h| h.space.as_ref()) else {
+            let Some(sp) = theirs(&at) else {
                 return false;
             };
             if offers.iter().any(|o| o.space == at) {
                 return true;
             }
-            match open.succeeds() {
-                Some(before) => at = before,
-                None => return false,
+            let Some(before) = sp.succeeds() else {
+                return false;
+            };
+            // ended by them, with a removed key, while still in it
+            let Some(old) = theirs(&before) else {
+                return false;
+            };
+            let named = old.succeeds_naming(&at);
+            let by_them = !named.is_empty()
+                && named.iter().all(|x| {
+                    old.dag()
+                        .get(x)
+                        .is_some_and(|e| e.author() == *identity && removed.contains(&e.signer()))
+                });
+            if !by_them || old.has_left(identity) {
+                return false;
             }
+            at = before;
         }
         false
     }
@@ -2393,13 +2443,6 @@ impl Core {
     /// theirs, then the spaces they share (`spaces.md#holding-a-space`).
     pub fn labels_with(&self, identity: &[u8; 32]) -> Vec<[u8; 32]> {
         let mut v: Vec<[u8; 32]> = self.identity_label().into_iter().collect();
-        // spaces the account lists that are not here, as after a recovery:
-        // asked of each contact, and taken from one that is a member
-        for l in self.listed_unheld() {
-            if !v.contains(&l) {
-                v.push(l);
-            }
-        }
         // copies held for one or the other (D80)
         for l in self
             .held_given(identity)
@@ -2411,11 +2454,7 @@ impl Core {
             }
         }
         v.push(identity_log_label(identity));
-        v.extend(
-            self.spaces
-                .keys()
-                .filter(|l| self.shares(identity, l) || self.offered_by_them(identity, l)),
-        );
+        v.extend(self.spaces.keys().filter(|l| self.shares(identity, l)));
         // An offered space not open here yet, to fetch from them.
         for o in self.offers_from(identity) {
             if !v.contains(&o.space) && self.offered_here(identity, &o.space) {

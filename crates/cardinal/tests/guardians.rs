@@ -995,6 +995,7 @@ fn a_recovery_asks_before_keeping_the_owners_successions() {
     let cy = person(root.path(), "cy");
     meet(&laptop, &bo, "Ana");
     meet(&laptop, &cy, "Ana");
+    meet(&bo, &cy, "Bo");
     // a group of the three, and cy taken out of it
     let made = ask(
         &laptop,
@@ -1089,5 +1090,21 @@ fn a_recovery_asks_before_keeping_the_owners_successions() {
     assert!(
         r["successions"].as_array().is_some_and(Vec::is_empty),
         "{r}"
+    );
+    // Cy, taken out, is not given the successor by bo: what bo gives the
+    // recovered person's device it gives nobody else.
+    let bo_at = at.clone();
+    for _ in 0..3 {
+        let _ = cy.try_cli(&["contacts", "Bo", "--look", "--at", &bo_at]);
+        std::thread::sleep(Duration::from_secs(2));
+    }
+    let spaces = reply(&cy, &json!({"cmd": "status"}))["spaces"].clone();
+    let short = &g2[..16];
+    assert!(
+        spaces.as_array().is_some_and(|a| {
+            a.iter()
+                .all(|x| x["id"] != short || x["entries"].as_u64() == Some(0))
+        }),
+        "{spaces}"
     );
 }

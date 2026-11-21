@@ -94,6 +94,50 @@ struct Recovered {
     /// Those answered, kept or not, never asked again.
     #[serde(default)]
     answered: Vec<String>,
+    /// When the recovery finished, by this device's clock (ms): the spaces
+    /// missing are asked of contacts, and a lost device's work kept as it
+    /// arrives, for [`AFTER_FINISH`] from then. None in a file from before.
+    #[serde(default)]
+    finished_ms: Option<u64>,
+    /// The contacts (hex) asked a second time, once per recovery.
+    #[serde(default)]
+    asked_again: Vec<String>,
+}
+
+/// How long after a recovery finished the spaces missing are asked of
+/// contacts, and what a lost device wrote is kept as each space arrives.
+/// After that, only the person's own `keep-work` keeps more.
+pub const AFTER_FINISH: std::time::Duration = std::time::Duration::from_secs(7 * 24 * 3600);
+
+impl Recovered {
+    fn fresh(&self) -> bool {
+        self.finished_ms.is_some_and(|f| {
+            crate::core::now_ms() < f.saturating_add(AFTER_FINISH.as_millis() as u64)
+        })
+    }
+}
+
+/// The spaces to ask `who` for, after this person's recovery and for a
+/// while: those they are known to share and that are not here.
+pub fn asks_of(d: &Daemon, who: &[u8; 32]) -> Vec<SpaceId> {
+    match load_recovered(d) {
+        Some(r) if r.fresh() => d.core().unheld_shared_with(who),
+        _ => Vec::new(),
+    }
+}
+
+/// Whether `who` is to be asked a second time, which is once per recovery.
+pub fn ask_again_once(d: &Daemon, who: &[u8; 32]) -> bool {
+    let Some(mut r) = load_recovered(d) else {
+        return false;
+    };
+    let h = hex::encode(who);
+    if !r.fresh() || r.asked_again.contains(&h) {
+        return false;
+    }
+    r.asked_again.push(h);
+    save_recovered(d, &r);
+    true
 }
 
 fn load(d: &Daemon) -> Option<Under> {
@@ -740,6 +784,7 @@ pub async fn finish(
             pair_again: u.forgotten.clone(),
             forgotten: u.forgotten.clone(),
             lost_at,
+            finished_ms: Some(crate::core::now_ms()),
             ..Recovered::default()
         },
     );
@@ -772,6 +817,7 @@ pub async fn finish(
             pair_again: pair_again.clone(),
             forgotten: u.forgotten.clone(),
             lost_at,
+            finished_ms: Some(crate::core::now_ms()),
             ..Recovered::default()
         },
     );
@@ -933,8 +979,11 @@ pub fn tend_recovered(d: &Arc<Daemon>) {
         .filter_map(|k| hex::decode(k).ok()?.try_into().ok())
         .collect();
     let mut changed = false;
+    // kept as spaces arrive only for a while after the finish: then by the
+    // person's own `keep-work` (a thief sets the clock those entries give)
+    let fresh = r.fresh();
     for k in &keys {
-        if let Some(up_to) = r.lost_at {
+        if let (true, Some(up_to)) = (fresh, r.lost_at) {
             let written = d.core().keep_work_but_successions(k, up_to);
             match written {
                 Ok(written) => {
@@ -1159,8 +1208,14 @@ fn guardians_logs(h: &Helper, who: &EntryId) -> Vec<([u8; 32], Vec<Vec<u8>>)> {
         let Some(sp) = core.spaces.get(&c.space).and_then(|x| x.space.as_ref()) else {
             continue;
         };
+        // one log a persona: its guardian's own
+        let mut theirs: Option<[u8; 32]> = None;
         for x in relationship::carried(sp) {
             if x.author == c.identity && x.identity != *who {
+                if theirs.is_some_and(|t| t != x.identity) {
+                    continue;
+                }
+                theirs = Some(x.identity);
                 by.entry(x.identity).or_default().push(x.entry);
             }
         }
@@ -1292,6 +1347,20 @@ mod tests {
     use super::*;
     use cardinal_crypto::HybridKeyPair;
     use cardinal_identity::{Created, DeviceKeys, Power};
+
+    #[test]
+    fn after_the_window_nothing_more_is_asked_or_kept() {
+        let now = crate::core::now_ms();
+        let at = |f: Option<u64>| Recovered {
+            finished_ms: f,
+            ..Recovered::default()
+        };
+        assert!(at(Some(now)).fresh());
+        let past = AFTER_FINISH.as_millis() as u64 + 1000;
+        assert!(!at(Some(now - past)).fresh());
+        // a file from before the window was kept asks nothing
+        assert!(!at(None).fresh());
+    }
 
     /// A person with a host, another device, and an admin.
     fn person() -> (IdentityLog, Vec<KeyId>) {
