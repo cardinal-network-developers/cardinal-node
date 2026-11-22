@@ -3023,6 +3023,50 @@ mod tests {
         assert_eq!(h.named(&g).len(), 1);
     }
 
+    /// D81. The field is the spec's `no record`, whose key differs from
+    /// the `no-record` this implementation wrote before (an extension's key
+    /// is the first 7 bytes of its name): a list emptied by an older
+    /// device, resting on a record under the old name, still waits for it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_no_record_under_the_old_name_is_still_read() {
+        assert_ne!(
+            relationship::no_record_key(),
+            relationship::old_no_record_key()
+        );
+        assert_eq!(
+            relationship::no_record_key().to_be_bytes()[1..],
+            *b"no reco"
+        );
+        let h = Home::new().await;
+        h.hosts();
+        let elsewhere = [9u8; 32];
+        let v = Value::Record(Record::new().with(1, elsewhere));
+        let old = cardinal_space::SpaceOp::set(
+            cardinal_space::reach_node_id(&h.me),
+            relationship::old_no_record_key(),
+            Some(v),
+        );
+        let ops = vec![relationship::set_reach(&h.me, &[]), old];
+        h.d.write_and_push(&h.rel, ops).unwrap();
+        {
+            let core = h.d.core();
+            let sp = core.spaces[&h.rel].space.as_ref().unwrap();
+            assert_eq!(relationship::rests_on(sp.state(), &h.me), vec![elsewhere]);
+        }
+        for _ in 0..2 {
+            write_reach(&h.d, &h.rel).await.unwrap();
+            assert!(h.named(&h.rel).is_empty(), "filled in before the record");
+        }
+        // What this device writes is under the spec's name.
+        say_reach(&h.d, &h.rel, false).await.unwrap();
+        let core = h.d.core();
+        let sp = core.spaces[&h.rel].space.as_ref().unwrap();
+        assert!(!sp
+            .state()
+            .reach_values(&h.me, relationship::no_record_key())
+            .is_empty());
+    }
+
     /// D75, review H1. Another of the person's devices says no: its empty
     /// list reaches this host before the account entry that records the
     /// no (as through a contact, while the host and the phone are not

@@ -2271,7 +2271,7 @@ asks for around that is not built yet.
     was set after the cut and the record still says the no, their device
     sets the successor's list to it: empty, where the old list is empty
     and the record says "no hosts here"; without each host the record
-    takes out that the old list does not name, otherwise. The `no-record`
+    takes out that the old list does not name, otherwise. The `no record`
     the old list rested on goes beside it. Nothing is written where the
     successor's list says so already, and a yes clears the record, so a
     list set since by a yes is never emptied. This is the record emptying
@@ -2284,19 +2284,22 @@ asks for around that is not built yet.
     to an empty list too. A list never set is the joining, and names
     every host of theirs not recorded as a no. No device adds another to
     a list already set.
-  - **The list says which record it rests on** (not in the text). The
-    list a no writes, and the one taking a host out writes, carry beside
-    them in the reach node an extension field `no-record` (key: the
-    first 7 bytes of the name, `evolution.md#fields-in-a-base-node`),
-    `{1: the id of the account entry that records the no}`. A host names
-    itself to a list that is set only once its account holds every entry
-    that field names; then it goes by the record. The two are in two
-    spaces and may arrive in either order, through different devices: a
-    host that had the list and not the record would otherwise fill in a
-    no, for good. A list emptied with no such field (by mistake, or
-    before this) is filled at once. The field names an account entry to
-    every member, which says nothing of what is in it. **Spec question:**
-    should the spec carry this, or tie the list to the record otherwise?
+  - **The list says which record it rests on**
+    (`hosts.md#telling-others-where-to-reach-you`). The list a no writes,
+    and the one taking a host out writes, carry beside them in the reach
+    node the extension field `no record` (key: the first 7 bytes of the
+    name, `evolution.md#fields-in-a-base-node`), `{1: the id of the
+    account entry that records the no}`. A host names itself to a list
+    that is set only once its account holds every entry that field
+    names; then it goes by the record. The two are in two spaces and may
+    arrive in either order, through different devices: a host that had
+    the list and not the record would otherwise fill in a no, for good. A
+    list emptied with no such field (by mistake, or before this) is
+    filled at once. The field names an account entry to every member,
+    which says nothing of what is in it. **Fixed (D81):** until 0.1.18
+    this node wrote the field as `no-record`, whose first 7 bytes, and so
+    whose key, differ from the spec's; it writes `no record` now and reads
+    both, the old one first where only the last counts.
   - **A `set` key wider than 32 bits** was written cut down to 32 bits by
     `SpaceOp::set`, which an extension's key (56 bits) is. It is written
     whole now.

@@ -642,8 +642,11 @@ impl Core {
                 continue;
             }
             let was = relationship::reach_of(old, &me);
-            let rests: Option<EntryId> = after(relationship::no_record_key())
+            // under the name this implementation wrote before, or the
+            // spec's, which is written now and so comes last
+            let rests: Option<EntryId> = after(relationship::old_no_record_key())
                 .into_iter()
+                .chain(after(relationship::no_record_key()))
                 .filter_map(|v| {
                     v.value
                         .as_ref()?

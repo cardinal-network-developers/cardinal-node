@@ -206,17 +206,23 @@ pub fn extension_key(name: &str) -> u64 {
     u64::from_be_bytes(b)
 }
 
-/// The reach node's extension field `no-record` (this implementation's,
+/// The reach node's extension field `no record` (`hosts.md#telling-others-where-to-reach-you`,
 /// D75): `{1: account entry id}`, the entry of the person's account that
 /// records the no the list written beside it rests on ("no hosts here",
 /// or "not this host here"). Only the person's own devices make anything
 /// of it: a host names itself to that list only once its account holds
 /// that entry, whatever order the two spaces arrive in.
 pub fn no_record_key() -> u64 {
+    extension_key("no record")
+}
+
+/// The key this implementation wrote the same field under before 0.1.18,
+/// from the name `no-record`: still read, never written.
+pub fn old_no_record_key() -> u64 {
     extension_key("no-record")
 }
 
-/// `set` of the `no-record` field: the list beside it rests on `entry`
+/// `set` of the `no record` field: the list beside it rests on `entry`
 /// of the person's account.
 pub fn set_rests_on(author: &IdentityId, entry: &EntryId) -> SpaceOp {
     let v = Value::Record(Record::new().with(1, *entry));
@@ -224,9 +230,11 @@ pub fn set_rests_on(author: &IdentityId, entry: &EntryId) -> SpaceOp {
 }
 
 /// The account entries `who`'s lists here rest on, by every value of the
-/// `no-record` field.
+/// `no record` field, under either name.
 pub fn rests_on(state: &State, who: &IdentityId) -> Vec<EntryId> {
-    let values = state.reach_values(who, no_record_key()).iter();
+    let values = [old_no_record_key(), no_record_key()]
+        .into_iter()
+        .flat_map(|k| state.reach_values(who, k).iter());
     let ids = values.filter_map(|v| v.value.as_ref()?.as_record()?.get(1)?.as_bytes());
     ids.filter_map(|b| b.try_into().ok()).collect()
 }
