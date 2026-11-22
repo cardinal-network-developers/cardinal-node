@@ -1065,16 +1065,16 @@ Readings:
   carried message up to the one it stands at, by rank. A canonical state
   in which a parent is not a node it records, or a node is its own
   ancestor, is refused.
-- **Spec question: who wrote a carried value.** A group counts only an
-  admin's say on its name, its introductions and its member nodes, and
-  a canonical state does not say who wrote a value, so a value a writer
-  set on one of those, which counted for nothing, would count after any
-  succession. Here a carried value counts for nothing there by itself:
-  the owner's first entry in the successor sets each of those fields
-  again to what the old space resolved (`group::reassert_ops`), and that
-  entry is nobody's work to post again. Until it arrives a follower shows
-  no group name. The specification could instead say that the state at a
-  cut leaves out what does not count, or record each value's author.
+- **Admin-only values do not carry** (designer, ASK 9 = b, 2026-11-22;
+  `profiles.md#group`). A group counts only an admin's say on its name,
+  its introductions and its member nodes, and a canonical state does not
+  say who wrote a value, so in a successor the values those fields carried
+  count for nothing. The owner sets each of them again, to what the old
+  space resolved (`group::reassert_ops`), in the successor's **genesis**,
+  beside its `add_member`s, so a follower shows the group's name from the
+  genesis on. (Before, in the owner's first entry after it, and a follower
+  showed no name until that came.) A successor written before this, whose
+  first entry did it, still reads, and that entry is still nobody's work.
 - **Whom a successor names.** Every member of the group who has not
   left, with the highest role they hold, but whoever is taken out, and
   with the lower role for whoever is lowered. A member who had left is
@@ -1150,8 +1150,9 @@ Readings:
     reconciled it with a peer that holds it since it followed, or since
     it started: who is there is known only then, since someone added
     after the genesis may not have come with it. Entries of control ops
-    alone (a `succeed`, a `rotate`) and the owner's first entry in a
-    successor are nobody's work, and are neither posted nor held back.
+    alone (a `succeed`, a `rotate`), and the owner's first entry in a
+    successor written before the genesis set the admin-only values, are
+    nobody's work, and are neither posted nor held back.
   - "All were members of the space the work was written in" is read as:
     every member of the space that stands was ever a member of that space.
     Otherwise the work is held back, `groups` says how much, and

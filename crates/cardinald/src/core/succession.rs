@@ -447,12 +447,18 @@ impl Core {
             }
         }
         let refs: Vec<&HybridPublicKey> = keys.iter().collect();
-        let ops = named
+        let mut ops: Vec<SpaceOp> = named
             .iter()
             .map(|(w, r)| SpaceOp::add_member(*w, *r))
             .collect();
         let profile = sp.profile();
         let initial = State::from_canonical(profile, &Record::decode(&canonical)?)?;
+        // What only an admin's say sets counts for nothing as carried: the
+        // owner sets it again in the genesis itself, so there is no gap
+        // (`profiles.md#group`, "These values do not carry").
+        if profile == cardinal_space::group::GROUP {
+            ops.extend(cardinal_space::group::reassert_ops(sp, &initial));
+        }
         let (new, genesis) = Space::create_successor(
             profile,
             sp.policy().clone(),
@@ -473,29 +479,13 @@ impl Core {
             .filter(|w| !ids.contains(w))
             .collect();
         let local_name = cardinal_space::group::name(sp);
-        let reassert = match profile {
-            cardinal_space::group::GROUP => {
-                let carried = State::from_canonical(profile, &Record::decode(&canonical)?)?;
-                cardinal_space::group::reassert_ops(sp, &carried)
-            }
-            _ => Vec::new(),
-        };
         // The successor first, so that nothing names what is not here.
         let dir = Holder::dir(&self.paths, &new_id);
         std::fs::create_dir_all(&dir)?;
         crate::paths::write_private(&dir.join("initial-state.bin"), &canonical, 0o600)?;
         let genesis_bytes = genesis.encode();
         self.ingest_space(new_id, std::slice::from_ref(&genesis_bytes))?;
-        let mut new_entries = vec![genesis_bytes.clone()];
-        if !reassert.is_empty() {
-            let ident = self.identity.as_ref().expect("checked above");
-            let h = self.spaces.get_mut(&new_id).expect("held");
-            let (id, bytes) = h.write_one(ident, &self.keys, reassert)?;
-            h.notes.not_work.insert(hex::encode(id));
-            h.save_notes();
-            new_entries.push(bytes);
-            self.settle(&new_id);
-        }
+        let new_entries = vec![genesis_bytes.clone()];
         let ident = self.identity.as_ref().expect("checked above");
         let h = self.spaces.get_mut(space).expect("held");
         let succeed = SpaceOp::succeed_with(new_id, &left_out, None);
