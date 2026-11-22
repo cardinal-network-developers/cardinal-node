@@ -11,7 +11,9 @@
 //! - its own devices', `k = derive("discovery", discovery secret)`;
 //! - its trusted contacts', `k = derive("presence", presence secret)`;
 //! - `k = derive("one-time", secret)`, while an invitation that carries the
-//!   secret is outstanding.
+//!   secret is outstanding;
+//! - `k = derive("pairing channel", varint(channel))`, while a pairing code
+//!   is shown ([`pairing_key`]).
 //!
 //! Whoever sees one checks every tag against every key they hold.
 //!
@@ -94,6 +96,16 @@ pub enum TagType {
 /// `k = derive("one-time", secret)`: the key of a one-time tag.
 pub fn one_time_key(secret: &[u8]) -> Zeroizing<[u8; 32]> {
     derive(Purpose::OneTime, secret)
+}
+
+/// `k = derive("pairing channel", varint(channel))`: the key of the tag a
+/// device showing a pairing code advertises. Made from the channel alone,
+/// so anyone can make it and it says no more than the LAN's `c=`: someone
+/// here is pairing on that channel. The code's words never go into a tag.
+pub fn pairing_key(channel: u16) -> Zeroizing<[u8; 32]> {
+    let mut v = Vec::new();
+    cardinal_encoding::write_varint(channel as u64, &mut v);
+    derive(Purpose::PairingChannel, &v)
 }
 
 /// One tag: `nonce (8) || first8(BLAKE3.keyed_hash(k, nonce))`, or as
@@ -333,6 +345,62 @@ impl<T: AsyncRead + AsyncWrite + Send + Unpin + 'static> Channel for T {}
 
 /// A channel, boxed.
 pub type BoxChannel = Box<dyn Channel>;
+
+/// A channel whose first bytes were read already, to look at them, and
+/// are given back first.
+pub struct Prefixed {
+    head: Vec<u8>,
+    at: usize,
+    inner: BoxChannel,
+}
+
+impl Prefixed {
+    /// `inner`, with `head` read from it before.
+    pub fn new(head: Vec<u8>, inner: BoxChannel) -> Prefixed {
+        Prefixed { head, at: 0, inner }
+    }
+}
+
+impl AsyncRead for Prefixed {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<io::Result<()>> {
+        if self.at < self.head.len() {
+            let n = buf.remaining().min(self.head.len() - self.at);
+            let at = self.at;
+            buf.put_slice(&self.head[at..at + n]);
+            self.at += n;
+            return std::task::Poll::Ready(Ok(()));
+        }
+        Pin::new(&mut self.inner).poll_read(cx, buf)
+    }
+}
+
+impl AsyncWrite for Prefixed {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<io::Result<usize>> {
+        Pin::new(&mut self.inner).poll_write(cx, buf)
+    }
+
+    fn poll_flush(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<io::Result<()>> {
+        Pin::new(&mut self.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<io::Result<()>> {
+        Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
+}
 
 /// A future a [`Radio`] returns.
 pub type RadioFuture<'a, T> = Pin<Box<dyn Future<Output = io::Result<T>> + Send + 'a>>;

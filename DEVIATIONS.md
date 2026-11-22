@@ -119,7 +119,8 @@ below, each under its section.
   `derive("pair", K)`, and `derive("invite", K)` alike (`Isk::key32`).
 - **Spec ambiguity: the CPace channel identifier CI.** contact.md names the
   password, associated data, and session identifier, but not CI. Chose an
-  empty CI (the session identifier already binds both endpoints).
+  empty CI (the session identifier, from both sides' random values, is
+  unique to the attempt). Now in the text.
 - **Spec ambiguity: password encoding.** Chose PRS = the UTF-8 bytes of the
   three lowercase words joined by single spaces. The words are ASCII, so
   RFC 8265 preparation changes nothing.
@@ -1379,13 +1380,16 @@ Not implemented yet (the next milestone):
   English list (only "harbor" is). Codes here use only list words, e.g.
   `4-anchor-harbor-quit`; the parser rejects other words. Parsing accepts
   any case and spaces or hyphens between the parts.
-- **Spec ambiguity: the endpoints in the session identifier.** Chose: the
-  shower's endpoint is `{1: 1 (UDP), 2: the shower's IP address on the
-  route toward the typer, 3: the advertised pairing port}`, and the
-  typer's is `{1: 1, 2: the typer's IP address, 3: its pairing socket's
-  port}`, i.e. the UDP addresses each side's datagrams carry. This breaks
-  through NAT or on multi-homed hosts where the two sides see different
-  addresses; the spec could bind the advertised record instead.
+- **The session identifier takes no address** (ASK 6 = b, now in
+  `contact.md`): each attempt starts with the typer's `{0: 4, 1: r}` and
+  the shower's answer, 16 random bytes each, and the session id is
+  `BLAKE3("cardinal 1 pair" || varint(channel) || shower's r || typer's
+  r)`, on every carrier. A start is no guess: the shower keeps the last 16
+  starts, one per sender, answers a start sent again with the same value,
+  and takes a share only from a sender whose start it answered. Before, the
+  UDP addresses each side's datagrams carried went in, which broke on
+  dual-stack sockets and several addresses, and could not work over
+  Bluetooth.
 - **Spec ambiguity: the confirmation order.** The shower sends its share
   and then its tag at once; the typer always sends its tag, even when the
   shower's tag is wrong, so that a wrong code counts against the code.
@@ -1393,12 +1397,19 @@ Not implemented yet (the next milestone):
   in which the shower sent its tag and no valid typer tag followed (another
   typer started, or 10 seconds passed). After three, `Shower::run` returns
   `TooManyAttempts` and the caller shows a new code.
-- **Spec ambiguity: the power in the proof of possession.** The proof
-  binds a power, but the pairing message carries none, and the admin
-  decides the power afterwards. Chose: the new device signs for
-  `LocalDevice::join_power` (device by default); the typer verifies against
-  device power, then admin, and reports which in `NewDevice::power`. The
-  spec should carry the power or fix it to device.
+- **The admin device names the power** (ASK 5 = a, now in `contact.md`):
+  the typer's information carries field 7, 1 device or 2 admin (`cardinal
+  pair <code> --admin`, `pair-type`'s `admin`); the new device signs its
+  proof for exactly that and shows it (`pair-status` `power`, "This device
+  will join as an admin device"), and the typer accepts only a proof for
+  the power it sent (else `BadProof`, "did not agree to join at the power
+  this device chose"). A typer's information to a device with no identity
+  without field 7, or with another value, ends the pairing with a visible
+  error on the new device. The new device no longer chooses: `cardinal
+  pair --admin` without a code is refused, and `pair-show`'s `admin`
+  (field 1) is no longer used, so a client that sends it gets an error.
+  Field 7 is sent whenever the typer adds devices, also to a shower that
+  has an identity, which ignores it.
 - **Proofs only from a device without an identity.** When two people meet,
   neither sends a proof (a proof would let the other list your device in
   their own log). A typer must have an identity.
@@ -1407,11 +1418,14 @@ Not implemented yet (the next milestone):
   about 1450 bytes, more than the link's 1232: it relies on the LAN's MTU
   or IP fragmentation.
 - **Retransmission.** Lost pairing datagrams are retransmitted every 300
-  ms by the typer; the shower answers duplicates with its earlier replies.
+  ms by the typer (its start, its share, its tag with its information);
+  the shower answers duplicates with its earlier replies. Over a channel
+  nothing is sent twice.
 - **The link session after pairing.** The typer initiates to the shower's
   link endpoint (info field 4) with both full link keys and the single-use
   secret `derive("invite", K)`; each side expects the other's signing key
-  (and identity, if any) from the pairing.
+  (and identity, if any) from the pairing. Over Bluetooth it runs on the
+  pairing's own channel.
 - **mDNS** is a minimal DNS-SD over IPv4 multicast: unsolicited
   announcements (PTR, SRV, TXT, and A when known), answers to PTR queries,
   and browsing; no probing, conflict resolution, known-answer
@@ -1574,26 +1588,30 @@ Not implemented yet (the next milestone):
     handshake over a channel to the device that has it. The invitation's
     endpoint is left as it was; with no address at all `invite` still
     fails ("no address to give").
-  - **Pairing codes carry no one-time secret** (33 bits, for CPace), so
-    no one-time tag is made from one: offline, 2^33 keyed hashes recover
-    the code from the tag, and whoever has it can pair. Pairing over
-    Bluetooth is not done (spec question).
-  - **Endpoints**: carrier the 8-byte name, address the 6 bytes, port the
-    PSM (`EndpointAddr::ble`). The record does not say random or public;
-    read as random. Never written in a reach node, and not yet passed in
-    rendezvous.
-  - **"On while open"** is while a client watches with
-    `{"cmd": "watch", "window": true}`; a watch without it does not count
-    (Android's service watches with no window open). With `open` and no
-    window, a CLI-only device has Bluetooth off.
-  - **Android's bridge socket** (`CARDINAL_BLE_BRIDGE`) is mode 0600, each
-    connection's peer must be of the service's user, and the connection
-    that drives the radio says so in its first line (`{"control": true}`).
-  - **Channels are opened at security level low**, with no Bluetooth
-    pairing (Android: the insecure L2CAP calls): the link session proves
-    and encrypts.
-  - **The setting is this device's** (`config.toml` `bluetooth`), not the
-    account's: each device has its own radio and battery.
+  - **Pairing over Bluetooth** (ASK 1 = b, now in `contact.md` and
+    `carriers/ble.md`). The device showing a code advertises, with its
+    other tags, one made from the channel alone, `k = derive("pairing
+    channel", varint(channel))` (context `cardinal 1 pairing channel`,
+    kept out of `Purpose::ALL` and its vectors like `one-time`), so it
+    says no more than `c=` on a LAN; the words never go into a tag. While
+    the code shows, the first message on each channel opened to the device
+    says what it carries: a record (header's low three bits 5) is pairing,
+    anything else a link packet, handed to the link with the message given
+    back first. Pairing messages are prefixed by their length,
+    little-endian, as link packets over a stream; the link session follows
+    on the same channel. The shower counts failed attempts over UDP and
+    channels together against the one code, one attempt at a time; at most
+    4 channels are read at once, each closed after 15 s with no message,
+    and a channel whose attempt failed is closed. The typer (`cardinal pair
+    <code>` without `--at`) looks on the LAN and, where Bluetooth is on,
+    for the tag for 20 s, whichever answers first. Recovery invitations
+    over Bluetooth are out (decision (2): recovery needs a network).
+  - **Reading: dialling again after joining.** Over Bluetooth the new
+    device knows no address of the admin's to reconnect to as a member, so
+    the admin dials it again over Bluetooth, where it was seen, once the
+    pairing session ends (up to 10 tries a second apart), unless a
+    session came otherwise; the new device also tries the admin's IP
+    endpoint from field 4, as on a LAN.
 - **Reach: what goes where** (`profiles.md#reach`, `relationship.rs`).
   Field 1 holds host entries; field 2 the presence secret, only in a
   relationship; any other field of the node is untouched by a `set` of

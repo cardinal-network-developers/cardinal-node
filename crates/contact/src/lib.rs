@@ -3,8 +3,9 @@
 //! invitation record.
 //!
 //! - [`code`]: codes like `4-amber-harbor-quiet`.
-//! - [`pairing`]: the pairing exchange over UDP ([`pairing::Shower`],
-//!   [`pairing::pair_typer`]); its result opens a link session with the
+//! - [`pairing`]: the pairing exchange over UDP or a Bluetooth channel
+//!   ([`pairing::Shower`], [`pairing::pair_typer`],
+//!   [`pairing::pair_typer_on`]); its result opens a link session with the
 //!   pairing secret and, when the shower has no identity, yields the
 //!   [`pairing::NewDevice`] an admin device adds with `add_key`.
 //! - [`discovery`] over a minimal [`mdns`]: rotating, unlinkable tags only
@@ -25,7 +26,8 @@ pub use code::PairingCode;
 pub use endpoint::{Address, EndpointAddr};
 pub use invitation::{ContactMessage, Invitation};
 pub use pairing::{
-    pair_typer, DeviceEnroller, LocalDevice, NewDevice, PairRole, Paired, PeerInfo, Shower,
+    pair_typer, pair_typer_on, DeviceEnroller, LocalDevice, NewDevice, PairRole, Paired, PeerInfo,
+    Shower,
 };
 
 /// Errors from pairing, discovery, and invitations.

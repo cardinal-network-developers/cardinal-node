@@ -550,3 +550,97 @@ fn a_radio_too_old_for_extended_advertisements_stays_off_and_says_so() {
     assert!(said.contains("Wi-Fi and the internet still work"), "{said}");
     stop(&mut old);
 }
+
+/// Starts a device as [`start`] does, with multicast DNS on a port of its
+/// own: nobody else hears it, so only Bluetooth finds a pairing.
+fn start_alone(d: &mut Dev) {
+    let log = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(d.home.join("daemon.log"))
+        .unwrap();
+    let mut c = d.cmd();
+    c.args(["daemon", "--no-mount", "--no-discovery", "--name", d.name])
+        .arg("--listen")
+        .arg(format!("127.0.0.1:{}", d.port))
+        .arg("--mdns-port")
+        .arg(free_port().to_string());
+    let child = c.stdout(Stdio::null()).stderr(log).spawn().unwrap();
+    d.child = Some(child);
+    wait("the service up", 20, || {
+        d.try_cli(&["status"]).status.success()
+    });
+}
+
+#[test]
+fn a_new_device_is_paired_over_bluetooth_at_the_power_the_admin_chose() {
+    let root = tempfile::tempdir().unwrap();
+    let ether = root.path().join("ether");
+    let mut a = dev(root.path(), "laptop", &ether);
+    let mut b = dev(root.path(), "phone", &ether);
+    start_alone(&mut a);
+    start_alone(&mut b);
+    a.cli(&["init", "--yes", "--name", "Ana"]);
+    always(&a);
+    always(&b);
+    // The new device says nothing of the power: the admin device does.
+    let refused = b.try_cli(&["pair", "--admin"]);
+    assert!(!refused.status.success());
+    assert!(String::from_utf8_lossy(&refused.stderr).contains("where you type the code"));
+    let mut shower = b
+        .cmd()
+        .arg("pair")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .unwrap();
+    let mut out = BufReader::new(shower.stdout.take().unwrap());
+    let mut code = None;
+    let mut line = String::new();
+    while code.is_none() {
+        line.clear();
+        assert!(out.read_line(&mut line).unwrap() > 0, "pair ended early");
+        if let Some(c) = line.trim().strip_prefix("cardinal pair ") {
+            code = Some(c.to_owned());
+        }
+    }
+    // Over Bluetooth: the tag made from the code's channel.
+    let ads: Vec<_> = std::fs::read_dir(ether.join("ads")).unwrap().collect();
+    assert!(
+        !ads.is_empty(),
+        "the new device advertises the code's channel"
+    );
+    let typed = a.try_cli(&["pair", &code.unwrap(), "--admin"]);
+    let said = String::from_utf8_lossy(&typed.stdout).to_string();
+    assert!(
+        typed.status.success() && said.contains("Added"),
+        "{said}{}\n{}",
+        String::from_utf8_lossy(&typed.stderr),
+        a.log()
+    );
+    assert!(
+        a.log()
+            .contains("looking for the device showing the pairing code over Bluetooth"),
+        "{}",
+        a.log()
+    );
+    let mut rest = String::new();
+    std::io::Read::read_to_string(&mut out, &mut rest).unwrap();
+    assert!(shower.wait().unwrap().success(), "{rest}\n{}", b.log());
+    assert!(
+        rest.contains("This device will join as an admin device"),
+        "{rest}"
+    );
+    // It signed for admin, and is one.
+    let v = ask(&a, json!({"cmd": "devices"}));
+    let phone = v["devices"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|x| x["name"] == "phone")
+        .cloned()
+        .unwrap_or_else(|| panic!("{v}"));
+    assert_eq!(phone["power"], "admin", "{v}");
+    stop(&mut a);
+    stop(&mut b);
+}

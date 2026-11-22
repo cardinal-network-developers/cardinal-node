@@ -558,6 +558,7 @@ pub async fn restore(d: &Arc<Daemon>, words: &str, at: &str, key: &str) -> anyho
         admin_name: at.to_owned(),
         admin_key: host_key,
         admin_addr: Some(addr),
+        power: None,
     };
     d.on_session(s.clone());
     // The log, then this device in it, signed by the root.

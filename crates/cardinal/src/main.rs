@@ -103,8 +103,9 @@ enum Cmd {
         /// network (shown next to the code).
         #[arg(long, value_name = "IP:PORT")]
         at: Option<String>,
-        /// Make the new device an admin device (it can add and remove
-        /// devices). Give it on both devices.
+        /// Add the new device as an admin device (it can add and remove
+        /// devices). Give it where you type the code: the new device is
+        /// told, and agrees to exactly that.
         #[arg(long)]
         admin: bool,
         /// What to call the new device (default: its machine's name). Your
@@ -2007,7 +2008,13 @@ async fn pair(
         );
         return Ok(());
     }
-    let mut req = json!({"cmd": "pair-show", "admin": admin});
+    if admin {
+        anyhow::bail!(
+            "give --admin where you type the code: `cardinal pair <code> --admin` on the \
+             device you already use. This device is told, and shows it."
+        );
+    }
+    let mut req = json!({"cmd": "pair-show"});
     if let Some(d) = &device {
         req["device"] = json!(d);
     }
@@ -2033,14 +2040,21 @@ async fn pair(
     loop {
         tokio::time::sleep(Duration::from_millis(400)).await;
         let s = call(paths, json!({"cmd": "pair-status"})).await?;
-        match s["state"].as_str().unwrap_or("") {
-            "joining" if !said_joining => {
-                said_joining = true;
-                println!(
-                    "Paired with \"{}\". Receiving your identity...",
-                    s["admin"].as_str().unwrap_or("your device")
-                );
-            }
+        let state = s["state"].as_str().unwrap_or("");
+        // Said once, even where joining was over before it was asked.
+        if (state == "joining" || state == "joined") && !said_joining {
+            said_joining = true;
+            let power = match s["power"].as_str() {
+                Some("admin") => "an admin device (it can add and remove devices)",
+                _ => "a device",
+            };
+            println!(
+                "Paired with \"{}\". This device will join as {power}. Receiving your \
+                 identity...",
+                s["admin"].as_str().unwrap_or("your device")
+            );
+        }
+        match state {
             "joined" => {
                 if s["files"].as_bool() == Some(true) {
                     let st = call(paths, json!({"cmd": "status"})).await?;
@@ -2549,8 +2563,8 @@ async fn client(cmd: Cmd) -> anyhow::Result<()> {
             if admins == 0 {
                 println!(
                     "None of your devices is an admin device now, so adding a device will ask for\n\
-                     your recovery words. To have one again, run `cardinal pair --admin` on a new\n\
-                     device and type its code here."
+                     your recovery words. To have one again, run `cardinal pair` on a new device\n\
+                     and type its code here with `cardinal pair <code> --admin`."
                 );
             }
             Ok(())

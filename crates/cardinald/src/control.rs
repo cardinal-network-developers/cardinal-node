@@ -331,6 +331,16 @@ fn regard(req: &Value) -> account::Regard {
     }
 }
 
+/// The power a pairing joins this device at, as `pair-status` says it:
+/// `device` or `admin`, as the admin device named it.
+fn joins_as(p: Option<cardinal_identity::Power>) -> Value {
+    match p {
+        Some(cardinal_identity::Power::Admin) => json!("admin"),
+        Some(cardinal_identity::Power::Device) => json!("device"),
+        _ => Value::Null,
+    }
+}
+
 fn power_name(p: Power) -> &'static str {
     match p {
         Power::Device => "device",
@@ -424,12 +434,11 @@ async fn handle(d: &Arc<Daemon>, req: &Value) -> anyhow::Result<Value> {
             Ok(json!({"entries": n}))
         }
         "pair-show" => {
-            let admin = req.get("admin").and_then(|v| v.as_bool()).unwrap_or(false);
             // what to call this device, where the window knows better
             if let Some(name) = device_name(req)? {
                 rename_this_device(d, &name)?;
             }
-            let s = crate::pair::show(d, admin).await?;
+            let s = crate::pair::show(d).await?;
             Ok(
                 json!({"code": s.code, "addrs": s.addrs.iter().map(|a| a.to_string()).collect::<Vec<_>>() }),
             )
@@ -439,12 +448,15 @@ async fn handle(d: &Arc<Daemon>, req: &Value) -> anyhow::Result<Value> {
             Ok(match ps {
                 PairState::Idle => json!({"state": "idle"}),
                 PairState::Showing { code } => json!({"state": "showing", "code": code}),
-                PairState::Joining { admin_name, .. } => {
-                    json!({"state": "joining", "admin": admin_name})
+                PairState::Joining {
+                    admin_name, power, ..
+                } => {
+                    json!({"state": "joining", "admin": admin_name, "power": joins_as(power)})
                 }
-                PairState::Joined { admin_name } => {
+                PairState::Joined { admin_name, power } => {
                     let files = d.core().files_id().is_some();
-                    json!({"state": "joined", "admin": admin_name, "files": files})
+                    json!({"state": "joined", "admin": admin_name, "files": files,
+                        "power": joins_as(power)})
                 }
                 PairState::Failed(e) => json!({"state": "failed", "error": e}),
             })
@@ -1233,7 +1245,9 @@ fn status(d: &Arc<Daemon>) -> Value {
     let pairing = match d.pairing.lock().unwrap_or_else(|e| e.into_inner()).clone() {
         PairState::Idle => Value::Null,
         PairState::Showing { code } => json!({"state": "showing", "code": code}),
-        PairState::Joining { admin_name, .. } => json!({"state": "joining", "admin": admin_name}),
+        PairState::Joining {
+            admin_name, power, ..
+        } => json!({"state": "joining", "admin": admin_name, "power": joins_as(power)}),
         PairState::Joined { .. } => Value::Null,
         PairState::Failed(e) => json!({"state": "failed", "error": e}),
     };

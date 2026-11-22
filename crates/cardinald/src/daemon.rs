@@ -193,11 +193,16 @@ pub enum PairState {
         admin_key: [u8; 32],
         /// Its link endpoint, as it told us (the IP may be unspecified).
         admin_addr: Option<SocketAddr>,
+        /// The power this device joins at, as the admin device named it
+        /// and this one signed: what its person is shown.
+        power: Option<cardinal_identity::Power>,
     },
     /// Joined.
     Joined {
         /// The admin device's name.
         admin_name: String,
+        /// The power it joined at.
+        power: Option<cardinal_identity::Power>,
     },
     /// Failed.
     Failed(String),
@@ -1349,11 +1354,13 @@ impl Daemon {
         }));
         self.directory.update(Some(&st), &[]);
         let prev = std::mem::take(&mut *lock(&self.pairing));
-        let admin_name = match &prev {
-            PairState::Joining { admin_name, .. } => admin_name.clone(),
-            _ => String::new(),
+        let (admin_name, power) = match &prev {
+            PairState::Joining {
+                admin_name, power, ..
+            } => (admin_name.clone(), *power),
+            _ => (String::new(), None),
         };
-        *lock(&self.pairing) = PairState::Joined { admin_name };
+        *lock(&self.pairing) = PairState::Joined { admin_name, power };
         // Reconnect as a member: the pairing session carried no proof of
         // this device, so the admin will treat a new session normally.
         if let PairState::Joining {
