@@ -13,6 +13,7 @@
 //! - [`files`], [`account`]: profile helpers.
 
 pub mod account;
+pub mod application;
 pub mod entry;
 pub mod epoch;
 mod error;
