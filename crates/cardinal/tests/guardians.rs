@@ -958,3 +958,160 @@ fn a_guardian_names_whom_an_invitation_is_for() {
     assert!(o.status.success(), "{}", out(&o));
     assert!(out(&o).contains("They held no copy"), "{}", out(&o));
 }
+
+fn reply(d: &Dev, req: &serde_json::Value) -> serde_json::Value {
+    use std::io::{BufRead, BufReader, Write};
+    let mut s = std::os::unix::net::UnixStream::connect(d.home.join("control.sock")).unwrap();
+    writeln!(s, "{req}").unwrap();
+    let mut line = String::new();
+    BufReader::new(s).read_line(&mut line).unwrap();
+    serde_json::from_str(&line).unwrap()
+}
+
+fn ask(d: &Dev, req: serde_json::Value) -> serde_json::Value {
+    let r = reply(d, &req);
+    assert_eq!(r["ok"], true, "{req} got {r}");
+    r
+}
+
+/// A recovery removes the device with which the person, as owner, took
+/// someone out of a group. That succession counts only if a keep lists it,
+/// and after the recovery none does: it falls, with no question asked, and
+/// the old group stands for everyone again, the one taken out included,
+/// while the person's ordinary work up to when the device was lost is kept.
+/// The discovery and presence secrets are made anew.
+#[test]
+fn a_recovery_undoes_the_lost_devices_successions() {
+    use serde_json::json;
+    if !fuse_available() {
+        eprintln!("skipping: /dev/fuse or fusermount3 is not available");
+        return;
+    }
+    let root = tempfile::tempdir().unwrap();
+    let mut laptop = Dev::new(root.path(), "laptop", free_port());
+    laptop.start();
+    let words = words_from(&laptop.cli(&["init", "--yes", "--name", "ana"]));
+    laptop.wait_mounted();
+    let bo = person(root.path(), "bo");
+    let mut cy = person(root.path(), "cy");
+    meet(&laptop, &bo, "Ana");
+    meet(&laptop, &cy, "Ana");
+    meet(&bo, &cy, "Bo");
+    // a group of the three, and cy taken out of it
+    let made = ask(
+        &laptop,
+        json!({"cmd": "group-create", "name": "Garden club", "people": ["bo", "cy"]}),
+    );
+    let g = made["group"].as_str().unwrap().to_owned();
+    for d in [&bo, &cy] {
+        wait("the offer arrives", 30, || {
+            let r = ask(d, json!({"cmd": "groups"}));
+            r["offers"]
+                .as_array()
+                .is_some_and(|o| o.iter().any(|x| x["name"] == "Garden club"))
+        });
+        ask(d, json!({"cmd": "group-join", "group": g}));
+    }
+    let listed = |d: &Dev| -> Option<String> {
+        let r = ask(d, json!({"cmd": "groups"}));
+        r["groups"].as_array().and_then(|all| {
+            all.iter()
+                .find(|x| x["name"] == "Garden club")
+                .and_then(|x| x["group"].as_str().map(str::to_owned))
+        })
+    };
+    // the group `g` as `d` lists it, standing: not ended
+    let stands = |d: &Dev, g: &str| -> bool {
+        let r = ask(d, json!({"cmd": "groups"}));
+        r["groups"].as_array().is_some_and(|all| {
+            all.iter()
+                .any(|x| x["name"] == "Garden club" && x["group"] == g && x["ended"].is_null())
+        })
+    };
+    wait("cy is in the group", 60, || stands(&cy, &g));
+    let removed = ask(
+        &laptop,
+        json!({"cmd": "group-remove", "group": g, "who": "cy"}),
+    );
+    let g2 = removed["group"].as_str().unwrap().to_owned();
+    wait("bo follows", 60, || {
+        listed(&bo).as_deref() == Some(g2.as_str())
+    });
+    // cy is told it ended for them
+    wait("cy sees it end", 60, || !stands(&cy, &g));
+    // Bo guards her, and holds her account.
+    accept_guarding(&[&bo]);
+    let o = name_accepted(&laptop, &words, &["bo", "--delay", "4s"]);
+    assert!(o.status.success(), "{}", out(&o));
+    wait("the guardian knows", 30, || {
+        bo.cli(&["guarding"]).contains("Ana: one of 1 guardians")
+    });
+    hold_account(&laptop, &[&bo]);
+    laptop.stop();
+    drop(laptop);
+    // lost now, by the laptop's clock, which is this machine's
+    let lost_at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis()
+        .to_string();
+
+    let new = new_device(root.path(), "new");
+    let fp = fingerprint_from(&new.cli(&["recover", "start", &recovery_invitation(&bo, "Ana")]));
+    wait("bo sees the recovery", 30, || {
+        bo.cli(&["guarding"]).contains(&fp)
+    });
+    endorse_and_confirm(&[&bo], &fp);
+    wait("the account is given back", 60, || {
+        new.cli(&["recover"]).contains("your account among it")
+    });
+    let o = new.try_cli(&["recover", "finish", "--lost-at", &lost_at]);
+    assert!(o.status.success(), "{}", out(&o));
+    // The secrets are new.
+    assert!(
+        new.log().contains("new discovery and presence secrets"),
+        "{}",
+        new.log()
+    );
+    // Nothing is asked: the succession simply falls. The old group stands
+    // again, here and for bo, who returns to it, and for cy, who is in it
+    // again. (With no host, they find each other by address.)
+    let (bo_at, cy_at) = (
+        format!("127.0.0.1:{}", bo.port),
+        format!("127.0.0.1:{}", cy.port),
+    );
+    let new_at = format!("127.0.0.1:{}", new.port);
+    wait("the old group stands for the person and bo", 120, || {
+        let _ = new.try_cli(&["contacts", "bo", "--look", "--at", &bo_at]);
+        let _ = bo.try_cli(&["contacts", "Ana", "--look", "--at", &new_at]);
+        stands(&new, &g) && stands(&bo, &g)
+    });
+    // Cy hears of the recovery from bo, at their next sync: on a session
+    // that stays up, a few minutes later; at once when cy comes back.
+    cy.stop();
+    cy.start();
+    cy.wait_mounted();
+    wait("the old group stands for cy too", 120, || {
+        let _ = cy.try_cli(&["contacts", "Bo", "--look", "--at", &bo_at]);
+        let _ = new.try_cli(&["contacts", "cy", "--look", "--at", &cy_at]);
+        stands(&cy, &g)
+    });
+    let r = ask(&new, json!({"cmd": "recover"}));
+    assert!(r.get("successions").is_none(), "{r}");
+    let r = reply(
+        &new,
+        &json!({"cmd": "recover-keep-succession", "id": "x", "keep": true}),
+    );
+    assert_ne!(r["ok"], true, "{r}");
+    // and nobody is left in what the lost device made
+    for d in [&new, &bo, &cy] {
+        let gs = ask(d, json!({"cmd": "groups"}));
+        assert!(
+            gs["groups"]
+                .as_array()
+                .is_some_and(|a| a.iter().all(|x| x["group"] != g2.as_str())),
+            "{}: {gs}",
+            d.name
+        );
+    }
+}

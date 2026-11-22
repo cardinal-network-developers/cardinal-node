@@ -134,7 +134,7 @@ impl Daemon {
                     Access::Other(identity)
                 } else if Some(*label) == core.identity_label()
                     || core.shares(&identity, label)
-                    || core.recovered_relationship(&identity, &device, label)
+                    || core.recovered_owns(&identity, &device, label)
                 {
                     Access::Full
                 } else if core.held_given(&identity).contains(label) {
@@ -235,13 +235,11 @@ pub async fn sync_all(d: &Arc<Daemon>, s: &Session) {
         PeerKind::Contact(identity, device) => {
             let core = d.core();
             let mut labels = core.labels_with(&identity);
-            // after their recovery, their relationship, for their keeps
+            // after their recovery, what they started, for their keeps
             let theirs: Vec<Label> = core
                 .spaces
                 .keys()
-                .filter(|l| {
-                    !labels.contains(*l) && core.recovered_relationship(&identity, &device, l)
-                })
+                .filter(|l| !labels.contains(*l) && core.recovered_owns(&identity, &device, l))
                 .copied()
                 .collect();
             labels.extend(theirs);
@@ -263,6 +261,25 @@ pub async fn sync_all(d: &Arc<Daemon>, s: &Session) {
                 short(&label),
                 short(&s.peer_static())
             ),
+        }
+    }
+    // After this person's recovery: what they started and offered this
+    // contact, and their relationship, not here yet, asked of them alone,
+    // taken only in answer and served to nobody (`hosts.md#restore`, D81).
+    let Some(member) = member else {
+        return;
+    };
+    if !crate::recovering::was_recovered(d) {
+        return;
+    }
+    let asks = d.core().own_unheld_with(&member);
+    for label in asks {
+        if let Err(e) = reconcile_as(d, s, label, Access::Offered).await {
+            tracing::debug!(
+                "asking {} for {}: {e:#}",
+                short(&s.peer_static()),
+                short(&label)
+            );
         }
     }
 }

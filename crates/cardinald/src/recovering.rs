@@ -107,6 +107,12 @@ impl Recovered {
     }
 }
 
+/// Whether this device was made the person's by a recovery that removed
+/// their other devices.
+pub fn was_recovered(d: &Daemon) -> bool {
+    load_recovered(d).is_some_and(|r| !r.forgotten.is_empty())
+}
+
 fn load(d: &Daemon) -> Option<Under> {
     let b = std::fs::read(d.paths.recovering()).ok()?;
     serde_json::from_slice(&b).ok()

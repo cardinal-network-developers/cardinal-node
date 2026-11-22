@@ -744,11 +744,30 @@ differs or was read:
   be written once no device survives). Nothing is asked: the old space
   stands again, whoever followed returns to it, and the person redoes the
   change by hand if it was theirs. **What a contact gives a recovered
-  person,** beyond what a space's members allow: only to a device the new
+  person** (`hosts.md#restore` says only that spaces "come back as their
+  other holders are reached"; sync.md lets only members name a space, and
+  after a recovery that kept no old key nothing the person wrote counts,
+  every genesis of theirs included, so no member would give back a space
+  the person started, nor their relationship): only to a device the new
   root of a recovery in effect in that person's log (as held here) added,
-  and only their relationship with this person, which nothing of theirs
-  in it counts for until their keeps arrive, so that those keeps can reach
-  it. No offer gives anything. **Also after `finish`:** the removed
+  and only their relationship with this person, and a space held here
+  that they started, its genesis theirs by its signature, signed by a key
+  the recovery removed, set aside, and not a successor; so that their
+  keeps can reach it, and it stands again. No offer gives anything, and
+  no time limits it. **What a recovered device asks for:** of each
+  contact, with reconciles it starts, which take what comes and serve
+  nothing, their relationship if the account lists it and it is not
+  here, and the spaces its own offers in that relationship name (its own
+  signed entries, kept), not here; while `recovered.json` names removed
+  keys. Without this, the old group in the test stood for nobody: bo's
+  copy was all set aside, and cy never heard of the recovery. **Not
+  yet:** a contact who is not a guardian refuses the recovered device's
+  sessions ("unknown device") until it holds the person's new log, which
+  it gets only from someone else who shares a space with the person, at
+  their next sync (every three minutes on a session that stays up, at
+  once on a new one); `sync.md` has each side reconcile the other's log
+  first. The test brings cy back to show the rest.
+  **Also after `finish`:** the removed
   devices' link keys are taken out of every mailbox, the discovery and
   presence secrets are made new (the presence secret given to each trusted
   contact again, nearby advertisements restarted with the new one), and
@@ -906,11 +925,14 @@ What is not built:
   writes a `keep` for a `succeed` or a successor's genesis: not when the
   person confirms it on another device, not when a device is retired,
   and not when one is lost (nothing shows the person what that device's
-  successions did). Validity already says that an unkept one by a removed
+  successions did); after a recovery they fall by design (D81, see
+  Guardians). Validity already says that an unkept one by a removed
   key does not count; a device then finds that no successor stands, takes
   the old space for current again and posts there what it wrote in the
-  successor. That return is written and not tested, since nothing here
-  removes a key under a succession in a test.
+  successor. Tested after a recovery (`guardians.rs`,
+  `a_recovery_undoes_the_lost_devices_successions`): the old group stands
+  again for the person, for the member who followed, and for the one
+  taken out.
 - **Relationships, and spaces with no owner.** Nothing here writes a
   `succeed` in one, and no request asks to: a relationship is never
   started afresh. A device that holds one whose members all named one

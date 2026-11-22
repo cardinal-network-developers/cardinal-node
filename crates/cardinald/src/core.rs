@@ -2326,24 +2326,72 @@ impl Core {
             .is_some_and(|added| added.signer() == r.root)
     }
 
-    /// Whether `label` is this person's relationship with `identity`, and
-    /// `device` one their recovery's new root added: after a recovery that
-    /// kept no old key, nothing they wrote in it counts here until their
-    /// keeps arrive, which it carries (`hosts.md#restore`, D80). Nothing
-    /// else is given beyond what a space's members allow: no offer, and no
-    /// space they started, which falls with what else they wrote until
-    /// whoever holds it as a member is reached.
-    pub fn recovered_relationship(
-        &self,
-        identity: &[u8; 32],
-        device: &KeyId,
-        label: &[u8; 32],
-    ) -> bool {
-        self.recovered_device(identity, device)
-            && self
-                .contacts()
-                .iter()
-                .any(|c| c.identity == *identity && c.space == *label && !c.refused)
+    /// Whether a recovered person's device `device` may sync `label` with
+    /// this device although nothing of theirs in it counts here yet: only a
+    /// device their recovery's new root added, and only their relationship
+    /// with this person, or a space they started before it, its genesis
+    /// theirs, signed by a key the recovery removed, set aside, and not a
+    /// successor (`hosts.md#restore`, D80, D81). Their keeps can then reach
+    /// it, and what they started stands again. Nothing an offer says gives
+    /// anything: the genesis is theirs by its signature.
+    pub fn recovered_owns(&self, identity: &[u8; 32], device: &KeyId, label: &[u8; 32]) -> bool {
+        if !self.recovered_device(identity, device) {
+            return false;
+        }
+        let theirs = self
+            .contacts()
+            .iter()
+            .any(|c| c.identity == *identity && c.space == *label && !c.refused);
+        theirs || self.started_before_recovery(identity, label)
+    }
+
+    /// Whether `label` is a space held here that `identity` started with a
+    /// key their log has since removed, which falls here until they keep
+    /// it: its genesis theirs, set aside, and not a successor's.
+    fn started_before_recovery(&self, identity: &[u8; 32], label: &[u8; 32]) -> bool {
+        let Some(other) = self.others.get(identity) else {
+            return false;
+        };
+        let Some(sp) = self.spaces.get(label).and_then(|h| h.space.as_ref()) else {
+            return false;
+        };
+        let Some(g) = sp.dag().get(label) else {
+            return false;
+        };
+        let st = other.log.state();
+        sp.succeeds().is_none()
+            && g.author() == *identity
+            && sp.validity().unwitnessed.contains(label)
+            && st.removed().any(|k| *k == g.signer())
+    }
+
+    /// After this person's recovery, what to ask `identity` for that is
+    /// not open here: their relationship, as the account records it, and
+    /// the spaces this person offered them in it, by its own offers. Each
+    /// is taken only in answer; what `identity` gives of it is up to them
+    /// ([`Core::recovered_owns`]).
+    pub fn own_unheld_with(&self, identity: &[u8; 32]) -> Vec<SpaceId> {
+        let Some(c) = self
+            .contacts()
+            .into_iter()
+            .find(|c| c.identity == *identity && !c.refused && c.recovery_of.is_none())
+        else {
+            return Vec::new();
+        };
+        let open = |s: &SpaceId| self.spaces.get(s).is_some_and(|h| h.space.is_some());
+        let mut out = Vec::new();
+        if !open(&c.space) {
+            out.push(c.space);
+        }
+        let me = self.me();
+        if let Some(rel) = self.spaces.get(&c.space).and_then(|h| h.space.as_ref()) {
+            for o in cardinal_space::group::offers(rel.state()) {
+                if Some(o.from) == me && !open(&o.space) && !out.contains(&o.space) {
+                    out.push(o.space);
+                }
+            }
+        }
+        out
     }
 
     /// Whether `identity`'s log, as held here, has this device in it.
