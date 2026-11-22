@@ -93,6 +93,21 @@
     },
     {
       "error": "length_exceeds_input",
+      "hex": "1500",
+      "name": "record count past end"
+    },
+    {
+      "error": "length_exceeds_input",
+      "hex": "1b41",
+      "name": "text length past end"
+    },
+    {
+      "error": "length_exceeds_input",
+      "hex": "0c1200",
+      "name": "nested bytes length past end"
+    },
+    {
+      "error": "length_exceeds_input",
       "hex": "fcffffffffffff3f",
       "name": "huge list count"
     },
@@ -191,12 +206,17 @@
     {
       "hex": "b3016c696e650a2271756f74656422205c20746162092001",
       "name": "text escapes",
-      "text": "\"line\\n\\\"quoted\\\" \\\\ tab\\t \\u0001\""
+      "text": "\"line\\n\\\"quoted\\\" \\\\ tab\\u{9} \\u{1}\""
     },
     {
       "hex": "53636166c3a920f09f90a6",
       "name": "text non-ascii",
       "text": "\"café 🐦\""
+    },
+    {
+      "hex": "530d001f7fc285c29fc2a0",
+      "name": "text control characters",
+      "text": "\"\\u{d}\\u{0}\\u{1f}\\u{7f}\\u{85}\\u{9f} \""
     },
     {
       "hex": "04",

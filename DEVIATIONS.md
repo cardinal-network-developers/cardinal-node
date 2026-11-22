@@ -53,13 +53,6 @@ below, each under its section.
   depth 0, and a list or record has depth one more than its deepest item.
   So 32 nested lists around an integer are accepted and 33 are rejected
   (`vectors/encoding.json`, "depth 32 (maximum)" and "depth 33").
-- **Spec ambiguity: which JSON string escaping the text rendering uses.**
-  "text = JSON string" allows several escapings of one string. Chose the
-  minimal escaping of RFC 8259, which is what `serde_json` and most JSON
-  serializers produce: `"` and `\` are escaped; U+0008, U+0009, U+000A,
-  U+000C, U+000D use `\b \t \n \f \r`; other characters below U+0020 use
-  `\u00xx` with lowercase hex; everything else, including DEL and non-ASCII,
-  is written as itself.
 - **Spec ambiguity: whether a signed object's body must itself be
   canonical.** The table says the body is "the canonical encoding of the
   inner record". Chose: reading a signed object rejects it unless the body
