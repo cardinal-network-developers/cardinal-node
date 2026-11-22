@@ -595,6 +595,7 @@ fn markdown() -> String {
         (150, 179, "Guardians and recovery"),
         (180, 199, "Networks, hosts and peers"),
         (200, 219, "Inspection and measuring"),
+        (220, 239, "Applications"),
     ];
     for (lo, hi, title) in groups {
         out += &format!(
