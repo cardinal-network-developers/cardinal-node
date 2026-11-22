@@ -194,15 +194,10 @@ pub fn show(d: &Daemon) -> anyhow::Result<Json> {
         })
         .collect();
     // whom each change names, and when this person made it
-    let made: Vec<(String, Json, Option<u64>)> = core
+    let made: Vec<account::GuardiansRecord> = core
         .account()
         .and_then(|a| a.space.as_ref())
-        .map(|sp| {
-            account::settings_made(sp.state())
-                .into_iter()
-                .map(|(n, v, t)| (n, json!(v.as_text()), t))
-                .collect()
-        })
+        .map(|sp| account::guardians_named(sp.state()))
         .unwrap_or_default();
     let contacts = core.contacts();
     let changes: Vec<Json> = policy
@@ -212,25 +207,21 @@ pub fn show(d: &Daemon) -> anyhow::Result<Json> {
                 .into_iter()
                 .filter(|(id, _)| !st.in_effect.contains(id))
                 .map(|(id, p)| {
-                    let key = format!("{NAMED_SETTING}{}", hex::encode(id));
                     let (names, since) = made
                         .iter()
-                        .find(|(n, _, _)| *n == key)
-                        .map(|(_, v, t)| {
-                            let names: Vec<String> = v
-                                .as_str()
-                                .unwrap_or("")
-                                .split(',')
-                                .filter_map(|pair| {
-                                    let c: [u8; 32] =
-                                        hex::decode(pair.split_once(':')?.0).ok()?.try_into().ok()?;
+                        .find(|g| g.policy == id)
+                        .map(|g| {
+                            let names: Vec<String> = g
+                                .named
+                                .iter()
+                                .filter_map(|(c, _)| {
                                     contacts
                                         .iter()
-                                        .find(|x| x.identity == c)
+                                        .find(|x| x.identity == *c)
                                         .map(|x| x.petname.clone())
                                 })
                                 .collect();
-                            (names, *t)
+                            (names, g.made)
                         })
                         .unwrap_or_default();
                     let objected = objected(&ident.log, &id);
@@ -404,10 +395,10 @@ pub fn set(
         .core()
         .account_id()
         .ok_or_else(|| anyhow::anyhow!("the account space is not here yet"))?;
-    let pairs: Vec<String> = chosen
+    let pairs: Vec<([u8; 32], [u8; 32])> = chosen
         .iter()
         .zip(&named)
-        .map(|(c, (p, _))| format!("{}:{}", hex::encode(c.identity), hex::encode(p)))
+        .map(|(c, (p, _))| (c.identity, *p))
         .collect();
     let (entries, written) = {
         let mut core = d.core();
@@ -424,13 +415,7 @@ pub fn set(
         // Whom it names, kept in the account before the entry itself, so
         // that a stop between the two never leaves a policy nobody here
         // can map to its guardians.
-        let written = core.write(
-            &acc,
-            vec![account::create_setting(
-                &format!("{NAMED_SETTING}{}", hex::encode(e1.id())),
-                pairs.join(","),
-            )],
-        )?;
+        let written = core.write(&acc, vec![account::create_guardians(&e1.id(), &pairs)])?;
         let ident = core.identity.as_mut().expect("identity");
         ident.record_own(&e1)?;
         let mut entries = vec![e1.encode()];
@@ -470,10 +455,6 @@ pub fn set(
     }))
 }
 
-/// The account setting naming, for the policy that this then the policy's
-/// id in hex names, the contacts and the personas it names, as
-/// `contact:persona,...` in hex. Not in the specification.
-pub const NAMED_SETTING: &str = "guardians: named ";
 /// The account setting by which a person's devices say a policy's
 /// guardians were marked and given the account, and the key rotated.
 pub const APPLIED_SETTING: &str = "guardians: applied ";
@@ -484,26 +465,9 @@ fn named_policies(core: &crate::core::Core) -> Vec<(EntryId, Vec<(EntryId, Entry
     let Some(acc) = core.account().and_then(|a| a.space.as_ref()) else {
         return Vec::new();
     };
-    account::settings(acc.state())
+    account::guardians_named(acc.state())
         .into_iter()
-        .filter_map(|(name, v)| {
-            let policy: EntryId = hex::decode(name.strip_prefix(NAMED_SETTING)?)
-                .ok()?
-                .try_into()
-                .ok()?;
-            let pairs = v
-                .as_text()?
-                .split(',')
-                .filter_map(|p| {
-                    let (c, q) = p.split_once(':')?;
-                    Some((
-                        hex::decode(c).ok()?.try_into().ok()?,
-                        hex::decode(q).ok()?.try_into().ok()?,
-                    ))
-                })
-                .collect();
-            Some((policy, pairs))
-        })
+        .map(|g| (g.policy, g.named))
         .collect()
 }
 

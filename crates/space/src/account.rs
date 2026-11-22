@@ -33,6 +33,8 @@ pub const NOT_THIS_HOST: u64 = 14;
 pub const NETWORK: u64 = 15;
 /// Persona kind (`profiles.md#account`, D78).
 pub const PERSONA: u64 = 16;
+/// Node kind: whom a policy's commitments name (`profiles.md#account`).
+pub const GUARDIANS: u64 = 17;
 
 /// A space node's field: this person said no to naming their hosts in
 /// it, "no hosts here" (D75, `hosts.md#telling-others-where-to-reach-you`).
@@ -1223,4 +1225,64 @@ pub fn contact_change(
         }
     }
     ops
+}
+
+/// Whom one recovery policy of this person's names: a guardians node
+/// (`profiles.md#account`, kind 17).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GuardiansRecord {
+    /// The node.
+    pub node: NodeId,
+    /// The `set_recovery` entry of this identity.
+    pub policy: EntryId,
+    /// For each commitment of that policy, in its order: the guardian's
+    /// identity, as their contact names it, and the persona they guard this
+    /// person through.
+    pub named: Vec<(IdentityId, IdentityId)>,
+    /// When the entry that made it says it was made.
+    pub made: Option<u64>,
+}
+
+/// `create` of a guardians node: `named`, for each commitment of `policy`
+/// in its order, the guardian and their persona.
+pub fn create_guardians(policy: &EntryId, named: &[(IdentityId, IdentityId)]) -> SpaceOp {
+    let item =
+        |(g, p): &(IdentityId, IdentityId)| Value::Record(Record::new().with(1, *g).with(2, *p));
+    SpaceOp::create(
+        NodeKind::Uint(GUARDIANS),
+        ROOT,
+        "",
+        Record::new()
+            .with(1, *policy)
+            .with(2, Value::List(named.iter().map(item).collect())),
+    )
+}
+
+/// The guardians nodes that are not deleted and are written as their
+/// table says; one that is not is no record of anything.
+pub fn guardians_named(state: &State) -> Vec<GuardiansRecord> {
+    let id32 = |v: &Value| -> Option<[u8; 32]> { v.as_bytes()?.try_into().ok() };
+    state
+        .children(&ROOT)
+        .into_iter()
+        .filter(|n| n.kind == NodeKind::Uint(GUARDIANS) && !n.deleted)
+        .filter_map(|n| {
+            let policy = n.field(1).and_then(id32)?;
+            let named = n
+                .field(2)?
+                .as_list()?
+                .iter()
+                .map(|v| {
+                    let r = v.as_record()?;
+                    Some((r.get(1).and_then(id32)?, r.get(2).and_then(id32)?))
+                })
+                .collect::<Option<Vec<_>>>()?;
+            Some(GuardiansRecord {
+                node: n.id,
+                policy,
+                named,
+                made: n.created,
+            })
+        })
+        .collect()
 }

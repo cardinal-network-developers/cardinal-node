@@ -393,9 +393,13 @@ differs or was read:
   key, naming fresh personas (each guardian, asked again, accepts with a
   persona not named by a policy of this person's that is in effect or still
   under way; one named only by a change given up serves again). Which
-  contact each policy named is kept in an account setting, `"guardians:
-  named "` and the policy's id, `contact:persona,...`, written before the
-  `set_recovery` itself. One change at a time: `set` refuses while a change
+  contact each policy named is kept in a **guardians node** (account kind
+  17, `profiles.md#account`, designer 2026-11-22): `1: the policy's entry
+  id; 2: list of {1: guardian identity, 2: persona}`, one for each
+  commitment in its order, written before the `set_recovery` itself. One
+  not written as its table says names nobody. (Before, an account setting
+  `"guardians: named "` with `contact:persona,...` in hex; a policy named
+  that way is no longer read, and has to be set again.) One change at a time: `set` refuses while a change
   is under way that the person has not objected to; an `object` on a
   change is how the person tells their guardians it is given up. The
   person's `cardinal guardians` shows each change under way with a
