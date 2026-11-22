@@ -86,6 +86,9 @@ const NEARBY_WINDOW: Duration = Duration::from_secs(10);
 const NEARBY_PER_SOURCE: u32 = 8;
 /// How often the LAN advertisement is made again, with fresh nonces.
 const ADVERTISE_EVERY: Duration = Duration::from_secs(30);
+/// How long LAN discovery waits to open its sockets again when it could
+/// not, unless the network changes first.
+const DISCOVERY_RETRY: Duration = Duration::from_secs(10);
 
 /// Addresses of this person's devices, learned from pairing, discovery,
 /// successful connections, and each other.
@@ -370,6 +373,9 @@ pub struct Daemon {
     next_gen: AtomicU64,
     started: Instant,
     discovery_started: AtomicBool,
+    /// Told when the network changes: LAN discovery opens its sockets
+    /// again, on the network this device is on now.
+    rediscover: tokio::sync::Notify,
 }
 
 /// Saved link counters (`link.md#handshake`).
@@ -604,6 +610,7 @@ impl Daemon {
             next_gen: AtomicU64::new(1),
             started: Instant::now(),
             discovery_started: AtomicBool::new(false),
+            rediscover: tokio::sync::Notify::new(),
         });
         d.restore_counters();
         crate::outside::load(&d);
@@ -726,6 +733,8 @@ impl Daemon {
             s.check();
         }
         self.unreadable.network_changed();
+        // A permit is kept if discovery is between rounds.
+        self.rediscover.notify_one();
         // and the services of the personas this device acts as, which
         // listen on the same network
         let inside: Vec<Arc<crate::helper::Helper>> = lock(&self.helper)
@@ -1974,23 +1983,10 @@ impl Daemon {
             // when the discovery secret does (renewed after a recovery).
             let advertise = |secret: &[u8; 32], presence: Option<[u8; 32]>| {
                 // The advertised port is the TCP link port (see README).
-                match disc::advertise_tags(cfg, secret, presence.as_ref(), port, ADVERTISE_EVERY) {
-                    Ok(a) => Some(a),
-                    Err(e) => {
-                        tracing::warn!("LAN discovery: cannot advertise: {e}");
-                        None
-                    }
-                }
+                disc::advertise_tags(cfg, secret, presence.as_ref(), port, ADVERTISE_EVERY)
+                    .map_err(|e| format!("cannot advertise: {e}"))
             };
             let mut presence = crate::presence::advertised(&d.core());
-            let mut _ad = advertise(&secret, presence);
-            let mut browser = match disc::browse_devices(cfg, Duration::from_secs(15)) {
-                Ok(b) => b,
-                Err(e) => {
-                    tracing::warn!("LAN discovery: cannot browse: {e}");
-                    return;
-                }
-            };
             let mut stop = d.stopping.subscribe();
             let mut look = tokio::time::interval(Duration::from_secs(2));
             // The keys of the contacts' tags, derived once for the state
@@ -1998,66 +1994,125 @@ impl Daemon {
             let mut keys: (u64, Vec<TagKey>) = (u64::MAX, Vec::new());
             // c= work per source, at most so much in a window (M3).
             let mut by_source: HashMap<std::net::IpAddr, (Instant, u32)> = HashMap::new();
-            loop {
-                tokio::select! {
-                    f = browser.next() => {
-                        let Some(f) = f else { break };
-                        // Only from the local link, and only its source is
-                        // dialled, whatever its records say (L1).
-                        if !crate::networks::on_local_link(f.from) {
-                            continue;
+            // What went wrong last, said at WARN once and not at each try.
+            let mut failed: Option<String> = None;
+            // Each round opens the sockets afresh: a socket joins the group
+            // on the interface the system chose when it opened, so one
+            // opened before the network was up, or on the network this
+            // device has since left, hears nothing (2026-11-22). A round
+            // ends when the network changes, or when the sockets fail, and
+            // one that could not open is tried again after a while.
+            'rounds: loop {
+                let opened = advertise(&secret, presence).and_then(|ad| {
+                    disc::browse_devices(cfg, Duration::from_secs(15))
+                        .map(|b| (ad, b))
+                        .map_err(|e| format!("cannot browse: {e}"))
+                });
+                let (mut _ad, mut browser) = match opened {
+                    Ok((ad, browser)) => {
+                        if failed.take().is_some() {
+                            tracing::info!("LAN discovery: running again");
                         }
-                        let at = SocketAddr::new(f.from, f.addr.port());
-                        if Some(at.port()) == d.endpoint.tcp_addr().map(|a| a.port())
-                            && is_local_ip(&at.ip()) {
-                            continue;
-                        }
-                        // Own devices first: one hash, never held up by
-                        // the work for contacts.
-                        if f.txt.iter().any(|t| disc::check_device_txt(&own, t)) {
-                            d.discovered(at).await;
-                            continue;
-                        }
-                        // Only the first c= is looked at.
-                        let Some(tag) = f.txt.iter().find(|t| t.starts_with(CONTACTS)) else {
-                            continue;
-                        };
-                        let now = Instant::now();
-                        by_source.retain(|_, (since, _)| now.duration_since(*since) < NEARBY_WINDOW);
-                        let seen = by_source.entry(f.from).or_insert((now, 0));
-                        seen.1 += 1;
-                        if seen.1 > NEARBY_PER_SOURCE {
-                            continue;
-                        }
-                        let version = d.core().state_version();
-                        if keys.0 != version {
-                            let theirs = crate::presence::of_contacts(&d.core());
-                            let derived = theirs.iter().map(|(who, s)| (*who, disc::presence_key(s)));
-                            keys = (version, derived.collect());
-                        }
-                        let found = keys.1.iter().find(|(_, k)| check_tag_txt(CONTACTS, k, tag));
-                        if let Some((who, _)) = found {
-                            let (d, who) = (d.clone(), *who);
-                            tokio::spawn(async move {
-                                crate::rendezvous::found_nearby(&d, who, at).await
-                            });
-                        }
+                        (Some(ad), browser)
                     }
-                    _ = look.tick() => {
-                        let now = crate::presence::advertised(&d.core());
-                        let mine = d.core().discovery_secret();
-                        let renewed = mine.is_some_and(|m| m != secret);
-                        if now != presence || renewed {
-                            if let Some(m) = mine.filter(|_| renewed) {
-                                secret = m;
-                                own = disc::discovery_key(&secret);
+                    Err(e) => {
+                        if failed.as_ref() != Some(&e) {
+                            tracing::warn!(
+                                "LAN discovery: {e}; trying again every {} s, and when the \
+                                 network changes",
+                                DISCOVERY_RETRY.as_secs()
+                            );
+                        } else {
+                            tracing::debug!("LAN discovery: {e}");
+                        }
+                        failed = Some(e);
+                        tokio::select! {
+                            _ = tokio::time::sleep(DISCOVERY_RETRY) => {}
+                            _ = d.rediscover.notified() => {}
+                            _ = stop.changed() => break 'rounds,
+                        }
+                        presence = crate::presence::advertised(&d.core());
+                        continue 'rounds;
+                    }
+                };
+                loop {
+                    tokio::select! {
+                        f = browser.next() => {
+                            let Some(f) = f else {
+                                failed = Some("browsing stopped".into());
+                                tokio::select! {
+                                    _ = tokio::time::sleep(DISCOVERY_RETRY) => {}
+                                    _ = stop.changed() => break 'rounds,
+                                }
+                                continue 'rounds;
+                            };
+                            // Only from the local link, and only its source is
+                            // dialled, whatever its records say (L1).
+                            if !crate::networks::on_local_link(f.from) {
+                                continue;
                             }
-                            presence = now;
-                            _ad = None;
-                            _ad = advertise(&secret, presence);
+                            let at = SocketAddr::new(f.from, f.addr.port());
+                            if Some(at.port()) == d.endpoint.tcp_addr().map(|a| a.port())
+                                && is_local_ip(&at.ip()) {
+                                continue;
+                            }
+                            // Own devices first: one hash, never held up by
+                            // the work for contacts.
+                            if f.txt.iter().any(|t| disc::check_device_txt(&own, t)) {
+                                d.discovered(at).await;
+                                continue;
+                            }
+                            // Only the first c= is looked at.
+                            let Some(tag) = f.txt.iter().find(|t| t.starts_with(CONTACTS)) else {
+                                continue;
+                            };
+                            let now = Instant::now();
+                            by_source.retain(|_, (since, _)| now.duration_since(*since) < NEARBY_WINDOW);
+                            let seen = by_source.entry(f.from).or_insert((now, 0));
+                            seen.1 += 1;
+                            if seen.1 > NEARBY_PER_SOURCE {
+                                continue;
+                            }
+                            let version = d.core().state_version();
+                            if keys.0 != version {
+                                let theirs = crate::presence::of_contacts(&d.core());
+                                let derived = theirs.iter().map(|(who, s)| (*who, disc::presence_key(s)));
+                                keys = (version, derived.collect());
+                            }
+                            let found = keys.1.iter().find(|(_, k)| check_tag_txt(CONTACTS, k, tag));
+                            if let Some((who, _)) = found {
+                                let (d, who) = (d.clone(), *who);
+                                tokio::spawn(async move {
+                                    crate::rendezvous::found_nearby(&d, who, at).await
+                                });
+                            }
                         }
+                        _ = look.tick() => {
+                            let now = crate::presence::advertised(&d.core());
+                            let mine = d.core().discovery_secret();
+                            let renewed = mine.is_some_and(|m| m != secret);
+                            if now != presence || renewed {
+                                if let Some(m) = mine.filter(|_| renewed) {
+                                    secret = m;
+                                    own = disc::discovery_key(&secret);
+                                }
+                                presence = now;
+                                _ad = None;
+                                match advertise(&secret, presence) {
+                                    Ok(a) => _ad = Some(a),
+                                    Err(e) => {
+                                        tracing::warn!("LAN discovery: {e}");
+                                        continue 'rounds;
+                                    }
+                                }
+                            }
+                        }
+                        _ = d.rediscover.notified() => {
+                            tracing::debug!("LAN discovery: the network changed, opening again");
+                            continue 'rounds;
+                        }
+                        _ = stop.changed() => break 'rounds,
                     }
-                    _ = stop.changed() => break,
                 }
             }
         });
