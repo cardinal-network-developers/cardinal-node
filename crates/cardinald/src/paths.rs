@@ -168,6 +168,22 @@ impl Paths {
         }
     }
 
+    /// The application interface's socket (`apps.md#the-application-interface`):
+    /// `$CARDINAL_APP_SOCKET`, else beside the control socket, its name
+    /// with `-apps` added (`cardinal-apps.sock`, `control-apps.sock`).
+    pub fn app_socket(&self) -> PathBuf {
+        if let Some(s) = std::env::var_os("CARDINAL_APP_SOCKET") {
+            return PathBuf::from(s);
+        }
+        let name = self.socket.file_name().map(|n| n.to_string_lossy().into_owned());
+        let name = name.unwrap_or_else(|| "cardinal.sock".into());
+        let named = match name.strip_suffix(".sock") {
+            Some(stem) => format!("{stem}-apps.sock"),
+            None => format!("{name}-apps"),
+        };
+        self.socket.with_file_name(named)
+    }
+
     /// The device's private keys.
     pub fn device_key(&self) -> PathBuf {
         self.home.join("device.key")

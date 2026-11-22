@@ -1140,6 +1140,7 @@ impl Holder {
         identity: &Identity,
         keys: &Keys,
         added: &[([u8; 32], HybridPublicKey)],
+        role: u64,
         ops: Vec<SpaceOp>,
     ) -> anyhow::Result<Vec<u8>> {
         let mine = identity
@@ -1155,7 +1156,6 @@ impl Holder {
             .space
             .as_mut()
             .ok_or_else(|| anyhow::anyhow!("space not open yet"))?;
-        let role = cardinal_space::group::WRITER;
         let adding: Vec<_> = added.iter().map(|(w, k)| (*w, role, k)).collect();
         let mut everyone = vec![&mine];
         everyone.extend(self.member_keys.iter());
@@ -2775,7 +2775,65 @@ impl Core {
             .spaces
             .get_mut(space)
             .ok_or_else(|| anyhow::anyhow!("space not held"))?;
-        let bytes = h.add_members(ident, &self.keys, &added, ops)?;
+        let bytes = h.add_members(ident, &self.keys, &added, cardinal_space::group::WRITER, ops)?;
+        self.settle(space);
+        Ok(bytes)
+    }
+
+    /// Makes a space of an application, `profile` the name of its root,
+    /// with this person as its owner and `ops` in its genesis besides
+    /// (`profiles.md#applications-normative`). Returns its id.
+    pub fn create_app_space(
+        &mut self,
+        profile: [u8; 32],
+        ops: Vec<SpaceOp>,
+    ) -> anyhow::Result<SpaceId> {
+        let ident = self
+            .identity
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("this device has no identity yet"))?;
+        let mine = ident
+            .enc
+            .first()
+            .ok_or_else(|| anyhow::anyhow!("no encryption key"))?
+            .public_key()
+            .clone();
+        let mut all = vec![SpaceOp::add_member(ident.id(), cardinal_space::group::OWNER)];
+        all.extend(ops);
+        let (space, sealed) = Space::create_with(
+            cardinal_space::Profile::Named(profile),
+            cardinal_space::Policy::default(),
+            &ident.log,
+            &self.keys.device.signing,
+            &[&mine],
+            all,
+            Some(now_ms()),
+        )?;
+        let id = space.id();
+        self.ingest_space(id, &[sealed.encode()])?;
+        Ok(id)
+    }
+
+    /// Adds `who` to a space as `role`. Returns the sealed bytes.
+    pub fn add_to_space(
+        &mut self,
+        space: &SpaceId,
+        who: &[[u8; 32]],
+        role: u64,
+    ) -> anyhow::Result<Vec<u8>> {
+        let mut added = Vec::new();
+        for w in who {
+            added.push((*w, self.encryption_key_of(w)?));
+        }
+        let ident = self
+            .identity
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("this device has no identity yet"))?;
+        let h = self
+            .spaces
+            .get_mut(space)
+            .ok_or_else(|| anyhow::anyhow!("space not held"))?;
+        let bytes = h.add_members(ident, &self.keys, &added, role, Vec::new())?;
         self.settle(space);
         Ok(bytes)
     }

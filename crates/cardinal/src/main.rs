@@ -327,6 +327,28 @@ enum Cmd {
         #[command(subcommand)]
         cmd: GroupCmd,
     },
+    /// Answer what a program asks of you: to see or change an
+    /// application's spaces, to start one, or whom to share one with. With
+    /// nothing, lists what is waiting; with its number, says yes, or no
+    /// with --no.
+    Approve {
+        id: Option<u64>,
+        /// Say no.
+        #[arg(long)]
+        no: bool,
+        /// Whom to share with, by what you call them.
+        #[arg(long = "with", num_args = 1..)]
+        with: Vec<String>,
+        /// What those you share with may do: reader or writer.
+        #[arg(long)]
+        role: Option<String>,
+    },
+    /// Programs and the applications they may use: approvals on all your
+    /// devices, and spaces of applications offered to you.
+    Apps {
+        #[command(subcommand)]
+        cmd: AppsCmd,
+    },
     /// A clipboard shared by your own devices: copy on one, paste on
     /// another, for ten minutes. Nobody else is sent it, and it is not kept.
     Clip {
@@ -566,6 +588,18 @@ enum ClipCmd {
     Copy { text: Option<String> },
     /// Print what was last copied on any of your devices.
     Paste,
+}
+
+#[derive(Subcommand)]
+enum AppsCmd {
+    /// Every approval of yours, on every device.
+    Approvals,
+    /// Take an approval back, by the start of its id.
+    Revoke { id: String },
+    /// Spaces of applications offered to you, such as a calendar.
+    Offers,
+    /// Take a space offered to you, by its id or name.
+    Join { space: String },
 }
 
 #[derive(Subcommand)]
@@ -3285,6 +3319,79 @@ async fn client(cmd: Cmd) -> anyhow::Result<()> {
             }
             Ok(())
         }
+        Cmd::Approve { id, no, with, role } => {
+            let Some(id) = id else {
+                let v = call(&paths, json!({"cmd": "app-questions"})).await?;
+                let qs = v["questions"].as_array().cloned().unwrap_or_default();
+                if qs.is_empty() {
+                    println!("Nothing is waiting for you.");
+                }
+                for q in qs {
+                    println!("{}. {}", q["id"], q["what"].as_str().unwrap_or(""));
+                    println!("   ({}: {})", q["name"].as_str().unwrap_or(""), q["program"].as_str().unwrap_or(""));
+                    if q["asks"] == "share" {
+                        println!("   Answer with --with and the people, and --role reader or writer.");
+                    }
+                }
+                return Ok(());
+            };
+            let req = json!({"cmd": "app-answer", "id": id, "yes": !no, "people": with, "role": role});
+            call(&paths, req).await?;
+            println!("{}", if no { "Said no." } else { "Said yes." });
+            Ok(())
+        }
+        Cmd::Apps { cmd } => match cmd {
+            AppsCmd::Approvals => {
+                let v = call(&paths, json!({"cmd": "approvals"})).await?;
+                let all = v["approvals"].as_array().cloned().unwrap_or_default();
+                if all.is_empty() {
+                    println!("No program is approved for anything.");
+                }
+                for a in all {
+                    let how = if a["change"] == true { "see and change" } else { "see" };
+                    let off = if a["revoked"] == true { "  (revoked)" } else { "" };
+                    let here = if a["this_device"] == true { "this device".to_owned() } else {
+                        a["device"].as_str().unwrap_or("another device").to_owned()
+                    };
+                    println!(
+                        "{}  {} may {how} every {}, on {here}: {}{off}",
+                        &a["id"].as_str().unwrap_or("")[..8.min(a["id"].as_str().unwrap_or("").len())],
+                        a["name"].as_str().unwrap_or(""),
+                        a["covers"].as_str().unwrap_or(""),
+                        a["program"].as_str().unwrap_or(""),
+                    );
+                }
+                Ok(())
+            }
+            AppsCmd::Revoke { id } => {
+                call(&paths, json!({"cmd": "approval-revoke", "id": id})).await?;
+                println!("Revoked.");
+                Ok(())
+            }
+            AppsCmd::Offers => {
+                let v = call(&paths, json!({"cmd": "app-offers"})).await?;
+                let all = v["offers"].as_array().cloned().unwrap_or_default();
+                if all.is_empty() {
+                    println!("Nothing is offered to you.");
+                }
+                for o in all {
+                    let app = o["application"].as_str().unwrap_or("something");
+                    println!(
+                        "{}  {} shares a {} with you: {}",
+                        &o["space"].as_str().unwrap_or("")[..16],
+                        o["from"].as_str().unwrap_or(""),
+                        app.to_lowercase(),
+                        o["name"].as_str().unwrap_or(""),
+                    );
+                }
+                Ok(())
+            }
+            AppsCmd::Join { space } => {
+                let v = call(&paths, json!({"cmd": "app-join", "space": space})).await?;
+                println!("Joined {}.", v["name"].as_str().unwrap_or(""));
+                Ok(())
+            }
+        },
         Cmd::Clip { cmd } => match cmd {
             ClipCmd::Copy { text } => {
                 let text = match text {

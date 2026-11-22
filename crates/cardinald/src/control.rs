@@ -672,6 +672,14 @@ async fn handle(d: &Arc<Daemon>, req: &Value) -> anyhow::Result<Value> {
         "call-start" => crate::calls::start(d, arg(req, "who")?, formats(req)?).await,
         "clip-copy" => crate::clipboard::copy(d, arg(req, "text")?).await,
         "clip" => Ok(crate::clipboard::paste(d)),
+        // What programs ask through the application interface, and the
+        // person's approvals (`apps.rs`).
+        "app-questions" => Ok(crate::apps::questions(d)),
+        "app-answer" => crate::apps::answer(d, req),
+        "approvals" => Ok(crate::apps::list_approvals(d)),
+        "approval-revoke" => crate::apps::revoke(d, arg(req, "id")?),
+        "app-offers" => Ok(crate::apps::list_offers(d)),
+        "app-join" => crate::apps::join(d, arg(req, "space")?),
         "call-answer" => crate::calls::answer(d, formats(req)?).await,
         "call-end" => crate::calls::end(d).await,
         "conversations" => Ok(crate::contacts::conversations(d)),

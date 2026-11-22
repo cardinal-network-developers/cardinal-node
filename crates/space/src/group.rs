@@ -75,6 +75,21 @@ pub fn create_offer(space: &SpaceId, name: &str, profile: u64) -> SpaceOp {
     )
 }
 
+/// `create` of an offer of a space of any profile, in a relationship
+/// space: field 3 a core profile's number or an application's name.
+pub fn create_offer_of(space: &SpaceId, name: &str, profile: Profile) -> SpaceOp {
+    let profile = match profile {
+        Profile::Core(n) => Value::from(n),
+        Profile::Named(h) => Value::from(h),
+    };
+    SpaceOp::create(
+        NodeKind::Uint(OFFER),
+        ROOT,
+        "offer",
+        Record::new().with(1, *space).with(2, name).with(3, profile),
+    )
+}
+
 /// An offer of a space, as a relationship space holds it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Offer {

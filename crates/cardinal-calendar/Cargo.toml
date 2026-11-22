@@ -1,0 +1,22 @@
+[package]
+name = "cardinal-calendar"
+description = "A calendar on the command line, a program of the Cardinal application interface"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "cardinal-calendar"
+path = "src/main.rs"
+
+[dependencies]
+cardinal-encoding.workspace = true
+anyhow.workspace = true
+clap.workspace = true
+hex.workspace = true
+getrandom.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+socket2.workspace = true

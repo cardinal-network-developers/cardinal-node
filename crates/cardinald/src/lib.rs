@@ -7,6 +7,7 @@
 
 pub mod api;
 pub mod applog;
+pub mod apps;
 pub mod bluetooth;
 #[cfg(target_os = "linux")]
 pub mod bluez;

@@ -171,6 +171,35 @@ mod imp {
         SockAddr::unix(path).is_ok_and(|a| s.connect(&a).is_ok())
     }
 
+    /// The process id of a connected socket's peer.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn peer_pid(s: &Socket) -> Option<u32> {
+        use std::os::fd::AsRawFd;
+        let mut cred = libc::ucred {
+            pid: 0,
+            uid: 0,
+            gid: 0,
+        };
+        let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+        // SAFETY: `cred` and `len` are valid for the call, which writes at
+        // most `len` bytes into `cred`.
+        let r = unsafe {
+            libc::getsockopt(
+                s.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_PEERCRED,
+                (&mut cred as *mut libc::ucred).cast(),
+                &mut len,
+            )
+        };
+        (r == 0 && cred.pid > 0).then_some(cred.pid as u32)
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    fn peer_pid(_: &Socket) -> Option<u32> {
+        None
+    }
+
     pub struct Listener(AsyncFd<Socket>);
 
     impl Listener {
@@ -195,12 +224,21 @@ mod imp {
         }
 
         pub async fn accept(&mut self) -> io::Result<(Reader, Writer)> {
+            let (r, w, _) = self.accept_peer().await?;
+            Ok((r, w))
+        }
+
+        /// [`accept`](Self::accept), and the process id of the peer where
+        /// the platform tells it (`SO_PEERCRED`).
+        pub async fn accept_peer(&mut self) -> io::Result<(Reader, Writer, Option<u32>)> {
             loop {
                 let mut guard = self.0.readable().await?;
                 if let Ok(r) = guard.try_io(|s| s.get_ref().accept()) {
                     let (s, _) = r?;
                     ready(&s)?;
-                    return halves(s);
+                    let pid = peer_pid(&s);
+                    let (r, w) = halves(s)?;
+                    return Ok((r, w, pid));
                 }
             }
         }

@@ -283,6 +283,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "cardinal-calendar"
+version = "0.1.19"
+dependencies = [
+ "anyhow",
+ "cardinal-encoding",
+ "clap",
+ "getrandom 0.4.3",
+ "hex",
+ "socket2",
+]
+
+[[package]]
 name = "cardinal-contact"
 version = "0.1.19"
 dependencies = [

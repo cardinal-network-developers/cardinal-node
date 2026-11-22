@@ -313,6 +313,9 @@ pub struct Daemon {
     /// The person's grant to inspect what this device holds, if any
     /// (`inspect.rs`): in memory only, so a restart ends it.
     pub inspection: crate::inspect::Inspection,
+    /// The application interface's questions, handles and sequence
+    /// numbers (`apps.rs`).
+    pub apps: crate::apps::Apps,
     /// The data directory, held for as long as the service runs.
     _lock: crate::lock::Lock,
     /// Audio heard on calls, for a client, by call.
@@ -583,6 +586,7 @@ impl Daemon {
             rang: Mutex::new(HashMap::new()),
             spread: Mutex::new(cardinal_sync::Spread::new()),
             inspection: Default::default(),
+            apps: Default::default(),
             _lock: lock,
             call_audio: tokio::sync::broadcast::channel(64).0,
             call_video: tokio::sync::broadcast::channel(512).0,
@@ -2242,6 +2246,12 @@ impl Daemon {
             true => None,
             false => Some(crate::control::serve(self.clone())?),
         };
+        // the application interface (`apps.md#the-application-interface`)
+        #[cfg(unix)]
+        let apps = match helper {
+            true => None,
+            false => Some(crate::apps::serve(self.clone())?),
+        };
         tracing::info!(
             "cardinal {} daemon started: data in {}, listening on {}, control socket {}",
             cardinal_update::VERSION,
@@ -2404,6 +2414,11 @@ impl Daemon {
         if control.is_some() {
             drop(control);
             let _ = std::fs::remove_file(&self.paths.socket);
+        }
+        #[cfg(unix)]
+        if let Some(apps) = apps {
+            apps.abort();
+            let _ = std::fs::remove_file(self.paths.app_socket());
         }
         if !helper {
             crate::helper::stop_all(&self).await;

@@ -12,6 +12,7 @@ members = [
     "crates/update",
     "crates/cardinald",
     "crates/cardinal",
+    "crates/cardinal-calendar",
 ]
 
 [workspace.package]

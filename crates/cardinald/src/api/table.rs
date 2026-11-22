@@ -259,6 +259,14 @@ macro_rules! gone {
 
 // ---- Records in replies ----
 
+rec!(APP_QUESTION "app question":
+    1 "asks" T, 2 "id" U, 3 "name" T, 4 "program" T, 5 "role" T, 6 "what" T);
+rec!(APPROVAL "approval":
+    1 "change" BOOL, 2 "covers" T, 3 "device" T, 4 "family" B, 5 "id" B, 6 "name" T,
+    7 "program" T, 8 "revoked" BOOL, 9 "this_device" BOOL);
+rec!(APP_OFFER "app offer":
+    1 "application" T, 2 "from" T, 3 "name" T, 4 "sentence" T, 5 "space" B);
+
 rec!(ATTACHMENT "attachment": 1 "name" T, 2 "size" U, 3 "type" T);
 rec!(BLUETOOTH "bluetooth":
     1 "available" BOOL, 2 "channels_in" U, 3 "error" T, 4 "mode" T, 5 "on" BOOL, 6 "psm" U,
@@ -725,6 +733,16 @@ pub static REQUESTS: &[Request] = &[
     req!(210 "speedtest" (1 "device" REF) -> (
         2 "device" T, 3 "ms" U, 4 "receive" U, 5 "received_bytes" U, 6 "rtt_median_us" U,
         7 "rtt_min_us" U, 8 "send" U, 9 "sent_bytes" U)),
+    // ---- Applications: 220 to 239 ----
+    paged!(after 220 "app-questions" (1 "after" U, 2 "limit" U) -> (
+        2 "questions" [APP_QUESTION], 3 "more" BOOL, 4 "next" U)),
+    req!(221 "app-answer" (1 "id" U, 2 "yes" BOOL, 3 "people" [REF], 4 "role" T) -> ()),
+    paged!(after 222 "approvals" (1 "after" U, 2 "limit" U) -> (
+        2 "approvals" [APPROVAL], 3 "more" BOOL, 4 "next" U)),
+    req!(223 "approval-revoke" (1 "id" REF) -> ()),
+    paged!(after 224 "app-offers" (1 "after" U, 2 "limit" U) -> (
+        2 "offers" [APP_OFFER], 3 "more" BOOL, 4 "next" U)),
+    req!(225 "app-join" (1 "space" REF) -> (2 "space" B, 3 "name" T)),
 ];
 
 // ---- What the service's program says without starting ----
