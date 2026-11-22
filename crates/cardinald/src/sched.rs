@@ -33,6 +33,13 @@
 //!   never a failure and never makes its device lack anything: only a
 //!   reply without an id says not held. Once every id of a request came
 //!   from elsewhere, the request is dropped ([`Scheduler::moot`]).
+//! - Silence costs the silent: a late device's window halves with each
+//!   doubling of its expectation, a hedge late in turn is hedged again,
+//!   to a holder not asked yet, and a request late twice over no longer
+//!   holds a place among the [`MAX_TOTAL`] or in its device's window
+//!   (it is still taken if it comes; a device holds at most
+//!   [`MAX_WINDOW`] such). So holders that stop answering, however many,
+//!   never keep the work from one that answers.
 //!
 //! The scheduler does no I/O and takes the time as an argument, so it is
 //! tested on its own; `net.rs` drives it.
@@ -75,6 +82,9 @@ pub const HEDGE_MIN: Duration = Duration::from_millis(750);
 pub const INITIAL_PER_CHUNK: Duration = Duration::from_secs(1);
 /// How many times a late device's expectation doubles at most.
 pub const MAX_BACKOFF: u32 = 6;
+/// Times a request may be found past what its device is expected to take
+/// before it stops holding a place ([`MAX_TOTAL`], its device's window).
+pub const STALE_AFTER: u32 = 2;
 /// Consecutive failures (errors, a closed stream or session, a bad reply;
 /// never lateness) before a device is left out (until it reconnects).
 pub const MAX_FAILURES: u32 = 3;
@@ -124,7 +134,8 @@ impl PeerStats {
         }
     }
 
-    /// Requests to keep outstanding so the link stays busy.
+    /// Requests to keep outstanding so the link stays busy; halved for
+    /// each time in a row the device was late, down to one.
     pub fn window(&self) -> usize {
         if self.samples == 0 {
             return PROBE_WINDOW;
@@ -132,7 +143,7 @@ impl PeerStats {
         let per = self.reply_bytes.max(64.0 * 1024.0);
         let bdp = self.rate * self.min_latency.max(0.001);
         let w = (2.0 * bdp / per).ceil() as usize + 1;
-        w.clamp(2, MAX_WINDOW)
+        (w.clamp(2, MAX_WINDOW) >> self.backoff.min(MAX_BACKOFF)).max(1)
     }
 
     /// How long a request is expected to take when `chunks` chunks are
@@ -202,6 +213,9 @@ impl PeerStats {
 struct PeerState {
     stats: PeerStats,
     outstanding: usize,
+    /// Of those, the requests late twice over ([`STALE_AFTER`]): they hold
+    /// no place in its window.
+    stale: usize,
     /// Chunks asked of it and not answered yet.
     chunks_out: usize,
     /// Bytes expected from the outstanding requests.
@@ -222,6 +236,7 @@ impl PeerState {
         PeerState {
             stats,
             outstanding: 0,
+            stale: 0,
             chunks_out: 0,
             expected: 0.0,
             failures: 0,
@@ -261,7 +276,7 @@ impl PeerState {
     }
 
     fn has_room(&self) -> bool {
-        self.live && self.outstanding < self.stats.window()
+        self.live && self.stale < MAX_WINDOW && self.outstanding - self.stale < self.stats.window()
     }
 
     /// When a request of `bytes` given to it now would be done.
@@ -293,6 +308,10 @@ struct Outstanding {
     ahead: usize,
     /// When it is next looked at as late.
     due: Instant,
+    /// Times it was found late.
+    late: u32,
+    /// Late [`STALE_AFTER`] times: it holds no place.
+    stale: bool,
 }
 
 /// What a reply means.
@@ -342,9 +361,10 @@ impl Scheduler {
                     // reconnected: start over, keeping what it lacked
                     let lacks = std::mem::take(&mut p.lacks);
                     let (outstanding, expected) = (p.outstanding, p.expected);
-                    let chunks_out = p.chunks_out;
+                    let (chunks_out, stale) = (p.chunks_out, p.stale);
                     *p = PeerState::new(*stats);
                     p.lacks = lacks;
+                    p.stale = stale;
                     p.outstanding = outstanding;
                     p.chunks_out = chunks_out;
                     p.expected = expected;
@@ -389,6 +409,11 @@ impl Scheduler {
         self.requests.len()
     }
 
+    /// Requests outstanding that hold a place: those not late twice over.
+    fn holding(&self) -> usize {
+        self.requests.values().filter(|r| !r.stale).count()
+    }
+
     /// Whether nothing is wanted or outstanding.
     pub fn is_idle(&self) -> bool {
         self.wanted.is_empty() && self.requests.is_empty()
@@ -408,10 +433,10 @@ impl Scheduler {
 
     /// The device to give a request of `bytes` with `id` in it: live,
     /// with room, not known to lack it, expected to finish first.
-    fn best_peer(&self, id: &Id, bytes: f64, now: Instant, exclude: Option<&Peer>) -> Option<Peer> {
+    fn best_peer(&self, id: &Id, bytes: f64, now: Instant, exclude: &[Peer]) -> Option<Peer> {
         self.order
             .iter()
-            .filter(|k| Some(*k) != exclude)
+            .filter(|k| !exclude.contains(k))
             .filter_map(|k| self.peers.get(k).map(|p| (k, p)))
             .filter(|(_, p)| p.has_room() && !p.lacks(id, now))
             .min_by(|a, b| {
@@ -453,10 +478,11 @@ impl Scheduler {
                 ids: ids.clone(),
                 sent: now,
                 expected,
-                // a hedge is not hedged again
                 hedged: hedge,
                 ahead,
                 due,
+                late: 0,
+                stale: false,
             },
         );
         Request {
@@ -472,60 +498,90 @@ impl Scheduler {
     pub fn poll(&mut self, now: Instant) -> Vec<Request> {
         let mut out = Vec::new();
         // Requests well past what their devices are expected to take:
-        // asked of another holder too.
-        let slow: Vec<u64> = self
+        // asked of another holder too, a hedge as well as the request it
+        // hedged, so that two silent holders cannot hold ids between them.
+        let mut slow: Vec<u64> = self
             .requests
             .iter()
-            .filter(|(_, r)| !r.hedged && now > r.due)
+            .filter(|(_, r)| now > r.due)
             .map(|(k, _)| *k)
             .collect();
+        slow.sort_unstable();
         for rid in slow {
-            if self.requests.len() >= MAX_TOTAL + MAX_TOTAL / 2 {
-                break;
-            }
-            let (peer, ids) = {
+            // Late: what is expected of its device doubles, and its window
+            // halves, until it answers. It has not failed, and lacks
+            // nothing. Late twice over, it holds no place.
+            let (peer, ahead) = {
                 let r = &self.requests[&rid];
-                let ids: Vec<Id> = r
-                    .ids
-                    .iter()
-                    .filter(|i| self.wanted.contains_key(*i))
-                    .copied()
-                    .collect();
-                (r.peer, ids)
+                (r.peer, r.ahead)
             };
-            if ids.is_empty() {
-                continue;
-            }
-            // Late: what is expected of its device doubles, until it
-            // answers. It has not failed, and lacks nothing.
-            let ahead = self.requests[&rid].ahead;
+            let became_stale = {
+                let r = self.requests.get_mut(&rid).expect("request");
+                r.late += 1;
+                let now_stale = !r.stale && r.late >= STALE_AFTER;
+                r.stale |= now_stale;
+                now_stale
+            };
             if let Some(p) = self.peers.get_mut(&peer) {
                 p.stats.backoff = (p.stats.backoff + 1).min(MAX_BACKOFF);
+                p.stale += usize::from(became_stale);
                 let again = now + p.stats.expect(ahead);
                 self.requests.get_mut(&rid).expect("request").due = again;
             }
+            if self.holding() >= MAX_TOTAL + MAX_TOTAL / 2 {
+                continue;
+            }
+            // what nothing else that holds a place asks for, and who was
+            // asked for it already
+            let r = &self.requests[&rid];
+            let mut asked: Vec<Peer> = vec![peer];
+            let mut covered: HashSet<Id> = HashSet::new();
+            for (k, o) in &self.requests {
+                if *k == rid || !o.ids.iter().any(|i| r.ids.contains(i)) {
+                    continue;
+                }
+                asked.push(o.peer);
+                if !o.stale {
+                    covered.extend(o.ids.iter().copied());
+                }
+            }
+            let ids: Vec<Id> = r
+                .ids
+                .iter()
+                .filter(|i| self.wanted.contains_key(*i) && !covered.contains(*i))
+                .copied()
+                .collect();
+            if ids.is_empty() {
+                continue;
+            }
             let bytes = ids.len() as f64 * PRIOR_REQUEST / BATCH as f64;
-            let Some(other) = self.best_peer(&ids[0], bytes, now, Some(&peer)) else {
+            let Some(other) = self.best_peer(&ids[0], bytes, now, &asked) else {
                 // No other holder with room: waited for, and looked at
                 // again after the longer wait.
                 continue;
             };
+            let first = !self.requests[&rid].hedged;
             self.requests.get_mut(&rid).expect("request").hedged = true;
-            if let Some(p) = self.peers.get_mut(&peer) {
-                p.stats
-                    .penalize(now.saturating_duration_since(self.requests[&rid].sent));
+            if first {
+                if let Some(p) = self.peers.get_mut(&peer) {
+                    p.stats
+                        .penalize(now.saturating_duration_since(self.requests[&rid].sent));
+                }
             }
             let ids: Vec<Id> = ids
                 .into_iter()
                 .filter(|i| !self.peers[&other].lacks(i, now))
                 .collect();
+            if ids.is_empty() {
+                continue;
+            }
             out.push(self.issue(other, ids, now, true));
         }
         self.drop_unreachable(now);
         // New work, retries first, to the devices expected to finish
         // first. A device busy or lacking the ids at the head of the
         // queue does not hold up the others.
-        while self.requests.len() < MAX_TOTAL && self.queued() > 0 {
+        while self.holding() < MAX_TOTAL && self.queued() > 0 {
             let mut candidates: Vec<Peer> = self
                 .order
                 .iter()
@@ -545,7 +601,7 @@ impl Scheduler {
                     issued = true;
                 }
                 if !ids.is_empty() {
-                    if self.requests.len() < MAX_TOTAL {
+                    if self.holding() < MAX_TOTAL {
                         out.push(self.issue(peer, ids, now, false));
                         issued = true;
                     } else {
@@ -677,11 +733,7 @@ impl Scheduler {
 
     /// The next time [`poll`](Self::poll) may hedge a request.
     pub fn next_deadline(&self) -> Option<Instant> {
-        self.requests
-            .values()
-            .filter(|r| !r.hedged)
-            .map(|r| r.due)
-            .min()
+        self.requests.values().map(|r| r.due).min()
     }
 
     /// Requests none of whose ids is wanted any more: everything they ask
@@ -704,6 +756,9 @@ impl Scheduler {
         if let Some(p) = self.peers.get_mut(&r.peer) {
             p.tick(now);
             p.outstanding = p.outstanding.saturating_sub(1);
+            if r.stale {
+                p.stale = p.stale.saturating_sub(1);
+            }
             p.chunks_out = p.chunks_out.saturating_sub(r.ids.len());
             p.expected = (p.expected - r.expected).max(0.0);
         }
@@ -1158,5 +1213,102 @@ mod tests {
         assert_eq!(out.accepted, vec![id(1)]);
         assert_eq!(s.peers[&A].stats.backoff, 0);
         assert!(s.is_idle());
+    }
+}
+
+#[cfg(test)]
+mod silent {
+    use super::*;
+
+    fn id(n: u32) -> Id {
+        let mut i = [0u8; 32];
+        i[..4].copy_from_slice(&n.to_le_bytes());
+        i
+    }
+
+    fn measured(latency: f64) -> PeerStats {
+        PeerStats {
+            rate: 1e9,
+            latency,
+            min_latency: latency,
+            reply_bytes: 1024.0 * 1024.0,
+            samples: 10,
+            bytes_total: 0,
+            per_chunk: latency / BATCH as f64,
+            per_chunk_var: 0.0,
+            backoff: 0,
+        }
+    }
+
+    /// The review of 2026-11-22: two holders that stop answering, each
+    /// quick when last measured, and one honest one. However the silent
+    /// two take requests and each other's hedges, the honest one always
+    /// gets work, and everything comes.
+    #[test]
+    fn two_silent_holders_do_not_stall_an_honest_one() {
+        let (s1, s2, h) = ([1u8; 32], [2u8; 32], [3u8; 32]);
+        let t0 = Instant::now();
+        let mut s = Scheduler::new();
+        // the silent two look quicker than the honest one
+        s.set_peers(&[
+            (s1, measured(0.05)),
+            (s2, measured(0.05)),
+            (h, measured(0.2)),
+        ]);
+        assert_eq!(measured(0.05).window(), MAX_WINDOW);
+        let n = 16 * 60;
+        for i in 0..n {
+            s.push(id(i));
+        }
+        let mut now = t0;
+        let mut pending: Vec<(Instant, Request)> = Vec::new();
+        let mut got = 0;
+        let mut steps = 0;
+        while s.wanted() > 0 {
+            steps += 1;
+            assert!(steps < 200_000, "no progress: {} wanted", s.wanted());
+            assert!(
+                now < t0 + Duration::from_secs(3600),
+                "an hour, and {} still wanted",
+                s.wanted()
+            );
+            for rid in s.moot() {
+                s.cancel(rid, now);
+            }
+            for r in s.poll(now) {
+                if r.peer == h {
+                    // one after another, 0.2 s each
+                    let last = pending.iter().map(|(t, _)| *t).max().unwrap_or(now);
+                    pending.push((last.max(now) + Duration::from_millis(200), r));
+                }
+            }
+            // bounded, whatever the silent ones hold
+            assert!(
+                s.outstanding() <= 3 * 2 * MAX_WINDOW + MAX_TOTAL,
+                "{}",
+                s.outstanding()
+            );
+            pending.sort_by_key(|(t, _)| *t);
+            let next_reply = pending.first().map(|(t, _)| *t);
+            let next = [next_reply, s.next_deadline()]
+                .into_iter()
+                .flatten()
+                .min()
+                .unwrap_or(now + Duration::from_secs(1));
+            now = next.max(now + Duration::from_millis(1));
+            while pending.first().is_some_and(|(t, _)| *t <= now) {
+                let (_, r) = pending.remove(0);
+                let bytes = (r.ids.len() * (1 << 20) / BATCH) as u64;
+                got += s.reply(r.id, &r.ids, bytes, now).accepted.len();
+            }
+        }
+        assert_eq!(got, n as usize);
+        assert!(s.take_unavailable().is_empty());
+        // the silent ones failed nothing and lack nothing: they are late
+        for p in [s1, s2] {
+            let st = &s.peers[&p];
+            assert!(st.live && st.failures == 0 && st.lacks.is_empty());
+            assert!(st.stats.window() < MAX_WINDOW, "its window shrank");
+        }
     }
 }
