@@ -4,8 +4,12 @@
 //! Every request opens its own stream. The opener's first message names
 //! the conversation:
 //!
-//! - `reconcile`: a dialogue on the stream until a side's message holds
-//!   only skips; each side then fetches what it lacks with `want`.
+//! - `reconcile`: a dialogue on the stream, in turns of one or more
+//!   messages, until a side's turn holds only skips; each side fetches what
+//!   it lacks with `want` as soon as it learns of it, spread across the
+//!   peers reconciling the set at once.
+//! - `summary`: on a long-delay link, the opener's short ids; answered with
+//!   the objects it lacks, then a `reconcile` the answerer opens.
 //! - `want`: answered with `objects` messages, then the stream ends.
 //! - `objects`: pushed after a write (entries under 900 bytes).
 //! - `heads`: pushed after a write; the receiver wants what it lacks.
@@ -21,6 +25,7 @@ use cardinal_link::{Priority, Service, Session, Stream};
 use cardinal_space::SpaceId;
 use cardinal_sync::{
     identity_log_label, want_messages, BlobReply, BlobRequest, Label, MemSet, Message, Reconciler,
+    SetStore,
 };
 use tokio::io::AsyncWriteExt;
 
@@ -355,7 +360,8 @@ async fn handle_stream(d: &Arc<Daemon>, s: &Session, mut st: Stream) -> anyhow::
         return Ok(());
     };
     match from_value(v)? {
-        Message::Reconcile { label, ranges } => {
+        m @ Message::Reconcile { .. } => {
+            let label = *m.label();
             let access = d.access(kind, &label);
             let set = if access == Access::None {
                 MemSet::new()
@@ -363,37 +369,21 @@ async fn handle_stream(d: &Arc<Daemon>, s: &Session, mut st: Stream) -> anyhow::
                 d.core().set(&label)
             };
             let mut rec = Reconciler::new(label, set);
-            let mut ranges = ranges;
-            let mut rounds = 0u32;
-            while let Some(reply) = rec.receive(&ranges)? {
-                st.send_message(&to_value(&reply)).await?;
-                if rec.is_done() {
-                    break;
-                }
-                if !access.takes_objects() {
-                    // Nothing will be fetched, so nothing need be kept.
-                    rec.take_wanted();
-                } else if is_someone_else(kind) && rec.wanted_count() >= MAX_WANTED {
-                    break;
-                }
-                let Some(v) = st.recv_message_max(longest).await? else {
-                    break;
-                };
-                match from_value(v)? {
-                    Message::Reconcile { ranges: r, .. } => ranges = r,
-                    _ => anyhow::bail!("expected reconcile"),
-                }
-                rounds += 1;
-                if rounds > 100_000 {
-                    anyhow::bail!("reconciliation does not end");
-                }
-            }
+            let mut fetcher = Fetcher::start(d, s, label, access);
+            let talk = Talk {
+                kind,
+                peer: s.peer_static(),
+                access,
+                longest,
+                wait: None,
+                objects_first: false,
+            };
+            let r = converse(d, &mut st, &mut rec, Some(m), &talk, &mut fetcher).await;
             let _ = st.shutdown().await;
-            let wanted = rec.take_wanted();
-            if access.takes_objects() && !wanted.is_empty() {
-                fetch_objects(d, s, label, wanted, access).await?;
-            }
+            r?;
+            fetcher.finish().await?;
         }
+        m @ Message::Summary { .. } => answer_summary(d, s, st, kind, m).await?,
         Message::Want { label, ids } => {
             if d.access(kind, &label).may_fetch() {
                 let msgs = {
@@ -482,49 +472,461 @@ async fn reconcile_inner(
     access: Access,
 ) -> anyhow::Result<()> {
     let kind = d.classify(s);
-    let longest = longest_from(kind);
     if !access.takes_objects() {
         return Ok(());
     }
     let set = d.core().set(&label);
-    let mut rec = Reconciler::new(label, set);
     let mut st = s.open_stream(Service::SYNC, Priority::Background)?;
-    st.send_message(&to_value(&rec.initiate())).await?;
-    let mut rounds = 0u32;
-    while !rec.is_done() {
-        let Some(v) = tokio::time::timeout(REQUEST_TIMEOUT, st.recv_message_max(longest))
-            .await
-            .map_err(|_| anyhow::anyhow!("timed out"))??
-        else {
-            break;
-        };
-        let Message::Reconcile { ranges, .. } = from_value(v)? else {
-            anyhow::bail!("expected reconcile");
-        };
-        match rec.receive(&ranges)? {
-            Some(reply) => st.send_message(&to_value(&reply)).await?,
-            None => break,
+    let long = long_delay(s);
+    if long {
+        // One turn of short ids, so that the other sends at once what this
+        // side lacks; the drill-down it then opens is the backstop.
+        let bits = cardinal_sync::summary_bits(set.len());
+        let nonce = cardinal_crypto::random_bytes::<32>();
+        tracing::debug!(
+            "reconcile {} with {}: a summary of {} ids, {bits} bits each",
+            short(&label),
+            short(&s.peer_static()),
+            set.len()
+        );
+        for m in
+            cardinal_sync::summary_messages(label, &set, nonce, bits, cardinal_sync::MAX_MESSAGE)
+        {
+            st.send_message(&to_value(&m)).await?;
         }
-        if is_someone_else(kind) && rec.wanted_count() >= MAX_WANTED {
-            break;
+    }
+    let mut rec = Reconciler::new(label, set);
+    if !long {
+        st.send_message(&to_value(&rec.initiate())).await?;
+    }
+    let mut fetcher = Fetcher::start(d, s, label, access);
+    let talk = Talk {
+        kind,
+        peer: s.peer_static(),
+        access,
+        // What answers a summary is objects asked for, as large as any.
+        longest: if long {
+            MAX_MESSAGE
+        } else {
+            longest_from(kind)
+        },
+        wait: Some(patience(s)),
+        objects_first: long,
+    };
+    let r = converse(d, &mut st, &mut rec, None, &talk, &mut fetcher).await;
+    let _ = st.shutdown().await;
+    r?;
+    fetcher.finish().await
+}
+
+/// Above this measured round trip a link is long, and a reconciliation
+/// opens with a summary (`sync.md#long-delays`).
+const LONG_DELAY: Duration = Duration::from_secs(2);
+
+/// The most bytes of short ids a summary may hold: from someone else's
+/// device, about a million ids of 8 bytes; from this person's own, 64 MiB.
+const SUMMARY_FROM_OTHERS: usize = 8 << 20;
+const SUMMARY_FROM_OWN: usize = 64 << 20;
+
+/// Whether the link to a peer is long: its measured round trip is above
+/// [`LONG_DELAY`], or above `CARDINAL_TEST_SUMMARY_RTT_MS` where tests set
+/// it (0: every link).
+fn long_delay(s: &Session) -> bool {
+    let limit = test_summary_rtt().unwrap_or(LONG_DELAY);
+    limit.is_zero() || s.stats().srtt.is_some_and(|rtt| rtt > limit)
+}
+
+fn test_summary_rtt() -> Option<Duration> {
+    static LIMIT: std::sync::OnceLock<Option<Duration>> = std::sync::OnceLock::new();
+    *LIMIT.get_or_init(|| {
+        std::env::var("CARDINAL_TEST_SUMMARY_RTT_MS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .map(Duration::from_millis)
+    })
+}
+
+/// How long to wait for a peer's next message: [`REQUEST_TIMEOUT`], or
+/// four round trips on a link slower than that.
+fn patience(s: &Session) -> Duration {
+    let rtt = s.stats().srtt.unwrap_or_default();
+    REQUEST_TIMEOUT.max(rtt * 4)
+}
+
+/// How a reconciliation on one stream goes.
+struct Talk {
+    kind: PeerKind,
+    /// The peer's static key.
+    peer: [u8; 32],
+    access: Access,
+    /// The longest message taken from the peer.
+    longest: usize,
+    /// How long to wait for each message, if not for ever.
+    wait: Option<Duration>,
+    /// Whether objects may come before the peer's first reconcile message:
+    /// the answer to this side's summary.
+    objects_first: bool,
+}
+
+/// Carries a reconciliation on `st` until a turn of only skips ends it:
+/// takes each message of the peer's turns, sends this side's turns, and
+/// hands what it learns this side lacks to `fetcher` at once
+/// (`sync.md#range-reconciliation`). `first` is a message already read.
+/// Objects that answer this side's summary are taken in before the
+/// drill-down begins, and added to the set reconciled, so the backstop
+/// does not ask for them again.
+async fn converse(
+    d: &Arc<Daemon>,
+    st: &mut Stream,
+    rec: &mut Reconciler<MemSet>,
+    mut first: Option<Message>,
+    talk: &Talk,
+    fetcher: &mut Fetcher,
+) -> anyhow::Result<()> {
+    let mut messages = 0u32;
+    let mut objects_ok = talk.objects_first;
+    let mut arrived: Vec<Vec<u8>> = Vec::new();
+    let mut arrived_bytes = 0usize;
+    loop {
+        let m = match first.take() {
+            Some(m) => m,
+            None => {
+                let next = st.recv_message_max(talk.longest);
+                let v = match talk.wait {
+                    Some(w) => tokio::time::timeout(w, next)
+                        .await
+                        .map_err(|_| anyhow::anyhow!("timed out"))??,
+                    None => next.await?,
+                };
+                let Some(v) = v else { break };
+                from_value(v)?
+            }
+        };
+        match m {
+            Message::Objects { objects, .. } if objects_ok => {
+                arrived_bytes += objects.iter().map(Vec::len).sum::<usize>();
+                arrived.extend(objects);
+                if arrived_bytes >= INGEST_BATCH {
+                    arrived_bytes = 0;
+                    take_in(d, talk, rec, std::mem::take(&mut arrived)).await?;
+                }
+            }
+            m @ Message::Reconcile { .. } => {
+                if objects_ok {
+                    objects_ok = false;
+                    take_in(d, talk, rec, std::mem::take(&mut arrived)).await?;
+                }
+                let turn = rec.handle(&m)?;
+                for out in &turn {
+                    st.send_message(&to_value(out)).await?;
+                }
+                let wanted = rec.take_wanted();
+                if talk.access.takes_objects() {
+                    fetcher.learn(wanted);
+                }
+                if rec.is_done() {
+                    break;
+                }
+                if is_someone_else(talk.kind) && fetcher.learned >= MAX_WANTED {
+                    break;
+                }
+            }
+            _ => anyhow::bail!("expected reconcile"),
         }
-        rounds += 1;
-        if rounds > 100_000 {
+        messages += 1;
+        if messages > 100_000 {
             anyhow::bail!("reconciliation does not end");
         }
     }
-    let _ = st.shutdown().await;
-    let wanted = rec.take_wanted();
-    if !wanted.is_empty() {
-        tracing::debug!(
-            "reconcile {}: fetching {} from {}",
-            short(&label),
-            wanted.len(),
-            short(&s.peer_static())
-        );
-        fetch_objects(d, s, label, wanted, access).await?;
+    Ok(())
+}
+
+/// How many bytes of objects that came together are taken in at once:
+/// taking in rebuilds what is held, so not one message at a time.
+const INGEST_BATCH: usize = 16 << 20;
+
+/// Takes in the objects that answered this side's summary, and adds what
+/// is now held to the set being reconciled.
+async fn take_in(
+    d: &Arc<Daemon>,
+    talk: &Talk,
+    rec: &mut Reconciler<MemSet>,
+    objects: Vec<Vec<u8>>,
+) -> anyhow::Result<()> {
+    let access = talk.access;
+    if objects.is_empty() || !access.takes_objects() {
+        return Ok(());
+    }
+    let label = *rec.label();
+    let ids = object_ids(d, label, access, &objects);
+    let d2 = d.clone();
+    let outcome = tokio::task::spawn_blocking(move || d2.ingest(label, objects, access)).await??;
+    d.pass_on(label, outcome.complete, outcome.objects, talk.peer);
+    let core = d.core();
+    for id in ids.into_iter().flatten() {
+        if core.has(&label, &id) {
+            rec.set_mut().insert(id);
+        }
     }
     Ok(())
+}
+
+/// Answers a summary (`sync.md#long-delays`): reads the rest of it, sends
+/// every object whose short id is absent from it (or, when chance matches
+/// are likely enough, every object), and then opens the exact drill-down
+/// as its initiator. A malformed summary resets the stream.
+async fn answer_summary(
+    d: &Arc<Daemon>,
+    s: &Session,
+    mut st: Stream,
+    kind: PeerKind,
+    first: Message,
+) -> anyhow::Result<()> {
+    let label = *first.label();
+    let access = d.access(kind, &label);
+    let limit = if is_someone_else(kind) {
+        SUMMARY_FROM_OTHERS
+    } else {
+        SUMMARY_FROM_OWN
+    };
+    let longest = longest_from(kind);
+    let mut reader = cardinal_sync::SummaryReader::new(label, limit);
+    let mut m = first;
+    let summary = loop {
+        match reader.push(&m) {
+            Ok(Some(summary)) => break summary,
+            Ok(None) => {}
+            Err(e) => {
+                st.reset(0);
+                return Err(e.into());
+            }
+        }
+        let Some(v) = st.recv_message_max(longest).await? else {
+            return Ok(());
+        };
+        m = match from_value(v) {
+            Ok(m @ Message::Summary { .. }) => m,
+            _ => {
+                st.reset(0);
+                anyhow::bail!("summary: a message that is not one in the middle");
+            }
+        };
+    };
+    let set = if access == Access::None {
+        MemSet::new()
+    } else {
+        d.core().set(&label)
+    };
+    if access.may_fetch() {
+        let everything = summary.sends_everything(set.len());
+        let (summary2, set2) = (summary.clone(), set.clone());
+        let ids = tokio::task::spawn_blocking(move || summary2.to_send(&set2)).await?;
+        tracing::debug!(
+            "answering a summary of {} from {}: {} ids against {}, {} bits; sending {}{}",
+            short(&label),
+            short(&s.peer_static()),
+            summary.count,
+            set.len(),
+            summary.bits,
+            ids.len(),
+            if everything { ", everything" } else { "" }
+        );
+        for chunk in ids.chunks(cardinal_sync::MAX_WANT) {
+            let msgs = {
+                let core = d.core();
+                cardinal_sync::objects_messages(
+                    label,
+                    chunk.iter().filter_map(|id| core.get(&label, id)),
+                )
+            };
+            for m in msgs {
+                st.send_message(&to_value(&m)).await?;
+            }
+        }
+    }
+    let mut rec = Reconciler::new(label, set);
+    st.send_message(&to_value(&rec.initiate())).await?;
+    let mut fetcher = Fetcher::start(d, s, label, access);
+    let talk = Talk {
+        kind,
+        peer: s.peer_static(),
+        access,
+        longest,
+        wait: Some(patience(s)),
+        objects_first: false,
+    };
+    let r = converse(d, &mut st, &mut rec, None, &talk, &mut fetcher).await;
+    let _ = st.shutdown().await;
+    r?;
+    fetcher.finish().await
+}
+
+/// Fetches what one reconciliation learns this side lacks, as it learns it
+/// (`sync.md#fetching-objects`). The ids go to the daemon's [`Spread`]:
+/// a worker for this peer takes batches nobody else is being asked for, so
+/// a set reconciled with several peers at once comes from all of them. A
+/// fetcher dropped unfinished lets its worker run out on its own.
+///
+/// [`Spread`]: cardinal_sync::Spread
+struct Fetcher {
+    d: Arc<Daemon>,
+    label: Label,
+    peer: [u8; 32],
+    wake: Arc<tokio::sync::Notify>,
+    ended: Arc<std::sync::atomic::AtomicBool>,
+    task: Option<tokio::task::JoinHandle<anyhow::Result<()>>>,
+    /// How many ids it was told of.
+    learned: usize,
+}
+
+impl Fetcher {
+    fn start(d: &Arc<Daemon>, s: &Session, label: Label, access: Access) -> Fetcher {
+        let wake = Arc::new(tokio::sync::Notify::new());
+        let ended = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let task = access.takes_objects().then(|| {
+            d.spread.lock().unwrap().join(label, s.peer_static());
+            let (d, s, wake, ended) = (d.clone(), s.clone(), wake.clone(), ended.clone());
+            tokio::spawn(async move { fetch_worker(&d, &s, label, access, &wake, &ended).await })
+        });
+        Fetcher {
+            d: d.clone(),
+            label,
+            peer: s.peer_static(),
+            wake,
+            ended,
+            task,
+            learned: 0,
+        }
+    }
+
+    /// The peer holds `ids`, which this side lacked when it learned them.
+    fn learn(&mut self, ids: Vec<[u8; 32]>) {
+        if self.task.is_none() || ids.is_empty() {
+            return;
+        }
+        let ids: Vec<[u8; 32]> = {
+            let core = self.d.core();
+            ids.into_iter()
+                .filter(|id| !core.has(&self.label, id))
+                .collect()
+        };
+        self.learned += ids.len();
+        self.d
+            .spread
+            .lock()
+            .unwrap()
+            .learn(self.label, self.peer, ids);
+        self.wake.notify_one();
+    }
+
+    /// The reconciliation has ended: waits until everything learned has
+    /// come, from this peer or another.
+    async fn finish(mut self) -> anyhow::Result<()> {
+        self.end();
+        match self.task.take() {
+            Some(t) => t.await?,
+            None => Ok(()),
+        }
+    }
+
+    fn end(&self) {
+        self.ended.store(true, std::sync::atomic::Ordering::Release);
+        self.wake.notify_one();
+    }
+}
+
+impl Drop for Fetcher {
+    fn drop(&mut self) {
+        self.end();
+    }
+}
+
+/// Takes batches of what `s`'s peer holds and this side lacks, asks for
+/// them, and takes the objects in, until the reconciliation has ended and
+/// nothing it learned is left: nothing for this peer, and nothing another
+/// peer is being asked for that this one could give if that one does not.
+async fn fetch_worker(
+    d: &Arc<Daemon>,
+    s: &Session,
+    label: Label,
+    access: Access,
+    wake: &tokio::sync::Notify,
+    ended: &std::sync::atomic::AtomicBool,
+) -> anyhow::Result<()> {
+    let peer = s.peer_static();
+    let mut got: Vec<Vec<u8>> = Vec::new();
+    let mut bytes = 0usize;
+    let mut asked: Vec<[u8; 32]> = Vec::new();
+    let r: anyhow::Result<()> = async {
+        loop {
+            let over = ended.load(std::sync::atomic::Ordering::Acquire);
+            let batch = d
+                .spread
+                .lock()
+                .unwrap()
+                .take(&label, peer, cardinal_sync::MAX_WANT);
+            if batch.is_empty() {
+                if !got.is_empty() {
+                    // Nothing more to ask for now: take in what came.
+                    bytes = 0;
+                    let objects = std::mem::take(&mut got);
+                    let ids = std::mem::take(&mut asked);
+                    let r = ingest_from(d, s, label, objects, access, over).await;
+                    settle(d, &label, peer, &ids);
+                    r?;
+                    continue;
+                }
+                if !over {
+                    wake.notified().await;
+                } else if d.spread.lock().unwrap().waits_on_others(&label, peer) {
+                    // Another peer is asked for something this one holds:
+                    // if it does not give it, this one is asked next.
+                    let _ = tokio::time::timeout(Duration::from_millis(200), wake.notified()).await;
+                } else {
+                    return Ok(());
+                }
+                continue;
+            }
+            let r = fetch_raw(d, s, label, &batch, access).await;
+            asked.extend_from_slice(&batch);
+            match r {
+                Ok(objects) => {
+                    bytes += objects.iter().map(Vec::len).sum::<usize>();
+                    got.extend(objects);
+                }
+                Err(e) => {
+                    let objects = std::mem::take(&mut got);
+                    let _ = ingest_from(d, s, label, objects, access, true).await;
+                    settle(d, &label, peer, &std::mem::take(&mut asked));
+                    return Err(e);
+                }
+            }
+            if bytes >= INGEST_BATCH {
+                bytes = 0;
+                let objects = std::mem::take(&mut got);
+                let ids = std::mem::take(&mut asked);
+                let r = ingest_from(d, s, label, objects, access, false).await;
+                settle(d, &label, peer, &ids);
+                r?;
+            }
+        }
+    }
+    .await;
+    d.spread.lock().unwrap().leave(&label, peer);
+    if r.is_ok() && d.spread.lock().unwrap().len(&label) == 0 {
+        tracing::trace!("reconcile {}: all fetched", short(&label));
+    }
+    r
+}
+
+/// The answer for `ids` has come and been taken in: what is held now is
+/// done with, the rest goes to another holder.
+fn settle(d: &Daemon, label: &Label, peer: [u8; 32], ids: &[[u8; 32]]) {
+    let core = d.core();
+    d.spread
+        .lock()
+        .unwrap()
+        .settle(label, peer, ids, |id| core.has(label, id));
 }
 
 /// Fetches objects of a set by id with `want`, and ingests them.
@@ -538,15 +940,32 @@ pub async fn fetch_objects(
     if !access.takes_objects() {
         return Ok(());
     }
+    let got = fetch_raw(d, s, label, &ids, access).await?;
+    if !got.is_empty() {
+        ingest(d, s, label, got, access).await?;
+    }
+    Ok(())
+}
+
+/// Asks for objects of a set by id with `want`, and gives what came that
+/// is one of them.
+async fn fetch_raw(
+    d: &Arc<Daemon>,
+    s: &Session,
+    label: Label,
+    ids: &[[u8; 32]],
+    access: Access,
+) -> anyhow::Result<Vec<Vec<u8>>> {
     let wanted: HashSet<[u8; 32]> = ids.iter().copied().collect();
     let mut got: Vec<Vec<u8>> = Vec::new();
     let mut bytes = 0;
-    'asking: for msg in want_messages(label, &ids) {
+    let wait = patience(s);
+    'asking: for msg in want_messages(label, ids) {
         let mut st = s.open_stream(Service::SYNC, Priority::Background)?;
         st.send_message(&to_value(&msg)).await?;
         let _ = st.shutdown().await;
         loop {
-            let v = tokio::time::timeout(REQUEST_TIMEOUT, st.recv_message_max(MAX_MESSAGE))
+            let v = tokio::time::timeout(wait, st.recv_message_max(MAX_MESSAGE))
                 .await
                 .map_err(|_| anyhow::anyhow!("timed out"))??;
             let Some(v) = v else { break };
@@ -560,25 +979,42 @@ pub async fn fetch_objects(
         }
     }
     // Check every object against the ids asked for.
+    let found = object_ids(d, label, access, &got);
+    let mut found = found.into_iter();
+    got.retain(|_| {
+        found
+            .next()
+            .flatten()
+            .is_some_and(|id| wanted.contains(&id))
+    });
+    Ok(got)
+}
+
+/// The id of each object of a set, as the layer that owns the set makes
+/// it: an identity entry's, or the BLAKE3 of the bytes. `None` for one
+/// that is not even an entry.
+fn object_ids(
+    d: &Daemon,
+    label: Label,
+    access: Access,
+    objects: &[Vec<u8>],
+) -> Vec<Option<[u8; 32]>> {
     let is_identity = matches!(access, Access::Join(_) | Access::Other(_)) || {
         let core = d.core();
         Some(label) == core.identity_label() || core.other_of_label(&label).is_some()
     };
-    got.retain(|b| {
-        let id = if is_identity {
-            match cardinal_identity::IdentityEntry::decode(b) {
-                Ok(e) => e.id(),
-                Err(_) => return false,
+    objects
+        .iter()
+        .map(|b| {
+            if is_identity {
+                cardinal_identity::IdentityEntry::decode(b)
+                    .ok()
+                    .map(|e| e.id())
+            } else {
+                Some(*blake3::hash(b).as_bytes())
             }
-        } else {
-            *blake3::hash(b).as_bytes()
-        };
-        wanted.contains(&id)
-    });
-    if !got.is_empty() {
-        ingest(d, s, label, got, access).await?;
-    }
-    Ok(())
+        })
+        .collect()
 }
 
 /// Ingests objects of a set from a peer.
@@ -589,6 +1025,22 @@ async fn ingest(
     objects: Vec<Vec<u8>>,
     access: Access,
 ) -> anyhow::Result<()> {
+    ingest_from(d, s, label, objects, access, true).await
+}
+
+/// [`ingest`], reconciling again with the peer for missing parents only if
+/// `follow`: not while more of the same set is still coming.
+async fn ingest_from(
+    d: &Arc<Daemon>,
+    s: &Session,
+    label: Label,
+    objects: Vec<Vec<u8>>,
+    access: Access,
+    follow: bool,
+) -> anyhow::Result<()> {
+    if objects.is_empty() {
+        return Ok(());
+    }
     let d2 = d.clone();
     let outcome = tokio::task::spawn_blocking(move || d2.ingest(label, objects, access)).await??;
     d.pass_on(label, outcome.complete, outcome.objects, s.peer_static());
@@ -603,7 +1055,7 @@ async fn ingest(
             }
         });
     }
-    if outcome.missing_parents {
+    if outcome.missing_parents && follow {
         let d2 = d.clone();
         let s2 = s.clone();
         tokio::spawn(async move {

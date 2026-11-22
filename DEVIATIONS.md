@@ -214,21 +214,70 @@ below, each under its section.
 
 ## Sync (`spec/sync.md`)
 
-- **Spec ambiguity: what "continues in the next message" means.** A
-  reconcile message must cover all ids, so a reply cannot simply be cut
-  off. Chose: every message gets exactly one reply. When a reply nears
-  64 KiB, the remaining received ranges are answered with this side's own
-  fingerprint of the same range (or an empty list if it holds none there),
-  without splitting, so the peer does the splitting next round; if even
-  that does not fit, everything from there to the end becomes one range
-  (a list if this side holds at most 32 ids there, else a fingerprint).
-  A "you lack" list that does not fit is cut at the first id not sent,
-  which becomes the range's upper bound. Termination is unchanged: a side
-  that receives only skips replies nothing. Large differences therefore
-  cost round trips in proportion to the bytes exchanged (about 1.3 KiB per
-  differing id at a million ids: 10,000 differences each way take about
-  290 round trips). A future spec revision could allow several messages
-  per turn.
+- **Turns (D83).** A turn is one or more reconcile messages, the last with
+  field 3 true. Field 3 is written only when true, and absent reads as
+  false (`encoding.md`: an absent field is omitted). A side answers a turn
+  once it has ended, but learns from each message as it comes, and fetches
+  what it learns at once. Each message is checked: its ranges ascend, go on
+  past where the turn's previous message stopped, and the last is
+  open-ended exactly when the message ends the turn; otherwise the stream
+  ends. **Reading: how much a turn says.** At most about 1 MiB (sixteen
+  64 KiB messages). Past that, the old coarse answer (formerly at 64 KiB):
+  the remaining ranges are answered with this side's own fingerprint of
+  the same range, unsplit, or, with no room even for that, everything to
+  the end becomes one range, so a turn still covers every id. A "you lack"
+  list is sent as several "you lack" ranges, each ending where the next
+  begins, so each fits a message. A side whose turn limit is one message
+  interoperates with one that sends sixteen (tested both ways). 10,000 ids
+  differing by half now take 4 round trips, where one-message turns took
+  many more.
+- **Reading: spreading `want`s** (`sync.md#fetching-objects`). The daemon
+  keeps, per set, each id it lacks, which peers' reconciliations showed it
+  held there, and which peer is being asked (`cardinal_sync::Spread`).
+  Each reconciliation has a worker that takes up to 256 ids nobody is
+  being asked for and that its peer holds, asks, and takes the answer in.
+  What a peer did not give goes back for another holder. When its
+  reconciliation ends, a worker stays while another peer is asked for
+  something its own peer also holds, so a reconcile still returns with
+  what that peer could give, and leaves after. What only a departed peer
+  held is forgotten for the next reconcile. **Reading: when objects are
+  taken in.** Taking in rebuilds a space, so a worker takes in what came
+  once nothing more is to be asked just then, or 16 MiB has come, not
+  after every `want`; it reconciles again for missing parents only once
+  its reconciliation has ended.
+- **Reading: when a link is long** (`sync.md#long-delays`). When the
+  session's smoothed round trip is above 2 seconds. Only unreliable
+  carriers (UDP) measure one; a link without a measure is not long.
+  `CARDINAL_TEST_SUMMARY_RTT_MS` sets the limit for tests, 0 making every
+  link long. On a long link a device waits four round trips for each
+  message, where it otherwise waits 120 seconds.
+- **Reading: the length of short ids.** The sender cannot know how many
+  ids the other holds, so it assumes up to 2^32 and keeps `E` at most
+  2^-20 against that: `b` is the bit length of its own count plus 52,
+  rounded up to a multiple of 8. 56 bits for a few ids, 72 for 50,000, 80
+  for ten million. A device that holds nothing sends count 0, 56 bits, no
+  short ids. **Spec error:** sync.md's last paragraph says a sender keeps
+  `E` below 1 and that "32 bits serve two sides of 50,000 ids each, 48
+  bits two of ten million"; at those lengths `E` is about 0.58 and 0.36,
+  far above the 2^-20 at which the responder sends everything, so a
+  sender following the example always gets the whole set. Read as: keep
+  `E` at most 2^-20, so `b` ≥ log2(n_mine × n_theirs) + 20 (56 bits for
+  50,000 a side, 72 for ten million).
+- **Reading: where a summary's answer goes.** On the summary's stream: the
+  responder's `objects`, then its reconcile messages, the summary's sender
+  answering them. `objects` are taken only before the first reconcile
+  message; one after is an error that ends the stream. What came is taken
+  in before the drill-down is answered, and added to the set reconciled,
+  so the backstop does not ask for it again.
+- **Reading: who is answered.** A summary for a set the sender may not
+  name is answered as for an empty set: nothing sent, an empty drill-down.
+  A peer that may give but not take this set (one offered, or the admin
+  device being joined) is sent no objects, and is reconciled with the set
+  as held. **Reading: how large a summary is taken.** At most 8 MiB of
+  short ids from someone else's device (about a million ids at 8 bytes),
+  64 MiB from one of this person's; a larger one is treated as malformed
+  and its stream reset. The spec might say a device may refuse a summary
+  too large for it.
 - **Reading: split points.** A range of `c > 32` ids is split at positions
   `floor(c * i / 16)`; each subrange's upper bound is the full 32-byte id
   at the next split position, and the last keeps the received bound. The

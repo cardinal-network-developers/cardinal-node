@@ -156,15 +156,13 @@ async fn reconcile_within(
             break;
         };
         let Some(r) = v.as_record() else { break };
-        let Ok(Message::Reconcile { ranges, .. }) = Message::from_record(r) else {
+        let Ok(m @ Message::Reconcile { .. }) = Message::from_record(r) else {
             break;
         };
-        match rec.receive(&ranges).unwrap() {
-            Some(reply) => st
-                .send_message(&Value::Record(reply.to_record()))
+        for reply in rec.handle(&m).unwrap() {
+            st.send_message(&Value::Record(reply.to_record()))
                 .await
-                .unwrap(),
-            None => break,
+                .unwrap();
         }
     }
     let _ = st.shutdown().await;
@@ -828,6 +826,7 @@ fn a_false_invitation_gets_nothing_from_who_accepts_it() {
                                 upper: None,
                                 mode: Mode::Skip,
                             }],
+                            end: true,
                         };
                         let _ = log
                             .send_message(&Value::Record(nothing_new.to_record()))
@@ -865,6 +864,7 @@ async fn offer_ids(s: &Session, label: [u8; 32], rounds: u64) -> u64 {
                 upper: None,
                 mode: Mode::List(ids.collect()),
             }],
+            end: true,
         };
         if st
             .send_message(&Value::Record(offer.to_record()))
