@@ -755,7 +755,7 @@ fn to_confirm_json(
         .collect()
 }
 
-fn name_of(
+pub(crate) fn name_of(
     me: &[u8; 32],
     contacts: &[ContactRecord],
     members: &[Member],
@@ -764,8 +764,12 @@ fn name_of(
     if who == me {
         return "You".into();
     }
-    if let Some(c) = contacts.iter().find(|c| c.identity == *who && !c.refused) {
-        return c.petname.clone();
+    // two records of one contact: refused if either is (the cautious
+    // answer), and then not named by this person's name for them
+    if !cardinal_space::account::refused(contacts, who) {
+        if let Some(c) = contacts.iter().find(|c| c.identity == *who) {
+            return c.petname.clone();
+        }
     }
     let shown = members
         .iter()

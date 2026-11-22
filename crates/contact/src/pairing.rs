@@ -291,7 +291,21 @@ pub fn is_pairing_message(first: &[u8]) -> bool {
     first.first().is_some_and(|b| b & 7 == 5)
 }
 
-fn seal_info(k: &[u8; 32], local: &LocalDevice, proof: Option<[u8; 64]>) -> Vec<u8> {
+/// The associated data of the information a side sends: its role, so that
+/// neither side's message can be sent back to it as the other's.
+fn info_label(from: PairRole) -> &'static [u8] {
+    match from {
+        PairRole::Typer => b"cardinal 1 pair typer",
+        PairRole::Shower => b"cardinal 1 pair shower",
+    }
+}
+
+fn seal_info(
+    k: &[u8; 32],
+    local: &LocalDevice,
+    proof: Option<[u8; 64]>,
+    from: PairRole,
+) -> Vec<u8> {
     let plain = Record::new()
         .with_opt(1, local.identity)
         .with(2, local.signing_key.public_key())
@@ -302,7 +316,7 @@ fn seal_info(k: &[u8; 32], local: &LocalDevice, proof: Option<[u8; 64]>) -> Vec<
         .with_opt(7, local.adds_at)
         .encode();
     let key = derive(Purpose::Pair, k);
-    let (nonce, ct) = xchacha20poly1305_encrypt_random(&key, &[], &plain);
+    let (nonce, ct) = xchacha20poly1305_encrypt_random(&key, info_label(from), &plain);
     Record::new()
         .with(0, OP_INFO)
         .with(1, nonce)
@@ -310,13 +324,13 @@ fn seal_info(k: &[u8; 32], local: &LocalDevice, proof: Option<[u8; 64]>) -> Vec<
         .encode()
 }
 
-fn open_info(k: &[u8; 32], r: &Record) -> Result<PeerInfo, ContactError> {
+fn open_info(k: &[u8; 32], r: &Record, from: PairRole) -> Result<PeerInfo, ContactError> {
     let bad = |_| ContactError::Malformed("pairing info");
     let nonce = r.bytes_n::<24>(1).map_err(bad)?;
     let ct = r.bytes(2).map_err(bad)?;
     let key = derive(Purpose::Pair, k);
     let plain = Zeroizing::new(
-        xchacha20poly1305_decrypt(&key, &nonce, &[], ct)
+        xchacha20poly1305_decrypt(&key, &nonce, info_label(from), ct)
             .map_err(|_| ContactError::Malformed("pairing info decryption"))?,
     );
     let p = Record::decode(&plain).map_err(|_| ContactError::Malformed("pairing info"))?;
@@ -501,8 +515,10 @@ impl ShowerState {
                     return Ok(Heard::Answer(Vec::new()));
                 };
                 let sid = session_id(self.code.channel, &s.shower, &s.typer);
-                if self.attempt.take().is_some_and(|a| !a.confirmed) {
-                    // A new attempt abandons the old one.
+                if self.attempt.take().is_some() {
+                    // A new attempt abandons the old one, which counts as
+                    // failed whether or not its tag was right: else one
+                    // who knows the code could take attempts without end.
                     self.fail()?;
                 }
                 let cp = Cpace::start(CpaceRole::Responder, &self.pw, b"", &sid, b"");
@@ -551,7 +567,7 @@ impl ShowerState {
                 if a.from != from || !a.confirmed {
                     return Ok(Heard::Answer(Vec::new()));
                 }
-                let Ok(peer) = open_info(&a.k, &rec) else {
+                let Ok(peer) = open_info(&a.k, &rec, PairRole::Typer) else {
                     return Ok(Heard::Answer(Vec::new()));
                 };
                 if peer.identity.is_none() && self.local.identity.is_none() {
@@ -561,7 +577,7 @@ impl ShowerState {
                 // and the pairing with it: the person sees why.
                 let proof = make_proof(&self.local, &peer)?;
                 let joins_at = proof.and(peer.power);
-                let reply = seal_info(&a.k, &self.local, proof);
+                let reply = seal_info(&a.k, &self.local, proof, PairRole::Shower);
                 let link_secret = derive(Purpose::Invite, &a.k[..]);
                 Ok(Heard::Done(
                     Box::new(Paired {
@@ -893,14 +909,16 @@ async fn typer(
     }
     // Step 4: our information, with the power we add a new device at; then
     // theirs. Over UDP the tag goes again with it, in case it was lost.
-    let info = seal_info(&k, local, None);
+    let info = seal_info(&k, local, None, PairRole::Typer);
     let ms = match wire {
         Wire::Udp(_) => vec![tag_msg, info],
         Wire::Channel(_) => vec![info],
     };
     let peer = wire
         .ask(&ms, deadline, |op, rec| {
-            Ok((op == OP_INFO).then(|| open_info(&k, rec).ok()).flatten())
+            Ok((op == OP_INFO)
+                .then(|| open_info(&k, rec, PairRole::Shower).ok())
+                .flatten())
         })
         .await?;
     let new_device = match (peer.identity, peer.proof, local.identity) {
@@ -973,6 +991,62 @@ mod tests {
         assert!(!is_pairing_message(&[]));
     }
 
+    /// The review of 2026-11-22: an attempt that passed its tag check and
+    /// is then displaced by a new one counts as failed, as an unconfirmed
+    /// one does, so even one who knows the code gets three attempts.
+    #[test]
+    fn a_displaced_confirmed_attempt_counts_as_failed() {
+        let code = PairingCode::generate();
+        let mut state = ShowerState {
+            pw: Zeroizing::new(code.password()),
+            code: code.clone(),
+            local: device(2, None, None),
+            failures: 0,
+            starts: VecDeque::new(),
+            attempt: None,
+        };
+        let confirmed = |state: &mut ShowerState, port: u16| -> Result<(), ContactError> {
+            let from = From::Udp(SocketAddr::from(([127, 0, 0, 1], port)));
+            let typer: [u8; RANDOM_LEN] = random_bytes();
+            let Heard::Answer(a) = state.heard(from, &msg(OP_START, &typer))? else {
+                panic!("a start is answered")
+            };
+            let (_, r) = parse(&a[0]).unwrap();
+            let shower = r.bytes_n::<RANDOM_LEN>(1).unwrap();
+            let sid = session_id(code.channel, &shower, &typer);
+            let cp = Cpace::start(CpaceRole::Initiator, &code.password(), b"", &sid, b"");
+            let share = *cp.share();
+            let Heard::Answer(a) = state.heard(from, &msg(OP_SHARE, &share))? else {
+                panic!("a share is answered")
+            };
+            let (_, r) = parse(&a[0]).unwrap();
+            let k = cp.finish(r.bytes(1).unwrap(), b"").unwrap().key32();
+            state.heard(from, &msg(OP_TAG, &confirm_tag(&k, &share)))?;
+            assert!(state.attempt.as_ref().unwrap().confirmed);
+            Ok(())
+        };
+        confirmed(&mut state, 1).unwrap();
+        assert_eq!(state.failures, 0);
+        confirmed(&mut state, 2).unwrap();
+        assert_eq!(state.failures, 1, "the first, displaced, failed");
+        confirmed(&mut state, 3).unwrap();
+        assert!(matches!(
+            confirmed(&mut state, 4),
+            Err(ContactError::TooManyAttempts)
+        ));
+    }
+
+    /// Each side's information is sealed for its direction: the typer's
+    /// sent back to it does not open as the shower's.
+    #[test]
+    fn pairing_information_is_sealed_for_its_direction() {
+        let k = [7u8; 32];
+        let local = device(3, Some([9; 32]), Some(POWER_DEVICE));
+        let (_, rec) = parse(&seal_info(&k, &local, None, PairRole::Typer)).unwrap();
+        assert!(open_info(&k, &rec, PairRole::Typer).is_ok());
+        assert!(open_info(&k, &rec, PairRole::Shower).is_err());
+    }
+
     /// A shower that signs for admin power whatever the typer named.
     #[tokio::test]
     async fn a_proof_for_another_power_than_named_is_refused() {
@@ -996,7 +1070,7 @@ mod tests {
                 if parse(&m).is_some_and(|(op, _)| op == OP_INFO) {
                     if let Some(a) = state.attempt.as_ref().filter(|a| a.confirmed) {
                         let (_, rec) = parse(&m).unwrap();
-                        let peer = open_info(&a.k, &rec).unwrap();
+                        let peer = open_info(&a.k, &rec, PairRole::Typer).unwrap();
                         assert_eq!(peer.power, Some(POWER_DEVICE));
                         let proof = local.signing_key.sign(&proof_message(
                             &peer.identity.unwrap(),
@@ -1004,7 +1078,7 @@ mod tests {
                             POWER_ADMIN,
                             &local.link_key,
                         ));
-                        let reply = seal_info(&a.k, &local, Some(proof));
+                        let reply = seal_info(&a.k, &local, Some(proof), PairRole::Shower);
                         socket.send_to(&reply, from).await.unwrap();
                         continue;
                     }

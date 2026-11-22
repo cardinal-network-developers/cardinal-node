@@ -26,9 +26,13 @@ use crate::contacts::{self, identity};
 use crate::daemon::Daemon;
 
 /// A trusted contact, and someone this person may introduce or be
-/// introduced through: not refused, and not set to no introductions.
-fn introduces(c: &ContactRecord) -> bool {
-    c.connects() && c.regard.introductions
+/// introduced through: not refused, and not set to no introductions, by
+/// every record this person has of them (two devices that made one at
+/// once made one contact, read the cautious way: `profiles.md#account`).
+fn introduces(contacts: &[ContactRecord], c: &ContactRecord) -> bool {
+    let all = cardinal_space::account::nodes_of(contacts, &c.identity);
+    let all = if all.is_empty() { vec![c] } else { all };
+    all.iter().all(|n| n.connects() && n.regard.introductions)
 }
 
 /// An introduction's invitation, if it is what it must be: made by `from`,
@@ -61,9 +65,10 @@ pub fn introduce(d: &Arc<Daemon>, who: &str, to: &str, note: Option<&str>) -> an
     let x = contacts::listed(d, who)?;
     let b = contacts::listed(d, to)?;
     anyhow::ensure!(x.identity != b.identity, "that is one person");
+    let all = d.core().contacts();
     for c in [&x, &b] {
         anyhow::ensure!(
-            introduces(c),
+            introduces(&all, c),
             "you do not introduce {}: they are not trusted, or set to no introductions",
             c.petname
         );
@@ -145,7 +150,7 @@ pub fn ask_in_group(
     let contacts = d.core().contacts();
     let admin = contacts
         .iter()
-        .find(|c| admins.contains(&c.identity) && introduces(c))
+        .find(|c| admins.contains(&c.identity) && introduces(&contacts, c))
         .ok_or_else(|| {
             anyhow::anyhow!("no admin of {group_name} that you know can introduce you")
         })?;
@@ -184,7 +189,7 @@ fn waiting(d: &Daemon) -> Vec<Waiting> {
     let core = d.core();
     let contacts = core.contacts();
     let mut out = Vec::new();
-    for c in contacts.iter().filter(|c| introduces(c)) {
+    for c in contacts.iter().filter(|c| introduces(&contacts, c)) {
         let Some(sp) = core.spaces.get(&c.space).and_then(|h| h.space.as_ref()) else {
             continue;
         };
@@ -320,7 +325,7 @@ async fn tend(d: &Arc<Daemon>) {
             let sp = core.spaces.get(&c.space).and_then(|h| h.space.as_ref());
             sp.map(relationship::introductions).unwrap_or_default()
         };
-        for b in contacts.iter().filter(|c| introduces(c)) {
+        for b in contacts.iter().filter(|c| introduces(&contacts, c)) {
             for n in intros_of(b) {
                 // Ben said yes to one this person made: Ana hears of it.
                 if n.creator == me && n.introducer == me {
@@ -330,7 +335,7 @@ async fn tend(d: &Arc<Daemon>) {
                         answer,
                         contacts
                             .iter()
-                            .find(|c| c.identity == n.introduced && introduces(c)),
+                            .find(|c| c.identity == n.introduced && introduces(&contacts, c)),
                     ) else {
                         continue;
                     };
@@ -372,7 +377,7 @@ async fn tend(d: &Arc<Daemon>) {
                     };
                     let target = contacts
                         .iter()
-                        .find(|c| c.identity == n.introduced && introduces(c));
+                        .find(|c| c.identity == n.introduced && introduces(&contacts, c));
                     let allowed = target.is_some() && {
                         let sp = core.spaces.get(&g).and_then(|h| h.space.as_ref());
                         sp.is_some_and(|sp| {
@@ -461,6 +466,50 @@ mod tests {
     use super::*;
     use cardinal_contact::EndpointAddr;
     use cardinal_link::CarrierKind;
+
+    fn record(node: u8, who: u8, introductions: bool, refused: bool) -> ContactRecord {
+        ContactRecord {
+            node: [node; 16],
+            identity: [who; 32],
+            petname: format!("p{node}"),
+            own: true,
+            suggested: None,
+            picture: None,
+            space: [node; 32],
+            regard: cardinal_space::account::Regard {
+                trusted: true,
+                introductions,
+            },
+            refused,
+            category: "People".into(),
+            met: None,
+            guardian: false,
+            recovery_of: None,
+        }
+    }
+
+    /// The review of 2026-11-22: two records of one contact, made on two
+    /// devices at once, are read the cautious way. One that takes no
+    /// introductions, or refuses them, decides for both.
+    #[test]
+    fn two_records_of_one_contact_give_the_cautious_answer() {
+        let yes = record(1, 7, true, false);
+        let no = record(2, 7, false, false);
+        let other = record(3, 8, true, false);
+        let all = [yes.clone(), no.clone(), other.clone()];
+        assert!(!introduces(&all, &yes) && !introduces(&all, &no));
+        assert!(introduces(&all, &other));
+        let refused = [yes.clone(), record(4, 7, true, true)];
+        assert!(!introduces(&refused, &yes));
+        assert!(introduces(&[yes.clone()], &yes));
+        // and in a group, a refused record means their own name is not shown
+        let me = [9; 32];
+        assert_eq!(
+            crate::groups::name_of(&me, &refused, &[], &[7; 32]),
+            "Someone"
+        );
+        assert_eq!(crate::groups::name_of(&me, &[yes], &[], &[7; 32]), "p1");
+    }
 
     /// Only the person introduced may connect by an introduction, with an
     /// invitation of the other's made for them: one written in by anyone else,

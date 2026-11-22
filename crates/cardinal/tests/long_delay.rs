@@ -79,3 +79,44 @@ fn summaries_on_a_long_link() {
         );
     }
 }
+
+/// An answer to a summary that brings more objects unasked than one may
+/// carry (here, for the test, three) is refused: the stream is reset, and
+/// the set reconciled turn by turn, its objects asked for. Nothing is lost.
+#[test]
+fn an_answer_beyond_what_a_summary_may_carry_is_refused() {
+    if !fuse_available() {
+        eprintln!("skipping: /dev/fuse or fusermount3 is not available");
+        return;
+    }
+    let root = tempfile::tempdir().unwrap();
+    let mut a = Dev::new(root.path(), "alpha", free_port());
+    let mut b = Dev::new(root.path(), "beta", free_port());
+    for d in [&mut a, &mut b] {
+        d.env
+            .push(("CARDINAL_TEST_SUMMARY_RTT_MS".into(), "0".into()));
+        d.env
+            .push(("CARDINAL_TEST_SUMMARY_ANSWER_MAX".into(), "3".into()));
+    }
+    a.start();
+    b.start();
+    let out = a.cli(&["init", "--yes", "--name", "alpha"]);
+    assert!(out.contains("Set up"), "{out}");
+    a.wait_mounted();
+    for i in 0..20 {
+        std::fs::write(a.p(&format!("a{i:02}.txt")), format!("alpha {i}\n")).unwrap();
+    }
+    a.cli(&["flush"]);
+    pair(&a, &b);
+    b.wait_mounted();
+    wait("beta has alpha's files", 60, || {
+        (0..20).all(|i| {
+            read(&b.p(&format!("a{i:02}.txt"))).as_deref() == Some(&format!("alpha {i}\n"))
+        })
+    });
+    let log = b.log();
+    assert!(
+        log.contains("reconciling") && log.contains("turn by turn"),
+        "{log}"
+    );
+}

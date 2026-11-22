@@ -472,9 +472,58 @@ async fn reconcile_inner(
     if !access.takes_objects() {
         return Ok(());
     }
+    let long = long_delay(s);
+    let r = Box::pin(reconcile_once(d, s, label, access, kind, long)).await;
+    match r {
+        // an answer to the summary beyond what one may carry: refused, and
+        // reconciled as on any link
+        Err(e) if long && e.downcast_ref::<TooMuchUnasked>().is_some() => {
+            tracing::debug!("{e}: reconciling {} turn by turn", short(&label));
+            Box::pin(reconcile_once(d, s, label, access, kind, false)).await
+        }
+        r => r,
+    }
+}
+
+/// A summary's answer brought more objects than one may carry
+/// ([`SUMMARY_ANSWER_FROM_OTHERS`]).
+#[derive(Debug)]
+struct TooMuchUnasked;
+
+impl std::fmt::Display for TooMuchUnasked {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("an answer to a summary beyond what one may carry")
+    }
+}
+
+impl std::error::Error for TooMuchUnasked {}
+
+/// The most objects, and bytes of them, taken unasked as the answer to
+/// this side's summary: from someone else's device as many as a
+/// drill-down may learn of ([`MAX_WANTED`]); from this person's own, 16
+/// times that. Beyond, the stream is reset and the set reconciled turn by
+/// turn, its objects asked for.
+const SUMMARY_ANSWER_FROM_OTHERS: (usize, usize) = (MAX_WANTED, 256 << 20);
+const SUMMARY_ANSWER_FROM_OWN: (usize, usize) = (16 * MAX_WANTED, 4 << 30);
+
+/// `CARDINAL_TEST_SUMMARY_ANSWER_MAX`, where tests set it: the most
+/// objects a summary's answer may carry, in place of the limits above.
+fn test_answer_max() -> Option<usize> {
+    std::env::var("CARDINAL_TEST_SUMMARY_ANSWER_MAX")
+        .ok()
+        .and_then(|v| v.parse().ok())
+}
+
+async fn reconcile_once(
+    d: &Arc<Daemon>,
+    s: &Session,
+    label: Label,
+    access: Access,
+    kind: PeerKind,
+    long: bool,
+) -> anyhow::Result<()> {
     let set = d.core().set(&label);
     let mut st = s.open_stream(Service::SYNC, Priority::Background)?;
-    let long = long_delay(s);
     if long {
         // One turn of short ids, so that the other sends at once what this
         // side lacks; the drill-down it then opens is the backstop.
@@ -584,6 +633,13 @@ async fn converse(
     let mut objects_ok = talk.objects_first;
     let mut arrived: Vec<Vec<u8>> = Vec::new();
     let mut arrived_bytes = 0usize;
+    let (most, most_bytes) = if is_someone_else(talk.kind) {
+        SUMMARY_ANSWER_FROM_OTHERS
+    } else {
+        SUMMARY_ANSWER_FROM_OWN
+    };
+    let most = test_answer_max().unwrap_or(most);
+    let (mut unasked, mut unasked_bytes) = (0usize, 0usize);
     loop {
         let m = match first.take() {
             Some(m) => m,
@@ -601,7 +657,14 @@ async fn converse(
         };
         match m {
             Message::Objects { objects, .. } if objects_ok => {
-                arrived_bytes += objects.iter().map(Vec::len).sum::<usize>();
+                let bytes = objects.iter().map(Vec::len).sum::<usize>();
+                unasked += objects.len();
+                unasked_bytes += bytes;
+                if unasked > most || unasked_bytes > most_bytes {
+                    st.reset(0);
+                    return Err(TooMuchUnasked.into());
+                }
+                arrived_bytes += bytes;
                 arrived.extend(objects);
                 if arrived_bytes >= INGEST_BATCH {
                     arrived_bytes = 0;
@@ -698,7 +761,12 @@ async fn answer_summary(
                 return Err(e.into());
             }
         }
-        let Some(v) = st.recv_message_max(longest).await? else {
+        // the rest of it, waited for in proportion to the round trip
+        let next = tokio::time::timeout(patience(s), st.recv_message_max(longest));
+        let Some(v) = next
+            .await
+            .map_err(|_| anyhow::anyhow!("summary: the rest of it timed out"))??
+        else {
             return Ok(());
         };
         m = match from_value(v) {

@@ -306,6 +306,7 @@ async fn find_and_pair(
     let ble = crate::bluetooth::find_pairing(d, code.channel);
     tokio::pin!(lan, ble);
     let (mut lan_done, mut ble_done) = (false, false);
+    let mut ble_failed: Option<anyhow::Error> = None;
     loop {
         tokio::select! {
             r = &mut lan, if !lan_done => {
@@ -316,16 +317,41 @@ async fn find_and_pair(
             }
             r = &mut ble, if !ble_done => {
                 ble_done = true;
-                if let Some(seen) = r {
+                let Some(seen) = r else { continue };
+                let tried = async {
                     let mut ch = crate::bluetooth::open_channel(&seen).await?;
-                    let p = pair_typer_on(local, code, &mut ch, Duration::from_secs(30))
-                        .await
-                        .map_err(pair_error)?;
-                    return Ok((p, Over::Ble(seen, ch)));
+                    match pair_typer_on(local, code, &mut ch, Duration::from_secs(30)).await {
+                        Ok(p) => Ok(Ok((p, ch))),
+                        Err(e) => Ok(Err(e)),
+                    }
+                };
+                let e = match tried.await {
+                    Ok(Ok((p, ch))) => return Ok((p, Over::Ble(seen, ch))),
+                    // what the code or the other device decided is the
+                    // same over any carrier
+                    Ok(Err(
+                        e @ (cardinal_contact::ContactError::WrongCode
+                        | cardinal_contact::ContactError::TooManyAttempts
+                        | cardinal_contact::ContactError::BadProof
+                        | cardinal_contact::ContactError::NoIdentity),
+                    )) => return Err(pair_error(e)),
+                    Ok(Err(e)) => pair_error(e),
+                    Err(e) => e,
+                };
+                // The radio failed it: the local network may still find
+                // the device, looked for again if it gave up meanwhile.
+                tracing::info!("pairing over Bluetooth failed: {e:#}; trying the local network");
+                ble_failed = Some(e);
+                if lan_done {
+                    lan.set(find_pairing(d.mdns_config(), code.channel, Duration::from_secs(20)));
+                    lan_done = false;
                 }
             }
             else => break,
         }
+    }
+    if let Some(e) = ble_failed {
+        return Err(e.context("not found on the local network either"));
     }
     anyhow::bail!(
         "could not find the device showing that code on the local network{}. Are both on the \
