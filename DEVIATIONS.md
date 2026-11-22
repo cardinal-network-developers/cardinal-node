@@ -473,21 +473,33 @@ differs or was read:
   with no guardian persona node for this person ("has not accepted"). The
   person is asked out of band. `cardinal guarding` lists those accepted
   but not named yet.
-- **Reading: burning a persona (and see changing guardians, above).**
-  "Burned once a recovery it acted in is in effect, and when a change of
-  policy no longer names it": a persona is burned once the person's
-  current policy no longer names it, and that policy descends from one
-  that did (this device remembers which, `persona:policy`, in
-  `guarding.json`), never from a record that failed to open for another
-  reason. A persona that acted in a recovery stays while the policy
-  naming it is current, to confirm the change that follows; after that,
-  30 days after the recovery took effect and the new device took it up
-  (the new root wrote again), it is burned in any case. Burning reads what
-  is held for the person first, writes `leave` in the persona's recovery
-  relationships, sets account persona field 5, stops the service and
-  removes its directory, and drops the copies held for the person, unless
-  another persona of this person's still guards them. `cardinal guarding
-  accept` repairs a relationship that lacks the persona's node.
+- **Burning a persona (D81, and see changing guardians, above).** A
+  persona ends only when the person's current policy no longer names it,
+  and that policy descends from one that did (this device remembers
+  which, `persona:policy`, in `guarding.json`), never from a record that
+  failed to open for another reason. Nothing else ends it: a persona
+  that acted in a recovery stays while the policy naming it is current,
+  however long (D79's "burned once a recovery it acted in is in effect"
+  is not built; the 30 days after a recovery that ended one before are
+  gone). Burning reads what is held for the person first, writes `leave`
+  in the persona's recovery relationships, sets account persona field 5,
+  stops the service and removes its directory, and drops the copies held
+  for the person, unless another persona of this person's still guards
+  them: those named now, and those this device took before
+  (`guarding.json` `held`), since the person's devices may have taken the
+  node naming one back already (**fixed on the way:** a copy so un-named
+  was kept for good). **Told, with nothing written for it:** the person's devices write
+  nothing to say a guardian was left out (a `leave` in the relationship
+  the two share would end their friendship, which holds the persona node,
+  the request and the held copy); the new policy in the person's log,
+  which the guardian's devices sync as a contact's, is the signal, and
+  the person's devices stop giving that guardian the sealed copy (the
+  held copy node goes, above). Where no other persona of this person's
+  guards them, `guarding` then lists `no_longer_needed` (`name`, `id`,
+  `at_ms`, `text`: "Ana no longer needs you as a guardian"), kept in
+  `guarding.json` until this person guards them again; `cardinal
+  guarding` prints it. `cardinal guarding accept` repairs a relationship
+  that lacks the persona's node.
 - **Reading: how a relationship is marked "recovery for" the person.**
   The spec says guardian software shows it so, never as a contact, but
   gives the account's contact node no field for it. Chose: contact field

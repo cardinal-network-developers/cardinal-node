@@ -1027,6 +1027,9 @@ fn print_guarding(v: &Value) {
             a.as_str().unwrap_or("")
         );
     }
+    for a in v["no_longer_needed"].as_array().into_iter().flatten() {
+        println!("{}.", a["text"].as_str().unwrap_or(""));
+    }
     if people.is_empty() {
         println!("You guard nobody.");
         return;

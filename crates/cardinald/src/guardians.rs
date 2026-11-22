@@ -99,10 +99,20 @@ struct Seen {
     /// a later policy no longer names is burned.
     #[serde(default)]
     named: BTreeSet<String>,
-    /// Decision (hex) to when this device first saw it in effect.
+    /// The people (hex) whose current policy no longer names the persona
+    /// this person guarded them through, and who are guarded through no
+    /// other, to when it was seen: "Ana no longer needs you as a guardian".
     #[serde(default)]
-    effect: BTreeMap<String, u64>,
+    no_longer: BTreeMap<String, u64>,
+    /// The copies this device took to hold for someone, as `person:label`
+    /// (hex): dropped when the persona goes, even once the person's
+    /// devices have taken back the node that named them.
+    #[serde(default)]
+    held: BTreeSet<String>,
 }
+
+/// One at a time: what is seen is read, added to, and written back.
+static SEEN: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 fn load_seen(d: &Daemon) -> Seen {
     std::fs::read(d.paths.guarding())
@@ -1455,12 +1465,16 @@ fn shown(d: &Daemon, seen: &Seen, g: &Guarded) -> Shown {
 /// and when a threshold of guardians was first seen to endorse it, and
 /// which personas a policy has named. Called whenever a log changes.
 pub fn observe(d: &Daemon) {
-    // one at a time: what is seen is read, added to, and written back
-    static ONE: std::sync::Mutex<()> = std::sync::Mutex::new(());
-    let _one = ONE.lock().unwrap_or_else(|e| e.into_inner());
+    let _one = SEEN.lock().unwrap_or_else(|e| e.into_inner());
     let mut seen = load_seen(d);
     let mut changed = false;
     for g in guarded(d) {
+        for l in d.core().held_taken(&g.identity) {
+            let item = format!("{}:{}", hex::encode(g.identity), hex::encode(l));
+            if seen.held.insert(item) {
+                changed = true;
+            }
+        }
         for ch in changes(d, &g) {
             if let std::collections::btree_map::Entry::Vacant(v) =
                 seen.first.entry(hex::encode(ch.entry))
@@ -1486,10 +1500,6 @@ pub fn observe(d: &Daemon) {
         };
         for w in &all {
             let key = hex::encode(w.recovery.entry);
-            if w.in_effect && !seen.effect.contains_key(&key) {
-                seen.effect.insert(key.clone(), now_ms());
-                changed = true;
-            }
             if !seen.first.contains_key(&key) {
                 if under_way(&seen) > 0 && !w.in_effect {
                     tracing::warn!(
@@ -1642,6 +1652,7 @@ pub fn list(d: &Daemon) -> Json {
         "guarding": people,
         "accepted": accepted,
         "named_in_change": in_change,
+        "no_longer_needed": no_longer_json(d, &seen),
         "asked": asked(d),
         "now_ms": now_ms(),
     })
@@ -2658,14 +2669,13 @@ fn retire_moot(d: &Arc<Daemon>) {
     }
 }
 
-/// How long a persona waits, after a recovery it acted in took effect, for
-/// the new device to take it up, before it is burned anyway.
-const SPENT_AFTER_MS: u64 = 30 * 24 * 60 * 60 * 1000;
-
-/// Burns the guardian personas whose purpose is over (D79): one that
-/// acted in a recovery now in effect, and one a policy named that the
-/// current policy no longer names. Its service stops and goes; the account
-/// keeps it, burned, and its id is never used again.
+/// Burns the guardian personas whose purpose is over (D79, D81): one
+/// that a policy named and that the person's current policy, which
+/// descends from that one, no longer names. A persona that acted in a
+/// recovery stays while the policy naming it is current. Its service stops
+/// and goes; the account keeps it, burned, and its id is never used again.
+/// Where no other persona guards the same person, this person is told "Ana
+/// no longer needs you as a guardian".
 async fn burn_spent(d: &Arc<Daemon>) {
     let seen = load_seen(d);
     let all = guarded(d);
@@ -2677,49 +2687,6 @@ async fn burn_spent(d: &Arc<Daemon>) {
             .iter()
             .filter(|g| g.persona.identity == p.identity)
             .collect();
-        // A recovery it acted in is in effect, and the new device has
-        // taken it up (the new root wrote again in the log), or a month has
-        // passed: until then the persona's relationships may still hold
-        // what the new device needs, its last confirmation among them.
-        let finished = |w: &Wanted| {
-            let core = d.core();
-            let found = core.others.get(&who).is_some_and(|o| {
-                let st = o.log.state();
-                o.log.entries().any(|e| {
-                    e.signer() == w.recovery.root
-                        && e.id() != w.recovery.entry
-                        && st.is_valid(&e.id())
-                })
-            });
-            found
-        };
-        let long_ago = |w: &Wanted| {
-            seen.effect
-                .get(&hex::encode(w.recovery.entry))
-                .is_some_and(|t| now_ms().saturating_sub(*t) > SPENT_AFTER_MS)
-        };
-        // The guardians who acted confirm the `set_recovery` that follows
-        // (`identity.md#what-a-recovery-does`): a persona that acted stays
-        // until a policy no longer names it, or until long after.
-        let cur = {
-            let core = d.core();
-            core.others
-                .get(&who)
-                .and_then(|o| o.log.current_policy())
-                .map(|q| q.entry)
-        };
-        // and never while the policy naming it is the current one
-        let spent = mine
-            .iter()
-            .filter(|g| Some(g.policy.entry) != cur)
-            .any(|g| {
-                wanted(d, g).iter().any(|w| {
-                    w.in_effect
-                        && (w.endorsed.contains(&p.identity) || w.confirmed.contains(&p.identity))
-                        && finished(w)
-                        && long_ago(w)
-                })
-            });
         // A later policy, in effect, that no longer names it: known only
         // when that policy descends from one that named it, never from a
         // record that failed to open for another reason.
@@ -2744,7 +2711,7 @@ async fn burn_spent(d: &Arc<Daemon>) {
                     && !mine.iter().any(|g| g.policy.entry == current)
             })
         };
-        if !(spent || dropped) {
+        if !dropped {
             continue;
         }
         let Some(acc) = d.core().account_id() else {
@@ -2753,7 +2720,7 @@ async fn burn_spent(d: &Arc<Daemon>) {
         // What is held for the person, read before the persona is burned:
         // dropped only if no other persona for them stays, as a guardian
         // named again keeps it.
-        let held = {
+        let (held, others) = {
             let core = d.core();
             let others = core
                 .account()
@@ -2766,11 +2733,25 @@ async fn burn_spent(d: &Arc<Daemon>) {
                             && q.identity != p.identity
                     })
                 });
-            if others {
+            let mut held = if others {
                 Vec::new()
             } else {
                 core.held_taken(&who)
+            };
+            // and what was taken for them before, which the person's
+            // devices may have stopped naming already
+            if !others {
+                let mine = format!("{}:", hex::encode(who));
+                for item in seen.held.iter().filter(|i| i.starts_with(&mine)) {
+                    let l: Option<[u8; 32]> = hex::decode(&item[mine.len()..])
+                        .ok()
+                        .and_then(|b| b.try_into().ok());
+                    if let Some(l) = l.filter(|l| !held.contains(l)) {
+                        held.push(l);
+                    }
+                }
             }
+            (held, others)
         };
         if let Err(e) = d.write_and_push(
             &acc,
@@ -2812,8 +2793,49 @@ async fn burn_spent(d: &Arc<Daemon>) {
                 core.drop_held(&l);
             }
         }
+        if !others {
+            let _one = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+            let mut seen = load_seen(d);
+            seen.no_longer
+                .entry(hex::encode(who))
+                .or_insert_with(now_ms);
+            let mine = format!("{}:", hex::encode(who));
+            seen.held.retain(|i| !i.starts_with(&mine));
+            save_seen(d, &seen);
+            drop(_one);
+            d.bump();
+        }
         tracing::info!("burned persona {}", short(&p.identity));
     }
+}
+
+/// The people whose current policy no longer names this person's guardian
+/// persona for them, and whom no other persona of theirs guards, as a
+/// window shows them: "Ana no longer needs you as a guardian". Each stays
+/// listed until this person guards them again.
+fn no_longer_json(d: &Daemon, seen: &Seen) -> Vec<Json> {
+    let mine = my_personas(d);
+    let core = d.core();
+    seen.no_longer
+        .iter()
+        .filter_map(|(who, at)| {
+            let id: EntryId = hex::decode(who).ok()?.try_into().ok()?;
+            if mine.iter().any(|p| p.for_identity == Some(id)) {
+                return None;
+            }
+            let name = core
+                .contacts()
+                .into_iter()
+                .find(|c| c.identity == id && c.recovery_of.is_none())
+                .map_or_else(|| account::short_key(&id), |c| c.petname);
+            Some(json!({
+                "name": name,
+                "id": who,
+                "at_ms": at,
+                "text": format!("{name} no longer needs you as a guardian"),
+            }))
+        })
+        .collect()
 }
 
 /// Starts the services of this person's guardian personas that this

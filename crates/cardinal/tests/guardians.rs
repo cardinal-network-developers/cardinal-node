@@ -759,6 +759,25 @@ fn guardians_change_with_the_guardians_consent() {
     wait("cy guards nobody", 30, || {
         cy.cli(&["guarding"]).contains("You guard nobody")
     });
+    // Nothing was written to tell cy: the policy in effect no longer names
+    // the persona, and cy's device says so.
+    assert!(
+        cy.cli(&["guarding"])
+            .contains("Ana no longer needs you as a guardian"),
+        "{}",
+        cy.cli(&["guarding"])
+    );
+    // and holds her account for her no more
+    let account = ana.status()["spaces"]
+        .as_array()
+        .and_then(|a| a.iter().find(|x| x["kind"] == "account"))
+        .and_then(|x| x["id"].as_str().map(str::to_owned))
+        .unwrap();
+    wait("cy holds no copy of ana's account", 30, || {
+        cy.status()["spaces"]
+            .as_array()
+            .is_some_and(|a| a.iter().all(|x| x["id"] != account.as_str()))
+    });
     // Di holds the account now; cy may no longer fetch it; bo, named
     // again, keeps the copy his burned persona held.
     hold_account(&ana, &[&di]);
@@ -768,6 +787,8 @@ fn guardians_change_with_the_guardians_consent() {
     assert!(bo
         .cli(&["guarding"])
         .contains("sealed copy of their account"));
+    // Bo, named again through a fresh persona, still guards her: no notice.
+    assert!(!bo.cli(&["guarding"]).contains("no longer needs you"));
 
     // And the new guardians recover her: the new device sees the new
     // policy in office, by the old guardians' confirmations their personas
@@ -792,6 +813,14 @@ fn guardians_change_with_the_guardians_consent() {
     let o = new.try_cli(&["recover", "finish"]);
     assert!(o.status.success(), "{}", out(&o));
     assert!(out(&o).contains("your account, contacts"), "{}", out(&o));
+    // The personas that acted stay while the policy naming them is the
+    // current one, once the new device has taken the identity up too (D81).
+    std::thread::sleep(Duration::from_secs(3));
+    for g in [&bo, &di] {
+        let o = g.cli(&["guarding"]);
+        assert!(o.contains("Ana: one of 2 guardians"), "{o}");
+        assert!(!o.contains("no longer needs you"), "{o}");
+    }
 }
 
 /// A new device lost before the recovery is in effect is started over on
