@@ -702,26 +702,57 @@ pub fn moved_seen(d: &Daemon, group: &str) -> anyhow::Result<Json> {
 
 /// The person's OK to how another of their devices moved a group
 /// (`spaces.md#a-succession-by-a-device-that-is-later-removed`, "Kept when
-/// the person confirms it"): keeps each succession its `confirm` lists, a
-/// `keep` of the `succeed` and of the genesis it names, and clears the
-/// note as [`moved_seen`] does. Answers how many entries it wrote.
-pub fn confirm_move(d: &Arc<Daemon>, group: &str) -> anyhow::Result<Json> {
+/// the person confirms it"): keeps each succession `moves` names (by the
+/// earlier group it left, as `to_confirm` gives it) that still awaits
+/// their word, a `keep` of the `succeed` and of the genesis it names, and
+/// clears the note as [`moved_seen`] does. A move the person was not shown,
+/// one that arrived after, is not kept. Answers how many entries it wrote.
+pub fn confirm_move(d: &Arc<Daemon>, group: &str, moves: &[String]) -> anyhow::Result<Json> {
     let g = find(d, group)?;
-    let written = {
-        let mut core = d.core();
-        let mut written = Vec::new();
-        for old in core.successions_to_confirm(&g.id) {
-            written.extend(core.keep_succession(&old)?);
-        }
-        core.moved_seen(&g.id);
-        written
-    };
+    anyhow::ensure!(
+        !moves.is_empty(),
+        "say which moves the person saw (moves: the groups to_confirm gives)"
+    );
+    let mut seen = Vec::new();
+    for m in moves {
+        let id: Option<SpaceId> = hex::decode(m).ok().and_then(|b| b.try_into().ok());
+        seen.push(id.ok_or_else(|| anyhow::anyhow!("a move is a group id in hex: {m}"))?);
+    }
+    let written = d.core().confirm_moves(&g.id, &seen)?;
     let kept = written.len();
     for (space, bytes) in written {
         d.push(&space, vec![bytes]);
     }
     d.bump();
     Ok(json!({ "kept": kept }))
+}
+
+/// Each move on the way to `id` that awaits this person's word, nearest
+/// first: `group`, the earlier group it left (what `group-confirm-move`
+/// takes), `to`, the group it moved to, who moved it and on which device,
+/// when, and what it changed.
+fn to_confirm_json(
+    core: &Core,
+    me: &[u8; 32],
+    contacts: &[ContactRecord],
+    named: &[Member],
+    id: &SpaceId,
+) -> Vec<Json> {
+    core.successions_to_confirm(id)
+        .iter()
+        .filter_map(|old| {
+            let new = core.spaces.get(old)?.space.as_ref()?.successor()?;
+            let sp = core.spaces.get(&new)?.space.as_ref()?;
+            let mut c = change_json(core, me, contacts, named, &new);
+            c["group"] = json!(hex::encode(old));
+            c["to"] = json!(hex::encode(new));
+            c["by"] = json!(name_of(me, contacts, named, &sp.creator()));
+            c["at"] = json!(sp.entry(&new).and_then(|g| g.time()));
+            c["seen"] = json!(core.spaces.get(&new).and_then(|h| h.notes().first_seen_ms));
+            c["device"] = json!(core.moved_by_device(&new));
+            Some(c)
+        })
+        .collect()
 }
 
 fn name_of(
@@ -812,11 +843,8 @@ pub fn list_of(core: &Core) -> Json {
         let seen = notes.and_then(|n| n.first_seen_ms);
         let fresh = seen.is_none_or(|t| now_ms().saturating_sub(t) < MOVED_FOR_MS);
         // what another device of the person's moved, until they say OK
-        let confirm: Vec<String> = core
-            .successions_to_confirm(id)
-            .iter()
-            .map(hex::encode)
-            .collect();
+        let to_confirm = to_confirm_json(core, &me, &contacts, &named, id);
+        let confirm: Vec<Json> = to_confirm.iter().map(|c| c["group"].clone()).collect();
         let told = fresh && !notes.is_some_and(|n| n.moved_seen);
         let moved = (sp.succeeds().is_some() && (told || !confirm.is_empty())).then(|| {
             let mut c = change_json(core, &me, &contacts, &named, id);
@@ -839,6 +867,7 @@ pub fn list_of(core: &Core) -> Json {
             "ended": ended,
             "moved": moved,
             "confirm": confirm,
+            "to_confirm": to_confirm,
             "did_not_stand": lost_ids,
             "did_not_stand_changes": lost,
             "held_back": core.held_back(id),

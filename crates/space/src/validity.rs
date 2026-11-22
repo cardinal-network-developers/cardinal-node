@@ -158,9 +158,12 @@ fn mark_in(records: &[cardinal_identity::Protocol], name: &[u8; 32]) -> Option<b
 
 /// The mark of extension `name` for entry `id` of a space: what the
 /// protocol records in its causal past, or in it, say. Only the records
-/// the space's genesis holds, and those its owner wrote, count: only the
-/// owner may write `set_protocol` (`evolution.md#declaring-what-you-speak`),
-/// so no one else's declares anything, valid or not.
+/// the space's genesis holds, and those in valid entries its owner wrote
+/// (`counts`), count: only the owner may write `set_protocol`
+/// (`evolution.md#declaring-what-you-speak`), so no one else's declares
+/// anything, and nor does an entry of theirs that is not valid, such as one
+/// a removed key signed. The entry's own records count for it where its
+/// author is the owner.
 fn extension_mark(
     dag: &Dag<SpaceEntry>,
     genesis: Option<EntryId>,
@@ -168,6 +171,7 @@ fn extension_mark(
     id: &EntryId,
     e: &SpaceEntry,
     name: &[u8; 32],
+    counts: &dyn Fn(&EntryId) -> bool,
 ) -> Option<bool> {
     let past = if e.is_genesis() {
         HashSet::new()
@@ -178,7 +182,9 @@ fn extension_mark(
     let mine = std::iter::once((*id, e));
     let earlier = past.iter().filter_map(|x| Some((*x, dag.get(x)?)));
     for (x, xe) in mine.chain(earlier) {
-        if Some(x) == genesis || (e.is_genesis() && x == *id) || Some(xe.author()) == owner {
+        let own = x == *id && (e.is_genesis() || Some(xe.author()) == owner);
+        let owners = Some(xe.author()) == owner && counts(&x);
+        if Some(x) == genesis || own || owners {
             records.extend(protocols(xe));
         }
     }
@@ -466,6 +472,16 @@ pub struct Judge {
     /// The genesis is valid: its signature counts and it is well formed.
     root: bool,
     validity: Validity,
+    /// Entries after the genesis that its owner wrote and that hold a
+    /// protocol record.
+    proto: Vec<EntryId>,
+    /// Those of them whose records count for what descends from them: the
+    /// valid ones ([`extension_mark`]).
+    declarers: HashSet<EntryId>,
+    /// An entry here uses an extension.
+    ext_used: bool,
+    /// Judging everything again, as [`Judge::settle_declarers`] does.
+    rebuilding: bool,
 }
 
 impl Default for Judge {
@@ -490,6 +506,10 @@ impl Judge {
             genesis: None,
             root: false,
             validity: Validity::default(),
+            proto: Vec::new(),
+            declarers: HashSet::new(),
+            ext_used: false,
+            rebuilding: false,
         }
     }
 
@@ -524,6 +544,75 @@ impl Judge {
     /// If the entry or one of its parents is not in `dag`, or a parent was
     /// never given to this judge.
     pub fn arrive(&mut self, dag: &Dag<SpaceEntry>, id: &EntryId) -> Vec<EntryId> {
+        let changed = self.arrive_one(dag, id);
+        // nothing descends from it yet: its records count from now on if it
+        // is valid
+        if self.proto.last() == Some(id) && self.validity.valid.contains(id) {
+            self.declarers.insert(*id);
+        }
+        self.settle_declarers(dag, changed)
+    }
+
+    /// Where an entry of the owner's that holds a protocol record has come
+    /// to be valid, or stopped being so, since what descends from it was
+    /// judged, and an extension is used here: judges everything again with
+    /// the records of those valid now counting, until that holds of what
+    /// it finds. Rare: such an entry is the owner's own. Returns `changed`
+    /// with every entry whose validity that changed.
+    fn settle_declarers(&mut self, dag: &Dag<SpaceEntry>, changed: Vec<EntryId>) -> Vec<EntryId> {
+        if self.rebuilding {
+            return changed;
+        }
+        let valid_now = |j: &Judge| -> HashSet<EntryId> {
+            let valid = &j.validity.valid;
+            j.proto
+                .iter()
+                .filter(|x| valid.contains(*x))
+                .copied()
+                .collect()
+        };
+        let mut now = valid_now(self);
+        if now == self.declarers {
+            return changed;
+        }
+        if !self.ext_used {
+            self.declarers = now;
+            return changed;
+        }
+        let before = self.validity.valid.clone();
+        let order: Vec<EntryId> = dag
+            .log_order()
+            .iter()
+            .filter(|x| self.info.contains_key(*x))
+            .copied()
+            .collect();
+        // a handful of rounds settles any history a person makes
+        for _ in 0..4 {
+            let mut fresh = Judge::new();
+            fresh.states = self.states.clone();
+            fresh.declarers = now.clone();
+            fresh.rebuilding = true;
+            for x in &order {
+                fresh.arrive_one(dag, x);
+            }
+            fresh.rebuilding = false;
+            let found = valid_now(&fresh);
+            *self = fresh;
+            if found == now {
+                break;
+            }
+            now = found;
+        }
+        let mut out = changed;
+        for x in before.symmetric_difference(&self.validity.valid) {
+            if !out.contains(x) {
+                out.push(*x);
+            }
+        }
+        out
+    }
+
+    fn arrive_one(&mut self, dag: &Dag<SpaceEntry>, id: &EntryId) -> Vec<EntryId> {
         let e = dag.get(id).expect("an entry that arrived is in the graph");
         let (author, key, head) = (e.author(), e.signer(), e.author_head());
         // A space has one genesis: its id is the space's. A second entry
@@ -540,19 +629,24 @@ impl Judge {
         let mut leave = false;
         let mut opaque = false;
         let (gid, owner) = (self.genesis.as_ref().map(|g| g.id), self.owner());
+        let counts = |x: &EntryId| self.declarers.contains(x);
+        let mut ext_used = false;
         for op in e.ops() {
             // An extension op is what the protocol records say: an op
             // nobody defined where none declares it, and otherwise nothing
             // to validity, opaque where marked critical, since nothing
             // here knows any extension (`evolution.md#critical-and-ignorable`).
             let class = match class(e, op.body()) {
-                Class::Ext(name) => match extension_mark(dag, gid, owner, id, e, &name) {
-                    None => Class::Invalid,
-                    Some(critical) => {
-                        opaque |= critical;
-                        Class::Declared
+                Class::Ext(name) => {
+                    ext_used = true;
+                    match extension_mark(dag, gid, owner, id, e, &name, &counts) {
+                        None => Class::Invalid,
+                        Some(critical) => {
+                            opaque |= critical;
+                            Class::Declared
+                        }
                     }
-                },
+                }
                 c => c,
             };
             need = match (need, least_role(class, op.body(), has_owner)) {
@@ -574,6 +668,10 @@ impl Judge {
                 SpaceOpBody::Leave => leave = true,
                 _ => {}
             }
+        }
+        self.ext_used |= ext_used;
+        if !genesis && owner == Some(author) && !protocols(e).is_empty() {
+            self.proto.push(*id);
         }
         if opaque {
             // what this verifier cannot read vouches for nothing and ends
@@ -730,7 +828,11 @@ impl Judge {
         let keepers = self.listed.get(id).map_or(&[][..], |v| v.as_slice());
         keepers.iter().any(|w| {
             let counts = self.info.get(w).is_some_and(|i| i.ok);
-            let same = dag.get(w).is_some_and(|we| we.author() == *author);
+            // a `keep` for the key that signed it keeps nothing: no entry
+            // vouches for its own key's past
+            let same = dag
+                .get(w)
+                .is_some_and(|we| we.author() == *author && we.signer() != *key);
             let keeps = self.marked(w).map_or(&[][..], |m| m.keeps.as_slice());
             counts && same && keeps.iter().any(|(k, es)| k == key && es.contains(id))
         })
@@ -822,7 +924,7 @@ impl Judge {
         let Some(keeps) = self.marked(w).map(|m| &m.keeps).filter(|k| !k.is_empty()) else {
             return;
         };
-        let Some(author) = dag.get(w).map(|we| we.author()) else {
+        let Some((author, signer)) = dag.get(w).map(|we| (we.author(), we.signer())) else {
             return;
         };
         let Some(waiting) = self.waiting.get(&author) else {
@@ -830,6 +932,10 @@ impl Judge {
         };
         let mut found = Vec::new();
         for (k, listed) in keeps {
+            // a `keep` for the key that signed it keeps nothing
+            if *k == signer {
+                continue;
+            }
             let Some(ys) = waiting.get(k) else { continue };
             let listed = listed.iter().filter(|l| only.is_none_or(|o| o == *l));
             // an entry that is not here yet keeps nothing until it is
@@ -867,7 +973,8 @@ impl Judge {
             return Vec::new();
         }
         self.states.insert(author, state);
-        self.recount(dag, &author)
+        let changed = self.recount(dag, &author);
+        self.settle_declarers(dag, changed)
     }
 
     /// Works out again, from nothing, which of one author's entries have a
@@ -916,7 +1023,7 @@ impl Judge {
                         built_on.extend_from_slice(dag.parents(w));
                     }
                     for (key, listed) in self.marked(w).map_or(&[][..], |m| m.keeps.as_slice()) {
-                        if *key == k {
+                        if *key == k && wkey != k {
                             kept.extend_from_slice(listed);
                         }
                     }
@@ -1426,7 +1533,46 @@ pub struct ByRules {
 /// The cost is quadratic in the number of entries: this is the reference
 /// the native evaluation is tested against, not something to run on a
 /// space of any size.
+///
+/// Which of the owner's entries declare extensions for what descends from
+/// them turns on which are valid ([`extension_mark`]): it is evaluated
+/// again with the records of those found valid until that holds of what
+/// it finds, as the native evaluation does.
 pub fn by_rules(dag: &Dag<SpaceEntry>, logs: &[&IdentityLog]) -> Result<ByRules, Error> {
+    let g = dag.log_order().first().and_then(|g| dag.get(g));
+    let g = g.ok_or(Error::Malformed("no genesis"))?;
+    let space = g.id();
+    let first = Genesis::read(&space, g);
+    let owner = first.formed.then_some(first.owner).flatten();
+    let proto: Vec<EntryId> = dag
+        .iter()
+        .filter(|(_, e)| !e.is_genesis() && Some(e.author()) == owner && !protocols(e).is_empty())
+        .map(|(id, _)| *id)
+        .collect();
+    let mut r = by_rules_with(dag, logs, None)?;
+    let mut declarers: Option<HashSet<EntryId>> = None;
+    for _ in 0..5 {
+        let found: HashSet<EntryId> = proto
+            .iter()
+            .filter(|x| r.valid.contains(*x))
+            .copied()
+            .collect();
+        if declarers.as_ref() == Some(&found) || (declarers.is_none() && found.len() == proto.len())
+        {
+            break;
+        }
+        r = by_rules_with(dag, logs, Some(&found))?;
+        declarers = Some(found);
+    }
+    Ok(r)
+}
+
+fn by_rules_with(
+    dag: &Dag<SpaceEntry>,
+    logs: &[&IdentityLog],
+    declarers: Option<&HashSet<EntryId>>,
+) -> Result<ByRules, Error> {
+    let counts = |x: &EntryId| declarers.is_none_or(|d| d.contains(x));
     let g = dag.log_order().first().and_then(|g| dag.get(g));
     let g = g.ok_or(Error::Malformed("no genesis"))?;
     let space = g.id();
@@ -1441,15 +1587,17 @@ pub fn by_rules(dag: &Dag<SpaceEntry>, logs: &[&IdentityLog]) -> Result<ByRules,
         let mut ops = Vec::new();
         for o in e.ops() {
             let class = match class(e, o.body()) {
-                Class::Ext(name) => match extension_mark(dag, Some(space), owner, id, e, &name) {
-                    None => Class::Invalid,
-                    Some(critical) => {
-                        if critical && !opaque.contains(id) {
-                            opaque.push(*id);
+                Class::Ext(name) => {
+                    match extension_mark(dag, Some(space), owner, id, e, &name, &counts) {
+                        None => Class::Invalid,
+                        Some(critical) => {
+                            if critical && !opaque.contains(id) {
+                                opaque.push(*id);
+                            }
+                            Class::Declared
                         }
-                        Class::Declared
                     }
-                },
+                }
                 c => c,
             };
             ops.push(match (class, o.body()) {

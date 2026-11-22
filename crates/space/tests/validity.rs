@@ -1723,3 +1723,73 @@ fn the_protocol_record_marks_each_extension_in_a_space_too() {
     assert_eq!(s.valid(&["stranger", "on_it"]), [false, true]);
     assert_eq!(s.judge.validity().stalled.len(), 1);
 }
+
+/// The review of 2026-11-22: only the genesis and the owner's valid
+/// entries declare. An entry of the owner's whose signature does not count
+/// declares nothing, whether its key was removed before it was written or
+/// it came to need a witness after and none came; and what used the
+/// extension it declared is judged again when it stops counting.
+#[test]
+fn only_the_owner_s_valid_entries_declare() {
+    let (early, late) = ([0x44u8; 32], [0x55u8; 32]);
+    let ext = |name: [u8; 32]| {
+        vec![SpaceOp::from_record(
+            Record::new().with(0, name).with(1, 7u64),
+        )]
+    };
+    let protocol = |exts: &[([u8; 32], bool)]| {
+        let p = cardinal_identity::Protocol {
+            base: [0; 32],
+            extensions: exts.to_vec(),
+        };
+        vec![SpaceOp::from_record(
+            Record::new().with(0, 9u32).with(1, p.to_record()),
+        )]
+    };
+    let mut s = Scene::new(ANA, A, &[(ANA, OWNER), (CY, READER)], None);
+    // Ana's phone declares one, and Cy uses it: valid while the phone counts
+    s.write("by_phone", ANA, P, protocol(&[(early, false)]), None);
+    s.write("early", CY, P, ext(early), Some(&["by_phone"]));
+    assert_eq!(s.valid(&["by_phone", "early"]), [true, true]);
+    // the phone is removed, and nothing of Ana's under another key built
+    // on its entry: it stops counting, and declares nothing
+    s.remove_phone(ANA);
+    assert_eq!(s.valid(&["by_phone", "early"]), [false, false]);
+    // written by the removed key after, it declares nothing either
+    s.write("removed", ANA, P, protocol(&[(late, false)]), None);
+    s.write("late", CY, P, ext(late), Some(&["removed"]));
+    assert_eq!(s.valid(&["removed", "late"]), [false, false]);
+    // kept, the phone's entry counts again, and so does what it declared
+    s.write("k", ANA, A, keep(&s, ANA, P, &["by_phone"]), None);
+    assert_eq!(s.valid(&["by_phone", "early"]), [true, true]);
+}
+
+/// The review of 2026-11-22: a `keep` a key writes for itself keeps
+/// nothing, even where another key of the person's built on it. Else a
+/// phone could write a `succeed` and then such a keep, and the laptop,
+/// building on it unknowingly, would keep the `succeed` its person never
+/// confirmed.
+#[test]
+fn a_keep_for_its_own_key_keeps_nothing() {
+    let mut s = Scene::new(ANA, A, &[(ANA, OWNER)], None);
+    s.write("w", ANA, A, app(), None);
+    s.write("end", ANA, P, succeed(1), None);
+    s.write("self", ANA, P, keep(&s, ANA, P, &["end"]), Some(&["end"]));
+    s.write("p", ANA, P, app(), Some(&["w"]));
+    s.write("own", ANA, P, keep(&s, ANA, P, &["p"]), Some(&["p"]));
+    // the laptop builds on the self-keep, and then the phone is removed:
+    // the self-keep is witnessed, and what it lists is not kept by it
+    s.write("on", ANA, A, app(), Some(&["self", "own"]));
+    s.remove_phone(ANA);
+    assert!(s.judge.validity().author_ok.contains(&s.named["self"]));
+    assert!(!s.judge.validity().author_ok.contains(&s.named["end"]));
+    assert!(
+        s.judge.validity().author_ok.contains(&s.named["p"]),
+        "witnessed"
+    );
+    // a keep the laptop writes for the phone keeps it
+    s.write("k", ANA, A, keep(&s, ANA, P, &["end"]), Some(&["on"]));
+    assert!(s.judge.validity().author_ok.contains(&s.named["end"]));
+    let logs: Vec<&IdentityLog> = s.people.iter().map(|p| &p.log).collect();
+    compare(&s.judge, &s.dag, &logs, "a keep for its own key");
+}

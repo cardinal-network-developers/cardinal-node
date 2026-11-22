@@ -298,10 +298,11 @@ rec!(GROUP "group":
     1 "admin" BOOL, 2 "did_not_stand" [B], 3 "did_not_stand_changes" [GROUP_CHANGE],
     4 "ended" T, 5 "group" B, 6 "held_back" U, 7 "introductions" BOOL, 8 "last" {LAST},
     9 "members" U, 10 "moved" {GROUP_CHANGE}, 11 "name" T, 12 "not_posted" U, 13 "public" BOOL,
-    14 "reach" {GROUP_REACH}, 15 "role" T, 16 "unread" U, 17 "was" B, 18 "confirm" [B]);
+    14 "reach" {GROUP_REACH}, 15 "role" T, 16 "unread" U, 17 "was" B, 18 "confirm" [B],
+    19 "to_confirm" [GROUP_CHANGE]);
 rec!(GROUP_CHANGE "group change":
     1 "at" U, 2 "by" T, 3 "group" B, 4 "roles" [ROLE_CHANGE], 5 "seen" U, 6 "taken_out" [T],
-    7 "device" T);
+    7 "device" T, 8 "to" B);
 rec!(GROUP_REACH "group reach":
     1 "added" [T], 2 "ask" BOOL, 3 "public" BOOL, 4 "said_no" BOOL, 5 "set" BOOL,
     6 "shared" BOOL, 7 "waiting" BOOL, 8 "what" [T], 9 "who" [T], 10 "named" [T]);
@@ -562,7 +563,7 @@ pub static REQUESTS: &[Request] = &[
     req!(82 "group-role" (1 "group" REF, 2 "who" REF, 3 "role" T) -> (2 "group" B, 3 "was" B)),
     req!(83 "group-post-again" (1 "group" REF) -> (2 "posted" U)),
     req!(84 "group-moved-seen" (1 "group" REF) -> ()),
-    req!(85 "group-confirm-move" (1 "group" REF) -> (2 "kept" U)),
+    req!(85 "group-confirm-move" (1 "group" REF, 2 "moves" [B]) -> (2 "kept" U)),
     // ---- Calls and the clipboard: 100 to 119 ----
     req!(100 "call" () -> (2 "call" {CALL}, 3 "ended" {CALL_ENDED})),
     req!(101 "call-start" (1 "who" REF, 2 "group" REF, 3 "formats" [B], 4 "format_names" [T]) -> ()),

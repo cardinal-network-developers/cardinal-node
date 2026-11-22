@@ -3444,7 +3444,7 @@ impl Core {
                     continue;
                 }
                 let Some(e) = sp.dag().get(x) else { continue };
-                if keys.contains(&&e.signer()) {
+                if keys.contains(&&e.signer()) && !self.ends_or_begins(id, x, &e.signer()) {
                     let by_key = wanted.entry(*id).or_default();
                     by_key.entry(e.signer()).or_default().push(*x);
                 }
@@ -3576,6 +3576,24 @@ impl Core {
         out
     }
 
+    /// The person's OK to the moves on the way to `id` that they saw
+    /// (`seen`, each by the earlier space it left): keeps each of them that
+    /// still awaits their word ([`Core::keep_succession`]), and nothing
+    /// else, so that a move that arrived after they looked is not kept on
+    /// a word given before it. Clears the note of the move once nothing is
+    /// left to confirm. Software MUST NOT call this without its person.
+    pub fn confirm_moves(&mut self, id: &SpaceId, seen: &[SpaceId]) -> anyhow::Result<Written> {
+        let waiting = self.successions_to_confirm(id);
+        let mut written = Vec::new();
+        for old in waiting.iter().filter(|o| seen.contains(o)) {
+            written.extend(self.keep_succession(old)?);
+        }
+        if waiting.iter().all(|o| seen.contains(o)) {
+            self.moved_seen(id);
+        }
+        Ok(written)
+    }
+
     /// The name of the person's device that signed the genesis of `id`, a
     /// successor, where that is another device of theirs: who moved it.
     pub fn moved_by_device(&self, id: &SpaceId) -> Option<String> {
@@ -3624,6 +3642,24 @@ impl Core {
         written
     }
 
+    /// Whether an entry this device signed in `space` holds a `keep` for
+    /// `key` that lists `x`.
+    fn kept_by_me_now(&self, space: &SpaceId, key: &KeyId, x: &EntryId) -> bool {
+        let mine = self.keys.key();
+        let Some(sp) = self.spaces.get(space).and_then(|h| h.space.as_ref()) else {
+            return false;
+        };
+        let dag = sp.dag();
+        dag.log_order().iter().any(|y| {
+            dag.get(y).is_some_and(|e| {
+                e.signer() == mine
+                    && e.ops().iter().any(|o| {
+                        matches!(o.body(), SpaceOpBody::Keep { key: k, entries } if k == key && entries.contains(x))
+                    })
+            })
+        })
+    }
+
     /// Whether an entry of this person's in `space` holds a `keep` for
     /// `key` that lists `x`.
     fn kept_by_me(&self, space: &SpaceId, key: &KeyId, x: &EntryId) -> bool {
@@ -3642,15 +3678,19 @@ impl Core {
         })
     }
 
-    /// Keeps, in every space held, each entry of this person's that one of
-    /// `keys`, keys their log has removed, signed, that holds a `keep` and
-    /// that nothing witnessed: after a recovery by guardians, a succession
-    /// (or any work) kept before the loss, by another of the person's
-    /// devices when they confirmed it or with a retired device's work, is
-    /// the person's work like any other, and stands again once kept
-    /// (`spaces.md#a-succession-by-a-device-that-is-later-removed`). Kept
-    /// whenever written, as leaves are. Only what nothing kept falls.
-    /// Returns the entries written.
+    /// After a recovery by guardians, writes again, in every space held,
+    /// each `keep` an entry of this person's holds where one of `keys`,
+    /// keys their log has removed, signed that entry and nothing witnessed
+    /// it: a succession (or any work) kept before the loss, by another of
+    /// the person's devices when they confirmed it or with a retired
+    /// device's work, is the person's work like any other, and stands again
+    /// once kept (`spaces.md#a-succession-by-a-device-that-is-later-removed`).
+    /// Only a `keep` for another key than the one that signed it is written
+    /// again, and for removed keys only; the entry that carries it is not
+    /// itself kept, so that nothing it rests on comes back with it. A device
+    /// cannot vouch for its own past: a thief's `keep` of its own work keeps
+    /// nothing. Only what another device kept stands. Returns the entries
+    /// written.
     pub fn keep_earlier_keeps(&mut self, keys: &[KeyId]) -> anyhow::Result<Written> {
         let ident = self
             .identity
@@ -3665,21 +3705,38 @@ impl Core {
             };
             for x in &sp.validity().unwitnessed {
                 let Some(e) = sp.dag().get(x) else { continue };
-                let keeps = e
-                    .ops()
-                    .iter()
-                    .any(|o| matches!(o.body(), SpaceOpBody::Keep { .. }));
-                if keeps && e.author() == me && keys.contains(&&e.signer()) {
+                if e.author() != me || !keys.contains(&&e.signer()) {
+                    continue;
+                }
+                for o in e.ops() {
+                    let SpaceOpBody::Keep { key, entries } = o.body() else {
+                        continue;
+                    };
+                    if *key == e.signer() || st.power(key).is_some() {
+                        continue;
+                    }
                     let by_key = wanted.entry(*id).or_default();
-                    by_key.entry(e.signer()).or_default().push(*x);
+                    by_key
+                        .entry(*key)
+                        .or_default()
+                        .extend(entries.iter().copied());
                 }
             }
         }
+        // what a keep of this device's already lists, it does not list again
+        for (id, by_key) in wanted.iter_mut() {
+            for (key, xs) in by_key.iter_mut() {
+                xs.sort();
+                xs.dedup();
+                xs.retain(|x| !self.kept_by_me_now(id, key, x));
+            }
+            by_key.retain(|_, xs| !xs.is_empty());
+        }
+        wanted.retain(|_, by_key| !by_key.is_empty());
         let mut written = Vec::new();
         for (id, by_key) in wanted {
             let h = self.spaces.get_mut(&id).expect("held");
-            for (key, mut xs) in by_key {
-                xs.sort();
+            for (key, xs) in by_key {
                 match h.write_keeps(ident, &self.keys, vec![SpaceOp::keep(key, &xs)]) {
                     Ok(bytes) => written.push((id, bytes)),
                     Err(e) => tracing::debug!("keeping an earlier keep in {}: {e:#}", short(&id)),
@@ -3694,21 +3751,27 @@ impl Core {
     }
 
     /// Whether `x`, in `space`, is part of a succession the removed `key`
-    /// made: a `succeed`, or anything in a successor whose genesis that key
-    /// signed and nothing keeps.
+    /// made: a `succeed` nothing keeps, or what descends from one (a keep
+    /// of it would keep the `succeed` too), or anything in a successor
+    /// whose genesis that key signed and nothing keeps.
     fn ends_or_begins(&self, space: &SpaceId, x: &EntryId, key: &KeyId) -> bool {
         let Some(sp) = self.spaces.get(space).and_then(|h| h.space.as_ref()) else {
             return false;
         };
-        let succeeds = sp.dag().get(x).is_some_and(|e| {
-            e.ops()
-                .iter()
-                .any(|o| matches!(o.body(), cardinal_space::SpaceOpBody::Succeed { .. }))
+        let dag = sp.dag();
+        let unwitnessed = &sp.validity().unwitnessed;
+        let after_succeed = unwitnessed.iter().any(|y| {
+            dag.get(y).is_some_and(|e| {
+                e.signer() == *key
+                    && e.ops()
+                        .iter()
+                        .any(|o| matches!(o.body(), cardinal_space::SpaceOpBody::Succeed { .. }))
+            }) && dag.is_ancestor_or_self(y, x)
         });
         let begun = sp.succeeds().is_some()
-            && sp.validity().unwitnessed.contains(space)
-            && sp.dag().get(space).is_some_and(|g| g.signer() == *key);
-        succeeds || begun
+            && unwitnessed.contains(space)
+            && dag.get(space).is_some_and(|g| g.signer() == *key);
+        after_succeed || begun
     }
 
     /// Keeps, in each of `spaces`, everything this person's removed devices
@@ -7739,9 +7802,10 @@ mod tests {
     /// Ana takes Cy out of a group on her phone and, where `confirmed`,
     /// confirms it on her laptop, which keeps it; she loses both, and her
     /// guardians recover her. The new device keeps what the person kept
-    /// before the loss. Returns whether, for Bo, the successor stands with
-    /// Cy out, and the same as the new device sees it.
-    fn a_succession_after_a_recovery(confirmed: bool) -> (bool, bool) {
+    /// before the loss. Where `thief`, the phone, a thief's, also writes
+    /// keeps of its own work in both spaces. Returns whether, for Bo, the
+    /// successor stands with Cy out, and the same as the new device sees it.
+    fn a_succession_after_a_recovery(confirmed: bool, thief: bool) -> (bool, bool) {
         let ([mut ana, mut bo, cy], g) = family();
         let store = cardinal_blob::MemStore::new();
         let mut laptop = ana.second_device();
@@ -7775,6 +7839,17 @@ mod tests {
             assert!(laptop.core.successions_to_confirm(&s).is_empty());
             assert_eq!(listed(&laptop)["confirm"], serde_json::json!([]));
         }
+        if thief {
+            let phone = ana.core.keys.key();
+            let succeed = *ana.space(&g).dag().heads().first().unwrap();
+            for (space, listed) in [(g, vec![]), (g, vec![succeed]), (s, vec![]), (s, vec![s])] {
+                let ident = ana.core.identity.as_ref().unwrap();
+                let h = ana.core.spaces.get_mut(&space).unwrap();
+                h.write_keeps(ident, &ana.core.keys, vec![SpaceOp::keep(phone, &listed)])
+                    .unwrap();
+            }
+            bo.syncs(&ana, &s, &store);
+        }
         bo.syncs(&ana, &g, &store);
         bo.syncs(&laptop, &g, &store);
         bo.syncs(&laptop, &s, &store);
@@ -7797,6 +7872,17 @@ mod tests {
             written.extend(new.core.keep_earlier_keeps(&lost).unwrap());
         }
         assert_eq!(written.len(), if confirmed { 2 } else { 0 });
+        if !confirmed {
+            // nor does the lost phone's ordinary work, kept, bring it back
+            for space in [g, s] {
+                if new.holds(&space) {
+                    new.takes(&space, &bo.set_of(&space));
+                }
+            }
+            let (more, _) = new.core.keep_work(&lost[0], None).unwrap();
+            written.extend(more);
+            written.extend(new.core.keep_leaves(&lost).unwrap());
+        }
         for (space, bytes) in written {
             bo.takes(&space, &[bytes]);
         }
@@ -7815,8 +7901,81 @@ mod tests {
     /// nothing kept falls.
     #[test]
     fn a_succession_kept_before_the_loss_stands_after_a_recovery() {
-        assert_eq!(a_succession_after_a_recovery(true), (true, true));
-        assert_eq!(a_succession_after_a_recovery(false), (false, false));
+        assert_eq!(a_succession_after_a_recovery(true, false), (true, true));
+        assert_eq!(a_succession_after_a_recovery(false, false), (false, false));
+    }
+
+    /// The review of 2026-11-22: an OK keeps only the moves the person
+    /// was shown. The phone moves a group twice; the laptop shows the
+    /// first, and the second arrives before its person says OK to it.
+    #[test]
+    fn an_ok_keeps_only_the_moves_the_person_saw() {
+        let ([mut ana, bo, _cy], g) = family();
+        let store = cardinal_blob::MemStore::new();
+        let mut laptop = ana.second_device();
+        laptop.takes(&g, &ana.all_of(&g));
+        let s = ana
+            .core
+            .succeed(&store, &g, &[(bo.id(), WRITER)])
+            .unwrap()
+            .new;
+        laptop.syncs(&ana, &g, &store);
+        assert!(laptop.holds(&s));
+        let listed = |p: &Person, id: &SpaceId| {
+            let all = crate::groups::list_of(&p.core);
+            let mut one = all["groups"].as_array().unwrap().iter();
+            let one = one.find(|x| x["group"] == hex::encode(id)).cloned();
+            one.unwrap_or_else(|| panic!("{all}"))
+        };
+        let shown = listed(&laptop, &s)["to_confirm"].clone();
+        assert_eq!(shown.as_array().unwrap().len(), 1, "{shown}");
+        assert_eq!(shown[0]["group"], hex::encode(g));
+        assert_eq!(shown[0]["to"], hex::encode(s));
+        assert_eq!(shown[0]["by"], "You");
+        // the second move arrives before the person says OK
+        let s2 = ana
+            .core
+            .succeed(&store, &s, &[(bo.id(), WRITER)])
+            .unwrap()
+            .new;
+        laptop.syncs(&ana, &s, &store);
+        assert!(laptop.holds(&s2));
+        let now = listed(&laptop, &s2)["to_confirm"].clone();
+        let olds: Vec<&str> = now
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| c["group"].as_str().unwrap())
+            .collect();
+        assert_eq!(olds, [hex::encode(s), hex::encode(g)], "nearest first");
+        assert_eq!(listed(&laptop, &s2)["confirm"], serde_json::json!(olds));
+        // the OK the person gave to what they saw keeps that alone
+        let kept = laptop.core.confirm_moves(&s2, &[g]).unwrap();
+        assert_eq!(kept.len(), 2, "the first succeed and its genesis");
+        assert_eq!(laptop.core.successions_to_confirm(&s2), vec![s]);
+        assert!(
+            listed(&laptop, &s2)["moved"].is_object(),
+            "still to confirm"
+        );
+        // a move not on the way confirms nothing
+        assert!(laptop
+            .core
+            .confirm_moves(&s2, &[[9; 32]])
+            .unwrap()
+            .is_empty());
+        let kept = laptop.core.confirm_moves(&s2, &[s]).unwrap();
+        assert_eq!(kept.len(), 2);
+        assert!(laptop.core.successions_to_confirm(&s2).is_empty());
+    }
+
+    /// The review of 2026-11-22: a thief's phone that moves a group and
+    /// then keeps its own work, in the old group and the new, keeps
+    /// nothing. Only a keep another device wrote survives a recovery; the
+    /// laptop's confirmation still does, beside the thief's keeps.
+    #[test]
+    fn a_device_s_keep_of_its_own_succession_does_not_survive_a_recovery() {
+        assert_eq!(a_succession_after_a_recovery(false, true), (false, false));
+        assert_eq!(a_succession_after_a_recovery(true, true), (true, true));
     }
 
     /// The narrow path after a recovery by guardians (`hosts.md#restore`,

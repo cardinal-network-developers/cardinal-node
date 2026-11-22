@@ -1085,7 +1085,54 @@ struct Conversion<'a> {
 }
 
 impl<'a> Conversion<'a> {
+    /// The logs converted, where the protocol records that count are
+    /// those in valid entries signed by admin and root keys
+    /// (`evolution.md#critical-and-ignorable`): whether an entry is valid
+    /// turns on the records before it, so the logs are converted again with
+    /// the records found to count until that holds of what is found. Most
+    /// logs use no extension, and are converted once.
     fn new(logs: &[&'a IdentityLog]) -> Conversion<'a> {
+        let uses = logs.iter().flat_map(|l| l.entries()).any(|e| {
+            e.ops()
+                .iter()
+                .any(|o| matches!(o.body(), OpBody::Extension { .. }))
+        });
+        let mut conv = Conversion::with(logs, None);
+        if !uses {
+            return conv;
+        }
+        let records: Vec<(&IdentityLog, &IdentityEntry)> = logs
+            .iter()
+            .flat_map(|l| l.entries().map(move |e| (*l, e)))
+            .filter(|(_, e)| {
+                e.protocol().is_some()
+                    || e.ops()
+                        .iter()
+                        .any(|o| matches!(o.body(), OpBody::SetProtocol { .. }))
+            })
+            .collect();
+        let mut declarers: Option<HashSet<EntryId>> = None;
+        // a handful of rounds settles any history a person makes
+        for _ in 0..5 {
+            let mut found = HashSet::new();
+            let mut states: HashMap<EntryId, IdentityState> = HashMap::new();
+            for (l, e) in &records {
+                let st = states.entry(l.id).or_insert_with(|| conv.state(l));
+                if st.valid.contains(&e.id()) && admin_or_root(l, &e.signer()) {
+                    found.insert(e.id());
+                }
+            }
+            let all = found.len() == records.len();
+            if declarers.as_ref() == Some(&found) || (declarers.is_none() && all) {
+                break;
+            }
+            conv = Conversion::with(logs, Some(&found));
+            declarers = Some(found);
+        }
+        conv
+    }
+
+    fn with(logs: &[&'a IdentityLog], declarers: Option<&HashSet<EntryId>>) -> Conversion<'a> {
         let mut world = World::new();
         let all: HashMap<EntryId, (&'a IdentityLog, &'a IdentityEntry)> = logs
             .iter()
@@ -1194,7 +1241,7 @@ impl<'a> Conversion<'a> {
                     }
                     let e = q.pop().expect("entry");
                     let ok = |d: &EntryId| refers(logs[li], e, d);
-                    let entry = convert(&mut world, logs[li], e, &ok, &revealed);
+                    let entry = convert(&mut world, logs[li], e, &ok, &revealed, declarers);
                     world
                         .put(entry)
                         .expect("parents and decisions are placed first");
@@ -1212,7 +1259,7 @@ impl<'a> Conversion<'a> {
                 break;
             };
             let e = queues[li].pop().expect("entry");
-            let entry = convert(&mut world, logs[li], e, &|_| false, &revealed);
+            let entry = convert(&mut world, logs[li], e, &|_| false, &revealed, declarers);
             world.put(entry).expect("parents are placed first");
             placed.insert(e.id());
         }
@@ -1360,14 +1407,32 @@ impl<'a> Conversion<'a> {
     }
 }
 
+/// Whether `key` was added to `log` as an admin or root key.
+fn admin_or_root(log: &IdentityLog, key: &KeyId) -> bool {
+    log.entries().any(|e| {
+        e.ops().iter().any(|o| match o.body() {
+            OpBody::AddKey { key: k, power, .. } => k == key && *power >= 2,
+            OpBody::Recover { root, .. } => root == key,
+            _ => false,
+        })
+    })
+}
+
 /// The mark of extension `name` for entry `e` of `log`: whether a protocol
 /// record in its causal past, or in it, marks it critical; `None` where no
-/// record declares it.
-fn extension_mark(log: &IdentityLog, e: &IdentityEntry, name: &[u8; 32]) -> Option<bool> {
+/// record declares it. With `declarers`, only the records in those entries
+/// of its past count, besides its own.
+fn extension_mark(
+    log: &IdentityLog,
+    e: &IdentityEntry,
+    name: &[u8; 32],
+    declarers: Option<&HashSet<EntryId>>,
+) -> Option<bool> {
     let dag = log.dag();
     let past = dag.ancestors_of(e.parents());
     let records = past
         .iter()
+        .filter(|x| declarers.is_none_or(|d| d.contains(*x)))
         .filter_map(|x| dag.get(x))
         .chain(std::iter::once(e))
         .flat_map(|x| {
@@ -1394,9 +1459,11 @@ fn convert(
     e: &IdentityEntry,
     refers: &dyn Fn(&EntryId) -> bool,
     revealed: &HashMap<EntryId, BTreeSet<EntryId>>,
+    declarers: Option<&HashSet<EntryId>>,
 ) -> model::Entry {
     let mut sym = |b: &[u8; 32]| w.sym(&hex_encode(b));
     let id = e.id();
+    let counts = declarers.is_none_or(|d| d.contains(&id));
     let binding = if e.is_genesis() { log.root0 } else { log.id };
     let mut ops = Vec::new();
     for op in e.ops() {
@@ -1466,14 +1533,20 @@ fn convert(
                 }
             }
             OpBody::Object { .. } => Op::Object,
+            // what an entry that does not count declares, it declares to
+            // nothing after it
             OpBody::SetProtocol { protocol } => Op::Protocol {
-                declares: protocol.extensions.iter().map(|(n, _)| sym(n)).collect(),
+                declares: if counts {
+                    protocol.extensions.iter().map(|(n, _)| sym(n)).collect()
+                } else {
+                    Vec::new()
+                },
             },
             // The protocol records in its causal past, or in it, decide:
             // critical if any marks it so, ignorable if all say ignorable,
             // and an op nobody defined if none declares it
             // (`evolution.md#critical-and-ignorable`).
-            OpBody::Extension { name } => match extension_mark(log, e, name) {
+            OpBody::Extension { name } => match extension_mark(log, e, name, declarers) {
                 Some(critical) => Op::Ext {
                     name: sym(name),
                     critical,
@@ -1486,7 +1559,11 @@ fn convert(
     if let Some(p) = e.protocol() {
         // the genesis protocol record declares extensions like set_protocol
         ops.push(Op::Protocol {
-            declares: p.extensions.iter().map(|(n, _)| sym(n)).collect(),
+            declares: if counts {
+                p.extensions.iter().map(|(n, _)| sym(n)).collect()
+            } else {
+                Vec::new()
+            },
         });
     }
     model::Entry {
@@ -1875,6 +1952,59 @@ mod tests {
         assert!(Protocol::from_record(&twice).is_err());
         let op = IdentityOp::from_record(Record::new().with(0, 10u32).with(1, twice));
         assert_eq!(op.body(), &OpBody::Malformed);
+    }
+
+    /// The review of 2026-11-22: only records in valid entries by admin
+    /// and root keys declare. A device key's `set_protocol`, and one an
+    /// admin key writes after its removal, declare nothing to what follows.
+    #[test]
+    fn only_valid_entries_by_admin_keys_declare() {
+        use cardinal_encoding::Record;
+        let d1 = DeviceKeys::generate();
+        let Created { mut log, .. } =
+            IdentityLog::create_with(phrase(9), &d1, HybridKeyPair::generate()).unwrap();
+        let device = DeviceKeys::generate();
+        log.add_key(&d1.signing, &device.request(&log.id(), Power::Device), None)
+            .unwrap();
+        let (a, b, c) = ([0x31u8; 32], [0x32u8; 32], [0x33u8; 32]);
+        let ext =
+            |name: [u8; 32]| IdentityOp::from_record(Record::new().with(0, name).with(1, 7u64));
+        let protocol = |name: [u8; 32]| Protocol {
+            base: [0; 32],
+            extensions: vec![(name, false)],
+        };
+        // a device key's record
+        let theirs = log
+            .append(
+                &device.signing,
+                vec![IdentityOp::set_protocol(&protocol(a))],
+            )
+            .unwrap();
+        let used = log.append(&device.signing, vec![ext(a)]).unwrap();
+        let st = log.state();
+        assert!(!st.is_valid(&theirs.id()) && !st.is_valid(&used.id()));
+        // an admin's, once removed
+        let admin = DeviceKeys::generate();
+        log.add_key(&d1.signing, &admin.request(&log.id(), Power::Admin), None)
+            .unwrap();
+        let root = phrase(9).root_signing_key();
+        log.append(
+            &root,
+            vec![IdentityOp::remove_key(admin.signing.public_key())],
+        )
+        .unwrap();
+        assert!(log.state().power(&admin.signing.public_key()).is_none());
+        let late = log
+            .append(&admin.signing, vec![IdentityOp::set_protocol(&protocol(b))])
+            .unwrap();
+        let used = log.append(&device.signing, vec![ext(b)]).unwrap();
+        let st = log.state();
+        assert!(!st.is_valid(&late.id()) && !st.is_valid(&used.id()));
+        // an admin's in effect declares
+        log.append(&d1.signing, vec![IdentityOp::set_protocol(&protocol(c))])
+            .unwrap();
+        let used = log.append(&device.signing, vec![ext(c)]).unwrap();
+        assert!(log.state().is_valid(&used.id()));
     }
 
     #[test]

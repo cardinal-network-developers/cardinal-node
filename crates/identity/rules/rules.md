@@ -333,8 +333,10 @@ author_ok(X) :- attrib(X), witnessed(X).
 % a succeed, and a successor's genesis, are never witnessed this way
 witnessed(X) :- author(X,A), skey(X,K), not s_structural(X), s_anc(X,W), author(W,A),
                 skey(W,K2), K2 != K, author_ok(W), cites(W,H), not id_removed_at(A,K,H).
-% listed, or an ancestor of an entry listed, by a keep of the author's
-witnessed(X) :- author(X,A), skey(X,K), s_keep(W,K,E), s_ae(X,E), author(W,A), author_ok(W).
+% listed, or an ancestor of an entry listed, by a keep of the author's that
+% another key signed: a keep for its own key keeps nothing
+witnessed(X) :- author(X,A), skey(X,K), s_keep(W,K,E), s_ae(X,E), author(W,A), author_ok(W),
+                skey(W,K2), K2 != K.
 root(G) :- s_genesis(G), author_ok(G), not s_badgenesis(G).
 % who named which successor, and which entries have that naming behind them
 named(M,S,Y) :- s_names(Y,S), author(Y,M), decider(M), author_ok(Y), s_genesis(G),
