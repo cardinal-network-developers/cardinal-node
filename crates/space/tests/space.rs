@@ -1721,3 +1721,35 @@ fn two_records_of_one_contact_merge_and_a_race_stays_safe() {
     assert_eq!(one.len(), 1);
     assert!(one[0].refused && account::refused(&all, &cy));
 }
+
+/// A guardians node (`profiles.md#account`, kind 17) reads back as written,
+/// and one not written as its table says names nobody.
+#[test]
+fn a_guardians_node_names_each_commitment() {
+    let p = person(10, 0);
+    let d0 = &p.devices[0];
+    let (mut acct, _) = Space::create(
+        Profile::ACCOUNT,
+        Policy::default(),
+        &p.log,
+        &d0.signing,
+        &[p.enc.public_key()],
+        None,
+    )
+    .unwrap();
+    let named = [([1u8; 32], [2u8; 32]), ([3; 32], [4; 32])];
+    let bad = SpaceOp::create(
+        NodeKind::Uint(account::GUARDIANS),
+        ROOT,
+        "",
+        Record::new().with(1, [6u8; 32]).with(2, "Bo and Cy"),
+    );
+    let ops = vec![account::create_guardians(&[5; 32], &named), bad];
+    acct.write(&p.log, &d0.signing, ops, Some(7)).unwrap();
+    let read = account::guardians_named(acct.state());
+    assert_eq!(read.len(), 1);
+    assert_eq!(
+        (read[0].policy, read[0].named.as_slice(), read[0].made),
+        ([5; 32], &named[..], Some(7))
+    );
+}
