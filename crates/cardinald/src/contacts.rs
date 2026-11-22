@@ -766,7 +766,9 @@ pub fn set(d: &Arc<Daemon>, who: &str, setting: &str) -> anyhow::Result<Json> {
         .core()
         .account_id()
         .ok_or_else(|| anyhow::anyhow!("the account space is not here yet"))?;
-    let ops = set_ops(&d.core().contacts(), &contact.identity, key, value);
+    let ops = d
+        .core()
+        .contact_ops(&contact.identity, &[(key, Some(value.into()))]);
     d.write_and_push(&account, ops)?;
     d.peers_changed();
     if setting == "refuse" {
@@ -774,19 +776,6 @@ pub fn set(d: &Arc<Daemon>, who: &str, setting: &str) -> anyhow::Result<Json> {
         return Ok(json!({"reach": reach}));
     }
     Ok(json!({}))
-}
-
-/// What sets one of a contact's fields: a `set` on every node for them
-/// but a recovery's. Two made at once on two devices are one contact,
-/// refused where any refuses them and trusted where all do
-/// (`presence.rs`), so a setting on one alone could not refuse them, nor
-/// take back a refusal.
-fn set_ops(contacts: &[ContactRecord], who: &[u8; 32], key: u64, value: bool) -> Vec<SpaceOp> {
-    account::nodes_of(contacts, who)
-        .into_iter()
-        .filter(|c| c.recovery_of.is_none())
-        .map(|c| account::set_field(c.node, key, value))
-        .collect()
 }
 
 /// The person says, in their relationship with a contact, whether the
@@ -832,8 +821,10 @@ pub fn rename(d: &Arc<Daemon>, who: &str, name: &str) -> anyhow::Result<Json> {
             .ok_or_else(|| anyhow::anyhow!("the account space is not here yet"))?;
         // Empty, not absent: a release before this one reads a contact
         // without a petname as no contact at all.
-        let op = account::set_field(contact.node, account::PETNAME, "");
-        d.write_and_push(&account, vec![op])?;
+        let ops = d
+            .core()
+            .contact_ops(&contact.identity, &[(account::PETNAME, Some("".into()))]);
+        d.write_and_push(&account, ops)?;
         let c = find(d, &hex::encode(&contact.identity[..8]))?;
         return Ok(Json::Object(crate::names::shown(d, &c)));
     }
@@ -848,8 +839,10 @@ pub fn rename(d: &Arc<Daemon>, who: &str, name: &str) -> anyhow::Result<Json> {
         .core()
         .account_id()
         .ok_or_else(|| anyhow::anyhow!("the account space is not here yet"))?;
-    let op = account::set_field(contact.node, account::PETNAME, name);
-    d.write_and_push(&account, vec![op])?;
+    let ops = d
+        .core()
+        .contact_ops(&contact.identity, &[(account::PETNAME, Some(name.into()))]);
+    d.write_and_push(&account, ops)?;
     Ok(json!({"name": name}))
 }
 
@@ -867,8 +860,11 @@ pub fn set_category(d: &Arc<Daemon>, who: &str, category: &str) -> anyhow::Resul
         .core()
         .account_id()
         .ok_or_else(|| anyhow::anyhow!("the account space is not here yet"))?;
-    let op = account::set_field(contact.node, account::CATEGORY, category);
-    d.write_and_push(&account, vec![op])?;
+    let ops = d.core().contact_ops(
+        &contact.identity,
+        &[(account::CATEGORY, Some(category.into()))],
+    );
+    d.write_and_push(&account, ops)?;
     Ok(json!({"category": category}))
 }
 
@@ -1900,37 +1896,6 @@ mod tests {
             invitation,
             at,
         }
-    }
-
-    #[test]
-    fn a_setting_is_set_on_every_node_for_the_contact() {
-        let record = |node: u8, who: u8, recovery: bool| ContactRecord {
-            node: [node; 16],
-            identity: [who; 32],
-            petname: "Cy".into(),
-            own: true,
-            suggested: None,
-            picture: None,
-            space: [node; 32],
-            regard: Regard::default(),
-            refused: false,
-            category: account::PEOPLE.into(),
-            met: None,
-            guardian: false,
-            recovery_of: recovery.then_some([9; 32]),
-        };
-        let all = [
-            record(1, 3, false),
-            record(2, 3, false),
-            record(4, 3, true),
-            record(5, 6, false),
-        ];
-        let ops = set_ops(&all, &[3; 32], account::REFUSED, true);
-        let want: Vec<SpaceOp> = [[1u8; 16], [2; 16]]
-            .iter()
-            .map(|n| account::set_field(*n, account::REFUSED, true))
-            .collect();
-        assert_eq!(ops, want);
     }
 
     #[test]

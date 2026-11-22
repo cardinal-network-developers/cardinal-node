@@ -1494,17 +1494,28 @@ Not implemented yet (the next milestone):
     from field 2 in every relationship with them held here, ended or
     left too, where nothing more is written. Trusted again, they are
     given the one in use.
-  - **Reading: two contact nodes for one identity** (made at once on two
-    devices) are one contact: trusted only if every node says trusted
-    and none refused. The same rule decides elsewhere: whether a session
-    is a contact's (`Daemon::classify`, `account::connects`), and
-    whether a guardian or a recovery helper is given sets to hold
-    (`Core::held_given`, `core::holds_for`: every node names them so,
-    and none refuses them). A setting (`contact-set`: trust, hosts only,
-    introductions, refuse) is written on every node for the identity
-    but a recovery's, so that such a contact can be refused, and
-    refused no longer; and finding a contact by name takes two nodes
-    for one identity for one contact, not two of that name.
+  - **Two records of one contact** (designer, ASK 11 = b + merge,
+    2026-11-22; `profiles.md#account`). Every record counts, and the
+    cautious answer wins: trusted and taking introductions only if every
+    record says so, refused if any does; a field in conflict within one
+    record is read the same way, and so is "is a guardian" (field 5). The
+    same rule decides whether a session is a contact's
+    (`Daemon::classify`, `account::connects`) and whether a guardian or a
+    recovery helper is given sets to hold (`core::holds_for`). The next
+    change the person makes to the contact (`contact-set`, a petname, a
+    category, a picture, marking guardians) merges, in the same entry, the
+    records into the one with the lowest node id (`account::contact_change`):
+    the cautious fields 6 to 8, the petname written last by its entries'
+    times (then log order), the target's other fields kept and what it lacks
+    filled from the others, newest first, and the others deleted; then the
+    change is set on what is left. Where a concurrent change touches a
+    deleted record its delete yields and the record stays, still counted
+    (tested, `two_records_of_one_contact_merge_and_a_race_stays_safe`).
+    **Reading, against the spec:** only records naming the same
+    relationship space as the lowest are merged; one naming another
+    relationship stays, and is set like the others, since deleting it
+    would take that relationship out of the person's contacts. A recovery's
+    relationship is no contact and is never merged.
   - **Reading: "accept every value a contact gave"** is every value field
     2 of their reach node holds now in the relationship, two where two of
     their devices set it at the same moment; not values set before.

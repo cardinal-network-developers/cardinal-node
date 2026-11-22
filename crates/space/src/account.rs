@@ -761,6 +761,24 @@ pub struct SpaceRecord {
     pub succeeded: Option<SpaceId>,
 }
 
+/// Whether every value of a flag is true, `absent` where it has none (or
+/// a value is cleared).
+fn every(n: &crate::state::Node, key: u64, absent: bool) -> bool {
+    let vs = n.values(key);
+    let one = |v: &crate::state::FieldValue| v.value.as_ref().map_or(Some(absent), Value::as_bool);
+    match vs.is_empty() {
+        true => absent,
+        false => vs.iter().all(|v| one(v) == Some(true)),
+    }
+}
+
+/// Whether any value of a flag is true.
+fn some(n: &crate::state::Node, key: u64) -> bool {
+    n.values(key)
+        .iter()
+        .any(|v| v.value.as_ref().and_then(Value::as_bool) == Some(true))
+}
+
 fn last(n: &crate::state::Node, key: u64) -> Option<&Value> {
     // the value with the greatest entry id, for display when in conflict
     n.values(key).iter().rev().find_map(|v| v.value.as_ref())
@@ -917,7 +935,7 @@ pub fn contacts(state: &State) -> Vec<ContactRecord> {
         .into_iter()
         .filter(|n| n.kind == NodeKind::Uint(CONTACT) && !n.deleted)
         .filter_map(|n| {
-            let flag = |key| last(n, key).and_then(Value::as_bool);
+            let (all, any) = (|key, absent| every(n, key, absent), |key| some(n, key));
             let text = |key| {
                 last(n, key)
                     .and_then(Value::as_text)
@@ -938,11 +956,13 @@ pub fn contacts(state: &State) -> Vec<ContactRecord> {
                 suggested,
                 picture: last(n, PICTURE).and_then(Value::as_record).cloned(),
                 space: last(n, 3)?.as_bytes()?.try_into().ok()?,
+                // a field in conflict is read as two records are: the
+                // cautious answer
                 regard: Regard {
-                    trusted: flag(TRUSTED).unwrap_or(false),
-                    introductions: flag(INTRODUCTIONS).unwrap_or(true),
+                    trusted: all(TRUSTED, false),
+                    introductions: all(INTRODUCTIONS, true),
                 },
-                refused: flag(REFUSED).unwrap_or(false),
+                refused: any(REFUSED),
                 category: last(n, CATEGORY)
                     .and_then(Value::as_text)
                     .map(str::trim)
@@ -952,7 +972,7 @@ pub fn contacts(state: &State) -> Vec<ContactRecord> {
                 met: last(n, MET)
                     .and_then(Value::as_record)
                     .and_then(Met::from_record),
-                guardian: flag(GUARDIAN).unwrap_or(false),
+                guardian: all(GUARDIAN, false),
                 recovery_of: last(n, RECOVERY_OF)
                     .and_then(Value::as_bytes)
                     .and_then(|b| b.try_into().ok()),
@@ -1105,4 +1125,102 @@ pub fn personas(state: &State) -> Vec<PersonaRecord> {
             })
         })
         .collect()
+}
+
+/// The ops of a change to `who`'s contact: `changes`, a value (or `None`,
+/// to clear) for each field, set on every record of theirs but a
+/// recovery's. Where two or more records name the same relationship space
+/// as the one with the lowest node id, they are merged into it first, in
+/// the same ops (`profiles.md#account`, "Two records of one contact"): it is
+/// set to the cautious value of fields 6 to 8 (trusted and taking
+/// introductions only if every record is, refused if any is) and to the
+/// petname written last, by the times its entries give; it keeps its other
+/// fields, filling any it lacks from the others, newest first; and the
+/// others are deleted. A record that names another relationship is left as
+/// it is, and set like the rest: deleting it would take that relationship
+/// out of the person's contacts. Nothing where they have no record.
+pub fn contact_change(
+    sp: &crate::Space,
+    who: &IdentityId,
+    changes: &[(u64, Option<Value>)],
+) -> Vec<SpaceOp> {
+    let state = sp.state();
+    let mut records: Vec<&crate::state::Node> = state
+        .children(&ROOT)
+        .into_iter()
+        .filter(|n| n.kind == NodeKind::Uint(CONTACT) && !n.deleted)
+        .filter(|n| last(n, 1).and_then(Value::as_bytes) == Some(&who[..]))
+        .filter(|n| n.values(RECOVERY_OF).iter().all(|v| v.value.is_none()))
+        .collect();
+    records.sort_by_key(|n| n.id);
+    let Some(target) = records.first().copied() else {
+        return Vec::new();
+    };
+    let space_of = |n: &crate::state::Node| last(n, 3).cloned();
+    let (merged, apart): (Vec<&crate::state::Node>, Vec<&crate::state::Node>) = records
+        .iter()
+        .copied()
+        .partition(|n| space_of(n) == space_of(target));
+    let changed = |key: u64| changes.iter().any(|(k, _)| *k == key);
+    let mut ops = Vec::new();
+    if merged.len() > 1 {
+        // when each value was written: the time its entry gives, then log order
+        let when = |v: &crate::state::FieldValue| {
+            let time = sp.dag().get(&v.entry).and_then(|e| e.time());
+            (time, sp.dag().position(&v.entry))
+        };
+        let flags = [
+            (TRUSTED, merged.iter().all(|n| every(n, TRUSTED, false))),
+            (
+                INTRODUCTIONS,
+                merged.iter().all(|n| every(n, INTRODUCTIONS, true)),
+            ),
+            (REFUSED, merged.iter().any(|n| some(n, REFUSED))),
+        ];
+        for (key, want) in flags {
+            let has = match key {
+                REFUSED => some(target, key),
+                INTRODUCTIONS => every(target, key, true),
+                _ => every(target, key, false),
+            };
+            if !changed(key) && (has != want || target.in_conflict(key)) {
+                ops.push(set_field(target.id, key, want));
+            }
+        }
+        // the petname written last
+        let newest = |key: u64| {
+            merged
+                .iter()
+                .flat_map(|n| n.values(key).iter())
+                .max_by_key(|v| when(v))
+                .cloned()
+        };
+        if let Some(name) = newest(PETNAME) {
+            let same = target.values(PETNAME).len() == 1 && target.values(PETNAME)[0] == name;
+            if !changed(PETNAME) && !same {
+                ops.push(SpaceOp::set(target.id, PETNAME, name.value));
+            }
+        }
+        // what the target lacks, from the others
+        let keys: std::collections::BTreeSet<u64> = merged[1..]
+            .iter()
+            .flat_map(|n| n.fields.keys().copied())
+            .collect();
+        for key in keys {
+            let ours = [1, 3, PETNAME, INTRODUCTIONS, TRUSTED, REFUSED, RECOVERY_OF];
+            if ours.contains(&key) || changed(key) || !target.values(key).is_empty() {
+                continue;
+            }
+            if let Some(v) = newest(key).and_then(|v| v.value) {
+                ops.push(SpaceOp::set(target.id, key, Some(v)));
+            }
+        }
+        ops.extend(merged[1..].iter().map(|n| SpaceOp::delete(n.id)));
+    }
+    for n in std::iter::once(target).chain(apart) {
+        for (key, value) in changes {
+            ops.push(SpaceOp::set(n.id, *key, value.clone()));
+        }
+    }
+    ops
 }

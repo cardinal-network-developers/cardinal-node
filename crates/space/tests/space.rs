@@ -1593,3 +1593,131 @@ fn two_nodes_for_one_contact_are_judged_together() {
     acct.write(&p.log, &d0.signing, vec![refuse], None).unwrap();
     assert!(account::refused(&account::contacts(acct.state()), &cy));
 }
+
+/// Two records of one contact (`profiles.md#account`, designer
+/// 2026-11-22): the next change merges them into the lowest, with the
+/// cautious values, the petname written last, and the rest deleted, in one
+/// entry. When another device, at the same time, changes the record being
+/// deleted, the delete yields and that record stays; every record still
+/// counts, so its refusal holds, and the next change merges again.
+#[test]
+fn two_records_of_one_contact_merge_and_a_race_stays_safe() {
+    use account::{Regard, PETNAME, REFUSED, TRUSTED};
+    let p = person(9, 1);
+    let (d0, d1) = (&p.devices[0], &p.devices[1]);
+    let (mut a, genesis) = Space::create(
+        Profile::ACCOUNT,
+        Policy::default(),
+        &p.log,
+        &d0.signing,
+        &[p.enc.public_key()],
+        None,
+    )
+    .unwrap();
+    let enc1 = p.log.open_encryption_key(d1).unwrap();
+    let genesis = SealedEntry::decode(&genesis.encode()).unwrap();
+    let mut b = Space::open_genesis(&genesis, &[&enc1], Some(p.log.state())).unwrap();
+    let write = |s: &mut Space, d: &DeviceKeys, ops: Vec<SpaceOp>, t: u64| {
+        s.write_entry(&p.log, &d.signing, ops, Some(t)).unwrap().0
+    };
+    let cy = [3u8; 32];
+    let rel = [7u8; 32];
+    let hosts_only = Regard {
+        trusted: false,
+        introductions: true,
+    };
+    // made at once on two devices, one naming them "Cy", one "Cyril"
+    write(
+        &mut a,
+        d0,
+        vec![account::create_contact(&cy, "Cy", &rel, Regard::default())],
+        10,
+    );
+    write(
+        &mut b,
+        d1,
+        vec![account::create_contact(&cy, "Cyril", &rel, hosts_only)],
+        20,
+    );
+    sync(&a, &mut b, &enc1);
+    sync(&b, &mut a, &p.enc);
+    let all = account::contacts(a.state());
+    assert_eq!(account::nodes_of(&all, &cy).len(), 2);
+    assert!(!account::connects(&all, &cy), "trusted only if all are");
+    // the next change, made where all is seen: one record, merged
+    let ops = account::contact_change(&a, &cy, &[(account::CATEGORY, Some("Family".into()))]);
+    write(&mut a, d0, ops, 30);
+    let all = account::contacts(a.state());
+    let left = account::nodes_of(&all, &cy);
+    assert_eq!(left.len(), 1, "{left:?}");
+    let low = left[0];
+    assert!(!low.regard.trusted, "the cautious value");
+    assert_eq!(low.petname, "Cyril", "the petname written last");
+    assert_eq!(low.category, "Family");
+    assert!(
+        account::contact_change(&a, &cy, &[]).is_empty(),
+        "nothing more to merge"
+    );
+
+    // Again from two records, with a race: one device merges while the
+    // other, not having seen it, refuses on every record
+    let mut a2 = {
+        let (s, g) = Space::create(
+            Profile::ACCOUNT,
+            Policy::default(),
+            &p.log,
+            &d0.signing,
+            &[p.enc.public_key()],
+            None,
+        )
+        .unwrap();
+        let g = SealedEntry::decode(&g.encode()).unwrap();
+        (
+            s,
+            Space::open_genesis(&g, &[&enc1], Some(p.log.state())).unwrap(),
+        )
+    };
+    let (x, y) = (&mut a2.0, &mut a2.1);
+    write(
+        x,
+        d0,
+        vec![account::create_contact(&cy, "Cy", &rel, Regard::default())],
+        10,
+    );
+    write(
+        y,
+        d1,
+        vec![account::create_contact(&cy, "Cy", &rel, Regard::default())],
+        11,
+    );
+    sync(x, y, &enc1);
+    sync(y, x, &p.enc);
+    let merge = account::contact_change(x, &cy, &[(PETNAME, Some("C".into()))]);
+    assert!(merge
+        .iter()
+        .any(|o| matches!(o.body(), cardinal_space::SpaceOpBody::Delete { .. })));
+    write(x, d0, merge, 30);
+    let nodes: Vec<_> = account::contacts(y.state())
+        .iter()
+        .map(|c| c.node)
+        .collect();
+    let refuse: Vec<SpaceOp> = nodes
+        .iter()
+        .map(|n| account::set_field(*n, REFUSED, true))
+        .collect();
+    write(y, d1, refuse, 31);
+    sync(x, y, &enc1);
+    sync(y, x, &p.enc);
+    assert_eq!(x.state().canonical(), y.state().canonical());
+    let all = account::contacts(x.state());
+    assert_eq!(account::nodes_of(&all, &cy).len(), 2, "the delete yielded");
+    assert!(account::refused(&all, &cy), "and the refusal holds");
+    assert!(!account::connects(&all, &cy));
+    // the next change merges again, refused
+    let again = account::contact_change(x, &cy, &[(TRUSTED, Some(true.into()))]);
+    write(x, d0, again, 40);
+    let all = account::contacts(x.state());
+    let one = account::nodes_of(&all, &cy);
+    assert_eq!(one.len(), 1);
+    assert!(one[0].refused && account::refused(&all, &cy));
+}

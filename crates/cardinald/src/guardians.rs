@@ -855,15 +855,24 @@ fn mark_guardians(d: &Arc<Daemon>, chosen: &[account::ContactRecord]) -> anyhow:
     let Some(acc) = d.core().account_id() else {
         return Ok(());
     };
-    let ops: Vec<_> = d
-        .core()
-        .contacts()
-        .into_iter()
-        .filter_map(|c| {
-            let now = chosen.iter().any(|x| x.identity == c.identity);
-            (now != c.guardian).then(|| account::set_field(c.node, account::GUARDIAN, now))
-        })
-        .collect();
+    // each contact whose records say otherwise, merged if they are two
+    let ops: Vec<_> = {
+        let core = d.core();
+        let mut whom: Vec<([u8; 32], bool)> = core
+            .contacts()
+            .into_iter()
+            .filter(|c| c.recovery_of.is_none())
+            .filter_map(|c| {
+                let now = chosen.iter().any(|x| x.identity == c.identity);
+                (now != c.guardian).then_some((c.identity, now))
+            })
+            .collect();
+        whom.sort();
+        whom.dedup();
+        whom.into_iter()
+            .flat_map(|(who, now)| core.contact_ops(&who, &[(account::GUARDIAN, Some(now.into()))]))
+            .collect()
+    };
     if !ops.is_empty() {
         d.write_and_push(&acc, ops)?;
     }

@@ -1458,6 +1458,21 @@ impl Core {
             .unwrap_or_default()
     }
 
+    /// The ops of a change to `who`'s contact
+    /// ([`cardinal_space::account::contact_change`]): the records of theirs
+    /// merged first where there are two, and the change set on what is
+    /// left. Empty without an account, or with no record of them.
+    pub fn contact_ops(
+        &self,
+        who: &[u8; 32],
+        changes: &[(u64, Option<cardinal_encoding::Value>)],
+    ) -> Vec<SpaceOp> {
+        self.account()
+            .and_then(|a| a.space.as_ref())
+            .map(|s| cardinal_space::account::contact_change(s, who, changes))
+            .unwrap_or_default()
+    }
+
     /// The spaces shared with anyone, with the other members who have not
     /// left and whom this person has not refused.
     pub fn shared_spaces(&self) -> Vec<(SpaceId, Vec<[u8; 32]>)> {
