@@ -47,8 +47,20 @@ const DEFAULT_LIMIT: usize = 48;
 const MAX_LIMIT: usize = 300_000;
 /// How many items of a list are shown unless more are asked for.
 const DEFAULT_ITEMS: usize = 24;
-/// How many entries or nodes one reply lists at most.
+/// How many entries or nodes are rendered for one page at most: fewer
+/// than that fit in a message (`api::page` cuts the page to what fits).
 const MAX_PAGE: usize = 5_000;
+
+/// Where a page of entries or nodes starts, and how many are rendered for
+/// it (`apps.md`, Pages).
+fn page_of(req: &Json) -> (usize, usize) {
+    let after = req.get("after").and_then(Json::as_u64).unwrap_or(0) as usize;
+    let limit = req.get("limit").and_then(Json::as_u64).filter(|n| *n > 0);
+    (
+        after,
+        limit.map_or(MAX_PAGE, |c| (c as usize).min(MAX_PAGE)),
+    )
+}
 /// How deep a value is rendered before it is cut.
 const MAX_DEPTH: usize = 32;
 
@@ -142,7 +154,7 @@ impl Opts {
                 .map_or(default, |v| (v as usize).min(MAX_LIMIT))
         };
         Opts {
-            limit: n("limit", DEFAULT_LIMIT),
+            limit: n("value_bytes", DEFAULT_LIMIT),
             items: n("items", DEFAULT_ITEMS),
         }
     }
@@ -926,11 +938,7 @@ fn fields_json(r: &Render, fields: &BTreeMap<u64, Vec<FieldValue>>, hidden: &Has
 fn entries(d: &Daemon, req: &Json) -> anyhow::Result<Json> {
     let core = d.core();
     let hd = holder(&core, req)?;
-    let offset = req.get("offset").and_then(Json::as_u64).unwrap_or(0) as usize;
-    let count = req
-        .get("count")
-        .and_then(Json::as_u64)
-        .map_or(500, |c| (c as usize).min(MAX_PAGE));
+    let (offset, count) = page_of(req);
     let sp = hd.space.as_ref();
     let mut opened: HashMap<[u8; 32], [u8; 32]> = HashMap::new();
     if let Some(sp) = sp {
@@ -963,7 +971,8 @@ fn entries(d: &Daemon, req: &Json) -> anyhow::Result<Json> {
                 })
             })
             .collect();
-        return Ok(json!({"total": total, "offset": offset, "entries": list}));
+        return Ok(json!({"total": total, crate::api::PAGE_FROM: offset,
+            crate::api::PAGE_TOTAL: total, "entries": list}));
     }
     let Some(sp) = sp else {
         anyhow::bail!("this space cannot be opened here: only its sealed entries can be seen");
@@ -1000,10 +1009,8 @@ fn entries(d: &Daemon, req: &Json) -> anyhow::Result<Json> {
             }))
         })
         .collect();
-    Ok(
-        json!({"total": order.len(), "offset": offset, "entries": list,
-        "pending": hd.pending().len()}),
-    )
+    Ok(json!({"total": order.len(), crate::api::PAGE_FROM: offset,
+        crate::api::PAGE_TOTAL: order.len(), "entries": list, "pending": hd.pending().len()}))
 }
 
 /// One entry whole: its sealed form, its signed object and its ops, or the
@@ -1160,11 +1167,7 @@ fn nodes(d: &Daemon, req: &Json) -> anyhow::Result<Json> {
         Some(_) => Some(hex16(req, "parent")?),
         None => None,
     };
-    let offset = req.get("offset").and_then(Json::as_u64).unwrap_or(0) as usize;
-    let count = req
-        .get("count")
-        .and_then(Json::as_u64)
-        .map_or(500, |c| (c as usize).min(MAX_PAGE));
+    let (offset, count) = page_of(req);
     let mut list: Vec<&cardinal_space::Node> = st
         .nodes()
         .filter(|n| kind.is_none_or(|k| kind_json(&n.kind) == *k))
@@ -1178,7 +1181,10 @@ fn nodes(d: &Daemon, req: &Json) -> anyhow::Result<Json> {
         .take(count)
         .map(|n| node_brief(n, sp))
         .collect();
-    Ok(json!({"total": total, "offset": offset, "nodes": out}))
+    Ok(
+        json!({"total": total, crate::api::PAGE_FROM: offset, crate::api::PAGE_TOTAL: total,
+        "nodes": out}),
+    )
 }
 
 /// One node whole: its fields and every value, and the ops in the history

@@ -19,7 +19,7 @@ use cardinal_contact::{ContactMessage, EndpointAddr, Invitation};
 use cardinal_encoding::Value;
 use cardinal_link::{CarrierKind, Priority, SecretEntry, Service, Session, Stream, Target};
 use cardinal_space::account::{self, ContactRecord, Regard};
-use cardinal_space::{relationship, SpaceId, SpaceOp};
+use cardinal_space::{relationship, NodeId, Space, SpaceId, SpaceOp};
 use cardinal_sync::identity_log_label;
 use serde_json::{json, Value as Json};
 use tokio::io::AsyncWriteExt;
@@ -1439,8 +1439,34 @@ fn state_of(read: bool, waiting: bool) -> &'static str {
     }
 }
 
-/// The conversation with a contact, oldest first.
-pub fn messages(d: &Daemon, who: &str) -> anyhow::Result<Json> {
+/// How many of a conversation's messages, oldest first, come before the
+/// message `before` names: its id in hex, or the start of one shown here
+/// (`apps.md`, Pages). One taken back since keeps its place, so a page
+/// asked for after it is still the one before it.
+pub(crate) fn upto(
+    sp: &Space,
+    all: &[relationship::Message],
+    before: Option<&str>,
+) -> anyhow::Result<usize> {
+    let Some(b) = before.map(str::trim) else {
+        return Ok(all.len());
+    };
+    let id: Option<NodeId> = hex::decode(b).ok().and_then(|v| v.try_into().ok());
+    let id = id.or_else(|| {
+        let mut shown = all.iter().filter(|m| hex::encode(m.id).starts_with(b));
+        match (shown.next(), shown.next()) {
+            (Some(m), None) if !b.is_empty() => Some(m.id),
+            _ => None,
+        }
+    });
+    let place = id.and_then(|id| relationship::message_place(sp, &id));
+    let place = place.ok_or_else(|| anyhow::anyhow!("there is no message {b} here"))?;
+    Ok(relationship::before_place(sp, all, &place))
+}
+
+/// The conversation with a contact, oldest first: those before `before`,
+/// if it names one.
+pub fn messages(d: &Daemon, who: &str, before: Option<&str>) -> anyhow::Result<Json> {
     let contact = listed(d, who)?;
     let (space, them) = (contact.space, contact.identity);
     let here = mailbox::written_here(d, &space);
@@ -1451,9 +1477,11 @@ pub fn messages(d: &Daemon, who: &str) -> anyhow::Result<Json> {
     let open = open.ok_or_else(|| anyhow::anyhow!("that space is not open yet"))?;
     let all = relationship::messages(open);
     let read = relationship::read_by(open, &them, &all);
+    let upto = upto(open, &all, before)?;
     let said: Vec<Json> = all
         .iter()
         .zip(read)
+        .take(upto)
         .map(|(m, read)| {
             let mine = Some(m.author) == me;
             json!({

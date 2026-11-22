@@ -648,18 +648,12 @@ pub fn messages(space: &Space) -> Vec<Message> {
         return Vec::new();
     };
     let state = space.state();
-    let mut found: Vec<((u8, usize), Message)> = state
+    let mut found: Vec<(Place, Message)> = state
         .children(&conversation)
         .into_iter()
         .filter(|n| n.kind == NodeKind::Uint(MESSAGE) && !n.deleted)
         .filter_map(|n| {
-            // A message a successor carried comes first, where the
-            // initial state ranks it, with the time it was written
-            // (`state.md#canonical-state`).
-            let at = match state.carried_rank(&n.id) {
-                Some(rank) => (0, rank as usize),
-                None => (1, space.dag().position(&n.created_in)?),
-            };
+            let at = place_of(space, n)?;
             let reply_to = n.values(3).iter().rev().find_map(|v| v.value.as_ref());
             let reply_to = reply_to.and_then(Value::as_bytes);
             let reactions = state.children(&n.id).into_iter();
@@ -689,8 +683,38 @@ pub fn messages(space: &Space) -> Vec<Message> {
             Some((at, message))
         })
         .collect();
-    found.sort_by_key(|(at, _)| *at);
+    found.sort_by(|(a, _), (b, _)| a.cmp(b));
     found.into_iter().map(|(_, m)| m).collect()
+}
+
+/// Where a message comes in the order [`messages`] gives them, for a page
+/// of them that ends before one: a message taken back since still has its
+/// place.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct Place((u8, usize), String, NodeId);
+
+fn place_of(space: &Space, n: &Node) -> Option<Place> {
+    // A message a successor carried comes first, where the initial state
+    // ranks it, with the time it was written (`state.md#canonical-state`);
+    // then by log order, and within an entry as the tree sorts children.
+    let at = match space.state().carried_rank(&n.id) {
+        Some(rank) => (0, rank as usize),
+        None => (1, space.dag().position(&n.created_in)?),
+    };
+    Some(Place(at, n.name.clone(), n.id))
+}
+
+/// The place of the message `id`, or of the one posted again that had
+/// that id, whether or not it has been taken back since.
+pub fn message_place(space: &Space, id: &NodeId) -> Option<Place> {
+    let state = space.state();
+    let n = state.node(&state.now_called(id)?)?;
+    place_of(space, n)
+}
+
+/// How many of `messages`, as [`messages`] gave them, come before `place`.
+pub fn before_place(space: &Space, messages: &[Message], place: &Place) -> usize {
+    messages.partition_point(|m| message_place(space, &m.id).is_some_and(|p| p < *place))
 }
 
 // ---- Recovery (`identity.md#how-guardians-act`) ---------------------------

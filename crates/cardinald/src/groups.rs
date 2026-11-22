@@ -934,7 +934,7 @@ fn message_in(d: &Daemon, space: &SpaceId, id: &str) -> anyhow::Result<relations
 
 /// The conversation of a group, oldest first, with who said each thing and
 /// how many of the others have read what this person said.
-pub fn messages(d: &Daemon, group: &str) -> anyhow::Result<Json> {
+pub fn messages(d: &Daemon, group: &str, before: Option<&str>) -> anyhow::Result<Json> {
     let g = find(d, group)?;
     use_members(d, &g.id);
     let me = identity(d)?;
@@ -955,8 +955,10 @@ pub fn messages(d: &Daemon, group: &str) -> anyhow::Result<Json> {
         read_by.insert(*m, relationship::read_by(sp, m, &all));
     }
     let contacts = core.contacts();
+    let upto = contacts::upto(sp, &all, before)?;
     let said: Vec<Json> = all
         .iter()
+        .take(upto)
         .enumerate()
         .map(|(i, m)| {
             let mine = m.author == me;

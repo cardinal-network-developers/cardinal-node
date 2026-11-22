@@ -65,9 +65,28 @@ pub struct Request {
     pub name: &'static str,
     pub args: &'static [Field],
     pub reply: &'static [Field],
+    /// Whether its answer comes in pages, and how (`apps.md`, Pages).
+    pub page: Page,
     /// A request no longer answered: the service says it has no such
     /// request, and its number stays taken.
     pub gone: bool,
+}
+
+/// How a request's answer comes in pages (`apps.md`, Pages). The lists of
+/// a paged reply are its fields that are lists, in the order of their
+/// numbers; its other fields come whole on every page.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Page {
+    /// It does not: what it answers does not grow with what the person
+    /// holds, or it does something, which a second page would do again.
+    Whole,
+    /// By position, through the reply's lists in turn: `after` is how many
+    /// items came before the page, and `next` the `after` of the next.
+    After,
+    /// Back from the newest of the one list `list`, oldest first within a
+    /// page: `before` is the id (field `id` of its records) of the oldest
+    /// item had, and `next` the oldest of this page.
+    Before { list: &'static str },
 }
 
 macro_rules! f {
@@ -205,7 +224,25 @@ macro_rules! req {
             name: $name,
             args: &[$(f!($an $af $at)),*],
             reply: &[$(f!($rn $rf $rt)),*],
+            page: Page::Whole,
             gone: false,
+        }
+    };
+}
+
+/// A request whose answer comes in pages, written as `req!` writes one
+/// after how: `after`, or `before` and the list paged.
+macro_rules! paged {
+    (after $($t:tt)*) => {
+        Request {
+            page: Page::After,
+            ..req!($($t)*)
+        }
+    };
+    (before $list:literal $($t:tt)*) => {
+        Request {
+            page: Page::Before { list: $list },
+            ..req!($($t)*)
         }
     };
 }
@@ -419,7 +456,7 @@ macro_rules! guarding_reply {
 pub static REQUESTS: &[Request] = &[
     // ---- The service, this device, and the person's devices: 1 to 29 ----
     req!(1 "hello" () -> (2 "api" U, 3 "version" T)),
-    req!(2 "status" () -> (
+    paged!(after 2 "status" (1 "after" U, 2 "limit" U) -> (
         2 "bluetooth" {BLUETOOTH}, 3 "carrying_calls" U, 4 "conditions" {CONDITIONS},
         5 "conflicts" U, 6 "copies" {COPIES}, 7 "devices" [DEVICE], 8 "files_ready" BOOL,
         9 "home" T, 10 "hosts" U, 11 "identity" B, 12 "identity_id" B,
@@ -428,7 +465,8 @@ pub static REQUESTS: &[Request] = &[
         21 "network" {NETWORK}, 22 "not_saved" U, 23 "not_saved_undone" U, 24 "old" {OLD},
         25 "pairing" {PAIRING}, 26 "peers" [T], 27 "pending_changes" BOOL,
         28 "progress" {PROGRESS}, 29 "read_markers" BOOL, 30 "removed" BOOL, 31 "retention" T,
-        32 "router" {ROUTER}, 33 "spaces" [SPACE], 34 "uptime_s" U)),
+        32 "router" {ROUTER}, 33 "spaces" [SPACE], 34 "uptime_s" U, 35 "more" BOOL,
+        36 "next" U)),
     req!(3 "watch" (1 "window" BOOL) -> ()),
     req!(4 "stop" () -> ()),
     req!(5 "reload" () -> ()),
@@ -439,7 +477,8 @@ pub static REQUESTS: &[Request] = &[
     req!(9 "setup-finish" (1 "name" T, 2 "answers" [T], 3 "device" T) -> (
         2 "device" T, 3 "name" T)),
     req!(10 "me" (1 "name" T) -> (2 "name" T, 3 "set" BOOL)),
-    req!(11 "devices" () -> (2 "devices" [DEVICE])),
+    paged!(after 11 "devices" (1 "after" U, 2 "limit" U) -> (
+        2 "devices" [DEVICE], 3 "more" BOOL, 4 "next" U)),
     req!(12 "device-rename" (1 "device" REF, 2 "name" T) -> (2 "key" B, 3 "name" T)),
     req!(13 "remove-device" (1 "who" REF, 2 "lost" BOOL, 3 "words" T) -> (
         2 "dropped" U, 3 "name" T)),
@@ -449,23 +488,28 @@ pub static REQUESTS: &[Request] = &[
     req!(16 "pair-type" (1 "code" T, 2 "at" T, 3 "admin" BOOL, 4 "words" T, 5 "device" T) -> (
         2 "name" T)),
     // ---- People, conversations and invitations: 30 to 69 ----
-    req!(30 "contacts" (1 "all" BOOL) -> (2 "contacts" [CONTACT])),
+    paged!(after 30 "contacts" (1 "all" BOOL, 2 "after" U, 3 "limit" U) -> (
+        2 "contacts" [CONTACT], 3 "more" BOOL, 4 "next" U)),
     req!(31 "contact" (
         1 "who" REF, 2 "setting" T, 3 "name" T, 4 "picture" T, 5 "category" T, 6 "host" T
     ) -> (
         2 "category" T, 3 "name" T, 4 "own" BOOL, 5 "picture" T, 6 "reach" [GROUP_SHOWN],
         7 "suggested" T, 8 "named" T)),
-    req!(32 "contact-status" (1 "who" REF, 2 "look" BOOL, 3 "at" T) -> (
+    paged!(after 32 "contact-status" (
+        1 "who" REF, 2 "look" BOOL, 3 "at" T, 4 "after" U, 5 "limit" U
+    ) -> (
         2 "devices" [SESSION_DEVICE], 3 "direct_sessions" BOOL, 4 "identity" B,
         5 "in_use_for_s" U, 6 "introductions" BOOL, 7 "last_look" [STEP], 8 "look_every_s" U,
         9 "looked_for" T, 10 "looked_s_ago" U, 11 "looking" BOOL, 12 "looking_since" U,
         13 "looks_without_session" U, 14 "name" T, 15 "nearby" {NEARBY},
         16 "nearby_tries" [STEP], 17 "own" BOOL, 18 "refused" BOOL, 19 "router" {ROUTER},
         20 "sessions" [STEP], 21 "suggested" T, 22 "their_reach" [THEIR_REACH],
-        23 "trusted" BOOL, 24 "your_reach" [THEIR_REACH])),
-    req!(33 "conversations" () -> (2 "conversations" [CONVERSATION])),
-    req!(34 "messages" (1 "who" REF, 2 "group" REF) -> (
-        2 "group" B, 3 "messages" [MESSAGE], 4 "name" T)),
+        23 "trusted" BOOL, 24 "your_reach" [THEIR_REACH], 25 "more" BOOL, 26 "next" U)),
+    paged!(after 33 "conversations" (1 "after" U, 2 "limit" U) -> (
+        2 "conversations" [CONVERSATION], 3 "more" BOOL, 4 "next" U)),
+    paged!(before "messages" 34 "messages" (
+        1 "who" REF, 2 "group" REF, 3 "before" REF, 4 "limit" U
+    ) -> (2 "group" B, 3 "messages" [MESSAGE], 4 "name" T, 5 "more" BOOL, 6 "next" B)),
     req!(35 "say" (1 "who" REF, 2 "text" T, 3 "reply_to" REF, 4 "attach" [T], 5 "group" REF) -> (
         2 "reachable" BOOL)),
     req!(36 "save-attachment" (
@@ -484,14 +528,17 @@ pub static REQUESTS: &[Request] = &[
         1 "code" T, 2 "name" T, 3 "via" T, 4 "hosts_only" BOOL, 5 "no_introductions" BOOL,
         6 "for" REF
     ) -> (2 "name" T, 3 "recovery_of" B)),
-    req!(44 "invitations" () -> (2 "invitations" [INVITATION])),
+    paged!(after 44 "invitations" (1 "after" U, 2 "limit" U) -> (
+        2 "invitations" [INVITATION], 3 "more" BOOL, 4 "next" U)),
     req!(45 "cancel-invitation" (1 "id" REF) -> ()),
-    req!(46 "introductions" () -> (2 "introductions" [INTRODUCTION])),
+    paged!(after 46 "introductions" (1 "after" U, 2 "limit" U) -> (
+        2 "introductions" [INTRODUCTION], 3 "more" BOOL, 4 "next" U)),
     req!(47 "introduce" (1 "who" REF, 2 "to" REF, 3 "note" T) -> ()),
     req!(48 "introduction-accept" (1 "id" REF) -> (2 "name" T, 3 "recovery_of" B)),
     req!(49 "introduction-decline" (1 "id" REF) -> ()),
     // ---- Groups: 70 to 99 ----
-    req!(70 "groups" () -> (2 "groups" [GROUP], 3 "offers" [OFFER])),
+    paged!(after 70 "groups" (1 "after" U, 2 "limit" U) -> (
+        2 "groups" [GROUP], 3 "offers" [OFFER], 4 "more" BOOL, 5 "next" U)),
     req!(71 "group-create" (1 "name" T, 2 "people" [REF]) -> (2 "group" B, 3 "name" T)),
     req!(72 "group-join" (1 "group" REF, 2 "reach" BOOL) -> (
         2 "group" B, 3 "name" T, 4 "shared" BOOL, 5 "waiting" BOOL)),
@@ -502,8 +549,8 @@ pub static REQUESTS: &[Request] = &[
     req!(76 "group-add" (1 "group" REF, 2 "people" [REF], 3 "shown" T) -> ()),
     req!(77 "group-remove" (1 "group" REF, 2 "who" REF) -> (
         2 "group" B, 3 "left_out" [B], 4 "was" B)),
-    req!(78 "group-members" (1 "group" REF) -> (
-        2 "group" B, 3 "members" [MEMBER], 4 "name" T)),
+    paged!(after 78 "group-members" (1 "group" REF, 2 "after" U, 3 "limit" U) -> (
+        2 "group" B, 3 "members" [MEMBER], 4 "name" T, 5 "more" BOOL, 6 "next" U)),
     req!(79 "group-set" (1 "group" REF, 2 "name" T, 3 "introductions" BOOL) -> ()),
     req!(80 "group-member" (1 "group" REF, 2 "who" REF, 3 "shown" T, 4 "introduce" BOOL) -> ()),
     req!(81 "group-connect" (1 "group" REF, 2 "who" REF, 3 "note" T) -> (2 "asked" BOOL)),
@@ -519,7 +566,8 @@ pub static REQUESTS: &[Request] = &[
     req!(105 "clip-copy" (1 "text" T) -> (2 "devices" U)),
     req!(106 "clip" () -> (2 "from" T, 3 "here" BOOL, 4 "seconds" U, 5 "text" T)),
     // ---- The one folder: 120 to 149 ----
-    req!(120 "files" (1 "path" T) -> (2 "files" [FILE], 3 "path" T, 4 "place" {PLACE})),
+    paged!(after 120 "files" (1 "path" T, 2 "after" U, 3 "limit" U) -> (
+        2 "files" [FILE], 3 "path" T, 4 "place" {PLACE}, 5 "more" BOOL, 6 "next" U)),
     req!(121 "mkdir" (1 "path" T) -> (2 "path" T)),
     req!(122 "move" (1 "from" T, 2 "to" T) -> (2 "path" T)),
     req!(123 "remove" (1 "path" T) -> (2 "path" T)),
@@ -531,8 +579,10 @@ pub static REQUESTS: &[Request] = &[
     req!(129 "mount" (1 "path" T) -> (2 "path" T)),
     req!(130 "unmount" () -> ()),
     req!(131 "flush" () -> (2 "entries" U)),
-    req!(132 "conflicts" () -> (2 "conflicts" [CONFLICT])),
-    req!(133 "history" (1 "path" T) -> (2 "path" T, 3 "versions" [VERSION])),
+    paged!(after 132 "conflicts" (1 "after" U, 2 "limit" U) -> (
+        2 "conflicts" [CONFLICT], 3 "more" BOOL, 4 "next" U)),
+    paged!(after 133 "history" (1 "path" T, 2 "after" U, 3 "limit" U) -> (
+        2 "path" T, 3 "versions" [VERSION], 4 "more" BOOL, 5 "next" U)),
     req!(134 "restore" (1 "path" T, 2 "version" U) -> (2 "path" T, 3 "version" U)),
     req!(135 "pin" (1 "path" T) -> (2 "on_demand" BOOL, 3 "path" T)),
     req!(136 "unpin" (1 "path" T) -> (2 "on_demand" BOOL, 3 "path" T)),
@@ -593,50 +643,62 @@ pub static REQUESTS: &[Request] = &[
     req!(184 "host-off" () -> (2 "hosts" [HOST])),
     req!(185 "peer-add" (1 "addr" T) -> (2 "addr" T)),
     req!(186 "peer-remove" (1 "addr" T) -> ()),
-    req!(187 "peer-list" () -> (2 "peers" [PEER])),
+    paged!(after 187 "peer-list" (1 "after" U, 2 "limit" U) -> (
+        2 "peers" [PEER], 3 "more" BOOL, 4 "next" U)),
     // ---- Inspection and measuring: 200 to 219 ----
     req!(200 "inspect-on" (1 "minutes" U) -> (2 "token" B, 3 "until" U)),
     req!(201 "inspect-off" () -> (2 "was_on" BOOL)),
-    req!(202 "inspect" (1 "token" REF) -> (
+    paged!(after 202 "inspect" (1 "token" REF, 2 "after" U, 3 "limit" U) -> (
         2 "device" {INSPECT_DEVICE}, 3 "identity" {INSPECT_IDENTITY}, 4 "others" [OTHER_LOG],
-        5 "spaces" [INSPECT_SPACE], 6 "store" {STORE}, 7 "version" T)),
-    req!(203 "inspect-identity" (
-        1 "token" REF, 2 "who" REF, 3 "entry" REF, 4 "path" [SCALAR], 5 "limit" U, 6 "items" U
+        5 "spaces" [INSPECT_SPACE], 6 "store" {STORE}, 7 "version" T, 8 "more" BOOL,
+        9 "next" U)),
+    paged!(after 203 "inspect-identity" (
+        1 "token" REF, 2 "who" REF, 3 "entry" REF, 4 "path" [SCALAR], 5 "value_bytes" U,
+        6 "items" U, 7 "after" U, 8 "limit" U
     ) -> (
         2 "attached" [ATTACHED_LOG], 3 "entries" [IDENTITY_ENTRY], 4 "id" B, 5 "stalled" [B],
-        6 "value" {VALUE})),
-    req!(204 "inspect-space" (1 "token" REF, 2 "space" REF, 3 "limit" U, 4 "items" U) -> (
+        6 "value" {VALUE}, 7 "more" BOOL, 8 "next" U)),
+    paged!(after 204 "inspect-space" (
+        1 "token" REF, 2 "space" REF, 3 "value_bytes" U, 4 "items" U, 5 "after" U, 6 "limit" U
+    ) -> (
         2 "account" BOOL, 3 "bytes" U, 4 "conflicts" U, 5 "created" U, 6 "creator" B,
         7 "current_epoch" B, 8 "entries" U, 9 "epochs" [EPOCH], 10 "files" BOOL, 11 "heads" [B],
         12 "id" B, 13 "kinds" [KIND_COUNT], 14 "label" T, 15 "members" [SPACE_MEMBER],
         16 "my_role" U, 17 "nodes" U, 18 "opened" BOOL, 19 "owner" B, 20 "pending" U,
         21 "policy" {POLICY}, 22 "profile" KIND, 23 "reach" [REACH_NODE], 24 "rejected" U,
         25 "root" {ROOT}, 26 "sealed" U, 27 "stats" {STATS}, 28 "successor" B,
-        29 "unwitnessed" U, 30 "valid" U)),
-    req!(205 "inspect-entries" (
-        1 "token" REF, 2 "space" REF, 3 "view" T, 4 "offset" U, 5 "count" U
-    ) -> (2 "entries" [INSPECT_ENTRY], 3 "offset" U, 4 "pending" U, 5 "total" U)),
-    req!(206 "inspect-entry" (
+        29 "unwitnessed" U, 30 "valid" U, 31 "more" BOOL, 32 "next" U)),
+    paged!(after 205 "inspect-entries" (
+        1 "token" REF, 2 "space" REF, 3 "view" T, 4 "offset" (gone U), 5 "count" (gone U),
+        6 "after" U, 7 "limit" U
+    ) -> (
+        2 "entries" [INSPECT_ENTRY], 3 "offset" (gone U), 4 "pending" U, 5 "total" U,
+        6 "more" BOOL, 7 "next" U)),
+    paged!(after 206 "inspect-entry" (
         1 "token" REF, 2 "space" REF, 3 "entry" REF, 4 "sealed_id" REF, 5 "path" [SCALAR],
-        6 "limit" U, 7 "items" U
+        6 "value_bytes" U, 7 "items" U, 8 "after" U, 9 "limit" U
     ) -> (
         2 "accepted" BOOL, 3 "children" [B], 4 "entry" B, 5 "header" {VALUE}, 6 "ops" [OP],
         7 "position" U, 8 "sealed" {VALUE}, 9 "sealed_id" B, 10 "signatures" [SIGNATURE],
-        11 "valid" BOOL, 12 "weigh" {WEIGH}, 13 "value" {VALUE})),
-    req!(207 "inspect-nodes" (
-        1 "token" REF, 2 "space" REF, 3 "kind" KIND, 4 "parent" REF, 5 "offset" U, 6 "count" U
-    ) -> (2 "nodes" [NODE_BRIEF], 3 "offset" U, 4 "total" U)),
-    req!(208 "inspect-node" (
-        1 "token" REF, 2 "space" REF, 3 "node" REF, 4 "path" [SCALAR], 5 "limit" U, 6 "items" U
+        11 "valid" BOOL, 12 "weigh" {WEIGH}, 13 "value" {VALUE}, 14 "more" BOOL, 15 "next" U)),
+    paged!(after 207 "inspect-nodes" (
+        1 "token" REF, 2 "space" REF, 3 "kind" KIND, 4 "parent" REF, 5 "offset" (gone U),
+        6 "count" (gone U), 7 "after" U, 8 "limit" U
+    ) -> (
+        2 "nodes" [NODE_BRIEF], 3 "offset" (gone U), 4 "total" U, 5 "more" BOOL, 6 "next" U)),
+    paged!(after 208 "inspect-node" (
+        1 "token" REF, 2 "space" REF, 3 "node" REF, 4 "path" [SCALAR], 5 "value_bytes" U,
+        6 "items" U, 7 "after" U, 8 "limit" U
     ) -> (
         2 "bytes" U, 3 "children" U, 4 "created" U, 5 "created_in" B, 6 "creator" B,
         7 "delete_conflict" BOOL, 8 "deleted" BOOL, 9 "fields" [[U]],
         10 "history" [NODE_HISTORY], 11 "id" B, 12 "kind" KIND, 13 "name" T, 14 "parent" B,
-        15 "position" U, 16 "special" T, 17 "values" [NODE_FIELD], 18 "value" {VALUE})),
-    req!(209 "debug-tree" () -> (
+        15 "position" U, 16 "special" T, 17 "values" [NODE_FIELD], 18 "value" {VALUE},
+        19 "more" BOOL, 20 "next" U)),
+    paged!(after 209 "debug-tree" (1 "after" U, 2 "limit" U) -> (
         2 "deleted" U, 3 "epoch" B, 4 "heads" B, 5 "items" [TREE_ITEM], 6 "mounted" BOOL,
         7 "pending" BOOL, 8 "settle" U, 9 "state" B, 10 "stuck" [STUCK_ITEM],
-        11 "unshown" [UNSHOWN_NODE])),
+        11 "unshown" [UNSHOWN_NODE], 12 "more" BOOL, 13 "next" U)),
     req!(210 "speedtest" (1 "device" REF) -> (
         2 "device" T, 3 "ms" U, 4 "receive" U, 5 "received_bytes" U, 6 "rtt_median_us" U,
         7 "rtt_min_us" U, 8 "send" U, 9 "sent_bytes" U)),

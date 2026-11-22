@@ -363,6 +363,18 @@ as `words`, would let the same request through; 6 (`needs for`), that an
 needs `for`. `cardinal --trace <command>` shows a command's requests and
 replies in the text rendering with these names, and `cardinal api-trace
 --listen PATH` passes a client's messages on to the daemon and shows them.
+
+A request whose answer grows with what the person holds answers a page of
+it (`apps.md`, Pages; `table.rs` marks each with `paged!`): `limit`
+items at most, as many as fit in a message (256 KiB) with the reply's
+other fields, from a cursor on, with `more` and, when there is more,
+`next`, the cursor of the next page. `messages` pages back from the
+newest, `before` a message's id, the oldest of a page coming first; every
+other one by position, `after` the items already had, through the
+reply's lists in the order of their numbers. `api::page` cuts every such
+reply as it leaves, from what the handler gave; an item that alone does
+not fit is error 4, never cut short. The command line asks page after
+page (`control::request`) and shows the whole, as before.
 Requests: `status`, `devices`, `remove-device`,
 `recovery-check` (`words`; changes nothing), `free-space` (`dry_run`; or
 `unnamed`, with `delete`),
@@ -596,11 +608,15 @@ new grant ends the old token; the grant lives in memory only, so a
 restart ends it too. Every request takes the `token`, and there is one
 for each view: `inspect` (the overview), `inspect-identity` (`who`, `entry`,
 `path`), `inspect-space` (`space`), `inspect-entries` (`space`, `view`:
-`sealed` or `opened`, `offset`, `count`), `inspect-entry` (`space`, `entry`
+`sealed` or `opened`), `inspect-entry` (`space`, `entry`
 or `sealed_id`, `path` from `sealed`, `signed` or `entry`), `inspect-nodes`
 (`space`, `kind`, `parent`), `inspect-node` (`space`, `node`, `path`);
-`limit` and `items` say how
-much of each value to send (48 bytes and 24 items unless asked). Values
+each comes in pages, by `after` and `limit` (entries and nodes rendered
+5,000 at most a page, which the cap then cuts), in place of
+`inspect-entries`' and `inspect-nodes`' `offset` and `count`, which are no
+longer read. `value_bytes` (once `limit`, under the same number) and
+`items` say how much of each value to send (48 bytes and 24 items unless
+asked). Values
 come typed with their encoded length; no private key is ever sent: an
 epoch key, a blob reference's key, a secret node's value, a reach
 node's presence secret (field 2, D74) and an invitation's secret come as a value whose `t` is `secret`, with `what` and `len`, bytes that

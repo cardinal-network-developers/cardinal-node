@@ -384,6 +384,100 @@ fn lists_a_folder() {
     assert_eq!(inside["files"][0]["folder"], false);
 }
 
+/// A conversation longer than one message holds comes in pages, back from
+/// the newest, each under the cap; the cursor is a message's id, and one
+/// taken back keeps its place (`apps.md`, Pages). The command line pages
+/// through it all, as before.
+#[test]
+fn a_long_conversation_comes_in_pages() {
+    if !fuse_available() {
+        eprintln!("skipping: /dev/fuse or fusermount3 is not available");
+        return;
+    }
+    let root = tempfile::tempdir().unwrap();
+    let (a, _b) = met(root.path());
+    let bo = only(&a)["name"].as_str().unwrap().to_owned();
+    // forty of eight thousand bytes: more than a message carries
+    let text = |i: usize| format!("{i:02} {}", "x".repeat(8000));
+    for i in 0..40 {
+        ask(&a, json!({"cmd": "say", "who": bo, "text": text(i)}));
+    }
+    let texts = |v: &Value| -> Vec<String> {
+        let list = v["messages"].as_array().unwrap().iter();
+        list.map(|m| m["text"].as_str().unwrap().to_owned())
+            .collect()
+    };
+    let first = ask(&a, json!({"cmd": "messages", "who": bo}));
+    let shown = texts(&first);
+    assert!(!shown.is_empty() && shown.len() < 40, "{}", shown.len());
+    assert_eq!(shown.last(), Some(&text(39)), "the newest come first");
+    assert_eq!(first["more"], true);
+    let mut all = shown;
+    let mut before = first["next"].clone();
+    loop {
+        let p = ask(&a, json!({"cmd": "messages", "who": bo, "before": before}));
+        let mut older = texts(&p);
+        assert!(!older.is_empty());
+        older.append(&mut all);
+        all = older;
+        if p["more"] != true {
+            assert!(p.get("next").is_none(), "{}", p["next"]);
+            break;
+        }
+        before = p["next"].clone();
+    }
+    assert_eq!(all, (0..40).map(text).collect::<Vec<_>>());
+
+    // a limit: the newest so many
+    let p = ask(&a, json!({"cmd": "messages", "who": bo, "limit": 3}));
+    assert_eq!(texts(&p), [text(37), text(38), text(39)]);
+    let id = p["messages"][0]["id"].clone();
+    assert_eq!(p["next"], id);
+    // taken back, it still marks where the page before it ends
+    ask(&a, json!({"cmd": "delete-message", "who": bo, "id": id}));
+    let p = ask(
+        &a,
+        json!({"cmd": "messages", "who": bo, "before": id, "limit": 2}),
+    );
+    assert_eq!(texts(&p), [text(35), text(36)]);
+
+    // the command line shows every one
+    let out = a.cli(&["messages", &bo]);
+    for i in (0..40).filter(|i| *i != 37) {
+        assert!(out.contains(&format!("you: {i:02} xxx")), "{i} missing");
+    }
+    assert!(!out.contains("you: 37 "));
+
+    // a folder too, by position
+    for n in ["a", "b", "c", "d", "e"] {
+        ask(&a, json!({"cmd": "mkdir", "path": n}));
+    }
+    let mut names = Vec::new();
+    let mut after = json!(0);
+    loop {
+        let p = ask(&a, json!({"cmd": "files", "after": after, "limit": 2}));
+        let page = p["files"].as_array().unwrap();
+        assert!(page.len() <= 2);
+        names.extend(page.iter().map(|f| f["name"].as_str().unwrap().to_owned()));
+        if p["more"] != true {
+            break;
+        }
+        after = p["next"].clone();
+    }
+    let whole = ask(&a, json!({"cmd": "files"}));
+    assert_eq!(whole["more"], false);
+    let listed: Vec<&str> = whole["files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|f| f["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(names, listed);
+    for n in ["a", "b", "c", "d", "e"] {
+        assert!(listed.contains(&n), "{listed:?}");
+    }
+}
+
 /// The reason a request was turned down.
 fn turned_down(d: &Dev, req: Value) -> String {
     let reply = common::reply(d, &req);

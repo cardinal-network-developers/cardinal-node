@@ -220,6 +220,165 @@ fn a_request_no_longer_answered_keeps_its_number() {
     );
 }
 
+#[test]
+fn a_paged_request_has_its_cursor_and_says_if_there_is_more() {
+    let ty = |fields: &[Field], name: &str| {
+        fields
+            .iter()
+            .find(|f| f.name == name)
+            .map(|f| ty_text(&f.ty))
+    };
+    for r in REQUESTS.iter().filter(|r| r.page != Page::Whole) {
+        assert_eq!(ty(r.args, "limit").as_deref(), Some("uint"), "{}", r.name);
+        assert_eq!(ty(r.reply, "more").as_deref(), Some("bool"), "{}", r.name);
+        match r.page {
+            Page::After => {
+                assert_eq!(ty(r.args, "after").as_deref(), Some("uint"), "{}", r.name);
+                assert_eq!(ty(r.reply, "next").as_deref(), Some("uint"), "{}", r.name);
+            }
+            Page::Before { list } => {
+                assert_eq!(ty(r.args, "before").as_deref(), Some("ref"), "{}", r.name);
+                assert_eq!(ty(r.reply, "next").as_deref(), Some("bytes"), "{}", r.name);
+                let f = r.reply.iter().find(|f| f.name == list).unwrap();
+                let Ty::Recs(rec) = f.ty else {
+                    panic!("{} pages {list}, which is not a list of records", r.name)
+                };
+                assert_eq!(ty(rec.fields, "id").as_deref(), Some("bytes"), "{}", r.name);
+            }
+            Page::Whole => unreachable!(),
+        }
+    }
+    // what grows with what the person holds comes in pages
+    for name in [
+        "status",
+        "devices",
+        "contacts",
+        "contact-status",
+        "conversations",
+        "messages",
+        "groups",
+        "group-members",
+        "files",
+        "peer-list",
+        "inspect",
+        "inspect-identity",
+        "inspect-space",
+        "inspect-entries",
+        "inspect-entry",
+        "inspect-nodes",
+        "inspect-node",
+        "debug-tree",
+    ] {
+        assert_ne!(by_name(name).unwrap().page, Page::Whole, "{name}");
+    }
+}
+
+fn texts(n: usize, len: usize) -> Vec<String> {
+    (0..n).map(|i| format!("{i:0len$}")).collect()
+}
+
+#[test]
+fn a_page_goes_through_each_list_in_turn() {
+    let spec = by_name("groups").unwrap();
+    let groups: Vec<Json> = (0..3).map(|i| json!({"name": format!("g{i}")})).collect();
+    let offers: Vec<Json> = (0..2).map(|i| json!({"name": format!("o{i}")})).collect();
+    let full = json!({"groups": groups, "offers": offers});
+    let ask = |after: u64, limit: u64| {
+        let req = json!({"cmd": "groups", "after": after, "limit": limit});
+        page(spec, &req, full.clone()).unwrap()
+    };
+    let p = ask(0, 2);
+    assert_eq!(p["groups"].as_array().unwrap().len(), 2);
+    assert_eq!(p["offers"], json!([]));
+    assert_eq!(
+        (p["more"].clone(), p["next"].clone()),
+        (json!(true), json!(2))
+    );
+    let p = ask(2, 2);
+    assert_eq!(p["groups"][0]["name"], "g2");
+    assert_eq!(p["offers"][0]["name"], "o0");
+    assert_eq!(p["next"], 4);
+    let p = ask(4, 2);
+    assert_eq!(p["groups"], json!([]));
+    assert_eq!(p["offers"][0]["name"], "o1");
+    assert_eq!(p["more"], false);
+    assert!(p.get("next").is_none());
+    // without a limit, all that fit
+    let p = page(spec, &json!({"cmd": "groups"}), full.clone()).unwrap();
+    assert_eq!(p["groups"].as_array().unwrap().len(), 3);
+    assert_eq!(p["more"], false);
+    // a request that is not paged is left as it is
+    let spec = by_name("guardians").unwrap();
+    let v = json!({"names": texts(3, 4)});
+    assert_eq!(page(spec, &json!({}), v.clone()).unwrap(), v);
+}
+
+#[test]
+fn a_page_never_holds_more_than_a_message() {
+    let spec = by_name("peer-list").unwrap();
+    let peers: Vec<Json> = texts(400, 1000)
+        .into_iter()
+        .map(|a| json!({"addr": a}))
+        .collect();
+    let full = json!({"peers": peers});
+    let mut after = 0u64;
+    let mut seen = 0;
+    loop {
+        let req = json!({"cmd": "peer-list", "after": after});
+        let p = page(spec, &req, full.clone()).unwrap();
+        let msg = encode_reply(spec, Ok(&p));
+        assert!(msg.len() <= MAX_MESSAGE, "{} bytes", msg.len());
+        let n = p["peers"].as_array().unwrap().len();
+        assert!(n > 0);
+        assert_eq!(p["peers"][0]["addr"], format!("{seen:01000}"));
+        seen += n;
+        if p["more"] == false {
+            break;
+        }
+        after = p["next"].as_u64().unwrap();
+        assert_eq!(after as usize, seen);
+    }
+    assert_eq!(seen, 400);
+    // an item larger than a message is said to be, not cut
+    let big = json!({"peers": [{"addr": "x".repeat(MAX_MESSAGE)}]});
+    let e = page(spec, &json!({"cmd": "peer-list"}), big).unwrap_err();
+    assert_eq!(e.0, status::TOO_LARGE);
+}
+
+#[test]
+fn messages_page_back_from_the_newest() {
+    let spec = by_name("messages").unwrap();
+    let said: Vec<Json> = (0..5u8)
+        .map(|i| json!({"id": hex::encode([i; 16]), "text": format!("m{i}")}))
+        .collect();
+    let full = json!({"name": "Ana", "messages": said});
+    let p = page(spec, &json!({"cmd": "messages", "limit": 2}), full.clone()).unwrap();
+    let texts: Vec<&str> = p["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| m["text"].as_str().unwrap())
+        .collect();
+    assert_eq!(texts, ["m3", "m4"], "the newest, oldest first");
+    assert_eq!(p["more"], true);
+    assert_eq!(p["next"], hex::encode([3u8; 16]));
+    assert_eq!(p["name"], "Ana");
+    // the handler gives those before `before`; the oldest are the last page
+    let before: Vec<Json> = full["messages"].as_array().unwrap()[..1].to_vec();
+    let p = page(
+        spec,
+        &json!({"cmd": "messages", "limit": 2}),
+        json!({"messages": before}),
+    )
+    .unwrap();
+    assert_eq!(p["messages"][0]["text"], "m0");
+    assert_eq!(p["more"], false);
+    assert!(p.get("next").is_none());
+    // on the wire, `next` is bytes
+    let msg = encode_reply(spec, Ok(&page(spec, &json!({"limit": 1}), full).unwrap()));
+    assert_eq!(Record::decode(&msg).unwrap().bytes(6).unwrap(), [4u8; 16]);
+}
+
 /// The tables as `apps.md` gives them: `CARDINAL_API_TABLES=<file>`
 /// writes them there.
 #[test]

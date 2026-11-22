@@ -45,8 +45,71 @@ pub fn trace(on: bool) {
 
 /// Sends a request to a running daemon and returns its reply. Both are by
 /// name: `req` names the request in `cmd`, and the reply has `ok`, and
-/// `error` when it is not.
+/// `error` when it is not. A request whose answer comes in pages is asked
+/// for page after page, and the reply holds every page's items, unless
+/// `req` asks for one page itself, with `limit`, `after` or `before`.
 pub async fn request(socket: &std::path::Path, req: &Value) -> anyhow::Result<Value> {
+    let name = req.get("cmd").and_then(Value::as_str).unwrap_or("");
+    let one = ["limit", "after", "before"]
+        .iter()
+        .any(|k| req.get(*k).is_some_and(|v| !v.is_null()));
+    let page = match api::by_name(name) {
+        Some(spec) if !one => spec.page,
+        _ => api::Page::Whole,
+    };
+    let mut all = request_one(socket, req).await?;
+    if page == api::Page::Whole {
+        return Ok(all);
+    }
+    let spec = api::by_name(name).expect("paged above");
+    let lists: Vec<&'static str> = match page {
+        api::Page::Before { list } => vec![list],
+        _ => spec
+            .reply
+            .iter()
+            .filter(|f| matches!(f.ty, api::Ty::List(_) | api::Ty::Recs(_)))
+            .map(|f| f.name)
+            .collect(),
+    };
+    let mut next_req = req.clone();
+    while all["ok"] == true && all["more"] == true {
+        let Some(next) = all.get("next").cloned() else {
+            break;
+        };
+        let cursor = match page {
+            api::Page::Before { .. } => "before",
+            _ => "after",
+        };
+        next_req[cursor] = next;
+        let more = request_one(socket, &next_req).await?;
+        if more["ok"] != true {
+            return Ok(more);
+        }
+        let mut grew = false;
+        for l in &lists {
+            let got = more[*l].as_array().cloned().unwrap_or_default();
+            grew |= !got.is_empty();
+            let had = all[*l].as_array().cloned().unwrap_or_default();
+            all[*l] = match page {
+                api::Page::Before { .. } => json!(got.into_iter().chain(had).collect::<Vec<_>>()),
+                _ => json!(had.into_iter().chain(got).collect::<Vec<_>>()),
+            };
+        }
+        all["more"] = more["more"].clone();
+        all["next"] = more["next"].clone();
+        if !grew {
+            break;
+        }
+    }
+    if let Some(o) = all.as_object_mut() {
+        o.remove("more");
+        o.remove("next");
+    }
+    Ok(all)
+}
+
+/// [`request`], one page of it.
+async fn request_one(socket: &std::path::Path, req: &Value) -> anyhow::Result<Value> {
     let (spec, msg) = api::encode_request(req)?;
     let tracing = TRACE.load(Ordering::Relaxed);
     if tracing {
@@ -128,7 +191,10 @@ async fn connection(d: Arc<Daemon>, mut r: Reader, mut w: Writer) {
             _ => {}
         }
         let reply = match handle(&d, &req).await.map_err(|e| capitalized(&req, e)) {
-            Ok(v) => api::encode_reply(spec, Ok(&v)),
+            Ok(v) => match api::page(spec, &req, v) {
+                Ok(v) => api::encode_reply(spec, Ok(&v)),
+                Err((st, why)) => api::encode_reply(spec, Err((st, &why))),
+            },
             Err(e) => {
                 let st = if e.is::<crate::recovery::NeedsWords>() {
                     status::NEEDS_WORDS
@@ -431,8 +497,10 @@ async fn handle(d: &Arc<Daemon>, req: &Value) -> anyhow::Result<Value> {
         "invitations" => Ok(crate::contacts::invitations(d)),
         "cancel-invitation" => crate::contacts::cancel_invitation(d, arg(req, "id")?),
         "contact-status" => {
-            let look = req.get("look").and_then(|v| v.as_bool()) == Some(true);
-            let at = match req.get("at").and_then(|v| v.as_str()) {
+            // looking is done with the first page, never again for the next
+            let first = req.get("after").and_then(Value::as_u64).unwrap_or(0) == 0;
+            let look = first && req.get("look").and_then(|v| v.as_bool()) == Some(true);
+            let at = match req.get("at").and_then(|v| v.as_str()).filter(|_| first) {
                 Some(a) => Some(a.parse().map_err(|_| {
                     anyhow::anyhow!("{a} is not an address; it looks like 192.168.1.20:7171")
                 })?),
@@ -466,7 +534,11 @@ async fn handle(d: &Arc<Daemon>, req: &Value) -> anyhow::Result<Value> {
             let attach = strings(req, "attach");
             crate::groups::say(d, arg(req, "group")?, arg(req, "text")?, reply_to, &attach).await
         }
-        "messages" if req.get("group").is_some() => crate::groups::messages(d, arg(req, "group")?),
+        "messages" if req.get("group").is_some() => crate::groups::messages(
+            d,
+            arg(req, "group")?,
+            req.get("before").and_then(Value::as_str),
+        ),
         "mark-read" if req.get("group").is_some() => {
             crate::groups::mark_read(d, arg(req, "group")?)
         }
@@ -594,7 +666,11 @@ async fn handle(d: &Arc<Daemon>, req: &Value) -> anyhow::Result<Value> {
             let text = req.get("text").and_then(|v| v.as_str());
             crate::onefolder::share(d, arg(req, "who")?, &paths, text).await
         }
-        "messages" => crate::contacts::messages(d, arg(req, "who")?),
+        "messages" => crate::contacts::messages(
+            d,
+            arg(req, "who")?,
+            req.get("before").and_then(Value::as_str),
+        ),
         "recovery-check" => {
             crate::recovery::root_from_words(d, arg(req, "words")?)?;
             Ok(json!({}))

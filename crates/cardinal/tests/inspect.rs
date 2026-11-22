@@ -73,14 +73,33 @@ fn inspection_is_granted_read_only_and_keeps_secrets() {
         let sealed = ask(json!({"what": "entries", "space": id, "view": "sealed"}));
         assert_eq!(sealed["total"], s["sealed"]);
         let opened = ask(json!({"what": "entries", "space": id}));
+        // a page at a time, the same entries
+        let ids = |v: &Value| -> Vec<Value> {
+            let list = v["entries"].as_array().unwrap().iter();
+            list.map(|e| e["entry"].clone()).collect()
+        };
+        let mut paged = Vec::new();
+        let mut after = 0;
+        loop {
+            let p = ask(json!({"what": "entries", "space": id, "after": after, "limit": 3}));
+            assert!(ids(&p).len() <= 3);
+            paged.extend(ids(&p));
+            if p["more"] != true {
+                break;
+            }
+            after = p["next"].as_u64().unwrap();
+        }
+        assert_eq!(paged, ids(&opened));
         for e in opened["entries"].as_array().unwrap() {
-            let full =
-                ask(json!({"what": "entry", "space": id, "entry": e["entry"], "limit": 300000}));
+            let full = ask(
+                json!({"what": "entry", "space": id, "entry": e["entry"], "value_bytes": 300000}),
+            );
             seen.push_str(&full.to_string());
         }
         let nodes = ask(json!({"what": "nodes", "space": id}));
         for n in nodes["nodes"].as_array().unwrap() {
-            let full = ask(json!({"what": "node", "space": id, "node": n["id"], "limit": 300000}));
+            let full =
+                ask(json!({"what": "node", "space": id, "node": n["id"], "value_bytes": 300000}));
             seen.push_str(&full.to_string());
         }
     }
@@ -88,7 +107,7 @@ fn inspection_is_granted_read_only_and_keeps_secrets() {
     // and nothing leads to its value.
     let nodes = ask(json!({"what": "nodes", "space": acc, "kind": 5}));
     let secret = &nodes["nodes"][0];
-    let n = ask(json!({"what": "node", "space": acc, "node": secret["id"], "limit": 300000}));
+    let n = ask(json!({"what": "node", "space": acc, "node": secret["id"], "value_bytes": 300000}));
     let v = n["values"]
         .as_array()
         .unwrap()
@@ -112,7 +131,7 @@ fn inspection_is_granted_read_only_and_keeps_secrets() {
         let r = raw(
             &d,
             json!({"cmd": "inspect-entry", "token": token, "space": acc,
-            "entry": made_in, "path": path, "limit": 300000}),
+            "entry": made_in, "path": path, "value_bytes": 300000}),
         );
         assert_eq!(r["ok"], false, "{path} gave {r}");
     }
@@ -164,7 +183,7 @@ fn a_presence_secret_in_a_reach_node_is_kept_secret() {
             continue;
         };
         let node = mine["reach_node"].clone();
-        let n = ask(json!({"what": "node", "space": id, "node": node, "limit": 300000}));
+        let n = ask(json!({"what": "node", "space": id, "node": node, "value_bytes": 300000}));
         if n["ok"] != true {
             continue;
         }
@@ -182,8 +201,9 @@ fn a_presence_secret_in_a_reach_node_is_kept_secret() {
         let opened = ask(json!({"what": "entries", "space": id}));
         let mut shown = String::new();
         for e in opened["entries"].as_array().unwrap() {
-            let full =
-                ask(json!({"what": "entry", "space": id, "entry": e["entry"], "limit": 300000}));
+            let full = ask(
+                json!({"what": "entry", "space": id, "entry": e["entry"], "value_bytes": 300000}),
+            );
             shown.push_str(&full.to_string());
         }
         assert!(shown.contains("\"t\":\"secret\""), "{shown}");

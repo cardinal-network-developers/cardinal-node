@@ -18,7 +18,9 @@ pub mod blocking;
 use cardinal_encoding::{Record, Value};
 use serde_json::{json, Map, Value as Json};
 
-pub use table::{Field, Rec, Request, Ty, EVENTS, FRAMES, REQUESTS};
+pub use table::{Field, Page, Rec, Request, Ty, EVENTS, FRAMES, REQUESTS};
+
+use crate::transport::MAX_MESSAGE;
 
 /// A reply's key 0, and the numbers of the errors (`apps.md`, Errors).
 pub mod status {
@@ -278,6 +280,159 @@ pub fn decode_request(msg: &[u8]) -> Result<(&'static Request, Json), Refused> {
     let mut o = record_from_wire(spec.args, &r, spec.name, 1).map_err(Refused::malformed)?;
     o.insert("cmd".into(), json!(spec.name));
     Ok((spec, Json::Object(o)))
+}
+
+/// What a handler may add to a paged reply when it gave only some of its
+/// lists' items, for [`page`]: the position of the first it gave (of an
+/// `after` page), and how many there are in all; or (of a `before` page)
+/// how many older than those it gave there are. Never sent.
+pub const PAGE_FROM: &str = "_page_from";
+pub const PAGE_TOTAL: &str = "_page_total";
+pub const PAGE_OLDER: &str = "_page_older";
+
+/// Room kept in a message beside a page's items: the status, `more`,
+/// `next`, and each list's key and length.
+const PAGE_ROOM: usize = 64;
+const LIST_ROOM: usize = 12;
+
+/// Cuts a paged reply (`apps.md`, Pages) to the page the request asks
+/// for: at most `limit` items, and as many as fit in a message with the
+/// reply's other fields, from the cursor on; with `more` and, when there
+/// is more, `next`. Lists not paged are left whole. An item too large for
+/// a message alone is an error, `TOO_LARGE`: nothing is cut silently.
+pub fn page(spec: &Request, req: &Json, mut reply: Json) -> Result<Json, (u64, String)> {
+    let Some(o) = reply.as_object_mut() else {
+        return Ok(reply);
+    };
+    let num = |o: &mut Map<String, Json>, k: &str| o.remove(k).and_then(|v| v.as_u64());
+    let from = num(o, PAGE_FROM).unwrap_or(0) as usize;
+    let total = num(o, PAGE_TOTAL).map(|t| t as usize);
+    let older = num(o, PAGE_OLDER).unwrap_or(0) as usize;
+    if spec.page == Page::Whole {
+        return Ok(reply);
+    }
+    let limit = req
+        .get("limit")
+        .and_then(Json::as_u64)
+        .filter(|n| *n > 0)
+        .map_or(usize::MAX, |n| n as usize);
+    let lists: Vec<&Field> = match spec.page {
+        Page::Before { list } => spec.reply.iter().filter(|f| f.name == list).collect(),
+        _ => spec
+            .reply
+            .iter()
+            .filter(|f| matches!(f.ty, Ty::List(_) | Ty::Recs(_)))
+            .collect(),
+    };
+    let mut lists: Vec<&Field> = lists;
+    lists.sort_by_key(|f| f.n);
+    // every item, by its list, in order
+    let mut items: Vec<(usize, Json)> = Vec::new();
+    let mut present = vec![false; lists.len()];
+    for (li, f) in lists.iter().enumerate() {
+        if let Some(v) = o.remove(f.name) {
+            if let Json::Array(a) = v {
+                present[li] = true;
+                items.extend(a.into_iter().map(|x| (li, x)));
+            } else if !v.is_null() {
+                o.insert(f.name.to_owned(), v);
+            }
+        }
+    }
+    let base = record_to_wire(spec.reply, o, spec.name)
+        .map(|r| r.encoded_len())
+        .unwrap_or(0);
+    let room = MAX_MESSAGE.saturating_sub(base + PAGE_ROOM + LIST_ROOM * lists.len());
+    let size = |li: usize, x: &Json| -> usize {
+        let ty = match &lists[li].ty {
+            Ty::List(t) => *t,
+            Ty::Recs(r) => {
+                return x
+                    .as_object()
+                    .and_then(|o| record_to_wire(r.fields, o, lists[li].name).ok())
+                    .map_or(0, |r| r.encoded_len())
+            }
+            _ => return 0,
+        };
+        to_wire(ty, x, lists[li].name).map_or(0, |v| v.encoded_len())
+    };
+    let too_large = |li: usize, at: usize, n: usize| {
+        (
+            status::TOO_LARGE,
+            format!(
+                "item {at} of {} is {n} bytes, more than a message may hold beside the rest \
+                 of the answer to {}",
+                lists[li].name, spec.name
+            ),
+        )
+    };
+    let mut used = 0usize;
+    let mut taken: Vec<(usize, Json)> = Vec::new();
+    let (more, next) = match spec.page {
+        Page::Whole => unreachable!("answered whole above"),
+        Page::After => {
+            let after = req.get("after").and_then(Json::as_u64).unwrap_or(0) as usize;
+            let start = after.max(from);
+            let all = total.unwrap_or(from + items.len()).max(from + items.len());
+            let mut at = start;
+            for (li, x) in items.into_iter().skip(start - from) {
+                if taken.len() >= limit {
+                    break;
+                }
+                let n = size(li, &x);
+                if used + n > room {
+                    if taken.is_empty() {
+                        return Err(too_large(li, at, n));
+                    }
+                    break;
+                }
+                used += n;
+                taken.push((li, x));
+                at += 1;
+            }
+            let more = at < all;
+            (more, more.then(|| json!(at)))
+        }
+        Page::Before { .. } => {
+            let mut left = items.len();
+            while let Some((li, x)) = items.pop() {
+                if taken.len() >= limit {
+                    items.push((li, x));
+                    break;
+                }
+                let n = size(li, &x);
+                if used + n > room {
+                    if taken.is_empty() {
+                        return Err(too_large(li, older + left - 1, n));
+                    }
+                    items.push((li, x));
+                    break;
+                }
+                used += n;
+                taken.push((li, x));
+                left -= 1;
+            }
+            taken.reverse();
+            let more = left > 0 || older > 0;
+            let next = taken.first().and_then(|(_, x)| x.get("id")).cloned();
+            (more, if more { next } else { None })
+        }
+    };
+    for (li, f) in lists.iter().enumerate() {
+        if present[li] {
+            o.insert(f.name.to_owned(), json!([]));
+        }
+    }
+    for (li, x) in taken {
+        if let Some(Json::Array(a)) = o.get_mut(lists[li].name) {
+            a.push(x);
+        }
+    }
+    o.insert("more".into(), json!(more));
+    if let Some(next) = next {
+        o.insert("next".into(), next);
+    }
+    Ok(reply)
 }
 
 /// A reply as a message. `Err` is a status other than OK and why.
