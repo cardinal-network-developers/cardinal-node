@@ -72,6 +72,12 @@ pub struct Validity {
     /// they, and everything that descends from them, are not valid here
     /// until it does. Nothing here knows any extension.
     pub stalled: HashSet<EntryId>,
+    /// Which of the owner's protocol records count did not settle
+    /// ([`model::settle_declarers`]): the space is frozen, and judged with
+    /// only the records found in every round counting. Not expected: an
+    /// entry's validity turns only on its own causal past, so the records
+    /// settle within [`rounds`] evaluations.
+    pub frozen: bool,
 }
 
 impl Validity {
@@ -478,6 +484,10 @@ pub struct Judge {
     /// Those of them whose records count for what descends from them: the
     /// valid ones ([`extension_mark`]).
     declarers: HashSet<EntryId>,
+    /// Those of them found valid when the declarers were last settled:
+    /// [`Self::declarers`] where they settled, and otherwise what the
+    /// frozen judgement found. Only a change from these judges again.
+    settled: HashSet<EntryId>,
     /// An entry here uses an extension.
     ext_used: bool,
     /// Judging everything again, as [`Judge::settle_declarers`] does.
@@ -508,6 +518,7 @@ impl Judge {
             validity: Validity::default(),
             proto: Vec::new(),
             declarers: HashSet::new(),
+            settled: HashSet::new(),
             ext_used: false,
             rebuilding: false,
         }
@@ -547,23 +558,30 @@ impl Judge {
         let changed = self.arrive_one(dag, id);
         // nothing descends from it yet: its records count from now on if it
         // is valid
-        if self.proto.last() == Some(id) && self.validity.valid.contains(id) {
+        if self.proto.last() == Some(id)
+            && self.validity.valid.contains(id)
+            && !self.validity.frozen
+        {
             self.declarers.insert(*id);
+            self.settled.insert(*id);
         }
         self.settle_declarers(dag, changed)
     }
 
     /// Where an entry of the owner's that holds a protocol record has come
-    /// to be valid, or stopped being so, since what descends from it was
-    /// judged, and an extension is used here: judges everything again with
-    /// the records of those valid now counting, until that holds of what
-    /// it finds. Rare: such an entry is the owner's own. Returns `changed`
-    /// with every entry whose validity that changed.
+    /// to be valid, or stopped being so, since the declarers were last
+    /// settled, and an extension is used here: judges everything again with
+    /// the records of those valid now counting, until that holds of what it
+    /// finds, and frozen where it does not ([`model::settle_declarers`]).
+    /// Where it settles there is one answer, whichever records it starts
+    /// from, so this finds what [`by_rules`] finds. Rare: such an entry is
+    /// the owner's own. Returns `changed` with every entry whose validity
+    /// that changed.
     fn settle_declarers(&mut self, dag: &Dag<SpaceEntry>, changed: Vec<EntryId>) -> Vec<EntryId> {
         if self.rebuilding {
             return changed;
         }
-        let valid_now = |j: &Judge| -> HashSet<EntryId> {
+        let valid_now = |j: &Judge| -> BTreeSet<EntryId> {
             let valid = &j.validity.valid;
             j.proto
                 .iter()
@@ -571,12 +589,13 @@ impl Judge {
                 .copied()
                 .collect()
         };
-        let mut now = valid_now(self);
-        if now == self.declarers {
+        let now = valid_now(self);
+        if now.len() == self.settled.len() && now.iter().all(|x| self.settled.contains(x)) {
             return changed;
         }
         if !self.ext_used {
-            self.declarers = now;
+            self.declarers = now.iter().copied().collect();
+            self.settled = self.declarers.clone();
             return changed;
         }
         let before = self.validity.valid.clone();
@@ -586,23 +605,23 @@ impl Judge {
             .filter(|x| self.info.contains_key(*x))
             .copied()
             .collect();
-        // a handful of rounds settles any history a person makes
-        for _ in 0..4 {
+        let states = self.states.clone();
+        let rebuild = |d: &BTreeSet<EntryId>| {
             let mut fresh = Judge::new();
-            fresh.states = self.states.clone();
-            fresh.declarers = now.clone();
+            fresh.states = states.clone();
+            fresh.declarers = d.iter().copied().collect();
             fresh.rebuilding = true;
             for x in &order {
                 fresh.arrive_one(dag, x);
             }
             fresh.rebuilding = false;
-            let found = valid_now(&fresh);
-            *self = fresh;
-            if found == now {
-                break;
-            }
-            now = found;
-        }
+            fresh
+        };
+        let rounds = rounds(self.proto.len());
+        let (mut fresh, frozen) = model::settle_declarers(now, rounds, rebuild, valid_now);
+        fresh.settled = valid_now(&fresh).into_iter().collect();
+        fresh.validity.frozen = frozen;
+        *self = fresh;
         let mut out = changed;
         for x in before.symmetric_difference(&self.validity.valid) {
             if !out.contains(x) {
@@ -1511,6 +1530,15 @@ impl Judge {
 
 // ------------------------------------------------------- the rules, run
 
+/// How many evaluations finding which of the owner's `records` protocol
+/// records count may take. Whether an entry is valid turns only on its own
+/// causal past, so each evaluation settles at least one more record, in
+/// the order they were written: they settle within one evaluation for each
+/// and one more to see it.
+pub fn rounds(records: usize) -> usize {
+    records + 2
+}
+
 /// What the normative `space` program finds.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ByRules {
@@ -1526,6 +1554,9 @@ pub struct ByRules {
     pub candidates: BTreeSet<SpaceId>,
     /// `successor`.
     pub successor: Option<SpaceId>,
+    /// Which of the owner's protocol records count never settles: the
+    /// space is frozen ([`model::settle_declarers`]).
+    pub frozen: bool,
 }
 
 /// Evaluates a space with the normative `space` program, given the identity
@@ -1549,22 +1580,30 @@ pub fn by_rules(dag: &Dag<SpaceEntry>, logs: &[&IdentityLog]) -> Result<ByRules,
         .filter(|(_, e)| !e.is_genesis() && Some(e.author()) == owner && !protocols(e).is_empty())
         .map(|(id, _)| *id)
         .collect();
-    let mut r = by_rules_with(dag, logs, None)?;
-    let mut declarers: Option<HashSet<EntryId>> = None;
-    for _ in 0..5 {
-        let found: HashSet<EntryId> = proto
-            .iter()
-            .filter(|x| r.valid.contains(*x))
-            .copied()
-            .collect();
-        if declarers.as_ref() == Some(&found) || (declarers.is_none() && found.len() == proto.len())
-        {
-            break;
-        }
-        r = by_rules_with(dag, logs, Some(&found))?;
-        declarers = Some(found);
+    let start: BTreeSet<EntryId> = proto.iter().copied().collect();
+    let mut failed = None;
+    let (r, frozen) = model::settle_declarers(
+        start,
+        rounds(proto.len()),
+        |d| match by_rules_with(dag, logs, Some(&d.iter().copied().collect())) {
+            Ok(r) => r,
+            Err(e) => {
+                failed = Some(e);
+                ByRules::default()
+            }
+        },
+        |r: &ByRules| {
+            proto
+                .iter()
+                .filter(|x| r.valid.contains(*x))
+                .copied()
+                .collect()
+        },
+    );
+    if let Some(e) = failed {
+        return Err(e);
     }
-    Ok(r)
+    Ok(ByRules { frozen, ..r })
 }
 
 fn by_rules_with(
@@ -1680,5 +1719,6 @@ fn by_rules_with(
         closed: unary("closed").collect(),
         candidates: unary("candidate").collect(),
         successor: unary("successor").next(),
+        frozen: false,
     })
 }

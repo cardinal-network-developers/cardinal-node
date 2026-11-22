@@ -740,6 +740,51 @@ fn confirm_facts(
     }
 }
 
+/// How many evaluations finding which protocol records count in an
+/// identity log may take before the history is taken as one that does not
+/// settle.
+pub const DECLARER_ROUNDS: usize = 8;
+
+/// Which protocol records count (`evolution.md#critical-and-ignorable`):
+/// whether a record's entry is valid turns on the records before it, so
+/// evaluation runs again with the records found to count until that holds
+/// of what is found. `start` is every record that could count; `eval`
+/// evaluates with those given as counting, and `found` reads which of
+/// `start` count in a result. A history whose found records repeat a set
+/// already seen, or have not settled after `rounds` evaluations, has no
+/// answer that rules can give: it is evaluated once more with only the
+/// records found in every round counting, and the second value is true, so
+/// that the caller freezes what it judges rather than take one round's
+/// answer. Every evaluation of identities and spaces goes through here, so
+/// each finds the same.
+pub fn settle_declarers<T: Ord + Clone, R>(
+    start: BTreeSet<T>,
+    rounds: usize,
+    mut eval: impl FnMut(&BTreeSet<T>) -> R,
+    found: impl Fn(&R) -> BTreeSet<T>,
+) -> (R, bool) {
+    let mut seen = vec![start.clone()];
+    let mut now = start;
+    let mut r = eval(&now);
+    loop {
+        let f = found(&r);
+        if f == now {
+            return (r, false);
+        }
+        let repeats = seen.contains(&f);
+        seen.push(f.clone());
+        if repeats || seen.len() > rounds {
+            let every = seen
+                .iter()
+                .skip(1)
+                .fold(seen[0].clone(), |a, b| a.intersection(b).cloned().collect());
+            return (eval(&every), true);
+        }
+        now = f;
+        r = eval(&now);
+    }
+}
+
 /// The relations an identity evaluation reports.
 pub const IDENTITY_RESULTS: [&str; 17] = [
     "valid",
@@ -836,10 +881,20 @@ pub fn evaluate_identity(
     let mut f = identity_facts(world, ident, &ids);
     confirm_facts(world, ident, &ids, known, &mut f);
     world.active.borrow_mut().pop();
-    let mut rel = evaluate(identity_program(), &f, &world.symbols);
-    // Only records in valid entries signed by admin and root keys declare:
-    // evaluated again with those found so, until that holds of what is
-    // found (`world.py`).
+    // Only records in valid entries signed by admin and root keys declare,
+    // and a record whose key the log never makes an admin or root never
+    // does: evaluated again with those found so, until that holds of what
+    // is found (`world.py`, [`settle_declarers`]).
+    let mighty: HashSet<Sym> = ids
+        .iter()
+        .filter(|x| world.entries[x].log == ident)
+        .flat_map(|x| world.entries[x].ops.iter())
+        .filter_map(|op| match op {
+            Op::Add { key, power } if *power >= 2 => Some(*key),
+            Op::Recover { root, .. } => Some(*root),
+            _ => None,
+        })
+        .collect();
     let protos: BTreeSet<Sym> = ids
         .iter()
         .copied()
@@ -850,9 +905,20 @@ pub fn evaluate_identity(
                 .iter()
                 .any(|op| matches!(op, Op::Protocol { .. }))
         })
+        .filter(|x| mighty.contains(&world.entries[x].signer))
         .collect();
-    let mut declarers: Option<BTreeSet<Sym>> = None;
-    for _ in 0..5 {
+    let all_count = protos.len()
+        == ids
+            .iter()
+            .filter(|x| world.entries[x].log == ident)
+            .filter(|x| {
+                world.entries[x]
+                    .ops
+                    .iter()
+                    .any(|op| matches!(op, Op::Protocol { .. }))
+            })
+            .count();
+    let found = |rel: &crate::datalog::Relations| -> BTreeSet<Sym> {
         let valid = rel.set("valid");
         let power: HashMap<Sym, i64> = rel
             .set("kpow")
@@ -862,24 +928,30 @@ pub fn evaluate_identity(
                 _ => None,
             })
             .collect();
-        let found: BTreeSet<Sym> = protos
+        protos
             .iter()
             .copied()
             .filter(|x| valid.contains(&[Val::Sym(*x)][..]))
             .filter(|x| power.get(&world.entries[x].signer).is_some_and(|p| *p >= 2))
-            .collect();
-        if found == *declarers.as_ref().unwrap_or(&protos) {
-            break;
-        }
-        let mut g = identity_facts_with(world, ident, &ids, Some(&found));
-        confirm_facts(world, ident, &ids, known, &mut g);
-        rel = evaluate(identity_program(), &g, &world.symbols);
-        declarers = Some(found);
-    }
+            .collect()
+    };
+    let (rel, unsettled) = settle_declarers(
+        protos.clone(),
+        DECLARER_ROUNDS,
+        |d| {
+            if all_count && *d == protos {
+                return evaluate(identity_program(), &f, &world.symbols);
+            }
+            let mut g = identity_facts_with(world, ident, &ids, Some(d));
+            confirm_facts(world, ident, &ids, known, &mut g);
+            evaluate(identity_program(), &g, &world.symbols)
+        },
+        found,
+    );
     let mut r = IdentityResult {
         rels: IDENTITY_RESULTS.iter().map(|&k| (k, rel.set(k))).collect(),
-        frozen: rel.any("frozen"),
-        contested: rel.any("contested"),
+        frozen: unsettled || rel.any("frozen"),
+        contested: unsettled || rel.any("contested"),
         stalled: BTreeSet::new(),
     };
     // A valid entry using a critical extension this verifier does not know

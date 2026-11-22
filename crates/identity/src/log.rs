@@ -1082,6 +1082,9 @@ impl<'a> Gathered<'a> {
 struct Conversion<'a> {
     world: World,
     logs: HashMap<EntryId, &'a IdentityLog>,
+    /// Which protocol records count did not settle: every log here is
+    /// frozen ([`model::settle_declarers`]).
+    unsettled: bool,
 }
 
 impl<'a> Conversion<'a> {
@@ -1089,46 +1092,52 @@ impl<'a> Conversion<'a> {
     /// those in valid entries signed by admin and root keys
     /// (`evolution.md#critical-and-ignorable`): whether an entry is valid
     /// turns on the records before it, so the logs are converted again with
-    /// the records found to count until that holds of what is found. Most
-    /// logs use no extension, and are converted once.
+    /// the records found to count until that holds of what is found
+    /// ([`model::settle_declarers`]). Only a record after a genesis, by a
+    /// key its log makes an admin or root, can come not to count, and only
+    /// an extension op cares: logs without both are converted once. A
+    /// history that does not settle is frozen.
     fn new(logs: &[&'a IdentityLog]) -> Conversion<'a> {
-        let uses = logs.iter().flat_map(|l| l.entries()).any(|e| {
-            e.ops()
-                .iter()
-                .any(|o| matches!(o.body(), OpBody::Extension { .. }))
-        });
-        let mut conv = Conversion::with(logs, None);
-        if !uses {
-            return conv;
-        }
         let records: Vec<(&IdentityLog, &IdentityEntry)> = logs
             .iter()
             .flat_map(|l| l.entries().map(move |e| (*l, e)))
-            .filter(|(_, e)| {
-                e.protocol().is_some()
+            .filter(|(l, e)| {
+                (e.protocol().is_some()
                     || e.ops()
                         .iter()
-                        .any(|o| matches!(o.body(), OpBody::SetProtocol { .. }))
+                        .any(|o| matches!(o.body(), OpBody::SetProtocol { .. })))
+                    && admin_or_root(l, &e.signer())
             })
             .collect();
-        let mut declarers: Option<HashSet<EntryId>> = None;
-        // a handful of rounds settles any history a person makes
-        for _ in 0..5 {
-            let mut found = HashSet::new();
-            let mut states: HashMap<EntryId, IdentityState> = HashMap::new();
-            for (l, e) in &records {
-                let st = states.entry(l.id).or_insert_with(|| conv.state(l));
-                if st.valid.contains(&e.id()) && admin_or_root(l, &e.signer()) {
-                    found.insert(e.id());
-                }
-            }
-            let all = found.len() == records.len();
-            if declarers.as_ref() == Some(&found) || (declarers.is_none() && all) {
-                break;
-            }
-            conv = Conversion::with(logs, Some(&found));
-            declarers = Some(found);
+        let start: BTreeSet<EntryId> = records.iter().map(|(_, e)| e.id()).collect();
+        let later = records.iter().any(|(_, e)| !e.is_genesis());
+        let uses = later
+            && logs.iter().flat_map(|l| l.entries()).any(|e| {
+                e.ops()
+                    .iter()
+                    .any(|o| matches!(o.body(), OpBody::Extension { .. }))
+            });
+        if !uses {
+            let d: HashSet<EntryId> = start.into_iter().collect();
+            return Conversion::with(logs, Some(&d));
         }
+        let (mut conv, unsettled) = model::settle_declarers(
+            start,
+            model::DECLARER_ROUNDS,
+            |d| Conversion::with(logs, Some(&d.iter().copied().collect())),
+            |conv| {
+                let mut states: HashMap<EntryId, IdentityState> = HashMap::new();
+                let mut found = BTreeSet::new();
+                for (l, e) in &records {
+                    let st = states.entry(l.id).or_insert_with(|| conv.state(l));
+                    if st.valid.contains(&e.id()) {
+                        found.insert(e.id());
+                    }
+                }
+                found
+            },
+        );
+        conv.unsettled = unsettled;
         conv
     }
 
@@ -1266,6 +1275,7 @@ impl<'a> Conversion<'a> {
         Conversion {
             world,
             logs: logs.iter().map(|l| (l.id, *l)).collect(),
+            unsettled: false,
         }
     }
 
@@ -1383,8 +1393,8 @@ impl<'a> Conversion<'a> {
         let _ = &self.logs;
         IdentityState {
             identity: log.id,
-            frozen: r.frozen,
-            contested: r.contested,
+            frozen: r.frozen || self.unsettled,
+            contested: r.contested || self.unsettled,
             valid,
             stalled: r.stalled.iter().map(|s| self.id_of(*s)).collect(),
             keys,
@@ -2005,6 +2015,68 @@ mod tests {
             .unwrap();
         let used = log.append(&device.signing, vec![ext(c)]).unwrap();
         assert!(log.state().is_valid(&used.id()));
+    }
+
+    /// Records whose counting turns on itself without settling: P, by
+    /// admin A, declares X; Q, by admin B, declares Y. The root's E1 uses X
+    /// and removes B beside Q; its E2 uses Y and removes A beside P. With
+    /// both records counting, both removals stand and neither record is
+    /// valid; with neither, nothing uses X or Y validly and both are. No
+    /// round's answer is taken: the identity is frozen, and an ordinary
+    /// history beside it is not.
+    #[test]
+    fn records_that_never_settle_freeze_the_identity() {
+        use cardinal_encoding::Record;
+        let d1 = DeviceKeys::generate();
+        let Created { mut log, .. } =
+            IdentityLog::create_with(phrase(10), &d1, HybridKeyPair::generate()).unwrap();
+        let root = phrase(10).root_signing_key();
+        let (a, b) = (DeviceKeys::generate(), DeviceKeys::generate());
+        log.add_key(&d1.signing, &a.request(&log.id(), Power::Admin), None)
+            .unwrap();
+        let base = log
+            .add_key(&d1.signing, &b.request(&log.id(), Power::Admin), None)
+            .unwrap();
+        assert!(!log.state().frozen);
+        let (x, y) = ([0x41u8; 32], [0x42u8; 32]);
+        let ext =
+            |name: [u8; 32]| IdentityOp::from_record(Record::new().with(0, name).with(1, 7u64));
+        let declare = |name: [u8; 32]| {
+            IdentityOp::set_protocol(&Protocol {
+                base: [0; 32],
+                extensions: vec![(name, false)],
+            })
+        };
+        let g = log.id();
+        let entry = |parents: &[EntryId], ops: Vec<IdentityOp>, key: &SigningKey| {
+            let mut e = EntryBuilder::new(g, parents);
+            for op in ops {
+                e = e.op(op);
+            }
+            e.sign(key).unwrap()
+        };
+        let p = entry(&[base.id()], vec![declare(x)], &a.signing);
+        let q = entry(&[base.id()], vec![declare(y)], &b.signing);
+        let e1 = entry(
+            &[p.id()],
+            vec![ext(x), IdentityOp::remove_key(b.key())],
+            &root,
+        );
+        let e2 = entry(
+            &[q.id()],
+            vec![ext(y), IdentityOp::remove_key(a.key())],
+            &root,
+        );
+        for e in [p, q, e1.clone()] {
+            log.insert(e).unwrap();
+        }
+        // one side alone settles
+        let st = log.state();
+        assert!(!st.frozen && st.is_valid(&e1.id()));
+        log.insert(e2).unwrap();
+        let st = log.state();
+        assert!(st.frozen && st.contested);
+        assert_eq!(*st, log.evaluate(&[]), "the same each time");
     }
 
     #[test]

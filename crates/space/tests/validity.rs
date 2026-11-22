@@ -466,6 +466,7 @@ fn compare(judge: &Judge, dag: &Dag<SpaceEntry>, logs: &[&IdentityLog], what: &s
         "candidates, {what}"
     );
     assert_eq!(judge.successor(dag), rules.successor, "successor, {what}");
+    assert_eq!(found.frozen, rules.frozen, "frozen, {what}");
     // what waits for a witness is what its key signed in good time and
     // does not count
     assert!(found.unwitnessed.is_disjoint(&found.author_ok), "{what}");
@@ -1762,6 +1763,50 @@ fn only_the_owner_s_valid_entries_declare() {
     // kept, the phone's entry counts again, and so does what it declared
     s.write("k", ANA, A, keep(&s, ANA, P, &["by_phone"]), None);
     assert_eq!(s.valid(&["by_phone", "early"]), [true, true]);
+}
+
+/// The review of 2026-11-23: records that settle only after many rounds.
+/// Each of the owner's entries uses the extension the one before declared
+/// and declares the next, so each counts only once the one before does.
+/// Nothing about it is unsettled, however long the chain: an entry's
+/// validity turns only on its own past. Kept late, the first brings back
+/// the whole chain, judged again as the rules judge it, and not frozen.
+#[test]
+fn a_long_chain_of_records_settles_and_is_not_frozen() {
+    let ext = |name: [u8; 32]| SpaceOp::from_record(Record::new().with(0, name).with(1, 7u64));
+    let declare = |name: [u8; 32]| {
+        let p = cardinal_identity::Protocol {
+            base: [0; 32],
+            extensions: vec![(name, false)],
+        };
+        SpaceOp::from_record(Record::new().with(0, 9u32).with(1, p.to_record()))
+    };
+    let name = |i: u8| [0x60 + i; 32];
+    let mut s = Scene::new(ANA, A, &[(ANA, OWNER), (CY, READER)], None);
+    // the phone's first record; the phone is removed before anything of
+    // Ana's builds on it
+    s.write("first", ANA, P, vec![declare(name(0))], None);
+    s.remove_phone(ANA);
+    let mut chain = Vec::new();
+    for i in 1..12u8 {
+        let n: &'static str = Box::leak(format!("p{i}").into_boxed_str());
+        s.write(n, ANA, A, vec![ext(name(i - 1)), declare(name(i))], None);
+        chain.push(n);
+    }
+    s.write("use", CY, P, vec![ext(name(11))], None);
+    let logs: Vec<&IdentityLog> = s.people.iter().map(|p| &p.log).collect();
+    compare(&s.judge, &s.dag, &logs, "a chain that counts for nothing");
+    assert!(chain
+        .iter()
+        .all(|n| !s.judge.validity().is_valid(&s.named[n])));
+    assert!(!s.judge.validity().frozen);
+    // kept, the first counts, and with it the chain
+    s.write("k", ANA, A, keep(&s, ANA, P, &["first"]), None);
+    let logs: Vec<&IdentityLog> = s.people.iter().map(|p| &p.log).collect();
+    compare(&s.judge, &s.dag, &logs, "a chain kept");
+    let v = s.judge.validity();
+    assert!(chain.iter().all(|n| v.is_valid(&s.named[n])) && !v.frozen);
+    assert!(v.is_valid(&s.named["use"]));
 }
 
 /// The review of 2026-11-22: a `keep` a key writes for itself keeps
