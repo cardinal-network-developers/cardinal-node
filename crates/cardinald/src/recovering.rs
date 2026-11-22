@@ -1135,6 +1135,10 @@ pub async fn undo_kept(d: &Arc<Daemon>, to: &str) -> anyhow::Result<Json> {
     let to = kept_change(d, &r, to)?;
     let undo = d.core().undo_of(&to)?;
     let done = crate::following::succeed(d, &to, |sp| crate::core::undo_named(sp, &undo)).await?;
+    // Whoever it left out holds nothing that leads to the new group: it is
+    // offered to them, as an addition is.
+    let back: Vec<[u8; 32]> = undo.out.iter().map(|(w, _)| *w).collect();
+    crate::groups::offer_to(d, &done.new, &back)?;
     update_recovered(d, |r| {
         r.undone.insert(hex::encode(to), hex::encode(done.new));
     });

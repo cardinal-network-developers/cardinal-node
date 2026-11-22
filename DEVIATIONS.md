@@ -839,7 +839,12 @@ differs or was read:
   it left out with the role they had and giving back each role it changed,
   to whoever still has the one it gave. A group handed on is refused: its
   new owner holds it. Nothing is asked or held back (`core.rs`,
-  `a_change_kept_after_a_recovery_is_listed_and_can_be_undone`).
+  `a_change_kept_after_a_recovery_is_listed_and_can_be_undone`). Whoever
+  undo adds back is offered the group, as an addition is: nothing they
+  hold leads to it. A successor the person started with a removed key
+  counts for nobody on the new device until it writes the keep again, so
+  it is synced with those its genesis names, who hold that keep
+  (`guardians.rs`, `a_move_confirmed_before_the_loss_stands_after_a_recovery`).
   A contact gives a recovered device a successor by the narrow path only
   where an entry there of the person's, by a removed key, keeps its
   genesis. **What a contact gives a recovered

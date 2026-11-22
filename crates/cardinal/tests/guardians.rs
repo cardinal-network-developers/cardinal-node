@@ -1172,3 +1172,186 @@ fn a_recovery_undoes_the_lost_devices_successions() {
         );
     }
 }
+
+/// D83/D84, end to end: Ana's laptop takes Cy out of a group (a
+/// succession), and her phone, shown the move, confirms it, before both
+/// are lost. After a recovery by guardians the move stands: the new device
+/// holds the successor and lists it in `kept_changes`, Bo stays in it, and
+/// Cy stays out, until `recover-undo` moves the group on again with Cy
+/// back.
+#[test]
+fn a_move_confirmed_before_the_loss_stands_after_a_recovery() {
+    two_devices_move_then_recovery(true);
+}
+
+/// The same with the phone never confirming the move: it falls for
+/// everyone, Cy back in the old group, and nothing is listed to undo.
+#[test]
+fn a_move_not_confirmed_before_the_loss_falls_after_a_recovery() {
+    two_devices_move_then_recovery(false);
+}
+
+fn two_devices_move_then_recovery(confirmed: bool) {
+    use serde_json::json;
+    if !fuse_available() {
+        eprintln!("skipping: /dev/fuse or fusermount3 is not available");
+        return;
+    }
+    let root = tempfile::tempdir().unwrap();
+    let mut laptop = Dev::new(root.path(), "laptop", free_port());
+    laptop.start();
+    let words = words_from(&laptop.cli(&["init", "--yes", "--name", "ana"]));
+    laptop.wait_mounted();
+    let mut phone = Dev::new(root.path(), "phone", free_port());
+    phone.start();
+    pair(&laptop, &phone);
+    phone.wait_mounted();
+    let bo = person(root.path(), "bo");
+    let mut cy = person(root.path(), "cy");
+    meet(&laptop, &bo, "Ana");
+    meet(&laptop, &cy, "Ana");
+    meet(&bo, &cy, "Bo");
+    let made = ask(
+        &laptop,
+        json!({"cmd": "group-create", "name": "Garden club", "people": ["bo", "cy"]}),
+    );
+    let g = made["group"].as_str().unwrap().to_owned();
+    for d in [&bo, &cy] {
+        wait("the offer arrives", 30, || {
+            let r = ask(d, json!({"cmd": "groups"}));
+            r["offers"]
+                .as_array()
+                .is_some_and(|o| o.iter().any(|x| x["name"] == "Garden club"))
+        });
+        ask(d, json!({"cmd": "group-join", "group": g}));
+    }
+    let entry = |d: &Dev, g: &str| -> Option<serde_json::Value> {
+        let r = ask(d, json!({"cmd": "groups"}));
+        r["groups"]
+            .as_array()
+            .and_then(|all| all.iter().find(|x| x["group"] == g).cloned())
+    };
+    let stands = |d: &Dev, g: &str| -> bool { entry(d, g).is_some_and(|x| x["ended"].is_null()) };
+    wait("cy is in the group", 60, || stands(&cy, &g));
+    wait("the phone holds the group", 60, || stands(&phone, &g));
+    let removed = ask(
+        &laptop,
+        json!({"cmd": "group-remove", "group": g, "who": "cy"}),
+    );
+    let g2 = removed["group"].as_str().unwrap().to_owned();
+    // the phone is shown the move, and Ana says OK to it there
+    wait("the phone is asked to confirm the move", 60, || {
+        entry(&phone, &g2).is_some_and(|x| {
+            x["to_confirm"]
+                .as_array()
+                .is_some_and(|c| c.iter().any(|m| m["group"] == g && m["to"] == g2))
+        })
+    });
+    if confirmed {
+        let o = ask(
+            &phone,
+            json!({"cmd": "group-confirm-move", "group": g2, "moves": [g], "to": [g2]}),
+        );
+        assert_eq!(o["kept"], 2, "{o}");
+    }
+    wait("bo follows", 60, || stands(&bo, &g2));
+    wait("cy sees it end", 60, || !stands(&cy, &g));
+    // Bo guards her, and holds her account.
+    accept_guarding(&[&bo]);
+    let o = name_accepted(&laptop, &words, &["bo", "--delay", "4s"]);
+    assert!(o.status.success(), "{}", out(&o));
+    wait("the guardian knows", 30, || {
+        bo.cli(&["guarding"]).contains("Ana: one of 1 guardians")
+    });
+    hold_account(&laptop, &[&bo]);
+    // what the phone kept has reached bo before the loss
+    std::thread::sleep(Duration::from_secs(3));
+    laptop.stop();
+    phone.stop();
+    drop(laptop);
+    drop(phone);
+    let lost_at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis()
+        .to_string();
+
+    let new = new_device(root.path(), "new");
+    let fp = fingerprint_from(&new.cli(&["recover", "start", &recovery_invitation(&bo, "Ana")]));
+    wait("bo sees the recovery", 30, || {
+        bo.cli(&["guarding"]).contains(&fp)
+    });
+    endorse_and_confirm(&[&bo], &fp);
+    wait("the account is given back", 60, || {
+        new.cli(&["recover"]).contains("your account among it")
+    });
+    let o = new.try_cli(&["recover", "finish", "--lost-at", &lost_at]);
+    assert!(o.status.success(), "{}", out(&o));
+    let (bo_at, cy_at) = (
+        format!("127.0.0.1:{}", bo.port),
+        format!("127.0.0.1:{}", cy.port),
+    );
+    let new_at = format!("127.0.0.1:{}", new.port);
+    if !confirmed {
+        // Nothing kept the move: it falls, and the old group stands for
+        // the person, bo and cy, and nothing is listed to undo.
+        wait("the old group stands for the person and bo", 120, || {
+            let _ = new.try_cli(&["contacts", "bo", "--look", "--at", &bo_at]);
+            let _ = bo.try_cli(&["contacts", "Ana", "--look", "--at", &new_at]);
+            stands(&new, &g) && stands(&bo, &g)
+        });
+        cy.stop();
+        cy.start();
+        cy.wait_mounted();
+        wait("the old group stands for cy too", 120, || {
+            let _ = cy.try_cli(&["contacts", "Bo", "--look", "--at", &bo_at]);
+            let _ = new.try_cli(&["contacts", "cy", "--look", "--at", &cy_at]);
+            stands(&cy, &g)
+        });
+        let r = ask(&new, json!({"cmd": "recover"}));
+        assert_eq!(r["kept_changes"], json!([]), "{r}");
+        for d in [&new, &bo, &cy] {
+            assert!(entry(d, &g2).is_none(), "{}: g2 is listed", d.name);
+        }
+        return;
+    }
+    // The move stands: the successor, for the new device and for bo.
+    wait("the successor stands for the person and bo", 120, || {
+        let _ = new.try_cli(&["contacts", "bo", "--look", "--at", &bo_at]);
+        let _ = bo.try_cli(&["contacts", "Ana", "--look", "--at", &new_at]);
+        stands(&new, &g2) && stands(&bo, &g2)
+    });
+    // and it is listed, to undo
+    let kept = ask(&new, json!({"cmd": "recover"}))["kept_changes"].clone();
+    let listed = kept.as_array().cloned().unwrap_or_default();
+    assert_eq!(listed.len(), 1, "{kept}");
+    assert_eq!(listed[0]["group"], g.as_str(), "{kept}");
+    assert_eq!(listed[0]["to"], g2.as_str(), "{kept}");
+    assert_eq!(listed[0]["can_undo"], true, "{kept}");
+    // Cy stays out, once he has heard of the recovery too.
+    cy.stop();
+    cy.start();
+    cy.wait_mounted();
+    for _ in 0..3 {
+        let _ = cy.try_cli(&["contacts", "Bo", "--look", "--at", &bo_at]);
+        let _ = new.try_cli(&["contacts", "cy", "--look", "--at", &cy_at]);
+        std::thread::sleep(Duration::from_secs(2));
+    }
+    assert!(!stands(&cy, &g), "cy is not in the old group again");
+    assert!(stands(&new, &g2) && stands(&bo, &g2));
+    // Undo: the group moves on again, with cy back.
+    let o = ask(&new, json!({"cmd": "recover-undo", "to": g2}));
+    let g3 = o["group"].as_str().unwrap().to_owned();
+    assert_eq!(o["kept_changes"][0]["undone"], g3.as_str(), "{o}");
+    wait("the group is offered to cy again", 120, || {
+        let _ = cy.try_cli(&["contacts", "Bo", "--look", "--at", &bo_at]);
+        let _ = new.try_cli(&["contacts", "cy", "--look", "--at", &cy_at]);
+        let r = ask(&cy, json!({"cmd": "groups"}));
+        r["offers"]
+            .as_array()
+            .is_some_and(|o| o.iter().any(|x| x["group"] == g3.as_str()))
+    });
+    ask(&cy, json!({"cmd": "group-join", "group": g3}));
+    wait("cy is in it", 60, || stands(&cy, &g3));
+    wait("bo follows the undo", 60, || stands(&bo, &g3));
+}

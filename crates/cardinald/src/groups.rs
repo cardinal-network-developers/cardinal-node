@@ -178,6 +178,24 @@ fn offer(d: &Arc<Daemon>, id: &SpaceId, name: &str, to: &[ContactRecord]) -> any
     Ok(())
 }
 
+/// Offers the group `id` to each of `who` who is a contact of this
+/// person's (and not refused): those a succession named back in it, who
+/// hold nothing that leads to it.
+pub(crate) fn offer_to(d: &Arc<Daemon>, id: &SpaceId, who: &[[u8; 32]]) -> anyhow::Result<()> {
+    let (name, to) = {
+        let core = d.core();
+        let sp = core.spaces.get(id).and_then(|h| h.space.as_ref());
+        let name = sp.map(group::name).unwrap_or_default();
+        let to: Vec<ContactRecord> = core
+            .contacts()
+            .into_iter()
+            .filter(|c| who.contains(&c.identity) && !c.refused && c.recovery_of.is_none())
+            .collect();
+        (name, to)
+    };
+    offer(d, id, &name, &to)
+}
+
 /// Makes a group of this person and `who`, and offers it to each of them.
 pub fn create(d: &Arc<Daemon>, name: &str, who: &[String]) -> anyhow::Result<Json> {
     let name = name.trim();
@@ -1397,11 +1415,16 @@ pub(crate) fn member_sessions(d: &Daemon, space: &SpaceId) -> Vec<cardinal_link:
         let core = d.core();
         let me = core.identity.as_ref().map(|i| i.id());
         let sp = core.spaces.get(space).and_then(|h| h.space.as_ref());
-        sp.map(|sp| {
-            let present = sp.present().into_iter();
-            present.filter(|m| Some(*m) != me).collect()
-        })
-        .unwrap_or_default()
+        let mut members: Vec<[u8; 32]> = sp
+            .map(|sp| {
+                let present = sp.present().into_iter();
+                present.filter(|m| Some(*m) != me).collect()
+            })
+            .unwrap_or_default();
+        // what the person started before a recovery, which nobody is in
+        // here until it stands again
+        members.extend(core.own_fallen_with(space));
+        members
     };
     if members.is_empty() {
         return Vec::new();

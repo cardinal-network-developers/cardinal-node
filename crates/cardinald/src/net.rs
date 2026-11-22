@@ -137,6 +137,7 @@ impl Daemon {
                 } else if Some(*label) == core.identity_label()
                     || core.shares(&identity, label)
                     || core.recovered_owns(&identity, &device, label)
+                    || core.own_fallen_with(label).contains(&identity)
                 {
                     Access::Full
                 } else if core.held_given(&identity).contains(label) {

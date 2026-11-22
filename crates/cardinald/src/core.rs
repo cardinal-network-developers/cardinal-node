@@ -2395,6 +2395,38 @@ impl Core {
             && st.removed().any(|k| *k == g.signer())
     }
 
+    /// The other side of [`Core::started_before_recovery`], on this
+    /// person's recovered device: where `label` is a space held here that
+    /// they started with a key their recovery removed, whose genesis falls
+    /// here until a keep of theirs lists it, those its genesis names, but
+    /// this person. Nothing of it counts here yet, so nobody is in it; the
+    /// keep another of their old devices wrote before the loss (a move
+    /// they confirmed, D83) is with them, and this device must fetch it to
+    /// write it again ([`Core::keep_earlier_keeps`]). Empty once it stands.
+    pub fn own_fallen_with(&self, label: &SpaceId) -> Vec<[u8; 32]> {
+        let Some(ident) = self.identity.as_ref() else {
+            return Vec::new();
+        };
+        let Some(sp) = self.spaces.get(label).and_then(|h| h.space.as_ref()) else {
+            return Vec::new();
+        };
+        let Some(g) = sp.dag().get(label) else {
+            return Vec::new();
+        };
+        let me = ident.id();
+        if g.author() != me
+            || !ident.state().is_removed(&g.signer())
+            || !sp.validity().unwitnessed.contains(label)
+        {
+            return Vec::new();
+        }
+        cardinal_space::succession::genesis_members(sp)
+            .into_iter()
+            .map(|(w, _)| w)
+            .filter(|w| *w != me)
+            .collect()
+    }
+
     /// After this person's recovery, what to ask `identity` for that is
     /// not open here: their relationship, as the account records it, and
     /// the spaces this person offered them in it, by its own offers. Each
@@ -2452,6 +2484,15 @@ impl Core {
         }
         v.push(identity_log_label(identity));
         v.extend(self.spaces.keys().filter(|l| self.shares(identity, l)));
+        // after this person's recovery, what they started that falls here
+        // and names `identity`, for the keep of it they may hold
+        let fallen: Vec<[u8; 32]> = self
+            .spaces
+            .keys()
+            .filter(|l| !v.contains(l) && self.own_fallen_with(l).contains(identity))
+            .copied()
+            .collect();
+        v.extend(fallen);
         // An offered space not open here yet, to fetch from them.
         for o in self.offers_from(identity) {
             if !v.contains(&o.space) && self.offered_here(identity, &o.space) {
