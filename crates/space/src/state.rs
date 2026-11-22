@@ -1138,8 +1138,12 @@ impl State {
                             conflict: false,
                         },
                     };
+                    // each flag remembers the delete that set it: one
+                    // already set stays as it was, so a restore of this
+                    // node does not bring back what was deleted on its own
+                    // before (`state.md#deletion-yields-to-concurrent-work`)
                     for m in eff.delete {
-                        if let Some(n) = self.nodes.get_mut(&m) {
+                        if let Some(n) = self.nodes.get_mut(&m).filter(|n| !n.deleted) {
                             n.deleted = true;
                             n.delete_conflict = false;
                             n.deleted_by = Some((id, i));
@@ -1152,6 +1156,7 @@ impl State {
                     }
                 }
                 SpaceOpBody::Restore { node } => {
+                    // the node's flag, and those its delete set beneath it
                     let by = self.nodes.get(node).and_then(|n| n.deleted_by);
                     for m in self.subtree(node) {
                         if let Some(n) = self.nodes.get_mut(&m) {

@@ -879,6 +879,91 @@ fn the_canonical_state_says_in_what_order_and_when_nodes_were_made() {
     assert_eq!(records.len(), 3);
 }
 
+/// `state.md#deletion-yields-to-concurrent-work`: each deleted flag
+/// remembers the delete that set it. A restore of a folder brings back what
+/// deleting the folder took, and not a file deleted on its own before, as a
+/// trash does; and a restore names what it restores, so a delete
+/// concurrent with it yields.
+#[test]
+fn a_restore_brings_back_what_its_delete_took_and_nothing_else() {
+    let p = person(23, 1);
+    let (d0, d1) = (&p.devices[0], &p.devices[1]);
+    let (mut a, genesis) = Space::create(
+        Profile::FILES,
+        Policy::default(),
+        &p.log,
+        &d0.signing,
+        &[p.enc.public_key()],
+        None,
+    )
+    .unwrap();
+    let enc1 = p.log.open_encryption_key(d1).unwrap();
+    let genesis = SealedEntry::decode(&genesis.encode()).unwrap();
+    let mut b = Space::open_genesis(&genesis, &[&enc1], Some(p.log.state())).unwrap();
+    let write = |s: &mut Space, d: &DeviceKeys, ops: Vec<SpaceOp>| {
+        s.write_entry(&p.log, &d.signing, ops, None).unwrap().0
+    };
+    let made = write(&mut a, d0, vec![files::create_folder(ROOT, "Trip")]);
+    let trip = files::created_node(&made, 0);
+    let made = write(
+        &mut a,
+        d0,
+        ["a", "b", "c"]
+            .iter()
+            .map(|n| files::create_file(trip, n, &file(n.as_bytes()), 0o644, None))
+            .collect(),
+    );
+    let [fa, fb, fc] = [0, 1, 2].map(|i| files::created_node(&made, i));
+    let deleted = |s: &Space, n: &cardinal_space::NodeId| s.state().node(n).unwrap().deleted;
+    // worked out from nothing, by the sharing and by the definition, the same
+    let every_way = |s: &Space| {
+        let valid = &s.validity().valid;
+        let full = cardinal_space::State::compute(Profile::FILES, s.dag(), valid);
+        assert_eq!(full.canonical(), s.state().canonical());
+        let plain = cardinal_space::State::compute_by_definition(Profile::FILES, s.dag(), valid);
+        assert_eq!(plain.canonical(), s.state().canonical());
+    };
+
+    write(&mut a, d0, vec![SpaceOp::delete(fc)]);
+    write(&mut a, d0, vec![SpaceOp::delete(trip)]);
+    assert!([trip, fa, fb, fc].iter().all(|n| deleted(&a, n)));
+    write(&mut a, d0, vec![SpaceOp::restore(trip)]);
+    assert!(!deleted(&a, &trip) && !deleted(&a, &fa) && !deleted(&a, &fb));
+    assert!(
+        deleted(&a, &fc),
+        "deleted on its own before, it stays deleted"
+    );
+    let names: Vec<String> = Files::new(&a)
+        .list_path("Trip")
+        .unwrap()
+        .into_iter()
+        .map(|e| e.name)
+        .collect();
+    assert_eq!(names, ["a", "b"]);
+    every_way(&a);
+    // the same arriving on another device, all at once
+    sync(&a, &mut b, &enc1);
+    assert_eq!(b.state().canonical(), a.state().canonical());
+    every_way(&b);
+
+    // one device restores c while the other deletes Trip: the restore
+    // touches c and what is above it, so the delete takes only a and b
+    write(&mut a, d0, vec![SpaceOp::restore(fc)]);
+    write(&mut b, d1, vec![SpaceOp::delete(trip)]);
+    sync(&a, &mut b, &enc1);
+    sync(&b, &mut a, &p.enc);
+    assert_eq!(b.state().canonical(), a.state().canonical());
+    assert!(!deleted(&a, &fc), "restored");
+    assert!(!deleted(&a, &trip), "touched by the restore");
+    assert!(a.state().node(&trip).unwrap().delete_conflict);
+    assert!(
+        deleted(&a, &fa) && deleted(&a, &fb),
+        "untouched, so deleted"
+    );
+    every_way(&a);
+    every_way(&b);
+}
+
 #[test]
 fn written_beside_supersedes_and_deletes_nothing() {
     // `state.md`: a `set` written beside adds its value and supersedes none;

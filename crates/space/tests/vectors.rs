@@ -119,6 +119,110 @@ fn state_vectors() {
             node(0, "Trip", trip, ROOT),
             node(1, "plan.txt", plan, trip),
         ],
+        "a_restore": restore_vector(&key, author, head, epoch),
     });
     check_or_write("state.json", vectors);
+}
+
+/// The example of `state.md#deletion-yields-to-concurrent-work`: a delete
+/// flags only what is not already deleted, and a restore clears the flags
+/// its delete set, and no others.
+fn restore_vector(key: &SigningKey, author: [u8; 32], head: [u8; 32], epoch: [u8; 16]) -> Json {
+    use cardinal_identity::dag::Dag;
+    use cardinal_space::files::{self, Content};
+    use cardinal_space::{Profile, SpaceEntry, State};
+    use std::collections::HashSet;
+
+    let mut dag: Dag<SpaceEntry> = Dag::new();
+    // a genesis with no ops, whose id is the space's
+    let genesis = SpaceEntryBuilder::genesis(author, head, epoch)
+        .time(1_700_000_100_000)
+        .sign(key)
+        .unwrap();
+    let space = genesis.id();
+    dag.insert(space, Vec::new(), genesis);
+    let mut time = 1_700_000_100_000u64;
+    let mut write = |dag: &mut Dag<SpaceEntry>, parents: &[[u8; 32]], ops: Vec<SpaceOp>| {
+        time += 1000;
+        let e = SpaceEntryBuilder::new(space, parents, author, head, epoch)
+            .ops(ops)
+            .time(time)
+            .sign(key)
+            .unwrap();
+        let id = e.id();
+        dag.insert(id, parents.to_vec(), e);
+        id
+    };
+    let e1 = write(&mut dag, &[space], vec![files::create_folder(ROOT, "Trip")]);
+    let trip = derived_id(&e1, 0);
+    let e2 = write(
+        &mut dag,
+        &[e1],
+        ["a", "b", "c"]
+            .iter()
+            .map(|n| {
+                files::create_file(
+                    trip,
+                    n,
+                    &Content::Inline(n.as_bytes().to_vec()),
+                    0o644,
+                    None,
+                )
+            })
+            .collect(),
+    );
+    let [a, b, c] = [0, 1, 2].map(|i| derived_id(&e2, i));
+    let e3 = write(&mut dag, &[e2], vec![SpaceOp::delete(c)]);
+    let e4 = write(&mut dag, &[e3], vec![SpaceOp::delete(trip)]);
+    let e5 = write(&mut dag, &[e4], vec![SpaceOp::restore(trip)]);
+    let state_of = |dag: &Dag<SpaceEntry>| {
+        let valid: HashSet<_> = dag.log_order().iter().copied().collect();
+        State::compute(Profile::FILES, dag, &valid)
+    };
+    let named = [("Trip", trip), ("a", a), ("b", b), ("c", c)];
+    let flags = |st: &State| -> Json {
+        let mut out = serde_json::Map::new();
+        for (name, id) in named {
+            let n = st.node(&id).unwrap();
+            out.insert(
+                name.into(),
+                json!({"id": hx(id), "deleted": n.deleted, "delete_conflict": n.delete_conflict}),
+            );
+        }
+        Json::Object(out)
+    };
+    let after_restore = state_of(&dag);
+    assert!(after_restore.node(&c).unwrap().deleted);
+    assert!(!after_restore.node(&a).unwrap().deleted);
+    let then = flags(&after_restore);
+    let canonical = after_restore.canonical().encode();
+    // then, both on e5: one restores c, the other deletes Trip
+    let e6 = write(&mut dag, &[e5], vec![SpaceOp::restore(c)]);
+    let e7 = write(&mut dag, &[e5], vec![SpaceOp::delete(trip)]);
+    let both = state_of(&dag);
+    assert!(!both.node(&trip).unwrap().deleted && !both.node(&c).unwrap().deleted);
+    assert!(both.node(&a).unwrap().deleted);
+    let entries: Vec<String> = [space, e1, e2, e3, e4, e5, e6, e7]
+        .iter()
+        .map(|id| hx(dag.get(id).unwrap().encode()))
+        .collect();
+    json!({
+        "description": "A restore clears the flags its delete set, and no others \
+            (state.md#deletion-yields-to-concurrent-work). A files space signed as the example \
+            above is, whose genesis (the first of `entries`) has no ops, and seven entries \
+            after it: e1 makes the folder Trip, e2 the files a, b and c \
+            in it, e3 deletes c, e4 deletes Trip, and e5 restores Trip, each after the one \
+            before. e4 flags Trip, a and b, and not c, which e3 had flagged, so after e5 Trip, \
+            a and b are back and c is still deleted: `after_restore` gives each node's flags \
+            and `after_restore_canonical` the canonical state's encoding. Then e6 restores c \
+            and e7 deletes Trip, both after e5 and so concurrent: the restore names c, which \
+            touches c and everything above it, so the delete yields there; `after_both` has \
+            Trip and c not deleted, Trip with a delete conflict, and a and b deleted, \
+            `after_both_root` the canonical state's BLAKE3.",
+        "entries": entries,
+        "after_restore": then,
+        "after_restore_canonical": hx(canonical),
+        "after_both": flags(&both),
+        "after_both_root": hx(both.root_hash()),
+    })
 }

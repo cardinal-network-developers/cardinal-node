@@ -1183,11 +1183,15 @@ Readings:
   identity's reach node, which could not be answered without knowing every
   identity; both reasons reject the entry, so the answer is never needed.
   A `set` written beside, and a cleared field, behave as on any node.
-- **Spec ambiguity: what a delete deletes.** Chose: a delete of N flags N
-  and every node beneath N in the delete's causal past that no concurrent
-  op touched; N is flagged delete conflict if touched. A `restore` of N
-  clears N and the nodes beneath it that the same delete flagged. Views
-  hide everything beneath a deleted node.
+- **What a delete deletes** (`state.md#deletion-yields-to-concurrent-work`,
+  which says it since 2026-11-21). A delete of N flags N and every node
+  beneath N in the delete's causal past that is not already deleted and
+  that no concurrent op touched; N is flagged delete conflict if touched.
+  A `restore` of N clears N and the nodes beneath it that the same delete
+  flagged, so a file deleted on its own before its folder stays deleted
+  when the folder comes back. (Before, a delete flagged again what was
+  already deleted, and such a file came back with its folder.) Views hide
+  everything beneath a deleted node.
 - **Any kind, anywhere** (`state.md#operations`). A `create` is accepted
   whatever its kind and wherever it puts the node, and the files and
   account profiles reject nothing for kind or place any more. What shows a
