@@ -275,7 +275,8 @@ rec!(CONTACT "contact":
     1 "category" T, 2 "connected" BOOL, 3 "identity" B, 4 "introductions" BOOL, 5 "met" {MET},
     6 "name" T, 7 "nearby" BOOL, 8 "own" BOOL, 9 "picture" T, 10 "recovered" T,
     11 "refused" BOOL, 12 "relayed" BOOL, 13 "suggested" T, 14 "trusted" BOOL,
-    15 "recovered_seen" U, 16 "recovered_new_guardians" BOOL, 17 "recovered_delay" U);
+    15 "recovered_seen" U, 16 "recovered_new_guardians" BOOL, 17 "recovered_delay" U,
+    18 "unreadable" T);
 rec!(CONTACT_REACH "contact reach":
     1 "named" [T], 2 "said_no" BOOL, 3 "shared" BOOL, 4 "waiting" BOOL);
 rec!(CONVERSATION "conversation":
@@ -287,7 +288,7 @@ rec!(COPIES "copies":
     6 "now" U, 7 "older_than_ms" U);
 rec!(DEVICE "device":
     1 "addr" T, 2 "carrier" T, 3 "fetch" {FETCH}, 4 "key" B, 5 "name" T, 6 "online" BOOL,
-    7 "power" T, 8 "this" BOOL, 9 "through" T);
+    7 "power" T, 8 "this" BOOL, 9 "through" T, 10 "unreadable" {UNREADABLE});
 rec!(ENDPOINT "endpoint": 1 "endpoint" T, 2 "local" BOOL, 3 "tried" BOOL, 4 "why_not" T);
 rec!(FETCH "fetch": 1 "latency_ms" U, 2 "rate" U, 3 "received" U, 4 "replies" U);
 rec!(FILE "file":
@@ -370,7 +371,7 @@ rec!(SESSION_DEVICE "contact's device":
     1 "addr" T, 2 "bytes_received" U, 3 "bytes_sent" U, 4 "carrier" T, 5 "heard_ms_ago" U,
     6 "kept_in_touch" BOOL, 7 "key" B, 8 "online" BOOL, 9 "open_for_s" U, 10 "opened_by" T,
     11 "packets_dropped" U, 12 "packets_lost" U, 13 "route" T, 14 "rtt_ms" U,
-    15 "they_see_you_at" T, 16 "through" T);
+    15 "they_see_you_at" T, 16 "through" T, 17 "unreadable" {UNREADABLE});
 rec!(SET_ASIDE "set aside": 1 "entry" B, 2 "space" B, 3 "time_ms" U);
 rec!(SPACE "space": 1 "entries" U, 2 "id" B, 3 "kind" T, 4 "set_aside" U, 5 "valid" U);
 rec!(STEP "step": 1 "at" U, 2 "ok" BOOL, 3 "text" T);
@@ -381,6 +382,8 @@ rec!(TREE_ITEM "tree item":
     1 "dirty" BOOL, 2 "ino" U, 3 "kind" T, 4 "local" BOOL, 5 "node" B, 6 "path" T, 7 "size" U);
 rec!(STUCK_ITEM "stuck item":
     1 "dirty" T, 2 "kind" T, 3 "opens" U, 4 "path" T, 5 "staged" BOOL);
+rec!(UNREADABLE "unreadable":
+    1 "reason" T, 2 "retry_in_s" U, 3 "says" T, 4 "since" U, 5 "theirs" BOOL, 6 "version" T);
 rec!(UNSHOWN_NODE "unshown node": 1 "name" T, 2 "node" B);
 rec!(VERSION "version":
     1 "current" BOOL, 2 "device" T, 3 "here" BOOL, 4 "size" U, 5 "time" U, 6 "version" U);

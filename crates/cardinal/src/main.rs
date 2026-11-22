@@ -2116,6 +2116,7 @@ fn print_devices(devs: &Value) {
         if let Some(f) = source_line(&d["fetch"]) {
             println!("      {f}");
         }
+        print!("{}", unreadable_line(&d["unreadable"]));
     }
 }
 
@@ -3002,6 +3003,9 @@ async fn client(cmd: Cmd) -> anyhow::Result<()> {
                     line.push_str("  refused");
                 }
                 println!("{line}  [{}]", c["identity"].as_str().unwrap_or(""));
+                if let Some(u) = c["unreadable"].as_str() {
+                    println!("  {}", printable(u));
+                }
                 if let Some(r) = c["recovered"].as_str() {
                     let name = c["name"].as_str().unwrap_or("");
                     // the day in this person's own time, from the fields
@@ -3942,6 +3946,21 @@ fn reach_lines(out: &mut String, list: &serde_json::Value, whose: &str) {
 }
 
 /// `cardinal contacts NAME`, in words.
+/// What a device that could not be read says, on lines of its own, or
+/// nothing.
+fn unreadable_line(u: &serde_json::Value) -> String {
+    let Some(says) = u["says"].as_str() else {
+        return String::new();
+    };
+    let mut out = format!("      {}\n", printable(says));
+    out.push_str(&format!(
+        "      ({}; trying again in {})\n",
+        printable(u["reason"].as_str().unwrap_or("")),
+        secs_ago(u["retry_in_s"].as_u64().unwrap_or(0)).trim_end_matches(" ago")
+    ));
+    out
+}
+
 fn contact_status(v: &serde_json::Value) -> String {
     let mut out = String::new();
     let mut head = printable(v["name"].as_str().unwrap_or(""));
@@ -3972,8 +3991,10 @@ fn contact_status(v: &serde_json::Value) -> String {
         } else {
             ""
         };
+        let unread = unreadable_line(&dv["unreadable"]);
         if dv["online"] != true {
             out.push_str(&format!("  ○ {key}  no session{kept}\n"));
+            out.push_str(&unread);
             continue;
         }
         let route = match (
@@ -4007,6 +4028,7 @@ fn contact_status(v: &serde_json::Value) -> String {
         if let Some(a) = dv["they_see_you_at"].as_str() {
             out.push_str(&format!("      they see you at {a}\n"));
         }
+        out.push_str(&unread);
     }
     out.push_str("Where they say to find them, in the space you share:\n");
     reach_lines(&mut out, &v["their_reach"], "their");

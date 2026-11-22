@@ -923,11 +923,27 @@ pub fn list(d: &Daemon, all: bool) -> Json {
                 "connected": connected.contains(&c.identity),
                 "relayed": relayed.contains(&c.identity),
                 "nearby": near.contains(&c.identity),
+                "unreadable": unreadable(d, c),
             });
             crate::names::with_shown(d, c, v)
         })
         .collect();
     json!({"contacts": contacts})
+}
+
+/// What is said of the first of a contact's devices that sent what this
+/// device cannot read, or could not read it (`unreadable.rs`), if one did.
+fn unreadable(d: &Daemon, c: &ContactRecord) -> Option<String> {
+    let keys: Vec<[u8; 32]> = {
+        let core = d.core();
+        let o = core.others.get(&c.identity)?;
+        let st = o.log.state();
+        st.keys.values().map(|k| k.key).collect()
+    };
+    let name = format!("One of {}'s devices", c.petname);
+    keys.iter()
+        .find_map(|k| d.unreadable.json(k, &name))
+        .and_then(|v| v["says"].as_str().map(str::to_owned))
 }
 
 /// What a contact's software says of someone recovered by guardians
@@ -1876,14 +1892,17 @@ pub async fn status(
         .into_iter()
         .map(|(k, _)| k)
         .collect();
+    let their_device = d.unreadable_name(&PeerKind::Contact(c.identity, [0; 32]));
     let devices: Vec<Json> = theirs
         .iter()
         .map(|(x, k)| {
+            let unreadable = d.unreadable.json(k, &their_device);
             let Some((s, open_for)) = d.session_since(x) else {
                 return json!({
                     "key": hex::encode(&k[..8]),
                     "online": false,
                     "kept_in_touch": standing.contains(k),
+                    "unreadable": unreadable,
                 });
             };
             let st = s.stats();
@@ -1905,6 +1924,7 @@ pub async fn status(
                 "packets_lost": st.packets_lost,
                 "packets_dropped": st.packets_dropped,
                 "they_see_you_at": s.observed_addr().map(|a| a.to_string()),
+                "unreadable": unreadable,
             })
         })
         .collect();

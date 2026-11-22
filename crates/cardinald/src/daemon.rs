@@ -261,6 +261,9 @@ pub struct Daemon {
     /// Addresses of devices.
     pub book: Mutex<PeerBook>,
     backoff: Mutex<HashMap<KeyId, (Instant, Duration)>>,
+    /// Devices whose sessions closed on something one side could not read
+    /// (`unreadable.rs`).
+    pub unreadable: crate::unreadable::Unreadables,
     pub(crate) connecting: Mutex<HashSet<KeyId>>,
     /// Bumped on every change to the identity or a space.
     pub changed: watch::Sender<u64>,
@@ -483,6 +486,7 @@ impl Daemon {
         ec.allow_public = config.host;
         ec.session = SessionConfig {
             keepalive: Some(Duration::from_secs(20)),
+            software: Some(format!("cardinal {}", cardinal_update::VERSION)),
             ..SessionConfig::default()
         };
         let listen: SocketAddr = config.listen.parse().map_err(|_| {
@@ -548,6 +552,7 @@ impl Daemon {
             sessions: Mutex::new(HashMap::new()),
             book: Mutex::new(book),
             backoff: Mutex::new(HashMap::new()),
+            unreadable: Default::default(),
             connecting: Mutex::new(HashSet::new()),
             changed: watch::channel(0).0,
             pairing: Mutex::new(PairState::Idle),
@@ -715,6 +720,7 @@ impl Daemon {
         for s in &sessions {
             s.check();
         }
+        self.unreadable.network_changed();
         // and the services of the personas this device acts as, which
         // listen on the same network
         let inside: Vec<Arc<crate::helper::Helper>> = lock(&self.helper)
@@ -1153,10 +1159,17 @@ impl Daemon {
         let mut m = lock(&self.sessions);
         if m.get(peer_static).is_some_and(|c| c.gen == gen) {
             let mut refused = None;
+            let mut unread = None;
             if let Some(c) = m.remove(peer_static) {
                 if let PeerKind::Own(k) | PeerKind::Contact(_, k) = c.kind {
                     if is_prove_first(c.session.close_reason().as_ref()) {
                         refused = Some(k);
+                    }
+                    if let Some(r) = c.session.close_reason() {
+                        unread = self
+                            .unreadable
+                            .closed(k, *peer_static, &r)
+                            .map(|_| (c.kind, k));
                     }
                 }
                 if let PeerKind::Contact(who, k) = c.kind {
@@ -1181,6 +1194,18 @@ impl Daemon {
                 let next = Instant::now() + PROVE_FIRST_BACKOFF;
                 lock(&self.backoff).insert(k, (next, PROVE_FIRST_BACKOFF));
             }
+            // Said once, not at each session that closes the same way.
+            if let Some((kind, k)) = unread {
+                let name = self.unreadable_name(&kind);
+                if let Some(v) = self.unreadable.json(&k, &name) {
+                    tracing::warn!(
+                        "{} ({}; they do not sync until then, and this device dials \
+                         them less often)",
+                        v["says"].as_str().unwrap_or(""),
+                        v["reason"].as_str().unwrap_or("")
+                    );
+                }
+            }
             lock(&self.proven).remove(peer_static);
             lock(&self.invited).remove(peer_static);
             lock(&self.exchanging).remove(peer_static);
@@ -1189,6 +1214,27 @@ impl Daemon {
             // A device has one session with another, so a fetch may have
             // been waiting for this one to end.
             self.bump();
+        }
+    }
+
+    /// Who a device that could not be read is to the person: their own
+    /// device's name, or a contact's device.
+    pub fn unreadable_name(&self, kind: &PeerKind) -> String {
+        match kind {
+            PeerKind::Own(k) => self.device_name(k),
+            PeerKind::Contact(who, _) => {
+                let name = self
+                    .core()
+                    .contacts()
+                    .into_iter()
+                    .find(|c| c.identity == *who)
+                    .map(|c| c.petname);
+                match name {
+                    Some(n) => format!("One of {n}'s devices"),
+                    None => "A contact's device".into(),
+                }
+            }
+            _ => "A device".into(),
         }
     }
 
@@ -1651,6 +1697,9 @@ impl Daemon {
                         continue;
                     }
                 }
+            }
+            if !self.unreadable.due(&key, link.x25519()) {
+                continue;
             }
             if !lock(&self.connecting).insert(key) {
                 continue;

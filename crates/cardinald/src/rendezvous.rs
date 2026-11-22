@@ -1395,8 +1395,14 @@ pub async fn reach_contacts(d: Arc<Daemon>) {
                 return false;
             };
             let st = o.log.state();
-            let links = st.keys.values().filter_map(|k| k.link_key.as_ref());
-            links.into_iter().any(|l| !d.is_online(l.x25519()))
+            // one that could not be read waits its turn (`unreadable.rs`)
+            let links = st
+                .keys
+                .values()
+                .filter_map(|k| Some((k.key, k.link_key.as_ref()?)));
+            links
+                .into_iter()
+                .any(|(k, l)| !d.is_online(l.x25519()) && d.unreadable.due(&k, l.x25519()))
         };
         let ones = contacts.iter().filter(|c| c.connects());
         let ones = ones.filter(|c| d.rendezvous.in_use(&c.identity));

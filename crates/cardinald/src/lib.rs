@@ -55,6 +55,7 @@ pub mod settings;
 pub mod setup;
 pub mod speedtest;
 pub mod transport;
+pub mod unreadable;
 pub mod upnp;
 
 /// What tests in several modules set up alike.

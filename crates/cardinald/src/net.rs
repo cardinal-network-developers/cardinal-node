@@ -250,9 +250,16 @@ pub async fn sync_all(d: &Arc<Daemon>, s: &Session) {
         PeerKind::Token(_) | PeerKind::Stranger => return,
         _ => (d.core().labels(), None),
     };
+    let device = match d.classify(s) {
+        PeerKind::Own(k) | PeerKind::Contact(_, k) => Some(k),
+        _ => None,
+    };
+    let mut read = !labels.is_empty();
     for label in labels {
         let mine = crate::mailbox::written_here(d, &label);
-        match reconcile(d, s, label).await {
+        let done = reconcile(d, s, label).await;
+        read &= done.is_ok();
+        match done {
             Ok(()) => {
                 if let Some(member) = member {
                     d.mailbox.mark_sent(&label, &member, &mine);
@@ -263,6 +270,13 @@ pub async fn sync_all(d: &Arc<Daemon>, s: &Session) {
                 short(&label),
                 short(&s.peer_static())
             ),
+        }
+    }
+    // Every set reconciled, and the session still open: whatever could not
+    // be read before can be now (`unreadable.rs`).
+    if let Some(k) = device.filter(|_| read && !s.is_closed()) {
+        if d.unreadable.synced(&k) {
+            tracing::info!("{} reads this device again", short(&s.peer_static()));
         }
     }
     // After this person's recovery: what they started and offered this

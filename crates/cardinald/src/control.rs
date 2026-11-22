@@ -1172,6 +1172,9 @@ fn devices(d: &Daemon) -> Vec<Value> {
                 });
             json!({
                 "name": name_of(&k.key),
+                // what it sent that this device cannot read, or the other
+                // way round (`unreadable.rs`)
+                "unreadable": d.unreadable.json(&k.key, &name_of(&k.key)),
                 "key": hex::encode(&k.key[..8]),
                 "power": power_name(k.power),
                 "this": k.key == me,

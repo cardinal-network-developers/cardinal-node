@@ -81,6 +81,10 @@ pub struct SessionConfig {
     pub answer_timeout: Duration,
     /// How long the handshake, proofs, and first rekey may take.
     pub establish_timeout: Duration,
+    /// The software and its version, said in a `close` frame for a
+    /// protocol violation (`; cardinal 0.1.19`), so a peer that sent what
+    /// this one cannot read can say which release it speaks to.
+    pub software: Option<String>,
 }
 
 impl Default for SessionConfig {
@@ -92,6 +96,7 @@ impl Default for SessionConfig {
             keepalive: None,
             answer_timeout: Duration::from_secs(10),
             establish_timeout: Duration::from_secs(15),
+            software: None,
         }
     }
 }
@@ -601,9 +606,10 @@ impl Conn {
         if self.close.is_some() {
             return;
         }
-        let text = match &reason {
-            CloseReason::Local(r) => r.clone(),
-            other => other.to_string(),
+        let text = match (&reason, &self.config.software) {
+            (CloseReason::Local(r), _) => r.clone(),
+            (CloseReason::Protocol(_), Some(sw)) => format!("{reason}; {sw}"),
+            (other, _) => other.to_string(),
         };
         // Before confirmation the responder may not send at all.
         if self.confirmed {

@@ -6,8 +6,10 @@
 //!
 //! 0.1.19 does not work beside 0.1.18: pairing, the sync turns and the
 //! link's reset frame all changed, so against 0.1.18 only
-//! `data_written_by_the_old_version_opens` passes. The rest hold again
-//! against 0.1.19 and later.
+//! `data_written_by_the_old_version_opens` and the two that check the
+//! person is told (`an_old_device_that_cannot_be_read_is_named`,
+//! `an_old_contact_that_cannot_be_read_is_named`) pass. The rest hold
+//! again against 0.1.19 and later.
 
 mod common;
 
@@ -283,4 +285,132 @@ fn an_old_account_gets_a_name_of_its_own() {
     });
     no_panic(&phone);
     no_panic(&ana);
+}
+
+/// What `status` on `d` says of its device `name` that it cannot read, if
+/// anything.
+fn unreadable_device(d: &Dev, name: &str) -> Option<serde_json::Value> {
+    let st = d.status();
+    let devices = st["devices"].as_array().cloned().unwrap_or_default();
+    let dv = devices.into_iter().find(|x| x["name"] == name)?;
+    dv["unreadable"]
+        .is_object()
+        .then(|| dv["unreadable"].clone())
+}
+
+fn count(log: &str, all: &[&str]) -> usize {
+    log.lines()
+        .filter(|l| all.iter().all(|w| l.contains(w)))
+        .count()
+}
+
+/// A release this one cannot read (0.1.18 beside 0.1.19): two of a
+/// person's devices, one updated, do not sync, and the updated one says so
+/// in `status`, at WARN once, and dials the other less often. Against a
+/// release it reads, they sync and nothing is said.
+#[test]
+fn an_old_device_that_cannot_be_read_is_named() {
+    let Some(old) = old_bin() else { return };
+    let root = tempfile::tempdir().unwrap();
+    let mut a = old_device(root.path(), "alpha", &old);
+    let mut b = old_device(root.path(), "beta", &old);
+    first(&mut a);
+    b.start();
+    pair(&a, &b);
+    both_ways(&a, &b, "before");
+    update(&mut b);
+
+    write(&a, "after.txt", "after");
+    let mut said = None;
+    wait("beta syncs with alpha, or says why not", 90, || {
+        if read(&b.p("after.txt")).as_deref() == Some("after") {
+            return true;
+        }
+        said = unreadable_device(&b, "alpha");
+        said.is_some()
+    });
+    let Some(said) = said else {
+        assert!(unreadable_device(&b, "alpha").is_none());
+        eprintln!("the old version is read: nothing to say");
+        return;
+    };
+    let says = said["says"].as_str().unwrap().to_owned();
+    eprintln!("beta says: {says} ({})", said["reason"]);
+    assert!(says.starts_with("alpha "), "{says}");
+    assert!(says.contains("Update"), "{says}");
+    assert!(b.cli(&["status"]).contains(&says));
+
+    // Sessions keep closing, alpha dialling as it always did; beta says it
+    // once and dials alpha twice at most in the first 45 s.
+    let dialled = count(&b.log(), &["connected to alpha", "outgoing"]);
+    std::thread::sleep(std::time::Duration::from_secs(45));
+    let log = b.log();
+    let more = count(&log, &["connected to alpha", "outgoing"]) - dialled;
+    assert!(more <= 2, "beta dialled alpha {more} times in 45 s");
+    assert_eq!(count(&log, &["WARN", &says]), 1, "{log}");
+    assert!(unreadable_device(&b, "alpha").is_some());
+
+    // Updated, alpha syncs, and nothing is said any more.
+    update(&mut a);
+    both_ways(&a, &b, "both-updated");
+    wait("beta reads alpha again", 60, || {
+        unreadable_device(&b, "alpha").is_none()
+    });
+    no_panic(&a);
+    no_panic(&b);
+}
+
+/// The same with a contact: their device, on the release this one cannot
+/// read, is named in `contacts` and `contacts <name>`.
+#[test]
+fn an_old_contact_that_cannot_be_read_is_named() {
+    let Some(old) = old_bin() else { return };
+    let root = tempfile::tempdir().unwrap();
+    let mut ana = old_device(root.path(), "ana", &old);
+    let mut bo = old_device(root.path(), "bo", &old);
+    first(&mut ana);
+    first(&mut bo);
+    let at = format!("127.0.0.1:{}", ana.port);
+    let code = ana.cli(&["invite", "--address", &at, "--name", "Ana"]);
+    let done = bo.cli(&["accept", code.trim()]);
+    assert!(done.contains("Connected to Ana"), "{done}");
+    wait("ana lists bo", 20, || ana.cli(&["contacts"]).contains("bo"));
+    ana.cli(&["say", "bo", "before"]);
+    wait("bo reads it", 30, || {
+        bo.cli(&["messages", "Ana"]).contains("before")
+    });
+
+    update(&mut bo);
+    bo.cli(&["say", "Ana", "after"]);
+    ana.cli(&["say", "bo", "after"]);
+    // Messages may still come through a mailbox; the sessions cannot.
+    let mut said = None;
+    for _ in 0..90 {
+        said = only_contact(&bo)["unreadable"].as_str().map(str::to_owned);
+        if said.is_some() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_secs(1));
+    }
+    let Some(says) = said else {
+        eprintln!("the old version is read: nothing to say");
+        assert!(bo.cli(&["messages", "Ana"]).contains("after"));
+        return;
+    };
+    eprintln!("bo says: {says}");
+    assert!(says.starts_with("One of Ana's devices "), "{says}");
+    assert!(bo.cli(&["contacts"]).contains(&says));
+    let status = control(
+        &bo,
+        serde_json::json!({"cmd": "contact-status", "who": "Ana"}),
+    );
+    let devices = status["devices"].as_array().cloned().unwrap_or_default();
+    assert!(
+        devices
+            .iter()
+            .any(|d| d["unreadable"]["says"] == says.as_str()),
+        "{status}"
+    );
+    assert!(bo.cli(&["contacts", "Ana"]).contains(&says));
+    no_panic(&bo);
 }
