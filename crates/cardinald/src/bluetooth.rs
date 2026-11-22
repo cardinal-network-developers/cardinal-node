@@ -33,7 +33,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use cardinal_contact::ble::{self, Advert, BleAddr, Keys, Radio, Sighting, TagType};
+use cardinal_contact::ble::{self, Advert, BleAddr, Keys, NotAvailable, Radio, Sighting, TagType};
 use cardinal_contact::discovery::{discovery_key, presence_key};
 use cardinal_contact::Invitation;
 use cardinal_crypto::HybridPublicKey;
@@ -104,12 +104,11 @@ const CHANNEL_WITHIN: Duration = Duration::from_secs(10);
 /// How long a handshake over a channel may take.
 const HANDSHAKE_WITHIN: Duration = Duration::from_secs(8);
 /// How long someone accepting an invitation looks for its tag: where the
-/// other device has only a legacy advertisement, one tag a time, its
-/// one-time tag is in every other one ([`Keys::legacy`]), and those come
-/// every [`ADVERTISE_FAST`].
+/// other device has more one-time tags than places, its own is in a random
+/// few of its advertisements, made every [`ADVERTISE_FAST`].
 const INVITATION_WITHIN: Duration = Duration::from_secs(60);
 /// How often the advertisement is made again while it has a one-time tag,
-/// so that a legacy one gets round its tags soon.
+/// so that more of them than there are places take turns soon.
 const ADVERTISE_FAST: Duration = Duration::from_secs(10);
 /// How long to wait before trying the radio again when it failed: the
 /// app that drives it on Android connects a moment after the service starts.
@@ -144,7 +143,7 @@ struct Shown {
     /// The radio, in words, once one was made.
     radio: Option<String>,
     /// Whether it could be used, the last time it was asked.
-    available: Option<Result<(), String>>,
+    available: Option<Result<(), NotAvailable>>,
     /// Advertising, scanning and listening now.
     on: bool,
     /// The PSM listened on.
@@ -284,6 +283,10 @@ fn system_radio(d: &Daemon) -> Result<Arc<dyn Radio>, String> {
     #[cfg(unix)]
     if let Some(dir) = std::env::var_os("CARDINAL_TEST_BLE_ETHER") {
         let ether = ble::DirEther::new(dir).map_err(|e| e.to_string())?;
+        // A radio of an older phone, for tests.
+        if std::env::var_os("CARDINAL_TEST_BLE_TOO_OLD").is_some() {
+            return Ok(Arc::new(ether.old_radio()));
+        }
         return Ok(Arc::new(ether.radio()));
     }
     #[cfg(unix)]
@@ -496,7 +499,9 @@ async fn run(d: &Arc<Daemon>) -> Result<(), String> {
     let radio = radio(d)?;
     let available = radio.available().await.map_err(|e| e.to_string())?;
     show(d, |s| s.available = Some(available.clone()));
-    available?;
+    // A radio too old for extended advertisements stays off: nobody would
+    // find this device, and there is no short form.
+    available.map_err(|e| e.to_string())?;
     let mut listening = radio
         .listen()
         .await
@@ -857,8 +862,9 @@ pub fn status(d: &Daemon) -> Value {
     let (available, why_not) = match &shown.available {
         None => (Value::Null, Value::Null),
         Some(Ok(())) => (json!(true), Value::Null),
-        Some(Err(e)) => (json!(false), json!(e)),
+        Some(Err(e)) => (json!(false), json!(e.to_string())),
     };
+    let too_old = shown.available == Some(Err(NotAvailable::TooOld));
     json!({
         "mode": mode(d).as_str(),
         "on": shown.on,
@@ -871,6 +877,9 @@ pub fn status(d: &Daemon) -> Value {
         "seen": b.seen.load(Ordering::Relaxed),
         "recognized": b.recognized.load(Ordering::Relaxed),
         "channels_in": lock(&b.incoming).iter().filter(|c| !c.on.is_closed()).count(),
+        // This device's Bluetooth cannot send extended advertisements:
+        // Bluetooth stays off, whatever the setting.
+        "too_old": too_old,
     })
 }
 
@@ -881,10 +890,10 @@ pub async fn check(d: &Daemon) -> Value {
         let r = match radio(d) {
             Ok(r) => match tokio::time::timeout(Duration::from_secs(3), r.available()).await {
                 Ok(Ok(a)) => a,
-                Ok(Err(e)) => Err(e.to_string()),
-                Err(_) => Err("the radio did not answer".into()),
+                Ok(Err(e)) => Err(e.to_string().into()),
+                Err(_) => Err("the radio did not answer".to_owned().into()),
             },
-            Err(e) => Err(e),
+            Err(e) => Err(e.into()),
         };
         show(d, |s| s.available = Some(r));
     }

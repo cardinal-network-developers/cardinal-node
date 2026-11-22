@@ -6,13 +6,10 @@
 //! - **Advertising**: an `org.bluez.LEAdvertisement1` object this process
 //!   serves, registered with the adapter's `LEAdvertisingManager1`, of type
 //!   `peripheral` (connectable), with the service UUID in the advertisement
-//!   and the service data under it. Where the adapter says an advertisement
-//!   cannot hold it all (`SupportedCapabilities`' `MaxAdvLen`), or refuses
-//!   it, the advertisement has the UUID and the scan response one short tag
-//!   (`ScanResponseServiceData`, which BlueZ has only when run with
-//!   `--experimental`). Where the adapter takes a second advertisement, the
-//!   legacy one goes beside the full one, for scanners that see only
-//!   legacy advertisements.
+//!   and the service data under it, which only an extended advertisement
+//!   holds. There is no legacy form: an adapter that says its advertisements
+//!   cannot hold it all (`SupportedCapabilities`' `MaxAdvLen`) is too old
+//!   ([`NotAvailable::TooOld`]), and Bluetooth stays off.
 //! - **Scanning**: `SetDiscoveryFilter` (LE, the service UUID, duplicates
 //!   reported) and `StartDiscovery`; each `org.bluez.Device1` whose
 //!   `ServiceData` has the UUID is a sighting, again at each change of its
@@ -38,7 +35,8 @@ use std::sync::Arc;
 use std::task::{ready, Context, Poll};
 
 use cardinal_contact::ble::{
-    BleAddr, BoxChannel, Keys, Listening, Radio, RadioFuture, Sighting, SERVICE_UUID,
+    BleAddr, BoxChannel, Keys, Listening, NotAvailable, Radio, RadioFuture, Sighting, ADVERT_LEN,
+    SERVICE_UUID,
 };
 use futures_util::StreamExt;
 use tokio::io::unix::AsyncFd;
@@ -60,8 +58,6 @@ pub struct BlueZ {
     address: Option<String>,
     /// Advertisements registered, for their object paths.
     made: AtomicU64,
-    /// Refreshes of the advertisement: whose turn a legacy one is.
-    turn: AtomicU64,
 }
 
 impl Default for BlueZ {
@@ -82,7 +78,6 @@ impl BlueZ {
             bus: Mutex::new(None),
             address: std::env::var("CARDINAL_TEST_BLUEZ_BUS").ok(),
             made: AtomicU64::new(0),
-            turn: AtomicU64::new(0),
         }
     }
 
@@ -243,17 +238,13 @@ impl Devices {
 /// The advertisement, as BlueZ reads it.
 struct Advertisement {
     /// Service data under the UUID, in the advertisement itself.
-    data: Option<Vec<u8>>,
-    /// Service data in the scan response, for a legacy advertisement.
-    scan_response: Option<Vec<u8>>,
+    data: Vec<u8>,
 }
 
-fn data_map(data: &Option<Vec<u8>>) -> HashMap<String, OwnedValue> {
+fn data_map(data: &[u8]) -> HashMap<String, OwnedValue> {
     let mut m = HashMap::new();
-    if let Some(d) = data {
-        if let Ok(v) = OwnedValue::try_from(Value::from(d.clone())) {
-            m.insert(SERVICE_UUID.to_owned(), v);
-        }
+    if let Ok(v) = OwnedValue::try_from(Value::from(data.to_vec())) {
+        m.insert(SERVICE_UUID.to_owned(), v);
     }
     m
 }
@@ -277,11 +268,6 @@ impl Advertisement {
     #[zbus(property, name = "ServiceData")]
     fn service_data(&self) -> HashMap<String, OwnedValue> {
         data_map(&self.data)
-    }
-
-    #[zbus(property, name = "ScanResponseServiceData")]
-    fn scan_response_service_data(&self) -> HashMap<String, OwnedValue> {
-        data_map(&self.scan_response)
     }
 }
 
@@ -319,8 +305,14 @@ async fn max_adv_len(bus: &Connection, adapter: &OwnedObjectPath) -> Option<usiz
 
 /// The bytes an advertisement with the service data in it takes: flags,
 /// the 128-bit UUID list, and the service data element.
-fn full_len(data: &[u8]) -> usize {
-    3 + (2 + 16) + (2 + 16 + data.len())
+fn full_len(data_len: usize) -> usize {
+    3 + (2 + 16) + (2 + 16 + data_len)
+}
+
+/// Whether an adapter whose advertisements hold `max` bytes, where it
+/// says, is too old: only an extended advertisement holds the tags.
+fn too_short(max: Option<usize>) -> bool {
+    max.is_some_and(|max| full_len(ADVERT_LEN) > max)
 }
 
 impl BlueZ {
@@ -501,25 +493,34 @@ impl Radio for BlueZ {
         "BlueZ".into()
     }
 
-    fn available(&self) -> RadioFuture<'_, Result<(), String>> {
+    fn available(&self) -> RadioFuture<'_, Result<(), NotAvailable>> {
         Box::pin(async move {
             let (path, all) = match self.adapter().await {
                 Ok(x) => x,
-                Err(e) => return Ok(Err(format!("no Bluetooth here: {e}"))),
+                Err(e) => return Ok(Err(format!("no Bluetooth here: {e}").into())),
             };
             let ifaces = &all[&path];
             if !ifaces.contains_key(ADVERTISING) {
                 return Ok(Err(format!(
                     "{} cannot advertise over Bluetooth Low Energy",
                     path.as_str()
-                )));
+                )
+                .into()));
             }
             let powered: bool = get(&ifaces[ADAPTER], "Powered").unwrap_or(false);
             if !powered {
                 return Ok(Err(format!(
                     "Bluetooth is off on this computer ({})",
                     path.as_str()
-                )));
+                )
+                .into()));
+            }
+            // Only an extended advertisement holds the tags. An adapter
+            // that does not say how long one may be is tried.
+            if let Ok(bus) = self.bus().await {
+                if too_short(max_adv_len(&bus, &path).await) {
+                    return Ok(Err(NotAvailable::TooOld));
+                }
             }
             // Without privacy, the adapter advertises and connects from its
             // fixed address, and anyone could follow this computer by it.
@@ -536,7 +537,7 @@ impl Radio for BlueZ {
                 Some(privacy_in_conf(&conf))
             });
             if private != Some(true) {
-                return Ok(Err(NO_PRIVACY.into()));
+                return Ok(Err(NO_PRIVACY.to_owned().into()));
             }
             Ok(Ok(()))
         })
@@ -571,41 +572,13 @@ impl Radio for BlueZ {
     }
 
     fn advertise(&self, keys: &Keys, psm: u16) -> RadioFuture<'_, Box<dyn Send>> {
-        let full = keys.advert(psm).encode();
-        let n = self.turn.fetch_add(1, Ordering::Relaxed) as usize;
-        let legacy = keys.legacy(psm, n).and_then(|a| a.encode_legacy());
+        let data = keys.advert(psm).encode();
         Box::pin(async move {
             let bus = self.bus().await?;
             let (adapter, _) = self.adapter().await?;
-            let fits = max_adv_len(&bus, &adapter)
-                .await
-                .is_none_or(|max| full_len(&full) <= max);
-            let legacy_ad = || Advertisement {
-                data: None,
-                scan_response: legacy.clone(),
-            };
-            if fits {
-                let ad = Advertisement {
-                    data: Some(full),
-                    scan_response: None,
-                };
-                match self.register(&bus, &adapter, ad).await {
-                    Ok(a) => {
-                        // A legacy one beside it, where the adapter has room,
-                        // for scanners that see no extended advertisement.
-                        let beside = match self.register(&bus, &adapter, legacy_ad()).await {
-                            Ok(b) => Some(b),
-                            Err(e) => {
-                                tracing::debug!("Bluetooth: no legacy advertisement beside: {e}");
-                                None
-                            }
-                        };
-                        return Ok(Box::new((a, beside)) as Box<dyn Send>);
-                    }
-                    Err(e) => tracing::debug!("Bluetooth: a full advertisement: {e}"),
-                }
-            }
-            let a = self.register(&bus, &adapter, legacy_ad()).await?;
+            let a = self
+                .register(&bus, &adapter, Advertisement { data })
+                .await?;
             Ok(Box::new(a) as Box<dyn Send>)
         })
     }
@@ -1102,7 +1075,7 @@ mod tests {
     }
 
     #[test]
-    fn a_full_advertisement_fits_an_extended_one() {
+    fn a_full_advertisement_fits_only_an_extended_one() {
         use cardinal_contact::ble::{Advert, Keys, TagType};
         let k = cardinal_crypto::Zeroizing::new([7u8; 32]);
         let data = Keys {
@@ -1110,10 +1083,15 @@ mod tests {
         }
         .advert(0x81)
         .encode();
+        assert_eq!(data.len(), ADVERT_LEN);
         // An extended advertisement holds up to 251 bytes in one packet.
-        assert!(full_len(&data) <= 251);
-        // Its four tags are more than a legacy one holds.
-        assert!(full_len(&data) > 31);
+        assert!(full_len(data.len()) <= 251);
+        assert!(!too_short(Some(251)));
+        // Its four tags are more than a legacy one holds: an adapter that
+        // sends only those is too old, and one that does not say is tried.
+        assert!(full_len(data.len()) > 31);
+        assert!(too_short(Some(31)));
+        assert!(!too_short(None));
         assert!(Advert::decode(&data).is_some());
     }
 

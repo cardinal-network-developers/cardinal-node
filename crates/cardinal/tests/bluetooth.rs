@@ -512,3 +512,41 @@ fn a_window_hears_the_radio_come_on_stop_fail_and_recover() {
     drop(window);
     stop(&mut ana);
 }
+
+#[test]
+fn a_radio_too_old_for_extended_advertisements_stays_off_and_says_so() {
+    let root = tempfile::tempdir().unwrap();
+    let ether = root.path().join("ether");
+    let mut old = dev(root.path(), "old", &ether);
+    old.env
+        .push(("CARDINAL_TEST_BLE_TOO_OLD".into(), "1".into()));
+    start(&mut old);
+    old.cli(&["init", "--yes", "--name", "Ana"]);
+    old.cli(&["bluetooth", "always"]);
+    wait("the radio said it is too old", 20, || {
+        bluetooth(&old)["too_old"] == true
+    });
+    // It stays off, whatever the setting, and sends nothing: there is no
+    // short form to fall back on.
+    std::thread::sleep(std::time::Duration::from_secs(2));
+    let b = bluetooth(&old);
+    assert_eq!(
+        (b["mode"].clone(), b["on"].clone(), b["available"].clone()),
+        (json!("always"), json!(false), json!(false)),
+        "{b}"
+    );
+    assert!(b["why_not"].as_str().unwrap().contains("extended"), "{b}");
+    assert_eq!(
+        std::fs::read_dir(ether.join("ads"))
+            .map(|d| d.count())
+            .unwrap_or(0),
+        0
+    );
+    let said = old.cli(&["bluetooth"]);
+    assert!(
+        said.contains("too old for Cardinal to find people nearby"),
+        "{said}"
+    );
+    assert!(said.contains("Wi-Fi and the internet still work"), "{said}");
+    stop(&mut old);
+}

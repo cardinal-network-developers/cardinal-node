@@ -262,7 +262,8 @@ macro_rules! gone {
 rec!(ATTACHMENT "attachment": 1 "name" T, 2 "size" U, 3 "type" T);
 rec!(BLUETOOTH "bluetooth":
     1 "available" BOOL, 2 "channels_in" U, 3 "error" T, 4 "mode" T, 5 "on" BOOL, 6 "psm" U,
-    7 "radio" T, 8 "recognized" U, 9 "seen" U, 10 "why_not" T, 11 "windows" U);
+    7 "radio" T, 8 "recognized" U, 9 "seen" U, 10 "why_not" T, 11 "windows" U,
+    12 "too_old" BOOL);
 rec!(CALL "call":
     1 "frames" {CALL_FRAMES}, 2 "group" B, 3 "id" B, 4 "linked" U, 5 "name" T, 6 "offered" [B],
     7 "people" U, 8 "picture" T, 9 "seconds" U, 10 "state" T, 11 "taken" [B], 12 "who" B);
@@ -637,7 +638,8 @@ pub static REQUESTS: &[Request] = &[
         7 "on" BOOL, 8 "protocol" T, 9 "seconds_left" U, 10 "this_device" BOOL)),
     req!(181 "bluetooth" (1 "mode" T) -> (
         2 "available" BOOL, 3 "channels_in" U, 4 "error" T, 5 "mode" T, 6 "on" BOOL, 7 "psm" U,
-        8 "radio" T, 9 "recognized" U, 10 "seen" U, 11 "why_not" T, 12 "windows" U)),
+        8 "radio" T, 9 "recognized" U, 10 "seen" U, 11 "why_not" T, 12 "windows" U,
+        13 "too_old" BOOL)),
     req!(182 "network" (1 "mine" BOOL, 2 "name" T) -> (
         2 "answered" BOOL, 3 "ask" BOOL, 4 "known" BOOL, 5 "mine" BOOL, 6 "name" T,
         7 "router" T, 8 "routers" BOOL)),

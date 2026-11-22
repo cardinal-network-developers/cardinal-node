@@ -14,18 +14,21 @@
 //!
 //! - `{"op": "listen"}`, answered `{"op": "listening", "psm": n}` or
 //!   `{"op": "listen-failed", "error": "..."}`; `{"op": "unlisten"}`;
-//! - `{"op": "advertise", "data": hex, "legacy": hex}`: the service data of
-//!   an extended advertisement, and of a legacy one with the UUID in the
-//!   advertisement and the data in the scan response, for where extended
-//!   advertising is not supported; `{"op": "unadvertise"}`;
+//! - `{"op": "advertise", "data": hex}`: the service data of an extended
+//!   advertisement, with the UUID in it too; `{"op": "unadvertise"}`. There
+//!   is no legacy form;
 //! - `{"op": "scan"}`, `{"op": "unscan"}`;
 //! - `{"op": "connect", "id": n, "addr": "AA:BB:...", "random": bool,
 //!   "psm": n}`.
 //!
 //! The app says:
 //!
-//! - `{"op": "state", "available": bool, "why": "..."}`, first and at each
-//!   change;
+//! - `{"op": "state", "available": bool, "why": "...", "extended": bool}`,
+//!   first and at each change: `extended` whether the radio sends LE
+//!   extended advertisements (Android's `isLeExtendedAdvertisingSupported`).
+//!   One that does not is too old ([`NotAvailable::TooOld`]), and a state
+//!   that says available without saying `extended` is taken as not
+//!   available, with why;
 //! - `{"op": "seen", "addr": "...", "random": bool, "data": hex}` for each
 //!   advertisement under the service UUID;
 //! - `{"op": "connect-failed", "id": n, "error": "..."}`;
@@ -48,7 +51,7 @@ use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{mpsc, oneshot};
 
-use super::{BleAddr, BoxChannel, Keys, Listening, Radio, RadioFuture, Sighting};
+use super::{BleAddr, BoxChannel, Keys, Listening, NotAvailable, Radio, RadioFuture, Sighting};
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
@@ -59,7 +62,7 @@ struct Shared {
     /// Lines to the app, while it is connected.
     to_app: Option<mpsc::UnboundedSender<String>>,
     /// What the app last said of the radio.
-    state: Option<Result<(), String>>,
+    state: Option<Result<(), NotAvailable>>,
     listening: Option<mpsc::Sender<(BleAddr, BoxChannel)>>,
     psm: Option<oneshot::Sender<io::Result<u16>>>,
     scanning: Option<mpsc::Sender<Sighting>>,
@@ -76,8 +79,6 @@ pub struct BridgeRadio {
     shared: Arc<Mutex<Shared>>,
     /// Channels asked for, by number.
     next: Arc<AtomicU64>,
-    /// Refreshes of the advertisement: whose turn a legacy one is.
-    turn: Arc<AtomicU64>,
     path: PathBuf,
 }
 
@@ -136,7 +137,6 @@ impl BridgeRadio {
         let r = BridgeRadio {
             shared: Arc::default(),
             next: Arc::new(AtomicU64::new(1)),
-            turn: Arc::new(AtomicU64::new(0)),
             path,
         };
         let shared = r.shared.clone();
@@ -230,7 +230,9 @@ async fn serve(shared: Arc<Mutex<Shared>>, mut s: UnixStream) -> io::Result<()> 
         return Ok(());
     }
     held.to_app = None;
-    held.state = Some(Err("the app's Bluetooth went away".into()));
+    held.state = Some(Err(NotAvailable::Why(
+        "the app's Bluetooth went away".into(),
+    )));
     // What was under way ends with it.
     held.listening = None;
     held.scanning = None;
@@ -242,9 +244,16 @@ fn on_event(shared: &Mutex<Shared>, v: &Value) {
     let mut held = lock(shared);
     match v["op"].as_str() {
         Some("state") => {
-            held.state = Some(match v["available"].as_bool() {
-                Some(true) => Ok(()),
-                _ => Err(v["why"].as_str().unwrap_or("Bluetooth is off").to_owned()),
+            held.state = Some(match (v["available"].as_bool(), v["extended"].as_bool()) {
+                (Some(true), Some(true)) => Ok(()),
+                (Some(true), Some(false)) => Err(NotAvailable::TooOld),
+                (Some(true), None) => Err(NotAvailable::Why(
+                    "the app did not say whether its Bluetooth sends extended advertisements"
+                        .into(),
+                )),
+                _ => Err(NotAvailable::Why(
+                    v["why"].as_str().unwrap_or("Bluetooth is off").to_owned(),
+                )),
             });
         }
         Some("listening") => {
@@ -296,13 +305,15 @@ impl Radio for BridgeRadio {
         lock(&self.shared).failure.clone()
     }
 
-    fn available(&self) -> RadioFuture<'_, Result<(), String>> {
+    fn available(&self) -> RadioFuture<'_, Result<(), NotAvailable>> {
         Box::pin(async move {
             let held = lock(&self.shared);
             Ok(match (&held.to_app, &held.state) {
-                (None, _) => Err("the app's Bluetooth is not connected".into()),
+                (None, _) => Err("the app's Bluetooth is not connected".to_owned().into()),
                 (_, Some(s)) => s.clone(),
-                (_, None) => Err("the app has not said whether Bluetooth is on".into()),
+                (_, None) => Err("the app has not said whether Bluetooth is on"
+                    .to_owned()
+                    .into()),
             })
         })
     }
@@ -331,13 +342,8 @@ impl Radio for BridgeRadio {
 
     fn advertise(&self, keys: &Keys, psm: u16) -> RadioFuture<'_, Box<dyn Send>> {
         let data = keys.advert(psm).encode();
-        let n = self.turn.fetch_add(1, Ordering::Relaxed) as usize;
-        let legacy = keys
-            .legacy(psm, n)
-            .and_then(|a| a.encode_legacy())
-            .unwrap_or_default();
         Box::pin(async move {
-            self.tell(json!({"op": "advertise", "data": hex(&data), "legacy": hex(&legacy)}))?;
+            self.tell(json!({"op": "advertise", "data": hex(&data)}))?;
             Ok(self.told_on_drop(json!({"op": "unadvertise"})))
         })
     }
@@ -399,9 +405,11 @@ mod tests {
     async fn app(path: PathBuf, radio: crate::ble::MemoryRadio) {
         let s = UnixStream::connect(&path).await.unwrap();
         let (r, mut w) = s.into_split();
-        w.write_all(b"{\"control\":true}\n{\"op\":\"state\",\"available\":true}\n")
-            .await
-            .unwrap();
+        w.write_all(
+            b"{\"control\":true}\n{\"op\":\"state\",\"available\":true,\"extended\":true}\n",
+        )
+        .await
+        .unwrap();
         let (out, mut out_rx) = mpsc::unbounded_channel::<String>();
         tokio::spawn(async move {
             while let Some(l) = out_rx.recv().await {
@@ -434,7 +442,7 @@ mod tests {
                 "advertise" => {
                     let data = unhex(v["data"].as_str().unwrap()).unwrap();
                     assert!(Advert::decode(&data).is_some());
-                    assert!(unhex(v["legacy"].as_str().unwrap()).is_some());
+                    assert!(v.get("legacy").is_none(), "there is no legacy form");
                     held.push(radio.advertise_data(data));
                 }
                 "connect" => {
@@ -508,6 +516,53 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn an_app_whose_bluetooth_is_too_old_says_so() {
+        let dir = std::env::temp_dir().join(format!(
+            "cardinal-bridge-{}",
+            hex(&cardinal_crypto::random_bytes::<6>())
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("b");
+        let bridge = BridgeRadio::bind(&path).unwrap();
+        let mut app = UnixStream::connect(&path).await.unwrap();
+        // What the bridge says once it says `want`, or at last.
+        async fn until(
+            b: &BridgeRadio,
+            want: impl Fn(&Result<(), NotAvailable>) -> bool,
+        ) -> Result<(), NotAvailable> {
+            for _ in 0..100 {
+                let a = b.available().await.unwrap();
+                if want(&a) {
+                    return a;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+            b.available().await.unwrap()
+        }
+        app.write_all(
+            b"{\"control\":true}\n{\"op\":\"state\",\"available\":true,\"extended\":false}\n",
+        )
+        .await
+        .unwrap();
+        let a = until(&bridge, |a| *a == Err(NotAvailable::TooOld)).await;
+        assert_eq!(a, Err(NotAvailable::TooOld));
+        // A state that does not say is not taken as a yes.
+        app.write_all(b"{\"op\":\"state\",\"available\":true}\n")
+            .await
+            .unwrap();
+        let a = until(&bridge, |a| *a != Err(NotAvailable::TooOld)).await;
+        assert!(
+            matches!(&a, Err(NotAvailable::Why(w)) if w.contains("extended")),
+            "{a:?}"
+        );
+        app.write_all(b"{\"op\":\"state\",\"available\":true,\"extended\":true}\n")
+            .await
+            .unwrap();
+        assert_eq!(until(&bridge, |a| a.is_ok()).await, Ok(()));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
     async fn a_connect_given_up_on_is_forgotten() {
         let dir = std::env::temp_dir().join(format!(
             "cardinal-bridge-{}",
@@ -518,9 +573,11 @@ mod tests {
         let bridge = BridgeRadio::bind(&path).unwrap();
         // An app that takes the control connection and never answers.
         let mut app = UnixStream::connect(&path).await.unwrap();
-        app.write_all(b"{\"control\":true}\n{\"op\":\"state\",\"available\":true}\n")
-            .await
-            .unwrap();
+        app.write_all(
+            b"{\"control\":true}\n{\"op\":\"state\",\"available\":true,\"extended\":true}\n",
+        )
+        .await
+        .unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         let to = BleAddr::parse("C0:00:00:00:00:01", true).unwrap();
         let tried = tokio::time::timeout(

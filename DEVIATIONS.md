@@ -1488,8 +1488,8 @@ Not implemented yet (the next milestone):
   text: the UUID, service data of the PSM (little-endian) and always four
   16-byte tags with **no type byte**, `nonce (8) || first8` as on a local
   network, in a random order, the places this device has no tag for
-  filled with random bytes, which look like tags; a legacy form of PSM
-  and one tag cut to `nonce (4) || first6`, with no type either; L2CAP LE
+  filled with random bytes, which look like tags; no legacy (short) form
+  (ASK 13, Daniel 2026-11-22); L2CAP LE
   credit-based channels with packets length-prefixed as over TCP, and the
   person's three states. A device checks each tag against every key it
   holds: its own devices' (`discovery`), each trusted contact's
@@ -1501,7 +1501,7 @@ Not implemented yet (the next milestone):
     context `cardinal 1 one-time`, and like `presence` kept out of
     `Purpose::ALL` and its vectors until published.
   - **The service UUID is in the advertisement too**, as a 128-bit UUID
-    list, in the extended form as in the legacy one: scanners filter on
+    list: scanners filter on
     it (BlueZ's discovery filter and Android's `ScanFilter` match the UUID
     list, not service data keys). The extended form is then flags, the
     UUID list and the service data: 3 + 18 + 18 + 2 + 64 = 105 bytes.
@@ -1509,23 +1509,19 @@ Not implemented yet (the next milestone):
     there are any, and one-time tags in the places left, a random few of
     them at each refresh when there are more; with nothing to say, nothing
     is advertised. A replayed tag is a known limit, as on a local network.
-  - **Legacy form on BlueZ** goes in `ScanResponseServiceData`, which
-    BlueZ has only with `--experimental`; without it the advertisement
-    carries the UUID and no tag, and nobody finds the device. Used where
-    the adapter's `SupportedCapabilities` `MaxAdvLen` is too short for
-    the full form, or the full one is refused.
-  - **Both forms at once where the radio has room** (spec question): a
-    device that sends the extended form sends the legacy one beside it,
-    as a second advertising set (BlueZ: a second registration; Android: a
-    second `AdvertisingSet`), so that a phone whose scanner sees only
-    legacy advertisements still finds it. Where the second is refused,
-    only the extended one goes. The draft says which form to use, not
-    whether both.
-  - **Which tag in a legacy advertisement:** the keys take turns, one per
-    refresh (each counted apart from anything else the radio numbers).
-    While there is a one-time tag, one has every other turn, since whoever
-    holds the invitation is looking now; and the advertisement is made
-    again every 10 s instead of 30 s. Someone accepting looks for 60 s.
+  - **No short form; a radio too old says so** (ASK 13 = a). Service data
+    of any length but 2 + 4 × 16 is not an advertisement. A radio that
+    cannot send extended advertisements is too old
+    (`NotAvailable::TooOld`): Bluetooth stays off whatever the setting,
+    nothing is advertised, and `status`/`bluetooth` say `too_old` (with
+    `available` false and `why_not` in words) for a client to show "This
+    phone's Bluetooth is too old for Cardinal to find people nearby. Wi-Fi
+    and the internet still work." On BlueZ: an adapter whose
+    `SupportedCapabilities` `MaxAdvLen` is shorter than the advertisement
+    (105 bytes); one that does not say is tried. Through Android's bridge:
+    the app's `state` line carries `extended`
+    (`isLeExtendedAdvertisingSupported`); a state that says available
+    without it is not taken as available.
   - **BlueZ only with privacy on.** Without the controller's privacy
     (`Privacy = device` in `/etc/bluetooth/main.conf`), BlueZ advertises
     and opens channels from the adapter's fixed public address, which
@@ -1535,8 +1531,6 @@ Not implemented yet (the next milestone):
     that cannot be read, from `main.conf`; without it the radio is not
     used, and `why_not` says how to turn it on. Android advertises and
     connects from resolvable private addresses already.
-  - **A short tag** matches only `keyed_hash(k, nonce4)[..6]`. Service
-    data of 12 bytes is the legacy form; of 2 + 16n, the extended one.
   - **One channel, every key at once.** A tag says whose device, not
     which: own devices' or a contact's device is dialled
     by opening one channel and starting a handshake to each of the

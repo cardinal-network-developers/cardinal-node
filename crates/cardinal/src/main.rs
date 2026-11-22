@@ -1346,6 +1346,13 @@ fn print_bluetooth(b: &Value) {
         "not on now".to_owned()
     };
     println!("Bluetooth: {when} (`cardinal bluetooth off|open|always`); {now}.");
+    if b["too_old"] == json!(true) {
+        println!(
+            "  This device's Bluetooth is too old for Cardinal to find people nearby. Wi-Fi and \
+             the internet still work."
+        );
+        return;
+    }
     match (&b["available"], b["why_not"].as_str()) {
         (Value::Bool(true), _) => {
             let radio = b["radio"].as_str().unwrap_or("a radio");
