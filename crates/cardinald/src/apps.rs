@@ -1451,11 +1451,15 @@ pub fn revoke(d: &Arc<Daemon>, id: &str) -> anyhow::Result<Json> {
     Ok(json!({}))
 }
 
+/// A space offered: its id, the name it was offered by, who offered it,
+/// and its application's title and sentence where the space says them.
+type Offered = (SpaceId, String, String, Option<(String, String)>);
+
 /// The spaces of applications offered to this person and not yet taken:
 /// (space, name, from, the application's title and sentence).
-fn offers(core: &Core) -> Vec<(SpaceId, String, String, Option<(String, String)>)> {
+fn offers(core: &Core) -> Vec<Offered> {
     let declined = core.declined();
-    let mut out: Vec<(SpaceId, String, String, Option<(String, String)>)> = Vec::new();
+    let mut out: Vec<Offered> = Vec::new();
     for c in core.contacts().into_iter().filter(|c| !c.refused) {
         for o in core.offers_from(&c.identity) {
             let Some(sp) = core.spaces.get(&o.space).and_then(|h| h.space.as_ref()) else {
