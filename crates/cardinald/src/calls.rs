@@ -901,17 +901,20 @@ pub fn current(d: &Daemon) -> Json {
             c.id,
         )
     };
-    let (linked, people, frames) = if group {
+    let (linked, people, frames, heard) = if group {
         let gs = groups(d);
         let g = gs.get(&id);
+        let now = Instant::now();
         (
             Some(g.map_or(0, |g| g.tree.links())),
-            Some(g.map_or(1, |g| g.tree.on_it(Instant::now()))),
+            Some(g.map_or(1, |g| g.tree.on_it(now))),
             g.map(|g| json!({"in": g.frames_in, "new": g.frames_new})),
+            g.map(|g| g.tree.others_heard(now)),
         )
     } else {
-        (None, None, None)
+        (None, None, None, None)
     };
+    let voices = heard.map(|heard| voices(d, &space, &heard));
     // the picture this person sees for them, if any
     let picture = {
         let contacts = d.core().contacts();
@@ -929,9 +932,53 @@ pub fn current(d: &Daemon) -> Json {
         "linked": linked,
         "people": people,
         "frames": frames,
+        "voices": voices,
         "offered": offered,
         "taken": taken,
     }, "ended": ended})
+}
+
+/// Who each voice heard on a group call is, as this person knows them:
+/// `voice`, as a frame's `from` says it; `identity`, the start of the
+/// person's id, as `contacts` and `group-members` give it; `name`, this
+/// person's name for them, or else the group's; `contact`; `picture`,
+/// a contact's; and `you`, a device of this person's own. A voice is named
+/// only for a device key in the log of a member of the group, as held here,
+/// the key its frames were checked against: a voice heard that no member's
+/// log has a key for is left out, since nothing says whose it is.
+fn voices(d: &Daemon, space: &SpaceId, heard: &[Voice]) -> Vec<Json> {
+    let owners = device_owners(d, space);
+    let core = d.core();
+    let Some(sp) = core.spaces.get(space).and_then(|h| h.space.as_ref()) else {
+        return Vec::new();
+    };
+    let Some(me) = core.identity.as_ref().map(|i| i.id()) else {
+        return Vec::new();
+    };
+    let members = cardinal_space::group::members(sp);
+    let contacts = core.contacts();
+    heard
+        .iter()
+        .filter_map(|v| {
+            let who = owners.get(v)?;
+            let you = *who == me;
+            // named as `group-members` names them: "You", this person's
+            // name for a contact not refused, or else the group's
+            let name = crate::groups::name_of(&me, &contacts, &members, who);
+            let known = (!you && !cardinal_space::account::refused(&contacts, who))
+                .then(|| contacts.iter().find(|c| c.identity == *who))
+                .flatten();
+            let picture = known.and_then(|c| crate::names::shown(d, c).remove("picture"));
+            Some(json!({
+                "voice": hex::encode(v),
+                "identity": hex::encode(&who[..8]),
+                "name": name,
+                "contact": known.is_some(),
+                "picture": picture,
+                "you": you,
+            }))
+        })
+        .collect()
 }
 
 /// How many group calls this device carries for others, without its person.
@@ -1700,8 +1747,26 @@ fn key_of(d: &Daemon, id: &[u8; 16], voice: &Voice) -> Option<[u8; 32]> {
 /// The signing keys of the devices of a group's members, by voice, from
 /// their logs as held here.
 fn device_keys(d: &Daemon, space: &SpaceId) -> HashMap<Voice, [u8; 32]> {
+    member_devices(d, space)
+        .into_iter()
+        .map(|(v, key, _)| (v, key))
+        .collect()
+}
+
+/// The member whose device each voice of a group is, from their logs as
+/// held here: the same keys [`device_keys`] checks frames against.
+fn device_owners(d: &Daemon, space: &SpaceId) -> HashMap<Voice, [u8; 32]> {
+    member_devices(d, space)
+        .into_iter()
+        .map(|(v, _, who)| (v, who))
+        .collect()
+}
+
+/// Each device of a group's members: its voice, its signing key, and the
+/// member, from their logs as held here.
+fn member_devices(d: &Daemon, space: &SpaceId) -> Vec<(Voice, [u8; 32], [u8; 32])> {
     let core = d.core();
-    let mut out = HashMap::new();
+    let mut out = Vec::new();
     let Some(sp) = core.spaces.get(space).and_then(|h| h.space.as_ref()) else {
         return out;
     };
@@ -1717,7 +1782,7 @@ fn device_keys(d: &Daemon, space: &SpaceId) -> HashMap<Voice, [u8; 32]> {
             continue;
         }
         for k in state.keys.values().filter(|k| k.link_key.is_some()) {
-            out.insert(mesh::voice_of(&k.key), k.key);
+            out.push((mesh::voice_of(&k.key), k.key, m));
         }
     }
     out
@@ -1756,6 +1821,8 @@ fn passed(d: &Arc<Daemon>, from: &Session, id: &[u8; 16], bytes: Bytes) {
     // a key known here was made up by the device that sent it: that link is
     // let go. One whose key is not known here yet only goes nowhere.
     let forged = new && !genuine && key.is_some();
+    // a voice newly on the call changes who `call` says is on it
+    let mut came = false;
     let (got, to, hear, went_live, confirmed, label, routing) = {
         let mut gs = groups(d);
         let Some(g) = gs.get_mut(id) else { return };
@@ -1766,9 +1833,11 @@ fn passed(d: &Arc<Daemon>, from: &Session, id: &[u8; 16], bytes: Bytes) {
             g.sessions.remove(&ps);
             return;
         }
+        let was = g.tree.heard_lately(&voice, now);
         let got = g.tree.on_frame(&ps, voice, n, here, genuine, now);
         if got.fresh {
             g.pictures.came(voice, ps, now);
+            came = !was && g.tree.own().is_some();
         }
         g.frames_in += 1;
         g.frames_new += u64::from(got.fresh);
@@ -1808,6 +1877,9 @@ fn passed(d: &Arc<Daemon>, from: &Session, id: &[u8; 16], bytes: Bytes) {
     }
     if confirmed {
         tokio::spawn(switch_to(d.clone(), *id));
+    }
+    if came {
+        d.bump();
     }
 }
 

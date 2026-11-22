@@ -712,6 +712,26 @@ impl Tree {
             .count()
     }
 
+    /// The voices of the others on the call, heard lately: each only ever
+    /// counted from a frame whose signature held.
+    pub fn others_heard(&self, now: Instant) -> Vec<Voice> {
+        let mut out: Vec<Voice> = self
+            .heard
+            .iter()
+            .filter(|(v, t)| Some(**v) != self.own && now.duration_since(**t) < ON_IT_FOR)
+            .map(|(v, _)| *v)
+            .collect();
+        out.sort();
+        out
+    }
+
+    /// Whether `voice` was heard lately.
+    pub fn heard_lately(&self, voice: &Voice, now: Instant) -> bool {
+        self.heard
+            .get(voice)
+            .is_some_and(|t| now.duration_since(*t) < ON_IT_FOR)
+    }
+
     /// How many are on the call: the others, and its own person if on it.
     pub fn on_it(&self, now: Instant) -> usize {
         self.others(now) + usize::from(self.own.is_some())

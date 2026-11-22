@@ -919,3 +919,172 @@ fn in_a_mesh_each_window_gets_the_sizes_it_asked_for() {
     }
     assert!(given[3].pictures.is_empty(), "dee asked for nothing");
 }
+
+/// Who is on a group call, by voice, as `call` gives it: `voice` to
+/// `(name, identity, contact, you)`.
+fn voices(d: &Dev) -> HashMap<String, (String, String, bool, bool)> {
+    let c = call(d);
+    let Some(l) = c["voices"].as_array() else {
+        return HashMap::new();
+    };
+    l.iter()
+        .map(|v| {
+            let s = |k: &str| v[k].as_str().unwrap_or_default().to_owned();
+            (
+                s("voice"),
+                (
+                    s("name"),
+                    s("identity"),
+                    v["contact"] == true,
+                    v["you"] == true,
+                ),
+            )
+        })
+        .collect()
+}
+
+/// This person's name for each member of a group, by the start of their id.
+fn names_in(d: &Dev, g: &str) -> HashMap<String, (String, bool)> {
+    let m = ask(d, json!({"cmd": "group-members", "group": g}));
+    m["members"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| {
+            let s = |k: &str| m[k].as_str().unwrap_or_default().to_owned();
+            (s("id"), (s("name"), m["contact"] == true))
+        })
+        .collect()
+}
+
+/// Four on a group call: Carol knows everyone, Ana knows Carol and Dee but
+/// not Ben. Each window is told, for every voice it hears, whose it is:
+/// a contact by this person's name for them, someone else by the group's,
+/// and the `from` of a voice's sound is one of them.
+#[test]
+fn a_group_call_says_whose_each_voice_is() {
+    let root = tempfile::tempdir().unwrap();
+    let carol = person(root.path(), "carol");
+    let ana = person(root.path(), "ana");
+    let ben = person(root.path(), "ben");
+    let dee = person(root.path(), "dee");
+    plugged_in(&carol, true);
+    for d in [&ana, &ben, &dee] {
+        plugged_in(d, false);
+    }
+    meet(&carol, &ana);
+    meet(&carol, &ben);
+    meet(&carol, &dee);
+    meet(&ana, &dee);
+    let g = group(&carol, &[&ana, &ben, &dee]);
+    ask(&carol, json!({"cmd": "call-start", "group": g}));
+    for d in [&ana, &ben, &dee] {
+        wait("rung", 20, || standing(d) == "ringing");
+        ask(d, json!({"cmd": "call-answer"}));
+    }
+    let all = [&carol, &ana, &ben, &dee];
+    wait("each hears the three others", 30, || {
+        all.iter().all(|d| voices(d).len() == 3)
+    });
+    for d in all {
+        let names = names_in(d, &g);
+        let v = voices(d);
+        let mut ids: Vec<&String> = v.values().map(|w| &w.1).collect();
+        ids.sort();
+        ids.dedup();
+        assert_eq!(ids.len(), 3, "{}: three people, {v:?}", d.name);
+        for (name, id, contact, you) in v.values() {
+            assert!(!you, "{}: no device of its own on it", d.name);
+            let (n, c) = &names[id];
+            assert_eq!((name, contact), (n, c), "{}: {v:?} {names:?}", d.name);
+            assert_ne!(name, "You");
+        }
+        let contacts = v.values().filter(|w| w.2).count();
+        let want = match d.name {
+            "carol" => 3,
+            "ana" | "dee" => 2,
+            _ => 1,
+        };
+        assert_eq!(contacts, want, "{}: {v:?}", d.name);
+    }
+    let named = |d: &Dev, who: &str| voices(d).values().any(|w| w.0 == who && w.2);
+    assert!(
+        named(&ana, "Carol") && named(&ana, "Dee"),
+        "{:?}",
+        voices(&ana)
+    );
+    let ben_to_ana = voices(&ana).into_values().find(|w| !w.2).unwrap();
+    assert_eq!(ben_to_ana.0, names_in(&ana, &g)[&ben_to_ana.1].0);
+
+    // what Ben says comes to Ana from the voice named as his
+    let mut lines = [Line::open(&ana, 1), Line::open(&ben, 2)];
+    for _ in 0..50 {
+        lines[1].say();
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let mut from = None;
+    while let Some(f) = lines[0].m.next() {
+        if f["audio"].is_string() {
+            from = f["from"].as_str().map(str::to_owned);
+            break;
+        }
+    }
+    let from = from.expect("ana heard ben");
+    assert_eq!(voices(&ana)[&from].1, ben_to_ana.1, "{:?}", voices(&ana));
+}
+
+/// Ben is on a group call on two devices: the phone's voice is his own,
+/// named as he is, and Ana sees both as Ben.
+#[test]
+fn a_group_call_says_a_voice_is_another_device_of_ones_own() {
+    if !fuse_available() {
+        eprintln!("skipping: /dev/fuse or fusermount3 is not available");
+        return;
+    }
+    let root = tempfile::tempdir().unwrap();
+    let ana = person(root.path(), "ana");
+    let ben = person(root.path(), "ben");
+    let cy = person(root.path(), "cy");
+    plugged_in(&ana, false);
+    plugged_in(&ben, false);
+    plugged_in(&cy, false);
+    meet(&ana, &ben);
+    meet(&ana, &cy);
+    let g = group(&ana, &[&ben, &cy]);
+    let phone = start_paired(root.path(), &ben);
+    plugged_in(&phone, false);
+    wait("ben's phone has the group", 60, || {
+        let v = reply(&phone, &json!({"cmd": "groups"}));
+        v["groups"].as_array().is_some_and(|g| !g.is_empty())
+    });
+    wait("ben's phone reaches ana", 60, || {
+        reply(&phone, &json!({"cmd": "contacts"}))["contacts"][0]["connected"] == true
+    });
+
+    ask(&ana, json!({"cmd": "call-start", "group": g}));
+    wait("ben and cy ring", 20, || {
+        standing(&ben) == "ringing" && standing(&cy) == "ringing"
+    });
+    ask(&ben, json!({"cmd": "call-answer"}));
+    ask(&cy, json!({"cmd": "call-answer"}));
+    wait("the phone stops ringing", 20, || {
+        standing(&phone).is_empty()
+    });
+    // and Ben joins it from the phone as well
+    ask(&phone, json!({"cmd": "call-start", "group": g}));
+    wait("ana hears three voices", 40, || voices(&ana).len() == 3);
+    wait("ben hears his phone", 40, || {
+        voices(&ben).values().any(|w| w.3)
+    });
+    let mine = voices(&ben);
+    let own: Vec<_> = mine.values().filter(|w| w.3).collect();
+    assert_eq!(own.len(), 1, "{mine:?}");
+    assert_eq!(own[0].0, "You");
+    assert!(!own[0].2, "his own is not a contact");
+    let at_ana = voices(&ana);
+    let bens: Vec<_> = at_ana.values().filter(|w| w.0 == "Ben").collect();
+    assert_eq!(bens.len(), 2, "{at_ana:?}");
+    assert_eq!(bens[0].1, bens[1].1, "one person");
+    assert!(bens.iter().all(|w| w.2 && !w.3));
+    assert_eq!(own[0].1, bens[0].1, "the same person, as each names them");
+}
