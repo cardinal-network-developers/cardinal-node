@@ -5,8 +5,8 @@
 //! what this implementation produces.
 
 use cardinal_sync::{
-    fingerprint, identity_log_label, BlobReply, BlobRequest, Bundle, Id, MemSet, Message, Mode,
-    Range, Reconciler, SetStore, Sum,
+    fingerprint, identity_log_label, summary_messages, BlobReply, BlobRequest, Bundle, Id, MemSet,
+    Message, Mode, Range, Reconciler, SetStore, Sum,
 };
 use serde_json::{json, Value as Json};
 
@@ -61,7 +61,7 @@ fn sync_vectors() {
     let first = ra.initiate();
     let half = MemSet::from_unsorted(ids[..20].to_vec());
     let mut rb = Reconciler::new(label, &half);
-    let reply = rb.handle(&first).unwrap().unwrap();
+    let reply = rb.handle(&first).unwrap().remove(0);
     let small = MemSet::from_unsorted(ids[..3].to_vec());
     let list_first = Reconciler::new(label, &small).initiate();
 
@@ -85,7 +85,20 @@ fn sync_vectors() {
                 mode: Mode::Fingerprint([7; 16]),
             },
         ],
+        end: true,
     };
+    let part = Message::Reconcile {
+        label,
+        ranges: vec![Range {
+            upper: Some(ids[3]),
+            mode: Mode::Skip,
+        }],
+        end: false,
+    };
+    let three = MemSet::from_unsorted(ids[..3].to_vec());
+    let nonce = fixed32("sync nonce");
+    let summary = &summary_messages(label, &three, nonce, 64, 1 << 16)[0];
+    let nothing = &summary_messages(label, &MemSet::new(), nonce, 56, 1 << 16)[0];
     let request = BlobRequest {
         ids: vec![ids[0], ids[1]],
     };
@@ -94,7 +107,7 @@ fn sync_vectors() {
     check_or_write(
         "sync.json",
         json!({
-            "description": "Sync (sync.md). Ids are BLAKE3(\"cardinal test vector \" || \"sync id {i}\"). sum = sum of ids as 256-bit little-endian integers mod 2^256, 32 bytes LE; fingerprint = first16(BLAKE3(sum || varint(count))). Messages are canonical encodings.",
+            "description": "Sync (sync.md). Ids are BLAKE3(\"cardinal test vector \" || \"sync id {i}\"); the summaries' nonce is BLAKE3(\"cardinal test vector \" || \"sync nonce\"), short ids its keyed hash of each id, cut and sorted. sum = sum of ids as 256-bit little-endian integers mod 2^256, 32 bytes LE; fingerprint = first16(BLAKE3(sum || varint(count))). Messages are canonical encodings.",
             "fingerprints": [fp(0), fp(1), fp(2), fp(40)],
             "sum_wraps": {
                 "a": hx([0xffu8; 32]),
@@ -111,6 +124,9 @@ fn sync_vectors() {
                 "reply_holding_first_20": hx(reply.encode()),
                 "initiate_3_ids": hx(list_first.encode()),
                 "ranges_example": hx(range_example.encode()),
+                "turn_goes_on": hx(part.encode()),
+                "summary_3_ids_64_bits": hx(summary.encode()),
+                "summary_nothing_held": hx(nothing.encode()),
                 "want": hx(Message::Want { label, ids: vec![ids[0], ids[1]] }.encode()),
                 "objects": hx(objects.encode()),
                 "heads": hx(Message::Heads { label, ids: vec![ids[2]] }.encode()),

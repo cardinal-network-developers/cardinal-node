@@ -101,15 +101,13 @@ async fn reconcile(s: &Session, label: [u8; 32], have: MemSet) -> Vec<[u8; 32]> 
             break;
         };
         let Some(r) = v.as_record() else { break };
-        let Ok(Message::Reconcile { ranges, .. }) = Message::from_record(r) else {
+        let Ok(m @ Message::Reconcile { .. }) = Message::from_record(r) else {
             break;
         };
-        match rec.receive(&ranges).unwrap() {
-            Some(reply) => st
-                .send_message(&Value::Record(reply.to_record()))
+        for reply in rec.handle(&m).unwrap() {
+            st.send_message(&Value::Record(reply.to_record()))
                 .await
-                .unwrap(),
-            None => break,
+                .unwrap();
         }
     }
     let _ = st.shutdown().await;
@@ -227,7 +225,9 @@ fn answer(s: Session, sets: Sets) -> mpsc::UnboundedReceiver<Stream> {
                     return;
                 };
                 match m {
-                    Message::Reconcile { label, mut ranges } => {
+                    m @ Message::Reconcile { .. } => {
+                        let label = *m.label();
+                        let mut m = m;
                         if STALL.lock().unwrap().contains(&label) {
                             tokio::time::sleep(Duration::from_secs(10)).await;
                         }
@@ -238,20 +238,22 @@ fn answer(s: Session, sets: Sets) -> mpsc::UnboundedReceiver<Stream> {
                             }
                         }
                         let mut rec = Reconciler::new(label, set);
-                        while let Ok(Some(reply)) = rec.receive(&ranges) {
-                            let _ = st.send_message(&Value::Record(reply.to_record())).await;
+                        while let Ok(turn) = rec.handle(&m) {
+                            for reply in turn {
+                                let _ = st.send_message(&Value::Record(reply.to_record())).await;
+                            }
                             if rec.is_done() {
                                 break;
                             }
                             let Ok(Some(v)) = st.recv_message_max(1 << 24).await else {
                                 break;
                             };
-                            let Some(Ok(Message::Reconcile { ranges: r, .. })) =
+                            let Some(Ok(next @ Message::Reconcile { .. })) =
                                 v.as_record().map(Message::from_record)
                             else {
                                 break;
                             };
-                            ranges = r;
+                            m = next;
                         }
                         let _ = st.shutdown().await;
                     }

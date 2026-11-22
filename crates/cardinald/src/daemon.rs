@@ -301,6 +301,9 @@ pub struct Daemon {
     pub conditions: crate::conditions::Conditions,
     /// When each contact rang lately, so they can ring only so often.
     pub rang: Mutex<HashMap<[u8; 32], std::collections::VecDeque<Instant>>>,
+    /// What this device lacks of each set, which peers hold it and which
+    /// is being asked, so `want`s spread across peers (`sync.md#fetching-objects`).
+    pub spread: Mutex<cardinal_sync::Spread<[u8; 32]>>,
     /// The person's grant to inspect what this device holds, if any
     /// (`inspect.rs`): in memory only, so a restart ends it.
     pub inspection: crate::inspect::Inspection,
@@ -558,6 +561,7 @@ impl Daemon {
             passed_rings: Mutex::new(std::collections::VecDeque::new()),
             conditions: crate::conditions::Conditions::default(),
             rang: Mutex::new(HashMap::new()),
+            spread: Mutex::new(cardinal_sync::Spread::new()),
             inspection: Default::default(),
             _lock: lock,
             call_audio: tokio::sync::broadcast::channel(64).0,
