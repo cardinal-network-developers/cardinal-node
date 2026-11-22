@@ -27,10 +27,6 @@ use crate::keys::Keys;
 use crate::net::{self, Access};
 use crate::paths::{write_private, Paths};
 
-/// What a contact may fetch from here, and the size of the space it was
-/// worked out from.
-pub type SharedBlobs = (usize, Arc<HashSet<[u8; 32]>>);
-
 /// Who a session's peer is.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PeerKind {
@@ -300,8 +296,6 @@ pub struct Daemon {
     pub conditions: crate::conditions::Conditions,
     /// When each contact rang lately, so they can ring only so often.
     pub rang: Mutex<HashMap<[u8; 32], std::collections::VecDeque<Instant>>>,
-    /// What each contact may fetch from here.
-    pub shared_blobs: Mutex<HashMap<[u8; 32], SharedBlobs>>,
     /// The person's grant to inspect what this device holds, if any
     /// (`inspect.rs`): in memory only, so a restart ends it.
     pub inspection: crate::inspect::Inspection,
@@ -559,7 +553,6 @@ impl Daemon {
             passed_rings: Mutex::new(std::collections::VecDeque::new()),
             conditions: crate::conditions::Conditions::default(),
             rang: Mutex::new(HashMap::new()),
-            shared_blobs: Mutex::new(HashMap::new()),
             inspection: Default::default(),
             _lock: lock,
             call_audio: tokio::sync::broadcast::channel(64).0,

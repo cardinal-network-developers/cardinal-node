@@ -148,16 +148,15 @@ below, each under its section.
 
 ## Blobs (`spec/blobs.md`)
 
-- **A contact is served only what this person put in what they share.**
-  `sync.md#blob-transfer` serves any peer with a session, since an id is the
-  right to fetch it. Here a person's own devices get anything, and a contact
-  only the chunks and indexes of this person's attachments, and of content
-  this person wrote in the shared folder, in the space shared with them, so
-  one who knew the id of a private chunk would still not get it. What a
-  contact put there themselves comes from their devices. In a group, a
-  member who is a contact gets every file the group's messages carry that
-  this device holds, whoever sent it, since members who do not know each
-  other get files through one who knows both, who keeps them.
+- **Who is served chunks** (`sync.md#blob-transfer`; D81 brought this in
+  line, the node had served a contact only this person's attachments and
+  shared-folder content in what the two share). Knowing an id is the right
+  to fetch it: a person's own devices and every contact with a session get
+  whatever this device holds of the ids they ask for, from whatever space
+  the reference came in, or none ("send this file to Ben"). A token's
+  session, which reaches this device as a host, gets no chunk: a host
+  serves token holders only the stored sets the owner allowed, and this
+  node keeps none for anyone. Nor does someone not a contact yet.
 - **What current state references** (`blobs.md#retention`,
   `fetch::state_blobs`). Every blob reference, found by its shape at any
   depth, in every value a field holds now (each of them where a field is
@@ -182,10 +181,6 @@ below, each under its section.
     so `free-space --unnamed` leaves it too.
   - **Reading: a full holder.** Retention here is one setting for the
     device (`retention` in `config.toml`), not one per space.
-  - **Reading: what a contact is served** follows what they now fetch: in
-    a relationship, also every reference in a value this person wrote
-    there, and in a group everything its state references (see the first
-    item of this section).
   - A record that only looks like a reference is fetched like one, and
     stays wanted for as long as nobody has it. In the account space
     nothing is looked for.

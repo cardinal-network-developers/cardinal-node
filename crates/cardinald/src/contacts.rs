@@ -14,7 +14,7 @@ use std::time::Duration;
 
 use std::collections::HashSet;
 
-use cardinal_blob::{BlobReader, BlobRef, BlobWriter, ConvergenceSecret, NoFetch};
+use cardinal_blob::{BlobReader, BlobRef, BlobWriter, ConvergenceSecret};
 use cardinal_contact::{ContactMessage, EndpointAddr, Invitation};
 use cardinal_encoding::Value;
 use cardinal_link::{CarrierKind, Priority, SecretEntry, Service, Session, Stream, Target};
@@ -1169,136 +1169,6 @@ pub(crate) async fn encode_attachments(
         Ok(out)
     })
     .await?
-}
-
-/// The objects of the files this person attached in the space shared with
-/// `who`: all a contact may fetch from here (`sync.md#blob-transfer`). Only
-/// this person's own: a reference the contact wrote could name anything.
-/// Worked out again only when the space has grown, and away from the runtime.
-pub async fn shared_blobs(d: &Arc<Daemon>, who: &[u8; 32]) -> Arc<HashSet<[u8; 32]>> {
-    let size = {
-        let core = d.core();
-        let contacts = core.contacts();
-        let space = contacts
-            .iter()
-            .find(|c| c.identity == *who)
-            .map(|c| c.space);
-        // And the groups the two are in: what a group's messages carry is
-        // every member's, whoever sent it, since members who do not know
-        // each other get it through one who knows both.
-        let groups = core.groups_shared_with(who);
-        let seen: usize = groups
-            .iter()
-            .filter_map(|g| core.spaces.get(g))
-            .map(|h| h.set_len())
-            .sum();
-        // What this device holds of other members' files changes with no
-        // new entry, so with groups the answer is worked out again every few
-        // seconds.
-        let lately = if groups.is_empty() {
-            0
-        } else {
-            (crate::core::now_ms() / 5000) as usize
-        };
-        space
-            .and_then(|s| core.spaces.get(&s))
-            .map(|h| (h.id, (h.set_len() + seen) ^ (lately << 24), groups))
-    };
-    let Some((space, size, groups)) = size else {
-        return Arc::default();
-    };
-    {
-        let cache = d.shared_blobs.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some((_, ids)) = cache.get(who).filter(|(was, _)| *was == size) {
-            return ids.clone();
-        }
-    }
-    let (d, who) = (d.clone(), *who);
-    let worked_out = tokio::task::spawn_blocking(move || {
-        let blobs = shared_refs(&d.core(), &space, &groups);
-        let (mut files, mut ids) = (HashSet::new(), HashSet::new());
-        for blob in blobs {
-            // The same file attached again is the same objects.
-            if !files.insert(blob.id) {
-                continue;
-            }
-            // What this device holds of it: an index it has not got names nothing.
-            let mut reader = BlobReader::new(&*d.store, &NoFetch, blob);
-            let _ = reader.for_each_object(|id| {
-                ids.insert(*id);
-            });
-        }
-        let ids = Arc::new(ids);
-        let mut cache = d.shared_blobs.lock().unwrap_or_else(|e| e.into_inner());
-        cache.insert(who, (size, ids.clone()));
-        ids
-    });
-    worked_out.await.unwrap_or_default()
-}
-
-/// The blobs a contact may fetch from here: those of the files this person
-/// attached in the relationship `space`, of what they put in its shared
-/// folder, and of whatever else they wrote there that current state
-/// references, which is the content of kinds this build does not know and
-/// the other's devices fetch all the same (`blobs.md#retention`). Only
-/// this person's own: a reference the contact wrote could name anything.
-/// And of each of `groups`, everything its messages carry and its current
-/// state references, whoever wrote it.
-pub fn shared_refs(core: &Core, space: &SpaceId, groups: &[SpaceId]) -> Vec<BlobRef> {
-    let me = core.identity.as_ref().map(|i| i.id());
-    let open = core.spaces.get(space).and_then(|h| h.space.as_ref());
-    let all = open.map(relationship::messages).unwrap_or_default();
-    let mine = all.into_iter().filter(|m| Some(m.author) == me);
-    let attached = mine
-        .flat_map(|m| m.attachments)
-        .filter_map(|a| BlobRef::from_record(&a.blob).ok());
-    // and what this person put in the shared folder
-    let put = open
-        .map(|sp| shared_folder_content(sp, me))
-        .unwrap_or_default();
-    let other = match (open, me) {
-        (Some(sp), Some(me)) => crate::fetch::state_blobs_by(sp, Some(me)),
-        _ => Vec::new(),
-    };
-    let spaces = groups.iter();
-    let spaces = spaces.filter_map(|g| core.spaces.get(g).and_then(|h| h.space.as_ref()));
-    let in_groups = spaces.flat_map(|sp| {
-        let carried = relationship::messages(sp).into_iter();
-        let carried = carried
-            .flat_map(|m| m.attachments)
-            .filter_map(|a| BlobRef::from_record(&a.blob).ok());
-        // and a successor's initial state, for a member added to it since,
-        // who holds no space it could work it out from
-        let initial = sp.succession().and_then(|s| s.initial_state.as_ref());
-        let initial = initial.and_then(|r| BlobRef::from_record(r).ok());
-        carried.chain(crate::fetch::state_blobs(sp)).chain(initial)
-    });
-    let own = attached.chain(put).chain(other);
-    own.chain(in_groups).collect()
-}
-
-/// The content versions of the shared folder's files that `me` wrote.
-fn shared_folder_content(space: &cardinal_space::Space, me: Option<[u8; 32]>) -> Vec<BlobRef> {
-    use cardinal_space::files::{Content, FileKind, Files};
-    let files = Files::new(space);
-    let mut out = Vec::new();
-    let mut stack = vec![cardinal_space::ROOT];
-    while let Some(dir) = stack.pop() {
-        for e in files.list(&dir) {
-            match e.kind {
-                FileKind::Folder => stack.push(e.node),
-                FileKind::File if e.conflict_version.is_none() => {
-                    for v in files.content(&e.node) {
-                        if let (Some(Content::Blob(b)), true) = (v.content, Some(v.author) == me) {
-                            out.push(crate::fetch::blob_ref(&b));
-                        }
-                    }
-                }
-                _ => {}
-            }
-        }
-    }
-    out
 }
 
 /// Writes a whole blob to `out`, and says how much.

@@ -6254,10 +6254,8 @@ mod tests {
         assert_eq!(of(&|_| false, false), [(None, 9)]);
         assert_eq!(of(&|w| *w == a, true), []);
 
-        // What one fetches another serves. Between two people each gives
-        // what they wrote there themselves, since a reference the other
-        // wrote could name anything; in a group, a member gets whatever
-        // its state holds.
+        // Between two people each fetches all of it, in full, from the
+        // other: what each wrote, and what the other did.
         ana.meets(&bo);
         bo.meets(&ana);
         let (rel, genesis) = ana.core.create_relationship(&bo.id()).unwrap();
@@ -6268,18 +6266,6 @@ mod tests {
         let his = odd("his", ROOT, held(12));
         let (_, his) = bo.core.write_entry(&rel, vec![his]).unwrap();
         ana.core.ingest_space(rel, &[his]).unwrap();
-        let serves = |p: &Person, groups: &[SpaceId]| {
-            let all = crate::contacts::shared_refs(&p.core, &rel, groups);
-            let mut ids: Vec<u8> = all.iter().map(|b| b.id[0]).collect();
-            ids.sort();
-            ids.dedup();
-            ids
-        };
-        assert_eq!(serves(&ana, &[]), [11]);
-        assert_eq!(serves(&bo, &[]), [12]);
-        assert_eq!(serves(&ana, &[g]), [9, 11]);
-        assert_eq!(serves(&bo, &[g]), [9, 12]);
-        // And each fetches all of it, in full.
         let sp = bo.space(&rel);
         let all = crate::fetch::wanted(sp, Vec::new(), false, &nothing);
         assert_eq!(ids(all), [11, 12]);

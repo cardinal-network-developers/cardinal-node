@@ -416,7 +416,7 @@ fn a_contact_opens_what_they_share_and_nothing_else() {
     let private_file: Vec<u8> = (0..3_000_000u32).map(|n| (n * 7 % 251) as u8).collect();
     std::fs::write(ana.p("private.bin"), &private_file).unwrap();
     ana.cli(&["flush"]);
-    // Taken now: one of what Ana sends bo below would be served to him.
+    // Taken now: a chunk of her own files, in no space she shares with bo.
     let chunk = a_chunk(&ana.home.join("blobs"));
     contacts(&ana, &bo);
     bo.cli(&["say", "Ana", "an honest word"]);
@@ -483,16 +483,19 @@ fn a_contact_opens_what_they_share_and_nothing_else() {
         blob.send_message_bytes(&wanted.encode()).await.unwrap();
         let _ = blob.shutdown().await;
         let got = tokio::time::timeout(Duration::from_secs(3), blob.recv_message_max(1 << 24));
-        // A contact may be served what is attached in what they share, and is
-        // told that anything else is not held.
-        if let Ok(Ok(Some(v))) = got.await {
-            let reply = BlobReply::decode(&v.encode()).unwrap();
-            let held = reply
-                .items
-                .iter()
-                .any(|i| matches!(i, BlobItem::Held { .. }));
-            assert!(!held, "read a private chunk");
-        }
+        // A chunk is served to a contact by its id alone, whatever space,
+        // if any, the reference came in (`sync.md#blob-transfer`, "send this
+        // file to Ben"): the id is unguessable, and the chunk useless
+        // without the key in a reference.
+        let Ok(Ok(Some(v))) = got.await else {
+            panic!("a contact was not served a chunk by its id");
+        };
+        let reply = BlobReply::decode(&v.encode()).unwrap();
+        let held = reply
+            .items
+            .iter()
+            .any(|i| matches!(i, BlobItem::Held { .. }));
+        assert!(held, "a contact was not served a chunk by its id");
 
         // An invitation is over once it is over.
         let hello = Record::new().with(0, 1u64).with(1, [1u8; 32]).with(2, "x");

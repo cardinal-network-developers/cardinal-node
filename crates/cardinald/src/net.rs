@@ -324,32 +324,19 @@ async fn handle_stream(d: &Arc<Daemon>, s: &Session, mut st: Stream) -> anyhow::
         return crate::mailbox::serve(d, s, st).await;
     }
     if st.service() == Service::BLOB {
-        let kind = d.session_kind(&s.peer_static());
-        let allowed = if may_fetch_blobs(kind) {
-            None
-        } else {
-            // Who it is now: an invitation's session is a contact's once
-            // the two have met, and goes on as theirs.
-            match d.classify(s) {
-                // A contact gets what was attached in the spaces they share.
-                PeerKind::Contact(who, _) => {
-                    let shared = crate::contacts::shared_blobs(d, &who).await;
-                    tracing::debug!(
-                        "{} may fetch {} objects of what was sent them",
-                        short(&who),
-                        shared.len()
-                    );
-                    Some(shared)
-                }
-                other => {
-                    tracing::debug!("no blobs for {} ({other:?})", short(&s.peer_static()));
-                    st.reset(0);
-                    return Ok(());
-                }
-            }
+        // Who it is now: an invitation's session is a contact's once the
+        // two have met, and goes on as theirs.
+        let kind = match d.session_kind(&s.peer_static()) {
+            k if may_fetch_blobs(k) => k,
+            _ => Some(d.classify(s)),
         };
+        if !may_fetch_blobs(kind) {
+            tracing::debug!("no blobs for {} ({kind:?})", short(&s.peer_static()));
+            st.reset(0);
+            return Ok(());
+        }
         tracing::trace!("blob stream {} accepted", st.id());
-        return serve_blob(d, st, allowed).await;
+        return serve_blob(d, st).await;
     }
     if st.service() == crate::speedtest::service() && crate::speedtest::offered() {
         return crate::speedtest::serve(d, s, st).await;
@@ -705,20 +692,23 @@ fn test_blob_delay() -> Option<u64> {
     })
 }
 
-/// Whether a peer may ask for objects by id. The store holds everything this
-/// device keeps, and nothing shared with anyone else has chunks yet, so only
-/// the person's own devices may.
+/// Whether a peer may ask for objects by id (`sync.md#blob-transfer`):
+/// chunk ids are unguessable and chunks useless without the key in a
+/// reference, so knowing an id is the right to fetch it, from a device with
+/// a session: the person's own devices, and contacts, whatever space the
+/// reference came in or none ("send this file to Ben"). Not a token's
+/// session, which reaches this device as a host: a host serves token
+/// holders only the stored sets the owner allowed, and this one keeps none
+/// for anyone. Nor someone not a contact yet.
 fn may_fetch_blobs(kind: Option<PeerKind>) -> bool {
-    matches!(kind, Some(PeerKind::Own(_) | PeerKind::Proven))
+    matches!(
+        kind,
+        Some(PeerKind::Own(_) | PeerKind::Proven | PeerKind::Contact(..))
+    )
 }
 
-/// Serves blob objects: everything this device holds, or with `allowed`, only
-/// those.
-async fn serve_blob(
-    d: &Arc<Daemon>,
-    mut st: Stream,
-    allowed: Option<Arc<HashSet<[u8; 32]>>>,
-) -> anyhow::Result<()> {
+/// Serves blob objects: whatever this device holds of those asked for.
+async fn serve_blob(d: &Arc<Daemon>, mut st: Stream) -> anyhow::Result<()> {
     let Some(v) = st.recv_message_max(1 << 20).await? else {
         return Ok(());
     };
@@ -738,9 +728,6 @@ async fn serve_blob(
         }
         req.serve(|id| {
             use cardinal_blob::ObjectStore;
-            if allowed.as_ref().is_some_and(|a| !a.contains(id)) {
-                return None;
-            }
             // being dropped: not counted as a copy by whoever asks
             if leaving
                 .lock()
@@ -1065,11 +1052,11 @@ mod tests {
     }
 
     #[test]
-    fn only_a_persons_own_devices_may_fetch_blobs() {
+    fn own_devices_and_contacts_may_fetch_blobs() {
         let someone = [1u8; 32];
         assert!(may_fetch_blobs(Some(PeerKind::Own(someone))));
         assert!(may_fetch_blobs(Some(PeerKind::Proven)));
-        assert!(!may_fetch_blobs(Some(PeerKind::Contact(someone, someone))));
+        assert!(may_fetch_blobs(Some(PeerKind::Contact(someone, someone))));
         assert!(!may_fetch_blobs(Some(PeerKind::Inviting(someone, None))));
         assert!(!may_fetch_blobs(Some(PeerKind::Token([1; 16]))));
         assert!(!may_fetch_blobs(Some(PeerKind::Restoring)));
