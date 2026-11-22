@@ -1617,6 +1617,11 @@ async fn keep_work_of(d: &Arc<Daemon>, key: &[u8; 32]) -> anyhow::Result<()> {
             d.push(space, vec![entry]);
         }
     }
+    // and its successions, which building on them does not keep
+    let kept = d.core().keep_successions_of(key);
+    for (space, bytes) in kept {
+        d.push(&space, vec![bytes]);
+    }
     Ok(())
 }
 

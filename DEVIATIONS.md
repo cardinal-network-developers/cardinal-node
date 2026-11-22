@@ -326,6 +326,13 @@ below, each under its section.
   the entry from the graph, which would strand its descendants). The same
   applies to an `add_key` of a device or admin key without a link key, of a
   root without a recovery public key, or with a power outside 1–3.
+- **A malformed ML-KEM public key makes its entry invalid** (designer,
+  2026-11-22). A hybrid public key whose ML-KEM part fails the FIPS 203
+  input check, or has the wrong length, makes the op that carries it
+  malformed: an `add_key`'s link or recovery key, the new key of a
+  `set_encryption_key`, a policy's guardian key, a `recover`'s link or
+  recovery key. Its entry is invalid, and stays in the graph
+  (`log.rs`, `a_malformed_ml_kem_key_makes_its_entry_invalid`).
 - **Spec ambiguity: the proof message for a key without a link key.** Roots
   have no link key; chose to append nothing for "encoding of link key".
 - **Spec ambiguity: contexts in the genesis entry.** Wraps, recovery wraps,
@@ -335,13 +342,22 @@ below, each under its section.
 - **Spec ambiguity: the wrapped "encryption private key material".** Chose
   the hybrid key pair's 96-byte secret: X25519 private key then the ML-KEM
   seed `d || z` (`HybridKeyPair::secret_bytes`).
-- **Spec ambiguity: the genesis protocol record and critical extensions.**
-  "Declared first" names `set_protocol`; chose that the genesis protocol
-  record (field 5) also declares the extensions it lists.
-- **Spec ambiguity: whether an unknown extension op is critical.** Only the
-  extension's document says. A verifier that lacks the document treats it
-  as critical, and evaluates with an empty set of known extensions, so it
-  stops at valid entries that use one (`IdentityState::stalled`).
+- **The protocol record marks each extension** (designer, ASK 3 = b,
+  2026-11-22; `evolution.md#critical-and-ignorable`). Field 2 is a list of
+  `{1: name, 2: critical}`, the mark false where absent; a record that names
+  one extension twice, or an item that is not such a record, is malformed,
+  and so is the `set_protocol`, `start` or genesis that carries it. An
+  extension op is critical for its entry if a protocol record in its causal
+  past or in it (a genesis's included) marks it so, and stays critical
+  after; ignorable otherwise, on every device, one that knows the extension
+  included. Ignorable, any key may use it and it changes no validity;
+  critical, only admin and root keys, and a verifier that does not know it
+  stops at the valid entries that use it (`IdentityState::stalled`). An
+  extension op no record declares reads as an op nobody defined, so its
+  entry is invalid. Nothing here knows any extension, so every verifier
+  here lacks them all. (Before, every unknown extension was taken for
+  critical.) Tested both ways in
+  `the_protocol_record_marks_each_extension_and_the_mark_decides`.
 - **Not checked: wrap completeness.** "`set_encryption_key` MUST include a
   wrap for every device and admin key effective in the entry's causal past"
   is not a validity rule in `model/rules.md`; it is not enforced on
@@ -377,9 +393,13 @@ differs or was read:
   key, naming fresh personas (each guardian, asked again, accepts with a
   persona not named by a policy of this person's that is in effect or still
   under way; one named only by a change given up serves again). Which
-  contact each policy named is kept in an account setting, `"guardians:
-  named "` and the policy's id, `contact:persona,...`, written before the
-  `set_recovery` itself. One change at a time: `set` refuses while a change
+  contact each policy named is kept in a **guardians node** (account kind
+  17, `profiles.md#account`, designer 2026-11-22): `1: the policy's entry
+  id; 2: list of {1: guardian identity, 2: persona}`, one for each
+  commitment in its order, written before the `set_recovery` itself. One
+  not written as its table says names nobody. (Before, an account setting
+  `"guardians: named "` with `contact:persona,...` in hex; a policy named
+  that way is no longer read, and has to be set again.) One change at a time: `set` refuses while a change
   is under way that the person has not objected to; an `object` on a
   change is how the person tells their guardians it is given up. The
   person's `cardinal guardians` shows each change under way with a
@@ -710,11 +730,20 @@ differs or was read:
   (else the keys removed), which `cardinal recover` keeps showing from
   `recovered.json`. Other spaces, the files space among them, come back
   only as their other holders are reached.
-- **Reading: what contacts are told.** `contacts` says, for a contact
-  whose log shows a recovery in effect, "was recovered by guardians they
-  chose, after DELAY. If in doubt, check with them in person." whenever it
-  lists them, not once. The spec gives "on" the date of the policy, but an
-  identity entry carries no time, so no date is given.
+- **What contacts are told** (designer, ASK 8 = b, 2026-11-22;
+  `identity.md#what-a-recovery-does`). `contacts` says, for a contact whose
+  log shows a recovery in effect, whenever it lists them: "was recovered by
+  guardians they had chosen by DAY, after DELAY. If in doubt, check with
+  them in person.", DAY being when this device first saw the policy the
+  recovery was decided under (`seen-policies.json`, now `{at,
+  with_recovery}` by policy; the time alone, as written before, reads as
+  seen before any recovery). Where this device first saw the policy with a
+  recovery under it already in the log, no day: "was recovered by
+  guardians, after DELAY. These guardians were new to this device when the
+  recovery came. Check with NAME another way." For clients, the contact
+  record carries `recovered_seen` (that time, in ms) and
+  `recovered_new_guardians` beside the text (`apps.md`, contact fields 15
+  and 16).
 - **Reading: keeping a lost device's work after a recovery.** A recovery
   that kept none of the old keys leaves everything they wrote unwitnessed,
   every space's genesis included; the spec lets the person keep "those
@@ -736,14 +765,26 @@ differs or was read:
   that time is kept there too, not only in the spaces held at the moment
   it was said (`recover-lost-at` sets it later); after the week only
   `keep-work` keeps more, since a thief sets the clock those entries give.
-  **Successions fall** (D81, Daniel 2026-11-21): a `succeed`, or a
-  successor's genesis and everything in that successor, that a removed key
-  wrote is never kept, neither as spaces arrive nor by `keep-work`
-  (`spaces.md#a-succession-by-a-device-that-is-later-removed`: it counts
-  only if a keep lists it, and the spec's keeps "before the removal" cannot
-  be written once no device survives). Nothing is asked: the old space
-  stands again, whoever followed returns to it, and the person redoes the
-  change by hand if it was theirs. **What a contact gives a recovered
+  **Successions nothing kept fall; those kept before the loss stand**
+  (D81, and the designer, 2026-11-22): a `succeed`, or a successor's
+  genesis and everything in that successor, that a removed key wrote is
+  never kept by the new device on its own, neither as spaces arrive nor by
+  `keep-work`. But a `keep` another of the person's devices wrote before
+  the loss (when they confirmed the succession there, or with a retired
+  device's work) is the person's work: the new device keeps every entry of
+  theirs, by a removed key, that holds a `keep`, whenever written
+  (`Core::keep_earlier_keeps`, as each space arrives, before the rest), and
+  what it kept stands again. So the old space's `succeed` counts, the
+  device follows the successor from the trail's genesis though that
+  genesis is still set aside (its cut is checked under the genesis's own
+  epoch), keeps the earlier `keep` of the genesis there, and the successor
+  stands. Nothing is asked: what nothing kept falls, the old space stands
+  again, whoever followed returns to it, and the person redoes the change
+  by hand if it was theirs (`core.rs`,
+  `a_succession_kept_before_the_loss_stands_after_a_recovery`, both ways).
+  A contact gives a recovered device a successor by the narrow path only
+  where an entry there of the person's, by a removed key, keeps its
+  genesis. **What a contact gives a recovered
   person** (`hosts.md#restore` says only that spaces "come back as their
   other holders are reached"; sync.md lets only members name a space, and
   after a recovery that kept no old key nothing the person wrote counts,
@@ -911,6 +952,10 @@ differs or was read:
   records, exactly as carried in sealed-entry field 4.
 - **The cited author log head** written by this implementation is the last
   entry in log order at which the signing key is in effect.
+- **Extension ops in a space are still allowed to no role**, declared or
+  not: the protocol records of a space are read as their table says (one
+  that is not written so makes its op one nobody defined), but not applied,
+  so no mark is honoured there yet.
 - **Not applied: `set_policy` and `set_protocol`.** They are judged, and the
   policy a space runs under is still the one its genesis gave it. Whether
   it is public would be the genesis's to say even if they were applied.
@@ -931,11 +976,15 @@ and a member added to the successor afterwards).
 What is not built:
 
 - **A succession by a device that is later removed**
-  (`spaces.md#a-succession-by-a-device-that-is-later-removed`). Nothing
-  writes a `keep` for a `succeed` or a successor's genesis: not when the
-  person confirms it on another device, not when a device is retired,
-  and not when one is lost (nothing shows the person what that device's
-  successions did); after a recovery they fall by design (D81, see
+  (`spaces.md#a-succession-by-a-device-that-is-later-removed`).
+  `Core::keep_succession` writes, on the person's word, the `keep` of a
+  `succeed` (on it) and of the successor's genesis that another of their
+  devices made, and a device retired (not lost) has its successions kept
+  so with its work (`keep_successions_of`). **Not built:** nothing shows the
+  person on their other devices what one device's successions did, so no
+  request asks to confirm one yet (the tests call it), and nothing shows a
+  lost device's successions before its removal. After a recovery, those
+  nothing kept fall, and those kept before the loss stand (see
   Guardians). Validity already says that an unkept one by a removed
   key does not count; a device then finds that no successor stands, takes
   the old space for current again and posts there what it wrote in the
@@ -1032,16 +1081,16 @@ Readings:
   carried message up to the one it stands at, by rank. A canonical state
   in which a parent is not a node it records, or a node is its own
   ancestor, is refused.
-- **Spec question: who wrote a carried value.** A group counts only an
-  admin's say on its name, its introductions and its member nodes, and
-  a canonical state does not say who wrote a value, so a value a writer
-  set on one of those, which counted for nothing, would count after any
-  succession. Here a carried value counts for nothing there by itself:
-  the owner's first entry in the successor sets each of those fields
-  again to what the old space resolved (`group::reassert_ops`), and that
-  entry is nobody's work to post again. Until it arrives a follower shows
-  no group name. The specification could instead say that the state at a
-  cut leaves out what does not count, or record each value's author.
+- **Admin-only values do not carry** (designer, ASK 9 = b, 2026-11-22;
+  `profiles.md#group`). A group counts only an admin's say on its name,
+  its introductions and its member nodes, and a canonical state does not
+  say who wrote a value, so in a successor the values those fields carried
+  count for nothing. The owner sets each of them again, to what the old
+  space resolved (`group::reassert_ops`), in the successor's **genesis**,
+  beside its `add_member`s, so a follower shows the group's name from the
+  genesis on. (Before, in the owner's first entry after it, and a follower
+  showed no name until that came.) A successor written before this, whose
+  first entry did it, still reads, and that entry is still nobody's work.
 - **Whom a successor names.** Every member of the group who has not
   left, with the highest role they hold, but whoever is taken out, and
   with the lower role for whoever is lowered. A member who had left is
@@ -1117,8 +1166,9 @@ Readings:
     reconciled it with a peer that holds it since it followed, or since
     it started: who is there is known only then, since someone added
     after the genesis may not have come with it. Entries of control ops
-    alone (a `succeed`, a `rotate`) and the owner's first entry in a
-    successor are nobody's work, and are neither posted nor held back.
+    alone (a `succeed`, a `rotate`), and the owner's first entry in a
+    successor written before the genesis set the admin-only values, are
+    nobody's work, and are neither posted nor held back.
   - "All were members of the space the work was written in" is read as:
     every member of the space that stands was ever a member of that space.
     Otherwise the work is held back, `groups` says how much, and
@@ -1202,6 +1252,34 @@ Readings:
   when the folder comes back. (Before, a delete flagged again what was
   already deleted, and such a file came back with its folder.) Views hide
   everything beneath a deleted node.
+- **A delete of what is already deleted does nothing** (designer,
+  2026-11-22). No flag is set and no delete conflict, whatever is
+  concurrent with it, so a file made in a deleted folder since its delete
+  is not flagged by a second delete, and comes back when the folder is
+  restored. (Before, a second delete flagged it, and it stayed deleted.)
+  Two deletes of one folder made at once still both yield, as before: each
+  names the folder, which touches it.
+- **The delete number** (designer, 2026-11-22; `state.md#canonical-state`;
+  `vectors/state.json`, `a_restore`). Field 6 of a node record in the
+  canonical state is 0 for a node not deleted, and otherwise the number of
+  the delete that took it, the same for every node one delete took,
+  counted from 1 in the order the records, sorted by node id, first reach
+  each delete. A canonical state numbered any other way is refused, as one
+  no device computes (a bool's `true` is the integer 1, so a state with one
+  delete written as before still reads). A successor's initial state is
+  read with each carried node's number, and a restore there clears the node
+  and every node carried with the same number. The
+  numbers are the canonical state's alone: a device keeps which op took a
+  node, and numbers the deletes afresh each time it writes the state.
+- **Reading: a restore of a node left in delete conflict** (the spec does
+  not say). A delete that yielded at N still took what beneath N nothing
+  touched; a restore of N brings that back, as a restore of a deleted N
+  brings back what its delete took, and clears N's delete conflict. A
+  successor does not learn of it: the canonical state numbers only deletes
+  that flagged their node, so there a restore of such an N clears its
+  delete conflict only. **Spec question:** whether the canonical state
+  should give a node left in delete conflict the number of the delete that
+  yielded there.
 - **Any kind, anywhere** (`state.md#operations`). A `create` is accepted
   whatever its kind and wherever it puts the node, and the files and
   account profiles reject nothing for kind or place any more. What shows a
@@ -1229,8 +1307,11 @@ Readings:
   not recomputed ([Spaces](#spaces-specspacesmd)).
 - **Written beside.** A `set` written beside adds its value and supersedes
   none; a `delete` written beside deletes nothing and flags the node delete
-  conflict, and does nothing on a node that is already deleted. Nothing here
-  writes either: they belong to posting work again after a succession.
+  conflict, and does nothing on a node that is already deleted. They are
+  written for work posted again after a succession, and for a local change
+  of what came from elsewhere and was not shown yet
+  ([Daemon](#daemon-mount-and-cli-cardinald-cardinal), "What a local change
+  has seen").
 ## Link (`spec/link.md`)
 
 Deviations:
@@ -1443,17 +1524,28 @@ Not implemented yet (the next milestone):
     from field 2 in every relationship with them held here, ended or
     left too, where nothing more is written. Trusted again, they are
     given the one in use.
-  - **Reading: two contact nodes for one identity** (made at once on two
-    devices) are one contact: trusted only if every node says trusted
-    and none refused. The same rule decides elsewhere: whether a session
-    is a contact's (`Daemon::classify`, `account::connects`), and
-    whether a guardian or a recovery helper is given sets to hold
-    (`Core::held_given`, `core::holds_for`: every node names them so,
-    and none refuses them). A setting (`contact-set`: trust, hosts only,
-    introductions, refuse) is written on every node for the identity
-    but a recovery's, so that such a contact can be refused, and
-    refused no longer; and finding a contact by name takes two nodes
-    for one identity for one contact, not two of that name.
+  - **Two records of one contact** (designer, ASK 11 = b + merge,
+    2026-11-22; `profiles.md#account`). Every record counts, and the
+    cautious answer wins: trusted and taking introductions only if every
+    record says so, refused if any does; a field in conflict within one
+    record is read the same way, and so is "is a guardian" (field 5). The
+    same rule decides whether a session is a contact's
+    (`Daemon::classify`, `account::connects`) and whether a guardian or a
+    recovery helper is given sets to hold (`core::holds_for`). The next
+    change the person makes to the contact (`contact-set`, a petname, a
+    category, a picture, marking guardians) merges, in the same entry, the
+    records into the one with the lowest node id (`account::contact_change`):
+    the cautious fields 6 to 8, the petname written last by its entries'
+    times (then log order), the target's other fields kept and what it lacks
+    filled from the others, newest first, and the others deleted; then the
+    change is set on what is left. Where a concurrent change touches a
+    deleted record its delete yields and the record stays, still counted
+    (tested, `two_records_of_one_contact_merge_and_a_race_stays_safe`).
+    **Reading, against the spec:** only records naming the same
+    relationship space as the lowest are merged; one naming another
+    relationship stays, and is set like the others, since deleting it
+    would take that relationship out of the person's contacts. A recovery's
+    relationship is no contact and is never merged.
   - **Reading: "accept every value a contact gave"** is every value field
     2 of their reach node holds now in the relationship, two where two of
     their devices set it at the same moment; not values set before.
@@ -1913,23 +2005,28 @@ Not implemented yet (the next milestone):
   `cardinal free-space` deletes every old version on this device now.
   Restoring a version first makes sure all of it is on this device,
   fetching what is missing, and refuses when no online device has it.
-- **Spec ambiguity: what a local change has "seen".** `state.md` decides
-  supersession and delete conflicts by entry ancestry, and an entry's
-  parents are normally all current heads. A device that holds an entry
-  from elsewhere but has not *shown* it yet (it arrived in the quiet
-  period before a commit, or the file had local changes so the mount
-  kept the local view) would, by citing every head, claim to have seen
-  it: a local edit would silently supersede the remote one, a local
-  delete would win over a remote edit. Here such local ops are written in
-  an entry whose parents are the latest entries that do not descend from
-  the unseen ones (`Space::write_concurrent`), so the result is the
-  conflict copy or delete conflict the spec asks for. The spec could say
-  that parents are what the author had *seen*, not merely held, and that
-  writing with older parents is legitimate (`spaces.md` only notes
-  backdating in the context of memberships). When the current epoch began
-  after the unseen entry, or a rotation is due, the change is written
-  normally instead (an old-epoch entry could expose new content to a
-  removed device), with a warning.
+- **What a local change has "seen": written beside** (designer, ASK 7 = c,
+  2026-11-22). A device that holds an entry from elsewhere but has not
+  *shown* it yet (it arrived in the quiet period before a commit, or the
+  file had local changes so the mount kept the local view) writes its
+  local changes as every entry is written, on all the valid heads, under
+  the current epoch; but the op that would replace what it did not show is
+  written **beside**, so the two stand in conflict and nothing is chosen
+  silently. A content edit of a file with a version it has not shown is a
+  `set` beside, and so is its mode or modified time where such a version
+  set that field too (elsewhere a beside `set` of the mode would leave the
+  mode in conflict with the value this device had seen, which a file shows
+  as no mode). A delete of something changed elsewhere unseen, or of a
+  folder with something changed beneath it unseen, is a `delete` beside:
+  it deletes nothing and flags the node delete conflict, whatever beneath
+  it was untouched (a delete that yields would have taken that). **Readings:**
+  where the version this device had seen is still a value beside the unseen
+  one (two that were in conflict), the `set` beside leaves it too, a
+  conflict of three; and "beside" is widened from posting again after a
+  succession to this. (Before, such ops went in an entry of their own with
+  older parents, `Space::write_concurrent`, and were written normally, with
+  a warning, where an epoch had begun since; that is gone, and
+  `write_concurrent` is left to tests, which play another device with it.)
 - **A file edited here and deleted elsewhere, unseen,** is created again as
   a new node rather than kept as a delete conflict of the old one (as
   before); nothing is lost, but its history starts over.
@@ -2640,9 +2737,11 @@ asks for around that is not built yet.
 - **Reading: a failed `prove`** is answered with error 1, not permitted, and
   the session stays open until `PROVE_WITHIN` (30 seconds) passes. Any other
   request before a proof closes it, as the spec says.
-- **Spec ambiguity: a grant with no limit.** `hosts.md#grants` does not say
-  how to state one. Chose 0 storage bytes and 0 days of retention, for a
-  person's own device, which keeps what it holds.
+- **A grant with no limit** (designer, 2026-11-22). Storage bytes (field 5)
+  and retention (field 6) left out mean no limit, and 0 means none at all.
+  A person's own device leaves both out, since it keeps what it holds. A
+  grant with either field there and not a uint is no grant. (Before, 0
+  stood for no limit, and both fields had to be there.)
 - **Spec ambiguity: how the sheet writes a host's key.** It says only "the
   address and static key". Chose lower-case Crockford base 32 of the 32-byte
   X25519 key and the first 3 bytes of its BLAKE3 hash, in groups of 4, so

@@ -1013,9 +1013,11 @@ fn after_removal(d: &Arc<Daemon>, links: &[[u8; 32]]) {
 
 /// What the recovery's removed devices wrote, as spaces arrive after the
 /// finish: kept up to when the person said they were lost, but for their
-/// successions, which no keep lists and which so fall: the old space stands
-/// again, and whoever followed returns to it
-/// (`spaces.md#a-succession-by-a-device-that-is-later-removed`). The
+/// successions that nothing kept before the loss, which so fall: the old
+/// space stands again, and whoever followed returns to it
+/// (`spaces.md#a-succession-by-a-device-that-is-later-removed`). A keep
+/// written before the loss, by another of their devices, is kept whenever
+/// written, and what it kept stands. The
 /// person's `leave`s are kept whenever they were written, and however long
 /// after the finish a space comes: unkept, the person would be in every
 /// group they left again, and served it.
@@ -1035,6 +1037,18 @@ pub fn tend_recovered(d: &Arc<Daemon>) {
             }
         }
         Err(e) => tracing::debug!("keeping what the person left: {e:#}"),
+    }
+    // What the person kept before the loss stands, successions among it:
+    // kept whenever written, and before the rest, so that work in a
+    // successor kept so is kept as ordinary work then
+    let kept = d.core().keep_earlier_keeps(&keys);
+    match kept {
+        Ok(written) => {
+            for (space, bytes) in written {
+                d.push(&space, vec![bytes]);
+            }
+        }
+        Err(e) => tracing::debug!("keeping what the person kept before: {e:#}"),
     }
     // the rest as spaces arrive only for a while after the finish: then by
     // the person's own `keep-work` (a thief sets the clock those entries

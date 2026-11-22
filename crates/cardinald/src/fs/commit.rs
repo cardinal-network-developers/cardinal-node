@@ -12,7 +12,7 @@
 //! A local change supersedes only what the mount had shown when it was
 //! made: see [`write_pending`].
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -21,7 +21,7 @@ use cardinal_blob::{BlobWriter, ConvergenceSecret, FsStore, ObjectStore, INLINE_
 use cardinal_identity::EntryId;
 use cardinal_space::files::{self, Content, Files};
 use cardinal_space::state::named_nodes;
-use cardinal_space::{NodeId, Space, SpaceId, SpaceOp, ROOT};
+use cardinal_space::{NodeId, Space, SpaceId, SpaceOp, SpaceOpBody, ROOT};
 
 #[cfg(test)]
 use super::tree::ROOT_INO;
@@ -246,14 +246,6 @@ fn wants_encoding(t: &Tree, i: &Inode) -> bool {
         && !t.is_held(i)
 }
 
-/// Ops that must not descend from some entries: local changes made
-/// without having seen them.
-#[derive(Default)]
-struct Concurrent {
-    ops: Vec<SpaceOp>,
-    effects: Vec<Effect>,
-}
-
 /// The current content versions of `node` that the local view has not
 /// seen (`seen` are the versions it was based on).
 fn unseen_versions(sp: &Space, node: &NodeId, seen: &[EntryId]) -> Vec<EntryId> {
@@ -306,17 +298,35 @@ fn unseen_touching(sp: &Space, base: &[EntryId], node: &NodeId) -> Vec<EntryId> 
         .collect()
 }
 
+/// Whether a value of `key` on `node` now was written by one of `unseen`.
+fn written_by(sp: &Space, node: &NodeId, key: u64, unseen: &[EntryId]) -> bool {
+    let n = sp.state().node(node);
+    n.is_some_and(|n| n.values(key).iter().any(|v| unseen.contains(&v.entry)))
+}
+
+/// The same `set`, written beside: it supersedes nothing
+/// (`state.md#fields-are-multi-value-registers`).
+fn beside(op: SpaceOp) -> SpaceOp {
+    match op.body() {
+        SpaceOpBody::Set {
+            node, key, value, ..
+        } => SpaceOp::set_beside(*node, *key, value.clone()),
+        _ => op,
+    }
+}
+
 /// Turns the tree's pending changes into entries in `core` (the commit's
 /// step C; `encoded` is the content encoded for files, by inode and write
 /// generation). Returns the sealed entries written, to push.
 ///
-/// A local change is written so that it descends from what the tree had
-/// shown when it was made, and from nothing else it would override: a
-/// content edit whose file got another version from elsewhere in the
-/// meantime (one the tree has not shown, because the file had local
-/// changes or the change had not been applied yet) is written in an entry
-/// concurrent with that version, so both are kept as a conflict; a delete
-/// of something changed elsewhere unseen becomes a delete conflict.
+/// Every entry builds on everything the space holds. A local change of
+/// something whose change from elsewhere the tree has not shown (because
+/// the file had local changes, or the change had not been applied yet) is
+/// written **beside**, so that it stands in conflict with that change and
+/// replaces nothing (designer, 2026-11-22): a content edit is a `set`
+/// beside, and so is its mode or time where the change from elsewhere set
+/// that too, so both versions are kept as a conflict; a delete is a
+/// `delete` beside, which deletes nothing and flags a delete conflict.
 pub fn write_pending(
     core: &mut Core,
     t: &mut Tree,
@@ -399,8 +409,6 @@ pub fn write_pending(
         // `create` of the parent it names, where this round makes that.
         let mut made: HashMap<u64, usize> = HashMap::new();
         let mut under: HashMap<usize, usize> = HashMap::new();
-        // ops to write concurrent with the entries of the key
-        let mut concurrent: BTreeMap<Vec<EntryId>, Concurrent> = BTreeMap::new();
         // What is new first, so that whatever is put in a new folder
         // finds its `create` earlier in the round; each in the order it
         // was made here, which has a folder before what was made in it.
@@ -493,25 +501,23 @@ pub fn write_pending(
                             Effect::Clean(ino, Flag::Mtime),
                         ));
                     }
-                    // A version from elsewhere this edit has not seen: keep
-                    // both (with the file's mode and time, from the same
-                    // view).
+                    // A version from elsewhere this edit has not seen: the
+                    // edit goes beside it, so both are kept; and the mode
+                    // and time beside what that version set of them.
                     let unseen = if edit {
                         unseen_versions(sp, &node, &i.seen)
                     } else {
                         Vec::new()
                     };
-                    if unseen.is_empty() {
-                        for (op, eff) in own {
-                            ops.push(op);
-                            effects.push(eff);
-                        }
-                    } else {
-                        let c = concurrent.entry(unseen).or_default();
-                        for (op, eff) in own {
-                            c.ops.push(op);
-                            c.effects.push(eff);
-                        }
+                    for (op, eff) in own {
+                        let key = match op.body() {
+                            SpaceOpBody::Set { key, .. } => *key,
+                            _ => 0,
+                        };
+                        let replaces_unseen = !unseen.is_empty()
+                            && (key == files::FILE_CONTENT || written_by(sp, &node, key, &unseen));
+                        ops.push(if replaces_unseen { beside(op) } else { op });
+                        effects.push(eff);
                     }
                 }
             }
@@ -540,15 +546,13 @@ pub fn write_pending(
                     }
                 }
             }
-            unseen.sort();
-            if unseen.is_empty() {
-                ops.push(SpaceOp::delete(del.node));
-                effects.push(Effect::Deleted(del.node));
-            } else {
-                let c = concurrent.entry(unseen).or_default();
-                c.ops.push(SpaceOp::delete(del.node));
-                c.effects.push(Effect::Deleted(del.node));
-            }
+            // something changed elsewhere unseen: the delete goes beside,
+            // and the node stays, flagged a delete conflict
+            ops.push(match unseen.is_empty() {
+                true => SpaceOp::delete(del.node),
+                false => SpaceOp::delete_beside(del.node),
+            });
+            effects.push(Effect::Deleted(del.node));
         }
         if !t.settle.is_empty() {
             let f = Files::new(sp);
@@ -566,43 +570,6 @@ pub fn write_pending(
                     }
                     // nothing to settle, or not this person's to
                     None => drop(t.settle.remove(&node)),
-                }
-            }
-        }
-        // Concurrent entries first, so the ordinary ones after them
-        // descend from everything again.
-        for (exclude, c) in concurrent {
-            let sp = core
-                .spaces
-                .get(space)
-                .and_then(|h| h.space.as_ref())
-                .ok_or_else(|| anyhow::anyhow!("files space not open"))?;
-            if !can_write_concurrent(sp, &exclude, &c.ops) {
-                tracing::warn!(
-                    "a change made here without seeing one from elsewhere cannot be kept \
-                     apart from it; writing it after"
-                );
-                ops.extend(c.ops);
-                effects.extend(c.effects);
-                continue;
-            }
-            match core.write_entry_concurrent(space, &exclude, c.ops.clone()) {
-                Ok((eid, bytes)) => {
-                    tracing::info!(
-                        "a file changed here and on another device: keeping both versions"
-                    );
-                    written.push(bytes);
-                    match finish_if_accepted(core, space, t, &eid, &c.effects) {
-                        true => accepted = true,
-                        false => refused = true,
-                    }
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        "cannot keep a concurrent change apart ({e:#}); writing it after"
-                    );
-                    ops.extend(c.ops);
-                    effects.extend(c.effects);
                 }
             }
         }
@@ -683,26 +650,6 @@ fn name_parents(
             None => op.with_parent(nodes[place]),
         };
     }
-}
-
-/// Whether ops can be written in an entry concurrent with `exclude`:
-/// every node they name exists in that entry's past.
-fn can_write_concurrent(sp: &Space, exclude: &[EntryId], ops: &[SpaceOp]) -> bool {
-    let parents = sp.latest_excluding(exclude);
-    if parents.is_empty() {
-        return false;
-    }
-    let dag = sp.dag();
-    ops.iter().all(|op| {
-        named_nodes(op.body()).iter().all(|n| {
-            *n == ROOT
-                || sp.state().node(n).is_some_and(|x| {
-                    parents
-                        .iter()
-                        .any(|p| dag.is_ancestor_or_self(&x.created_in, p))
-                })
-        })
-    })
 }
 
 /// [`finish`], once the entry is known to count: software checks that
@@ -1682,6 +1629,99 @@ mod tests {
             .write_entry(&rel, vec![files::create_folder(d, "theirs")])
             .unwrap();
         assert!(theirs_accepts(&them, &rel, &reply));
+    }
+
+    /// ASK 7 (designer, 2026-11-22), in a shared folder. The other person
+    /// edits a file while this person has it open with changes of their
+    /// own, and then their identity key changes, so their next entry starts
+    /// a new epoch. The local edit builds on everything held, theirs
+    /// included, and is written under the epoch that is current; its `set`
+    /// is written beside, so the two versions stand in conflict and
+    /// neither replaces the other. A delete of something they changed,
+    /// unseen here, goes beside too: it deletes nothing and flags a delete
+    /// conflict.
+    #[test]
+    fn a_change_of_what_came_unshown_to_a_shared_folder_is_written_beside() {
+        let (mut me, mut them, _hers) = shared_with_a_file_of_theirs();
+        let rel = me.space;
+        let sealed = |fx: &Fx| -> Vec<Vec<u8>> {
+            let sp = fx.core.spaces[&rel].space.as_ref().unwrap();
+            sp.sealed_entries().map(|(_, s)| s.encode()).collect()
+        };
+        let ours = me.write("ours.txt", b"v1");
+        let gone = me.write("gone.txt", b"g1");
+        assert_eq!(me.commit(), 1);
+        let (node, gone_node) = (me.node(ours), me.node(gone));
+        them.core.ingest_space(rel, &sealed(&me)).unwrap();
+        // changed here, its mode too, not committed yet
+        me.write("ours.txt", b"mine");
+        let i = me.t.inodes.get_mut(&ours).unwrap();
+        i.perm = 0o640;
+        i.dirty.mode = true;
+        me.write("gone.txt", b"g-local");
+        // theirs, under a new epoch
+        them.space = rel;
+        them.new_identity_key();
+        let (theirs, _) = them
+            .core
+            .write_entry(
+                &rel,
+                vec![
+                    files::set_content(node, &Content::Inline(b"theirs".to_vec())),
+                    files::set_mode(node, 0o600),
+                    files::set_content(gone_node, &Content::Inline(b"g2".to_vec())),
+                ],
+            )
+            .unwrap();
+        assert!(them.sp().entry(&theirs).unwrap().starts_epoch());
+        let log = them.core.identity.as_ref().unwrap().all_entries();
+        let who = them.core.identity.as_ref().unwrap().id();
+        me.core.ingest_other(who, &log).unwrap();
+        me.core.ingest_space(rel, &sealed(&them)).unwrap();
+        me.refresh();
+        assert_eq!(
+            me.shown("ours.txt"),
+            b"mine",
+            "local changes win in the view"
+        );
+        // and this person deletes the other file, which kept its own
+        // changes in the view, not having seen its edit
+        me.t.remove(gone);
+        assert_eq!(me.commit(), 1);
+        let last = *me.sp().dag().log_order().last().unwrap();
+        let sp = me.sp();
+        assert!(
+            sp.dag().is_ancestor(&theirs, &last),
+            "it builds on everything held"
+        );
+        let entry = sp.entry(&last).unwrap();
+        assert_eq!(
+            entry.epoch(),
+            sp.current_epoch().unwrap(),
+            "the current epoch"
+        );
+        let written: Vec<&SpaceOpBody> = entry.ops().iter().map(|o| o.body()).collect();
+        assert!(written.iter().any(|o| matches!(o,
+            SpaceOpBody::Set { node: n, key: files::FILE_CONTENT, beside: true, .. } if *n == node)));
+        assert!(written.iter().any(|o| matches!(o,
+            SpaceOpBody::Delete { node: n, beside: true } if *n == gone_node)));
+        assert_eq!(
+            sorted(me.versions(&node)),
+            vec![b"mine".to_vec(), b"theirs".to_vec()]
+        );
+        let n = sp.state().node(&gone_node).unwrap();
+        assert!(!n.deleted && n.delete_conflict, "{n:?}");
+        // the mode they set and the one here stand beside each other too
+        let modes = sp
+            .state()
+            .node(&node)
+            .unwrap()
+            .values(files::FILE_MODE)
+            .len();
+        assert_eq!(modes, 2);
+        // the same on their device
+        them.core.ingest_space(rel, &sealed(&me)).unwrap();
+        assert_eq!(them.sp().state().canonical(), me.sp().state().canonical());
     }
 
     fn theirs_accepts(fx: &Fx, space: &SpaceId, entry: &EntryId) -> bool {

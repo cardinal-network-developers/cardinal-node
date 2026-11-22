@@ -157,8 +157,10 @@ pub async fn set_picture(d: &Arc<Daemon>, who: &str, from: &str) -> anyhow::Resu
         .ok_or_else(|| anyhow::anyhow!("the account space is not here yet"))?;
     let from = from.trim();
     if from.is_empty() {
-        let op = cardinal_space::SpaceOp::set(contact.node, account::PICTURE, None);
-        d.write_and_push(&acc, vec![op])?;
+        let ops = d
+            .core()
+            .contact_ops(&contact.identity, &[(account::PICTURE, None)]);
+        d.write_and_push(&acc, ops)?;
         return Ok(json!({"picture": null}));
     }
     // A file of the one folder is saved out first; one on the disk is read
@@ -196,8 +198,11 @@ pub async fn set_picture(d: &Arc<Daemon>, who: &str, from: &str) -> anyhow::Resu
     let blob = BlobRef::from_record(&attached.blob)?;
     let d2 = d.clone();
     tokio::task::spawn_blocking(move || write_cache(&d2, blob, &NoFetch)).await??;
-    let op = account::set_field(contact.node, account::PICTURE, Value::Record(attached.blob));
-    d.write_and_push(&acc, vec![op])?;
+    let picture = Some(Value::Record(attached.blob));
+    let ops = d
+        .core()
+        .contact_ops(&contact.identity, &[(account::PICTURE, picture)]);
+    d.write_and_push(&acc, ops)?;
     let c = crate::contacts::find(d, who).unwrap_or(contact);
     Ok(Json::Object(shown(d, &c)))
 }

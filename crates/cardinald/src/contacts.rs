@@ -766,7 +766,9 @@ pub fn set(d: &Arc<Daemon>, who: &str, setting: &str) -> anyhow::Result<Json> {
         .core()
         .account_id()
         .ok_or_else(|| anyhow::anyhow!("the account space is not here yet"))?;
-    let ops = set_ops(&d.core().contacts(), &contact.identity, key, value);
+    let ops = d
+        .core()
+        .contact_ops(&contact.identity, &[(key, Some(value.into()))]);
     d.write_and_push(&account, ops)?;
     d.peers_changed();
     if setting == "refuse" {
@@ -774,19 +776,6 @@ pub fn set(d: &Arc<Daemon>, who: &str, setting: &str) -> anyhow::Result<Json> {
         return Ok(json!({"reach": reach}));
     }
     Ok(json!({}))
-}
-
-/// What sets one of a contact's fields: a `set` on every node for them
-/// but a recovery's. Two made at once on two devices are one contact,
-/// refused where any refuses them and trusted where all do
-/// (`presence.rs`), so a setting on one alone could not refuse them, nor
-/// take back a refusal.
-fn set_ops(contacts: &[ContactRecord], who: &[u8; 32], key: u64, value: bool) -> Vec<SpaceOp> {
-    account::nodes_of(contacts, who)
-        .into_iter()
-        .filter(|c| c.recovery_of.is_none())
-        .map(|c| account::set_field(c.node, key, value))
-        .collect()
 }
 
 /// The person says, in their relationship with a contact, whether the
@@ -832,8 +821,10 @@ pub fn rename(d: &Arc<Daemon>, who: &str, name: &str) -> anyhow::Result<Json> {
             .ok_or_else(|| anyhow::anyhow!("the account space is not here yet"))?;
         // Empty, not absent: a release before this one reads a contact
         // without a petname as no contact at all.
-        let op = account::set_field(contact.node, account::PETNAME, "");
-        d.write_and_push(&account, vec![op])?;
+        let ops = d
+            .core()
+            .contact_ops(&contact.identity, &[(account::PETNAME, Some("".into()))]);
+        d.write_and_push(&account, ops)?;
         let c = find(d, &hex::encode(&contact.identity[..8]))?;
         return Ok(Json::Object(crate::names::shown(d, &c)));
     }
@@ -848,8 +839,10 @@ pub fn rename(d: &Arc<Daemon>, who: &str, name: &str) -> anyhow::Result<Json> {
         .core()
         .account_id()
         .ok_or_else(|| anyhow::anyhow!("the account space is not here yet"))?;
-    let op = account::set_field(contact.node, account::PETNAME, name);
-    d.write_and_push(&account, vec![op])?;
+    let ops = d
+        .core()
+        .contact_ops(&contact.identity, &[(account::PETNAME, Some(name.into()))]);
+    d.write_and_push(&account, ops)?;
     Ok(json!({"name": name}))
 }
 
@@ -867,8 +860,11 @@ pub fn set_category(d: &Arc<Daemon>, who: &str, category: &str) -> anyhow::Resul
         .core()
         .account_id()
         .ok_or_else(|| anyhow::anyhow!("the account space is not here yet"))?;
-    let op = account::set_field(contact.node, account::CATEGORY, category);
-    d.write_and_push(&account, vec![op])?;
+    let ops = d.core().contact_ops(
+        &contact.identity,
+        &[(account::CATEGORY, Some(category.into()))],
+    );
+    d.write_and_push(&account, ops)?;
     Ok(json!({"category": category}))
 }
 
@@ -912,9 +908,11 @@ pub fn list(d: &Daemon, all: bool) -> Json {
         .filter(|c| c.recovery_of.is_none())
         .filter(|c| all || !c.refused)
         .map(|c| {
-            let recovered = recovered_note(d, &c.identity);
+            let recovered = recovered_note(d, &c.identity, &c.petname);
             let v = json!({
-                "recovered": recovered,
+                "recovered": recovered.as_ref().map(|r| r.text.clone()),
+                "recovered_seen": recovered.as_ref().and_then(|r| r.seen),
+                "recovered_new_guardians": recovered.as_ref().map(|r| r.new_guardians),
                 "met": c.met.as_ref().map(|m| met_json(m, &everyone, &group_names)),
                 "identity": hex::encode(&c.identity[..8]),
                 "trusted": c.regard.trusted,
@@ -933,9 +931,17 @@ pub fn list(d: &Daemon, all: bool) -> Json {
 
 /// What a contact's software says of someone recovered by guardians
 /// (`identity.md#what-a-recovery-does`, D79), if their log shows a recovery
-/// in effect. Identity entries carry no time, so the date of the policy is
-/// not given (DEVIATIONS.md).
-fn recovered_note(d: &Daemon, who: &[u8; 32]) -> Option<String> {
+/// in effect: the text, the day this device first saw the policy it was
+/// decided under, and whether it first saw that policy together with the
+/// recovery, when there is no day to give and the person is to be checked
+/// with another way (designer, ASK 8 = b).
+pub(crate) struct Recovered {
+    pub text: String,
+    pub seen: Option<u64>,
+    pub new_guardians: bool,
+}
+
+fn recovered_note(d: &Daemon, who: &[u8; 32], name: &str) -> Option<Recovered> {
     let core = d.core();
     let log = &core.others.get(who)?.log;
     let st = log.state();
@@ -944,55 +950,107 @@ fn recovered_note(d: &Daemon, who: &[u8; 32]) -> Option<String> {
         .into_iter()
         .find(|r| st.in_effect.contains(&r.entry))?;
     let p = log.policy(&r.policy)?;
-    // The date the policy was chosen on, as this device first saw it.
-    let on = first_seen(d, &r.policy).map(day_text);
-    Some(match on {
-        Some(day) => format!(
-            "was recovered by guardians they chose on {day}, after {}. If in doubt, check \
-             with them in person.",
-            crate::guardians::delay_text(p.delay)
-        ),
-        None => format!(
-            "was recovered by guardians they chose, after {}. If in doubt, check with them \
-             in person.",
-            crate::guardians::delay_text(p.delay)
-        ),
+    let delay = crate::guardians::delay_text(p.delay);
+    let seen = first_seen(d, &r.policy);
+    Some(match seen {
+        Some(Seen {
+            at,
+            with_recovery: false,
+        }) => Recovered {
+            text: format!(
+                "was recovered by guardians they had chosen by {}, after {delay}. If in \
+                 doubt, check with them in person.",
+                day_text(at)
+            ),
+            seen: Some(at),
+            new_guardians: false,
+        },
+        _ => Recovered {
+            text: format!(
+                "was recovered by guardians, after {delay}. These guardians were new to this \
+                 device when the recovery came. Check with {name} another way."
+            ),
+            seen: None,
+            new_guardians: true,
+        },
     })
+}
+
+/// When this device first saw a recovery policy of a contact's, and
+/// whether a recovery under it came with it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+struct Seen {
+    at: u64,
+    #[serde(default)]
+    with_recovery: bool,
+}
+
+/// What `seen-policies.json` holds, by policy in hex: a record, or, as
+/// written before, the time alone.
+#[derive(serde::Deserialize)]
+#[serde(untagged)]
+enum Kept {
+    Seen(Seen),
+    At(u64),
+}
+
+fn seen_policies(d: &Daemon) -> std::collections::BTreeMap<String, Seen> {
+    let path = d.paths.home.join("seen-policies.json");
+    read_seen(&std::fs::read(path).unwrap_or_default())
+}
+
+fn read_seen(bytes: &[u8]) -> std::collections::BTreeMap<String, Seen> {
+    let read: std::collections::BTreeMap<String, Kept> =
+        serde_json::from_slice(bytes).unwrap_or_default();
+    read.into_iter()
+        .map(|(k, v)| {
+            let seen = match v {
+                Kept::Seen(s) => s,
+                Kept::At(at) => Seen {
+                    at,
+                    with_recovery: false,
+                },
+            };
+            (k, seen)
+        })
+        .collect()
 }
 
 /// When this device first saw each recovery policy of its contacts
 /// (`seen-policies.json`): identity entries carry no time, so this is the
-/// date a contact's software can give for one (DEVIATIONS.md).
-fn first_seen(d: &Daemon, policy: &[u8; 32]) -> Option<u64> {
-    let b = std::fs::read(d.paths.home.join("seen-policies.json")).ok()?;
-    let m: std::collections::BTreeMap<String, u64> = serde_json::from_slice(&b).ok()?;
-    m.get(&hex::encode(policy)).copied()
+/// date a contact's software can give for one (`identity.md`).
+fn first_seen(d: &Daemon, policy: &[u8; 32]) -> Option<Seen> {
+    seen_policies(d).get(&hex::encode(policy)).copied()
 }
 
 /// Notes when this device first saw `who`'s current recovery policy, and
-/// those their recoveries act under.
+/// those their recoveries act under; and, for each, whether a recovery
+/// under it was in their log already then.
 pub(crate) fn note_policies(d: &Daemon, who: &[u8; 32]) {
     let path = d.paths.home.join("seen-policies.json");
-    let mut m: std::collections::BTreeMap<String, u64> = std::fs::read(&path)
-        .ok()
-        .and_then(|b| serde_json::from_slice(&b).ok())
-        .unwrap_or_default();
-    let policies: Vec<[u8; 32]> = {
+    let mut m = seen_policies(d);
+    let (policies, recovered): (Vec<[u8; 32]>, Vec<[u8; 32]>) = {
         let core = d.core();
         let Some(o) = core.others.get(who) else {
             return;
         };
-        o.log
+        let under: Vec<[u8; 32]> = o.log.recoveries().into_iter().map(|r| r.policy).collect();
+        let all = o
+            .log
             .current_policy()
             .map(|p| p.entry)
             .into_iter()
-            .chain(o.log.recoveries().into_iter().map(|r| r.policy))
-            .collect()
+            .chain(under.iter().copied())
+            .collect();
+        (all, under)
     };
     let mut changed = false;
     for p in policies {
         if let std::collections::btree_map::Entry::Vacant(v) = m.entry(hex::encode(p)) {
-            v.insert(now_ms());
+            v.insert(Seen {
+                at: now_ms(),
+                with_recovery: recovered.contains(&p),
+            });
             changed = true;
         }
     }
@@ -1902,35 +1960,25 @@ mod tests {
         }
     }
 
+    /// What `seen-policies.json` held before (the time alone) reads as a
+    /// policy seen before any recovery; what it holds now says.
     #[test]
-    fn a_setting_is_set_on_every_node_for_the_contact() {
-        let record = |node: u8, who: u8, recovery: bool| ContactRecord {
-            node: [node; 16],
-            identity: [who; 32],
-            petname: "Cy".into(),
-            own: true,
-            suggested: None,
-            picture: None,
-            space: [node; 32],
-            regard: Regard::default(),
-            refused: false,
-            category: account::PEOPLE.into(),
-            met: None,
-            guardian: false,
-            recovery_of: recovery.then_some([9; 32]),
-        };
-        let all = [
-            record(1, 3, false),
-            record(2, 3, false),
-            record(4, 3, true),
-            record(5, 6, false),
-        ];
-        let ops = set_ops(&all, &[3; 32], account::REFUSED, true);
-        let want: Vec<SpaceOp> = [[1u8; 16], [2; 16]]
-            .iter()
-            .map(|n| account::set_field(*n, account::REFUSED, true))
-            .collect();
-        assert_eq!(ops, want);
+    fn seen_policies_read_as_written_before_and_now() {
+        let m = read_seen(br#"{"aa": 5, "bb": {"at": 6, "with_recovery": true}}"#);
+        assert_eq!(
+            m["aa"],
+            Seen {
+                at: 5,
+                with_recovery: false
+            }
+        );
+        assert_eq!(
+            m["bb"],
+            Seen {
+                at: 6,
+                with_recovery: true
+            }
+        );
     }
 
     #[test]

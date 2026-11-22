@@ -152,10 +152,13 @@ fn succeed(
         judged_with: pinned,
         ..Succession::default()
     };
-    let ops = named
+    let mut ops: Vec<SpaceOp> = named
         .iter()
         .map(|(w, r)| SpaceOp::add_member(*w, *r))
         .collect();
+    // The owner sets again, in the genesis, what only an admin's say counts
+    // on: carried, it counts for nothing.
+    ops.extend(group::reassert_ops(a, &at_cut));
     let (mut s, g) = Space::create_successor(
         group::GROUP,
         a.policy().clone(),
@@ -183,12 +186,6 @@ fn succeed(
     )
     .unwrap();
     s.set_identities([t.ana.log.state(), t.bo.log.state(), t.cy.log.state()]);
-    // The owner sets again what only an admin's say counts on.
-    let again = group::reassert_ops(a, &at_cut);
-    if !again.is_empty() {
-        s.write(&t.ana.log, &t.ana.device.signing, again, Some(3))
-            .unwrap();
-    }
     (s, g, at_cut)
 }
 
@@ -463,12 +460,14 @@ fn what_a_writer_set_where_only_an_admin_counts_does_not_count_after() {
     // Carried, his values are there; what stands is what Ana's group said.
     assert_eq!(group::name(&s), was_name);
     assert_eq!(name_of(&s, t.bo.id()), was_bo);
-    // and before the owner's first entry comes, carried values say nothing
+    // and with the genesis alone, which sets them again, there is no gap:
+    // the names Ana's group gave, never Bo's (`profiles.md#group`)
+    assert_eq!(s.dag().len(), 1, "the genesis alone");
     let mut bare = Space::open_genesis(&g, &[&t.bo.enc], None).unwrap();
     bare.set_initial_state(State::from_canonical(group::GROUP, &at_cut.canonical()).unwrap());
     bare.set_identities([t.ana.log.state(), t.bo.log.state()]);
-    assert_ne!(group::name(&bare), "Bo's club");
-    assert_ne!(name_of(&bare, t.bo.id()).as_deref(), Some("Boss"));
+    assert_eq!(group::name(&bare), was_name);
+    assert_eq!(name_of(&bare, t.bo.id()), was_bo);
 }
 
 #[test]

@@ -126,7 +126,7 @@ fn admins_value<'a>(space: &'a Space, n: &'a Node, key: u64) -> Option<&'a Value
         // (`spaces.md#what-comes-across`).
         // A value a successor carried counts for nothing by itself: who
         // wrote it is not here to judge. The owner sets these fields again,
-        // as the old space resolved them, in the successor's first entry
+        // as the old space resolved them, in the successor's genesis
         // ([`reassert_ops`]).
         let counts = match dag.get(&v.entry) {
             Some(e) => role_of(space, &e.author()).is_some_and(|r| r >= ADMIN),
@@ -136,7 +136,7 @@ fn admins_value<'a>(space: &'a Space, n: &'a Node, key: u64) -> Option<&'a Value
     })
 }
 
-/// What the owner writes first in a successor of the group `old`, whose
+/// What the owner writes in the genesis of a successor of the group `old`, whose
 /// initial state is `carried`: each field on which only an admin's say
 /// counts (the group's name and introductions, and each member node's
 /// identity, name and introduction), set to what `old` resolves it to, or

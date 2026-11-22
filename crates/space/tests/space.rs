@@ -962,6 +962,122 @@ fn a_restore_brings_back_what_its_delete_took_and_nothing_else() {
     );
     every_way(&a);
     every_way(&b);
+    // a restore of Trip, left in delete conflict, brings back what the
+    // delete that yielded there took beneath it
+    write(&mut a, d0, vec![SpaceOp::restore(trip)]);
+    assert!(!deleted(&a, &fa) && !deleted(&a, &fb) && !deleted(&a, &fc));
+    assert!(!a.state().node(&trip).unwrap().delete_conflict);
+    every_way(&a);
+}
+
+/// `state.md#deletion-yields-to-concurrent-work`: a delete of a node that
+/// is already deleted does nothing. A file made in a deleted folder is not
+/// flagged by a second delete of the folder, so it comes back when the
+/// folder is restored. In the canonical state every node one delete took has that delete's
+/// number, and a state that numbers its deletes otherwise is refused.
+#[test]
+fn a_delete_of_what_is_deleted_does_nothing() {
+    let p = person(24, 1);
+    let (d0, d1) = (&p.devices[0], &p.devices[1]);
+    let (mut a, genesis) = Space::create(
+        Profile::FILES,
+        Policy::default(),
+        &p.log,
+        &d0.signing,
+        &[p.enc.public_key()],
+        None,
+    )
+    .unwrap();
+    let enc1 = p.log.open_encryption_key(d1).unwrap();
+    let genesis = SealedEntry::decode(&genesis.encode()).unwrap();
+    let mut b = Space::open_genesis(&genesis, &[&enc1], Some(p.log.state())).unwrap();
+    let write = |s: &mut Space, d: &DeviceKeys, ops: Vec<SpaceOp>| {
+        s.write_entry(&p.log, &d.signing, ops, None).unwrap().0
+    };
+    let deleted = |s: &Space, n: &cardinal_space::NodeId| s.state().node(n).unwrap().deleted;
+    let every_way = |s: &Space| {
+        let valid = &s.validity().valid;
+        let full = cardinal_space::State::compute(Profile::FILES, s.dag(), valid);
+        assert_eq!(full.canonical(), s.state().canonical());
+        let plain = cardinal_space::State::compute_by_definition(Profile::FILES, s.dag(), valid);
+        assert_eq!(plain.canonical(), s.state().canonical());
+    };
+    let made = write(&mut a, d0, vec![files::create_folder(ROOT, "Trip")]);
+    let trip = files::created_node(&made, 0);
+    let made = write(
+        &mut a,
+        d0,
+        vec![files::create_file(trip, "a", &file(b"a"), 0o644, None)],
+    );
+    let fa = files::created_node(&made, 0);
+    write(&mut a, d0, vec![SpaceOp::delete(trip)]);
+    let made = write(
+        &mut a,
+        d0,
+        vec![files::create_file(trip, "late", &file(b"l"), 0o644, None)],
+    );
+    let late = files::created_node(&made, 0);
+    write(&mut a, d0, vec![SpaceOp::delete(trip)]);
+    assert!(deleted(&a, &trip) && deleted(&a, &fa));
+    assert!(!deleted(&a, &late), "the second delete does nothing");
+    every_way(&a);
+    write(&mut a, d0, vec![SpaceOp::restore(trip)]);
+    assert!(!deleted(&a, &trip) && !deleted(&a, &fa) && !deleted(&a, &late));
+    every_way(&a);
+
+    // the other device deletes Trip again, and then deletes it once more
+    // after a file is made in it
+    sync(&a, &mut b, &enc1);
+    write(&mut b, d1, vec![SpaceOp::delete(trip)]);
+    sync(&b, &mut a, &p.enc);
+    assert_eq!(a.state().canonical(), b.state().canonical());
+    assert!([trip, fa, late].iter().all(|n| deleted(&a, n)));
+    every_way(&a);
+    // one delete took all three: they share its number
+    let canonical = a.state().canonical();
+    let numbers: Vec<u64> = canonical
+        .list(1)
+        .unwrap()
+        .iter()
+        .filter_map(|v| v.as_record())
+        .map(|r| r.uint(6).unwrap())
+        .collect();
+    assert_eq!(numbers, [1; 3]);
+    write(&mut b, d1, vec![SpaceOp::restore(trip)]);
+    sync(&b, &mut a, &p.enc);
+    assert!([trip, fa, late].iter().all(|n| !deleted(&a, n)));
+    every_way(&a);
+
+    // a canonical state whose deletes are not numbered from 1, in the
+    // order its records first list them, is not one any device computes
+    let renumbered = |canonical: &Record, by: &dyn Fn(u64) -> u64| -> Record {
+        let list: Vec<cardinal_encoding::Value> = canonical
+            .list(1)
+            .unwrap()
+            .iter()
+            .map(|v| {
+                let r = v.as_record().unwrap();
+                match r.uint(6).unwrap() {
+                    0 => r.clone().into(),
+                    n => r.clone().with(6, by(n)).into(),
+                }
+            })
+            .collect();
+        canonical
+            .clone()
+            .with(1, cardinal_encoding::Value::List(list))
+    };
+    write(&mut a, d0, vec![SpaceOp::delete(late)]);
+    write(&mut a, d0, vec![SpaceOp::delete(trip)]);
+    let two = a.state().canonical();
+    assert!(cardinal_space::State::from_canonical(Profile::FILES, &two).is_ok());
+    let from_one = |n: u64| n + 1;
+    let swapped = |n: u64| 3 - n;
+    let ways: [&dyn Fn(u64) -> u64; 2] = [&from_one, &swapped];
+    for by in ways {
+        let bad = renumbered(&two, by);
+        assert!(cardinal_space::State::from_canonical(Profile::FILES, &bad).is_err());
+    }
 }
 
 #[test]
@@ -1476,4 +1592,164 @@ fn two_nodes_for_one_contact_are_judged_together() {
     let refuse = account::set_field(one, REFUSED, true);
     acct.write(&p.log, &d0.signing, vec![refuse], None).unwrap();
     assert!(account::refused(&account::contacts(acct.state()), &cy));
+}
+
+/// Two records of one contact (`profiles.md#account`, designer
+/// 2026-11-22): the next change merges them into the lowest, with the
+/// cautious values, the petname written last, and the rest deleted, in one
+/// entry. When another device, at the same time, changes the record being
+/// deleted, the delete yields and that record stays; every record still
+/// counts, so its refusal holds, and the next change merges again.
+#[test]
+fn two_records_of_one_contact_merge_and_a_race_stays_safe() {
+    use account::{Regard, PETNAME, REFUSED, TRUSTED};
+    let p = person(9, 1);
+    let (d0, d1) = (&p.devices[0], &p.devices[1]);
+    let (mut a, genesis) = Space::create(
+        Profile::ACCOUNT,
+        Policy::default(),
+        &p.log,
+        &d0.signing,
+        &[p.enc.public_key()],
+        None,
+    )
+    .unwrap();
+    let enc1 = p.log.open_encryption_key(d1).unwrap();
+    let genesis = SealedEntry::decode(&genesis.encode()).unwrap();
+    let mut b = Space::open_genesis(&genesis, &[&enc1], Some(p.log.state())).unwrap();
+    let write = |s: &mut Space, d: &DeviceKeys, ops: Vec<SpaceOp>, t: u64| {
+        s.write_entry(&p.log, &d.signing, ops, Some(t)).unwrap().0
+    };
+    let cy = [3u8; 32];
+    let rel = [7u8; 32];
+    let hosts_only = Regard {
+        trusted: false,
+        introductions: true,
+    };
+    // made at once on two devices, one naming them "Cy", one "Cyril"
+    write(
+        &mut a,
+        d0,
+        vec![account::create_contact(&cy, "Cy", &rel, Regard::default())],
+        10,
+    );
+    write(
+        &mut b,
+        d1,
+        vec![account::create_contact(&cy, "Cyril", &rel, hosts_only)],
+        20,
+    );
+    sync(&a, &mut b, &enc1);
+    sync(&b, &mut a, &p.enc);
+    let all = account::contacts(a.state());
+    assert_eq!(account::nodes_of(&all, &cy).len(), 2);
+    assert!(!account::connects(&all, &cy), "trusted only if all are");
+    // the next change, made where all is seen: one record, merged
+    let ops = account::contact_change(&a, &cy, &[(account::CATEGORY, Some("Family".into()))]);
+    write(&mut a, d0, ops, 30);
+    let all = account::contacts(a.state());
+    let left = account::nodes_of(&all, &cy);
+    assert_eq!(left.len(), 1, "{left:?}");
+    let low = left[0];
+    assert!(!low.regard.trusted, "the cautious value");
+    assert_eq!(low.petname, "Cyril", "the petname written last");
+    assert_eq!(low.category, "Family");
+    assert!(
+        account::contact_change(&a, &cy, &[]).is_empty(),
+        "nothing more to merge"
+    );
+
+    // Again from two records, with a race: one device merges while the
+    // other, not having seen it, refuses on every record
+    let mut a2 = {
+        let (s, g) = Space::create(
+            Profile::ACCOUNT,
+            Policy::default(),
+            &p.log,
+            &d0.signing,
+            &[p.enc.public_key()],
+            None,
+        )
+        .unwrap();
+        let g = SealedEntry::decode(&g.encode()).unwrap();
+        (
+            s,
+            Space::open_genesis(&g, &[&enc1], Some(p.log.state())).unwrap(),
+        )
+    };
+    let (x, y) = (&mut a2.0, &mut a2.1);
+    write(
+        x,
+        d0,
+        vec![account::create_contact(&cy, "Cy", &rel, Regard::default())],
+        10,
+    );
+    write(
+        y,
+        d1,
+        vec![account::create_contact(&cy, "Cy", &rel, Regard::default())],
+        11,
+    );
+    sync(x, y, &enc1);
+    sync(y, x, &p.enc);
+    let merge = account::contact_change(x, &cy, &[(PETNAME, Some("C".into()))]);
+    assert!(merge
+        .iter()
+        .any(|o| matches!(o.body(), cardinal_space::SpaceOpBody::Delete { .. })));
+    write(x, d0, merge, 30);
+    let nodes: Vec<_> = account::contacts(y.state())
+        .iter()
+        .map(|c| c.node)
+        .collect();
+    let refuse: Vec<SpaceOp> = nodes
+        .iter()
+        .map(|n| account::set_field(*n, REFUSED, true))
+        .collect();
+    write(y, d1, refuse, 31);
+    sync(x, y, &enc1);
+    sync(y, x, &p.enc);
+    assert_eq!(x.state().canonical(), y.state().canonical());
+    let all = account::contacts(x.state());
+    assert_eq!(account::nodes_of(&all, &cy).len(), 2, "the delete yielded");
+    assert!(account::refused(&all, &cy), "and the refusal holds");
+    assert!(!account::connects(&all, &cy));
+    // the next change merges again, refused
+    let again = account::contact_change(x, &cy, &[(TRUSTED, Some(true.into()))]);
+    write(x, d0, again, 40);
+    let all = account::contacts(x.state());
+    let one = account::nodes_of(&all, &cy);
+    assert_eq!(one.len(), 1);
+    assert!(one[0].refused && account::refused(&all, &cy));
+}
+
+/// A guardians node (`profiles.md#account`, kind 17) reads back as written,
+/// and one not written as its table says names nobody.
+#[test]
+fn a_guardians_node_names_each_commitment() {
+    let p = person(10, 0);
+    let d0 = &p.devices[0];
+    let (mut acct, _) = Space::create(
+        Profile::ACCOUNT,
+        Policy::default(),
+        &p.log,
+        &d0.signing,
+        &[p.enc.public_key()],
+        None,
+    )
+    .unwrap();
+    let named = [([1u8; 32], [2u8; 32]), ([3; 32], [4; 32])];
+    let bad = SpaceOp::create(
+        NodeKind::Uint(account::GUARDIANS),
+        ROOT,
+        "",
+        Record::new().with(1, [6u8; 32]).with(2, "Bo and Cy"),
+    );
+    let ops = vec![account::create_guardians(&[5; 32], &named), bad];
+    acct.write(&p.log, &d0.signing, ops, Some(7)).unwrap();
+    let read = account::guardians_named(acct.state());
+    assert_eq!(read.len(), 1);
+    assert_eq!(
+        (read[0].policy, read[0].named.as_slice(), read[0].made),
+        ([5; 32], &named[..], Some(7))
+    );
 }
