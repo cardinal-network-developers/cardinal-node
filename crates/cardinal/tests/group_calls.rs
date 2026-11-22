@@ -537,3 +537,48 @@ fn a_link_cut_one_way_is_made_again() {
         "{heard:?}"
     );
 }
+
+/// In a group each sender needs every receiver's viewport
+/// (`basics/video.md`): Ben's reaches Ana through Carol's device, which only
+/// carries the call, with the voice it is, as his sound has it, and is said
+/// again every five seconds.
+#[test]
+fn a_viewport_is_passed_on_to_everyone_on_a_group_call() {
+    let root = tempfile::tempdir().unwrap();
+    let carol = person(root.path(), "carol");
+    let ana = person(root.path(), "ana");
+    let ben = person(root.path(), "ben");
+    plugged_in(&carol, true);
+    plugged_in(&ana, false);
+    plugged_in(&ben, false);
+    meet(&carol, &ana);
+    meet(&carol, &ben);
+    let g = group(&carol, &[&ana, &ben]);
+    ask(&ana, json!({"cmd": "call-start", "group": g}));
+    wait("ben is rung", 20, || standing(&ben) == "ringing");
+    ask(&ben, json!({"cmd": "call-answer"}));
+    wait("live", 20, || standing(&ana) == "live");
+
+    let mut lines = [Line::open(&ana, 1), Line::open(&ben, 2)];
+    lines[1].m.send(&json!({"width": 3, "height": 4}));
+    let (mut views, mut voice) = (Vec::new(), None);
+    let until = std::time::Instant::now() + Duration::from_secs(8);
+    while std::time::Instant::now() < until {
+        lines[1].say();
+        if let Some(v) = lines[0].m.next() {
+            if v.get("width").is_some() {
+                views.push(v);
+            } else if let Some(from) = v["from"].as_str() {
+                voice = Some(from.to_owned());
+            }
+        }
+        if let Some(v) = lines[1].m.next() {
+            assert!(v.get("width").is_none(), "ben is not told his own: {v}");
+        }
+    }
+    let voice = voice.expect("ana heard ben");
+    assert!(views.len() >= 2, "said now and again: {views:?}");
+    for v in &views {
+        assert_eq!(*v, json!({"width": 3, "height": 4, "from": voice}));
+    }
+}

@@ -761,4 +761,5 @@ pub static EVENTS: &[Request] = &[req!(1 "changed" (1 "seq" U) -> ())];
 pub static FRAMES: &[Request] = &[
     req!(1 "audio" (1 "audio" B, 3 "from" B) -> ()),
     req!(2 "frame" (1 "frame" B, 2 "format" B, 3 "from" B) -> ()),
+    req!(3 "viewport" (1 "width" U, 2 "height" U, 3 "from" B) -> ()),
 ];

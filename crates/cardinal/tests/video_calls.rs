@@ -197,3 +197,50 @@ fn voice_only_answers_get_no_video() {
     wait("live", 10, || standing(&a) == "live");
     assert!(ask(&a, json!({"cmd": "call"}))["call"]["taken"].is_null());
 }
+
+/// The viewports that came on a line within `secs` seconds.
+fn viewports(l: &mut Line, secs: u64) -> Vec<Value> {
+    let until = std::time::Instant::now() + Duration::from_secs(secs);
+    let mut out = Vec::new();
+    while std::time::Instant::now() < until {
+        if let Some(v) = l.m.next() {
+            if v.get("width").is_some() {
+                out.push(v);
+            }
+        }
+    }
+    out
+}
+
+/// A window tells the service the shape of its viewport; the other side's
+/// window has it, apart from the video, again every five seconds, and as
+/// soon as it changes (`basics/video.md`).
+#[test]
+fn a_viewport_reaches_the_one_sending_video() {
+    if !fuse_available() {
+        eprintln!("skipping: /dev/fuse or fusermount3 is not available");
+        return;
+    }
+    let root = tempfile::tempdir().unwrap();
+    let (a, b, bo) = met(root.path());
+    let both = json!(["voice 1", "video vp8 1"]);
+    ask(
+        &a,
+        json!({"cmd": "call-start", "who": bo, "format_names": both}),
+    );
+    wait("bo's device rings", 10, || standing(&b) == "ringing");
+    ask(&b, json!({"cmd": "call-answer", "format_names": both}));
+    wait("ana hears the answer", 10, || standing(&a) == "live");
+    let (mut la, mut lb) = (Line::open(&a), Line::open(&b));
+    std::thread::sleep(Duration::from_millis(200));
+    lb.m.send(&json!({"width": 9, "height": 16}));
+    let tall = json!({"width": 9, "height": 16});
+    let got = viewports(&mut la, 7);
+    assert!(got.len() >= 2, "said now and again: {got:?}");
+    assert!(got.iter().all(|v| *v == tall), "{got:?}");
+    lb.m.send(&json!({"width": 16, "height": 9}));
+    let got = viewports(&mut la, 2);
+    assert_eq!(got, vec![json!({"width": 16, "height": 9})]);
+    assert!(viewports(&mut lb, 1).is_empty(), "not given back");
+    ask(&a, json!({"cmd": "call-end"}));
+}

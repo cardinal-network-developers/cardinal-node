@@ -196,6 +196,9 @@ pub struct Call {
     offered: Option<Vec<Format>>,
     /// What the answer took, if it named formats.
     taken: Option<Vec<Format>>,
+    /// The shape of this person's window, while one shows the call: told to
+    /// those who send it video (`basics/video.md`), and never kept.
+    viewport: Option<Viewport>,
 }
 
 impl Call {
@@ -220,6 +223,7 @@ impl Call {
             group: false,
             offered: None,
             taken: None,
+            viewport: None,
         }
     }
 
@@ -277,6 +281,9 @@ pub struct Group {
     /// Linked only to see whether someone is on it, as another device said:
     /// until when, and that device's voice.
     probe: Option<(Instant, Voice)>,
+    /// The number of the newest viewport of each voice seen here, this
+    /// device's own among them.
+    viewports: HashMap<Voice, u32>,
     /// Frames that came on its links, and how many of them were new.
     frames_in: u64,
     frames_new: u64,
@@ -340,6 +347,33 @@ pub fn draft_format(short: &str) -> Format {
 /// Voice (`basics/voice.md`): its frames keep the call's first channel.
 pub fn voice() -> Format {
     draft_format("voice 1")
+}
+
+/// Video (`basics/video.md`): of its frames this service reads only the
+/// viewports, which it repeats and, in a group, passes on.
+pub fn video() -> Format {
+    draft_format("video vp8 1")
+}
+
+/// The shape of a window that shows someone's video: its width and height.
+pub type Viewport = (u16, u16);
+
+/// A viewport on the video channel is `1 || width (2) || height (2)`,
+/// big-endian, which no RTP packet is: RTP's first byte starts with bits 10.
+const VIEWPORT: u8 = 1;
+
+fn viewport_frame((w, h): Viewport) -> [u8; 5] {
+    let (w, h) = (w.to_be_bytes(), h.to_be_bytes());
+    [VIEWPORT, w[0], w[1], h[0], h[1]]
+}
+
+/// The viewport a frame on the video channel is, if it is one.
+fn viewport_in(b: &[u8]) -> Option<Viewport> {
+    let [VIEWPORT, w0, w1, h0, h1] = *b else {
+        return None;
+    };
+    let v = (u16::from_be_bytes([w0, w1]), u16::from_be_bytes([h0, h1]));
+    (v.0 > 0 && v.1 > 0).then_some(v)
 }
 
 /// Formats in their order, each once.
@@ -748,9 +782,14 @@ fn go_live(d: &Arc<Daemon>, s: &Session, id: [u8; 16]) {
                     tokio::select! {
                         _ = over.wait_for(|over| *over) => return,
                         heard = ch.recv() => match heard {
-                            Some(frame) => {
-                                let _ = d.call_video.send((id, format, frame));
-                            }
+                            Some(frame) => match viewport_in(&frame) {
+                                Some(v) if format == video() => {
+                                    let _ = d.call_viewport.send((id, None, v));
+                                }
+                                _ => {
+                                    let _ = d.call_video.send((id, format, frame));
+                                }
+                            },
                             None => return,
                         },
                     }
@@ -777,6 +816,8 @@ fn go_live(d: &Arc<Daemon>, s: &Session, id: [u8; 16]) {
                     if s.is_closed() {
                         break;
                     }
+                    // Said again, for one that was lost.
+                    send_viewport(&d);
                 }
             }
         }
@@ -990,6 +1031,7 @@ fn new_group(space: SpaceId, own: Option<Voice>, waiting: bool) -> Group {
         answered: HashMap::new(),
         thin_since: None,
         probe: None,
+        viewports: HashMap::new(),
         frames_in: 0,
         frames_new: 0,
         since: Instant::now(),
@@ -1228,6 +1270,9 @@ async fn drive(d: Arc<Daemon>, id: [u8; 16], mut over: watch::Receiver<bool>) {
         }
         for (s, l, b) in out {
             let _ = s.send_datagram(l, Priority::RealTime, b);
+        }
+        if here && on_it {
+            send_viewport(&d);
         }
         if !silent.is_empty() {
             // Its session may be gone too: it is asked, and linked again
@@ -1531,6 +1576,7 @@ fn live_now(d: &Daemon, id: &[u8; 16]) {
 fn carry_link(d: &Arc<Daemon>, s: &Session, space: SpaceId, id: [u8; 16], linked: u64) {
     let mut sound = s.channel(channel_label(&space, &id), Priority::RealTime);
     let mut words = s.channel(routing_label(&space, &id), Priority::RealTime);
+    let mut views = s.channel(format_label(&space, &id, &video()), Priority::RealTime);
     let (d, s) = (d.clone(), s.clone());
     let over = groups(&d).get(&id).map(|g| g.over.subscribe());
     let Some(mut over) = over else { return };
@@ -1545,6 +1591,10 @@ fn carry_link(d: &Arc<Daemon>, s: &Session, space: SpaceId, id: [u8; 16], linked
                 },
                 word = words.recv() => match word {
                     Some(word) => said(&d, &s, &id, &word),
+                    None => break,
+                },
+                view = views.recv() => match view {
+                    Some(view) => viewed(&d, &s, &id, &view),
                     None => break,
                 },
                 _ = check.tick() => {
@@ -1728,6 +1778,60 @@ fn said(d: &Daemon, from: &Session, id: &[u8; 16], bytes: &[u8]) {
     }
 }
 
+/// A viewport of a group call, come on the link `from` (`basics/video.md`):
+/// the newest of its voice, signed by its device, is passed on to every other
+/// link and given to this person's window.
+fn viewed(d: &Daemon, from: &Session, id: &[u8; 16], bytes: &[u8]) {
+    let Some(f) = Frame::parse(bytes) else {
+        return;
+    };
+    let Some(v) = viewport_in(f.payload) else {
+        return;
+    };
+    let ps = from.peer_static();
+    let newest = |g: &Group| {
+        g.viewports
+            .get(&f.voice)
+            .is_none_or(|m| mesh::after(f.n, *m))
+    };
+    {
+        let mut gs = groups(d);
+        let Some(g) = gs.get_mut(id) else { return };
+        if !g.tree.admit(&ps, Instant::now()) || !newest(g) {
+            return;
+        }
+    }
+    let Some(key) = key_of(d, id, &f.voice) else {
+        return;
+    };
+    if !mesh::signed_as(mesh::VIEWPORT, &f, id, &key) {
+        return;
+    }
+    let (to, label, show) = {
+        let mut gs = groups(d);
+        let Some(g) = gs.get_mut(id) else { return };
+        // Another link may have brought it while it was checked.
+        if !newest(g) {
+            return;
+        }
+        g.viewports.insert(f.voice, f.n);
+        let to: Vec<Session> = g
+            .sessions
+            .iter()
+            .filter(|(l, _)| **l != ps)
+            .map(|(_, (s, _))| s.clone())
+            .collect();
+        let show = g.tree.own().is_some_and(|own| own != f.voice);
+        (to, format_label(&g.space, id, &video()), show)
+    };
+    for s in to {
+        let _ = s.send_datagram(label, Priority::RealTime, Bytes::copy_from_slice(bytes));
+    }
+    if show {
+        let _ = d.call_viewport.send((*id, Some(f.voice), v));
+    }
+}
+
 /// Serves the `ephemeral` service. Only someone this person shares the space
 /// with may ring them in it (`spaces.md#ephemeral-messages`); this person's
 /// own devices speak only of group calls.
@@ -1904,10 +2008,19 @@ async fn told_the_others(
 /// Audio and the call's other formats for and from a client, one frame per
 /// message (`apps.md#the-local-interface`), after a reply that there is a
 /// call to carry; until the client goes or the call does.
-pub async fn media(d: &Arc<Daemon>, spec: &crate::api::Request, mut r: Reader, mut w: Writer) {
+pub async fn media(d: &Arc<Daemon>, spec: &crate::api::Request, r: Reader, w: Writer) {
+    carry_media(d, spec, r, w).await;
+    // The window's viewport goes with it.
+    if let Some(c) = lock(d).as_mut() {
+        c.viewport = None;
+    }
+}
+
+async fn carry_media(d: &Arc<Daemon>, spec: &crate::api::Request, mut r: Reader, mut w: Writer) {
     use cardinal_encoding::Record;
     let mut heard = d.call_audio.subscribe();
     let mut seen = d.call_video.subscribe();
+    let mut views = d.call_viewport.subscribe();
     let mut stopping = d.stopping.subscribe();
     let mut changed = d.changed.subscribe();
     let Some(call) = lock(d).as_ref().map(|c| c.id) else {
@@ -1957,14 +2070,41 @@ pub async fn media(d: &Arc<Daemon>, spec: &crate::api::Request, mut r: Reader, m
                     return;
                 }
             }
+            view = views.recv() => {
+                let Ok((of, voice, (width, height))) = view else { continue };
+                if of != call {
+                    continue;
+                }
+                let out = Record::new()
+                    .with(0, crate::api::frame::VIEWPORT)
+                    .with(1, u64::from(width))
+                    .with(2, u64::from(height))
+                    .with_opt(3, voice.map(|v| v.to_vec()));
+                if w.send(&out.encode()).await.is_err() {
+                    return;
+                }
+            }
             got = r.recv() => {
                 let Ok(Some(got)) = got else { return };
                 let crate::transport::Received::Message(msg) = got else { continue };
                 let Ok(rec) = Record::decode(&msg) else { continue };
+                let kind = rec.get(0).and_then(cardinal_encoding::Value::as_uint);
+                if kind == Some(crate::api::frame::VIEWPORT) {
+                    let side = |k| {
+                        rec.get(k)
+                            .and_then(cardinal_encoding::Value::as_uint)
+                            .and_then(|n| u16::try_from(n).ok())
+                            .filter(|n| *n > 0)
+                    };
+                    if let (Some(width), Some(height)) = (side(1), side(2)) {
+                        set_viewport(d, (width, height));
+                    }
+                    continue;
+                }
                 let Some(bytes) = rec.get(1).and_then(cardinal_encoding::Value::as_bytes) else {
                     continue;
                 };
-                match rec.get(0).and_then(cardinal_encoding::Value::as_uint) {
+                match kind {
                     Some(crate::api::frame::AUDIO) => send_audio(d, bytes.to_vec()),
                     Some(crate::api::frame::OTHER) => {
                         let format = rec
@@ -1979,6 +2119,55 @@ pub async fn media(d: &Arc<Daemon>, spec: &crate::api::Request, mut r: Reader, m
                 }
             }
         }
+    }
+}
+
+/// The shape of this person's window changed: those sending it video are
+/// told now, and again every five seconds.
+fn set_viewport(d: &Daemon, v: Viewport) {
+    if let Some(c) = lock(d).as_mut() {
+        c.viewport = Some(v);
+    }
+    send_viewport(d);
+}
+
+/// Tells those on the call the shape of this person's window, if one shows
+/// it (`basics/video.md`): between two people on the video channel, if the
+/// call took video; in a group, signed, to every link.
+fn send_viewport(d: &Daemon) {
+    let (id, group, session, label, v) = {
+        let call = lock(d);
+        let Some(c) = call.as_ref().filter(|c| c.standing != Standing::Ringing) else {
+            return;
+        };
+        let Some(v) = c.viewport else { return };
+        if !c.group && !c.taken.as_ref().is_some_and(|t| t.contains(&video())) {
+            return;
+        }
+        let label = format_label(&c.space, &c.id, &video());
+        (c.id, c.group, c.session.clone(), label, viewport_frame(v))
+    };
+    if !group {
+        if let Some(s) = session {
+            let _ = s.send_datagram(label, Priority::RealTime, Bytes::copy_from_slice(&v));
+        }
+        return;
+    }
+    let (out, to) = {
+        let mut gs = groups(d);
+        let Some(g) = gs.get_mut(&id) else { return };
+        let Some(own) = g.tree.own() else { return };
+        let n = g
+            .viewports
+            .get(&own)
+            .map_or_else(mesh::first_number, |n| n.wrapping_add(1));
+        g.viewports.insert(own, n);
+        let out = mesh::frame_of(mesh::VIEWPORT, &d.keys.signing, &id, &own, n, &v);
+        let to: Vec<Session> = g.sessions.values().map(|(s, _)| s.clone()).collect();
+        (Bytes::from(out), to)
+    };
+    for s in to {
+        let _ = s.send_datagram(label, Priority::RealTime, out.clone());
     }
 }
 
@@ -2060,6 +2249,36 @@ fn send_audio(d: &Daemon, frame: Vec<u8>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A viewport reads back, is never an RTP packet, and a viewport signed
+    /// for a group is not a frame of sound.
+    #[test]
+    fn a_viewport_is_told_apart_from_video_and_sound() {
+        let b = viewport_frame((9, 16));
+        assert_eq!(b, [1, 0, 9, 0, 16]);
+        assert_eq!(viewport_in(&b), Some((9, 16)));
+        assert_eq!(viewport_in(&[1, 0, 0, 0, 16]), None, "no side is zero");
+        // RTP version 2, payload type 96, the size of a viewport
+        assert_eq!(viewport_in(&[0x80, 96, 0, 1, 2]), None);
+        assert_eq!(viewport_in(&b[..4]), None);
+        let key = cardinal_crypto::SigningKey::generate();
+        let own = mesh::voice_of(&key.public_key());
+        let f = mesh::frame_of(mesh::VIEWPORT, &key, &[7; 16], &own, 3, &b);
+        let f = Frame::parse(&f).unwrap();
+        assert!(mesh::signed_as(
+            mesh::VIEWPORT,
+            &f,
+            &[7; 16],
+            &key.public_key()
+        ));
+        assert!(!mesh::signed_by(&f, &[7; 16], &key.public_key()));
+        assert!(!mesh::signed_as(
+            mesh::VIEWPORT,
+            &f,
+            &[8; 16],
+            &key.public_key()
+        ));
+    }
 
     #[test]
     fn an_answer_naming_nothing_takes_voice_only_and_formats_come_once() {

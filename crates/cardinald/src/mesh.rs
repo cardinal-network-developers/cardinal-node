@@ -85,10 +85,17 @@ impl<'a> Frame<'a> {
     }
 }
 
-/// What a frame's signature covers, so that it holds for this call only.
-pub fn signed_part(call: &[u8; 16], voice: &Voice, n: u32, payload: &[u8]) -> Vec<u8> {
+/// What a frame's signature says it is: a frame of the call's sound.
+const FRAME: &[u8] = b"cardinal call frame v1";
+/// A viewport on a group call's video channel (`basics/video.md`), signed
+/// apart so that it can never be taken for sound.
+pub const VIEWPORT: &[u8] = b"cardinal call viewport v1";
+
+/// What a frame's signature covers, so that it holds for this call only and
+/// for frames of the kind `what` says.
+fn signed_in(what: &[u8], call: &[u8; 16], voice: &Voice, n: u32, payload: &[u8]) -> Vec<u8> {
     let mut m = Vec::with_capacity(32 + 16 + 12 + payload.len());
-    m.extend_from_slice(b"cardinal call frame v1");
+    m.extend_from_slice(what);
     m.extend_from_slice(call);
     m.extend_from_slice(voice);
     m.extend_from_slice(&n.to_be_bytes());
@@ -104,7 +111,19 @@ pub fn frame(
     n: u32,
     payload: &[u8],
 ) -> Vec<u8> {
-    let signature = key.sign(&signed_part(call, voice, n, payload));
+    frame_of(FRAME, key, call, voice, n, payload)
+}
+
+/// A frame of the kind `what` says, signed.
+pub fn frame_of(
+    what: &[u8],
+    key: &cardinal_crypto::SigningKey,
+    call: &[u8; 16],
+    voice: &Voice,
+    n: u32,
+    payload: &[u8],
+) -> Vec<u8> {
+    let signature = key.sign(&signed_in(what, call, voice, n, payload));
     let mut out = Vec::with_capacity(HEADER + payload.len());
     out.extend_from_slice(voice);
     out.extend_from_slice(&n.to_be_bytes());
@@ -115,8 +134,18 @@ pub fn frame(
 
 /// Whether a frame is signed by `key`.
 pub fn signed_by(f: &Frame<'_>, call: &[u8; 16], key: &[u8; 32]) -> bool {
-    let m = signed_part(call, &f.voice, f.n, f.payload);
+    signed_as(FRAME, f, call, key)
+}
+
+/// Whether a frame of the kind `what` says is signed by `key`.
+pub fn signed_as(what: &[u8], f: &Frame<'_>, call: &[u8; 16], key: &[u8; 32]) -> bool {
+    let m = signed_in(what, call, &f.voice, f.n, f.payload);
     cardinal_crypto::sign::verify(key, &m, &f.signature).is_ok()
+}
+
+/// Whether `n` is past `m`, counting round.
+pub fn after(n: u32, m: u32) -> bool {
+    ahead(n, m) > 0
 }
 
 pub fn voice_of(key: &[u8; 32]) -> Voice {

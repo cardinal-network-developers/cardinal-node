@@ -61,6 +61,10 @@ pub mod frame {
     pub const AUDIO: u64 = 1;
     /// A frame of another format the call took, named in key 2.
     pub const OTHER: u64 = 2;
+    /// The shape of a window's viewport, width and height in keys 1 and 2
+    /// (`basics/video.md`): from the window, its own; from the service, a
+    /// receiver's, with key 3 in a group.
+    pub const VIEWPORT: u64 = 3;
 }
 
 /// A reply's key 1 in an error: why, in words.
@@ -654,10 +658,12 @@ pub fn decode_event(msg: &[u8]) -> anyhow::Result<Option<Json>> {
 }
 
 /// A `call-media` frame as a message: `{"audio": hex}` and in a group
-/// `from`, or `{"frame": hex, "format": hex}`.
+/// `from`, `{"frame": hex, "format": hex}`, or `{"width": n, "height": n}`.
 pub fn frame_message(frame: &Json) -> anyhow::Result<Vec<u8>> {
     let kind = if frame.get("frame").is_some() {
         "frame"
+    } else if frame.get("width").is_some() {
+        "viewport"
     } else {
         "audio"
     };

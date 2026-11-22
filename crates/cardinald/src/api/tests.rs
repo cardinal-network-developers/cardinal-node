@@ -232,6 +232,19 @@ fn events_and_frames() {
             .with(2, vec![0xaau8])
             .encode()
     );
+    let v = frame_message(&json!({"width": 9, "height": 16})).unwrap();
+    assert_eq!(
+        v,
+        Record::new()
+            .with(0, 3u64)
+            .with(1, 9u64)
+            .with(2, 16u64)
+            .encode()
+    );
+    assert_eq!(
+        decode_frame(&v).unwrap().unwrap(),
+        json!({"width": 9, "height": 16})
+    );
 }
 
 #[test]
