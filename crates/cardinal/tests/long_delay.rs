@@ -83,6 +83,11 @@ fn summaries_on_a_long_link() {
 /// An answer to a summary that brings more objects unasked than one may
 /// carry (here, for the test, three) is refused: the stream is reset, and
 /// the set reconciled turn by turn, its objects asked for. Nothing is lost.
+///
+/// The answer is provoked on a reconnection, when beta already holds the
+/// space and so opens with its own summary of it: at the first meeting,
+/// right after joining, beta may learn of the space only from alpha's
+/// summary, which it answers, and then never sends one of its own.
 #[test]
 fn an_answer_beyond_what_a_summary_may_carry_is_refused() {
     if !fuse_available() {
@@ -103,20 +108,33 @@ fn an_answer_beyond_what_a_summary_may_carry_is_refused() {
     let out = a.cli(&["init", "--yes", "--name", "alpha"]);
     assert!(out.contains("Set up"), "{out}");
     a.wait_mounted();
-    for i in 0..20 {
-        std::fs::write(a.p(&format!("a{i:02}.txt")), format!("alpha {i}\n")).unwrap();
-    }
+    std::fs::write(a.p("first.txt"), "first\n").unwrap();
     a.cli(&["flush"]);
     pair(&a, &b);
     b.wait_mounted();
+    wait("beta has alpha's first file", 60, || {
+        read(&b.p("first.txt")).as_deref() == Some("first\n")
+    });
+
+    // With beta away, alpha writes in many commits, each its own objects:
+    // more than an answer may carry.
+    b.stop();
+    for i in 0..10 {
+        std::fs::write(a.p(&format!("a{i:02}.txt")), format!("alpha {i}\n")).unwrap();
+        a.cli(&["flush"]);
+    }
+    let before = b.log().len();
+    b.start();
+    b.wait_mounted();
     wait("beta has alpha's files", 60, || {
-        (0..20).all(|i| {
+        (0..10).all(|i| {
             read(&b.p(&format!("a{i:02}.txt"))).as_deref() == Some(&format!("alpha {i}\n"))
         })
     });
     let log = b.log();
+    let since = &log[before..];
     assert!(
-        log.contains("reconciling") && log.contains("turn by turn"),
+        since.contains("reconciling") && since.contains("turn by turn"),
         "{log}"
     );
 }
