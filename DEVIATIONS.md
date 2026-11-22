@@ -1202,6 +1202,26 @@ Readings:
   when the folder comes back. (Before, a delete flagged again what was
   already deleted, and such a file came back with its folder.) Views hide
   everything beneath a deleted node.
+- **A delete of what is already deleted does nothing** (designer,
+  2026-11-22). No flag is set and no delete conflict, whatever is
+  concurrent with it, so a file made in a deleted folder since its delete
+  is not flagged by a second delete, and comes back when the folder is
+  restored. (Before, a second delete flagged it, and it stayed deleted.)
+  Two deletes of one folder made at once still both yield, as before: each
+  names the folder, which touches it.
+- **The delete number** (designer, 2026-11-22; `vectors/state.json`,
+  `a_restore`). In the canonical state, field 6 of a deleted node's record
+  is no longer `true` but the number of the delete that took it, the same
+  for every node one delete took, so that a restore in a successor clears
+  exactly what one delete set. **Readings, until `state.md` says:** field 6
+  is a uint, absent when the node is not deleted (a bool there is
+  malformed); deletes are numbered from 0 in the order the records, sorted
+  by node id, list the first node each took; a canonical state numbered
+  any other way is refused, as one no device computes. A successor's
+  initial state is read with each carried node's number, and a restore
+  there clears the node and every node carried with the same number. The
+  numbers are the canonical state's alone: a device keeps which op took a
+  node, and numbers the deletes afresh each time it writes the state.
 - **Any kind, anywhere** (`state.md#operations`). A `create` is accepted
   whatever its kind and wherever it puts the node, and the files and
   account profiles reject nothing for kind or place any more. What shows a

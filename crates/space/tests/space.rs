@@ -964,6 +964,126 @@ fn a_restore_brings_back_what_its_delete_took_and_nothing_else() {
     every_way(&b);
 }
 
+/// `state.md#deletion-yields-to-concurrent-work`: a delete of a node that
+/// is already deleted does nothing. A file made in a deleted folder is not
+/// flagged by a second delete of the folder, so it comes back when the
+/// folder is restored. In the canonical state every node one delete took has that delete's
+/// number, and a state that numbers its deletes otherwise is refused.
+#[test]
+fn a_delete_of_what_is_deleted_does_nothing() {
+    let p = person(24, 1);
+    let (d0, d1) = (&p.devices[0], &p.devices[1]);
+    let (mut a, genesis) = Space::create(
+        Profile::FILES,
+        Policy::default(),
+        &p.log,
+        &d0.signing,
+        &[p.enc.public_key()],
+        None,
+    )
+    .unwrap();
+    let enc1 = p.log.open_encryption_key(d1).unwrap();
+    let genesis = SealedEntry::decode(&genesis.encode()).unwrap();
+    let mut b = Space::open_genesis(&genesis, &[&enc1], Some(p.log.state())).unwrap();
+    let write = |s: &mut Space, d: &DeviceKeys, ops: Vec<SpaceOp>| {
+        s.write_entry(&p.log, &d.signing, ops, None).unwrap().0
+    };
+    let deleted = |s: &Space, n: &cardinal_space::NodeId| s.state().node(n).unwrap().deleted;
+    let every_way = |s: &Space| {
+        let valid = &s.validity().valid;
+        let full = cardinal_space::State::compute(Profile::FILES, s.dag(), valid);
+        assert_eq!(full.canonical(), s.state().canonical());
+        let plain = cardinal_space::State::compute_by_definition(Profile::FILES, s.dag(), valid);
+        assert_eq!(plain.canonical(), s.state().canonical());
+    };
+    let made = write(&mut a, d0, vec![files::create_folder(ROOT, "Trip")]);
+    let trip = files::created_node(&made, 0);
+    let made = write(
+        &mut a,
+        d0,
+        vec![files::create_file(trip, "a", &file(b"a"), 0o644, None)],
+    );
+    let fa = files::created_node(&made, 0);
+    write(&mut a, d0, vec![SpaceOp::delete(trip)]);
+    let made = write(
+        &mut a,
+        d0,
+        vec![files::create_file(trip, "late", &file(b"l"), 0o644, None)],
+    );
+    let late = files::created_node(&made, 0);
+    write(&mut a, d0, vec![SpaceOp::delete(trip)]);
+    assert!(deleted(&a, &trip) && deleted(&a, &fa));
+    assert!(!deleted(&a, &late), "the second delete does nothing");
+    every_way(&a);
+    write(&mut a, d0, vec![SpaceOp::restore(trip)]);
+    assert!(!deleted(&a, &trip) && !deleted(&a, &fa) && !deleted(&a, &late));
+    every_way(&a);
+
+    // the other device deletes Trip again, and then deletes it once more
+    // after a file is made in it
+    sync(&a, &mut b, &enc1);
+    write(&mut b, d1, vec![SpaceOp::delete(trip)]);
+    sync(&b, &mut a, &p.enc);
+    assert_eq!(a.state().canonical(), b.state().canonical());
+    assert!([trip, fa, late].iter().all(|n| deleted(&a, n)));
+    every_way(&a);
+    // one delete took all three: they share its number
+    let canonical = a.state().canonical();
+    let numbers: Vec<Option<u64>> = canonical
+        .list(1)
+        .unwrap()
+        .iter()
+        .filter_map(|v| v.as_record())
+        .map(|r| r.opt_uint(6).unwrap())
+        .collect();
+    assert_eq!(numbers, [Some(0); 3]);
+    write(&mut b, d1, vec![SpaceOp::restore(trip)]);
+    sync(&b, &mut a, &p.enc);
+    assert!([trip, fa, late].iter().all(|n| !deleted(&a, n)));
+    every_way(&a);
+
+    // a canonical state whose deletes are not numbered from 0, in the
+    // order its records first list them, is not one any device computes
+    let renumbered = |canonical: &Record, by: &dyn Fn(u64) -> u64| -> Record {
+        let list: Vec<cardinal_encoding::Value> = canonical
+            .list(1)
+            .unwrap()
+            .iter()
+            .map(|v| {
+                let r = v.as_record().unwrap();
+                match r.opt_uint(6).unwrap() {
+                    Some(n) => r.clone().with(6, by(n)).into(),
+                    None => r.clone().into(),
+                }
+            })
+            .collect();
+        canonical.clone().with(1, cardinal_encoding::Value::List(list))
+    };
+    write(&mut a, d0, vec![SpaceOp::delete(late)]);
+    write(&mut a, d0, vec![SpaceOp::delete(trip)]);
+    let two = a.state().canonical();
+    assert!(cardinal_space::State::from_canonical(Profile::FILES, &two).is_ok());
+    let from_one = |n: u64| n + 1;
+    let swapped = |n: u64| 1 - n;
+    let ways: [&dyn Fn(u64) -> u64; 2] = [&from_one, &swapped];
+    for by in ways {
+        let bad = renumbered(&two, by);
+        assert!(cardinal_space::State::from_canonical(Profile::FILES, &bad).is_err());
+    }
+    let as_bool = renumbered(&two, &|n| n).with(1, {
+        let list = two.list(1).unwrap().to_vec();
+        let flagged = list.into_iter().map(|v| {
+            let r = v.as_record().unwrap().clone();
+            match r.opt_uint(6).unwrap() {
+                Some(_) => r.with(6, true).into(),
+                None => r.into(),
+            }
+        });
+        cardinal_encoding::Value::List(flagged.collect())
+    });
+    assert!(cardinal_space::State::from_canonical(Profile::FILES, &as_bool).is_err());
+}
+
 #[test]
 fn written_beside_supersedes_and_deletes_nothing() {
     // `state.md`: a `set` written beside adds its value and supersedes none;

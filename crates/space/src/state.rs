@@ -96,7 +96,19 @@ pub struct Node {
     pub created: Option<u64>,
     /// The position of its `create` in that entry.
     created_op: u32,
-    deleted_by: Option<(EntryId, u32)>,
+    /// The delete that set its deleted flag, if it is set.
+    deleted_by: Option<Took>,
+}
+
+/// The delete that took a node (`state.md#deletion-yields-to-concurrent-work`):
+/// the place of a `delete` op in this space, or, for a node a successor's
+/// initial state carried deleted, the number that state gave the delete,
+/// which every node that one delete took shares
+/// (`state.md#canonical-state`, field 6).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum Took {
+    Op(EntryId, u32),
+    Carried(u64),
 }
 
 impl Node {
@@ -547,6 +559,7 @@ impl State {
             Ok(out)
         };
         let mut seen: HashSet<NodeId> = HashSet::new();
+        let mut numbers: Vec<u64> = Vec::new();
         for r in canonical.opt_list(1)?.unwrap_or(&[]) {
             let r = r.as_record().ok_or(bad.clone())?;
             let id = r.get(1).and_then(id16).ok_or(bad.clone())?;
@@ -564,6 +577,11 @@ impl State {
             let writer = r.get(7).and_then(id32).ok_or(bad.clone())?;
             let creator = r.get(9).and_then(id32).ok_or(bad.clone())?;
             let rank = r.uint(10)?;
+            // the delete that took it, if it is deleted
+            let took = r.opt_uint(6)?;
+            if let Some(t) = took.filter(|t| !numbers.contains(t)) {
+                numbers.push(t);
+            }
             let author_owned = fields.get(&AUTHOR_OWNED_FIELD).is_some_and(|vs| {
                 vs.iter()
                     .any(|v| v.value.as_ref().and_then(|x| x.as_uint()) == Some(1))
@@ -586,7 +604,7 @@ impl State {
                     parent,
                     name: r.opt_text(4)?.unwrap_or("").to_owned(),
                     fields,
-                    deleted: r.opt_bool(6)?.unwrap_or(false),
+                    deleted: took.is_some(),
                     delete_conflict: r.opt_bool(8)?.unwrap_or(false),
                     position_writer: writer,
                     creator,
@@ -596,10 +614,15 @@ impl State {
                     created_in: writer,
                     created: r.opt_uint(11)?,
                     created_op: 0,
-                    deleted_by: None,
+                    deleted_by: took.map(Took::Carried),
                 },
             );
             st.carried.insert(id, rank);
+        }
+        // The deletes are numbered from 0 in the order the records list the
+        // first node each took: what a state computed from entries numbers.
+        if numbers != (0..numbers.len() as u64).collect::<Vec<_>>() {
+            return Err(bad);
         }
         // Every parent is a node it records, or the root, and no node is
         // its own ancestor: what a tree computed from entries always is.
@@ -1131,6 +1154,12 @@ impl State {
                     node,
                     beside: false,
                 } => {
+                    // A delete of a node already deleted does nothing: what
+                    // was made beneath it since comes back with the restore
+                    // of the delete that took it.
+                    if self.nodes.get(node).is_some_and(|n| n.deleted) {
+                        continue;
+                    }
                     let eff = match effects.as_mut() {
                         Some(decide) => decide(i, node),
                         None => DeleteEffect {
@@ -1146,7 +1175,7 @@ impl State {
                         if let Some(n) = self.nodes.get_mut(&m).filter(|n| !n.deleted) {
                             n.deleted = true;
                             n.delete_conflict = false;
-                            n.deleted_by = Some((id, i));
+                            n.deleted_by = Some(Took::Op(id, i));
                         }
                     }
                     if eff.conflict {
@@ -1295,7 +1324,9 @@ impl State {
     /// (`state.md#canonical-state`). Every other node's record says where
     /// it comes in the order the nodes were created in (field 10) and when
     /// its creating entry says it was made (field 11), so that a device
-    /// starting from a canonical state can show them as they were made.
+    /// starting from a canonical state can show them as they were made; and
+    /// a deleted node's, the number of the delete that took it (field 6),
+    /// which every node that delete took shares.
     pub fn canonical(&self) -> Record {
         fn fields(fields: &BTreeMap<u64, Vec<FieldValue>>) -> Value {
             let set = fields.iter().filter(|(_, vs)| !vs.is_empty());
@@ -1324,15 +1355,28 @@ impl State {
             .collect();
         made.sort_unstable();
         let rank: HashMap<NodeId, u64> = made.iter().map(|(_, _, _, id)| *id).zip(0..).collect();
+        // Each delete that took a node is numbered from 0, in the order the
+        // records list the first node it took: so a restore in a successor
+        // clears exactly the flags one delete set.
+        let mut ids: Vec<&NodeId> = self.nodes.keys().collect();
+        ids.sort_unstable();
+        let mut number: HashMap<Took, u64> = HashMap::new();
+        for id in ids {
+            if let Some(t) = self.nodes[id].deleted_by.filter(|_| self.nodes[id].deleted) {
+                let next = number.len() as u64;
+                number.entry(t).or_insert(next);
+            }
+        }
         let mut records: Vec<(NodeId, Record)> = Vec::new();
         for (id, n) in &self.nodes {
+            let took = n.deleted_by.filter(|_| n.deleted).map(|t| number[&t]);
             let r = Record::new()
                 .with(1, n.id)
                 .with(2, n.kind.to_value())
                 .with(3, n.parent)
                 .with(4, n.name.as_str())
                 .with(5, fields(&n.fields))
-                .with(6, n.deleted)
+                .with_opt(6, took)
                 .with(7, n.position_writer)
                 .with(8, n.delete_conflict)
                 .with(9, n.creator)
