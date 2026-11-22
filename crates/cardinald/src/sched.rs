@@ -19,9 +19,20 @@
 //!   than a moment ago is asked again: devices fetching the same content
 //!   at once then take it from each other rather than all from the slow
 //!   one.
-//! - A request outstanding much longer than its device's typical latency
-//!   is hedged: its ids are asked of another device too, and whichever
-//!   copy arrives first is kept.
+//! - No fixed time is waited (`sync.md#blob-transfer`: there is no reply
+//!   for busy). Each device's time per chunk is learned as TCP learns a
+//!   round trip (RFC 6298): a smoothed time and its variation, per chunk
+//!   outstanding at that device when a request went, so a request of
+//!   `n` chunks behind `m` others is expected within `(n + m) × (srtt + 4 ×
+//!   rttvar)`. A device not measured yet is given a patient
+//!   [`INITIAL_PER_CHUNK`]. A request well past that is hedged: its ids are
+//!   asked of another holder too, whichever copy arrives first is kept,
+//!   and the late device's expectation doubles until it answers again
+//!   (TCP's backoff). Where no other holder has room, it is waited for,
+//!   and looked at again after the longer expectation. A late request is
+//!   never a failure and never makes its device lack anything: only a
+//!   reply without an id says not held. Once every id of a request came
+//!   from elsewhere, the request is dropped ([`Scheduler::moot`]).
 //!
 //! The scheduler does no I/O and takes the time as an argument, so it is
 //! tested on its own; `net.rs` drives it.
@@ -56,13 +67,16 @@ pub const LACK_MEMORY: Duration = Duration::from_secs(30);
 pub const RECHECK_AFTER: Duration = Duration::from_millis(250);
 /// See [`RECHECK_AFTER`] (a ratio of typical latencies).
 pub const QUICKER: f64 = 2.0;
-/// A request is hedged after this many times its device's typical
-/// latency...
-pub const HEDGE_FACTOR: u32 = 4;
-/// ... but never sooner than this.
+/// A request is hedged no sooner than this, however quick its device.
 pub const HEDGE_MIN: Duration = Duration::from_millis(750);
-/// Consecutive failures before a device is left out (until it
-/// reconnects).
+/// The time per chunk expected of a device not measured yet: patient, as
+/// TCP's first retransmission timeout is, so that a slow first answer
+/// over Bluetooth is not passed over.
+pub const INITIAL_PER_CHUNK: Duration = Duration::from_secs(1);
+/// How many times a late device's expectation doubles at most.
+pub const MAX_BACKOFF: u32 = 6;
+/// Consecutive failures (errors, a closed stream or session, a bad reply;
+/// never lateness) before a device is left out (until it reconnects).
 pub const MAX_FAILURES: u32 = 3;
 /// Throughput samples cover at least this much busy time (or one typical
 /// latency): replies come in bursts.
@@ -91,6 +105,14 @@ pub struct PeerStats {
     /// Bytes received from this device since the daemon started,
     /// including late duplicates of hedged requests.
     pub bytes_total: u64,
+    /// Smoothed time per chunk outstanding, seconds (RFC 6298's SRTT);
+    /// 0 if unmeasured.
+    pub per_chunk: f64,
+    /// Its variation (RFC 6298's RTTVAR).
+    pub per_chunk_var: f64,
+    /// Times in a row a request of this device's went past what was
+    /// expected of it: each doubles what is expected next.
+    pub backoff: u32,
 }
 
 impl PeerStats {
@@ -113,12 +135,31 @@ impl PeerStats {
         w.clamp(2, MAX_WINDOW)
     }
 
-    /// When an outstanding request should be hedged.
-    pub fn hedge_after(&self) -> Duration {
-        if self.samples == 0 {
-            return HEDGE_MIN * 4;
+    /// How long a request is expected to take when `chunks` chunks are
+    /// outstanding at this device, its own included: past that, it is well
+    /// past what this device does, and another holder is asked.
+    pub fn expect(&self, chunks: usize) -> Duration {
+        let per = if self.per_chunk > 0.0 {
+            self.per_chunk + 4.0 * self.per_chunk_var
+        } else {
+            INITIAL_PER_CHUNK.as_secs_f64()
+        };
+        let backoff = f64::from(1u32 << self.backoff.min(MAX_BACKOFF));
+        Duration::from_secs_f64(per * chunks.max(1) as f64 * backoff).max(HEDGE_MIN)
+    }
+
+    /// A reply came `latency` after it was asked, with `chunks` chunks
+    /// outstanding at the device then, its own included (RFC 6298).
+    fn sample_per_chunk(&mut self, latency: Duration, chunks: usize) {
+        let r = latency.as_secs_f64() / chunks.max(1) as f64;
+        if self.per_chunk <= 0.0 {
+            self.per_chunk = r;
+            self.per_chunk_var = r / 2.0;
+        } else {
+            self.per_chunk_var = 0.75 * self.per_chunk_var + 0.25 * (self.per_chunk - r).abs();
+            self.per_chunk = 0.875 * self.per_chunk + 0.125 * r;
         }
-        Duration::from_secs_f64(self.latency * HEDGE_FACTOR as f64).max(HEDGE_MIN)
+        self.backoff = 0;
     }
 
     /// One reply: its size and latency. The first reply also gives a
@@ -161,6 +202,8 @@ impl PeerStats {
 struct PeerState {
     stats: PeerStats,
     outstanding: usize,
+    /// Chunks asked of it and not answered yet.
+    chunks_out: usize,
     /// Bytes expected from the outstanding requests.
     expected: f64,
     failures: u32,
@@ -179,6 +222,7 @@ impl PeerState {
         PeerState {
             stats,
             outstanding: 0,
+            chunks_out: 0,
             expected: 0.0,
             failures: 0,
             live: true,
@@ -245,6 +289,10 @@ struct Outstanding {
     sent: Instant,
     expected: f64,
     hedged: bool,
+    /// Chunks outstanding at its device when it went, its own included.
+    ahead: usize,
+    /// When it is next looked at as late.
+    due: Instant,
 }
 
 /// What a reply means.
@@ -294,9 +342,11 @@ impl Scheduler {
                     // reconnected: start over, keeping what it lacked
                     let lacks = std::mem::take(&mut p.lacks);
                     let (outstanding, expected) = (p.outstanding, p.expected);
+                    let chunks_out = p.chunks_out;
                     *p = PeerState::new(*stats);
                     p.lacks = lacks;
                     p.outstanding = outstanding;
+                    p.chunks_out = chunks_out;
                     p.expected = expected;
                 }
                 Some(_) => {}
@@ -385,6 +435,9 @@ impl Scheduler {
             / BATCH as f64;
         p.tick(now);
         p.outstanding += 1;
+        p.chunks_out += ids.len();
+        let ahead = p.chunks_out;
+        let due = now + p.stats.expect(ahead);
         p.expected += expected;
         for id in &ids {
             if let Some(n) = self.wanted.get_mut(id) {
@@ -402,6 +455,8 @@ impl Scheduler {
                 expected,
                 // a hedge is not hedged again
                 hedged: hedge,
+                ahead,
+                due,
             },
         );
         Request {
@@ -416,16 +471,12 @@ impl Scheduler {
     /// work while devices have room.
     pub fn poll(&mut self, now: Instant) -> Vec<Request> {
         let mut out = Vec::new();
-        // Hedges.
+        // Requests well past what their devices are expected to take:
+        // asked of another holder too.
         let slow: Vec<u64> = self
             .requests
             .iter()
-            .filter(|(_, r)| {
-                !r.hedged
-                    && self.peers.get(&r.peer).is_some_and(|p| {
-                        now.saturating_duration_since(r.sent) > p.stats.hedge_after()
-                    })
-            })
+            .filter(|(_, r)| !r.hedged && now > r.due)
             .map(|(k, _)| *k)
             .collect();
         for rid in slow {
@@ -445,8 +496,18 @@ impl Scheduler {
             if ids.is_empty() {
                 continue;
             }
+            // Late: what is expected of its device doubles, until it
+            // answers. It has not failed, and lacks nothing.
+            let ahead = self.requests[&rid].ahead;
+            if let Some(p) = self.peers.get_mut(&peer) {
+                p.stats.backoff = (p.stats.backoff + 1).min(MAX_BACKOFF);
+                let again = now + p.stats.expect(ahead);
+                self.requests.get_mut(&rid).expect("request").due = again;
+            }
             let bytes = ids.len() as f64 * PRIOR_REQUEST / BATCH as f64;
             let Some(other) = self.best_peer(&ids[0], bytes, now, Some(&peer)) else {
+                // No other holder with room: waited for, and looked at
+                // again after the longer wait.
                 continue;
             };
             self.requests.get_mut(&rid).expect("request").hedged = true;
@@ -619,12 +680,23 @@ impl Scheduler {
         self.requests
             .values()
             .filter(|r| !r.hedged)
-            .filter_map(|r| {
-                self.peers
-                    .get(&r.peer)
-                    .map(|p| r.sent + p.stats.hedge_after())
-            })
+            .map(|r| r.due)
             .min()
+    }
+
+    /// Requests none of whose ids is wanted any more: everything they ask
+    /// for came from elsewhere. Drop them ([`cancel`](Self::cancel)).
+    pub fn moot(&self) -> Vec<u64> {
+        self.requests
+            .iter()
+            .filter(|(_, r)| r.ids.iter().all(|i| !self.wanted.contains_key(i)))
+            .map(|(k, _)| *k)
+            .collect()
+    }
+
+    /// A request given up on because it is moot: no failure, no sample.
+    pub fn cancel(&mut self, rid: u64, now: Instant) {
+        self.finish(rid, now);
     }
 
     fn finish(&mut self, rid: u64, now: Instant) -> Option<Outstanding> {
@@ -632,6 +704,7 @@ impl Scheduler {
         if let Some(p) = self.peers.get_mut(&r.peer) {
             p.tick(now);
             p.outstanding = p.outstanding.saturating_sub(1);
+            p.chunks_out = p.chunks_out.saturating_sub(r.ids.len());
             p.expected = (p.expected - r.expected).max(0.0);
         }
         for id in &r.ids {
@@ -652,8 +725,9 @@ impl Scheduler {
         let got: HashSet<Id> = got.iter().copied().collect();
         if let Some(p) = self.peers.get_mut(&r.peer) {
             p.failures = 0;
-            p.stats
-                .sample_reply(bytes, now.saturating_duration_since(r.sent));
+            let latency = now.saturating_duration_since(r.sent);
+            p.stats.sample_reply(bytes, latency);
+            p.stats.sample_per_chunk(latency, r.ahead);
             p.received(bytes);
             for id in &r.ids {
                 if !got.contains(id) {
@@ -679,7 +753,8 @@ impl Scheduler {
         ReplyOutcome { accepted }
     }
 
-    /// A request failed (timed out, the session closed, a bad reply).
+    /// A request failed (the stream or session closed, a bad reply): never
+    /// for being late, which [`poll`](Self::poll) deals with.
     pub fn failed(&mut self, rid: u64, now: Instant) {
         let Some(r) = self.finish(rid, now) else {
             return;
@@ -721,6 +796,9 @@ mod tests {
             reply_bytes: 1024.0 * 1024.0,
             samples: 10,
             bytes_total: 0,
+            per_chunk: latency / BATCH as f64,
+            per_chunk_var: 0.0,
+            backoff: 0,
         }
     }
 
@@ -985,5 +1063,100 @@ mod tests {
         assert!(fast.window() > 4, "{}", fast.window());
         assert!(fast.window() <= MAX_WINDOW);
         assert_eq!(PeerStats::default().window(), PROBE_WINDOW);
+    }
+
+    /// One device measured at `per_chunk` seconds a chunk, steadily.
+    fn steady(per_chunk: f64) -> PeerStats {
+        PeerStats {
+            per_chunk,
+            per_chunk_var: 0.0,
+            ..measured(1e6, per_chunk * BATCH as f64)
+        }
+    }
+
+    #[test]
+    fn a_new_device_is_given_patience_and_then_what_it_showed() {
+        let new = PeerStats::default();
+        assert_eq!(new.expect(BATCH), INITIAL_PER_CHUNK * BATCH as u32);
+        // A first reply: 2 s for 16 chunks.
+        let mut p = new;
+        p.sample_per_chunk(Duration::from_secs(2), BATCH);
+        assert_eq!(p.expect(BATCH), Duration::from_secs(6), "{p:?}");
+        // Steady replies narrow it to about what it takes.
+        for _ in 0..40 {
+            p.sample_per_chunk(Duration::from_secs(2), BATCH);
+        }
+        let e = p.expect(BATCH).as_secs_f64();
+        assert!((2.0..2.1).contains(&e), "{e}");
+        // Late, it doubles, and an answer brings it back.
+        p.backoff = 2;
+        assert!((p.expect(BATCH).as_secs_f64() - 4.0 * e).abs() < 1e-6);
+        p.sample_per_chunk(Duration::from_secs(2), BATCH);
+        assert_eq!(p.backoff, 0);
+    }
+
+    #[test]
+    fn a_slow_device_is_passed_over_when_well_past_what_it_does() {
+        let t0 = Instant::now();
+        let mut s = Scheduler::new();
+        // A: half a second a chunk; it is the only one at first.
+        s.set_peers(&[(A, steady(0.5))]);
+        for i in 0..BATCH as u32 {
+            s.push(id(i));
+        }
+        let first = s.poll(t0).remove(0);
+        assert_eq!(first.peer, A);
+        // B comes; what A takes, 8 s for these 16, is not past yet.
+        s.set_peers(&[(A, steady(0.5)), (B, steady(0.01))]);
+        assert_eq!(s.next_deadline(), Some(t0 + Duration::from_secs(8)));
+        assert!(s.poll(t0 + Duration::from_secs(7)).is_empty());
+        // Past it, well short of any fixed 20 s, B is asked too.
+        let h = s.poll(t0 + Duration::from_millis(8_001));
+        assert_eq!(h.len(), 1, "{h:?}");
+        assert!(h[0].hedge && h[0].peer == B && h[0].ids == first.ids);
+        // A is late, not gone: it lacks nothing and has not failed, and
+        // is given twice as long next time.
+        let a = &s.peers[&A];
+        assert!(a.live && a.failures == 0 && a.lacks.is_empty());
+        assert_eq!(a.stats.backoff, 1);
+        // B's answer is kept, and A's request is moot: dropped, no failure.
+        let t = t0 + Duration::from_millis(8_100);
+        let out = s.reply(h[0].id, &h[0].ids, 1 << 20, t);
+        assert_eq!(out.accepted.len(), BATCH);
+        assert_eq!(s.moot(), vec![first.id]);
+        s.cancel(first.id, t);
+        assert!(s.is_idle());
+        assert_eq!(s.peers[&A].failures, 0);
+        assert_eq!(s.peers[&A].chunks_out, 0);
+    }
+
+    #[test]
+    fn with_no_other_holder_a_late_request_is_waited_for_and_never_fails() {
+        let t0 = Instant::now();
+        let mut s = Scheduler::new();
+        s.set_peers(&[(A, steady(0.1))]);
+        s.push(id(1));
+        let r = s.poll(t0).remove(0);
+        let mut deadline = s.next_deadline().unwrap();
+        // An hour of silence: nothing given up on, nothing marked lacking;
+        // it is looked at again, later each time.
+        let mut now = t0;
+        for _ in 0..20 {
+            now = deadline + Duration::from_millis(1);
+            assert!(s.poll(now).is_empty());
+            let next = s.next_deadline().unwrap();
+            assert!(next > deadline);
+            deadline = next;
+        }
+        now += Duration::from_secs(3600);
+        assert!(s.poll(now).is_empty());
+        assert!(s.take_unavailable().is_empty());
+        assert!(s.peers[&A].lacks.is_empty() && s.peers[&A].live);
+        assert_eq!(s.peers[&A].stats.backoff, MAX_BACKOFF);
+        // It answers at last: kept, and its device is trusted again.
+        let out = s.reply(r.id, &[id(1)], 100, now);
+        assert_eq!(out.accepted, vec![id(1)]);
+        assert_eq!(s.peers[&A].stats.backoff, 0);
+        assert!(s.is_idle());
     }
 }

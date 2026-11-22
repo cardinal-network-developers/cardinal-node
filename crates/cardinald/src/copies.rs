@@ -17,11 +17,15 @@
 //!   failing. So the count is of copies of everything older than an hour.
 //! - **Only a missing or damaged piece fails.** A device that answers
 //!   "not held" for such a piece, or sends one that does not hash to its
-//!   id, stops counting until it passes a check. One that does not answer
-//!   is asked again at its next check, and fails when it misses two in a
-//!   row. What devices fetch is not watched: one rebuilding after a lost
-//!   disk fails checks while pieces are missing and passes once it has
-//!   them again.
+//!   id, stops counting until it passes a check. Silence or slowness is
+//!   never a failure (`blobs.md#counting-copies`): one that does not
+//!   answer within what it is expected to take
+//!   ([`crate::sched::PeerStats::expect`], learned from its replies, and
+//!   patient with one not measured) has not confirmed anything, so it does
+//!   not count, and is unconfirmed rather than failed or missing pieces;
+//!   it is asked again at its next check. What devices fetch is not
+//!   watched: one rebuilding after a lost disk fails checks while pieces
+//!   are missing and passes once it has them again.
 //! - **Still copying, or missing pieces.** A device that has never passed
 //!   a check is still copying, and is said to be; one that passed and now
 //!   does not is missing pieces.
@@ -100,8 +104,6 @@ impl Rules {
     }
 }
 
-/// Checks in a row a device may leave unanswered before it fails one.
-pub const MISSES: u8 = 2;
 /// Average chunk size, to weigh blobs by their number of chunks.
 const AVG_CHUNK: u64 = 64 * 1024;
 
@@ -116,7 +118,8 @@ pub enum Outcome {
     /// had for less than the minimum age: it is still copying. Neither a
     /// pass nor a failure.
     Copying(String),
-    /// No answer (timed out, or the service failed), in plain words.
+    /// No answer in the time its device is expected to take, or the
+    /// service failed, in plain words: nothing confirmed, nothing failed.
     Unanswered(String),
 }
 
@@ -134,10 +137,12 @@ pub struct Holder {
     pub fail_reason: Option<String>,
     /// Checks it left unanswered since it last answered one.
     pub missed: u8,
+    /// Why the last one went unanswered.
+    pub silent: Option<String>,
     /// When the last check it answered started, pass or not.
     pub last_answer: Option<u64>,
-    /// Whether the last failure was for not answering, and not for a
-    /// piece that was missing or damaged.
+    /// Whether the last failure was for not answering, as an earlier build
+    /// counted silence: such a failure is not one now.
     pub unanswered: bool,
 }
 
@@ -149,11 +154,10 @@ pub enum Verdict {
         /// When.
         checked: u64,
     },
-    /// It did not answer its last checks.
-    Failed {
-        /// When the check started.
-        at: u64,
-        /// Why.
+    /// It did not answer its last check: it has not confirmed anything,
+    /// so it does not count, but it has not failed either.
+    Unconfirmed {
+        /// Why, in plain words.
         reason: String,
     },
     /// It passed a check once, and its last one found pieces missing or
@@ -188,7 +192,7 @@ impl Verdict {
     pub fn state(&self) -> &'static str {
         match self {
             Verdict::Counted { .. } => "passed",
-            Verdict::Failed { .. } => "failed",
+            Verdict::Unconfirmed { .. } => "unconfirmed",
             Verdict::Missing { .. } => "missing",
             Verdict::Copying { .. } => "copying",
             Verdict::Stale { .. } => "stale",
@@ -199,12 +203,13 @@ impl Verdict {
 
 impl Holder {
     /// Records a check that started at `started`. An unanswered check
-    /// fails only when it is the [`MISSES`]th in a row.
+    /// confirms nothing and fails nothing.
     pub fn checked(&mut self, started: u64, outcome: Outcome) {
         self.last_check = Some(self.last_check.map_or(started, |t| t.max(started)));
         if !matches!(outcome, Outcome::Unanswered(_)) {
             self.last_answer = Some(started);
             self.missed = 0;
+            self.silent = None;
         }
         match outcome {
             Outcome::Passed => self.last_pass = Some(started),
@@ -214,10 +219,7 @@ impl Holder {
             Outcome::Copying(_) => {}
             Outcome::Unanswered(why) => {
                 self.missed = self.missed.saturating_add(1);
-                if self.missed >= MISSES {
-                    let why = format!("did not answer {} checks in a row ({why})", self.missed);
-                    self.fail(started, why, true);
-                }
+                self.silent = Some(why);
             }
         }
     }
@@ -228,24 +230,38 @@ impl Holder {
         self.unanswered = unanswered;
     }
 
-    /// What a check that did not pass makes of a device: one that did not
-    /// answer failed; one that has passed before is missing pieces; one
-    /// that never has is still copying (`blobs.md#counting-copies`).
+    /// Its last failure, if it stands: not one for silence an earlier
+    /// build recorded.
+    fn failed_at(&self) -> Option<u64> {
+        self.last_fail.filter(|_| !self.unanswered)
+    }
+
+    /// What a check that did not pass makes of a device: one that has
+    /// passed before is missing pieces; one that never has is still
+    /// copying (`blobs.md#counting-copies`).
     fn failing(&self, at: u64) -> Verdict {
         let reason = self.fail_reason.clone();
         let reason = reason.unwrap_or_else(|| "failed a check".into());
-        match (self.unanswered, self.last_pass) {
-            (true, _) => Verdict::Failed { at, reason },
-            (false, Some(_)) => Verdict::Missing { at, reason },
-            (false, None) => Verdict::Copying { reason },
+        match self.last_pass {
+            Some(_) => Verdict::Missing { at, reason },
+            None => Verdict::Copying { reason },
         }
     }
 
     /// Whether it counts now.
     pub fn verdict(&self, r: &Rules, now: u64) -> Verdict {
+        // Silent at its last check: nothing confirmed since.
+        if self.missed > 0 {
+            let why = self.silent.as_deref().unwrap_or("no answer");
+            let reason = match self.missed {
+                1 => format!("did not answer its last check ({why})"),
+                n => format!("did not answer its last {n} checks ({why})"),
+            };
+            return Verdict::Unconfirmed { reason };
+        }
         // The last check failed (and nothing passed since).
         if let Some(f) = self
-            .last_fail
+            .failed_at()
             .filter(|f| self.last_pass.is_none_or(|p| p <= *f))
         {
             return self.failing(f);
@@ -264,7 +280,7 @@ impl Holder {
     /// This device's own standing: it keeps everything, so it counts
     /// unless its latest own check found something missing.
     pub fn own_verdict(&self) -> Verdict {
-        match (self.last_fail, self.last_pass) {
+        match (self.failed_at(), self.last_pass) {
             (Some(f), p) if p.is_none_or(|p| p < f) => self.failing(f),
             (_, p) => Verdict::Counted {
                 checked: p.unwrap_or(0),
@@ -650,7 +666,7 @@ impl Tracker {
         let before = verdict(h).counted();
         h.checked(started, outcome);
         match (before, verdict(h)) {
-            (true, Verdict::Failed { reason, .. } | Verdict::Missing { reason, .. }) => {
+            (true, Verdict::Unconfirmed { reason } | Verdict::Missing { reason, .. }) => {
                 tracing::warn!("not counting {name} as a copy of your files: {reason}")
             }
             (false, v) if v.counted() => tracing::info!("{name} counts as a copy of your files"),
@@ -876,15 +892,29 @@ pub fn start(d: Arc<Daemon>) {
                 let s = s.clone();
                 running.insert(key);
                 d.copies.begin(key);
+                // As long as this device is expected to take, from what it
+                // has shown, patient where nothing was measured.
+                let within = d
+                    .blob_stats
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .get(&s.peer_static())
+                    .copied()
+                    .unwrap_or_default()
+                    .expect(asked.len());
                 checks.spawn(async move {
                     let started = now_ms();
                     let ids: Vec<[u8; 32]> = asked.iter().map(|a| a.id).collect();
-                    let outcome =
-                        match crate::net::blob_request(&s, ids, Priority::Background).await {
-                            Ok(reply) => Some(judge(&asked, &reply, false)),
-                            Err(_) if s.is_closed() => None,
-                            Err(e) => Some(Outcome::Unanswered(format!("{e:#}"))),
-                        };
+                    let asking = crate::net::blob_request(&s, ids, Priority::Background);
+                    let outcome = match tokio::time::timeout(within, asking).await {
+                        Ok(Ok(reply)) => Some(judge(&asked, &reply, false)),
+                        Ok(Err(_)) | Err(_) if s.is_closed() => None,
+                        Ok(Err(e)) => Some(Outcome::Unanswered(format!("{e:#}"))),
+                        Err(_) => Some(Outcome::Unanswered(format!(
+                            "not within {:.0} s, what it is expected to take",
+                            within.as_secs_f64()
+                        ))),
+                    };
                     (key, started, outcome)
                 });
             }
@@ -924,7 +954,7 @@ pub fn status(d: &Daemon) -> Value {
         };
         let reason = match &verdict {
             Verdict::Counted { .. } => None,
-            Verdict::Failed { reason, .. }
+            Verdict::Unconfirmed { reason }
             | Verdict::Missing { reason, .. }
             | Verdict::Copying { reason } => Some(reason.clone()),
             Verdict::Stale { .. } => Some("not checked recently".to_owned()),
@@ -1005,34 +1035,47 @@ mod tests {
     }
 
     #[test]
-    fn a_missed_answer_fails_only_the_second_time_in_a_row() {
+    fn silence_confirms_nothing_and_fails_nothing() {
         let r = rules();
         let mut h = Holder::default();
         h.checked(0, Outcome::Passed);
-        let timed_out = || Outcome::Unanswered("timed out".into());
-        // one miss: still counted, and asked again an interval later
-        h.checked(10 * MIN, timed_out());
-        assert!(h.verdict(&r, 10 * MIN + 1).counted());
-        assert_eq!(h.next_check(&r, 1.0), 10 * MIN + r.interval_ms);
-        // an answer in between starts over
-        h.checked(20 * MIN, Outcome::Passed);
-        h.checked(30 * MIN, timed_out());
-        assert!(h.verdict(&r, 30 * MIN + 1).counted());
-        // two in a row fail
-        h.checked(40 * MIN, timed_out());
+        let silent = || Outcome::Unanswered("not within 4 s".into());
+        // Silent: not counted, since nothing is confirmed, and neither
+        // failed nor missing pieces; asked again an interval later.
+        h.checked(10 * MIN, silent());
+        let v = h.verdict(&r, 10 * MIN + 1);
+        assert!(!v.counted());
+        assert_eq!(v.state(), "unconfirmed");
         assert_eq!(
-            h.verdict(&r, 40 * MIN + 1),
-            Verdict::Failed {
-                at: 40 * MIN,
-                reason: "did not answer 2 checks in a row (timed out)".into()
+            v,
+            Verdict::Unconfirmed {
+                reason: "did not answer its last check (not within 4 s)".into()
             }
         );
-        // and it stays failed until it passes
-        h.checked(50 * MIN, timed_out());
-        assert!(!h.verdict(&r, 50 * MIN + 1).counted());
-        h.checked(60 * MIN, Outcome::Passed);
-        assert!(h.verdict(&r, 60 * MIN + 1).counted());
+        assert_eq!(h.next_check(&r, 1.0), 10 * MIN + r.interval_ms);
+        // However long it stays silent.
+        for i in 2..30 {
+            h.checked(i * 10 * MIN, silent());
+            assert_eq!(h.verdict(&r, i * 10 * MIN + 1).state(), "unconfirmed");
+        }
+        assert!(h.last_fail.is_none());
+        // An answer stands as it says.
+        h.checked(400 * MIN, Outcome::Passed);
+        assert!(h.verdict(&r, 400 * MIN + 1).counted());
         assert_eq!(h.missed, 0);
+        // Only "not held" counts against it.
+        h.checked(410 * MIN, silent());
+        h.checked(
+            420 * MIN,
+            Outcome::Failed("did not have 1 of the 4 pieces".into()),
+        );
+        assert_eq!(h.verdict(&r, 420 * MIN + 1).state(), "missing");
+        // What an earlier build saved of failing for silence is no failure.
+        let saved = r#"{"last_check": 9, "last_pass": 5, "last_fail": 9,
+            "fail_reason": "did not answer 2 checks in a row", "missed": 0,
+            "unanswered": true}"#;
+        let old: Holder = serde_json::from_str(saved).unwrap();
+        assert!(old.verdict(&r, 10).counted());
     }
 
     #[test]
@@ -1202,8 +1245,8 @@ mod tests {
     }
 
     /// A holder that has never passed is still copying; one that passed
-    /// and now misses pieces is missing them; one that does not answer
-    /// failed. None of them counts.
+    /// and now misses pieces is missing them; one that does not answer is
+    /// unconfirmed. None of them counts.
     #[test]
     fn still_copying_is_told_from_missing_pieces() {
         let r = rules();
@@ -1236,12 +1279,12 @@ mod tests {
         let timed_out = || Outcome::Unanswered("timed out".into());
         h.checked(70 * MIN, timed_out());
         h.checked(80 * MIN, timed_out());
-        assert_eq!(state(&h, 81 * MIN), "failed");
+        assert_eq!(state(&h, 81 * MIN), "unconfirmed");
         let mut never = Holder::default();
         never.checked(MIN, timed_out());
-        assert_eq!(state(&never, 2 * MIN), "unchecked");
+        assert_eq!(state(&never, 2 * MIN), "unconfirmed");
         never.checked(2 * MIN, timed_out());
-        assert_eq!(state(&never, 3 * MIN), "failed");
+        assert_eq!(state(&never, 3 * MIN), "unconfirmed");
         // This device, for itself.
         let mut own = Holder::default();
         assert_eq!(own.own_verdict().state(), "passed");

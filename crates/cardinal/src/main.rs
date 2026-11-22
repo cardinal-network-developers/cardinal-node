@@ -2356,10 +2356,11 @@ fn copies_lines(c: &Value, devices: usize) -> Vec<String> {
     {
         let when = |k: &str| age(&h[k]).map(|a| format!(" ({a})")).unwrap_or_default();
         let why = match h["state"].as_str().unwrap_or("") {
-            "failed" => format!(
-                "{}{}",
-                h["reason"].as_str().unwrap_or("failed a check"),
-                when("last_fail")
+            // silent: nothing confirmed, nothing lost
+            "unconfirmed" => format!(
+                "not confirmed: {}{}",
+                h["reason"].as_str().unwrap_or("did not answer"),
+                when("last_check")
             ),
             // passed once, and its last check found pieces gone
             "missing" => format!(
@@ -4203,8 +4204,8 @@ mod tests {
             vec![
                 "Copies: 3 — this device, saint-joseph (spot-checked 1 minute ago), laptop \
                  (spot-checked 2 hours ago); files older than an hour",
-                "  nuc: not counted — did not have 3 of the 4 pieces of your files asked for \
-                 (2 minutes ago)"
+                "  nuc: not counted — not confirmed: did not answer its last check (not within \
+                 4 s) (2 minutes ago)"
             ]
         );
         // Only this device, another catching up.
@@ -4239,9 +4240,9 @@ mod tests {
     }
 
     fn failed_holder(now: u64) -> Value {
-        let mut h = holder("nuc", false, "failed", Some(now - 3_000_000));
-        h["reason"] = json!("did not have 3 of the 4 pieces of your files asked for");
-        h["last_fail"] = json!(now - 120_000);
+        let mut h = holder("nuc", false, "unconfirmed", Some(now - 3_000_000));
+        h["reason"] = json!("did not answer its last check (not within 4 s)");
+        h["last_check"] = json!(now - 120_000);
         h
     }
 

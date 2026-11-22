@@ -1952,11 +1952,24 @@ Not implemented yet (the next milestone):
 - **A file edited here and deleted elsewhere, unseen,** is created again as
   a new node rather than kept as a delete conflict of the old one (as
   before); nothing is lost, but its history starts over.
-- **Spec ambiguity: a device that refuses a blob request.** `sync.md`
-  lets a device refuse requests over its rate limits but gives no reply for
-  "busy", only "not held". The fetcher treats "not held" as "this device
-  lacks it" for 30 s and asks the others; a refusal by silence ends in the
-  20 s timeout. Suggest a "busy, retry later" item.
+- **No fixed time for a blob request** (ASK 12, now in `sync.md`: no reply
+  for busy, no time set). A request waits as long as its session lasts;
+  the fetcher moves on by what it learned of each device (`sched.rs`): a
+  smoothed time per chunk and its variation as RFC 6298 keeps a round
+  trip (SRTT, RTTVAR, gains 1/8 and 1/4), per chunk outstanding at the
+  device when the request went, so a request is expected within `chunks
+  outstanding × (srtt + 4 × rttvar)`, at least 0.75 s. A device not
+  measured yet is given 1 s a chunk (16 s for a first request of 16),
+  patient as TCP's first timeout is. Past that, its ids are asked of
+  another holder with room as well, and the late device's expectation
+  doubles (up to 64 times) until it answers; with no other holder, the
+  request is waited for and looked at again after the longer wait.
+  Lateness is never a failure and never makes a device lack anything:
+  only a reply without an id is "not held" (believed 30 s). A request
+  whose ids all came from elsewhere is dropped (its stream reset) and
+  frees its device's room. Only errors (the stream or session closing, a
+  bad reply) count toward leaving a device out. This replaces the
+  fixed 20 s timeout.
 - **Choosing which device to ask for blobs** is local policy (`sched.rs`):
   per-device throughput and latency estimates, work in proportion to
   throughput, hedged requests when a device is slow. A hedge makes a
@@ -2705,14 +2718,19 @@ asks for around that is not built yet.
   for a holder that has answered a check and never passed one, whether
   its last check found old pieces missing, damaged ones, or only new
   ones not there yet; `missing` for one that passed and whose last check
-  then found pieces missing or damaged. `failed` is now only a holder
-  that left two checks in a row unanswered, which the text keeps apart
-  ("better asked again than failed at once"), and `unchecked` one that
-  has answered none. This device says the same of itself.
-- **Readings: failing, "recently".** A check with no answer
-  (timed out; a closed session is not a check) fails only when it is
-  the second in a row: the spec suggests asking again rather than
-  failing at once, and leaves how often to each device. A passed check
+  then found pieces missing or damaged; `unconfirmed` (no longer
+  `failed`) for one whose last check went unanswered; and `unchecked`
+  one that has answered none. This device says the same of itself.
+- **Silence confirms nothing and fails nothing** (ASK 12, `blobs.md`). A
+  check waits as long as its holder is expected to take
+  (`PeerStats::expect`, from what fetching learned of it, patient with
+  one not measured); with no answer by then (a closed session is not a
+  check) the holder is `unconfirmed`: not counted as a copy, so nothing
+  is dropped on its word, but neither failed nor missing pieces, and it
+  is asked again at its next check, however many go unanswered. Only a
+  reply that says not held counts against it. A failure an earlier build
+  recorded for two silent checks is read as none.
+- **Readings: "recently".** A passed check
   counts for 7 days while the holder is not checked again (an offline
   laptop), and status gives its time. Results are persisted
   (`copies.json`), so a restart neither drops offline holders nor shows
