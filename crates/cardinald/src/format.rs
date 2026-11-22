@@ -114,8 +114,9 @@ pub fn written_by(format: Option<u64>) -> &'static str {
 /// answers there: which `store` (`empty`, `current`, `other`, or
 /// `unreadable` where a marker is there and cannot be read), what it
 /// `holds`, counted without reading any of it, and of another version's
-/// who it was `written_by` and the `refusal` in words. `cardinal store`
-/// and `cardinald --store` both print this, as one line.
+/// who it was `written_by` and the `refusal` in words. By name, as the
+/// service holds a reply; [`report`] is it as `cardinald --store` writes
+/// it.
 pub fn says(paths: &Paths) -> serde_json::Value {
     let found = crate::clear::found(paths);
     let mut out = serde_json::json!({
@@ -146,6 +147,23 @@ pub fn says(paths: &Paths) -> serde_json::Value {
         }
     }
     out
+}
+
+/// [`says`] as the service's program writes it (`apps.md`, The local
+/// interface): one record in the base encoding, numbered as the table
+/// [`crate::api::PROGRAM`] gives `--store`'s reply.
+pub fn report(paths: &Paths) -> Vec<u8> {
+    let spec = crate::api::program("--store").expect("the table has it");
+    crate::api::encode_reply(spec, Ok(&says(paths)))
+}
+
+/// A report the service's program wrote for `option`, by name: `ok`, and
+/// on an error `error` with why; then its fields. For a client, a tool or
+/// a test that reads one.
+pub fn read_report(option: &str, bytes: &[u8]) -> anyhow::Result<serde_json::Value> {
+    let spec = crate::api::program(option)
+        .ok_or_else(|| anyhow::anyhow!("the service's program says nothing for {option}"))?;
+    crate::api::decode_reply(spec, bytes)
 }
 
 /// What to tell a person whose data directory this version cannot read:

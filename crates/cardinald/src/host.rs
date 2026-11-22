@@ -398,7 +398,8 @@ fn own_nodes(d: &Daemon, host: bool) -> anyhow::Result<([u8; 32], Vec<SpaceOp>)>
     Ok((acc.id, ops))
 }
 
-/// What belongs on the recovery sheet: this identity's hosts.
+/// What belongs on the recovery sheet: this identity's hosts, each with
+/// its static key as bytes, which a sheet writes as [`sheet_key`] does.
 pub fn sheet(d: &Daemon) -> anyhow::Result<Json> {
     let core = d.core();
     let ident = core
@@ -422,7 +423,7 @@ pub fn sheet(d: &Daemon) -> anyhow::Result<Json> {
             json!({
                 "name": names.get(&signer).cloned().unwrap_or_else(|| account::short_key(&signer)),
                 "addresses": g.endpoints.iter().map(Endpoint::to_string).collect::<Vec<_>>(),
-                "key": sheet_key(g.link_key.x25519()),
+                "key": hex::encode(g.link_key.x25519()),
             })
         })
         .collect();
@@ -539,7 +540,8 @@ async fn not_reached(at: &str, addr: SocketAddr, e: LinkError) -> anyhow::Error 
 }
 
 /// Restores this device from a host (`hosts.md#restore`): the recovery
-/// words and the host's address and key, from the recovery sheet.
+/// words and the host's address and static key, from the recovery sheet,
+/// the key as bytes (hex here), as [`read_sheet_key`] reads it off one.
 pub async fn restore(d: &Arc<Daemon>, words: &str, at: &str, key: &str) -> anyhow::Result<Json> {
     if d.core().identity.is_some() {
         anyhow::bail!("this device already belongs to someone. Nothing was changed.");
@@ -567,17 +569,18 @@ pub async fn restore(d: &Arc<Daemon>, words: &str, at: &str, key: &str) -> anyho
     Ok(json!({"at": at}))
 }
 
-/// A restore session with the host at `at` whose sheet key is `key`: the
-/// session, the address it reached, the host's static key, and its
-/// signing key.
+/// A restore session with the host at `at` whose static key is `key`, its
+/// 32 bytes in hex: the session, the address it reached, the host's static
+/// key, and its signing key.
 pub(crate) async fn open_restore(
     d: &Arc<Daemon>,
     at: &str,
     key: &str,
 ) -> anyhow::Result<(Session, SocketAddr, [u8; 32], [u8; 32])> {
-    let host = read_sheet_key(key).ok_or_else(|| {
-        anyhow::anyhow!("that key does not check out; a character was probably mistyped")
-    })?;
+    let host: [u8; 32] = hex::decode(key)
+        .ok()
+        .and_then(|b| b.try_into().ok())
+        .ok_or_else(|| anyhow::anyhow!("a host's key is its 32 bytes"))?;
     let endpoint = Endpoint::parse(at).ok_or_else(|| {
         anyhow::anyhow!("{at} is not an address; it looks like 192.168.1.20:7171")
     })?;

@@ -545,6 +545,35 @@ fn a_contact_can_be_renamed() {
             .count(),
         1
     );
+
+    // Sent as bytes, Bo's id is Bo and nothing else, whatever anyone is
+    // called: with Cy named the text of it, that text names both, and the
+    // bytes Bo alone. The bytes of a name name nobody.
+    ask(&a, json!({"cmd": "contact", "who": "cy", "name": bo}));
+    let both = turned_down(&a, json!({"cmd": "messages", "who": bo}));
+    assert!(both.contains("more than one"), "{both}");
+    let as_bytes = format!("{}{bo}", cardinald::api::EXACT);
+    ask(&a, json!({"cmd": "messages", "who": as_bytes}));
+    let named = ask(
+        &a,
+        json!({"cmd": "contact", "who": as_bytes, "name": "Bo by id"}),
+    );
+    assert_eq!(named["name"], "Bo by id");
+    let listed = ask(&a, json!({"cmd": "contacts"}))["contacts"].clone();
+    let names: Vec<&str> = listed
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|c| c["name"].as_str())
+        .collect();
+    assert_eq!(names.len(), 2, "{names:?}");
+    assert!(
+        names.contains(&"Bo by id") && names.contains(&bo.as_str()),
+        "{names:?}"
+    );
+    let name = format!("{}{}", cardinald::api::EXACT, hex::encode("cy"));
+    let none = turned_down(&a, json!({"cmd": "messages", "who": name}));
+    assert!(none.contains("no contact"), "{none}");
 }
 
 /// A conversation is more than text: a reply names what it answers, an edit

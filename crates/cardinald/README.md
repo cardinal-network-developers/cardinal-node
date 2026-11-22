@@ -30,8 +30,10 @@ In the data directory:
   `config.toml` and, unless told otherwise, `local/` and `local-shared/`.
   A client that starts the service itself asks `cardinald --store` which
   store is here and what it holds, and clears one this version cannot
-  read with `cardinald --clear` (`bin/cardinald.rs`): one line of JSON
-  each.
+  read with `cardinald --clear` (`bin/cardinald.rs`): each writes one
+  record in the base encoding to standard output, numbered as a reply is
+  (`api::PROGRAM`), and nothing after it. `cardinal store` writes the same
+  record, or to a terminal its text rendering.
 - `device.key` — the Ed25519 signing seed and the hybrid link key, JSON
   hex, **mode 0600**. Keeping them in the desktop keyring (Secret Service)
   or a TPM is future work.
@@ -373,8 +375,18 @@ newest, `before` a message's id, the oldest of a page coming first; every
 other one by position, `after` the items already had, through the
 reply's lists in the order of their numbers. `api::page` cuts every such
 reply as it leaves, from what the handler gave; an item that alone does
-not fit is error 4, never cut short. The command line asks page after
-page (`control::request`) and shows the whole, as before.
+not fit is error 4, never cut short, which says which item in `at`, its
+place as `after` counts, and `id`, where its records have one
+(`api::ERROR_FIELDS`), so that a client can ask for what comes after it.
+The command line asks page after page (`control::request`) and shows the
+whole, as before.
+
+A `ref` sent as bytes names an id and nothing else: the person, device,
+group, member or message whose id it is, whole or as the service gives it
+(the first eight bytes of a person's identity or a device's key), and
+never a name or the start of an id, which only text names. Inside, such a
+ref is held as NUL and the hex (`api::EXACT`, `api::reference`), and text
+that begins with NUL is malformed.
 Requests: `status`, `devices`, `remove-device`,
 `recovery-check` (`words`; changes nothing), `free-space` (`dry_run`; or
 `unnamed`, with `delete`),

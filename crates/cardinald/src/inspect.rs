@@ -131,7 +131,9 @@ impl Inspection {
             *g = None;
             return Err(off());
         }
-        let given = token.and_then(|t| hex::decode(t).ok()).unwrap_or_default();
+        let given = token
+            .and_then(|t| hex::decode(crate::api::id_hex(t)).ok())
+            .unwrap_or_default();
         if !cardinal_crypto::ct_eq(&given, &grant.token) {
             anyhow::bail!("that is not the token inspection was turned on with");
         }
@@ -672,7 +674,7 @@ fn hex32(req: &Json, name: &str) -> anyhow::Result<[u8; 32]> {
         .get(name)
         .and_then(Json::as_str)
         .ok_or_else(|| anyhow::anyhow!("missing argument {name}"))?;
-    hex::decode(s)
+    hex::decode(crate::api::id_hex(s))
         .ok()
         .and_then(|b| b.try_into().ok())
         .ok_or_else(|| anyhow::anyhow!("{name} is 32 bytes of hex"))
@@ -683,7 +685,7 @@ fn hex16(req: &Json, name: &str) -> anyhow::Result<[u8; 16]> {
         .get(name)
         .and_then(Json::as_str)
         .ok_or_else(|| anyhow::anyhow!("missing argument {name}"))?;
-    hex::decode(s)
+    hex::decode(crate::api::id_hex(s))
         .ok()
         .and_then(|b| b.try_into().ok())
         .ok_or_else(|| anyhow::anyhow!("{name} is 16 bytes of hex"))
@@ -721,7 +723,7 @@ fn identity(d: &Daemon, req: &Json) -> anyhow::Result<Json> {
     let o = Opts::of(req);
     let r = Render { o, store: None };
     if let Some(e) = req.get("entry").and_then(Json::as_str) {
-        let id: [u8; 32] = hex::decode(e)
+        let id: [u8; 32] = hex::decode(crate::api::id_hex(e))
             .ok()
             .and_then(|b| b.try_into().ok())
             .unwrap_or_default();
@@ -1116,7 +1118,7 @@ fn entry(d: &Daemon, req: &Json) -> anyhow::Result<Json> {
             .signed()
             .signatures()
             .iter()
-            .map(|s| json!({"key": h(&s.key), "signature": 64}))
+            .map(|s| json!({"key": h(&s.key), "signature": h(&s.signature)}))
             .collect();
         let v = sp.validity();
         out["header"] = r.record(&head, 0);

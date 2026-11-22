@@ -236,7 +236,7 @@ pub fn invitations(d: &Daemon) -> Json {
 
 /// Cancels an invitation on every device of this person.
 pub fn cancel_invitation(d: &Arc<Daemon>, id: &str) -> anyhow::Result<Json> {
-    let node = hex::decode(id).ok();
+    let node = hex::decode(crate::api::id_hex(id)).ok();
     let node = node.and_then(|b| <[u8; 16]>::try_from(b.as_slice()).ok());
     let node = node.ok_or_else(|| anyhow::anyhow!("that is not an invitation"))?;
     anyhow::ensure!(
@@ -1040,15 +1040,23 @@ fn met_json(m: &account::Met, contacts: &[ContactRecord], groups: &[(SpaceId, St
     json!({"how": how, "by": by, "group": group, "via": m.via})
 }
 
-/// The contact called `who`.
+/// The contact `who` names: typed, by what this person calls them or the
+/// id `contacts` gives them; as bytes, by that id or their identity whole,
+/// and never by a name.
 pub(crate) fn find(d: &Daemon, who: &str) -> anyhow::Result<ContactRecord> {
+    let asked = crate::api::reference(who);
     let w = who.to_lowercase();
     let mut contacts = d.core().contacts();
     // a recovery's relationship is no contact (`guardians.rs`)
     contacts.retain(|c| c.recovery_of.is_none());
-    let named =
-        |c: &ContactRecord| c.petname.to_lowercase() == w || hex::encode(&c.identity[..8]) == w;
+    let named = |c: &ContactRecord| match asked {
+        crate::api::Ref::Id(_) => asked.is_id(&c.identity),
+        crate::api::Ref::Typed(_) => {
+            c.petname.to_lowercase() == w || hex::encode(&c.identity[..8]) == w
+        }
+    };
     let mut found = contacts.into_iter().filter(named);
+    let who = crate::api::shown(who);
     let contact = found
         .next()
         .ok_or_else(|| anyhow::anyhow!("no contact called {who:?}"))?;
@@ -1273,7 +1281,7 @@ fn message_in(
     contact: &ContactRecord,
     id: &str,
 ) -> anyhow::Result<relationship::Message> {
-    let id = hex::decode(id).ok();
+    let id = hex::decode(crate::api::id_hex(id)).ok();
     let id = id.and_then(|b| <[u8; 16]>::try_from(b.as_slice()).ok());
     let id = id.ok_or_else(|| anyhow::anyhow!("that is not a message"))?;
     let core = d.core();
@@ -1440,9 +1448,9 @@ fn state_of(read: bool, waiting: bool) -> &'static str {
 }
 
 /// How many of a conversation's messages, oldest first, come before the
-/// message `before` names: its id in hex, or the start of one shown here
-/// (`apps.md`, Pages). One taken back since keeps its place, so a page
-/// asked for after it is still the one before it.
+/// message `before` names: its id, as bytes or typed in hex, or typed, the
+/// start of one shown here (`apps.md`, Pages). One taken back since keeps
+/// its place, so a page asked for after it is still the one before it.
 pub(crate) fn upto(
     sp: &Space,
     all: &[relationship::Message],
@@ -1451,8 +1459,13 @@ pub(crate) fn upto(
     let Some(b) = before.map(str::trim) else {
         return Ok(all.len());
     };
+    let given = matches!(crate::api::reference(b), crate::api::Ref::Id(_));
+    let b = crate::api::id_hex(b);
     let id: Option<NodeId> = hex::decode(b).ok().and_then(|v| v.try_into().ok());
     let id = id.or_else(|| {
+        if given {
+            return None;
+        }
         let mut shown = all.iter().filter(|m| hex::encode(m.id).starts_with(b));
         match (shown.next(), shown.next()) {
             (Some(m), None) if !b.is_empty() => Some(m.id),

@@ -1,6 +1,7 @@
 //! What `cardinald` tells a client that starts it and has no `cardinal`
 //! command: which store the data directory holds (`--store`), and its
-//! removal (`--clear`). Each answers in one line of JSON.
+//! removal (`--clear`). Each answers with one record in the base encoding,
+//! numbered as a reply is, and nothing after it.
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
@@ -20,10 +21,16 @@ fn cmd(home: &Path) -> Command {
 
 fn asked(home: &Path, what: &str) -> (Output, Value) {
     let out = cmd(home).arg(what).output().unwrap();
-    let said = String::from_utf8_lossy(&out.stdout).into_owned();
-    assert_eq!(said.lines().count(), 1, "one line: {said:?}");
-    let v = serde_json::from_str(&said).unwrap_or_else(|e| panic!("{said:?}: {e}"));
+    let v = read(what, &out.stdout);
     (out, v)
+}
+
+/// What the program wrote: exactly one record, read by the table's names.
+fn read(what: &str, said: &[u8]) -> Value {
+    let r = cardinal_encoding::Record::decode(said)
+        .unwrap_or_else(|e| panic!("not one record, and nothing after it: {said:?}: {e}"));
+    assert!(r.get(0).is_some(), "key 0 is the status: {r:?}");
+    cardinald::format::read_report(what, said).unwrap()
 }
 
 fn put(home: &Path, rel: &str, bytes: &[u8]) {
@@ -232,8 +239,7 @@ fn it_clears_nothing_while_the_service_runs() {
         "{why}"
     );
     assert!(home.join("device.key").exists(), "its keys were removed");
-    let said = String::from_utf8_lossy(&other.stdout).into_owned();
-    let v: Value = serde_json::from_str(said.trim()).unwrap_or_else(|e| panic!("{said:?}: {e}"));
+    let v = read("--clear", &other.stdout);
     assert!(!other.status.success(), "{v}");
     assert_eq!(v["ok"], false, "{v}");
     let why = v["error"].as_str().unwrap();

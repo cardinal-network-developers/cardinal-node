@@ -603,7 +603,7 @@ pub async fn start(
     };
     let named = match identity {
         Some(i) => Some(
-            hex::decode(i.trim())
+            hex::decode(crate::api::id_hex(i.trim()))
                 .ok()
                 .and_then(|b| <[u8; 32]>::try_from(b).ok())
                 .ok_or_else(|| anyhow::anyhow!("{i} is not an identity id (64 hex digits)"))?,

@@ -7,7 +7,9 @@
 //! reply's fields are numbered from 2, after key 0, the status, and key 1,
 //! why an error happened. A record inside a reply numbers its fields from
 //! one. Field numbers are in alphabetical order of the names as first
-//! given, and what is added later comes after.
+//! given, and what is added later comes after. A field whose type had to
+//! change keeps its number, no longer used, and its name is given again
+//! with a new number and the new type.
 
 /// What a field holds.
 #[derive(Debug)]
@@ -316,7 +318,7 @@ rec!(HOLDER "holder":
     1 "checking" BOOL, 2 "counted" BOOL, 3 "key" B, 4 "last_check" U, 5 "last_fail" U,
     6 "last_pass" U, 7 "missed" U, 8 "name" T, 9 "online" BOOL, 10 "reason" T, 11 "state" T,
     12 "this" BOOL);
-rec!(HOST "host": 1 "addresses" [T], 2 "key" T, 3 "name" T);
+rec!(HOST "host": 1 "addresses" [T], 2 "key" (gone T), 3 "name" T, 4 "key" B);
 rec!(INSPECTION "inspection": 1 "on" BOOL, 2 "until" U);
 rec!(INTRODUCTION "introduction":
     1 "from" T, 2 "group" T, 3 "id" B, 4 "kind" T, 5 "name" T, 6 "note" T);
@@ -430,7 +432,7 @@ rec!(POLICY "policy": 1 "history_shared" BOOL, 2 "public" BOOL, 3 "rotate_after"
 rec!(REACH_NODE "reach node":
     1 "bytes" U, 2 "fields" [NODE_FIELD], 3 "id" B, 4 "identity" B);
 rec!(ROOT "root": 1 "children" U, 2 "id" B);
-rec!(SIGNATURE "signature": 1 "key" B, 2 "signature" U);
+rec!(SIGNATURE "signature": 1 "key" B, 2 "signature" (gone U), 3 "signature" B);
 rec!(SPACE_MEMBER "space member":
     1 "added_by" B, 2 "identity" B, 3 "left" BOOL, 4 "log_held" BOOL, 5 "name" T,
     6 "reach_node" B, 7 "role" U);
@@ -628,7 +630,7 @@ pub static REQUESTS: &[Request] = &[
     req!(169 "keep-work" (1 "name" T, 2 "up_to" T) -> (2 "kept" U, 3 "set_aside" [SET_ASIDE])),
     req!(170 "recovery-check" (1 "words" T) -> ()),
     req!(171 "recovery-sheet" () -> (2 "hosts" [HOST])),
-    req!(172 "restore-from-host" (1 "words" T, 2 "at" T, 3 "key" T) -> (2 "at" T)),
+    req!(172 "restore-from-host" (1 "words" T, 2 "at" T, 3 "key" (gone T), 4 "key" B) -> (2 "at" T)),
     // ---- Networks, hosts and peers: 180 to 199 ----
     req!(180 "router" (1 "on" BOOL, 2 "this_device" BOOL) -> (
         2 "error" T, 3 "everywhere" BOOL, 4 "external" T, 5 "named" [T], 6 "network" {NETWORK},
@@ -703,6 +705,31 @@ pub static REQUESTS: &[Request] = &[
         2 "device" T, 3 "ms" U, 4 "receive" U, 5 "received_bytes" U, 6 "rtt_median_us" U,
         7 "rtt_min_us" U, 8 "send" U, 9 "sent_bytes" U)),
 ];
+
+// ---- What the service's program says without starting ----
+
+rec!(DATA_HELD "data held":
+    1 "bytes" U, 2 "identity" BOOL, 3 "local" U, 4 "local_bytes" U, 5 "objects" U,
+    6 "other" BOOL, 7 "spaces" U, 8 "unsaved" U, 9 "unsaved_bytes" U);
+
+/// What the service's program says without starting (`apps.md`, The local
+/// interface), by the option that asks it: one record on its standard
+/// output, numbered as a reply is, with nothing after it. `--store` says
+/// which data is there and what it holds, counted without reading any of
+/// it; `--clear` removes data this version cannot read, or fails, saying
+/// why.
+pub static PROGRAM: &[Request] = &[
+    req!(1 "--store" () -> (
+        2 "holds" {DATA_HELD}, 3 "refusal" T, 4 "store" T, 5 "written_by" T)),
+    req!(2 "--clear" () -> ()),
+];
+
+/// What an error's reply says besides why, in key 1, numbered as a reply's
+/// fields are (`apps.md`, Errors): of error 4 to a paged request, which item
+/// was too large for a message on its own, by its place in the answer as
+/// `after` counts (`at`), and by its `id` where it has one, so that a
+/// client can ask for what comes after it.
+pub static ERROR_FIELDS: &[Field] = &[f!(2 "at" U), f!(3 "id" B)];
 
 /// The events of a `watch` connection: key 0 says which.
 pub static EVENTS: &[Request] = &[req!(1 "changed" (1 "seq" U) -> ())];

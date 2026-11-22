@@ -193,7 +193,7 @@ async fn connection(d: Arc<Daemon>, mut r: Reader, mut w: Writer) {
         let reply = match handle(&d, &req).await.map_err(|e| capitalized(&req, e)) {
             Ok(v) => match api::page(spec, &req, v) {
                 Ok(v) => api::encode_reply(spec, Ok(&v)),
-                Err((st, why)) => api::encode_reply(spec, Err((st, &why))),
+                Err((st, why, item)) => api::error_reply_with(st, &why, &item),
             },
             Err(e) => {
                 let st = if e.is::<crate::recovery::NeedsWords>() {
@@ -964,12 +964,17 @@ async fn speedtest(d: &Arc<Daemon>, who: &str) -> anyhow::Result<Value> {
         let names = core.device_names();
         let st = ident.state();
         let w = who.to_lowercase();
+        let asked = api::reference(who);
+        let who = api::shown(who);
         let matches: Vec<_> = st
             .keys
             .values()
-            .filter(|k| {
-                names.get(&k.key).is_some_and(|n| n.to_lowercase() == w)
-                    || hex::encode(k.key).starts_with(&w)
+            .filter(|k| match asked {
+                api::Ref::Id(_) => asked.is_id(&k.key),
+                api::Ref::Typed(_) => {
+                    names.get(&k.key).is_some_and(|n| n.to_lowercase() == w)
+                        || hex::encode(k.key).starts_with(&w)
+                }
             })
             .collect();
         let k = match matches.as_slice() {
@@ -1619,8 +1624,9 @@ async fn keep_work_of(d: &Arc<Daemon>, key: &[u8; 32]) -> anyhow::Result<()> {
 /// that no other key built on; any other keeps its work. Either way it is
 /// told first, while it still can be: nobody answers it afterwards, and until
 /// then it can pass the news to devices this one cannot reach.
-/// One of this person's devices, by its name or the start of its key, and
-/// what it is called.
+/// One of this person's devices, typed by its name or the start of its
+/// key, or as bytes by its key (as `devices` gives it, or whole), and what
+/// it is called.
 fn find_device(d: &Daemon, who: &str) -> anyhow::Result<([u8; 32], String)> {
     let core = d.core();
     let ident = core
@@ -1630,12 +1636,17 @@ fn find_device(d: &Daemon, who: &str) -> anyhow::Result<([u8; 32], String)> {
     let names = core.device_names();
     let st = ident.state();
     let w = who.trim().to_lowercase();
+    let asked = api::reference(who);
+    let who = api::shown(who);
     let matches: Vec<[u8; 32]> = st
         .keys
         .keys()
-        .filter(|k| {
-            names.get(*k).is_some_and(|n| n.to_lowercase() == w)
-                || (!w.is_empty() && hex::encode(k).starts_with(&w))
+        .filter(|k| match asked {
+            api::Ref::Id(_) => asked.is_id(k.as_slice()),
+            api::Ref::Typed(_) => {
+                names.get(*k).is_some_and(|n| n.to_lowercase() == w)
+                    || (!w.is_empty() && hex::encode(k).starts_with(&w))
+            }
         })
         .copied()
         .collect();

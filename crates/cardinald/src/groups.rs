@@ -31,6 +31,7 @@ use cardinal_space::group::{self, Member};
 use cardinal_space::{relationship, Space, SpaceId, SpaceOp};
 use serde_json::{json, Value as Json};
 
+use crate::api::{self, Ref};
 use crate::contacts::{self, identity};
 use crate::core::{now_ms, Core};
 use crate::daemon::Daemon;
@@ -83,6 +84,17 @@ fn find_among(d: &Daemon, group: &str, in_it: bool) -> anyhow::Result<Found> {
         });
     }
     all.retain(|g| g.joined || !in_it);
+    // given as bytes: the group whose id it is, or the one in its place
+    if let asked @ Ref::Id(_) = api::reference(group) {
+        let now = was
+            .iter()
+            .find(|(old, _)| asked.is_id(old))
+            .map(|(_, now)| *now);
+        let id = now.or_else(|| all.iter().find(|g| asked.is_id(&g.id)).map(|g| g.id));
+        return id
+            .and_then(|id| all.into_iter().find(|g| g.id == id))
+            .ok_or_else(|| anyhow::anyhow!("there is no group {}", api::shown(group)));
+    }
     let start = group.to_ascii_lowercase();
     if group.len() >= 8 {
         let now = was
@@ -225,10 +237,24 @@ pub fn add(
     Ok(json!({}))
 }
 
-/// The member of a group someone means: a contact by their petname, or
-/// anyone by the name the group shows for them.
+/// The member of a group someone means: typed, a contact by their
+/// petname, or anyone by the name the group shows for them; as bytes, the
+/// member with that id (as `group-members` gives it) or identity.
 fn member_named(contacts: &[ContactRecord], sp: &Space, who: &str) -> anyhow::Result<[u8; 32]> {
     let in_it = |id: &[u8; 32]| sp.validity().members.iter().any(|m| m.identity == *id);
+    if let asked @ Ref::Id(_) = api::reference(who) {
+        // one identity may be named with several roles
+        let mut found: Vec<[u8; 32]> = sp.validity().members.iter().map(|m| m.identity).collect();
+        found.retain(|id| asked.is_id(id));
+        found.sort();
+        found.dedup();
+        let who = api::shown(who);
+        return match found.as_slice() {
+            [id] => Ok(*id),
+            [] => anyhow::bail!("nobody in it has the id {who}"),
+            _ => anyhow::bail!("more than one in it has an id starting {who}: give it whole"),
+        };
+    }
     if let Some(c) = contacts
         .iter()
         .find(|c| c.petname == who && in_it(&c.identity))
@@ -920,7 +946,7 @@ pub async fn say(
 }
 
 fn message_in(d: &Daemon, space: &SpaceId, id: &str) -> anyhow::Result<relationship::Message> {
-    let id = hex::decode(id).ok();
+    let id = hex::decode(api::id_hex(id)).ok();
     let id = id.and_then(|b| <[u8; 16]>::try_from(b.as_slice()).ok());
     let id = id.ok_or_else(|| anyhow::anyhow!("that is not a message"))?;
     let core = d.core();

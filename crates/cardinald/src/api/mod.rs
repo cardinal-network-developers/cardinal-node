@@ -18,7 +18,7 @@ pub mod blocking;
 use cardinal_encoding::{Record, Value};
 use serde_json::{json, Map, Value as Json};
 
-pub use table::{Field, Page, Rec, Request, Ty, EVENTS, FRAMES, REQUESTS};
+pub use table::{Field, Page, Rec, Request, Ty, ERROR_FIELDS, EVENTS, FRAMES, PROGRAM, REQUESTS};
 
 use crate::transport::MAX_MESSAGE;
 
@@ -83,9 +83,65 @@ impl Refused {
     }
 }
 
+/// How the service holds a `ref` that came as bytes: this mark, then the
+/// bytes in hex. A `ref` sent as text never begins with it (one that does
+/// is malformed), so an id given as bytes is never taken for a name or for
+/// the start of an id (`apps.md`, Types): [`reference`] tells the two
+/// apart, and a handler that reads it as text finds nothing by it.
+pub const EXACT: char = '\u{0}';
+
+/// A `ref` argument, as a handler takes it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Ref<'a> {
+    /// Text, as a person types it: a name, or the start of an id in hex,
+    /// read by whatever rules the request has for it.
+    Typed(&'a str),
+    /// The bytes of an id, in hex: that id and nothing else.
+    Id(&'a str),
+}
+
+/// A `ref` argument as the service holds it, told apart.
+pub fn reference(s: &str) -> Ref<'_> {
+    match s.strip_prefix(EXACT) {
+        Some(h) => Ref::Id(h),
+        None => Ref::Typed(s),
+    }
+}
+
+/// The hex of a `ref` that only an id answers, given as bytes or typed in
+/// hex: for a handler that reads it as an id whole.
+pub fn id_hex(s: &str) -> &str {
+    s.strip_prefix(EXACT).unwrap_or(s)
+}
+
+/// A `ref` as an error shows it: an id given as bytes in hex, text as it
+/// was typed.
+pub fn shown(s: &str) -> &str {
+    id_hex(s)
+}
+
+impl Ref<'_> {
+    /// Whether this is `id` given as bytes: the id whole, or its first
+    /// eight bytes, as the service gives the ids of people and devices
+    /// (`identity`, `key`, `id`). Text is never an id here.
+    pub fn is_id(&self, id: &[u8]) -> bool {
+        let Ref::Id(h) = self else {
+            return false;
+        };
+        let full = hex::encode(id);
+        *h == full || (h.len() == 16 && id.len() > 8 && full.starts_with(h))
+    }
+}
+
 /// The request with this name, if it is answered.
 pub fn by_name(name: &str) -> Option<&'static Request> {
     REQUESTS.iter().find(|r| r.name == name && !r.gone)
+}
+
+/// What the service's program says when asked `option` (`--store`,
+/// `--clear`), as its table gives it.
+pub fn program(option: &str) -> Option<&'static Request> {
+    PROGRAM.iter().find(|r| r.name == option)
 }
 
 /// The request with this number, answered or not: a tool that shows
@@ -94,8 +150,12 @@ pub fn by_number(n: u64) -> Option<&'static Request> {
     REQUESTS.iter().find(|r| r.n == n)
 }
 
+/// The field in use called `name`: one no longer used may have had the
+/// name before it.
 fn field_by_name<'a>(fields: &'a [Field], name: &str) -> Option<&'a Field> {
-    fields.iter().find(|f| f.name == name)
+    fields
+        .iter()
+        .find(|f| f.name == name && !matches!(f.ty, Ty::Gone(_)))
 }
 
 fn field_by_number(fields: &[Field], n: u64) -> Option<&Field> {
@@ -120,7 +180,13 @@ fn to_wire(ty: &Ty, v: &Json, at: &str) -> Result<Value, String> {
             Value::from(cardinal_encoding::Int::new(n).ok_or_else(|| wrong("within 2^60"))?)
         }
         Ty::Bool => Value::from(v.as_bool().ok_or_else(|| wrong("true or false"))?),
-        Ty::Ref => Value::from(v.as_str().ok_or_else(|| wrong("text"))?),
+        Ty::Ref => {
+            let s = v.as_str().ok_or_else(|| wrong("text"))?;
+            match reference(s) {
+                Ref::Typed(t) => Value::from(t),
+                Ref::Id(h) => Value::from(hex::decode(h).map_err(|_| wrong("hex"))?),
+            }
+        }
         Ty::Kind => match v {
             Json::Number(_) => to_wire(&Ty::Uint, v, at)?,
             _ => to_wire(&Ty::Bytes, v, at)?,
@@ -181,8 +247,14 @@ fn from_wire(ty: &Ty, v: &Value, at: &str) -> Result<Json, String> {
         Ty::Int => json!(v.as_int().ok_or_else(|| wrong("an integer"))?),
         Ty::Bool => json!(v.as_bool().ok_or_else(|| wrong("0 or 1"))?),
         Ty::Ref => match v {
-            Value::Bytes(b) => json!(hex::encode(b)),
-            _ => json!(v.as_text().ok_or_else(|| wrong("text or bytes"))?),
+            Value::Bytes(b) => json!(format!("{EXACT}{}", hex::encode(b))),
+            _ => {
+                let t = v.as_text().ok_or_else(|| wrong("text or bytes"))?;
+                if t.starts_with(EXACT) {
+                    return Err(format!("{at} is text that begins with NUL"));
+                }
+                json!(t)
+            }
         },
         Ty::Kind => match v {
             Value::Bytes(b) => json!(hex::encode(b)),
@@ -295,12 +367,18 @@ pub const PAGE_OLDER: &str = "_page_older";
 const PAGE_ROOM: usize = 64;
 const LIST_ROOM: usize = 12;
 
+/// A paged answer that could not be given: the status, why, and the
+/// fields of [`ERROR_FIELDS`] that say which item, by name.
+pub type Unpaged = (u64, String, Json);
+
 /// Cuts a paged reply (`apps.md`, Pages) to the page the request asks
 /// for: at most `limit` items, and as many as fit in a message with the
 /// reply's other fields, from the cursor on; with `more` and, when there
 /// is more, `next`. Lists not paged are left whole. An item too large for
-/// a message alone is an error, `TOO_LARGE`: nothing is cut silently.
-pub fn page(spec: &Request, req: &Json, mut reply: Json) -> Result<Json, (u64, String)> {
+/// a message alone is an error, `TOO_LARGE`, that says which item, by its
+/// place and its id: nothing is cut silently, and a client can ask for
+/// what comes after it.
+pub fn page(spec: &Request, req: &Json, mut reply: Json) -> Result<Json, Unpaged> {
     let Some(o) = reply.as_object_mut() else {
         return Ok(reply);
     };
@@ -356,7 +434,16 @@ pub fn page(spec: &Request, req: &Json, mut reply: Json) -> Result<Json, (u64, S
         };
         to_wire(ty, x, lists[li].name).map_or(0, |v| v.encoded_len())
     };
-    let too_large = |li: usize, at: usize, n: usize| {
+    let too_large = |li: usize, at: usize, n: usize, x: &Json| {
+        // its id, where its records have one
+        let id = match &lists[li].ty {
+            Ty::Recs(r)
+                if field_by_name(r.fields, "id").is_some_and(|f| matches!(f.ty, Ty::Bytes)) =>
+            {
+                x.get("id").filter(|v| v.is_string()).cloned()
+            }
+            _ => None,
+        };
         (
             status::TOO_LARGE,
             format!(
@@ -364,6 +451,7 @@ pub fn page(spec: &Request, req: &Json, mut reply: Json) -> Result<Json, (u64, S
                  of the answer to {}",
                 lists[li].name, spec.name
             ),
+            json!({"at": at, "id": id}),
         )
     };
     let mut used = 0usize;
@@ -382,7 +470,7 @@ pub fn page(spec: &Request, req: &Json, mut reply: Json) -> Result<Json, (u64, S
                 let n = size(li, &x);
                 if used + n > room {
                     if taken.is_empty() {
-                        return Err(too_large(li, at, n));
+                        return Err(too_large(li, at, n, &x));
                     }
                     break;
                 }
@@ -403,7 +491,7 @@ pub fn page(spec: &Request, req: &Json, mut reply: Json) -> Result<Json, (u64, S
                 let n = size(li, &x);
                 if used + n > room {
                     if taken.is_empty() {
-                        return Err(too_large(li, older + left - 1, n));
+                        return Err(too_large(li, older + left - 1, n, &x));
                     }
                     items.push((li, x));
                     break;
@@ -472,6 +560,20 @@ pub fn error_reply(status: u64, why: &str) -> Vec<u8> {
     Record::new().with(0, status).with(WHY, why).encode()
 }
 
+/// An error reply that says more than why: the fields of
+/// [`ERROR_FIELDS`] in `more`, by name.
+pub fn error_reply_with(status: u64, why: &str, more: &Json) -> Vec<u8> {
+    let empty = Map::new();
+    let o = more.as_object().unwrap_or(&empty);
+    let mut r = record_to_wire(ERROR_FIELDS, o, "error").unwrap_or_else(|e| {
+        tracing::error!("an error's fields: {e}");
+        Record::new()
+    });
+    r.insert(0, status);
+    r.insert(WHY, why);
+    r.encode()
+}
+
 /// A reply off the wire, in the form the command line has always read:
 /// `ok`, and on an error `error` with why and `needs_words` or
 /// `needs_for`; then the reply's fields by name.
@@ -488,13 +590,17 @@ pub fn decode_reply(spec: &Request, msg: &[u8]) -> anyhow::Result<Json> {
         } else {
             why.to_owned()
         };
-        return Ok(json!({
-            "ok": false,
-            "error": why,
-            "status": st,
-            "needs_words": st == status::NEEDS_WORDS,
-            "needs_for": st == status::NEEDS_FOR,
-        }));
+        let mut out = record_from_wire(ERROR_FIELDS, &r, "error", 2).unwrap_or_default();
+        for (k, v) in [
+            ("ok", json!(false)),
+            ("error", json!(why)),
+            ("status", json!(st)),
+            ("needs_words", json!(st == status::NEEDS_WORDS)),
+            ("needs_for", json!(st == status::NEEDS_FOR)),
+        ] {
+            out.insert(k.into(), v);
+        }
+        return Ok(Json::Object(out));
     }
     let mut o = record_from_wire(spec.reply, &r, spec.name, 2).map_err(anyhow::Error::msg)?;
     o.insert("ok".into(), json!(true));
@@ -624,9 +730,15 @@ pub fn render_request(msg: &[u8]) -> String {
     render(msg, Zero::Request, fields, 1)
 }
 
-/// A reply to `spec` as a tool shows it.
+/// A reply to `spec` as a tool shows it: an error's with the fields an
+/// error has.
 pub fn render_reply(spec: &Request, msg: &[u8]) -> String {
-    render(msg, Zero::Status, spec.reply, 2)
+    let failed = Record::decode(msg)
+        .ok()
+        .and_then(|r| r.get(0).and_then(Value::as_uint))
+        .is_some_and(|st| st != status::OK);
+    let fields = if failed { ERROR_FIELDS } else { spec.reply };
+    render(msg, Zero::Status, fields, 2)
 }
 
 /// A message of a stream (`watch`'s events, `call-media`'s frames) as a

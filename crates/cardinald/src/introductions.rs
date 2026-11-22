@@ -21,6 +21,7 @@ use cardinal_space::relationship::{self, Introduction};
 use cardinal_space::{SpaceId, SpaceOp};
 use serde_json::{json, Value as Json};
 
+use crate::api::Ref;
 use crate::contacts::{self, identity};
 use crate::daemon::Daemon;
 
@@ -88,19 +89,34 @@ pub fn ask_in_group(
             let sp = h.space.as_ref()?;
             (sp.profile() == group::GROUP).then_some((id, sp))
         });
+        // as bytes, the group and the member whose ids they are
+        let (asked, person) = (
+            crate::api::reference(group_name),
+            crate::api::reference(who),
+        );
         let found: Vec<_> = groups
-            .filter(|(id, sp)| {
-                group::name(sp) == group_name
-                    || (group_name.len() >= 8 && hex::encode(id).starts_with(group_name))
+            .filter(|(id, sp)| match asked {
+                Ref::Id(_) => asked.is_id(id.as_slice()),
+                Ref::Typed(_) => {
+                    group::name(sp) == group_name
+                        || (group_name.len() >= 8 && hex::encode(id).starts_with(group_name))
+                }
             })
             .collect();
+        let (group_name, who) = (crate::api::shown(group_name), crate::api::shown(who));
         let [(id, sp)] = found.as_slice() else {
             anyhow::bail!("there is no one group {group_name}");
         };
         let members = group::members(sp);
         let them = members
             .iter()
-            .find(|m| m.name.as_deref() == Some(who) && m.identity != me)
+            .find(|m| {
+                let meant = match person {
+                    Ref::Id(_) => person.is_id(&m.identity),
+                    Ref::Typed(_) => m.name.as_deref() == Some(who),
+                };
+                meant && m.identity != me
+            })
             .ok_or_else(|| anyhow::anyhow!("nobody in it is called {who}"))?;
         anyhow::ensure!(
             group::introductions(sp),
@@ -222,6 +238,7 @@ pub fn list(d: &Daemon) -> Json {
 }
 
 fn find(d: &Daemon, id: &str) -> anyhow::Result<Waiting> {
+    let id = crate::api::id_hex(id);
     let found = waiting(d)
         .into_iter()
         .find(|w| hex::encode(w.intro.node) == id);

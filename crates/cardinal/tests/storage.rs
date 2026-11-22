@@ -144,11 +144,12 @@ fn a_store_of_another_format_is_refused_whole_and_can_be_cleared() {
         assert!(!said(&o).contains("not running"), "{args:?}");
     }
     assert_eq!(everything(&ana.home), before, "something was changed");
-    // One command answers all the same, for a window to read: one line of
-    // JSON saying which store is here and why it is refused.
-    let line = ana.cli(&["store"]);
-    assert_eq!(line.lines().count(), 1, "{line:?}");
-    let v: serde_json::Value = serde_json::from_str(&line).unwrap();
+    // One command answers all the same, for a window to read: the record
+    // `cardinald --store` writes, saying which store is here and why it is
+    // refused.
+    let o = ana.try_cli(&["store"]);
+    assert!(o.status.success(), "{o:?}");
+    let v = cardinald::format::read_report("--store", &o.stdout).unwrap();
     assert_eq!(v["store"], "other", "{v}");
     assert_eq!(v["written_by"], "earlier", "{v}");
     assert!(v["holds"]["spaces"].as_u64().unwrap() > 0, "{v}");

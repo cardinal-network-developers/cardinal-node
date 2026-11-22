@@ -1712,12 +1712,13 @@ Not implemented yet (the next milestone):
 - **A client that starts the service itself** (`bin/cardinald.rs`; not in
   the specification). A phone and Windows have no `cardinal` command to
   say why the service did not start, or to clear a store. `cardinald
-  --store` answers in one line of JSON and starts nothing: `store`
+  --store` answers with one base-encoded record on standard output, numbered
+  as a reply is (`apps.md`, The local interface), and starts nothing: `store`
   (`empty`, `current`, `other`), what the directory `holds` as `clear`
   counts it, and for another version's store `written_by` (`earlier`,
   `later`, `another`) and the `refusal` in the daemon's words. `cardinald
   --clear` removes what `cardinal clear` removes, never the files kept on
-  this device only, answers `ok` or an `error`, and refuses while a
+  this device only, answers done (status 0) or failed with why, and refuses while a
   service answers on that directory. It also refuses a store this version
   can read: nothing in it asks the person, so it cannot remove one that
   works. The client says what will be removed and asks first
@@ -2063,6 +2064,22 @@ asks for around that is not built yet.
     own. An op's `kind` no longer reads `"reach"` for a reach node: that is
     `reach` (1), and the sizes of an entry's ops are records
     (`op`, `kind`, `reach`, `bytes`) in place of lists.
+  - **A `ref` sent as bytes is an id alone**: of a contact, their
+    identity whole or the first eight bytes `contacts` gives; of a device,
+    its key likewise; of a group, its id, or an id it had before; of a
+    member, their identity; of a message, an invitation or an
+    introduction, its id. Never a name or the start of an id, which text
+    names as before. Inside, it is NUL and the hex, and text that begins
+    with NUL is malformed.
+  - **Error 4 for one item too large** says which in `at` (its place, as
+    `after` counts) and `id` (where its records have one): keys 2 and 3 of
+    the error reply. A reply too large that is not paged says nothing more.
+  - **A host's key is bytes** in `recovery-sheet`, `host` and `host-off`
+    (`host`'s field 4; field 2, text, is no longer used), and
+    `restore-from-host` takes it as bytes (argument 4); the command line
+    writes and reads it as the sheet does (`hosts.md#restore`).
+  - **An inspected entry's signatures** carry the signature's bytes
+    (`signature`'s field 3; field 2, its length, is no longer used).
   - **A speed test** gives round trips in whole microseconds
     (`rtt_min_us`, `rtt_median_us`) and the phase in milliseconds (`ms`):
     the encoding has no fractions.

@@ -6,7 +6,10 @@
 //!
 //! Such a client has no `cardinal` to tell its person why the service will
 //! not start on a store another version wrote, or to clear one. So two
-//! options answer in one line of JSON, and start nothing:
+//! options answer, and start nothing, with one record in the base encoding
+//! on standard output and nothing after it, numbered as a reply is
+//! (`apps.md`, The local interface; [`cardinald::api::PROGRAM`]): key 0 is
+//! 0, or an error's number with why in key 1.
 //!
 //! - `cardinald --store` says which store the data directory holds
 //!   (`empty`, `current`, `other`, or `unreadable` if its marker is there
@@ -22,10 +25,32 @@
 //!   read, or what lies in a directory that holds no store. `cardinal
 //!   clear` does that, and asks.
 
+use std::io::Write;
+
+use cardinald::api::{self, status};
 use cardinald::format::{self, Store};
 use cardinald::paths::Paths;
 use cardinald::Overrides;
 use serde_json::{json, Value};
+
+/// Writes a report on standard output, and nothing else.
+fn write_out(report: &[u8]) -> anyhow::Result<()> {
+    let mut out = std::io::stdout().lock();
+    out.write_all(report)?;
+    out.flush()?;
+    Ok(())
+}
+
+/// `--clear`'s answer as a record: done, or failed and why.
+fn cleared(said: &Value) -> Vec<u8> {
+    match said["error"].as_str() {
+        None => {
+            let spec = api::program("--clear").expect("the table has it");
+            api::encode_reply(spec, Ok(&json!({})))
+        }
+        Some(why) => api::error_reply(status::FAILED, why),
+    }
+}
 
 /// Removes what the service wrote, for `--clear`, unless one is running.
 async fn clear(paths: &Paths) -> Value {
@@ -92,15 +117,14 @@ fn main() -> anyhow::Result<()> {
     }
     let paths = Paths::from_env();
     if asked.as_deref() == Some("--store") {
-        println!("{}", format::says(&paths));
-        return Ok(());
+        return write_out(&format::report(&paths));
     }
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
     if asked.is_some() {
         let said = rt.block_on(clear(&paths));
-        println!("{said}");
+        write_out(&cleared(&said))?;
         std::process::exit(if said["ok"] == true { 0 } else { 1 });
     }
     cardinald::init_logging();

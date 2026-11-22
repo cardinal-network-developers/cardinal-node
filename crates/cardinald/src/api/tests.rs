@@ -12,7 +12,10 @@ fn check_fields(fields: &[Field], first: u64, at: &str, seen: &mut HashSet<&'sta
             f.n
         );
         assert!(numbers.insert(f.n), "{at} gives {} twice", f.n);
-        assert!(names.insert(f.name), "{at} names {} twice", f.name);
+        // a name no longer used may be given again, to a field in use
+        if !matches!(f.ty, Ty::Gone(_)) {
+            assert!(names.insert(f.name), "{at} names {} twice", f.name);
+        }
         check_ty(&f.ty, seen);
     }
 }
@@ -42,6 +45,17 @@ fn every_number_is_given_once() {
             check_fields(e.args, 1, e.name, &mut seen);
         }
     }
+    // what the program says, and what an error says, are numbered as a
+    // reply's fields are
+    for r in PROGRAM {
+        assert!(
+            r.args.is_empty(),
+            "{} is an option, with nothing to it",
+            r.name
+        );
+        check_fields(r.reply, 2, r.name, &mut seen);
+    }
+    check_fields(ERROR_FIELDS, 2, "an error", &mut seen);
     // record names are unique too
     let mut by_name = std::collections::HashMap::new();
     fn walk(ty: &Ty, by_name: &mut std::collections::HashMap<&'static str, *const Rec>) {
@@ -60,7 +74,7 @@ fn every_number_is_given_once() {
             _ => {}
         }
     }
-    for r in REQUESTS {
+    for r in REQUESTS.iter().chain(PROGRAM) {
         for f in r.args.iter().chain(r.reply) {
             walk(&f.ty, &mut by_name);
         }
@@ -90,14 +104,43 @@ fn a_request_goes_by_number_and_comes_back_by_name() {
     );
 }
 
+/// A ref given as bytes is an id, and never a name or the start of one:
+/// the handlers tell it from text, which they read as a person types it.
 #[test]
-fn a_reference_may_be_bytes() {
+fn a_reference_may_be_bytes_and_is_then_an_id_alone() {
     let msg = Record::new()
         .with(0, 45u64)
         .with(1, vec![0xabu8, 0xcd])
         .encode();
     let (_, named) = decode_request(&msg).unwrap();
-    assert_eq!(named["id"], "abcd");
+    let id = named["id"].as_str().unwrap();
+    assert_eq!(reference(id), Ref::Id("abcd"));
+    assert_eq!(id_hex(id), "abcd");
+    // the same as text is typed
+    let typed = Record::new().with(0, 45u64).with(1, "abcd").encode();
+    let (_, named) = decode_request(&typed).unwrap();
+    assert_eq!(reference(named["id"].as_str().unwrap()), Ref::Typed("abcd"));
+    // and nothing typed passes for bytes
+    let sly = Record::new().with(0, 45u64).with(1, "\u{0}abcd").encode();
+    assert_eq!(decode_request(&sly).unwrap_err().status, status::MALFORMED);
+    // it goes back out as bytes, as a client sends it
+    let (_, back) = encode_request(&json!({"cmd": "cancel-invitation", "id": id})).unwrap();
+    assert_eq!(back, msg);
+    // whole, or the first eight bytes the service gives in its place
+    let key = [0x11u8; 32];
+    let whole = format!("{EXACT}{}", hex::encode(key));
+    let short = format!("{EXACT}{}", hex::encode(&key[..8]));
+    let start = format!("{EXACT}{}", hex::encode(&key[..4]));
+    assert!(reference(&whole).is_id(&key));
+    assert!(reference(&short).is_id(&key));
+    assert!(
+        !reference(&start).is_id(&key),
+        "the start of an id is no id"
+    );
+    assert!(
+        !reference(&hex::encode(key)).is_id(&key),
+        "text is not an id here"
+    );
 }
 
 #[test]
@@ -345,6 +388,51 @@ fn a_page_never_holds_more_than_a_message() {
     assert_eq!(e.0, status::TOO_LARGE);
 }
 
+/// Error 4 says which item was too large, so that a client can ask for
+/// what comes after it: by its place as `after` counts, and by its id
+/// where it has one.
+#[test]
+fn an_item_too_large_is_named_so_that_it_can_be_paged_past() {
+    let spec = by_name("peer-list").unwrap();
+    let peers = json!({"peers": [
+        {"addr": "a"}, {"addr": "x".repeat(MAX_MESSAGE)}, {"addr": "c"}
+    ]});
+    let p = page(spec, &json!({"limit": 1}), peers.clone()).unwrap();
+    assert_eq!(p["next"], 1);
+    let (st, why, item) = page(spec, &json!({"after": 1}), peers.clone()).unwrap_err();
+    assert_eq!(item, json!({"at": 1, "id": null}));
+    let msg = error_reply_with(st, &why, &item);
+    let r = Record::decode(&msg).unwrap();
+    assert_eq!(r.uint(0).unwrap(), status::TOO_LARGE);
+    assert_eq!(r.uint(2).unwrap(), 1);
+    assert!(r.get(3).is_none(), "a peer has no id");
+    let back = decode_reply(spec, &msg).unwrap();
+    assert_eq!(
+        (back["ok"].clone(), back["at"].clone()),
+        (json!(false), json!(1))
+    );
+    assert!(
+        render_reply(spec, &msg).contains("at: 1"),
+        "{}",
+        render_reply(spec, &msg)
+    );
+    // and after it, the rest
+    let p = page(spec, &json!({"after": 2}), peers).unwrap();
+    assert_eq!(p["peers"][0]["addr"], "c");
+
+    // a message by its id too, which `before` takes
+    let spec = by_name("messages").unwrap();
+    let id = hex::encode([7u8; 16]);
+    let said = json!({"messages": [
+        {"id": hex::encode([6u8; 16]), "text": "before it"},
+        {"id": id, "text": "x".repeat(MAX_MESSAGE)},
+    ]});
+    let (st, why, item) = page(spec, &json!({}), said).unwrap_err();
+    assert_eq!(item, json!({"at": 1, "id": id}));
+    let r = Record::decode(&error_reply_with(st, &why, &item)).unwrap();
+    assert_eq!(r.bytes(3).unwrap(), [7u8; 16]);
+}
+
 #[test]
 fn messages_page_back_from_the_newest() {
     let spec = by_name("messages").unwrap();
@@ -512,6 +600,14 @@ fn markdown() -> String {
             );
         }
     }
+    out += "\n#### What the program says\n\n| Asked | Reply |\n|---|---|\n";
+    for r in PROGRAM {
+        out += &format!("| `{}` | {} |\n", r.name, fields_text(r.reply));
+    }
+    out += &format!(
+        "\n#### What an error says\n\n{}\n",
+        fields_text(ERROR_FIELDS)
+    );
     let mut seen: Vec<&Rec> = Vec::new();
     fn walk<'a>(ty: &'a Ty, seen: &mut Vec<&'a Rec>) {
         match ty {
@@ -525,7 +621,7 @@ fn markdown() -> String {
             _ => {}
         }
     }
-    for r in REQUESTS {
+    for r in REQUESTS.iter().chain(PROGRAM) {
         for f in r.args.iter().chain(r.reply) {
             walk(&f.ty, &mut seen);
         }

@@ -525,8 +525,9 @@ enum Cmd {
     },
     /// Stop the daemon.
     Stop,
-    /// Say which Cardinal data is on this device, as one line of JSON, and
-    /// change nothing. A window asks this when the daemon does not answer.
+    /// Say which Cardinal data is on this device, and change nothing: the
+    /// record `cardinald --store` writes, for a window to read when the
+    /// daemon does not answer, or to a terminal its text rendering.
     #[command(hide = true)]
     Store,
     #[command(flatten)]
@@ -1442,7 +1443,12 @@ fn print_sheet(v: &Value) {
     for h in &hosts {
         println!();
         println!("  Always-on device: {}", h["name"].as_str().unwrap_or(""));
-        let key = h["key"].as_str().unwrap_or("");
+        // the key's bytes, written for a person to copy
+        let key = h["key"]
+            .as_str()
+            .and_then(|k| <[u8; 32]>::try_from(hex::decode(k).ok()?).ok())
+            .map(|k| cardinald::host::sheet_key(&k))
+            .unwrap_or_default();
         for a in h["addresses"].as_array().into_iter().flatten() {
             println!("  Address:          {}", a.as_str().unwrap_or(""));
         }
@@ -2562,8 +2568,13 @@ async fn client(cmd: Cmd) -> anyhow::Result<()> {
         Cmd::Recovery {
             cmd: RecoveryCmd::Restore { host, key },
         } => {
+            // the key as the sheet writes it, checked before anything is sent
+            let key = cardinald::host::read_sheet_key(&key).ok_or_else(|| {
+                anyhow::anyhow!("that key does not check out; a character was probably mistyped")
+            })?;
             let words = read_words(None, "Type your 24 recovery words.").await?;
             println!("Reaching {host}...");
+            let key = hex::encode(key);
             call(
                 &paths,
                 json!({"cmd": "restore-from-host", "words": words.as_str(), "at": host, "key": key}),
@@ -3748,7 +3759,16 @@ async fn client(cmd: Cmd) -> anyhow::Result<()> {
             Ok(())
         }
         Cmd::Store => {
-            println!("{}", cardinald::format::says(&paths));
+            use std::io::{IsTerminal, Write};
+            let report = cardinald::format::report(&paths);
+            let mut out = std::io::stdout().lock();
+            if out.is_terminal() {
+                let spec = cardinald::api::program("--store").expect("the table has it");
+                writeln!(out, "{}", cardinald::api::render_reply(spec, &report))?;
+            } else {
+                out.write_all(&report)?;
+            }
+            out.flush()?;
             Ok(())
         }
         Cmd::Inspect { cmd } => match cmd {
