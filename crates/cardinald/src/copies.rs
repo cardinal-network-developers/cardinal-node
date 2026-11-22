@@ -21,9 +21,12 @@
 //!   never a failure (`blobs.md#counting-copies`): one that does not
 //!   answer within what it is expected to take
 //!   ([`crate::sched::PeerStats::expect`], learned from its replies, and
-//!   patient with one not measured) has not confirmed anything, so it does
-//!   not count, and is unconfirmed rather than failed or missing pieces;
-//!   it is asked again at its next check. What devices fetch is not
+//!   patient with one not measured) has not confirmed anything since, and
+//!   is asked again at its next check. A pass within the horizon (7 days)
+//!   keeps it counted meanwhile, as it keeps a device offline counted;
+//!   past that, or with no pass, it is unconfirmed rather than failed or
+//!   missing pieces. The count is for the person: dropping a chunk asks a
+//!   holder afresh (`cleanup.rs`, lock, check, delete). What devices fetch is not
 //!   watched: one rebuilding after a lost disk fails checks while pieces
 //!   are missing and passes once it has them again.
 //! - **Still copying, or missing pieces.** A device that has never passed
@@ -67,8 +70,9 @@ pub struct Rules {
     pub min_age_ms: u64,
     /// Objects asked for per check.
     pub sample: usize,
-    /// How long a passed check keeps an unchecked (offline) device
-    /// counted: 7 days.
+    /// How long a passed check keeps a device counted that has not been
+    /// checked since, or has left checks unanswered since, as one offline
+    /// does: 7 days. For what the person is shown only.
     pub horizon_ms: u64,
 }
 
@@ -248,10 +252,23 @@ impl Holder {
         }
     }
 
-    /// Whether it counts now.
+    /// Whether it counts now, for what the person is shown: a pass
+    /// within the horizon counts though a check since went unanswered, as
+    /// one does when its device goes offline. Dropping a chunk never goes
+    /// by this: it asks a holder afresh (`blobs.md#dropping-a-chunk`).
     pub fn verdict(&self, r: &Rules, now: u64) -> Verdict {
-        // Silent at its last check: nothing confirmed since.
+        let standing_fail = self
+            .failed_at()
+            .filter(|f| self.last_pass.is_none_or(|p| p <= *f));
+        // Silent at its last check: nothing confirmed since, but a pass
+        // within the horizon, with no failure after it, still counts.
         if self.missed > 0 {
+            if let Some(p) = self
+                .last_pass
+                .filter(|p| standing_fail.is_none() && now.saturating_sub(*p) <= r.horizon_ms)
+            {
+                return Verdict::Counted { checked: p };
+            }
             let why = self.silent.as_deref().unwrap_or("no answer");
             let reason = match self.missed {
                 1 => format!("did not answer its last check ({why})"),
@@ -260,10 +277,7 @@ impl Holder {
             return Verdict::Unconfirmed { reason };
         }
         // The last check failed (and nothing passed since).
-        if let Some(f) = self
-            .failed_at()
-            .filter(|f| self.last_pass.is_none_or(|p| p <= *f))
-        {
+        if let Some(f) = standing_fail {
             return self.failing(f);
         }
         match self.last_pass {
@@ -1040,36 +1054,52 @@ mod tests {
         let mut h = Holder::default();
         h.checked(0, Outcome::Passed);
         let silent = || Outcome::Unanswered("not within 4 s".into());
-        // Silent: not counted, since nothing is confirmed, and neither
-        // failed nor missing pieces; asked again an interval later.
+        // Silent: neither failed nor missing pieces, and asked again an
+        // interval later. Its pass, within the horizon, still counts, as
+        // it does for a device gone offline.
         h.checked(10 * MIN, silent());
         let v = h.verdict(&r, 10 * MIN + 1);
+        assert_eq!(v, Verdict::Counted { checked: 0 });
+        assert_eq!(h.next_check(&r, 1.0), 10 * MIN + r.interval_ms);
+        for i in 2..30 {
+            h.checked(i * 10 * MIN, silent());
+            assert!(h.verdict(&r, i * 10 * MIN + 1).counted());
+        }
+        // Past the horizon it is unconfirmed, however long it stays silent.
+        let late = r.horizon_ms + 1;
+        h.checked(late, silent());
+        let v = h.verdict(&r, late + 1);
         assert!(!v.counted());
         assert_eq!(v.state(), "unconfirmed");
-        assert_eq!(
+        assert!(matches!(
             v,
+            Verdict::Unconfirmed { reason } if reason.starts_with("did not answer its last 30 checks")
+        ));
+        // With no pass, silence confirms nothing.
+        let mut never = Holder::default();
+        never.checked(0, silent());
+        assert_eq!(
+            never.verdict(&r, 1),
             Verdict::Unconfirmed {
                 reason: "did not answer its last check (not within 4 s)".into()
             }
         );
-        assert_eq!(h.next_check(&r, 1.0), 10 * MIN + r.interval_ms);
-        // However long it stays silent.
-        for i in 2..30 {
-            h.checked(i * 10 * MIN, silent());
-            assert_eq!(h.verdict(&r, i * 10 * MIN + 1).state(), "unconfirmed");
-        }
         assert!(h.last_fail.is_none());
         // An answer stands as it says.
-        h.checked(400 * MIN, Outcome::Passed);
-        assert!(h.verdict(&r, 400 * MIN + 1).counted());
+        let t = late + 400 * MIN;
+        h.checked(t, Outcome::Passed);
+        assert!(h.verdict(&r, t + 1).counted());
         assert_eq!(h.missed, 0);
-        // Only "not held" counts against it.
-        h.checked(410 * MIN, silent());
+        // Only "not held" counts against it, and silence after it does
+        // not bring back the count.
+        h.checked(t + 10 * MIN, silent());
         h.checked(
-            420 * MIN,
+            t + 20 * MIN,
             Outcome::Failed("did not have 1 of the 4 pieces".into()),
         );
-        assert_eq!(h.verdict(&r, 420 * MIN + 1).state(), "missing");
+        assert_eq!(h.verdict(&r, t + 20 * MIN + 1).state(), "missing");
+        h.checked(t + 30 * MIN, silent());
+        assert!(!h.verdict(&r, t + 30 * MIN + 1).counted());
         // What an earlier build saved of failing for silence is no failure.
         let saved = r#"{"last_check": 9, "last_pass": 5, "last_fail": 9,
             "fail_reason": "did not answer 2 checks in a row", "missed": 0,
@@ -1118,7 +1148,11 @@ mod tests {
             (Some(200), Some(100), 1)
         );
         again.finish(k, 400, Some(Outcome::Unanswered("timed out".into())));
-        assert!(!again.lock().holders[&k].verdict(&r, 500).counted());
+        // its pass is within the horizon: it counts for the person still
+        assert!(again.lock().holders[&k].verdict(&r, 500).counted());
+        assert_eq!(again.lock().holders[&k].missed, 2);
+        let past = r.horizon_ms + 101;
+        assert!(!again.lock().holders[&k].verdict(&r, past).counted());
         // a file written by an earlier build, with fields no longer used
         std::fs::write(
             &path,
@@ -1279,7 +1313,9 @@ mod tests {
         let timed_out = || Outcome::Unanswered("timed out".into());
         h.checked(70 * MIN, timed_out());
         h.checked(80 * MIN, timed_out());
-        assert_eq!(state(&h, 81 * MIN), "unconfirmed");
+        // its pass, within the horizon, still counts
+        assert_eq!(state(&h, 81 * MIN), "passed");
+        assert_eq!(state(&h, 60 * MIN + r.horizon_ms + 1), "unconfirmed");
         let mut never = Holder::default();
         never.checked(MIN, timed_out());
         assert_eq!(state(&never, 2 * MIN), "unconfirmed");

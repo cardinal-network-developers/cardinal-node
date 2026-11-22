@@ -1667,3 +1667,59 @@ fn a_form_signed_again_is_told_from_those_kept_by_looking_it_up() {
     let bound = start * 3 + std::time::Duration::from_millis(10);
     assert!(asked.is_some() || end < bound, "{start:?} then {end:?}");
 }
+
+/// `evolution.md#critical-and-ignorable`, in a space as in an identity log:
+/// the protocol record marks each extension, and the mark decides. An
+/// extension no record declares is an op nobody defined; one marked
+/// ignorable changes nothing about validity, so any member may use it; one
+/// marked critical, which nothing here knows, is where the verifier stops:
+/// the entry that uses it, and what descends from it, are not valid here,
+/// while what is beside it is. Only the owner's records declare.
+#[test]
+fn the_protocol_record_marks_each_extension_in_a_space_too() {
+    let (quiet, loud, other) = ([0x11u8; 32], [0x22u8; 32], [0x33u8; 32]);
+    let ext = |name: [u8; 32]| {
+        vec![SpaceOp::from_record(
+            Record::new().with(0, name).with(1, 7u64),
+        )]
+    };
+    let protocol = |exts: &[([u8; 32], bool)]| {
+        let p = cardinal_identity::Protocol {
+            base: [0; 32],
+            extensions: exts.to_vec(),
+        };
+        vec![SpaceOp::from_record(
+            Record::new().with(0, 9u32).with(1, p.to_record()),
+        )]
+    };
+    let mut s = Scene::new(ANA, A, &[(ANA, OWNER), (BEN, WRITER), (CY, READER)], None);
+    s.write("undeclared", BEN, P, ext(quiet), None);
+    s.write(
+        "declared",
+        ANA,
+        A,
+        protocol(&[(quiet, false), (loud, true)]),
+        None,
+    );
+    s.write("quiet", CY, P, ext(quiet), None);
+    // a writer's record declares nothing
+    s.write("theirs", BEN, P, protocol(&[(other, false)]), None);
+    s.write("other", BEN, P, ext(other), None);
+    assert_eq!(
+        s.valid(&["undeclared", "declared", "quiet", "theirs", "other"]),
+        [false, true, true, false, false]
+    );
+    assert!(s.judge.validity().stalled.is_empty());
+    // critical: the verifier stops there
+    s.write("loud", BEN, P, ext(loud), Some(&["quiet"]));
+    s.write("after", ANA, A, app(), Some(&["loud"]));
+    s.write("beside", ANA, A, app(), Some(&["quiet"]));
+    assert_eq!(s.valid(&["loud", "after", "beside"]), [false, false, true]);
+    let stalled = &s.judge.validity().stalled;
+    assert!(stalled.len() == 1 && stalled.contains(&s.named["loud"]));
+    // one that would be invalid anyway stops nothing
+    s.write("stranger", EVE, P, ext(loud), Some(&["quiet"]));
+    s.write("on_it", ANA, A, app(), Some(&["stranger"]));
+    assert_eq!(s.valid(&["stranger", "on_it"]), [false, true]);
+    assert_eq!(s.judge.validity().stalled.len(), 1);
+}

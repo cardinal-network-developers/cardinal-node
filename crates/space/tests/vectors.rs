@@ -225,6 +225,35 @@ fn restore_vector(key: &SigningKey, author: [u8; 32], head: [u8; 32], epoch: [u8
     let both = state_of(&dag);
     assert!(!both.node(&trip).unwrap().deleted && !both.node(&c).unwrap().deleted);
     assert!(both.node(&a).unwrap().deleted);
+    // Trip, kept by the delete conflict, has the number of the delete that
+    // yielded there, which a and b have: a restore of Trip in a successor
+    // brings them back.
+    let both_canonical = both.canonical();
+    let number_in = |canonical: &cardinal_encoding::Record, id: [u8; 16]| -> u64 {
+        let list = canonical.list(1).unwrap();
+        let r = list
+            .iter()
+            .filter_map(|v| v.as_record())
+            .find(|r| r.bytes(1).ok() == Some(&id[..]))
+            .unwrap();
+        r.uint(6).unwrap()
+    };
+    let both_numbers: serde_json::Map<String, Json> = named
+        .iter()
+        .map(|(name, id)| ((*name).into(), json!(number_in(&both_canonical, *id))))
+        .collect();
+    assert_ne!(number_in(&both_canonical, trip), 0);
+    assert_eq!(
+        number_in(&both_canonical, trip),
+        number_in(&both_canonical, a)
+    );
+    assert_eq!(
+        number_in(&both_canonical, trip),
+        number_in(&both_canonical, b)
+    );
+    assert_eq!(number_in(&both_canonical, c), 0);
+    let conflict_in_successor =
+        conflict_successor_vector(key, author, head, epoch, &both, [trip, a, b, c]);
     let entries: Vec<String> = [space, e1, e2, e3, e4, e5, e6, e7]
         .iter()
         .map(|id| hx(dag.get(id).unwrap().encode()))
@@ -245,7 +274,9 @@ fn restore_vector(key: &SigningKey, author: [u8; 32], head: [u8; 32], epoch: [u8
             and e7 deletes Trip, both after e5 and so concurrent: the restore names c, which \
             touches c and everything above it, so the delete yields there; `after_both` has \
             Trip and c not deleted, Trip with a delete conflict, and a and b deleted, \
-            `after_both_root` the canonical state's BLAKE3.",
+            `after_both_root` the canonical state's BLAKE3. In that canonical state Trip, which \
+            the delete conflict kept, has the number of the delete that yielded there, the \
+            number a and b have, and c has 0: `after_both_numbers`.",
         "entries": entries,
         "after_deletes_canonical": hx(taken_canonical.encode()),
         "after_deletes_numbers": Json::Object(numbers),
@@ -254,6 +285,73 @@ fn restore_vector(key: &SigningKey, author: [u8; 32], head: [u8; 32], epoch: [u8
         "after_restore_canonical": hx(canonical),
         "after_both": flags(&both),
         "after_both_root": hx(both.root_hash()),
+        "after_both_numbers": Json::Object(both_numbers),
+        "conflict_in_a_successor": conflict_in_successor,
+    })
+}
+
+/// A restore in a successor of a node that a delete conflict kept brings
+/// back what the delete that yielded there took beneath it: the successor
+/// starts from the canonical state after e6 and e7, where Trip has e7's
+/// number, and its first entry restores Trip, which brings back a and b.
+fn conflict_successor_vector(
+    key: &SigningKey,
+    author: [u8; 32],
+    head: [u8; 32],
+    epoch: [u8; 16],
+    initial: &cardinal_space::State,
+    [trip, a, b, c]: [[u8; 16]; 4],
+) -> Json {
+    use cardinal_identity::dag::Dag;
+    use cardinal_space::{Profile, SpaceEntry, State};
+    use std::collections::HashSet;
+
+    let initial = State::from_canonical(Profile::FILES, &initial.canonical()).unwrap();
+    let kept = initial.node(&trip).unwrap();
+    assert!(!kept.deleted && kept.delete_conflict, "carried as it was");
+    assert!(initial.node(&a).unwrap().deleted);
+    let mut dag: Dag<SpaceEntry> = Dag::new();
+    let genesis = SpaceEntryBuilder::genesis(author, head, epoch)
+        .time(1_700_000_300_000)
+        .sign(key)
+        .unwrap();
+    let space = genesis.id();
+    dag.insert(space, Vec::new(), genesis);
+    let s1 = SpaceEntryBuilder::new(space, &[space], author, head, epoch)
+        .ops(vec![SpaceOp::restore(trip)])
+        .time(1_700_000_301_000)
+        .sign(key)
+        .unwrap();
+    let s1_id = s1.id();
+    dag.insert(s1_id, vec![space], s1);
+    let valid: HashSet<_> = dag.log_order().iter().copied().collect();
+    let back = State::compute_from(Profile::FILES, Some(&initial), &dag, &valid);
+    let n = |id: &[u8; 16]| back.node(id).unwrap();
+    assert!([trip, a, b].iter().all(|x| !n(x).deleted));
+    assert!(!n(&trip).delete_conflict);
+    assert!(!n(&c).deleted);
+    let entries: Vec<String> = [space, s1_id]
+        .iter()
+        .map(|id| hx(dag.get(id).unwrap().encode()))
+        .collect();
+    let named = [("Trip", trip), ("a", a), ("b", b), ("c", c)];
+    let mut flags = serde_json::Map::new();
+    for (name, id) in named {
+        let x = n(&id);
+        flags.insert(
+            name.into(),
+            json!({"id": hx(id), "deleted": x.deleted, "delete_conflict": x.delete_conflict}),
+        );
+    }
+    json!({
+        "description": "A successor whose initial state is the canonical state of `after_both`, \
+            and whose genesis (the first of `entries`) has no ops. s1 restores Trip, which the \
+            delete conflict kept: what the delete that yielded there took beneath it, a and b, \
+            comes back with it, and Trip's delete conflict is cleared (`after_s1`, whose \
+            canonical state's BLAKE3 is `after_s1_root`).",
+        "entries": entries,
+        "after_s1": Json::Object(flags),
+        "after_s1_root": hx(back.root_hash()),
     })
 }
 

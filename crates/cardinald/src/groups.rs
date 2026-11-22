@@ -700,6 +700,30 @@ pub fn moved_seen(d: &Daemon, group: &str) -> anyhow::Result<Json> {
     Ok(json!({}))
 }
 
+/// The person's OK to how another of their devices moved a group
+/// (`spaces.md#a-succession-by-a-device-that-is-later-removed`, "Kept when
+/// the person confirms it"): keeps each succession its `confirm` lists, a
+/// `keep` of the `succeed` and of the genesis it names, and clears the
+/// note as [`moved_seen`] does. Answers how many entries it wrote.
+pub fn confirm_move(d: &Arc<Daemon>, group: &str) -> anyhow::Result<Json> {
+    let g = find(d, group)?;
+    let written = {
+        let mut core = d.core();
+        let mut written = Vec::new();
+        for old in core.successions_to_confirm(&g.id) {
+            written.extend(core.keep_succession(&old)?);
+        }
+        core.moved_seen(&g.id);
+        written
+    };
+    let kept = written.len();
+    for (space, bytes) in written {
+        d.push(&space, vec![bytes]);
+    }
+    d.bump();
+    Ok(json!({ "kept": kept }))
+}
+
 fn name_of(
     me: &[u8; 32],
     contacts: &[ContactRecord],
@@ -787,14 +811,21 @@ pub fn list_of(core: &Core) -> Json {
         // aged from when this device first held it, not by the mover's clock
         let seen = notes.and_then(|n| n.first_seen_ms);
         let fresh = seen.is_none_or(|t| now_ms().saturating_sub(t) < MOVED_FOR_MS);
-        let moved = (sp.succeeds().is_some() && fresh && !notes.is_some_and(|n| n.moved_seen))
-            .then(|| {
-                let mut c = change_json(core, &me, &contacts, &named, id);
-                c["by"] = json!(name_of(&me, &contacts, &named, &sp.creator()));
-                c["at"] = json!(at);
-                c["seen"] = json!(seen);
-                c
-            });
+        // what another device of the person's moved, until they say OK
+        let confirm: Vec<String> = core
+            .successions_to_confirm(id)
+            .iter()
+            .map(hex::encode)
+            .collect();
+        let told = fresh && !notes.is_some_and(|n| n.moved_seen);
+        let moved = (sp.succeeds().is_some() && (told || !confirm.is_empty())).then(|| {
+            let mut c = change_json(core, &me, &contacts, &named, id);
+            c["by"] = json!(name_of(&me, &contacts, &named, &sp.creator()));
+            c["at"] = json!(at);
+            c["seen"] = json!(seen);
+            c["device"] = json!(core.moved_by_device(id));
+            c
+        });
         let lost_ids: Vec<String> = lost.iter().map(hex::encode).collect();
         let lost: Vec<Json> = lost
             .iter()
@@ -807,6 +838,7 @@ pub fn list_of(core: &Core) -> Json {
         let group = json!({
             "ended": ended,
             "moved": moved,
+            "confirm": confirm,
             "did_not_stand": lost_ids,
             "did_not_stand_changes": lost,
             "held_back": core.held_back(id),

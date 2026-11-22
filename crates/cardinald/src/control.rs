@@ -587,6 +587,7 @@ async fn handle(d: &Arc<Daemon>, req: &Value) -> anyhow::Result<Value> {
         }
         "group-post-again" => crate::groups::post_again(d, arg(req, "group")?),
         "group-moved-seen" => crate::groups::moved_seen(d, arg(req, "group")?),
+        "group-confirm-move" => crate::groups::confirm_move(d, arg(req, "group")?),
         "group-leave" => crate::groups::leave(d, arg(req, "group")?),
         "group-join" => {
             let reach = answer_in(req, "reach")?;

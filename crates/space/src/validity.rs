@@ -67,6 +67,11 @@ pub struct Validity {
     /// Entries whose signing key was in effect at the head they cite and has
     /// been removed since, which no witness or `keep` vouches for (yet).
     pub unwitnessed: HashSet<EntryId>,
+    /// Entries that would be valid and use an extension critical for them,
+    /// which this verifier does not know (`evolution.md#what-a-device-does-with-a-critical-extension-it-does-not-know`):
+    /// they, and everything that descends from them, are not valid here
+    /// until it does. Nothing here knows any extension.
+    pub stalled: HashSet<EntryId>,
 }
 
 impl Validity {
@@ -109,6 +114,75 @@ enum Class {
     /// A control op this implementation does not define, or a malformed op:
     /// no role.
     Invalid,
+    /// An extension op, before the protocol records say what it is.
+    Ext([u8; 32]),
+    /// An extension op a protocol record declares: it changes nothing
+    /// about validity, so any member may write it. Where it is marked
+    /// critical, the entry is opaque besides.
+    Declared,
+}
+
+/// The protocol records an entry carries: its `start`'s, and each
+/// `set_protocol`'s.
+fn protocols(e: &SpaceEntry) -> Vec<cardinal_identity::Protocol> {
+    let mut out = Vec::new();
+    for op in e.ops() {
+        let r = match op.body() {
+            SpaceOpBody::Start {
+                protocol: Some(p), ..
+            } => Some(p),
+            SpaceOpBody::SetProtocol => op.record().get(1).and_then(|v| v.as_record()),
+            _ => None,
+        };
+        if let Some(p) = r.and_then(|r| cardinal_identity::Protocol::from_record(r).ok()) {
+            out.push(p);
+        }
+    }
+    out
+}
+
+/// The mark of extension `name` in these records: critical if any marks
+/// it so, ignorable if all that name it say ignorable, `None` where none
+/// declares it (`evolution.md#critical-and-ignorable`).
+fn mark_in(records: &[cardinal_identity::Protocol], name: &[u8; 32]) -> Option<bool> {
+    let mut mark = None;
+    for p in records {
+        for (n, critical) in &p.extensions {
+            if n == name {
+                mark = Some(mark.unwrap_or(false) || *critical);
+            }
+        }
+    }
+    mark
+}
+
+/// The mark of extension `name` for entry `id` of a space: what the
+/// protocol records in its causal past, or in it, say. Only the records
+/// the space's genesis holds, and those its owner wrote, count: only the
+/// owner may write `set_protocol` (`evolution.md#declaring-what-you-speak`),
+/// so no one else's declares anything, valid or not.
+fn extension_mark(
+    dag: &Dag<SpaceEntry>,
+    genesis: Option<EntryId>,
+    owner: Option<IdentityId>,
+    id: &EntryId,
+    e: &SpaceEntry,
+    name: &[u8; 32],
+) -> Option<bool> {
+    let past = if e.is_genesis() {
+        HashSet::new()
+    } else {
+        dag.ancestors_of(e.parents())
+    };
+    let mut records = Vec::new();
+    let mine = std::iter::once((*id, e));
+    let earlier = past.iter().filter_map(|x| Some((*x, dag.get(x)?)));
+    for (x, xe) in mine.chain(earlier) {
+        if Some(x) == genesis || (e.is_genesis() && x == *id) || Some(xe.author()) == owner {
+            records.extend(protocols(xe));
+        }
+    }
+    mark_in(&records, name)
 }
 
 /// What an op is to the rules, read from the entry alone
@@ -125,6 +199,7 @@ fn class(e: &SpaceEntry, op: &SpaceOpBody) -> Class {
         SpaceOpBody::Keep { .. } => Class::Keep,
         SpaceOpBody::SetPolicy { .. } | SpaceOpBody::SetProtocol => Class::OwnerOnly,
         SpaceOpBody::Unknown { number } if number.is_none_or(|n| n < 32) => Class::Invalid,
+        SpaceOpBody::Extension { name } => Class::Ext(*name),
         SpaceOpBody::Set { node, .. } if *node == reach_node_id(&e.author()) => Class::Reach,
         _ => Class::App,
     }
@@ -134,7 +209,7 @@ fn class(e: &SpaceEntry, op: &SpaceOpBody) -> Class {
 /// `None` if no role may (the roles table of `spaces.md#members-and-roles`).
 fn least_role(class: Class, op: &SpaceOpBody, has_owner: bool) -> Option<u64> {
     match class {
-        Class::Leave | Class::Keep | Class::Reach => Some(READER),
+        Class::Leave | Class::Keep | Class::Reach | Class::Declared => Some(READER),
         Class::App => Some(WRITER),
         // only a genesis names an owner
         Class::Add => match op {
@@ -144,7 +219,7 @@ fn least_role(class: Class, op: &SpaceOpBody, has_owner: bool) -> Option<u64> {
         Class::OwnerOnly => Some(OWNER),
         // the owner's alone; with no owner, every member's
         Class::Succeed => Some(if has_owner { OWNER } else { READER }),
-        Class::Start | Class::Invalid => None,
+        Class::Start | Class::Invalid | Class::Ext(_) => None,
     }
 }
 
@@ -171,8 +246,14 @@ impl Genesis {
         let mut adds = Vec::new();
         let mut starts = 0;
         let mut others = Vec::new();
+        let records = protocols(e);
         for op in e.ops() {
-            match (class(e, op.body()), op.body()) {
+            let class = match class(e, op.body()) {
+                Class::Ext(name) if mark_in(&records, &name).is_some() => Class::Declared,
+                Class::Ext(_) => Class::Invalid,
+                c => c,
+            };
+            match (class, op.body()) {
                 (Class::Start, _) => starts += 1,
                 (Class::Add, SpaceOpBody::AddMember { identity, role, .. }) => {
                     adds.push((*identity, *role))
@@ -347,6 +428,11 @@ struct Info {
     /// space: its author must name one, its signature counts, and a role
     /// the genesis gave its author may perform all of its ops.
     named: bool,
+    /// It uses an extension critical for it, which this verifier does not
+    /// know: valid by the rules, it is where this verifier stops. Its
+    /// signature witnesses nothing, its `keep` ops keep nothing and its
+    /// `succeed` names nothing here.
+    opaque: bool,
     marked: Option<Box<Marked>>,
 }
 
@@ -452,8 +538,23 @@ impl Judge {
         let mut need = (genesis || !e.is_genesis()).then_some(READER);
         let mut structural = false;
         let mut leave = false;
+        let mut opaque = false;
+        let (gid, owner) = (self.genesis.as_ref().map(|g| g.id), self.owner());
         for op in e.ops() {
-            let class = class(e, op.body());
+            // An extension op is what the protocol records say: an op
+            // nobody defined where none declares it, and otherwise nothing
+            // to validity, opaque where marked critical, since nothing
+            // here knows any extension (`evolution.md#critical-and-ignorable`).
+            let class = match class(e, op.body()) {
+                Class::Ext(name) => match extension_mark(dag, gid, owner, id, e, &name) {
+                    None => Class::Invalid,
+                    Some(critical) => {
+                        opaque |= critical;
+                        Class::Declared
+                    }
+                },
+                c => c,
+            };
             need = match (need, least_role(class, op.body(), has_owner)) {
                 (Some(a), Some(b)) => Some(a.max(b)),
                 _ => None,
@@ -474,13 +575,21 @@ impl Judge {
                 _ => {}
             }
         }
+        if opaque {
+            // what this verifier cannot read vouches for nothing and ends
+            // nothing
+            marked.keeps.clear();
+            marked.names.clear();
+        }
         let past = if e.is_genesis() {
             Arc::new(Bits::default())
         } else {
             self.past_of(e.parents())
         };
-        // a genesis is in every other entry's past, and needs no mark
-        let rests = !marked.adds.is_empty() || !marked.names.is_empty();
+        // a genesis is in every other entry's past, and needs no mark; an
+        // opaque entry has one, so that what descends from it is judged
+        // again when it comes to stop the verifier or stops doing so
+        let rests = !marked.adds.is_empty() || !marked.names.is_empty() || opaque;
         let mark = (rests && !genesis).then(|| {
             self.marks.push(*id);
             (self.marks.len() - 1) as u32
@@ -514,6 +623,7 @@ impl Judge {
                 ok: false,
                 valid: false,
                 named: false,
+                opaque,
                 marked: (!nothing).then(|| Box::new(marked)),
             },
         );
@@ -562,7 +672,10 @@ impl Judge {
                 self.root = self.root_now();
             }
             let named = self.named_now(dag, id);
-            let valid = self.valid_now(dag, id);
+            let (valid, stops) = self.judge_now(dag, id);
+            if stops {
+                self.validity.stalled.insert(*id);
+            }
             let i = self.info.get_mut(id).expect("just added");
             i.named = named;
             i.valid = valid;
@@ -659,6 +772,9 @@ impl Judge {
     /// trusted: the entries of `w`'s author that wait and that `w`, whose
     /// signature counts, witnesses.
     fn witness_from(&mut self, dag: &Dag<SpaceEntry>, w: &EntryId, counted: &mut Vec<EntryId>) {
+        if self.info.get(w).is_some_and(|i| i.opaque) {
+            return;
+        }
         let Some(we) = dag.get(w) else { return };
         let (author, key, head) = (we.author(), we.signer(), we.author_head());
         let (Some(waiting), Some(state)) = (self.waiting.get(&author), self.states.get(&author))
@@ -795,7 +911,8 @@ impl Judge {
                 let mut kept = Vec::new();
                 for w in &ok {
                     let (wkey, whead) = sig(w);
-                    if wkey != k && !state.is_removed_at(&k, &whead) {
+                    let opaque = self.info.get(w).is_some_and(|i| i.opaque);
+                    if wkey != k && !opaque && !state.is_removed_at(&k, &whead) {
                         built_on.extend_from_slice(dag.parents(w));
                     }
                     for (key, listed) in self.marked(w).map_or(&[][..], |m| m.keeps.as_slice()) {
@@ -914,7 +1031,30 @@ impl Judge {
                 .is_some_and(|need| by_genesis.is_some_and(|r| *r >= need))
     }
 
-    /// Whether `id` is valid, given what is held about its causal past.
+    /// Whether `id` is valid here, and whether it is where this verifier
+    /// stops: valid by the rules and opaque. An entry that stops it, and
+    /// everything descending from one, is not valid here
+    /// (`evolution.md#what-a-device-does-with-a-critical-extension-it-does-not-know`).
+    fn judge_now(&self, dag: &Dag<SpaceEntry>, id: &EntryId) -> (bool, bool) {
+        let by_rules = self.valid_now(dag, id);
+        let Some(i) = self.info.get(id) else {
+            return (false, false);
+        };
+        let gid = self.genesis.as_ref().map(|g| g.id);
+        let behind = self.validity.stalled.iter().any(|s| {
+            s != id
+                && (Some(*s) == gid
+                    || self
+                        .info
+                        .get(s)
+                        .and_then(|x| x.mark)
+                        .is_some_and(|m| i.past.get(m)))
+        });
+        (by_rules && !i.opaque && !behind, by_rules && i.opaque)
+    }
+
+    /// Whether `id` is valid by the rules, given what is held about its
+    /// causal past.
     fn valid_now(&self, dag: &Dag<SpaceEntry>, id: &EntryId) -> bool {
         let (Some(g), Some(i)) = (&self.genesis, self.info.get(id)) else {
             return false;
@@ -967,6 +1107,9 @@ impl Judge {
         // to count or stopped. Log order puts them before what descends
         // from them.
         let mut moved = Bits::default();
+        // a genesis that came to stop the verifier, or stopped doing so:
+        // everything after it is judged again
+        let mut all_after = false;
         let mut changed = Vec::new();
         let mut members = all;
         for z in &order[start..] {
@@ -975,15 +1118,30 @@ impl Judge {
             let Some(past) = self.info.get(z).map(|i| &i.past) else {
                 continue;
             };
-            let hit = todo.remove(z) || all || (!moved.is_empty() && past.intersects(&moved));
+            let hit = todo.remove(z)
+                || all
+                || all_after
+                || (!moved.is_empty() && past.intersects(&moved));
             if !hit {
-                if todo.is_empty() && moved.is_empty() {
+                if todo.is_empty() && moved.is_empty() && !all_after {
                     break;
                 }
                 continue;
             }
             let named = self.named_now(dag, z);
-            let valid = self.valid_now(dag, z);
+            let (valid, stops) = self.judge_now(dag, z);
+            if stops != self.validity.stalled.contains(z) {
+                if stops {
+                    self.validity.stalled.insert(*z);
+                } else {
+                    self.validity.stalled.remove(z);
+                }
+                // what descends from it is judged again
+                match self.info.get(z).and_then(|i| i.mark) {
+                    Some(m) => moved.set(m),
+                    None => all_after = true,
+                }
+            }
             let i = self.info.get_mut(z).expect("entries judged are known");
             let (was_valid, was_named) = (i.valid, i.named);
             i.valid = valid;
@@ -1275,10 +1433,26 @@ pub fn by_rules(dag: &Dag<SpaceEntry>, logs: &[&IdentityLog]) -> Result<ByRules,
     let mut w = model_world(logs);
     let sym = |w: &mut model::World, b: &[u8]| w.sym(&hex_encode(b));
     let space_sym = sym(&mut w, &space);
+    let first = Genesis::read(&space, g);
+    let owner = first.formed.then_some(first.owner).flatten();
+    // entries that use an extension critical for them: opaque
+    let mut opaque: Vec<EntryId> = Vec::new();
     for (id, e) in dag.iter() {
         let mut ops = Vec::new();
         for o in e.ops() {
-            ops.push(match (class(e, o.body()), o.body()) {
+            let class = match class(e, o.body()) {
+                Class::Ext(name) => match extension_mark(dag, Some(space), owner, id, e, &name) {
+                    None => Class::Invalid,
+                    Some(critical) => {
+                        if critical && !opaque.contains(id) {
+                            opaque.push(*id);
+                        }
+                        Class::Declared
+                    }
+                },
+                c => c,
+            };
+            ops.push(match (class, o.body()) {
                 (_, SpaceOpBody::Start { succession, .. }) => Op::Start {
                     succeeds: succession.succeeds.as_ref().map(|x| sym(&mut w, x)),
                 },
@@ -1295,8 +1469,9 @@ pub fn by_rules(dag: &Dag<SpaceEntry>, logs: &[&IdentityLog]) -> Result<ByRules,
                 },
                 (Class::Leave, _) => Op::Leave,
                 (Class::OwnerOnly, _) => Op::OwnerOnly,
-                (Class::Reach, _) => Op::Reach,
-                (Class::Invalid, _) => Op::Invalid,
+                // an op that changes nothing, which any member may write
+                (Class::Reach | Class::Declared, _) => Op::Reach,
+                (Class::Invalid | Class::Ext(_), _) => Op::Invalid,
                 _ => Op::App,
             });
         }
@@ -1313,8 +1488,32 @@ pub fn by_rules(dag: &Dag<SpaceEntry>, logs: &[&IdentityLog]) -> Result<ByRules,
             .map_err(|_| Error::Malformed("space entries out of order"))?;
     }
     let ids = w.log_ids(space_sym);
-    let r = model::evaluate_space(&w, space_sym, &ids);
+    let mut r = model::evaluate_space(&w, space_sym, &ids);
+    // As for an identity log (`evolution.md`): evaluated again without
+    // each valid opaque entry and everything that descends from it.
     let id32 = |s: u32| -> [u8; 32] { hex_decode(w.name(s)).try_into().unwrap_or([0; 32]) };
+    let valid: HashSet<EntryId> = r.unary("valid").into_iter().map(id32).collect();
+    let stops: Vec<EntryId> = opaque.into_iter().filter(|x| valid.contains(x)).collect();
+    // A signature counts or not whatever the entry holds: what is left out
+    // keeps what the first evaluation found of it.
+    let mut signed: HashSet<EntryId> = HashSet::new();
+    if !stops.is_empty() {
+        signed = r
+            .unary("author_ok")
+            .into_iter()
+            .map(id32)
+            .filter(|x| stops.iter().any(|o| dag.is_ancestor_or_self(o, x)))
+            .collect();
+        let rest: BTreeSet<_> = ids
+            .iter()
+            .copied()
+            .filter(|s| {
+                let x = id32(*s);
+                !stops.iter().any(|o| dag.is_ancestor_or_self(o, &x))
+            })
+            .collect();
+        r = model::evaluate_space(&w, space_sym, &rest);
+    }
     let unary = |name: &str| r.unary(name).into_iter().map(id32);
     let mut members = Vec::new();
     for t in r.rel("member") {
@@ -1328,7 +1527,7 @@ pub fn by_rules(dag: &Dag<SpaceEntry>, logs: &[&IdentityLog]) -> Result<ByRules,
     members.sort();
     Ok(ByRules {
         valid: unary("valid").collect(),
-        author_ok: unary("author_ok").collect(),
+        author_ok: unary("author_ok").chain(signed).collect(),
         members,
         closed: unary("closed").collect(),
         candidates: unary("candidate").collect(),

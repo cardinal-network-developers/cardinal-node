@@ -1002,10 +1002,23 @@ differs or was read:
   records, exactly as carried in sealed-entry field 4.
 - **The cited author log head** written by this implementation is the last
   entry in log order at which the signing key is in effect.
-- **Extension ops in a space are still allowed to no role**, declared or
-  not: the protocol records of a space are read as their table says (one
-  that is not written so makes its op one nobody defined), but not applied,
-  so no mark is honoured there yet.
+- **The protocol record marks each extension in a space too**
+  (`evolution.md#critical-and-ignorable`; `validity::extension_mark`,
+  tested in `the_protocol_record_marks_each_extension_in_a_space_too`).
+  An op whose key 0 is 32 bytes is an extension op. Where no protocol
+  record in its entry's causal past, or in the entry, declares it, it is
+  an op nobody defined, allowed to no role. Declared ignorable, it changes
+  nothing about validity, so any member may write it, and its entry is
+  accepted for state with the op ignored. Declared critical, the entry is
+  judged as if the op did nothing; valid so, it is where this verifier
+  stops (`Validity::stalled`), since nothing here knows any extension: it
+  and everything descending from it are not valid here, while what is
+  beside it is, and `by_rules` evaluates again without them, as for an
+  identity log. Two readings: **only the genesis's record and those the
+  owner wrote declare**, since only the owner may write `set_protocol` and
+  a record nobody may write should not make a member's op opaque; and an
+  opaque entry witnesses nothing, keeps nothing and names no successor,
+  valid or not, so what this device cannot read vouches for nothing.
 - **Not applied: `set_policy` and `set_protocol`.** They are judged, and the
   policy a space runs under is still the one its genesis gave it. Whether
   it is public would be the genesis's to say even if they were applied.
@@ -1321,15 +1334,16 @@ Readings:
   and every node carried with the same number. The
   numbers are the canonical state's alone: a device keeps which op took a
   node, and numbers the deletes afresh each time it writes the state.
-- **Reading: a restore of a node left in delete conflict** (the spec does
-  not say). A delete that yielded at N still took what beneath N nothing
-  touched; a restore of N brings that back, as a restore of a deleted N
-  brings back what its delete took, and clears N's delete conflict. A
-  successor does not learn of it: the canonical state numbers only deletes
-  that flagged their node, so there a restore of such an N clears its
-  delete conflict only. **Spec question:** whether the canonical state
-  should give a node left in delete conflict the number of the delete that
-  yielded there.
+- **A restore of a node left in delete conflict** (designer, 2026-11-22;
+  `state.md#deletion-yields-to-concurrent-work` and `#canonical-state`;
+  `vectors/state.json`, `a_restore`, `after_both_numbers` and
+  `conflict_in_a_successor`). A delete that yielded at N still took what
+  beneath N nothing touched; a restore of N brings that back, as a restore
+  of a deleted N brings back what its delete took, and clears N's delete
+  conflict. The canonical state gives such an N the number of the delete
+  that yielded there, with field 8 true, which says it is not deleted; so
+  in a successor too a restore of N brings back what that delete took.
+  A node flagged by a `delete` written beside has no delete there, and 0.
 - **Any kind, anywhere** (`state.md#operations`). A `create` is accepted
   whatever its kind and wherever it puts the node, and the files and
   account profiles reject nothing for kind or place any more. What shows a

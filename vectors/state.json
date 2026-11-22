@@ -22,7 +22,13 @@
         "id": "7377fcde6fed8a6a9bc12b6f690f11d1"
       }
     },
-    "after_both_root": "7dcc760e1dc5b29ec9b06612efa1b0b2b6b84ce07e4103590f35505dd6d94ac4",
+    "after_both_numbers": {
+      "Trip": 1,
+      "a": 1,
+      "b": 1,
+      "c": 0
+    },
+    "after_both_root": "9c5d24d423dcf5536bd1e400f4b079d3fc74b4aa4fd4b48ae0b53d02f0dba7e2",
     "after_deletes_canonical": "15006801245d01820147a2436bcb67d5a75fc8a7d5dac24b380210038201db91ffff3f8e284cd643bd7c4347995b040b620514150108020c150182021bddae544afc7de9616f1577905f150b08ee31dd4b949ac22a33104067826921020a62150110020c150182021bddae544afc7de9616f1577905f150b08ee31dd4b949ac22a3310406782692102a01a06080782021bddae544afc7de9616f1577905f150b08ee31dd4b949ac22a33104067826921080009820263e75b517e54e8e641b09c77264994280fdb1bbcd0ee23da8d6a70b416193a1f0a100b80e7def9e78b035d0182017377fcde6fed8a6a9bc12b6f690f11d10210038201db91ffff3f8e284cd643bd7c4347995b040b630514150108020c150182021bddae544afc7de9616f1577905f150b08ee31dd4b949ac22a33104067826921020a63150110020c150182021bddae544afc7de9616f1577905f150b08ee31dd4b949ac22a3310406782692102a01a06100782021bddae544afc7de9616f1577905f150b08ee31dd4b949ac22a33104067826921080009820263e75b517e54e8e641b09c77264994280fdb1bbcd0ee23da8d6a70b416193a1f0a180b80e7def9e78b035d018201add30f4925045d3850e852874bbb20ad0210038201db91ffff3f8e284cd643bd7c4347995b040b610514150108020c150182021bddae544afc7de9616f1577905f150b08ee31dd4b949ac22a33104067826921020a61150110020c150182021bddae544afc7de9616f1577905f150b08ee31dd4b949ac22a3310406782692102a01a06080782021bddae544afc7de9616f1577905f150b08ee31dd4b949ac22a33104067826921080009820263e75b517e54e8e641b09c77264994280fdb1bbcd0ee23da8d6a70b416193a1f0a080b80e7def9e78b035d018201db91ffff3f8e284cd643bd7c4347995b020803820100000000000000000000000000000000042354726970050406080782022f37097c832e4b87f1ed573afcdc5a9a950f0ee484593cf8f1eb8afd8f5ec6d8080009820263e75b517e54e8e641b09c77264994280fdb1bbcd0ee23da8d6a70b416193a1f0a000bc0a8def9e78b03",
     "after_deletes_numbers": {
       "Trip": 1,
@@ -53,7 +59,37 @@
       }
     },
     "after_restore_canonical": "15006801245d01820147a2436bcb67d5a75fc8a7d5dac24b380210038201db91ffff3f8e284cd643bd7c4347995b040b620514150108020c150182021bddae544afc7de9616f1577905f150b08ee31dd4b949ac22a33104067826921020a62150110020c150182021bddae544afc7de9616f1577905f150b08ee31dd4b949ac22a3310406782692102a01a06000782021bddae544afc7de9616f1577905f150b08ee31dd4b949ac22a33104067826921080009820263e75b517e54e8e641b09c77264994280fdb1bbcd0ee23da8d6a70b416193a1f0a100b80e7def9e78b035d0182017377fcde6fed8a6a9bc12b6f690f11d10210038201db91ffff3f8e284cd643bd7c4347995b040b630514150108020c150182021bddae544afc7de9616f1577905f150b08ee31dd4b949ac22a33104067826921020a63150110020c150182021bddae544afc7de9616f1577905f150b08ee31dd4b949ac22a3310406782692102a01a06080782021bddae544afc7de9616f1577905f150b08ee31dd4b949ac22a33104067826921080009820263e75b517e54e8e641b09c77264994280fdb1bbcd0ee23da8d6a70b416193a1f0a180b80e7def9e78b035d018201add30f4925045d3850e852874bbb20ad0210038201db91ffff3f8e284cd643bd7c4347995b040b610514150108020c150182021bddae544afc7de9616f1577905f150b08ee31dd4b949ac22a33104067826921020a61150110020c150182021bddae544afc7de9616f1577905f150b08ee31dd4b949ac22a3310406782692102a01a06000782021bddae544afc7de9616f1577905f150b08ee31dd4b949ac22a33104067826921080009820263e75b517e54e8e641b09c77264994280fdb1bbcd0ee23da8d6a70b416193a1f0a080b80e7def9e78b035d018201db91ffff3f8e284cd643bd7c4347995b020803820100000000000000000000000000000000042354726970050406000782022f37097c832e4b87f1ed573afcdc5a9a950f0ee484593cf8f1eb8afd8f5ec6d8080009820263e75b517e54e8e641b09c77264994280fdb1bbcd0ee23da8d6a70b416193a1f0a000bc0a8def9e78b03",
-    "description": "A restore clears the flags its delete set, and no others (state.md#deletion-yields-to-concurrent-work). A files space signed as the example above is, whose genesis (the first of `entries`) has no ops, and seven entries after it: e1 makes the folder Trip, e2 the files a, b and c in it, e3 deletes c, e4 deletes Trip, and e5 restores Trip, each after the one before. e4 flags Trip, a and b, and not c, which e3 had flagged. In the canonical state after e4 (`after_deletes_canonical`), field 6 of each deleted node's record is the number of the delete that took it, the same for every node one delete took, counted from 1 in the order the records, sorted by node id, list the first node each delete took, and 0 for a node not deleted: `after_deletes_numbers`. After e5 Trip, a and b are back and c is still deleted: `after_restore` gives each node's flags and `after_restore_canonical` the canonical state's encoding. Then e6 restores c and e7 deletes Trip, both after e5 and so concurrent: the restore names c, which touches c and everything above it, so the delete yields there; `after_both` has Trip and c not deleted, Trip with a delete conflict, and a and b deleted, `after_both_root` the canonical state's BLAKE3.",
+    "conflict_in_a_successor": {
+      "after_s1": {
+        "Trip": {
+          "delete_conflict": false,
+          "deleted": false,
+          "id": "db91ffff3f8e284cd643bd7c4347995b"
+        },
+        "a": {
+          "delete_conflict": false,
+          "deleted": false,
+          "id": "add30f4925045d3850e852874bbb20ad"
+        },
+        "b": {
+          "delete_conflict": false,
+          "deleted": false,
+          "id": "47a2436bcb67d5a75fc8a7d5dac24b38"
+        },
+        "c": {
+          "delete_conflict": false,
+          "deleted": false,
+          "id": "7377fcde6fed8a6a9bc12b6f690f11d1"
+        }
+      },
+      "after_s1_root": "cb3c69f96ed00dd520c88bd51c31a41479f9573ef81e5d5b37552fcf33146059",
+      "description": "A successor whose initial state is the canonical state of `after_both`, and whose genesis (the first of `entries`) has no ops. s1 restores Trip, which the delete conflict kept: what the delete that yielded there took beneath it, a and b, comes back with it, and Trip's delete conflict is cleared (`after_s1`, whose canonical state's BLAKE3 is `after_s1_root`).",
+      "entries": [
+        "1d000801b20635002003820263e75b517e54e8e641b09c77264994280fdb1bbcd0ee23da8d6a70b416193a1f0482029a6b8e37d211e108840db8175376e5cdb4a88d73724e5352d5ea0d6118acf89405040680bebffae78b030782014bece1be13ab8fcf3602f0d747dd1e02020c150182025aa3563fe67a1114f0e7c1e17916929065261af42c7d7f2a205aa281d1eb0656028204f563d62934c7445ea70776ff5c618ee57a9e2c4db15c32fa1d61ad129fe26eac519a8d98e5429929eef02efcc744df594bf2c4bc88bef6c69353f665a2e0460e",
+        "1d000801a20c45002001820227665d7ab7867f7520c073df73d2031696ca70a4aee2b817a98cb014b612dae4020c820227665d7ab7867f7520c073df73d2031696ca70a4aee2b817a98cb014b612dae403820263e75b517e54e8e641b09c77264994280fdb1bbcd0ee23da8d6a70b416193a1f0482029a6b8e37d211e108840db8175376e5cdb4a88d73724e5352d5ea0d6118acf894050c1500a002018201db91ffff3f8e284cd643bd7c4347995b06c0fcbffae78b030782014bece1be13ab8fcf3602f0d747dd1e02020c150182025aa3563fe67a1114f0e7c1e17916929065261af42c7d7f2a205aa281d1eb0656028204a3a5a260fbcb9368bbd8041541fd312f7ca05199b3fc6e87bc15bbe037a63a5e92e55c82db9d72e6f730c3adffa693e5ce624f076aa3594c560665f2bda1ee04"
+      ]
+    },
+    "description": "A restore clears the flags its delete set, and no others (state.md#deletion-yields-to-concurrent-work). A files space signed as the example above is, whose genesis (the first of `entries`) has no ops, and seven entries after it: e1 makes the folder Trip, e2 the files a, b and c in it, e3 deletes c, e4 deletes Trip, and e5 restores Trip, each after the one before. e4 flags Trip, a and b, and not c, which e3 had flagged. In the canonical state after e4 (`after_deletes_canonical`), field 6 of each deleted node's record is the number of the delete that took it, the same for every node one delete took, counted from 1 in the order the records, sorted by node id, list the first node each delete took, and 0 for a node not deleted: `after_deletes_numbers`. After e5 Trip, a and b are back and c is still deleted: `after_restore` gives each node's flags and `after_restore_canonical` the canonical state's encoding. Then e6 restores c and e7 deletes Trip, both after e5 and so concurrent: the restore names c, which touches c and everything above it, so the delete yields there; `after_both` has Trip and c not deleted, Trip with a delete conflict, and a and b deleted, `after_both_root` the canonical state's BLAKE3. In that canonical state Trip, which the delete conflict kept, has the number of the delete that yielded there, the number a and b have, and c has 0: `after_both_numbers`.",
     "entries": [
       "1d000801b20635002003820263e75b517e54e8e641b09c77264994280fdb1bbcd0ee23da8d6a70b416193a1f0482029a6b8e37d211e108840db8175376e5cdb4a88d73724e5352d5ea0d6118acf89405040680eaddf9e78b030782014bece1be13ab8fcf3602f0d747dd1e02020c150182025aa3563fe67a1114f0e7c1e17916929065261af42c7d7f2a205aa281d1eb0656028204c23204acf0e3b7acd0ae7dca01a979ecfeca5bcfb5ba6afb4a760ea6b466109057822903d9d249a06f86aafb81d8020caf4d02f1c20284cb04d03878e07f8506",
       "1d000801f20c450020018202cbc6c40dcd82f9c58d61f3d183cc6014e31377d99abcd9a32ccc2fb18c631572020c8202cbc6c40dcd82f9c58d61f3d183cc6014e31377d99abcd9a32ccc2fb18c63157203820263e75b517e54e8e641b09c77264994280fdb1bbcd0ee23da8d6a70b416193a1f0482029a6b8e37d211e108840db8175376e5cdb4a88d73724e5352d5ea0d6118acf894050c2d008002010802820100000000000000000000000000000000032354726970040506c0a8def9e78b030782014bece1be13ab8fcf3602f0d747dd1e02020c150182025aa3563fe67a1114f0e7c1e17916929065261af42c7d7f2a205aa281d1eb0656028204cbd7ddfaf2c6fe7893665aba6ddbdc3d83ac70025c8fb395e183d13f5a457fc0fbe82621002fe9a5786cd108b25bde7f05b23cc68fb4dd50da51344b1b611b06",

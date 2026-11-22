@@ -3528,6 +3528,68 @@ impl Core {
         Ok(written)
     }
 
+    /// The successions on the way to `id` that await this person's word
+    /// (`spaces.md#a-succession-by-a-device-that-is-later-removed`, "Kept
+    /// when the person confirms it"): each earlier space, nearest first,
+    /// whose `succeed` naming the next one another device of this person's
+    /// signed, where a `keep` of theirs does not yet list both it and the
+    /// genesis of the space it names. Spaces not held here end the walk.
+    pub fn successions_to_confirm(&self, id: &SpaceId) -> Vec<SpaceId> {
+        let (Some(me), mine) = (self.me(), self.keys.key()) else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        let mut cur = *id;
+        // a chain this long is not one a person made by hand
+        for _ in 0..64 {
+            let Some(sp) = self.spaces.get(&cur).and_then(|h| h.space.as_ref()) else {
+                break;
+            };
+            let Some(old) = sp.succeeds() else { break };
+            let Some(o) = self.spaces.get(&old).and_then(|h| h.space.as_ref()) else {
+                break;
+            };
+            let dag = o.dag();
+            let succeed = dag.log_order().iter().copied().find(|x| {
+                dag.get(x).is_some_and(|e| {
+                    e.author() == me
+                        && e.ops().iter().any(|op| {
+                            matches!(op.body(), SpaceOpBody::Succeed { successor, .. } if *successor == cur)
+                        })
+                })
+            });
+            let signer = succeed.and_then(|x| dag.get(&x)).map(|e| e.signer());
+            let genesis = sp.dag().get(&cur).map(|g| g.signer());
+            if let (Some(x), Some(k), Some(g)) = (succeed, signer, genesis) {
+                let open = |space: &SpaceId, key: &KeyId, e: &EntryId| {
+                    *key != mine && !self.kept_by_me(space, key, e)
+                };
+                if open(&old, &k, &x) || open(&cur, &g, &cur) {
+                    out.push(old);
+                }
+            }
+            if old == *id {
+                break;
+            }
+            cur = old;
+        }
+        out
+    }
+
+    /// The name of the person's device that signed the genesis of `id`, a
+    /// successor, where that is another device of theirs: who moved it.
+    pub fn moved_by_device(&self, id: &SpaceId) -> Option<String> {
+        let sp = self.spaces.get(id)?.space.as_ref()?;
+        let g = sp.dag().get(id)?;
+        if Some(g.author()) != self.me() || g.signer() == self.keys.key() {
+            return None;
+        }
+        self.device_names()
+            .get(&g.signer())
+            .cloned()
+            .filter(|n| !n.is_empty())
+    }
+
     /// For a device being retired (`spaces.md#authors`, "Retired"): keeps
     /// each succession `key` made that nothing of this person's keeps yet,
     /// with the rest of its work ([`Core::keep_succession`]).
@@ -7692,10 +7754,26 @@ mod tests {
             .new;
         laptop.syncs(&ana, &g, &store);
         assert!(laptop.holds(&s), "the laptop follows");
+        // The laptop asks its person, and the phone does not ask its own.
+        assert_eq!(laptop.core.successions_to_confirm(&s), vec![g]);
+        assert!(ana.core.successions_to_confirm(&s).is_empty());
+        let listed = |p: &Person| {
+            let all = crate::groups::list_of(&p.core);
+            let mut one = all["groups"].as_array().unwrap().iter();
+            let one = one.find(|x| x["group"] == hex::encode(s)).cloned();
+            one.unwrap_or_else(|| panic!("{all}"))
+        };
+        assert_eq!(
+            listed(&laptop)["confirm"],
+            serde_json::json!([hex::encode(g)])
+        );
+        assert!(listed(&laptop)["moved"].is_object());
         if confirmed {
             let kept = laptop.core.keep_succession(&g).unwrap();
             assert_eq!(kept.len(), 2, "the succeed and the genesis");
             assert!(laptop.core.keep_succession(&g).unwrap().is_empty(), "once");
+            assert!(laptop.core.successions_to_confirm(&s).is_empty());
+            assert_eq!(listed(&laptop)["confirm"], serde_json::json!([]));
         }
         bo.syncs(&ana, &g, &store);
         bo.syncs(&laptop, &g, &store);

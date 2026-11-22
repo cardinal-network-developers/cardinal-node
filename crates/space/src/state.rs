@@ -581,11 +581,15 @@ impl State {
             let writer = r.get(7).and_then(id32).ok_or(bad.clone())?;
             let creator = r.get(9).and_then(id32).ok_or(bad.clone())?;
             let rank = r.uint(10)?;
-            // the delete that took it, if it is deleted
-            let took = Some(r.uint(6)?).filter(|t| *t != 0);
-            if let Some(t) = took.filter(|t| !numbers.contains(t)) {
+            // the delete that took it, if it is deleted; or, for a node a
+            // delete conflict kept, the delete that yielded there, so that
+            // a restore of it brings back what that delete took beneath it
+            let number = Some(r.uint(6)?).filter(|t| *t != 0);
+            if let Some(t) = number.filter(|t| !numbers.contains(t)) {
                 numbers.push(t);
             }
+            let delete_conflict = r.opt_bool(8)?.unwrap_or(false);
+            let took = number.filter(|_| !delete_conflict);
             let author_owned = fields.get(&AUTHOR_OWNED_FIELD).is_some_and(|vs| {
                 vs.iter()
                     .any(|v| v.value.as_ref().and_then(|x| x.as_uint()) == Some(1))
@@ -609,7 +613,7 @@ impl State {
                     name: r.opt_text(4)?.unwrap_or("").to_owned(),
                     fields,
                     deleted: took.is_some(),
-                    delete_conflict: r.opt_bool(8)?.unwrap_or(false),
+                    delete_conflict,
                     position_writer: writer,
                     creator,
                     // Carried: the entry that made it is in an earlier
@@ -619,7 +623,7 @@ impl State {
                     created: r.opt_uint(11)?,
                     created_op: 0,
                     deleted_by: took.map(Took::Carried),
-                    conflict_by: None,
+                    conflict_by: number.filter(|_| delete_conflict).map(Took::Carried),
                 },
             );
             st.carried.insert(id, rank);
@@ -1370,19 +1374,28 @@ impl State {
         let rank: HashMap<NodeId, u64> = made.iter().map(|(_, _, _, id)| *id).zip(0..).collect();
         // Each delete that took a node is numbered from 1, in the order the
         // records list the first node it took: so a restore in a successor
-        // clears exactly the flags one delete set.
+        // clears exactly the flags one delete set. A node that a delete
+        // conflict kept has the number of the delete that yielded there,
+        // so a restore of it brings back what that delete took beneath it.
+        let took = |n: &Node| {
+            if n.deleted {
+                n.deleted_by
+            } else {
+                n.conflict_by.filter(|_| n.delete_conflict)
+            }
+        };
         let mut ids: Vec<&NodeId> = self.nodes.keys().collect();
         ids.sort_unstable();
         let mut number: HashMap<Took, u64> = HashMap::new();
         for id in ids {
-            if let Some(t) = self.nodes[id].deleted_by.filter(|_| self.nodes[id].deleted) {
+            if let Some(t) = took(&self.nodes[id]) {
                 let next = number.len() as u64 + 1;
                 number.entry(t).or_insert(next);
             }
         }
         let mut records: Vec<(NodeId, Record)> = Vec::new();
         for (id, n) in &self.nodes {
-            let took = n.deleted_by.filter(|_| n.deleted).map_or(0, |t| number[&t]);
+            let took = took(n).map_or(0, |t| number[&t]);
             let r = Record::new()
                 .with(1, n.id)
                 .with(2, n.kind.to_value())

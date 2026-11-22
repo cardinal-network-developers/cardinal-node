@@ -268,6 +268,14 @@ pub enum SpaceOpBody {
     },
     /// 37 `checkpoint`.
     Checkpoint,
+    /// An extension op (`evolution.md#extensions-are-named-by-hash`): key
+    /// `0` is the extension's 32-byte name. What it means is the
+    /// extension's; whether it counts is the protocol records' to say
+    /// (`evolution.md#critical-and-ignorable`).
+    Extension {
+        /// The extension's name.
+        name: [u8; 32],
+    },
     /// An op this implementation does not know, or with malformed fields.
     /// Control ops (1-31) and malformed ops make an entry invalid; unknown
     /// profile ops make it not accepted for state.
@@ -287,7 +295,8 @@ impl SpaceOpBody {
             | SpaceOpBody::Move { .. }
             | SpaceOpBody::Delete { .. }
             | SpaceOpBody::Restore { .. }
-            | SpaceOpBody::Checkpoint => false,
+            | SpaceOpBody::Checkpoint
+            | SpaceOpBody::Extension { .. } => false,
             _ => true,
         }
     }
@@ -374,7 +383,12 @@ impl SpaceOp {
 
     fn parse(r: &Record, made: &dyn Fn(u64) -> Option<NodeId>) -> Result<SpaceOpBody, Error> {
         let Some(n) = r.get(0).and_then(|v| v.as_uint()) else {
-            return Ok(SpaceOpBody::Unknown { number: None });
+            // an extension's op is named by its 32-byte name
+            let name = r.get(0).and_then(|v| v.as_bytes());
+            return Ok(match name.and_then(|b| <[u8; 32]>::try_from(b).ok()) {
+                Some(name) => SpaceOpBody::Extension { name },
+                None => SpaceOpBody::Unknown { number: None },
+            });
         };
         Ok(match n {
             1 => SpaceOpBody::Start {
