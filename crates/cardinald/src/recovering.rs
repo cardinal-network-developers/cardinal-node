@@ -92,6 +92,14 @@ struct Recovered {
     /// None in a file from before.
     #[serde(default)]
     finished_ms: Option<u64>,
+    /// The contacts (hex) who answered what this device asked them for
+    /// after the recovery ([`asks_of`]): they are asked nothing more.
+    #[serde(default)]
+    answered: Vec<String>,
+    /// The spaces (hex) asked for that came: never asked for again, so one
+    /// the person lets go of since stays gone.
+    #[serde(default)]
+    got: Vec<String>,
 }
 
 /// How long after a recovery finished what a lost device wrote is kept as
@@ -99,18 +107,94 @@ struct Recovered {
 /// more.
 pub const AFTER_FINISH: std::time::Duration = std::time::Duration::from_secs(7 * 24 * 3600);
 
+/// How long after a recovery finished the device asks its contacts for
+/// what it does not hold of theirs and the person's ([`asks_of`]): each
+/// contact until they answer, and nobody after this.
+pub const ASKING_FOR: std::time::Duration = AFTER_FINISH;
+
 impl Recovered {
     fn fresh(&self) -> bool {
-        self.finished_ms.is_some_and(|f| {
-            crate::core::now_ms() < f.saturating_add(AFTER_FINISH.as_millis() as u64)
-        })
+        self.within(AFTER_FINISH)
+    }
+
+    /// Whether the recovery finished less than `long` ago. Never, in a
+    /// file from before the time was kept.
+    fn within(&self, long: std::time::Duration) -> bool {
+        self.finished_ms
+            .is_some_and(|f| crate::core::now_ms() < f.saturating_add(long.as_millis() as u64))
+    }
+
+    /// The keys the recovery removed.
+    fn keys(&self) -> Vec<KeyId> {
+        self.forgotten
+            .iter()
+            .filter_map(|k| hex::decode(k).ok()?.try_into().ok())
+            .collect()
     }
 }
 
-/// Whether this device was made the person's by a recovery that removed
-/// their other devices.
-pub fn was_recovered(d: &Daemon) -> bool {
-    load_recovered(d).is_some_and(|r| !r.forgotten.is_empty())
+/// What this device asks `who` for after the person's recovery, not open
+/// here: their relationship and the spaces the person offered them in it
+/// (`hosts.md#restore`, D81), but none asked for before that came, nor one
+/// the person said no to. `None` once nothing is to be asked of them: no
+/// recovery that removed the person's other devices took place here, it
+/// finished more than [`ASKING_FOR`] ago, or `who` answered already.
+pub fn asks_of(d: &Daemon, who: &[u8; 32]) -> Option<Vec<SpaceId>> {
+    let r = load_recovered(d)?;
+    if r.forgotten.is_empty() || !r.within(ASKING_FOR) || r.answered.contains(&hex::encode(who)) {
+        return None;
+    }
+    Some(unheld(d, &r, who))
+}
+
+/// What there is to ask `who` for, answered or not.
+fn unheld(d: &Daemon, r: &Recovered, who: &[u8; 32]) -> Vec<SpaceId> {
+    let core = d.core();
+    let declined = core.declined();
+    let mut asks = core.own_unheld_with(who);
+    asks.retain(|s| !declined.contains(s) && !r.got.contains(&hex::encode(s)));
+    asks
+}
+
+/// After asking `who` for `asked`: what came is never asked for again, and
+/// when every ask went through and there is nothing else to ask, `who` has
+/// answered, and is asked nothing more. A relationship that came may name
+/// offers not asked for yet: those are asked next time. A contact who gives
+/// nothing of a space has said no: their device knows this one as the
+/// person's, or would not have answered it, and so knows of the recovery.
+pub fn asked(d: &Daemon, who: &[u8; 32], asked: &[SpaceId], through: bool) {
+    let came: Vec<String> = {
+        let core = d.core();
+        asked
+            .iter()
+            .filter(|s| core.spaces.get(*s).is_some_and(|h| h.space.is_some()))
+            .map(hex::encode)
+            .collect()
+    };
+    update_recovered(d, |r| {
+        for s in came {
+            if !r.got.contains(&s) {
+                r.got.push(s);
+            }
+        }
+        let left = unheld(d, r, who);
+        let who = hex::encode(who);
+        if through && left.iter().all(|s| asked.contains(s)) && !r.answered.contains(&who) {
+            r.answered.push(who);
+        }
+    });
+}
+
+/// One change to `recovered.json` at a time: the sessions of every contact
+/// record their answers in it at once.
+static RECOVERED: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn update_recovered(d: &Daemon, change: impl FnOnce(&mut Recovered)) -> Option<()> {
+    let _one = RECOVERED.lock().unwrap_or_else(|e| e.into_inner());
+    let mut r = load_recovered(d)?;
+    change(&mut r);
+    save_recovered(d, &r);
+    Some(())
 }
 
 fn load(d: &Daemon) -> Option<Under> {
@@ -757,6 +841,7 @@ pub async fn finish(
             forgotten: u.forgotten.clone(),
             lost_at,
             finished_ms: Some(crate::core::now_ms()),
+            ..Recovered::default()
         },
     );
     // the link keys the removed devices had, by their keys
@@ -782,15 +867,10 @@ pub async fn finish(
         true => remembered(d),
         false => u.forgotten.clone(),
     };
-    save_recovered(
-        d,
-        &Recovered {
-            pair_again: pair_again.clone(),
-            forgotten: u.forgotten.clone(),
-            lost_at,
-            finished_ms: Some(crate::core::now_ms()),
-        },
-    );
+    update_recovered(d, |r| {
+        r.pair_again = pair_again.clone();
+        r.finished_ms = Some(crate::core::now_ms());
+    });
     // The removed devices' hosts leave the lists that name them, and the
     // secrets they held are made anew (`hosts.md#local-discovery`).
     after_removal(d, &forgotten_links(&log_links, &u.forgotten));
@@ -935,25 +1015,34 @@ fn after_removal(d: &Arc<Daemon>, links: &[[u8; 32]]) {
 /// finish: kept up to when the person said they were lost, but for their
 /// successions, which no keep lists and which so fall: the old space stands
 /// again, and whoever followed returns to it
-/// (`spaces.md#a-succession-by-a-device-that-is-later-removed`).
+/// (`spaces.md#a-succession-by-a-device-that-is-later-removed`). The
+/// person's `leave`s are kept whenever they were written, and however long
+/// after the finish a space comes: unkept, the person would be in every
+/// group they left again, and served it.
 pub fn tend_recovered(d: &Arc<Daemon>) {
     let Some(r) = load_recovered(d) else {
-        return;
-    };
-    // kept as spaces arrive only for a while after the finish: then by the
-    // person's own `keep-work` (a thief sets the clock those entries give)
-    let Some(up_to) = r.lost_at.filter(|_| r.fresh()) else {
         return;
     };
     if r.forgotten.is_empty() || d.core().identity.is_none() {
         return;
     }
-    for k in r
-        .forgotten
-        .iter()
-        .filter_map(|k| hex::decode(k).ok()?.try_into().ok())
-    {
-        let k: KeyId = k;
+    let keys = r.keys();
+    let left = d.core().keep_leaves(&keys);
+    match left {
+        Ok(written) => {
+            for (space, bytes) in written {
+                d.push(&space, vec![bytes]);
+            }
+        }
+        Err(e) => tracing::debug!("keeping what the person left: {e:#}"),
+    }
+    // the rest as spaces arrive only for a while after the finish: then by
+    // the person's own `keep-work` (a thief sets the clock those entries
+    // give)
+    let Some(up_to) = r.lost_at.filter(|_| r.fresh()) else {
+        return;
+    };
+    for k in keys {
         // the core is let go before what was written is pushed
         let kept = d.core().keep_work(&k, Some(up_to));
         match kept {
@@ -971,9 +1060,8 @@ pub fn tend_recovered(d: &Arc<Daemon>) {
 /// recovery removed, said after the finish: what they wrote up to then is
 /// kept, as each space arrives.
 pub fn set_lost_at(d: &Arc<Daemon>, lost_at: Option<u64>) -> anyhow::Result<Json> {
-    let mut r = load_recovered(d).ok_or_else(|| anyhow::anyhow!("no recovery took place here"))?;
-    r.lost_at = lost_at;
-    save_recovered(d, &r);
+    update_recovered(d, |r| r.lost_at = lost_at)
+        .ok_or_else(|| anyhow::anyhow!("no recovery took place here"))?;
     tend_recovered(d);
     Ok(json!({"lost_devices": lost_json(d)}))
 }
@@ -1287,6 +1375,48 @@ mod tests {
         let mut keys = keys;
         keys.sort();
         assert_eq!(had, keys);
+    }
+
+    /// After a recovery each contact is asked until they answer, and only
+    /// for a while after the finish; what came is recorded, never to be
+    /// asked for again.
+    #[tokio::test]
+    async fn contacts_are_asked_until_they_answer_and_for_a_while_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let (paths, config) = crate::testing::set_up(dir.path());
+        let d = Daemon::start(paths, config).await.unwrap();
+        let who = [7u8; 32];
+        assert!(asks_of(&d, &who).is_none(), "no recovery took place here");
+        let now = crate::core::now_ms();
+        let r = Recovered {
+            forgotten: vec![hex::encode([5u8; 32])],
+            finished_ms: Some(now),
+            ..Recovered::default()
+        };
+        save_recovered(&d, &r);
+        assert_eq!(asks_of(&d, &who), Some(Vec::new()));
+        // an ask that did not go through is made again
+        asked(&d, &who, &[], false);
+        assert_eq!(asks_of(&d, &who), Some(Vec::new()));
+        asked(&d, &who, &[], true);
+        assert!(asks_of(&d, &who).is_none(), "they answered");
+        // what came is recorded
+        let account = d.core().account_id().unwrap();
+        let other = [8u8; 32];
+        asked(&d, &other, &[account], false);
+        let r = load_recovered(&d).unwrap();
+        assert!(r.got.contains(&hex::encode(account)));
+        assert_eq!(asks_of(&d, &other), Some(Vec::new()));
+        // and after the time, nobody is asked
+        let long_ago = now - ASKING_FOR.as_millis() as u64 - 1000;
+        save_recovered(
+            &d,
+            &Recovered {
+                finished_ms: Some(long_ago),
+                ..r
+            },
+        );
+        assert!(asks_of(&d, &other).is_none());
     }
 
     /// `finish` made the device the person's and stopped before the end:

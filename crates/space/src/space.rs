@@ -424,6 +424,12 @@ impl Space {
         all
     }
 
+    /// Every `leave` `who` wrote here, whether it counts or not: one
+    /// signed by a key their log has since removed waits for a `keep`.
+    pub fn leaves_of(&self, who: &IdentityId) -> &[EntryId] {
+        self.judge.leaves_of(who)
+    }
+
     /// Who has left, and the `leave` of theirs that stands.
     pub fn left(&self) -> Vec<(IdentityId, EntryId)> {
         self.judge.standing_leaves(&self.dag)

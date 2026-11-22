@@ -758,8 +758,18 @@ differs or was read:
   contact, with reconciles it starts, which take what comes and serve
   nothing, their relationship if the account lists it and it is not
   here, and the spaces its own offers in that relationship name (its own
-  signed entries, kept), not here; while `recovered.json` names removed
-  keys. Without this, the old group in the test stood for nobody: bo's
+  signed entries, kept), not here, but none it asked for that came
+  (`got`), so that one the person lets go of since stays gone, nor one
+  they said no to; for a week after the finish (`ASKING_FOR`), and of
+  each contact until a round of asks all went through with nothing left
+  to ask (`answered`): a contact whose device answers this one as the
+  person's knows of the recovery, so what it gives nothing of it has
+  refused. **The person's leaves are kept** (`Core::keep_leaves`), every
+  `leave` of theirs a removed key signed, whenever written and however
+  late its space comes, beside the keep up to the time lost: unkept, the
+  person is in every group they left again, and its members serve it to
+  them. A keep of a leave keeps what that key wrote before it there too,
+  and `keep-work` keeps leaves past its point. Without this, the old group in the test stood for nobody: bo's
   copy was all set aside, and cy never heard of the recovery. **Not
   yet:** a contact who is not a guardian refuses the recovered device's
   sessions ("unknown device") until it holds the person's new log, which

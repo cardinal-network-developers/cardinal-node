@@ -1100,6 +1100,11 @@ impl Judge {
         })
     }
 
+    /// Every `leave` `who` wrote, valid or not, in the order they arrived.
+    pub fn leaves_of(&self, who: &IdentityId) -> &[EntryId] {
+        self.leaves.get(who).map_or(&[][..], |v| v.as_slice())
+    }
+
     /// Each `leave` that stands: a valid one that no valid `add_member` of
     /// its author descends from, with who wrote it.
     pub fn standing_leaves(&self, dag: &Dag<SpaceEntry>) -> Vec<(IdentityId, EntryId)> {

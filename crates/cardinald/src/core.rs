@@ -3333,7 +3333,9 @@ impl Core {
     /// everything in it, count only if a keep lists them, and after the
     /// removal none does, so they fall
     /// (`spaces.md#a-succession-by-a-device-that-is-later-removed`).
-    /// Returns what was written, by space, and how many entries are kept.
+    /// Its `leave`s are kept whenever written, as [`Core::keep_leaves`]
+    /// keeps them. Returns what was written, by space, and how many
+    /// entries are kept.
     pub fn keep_work(
         &mut self,
         key: &KeyId,
@@ -3344,6 +3346,7 @@ impl Core {
         for (space, x, t) in work {
             let wanted = match (up_to, t) {
                 (None, _) => true,
+                _ if self.is_leave(&space, &x) => true,
                 (Some(u), Some(t)) => t <= u,
                 (Some(_), None) => false,
             };
@@ -3374,6 +3377,72 @@ impl Core {
             self.settle(&id);
         }
         Ok((written, kept))
+    }
+
+    /// Whether `x`, in `space`, holds a `leave`.
+    fn is_leave(&self, space: &SpaceId, x: &EntryId) -> bool {
+        let sp = self.spaces.get(space).and_then(|h| h.space.as_ref());
+        sp.and_then(|sp| sp.dag().get(x)).is_some_and(|e| {
+            e.ops()
+                .iter()
+                .any(|o| matches!(o.body(), cardinal_space::SpaceOpBody::Leave))
+        })
+    }
+
+    /// Keeps, in every space held, each `leave` of this person's that one
+    /// of `keys`, keys their log has removed, signed and that nothing
+    /// witnessed: after a recovery that kept no old key, what the person
+    /// left they left still, whenever they wrote it and however late the
+    /// space comes (D81: their ordinary work comes back). Unkept, they
+    /// would be in every group they left again, and served it. A `keep` of
+    /// a leave keeps what that key wrote before it there too. Returns the
+    /// entries written.
+    pub fn keep_leaves(&mut self, keys: &[KeyId]) -> anyhow::Result<Written> {
+        let ident = self
+            .identity
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("this device has no identity yet"))?;
+        let (me, st) = (ident.id(), ident.state());
+        let keys: Vec<&KeyId> = keys.iter().filter(|k| st.power(k).is_none()).collect();
+        let mut wanted: BTreeMap<SpaceId, BTreeMap<KeyId, Vec<EntryId>>> = BTreeMap::new();
+        for (id, h) in &self.spaces {
+            let Some(sp) = h.space.as_ref() else {
+                continue;
+            };
+            for x in sp.leaves_of(&me) {
+                if !sp.validity().unwitnessed.contains(x) {
+                    continue;
+                }
+                let Some(e) = sp.dag().get(x) else { continue };
+                if keys.contains(&&e.signer()) {
+                    let by_key = wanted.entry(*id).or_default();
+                    by_key.entry(e.signer()).or_default().push(*x);
+                }
+            }
+        }
+        let mut written = Vec::new();
+        for (id, by_key) in wanted {
+            let h = self.spaces.get_mut(&id).expect("held");
+            for (key, xs) in by_key {
+                let dag = h.space.as_ref().expect("open").dag();
+                let mut latest: Vec<EntryId> = xs
+                    .iter()
+                    .filter(|x| !xs.iter().any(|y| y != *x && dag.is_ancestor(x, y)))
+                    .copied()
+                    .collect();
+                latest.sort();
+                // one space that cannot take a keep holds up no other
+                match h.write_keeps(ident, &self.keys, vec![SpaceOp::keep(key, &latest)]) {
+                    Ok(bytes) => written.push((id, bytes)),
+                    Err(e) => tracing::debug!("keeping a leave in {}: {e:#}", short(&id)),
+                }
+            }
+        }
+        let ids: Vec<SpaceId> = written.iter().map(|(id, _)| *id).collect();
+        for id in ids {
+            self.settle(&id);
+        }
+        Ok(written)
     }
 
     /// Whether `x`, in `space`, is part of a succession the removed `key`
@@ -7217,5 +7286,219 @@ mod tests {
         assert!(!account::connects(&all, &ana.id()));
         assert!(account::refused(&all, &ana.id()));
         assert!(!holds_for(&all, &ana.id()));
+    }
+
+    /// A copy of a log, to write entries for it as a device of its person
+    /// would: its entries, the genesis first.
+    fn standalone(entries: &[Vec<u8>]) -> IdentityLog {
+        let genesis = IdentityEntry::decode(&entries[0]).unwrap();
+        let mut log = IdentityLog::from_genesis(genesis).unwrap();
+        for e in &entries[1..] {
+            log.insert_bytes(e).unwrap();
+        }
+        log
+    }
+
+    /// Ana's group, which Dee joined and then left from another device of
+    /// theirs, which they removed afterwards as lost: the leave counts no
+    /// longer, here or at Ana's. With the removed key.
+    fn left_from_a_device_since_removed() -> (Person, Person, SpaceId, KeyId) {
+        let [mut ana, mut dee, _, _] = four();
+        let both = [(dee.id(), "Dee".to_owned())];
+        let g = ana.core.create_group("Choir", "Ana", &both).unwrap();
+        dee.takes(&g, &ana.all_of(&g));
+        let joined = dee.says_reach(&g, false);
+        ana.takes(&g, &[joined]);
+        let mut lost = dee.second_device();
+        ana.core.ingest_other(dee.id(), &dee.log()).unwrap();
+        lost.takes(&g, &dee.all_of(&g));
+        let (_, gone) = lost
+            .core
+            .write_entry(&g, relationship::leave_ops(&dee.id()))
+            .unwrap();
+        dee.takes(&g, std::slice::from_ref(&gone));
+        ana.takes(&g, &[gone]);
+        assert!(dee.space(&g).has_left(&dee.id()));
+        assert!(ana.space(&g).has_left(&dee.id()));
+        let key = lost.core.keys.key();
+        let removal = standalone(&dee.log())
+            .append(
+                &dee.root,
+                vec![cardinal_identity::IdentityOp::remove_key(key)],
+            )
+            .unwrap()
+            .encode();
+        dee.core.ingest_identity(&[removal], None).unwrap();
+        ana.core.ingest_other(dee.id(), &dee.log()).unwrap();
+        assert!(!dee.space(&g).has_left(&dee.id()), "the leave still counts");
+        assert!(ana.core.shares(&dee.id(), &g), "Ana would not serve it");
+        (ana, dee, g, key)
+    }
+
+    /// D81, after a recovery that kept none of the person's keys: what they
+    /// left they left still. A leave a removed key signed is kept whenever
+    /// it was written, so they are not in the group again, nor served it.
+    #[test]
+    fn a_leave_a_removed_key_signed_is_kept() {
+        let (mut ana, mut dee, g, lost) = left_from_a_device_since_removed();
+        let written = dee.core.keep_leaves(&[lost]).unwrap();
+        assert_eq!(written.len(), 1);
+        assert!(dee.space(&g).has_left(&dee.id()));
+        ana.takes(&g, &[written[0].1.clone()]);
+        assert!(ana.space(&g).has_left(&dee.id()));
+        assert!(!ana.core.shares(&dee.id(), &g));
+        // once is enough
+        assert!(dee.core.keep_leaves(&[lost]).unwrap().is_empty());
+    }
+
+    /// The person's own keep of a lost device's work, up to when they lost
+    /// it, keeps its leaves whenever they were written.
+    #[test]
+    fn a_keep_of_ordinary_work_keeps_the_leaves_after_the_point() {
+        let (_ana, mut dee, g, lost) = left_from_a_device_since_removed();
+        let (written, kept) = dee.core.keep_work(&lost, Some(1)).unwrap();
+        assert_eq!((written.len(), kept), (1, 1));
+        assert!(dee.space(&g).has_left(&dee.id()));
+        assert!(dee.core.keep_leaves(&[lost]).unwrap().is_empty());
+    }
+
+    /// Dee's log after their guardians recovered it, keeping none of their
+    /// keys, and a device the new root added, as a contact's device comes
+    /// to hold it: the entries (the guardians' acts among them), that
+    /// device's keys, and the log, to write as it would.
+    fn recovered(
+        dee: &Person,
+        guardians: [&Person; 2],
+    ) -> (Vec<Vec<u8>>, cardinal_identity::DeviceKeys, IdentityLog) {
+        use cardinal_identity::{DeviceKeys, IdentityOp, Power};
+        let mut log = standalone(&dee.log());
+        let enc = dee.core.identity.as_ref().unwrap().enc.first();
+        let named: Vec<_> = guardians.iter().map(|g| (g.id(), g.enc())).collect();
+        log.set_guardians(&dee.root, &named, 2, 0, true, enc)
+            .unwrap();
+        let phrase = cardinal_crypto::RecoveryPhrase::from_entropy(&[42; 32]);
+        let new_root = phrase.root_signing_key();
+        let link = HybridKeyPair::generate();
+        let policy = log.current_policy().unwrap();
+        let rec = log
+            .recover_entry(
+                &log.recovery_parents(),
+                &new_root,
+                &[],
+                link.public_key(),
+                policy.entry,
+                phrase.recovery_key_pair().public_key(),
+            )
+            .unwrap();
+        let decision = rec.id();
+        log.insert(rec).unwrap();
+        let mut theirs: Vec<IdentityLog> = guardians.iter().map(|g| standalone(&g.log())).collect();
+        for confirm in [false, true] {
+            for (g, glog) in guardians.iter().zip(theirs.iter_mut()) {
+                let gi = g.core.identity.as_ref().unwrap();
+                let rec = log.guardian_record(&policy, &g.id(), &gi.enc).unwrap();
+                let op = if confirm {
+                    let r = log.recovery(&decision).unwrap();
+                    let share = log.seal_share(&r, rec.share.as_ref().unwrap()).unwrap();
+                    IdentityOp::confirm(decision, rec.position, rec.salt, Some(&share))
+                } else {
+                    IdentityOp::endorse(decision, rec.position, rec.salt)
+                };
+                glog.append(&g.core.keys.device.signing, vec![op]).unwrap();
+                for e in glog.entries().cloned().collect::<Vec<_>>() {
+                    let _ = log.attach(e);
+                }
+            }
+        }
+        assert!(log.state().in_effect.contains(&decision), "not in effect");
+        let new = DeviceKeys::generate();
+        log.add_key(&new_root, &new.request(&log.id(), Power::Admin), None)
+            .unwrap();
+        let mut all: Vec<Vec<u8>> = log.entries().map(IdentityEntry::encode).collect();
+        for glog in &theirs {
+            all.extend(glog.entries().map(IdentityEntry::encode));
+        }
+        (all, new, log)
+    }
+
+    /// The narrow path after a recovery by guardians (`hosts.md#restore`,
+    /// D80, D81): a device the new root added may sync, beside its
+    /// relationship with this person, a space its person started before
+    /// it with a key it removed, set aside, so that a keep of theirs can
+    /// reach it. Not a space someone else started, nor a successor, nor a
+    /// genesis already witnessed; and no other device of theirs.
+    #[test]
+    fn the_narrow_path_after_a_recovery_takes_only_what_the_person_started() {
+        let [mut ana, mut dee, g1, g2] = four();
+        let store = cardinal_blob::MemStore::new();
+        let to_ana = [(ana.id(), "Ana".to_owned())];
+        let started = dee.core.create_group("Dee's", "Dee", &to_ana).unwrap();
+        let kept = dee.core.create_group("Kept", "Dee", &to_ana).unwrap();
+        let old = dee.core.create_group("Old", "Dee", &to_ana).unwrap();
+        let to_dee = [(dee.id(), "Dee".to_owned())];
+        let anas = ana.core.create_group("Ana's", "Ana", &to_dee).unwrap();
+        for s in [started, kept, old] {
+            ana.takes(&s, &dee.all_of(&s));
+        }
+        dee.takes(&anas, &ana.all_of(&anas));
+        let successor = dee
+            .core
+            .succeed(&store, &old, &[(ana.id(), WRITER)])
+            .unwrap()
+            .new;
+        ana.syncs(&dee, &old, &store);
+        ana.syncs(&dee, &successor, &store);
+        assert!(ana.holds(&successor));
+        let device = dee.core.keys.key();
+
+        let (entries, new, log) = recovered(&dee, [&g1, &g2]);
+        assert!(ana.core.ingest_other(dee.id(), &entries).unwrap());
+        let unwitnessed = |p: &Person, s: &SpaceId| p.space(s).validity().unwitnessed.contains(s);
+        for s in [started, kept, successor] {
+            assert!(unwitnessed(&ana, &s), "{} still counts", short(&s));
+        }
+        assert!(ana.core.recovered_owns(&dee.id(), &new.key(), &started));
+        // a device the new root did not add
+        assert!(!ana.core.recovered_owns(&dee.id(), &device, &started));
+        // a space someone else started
+        assert!(!ana.core.recovered_owns(&dee.id(), &new.key(), &anas));
+        // a successor
+        assert!(!ana.core.recovered_owns(&dee.id(), &new.key(), &successor));
+        // a genesis already witnessed: here by a keep of the new device's
+        let sp = ana
+            .core
+            .spaces
+            .get_mut(&kept)
+            .unwrap()
+            .space
+            .as_mut()
+            .unwrap();
+        sp.write_keeps(&log, &new.signing, vec![SpaceOp::keep(device, &[kept])])
+            .unwrap();
+        assert!(!unwitnessed(&ana, &kept));
+        assert!(!ana.core.recovered_owns(&dee.id(), &new.key(), &kept));
+    }
+
+    /// Nor is a device the narrow path's where no recovery took place: one
+    /// the person added with their words, after removing the device that
+    /// started a space, takes nothing by it.
+    #[test]
+    fn a_device_no_recovery_added_takes_nothing_by_the_narrow_path() {
+        use cardinal_identity::{DeviceKeys, IdentityOp, Power};
+        let [mut ana, mut dee, _, _] = four();
+        let to_ana = [(ana.id(), "Ana".to_owned())];
+        let started = dee.core.create_group("Dee's", "Dee", &to_ana).unwrap();
+        ana.takes(&started, &dee.all_of(&started));
+        let mut log = standalone(&dee.log());
+        let new = DeviceKeys::generate();
+        log.add_key(&dee.root, &new.request(&dee.id(), Power::Admin), None)
+            .unwrap();
+        log.append(&dee.root, vec![IdentityOp::remove_key(dee.core.keys.key())])
+            .unwrap();
+        let entries: Vec<Vec<u8>> = log.entries().map(IdentityEntry::encode).collect();
+        ana.core.ingest_other(dee.id(), &entries).unwrap();
+        let sp = ana.space(&started);
+        assert!(sp.validity().unwitnessed.contains(&started));
+        assert!(!ana.core.recovered_owns(&dee.id(), &new.key(), &started));
     }
 }

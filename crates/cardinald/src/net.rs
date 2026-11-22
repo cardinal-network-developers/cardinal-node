@@ -266,22 +266,26 @@ pub async fn sync_all(d: &Arc<Daemon>, s: &Session) {
     // After this person's recovery: what they started and offered this
     // contact, and their relationship, not here yet, asked of them alone,
     // taken only in answer and served to nobody (`hosts.md#restore`, D81).
+    // Each contact is asked until they answer, for a while after the
+    // finish, and nothing that came once is asked for again.
     let Some(member) = member else {
         return;
     };
-    if !crate::recovering::was_recovered(d) {
+    let Some(asks) = crate::recovering::asks_of(d, &member) else {
         return;
-    }
-    let asks = d.core().own_unheld_with(&member);
-    for label in asks {
-        if let Err(e) = reconcile_as(d, s, label, Access::Offered).await {
+    };
+    let mut through = true;
+    for label in &asks {
+        if let Err(e) = reconcile_as(d, s, *label, Access::Offered).await {
+            through = false;
             tracing::debug!(
                 "asking {} for {}: {e:#}",
                 short(&s.peer_static()),
-                short(&label)
+                short(label)
             );
         }
     }
+    crate::recovering::asked(d, &member, &asks, through);
 }
 
 async fn handle_stream(d: &Arc<Daemon>, s: &Session, mut st: Stream) -> anyhow::Result<()> {
