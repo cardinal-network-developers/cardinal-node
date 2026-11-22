@@ -266,7 +266,7 @@ impl Render<'_> {
                 } else {
                     &b[..b.len().min(self.o.limit)]
                 };
-                let mut out = json!({"t": "bytes", "n": b.len(), "len": len, "hex": h(shown),
+                let mut out = json!({"t": "bytes", "n": b.len(), "len": len, "data": h(shown),
                     "cut": b.len() > shown.len()});
                 if withheld {
                     out["withheld"] = json!("these bytes encode a key");
@@ -419,8 +419,19 @@ fn secret_positions(sp: &Space, e: &SpaceEntry) -> Vec<Vec<Json>> {
     out
 }
 
-/// What an op is about, for counting bytes: the kind of the node it makes
-/// or names, `"reach"` for a reach node, or nothing for a control op.
+/// What an op is about, for counting bytes, as fields of the op's record:
+/// `kind`, the kind of the node it makes or names, or `reach` for its
+/// author's reach node; nothing for a control op.
+fn op_about(sp: &Space, e: &SpaceEntry, i: usize) -> Json {
+    match op_kind(sp, e, i) {
+        Some(Json::String(s)) if s == "reach" => json!({"reach": true}),
+        Some(kind) => json!({"kind": kind}),
+        None => json!({}),
+    }
+}
+
+/// What an op is about: the kind of the node it makes or names, `"reach"`
+/// for a reach node, or nothing for a control op.
 fn op_kind(sp: &Space, e: &SpaceEntry, i: usize) -> Option<Json> {
     let op = &e.ops()[i];
     let node = match op.body() {
@@ -474,7 +485,10 @@ fn weigh(sealed_bytes: &[u8], sp: Option<&Space>, e: Option<&SpaceEntry>) -> Jso
             Some(n) => json!(n),
             None => json!(v.as_bytes().map(h)),
         });
-        ops.push(json!([number, op_kind(sp, e, i), n]));
+        let mut weighed = op_about(sp, e, i);
+        weighed["op"] = json!(number);
+        weighed["bytes"] = json!(n);
+        ops.push(weighed);
     }
     out["signature"] = json!(signed.saturating_sub(body));
     out["fields"] = json!(body.saturating_sub(ops_len));
@@ -1082,13 +1096,12 @@ fn entry(d: &Daemon, req: &Json) -> anyhow::Result<Json> {
             .map(|(i, op)| {
                 let made = matches!(op.body(), SpaceOpBody::Create { .. })
                     .then(|| h(&cardinal_space::entry::derived_id(&e.id(), i)));
-                json!({
-                    "index": i,
-                    "bytes": op.record().encoded_len(),
-                    "kind": op_kind(sp, e, i),
-                    "creates": made,
-                    "op": render_op(&r, sp, &secrets, op),
-                })
+                let mut out = op_about(sp, e, i);
+                out["index"] = json!(i);
+                out["bytes"] = json!(op.record().encoded_len());
+                out["creates"] = json!(made);
+                out["op"] = render_op(&r, sp, &secrets, op);
+                out
             })
             .collect();
         let head = without(e.record(), 5);
@@ -1354,7 +1367,7 @@ mod tests {
         let v = Value::Bytes(vec![0xab; 100]);
         let out = r.value(&v, 0);
         assert_eq!(out["n"], 100);
-        assert_eq!(out["hex"], "abababab");
+        assert_eq!(out["data"], "abababab");
         assert_eq!(out["cut"], true);
         assert_eq!(out["len"], v.encoded_len());
         let l = Value::List(vec![

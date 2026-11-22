@@ -205,14 +205,7 @@ fn only_contact(d: &Dev) -> serde_json::Value {
 }
 
 fn control(d: &Dev, req: serde_json::Value) -> serde_json::Value {
-    use std::io::{BufRead, BufReader, Write};
-    let mut s = std::os::unix::net::UnixStream::connect(d.home.join("control.sock")).unwrap();
-    writeln!(s, "{req}").unwrap();
-    let mut line = String::new();
-    BufReader::new(s).read_line(&mut line).unwrap();
-    let v: serde_json::Value = serde_json::from_str(&line).unwrap();
-    assert_eq!(v["ok"], true, "{req} got {v}");
-    v
+    common::ask(d, &req)
 }
 
 /// An account made before the self node (D71) has none: its person is

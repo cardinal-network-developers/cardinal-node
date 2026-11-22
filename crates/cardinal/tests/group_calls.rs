@@ -7,9 +7,7 @@
 mod common;
 
 use std::collections::HashMap;
-use std::io::{BufRead, BufReader, Write};
 use std::net::{Ipv4Addr, SocketAddr};
-use std::os::unix::net::UnixStream;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -19,11 +17,7 @@ use serde_json::{json, Value};
 use tokio::net::UdpSocket;
 
 fn reply(d: &Dev, req: &Value) -> Value {
-    let mut s = UnixStream::connect(d.home.join("control.sock")).unwrap();
-    writeln!(s, "{req}").unwrap();
-    let mut line = String::new();
-    BufReader::new(s).read_line(&mut line).unwrap();
-    serde_json::from_str(&line).unwrap()
+    common::reply(d, req)
 }
 
 fn ask(d: &Dev, req: Value) -> Value {
@@ -112,38 +106,32 @@ fn carrying(d: &Dev) -> u64 {
 
 /// A call's sound, as a client has it.
 struct Line {
-    w: UnixStream,
-    r: BufReader<UnixStream>,
+    m: Media,
     tag: u8,
     n: u32,
 }
 
 impl Line {
     fn open(d: &Dev, tag: u8) -> Line {
-        let mut w = UnixStream::connect(d.home.join("control.sock")).unwrap();
-        writeln!(w, "{}", json!({"cmd": "call-media"})).unwrap();
-        w.set_read_timeout(Some(Duration::from_millis(5))).unwrap();
-        let r = BufReader::new(w.try_clone().unwrap());
-        Line { w, r, tag, n: 0 }
+        Line {
+            m: Media::open(d, Duration::from_millis(5)),
+            tag,
+            n: 0,
+        }
     }
 
     fn say(&mut self) {
         let mut frame = self.n.to_be_bytes().to_vec();
         frame.extend_from_slice(&[self.tag; 20]);
         self.n += 1;
-        writeln!(self.w, "{}", json!({"audio": hex::encode(frame)})).unwrap();
+        self.m.send(&json!({"audio": hex::encode(frame)}));
     }
 
     /// The tags heard so far, and how often.
     fn heard(&mut self, into: &mut HashMap<u8, u32>) {
         loop {
-            let mut line = String::new();
-            match self.r.read_line(&mut line) {
-                Ok(0) | Err(_) => return,
-                Ok(_) => {}
-            }
-            let Ok(v) = serde_json::from_str::<Value>(&line) else {
-                continue;
+            let Some(v) = self.m.next() else {
+                return;
             };
             if let Some(audio) = v["audio"].as_str() {
                 let bytes = hex::decode(audio).unwrap();

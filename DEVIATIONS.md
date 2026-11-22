@@ -53,13 +53,6 @@ below, each under its section.
   depth 0, and a list or record has depth one more than its deepest item.
   So 32 nested lists around an integer are accepted and 33 are rejected
   (`vectors/encoding.json`, "depth 32 (maximum)" and "depth 33").
-- **Spec ambiguity: which JSON string escaping the text rendering uses.**
-  "text = JSON string" allows several escapings of one string. Chose the
-  minimal escaping of RFC 8259, which is what `serde_json` and most JSON
-  serializers produce: `"` and `\` are escaped; U+0008, U+0009, U+000A,
-  U+000C, U+000D use `\b \t \n \f \r`; other characters below U+0020 use
-  `\u00xx` with lowercase hex; everything else, including DEL and non-ASCII,
-  is written as itself.
 - **Spec ambiguity: whether a signed object's body must itself be
   canonical.** The table says the body is "the canonical encoding of the
   inner record". Chose: reading a signed object rejects it unless the body
@@ -2035,6 +2028,45 @@ asks for around that is not built yet.
   ends it. Two people ringing each other at once each find the other busy.
 - **A message can read as `sent` with a very long backlog.** A reconcile that
   stops at its limit of wanted ids still counts as confirming.
+- **The local interface's messages** (`apps.md#the-local-interface`,
+  `api/`, `transport.rs`). Each message is one base-encoded record on a
+  `SOCK_SEQPACKET` socket (a named pipe in message mode on Windows), at most
+  256 KiB. Readings and choices:
+  - **Inside, by name.** The handlers build and read JSON trees by field
+    name as before; `api/table.rs` gives every request, argument, reply
+    field and record its number and type, and `api` turns one form into the
+    other at the socket. A value the service holds as hex (a key, an id, a
+    hash) is bytes on the wire. `apps.md`'s tables of numbers are generated
+    from that file (`CARDINAL_API_TABLES=<file> cargo test -p cardinald
+    --lib api::tests::tables`).
+  - **A reply field without a number** is this build's mistake. In a debug
+    build, where the tests run, the request then fails; in a release build
+    the field is left out and the service logs an error. A field no test
+    reaches can be missing from the table without anything failing.
+  - **Linux's send buffer.** Linux refuses a datagram larger than the
+    sender's buffer, about 208 KiB by default. Both ends here ask for 512 KiB,
+    which the kernel caps at twice `net.core.wmem_max` (416 KiB unless
+    lowered), so 256 KiB always fits. A reply larger than that is answered
+    with error 4 (`too large`): `messages` of a very long conversation,
+    `files` of a huge folder, `inspect-entry` of the largest entries. None of
+    them pages yet.
+  - **The service sends a reply first on `watch` and `call-media`**, an
+    ordinary one, before the events or frames: an error, as for no call, has
+    somewhere to go. Before, `call-media` without a call closed at once.
+  - **`inspect` is a request for each view** (`inspect`, the overview, and
+    `inspect-identity`, `-space`, `-entries`, `-entry`, `-nodes`, `-node`)
+    in place of one with `what`, since each view answers with fields of its
+    own. An op's `kind` no longer reads `"reach"` for a reach node: that is
+    `reach` (1), and the sizes of an entry's ops are records
+    (`op`, `kind`, `reach`, `bytes`) in place of lists.
+  - **A speed test** gives round trips in whole microseconds
+    (`rtt_min_us`, `rtt_median_us`) and the phase in milliseconds (`ms`):
+    the encoding has no fractions.
+  - **On Windows** the pipe is driven with overlapped I/O on threads of its
+    own, since Tokio's pipes read through a buffer that loses where a message
+    ends. Tried on Windows 11 with a .NET client in message mode (a
+    reply, a malformed and a too large message, `watch`); the tests here
+    run on Linux.
 - **On Windows the client's pipe trusts whoever holds its name.** Another account
   on the machine could take the name while no daemon runs, and the client would
   talk to it, recovery words included. The cure is a pipe with its own access

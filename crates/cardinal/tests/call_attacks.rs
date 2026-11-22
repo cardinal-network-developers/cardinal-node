@@ -3,9 +3,7 @@
 
 mod common;
 
-use std::io::{BufRead, BufReader, Write};
 use std::net::SocketAddr;
-use std::os::unix::net::UnixStream;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -33,11 +31,7 @@ fn person(root: &std::path::Path, name: &'static str) -> Dev {
 }
 
 fn try_ask(d: &Dev, req: Json) -> Json {
-    let mut s = UnixStream::connect(d.home.join("control.sock")).unwrap();
-    writeln!(s, "{req}").unwrap();
-    let mut line = String::new();
-    BufReader::new(s).read_line(&mut line).unwrap();
-    serde_json::from_str(&line).unwrap()
+    common::reply(d, &req)
 }
 
 fn ask(d: &Dev, req: Json) -> Json {
@@ -159,23 +153,18 @@ fn label_of(space: &[u8; 32], id: &[u8; 16]) -> [u8; 16] {
 }
 
 struct Line {
-    r: BufReader<UnixStream>,
+    m: Media,
 }
 
 impl Line {
     fn open(d: &Dev) -> Line {
-        let mut w = UnixStream::connect(d.home.join("control.sock")).unwrap();
-        writeln!(w, "{}", json!({"cmd": "call-media"})).unwrap();
-        w.set_read_timeout(Some(Duration::from_millis(50))).unwrap();
         Line {
-            r: BufReader::new(w),
+            m: Media::open(d, Duration::from_millis(50)),
         }
     }
 
     fn heard(&mut self) -> Option<Vec<u8>> {
-        let mut line = String::new();
-        self.r.read_line(&mut line).ok()?;
-        let v: Json = serde_json::from_str(&line).ok()?;
+        let v = self.m.next()?;
         hex::decode(v["audio"].as_str()?).ok()
     }
 }
@@ -196,11 +185,7 @@ fn cpu_ticks(pid: u32) -> u64 {
 }
 
 fn seq_now(d: &Dev) -> u64 {
-    let mut s = UnixStream::connect(d.home.join("control.sock")).unwrap();
-    writeln!(s, "{}", json!({"cmd": "watch"})).unwrap();
-    let mut line = String::new();
-    BufReader::new(s).read_line(&mut line).unwrap();
-    let v: Json = serde_json::from_str(&line).unwrap();
+    let v = common::reply(d, &json!({"cmd": "watch"}));
     v["seq"].as_u64().unwrap()
 }
 

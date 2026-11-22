@@ -321,11 +321,11 @@ impl Measured {
         json!({
             "receive": self.receive.round() as u64,
             "send": self.send.round() as u64,
-            "rtt_min_ms": self.rtt_min.as_secs_f64() * 1000.0,
-            "rtt_median_ms": self.rtt_median.as_secs_f64() * 1000.0,
+            "rtt_min_us": self.rtt_min.as_micros() as u64,
+            "rtt_median_us": self.rtt_median.as_micros() as u64,
             "received_bytes": self.received,
             "sent_bytes": self.sent,
-            "seconds": self.phase.as_secs_f64(),
+            "ms": self.phase.as_millis() as u64,
         })
     }
 }

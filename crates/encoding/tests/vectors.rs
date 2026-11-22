@@ -81,6 +81,10 @@ fn encoding_vectors() {
             Value::from("line\n\"quoted\" \\ tab\t \u{1}"),
         ),
         ("text non-ascii", Value::from("café 🐦")),
+        (
+            "text control characters",
+            Value::from("\r\u{0}\u{1f}\u{7f}\u{85}\u{9f}\u{a0}"),
+        ),
         ("empty list", Value::List(vec![])),
         (
             "list",
@@ -166,6 +170,9 @@ fn encoding_vectors() {
         ("record keys duplicate", vec![0x15, 0x01, 0x00, 0x01, 0x00]),
         ("record missing value", vec![0x0d, 0x00]),
         ("list count past end", vec![0x14, 0x00]),
+        ("record count past end", vec![0x15, 0x00]),
+        ("text length past end", vec![0x1b, 0x41]),
+        ("nested bytes length past end", vec![0x0c, 0x12, 0x00]),
         (
             "huge list count",
             vec![0xfc, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x3f],

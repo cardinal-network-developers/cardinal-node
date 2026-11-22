@@ -5,6 +5,7 @@
 //!
 //! See `README.md` in this crate for the design.
 
+pub mod api;
 pub mod applog;
 pub mod bluetooth;
 #[cfg(target_os = "linux")]

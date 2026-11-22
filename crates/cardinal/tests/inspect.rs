@@ -5,15 +5,22 @@ mod common;
 
 use common::*;
 use serde_json::{json, Value};
-use std::io::{BufRead, BufReader, Write};
-use std::os::unix::net::UnixStream;
 
 fn raw(d: &Dev, req: Value) -> Value {
-    let mut s = UnixStream::connect(d.home.join("control.sock")).unwrap();
-    writeln!(s, "{req}").unwrap();
-    let mut line = String::new();
-    BufReader::new(s).read_line(&mut line).unwrap();
-    serde_json::from_str(&line).unwrap()
+    common::reply(d, &req)
+}
+
+/// The request for one view of inspection, named by `what`, as the
+/// explorer asks: `inspect` for the overview, else `inspect-<what>`.
+fn view(mut req: Value, token: &str) -> Value {
+    let what = req.as_object_mut().unwrap().remove("what");
+    let cmd = match what.as_ref().and_then(Value::as_str) {
+        None | Some("overview") => "inspect".to_owned(),
+        Some(w) => format!("inspect-{w}"),
+    };
+    req["cmd"] = json!(cmd);
+    req["token"] = json!(token);
+    req
 }
 
 fn ok(d: &Dev, req: Value) -> Value {
@@ -35,7 +42,7 @@ fn inspection_is_granted_read_only_and_keeps_secrets() {
     });
 
     // Off until the person turns it on.
-    let r = raw(&d, json!({"cmd": "inspect", "what": "overview"}));
+    let r = raw(&d, json!({"cmd": "inspect"}));
     assert_eq!(r["ok"], false);
     assert_eq!(d.status()["inspection"]["on"], false);
 
@@ -46,11 +53,7 @@ fn inspection_is_granted_read_only_and_keeps_secrets() {
     let wrong = raw(&d, json!({"cmd": "inspect", "token": "00".repeat(32)}));
     assert_eq!(wrong["ok"], false);
 
-    let ask = |mut req: Value| {
-        req["cmd"] = json!("inspect");
-        req["token"] = json!(token);
-        ok(&d, req)
-    };
+    let ask = |req: Value| ok(&d, view(req, &token));
     let o = ask(json!({"what": "overview"}));
     let me = o["identity"]["id"].as_str().unwrap().to_string();
     let spaces = o["spaces"].as_array().unwrap().clone();
@@ -95,7 +98,7 @@ fn inspection_is_granted_read_only_and_keeps_secrets() {
     assert_eq!(v["values"][0]["v"]["t"], "secret");
     let by_path = raw(
         &d,
-        json!({"cmd": "inspect", "token": token, "what": "node", "space": acc,
+        json!({"cmd": "inspect-node", "token": token, "space": acc,
         "node": secret["id"], "path": [2, 0]}),
     );
     assert_eq!(by_path["ok"], false);
@@ -108,7 +111,7 @@ fn inspection_is_granted_read_only_and_keeps_secrets() {
     ] {
         let r = raw(
             &d,
-            json!({"cmd": "inspect", "token": token, "what": "entry", "space": acc,
+            json!({"cmd": "inspect-entry", "token": token, "space": acc,
             "entry": made_in, "path": path, "limit": 300000}),
         );
         assert_eq!(r["ok"], false, "{path} gave {r}");
@@ -149,12 +152,7 @@ fn a_presence_secret_in_a_reach_node_is_kept_secret() {
     });
     let token = ana.cli(&["inspect", "on", "--yes", "--quiet", "--minutes", "5"]);
     let token = token.trim().to_string();
-    let ask = |req: Value| {
-        let mut req = req;
-        req["cmd"] = json!("inspect");
-        req["token"] = json!(token);
-        raw(&ana, req)
-    };
+    let ask = |req: Value| raw(&ana, view(req, &token));
     let o = ask(json!({"what": "overview"}));
     let me = o["identity"]["id"].as_str().unwrap().to_string();
     let mut found = false;

@@ -10,6 +10,76 @@ use std::time::{Duration, Instant};
 
 pub const BIN: &str = env!("CARGO_BIN_EXE_cardinal");
 
+/// A connection to a service's local interface, which speaks its requests
+/// and replies by name (`cardinald::api`).
+pub use cardinald::api::blocking::Client;
+
+/// Asks the service on `socket`: `req` names the request in `cmd`, with its
+/// arguments by name. The reply is by name too, with `ok`, and `error` when
+/// it is not.
+pub fn reply_at(socket: &Path, req: &serde_json::Value) -> serde_json::Value {
+    let mut c = Client::connect(socket)
+        .unwrap_or_else(|e| panic!("no service at {}: {e}", socket.display()));
+    c.ask(req).unwrap_or_else(|e| panic!("{req}: {e:#}"))
+}
+
+/// A client's end of a call's media (`call-media`): frames by name, as
+/// `{"audio": hex}` and, in a group, `from`; or `{"frame": hex, "format":
+/// hex}`.
+pub struct Media {
+    c: Client,
+    open: bool,
+}
+
+impl Media {
+    /// Asks for the call's media; a receive then waits at most `wait`.
+    /// Without a call the service says so and the connection carries
+    /// nothing.
+    pub fn open(d: &Dev, wait: Duration) -> Media {
+        let mut c = d.connect();
+        c.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+        let r = c.ask(&serde_json::json!({"cmd": "call-media"})).unwrap();
+        c.set_read_timeout(Some(wait)).unwrap();
+        Media {
+            c,
+            open: r["ok"] == true,
+        }
+    }
+
+    /// How long a receive waits from now on.
+    pub fn set_wait(&mut self, wait: Duration) {
+        self.c.set_read_timeout(Some(wait)).unwrap();
+    }
+
+    /// Sends a frame; one the service no longer takes is lost, as a
+    /// datagram is.
+    pub fn send(&mut self, frame: &serde_json::Value) {
+        if self.open {
+            let _ = self.c.send_frame(frame);
+        }
+    }
+
+    /// The next frame, or `None` when none came in time or the media ended.
+    pub fn next(&mut self) -> Option<serde_json::Value> {
+        if !self.open {
+            return None;
+        }
+        self.c.frame().ok().flatten()
+    }
+}
+
+/// [`reply_at`] a device's service.
+pub fn reply(d: &Dev, req: &serde_json::Value) -> serde_json::Value {
+    reply_at(&d.socket(), req)
+}
+
+/// [`reply`], which must be `ok`.
+pub fn ask(d: &Dev, req: &serde_json::Value) -> serde_json::Value {
+    let r = reply(d, req);
+    assert_eq!(r["ok"], true, "{} asked {req}: {r}", d.name);
+    r
+}
+
 pub struct Dev {
     pub name: &'static str,
     pub home: PathBuf,
@@ -40,6 +110,16 @@ impl Dev {
                 "/nothing/here".into(),
             )],
         }
+    }
+
+    /// Where its service listens.
+    pub fn socket(&self) -> PathBuf {
+        self.home.join("control.sock")
+    }
+
+    /// A connection to its service.
+    pub fn connect(&self) -> Client {
+        Client::connect(&self.socket()).expect("the service listens")
     }
 
     pub fn cmd(&self) -> Command {

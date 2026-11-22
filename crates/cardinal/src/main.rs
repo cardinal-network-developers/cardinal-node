@@ -30,6 +30,10 @@ struct Cli {
     /// port.
     #[arg(long, global = true, value_name = "DIR")]
     home: Option<PathBuf>,
+    /// Show each request this command sends the daemon, and its reply, on
+    /// standard error, in the text rendering with field names.
+    #[arg(long, global = true)]
+    trace: bool,
     #[command(subcommand)]
     cmd: Cmd,
 }
@@ -503,6 +507,15 @@ enum Cmd {
     /// Save pending changes in the folder now.
     #[command(hide = true)]
     Flush,
+    /// Show what a client and the daemon say to each other: listens at
+    /// PATH, passes every message on to the daemon and back, and prints each
+    /// in the text rendering with field names. Point a client's
+    /// CARDINAL_SOCKET at PATH.
+    ApiTrace {
+        /// Where to listen (a socket path; on Windows a pipe name).
+        #[arg(long, value_name = "PATH")]
+        listen: PathBuf,
+    },
     /// Let a program you choose look at everything this device holds, keys
     /// aside, for designing Cardinal's data structures: `on` prints a token
     /// to give it, `off` ends it at once.
@@ -1139,6 +1152,7 @@ enum PeerCmd {
 
 fn main() {
     let cli = Cli::parse();
+    control::trace(cli.trace);
     if let Some(h) = &cli.home {
         std::env::set_var("CARDINAL_HOME", h);
     }
@@ -2389,8 +2403,8 @@ fn speed_line(v: &Value) -> String {
         "{name}: receive {}/s, send {}/s, round trip {} (median {})",
         human_size(v["receive"].as_u64().unwrap_or(0)),
         human_size(v["send"].as_u64().unwrap_or(0)),
-        rtt(v["rtt_min_ms"].as_f64().unwrap_or(0.0)),
-        rtt(v["rtt_median_ms"].as_f64().unwrap_or(0.0)),
+        rtt(v["rtt_min_us"].as_u64().unwrap_or(0) as f64 / 1000.0),
+        rtt(v["rtt_median_us"].as_u64().unwrap_or(0) as f64 / 1000.0),
     )
 }
 
@@ -3727,6 +3741,7 @@ async fn client(cmd: Cmd) -> anyhow::Result<()> {
             }
             Ok(())
         }
+        Cmd::ApiTrace { listen } => api_trace(&paths, &listen).await,
         Cmd::Flush => {
             let v = call(&paths, json!({"cmd": "flush"})).await?;
             println!("Saved ({} entries).", v["entries"]);
@@ -3978,6 +3993,107 @@ fn contact_status(v: &serde_json::Value) -> String {
     out
 }
 
+/// `cardinal api-trace`: passes a client's messages on to the daemon and
+/// back, and prints each, numbered by connection.
+async fn api_trace(paths: &Paths, listen: &std::path::Path) -> anyhow::Result<()> {
+    use cardinald::transport::{self, Listener};
+    let mut listener = Listener::bind(listen)?;
+    eprintln!(
+        "Passing {} on to {}. Point a client's CARDINAL_SOCKET at {0}.",
+        listen.display(),
+        paths.socket.display()
+    );
+    let mut n = 0u64;
+    loop {
+        let (cr, cw) = listener.accept().await?;
+        n += 1;
+        let (sr, sw) = match transport::connect(&paths.socket).await {
+            Ok(x) => x,
+            Err(e) => {
+                eprintln!(
+                    "[{n}] the daemon does not answer at {}: {e}",
+                    paths.socket.display()
+                );
+                continue;
+            }
+        };
+        tokio::spawn(trace_connection(n, cr, cw, sr, sw));
+    }
+}
+
+/// One traced connection: requests one way and replies the other, then a
+/// `watch`'s events or a call's frames.
+async fn trace_connection(
+    n: u64,
+    mut cr: cardinald::transport::Reader,
+    mut cw: cardinald::transport::Writer,
+    mut sr: cardinald::transport::Reader,
+    mut sw: cardinald::transport::Writer,
+) {
+    use cardinald::api::{self, Zero};
+    use cardinald::transport::Received;
+    // the request a reply answers, and what the connection carries after it
+    let mut asked: std::collections::VecDeque<&'static api::Request> = Default::default();
+    let mut stream: Option<&'static [api::Request]> = None;
+    let bytes = |m: &Received| match m {
+        Received::Message(b) => b.clone(),
+        Received::TooLarge => Vec::new(),
+    };
+    loop {
+        tokio::select! {
+            m = cr.recv() => {
+                let Ok(Some(m)) = m else {
+                    println!("[{n}] the client closed");
+                    return;
+                };
+                let msg = bytes(&m);
+                match stream {
+                    Some(t) => println!("[{n}] > {}", api::render_stream(t, &msg)),
+                    None => {
+                        println!("[{n}] > {}", api::render_request(&msg));
+                        let spec = cardinal_encoding::Record::decode(&msg)
+                            .ok()
+                            .and_then(|r| r.get(0).and_then(cardinal_encoding::Value::as_uint))
+                            .and_then(api::by_number);
+                        if let Some(spec) = spec {
+                            asked.push_back(spec);
+                        }
+                    }
+                }
+                if sw.send(&msg).await.is_err() {
+                    return;
+                }
+            }
+            m = sr.recv() => {
+                let Ok(Some(m)) = m else {
+                    println!("[{n}] the daemon closed");
+                    return;
+                };
+                let msg = bytes(&m);
+                match (stream, asked.pop_front()) {
+                    (Some(t), _) => println!("[{n}] < {}", api::render_stream(t, &msg)),
+                    (None, Some(spec)) => {
+                        println!("[{n}] < {}", api::render_reply(spec, &msg));
+                        let ok = cardinal_encoding::Record::decode(&msg)
+                            .ok()
+                            .and_then(|r| r.get(0).and_then(cardinal_encoding::Value::as_uint))
+                            == Some(api::status::OK);
+                        stream = match spec.name {
+                            "watch" if ok => Some(api::EVENTS),
+                            "call-media" if ok => Some(api::FRAMES),
+                            _ => None,
+                        };
+                    }
+                    (None, None) => println!("[{n}] < {}", api::render(&msg, Zero::Status, &[], 2)),
+                }
+                if cw.send(&msg).await.is_err() {
+                    return;
+                }
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4091,7 +4207,7 @@ mod tests {
     #[test]
     fn speedtest_line() {
         let v = json!({"device": "saint-joseph", "receive": 38_200_000u64,
-            "send": 36_900_000u64, "rtt_min_ms": 0.42, "rtt_median_ms": 0.61});
+            "send": 36_900_000u64, "rtt_min_us": 420, "rtt_median_us": 610});
         assert_eq!(
             speed_line(&v),
             "saint-joseph: receive 38.2 MB/s, send 36.9 MB/s, round trip 0.4 ms (median 0.6 ms)"

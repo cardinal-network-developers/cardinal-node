@@ -10,6 +10,9 @@ use crate::DecodeError;
 /// deepest item. A top-level list of lists of integers has depth 2.
 pub const MAX_DEPTH: usize = 32;
 
+/// The most items a list reserves room for before reading them.
+const PREALLOCATED: usize = 256;
+
 const T_UINT: u64 = 0;
 const T_NEG: u64 = 1;
 const T_BYTES: u64 = 2;
@@ -169,7 +172,8 @@ impl Decoder<'_> {
     }
 
     /// Each item takes at least one byte, so a count larger than the
-    /// remaining input is malformed. Checking this first bounds allocation.
+    /// remaining input is malformed, and is rejected on reading the header,
+    /// before anything is allocated (`encoding.md#limits`).
     fn check_count(&self, n: u64, at: usize) -> Result<usize, DecodeError> {
         if n > self.remaining() as u64 {
             return Err(DecodeError::LengthExceedsInput { offset: at });
@@ -201,7 +205,10 @@ impl Decoder<'_> {
                     return Err(DecodeError::TooDeep { offset: at });
                 }
                 let count = self.check_count(n, at)?;
-                let mut items = Vec::with_capacity(count);
+                // A count within the input can still be many times the
+                // memory of the bytes it claims, nested 32 deep, so the
+                // list grows with what is actually read.
+                let mut items = Vec::with_capacity(count.min(PREALLOCATED));
                 for _ in 0..count {
                     items.push(self.value(depth + 1)?);
                 }
@@ -300,6 +307,9 @@ mod tests {
             ("15 01 00 00 00", UnsortedKeys { offset: 3, key: 0 }),
             ("15 01 00 01 00", DuplicateKey { offset: 3, key: 1 }),
             ("14 00", LengthExceedsInput { offset: 0 }),
+            ("15 00", LengthExceedsInput { offset: 0 }),
+            ("1b 41", LengthExceedsInput { offset: 0 }),
+            ("0c 12 00", LengthExceedsInput { offset: 1 }),
             ("0d 00", UnexpectedEnd { offset: 2 }),
         ];
         for (h, err) in cases {

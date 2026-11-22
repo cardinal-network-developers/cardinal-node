@@ -7,8 +7,6 @@ mod common;
 
 use common::*;
 use serde_json::{json, Value};
-use std::io::{BufRead, BufReader, Write};
-use std::os::unix::net::UnixStream;
 use std::time::Duration;
 
 fn person(root: &std::path::Path, name: &'static str) -> Dev {
@@ -20,11 +18,7 @@ fn person(root: &std::path::Path, name: &'static str) -> Dev {
 }
 
 fn try_ask(d: &Dev, req: Value) -> Value {
-    let mut s = UnixStream::connect(d.home.join("control.sock")).unwrap();
-    writeln!(s, "{req}").unwrap();
-    let mut line = String::new();
-    BufReader::new(s).read_line(&mut line).unwrap();
-    serde_json::from_str(&line).unwrap()
+    common::reply(d, &req)
 }
 
 fn ask(d: &Dev, req: Value) -> Value {
@@ -65,34 +59,29 @@ fn wait_name(a: &Dev) -> String {
 
 /// A client's line of audio.
 struct Line {
-    w: UnixStream,
-    r: BufReader<UnixStream>,
+    m: Media,
 }
 
 impl Line {
     fn open(d: &Dev) -> Line {
-        let mut w = UnixStream::connect(d.home.join("control.sock")).unwrap();
-        writeln!(w, "{}", json!({"cmd": "call-media"})).unwrap();
-        w.set_read_timeout(Some(Duration::from_millis(50))).unwrap();
-        let r = BufReader::new(w.try_clone().unwrap());
-        Line { w, r }
+        Line {
+            m: Media::open(d, Duration::from_millis(50)),
+        }
     }
 
     fn say(&mut self, n: u32) {
         let frame = hex::encode(n.to_be_bytes());
-        writeln!(self.w, "{}", json!({"audio": frame})).unwrap();
+        self.m.send(&json!({"audio": frame}));
     }
 
     fn show(&mut self, format: &str, n: u32) {
         let frame = hex::encode(n.to_be_bytes());
-        writeln!(self.w, "{}", json!({"frame": frame, "format": format})).unwrap();
+        self.m.send(&json!({"frame": frame, "format": format}));
     }
 
     /// What came, as (kind, number): `audio`, or a format's hex.
     fn got(&mut self) -> Option<(String, u32)> {
-        let mut line = String::new();
-        self.r.read_line(&mut line).ok()?;
-        let v: Value = serde_json::from_str(&line).ok()?;
+        let v = self.m.next()?;
         let (kind, h) = match v["audio"].as_str() {
             Some(h) => ("audio".to_owned(), h),
             None => (v["format"].as_str()?.to_owned(), v["frame"].as_str()?),

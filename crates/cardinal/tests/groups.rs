@@ -10,15 +10,9 @@ mod common;
 
 use common::*;
 use serde_json::{json, Value};
-use std::io::{BufRead, BufReader, Write};
-use std::os::unix::net::UnixStream;
 
 fn reply(d: &Dev, req: &Value) -> Value {
-    let mut s = UnixStream::connect(d.home.join("control.sock")).unwrap();
-    writeln!(s, "{req}").unwrap();
-    let mut line = String::new();
-    BufReader::new(s).read_line(&mut line).unwrap();
-    serde_json::from_str(&line).unwrap()
+    common::reply(d, req)
 }
 
 fn ask(d: &Dev, req: Value) -> Value {
@@ -840,24 +834,20 @@ fn standing(d: &Dev) -> Value {
 
 /// A call's sound, as a client has it.
 struct Line {
-    w: UnixStream,
-    r: BufReader<UnixStream>,
+    m: Media,
 }
 
 impl Line {
     fn open(d: &Dev) -> Line {
-        let mut w = UnixStream::connect(d.home.join("control.sock")).unwrap();
-        writeln!(w, "{}", json!({"cmd": "call-media"})).unwrap();
-        w.set_read_timeout(Some(std::time::Duration::from_millis(20)))
-            .unwrap();
-        let r = BufReader::new(w.try_clone().unwrap());
-        Line { w, r }
+        Line {
+            m: Media::open(d, std::time::Duration::from_millis(20)),
+        }
     }
 
     fn say(&mut self, tag: u8, n: u32) {
         let mut frame = n.to_be_bytes().to_vec();
         frame.extend_from_slice(&[tag; 20]);
-        writeln!(self.w, "{}", json!({"audio": hex::encode(frame)})).unwrap();
+        self.m.send(&json!({"audio": hex::encode(frame)}));
     }
 
     /// The voices heard so far, by who, and what each said.
@@ -866,13 +856,8 @@ impl Line {
         into: &mut std::collections::HashMap<String, std::collections::HashSet<u8>>,
     ) {
         loop {
-            let mut line = String::new();
-            match self.r.read_line(&mut line) {
-                Ok(0) | Err(_) => return,
-                Ok(_) => {}
-            }
-            let Ok(v) = serde_json::from_str::<Value>(&line) else {
-                continue;
+            let Some(v) = self.m.next() else {
+                return;
             };
             let (Some(from), Some(audio)) = (v["from"].as_str(), v["audio"].as_str()) else {
                 continue;

@@ -20,7 +20,7 @@ use cardinal_encoding::{Record, Value};
 use cardinal_link::{Priority, Service, Session, Stream};
 use cardinal_space::SpaceId;
 use serde_json::{json, Value as Json};
-use tokio::io::{AsyncWriteExt, BufReader};
+use tokio::io::AsyncWriteExt;
 use tokio::sync::watch;
 
 use crate::contacts;
@@ -1901,16 +1901,26 @@ async fn told_the_others(
     }
 }
 
-/// Audio for and from a client, one `{"audio": hex}` line per frame, until
-/// the client goes or the call does.
-pub async fn media(d: &Arc<Daemon>, mut lines: tokio::io::Lines<BufReader<Reader>>, mut w: Writer) {
+/// Audio and the call's other formats for and from a client, one frame per
+/// message (`apps.md#the-local-interface`), after a reply that there is a
+/// call to carry; until the client goes or the call does.
+pub async fn media(d: &Arc<Daemon>, spec: &crate::api::Request, mut r: Reader, mut w: Writer) {
+    use cardinal_encoding::Record;
     let mut heard = d.call_audio.subscribe();
     let mut seen = d.call_video.subscribe();
     let mut stopping = d.stopping.subscribe();
     let mut changed = d.changed.subscribe();
     let Some(call) = lock(d).as_ref().map(|c| c.id) else {
+        let no = crate::api::error_reply(crate::api::status::FAILED, "there is no call");
+        let _ = w.send(&no).await;
         return;
     };
+    if w.send(&crate::api::encode_reply(spec, Ok(&json!({}))))
+        .await
+        .is_err()
+    {
+        return;
+    }
     let current = |d: &Daemon| lock(d).as_ref().is_some_and(|c| c.id == call);
     loop {
         tokio::select! {
@@ -1925,13 +1935,12 @@ pub async fn media(d: &Arc<Daemon>, mut lines: tokio::io::Lines<BufReader<Reader
                 if of != call {
                     continue;
                 }
-                let mut out = match voice {
-                    Some(v) => json!({"audio": hex::encode(&frame), "from": hex::encode(v)}),
-                    None => json!({"audio": hex::encode(&frame)}),
-                }
-                .to_string();
-                out.push('\n');
-                if w.write_all(out.as_bytes()).await.is_err() {
+                // `apps.md`, Calls' media: audio is frame 1, `from` key 3
+                let out = Record::new()
+                    .with(0, crate::api::frame::AUDIO)
+                    .with(1, frame.to_vec())
+                    .with_opt(3, voice.map(|v| v.to_vec()));
+                if w.send(&out.encode()).await.is_err() {
                     return;
                 }
             }
@@ -1940,30 +1949,34 @@ pub async fn media(d: &Arc<Daemon>, mut lines: tokio::io::Lines<BufReader<Reader
                 if of != call {
                     continue;
                 }
-                let mut out = json!({"frame": hex::encode(&frame), "format": hex::encode(format)})
-                    .to_string();
-                out.push('\n');
-                if w.write_all(out.as_bytes()).await.is_err() {
+                let out = Record::new()
+                    .with(0, crate::api::frame::OTHER)
+                    .with(1, frame.to_vec())
+                    .with(2, format.to_vec());
+                if w.send(&out.encode()).await.is_err() {
                     return;
                 }
             }
-            line = lines.next_line() => {
-                let Ok(Some(line)) = line else { return };
-                let Ok(v) = serde_json::from_str::<Json>(&line) else { continue };
-                if let Some(frame) = v["frame"].as_str().and_then(|h| hex::decode(h).ok()) {
-                    let format = v["format"]
-                        .as_str()
-                        .and_then(|h| hex::decode(h).ok())
-                        .and_then(|f| <Format>::try_from(f.as_slice()).ok());
-                    if let Some(format) = format {
-                        send_frame(d, format, frame);
-                    }
-                    continue;
-                }
-                let Some(frame) = v["audio"].as_str().and_then(|h| hex::decode(h).ok()) else {
+            got = r.recv() => {
+                let Ok(Some(got)) = got else { return };
+                let crate::transport::Received::Message(msg) = got else { continue };
+                let Ok(rec) = Record::decode(&msg) else { continue };
+                let Some(bytes) = rec.get(1).and_then(cardinal_encoding::Value::as_bytes) else {
                     continue;
                 };
-                send_audio(d, frame);
+                match rec.get(0).and_then(cardinal_encoding::Value::as_uint) {
+                    Some(crate::api::frame::AUDIO) => send_audio(d, bytes.to_vec()),
+                    Some(crate::api::frame::OTHER) => {
+                        let format = rec
+                            .get(2)
+                            .and_then(cardinal_encoding::Value::as_bytes)
+                            .and_then(|f| <Format>::try_from(f).ok());
+                        if let Some(format) = format {
+                            send_frame(d, format, bytes.to_vec());
+                        }
+                    }
+                    _ => {}
+                }
             }
         }
     }

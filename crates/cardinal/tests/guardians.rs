@@ -989,12 +989,7 @@ fn a_guardian_names_whom_an_invitation_is_for() {
 }
 
 fn reply(d: &Dev, req: &serde_json::Value) -> serde_json::Value {
-    use std::io::{BufRead, BufReader, Write};
-    let mut s = std::os::unix::net::UnixStream::connect(d.home.join("control.sock")).unwrap();
-    writeln!(s, "{req}").unwrap();
-    let mut line = String::new();
-    BufReader::new(s).read_line(&mut line).unwrap();
-    serde_json::from_str(&line).unwrap()
+    common::reply(d, req)
 }
 
 fn ask(d: &Dev, req: serde_json::Value) -> serde_json::Value {
@@ -1127,11 +1122,17 @@ fn a_recovery_undoes_the_lost_devices_successions() {
     });
     let r = ask(&new, json!({"cmd": "recover"}));
     assert!(r.get("successions").is_none(), "{r}");
-    let r = reply(
-        &new,
-        &json!({"cmd": "recover-keep-succession", "id": "x", "keep": true}),
-    );
-    assert_ne!(r["ok"], true, "{r}");
+    // the request that asked about one is no longer answered, its number
+    // still taken
+    let mut c = new.connect();
+    let asked = cardinal_encoding::Record::new()
+        .with(0, 165u64)
+        .with(1, "x")
+        .with(2, true);
+    c.send_raw(&asked.encode()).unwrap();
+    let got = c.recv_raw().unwrap().expect("a reply");
+    let got = cardinal_encoding::Record::decode(&got).unwrap();
+    assert_eq!(got.uint(0).unwrap(), cardinald::api::status::UNKNOWN);
     // and nobody is left in what the lost device made
     for d in [&new, &bo, &cy] {
         let gs = ask(d, json!({"cmd": "groups"}));

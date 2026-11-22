@@ -35,6 +35,10 @@ fuser = { version = "0.15", default-features = false, features = ["abi-7-19"], o
 # gitignore syntax for `.cardinalignore` (fs/local.rs).
 ignore = "0.4"
 
+# The local interface's SOCK_SEQPACKET socket (transport.rs).
+[target.'cfg(unix)'.dependencies]
+socket2.workspace = true
+
 # BlueZ over D-Bus for Bluetooth Low Energy (`bluez.rs`): pure Rust, no
 # libdbus or libbluetooth.
 [target.'cfg(target_os = "linux")'.dependencies]
@@ -48,6 +52,12 @@ windows-sys = { version = "0.61", features = [
     "Win32_NetworkManagement_IpHelper",
     "Win32_NetworkManagement_Ndis",
     "Win32_Networking_WinSock",
+    # The local interface's named pipe, in message mode (transport.rs).
+    "Win32_Security",
+    "Win32_Storage_FileSystem",
+    "Win32_System_IO",
+    "Win32_System_Pipes",
+    "Win32_System_Threading",
 ] }
 
 [features]

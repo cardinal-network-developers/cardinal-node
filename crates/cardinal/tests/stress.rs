@@ -22,7 +22,7 @@ mod common;
 use common::*;
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
-use std::io::{BufRead, BufReader, Write};
+use std::io::Write;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
@@ -73,13 +73,7 @@ fn content(rng: &mut Rng) -> Vec<u8> {
 
 /// A request on a daemon's control socket.
 fn request(d: &Dev, req: Value) -> Value {
-    let mut s = std::os::unix::net::UnixStream::connect(d.home.join("control.sock")).unwrap();
-    let mut line = req.to_string();
-    line.push('\n');
-    s.write_all(line.as_bytes()).unwrap();
-    let mut out = String::new();
-    BufReader::new(s).read_line(&mut out).unwrap();
-    serde_json::from_str(&out).unwrap()
+    common::reply(d, &req)
 }
 
 /// Files under a mount, recursively (paths relative to it).

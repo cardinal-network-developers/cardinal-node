@@ -8,8 +8,6 @@ mod common;
 
 use common::*;
 use serde_json::{json, Value};
-use std::io::{BufRead, BufReader, Write};
-use std::os::unix::net::UnixStream;
 use std::time::Duration;
 
 fn person(root: &std::path::Path, name: &'static str) -> Dev {
@@ -20,17 +18,9 @@ fn person(root: &std::path::Path, name: &'static str) -> Dev {
     d
 }
 
-fn socket(d: &Dev) -> std::path::PathBuf {
-    d.home.join("control.sock")
-}
-
 /// One request and its reply, as a client makes them.
 fn ask(d: &Dev, req: Value) -> Value {
-    let mut s = UnixStream::connect(socket(d)).unwrap();
-    writeln!(s, "{req}").unwrap();
-    let mut line = String::new();
-    BufReader::new(s).read_line(&mut line).unwrap();
-    let reply: Value = serde_json::from_str(&line).unwrap();
+    let reply = common::reply(d, &req);
     assert_eq!(reply["ok"], true, "{req} got {reply}");
     reply
 }
@@ -66,7 +56,70 @@ fn says_which_version_it_speaks() {
     }
     let root = tempfile::tempdir().unwrap();
     let a = person(root.path(), "ana");
-    assert_eq!(ask(&a, json!({"cmd": "hello"}))["api"], 1);
+    assert_eq!(ask(&a, json!({"cmd": "hello"}))["api"], 2);
+}
+
+/// The messages themselves (`apps.md#the-local-interface`): one record
+/// each, a request by its number and its arguments by theirs, and a reply
+/// with its status in key 0. What is not a request is answered with an
+/// error, and the connection goes on.
+#[test]
+fn the_interface_is_records_with_numbers() {
+    use cardinal_encoding::{Record, Value as V};
+    let root = tempfile::tempdir().unwrap();
+    let mut a = Dev::new(root.path(), "ana", free_port());
+    a.start_with(&["--no-mount"]);
+    let mut c = a.connect();
+    let mut answer = |msg: &[u8]| {
+        c.send_raw(msg).unwrap();
+        Record::decode(&c.recv_raw().unwrap().unwrap()).unwrap()
+    };
+    // hello is 1: status 0, then api (2) and version (3)
+    let r = answer(&Record::new().with(0, 1u64).encode());
+    assert_eq!(r.uint(0).unwrap(), 0);
+    assert_eq!(r.uint(2).unwrap(), 2);
+    assert!(r.text(3).is_ok(), "{r}");
+    // not one record: malformed (2), and why in key 1
+    let r = answer(&[0x1d, 0x00]);
+    assert_eq!(r.uint(0).unwrap(), 2, "{r}");
+    assert!(!r.text(1).unwrap().is_empty());
+    let r = answer(&[0x08, 0x08]);
+    assert_eq!(r.uint(0).unwrap(), 2, "trailing bytes: {r}");
+    // a number nobody gave: unknown (3)
+    let r = answer(&Record::new().with(0, 9999u64).encode());
+    assert_eq!(r.uint(0).unwrap(), 3, "{r}");
+    // an argument of the wrong type: malformed
+    let r = answer(&Record::new().with(0, 10u64).with(1, 5u64).encode());
+    assert_eq!(r.uint(0).unwrap(), 2, "{r}");
+    // larger than a message may be: malformed, and nothing else is read
+    let big = Record::new()
+        .with(0, 105u64)
+        .with(1, "x".repeat(300 * 1024))
+        .encode();
+    let r = answer(&big);
+    assert_eq!(r.uint(0).unwrap(), 2, "{r}");
+    // and the connection still answers
+    let r = answer(&Record::new().with(0, 1u64).encode());
+    assert_eq!(r.uint(0).unwrap(), 0);
+    // a failure is 1, with why
+    let say = Record::new().with(0, 35u64).with(1, "nobody").with(2, "hi");
+    let r = answer(&say.encode());
+    assert_eq!(r.uint(0).unwrap(), 1, "no identity yet: {r}");
+    assert!(!r.text(1).unwrap().is_empty(), "{r}");
+
+    // watch: a reply, then only events, the first at once
+    let mut w = a.connect();
+    w.send_raw(&Record::new().with(0, 3u64).encode()).unwrap();
+    let ok = Record::decode(&w.recv_raw().unwrap().unwrap()).unwrap();
+    assert_eq!(ok.uint(0).unwrap(), 0);
+    let e = Record::decode(&w.recv_raw().unwrap().unwrap()).unwrap();
+    assert_eq!(e.uint(0).unwrap(), 1, "changed: {e}");
+    assert!(matches!(e.get(1), Some(V::Int(_))), "{e}");
+    assert_eq!(e.len(), 2, "an event carries nothing else: {e}");
+
+    // no call: call-media says so
+    let r = answer(&Record::new().with(0, 104u64).encode());
+    assert_eq!(r.uint(0).unwrap(), 1, "{r}");
 }
 
 /// A message arrives, and the client hears without asking. It then reads the
@@ -81,20 +134,17 @@ fn news_comes_by_itself_and_read_travels_back() {
     let (a, b) = met(root.path());
     let bo = only(&a)["name"].as_str().unwrap().to_owned();
 
-    let mut news = UnixStream::connect(socket(&a)).unwrap();
+    let mut news = a.connect();
     news.set_read_timeout(Some(Duration::from_secs(30)))
         .unwrap();
-    writeln!(news, "{}", json!({"cmd": "watch"})).unwrap();
-    let mut news = BufReader::new(news);
-    let mut first = String::new();
-    news.read_line(&mut first).unwrap();
-    let first: Value = serde_json::from_str(&first).unwrap();
+    let watching = news.ask(&json!({"cmd": "watch"})).unwrap();
+    assert_eq!(watching["ok"], true, "{watching}");
+    let first = news.event().unwrap().unwrap();
     assert_eq!(first["event"], "changed", "{first}");
 
     b.cli(&["say", "Ana", "hello from bo"]);
     wait("the message arrives", 30, || {
-        let mut line = String::new();
-        news.read_line(&mut line).unwrap();
+        news.event().unwrap().unwrap();
         only(&a)["unread"] == 1
     });
     let c = only(&a);
@@ -284,12 +334,8 @@ fn a_client_can_set_up_a_first_device() {
     assert_ne!(at[0], at[1]);
 
     // Wrong words save nothing, and leave the same identity on offer.
-    let mut s = UnixStream::connect(socket(&a)).unwrap();
     let wrong = json!({"cmd": "setup-finish", "name": "Ana", "answers": ["no", "no"]});
-    writeln!(s, "{wrong}").unwrap();
-    let mut line = String::new();
-    BufReader::new(s).read_line(&mut line).unwrap();
-    let reply: Value = serde_json::from_str(&line).unwrap();
+    let reply = common::reply(&a, &wrong);
     assert_eq!(reply["ok"], false, "{reply}");
     assert!(a.status()["identity"].is_null());
 
@@ -340,11 +386,7 @@ fn lists_a_folder() {
 
 /// The reason a request was turned down.
 fn turned_down(d: &Dev, req: Value) -> String {
-    let mut s = UnixStream::connect(socket(d)).unwrap();
-    writeln!(s, "{req}").unwrap();
-    let mut line = String::new();
-    BufReader::new(s).read_line(&mut line).unwrap();
-    let reply: Value = serde_json::from_str(&line).unwrap();
+    let reply = common::reply(d, &req);
     assert_eq!(reply["ok"], false, "{req} got {reply}");
     reply["error"].as_str().unwrap_or_default().to_owned()
 }
