@@ -128,7 +128,7 @@ fn save_seen(d: &Daemon, seen: &Seen) {
     }
 }
 
-pub(crate) fn delay_text(secs: u64) -> String {
+pub fn delay_text(secs: u64) -> String {
     let (n, unit) = match secs {
         s if s % 86_400 == 0 && s > 0 => (s / 86_400, "day"),
         s if s % 3600 == 0 && s > 0 => (s / 3600, "hour"),

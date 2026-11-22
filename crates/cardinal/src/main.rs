@@ -1599,6 +1599,12 @@ fn fetch_line(p: &Value) -> String {
     line
 }
 
+/// A day, as `2026-11-21`, in local time.
+fn human_day(ms: u64) -> String {
+    let t = human_time(Some(ms));
+    t.split(' ').next().unwrap_or(&t).to_owned()
+}
+
 fn human_time(ms: Option<u64>) -> String {
     let Some(ms) = ms else {
         return "unknown time".into();
@@ -2997,7 +3003,20 @@ async fn client(cmd: Cmd) -> anyhow::Result<()> {
                 }
                 println!("{line}  [{}]", c["identity"].as_str().unwrap_or(""));
                 if let Some(r) = c["recovered"].as_str() {
-                    println!("  {} {r}", c["name"].as_str().unwrap_or(""));
+                    let name = c["name"].as_str().unwrap_or("");
+                    // the day in this person's own time, from the fields
+                    let local = c["recovered_seen"]
+                        .as_u64()
+                        .zip(c["recovered_delay"].as_u64());
+                    match local {
+                        Some((seen, delay)) => println!(
+                            "  {name} was recovered by guardians they had chosen by {}, after \
+                             {}. If in doubt, check with them in person.",
+                            human_day(seen),
+                            cardinald::guardians::delay_text(delay)
+                        ),
+                        None => println!("  {name} {r}"),
+                    }
                 }
             }
             Ok(())

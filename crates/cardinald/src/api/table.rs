@@ -275,7 +275,7 @@ rec!(CONTACT "contact":
     1 "category" T, 2 "connected" BOOL, 3 "identity" B, 4 "introductions" BOOL, 5 "met" {MET},
     6 "name" T, 7 "nearby" BOOL, 8 "own" BOOL, 9 "picture" T, 10 "recovered" T,
     11 "refused" BOOL, 12 "relayed" BOOL, 13 "suggested" T, 14 "trusted" BOOL,
-    15 "recovered_seen" U, 16 "recovered_new_guardians" BOOL);
+    15 "recovered_seen" U, 16 "recovered_new_guardians" BOOL, 17 "recovered_delay" U);
 rec!(CONTACT_REACH "contact reach":
     1 "named" [T], 2 "said_no" BOOL, 3 "shared" BOOL, 4 "waiting" BOOL);
 rec!(CONVERSATION "conversation":

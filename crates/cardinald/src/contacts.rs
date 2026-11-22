@@ -913,6 +913,7 @@ pub fn list(d: &Daemon, all: bool) -> Json {
                 "recovered": recovered.as_ref().map(|r| r.text.clone()),
                 "recovered_seen": recovered.as_ref().and_then(|r| r.seen),
                 "recovered_new_guardians": recovered.as_ref().map(|r| r.new_guardians),
+                "recovered_delay": recovered.as_ref().map(|r| r.delay),
                 "met": c.met.as_ref().map(|m| met_json(m, &everyone, &group_names)),
                 "identity": hex::encode(&c.identity[..8]),
                 "trusted": c.regard.trusted,
@@ -939,6 +940,8 @@ pub(crate) struct Recovered {
     pub text: String,
     pub seen: Option<u64>,
     pub new_guardians: bool,
+    /// The guardians' delay, in seconds, as the policy gives it.
+    pub delay: u64,
 }
 
 fn recovered_note(d: &Daemon, who: &[u8; 32], name: &str) -> Option<Recovered> {
@@ -950,7 +953,8 @@ fn recovered_note(d: &Daemon, who: &[u8; 32], name: &str) -> Option<Recovered> {
         .into_iter()
         .find(|r| st.in_effect.contains(&r.entry))?;
     let p = log.policy(&r.policy)?;
-    let delay = crate::guardians::delay_text(p.delay);
+    let secs = p.delay;
+    let delay = crate::guardians::delay_text(secs);
     let seen = first_seen(d, &r.policy);
     Some(match seen {
         Some(Seen {
@@ -958,12 +962,13 @@ fn recovered_note(d: &Daemon, who: &[u8; 32], name: &str) -> Option<Recovered> {
             with_recovery: false,
         }) => Recovered {
             text: format!(
-                "was recovered by guardians they had chosen by {}, after {delay}. If in \
-                 doubt, check with them in person.",
+                "was recovered by guardians they had chosen by {} (UTC), after {delay}. If \
+                 in doubt, check with them in person.",
                 day_text(at)
             ),
             seen: Some(at),
             new_guardians: false,
+            delay: secs,
         },
         _ => Recovered {
             text: format!(
@@ -972,6 +977,7 @@ fn recovered_note(d: &Daemon, who: &[u8; 32], name: &str) -> Option<Recovered> {
             ),
             seen: None,
             new_guardians: true,
+            delay: secs,
         },
     })
 }
