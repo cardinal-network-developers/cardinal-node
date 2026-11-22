@@ -765,14 +765,26 @@ differs or was read:
   that time is kept there too, not only in the spaces held at the moment
   it was said (`recover-lost-at` sets it later); after the week only
   `keep-work` keeps more, since a thief sets the clock those entries give.
-  **Successions fall** (D81, Daniel 2026-11-21): a `succeed`, or a
-  successor's genesis and everything in that successor, that a removed key
-  wrote is never kept, neither as spaces arrive nor by `keep-work`
-  (`spaces.md#a-succession-by-a-device-that-is-later-removed`: it counts
-  only if a keep lists it, and the spec's keeps "before the removal" cannot
-  be written once no device survives). Nothing is asked: the old space
-  stands again, whoever followed returns to it, and the person redoes the
-  change by hand if it was theirs. **What a contact gives a recovered
+  **Successions nothing kept fall; those kept before the loss stand**
+  (D81, and the designer, 2026-11-22): a `succeed`, or a successor's
+  genesis and everything in that successor, that a removed key wrote is
+  never kept by the new device on its own, neither as spaces arrive nor by
+  `keep-work`. But a `keep` another of the person's devices wrote before
+  the loss (when they confirmed the succession there, or with a retired
+  device's work) is the person's work: the new device keeps every entry of
+  theirs, by a removed key, that holds a `keep`, whenever written
+  (`Core::keep_earlier_keeps`, as each space arrives, before the rest), and
+  what it kept stands again. So the old space's `succeed` counts, the
+  device follows the successor from the trail's genesis though that
+  genesis is still set aside (its cut is checked under the genesis's own
+  epoch), keeps the earlier `keep` of the genesis there, and the successor
+  stands. Nothing is asked: what nothing kept falls, the old space stands
+  again, whoever followed returns to it, and the person redoes the change
+  by hand if it was theirs (`core.rs`,
+  `a_succession_kept_before_the_loss_stands_after_a_recovery`, both ways).
+  A contact gives a recovered device a successor by the narrow path only
+  where an entry there of the person's, by a removed key, keeps its
+  genesis. **What a contact gives a recovered
   person** (`hosts.md#restore` says only that spaces "come back as their
   other holders are reached"; sync.md lets only members name a space, and
   after a recovery that kept no old key nothing the person wrote counts,
@@ -964,11 +976,15 @@ and a member added to the successor afterwards).
 What is not built:
 
 - **A succession by a device that is later removed**
-  (`spaces.md#a-succession-by-a-device-that-is-later-removed`). Nothing
-  writes a `keep` for a `succeed` or a successor's genesis: not when the
-  person confirms it on another device, not when a device is retired,
-  and not when one is lost (nothing shows the person what that device's
-  successions did); after a recovery they fall by design (D81, see
+  (`spaces.md#a-succession-by-a-device-that-is-later-removed`).
+  `Core::keep_succession` writes, on the person's word, the `keep` of a
+  `succeed` (on it) and of the successor's genesis that another of their
+  devices made, and a device retired (not lost) has its successions kept
+  so with its work (`keep_successions_of`). **Not built:** nothing shows the
+  person on their other devices what one device's successions did, so no
+  request asks to confirm one yet (the tests call it), and nothing shows a
+  lost device's successions before its removal. After a recovery, those
+  nothing kept fall, and those kept before the loss stand (see
   Guardians). Validity already says that an unkept one by a removed
   key does not count; a device then finds that no successor stands, takes
   the old space for current again and posts there what it wrote in the

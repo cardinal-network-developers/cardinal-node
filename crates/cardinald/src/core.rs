@@ -12,7 +12,7 @@ use cardinal_identity::{EntryId, IdentityEntry, IdentityLog, IdentityState, Inse
 use cardinal_space::account;
 use cardinal_space::entry::NodeKind;
 use cardinal_space::relationship;
-use cardinal_space::{Profile, SealedEntry, Space, SpaceId, SpaceOp, ROOT};
+use cardinal_space::{Profile, SealedEntry, Space, SpaceId, SpaceOp, SpaceOpBody, ROOT};
 use cardinal_sync::{identity_log_label, MemSet, SetStore};
 
 use crate::applog::{AppendLog, Loc};
@@ -2374,7 +2374,22 @@ impl Core {
             return false;
         };
         let st = other.log.state();
-        sp.succeeds().is_none()
+        // a successor, only where a keep of theirs, by another device of
+        // theirs since removed, kept it before the loss
+        let kept_before = || {
+            let dag = sp.dag();
+            dag.log_order().iter().any(|y| {
+                dag.get(y).is_some_and(|e| {
+                    e.author() == *identity
+                        && st.removed().any(|k| *k == e.signer())
+                        && e.ops().iter().any(|o| {
+                            matches!(o.body(), SpaceOpBody::Keep { key, entries }
+                                if *key == g.signer() && entries.contains(label))
+                        })
+                })
+            })
+        };
+        (sp.succeeds().is_none() || kept_before())
             && g.author() == *identity
             && sp.validity().unwitnessed.contains(label)
             && st.removed().any(|k| *k == g.signer())
@@ -3450,6 +3465,162 @@ impl Core {
                 match h.write_keeps(ident, &self.keys, vec![SpaceOp::keep(key, &latest)]) {
                     Ok(bytes) => written.push((id, bytes)),
                     Err(e) => tracing::debug!("keeping a leave in {}: {e:#}", short(&id)),
+                }
+            }
+        }
+        let ids: Vec<SpaceId> = written.iter().map(|(id, _)| *id).collect();
+        for id in ids {
+            self.settle(&id);
+        }
+        Ok(written)
+    }
+
+    /// Keeps, on its person's word, a succession another of their devices
+    /// made of `old` (`spaces.md#a-succession-by-a-device-that-is-later-removed`,
+    /// "Kept when the person confirms it"): a `keep` of the `succeed` in
+    /// `old`, on it, and a `keep` of the successor's genesis there, each
+    /// for the key that signed it. From then on the succession stands
+    /// whatever becomes of that device, and after a recovery too, once the
+    /// new device keeps this one's work. Nothing where this device made it,
+    /// or where a keep of this person's already lists it. Software MUST
+    /// NOT call this without its person. Returns the entries written.
+    pub fn keep_succession(&mut self, old: &SpaceId) -> anyhow::Result<Written> {
+        let ident = self
+            .identity
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("this device has no identity yet"))?;
+        let (me, mine) = (ident.id(), self.keys.key());
+        let sp = self.spaces.get(old).and_then(|h| h.space.as_ref());
+        let sp = sp.ok_or_else(|| anyhow::anyhow!("that space is not open here"))?;
+        let new = sp
+            .successor()
+            .ok_or_else(|| anyhow::anyhow!("nothing stands in its place"))?;
+        let dag = sp.dag();
+        let succeed = dag.log_order().iter().copied().find(|x| {
+            dag.get(x).is_some_and(|e| {
+                e.author() == me
+                    && e.ops().iter().any(|o| {
+                        matches!(o.body(), SpaceOpBody::Succeed { successor, .. } if *successor == new)
+                    })
+            })
+        });
+        let succeed =
+            succeed.ok_or_else(|| anyhow::anyhow!("that succession is not this person's"))?;
+        let mut wanted: Vec<(SpaceId, KeyId, EntryId)> = Vec::new();
+        let signer = dag.get(&succeed).expect("found").signer();
+        wanted.push((*old, signer, succeed));
+        let theirs = self.spaces.get(&new).and_then(|h| h.space.as_ref());
+        let theirs = theirs.ok_or_else(|| anyhow::anyhow!("its successor is not held here"))?;
+        let g = theirs.dag().get(&new).map(|g| g.signer());
+        let g = g.ok_or_else(|| anyhow::anyhow!("its successor's genesis is not here"))?;
+        wanted.push((new, g, new));
+        let mut written = Vec::new();
+        for (space, key, x) in wanted {
+            if key == mine || self.kept_by_me(&space, &key, &x) {
+                continue;
+            }
+            let ident = self.identity.as_ref().expect("checked");
+            let h = self.spaces.get_mut(&space).expect("held");
+            let bytes = h.write_keeps(ident, &self.keys, vec![SpaceOp::keep(key, &[x])])?;
+            written.push((space, bytes));
+            self.settle(&space);
+        }
+        Ok(written)
+    }
+
+    /// For a device being retired (`spaces.md#authors`, "Retired"): keeps
+    /// each succession `key` made that nothing of this person's keeps yet,
+    /// with the rest of its work ([`Core::keep_succession`]).
+    pub fn keep_successions_of(&mut self, key: &KeyId) -> Written {
+        let me = self.me();
+        let mine: Vec<SpaceId> = self
+            .spaces
+            .iter()
+            .filter_map(|(id, h)| {
+                let sp = h.space.as_ref()?;
+                let new = sp.successor()?;
+                let dag = sp.dag();
+                let by = dag.log_order().iter().any(|x| {
+                    dag.get(x).is_some_and(|e| {
+                        Some(e.author()) == me
+                            && e.signer() == *key
+                            && e.ops().iter().any(|o| {
+                                matches!(o.body(), SpaceOpBody::Succeed { successor, .. } if *successor == new)
+                            })
+                    })
+                });
+                by.then_some(*id)
+            })
+            .collect();
+        let mut written = Vec::new();
+        for old in mine {
+            match self.keep_succession(&old) {
+                Ok(w) => written.extend(w),
+                Err(e) => tracing::warn!("keeping a succession of {}: {e:#}", short(&old)),
+            }
+        }
+        written
+    }
+
+    /// Whether an entry of this person's in `space` holds a `keep` for
+    /// `key` that lists `x`.
+    fn kept_by_me(&self, space: &SpaceId, key: &KeyId, x: &EntryId) -> bool {
+        let me = self.me();
+        let Some(sp) = self.spaces.get(space).and_then(|h| h.space.as_ref()) else {
+            return false;
+        };
+        let dag = sp.dag();
+        dag.log_order().iter().any(|y| {
+            dag.get(y).is_some_and(|e| {
+                Some(e.author()) == me
+                    && e.ops().iter().any(|o| {
+                        matches!(o.body(), SpaceOpBody::Keep { key: k, entries } if k == key && entries.contains(x))
+                    })
+            })
+        })
+    }
+
+    /// Keeps, in every space held, each entry of this person's that one of
+    /// `keys`, keys their log has removed, signed, that holds a `keep` and
+    /// that nothing witnessed: after a recovery by guardians, a succession
+    /// (or any work) kept before the loss, by another of the person's
+    /// devices when they confirmed it or with a retired device's work, is
+    /// the person's work like any other, and stands again once kept
+    /// (`spaces.md#a-succession-by-a-device-that-is-later-removed`). Kept
+    /// whenever written, as leaves are. Only what nothing kept falls.
+    /// Returns the entries written.
+    pub fn keep_earlier_keeps(&mut self, keys: &[KeyId]) -> anyhow::Result<Written> {
+        let ident = self
+            .identity
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("this device has no identity yet"))?;
+        let (me, st) = (ident.id(), ident.state());
+        let keys: Vec<&KeyId> = keys.iter().filter(|k| st.power(k).is_none()).collect();
+        let mut wanted: BTreeMap<SpaceId, BTreeMap<KeyId, Vec<EntryId>>> = BTreeMap::new();
+        for (id, h) in &self.spaces {
+            let Some(sp) = h.space.as_ref() else {
+                continue;
+            };
+            for x in &sp.validity().unwitnessed {
+                let Some(e) = sp.dag().get(x) else { continue };
+                let keeps = e
+                    .ops()
+                    .iter()
+                    .any(|o| matches!(o.body(), SpaceOpBody::Keep { .. }));
+                if keeps && e.author() == me && keys.contains(&&e.signer()) {
+                    let by_key = wanted.entry(*id).or_default();
+                    by_key.entry(e.signer()).or_default().push(*x);
+                }
+            }
+        }
+        let mut written = Vec::new();
+        for (id, by_key) in wanted {
+            let h = self.spaces.get_mut(&id).expect("held");
+            for (key, mut xs) in by_key {
+                xs.sort();
+                match h.write_keeps(ident, &self.keys, vec![SpaceOp::keep(key, &xs)]) {
+                    Ok(bytes) => written.push((id, bytes)),
+                    Err(e) => tracing::debug!("keeping an earlier keep in {}: {e:#}", short(&id)),
                 }
             }
         }
@@ -7434,6 +7605,140 @@ mod tests {
             all.extend(glog.entries().map(IdentityEntry::encode));
         }
         (all, new, log)
+    }
+
+    /// Ana's log recovered by two guardians, keeping none of her keys, and
+    /// a new device of hers that the new root added, holding the identity
+    /// key, as `recover finish` leaves it; the log's entries, for others.
+    fn recovered_device(ana: &Person, guardians: [&Person; 2]) -> (Person, Vec<Vec<u8>>) {
+        use cardinal_identity::{IdentityOp, Power};
+        let mut log = standalone(&ana.log());
+        let enc = ana.core.identity.as_ref().unwrap().enc.first();
+        let named: Vec<_> = guardians.iter().map(|g| (g.id(), g.enc())).collect();
+        log.set_guardians(&ana.root, &named, 2, 0, true, enc)
+            .unwrap();
+        let phrase = cardinal_crypto::RecoveryPhrase::from_entropy(&[43; 32]);
+        let new_root = phrase.root_signing_key();
+        let link = HybridKeyPair::generate();
+        let policy = log.current_policy().unwrap();
+        let rec = log
+            .recover_entry(
+                &log.recovery_parents(),
+                &new_root,
+                &[],
+                link.public_key(),
+                policy.entry,
+                phrase.recovery_key_pair().public_key(),
+            )
+            .unwrap();
+        let decision = rec.id();
+        log.insert(rec).unwrap();
+        let mut theirs: Vec<IdentityLog> = guardians.iter().map(|g| standalone(&g.log())).collect();
+        for confirm in [false, true] {
+            for (g, glog) in guardians.iter().zip(theirs.iter_mut()) {
+                let gi = g.core.identity.as_ref().unwrap();
+                let rec = log.guardian_record(&policy, &g.id(), &gi.enc).unwrap();
+                let op = if confirm {
+                    let r = log.recovery(&decision).unwrap();
+                    let share = log.seal_share(&r, rec.share.as_ref().unwrap()).unwrap();
+                    IdentityOp::confirm(decision, rec.position, rec.salt, Some(&share))
+                } else {
+                    IdentityOp::endorse(decision, rec.position, rec.salt)
+                };
+                glog.append(&g.core.keys.device.signing, vec![op]).unwrap();
+                for e in glog.entries().cloned().collect::<Vec<_>>() {
+                    let _ = log.attach(e);
+                }
+            }
+        }
+        assert!(log.state().in_effect.contains(&decision), "not in effect");
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::at(dir.path());
+        let keys = Arc::new(Keys::load_or_create(&paths.device_key()).unwrap());
+        let mut core = Core::load(&paths, keys).unwrap();
+        let request = core.keys.device.request(&log.id(), Power::Admin);
+        log.add_key(&new_root, &request, enc).unwrap();
+        let mut all: Vec<Vec<u8>> = log.entries().map(IdentityEntry::encode).collect();
+        for glog in &theirs {
+            all.extend(glog.entries().map(IdentityEntry::encode));
+        }
+        assert!(core.ingest_identity(&all, Some(ana.id())).unwrap().joined);
+        let mut new = Person {
+            _dir: dir,
+            core,
+            root: new_root,
+        };
+        for (id, log) in ana.others() {
+            new.core.ingest_other(id, &log).unwrap();
+        }
+        (new, all)
+    }
+
+    /// Ana takes Cy out of a group on her phone and, where `confirmed`,
+    /// confirms it on her laptop, which keeps it; she loses both, and her
+    /// guardians recover her. The new device keeps what the person kept
+    /// before the loss. Returns whether, for Bo, the successor stands with
+    /// Cy out, and the same as the new device sees it.
+    fn a_succession_after_a_recovery(confirmed: bool) -> (bool, bool) {
+        let ([mut ana, mut bo, cy], g) = family();
+        let store = cardinal_blob::MemStore::new();
+        let mut laptop = ana.second_device();
+        bo.core.ingest_other(ana.id(), &ana.log()).unwrap();
+        laptop.takes(&g, &ana.all_of(&g));
+        let s = ana
+            .core
+            .succeed(&store, &g, &[(bo.id(), WRITER)])
+            .unwrap()
+            .new;
+        laptop.syncs(&ana, &g, &store);
+        assert!(laptop.holds(&s), "the laptop follows");
+        if confirmed {
+            let kept = laptop.core.keep_succession(&g).unwrap();
+            assert_eq!(kept.len(), 2, "the succeed and the genesis");
+            assert!(laptop.core.keep_succession(&g).unwrap().is_empty(), "once");
+        }
+        bo.syncs(&ana, &g, &store);
+        bo.syncs(&laptop, &g, &store);
+        bo.syncs(&laptop, &s, &store);
+        assert_eq!(bo.core.current(&g), s);
+        let lost = [ana.core.keys.key(), laptop.core.keys.key()];
+        let (g1, g2) = (Person::new(), Person::new());
+        let (mut new, log) = recovered_device(&ana, [&g1, &g2]);
+        bo.core.ingest_other(ana.id(), &log).unwrap();
+        bo.core.follow(&store);
+        // nothing kept yet: the succession does not count for now
+        assert!(!bo.space(&g).ended(), "unkept, the old group stands");
+        new.takes(&g, &bo.set_of(&g));
+        new.takes(&s, &bo.set_of(&s));
+        // as each space arrives: the old group first, then, once its
+        // succession counts, the successor it follows to
+        let mut written = new.core.keep_earlier_keeps(&lost).unwrap();
+        new.syncs(&bo, &g, &store);
+        if new.holds(&s) {
+            new.takes(&s, &bo.set_of(&s));
+            written.extend(new.core.keep_earlier_keeps(&lost).unwrap());
+        }
+        assert_eq!(written.len(), if confirmed { 2 } else { 0 });
+        for (space, bytes) in written {
+            bo.takes(&space, &[bytes]);
+        }
+        bo.core.follow(&store);
+        let stands = |p: &Person| {
+            p.space(&g).ended()
+                && p.space(&s).role_of(&cy.id()).is_none()
+                && p.space(&s).owner() == Some(ana.id())
+        };
+        let for_bo = stands(&bo) && bo.core.current(&g) == s;
+        (for_bo, stands(&new))
+    }
+
+    /// The designer's decision of 2026-11-22: after a recovery by
+    /// guardians, a succession kept before the loss stands, and one
+    /// nothing kept falls.
+    #[test]
+    fn a_succession_kept_before_the_loss_stands_after_a_recovery() {
+        assert_eq!(a_succession_after_a_recovery(true), (true, true));
+        assert_eq!(a_succession_after_a_recovery(false), (false, false));
     }
 
     /// The narrow path after a recovery by guardians (`hosts.md#restore`,

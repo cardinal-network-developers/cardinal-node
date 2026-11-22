@@ -742,8 +742,12 @@ impl Core {
                 false => Err("its initial state is not the state at its cut".to_owned()),
             };
         };
-        let epoch = new
+        // the genesis's epoch: the current one, or, where the genesis is set
+        // aside until a keep of it comes (after a recovery), its own
+        let first = new
             .current_epoch()
+            .or_else(|| new.dag().get(&new.id()).map(|g| g.epoch()));
+        let epoch = first
             .and_then(|e| new.keyring().get(&e).cloned())
             .ok_or("no key for its first epoch")?;
         let (reference, canonical) =
