@@ -157,3 +157,91 @@ fn old_versions_are_kept_then_freed() {
         "{out}"
     );
 }
+
+/// The files space's line of `space-usage`.
+fn files_usage(d: &Dev) -> serde_json::Value {
+    let r = ask(d, &serde_json::json!({"cmd": "space-usage"}));
+    let all = r["spaces"].as_array().cloned().unwrap_or_default();
+    all.into_iter()
+        .find(|s| s["name"] == "files" || s["name"] == "Cardinal")
+        .unwrap_or_else(|| panic!("no files space in {r}"))
+}
+
+/// What history costs, and emptying it (D85): each space held is counted
+/// as live chunks, history-only chunks and its log, for what this device
+/// holds; a device that keeps old versions for some days says so, in the
+/// account placement too; and "empty now" drops the history-only chunks
+/// of a space at once, with no copy check, leaving what is current.
+#[test]
+fn history_is_counted_and_emptied_at_once() {
+    if !fuse_available() {
+        eprintln!("skipping: /dev/fuse or fusermount3 is not available");
+        return;
+    }
+    let root = tempfile::tempdir().unwrap();
+    let mut a = Dev::new(root.path(), "alpha", free_port());
+    a.env
+        .push(("CARDINAL_TEST_FREE_MIN_AGE_MS".into(), "0".into()));
+    a.start();
+    a.cli(&["init", "--yes", "--name", "alpha"]);
+    a.wait_mounted();
+    let (v1, v2) = (content(600 << 10, 11), content(300 << 10, 12));
+    std::fs::write(a.p("h.bin"), &v1).unwrap();
+    a.cli(&["flush"]);
+    let first = files_usage(&a);
+    assert!(
+        first["live_bytes"].as_u64().unwrap() >= 600 << 10,
+        "{first}"
+    );
+    assert_eq!(first["history_bytes"], 0, "{first}");
+    assert!(first["log_bytes"].as_u64().unwrap() > 0, "{first}");
+    assert_eq!(first["full"], true);
+    // by convention old versions are kept 30 days: history for 30 days
+    assert_eq!(first["retention"], "history-days", "{first}");
+    assert_eq!(first["history_days"], 30, "{first}");
+
+    // a new version: the first is history only
+    std::fs::write(a.p("h.bin"), &v2).unwrap();
+    a.cli(&["flush"]);
+    let second = files_usage(&a);
+    let history = second["history_bytes"].as_u64().unwrap();
+    assert!(history >= 600 << 10, "{second}");
+    assert!(
+        second["live_bytes"].as_u64().unwrap() >= 300 << 10,
+        "{second}"
+    );
+    assert!(
+        second["live_bytes"].as_u64().unwrap() < 600 << 10,
+        "{second}"
+    );
+
+    // empty now, for that space alone
+    let space = second["space"].as_str().unwrap().to_owned();
+    let out = ask(
+        &a,
+        &serde_json::json!({"cmd": "history-empty", "space": space}),
+    );
+    assert!(out["bytes"].as_u64().unwrap() >= 600 << 10, "{out}");
+    let after = files_usage(&a);
+    assert_eq!(after["history_bytes"], 0, "{after}");
+    assert_eq!(
+        after["live_bytes"], second["live_bytes"],
+        "the current file stays"
+    );
+    assert_eq!(std::fs::read(a.p("h.bin")).unwrap(), v2);
+    assert!(version_line(&a, "h.bin", 1).contains("(not on this device)"));
+
+    // kept forever is history; kept for no days is full
+    a.cli(&["keep-old", "forever"]);
+    assert_eq!(files_usage(&a)["retention"], "history");
+    a.cli(&["keep-old", "0"]);
+    let none = files_usage(&a);
+    assert_eq!(none["retention"], "full");
+    assert!(none["history_days"].is_null(), "{none}");
+    // a space that is not held is refused
+    let r = reply(
+        &a,
+        &serde_json::json!({"cmd": "history-empty", "space": "zz"}),
+    );
+    assert_eq!(r["ok"], false, "{r}");
+}

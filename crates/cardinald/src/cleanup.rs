@@ -36,7 +36,7 @@ use std::time::{Duration, SystemTime};
 
 use cardinal_blob::{decrypt, BlobRef, Id, Index, ObjectStore};
 use cardinal_space::files::{Content, FILE_CONTENT};
-use cardinal_space::{Space, SpaceOpBody};
+use cardinal_space::{Space, SpaceId, SpaceOpBody};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
@@ -320,16 +320,7 @@ pub fn unnamed(d: &Daemon, delete: bool) -> anyhow::Result<Unnamed> {
         let named_now = || {
             let core = d.core();
             let (roots, unsure) = core.named_blobs();
-            let files = core.files_id().and_then(|f| core.spaces.get(&f));
-            let live: HashSet<Id> = files
-                .and_then(|h| h.space.as_ref())
-                .map(|sp| {
-                    crate::fetch::current_refs(sp)
-                        .iter()
-                        .map(|b| b.id)
-                        .collect()
-                })
-                .unwrap_or_default();
+            let live: HashSet<Id> = all_live(&space_blobs(&core)).iter().map(|b| b.id).collect();
             (roots, unsure, live)
         };
         let (roots, mut unsure, live) = named_now();
@@ -408,6 +399,9 @@ pub struct Wanted<'a> {
     /// Under on-demand retention: the blobs of pinned files, and the most
     /// bytes to keep of other current files.
     pub on_demand: Option<(&'a [BlobRef], u64)>,
+    /// Under on-demand retention, the current blobs whose objects may be
+    /// dropped beyond the budget: the files'. `None`: all of `live`.
+    pub evictable: Option<&'a [BlobRef]>,
 }
 
 /// Decides what to delete: the objects of expired blobs that no current
@@ -454,6 +448,13 @@ pub fn plan(
         }
     }
     if let Some((pins, budget)) = wanted.on_demand {
+        if let Some(ev) = wanted.evictable {
+            let mut may = HashSet::new();
+            for b in ev {
+                held_objects(store, b, &mut may)?;
+            }
+            unpinned.retain(|o| may.contains(&o.id));
+        }
         let mut pinned = HashSet::new();
         for b in pins {
             held_objects(store, b, &mut pinned)?;
@@ -572,11 +573,19 @@ impl Cleaner {
 /// `now_all` every old version, and with `dry_run` only says what it
 /// would delete.
 pub fn pass(d: &Daemon, now_all: bool, dry_run: bool) -> anyhow::Result<Freed> {
+    let empty = if now_all { Empty::All } else { Empty::No };
+    pass_emptying(d, empty, dry_run)
+}
+
+/// [`pass`], freeing at once what `empty` says ("empty now",
+/// `blobs.md#retention`): a chunk nothing current references needs no copy
+/// check.
+pub fn pass_emptying(d: &Daemon, empty: Empty, dry_run: bool) -> anyhow::Result<Freed> {
     let c = &d.cleanup;
     let _one_at_a_time = lock(&c.running);
     // From finding what is current to deleting, no commit runs.
     let (mut freed, evict, excess, live) =
-        crate::fs::commit::without_commits(|| pass_now(d, now_all, dry_run))?;
+        crate::fs::commit::without_commits(|| pass_now(d, empty, dry_run))?;
     let (mut files, mut kept_bytes, mut unasked) = (0u64, 0u64, false);
     if !evict.is_empty() {
         let (objects, bytes, kept) = evict_checked(d, &evict, excess, dry_run);
@@ -693,7 +702,84 @@ fn evict_checked(d: &Daemon, evict: &[(Id, u64)], excess: u64, dry_run: bool) ->
 
 type Passed = (Freed, Vec<(Id, u64)>, u64, Vec<BlobRef>);
 
-fn pass_now(d: &Daemon, now_all: bool, dry_run: bool) -> anyhow::Result<Passed> {
+/// What a pass frees at once, whatever the keep period: nothing, every
+/// history-only chunk, or those of one space ("empty now").
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Empty {
+    /// Only what is past the keep period.
+    No,
+    /// Every chunk only history references, in every space.
+    All,
+    /// Those of one space.
+    Space(SpaceId),
+}
+
+/// What one space held here references (`blobs.md#retention`).
+pub struct SpaceBlobs {
+    /// The space.
+    pub space: SpaceId,
+    /// What its current state references.
+    pub live: Vec<BlobRef>,
+    /// Every blob its history names, current or not, by top id.
+    pub known: HashMap<Id, BlobRef>,
+}
+
+/// Every blob reference the applied entries of a space give a node's
+/// field, in a `create` or a `set`, at any depth ([`refs_in`]): what its
+/// nodes have held, current or not. That needs no knowledge of a profile,
+/// as current state needs none (`blobs.md#retention`). A reference held
+/// anywhere else, such as a successor's initial state, is never an old
+/// version, and is never freed as one.
+pub fn history_blobs(sp: &Space) -> HashMap<Id, BlobRef> {
+    let mut refs = HashSet::new();
+    for id in sp.state().applied() {
+        let Some(e) = sp.entry(id) else { continue };
+        for op in e.ops() {
+            match op.body() {
+                SpaceOpBody::Create { fields, .. } => {
+                    fields.iter().for_each(|(_, x)| refs_in(x, &mut refs))
+                }
+                SpaceOpBody::Set { value: Some(v), .. } => refs_in(v, &mut refs),
+                _ => {}
+            }
+        }
+    }
+    let mut out: HashMap<Id, BlobRef> = refs.into_iter().map(|b| (b.id, b)).collect();
+    for (id, b) in known_blobs(sp) {
+        out.entry(id).or_insert(b);
+    }
+    out
+}
+
+/// [`SpaceBlobs`] of every space open here.
+pub fn space_blobs(core: &crate::core::Core) -> Vec<SpaceBlobs> {
+    let mut out = Vec::new();
+    for (id, h) in &core.spaces {
+        let Some(sp) = h.space.as_ref() else { continue };
+        out.push(SpaceBlobs {
+            space: *id,
+            live: crate::fetch::current_refs(sp),
+            known: history_blobs(sp),
+        });
+    }
+    out
+}
+
+/// What current state references in any space open here, each blob once.
+pub fn all_live(spaces: &[SpaceBlobs]) -> Vec<BlobRef> {
+    let mut seen = HashSet::new();
+    let mut out = Vec::new();
+    for s in spaces {
+        for b in &s.live {
+            if seen.insert(b.id) {
+                out.push(*b);
+            }
+        }
+    }
+    out
+}
+
+fn pass_now(d: &Daemon, empty: Empty, dry_run: bool) -> anyhow::Result<Passed> {
     let c = &d.cleanup;
     let (keep, on_demand, pins, budget) = {
         let cfg = d.config();
@@ -704,32 +790,56 @@ fn pass_now(d: &Daemon, now_all: bool, dry_run: bool) -> anyhow::Result<Passed> 
             cfg.on_demand_budget,
         )
     };
-    let (live, known, pinned) = {
+    let (files_live, spaces, pinned) = {
         let core = d.core();
-        let Some(sp) = core
+        let files = core
             .files_id()
             .and_then(|f| core.spaces.get(&f))
-            .and_then(|h| h.space.as_ref())
-        else {
-            return Ok((Freed::default(), Vec::new(), 0, Vec::new()));
+            .and_then(|h| h.space.as_ref());
+        let (files_live, pinned) = match files {
+            Some(sp) => {
+                let current = current_blobs(sp);
+                let pinned: Vec<BlobRef> = current
+                    .iter()
+                    .filter(|(p, _)| {
+                        pins.iter()
+                            .any(|pin| p == pin || p.starts_with(&format!("{pin}/")))
+                    })
+                    .map(|(_, b)| *b)
+                    .collect();
+                // What the folder does not show is current state all the
+                // same: a file of a kind this build does not know, or one
+                // that was moved into a file. Its content is never freed as
+                // an old version.
+                (crate::fetch::current_refs(sp), pinned)
+            }
+            None => (Vec::new(), Vec::new()),
         };
-        let current = current_blobs(sp);
-        let pinned: Vec<BlobRef> = current
-            .iter()
-            .filter(|(p, _)| {
-                pins.iter()
-                    .any(|pin| p == pin || p.starts_with(&format!("{pin}/")))
-            })
-            .map(|(_, b)| *b)
-            .collect();
-        // What the folder does not show is current state all the same: a
-        // file of a kind this build does not know, or one that was moved
-        // into a file. Its content is never freed as an old version.
-        let live = crate::fetch::current_refs(sp);
-        (live, known_blobs(sp), pinned)
+        (files_live, space_blobs(&core), pinned)
     };
+    if spaces.is_empty() {
+        return Ok((Freed::default(), Vec::new(), 0, Vec::new()));
+    }
+    // A chunk only history references in one space, and that current
+    // state references in another, is current: it stays.
+    let live = all_live(&spaces);
     let now = now_ms();
     let live_ids: HashSet<Id> = live.iter().map(|b| b.id).collect();
+    let mut known: HashMap<Id, BlobRef> = HashMap::new();
+    for s in &spaces {
+        for (id, b) in &s.known {
+            known.entry(*id).or_insert(*b);
+        }
+    }
+    let now_too: HashSet<Id> = match empty {
+        Empty::No => HashSet::new(),
+        Empty::All => known.keys().copied().collect(),
+        Empty::Space(id) => spaces
+            .iter()
+            .filter(|s| s.space == id)
+            .flat_map(|s| s.known.keys().copied())
+            .collect(),
+    };
     let (old, expired): (Vec<BlobRef>, Vec<BlobRef>) = {
         let mut l = lock(&c.ledger);
         if l.update(&live_ids, &known.keys().copied().collect(), now) {
@@ -738,13 +848,14 @@ fn pass_now(d: &Daemon, now_all: bool, dry_run: bool) -> anyhow::Result<Passed> 
         known
             .values()
             .filter(|b| !live_ids.contains(&b.id))
-            .partition(|b| !now_all && l.kept(&b.id, now, keep))
+            .partition(|b| !now_too.contains(&b.id) && l.kept(&b.id, now, keep))
     };
     let wanted = Wanted {
         live: &live,
         old: &old,
         expired: &expired,
         on_demand: on_demand.then_some((&pinned[..], budget)),
+        evictable: Some(&files_live),
     };
     let store: &dyn ObjectStore = &*d.store;
     let p = plan(store, &wanted, SystemTime::now(), c.min_age)?;
@@ -792,7 +903,111 @@ fn pass_now(d: &Daemon, now_all: bool, dry_run: bool) -> anyhow::Result<Passed> 
             unasked,
         });
     }
-    Ok((freed, p.evict, p.excess, live))
+    Ok((freed, p.evict, p.excess, files_live))
+}
+
+/// What one space costs on this device (`blobs.md#what-history-costs`):
+/// the bytes of the chunks its current state references, of those only
+/// its history references (that no current state here references), and
+/// of its log, as this device holds them.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Usage {
+    /// The space.
+    pub space: SpaceId,
+    /// Chunks current state references.
+    pub live: u64,
+    /// Chunks only older versions and deleted nodes reference.
+    pub history: u64,
+    /// The sealed entries.
+    pub log: u64,
+}
+
+/// [`Usage`] of each space in `spaces`, from the objects `store` holds:
+/// each object counted once, as live where any current state here names
+/// it.
+pub fn usage(store: &dyn ObjectStore, spaces: &[SpaceBlobs]) -> io::Result<Vec<Usage>> {
+    let sizes: HashMap<Id, u64> = store.list()?.into_iter().map(|o| (o.id, o.size)).collect();
+    let bytes = |objs: &HashSet<Id>| -> u64 { objs.iter().filter_map(|id| sizes.get(id)).sum() };
+    let mut current = HashSet::new();
+    for b in all_live(spaces) {
+        held_objects(store, &b, &mut current)?;
+    }
+    let mut out = Vec::new();
+    for s in spaces {
+        let mut live = HashSet::new();
+        for b in &s.live {
+            held_objects(store, b, &mut live)?;
+        }
+        let live_ids: HashSet<Id> = s.live.iter().map(|b| b.id).collect();
+        let mut old = HashSet::new();
+        for b in s.known.values().filter(|b| !live_ids.contains(&b.id)) {
+            held_objects(store, b, &mut old)?;
+        }
+        old.retain(|id| !current.contains(id));
+        out.push(Usage {
+            space: s.space,
+            live: bytes(&live),
+            history: bytes(&old),
+            log: 0,
+        });
+    }
+    Ok(out)
+}
+
+/// `space-usage`: what each space held here costs on this device, the
+/// largest first: live, history only, and log bytes, whether this device
+/// keeps the space in full, and its retention. Blocking.
+pub fn usage_of(d: &Daemon) -> anyhow::Result<Value> {
+    let (spaces, logs, names) = {
+        let core = d.core();
+        let spaces = space_blobs(&core);
+        let mut logs = HashMap::new();
+        let mut names = HashMap::new();
+        for (id, h) in &core.spaces {
+            logs.insert(*id, crate::inspect::sealed_total(h).1 as u64);
+            let label = crate::inspect::label_of(&core, id, h.space.as_ref());
+            names.insert(*id, label.unwrap_or_default());
+        }
+        (spaces, logs, names)
+    };
+    let mut used = usage(&*d.store, &spaces)?;
+    // a space that cannot be opened here holds its log all the same
+    for (id, log) in &logs {
+        match used.iter_mut().find(|u| u.space == *id) {
+            Some(u) => u.log = *log,
+            None => used.push(Usage {
+                space: *id,
+                log: *log,
+                ..Usage::default()
+            }),
+        }
+    }
+    used.sort_by_key(|u| std::cmp::Reverse(u.live + u.history + u.log));
+    let cfg = d.config();
+    let keep = Keep::parse(&cfg.keep_old).unwrap_or(Keep::Days(30));
+    let (retention, days) = match (cfg.on_demand(), keep) {
+        (true, _) => ("on-demand", None),
+        (false, Keep::Forever) => ("history", None),
+        (false, Keep::Days(0)) => ("full", None),
+        (false, Keep::Days(n)) => ("history-days", Some(n)),
+    };
+    let full = !cfg.on_demand();
+    let list: Vec<Value> = used
+        .iter()
+        .map(|u| {
+            json!({
+                "space": hex::encode(u.space),
+                "name": names.get(&u.space).cloned().unwrap_or_default(),
+                "live_bytes": u.live,
+                "history_bytes": u.history,
+                "log_bytes": u.log,
+                "full": full,
+                "retention": retention,
+                "history_days": days,
+            })
+        })
+        .collect();
+    Ok(json!({ "spaces": list }))
 }
 
 /// Starts the hourly pass (`CARDINAL_TEST_FREE_INTERVAL_MS` for tests),
@@ -994,6 +1209,7 @@ mod tests {
             old: &[recent],
             expired: &[expired, shared],
             on_demand: None,
+            evictable: None,
         };
         let p = plan(&store, &wanted, later, Duration::from_secs(3600)).unwrap();
         let held = |b: &BlobRef| {
@@ -1021,6 +1237,68 @@ mod tests {
         .unwrap();
         assert!(p.delete.is_empty());
         assert!(p.old_bytes > 0);
+    }
+
+    /// What history costs (D85): a space's chunks are live where its
+    /// current state names them, history only where only older versions
+    /// name them and no current state here does, and counted for what is
+    /// held alone.
+    #[test]
+    fn usage_counts_live_and_history_only_for_what_is_held() {
+        let store = MemStore::new();
+        let secret = ConvergenceSecret::from_epoch_key(&[7u8; 32]);
+        let cur = encode_bytes(&data(1 << 20, 1), &secret, &store).unwrap();
+        let old = encode_bytes(&data(1 << 20, 2), &secret, &store).unwrap();
+        // shares most of its chunks with the current file: those are live
+        let mut v = data(1 << 20, 1);
+        v.extend_from_slice(&data(256 << 10, 3));
+        let shared = encode_bytes(&v, &secret, &store).unwrap();
+        // current in another space: live, never history
+        let other = encode_bytes(&data(512 << 10, 4), &secret, &store).unwrap();
+        // named by history, not held here: counts for nothing
+        let away = encode_bytes(&data(512 << 10, 5), &secret, MemStore::new()).unwrap();
+        let known = |bs: &[BlobRef]| bs.iter().map(|b| (b.id, *b)).collect();
+        let spaces = [
+            SpaceBlobs {
+                space: [1; 32],
+                live: vec![cur],
+                known: known(&[cur, old, shared, other, away]),
+            },
+            SpaceBlobs {
+                space: [2; 32],
+                live: vec![other],
+                known: known(&[other]),
+            },
+        ];
+        let held = |bs: &[BlobRef]| {
+            let mut o = HashSet::new();
+            for b in bs {
+                held_objects(&store, b, &mut o).unwrap();
+            }
+            o
+        };
+        let size = |o: &HashSet<Id>| -> u64 {
+            store
+                .list()
+                .unwrap()
+                .iter()
+                .filter(|x| o.contains(&x.id))
+                .map(|x| x.size)
+                .sum()
+        };
+        let u = usage(&store, &spaces).unwrap();
+        let live = held(&[cur]);
+        let mut hist = held(&[old, shared]);
+        hist.retain(|id| !live.contains(id));
+        assert_eq!(u[0].live, size(&live));
+        assert_eq!(u[0].history, size(&hist));
+        assert!(u[0].history > 1 << 20 && u[0].history < (1 << 20) + (512 << 10));
+        assert_eq!(u[1].live, size(&held(&[other])));
+        assert_eq!(u[1].history, 0);
+        // the log is the caller's to count
+        assert_eq!(u[0].log, 0);
+        // all that is current, each blob once
+        assert_eq!(all_live(&spaces).len(), 2);
     }
 
     #[test]
@@ -1059,6 +1337,7 @@ mod tests {
             old: &[],
             expired: &[],
             on_demand: Some((&[pinned], 512 << 10)),
+            evictable: None,
         };
         let p = plan(&store, &wanted, later, Duration::from_secs(3600)).unwrap();
         let mut pin_o = HashSet::new();

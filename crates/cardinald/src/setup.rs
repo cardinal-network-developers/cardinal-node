@@ -173,19 +173,29 @@ pub(crate) fn create_spaces(
     Ok(())
 }
 
-/// The retention policy a configuration asks for: full with old
-/// versions kept forever is history (`blobs.md#retention`).
+/// The retention policy a configuration asks for (`blobs.md#retention`):
+/// full with old versions kept forever is history, kept for some days is
+/// history for that many days, and kept for none is full.
 pub fn retention(config: &Config) -> Retention {
+    use crate::cleanup::Keep;
     if config.on_demand() {
-        Retention::OnDemand
-    } else if matches!(
-        crate::cleanup::Keep::parse(&config.keep_old),
-        Ok(crate::cleanup::Keep::Forever)
-    ) {
-        Retention::History
-    } else {
-        Retention::Full
+        return Retention::OnDemand;
     }
+    match Keep::parse(&config.keep_old) {
+        Ok(Keep::Forever) => Retention::History,
+        Ok(Keep::Days(0)) => Retention::Full,
+        _ => Retention::HistoryFor,
+    }
+}
+
+/// Under history for a number of days, how many: what `keep_old` says, 30
+/// where it says nothing this build reads.
+pub fn history_days(config: &Config) -> Option<u64> {
+    use crate::cleanup::Keep;
+    (retention(config) == Retention::HistoryFor).then(|| match Keep::parse(&config.keep_old) {
+        Ok(Keep::Days(n)) => n,
+        _ => 30,
+    })
 }
 
 /// The placement of the files space on this device.
@@ -195,6 +205,7 @@ pub fn placement_op(
     config: &Config,
 ) -> cardinal_space::SpaceOp {
     let retention = retention(config);
+    let days = history_days(config);
     let path = config.mount.as_ref().map(|p| p.display().to_string());
-    account::create_placement(space_node, device, retention, path.as_deref(), false)
+    account::create_placement_keeping(space_node, device, retention, days, path.as_deref(), false)
 }

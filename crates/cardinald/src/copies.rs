@@ -49,7 +49,7 @@ use std::time::Duration;
 use cardinal_blob::{decrypt, BlobRef, FsStore, Index, ObjectStore};
 use cardinal_identity::KeyId;
 use cardinal_link::Priority;
-use cardinal_space::account::{self, Retention};
+use cardinal_space::account;
 use cardinal_space::SpaceId;
 use cardinal_sync::{BlobItem, BlobReply};
 use serde::{Deserialize, Serialize};
@@ -714,7 +714,7 @@ fn plan(d: &Daemon) -> Option<Plan> {
         .filter(|r| r.space == files)
     {
         for p in rec.placements {
-            if p.device == me || !matches!(p.retention, Retention::Full | Retention::History) {
+            if p.device == me || !p.retention.keeps_all_current() {
                 continue;
             }
             let Some(x) = st

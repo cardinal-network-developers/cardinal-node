@@ -331,6 +331,10 @@ rec!(INVITATION "invitation":
     1 "cancelled" BOOL, 2 "expired" BOOL, 3 "hosts_only" BOOL, 4 "id" B, 5 "made" U,
     6 "name" T, 7 "outstanding" BOOL, 8 "used" U, 9 "uses" U);
 rec!(LAST "last message": 1 "from" T, 2 "mine" BOOL, 3 "text" T, 4 "time" U);
+rec!(KEPT_CHANGE "kept change":
+    1 "at" U, 2 "by" T, 3 "can_undo" BOOL, 4 "device" T, 5 "group" B, 6 "handed_to" T,
+    7 "name" T, 8 "roles" [ROLE_CHANGE], 9 "taken_out" [T], 10 "to" B, 11 "undo" T,
+    12 "undone" B);
 rec!(LOST_DEVICE "lost device": 1 "key" B, 2 "name" T, 3 "set_aside" U);
 rec!(MEMBER "member":
     1 "contact" BOOL, 2 "id" B, 3 "introduce" BOOL, 4 "left" BOOL, 5 "name" T, 6 "own" BOOL,
@@ -373,6 +377,9 @@ rec!(SESSION_DEVICE "contact's device":
     11 "packets_dropped" U, 12 "packets_lost" U, 13 "route" T, 14 "rtt_ms" U,
     15 "they_see_you_at" T, 16 "through" T, 17 "unreadable" {UNREADABLE});
 rec!(SET_ASIDE "set aside": 1 "entry" B, 2 "space" B, 3 "time_ms" U);
+rec!(SPACE_USAGE "space usage":
+    1 "full" BOOL, 2 "history_bytes" U, 3 "history_days" U, 4 "live_bytes" U, 5 "log_bytes" U,
+    6 "name" T, 7 "retention" T, 8 "space" B);
 rec!(SPACE "space": 1 "entries" U, 2 "id" B, 3 "kind" T, 4 "set_aside" U, 5 "valid" U);
 rec!(STEP "step": 1 "at" U, 2 "ok" BOOL, 3 "text" T);
 rec!(SUCCESSION "succession": 1 "id" T, 2 "space" T);
@@ -601,6 +608,9 @@ pub static REQUESTS: &[Request] = &[
     req!(139 "free-space" (1 "dry_run" BOOL, 2 "unnamed" BOOL, 3 "delete" BOOL) -> (
         2 "bytes" U, 3 "deleted" BOOL, 4 "left" U, 5 "objects" U, 6 "only_here" {ONLY_HERE},
         7 "unchecked" BOOL, 8 "unsure" [T])),
+    paged!(after 140 "space-usage" (1 "after" U, 2 "limit" U) -> (
+        2 "spaces" [SPACE_USAGE], 3 "more" BOOL, 4 "next" U)),
+    req!(141 "history-empty" (1 "space" REF) -> (2 "bytes" U, 3 "left" U, 4 "objects" U)),
     // ---- Guardians and recovery: 150 to 179 ----
     req!(150 "guardians" () -> (
         2 "asked" [T], 3 "changes" [GUARDIAN_CHANGE], 4 "copy_full" [T], 5 "data" BOOL,
@@ -624,7 +634,7 @@ pub static REQUESTS: &[Request] = &[
         7 "held" U, 8 "helper" BOOL, 9 "identity" B, 10 "in_effect" BOOL, 11 "lost_at" U,
         12 "lost_devices" [LOST_DEVICE], 13 "pair_again" [PAIR_AGAIN], 14 "proposed" U,
         15 "successions" (gone [SUCCESSION]), 16 "threshold" U, 17 "under_way" BOOL,
-        18 "finished" BOOL, 19 "words" T)),
+        18 "finished" BOOL, 19 "words" T, 20 "kept_changes" [KEPT_CHANGE])),
     req!(163 "recover-start" (1 "code" T, 2 "identity" REF) -> (
         2 "fingerprint" T, 3 "identity" B)),
     req!(164 "recover-invite" (1 "at" T) -> (2 "code" T, 3 "fingerprint" T)),
@@ -639,6 +649,8 @@ pub static REQUESTS: &[Request] = &[
     req!(170 "recovery-check" (1 "words" T) -> ()),
     req!(171 "recovery-sheet" () -> (2 "hosts" [HOST])),
     req!(172 "restore-from-host" (1 "words" T, 2 "at" T, 3 "key" (gone T), 4 "key" B) -> (2 "at" T)),
+    req!(173 "recover-undo" (1 "to" B) -> (2 "group" B, 3 "kept_changes" [KEPT_CHANGE])),
+    req!(174 "recover-kept-seen" (1 "to" [B]) -> (2 "kept_changes" [KEPT_CHANGE])),
     // ---- Networks, hosts and peers: 180 to 199 ----
     req!(180 "router" (1 "on" BOOL, 2 "this_device" BOOL) -> (
         2 "error" T, 3 "everywhere" BOOL, 4 "external" T, 5 "named" [T], 6 "network" {NETWORK},

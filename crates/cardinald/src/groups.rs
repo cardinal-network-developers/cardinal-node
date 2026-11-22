@@ -673,6 +673,75 @@ fn change_json(
     })
 }
 
+/// A group change kept after a recovery by guardians (D84): another of
+/// the person's old devices made it and one confirmed it before the loss,
+/// so it stands, and the recovered device lists it for the person to undo
+/// if they do not recognise it. `group`, the group it left, and `to`, the
+/// one it moved to (what `recover-undo` takes); who and which device, when,
+/// what it changed, who it was handed on to if it was, whether undo can
+/// put it right and what undo does, in words, and `undone`, the group an
+/// undo made.
+pub(crate) fn kept_change_json(
+    core: &Core,
+    old: &SpaceId,
+    new: &SpaceId,
+    undone: Option<&str>,
+) -> Option<Json> {
+    let me = core.me()?;
+    let contacts = core.contacts();
+    let sp = core.spaces.get(new)?.space.as_ref()?;
+    let mut all = named_in(sp);
+    if let Some(o) = core.spaces.get(old).and_then(|h| h.space.as_ref()) {
+        all.extend(named_in(o));
+    }
+    let mut c = change_json(core, &me, &contacts, &all, new);
+    let name = |w: &[u8; 32]| name_of(&me, &contacts, &all, w);
+    let group_name = group::name(sp);
+    let handed = sp.owner().filter(|o| *o != me).map(|o| name(&o));
+    let undo = match &handed {
+        Some(h) => format!(
+            "Undo cannot take {group_name} back: it was handed on to {h}, who holds it now. \
+             Only they can hand it back."
+        ),
+        None => {
+            let mut parts = Vec::new();
+            let out: Vec<String> = c["taken_out"]
+                .as_array()
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|x| x.as_str().map(str::to_owned))
+                        .collect()
+                })
+                .unwrap_or_default();
+            if !out.is_empty() {
+                parts.push(format!("adds back {}", out.join(", ")));
+            }
+            for r in c["roles"].as_array().into_iter().flatten() {
+                parts.push(format!(
+                    "gives {} back the role of {}",
+                    r["name"].as_str().unwrap_or("Someone"),
+                    r["from"].as_str().unwrap_or("member")
+                ));
+            }
+            format!(
+                "Undo moves {group_name} on again: it {}.",
+                parts.join(", and ")
+            )
+        }
+    };
+    c["group"] = json!(hex::encode(old));
+    c["to"] = json!(hex::encode(new));
+    c["name"] = json!(group_name);
+    c["by"] = json!(name(&sp.creator()));
+    c["at"] = json!(sp.entry(new).and_then(|g| g.time()));
+    c["device"] = json!(core.moved_by_device(new));
+    c["handed_to"] = json!(handed);
+    c["can_undo"] = json!(handed.is_none());
+    c["undo"] = json!(undo);
+    c["undone"] = json!(undone);
+    Some(c)
+}
+
 /// How long the note of how a group moved stays, unless cleared first.
 const MOVED_FOR_MS: u64 = 7 * 24 * 3600 * 1000;
 

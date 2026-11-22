@@ -316,6 +316,23 @@ fn formats(req: &Value) -> anyhow::Result<Option<Vec<crate::calls::Format>>> {
         .map(Some)
 }
 
+/// A space held here, by its id in hex or the start of it.
+fn space_held(d: &Daemon, s: &str) -> anyhow::Result<cardinal_space::SpaceId> {
+    let s = crate::api::id_hex(s).trim().to_ascii_lowercase();
+    let core = d.core();
+    let found: Vec<cardinal_space::SpaceId> = core
+        .spaces
+        .keys()
+        .filter(|id| hex::encode(id).starts_with(&s))
+        .copied()
+        .collect();
+    match found[..] {
+        [one] if !s.is_empty() => Ok(one),
+        [] => anyhow::bail!("no space held here has the id {s}"),
+        _ => anyhow::bail!("more than one space held here starts with {s}: give more of its id"),
+    }
+}
+
 fn arg<'a>(req: &'a Value, name: &str) -> anyhow::Result<&'a str> {
     req.get(name)
         .and_then(|v| v.as_str())
@@ -781,6 +798,8 @@ async fn handle(d: &Arc<Daemon>, req: &Value) -> anyhow::Result<Value> {
             crate::recovering::set_lost_at(d, req.get("lost_at").and_then(Value::as_u64))
         }
         "recover-cancel" => crate::recovering::cancel(d).await,
+        "recover-undo" => crate::recovering::undo_kept(d, arg(req, "to")?).await,
+        "recover-kept-seen" => crate::recovering::kept_seen(d, &strings(req, "to")),
         "recover-finish" => {
             let without = req.get("without_account").and_then(Value::as_bool) == Some(true);
             let lost_at = req.get("lost_at").and_then(Value::as_u64);
@@ -914,6 +933,22 @@ async fn handle(d: &Arc<Daemon>, req: &Value) -> anyhow::Result<Value> {
                 "only_here": crate::cleanup::status(d)["only_here"],
                 "unchecked": crate::cleanup::status(d)["unchecked"],
             }))
+        }
+        "space-usage" => {
+            let d2 = d.clone();
+            tokio::task::spawn_blocking(move || crate::cleanup::usage_of(&d2)).await?
+        }
+        "history-empty" => {
+            let empty = match req.get("space").and_then(Value::as_str) {
+                None | Some("") => crate::cleanup::Empty::All,
+                Some(s) => crate::cleanup::Empty::Space(space_held(d, s)?),
+            };
+            let d2 = d.clone();
+            let f = tokio::task::spawn_blocking(move || {
+                crate::cleanup::pass_emptying(&d2, empty, false)
+            })
+            .await??;
+            Ok(json!({"objects": f.objects, "bytes": f.bytes, "left": f.left}))
         }
         "keep-old" => {
             let keep = crate::cleanup::Keep::parse(arg(req, "keep")?)?;

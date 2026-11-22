@@ -469,6 +469,33 @@ fn guardians_give_an_identity_back() {
     assert!(!devices.contains(&nuc_key), "{devices}");
     // and `recover` still lists them, to pair again
     assert!(new.cli(&["recover"]).contains(&nuc_key));
+    // No group change was confirmed before the loss: none is listed to
+    // undo (D84), and one that is not listed cannot be undone or dismissed.
+    let r = ask(&new, serde_json::json!({"cmd": "recover"}));
+    assert_eq!(r["kept_changes"], serde_json::json!([]), "{r}");
+    let fake = "ab".repeat(32);
+    let o = reply(
+        &new,
+        &serde_json::json!({"cmd": "recover-undo", "to": fake}),
+    );
+    assert_eq!(o["ok"], false, "{o}");
+    assert!(
+        o["error"]
+            .as_str()
+            .unwrap()
+            .contains("not a change your old devices"),
+        "{o}"
+    );
+    let o = reply(
+        &new,
+        &serde_json::json!({"cmd": "recover-kept-seen", "to": [fake]}),
+    );
+    assert_eq!(o["ok"], false, "{o}");
+    let o = ask(
+        &new,
+        serde_json::json!({"cmd": "recover-kept-seen", "to": []}),
+    );
+    assert_eq!(o["kept_changes"], serde_json::json!([]), "{o}");
     // The new words are the identity's: the old ones are not.
     let o = new.cli_input(&["recovery", "check"], &words);
     assert!(!o.status.success(), "{}", out(&o));

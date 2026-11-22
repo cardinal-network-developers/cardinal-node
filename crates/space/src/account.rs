@@ -147,7 +147,15 @@ pub enum Retention {
     OnDemand = 1,
     /// Also keep chunks referenced only by older versions.
     History = 2,
+    /// Also keep chunks referenced only by older versions and deleted
+    /// nodes, for the number of days field 5 of the placement gives
+    /// ([`PLACEMENT_DAYS`]), from when this device first saw each stop
+    /// being current.
+    HistoryFor = 3,
 }
+
+/// A placement's field: under retention 3, how many days history is kept.
+pub const PLACEMENT_DAYS: u64 = 5;
 
 impl Retention {
     fn from_u64(v: u64) -> Option<Retention> {
@@ -155,8 +163,15 @@ impl Retention {
             0 => Retention::Full,
             1 => Retention::OnDemand,
             2 => Retention::History,
+            3 => Retention::HistoryFor,
             _ => return None,
         })
+    }
+
+    /// Whether a device with this retention keeps every chunk current
+    /// state references: a full holder (`blobs.md#retention`).
+    pub fn keeps_all_current(self) -> bool {
+        !matches!(self, Retention::OnDemand)
     }
 }
 
@@ -546,6 +561,19 @@ pub fn create_placement(
     path: Option<&str>,
     light: bool,
 ) -> SpaceOp {
+    create_placement_keeping(space_node, device, retention, None, path, light)
+}
+
+/// [`create_placement`], with the days history is kept under
+/// [`Retention::HistoryFor`] (field 5).
+pub fn create_placement_keeping(
+    space_node: NodeId,
+    device: &KeyId,
+    retention: Retention,
+    days: Option<u64>,
+    path: Option<&str>,
+    light: bool,
+) -> SpaceOp {
     SpaceOp::create(
         NodeKind::Uint(PLACEMENT),
         space_node,
@@ -554,7 +582,8 @@ pub fn create_placement(
             .with(1, *device)
             .with(2, retention as u32)
             .with_opt(3, path)
-            .with(4, light),
+            .with(4, light)
+            .with_opt(PLACEMENT_DAYS, days),
     )
 }
 
@@ -739,6 +768,9 @@ pub struct PlacementRecord {
     pub device: KeyId,
     /// Retention.
     pub retention: Retention,
+    /// Under [`Retention::HistoryFor`], the days history is kept; `None`
+    /// under any other.
+    pub days: Option<u64>,
     /// Where the device shows the space.
     pub path: Option<String>,
     /// Whether the device is a light holder.
@@ -1041,10 +1073,18 @@ pub fn spaces(state: &State) -> Vec<SpaceRecord> {
                 .into_iter()
                 .filter(|p| p.kind == NodeKind::Uint(PLACEMENT) && !p.deleted)
                 .filter_map(|p| {
+                    let retention = Retention::from_u64(last(p, 2)?.as_uint()?)?;
+                    // history for a number of days says how many, or is
+                    // malformed, and no placement
+                    let days = match retention {
+                        Retention::HistoryFor => Some(last(p, PLACEMENT_DAYS)?.as_uint()?),
+                        _ => None,
+                    };
                     Some(PlacementRecord {
                         node: p.id,
                         device: last(p, 1)?.as_bytes()?.try_into().ok()?,
-                        retention: Retention::from_u64(last(p, 2)?.as_uint()?)?,
+                        retention,
+                        days,
                         path: last(p, 3).and_then(|v| v.as_text()).map(str::to_owned),
                         light: last(p, 4).and_then(|v| v.as_bool()).unwrap_or(false),
                     })

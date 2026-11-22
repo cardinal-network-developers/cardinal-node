@@ -511,7 +511,7 @@ fn weigh(sealed_bytes: &[u8], sp: Option<&Space>, e: Option<&SpaceEntry>) -> Jso
 }
 
 /// What this person calls a space, where anything says.
-fn label_of(core: &Core, id: &SpaceId, sp: Option<&Space>) -> Option<String> {
+pub(crate) fn label_of(core: &Core, id: &SpaceId, sp: Option<&Space>) -> Option<String> {
     let acc = core.account().and_then(|h| h.space.as_ref());
     if core.account_id() == Some(*id) {
         return Some("account".into());
@@ -542,7 +542,7 @@ fn label_of(core: &Core, id: &SpaceId, sp: Option<&Space>) -> Option<String> {
         .map(str::to_owned)
 }
 
-fn sealed_total(hd: &Holder) -> (usize, usize) {
+pub(crate) fn sealed_total(hd: &Holder) -> (usize, usize) {
     let mut n = 0;
     let mut bytes = 0;
     for sid in hd.set.iter() {

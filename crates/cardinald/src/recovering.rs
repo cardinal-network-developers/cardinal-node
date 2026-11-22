@@ -100,6 +100,14 @@ struct Recovered {
     /// the person lets go of since stays gone.
     #[serde(default)]
     got: Vec<String>,
+    /// The kept group changes (D84) the person dismissed, each by the
+    /// group it moved to (hex): no longer listed.
+    #[serde(default)]
+    kept_seen: Vec<String>,
+    /// The kept group changes the person undid, each by the group it moved
+    /// to (hex), with the group the undo made.
+    #[serde(default)]
+    undone: BTreeMap<String, String>,
 }
 
 /// How long after a recovery finished what a lost device wrote is kept as
@@ -608,6 +616,7 @@ pub fn status(d: &Arc<Daemon>) -> anyhow::Result<Json> {
             // as the spaces arrive, after the finish
             "lost_devices": lost_json(d),
             "lost_at": r.lost_at,
+            "kept_changes": kept_json(d, &r),
         }));
     };
     // `finish` made this device the person's but did not get to the end, as
@@ -1078,6 +1087,81 @@ pub fn set_lost_at(d: &Arc<Daemon>, lost_at: Option<u64>) -> anyhow::Result<Json
         .ok_or_else(|| anyhow::anyhow!("no recovery took place here"))?;
     tend_recovered(d);
     Ok(json!({"lost_devices": lost_json(d)}))
+}
+
+/// The group changes kept after the recovery (D84) that the person has not
+/// dismissed: "These changes were confirmed by your old devices before you
+/// lost them. Undo any you don't recognise."
+fn kept_json(d: &Daemon, r: &Recovered) -> Vec<Json> {
+    if r.forgotten.is_empty() {
+        return Vec::new();
+    }
+    let core = d.core();
+    core.kept_after_recovery(&r.keys())
+        .into_iter()
+        .filter(|(_, new)| !r.kept_seen.contains(&hex::encode(new)))
+        .filter_map(|(old, new)| {
+            let undone = r.undone.get(&hex::encode(new)).map(String::as_str);
+            crate::groups::kept_change_json(&core, &old, &new, undone)
+        })
+        .collect()
+}
+
+/// The group change kept after the recovery that moved a group to `to`
+/// (hex), as [`kept_json`] lists it, whether dismissed or not.
+fn kept_change(d: &Daemon, r: &Recovered, to: &str) -> anyhow::Result<SpaceId> {
+    let to: SpaceId = hex::decode(to.trim())
+        .ok()
+        .and_then(|b| b.try_into().ok())
+        .ok_or_else(|| {
+            anyhow::anyhow!("a kept change is named by the group it moved to, in hex")
+        })?;
+    let kept = d.core().kept_after_recovery(&r.keys());
+    anyhow::ensure!(
+        kept.iter().any(|(_, new)| *new == to),
+        "that is not a change your old devices confirmed before the recovery"
+    );
+    Ok(to)
+}
+
+/// `recover-undo`: the person undoes a group change kept after the
+/// recovery (D84), as its owner: a removal by moving the group on again
+/// with whoever it dropped added back, a role change by giving the role
+/// before back. A group handed on cannot be taken back: its new owner holds
+/// it. Nothing is asked of anyone, and the change stays listed, undone,
+/// until the person dismisses it.
+pub async fn undo_kept(d: &Arc<Daemon>, to: &str) -> anyhow::Result<Json> {
+    let r = load_recovered(d).ok_or_else(|| anyhow::anyhow!("no recovery took place here"))?;
+    let to = kept_change(d, &r, to)?;
+    let undo = d.core().undo_of(&to)?;
+    let done = crate::following::succeed(d, &to, |sp| crate::core::undo_named(sp, &undo)).await?;
+    update_recovered(d, |r| {
+        r.undone.insert(hex::encode(to), hex::encode(done.new));
+    });
+    d.bump();
+    let r = load_recovered(d).unwrap_or_default();
+    Ok(json!({"group": hex::encode(done.new), "kept_changes": kept_json(d, &r)}))
+}
+
+/// `recover-kept-seen`: the person dismissed the kept group changes `to`
+/// names (each by the group it moved to): they are no longer listed. One
+/// they were not shown, which came after, stays.
+pub fn kept_seen(d: &Daemon, to: &[String]) -> anyhow::Result<Json> {
+    let r = load_recovered(d).ok_or_else(|| anyhow::anyhow!("no recovery took place here"))?;
+    let mut seen = Vec::new();
+    for t in to {
+        seen.push(hex::encode(kept_change(d, &r, t)?));
+    }
+    update_recovered(d, |r| {
+        for s in seen {
+            if !r.kept_seen.contains(&s) {
+                r.kept_seen.push(s);
+            }
+        }
+    });
+    d.bump();
+    let r = load_recovered(d).unwrap_or_default();
+    Ok(json!({"kept_changes": kept_json(d, &r)}))
 }
 
 /// The devices the recovery removed, with how much of what each wrote is

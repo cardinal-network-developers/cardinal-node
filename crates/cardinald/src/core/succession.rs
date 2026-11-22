@@ -1237,3 +1237,114 @@ impl Core {
         Ok(out)
     }
 }
+
+/// What undoing a group change kept after a recovery puts right (D84):
+/// whoever it left out, each with the role they had before it, and each
+/// role it changed, as `(who, before, after)`.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Undo {
+    /// Whoever the change left out, with the role they had.
+    pub out: Vec<([u8; 32], u64)>,
+    /// Each role it changed: who, the role before, the role after.
+    pub roles: Vec<([u8; 32], u64, u64)>,
+}
+
+/// The members a successor of `sp`, the group as it stands now, names to
+/// undo `undo`: everyone in it who has not left, with their role, and
+/// back whoever the change left out who is not in it again, with the role
+/// they had, and back the role before for whoever still has the one the
+/// change gave. Refused where nothing is left to undo.
+pub fn undo_named(sp: &Space, undo: &Undo) -> anyhow::Result<Vec<([u8; 32], u64)>> {
+    let mut named: Vec<([u8; 32], u64)> = cardinal_space::group::members(sp)
+        .into_iter()
+        .filter(|m| !m.left)
+        .map(|m| (m.identity, m.role))
+        .collect();
+    let mut changed = false;
+    for (who, role) in &undo.out {
+        if !named.iter().any(|(w, _)| w == who) {
+            named.push((*who, *role));
+            changed = true;
+        }
+    }
+    for (who, before, after) in &undo.roles {
+        if let Some(m) = named.iter_mut().find(|(w, r)| w == who && r == after) {
+            m.1 = *before;
+            changed = true;
+        }
+    }
+    anyhow::ensure!(
+        changed,
+        "nothing of that change is left to undo: it is as it was"
+    );
+    Ok(named)
+}
+
+impl Core {
+    /// The group changes another of this person's devices made, signed by
+    /// one of `keys` (the keys a recovery by guardians removed), that
+    /// stand because this device wrote again a `keep` of them from before
+    /// the loss (D84, [`Core::keep_earlier_keeps`]): each as `(old, new)`,
+    /// the group it left and the one it moved to, in the order of the old
+    /// groups' ids. A thief holding two of the devices could have made one
+    /// and confirmed it on the other, so the person is shown each, to undo.
+    pub fn kept_after_recovery(&self, keys: &[KeyId]) -> Vec<(SpaceId, SpaceId)> {
+        let Some(me) = self.me() else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        for (id, h) in &self.spaces {
+            let Some(sp) = h
+                .space
+                .as_ref()
+                .filter(|s| s.profile() == cardinal_space::group::GROUP)
+            else {
+                continue;
+            };
+            let dag = sp.dag();
+            for x in dag.log_order() {
+                let Some(e) = dag.get(x) else { continue };
+                if e.author() != me || !keys.contains(&e.signer()) {
+                    continue;
+                }
+                for o in e.ops() {
+                    let SpaceOpBody::Succeed { successor, .. } = o.body() else {
+                        continue;
+                    };
+                    if self.kept_by_me_now(id, &e.signer(), x) && !out.contains(&(*id, *successor))
+                    {
+                        out.push((*id, *successor));
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// What undoing the change that moved a group to `new` puts right
+    /// ([`Undo`]). Refused where it is not held here, or where it handed
+    /// the group on: the new owner holds it, and only they can hand it
+    /// back.
+    pub fn undo_of(&self, new: &SpaceId) -> anyhow::Result<Undo> {
+        let me = self
+            .me()
+            .ok_or_else(|| anyhow::anyhow!("this device has no identity yet"))?;
+        let sp = self.spaces.get(new).and_then(|h| h.space.as_ref());
+        let sp = sp.ok_or_else(|| anyhow::anyhow!("that group is not held here"))?;
+        let old = sp
+            .succeeds()
+            .and_then(|o| self.spaces.get(&o)?.space.as_ref());
+        let old = old.ok_or_else(|| anyhow::anyhow!("the group it moved from is not held here"))?;
+        anyhow::ensure!(
+            sp.owner() == Some(me),
+            "that group was handed on: its new owner holds it now, and only they can hand it \
+             back. Undo cannot take it back"
+        );
+        let (left_out, roles) = plan::changes(old, sp);
+        let out = left_out
+            .into_iter()
+            .map(|w| (w, old.role_of(&w).unwrap_or(cardinal_space::group::WRITER)))
+            .collect();
+        Ok(Undo { out, roles })
+    }
+}

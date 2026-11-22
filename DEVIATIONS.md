@@ -168,11 +168,10 @@ below, each under its section.
     a deleted node holds, or one beneath it, is not current, as the
     content of a deleted file is not. It is kept as an old version only
     where it is a file's content; see the next.
-  - **Not done: old values of kinds nobody knows.** What such a field
-    held before is not current and is not known to the hourly pass as an
-    old version either (`known_blobs` reads file content alone), so on a
-    device that fetched it, it stays until `cardinal clear`. It is named,
-    so `free-space --unnamed` leaves it too.
+  - **Old values of kinds nobody knows.** What such a field held before
+    is not current, and the hourly pass finds it by its shape in the
+    applied entries of any space (D85), so it is freed as an old version
+    is.
   - **Reading: a full holder.** Retention here is one setting for the
     device (`retention` in `config.toml`), not one per space.
   - A record that only looks like a reference is fetched like one, and
@@ -832,6 +831,15 @@ differs or was read:
   again, whoever followed returns to it, and the person redoes the change
   by hand if it was theirs (`core.rs`,
   `a_succession_kept_before_the_loss_stands_after_a_recovery`, both ways).
+  **Each group change so kept is listed to undo** (D84): `recover` gives
+  `kept_changes`, every succession of a group a removed key of the
+  person's signed whose `keep` this device wrote again, with what it
+  changed and what undo does, until `recover-kept-seen` dismisses it.
+  `recover-undo` moves the group on again as its owner, adding back whoever
+  it left out with the role they had and giving back each role it changed,
+  to whoever still has the one it gave. A group handed on is refused: its
+  new owner holds it. Nothing is asked or held back (`core.rs`,
+  `a_change_kept_after_a_recovery_is_listed_and_can_be_undone`).
   A contact gives a recovered device a successor by the narrow path only
   where an entry there of the person's, by a removed key, keeps its
   genesis. **What a contact gives a recovered
@@ -2075,10 +2083,17 @@ Not implemented yet (the next milestone):
     for, made beside the rotation, though they were given the key. Chose:
     the rule as written, for any valid `add_member` of a member who has
     not left; it costs one epoch.
-- **Retention: old versions for a while.** `full` keeps every chunk of
-  current state, and also the chunks of deleted files and replaced
-  versions for `keep_old` (30 days by default), so they can be restored;
-  `history` is `keep_old = forever`, and the placement records 2 then.
+- **Retention: old versions for a while** (D85). `keep_old` (30 days
+  unless set, a convention of this build) is history for that many days,
+  and the placement records 3 with the days in field 5; `forever` is
+  history, and records 2; `0` is full, and records 0. One setting for the
+  device: only the files space has a placement, and the same period holds
+  for every space held. The hourly pass, and `history-empty` ("empty
+  now", for one space or all), free what only history references in any
+  space, by references found by their shape; eviction under on demand
+  stays the files'. `space-usage` counts each space's live, history-only
+  and log bytes for what this device holds; `full` there is the device's
+  retention.
   The period counts from when this device first saw a blob stop being
   current (`old-versions.json`), not from entry times, which are other
   devices' clocks. Only objects reachable from an expired blob and from

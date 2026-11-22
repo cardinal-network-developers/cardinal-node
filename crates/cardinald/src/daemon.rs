@@ -1590,12 +1590,25 @@ impl Daemon {
             }
             Some(_) => {
                 let want = crate::setup::retention(&cfg);
-                for p in mine.iter().filter(|p| p.retention != want) {
+                let days = crate::setup::history_days(&cfg);
+                for p in mine
+                    .iter()
+                    .filter(|p| p.retention != want || p.days != days)
+                {
                     tracing::info!(
-                        "recording this device's retention ({}) in the account space",
-                        cfg.retention
+                        "recording this device's retention ({}, old versions kept {}) in the \
+                         account space",
+                        cfg.retention,
+                        cfg.keep_old
                     );
-                    ops.push(account::set_field(p.node, 2, want as u32));
+                    // the days first: a placement saying history for a
+                    // number of days without one is malformed
+                    if let Some(n) = days.filter(|n| p.days != Some(*n)) {
+                        ops.push(account::set_field(p.node, account::PLACEMENT_DAYS, n));
+                    }
+                    if p.retention != want {
+                        ops.push(account::set_field(p.node, 2, want as u32));
+                    }
                 }
             }
         }

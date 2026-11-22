@@ -22,7 +22,7 @@ use crate::paths::Paths;
 mod succession;
 #[cfg(test)]
 use succession::ops_hash;
-pub use succession::{Notes, Succeeded};
+pub use succession::{undo_named, Notes, Succeeded, Undo};
 
 /// The account-space secret holding the discovery secret.
 pub const DISCOVERY_PURPOSE: &str = "discovery";
@@ -7977,6 +7977,93 @@ mod tests {
     fn a_succession_kept_before_the_loss_stands_after_a_recovery() {
         assert_eq!(a_succession_after_a_recovery(true, false), (true, true));
         assert_eq!(a_succession_after_a_recovery(false, false), (false, false));
+    }
+
+    /// D84: after a recovery by guardians, a group change another of the
+    /// person's old devices confirmed before the loss stands, and the new
+    /// device lists it for the person to undo. Undo is the owner putting it
+    /// right: the group moves on again with Cy, whom the change dropped,
+    /// back as he was. Nothing is asked of anyone. One nothing kept is not
+    /// listed: it fell.
+    #[test]
+    fn a_change_kept_after_a_recovery_is_listed_and_can_be_undone() {
+        for confirmed in [true, false] {
+            let ([mut ana, mut bo, cy], g) = family();
+            let store = cardinal_blob::MemStore::new();
+            let mut laptop = ana.second_device();
+            bo.core.ingest_other(ana.id(), &ana.log()).unwrap();
+            laptop.takes(&g, &ana.all_of(&g));
+            let s = ana
+                .core
+                .succeed(&store, &g, &[(bo.id(), WRITER)])
+                .unwrap()
+                .new;
+            laptop.syncs(&ana, &g, &store);
+            if confirmed {
+                assert_eq!(laptop.core.keep_succession(&g).unwrap().len(), 2);
+            }
+            bo.syncs(&ana, &g, &store);
+            bo.syncs(&laptop, &g, &store);
+            bo.syncs(&laptop, &s, &store);
+            let lost = [ana.core.keys.key(), laptop.core.keys.key()];
+            // before the recovery, nothing is listed: no key is removed
+            assert!(laptop.core.kept_after_recovery(&[]).is_empty());
+            let (g1, g2) = (Person::new(), Person::new());
+            let (mut new, log) = recovered_device(&ana, [&g1, &g2]);
+            bo.core.ingest_other(ana.id(), &log).unwrap();
+            new.takes(&g, &bo.set_of(&g));
+            new.takes(&s, &bo.set_of(&s));
+            let mut written = new.core.keep_earlier_keeps(&lost).unwrap();
+            new.syncs(&bo, &g, &store);
+            if new.holds(&s) {
+                new.takes(&s, &bo.set_of(&s));
+                written.extend(new.core.keep_earlier_keeps(&lost).unwrap());
+            }
+            let kept = new.core.kept_after_recovery(&lost);
+            if !confirmed {
+                assert!(kept.is_empty(), "nothing kept it, so it fell: {kept:?}");
+                continue;
+            }
+            assert_eq!(kept, vec![(g, s)]);
+            let c = crate::groups::kept_change_json(&new.core, &g, &s, None).unwrap();
+            assert_eq!(c["taken_out"], serde_json::json!(["Cy"]), "{c}");
+            assert_eq!(c["can_undo"], true);
+            assert!(c["undo"].as_str().unwrap().contains("adds back Cy"), "{c}");
+            // the undo: Cy back, as a writer, as before
+            let undo = new.core.undo_of(&s).unwrap();
+            assert_eq!(undo.out, vec![(cy.id(), WRITER)]);
+            let now = new.core.current(&s);
+            assert_eq!(now, s);
+            let named = undo_named(new.space(&s), &undo).unwrap();
+            assert!(named.contains(&(cy.id(), WRITER)), "{named:?}");
+            assert!(named.contains(&(bo.id(), WRITER)), "{named:?}");
+            let again = new.core.succeed(&store, &s, &named).unwrap().new;
+            assert_eq!(new.space(&again).role_of(&cy.id()), Some(WRITER));
+            assert_eq!(new.space(&again).owner(), Some(ana.id()));
+            // once undone, there is nothing left to undo
+            let err = undo_named(new.space(&again), &undo).unwrap_err();
+            assert!(format!("{err}").contains("nothing of that change"), "{err}");
+            // the change is still listed, until the person dismisses it
+            assert_eq!(new.core.kept_after_recovery(&lost), vec![(g, s)]);
+            drop(written);
+        }
+    }
+
+    /// An undo of a role change gives the role before back, to whoever
+    /// still has the one the change gave, and to nobody else.
+    #[test]
+    fn undoing_a_role_change_gives_the_role_back() {
+        let ([ana, bo, cy], g) = family();
+        let sp = ana.space(&g);
+        let undo = Undo {
+            out: vec![],
+            roles: vec![(bo.id(), ADMIN, WRITER), (cy.id(), ADMIN, READER)],
+        };
+        // Bo is a writer, as the change made him: he is an admin again. Cy
+        // is not a reader now, so his role is not touched.
+        let named = undo_named(sp, &undo).unwrap();
+        assert!(named.contains(&(bo.id(), ADMIN)), "{named:?}");
+        assert!(named.contains(&(cy.id(), WRITER)), "{named:?}");
     }
 
     /// The review of 2026-11-22: an OK keeps only the moves the person

@@ -477,6 +477,38 @@ fn account_space_devices_and_placements() {
     assert_eq!(spaces.len(), 1);
     assert_eq!(spaces[0].placements.len(), 1);
     assert_eq!(spaces[0].placements[0].retention, Retention::OnDemand);
+
+    // History for a number of days says how many (field 5); one that does
+    // not is malformed, and no placement (D85).
+    acct.write(
+        &p.log,
+        &d0.signing,
+        vec![
+            account::create_placement_keeping(
+                space_node,
+                &p.devices[1].key(),
+                Retention::HistoryFor,
+                Some(30),
+                None,
+                false,
+            ),
+            account::create_placement(space_node, &[5; 32], Retention::HistoryFor, None, false),
+        ],
+        None,
+    )
+    .unwrap();
+    let spaces = account::spaces(acct.state());
+    assert_eq!(spaces[0].placements.len(), 2, "{:?}", spaces[0].placements);
+    let server = spaces[0]
+        .placements
+        .iter()
+        .find(|x| x.device == p.devices[1].key())
+        .unwrap();
+    assert_eq!(server.retention, Retention::HistoryFor);
+    assert_eq!(server.days, Some(30));
+    assert!(server.retention.keeps_all_current());
+    assert!(!Retention::OnDemand.keeps_all_current());
+    assert!(spaces[0].placements.iter().all(|x| x.device != [5; 32]));
 }
 
 #[test]
