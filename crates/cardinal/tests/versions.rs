@@ -3,6 +3,11 @@
 //!
 //! Skipped (with a message) without it, or when `/dev/fuse` or `fusermount3`
 //! is missing.
+//!
+//! 0.1.19 does not work beside 0.1.18: pairing, the sync turns and the
+//! link's reset frame all changed, so against 0.1.18 only
+//! `data_written_by_the_old_version_opens` passes. The rest hold again
+//! against 0.1.19 and later.
 
 mod common;
 
@@ -77,6 +82,26 @@ fn no_panic(d: &Dev) {
     for l in lines.filter(|l| l.contains("WARN") || l.contains("ERROR")) {
         eprintln!("{}: {l}", d.name);
     }
+}
+
+/// One device, updated on its own: what the old version wrote opens, and
+/// the new one goes on writing beside it.
+#[test]
+fn data_written_by_the_old_version_opens() {
+    let Some(old) = old_bin() else { return };
+    let root = tempfile::tempdir().unwrap();
+    let mut a = old_device(root.path(), "alpha", &old);
+    first(&mut a);
+    write(&a, "old.txt", "written by the old version");
+    update(&mut a);
+    assert_eq!(read(&a.p("old.txt")).unwrap(), "written by the old version");
+    write(&a, "new.txt", "written by the new one");
+    a.stop();
+    a.start();
+    a.wait_mounted();
+    assert_eq!(read(&a.p("old.txt")).unwrap(), "written by the old version");
+    assert_eq!(read(&a.p("new.txt")).unwrap(), "written by the new one");
+    no_panic(&a);
 }
 
 #[test]
