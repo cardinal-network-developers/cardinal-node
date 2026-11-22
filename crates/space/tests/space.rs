@@ -1063,7 +1063,9 @@ fn a_delete_of_what_is_deleted_does_nothing() {
                 }
             })
             .collect();
-        canonical.clone().with(1, cardinal_encoding::Value::List(list))
+        canonical
+            .clone()
+            .with(1, cardinal_encoding::Value::List(list))
     };
     write(&mut a, d0, vec![SpaceOp::delete(late)]);
     write(&mut a, d0, vec![SpaceOp::delete(trip)]);

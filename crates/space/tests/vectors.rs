@@ -310,7 +310,13 @@ fn successor_vector(
     let s2 = write(&mut dag, vec![SpaceOp::delete(trip)]);
     let s3 = write(
         &mut dag,
-        vec![files::create_file(trip, "d", &Content::Inline(b"d".to_vec()), 0o644, None)],
+        vec![files::create_file(
+            trip,
+            "d",
+            &Content::Inline(b"d".to_vec()),
+            0o644,
+            None,
+        )],
     );
     let d = derived_id(&s3, 0);
     let s4 = write(&mut dag, vec![SpaceOp::delete(trip)]);

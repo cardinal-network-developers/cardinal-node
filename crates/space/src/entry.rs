@@ -386,7 +386,15 @@ impl SpaceOp {
                     Some(p) => Policy::from_record(p)?,
                     None => Policy::default(),
                 },
-                protocol: r.opt_record(5)?.cloned(),
+                protocol: match r.opt_record(5)? {
+                    // written as its table says, or this is no `start`
+                    Some(p) => {
+                        cardinal_identity::Protocol::from_record(p)
+                            .map_err(|_| Error::Malformed("protocol record"))?;
+                        Some(p.clone())
+                    }
+                    None => None,
+                },
                 succession: Box::new(Succession {
                     succeeds: r.opt_bytes_n(3)?,
                     initial_state: r.opt_record(4)?.cloned(),
@@ -425,8 +433,10 @@ impl SpaceOp {
                 address: r.opt_record(3)?.cloned(),
             },
             9 => {
-                // its one field, which it must have: the protocol record
-                r.record(1)?;
+                // its one field, which it must have: the protocol record,
+                // written as its table says
+                cardinal_identity::Protocol::from_record(r.record(1)?)
+                    .map_err(|_| Error::Malformed("protocol record"))?;
                 SpaceOpBody::SetProtocol
             }
             32 => SpaceOpBody::Create {
@@ -1434,6 +1444,24 @@ mod tests {
         not_that_op(op(6), 6, "set_policy with no policy");
         not_that_op(op(9), 9, "set_protocol with no record");
         not_that_op(op(9).with(1, "a protocol"), 9, "set_protocol");
+        let named = |critical: bool| Record::new().with(1, [3u8; 32]).with(2, critical);
+        let twice = Record::new()
+            .with(1, [0u8; 32])
+            .with(2, Value::list([named(false), named(true)]));
+        not_that_op(
+            op(9).with(1, twice.clone()),
+            9,
+            "set_protocol, one extension twice",
+        );
+        not_that_op(start().with(5, twice), 1, "start, one extension twice");
+        let bare = Record::new()
+            .with(1, [0u8; 32])
+            .with(2, Value::list([[3u8; 32]]));
+        not_that_op(
+            op(9).with(1, bare),
+            9,
+            "set_protocol, an extension unmarked as a record",
+        );
         not_that_op(
             op(7).with(2, Value::list([[1u8; 32]])),
             7,
@@ -1446,7 +1474,11 @@ mod tests {
         assert!(is(add()) && is(add().with(3, who)) && is(add().with(20, "more")));
         assert!(is(succeed()) && is(succeed().with(2, Value::list([who]))));
         assert!(is(set()) && is(set().with(4, true)) && is(set().with(3, "v").with(9, 1u32)));
-        assert!(is(start()) && is(op(9).with(1, Record::new())) && is(op(4).with(1, "x")));
+        assert!(
+            is(start())
+                && is(op(9).with(1, Record::new().with(1, [0u8; 32])))
+                && is(op(4).with(1, "x"))
+        );
         // An entry is malformed, and rejected, if a parent is listed twice
         // or an item of its op list is not a record.
         let key = SigningKey::from_seed(&[7; 32]);

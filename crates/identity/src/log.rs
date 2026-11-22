@@ -649,6 +649,18 @@ impl IdentityLog {
         conv.state(refs[0])
     }
 
+    /// [`evaluate`](Self::evaluate) with no other log, as a verifier that
+    /// knows the extensions `known` judges it.
+    #[cfg(test)]
+    fn evaluate_knowing(&self, known: &[[u8; 32]]) -> IdentityState {
+        let logs: Vec<&IdentityLog> = vec![self];
+        let plan = gather(&logs);
+        let owned = plan.owned();
+        let refs = plan.refs(&owned);
+        let conv = Conversion::new(&refs);
+        conv.state_knowing(refs[0], known)
+    }
+
     /// Appends an entry signed by `author`, with the current heads as
     /// parents.
     pub fn append(
@@ -1215,9 +1227,18 @@ impl<'a> Conversion<'a> {
     }
 
     fn state(&self, log: &IdentityLog) -> IdentityState {
+        // no extensions are implemented yet
+        self.state_knowing(log, &[])
+    }
+
+    /// The state as a verifier that knows the extensions `known` judges it.
+    fn state_knowing(&self, log: &IdentityLog, known: &[[u8; 32]]) -> IdentityState {
         let w = &self.world;
         let ident = w.get_sym(&hex_encode(&log.id)).expect("identity");
-        let known = BTreeSet::new(); // no extensions are implemented yet
+        let known: BTreeSet<_> = known
+            .iter()
+            .filter_map(|k| w.get_sym(&hex_encode(k)))
+            .collect();
         let r = model::evaluate_identity(w, ident, &w.all(), Some(&known));
         let pair = |t: &[Val]| match t {
             [Val::Sym(a), Val::Sym(b)] => Some((self.id_of(*a), self.id_of(*b))),
@@ -1339,6 +1360,34 @@ impl<'a> Conversion<'a> {
     }
 }
 
+/// The mark of extension `name` for entry `e` of `log`: whether a protocol
+/// record in its causal past, or in it, marks it critical; `None` where no
+/// record declares it.
+fn extension_mark(log: &IdentityLog, e: &IdentityEntry, name: &[u8; 32]) -> Option<bool> {
+    let dag = log.dag();
+    let past = dag.ancestors_of(e.parents());
+    let records = past
+        .iter()
+        .filter_map(|x| dag.get(x))
+        .chain(std::iter::once(e))
+        .flat_map(|x| {
+            let ops = x.ops().iter().filter_map(|o| match o.body() {
+                OpBody::SetProtocol { protocol } => Some(protocol),
+                _ => None,
+            });
+            ops.chain(x.protocol())
+        });
+    let mut mark = None;
+    for p in records {
+        for (n, critical) in &p.extensions {
+            if n == name {
+                mark = Some(mark.unwrap_or(false) || *critical);
+            }
+        }
+    }
+    mark
+}
+
 fn convert(
     w: &mut World,
     log: &IdentityLog,
@@ -1418,13 +1467,18 @@ fn convert(
             }
             OpBody::Object { .. } => Op::Object,
             OpBody::SetProtocol { protocol } => Op::Protocol {
-                declares: protocol.extensions.iter().map(&mut sym).collect(),
+                declares: protocol.extensions.iter().map(|(n, _)| sym(n)).collect(),
             },
-            OpBody::Extension { name } => Op::Ext {
-                name: sym(name),
-                // whether an unknown extension is critical is said only
-                // by its document; assume it is (DEVIATIONS.md)
-                critical: true,
+            // The protocol records in its causal past, or in it, decide:
+            // critical if any marks it so, ignorable if all say ignorable,
+            // and an op nobody defined if none declares it
+            // (`evolution.md#critical-and-ignorable`).
+            OpBody::Extension { name } => match extension_mark(log, e, name) {
+                Some(critical) => Op::Ext {
+                    name: sym(name),
+                    critical,
+                },
+                None => Op::Invalid,
             },
             OpBody::Malformed => Op::Invalid,
         });
@@ -1432,7 +1486,7 @@ fn convert(
     if let Some(p) = e.protocol() {
         // the genesis protocol record declares extensions like set_protocol
         ops.push(Op::Protocol {
-            declares: p.extensions.iter().map(&mut sym).collect(),
+            declares: p.extensions.iter().map(|(n, _)| sym(n)).collect(),
         });
     }
     model::Entry {
@@ -1740,14 +1794,87 @@ mod tests {
         assert_eq!(log.state().power(&d2.key()), Some(Power::Device));
         // a new encryption key that fails the check
         let fresh = HybridKeyPair::generate();
-        let sek = IdentityOp::from_record(
-            Record::new()
-                .with(0, 3u32)
-                .with(1, bad(fresh.public_key())),
-        );
+        let sek =
+            IdentityOp::from_record(Record::new().with(0, 3u32).with(1, bad(fresh.public_key())));
         assert_eq!(sek.body(), &OpBody::Malformed);
         let e = log.append(&d1.signing, vec![sek]).unwrap();
         assert!(!log.state().is_valid(&e.id()));
+    }
+
+    /// `evolution.md#critical-and-ignorable` (designer, 2026-11-22): the
+    /// protocol record marks each extension, and the mark decides on every
+    /// device. Ignorable, its ops change no validity, for a verifier that
+    /// knows the extension as for one that does not, and any key may use
+    /// it. Critical, a device key may not use it, and a verifier that lacks
+    /// it stops at an admin's entry that does, while one that knows it
+    /// judges on; once marked critical it stays so. An extension no record
+    /// declares is an op nobody defined, and a record that names one
+    /// extension twice is malformed.
+    #[test]
+    fn the_protocol_record_marks_each_extension_and_the_mark_decides() {
+        use cardinal_encoding::Record;
+        let d1 = DeviceKeys::generate();
+        let Created { mut log, .. } =
+            IdentityLog::create_with(phrase(8), &d1, HybridKeyPair::generate()).unwrap();
+        let device = DeviceKeys::generate();
+        log.add_key(&d1.signing, &device.request(&log.id(), Power::Device), None)
+            .unwrap();
+        let (quiet, loud) = ([0x11u8; 32], [0x22u8; 32]);
+        let ext =
+            |name: [u8; 32]| IdentityOp::from_record(Record::new().with(0, name).with(1, 7u64));
+        let protocol = |exts: &[([u8; 32], bool)]| Protocol {
+            base: [0; 32],
+            extensions: exts.to_vec(),
+        };
+        // undeclared: an op nobody defined, whatever its document says
+        let e = log.append(&d1.signing, vec![ext(quiet)]).unwrap();
+        assert!(!log.state().is_valid(&e.id()));
+        let p = protocol(&[(quiet, false), (loud, true)]);
+        // the record reads back as written
+        assert_eq!(Protocol::from_record(&p.to_record()).unwrap(), p);
+        let declared = log
+            .append(&d1.signing, vec![IdentityOp::set_protocol(&p)])
+            .unwrap();
+        assert!(log.state().is_valid(&declared.id()));
+        // ignorable: a device key may use it, and nobody stops at it
+        let q = log.append(&device.signing, vec![ext(quiet)]).unwrap();
+        for known in [&[][..], &[quiet][..]] {
+            let st = log.evaluate_knowing(known);
+            assert!(st.is_valid(&q.id()) && st.stalled.is_empty(), "{known:?}");
+        }
+        // critical: not a device key's to use
+        let bad = log.append(&device.signing, vec![ext(loud)]).unwrap();
+        assert!(!log.state().is_valid(&bad.id()));
+        // an admin's entry with it is where a verifier without it stops
+        let l = log.append(&d1.signing, vec![ext(loud)]).unwrap();
+        let after = DeviceKeys::generate();
+        let added = log
+            .add_key(&d1.signing, &after.request(&log.id(), Power::Device), None)
+            .unwrap();
+        let without = log.evaluate_knowing(&[]);
+        assert_eq!(without.stalled, [l.id()]);
+        assert!(!without.is_valid(&added.id()), "what follows waits");
+        let with = log.evaluate_knowing(&[loud]);
+        assert!(with.stalled.is_empty() && with.is_valid(&added.id()));
+        // marked ignorable later, it stays critical
+        log.append(
+            &d1.signing,
+            vec![IdentityOp::set_protocol(&protocol(&[(loud, false)]))],
+        )
+        .unwrap();
+        let again = log.append(&device.signing, vec![ext(loud)]).unwrap();
+        assert!(!log.evaluate_knowing(&[loud]).is_valid(&again.id()));
+        // a record naming one extension twice
+        let twice = Record::new().with(1, [0u8; 32]).with(
+            2,
+            cardinal_encoding::Value::list([
+                Record::new().with(1, quiet),
+                Record::new().with(1, quiet).with(2, true),
+            ]),
+        );
+        assert!(Protocol::from_record(&twice).is_err());
+        let op = IdentityOp::from_record(Record::new().with(0, 10u32).with(1, twice));
+        assert_eq!(op.body(), &OpBody::Malformed);
     }
 
     #[test]

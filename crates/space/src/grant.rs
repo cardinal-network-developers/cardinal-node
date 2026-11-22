@@ -256,7 +256,10 @@ mod tests {
             ..grant()
         };
         let read = open(&zero);
-        assert_eq!((read.storage_bytes, read.retention_days), (Some(0), Some(0)));
+        assert_eq!(
+            (read.storage_bytes, read.retention_days),
+            (Some(0), Some(0))
+        );
         let some = Grant {
             storage_bytes: Some(1 << 30),
             retention_days: Some(30),

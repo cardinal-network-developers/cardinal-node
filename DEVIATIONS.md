@@ -342,13 +342,22 @@ below, each under its section.
 - **Spec ambiguity: the wrapped "encryption private key material".** Chose
   the hybrid key pair's 96-byte secret: X25519 private key then the ML-KEM
   seed `d || z` (`HybridKeyPair::secret_bytes`).
-- **Spec ambiguity: the genesis protocol record and critical extensions.**
-  "Declared first" names `set_protocol`; chose that the genesis protocol
-  record (field 5) also declares the extensions it lists.
-- **Spec ambiguity: whether an unknown extension op is critical.** Only the
-  extension's document says. A verifier that lacks the document treats it
-  as critical, and evaluates with an empty set of known extensions, so it
-  stops at valid entries that use one (`IdentityState::stalled`).
+- **The protocol record marks each extension** (designer, ASK 3 = b,
+  2026-11-22; `evolution.md#critical-and-ignorable`). Field 2 is a list of
+  `{1: name, 2: critical}`, the mark false where absent; a record that names
+  one extension twice, or an item that is not such a record, is malformed,
+  and so is the `set_protocol`, `start` or genesis that carries it. An
+  extension op is critical for its entry if a protocol record in its causal
+  past or in it (a genesis's included) marks it so, and stays critical
+  after; ignorable otherwise, on every device, one that knows the extension
+  included. Ignorable, any key may use it and it changes no validity;
+  critical, only admin and root keys, and a verifier that does not know it
+  stops at the valid entries that use it (`IdentityState::stalled`). An
+  extension op no record declares reads as an op nobody defined, so its
+  entry is invalid. Nothing here knows any extension, so every verifier
+  here lacks them all. (Before, every unknown extension was taken for
+  critical.) Tested both ways in
+  `the_protocol_record_marks_each_extension_and_the_mark_decides`.
 - **Not checked: wrap completeness.** "`set_encryption_key` MUST include a
   wrap for every device and admin key effective in the entry's causal past"
   is not a validity rule in `model/rules.md`; it is not enforced on
@@ -918,6 +927,10 @@ differs or was read:
   records, exactly as carried in sealed-entry field 4.
 - **The cited author log head** written by this implementation is the last
   entry in log order at which the signing key is in effect.
+- **Extension ops in a space are still allowed to no role**, declared or
+  not: the protocol records of a space are read as their table says (one
+  that is not written so makes its op one nobody defined), but not applied,
+  so no mark is honoured there yet.
 - **Not applied: `set_policy` and `set_protocol`.** They are judged, and the
   policy a space runs under is still the one its genesis gave it. Whether
   it is public would be the genesis's to say even if they were applied.

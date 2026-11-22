@@ -1679,7 +1679,11 @@ mod tests {
         me.core.ingest_other(who, &log).unwrap();
         me.core.ingest_space(rel, &sealed(&them)).unwrap();
         me.refresh();
-        assert_eq!(me.shown("ours.txt"), b"mine", "local changes win in the view");
+        assert_eq!(
+            me.shown("ours.txt"),
+            b"mine",
+            "local changes win in the view"
+        );
         // and this person deletes the other file, which kept its own
         // changes in the view, not having seen its edit
         me.t.remove(gone);
@@ -1691,7 +1695,11 @@ mod tests {
             "it builds on everything held"
         );
         let entry = sp.entry(&last).unwrap();
-        assert_eq!(entry.epoch(), sp.current_epoch().unwrap(), "the current epoch");
+        assert_eq!(
+            entry.epoch(),
+            sp.current_epoch().unwrap(),
+            "the current epoch"
+        );
         let written: Vec<&SpaceOpBody> = entry.ops().iter().map(|o| o.body()).collect();
         assert!(written.iter().any(|o| matches!(o,
             SpaceOpBody::Set { node: n, key: files::FILE_CONTENT, beside: true, .. } if *n == node)));
@@ -1704,14 +1712,16 @@ mod tests {
         let n = sp.state().node(&gone_node).unwrap();
         assert!(!n.deleted && n.delete_conflict, "{n:?}");
         // the mode they set and the one here stand beside each other too
-        let modes = sp.state().node(&node).unwrap().values(files::FILE_MODE).len();
+        let modes = sp
+            .state()
+            .node(&node)
+            .unwrap()
+            .values(files::FILE_MODE)
+            .len();
         assert_eq!(modes, 2);
         // the same on their device
         them.core.ingest_space(rel, &sealed(&me)).unwrap();
-        assert_eq!(
-            them.sp().state().canonical(),
-            me.sp().state().canonical()
-        );
+        assert_eq!(them.sp().state().canonical(), me.sp().state().canonical());
     }
 
     fn theirs_accepts(fx: &Fx, space: &SpaceId, entry: &EntryId) -> bool {

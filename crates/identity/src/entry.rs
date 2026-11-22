@@ -57,8 +57,10 @@ impl Power {
 pub struct Protocol {
     /// The base hash; 32 zero bytes for drafts.
     pub base: [u8; 32],
-    /// Extensions this identity uses.
-    pub extensions: Vec<[u8; 32]>,
+    /// Extensions this identity uses, each with its mark: true for
+    /// critical, false for ignorable. The mark decides on every device
+    /// (`evolution.md#critical-and-ignorable`).
+    pub extensions: Vec<([u8; 32], bool)>,
 }
 
 impl Protocol {
@@ -72,17 +74,28 @@ impl Protocol {
 
     /// The record form.
     pub fn to_record(&self) -> Record {
-        Record::new().with(1, self.base).with(
-            2,
-            Value::List(self.extensions.iter().map(|e| Value::from(*e)).collect()),
-        )
+        let item = |(name, critical): &([u8; 32], bool)| {
+            Value::Record(Record::new().with(1, *name).with(2, *critical))
+        };
+        Record::new()
+            .with(1, self.base)
+            .with(2, Value::List(self.extensions.iter().map(item).collect()))
     }
 
-    /// Reads the record form.
+    /// Reads the record form: each extension `{1: name, 2: critical}`,
+    /// the mark false where absent. A record that names one extension twice
+    /// is not written as its table says.
     pub fn from_record(r: &Record) -> Result<Protocol, Error> {
-        let mut extensions = Vec::new();
+        let mut extensions: Vec<([u8; 32], bool)> = Vec::new();
         for v in r.opt_list(2)?.unwrap_or(&[]) {
-            extensions.push(bytes32(v)?);
+            let item = v
+                .as_record()
+                .ok_or(Error::Malformed("an extension is a record"))?;
+            let name = bytes32(item.get(1).ok_or(Error::Malformed("extension name"))?)?;
+            if extensions.iter().any(|(n, _)| *n == name) {
+                return Err(Error::Malformed("an extension named twice"));
+            }
+            extensions.push((name, item.opt_bool(2)?.unwrap_or(false)));
         }
         Ok(Protocol {
             base: r.bytes_n(1)?,
