@@ -781,10 +781,10 @@ pub fn all_live(spaces: &[SpaceBlobs]) -> Vec<BlobRef> {
 
 fn pass_now(d: &Daemon, empty: Empty, dry_run: bool) -> anyhow::Result<Passed> {
     let c = &d.cleanup;
-    let (keep, on_demand, pins, budget) = {
+    let (cfg, on_demand, pins, budget) = {
         let cfg = d.config();
         (
-            Keep::parse(&cfg.keep_old).unwrap_or(Keep::Days(30)),
+            cfg.clone(),
             cfg.on_demand(),
             cfg.pins.clone(),
             cfg.on_demand_budget,
@@ -826,9 +826,14 @@ fn pass_now(d: &Daemon, empty: Empty, dry_run: bool) -> anyhow::Result<Passed> {
     let now = now_ms();
     let live_ids: HashSet<Id> = live.iter().map(|b| b.id).collect();
     let mut known: HashMap<Id, BlobRef> = HashMap::new();
+    // how long each space keeps its old versions: a blob the history of
+    // several references is kept as long as any of them keeps it
+    let mut keeps: HashMap<Id, Vec<Keep>> = HashMap::new();
     for s in &spaces {
+        let keep = cfg.keep_for(&s.space);
         for (id, b) in &s.known {
             known.entry(*id).or_insert(*b);
+            keeps.entry(*id).or_default().push(keep);
         }
     }
     let now_too: HashSet<Id> = match empty {
@@ -848,7 +853,14 @@ fn pass_now(d: &Daemon, empty: Empty, dry_run: bool) -> anyhow::Result<Passed> {
         known
             .values()
             .filter(|b| !live_ids.contains(&b.id))
-            .partition(|b| !now_too.contains(&b.id) && l.kept(&b.id, now, keep))
+            .partition(|b| {
+                !now_too.contains(&b.id)
+                    && keeps
+                        .get(&b.id)
+                        .into_iter()
+                        .flatten()
+                        .any(|k| l.kept(&b.id, now, *k))
+            })
     };
     let wanted = Wanted {
         live: &live,
@@ -984,17 +996,16 @@ pub fn usage_of(d: &Daemon) -> anyhow::Result<Value> {
     }
     used.sort_by_key(|u| std::cmp::Reverse(u.live + u.history + u.log));
     let cfg = d.config();
-    let keep = Keep::parse(&cfg.keep_old).unwrap_or(Keep::Days(30));
-    let (retention, days) = match (cfg.on_demand(), keep) {
-        (true, _) => ("on-demand", None),
-        (false, Keep::Forever) => ("history", None),
-        (false, Keep::Days(0)) => ("full", None),
-        (false, Keep::Days(n)) => ("history-days", Some(n)),
-    };
     let full = !cfg.on_demand();
     let list: Vec<Value> = used
         .iter()
         .map(|u| {
+            let (retention, days) = match (cfg.on_demand(), cfg.keep_for(&u.space)) {
+                (true, _) => ("on-demand", None),
+                (false, Keep::Forever) => ("history", None),
+                (false, Keep::Days(0)) => ("full", None),
+                (false, Keep::Days(n)) => ("history-days", Some(n)),
+            };
             json!({
                 "space": hex::encode(u.space),
                 "name": names.get(&u.space).cloned().unwrap_or_default(),

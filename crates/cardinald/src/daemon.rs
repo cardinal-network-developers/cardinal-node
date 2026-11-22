@@ -1580,17 +1580,17 @@ impl Daemon {
         }
         match space_node {
             Some(node) if mine.is_empty() => {
-                ops.push(crate::setup::placement_op(node, &me, &cfg));
+                ops.push(crate::setup::placement_op(node, &files, &me, &cfg));
             }
             None => {
                 let ids =
                     self.write_and_push(&acc, vec![account::create_space(&files, "Cardinal")])?;
                 let node = created_node(&ids[0], 0);
-                ops.push(crate::setup::placement_op(node, &me, &cfg));
+                ops.push(crate::setup::placement_op(node, &files, &me, &cfg));
             }
             Some(_) => {
-                let want = crate::setup::retention(&cfg);
-                let days = crate::setup::history_days(&cfg);
+                let want = crate::setup::retention(&cfg, &files);
+                let days = crate::setup::history_days(&cfg, &files);
                 for p in mine
                     .iter()
                     .filter(|p| p.retention != want || p.days != days)

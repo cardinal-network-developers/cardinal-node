@@ -604,7 +604,7 @@ pub static REQUESTS: &[Request] = &[
     req!(135 "pin" (1 "path" T) -> (2 "on_demand" BOOL, 3 "path" T)),
     req!(136 "unpin" (1 "path" T) -> (2 "on_demand" BOOL, 3 "path" T)),
     req!(137 "retention" (1 "mode" T) -> (2 "retention" T)),
-    req!(138 "keep-old" (1 "keep" T) -> (2 "keep" T)),
+    req!(138 "keep-old" (1 "keep" T, 2 "space" REF) -> (2 "keep" T)),
     req!(139 "free-space" (1 "dry_run" BOOL, 2 "unnamed" BOOL, 3 "delete" BOOL) -> (
         2 "bytes" U, 3 "deleted" BOOL, 4 "left" U, 5 "objects" U, 6 "only_here" {ONLY_HERE},
         7 "unchecked" BOOL, 8 "unsure" [T])),

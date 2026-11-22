@@ -169,43 +169,47 @@ pub(crate) fn create_spaces(
         ],
     )?;
     let space_node = created_node(&written[0].0, 2);
-    core.write(&acc_id, vec![placement_op(space_node, &keys.key(), config)])?;
+    core.write(
+        &acc_id,
+        vec![placement_op(space_node, &files_id, &keys.key(), config)],
+    )?;
     Ok(())
 }
 
-/// The retention policy a configuration asks for (`blobs.md#retention`):
-/// full with old versions kept forever is history, kept for some days is
-/// history for that many days, and kept for none is full.
-pub fn retention(config: &Config) -> Retention {
+/// The retention policy a configuration asks for `space`
+/// (`blobs.md#retention`): full with old versions kept forever is history,
+/// kept for some days is history for that many days, and kept for none is
+/// full; how long is what was set for the space, or else for the device.
+pub fn retention(config: &Config, space: &[u8; 32]) -> Retention {
     use crate::cleanup::Keep;
     if config.on_demand() {
         return Retention::OnDemand;
     }
-    match Keep::parse(&config.keep_old) {
-        Ok(Keep::Forever) => Retention::History,
-        Ok(Keep::Days(0)) => Retention::Full,
+    match config.keep_for(space) {
+        Keep::Forever => Retention::History,
+        Keep::Days(0) => Retention::Full,
         _ => Retention::HistoryFor,
     }
 }
 
-/// Under history for a number of days, how many: what `keep_old` says, 30
-/// where it says nothing this build reads.
-pub fn history_days(config: &Config) -> Option<u64> {
+/// Under history for a number of days, how many, for `space`.
+pub fn history_days(config: &Config, space: &[u8; 32]) -> Option<u64> {
     use crate::cleanup::Keep;
-    (retention(config) == Retention::HistoryFor).then(|| match Keep::parse(&config.keep_old) {
-        Ok(Keep::Days(n)) => n,
-        _ => 30,
+    (retention(config, space) == Retention::HistoryFor).then(|| match config.keep_for(space) {
+        Keep::Days(n) => n,
+        Keep::Forever => 30,
     })
 }
 
-/// The placement of the files space on this device.
+/// The placement of the files space `space` on this device.
 pub fn placement_op(
     space_node: cardinal_space::NodeId,
+    space: &[u8; 32],
     device: &[u8; 32],
     config: &Config,
 ) -> cardinal_space::SpaceOp {
-    let retention = retention(config);
-    let days = history_days(config);
+    let retention = retention(config, space);
+    let days = history_days(config, space);
     let path = config.mount.as_ref().map(|p| p.display().to_string());
     account::create_placement_keeping(space_node, device, retention, days, path.as_deref(), false)
 }

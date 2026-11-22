@@ -244,4 +244,49 @@ fn history_is_counted_and_emptied_at_once() {
         &serde_json::json!({"cmd": "history-empty", "space": "zz"}),
     );
     assert_eq!(r["ok"], false, "{r}");
+
+    // One space's period in place of the device's: history kept forever,
+    // but none of the files space's old versions kept.
+    a.cli(&["keep-old", "forever"]);
+    std::fs::write(a.p("h.bin"), content(200 << 10, 13)).unwrap();
+    a.cli(&["flush"]);
+    assert!(files_usage(&a)["history_bytes"].as_u64().unwrap() > 0);
+    let out = ask(
+        &a,
+        &serde_json::json!({"cmd": "keep-old", "keep": "7", "space": space}),
+    );
+    assert_eq!(out["keep"], "7 days", "{out}");
+    let files = files_usage(&a);
+    assert_eq!(files["retention"], "history-days", "{files}");
+    assert_eq!(files["history_days"], 7, "{files}");
+    let r = ask(&a, &serde_json::json!({"cmd": "space-usage"}));
+    let others: Vec<serde_json::Value> = r["spaces"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|s| s["space"] != space.as_str())
+        .cloned()
+        .collect();
+    assert!(!others.is_empty(), "{r}");
+    for o in &others {
+        assert_eq!(o["retention"], "history", "{o}");
+    }
+    let o = a.cli(&["keep-old", "0", "--space", &space]);
+    assert!(o.contains("for 0 days"), "{o}");
+    wait("the files space's old version is freed", 20, || {
+        files_usage(&a)["history_bytes"] == 0
+    });
+    assert_eq!(files_usage(&a)["retention"], "full");
+    let r = ask(&a, &serde_json::json!({"cmd": "space-usage"}));
+    for o in r["spaces"].as_array().unwrap() {
+        if o["space"] != space.as_str() {
+            assert_eq!(o["retention"], "history", "{o}");
+        }
+    }
+    // a space that is not held is refused
+    let r = reply(
+        &a,
+        &serde_json::json!({"cmd": "keep-old", "keep": "7", "space": "zz"}),
+    );
+    assert_eq!(r["ok"], false, "{r}");
 }

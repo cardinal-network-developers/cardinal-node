@@ -467,6 +467,10 @@ enum Cmd {
     KeepOld {
         /// Days, or `forever`.
         keep: String,
+        /// For this space alone (its id, as `space-usage` gives it), in
+        /// place of the device's period.
+        #[arg(long)]
+        space: Option<String>,
     },
     /// List the versions of a file.
     History {
@@ -3708,10 +3712,19 @@ async fn client(cmd: Cmd) -> anyhow::Result<()> {
             }
             Ok(())
         }
-        Cmd::KeepOld { keep } => {
-            let v = call(&paths, json!({"cmd": "keep-old", "keep": keep})).await?;
+        Cmd::KeepOld { keep, space } => {
+            let mut req = json!({"cmd": "keep-old", "keep": keep});
+            if let Some(s) = &space {
+                req["space"] = json!(s);
+            }
+            let v = call(&paths, req).await?;
             println!(
-                "This device now keeps deleted files and old versions {}.",
+                "This device now keeps deleted files and old versions{} {}.",
+                if space.is_some() {
+                    " in that space"
+                } else {
+                    ""
+                },
                 match v["keep"].as_str().unwrap_or("") {
                     "forever" => "forever".to_owned(),
                     k => format!("for {k}"),

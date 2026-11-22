@@ -2092,9 +2092,11 @@ Not implemented yet (the next milestone):
   unless set, a convention of this build) is history for that many days,
   and the placement records 3 with the days in field 5; `forever` is
   history, and records 2; `0` is full, and records 0. One setting for the
-  device: only the files space has a placement, and the same period holds
-  for every space held. The hourly pass, and `history-empty` ("empty
-  now", for one space or all), free what only history references in any
+  device, unless `keep-old` with a `space` set one for that space (in
+  `config.toml`, `keep_old_spaces`); only the files space has a
+  placement, recording its own period. A blob the history of several
+  spaces references stays as long as any of them keeps it. The hourly
+  pass, and `history-empty` ("empty now", for one space or all), free what only history references in any
   space, by references found by their shape; eviction under on demand
   stays the files'. `space-usage` counts each space's live, history-only
   and log bytes for what this device holds; `full` there is the device's

@@ -4,6 +4,7 @@
 //! lives in the account space instead; this holds only what is about this
 //! one device.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -79,6 +80,10 @@ pub struct Config {
     /// How long deleted files and old versions are kept after they stop
     /// being current: a number of days, or `forever` (`cleanup.rs`).
     pub keep_old: String,
+    /// For a space in particular (by its id in hex), how long its deleted
+    /// nodes and old versions are kept, in place of `keep_old`: what
+    /// `keep-old` with a `space` sets.
+    pub keep_old_spaces: BTreeMap<String, String>,
     /// Addresses (`host:port`) of devices reached over the internet.
     pub peers: Vec<String>,
     /// Paths (inside the mount) kept local under on-demand retention.
@@ -107,6 +112,7 @@ impl Default for Config {
             retention: "full".into(),
             on_demand_budget: DEFAULT_ON_DEMAND_BUDGET,
             keep_old: "30 days".into(),
+            keep_old_spaces: BTreeMap::new(),
             peers: Vec::new(),
             pins: Vec::new(),
             discovery: true,
@@ -246,6 +252,18 @@ impl Config {
     /// The multicast DNS port on this run.
     pub fn mdns(&self) -> u16 {
         self.this_run.mdns_port.unwrap_or(self.mdns_port)
+    }
+
+    /// How long old versions in `space` are kept: what was set for it, or
+    /// else for the device (30 days where neither says anything this build
+    /// reads).
+    pub fn keep_for(&self, space: &[u8; 32]) -> crate::cleanup::Keep {
+        use crate::cleanup::Keep;
+        self.keep_old_spaces
+            .get(&hex::encode(space))
+            .and_then(|k| Keep::parse(k).ok())
+            .or_else(|| Keep::parse(&self.keep_old).ok())
+            .unwrap_or(Keep::Days(30))
     }
 
     /// Whether retention is on demand.

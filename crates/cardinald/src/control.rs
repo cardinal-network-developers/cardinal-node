@@ -952,7 +952,15 @@ async fn handle(d: &Arc<Daemon>, req: &Value) -> anyhow::Result<Value> {
         }
         "keep-old" => {
             let keep = crate::cleanup::Keep::parse(arg(req, "keep")?)?;
-            d.config().keep_old = keep.to_string();
+            // for one space, in place of the device's period; without
+            // one, the device's, for every space not set otherwise
+            match req.get("space").and_then(Value::as_str) {
+                None | Some("") => d.config().keep_old = keep.to_string(),
+                Some(s) => {
+                    let space = hex::encode(space_held(d, s)?);
+                    d.config().keep_old_spaces.insert(space, keep.to_string());
+                }
+            }
             d.save_config()?;
             // Forever is history retention: record it for the other devices.
             d.housekeeping();
