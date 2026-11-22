@@ -434,3 +434,81 @@ fn a_channel_nobody_proves_anything_on_is_closed() {
     });
     stop(&mut a);
 }
+
+/// What `status` shows of Bluetooth.
+fn shown(d: &Dev) -> Value {
+    ask(d, json!({"cmd": "status"}))["bluetooth"].clone()
+}
+
+/// Waits for news on `w`, a watch, until what `status` shows of Bluetooth
+/// is as `ok` wants: a window that asks again only when it is told sees it
+/// within `secs`, or never.
+fn hear(w: &mut Client, d: &Dev, what: &str, secs: u64, ok: impl Fn(&Value) -> bool) {
+    let until = std::time::Instant::now() + std::time::Duration::from_secs(secs);
+    loop {
+        let left = until.saturating_duration_since(std::time::Instant::now());
+        if left.is_zero() {
+            panic!("no news of {what}: {}\n{}", shown(d), d.log());
+        }
+        w.set_read_timeout(Some(left)).unwrap();
+        match w.event() {
+            Ok(Some(_)) => {}
+            Ok(None) => panic!("the watch ended"),
+            Err(_) => panic!("no news of {what}: {}\n{}", shown(d), d.log()),
+        }
+        if ok(&shown(d)) {
+            return;
+        }
+    }
+}
+
+/// A window watching the service: while one does, "on while open" is on.
+fn open_window(d: &Dev) -> Client {
+    let mut w = d.connect();
+    let r = w.ask(&json!({"cmd": "watch", "window": true})).unwrap();
+    assert_eq!(r["ok"], true, "{r}");
+    w
+}
+
+/// The radio coming on, going off, failing and coming back is news to a
+/// window watching the service, as the setting is: none of these is the
+/// person's doing, so nothing else would tell it.
+#[test]
+fn a_window_hears_the_radio_come_on_stop_fail_and_recover() {
+    let root = tempfile::tempdir().unwrap();
+    let ether = root.path().join("ether");
+    let mut ana = dev(root.path(), "ana", &ether);
+    start(&mut ana);
+    ana.cli(&["init", "--yes", "--name", "Ana"]);
+    let said = ana.cli(&["bluetooth", "open"]);
+    assert!(said.contains("Bluetooth"), "{said}");
+    assert_eq!(shown(&ana)["on"], false, "no window yet");
+
+    // A watch that is no window, as a tray or a second view is.
+    let mut w = ana.connect();
+    w.set_read_timeout(Some(std::time::Duration::from_secs(10)))
+        .unwrap();
+    assert_eq!(w.ask(&json!({"cmd": "watch"})).unwrap()["ok"], true);
+    w.event().unwrap().unwrap();
+
+    // A window opens: the radio comes on, with no setting changed.
+    let window = open_window(&ana);
+    hear(&mut w, &ana, "the radio on", 20, |b| b["on"] == true);
+    // It closes: the radio stops.
+    drop(window);
+    hear(&mut w, &ana, "the radio off", 20, |b| b["on"] == false);
+
+    // The radio cannot be used: a window opening hears why.
+    std::fs::remove_dir_all(ether.join("ads")).unwrap();
+    let window = open_window(&ana);
+    hear(&mut w, &ana, "the radio failing", 20, |b| {
+        b["on"] == false && b["error"].is_string()
+    });
+    // It can again: the radio comes on, and the error clears.
+    std::fs::create_dir_all(ether.join("ads")).unwrap();
+    hear(&mut w, &ana, "the radio back", 30, |b| {
+        b["on"] == true && b["error"].is_null()
+    });
+    drop(window);
+    stop(&mut ana);
+}

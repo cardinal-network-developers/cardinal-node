@@ -136,8 +136,10 @@ pub struct Seen {
 /// a device advertising it was seen.
 type Wanted = (Zeroizing<[u8; 32]>, mpsc::Sender<Seen>);
 
-/// What the person sees of Bluetooth on this device.
-#[derive(Default)]
+/// What the person sees of Bluetooth on this device: what [`status`]
+/// says, but for the counts. It changes only through [`show`], which tells
+/// whoever watches the service.
+#[derive(Clone, Default, PartialEq)]
 struct Shown {
     /// The radio, in words, once one was made.
     radio: Option<String>,
@@ -186,6 +188,22 @@ struct Incoming {
     from: BleAddr,
     at: Instant,
     on: Attached,
+}
+
+/// Changes what the person sees of Bluetooth, and, where that changed
+/// anything, tells whoever watches the service: the radio coming on, going
+/// off or failing is news as much as the setting is.
+fn show<T>(d: &Daemon, f: impl FnOnce(&mut Shown) -> T) -> T {
+    let (t, changed) = {
+        let mut shown = lock(&d.bluetooth.shown);
+        let before = shown.clone();
+        let t = f(&mut shown);
+        (t, *shown != before)
+    };
+    if changed {
+        d.bump();
+    }
+    t
 }
 
 /// A window, while it watches the service.
@@ -248,7 +266,7 @@ fn radio(d: &Daemon) -> Result<Arc<dyn Radio>, String> {
         return Ok(r.clone());
     }
     let r = system_radio(d)?;
-    lock(&d.bluetooth.shown).radio = Some(r.describe());
+    show(d, |s| s.radio = Some(r.describe()));
     *held = Some(r.clone());
     Ok(r)
 }
@@ -333,9 +351,10 @@ pub fn start(d: &Arc<Daemon>) {
 
 fn off(d: &Daemon) {
     *lock(&d.bluetooth.running) = None;
-    let mut shown = lock(&d.bluetooth.shown);
-    shown.on = false;
-    shown.psm = None;
+    show(d, |s| {
+        s.on = false;
+        s.psm = None;
+    });
 }
 
 /// What this device advertises now: its own devices' tag, its trusted
@@ -466,7 +485,7 @@ async fn on(d: Arc<Daemon>) {
         } else {
             tracing::warn!("Bluetooth: {e}");
         }
-        lock(&d.bluetooth.shown).error = Some(e.clone());
+        show(&d, |s| s.error = Some(e.clone()));
         off(&d);
         // The controller tries again after this.
         tokio::time::sleep(RETRY_EVERY).await;
@@ -476,7 +495,7 @@ async fn on(d: Arc<Daemon>) {
 async fn run(d: &Arc<Daemon>) -> Result<(), String> {
     let radio = radio(d)?;
     let available = radio.available().await.map_err(|e| e.to_string())?;
-    lock(&d.bluetooth.shown).available = Some(available.clone());
+    show(d, |s| s.available = Some(available.clone()));
     available?;
     let mut listening = radio
         .listen()
@@ -498,12 +517,11 @@ async fn run(d: &Arc<Daemon>) -> Result<(), String> {
                 .map_err(|e| format!("cannot advertise: {e}"))?,
         )
     };
-    {
-        let mut shown = lock(&d.bluetooth.shown);
-        shown.on = true;
-        shown.psm = Some(psm);
-        shown.error = None;
-    }
+    show(d, |s| {
+        s.on = true;
+        s.psm = Some(psm);
+        s.error = None;
+    });
     *lock(&d.bluetooth.running) = Some(radio.clone());
     tracing::info!("Bluetooth on: {}, PSM {psm}", radio.describe());
     let mut look = tokio::time::interval(LOOK_EVERY);
@@ -868,7 +886,7 @@ pub async fn check(d: &Daemon) -> Value {
             },
             Err(e) => Err(e),
         };
-        lock(&d.bluetooth.shown).available = Some(r);
+        show(d, |s| s.available = Some(r));
     }
     status(d)
 }
