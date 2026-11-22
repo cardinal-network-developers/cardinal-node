@@ -9,18 +9,11 @@
 
 mod common;
 
-use std::io::{BufRead, BufReader, Write};
-use std::os::unix::net::UnixStream;
-
 use common::*;
 use serde_json::{json, Value};
 
 fn request(d: &Dev, req: Value) -> Value {
-    let mut s = UnixStream::connect(d.home.join("control.sock")).unwrap();
-    s.write_all(format!("{req}\n").as_bytes()).unwrap();
-    let mut line = String::new();
-    BufReader::new(s).read_line(&mut line).unwrap();
-    serde_json::from_str(&line).unwrap()
+    common::reply(d, &req)
 }
 
 /// The current epoch of the files space.

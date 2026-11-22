@@ -12,9 +12,7 @@ mod common;
 
 use common::*;
 use serde_json::{json, Value};
-use std::io::{BufRead, BufReader, Write};
 use std::net::{Ipv4Addr, SocketAddr, UdpSocket};
-use std::os::unix::net::UnixStream;
 use std::process::Stdio;
 
 /// A port for multicast on loopback, if loopback carries it here.
@@ -79,11 +77,7 @@ fn stop(d: &mut Dev) {
 }
 
 fn ask(d: &Dev, req: Value) -> Value {
-    let mut s = UnixStream::connect(d.home.join("control.sock")).unwrap();
-    writeln!(s, "{req}").unwrap();
-    let mut line = String::new();
-    BufReader::new(s).read_line(&mut line).unwrap();
-    let reply: Value = serde_json::from_str(&line).unwrap();
+    let reply = common::reply(d, &req);
     assert_eq!(reply["ok"], true, "{req} got {reply}");
     reply
 }

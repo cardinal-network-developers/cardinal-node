@@ -1,14 +1,17 @@
-//! The local control socket: one JSON request per line, one JSON reply per
-//! line. Only the user who runs the daemon can connect (mode 0600).
+//! The local interface (`apps.md#the-local-interface`): one request per
+//! message and one reply per message, each a record in the base encoding,
+//! over a channel only the user who runs the daemon can open
+//! (`transport.rs`). `api` turns messages into the named form the
+//! handlers here take and give.
 //!
-//! Requests are `{"cmd": "<name>", ...}`; replies are `{"ok": true, ...}`
-//! or `{"ok": false, "error": "<what to do>"}`. After `{"cmd": "watch"}` a
-//! connection only carries news, `{"ok": true, "event": "changed", "seq": n}`,
-//! until the client closes it (`apps.md#the-local-interface`). A window
-//! says `"window": true` with it: while one watches, Cardinal is open, and
-//! Bluetooth set to `open` is on (`bluetooth.rs`).
+//! After `watch`, a connection only carries news, an event `changed` with
+//! the count of changes, until the client closes it. A window says
+//! `window` with it: while one watches, Cardinal is open, and Bluetooth set
+//! to `open` is on (`bluetooth.rs`). After `call-media` it carries a call's
+//! frames (`calls.rs`).
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -18,82 +21,139 @@ use cardinal_space::files::{self, Content, Files, FILE_CONTENT};
 use cardinal_space::state::State;
 use cardinal_space::{NodeId, SpaceId, SpaceOpBody, ROOT};
 use serde_json::{json, Value};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
+use crate::api::{self, status};
 use crate::core::short;
 use crate::daemon::{Daemon, PairState};
 use crate::net;
-use crate::transport::{self, Listener, Reader, Writer};
+use crate::transport::{self, Listener, Reader, Received, Writer, MAX_MESSAGE};
 
 /// The version of this interface. A client compares it with `hello`'s.
-const API: u64 = 1;
+/// 2: the base encoding, with numbered fields, in place of lines of JSON.
+const API: u64 = 2;
 /// How long news waits, so that a burst of changes is one event.
 const NEWS_GATHERS: Duration = Duration::from_millis(100);
 
-/// Sends a request to a running daemon and returns its reply.
-pub async fn request(socket: &std::path::Path, req: &Value) -> anyhow::Result<Value> {
-    let (r, mut w) = transport::connect(socket).await?;
-    let mut line = serde_json::to_string(req)?;
-    line.push('\n');
-    w.write_all(line.as_bytes()).await?;
-    let mut lines = BufReader::new(r).lines();
-    let reply = lines
-        .next_line()
-        .await?
-        .ok_or_else(|| anyhow::anyhow!("the daemon closed the connection"))?;
-    Ok(serde_json::from_str(&reply)?)
+/// Whether [`request`] shows each request and reply on standard error, in
+/// the text rendering with the tables' names (`cardinal --trace`).
+static TRACE: AtomicBool = AtomicBool::new(false);
+
+/// Shows every request [`request`] sends, and its reply, on standard error.
+pub fn trace(on: bool) {
+    TRACE.store(on, Ordering::Relaxed);
 }
 
-/// Starts serving the control socket.
+/// Sends a request to a running daemon and returns its reply. Both are by
+/// name: `req` names the request in `cmd`, and the reply has `ok`, and
+/// `error` when it is not.
+pub async fn request(socket: &std::path::Path, req: &Value) -> anyhow::Result<Value> {
+    let (spec, msg) = api::encode_request(req)?;
+    let tracing = TRACE.load(Ordering::Relaxed);
+    if tracing {
+        eprintln!("> {}", api::render_request(&msg));
+    }
+    let (mut r, mut w) = transport::connect(socket).await?;
+    w.send(&msg).await?;
+    let reply = match r.recv().await? {
+        Some(Received::Message(m)) => m,
+        Some(Received::TooLarge) => anyhow::bail!("the daemon's reply was larger than a message"),
+        None => anyhow::bail!("the daemon closed the connection"),
+    };
+    if tracing {
+        eprintln!("< {}", api::render_reply(spec, &reply));
+    }
+    api::decode_reply(spec, &reply)
+}
+
+/// Starts serving the local interface.
 pub fn serve(d: Arc<Daemon>) -> anyhow::Result<tokio::task::JoinHandle<()>> {
     let mut listener = Listener::bind(&d.paths.socket)
         .map_err(|e| anyhow::anyhow!("{e:#} for {}", d.paths.home.display()))?;
     Ok(tokio::spawn(async move {
         loop {
-            let Ok((r, mut w)) = listener.accept().await else {
+            let Ok((r, w)) = listener.accept().await else {
                 continue;
             };
-            let d = d.clone();
-            tokio::spawn(async move {
-                let mut lines = BufReader::new(r).lines();
-                while let Ok(Some(line)) = lines.next_line().await {
-                    let req = serde_json::from_str::<Value>(&line).ok();
-                    let cmd = req.as_ref().and_then(|r| r["cmd"].as_str());
-                    if cmd == Some("watch") {
-                        // A window watching: "on while open" is on while it does.
-                        let window = req.as_ref().and_then(|r| r["window"].as_bool());
-                        let _window = (window == Some(true)).then(|| crate::bluetooth::window(&d));
-                        watch(&d, lines, w).await;
-                        break;
-                    }
-                    if cmd == Some("call-media") {
-                        crate::calls::media(&d, lines, w).await;
-                        break;
-                    }
-                    let reply = match serde_json::from_str::<Value>(&line) {
-                        Ok(req) => match handle(&d, &req).await.map_err(|e| capitalized(&req, e)) {
-                            Ok(mut v) => {
-                                v["ok"] = json!(true);
-                                v
-                            }
-                            Err(e) => json!({
-                                "ok": false,
-                                "error": format!("{e:#}"),
-                                "needs_words": e.is::<crate::recovery::NeedsWords>(),
-                                "needs_for": e.is::<crate::contacts::NeedsFor>(),
-                            }),
-                        },
-                        Err(e) => json!({"ok": false, "error": format!("bad request: {e}")}),
-                    };
-                    let mut out = reply.to_string();
-                    out.push('\n');
-                    if w.write_all(out.as_bytes()).await.is_err() {
-                        break;
-                    }
-                }
-            });
+            tokio::spawn(connection(d.clone(), r, w));
         }
     }))
+}
+
+/// Answers one connection's requests in turn, until it closes or becomes a
+/// stream.
+async fn connection(d: Arc<Daemon>, mut r: Reader, mut w: Writer) {
+    while let Ok(Some(got)) = r.recv().await {
+        let msg = match got {
+            Received::Message(m) => m,
+            Received::TooLarge => {
+                let why = format!("a message is at most {MAX_MESSAGE} bytes");
+                if w.send(&api::error_reply(status::MALFORMED, &why))
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
+                continue;
+            }
+        };
+        let (spec, req) = match api::decode_request(&msg) {
+            Ok(x) => x,
+            Err(refused) => {
+                if w.send(&api::error_reply(refused.status, &refused.why))
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
+                continue;
+            }
+        };
+        match spec.name {
+            "watch" => {
+                // A window watching: "on while open" is on while it does.
+                let window = req["window"].as_bool() == Some(true);
+                let _window = window.then(|| crate::bluetooth::window(&d));
+                if w.send(&api::encode_reply(spec, Ok(&json!({}))))
+                    .await
+                    .is_ok()
+                {
+                    watch(&d, r, w).await;
+                }
+                return;
+            }
+            "call-media" => {
+                crate::calls::media(&d, spec, r, w).await;
+                return;
+            }
+            _ => {}
+        }
+        let reply = match handle(&d, &req).await.map_err(|e| capitalized(&req, e)) {
+            Ok(v) => api::encode_reply(spec, Ok(&v)),
+            Err(e) => {
+                let st = if e.is::<crate::recovery::NeedsWords>() {
+                    status::NEEDS_WORDS
+                } else if e.is::<crate::contacts::NeedsFor>() {
+                    status::NEEDS_FOR
+                } else {
+                    status::FAILED
+                };
+                api::encode_reply(spec, Err((st, &format!("{e:#}"))))
+            }
+        };
+        let reply = if reply.len() > MAX_MESSAGE {
+            let why = format!(
+                "the answer to {} would be {} bytes, and a message is at most {MAX_MESSAGE}",
+                spec.name,
+                reply.len()
+            );
+            api::error_reply(status::TOO_LARGE, &why)
+        } else {
+            reply
+        };
+        if w.send(&reply).await.is_err() {
+            return;
+        }
+    }
 }
 
 /// An error of the guardians' and recovery requests, starting with a
@@ -120,14 +180,12 @@ fn capitalized(req: &Value, e: anyhow::Error) -> anyhow::Error {
 /// Tells a client each time something changed, until it goes. An event says
 /// only that there is news, and the client asks for what it shows, so one that
 /// is missed, or two that come as one, lose nothing.
-async fn watch(d: &Daemon, mut lines: tokio::io::Lines<BufReader<Reader>>, mut w: Writer) {
+async fn watch(d: &Daemon, mut r: Reader, mut w: Writer) {
     let mut changed = d.changed.subscribe();
     let mut stopping = d.stopping.subscribe();
     loop {
         let seq = *changed.borrow_and_update();
-        let mut out = json!({"ok": true, "event": "changed", "seq": seq}).to_string();
-        out.push('\n');
-        if w.write_all(out.as_bytes()).await.is_err() {
+        if w.send(&api::event_message(seq)).await.is_err() {
             return;
         }
         loop {
@@ -137,7 +195,7 @@ async fn watch(d: &Daemon, mut lines: tokio::io::Lines<BufReader<Reader>>, mut w
                     Err(_) => return,
                 },
                 _ = stopping.changed() => return,
-                line = lines.next_line() => match line {
+                m = r.recv() => match m {
                     Ok(Some(_)) => continue,
                     _ => return,
                 },
@@ -266,10 +324,14 @@ async fn handle(d: &Arc<Daemon>, req: &Value) -> anyhow::Result<Value> {
             d.bump();
             Ok(json!({"was_on": was}))
         }
-        "inspect" => {
+        // One request for each view, which `inspect.rs` tells by `what`.
+        "inspect" | "inspect-identity" | "inspect-space" | "inspect-entries" | "inspect-entry"
+        | "inspect-nodes" | "inspect-node" => {
             d.inspection
                 .check(req.get("token").and_then(Value::as_str))?;
-            crate::inspect::handle(d, req)
+            let mut req = req.clone();
+            req["what"] = json!(cmd.strip_prefix("inspect-").unwrap_or("overview"));
+            crate::inspect::handle(d, &req)
         }
         "devices" => Ok(json!({"devices": devices(d)})),
         "stop" => {

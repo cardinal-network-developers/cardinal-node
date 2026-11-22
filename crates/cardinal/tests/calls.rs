@@ -8,8 +8,6 @@ mod common;
 
 use common::*;
 use serde_json::{json, Value};
-use std::io::{BufRead, BufReader, Write};
-use std::os::unix::net::UnixStream;
 use std::time::{Duration, Instant};
 
 fn person(root: &std::path::Path, name: &'static str) -> Dev {
@@ -21,11 +19,7 @@ fn person(root: &std::path::Path, name: &'static str) -> Dev {
 }
 
 fn try_ask(d: &Dev, req: Value) -> Value {
-    let mut s = UnixStream::connect(d.home.join("control.sock")).unwrap();
-    writeln!(s, "{req}").unwrap();
-    let mut line = String::new();
-    BufReader::new(s).read_line(&mut line).unwrap();
-    serde_json::from_str(&line).unwrap()
+    common::reply(d, &req)
 }
 
 fn ask(d: &Dev, req: Value) -> Value {
@@ -66,28 +60,23 @@ fn wait_name(a: &Dev) -> String {
 
 /// A client's line of audio.
 struct Line {
-    w: UnixStream,
-    r: BufReader<UnixStream>,
+    m: Media,
 }
 
 impl Line {
     fn open(d: &Dev) -> Line {
-        let mut w = UnixStream::connect(d.home.join("control.sock")).unwrap();
-        writeln!(w, "{}", json!({"cmd": "call-media"})).unwrap();
-        w.set_read_timeout(Some(Duration::from_millis(50))).unwrap();
-        let r = BufReader::new(w.try_clone().unwrap());
-        Line { w, r }
+        Line {
+            m: Media::open(d, Duration::from_millis(50)),
+        }
     }
 
     fn say(&mut self, n: u32) {
         let frame = hex::encode(n.to_be_bytes());
-        writeln!(self.w, "{}", json!({"audio": frame})).unwrap();
+        self.m.send(&json!({"audio": frame}));
     }
 
     fn heard(&mut self) -> Option<u32> {
-        let mut line = String::new();
-        self.r.read_line(&mut line).ok()?;
-        let v: Value = serde_json::from_str(&line).ok()?;
+        let v = self.m.next()?;
         let b = hex::decode(v["audio"].as_str()?).ok()?;
         Some(u32::from_be_bytes(b.try_into().ok()?))
     }
@@ -313,8 +302,7 @@ fn a_big_transfer_does_not_hold_up_a_call() {
     ask(&bob, json!({"cmd": "call-answer"}));
     wait("live", 10, || standing(&a) == "live");
     let (mut la, mut lb) = (Line::open(&a), Line::open(&bob));
-    lb.w.set_read_timeout(Some(Duration::from_millis(2)))
-        .unwrap();
+    lb.m.set_wait(Duration::from_millis(2));
     std::thread::sleep(Duration::from_millis(200));
 
     // Bulk on the machine and on a's links while frames go.

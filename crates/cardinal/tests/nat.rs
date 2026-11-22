@@ -14,8 +14,6 @@ use std::sync::{Arc, Mutex};
 
 use common::*;
 use serde_json::{json, Value};
-use std::io::{BufRead, BufReader, Write};
-use std::os::unix::net::UnixStream;
 use std::time::Duration;
 use tokio::net::UdpSocket;
 
@@ -383,11 +381,7 @@ fn a_device_behind_a_forwarded_port_helps_and_catches_others_up() {
 }
 
 fn ask(d: &Dev, req: Value) -> Value {
-    let mut s = UnixStream::connect(d.home.join("control.sock")).unwrap();
-    writeln!(s, "{req}").unwrap();
-    let mut line = String::new();
-    BufReader::new(s).read_line(&mut line).unwrap();
-    let reply: Value = serde_json::from_str(&line).unwrap();
+    let reply = common::reply(d, &req);
     assert_eq!(reply["ok"], true, "{req} got {reply}");
     reply
 }
@@ -488,26 +482,19 @@ fn a_contact_behind_a_nat_is_reached_through_their_host() {
     ask(&bo, json!({"cmd": "call-answer"}));
     wait("ana hears the answer", 10, || standing(&ana) == "live");
 
-    let mut lines = [&ana, &bo].map(|d| {
-        let mut w = UnixStream::connect(d.home.join("control.sock")).unwrap();
-        writeln!(w, "{}", json!({"cmd": "call-media"})).unwrap();
-        w.set_read_timeout(Some(Duration::from_millis(50))).unwrap();
-        let r = BufReader::new(w.try_clone().unwrap());
-        (w, r)
-    });
+    let mut lines = [&ana, &bo].map(|d| Media::open(d, Duration::from_millis(50)));
     std::thread::sleep(Duration::from_millis(300));
     for n in 0..50u32 {
-        for (i, (w, _)) in lines.iter_mut().enumerate() {
+        for (i, m) in lines.iter_mut().enumerate() {
             let frame = hex::encode((n + 1000 * i as u32).to_be_bytes());
-            writeln!(w, "{}", json!({"audio": frame})).unwrap();
+            m.send(&json!({"audio": frame}));
         }
         std::thread::sleep(Duration::from_millis(20));
     }
     let mut heard = [0, 0];
     for _ in 0..100 {
-        for (i, (_, r)) in lines.iter_mut().enumerate() {
-            let mut line = String::new();
-            if r.read_line(&mut line).is_ok() && line.contains("audio") {
+        for (i, m) in lines.iter_mut().enumerate() {
+            if m.next().is_some_and(|f| f.get("audio").is_some()) {
                 heard[i] += 1;
             }
         }

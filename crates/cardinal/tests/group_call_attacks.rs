@@ -6,9 +6,7 @@
 
 mod common;
 
-use std::io::{BufRead, BufReader, Write};
 use std::net::SocketAddr;
-use std::os::unix::net::UnixStream;
 use std::time::Duration;
 
 use cardinal_encoding::{Record, Value};
@@ -25,11 +23,7 @@ const RING: u64 = 1;
 const JOIN: u64 = 4;
 
 fn reply(d: &Dev, req: &Json) -> Json {
-    let mut s = UnixStream::connect(d.home.join("control.sock")).unwrap();
-    writeln!(s, "{req}").unwrap();
-    let mut line = String::new();
-    BufReader::new(s).read_line(&mut line).unwrap();
-    serde_json::from_str(&line).unwrap()
+    common::reply(d, req)
 }
 
 fn ask(d: &Dev, req: Json) -> Json {

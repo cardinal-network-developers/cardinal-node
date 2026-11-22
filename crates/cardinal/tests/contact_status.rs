@@ -9,8 +9,6 @@ mod common;
 
 use common::*;
 use serde_json::{json, Value};
-use std::io::{BufRead, BufReader, Write};
-use std::os::unix::net::UnixStream;
 
 fn person(root: &std::path::Path, name: &'static str) -> Dev {
     let mut d = Dev::new(root, name, free_port());
@@ -21,11 +19,7 @@ fn person(root: &std::path::Path, name: &'static str) -> Dev {
 }
 
 fn ask(d: &Dev, req: Value) -> Value {
-    let mut s = UnixStream::connect(d.home.join("control.sock")).unwrap();
-    writeln!(s, "{req}").unwrap();
-    let mut line = String::new();
-    BufReader::new(s).read_line(&mut line).unwrap();
-    let reply: Value = serde_json::from_str(&line).unwrap();
+    let reply = common::reply(d, &req);
     assert_eq!(reply["ok"], true, "{req} got {reply}");
     reply
 }
@@ -193,11 +187,7 @@ fn at_an_address_reaches_a_contact_neither_side_could_find() {
 }
 
 fn try_status(d: &Dev, req: Value) -> Value {
-    let mut s = UnixStream::connect(d.home.join("control.sock")).unwrap();
-    writeln!(s, "{req}").unwrap();
-    let mut line = String::new();
-    BufReader::new(s).read_line(&mut line).unwrap();
-    serde_json::from_str(&line).unwrap()
+    common::reply(d, &req)
 }
 
 /// Daniel's case, 2026-11-19: a person with a host device and a laptop meets

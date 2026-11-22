@@ -960,12 +960,7 @@ fn a_guardian_names_whom_an_invitation_is_for() {
 }
 
 fn reply(d: &Dev, req: &serde_json::Value) -> serde_json::Value {
-    use std::io::{BufRead, BufReader, Write};
-    let mut s = std::os::unix::net::UnixStream::connect(d.home.join("control.sock")).unwrap();
-    writeln!(s, "{req}").unwrap();
-    let mut line = String::new();
-    BufReader::new(s).read_line(&mut line).unwrap();
-    serde_json::from_str(&line).unwrap()
+    common::reply(d, req)
 }
 
 fn ask(d: &Dev, req: serde_json::Value) -> serde_json::Value {

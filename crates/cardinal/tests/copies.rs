@@ -143,7 +143,7 @@ fn copies_and_speedtest() {
     assert_eq!(j[0]["device"], "alpha", "{j}");
     assert!(j[0]["receive"].as_u64().unwrap() > 0, "{j}");
     assert!(j[0]["send"].as_u64().unwrap() > 0, "{j}");
-    assert!(j[0]["rtt_min_ms"].as_f64().unwrap() > 0.0, "{j}");
+    assert!(j[0]["rtt_min_us"].as_u64().unwrap() > 0, "{j}");
     let o = a.try_cli(&["speedtest", "alpha"]);
     assert!(!o.status.success());
     assert!(String::from_utf8_lossy(&o.stderr).contains("this device"));

@@ -351,11 +351,19 @@ network.
 
 ## Control socket
 
-One JSON object per line each way: `{"cmd": "status"}` →
-`{"ok": true, ...}` or `{"ok": false, "error": "...", "needs_words":
-bool}`; `needs_words` means the recovery words, as `words`, would let the
-same request through; `needs_for`, that an `accept` of a recovery
-invitation made for whomever the guardian names needs `for`. Commands: `status`, `devices`, `remove-device`,
+One base-encoded record per message each way, on a `SOCK_SEQPACKET`
+socket (on Windows a named pipe in message mode), as
+`apps.md#the-local-interface` says: a request's number in key 0 and its
+arguments by number; a reply's status in key 0 (0 done, else an error
+number, with why in key 1) and its fields from key 2. `src/api/table.rs`
+numbers everything; inside, and in what follows, requests and fields go by
+the names it gives them. Error 5 (`needs words`) means the recovery words,
+as `words`, would let the same request through; 6 (`needs for`), that an
+`accept` of a recovery invitation made for whomever the guardian names
+needs `for`. `cardinal --trace <command>` shows a command's requests and
+replies in the text rendering with these names, and `cardinal api-trace
+--listen PATH` passes a client's messages on to the daemon and shows them.
+Requests: `status`, `devices`, `remove-device`,
 `recovery-check` (`words`; changes nothing), `free-space` (`dry_run`; or
 `unnamed`, with `delete`),
 `keep-old` (`keep`), `peer-add/remove/list`,
@@ -582,16 +590,17 @@ never sees. Off until the person turns it on, on this device:
 first unless `--yes`) prints a token, `cardinal inspect off`
 (`inspect-off`) ends it, and `status` says `inspection: {on, until}`. A
 new grant ends the old token; the grant lives in memory only, so a
-restart ends it too. Every request is `{"cmd": "inspect", "token": ...,
-"what": ...}`, with `what` one of `overview`, `identity` (`who`, `entry`,
-`path`), `space` (`space`), `entries` (`space`, `view`: `sealed` or
-`opened`, `offset`, `count`), `entry` (`space`, `entry` or `sealed_id`,
-`path` from `sealed`, `signed` or `entry`), `nodes` (`space`, `kind`,
-`parent`), `node` (`space`, `node`, `path`); `limit` and `items` say how
+restart ends it too. Every request takes the `token`, and there is one
+for each view: `inspect` (the overview), `inspect-identity` (`who`, `entry`,
+`path`), `inspect-space` (`space`), `inspect-entries` (`space`, `view`:
+`sealed` or `opened`, `offset`, `count`), `inspect-entry` (`space`, `entry`
+or `sealed_id`, `path` from `sealed`, `signed` or `entry`), `inspect-nodes`
+(`space`, `kind`, `parent`), `inspect-node` (`space`, `node`, `path`);
+`limit` and `items` say how
 much of each value to send (48 bytes and 24 items unless asked). Values
 come typed with their encoded length; no private key is ever sent: an
 epoch key, a blob reference's key, a secret node's value, a reach
-node's presence secret (field 2, D74) and an invitation's secret come as `{"t": "secret", "what", "len"}`, bytes that
+node's presence secret (field 2, D74) and an invitation's secret come as a value whose `t` is `secret`, with `what` and `len`, bytes that
 encode one are withheld, and no `path` leads to one. The space explorer
 (a separate program) draws all this. On a desktop without a sandbox this
 guards against accident, not against a program running as the person

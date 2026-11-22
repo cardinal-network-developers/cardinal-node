@@ -6,15 +6,10 @@
 mod common;
 
 use common::*;
-use std::io::{BufRead, BufReader, Write};
 
 /// One request on the service's interface, as a window asks.
 fn ask(d: &Dev, req: serde_json::Value) -> serde_json::Value {
-    let mut s = std::os::unix::net::UnixStream::connect(d.home.join("control.sock")).unwrap();
-    writeln!(s, "{req}").unwrap();
-    let mut line = String::new();
-    BufReader::new(s).read_line(&mut line).unwrap();
-    serde_json::from_str(&line).unwrap()
+    common::reply(d, &req)
 }
 
 #[test]
