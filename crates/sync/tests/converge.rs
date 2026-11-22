@@ -9,7 +9,8 @@
 use std::time::Instant;
 
 use cardinal_sync::{
-    answer_want, want_messages, Id, MemSet, Message, Reconciler, SetStore, MAX_MESSAGE,
+    answer_want, short_id, summary_bits, summary_messages, want_messages, Id, MemSet, Message,
+    Reconciler, SetStore, SummaryReader, MAX_MESSAGE, MAX_TURN,
 };
 use proptest::prelude::*;
 
@@ -24,6 +25,7 @@ fn id(seed: u64, n: u64) -> Id {
 #[derive(Debug, Default)]
 struct Outcome {
     messages: u64,
+    turns: u64,
     round_trips: u64,
     bytes_a: u64,
     bytes_b: u64,
@@ -31,34 +33,75 @@ struct Outcome {
 }
 
 fn reconcile(a: &MemSet, b: &MemSet, max: usize) -> (Vec<Id>, Vec<Id>, Outcome) {
+    reconcile_turns(a, b, max, MAX_TURN, MAX_TURN)
+}
+
+/// Runs a reconciliation, A initiating, each side with its own turn limit;
+/// gathers what each learns after every message, as a fetcher would.
+fn reconcile_turns(
+    a: &MemSet,
+    b: &MemSet,
+    max: usize,
+    turn_a: usize,
+    turn_b: usize,
+) -> (Vec<Id>, Vec<Id>, Outcome) {
     let label = [9u8; 32];
-    let mut ra = Reconciler::new(label, a).with_max_message(max);
-    let mut rb = Reconciler::new(label, b).with_max_message(max);
+    let mut ra = Reconciler::new(label, a)
+        .with_max_message(max)
+        .with_max_turn(turn_a);
+    let rb = Reconciler::new(label, b)
+        .with_max_message(max)
+        .with_max_turn(turn_b);
+    let first = vec![ra.initiate()];
+    let (wa, wb, out) = converse(ra, rb, first, max);
+    (wa, wb, out)
+}
+
+/// Carries turns between two reconcilers until both are done, starting
+/// with `turn` going to B.
+fn converse<S: SetStore>(
+    mut ra: Reconciler<S>,
+    mut rb: Reconciler<S>,
+    mut turn: Vec<Message>,
+    max: usize,
+) -> (Vec<Id>, Vec<Id>, Outcome) {
     let mut out = Outcome::default();
-    let mut msg = Some(ra.initiate());
+    let (mut wa, mut wb) = (Vec::new(), Vec::new());
     let mut to_b = true;
-    while let Some(m) = msg {
-        let bytes = m.encode();
-        assert!(bytes.len() <= max, "message of {} bytes", bytes.len());
-        if to_b {
-            out.bytes_a += bytes.len() as u64;
-        } else {
-            out.bytes_b += bytes.len() as u64;
+    while !turn.is_empty() {
+        out.turns += 1;
+        let mut next = Vec::new();
+        for m in turn {
+            let bytes = m.encode();
+            assert!(bytes.len() <= max, "message of {} bytes", bytes.len());
+            if to_b {
+                out.bytes_a += bytes.len() as u64;
+            } else {
+                out.bytes_b += bytes.len() as u64;
+            }
+            out.messages += 1;
+            let m = Message::decode(&bytes).unwrap();
+            let (r, w) = if to_b {
+                (&mut rb, &mut wb)
+            } else {
+                (&mut ra, &mut wa)
+            };
+            assert!(next.is_empty(), "a reply before the turn ended");
+            next = r.handle(&m).unwrap();
+            w.extend(r.take_wanted());
         }
-        out.messages += 1;
-        let m = Message::decode(&bytes).unwrap();
-        msg = if to_b {
-            rb.handle(&m).unwrap()
-        } else {
-            ra.handle(&m).unwrap()
-        };
+        turn = next;
         to_b = !to_b;
         assert!(out.messages < 100_000, "no convergence");
     }
     assert!(ra.is_done() && rb.is_done());
-    out.round_trips = out.messages.div_ceil(2);
+    out.round_trips = out.turns.div_ceil(2);
     out.truncated = ra.stats().truncated + rb.stats().truncated;
-    (ra.take_wanted(), rb.take_wanted(), out)
+    wa.sort();
+    wa.dedup();
+    wb.sort();
+    wb.dedup();
+    (wa, wb, out)
 }
 
 /// Sets of about `n` ids each, sharing `n * (1 - diff)`, each holding
@@ -141,8 +184,10 @@ fn disjoint_and_one_sided() {
     assert_eq!(wa.len(), 5000);
     assert!(wb.is_empty());
     // An empty initiator lists nothing; the peer answers "you lack" with
-    // everything, in as many messages as the size limit requires.
-    assert!(o.round_trips >= 3, "{o:?}");
+    // everything, in one turn of as many messages as the size limit
+    // requires, and the initiator's skips end it.
+    assert_eq!(o.turns, 3, "{o:?}");
+    assert!(o.messages > o.turns, "{o:?}");
 }
 
 #[test]
@@ -193,11 +238,14 @@ proptest! {
         ys in proptest::collection::vec(0u64..3000, 0..1500),
         max in 4096usize..70_000,
         a_starts in any::<bool>(),
+        turns in (0usize..3, 0usize..3),
     ) {
         let a: MemSet = xs.iter().map(|&i| id(5, i)).collect();
         let b: MemSet = ys.iter().map(|&i| id(5, i)).collect();
         let (first, second) = if a_starts { (&a, &b) } else { (&b, &a) };
-        let (w1, w2, _) = reconcile(first, second, max);
+        // One-message turns, a few messages, or the default.
+        let limit = |k: usize| [max, 3 * max, MAX_TURN][k];
+        let (w1, w2, _) = reconcile_turns(first, second, max, limit(turns.0), limit(turns.1));
         let expect1: Vec<Id> = second.iter().filter(|i| !first.contains(i)).copied().collect();
         let expect2: Vec<Id> = first.iter().filter(|i| !second.contains(i)).copied().collect();
         prop_assert_eq!(w1, expect1);
@@ -236,4 +284,106 @@ proptest! {
         prop_assert_eq!(wa, ea);
         prop_assert_eq!(wb, eb);
     }
+}
+
+/// A summary round on a long-delay link: A opens with a summary of `a`
+/// (with `bits`, and `extra` short ids added as if A held more), B answers
+/// with the objects it sends, A takes them in, and B opens the exact
+/// drill-down as initiator. Returns what B sent, what A learned it still
+/// lacks, what B learned it lacks, and the turns of the backstop.
+fn summary_round(
+    a: &MemSet,
+    b: &MemSet,
+    bits: u32,
+    extra: &[[u8; 32]],
+) -> (Vec<Id>, Vec<Id>, Vec<Id>, Outcome) {
+    let label = [9u8; 32];
+    let nonce = [3u8; 32];
+    let mut msgs = summary_messages(label, a, nonce, bits, MAX_MESSAGE);
+    if !extra.is_empty() {
+        // A chance match: A names short ids it does not hold.
+        let Message::Summary {
+            count, short_ids, ..
+        } = &mut msgs[0]
+        else {
+            unreachable!()
+        };
+        let w = (bits / 8) as usize;
+        let mut all: Vec<Vec<u8>> = short_ids.chunks(w).map(<[u8]>::to_vec).collect();
+        all.extend(extra.iter().map(|s| s[..w].to_vec()));
+        all.sort();
+        *short_ids = all.concat();
+        *count += extra.len() as u64;
+        assert_eq!(msgs.len(), 1, "a small set for this");
+    }
+    let mut reader = SummaryReader::new(label, 1 << 30);
+    let mut summary = None;
+    for m in &msgs {
+        summary = reader.push(&Message::decode(&m.encode()).unwrap()).unwrap();
+    }
+    let summary = summary.expect("the whole summary");
+    let sent = summary.to_send(b);
+    let mut a2 = a.clone();
+    a2.extend_from(sent.iter().copied());
+    // The backstop: B initiates, A answers with what it holds now.
+    let mut rb = Reconciler::new(label, b);
+    let ra = Reconciler::new(label, &a2);
+    let first = vec![rb.initiate()];
+    // The first turn goes to `converse`'s second side, A here.
+    let (wb, wa, o) = converse(rb, ra, first, MAX_MESSAGE);
+    (sent, wa, wb, o)
+}
+
+fn three_ways(n: u64, common: u64, seed: u64) -> (MemSet, MemSet) {
+    let a: MemSet = (0..n).map(|i| id(seed, i)).collect();
+    let b: MemSet = (n - common..2 * n - common).map(|i| id(seed, i)).collect();
+    (a, b)
+}
+
+#[test]
+fn a_summary_sends_what_is_absent_and_the_backstop_agrees() {
+    let (a, b) = three_ways(20_000, 15_000, 41);
+    let (sent, wa, wb, o) = summary_round(&a, &b, summary_bits(a.len()), &[]);
+    let expect: Vec<Id> = b.iter().filter(|i| !a.contains(i)).copied().collect();
+    assert_eq!(sent, expect, "B sends exactly what A lacks");
+    assert!(wa.is_empty(), "the backstop finds nothing more for A");
+    let lacks: Vec<Id> = a.iter().filter(|i| !b.contains(i)).copied().collect();
+    assert_eq!(wb, lacks, "and gives B what it lacks");
+    println!("summary backstop: {o:?}");
+}
+
+#[test]
+fn a_summary_of_nothing_brings_everything() {
+    let empty = MemSet::new();
+    let b: MemSet = (0..5000).map(|i| id(42, i)).collect();
+    let (sent, wa, wb, o) = summary_round(&empty, &b, summary_bits(0), &[]);
+    assert_eq!(sent.len(), 5000);
+    assert!(wa.is_empty() && wb.is_empty());
+    // B's fingerprint, A's equal one: one round trip.
+    assert_eq!(o.turns, 2, "{o:?}");
+}
+
+#[test]
+fn short_bits_send_the_whole_set() {
+    let (a, b) = three_ways(3000, 2000, 43);
+    // 24 bits for 3,000 a side: E = 9e6 / 2^24, far above 2^-20.
+    let (sent, wa, _, _) = summary_round(&a, &b, 24, &[]);
+    assert_eq!(sent.len(), b.len(), "everything B holds");
+    assert!(wa.is_empty());
+}
+
+#[test]
+fn the_backstop_finds_a_chance_match() {
+    let a: MemSet = (0..20).map(|i| id(44, i)).collect();
+    let b: MemSet = (10..40).map(|i| id(44, i)).collect();
+    // One of B's ids that A lacks, its short id in A's summary as though
+    // one of A's own had the same.
+    let hidden = id(44, 30);
+    let bits = summary_bits(a.len());
+    let forged = short_id(&[3u8; 32], &hidden, (bits / 8) as usize);
+    let (sent, wa, wb, _) = summary_round(&a, &b, bits, &[forged]);
+    assert!(!sent.contains(&hidden), "held back by the chance match");
+    assert_eq!(sent.len(), 19);
+    assert_eq!(wa, vec![hidden], "the drill-down finds it");
+    assert_eq!(wb.len(), 10);
 }

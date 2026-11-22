@@ -13,6 +13,9 @@ pub enum SyncError {
     UnknownOp(u64),
     /// The ranges of a reconcile message do not cover every id in order.
     BadRanges(&'static str),
+    /// A summary breaks its rules (`sync.md#long-delays`): malformed, and
+    /// its stream is reset.
+    BadSummary(&'static str),
     /// A bundle could not be opened or holds something other than objects
     /// messages.
     Bundle(&'static str),
@@ -27,6 +30,7 @@ impl fmt::Display for SyncError {
             SyncError::Schema(e) => write!(f, "sync message: {e}"),
             SyncError::UnknownOp(op) => write!(f, "unknown sync op {op}"),
             SyncError::BadRanges(why) => write!(f, "reconcile ranges: {why}"),
+            SyncError::BadSummary(why) => write!(f, "summary: {why}"),
             SyncError::Bundle(why) => write!(f, "bundle: {why}"),
             SyncError::Crypto(e) => write!(f, "bundle: {e}"),
         }

@@ -91,12 +91,16 @@ fn read_ids(r: &Record, key: u64) -> Result<Vec<Id>, SyncError> {
 /// A message of the `sync` service.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Message {
-    /// 1: `{0: 1, 1: label, 2: ranges}`.
+    /// 1: `{0: 1, 1: label, 2: ranges, 3: end of turn}`.
     Reconcile {
         /// The set.
         label: Label,
-        /// Ascending ranges covering every id.
+        /// Ascending ranges, going on from where the turn's previous
+        /// message stopped; the turn's messages together cover every id.
         ranges: Vec<Range>,
+        /// Whether this is the last message of its turn (field 3, written
+        /// only when true).
+        end: bool,
     },
     /// 2: `{0: 2, 1: label, 2: ids}`; at most [`MAX_WANT`](crate::MAX_WANT) ids.
     Want {
@@ -119,18 +123,37 @@ pub enum Message {
         /// The latest objects the sender holds.
         ids: Vec<Id>,
     },
+    /// 5: `{0: 5, 1: label, 2: count, 3: nonce, 4: bits, 5: short ids,
+    /// 6: end of turn}`, on long delays (`sync.md#long-delays`).
+    Summary {
+        /// The set.
+        label: Label,
+        /// How many ids the sender holds in the set.
+        count: u64,
+        /// Random, new for each summary.
+        nonce: [u8; 32],
+        /// The length of a short id in bits: a multiple of 8, 8 to 256.
+        bits: u32,
+        /// This message's short ids, ascending, written one after another.
+        short_ids: Vec<u8>,
+        /// Whether this is the last message of the summary (field 6,
+        /// written only when true).
+        end: bool,
+    },
 }
 
 impl Message {
     /// The record form.
     pub fn to_record(&self) -> Record {
         match self {
-            Message::Reconcile { label, ranges } => {
-                Record::new().with(0, 1u64).with(1, *label).with(
+            Message::Reconcile { label, ranges, end } => Record::new()
+                .with(0, 1u64)
+                .with(1, *label)
+                .with(
                     2,
                     Value::List(ranges.iter().map(|r| r.to_record().into()).collect()),
                 )
-            }
+                .with_opt(3, end.then_some(1u64)),
             Message::Want { label, ids } => Record::new()
                 .with(0, 2u64)
                 .with(1, *label)
@@ -145,12 +168,29 @@ impl Message {
                 .with(0, 4u64)
                 .with(1, *label)
                 .with(2, id_list(ids)),
+            Message::Summary {
+                label,
+                count,
+                nonce,
+                bits,
+                short_ids,
+                end,
+            } => Record::new()
+                .with(0, 5u64)
+                .with(1, *label)
+                .with(2, *count)
+                .with(3, *nonce)
+                .with(4, u64::from(*bits))
+                .with(5, short_ids.clone())
+                .with_opt(6, end.then_some(1u64)),
         }
     }
 
     /// Reads the record form. Ranges of a reconcile message are checked:
-    /// at least one, upper bounds strictly ascending, and only the last
-    /// open-ended.
+    /// at least one, upper bounds strictly ascending, and the last
+    /// open-ended exactly when the message ends its turn. A summary's bits
+    /// are checked, and its short ids for whole length and order within the
+    /// message; what spans messages is [`SummaryReader`](crate::SummaryReader)'s.
     pub fn from_record(r: &Record) -> Result<Message, SyncError> {
         let op = r.uint(0)?;
         let label = r.bytes_n::<32>(1)?;
@@ -161,8 +201,9 @@ impl Message {
                     .into_iter()
                     .map(Range::from_record)
                     .collect::<Result<Vec<_>, _>>()?;
-                check_ranges(&ranges)?;
-                Message::Reconcile { label, ranges }
+                let end = r.opt_bool(3)?.unwrap_or(false);
+                check_ranges(&ranges, end)?;
+                Message::Reconcile { label, ranges, end }
             }
             2 => Message::Want {
                 label,
@@ -184,6 +225,34 @@ impl Message {
                 label,
                 ids: read_ids(r, 2)?,
             },
+            5 => {
+                let bits = r.uint(4)?;
+                if !(8..=256).contains(&bits) || bits % 8 != 0 {
+                    return Err(SyncError::BadSummary(
+                        "bits must be a multiple of 8 from 8 to 256",
+                    ));
+                }
+                let short_ids = r.bytes(5)?.to_vec();
+                let width = (bits / 8) as usize;
+                if short_ids.len() % width != 0 {
+                    return Err(SyncError::BadSummary("short ids are not whole"));
+                }
+                if short_ids
+                    .chunks(width)
+                    .zip(short_ids.chunks(width).skip(1))
+                    .any(|(a, b)| a > b)
+                {
+                    return Err(SyncError::BadSummary("short ids must ascend"));
+                }
+                Message::Summary {
+                    label,
+                    count: r.uint(2)?,
+                    nonce: r.bytes_n::<32>(3)?,
+                    bits: bits as u32,
+                    short_ids,
+                    end: r.opt_bool(6)?.unwrap_or(false),
+                }
+            }
             _ => return Err(SyncError::UnknownOp(op)),
         })
     }
@@ -203,20 +272,35 @@ impl Message {
         match self {
             Message::Reconcile { label, .. }
             | Message::Want { label, .. }
-            | Message::Objects { label, .. } => label,
+            | Message::Objects { label, .. }
+            | Message::Summary { label, .. } => label,
             Message::Heads { label, .. } => label,
         }
     }
 }
 
-/// Checks that ranges cover every id: non-empty, strictly ascending upper
-/// bounds, and exactly the last one open-ended.
-pub(crate) fn check_ranges(ranges: &[Range]) -> Result<(), SyncError> {
+/// Checks the ranges of one message: non-empty, strictly ascending upper
+/// bounds, and the last one open-ended exactly when the message ends its
+/// turn (`sync.md#messages`). That one message goes on where the one before
+/// it stopped is the [`Reconciler`](crate::Reconciler)'s to check.
+pub(crate) fn check_ranges(ranges: &[Range], end: bool) -> Result<(), SyncError> {
     let Some((last, init)) = ranges.split_last() else {
         return Err(SyncError::BadRanges("no ranges"));
     };
-    if last.upper.is_some() {
-        return Err(SyncError::BadRanges("final range must be open-ended"));
+    if end && last.upper.is_some() {
+        return Err(SyncError::BadRanges(
+            "a turn's final range must be open-ended",
+        ));
+    }
+    if !end && last.upper.is_none() {
+        return Err(SyncError::BadRanges(
+            "only a turn's final range may be open-ended",
+        ));
+    }
+    if let (Some(u), Some(p)) = (&last.upper, init.last().and_then(|r| r.upper.as_ref())) {
+        if p >= u {
+            return Err(SyncError::BadRanges("upper bounds must ascend"));
+        }
     }
     let mut prev: Option<&Id> = None;
     for r in init {
@@ -260,6 +344,31 @@ mod tests {
                         mode: Mode::YouLack(vec![]),
                     },
                 ],
+                end: true,
+            },
+            Message::Reconcile {
+                label: [1; 32],
+                ranges: vec![Range {
+                    upper: Some([2; 32]),
+                    mode: Mode::Skip,
+                }],
+                end: false,
+            },
+            Message::Summary {
+                label: [1; 32],
+                count: 3,
+                nonce: [4; 32],
+                bits: 16,
+                short_ids: vec![0, 1, 0, 1, 9, 9],
+                end: true,
+            },
+            Message::Summary {
+                label: [1; 32],
+                count: 0,
+                nonce: [4; 32],
+                bits: 8,
+                short_ids: vec![],
+                end: false,
             },
             Message::Want {
                 label: [1; 32],
@@ -286,6 +395,7 @@ mod tests {
                 &Message::Reconcile {
                     label: [0; 32],
                     ranges,
+                    end: true,
                 }
                 .encode(),
             )
@@ -320,5 +430,26 @@ mod tests {
                 mode: Mode::Skip
             }
         ]));
+    }
+
+    #[test]
+    fn rejects_bad_summaries() {
+        let summary = |bits: u32, short_ids: Vec<u8>| Message::Summary {
+            label: [0; 32],
+            count: 2,
+            nonce: [0; 32],
+            bits,
+            short_ids,
+            end: true,
+        };
+        let ok = |m: Message| Message::decode(&m.encode()).is_ok();
+        assert!(ok(summary(16, vec![0, 1, 0, 2])));
+        assert!(ok(summary(16, vec![0, 1, 0, 1])), "equal ones each listed");
+        assert!(!ok(summary(16, vec![0, 2, 0, 1])), "descending");
+        assert!(!ok(summary(16, vec![0, 1, 0])), "not whole");
+        assert!(!ok(summary(12, vec![0, 1, 0, 2])), "not a multiple of 8");
+        assert!(!ok(summary(0, vec![])));
+        assert!(!ok(summary(264, vec![])));
+        assert!(ok(summary(256, vec![7; 32])));
     }
 }
