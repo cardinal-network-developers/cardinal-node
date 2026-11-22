@@ -730,11 +730,20 @@ differs or was read:
   (else the keys removed), which `cardinal recover` keeps showing from
   `recovered.json`. Other spaces, the files space among them, come back
   only as their other holders are reached.
-- **Reading: what contacts are told.** `contacts` says, for a contact
-  whose log shows a recovery in effect, "was recovered by guardians they
-  chose, after DELAY. If in doubt, check with them in person." whenever it
-  lists them, not once. The spec gives "on" the date of the policy, but an
-  identity entry carries no time, so no date is given.
+- **What contacts are told** (designer, ASK 8 = b, 2026-11-22;
+  `identity.md#what-a-recovery-does`). `contacts` says, for a contact whose
+  log shows a recovery in effect, whenever it lists them: "was recovered by
+  guardians they had chosen by DAY, after DELAY. If in doubt, check with
+  them in person.", DAY being when this device first saw the policy the
+  recovery was decided under (`seen-policies.json`, now `{at,
+  with_recovery}` by policy; the time alone, as written before, reads as
+  seen before any recovery). Where this device first saw the policy with a
+  recovery under it already in the log, no day: "was recovered by
+  guardians, after DELAY. These guardians were new to this device when the
+  recovery came. Check with NAME another way." For clients, the contact
+  record carries `recovered_seen` (that time, in ms) and
+  `recovered_new_guardians` beside the text (`apps.md`, contact fields 15
+  and 16).
 - **Reading: keeping a lost device's work after a recovery.** A recovery
   that kept none of the old keys leaves everything they wrote unwitnessed,
   every space's genesis included; the spec lets the person keep "those

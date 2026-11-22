@@ -908,9 +908,11 @@ pub fn list(d: &Daemon, all: bool) -> Json {
         .filter(|c| c.recovery_of.is_none())
         .filter(|c| all || !c.refused)
         .map(|c| {
-            let recovered = recovered_note(d, &c.identity);
+            let recovered = recovered_note(d, &c.identity, &c.petname);
             let v = json!({
-                "recovered": recovered,
+                "recovered": recovered.as_ref().map(|r| r.text.clone()),
+                "recovered_seen": recovered.as_ref().and_then(|r| r.seen),
+                "recovered_new_guardians": recovered.as_ref().map(|r| r.new_guardians),
                 "met": c.met.as_ref().map(|m| met_json(m, &everyone, &group_names)),
                 "identity": hex::encode(&c.identity[..8]),
                 "trusted": c.regard.trusted,
@@ -929,9 +931,17 @@ pub fn list(d: &Daemon, all: bool) -> Json {
 
 /// What a contact's software says of someone recovered by guardians
 /// (`identity.md#what-a-recovery-does`, D79), if their log shows a recovery
-/// in effect. Identity entries carry no time, so the date of the policy is
-/// not given (DEVIATIONS.md).
-fn recovered_note(d: &Daemon, who: &[u8; 32]) -> Option<String> {
+/// in effect: the text, the day this device first saw the policy it was
+/// decided under, and whether it first saw that policy together with the
+/// recovery, when there is no day to give and the person is to be checked
+/// with another way (designer, ASK 8 = b).
+pub(crate) struct Recovered {
+    pub text: String,
+    pub seen: Option<u64>,
+    pub new_guardians: bool,
+}
+
+fn recovered_note(d: &Daemon, who: &[u8; 32], name: &str) -> Option<Recovered> {
     let core = d.core();
     let log = &core.others.get(who)?.log;
     let st = log.state();
@@ -940,55 +950,107 @@ fn recovered_note(d: &Daemon, who: &[u8; 32]) -> Option<String> {
         .into_iter()
         .find(|r| st.in_effect.contains(&r.entry))?;
     let p = log.policy(&r.policy)?;
-    // The date the policy was chosen on, as this device first saw it.
-    let on = first_seen(d, &r.policy).map(day_text);
-    Some(match on {
-        Some(day) => format!(
-            "was recovered by guardians they chose on {day}, after {}. If in doubt, check \
-             with them in person.",
-            crate::guardians::delay_text(p.delay)
-        ),
-        None => format!(
-            "was recovered by guardians they chose, after {}. If in doubt, check with them \
-             in person.",
-            crate::guardians::delay_text(p.delay)
-        ),
+    let delay = crate::guardians::delay_text(p.delay);
+    let seen = first_seen(d, &r.policy);
+    Some(match seen {
+        Some(Seen {
+            at,
+            with_recovery: false,
+        }) => Recovered {
+            text: format!(
+                "was recovered by guardians they had chosen by {}, after {delay}. If in \
+                 doubt, check with them in person.",
+                day_text(at)
+            ),
+            seen: Some(at),
+            new_guardians: false,
+        },
+        _ => Recovered {
+            text: format!(
+                "was recovered by guardians, after {delay}. These guardians were new to this \
+                 device when the recovery came. Check with {name} another way."
+            ),
+            seen: None,
+            new_guardians: true,
+        },
     })
+}
+
+/// When this device first saw a recovery policy of a contact's, and
+/// whether a recovery under it came with it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+struct Seen {
+    at: u64,
+    #[serde(default)]
+    with_recovery: bool,
+}
+
+/// What `seen-policies.json` holds, by policy in hex: a record, or, as
+/// written before, the time alone.
+#[derive(serde::Deserialize)]
+#[serde(untagged)]
+enum Kept {
+    Seen(Seen),
+    At(u64),
+}
+
+fn seen_policies(d: &Daemon) -> std::collections::BTreeMap<String, Seen> {
+    let path = d.paths.home.join("seen-policies.json");
+    read_seen(&std::fs::read(path).unwrap_or_default())
+}
+
+fn read_seen(bytes: &[u8]) -> std::collections::BTreeMap<String, Seen> {
+    let read: std::collections::BTreeMap<String, Kept> =
+        serde_json::from_slice(bytes).unwrap_or_default();
+    read.into_iter()
+        .map(|(k, v)| {
+            let seen = match v {
+                Kept::Seen(s) => s,
+                Kept::At(at) => Seen {
+                    at,
+                    with_recovery: false,
+                },
+            };
+            (k, seen)
+        })
+        .collect()
 }
 
 /// When this device first saw each recovery policy of its contacts
 /// (`seen-policies.json`): identity entries carry no time, so this is the
-/// date a contact's software can give for one (DEVIATIONS.md).
-fn first_seen(d: &Daemon, policy: &[u8; 32]) -> Option<u64> {
-    let b = std::fs::read(d.paths.home.join("seen-policies.json")).ok()?;
-    let m: std::collections::BTreeMap<String, u64> = serde_json::from_slice(&b).ok()?;
-    m.get(&hex::encode(policy)).copied()
+/// date a contact's software can give for one (`identity.md`).
+fn first_seen(d: &Daemon, policy: &[u8; 32]) -> Option<Seen> {
+    seen_policies(d).get(&hex::encode(policy)).copied()
 }
 
 /// Notes when this device first saw `who`'s current recovery policy, and
-/// those their recoveries act under.
+/// those their recoveries act under; and, for each, whether a recovery
+/// under it was in their log already then.
 pub(crate) fn note_policies(d: &Daemon, who: &[u8; 32]) {
     let path = d.paths.home.join("seen-policies.json");
-    let mut m: std::collections::BTreeMap<String, u64> = std::fs::read(&path)
-        .ok()
-        .and_then(|b| serde_json::from_slice(&b).ok())
-        .unwrap_or_default();
-    let policies: Vec<[u8; 32]> = {
+    let mut m = seen_policies(d);
+    let (policies, recovered): (Vec<[u8; 32]>, Vec<[u8; 32]>) = {
         let core = d.core();
         let Some(o) = core.others.get(who) else {
             return;
         };
-        o.log
+        let under: Vec<[u8; 32]> = o.log.recoveries().into_iter().map(|r| r.policy).collect();
+        let all = o
+            .log
             .current_policy()
             .map(|p| p.entry)
             .into_iter()
-            .chain(o.log.recoveries().into_iter().map(|r| r.policy))
-            .collect()
+            .chain(under.iter().copied())
+            .collect();
+        (all, under)
     };
     let mut changed = false;
     for p in policies {
         if let std::collections::btree_map::Entry::Vacant(v) = m.entry(hex::encode(p)) {
-            v.insert(now_ms());
+            v.insert(Seen {
+                at: now_ms(),
+                with_recovery: recovered.contains(&p),
+            });
             changed = true;
         }
     }
@@ -1896,6 +1958,27 @@ mod tests {
             invitation,
             at,
         }
+    }
+
+    /// What `seen-policies.json` held before (the time alone) reads as a
+    /// policy seen before any recovery; what it holds now says.
+    #[test]
+    fn seen_policies_read_as_written_before_and_now() {
+        let m = read_seen(br#"{"aa": 5, "bb": {"at": 6, "with_recovery": true}}"#);
+        assert_eq!(
+            m["aa"],
+            Seen {
+                at: 5,
+                with_recovery: false
+            }
+        );
+        assert_eq!(
+            m["bb"],
+            Seen {
+                at: 6,
+                with_recovery: true
+            }
+        );
     }
 
     #[test]
