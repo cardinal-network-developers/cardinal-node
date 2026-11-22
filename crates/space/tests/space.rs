@@ -962,6 +962,12 @@ fn a_restore_brings_back_what_its_delete_took_and_nothing_else() {
     );
     every_way(&a);
     every_way(&b);
+    // a restore of Trip, left in delete conflict, brings back what the
+    // delete that yielded there took beneath it
+    write(&mut a, d0, vec![SpaceOp::restore(trip)]);
+    assert!(!deleted(&a, &fa) && !deleted(&a, &fb) && !deleted(&a, &fc));
+    assert!(!a.state().node(&trip).unwrap().delete_conflict);
+    every_way(&a);
 }
 
 /// `state.md#deletion-yields-to-concurrent-work`: a delete of a node that
@@ -1029,20 +1035,20 @@ fn a_delete_of_what_is_deleted_does_nothing() {
     every_way(&a);
     // one delete took all three: they share its number
     let canonical = a.state().canonical();
-    let numbers: Vec<Option<u64>> = canonical
+    let numbers: Vec<u64> = canonical
         .list(1)
         .unwrap()
         .iter()
         .filter_map(|v| v.as_record())
-        .map(|r| r.opt_uint(6).unwrap())
+        .map(|r| r.uint(6).unwrap())
         .collect();
-    assert_eq!(numbers, [Some(0); 3]);
+    assert_eq!(numbers, [1; 3]);
     write(&mut b, d1, vec![SpaceOp::restore(trip)]);
     sync(&b, &mut a, &p.enc);
     assert!([trip, fa, late].iter().all(|n| !deleted(&a, n)));
     every_way(&a);
 
-    // a canonical state whose deletes are not numbered from 0, in the
+    // a canonical state whose deletes are not numbered from 1, in the
     // order its records first list them, is not one any device computes
     let renumbered = |canonical: &Record, by: &dyn Fn(u64) -> u64| -> Record {
         let list: Vec<cardinal_encoding::Value> = canonical
@@ -1051,9 +1057,9 @@ fn a_delete_of_what_is_deleted_does_nothing() {
             .iter()
             .map(|v| {
                 let r = v.as_record().unwrap();
-                match r.opt_uint(6).unwrap() {
-                    Some(n) => r.clone().with(6, by(n)).into(),
-                    None => r.clone().into(),
+                match r.uint(6).unwrap() {
+                    0 => r.clone().into(),
+                    n => r.clone().with(6, by(n)).into(),
                 }
             })
             .collect();
@@ -1064,24 +1070,12 @@ fn a_delete_of_what_is_deleted_does_nothing() {
     let two = a.state().canonical();
     assert!(cardinal_space::State::from_canonical(Profile::FILES, &two).is_ok());
     let from_one = |n: u64| n + 1;
-    let swapped = |n: u64| 1 - n;
+    let swapped = |n: u64| 3 - n;
     let ways: [&dyn Fn(u64) -> u64; 2] = [&from_one, &swapped];
     for by in ways {
         let bad = renumbered(&two, by);
         assert!(cardinal_space::State::from_canonical(Profile::FILES, &bad).is_err());
     }
-    let as_bool = renumbered(&two, &|n| n).with(1, {
-        let list = two.list(1).unwrap().to_vec();
-        let flagged = list.into_iter().map(|v| {
-            let r = v.as_record().unwrap().clone();
-            match r.opt_uint(6).unwrap() {
-                Some(_) => r.with(6, true).into(),
-                None => r.into(),
-            }
-        });
-        cardinal_encoding::Value::List(flagged.collect())
-    });
-    assert!(cardinal_space::State::from_canonical(Profile::FILES, &as_bool).is_err());
 }
 
 #[test]

@@ -98,6 +98,10 @@ pub struct Node {
     created_op: u32,
     /// The delete that set its deleted flag, if it is set.
     deleted_by: Option<Took>,
+    /// The delete of it that yielded to concurrent work and flagged it a
+    /// delete conflict, which may have taken what was beneath it: a
+    /// restore of it brings that back.
+    conflict_by: Option<Took>,
 }
 
 /// The delete that took a node (`state.md#deletion-yields-to-concurrent-work`):
@@ -578,7 +582,7 @@ impl State {
             let creator = r.get(9).and_then(id32).ok_or(bad.clone())?;
             let rank = r.uint(10)?;
             // the delete that took it, if it is deleted
-            let took = r.opt_uint(6)?;
+            let took = Some(r.uint(6)?).filter(|t| *t != 0);
             if let Some(t) = took.filter(|t| !numbers.contains(t)) {
                 numbers.push(t);
             }
@@ -615,13 +619,14 @@ impl State {
                     created: r.opt_uint(11)?,
                     created_op: 0,
                     deleted_by: took.map(Took::Carried),
+                    conflict_by: None,
                 },
             );
             st.carried.insert(id, rank);
         }
-        // The deletes are numbered from 0 in the order the records list the
+        // The deletes are numbered from 1 in the order the records list the
         // first node each took: what a state computed from entries numbers.
-        if numbers != (0..numbers.len() as u64).collect::<Vec<_>>() {
+        if numbers != (1..=numbers.len() as u64).collect::<Vec<_>>() {
             return Err(bad);
         }
         // Every parent is a node it records, or the root, and no node is
@@ -1087,6 +1092,7 @@ impl State {
                             created: e.time(),
                             created_op: i,
                             deleted_by: None,
+                            conflict_by: None,
                         },
                     );
                 }
@@ -1181,18 +1187,25 @@ impl State {
                     if eff.conflict {
                         if let Some(n) = self.nodes.get_mut(node) {
                             n.delete_conflict = true;
+                            n.conflict_by = Some(Took::Op(id, i));
                         }
                     }
                 }
                 SpaceOpBody::Restore { node } => {
                     // the node's flag, and those its delete set beneath it
-                    let by = self.nodes.get(node).and_then(|n| n.deleted_by);
+                    // or, where its delete yielded, what that delete took
+                    // beneath it
+                    let by = self
+                        .nodes
+                        .get(node)
+                        .and_then(|n| n.deleted_by.or(n.conflict_by));
                     for m in self.subtree(node) {
                         if let Some(n) = self.nodes.get_mut(&m) {
                             if m == *node || (by.is_some() && n.deleted_by == by) {
                                 n.deleted = false;
                                 n.delete_conflict = false;
                                 n.deleted_by = None;
+                                n.conflict_by = None;
                             }
                         }
                     }
@@ -1355,7 +1368,7 @@ impl State {
             .collect();
         made.sort_unstable();
         let rank: HashMap<NodeId, u64> = made.iter().map(|(_, _, _, id)| *id).zip(0..).collect();
-        // Each delete that took a node is numbered from 0, in the order the
+        // Each delete that took a node is numbered from 1, in the order the
         // records list the first node it took: so a restore in a successor
         // clears exactly the flags one delete set.
         let mut ids: Vec<&NodeId> = self.nodes.keys().collect();
@@ -1363,20 +1376,20 @@ impl State {
         let mut number: HashMap<Took, u64> = HashMap::new();
         for id in ids {
             if let Some(t) = self.nodes[id].deleted_by.filter(|_| self.nodes[id].deleted) {
-                let next = number.len() as u64;
+                let next = number.len() as u64 + 1;
                 number.entry(t).or_insert(next);
             }
         }
         let mut records: Vec<(NodeId, Record)> = Vec::new();
         for (id, n) in &self.nodes {
-            let took = n.deleted_by.filter(|_| n.deleted).map(|t| number[&t]);
+            let took = n.deleted_by.filter(|_| n.deleted).map_or(0, |t| number[&t]);
             let r = Record::new()
                 .with(1, n.id)
                 .with(2, n.kind.to_value())
                 .with(3, n.parent)
                 .with(4, n.name.as_str())
                 .with(5, fields(&n.fields))
-                .with_opt(6, took)
+                .with(6, took)
                 .with(7, n.position_writer)
                 .with(8, n.delete_conflict)
                 .with(9, n.creator)

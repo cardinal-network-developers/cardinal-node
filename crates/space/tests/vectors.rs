@@ -192,18 +192,18 @@ fn restore_vector(key: &SigningKey, author: [u8; 32], head: [u8; 32], epoch: [u8
     let named = [("Trip", trip), ("a", a), ("b", b), ("c", c)];
     let flags = |st: &State| flags_of(st, &named);
     // Two deletes stand after e4: each deleted node's record numbers the
-    // delete that took it, from 0 in the order the records list the first
+    // delete that took it, from 1 in the order the records list the first
     // node each took.
     let taken = state_of(&dag);
     let taken_canonical = taken.canonical();
-    let number_of = |id: [u8; 16]| -> Option<u64> {
+    let number_of = |id: [u8; 16]| -> u64 {
         let list = taken_canonical.list(1).unwrap();
         let r = list
             .iter()
             .filter_map(|v| v.as_record())
             .find(|r| r.bytes(1).ok() == Some(&id[..]))
             .unwrap();
-        r.opt_uint(6).unwrap()
+        r.uint(6).unwrap()
     };
     let numbers: serde_json::Map<String, Json> = named
         .iter()
@@ -238,8 +238,8 @@ fn restore_vector(key: &SigningKey, author: [u8; 32], head: [u8; 32], epoch: [u8
             before. e4 flags Trip, a and b, and not c, which e3 had flagged. In the canonical \
             state after e4 (`after_deletes_canonical`), field 6 of each deleted node's record \
             is the number of the delete that took it, the same for every node one delete \
-            took, counted from 0 in the order the records, sorted by node id, list the first \
-            node each delete took: `after_deletes_numbers`. After e5 Trip, \
+            took, counted from 1 in the order the records, sorted by node id, list the first \
+            node each delete took, and 0 for a node not deleted: `after_deletes_numbers`. After e5 Trip, \
             a and b are back and c is still deleted: `after_restore` gives each node's flags \
             and `after_restore_canonical` the canonical state's encoding. Then e6 restores c \
             and e7 deletes Trip, both after e5 and so concurrent: the restore names c, which \

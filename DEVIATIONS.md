@@ -1216,19 +1216,27 @@ Readings:
   restored. (Before, a second delete flagged it, and it stayed deleted.)
   Two deletes of one folder made at once still both yield, as before: each
   names the folder, which touches it.
-- **The delete number** (designer, 2026-11-22; `vectors/state.json`,
-  `a_restore`). In the canonical state, field 6 of a deleted node's record
-  is no longer `true` but the number of the delete that took it, the same
-  for every node one delete took, so that a restore in a successor clears
-  exactly what one delete set. **Readings, until `state.md` says:** field 6
-  is a uint, absent when the node is not deleted (a bool there is
-  malformed); deletes are numbered from 0 in the order the records, sorted
-  by node id, list the first node each took; a canonical state numbered
-  any other way is refused, as one no device computes. A successor's
-  initial state is read with each carried node's number, and a restore
-  there clears the node and every node carried with the same number. The
+- **The delete number** (designer, 2026-11-22; `state.md#canonical-state`;
+  `vectors/state.json`, `a_restore`). Field 6 of a node record in the
+  canonical state is 0 for a node not deleted, and otherwise the number of
+  the delete that took it, the same for every node one delete took,
+  counted from 1 in the order the records, sorted by node id, first reach
+  each delete. A canonical state numbered any other way is refused, as one
+  no device computes (a bool's `true` is the integer 1, so a state with one
+  delete written as before still reads). A successor's initial state is
+  read with each carried node's number, and a restore there clears the node
+  and every node carried with the same number. The
   numbers are the canonical state's alone: a device keeps which op took a
   node, and numbers the deletes afresh each time it writes the state.
+- **Reading: a restore of a node left in delete conflict** (the spec does
+  not say). A delete that yielded at N still took what beneath N nothing
+  touched; a restore of N brings that back, as a restore of a deleted N
+  brings back what its delete took, and clears N's delete conflict. A
+  successor does not learn of it: the canonical state numbers only deletes
+  that flagged their node, so there a restore of such an N clears its
+  delete conflict only. **Spec question:** whether the canonical state
+  should give a node left in delete conflict the number of the delete that
+  yielded there.
 - **Any kind, anywhere** (`state.md#operations`). A `create` is accepted
   whatever its kind and wherever it puts the node, and the files and
   account profiles reject nothing for kind or place any more. What shows a
@@ -1256,8 +1264,11 @@ Readings:
   not recomputed ([Spaces](#spaces-specspacesmd)).
 - **Written beside.** A `set` written beside adds its value and supersedes
   none; a `delete` written beside deletes nothing and flags the node delete
-  conflict, and does nothing on a node that is already deleted. Nothing here
-  writes either: they belong to posting work again after a succession.
+  conflict, and does nothing on a node that is already deleted. They are
+  written for work posted again after a succession, and for a local change
+  of what came from elsewhere and was not shown yet
+  ([Daemon](#daemon-mount-and-cli-cardinald-cardinal), "What a local change
+  has seen").
 ## Link (`spec/link.md`)
 
 Deviations:
@@ -1940,23 +1951,28 @@ Not implemented yet (the next milestone):
   `cardinal free-space` deletes every old version on this device now.
   Restoring a version first makes sure all of it is on this device,
   fetching what is missing, and refuses when no online device has it.
-- **Spec ambiguity: what a local change has "seen".** `state.md` decides
-  supersession and delete conflicts by entry ancestry, and an entry's
-  parents are normally all current heads. A device that holds an entry
-  from elsewhere but has not *shown* it yet (it arrived in the quiet
-  period before a commit, or the file had local changes so the mount
-  kept the local view) would, by citing every head, claim to have seen
-  it: a local edit would silently supersede the remote one, a local
-  delete would win over a remote edit. Here such local ops are written in
-  an entry whose parents are the latest entries that do not descend from
-  the unseen ones (`Space::write_concurrent`), so the result is the
-  conflict copy or delete conflict the spec asks for. The spec could say
-  that parents are what the author had *seen*, not merely held, and that
-  writing with older parents is legitimate (`spaces.md` only notes
-  backdating in the context of memberships). When the current epoch began
-  after the unseen entry, or a rotation is due, the change is written
-  normally instead (an old-epoch entry could expose new content to a
-  removed device), with a warning.
+- **What a local change has "seen": written beside** (designer, ASK 7 = c,
+  2026-11-22). A device that holds an entry from elsewhere but has not
+  *shown* it yet (it arrived in the quiet period before a commit, or the
+  file had local changes so the mount kept the local view) writes its
+  local changes as every entry is written, on all the valid heads, under
+  the current epoch; but the op that would replace what it did not show is
+  written **beside**, so the two stand in conflict and nothing is chosen
+  silently. A content edit of a file with a version it has not shown is a
+  `set` beside, and so is its mode or modified time where such a version
+  set that field too (elsewhere a beside `set` of the mode would leave the
+  mode in conflict with the value this device had seen, which a file shows
+  as no mode). A delete of something changed elsewhere unseen, or of a
+  folder with something changed beneath it unseen, is a `delete` beside:
+  it deletes nothing and flags the node delete conflict, whatever beneath
+  it was untouched (a delete that yields would have taken that). **Readings:**
+  where the version this device had seen is still a value beside the unseen
+  one (two that were in conflict), the `set` beside leaves it too, a
+  conflict of three; and "beside" is widened from posting again after a
+  succession to this. (Before, such ops went in an entry of their own with
+  older parents, `Space::write_concurrent`, and were written normally, with
+  a warning, where an epoch had begun since; that is gone, and
+  `write_concurrent` is left to tests, which play another device with it.)
 - **A file edited here and deleted elsewhere, unseen,** is created again as
   a new node rather than kept as a delete conflict of the old one (as
   before); nothing is lost, but its history starts over.
