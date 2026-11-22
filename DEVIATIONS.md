@@ -1622,19 +1622,26 @@ Not implemented yet (the next milestone):
   poly1305_backend="soft"'` makes sealing a 1200-byte packet about twice as
   fast. Worth revisiting before tuning anything else.
 
-- **Spec ambiguity: flow control of a reset stream.** The `reset` frame
-  carries no final size (QUIC's RESET_STREAM does), so a receiver that
-  resets a stream cannot tell how much more data the peer sent before it
-  saw the reset. That data counts against the peer's session credit; if the
-  receiver drops it without counting it, the credit leaks away and the
-  session eventually stalls. Chosen without a wire
-  change: a stream reset locally is kept until the peer's `fin` or `reset`
-  arrives, and data arriving for it meanwhile is counted as received and
-  consumed; a side that receives a `reset` while it was still sending
-  answers with a `reset` of its own, so the other side knows the last of
-  the data has arrived. On reliable carriers this is exact. On UDP, data
-  lost before the reset is never resent and its credit is still lost.
-  Suggest: give `reset` a final-size field.
+- **A reset carries its final size** (decision on ASK review item, Daniel
+  2026-11-22, ahead of the `link.md` text; QUIC's RESET_STREAM). `reset`
+  is `{0: 5, 1: stream id, 2: reason, 3: final size}`, the final size the
+  highest offset the sender sent on the stream, written even when 0; a
+  reset without field 3 is malformed and closes the session. The receiver
+  counts every byte below the final size against the session window, at
+  once and as consumed, arrived or not, and drops what arrives later for
+  it (data past the final size, a final size below data received, or one
+  that differs from a fin already received, closes the session). A side
+  that receives a reset while still sending answers with a reset of its
+  own, carrying how much it sent, unless its fin has gone where it surely
+  arrives (over a reliable carrier, or acknowledged). A stream reset
+  locally is kept until the peer's fin or reset gives its final size.
+  This replaces the node's earlier workaround without a wire change,
+  which on UDP lost the credit of data lost before a reset.
+  - **Reading: a reset for a stream never seen** (its data lost, or
+    overtaken) opens and ends it at once: its final size is counted, and
+    it is answered with a reset of final size 0, so the sender can forget
+    the stream too; a peer stream reset before the frame naming its
+    service arrived is never offered to the application.
 - **Reading: streams whose first frames arrive out of order.** `link.md`
   does not say whether a frame for a peer stream id below the highest one
   seen, never seen before, opens that stream or belongs to one that ended.

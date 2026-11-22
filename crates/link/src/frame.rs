@@ -170,12 +170,16 @@ pub enum Frame {
     },
     /// 4: stream.
     Stream(StreamFrame),
-    /// 5: reset.
+    /// 5: reset: the stream ends, both ways, unfinished.
     Reset {
         /// Stream id.
         id: u64,
         /// Reason code.
         reason: u64,
+        /// The final size of what the sender sent on the stream: every
+        /// byte below it counts against the session window, arrived or
+        /// not (QUIC's RESET_STREAM).
+        final_size: u64,
     },
     /// 6: window.
     Window {
@@ -275,7 +279,15 @@ impl Frame {
                 .with_opt(4, s.fin.then_some(1u64))
                 .with_opt(5, s.service.map(Service::to_value))
                 .with_opt(6, s.priority.map(|p| p as u64)),
-            Frame::Reset { id, reason } => r.with(0, types::RESET).with(1, *id).with(2, *reason),
+            Frame::Reset {
+                id,
+                reason,
+                final_size,
+            } => r
+                .with(0, types::RESET)
+                .with(1, *id)
+                .with(2, *reason)
+                .with(3, *final_size),
             Frame::Window { id, max } => r.with(0, types::WINDOW).with(1, *id).with(2, *max),
             Frame::Datagram { channel, data } => r
                 .with(0, types::DATAGRAM)
@@ -377,6 +389,7 @@ impl Frame {
             types::RESET => Frame::Reset {
                 id: r.uint(1).map_err(bad("reset id"))?,
                 reason: r.opt_uint(2).map_err(bad("reset reason"))?.unwrap_or(0),
+                final_size: r.uint(3).map_err(bad("reset final size"))?,
             },
             types::WINDOW => Frame::Window {
                 id: r.uint(1).map_err(bad("window id"))?,
@@ -652,7 +665,11 @@ mod tests {
                 service: None,
                 priority: None,
             }),
-            Frame::Reset { id: 5, reason: 2 },
+            Frame::Reset {
+                id: 5,
+                reason: 2,
+                final_size: 70_000,
+            },
             Frame::Window {
                 id: 0,
                 max: 1 << 20,
@@ -705,5 +722,23 @@ mod tests {
         b.push(0xff);
         assert!(decode_frames(&b).is_err());
         assert!(decode_frames(&[0x00]).is_err());
+    }
+
+    #[test]
+    fn a_reset_says_how_much_was_sent() {
+        let f = Frame::Reset {
+            id: 3,
+            reason: 0,
+            final_size: 0,
+        };
+        let r = f.to_record();
+        assert_eq!(r.uint(3).unwrap(), 0, "a final size of 0 is written");
+        assert_eq!(decode_frames(&r.encode()).unwrap(), vec![f]);
+        // Without it, the frame is malformed.
+        let short = Record::new()
+            .with(0, types::RESET)
+            .with(1, 3u64)
+            .with(2, 0u64);
+        assert!(decode_frames(&short.encode()).is_err());
     }
 }
