@@ -566,7 +566,7 @@ pub static REQUESTS: &[Request] = &[
     req!(82 "group-role" (1 "group" REF, 2 "who" REF, 3 "role" T) -> (2 "group" B, 3 "was" B)),
     req!(83 "group-post-again" (1 "group" REF) -> (2 "posted" U)),
     req!(84 "group-moved-seen" (1 "group" REF) -> ()),
-    req!(85 "group-confirm-move" (1 "group" REF, 2 "moves" [B]) -> (2 "kept" U)),
+    req!(85 "group-confirm-move" (1 "group" REF, 2 "moves" [B], 3 "to" [B]) -> (2 "kept" U)),
     // ---- Calls and the clipboard: 100 to 119 ----
     req!(100 "call" () -> (2 "call" {CALL}, 3 "ended" {CALL_ENDED})),
     req!(101 "call-start" (1 "who" REF, 2 "group" REF, 3 "formats" [B], 4 "format_names" [T]) -> ()),

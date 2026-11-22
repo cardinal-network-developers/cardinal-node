@@ -703,22 +703,43 @@ pub fn moved_seen(d: &Daemon, group: &str) -> anyhow::Result<Json> {
 /// The person's OK to how another of their devices moved a group
 /// (`spaces.md#a-succession-by-a-device-that-is-later-removed`, "Kept when
 /// the person confirms it"): keeps each succession `moves` names (by the
-/// earlier group it left, as `to_confirm` gives it) that still awaits
-/// their word, a `keep` of the `succeed` and of the genesis it names, and
-/// clears the note as [`moved_seen`] does. A move the person was not shown,
-/// one that arrived after, is not kept. Answers how many entries it wrote.
-pub fn confirm_move(d: &Arc<Daemon>, group: &str, moves: &[String]) -> anyhow::Result<Json> {
+/// earlier group it left, and in `to`, beside it, the group it moved to,
+/// as `to_confirm` gives them) that still awaits their word, a `keep` of
+/// the `succeed` and of the genesis it names, and clears the note as
+/// [`moved_seen`] does. A move the person was not shown, one that arrived
+/// after, is not kept. Without `to`, a move is named by the group it left
+/// alone, which is refused where the person's devices moved that group to
+/// two places. Answers how many entries it wrote.
+pub fn confirm_move(
+    d: &Arc<Daemon>,
+    group: &str,
+    moves: &[String],
+    to: &[String],
+) -> anyhow::Result<Json> {
     let g = find(d, group)?;
     anyhow::ensure!(
         !moves.is_empty(),
         "say which moves the person saw (moves: the groups to_confirm gives)"
     );
-    let mut seen = Vec::new();
-    for m in moves {
+    anyhow::ensure!(
+        to.is_empty() || to.len() == moves.len(),
+        "to names where each move went, one for each of moves"
+    );
+    let id_of = |m: &String| -> anyhow::Result<SpaceId> {
         let id: Option<SpaceId> = hex::decode(m).ok().and_then(|b| b.try_into().ok());
-        seen.push(id.ok_or_else(|| anyhow::anyhow!("a move is a group id in hex: {m}"))?);
-    }
-    let written = d.core().confirm_moves(&g.id, &seen)?;
+        id.ok_or_else(|| anyhow::anyhow!("a move is a group id in hex: {m}"))
+    };
+    let seen = moves
+        .iter()
+        .map(id_of)
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    let written = if to.is_empty() {
+        d.core().confirm_moves(&g.id, &seen)?
+    } else {
+        let to = to.iter().map(id_of).collect::<anyhow::Result<Vec<_>>>()?;
+        let pairs: Vec<(SpaceId, SpaceId)> = seen.into_iter().zip(to).collect();
+        d.core().confirm_moves_to(&g.id, &pairs)?
+    };
     let kept = written.len();
     for (space, bytes) in written {
         d.push(&space, vec![bytes]);
@@ -738,10 +759,10 @@ fn to_confirm_json(
     named: &[Member],
     id: &SpaceId,
 ) -> Vec<Json> {
-    core.successions_to_confirm(id)
+    core.moves_to_confirm(id)
         .iter()
-        .filter_map(|old| {
-            let new = core.spaces.get(old)?.space.as_ref()?.successor()?;
+        .filter_map(|(old, new)| {
+            let new = *new;
             let sp = core.spaces.get(&new)?.space.as_ref()?;
             let mut c = change_json(core, me, contacts, named, &new);
             c["group"] = json!(hex::encode(old));

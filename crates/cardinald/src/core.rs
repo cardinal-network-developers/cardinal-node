@@ -3488,6 +3488,19 @@ impl Core {
     /// or where a keep of this person's already lists it. Software MUST
     /// NOT call this without its person. Returns the entries written.
     pub fn keep_succession(&mut self, old: &SpaceId) -> anyhow::Result<Written> {
+        let sp = self.spaces.get(old).and_then(|h| h.space.as_ref());
+        let sp = sp.ok_or_else(|| anyhow::anyhow!("that space is not open here"))?;
+        let new = sp
+            .successor()
+            .ok_or_else(|| anyhow::anyhow!("nothing stands in its place"))?;
+        self.keep_succession_to(old, &new)
+    }
+
+    /// [`Core::keep_succession`] of the move from `old` to `new` in
+    /// particular: the person's `succeed` in `old` naming `new`, and the
+    /// genesis of `new`.
+    pub fn keep_succession_to(&mut self, old: &SpaceId, new: &SpaceId) -> anyhow::Result<Written> {
+        let new = *new;
         let ident = self
             .identity
             .as_ref()
@@ -3495,9 +3508,6 @@ impl Core {
         let (me, mine) = (ident.id(), self.keys.key());
         let sp = self.spaces.get(old).and_then(|h| h.space.as_ref());
         let sp = sp.ok_or_else(|| anyhow::anyhow!("that space is not open here"))?;
-        let new = sp
-            .successor()
-            .ok_or_else(|| anyhow::anyhow!("nothing stands in its place"))?;
         let dag = sp.dag();
         let succeed = dag.log_order().iter().copied().find(|x| {
             dag.get(x).is_some_and(|e| {
@@ -3538,6 +3548,15 @@ impl Core {
     /// signed, where a `keep` of theirs does not yet list both it and the
     /// genesis of the space it names. Spaces not held here end the walk.
     pub fn successions_to_confirm(&self, id: &SpaceId) -> Vec<SpaceId> {
+        self.moves_to_confirm(id)
+            .into_iter()
+            .map(|(old, _)| old)
+            .collect()
+    }
+
+    /// [`Core::successions_to_confirm`], each with the space it moved to on
+    /// the way to `id`: `(old, to)`.
+    pub fn moves_to_confirm(&self, id: &SpaceId) -> Vec<(SpaceId, SpaceId)> {
         let (Some(me), mine) = (self.me(), self.keys.key()) else {
             return Vec::new();
         };
@@ -3568,7 +3587,7 @@ impl Core {
                     *key != mine && !self.kept_by_me(space, key, e)
                 };
                 if open(&old, &k, &x) || open(&cur, &g, &cur) {
-                    out.push(old);
+                    out.push((old, cur));
                 }
             }
             if old == *id {
@@ -3585,16 +3604,68 @@ impl Core {
     /// else, so that a move that arrived after they looked is not kept on
     /// a word given before it. Clears the note of the move once nothing is
     /// left to confirm. Software MUST NOT call this without its person.
+    ///
+    /// A move named by the earlier space alone is the one on the way to
+    /// `id` only where the person moved that space to one place: where
+    /// their devices moved it to two, it is refused, and nothing is kept,
+    /// for the window to name each by where it went too
+    /// ([`Core::confirm_moves_to`]).
     pub fn confirm_moves(&mut self, id: &SpaceId, seen: &[SpaceId]) -> anyhow::Result<Written> {
-        let waiting = self.successions_to_confirm(id);
-        let mut written = Vec::new();
-        for old in waiting.iter().filter(|o| seen.contains(o)) {
-            written.extend(self.keep_succession(old)?);
+        let waiting = self.moves_to_confirm(id);
+        let mut pairs = Vec::new();
+        for (old, to) in waiting.iter().filter(|(o, _)| seen.contains(o)) {
+            anyhow::ensure!(
+                self.moved_to(old).len() <= 1,
+                "that group was moved to more than one place: say which move was seen by \
+                 where it went too (to)"
+            );
+            pairs.push((*old, *to));
         }
-        if waiting.iter().all(|o| seen.contains(o)) {
+        self.confirm_moves_to(id, &pairs)
+    }
+
+    /// [`Core::confirm_moves`] with each move the person saw named by the
+    /// earlier space it left and the space it moved to, as `to_confirm`
+    /// gives them: only a move on the way to `id` that is both is kept.
+    pub fn confirm_moves_to(
+        &mut self,
+        id: &SpaceId,
+        seen: &[(SpaceId, SpaceId)],
+    ) -> anyhow::Result<Written> {
+        let waiting = self.moves_to_confirm(id);
+        let mut written = Vec::new();
+        for (old, to) in waiting.iter().filter(|m| seen.contains(m)) {
+            written.extend(self.keep_succession_to(old, to)?);
+        }
+        if waiting.iter().all(|m| seen.contains(m)) {
             self.moved_seen(id);
         }
         Ok(written)
+    }
+
+    /// Where this person's `succeed`s in `old` moved it, each once.
+    fn moved_to(&self, old: &SpaceId) -> Vec<SpaceId> {
+        let Some(me) = self.me() else {
+            return Vec::new();
+        };
+        let Some(sp) = self.spaces.get(old).and_then(|h| h.space.as_ref()) else {
+            return Vec::new();
+        };
+        let dag = sp.dag();
+        let mut out: Vec<SpaceId> = Vec::new();
+        for x in dag.log_order() {
+            let Some(e) = dag.get(x).filter(|e| e.author() == me) else {
+                continue;
+            };
+            for o in e.ops() {
+                if let SpaceOpBody::Succeed { successor, .. } = o.body() {
+                    if !out.contains(successor) {
+                        out.push(*successor);
+                    }
+                }
+            }
+        }
+        out
     }
 
     /// The name of the person's device that signed the genesis of `id`, a
@@ -7969,6 +8040,80 @@ mod tests {
         let kept = laptop.core.confirm_moves(&s2, &[s]).unwrap();
         assert_eq!(kept.len(), 2);
         assert!(laptop.core.successions_to_confirm(&s2).is_empty());
+    }
+
+    /// The review of 2026-11-23: a move is the group it left and the one
+    /// it went to. Ana's main device and her phone each move the group
+    /// before hearing of the other. The laptop is shown the first move,
+    /// and the phone's arrives before the person says OK: named by both,
+    /// the move shown is kept, and not the other; named by the group it
+    /// left alone, which is now either, it is refused.
+    #[test]
+    fn a_move_is_named_by_where_it_went_too() {
+        let ([mut ana, bo, _cy], g) = family();
+        let store = cardinal_blob::MemStore::new();
+        let mut phone = ana.second_device();
+        let mut laptop = ana.second_device();
+        phone.takes(&g, &ana.all_of(&g));
+        laptop.takes(&g, &ana.all_of(&g));
+        let s1 = ana
+            .core
+            .succeed(&store, &g, &[(bo.id(), WRITER)])
+            .unwrap()
+            .new;
+        let s2 = phone
+            .core
+            .succeed(&store, &g, &[(bo.id(), WRITER)])
+            .unwrap()
+            .new;
+        laptop.syncs(&ana, &g, &store);
+        assert!(laptop.holds(&s1));
+        let all = crate::groups::list_of(&laptop.core);
+        let mut one = all["groups"].as_array().unwrap().iter();
+        let shown = one.find(|x| x["group"] == hex::encode(s1)).unwrap()["to_confirm"].clone();
+        assert_eq!(shown[0]["group"], hex::encode(g), "{shown}");
+        assert_eq!(shown[0]["to"], hex::encode(s1), "{shown}");
+        assert_eq!(laptop.core.successions_to_confirm(&s1), vec![g]);
+        // before the person answers, the phone's move arrives
+        laptop.syncs(&phone, &g, &store);
+        assert_eq!(laptop.core.moves_to_confirm(&s1), vec![(g, s1)]);
+        // by the group it left alone: either move, so neither
+        let e = laptop.core.confirm_moves(&s1, &[g]).unwrap_err();
+        assert!(e.to_string().contains("more than one place"), "{e}");
+        // the other move is not on the way to this group
+        assert!(laptop
+            .core
+            .confirm_moves_to(&s1, &[(g, s2)])
+            .unwrap()
+            .is_empty());
+        let kept = laptop.core.confirm_moves_to(&s1, &[(g, s1)]).unwrap();
+        assert_eq!(kept.len(), 2, "the first succeed and its genesis");
+        assert!(laptop.core.moves_to_confirm(&s1).is_empty());
+        let g_space = laptop.space(&g);
+        let succeed_of = |to: SpaceId| {
+            let dag = g_space.dag();
+            dag.log_order().iter().copied().find(|x| {
+                dag.get(x).is_some_and(|e| {
+                    e.ops().iter().any(|o| {
+                        matches!(o.body(), SpaceOpBody::Succeed { successor, .. } if *successor == to)
+                    })
+                })
+            })
+        };
+        let (k1, k2) = (succeed_of(s1).unwrap(), succeed_of(s2).unwrap());
+        let me = laptop.core.keys.key();
+        let kept_by_laptop = |x: &EntryId| {
+            let dag = g_space.dag();
+            dag.log_order().iter().any(|y| {
+                dag.get(y).is_some_and(|e| {
+                    e.signer() == me
+                        && e.ops().iter().any(|o| {
+                            matches!(o.body(), SpaceOpBody::Keep { entries, .. } if entries.contains(x))
+                        })
+                })
+            })
+        };
+        assert!(kept_by_laptop(&k1) && !kept_by_laptop(&k2));
     }
 
     /// The review of 2026-11-22: a thief's phone that moves a group and
