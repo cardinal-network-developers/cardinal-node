@@ -3143,10 +3143,13 @@ impl Core {
         let bytes = log_bytes(&log);
         self.install_identity(&bytes)?;
         self.joining.clear();
-        tracing::info!(
-            "joined identity {} as a device",
-            short(&self.identity.as_ref().expect("installed").id())
-        );
+        let ident = self.identity.as_ref().expect("installed");
+        let power = match ident.state().power(&self.keys.key()) {
+            Some(cardinal_identity::Power::Admin) => "an admin device",
+            Some(cardinal_identity::Power::Root) => "its root",
+            _ => "a device",
+        };
+        tracing::info!("joined identity {} as {power}", short(&ident.id()));
         Ok(IdentityChange {
             changed: true,
             joined: true,

@@ -184,6 +184,11 @@ pub struct Bluetooth {
     /// made from it, and where a channel whose first message is pairing's
     /// goes.
     pairing: Mutex<Option<Pairing>>,
+    /// The channel of a pairing that ran over Bluetooth here, on a new
+    /// device waiting for the log that adds it: its tag stays advertised
+    /// while it waits, so that the admin device can find it again
+    /// whatever became of the first session.
+    joining: Mutex<Option<u16>>,
 }
 
 /// A pairing shown over Bluetooth.
@@ -385,6 +390,12 @@ fn keys(d: &Daemon) -> Keys {
     if let Some((channel, tx)) = lock(&d.bluetooth.pairing).as_ref() {
         if !tx.is_closed() {
             keys.push((TagType::OneTime, ble::pairing_key(*channel)));
+        }
+    }
+    // A new device waiting for the log that adds it: found again so.
+    if let Some(channel) = *lock(&d.bluetooth.joining) {
+        if matches!(*lock(&d.pairing), crate::daemon::PairState::Joining { .. }) {
+            keys.push((TagType::OneTime, ble::pairing_key(channel)));
         }
     }
     for secret in crate::contacts::answered_here(d) {
@@ -896,6 +907,14 @@ pub fn show_pairing(d: &Daemon, channel: u16, tx: mpsc::Sender<(ble::BoxChannel,
 /// The pairing code is no longer shown.
 pub fn stop_pairing(d: &Daemon) {
     *lock(&d.bluetooth.pairing) = None;
+}
+
+/// A pairing on `channel` ran over Bluetooth, and this device now waits
+/// for the log that adds it: the tag made from the channel is advertised
+/// for as long as it waits.
+pub fn wait_joining(d: &Daemon, channel: u16) {
+    *lock(&d.bluetooth.joining) = Some(channel);
+    d.bluetooth.poke.notify_one();
 }
 
 /// Looks nearby for a device showing a pairing code on `channel`, by the

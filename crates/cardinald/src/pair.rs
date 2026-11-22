@@ -97,10 +97,24 @@ pub async fn show(d: &Arc<Daemon>) -> anyhow::Result<Shown> {
                     *ps = PairState::Failed("the other device has no identity".into());
                     return;
                 };
-                d2.endpoint.add_secret(p.secret_entry());
+                let mut entry = p.secret_entry();
+                // Over Bluetooth the admin device may need more than one
+                // session to reach this one with the log (`dial_again`)
+                if p.channel.is_some() {
+                    entry.uses = Some(DIAL_AGAIN_USES);
+                }
+                d2.endpoint.add_secret(entry);
                 // Over Bluetooth, the link session follows on the channel.
                 if let Some(ch) = p.channel.take() {
-                    crate::bluetooth::carry(&d2, ch, "bluetooth pairing".into());
+                    // Tests stand in for a radio that stalls the session.
+                    if std::env::var_os("CARDINAL_TEST_BLE_DROP_PAIRING_CHANNEL").is_some() {
+                        drop(ch);
+                    } else {
+                        crate::bluetooth::carry(&d2, ch, "bluetooth pairing".into());
+                    }
+                    // and the admin device finds this one again by the
+                    // code's tag, until it has the log that adds it
+                    crate::bluetooth::wait_joining(&d2, code.channel);
                 }
                 let power = p.joins_at.and_then(Power::from_u64);
                 tracing::info!(
@@ -233,25 +247,39 @@ pub async fn type_code(
         Over::Lan(addr) => {
             let secret = zeroize::Zeroizing::new(paired.link_secret.to_vec());
             let endpoint = paired.peer.endpoint.socket_addr();
-            link_on_lan(d, endpoint, &secret, &nd, addr).await?
+            Some(link_on_lan(d, endpoint, &secret, &nd, addr).await?)
         }
         Over::Ble(seen, ch) => {
             let on = crate::bluetooth::carry(d, ch, format!("bluetooth pairing {}", seen.addr));
             let s = d
                 .endpoint
                 .connect_on(&on, paired.target_on(CarrierKind::Ble))
-                .await
-                .map_err(|e| {
-                    anyhow::anyhow!(
-                        "added the device, but the session over Bluetooth failed ({e}). Run \
-                         `cardinal pair` on it again."
-                    )
-                })?;
-            tokio::spawn(dial_again(d.clone(), s.clone(), seen, nd.link_key.clone()));
+                .await;
+            // The device is added either way: it is found again by the
+            // code's tag, which it shows until it has the log.
+            let s = match s {
+                Ok(s) => Some(s),
+                Err(e) => {
+                    tracing::warn!(
+                        "the session over Bluetooth with the new device failed ({e}); \
+                         finding it again"
+                    );
+                    None
+                }
+            };
+            tokio::spawn(dial_again(
+                d.clone(),
+                s.clone(),
+                code.channel,
+                nd.link_key.clone(),
+                paired.target_on(CarrierKind::Ble),
+            ));
             s
         }
     };
-    d.on_session(s);
+    if let Some(s) = s {
+        d.on_session(s);
+    }
     tracing::info!("added {} as a {:?} device", nd.name, power);
     Ok(nd.name)
 }
@@ -366,29 +394,66 @@ async fn find_and_pair(
 }
 
 /// Over Bluetooth the new device knows no address of this one's: once the
-/// pairing session ends, as it does when the new device has joined, this
-/// device dials it again where it was, as one of the person's own.
+/// pairing session ends, as it does when the new device has joined, or as
+/// it may before, if the radio stalls it, this device dials it again,
+/// found by the code's tag, which the new device advertises for as long as
+/// it waits for the log that adds it. Done when it no longer shows the tag
+/// (it joined, or gave up), when it reached this device itself, or after
+/// [`DIAL_AGAIN_FOR`].
 async fn dial_again(
     d: Arc<Daemon>,
-    pairing: cardinal_link::Session,
-    seen: crate::bluetooth::Seen,
+    pairing: Option<cardinal_link::Session>,
+    channel: u16,
     link_key: cardinal_crypto::HybridPublicKey,
+    target: Target,
 ) {
-    pairing.closed().await;
-    for _ in 0..10 {
-        tokio::time::sleep(Duration::from_secs(1)).await;
+    let until = tokio::time::Instant::now() + DIAL_AGAIN_FOR;
+    let mut current = pairing;
+    let mut missed = 0;
+    while tokio::time::Instant::now() < until {
+        if let Some(s) = current.take() {
+            s.closed().await;
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
         if d.is_online(link_key.x25519()) {
             return;
         }
-        match crate::bluetooth::dial(&d, &seen, std::slice::from_ref(&link_key)).await {
-            Ok(s) => {
-                d.on_session(s);
+        let Some(seen) = crate::bluetooth::find_pairing(&d, channel).await else {
+            // not showing it any more, twice: it joined, or stopped waiting
+            missed += 1;
+            if missed >= 2 {
                 return;
             }
-            Err(e) => tracing::debug!("Bluetooth: the new device at {}: {e:#}", seen.addr),
+            continue;
+        };
+        missed = 0;
+        // with the pairing's secret, the one thing it knows of this device
+        // until it has the log
+        let again = async {
+            let ch = crate::bluetooth::open_channel(&seen).await?;
+            let on = crate::bluetooth::carry(&d, ch, format!("bluetooth pairing {}", seen.addr));
+            let s = d.endpoint.connect_on(&on, target.clone()).await?;
+            anyhow::Ok(s)
+        };
+        match again.await {
+            Ok(s) => {
+                tracing::info!("Bluetooth: reached the new device again at {}", seen.addr);
+                d.on_session(s.clone());
+                current = Some(s);
+            }
+            Err(e) => {
+                tracing::debug!("Bluetooth: the new device at {}: {e:#}", seen.addr);
+                tokio::time::sleep(Duration::from_secs(2)).await;
+            }
         }
     }
 }
+
+/// How long an admin device keeps finding a new device paired over
+/// Bluetooth that has not joined yet.
+const DIAL_AGAIN_FOR: Duration = Duration::from_secs(600);
+/// How many sessions the pairing's secret opens, over Bluetooth.
+const DIAL_AGAIN_USES: u32 = 16;
 
 /// The link session with a device paired on the LAN: at its advertised
 /// endpoint, at the address reached.

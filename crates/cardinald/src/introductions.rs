@@ -501,7 +501,7 @@ mod tests {
         assert!(introduces(&all, &other));
         let refused = [yes.clone(), record(4, 7, true, true)];
         assert!(!introduces(&refused, &yes));
-        assert!(introduces(&[yes.clone()], &yes));
+        assert!(introduces(std::slice::from_ref(&yes), &yes));
         // and in a group, a refused record means their own name is not shown
         let me = [9; 32];
         assert_eq!(

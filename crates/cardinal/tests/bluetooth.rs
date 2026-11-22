@@ -644,3 +644,65 @@ fn a_new_device_is_paired_over_bluetooth_at_the_power_the_admin_chose() {
     stop(&mut a);
     stop(&mut b);
 }
+
+/// From the Android two-phone check: the session that follows a pairing
+/// over Bluetooth stalled, the admin had added the new device, and it
+/// never joined. Here the new device drops that session's channel: the
+/// admin finds it again by the code's tag, which it shows until it has the
+/// log, and it joins.
+#[test]
+fn a_new_device_whose_first_session_stalls_is_found_again_and_joins() {
+    let root = tempfile::tempdir().unwrap();
+    let ether = root.path().join("ether");
+    let mut a = dev(root.path(), "laptop", &ether);
+    let mut b = dev(root.path(), "phone", &ether);
+    b.env
+        .push(("CARDINAL_TEST_BLE_DROP_PAIRING_CHANNEL".into(), "1".into()));
+    start_alone(&mut a);
+    start_alone(&mut b);
+    a.cli(&["init", "--yes", "--name", "Ana"]);
+    always(&a);
+    always(&b);
+    let mut shower = b
+        .cmd()
+        .arg("pair")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .unwrap();
+    let mut out = BufReader::new(shower.stdout.take().unwrap());
+    let mut code = None;
+    let mut line = String::new();
+    while code.is_none() {
+        line.clear();
+        assert!(out.read_line(&mut line).unwrap() > 0, "pair ended early");
+        if let Some(c) = line.trim().strip_prefix("cardinal pair ") {
+            code = Some(c.to_owned());
+        }
+    }
+    let typed = a.try_cli(&["pair", &code.unwrap(), "--admin"]);
+    assert!(
+        typed.status.success(),
+        "{}{}\n{}",
+        String::from_utf8_lossy(&typed.stdout),
+        String::from_utf8_lossy(&typed.stderr),
+        a.log()
+    );
+    let mut rest = String::new();
+    std::io::Read::read_to_string(&mut out, &mut rest).unwrap();
+    assert!(
+        shower.wait().unwrap().success(),
+        "{rest}\n{}\n{}",
+        b.log(),
+        a.log()
+    );
+    assert!(b.log().contains("joined identity"), "{}", b.log());
+    assert!(b.log().contains("as an admin device"), "{}", b.log());
+    assert!(
+        a.log().contains("reached the new device again"),
+        "{}",
+        a.log()
+    );
+    stop(&mut a);
+    stop(&mut b);
+}

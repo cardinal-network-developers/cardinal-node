@@ -505,6 +505,17 @@ fn graph_facts(
 /// The input facts of the `identity` program for log `ident` over `ids`
 /// (`identity_facts`), without `confirm_ok`.
 pub fn identity_facts(world: &World, ident: Sym, ids: &BTreeSet<Sym>) -> Facts {
+    identity_facts_with(world, ident, ids, None)
+}
+
+/// [`identity_facts`] where only the protocol records in `declarers`, and
+/// in the entry itself, declare (`evolution.md#critical-and-ignorable`).
+pub fn identity_facts_with(
+    world: &World,
+    ident: Sym,
+    ids: &BTreeSet<Sym>,
+    declarers: Option<&BTreeSet<Sym>>,
+) -> Facts {
     let own: BTreeSet<Sym> = ids
         .iter()
         .copied()
@@ -629,6 +640,7 @@ pub fn identity_facts(world: &World, ident: Sym, ids: &BTreeSet<Sym>) -> Facts {
         // a critical extension is used only after a set_protocol declares it
         let declared: HashSet<Sym> = anc[&x]
             .iter()
+            .filter(|a| declarers.is_none_or(|d| d.contains(*a)))
             .chain(std::iter::once(&x))
             .flat_map(|a| world.entries[a].ops.iter())
             .filter_map(|op| match op {
@@ -824,7 +836,46 @@ pub fn evaluate_identity(
     let mut f = identity_facts(world, ident, &ids);
     confirm_facts(world, ident, &ids, known, &mut f);
     world.active.borrow_mut().pop();
-    let rel = evaluate(identity_program(), &f, &world.symbols);
+    let mut rel = evaluate(identity_program(), &f, &world.symbols);
+    // Only records in valid entries signed by admin and root keys declare:
+    // evaluated again with those found so, until that holds of what is
+    // found (`world.py`).
+    let protos: BTreeSet<Sym> = ids
+        .iter()
+        .copied()
+        .filter(|x| world.entries[x].log == ident)
+        .filter(|x| {
+            world.entries[x]
+                .ops
+                .iter()
+                .any(|op| matches!(op, Op::Protocol { .. }))
+        })
+        .collect();
+    let mut declarers: Option<BTreeSet<Sym>> = None;
+    for _ in 0..5 {
+        let valid = rel.set("valid");
+        let power: HashMap<Sym, i64> = rel
+            .set("kpow")
+            .iter()
+            .filter_map(|t| match &t[..] {
+                [Val::Sym(k), Val::Int(p)] => Some((*k, *p)),
+                _ => None,
+            })
+            .collect();
+        let found: BTreeSet<Sym> = protos
+            .iter()
+            .copied()
+            .filter(|x| valid.contains(&[Val::Sym(*x)][..]))
+            .filter(|x| power.get(&world.entries[x].signer).is_some_and(|p| *p >= 2))
+            .collect();
+        if found == *declarers.as_ref().unwrap_or(&protos) {
+            break;
+        }
+        let mut g = identity_facts_with(world, ident, &ids, Some(&found));
+        confirm_facts(world, ident, &ids, known, &mut g);
+        rel = evaluate(identity_program(), &g, &world.symbols);
+        declarers = Some(found);
+    }
     let mut r = IdentityResult {
         rels: IDENTITY_RESULTS.iter().map(|&k| (k, rel.set(k))).collect(),
         frozen: rel.any("frozen"),
