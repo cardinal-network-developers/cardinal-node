@@ -23,7 +23,9 @@ use cardinal_identity::EntryId;
 use cardinal_link::Priority;
 use cardinal_space::application::{self, Document, Family, Type};
 use cardinal_space::entry::derived_id;
-use cardinal_space::{account, NodeId, NodeKind, Profile, Space, SpaceId, SpaceOp, SpaceOpBody, ROOT};
+use cardinal_space::{
+    account, NodeId, NodeKind, Profile, Space, SpaceId, SpaceOp, SpaceOpBody, ROOT,
+};
 use serde_json::{json, Value as Json};
 use tokio::sync::oneshot;
 
@@ -159,15 +161,12 @@ impl Apps {
     fn seq(&self, sp: &Space) -> u64 {
         let mut all = lock(&self.seqs);
         let t = all.entry(sp.id()).or_default();
+        // what was there when this service first looked counts as 0
+        let first = t.seen.is_empty();
         for e in sp.state().applied() {
             if !t.seen.contains_key(e) {
-                // what was there when this service first looked counts as 0
-                let n = if t.seen.is_empty() && t.next == 0 {
-                    0
-                } else {
-                    t.next + 1
-                };
-                t.next = n.max(t.next);
+                let n = if first { 0 } else { t.next + 1 };
+                t.next = n;
                 t.seen.insert(*e, n);
             }
         }
@@ -242,7 +241,8 @@ pub fn approvals(core: &Core) -> Vec<Approval> {
         .into_iter()
         .filter(|n| n.kind == NodeKind::Uint(APPROVAL) && !n.deleted)
         .filter_map(|n| {
-            let b32 = |v: Option<Value>| v.and_then(|v| v.as_bytes().and_then(|b| b.try_into().ok()));
+            let b32 =
+                |v: Option<Value>| v.and_then(|v| v.as_bytes().and_then(|b| b.try_into().ok()));
             let text = |k| last(n, k).and_then(|v| v.as_text().map(str::to_owned));
             let flag = |k| last(n, k).and_then(|v| v.as_bool()).unwrap_or(false);
             Some(Approval {
@@ -252,7 +252,10 @@ pub fn approvals(core: &Core) -> Vec<Approval> {
                 named: text(3).unwrap_or_default(),
                 family: b32(last(n, 4))?,
                 change: flag(5),
-                revoked: n.values(6).iter().any(|v| v.value.as_ref().and_then(Value::as_bool) == Some(true)),
+                revoked: n
+                    .values(6)
+                    .iter()
+                    .any(|v| v.value.as_ref().and_then(Value::as_bool) == Some(true)),
             })
         })
         .collect()
@@ -271,7 +274,13 @@ fn approved(d: &Daemon, program: &str) -> HashMap<[u8; 32], bool> {
     out
 }
 
-fn record_approval(d: &Arc<Daemon>, program: &str, named: &str, root: [u8; 32], change: bool) -> anyhow::Result<()> {
+fn record_approval(
+    d: &Arc<Daemon>,
+    program: &str,
+    named: &str,
+    root: [u8; 32],
+    change: bool,
+) -> anyhow::Result<()> {
     let account = d
         .core()
         .account_id()
@@ -352,7 +361,8 @@ fn program_of(pid: Option<u32>) -> String {
 #[cfg(unix)]
 pub fn serve(d: Arc<Daemon>) -> anyhow::Result<tokio::task::JoinHandle<()>> {
     let path = d.paths.app_socket();
-    let mut listener = Listener::bind(&path).map_err(|e| anyhow::anyhow!("{e:#} for {}", path.display()))?;
+    let mut listener =
+        Listener::bind(&path).map_err(|e| anyhow::anyhow!("{e:#} for {}", path.display()))?;
     Ok(tokio::spawn(async move {
         loop {
             let Ok((r, w, pid)) = listener.accept_peer().await else {
@@ -399,7 +409,10 @@ async fn connection(d: Arc<Daemon>, mut conn: Conn, mut r: Reader, mut w: Writer
             }
         };
         let Ok(rec) = Record::decode(&msg) else {
-            if w.send(&reply(Err(no(err::MALFORMED, "not one canonical record")))).await.is_err() {
+            if w.send(&reply(Err(no(err::MALFORMED, "not one canonical record"))))
+                .await
+                .is_err()
+            {
                 return;
             }
             continue;
@@ -407,7 +420,9 @@ async fn connection(d: Arc<Daemon>, mut conn: Conn, mut r: Reader, mut w: Writer
         let number = rec.get(0).and_then(Value::as_uint);
         if number == Some(req::WATCH) {
             if conn.family.is_none() {
-                let _ = w.send(&reply(Err(no(err::NOT_APPROVED, "say hello first")))).await;
+                let _ = w
+                    .send(&reply(Err(no(err::NOT_APPROVED, "say hello first"))))
+                    .await;
                 continue;
             }
             if w.send(&reply(Ok(Record::new()))).await.is_ok() {
@@ -468,9 +483,16 @@ fn uint_opt(rec: &Record, k: u64) -> Result<Option<u64>, No> {
 
 /// A page of `items`, each already encoded as a value: those from `after`,
 /// as many as `limit` says or as fit. Answers them, `more` and `next`.
-fn page(items: Vec<Value>, rec: &Record, after_key: u64, limit_key: u64) -> Result<(Vec<Value>, bool, u64), No> {
+fn page(
+    items: Vec<Value>,
+    rec: &Record,
+    after_key: u64,
+    limit_key: u64,
+) -> Result<(Vec<Value>, bool, u64), No> {
     let after = uint_opt(rec, after_key)?.unwrap_or(0) as usize;
-    let limit = uint_opt(rec, limit_key)?.filter(|l| *l > 0).map(|l| l as usize);
+    let limit = uint_opt(rec, limit_key)?
+        .filter(|l| *l > 0)
+        .map(|l| l as usize);
     let mut out = Vec::new();
     let mut size = 0;
     let mut at = after;
@@ -480,7 +502,10 @@ fn page(items: Vec<Value>, rec: &Record, after_key: u64, limit_key: u64) -> Resu
             return Ok((out, true, at as u64));
         }
         if n > PAGE_BYTES {
-            return Err(no(err::TOO_LARGE, format!("item {at} is too large for a message on its own")));
+            return Err(no(
+                err::TOO_LARGE,
+                format!("item {at} is too large for a message on its own"),
+            ));
         }
         size += n;
         out.push(v);
@@ -508,7 +533,9 @@ fn visible(d: &Daemon, program: &str) -> Vec<(SpaceId, [u8; 32], bool)> {
         let Profile::Named(root) = sp.profile() else {
             continue;
         };
-        let Some(change) = ok.get(&root) else { continue };
+        let Some(change) = ok.get(&root) else {
+            continue;
+        };
         if !core.is_joined(id) || core.is_superseded(id) || sp.has_left(&me) {
             continue;
         }
@@ -519,16 +546,31 @@ fn visible(d: &Daemon, program: &str) -> Vec<(SpaceId, [u8; 32], bool)> {
 }
 
 /// The space a handle names, if the program may see it.
-fn space_of(d: &Daemon, conn: &Conn, rec: &Record, k: u64) -> Result<(SpaceId, [u8; 32], bool), No> {
+fn space_of(
+    d: &Daemon,
+    conn: &Conn,
+    rec: &Record,
+    k: u64,
+) -> Result<(SpaceId, [u8; 32], bool), No> {
     let h: [u8; 16] = bytes_arg(rec, k, "a space")?;
     visible(d, &conn.program)
         .into_iter()
         .find(|(id, _, _)| space_handle(d, &conn.program, id) == h)
-        .ok_or_else(|| no(err::NOT_APPROVED, "no space this program may see has that handle"))
+        .ok_or_else(|| {
+            no(
+                err::NOT_APPROVED,
+                "no space this program may see has that handle",
+            )
+        })
 }
 
 fn hello(d: &Arc<Daemon>, conn: &mut Conn, rec: &Record) -> Answer {
-    let named = rec.get(1).and_then(Value::as_text).unwrap_or("").trim().to_owned();
+    let named = rec
+        .get(1)
+        .and_then(Value::as_text)
+        .unwrap_or("")
+        .trim()
+        .to_owned();
     let docs = match rec.get(2) {
         None => Vec::new(),
         Some(v) => v
@@ -545,7 +587,11 @@ fn hello(d: &Arc<Daemon>, conn: &mut Conn, rec: &Record) -> Answer {
     };
     let names: Vec<Value> = docs.iter().map(|d| Value::from(d.name)).collect();
     let family = Family::new(docs).map_err(|e| no(err::FAILED, e))?;
-    conn.named = if named.is_empty() { "A program".into() } else { named };
+    conn.named = if named.is_empty() {
+        "A program".into()
+    } else {
+        named
+    };
     conn.family = Some(family);
     let ok = approved(d, &conn.program);
     let approved: Vec<Value> = ok
@@ -585,7 +631,14 @@ async fn approve(d: &Arc<Daemon>, conn: &Conn, rec: &Record) -> Answer {
     let root = root_given(conn, rec, 1)?;
     let change = rec.get(2).and_then(Value::as_bool).unwrap_or(false);
     let had = approved(d, &conn.program).get(&root).copied();
-    let done = |change: bool| Record::new().with(2, Record::new().with(1, root).with_opt(2, change.then_some(true)));
+    let done = |change: bool| {
+        Record::new().with(
+            2,
+            Record::new()
+                .with(1, root)
+                .with_opt(2, change.then_some(true)),
+        )
+    };
     if had.is_some_and(|c| c || !change) {
         return Ok(done(had.unwrap_or(false)));
     }
@@ -594,7 +647,16 @@ async fn approve(d: &Arc<Daemon>, conn: &Conn, rec: &Record) -> Answer {
         true => format!("{} may see and change every {t} you have, and those shared with you later. {UNISOLATED}", conn.named),
         false => format!("{} may see every {t} you have, and those shared with you later. {UNISOLATED}", conn.named),
     };
-    let said = d.apps.ask(d, &conn.program, &conn.named, Asks::Family { root, change }, what).await;
+    let said = d
+        .apps
+        .ask(
+            d,
+            &conn.program,
+            &conn.named,
+            Asks::Family { root, change },
+            what,
+        )
+        .await;
     if !said.yes {
         return Ok(Record::new());
     }
@@ -619,7 +681,12 @@ async fn new_space(d: &Arc<Daemon>, conn: &Conn, rec: &Record) -> Answer {
             root,
             name: name.clone(),
         };
-        if !d.apps.ask(d, &conn.program, &conn.named, asks, what).await.yes {
+        if !d
+            .apps
+            .ask(d, &conn.program, &conn.named, asks, what)
+            .await
+            .yes
+        {
             return Err(no(err::NOT_APPROVED, "the person said no"));
         }
         record_approval(d, &conn.program, &conn.named, root, true)?;
@@ -777,7 +844,13 @@ fn touched(sp: &Space, entries: &[EntryId]) -> HashSet<NodeId> {
 
 /// A value of the space as the program is given it: members and files as
 /// handles.
-fn outward(d: &Daemon, program: &str, space: &SpaceId, ty: Option<(Type, bool)>, v: &Value) -> Value {
+fn outward(
+    d: &Daemon,
+    program: &str,
+    space: &SpaceId,
+    ty: Option<(Type, bool)>,
+    v: &Value,
+) -> Value {
     let one = |t: Type, v: &Value| -> Value {
         match t {
             Type::Member => match v.as_bytes().and_then(|b| <[u8; 32]>::try_from(b).ok()) {
@@ -816,7 +889,10 @@ fn nodes(d: &Arc<Daemon>, conn: &Conn, rec: &Record) -> Answer {
         None => None,
         Some(v) => Some(match (v.as_uint(), v.as_bytes()) {
             (Some(n), _) => NodeKind::Uint(n),
-            (_, Some(b)) => NodeKind::Named(b.try_into().map_err(|_| no(err::MALFORMED, "a kind is a number or 32 bytes"))?),
+            (_, Some(b)) => NodeKind::Named(
+                b.try_into()
+                    .map_err(|_| no(err::MALFORMED, "a kind is a number or 32 bytes"))?,
+            ),
             _ => return Err(no(err::MALFORMED, "a kind is a number or 32 bytes")),
         }),
     };
@@ -830,7 +906,9 @@ fn nodes(d: &Arc<Daemon>, conn: &Conn, rec: &Record) -> Answer {
             .and_then(|h| h.space.as_ref())
             .ok_or_else(|| no(err::FAILED, "that space is not open here"))?;
         let seq = d.apps.seq(sp);
-        let changed = since.and_then(|s| d.apps.since(sp, s)).map(|e| touched(sp, &e));
+        let changed = since
+            .and_then(|s| d.apps.since(sp, s))
+            .map(|e| touched(sp, &e));
         let st = sp.state();
         let mut all: Vec<&cardinal_space::Node> = st
             .nodes()
@@ -852,21 +930,33 @@ fn nodes(d: &Arc<Daemon>, conn: &Conn, rec: &Record) -> Answer {
                     if *key == application::AUTHOR_OWNED {
                         continue;
                     }
-                    let ty = def.as_ref().and_then(|k| k.field(*key)).map(|f| (f.ty, f.list));
-                    let set: Vec<_> = values.iter().filter_map(|v| v.value.as_ref().map(|x| (v.entry, x))).collect();
+                    let ty = def
+                        .as_ref()
+                        .and_then(|k| k.field(*key))
+                        .map(|f| (f.ty, f.list));
+                    let set: Vec<_> = values
+                        .iter()
+                        .filter_map(|v| v.value.as_ref().map(|x| (v.entry, x)))
+                        .collect();
                     let f = match set.as_slice() {
                         [] => continue,
-                        [(_, v)] => Record::new().with(1, *key).with(2, outward(d, program, &id, ty, v)),
+                        [(_, v)] => Record::new()
+                            .with(1, *key)
+                            .with(2, outward(d, program, &id, ty, v)),
                         many => {
                             let versions = many.iter().map(|(e, v)| {
-                                let by = sp.entry(e).map(|e| member_handle(d, program, &id, &e.author()));
+                                let by = sp
+                                    .entry(e)
+                                    .map(|e| member_handle(d, program, &id, &e.author()));
                                 Value::Record(
                                     Record::new()
                                         .with(1, outward(d, program, &id, ty, v))
                                         .with_opt(2, by),
                                 )
                             });
-                            Record::new().with(1, *key).with(3, Value::List(versions.collect()))
+                            Record::new()
+                                .with(1, *key)
+                                .with(3, Value::List(versions.collect()))
                         }
                     };
                     fields.push(Value::Record(f));
@@ -898,7 +988,14 @@ fn nodes(d: &Arc<Daemon>, conn: &Conn, rec: &Record) -> Answer {
 
 /// A value the program wrote, as the space holds it: handles of members
 /// and files turned back into what they name.
-fn inward(d: &Daemon, program: &str, space: &SpaceId, sp: &Space, ty: Option<(Type, bool)>, v: &Value) -> Result<Value, String> {
+fn inward(
+    d: &Daemon,
+    program: &str,
+    space: &SpaceId,
+    sp: &Space,
+    ty: Option<(Type, bool)>,
+    v: &Value,
+) -> Result<Value, String> {
     let one = |t: Type, v: &Value| -> Result<Value, String> {
         let h: Option<[u8; 16]> = v.as_bytes().and_then(|b| b.try_into().ok());
         match t {
@@ -924,7 +1021,9 @@ fn inward(d: &Daemon, program: &str, space: &SpaceId, sp: &Space, ty: Option<(Ty
     match ty {
         Some((t @ (Type::Member | Type::File), false)) => one(t, v),
         Some((t @ (Type::Member | Type::File), true)) => match v.as_list() {
-            Some(items) => Ok(Value::List(items.iter().map(|x| one(t, x)).collect::<Result<_, _>>()?)),
+            Some(items) => Ok(Value::List(
+                items.iter().map(|x| one(t, x)).collect::<Result<_, _>>()?,
+            )),
             None => Ok(v.clone()),
         },
         _ => Ok(v.clone()),
@@ -934,7 +1033,10 @@ fn inward(d: &Daemon, program: &str, space: &SpaceId, sp: &Space, ty: Option<(Ty
 fn write(d: &Arc<Daemon>, conn: &Conn, rec: &Record) -> Answer {
     let (id, root, change) = space_of(d, conn, rec, 1)?;
     if !change {
-        return Err(no(err::NOT_APPROVED, "this program may not change that space"));
+        return Err(no(
+            err::NOT_APPROVED,
+            "this program may not change that space",
+        ));
     }
     let family = conn.family()?.only(&[root]);
     let ops: Vec<Record> = rec
@@ -942,7 +1044,11 @@ fn write(d: &Arc<Daemon>, conn: &Conn, rec: &Record) -> Answer {
         .and_then(Value::as_list)
         .ok_or_else(|| no(err::MALFORMED, "ops are a list of records"))?
         .iter()
-        .map(|v| v.as_record().cloned().ok_or_else(|| no(err::MALFORMED, "an op is a record")))
+        .map(|v| {
+            v.as_record()
+                .cloned()
+                .ok_or_else(|| no(err::MALFORMED, "an op is a record"))
+        })
         .collect::<Result<_, _>>()?;
     if ops.is_empty() {
         return Err(no(err::FAILED, "a write has one op at least"));
@@ -955,7 +1061,9 @@ fn write(d: &Arc<Daemon>, conn: &Conn, rec: &Record) -> Answer {
     };
     let written = {
         let mut core = d.core();
-        let me = core.me().ok_or_else(|| no(err::FAILED, "this device has no identity yet"))?;
+        let me = core
+            .me()
+            .ok_or_else(|| no(err::FAILED, "this device has no identity yet"))?;
         let checked = {
             let sp = core
                 .spaces
@@ -974,30 +1082,43 @@ fn write(d: &Arc<Daemon>, conn: &Conn, rec: &Record) -> Answer {
                             _ => None,
                         });
                         let def = kind.and_then(|k| family.known(&k)).map(|k| k.def.clone());
-                        if let (Some(def), Some(fields)) = (def, op.get(4).and_then(Value::as_record).cloned()) {
+                        if let (Some(def), Some(fields)) =
+                            (def, op.get(4).and_then(Value::as_record).cloned())
+                        {
                             let mut out = Record::new();
                             for (k, v) in fields.iter() {
                                 let ty = def.field(*k).map(|f| (f.ty, f.list));
-                                out.insert(*k, inward(d, program, &id, sp, ty, v).map_err(|e| refused(at, e))?);
+                                out.insert(
+                                    *k,
+                                    inward(d, program, &id, sp, ty, v)
+                                        .map_err(|e| refused(at, e))?,
+                                );
                             }
                             op.insert(4, out);
                         }
                     }
                     Some(33) => {
-                        let node: Option<NodeId> = op.get(1).and_then(Value::as_bytes).and_then(|b| b.try_into().ok());
+                        let node: Option<NodeId> = op
+                            .get(1)
+                            .and_then(Value::as_bytes)
+                            .and_then(|b| b.try_into().ok());
                         let n = node.and_then(|n| sp.state().node(&n));
                         let def = n.and_then(|n| family.known(&n.kind)).map(|k| k.def.clone());
                         let key = op.get(2).and_then(Value::as_uint);
                         if let (Some(def), Some(key), Some(v)) = (def, key, op.get(3).cloned()) {
                             let ty = def.field(key).map(|f| (f.ty, f.list));
-                            op.insert(3, inward(d, program, &id, sp, ty, &v).map_err(|e| refused(at, e))?);
+                            op.insert(
+                                3,
+                                inward(d, program, &id, sp, ty, &v).map_err(|e| refused(at, e))?,
+                            );
                         }
                     }
                     _ => {}
                 }
                 inside.push(op);
             }
-            let checked = application::check(&family, sp.state(), &me, &inside).map_err(|r| refused(r.at, r.why))?;
+            let checked = application::check(&family, sp.state(), &me, &inside)
+                .map_err(|r| refused(r.at, r.why))?;
             let mut all = checked.clone();
             for doc in application::documents_wanted(&family, sp.state(), &checked) {
                 all.push(application::document_node(&doc));
@@ -1026,19 +1147,25 @@ fn secret(d: &Daemon, space: &SpaceId) -> anyhow::Result<cardinal_blob::Converge
     let sp = sp.ok_or_else(|| anyhow::anyhow!("that space is not open here"))?;
     let key = sp.current_epoch().and_then(|e| sp.keyring().get(&e));
     let key = key.ok_or_else(|| anyhow::anyhow!("that space has no key yet"))?;
-    Ok(cardinal_blob::ConvergenceSecret::from_epoch_key(key.bytes()))
+    Ok(cardinal_blob::ConvergenceSecret::from_epoch_key(
+        key.bytes(),
+    ))
 }
 
 async fn file_put(d: &Arc<Daemon>, conn: &Conn, rec: &Record) -> Answer {
     let (id, _, change) = space_of(d, conn, rec, 1)?;
     if !change {
-        return Err(no(err::NOT_APPROVED, "this program may not change that space"));
+        return Err(no(
+            err::NOT_APPROVED,
+            "this program may not change that space",
+        ));
     }
     let from = std::path::PathBuf::from(text_arg(rec, 2, "from")?);
     let secret = secret(d, &id)?;
     let dd = d.clone();
     let blob = tokio::task::spawn_blocking(move || -> anyhow::Result<cardinal_blob::BlobRef> {
-        let mut f = std::fs::File::open(&from).map_err(|e| anyhow::anyhow!("cannot read {}: {e}", from.display()))?;
+        let mut f = std::fs::File::open(&from)
+            .map_err(|e| anyhow::anyhow!("cannot read {}: {e}", from.display()))?;
         anyhow::ensure!(f.metadata()?.is_file(), "{} is not a file", from.display());
         let mut w = cardinal_blob::BlobWriter::new(&secret, &*dd.store);
         std::io::copy(&mut f, &mut w)?;
@@ -1060,17 +1187,26 @@ async fn file_get(d: &Arc<Daemon>, conn: &Conn, rec: &Record) -> Answer {
         let files = lock(&d.apps.files);
         match files.get(&h) {
             Some((s, r)) if *s == id => r.clone(),
-            _ => return Err(no(err::FAILED, "no file of that space has that handle: list its nodes first")),
+            _ => {
+                return Err(no(
+                    err::FAILED,
+                    "no file of that space has that handle: list its nodes first",
+                ))
+            }
         }
     };
-    let blob = cardinal_blob::BlobRef::from_record(&blob).map_err(|_| no(err::FAILED, "that file cannot be read"))?;
+    let blob = cardinal_blob::BlobRef::from_record(&blob)
+        .map_err(|_| no(err::FAILED, "that file cannot be read"))?;
     let members: Vec<[u8; 32]> = {
         let core = d.core();
         let sp = core.spaces.get(&id).and_then(|h| h.space.as_ref());
         sp.map(|sp| sp.present()).unwrap_or_default()
     };
     let in_touch = d.people_in_touch();
-    let from: Vec<[u8; 32]> = members.into_iter().filter(|w| in_touch.contains(w)).collect();
+    let from: Vec<[u8; 32]> = members
+        .into_iter()
+        .filter(|w| in_touch.contains(w))
+        .collect();
     let mut last = anyhow::anyhow!("nobody who has it is in touch right now");
     for who in from.into_iter().map(Some).chain([None]) {
         let (dd, written) = (d.clone(), to.clone());
@@ -1100,11 +1236,16 @@ async fn share(d: &Arc<Daemon>, conn: &Conn, rec: &Record) -> Answer {
         .and_then(|doc| doc.sharing)
         .unwrap_or((false, 0));
     if !shared {
-        return Err(no(err::FAILED, "a space of this application has no members but its owner"));
+        return Err(no(
+            err::FAILED,
+            "a space of this application has no members but its owner",
+        ));
     }
     {
         let core = d.core();
-        let me = core.me().ok_or_else(|| no(err::FAILED, "this device has no identity yet"))?;
+        let me = core
+            .me()
+            .ok_or_else(|| no(err::FAILED, "this device has no identity yet"))?;
         let sp = core.spaces.get(&id).and_then(|h| h.space.as_ref());
         let mine = sp.and_then(|sp| sp.role_of(&me)).unwrap_or(0);
         if mine < cardinal_space::group::ADMIN {
@@ -1117,7 +1258,16 @@ async fn share(d: &Arc<Daemon>, conn: &Conn, rec: &Record) -> Answer {
         conn.named,
         if role >= 1 { "see and change it" } else { "see it" }
     );
-    let said = d.apps.ask(d, &conn.program, &conn.named, Asks::Share { space: id, role }, what).await;
+    let said = d
+        .apps
+        .ask(
+            d,
+            &conn.program,
+            &conn.named,
+            Asks::Share { space: id, role },
+            what,
+        )
+        .await;
     if said.yes && !said.people.is_empty() {
         let role = said.role.unwrap_or(role);
         let theirs: Vec<_> = said
@@ -1195,24 +1345,25 @@ fn asks_name(a: &Asks) -> &'static str {
 pub fn questions(d: &Daemon) -> Json {
     let mut q = lock(&d.apps.questions);
     q.1.retain(|q| q.answer.as_ref().is_some_and(|a| !a.is_closed()));
-    let all: Vec<Json> = q
-        .1
-        .iter()
-        .map(|q| {
-            let role = match q.asks {
-                Asks::Share { role, .. } => Some(role_name(role)),
-                _ => None,
-            };
-            json!({"id": q.id, "program": q.program, "name": q.named, "what": q.what,
+    let all: Vec<Json> =
+        q.1.iter()
+            .map(|q| {
+                let role = match q.asks {
+                    Asks::Share { role, .. } => Some(role_name(role)),
+                    _ => None,
+                };
+                json!({"id": q.id, "program": q.program, "name": q.named, "what": q.what,
                    "asks": asks_name(&q.asks), "role": role})
-        })
-        .collect();
+            })
+            .collect();
     json!({"questions": all})
 }
 
 /// `app-answer`: the person's answer to a question.
 pub fn answer(d: &Daemon, req: &Json) -> anyhow::Result<Json> {
-    let id = req["id"].as_u64().ok_or_else(|| anyhow::anyhow!("missing argument id"))?;
+    let id = req["id"]
+        .as_u64()
+        .ok_or_else(|| anyhow::anyhow!("missing argument id"))?;
     let yes = req["yes"].as_bool() == Some(true);
     let people: Vec<String> = req["people"]
         .as_array()
@@ -1291,7 +1442,9 @@ pub fn revoke(d: &Arc<Daemon>, id: &str) -> anyhow::Result<Json> {
             [] => anyhow::bail!("there is no approval {id}"),
             _ => anyhow::bail!("more than one approval starts with {id}"),
         };
-        let account = core.account_id().ok_or_else(|| anyhow::anyhow!("the account space is not here yet"))?;
+        let account = core
+            .account_id()
+            .ok_or_else(|| anyhow::anyhow!("the account space is not here yet"))?;
         (account, node)
     };
     d.write_and_push(&account, vec![account::set_field(node, 6, true)])?;
@@ -1311,7 +1464,10 @@ fn offers(core: &Core) -> Vec<(SpaceId, String, String, Option<(String, String)>
             let Profile::Named(root) = sp.profile() else {
                 continue;
             };
-            if core.is_joined(&o.space) || declined.contains(&o.space) || out.iter().any(|x| x.0 == o.space) {
+            if core.is_joined(&o.space)
+                || declined.contains(&o.space)
+                || out.iter().any(|x| x.0 == o.space)
+            {
                 continue;
             }
             let doc = application::documents_in(sp.state())
@@ -1358,7 +1514,9 @@ pub fn join(d: &Arc<Daemon>, space: &str) -> anyhow::Result<Json> {
             [] => anyhow::bail!("nothing offered to you is {space}"),
             _ => anyhow::bail!("more than one offer is {space}: give its id"),
         };
-        let account = core.account_id().ok_or_else(|| anyhow::anyhow!("the account space is not here yet"))?;
+        let account = core
+            .account_id()
+            .ok_or_else(|| anyhow::anyhow!("the account space is not here yet"))?;
         (id, name, account)
     };
     d.write_and_push(&account, vec![account::create_space(&id, &name)])?;

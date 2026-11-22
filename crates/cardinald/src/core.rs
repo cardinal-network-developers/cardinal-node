@@ -2775,7 +2775,13 @@ impl Core {
             .spaces
             .get_mut(space)
             .ok_or_else(|| anyhow::anyhow!("space not held"))?;
-        let bytes = h.add_members(ident, &self.keys, &added, cardinal_space::group::WRITER, ops)?;
+        let bytes = h.add_members(
+            ident,
+            &self.keys,
+            &added,
+            cardinal_space::group::WRITER,
+            ops,
+        )?;
         self.settle(space);
         Ok(bytes)
     }
@@ -2798,7 +2804,10 @@ impl Core {
             .ok_or_else(|| anyhow::anyhow!("no encryption key"))?
             .public_key()
             .clone();
-        let mut all = vec![SpaceOp::add_member(ident.id(), cardinal_space::group::OWNER)];
+        let mut all = vec![SpaceOp::add_member(
+            ident.id(),
+            cardinal_space::group::OWNER,
+        )];
         all.extend(ops);
         let (space, sealed) = Space::create_with(
             cardinal_space::Profile::Named(profile),

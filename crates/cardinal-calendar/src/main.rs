@@ -11,7 +11,11 @@ use cardinal_encoding::{Record, Value};
 use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
-#[command(name = "cardinal-calendar", version, about = "Calendars, shared with the people you choose")]
+#[command(
+    name = "cardinal-calendar",
+    version,
+    about = "Calendars, shared with the people you choose"
+)]
 struct Cli {
     #[command(subcommand)]
     cmd: Cmd,
@@ -169,15 +173,17 @@ mod client {
             return PathBuf::from(p);
         }
         let run = std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from);
-        run.unwrap_or_else(|| PathBuf::from("/tmp")).join("cardinal-apps.sock")
+        run.unwrap_or_else(|| PathBuf::from("/tmp"))
+            .join("cardinal-apps.sock")
     }
 
     impl Client {
         pub fn connect() -> anyhow::Result<Client> {
             let p = path();
             let s = Socket::new(Domain::UNIX, Type::SEQPACKET, None)?;
-            s.connect(&SockAddr::unix(&p)?)
-                .map_err(|e| anyhow::anyhow!("Cardinal is not running here ({}): {e}", p.display()))?;
+            s.connect(&SockAddr::unix(&p)?).map_err(|e| {
+                anyhow::anyhow!("Cardinal is not running here ({}): {e}", p.display())
+            })?;
             let _ = s.set_send_buffer_size(512 * 1024);
             Ok(Client(s))
         }
@@ -192,7 +198,10 @@ mod client {
             let n = self.0.recv(&mut buf)?;
             anyhow::ensure!(n > 0, "Cardinal closed the connection");
             // SAFETY: `recv` initialised the first `n` bytes.
-            let bytes: Vec<u8> = buf[..n].iter().map(|b| unsafe { b.assume_init() }).collect();
+            let bytes: Vec<u8> = buf[..n]
+                .iter()
+                .map(|b| unsafe { b.assume_init() })
+                .collect();
             Ok(Record::decode(&bytes)?)
         }
     }
@@ -230,7 +239,14 @@ impl App {
     }
 
     /// Every item of a paged list, field `list` of the reply.
-    fn all(&mut self, r: Record, list: u64, after: u64, more: u64, next: u64) -> anyhow::Result<Vec<Record>> {
+    fn all(
+        &mut self,
+        r: Record,
+        list: u64,
+        after: u64,
+        more: u64,
+        next: u64,
+    ) -> anyhow::Result<Vec<Record>> {
         let mut out = Vec::new();
         let mut at = 0u64;
         loop {
@@ -301,15 +317,27 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
         Cmd::Document => unreachable!(),
         Cmd::Approve { change } => {
             eprintln!("Waiting for you to say yes in Cardinal (`cardinal approve`)...");
-            let r = app.ask(Record::new().with(0, 3u64).with(1, app.root).with(2, change))?;
+            let r = app.ask(
+                Record::new()
+                    .with(0, 3u64)
+                    .with(1, app.root)
+                    .with(2, change),
+            )?;
             match r.opt_record(2)? {
-                Some(a) if a.opt_bool(2)? == Some(true) => println!("Approved to see and change your calendars."),
+                Some(a) if a.opt_bool(2)? == Some(true) => {
+                    println!("Approved to see and change your calendars.")
+                }
                 Some(_) => println!("Approved to see your calendars."),
                 None => bail!("you said no"),
             }
         }
         Cmd::New { name } => {
-            let r = app.ask(Record::new().with(0, 4u64).with(1, app.root).with(2, name.as_str()))?;
+            let r = app.ask(
+                Record::new()
+                    .with(0, 4u64)
+                    .with(1, app.root)
+                    .with(2, name.as_str()),
+            )?;
             let space = r.bytes_n::<16>(2)?;
             let node = Record::new()
                 .with(0, 32u64)
@@ -317,7 +345,12 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
                 .with(2, [0u8; 16])
                 .with(3, "calendar")
                 .with(4, Record::new().with(1, name.as_str()));
-            app.ask(Record::new().with(0, 8u64).with(1, space).with(2, Value::list([Value::Record(node)])))?;
+            app.ask(
+                Record::new()
+                    .with(0, 8u64)
+                    .with(1, space)
+                    .with(2, Value::list([Value::Record(node)])),
+            )?;
             println!("{}", hex::encode(space));
         }
         Cmd::List => {
@@ -355,14 +388,29 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
                 .with(2, [0u8; 16])
                 .with(3, title.as_str())
                 .with(4, fields);
-            let r = app.ask(Record::new().with(0, 8u64).with(1, h).with(2, Value::list([Value::Record(op)])))?;
-            let id = r.list(2)?.first().and_then(|v| v.as_bytes()).map(hex::encode);
+            let r = app.ask(
+                Record::new()
+                    .with(0, 8u64)
+                    .with(1, h)
+                    .with(2, Value::list([Value::Record(op)])),
+            )?;
+            let id = r
+                .list(2)?
+                .first()
+                .and_then(|v| v.as_bytes())
+                .map(hex::encode);
             println!("{}", id.unwrap_or_default());
         }
         Cmd::Events { calendar } => {
             let (h, _, _) = app.find(&calendar)?;
             let mut events = Vec::new();
-            for n in app.all(Record::new().with(0, 7u64).with(1, h).with(3, EVENT), 2, 5, 4, 5)? {
+            for n in app.all(
+                Record::new().with(0, 7u64).with(1, h).with(3, EVENT),
+                2,
+                5,
+                4,
+                5,
+            )? {
                 let mut start = String::new();
                 let mut title = String::new();
                 for f in n.opt_list(5)?.unwrap_or(&[]) {
@@ -379,7 +427,11 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
             }
             events.sort();
             for (start, title, fits) in events {
-                let odd = if fits { "" } else { "  (not as this calendar expects)" };
+                let odd = if fits {
+                    ""
+                } else {
+                    "  (not as this calendar expects)"
+                };
                 println!("{start}  {title}{odd}");
             }
         }
@@ -391,7 +443,11 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
                 let Some(m) = m.as_record() else { continue };
                 let who = m.opt_text(2)?.unwrap_or("");
                 let role = m.opt_text(3)?.unwrap_or("");
-                let you = if m.opt_bool(4)? == Some(true) { " (you)" } else { "" };
+                let you = if m.opt_bool(4)? == Some(true) {
+                    " (you)"
+                } else {
+                    ""
+                };
                 println!("{who}{you}: {role}");
             }
         }

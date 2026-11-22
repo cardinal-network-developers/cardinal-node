@@ -219,7 +219,8 @@ fn place(v: &Value) -> Result<Place, String> {
     let r = v
         .as_record()
         .ok_or_else(|| bad("a place is neither a kind nor a record"))?;
-    let doc = name32(r, 1, "a place's document")?.ok_or_else(|| bad("a place names no document"))?;
+    let doc =
+        name32(r, 1, "a place's document")?.ok_or_else(|| bad("a place names no document"))?;
     let kind = r
         .get(2)
         .and_then(Value::as_uint)
@@ -229,7 +230,9 @@ fn place(v: &Value) -> Result<Place, String> {
 }
 
 fn field_def(v: &Value) -> Result<FieldDef, String> {
-    let r = v.as_record().ok_or_else(|| bad("a field is not a record"))?;
+    let r = v
+        .as_record()
+        .ok_or_else(|| bad("a field is not a record"))?;
     let key = r
         .get(1)
         .and_then(Value::as_uint)
@@ -296,7 +299,9 @@ impl Document {
         let sharing = match r.get(4) {
             None => None,
             Some(v) => {
-                let s = v.as_record().ok_or_else(|| bad("sharing is not a record"))?;
+                let s = v
+                    .as_record()
+                    .ok_or_else(|| bad("sharing is not a record"))?;
                 let shared = opt_bool(s, 1, "shared")?;
                 let role = match s.get(2) {
                     None => 0,
@@ -329,7 +334,10 @@ impl Document {
             for p in &k.places {
                 if let Place::Own(n) = p {
                     if !seen.contains(n) {
-                        return Err(bad(&format!("kind {} goes under kind {n}, which it lacks", k.kind)));
+                        return Err(bad(&format!(
+                            "kind {} goes under kind {n}, which it lacks",
+                            k.kind
+                        )));
                     }
                 }
                 if let Place::Of(doc, _) = p {
@@ -343,7 +351,9 @@ impl Document {
             return Err(bad("it is its own parent"));
         }
         if translates.is_some() && (language.is_none() || parent.is_some() || sharing.is_some()) {
-            return Err(bad("a translation has a language, and no parent and no sharing"));
+            return Err(bad(
+                "a translation has a language, and no parent and no sharing",
+            ));
         }
         Ok(Document {
             name,
@@ -466,10 +476,9 @@ impl Family {
                         Place::Root => None,
                         Place::Own(n) => Some(d.node_kind(*n)),
                         Place::Of(doc, n) => {
-                            let a = ancestors
-                                .iter()
-                                .find(|a| a.name == *doc)
-                                .ok_or_else(|| bad("a place names a document that is not an ancestor"))?;
+                            let a = ancestors.iter().find(|a| a.name == *doc).ok_or_else(|| {
+                                bad("a place names a document that is not an ancestor")
+                            })?;
                             a.kind(*n)
                                 .ok_or_else(|| bad("a place names a kind its document lacks"))?;
                             Some(a.node_kind(*n))
@@ -705,7 +714,9 @@ pub fn check(
             Some(33) => {
                 let n = node()?;
                 if !family.knows(n) {
-                    return Err(no("this program does not know that node, or a field of it".into()));
+                    return Err(no(
+                        "this program does not know that node, or a field of it".into()
+                    ));
                 }
                 own(n)?;
                 let k = family.known(&n.kind).expect("known");
@@ -730,7 +741,9 @@ pub fn check(
             Some(34) => {
                 let n = node()?;
                 if !family.knows(n) {
-                    return Err(no("this program does not know that node, or a field of it".into()));
+                    return Err(no(
+                        "this program does not know that node, or a field of it".into()
+                    ));
                 }
                 own(n)?;
                 let k = family.known(&n.kind).expect("known");
@@ -754,7 +767,11 @@ pub fn check(
                 }
                 out.push(op.clone());
             }
-            _ => return Err(no("a program writes create, set, move, delete and restore only".into())),
+            _ => {
+                return Err(no(
+                    "a program writes create, set, move, delete and restore only".into(),
+                ))
+            }
         }
     }
     Ok(out)
@@ -776,7 +793,10 @@ pub fn document_node(doc: &Document) -> Record {
         .with(1, DOCUMENT_NODE)
         .with(2, ROOT)
         .with(3, doc.title.as_str())
-        .with(4, Record::new().with(1, doc.name).with(2, doc.bytes.clone()))
+        .with(
+            4,
+            Record::new().with(1, doc.name).with(2, doc.bytes.clone()),
+        )
 }
 
 /// The documents a space's document nodes hold, those whose bytes are the
@@ -895,7 +915,9 @@ mod tests {
             .with(2, "tag")
             .with(
                 3,
-                Value::list([Value::Record(Record::new().with(1, root.name).with(2, 1u64))]),
+                Value::list([Value::Record(
+                    Record::new().with(1, root.name).with(2, 1u64),
+                )]),
             )
             .with(5, Value::list([Value::Record(field(1, "text", 1))]));
         let child = Document::parse(&doc(Some(root.name), vec![tag])).unwrap();
@@ -924,7 +946,9 @@ mod tests {
         let good = t(vec![note().with(2, "Notiz")]);
         assert!(good.translates_well(&root));
         assert!(Family::new(vec![root.clone(), good]).is_ok());
-        let other = t(vec![note().with(5, Value::list([Value::Record(field(1, "t", 2))]))]);
+        let other = t(vec![
+            note().with(5, Value::list([Value::Record(field(1, "t", 2))]))
+        ]);
         assert!(!other.translates_well(&root));
         assert!(Family::new(vec![root, other]).is_err());
     }

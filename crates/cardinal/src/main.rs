@@ -3328,14 +3328,21 @@ async fn client(cmd: Cmd) -> anyhow::Result<()> {
                 }
                 for q in qs {
                     println!("{}. {}", q["id"], q["what"].as_str().unwrap_or(""));
-                    println!("   ({}: {})", q["name"].as_str().unwrap_or(""), q["program"].as_str().unwrap_or(""));
+                    println!(
+                        "   ({}: {})",
+                        q["name"].as_str().unwrap_or(""),
+                        q["program"].as_str().unwrap_or("")
+                    );
                     if q["asks"] == "share" {
-                        println!("   Answer with --with and the people, and --role reader or writer.");
+                        println!(
+                            "   Answer with --with and the people, and --role reader or writer."
+                        );
                     }
                 }
                 return Ok(());
             };
-            let req = json!({"cmd": "app-answer", "id": id, "yes": !no, "people": with, "role": role});
+            let req =
+                json!({"cmd": "app-answer", "id": id, "yes": !no, "people": with, "role": role});
             call(&paths, req).await?;
             println!("{}", if no { "Said no." } else { "Said yes." });
             Ok(())
@@ -3348,14 +3355,25 @@ async fn client(cmd: Cmd) -> anyhow::Result<()> {
                     println!("No program is approved for anything.");
                 }
                 for a in all {
-                    let how = if a["change"] == true { "see and change" } else { "see" };
-                    let off = if a["revoked"] == true { "  (revoked)" } else { "" };
-                    let here = if a["this_device"] == true { "this device".to_owned() } else {
+                    let how = if a["change"] == true {
+                        "see and change"
+                    } else {
+                        "see"
+                    };
+                    let off = if a["revoked"] == true {
+                        "  (revoked)"
+                    } else {
+                        ""
+                    };
+                    let here = if a["this_device"] == true {
+                        "this device".to_owned()
+                    } else {
                         a["device"].as_str().unwrap_or("another device").to_owned()
                     };
                     println!(
                         "{}  {} may {how} every {}, on {here}: {}{off}",
-                        &a["id"].as_str().unwrap_or("")[..8.min(a["id"].as_str().unwrap_or("").len())],
+                        &a["id"].as_str().unwrap_or("")
+                            [..8.min(a["id"].as_str().unwrap_or("").len())],
                         a["name"].as_str().unwrap_or(""),
                         a["covers"].as_str().unwrap_or(""),
                         a["program"].as_str().unwrap_or(""),

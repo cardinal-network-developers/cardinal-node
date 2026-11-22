@@ -1389,6 +1389,33 @@ Readings:
   of what came from elsewhere and was not shown yet
   ([Daemon](#daemon-mount-and-cli-cardinald-cardinal), "What a local change
   has seen").
+## Applications (`spec/profiles.md#applications-normative`, `spec/apps.md#the-application-interface`)
+
+Stage 3, first step: the application document, document nodes, approvals
+and the application interface at `api` 1 (a draft), driven by
+`cardinal-calendar`. What is not built, or was read one way:
+
+- **Not built:** `send` and real-time channels, `open` and `preview`,
+  `persona`, handlers and formats of plain files, the "accept without
+  asking" rule, and a sandbox: every program is named by its executable
+  (`/proc/<pid>/exe` of the peer, `SO_PEERCRED`), and the questions say
+  that this protects nothing.
+- **Questions are in memory.** A program's `approve`, `new-space` or
+  `share` waits on its connection until the person answers
+  (`cardinal approve`); a restart, or the program going, drops it.
+- **File handles** of `file-put` and of files a program was given are
+  kept in memory: a handle from before a restart must be had again from
+  `nodes`. `file-put` takes a path on the device's disk, as the person's
+  `put` does.
+- **Joining** an offered space of an application writes the account's
+  space node only: the question of naming one's hosts there (D75) is not
+  asked, and the reach node is left unset.
+- **Translations** are taken in `hello` and checked against their
+  originals, but no document node is written for one.
+- **Sequence numbers** count the entries this device took since the
+  service started, above a base that rises with each start, so one from
+  before a restart is answered whole.
+
 ## Link (`spec/link.md`)
 
 Deviations:

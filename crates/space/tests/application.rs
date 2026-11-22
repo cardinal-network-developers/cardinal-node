@@ -43,15 +43,31 @@ fn root() -> Document {
         "Notes",
         None,
         vec![
-            kind(1, "note", Value::from(0u64), false, vec![field(1, "text", 1), field(2, "count", 2)]),
-            kind(2, "mark", Value::from(1u64), true, vec![field(1, "text", 1)]),
+            kind(
+                1,
+                "note",
+                Value::from(0u64),
+                false,
+                vec![field(1, "text", 1), field(2, "count", 2)],
+            ),
+            kind(
+                2,
+                "mark",
+                Value::from(1u64),
+                true,
+                vec![field(1, "text", 1)],
+            ),
         ],
     )
 }
 
 fn child(root: &Document) -> Document {
     let under = Value::Record(Record::new().with(1, root.name).with(2, 1u64));
-    document("Tags", Some(root.name), vec![kind(1, "tag", under, false, vec![field(1, "text", 1)])])
+    document(
+        "Tags",
+        Some(root.name),
+        vec![kind(1, "tag", under, false, vec![field(1, "text", 1)])],
+    )
 }
 
 struct Ana {
@@ -64,8 +80,12 @@ fn ana(root: &Document) -> Ana {
     let dev = DeviceKeys::generate();
     let Created {
         log, encryption, ..
-    } = IdentityLog::create_with(RecoveryPhrase::from_entropy(&[3; 32]), &dev, HybridKeyPair::generate())
-        .unwrap();
+    } = IdentityLog::create_with(
+        RecoveryPhrase::from_entropy(&[3; 32]),
+        &dev,
+        HybridKeyPair::generate(),
+    )
+    .unwrap();
     let genesis = vec![
         SpaceOp::add_member(log.id(), cardinal_space::group::OWNER),
         SpaceOp::from_record(application::document_node(root)),
@@ -86,7 +106,10 @@ fn ana(root: &Document) -> Ana {
 impl Ana {
     fn write(&mut self, ops: Vec<Record>) -> cardinal_identity::EntryId {
         let ops = ops.into_iter().map(SpaceOp::from_record).collect();
-        let (id, _) = self.space.write_entry(&self.log, &self.dev.signing, ops, None).unwrap();
+        let (id, _) = self
+            .space
+            .write_entry(&self.log, &self.dev.signing, ops, None)
+            .unwrap();
         id
     }
 
@@ -100,7 +123,12 @@ impl Ana {
 }
 
 fn create(kind: Value, parent: Value, fields: Record) -> Record {
-    Record::new().with(0, 32u64).with(1, kind).with(2, parent).with(3, "n").with(4, fields)
+    Record::new()
+        .with(0, 32u64)
+        .with(1, kind)
+        .with(2, parent)
+        .with(3, "n")
+        .with(4, fields)
 }
 
 #[test]
@@ -118,7 +146,12 @@ fn the_root_s_document_is_in_the_genesis_and_used_when_its_hash_matches() {
         .with(1, DOCUMENT_NODE)
         .with(2, ROOT)
         .with(3, "lie")
-        .with(4, Record::new().with(1, root.name).with(2, other.bytes.clone()));
+        .with(
+            4,
+            Record::new()
+                .with(1, root.name)
+                .with(2, other.bytes.clone()),
+        );
     a.write(vec![lie]);
     assert_eq!(a.doc_nodes(), 2, "it is in the state like any node");
     let held = application::documents_in(a.space.state());
@@ -133,7 +166,11 @@ fn a_child_s_document_node_is_written_once_on_first_use() {
     let family = Family::new(vec![root.clone(), tags.clone()]).unwrap();
     let mut a = ana(&root);
     let me = a.log.id();
-    let note = a.write(vec![create(Value::from(1u64), Value::from(ROOT), Record::new().with(1, "hi"))]);
+    let note = a.write(vec![create(
+        Value::from(1u64),
+        Value::from(ROOT),
+        Record::new().with(1, "hi"),
+    )]);
     let note = cardinal_space::entry::derived_id(&note, 0);
     // a note needs no document node of the child
     let ops = vec![create(Value::from(1u64), Value::from(ROOT), Record::new())];
@@ -143,7 +180,11 @@ fn a_child_s_document_node_is_written_once_on_first_use() {
     let NodeKind::Named(tag) = tags.node_kind(1) else {
         panic!("a child's kind is named")
     };
-    let ops = vec![create(Value::from(tag), Value::from(note), Record::new().with(1, "red"))];
+    let ops = vec![create(
+        Value::from(tag),
+        Value::from(note),
+        Record::new().with(1, "red"),
+    )];
     let mut all = application::check(&family, a.space.state(), &me, &ops).unwrap();
     let wanted = application::documents_wanted(&family, a.space.state(), &all);
     assert_eq!(wanted.len(), 1);
@@ -152,7 +193,11 @@ fn a_child_s_document_node_is_written_once_on_first_use() {
     a.write(all);
     assert_eq!(a.doc_nodes(), 2);
     // and the second does not
-    let ops = vec![create(Value::from(tag), Value::from(note), Record::new().with(1, "blue"))];
+    let ops = vec![create(
+        Value::from(tag),
+        Value::from(note),
+        Record::new().with(1, "blue"),
+    )];
     let all = application::check(&family, a.space.state(), &me, &ops).unwrap();
     assert!(application::documents_wanted(&family, a.space.state(), &all).is_empty());
 }
@@ -165,33 +210,77 @@ fn the_writer_s_service_refuses_what_its_documents_do_not_allow() {
     let me = a.log.id();
     let check = |a: &Ana, ops: Vec<Record>| application::check(&family, a.space.state(), &me, &ops);
     // a kind no document declares
-    let r = check(&a, vec![create(Value::from(9u64), Value::from(ROOT), Record::new())]).unwrap_err();
+    let r = check(
+        &a,
+        vec![create(Value::from(9u64), Value::from(ROOT), Record::new())],
+    )
+    .unwrap_err();
     assert_eq!(r.at, 0);
     assert!(r.why.contains("kind"), "{}", r.why);
     // a field of the wrong type, and one not declared
-    let r = check(&a, vec![create(Value::from(1u64), Value::from(ROOT), Record::new().with(2, "x"))]);
+    let r = check(
+        &a,
+        vec![create(
+            Value::from(1u64),
+            Value::from(ROOT),
+            Record::new().with(2, "x"),
+        )],
+    );
     assert!(r.is_err());
-    let r = check(&a, vec![create(Value::from(1u64), Value::from(ROOT), Record::new().with(7, "x"))]);
+    let r = check(
+        &a,
+        vec![create(
+            Value::from(1u64),
+            Value::from(ROOT),
+            Record::new().with(7, "x"),
+        )],
+    );
     assert!(r.is_err());
     // a mark goes under a note, not under the root; and is made the
     // author's own by the service
-    assert!(check(&a, vec![create(Value::from(2u64), Value::from(ROOT), Record::new())]).is_err());
+    assert!(check(
+        &a,
+        vec![create(Value::from(2u64), Value::from(ROOT), Record::new())]
+    )
+    .is_err());
     let ops = vec![
-        create(Value::from(1u64), Value::from(ROOT), Record::new().with(1, "hi")),
+        create(
+            Value::from(1u64),
+            Value::from(ROOT),
+            Record::new().with(1, "hi"),
+        ),
         create(Value::from(2u64), Value::from(0u64), Record::new()),
     ];
     let ok = check(&a, ops).unwrap();
-    assert_eq!(ok[1].get(4).and_then(|v| v.as_record()).and_then(|r| r.get(15)), Some(&Value::from(1u64)));
+    assert_eq!(
+        ok[1]
+            .get(4)
+            .and_then(|v| v.as_record())
+            .and_then(|r| r.get(15)),
+        Some(&Value::from(1u64))
+    );
     // the second op names the first by index: only an earlier one
-    let r = check(&a, vec![create(Value::from(2u64), Value::from(0u64), Record::new())]).unwrap_err();
+    let r = check(
+        &a,
+        vec![create(Value::from(2u64), Value::from(0u64), Record::new())],
+    )
+    .unwrap_err();
     assert_eq!(r.at, 0);
     // a control op is never a program's
     let leave = SpaceOp::leave().record().clone();
     assert!(check(&a, vec![leave]).is_err());
     // a node it does not know: neither set nor deleted
-    let odd = a.write(vec![create(Value::from(7u64), Value::from(ROOT), Record::new())]);
+    let odd = a.write(vec![create(
+        Value::from(7u64),
+        Value::from(ROOT),
+        Record::new(),
+    )]);
     let odd = cardinal_space::entry::derived_id(&odd, 0);
-    let set = Record::new().with(0, 33u64).with(1, odd).with(2, 1u64).with(3, "x");
+    let set = Record::new()
+        .with(0, 33u64)
+        .with(1, odd)
+        .with(2, 1u64)
+        .with(3, "x");
     assert!(check(&a, vec![set]).is_err());
     let del = Record::new().with(0, 35u64).with(1, odd);
     assert!(check(&a, vec![del]).is_err());

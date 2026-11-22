@@ -99,7 +99,9 @@ fn meet(ana: &Dev, ben: &Dev) {
     let at = format!("127.0.0.1:{}", ana.port);
     let code = ana.cli(&["invite", "--address", &at, "--name", "Ana"]);
     ben.cli(&["accept", code.trim(), "--name", "Ana"]);
-    wait("ana lists ben", 30, || ana.cli(&["contacts"]).to_lowercase().contains("ben"));
+    wait("ana lists ben", 30, || {
+        ana.cli(&["contacts"]).to_lowercase().contains("ben")
+    });
     ask(ana, &json!({"cmd": "contact", "who": "ben", "name": "Ben"}));
 }
 
@@ -110,7 +112,8 @@ struct Raw(Client);
 impl Raw {
     fn new(d: &Dev) -> Raw {
         let c = Client::connect(&app_socket(d)).expect("the application interface listens");
-        c.set_read_timeout(Some(std::time::Duration::from_secs(60))).unwrap();
+        c.set_read_timeout(Some(std::time::Duration::from_secs(60)))
+            .unwrap();
         Raw(c)
     }
 
@@ -120,7 +123,12 @@ impl Raw {
     }
 
     fn hello(&mut self, doc: &[u8]) -> Record {
-        let r = self.ask(Record::new().with(0, 1u64).with(1, "Test").with(2, Value::list([Value::from(doc.to_vec())])));
+        let r = self.ask(
+            Record::new()
+                .with(0, 1u64)
+                .with(1, "Test")
+                .with(2, Value::list([Value::from(doc.to_vec())])),
+        );
         assert_eq!(r.uint(0).unwrap(), 0, "{r}");
         r
     }
@@ -137,11 +145,24 @@ fn ana_shares_a_calendar_with_ben_whose_program_sees_it() {
     let started = cal_waiting(&ana, &["new", "Ana's calendar"]);
     let q = answer(&ana, &[]);
     assert_eq!(q["asks"], "new-space");
-    assert!(q["what"].as_str().unwrap().contains("Ana's calendar"), "{q}");
+    assert!(
+        q["what"].as_str().unwrap().contains("Ana's calendar"),
+        "{q}"
+    );
     let handle = finished(started).trim().to_owned();
     assert_eq!(handle.len(), 32, "{handle}");
     assert!(cal(&ana, &["list"]).contains("Ana's calendar"));
-    cal(&ana, &["add", "Ana's calendar", "Dentist", "20261126T090000", "--zone", "America/Chicago"]);
+    cal(
+        &ana,
+        &[
+            "add",
+            "Ana's calendar",
+            "Dentist",
+            "20261126T090000",
+            "--zone",
+            "America/Chicago",
+        ],
+    );
 
     // she shares it with Ben, choosing him in Cardinal
     let sharing = cal_waiting(&ana, &["share", "Ana's calendar"]);
@@ -159,7 +180,9 @@ fn ana_shares_a_calendar_with_ben_whose_program_sees_it() {
         space = o["space"].as_str().unwrap_or("").to_owned();
         o["application"] == "Calendar"
     });
-    assert!(ben.cli(&["apps", "offers"]).contains("Ana shares a calendar with you: Ana's calendar"));
+    assert!(ben
+        .cli(&["apps", "offers"])
+        .contains("Ana shares a calendar with you: Ana's calendar"));
     ben.cli(&["apps", "join", &space]);
 
     // his calendar program sees nothing until he approves it
@@ -187,7 +210,10 @@ fn ana_shares_a_calendar_with_ben_whose_program_sees_it() {
 
     // the approvals are in the account, and listed
     let approvals = ben.cli(&["apps", "approvals"]);
-    assert!(approvals.contains("may see every Calendar, on this device"), "{approvals}");
+    assert!(
+        approvals.contains("may see every Calendar, on this device"),
+        "{approvals}"
+    );
 
     // a program without an approval, on Ben's device, sees nothing
     let doc = calendar(&ben).arg("document").output().unwrap().stdout;
@@ -215,7 +241,11 @@ fn a_write_the_documents_do_not_allow_is_refused() {
     let mut bad = Raw::new(&ana);
     let mut broken = doc.clone();
     broken.push(0);
-    let r = bad.ask(Record::new().with(0, 1u64).with(2, Value::list([Value::from(broken)])));
+    let r = bad.ask(
+        Record::new()
+            .with(0, 1u64)
+            .with(2, Value::list([Value::from(broken)])),
+    );
     assert_ne!(r.uint(0).unwrap(), 0);
 
     // this test, as a program, asks to start a calendar, and Ana says yes
@@ -223,7 +253,8 @@ fn a_write_the_documents_do_not_allow_is_refused() {
     let doc2 = doc.clone();
     let started = std::thread::spawn(move || {
         let c = Client::connect(&socket).unwrap();
-        c.set_read_timeout(Some(std::time::Duration::from_secs(60))).unwrap();
+        c.set_read_timeout(Some(std::time::Duration::from_secs(60)))
+            .unwrap();
         let mut p = Raw(c);
         let hello = p.hello(&doc2);
         let root = hello.list(4).unwrap()[0].as_bytes().unwrap().to_vec();
@@ -234,13 +265,26 @@ fn a_write_the_documents_do_not_allow_is_refused() {
     answer(&ana, &[]);
     let (mut p, space) = started.join().unwrap();
     let write = |p: &mut Raw, op: Record| {
-        p.ask(Record::new().with(0, 8u64).with(1, space.clone()).with(2, Value::list([Value::Record(op)])))
+        p.ask(
+            Record::new()
+                .with(0, 8u64)
+                .with(1, space.clone())
+                .with(2, Value::list([Value::Record(op)])),
+        )
     };
     let create = |kind: u64, fields: Record| {
-        Record::new().with(0, 32u64).with(1, kind).with(2, [0u8; 16]).with(3, "x").with(4, fields)
+        Record::new()
+            .with(0, 32u64)
+            .with(1, kind)
+            .with(2, [0u8; 16])
+            .with(3, "x")
+            .with(4, fields)
     };
     // an event is written
-    let ok = write(&mut p, create(2, Record::new().with(1, "Lunch").with(2, "20261201T120000")));
+    let ok = write(
+        &mut p,
+        create(2, Record::new().with(1, "Lunch").with(2, "20261201T120000")),
+    );
     assert_eq!(ok.uint(0).unwrap(), 0, "{ok}");
     // a kind the calendar does not declare is refused, and says which op
     let r = write(&mut p, create(9, Record::new()));
@@ -255,8 +299,50 @@ fn a_write_the_documents_do_not_allow_is_refused() {
     // the space holds one document node, the calendar's, whatever was
     // written since
     let nodes = p.ask(Record::new().with(0, 7u64).with(1, space.clone()));
-    assert_eq!(nodes.list(2).unwrap().len(), 1, "a program is not given document nodes");
-    let token = ask(&ana, &json!({"cmd": "inspect-on"}))["token"].as_str().unwrap().to_owned();
+    assert_eq!(
+        nodes.list(2).unwrap().len(),
+        1,
+        "a program is not given document nodes"
+    );
+
+    // what changed since a sequence number, and a watch that says so
+    let seq = nodes.uint(3).unwrap();
+    let since = |p: &mut Raw, seq: u64| {
+        let r = p.ask(
+            Record::new()
+                .with(0, 7u64)
+                .with(1, space.clone())
+                .with(4, seq),
+        );
+        assert_eq!(r.uint(0).unwrap(), 0, "{r}");
+        (r.list(2).unwrap().len(), r.uint(3).unwrap())
+    };
+    assert_eq!(since(&mut p, seq), (0, seq));
+    let mut watching = Raw::new(&ana);
+    watching.hello(&doc);
+    assert_eq!(
+        watching.ask(Record::new().with(0, 2u64)).uint(0).unwrap(),
+        0
+    );
+    let event = |w: &mut Raw| Record::decode(&w.0.recv_raw().unwrap().unwrap()).unwrap();
+    let first = event(&mut watching);
+    assert_eq!(first.bytes(1).unwrap(), &space[..]);
+    assert_eq!(first.uint(2).unwrap(), seq);
+    let ok = write(
+        &mut p,
+        create(2, Record::new().with(1, "Tea").with(2, "20261202")),
+    );
+    assert_eq!(ok.uint(0).unwrap(), 0, "{ok}");
+    let next = event(&mut watching);
+    assert!(next.uint(2).unwrap() > seq, "{next}");
+    let (changed, now) = since(&mut p, seq);
+    assert_eq!((changed, now), (1, next.uint(2).unwrap()));
+    // a number this service never gave is answered whole
+    assert_eq!(since(&mut p, 5).0, 2);
+    let token = ask(&ana, &json!({"cmd": "inspect-on"}))["token"]
+        .as_str()
+        .unwrap()
+        .to_owned();
     let shown = ask(&ana, &json!({"cmd": "inspect", "token": token}));
     let spaces = shown["spaces"].as_array().cloned().unwrap_or_default();
     let ours = spaces
@@ -266,6 +352,9 @@ fn a_write_the_documents_do_not_allow_is_refused() {
         .as_str()
         .unwrap()
         .to_owned();
-    let docs = ask(&ana, &json!({"cmd": "inspect-nodes", "token": token, "space": ours, "kind": 0}));
+    let docs = ask(
+        &ana,
+        &json!({"cmd": "inspect-nodes", "token": token, "space": ours, "kind": 0}),
+    );
     assert_eq!(docs["nodes"].as_array().unwrap().len(), 1, "{docs}");
 }

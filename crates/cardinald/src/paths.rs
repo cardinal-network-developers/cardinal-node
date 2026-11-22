@@ -175,7 +175,10 @@ impl Paths {
         if let Some(s) = std::env::var_os("CARDINAL_APP_SOCKET") {
             return PathBuf::from(s);
         }
-        let name = self.socket.file_name().map(|n| n.to_string_lossy().into_owned());
+        let name = self
+            .socket
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned());
         let name = name.unwrap_or_else(|| "cardinal.sock".into());
         let named = match name.strip_suffix(".sock") {
             Some(stem) => format!("{stem}-apps.sock"),
