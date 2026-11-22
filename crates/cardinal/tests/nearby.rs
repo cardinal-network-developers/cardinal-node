@@ -201,3 +201,123 @@ fn trusted_contacts_with_no_host_find_each_other_on_the_local_network() {
     stop(&mut ana);
     stop(&mut bo);
 }
+
+/// Every `peers.json` under `dir`: the addresses a device learned.
+fn forget_addresses(dir: &std::path::Path) {
+    for e in std::fs::read_dir(dir).unwrap().flatten() {
+        let p = e.path();
+        if p.is_dir() {
+            forget_addresses(&p);
+        } else if p.file_name().is_some_and(|n| n == "peers.json") {
+            std::fs::remove_file(&p).unwrap();
+        }
+    }
+}
+
+/// 2026-11-22: after both updated to 0.1.19, the designer "lost a
+/// connection with the kids' device", a trusted contact on the same LAN.
+/// Two contacts on one LAN, neither with a host, on the release before;
+/// one updates, and while the other is still old their sessions close for
+/// what the new one cannot read, so it backs off dialling (`unreadable.rs`).
+/// Then the other updates too, and comes back at an address the first has
+/// never seen, its own addresses forgotten: nothing but `c=` brings them
+/// together, and it does within a minute, the backoff notwithstanding.
+/// Needs `CARDINAL_OLD_BIN`, the release before (0.1.18).
+#[test]
+fn contacts_updated_one_after_the_other_find_each_other_again_on_the_lan() {
+    let Some(old) = std::env::var_os("CARDINAL_OLD_BIN") else {
+        eprintln!("skipping: CARDINAL_OLD_BIN is not set");
+        return;
+    };
+    let Some(mdns) = loopback_mdns() else {
+        eprintln!("skipping: multicast on loopback is unavailable");
+        return;
+    };
+    let root = tempfile::tempdir().unwrap();
+    let mut ana = Dev::new(root.path(), "ana", free_port());
+    let mut bo = Dev::new(root.path(), "bo", free_port());
+    ana.bin = old.clone().into();
+    bo.bin = old.into();
+    start(&mut ana, Some(mdns));
+    start(&mut bo, Some(mdns));
+    ana.cli(&["init", "--yes", "--name", "Ana"]);
+    bo.cli(&["init", "--yes", "--name", "Bo"]);
+    let at = format!("127.0.0.1:{}", ana.port);
+    let code = ana.cli(&["invite", "--address", &at, "--name", "Ana"]);
+    bo.cli(&["accept", code.trim(), "--name", "Ana"]);
+    wait("Ana lists Bo", 30, || ana.cli(&["contacts"]).contains("Bo"));
+    // The old release's control socket speaks another protocol: what it
+    // says of a contact is asked of its command line.
+    let old_says = |d: &Dev, who: &str| -> Value {
+        serde_json::from_str(&d.cli(&["contacts", who, "--json"])).unwrap_or_default()
+    };
+    let mut gives = (Value::Null, Value::Null);
+    for _ in 0..60 {
+        gives = (
+            old_says(&ana, "Bo")["nearby"]["they_give_secret"].clone(),
+            old_says(&bo, "Ana")["nearby"]["they_give_secret"].clone(),
+        );
+        if gives == (json!(true), json!(true)) {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_secs(1));
+    }
+    eprintln!("on the old release, each has the other's secret: {gives:?}");
+
+    // Bo updates; Ana, still old, keeps dialling, and their sessions close
+    // unread.
+    stop(&mut bo);
+    bo.bin = BIN.into();
+    start(&mut bo, Some(mdns));
+    let mut unread = false;
+    for _ in 0..90 {
+        unread = status_of(&bo, "Ana")["devices"]
+            .as_array()
+            .is_some_and(|ds| ds.iter().any(|d| d["unreadable"].is_object()));
+        if unread {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_secs(1));
+    }
+    if !unread {
+        eprintln!("the old version is read: no mixed window to come back from");
+    } else {
+        let u = status_of(&bo, "Ana")["devices"].clone();
+        eprintln!("mixed window: Bo cannot read Ana: {u}");
+        // Long enough for the wait to double at least once.
+        std::thread::sleep(std::time::Duration::from_secs(40));
+    }
+
+    // Ana updates, at a new address, having forgotten Bo's.
+    stop(&mut ana);
+    forget_addresses(&ana.home);
+    ana.port = free_port();
+    ana.bin = BIN.into();
+    start(&mut ana, Some(mdns));
+    wait("they find each other again on the LAN", 60, || {
+        online(&ana, "Bo") && online(&bo, "Ana")
+    });
+    let found = |d: &Dev, who: &str| {
+        status_of(d, who)["nearby_tries"]
+            .to_string()
+            .contains("found on the local network")
+    };
+    assert!(
+        found(&ana, "Bo") || found(&bo, "Ana"),
+        "{}\n{}",
+        status_of(&ana, "Bo"),
+        status_of(&bo, "Ana")
+    );
+    // and the record of what could not be read is gone once they sync
+    bo.cli(&["say", "Ana", "both new"]);
+    wait("Ana reads it", 30, || {
+        ana.cli(&["messages", "Bo"]).contains("both new")
+    });
+    wait("Bo reads Ana again", 30, || {
+        status_of(&bo, "Ana")["devices"]
+            .as_array()
+            .is_some_and(|ds| ds.iter().all(|d| d["unreadable"].is_null()))
+    });
+    stop(&mut ana);
+    stop(&mut bo);
+}

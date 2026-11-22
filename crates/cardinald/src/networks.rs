@@ -351,7 +351,16 @@ pub fn on_local_link(ip: std::net::IpAddr) -> bool {
     if v4.is_link_local() {
         return true;
     }
-    match link_subnets() {
+    in_subnets(v4, link_subnets())
+}
+
+/// Whether `v4` is in one of `nets`, the subnets on the link where they
+/// were read. Where none were, a private address counts: Android keeps
+/// each network's routes in a table of its own and leaves the main one,
+/// which `/proc/net/route` shows, empty, so an empty list says nothing of
+/// the link (2026-11-22).
+fn in_subnets(v4: Ipv4Addr, nets: Option<Vec<(Ipv4Addr, Ipv4Addr)>>) -> bool {
+    match nets.filter(|n| !n.is_empty()) {
         Some(nets) => nets
             .iter()
             .any(|(net, mask)| u32::from(v4) & u32::from(*mask) == u32::from(*net)),
@@ -586,6 +595,28 @@ mod tests {
         );
         assert!(!on_local_link("8.8.8.8".parse().unwrap()));
         assert!(on_local_link("169.254.7.7".parse().unwrap()));
+    }
+
+    /// 2026-11-22: on Android the main table is empty, each network's
+    /// routes being in a table of their own, so the routes name no subnet.
+    /// A /23 such as the designer's counts whole, and an empty list is no
+    /// list: a private address counts, as where the routes cannot be read.
+    #[test]
+    fn no_subnet_on_the_link_says_nothing_of_it() {
+        let header =
+            "Iface\tDestination\tGateway \tFlags\tRefCnt\tUse\tMetric\tMask\t\tMTU\tWindow\tIRTT\n";
+        assert!(on_link_subnets(header).is_empty());
+        let phone: Ipv4Addr = "172.20.0.37".parse().unwrap();
+        assert!(in_subnets(phone, Some(on_link_subnets(header))));
+        assert!(in_subnets(phone, None));
+        assert!(!in_subnets("8.8.8.8".parse().unwrap(), Some(Vec::new())));
+        let slash23 =
+            format!("{header}wlan0\t000014AC\t00000000\t0001\t0\t0\t600\t00FEFFFF\t0\t0\t0\n");
+        let nets = Some(on_link_subnets(&slash23));
+        assert!(in_subnets(phone, nets.clone()));
+        assert!(in_subnets("172.20.1.20".parse().unwrap(), nets.clone()));
+        assert!(!in_subnets("172.20.2.1".parse().unwrap(), nets.clone()));
+        assert!(!in_subnets("10.0.0.1".parse().unwrap(), nets));
     }
 
     #[test]
