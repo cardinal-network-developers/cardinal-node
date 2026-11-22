@@ -756,10 +756,13 @@ pub static ERROR_FIELDS: &[Field] = &[f!(2 "at" U), f!(3 "id" B)];
 pub static EVENTS: &[Request] = &[req!(1 "changed" (1 "seq" U) -> ())];
 
 /// The frames of a `call-media` connection, both ways: key 0 says which.
-/// `from`, the voice a frame of a group call is, comes only from the
-/// service.
+/// `from` is the voice a frame of a group call is, from the service, or
+/// the sender a window's level or key picture is asked of.
 pub static FRAMES: &[Request] = &[
     req!(1 "audio" (1 "audio" B, 3 "from" B) -> ()),
-    req!(2 "frame" (1 "frame" B, 2 "format" B, 3 "from" B) -> ()),
+    req!(2 "frame" (1 "frame" B, 2 "format" B, 3 "from" B, 4 "size" U) -> ()),
     req!(3 "viewport" (1 "width" U, 2 "height" U, 3 "from" B) -> ()),
+    req!(4 "level" (1 "level" U, 3 "from" B) -> ()),
+    req!(5 "asked" (1 "small" BOOL, 2 "large" BOOL) -> ()),
+    req!(6 "key" (3 "from" B, 4 "size" U) -> ()),
 ];

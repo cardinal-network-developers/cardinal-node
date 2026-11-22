@@ -268,14 +268,14 @@ struct Parent {
 /// Which of a voice's latest numbers have been seen: the newest, when it
 /// came, and a bit for each of the `WINDOW` before it.
 #[derive(Clone)]
-struct Seen {
+pub struct Seen {
     newest: u32,
     at: Instant,
     bits: [u64; (WINDOW / 64) as usize],
 }
 
 impl Seen {
-    fn new(n: u32, at: Instant) -> Seen {
+    pub fn new(n: u32, at: Instant) -> Seen {
         let mut s = Seen {
             newest: n,
             at,
@@ -294,12 +294,12 @@ impl Seen {
     }
 
     /// Whether `n` is neither seen nor old.
-    fn fresh(&self, n: u32) -> bool {
+    pub fn fresh(&self, n: u32) -> bool {
         let d = ahead(n, self.newest);
         d > 0 || (d > -i64::from(WINDOW) && !self.has((-d) as u32))
     }
 
-    fn mark(&mut self, n: u32, at: Instant) {
+    pub fn mark(&mut self, n: u32, at: Instant) {
         let d = ahead(n, self.newest);
         if d <= 0 {
             if d > -i64::from(WINDOW) {

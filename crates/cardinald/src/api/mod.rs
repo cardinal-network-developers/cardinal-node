@@ -65,6 +65,15 @@ pub mod frame {
     /// (`basics/video.md`): from the window, its own; from the service, a
     /// receiver's, with key 3 in a group.
     pub const VIEWPORT: u64 = 3;
+    /// From the window, in a group: the level, key 1, it asks of the sender
+    /// in key 3 (`basics/video.md#groups`).
+    pub const LEVEL: u64 = 4;
+    /// To the window, in a group: whether small (key 1) and large (key 2)
+    /// pictures of its own are asked for.
+    pub const ASKED: u64 = 5;
+    /// A key picture of the size in key 4: from the window, asked of the
+    /// sender in key 3; to it, asked of its own.
+    pub const KEY: u64 = 6;
 }
 
 /// A reply's key 1 in an error: why, in words.
@@ -658,12 +667,20 @@ pub fn decode_event(msg: &[u8]) -> anyhow::Result<Option<Json>> {
 }
 
 /// A `call-media` frame as a message: `{"audio": hex}` and in a group
-/// `from`, `{"frame": hex, "format": hex}`, or `{"width": n, "height": n}`.
+/// `from`, `{"frame": hex, "format": hex}` and in a group `size`,
+/// `{"width": n, "height": n}`, `{"level": n, "from": hex}`, `{"small": b,
+/// "large": b}`, or `{"from": hex, "size": n}` for a key picture.
 pub fn frame_message(frame: &Json) -> anyhow::Result<Vec<u8>> {
     let kind = if frame.get("frame").is_some() {
         "frame"
     } else if frame.get("width").is_some() {
         "viewport"
+    } else if frame.get("level").is_some() {
+        "level"
+    } else if frame.get("small").is_some() {
+        "asked"
+    } else if frame.get("size").is_some() {
+        "key"
     } else {
         "audio"
     };

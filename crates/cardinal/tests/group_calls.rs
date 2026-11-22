@@ -2,7 +2,9 @@
 //! a device that helps others carries a call its own person is not on, a
 //! group where everyone knows everyone settles into a tree, someone who left
 //! comes back to the same call, and a link that went quiet while a device's
-//! network was gone is made again when it comes back.
+//! network was gone is made again when it comes back. Pictures go only
+//! where they were asked for, in the size asked or smaller
+//! (`basics/video.md#groups`).
 
 mod common;
 
@@ -581,4 +583,339 @@ fn a_viewport_is_passed_on_to_everyone_on_a_group_call() {
     for v in &views {
         assert_eq!(*v, json!({"width": 3, "height": 4, "from": voice}));
     }
+}
+
+/// The draft name of video, as a window gives it (`basics/video.md`).
+fn video_format() -> String {
+    hex::encode(blake3::hash(b"cardinal draft format: video vp8 1").as_bytes())
+}
+
+/// What a window was given on a group video call.
+#[derive(Default)]
+struct Given {
+    /// The voice of each tag it heard.
+    voices: HashMap<u8, String>,
+    /// The numbers of the pictures it was given, by tag and size.
+    pictures: HashMap<(u8, u64), Vec<u32>>,
+    /// The sizes it was told are asked of it: small, large.
+    asked: Vec<(bool, bool)>,
+    /// The sizes of its own it was asked for key pictures of.
+    keys: Vec<u64>,
+}
+
+impl Given {
+    fn count(&self, tag: u8, size: u64) -> usize {
+        self.pictures.get(&(tag, size)).map_or(0, Vec::len)
+    }
+
+    fn clear_pictures(&mut self) {
+        self.pictures.clear();
+    }
+}
+
+/// A window on a group call with video: its sound, which tells the others
+/// its voice, synthetic pictures of two sizes, and the levels it asks for.
+struct Window {
+    line: Line,
+}
+
+impl Window {
+    fn open(d: &Dev, tag: u8) -> Window {
+        Window {
+            line: Line::open(d, tag),
+        }
+    }
+
+    /// A picture: an RTP-like header, then its tag, size and number, and
+    /// something of the size of a packet of video.
+    fn show(&mut self, size: u8, n: u32) {
+        let mut b = vec![0x80, 96, self.line.tag, size];
+        b.extend_from_slice(&n.to_be_bytes());
+        b.extend_from_slice(&[0x55; 600]);
+        self.line.m.send(&json!({
+            "frame": hex::encode(b),
+            "format": video_format(),
+            "size": size,
+        }));
+    }
+
+    fn level(&mut self, from: &str, level: u8) {
+        self.line.m.send(&json!({"level": level, "from": from}));
+    }
+
+    fn key(&mut self, from: &str, size: u8) {
+        self.line.m.send(&json!({"from": from, "size": size}));
+    }
+
+    /// Takes everything that came so far.
+    fn take(&mut self, g: &mut Given) {
+        while let Some(v) = self.line.m.next() {
+            if let Some(audio) = v["audio"].as_str() {
+                let b = hex::decode(audio).unwrap();
+                if let Some(from) = v["from"].as_str() {
+                    g.voices.insert(b[4], from.to_owned());
+                }
+            } else if let Some(frame) = v["frame"].as_str() {
+                let b = hex::decode(frame).unwrap();
+                let size = v["size"].as_u64().expect("a picture in a group has a size");
+                assert_eq!(u64::from(b[3]), size, "given as the size it was sent");
+                assert!(v["from"].is_string(), "{v}");
+                let n = u32::from_be_bytes(b[4..8].try_into().unwrap());
+                g.pictures.entry((b[2], size)).or_default().push(n);
+            } else if v.get("small").is_some() {
+                g.asked.push((v["small"] == true, v["large"] == true));
+            } else if v.get("size").is_some() {
+                g.keys.push(v["size"].as_u64().unwrap());
+            }
+        }
+    }
+}
+
+fn take_all(w: &mut [Window], given: &mut [Given]) {
+    for (w, g) in w.iter_mut().zip(given.iter_mut()) {
+        w.take(g);
+    }
+}
+
+/// Each window speaks for a moment, so that each learns the others' voices.
+fn learn_voices(w: &mut [Window], given: &mut [Given]) {
+    let all = w.len();
+    let until = std::time::Instant::now() + Duration::from_secs(10);
+    while std::time::Instant::now() < until {
+        for x in w.iter_mut() {
+            x.line.say();
+        }
+        std::thread::sleep(Duration::from_millis(20));
+        take_all(w, given);
+        if given.iter().all(|g| g.voices.len() == all - 1) {
+            return;
+        }
+    }
+    panic!("not every window heard every other");
+}
+
+/// Senders `send` show large pictures for a moment, so that large is had
+/// wherever it is asked for before small comes; then both sizes, numbered
+/// `from..from + n`, or with `small_only` small alone. What each window was
+/// given of the second part.
+fn show_pictures(
+    w: &mut [Window],
+    given: &mut [Given],
+    send: &[usize],
+    from: u32,
+    n: u32,
+    small_only: bool,
+) {
+    if !small_only {
+        for i in 0..5 {
+            for s in send {
+                w[*s].show(2, from + 1000 + i);
+            }
+            std::thread::sleep(Duration::from_millis(40));
+        }
+    }
+    take_all(w, given);
+    for g in given.iter_mut() {
+        g.clear_pictures();
+    }
+    for i in from..from + n {
+        for s in send {
+            if !small_only {
+                w[*s].show(2, i);
+            }
+            w[*s].show(1, i);
+        }
+        std::thread::sleep(Duration::from_millis(33));
+        take_all(w, given);
+    }
+    for _ in 0..30 {
+        std::thread::sleep(Duration::from_millis(20));
+        take_all(w, given);
+    }
+}
+
+/// No picture is given twice.
+fn given_once(given: &[Given]) {
+    for g in given {
+        for (k, list) in &g.pictures {
+            let mut l = list.clone();
+            l.sort();
+            l.dedup();
+            assert_eq!(l.len(), list.len(), "{k:?} given twice: {list:?}");
+        }
+    }
+}
+
+/// Ana, Ben, Cy and Dee know only Carol, whose device carries the call.
+/// Ana asks Ben for large, Cy asks him for small, and Dee for nothing:
+/// Carol's device asks Ben for both and gives each what they asked, never
+/// more, and Dee none of his. When Ben sends small alone, Ana gets that.
+/// A key picture is asked of Ben for those who asked for his pictures.
+#[test]
+fn a_relay_gives_each_the_pictures_they_asked_for() {
+    let root = tempfile::tempdir().unwrap();
+    let carol = person(root.path(), "carol");
+    let ana = person(root.path(), "ana");
+    let ben = person(root.path(), "ben");
+    let cy = person(root.path(), "cy");
+    let dee = person(root.path(), "dee");
+    plugged_in(&carol, true);
+    for d in [&ana, &ben, &cy, &dee] {
+        plugged_in(d, false);
+        meet(&carol, d);
+    }
+    let g = group(&carol, &[&ana, &ben, &cy, &dee]);
+    ask(&ana, json!({"cmd": "call-start", "group": g}));
+    for d in [&ben, &cy, &dee] {
+        wait("rung", 20, || standing(d) == "ringing");
+        ask(d, json!({"cmd": "call-answer"}));
+    }
+    wait("carol's device carries it for all four", 30, || {
+        carrying(&carol) == 1 && [&ana, &ben, &cy, &dee].iter().all(|d| linked(d) == 1)
+    });
+
+    let mut w = vec![
+        Window::open(&ana, 1),
+        Window::open(&ben, 2),
+        Window::open(&cy, 3),
+        Window::open(&dee, 4),
+    ];
+    let mut given: Vec<Given> = (0..4).map(|_| Given::default()).collect();
+    learn_voices(&mut w, &mut given);
+    let ben_v = given[0].voices[&2].clone();
+    let ana_v = given[3].voices[&1].clone();
+    w[0].level(&ben_v, 2);
+    w[2].level(&given[2].voices[&2].clone(), 1);
+    w[3].level(&given[3].voices[&2].clone(), 0);
+    w[3].level(&ana_v, 2);
+    wait("ben is asked for both sizes, ana for large", 10, || {
+        take_all(&mut w, &mut given);
+        given[1].asked.last() == Some(&(true, true))
+            && given[0].asked.last() == Some(&(false, true))
+    });
+
+    show_pictures(&mut w, &mut given, &[0, 1], 0, 60, false);
+    given_once(&given);
+    let most = 54;
+    let (a, b, c, d) = (&given[0], &given[1], &given[2], &given[3]);
+    eprintln!(
+        "ana {:?}, cy {:?}, dee {:?}",
+        a.pictures.keys().collect::<Vec<_>>(),
+        c.pictures.keys().collect::<Vec<_>>(),
+        d.pictures.keys().collect::<Vec<_>>()
+    );
+    assert!(
+        a.count(2, 2) >= most,
+        "ana has ben large: {}",
+        a.count(2, 2)
+    );
+    // Small is within what she asked, before large is had; no more.
+    assert!(a.count(2, 1) <= 2, "ana has ben small: {}", a.count(2, 1));
+    assert!(c.count(2, 1) >= most, "cy has ben small: {}", c.count(2, 1));
+    assert_eq!(c.count(2, 2), 0, "cy asked for small: never large");
+    assert_eq!(
+        d.count(2, 1) + d.count(2, 2),
+        0,
+        "dee asked for none of ben"
+    );
+    assert!(
+        d.count(1, 2) >= most,
+        "dee has ana large: {}",
+        d.count(1, 2)
+    );
+    assert_eq!(b.pictures.len(), 0, "ben asked for nothing");
+    assert_eq!(c.count(1, 1) + c.count(1, 2), 0, "cy asked for none of ana");
+
+    // Ben's large goes: Ana is given his small, the best there is up to large.
+    show_pictures(&mut w, &mut given, &[1], 100, 60, true);
+    given_once(&given);
+    let (a, c, d) = (&given[0], &given[2], &given[3]);
+    assert!(
+        a.count(2, 1) >= 25,
+        "ana falls back to small: {}",
+        a.count(2, 1)
+    );
+    assert_eq!(a.count(2, 2), 0);
+    assert!(c.count(2, 1) >= most, "{}", c.count(2, 1));
+    assert_eq!(d.count(2, 1), 0, "dee still asked for none");
+
+    // Dee asked for none of Ben's: her ask for a key picture goes nowhere.
+    w[3].key(&given[3].voices[&2].clone(), 2);
+    std::thread::sleep(Duration::from_millis(1500));
+    take_all(&mut w, &mut given);
+    assert!(given[1].keys.is_empty(), "{:?}", given[1].keys);
+    w[0].key(&ben_v, 2);
+    wait("ben is asked for a key picture", 5, || {
+        take_all(&mut w, &mut given);
+        given[1].keys == [2]
+    });
+}
+
+/// Four who all know each other, each sending both sizes: every window is
+/// given each sender's pictures in the size it asked for, from that sender's
+/// own device, once; a window that asks for nothing is given nothing, and
+/// each sender is told which sizes are asked of it.
+#[test]
+fn in_a_mesh_each_window_gets_the_sizes_it_asked_for() {
+    let root = tempfile::tempdir().unwrap();
+    let all: Vec<Dev> = ["ana", "bo", "cy", "dee"]
+        .into_iter()
+        .map(|n| person(root.path(), n))
+        .collect();
+    for d in &all {
+        plugged_in(d, false);
+    }
+    for i in 0..all.len() {
+        for j in i + 1..all.len() {
+            meet(&all[i], &all[j]);
+        }
+    }
+    let (first, rest) = all.split_first().unwrap();
+    let others: Vec<&Dev> = rest.iter().collect();
+    let g = group(first, &others);
+    ask(first, json!({"cmd": "call-start", "group": g}));
+    for d in rest {
+        wait("rung", 20, || standing(d) == "ringing");
+        ask(d, json!({"cmd": "call-answer"}));
+    }
+    wait("each links with the three others", 30, || {
+        all.iter().all(|d| linked(d) == 3)
+    });
+    let mut w: Vec<Window> = all
+        .iter()
+        .enumerate()
+        .map(|(i, d)| Window::open(d, i as u8 + 1))
+        .collect();
+    let mut given: Vec<Given> = (0..4).map(|_| Given::default()).collect();
+    learn_voices(&mut w, &mut given);
+    // What each window asks of each sender, by tag: Dee asks for nothing.
+    let want: [[u8; 4]; 4] = [[0, 2, 1, 0], [1, 0, 2, 2], [1, 1, 0, 1], [0, 0, 0, 0]];
+    for (r, row) in want.iter().enumerate() {
+        for (s, level) in row.iter().enumerate() {
+            if *level > 0 {
+                let v = given[r].voices[&(s as u8 + 1)].clone();
+                w[r].level(&v, *level);
+            }
+        }
+    }
+    let told = [(true, false), (true, true), (true, true), (true, true)];
+    wait("each sender is told the sizes asked of it", 10, || {
+        take_all(&mut w, &mut given);
+        (0..4).all(|i| given[i].asked.last() == Some(&told[i]))
+    });
+
+    show_pictures(&mut w, &mut given, &[0, 1, 2, 3], 0, 60, false);
+    given_once(&given);
+    for (r, row) in want.iter().enumerate() {
+        for (s, level) in row.iter().enumerate() {
+            let tag = s as u8 + 1;
+            let (small, large) = (given[r].count(tag, 1), given[r].count(tag, 2));
+            match level {
+                0 => assert_eq!(small + large, 0, "{r} asked none of {tag}"),
+                1 => assert!(small >= 54 && large == 0, "{r} of {tag}: {small} {large}"),
+                _ => assert!(large >= 54 && small <= 2, "{r} of {tag}: {small} {large}"),
+            }
+        }
+    }
+    assert!(given[3].pictures.is_empty(), "dee asked for nothing");
 }

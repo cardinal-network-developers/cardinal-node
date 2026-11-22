@@ -319,8 +319,13 @@ pub struct Daemon {
     /// A call's audio as it comes in: the call, whose voice it is in a group
     /// call, and the frame.
     pub call_audio: tokio::sync::broadcast::Sender<([u8; 16], Option<[u8; 8]>, bytes::Bytes)>,
-    /// Frames of a call's other formats, such as video, for clients.
-    pub call_video: tokio::sync::broadcast::Sender<([u8; 16], crate::calls::Format, bytes::Bytes)>,
+    /// Frames of a call's other formats, such as video, for clients: the
+    /// call, the format, and in a group, whose picture it is and its size
+    /// (`basics/video.md#groups`).
+    pub call_video: tokio::sync::broadcast::Sender<crate::calls::Shown>,
+    /// What a group call asks of this device's window: the sizes of its
+    /// pictures asked for, or a key picture.
+    pub call_wants: tokio::sync::broadcast::Sender<([u8; 16], crate::pictures::Want)>,
     /// A receiver's viewport as it comes (`basics/video.md`): the call, whose
     /// it is in a group call, and its width and height.
     pub call_viewport:
@@ -581,6 +586,7 @@ impl Daemon {
             _lock: lock,
             call_audio: tokio::sync::broadcast::channel(64).0,
             call_video: tokio::sync::broadcast::channel(512).0,
+            call_wants: tokio::sync::broadcast::channel(16).0,
             call_viewport: tokio::sync::broadcast::channel(64).0,
             setting_up: Mutex::new(None),
             mount: Mutex::new(None),

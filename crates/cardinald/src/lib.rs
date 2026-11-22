@@ -45,6 +45,7 @@ pub mod onefolder;
 pub mod outside;
 pub mod pair;
 pub mod paths;
+pub mod pictures;
 pub mod portmap;
 pub mod presence;
 pub mod recovering;

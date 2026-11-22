@@ -26,6 +26,7 @@ use tokio::sync::watch;
 use crate::contacts;
 use crate::daemon::{Daemon, PeerKind};
 use crate::mesh::{self, Frame, LinkId, Tree, Voice, Word};
+use crate::pictures::{self, Ask, KeyTo, Pictures, Size, Want};
 use crate::transport::{Reader, Writer};
 use cardinal_space::account::ContactRecord;
 
@@ -284,6 +285,12 @@ pub struct Group {
     /// The number of the newest viewport of each voice seen here, this
     /// device's own among them.
     viewports: HashMap<Voice, u32>,
+    /// Its pictures (`basics/video.md#groups`): what is asked of whom.
+    pictures: Pictures,
+    /// The number of this device's next picture of each size.
+    picture_next: [u32; 2],
+    /// The sizes its window was last told are asked of it.
+    wanted: Option<Want>,
     /// Frames that came on its links, and how many of them were new.
     frames_in: u64,
     frames_new: u64,
@@ -316,6 +323,20 @@ fn routing_label(space: &SpaceId, id: &[u8; 16]) -> [u8; 16] {
     h.update(space);
     h.update(id);
     h.update(b"routing");
+    let mut label = [0; 16];
+    label.copy_from_slice(&h.finalize().as_bytes()[..16]);
+    label
+}
+
+/// The channel a group call's words about pictures go on:
+/// `first16(BLAKE3(space id || call id || format name || "asks"))`
+/// (`basics/video.md#groups`).
+fn asks_label(space: &SpaceId, id: &[u8; 16]) -> [u8; 16] {
+    let mut h = blake3::Hasher::new();
+    h.update(space);
+    h.update(id);
+    h.update(&video());
+    h.update(b"asks");
     let mut label = [0; 16];
     label.copy_from_slice(&h.finalize().as_bytes()[..16]);
     label
@@ -357,6 +378,18 @@ pub fn video() -> Format {
 
 /// The shape of a window that shows someone's video: its width and height.
 pub type Viewport = (u16, u16);
+
+/// A frame of one of a call's other formats, for this person's window: the
+/// call, the format, and in a group whose picture it is and its size
+/// (`basics/video.md#groups`).
+#[derive(Clone, Debug)]
+pub struct Shown {
+    pub call: [u8; 16],
+    pub format: Format,
+    pub from: Option<Voice>,
+    pub size: Option<Size>,
+    pub frame: Bytes,
+}
 
 /// A viewport on the video channel is `1 || width (2) || height (2)`,
 /// big-endian, which no RTP packet is: RTP's first byte starts with bits 10.
@@ -787,7 +820,13 @@ fn go_live(d: &Arc<Daemon>, s: &Session, id: [u8; 16]) {
                                     let _ = d.call_viewport.send((id, None, v));
                                 }
                                 _ => {
-                                    let _ = d.call_video.send((id, format, frame));
+                                    let _ = d.call_video.send(Shown {
+                                        call: id,
+                                        format,
+                                        from: None,
+                                        size: None,
+                                        frame,
+                                    });
                                 }
                             },
                             None => return,
@@ -1032,6 +1071,9 @@ fn new_group(space: SpaceId, own: Option<Voice>, waiting: bool) -> Group {
         thin_since: None,
         probe: None,
         viewports: HashMap::new(),
+        pictures: Pictures::default(),
+        picture_next: [mesh::first_number(); 2],
+        wanted: None,
         frames_in: 0,
         frames_new: 0,
         since: Instant::now(),
@@ -1225,6 +1267,7 @@ async fn drive(d: Arc<Daemon>, id: [u8; 16], mut over: watch::Receiver<bool>) {
                     .collect();
                 for l in gone {
                     g.tree.remove_link(&l);
+                    g.pictures.remove_link(&l);
                     g.sessions.remove(&l);
                 }
             }
@@ -1235,6 +1278,7 @@ async fn drive(d: Arc<Daemon>, id: [u8; 16], mut over: watch::Receiver<bool>) {
             }
             for l in g.tree.silent(now) {
                 g.tree.remove_link(&l);
+                g.pictures.remove_link(&l);
                 if let Some((s, _)) = g.sessions.remove(&l) {
                     // Asked to link again at the next look, not later.
                     g.asked.remove(&s.handshake_hash());
@@ -1273,6 +1317,9 @@ async fn drive(d: Arc<Daemon>, id: [u8; 16], mut over: watch::Receiver<bool>) {
         }
         if here && on_it {
             send_viewport(&d);
+        }
+        if keepalive || here {
+            say_asks(&d, &id, keepalive, here && on_it);
         }
         if !silent.is_empty() {
             // Its session may be gone too: it is asked, and linked again
@@ -1413,6 +1460,7 @@ async fn group_signal(
                 });
                 if !same {
                     g.tree.remove_link(&ps);
+                    g.pictures.remove_link(&ps);
                     g.sessions.remove(&ps);
                 }
                 let added = g.tree.add_link(ps, !carrying, now);
@@ -1478,6 +1526,7 @@ async fn group_signal(
                 if let Some(g) = gs.get_mut(&id) {
                     let ps = s.peer_static();
                     g.tree.remove_link(&ps);
+                    g.pictures.remove_link(&ps);
                     g.sessions.remove(&ps);
                     // That device has left.
                     if let Some(p) = s.peer_identity() {
@@ -1577,6 +1626,7 @@ fn carry_link(d: &Arc<Daemon>, s: &Session, space: SpaceId, id: [u8; 16], linked
     let mut sound = s.channel(channel_label(&space, &id), Priority::RealTime);
     let mut words = s.channel(routing_label(&space, &id), Priority::RealTime);
     let mut views = s.channel(format_label(&space, &id, &video()), Priority::RealTime);
+    let mut asks = s.channel(asks_label(&space, &id), Priority::RealTime);
     let (d, s) = (d.clone(), s.clone());
     let over = groups(&d).get(&id).map(|g| g.over.subscribe());
     let Some(mut over) = over else { return };
@@ -1594,7 +1644,11 @@ fn carry_link(d: &Arc<Daemon>, s: &Session, space: SpaceId, id: [u8; 16], linked
                     None => break,
                 },
                 view = views.recv() => match view {
-                    Some(view) => viewed(&d, &s, &id, &view),
+                    Some(view) => viewed(&d, &s, &id, view),
+                    None => break,
+                },
+                ask = asks.recv() => match ask {
+                    Some(ask) => asked(&d, &s, &id, &ask),
                     None => break,
                 },
                 _ = check.tick() => {
@@ -1611,6 +1665,7 @@ fn carry_link(d: &Arc<Daemon>, s: &Session, space: SpaceId, id: [u8; 16], linked
                 if g.sessions.get(&ps).is_some_and(|(_, n)| *n == linked) {
                     g.sessions.remove(&ps);
                     g.tree.remove_link(&ps);
+                    g.pictures.remove_link(&ps);
                     g.asked.remove(&s.handshake_hash());
                 }
             }
@@ -1707,10 +1762,14 @@ fn passed(d: &Arc<Daemon>, from: &Session, id: &[u8; 16], bytes: Bytes) {
         if forged {
             tracing::info!("a group call's link sent a frame it made up: letting it go");
             g.tree.remove_link(&ps);
+            g.pictures.remove_link(&ps);
             g.sessions.remove(&ps);
             return;
         }
         let got = g.tree.on_frame(&ps, voice, n, here, genuine, now);
+        if got.fresh {
+            g.pictures.came(voice, ps, now);
+        }
         g.frames_in += 1;
         g.frames_new += u64::from(got.fresh);
         let to: Vec<Session> = got
@@ -1781,10 +1840,14 @@ fn said(d: &Daemon, from: &Session, id: &[u8; 16], bytes: &[u8]) {
 /// A viewport of a group call, come on the link `from` (`basics/video.md`):
 /// the newest of its voice, signed by its device, is passed on to every other
 /// link and given to this person's window.
-fn viewed(d: &Daemon, from: &Session, id: &[u8; 16], bytes: &[u8]) {
-    let Some(f) = Frame::parse(bytes) else {
+fn viewed(d: &Daemon, from: &Session, id: &[u8; 16], bytes: Bytes) {
+    let Some(f) = Frame::parse(&bytes) else {
         return;
     };
+    if f.payload.first() == Some(&pictures::PICTURE_KIND) {
+        pictured(d, from, id, &f, &bytes);
+        return;
+    }
     let Some(v) = viewport_in(f.payload) else {
         return;
     };
@@ -1815,6 +1878,7 @@ fn viewed(d: &Daemon, from: &Session, id: &[u8; 16], bytes: &[u8]) {
             return;
         }
         g.viewports.insert(f.voice, f.n);
+        g.pictures.came(f.voice, ps, Instant::now());
         let to: Vec<Session> = g
             .sessions
             .iter()
@@ -1825,10 +1889,253 @@ fn viewed(d: &Daemon, from: &Session, id: &[u8; 16], bytes: &[u8]) {
         (to, format_label(&g.space, id, &video()), show)
     };
     for s in to {
-        let _ = s.send_datagram(label, Priority::RealTime, Bytes::copy_from_slice(bytes));
+        let _ = s.send_datagram(label, Priority::RealTime, bytes.clone());
     }
     if show {
         let _ = d.call_viewport.send((*id, Some(f.voice), v));
+    }
+}
+
+/// A picture of a group call, come on the link `from`
+/// (`basics/video.md#groups`): checked, passed on to the links whose levels
+/// select its size, and given to this person's window if its level does.
+fn pictured(d: &Daemon, from: &Session, id: &[u8; 16], f: &Frame<'_>, bytes: &Bytes) {
+    let [_, size, rtp @ ..] = f.payload else {
+        return;
+    };
+    let size = *size;
+    if !matches!(size, pictures::SMALL | pictures::LARGE) || rtp.is_empty() {
+        return;
+    }
+    let ps = from.peer_static();
+    let now = Instant::now();
+    {
+        let mut gs = groups(d);
+        let Some(g) = gs.get_mut(id) else { return };
+        // Past its share of pictures a link's are dropped unread.
+        if !g.pictures.admit(&ps, now) || !g.pictures.is_new(&f.voice, size, f.n) {
+            return;
+        }
+    }
+    let Some(key) = key_of(d, id, &f.voice) else {
+        return;
+    };
+    if !mesh::signed_as(pictures::PICTURE, f, id, &key) {
+        return;
+    }
+    let (to, label, show) = {
+        let mut gs = groups(d);
+        let Some(g) = gs.get_mut(id) else { return };
+        let Some(passed) = g.pictures.on_picture(ps, f.voice, size, f.n, now) else {
+            return;
+        };
+        let to: Vec<Session> = passed
+            .forward
+            .iter()
+            .filter_map(|l| g.sessions.get(l).map(|(s, _)| s.clone()))
+            .collect();
+        let show = passed.show && g.tree.own().is_some_and(|own| own != f.voice);
+        (to, format_label(&g.space, id, &video()), show)
+    };
+    for s in to {
+        let _ = s.send_datagram(label, Priority::Interactive, bytes.clone());
+    }
+    if show {
+        let _ = d.call_video.send(Shown {
+            call: *id,
+            format: video(),
+            from: Some(f.voice),
+            size: Some(size),
+            frame: bytes.slice(mesh::HEADER + 2..),
+        });
+    }
+}
+
+/// The link of each device of the group linked with this one, by its voice.
+fn direct_links(g: &Group) -> HashMap<Voice, LinkId> {
+    g.sessions
+        .iter()
+        .filter_map(|(l, (s, _))| {
+            s.peer_identity()
+                .map(|p| (mesh::voice_of(&p.signing_key), *l))
+        })
+        .collect()
+}
+
+/// A word about pictures on the link `from` (`basics/video.md#groups`):
+/// everything it asks of this device, or a key picture it wants. Only words
+/// about the voices of the group's devices count.
+fn asked(d: &Daemon, from: &Session, id: &[u8; 16], bytes: &[u8]) {
+    let Some(ask) = Ask::decode(bytes) else {
+        return;
+    };
+    for v in ask.voices() {
+        let known = groups(d).get(id).is_some_and(|g| g.keys.contains_key(&v));
+        if !known {
+            key_of(d, id, &v);
+        }
+    }
+    let ps = from.peer_static();
+    let now = Instant::now();
+    let key = {
+        let mut gs = groups(d);
+        let Some(g) = gs.get_mut(id) else { return };
+        if !g.sessions.contains_key(&ps) {
+            return;
+        }
+        match ask {
+            Ask::Levels(list) => {
+                let list: Vec<(Voice, u8)> = list
+                    .into_iter()
+                    .filter(|(v, _)| g.keys.contains_key(v))
+                    .collect();
+                g.pictures.on_levels(ps, &list, now);
+                None
+            }
+            Ask::Key(v, size) => {
+                if !g.keys.contains_key(&v) {
+                    return;
+                }
+                let direct = direct_links(g);
+                let own = g.tree.own();
+                match g.pictures.on_key(Some(&ps), v, size, own, &direct, now) {
+                    Some(to) => Some((to, v, size)),
+                    None => return,
+                }
+            }
+        }
+    };
+    match key {
+        Some((to, v, size)) => send_key(d, id, to, v, size),
+        None => say_asks(d, id, false, false),
+    }
+}
+
+/// Asks for a key picture of `voice`'s `size`: of this device's window, if
+/// the voice is its own, or of the link that sender's pictures come on.
+fn send_key(d: &Daemon, id: &[u8; 16], to: KeyTo, voice: Voice, size: Size) {
+    match to {
+        KeyTo::Window => {
+            let _ = d.call_wants.send((*id, Want::Key(size)));
+        }
+        KeyTo::Link(l) => {
+            let (s, label) = {
+                let gs = groups(d);
+                let Some(g) = gs.get(id) else { return };
+                let Some((s, _)) = g.sessions.get(&l) else {
+                    return;
+                };
+                (s.clone(), asks_label(&g.space, id))
+            };
+            let ask = Ask::Key(voice, size).encode();
+            let _ = s.send_datagram(label, Priority::RealTime, Bytes::from(ask));
+        }
+    }
+}
+
+/// Says to each link what this device asks of it of the call's pictures,
+/// if that changed or with `again`; tells this person's window the sizes
+/// asked of it, if that changed or with `remind`.
+fn say_asks(d: &Daemon, id: &[u8; 16], again: bool, remind: bool) {
+    let now = Instant::now();
+    let (out, want, label) = {
+        let mut gs = groups(d);
+        let Some(g) = gs.get_mut(id) else { return };
+        let own = g.tree.own();
+        let direct = direct_links(g);
+        let said = g.pictures.to_say(own, &direct, again, now);
+        let out: Vec<(Session, Vec<u8>)> = said
+            .iter()
+            .filter_map(|(l, a)| g.sessions.get(l).map(|(s, _)| (s.clone(), a.encode())))
+            .collect();
+        let want = own
+            .map(|_| g.pictures.wanted(own))
+            .filter(|w| remind || g.wanted != Some(*w));
+        if want.is_some() {
+            g.wanted = want;
+        }
+        (out, want, asks_label(&g.space, id))
+    };
+    for (s, b) in out {
+        let _ = s.send_datagram(label, Priority::RealTime, Bytes::from(b));
+    }
+    if let Some(w) = want {
+        let _ = d.call_wants.send((*id, w));
+    }
+}
+
+/// The group call this person is on, if any.
+fn group_call(d: &Daemon) -> Option<[u8; 16]> {
+    lock(d)
+        .as_ref()
+        .filter(|c| c.group && c.standing != Standing::Ringing)
+        .map(|c| c.id)
+}
+
+/// This person's window asks a sender on the group call for a level.
+fn set_level(d: &Daemon, voice: Voice, level: u8) {
+    let Some(id) = group_call(d) else { return };
+    if let Some(g) = groups(d).get_mut(&id) {
+        g.pictures.set_window(voice, level);
+    }
+    say_asks(d, &id, false, false);
+}
+
+/// This person's window wants a key picture of a sender's size.
+fn window_key(d: &Daemon, voice: Voice, size: Size) {
+    let Some(id) = group_call(d) else { return };
+    let to = {
+        let mut gs = groups(d);
+        let Some(g) = gs.get_mut(&id) else { return };
+        let direct = direct_links(g);
+        let own = g.tree.own();
+        g.pictures
+            .on_key(None, voice, size, own, &direct, Instant::now())
+    };
+    if let Some(to) = to {
+        send_key(d, &id, to, voice, size);
+    }
+}
+
+/// A picture of this person's on a group call: signed, and sent to the
+/// links whose levels select its size.
+fn send_picture(d: &Daemon, size: Size, rtp: &[u8]) {
+    if !matches!(size, pictures::SMALL | pictures::LARGE)
+        || rtp.is_empty()
+        || mesh::HEADER + 2 + rtp.len() > cardinal_link::MAX_DATAGRAM_PAYLOAD
+    {
+        return;
+    }
+    let live = lock(d)
+        .as_ref()
+        .filter(|c| c.group && c.standing == Standing::Live)
+        .map(|c| c.id);
+    let Some(id) = live else { return };
+    let (out, to, label) = {
+        let mut gs = groups(d);
+        let Some(g) = gs.get_mut(&id) else { return };
+        let Some(own) = g.tree.own() else { return };
+        let targets = g.pictures.sent_own(own, size, Instant::now());
+        if targets.is_empty() {
+            return;
+        }
+        let next = &mut g.picture_next[usize::from(size - 1)];
+        let n = *next;
+        *next = n.wrapping_add(1);
+        let mut payload = Vec::with_capacity(2 + rtp.len());
+        payload.extend_from_slice(&[pictures::PICTURE_KIND, size]);
+        payload.extend_from_slice(rtp);
+        let out = mesh::frame_of(pictures::PICTURE, &d.keys.signing, &id, &own, n, &payload);
+        let to: Vec<Session> = targets
+            .iter()
+            .filter_map(|l| g.sessions.get(l).map(|(s, _)| s.clone()))
+            .collect();
+        (Bytes::from(out), to, format_label(&g.space, &id, &video()))
+    };
+    for s in to {
+        if let Err(e) = s.send_datagram(label, Priority::Interactive, out.clone()) {
+            tracing::trace!("picture: {e}");
+        }
     }
 }
 
@@ -2010,9 +2317,17 @@ async fn told_the_others(
 /// call to carry; until the client goes or the call does.
 pub async fn media(d: &Arc<Daemon>, spec: &crate::api::Request, r: Reader, w: Writer) {
     carry_media(d, spec, r, w).await;
-    // The window's viewport goes with it.
-    if let Some(c) = lock(d).as_mut() {
+    // The window's viewport goes with it, and what it asked for.
+    let group = lock(d).as_mut().and_then(|c| {
         c.viewport = None;
+        c.group.then_some(c.id)
+    });
+    if let Some(id) = group {
+        if let Some(g) = groups(d).get_mut(&id) {
+            g.pictures.clear_window();
+            g.wanted = None;
+        }
+        say_asks(d, &id, false, false);
     }
 }
 
@@ -2021,6 +2336,7 @@ async fn carry_media(d: &Arc<Daemon>, spec: &crate::api::Request, mut r: Reader,
     let mut heard = d.call_audio.subscribe();
     let mut seen = d.call_video.subscribe();
     let mut views = d.call_viewport.subscribe();
+    let mut wants = d.call_wants.subscribe();
     let mut stopping = d.stopping.subscribe();
     let mut changed = d.changed.subscribe();
     let Some(call) = lock(d).as_ref().map(|c| c.id) else {
@@ -2033,6 +2349,12 @@ async fn carry_media(d: &Arc<Daemon>, spec: &crate::api::Request, mut r: Reader,
         .is_err()
     {
         return;
+    }
+    if let Some(id) = group_call(d).filter(|id| *id == call) {
+        if let Some(g) = groups(d).get_mut(&id) {
+            g.wanted = None;
+        }
+        say_asks(d, &id, false, false);
     }
     let current = |d: &Daemon| lock(d).as_ref().is_some_and(|c| c.id == call);
     loop {
@@ -2058,14 +2380,36 @@ async fn carry_media(d: &Arc<Daemon>, spec: &crate::api::Request, mut r: Reader,
                 }
             }
             frame = seen.recv() => {
-                let Ok((of, format, frame)) = frame else { continue };
-                if of != call {
+                let Ok(shown) = frame else { continue };
+                if shown.call != call {
                     continue;
                 }
                 let out = Record::new()
                     .with(0, crate::api::frame::OTHER)
-                    .with(1, frame.to_vec())
-                    .with(2, format.to_vec());
+                    .with(1, shown.frame.to_vec())
+                    .with(2, shown.format.to_vec())
+                    .with_opt(3, shown.from.map(|v| v.to_vec()))
+                    .with_opt(4, shown.size.map(u64::from));
+                if w.send(&out.encode()).await.is_err() {
+                    return;
+                }
+            }
+            want = wants.recv() => {
+                let Ok((of, want)) = want else { continue };
+                if of != call {
+                    continue;
+                }
+                // `basics/video.md#groups`: the sizes asked of this window,
+                // or a key picture of one
+                let out = match want {
+                    Want::Sizes { small, large } => Record::new()
+                        .with(0, crate::api::frame::ASKED)
+                        .with(1, small)
+                        .with(2, large),
+                    Want::Key(size) => Record::new()
+                        .with(0, crate::api::frame::KEY)
+                        .with(4, u64::from(size)),
+                };
                 if w.send(&out.encode()).await.is_err() {
                     return;
                 }
@@ -2101,6 +2445,27 @@ async fn carry_media(d: &Arc<Daemon>, spec: &crate::api::Request, mut r: Reader,
                     }
                     continue;
                 }
+                let from = rec
+                    .get(3)
+                    .and_then(cardinal_encoding::Value::as_bytes)
+                    .and_then(|v| Voice::try_from(v).ok());
+                let small_uint = |k| {
+                    rec.get(k)
+                        .and_then(cardinal_encoding::Value::as_uint)
+                        .map(|n| u8::try_from(n.min(255)).unwrap_or(255))
+                };
+                if kind == Some(crate::api::frame::LEVEL) {
+                    if let (Some(from), Some(level)) = (from, small_uint(1)) {
+                        set_level(d, from, level);
+                    }
+                    continue;
+                }
+                if kind == Some(crate::api::frame::KEY) {
+                    if let (Some(from), Some(size)) = (from, small_uint(4)) {
+                        window_key(d, from, size);
+                    }
+                    continue;
+                }
                 let Some(bytes) = rec.get(1).and_then(cardinal_encoding::Value::as_bytes) else {
                     continue;
                 };
@@ -2112,7 +2477,7 @@ async fn carry_media(d: &Arc<Daemon>, spec: &crate::api::Request, mut r: Reader,
                             .and_then(cardinal_encoding::Value::as_bytes)
                             .and_then(|f| <Format>::try_from(f).ok());
                         if let Some(format) = format {
-                            send_frame(d, format, bytes.to_vec());
+                            send_frame(d, format, bytes.to_vec(), small_uint(4));
                         }
                     }
                     _ => {}
@@ -2171,11 +2536,18 @@ fn send_viewport(d: &Daemon) {
     }
 }
 
-/// A frame of one of the call's formats other than voice, between two people:
-/// sent on that format's channel, if the call took it.
-fn send_frame(d: &Daemon, format: Format, frame: Vec<u8>) {
+/// A frame of one of the call's formats other than voice: between two
+/// people, sent on that format's channel, if the call took it; in a group, a
+/// picture of the size given (`basics/video.md#groups`).
+fn send_frame(d: &Daemon, format: Format, frame: Vec<u8>, size: Option<Size>) {
     if format == voice() {
         send_audio(d, frame);
+        return;
+    }
+    if lock(d).as_ref().is_some_and(|c| c.group) {
+        if let (true, Some(size)) = (format == video(), size) {
+            send_picture(d, size, &frame);
+        }
         return;
     }
     let (session, label) = {
