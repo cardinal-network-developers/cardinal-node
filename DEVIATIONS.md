@@ -1482,10 +1482,19 @@ Not implemented yet (the next milestone):
     one.
 - **Bluetooth Low Energy** (`carriers/ble.md`, D74; `contact/src/ble.rs`,
   `cardinald/src/bluetooth.rs`, `bluez.rs`, `link` `Endpoint::attach`). The
-  draft as written: the UUID, service data of the PSM (little-endian) and
-  17-byte tags of types 1, 2 and 3, a legacy form of PSM, type, `nonce (4)
-  || first6`, L2CAP LE credit-based channels with packets length-prefixed
-  as over TCP, and the person's three states. Readings:
+  draft, with D81's narrowing (Daniel, 2026-11-21) ahead of the draft
+  text: the UUID, service data of the PSM (little-endian) and always four
+  16-byte tags with **no type byte**, `nonce (8) || first8` as on a local
+  network, in a random order, the places this device has no tag for
+  filled with random bytes, which look like tags; a legacy form of PSM
+  and one tag cut to `nonce (4) || first6`, with no type either; L2CAP LE
+  credit-based channels with packets length-prefixed as over TCP, and the
+  person's three states. A device checks each tag against every key it
+  holds: its own devices' (`discovery`), each trusted contact's
+  (`presence`) and each one-time secret it waits on (`one-time`), which,
+  derived for different purposes, never match each other's tags. So an
+  advertisement no longer shows whether its device has trusted contacts,
+  or how many invitations are open. Readings:
   - **Purpose `one-time`** is used as `crypto.md` (draft) lists it,
     context `cardinal 1 one-time`, and like `presence` kept out of
     `Purpose::ALL` and its vectors until published.
@@ -1493,8 +1502,11 @@ Not implemented yet (the next milestone):
     list, in the extended form as in the legacy one: scanners filter on
     it (BlueZ's discovery filter and Android's `ScanFilter` match the UUID
     list, not service data keys). The extended form is then flags, the
-    UUID list and the service data: 3 + 18 + 18 + 2 + 17n bytes, 92 with
-    three tags. At most eight tags (`MAX_TAGS`).
+    UUID list and the service data: 3 + 18 + 18 + 2 + 64 = 105 bytes.
+  - **Which four** (`TAGS`): the own devices' and the contacts' tags when
+    there are any, and one-time tags in the places left, a random few of
+    them at each refresh when there are more; with nothing to say, nothing
+    is advertised. A replayed tag is a known limit, as on a local network.
   - **Legacy form on BlueZ** goes in `ScanResponseServiceData`, which
     BlueZ has only with `--experimental`; without it the advertisement
     carries the UUID and no tag, and nobody finds the device. Used where
@@ -1521,10 +1533,10 @@ Not implemented yet (the next milestone):
     that cannot be read, from `main.conf`; without it the radio is not
     used, and `why_not` says how to turn it on. Android advertises and
     connects from resolvable private addresses already.
-  - **Reading: tag types are bytes.** An unknown type is kept and matches
-    nothing; a short tag matches only `keyed_hash(k, nonce4)[..6]`.
+  - **A short tag** matches only `keyed_hash(k, nonce4)[..6]`. Service
+    data of 12 bytes is the legacy form; of 2 + 16n, the extended one.
   - **One channel, every key at once.** A tag says whose device, not
-    which: own devices' (type 1) or a contact's (type 2) device is dialled
+    which: own devices' or a contact's device is dialled
     by opening one channel and starting a handshake to each of the
     person's devices without a session at once on it
     (`Endpoint::connect_on`); only the one at the other end can answer,
@@ -1556,18 +1568,18 @@ Not implemented yet (the next milestone):
     a direct session replaces one through a host
     (`link.md#identity-binding`, extended: relayed, then Bluetooth, then
     direct over IP). Both ends can tell which a session is.
-  - **Type 3 is advertised only by the device an invitation names**
+  - **A one-time tag is advertised only by the device an invitation names**
     (`responder_static`), and only while it is outstanding. An invitation
     naming the person's host leads to the host's key, which no device in
     range has, so nothing advertises it (spec question).
   - **Accepting an invitation** dials its address first, as before; when
     that fails, or the invitation has no IP address, and Bluetooth is on,
-    it looks for the type-3 tag for 30 s and runs the invitation's
+    it looks for the one-time tag for 30 s and runs the invitation's
     handshake over a channel to the device that has it. The invitation's
     endpoint is left as it was; with no address at all `invite` still
     fails ("no address to give").
   - **Pairing codes carry no one-time secret** (33 bits, for CPace), so
-    no type-3 tag is made from one: offline, 2^33 keyed hashes recover
+    no one-time tag is made from one: offline, 2^33 keyed hashes recover
     the code from the tag, and whoever has it can pair. Pairing over
     Bluetooth is not done (spec question).
   - **Endpoints**: carrier the 8-byte name, address the 6 bytes, port the

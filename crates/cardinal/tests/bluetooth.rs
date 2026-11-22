@@ -158,6 +158,11 @@ fn two_people_with_no_network_meet_sync_and_write_over_bluetooth() {
             .to_string()
             .contains("found over Bluetooth")
     };
+    // the find is noted just after the session it opened is taken on
+    let until = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !(said(&ana, "Bo") || said(&bo, "Ana")) && std::time::Instant::now() < until {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
     assert!(
         said(&ana, "Bo") || said(&bo, "Ana"),
         "{}\n{}",
@@ -351,6 +356,9 @@ fn a_replayed_tag_of_ones_own_devices_does_not_keep_them_apart() {
         .find(|e| !e.file_name().to_string_lossy().starts_with('.'))
         .map(|e| std::fs::read(e.path()).unwrap())
         .expect("the laptop advertises");
+    // the PSM and four tags of sixteen bytes, with no type, whatever the
+    // laptop has to say (D81)
+    assert_eq!(mine.len(), 2 + 4 * 16);
     let psm = u16::from_le_bytes([mine[0], mine[1]]);
     a.cli(&["bluetooth", "off"]);
     always(&b);

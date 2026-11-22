@@ -3,17 +3,20 @@
 //! advertises, scans and opens L2CAP channels.
 //!
 //! A device advertises the service UUID [`SERVICE_UUID`] with service data
-//! under it: the PSM it listens on (2 bytes, little-endian), then tags of 17
-//! bytes each, a type and `nonce (8) || first8(BLAKE3.keyed_hash(k, nonce))`
-//! as on a local network:
+//! under it: the PSM it listens on (2 bytes, little-endian), then always
+//! [`TAGS`] tags of 16 bytes, each `nonce (8) || first8(BLAKE3.keyed_hash(k,
+//! nonce))` as on a local network, with no type, in a random order, and
+//! random bytes in the places this device has no tag for (D81). The keys:
 //!
-//! - type 1, [`TagType::Own`], `k = derive("discovery", discovery secret)`;
-//! - type 2, [`TagType::Contacts`], `k = derive("presence", presence secret)`;
-//! - type 3, [`TagType::OneTime`], `k = derive("one-time", secret)`, while an
-//!   invitation that carries the secret is outstanding.
+//! - its own devices', `k = derive("discovery", discovery secret)`;
+//! - its trusted contacts', `k = derive("presence", presence secret)`;
+//! - `k = derive("one-time", secret)`, while an invitation that carries the
+//!   secret is outstanding.
+//!
+//! Whoever sees one checks every tag against every key they hold.
 //!
 //! A legacy advertisement cannot hold that much: it has the PSM and one tag,
-//! of a type that changes at each refresh, cut to `nonce (4) || first6(...)`
+//! a different one at each refresh, cut to `nonce (4) || first6(...)`
 //! ([`Advert::encode_legacy`]). [`Advert::decode`] reads both.
 //!
 //! Link packets go over an L2CAP connection-oriented channel to that PSM,
@@ -61,50 +64,33 @@ pub fn carrier_name() -> [u8; 8] {
     n
 }
 
-/// The bytes of one full tag: a type, a nonce and the first 8 bytes of the
-/// keyed hash.
-pub const TAG_LEN: usize = 17;
-/// The bytes of a legacy advertisement's service data: the PSM, a type, a
-/// 4-byte nonce and the first 6 bytes of the keyed hash.
-pub const LEGACY_LEN: usize = 2 + 1 + 4 + 6;
-/// The most tags an advertisement carries. An extended advertisement holds
-/// more, but a long one is slower to send and to receive.
-pub const MAX_TAGS: usize = 8;
+/// The bytes of one full tag: a nonce and the first 8 bytes of the keyed
+/// hash, as on a local network, with no type.
+pub const TAG_LEN: usize = 16;
+/// The bytes of a legacy advertisement's service data: the PSM, a 4-byte
+/// nonce and the first 6 bytes of the keyed hash.
+pub const LEGACY_LEN: usize = 2 + 4 + 6;
+/// How many tags an extended advertisement carries, always: places this
+/// device has no tag for are random bytes, which look like tags, so that
+/// an advertisement says nothing of how many it has, or of what kinds.
+pub const TAGS: usize = 4;
 
-/// What a tag is for.
+/// What a tag is for, on this device only, to choose which to send. A tag
+/// carries no type on the air: whoever sees it checks it against every key
+/// they hold, and the keys, derived for different purposes, never match
+/// each other's tags.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum TagType {
-    /// 1: the person's own devices (`t=`).
+    /// The person's own devices (`t=`).
     Own,
-    /// 2: their trusted contacts (`c=`).
+    /// Their trusted contacts (`c=`).
     Contacts,
-    /// 3: a one-time secret, while an invitation that carries it is
+    /// A one-time secret, while an invitation that carries it is
     /// outstanding.
     OneTime,
 }
 
-impl TagType {
-    /// The byte on the air.
-    pub fn byte(self) -> u8 {
-        match self {
-            TagType::Own => 1,
-            TagType::Contacts => 2,
-            TagType::OneTime => 3,
-        }
-    }
-
-    /// The type of a byte, if this version knows it.
-    pub fn of(b: u8) -> Option<TagType> {
-        match b {
-            1 => Some(TagType::Own),
-            2 => Some(TagType::Contacts),
-            3 => Some(TagType::OneTime),
-            _ => None,
-        }
-    }
-}
-
-/// `k = derive("one-time", secret)`: the key of a type-3 tag.
+/// `k = derive("one-time", secret)`: the key of a one-time tag.
 pub fn one_time_key(secret: &[u8]) -> Zeroizing<[u8; 32]> {
     derive(Purpose::OneTime, secret)
 }
@@ -112,64 +98,43 @@ pub fn one_time_key(secret: &[u8]) -> Zeroizing<[u8; 32]> {
 /// One tag as it came: full, or cut to fit a legacy advertisement.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Tag {
-    /// `nonce (8) || first8(...)`.
-    Full {
-        /// Its type byte.
-        kind: u8,
-        /// The nonce and the hash.
-        body: [u8; 16],
-    },
+    /// `nonce (8) || first8(...)`, or as many random bytes.
+    Full([u8; TAG_LEN]),
     /// `nonce (4) || first6(...)`.
-    Short {
-        /// Its type byte.
-        kind: u8,
-        /// The nonce and the hash.
-        body: [u8; 10],
-    },
+    Short([u8; 10]),
 }
 
 impl Tag {
-    /// A full tag of `kind` made with `k`.
-    pub fn make(kind: TagType, k: &[u8; 32], nonce: [u8; 8]) -> Tag {
+    /// A full tag made with `k`.
+    pub fn make(k: &[u8; 32], nonce: [u8; 8]) -> Tag {
         let h = keyed_hash(k, &nonce);
-        let mut body = [0u8; 16];
+        let mut body = [0u8; TAG_LEN];
         body[..8].copy_from_slice(&nonce);
         body[8..].copy_from_slice(&h[..8]);
-        Tag::Full {
-            kind: kind.byte(),
-            body,
-        }
+        Tag::Full(body)
     }
 
-    /// The type byte.
-    pub fn kind(&self) -> u8 {
-        match self {
-            Tag::Full { kind, .. } | Tag::Short { kind, .. } => *kind,
-        }
+    /// Random bytes in a tag's place, which no key matches.
+    pub fn filler() -> Tag {
+        Tag::Full(random_bytes())
     }
 
-    /// Whether this is a tag of `kind` made with `k`.
-    pub fn matches(&self, kind: TagType, k: &[u8; 32]) -> bool {
-        if self.kind() != kind.byte() {
-            return false;
-        }
+    /// Whether this is a tag made with `k`.
+    pub fn matches(&self, k: &[u8; 32]) -> bool {
         match self {
-            Tag::Full { body, .. } => ct_eq(&keyed_hash(k, &body[..8])[..8], &body[8..]),
-            Tag::Short { body, .. } => ct_eq(&keyed_hash(k, &body[..4])[..6], &body[4..]),
+            Tag::Full(body) => ct_eq(&keyed_hash(k, &body[..8])[..8], &body[8..]),
+            Tag::Short(body) => ct_eq(&keyed_hash(k, &body[..4])[..6], &body[4..]),
         }
     }
 
     /// The same tag cut for a legacy advertisement: the first 4 bytes of
     /// its nonce, and the first 6 of the hash of those 4.
-    pub fn shorten(kind: TagType, k: &[u8; 32], nonce: [u8; 4]) -> Tag {
+    pub fn shorten(k: &[u8; 32], nonce: [u8; 4]) -> Tag {
         let h = keyed_hash(k, &nonce);
         let mut body = [0u8; 10];
         body[..4].copy_from_slice(&nonce);
         body[4..].copy_from_slice(&h[..6]);
-        Tag::Short {
-            kind: kind.byte(),
-            body,
-        }
+        Tag::Short(body)
     }
 }
 
@@ -182,12 +147,11 @@ pub struct Advert {
     pub tags: Vec<Tag>,
 }
 
-/// The keys a device advertises with, by type: what an [`Advert`] is made
-/// from at each refresh, with fresh nonces.
+/// The keys a device advertises with, by what each is for: what an
+/// [`Advert`] is made from at each refresh, with fresh nonces.
 #[derive(Clone, Default)]
 pub struct Keys {
-    /// Tags to make, in order: own devices first, then contacts, then each
-    /// one-time secret.
+    /// Tags to make: own devices, contacts, and each one-time secret.
     pub keys: Vec<(TagType, Zeroizing<[u8; 32]>)>,
 }
 
@@ -197,14 +161,24 @@ impl Keys {
         self.keys.is_empty()
     }
 
-    /// Full tags with fresh nonces, at most [`MAX_TAGS`].
+    /// [`TAGS`] full tags with fresh nonces, in a random order: the own
+    /// devices' and the contacts' tags, one-time tags in the places left
+    /// (a random choice of them, if there are more), and random bytes in
+    /// any place still empty.
     pub fn advert(&self, psm: u16) -> Advert {
-        let tags = self
-            .keys
-            .iter()
-            .take(MAX_TAGS)
-            .map(|(t, k)| Tag::make(*t, k, random_bytes()))
+        let (mut once, rest): (Vec<_>, Vec<_>) =
+            self.keys.iter().partition(|(t, _)| *t == TagType::OneTime);
+        shuffle(&mut once);
+        let mut tags: Vec<Tag> = rest
+            .into_iter()
+            .chain(once)
+            .take(TAGS)
+            .map(|(_, k)| Tag::make(k, random_bytes()))
             .collect();
+        while tags.len() < TAGS {
+            tags.push(Tag::filler());
+        }
+        shuffle(&mut tags);
         Advert { psm, tags }
     }
 
@@ -227,11 +201,19 @@ impl Keys {
             (false, false) if n % 2 == 0 => pick(&once, n / 2),
             (false, false) => pick(&rest, n / 2),
         };
-        let (t, k) = chosen?;
+        let (_, k) = chosen?;
         Some(Advert {
             psm,
-            tags: vec![Tag::shorten(*t, k, random_bytes())],
+            tags: vec![Tag::shorten(k, random_bytes())],
         })
+    }
+}
+
+/// Shuffles `v` in place (Fisher–Yates), from fresh randomness.
+fn shuffle<T>(v: &mut [T]) {
+    for i in (1..v.len()).rev() {
+        let r = u64::from_le_bytes(random_bytes());
+        v.swap(i, (r % (i as u64 + 1)) as usize);
     }
 }
 
@@ -242,12 +224,9 @@ impl Advert {
         out.extend_from_slice(&self.psm.to_le_bytes());
         for t in &self.tags {
             match t {
-                Tag::Full { kind, body } => {
-                    out.push(*kind);
-                    out.extend_from_slice(body);
-                }
+                Tag::Full(body) => out.extend_from_slice(body),
                 // A short tag goes only alone, in a legacy advertisement.
-                Tag::Short { .. } => {}
+                Tag::Short(_) => {}
             }
         }
         out
@@ -256,37 +235,33 @@ impl Advert {
     /// The service data of a legacy advertisement: the PSM and its first
     /// tag, which must be short.
     pub fn encode_legacy(&self) -> Option<Vec<u8>> {
-        let Some(Tag::Short { kind, body }) = self.tags.first() else {
+        let Some(Tag::Short(body)) = self.tags.first() else {
             return None;
         };
         let mut out = Vec::with_capacity(LEGACY_LEN);
         out.extend_from_slice(&self.psm.to_le_bytes());
-        out.push(*kind);
         out.extend_from_slice(body);
         Some(out)
     }
 
-    /// Reads service data of either kind. Tags of types this version does
-    /// not know are kept, and match nothing.
+    /// Reads service data of either kind: the PSM and one short tag, or
+    /// the PSM and any number of full ones.
     pub fn decode(data: &[u8]) -> Option<Advert> {
-        if data.len() < 2 {
+        if data.len() < 2 + TAG_LEN.min(LEGACY_LEN - 2) {
             return None;
         }
         let psm = u16::from_le_bytes([data[0], data[1]]);
         let rest = &data[2..];
-        let tags = if rest.len() == LEGACY_LEN - 2 {
+        let tags = if data.len() == LEGACY_LEN {
             let mut body = [0u8; 10];
-            body.copy_from_slice(&rest[1..]);
-            vec![Tag::Short {
-                kind: rest[0],
-                body,
-            }]
+            body.copy_from_slice(rest);
+            vec![Tag::Short(body)]
         } else if rest.len() % TAG_LEN == 0 {
             rest.chunks(TAG_LEN)
                 .map(|c| {
-                    let mut body = [0u8; 16];
-                    body.copy_from_slice(&c[1..]);
-                    Tag::Full { kind: c[0], body }
+                    let mut body = [0u8; TAG_LEN];
+                    body.copy_from_slice(c);
+                    Tag::Full(body)
                 })
                 .collect()
         } else {
@@ -295,9 +270,9 @@ impl Advert {
         Some(Advert { psm, tags })
     }
 
-    /// Whether any tag is of `kind` and made with `k`.
-    pub fn has(&self, kind: TagType, k: &[u8; 32]) -> bool {
-        self.tags.iter().any(|t| t.matches(kind, k))
+    /// Whether any tag is made with `k`.
+    pub fn has(&self, k: &[u8; 32]) -> bool {
+        self.tags.iter().any(|t| t.matches(k))
     }
 }
 
@@ -823,7 +798,7 @@ mod tests {
     }
 
     #[test]
-    fn tags_are_recognized_only_by_their_key_and_type() {
+    fn tags_are_recognized_by_their_key_alone() {
         let own = cardinal_crypto::derive(Purpose::Discovery, &[1; 32]);
         let theirs = cardinal_crypto::derive(Purpose::Presence, &[2; 32]);
         let once = one_time_key(&[3; 16]);
@@ -836,39 +811,102 @@ mod tests {
         };
         let ad = keys.advert(0x81);
         let data = ad.encode();
-        assert_eq!(data.len(), 2 + 3 * TAG_LEN);
+        // Always four tags of sixteen bytes, whatever there is to say.
+        assert_eq!(data.len(), 2 + TAGS * TAG_LEN);
         assert_eq!(&data[..2], &[0x81, 0]);
         let back = Advert::decode(&data).unwrap();
         assert_eq!(back, ad);
-        assert!(back.has(TagType::Own, &own));
-        assert!(back.has(TagType::Contacts, &theirs));
-        assert!(back.has(TagType::OneTime, &once));
-        // The type is part of the match: a contact's key never matches an
-        // own-device tag, nor the other way.
-        assert!(!back.has(TagType::Contacts, &own));
-        assert!(!back.has(TagType::Own, &theirs));
+        assert!(back.has(&own));
+        assert!(back.has(&theirs));
+        assert!(back.has(&once));
+        // Each tag matches its own key and no other: the keys are derived
+        // for different purposes, so a tag needs no type.
+        for t in &back.tags {
+            let n = [&own, &theirs, &once]
+                .iter()
+                .filter(|k| t.matches(k))
+                .count();
+            assert!(n <= 1, "{t:?}");
+        }
+        assert_eq!(
+            back.tags
+                .iter()
+                .filter(|t| [&own, &theirs, &once].iter().any(|k| t.matches(k)))
+                .count(),
+            3
+        );
         let stranger = cardinal_crypto::derive(Purpose::Presence, &[9; 32]);
-        assert!(!back.has(TagType::Contacts, &stranger));
+        assert!(!back.has(&stranger));
         // Fresh nonces at each refresh: nothing links two advertisements.
         let again = keys.advert(0x81);
         assert_ne!(again.encode(), data);
-        assert!(again.has(TagType::Contacts, &theirs));
+        assert!(again.has(&theirs));
         // A tampered tag matches nothing.
+        let at = back.tags.iter().position(|t| t.matches(&theirs)).unwrap();
         let mut bad = data.clone();
-        bad[2 + TAG_LEN + 16] ^= 1;
-        assert!(!Advert::decode(&bad)
-            .unwrap()
-            .has(TagType::Contacts, &theirs));
+        bad[2 + at * TAG_LEN + 15] ^= 1;
+        assert!(!Advert::decode(&bad).unwrap().has(&theirs));
         // Lengths that are neither form are not an advertisement.
         assert!(Advert::decode(&data[..5]).is_none());
+        assert!(Advert::decode(&data[..data.len() - 1]).is_none());
         assert!(Advert::decode(&[1]).is_none());
-        // A type this version does not know is kept, and matches nothing.
-        let mut later = data.clone();
-        later[2] = 9;
-        let later = Advert::decode(&later).unwrap();
-        assert_eq!(later.tags[0].kind(), 9);
-        assert!(!later.has(TagType::Own, &own));
-        assert_eq!(TagType::of(9), None);
+    }
+
+    #[test]
+    fn an_advertisement_says_nothing_of_how_many_tags_it_has() {
+        let own = cardinal_crypto::derive(Purpose::Discovery, &[1; 32]);
+        let one = Keys {
+            keys: vec![(TagType::Own, own.clone())],
+        };
+        let ad = one.advert(0x81);
+        // one tag and three places of random bytes, as long as four tags
+        assert_eq!(ad.tags.len(), TAGS);
+        assert_eq!(ad.encode().len(), 2 + TAGS * TAG_LEN);
+        assert_eq!(ad.tags.iter().filter(|t| t.matches(&own)).count(), 1);
+        // and where it stands changes
+        let places: std::collections::HashSet<usize> = (0..64)
+            .map(|_| {
+                one.advert(0x81)
+                    .tags
+                    .iter()
+                    .position(|t| t.matches(&own))
+                    .unwrap()
+            })
+            .collect();
+        assert!(places.len() > 1, "{places:?}");
+        // The filler is not the same twice.
+        let filler: Vec<Tag> = ad
+            .tags
+            .iter()
+            .filter(|t| !t.matches(&own))
+            .copied()
+            .collect();
+        assert_eq!(filler.len(), TAGS - 1);
+        assert!(filler.windows(2).all(|w| w[0] != w[1]));
+        // More than four: the own devices' and the contacts' are always
+        // there, and one-time ones fill the rest, a different few each time.
+        let theirs = cardinal_crypto::derive(Purpose::Presence, &[2; 32]);
+        let onces: Vec<Zeroizing<[u8; 32]>> = (0..5u8).map(|i| one_time_key(&[i; 16])).collect();
+        let mut keys = vec![
+            (TagType::Own, own.clone()),
+            (TagType::Contacts, theirs.clone()),
+        ];
+        keys.extend(onces.iter().map(|k| (TagType::OneTime, k.clone())));
+        let many = Keys { keys };
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..64 {
+            let ad = many.advert(1);
+            assert_eq!(ad.tags.len(), TAGS);
+            assert!(ad.has(&own) && ad.has(&theirs));
+            for (i, k) in onces.iter().enumerate() {
+                if ad.has(k) {
+                    seen.insert(i);
+                }
+            }
+        }
+        assert_eq!(seen.len(), onces.len());
+        // Nothing to say, and still four places.
+        assert_eq!(Keys::default().advert(1).tags.len(), TAGS);
     }
 
     #[test]
@@ -884,15 +922,16 @@ mod tests {
         let first = keys.legacy(0x99, 0).unwrap();
         let data = first.encode_legacy().unwrap();
         assert_eq!(data.len(), LEGACY_LEN);
-        // 31 bytes: the service data element (length, type, UUID) and this.
-        assert_eq!(2 + 16 + data.len(), 31);
+        // 31 bytes at most: the service data element (length, type, UUID)
+        // and this.
+        assert!(2 + 16 + data.len() <= 31);
         let back = Advert::decode(&data).unwrap();
         assert_eq!(back.psm, 0x99);
-        assert!(back.has(TagType::Own, &own));
-        assert!(!back.has(TagType::Contacts, &theirs));
+        assert!(back.has(&own));
+        assert!(!back.has(&theirs));
         let second = keys.legacy(0x99, 1).unwrap();
         let back = Advert::decode(&second.encode_legacy().unwrap()).unwrap();
-        assert!(back.has(TagType::Contacts, &theirs));
+        assert!(back.has(&theirs));
         assert!(Keys::default().legacy(1, 0).is_none());
         // With an invitation outstanding, its tag is in every other one.
         let once = cardinal_crypto::derive(Purpose::OneTime, &[3; 16]);
@@ -907,11 +946,7 @@ mod tests {
             .map(|n| {
                 let ad =
                     Advert::decode(&with.legacy(1, n).unwrap().encode_legacy().unwrap()).unwrap();
-                [
-                    ad.has(TagType::Own, &own),
-                    ad.has(TagType::Contacts, &theirs),
-                    ad.has(TagType::OneTime, &once),
-                ]
+                [ad.has(&own), ad.has(&theirs), ad.has(&once)]
             })
             .collect();
         for (n, c) in carried.iter().enumerate() {
@@ -951,7 +986,7 @@ mod tests {
         .await
         .unwrap();
         let advert = Advert::decode(&s.data).unwrap();
-        assert!(advert.has(TagType::Contacts, &theirs));
+        assert!(advert.has(&theirs));
         let mut ch = a.connect(s.addr, advert.psm).await.unwrap();
         let (from, mut far) = listening.incoming.recv().await.unwrap();
         assert_eq!(Some(from), a.own_addr());

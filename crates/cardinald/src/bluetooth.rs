@@ -635,13 +635,13 @@ fn sighted(d: &Arc<Daemon>, radio: &Arc<dyn Radio>, s: Sighting, known: &Known) 
         let mut wanted = lock(&d.bluetooth.wanted);
         wanted.retain(|(_, tx)| !tx.is_closed());
         for (k, tx) in wanted.iter() {
-            if ad.has(TagType::OneTime, k) {
+            if ad.has(k) {
                 recognized = true;
                 let _ = tx.try_send(seen.clone());
             }
         }
     }
-    if known.own.as_ref().is_some_and(|k| ad.has(TagType::Own, k)) {
+    if known.own.as_ref().is_some_and(|k| ad.has(k)) {
         recognized = true;
         let d = d.clone();
         let seen = seen.clone();
@@ -650,7 +650,7 @@ fn sighted(d: &Arc<Daemon>, radio: &Arc<dyn Radio>, s: Sighting, known: &Known) 
     // One keyed hash per trusted contact per advertisement.
     let mut found: Vec<[u8; 32]> = Vec::new();
     for (who, k) in &known.contacts {
-        if !found.contains(who) && ad.has(TagType::Contacts, k) {
+        if !found.contains(who) && ad.has(k) {
             found.push(*who);
         }
     }

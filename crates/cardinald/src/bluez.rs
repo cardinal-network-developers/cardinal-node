@@ -1103,20 +1103,18 @@ mod tests {
 
     #[test]
     fn a_full_advertisement_fits_an_extended_one() {
-        use cardinal_contact::ble::{Advert, Tag, TagType};
-        let k = [7u8; 32];
-        let tags = (0..cardinal_contact::ble::MAX_TAGS)
-            .map(|_| Tag::make(TagType::Contacts, &k, [1; 8]))
-            .collect();
-        let data = Advert { psm: 0x81, tags }.encode();
+        use cardinal_contact::ble::{Advert, Keys, TagType};
+        let k = cardinal_crypto::Zeroizing::new([7u8; 32]);
+        let data = Keys {
+            keys: vec![(TagType::Contacts, k)],
+        }
+        .advert(0x81)
+        .encode();
         // An extended advertisement holds up to 251 bytes in one packet.
         assert!(full_len(&data) <= 251);
-        // Three tags are already more than a legacy one holds.
-        let three = Advert {
-            psm: 0x81,
-            tags: vec![Tag::make(TagType::Own, &k, [1; 8]); 3],
-        };
-        assert!(full_len(&three.encode()) > 31);
+        // Its four tags are more than a legacy one holds.
+        assert!(full_len(&data) > 31);
+        assert!(Advert::decode(&data).is_some());
     }
 
     #[test]

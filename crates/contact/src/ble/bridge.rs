@@ -592,7 +592,7 @@ mod tests {
             }
         };
         let ad = Advert::decode(&s.data).unwrap();
-        assert!(ad.has(TagType::Contacts, &[2; 32]));
+        assert!(ad.has(&[2; 32]));
         let mut out = bridge.connect(s.addr, ad.psm).await.unwrap();
         let (_, mut back) = fl.incoming.recv().await.unwrap();
         back.write_all(b"pong").await.unwrap();
