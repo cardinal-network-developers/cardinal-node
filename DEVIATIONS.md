@@ -2660,9 +2660,11 @@ asks for around that is not built yet.
 - **Reading: a failed `prove`** is answered with error 1, not permitted, and
   the session stays open until `PROVE_WITHIN` (30 seconds) passes. Any other
   request before a proof closes it, as the spec says.
-- **Spec ambiguity: a grant with no limit.** `hosts.md#grants` does not say
-  how to state one. Chose 0 storage bytes and 0 days of retention, for a
-  person's own device, which keeps what it holds.
+- **A grant with no limit** (designer, 2026-11-22). Storage bytes (field 5)
+  and retention (field 6) left out mean no limit, and 0 means none at all.
+  A person's own device leaves both out, since it keeps what it holds. A
+  grant with either field there and not a uint is no grant. (Before, 0
+  stood for no limit, and both fields had to be there.)
 - **Spec ambiguity: how the sheet writes a host's key.** It says only "the
   address and static key". Chose lower-case Crockford base 32 of the 32-byte
   X25519 key and the first 3 bytes of its BLAKE3 hash, in groups of 4, so

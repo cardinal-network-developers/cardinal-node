@@ -4204,8 +4204,8 @@ mod tests {
                 // as `cardinal host` makes one: storage too, so it is no
                 // device that named itself (D72)
                 services: vec![MAILBOX, STORAGE],
-                storage_bytes: 0,
-                retention_days: 0,
+                storage_bytes: None,
+                retention_days: None,
                 endpoints: vec![Endpoint::parse(address).unwrap()],
                 link_key: self.core.keys.link.public_key().clone(),
             }

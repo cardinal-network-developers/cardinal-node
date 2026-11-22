@@ -350,8 +350,8 @@ fn write_grant(d: &Arc<Daemon>, named: &[Named]) -> anyhow::Result<()> {
             host: identity,
             served: identity,
             services: vec![MAILBOX, RENDEZVOUS, RELAY],
-            storage_bytes: 0,
-            retention_days: 0,
+            storage_bytes: None,
+            retention_days: None,
             endpoints: endpoints(named),
             link_key: d.keys.link.public_key().clone(),
         }

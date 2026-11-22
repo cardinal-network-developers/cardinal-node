@@ -132,10 +132,12 @@ pub struct Grant {
     pub served: [u8; 32],
     /// Its services.
     pub services: Vec<u64>,
-    /// Bytes of storage granted; 0 when there is no limit.
-    pub storage_bytes: u64,
-    /// Days unrenewed storage is kept; 0 when there is no limit.
-    pub retention_days: u64,
+    /// Bytes of storage granted: `None`, the field left out, when there is
+    /// no limit; 0 is none at all.
+    pub storage_bytes: Option<u64>,
+    /// Days an unfetched envelope or unrenewed storage is kept: `None`, the
+    /// field left out, when there is no limit; 0 is not at all.
+    pub retention_days: Option<u64>,
     /// Where it listens.
     pub endpoints: Vec<Endpoint>,
     /// The link key of the serving device.
@@ -151,8 +153,8 @@ impl Grant {
             .with(2, self.served)
             .with(3, Value::list(self.services.iter().copied()))
             .with(4, Value::list(Vec::<Record>::new()))
-            .with(5, self.storage_bytes)
-            .with(6, self.retention_days)
+            .with_opt(5, self.storage_bytes)
+            .with_opt(6, self.retention_days)
             .with(
                 7,
                 Value::list(self.endpoints.iter().map(Endpoint::to_record)),
@@ -175,6 +177,12 @@ impl Grant {
             return None;
         }
         let id = |k: u64| -> Option<[u8; 32]> { r.get(k)?.as_bytes()?.try_into().ok() };
+        let limit = |k: u64| -> Option<Option<u64>> {
+            match r.get(k) {
+                None => Some(None),
+                Some(v) => v.as_uint().map(Some),
+            }
+        };
         let grant = Grant {
             host: id(1)?,
             served: id(2)?,
@@ -184,8 +192,9 @@ impl Grant {
                 .iter()
                 .map(Value::as_uint)
                 .collect::<Option<_>>()?,
-            storage_bytes: r.get(5)?.as_uint()?,
-            retention_days: r.get(6)?.as_uint()?,
+            // left out, no limit; there, a uint, or it is no grant
+            storage_bytes: limit(5)?,
+            retention_days: limit(6)?,
             endpoints: r
                 .get(7)?
                 .as_list()?
@@ -208,8 +217,8 @@ mod tests {
             host: [1; 32],
             served: [1; 32],
             services: vec![STORAGE],
-            storage_bytes: 0,
-            retention_days: 0,
+            storage_bytes: None,
+            retention_days: None,
             endpoints: vec![
                 Endpoint::parse("192.168.1.20:7171").unwrap(),
                 Endpoint::parse("[fd00::20]:7171").unwrap(),
@@ -228,6 +237,45 @@ mod tests {
         assert_eq!(read.endpoints[0].to_string(), "192.168.1.20:7171");
         assert_eq!(read.endpoints[1].to_string(), "[fd00::20]:7171");
         assert_eq!(read.endpoints[2].socket_addr(), None);
+    }
+
+    /// `hosts.md#grants`: storage bytes and retention left out mean no
+    /// limit, and 0 means none; a value of another type is no grant.
+    #[test]
+    fn a_limit_left_out_is_none_and_zero_is_zero() {
+        let key = SigningKey::from_seed(&[2; 32]);
+        let open = |g: &Grant| Grant::open(&g.sign(&key)).unwrap().0;
+        let unlimited = grant();
+        let read = open(&unlimited);
+        assert_eq!((read.storage_bytes, read.retention_days), (None, None));
+        let inner = SignedObject::decode(&unlimited.sign(&key)).unwrap();
+        assert!(inner.inner().get(5).is_none() && inner.inner().get(6).is_none());
+        let zero = Grant {
+            storage_bytes: Some(0),
+            retention_days: Some(0),
+            ..grant()
+        };
+        let read = open(&zero);
+        assert_eq!((read.storage_bytes, read.retention_days), (Some(0), Some(0)));
+        let some = Grant {
+            storage_bytes: Some(1 << 30),
+            retention_days: Some(30),
+            ..grant()
+        };
+        assert_eq!(open(&some), some);
+        let g = grant();
+        let wrong = Record::new()
+            .with(0, HOST_GRANT)
+            .with(1, g.host)
+            .with(2, g.served)
+            .with(3, Value::list(g.services.iter().copied()))
+            .with(4, Value::list(Vec::<Record>::new()))
+            .with(5, "a lot")
+            .with(7, Value::list(Vec::<Record>::new()))
+            .with(8, g.link_key.to_record());
+        let mut o = SignedObject::new(wrong);
+        key.sign_object(&mut o);
+        assert_eq!(Grant::open(&o.encode()), None);
     }
 
     #[test]
@@ -278,8 +326,6 @@ mod tests {
             .with(2, g.served)
             .with(3, Value::list(g.services.iter().copied()))
             .with(4, Value::list(Vec::<Record>::new()))
-            .with(5, 0u64)
-            .with(6, 0u64)
             .with(7, Value::list(given.iter().cloned()))
             .with(8, g.link_key.to_record());
         let mut o = SignedObject::new(inner);
