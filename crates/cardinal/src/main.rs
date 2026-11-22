@@ -103,8 +103,9 @@ enum Cmd {
         /// network (shown next to the code).
         #[arg(long, value_name = "IP:PORT")]
         at: Option<String>,
-        /// Make the new device an admin device (it can add and remove
-        /// devices). Give it on both devices.
+        /// Add the new device as an admin device (it can add and remove
+        /// devices). Give it where you type the code: the new device is
+        /// told, and agrees to exactly that.
         #[arg(long)]
         admin: bool,
         /// What to call the new device (default: its machine's name). Your
@@ -1346,6 +1347,13 @@ fn print_bluetooth(b: &Value) {
         "not on now".to_owned()
     };
     println!("Bluetooth: {when} (`cardinal bluetooth off|open|always`); {now}.");
+    if b["too_old"] == json!(true) {
+        println!(
+            "  This device's Bluetooth is too old for Cardinal to find people nearby. Wi-Fi and \
+             the internet still work."
+        );
+        return;
+    }
     match (&b["available"], b["why_not"].as_str()) {
         (Value::Bool(true), _) => {
             let radio = b["radio"].as_str().unwrap_or("a radio");
@@ -2000,7 +2008,13 @@ async fn pair(
         );
         return Ok(());
     }
-    let mut req = json!({"cmd": "pair-show", "admin": admin});
+    if admin {
+        anyhow::bail!(
+            "give --admin where you type the code: `cardinal pair <code> --admin` on the \
+             device you already use. This device is told, and shows it."
+        );
+    }
+    let mut req = json!({"cmd": "pair-show"});
     if let Some(d) = &device {
         req["device"] = json!(d);
     }
@@ -2026,14 +2040,21 @@ async fn pair(
     loop {
         tokio::time::sleep(Duration::from_millis(400)).await;
         let s = call(paths, json!({"cmd": "pair-status"})).await?;
-        match s["state"].as_str().unwrap_or("") {
-            "joining" if !said_joining => {
-                said_joining = true;
-                println!(
-                    "Paired with \"{}\". Receiving your identity...",
-                    s["admin"].as_str().unwrap_or("your device")
-                );
-            }
+        let state = s["state"].as_str().unwrap_or("");
+        // Said once, even where joining was over before it was asked.
+        if (state == "joining" || state == "joined") && !said_joining {
+            said_joining = true;
+            let power = match s["power"].as_str() {
+                Some("admin") => "an admin device (it can add and remove devices)",
+                _ => "a device",
+            };
+            println!(
+                "Paired with \"{}\". This device will join as {power}. Receiving your \
+                 identity...",
+                s["admin"].as_str().unwrap_or("your device")
+            );
+        }
+        match state {
             "joined" => {
                 if s["files"].as_bool() == Some(true) {
                     let st = call(paths, json!({"cmd": "status"})).await?;
@@ -2335,10 +2356,11 @@ fn copies_lines(c: &Value, devices: usize) -> Vec<String> {
     {
         let when = |k: &str| age(&h[k]).map(|a| format!(" ({a})")).unwrap_or_default();
         let why = match h["state"].as_str().unwrap_or("") {
-            "failed" => format!(
-                "{}{}",
-                h["reason"].as_str().unwrap_or("failed a check"),
-                when("last_fail")
+            // silent: nothing confirmed, nothing lost
+            "unconfirmed" => format!(
+                "not confirmed: {}{}",
+                h["reason"].as_str().unwrap_or("did not answer"),
+                when("last_check")
             ),
             // passed once, and its last check found pieces gone
             "missing" => format!(
@@ -2542,8 +2564,8 @@ async fn client(cmd: Cmd) -> anyhow::Result<()> {
             if admins == 0 {
                 println!(
                     "None of your devices is an admin device now, so adding a device will ask for\n\
-                     your recovery words. To have one again, run `cardinal pair --admin` on a new\n\
-                     device and type its code here."
+                     your recovery words. To have one again, run `cardinal pair` on a new device\n\
+                     and type its code here with `cardinal pair <code> --admin`."
                 );
             }
             Ok(())
@@ -4182,8 +4204,8 @@ mod tests {
             vec![
                 "Copies: 3 — this device, saint-joseph (spot-checked 1 minute ago), laptop \
                  (spot-checked 2 hours ago); files older than an hour",
-                "  nuc: not counted — did not have 3 of the 4 pieces of your files asked for \
-                 (2 minutes ago)"
+                "  nuc: not counted — not confirmed: did not answer its last check (not within \
+                 4 s) (2 minutes ago)"
             ]
         );
         // Only this device, another catching up.
@@ -4218,9 +4240,9 @@ mod tests {
     }
 
     fn failed_holder(now: u64) -> Value {
-        let mut h = holder("nuc", false, "failed", Some(now - 3_000_000));
-        h["reason"] = json!("did not have 3 of the 4 pieces of your files asked for");
-        h["last_fail"] = json!(now - 120_000);
+        let mut h = holder("nuc", false, "unconfirmed", Some(now - 3_000_000));
+        h["reason"] = json!("did not answer its last check (not within 4 s)");
+        h["last_check"] = json!(now - 120_000);
         h
     }
 

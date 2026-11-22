@@ -858,3 +858,165 @@ fn streams_whose_frames_arrive_out_of_order() {
         "the earlier stream is not taken for one that ended"
     );
 }
+
+/// A pair over a carrier that loses packets, as UDP does: what is lost is
+/// sent again, unless its stream was reset.
+fn lossy_pair() -> Pair {
+    let mut p = pair();
+    p.a.reliable = false;
+    p.b.reliable = false;
+    p.pump();
+    p
+}
+
+/// Sends what `from` has to send to `to`, losing every `nth` packet.
+fn send_losing(from: &mut Conn, to: &mut Conn, to_path: u64, nth: usize, now: Instant) -> usize {
+    let mut n = 0;
+    while let Some((_, pkt)) = from.poll_transmit(now) {
+        n += 1;
+        if n % nth == 0 {
+            continue;
+        }
+        let mut v = pkt.to_vec();
+        to.recv_packet(&mut v, &Path::Mem(to_path), now);
+    }
+    n
+}
+
+#[test]
+fn a_reset_counts_what_never_arrived_and_the_credit_comes_back() {
+    let mut p = lossy_pair();
+    // Over 3 MiB sent and reset, three times the session window, each
+    // stream with packets lost that are never sent again.
+    let mut rounds = 0;
+    while p.a.session_sent <= 3 * SESSION_WINDOW {
+        rounds += 1;
+        assert!(rounds < 5000, "no progress: {}", p.a.session_sent);
+        let id =
+            p.a.open_stream(Service::BLOB, Priority::Background)
+                .unwrap();
+        write_all(&mut p.a, id, &[7u8; 64 * 1024]);
+        send_losing(&mut p.a, &mut p.b, 2, 2, p.now);
+        p.a.stream_reset(id, 9);
+        p.a.stream_dropped(id);
+        p.pump();
+        while let Some((bid, _, _)) = p.b.accept_stream() {
+            p.b.stream_dropped(bid);
+        }
+        p.pump();
+    }
+    // Everything A sent is counted where it went, arrived or not, and
+    // every stream has ended on both sides.
+    assert_eq!(p.b.session_recv_total, p.a.session_sent);
+    assert_eq!(p.b.session_consumed, p.b.session_recv_total);
+    assert!(p.a.streams.is_empty(), "{:?}", p.a.streams.keys());
+    assert!(p.b.streams.is_empty(), "{:?}", p.b.streams.keys());
+    assert!(p.a.close.is_none() && p.b.close.is_none());
+    // So the session still has credit: a stream after them all goes
+    // through whole.
+    let id =
+        p.a.open_stream(Service::SYNC, Priority::Interactive)
+            .unwrap();
+    let data: Vec<u8> = (0..600_000u32).map(|i| i as u8).collect();
+    let (mut sent, mut got, mut bid) = (0, Vec::new(), None);
+    for _ in 0..10_000 {
+        if got.len() == data.len() {
+            break;
+        }
+        if sent < data.len() {
+            sent += write_all(&mut p.a, id, &data[sent..]);
+            if sent == data.len() {
+                p.a.stream_finish(id);
+            }
+        }
+        p.pump();
+        if bid.is_none() {
+            bid = p.b.accept_stream().map(|(i, _, _)| i);
+        }
+        if let Some(i) = bid {
+            got.extend(read_all(&mut p.b, i));
+        }
+    }
+    assert_eq!(got.len(), data.len());
+    assert_eq!(got, data);
+}
+
+#[test]
+fn a_reset_before_any_data_arrived_is_counted_and_answered() {
+    let mut p = lossy_pair();
+    let id =
+        p.a.open_stream(Service::BLOB, Priority::Background)
+            .unwrap();
+    write_all(&mut p.a, id, &[1u8; 10_000]);
+    // Every packet with its data is lost.
+    let mut lost = Vec::new();
+    while let Some((_, pkt)) = p.a.poll_transmit(p.now) {
+        lost.push(pkt.to_vec());
+    }
+    let sent = p.a.session_sent;
+    assert!(sent > 0);
+    p.a.stream_reset(id, 3);
+    p.a.stream_dropped(id);
+    p.pump();
+    // Counted from the reset alone, and answered, so both forget it.
+    assert_eq!(p.b.session_recv_total, sent);
+    assert_eq!(p.b.session_consumed, sent);
+    assert!(p.a.streams.is_empty(), "the answer ends it here");
+    assert!(p.b.streams.is_empty());
+    assert!(p.b.accept_stream().is_none(), "nobody is told of it");
+    // Its data, arriving late, opens nothing.
+    for mut v in lost {
+        p.b.recv_packet(&mut v, &Path::Mem(2), p.now);
+    }
+    assert!(p.b.accept_stream().is_none());
+    assert_eq!(p.b.session_recv_total, sent);
+    assert!(p.b.close.is_none());
+}
+
+#[test]
+fn a_side_still_sending_answers_a_reset_with_how_much_it_sent() {
+    let mut p = lossy_pair();
+    let id =
+        p.a.open_stream(Service::SYNC, Priority::Interactive)
+            .unwrap();
+    write_all(&mut p.a, id, b"ask");
+    p.pump();
+    let (bid, _, _) = p.b.accept_stream().unwrap();
+    assert_eq!(read_all(&mut p.b, bid), b"ask");
+    // B answers at length, and some of it is lost; then A gives up.
+    write_all(&mut p.b, bid, &[5u8; 50_000]);
+    send_losing(&mut p.b, &mut p.a, 1, 3, p.now);
+    let before = p.a.session_recv_total;
+    p.a.stream_reset(id, 2);
+    p.a.stream_dropped(id);
+    p.pump();
+    p.b.stream_dropped(bid);
+    p.pump();
+    let b_sent = p.b.session_sent;
+    assert!(before < b_sent, "some of B's answer was lost");
+    assert_eq!(p.a.session_recv_total, b_sent, "B's reset said how much");
+    assert_eq!(p.a.session_consumed, b_sent);
+    assert!(p.a.streams.is_empty() && p.b.streams.is_empty());
+}
+
+#[test]
+fn a_reset_below_what_arrived_closes_the_session() {
+    let mut p = pair();
+    p.pump();
+    let id =
+        p.a.open_stream(Service::SYNC, Priority::Interactive)
+            .unwrap();
+    write_all(&mut p.a, id, &[0u8; 1000]);
+    p.pump();
+    p.a.control.push_back(Frame::Reset {
+        id,
+        reason: 0,
+        final_size: 10,
+    });
+    p.pump();
+    assert!(
+        matches!(&p.b.close, Some(CloseReason::Protocol(r)) if r.contains("reset")),
+        "{:?}",
+        p.b.close
+    );
+}

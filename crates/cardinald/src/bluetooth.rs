@@ -33,7 +33,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use cardinal_contact::ble::{self, Advert, BleAddr, Keys, Radio, Sighting, TagType};
+use cardinal_contact::ble::{self, Advert, BleAddr, Keys, NotAvailable, Radio, Sighting, TagType};
 use cardinal_contact::discovery::{discovery_key, presence_key};
 use cardinal_contact::Invitation;
 use cardinal_crypto::HybridPublicKey;
@@ -104,12 +104,11 @@ const CHANNEL_WITHIN: Duration = Duration::from_secs(10);
 /// How long a handshake over a channel may take.
 const HANDSHAKE_WITHIN: Duration = Duration::from_secs(8);
 /// How long someone accepting an invitation looks for its tag: where the
-/// other device has only a legacy advertisement, one tag a time, its
-/// one-time tag is in every other one ([`Keys::legacy`]), and those come
-/// every [`ADVERTISE_FAST`].
+/// other device has more one-time tags than places, its own is in a random
+/// few of its advertisements, made every [`ADVERTISE_FAST`].
 const INVITATION_WITHIN: Duration = Duration::from_secs(60);
 /// How often the advertisement is made again while it has a one-time tag,
-/// so that a legacy one gets round its tags soon.
+/// so that more of them than there are places take turns soon.
 const ADVERTISE_FAST: Duration = Duration::from_secs(10);
 /// How long to wait before trying the radio again when it failed: the
 /// app that drives it on Android connects a moment after the service starts.
@@ -144,7 +143,7 @@ struct Shown {
     /// The radio, in words, once one was made.
     radio: Option<String>,
     /// Whether it could be used, the last time it was asked.
-    available: Option<Result<(), String>>,
+    available: Option<Result<(), NotAvailable>>,
     /// Advertising, scanning and listening now.
     on: bool,
     /// The PSM listened on.
@@ -181,7 +180,20 @@ pub struct Bluetooth {
     recognized: AtomicU64,
     /// Channels others have open to this device.
     incoming: Mutex<Vec<Incoming>>,
+    /// A pairing code this device shows: its channel, advertised by the tag
+    /// made from it, and where a channel whose first message is pairing's
+    /// goes.
+    pairing: Mutex<Option<Pairing>>,
 }
+
+/// A pairing shown over Bluetooth.
+type Pairing = (u16, mpsc::Sender<(ble::BoxChannel, Vec<u8>)>);
+
+/// How long a channel opened while a pairing code shows may take to say
+/// whether it carries pairing or a link session.
+const FIRST_WITHIN: Duration = Duration::from_secs(10);
+/// How long the typer of a pairing code looks for its tag.
+const PAIRING_WITHIN: Duration = Duration::from_secs(20);
 
 /// A channel someone opened to this device.
 struct Incoming {
@@ -284,6 +296,10 @@ fn system_radio(d: &Daemon) -> Result<Arc<dyn Radio>, String> {
     #[cfg(unix)]
     if let Some(dir) = std::env::var_os("CARDINAL_TEST_BLE_ETHER") {
         let ether = ble::DirEther::new(dir).map_err(|e| e.to_string())?;
+        // A radio of an older phone, for tests.
+        if std::env::var_os("CARDINAL_TEST_BLE_TOO_OLD").is_some() {
+            return Ok(Arc::new(ether.old_radio()));
+        }
         return Ok(Arc::new(ether.radio()));
     }
     #[cfg(unix)]
@@ -365,6 +381,12 @@ fn off(d: &Daemon) {
 /// for this device now, and is to find it soonest.
 fn keys(d: &Daemon) -> Keys {
     let mut keys = Vec::new();
+    // Someone typing the code is looking now.
+    if let Some((channel, tx)) = lock(&d.bluetooth.pairing).as_ref() {
+        if !tx.is_closed() {
+            keys.push((TagType::OneTime, ble::pairing_key(*channel)));
+        }
+    }
     for secret in crate::contacts::answered_here(d) {
         keys.push((TagType::OneTime, ble::one_time_key(&secret)));
     }
@@ -496,7 +518,9 @@ async fn run(d: &Arc<Daemon>) -> Result<(), String> {
     let radio = radio(d)?;
     let available = radio.available().await.map_err(|e| e.to_string())?;
     show(d, |s| s.available = Some(available.clone()));
-    available?;
+    // A radio too old for extended advertisements stays off: nobody would
+    // find this device, and there is no short form.
+    available.map_err(|e| e.to_string())?;
     let mut listening = radio
         .listen()
         .await
@@ -578,6 +602,40 @@ async fn run(d: &Arc<Daemon>) -> Result<(), String> {
 /// and [`MAX_PER_ADDR`] from one address; when all are taken, the oldest
 /// with no session over it gives way.
 fn take_channel(d: &Arc<Daemon>, from: BleAddr, ch: ble::BoxChannel) {
+    // While a pairing code shows, the first message says which a channel
+    // carries: pairing's is a record, a link packet starts with its type
+    // (`carriers/ble.md`).
+    let pairing = lock(&d.bluetooth.pairing)
+        .as_ref()
+        .map(|(_, tx)| tx.clone())
+        .filter(|tx| !tx.is_closed());
+    if let Some(tx) = pairing {
+        let d = d.clone();
+        tokio::spawn(async move {
+            let mut ch = ch;
+            let first = tokio::time::timeout(
+                FIRST_WITHIN,
+                cardinal_contact::pairing::read_message(&mut ch),
+            );
+            let Ok(Ok(first)) = first.await else {
+                return;
+            };
+            if cardinal_contact::pairing::is_pairing_message(&first) {
+                let _ = tx.try_send((ch, first));
+                return;
+            }
+            let mut head = (first.len() as u16).to_le_bytes().to_vec();
+            head.extend_from_slice(&first);
+            let ch: ble::BoxChannel = Box::new(ble::Prefixed::new(head, ch));
+            link_channel(&d, from, ch);
+        });
+        return;
+    }
+    link_channel(d, from, ch);
+}
+
+/// A channel someone opened to this device, for the link.
+fn link_channel(d: &Arc<Daemon>, from: BleAddr, ch: ble::BoxChannel) {
     {
         let mut held = lock(&d.bluetooth.incoming);
         held.retain(|c| !c.on.is_closed());
@@ -822,6 +880,54 @@ async fn dial_targets(
     )
 }
 
+/// Whether the radio is on now, for what may be found over it.
+pub fn is_running(d: &Daemon) -> bool {
+    lock(&d.bluetooth.running).is_some()
+}
+
+/// Shows a pairing code over Bluetooth too, while `tx` is open: the tag
+/// made from its channel is advertised, and channels whose first message
+/// is pairing's go to `tx`.
+pub fn show_pairing(d: &Daemon, channel: u16, tx: mpsc::Sender<(ble::BoxChannel, Vec<u8>)>) {
+    *lock(&d.bluetooth.pairing) = Some((channel, tx));
+    d.bluetooth.poke.notify_one();
+}
+
+/// The pairing code is no longer shown.
+pub fn stop_pairing(d: &Daemon) {
+    *lock(&d.bluetooth.pairing) = None;
+}
+
+/// Looks nearby for a device showing a pairing code on `channel`, by the
+/// tag made from the channel alone. `None` where Bluetooth is off, or
+/// nobody was found in time.
+pub async fn find_pairing(d: &Arc<Daemon>, channel: u16) -> Option<Seen> {
+    lock(&d.bluetooth.running).as_ref()?;
+    let (tx, mut rx) = mpsc::channel(4);
+    lock(&d.bluetooth.wanted).push((ble::pairing_key(channel), tx));
+    tracing::info!("looking for the device showing the pairing code over Bluetooth");
+    tokio::time::timeout(PAIRING_WITHIN, rx.recv())
+        .await
+        .ok()
+        .flatten()
+}
+
+/// Opens a channel to a device seen.
+pub async fn open_channel(seen: &Seen) -> anyhow::Result<ble::BoxChannel> {
+    tokio::time::timeout(CHANNEL_WITHIN, seen.radio.connect(seen.addr, seen.psm))
+        .await
+        .map_err(|_| anyhow::anyhow!("no channel to {} in time", seen.addr))?
+        .map_err(|e| anyhow::anyhow!("no channel to {}: {e}", seen.addr))
+}
+
+/// Gives a channel a pairing ran over to the link, for the session that
+/// follows on it, closed once no session runs over it.
+pub fn carry(d: &Arc<Daemon>, ch: ble::BoxChannel, label: String) -> Attached {
+    let on = d.endpoint.attach(ch, CarrierKind::Ble, label);
+    tokio::spawn(keep_while_used(d.clone(), on.clone()));
+    on
+}
+
 /// Looks for the device that made `invitation` nearby, by the one-time tag
 /// its secret makes, and opens the invitation's session with it. `None`
 /// where Bluetooth is off, or nobody advertising it was found in time.
@@ -857,8 +963,9 @@ pub fn status(d: &Daemon) -> Value {
     let (available, why_not) = match &shown.available {
         None => (Value::Null, Value::Null),
         Some(Ok(())) => (json!(true), Value::Null),
-        Some(Err(e)) => (json!(false), json!(e)),
+        Some(Err(e)) => (json!(false), json!(e.to_string())),
     };
+    let too_old = shown.available == Some(Err(NotAvailable::TooOld));
     json!({
         "mode": mode(d).as_str(),
         "on": shown.on,
@@ -871,6 +978,9 @@ pub fn status(d: &Daemon) -> Value {
         "seen": b.seen.load(Ordering::Relaxed),
         "recognized": b.recognized.load(Ordering::Relaxed),
         "channels_in": lock(&b.incoming).iter().filter(|c| !c.on.is_closed()).count(),
+        // This device's Bluetooth cannot send extended advertisements:
+        // Bluetooth stays off, whatever the setting.
+        "too_old": too_old,
     })
 }
 
@@ -881,10 +991,10 @@ pub async fn check(d: &Daemon) -> Value {
         let r = match radio(d) {
             Ok(r) => match tokio::time::timeout(Duration::from_secs(3), r.available()).await {
                 Ok(Ok(a)) => a,
-                Ok(Err(e)) => Err(e.to_string()),
-                Err(_) => Err("the radio did not answer".into()),
+                Ok(Err(e)) => Err(e.to_string().into()),
+                Err(_) => Err("the radio did not answer".to_owned().into()),
             },
-            Err(e) => Err(e),
+            Err(e) => Err(e.into()),
         };
         show(d, |s| s.available = Some(r));
     }

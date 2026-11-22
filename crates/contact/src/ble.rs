@@ -11,13 +11,17 @@
 //! - its own devices', `k = derive("discovery", discovery secret)`;
 //! - its trusted contacts', `k = derive("presence", presence secret)`;
 //! - `k = derive("one-time", secret)`, while an invitation that carries the
-//!   secret is outstanding.
+//!   secret is outstanding;
+//! - `k = derive("pairing channel", varint(channel))`, while a pairing code
+//!   is shown ([`pairing_key`]).
 //!
 //! Whoever sees one checks every tag against every key they hold.
 //!
-//! A legacy advertisement cannot hold that much: it has the PSM and one tag,
-//! a different one at each refresh, cut to `nonce (4) || first6(...)`
-//! ([`Advert::encode_legacy`]). [`Advert::decode`] reads both.
+//! That is more than a legacy advertisement holds, and there is no short
+//! form: a radio that cannot send an extended advertisement (Bluetooth 5's
+//! LE extended advertising) says so ([`NotAvailable::TooOld`]), and
+//! Bluetooth stays off on its device. Service data of any other length
+//! than [`ADVERT_LEN`] is not an advertisement.
 //!
 //! Link packets go over an L2CAP connection-oriented channel to that PSM,
 //! each prefixed by its length as over TCP; the link crate carries them
@@ -64,16 +68,15 @@ pub fn carrier_name() -> [u8; 8] {
     n
 }
 
-/// The bytes of one full tag: a nonce and the first 8 bytes of the keyed
+/// The bytes of one tag: a nonce and the first 8 bytes of the keyed
 /// hash, as on a local network, with no type.
 pub const TAG_LEN: usize = 16;
-/// The bytes of a legacy advertisement's service data: the PSM, a 4-byte
-/// nonce and the first 6 bytes of the keyed hash.
-pub const LEGACY_LEN: usize = 2 + 4 + 6;
-/// How many tags an extended advertisement carries, always: places this
-/// device has no tag for are random bytes, which look like tags, so that
-/// an advertisement says nothing of how many it has, or of what kinds.
+/// How many tags an advertisement carries, always: places this device has
+/// no tag for are random bytes, which look like tags, so that an
+/// advertisement says nothing of how many it has, or of what kinds.
 pub const TAGS: usize = 4;
+/// The bytes of an advertisement's service data: the PSM and the tags.
+pub const ADVERT_LEN: usize = 2 + TAGS * TAG_LEN;
 
 /// What a tag is for, on this device only, to choose which to send. A tag
 /// carries no type on the air: whoever sees it checks it against every key
@@ -95,46 +98,39 @@ pub fn one_time_key(secret: &[u8]) -> Zeroizing<[u8; 32]> {
     derive(Purpose::OneTime, secret)
 }
 
-/// One tag as it came: full, or cut to fit a legacy advertisement.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Tag {
-    /// `nonce (8) || first8(...)`, or as many random bytes.
-    Full([u8; TAG_LEN]),
-    /// `nonce (4) || first6(...)`.
-    Short([u8; 10]),
+/// `k = derive("pairing channel", varint(channel))`: the key of the tag a
+/// device showing a pairing code advertises. Made from the channel alone,
+/// so anyone can make it and it says no more than the LAN's `c=`: someone
+/// here is pairing on that channel. The code's words never go into a tag.
+pub fn pairing_key(channel: u16) -> Zeroizing<[u8; 32]> {
+    let mut v = Vec::new();
+    cardinal_encoding::write_varint(channel as u64, &mut v);
+    derive(Purpose::PairingChannel, &v)
 }
 
+/// One tag: `nonce (8) || first8(BLAKE3.keyed_hash(k, nonce))`, or as
+/// many random bytes in a place with no tag.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Tag(pub [u8; TAG_LEN]);
+
 impl Tag {
-    /// A full tag made with `k`.
+    /// A tag made with `k`.
     pub fn make(k: &[u8; 32], nonce: [u8; 8]) -> Tag {
         let h = keyed_hash(k, &nonce);
         let mut body = [0u8; TAG_LEN];
         body[..8].copy_from_slice(&nonce);
         body[8..].copy_from_slice(&h[..8]);
-        Tag::Full(body)
+        Tag(body)
     }
 
     /// Random bytes in a tag's place, which no key matches.
     pub fn filler() -> Tag {
-        Tag::Full(random_bytes())
+        Tag(random_bytes())
     }
 
     /// Whether this is a tag made with `k`.
     pub fn matches(&self, k: &[u8; 32]) -> bool {
-        match self {
-            Tag::Full(body) => ct_eq(&keyed_hash(k, &body[..8])[..8], &body[8..]),
-            Tag::Short(body) => ct_eq(&keyed_hash(k, &body[..4])[..6], &body[4..]),
-        }
-    }
-
-    /// The same tag cut for a legacy advertisement: the first 4 bytes of
-    /// its nonce, and the first 6 of the hash of those 4.
-    pub fn shorten(k: &[u8; 32], nonce: [u8; 4]) -> Tag {
-        let h = keyed_hash(k, &nonce);
-        let mut body = [0u8; 10];
-        body[..4].copy_from_slice(&nonce);
-        body[4..].copy_from_slice(&h[..6]);
-        Tag::Short(body)
+        ct_eq(&keyed_hash(k, &self.0[..8])[..8], &self.0[8..])
     }
 }
 
@@ -181,32 +177,6 @@ impl Keys {
         shuffle(&mut tags);
         Advert { psm, tags }
     }
-
-    /// The one short tag a legacy advertisement holds at refresh `n`: the
-    /// keys take turns, and while there are one-time keys, one of them has
-    /// every other turn, since someone holding an invitation is looking for
-    /// it now.
-    pub fn legacy(&self, psm: u16, n: usize) -> Option<Advert> {
-        let (once, rest): (Vec<_>, Vec<_>) =
-            self.keys.iter().partition(|(t, _)| *t == TagType::OneTime);
-        fn pick<'a>(
-            of: &[&'a (TagType, Zeroizing<[u8; 32]>)],
-            i: usize,
-        ) -> Option<&'a (TagType, Zeroizing<[u8; 32]>)> {
-            of.get(i % of.len().max(1)).copied()
-        }
-        let chosen = match (once.is_empty(), rest.is_empty()) {
-            (true, _) => pick(&rest, n),
-            (false, true) => pick(&once, n),
-            (false, false) if n % 2 == 0 => pick(&once, n / 2),
-            (false, false) => pick(&rest, n / 2),
-        };
-        let (_, k) = chosen?;
-        Some(Advert {
-            psm,
-            tags: vec![Tag::shorten(k, random_bytes())],
-        })
-    }
 }
 
 /// Shuffles `v` in place (Fisher–Yates), from fresh randomness.
@@ -218,55 +188,32 @@ fn shuffle<T>(v: &mut [T]) {
 }
 
 impl Advert {
-    /// The service data of an extended advertisement.
+    /// The service data: the PSM, little-endian, then the tags.
     pub fn encode(&self) -> Vec<u8> {
         let mut out = Vec::with_capacity(2 + self.tags.len() * TAG_LEN);
         out.extend_from_slice(&self.psm.to_le_bytes());
         for t in &self.tags {
-            match t {
-                Tag::Full(body) => out.extend_from_slice(body),
-                // A short tag goes only alone, in a legacy advertisement.
-                Tag::Short(_) => {}
-            }
+            out.extend_from_slice(&t.0);
         }
         out
     }
 
-    /// The service data of a legacy advertisement: the PSM and its first
-    /// tag, which must be short.
-    pub fn encode_legacy(&self) -> Option<Vec<u8>> {
-        let Some(Tag::Short(body)) = self.tags.first() else {
-            return None;
-        };
-        let mut out = Vec::with_capacity(LEGACY_LEN);
-        out.extend_from_slice(&self.psm.to_le_bytes());
-        out.extend_from_slice(body);
-        Some(out)
-    }
-
-    /// Reads service data of either kind: the PSM and one short tag, or
-    /// the PSM and any number of full ones.
+    /// Reads service data: the PSM and exactly [`TAGS`] tags. Anything
+    /// else, the short form of a legacy advertisement among it, is not an
+    /// advertisement.
     pub fn decode(data: &[u8]) -> Option<Advert> {
-        if data.len() < 2 + TAG_LEN.min(LEGACY_LEN - 2) {
+        if data.len() != ADVERT_LEN {
             return None;
         }
         let psm = u16::from_le_bytes([data[0], data[1]]);
-        let rest = &data[2..];
-        let tags = if data.len() == LEGACY_LEN {
-            let mut body = [0u8; 10];
-            body.copy_from_slice(rest);
-            vec![Tag::Short(body)]
-        } else if rest.len() % TAG_LEN == 0 {
-            rest.chunks(TAG_LEN)
-                .map(|c| {
-                    let mut body = [0u8; TAG_LEN];
-                    body.copy_from_slice(c);
-                    Tag::Full(body)
-                })
-                .collect()
-        } else {
-            return None;
-        };
+        let tags = data[2..]
+            .chunks(TAG_LEN)
+            .map(|c| {
+                let mut body = [0u8; TAG_LEN];
+                body.copy_from_slice(c);
+                Tag(body)
+            })
+            .collect();
         Some(Advert { psm, tags })
     }
 
@@ -352,6 +299,36 @@ impl std::fmt::Debug for BleAddr {
     }
 }
 
+/// Why a radio cannot be used.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum NotAvailable {
+    /// It cannot send an extended advertisement (Bluetooth 5's LE extended
+    /// advertising), and the tags fit only in one: nobody would find this
+    /// device, so Bluetooth stays off on it. Wi-Fi and the internet are
+    /// not touched.
+    TooOld,
+    /// Anything else, in words: no radio, switched off, no privacy.
+    Why(String),
+}
+
+impl std::fmt::Display for NotAvailable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            NotAvailable::TooOld => f.write_str(
+                "this device's Bluetooth cannot send the long (extended) advertisements \
+                 Cardinal needs to find people nearby; Wi-Fi and the internet still work",
+            ),
+            NotAvailable::Why(w) => f.write_str(w),
+        }
+    }
+}
+
+impl From<String> for NotAvailable {
+    fn from(why: String) -> NotAvailable {
+        NotAvailable::Why(why)
+    }
+}
+
 /// An advertisement seen while scanning.
 #[derive(Clone, Debug)]
 pub struct Sighting {
@@ -368,6 +345,62 @@ impl<T: AsyncRead + AsyncWrite + Send + Unpin + 'static> Channel for T {}
 
 /// A channel, boxed.
 pub type BoxChannel = Box<dyn Channel>;
+
+/// A channel whose first bytes were read already, to look at them, and
+/// are given back first.
+pub struct Prefixed {
+    head: Vec<u8>,
+    at: usize,
+    inner: BoxChannel,
+}
+
+impl Prefixed {
+    /// `inner`, with `head` read from it before.
+    pub fn new(head: Vec<u8>, inner: BoxChannel) -> Prefixed {
+        Prefixed { head, at: 0, inner }
+    }
+}
+
+impl AsyncRead for Prefixed {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<io::Result<()>> {
+        if self.at < self.head.len() {
+            let n = buf.remaining().min(self.head.len() - self.at);
+            let at = self.at;
+            buf.put_slice(&self.head[at..at + n]);
+            self.at += n;
+            return std::task::Poll::Ready(Ok(()));
+        }
+        Pin::new(&mut self.inner).poll_read(cx, buf)
+    }
+}
+
+impl AsyncWrite for Prefixed {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<io::Result<usize>> {
+        Pin::new(&mut self.inner).poll_write(cx, buf)
+    }
+
+    fn poll_flush(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<io::Result<()>> {
+        Pin::new(&mut self.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<io::Result<()>> {
+        Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
+}
 
 /// A future a [`Radio`] returns.
 pub type RadioFuture<'a, T> = Pin<Box<dyn Future<Output = io::Result<T>> + Send + 'a>>;
@@ -389,8 +422,9 @@ pub trait Radio: Send + Sync + 'static {
     /// What the radio is, for the person: "BlueZ, adapter hci0", say.
     fn describe(&self) -> String;
 
-    /// Whether there is a radio to use, and if not, why not.
-    fn available(&self) -> RadioFuture<'_, Result<(), String>>;
+    /// Whether there is a radio to use, and if not, why not: among the
+    /// reasons, that it cannot send extended advertisements.
+    fn available(&self) -> RadioFuture<'_, Result<(), NotAvailable>>;
 
     /// Listens for L2CAP channels on a PSM of the system's choosing.
     fn listen(&self) -> RadioFuture<'_, Listening>;
@@ -464,6 +498,16 @@ impl MemoryEther {
         MemoryRadio {
             air: self.air.clone(),
             addr: BleAddr::random(),
+            too_old: false,
+        }
+    }
+
+    /// A radio in it that cannot send extended advertisements, as an
+    /// older phone's.
+    pub fn old_radio(&self) -> MemoryRadio {
+        MemoryRadio {
+            too_old: true,
+            ..self.radio()
         }
     }
 
@@ -488,6 +532,7 @@ impl Air {
 pub struct MemoryRadio {
     air: Arc<Mutex<Air>>,
     addr: BleAddr,
+    too_old: bool,
 }
 
 impl MemoryRadio {
@@ -512,8 +557,14 @@ impl Radio for MemoryRadio {
         format!("a radio in memory at {}", self.addr)
     }
 
-    fn available(&self) -> RadioFuture<'_, Result<(), String>> {
-        Box::pin(async { Ok(Ok(())) })
+    fn available(&self) -> RadioFuture<'_, Result<(), NotAvailable>> {
+        let too_old = self.too_old;
+        Box::pin(async move {
+            Ok(match too_old {
+                true => Err(NotAvailable::TooOld),
+                false => Ok(()),
+            })
+        })
     }
 
     fn listen(&self) -> RadioFuture<'_, Listening> {
@@ -635,6 +686,15 @@ impl DirEther {
             dir: self.dir.clone(),
             addr: BleAddr::random(),
             next_psm: Arc::new(Mutex::new(0x80)),
+            too_old: false,
+        }
+    }
+
+    /// A radio in it that cannot send extended advertisements.
+    pub fn old_radio(&self) -> DirRadio {
+        DirRadio {
+            too_old: true,
+            ..self.radio()
         }
     }
 }
@@ -645,6 +705,7 @@ pub struct DirRadio {
     dir: std::path::PathBuf,
     addr: BleAddr,
     next_psm: Arc<Mutex<u16>>,
+    too_old: bool,
 }
 
 #[cfg(unix)]
@@ -664,11 +725,12 @@ impl Radio for DirRadio {
         )
     }
 
-    fn available(&self) -> RadioFuture<'_, Result<(), String>> {
+    fn available(&self) -> RadioFuture<'_, Result<(), NotAvailable>> {
         Box::pin(async move {
             Ok(match self.dir.join("ads").is_dir() {
+                _ if self.too_old => Err(NotAvailable::TooOld),
                 true => Ok(()),
-                false => Err(format!("{} is gone", self.dir.display())),
+                false => Err(format!("{} is gone", self.dir.display()).into()),
             })
         })
     }
@@ -846,7 +908,7 @@ mod tests {
         let mut bad = data.clone();
         bad[2 + at * TAG_LEN + 15] ^= 1;
         assert!(!Advert::decode(&bad).unwrap().has(&theirs));
-        // Lengths that are neither form are not an advertisement.
+        // Other lengths are not an advertisement.
         assert!(Advert::decode(&data[..5]).is_none());
         assert!(Advert::decode(&data[..data.len() - 1]).is_none());
         assert!(Advert::decode(&[1]).is_none());
@@ -910,51 +972,40 @@ mod tests {
     }
 
     #[test]
-    fn a_legacy_advertisement_carries_one_short_tag_in_turn() {
+    fn there_is_no_short_form() {
         let own = cardinal_crypto::derive(Purpose::Discovery, &[1; 32]);
-        let theirs = cardinal_crypto::derive(Purpose::Presence, &[2; 32]);
+        // What a legacy advertisement used to hold: the PSM, a 4-byte
+        // nonce and 6 bytes of hash. It is not an advertisement now.
+        let h = keyed_hash(&own, &[1, 2, 3, 4]);
+        let mut short = vec![0x99, 0];
+        short.extend_from_slice(&[1, 2, 3, 4]);
+        short.extend_from_slice(&h[..6]);
+        assert_eq!(short.len(), 12);
+        assert!(Advert::decode(&short).is_none());
+        // Nor is one tag alone, or any number but four.
         let keys = Keys {
-            keys: vec![
-                (TagType::Own, own.clone()),
-                (TagType::Contacts, theirs.clone()),
-            ],
+            keys: vec![(TagType::Own, own.clone())],
         };
-        let first = keys.legacy(0x99, 0).unwrap();
-        let data = first.encode_legacy().unwrap();
-        assert_eq!(data.len(), LEGACY_LEN);
-        // 31 bytes at most: the service data element (length, type, UUID)
-        // and this.
-        assert!(2 + 16 + data.len() <= 31);
-        let back = Advert::decode(&data).unwrap();
-        assert_eq!(back.psm, 0x99);
-        assert!(back.has(&own));
-        assert!(!back.has(&theirs));
-        let second = keys.legacy(0x99, 1).unwrap();
-        let back = Advert::decode(&second.encode_legacy().unwrap()).unwrap();
-        assert!(back.has(&theirs));
-        assert!(Keys::default().legacy(1, 0).is_none());
-        // With an invitation outstanding, its tag is in every other one.
-        let once = cardinal_crypto::derive(Purpose::OneTime, &[3; 16]);
-        let with = Keys {
-            keys: vec![
-                (TagType::Own, own.clone()),
-                (TagType::Contacts, theirs.clone()),
-                (TagType::OneTime, once.clone()),
-            ],
-        };
-        let carried: Vec<[bool; 3]> = (0..6)
-            .map(|n| {
-                let ad =
-                    Advert::decode(&with.legacy(1, n).unwrap().encode_legacy().unwrap()).unwrap();
-                [ad.has(&own), ad.has(&theirs), ad.has(&once)]
-            })
-            .collect();
-        for (n, c) in carried.iter().enumerate() {
-            assert_eq!(c[2], n % 2 == 0, "turn {n}: {c:?}");
+        let data = keys.advert(0x99).encode();
+        assert_eq!(data.len(), ADVERT_LEN);
+        for n in 0..TAGS {
+            assert!(Advert::decode(&data[..2 + n * TAG_LEN]).is_none(), "{n}");
         }
-        assert!(carried.iter().any(|c| c[0]) && carried.iter().any(|c| c[1]));
-        // A full advertisement has no legacy form.
-        assert!(keys.advert(1).encode_legacy().is_none());
+        let mut five = data.clone();
+        five.extend_from_slice(&[0; TAG_LEN]);
+        assert!(Advert::decode(&five).is_none());
+        assert!(Advert::decode(&data).unwrap().has(&own));
+    }
+
+    #[tokio::test]
+    async fn a_radio_too_old_for_extended_advertisements_says_so() {
+        let ether = MemoryEther::new();
+        assert_eq!(ether.radio().available().await.unwrap(), Ok(()));
+        let old = ether.old_radio();
+        assert_eq!(old.available().await.unwrap(), Err(NotAvailable::TooOld));
+        assert!(NotAvailable::TooOld
+            .to_string()
+            .contains("Wi-Fi and the internet still work"));
     }
 
     #[test]

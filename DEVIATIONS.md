@@ -119,7 +119,8 @@ below, each under its section.
   `derive("pair", K)`, and `derive("invite", K)` alike (`Isk::key32`).
 - **Spec ambiguity: the CPace channel identifier CI.** contact.md names the
   password, associated data, and session identifier, but not CI. Chose an
-  empty CI (the session identifier already binds both endpoints).
+  empty CI (the session identifier, from both sides' random values, is
+  unique to the attempt). Now in the text.
 - **Spec ambiguity: password encoding.** Chose PRS = the UTF-8 bytes of the
   three lowercase words joined by single spaces. The words are ASCII, so
   RFC 8265 preparation changes nothing.
@@ -1460,13 +1461,16 @@ Not implemented yet (the next milestone):
   English list (only "harbor" is). Codes here use only list words, e.g.
   `4-anchor-harbor-quit`; the parser rejects other words. Parsing accepts
   any case and spaces or hyphens between the parts.
-- **Spec ambiguity: the endpoints in the session identifier.** Chose: the
-  shower's endpoint is `{1: 1 (UDP), 2: the shower's IP address on the
-  route toward the typer, 3: the advertised pairing port}`, and the
-  typer's is `{1: 1, 2: the typer's IP address, 3: its pairing socket's
-  port}`, i.e. the UDP addresses each side's datagrams carry. This breaks
-  through NAT or on multi-homed hosts where the two sides see different
-  addresses; the spec could bind the advertised record instead.
+- **The session identifier takes no address** (ASK 6 = b, now in
+  `contact.md`): each attempt starts with the typer's `{0: 4, 1: r}` and
+  the shower's answer, 16 random bytes each, and the session id is
+  `BLAKE3("cardinal 1 pair" || varint(channel) || shower's r || typer's
+  r)`, on every carrier. A start is no guess: the shower keeps the last 16
+  starts, one per sender, answers a start sent again with the same value,
+  and takes a share only from a sender whose start it answered. Before, the
+  UDP addresses each side's datagrams carried went in, which broke on
+  dual-stack sockets and several addresses, and could not work over
+  Bluetooth.
 - **Spec ambiguity: the confirmation order.** The shower sends its share
   and then its tag at once; the typer always sends its tag, even when the
   shower's tag is wrong, so that a wrong code counts against the code.
@@ -1474,12 +1478,19 @@ Not implemented yet (the next milestone):
   in which the shower sent its tag and no valid typer tag followed (another
   typer started, or 10 seconds passed). After three, `Shower::run` returns
   `TooManyAttempts` and the caller shows a new code.
-- **Spec ambiguity: the power in the proof of possession.** The proof
-  binds a power, but the pairing message carries none, and the admin
-  decides the power afterwards. Chose: the new device signs for
-  `LocalDevice::join_power` (device by default); the typer verifies against
-  device power, then admin, and reports which in `NewDevice::power`. The
-  spec should carry the power or fix it to device.
+- **The admin device names the power** (ASK 5 = a, now in `contact.md`):
+  the typer's information carries field 7, 1 device or 2 admin (`cardinal
+  pair <code> --admin`, `pair-type`'s `admin`); the new device signs its
+  proof for exactly that and shows it (`pair-status` `power`, "This device
+  will join as an admin device"), and the typer accepts only a proof for
+  the power it sent (else `BadProof`, "did not agree to join at the power
+  this device chose"). A typer's information to a device with no identity
+  without field 7, or with another value, ends the pairing with a visible
+  error on the new device. The new device no longer chooses: `cardinal
+  pair --admin` without a code is refused, and `pair-show`'s `admin`
+  (field 1) is no longer used, so a client that sends it gets an error.
+  Field 7 is sent whenever the typer adds devices, also to a shower that
+  has an identity, which ignores it.
 - **Proofs only from a device without an identity.** When two people meet,
   neither sends a proof (a proof would let the other list your device in
   their own log). A typer must have an identity.
@@ -1488,11 +1499,14 @@ Not implemented yet (the next milestone):
   about 1450 bytes, more than the link's 1232: it relies on the LAN's MTU
   or IP fragmentation.
 - **Retransmission.** Lost pairing datagrams are retransmitted every 300
-  ms by the typer; the shower answers duplicates with its earlier replies.
+  ms by the typer (its start, its share, its tag with its information);
+  the shower answers duplicates with its earlier replies. Over a channel
+  nothing is sent twice.
 - **The link session after pairing.** The typer initiates to the shower's
   link endpoint (info field 4) with both full link keys and the single-use
   secret `derive("invite", K)`; each side expects the other's signing key
-  (and identity, if any) from the pairing.
+  (and identity, if any) from the pairing. Over Bluetooth it runs on the
+  pairing's own channel.
 - **mDNS** is a minimal DNS-SD over IPv4 multicast: unsolicited
   announcements (PTR, SRV, TXT, and A when known), answers to PTR queries,
   and browsing; no probing, conflict resolution, known-answer
@@ -1580,8 +1594,8 @@ Not implemented yet (the next milestone):
   text: the UUID, service data of the PSM (little-endian) and always four
   16-byte tags with **no type byte**, `nonce (8) || first8` as on a local
   network, in a random order, the places this device has no tag for
-  filled with random bytes, which look like tags; a legacy form of PSM
-  and one tag cut to `nonce (4) || first6`, with no type either; L2CAP LE
+  filled with random bytes, which look like tags; no legacy (short) form
+  (ASK 13, Daniel 2026-11-22); L2CAP LE
   credit-based channels with packets length-prefixed as over TCP, and the
   person's three states. A device checks each tag against every key it
   holds: its own devices' (`discovery`), each trusted contact's
@@ -1593,7 +1607,7 @@ Not implemented yet (the next milestone):
     context `cardinal 1 one-time`, and like `presence` kept out of
     `Purpose::ALL` and its vectors until published.
   - **The service UUID is in the advertisement too**, as a 128-bit UUID
-    list, in the extended form as in the legacy one: scanners filter on
+    list: scanners filter on
     it (BlueZ's discovery filter and Android's `ScanFilter` match the UUID
     list, not service data keys). The extended form is then flags, the
     UUID list and the service data: 3 + 18 + 18 + 2 + 64 = 105 bytes.
@@ -1601,23 +1615,19 @@ Not implemented yet (the next milestone):
     there are any, and one-time tags in the places left, a random few of
     them at each refresh when there are more; with nothing to say, nothing
     is advertised. A replayed tag is a known limit, as on a local network.
-  - **Legacy form on BlueZ** goes in `ScanResponseServiceData`, which
-    BlueZ has only with `--experimental`; without it the advertisement
-    carries the UUID and no tag, and nobody finds the device. Used where
-    the adapter's `SupportedCapabilities` `MaxAdvLen` is too short for
-    the full form, or the full one is refused.
-  - **Both forms at once where the radio has room** (spec question): a
-    device that sends the extended form sends the legacy one beside it,
-    as a second advertising set (BlueZ: a second registration; Android: a
-    second `AdvertisingSet`), so that a phone whose scanner sees only
-    legacy advertisements still finds it. Where the second is refused,
-    only the extended one goes. The draft says which form to use, not
-    whether both.
-  - **Which tag in a legacy advertisement:** the keys take turns, one per
-    refresh (each counted apart from anything else the radio numbers).
-    While there is a one-time tag, one has every other turn, since whoever
-    holds the invitation is looking now; and the advertisement is made
-    again every 10 s instead of 30 s. Someone accepting looks for 60 s.
+  - **No short form; a radio too old says so** (ASK 13 = a). Service data
+    of any length but 2 + 4 × 16 is not an advertisement. A radio that
+    cannot send extended advertisements is too old
+    (`NotAvailable::TooOld`): Bluetooth stays off whatever the setting,
+    nothing is advertised, and `status`/`bluetooth` say `too_old` (with
+    `available` false and `why_not` in words) for a client to show "This
+    phone's Bluetooth is too old for Cardinal to find people nearby. Wi-Fi
+    and the internet still work." On BlueZ: an adapter whose
+    `SupportedCapabilities` `MaxAdvLen` is shorter than the advertisement
+    (105 bytes); one that does not say is tried. Through Android's bridge:
+    the app's `state` line carries `extended`
+    (`isLeExtendedAdvertisingSupported`); a state that says available
+    without it is not taken as available.
   - **BlueZ only with privacy on.** Without the controller's privacy
     (`Privacy = device` in `/etc/bluetooth/main.conf`), BlueZ advertises
     and opens channels from the adapter's fixed public address, which
@@ -1627,8 +1637,6 @@ Not implemented yet (the next milestone):
     that cannot be read, from `main.conf`; without it the radio is not
     used, and `why_not` says how to turn it on. Android advertises and
     connects from resolvable private addresses already.
-  - **A short tag** matches only `keyed_hash(k, nonce4)[..6]`. Service
-    data of 12 bytes is the legacy form; of 2 + 16n, the extended one.
   - **One channel, every key at once.** A tag says whose device, not
     which: own devices' or a contact's device is dialled
     by opening one channel and starting a handshake to each of the
@@ -1672,26 +1680,30 @@ Not implemented yet (the next milestone):
     handshake over a channel to the device that has it. The invitation's
     endpoint is left as it was; with no address at all `invite` still
     fails ("no address to give").
-  - **Pairing codes carry no one-time secret** (33 bits, for CPace), so
-    no one-time tag is made from one: offline, 2^33 keyed hashes recover
-    the code from the tag, and whoever has it can pair. Pairing over
-    Bluetooth is not done (spec question).
-  - **Endpoints**: carrier the 8-byte name, address the 6 bytes, port the
-    PSM (`EndpointAddr::ble`). The record does not say random or public;
-    read as random. Never written in a reach node, and not yet passed in
-    rendezvous.
-  - **"On while open"** is while a client watches with
-    `{"cmd": "watch", "window": true}`; a watch without it does not count
-    (Android's service watches with no window open). With `open` and no
-    window, a CLI-only device has Bluetooth off.
-  - **Android's bridge socket** (`CARDINAL_BLE_BRIDGE`) is mode 0600, each
-    connection's peer must be of the service's user, and the connection
-    that drives the radio says so in its first line (`{"control": true}`).
-  - **Channels are opened at security level low**, with no Bluetooth
-    pairing (Android: the insecure L2CAP calls): the link session proves
-    and encrypts.
-  - **The setting is this device's** (`config.toml` `bluetooth`), not the
-    account's: each device has its own radio and battery.
+  - **Pairing over Bluetooth** (ASK 1 = b, now in `contact.md` and
+    `carriers/ble.md`). The device showing a code advertises, with its
+    other tags, one made from the channel alone, `k = derive("pairing
+    channel", varint(channel))` (context `cardinal 1 pairing channel`,
+    kept out of `Purpose::ALL` and its vectors like `one-time`), so it
+    says no more than `c=` on a LAN; the words never go into a tag. While
+    the code shows, the first message on each channel opened to the device
+    says what it carries: a record (header's low three bits 5) is pairing,
+    anything else a link packet, handed to the link with the message given
+    back first. Pairing messages are prefixed by their length,
+    little-endian, as link packets over a stream; the link session follows
+    on the same channel. The shower counts failed attempts over UDP and
+    channels together against the one code, one attempt at a time; at most
+    4 channels are read at once, each closed after 15 s with no message,
+    and a channel whose attempt failed is closed. The typer (`cardinal pair
+    <code>` without `--at`) looks on the LAN and, where Bluetooth is on,
+    for the tag for 20 s, whichever answers first. Recovery invitations
+    over Bluetooth are out (decision (2): recovery needs a network).
+  - **Reading: dialling again after joining.** Over Bluetooth the new
+    device knows no address of the admin's to reconnect to as a member, so
+    the admin dials it again over Bluetooth, where it was seen, once the
+    pairing session ends (up to 10 tries a second apart), unless a
+    session came otherwise; the new device also tries the admin's IP
+    endpoint from field 4, as on a LAN.
 - **Reach: what goes where** (`profiles.md#reach`, `relationship.rs`).
   Field 1 holds host entries; field 2 the presence secret, only in a
   relationship; any other field of the node is untouched by a `set` of
@@ -1714,19 +1726,26 @@ Not implemented yet (the next milestone):
   poly1305_backend="soft"'` makes sealing a 1200-byte packet about twice as
   fast. Worth revisiting before tuning anything else.
 
-- **Spec ambiguity: flow control of a reset stream.** The `reset` frame
-  carries no final size (QUIC's RESET_STREAM does), so a receiver that
-  resets a stream cannot tell how much more data the peer sent before it
-  saw the reset. That data counts against the peer's session credit; if the
-  receiver drops it without counting it, the credit leaks away and the
-  session eventually stalls. Chosen without a wire
-  change: a stream reset locally is kept until the peer's `fin` or `reset`
-  arrives, and data arriving for it meanwhile is counted as received and
-  consumed; a side that receives a `reset` while it was still sending
-  answers with a `reset` of its own, so the other side knows the last of
-  the data has arrived. On reliable carriers this is exact. On UDP, data
-  lost before the reset is never resent and its credit is still lost.
-  Suggest: give `reset` a final-size field.
+- **A reset carries its final size** (decision on ASK review item, Daniel
+  2026-11-22, ahead of the `link.md` text; QUIC's RESET_STREAM). `reset`
+  is `{0: 5, 1: stream id, 2: reason, 3: final size}`, the final size the
+  highest offset the sender sent on the stream, written even when 0; a
+  reset without field 3 is malformed and closes the session. The receiver
+  counts every byte below the final size against the session window, at
+  once and as consumed, arrived or not, and drops what arrives later for
+  it (data past the final size, a final size below data received, or one
+  that differs from a fin already received, closes the session). A side
+  that receives a reset while still sending answers with a reset of its
+  own, carrying how much it sent, unless its fin has gone where it surely
+  arrives (over a reliable carrier, or acknowledged). A stream reset
+  locally is kept until the peer's fin or reset gives its final size.
+  This replaces the node's earlier workaround without a wire change,
+  which on UDP lost the credit of data lost before a reset.
+  - **Reading: a reset for a stream never seen** (its data lost, or
+    overtaken) opens and ends it at once: its final size is counted, and
+    it is answered with a reset of final size 0, so the sender can forget
+    the stream too; a peer stream reset before the frame naming its
+    service arrived is never offered to the application.
 - **Reading: streams whose first frames arrive out of order.** `link.md`
   does not say whether a frame for a peer stream id below the highest one
   seen, never seen before, opens that stream or belongs to one that ended.
@@ -2030,11 +2049,24 @@ Not implemented yet (the next milestone):
 - **A file edited here and deleted elsewhere, unseen,** is created again as
   a new node rather than kept as a delete conflict of the old one (as
   before); nothing is lost, but its history starts over.
-- **Spec ambiguity: a device that refuses a blob request.** `sync.md`
-  lets a device refuse requests over its rate limits but gives no reply for
-  "busy", only "not held". The fetcher treats "not held" as "this device
-  lacks it" for 30 s and asks the others; a refusal by silence ends in the
-  20 s timeout. Suggest a "busy, retry later" item.
+- **No fixed time for a blob request** (ASK 12, now in `sync.md`: no reply
+  for busy, no time set). A request waits as long as its session lasts;
+  the fetcher moves on by what it learned of each device (`sched.rs`): a
+  smoothed time per chunk and its variation as RFC 6298 keeps a round
+  trip (SRTT, RTTVAR, gains 1/8 and 1/4), per chunk outstanding at the
+  device when the request went, so a request is expected within `chunks
+  outstanding × (srtt + 4 × rttvar)`, at least 0.75 s. A device not
+  measured yet is given 1 s a chunk (16 s for a first request of 16),
+  patient as TCP's first timeout is. Past that, its ids are asked of
+  another holder with room as well, and the late device's expectation
+  doubles (up to 64 times) until it answers; with no other holder, the
+  request is waited for and looked at again after the longer wait.
+  Lateness is never a failure and never makes a device lack anything:
+  only a reply without an id is "not held" (believed 30 s). A request
+  whose ids all came from elsewhere is dropped (its stream reset) and
+  frees its device's room. Only errors (the stream or session closing, a
+  bad reply) count toward leaving a device out. This replaces the
+  fixed 20 s timeout.
 - **Choosing which device to ask for blobs** is local policy (`sched.rs`):
   per-device throughput and latency estimates, work in proportion to
   throughput, hedged requests when a device is slow. A hedge makes a
@@ -2785,14 +2817,19 @@ asks for around that is not built yet.
   for a holder that has answered a check and never passed one, whether
   its last check found old pieces missing, damaged ones, or only new
   ones not there yet; `missing` for one that passed and whose last check
-  then found pieces missing or damaged. `failed` is now only a holder
-  that left two checks in a row unanswered, which the text keeps apart
-  ("better asked again than failed at once"), and `unchecked` one that
-  has answered none. This device says the same of itself.
-- **Readings: failing, "recently".** A check with no answer
-  (timed out; a closed session is not a check) fails only when it is
-  the second in a row: the spec suggests asking again rather than
-  failing at once, and leaves how often to each device. A passed check
+  then found pieces missing or damaged; `unconfirmed` (no longer
+  `failed`) for one whose last check went unanswered; and `unchecked`
+  one that has answered none. This device says the same of itself.
+- **Silence confirms nothing and fails nothing** (ASK 12, `blobs.md`). A
+  check waits as long as its holder is expected to take
+  (`PeerStats::expect`, from what fetching learned of it, patient with
+  one not measured); with no answer by then (a closed session is not a
+  check) the holder is `unconfirmed`: not counted as a copy, so nothing
+  is dropped on its word, but neither failed nor missing pieces, and it
+  is asked again at its next check, however many go unanswered. Only a
+  reply that says not held counts against it. A failure an earlier build
+  recorded for two silent checks is read as none.
+- **Readings: "recently".** A passed check
   counts for 7 days while the holder is not checked again (an offline
   laptop), and status gives its time. Results are persisted
   (`copies.json`), so a restart neither drops offline holders nor shows

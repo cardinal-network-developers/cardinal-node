@@ -262,7 +262,8 @@ macro_rules! gone {
 rec!(ATTACHMENT "attachment": 1 "name" T, 2 "size" U, 3 "type" T);
 rec!(BLUETOOTH "bluetooth":
     1 "available" BOOL, 2 "channels_in" U, 3 "error" T, 4 "mode" T, 5 "on" BOOL, 6 "psm" U,
-    7 "radio" T, 8 "recognized" U, 9 "seen" U, 10 "why_not" T, 11 "windows" U);
+    7 "radio" T, 8 "recognized" U, 9 "seen" U, 10 "why_not" T, 11 "windows" U,
+    12 "too_old" BOOL);
 rec!(CALL "call":
     1 "frames" {CALL_FRAMES}, 2 "group" B, 3 "id" B, 4 "linked" U, 5 "name" T, 6 "offered" [B],
     7 "people" U, 8 "picture" T, 9 "seconds" U, 10 "state" T, 11 "taken" [B], 12 "who" B);
@@ -348,7 +349,7 @@ rec!(OLD "old versions":
     1 "at" U, 2 "bytes" U, 3 "keep" T, 4 "only_here" {ONLY_HERE}, 5 "unchecked" BOOL);
 rec!(ONLY_HERE "only here": 1 "bytes" U, 2 "files" U);
 rec!(PAIR_AGAIN "pair again": 1 "key" B, 2 "name" T);
-rec!(PAIRING "pairing": 1 "admin" T, 2 "code" T, 3 "error" T, 4 "state" T);
+rec!(PAIRING "pairing": 1 "admin" T, 2 "code" T, 3 "error" T, 4 "state" T, 5 "power" T);
 rec!(PEER "peer": 1 "addr" T, 2 "device" T);
 rec!(PLACE "place": 1 "kind" T, 2 "name" T, 3 "who" B);
 rec!(PROGRESS "progress":
@@ -485,9 +486,9 @@ pub static REQUESTS: &[Request] = &[
     req!(12 "device-rename" (1 "device" REF, 2 "name" T) -> (2 "key" B, 3 "name" T)),
     req!(13 "remove-device" (1 "who" REF, 2 "lost" BOOL, 3 "words" T) -> (
         2 "dropped" U, 3 "name" T)),
-    req!(14 "pair-show" (1 "admin" BOOL, 2 "device" T) -> (2 "addrs" [T], 3 "code" T)),
+    req!(14 "pair-show" (1 "admin" (gone BOOL), 2 "device" T) -> (2 "addrs" [T], 3 "code" T)),
     req!(15 "pair-status" () -> (
-        2 "admin" T, 3 "code" T, 4 "error" T, 5 "files" BOOL, 6 "state" T)),
+        2 "admin" T, 3 "code" T, 4 "error" T, 5 "files" BOOL, 6 "state" T, 7 "power" T)),
     req!(16 "pair-type" (1 "code" T, 2 "at" T, 3 "admin" BOOL, 4 "words" T, 5 "device" T) -> (
         2 "name" T)),
     // ---- People, conversations and invitations: 30 to 69 ----
@@ -638,7 +639,8 @@ pub static REQUESTS: &[Request] = &[
         7 "on" BOOL, 8 "protocol" T, 9 "seconds_left" U, 10 "this_device" BOOL)),
     req!(181 "bluetooth" (1 "mode" T) -> (
         2 "available" BOOL, 3 "channels_in" U, 4 "error" T, 5 "mode" T, 6 "on" BOOL, 7 "psm" U,
-        8 "radio" T, 9 "recognized" U, 10 "seen" U, 11 "why_not" T, 12 "windows" U)),
+        8 "radio" T, 9 "recognized" U, 10 "seen" U, 11 "why_not" T, 12 "windows" U,
+        13 "too_old" BOOL)),
     req!(182 "network" (1 "mine" BOOL, 2 "name" T) -> (
         2 "answered" BOOL, 3 "ask" BOOL, 4 "known" BOOL, 5 "mine" BOOL, 6 "name" T,
         7 "router" T, 8 "routers" BOOL)),

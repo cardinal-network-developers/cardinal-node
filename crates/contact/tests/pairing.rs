@@ -5,11 +5,14 @@ use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use cardinal_contact::ble::{BoxChannel, MemoryEther, Radio};
 use cardinal_contact::discovery::{
     advertise_device, advertise_pairing, find_pairing, DeviceBrowser,
 };
 use cardinal_contact::mdns::{open_socket, MdnsConfig};
-use cardinal_contact::pairing::{proof_message, POWER_DEVICE};
+use cardinal_contact::pairing::{
+    is_pairing_message, pair_typer_on, proof_message, read_message, POWER_ADMIN, POWER_DEVICE,
+};
 use cardinal_contact::{
     pair_typer, ContactError, DeviceEnroller, EndpointAddr, LocalDevice, NewDevice, PairRole,
     PairingCode, Shower,
@@ -61,7 +64,7 @@ impl Dev {
             link_key: self.key.public_key().clone(),
             link_endpoint: EndpointAddr::new(CarrierKind::Tcp, self.endpoint.tcp_addr().unwrap()),
             name: name.into(),
-            join_power: POWER_DEVICE,
+            adds_at: self.identity.map(|_| POWER_DEVICE),
         }
     }
 }
@@ -97,6 +100,7 @@ async fn add_own_device_by_pairing() {
         pair_typer(&me, &typed, addr, Duration::from_secs(5))
     );
     let (s, t) = (s.unwrap(), t.unwrap());
+    assert_eq!(s.joins_at, Some(POWER_DEVICE), "the new device was told");
     assert_eq!(s.role, PairRole::Shower);
     assert_eq!(t.role, PairRole::Typer);
     assert_eq!(*s.link_secret, *t.link_secret);
@@ -294,4 +298,215 @@ async fn pairing_found_by_mdns() {
     };
     let (s, t) = tokio::join!(shower.run(), typer);
     assert!(s.is_ok() && t.unwrap().new_device.is_some());
+}
+
+#[tokio::test]
+async fn the_admin_names_the_power_and_the_new_device_signs_exactly_that() {
+    let admin = dev(9, Some([0xdd; 32])).await;
+    let fresh = dev(10, None).await;
+    let shower = Shower::bind(fresh.local("server"), "127.0.0.1:0".parse().unwrap(), None)
+        .await
+        .unwrap();
+    let code = shower.code().clone();
+    let addr = shower.local_addr().unwrap();
+    let mut me = admin.local("desktop");
+    me.adds_at = Some(POWER_ADMIN);
+    let (s, t) = tokio::join!(
+        shower.run(),
+        pair_typer(&me, &code, addr, Duration::from_secs(5))
+    );
+    let (s, t) = (s.unwrap(), t.unwrap());
+    assert_eq!(s.joins_at, Some(POWER_ADMIN));
+    let nd = t.new_device.unwrap();
+    assert_eq!(nd.power, POWER_ADMIN);
+    assert!(nd.verify());
+    // The same proof does not stand for another power.
+    let other = cardinal_contact::NewDevice {
+        power: POWER_DEVICE,
+        ..nd
+    };
+    assert!(!other.verify());
+}
+
+#[tokio::test]
+async fn a_typer_that_names_no_power_ends_the_pairing() {
+    let admin = dev(11, Some([0xde; 32])).await;
+    let fresh = dev(12, None).await;
+    let shower = Shower::bind(fresh.local("phone"), "127.0.0.1:0".parse().unwrap(), None)
+        .await
+        .unwrap();
+    let code = shower.code().clone();
+    let addr = shower.local_addr().unwrap();
+    let mut me = admin.local("desktop");
+    me.adds_at = None;
+    let (s, t) = tokio::join!(
+        shower.run(),
+        pair_typer(&me, &code, addr, Duration::from_secs(2))
+    );
+    assert!(
+        matches!(s, Err(ContactError::Malformed(w)) if w.contains("power")),
+        "{s:?}"
+    );
+    assert!(t.is_err());
+}
+
+/// A shower over Bluetooth: channels opened to `radio`'s PSM whose first
+/// message is pairing's go to the shower, the others nowhere.
+async fn ble_shower(
+    shower: Shower,
+    radio: &cardinal_contact::ble::MemoryRadio,
+) -> (
+    u16,
+    tokio::task::JoinHandle<Result<cardinal_contact::Paired, ContactError>>,
+) {
+    let mut l = radio.listen().await.unwrap();
+    let (tx, rx) = tokio::sync::mpsc::channel(4);
+    let psm = l.psm;
+    tokio::spawn(async move {
+        let _guard = l.guard;
+        while let Some((_, mut ch)) = l.incoming.recv().await {
+            let Ok(first) = read_message(&mut ch).await else {
+                continue;
+            };
+            if is_pairing_message(&first) {
+                let _ = tx.send((ch, first)).await;
+            }
+        }
+    });
+    (psm, tokio::spawn(shower.with_channels(rx).run()))
+}
+
+#[tokio::test]
+async fn pairing_over_bluetooth_and_the_link_session_on_the_same_channel() {
+    let admin = dev(13, Some([0xe1; 32])).await;
+    let fresh = dev(14, None).await;
+    let ether = MemoryEther::new();
+    let (near, far) = (ether.radio(), ether.radio());
+    let shower = Shower::bind(fresh.local("phone"), "127.0.0.1:0".parse().unwrap(), None)
+        .await
+        .unwrap();
+    let code = shower.code().clone();
+    let (psm, run) = ble_shower(shower, &far).await;
+    let mut ch: BoxChannel = near.connect(far.addr(), psm).await.unwrap();
+    let t = pair_typer_on(
+        &admin.local("laptop"),
+        &code,
+        &mut ch,
+        Duration::from_secs(5),
+    )
+    .await
+    .unwrap();
+    let mut s = run.await.unwrap().unwrap();
+    assert_eq!(s.joins_at, Some(POWER_DEVICE));
+    assert!(t.new_device.as_ref().unwrap().verify());
+    // The link session runs over the same channel.
+    fresh.endpoint.add_secret(s.secret_entry());
+    let on_s = fresh
+        .endpoint
+        .attach(s.channel.take().unwrap(), CarrierKind::Ble, "pairing");
+    let on_t = admin.endpoint.attach(ch, CarrierKind::Ble, "pairing");
+    let (a, b) = tokio::join!(
+        admin
+            .endpoint
+            .connect_on(&on_t, t.target_on(CarrierKind::Ble)),
+        fresh.endpoint.accept()
+    );
+    let (a, b) = (a.unwrap(), b.unwrap());
+    assert!(on_s.carries(&b));
+    assert_eq!(b.peer_identity().unwrap().identity, [0xe1; 32]);
+    let mut st = a.open_stream(Service::SYNC, Priority::Background).unwrap();
+    st.write_all(b"identity log").await.unwrap();
+    st.shutdown().await.unwrap();
+    let mut r = b.accept_stream().await.unwrap();
+    let mut got = Vec::new();
+    r.read_to_end(&mut got).await.unwrap();
+    assert_eq!(got, b"identity log");
+}
+
+#[tokio::test]
+async fn three_wrong_codes_over_bluetooth_and_the_lan_together_end_the_code() {
+    let admin = dev(15, Some([0xe2; 32])).await;
+    let fresh = dev(16, None).await;
+    let ether = MemoryEther::new();
+    let (near, far) = (ether.radio(), ether.radio());
+    let mut shower = Shower::bind(fresh.local("phone"), "127.0.0.1:0".parse().unwrap(), None)
+        .await
+        .unwrap();
+    shower.attempt_timeout = Duration::from_secs(2);
+    let code = shower.code().clone();
+    let addr = shower.local_addr().unwrap();
+    let (psm, run) = ble_shower(shower, &far).await;
+    let wrong = |i: u16| {
+        let mut w = code.clone();
+        w.words[0] = (w.words[0] + 1 + i) % 2048;
+        w
+    };
+    // Two wrong over Bluetooth, each closing its channel.
+    for i in 0..2 {
+        let mut ch = near.connect(far.addr(), psm).await.unwrap();
+        let r = pair_typer_on(
+            &admin.local("laptop"),
+            &wrong(i),
+            &mut ch,
+            Duration::from_secs(3),
+        )
+        .await;
+        assert!(matches!(r, Err(ContactError::WrongCode)), "{i}: {r:?}");
+    }
+    // The third, on the LAN, is the last.
+    let r = pair_typer(
+        &admin.local("laptop"),
+        &wrong(2),
+        addr,
+        Duration::from_secs(3),
+    )
+    .await;
+    assert!(matches!(r, Err(ContactError::WrongCode)), "{r:?}");
+    let r = tokio::time::timeout(Duration::from_secs(3), run)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(matches!(r, Err(ContactError::TooManyAttempts)), "{r:?}");
+    // The right code finds nobody now.
+    let late = near.connect(far.addr(), psm).await;
+    if let Ok(mut ch) = late {
+        let r = pair_typer_on(
+            &admin.local("laptop"),
+            &code,
+            &mut ch,
+            Duration::from_secs(1),
+        )
+        .await;
+        assert!(r.is_err());
+    }
+}
+
+#[tokio::test]
+async fn a_right_code_over_bluetooth_after_two_wrong_ones_pairs() {
+    let admin = dev(17, Some([0xe3; 32])).await;
+    let fresh = dev(18, None).await;
+    let ether = MemoryEther::new();
+    let (near, far) = (ether.radio(), ether.radio());
+    let shower = Shower::bind(fresh.local("phone"), "127.0.0.1:0".parse().unwrap(), None)
+        .await
+        .unwrap();
+    let code = shower.code().clone();
+    let (psm, run) = ble_shower(shower, &far).await;
+    for i in 0..2u16 {
+        let mut w = code.clone();
+        w.words[1] = (w.words[1] + 1 + i) % 2048;
+        let mut ch = near.connect(far.addr(), psm).await.unwrap();
+        let r = pair_typer_on(&admin.local("laptop"), &w, &mut ch, Duration::from_secs(3)).await;
+        assert!(matches!(r, Err(ContactError::WrongCode)), "{r:?}");
+    }
+    let mut ch = near.connect(far.addr(), psm).await.unwrap();
+    let t = pair_typer_on(
+        &admin.local("laptop"),
+        &code,
+        &mut ch,
+        Duration::from_secs(5),
+    )
+    .await;
+    assert!(t.unwrap().new_device.is_some());
+    assert!(run.await.unwrap().is_ok());
 }

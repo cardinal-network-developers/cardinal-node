@@ -289,10 +289,11 @@ impl StreamState {
 
     fn recv_done(&self) -> bool {
         // A stream reset only locally is kept until the peer's fin or
-        // reset arrives: data the peer sent before it learned of the
-        // reset still counts against the session window, so it is
-        // counted as consumed when it arrives (else the peer's credit
-        // leaks away and the session stalls).
+        // reset says how much it sent: data the peer sent before it
+        // learned of the reset counts against the session window, as
+        // consumed when it arrives, and what never arrives once the final
+        // size is known (else the peer's credit leaks away and the
+        // session stalls).
         self.reset_remote.is_some() || self.recv_fin.is_some_and(|f| self.recv_read >= f)
     }
 
@@ -829,7 +830,15 @@ impl Conn {
                     self.close_local(CloseReason::Protocol(e.into()));
                 }
             }
-            Frame::Reset { id, reason } => self.on_reset(id, reason),
+            Frame::Reset {
+                id,
+                reason,
+                final_size,
+            } => {
+                if let Err(e) = self.on_reset(id, reason, final_size) {
+                    self.close_local(CloseReason::Protocol(e.into()));
+                }
+            }
             Frame::Window { id, max } => {
                 if id == 0 {
                     self.session_send_max = self.session_send_max.max(max);
@@ -1171,80 +1180,160 @@ impl Conn {
         }
     }
 
-    fn on_reset(&mut self, id: u64, reason: u64) {
-        // A stream reset before any of its data arrived has ended.
-        self.peer_unopened.remove(&id);
-        if let Some(s) = self.streams.get_mut(&id) {
-            if s.reset_remote.is_none() {
-                s.reset_remote = Some(reason);
-                // Echo the reset if this side was still sending, so the
-                // peer knows when the last of that data has arrived.
-                let echo = !s.reset_local && !s.fin_sent;
-                let unread = s.discard_received();
-                self.session_consumed += unread;
-                let s = self.streams.get_mut(&id).expect("stream");
-                if echo {
-                    s.reset_local = true;
-                    self.control.push_back(Frame::Reset { id, reason });
-                    self.signals.driver.notify_one();
-                }
-                self.update_session_window();
-                let s = self.streams.get_mut(&id).expect("stream");
-                s.send_buf.clear();
-                s.retx = RangeSet::new();
-                if let Some(w) = s.read_waker.take() {
-                    w.wake();
-                }
-                if let Some(w) = s.write_waker.take() {
-                    w.wake();
-                }
-            }
+    /// Whether a frame for peer stream `id`, not held now, opens it: one
+    /// never seen, or a lower id a higher one opened (as in QUIC). An id
+    /// seen and gone is a stream that has ended. Notes the id as seen.
+    fn opens_peer_stream(&mut self, id: u64) -> Result<bool, &'static str> {
+        if id <= self.highest_peer_stream {
+            return Ok(self.peer_unopened.remove(&id));
         }
+        let first = if self.highest_peer_stream == 0 {
+            if id % 2 == 1 {
+                1
+            } else {
+                2
+            }
+        } else {
+            self.highest_peer_stream + 2
+        };
+        if (id - first) / 2 > MAX_INCOMING_STREAMS as u64 {
+            return Err("stream id skips too many streams");
+        }
+        self.peer_unopened.extend((first..id).step_by(2));
+        if self.peer_unopened.len() > MAX_INCOMING_STREAMS {
+            return Err("too many streams not yet opened");
+        }
+        self.highest_peer_stream = id;
+        Ok(true)
+    }
+
+    fn is_local_stream(&self, id: u64) -> bool {
+        let local_parity = if self.role == Role::Initiator { 1 } else { 0 };
+        id % 2 == local_parity
+    }
+
+    /// `n` more bytes of the peer's, received and consumed at once: they
+    /// will never be read, and count against the session window all the
+    /// same, so that the peer's credit comes back.
+    fn count_unread(&mut self, n: u64) -> Result<(), &'static str> {
+        self.session_recv_total += n;
+        if self.session_recv_total > self.session_recv_max {
+            return Err("session flow control");
+        }
+        self.session_consumed += n;
+        Ok(())
+    }
+
+    /// The peer reset a stream, having sent `final_size` bytes on it
+    /// (`link.md#frames`, as QUIC's RESET_STREAM): whatever of that has not
+    /// arrived counts against the session window now, and anything
+    /// arriving later is dropped. A side still sending answers with its
+    /// own reset, so the other learns its final size too.
+    fn on_reset(&mut self, id: u64, reason: u64, final_size: u64) -> Result<(), &'static str> {
+        if id == 0 {
+            return Err("stream id 0");
+        }
+        if !self.streams.contains_key(&id) {
+            // Ours and gone, or the peer's and ended: counted already.
+            if self.is_local_stream(id) || !self.opens_peer_stream(id)? {
+                return Ok(());
+            }
+            // Reset before any of its data arrived: all of it counts, and
+            // the stream has ended. This side sent nothing on it.
+            if final_size > STREAM_WINDOW {
+                return Err("stream flow control");
+            }
+            self.count_unread(final_size)?;
+            self.control.push_back(Frame::Reset {
+                id,
+                reason,
+                final_size: 0,
+            });
+            self.signals.driver.notify_one();
+            self.update_session_window();
+            return Ok(());
+        }
+        let reliable = self.reliable;
+        let s = self.streams.get_mut(&id).expect("stream");
+        if s.reset_remote.is_some() {
+            return Ok(());
+        }
+        if final_size < s.recv_highest {
+            return Err("reset below data received");
+        }
+        if s.recv_fin.is_some_and(|f| f != final_size) {
+            return Err("reset and fin differ");
+        }
+        if final_size > s.recv_max {
+            return Err("stream flow control");
+        }
+        let late = final_size - s.recv_highest;
+        s.recv_highest = final_size;
+        s.recv_fin = Some(final_size);
+        s.reset_remote = Some(reason);
+        if !s.local && !s.announced {
+            // Its first frame, which names its service, will not come now:
+            // nobody is told of it, and it goes once done.
+            s.announced = true;
+            s.handle_dropped = true;
+        }
+        let unread = s.discard_received();
+        // Answer if this side was still sending, with how much it sent:
+        // not where its fin went out and arrives as surely as this reset.
+        let delivered = s.fin_sent && (reliable || s.fin_acked);
+        let echo = (!s.reset_local && !delivered).then_some(s.send_next);
+        if echo.is_some() {
+            s.reset_local = true;
+        }
+        s.send_buf.clear();
+        s.retx = RangeSet::new();
+        if let Some(w) = s.read_waker.take() {
+            w.wake();
+        }
+        if let Some(w) = s.write_waker.take() {
+            w.wake();
+        }
+        self.session_recv_total += late;
+        if self.session_recv_total > self.session_recv_max {
+            return Err("session flow control");
+        }
+        self.session_consumed += unread;
+        if let Some(sent) = echo {
+            self.control.push_back(Frame::Reset {
+                id,
+                reason,
+                final_size: sent,
+            });
+            self.signals.driver.notify_one();
+        }
+        self.update_session_window();
         self.gc_streams();
+        Ok(())
     }
 
     fn on_stream_frame(&mut self, f: StreamFrame) -> Result<(), &'static str> {
         if f.id == 0 {
             return Err("stream id 0");
         }
-        let local_parity = if self.role == Role::Initiator { 1 } else { 0 };
-        let is_local = f.id % 2 == local_parity;
+        let is_local = self.is_local_stream(f.id);
         if !self.streams.contains_key(&f.id) {
-            if is_local || (f.id <= self.highest_peer_stream && !self.peer_unopened.contains(&f.id))
-            {
+            if is_local || !self.opens_peer_stream(f.id)? {
                 return Ok(()); // A stream that has ended.
-            }
-            if f.id > self.highest_peer_stream {
-                let first = if self.highest_peer_stream == 0 {
-                    if f.id % 2 == 1 {
-                        1
-                    } else {
-                        2
-                    }
-                } else {
-                    self.highest_peer_stream + 2
-                };
-                if (f.id - first) / 2 > MAX_INCOMING_STREAMS as u64 {
-                    return Err("stream id skips too many streams");
-                }
-                self.peer_unopened.extend((first..f.id).step_by(2));
-                if self.peer_unopened.len() > MAX_INCOMING_STREAMS {
-                    return Err("too many streams not yet opened");
-                }
-            } else {
-                self.peer_unopened.remove(&f.id);
             }
             let open = self.streams.values().filter(|s| !s.local).count();
             if open >= MAX_INCOMING_STREAMS {
+                // Refused, having sent nothing on it.
                 self.control.push_back(Frame::Reset {
                     id: f.id,
                     reason: 1,
+                    final_size: 0,
                 });
-                self.highest_peer_stream = self.highest_peer_stream.max(f.id);
-                // Kept as reset, to count its data against the window.
+                // Kept as reset, to count its data against the window
+                // until the peer says how much it sent.
                 self.streams.insert(
                     f.id,
                     StreamState {
+                        recv_max: STREAM_WINDOW,
                         reset_local: true,
                         handle_dropped: true,
                         announced: true,
@@ -1253,7 +1342,6 @@ impl Conn {
                 );
                 return self.on_stream_frame(f);
             }
-            self.highest_peer_stream = self.highest_peer_stream.max(f.id);
             self.streams.insert(
                 f.id,
                 StreamState {
@@ -1265,6 +1353,14 @@ impl Conn {
         }
         let s = self.streams.get_mut(&f.id).expect("stream");
         if s.reset_remote.is_some() {
+            // Counted when the reset came, up to the final size it gave.
+            let end = f
+                .offset
+                .checked_add(f.data.len() as u64)
+                .ok_or("offset overflow")?;
+            if s.recv_fin.is_some_and(|fin| end > fin) {
+                return Err("data after the final size");
+            }
             return Ok(());
         }
         if s.reset_local {
@@ -1273,6 +1369,14 @@ impl Conn {
                 .offset
                 .checked_add(f.data.len() as u64)
                 .ok_or("offset overflow")?;
+            if end > s.recv_max {
+                return Err("stream flow control");
+            }
+            if s.recv_fin
+                .is_some_and(|fin| end > fin || (f.fin && end != fin))
+            {
+                return Err("data after fin");
+            }
             if end > s.recv_highest {
                 let n = end - s.recv_highest;
                 s.recv_highest = end;
@@ -1595,11 +1699,16 @@ impl Conn {
             }
             s.reset_local = true;
             let unread = s.discard_received();
+            let final_size = s.send_next;
             s.send_buf.clear();
             s.retx = RangeSet::new();
             self.session_consumed += unread;
             self.update_session_window();
-            self.control.push_back(Frame::Reset { id, reason });
+            self.control.push_back(Frame::Reset {
+                id,
+                reason,
+                final_size,
+            });
             self.signals.driver.notify_one();
         }
         self.gc_streams();

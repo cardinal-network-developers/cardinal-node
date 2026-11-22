@@ -43,9 +43,6 @@ const CONTACT_STREAMS: usize = 32;
 const MAX_FETCHED: usize = 64 * 1024 * 1024;
 /// How long one request may take.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
-/// How long one blob request (at most 4 MiB) may take before it is
-/// retried.
-const BLOB_TIMEOUT: Duration = Duration::from_secs(20);
 
 pub(crate) fn to_value(m: &Message) -> Value {
     Value::Record(m.to_record())
@@ -764,7 +761,10 @@ async fn serve_blob(d: &Arc<Daemon>, mut st: Stream) -> anyhow::Result<()> {
 }
 
 /// Asks one device for objects on the `blob` service: one request, one
-/// reply. Used by fetches and by copy checks alike.
+/// reply. Used by fetches and by copy checks alike. It waits as long as
+/// the session lasts: there is no reply for busy, and no fixed time;
+/// the caller moves on by what it learned of the device
+/// ([`crate::sched::PeerStats::expect`]).
 pub(crate) async fn blob_request(
     s: &Session,
     ids: Vec<[u8; 32]>,
@@ -776,9 +776,9 @@ pub(crate) async fn blob_request(
         .await?;
     st.shutdown().await?;
     tracing::trace!("blob request on stream {}", st.id());
-    let body = tokio::time::timeout(BLOB_TIMEOUT, st.recv_message_bytes_max(MAX_MESSAGE))
-        .await
-        .map_err(|_| anyhow::anyhow!("timed out"))??
+    let body = st
+        .recv_message_bytes_max(MAX_MESSAGE)
+        .await?
         .ok_or_else(|| anyhow::anyhow!("no reply"))?;
     Ok(BlobReply::decode(&body)?)
 }
@@ -849,6 +849,9 @@ pub struct BlobFetch {
     sessions: HashMap<[u8; 32], Session>,
     peers_checked: Option<Instant>,
     inflight: tokio::task::JoinSet<BlobDone>,
+    /// The requests in flight, to drop one whose objects all came from
+    /// elsewhere.
+    handles: HashMap<u64, tokio::task::AbortHandle>,
     ready: VecDeque<BlobEvent>,
     /// A contact whose devices may hold what is wanted too.
     from: Option<[u8; 32]>,
@@ -864,6 +867,7 @@ impl BlobFetch {
             sessions: HashMap::new(),
             peers_checked: None,
             inflight: tokio::task::JoinSet::new(),
+            handles: HashMap::new(),
             ready: VecDeque::new(),
             from: None,
         }
@@ -946,7 +950,7 @@ impl BlobFetch {
                 );
             }
             let priority = self.priority;
-            self.inflight.spawn(async move {
+            let h = self.inflight.spawn(async move {
                 let result = blob_request(&s, r.ids, priority).await;
                 BlobDone {
                     request: r.id,
@@ -954,6 +958,15 @@ impl BlobFetch {
                     result,
                 }
             });
+            self.handles.insert(r.id, h);
+        }
+        // A late request whose objects all came from another holder: its
+        // stream is dropped, and its device's room freed.
+        for rid in self.sched.moot() {
+            if let Some(h) = self.handles.remove(&rid) {
+                h.abort();
+            }
+            self.sched.cancel(rid, Instant::now());
         }
         let gone = self.sched.take_unavailable();
         if !gone.is_empty() {
@@ -962,6 +975,7 @@ impl BlobFetch {
     }
 
     fn done(&mut self, r: BlobDone) {
+        self.handles.remove(&r.request);
         let now = Instant::now();
         let mut received = 0;
         match r.result {
