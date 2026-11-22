@@ -254,11 +254,21 @@ pub async fn sync_all(d: &Arc<Daemon>, s: &Session) {
         PeerKind::Own(k) | PeerKind::Contact(_, k) => Some(k),
         _ => None,
     };
-    let mut read = !labels.is_empty();
+    let mut read = false;
     for label in labels {
         let mine = crate::mailbox::written_here(d, &label);
         let done = reconcile(d, s, label).await;
-        read &= done.is_ok();
+        // One set reconciled with no protocol error: whatever could not be
+        // read before can be now (`unreadable.rs`). Another set failing
+        // for its own reasons, such as access, says nothing of that.
+        if let Some(k) = device.filter(|_| !read && done.is_ok()) {
+            if crate::unreadable::reads_again(s.close_reason().as_ref()) {
+                read = true;
+                if d.unreadable.synced(&k) {
+                    tracing::info!("{} reads this device again", short(&s.peer_static()));
+                }
+            }
+        }
         match done {
             Ok(()) => {
                 if let Some(member) = member {
@@ -270,13 +280,6 @@ pub async fn sync_all(d: &Arc<Daemon>, s: &Session) {
                 short(&label),
                 short(&s.peer_static())
             ),
-        }
-    }
-    // Every set reconciled, and the session still open: whatever could not
-    // be read before can be now (`unreadable.rs`).
-    if let Some(k) = device.filter(|_| read && !s.is_closed()) {
-        if d.unreadable.synced(&k) {
-            tracing::info!("{} reads this device again", short(&s.peer_static()));
         }
     }
     // After this person's recovery: what they started and offered this

