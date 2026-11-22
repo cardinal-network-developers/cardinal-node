@@ -1691,6 +1691,65 @@ mod tests {
         assert_eq!(st.power(&d2.key()), None);
     }
 
+    /// An ML-KEM public key that fails the FIPS 203 input check (a
+    /// coefficient not below q) makes the op that carries it malformed, and
+    /// its entry invalid, whatever else is right in it: in an `add_key`'s
+    /// link key, whose proof is over exactly those bytes, and as the new key
+    /// of a `set_encryption_key`. The entry stays in the graph.
+    #[test]
+    fn a_malformed_ml_kem_key_makes_its_entry_invalid() {
+        use cardinal_encoding::Record;
+        let d1 = DeviceKeys::generate();
+        let Created { mut log, .. } =
+            IdentityLog::create_with(phrase(6), &d1, HybridKeyPair::generate()).unwrap();
+        let d2 = DeviceKeys::generate();
+        let good = d2.request(&log.id(), Power::Device);
+        let bad = |good: &HybridPublicKey| {
+            Record::new()
+                .with(1, *good.x25519())
+                .with(2, vec![0xffu8; cardinal_crypto::kem::PUBLIC_KEY_LEN])
+        };
+        let link = bad(&good.link_key);
+        assert!(HybridPublicKey::from_record(&link).is_err());
+        let id = log.id();
+        let add = |link: Record| {
+            let mut m = crate::entry::add_key_proof_message(&id, &d2.key(), 1, None);
+            m.extend(link.encode());
+            let proof = d2.signing.sign(&m);
+            IdentityOp::from_record(
+                Record::new()
+                    .with(0, 1u32)
+                    .with(1, d2.key())
+                    .with(2, 1u64)
+                    .with(3, link)
+                    .with(5, proof.to_vec()),
+            )
+        };
+        let op = add(link);
+        assert_eq!(op.body(), &OpBody::Malformed);
+        let e = log.append(&d1.signing, vec![op]).unwrap();
+        let st = log.state();
+        assert!(!st.is_valid(&e.id()));
+        assert_eq!(st.power(&d2.key()), None);
+        assert!(log.entries().any(|x| x.id() == e.id()), "kept in the graph");
+        // the same op with the key as it should be is valid
+        let op = add(good.link_key.to_record());
+        assert!(matches!(op.body(), OpBody::AddKey { .. }));
+        let e = log.append(&d1.signing, vec![op]).unwrap();
+        assert!(log.state().is_valid(&e.id()));
+        assert_eq!(log.state().power(&d2.key()), Some(Power::Device));
+        // a new encryption key that fails the check
+        let fresh = HybridKeyPair::generate();
+        let sek = IdentityOp::from_record(
+            Record::new()
+                .with(0, 3u32)
+                .with(1, bad(fresh.public_key())),
+        );
+        assert_eq!(sek.body(), &OpBody::Malformed);
+        let e = log.append(&d1.signing, vec![sek]).unwrap();
+        assert!(!log.state().is_valid(&e.id()));
+    }
+
     #[test]
     fn root_replacement_and_contest_freeze() {
         let d1 = DeviceKeys::generate();

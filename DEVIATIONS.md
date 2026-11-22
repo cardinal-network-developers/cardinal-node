@@ -326,6 +326,13 @@ below, each under its section.
   the entry from the graph, which would strand its descendants). The same
   applies to an `add_key` of a device or admin key without a link key, of a
   root without a recovery public key, or with a power outside 1–3.
+- **A malformed ML-KEM public key makes its entry invalid** (designer,
+  2026-11-22). A hybrid public key whose ML-KEM part fails the FIPS 203
+  input check, or has the wrong length, makes the op that carries it
+  malformed: an `add_key`'s link or recovery key, the new key of a
+  `set_encryption_key`, a policy's guardian key, a `recover`'s link or
+  recovery key. Its entry is invalid, and stays in the graph
+  (`log.rs`, `a_malformed_ml_kem_key_makes_its_entry_invalid`).
 - **Spec ambiguity: the proof message for a key without a link key.** Roots
   have no link key; chose to append nothing for "encoding of link key".
 - **Spec ambiguity: contexts in the genesis entry.** Wraps, recovery wraps,
