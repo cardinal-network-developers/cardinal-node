@@ -20,8 +20,10 @@
 //! devices first, and names only those that agree, so a token says nothing of
 //! who is online to anyone they would not talk to.
 //!
-//! Contacts are looked for only while in use (`sync.md#neighbours`): when
-//! this person turns to them, or has news for them, and a while after. A
+//! Contacts are looked for hard while in use (`sync.md#neighbours`): when
+//! this person turns to them, or has news for them, and a while after; the
+//! rest of the time a known path to each of their devices is kept
+//! (`known.rs`, D86). A
 //! person's own devices help with them too, the ones they are in touch with,
 //! so someone with no host of their own stays in touch with a few contacts'
 //! always-on devices and is found through those.
@@ -417,7 +419,7 @@ impl Rendezvous {
     }
 
     /// A step of the look for a contact under way.
-    fn step(&self, who: &[u8; 32], ok: Option<bool>, text: String) {
+    pub(crate) fn step(&self, who: &[u8; 32], ok: Option<bool>, text: String) {
         let mut trails = lock(&self.trails);
         let t = trails.entry(*who).or_default();
         if t.look.len() < STEPS {
@@ -484,6 +486,14 @@ impl Rendezvous {
     /// of their devices is open.
     pub fn look_every() -> Duration {
         REACH_EVERY
+    }
+
+    /// When this person last turned to each contact.
+    pub fn used_at(&self) -> HashMap<[u8; 32], Instant> {
+        lock(&self.in_use)
+            .iter()
+            .map(|(w, (t, _))| (*w, *t))
+            .collect()
     }
 
     /// Whether a contact is in use, and so to be looked for.
@@ -1088,7 +1098,7 @@ fn contact_incoming(d: &Arc<Daemon>, who: &[u8; 32], r: &Record) {
     let Some(at) = r.get(2).and_then(read_address) else {
         return;
     };
-    let Some((_, link)) = contact_device(d, who, &x) else {
+    let Some((device, link)) = contact_device(d, who, &x) else {
         return;
     };
     let trusted = d
@@ -1119,6 +1129,7 @@ fn contact_incoming(d: &Arc<Daemon>, who: &[u8; 32], r: &Record) {
     }
     // They turned to this person: look for them again if this goes.
     d.rendezvous.use_contact(who);
+    d.known.heard(&device);
     tracing::debug!("{} is looking for this device", short(&x));
     let d = d.clone();
     tokio::spawn(async move { punch(&d, &link, vec![at]).await });
@@ -1483,7 +1494,11 @@ async fn reach(d: &Arc<Daemon>, who: [u8; 32], space: SpaceId) {
             if usable.len() == 1 { "" } else { "es" }
         ),
     );
+    // Their own devices first: an anchor of this person's may be in touch.
     through_helpers(d, &who).await;
+    if !all_reached(d, &who) {
+        crate::known::try_paths(d, &who).await;
+    }
     tracing::debug!("looking for {} at {} hosts", short(&who), reach.len());
     for (r, addr) in usable {
         if all_reached(d, &who) {
@@ -1516,6 +1531,28 @@ async fn reach(d: &Arc<Daemon>, who: [u8; 32], space: SpaceId) {
             tracing::debug!("looking for {} at {addr}: {e:#}", short(&who));
         }
     }
+    // Last, when nothing found any of theirs: this device's own network,
+    // where multicast may not carry (`hosts.md#looking-for-someone`).
+    if !any_reached(d, &who) {
+        crate::known::sweep(d, who).await;
+    }
+}
+
+/// Whether any device of a contact's has a session that answers for it.
+fn any_reached(d: &Daemon, who: &[u8; 32]) -> bool {
+    let core = d.core();
+    let Some(o) = core.others.get(who) else {
+        return false;
+    };
+    let links: Vec<[u8; 32]> = o
+        .log
+        .state()
+        .keys
+        .values()
+        .filter_map(|k| Some(*k.link_key.as_ref()?.x25519()))
+        .collect();
+    drop(core);
+    links.iter().any(|x| reached(d, x))
 }
 
 fn plural(n: usize, what: &str) -> String {
@@ -1636,6 +1673,7 @@ async fn through_helpers(d: &Arc<Daemon>, who: &[u8; 32]) {
             let Some((device, link)) = contact_device(d, who, &f.device) else {
                 continue;
             };
+            d.known.heard(&device);
             if reached(d, link.x25519()) {
                 continue;
             }

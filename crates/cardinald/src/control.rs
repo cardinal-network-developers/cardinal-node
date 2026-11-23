@@ -438,6 +438,9 @@ async fn handle(d: &Arc<Daemon>, req: &Value) -> anyhow::Result<Value> {
         "network-changed" => {
             Ok(d.network_changed(req.get("why").and_then(|v| v.as_str()).unwrap_or("told")))
         }
+        // The device woke (D86): what a network change does, said by
+        // whatever sees it wake, as Android does for the app.
+        "wake" => Ok(d.network_changed("woke")),
         "flush" => {
             let d2 = d.clone();
             let n = tokio::task::spawn_blocking(move || -> anyhow::Result<usize> {

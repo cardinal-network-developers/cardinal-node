@@ -35,6 +35,7 @@ pub mod host;
 pub mod inspect;
 pub mod introductions;
 pub mod keys;
+pub mod known;
 pub mod lock;
 pub mod mailbox;
 pub mod mesh;

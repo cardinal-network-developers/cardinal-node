@@ -2494,6 +2494,14 @@ asks for around that is not built yet.
   a host for envelopes yet except itself, which lets go of them one by one.
 ## Hosts (`spec/hosts.md`)
 
+- **Known paths** (D86, `hosts.md#known-paths`; `known.rs`). The address
+  of a path is kept across restarts in `peers.json`, as other addresses
+  are, but only one a session this device opened worked at; when it was
+  confirmed is not kept, so after a restart every path is checked at once,
+  as on waking. Keepalives are every 20 s, as on every session, not
+  adapted to a NAT's timeout. Whether a device can receive connections is
+  read as whether it is a host of its own: any other reaches out on waking.
+  Neighbours in shared spaces still wait (see Sync).
 - **Only a person's own device is a host.** A device with `cardinal host`
   grants itself to its own identity, the case `hosts.md#grants` calls the
   common one. It holds spaces as any of the person's devices does, under

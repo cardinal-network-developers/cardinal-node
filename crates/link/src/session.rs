@@ -300,6 +300,17 @@ impl Session {
             .send_datagram(label, priority, data.into())
     }
 
+    /// Sends a ping after this long without sending, or none
+    /// (`hosts.md#devices-that-help`).
+    pub fn set_keepalive(&self, keepalive: Option<std::time::Duration>) {
+        self.inner.lock().set_keepalive(keepalive);
+    }
+
+    /// Whether this session sends keepalives, and how often.
+    pub fn keepalive(&self) -> Option<std::time::Duration> {
+        self.inner.lock().keepalive()
+    }
+
     /// Asks the peer for an answer now; without one in time the session ends
     /// (`Conn::check`).
     pub fn check(&self) {

@@ -355,6 +355,9 @@ rec!(MESSAGE "message":
     11 "text" T, 12 "time" U);
 rec!(NO_LONGER_NEEDED "no longer needed": 1 "at_ms" U, 2 "id" B, 3 "name" T, 4 "text" T);
 rec!(MET "met": 1 "by" T, 2 "group" T, 3 "how" T, 4 "via" T);
+rec!(KNOWN_PATH "known path":
+    1 "addr" T, 2 "checking" BOOL, 3 "confirmed_s_ago" U, 4 "misses" U, 5 "next_check_s" U,
+    6 "probes" U, 7 "wait_s" U);
 rec!(NEARBY "nearby": 1 "they_give_secret" BOOL, 2 "you_give_secret" BOOL);
 rec!(NETWORK "network":
     1 "answered" BOOL, 2 "ask" BOOL, 3 "known" BOOL, 4 "mine" BOOL, 5 "name" T, 6 "router" T,
@@ -384,7 +387,8 @@ rec!(SESSION_DEVICE "contact's device":
     1 "addr" T, 2 "bytes_received" U, 3 "bytes_sent" U, 4 "carrier" T, 5 "heard_ms_ago" U,
     6 "kept_in_touch" BOOL, 7 "key" B, 8 "online" BOOL, 9 "open_for_s" U, 10 "opened_by" T,
     11 "packets_dropped" U, 12 "packets_lost" U, 13 "route" T, 14 "rtt_ms" U,
-    15 "they_see_you_at" T, 16 "through" T, 17 "unreadable" {UNREADABLE});
+    15 "they_see_you_at" T, 16 "through" T, 17 "unreadable" {UNREADABLE},
+    18 "kept_alive_s" U, 19 "path" {KNOWN_PATH});
 rec!(SET_ASIDE "set aside": 1 "entry" B, 2 "space" B, 3 "time_ms" U);
 rec!(SPACE_USAGE "space usage":
     1 "full" BOOL, 2 "history_bytes" U, 3 "history_days" U, 4 "live_bytes" U, 5 "log_bytes" U,
@@ -746,6 +750,7 @@ pub static REQUESTS: &[Request] = &[
     paged!(after 224 "app-offers" (1 "after" U, 2 "limit" U) -> (
         2 "offers" [APP_OFFER], 3 "more" BOOL, 4 "next" U)),
     req!(225 "app-join" (1 "space" REF) -> (2 "space" B, 3 "name" T)),
+    req!(226 "wake" () -> (2 "checking" U)),
 ];
 
 // ---- What the service's program says without starting ----

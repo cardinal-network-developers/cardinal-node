@@ -120,6 +120,29 @@ fn link_subnets() -> Option<Vec<(Ipv4Addr, Ipv4Addr)>> {
     }
 }
 
+/// The subnets this device is on directly, where they can be read.
+pub fn subnets() -> Option<Vec<(Ipv4Addr, Ipv4Addr)>> {
+    link_subnets()
+}
+
+/// The addresses a sweep probes (`hosts.md#looking-for-someone`): every
+/// address of the subnet `own` is on, if that is a /23 or smaller, and
+/// otherwise of the /24 that holds it; never `own` itself, nor a subnet's
+/// first and last.
+pub fn sweep_range(own: Ipv4Addr, nets: &[(Ipv4Addr, Ipv4Addr)]) -> Vec<Ipv4Addr> {
+    let o = u32::from(own);
+    let (net, mask) = nets
+        .iter()
+        .map(|(n, m)| (u32::from(*n), u32::from(*m)))
+        .filter(|(n, m)| m.leading_ones() == m.count_ones() && m.count_ones() >= 23 && o & m == *n)
+        .max_by_key(|(_, m)| m.count_ones())
+        .unwrap_or((o & 0xffff_ff00, 0xffff_ff00));
+    (1..!mask)
+        .map(|h| Ipv4Addr::from(net | h))
+        .filter(|a| *a != own)
+        .collect()
+}
+
 /// One IPv4 route as Windows gives it (`MIB_IPFORWARD_ROW2`).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Route {
@@ -601,6 +624,30 @@ mod tests {
     /// routes being in a table of their own, so the routes name no subnet.
     /// A /23 such as the designer's counts whole, and an empty list is no
     /// list: a private address counts, as where the routes cannot be read.
+    #[test]
+    fn a_sweep_covers_a_small_subnet_or_the_24_around_this_device() {
+        let own = Ipv4Addr::new(192, 168, 4, 17);
+        let small = [(
+            Ipv4Addr::new(192, 168, 4, 0),
+            Ipv4Addr::new(255, 255, 254, 0),
+        )];
+        let r = sweep_range(own, &small);
+        assert_eq!(r.len(), 509, "a /23 but its first, last and this device");
+        assert!(r.contains(&Ipv4Addr::new(192, 168, 5, 200)));
+        assert!(!r.contains(&own));
+        let big = [(Ipv4Addr::new(10, 0, 0, 0), Ipv4Addr::new(255, 0, 0, 0))];
+        let r = sweep_range(Ipv4Addr::new(10, 1, 2, 3), &big);
+        assert_eq!(r.len(), 253);
+        assert!(r.iter().all(|a| a.octets()[..3] == [10, 1, 2]));
+        // unknown: the /24
+        assert_eq!(sweep_range(Ipv4Addr::new(127, 0, 0, 1), &[]).len(), 253);
+        let host = [(
+            Ipv4Addr::new(10, 9, 9, 9),
+            Ipv4Addr::new(255, 255, 255, 255),
+        )];
+        assert!(sweep_range(Ipv4Addr::new(10, 9, 9, 9), &host).is_empty());
+    }
+
     #[test]
     fn no_subnet_on_the_link_says_nothing_of_it() {
         let header =

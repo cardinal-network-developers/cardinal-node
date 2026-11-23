@@ -818,3 +818,85 @@ fn a_ring_finds_a_device_that_moved_while_its_old_session_looks_open() {
     ask(&ana, json!({"cmd": "call-answer"}));
     wait("bo hears the answer", 10, || standing(&bo) == "live");
 }
+
+/// The status of a contact as one device sees them.
+fn status_of(d: &Dev, who: &str) -> Value {
+    ask(d, json!({"cmd": "contact-status", "who": who}))
+}
+
+/// D86, 2026-11-23. Bo's phone, with no host, is on battery behind a
+/// router; Ana has no host either, but her desktop is plugged in, so it
+/// helps others: an anchor. When the phone wakes it reaches the anchor at
+/// the path it knows, and the anchor keeps that session alive while the
+/// phone sends no keepalive of its own. Ana's tablet, behind another
+/// router, asks her anchor for Bo (`connect` field 3), is introduced, and
+/// its message gets through. Before, nobody held a way to the phone, and
+/// with no host on either side the tablet could not find it.
+#[test]
+fn a_phone_that_wakes_reaches_a_contacts_anchor_and_is_found_through_it() {
+    if !fuse_available() {
+        eprintln!("skipping: /dev/fuse or fusermount3 is not available");
+        return;
+    }
+    let root = tempfile::tempdir().unwrap();
+    let mut ana = Dev::new(root.path(), "ana", free_port());
+    let mut tablet = Dev::new(root.path(), "tablet", free_port());
+    let mut bo = Dev::new(root.path(), "bo", free_port());
+    bo.env.push((BRIEFLY.0.into(), BRIEFLY.1.into()));
+    let (nt, nb) = (
+        Nat::new(Kind::PortRestricted),
+        Nat::new(Kind::PortRestricted),
+    );
+    ana.start();
+    ana.cli(&["init", "--yes", "--name", "ana"]);
+    ana.wait_mounted();
+    tablet.start();
+    pair(&ana, &tablet);
+    tablet.wait_mounted();
+    put_behind(&mut tablet, &nt);
+    bo.start();
+    bo.cli(&["init", "--yes", "--name", "bo"]);
+    bo.wait_mounted();
+    let at = format!("127.0.0.1:{}", ana.port);
+    let code = ana.cli(&["invite", "--address", &at, "--name", "Ana"]);
+    bo.cli(&["accept", code.trim(), "--name", "Ana"]);
+    wait("each lists the other", 30, || {
+        the_contact(&ana)["name"] == "bo" && the_contact(&bo)["name"] == "Ana"
+    });
+    wait("bo's phone knows a path to the anchor", 30, || {
+        status_of(&bo, "Ana")["devices"]
+            .as_array()
+            .is_some_and(|d| d.iter().any(|d| d["path"]["confirmed_s_ago"].is_u64()))
+    });
+    // Long enough that Bo turns to nobody.
+    std::thread::sleep(Duration::from_secs(5));
+
+    // The phone sleeps, and wakes behind a router, on battery.
+    moves_behind(&mut bo, &nb);
+    ask(
+        &bo,
+        json!({"cmd": "conditions", "plugged_in": false, "metered": false}),
+    );
+    wait("the phone reaches the anchor", 30, || connected(&ana));
+    let theirs = |d: &Dev, who: &str| {
+        let v = status_of(d, who);
+        let all = v["devices"].as_array().cloned().unwrap_or_default();
+        all.into_iter().find(|x| x["online"] == true)
+    };
+    let kept = |d: &Dev, who: &str| theirs(d, who).is_some_and(|x| x["kept_alive_s"].is_u64());
+    assert!(kept(&ana, "bo"), "{}", status_of(&ana, "bo"));
+    wait("the phone leaves the keepalives to the anchor", 30, || {
+        theirs(&bo, "Ana").is_some_and(|x| x["kept_alive_s"].is_null())
+    });
+
+    // Ana's tablet, behind its own router, writes to Bo: it asks the anchor.
+    tablet.cli(&["say", "bo", "through your anchor"]);
+    wait("bo reads it", 40, || {
+        bo.cli(&["messages", "Ana"]).contains("through your anchor")
+    });
+    assert!(
+        ana.log().contains("helping to 1 of"),
+        "the anchor did not introduce them"
+    );
+    assert!(kept(&ana, "bo"), "the anchor let the phone go");
+}

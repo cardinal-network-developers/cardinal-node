@@ -71,6 +71,8 @@ pub struct Conn {
 /// How long a device gets to answer over UDP before TCP is tried. Most of a
 /// failed attempt is an older device that does not listen there.
 const UDP_WITHIN: Duration = Duration::from_secs(2);
+/// How often a session kept for reachability pings (`link.md#keepalive-and-idle`).
+pub const KEEPALIVE: Duration = Duration::from_secs(20);
 /// How long it then gets over TCP. A device that does not answer is usually
 /// the wrong one, so what an address costs should stay small.
 const TCP_WITHIN: Duration = Duration::from_secs(3);
@@ -283,6 +285,8 @@ pub struct Daemon {
     saving_book: Mutex<()>,
     /// Rendezvous and relay, as a device and as a host.
     pub rendezvous: crate::rendezvous::Rendezvous,
+    /// The known paths to trusted contacts' devices (D86).
+    pub known: crate::known::Known,
     /// What this device, as a host, holds for its owner.
     pub mailbox: crate::mailbox::Mailbox,
     /// Pairing.
@@ -503,7 +507,7 @@ impl Daemon {
         ec.connect_timeout = Duration::from_secs(5);
         ec.allow_public = config.host;
         ec.session = SessionConfig {
-            keepalive: Some(Duration::from_secs(20)),
+            keepalive: Some(KEEPALIVE),
             software: Some(format!("cardinal {}", cardinal_update::VERSION)),
             ..SessionConfig::default()
         };
@@ -604,6 +608,7 @@ impl Daemon {
             personas: Mutex::new(HashMap::new()),
             saving_book: Mutex::new(()),
             rendezvous,
+            known: Default::default(),
             mailbox,
             copies: crate::copies::Tracker::load(copies_path, crate::copies::Rules::from_env()),
             cleanup: crate::cleanup::Cleaner::load(old_versions),
@@ -743,6 +748,7 @@ impl Daemon {
             s.check();
         }
         self.unreadable.network_changed();
+        self.known.woke();
         // A permit is kept if discovery is between rounds.
         self.rediscover.notify_one();
         // and the services of the personas this device acts as, which
@@ -2143,7 +2149,7 @@ impl Daemon {
         cfg
     }
 
-    async fn discovered(self: &Arc<Self>, addr: SocketAddr) {
+    pub(crate) async fn discovered(self: &Arc<Self>, addr: SocketAddr) {
         let devices: Vec<(KeyId, cardinal_crypto::HybridPublicKey)> = {
             let core = self.core();
             let Some(ident) = core.identity.as_ref() else {
@@ -2390,6 +2396,8 @@ impl Daemon {
             // Always, but for a helper: switched off now, on another
             // device it may be turned on.
             tokio::spawn(crate::portmap::keep(self.clone()));
+            // known paths to trusted contacts' devices, and probes (D86)
+            crate::known::start(self.clone());
             // a recovery through guardians under way goes on
             crate::recovering::resume(&self);
             // and this person's guardian personas act

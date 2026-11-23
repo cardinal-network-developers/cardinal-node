@@ -1902,6 +1902,7 @@ pub async fn status(
                     "key": hex::encode(&k[..8]),
                     "online": false,
                     "kept_in_touch": standing.contains(k),
+                    "path": d.known.json(k),
                     "unreadable": unreadable,
                 });
             };
@@ -1924,6 +1925,8 @@ pub async fn status(
                 "packets_lost": st.packets_lost,
                 "packets_dropped": st.packets_dropped,
                 "they_see_you_at": s.observed_addr().map(|a| a.to_string()),
+                "kept_alive_s": s.keepalive().map(|t| t.as_secs()),
+                "path": d.known.json(k),
                 "unreadable": unreadable,
             })
         })
@@ -1936,7 +1939,7 @@ pub async fn status(
     } else if in_use.is_some() {
         "while in use, every 30 s, until each of their devices has a session"
     } else {
-        "only when you message or call them, until you do"
+        "now and then at the last address that worked, and every 30 s once you message or call them"
     };
     let v = json!({
         "identity": hex::encode(&c.identity[..8]),

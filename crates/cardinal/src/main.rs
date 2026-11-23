@@ -4099,6 +4099,25 @@ fn unreadable_line(u: &serde_json::Value) -> String {
     out
 }
 
+/// The known path to a contact's device (D86), as a line.
+fn path_line(p: &serde_json::Value) -> String {
+    let Some(addr) = p["addr"].as_str() else {
+        return "      no known path\n".to_owned();
+    };
+    let confirmed = match p["confirmed_s_ago"].as_u64() {
+        Some(s) => format!("confirmed {}", secs_ago(s)),
+        None => "not confirmed yet".to_owned(),
+    };
+    let misses = match p["misses"].as_u64().unwrap_or(0) {
+        0 => String::new(),
+        n => format!(", {n} checks unanswered"),
+    };
+    format!(
+        "      known path {addr}, {confirmed}{misses}; next check in {} s\n",
+        p["next_check_s"].as_u64().unwrap_or(0)
+    )
+}
+
 fn contact_status(v: &serde_json::Value) -> String {
     let mut out = String::new();
     let mut head = printable(v["name"].as_str().unwrap_or(""));
@@ -4132,6 +4151,7 @@ fn contact_status(v: &serde_json::Value) -> String {
         let unread = unreadable_line(&dv["unreadable"]);
         if dv["online"] != true {
             out.push_str(&format!("  ○ {key}  no session{kept}\n"));
+            out.push_str(&path_line(&dv["path"]));
             out.push_str(&unread);
             continue;
         }
@@ -4165,6 +4185,9 @@ fn contact_status(v: &serde_json::Value) -> String {
         out.push('\n');
         if let Some(a) = dv["they_see_you_at"].as_str() {
             out.push_str(&format!("      they see you at {a}\n"));
+        }
+        if dv["kept_alive_s"].is_u64() {
+            out.push_str("      kept open: this device pings it\n");
         }
         out.push_str(&unread);
     }

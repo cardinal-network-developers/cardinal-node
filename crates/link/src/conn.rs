@@ -1771,6 +1771,21 @@ impl Conn {
     // ------------------------------------------------------------------
     // Timers.
 
+    /// Sends a ping after this long without sending, or none: a device that
+    /// does not help others leaves a contact's session to the other side
+    /// (`hosts.md#devices-that-help`).
+    pub fn set_keepalive(&mut self, keepalive: Option<Duration>) {
+        if self.config.keepalive != keepalive {
+            self.config.keepalive = keepalive;
+            self.signals.driver.notify_one();
+        }
+    }
+
+    /// Whether this session sends keepalives.
+    pub fn keepalive(&self) -> Option<Duration> {
+        self.config.keepalive
+    }
+
     /// Asks the peer for an answer now. On a session that watches for answers
     /// (`keepalive`), one that does not come within `answer_timeout` ends it:
     /// after the network changed, a session over the old one ends in seconds

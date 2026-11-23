@@ -39,6 +39,14 @@ pub const TYPE_COOKIE_REPLY: u8 = 3;
 pub const TYPE_DATA: u8 = 4;
 /// Relayed.
 pub const TYPE_RELAYED: u8 = 5;
+/// A probe, outside any session (`hosts.md#probe`).
+pub const TYPE_PROBE: u8 = 6;
+/// The answer to a probe.
+pub const TYPE_PROBE_ANSWER: u8 = 7;
+/// A probe's length.
+pub const PROBE_LEN: usize = 32;
+/// A probe answer's length.
+pub const PROBE_ANSWER_LEN: usize = 12;
 
 /// Field offsets of an initiation.
 pub mod init {

@@ -219,6 +219,88 @@ pub async fn find_pairing(
     .map_err(|_| ContactError::Timeout)?
 }
 
+// ---- probes (`hosts.md#probe`) ----
+
+use cardinal_link::packet::{PROBE_ANSWER_LEN, PROBE_LEN, TYPE_PROBE, TYPE_PROBE_ANSWER};
+
+/// The bytes a probe's tags are made over: its first 16.
+const PROBE_SIGNED: usize = 16;
+
+fn tag8(k: &[u8; 32], over: &[u8]) -> [u8; 8] {
+    let h = keyed_hash(k, over);
+    let mut t = [0u8; 8];
+    t.copy_from_slice(&h[..8]);
+    t
+}
+
+/// A probe: `6, 0, 0, 0`, `time` (u32, seconds since 1970), `nonce`, the
+/// own tag made with `own` (a discovery key), and the contact tag made with
+/// `contacts` (a presence key), or 8 zero bytes for none.
+pub fn probe(own: &[u8; 32], contacts: Option<&[u8; 32]>, time: u32, nonce: [u8; 8]) -> [u8; 32] {
+    let mut p = [0u8; PROBE_LEN];
+    p[0] = TYPE_PROBE;
+    p[4..8].copy_from_slice(&time.to_le_bytes());
+    p[8..16].copy_from_slice(&nonce);
+    let own_tag = tag8(own, &p[..PROBE_SIGNED]);
+    p[16..24].copy_from_slice(&own_tag);
+    if let Some(k) = contacts {
+        let theirs = tag8(k, &p[..PROBE_SIGNED]);
+        p[24..32].copy_from_slice(&theirs);
+    }
+    p
+}
+
+/// A probe as it came, if it is one: exactly 32 bytes, type 6, then three
+/// zero bytes. Anything else is no probe.
+pub fn read_probe(b: &[u8]) -> Option<[u8; 32]> {
+    if b.len() != PROBE_LEN || b[0] != TYPE_PROBE || b[1..4] != [0, 0, 0] {
+        return None;
+    }
+    b.try_into().ok()
+}
+
+/// A probe's time, in seconds since 1970.
+pub fn probe_time(p: &[u8; 32]) -> u32 {
+    u32::from_le_bytes([p[4], p[5], p[6], p[7]])
+}
+
+/// A probe's nonce.
+pub fn probe_nonce(p: &[u8; 32]) -> [u8; 8] {
+    let mut n = [0u8; 8];
+    n.copy_from_slice(&p[8..16]);
+    n
+}
+
+/// Whether a probe's own tag was made with `own`: one of this person's
+/// devices sent it.
+pub fn probe_from_own(p: &[u8; 32], own: &[u8; 32]) -> bool {
+    ct_eq(&tag8(own, &p[..PROBE_SIGNED]), &p[16..24])
+}
+
+/// Whether a probe's contact tag was made with `k`, a trusted contact's
+/// presence key. A probe with no contact tag matches none.
+pub fn probe_from_contact(p: &[u8; 32], k: &[u8; 32]) -> bool {
+    p[24..32] != [0u8; 8] && ct_eq(&tag8(k, &p[..PROBE_SIGNED]), &p[24..32])
+}
+
+/// The answer to a probe, made with `k`: the discovery key if the probe
+/// came from one of this person's devices, else this person's presence key.
+pub fn probe_answer(k: &[u8; 32], p: &[u8; 32]) -> [u8; 12] {
+    let mut a = [0u8; PROBE_ANSWER_LEN];
+    a[0] = TYPE_PROBE_ANSWER;
+    a[4..].copy_from_slice(&tag8(k, p));
+    a
+}
+
+/// Whether `a` answers probe `p` and was made with `k`. Only exactly 12
+/// bytes of type 7 with its three zero bytes can.
+pub fn answers(a: &[u8], p: &[u8; 32], k: &[u8; 32]) -> bool {
+    a.len() == PROBE_ANSWER_LEN
+        && a[0] == TYPE_PROBE_ANSWER
+        && a[1..4] == [0, 0, 0]
+        && ct_eq(&tag8(k, p), &a[4..])
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -249,5 +331,50 @@ mod tests {
         assert!(!check_tag_txt(OWN, &c, &t));
         assert!(!check_device_txt(&d, &t));
         assert!(!check_tag_txt(CONTACTS, &d, &t));
+    }
+    #[test]
+    fn a_probe_is_answered_only_with_the_right_secret() {
+        let own = [1u8; 32];
+        let theirs = [2u8; 32];
+        let p = probe(&own, Some(&theirs), 1_800_000_000, [9; 8]);
+        assert_eq!(read_probe(&p), Some(p));
+        assert_eq!(probe_time(&p), 1_800_000_000);
+        assert_eq!(probe_nonce(&p), [9; 8]);
+        assert!(probe_from_own(&p, &own));
+        assert!(!probe_from_own(&p, &theirs));
+        assert!(probe_from_contact(&p, &theirs));
+        assert!(!probe_from_contact(&p, &own));
+        let a = probe_answer(&theirs, &p);
+        assert!(answers(&a, &p, &theirs));
+        assert!(!answers(&a, &p, &own));
+        // To another probe, it is no answer.
+        let q = probe(&own, Some(&theirs), 1_800_000_000, [8; 8]);
+        assert!(!answers(&a, &q, &theirs));
+    }
+
+    #[test]
+    fn a_malformed_probe_or_answer_is_none() {
+        let p = probe(&[1; 32], None, 5, [3; 8]);
+        assert!(
+            !probe_from_contact(&p, &[0; 32]),
+            "no contact tag, no match"
+        );
+        let mut longer = p.to_vec();
+        longer.push(0);
+        assert_eq!(read_probe(&longer), None);
+        assert_eq!(read_probe(&p[..31]), None);
+        let mut padded = p;
+        padded[2] = 1;
+        assert_eq!(read_probe(&padded), None);
+        let mut typed = p;
+        typed[0] = 7;
+        assert_eq!(read_probe(&typed), None);
+        let a = probe_answer(&[1; 32], &p);
+        assert!(answers(&a, &p, &[1; 32]));
+        let mut off = a;
+        off[3] = 1;
+        assert!(!answers(&off, &p, &[1; 32]));
+        assert!(!answers(&a[..11], &p, &[1; 32]));
+        assert!(!answers(&[&a[..], &[0]].concat(), &p, &[1; 32]));
     }
 }

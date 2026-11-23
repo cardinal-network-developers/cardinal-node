@@ -302,7 +302,7 @@ impl Udp {
         }
     }
 
-    fn try_send_to(&self, packet: &[u8], addr: SocketAddr) {
+    pub(crate) fn try_send_to(&self, packet: &[u8], addr: SocketAddr) {
         let _ = match self.gateway {
             None => self.socket.try_send_to(packet, addr),
             Some(gateway) => {

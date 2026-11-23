@@ -314,7 +314,13 @@ pub(crate) struct EndpointInner {
     deferred: Mutex<Vec<Arc<SessionInner>>>,
     /// The channels this device forwards, as a host.
     relays: Mutex<HashMap<u32, Relay>>,
+    /// Where probes and their answers go (`hosts.md#probe`), if anyone
+    /// takes them.
+    probes: Mutex<Option<mpsc::Sender<(Vec<u8>, SocketAddr)>>>,
 }
+
+/// How many probes may wait to be looked at; more are dropped.
+const PROBES_WAITING: usize = 256;
 
 /// Waits until an attempt should stop, if it can be told to.
 async fn given_up(give_up: &mut Option<watch::Receiver<bool>>) {
@@ -459,6 +465,7 @@ impl Endpoint {
             weak: weak.clone(),
             deferred: Mutex::new(Vec::new()),
             relays: Mutex::new(HashMap::new()),
+            probes: Mutex::new(None),
         });
         if let Some(u) = udp {
             let h = spawn_udp(u, Arc::new(WeakIngress(Arc::downgrade(&inner))));
@@ -480,6 +487,22 @@ impl Endpoint {
             lock(&inner.tasks).push(h.abort_handle());
         }
         Ok(Endpoint { inner })
+    }
+
+    /// Probes and probe answers that come in over UDP, with where each came
+    /// from (`hosts.md#probe`). Only the latest receiver gets them; until
+    /// one is taken they are dropped, as are any beyond what waits.
+    pub fn probes(&self) -> mpsc::Receiver<(Vec<u8>, SocketAddr)> {
+        let (tx, rx) = mpsc::channel(PROBES_WAITING);
+        *lock(&self.inner.probes) = Some(tx);
+        rx
+    }
+
+    /// Sends a probe or an answer over UDP, outside any session.
+    pub fn send_probe(&self, packet: &[u8], to: SocketAddr) {
+        if let Some(u) = &self.inner.udp {
+            u.try_send_to(packet, to);
+        }
     }
 
     /// The bound UDP address.
@@ -909,6 +932,14 @@ impl EndpointInner {
             packet::TYPE_INITIATION => self.on_initiation(pkt, path),
             packet::TYPE_RESPONSE => self.on_response(pkt, path),
             packet::TYPE_COOKIE_REPLY => self.on_cookie_reply(pkt),
+            packet::TYPE_PROBE | packet::TYPE_PROBE_ANSWER => {
+                // Over UDP only: never relayed, never over TCP.
+                if let Path::Udp { addr, .. } = path {
+                    if let Some(tx) = lock(&self.probes).as_ref() {
+                        let _ = tx.try_send((pkt.to_vec(), *addr));
+                    }
+                }
+            }
             packet::TYPE_RELAYED => {
                 if let Some((channel, _)) = packet::parse_relayed(pkt) {
                     // As the host: on to the other side, as it came.
