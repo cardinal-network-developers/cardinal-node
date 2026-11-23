@@ -1137,6 +1137,7 @@ pub struct Hosting {
 pub fn hostings(space: &Space) -> Vec<Hosting> {
     let state = space.state();
     let dag = space.dag();
+    let members = space.validity().identities();
     let mut found: Vec<(Option<usize>, Hosting)> = state
         .children(&ROOT)
         .into_iter()
@@ -1155,7 +1156,8 @@ pub fn hostings(space: &Space) -> Vec<Hosting> {
                 offer: o.id,
                 host: o.creator,
                 serving,
-                accepted: of(HOST_ACCEPT).any(|c| c.creator != o.creator),
+                accepted: of(HOST_ACCEPT)
+                    .any(|c| c.creator != o.creator && members.contains(&c.creator)),
                 ended: of(HOST_END).next().is_some(),
             };
             (dag.position(&o.created_in), hosting)

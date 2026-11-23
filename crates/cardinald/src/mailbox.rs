@@ -45,6 +45,10 @@ const OUTSTANDING: usize = 256;
 const PER_DAY: u32 = 1024;
 /// How long an envelope waits for its owner, in seconds.
 const RETENTION: u64 = 30 * 24 * 60 * 60;
+/// Where envelopes wait until collected, as for a contact this device
+/// hosts: how long an owner device may go without fetching and still hold
+/// envelopes up.
+const FETCHER_GONE: u64 = 30 * 24 * 60 * 60;
 const DAY: u64 = 24 * 60 * 60;
 /// How often to look for something to deliver or collect, if nothing says so
 /// sooner.
@@ -83,6 +87,9 @@ pub(crate) const OP_ACK: u64 = 3;
 pub(crate) const OP_REGISTER: u64 = 4;
 pub(crate) const OP_REVOKE: u64 = 5;
 pub(crate) const OP_USAGE: u64 = 6;
+/// Sent by a contact's device that hosts this person, to their devices
+/// present there: an envelope waits (D87). No reply.
+pub(crate) const OP_WAITING: u64 = 7;
 pub(crate) const NOT_PERMITTED: u64 = 1;
 const FULL: u64 = 2;
 pub(crate) const UNKNOWN: u64 = 3;
@@ -147,6 +154,12 @@ pub struct Store {
     /// How long an envelope waits for its owner, in seconds: `None` until
     /// collected, as for a contact this device hosts (D87).
     retention: Option<u64>,
+    /// How long an owner device may go without fetching and still hold
+    /// envelopes up, in seconds.
+    fetchers_within: u64,
+    /// Whether the quota counts all tokens together, as for a contact this
+    /// device hosts, rather than each token alone.
+    whole: bool,
 }
 
 impl Store {
@@ -171,13 +184,32 @@ impl Store {
             saved,
             held,
             retention: Some(RETENTION),
+            fetchers_within: RETENTION,
+            whole: false,
         }
     }
 
-    /// The same, keeping each envelope until it is collected.
+    /// The same, as for a contact this device hosts (D87): each envelope
+    /// waits until it is collected, by the owner devices that fetched
+    /// within the last 30 days, and the quota counts all their tokens
+    /// together.
     pub(crate) fn until_collected(mut self) -> Store {
         self.retention = None;
+        self.fetchers_within = FETCHER_GONE;
+        self.whole = true;
         self
+    }
+
+    /// Forgets the owner devices not among `devices`, as those taken out
+    /// of the owner's log: they hold nothing up any longer.
+    pub(crate) fn keep_fetchers(&mut self, devices: &HashSet<KeyId>, now: u64) {
+        let before = self.saved.fetchers.len();
+        let keep: HashSet<String> = devices.iter().map(hex::encode).collect();
+        self.saved.fetchers.retain(|k, _| keep.contains(k));
+        if self.saved.fetchers.len() != before {
+            self.sweep(now);
+            let _ = self.save();
+        }
     }
 
     /// Envelopes waiting, under any token.
@@ -233,7 +265,8 @@ impl Store {
     }
 
     /// [`deposit`](Self::deposit), within a quota class's limits: envelopes
-    /// waiting and deposits a day under one token, `None` no limit.
+    /// waiting and deposits a day, `None` no limit; under one token, or
+    /// under all of them together for a contact this device hosts.
     pub(crate) fn deposit_within(
         &mut self,
         token: &Token,
@@ -254,8 +287,14 @@ impl Store {
         }
         let t = hex::encode(token);
         let today = self.saved.deposits.get(&t).copied().unwrap_or(0);
+        let (counted, waiting) = if self.whole {
+            let all: u32 = self.saved.deposits.values().sum();
+            (all, self.held.len())
+        } else {
+            (today, self.waiting_under(token))
+        };
         let over = |n: u64, limit: Option<u64>| limit.is_some_and(|l| n >= l);
-        if over(u64::from(today), per_day) || over(self.waiting_under(token) as u64, outstanding) {
+        if over(u64::from(counted), per_day) || over(waiting as u64, outstanding) {
             return Err(Refused::Full);
         }
         let held = Held {
@@ -318,10 +357,14 @@ impl Store {
     }
 
     /// Lets go of what every recent device has collected, and of what has
-    /// waited too long. A device gone longer than that holds nothing up.
+    /// waited too long. A device that has not fetched for a while holds
+    /// nothing up.
     fn sweep(&mut self, now: u64) {
         let recent = |at: u64| self.retention.is_none_or(|r| now.saturating_sub(at) < r);
-        self.saved.fetchers.retain(|_, f| recent(f.at));
+        let within = self.fetchers_within;
+        self.saved
+            .fetchers
+            .retain(|_, f| now.saturating_sub(f.at) < within);
         let collected = self.saved.fetchers.values().map(|f| f.acked).min();
         let gone: Vec<u64> = self
             .held
@@ -494,6 +537,12 @@ impl Mailbox {
         lock(&self.store).is_active(token)
     }
 
+    /// Tests: whether the holders of a token are let in.
+    #[cfg(test)]
+    pub(crate) fn admits(&self, token: &Token) -> bool {
+        lock(&self.secrets).values().any(|t| t == token)
+    }
+
     /// The token a session was opened with, if it was.
     pub fn token_of(&self, s: &Session) -> Option<Token> {
         match s.admission() {
@@ -575,6 +624,13 @@ pub async fn serve(d: &Arc<Daemon>, s: &Session, mut st: Stream) -> anyhow::Resu
     let Some(r) = v.as_record() else {
         return Ok(());
     };
+    // A contact's device that hosts this person says an envelope waits.
+    if r.get(0).and_then(Value::as_uint) == Some(OP_WAITING) {
+        if let PeerKind::Contact(who, _) = d.classify(s) {
+            crate::hosting::told_waiting(d, &who, &s.peer_static());
+        }
+        return Ok(());
+    }
     let reply = answer(d, s, r);
     st.send_message(&Value::Record(reply)).await?;
     st.shutdown().await?;
@@ -1787,12 +1843,14 @@ async fn collect(d: &Arc<Daemon>) {
 /// at a host of their own, and the host is told how far everything is
 /// taken. One that cannot be taken in yet holds back the acknowledgment of
 /// those after it, which are fetched again and taken in again, at no harm.
-pub(crate) async fn collect_at(d: &Arc<Daemon>, s: &Session) -> anyhow::Result<usize> {
+/// Gives how many were taken in, and whether any is held back so.
+pub(crate) async fn collect_at(d: &Arc<Daemon>, s: &Session) -> anyhow::Result<(usize, bool)> {
     let mut after = 0;
     let mut acked = None;
     let mut blocked = false;
     let mut taken = 0;
     loop {
+        let asked = after;
         let ask = Record::new().with(0, OP_FETCH).with(1, after);
         let reply = call(s, Service::MAILBOX, ask).await?;
         anyhow::ensure!(
@@ -1824,7 +1882,9 @@ pub(crate) async fn collect_at(d: &Arc<Daemon>, s: &Session) -> anyhow::Result<u
             }
         }
         let more = reply.get(2).and_then(Value::as_bool) == Some(true);
-        if list.is_empty() || !more {
+        // A host that says there is more and gives nothing past what it
+        // gave is not asked again.
+        if list.is_empty() || !more || after <= asked {
             break;
         }
     }
@@ -1836,7 +1896,7 @@ pub(crate) async fn collect_at(d: &Arc<Daemon>, s: &Session) -> anyhow::Result<u
         )
         .await?;
     }
-    Ok(taken)
+    Ok((taken, blocked))
 }
 
 /// What became of an envelope.
@@ -2251,6 +2311,76 @@ mod tests {
         let (rest, more) = s.fetch(&PHONE, last, 2);
         assert_eq!(rest.len(), 1);
         assert!(!more);
+    }
+
+    fn hosted_store() -> (tempfile::TempDir, Store) {
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = Store::load(dir.path().join("hosted")).until_collected();
+        s.register(&T);
+        (dir, s)
+    }
+
+    /// Review H2. For a contact this device hosts, an envelope waits until
+    /// collected, but not for a device that stopped fetching: after 30
+    /// days without a fetch it holds nothing up.
+    #[test]
+    fn a_hosted_device_that_stops_fetching_holds_nothing_up() {
+        let (_dir, mut s) = hosted_store();
+        s.fetch(&LAPTOP, 0, 1);
+        s.fetch(&PHONE, 0, 1);
+        let first = s.deposit(&T, b"x", 1).unwrap();
+        s.ack(&PHONE, first, 2);
+        assert_eq!(s.waiting(), 1, "the laptop has not collected it");
+        // still waiting for anyone after the retention of an own host
+        let later = 1 + RETENTION + DAY;
+        assert_eq!(s.fetch(&PHONE, 0, later - FETCHER_GONE + 10).0.len(), 1);
+        let next = s.deposit(&T, b"y", later).unwrap();
+        s.ack(&PHONE, next, later);
+        assert_eq!(s.waiting(), 0, "the laptop, silent 30 days, held it up");
+    }
+
+    /// Review H2. A device taken out of the owner's log holds nothing up.
+    #[test]
+    fn a_device_out_of_the_log_holds_nothing_up() {
+        let (_dir, mut s) = hosted_store();
+        s.fetch(&LAPTOP, 0, 1);
+        s.fetch(&PHONE, 0, 1);
+        let sequence = s.deposit(&T, b"x", 1).unwrap();
+        s.ack(&PHONE, sequence, 2);
+        assert_eq!(s.waiting(), 1);
+        s.keep_fetchers(&HashSet::from([PHONE]), 3);
+        assert_eq!(s.waiting(), 0);
+    }
+
+    /// Review M6. For a contact this device hosts, the quota counts all
+    /// their tokens together: more tokens are not more room.
+    #[test]
+    fn a_hosted_quota_counts_every_token_together() {
+        let (_dir, mut s) = hosted_store();
+        s.register(&OTHER);
+        let limits = (Some(2), Some(3));
+        assert!(s.deposit_within(&T, b"x", 1, limits).is_ok());
+        assert!(s.deposit_within(&OTHER, b"x", 1, limits).is_ok());
+        assert_eq!(
+            s.deposit_within(&OTHER, b"x", 1, limits),
+            Err(Refused::Full)
+        );
+        assert_eq!(s.deposit_within(&T, b"x", 1, limits), Err(Refused::Full));
+        // collected, there is room again within the day's count
+        s.fetch(&PHONE, 0, 1);
+        s.ack(&PHONE, 2, 1);
+        assert!(s.deposit_within(&T, b"x", 1, limits).is_ok());
+        s.ack(&PHONE, 3, 1);
+        assert_eq!(
+            s.deposit_within(&OTHER, b"x", 1, limits),
+            Err(Refused::Full)
+        );
+        assert!(s.deposit_within(&OTHER, b"x", 1 + DAY, limits).is_ok());
+        // an own host's store counts each token alone
+        let (_d2, mut own) = store();
+        own.register(&OTHER);
+        assert!(own.deposit_within(&T, b"x", 1, (Some(1), None)).is_ok());
+        assert!(own.deposit_within(&OTHER, b"x", 1, (Some(1), None)).is_ok());
     }
 
     /// `vectors/mailbox.json`: built by hand from `hosts.md` rather than by

@@ -752,6 +752,7 @@ impl Daemon {
         }
         self.unreadable.network_changed();
         self.known.woke();
+        crate::hosting::network_changed(self);
         // A permit is kept if discovery is between rounds.
         self.rediscover.notify_one();
         // and the services of the personas this device acts as, which
@@ -1701,11 +1702,31 @@ impl Daemon {
     /// (`sync.md#neighbours`), and of those this device stays in touch with
     /// because its person has no host.
     pub async fn connect_all(self: &Arc<Self>) {
+        self.connect_to(true).await;
+    }
+
+    /// [`connect_all`](Self::connect_all), as the reconnect loop does it
+    /// every few seconds: a device that does not help others dials no
+    /// neighbours then. It dials them when it wakes, when its network
+    /// changes and when its person turns to them; between, its anchors and
+    /// the sessions others open to it are its neighbours (D86).
+    pub async fn reconnect(self: &Arc<Self>) {
+        let neighbours = self.conditions.helps();
+        self.connect_to(neighbours).await;
+    }
+
+    /// The devices to dial: own devices, those of the contacts in use,
+    /// those this device stays in touch with, and, with `neighbours`, the
+    /// neighbours.
+    pub(crate) fn to_dial(
+        &self,
+        neighbours: bool,
+    ) -> Vec<(KeyId, cardinal_crypto::HybridPublicKey)> {
         let standing = crate::rendezvous::standing(self);
         let devices: Vec<(KeyId, cardinal_crypto::HybridPublicKey)> = {
             let core = self.core();
             let Some(ident) = core.identity.as_ref() else {
-                return;
+                return Vec::new();
             };
             let st = ident.state();
             let own = st.keys.values().filter(|k| k.key != self.keys.key());
@@ -1732,7 +1753,11 @@ impl Daemon {
                 }
             }
             // and the neighbours (`sync.md#neighbours`)
-            let neighbours = self.neighbours.devices();
+            let neighbours = if neighbours {
+                self.neighbours.devices()
+            } else {
+                HashSet::new()
+            };
             for c in contacts.iter().filter(|c| c.connects()) {
                 let Some(o) = core.others.get(&c.identity) else {
                     continue;
@@ -1747,6 +1772,11 @@ impl Daemon {
             }
             devices
         };
+        devices
+    }
+
+    async fn connect_to(self: &Arc<Self>, neighbours: bool) {
+        let devices = self.to_dial(neighbours);
         for (key, link) in devices {
             if self.is_direct_ip(link.x25519()) {
                 continue;
@@ -1765,6 +1795,7 @@ impl Daemon {
             if !lock(&self.connecting).insert(key) {
                 continue;
             }
+            self.neighbours.dialling(&key);
             let d = self.clone();
             tokio::spawn(async move {
                 let ok = d.try_device(key, link).await;
@@ -2335,7 +2366,7 @@ impl Daemon {
             let mut t = tokio::time::interval(Duration::from_secs(2));
             loop {
                 t.tick().await;
-                d.connect_all().await;
+                d.reconnect().await;
             }
         });
         // counters

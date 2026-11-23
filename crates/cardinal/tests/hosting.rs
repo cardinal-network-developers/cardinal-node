@@ -321,6 +321,66 @@ fn a_contacts_anchor_hosts_grandma() {
     wait("daniel hosts nobody", 30, || hosting(&daniel).is_empty());
 }
 
+/// Review M3. Grandma's phone, on battery behind a router and hosted,
+/// spends nothing on upkeep: it presents itself and collects once, on its
+/// new session, and then sends nothing on a timer. An envelope left for
+/// her while she is in touch is delivered at once: the anchor tells her
+/// phone it waits.
+#[test]
+fn a_hosted_phone_is_told_and_otherwise_quiet() {
+    if !fuse_available() {
+        eprintln!("skipping: /dev/fuse or fusermount3 is not available");
+        return;
+    }
+    let root = tempfile::tempdir().unwrap();
+    let (daniel, mut grandma, ben) = three(root.path());
+    host_grandma(&daniel, &grandma);
+    let ng = Nat::new(Kind::PortRestricted);
+    grandma
+        .env
+        .push(("CARDINAL_TEST_IN_USE_SECS".into(), "4".into()));
+    behind(&mut grandma, &ng);
+    ask(
+        &grandma,
+        json!({"cmd": "conditions", "plugged_in": false, "metered": false}),
+    );
+    wait("the host keeps grandma's phone in touch", 60, || {
+        kept_alive(&daniel, "grandma").is_some_and(|k| k.is_u64())
+            && kept_alive(&grandma, "Daniel").is_some_and(|k| k.is_null())
+    });
+    wait("grandma's phone presented itself and collected", 60, || {
+        let log = grandma.log();
+        log.contains("presenting to") && log.contains("collecting at")
+    });
+    std::thread::sleep(Duration::from_secs(5));
+    let count = |what: &str| grandma.log().matches(what).count();
+    let (presented, collected) = (count("presenting to"), count("collecting at"));
+    // Longer than the 30 s it collected at and the two minutes it
+    // presented at before.
+    std::thread::sleep(Duration::from_secs(130));
+    assert_eq!(count("presenting to"), presented, "it presented on a timer");
+    assert_eq!(count("collecting at"), collected, "it collected on a timer");
+    assert!(
+        kept_alive(&daniel, "grandma").is_some(),
+        "the session did not last"
+    );
+
+    // Ben keeps Grandma to hosts: he opens nothing to her, and what he
+    // says waits at the anchor, which tells her phone.
+    ask(
+        &ben,
+        json!({"cmd": "contact", "who": "grandma", "setting": "hosts-only"}),
+    );
+    ben.cli(&["say", "Grandma", "told at once"]);
+    wait("grandma reads it", 20, || {
+        grandma.cli(&["messages", "Ben"]).contains("told at once")
+    });
+    assert!(
+        grandma.log().contains("says an envelope waits"),
+        "it did not come by the anchor's word"
+    );
+}
+
 /// Daniel changes the quota on the host: one envelope at a time. A second
 /// one from Ben while Grandma is away is refused, as a full mailbox
 /// refuses: it never absorbs.
@@ -343,9 +403,7 @@ fn a_full_mailbox_refuses() {
     wait("one waits", 60, || waiting_at(&daniel) == 1);
     ben.cli(&["say", "Grandma", "two"]);
     wait("the second is refused", 60, || {
-        daniel
-            .log()
-            .contains("mailbox here is full under one token")
+        daniel.log().contains("mailbox here is full")
     });
     assert_eq!(waiting_at(&daniel), 1);
     grandma.start();

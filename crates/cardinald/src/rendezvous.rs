@@ -169,7 +169,7 @@ pub struct Rendezvous {
     looking: Mutex<HashSet<[u8; 32]>>,
     /// When this person last turned to each contact, and when that was last
     /// saved, as seconds since 1970.
-    in_use: Mutex<HashMap<[u8; 32], (Instant, u64)>>,
+    pub(crate) in_use: Mutex<HashMap<[u8; 32], (Instant, u64)>>,
     /// Where that is kept, so a device restarted mid-conversation still
     /// looks for whom it was talking to.
     in_use_path: Option<PathBuf>,
@@ -686,7 +686,7 @@ async fn present(d: &Daemon, s: &Session) {
 }
 
 /// Sends a message that has no reply.
-fn tell_device(s: Session, service: Service, message: Record) {
+pub(crate) fn tell_device(s: Session, service: Service, message: Record) {
     tokio::spawn(async move {
         if let Ok(mut st) = s.open_stream(service, Priority::Interactive) {
             let _ = st.send_message(&Value::Record(message)).await;

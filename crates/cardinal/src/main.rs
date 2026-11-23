@@ -747,12 +747,12 @@ enum HostingCmd {
         /// Give it more than once for more than one.
         #[arg(long = "on")]
         devices: Vec<String>,
-        /// Envelopes that may wait for them, and be left in a day, under
-        /// one token (256 if not given).
+        /// Envelopes that may wait for them, and be left in a day, all
+        /// their tokens together (256 if not given).
         #[arg(long)]
         envelopes: Option<u64>,
-        /// Megabytes a day relayed for them under one token (50 if not
-        /// given).
+        /// Megabytes a day relayed for them, all their tokens together (50
+        /// if not given).
         #[arg(long)]
         relay_mb: Option<u64>,
     },

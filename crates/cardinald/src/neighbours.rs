@@ -16,7 +16,14 @@
 //! A device that does not help sends no keepalives of its own: its
 //! anchors keep its sessions alive, and it only answers. Only when none of
 //! its sessions is kept alive by an anchor does it ping its neighbours, and
-//! then about every two minutes.
+//! then about every two minutes. Nor does it dial its neighbours on a
+//! timer: only when it wakes, when its network changes, or when its person
+//! turns to them; between, its anchors and the sessions others open to it
+//! are its neighbours.
+//!
+//! A neighbour not reached is let go and rests, ten minutes at first and
+//! twice as long each time it is not reached again, up to four hours, and
+//! is not chosen again while it rests.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Mutex, MutexGuard};
@@ -44,9 +51,12 @@ pub const MOST_SPARING: usize = 8;
 const REACH_WITHIN: Duration = Duration::from_secs(60);
 /// A neighbour is replaced after between this long and twice it.
 const KEEP_FOR: Duration = Duration::from_secs(20 * 60);
-/// How long one replaced, or not reached, is chosen only when no other is
-/// left.
+/// How long one replaced, or not reached, rests before it may be chosen
+/// again: one not reached rests twice as long each time, up to
+/// `REST_MOST`.
 const REST_FOR: Duration = Duration::from_secs(10 * 60);
+/// The longest rest.
+const REST_MOST: Duration = Duration::from_secs(4 * 60 * 60);
 /// How often a device that does not help pings a neighbour, and only when
 /// no anchor keeps any of its sessions alive: each ping wakes a phone's
 /// radio, and anchors carry reliability.
@@ -95,7 +105,8 @@ pub struct Candidate {
     pub host: bool,
     /// When its person was last turned to here.
     pub used: Option<Instant>,
-    /// Replaced, or not reached, lately: chosen only when no other is left.
+    /// Not reached lately, and its rest is over: chosen only when no other
+    /// is left.
     pub rested: bool,
 }
 
@@ -173,17 +184,34 @@ pub fn choose(
 struct Chosen {
     /// Its static key.
     x: [u8; 32],
-    /// When a session with it was last seen open.
-    open_at: Instant,
+    /// When it was first dialled since a session with it was last seen
+    /// open, if it was.
+    tried: Option<Instant>,
     /// When it is replaced.
     until: Instant,
+}
+
+/// A device let go: when it may be chosen again, and how many times in a
+/// row it was not reached.
+#[derive(Clone, Copy, Debug)]
+struct Rest {
+    until: Instant,
+    misses: u32,
+}
+
+/// How long a device rests after it was not reached `misses` times in a
+/// row: ten minutes, doubling, up to four hours.
+fn rest_for(misses: u32) -> Duration {
+    REST_FOR
+        .saturating_mul(1 << misses.saturating_sub(1).min(16))
+        .min(REST_MOST)
 }
 
 /// The neighbours this device keeps.
 #[derive(Default)]
 pub struct Neighbours {
     chosen: Mutex<HashMap<KeyId, Chosen>>,
-    rested: Mutex<HashMap<KeyId, Instant>>,
+    rested: Mutex<HashMap<KeyId, Rest>>,
 }
 
 impl Neighbours {
@@ -200,6 +228,64 @@ impl Neighbours {
     /// Whether a device is a neighbour.
     pub fn is(&self, device: &KeyId) -> bool {
         lock(&self.chosen).contains_key(device)
+    }
+
+    /// Tests: chooses a device, as a tick would.
+    #[cfg(test)]
+    pub(crate) fn choose_now(&self, device: KeyId, x: [u8; 32], now: Instant) {
+        let until = now + KEEP_FOR;
+        let c = Chosen {
+            x,
+            tried: None,
+            until,
+        };
+        lock(&self.chosen).insert(device, c);
+    }
+
+    /// A neighbour is being dialled.
+    pub fn dialling(&self, device: &KeyId) {
+        if let Some(c) = lock(&self.chosen).get_mut(device) {
+            c.tried.get_or_insert_with(Instant::now);
+        }
+    }
+
+    /// Lets go of the neighbours dialled and not reached within a minute,
+    /// and of those kept long enough, which rest; `open` says whether a
+    /// session with a device is open, which ends its rest. Gives those
+    /// kept.
+    fn let_go(&self, now: Instant, open: impl Fn(&[u8; 32]) -> bool) -> Vec<KeyId> {
+        let mut chosen = lock(&self.chosen);
+        let mut rested = lock(&self.rested);
+        chosen.retain(|k, c| {
+            if open(&c.x) {
+                c.tried = None;
+                rested.remove(k);
+            }
+            let unreached = c
+                .tried
+                .is_some_and(|t| now.duration_since(t) >= REACH_WITHIN);
+            if unreached {
+                let misses = rested.get(k).map_or(1, |r| r.misses + 1);
+                let until = now + rest_for(misses);
+                rested.insert(*k, Rest { until, misses });
+                return false;
+            }
+            if now >= c.until {
+                let misses = rested.get(k).map_or(0, |r| r.misses);
+                let until = now + REST_FOR;
+                rested.insert(*k, Rest { until, misses });
+                return false;
+            }
+            true
+        });
+        chosen.keys().copied().collect()
+    }
+
+    /// Whether a device rests now, and whether it was not reached lately.
+    fn resting(&self, device: &KeyId, now: Instant) -> (bool, bool) {
+        lock(&self.rested)
+            .get(device)
+            .map_or((false, false), |r| (now < r.until, r.misses > 0))
     }
 }
 
@@ -246,35 +332,31 @@ pub fn tick(d: &Daemon, theirs: &[Theirs]) {
     let n = &d.neighbours;
     let groups = groups(d, theirs);
     let used = d.rendezvous.used_at();
-    let kept: Vec<KeyId> = {
-        let mut chosen = lock(&n.chosen);
+    {
+        // a device seen in a session rests no longer; one gone, at all
         let mut rested = lock(&n.rested);
-        rested.retain(|_, t| now.duration_since(*t) < REST_FOR);
-        chosen.retain(|k, c| {
-            if d.session(&c.x).is_some() {
-                c.open_at = now;
-            }
-            let keep = now < c.until && now.duration_since(c.open_at) < REACH_WITHIN;
-            if !keep {
-                rested.insert(*k, now);
-            }
-            keep
+        rested.retain(|k, _| {
+            theirs
+                .iter()
+                .any(|t| t.device == *k && d.session(&t.x).is_none())
         });
-        chosen.keys().copied().collect()
-    };
-    let all: Vec<Candidate> = {
-        let rested = lock(&n.rested);
-        theirs
-            .iter()
-            .map(|t| Candidate {
+    }
+    let kept = n.let_go(now, |x| d.session(x).is_some());
+    // One resting is not chosen at all, even with no other left: a phone
+    // that is off is not dialled every minute.
+    let all: Vec<Candidate> = theirs
+        .iter()
+        .filter_map(|t| {
+            let (resting, missed) = n.resting(&t.device, now);
+            (!resting).then(|| Candidate {
                 device: t.device,
                 open: d.session(&t.x).is_some(),
                 host: t.host,
                 used: used.get(&t.who).copied(),
-                rested: rested.contains_key(&t.device),
+                rested: missed,
             })
-            .collect()
-    };
+        })
+        .collect();
     let picked = choose(
         &all,
         &groups,
@@ -292,7 +374,7 @@ pub fn tick(d: &Daemon, theirs: &[Theirs]) {
             let spread = u64::from(u16::from_le_bytes(random_bytes())) % KEEP_FOR.as_secs();
             Chosen {
                 x: t.x,
-                open_at: now,
+                tried: None,
                 until: now + KEEP_FOR + Duration::from_secs(spread),
             }
         });
@@ -404,5 +486,52 @@ mod tests {
         let first = choose(&all, &groups, &[], b, [1; 32]);
         let again = choose(&all, &groups, &first, b, [2; 32]);
         assert_eq!(first, again);
+    }
+
+    /// Review M4. A neighbour dialled and not reached rests ten minutes,
+    /// then twice as long each time it is not reached again, up to four
+    /// hours, and is not chosen while it rests; a session with it ends the
+    /// rest. One never dialled is not let go for not being reached.
+    #[test]
+    fn a_neighbour_not_reached_rests_ever_longer() {
+        assert_eq!(rest_for(1), REST_FOR);
+        assert_eq!(rest_for(2), 2 * REST_FOR);
+        assert_eq!(rest_for(3), 4 * REST_FOR);
+        assert_eq!(rest_for(9), REST_MOST);
+        assert_eq!(rest_for(u32::MAX), REST_MOST);
+        let n = Neighbours::default();
+        let (k, x) = ([1; 32], [2; 32]);
+        let mut now = Instant::now();
+        n.choose_now(k, x, now);
+        // never dialled, as by a phone between wakes: kept
+        let later = now + 10 * REACH_WITHIN;
+        let kept = n.let_go(later, |_| false);
+        assert_eq!(kept, vec![k]);
+        let mut rests = Vec::new();
+        for _ in 0..8 {
+            n.choose_now(k, x, now);
+            lock(&n.chosen).get_mut(&k).unwrap().tried = Some(now);
+            now += REACH_WITHIN;
+            assert!(n.let_go(now, |_| false).is_empty(), "it was not reached");
+            let (resting, missed) = n.resting(&k, now);
+            assert!(resting && missed);
+            let until = lock(&n.rested)[&k].until;
+            rests.push(until - now);
+            assert!(n.resting(&k, until - Duration::from_secs(1)).0);
+            assert!(!n.resting(&k, until).0);
+            now = until;
+        }
+        assert_eq!(rests[0], REST_FOR);
+        assert_eq!(rests[1], 2 * REST_FOR);
+        assert_eq!(*rests.last().unwrap(), REST_MOST);
+        // Seen in a session: its rest ends, and it starts again from ten
+        // minutes.
+        n.choose_now(k, x, now);
+        n.let_go(now, |o| *o == x);
+        assert!(!n.resting(&k, now).1);
+        lock(&n.chosen).get_mut(&k).unwrap().tried = Some(now);
+        now += REACH_WITHIN;
+        n.let_go(now, |_| false);
+        assert_eq!(lock(&n.rested)[&k].until - now, REST_FOR);
     }
 }

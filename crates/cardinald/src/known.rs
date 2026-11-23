@@ -182,6 +182,9 @@ struct Sent {
 #[derive(Default)]
 struct Keys {
     version: u64,
+    /// The count of changes it was read at (`Daemon::changed`), which
+    /// says without the core whether it may be out of date.
+    changes: u64,
     own: Option<Zeroizing<[u8; 32]>>,
     mine: Option<Zeroizing<[u8; 32]>>,
     theirs: Vec<([u8; 32], Zeroizing<[u8; 32]>)>,
@@ -430,8 +433,10 @@ pub fn start(d: Arc<Daemon>) {
 /// The keys probes are made and checked with, read again when the state
 /// changed.
 fn keys(d: &Daemon) -> MutexGuard<'_, Keys> {
+    let changes = *d.changed.borrow();
     let version = d.core().state_version();
     let mut k = lock(&d.known.keys);
+    k.changes = changes;
     if k.version != version || k.own.is_none() {
         let core = d.core();
         k.version = version;
@@ -455,8 +460,7 @@ fn on_probe(d: &Arc<Daemon>, pkt: &[u8], from: SocketAddr) {
     if d.known.sent_here(nonce) {
         return;
     }
-    let answer = {
-        let k = keys(d);
+    let check = |k: &Keys| {
         if k.own.as_ref().is_some_and(|o| disc::probe_from_own(&p, o)) {
             k.own.as_ref().map(|o| disc::probe_answer(o, &p))
         } else if k
@@ -469,6 +473,18 @@ fn on_probe(d: &Arc<Daemon>, pkt: &[u8], from: SocketAddr) {
             None
         }
     };
+    // With the keys read last, first: a probe from anyone at all must not
+    // take the core. They are read again only if something changed since.
+    let answer = {
+        let k = lock(&d.known.keys);
+        let fresh = k.own.is_some() && k.changes == *d.changed.borrow();
+        match check(&k) {
+            Some(a) => Some(a),
+            None if fresh => return,
+            None => None,
+        }
+    };
+    let answer = answer.or_else(|| check(&keys(d)));
     let Some(answer) = answer else {
         return;
     };
@@ -984,5 +1000,27 @@ mod tests {
         let n = (0..30).filter(|_| k.may_answer(ip)).count();
         assert_eq!(n, ANSWERS_PER_SOURCE as usize);
         assert!(k.may_answer("10.0.0.8".parse().unwrap()));
+    }
+
+    /// Review L. A probe whose tags this device does not know is dropped
+    /// without taking the core: anyone can send one.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_probe_from_anyone_takes_no_core() {
+        let dir = tempfile::tempdir().unwrap();
+        let (paths, config) = crate::testing::set_up(dir.path());
+        let d = Daemon::start(paths, config).await.unwrap();
+        drop(keys(&d));
+        let mut pkt = vec![cardinal_link::packet::TYPE_PROBE, 0, 0, 0];
+        pkt.extend_from_slice(&random_bytes::<24>());
+        let held = d.core();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let d2 = d.clone();
+        std::thread::spawn(move || {
+            on_probe(&d2, &pkt, "192.0.2.7:7171".parse().unwrap());
+            let _ = tx.send(());
+        });
+        let answered = rx.recv_timeout(Duration::from_secs(5));
+        drop(held);
+        assert!(answered.is_ok(), "it waited for the core");
     }
 }
