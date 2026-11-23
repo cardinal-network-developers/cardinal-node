@@ -428,6 +428,8 @@ pub(crate) struct Conn {
     close_frame: Option<String>,
     last_recv: Instant,
     last_send: Instant,
+    /// When the peer's last two pings came, the latest first.
+    pinged: [Option<Instant>; 2],
     /// Since when something sent has wanted an answer, with none come.
     unanswered: Option<Instant>,
     /// The number of the first packet sent since then: an ack of it or a
@@ -521,6 +523,7 @@ impl Conn {
             close: None,
             close_frame: None,
             last_recv: now,
+            pinged: [None, None],
             last_send: now,
             unanswered: None,
             unanswered_from: 0,
@@ -825,7 +828,8 @@ impl Conn {
 
     fn on_frame(&mut self, f: Frame, path: &Path, now: Instant) {
         match f {
-            Frame::Padding(_) | Frame::Ping | Frame::Unknown(_) => {}
+            Frame::Ping => self.pinged = [Some(now), self.pinged[0]],
+            Frame::Padding(_) | Frame::Unknown(_) => {}
             Frame::Ack {
                 largest,
                 delay_us,
@@ -1800,6 +1804,12 @@ impl Conn {
     /// When an authenticated packet last came from the peer.
     pub fn last_heard(&self) -> Instant {
         self.last_recv
+    }
+
+    /// Whether the peer has pinged twice within the last `within`: it is
+    /// keeping this session alive.
+    pub fn pinged_twice_within(&self, within: Duration, now: Instant) -> bool {
+        self.pinged[1].is_some_and(|t| now.saturating_duration_since(t) < within)
     }
 
     pub fn poll_timeout(&self) -> Option<Instant> {

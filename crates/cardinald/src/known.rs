@@ -13,7 +13,9 @@
 //! connections dials up to eight of those devices at their known paths.
 //! A device that helps others (an anchor) keeps those sessions alive, up to
 //! 64 of them; one that does not sends no keepalive on a contact's session
-//! it is not using, and leaves it to the other side.
+//! it is not using, and leaves it to the other side: only where none of
+//! the sessions it has is kept alive by an anchor does it ping its
+//! neighbours, about every two minutes (`sync.md#neighbours`).
 //!
 //! When its person turns to a contact and nothing else found them, a
 //! device probes its own subnet (`hosts.md#looking-for-someone`), at most
@@ -679,9 +681,10 @@ async fn reach_device(
 
 /// Keepalives follow what this device can afford: an anchor keeps up to
 /// [`ANCHOR_KEEPS`] contacts' sessions alive, its neighbours' first;
-/// another those of the contacts its person is turning to, and its
-/// neighbours' later than an anchor would, so that on one an anchor keeps
-/// alive it only answers.
+/// another those of the contacts its person is turning to, and otherwise
+/// sends none of its own, leaving them to its anchors: each ping wakes a
+/// phone's radio. Only when no session it has is kept alive by an anchor
+/// does it ping its neighbours, every [`crate::neighbours::SPARING_KEEPALIVE`].
 fn keepalives(d: &Daemon) {
     let checking = lock(&d.known.checking_until).is_some_and(|t| Instant::now() < t);
     if checking {
@@ -691,6 +694,10 @@ fn keepalives(d: &Daemon) {
     let used = d.rendezvous.used_at();
     let neighbours = d.neighbours.statics();
     let helps = d.conditions.helps();
+    let anchored = !helps
+        && sessions
+            .iter()
+            .any(|(_, s)| s.pinged_twice_within(crate::neighbours::ANCHOR_PINGS_WITHIN));
     let keep: HashSet<[u8; 32]> = if helps {
         let all = sessions
             .iter()
@@ -710,7 +717,7 @@ fn keepalives(d: &Daemon) {
     for (who, s) in sessions {
         let want = if keep.contains(&s.peer_static()) || d.rendezvous.in_use(&who) {
             Some(crate::daemon::KEEPALIVE)
-        } else if neighbours.contains(&s.peer_static()) {
+        } else if !anchored && neighbours.contains(&s.peer_static()) {
             Some(crate::neighbours::SPARING_KEEPALIVE)
         } else {
             None

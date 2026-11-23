@@ -828,7 +828,7 @@ fn status_of(d: &Dev, who: &str) -> Value {
 /// router; Ana has no host either, but her desktop is plugged in, so it
 /// helps others: an anchor. When the phone wakes it reaches the anchor at
 /// the path it knows, and the anchor keeps that session alive while the
-/// phone only answers its pings. Ana's tablet, behind another
+/// phone sends no keepalive of its own. Ana's tablet, behind another
 /// router, asks her anchor for Bo (`connect` field 3), is introduced, and
 /// its message gets through. Before, nobody held a way to the phone, and
 /// with no host on either side the tablet could not find it.
@@ -885,10 +885,10 @@ fn a_phone_that_wakes_reaches_a_contacts_anchor_and_is_found_through_it() {
     };
     let kept = |d: &Dev, who: &str| theirs(d, who).is_some_and(|x| x["kept_alive_s"].is_u64());
     assert!(kept(&ana, "bo"), "{}", status_of(&ana, "bo"));
-    // The anchor is one of the phone's lifelines (`sync.md#neighbours`),
-    // which it pings later than the anchor does: it only answers.
+    // The anchor is one of the phone's lifelines (`sync.md#neighbours`);
+    // the phone sends it no pings, and only answers the anchor's.
     wait("the phone leaves the keepalives to the anchor", 30, || {
-        theirs(&bo, "Ana").is_some_and(|x| x["neighbour"] == true && x["kept_alive_s"] == 25)
+        theirs(&bo, "Ana").is_some_and(|x| x["neighbour"] == true && x["kept_alive_s"].is_null())
     });
     assert_eq!(
         theirs(&ana, "bo").unwrap()["kept_alive_s"],
@@ -915,6 +915,24 @@ fn devices_of(d: &Dev, who: &str) -> Vec<Value> {
         .as_array()
         .cloned()
         .unwrap_or_default()
+}
+
+/// How often `d` pings each device of `who` it keeps as a neighbour and is
+/// in touch with, in seconds (null for none); empty if it is in touch with
+/// none.
+fn neighbour_pings(d: &Dev, who: &str) -> Vec<Value> {
+    devices_of(d, who)
+        .iter()
+        .filter(|x| x["neighbour"] == true && x["online"] == true)
+        .map(|x| x["kept_alive_s"].clone())
+        .collect()
+}
+
+/// Whether `d` pings every neighbour of `who`'s it is in touch with as
+/// `every` says, and is in touch with at least one.
+fn pings_neighbours(d: &Dev, who: &str, every: Value) -> bool {
+    let all = neighbour_pings(d, who);
+    !all.is_empty() && all.iter().all(|x| *x == every)
 }
 
 /// Whether `d` is in touch with a device of `who` it keeps as a neighbour.
@@ -951,6 +969,11 @@ fn said_in(d: &Dev, group: &str) -> Vec<String> {
 /// joined to its neighbours again. Before, a phone reached out only on
 /// waking, and the anchor, which cannot reach a phone behind a router, lost
 /// them all when it restarted.
+///
+/// Keepalives (`sync.md#neighbours`, 2026-11-23): a phone on battery with
+/// an anchor sends no pings of its own; a phone that is charging pings as
+/// an anchor does; and once nobody in the family helps, the phones ping
+/// their neighbours about every two minutes.
 #[test]
 fn a_family_group_hears_each_other_through_its_neighbours() {
     if !fuse_available() {
@@ -969,6 +992,8 @@ fn a_family_group_hears_each_other_through_its_neighbours() {
     let mut family: Vec<Dev> = Vec::new();
     for name in ["bo", "cy", "di"] {
         let mut d = Dev::new(root.path(), name, free_port());
+        // Nobody turns to anyone for long: the neighbours carry it all.
+        d.env.push((BRIEFLY.0.into(), BRIEFLY.1.into()));
         d.start();
         d.cli(&["init", "--yes", "--name", name]);
         d.wait_mounted();
@@ -1034,6 +1059,24 @@ fn a_family_group_hears_each_other_through_its_neighbours() {
             .count();
         assert!(n <= 3, "{}", status_of(d, "Ana"));
     }
+    // On battery, with an anchor: no pings of their own.
+    for d in &family {
+        wait("the phone leaves the keepalives to the anchor", 60, || {
+            pings_neighbours(d, "Ana", Value::Null)
+        });
+    }
+    // Charging, a phone helps, and pings as an anchor does.
+    let charging = json!({"cmd": "conditions", "plugged_in": true, "metered": false});
+    ask(&family[0], charging);
+    wait("the charging phone pings like an anchor", 30, || {
+        pings_neighbours(&family[0], "Ana", json!(20))
+    });
+    ask(&family[0], on_battery.clone());
+    wait(
+        "off the charger it leaves them to the anchor again",
+        30,
+        || pings_neighbours(&family[0], "Ana", Value::Null),
+    );
 
     // The anchor restarts: the phones join it again by themselves.
     desk.stop();
@@ -1083,5 +1126,16 @@ fn a_family_group_hears_each_other_through_its_neighbours() {
         wait("di's message arrives", 20, || {
             said_in(d, &g).iter().any(|m| m.ends_with(": on my way"))
         });
+    }
+
+    // The desktop goes on battery too: nobody in the family helps, so no
+    // anchor. The phones ping their neighbours, but only every two minutes.
+    ask(&desk, on_battery.clone());
+    for d in &family {
+        wait(
+            "with no anchor, the phone pings every two minutes",
+            120,
+            || pings_neighbours(d, "Ana", json!(120)),
+        );
     }
 }

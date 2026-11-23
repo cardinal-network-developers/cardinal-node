@@ -13,9 +13,10 @@
 //! A two-person space adds nothing beyond the lifelines: its two people
 //! reach each other by their known paths.
 //!
-//! A device that does not help pings its neighbours less often than one
-//! that does, so that on a session an anchor keeps alive it answers and
-//! never pings itself.
+//! A device that does not help sends no keepalives of its own: its
+//! anchors keep its sessions alive, and it only answers. Only when none of
+//! its sessions is kept alive by an anchor does it ping its neighbours, and
+//! then about every two minutes.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Mutex, MutexGuard};
@@ -46,9 +47,13 @@ const KEEP_FOR: Duration = Duration::from_secs(20 * 60);
 /// How long one replaced, or not reached, is chosen only when no other is
 /// left.
 const REST_FOR: Duration = Duration::from_secs(10 * 60);
-/// How often a device that does not help pings a neighbour: later than one
-/// that helps, which so keeps the session alive for both.
-pub const SPARING_KEEPALIVE: Duration = Duration::from_secs(25);
+/// How often a device that does not help pings a neighbour, and only when
+/// no anchor keeps any of its sessions alive: each ping wakes a phone's
+/// radio, and anchors carry reliability.
+pub const SPARING_KEEPALIVE: Duration = Duration::from_secs(120);
+/// A session the other side pinged twice within this is kept alive by an
+/// anchor, which pings every 20 s or so; a phone's two minutes never show.
+pub const ANCHOR_PINGS_WITHIN: Duration = Duration::from_secs(60);
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())

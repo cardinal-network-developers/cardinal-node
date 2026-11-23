@@ -484,6 +484,28 @@ fn without_keepalive_only_the_idle_timeout_closes_a_session() {
     assert!(matches!(p.a.close, Some(CloseReason::Idle)));
 }
 
+/// A peer that keeps a session alive pings it every 20 s or so: two pings
+/// within a minute show it; one that pings every two minutes does not.
+#[test]
+fn a_peer_that_keeps_a_session_alive_is_known_by_its_pings() {
+    let mut p = pair();
+    while p.pump() > 0 {}
+    let minute = Duration::from_secs(60);
+    assert!(!p.b.pinged_twice_within(minute, p.now));
+    p.a.control.push_back(Frame::Ping);
+    p.pump();
+    assert!(!p.b.pinged_twice_within(minute, p.now));
+    p.now += Duration::from_secs(20);
+    p.a.control.push_back(Frame::Ping);
+    p.pump();
+    assert!(p.b.pinged_twice_within(minute, p.now));
+    assert!(!p.a.pinged_twice_within(minute, p.now), "acks are no pings");
+    p.now += Duration::from_secs(120);
+    p.a.control.push_back(Frame::Ping);
+    p.pump();
+    assert!(!p.b.pinged_twice_within(minute, p.now));
+}
+
 /// A timer that is past and does nothing would spin the session's driver.
 #[test]
 fn a_rekey_nobody_answers_arms_no_timer_in_the_past() {

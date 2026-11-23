@@ -2499,9 +2499,9 @@ asks for around that is not built yet.
   of a path is kept across restarts in `peers.json`, as other addresses
   are, but only one a session this device opened worked at; when it was
   confirmed is not kept, so after a restart every path is checked at once,
-  as on waking. Keepalives are every 20 s, as on every session (25 s on a
-  neighbour's by a device that does not help), not adapted to a NAT's
-  timeout: lengthening them safely needs telling a NAT that forgot a
+  as on waking. Keepalives are every 20 s, as on every session (120 s on a
+  neighbour's by a device that does not help, where no anchor keeps any of
+  its sessions alive), not adapted to a NAT's timeout: lengthening them safely needs telling a NAT that forgot a
   mapping from a device that went away, which takes a second session or
   socket to try the longer wait on, and the tests' NAT forgets nothing to
   check it against. Whether a device can receive connections is read as
@@ -2515,6 +2515,8 @@ asks for around that is not built yet.
   addresses known for them, as a person's own devices are, with the same
   backoff; they are not looked for through hosts or by a probe of the
   network, which stay for the contacts in use.
+  An anchor is known by its pings: a contact's session the other side
+  pinged twice within 60 s is kept alive by one.
 - **Only a person's own device is a host.** A device with `cardinal host`
   grants itself to its own identity, the case `hosts.md#grants` calls the
   common one. It holds spaces as any of the person's devices does, under

@@ -323,6 +323,14 @@ impl Session {
         self.inner.lock().last_heard()
     }
 
+    /// Whether the peer has pinged twice within the last `within`: it is
+    /// keeping this session alive.
+    pub fn pinged_twice_within(&self, within: std::time::Duration) -> bool {
+        self.inner
+            .lock()
+            .pinged_twice_within(within, std::time::Instant::now())
+    }
+
     /// Closes the session with a reason the peer sees.
     pub fn close(&self, reason: &str) {
         let events = {
