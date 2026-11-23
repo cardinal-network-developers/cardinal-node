@@ -96,9 +96,11 @@ pub struct Hosted {
     present: Mutex<HashMap<[u8; 32], Present>>,
     /// As a host: relay bytes left today, by token and day.
     relay: Mutex<HashMap<(Token, u64), Arc<AtomicU64>>>,
-    /// As one hosted: when this device last presented itself to each host,
+    /// As one hosted: when, and on which session, this device last
+    /// presented itself to each host: a new session, which replaces one
+    /// that closed, is presented on at once. And when it last
     /// collected from it, and tried to reach it.
-    presented: Mutex<HashMap<[u8; 32], Instant>>,
+    presented: Mutex<HashMap<[u8; 32], (Instant, Session)>>,
     collected: Mutex<HashMap<[u8; 32], Instant>>,
     dialed: Mutex<HashMap<[u8; 32], Instant>>,
 }
@@ -603,7 +605,17 @@ async fn keep_as_hosted(d: &Arc<Daemon>) {
             }
             due
         };
-        if due(&d.mailbox.hosted.presented, PRESENT_EVERY) {
+        let present_now = {
+            let mut m = lock(&d.mailbox.hosted.presented);
+            let due = m
+                .get(&key)
+                .is_none_or(|(t, on)| t.elapsed() >= PRESENT_EVERY || on.is_closed());
+            if due {
+                m.insert(key, (Instant::now(), s.clone()));
+            }
+            due
+        };
+        if present_now {
             let ask = Record::new().with(0, OP_PRESENT).with(
                 1,
                 crate::rendezvous::address_list(&crate::rendezvous::local_addresses(d)),
