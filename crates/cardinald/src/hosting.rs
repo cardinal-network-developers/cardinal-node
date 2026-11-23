@@ -1027,7 +1027,9 @@ fn can_host(d: &Daemon) -> Vec<(KeyId, Grant)> {
     d.core()
         .mailboxes()
         .into_iter()
-        .filter(|(g, _)| g.endpoints.iter().any(|e| e.socket_addr().is_some()))
+        // a host named by a host name (as `cardinal host --address
+        // name:port` writes) is reachable as much as one named by address
+        .filter(|(g, _)| g.endpoints.iter().any(|e| e.usable()))
         .map(|(g, k)| (k, g))
         .collect()
 }
