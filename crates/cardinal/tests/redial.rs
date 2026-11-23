@@ -7,6 +7,8 @@
 //! time. On battery it stops dialling on a timer: in touch with nobody, it
 //! would try again in minutes, and a few times an hour at most. Told it
 //! woke, it dials at once.
+//!
+//! Skipped (with a message) when `/dev/fuse` or `fusermount3` is missing.
 
 mod common;
 
@@ -15,7 +17,7 @@ use serde_json::{json, Value};
 use std::time::{Duration, Instant};
 
 fn start(d: &mut Dev) {
-    d.start_with(&["--no-mount"]);
+    d.start();
 }
 
 /// Beta, as alpha sees it.
@@ -33,6 +35,10 @@ fn dials(a: &Dev) -> u64 {
 
 #[test]
 fn a_phone_on_battery_spares_its_radio_and_dials_when_it_wakes() {
+    if !fuse_available() {
+        eprintln!("skipping: /dev/fuse or fusermount3 is not available");
+        return;
+    }
     let root = tempfile::tempdir().unwrap();
     let mut a = Dev::new(root.path(), "alpha", free_port());
     let mut b = Dev::new(root.path(), "beta", free_port());

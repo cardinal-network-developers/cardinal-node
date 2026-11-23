@@ -368,11 +368,14 @@ impl Rendezvous {
         let at = unix_now();
         {
             let mut used = lock(&self.in_use);
-            for who in new {
-                used.insert(who, (Instant::now(), at));
+            for who in &new {
+                used.insert(*who, (Instant::now(), at));
             }
         }
         self.save();
+        // and dialled at once, as one turned to is
+        lock(&self.turned_to).extend(new);
+        self.turned.notify_one();
     }
 
     /// Saves the contacts in use and those this device knows of.

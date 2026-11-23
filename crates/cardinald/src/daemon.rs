@@ -1724,8 +1724,10 @@ impl Daemon {
     /// does not help dials nothing on a timer: it dials when it wakes,
     /// when its network changes and when its person turns to someone, and
     /// between, its anchors and the sessions others open to it keep it in
-    /// touch (D86). Only while it is in touch with nobody does it dial its
-    /// own devices and its neighbours, a few times an hour.
+    /// touch (D86). On a call it dials as one that helps does: its person
+    /// is using those they talk to all along. Only while it is in touch
+    /// with nobody does it dial its own devices and its neighbours, a few
+    /// times an hour.
     pub async fn reconnect(self: &Arc<Self>) {
         if let Some(what) = self.pass(Instant::now()) {
             self.connect_to(what).await;
@@ -1734,7 +1736,13 @@ impl Daemon {
 
     /// What a pass of the reconnect loop at `now` dials, if anything.
     pub(crate) fn pass(&self, now: Instant) -> Option<Dial> {
-        if self.conditions.helps() {
+        // A contact new here is turned to (`rendezvous.rs`).
+        let contacts: Vec<[u8; 32]> = self.core().contacts().iter().map(|c| c.identity).collect();
+        self.rendezvous.knows(contacts);
+        // On a call, the person is using those they talk to all along.
+        let on_call = lock(&self.call).is_some();
+        let on_call = on_call || !lock(&self.group_calls).is_empty();
+        if self.conditions.helps() || on_call {
             // and when it stops helping, its slow rounds start then
             lock(&self.sparing).start_over(now);
             return Some(Dial::All);
