@@ -560,11 +560,11 @@ fn read_address(v: &Value) -> Option<SocketAddr> {
     Some(SocketAddr::new(ip, port))
 }
 
-fn address_list(addresses: &[SocketAddr]) -> Value {
+pub(crate) fn address_list(addresses: &[SocketAddr]) -> Value {
     Value::list(addresses.iter().map(|a| Value::Record(address_record(a))))
 }
 
-fn read_addresses(v: Option<&Value>) -> Vec<SocketAddr> {
+pub(crate) fn read_addresses(v: Option<&Value>) -> Vec<SocketAddr> {
     v.and_then(Value::as_list)
         .unwrap_or_default()
         .iter()
@@ -602,7 +602,7 @@ fn observed(s: &Session) -> Option<SocketAddr> {
 
 /// The addresses this device has on its own networks, and the one its
 /// router gave it outside, if it gave one.
-fn local_addresses(d: &Daemon) -> Vec<SocketAddr> {
+pub(crate) fn local_addresses(d: &Daemon) -> Vec<SocketAddr> {
     let Some(udp) = d.endpoint.udp_addr() else {
         return Vec::new();
     };
@@ -885,11 +885,25 @@ pub async fn serve(d: &Arc<Daemon>, s: &Session, mut st: Stream) -> anyhow::Resu
     };
     let op = r.get(0).and_then(Value::as_uint);
     let kind = d.classify(s);
+    // As a host of a contact's (D87).
+    if let Some(reply) = crate::hosting::serve_rendezvous(d, s, &kind, st.service(), r).await {
+        if let Some(reply) = reply {
+            st.send_message(&Value::Record(reply)).await?;
+            st.shutdown().await?;
+        }
+        return Ok(());
+    }
     if let PeerKind::Contact(who, _) = kind {
         // One of their devices helps another of theirs to this one.
         let rendezvous = st.service() == Service::RENDEZVOUS;
         if rendezvous && op == Some(OP_INCOMING) && r.get(3).is_none() {
             contact_incoming(d, &who, r);
+            return Ok(());
+        }
+        // A contact's device that hosts this person says a token holder is
+        // looking for this device (D87).
+        if rendezvous && op == Some(OP_INCOMING) && crate::hosting::hosts_me(d, &who) {
+            incoming(d, s, r);
             return Ok(());
         }
         if !rendezvous && op == Some(OP_RELAYED) {
@@ -1147,6 +1161,17 @@ fn present_device(d: &Daemon, device: &[u8]) -> Option<Session> {
 
 /// Opens a channel between `s` and `other`, or finds the one they have.
 fn open_channel(d: &Daemon, s: &Session, other: &Session) -> Record {
+    open_channel_within(d, s, other, None)
+}
+
+/// [`open_channel`], forwarding at most what is left of `budget`, in bytes,
+/// where there is one: a token's relay bytes for the day.
+fn open_channel_within(
+    d: &Daemon,
+    s: &Session,
+    other: &Session,
+    budget: Option<Arc<std::sync::atomic::AtomicU64>>,
+) -> Record {
     if s.is_closed() || s.is_relayed() || other.is_relayed() {
         return error(NOT_PRESENT);
     }
@@ -1166,7 +1191,7 @@ fn open_channel(d: &Daemon, s: &Session, other: &Session) -> Record {
         channels.insert(channel, [mine, theirs]);
         channel
     };
-    d.endpoint.relay_open(channel, s, other);
+    d.endpoint.relay_open_within(channel, s, other, budget);
     let tell = Record::new()
         .with(0, OP_RELAYED)
         .with(1, channel as u64)
@@ -1192,6 +1217,25 @@ fn holder_token(d: &Daemon, kind: &PeerKind, r: &Record) -> Option<Token> {
 /// are named, so nothing tells the holder whether the others are online. The
 /// ones named are then told where the holder is, and each side tries the other.
 async fn connect_holder(d: &Arc<Daemon>, s: &Session, token: Token) -> Record {
+    let present: Vec<([u8; 32], Session, Vec<SocketAddr>)> = {
+        let mut present = lock(&d.rendezvous.present);
+        present.retain(|_, p| !p.session.is_closed());
+        present
+            .iter()
+            .map(|(k, p)| (*k, p.session.clone(), p.local.clone()))
+            .collect()
+    };
+    connect_holder_among(d, s, token, present).await
+}
+
+/// [`connect_holder`], among the devices `present`: this person's, or a
+/// contact's this device hosts.
+pub(crate) async fn connect_holder_among(
+    d: &Arc<Daemon>,
+    s: &Session,
+    token: Token,
+    present: Vec<([u8; 32], Session, Vec<SocketAddr>)>,
+) -> Record {
     let holder = s.peer_static();
     {
         let mut asked = lock(&d.rendezvous.token_asked);
@@ -1202,15 +1246,7 @@ async fn connect_holder(d: &Arc<Daemon>, s: &Session, token: Token) -> Record {
         asked.retain(|_, t| t.elapsed() < TOKEN_ASK_GAP);
         asked.insert((token, holder), Instant::now());
     }
-    let present: Vec<([u8; 32], Session, Vec<SocketAddr>)> = {
-        let mut present = lock(&d.rendezvous.present);
-        present.retain(|_, p| !p.session.is_closed());
-        present
-            .iter()
-            .filter(|(k, _)| **k != holder)
-            .map(|(k, p)| (*k, p.session.clone(), p.local.clone()))
-            .collect()
-    };
+    let present: Vec<_> = present.into_iter().filter(|(k, ..)| *k != holder).collect();
     tracing::debug!("a token holder looks for {} devices here", present.len());
     let (tx, mut rx) = mpsc::unbounded_channel();
     let ask_id = d
@@ -1291,7 +1327,7 @@ async fn connect_holder(d: &Arc<Daemon>, s: &Session, token: Token) -> Record {
 }
 
 /// One of this person's devices says whether a token holder may reach it.
-fn answered(d: &Daemon, s: &Session, r: &Record) {
+pub(crate) fn answered(d: &Daemon, s: &Session, r: &Record) {
     let who = r.get(1).and_then(Value::as_bytes);
     let Some(who) = who.and_then(|b| <[u8; 32]>::try_from(b).ok()) else {
         return;
@@ -1310,13 +1346,24 @@ fn relay_holder(d: &Daemon, s: &Session, r: &Record) -> Record {
     let Some(device) = r.get(2).and_then(Value::as_bytes) else {
         return error(UNKNOWN);
     };
-    let other = present_device(d, device).filter(|o| {
+    relay_holder_to(d, s, present_device(d, device), None)
+}
+
+/// Opens a channel between a token holder and `other`, if that device agreed
+/// to them lately, within `budget`.
+pub(crate) fn relay_holder_to(
+    d: &Daemon,
+    s: &Session,
+    other: Option<Session>,
+    budget: Option<Arc<std::sync::atomic::AtomicU64>>,
+) -> Record {
+    let other = other.filter(|o| {
         let agreed = lock(&d.rendezvous.agreed);
         let when = agreed.get(&(s.peer_static(), o.peer_static()));
         when.is_some_and(|t| t.elapsed() < AGREED_FOR)
     });
     match other {
-        Some(other) => open_channel(d, s, &other),
+        Some(other) => open_channel_within(d, s, &other, budget),
         None => error(NOT_PRESENT),
     }
 }

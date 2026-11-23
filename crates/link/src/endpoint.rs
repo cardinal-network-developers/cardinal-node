@@ -3,7 +3,7 @@
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, RwLock, Weak};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -339,9 +339,21 @@ async fn given_up(give_up: &mut Option<watch::Receiver<bool>>) {
 struct Relay {
     a: Session,
     b: Session,
+    /// Bytes it may still forward, if it has a limit.
+    budget: Option<Arc<AtomicU64>>,
 }
 
 impl Relay {
+    /// Takes `n` bytes from the budget, if there is room for them.
+    fn spend(&self, n: usize) -> bool {
+        let Some(b) = &self.budget else {
+            return true;
+        };
+        let n = n as u64;
+        b.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |left| left.checked_sub(n))
+            .is_ok()
+    }
+
     /// Where a packet from `from` goes, by the paths the two sessions are on
     /// now: a device behind a NAT can move. Nothing goes on from a path that
     /// does not belong to the channel.
@@ -622,9 +634,23 @@ impl Endpoint {
     /// devices' sessions with this one; what they send each other through
     /// it is end to end, and this device cannot read it.
     pub fn relay_open(&self, channel: u32, a: &Session, b: &Session) {
+        self.relay_open_within(channel, a, b, None);
+    }
+
+    /// [`relay_open`](Self::relay_open), forwarding at most what is left of
+    /// `budget`, in bytes, where there is one: a packet it has no room for
+    /// is dropped. The budget may be shared by several channels.
+    pub fn relay_open_within(
+        &self,
+        channel: u32,
+        a: &Session,
+        b: &Session,
+        budget: Option<Arc<AtomicU64>>,
+    ) {
         let relay = Relay {
             a: a.clone(),
             b: b.clone(),
+            budget,
         };
         lock(&self.inner.relays).insert(channel, relay);
     }
@@ -948,7 +974,9 @@ impl EndpointInner {
                     // As the host: on to the other side, as it came.
                     if let Some(relay) = lock(&self.relays).get(&channel) {
                         if let Some(to) = relay.other_side(path) {
-                            to.try_send(bytes::Bytes::copy_from_slice(pkt));
+                            if relay.spend(pkt.len()) {
+                                to.try_send(bytes::Bytes::copy_from_slice(pkt));
+                            }
                         }
                         return;
                     }

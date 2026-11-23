@@ -350,6 +350,7 @@ fn write_grant(d: &Arc<Daemon>, named: &[Named]) -> anyhow::Result<()> {
             host: identity,
             served: identity,
             services: vec![MAILBOX, RENDEZVOUS, RELAY],
+            classes: Vec::new(),
             storage_bytes: None,
             retention_days: None,
             endpoints: endpoints(named),

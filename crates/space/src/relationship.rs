@@ -1047,3 +1047,110 @@ pub fn held_full(space: &Space) -> Vec<(IdentityId, [u8; 32])> {
         .filter_map(|n| Some((n.creator, as_created(n, 1)?.as_bytes()?.try_into().ok()?)))
         .collect()
 }
+
+/// Host offer kind (`profiles.md#relationship`, D87): its author offers to
+/// host the other member. Author-owned; the devices that serve are the
+/// host serving nodes under it.
+pub const HOST_OFFER: u64 = 18;
+/// Host accepted kind: under an offer, by the member offered it.
+pub const HOST_ACCEPT: u64 = 19;
+/// Host ended kind: under an offer, by either member. Nothing undoes it.
+pub const HOST_END: u64 = 20;
+/// Host serving kind: under an offer, by its author, one for each device
+/// that serves, with its grant in field 1.
+pub const HOST_SERVING: u64 = 21;
+
+fn author_owned() -> Record {
+    Record::new().with(AUTHOR_OWNED_FIELD, 1u64)
+}
+
+/// The ops of an offer to host the other member, served by the devices
+/// whose signed grants are `grants`.
+pub fn create_host_offer(grants: &[Vec<u8>]) -> Vec<SpaceOp> {
+    let mut ops = vec![SpaceOp::create(
+        NodeKind::Uint(HOST_OFFER),
+        ROOT,
+        "host offer",
+        author_owned(),
+    )];
+    for g in grants {
+        let fields = author_owned().with(1, g.clone());
+        ops.push(SpaceOp::create_under(
+            NodeKind::Uint(HOST_SERVING),
+            0,
+            "host serving",
+            fields,
+        ));
+    }
+    ops
+}
+
+/// `create` of one more serving device under an offer.
+pub fn create_host_serving(offer: NodeId, grant: &[u8]) -> SpaceOp {
+    let fields = author_owned().with(1, grant.to_vec());
+    SpaceOp::create(NodeKind::Uint(HOST_SERVING), offer, "host serving", fields)
+}
+
+/// `set` of a serving device's grant: new endpoints, or a new quota.
+pub fn set_host_serving(node: NodeId, grant: &[u8]) -> SpaceOp {
+    SpaceOp::set(node, 1, Some(Value::from(grant.to_vec())))
+}
+
+/// `create` of the yes to an offer.
+pub fn create_host_accept(offer: NodeId) -> SpaceOp {
+    SpaceOp::create(NodeKind::Uint(HOST_ACCEPT), offer, "host accepted", author_owned())
+}
+
+/// `create` of the end of an offer, or of a hosting.
+pub fn create_host_end(offer: NodeId) -> SpaceOp {
+    SpaceOp::create(NodeKind::Uint(HOST_END), offer, "host ended", author_owned())
+}
+
+/// An offer to host, as a relationship space holds it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Hosting {
+    /// The offer node.
+    pub offer: NodeId,
+    /// Who offers: the host.
+    pub host: IdentityId,
+    /// The devices that serve: each node, and the grant it holds now.
+    pub serving: Vec<(NodeId, Vec<u8>)>,
+    /// The other member said yes.
+    pub accepted: bool,
+    /// Either ended it.
+    pub ended: bool,
+}
+
+/// The offers to host in a relationship space, in the order they were
+/// made. Only the offer's author's serving nodes count, and only the other
+/// member's yes; an end counts from either.
+pub fn hostings(space: &Space) -> Vec<Hosting> {
+    let state = space.state();
+    let dag = space.dag();
+    let mut found: Vec<(Option<usize>, Hosting)> = state
+        .children(&ROOT)
+        .into_iter()
+        .filter(|n| n.kind == NodeKind::Uint(HOST_OFFER) && !n.deleted)
+        .map(|o| {
+            let under = state.children(&o.id);
+            let of = |k: u64| under.iter().filter(move |c| c.kind == NodeKind::Uint(k));
+            let serving = of(HOST_SERVING)
+                .filter(|c| !c.deleted && c.creator == o.creator)
+                .filter_map(|c| {
+                    let v = c.values(1).iter().rev().find_map(|v| v.value.as_ref())?;
+                    Some((c.id, v.as_bytes()?.to_vec()))
+                })
+                .collect();
+            let hosting = Hosting {
+                offer: o.id,
+                host: o.creator,
+                serving,
+                accepted: of(HOST_ACCEPT).any(|c| c.creator != o.creator),
+                ended: of(HOST_END).next().is_some(),
+            };
+            (dag.position(&o.created_in), hosting)
+        })
+        .collect();
+    found.sort_by_key(|(at, _)| *at);
+    found.into_iter().map(|(_, h)| h).collect()
+}

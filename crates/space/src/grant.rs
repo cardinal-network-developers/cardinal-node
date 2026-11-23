@@ -123,6 +123,45 @@ impl fmt::Display for Endpoint {
     }
 }
 
+/// A quota class (`hosts.md#grants`): what one token may use. A limit
+/// left out (`None`) is no limit, and 0 is a limit of zero.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct QuotaClass {
+    /// Its number. Class 0 applies to tokens registered without one.
+    pub number: u64,
+    /// Envelopes waiting under one token.
+    pub outstanding: Option<u64>,
+    /// Deposits a day under one token.
+    pub per_day: Option<u64>,
+    /// Relay bytes a day under one token.
+    pub relay_bytes: Option<u64>,
+}
+
+impl QuotaClass {
+    fn to_record(&self) -> Record {
+        Record::new()
+            .with(1, self.number)
+            .with_opt(2, self.outstanding)
+            .with_opt(3, self.per_day)
+            .with_opt(4, self.relay_bytes)
+    }
+
+    fn from_record(r: &Record) -> Option<QuotaClass> {
+        let limit = |k: u64| -> Option<Option<u64>> {
+            match r.get(k) {
+                None => Some(None),
+                Some(v) => v.as_uint().map(Some),
+            }
+        };
+        Some(QuotaClass {
+            number: r.get(1)?.as_uint()?,
+            outstanding: limit(2)?,
+            per_day: limit(3)?,
+            relay_bytes: limit(4)?,
+        })
+    }
+}
+
 /// A host grant.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Grant {
@@ -132,6 +171,8 @@ pub struct Grant {
     pub served: [u8; 32],
     /// Its services.
     pub services: Vec<u64>,
+    /// Its quota classes: none, no limit but the host's own.
+    pub classes: Vec<QuotaClass>,
     /// Bytes of storage granted: `None`, the field left out, when there is
     /// no limit; 0 is none at all.
     pub storage_bytes: Option<u64>,
@@ -152,7 +193,10 @@ impl Grant {
             .with(1, self.host)
             .with(2, self.served)
             .with(3, Value::list(self.services.iter().copied()))
-            .with(4, Value::list(Vec::<Record>::new()))
+            .with(
+                4,
+                Value::list(self.classes.iter().map(QuotaClass::to_record)),
+            )
             .with_opt(5, self.storage_bytes)
             .with_opt(6, self.retention_days)
             .with(
@@ -192,6 +236,14 @@ impl Grant {
                 .iter()
                 .map(Value::as_uint)
                 .collect::<Option<_>>()?,
+            classes: match r.get(4) {
+                None => Vec::new(),
+                Some(v) => v
+                    .as_list()?
+                    .iter()
+                    .map(|c| QuotaClass::from_record(c.as_record()?))
+                    .collect::<Option<_>>()?,
+            },
             // left out, no limit; there, a uint, or it is no grant
             storage_bytes: limit(5)?,
             retention_days: limit(6)?,
@@ -217,6 +269,7 @@ mod tests {
             host: [1; 32],
             served: [1; 32],
             services: vec![STORAGE],
+            classes: Vec::new(),
             storage_bytes: None,
             retention_days: None,
             endpoints: vec![
@@ -279,6 +332,23 @@ mod tests {
         let mut o = SignedObject::new(wrong);
         key.sign_object(&mut o);
         assert_eq!(Grant::open(&o.encode()), None);
+    }
+
+    /// `hosts.md#grants`: a quota class reads back, a limit left out as
+    /// none.
+    #[test]
+    fn quota_classes_read_back() {
+        let key = SigningKey::from_seed(&[2; 32]);
+        let g = Grant {
+            classes: vec![QuotaClass {
+                number: 0,
+                outstanding: Some(256),
+                per_day: Some(0),
+                relay_bytes: None,
+            }],
+            ..grant()
+        };
+        assert_eq!(Grant::open(&g.sign(&key)).unwrap().0, g);
     }
 
     #[test]

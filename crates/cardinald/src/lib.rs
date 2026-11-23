@@ -37,6 +37,7 @@ pub mod introductions;
 pub mod keys;
 pub mod known;
 pub mod lock;
+pub mod hosting;
 pub mod mailbox;
 pub mod mesh;
 pub mod names;
