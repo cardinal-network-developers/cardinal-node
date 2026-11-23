@@ -551,9 +551,9 @@ async fn tick(d: &Arc<Daemon>) {
                 }
                 continue;
             }
-            if !paths.contains_key(&t.device) {
+            if let std::collections::hash_map::Entry::Vacant(e) = paths.entry(t.device) {
                 if let Some(addr) = d.known_addrs(&t.device).into_iter().next() {
-                    paths.insert(t.device, Path::new(t.who, addr, now));
+                    e.insert(Path::new(t.who, addr, now));
                 }
             }
         }

@@ -316,8 +316,11 @@ pub(crate) struct EndpointInner {
     relays: Mutex<HashMap<u32, Relay>>,
     /// Where probes and their answers go (`hosts.md#probe`), if anyone
     /// takes them.
-    probes: Mutex<Option<mpsc::Sender<(Vec<u8>, SocketAddr)>>>,
+    probes: Mutex<Option<mpsc::Sender<Probe>>>,
 }
+
+/// A probe or probe answer as it came, and where from.
+pub type Probe = (Vec<u8>, SocketAddr);
 
 /// How many probes may wait to be looked at; more are dropped.
 const PROBES_WAITING: usize = 256;
@@ -492,7 +495,7 @@ impl Endpoint {
     /// Probes and probe answers that come in over UDP, with where each came
     /// from (`hosts.md#probe`). Only the latest receiver gets them; until
     /// one is taken they are dropped, as are any beyond what waits.
-    pub fn probes(&self) -> mpsc::Receiver<(Vec<u8>, SocketAddr)> {
+    pub fn probes(&self) -> mpsc::Receiver<Probe> {
         let (tx, rx) = mpsc::channel(PROBES_WAITING);
         *lock(&self.inner.probes) = Some(tx);
         rx
