@@ -74,6 +74,8 @@ const AGREED_FOR: Duration = Duration::from_secs(60);
 const TOKEN_ASK_GAP: Duration = Duration::from_secs(1);
 /// How often to look for a trusted contact this device cannot reach.
 const REACH_EVERY: Duration = Duration::from_secs(30);
+/// The person turning to a contact dials them at most this often.
+const TURNED_EVERY: Duration = Duration::from_secs(30);
 /// How long a contact stays in use after this person last turned to them,
 /// or they rang: while they are, their devices are looked for.
 const IN_USE_FOR: Duration = Duration::from_secs(600);
@@ -170,6 +172,15 @@ pub struct Rendezvous {
     /// When this person last turned to each contact, and when that was last
     /// saved, as seconds since 1970.
     pub(crate) in_use: Mutex<HashMap<[u8; 32], (Instant, u64)>>,
+    /// The contacts this person turned to since the reconnect loop last
+    /// looked, and the loop's wakeup: they are dialled at once, also by a
+    /// device that dials nothing on a timer (D86).
+    pub(crate) turned_to: Mutex<HashSet<[u8; 32]>>,
+    pub(crate) turned: tokio::sync::Notify,
+    /// When each contact was last dialled for being turned to: a
+    /// conversation left open turns to them again and again, and that is
+    /// one dial in [`TURNED_EVERY`].
+    turned_at: Mutex<HashMap<[u8; 32], Instant>>,
     /// Where that is kept, so a device restarted mid-conversation still
     /// looks for whom it was talking to.
     in_use_path: Option<PathBuf>,
@@ -392,6 +403,15 @@ impl Rendezvous {
             used.insert(*who, (Instant::now(), if save { at } else { saved }));
             save
         };
+        let again = {
+            let mut at = lock(&self.turned_at);
+            at.retain(|_, t| t.elapsed() < TURNED_EVERY);
+            at.insert(*who, Instant::now()).is_none()
+        };
+        if again {
+            lock(&self.turned_to).insert(*who);
+            self.turned.notify_one();
+        }
         if save {
             self.save();
         }

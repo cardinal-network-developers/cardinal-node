@@ -266,6 +266,11 @@ pub struct Daemon {
     /// Addresses of devices.
     pub book: Mutex<PeerBook>,
     backoff: Mutex<HashMap<KeyId, (Instant, Duration)>>,
+    /// The slow rounds of a device that does not help and is in touch
+    /// with nobody (`redial.rs`).
+    sparing: Mutex<crate::redial::Sparing>,
+    /// How often each device was dialled since this one started.
+    dials: Mutex<HashMap<KeyId, u64>>,
     /// Devices whose sessions closed on something one side could not read
     /// (`unreadable.rs`).
     pub unreadable: crate::unreadable::Unreadables,
@@ -576,6 +581,8 @@ impl Daemon {
             sessions: Mutex::new(HashMap::new()),
             book: Mutex::new(book),
             backoff: Mutex::new(HashMap::new()),
+            sparing: Mutex::new(crate::redial::Sparing::new(Instant::now())),
+            dials: Mutex::new(HashMap::new()),
             unreadable: Default::default(),
             connecting: Mutex::new(HashSet::new()),
             changed: watch::channel(0).0,
@@ -752,6 +759,9 @@ impl Daemon {
         }
         self.unreadable.network_changed();
         self.known.woke();
+        // What was not reached on the old network may be on this one.
+        lock(&self.backoff).clear();
+        lock(&self.sparing).start_over(Instant::now());
         crate::hosting::network_changed(self);
         // A permit is kept if discovery is between rounds.
         self.rediscover.notify_one();
@@ -770,7 +780,10 @@ impl Daemon {
         }
         let d = self.clone();
         tokio::spawn(async move {
-            // Long enough for an answer to be missed (`answer_timeout`).
+            // At once what has no session, and those whose sessions were
+            // over the old network once they have had time to say so:
+            // long enough for an answer to be missed (`answer_timeout`).
+            d.connect_all().await;
             tokio::time::sleep(Duration::from_secs(11)).await;
             d.connect_all().await;
             crate::rendezvous::reach_contacts(d.clone()).await;
@@ -1702,28 +1715,82 @@ impl Daemon {
     /// (`sync.md#neighbours`), and of those this device stays in touch with
     /// because its person has no host.
     pub async fn connect_all(self: &Arc<Self>) {
-        self.connect_to(true).await;
+        self.connect_to(Dial::All).await;
     }
 
-    /// [`connect_all`](Self::connect_all), as the reconnect loop does it
-    /// every few seconds: a device that does not help others, and that an
-    /// anchor keeps in touch, dials no neighbours then. It dials them when
-    /// it wakes, when its network changes and when its person turns to
-    /// them; between, its anchors and the sessions others open to it are
-    /// its neighbours (D86). With no anchor, it keeps them itself.
+    /// A pass of the reconnect loop, every few seconds (`redial.rs`). A
+    /// device that helps others dials what [`connect_all`](Self::connect_all)
+    /// does, each device it does not reach less and less often. One that
+    /// does not help dials nothing on a timer: it dials when it wakes,
+    /// when its network changes and when its person turns to someone, and
+    /// between, its anchors and the sessions others open to it keep it in
+    /// touch (D86). Only while it is in touch with nobody does it dial its
+    /// own devices and its neighbours, a few times an hour.
     pub async fn reconnect(self: &Arc<Self>) {
-        let neighbours = self.conditions.helps() || !self.known.anchored();
-        self.connect_to(neighbours).await;
+        if let Some(what) = self.pass(Instant::now()) {
+            self.connect_to(what).await;
+        }
     }
 
-    /// The devices to dial: own devices, those of the contacts in use,
-    /// those this device stays in touch with, and, with `neighbours`, the
-    /// neighbours.
-    pub(crate) fn to_dial(
-        &self,
-        neighbours: bool,
-    ) -> Vec<(KeyId, cardinal_crypto::HybridPublicKey)> {
-        let standing = crate::rendezvous::standing(self);
+    /// What a pass of the reconnect loop at `now` dials, if anything.
+    pub(crate) fn pass(&self, now: Instant) -> Option<Dial> {
+        if self.conditions.helps() {
+            // and when it stops helping, its slow rounds start then
+            lock(&self.sparing).start_over(now);
+            return Some(Dial::All);
+        }
+        let alone = self.own_sessions().is_empty() && !self.known.anchored();
+        lock(&self.sparing).due(now, alone).then_some(Dial::Sparing)
+    }
+
+    /// This person turned to contacts: their devices are dialled at once,
+    /// whatever they were waiting for, and the rest as on waking.
+    pub async fn turned_to(self: &Arc<Self>, who: HashSet<[u8; 32]>) {
+        let theirs: Vec<KeyId> = {
+            let core = self.core();
+            who.iter()
+                .filter_map(|w| core.others.get(w))
+                .flat_map(|o| o.log.state().keys.keys().copied().collect::<Vec<_>>())
+                .collect()
+        };
+        {
+            let mut b = lock(&self.backoff);
+            for k in &theirs {
+                b.remove(k);
+            }
+        }
+        lock(&self.sparing).start_over(Instant::now());
+        self.connect_all().await;
+    }
+
+    /// How often this device dialled `device`, and how long it waits before
+    /// the next try, if it does.
+    pub fn dialled(&self, device: &KeyId) -> (u64, Option<Duration>) {
+        let n = lock(&self.dials).get(device).copied().unwrap_or(0);
+        let wait = lock(&self.backoff).get(device).map(|(_, w)| *w);
+        (n, wait)
+    }
+
+    /// When the reconnect loop dials next (`redial.rs`).
+    pub fn redial_json(&self) -> serde_json::Value {
+        let helps = self.conditions.helps();
+        serde_json::json!({
+            "helps": helps,
+            "alone": self.own_sessions().is_empty() && !self.known.anchored(),
+            "sparing": (!helps).then(|| lock(&self.sparing).json(Instant::now())),
+        })
+    }
+
+    /// The devices to dial: own devices and the neighbours, and, for
+    /// [`Dial::All`], those of the contacts in use and those this device
+    /// stays in touch with.
+    pub(crate) fn to_dial(&self, what: Dial) -> Vec<(KeyId, cardinal_crypto::HybridPublicKey)> {
+        let all = what == Dial::All;
+        let standing = if all {
+            crate::rendezvous::standing(self)
+        } else {
+            Vec::new()
+        };
         let devices: Vec<(KeyId, cardinal_crypto::HybridPublicKey)> = {
             let core = self.core();
             let Some(ident) = core.identity.as_ref() else {
@@ -1736,7 +1803,7 @@ impl Daemon {
                 .collect();
             let contacts = core.contacts();
             self.rendezvous.knows(contacts.iter().map(|c| c.identity));
-            let wanted = contacts.iter().filter(|c| c.connects());
+            let wanted = contacts.iter().filter(|c| all && c.connects());
             for c in wanted.filter(|c| self.rendezvous.in_use(&c.identity)) {
                 let Some(o) = core.others.get(&c.identity) else {
                     continue;
@@ -1754,11 +1821,7 @@ impl Daemon {
                 }
             }
             // and the neighbours (`sync.md#neighbours`)
-            let neighbours = if neighbours {
-                self.neighbours.devices()
-            } else {
-                HashSet::new()
-            };
+            let neighbours = self.neighbours.devices();
             for c in contacts.iter().filter(|c| c.connects()) {
                 let Some(o) = core.others.get(&c.identity) else {
                     continue;
@@ -1776,13 +1839,14 @@ impl Daemon {
         devices
     }
 
-    async fn connect_to(self: &Arc<Self>, neighbours: bool) {
-        let devices = self.to_dial(neighbours);
+    async fn connect_to(self: &Arc<Self>, what: Dial) {
+        let devices = self.to_dial(what);
         for (key, link) in devices {
             if self.is_direct_ip(link.x25519()) {
                 continue;
             }
-            {
+            // A slow round is a wait of its own.
+            if what == Dial::All {
                 let b = lock(&self.backoff);
                 if let Some((next, _)) = b.get(&key) {
                     if Instant::now() < *next {
@@ -1797,16 +1861,14 @@ impl Daemon {
                 continue;
             }
             self.neighbours.dialling(&key);
+            *lock(&self.dials).entry(key).or_default() += 1;
             let d = self.clone();
             tokio::spawn(async move {
                 let ok = d.try_device(key, link).await;
                 lock(&d.connecting).remove(&key);
                 if !ok {
                     let mut b = lock(&d.backoff);
-                    let delay = b
-                        .get(&key)
-                        .map(|(_, d)| (*d * 2).min(Duration::from_secs(60)))
-                        .unwrap_or(Duration::from_secs(1));
+                    let delay = crate::redial::after(b.get(&key).map(|(_, w)| *w));
                     b.insert(key, (Instant::now() + delay, delay));
                 }
             });
@@ -2365,9 +2427,17 @@ impl Daemon {
         let d = self.clone();
         tokio::spawn(async move {
             let mut t = tokio::time::interval(Duration::from_secs(2));
+            // Starting is waking.
+            t.tick().await;
+            d.connect_all().await;
             loop {
-                t.tick().await;
-                d.reconnect().await;
+                tokio::select! {
+                    _ = t.tick() => d.reconnect().await,
+                    _ = d.rendezvous.turned.notified() => {
+                        let who = std::mem::take(&mut *lock(&d.rendezvous.turned_to));
+                        d.turned_to(who).await;
+                    }
+                }
             }
         });
         // counters
@@ -2638,6 +2708,18 @@ fn route(s: &Session) -> String {
 /// Why a session closed, in words.
 /// How long a device that closed a session with "prove first" is left
 /// before it is dialled again.
+/// What a round of dialling reaches for (`redial.rs`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Dial {
+    /// Own devices, the contacts in use, those this device stays in touch
+    /// with and the neighbours: on waking, on a network change, when the
+    /// person turns to someone, and on each pass of a device that helps.
+    All,
+    /// Own devices and the neighbours, whatever they wait for: the slow
+    /// round of a device that does not help and is in touch with nobody.
+    Sparing,
+}
+
 const PROVE_FIRST_BACKOFF: Duration = Duration::from_secs(60);
 
 /// Whether a session was closed by the other end because this device is

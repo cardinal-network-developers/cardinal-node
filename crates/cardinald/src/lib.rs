@@ -54,6 +54,7 @@ pub mod portmap;
 pub mod presence;
 pub mod recovering;
 pub mod recovery;
+pub mod redial;
 pub mod rendezvous;
 pub mod sched;
 pub mod settings;

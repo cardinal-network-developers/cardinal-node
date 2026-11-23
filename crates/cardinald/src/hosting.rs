@@ -1569,11 +1569,13 @@ mod tests {
         assert!(!due(Some(&ok), one, 0, much_later));
     }
 
-    /// Review M4. A device that does not help others, kept in touch by an
-    /// anchor, dials no neighbours in the reconnect loop's passes; when it
-    /// wakes, it does.
+    /// Review M4, and the battery review: a device that does not help
+    /// others dials nobody in the reconnect loop's passes, only in a slow
+    /// round while it is in touch with nobody, and then only its own
+    /// devices and its neighbours; when it wakes, it dials them all.
     #[tokio::test(flavor = "multi_thread")]
-    async fn a_device_that_does_not_help_dials_no_neighbours_on_a_timer() {
+    async fn a_device_that_does_not_help_dials_nobody_on_a_timer() {
+        use crate::daemon::Dial;
         let h = Two::new().await;
         // with a host of its own, it stays in touch with nobody for that
         crate::host::enable(&h.d, &["203.0.113.5:7171".to_owned()]).unwrap();
@@ -1581,10 +1583,24 @@ mod tests {
         let x = *h.bo_keys.link.public_key().x25519();
         h.d.neighbours.choose_now(bo, x, Instant::now());
         let has = |list: Vec<(KeyId, _)>| list.iter().any(|(k, _)| *k == bo);
-        assert!(has(h.d.to_dial(true)), "on waking");
+        assert!(has(h.d.to_dial(Dial::All)), "on waking");
         // and its person is not turning to Bo, a contact new no longer
         lock(&h.d.rendezvous.in_use).clear();
-        assert!(has(h.d.to_dial(true)), "on waking");
-        assert!(!has(h.d.to_dial(false)), "on a timer");
+        assert!(has(h.d.to_dial(Dial::All)), "on waking");
+        assert!(has(h.d.to_dial(Dial::Sparing)), "a neighbour");
+        h.d.conditions.tell(crate::conditions::Told {
+            plugged_in: false,
+            metered: false,
+        });
+        let now = Instant::now();
+        assert_eq!(h.d.pass(now), None, "on a timer");
+        let later = now + crate::redial::SPARING_FIRST;
+        assert_eq!(h.d.pass(later), Some(Dial::Sparing), "alone, slowly");
+        assert_eq!(h.d.pass(later + Duration::from_secs(60)), None);
+        h.d.conditions.tell(crate::conditions::Told {
+            plugged_in: true,
+            metered: false,
+        });
+        assert_eq!(h.d.pass(now), Some(Dial::All), "helping");
     }
 }

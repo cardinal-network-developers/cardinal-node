@@ -16,10 +16,11 @@
 //! A device that does not help sends no keepalives of its own: its
 //! anchors keep its sessions alive, and it only answers. Only when none of
 //! its sessions is kept alive by an anchor does it ping its neighbours, and
-//! then about every two minutes. While an anchor keeps it in touch, it
-//! dials no neighbours on a timer either: only when it wakes, when its
-//! network changes, or when its person turns to them; between, its anchors
-//! and the sessions others open to it are its neighbours.
+//! then about every two minutes. Nor does it dial its neighbours on a
+//! timer: only when it wakes, when its network changes, or when its person
+//! turns to someone; between, its anchors and the sessions others open to
+//! it are its neighbours. In touch with nobody, it dials them a few times
+//! an hour at most (`redial.rs`).
 //!
 //! A neighbour not reached is let go and rests, ten minutes at first and
 //! twice as long each time it is not reached again, up to four hours, and

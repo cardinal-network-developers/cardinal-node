@@ -1221,6 +1221,7 @@ fn devices(d: &Daemon) -> Vec<Value> {
             let x = k.link_key.as_ref().map(|l| *l.x25519());
             let online = k.key == me || x.is_some_and(|x| d.is_online(&x));
             let carrier = x.and_then(|x| d.session_carrier(&x));
+            let (dials, redial) = d.dialled(&k.key);
             let through = x
                 .and_then(|x| d.relayed_through(&x))
                 .and_then(|h| by_link.get(&h));
@@ -1247,6 +1248,10 @@ fn devices(d: &Daemon) -> Vec<Value> {
                 "addr": if k.key == me || carrier == Some("relay") { None } else { addr },
                 "carrier": carrier,
                 "through": through,
+                // how often this device dialled it, and the wait before
+                // the next try (`redial.rs`)
+                "dials": dials,
+                "redial_s": redial.map(|w| w.as_secs()),
                 // what this device's fetcher thinks of it as a source
                 "fetch": x.and_then(|x| stats.get(&x)).map(|s| json!({
                     "rate": s.rate as u64,
@@ -1353,6 +1358,7 @@ fn status(d: &Arc<Daemon>) -> Value {
         "progress": progress,
         "copies": crate::copies::status(d),
         "conditions": d.conditions.json(),
+        "redial": d.redial_json(),
         "carrying_calls": crate::calls::carried(d),
         "old": crate::cleanup::status(d),
         "pairing": pairing,
