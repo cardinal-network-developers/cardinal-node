@@ -199,6 +199,9 @@ pub struct Known {
     woke: AtomicBool,
     checking_until: Mutex<Option<Instant>>,
     keys: Mutex<Keys>,
+    /// The contacts' devices seen keeping a session alive, by link key:
+    /// anchors, whose silence means they went away.
+    anchors: Mutex<HashSet<[u8; 32]>>,
 }
 
 impl Known {
@@ -694,10 +697,32 @@ fn keepalives(d: &Daemon) {
     let used = d.rendezvous.used_at();
     let neighbours = d.neighbours.statics();
     let helps = d.conditions.helps();
-    let anchored = !helps
-        && sessions
-            .iter()
-            .any(|(_, s)| s.pinged_twice_within(crate::neighbours::ANCHOR_PINGS_WITHIN));
+    let within = crate::neighbours::ANCHOR_PINGS_WITHIN;
+    let mut sessions = sessions;
+    {
+        // A session only answered sees no ping of its own go unanswered:
+        // an anchor that has gone quiet has gone, or stopped helping, and
+        // its session is let go, so that it is dialled again or replaced.
+        let mut anchors = lock(&d.known.anchors);
+        anchors.retain(|x| sessions.iter().any(|(_, s)| s.peer_static() == *x));
+        for (_, s) in &sessions {
+            if s.pinged_twice_within(within) {
+                anchors.insert(s.peer_static());
+            }
+        }
+        sessions.retain(|(_, s)| {
+            let quiet = anchors.contains(&s.peer_static())
+                && s.keepalive().is_none()
+                && s.last_heard().elapsed() > within;
+            if quiet {
+                tracing::info!("an anchor went quiet: letting its session go");
+                anchors.remove(&s.peer_static());
+                s.close("quiet");
+            }
+            !quiet
+        });
+    }
+    let anchored = !helps && sessions.iter().any(|(_, s)| s.pinged_twice_within(within));
     let keep: HashSet<[u8; 32]> = if helps {
         let all = sessions
             .iter()

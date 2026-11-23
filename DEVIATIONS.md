@@ -2516,7 +2516,9 @@ asks for around that is not built yet.
   backoff; they are not looked for through hosts or by a probe of the
   network, which stay for the contacts in use.
   An anchor is known by its pings: a contact's session the other side
-  pinged twice within 60 s is kept alive by one.
+  pinged twice within 60 s is kept alive by one, and one that then
+  goes quiet for 60 s is let go (the phone that only answers has no ping of
+  its own to go unanswered), so that it is dialled again or replaced.
 - **Only a person's own device is a host.** A device with `cardinal host`
   grants itself to its own identity, the case `hosts.md#grants` calls the
   common one. It holds spaces as any of the person's devices does, under

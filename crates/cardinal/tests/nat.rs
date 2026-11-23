@@ -887,7 +887,7 @@ fn a_phone_that_wakes_reaches_a_contacts_anchor_and_is_found_through_it() {
     assert!(kept(&ana, "bo"), "{}", status_of(&ana, "bo"));
     // The anchor is one of the phone's lifelines (`sync.md#neighbours`);
     // the phone sends it no pings, and only answers the anchor's.
-    wait("the phone leaves the keepalives to the anchor", 30, || {
+    wait("the phone leaves the keepalives to the anchor", 90, || {
         theirs(&bo, "Ana").is_some_and(|x| x["neighbour"] == true && x["kept_alive_s"].is_null())
     });
     assert_eq!(
@@ -1087,15 +1087,17 @@ fn a_family_group_hears_each_other_through_its_neighbours() {
         json!({"cmd": "conditions", "plugged_in": true, "metered": false}),
     );
     for d in &family {
-        wait("the phone joins the anchor again", 90, || {
+        wait("the phone joins the anchor again", 150, || {
             neighbour_online(d, "Ana")
         });
     }
-    let held = ask(&desk, json!({"cmd": "contacts"}))["contacts"]
-        .as_array()
-        .cloned()
-        .unwrap_or_default();
-    assert!(held.iter().all(|c| c["connected"] == true), "{held:?}");
+    // A phone only answers the anchor, so it learns the old session is gone
+    // when the anchor goes quiet on it.
+    wait("the anchor holds every phone again", 150, || {
+        ask(&desk, json!({"cmd": "contacts"}))["contacts"]
+            .as_array()
+            .is_some_and(|c| c.iter().all(|c| c["connected"] == true))
+    });
 
     // Bo writes; nobody opens anything, and everyone has it promptly.
     let start = std::time::Instant::now();
@@ -1134,7 +1136,7 @@ fn a_family_group_hears_each_other_through_its_neighbours() {
     for d in &family {
         wait(
             "with no anchor, the phone pings every two minutes",
-            120,
+            180,
             || pings_neighbours(d, "Ana", json!(120)),
         );
     }
