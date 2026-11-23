@@ -350,8 +350,10 @@ impl Relay {
             return true;
         };
         let n = n as u64;
-        b.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |left| left.checked_sub(n))
-            .is_ok()
+        b.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |left| {
+            left.checked_sub(n)
+        })
+        .is_ok()
     }
 
     /// Where a packet from `from` goes, by the paths the two sessions are on

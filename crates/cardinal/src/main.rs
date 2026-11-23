@@ -3780,9 +3780,9 @@ async fn client(cmd: Cmd) -> anyhow::Result<()> {
                     (true, true) => format!("You host {name}"),
                     (true, false) => format!("You offered to host {name}"),
                     (false, true) => format!("{name} hosts you"),
-                    (false, false) => format!(
-                        "{name} offers to host you: `cardinal hosting accept {name}`"
-                    ),
+                    (false, false) => {
+                        format!("{name} offers to host you: `cardinal hosting accept {name}`")
+                    }
                 };
                 let on: Vec<&str> = h["devices"]
                     .as_array()
@@ -3801,7 +3801,9 @@ async fn client(cmd: Cmd) -> anyhow::Result<()> {
                     .unwrap_or_default();
                 println!(
                     "  {line}{on} ({} envelopes, {} MB relayed a day{waiting})",
-                    h["envelopes"].as_u64().map_or("any".into(), |n| n.to_string()),
+                    h["envelopes"]
+                        .as_u64()
+                        .map_or("any".into(), |n| n.to_string()),
                     h["relay_bytes"]
                         .as_u64()
                         .map_or("any".into(), |n| (n / 1_000_000).to_string()),

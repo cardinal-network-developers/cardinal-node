@@ -1098,12 +1098,22 @@ pub fn set_host_serving(node: NodeId, grant: &[u8]) -> SpaceOp {
 
 /// `create` of the yes to an offer.
 pub fn create_host_accept(offer: NodeId) -> SpaceOp {
-    SpaceOp::create(NodeKind::Uint(HOST_ACCEPT), offer, "host accepted", author_owned())
+    SpaceOp::create(
+        NodeKind::Uint(HOST_ACCEPT),
+        offer,
+        "host accepted",
+        author_owned(),
+    )
 }
 
 /// `create` of the end of an offer, or of a hosting.
 pub fn create_host_end(offer: NodeId) -> SpaceOp {
-    SpaceOp::create(NodeKind::Uint(HOST_END), offer, "host ended", author_owned())
+    SpaceOp::create(
+        NodeKind::Uint(HOST_END),
+        offer,
+        "host ended",
+        author_owned(),
+    )
 }
 
 /// An offer to host, as a relationship space holds it.

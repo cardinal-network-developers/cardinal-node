@@ -12,11 +12,11 @@ mod common;
 
 use common::*;
 use serde_json::{json, Value};
-use std::time::Duration;
 use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use tokio::net::UdpSocket;
 
@@ -142,7 +142,6 @@ async fn back(
     }
 }
 
-
 fn behind(d: &mut Dev, nat: &Nat) {
     d.stop();
     d.env.retain(|(k, _)| k != "CARDINAL_TEST_UDP_GATEWAY");
@@ -188,7 +187,11 @@ fn three(root: &std::path::Path) -> (Dev, Dev, Dev) {
     let mut daniel = Dev::new(root, "daniel", free_port());
     let mut grandma = Dev::new(root, "grandma", free_port());
     let mut ben = Dev::new(root, "ben", free_port());
-    for (d, name) in [(&mut daniel, "daniel"), (&mut grandma, "grandma"), (&mut ben, "ben")] {
+    for (d, name) in [
+        (&mut daniel, "daniel"),
+        (&mut grandma, "grandma"),
+        (&mut ben, "ben"),
+    ] {
         d.start();
         d.cli(&["init", "--yes", "--name", name]);
         d.wait_mounted();
@@ -251,7 +254,9 @@ fn a_contacts_anchor_hosts_grandma() {
     // Her phone wakes behind a router: it collects what waited.
     behind(&mut grandma, &ng);
     wait("grandma reads it", 60, || {
-        grandma.cli(&["messages", "Ben"]).contains("while you were away")
+        grandma
+            .cli(&["messages", "Ben"])
+            .contains("while you were away")
     });
     assert!(
         grandma.log().contains("envelopes left with"),
@@ -265,7 +270,9 @@ fn a_contacts_anchor_hosts_grandma() {
         c["connected"] == true && c["relayed"] == true
     });
     assert!(
-        daniel.log().contains("a token holder looks for 1 devices here"),
+        daniel
+            .log()
+            .contains("a token holder looks for 1 devices here"),
         "the anchor did not introduce them"
     );
     wait("grandma reads it", 30, || {
@@ -303,7 +310,9 @@ fn a_full_mailbox_refuses() {
     wait("one waits", 60, || waiting_at(&daniel) == 1);
     ben.cli(&["say", "Grandma", "two"]);
     wait("the second is refused", 60, || {
-        daniel.log().contains("mailbox here is full under one token")
+        daniel
+            .log()
+            .contains("mailbox here is full under one token")
     });
     assert_eq!(waiting_at(&daniel), 1);
     grandma.start();

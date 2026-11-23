@@ -593,7 +593,8 @@ fn answer(d: &Daemon, s: &Session, r: &Record) -> Record {
         PeerKind::Own(device) => device,
         // a device of a contact this one hosts, for their own mailbox
         PeerKind::Contact(who, device) => {
-            return crate::hosting::answer_owner(d, &who, &device, r).unwrap_or(error(NOT_PERMITTED))
+            return crate::hosting::answer_owner(d, &who, &device, r)
+                .unwrap_or(error(NOT_PERMITTED))
         }
         _ => return error(NOT_PERMITTED),
     };
@@ -1828,7 +1829,12 @@ pub(crate) async fn collect_at(d: &Arc<Daemon>, s: &Session) -> anyhow::Result<u
         }
     }
     if let Some(sequence) = acked {
-        call(s, Service::MAILBOX, Record::new().with(0, OP_ACK).with(1, sequence)).await?;
+        call(
+            s,
+            Service::MAILBOX,
+            Record::new().with(0, OP_ACK).with(1, sequence),
+        )
+        .await?;
     }
     Ok(taken)
 }

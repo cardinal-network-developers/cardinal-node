@@ -257,7 +257,11 @@ fn ever_offered(d: &Daemon) -> HashSet<[u8; 32]> {
     let mut out = HashSet::new();
     for (who, _, _, h) in all(d) {
         if h.host == who {
-            out.extend(grants(d, &who, &me, &h).iter().map(|(_, g)| *g.link_key.x25519()));
+            out.extend(
+                grants(d, &who, &me, &h)
+                    .iter()
+                    .map(|(_, g)| *g.link_key.x25519()),
+            );
         }
     }
     out
@@ -281,7 +285,10 @@ pub(crate) fn is_hosted_token(d: &Daemon, token: &Token) -> bool {
 fn token_owner(d: &Daemon, token: &Token) -> Option<Serving> {
     let who = {
         let stores = lock(&d.mailbox.hosted.stores);
-        stores.iter().find(|(_, s)| s.is_active(token)).map(|(w, _)| *w)
+        stores
+            .iter()
+            .find(|(_, s)| s.is_active(token))
+            .map(|(w, _)| *w)
     }?;
     serving(d).into_iter().find(|s| s.who == who && s.active)
 }
@@ -451,20 +458,22 @@ pub(crate) async fn serve_rendezvous(
     let owner = token_owner(d, &token)?;
     let present = present_of(d, &owner.who);
     match op {
-        Some(OP_CONNECT) if rendezvous => {
-            Some(Some(crate::rendezvous::connect_holder_among(d, s, token, present).await))
-        }
+        Some(OP_CONNECT) if rendezvous => Some(Some(
+            crate::rendezvous::connect_holder_among(d, s, token, present).await,
+        )),
         Some(OP_RELAY) if !rendezvous => {
             if !d.conditions.helps() {
                 return Some(Some(mailbox::error(BUSY)));
             }
             let device = r.get(2).and_then(Value::as_bytes)?;
-            let other = present
-                .into_iter()
-                .map(|(_, s, _)| s)
-                .find(|o| o.peer_identity().is_some_and(|p| p.signing_key.as_slice() == device));
+            let other = present.into_iter().map(|(_, s, _)| s).find(|o| {
+                o.peer_identity()
+                    .is_some_and(|p| p.signing_key.as_slice() == device)
+            });
             let budget = relay_budget(d, &token, &owner.class);
-            Some(Some(crate::rendezvous::relay_holder_to(d, s, other, budget)))
+            Some(Some(crate::rendezvous::relay_holder_to(
+                d, s, other, budget,
+            )))
         }
         _ => Some(Some(mailbox::error(mailbox::UNKNOWN))),
     }
@@ -729,7 +738,10 @@ async fn take_out(d: &Arc<Daemon>, hosts: &[MyHost]) {
             if !named.iter().any(|r| gone.contains(&r.host)) {
                 continue;
             }
-            let kept: Vec<Reach> = named.into_iter().filter(|r| !gone.contains(&r.host)).collect();
+            let kept: Vec<Reach> = named
+                .into_iter()
+                .filter(|r| !gone.contains(&r.host))
+                .collect();
             (kept, mailbox::Decided::now(&core, &space))
         };
         let set = relationship::set_reach(&me, &reach);
@@ -921,7 +933,10 @@ pub fn end(d: &Arc<Daemon>, who: &str) -> anyhow::Result<Json> {
         .map(|(_, _, _, h)| h.offer)
         .collect();
     if !open.is_empty() {
-        let ops = open.into_iter().map(relationship::create_host_end).collect();
+        let ops = open
+            .into_iter()
+            .map(relationship::create_host_end)
+            .collect();
         d.write_and_push(&contact.space, ops)?;
     }
     Ok(json!({"ended": true}))
