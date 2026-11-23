@@ -42,6 +42,8 @@ const CHECK_EVERY: Duration = Duration::from_secs(30 * 60);
 const MAX_WAIT: Duration = Duration::from_secs(4 * 3600);
 /// How long an answer to a probe may take.
 const ANSWER_WITHIN: Duration = Duration::from_secs(5);
+/// How long a look tries a known path.
+const PATH_WITHIN: Duration = Duration::from_secs(3);
 /// How long a dial on waking may take before it counts as a miss.
 const DIAL_WITHIN: Duration = Duration::from_secs(60);
 /// How far a probe's time may be from this device's clock, in seconds.
@@ -697,12 +699,16 @@ pub async fn try_paths(d: &Arc<Daemon>, who: &[u8; 32]) {
         .collect();
     let mut tries = tokio::task::JoinSet::new();
     for t in theirs {
-        let Some(p) = d.known.path(&t.device) else {
+        // One that did not answer its last check is away: a look does not
+        // wait on it.
+        let Some(p) = d.known.path(&t.device).filter(|p| p.misses == 0) else {
             continue;
         };
         let d = d.clone();
         tries.spawn(async move {
-            let r = d.dial(|c| Target::new(p.addr, c, &t.link)).await;
+            let target =
+                Target::new(p.addr, cardinal_link::CarrierKind::Udp, &t.link).within(PATH_WITHIN);
+            let r = d.endpoint.connect(target).await;
             (t, p.addr, r)
         });
     }
@@ -784,7 +790,9 @@ pub async fn sweep(d: &Arc<Daemon>, who: [u8; 32]) -> usize {
             }
         }
     }
-    if to.is_empty() {
+    // A device behind the tests' simulated NAT has no network of its own:
+    // everything it sends goes through the one gateway.
+    if to.is_empty() || std::env::var_os("CARDINAL_TEST_UDP_GATEWAY").is_some() {
         return 0;
     }
     lock(&d.known.sent).push_back(Sent {

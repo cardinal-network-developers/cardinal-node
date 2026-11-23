@@ -1496,9 +1496,12 @@ async fn reach(d: &Arc<Daemon>, who: [u8; 32], space: SpaceId) {
     );
     // Their own devices first: an anchor of this person's may be in touch.
     through_helpers(d, &who).await;
-    if !all_reached(d, &who) {
-        crate::known::try_paths(d, &who).await;
-    }
+    // Then their known paths, beside their hosts, so neither waits on the
+    // other.
+    let paths = (!all_reached(d, &who)).then(|| {
+        let d = d.clone();
+        tokio::spawn(async move { crate::known::try_paths(&d, &who).await })
+    });
     tracing::debug!("looking for {} at {} hosts", short(&who), reach.len());
     for (r, addr) in usable {
         if all_reached(d, &who) {
@@ -1530,6 +1533,9 @@ async fn reach(d: &Arc<Daemon>, who: [u8; 32], space: SpaceId) {
                 .step(&who, Some(false), format!("their host at {addr}: {e:#}"));
             tracing::debug!("looking for {} at {addr}: {e:#}", short(&who));
         }
+    }
+    if let Some(p) = paths {
+        let _ = p.await;
     }
     // Last, when nothing found any of theirs: this device's own network,
     // where multicast may not carry (`hosts.md#looking-for-someone`).
