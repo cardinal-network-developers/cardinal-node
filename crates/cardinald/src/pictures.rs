@@ -171,11 +171,13 @@ impl Pictures {
         }
     }
 
-    /// This device's window asks a sender for a level; 0 stops it.
+    /// This device's window asks a sender for a level; 0 stops it. It asks
+    /// at most as many senders as one `levels` names: past them a new one
+    /// is not asked.
     pub fn set_window(&mut self, voice: Voice, level: u8) {
         if level == 0 {
             self.window.remove(&voice);
-        } else {
+        } else if self.window.len() < MOST_ASKED || self.window.contains_key(&voice) {
             self.window.insert(voice, level.min(LARGE));
         }
     }
@@ -447,6 +449,22 @@ mod tests {
         p.on_levels(link(4), &[(BEN, 1)], now);
         p.on_levels(link(5), &[(BEN, 0)], now);
         (p, HashMap::from([(BEN, link(2))]), now)
+    }
+
+    #[test]
+    fn the_window_asks_a_bounded_number_of_senders() {
+        let mut p = Pictures::default();
+        for i in 0..MOST_ASKED + 10 {
+            p.set_window([i as u8, 1, 0, 0, 0, 0, 0, 0], LARGE);
+        }
+        assert_eq!(p.window.len(), MOST_ASKED);
+        // one already asked is still changed, and one stopped makes room
+        p.set_window([0, 1, 0, 0, 0, 0, 0, 0], SMALL);
+        assert_eq!(p.window.get(&[0, 1, 0, 0, 0, 0, 0, 0]), Some(&SMALL));
+        p.set_window([0, 1, 0, 0, 0, 0, 0, 0], 0);
+        p.set_window([200, 1, 0, 0, 0, 0, 0, 0], LARGE);
+        assert!(p.window.contains_key(&[200, 1, 0, 0, 0, 0, 0, 0]));
+        assert_eq!(p.window.len(), MOST_ASKED);
     }
 
     #[test]

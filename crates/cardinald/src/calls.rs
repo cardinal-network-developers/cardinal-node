@@ -269,6 +269,9 @@ pub struct Group {
     /// The signing keys of the group's devices, by voice, and when read.
     keys: HashMap<Voice, [u8; 32]>,
     keys_at: Option<Instant>,
+    /// The members last seen in the group: when they change, as when
+    /// someone leaves, the keys are read again.
+    members: std::collections::HashSet<[u8; 32]>,
     /// The number of this device's next frame.
     next: u32,
     /// Its person called, and nobody else is on it yet.
@@ -1111,6 +1114,7 @@ fn new_group(space: SpaceId, own: Option<Voice>, waiting: bool) -> Group {
         linked: 0,
         keys: HashMap::new(),
         keys_at: None,
+        members: std::collections::HashSet::new(),
         next: mesh::first_number(),
         waiting,
         asked: HashMap::new(),
@@ -1291,6 +1295,7 @@ async fn drive(d: Arc<Daemon>, id: [u8; 16], mut over: watch::Receiver<bool>) {
         let mut out: Vec<(Session, [u8; 16], Vec<u8>)> = Vec::new();
         let mut silent = Vec::new();
         let mut done = false;
+        let mut rekey = false;
         {
             let mut gs = groups(&d);
             let Some(g) = gs.get_mut(&id) else { return };
@@ -1303,6 +1308,10 @@ async fn drive(d: Arc<Daemon>, id: [u8; 16], mut over: watch::Receiver<bool>) {
             }
             // A device no longer in the group hears no more of it.
             if let Some(members) = &members {
+                if g.members != *members {
+                    g.members.clone_from(members);
+                    rekey = true;
+                }
                 let gone: Vec<LinkId> = g
                     .sessions
                     .iter()
@@ -1357,6 +1366,15 @@ async fn drive(d: Arc<Daemon>, id: [u8; 16], mut over: watch::Receiver<bool>) {
                 let heard = g.tree.last_fresh().unwrap_or(g.since).max(g.since);
                 let quiet = now.duration_since(heard) >= QUIET_FOR;
                 done = thin_long || quiet || !helps;
+            }
+        }
+        // The group's members changed: its devices' keys, which video,
+        // viewports and levels are checked against, are read again.
+        if rekey {
+            let keys = device_keys(&d, &space);
+            if let Some(g) = groups(&d).get_mut(&id) {
+                g.keys = keys;
+                g.keys_at = Some(Instant::now());
             }
         }
         for (s, l, b) in out {
@@ -1945,8 +1963,9 @@ fn viewed(d: &Daemon, from: &Session, id: &[u8; 16], bytes: Bytes) {
     let (to, label, show) = {
         let mut gs = groups(d);
         let Some(g) = gs.get_mut(id) else { return };
-        // Another link may have brought it while it was checked.
-        if !newest(g) {
+        // Another link may have brought it while it was checked, or this
+        // one been dropped.
+        if !newest(g) || !on_call(g, &ps) {
             return;
         }
         g.viewports.insert(f.voice, f.n);
@@ -1984,8 +2003,9 @@ fn pictured(d: &Daemon, from: &Session, id: &[u8; 16], f: &Frame<'_>, bytes: &By
     {
         let mut gs = groups(d);
         let Some(g) = gs.get_mut(id) else { return };
-        // Past its share of pictures a link's are dropped unread.
-        if !g.pictures.admit(&ps, now) || !g.pictures.is_new(&f.voice, size, f.n) {
+        // A link no longer on the call sends nothing; past its share of
+        // pictures a link's are dropped unread.
+        if !admits_picture(g, &ps, &f.voice, size, f.n, now) {
             return;
         }
     }
@@ -1998,6 +2018,10 @@ fn pictured(d: &Daemon, from: &Session, id: &[u8; 16], f: &Frame<'_>, bytes: &By
     let (to, label, show) = {
         let mut gs = groups(d);
         let Some(g) = gs.get_mut(id) else { return };
+        // It may have been dropped while the picture was checked.
+        if !on_call(g, &ps) {
+            return;
+        }
         let Some(passed) = g.pictures.on_picture(ps, f.voice, size, f.n, now) else {
             return;
         };
@@ -2021,6 +2045,25 @@ fn pictured(d: &Daemon, from: &Session, id: &[u8; 16], f: &Frame<'_>, bytes: &By
             frame: bytes.slice(mesh::HEADER + 2..),
         });
     }
+}
+
+/// Whether `link` is still one of the call's links: one dropped sends
+/// nothing that is taken. A link is in the tree just while it has a session.
+fn on_call(g: &Group, link: &LinkId) -> bool {
+    g.tree.has_link(link)
+}
+
+/// Whether a picture on `link` is looked at: the link is on the call, within
+/// its share of pictures, and the picture not seen here.
+fn admits_picture(
+    g: &mut Group,
+    link: &LinkId,
+    voice: &Voice,
+    size: Size,
+    n: u32,
+    now: Instant,
+) -> bool {
+    on_call(g, link) && g.pictures.admit(link, now) && g.pictures.is_new(voice, size, n)
 }
 
 /// The link of each device of the group linked with this one, by its voice.
@@ -2693,6 +2736,39 @@ fn send_audio(d: &Daemon, frame: Vec<u8>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A link dropped from a call, as one that sent a forged frame is, has
+    /// its pictures refused and becomes no sender's source.
+    #[test]
+    fn a_dropped_link_sends_no_pictures() {
+        let now = Instant::now();
+        let space: SpaceId = [7; 32];
+        let mut g = new_group(space, Some([1; 8]), false);
+        let link = [3; 32];
+        let ben: Voice = [2; 8];
+        g.tree.add_link(link, true, now);
+        assert!(admits_picture(&mut g, &link, &ben, pictures::SMALL, 1, now));
+        g.tree.remove_link(&link);
+        g.pictures.remove_link(&link);
+        g.sessions.remove(&link);
+        assert!(!on_call(&g, &link));
+        assert!(!admits_picture(
+            &mut g,
+            &link,
+            &ben,
+            pictures::SMALL,
+            2,
+            now
+        ));
+        assert!(!admits_picture(
+            &mut g,
+            &[4; 32],
+            &ben,
+            pictures::SMALL,
+            2,
+            now
+        ));
+    }
 
     /// A viewport reads back, is never an RTP packet, and a viewport signed
     /// for a group is not a frame of sound.
