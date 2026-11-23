@@ -388,7 +388,7 @@ rec!(SESSION_DEVICE "contact's device":
     6 "kept_in_touch" BOOL, 7 "key" B, 8 "online" BOOL, 9 "open_for_s" U, 10 "opened_by" T,
     11 "packets_dropped" U, 12 "packets_lost" U, 13 "route" T, 14 "rtt_ms" U,
     15 "they_see_you_at" T, 16 "through" T, 17 "unreadable" {UNREADABLE},
-    18 "kept_alive_s" U, 19 "path" {KNOWN_PATH});
+    18 "kept_alive_s" U, 19 "path" {KNOWN_PATH}, 20 "neighbour" BOOL);
 rec!(SET_ASIDE "set aside": 1 "entry" B, 2 "space" B, 3 "time_ms" U);
 rec!(SPACE_USAGE "space usage":
     1 "full" BOOL, 2 "history_bytes" U, 3 "history_days" U, 4 "live_bytes" U, 5 "log_bytes" U,

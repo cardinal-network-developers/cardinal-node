@@ -40,6 +40,7 @@ pub mod lock;
 pub mod mailbox;
 pub mod mesh;
 pub mod names;
+pub mod neighbours;
 pub mod net;
 pub mod networks;
 pub mod news;

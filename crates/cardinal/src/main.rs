@@ -4189,6 +4189,9 @@ fn contact_status(v: &serde_json::Value) -> String {
         if dv["kept_alive_s"].is_u64() {
             out.push_str("      kept open: this device pings it\n");
         }
+        if dv["neighbour"] == true {
+            out.push_str("      a neighbour: kept in touch with\n");
+        }
         out.push_str(&unread);
     }
     out.push_str("Where they say to find them, in the space you share:\n");

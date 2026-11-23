@@ -1902,6 +1902,7 @@ pub async fn status(
                     "key": hex::encode(&k[..8]),
                     "online": false,
                     "kept_in_touch": standing.contains(k),
+                    "neighbour": d.neighbours.is(k),
                     "path": d.known.json(k),
                     "unreadable": unreadable,
                 });
@@ -1926,6 +1927,7 @@ pub async fn status(
                 "packets_dropped": st.packets_dropped,
                 "they_see_you_at": s.observed_addr().map(|a| a.to_string()),
                 "kept_alive_s": s.keepalive().map(|t| t.as_secs()),
+                "neighbour": d.neighbours.is(k),
                 "path": d.known.json(k),
                 "unreadable": unreadable,
             })

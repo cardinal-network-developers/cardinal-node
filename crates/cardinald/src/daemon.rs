@@ -287,6 +287,8 @@ pub struct Daemon {
     pub rendezvous: crate::rendezvous::Rendezvous,
     /// The known paths to trusted contacts' devices (D86).
     pub known: crate::known::Known,
+    /// The trusted contacts' devices kept in touch with (`sync.md#neighbours`).
+    pub neighbours: crate::neighbours::Neighbours,
     /// What this device, as a host, holds for its owner.
     pub mailbox: crate::mailbox::Mailbox,
     /// Pairing.
@@ -609,6 +611,7 @@ impl Daemon {
             saving_book: Mutex::new(()),
             rendezvous,
             known: Default::default(),
+            neighbours: Default::default(),
             mailbox,
             copies: crate::copies::Tracker::load(copies_path, crate::copies::Rules::from_env()),
             cleanup: crate::cleanup::Cleaner::load(old_versions),
@@ -1694,8 +1697,9 @@ impl Daemon {
     // ---- connections ----
 
     /// Tries to connect to every own device that is not online, and to the
-    /// devices of the contacts in use (`sync.md#neighbours`), and of those
-    /// this device stays in touch with because its person has no host.
+    /// devices of the contacts in use and the neighbours
+    /// (`sync.md#neighbours`), and of those this device stays in touch with
+    /// because its person has no host.
     pub async fn connect_all(self: &Arc<Self>) {
         let standing = crate::rendezvous::standing(self);
         let devices: Vec<(KeyId, cardinal_crypto::HybridPublicKey)> = {
@@ -1725,6 +1729,20 @@ impl Daemon {
             for (key, link) in standing {
                 if !devices.iter().any(|(k, _)| *k == key) {
                     devices.push((key, link));
+                }
+            }
+            // and the neighbours (`sync.md#neighbours`)
+            let neighbours = self.neighbours.devices();
+            for c in contacts.iter().filter(|c| c.connects()) {
+                let Some(o) = core.others.get(&c.identity) else {
+                    continue;
+                };
+                for k in o.log.state().keys.values() {
+                    if neighbours.contains(&k.key) && !devices.iter().any(|(d, _)| *d == k.key) {
+                        if let Some(l) = k.link_key.clone() {
+                            devices.push((k.key, l));
+                        }
+                    }
                 }
             }
             devices

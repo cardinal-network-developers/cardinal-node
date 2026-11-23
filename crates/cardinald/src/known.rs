@@ -370,15 +370,29 @@ pub fn reach_out(mut c: Vec<Candidate>) -> Vec<KeyId> {
     c.into_iter().take(REACH_OUT).map(|c| c.device).collect()
 }
 
+/// One contact's session, as an anchor weighs keeping it alive.
+pub struct Kept {
+    pub x: [u8; 32],
+    /// A neighbour's (`sync.md#neighbours`).
+    pub neighbour: bool,
+    /// When its person was last turned to here.
+    pub used: Option<Instant>,
+    /// How long it has been open.
+    pub open: Duration,
+}
+
 /// The contacts' sessions an anchor keeps alive, by static key: at most
-/// [`ANCHOR_KEEPS`], those of the contacts last turned to first, then the
-/// sessions open longest.
-pub fn anchor_keeps(mut s: Vec<([u8; 32], Option<Instant>, Duration)>) -> HashSet<[u8; 32]> {
-    s.sort_by(|a, b| b.1.cmp(&a.1).then(b.2.cmp(&a.2)).then(a.0.cmp(&b.0)));
-    s.into_iter()
-        .take(ANCHOR_KEEPS)
-        .map(|(x, _, _)| x)
-        .collect()
+/// [`ANCHOR_KEEPS`], its neighbours' first, then those of the contacts last
+/// turned to, then the sessions open longest.
+pub fn anchor_keeps(mut s: Vec<Kept>) -> HashSet<[u8; 32]> {
+    s.sort_by(|a, b| {
+        b.neighbour
+            .cmp(&a.neighbour)
+            .then(b.used.cmp(&a.used))
+            .then(b.open.cmp(&a.open))
+            .then(a.x.cmp(&b.x))
+    });
+    s.into_iter().take(ANCHOR_KEEPS).map(|k| k.x).collect()
 }
 
 /// Starts answering probes and keeping the paths.
@@ -521,6 +535,16 @@ fn new_probe(d: &Daemon) -> Option<disc::Probe> {
 /// and keepalives follow what this device can afford.
 async fn tick(d: &Arc<Daemon>) {
     let theirs = trusted_devices(d);
+    let all: Vec<crate::neighbours::Theirs> = theirs
+        .iter()
+        .map(|t| crate::neighbours::Theirs {
+            who: t.who,
+            device: t.device,
+            x: *t.link.x25519(),
+            host: t.host,
+        })
+        .collect();
+    crate::neighbours::tick(d, &all);
     let now = Instant::now();
     let woke = d.known.woke.swap(false, Ordering::SeqCst);
     let mut learnt = Vec::new();
@@ -654,8 +678,10 @@ async fn reach_device(
 }
 
 /// Keepalives follow what this device can afford: an anchor keeps up to
-/// [`ANCHOR_KEEPS`] contacts' sessions alive; another only those of the
-/// contacts its person is turning to.
+/// [`ANCHOR_KEEPS`] contacts' sessions alive, its neighbours' first;
+/// another those of the contacts its person is turning to, and its
+/// neighbours' later than an anchor would, so that on one an anchor keeps
+/// alive it only answers.
 fn keepalives(d: &Daemon) {
     let checking = lock(&d.known.checking_until).is_some_and(|t| Instant::now() < t);
     if checking {
@@ -663,14 +689,18 @@ fn keepalives(d: &Daemon) {
     }
     let sessions = d.contacts_in_touch();
     let used = d.rendezvous.used_at();
-    let keep: HashSet<[u8; 32]> = if d.conditions.helps() {
+    let neighbours = d.neighbours.statics();
+    let helps = d.conditions.helps();
+    let keep: HashSet<[u8; 32]> = if helps {
         let all = sessions
             .iter()
-            .map(|(who, s)| {
-                let open = d
+            .map(|(who, s)| Kept {
+                x: s.peer_static(),
+                neighbour: neighbours.contains(&s.peer_static()),
+                used: used.get(who).copied(),
+                open: d
                     .session_since(&s.peer_static())
-                    .map_or(Duration::ZERO, |(_, t)| t);
-                (s.peer_static(), used.get(who).copied(), open)
+                    .map_or(Duration::ZERO, |(_, t)| t),
             })
             .collect();
         anchor_keeps(all)
@@ -680,6 +710,8 @@ fn keepalives(d: &Daemon) {
     for (who, s) in sessions {
         let want = if keep.contains(&s.peer_static()) || d.rendezvous.in_use(&who) {
             Some(crate::daemon::KEEPALIVE)
+        } else if neighbours.contains(&s.peer_static()) {
+            Some(crate::neighbours::SPARING_KEEPALIVE)
         } else {
             None
         };
@@ -886,13 +918,16 @@ mod tests {
     fn an_anchor_keeps_at_most_64() {
         let now = Instant::now();
         let s: Vec<_> = (0..100u8)
-            .map(|i| {
-                let used = (i == 99).then_some(now);
-                ([i; 32], used, Duration::from_secs(u64::from(i)))
+            .map(|i| Kept {
+                x: [i; 32],
+                neighbour: i == 1,
+                used: (i == 99).then_some(now),
+                open: Duration::from_secs(u64::from(i)),
             })
             .collect();
         let keep = anchor_keeps(s);
         assert_eq!(keep.len(), ANCHOR_KEEPS);
+        assert!(keep.contains(&[1; 32]), "a neighbour first");
         assert!(keep.contains(&[99; 32]));
         assert!(keep.contains(&[98; 32]), "then the longest open");
         assert!(!keep.contains(&[0; 32]));

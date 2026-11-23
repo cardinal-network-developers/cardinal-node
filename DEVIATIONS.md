@@ -305,10 +305,11 @@ below, each under its section.
   hash ids for this reason; artificial ids that differ only in their top
   byte collide trivially.
 
-- **Notices reach only this person's devices.** `sync.md#notices` is
+- **Notices reach only the devices in touch.** `sync.md#notices` is
   implemented for a person's own devices, which are all a device has
-  sessions with here. Neighbours (about six random sessions in a large
-  space) and deposits for offline members wait for sharing and hosts.
+  sessions with here, and to the contacts' devices it has sessions with
+  that are entitled to the set: its neighbours among them (see Hosts).
+  Deposits for offline members wait for sharing and hosts.
   Notices that would reach a mailbox go nowhere, and a device that was
   offline catches up by reconciling when it returns.
 - **Reading: how long news waits.** `sync.md#notices` lets a device wait a
@@ -2498,10 +2499,22 @@ asks for around that is not built yet.
   of a path is kept across restarts in `peers.json`, as other addresses
   are, but only one a session this device opened worked at; when it was
   confirmed is not kept, so after a restart every path is checked at once,
-  as on waking. Keepalives are every 20 s, as on every session, not
-  adapted to a NAT's timeout. Whether a device can receive connections is
-  read as whether it is a host of its own: any other reaches out on waking.
-  Neighbours in shared spaces still wait (see Sync).
+  as on waking. Keepalives are every 20 s, as on every session (25 s on a
+  neighbour's by a device that does not help), not adapted to a NAT's
+  timeout: lengthening them safely needs telling a NAT that forgot a
+  mapping from a device that went away, which takes a second session or
+  socket to try the longer wait on, and the tests' NAT forgets nothing to
+  check it against. Whether a device can receive connections is read as
+  whether it is a host of its own: any other reaches out on waking.
+- **Neighbours** (`sync.md#neighbours`; `neighbours.rs`). A group is a
+  space this person is in with three or more members present. The
+  numbers are the spec's defaults: 6 a group (3 for a device that does not
+  help), at least 8 lifelines (3), at most 32 in all (8). One not in touch
+  for 60 s, or kept 20 to 40 minutes, is replaced, and chosen again only
+  when no other is left, for 10 minutes. Neighbours are dialled at the
+  addresses known for them, as a person's own devices are, with the same
+  backoff; they are not looked for through hosts or by a probe of the
+  network, which stay for the contacts in use.
 - **Only a person's own device is a host.** A device with `cardinal host`
   grants itself to its own identity, the case `hosts.md#grants` calls the
   common one. It holds spaces as any of the person's devices does, under

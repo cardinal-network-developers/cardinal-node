@@ -828,7 +828,7 @@ fn status_of(d: &Dev, who: &str) -> Value {
 /// router; Ana has no host either, but her desktop is plugged in, so it
 /// helps others: an anchor. When the phone wakes it reaches the anchor at
 /// the path it knows, and the anchor keeps that session alive while the
-/// phone sends no keepalive of its own. Ana's tablet, behind another
+/// phone only answers its pings. Ana's tablet, behind another
 /// router, asks her anchor for Bo (`connect` field 3), is introduced, and
 /// its message gets through. Before, nobody held a way to the phone, and
 /// with no host on either side the tablet could not find it.
@@ -885,9 +885,17 @@ fn a_phone_that_wakes_reaches_a_contacts_anchor_and_is_found_through_it() {
     };
     let kept = |d: &Dev, who: &str| theirs(d, who).is_some_and(|x| x["kept_alive_s"].is_u64());
     assert!(kept(&ana, "bo"), "{}", status_of(&ana, "bo"));
+    // The anchor is one of the phone's lifelines (`sync.md#neighbours`),
+    // which it pings later than the anchor does: it only answers.
     wait("the phone leaves the keepalives to the anchor", 30, || {
-        theirs(&bo, "Ana").is_some_and(|x| x["kept_alive_s"].is_null())
+        theirs(&bo, "Ana").is_some_and(|x| x["neighbour"] == true && x["kept_alive_s"] == 25)
     });
+    assert_eq!(
+        theirs(&ana, "bo").unwrap()["kept_alive_s"],
+        20,
+        "{}",
+        status_of(&ana, "bo")
+    );
 
     // Ana's tablet, behind its own router, writes to Bo: it asks the anchor.
     tablet.cli(&["say", "bo", "through your anchor"]);
@@ -899,4 +907,181 @@ fn a_phone_that_wakes_reaches_a_contacts_anchor_and_is_found_through_it() {
         "the anchor did not introduce them"
     );
     assert!(kept(&ana, "bo"), "the anchor let the phone go");
+}
+
+/// The devices of `who` as `d` sees them.
+fn devices_of(d: &Dev, who: &str) -> Vec<Value> {
+    status_of(d, who)["devices"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+}
+
+/// Whether `d` is in touch with a device of `who` it keeps as a neighbour.
+fn neighbour_online(d: &Dev, who: &str) -> bool {
+    devices_of(d, who)
+        .iter()
+        .any(|x| x["neighbour"] == true && x["online"] == true)
+}
+
+/// What a group's conversation holds on a device, as `from: text`.
+fn said_in(d: &Dev, group: &str) -> Vec<String> {
+    let r = common::reply(d, &json!({"cmd": "messages", "group": group}));
+    let all = r["messages"].as_array().cloned().unwrap_or_default();
+    all.iter()
+        .map(|m| {
+            format!(
+                "{}: {}",
+                m["from"].as_str().unwrap_or(""),
+                m["text"].as_str().unwrap_or("")
+            )
+        })
+        .collect()
+}
+
+/// `sync.md#neighbours`, 2026-11-23: neighbours are what keep a family
+/// group from becoming a frustrating mess of sporadic delivery. Ana, Bo,
+/// Cy and Di each have a phone on battery behind a router of their own;
+/// Ana's desktop, plugged in, is the one anchor, and the only trusted
+/// contact the others share. Each phone keeps its neighbours in the group
+/// (at most three, as a phone), and the anchor keeps those sessions alive.
+/// When the anchor restarts, the phones join it again by themselves; a
+/// message any of them writes then reaches all the others with nobody
+/// opening a conversation; and a phone that wakes on another network is
+/// joined to its neighbours again. Before, a phone reached out only on
+/// waking, and the anchor, which cannot reach a phone behind a router, lost
+/// them all when it restarted.
+#[test]
+fn a_family_group_hears_each_other_through_its_neighbours() {
+    if !fuse_available() {
+        eprintln!("skipping: /dev/fuse or fusermount3 is not available");
+        return;
+    }
+    let root = tempfile::tempdir().unwrap();
+    let mut desk = Dev::new(root.path(), "ana", free_port());
+    let mut phone = Dev::new(root.path(), "phone", free_port());
+    desk.start();
+    desk.cli(&["init", "--yes", "--name", "ana"]);
+    desk.wait_mounted();
+    phone.start();
+    pair(&desk, &phone);
+    phone.wait_mounted();
+    let mut family: Vec<Dev> = Vec::new();
+    for name in ["bo", "cy", "di"] {
+        let mut d = Dev::new(root.path(), name, free_port());
+        d.start();
+        d.cli(&["init", "--yes", "--name", name]);
+        d.wait_mounted();
+        let at = format!("127.0.0.1:{}", desk.port);
+        let code = desk.cli(&["invite", "--address", &at, "--name", "Ana"]);
+        d.cli(&["accept", code.trim(), "--name", "Ana"]);
+        wait("ana lists them", 30, || {
+            desk.cli(&["contacts"]).contains(name)
+        });
+        family.push(d);
+    }
+    // Two-person spaces only so far: each keeps its lifelines, all it has.
+    for d in &family {
+        wait("a lifeline to each of ana's devices", 30, || {
+            let all = devices_of(d, "Ana");
+            all.len() == 2 && all.iter().all(|x| x["neighbour"] == true)
+        });
+    }
+    let made = ask(
+        &desk,
+        json!({"cmd": "group-create", "name": "Family", "people": ["bo", "cy", "di"]}),
+    );
+    let g = made["group"].as_str().unwrap().to_owned();
+    for d in &family {
+        wait("the offer arrives", 30, || {
+            ask(d, json!({"cmd": "groups"}))["offers"]
+                .as_array()
+                .is_some_and(|o| o.iter().any(|o| o["name"] == "Family"))
+        });
+        ask(d, json!({"cmd": "group-join", "group": g}));
+    }
+    wait("ana's phone has the group", 30, || {
+        ask(&phone, json!({"cmd": "groups"}))["groups"]
+            .as_array()
+            .is_some_and(|x| x.iter().any(|x| x["name"] == "Family"))
+    });
+
+    // Everyone's phone goes behind a router of its own, on battery.
+    let nats: Vec<Nat> = (0..5).map(|_| Nat::new(Kind::PortRestricted)).collect();
+    put_behind(&mut phone, &nats[0]);
+    for (d, n) in family.iter_mut().zip(&nats[1..4]) {
+        put_behind(d, n);
+    }
+    let on_battery = json!({"cmd": "conditions", "plugged_in": false, "metered": false});
+    ask(&phone, on_battery.clone());
+    for d in &family {
+        ask(d, on_battery.clone());
+    }
+    ask(
+        &desk,
+        json!({"cmd": "conditions", "plugged_in": true, "metered": false}),
+    );
+    for d in &family {
+        wait("the phone is in touch with the anchor", 40, || {
+            neighbour_online(d, "Ana")
+        });
+    }
+    // Bounds: a phone keeps at most three in its one group.
+    for d in &family {
+        let n = devices_of(d, "Ana")
+            .iter()
+            .filter(|x| x["neighbour"] == true)
+            .count();
+        assert!(n <= 3, "{}", status_of(d, "Ana"));
+    }
+
+    // The anchor restarts: the phones join it again by themselves.
+    desk.stop();
+    desk.start();
+    desk.wait_mounted();
+    ask(
+        &desk,
+        json!({"cmd": "conditions", "plugged_in": true, "metered": false}),
+    );
+    for d in &family {
+        wait("the phone joins the anchor again", 90, || {
+            neighbour_online(d, "Ana")
+        });
+    }
+    let held = ask(&desk, json!({"cmd": "contacts"}))["contacts"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    assert!(held.iter().all(|c| c["connected"] == true), "{held:?}");
+
+    // Bo writes; nobody opens anything, and everyone has it promptly.
+    let start = std::time::Instant::now();
+    ask(
+        &family[0],
+        json!({"cmd": "say", "group": g, "text": "dinner at six"}),
+    );
+    for d in family[1..].iter().chain([&phone, &desk]) {
+        wait("bo's message arrives", 20, || {
+            said_in(d, &g)
+                .iter()
+                .any(|m| m.ends_with(": dinner at six"))
+        });
+    }
+    assert!(start.elapsed() < Duration::from_secs(20));
+
+    // Cy's phone sleeps and wakes on another network: joined again.
+    moves_behind(&mut family[1], &nats[4]);
+    ask(&family[1], on_battery.clone());
+    wait("cy's phone is joined to its neighbours again", 40, || {
+        neighbour_online(&family[1], "Ana")
+    });
+    ask(
+        &family[2],
+        json!({"cmd": "say", "group": g, "text": "on my way"}),
+    );
+    for d in [&family[0], &family[1], &phone] {
+        wait("di's message arrives", 20, || {
+            said_in(d, &g).iter().any(|m| m.ends_with(": on my way"))
+        });
+    }
 }
