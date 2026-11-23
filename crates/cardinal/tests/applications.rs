@@ -358,3 +358,123 @@ fn a_write_the_documents_do_not_allow_is_refused() {
     );
     assert_eq!(docs["nodes"].as_array().unwrap().len(), 1, "{docs}");
 }
+
+/// A document that adds guests to the calendar: a guest is a member.
+fn guests(calendar: &[u8]) -> Vec<u8> {
+    let root = cardinal_space::application::name_of(calendar);
+    let field = Record::new().with(1, 1u64).with(2, "who").with(3, 7u64);
+    let guest = Record::new()
+        .with(1, 1u64)
+        .with(2, "guest")
+        .with(3, Value::list([Value::from(0u64)]))
+        .with(5, Value::list([Value::Record(field)]));
+    Record::new()
+        .with(0, 14u64)
+        .with(1, "Guests")
+        .with(2, "Who comes to an event.")
+        .with(3, root)
+        .with(5, Value::list([Value::Record(guest)]))
+        .with(6, "Guests.\n")
+        .with(8, "en")
+        .encode()
+}
+
+/// What a program is given of another application's kinds is typed by
+/// the documents the space holds: a member as a handle, never as an
+/// identity. A question goes when the program that asked it does.
+#[test]
+fn another_application_s_members_are_handles_and_a_question_goes_with_its_asker() {
+    let root = tempfile::tempdir().unwrap();
+    let ana = person(root.path(), "ana");
+    let cal_doc = calendar(&ana).arg("document").output().unwrap().stdout;
+    let guest_doc = guests(&cal_doc);
+    let cal_root = cardinal_space::application::name_of(&cal_doc);
+    let connect = |d: &Dev, docs: &[&[u8]]| {
+        let mut p = Raw::new(d);
+        let docs = Value::List(docs.iter().map(|b| Value::from(b.to_vec())).collect());
+        let hello = p.ask(Record::new().with(0, 1u64).with(1, "Test").with(2, docs));
+        assert_eq!(hello.uint(0).unwrap(), 0, "{hello}");
+        p
+    };
+    // a program with both documents starts a calendar
+    let socket = app_socket(&ana);
+    let both = (cal_doc.clone(), guest_doc.clone());
+    let started = std::thread::spawn(move || {
+        let c = Client::connect(&socket).unwrap();
+        c.set_read_timeout(Some(std::time::Duration::from_secs(60)))
+            .unwrap();
+        let mut p = Raw(c);
+        let docs = Value::list([Value::from(both.0), Value::from(both.1)]);
+        let hello = p.ask(Record::new().with(0, 1u64).with(1, "Both").with(2, docs));
+        assert_eq!(hello.uint(0).unwrap(), 0, "{hello}");
+        let r = p.ask(
+            Record::new()
+                .with(0, 4u64)
+                .with(1, cal_root)
+                .with(2, "Party"),
+        );
+        assert_eq!(r.uint(0).unwrap(), 0, "{r}");
+        (p, r.bytes(2).unwrap().to_vec())
+    });
+    answer(&ana, &[]);
+    let (mut p, space) = started.join().unwrap();
+    // and writes a guest: Ana, by her handle
+    let members = p.ask(Record::new().with(0, 6u64).with(1, space.clone()));
+    let me = members.list(2).unwrap()[0]
+        .as_record()
+        .unwrap()
+        .bytes(1)
+        .unwrap()
+        .to_vec();
+    let guests = cardinal_space::application::Document::parse(&guest_doc).unwrap();
+    let kind = match guests.node_kind(1) {
+        cardinal_space::NodeKind::Named(k) => k,
+        k => panic!("a child's kind is named: {k:?}"),
+    };
+    let op = Record::new()
+        .with(0, 32u64)
+        .with(1, kind)
+        .with(2, [0u8; 16])
+        .with(3, "ana")
+        .with(4, Record::new().with(1, me.clone()));
+    let ok = p.ask(
+        Record::new()
+            .with(0, 8u64)
+            .with(1, space.clone())
+            .with(2, Value::list([Value::Record(op)])),
+    );
+    assert_eq!(ok.uint(0).unwrap(), 0, "{ok}");
+    // a program with the calendar's document alone is given her handle
+    let mut q = connect(&ana, &[&cal_doc]);
+    let nodes = q.ask(Record::new().with(0, 7u64).with(1, space.clone()));
+    assert_eq!(nodes.uint(0).unwrap(), 0, "{nodes}");
+    let all = nodes.list(2).unwrap();
+    let guest = all
+        .iter()
+        .filter_map(Value::as_record)
+        .find(|n| n.bytes(2).is_ok_and(|k| k == kind))
+        .expect("the guest is listed");
+    let field = guest.list(5).unwrap()[0].as_record().unwrap().clone();
+    assert_eq!(
+        field.bytes(2).unwrap(),
+        &me[..],
+        "a handle, not an identity: {field}"
+    );
+    assert!(field.get(4).is_none(), "{field}");
+
+    // a question waits for Ana while its asker is there, and goes with it
+    let mut sharing = connect(&ana, &[&cal_doc]);
+    sharing
+        .0
+        .send_raw(&Record::new().with(0, 11u64).with(1, space.clone()).encode())
+        .unwrap();
+    wait("ana is asked", 30, || {
+        ask(&ana, &json!({"cmd": "app-questions"}))["questions"][0]["asks"] == "share"
+    });
+    drop(sharing);
+    wait("the question went with its asker", 30, || {
+        ask(&ana, &json!({"cmd": "app-questions"}))["questions"]
+            .as_array()
+            .is_some_and(|q| q.is_empty())
+    });
+}

@@ -21,7 +21,7 @@ use std::sync::{Arc, Mutex};
 use cardinal_encoding::{Record, Value};
 use cardinal_identity::EntryId;
 use cardinal_link::Priority;
-use cardinal_space::application::{self, Document, Family, Type};
+use cardinal_space::application::{self, Document, Family, FieldDef, KindDef, Type};
 use cardinal_space::entry::derived_id;
 use cardinal_space::{
     account, NodeId, NodeKind, Profile, Space, SpaceId, SpaceOp, SpaceOpBody, ROOT,
@@ -129,8 +129,73 @@ pub struct Apps {
     base: u64,
     questions: Mutex<(u64, Vec<Question>)>,
     seqs: Mutex<HashMap<SpaceId, Tracker>>,
-    /// The files put by programs, by handle, until they are written.
-    files: Mutex<HashMap<[u8; 16], (SpaceId, Record)>>,
+    /// The files programs were given or put, by handle, while a connection
+    /// that had them is open, and at most [`MOST_FILES`].
+    files: Mutex<Files>,
+    /// The number of the next connection.
+    conns: std::sync::atomic::AtomicU64,
+}
+
+/// The most file handles kept at once: past them the oldest go.
+const MOST_FILES: usize = 65_536;
+
+/// A file handle's space and file, and the connections that had it.
+struct HeldFile {
+    space: SpaceId,
+    file: Record,
+    conns: HashSet<u64>,
+}
+
+#[derive(Default)]
+struct Files {
+    by: HashMap<[u8; 16], HeldFile>,
+    /// The handles in the order they were first kept.
+    order: std::collections::VecDeque<[u8; 16]>,
+}
+
+impl Files {
+    fn keep(&mut self, h: [u8; 16], space: SpaceId, file: Record, conn: u64) {
+        match self.by.get_mut(&h) {
+            Some(f) => {
+                f.conns.insert(conn);
+            }
+            None => {
+                self.by.insert(
+                    h,
+                    HeldFile {
+                        space,
+                        file,
+                        conns: HashSet::from([conn]),
+                    },
+                );
+                self.order.push_back(h);
+            }
+        }
+        while self.by.len() > MOST_FILES {
+            let Some(old) = self.order.pop_front() else {
+                break;
+            };
+            self.by.remove(&old);
+        }
+    }
+
+    /// The file a handle names in `space`.
+    fn get(&self, h: &[u8; 16], space: &SpaceId) -> Option<&Record> {
+        self.by
+            .get(h)
+            .filter(|f| f.space == *space)
+            .map(|f| &f.file)
+    }
+
+    /// A connection went: the handles only it had go too.
+    fn gone(&mut self, conn: u64) {
+        self.by.retain(|_, f| {
+            f.conns.remove(&conn);
+            !f.conns.is_empty()
+        });
+        let by = &self.by;
+        self.order.retain(|h| by.contains_key(h));
+    }
 }
 
 impl Default for Apps {
@@ -139,7 +204,8 @@ impl Default for Apps {
             base: now_ms().saturating_mul(1000),
             questions: Mutex::new((1, Vec::new())),
             seqs: Mutex::new(HashMap::new()),
-            files: Mutex::new(HashMap::new()),
+            files: Mutex::new(Files::default()),
+            conns: std::sync::atomic::AtomicU64::new(1),
         }
     }
 }
@@ -150,6 +216,10 @@ impl Default for Apps {
 struct Tracker {
     seen: HashMap<EntryId, u64>,
     next: u64,
+    /// How many of the space's applied entries were looked at, and the last
+    /// of them: while they are the same, nothing is new.
+    walked: usize,
+    last: Option<EntryId>,
 }
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -163,13 +233,23 @@ impl Apps {
         let t = all.entry(sp.id()).or_default();
         // what was there when this service first looked counts as 0
         let first = t.seen.is_empty();
-        for e in sp.state().applied() {
+        let applied = sp.state().applied();
+        // Entries are only added, and those applied keep their order among
+        // themselves: while the last one looked at is still where it was,
+        // only those after it are new.
+        let from = match t.walked.checked_sub(1).map(|i| applied.get(i)) {
+            Some(at) if at == t.last.as_ref() => t.walked,
+            _ => 0,
+        };
+        for e in &applied[from.min(applied.len())..] {
             if !t.seen.contains_key(e) {
                 let n = if first { 0 } else { t.next + 1 };
                 t.next = n;
                 t.seen.insert(*e, n);
             }
         }
+        t.walked = applied.len();
+        t.last = applied.last().copied();
         self.base + t.next
     }
 
@@ -192,10 +272,23 @@ impl Apps {
         )
     }
 
-    /// Asks the person, and waits for the answer.
+    /// Asks the person, and waits for the answer. Should the asking stop,
+    /// as when its connection goes, the question goes with it.
     async fn ask(&self, d: &Daemon, program: &str, named: &str, asks: Asks, what: String) -> Said {
+        struct Asked<'a>(&'a Apps, &'a Daemon, u64);
+        impl Drop for Asked<'_> {
+            fn drop(&mut self) {
+                let mut q = lock(&self.0.questions);
+                let before = q.1.len();
+                q.1.retain(|q| q.id != self.2);
+                if q.1.len() != before {
+                    drop(q);
+                    self.1.bump();
+                }
+            }
+        }
         let (tx, rx) = oneshot::channel();
-        {
+        let id = {
             let mut q = lock(&self.questions);
             let id = q.0;
             q.0 += 1;
@@ -208,7 +301,9 @@ impl Apps {
                 what,
                 answer: Some(tx),
             });
-        }
+            id
+        };
+        let _asked = Asked(self, d, id);
         d.bump();
         let said = rx.await.unwrap_or_default();
         d.bump();
@@ -332,6 +427,8 @@ fn file_handle(d: &Daemon, program: &str, space: &SpaceId, blob: &Record) -> [u8
 // ---- A connection ----
 
 struct Conn {
+    /// This connection's number, for the file handles it was given.
+    id: u64,
     program: String,
     named: String,
     family: Option<Family>,
@@ -345,16 +442,29 @@ impl Conn {
     }
 }
 
-/// How the platform names the program at the other end of a connection.
-fn program_of(pid: Option<u32>) -> String {
-    let exe = pid.and_then(|p| std::fs::read_link(format!("/proc/{p}/exe")).ok());
-    match exe {
-        Some(p) => {
-            let p = p.to_string_lossy();
-            p.strip_suffix(" (deleted)").unwrap_or(&p).to_owned()
-        }
-        None => "unknown".to_owned(),
-    }
+/// How the platform names the program at the other end of a connection:
+/// `None` when it cannot tell, and then the connection is refused.
+fn program_of(pid: Option<u32>) -> Option<String> {
+    let exe = std::fs::read_link(format!("/proc/{}/exe", pid?)).ok()?;
+    let p = exe.to_string_lossy();
+    let p = p.strip_suffix(" (deleted)").unwrap_or(&p);
+    (!p.is_empty()).then(|| p.to_owned())
+}
+
+/// The most characters of the name a program gives itself that the person
+/// is shown.
+const MOST_NAMED: usize = 60;
+
+/// The name a program gives itself, as the person is shown it: plain text
+/// on one line, no control characters, at most [`MOST_NAMED`] characters.
+fn plain_name(named: &str) -> String {
+    let words: Vec<&str> = named
+        .split(|c: char| c.is_whitespace() || c.is_control())
+        .filter(|w| !w.is_empty())
+        .collect();
+    let mut out: String = words.join(" ").chars().take(MOST_NAMED).collect();
+    out.truncate(out.trim_end().len());
+    out
 }
 
 /// Starts serving the application interface.
@@ -368,8 +478,17 @@ pub fn serve(d: Arc<Daemon>) -> anyhow::Result<tokio::task::JoinHandle<()>> {
             let Ok((r, w, pid)) = listener.accept_peer().await else {
                 continue;
             };
+            // A program this device cannot name is not one it can approve.
+            let Some(program) = program_of(pid) else {
+                tracing::info!("refused a program at the application interface: it cannot be told");
+                continue;
+            };
             let conn = Conn {
-                program: program_of(pid),
+                id: d
+                    .apps
+                    .conns
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+                program,
                 named: String::new(),
                 family: None,
             };
@@ -396,8 +515,23 @@ fn reply(r: Answer) -> Vec<u8> {
     bytes
 }
 
-async fn connection(d: Arc<Daemon>, mut conn: Conn, mut r: Reader, mut w: Writer) {
-    while let Ok(Some(got)) = r.recv().await {
+async fn connection(d: Arc<Daemon>, conn: Conn, r: Reader, w: Writer) {
+    let id = conn.id;
+    serve_conn(&d, conn, r, w).await;
+    lock(&d.apps.files).gone(id);
+}
+
+async fn serve_conn(d: &Arc<Daemon>, mut conn: Conn, mut r: Reader, mut w: Writer) {
+    // A message that came while a request was being answered: the next.
+    let mut early: Option<Received> = None;
+    loop {
+        let got = match early.take() {
+            Some(m) => m,
+            None => match r.recv().await {
+                Ok(Some(m)) => m,
+                _ => return,
+            },
+        };
         let msg = match got {
             Received::Message(m) => m,
             Received::TooLarge => {
@@ -426,13 +560,27 @@ async fn connection(d: Arc<Daemon>, mut conn: Conn, mut r: Reader, mut w: Writer
                 continue;
             }
             if w.send(&reply(Ok(Record::new()))).await.is_ok() {
-                watch(&d, &conn, r, w).await;
+                watch(d, &conn, r, w).await;
             }
             return;
         }
         let answer = match number {
-            Some(req::HELLO) => hello(&d, &mut conn, &rec),
-            Some(n) => request(&d, &conn, n, &rec).await,
+            Some(req::HELLO) => hello(d, &mut conn, &rec),
+            Some(n) => {
+                // While it waits, as for the person, the connection may go:
+                // then the request, and any question it asked, go too.
+                let asked = request(d, &conn, n, &rec);
+                tokio::pin!(asked);
+                loop {
+                    tokio::select! {
+                        a = &mut asked => break a,
+                        m = r.recv(), if early.is_none() => match m {
+                            Ok(Some(m)) => early = Some(m),
+                            _ => return,
+                        },
+                    }
+                }
+            }
             None => Err(no(err::MALFORMED, "a request's key 0 is its number")),
         };
         if w.send(&reply(answer)).await.is_err() {
@@ -565,12 +713,7 @@ fn space_of(
 }
 
 fn hello(d: &Arc<Daemon>, conn: &mut Conn, rec: &Record) -> Answer {
-    let named = rec
-        .get(1)
-        .and_then(Value::as_text)
-        .unwrap_or("")
-        .trim()
-        .to_owned();
+    let named = plain_name(rec.get(1).and_then(Value::as_text).unwrap_or(""));
     let docs = match rec.get(2) {
         None => Vec::new(),
         Some(v) => v
@@ -842,44 +985,74 @@ fn touched(sp: &Space, entries: &[EntryId]) -> HashSet<NodeId> {
     out
 }
 
-/// A value of the space as the program is given it: members and files as
-/// handles.
-fn outward(
-    d: &Daemon,
-    program: &str,
-    space: &SpaceId,
-    ty: Option<(Type, bool)>,
+/// A value of the space as the program is given it (`apps.md`, Values):
+/// one of the type its field is declared with, members and files as
+/// handles. `None`, withheld, when no document says the field's type, or
+/// the value is not of it: a program never sees a member's identity or a
+/// file's keys as they are.
+fn given(
+    f: Option<&FieldDef>,
     v: &Value,
-) -> Value {
-    let one = |t: Type, v: &Value| -> Value {
-        match t {
-            Type::Member => match v.as_bytes().and_then(|b| <[u8; 32]>::try_from(b).ok()) {
-                Some(who) => Value::from(member_handle(d, program, space, &who)),
-                None => v.clone(),
-            },
-            Type::File => match v.as_record() {
-                Some(r) => {
-                    let h = file_handle(d, program, space, r);
-                    lock(&d.apps.files).insert(h, (*space, r.clone()));
-                    Value::from(h)
-                }
-                None => v.clone(),
-            },
-            _ => v.clone(),
+    member: &dyn Fn(&[u8; 32]) -> [u8; 16],
+    file: &mut dyn FnMut(&Record) -> [u8; 16],
+) -> Option<Value> {
+    let f = f.filter(|f| f.holds(v))?;
+    let mut one = |x: &Value| -> Option<Value> {
+        match f.ty {
+            Type::Member => {
+                let who: [u8; 32] = x.as_bytes()?.try_into().ok()?;
+                Some(Value::from(member(&who)))
+            }
+            Type::File => Some(Value::from(file(x.as_record()?))),
+            _ => Some(x.clone()),
         }
     };
-    match ty {
-        Some((t @ (Type::Member | Type::File), false)) => one(t, v),
-        Some((t @ (Type::Member | Type::File), true)) => match v.as_list() {
-            Some(items) => Value::List(items.iter().map(|x| one(t, x)).collect()),
-            None => v.clone(),
-        },
-        _ => v.clone(),
+    match (f.ty, f.list) {
+        (Type::Member | Type::File, true) => {
+            let items = v.as_list()?.iter().map(&mut one);
+            Some(Value::List(items.collect::<Option<_>>()?))
+        }
+        (Type::Member | Type::File, false) => one(v),
+        _ => Some(v.clone()),
     }
 }
 
+/// [`given`], with this device's handles for `conn`.
+fn outward(
+    d: &Daemon,
+    conn: &Conn,
+    space: &SpaceId,
+    f: Option<&FieldDef>,
+    v: &Value,
+) -> Option<Value> {
+    let member = |who: &[u8; 32]| member_handle(d, &conn.program, space, who);
+    let mut file = |r: &Record| {
+        let h = file_handle(d, &conn.program, space, r);
+        lock(&d.apps.files).keep(h, *space, r.clone(), conn.id);
+        h
+    };
+    given(f, v, &member, &mut file)
+}
+
+/// The kinds the documents a space holds declare, as the space names
+/// them: of its own application's root, and of every child document. A
+/// root document of another application says nothing here.
+fn held_kinds(st: &cardinal_space::State, root: &[u8; 32]) -> HashMap<NodeKind, KindDef> {
+    let mut out = HashMap::new();
+    for doc in application::documents_in(st) {
+        if doc.translates.is_some() || (doc.parent.is_none() && doc.name != *root) {
+            continue;
+        }
+        for k in &doc.kinds {
+            out.entry(doc.node_kind(k.kind))
+                .or_insert_with(|| k.clone());
+        }
+    }
+    out
+}
+
 fn nodes(d: &Arc<Daemon>, conn: &Conn, rec: &Record) -> Answer {
-    let (id, _, _) = space_of(d, conn, rec, 1)?;
+    let (id, root, _) = space_of(d, conn, rec, 1)?;
     let family = conn.family()?;
     let parent: Option<NodeId> = match rec.get(2) {
         None => None,
@@ -910,6 +1083,7 @@ fn nodes(d: &Arc<Daemon>, conn: &Conn, rec: &Record) -> Answer {
             .and_then(|s| d.apps.since(sp, s))
             .map(|e| touched(sp, &e));
         let st = sp.state();
+        let held = held_kinds(st, &root);
         let mut all: Vec<&cardinal_space::Node> = st
             .nodes()
             .filter(|n| n.kind != NodeKind::Uint(application::DOCUMENT_NODE))
@@ -924,33 +1098,39 @@ fn nodes(d: &Arc<Daemon>, conn: &Conn, rec: &Record) -> Answer {
         let items: Vec<Value> = all
             .into_iter()
             .map(|n| {
-                let def = family.known(&n.kind).map(|k| k.def.clone());
+                // Typed by the program's documents, or else by those the
+                // space holds.
+                let def = family
+                    .known(&n.kind)
+                    .map(|k| &k.def)
+                    .or_else(|| held.get(&n.kind));
                 let mut fields = Vec::new();
                 for (key, values) in &n.fields {
                     if *key == application::AUTHOR_OWNED {
                         continue;
                     }
-                    let ty = def
-                        .as_ref()
-                        .and_then(|k| k.field(*key))
-                        .map(|f| (f.ty, f.list));
+                    let ty = def.and_then(|k| k.field(*key));
                     let set: Vec<_> = values
                         .iter()
                         .filter_map(|v| v.value.as_ref().map(|x| (v.entry, x)))
                         .collect();
+                    // a value withheld is marked so, with nothing in its place
                     let f = match set.as_slice() {
                         [] => continue,
-                        [(_, v)] => Record::new()
-                            .with(1, *key)
-                            .with(2, outward(d, program, &id, ty, v)),
+                        [(_, v)] => match outward(d, conn, &id, ty, v) {
+                            Some(v) => Record::new().with(1, *key).with(2, v),
+                            None => Record::new().with(1, *key).with(4, true),
+                        },
                         many => {
                             let versions = many.iter().map(|(e, v)| {
                                 let by = sp
                                     .entry(e)
                                     .map(|e| member_handle(d, program, &id, &e.author()));
+                                let v = outward(d, conn, &id, ty, v);
                                 Value::Record(
                                     Record::new()
-                                        .with(1, outward(d, program, &id, ty, v))
+                                        .with_opt(3, v.is_none().then_some(true))
+                                        .with_opt(1, v)
                                         .with_opt(2, by),
                                 )
                             });
@@ -1010,9 +1190,9 @@ fn inward(
             Type::File => {
                 let h = h.ok_or("a file is given by its handle")?;
                 let files = lock(&d.apps.files);
-                match files.get(&h) {
-                    Some((s, r)) if s == space => Ok(Value::Record(r.clone())),
-                    _ => Err("no file of the space has that handle".into()),
+                match files.get(&h, space) {
+                    Some(r) => Ok(Value::Record(r.clone())),
+                    None => Err("no file of the space has that handle".into()),
                 }
             }
             _ => Ok(v.clone()),
@@ -1175,7 +1355,7 @@ async fn file_put(d: &Arc<Daemon>, conn: &Conn, rec: &Record) -> Answer {
     .map_err(failed)??;
     let r = blob.to_record();
     let h = file_handle(d, &conn.program, &id, &r);
-    lock(&d.apps.files).insert(h, (id, r));
+    lock(&d.apps.files).keep(h, id, r, conn.id);
     Ok(Record::new().with(2, h).with(3, blob.size))
 }
 
@@ -1185,9 +1365,9 @@ async fn file_get(d: &Arc<Daemon>, conn: &Conn, rec: &Record) -> Answer {
     let to = std::path::PathBuf::from(text_arg(rec, 3, "to")?);
     let blob = {
         let files = lock(&d.apps.files);
-        match files.get(&h) {
-            Some((s, r)) if *s == id => r.clone(),
-            _ => {
+        match files.get(&h, &id) {
+            Some(r) => r.clone(),
+            None => {
                 return Err(no(
                     err::FAILED,
                     "no file of that space has that handle: list its nodes first",
@@ -1229,7 +1409,13 @@ async fn file_get(d: &Arc<Daemon>, conn: &Conn, rec: &Record) -> Answer {
 }
 
 async fn share(d: &Arc<Daemon>, conn: &Conn, rec: &Record) -> Answer {
-    let (id, root, _) = space_of(d, conn, rec, 1)?;
+    let (id, root, change) = space_of(d, conn, rec, 1)?;
+    if !change {
+        return Err(no(
+            err::NOT_APPROVED,
+            "this program may not change that space",
+        ));
+    }
     let (shared, role) = conn
         .family()?
         .document(&root)
@@ -1526,4 +1712,94 @@ pub fn join(d: &Arc<Daemon>, space: &str) -> anyhow::Result<Json> {
     d.write_and_push(&account, vec![account::create_space(&id, &name)])?;
     d.bump();
     Ok(json!({"space": hex::encode(id), "name": name}))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn def(ty: Type, list: bool) -> FieldDef {
+        FieldDef {
+            key: 1,
+            name: "f".into(),
+            ty,
+            list,
+        }
+    }
+
+    /// Only what a document types is given, members as handles; what no
+    /// document types, or is not of its type, is withheld, never raw.
+    #[test]
+    fn a_value_is_given_only_as_a_document_types_it() {
+        let member = |who: &[u8; 32]| -> [u8; 16] { who[..16].try_into().unwrap() };
+        let mut file = |_: &Record| -> [u8; 16] { [9; 16] };
+        let who = Value::from([7u8; 32]);
+        let m = def(Type::Member, false);
+        assert_eq!(
+            given(Some(&m), &who, &member, &mut file),
+            Some(Value::from([7u8; 16]))
+        );
+        let ms = def(Type::Member, true);
+        assert_eq!(
+            given(Some(&ms), &Value::list([who.clone()]), &member, &mut file),
+            Some(Value::list([Value::from([7u8; 16])]))
+        );
+        // no document says the type: withheld
+        assert_eq!(given(None, &who, &member, &mut file), None);
+        assert_eq!(given(None, &Value::from("hi"), &member, &mut file), None);
+        // not of its type: withheld, a record of keys above all
+        let keys = Value::Record(Record::new().with(1, [1u8; 32]));
+        assert_eq!(given(Some(&m), &keys, &member, &mut file), None);
+        let f = def(Type::File, false);
+        assert_eq!(given(Some(&f), &keys, &member, &mut file), None);
+        assert_eq!(given(Some(&ms), &who, &member, &mut file), None);
+        // text as it is
+        let t = def(Type::Text, false);
+        assert_eq!(
+            given(Some(&t), &Value::from("hi"), &member, &mut file),
+            Some(Value::from("hi"))
+        );
+    }
+
+    #[test]
+    fn a_program_s_name_is_one_short_line() {
+        assert_eq!(plain_name("  Cal\nendar\t\u{7}x  "), "Cal endar x");
+        assert_eq!(plain_name(&"a".repeat(500)).chars().count(), MOST_NAMED);
+        assert_eq!(
+            plain_name(&"é ".repeat(100)).chars().count(),
+            MOST_NAMED - 1
+        );
+        assert_eq!(plain_name("\n\n"), "");
+    }
+
+    #[test]
+    fn a_program_that_cannot_be_told_is_not_named() {
+        assert_eq!(program_of(None), None);
+        assert!(program_of(Some(std::process::id())).is_some());
+    }
+
+    /// File handles go with the connections that had them, and are bounded.
+    #[test]
+    fn file_handles_go_with_their_connections() {
+        let mut f = Files::default();
+        let space = [1; 32];
+        let r = Record::new().with(1, 1u64);
+        f.keep([1; 16], space, r.clone(), 1);
+        f.keep([1; 16], space, r.clone(), 2);
+        f.keep([2; 16], space, r.clone(), 2);
+        assert!(f.get(&[1; 16], &space).is_some());
+        assert!(f.get(&[1; 16], &[2; 32]).is_none());
+        f.gone(2);
+        assert!(f.get(&[1; 16], &space).is_some());
+        assert!(f.get(&[2; 16], &space).is_none());
+        f.gone(1);
+        assert!(f.by.is_empty() && f.order.is_empty());
+        for i in 0..MOST_FILES + 5 {
+            let mut h = [0u8; 16];
+            h[..8].copy_from_slice(&(i as u64).to_le_bytes());
+            f.keep(h, space, r.clone(), 3);
+        }
+        assert_eq!(f.by.len(), MOST_FILES);
+        assert!(f.get(&[0; 16], &space).is_none(), "the oldest went");
+    }
 }
