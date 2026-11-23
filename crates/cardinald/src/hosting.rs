@@ -488,6 +488,14 @@ pub(crate) async fn serve_rendezvous(
     }
 }
 
+/// The static keys of the contacts' devices present here, as one this
+/// device hosts.
+pub(crate) fn present_here(d: &Daemon) -> HashSet<[u8; 32]> {
+    let mut present = lock(&d.mailbox.hosted.present);
+    present.retain(|_, (_, s, _)| !s.is_closed());
+    present.keys().copied().collect()
+}
+
 /// The devices of a contact present here.
 fn present_of(d: &Daemon, who: &[u8; 32]) -> Vec<([u8; 32], Session, Vec<SocketAddr>)> {
     let mut present = lock(&d.mailbox.hosted.present);

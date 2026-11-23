@@ -224,6 +224,16 @@ fn host_grandma(daniel: &Dev, grandma: &Dev) {
     });
 }
 
+/// How often `d` pings the device of `who`'s it is in touch with, in
+/// seconds (null for none); `None` if it is in touch with none.
+fn kept_alive(d: &Dev, who: &str) -> Option<Value> {
+    let v = ask(d, json!({"cmd": "contact-status", "who": who}));
+    let all = v["devices"].as_array().cloned().unwrap_or_default();
+    all.into_iter()
+        .find(|x| x["online"] == true)
+        .map(|x| x["kept_alive_s"].clone())
+}
+
 fn waiting_at(daniel: &Dev) -> u64 {
     let all = hosting(daniel);
     all.iter().find_map(|h| h["waiting"].as_u64()).unwrap_or(0)
@@ -251,8 +261,16 @@ fn a_contacts_anchor_hosts_grandma() {
         waiting_at(&daniel) >= 1
     });
 
-    // Her phone wakes behind a router: it collects what waited.
+    // Her phone wakes behind a router, on battery: it collects what waited.
+    // Nobody is turned to for long, so only the anchor keeps it in touch.
+    grandma
+        .env
+        .push(("CARDINAL_TEST_IN_USE_SECS".into(), "4".into()));
     behind(&mut grandma, &ng);
+    ask(
+        &grandma,
+        json!({"cmd": "conditions", "plugged_in": false, "metered": false}),
+    );
     wait("grandma reads it", 60, || {
         grandma
             .cli(&["messages", "Ben"])
@@ -262,6 +280,13 @@ fn a_contacts_anchor_hosts_grandma() {
         grandma.log().contains("envelopes left with"),
         "it did not come from the mailbox"
     );
+
+    // D86 with D87: her host is her anchor. It keeps her phone's session
+    // alive, and the phone, on battery, sends it no pings of its own.
+    wait("the host keeps grandma's phone in touch", 60, || {
+        kept_alive(&daniel, "grandma").is_some_and(|k| k.is_u64())
+            && kept_alive(&grandma, "Daniel").is_some_and(|k| k.is_null())
+    });
 
     // Ben finds her phone through the anchor, and is relayed through it.
     ben.cli(&["say", "Grandma", "are you there?"]);
@@ -278,6 +303,14 @@ fn a_contacts_anchor_hosts_grandma() {
     wait("grandma reads it", 30, || {
         grandma.cli(&["messages", "Ben"]).contains("are you there?")
     });
+    wait(
+        "the phone still leaves the keepalives to its host",
+        30,
+        || {
+            kept_alive(&grandma, "Daniel").is_some_and(|k| k.is_null())
+                && kept_alive(&daniel, "grandma").is_some_and(|k| k.is_u64())
+        },
+    );
 
     // Grandma ends it: her devices stop naming the anchor, and it serves
     // her no longer.

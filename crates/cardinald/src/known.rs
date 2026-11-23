@@ -724,11 +724,15 @@ fn keepalives(d: &Daemon) {
     }
     let anchored = !helps && sessions.iter().any(|(_, s)| s.pinged_twice_within(within));
     let keep: HashSet<[u8; 32]> = if helps {
+        // A contact's device present here as one this device hosts (D87)
+        // is kept alive as a neighbour's is: its host is its anchor.
+        let hosted = crate::hosting::present_here(d);
         let all = sessions
             .iter()
             .map(|(who, s)| Kept {
                 x: s.peer_static(),
-                neighbour: neighbours.contains(&s.peer_static()),
+                neighbour: neighbours.contains(&s.peer_static())
+                    || hosted.contains(&s.peer_static()),
                 used: used.get(who).copied(),
                 open: d
                     .session_since(&s.peer_static())
