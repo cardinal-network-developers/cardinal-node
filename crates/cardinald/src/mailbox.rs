@@ -82,11 +82,11 @@ pub(crate) const OP_FETCH: u64 = 2;
 pub(crate) const OP_ACK: u64 = 3;
 pub(crate) const OP_REGISTER: u64 = 4;
 pub(crate) const OP_REVOKE: u64 = 5;
-const OP_USAGE: u64 = 6;
-const NOT_PERMITTED: u64 = 1;
+pub(crate) const OP_USAGE: u64 = 6;
+pub(crate) const NOT_PERMITTED: u64 = 1;
 const FULL: u64 = 2;
-const UNKNOWN: u64 = 3;
-const MALFORMED: u64 = 4;
+pub(crate) const UNKNOWN: u64 = 3;
+pub(crate) const MALFORMED: u64 = 4;
 
 /// An envelope a host holds.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -144,6 +144,9 @@ pub struct Store {
     dir: PathBuf,
     saved: Saved,
     held: BTreeMap<u64, Held>,
+    /// How long an envelope waits for its owner, in seconds: `None` until
+    /// collected, as for a contact this device hosts (D87).
+    retention: Option<u64>,
 }
 
 impl Store {
@@ -163,7 +166,23 @@ impl Store {
                 }
             }
         }
-        Store { dir, saved, held }
+        Store {
+            dir,
+            saved,
+            held,
+            retention: Some(RETENTION),
+        }
+    }
+
+    /// The same, keeping each envelope until it is collected.
+    pub(crate) fn until_collected(mut self) -> Store {
+        self.retention = None;
+        self
+    }
+
+    /// Envelopes waiting, under any token.
+    pub(crate) fn waiting(&self) -> usize {
+        self.held.len()
     }
 
     fn save(&self) -> std::io::Result<()> {
@@ -209,6 +228,19 @@ impl Store {
 
     /// Leaves an envelope, and gives its sequence.
     pub fn deposit(&mut self, token: &Token, envelope: &[u8], now: u64) -> Result<u64, Refused> {
+        let limits = (Some(OUTSTANDING as u64), Some(u64::from(PER_DAY)));
+        self.deposit_within(token, envelope, now, limits)
+    }
+
+    /// [`deposit`](Self::deposit), within a quota class's limits: envelopes
+    /// waiting and deposits a day under one token, `None` no limit.
+    pub(crate) fn deposit_within(
+        &mut self,
+        token: &Token,
+        envelope: &[u8],
+        now: u64,
+        (outstanding, per_day): (Option<u64>, Option<u64>),
+    ) -> Result<u64, Refused> {
         if envelope.is_empty() || envelope.len() > MAX_ENVELOPE {
             return Err(Refused::Malformed);
         }
@@ -222,7 +254,8 @@ impl Store {
         }
         let t = hex::encode(token);
         let today = self.saved.deposits.get(&t).copied().unwrap_or(0);
-        if today >= PER_DAY || self.waiting_under(token) >= OUTSTANDING {
+        let over = |n: u64, limit: Option<u64>| limit.is_some_and(|l| n >= l);
+        if over(u64::from(today), per_day) || over(self.waiting_under(token) as u64, outstanding) {
             return Err(Refused::Full);
         }
         let held = Held {
@@ -274,7 +307,7 @@ impl Store {
     }
 
     /// Envelopes and bytes waiting, and deposits today, by token.
-    fn usage(&self) -> Vec<(Token, usize, u32)> {
+    pub(crate) fn usage(&self) -> Vec<(Token, usize, u32)> {
         self.active()
             .into_iter()
             .map(|t| {
@@ -287,7 +320,7 @@ impl Store {
     /// Lets go of what every recent device has collected, and of what has
     /// waited too long. A device gone longer than that holds nothing up.
     fn sweep(&mut self, now: u64) {
-        let recent = |at: u64| now.saturating_sub(at) < RETENTION;
+        let recent = |at: u64| self.retention.is_none_or(|r| now.saturating_sub(at) < r);
         self.saved.fetchers.retain(|_, f| recent(f.at));
         let collected = self.saved.fetchers.values().map(|f| f.acked).min();
         let gone: Vec<u64> = self
@@ -338,7 +371,10 @@ pub struct Mailbox {
     /// When each space was last fetched for an envelope's sake.
     pulled: Mutex<HashMap<SpaceId, Instant>>,
     /// Held while this device writes where to reach its person.
-    reaching: tokio::sync::Mutex<()>,
+    pub(crate) reaching: tokio::sync::Mutex<()>,
+    /// The contacts this device hosts, and its hosts that are contacts'
+    /// (D87).
+    pub(crate) hosted: crate::hosting::Hosted,
     /// The spaces where what this device set about on its own failed, as
     /// for a log that cannot be written, and when it tries again.
     put_off: Mutex<HashMap<SpaceId, PutOff>>,
@@ -393,13 +429,14 @@ impl Mailbox {
             .and_then(|b| serde_json::from_slice(&b).ok())
             .unwrap_or_default();
         Mailbox {
-            store: Mutex::new(Store::load(dir)),
+            store: Mutex::new(Store::load(dir.clone())),
             secrets: Mutex::new(HashMap::new()),
             sent: Mutex::new(sent),
             sent_path,
             going: Mutex::new(HashSet::new()),
             pulled: Mutex::new(HashMap::new()),
             reaching: tokio::sync::Mutex::new(()),
+            hosted: crate::hosting::Hosted::load(dir.join("hosted")),
             put_off: Mutex::new(HashMap::new()),
             pending_no: Mutex::new(pending_no),
             pending_no_path,
@@ -469,7 +506,7 @@ impl Mailbox {
 }
 
 /// Lets a token's holder open a session with this host (`link.md#handshake`).
-fn admit(d: &Daemon, token: &Token) {
+pub(crate) fn admit(d: &Daemon, token: &Token) {
     let mut entry = SecretEntry::new(&derive(Purpose::Token, token)[..]);
     entry.uses = None;
     let id = d.endpoint.add_secret(entry);
@@ -477,7 +514,7 @@ fn admit(d: &Daemon, token: &Token) {
 }
 
 /// Stops admitting a token, and ends what it opened.
-fn dismiss(d: &Daemon, token: &Token) {
+pub(crate) fn dismiss(d: &Daemon, token: &Token) {
     let mut secrets = lock(&d.mailbox.secrets);
     let ids: Vec<u64> = secrets
         .iter()
@@ -521,7 +558,7 @@ pub fn revoke(d: &Daemon, token: &Token) {
     dismiss(d, token);
 }
 
-fn error(code: u64) -> Record {
+pub(crate) fn error(code: u64) -> Record {
     Record::new().with(0, OP_ERROR).with(1, code)
 }
 
@@ -552,8 +589,14 @@ fn answer(d: &Daemon, s: &Session, r: &Record) -> Record {
     if op == Some(OP_DEPOSIT) {
         return deposit(d, r);
     }
-    let PeerKind::Own(device) = d.classify(s) else {
-        return error(NOT_PERMITTED);
+    let device = match d.classify(s) {
+        PeerKind::Own(device) => device,
+        // a device of a contact this one hosts, for their own mailbox
+        PeerKind::Contact(who, device) => {
+            return crate::hosting::answer_owner(d, &who, &device, r)
+                .unwrap_or(error(NOT_PERMITTED))
+        }
+        _ => return error(NOT_PERMITTED),
     };
     match op {
         Some(OP_FETCH) => {
@@ -611,7 +654,12 @@ fn deposit(d: &Daemon, r: &Record) -> Record {
     let (Some(token), Some(envelope)) = (token, envelope) else {
         return error(MALFORMED);
     };
-    let left = lock(&d.mailbox.store).deposit(&token, envelope, now());
+    let own = lock(&d.mailbox.store).is_active(&token);
+    let left = match own {
+        true => lock(&d.mailbox.store).deposit(&token, envelope, now()),
+        // a token of a contact this device hosts, or none
+        false => crate::hosting::deposit(d, &token, envelope, now()),
+    };
     match left {
         Ok(_) => {
             d.bump();
@@ -735,8 +783,7 @@ async fn reach_here(
             own_token(d, space)
         } else {
             let token: Token = random_bytes();
-            let at_host = |s: &Session| s.peer_static() == host;
-            let Some(s) = d.own_sessions().into_iter().find(at_host) else {
+            let Some(s) = d.session(&host) else {
                 continue;
             };
             let one = Value::Record(Record::new().with(1, token).with(2, 0u64));
@@ -814,20 +861,20 @@ async fn take_back(d: &Arc<Daemon>, new: &[Reach]) {
 /// While a token was being registered an entry may have arrived, and one
 /// that set the list, an empty list above all, is later than the
 /// decision (R1): a no must not be written over.
-struct Decided {
+pub(crate) struct Decided {
     telling: crate::core::Telling,
     set_by: Vec<String>,
 }
 
 impl Decided {
-    fn now(core: &crate::core::Core, space: &SpaceId) -> Decided {
+    pub(crate) fn now(core: &crate::core::Core, space: &SpaceId) -> Decided {
         Decided {
             telling: core.telling(space),
             set_by: core.list_set_by(space),
         }
     }
 
-    fn still(&self, core: &crate::core::Core, space: &SpaceId) -> bool {
+    pub(crate) fn still(&self, core: &crate::core::Core, space: &SpaceId) -> bool {
         core.list_set_by(space) == self.set_by && core.telling(space) == self.telling
     }
 }
@@ -866,7 +913,7 @@ async fn set_as_decided(
 }
 
 /// Notes that what software set about on its own in a space failed.
-fn put_off(d: &Daemon, space: &SpaceId) {
+pub(crate) fn put_off(d: &Daemon, space: &SpaceId) {
     let mut all = lock(&d.mailbox.put_off);
     let wait = match all.get(space) {
         Some(was) => (was.wait * 2).min(PUT_OFF.1),
@@ -877,7 +924,7 @@ fn put_off(d: &Daemon, space: &SpaceId) {
 }
 
 /// Whether an attempt in a space is put off for now.
-fn is_put_off(d: &Daemon, space: &SpaceId) -> bool {
+pub(crate) fn is_put_off(d: &Daemon, space: &SpaceId) -> bool {
     let all = lock(&d.mailbox.put_off);
     all.get(space).is_some_and(|p| Instant::now() < p.until)
 }
@@ -949,7 +996,7 @@ fn pending_no(d: &Daemon, space: &SpaceId, pending: bool) {
 /// Whether every account entry the person's lists in `space` rest on is
 /// held here (`relationship::rests_on`): until then a no the list was
 /// written for may not have arrived, and no host names itself there.
-fn record_here(core: &crate::core::Core, space: &SpaceId) -> bool {
+pub(crate) fn record_here(core: &crate::core::Core, space: &SpaceId) -> bool {
     let (Some(me), Some(sp)) = (
         core.me(),
         core.spaces.get(space).and_then(|h| h.space.as_ref()),
@@ -1735,6 +1782,63 @@ async fn collect(d: &Arc<Daemon>) {
     }
 }
 
+/// Collects this person's mailbox at a contact's device that hosts them
+/// (D87), over the session `s` with it: each envelope is taken in as one
+/// at a host of their own, and the host is told how far everything is
+/// taken. One that cannot be taken in yet holds back the acknowledgment of
+/// those after it, which are fetched again and taken in again, at no harm.
+pub(crate) async fn collect_at(d: &Arc<Daemon>, s: &Session) -> anyhow::Result<usize> {
+    let mut after = 0;
+    let mut acked = None;
+    let mut blocked = false;
+    let mut taken = 0;
+    loop {
+        let ask = Record::new().with(0, OP_FETCH).with(1, after);
+        let reply = call(s, Service::MAILBOX, ask).await?;
+        anyhow::ensure!(
+            reply.get(0).and_then(Value::as_uint) == Some(OP_FETCH),
+            "the host did not let this device fetch"
+        );
+        let list = reply.record_list(1).unwrap_or_default();
+        for r in &list {
+            let sequence = r.get(1).and_then(Value::as_uint);
+            let token = read_token(r.get(2));
+            let envelope = r.get(3).and_then(Value::as_bytes);
+            let (Some(sequence), Some(token), Some(envelope)) = (sequence, token, envelope) else {
+                continue;
+            };
+            let held = Held {
+                sequence,
+                token,
+                at: now(),
+                envelope: envelope.to_vec(),
+            };
+            after = after.max(sequence);
+            match take_in(d, &held).await {
+                Taken::Done if !blocked => {
+                    acked = Some(sequence);
+                    taken += 1;
+                }
+                Taken::Done => taken += 1,
+                Taken::NotYet => blocked = true,
+            }
+        }
+        let more = reply.get(2).and_then(Value::as_bool) == Some(true);
+        if list.is_empty() || !more {
+            break;
+        }
+    }
+    if let Some(sequence) = acked {
+        call(
+            s,
+            Service::MAILBOX,
+            Record::new().with(0, OP_ACK).with(1, sequence),
+        )
+        .await?;
+    }
+    Ok(taken)
+}
+
 /// What became of an envelope.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Taken {
@@ -1820,6 +1924,7 @@ fn pull_every() -> Duration {
 /// The two go separately: what comes in must not wait on a host of someone
 /// else's that does not answer.
 pub fn start(d: Arc<Daemon>) {
+    crate::hosting::start(d.clone());
     let collecting = d.clone();
     tokio::spawn(async move {
         let mut changed = collecting.changed.subscribe();

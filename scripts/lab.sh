@@ -4,7 +4,8 @@
 # `mapped` a device named only by the port its router gave it (D72), on a
 # network marked as its person's (D76), `unmarked` the same device on a
 # network nobody marked, whose router is never asked, and `cousin` is two
-# people where only one has a host, who call each other.
+# people where only one has a host, who call each other, and `hosted` Daniel's
+# nuc hosting Grandma, whom Ben reaches through it (D87).
 #
 #   cargo build -p cardinal && scripts/lab.sh people
 set -e

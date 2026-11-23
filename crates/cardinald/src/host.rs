@@ -148,6 +148,7 @@ fn enable_at(d: &Arc<Daemon>, endpoints: Vec<Endpoint>) -> anyhow::Result<Json> 
         host: identity,
         served: identity,
         services: vec![MAILBOX, STORAGE, RENDEZVOUS, RELAY],
+        classes: Vec::new(),
         storage_bytes: None,
         retention_days: None,
         endpoints,

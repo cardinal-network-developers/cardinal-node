@@ -32,6 +32,7 @@ pub mod groups;
 pub mod guardians;
 pub mod helper;
 pub mod host;
+pub mod hosting;
 pub mod inspect;
 pub mod introductions;
 pub mod keys;

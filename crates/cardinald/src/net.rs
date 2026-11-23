@@ -171,6 +171,9 @@ impl Daemon {
                     Access::None
                 }
             }
+            // a contact's token, at a device that hosts them: their
+            // mailbox, rendezvous and relay, and nothing to sync (D87)
+            PeerKind::Token(token) if crate::hosting::is_hosted_token(self, &token) => Access::None,
             PeerKind::Token(token) => {
                 let core = self.core();
                 // a token serves what stands in place of its space, and

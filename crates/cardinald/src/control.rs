@@ -734,6 +734,14 @@ async fn handle(d: &Arc<Daemon>, req: &Value) -> anyhow::Result<Value> {
             crate::host::enable(d, &addresses)
         }
         "host-off" => crate::host::disable(d),
+        "host-offer" => {
+            let devices = strings(req, "devices");
+            let n = |k: &str| req.get(k).and_then(|v| v.as_u64());
+            crate::hosting::offer(d, arg(req, "who")?, &devices, n("envelopes"), n("relay_mb"))
+        }
+        "host-accept" => crate::hosting::accept(d, arg(req, "who")?),
+        "host-end" => crate::hosting::end(d, arg(req, "who")?),
+        "hosting" => Ok(crate::hosting::list(d)),
         "router" => {
             if let Some(on) = req.get("on").and_then(|v| v.as_bool()) {
                 let here = req.get("this_device").and_then(|v| v.as_bool()) == Some(true);
