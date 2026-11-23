@@ -198,6 +198,92 @@ fn voice_only_answers_get_no_video() {
     assert!(ask(&a, json!({"cmd": "call"}))["call"]["taken"].is_null());
 }
 
+/// How many formats `key` (`taken` or `they_take`) of a device's call names.
+fn named(d: &Dev, key: &str) -> Option<usize> {
+    ask(d, json!({"cmd": "call"}))["call"][key]
+        .as_array()
+        .map(Vec::len)
+}
+
+/// Receiving video is each side's own choice, during the call too
+/// (`basics/video.md`): answered with voice only, no video comes; a new
+/// answer taking video starts it coming, to that side alone, and one with
+/// voice only stops it. The other side is told each time.
+#[test]
+fn answering_again_turns_video_on_and_off() {
+    if !fuse_available() {
+        eprintln!("skipping: /dev/fuse or fusermount3 is not available");
+        return;
+    }
+    let root = tempfile::tempdir().unwrap();
+    let (a, b, bo) = met(root.path());
+    let both = json!(["voice 1", "video vp8 1"]);
+    let voice = json!(["voice 1"]);
+    ask(
+        &a,
+        json!({"cmd": "call-start", "who": bo, "format_names": both}),
+    );
+    wait("bo's device rings", 10, || standing(&b) == "ringing");
+    let video = ask(&b, json!({"cmd": "call"}))["call"]["offered"][1]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    ask(&b, json!({"cmd": "call-answer", "format_names": voice}));
+    wait("ana hears the answer", 10, || standing(&a) == "live");
+    let of = |l: &[(String, u32)], k: &str| l.iter().filter(|(x, _)| x == k).count();
+
+    // Voice only: no video either way, though both windows send it.
+    let (at_a, at_b) = exchange(&a, &b, &video);
+    assert_eq!(of(&at_b, "audio"), 30, "{at_b:?}");
+    assert_eq!(
+        of(&at_b, &video) + of(&at_a, &video),
+        0,
+        "{at_a:?} {at_b:?}"
+    );
+
+    // Bo takes video: Ana's device is told, and sends him hers; she still
+    // takes none of his.
+    ask(&b, json!({"cmd": "call-answer", "format_names": both}));
+    assert_eq!(named(&b, "taken"), Some(2));
+    wait("ana is told bo takes video", 10, || {
+        named(&a, "they_take") == Some(2)
+    });
+    assert_eq!(named(&a, "taken"), Some(1));
+    let (at_a, at_b) = exchange(&a, &b, &video);
+    assert_eq!(of(&at_b, &video), 30, "{at_b:?}");
+    assert_eq!(of(&at_a, &video), 0, "{at_a:?}");
+
+    // Ana takes it too, the caller answering again.
+    ask(&a, json!({"cmd": "call-answer", "format_names": both}));
+    wait("bo is told", 10, || named(&b, "they_take") == Some(2));
+    let (at_a, at_b) = exchange(&a, &b, &video);
+    assert_eq!(of(&at_a, &video), 30, "{at_a:?}");
+    assert_eq!(of(&at_b, &video), 30, "{at_b:?}");
+
+    // Bo goes back to voice only: his video stops; Ana's goes on.
+    ask(&b, json!({"cmd": "call-answer"}));
+    wait("ana is told bo takes voice only", 10, || {
+        named(&a, "they_take") == Some(1)
+    });
+    let (at_a, at_b) = exchange(&a, &b, &video);
+    assert_eq!(of(&at_b, &video), 0, "{at_b:?}");
+    assert_eq!(of(&at_b, "audio"), 30, "{at_b:?}");
+    assert_eq!(of(&at_a, &video), 30, "{at_a:?}");
+    assert_eq!(standing(&a), "live");
+    assert_eq!(standing(&b), "live");
+    ask(&a, json!({"cmd": "call-end"}));
+    wait("over", 10, || standing(&b).is_null());
+
+    // A voice call that offered nothing else has nothing to answer again.
+    ask(&a, json!({"cmd": "call-start", "who": bo}));
+    wait("rings", 10, || standing(&b) == "ringing");
+    ask(&b, json!({"cmd": "call-answer"}));
+    wait("live", 10, || standing(&a) == "live");
+    let again = try_ask(&b, json!({"cmd": "call-answer", "format_names": both}));
+    assert_eq!(again["ok"], false, "{again}");
+    assert_eq!(standing(&b), "live");
+}
+
 /// The viewports that came on a line within `secs` seconds.
 fn viewports(l: &mut Line, secs: u64) -> Vec<Value> {
     let until = std::time::Instant::now() + Duration::from_secs(secs);

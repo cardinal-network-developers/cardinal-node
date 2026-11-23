@@ -275,7 +275,7 @@ rec!(BLUETOOTH "bluetooth":
 rec!(CALL "call":
     1 "frames" {CALL_FRAMES}, 2 "group" B, 3 "id" B, 4 "linked" U, 5 "name" T, 6 "offered" [B],
     7 "people" U, 8 "picture" T, 9 "seconds" U, 10 "state" T, 11 "taken" [B], 12 "who" B,
-    13 "voices" [VOICE]);
+    13 "voices" [VOICE], 14 "they_take" [B]);
 rec!(CALL_ENDED "call ended": 1 "group" B, 2 "how" T, 3 "id" B, 4 "name" T, 5 "who" B);
 rec!(CONDITIONS "conditions": 1 "helps" BOOL, 2 "metered" BOOL, 3 "plugged_in" BOOL);
 rec!(CONFLICT "conflict":

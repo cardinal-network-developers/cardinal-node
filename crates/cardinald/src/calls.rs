@@ -195,8 +195,12 @@ pub struct Call {
     group: bool,
     /// What the ring offered, if it named formats.
     offered: Option<Vec<Format>>,
-    /// What the answer took, if it named formats.
+    /// What this device takes of it, if the ring named formats: what its
+    /// answer took, or the other side's, until this one answers again.
     taken: Option<Vec<Format>>,
+    /// What the other side takes, and so what this device sends it: what
+    /// the answer took, until they answer again (`basics/video.md`).
+    they_take: Option<Vec<Format>>,
     /// The shape of this person's window, while one shows the call: told to
     /// those who send it video (`basics/video.md`), and never kept.
     viewport: Option<Viewport>,
@@ -224,6 +228,7 @@ impl Call {
             group: false,
             offered: None,
             taken: None,
+            they_take: None,
             viewport: None,
         }
     }
@@ -666,8 +671,16 @@ async fn ring_where_found(
     }
 }
 
-/// Takes the call that is ringing here.
+/// Takes the call that is ringing here; on a call already live between two
+/// people, changes what this device takes of what was offered
+/// ([`answer_again`]).
 pub async fn answer(d: &Arc<Daemon>, formats: Option<Vec<Format>>) -> anyhow::Result<Json> {
+    let live = lock(d)
+        .as_ref()
+        .is_some_and(|c| c.standing == Standing::Live && !c.group);
+    if live {
+        return answer_again(d, formats).await;
+    }
     let group = lock(d)
         .as_ref()
         .filter(|c| c.standing == Standing::Ringing && c.group)
@@ -696,6 +709,7 @@ pub async fn answer(d: &Arc<Daemon>, formats: Option<Vec<Format>>) -> anyhow::Re
             .offered
             .as_deref()
             .map(|offered| taking(offered, formats.as_deref()));
+        c.they_take = c.taken.clone();
         let s = c.session.clone();
         (
             s.ok_or_else(|| anyhow::anyhow!("that call has gone"))?,
@@ -709,6 +723,38 @@ pub async fn answer(d: &Arc<Daemon>, formats: Option<Vec<Format>>) -> anyhow::Re
         return Err(e);
     }
     go_live(d, &s, id);
+    Ok(json!({}))
+}
+
+/// A new `answer` on a live call between two people (`basics/video.md`):
+/// what this device takes now, of what the ring offered. The other side is
+/// told, and sends only that from then on; what this device no longer takes
+/// is not given to its window either.
+async fn answer_again(d: &Arc<Daemon>, formats: Option<Vec<Format>>) -> anyhow::Result<Json> {
+    let (s, space, id, taken) = {
+        let mut call = lock(d);
+        let c = call
+            .as_mut()
+            .filter(|c| c.standing == Standing::Live && !c.group)
+            .ok_or_else(|| anyhow::anyhow!("there is no call to answer"))?;
+        let offered = c
+            .offered
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("this call offered only voice"))?;
+        let taken = taking(offered, formats.as_deref());
+        c.taken = Some(taken.clone());
+        let s = c.session.clone();
+        (
+            s.ok_or_else(|| anyhow::anyhow!("that call has gone"))?,
+            c.space,
+            c.id,
+            taken,
+        )
+    };
+    d.bump();
+    tell_formats(&s, ANSWER, &space, &id, Some(&taken)).await?;
+    // Taking video again, the sender has this window's shape at once.
+    send_viewport(d);
     Ok(json!({}))
 }
 
@@ -799,8 +845,10 @@ fn go_live(d: &Arc<Daemon>, s: &Session, id: [u8; 16]) {
         c.session = Some(s.clone());
         c.live_since = Some(Instant::now());
         let label = channel_label(&c.space, &c.id);
+        // Every format offered has its channel, since an answer may take it
+        // later; what comes of one this device does not take now is dropped.
         let others: Vec<Format> = c
-            .taken
+            .offered
             .iter()
             .flatten()
             .filter(|f| **f != voice())
@@ -822,6 +870,7 @@ fn go_live(d: &Arc<Daemon>, s: &Session, id: [u8; 16]) {
                                 Some(v) if format == video() => {
                                     let _ = d.call_viewport.send((id, None, v));
                                 }
+                                _ if !takes(&d, &id, &format) => {}
                                 _ => {
                                     let _ = d.call_video.send(Shown {
                                         call: id,
@@ -868,6 +917,13 @@ fn go_live(d: &Arc<Daemon>, s: &Session, id: [u8; 16]) {
     });
 }
 
+/// Whether this device takes `format` on the call `id` now.
+fn takes(d: &Daemon, id: &[u8; 16], format: &Format) -> bool {
+    lock(d)
+        .as_ref()
+        .is_some_and(|c| c.id == *id && c.taken.as_ref().is_some_and(|t| t.contains(format)))
+}
+
 /// What is known of the call under way.
 pub fn current(d: &Daemon) -> Json {
     let ended = d
@@ -875,14 +931,15 @@ pub fn current(d: &Daemon) -> Json {
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .clone();
-    let (offered, taken) = {
+    let (offered, taken, they_take) = {
         let call = lock(d);
         let hexes = |l: &Option<Vec<Format>>| {
             l.as_ref()
                 .map(|l| l.iter().map(hex::encode).collect::<Vec<_>>())
         };
-        call.as_ref()
-            .map_or((None, None), |c| (hexes(&c.offered), hexes(&c.taken)))
+        call.as_ref().map_or((None, None, None), |c| {
+            (hexes(&c.offered), hexes(&c.taken), hexes(&c.they_take))
+        })
     };
     let (who, name, standing, seconds, space, group, id) = {
         let call = lock(d);
@@ -938,6 +995,7 @@ pub fn current(d: &Daemon) -> Json {
         "voices": voices,
         "offered": offered,
         "taken": taken,
+        "they_take": they_take,
     }, "ended": ended})
 }
 
@@ -2329,6 +2387,7 @@ pub async fn serve(d: &Arc<Daemon>, s: &Session, mut st: Stream, v: Value) -> an
                 ring_out(d, id);
             }
         }
+        ANSWER if answered_again(d, s, &them, &sig) => {}
         ANSWER => {
             // Checked and taken at once: the call may end, and another
             // begin, between two looks.
@@ -2343,6 +2402,7 @@ pub async fn serve(d: &Arc<Daemon>, s: &Session, mut st: Stream, v: Value) -> an
                         .offered
                         .as_deref()
                         .map(|offered| taking(offered, sig.formats.as_deref()));
+                    c.they_take = c.taken.clone();
                     true
                 })
             };
@@ -2392,6 +2452,36 @@ pub async fn serve(d: &Arc<Daemon>, s: &Session, mut st: Stream, v: Value) -> an
         _ => st.reset(0),
     }
     Ok(())
+}
+
+/// Whether `sig` is a new `answer` on the live call between two people
+/// that its session carries: if so, what the other side takes is now what
+/// it names of what was offered, and this device sends only that.
+fn answered_again(d: &Daemon, s: &Session, them: &[u8; 32], sig: &Signal) -> bool {
+    let changed = {
+        let mut call = lock(d);
+        let Some(c) = call.as_mut().filter(|c| {
+            c.id == sig.id
+                && c.who == *them
+                && c.standing == Standing::Live
+                && c.carrying
+                && !c.group
+                && c.session
+                    .as_ref()
+                    .is_some_and(|on| on.peer_static() == s.peer_static())
+        }) else {
+            return false;
+        };
+        c.they_take = c
+            .offered
+            .as_deref()
+            .map(|offered| taking(offered, sig.formats.as_deref()));
+        true
+    };
+    if changed {
+        d.bump();
+    }
+    changed
 }
 
 /// Whether `id` from `them` is the call already ringing here.
@@ -2673,7 +2763,8 @@ fn send_frame(d: &Daemon, format: Format, frame: Vec<u8>, size: Option<Size>) {
         else {
             return;
         };
-        if !c.taken.as_ref().is_some_and(|t| t.contains(&format)) {
+        // Sent only what the other side takes (`basics/video.md`).
+        if !c.they_take.as_ref().is_some_and(|t| t.contains(&format)) {
             return;
         }
         (c.session.clone(), format_label(&c.space, &c.id, &format))
