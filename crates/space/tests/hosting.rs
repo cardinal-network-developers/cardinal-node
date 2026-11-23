@@ -130,7 +130,7 @@ fn grant(p: &Pair, port: u16) -> Vec<u8> {
 fn an_offer_counts_only_from_whom_it_may() {
     let mut p = relationship_of(person(71, 0), person(72, 0));
     let (g1, g2) = (grant(&p, 1), grant(&p, 2));
-    p.ana_writes(relationship::create_host_offer(&[g1.clone()]));
+    p.ana_writes(relationship::create_host_offer(std::slice::from_ref(&g1)));
     let h = relationship::hostings(&p.b);
     assert_eq!(h.len(), 1);
     assert_eq!(h[0].host, p.ana.log.id());

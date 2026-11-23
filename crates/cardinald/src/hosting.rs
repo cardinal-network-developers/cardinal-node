@@ -79,6 +79,10 @@ pub fn default_class() -> QuotaClass {
     }
 }
 
+/// A contact's device present at this one: whose, its session, and the
+/// local addresses it gave.
+type Present = ([u8; 32], Session, Vec<SocketAddr>);
+
 /// A device of this person's hosting someone, and a device of someone's
 /// hosting this person, keep this.
 pub struct Hosted {
@@ -89,7 +93,7 @@ pub struct Hosted {
     admitted: Mutex<HashMap<[u8; 32], HashSet<Token>>>,
     /// As a host: contacts' devices present, by static key: whose, the
     /// session, and the local addresses they gave.
-    present: Mutex<HashMap<[u8; 32], ([u8; 32], Session, Vec<SocketAddr>)>>,
+    present: Mutex<HashMap<[u8; 32], Present>>,
     /// As a host: relay bytes left today, by token and day.
     relay: Mutex<HashMap<(Token, u64), Arc<AtomicU64>>>,
     /// As one hosted: when this device last presented itself to each host,
