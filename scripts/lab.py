@@ -677,19 +677,25 @@ def hosted():
     code = ben.cli("invite", "--address", f"{ben.ip}:7171", "--name", "Ben").strip()
     gran.cli("accept", code, "--name", "Ben")
 
-    def contact(d, name):
-        for c in d.ask({"cmd": "contacts"}).get("contacts") or []:
-            if c.get("name") == name:
-                return c
-        return {}
+    def met(d, name):
+        return any(l.split()[0:1] == [name] for l in d.cli("contacts").splitlines())
 
-    def hosting(d):
-        return d.ask({"cmd": "hosting"}).get("hosting") or []
+    def reached(d, name):
+        """Whether `d` has a session with a device of `name`, and whether
+        through something."""
+        v = json.loads(d.cli("contacts", name, "--json"))
+        on = [x for x in v.get("devices") or [] if x.get("online")]
+        return bool(on), any(x.get("through") for x in on)
 
-    ok = wait("they meet", 60, lambda: contact(nuc, "grandma") and contact(ben, "grandma"))
+    def waiting(d):
+        import re
+        m = re.search(r"(\d+) envelopes waiting here", d.cli("hosting"))
+        return int(m.group(1)) if m else 0
+
+    ok = wait("they meet", 60, lambda: met(nuc, "grandma") and met(ben, "grandma"))
     print("hosted:", flush=True)
     nuc.cli("hosting", "offer", "grandma")
-    wait("the offer", 60, lambda: any(not h.get("mine") for h in hosting(gran)))
+    wait("the offer", 60, lambda: "offers to host you" in gran.cli("hosting"))
     gran.cli("hosting", "accept", "Daniel")
     named = wait("named", 90, lambda: "device as a host of this person's" in gran.log())
     print(f"    grandma names the nuc as her host: {named is not None}", flush=True)
@@ -698,24 +704,23 @@ def hosted():
     ben.roam("ben-home", 3)
     gran.stop()
     ben.cli("say", "grandma", "while you were away")
-    waiting = wait("waiting", 90, lambda: any((h.get("waiting") or 0) >= 1 for h in hosting(nuc)))
-    print(f"    ben's message waits at the nuc: {waiting is not None}", flush=True)
+    left = wait("waiting", 90, lambda: waiting(nuc) >= 1)
+    print(f"    ben's message waits at the nuc: {left is not None}", flush=True)
     gran.start()
     got = wait("collected", 90, lambda: "while you were away" in gran.cli("messages", "Ben"))
     mailbox = "envelopes left with" in gran.log()
     print(f"    her phone woke and collected it: {got is not None}, from the mailbox: {mailbox}",
           flush=True)
     ben.cli("say", "grandma", "are you there?")
-    reached = wait("reached", 90, lambda: contact(ben, "grandma").get("connected"))
-    c = contact(ben, "grandma")
-    print(f"    ben reached her phone through the nuc: {reached is not None}, "
-          f"relayed: {c.get('relayed')}", flush=True)
+    found = wait("reached", 90, lambda: reached(ben, "grandma")[0])
+    print(f"    ben reached her phone through the nuc: {found is not None}, "
+          f"relayed: {reached(ben, 'grandma')[1]}", flush=True)
     gran.cli("hosting", "end", "Daniel")
     out = wait("taken out", 90, lambda: "no longer names a contact's host" in gran.log())
-    gone = wait("ended", 60, lambda: not hosting(nuc))
+    gone = wait("ended", 60, lambda: "You host nobody" in nuc.cli("hosting"))
     print(f"    ended: grandma stops naming it {out is not None}, the nuc hosts nobody "
           f"{gone is not None}", flush=True)
-    passed = all(x is not None for x in (ok, named, waiting, got, reached, out, gone)) and mailbox
+    passed = all(x is not None for x in (ok, named, left, got, found, out, gone)) and mailbox
     print(f"    {'PASS' if passed else 'FAIL'}", flush=True)
     for d in (nuc, gran, ben):
         d.stop()
