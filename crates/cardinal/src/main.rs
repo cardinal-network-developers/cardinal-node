@@ -402,6 +402,14 @@ enum Cmd {
         #[arg(long)]
         off: bool,
     },
+    /// Hosting trusted contacts, and being hosted by one: their mailbox,
+    /// and a way to reach their devices, on your devices that can be
+    /// reached from outside your network. With nothing after it, lists
+    /// whom you host, who hosts you, and the offers between.
+    Hosting {
+        #[command(subcommand)]
+        cmd: Option<HostingCmd>,
+    },
     /// Your 24 recovery words.
     Recovery {
         #[command(subcommand)]
@@ -725,6 +733,38 @@ enum GroupCmd {
         /// Introduced through the group again.
         #[arg(long, conflicts_with = "no_introductions")]
         introductions: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum HostingCmd {
+    /// Offer to host a trusted contact, or, where you have, add devices and
+    /// change how much they may use.
+    Offer {
+        /// The contact.
+        who: String,
+        /// A device of yours to host them on; all that can if none is given.
+        /// Give it more than once for more than one.
+        #[arg(long = "on")]
+        devices: Vec<String>,
+        /// Envelopes that may wait for them, and be left in a day, under
+        /// one token (256 if not given).
+        #[arg(long)]
+        envelopes: Option<u64>,
+        /// Megabytes a day relayed for them under one token (50 if not
+        /// given).
+        #[arg(long)]
+        relay_mb: Option<u64>,
+    },
+    /// Say yes to a contact's offer to host you.
+    Accept {
+        /// The contact.
+        who: String,
+    },
+    /// End hosting a contact, being hosted by one, or an offer between you.
+    End {
+        /// The contact.
+        who: String,
     },
 }
 
@@ -3687,6 +3727,98 @@ async fn client(cmd: Cmd) -> anyhow::Result<()> {
             }
             let v = call(&paths, req).await?;
             print_network(&v);
+            Ok(())
+        }
+        Cmd::Hosting { cmd } => {
+            match cmd {
+                None => {}
+                Some(HostingCmd::Offer {
+                    who,
+                    devices,
+                    envelopes,
+                    relay_mb,
+                }) => {
+                    let mut req = json!({"cmd": "host-offer", "who": who, "devices": devices});
+                    if let Some(n) = envelopes {
+                        req["envelopes"] = json!(n);
+                    }
+                    if let Some(n) = relay_mb {
+                        req["relay_mb"] = json!(n);
+                    }
+                    let v = call(&paths, req).await?;
+                    let on: Vec<&str> = v["devices"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .filter_map(|d| d.as_str())
+                        .collect();
+                    println!("Offered to host {who} on {}.", on.join(", "));
+                    println!("They are told: {}", v["sees"].as_str().unwrap_or(""));
+                    return Ok(());
+                }
+                Some(HostingCmd::Accept { who }) => {
+                    let v = call(&paths, json!({"cmd": "host-accept", "who": who})).await?;
+                    println!("{who} hosts you now. {}", v["sees"].as_str().unwrap_or(""));
+                    return Ok(());
+                }
+                Some(HostingCmd::End { who }) => {
+                    call(&paths, json!({"cmd": "host-end", "who": who})).await?;
+                    println!("Hosting between you and {who} has ended.");
+                    return Ok(());
+                }
+            }
+            let v = call(&paths, json!({"cmd": "hosting"})).await?;
+            let list = v["hosting"].as_array().cloned().unwrap_or_default();
+            if list.is_empty() {
+                println!("You host nobody, and nobody hosts you.");
+            }
+            for h in list {
+                let name = h["name"].as_str().unwrap_or("");
+                let mine = h["mine"] == true;
+                let accepted = h["accepted"] == true;
+                let line = match (mine, accepted) {
+                    (true, true) => format!("You host {name}"),
+                    (true, false) => format!("You offered to host {name}"),
+                    (false, true) => format!("{name} hosts you"),
+                    (false, false) => format!(
+                        "{name} offers to host you: `cardinal hosting accept {name}`"
+                    ),
+                };
+                let on: Vec<&str> = h["devices"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|d| d.as_str())
+                    .collect();
+                let on = if on.is_empty() {
+                    String::new()
+                } else {
+                    format!(" on {}", on.join(", "))
+                };
+                let waiting = h["waiting"]
+                    .as_u64()
+                    .map(|n| format!(", {n} envelopes waiting here"))
+                    .unwrap_or_default();
+                println!(
+                    "  {line}{on} ({} envelopes, {} MB relayed a day{waiting})",
+                    h["envelopes"].as_u64().map_or("any".into(), |n| n.to_string()),
+                    h["relay_bytes"]
+                        .as_u64()
+                        .map_or("any".into(), |n| (n / 1_000_000).to_string()),
+                );
+            }
+            match v["why_not"].as_str() {
+                Some(why) => println!("{why}"),
+                None => {
+                    let can: Vec<&str> = v["can"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .filter_map(|d| d.as_str())
+                        .collect();
+                    println!("Your devices that can host someone: {}", can.join(", "));
+                }
+            }
             Ok(())
         }
         Cmd::Host { addresses, off } => {
