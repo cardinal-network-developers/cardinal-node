@@ -1569,8 +1569,9 @@ mod tests {
         assert!(!due(Some(&ok), one, 0, much_later));
     }
 
-    /// Review M4. A device that does not help others dials no neighbours
-    /// in the reconnect loop's passes; when it wakes, it does.
+    /// Review M4. A device that does not help others, kept in touch by an
+    /// anchor, dials no neighbours in the reconnect loop's passes; when it
+    /// wakes, it does.
     #[tokio::test(flavor = "multi_thread")]
     async fn a_device_that_does_not_help_dials_no_neighbours_on_a_timer() {
         let h = Two::new().await;

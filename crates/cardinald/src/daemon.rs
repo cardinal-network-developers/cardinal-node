@@ -1706,12 +1706,13 @@ impl Daemon {
     }
 
     /// [`connect_all`](Self::connect_all), as the reconnect loop does it
-    /// every few seconds: a device that does not help others dials no
-    /// neighbours then. It dials them when it wakes, when its network
-    /// changes and when its person turns to them; between, its anchors and
-    /// the sessions others open to it are its neighbours (D86).
+    /// every few seconds: a device that does not help others, and that an
+    /// anchor keeps in touch, dials no neighbours then. It dials them when
+    /// it wakes, when its network changes and when its person turns to
+    /// them; between, its anchors and the sessions others open to it are
+    /// its neighbours (D86). With no anchor, it keeps them itself.
     pub async fn reconnect(self: &Arc<Self>) {
-        let neighbours = self.conditions.helps();
+        let neighbours = self.conditions.helps() || !self.known.anchored();
         self.connect_to(neighbours).await;
     }
 

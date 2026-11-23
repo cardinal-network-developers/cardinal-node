@@ -205,9 +205,17 @@ pub struct Known {
     /// The contacts' devices seen keeping a session alive, by link key:
     /// anchors, whose silence means they went away.
     anchors: Mutex<HashSet<[u8; 32]>>,
+    /// An anchor keeps one of this device's sessions alive, as the last
+    /// look at keepalives found.
+    anchored: AtomicBool,
 }
 
 impl Known {
+    /// Whether an anchor keeps one of this device's sessions alive.
+    pub fn anchored(&self) -> bool {
+        self.anchored.load(Ordering::Relaxed)
+    }
+
     /// The device was seen in a session, or answered, at `addr`.
     pub fn confirm(&self, device: KeyId, who: [u8; 32], addr: SocketAddr) {
         let now = Instant::now();
@@ -739,6 +747,7 @@ fn keepalives(d: &Daemon) {
         });
     }
     let anchored = !helps && sessions.iter().any(|(_, s)| s.pinged_twice_within(within));
+    d.known.anchored.store(anchored, Ordering::Relaxed);
     let keep: HashSet<[u8; 32]> = if helps {
         // A contact's device present here as one this device hosts (D87)
         // is kept alive as a neighbour's is: its host is its anchor.
