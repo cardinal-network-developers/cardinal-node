@@ -15,7 +15,7 @@ use serde_json::{json, Value};
 use std::time::{Duration, Instant};
 
 fn start(d: &mut Dev) {
-    d.start_with(&["--no-mount", "--no-discovery"]);
+    d.start_with(&["--no-mount"]);
 }
 
 /// Beta, as alpha sees it.

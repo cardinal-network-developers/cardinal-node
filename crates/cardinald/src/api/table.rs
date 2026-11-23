@@ -297,7 +297,8 @@ rec!(COPIES "copies":
     6 "now" U, 7 "older_than_ms" U);
 rec!(DEVICE "device":
     1 "addr" T, 2 "carrier" T, 3 "fetch" {FETCH}, 4 "key" B, 5 "name" T, 6 "online" BOOL,
-    7 "power" T, 8 "this" BOOL, 9 "through" T, 10 "unreadable" {UNREADABLE});
+    7 "power" T, 8 "this" BOOL, 9 "through" T, 10 "unreadable" {UNREADABLE}, 11 "dials" U,
+    12 "redial_s" U);
 rec!(ENDPOINT "endpoint": 1 "endpoint" T, 2 "local" BOOL, 3 "tried" BOOL, 4 "why_not" T);
 rec!(FETCH "fetch": 1 "latency_ms" U, 2 "rate" U, 3 "received" U, 4 "replies" U);
 rec!(FILE "file":
@@ -383,6 +384,8 @@ rec!(RECOVERY "recovery":
     5 "endorsed" U, 6 "endorsed_by_me" BOOL, 7 "fingerprint" T, 8 "id" B, 9 "in_effect" BOOL,
     10 "keeps_keys" BOOL, 11 "objected" BOOL, 12 "pending" BOOL);
 rec!(ROLE_CHANGE "role change": 1 "from" T, 2 "name" T, 3 "to" T);
+rec!(REDIAL "redial": 1 "alone" BOOL, 2 "helps" BOOL, 3 "sparing" {SPARING});
+rec!(SPARING "sparing": 1 "next_s" U, 2 "wait_s" U);
 rec!(ROUTER "router":
     1 "error" T, 2 "everywhere" BOOL, 3 "external" T, 4 "named" [T], 5 "network" {NETWORK},
     6 "on" BOOL, 7 "protocol" T, 8 "seconds_left" U, 9 "this_device" BOOL);
@@ -500,7 +503,7 @@ pub static REQUESTS: &[Request] = &[
         25 "pairing" {PAIRING}, 26 "peers" [T], 27 "pending_changes" BOOL,
         28 "progress" {PROGRESS}, 29 "read_markers" BOOL, 30 "removed" BOOL, 31 "retention" T,
         32 "router" {ROUTER}, 33 "spaces" [SPACE], 34 "uptime_s" U, 35 "more" BOOL,
-        36 "next" U)),
+        36 "next" U, 37 "redial" {REDIAL})),
     req!(3 "watch" (1 "window" BOOL) -> ()),
     req!(4 "stop" () -> ()),
     req!(5 "reload" () -> ()),
