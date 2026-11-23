@@ -161,16 +161,17 @@ impl MyHost {
 /// relationship, whether this person trusts them, and the hosting.
 fn all(d: &Daemon) -> Vec<([u8; 32], SpaceId, bool, Hosting)> {
     let core = d.core();
+    let contacts = core.contacts();
     let mut out = Vec::new();
     let mut seen = HashSet::new();
-    for c in core.contacts() {
+    for c in &contacts {
         if c.recovery_of.is_some() || !seen.insert(c.space) {
             continue;
         }
         let Some(sp) = core.spaces.get(&c.space).and_then(|h| h.space.as_ref()) else {
             continue;
         };
-        let trusted = cardinal_space::account::connects(&core.contacts(), &c.identity);
+        let trusted = cardinal_space::account::connects(&contacts, &c.identity);
         for h in relationship::hostings(sp) {
             out.push((c.identity, c.space, trusted, h));
         }
@@ -333,7 +334,9 @@ pub(crate) fn answer_owner(
     if !s.active && !matches!(op, Some(mailbox::OP_FETCH | mailbox::OP_ACK)) {
         return Some(mailbox::error(mailbox::NOT_PERMITTED));
     }
-    open_store(d, who);
+    if s.active {
+        open_store(d, who);
+    }
     let mut stores = lock(&d.mailbox.hosted.stores);
     let store = stores.get_mut(who)?;
     let reply = match op {
@@ -513,7 +516,7 @@ fn relay_budget(d: &Daemon, token: &Token, class: &QuotaClass) -> Option<Arc<Ato
 /// takes itself out where it can no longer be reached.
 fn keep_as_host(d: &Arc<Daemon>) {
     let serving = serving(d);
-    for s in &serving {
+    for s in serving.iter().filter(|s| s.active) {
         open_store(d, &s.who);
     }
     let known: Vec<[u8; 32]> = lock(&d.mailbox.hosted.stores).keys().copied().collect();
