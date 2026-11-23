@@ -653,6 +653,75 @@ def unmarked():
     sh("for n in $(ip netns list | cut -d' ' -f1); do ip netns del $n; done", check=False)
 
 
+def hosted():
+    """D87: Daniel's nuc, behind his strict router with its port forwarded,
+    hosts Grandma, whose phone is behind an ordinary router with no host of
+    her own. Ben, whom she met at her house and who is nobody to Daniel,
+    goes home behind a strict router and writes to her while her phone is
+    off: the envelope waits at the nuc. Her phone wakes and collects it;
+    Ben then finds her phone through the nuc and is relayed. She ends it."""
+    net = Net()
+    net.router("dan-home", "internet", "198.51.100.10", "198.51.100.1", "192.168.1", "hard",
+               forward="192.168.1.2")
+    net.router("gran-home", "internet", "198.51.101.10", "198.51.101.1", "192.168.2", "easy")
+    net.router("ben-home", "internet", "198.51.103.10", "198.51.103.1", "192.168.4", "hard")
+    nuc = Dev(net, "nuc", "dan-home", 2)
+    gran = Dev(net, "grandma", "gran-home", 3)
+    ben = Dev(net, "ben", "gran-home", 4)
+    for d in (nuc, gran, ben):
+        d.start()
+        d.cli("init", "--yes", "--name", d.name)
+    nuc.cli("host", "--address", "198.51.100.10:7171")
+    code = nuc.cli("invite", "--name", "Daniel").strip()
+    gran.cli("accept", code, "--name", "Daniel")
+    code = ben.cli("invite", "--address", f"{ben.ip}:7171", "--name", "Ben").strip()
+    gran.cli("accept", code, "--name", "Ben")
+
+    def contact(d, name):
+        for c in d.ask({"cmd": "contacts"}).get("contacts") or []:
+            if c.get("name") == name:
+                return c
+        return {}
+
+    def hosting(d):
+        return d.ask({"cmd": "hosting"}).get("hosting") or []
+
+    ok = wait("they meet", 60, lambda: contact(nuc, "grandma") and contact(ben, "grandma"))
+    print("hosted:", flush=True)
+    nuc.cli("hosting", "offer", "grandma")
+    wait("the offer", 60, lambda: any(not h.get("mine") for h in hosting(gran)))
+    gran.cli("hosting", "accept", "Daniel")
+    named = wait("named", 90, lambda: "device as a host of this person's" in gran.log())
+    print(f"    grandma names the nuc as her host: {named is not None}", flush=True)
+    time.sleep(5)
+
+    ben.roam("ben-home", 3)
+    gran.stop()
+    ben.cli("say", "grandma", "while you were away")
+    waiting = wait("waiting", 90, lambda: any((h.get("waiting") or 0) >= 1 for h in hosting(nuc)))
+    print(f"    ben's message waits at the nuc: {waiting is not None}", flush=True)
+    gran.start()
+    got = wait("collected", 90, lambda: "while you were away" in gran.cli("messages", "Ben"))
+    mailbox = "envelopes left with" in gran.log()
+    print(f"    her phone woke and collected it: {got is not None}, from the mailbox: {mailbox}",
+          flush=True)
+    ben.cli("say", "grandma", "are you there?")
+    reached = wait("reached", 90, lambda: contact(ben, "grandma").get("connected"))
+    c = contact(ben, "grandma")
+    print(f"    ben reached her phone through the nuc: {reached is not None}, "
+          f"relayed: {c.get('relayed')}", flush=True)
+    gran.cli("hosting", "end", "Daniel")
+    out = wait("taken out", 90, lambda: "no longer names a contact's host" in gran.log())
+    gone = wait("ended", 60, lambda: not hosting(nuc))
+    print(f"    ended: grandma stops naming it {out is not None}, the nuc hosts nobody "
+          f"{gone is not None}", flush=True)
+    passed = all(x is not None for x in (ok, named, waiting, got, reached, out, gone)) and mailbox
+    print(f"    {'PASS' if passed else 'FAIL'}", flush=True)
+    for d in (nuc, gran, ben):
+        d.stop()
+    sh("for n in $(ip netns list | cut -d' ' -f1); do ip netns del $n; done", check=False)
+
+
 os.makedirs(SOCKETS, exist_ok=True)
 os.makedirs(WORK, exist_ok=True)
 if "trace" in WHICH:
@@ -670,6 +739,8 @@ if "mapped" in WHICH:
     mapped()
 if "unmarked" in WHICH:
     unmarked()
+if "hosted" in WHICH:
+    hosted()
 if "cousin" in WHICH:
     cousin("easy", "his home behind an ordinary router")
     cousin("cgnat", "his home behind carrier-grade NAT")
