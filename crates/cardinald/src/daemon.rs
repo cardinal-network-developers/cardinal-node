@@ -1736,8 +1736,21 @@ impl Daemon {
 
     /// What a pass of the reconnect loop at `now` dials, if anything.
     pub(crate) fn pass(&self, now: Instant) -> Option<Dial> {
-        // A contact new here is turned to (`rendezvous.rs`).
-        let contacts: Vec<[u8; 32]> = self.core().contacts().iter().map(|c| c.identity).collect();
+        // A contact new here is turned to (`rendezvous.rs`), once there is
+        // a device of theirs to dial: their log may come after the record.
+        let contacts: Vec<[u8; 32]> = {
+            let core = self.core();
+            let dialable = |w: &[u8; 32]| {
+                core.others
+                    .get(w)
+                    .is_some_and(|o| o.log.state().keys.values().any(|k| k.link_key.is_some()))
+            };
+            let all = core.contacts();
+            all.iter()
+                .map(|c| c.identity)
+                .filter(|w| dialable(w))
+                .collect()
+        };
         self.rendezvous.knows(contacts);
         // On a call, the person is using those they talk to all along.
         let on_call = lock(&self.call).is_some();
@@ -1810,7 +1823,14 @@ impl Daemon {
                 .filter_map(|k| Some((k.key, k.link_key.clone()?)))
                 .collect();
             let contacts = core.contacts();
-            self.rendezvous.knows(contacts.iter().map(|c| c.identity));
+            // as `pass` does: only those with a device to dial
+            let dialable = |w: &[u8; 32]| {
+                core.others
+                    .get(w)
+                    .is_some_and(|o| o.log.state().keys.values().any(|k| k.link_key.is_some()))
+            };
+            let ids = contacts.iter().map(|c| c.identity);
+            self.rendezvous.knows(ids.filter(|w| dialable(w)));
             let wanted = contacts.iter().filter(|c| all && c.connects());
             for c in wanted.filter(|c| self.rendezvous.in_use(&c.identity)) {
                 let Some(o) = core.others.get(&c.identity) else {

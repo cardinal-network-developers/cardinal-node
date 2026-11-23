@@ -545,13 +545,17 @@ fn a_contact_not_trusted_back_is_not_reached_through_a_host() {
     ana.cli(&["contact", "bo", "hosts-only"]);
     let (na, nb) = (Nat::new(Kind::Symmetric), Nat::new(Kind::Symmetric));
     put_behind(&mut ana, &na);
+    // Bo looks for Ana as soon as they meet, while her laptop still trusts
+    // him back: only what follows counts.
+    let from = bo.log().len();
     put_behind(&mut bo, &nb);
+    let since = |bo: &Dev| bo.log().get(from..).unwrap_or_default().to_owned();
     wait("ana's host answers bo", 40, || {
-        bo.log().contains("host named 0 of their devices")
+        since(&bo).contains("host named 0 of their devices")
     });
     std::thread::sleep(Duration::from_secs(5));
     assert!(
-        !bo.log().contains("host named 1"),
+        !since(&bo).contains("host named 1"),
         "the host named ana's laptop"
     );
     assert_eq!(the_contact(&bo)["connected"], false);
