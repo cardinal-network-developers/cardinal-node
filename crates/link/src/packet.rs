@@ -44,7 +44,7 @@ pub const TYPE_PROBE: u8 = 6;
 /// The answer to a probe.
 pub const TYPE_PROBE_ANSWER: u8 = 7;
 /// A probe's length.
-pub const PROBE_LEN: usize = 32;
+pub const PROBE_LEN: usize = 28;
 /// A probe answer's length.
 pub const PROBE_ANSWER_LEN: usize = 12;
 

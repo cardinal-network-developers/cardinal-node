@@ -4,7 +4,7 @@
 //! in proportion to what it can afford. For each of their devices this one
 //! keeps the last address a direct session worked at, and when that was
 //! confirmed. While there is no session it confirms it about every 30
-//! minutes, and at once on waking or a network change, with a 32-byte probe
+//! minutes, and at once on waking or a network change, with a 28-byte probe
 //! (`hosts.md#probe`) that only a device of a person who trusts this one
 //! answers. A probe with no answer doubles the wait, up to four hours;
 //! anything that shows the device puts it back.
@@ -46,9 +46,10 @@ const ANSWER_WITHIN: Duration = Duration::from_secs(5);
 const PATH_WITHIN: Duration = Duration::from_secs(3);
 /// How long a dial on waking may take before it counts as a miss.
 const DIAL_WITHIN: Duration = Duration::from_secs(60);
-/// How far a probe's time may be from this device's clock, in seconds.
-const TIME_WINDOW: u64 = 300;
-/// How long the nonces of probes answered are kept.
+/// How long the nonces of probes answered are kept. A probe carries no
+/// time, so this is all that stops one being answered twice here; one
+/// replayed later, or elsewhere, tells whoever replays it that a device
+/// there recognizes its tag, as a replayed advertisement does.
 const NONCES_FOR: Duration = Duration::from_secs(600);
 /// The most nonces kept; older ones go first.
 const NONCES_KEPT: usize = 4096;
@@ -165,7 +166,7 @@ impl Path {
 
 /// A probe sent, waiting for answers.
 struct Sent {
-    probe: [u8; 32],
+    probe: disc::Probe,
     /// Where it went: an answer from anywhere else is none.
     to: HashSet<SocketAddr>,
     /// The device whose path it checks, or none for a sweep.
@@ -435,10 +436,6 @@ fn on_probe(d: &Arc<Daemon>, pkt: &[u8], from: SocketAddr) {
     if d.known.sent_here(nonce) {
         return;
     }
-    let now = unix_ms() / 1000;
-    if now.abs_diff(u64::from(disc::probe_time(&p))) > TIME_WINDOW {
-        return;
-    }
     let answer = {
         let k = keys(d);
         if k.own.as_ref().is_some_and(|o| disc::probe_from_own(&p, o)) {
@@ -514,11 +511,10 @@ fn on_answer(d: &Arc<Daemon>, pkt: &[u8], from: SocketAddr) {
 }
 
 /// A new probe, made now.
-fn new_probe(d: &Daemon) -> Option<[u8; 32]> {
+fn new_probe(d: &Daemon) -> Option<disc::Probe> {
     let k = keys(d);
     let own = k.own.as_ref()?;
-    let time = u32::try_from(unix_ms() / 1000).unwrap_or(u32::MAX);
-    Some(disc::probe(own, k.mine.as_deref(), time, random_bytes()))
+    Some(disc::probe(own, k.mine.as_deref(), random_bytes()))
 }
 
 /// One pass: the paths follow the sessions open, those due are checked,
