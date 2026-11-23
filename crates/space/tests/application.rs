@@ -287,4 +287,19 @@ fn the_writer_s_service_refuses_what_its_documents_do_not_allow() {
     // the node is in the state all the same, and does not fit
     let n = a.space.state().node(&odd).unwrap().clone();
     assert!(!family.fits(a.space.state(), &n));
+    // a move with a key past its three is refused, as the others are
+    let note = a.write(vec![create(
+        Value::from(1u64),
+        Value::from(ROOT),
+        Record::new(),
+    )]);
+    let note = cardinal_space::entry::derived_id(&note, 0);
+    let mv = Record::new()
+        .with(0, 34u64)
+        .with(1, note)
+        .with(2, ROOT)
+        .with(3, "moved");
+    assert!(check(&a, vec![mv.clone()]).is_ok());
+    let r = check(&a, vec![mv.with(4, "was")]).unwrap_err();
+    assert!(r.why.contains("fields 1 to 3"), "{}", r.why);
 }

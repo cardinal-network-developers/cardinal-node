@@ -754,6 +754,9 @@ pub fn check(
                 if op.get(3).and_then(Value::as_text).is_none() {
                     return Err(no("it has no name".into()));
                 }
+                if op.iter().any(|(k, _)| *k > 3) {
+                    return Err(no("a move here has fields 1 to 3 only".into()));
+                }
                 out.push(op.clone());
             }
             Some(35) | Some(36) => {
