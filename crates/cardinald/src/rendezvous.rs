@@ -1843,6 +1843,10 @@ pub async fn found_near(d: &Arc<Daemon>, who: [u8; 32], near: Near) {
             .filter_map(|k| Some((k.key, k.link_key.clone()?)))
             .collect()
     };
+    // Their tag seen: their known paths are checked as usual again (D86).
+    for (k, _) in &theirs {
+        d.known.heard(k);
+    }
     // Over Bluetooth a device with any session is left alone; on the LAN
     // one reached only over Bluetooth is tried, for something better.
     let carrier = near.carrier();
