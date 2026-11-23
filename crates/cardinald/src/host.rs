@@ -393,7 +393,8 @@ fn own_nodes(d: &Daemon, host: bool) -> anyhow::Result<([u8; 32], Vec<SpaceOp>)>
         }
     }
     if let Some(n) = account::devices(st).into_iter().find(|n| n.key == me) {
-        ops.push(account::set_field(n.node, 3, host));
+        // Whether it is always on, field 3, is its own to say as it helps
+        // others or not (`hosting::say_always_on`), host or not.
         ops.push(account::set_field(n.node, 4, host));
     }
     Ok((acc.id, ops))

@@ -648,6 +648,22 @@ fn helpers(d: &Daemon) -> Vec<Session> {
     sessions.filter(|s| !s.is_relayed()).collect()
 }
 
+/// The sessions that can help this device to another of its person's:
+/// their own devices, and the contacts' devices that host them (D87). One
+/// hop, as for [`helpers`].
+fn own_helpers(d: &Daemon) -> Vec<Session> {
+    let mut out = helpers(d);
+    for h in crate::hosting::my_hosts(d) {
+        let s = d.session(h.grant.link_key.x25519());
+        if let Some(s) = s.filter(|s| !s.is_relayed()) {
+            if !out.iter().any(|o| o.peer_static() == s.peer_static()) {
+                out.push(s);
+            }
+        }
+    }
+    out
+}
+
 /// The devices of this person's with no direct session, by static key.
 fn wanted(d: &Daemon) -> HashMap<[u8; 32], (KeyId, HybridPublicKey)> {
     let devices: Vec<(KeyId, HybridPublicKey)> = {
@@ -771,7 +787,7 @@ pub async fn ask_helpers(d: Arc<Daemon>) {
         }
         *asked = Some(Instant::now());
     }
-    for s in helpers(&d) {
+    for s in own_helpers(&d) {
         ask(&d, &s).await;
     }
 }
@@ -812,7 +828,7 @@ async fn meet(d: Arc<Daemon>, device: KeyId, link: HybridPublicKey, addresses: V
     // One of the two asks, and either can tell which.
     let mine = *d.keys.link.public_key().x25519();
     if mine < *link.x25519() {
-        for helper in helpers(&d) {
+        for helper in own_helpers(&d) {
             if d.is_online(link.x25519()) {
                 break;
             }
@@ -1002,30 +1018,61 @@ fn error(code: u64) -> Record {
 
 /// Tells every device present of `s`, and `s` of them.
 fn connect(s: &Session, d: &Daemon) -> Record {
+    let present: Vec<([u8; 32], Session, Vec<SocketAddr>)> = {
+        let mut present = lock(&d.rendezvous.present);
+        present.retain(|_, p| !p.session.is_closed());
+        present
+            .iter()
+            .map(|(k, p)| (*k, p.session.clone(), p.local.clone()))
+            .collect()
+    };
+    connect_among(s, present)
+}
+
+/// [`connect`], among the devices `present`: this person's, or those of a
+/// contact this device hosts, where one of theirs asks (D87).
+pub(crate) fn connect_among(
+    s: &Session,
+    present: Vec<([u8; 32], Session, Vec<SocketAddr>)>,
+) -> Record {
     let me = s.peer_static();
-    let mut present = lock(&d.rendezvous.present);
-    present.retain(|_, p| !p.session.is_closed());
     let asker = Found {
         device: me,
         observed: observed(s),
         local: present
-            .get(&me)
-            .map(|p| p.local.clone())
+            .iter()
+            .find(|(k, ..)| *k == me)
+            .map(|(_, _, l)| l.clone())
             .unwrap_or_default(),
     };
     let tell = found_record(&asker).with(0, OP_INCOMING);
     let mut found = Vec::new();
-    for (device, p) in present.iter().filter(|(k, _)| **k != me) {
+    for (device, session, local) in present.iter().filter(|(k, ..)| *k != me) {
         found.push(Value::Record(found_record(&Found {
             device: *device,
-            observed: observed(&p.session),
-            local: p.local.clone(),
+            observed: observed(session),
+            local: local.clone(),
         })));
-        tell_device(p.session.clone(), Service::RENDEZVOUS, tell.clone());
+        tell_device(session.clone(), Service::RENDEZVOUS, tell.clone());
     }
     Record::new()
         .with(0, OP_CONNECT)
         .with(1, Value::list(found))
+}
+
+/// Opens a channel between `s` and `other`, within `budget`, or says it is
+/// not present: for a contact this device hosts, to another of their own
+/// devices (D87).
+pub(crate) fn relay_to(
+    d: &Daemon,
+    s: &Session,
+    other: Option<Session>,
+    budget: Option<Arc<std::sync::atomic::AtomicU64>>,
+) -> Record {
+    match other {
+        Some(other) => open_channel_within(d, s, &other, budget),
+        None => error(NOT_PRESENT),
+    }
 }
 
 /// Another of this person's devices says one is looking for this one: one
@@ -1132,6 +1179,17 @@ fn contact_incoming(d: &Arc<Daemon>, who: &[u8; 32], r: &Record) {
     let Some(x) = identity_field(r.get(1)) else {
         return;
     };
+    // A contact's device that hosts this person says another device of
+    // this person's own is looking for this one (D87): as one of their own
+    // devices would.
+    if crate::hosting::hosts_me(d, who) {
+        if let Some((device, link)) = wanted(d).remove(&x) {
+            let at = read_found(r).map(|f| f.addresses()).unwrap_or_default();
+            tracing::debug!("a host says {} is looking for this device", short(&x));
+            tokio::spawn(meet(d.clone(), device, link, at));
+            return;
+        }
+    }
     let Some(at) = r.get(2).and_then(read_address) else {
         return;
     };

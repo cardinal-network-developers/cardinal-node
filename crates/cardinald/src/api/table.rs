@@ -334,9 +334,11 @@ rec!(HOLDER "holder":
     6 "last_pass" U, 7 "missed" U, 8 "name" T, 9 "online" BOOL, 10 "reason" T, 11 "state" T,
     12 "this" BOOL);
 rec!(HOST "host": 1 "addresses" [T], 2 "key" (gone T), 3 "name" T, 4 "key" B);
+rec!(HOSTABLE "hostable": 1 "name" T, 2 "outside" BOOL, 3 "sees" T, 4 "services" [T]);
 rec!(HOSTING "hosting":
     1 "accepted" BOOL, 2 "devices" [T], 3 "ended" BOOL, 4 "envelopes" U, 5 "mine" BOOL,
-    6 "name" T, 7 "relay_bytes" U, 8 "sees" T, 9 "waiting" U, 10 "who" B);
+    6 "name" T, 7 "relay_bytes" U, 8 "sees" T, 9 "waiting" U, 10 "who" B,
+    11 "serving" [HOSTABLE]);
 rec!(INSPECTION "inspection": 1 "on" BOOL, 2 "until" U);
 rec!(INTRODUCTION "introduction":
     1 "from" T, 2 "group" T, 3 "id" B, 4 "kind" T, 5 "name" T, 6 "note" T);
@@ -690,10 +692,11 @@ pub static REQUESTS: &[Request] = &[
     paged!(after 187 "peer-list" (1 "after" U, 2 "limit" U) -> (
         2 "peers" [PEER], 3 "more" BOOL, 4 "next" U)),
     req!(188 "host-offer" (1 "who" REF, 2 "devices" [T], 3 "envelopes" U, 4 "relay_mb" U) -> (
-        2 "devices" [T], 3 "sees" T)),
+        2 "devices" [T], 3 "sees" T, 4 "on" [HOSTABLE])),
     req!(189 "host-accept" (1 "who" REF) -> (2 "sees" T)),
     req!(190 "host-end" (1 "who" REF) -> (2 "ended" BOOL)),
-    req!(191 "hosting" () -> (2 "can" [T], 3 "hosting" [HOSTING], 4 "why_not" T)),
+    req!(191 "hosting" () -> (
+        2 "can" [T], 3 "hosting" [HOSTING], 4 "why_not" T, 5 "devices" [HOSTABLE])),
     // ---- Inspection and measuring: 200 to 219 ----
     req!(200 "inspect-on" (1 "minutes" U) -> (2 "token" B, 3 "until" U)),
     req!(201 "inspect-off" () -> (2 "was_on" BOOL)),

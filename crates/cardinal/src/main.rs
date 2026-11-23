@@ -768,6 +768,32 @@ enum HostingCmd {
     },
 }
 
+/// What a device gives someone hosted, as `hosting` and `host-offer` say.
+fn services_of(d: &Value) -> String {
+    let all: Vec<&str> = d["services"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|s| s.as_str())
+        .collect();
+    all.join(", ")
+}
+
+/// One device that can host someone, on a line: what it gives, and how it
+/// is reached.
+fn hostable_line(d: &Value) -> String {
+    let how = if d["outside"] == true {
+        "reachable from outside its network"
+    } else {
+        "reached only through its own sessions: no mailbox"
+    };
+    format!(
+        "{}: {} ({how})",
+        d["name"].as_str().unwrap_or(""),
+        services_of(d)
+    )
+}
+
 #[derive(Subcommand)]
 enum RecoveryCmd {
     /// Check the words you wrote down: type them, and this says whether
@@ -3746,13 +3772,10 @@ async fn client(cmd: Cmd) -> anyhow::Result<()> {
                         req["relay_mb"] = json!(n);
                     }
                     let v = call(&paths, req).await?;
-                    let on: Vec<&str> = v["devices"]
-                        .as_array()
-                        .into_iter()
-                        .flatten()
-                        .filter_map(|d| d.as_str())
-                        .collect();
-                    println!("Offered to host {who} on {}.", on.join(", "));
+                    println!("Offered to host {who} on:");
+                    for d in v["on"].as_array().into_iter().flatten() {
+                        println!("  {}", hostable_line(d));
+                    }
                     println!("They are told: {}", v["sees"].as_str().unwrap_or(""));
                     return Ok(());
                 }
@@ -3784,11 +3807,15 @@ async fn client(cmd: Cmd) -> anyhow::Result<()> {
                         format!("{name} offers to host you: `cardinal hosting accept {name}`")
                     }
                 };
-                let on: Vec<&str> = h["devices"]
+                let on: Vec<String> = h["serving"]
                     .as_array()
                     .into_iter()
                     .flatten()
-                    .filter_map(|d| d.as_str())
+                    .filter(|_| mine)
+                    .map(|d| {
+                        let name = d["name"].as_str().unwrap_or("");
+                        format!("{name} ({})", services_of(d))
+                    })
                     .collect();
                 let on = if on.is_empty() {
                     String::new()
@@ -3812,13 +3839,10 @@ async fn client(cmd: Cmd) -> anyhow::Result<()> {
             match v["why_not"].as_str() {
                 Some(why) => println!("{why}"),
                 None => {
-                    let can: Vec<&str> = v["can"]
-                        .as_array()
-                        .into_iter()
-                        .flatten()
-                        .filter_map(|d| d.as_str())
-                        .collect();
-                    println!("Your devices that can host someone: {}", can.join(", "));
+                    println!("Your devices that can host someone:");
+                    for d in v["devices"].as_array().into_iter().flatten() {
+                        println!("  {}", hostable_line(d));
+                    }
                 }
             }
             Ok(())

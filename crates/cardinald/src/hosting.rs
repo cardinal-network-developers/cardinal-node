@@ -1,17 +1,23 @@
 //! Hosting a trusted contact (D87, `hosts.md#hosting-a-contact`).
 //!
 //! A person offers, in the relationship they share, to host a trusted
-//! contact on some of their devices: those that can be reached from
-//! outside their network. The offer holds one grant for each serving
-//! device. The contact says yes there, and from then on their devices name
-//! each serving device in their reach nodes as one of their hosts, register
-//! tokens with it, present themselves to it and collect their mailbox from
-//! it. Either can end it there, at any time; nothing undoes an end.
+//! contact on some of their devices that help others: plugged in, on a
+//! network that is not metered, or named as a host. Each gives what it can.
+//! One that can be reached from outside its network keeps a mailbox for
+//! the contact, introduces and relays; one reached only through its own
+//! sessions introduces and relays for those in session with it. The offer
+//! holds one grant for each serving device, with those services. The
+//! contact says yes there, and from then on their devices name each serving
+//! device that keeps a mailbox in their reach nodes as one of their hosts,
+//! register tokens with it, and collect their mailbox from it, and present
+//! themselves to every serving device they are in session with. Either can
+//! end it there, at any time; nothing undoes an end.
 //!
 //! Step 1 is reach only: mailbox, rendezvous and relay. A serving device
 //! learns who leaves envelopes for the contact (by token), when, and how
-//! big, and whom it relays them with; when their devices are online, and
-//! the addresses they come from and present; never what anything says.
+//! big, where it keeps a mailbox, and whom it relays them with; when their
+//! devices are online, and the addresses they come from and present; never
+//! what anything says.
 //!
 //! A hosted device spends no radio wakeups on upkeep: the serving device
 //! keeps its session alive, as its anchor, and says when an envelope
@@ -25,11 +31,12 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use cardinal_crypto::random_bytes;
+use cardinal_crypto::{random_bytes, HybridPublicKey};
 use cardinal_encoding::{Record, Value};
 use cardinal_identity::KeyId;
 use cardinal_link::{Service, Session, Target};
-use cardinal_space::grant::{Grant, QuotaClass, MAILBOX, RELAY, RENDEZVOUS};
+use cardinal_space::account;
+use cardinal_space::grant::{Endpoint, Grant, QuotaClass, MAILBOX, RELAY, RENDEZVOUS};
 use cardinal_space::relationship::{self, Hosting, Reach};
 use cardinal_space::{NodeId, SpaceId, SpaceOp};
 use serde_json::{json, Value as Json};
@@ -61,10 +68,82 @@ const OP_ANSWER: u64 = 5;
 const OP_RELAY: u64 = 1;
 const BUSY: u64 = 5;
 
-/// What the person offered is told the host's devices see.
+/// What the person offered is told the host's devices see, where one of
+/// them keeps a mailbox for them.
 pub const SEES: &str = "The host's devices see who leaves you envelopes, when, and how big, \
      and whom you reach through them; when your devices are online, the public addresses \
      they come from, and the local addresses they give; never what anything says.";
+/// What the person offered is told the host's devices see, where none of
+/// them keeps a mailbox for them.
+pub const SEES_NO_MAILBOX: &str = "The host's devices keep no mail for you. They see whom you \
+     reach through them, and when; when your devices are online, the public addresses they \
+     come from, and the local addresses they give; never what anything says.";
+/// What one serving device that keeps a mailbox sees.
+pub const DEVICE_SEES: &str = "It keeps a mailbox for you. It sees who leaves you envelopes, \
+     when, and how big, and whom you reach through it; when your devices are online, the \
+     public addresses they come from, and the local addresses they give; never what anything \
+     says.";
+/// What one serving device reached only through its own sessions sees.
+pub const DEVICE_SEES_NO_MAILBOX: &str = "It keeps no mail for you, and introduces and relays \
+     you only among those in touch with it. It sees whom you reach through it, and when; when \
+     your devices are online, the public addresses they come from, and the local addresses \
+     they give; never what anything says.";
+
+/// What a set of serving devices sees, told before a yes.
+pub fn sees<'a>(services: impl IntoIterator<Item = &'a [u64]>) -> &'static str {
+    let mut any = false;
+    for s in services {
+        if s.contains(&MAILBOX) {
+            return SEES;
+        }
+        any = true;
+    }
+    if any {
+        SEES_NO_MAILBOX
+    } else {
+        SEES
+    }
+}
+
+/// What one serving device with `services` sees.
+pub fn device_sees(services: &[u64]) -> &'static str {
+    if services.contains(&MAILBOX) {
+        DEVICE_SEES
+    } else {
+        DEVICE_SEES_NO_MAILBOX
+    }
+}
+
+/// The services a device gives someone hosted: a mailbox too where it can
+/// be reached from outside its network.
+pub fn services(outside: bool) -> Vec<u64> {
+    if outside {
+        vec![MAILBOX, RENDEZVOUS, RELAY]
+    } else {
+        vec![RENDEZVOUS, RELAY]
+    }
+}
+
+/// The services, by name, for windows.
+fn service_names(services: &[u64]) -> Vec<&'static str> {
+    let mut out = Vec::new();
+    for (s, name) in [
+        (MAILBOX, "mailbox"),
+        (RENDEZVOUS, "rendezvous"),
+        (RELAY, "relay"),
+    ] {
+        if services.contains(&s) {
+            out.push(name);
+        }
+    }
+    out
+}
+
+/// Whether a grant names a device someone hosted names in their reach
+/// nodes: it keeps a mailbox, at an address others can reach.
+pub(crate) fn named_in_reach(g: &Grant) -> bool {
+    g.services.contains(&MAILBOX) && g.endpoints.iter().any(Endpoint::usable)
+}
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
@@ -410,6 +489,10 @@ pub(crate) fn deposit(
     let Some(s) = token_owner(d, token) else {
         return Err(Refused::NotPermitted);
     };
+    // A device reached only through its own sessions keeps no mail.
+    if !s.grant.services.contains(&MAILBOX) {
+        return Err(Refused::NotPermitted);
+    }
     let mut stores = lock(&d.mailbox.hosted.stores);
     let Some(store) = stores.get_mut(&s.who) else {
         return Err(Refused::NotPermitted);
@@ -443,6 +526,10 @@ pub(crate) fn answer_owner(
     let s = serving(d).into_iter().find(|s| s.who == *who)?;
     let op = r.get(0).and_then(Value::as_uint);
     if !s.active && !matches!(op, Some(mailbox::OP_FETCH | mailbox::OP_ACK)) {
+        return Some(mailbox::error(mailbox::NOT_PERMITTED));
+    }
+    // Where it keeps no mailbox for them, no token is theirs here.
+    if op == Some(mailbox::OP_REGISTER) && !s.grant.services.contains(&MAILBOX) {
         return Some(mailbox::error(mailbox::NOT_PERMITTED));
     }
     if s.active {
@@ -579,6 +666,31 @@ pub(crate) async fn serve_rendezvous(
             lock(&d.mailbox.hosted.present).insert(s.peer_static(), (*who, s.clone(), local));
             return Some(Some(Record::new().with(0, OP_PRESENT)));
         }
+        // One of their devices looks for another of theirs present here,
+        // or asks to be relayed to it, with no token: as this person's own
+        // devices are helped to each other.
+        if r.get(1).is_none() && r.get(3).is_none() {
+            let served = serving(d).into_iter().find(|x| x.who == *who && x.active);
+            match (served, op) {
+                (Some(_), Some(OP_CONNECT)) if rendezvous => {
+                    let present = present_of(d, who);
+                    return Some(Some(crate::rendezvous::connect_among(s, present)));
+                }
+                (Some(x), Some(OP_RELAY)) if !rendezvous => {
+                    if !d.conditions.helps() {
+                        return Some(Some(mailbox::error(BUSY)));
+                    }
+                    let device = r.get(2).and_then(Value::as_bytes)?;
+                    let other = present_of(d, who).into_iter().map(|(_, s, _)| s).find(|o| {
+                        o.peer_identity()
+                            .is_some_and(|p| p.signing_key.as_slice() == device)
+                    });
+                    let budget = relay_budget(d, who, &x.class);
+                    return Some(Some(crate::rendezvous::relay_to(d, s, other, budget)));
+                }
+                _ => {}
+            }
+        }
     }
     let token: Token = r.get(1)?.as_bytes()?.try_into().ok()?;
     let allowed = match kind {
@@ -707,20 +819,24 @@ fn keep_as_host(d: &Arc<Daemon>) {
             Some(_) => {}
         }
     }
-    // This device's own grants, where it serves.
-    let own = crate::host::own_grant(d);
+    // This device's own grants, where it serves: what it can give now. One
+    // that can no longer be reached from outside keeps no mailbox, and
+    // still introduces and relays for those in session with it.
+    let own = crate::host::own_grant(d).filter(|g| g.endpoints.iter().any(Endpoint::usable));
+    let (services, endpoints) = match own {
+        Some(g) => (self::services(true), g.endpoints),
+        None => (self::services(false), Vec::new()),
+    };
     for s in serving.iter().filter(|s| s.active) {
-        let op = match &own {
-            None => SpaceOp::delete(s.node),
-            Some(g) if g.endpoints != s.grant.endpoints => {
-                let grant = Grant {
-                    endpoints: g.endpoints.clone(),
-                    ..s.grant.clone()
-                };
-                relationship::set_host_serving(s.node, &grant.sign(&d.keys.signing))
-            }
-            Some(_) => continue,
+        if s.grant.services == services && s.grant.endpoints == endpoints {
+            continue;
+        }
+        let grant = Grant {
+            services: services.clone(),
+            endpoints: endpoints.clone(),
+            ..s.grant.clone()
         };
+        let op = relationship::set_host_serving(s.node, &grant.sign(&d.keys.signing));
         if let Err(e) = d.write_and_push(&s.space, vec![op]) {
             tracing::debug!("keeping a grant to {} current: {e:#}", short(&s.who));
         }
@@ -740,12 +856,15 @@ async fn keep_as_hosted(d: &Arc<Daemon>) {
     let moved = d.mailbox.hosted.moved.load(Ordering::Relaxed);
     for h in &hosts {
         let key = h.key();
+        // One reached only through its own sessions is its anchor: it
+        // keeps the session, as do this person's other ways to it.
         let s = match d.session(&key) {
             Some(s) => s,
-            None => {
+            None if h.grant.endpoints.iter().any(Endpoint::usable) => {
                 reach_host(d, h, moved).await;
                 continue;
             }
+            None => continue,
         };
         if s.is_relayed() {
             continue;
@@ -772,6 +891,9 @@ async fn keep_as_hosted(d: &Arc<Daemon>) {
             let was = m.get(&key).copied();
             m.insert(key, done(was.as_ref(), session, moved, ok, Instant::now()));
         }
+        if !h.grant.services.contains(&MAILBOX) {
+            continue;
+        }
         let told = lock(&d.mailbox.hosted.waiting).remove(&key);
         let collect_now = told || {
             let m = lock(&d.mailbox.hosted.collected);
@@ -795,6 +917,9 @@ async fn keep_as_hosted(d: &Arc<Daemon>) {
             let was = m.get(&key).copied();
             m.insert(key, done(was.as_ref(), session, moved, ok, Instant::now()));
         }
+        if !named_in_reach(&h.grant) {
+            continue;
+        }
         let naming_due = lock(&d.mailbox.hosted.naming)
             .get(&key)
             .is_none_or(|a| a.due(moved, Instant::now()));
@@ -809,7 +934,11 @@ async fn keep_as_hosted(d: &Arc<Daemon>) {
             }
         }
     }
-    take_out(d, &hosts).await;
+    let named: Vec<MyHost> = hosts
+        .into_iter()
+        .filter(|h| named_in_reach(&h.grant))
+        .collect();
+    take_out(d, &named).await;
 }
 
 /// Ends every hosting of this person by a contact they no longer trust,
@@ -956,8 +1085,9 @@ async fn name(d: &Arc<Daemon>, h: &MyHost, s: &Session) -> bool {
 }
 
 /// Takes out of this person's reach nodes every contact's device that
-/// hosted them and does not now: the hosting ended, or that device was
-/// taken out of it. A host of their own is never taken out here.
+/// hosted them and does not now name in them (`hosts`): the hosting ended,
+/// that device was taken out of it, or it keeps no mailbox now. A host of
+/// their own is never taken out here.
 async fn take_out(d: &Arc<Daemon>, hosts: &[MyHost]) {
     let now: HashSet<[u8; 32]> = hosts.iter().map(MyHost::key).collect();
     let own: HashSet<[u8; 32]> = d
@@ -1012,6 +1142,7 @@ pub fn start(d: Arc<Daemon>) {
             if d.core().identity.is_none() {
                 continue;
             }
+            say_always_on(&d);
             keep_as_host(&d);
             keep_as_hosted(&d).await;
             tokio::time::sleep(Duration::from_millis(500)).await;
@@ -1019,24 +1150,150 @@ pub fn start(d: Arc<Daemon>) {
     });
 }
 
+/// Says in this device's own device node, field 3, whether it is always
+/// on: whether it helps others now. Its person's other devices go by it to
+/// say which of their devices can host someone. Written only when it
+/// changes.
+fn say_always_on(d: &Arc<Daemon>) {
+    let helps = d.conditions.helps();
+    let me = d.keys.key();
+    let (space, node) = {
+        let core = d.core();
+        let Some(acc) = core.account() else { return };
+        let Some(sp) = acc.space.as_ref() else { return };
+        let mine = account::devices(sp.state())
+            .into_iter()
+            .find(|n| n.key == me);
+        match mine {
+            Some(n) if n.always_on != helps => (acc.id, n.node),
+            _ => return,
+        }
+    };
+    match d.write_and_push(&space, vec![account::set_field(node, 3, helps)]) {
+        Ok(_) => tracing::info!("this device says it is always on: {helps}"),
+        Err(e) => tracing::debug!("saying whether this device is always on: {e:#}"),
+    }
+}
+
 // ---- What the person asks ----
 
-/// This person's devices that can host someone now: those that can be
-/// reached from outside their network, each with its grant to itself.
-fn can_host(d: &Daemon) -> Vec<(KeyId, Grant)> {
-    d.core()
+/// One of this person's devices that can host someone now, and what it can
+/// give: a mailbox too where it can be reached from outside its network.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct Able {
+    pub key: KeyId,
+    pub outside: bool,
+    pub endpoints: Vec<Endpoint>,
+    pub link_key: HybridPublicKey,
+}
+
+impl Able {
+    fn services(&self) -> Vec<u64> {
+        services(self.outside)
+    }
+}
+
+/// One of this person's devices, as their account and log say.
+#[derive(Clone, Debug)]
+pub(crate) struct Device {
+    pub key: KeyId,
+    /// It says it is always on: it helps others.
+    pub always_on: bool,
+    /// It is named as a host.
+    pub is_host: bool,
+    /// Its own grant as a host, where it gives usable endpoints: its
+    /// endpoints and link key.
+    pub outside: Option<(Vec<Endpoint>, HybridPublicKey)>,
+    /// Its link key, from the person's log; none once it is taken out.
+    pub link_key: Option<HybridPublicKey>,
+}
+
+/// The devices that can host someone, of `devices`: each always on, named
+/// as a host, or reachable from outside, and still in the person's log.
+pub(crate) fn able(devices: Vec<Device>) -> Vec<Able> {
+    let mut out: Vec<Able> = Vec::new();
+    for dv in devices {
+        if out.iter().any(|a| a.key == dv.key) {
+            continue;
+        }
+        let Some(link) = dv.link_key else { continue };
+        let a = match dv.outside {
+            Some((endpoints, link_key)) => Able {
+                key: dv.key,
+                outside: true,
+                endpoints,
+                link_key,
+            },
+            None if dv.always_on || dv.is_host => Able {
+                key: dv.key,
+                outside: false,
+                endpoints: Vec::new(),
+                link_key: link,
+            },
+            None => continue,
+        };
+        out.push(a);
+    }
+    out
+}
+
+/// This person's devices that can host someone now, each with what it can
+/// give. This device goes by whether it helps others now; the others by
+/// what they say in their device nodes.
+fn can_host(d: &Daemon) -> Vec<Able> {
+    let here = d.keys.key();
+    let helps = d.conditions.helps();
+    let core = d.core();
+    let Some(sp) = core.account().and_then(|a| a.space.as_ref()) else {
+        return Vec::new();
+    };
+    // a host named by a host name (as `cardinal host --address name:port`
+    // writes) is reachable as much as one named by address
+    let outside: HashMap<KeyId, (Vec<Endpoint>, HybridPublicKey)> = core
         .mailboxes()
         .into_iter()
-        // a host named by a host name (as `cardinal host --address
-        // name:port` writes) is reachable as much as one named by address
-        .filter(|(g, _)| g.endpoints.iter().any(|e| e.usable()))
-        .map(|(g, k)| (k, g))
-        .collect()
+        .filter(|(g, _)| g.endpoints.iter().any(Endpoint::usable))
+        .map(|(g, k)| (k, (g.endpoints, g.link_key)))
+        .collect();
+    let links: HashMap<KeyId, HybridPublicKey> = core
+        .identity
+        .as_ref()
+        .map(|i| {
+            let st = i.state();
+            let keys = st.keys.values();
+            keys.filter_map(|k| Some((k.key, k.link_key.clone()?)))
+                .collect()
+        })
+        .unwrap_or_default();
+    let devices = account::devices(sp.state())
+        .into_iter()
+        .map(|n| Device {
+            key: n.key,
+            always_on: if n.key == here { helps } else { n.always_on },
+            is_host: n.is_host,
+            outside: outside.get(&n.key).cloned(),
+            link_key: links.get(&n.key).cloned(),
+        })
+        .collect();
+    able(devices)
 }
 
 /// Why none of this person's devices can host anyone now.
-pub const WHY_NOT: &str = "None of your devices can be reached from outside its network now. \
-     At home, say this is your network, so that your router can open a port, or set up a host.";
+pub const WHY_NOT: &str = "None of your devices can host anyone now: none is plugged in on a \
+     network that is not metered, and none is a host. Leave one plugged in at home, or set up a \
+     host.";
+
+/// A serving device, for windows: its name, whether it can be reached from
+/// outside its network, what it gives, and what it sees.
+fn hostable(name: String, services: &[u64], endpoints: &[Endpoint]) -> Json {
+    let outside = services.contains(&MAILBOX) && endpoints.iter().any(Endpoint::usable);
+    json!({
+        "name": name,
+        "outside": outside,
+        "sees": device_sees(services),
+        "services": service_names(services),
+    })
+}
 
 fn device_name(d: &Daemon, key: &KeyId) -> String {
     let names = d.core().device_names();
@@ -1058,8 +1315,9 @@ fn offered_to(d: &Daemon, who: &[u8; 32]) -> Option<(SpaceId, Hosting)> {
 }
 
 /// Offers to host a trusted contact on this person's devices that can
-/// (`devices`, by name; all of them if none is named), with a quota; or,
-/// where an offer stands, adds the devices named and sets the quota.
+/// (`devices`, by name; all of them if none is named), each with what it
+/// can give, with a quota; or, where an offer stands, adds the devices
+/// named and sets the quota.
 pub fn offer(
     d: &Arc<Daemon>,
     who: &str,
@@ -1078,18 +1336,19 @@ pub fn offer(
         .ok_or_else(|| anyhow::anyhow!("this device does not belong to anyone"))?;
     let able = can_host(d);
     anyhow::ensure!(!able.is_empty(), "{WHY_NOT}");
-    let chosen: Vec<(KeyId, Grant)> = if devices.is_empty() {
+    let chosen: Vec<Able> = if devices.is_empty() {
         able.clone()
     } else {
         let mut out = Vec::new();
         for name in devices {
             let found = able
                 .iter()
-                .find(|(k, _)| device_name(d, k).eq_ignore_ascii_case(name));
+                .find(|a| device_name(d, &a.key).eq_ignore_ascii_case(name));
             match found {
                 Some(x) => out.push(x.clone()),
                 None => anyhow::bail!(
-                    "{name} cannot host anyone now: it cannot be reached from outside its network"
+                    "{name} cannot host anyone now: it is not plugged in on a network that is \
+                     not metered, and it is not a host"
                 ),
             }
         }
@@ -1108,22 +1367,23 @@ pub fn offer(
     if let Some(mb) = relay_mb {
         class.relay_bytes = Some(mb * 1_000_000);
     }
-    let grant_for = |g: &Grant| {
+    let grant_for = |services: Vec<u64>, endpoints: &[Endpoint], link_key: &HybridPublicKey| {
         Grant {
             host: me,
             served: contact.identity,
-            services: vec![MAILBOX, RENDEZVOUS, RELAY],
+            services,
             classes: vec![class.clone()],
             storage_bytes: Some(0),
             retention_days: None,
-            endpoints: g.endpoints.clone(),
-            link_key: g.link_key.clone(),
+            endpoints: endpoints.to_vec(),
+            link_key: link_key.clone(),
         }
         .sign(&d.keys.signing)
     };
+    let new_grant = |a: &Able| grant_for(a.services(), &a.endpoints, &a.link_key);
     let ops = match &standing {
         None => {
-            let grants: Vec<Vec<u8>> = chosen.iter().map(|(_, g)| grant_for(g)).collect();
+            let grants: Vec<Vec<u8>> = chosen.iter().map(new_grant).collect();
             relationship::create_host_offer(&grants)
         }
         Some((_, h)) => {
@@ -1132,12 +1392,13 @@ pub fn offer(
             // the quota, on every device already serving
             for (node, g) in &have {
                 if g.classes.first() != Some(&class) {
-                    ops.push(relationship::set_host_serving(*node, &grant_for(g)));
+                    let again = grant_for(g.services.clone(), &g.endpoints, &g.link_key);
+                    ops.push(relationship::set_host_serving(*node, &again));
                 }
             }
-            for (_, g) in &chosen {
-                if !have.iter().any(|(_, o)| o.link_key == g.link_key) {
-                    ops.push(relationship::create_host_serving(h.offer, &grant_for(g)));
+            for a in &chosen {
+                if !have.iter().any(|(_, o)| o.link_key == a.link_key) {
+                    ops.push(relationship::create_host_serving(h.offer, &new_grant(a)));
                 }
             }
             ops
@@ -1146,8 +1407,14 @@ pub fn offer(
     if !ops.is_empty() {
         d.write_and_push(&contact.space, ops)?;
     }
-    let names: Vec<String> = chosen.iter().map(|(k, _)| device_name(d, k)).collect();
-    Ok(json!({"devices": names, "sees": SEES}))
+    let names: Vec<String> = chosen.iter().map(|a| device_name(d, &a.key)).collect();
+    let on: Vec<Json> = chosen
+        .iter()
+        .map(|a| hostable(device_name(d, &a.key), &a.services(), &a.endpoints))
+        .collect();
+    let given: Vec<Vec<u64>> = chosen.iter().map(Able::services).collect();
+    let sees = sees(given.iter().map(Vec::as_slice));
+    Ok(json!({"devices": names, "on": on, "sees": sees}))
 }
 
 /// The person says yes to a contact's offer to host them.
@@ -1164,7 +1431,10 @@ pub fn accept(d: &Arc<Daemon>, who: &str) -> anyhow::Result<Json> {
         let op = relationship::create_host_accept(offer.offer);
         d.write_and_push(&contact.space, vec![op])?;
     }
-    Ok(json!({"sees": SEES}))
+    let me = d.core().me().unwrap_or_default();
+    let gs = grants(d, &contact.identity, &me, &offer);
+    let sees = sees(gs.iter().map(|(_, g)| g.services.as_slice()));
+    Ok(json!({"sees": sees}))
 }
 
 /// Either side ends a hosting, or an offer not yet answered.
@@ -1204,10 +1474,15 @@ pub fn list(d: &Daemon) -> Json {
     };
     let mine: HashMap<[u8; 32], KeyId> = d
         .core()
-        .mailboxes()
-        .into_iter()
-        .map(|(g, k)| (*g.link_key.x25519(), k))
-        .collect();
+        .identity
+        .as_ref()
+        .map(|i| {
+            let st = i.state();
+            let keys = st.keys.values();
+            keys.filter_map(|k| Some((*k.link_key.as_ref()?.x25519(), k.key)))
+                .collect()
+        })
+        .unwrap_or_default();
     let mut out = Vec::new();
     for (who, _, _, h) in all(d) {
         if h.ended {
@@ -1224,16 +1499,19 @@ pub fn list(d: &Daemon) -> Json {
             .first()
             .and_then(|(_, g)| g.classes.first().cloned())
             .unwrap_or_default();
+        let name = |g: &Grant| match mine.get(g.link_key.x25519()) {
+            Some(k) if by_me => device_name(d, k),
+            _ => hex::encode(&g.link_key.x25519()[..4]),
+        };
         let devices: Vec<String> = match by_me {
-            true => gs
-                .iter()
-                .map(|(_, g)| match mine.get(g.link_key.x25519()) {
-                    Some(k) => device_name(d, k),
-                    None => hex::encode(&g.link_key.x25519()[..4]),
-                })
-                .collect(),
+            true => gs.iter().map(|(_, g)| name(g)).collect(),
             false => Vec::new(),
         };
+        let on: Vec<Json> = gs
+            .iter()
+            .map(|(_, g)| hostable(name(g), &g.services, &g.endpoints))
+            .collect();
+        let sees = sees(gs.iter().map(|(_, g)| g.services.as_slice()));
         let serves_here = by_me && gs.iter().any(|(_, g)| *g.link_key.x25519() == here);
         let waiting = serves_here.then(|| {
             lock(&d.mailbox.hosted.stores)
@@ -1248,14 +1526,20 @@ pub fn list(d: &Daemon) -> Json {
             "mine": by_me,
             "name": name_of(&who),
             "relay_bytes": class.relay_bytes,
-            "sees": SEES,
+            "sees": sees,
+            "serving": on,
             "waiting": waiting,
             "who": hex::encode(who),
         }));
     }
-    let can: Vec<String> = can_host(d).iter().map(|(k, _)| device_name(d, k)).collect();
+    let able = can_host(d);
+    let can: Vec<String> = able.iter().map(|a| device_name(d, &a.key)).collect();
+    let devices: Vec<Json> = able
+        .iter()
+        .map(|a| hostable(device_name(d, &a.key), &a.services(), &a.endpoints))
+        .collect();
     let why_not = can.is_empty().then_some(WHY_NOT);
-    json!({"can": can, "hosting": out, "why_not": why_not})
+    json!({"can": can, "devices": devices, "hosting": out, "why_not": why_not})
 }
 
 #[cfg(test)]
@@ -1327,6 +1611,12 @@ mod tests {
         /// This device can be reached, offers to host Bo, and he says yes.
         fn hosts_bo(&mut self, envelopes: Option<u64>) {
             crate::host::enable(&self.d, &["203.0.113.5:7171".to_owned()]).unwrap();
+            self.offers_bo(envelopes);
+        }
+
+        /// This device offers to host Bo on what it can give now, and he
+        /// says yes.
+        fn offers_bo(&mut self, envelopes: Option<u64>) {
             offer(&self.d, "Bo", &[], envelopes, None).unwrap();
             self.bo_hears();
             let offer = self.hostings().last().unwrap().offer;
@@ -1379,6 +1669,192 @@ mod tests {
             let set = account::set_field(node, account::TRUSTED, trusted);
             self.d.write_and_push(&account, vec![set]).unwrap();
         }
+    }
+
+    fn plugged_in(d: &Daemon, plugged_in: bool) {
+        d.conditions.tell(crate::conditions::Told {
+            plugged_in,
+            metered: false,
+        });
+    }
+
+    /// The services of the one grant this device serves Bo under.
+    fn served(h: &Two) -> Grant {
+        let s = serving(&h.d);
+        assert_eq!(s.len(), 1);
+        assert!(s[0].active);
+        s[0].grant.clone()
+    }
+
+    /// A household whose one always-on device sits behind a router, with
+    /// no port forwarded: it can still host Bo, for rendezvous and relay
+    /// among those in session with it, and offers no mailbox. Unplugged,
+    /// it can host nobody, and says why.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_device_behind_a_router_hosts_without_a_mailbox() {
+        let mut h = Two::new().await;
+        plugged_in(&h.d, false);
+        let v = list(&h.d);
+        assert_eq!(v["why_not"], WHY_NOT, "{v}");
+        assert!(offer(&h.d, "Bo", &[], None, None).is_err());
+        plugged_in(&h.d, true);
+        let v = list(&h.d);
+        assert!(v["why_not"].is_null(), "{v}");
+        let dv = &v["devices"][0];
+        assert_eq!(dv["outside"], false, "{v}");
+        assert_eq!(dv["services"], json!(["rendezvous", "relay"]), "{v}");
+        assert_eq!(dv["sees"], DEVICE_SEES_NO_MAILBOX);
+        let said = offer(&h.d, "Bo", &[], None, None).unwrap();
+        assert_eq!(said["sees"], SEES_NO_MAILBOX, "{said}");
+        assert_eq!(said["on"][0]["services"], json!(["rendezvous", "relay"]));
+        h.bo_hears();
+        let offer = h.hostings().last().unwrap().offer;
+        h.bo_writes(vec![relationship::create_host_accept(offer)]);
+        let g = served(&h);
+        assert_eq!(g.services, vec![RENDEZVOUS, RELAY]);
+        assert!(g.endpoints.is_empty());
+        assert!(!named_in_reach(&g), "named where it cannot be reached");
+        // No token is his here, so nobody leaves him anything.
+        let his: Token = random_bytes();
+        let one = Value::Record(Record::new().with(1, his).with(2, 0u64));
+        let r = Record::new()
+            .with(0, mailbox::OP_REGISTER)
+            .with(1, Value::list([one]));
+        assert_eq!(h.bo_asks(r), mailbox::error(mailbox::NOT_PERMITTED));
+        assert!(!h.bos_store_has(&his));
+        assert!(deposit(&h.d, &his, b"x", now()).is_err());
+        // Its upkeep keeps the grant as it is: it serves on.
+        keep_as_host(&h.d);
+        assert_eq!(served(&h), g);
+        let listed = list(&h.d);
+        let mine = &listed["hosting"][0];
+        assert_eq!(mine["sees"], SEES_NO_MAILBOX, "{listed}");
+        assert_eq!(mine["serving"][0]["outside"], false, "{listed}");
+    }
+
+    /// A device that can be reached from outside offers a mailbox too, and
+    /// is named where Bo's hosts are. Once it can be reached no longer, it
+    /// keeps introducing and relaying for him, and keeps no mailbox: Bo's
+    /// devices take it out of their lists.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_reachable_device_offers_a_mailbox() {
+        let mut h = Two::new().await;
+        plugged_in(&h.d, false);
+        crate::host::enable(&h.d, &["203.0.113.5:7171".to_owned()]).unwrap();
+        let v = list(&h.d);
+        let dv = &v["devices"][0];
+        assert_eq!(dv["outside"], true, "{v}");
+        assert_eq!(dv["services"], json!(["mailbox", "rendezvous", "relay"]));
+        assert_eq!(dv["sees"], DEVICE_SEES);
+        h.offers_bo(None);
+        let g = served(&h);
+        assert_eq!(g.services, vec![MAILBOX, RENDEZVOUS, RELAY]);
+        assert!(named_in_reach(&g));
+        assert_eq!(accept_sees(&h), SEES);
+        crate::host::disable(&h.d).unwrap();
+        keep_as_host(&h.d);
+        let g = served(&h);
+        assert_eq!(g.services, vec![RENDEZVOUS, RELAY], "it stopped serving");
+        assert!(g.endpoints.is_empty());
+        assert!(!named_in_reach(&g));
+    }
+
+    /// What the offer tells Bo, as his device would read it.
+    fn accept_sees(h: &Two) -> &'static str {
+        let me = h.d.core().me().unwrap();
+        let hosting = h.hostings().last().unwrap().clone();
+        let gs = grants(&h.d, &me, &h.bo_id, &hosting);
+        sees(gs.iter().map(|(_, g)| g.services.as_slice()))
+    }
+
+    /// A household with a device reachable from outside and another that
+    /// is always on behind the router: each is offered with what it can
+    /// give. A device that is neither, or that was taken out of the
+    /// person's log, is not.
+    #[test]
+    fn each_device_gives_what_it_can() {
+        let link = |n: u8| {
+            let keys = cardinal_crypto::HybridKeyPair::from_seed(&[n; 32]);
+            keys.public_key().clone()
+        };
+        let at = vec![Endpoint::parse("203.0.113.5:7171").unwrap()];
+        let device = |n: u8, always_on: bool, outside: bool, in_log: bool| Device {
+            key: [n; 32],
+            always_on,
+            is_host: outside,
+            outside: outside.then(|| (at.clone(), link(n))),
+            link_key: in_log.then(|| link(n)),
+        };
+        let found = able(vec![
+            device(1, false, true, true),
+            device(2, true, false, true),
+            device(3, false, false, true),
+            device(4, true, false, false),
+        ]);
+        assert_eq!(found.len(), 2, "{found:?}");
+        assert!(found[0].outside && found[0].endpoints == at);
+        assert_eq!(found[0].services(), vec![MAILBOX, RENDEZVOUS, RELAY]);
+        assert!(!found[1].outside && found[1].endpoints.is_empty());
+        assert_eq!(found[1].services(), vec![RENDEZVOUS, RELAY]);
+        assert_eq!(found[1].link_key, link(2));
+        // what Bo is told, of the two and of each
+        let given: Vec<Vec<u64>> = found.iter().map(Able::services).collect();
+        assert_eq!(sees(given.iter().map(Vec::as_slice)), SEES);
+        assert_eq!(sees([given[1].as_slice()]), SEES_NO_MAILBOX);
+        assert_eq!(device_sees(&given[0]), DEVICE_SEES);
+        assert_eq!(device_sees(&given[1]), DEVICE_SEES_NO_MAILBOX);
+    }
+
+    /// A device says in its own device node whether it is always on, as it
+    /// helps others or not, so that its person's other devices can tell;
+    /// and writes only when that changes.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_device_says_whether_it_is_always_on() {
+        let h = Two::new().await;
+        let always_on = || {
+            let core = h.d.core();
+            let st = core.account().unwrap().space.as_ref().unwrap().state();
+            let me = h.d.keys.key();
+            let n = account::devices(st).into_iter().find(|n| n.key == me);
+            n.unwrap().always_on
+        };
+        let account = h.d.core().account_id().unwrap();
+        let written = || h.d.core().entries_by(&account, &h.d.keys.key()).len();
+        for on in [true, false, true] {
+            plugged_in(&h.d, on);
+            say_always_on(&h.d);
+            assert_eq!(always_on(), on);
+            let before = written();
+            say_always_on(&h.d);
+            assert_eq!(written(), before, "wrote with nothing changed");
+        }
+    }
+
+    /// Bo hosts this person on a device behind his router: this person's
+    /// devices name it nowhere and collect nothing there, and are told it
+    /// keeps no mail for them.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn one_hosted_names_no_device_without_a_mailbox() {
+        let mut h = Two::new().await;
+        let me = h.d.core().me().unwrap();
+        let grant = Grant {
+            host: h.bo_id,
+            served: me,
+            services: vec![RENDEZVOUS, RELAY],
+            classes: vec![default_class()],
+            storage_bytes: Some(0),
+            retention_days: None,
+            endpoints: Vec::new(),
+            link_key: h.bo_keys.link.public_key().clone(),
+        }
+        .sign(&h.bo_keys.signing);
+        h.bo_writes(relationship::create_host_offer(&[grant]));
+        let said = accept(&h.d, "Bo").unwrap();
+        assert_eq!(said["sees"], SEES_NO_MAILBOX, "{said}");
+        let hosts = my_hosts(&h.d);
+        assert_eq!(hosts.len(), 1);
+        assert!(hosts_me(&h.d, &h.bo_id));
+        assert!(!named_in_reach(&hosts[0].grant));
     }
 
     /// Review H1. A contact this device hosts cannot register a token

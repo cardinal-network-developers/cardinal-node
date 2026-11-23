@@ -443,3 +443,76 @@ fn only_a_trusted_contact_is_hosted() {
         "named before accepting"
     );
 }
+
+/// A household whose one always-on device sits behind a router, with no
+/// port forwarded, hosts Grandma all the same: the device is offered for
+/// what it can give, rendezvous and relay for those in session with it,
+/// and no mailbox. It is her phone's anchor, keeping its session alive,
+/// and her devices present themselves there, name it nowhere and collect
+/// nothing from it.
+#[test]
+fn a_household_behind_a_router_hosts_grandma() {
+    if !fuse_available() {
+        eprintln!("skipping: /dev/fuse or fusermount3 is not available");
+        return;
+    }
+    let root = tempfile::tempdir().unwrap();
+    let mut daniel = Dev::new(root.path(), "daniel", free_port());
+    let mut grandma = Dev::new(root.path(), "grandma", free_port());
+    for (d, name) in [(&mut daniel, "daniel"), (&mut grandma, "grandma")] {
+        d.start();
+        d.cli(&["init", "--yes", "--name", name]);
+        d.wait_mounted();
+    }
+    ask(
+        &daniel,
+        json!({"cmd": "conditions", "plugged_in": true, "metered": false}),
+    );
+    meet(&daniel, &grandma, "Daniel");
+    let v = ask(&daniel, json!({"cmd": "hosting"}));
+    assert!(v["why_not"].is_null(), "{v}");
+    assert_eq!(v["devices"][0]["outside"], false, "{v}");
+    assert_eq!(v["devices"][0]["services"], json!(["rendezvous", "relay"]));
+    let said = daniel.cli(&["hosting", "offer", "grandma"]);
+    assert!(said.contains("no mailbox"), "{said}");
+    assert!(said.contains("keep no mail for you"), "{said}");
+    wait("grandma hears of the offer", 30, || {
+        hosting(&grandma).iter().any(|h| h["mine"] == false)
+    });
+    grandma.cli(&["hosting", "accept", "Daniel"]);
+    wait("daniel hosts grandma", 30, || {
+        hosting(&daniel).iter().any(|h| h["accepted"] == true)
+    });
+
+    // Her phone, on battery behind a router of its own.
+    let ng = Nat::new(Kind::PortRestricted);
+    grandma
+        .env
+        .push(("CARDINAL_TEST_IN_USE_SECS".into(), "4".into()));
+    behind(&mut grandma, &ng);
+    ask(
+        &grandma,
+        json!({"cmd": "conditions", "plugged_in": false, "metered": false}),
+    );
+    wait(
+        "the household's device keeps her phone in touch",
+        90,
+        || {
+            kept_alive(&daniel, "grandma").is_some_and(|k| k.is_u64())
+                && kept_alive(&grandma, "Daniel").is_some_and(|k| k.is_null())
+        },
+    );
+    wait("her phone presented itself there", 60, || {
+        grandma.log().contains("presenting to")
+    });
+    std::thread::sleep(Duration::from_secs(5));
+    let log = grandma.log();
+    assert!(
+        !log.contains("device as a host of this person's"),
+        "named where nobody can reach it"
+    );
+    assert!(
+        !log.contains("collecting at"),
+        "collected where no mail is kept"
+    );
+}
