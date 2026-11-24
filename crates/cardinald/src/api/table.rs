@@ -338,7 +338,8 @@ rec!(HOSTABLE "hostable": 1 "name" T, 2 "outside" BOOL, 3 "sees" T, 4 "services"
 rec!(HOSTING "hosting":
     1 "accepted" BOOL, 2 "devices" [T], 3 "ended" BOOL, 4 "envelopes" U, 5 "mine" BOOL,
     6 "name" T, 7 "relay_bytes" U, 8 "sees" T, 9 "waiting" U, 10 "who" B,
-    11 "serving" [HOSTABLE]);
+    11 "serving" [HOSTABLE], 12 "offered_at" U, 13 "after" B, 14 "accepted_at" U,
+    15 "ended_at" U, 16 "ended_by" B, 17 "declined" BOOL);
 rec!(INSPECTION "inspection": 1 "on" BOOL, 2 "until" U);
 rec!(INTRODUCTION "introduction":
     1 "from" T, 2 "group" T, 3 "id" B, 4 "kind" T, 5 "name" T, 6 "note" T);

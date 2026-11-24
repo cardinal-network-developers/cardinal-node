@@ -1460,8 +1460,20 @@ pub fn end(d: &Arc<Daemon>, who: &str) -> anyhow::Result<Json> {
     Ok(json!({"ended": true}))
 }
 
-/// Whom this person hosts, who hosts them, and the offers between, with
-/// the devices that can host someone now, or why none can.
+/// The message in the conversation of `space` that an offer at `place`
+/// comes just after, in the order `messages` gives them; `None` where it
+/// comes before every one.
+fn after_message(d: &Daemon, space: &SpaceId, place: &relationship::Place) -> Option<NodeId> {
+    let core = d.core();
+    let sp = core.spaces.get(space)?.space.as_ref()?;
+    let said = relationship::messages(sp);
+    let before = relationship::before_place(sp, &said, place);
+    before.checked_sub(1).map(|i| said[i].id)
+}
+
+/// Whom this person hosts, who hosts them, and the offers between, ended
+/// ones too, in the order they were offered, with the devices that can host
+/// someone now, or why none can.
 pub fn list(d: &Daemon) -> Json {
     let me = d.core().me();
     let contacts = d.core().contacts();
@@ -1484,10 +1496,9 @@ pub fn list(d: &Daemon) -> Json {
         })
         .unwrap_or_default();
     let mut out = Vec::new();
-    for (who, _, _, h) in all(d) {
-        if h.ended {
-            continue;
-        }
+    // Ended and declined ones too, so that every device of the person shows
+    // the same last state for each.
+    for (who, space, _, h) in all(d) {
         let by_me = Some(h.host) == me;
         let (host, served) = if by_me {
             (me.unwrap_or_default(), who)
@@ -1518,10 +1529,21 @@ pub fn list(d: &Daemon) -> Json {
                 .get(&who)
                 .map_or(0, Store::waiting)
         });
+        let after = h
+            .place
+            .as_ref()
+            .and_then(|place| after_message(d, &space, place));
+        let declined = h.ended && !h.accepted && h.ended_by == Some(served);
         out.push(json!({
             "accepted": h.accepted,
+            "accepted_at": h.accepted_at.filter(|_| h.accepted),
+            "after": after.map(hex::encode),
+            "declined": declined,
             "devices": devices,
-            "ended": false,
+            "ended": h.ended,
+            "ended_at": h.ended_at,
+            "ended_by": h.ended_by.map(hex::encode),
+            "offered_at": h.offered_at,
             "envelopes": class.outstanding,
             "mine": by_me,
             "name": name_of(&who),

@@ -3809,9 +3809,22 @@ async fn client(cmd: Cmd) -> anyhow::Result<()> {
                 }
             }
             let v = call(&paths, json!({"cmd": "hosting"})).await?;
-            let list = v["hosting"].as_array().cloned().unwrap_or_default();
+            let all = v["hosting"].as_array().cloned().unwrap_or_default();
+            // what has ended or was declined is said in one line each
+            let (list, over): (Vec<Value>, Vec<Value>) =
+                all.into_iter().partition(|h| h["ended"] != true);
             if list.is_empty() {
                 println!("You host nobody, and nobody hosts you.");
+            }
+            for h in &over {
+                let name = h["name"].as_str().unwrap_or("");
+                let line = match (h["mine"] == true, h["declined"] == true) {
+                    (true, true) => format!("{name} declined your offer to host them"),
+                    (false, true) => format!("You declined {name}'s offer to host you"),
+                    (true, false) => format!("Your hosting of {name} ended"),
+                    (false, false) => format!("{name}'s hosting of you ended"),
+                };
+                println!("  {line}");
             }
             for h in list {
                 let name = h["name"].as_str().unwrap_or("");

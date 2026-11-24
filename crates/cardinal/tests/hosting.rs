@@ -318,7 +318,9 @@ fn a_contacts_anchor_hosts_grandma() {
     wait("grandma stops naming the anchor", 60, || {
         grandma.log().contains("no longer names a contact's host")
     });
-    wait("daniel hosts nobody", 30, || hosting(&daniel).is_empty());
+    wait("daniel hosts nobody", 30, || {
+        hosting(&daniel).iter().all(|h| h["ended"] == true)
+    });
 }
 
 /// Review M3. Grandma's phone, on battery behind a router and hosted,
@@ -579,4 +581,158 @@ fn a_household_behind_a_router_hosts_grandma() {
         !log.contains("collecting at"),
         "collected where no mail is kept"
     );
+}
+
+/// What `hosting` says of each hosting, but how many envelopes wait,
+/// which is of the device asked.
+fn hostings_but_waiting(d: &Dev) -> Vec<Value> {
+    let mut all = hosting(d);
+    for h in &mut all {
+        if let Some(o) = h.as_object_mut() {
+            o.remove("waiting");
+        }
+    }
+    all
+}
+
+/// Waits until both devices of a person say the same of each hosting, and
+/// it is what `then` looks for; gives what they say.
+fn alike(a: &Dev, b: &Dev, what: &str, then: impl Fn(&[Value]) -> bool) -> Vec<Value> {
+    let mut got = Vec::new();
+    let mut last = (Vec::new(), Vec::new());
+    let ok = (0..6000).any(|_| {
+        let (x, y) = (hostings_but_waiting(a), hostings_but_waiting(b));
+        let same = x == y && then(&x);
+        if same {
+            got = x;
+        } else {
+            last = (x, y);
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        same
+    });
+    assert!(
+        ok,
+        "{what}: {} has {:?}, {} has {:?}",
+        a.name, last.0, b.name, last.1
+    );
+    got
+}
+
+/// Every device of a person says the same of each hosting, ended and
+/// declined ones too, with the same times and the same place among the
+/// messages of the conversation: Daniel offers, Grandma says yes on her
+/// second device, Daniel ends it on his; Daniel offers again, and Grandma
+/// declines.
+#[test]
+fn every_device_of_a_person_says_the_same_of_each_hosting() {
+    if !fuse_available() {
+        eprintln!("skipping: /dev/fuse or fusermount3 is not available");
+        return;
+    }
+    let root = tempfile::tempdir().unwrap();
+    let mut daniel = Dev::new(root.path(), "daniel", free_port());
+    let mut grandma = Dev::new(root.path(), "grandma", free_port());
+    for (d, name) in [(&mut daniel, "daniel"), (&mut grandma, "grandma")] {
+        d.start();
+        d.cli(&["init", "--yes", "--name", name]);
+        d.wait_mounted();
+    }
+    ask(
+        &daniel,
+        json!({"cmd": "conditions", "plugged_in": true, "metered": false}),
+    );
+    let at = format!("127.0.0.1:{}", daniel.port);
+    daniel.cli(&["host", "--address", &at]);
+    meet(&daniel, &grandma, "Daniel");
+    let second = |of: &Dev, name: &'static str| {
+        let mut d = Dev::new(root.path(), name, free_port());
+        d.start();
+        pair(of, &d);
+        ask(
+            &d,
+            json!({"cmd": "conditions", "plugged_in": false, "metered": false}),
+        );
+        d
+    };
+    let daniels = second(&daniel, "daniels-phone");
+    let grandmas = second(&grandma, "grandmas-phone");
+    wait("each second device knows the other person", 60, || {
+        !contact(&daniels, "grandma").is_null() && !contact(&grandmas, "Daniel").is_null()
+    });
+
+    // A message first, so that the offer comes after it.
+    daniel.cli(&["say", "grandma", "before the offer"]);
+    let said = |d: &Dev, who: &str| -> Vec<Value> {
+        let v = ask(d, json!({"cmd": "messages", "who": who}));
+        v["messages"].as_array().cloned().unwrap_or_default()
+    };
+    wait("grandma's phone has the message", 60, || {
+        !said(&grandmas, "Daniel").is_empty()
+    });
+    let first_said = said(&grandma, "Daniel")[0]["id"].clone();
+    daniel.cli(&["hosting", "offer", "grandma"]);
+    let offered = |all: &[Value]| all.len() == 1 && all[0]["offered_at"].is_u64();
+    let hers = alike(&grandma, &grandmas, "the offer", offered);
+    let his = alike(&daniel, &daniels, "the offer", offered);
+    let (h, g) = (&his[0], &hers[0]);
+    assert_eq!(h["mine"], true, "{h}");
+    assert_eq!(g["mine"], false, "{g}");
+    assert_eq!(h["offered_at"], g["offered_at"]);
+    assert_eq!(g["after"], first_said, "{g}");
+    assert_eq!(h["after"], first_said, "{h}");
+    assert!(g["accepted_at"].is_null() && g["ended_at"].is_null(), "{g}");
+    assert_eq!(g["ended"], false);
+    let (grandma_id, daniel_id) = (h["who"].clone(), g["who"].clone());
+
+    // Yes, from her second device; a message after it, which the offer
+    // still comes before.
+    grandmas.cli(&["hosting", "accept", "Daniel"]);
+    daniel.cli(&["say", "grandma", "after the offer"]);
+    let accepted = |all: &[Value]| all.len() == 1 && all[0]["accepted_at"].is_u64();
+    let hers = alike(&grandma, &grandmas, "the yes", accepted);
+    let his = alike(&daniel, &daniels, "the yes", accepted);
+    let (h, g) = (&his[0], &hers[0]);
+    assert_eq!(h["accepted_at"], g["accepted_at"]);
+    assert!(g["accepted_at"].as_u64() >= g["offered_at"].as_u64(), "{g}");
+    assert_eq!(g["after"], first_said, "{g}");
+
+    // Ended, on his second device.
+    daniels.cli(&["hosting", "end", "grandma"]);
+    let ended = |all: &[Value]| all.len() == 1 && all[0]["ended_at"].is_u64();
+    let hers = alike(&grandma, &grandmas, "the end", ended);
+    let his = alike(&daniel, &daniels, "the end", ended);
+    let (h, g) = (&his[0], &hers[0]);
+    for x in [h, g] {
+        assert_eq!(x["ended"], true, "{x}");
+        assert_eq!(x["accepted"], true, "{x}");
+        assert_eq!(x["declined"], false, "{x}");
+        assert_eq!(x["ended_by"], daniel_id, "{x}");
+    }
+    assert_eq!(h["ended_at"], g["ended_at"]);
+    let first = g.clone();
+
+    // Offered again, and declined.
+    daniel.cli(&["hosting", "offer", "grandma"]);
+    let again = |all: &[Value]| all.len() == 2 && all[1]["offered_at"].is_u64();
+    alike(&grandma, &grandmas, "the second offer", again);
+    grandma.cli(&["hosting", "end", "Daniel"]);
+    let declined = |all: &[Value]| all.len() == 2 && all[1]["ended_at"].is_u64();
+    let hers = alike(&grandma, &grandmas, "the no", declined);
+    let his = alike(&daniel, &daniels, "the no", declined);
+    let (h, g) = (&his[1], &hers[1]);
+    for x in [h, g] {
+        assert_eq!(x["declined"], true, "{x}");
+        assert_eq!(x["accepted"], false, "{x}");
+        assert!(x["accepted_at"].is_null(), "{x}");
+        assert_eq!(x["ended_by"], grandma_id, "{x}");
+    }
+    assert_eq!(h["ended_at"], g["ended_at"]);
+    assert_eq!(h["offered_at"], g["offered_at"]);
+    let second_said = said(&grandma, "Daniel")[1]["id"].clone();
+    assert_eq!(g["after"], second_said, "{g}");
+    // The first is as it was.
+    assert_eq!(hers[0], first);
+    let shown = grandma.cli(&["hosting"]);
+    assert!(shown.contains("You declined Daniel's offer"), "{shown}");
 }

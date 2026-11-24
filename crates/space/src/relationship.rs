@@ -1129,6 +1129,17 @@ pub struct Hosting {
     pub accepted: bool,
     /// Either ended it.
     pub ended: bool,
+    /// The offer's time, its author's clock, as a message's.
+    pub offered_at: Option<u64>,
+    /// Where the offer comes among the conversation's messages, in the
+    /// order [`messages`] gives them.
+    pub place: Option<Place>,
+    /// The time of the yes that counts, the first in log order.
+    pub accepted_at: Option<u64>,
+    /// The time of the end, the first in log order.
+    pub ended_at: Option<u64>,
+    /// Who ended it, by that first end.
+    pub ended_by: Option<IdentityId>,
 }
 
 /// The offers to host in a relationship space, in the order they were
@@ -1152,13 +1163,28 @@ pub fn hostings(space: &Space) -> Vec<Hosting> {
                     Some((c.id, v.as_bytes()?.to_vec()))
                 })
                 .collect();
+            // the first by log order, which every device computes the same way
+            let first = |k: u64, yes: &dyn Fn(&Node) -> bool| {
+                of(k)
+                    .filter(|c| yes(c))
+                    .min_by_key(|c| (dag.position(&c.created_in), c.id))
+                    .copied()
+            };
+            let yes = first(HOST_ACCEPT, &|c: &Node| {
+                c.creator != o.creator && members.contains(&c.creator)
+            });
+            let end = first(HOST_END, &|_: &Node| true);
             let hosting = Hosting {
                 offer: o.id,
                 host: o.creator,
                 serving,
-                accepted: of(HOST_ACCEPT)
-                    .any(|c| c.creator != o.creator && members.contains(&c.creator)),
-                ended: of(HOST_END).next().is_some(),
+                accepted: yes.is_some(),
+                ended: end.is_some(),
+                offered_at: o.created,
+                place: place_of(space, o),
+                accepted_at: yes.and_then(|c| c.created),
+                ended_at: end.and_then(|c| c.created),
+                ended_by: end.map(|c| c.creator),
             };
             (dag.position(&o.created_in), hosting)
         })
