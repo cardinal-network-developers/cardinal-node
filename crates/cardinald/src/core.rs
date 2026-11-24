@@ -2168,14 +2168,20 @@ impl Core {
             .any(|(entry, s)| s.sealed_id() == id && h.validity().valid.contains(entry))
     }
 
-    /// The entries of a space that `device` signed, sealed.
+    /// The entries of a space that `device` signed, sealed, in log order:
+    /// each after its parents, the newest last.
     pub fn entries_by(&self, space: &SpaceId, device: &KeyId) -> Vec<(EntryId, Vec<u8>)> {
         let Some(h) = self.spaces.get(space).and_then(|h| h.space.as_ref()) else {
             return Vec::new();
         };
-        h.sealed_entries()
+        let mut out: Vec<(Option<usize>, EntryId, Vec<u8>)> = h
+            .sealed_entries()
             .filter(|(id, _)| h.entry(id).is_some_and(|e| e.signer() == *device))
-            .map(|(id, sealed)| (*id, sealed.encode()))
+            .map(|(id, sealed)| (h.dag().position(id), *id, sealed.encode()))
+            .collect();
+        out.sort_by_key(|(at, _, _)| *at);
+        out.into_iter()
+            .map(|(_, id, sealed)| (id, sealed))
             .collect()
     }
 

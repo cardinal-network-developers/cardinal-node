@@ -1765,28 +1765,42 @@ async fn deliver_to(d: &Arc<Daemon>, space: &SpaceId, member: &[u8; 32]) {
     let Some((epoch, key)) = d.core().envelope_key(space) else {
         return;
     };
-    let (fits, long): (Vec<_>, Vec<_>) = unsent
+    // The newest of what fits goes inside envelopes, a short burst as one
+    // envelope each, so that it reaches them even if this device is gone
+    // by the time they look. Anything else is told of by one heads
+    // message, to fetch from whoever has it: this person's host, or
+    // another member's (`hosts.md#mailbox`), or from this device when the
+    // two next meet.
+    let sealed: Vec<_> = unsent
         .iter()
         .map(|(id, entry)| (*id, seal(&epoch, &key, &entry[..])))
-        .partition(|(_, envelope)| envelope.len() <= MAX_ENVELOPE);
-    let some = &fits[..fits.len().min(LEAVE_AT_ONCE)];
-    let left = leave(d, &reach, some).await;
+        .collect();
+    let (carry, told) = to_carry(sealed);
+    let left = leave(d, &reach, &carry).await;
     d.mailbox.mark_sent(space, member, &left);
-    // Too long to carry, so say that it is there, if this person has a host
-    // to fetch it from.
-    let me = d.core().identity.as_ref().map(|i| i.id());
-    let hosted = me.is_some_and(|me| !d.core().reach_of(space, &me).is_empty());
-    if long.is_empty() || !hosted {
+    if told.is_empty() {
         return;
     }
     let mut ids = d.core().heads(space);
     ids.truncate(MAX_HEADS);
     let heads = Message::Heads { label: *space, ids };
-    let notice = (long[0].0, seal(&epoch, &key, to_value(&heads)));
+    let notice = (told[0], seal(&epoch, &key, to_value(&heads)));
     if !leave(d, &reach, &[notice]).await.is_empty() {
-        let long: Vec<EntryId> = long.iter().map(|(id, _)| *id).collect();
-        d.mailbox.mark_sent(space, member, &long);
+        d.mailbox.mark_sent(space, member, &told);
     }
+}
+
+/// Of entries sealed into envelopes, in log order: those to carry inside
+/// envelopes, the newest that fit, at most [`LEAVE_AT_ONCE`], still in log
+/// order; and those a heads message tells of instead, the ones too long
+/// for an envelope and anything older that fits but is not carried.
+fn to_carry(sealed: Vec<(EntryId, Vec<u8>)>) -> (Vec<(EntryId, Vec<u8>)>, Vec<EntryId>) {
+    let (mut carry, mut told): (Vec<_>, Vec<_>) = sealed
+        .into_iter()
+        .partition(|(_, envelope)| envelope.len() <= MAX_ENVELOPE);
+    let older = carry.len().saturating_sub(LEAVE_AT_ONCE);
+    told.extend(carry.drain(..older));
+    (carry, told.into_iter().map(|(id, _)| id).collect())
 }
 
 /// Delivers what this device wrote to each member it has no session with.
@@ -2057,6 +2071,24 @@ mod tests {
         let envelope = seal(&[7; 16], &[8; 32], to_value(&heads));
         assert!(envelope.len() <= MAX_ENVELOPE);
         assert_eq!(open_envelope(&envelope, &[8; 32]), Some(Notice::Heads(ids)));
+    }
+
+    /// The newest that fit are carried, in log order; what is too long, and
+    /// anything older past what one look leaves, is told of by a notice.
+    #[test]
+    fn the_newest_that_fit_are_carried_and_the_rest_told_of() {
+        let entry = |n: u8, len: usize| ([n; 32], vec![0; len]);
+        let (carry, told) = to_carry(vec![entry(1, 100), entry(2, 2000), entry(3, 200)]);
+        let ids: Vec<EntryId> = carry.iter().map(|(id, _)| *id).collect();
+        assert_eq!(ids, vec![[1; 32], [3; 32]]);
+        assert_eq!(told, vec![[2; 32]]);
+
+        let burst: Vec<_> = (0..LEAVE_AT_ONCE as u8 + 3).map(|n| entry(n, 50)).collect();
+        let (carry, told) = to_carry(burst);
+        assert_eq!(carry.len(), LEAVE_AT_ONCE);
+        assert_eq!(carry[0].0, [3; 32]);
+        assert_eq!(carry.last().unwrap().0, [LEAVE_AT_ONCE as u8 + 2; 32]);
+        assert_eq!(told, vec![[0; 32], [1; 32], [2; 32]]);
     }
 
     #[test]

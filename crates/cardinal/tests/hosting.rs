@@ -412,6 +412,70 @@ fn a_full_mailbox_refuses() {
     });
 }
 
+/// A short word to Grandma reaches her even if the writer's device is gone
+/// by the time her phone wakes: Ben writes while her phone is off, and goes
+/// offline himself. The entry travels inside the envelope at Daniel's
+/// anchor, and her phone takes it in from there. A message too long for an
+/// envelope is only told of, and comes once Ben is back.
+#[test]
+fn a_short_word_reaches_grandma_with_the_writer_gone() {
+    if !fuse_available() {
+        eprintln!("skipping: /dev/fuse or fusermount3 is not available");
+        return;
+    }
+    let root = tempfile::tempdir().unwrap();
+    let (daniel, mut grandma, mut ben) = three(root.path());
+    host_grandma(&daniel, &grandma);
+    std::thread::sleep(Duration::from_secs(5));
+
+    // What Ben wrote before goes to the mailbox as soon as her phone is off:
+    // it is let settle first, so that what is counted is the message.
+    grandma.stop();
+    std::thread::sleep(Duration::from_secs(5));
+    let before = waiting_at(&daniel);
+    ben.cli(&["say", "Grandma", "a short word"]);
+    wait("the envelope waits at daniel's anchor", 60, || {
+        waiting_at(&daniel) > before
+    });
+    ben.stop();
+    grandma.start();
+    wait("grandma reads it with ben gone", 60, || {
+        grandma.cli(&["messages", "Ben"]).contains("a short word")
+    });
+    assert!(
+        grandma.log().contains("envelopes left with"),
+        "it did not come from the mailbox"
+    );
+    wait("the envelope is collected", 30, || waiting_at(&daniel) == 0);
+
+    // Too long to carry: what waits is a notice, which Grandma cannot act
+    // on while Ben is away.
+    let long = "x".repeat(3000);
+    grandma.stop();
+    ben.start();
+    std::thread::sleep(Duration::from_secs(5));
+    let before = waiting_at(&daniel);
+    ben.cli(&["say", "Grandma", &long]);
+    wait("the notice waits at daniel's anchor", 60, || {
+        waiting_at(&daniel) > before
+    });
+    ben.stop();
+    let collected = grandma.log().matches("collecting at").count();
+    grandma.start();
+    wait("grandma's phone collects", 60, || {
+        grandma.log().matches("collecting at").count() > collected
+    });
+    std::thread::sleep(Duration::from_secs(10));
+    assert!(
+        !grandma.cli(&["messages", "Ben"]).contains(&long),
+        "the long message came with ben away"
+    );
+    ben.start();
+    wait("grandma reads the long one with ben back", 90, || {
+        grandma.cli(&["messages", "Ben"]).contains(&long)
+    });
+}
+
 /// Only a trusted contact can be hosted, and nobody else can use what is
 /// offered: someone Daniel keeps to hosts is refused an offer, and a host
 /// offered and not accepted serves nobody.
