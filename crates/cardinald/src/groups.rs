@@ -1341,6 +1341,38 @@ pub fn set(
     Ok(json!({}))
 }
 
+/// Why a group was not renamed.
+#[derive(Debug)]
+pub enum NotAdmin {
+    /// Only its owner and its admins name it.
+    No(anyhow::Error),
+    /// Anything else.
+    Other(anyhow::Error),
+}
+
+/// Renames a group, by its id: what renaming its folder does (D88). Anyone
+/// but its owner and its admins is refused, and says so.
+pub fn rename(d: &Arc<Daemon>, group: &SpaceId, name: &str) -> Result<(), NotAdmin> {
+    let me = identity(d).map_err(NotAdmin::Other)?;
+    if name.trim().is_empty() {
+        return Err(NotAdmin::Other(anyhow::anyhow!("a group needs a name")));
+    }
+    {
+        let core = d.core();
+        let sp = core.spaces.get(group).and_then(|h| h.space.as_ref());
+        let sp =
+            sp.ok_or_else(|| NotAdmin::Other(anyhow::anyhow!("that group is not open yet")))?;
+        if !may_manage(sp, &me) {
+            let called = group::name(sp);
+            return Err(NotAdmin::No(anyhow::anyhow!(
+                "only an admin of {called} can rename it"
+            )));
+        }
+    }
+    set(d, &hex::encode(group), Some(name), None).map_err(NotAdmin::Other)?;
+    Ok(())
+}
+
 /// Changes what the others see a member called, or whether they are
 /// introduced through the group.
 pub fn set_member(

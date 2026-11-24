@@ -123,3 +123,64 @@ fn my_folder_named_like_a_category_is_shown_beside_it() {
     std::fs::rename(a.p("People (2)"), a.p("Folk")).unwrap();
     assert_eq!(names(&a.p("Folk")), ["new.txt", "old.txt"]);
 }
+
+/// A group's folder in the mount (D88): `Groups/<name>`, renamed only by
+/// an admin or the owner, and refused to anyone else with a permission
+/// error.
+#[test]
+fn a_groups_folder_is_renamed_only_by_its_admins() {
+    if !fuse_available() {
+        eprintln!("skipping: /dev/fuse or fusermount3 is not available");
+        return;
+    }
+    let root = tempfile::tempdir().unwrap();
+    let (a, b) = met(root.path());
+    let ask = |d: &Dev, req: serde_json::Value| {
+        let r = reply(d, &req);
+        assert_eq!(r["ok"], true, "{req} got {r}");
+        r
+    };
+    let made = ask(
+        &a,
+        serde_json::json!({"cmd": "group-create", "name": "Family", "people": ["Bo"]}),
+    );
+    let g = made["group"].as_str().unwrap().to_owned();
+    wait("bo is offered it", 30, || {
+        let r = ask(&b, serde_json::json!({"cmd": "groups"}));
+        r["offers"].as_array().is_some_and(|o| !o.is_empty())
+    });
+    assert_eq!(names(&b.mount), ["People"]);
+    ask(&b, serde_json::json!({"cmd": "group-join", "group": g}));
+    wait("bo's folder for the group", 30, || {
+        b.p("Groups/Family").is_dir()
+    });
+    assert_eq!(names(&b.mount), ["Groups", "People"]);
+    std::fs::write(b.p("Groups/Family/plan.txt"), "picnic").unwrap();
+    wait("ana has bo's plan", 30, || {
+        std::fs::read_to_string(a.p("Groups/Family/plan.txt"))
+            .ok()
+            .as_deref()
+            == Some("picnic")
+    });
+
+    // Bo may not rename it; nobody removes it.
+    let err = std::fs::rename(b.p("Groups/Family"), b.p("Groups/Kin")).unwrap_err();
+    // EACCES: this person lacks the right, where EPERM is for nobody
+    assert_eq!(err.raw_os_error(), Some(13), "{err}");
+    assert!(b.p("Groups/Family").is_dir());
+    // (only the folder itself: what is in it is removed as in any folder)
+    let err = std::fs::remove_dir(b.p("Groups/Family")).unwrap_err();
+    assert_eq!(err.kind(), ErrorKind::PermissionDenied, "{err}");
+    assert!(std::fs::rename(b.p("Groups/Family"), b.p("People/Family")).is_err());
+    // Ana, its owner, may: the group is renamed, and Bo's folder follows.
+    std::fs::rename(a.p("Groups/Family"), a.p("Groups/Kin")).unwrap();
+    wait("bo's folder follows", 30, || b.p("Groups/Kin").is_dir());
+    assert!(!b.p("Groups/Family").exists());
+    assert_eq!(
+        std::fs::read_to_string(b.p("Groups/Kin/plan.txt")).unwrap(),
+        "picnic"
+    );
+    // Leaving takes it away.
+    ask(&b, serde_json::json!({"cmd": "group-leave", "group": g}));
+    wait("bo's Groups goes", 30, || !b.p("Groups").exists());
+}

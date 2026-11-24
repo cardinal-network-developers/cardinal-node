@@ -63,18 +63,16 @@ impl CardinalFs {
         CardinalFs::shared_with(d, tree, None)
     }
 
-    /// A filesystem over `tree`, a folder shared with `contact`, whose
+    /// A filesystem over `tree`, a folder shared with `others`, whose
     /// devices may hold what is in it too.
     pub fn shared_with(
         d: Arc<Daemon>,
         tree: Arc<Mutex<Tree>>,
-        contact: Option<[u8; 32]>,
+        others: Option<crate::fetch::Others>,
     ) -> CardinalFs {
         let priority = cardinal_link::Priority::Interactive;
-        let fetcher: &'static Fetcher = Box::leak(Box::new(match contact {
-            Some(who) => Fetcher::from_contact(&d, priority, who),
-            None => Fetcher::new(&d, priority),
-        }));
+        let fetcher: &'static Fetcher =
+            Box::leak(Box::new(Fetcher::from_others(&d, priority, others)));
         CardinalFs {
             d,
             tree,

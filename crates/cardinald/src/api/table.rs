@@ -303,7 +303,7 @@ rec!(ENDPOINT "endpoint": 1 "endpoint" T, 2 "local" BOOL, 3 "tried" BOOL, 4 "why
 rec!(FETCH "fetch": 1 "latency_ms" U, 2 "rate" U, 3 "received" U, 4 "replies" U);
 rec!(FILE "file":
     1 "added_by" T, 2 "category" BOOL, 3 "folder" BOOL, 4 "mine" BOOL, 5 "name" T, 6 "size" U,
-    7 "time" U, 8 "versions" U, 9 "who" B);
+    7 "time" U, 8 "versions" U, 9 "who" B, 10 "group" B);
 rec!(CALL_FRAMES "frames": 1 "in" U, 2 "new" U);
 rec!(GROUP "group":
     1 "admin" BOOL, 2 "did_not_stand" [B], 3 "did_not_stand_changes" [GROUP_CHANGE],
@@ -377,7 +377,7 @@ rec!(ONLY_HERE "only here": 1 "bytes" U, 2 "files" U);
 rec!(PAIR_AGAIN "pair again": 1 "key" B, 2 "name" T);
 rec!(PAIRING "pairing": 1 "admin" T, 2 "code" T, 3 "error" T, 4 "state" T, 5 "power" T);
 rec!(PEER "peer": 1 "addr" T, 2 "device" T);
-rec!(PLACE "place": 1 "kind" T, 2 "name" T, 3 "who" B);
+rec!(PLACE "place": 1 "kind" T, 2 "name" T, 3 "who" B, 4 "group" B);
 rec!(PROGRESS "progress":
     1 "bytes_fetched" U, 2 "bytes_pending" U, 3 "bytes_wanted" U, 4 "files_pending" U,
     5 "last_error" T, 6 "rate" U);

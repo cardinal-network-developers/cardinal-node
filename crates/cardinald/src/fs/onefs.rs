@@ -21,13 +21,14 @@ use fuser::{
     FileAttr, FileType, Filesystem, ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory, ReplyEmpty,
     ReplyEntry, ReplyOpen, ReplyStatfs, ReplyWrite, Request, TimeOrNow,
 };
-use libc::{EEXIST, EINVAL, EISDIR, ENOENT, EPERM, EXDEV};
+use libc::{EACCES, EEXIST, EINVAL, EISDIR, ENOENT, EPERM, EXDEV};
 
 use super::commit;
 use super::ops::CardinalFs;
 use super::tree::{Inval, Kind, Snapshot, Tree, ROOT_INO};
 use crate::daemon::Daemon;
-use crate::onefolder::{self, Shown};
+use crate::fetch::Others;
+use crate::onefolder::{self, Refused, Shown};
 
 /// How many bits of an inode number are a part's own.
 const PART_BITS: u32 = 40;
@@ -61,9 +62,9 @@ pub struct Part {
 }
 
 impl Part {
-    /// Opens a part numbered `number` for `space`, shared with `contact`
-    /// if it is a relationship's.
-    pub fn open(d: &Arc<Daemon>, number: u64, space: SpaceId, contact: Option<[u8; 32]>) -> Part {
+    /// Opens a part numbered `number` for `space`, shared with `others`
+    /// if it is a relationship's or a group's.
+    pub fn open(d: &Arc<Daemon>, number: u64, space: SpaceId, others: Option<Others>) -> Part {
         let (staging, local) = match number {
             0 => (d.paths.staging(), d.paths.local()),
             _ => {
@@ -100,7 +101,7 @@ impl Part {
                 tracing::info!("taking up {taken} flushed files not yet saved");
             }
         }
-        let fs = CardinalFs::shared_with(d.clone(), tree.clone(), contact);
+        let fs = CardinalFs::shared_with(d.clone(), tree.clone(), others);
         let stop = Arc::new(AtomicBool::new(false));
         let scheduler = commit::spawn_scheduler(d.clone(), tree.clone(), space, stop.clone());
         Part {
@@ -232,11 +233,11 @@ pub fn update(d: &Arc<Daemon>, parts: &Mutex<Parts>) -> Vec<Inval> {
         let g = lock(parts);
         shown
             .iter()
-            .filter(|s| !g.by_space.contains_key(&s.contact.space))
+            .filter(|s| !g.by_space.contains_key(&s.space))
             .filter(|s| {
                 d.core()
                     .spaces
-                    .get(&s.contact.space)
+                    .get(&s.space)
                     .is_some_and(|h| h.space.is_some())
             })
             .cloned()
@@ -251,15 +252,8 @@ pub fn update(d: &Arc<Daemon>, parts: &Mutex<Parts>) -> Vec<Inval> {
             g.next += 1;
             n
         };
-        tracing::debug!(
-            "showing {} at {}",
-            hex::encode(&s.contact.space[..4]),
-            s.path()
-        );
-        opened.push((
-            number,
-            Part::open(d, number, s.contact.space, Some(s.contact.identity)),
-        ));
+        tracing::debug!("showing {} at {}", hex::encode(&s.space[..4]), s.path());
+        opened.push((number, Part::open(d, number, s.space, Some(s.others()))));
     }
     let mut g = lock(parts);
     for (number, p) in opened {
@@ -275,7 +269,7 @@ pub fn update(d: &Arc<Daemon>, parts: &Mutex<Parts>) -> Vec<Inval> {
     let before = std::mem::take(&mut g.listed);
     let mut listed = Vec::new();
     for s in &shown {
-        let Some(&part) = g.by_space.get(&s.contact.space) else {
+        let Some(&part) = g.by_space.get(&s.space) else {
             continue;
         };
         let index = match g.categories.iter().position(|c| *c == s.category) {
@@ -801,7 +795,8 @@ impl OneFs {
     }
 
     /// Renames a relationship's folder: what the contact is called, or the
-    /// category they are listed under.
+    /// category they are listed under; or a group's, which renames the
+    /// group where this person may (D88).
     fn rename_relationship(
         &self,
         parent: u64,
@@ -818,24 +813,21 @@ impl OneFs {
                 return Err(EEXIST);
             }
             let space = g.parts.get(&part).ok_or(ENOENT)?.space;
-            (space, (from != to).then(|| g.categories[to].clone()))
+            (space, g.categories[to].clone())
         };
         let shown = onefolder::relationships(&self.d)
             .into_iter()
-            .find(|s| s.contact.space == who)
+            .find(|s| s.space == who)
             .ok_or(ENOENT)?;
-        if newname != shown.name {
-            crate::contacts::rename(&self.d, &shown.who(), newname).map_err(|e| {
-                tracing::info!("cannot rename {}: {e:#}", shown.name);
-                EEXIST
-            })?;
-        }
-        if let Some(c) = category {
-            crate::contacts::set_category(&self.d, &shown.who(), &c).map_err(|e| {
-                tracing::info!("cannot move {}: {e:#}", shown.name);
-                EPERM
-            })?;
-        }
+        onefolder::rename_shared(&self.d, &shown, &category, newname).map_err(|e| {
+            let (errno, e) = match e {
+                Refused::Denied(e) => (EACCES, e),
+                Refused::NotPermitted(e) => (EPERM, e),
+                Refused::Other(e) => (EEXIST, e),
+            };
+            tracing::info!("cannot rename {}: {e:#}", shown.name);
+            errno
+        })?;
         update(&self.d, &self.parts);
         Ok(())
     }

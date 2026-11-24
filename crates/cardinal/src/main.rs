@@ -3262,7 +3262,11 @@ async fn client(cmd: Cmd) -> anyhow::Result<()> {
                 .as_str()
                 .filter(|_| v["place"]["kind"] == "shared")
             {
-                println!("Shared with {name}: you both see what is here.");
+                if v["place"]["group"].is_string() {
+                    println!("Shared in {name}: everyone in the group sees what is here.");
+                } else {
+                    println!("Shared with {name}: you both see what is here.");
+                }
             }
             for f in v["files"].as_array().into_iter().flatten() {
                 let name = printable(f["name"].as_str().unwrap_or("?"));

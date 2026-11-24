@@ -20,7 +20,17 @@ use crate::sched::Rank;
 pub struct Fetcher {
     d: std::sync::Weak<Daemon>,
     priority: Priority,
-    contact: Option<[u8; 32]>,
+    others: Option<Others>,
+}
+
+/// Whose devices besides this person's may hold what a shared folder holds.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Others {
+    /// A contact's, in the relationship's folder.
+    Contact([u8; 32]),
+    /// The members' of a group, in its folder: whichever of them this
+    /// device is in touch with when it asks.
+    Group(cardinal_space::SpaceId),
 }
 
 impl Fetcher {
@@ -29,17 +39,36 @@ impl Fetcher {
         Fetcher {
             d: Arc::downgrade(d),
             priority,
-            contact: None,
+            others: None,
         }
     }
 
     /// One that asks a contact's devices too, for what they shared.
     pub fn from_contact(d: &Arc<Daemon>, priority: Priority, who: [u8; 32]) -> Fetcher {
+        Fetcher::from_others(d, priority, Some(Others::Contact(who)))
+    }
+
+    /// One that asks the devices of `others` too, if any.
+    pub fn from_others(d: &Arc<Daemon>, priority: Priority, others: Option<Others>) -> Fetcher {
         Fetcher {
-            contact: Some(who),
+            others,
             ..Fetcher::new(d, priority)
         }
     }
+}
+
+/// A member of a group this device is in touch with now, other than its
+/// own person: who is asked for what the group's folder holds.
+fn member_in_touch(d: &Daemon, space: &cardinal_space::SpaceId) -> Option<[u8; 32]> {
+    let members = {
+        let core = d.core();
+        let me = core.identity.as_ref().map(|i| i.id());
+        let sp = core.spaces.get(space).and_then(|h| h.space.as_ref())?;
+        let all = sp.present().into_iter();
+        all.filter(|w| Some(*w) != me).collect::<Vec<_>>()
+    };
+    let in_touch = d.people_in_touch();
+    members.into_iter().find(|w| in_touch.contains(w))
 }
 
 impl Fetch for Fetcher {
@@ -47,13 +76,13 @@ impl Fetch for Fetcher {
         let Some(d) = self.d.upgrade() else {
             return Ok(Vec::new());
         };
+        let from = match self.others {
+            Some(Others::Contact(who)) => Some(who),
+            Some(Others::Group(space)) => member_in_touch(&d, &space),
+            None => None,
+        };
         let rt = d.rt.clone();
-        let got = rt.block_on(crate::net::fetch_blobs_from(
-            &d,
-            ids,
-            self.priority,
-            self.contact,
-        ));
+        let got = rt.block_on(crate::net::fetch_blobs_from(&d, ids, self.priority, from));
         let n: usize = got.iter().map(|(_, b)| b.len()).sum();
         d.progress
             .lock()
@@ -191,12 +220,12 @@ type Named = (String, BlobRef);
 /// current state references besides comes through such a member too.
 pub fn wanted_of_group(
     space: &Space,
+    base: &str,
     me: Option<[u8; 32]>,
     known: &dyn Fn(&[u8; 32]) -> bool,
     on_demand: bool,
     pinned: &dyn Fn(&str) -> bool,
 ) -> Vec<(Option<[u8; 32]>, Named)> {
-    let base = format!("Groups/{}", cardinal_space::group::name(space));
     let through = space.present().into_iter().find(|w| known(w));
     let mut listed: HashSet<[u8; 32]> = HashSet::new();
     let mut out = Vec::new();
@@ -412,13 +441,19 @@ async fn pass(d: &Arc<Daemon>, complete: &mut HashSet<[u8; 32]>) -> anyhow::Resu
             sources.push((None, unshown));
         }
     }
-    for s in crate::onefolder::relationships(d) {
+    let shown = crate::onefolder::relationships(d);
+    // where each group's folder is, which a pin names
+    let group_paths: HashMap<cardinal_space::SpaceId, String> = shown
+        .iter()
+        .filter(|s| s.group().is_some())
+        .map(|s| (s.space, s.path()))
+        .collect();
+    for s in shown {
+        let Some(contact) = s.contact().map(|c| c.identity) else {
+            continue;
+        };
         let core = d.core();
-        let Some(space) = core
-            .spaces
-            .get(&s.contact.space)
-            .and_then(|h| h.space.as_ref())
-        else {
+        let Some(space) = core.spaces.get(&s.space).and_then(|h| h.space.as_ref()) else {
             continue;
         };
         let base = s.path();
@@ -436,7 +471,7 @@ async fn pass(d: &Arc<Daemon>, complete: &mut HashSet<[u8; 32]>) -> anyhow::Resu
             }
         }
         let theirs = wanted(space, shown, on_demand, &keep);
-        sources.push((Some(s.contact.identity), theirs));
+        sources.push((Some(contact), theirs));
     }
     // A group's messages: each file from whoever sent it if this person
     // knows them, and through a member they know if not, who keeps it.
@@ -446,7 +481,7 @@ async fn pass(d: &Arc<Daemon>, complete: &mut HashSet<[u8; 32]>) -> anyhow::Resu
         let contacts = core.contacts();
         let known = |w: &[u8; 32]| contacts.iter().any(|c| c.identity == *w && c.connects());
         let mut by: HashMap<Option<[u8; 32]>, Vec<(String, BlobRef)>> = HashMap::new();
-        for h in core.spaces.values() {
+        for (id, h) in &core.spaces {
             let Some(space) = h.space.as_ref() else {
                 continue;
             };
@@ -454,7 +489,11 @@ async fn pass(d: &Arc<Daemon>, complete: &mut HashSet<[u8; 32]>) -> anyhow::Resu
             if space.profile() != cardinal_space::group::GROUP || !joined {
                 continue;
             }
-            for (from, x) in wanted_of_group(space, me, &known, on_demand, &pinned) {
+            let base = group_paths.get(id).cloned().unwrap_or_else(|| {
+                let name = cardinal_space::group::name(space);
+                format!("{}/{name}", crate::onefolder::GROUPS)
+            });
+            for (from, x) in wanted_of_group(space, &base, me, &known, on_demand, &pinned) {
                 by.entry(from).or_default().push(x);
             }
         }

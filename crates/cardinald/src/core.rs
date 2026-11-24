@@ -6822,7 +6822,14 @@ mod tests {
         let (a, me) = (ana.id(), Some(bo.id()));
         let of = |known: &dyn Fn(&[u8; 32]) -> bool, on_demand| {
             let sp = bo.space(&g);
-            let all = crate::fetch::wanted_of_group(sp, me, known, on_demand, &|_| false);
+            let all = crate::fetch::wanted_of_group(
+                sp,
+                "Groups/Garden club",
+                me,
+                known,
+                on_demand,
+                &|_| false,
+            );
             let from = all.into_iter().map(|(from, (_, b))| (from, b.id[0]));
             from.collect::<Vec<_>>()
         };

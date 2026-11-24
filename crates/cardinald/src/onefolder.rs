@@ -1,7 +1,8 @@
 //! The one folder (`profiles.md#one-folder-for-everything-guidance`). Its root
 //! is the person's files space; beside that space's own entries it holds a
 //! folder for each category of relationship, and in each, every relationship's
-//! shared folder under the contact's petname. Every window, and every way of
+//! shared folder under the contact's petname, and `Groups`, with each group's
+//! shared folder under the group's name (D88). Every window, and every way of
 //! showing files, goes through here, so they all show the same tree.
 
 use std::collections::HashSet;
@@ -14,22 +15,41 @@ use cardinal_identity::EntryId;
 use cardinal_link::Priority;
 use cardinal_space::account::ContactRecord;
 use cardinal_space::files::{self, Content, FileKind, Files, Kinds};
-use cardinal_space::{relationship, NodeId, Space, SpaceId, SpaceOp, ROOT};
+use cardinal_space::{group, relationship, NodeId, Space, SpaceId, SpaceOp, ROOT};
 use serde_json::{json, Value as Json};
 
 use crate::core::now_ms;
 use crate::daemon::Daemon;
-use crate::fetch::{blob_ref, Fetcher};
+use crate::fetch::{blob_ref, Fetcher, Others};
 
-/// A relationship's folder, as the one folder shows it.
+/// The category folder of the person's groups. It is the groups' own: a
+/// contact category of that name is shown as `Groups (2)` (D88).
+pub const GROUPS: &str = "Groups";
+
+/// What a group with no name is shown as.
+const NO_NAME: &str = "Group";
+
+/// A shared folder, as the one folder shows it.
 #[derive(Clone, Debug)]
 pub struct Shown {
     /// The category folder it is in.
     pub category: String,
-    /// Its folder's name: the petname, made unique in the category.
+    /// Its folder's name: the petname or the group's name, made unique in
+    /// the category.
     pub name: String,
-    /// Whose.
-    pub contact: ContactRecord,
+    /// The space whose folder it is.
+    pub space: SpaceId,
+    /// Whose it is besides this person's.
+    pub whose: Whose,
+}
+
+/// Whose a shared folder is besides this person's.
+#[derive(Clone, Debug)]
+pub enum Whose {
+    /// A relationship's: the contact's.
+    Contact(Box<ContactRecord>),
+    /// A group's, by its name as the group gives it.
+    Group(String),
 }
 
 impl Shown {
@@ -38,9 +58,39 @@ impl Shown {
         format!("{}/{}", self.category, self.name)
     }
 
+    /// The contact, for a relationship's folder.
+    pub fn contact(&self) -> Option<&ContactRecord> {
+        match &self.whose {
+            Whose::Contact(c) => Some(c.as_ref()),
+            Whose::Group(_) => None,
+        }
+    }
+
+    /// The group, for a group's folder.
+    pub fn group(&self) -> Option<SpaceId> {
+        matches!(self.whose, Whose::Group(_)).then_some(self.space)
+    }
+
     /// The contact's id, as the local interface names people.
-    pub fn who(&self) -> String {
-        hex::encode(&self.contact.identity[..8])
+    pub fn who(&self) -> Option<String> {
+        self.contact().map(|c| hex::encode(&c.identity[..8]))
+    }
+
+    /// What the folder is named after: the contact's petname, or the
+    /// group's name.
+    pub fn called(&self) -> &str {
+        match &self.whose {
+            Whose::Contact(c) => &c.petname,
+            Whose::Group(n) => n,
+        }
+    }
+
+    /// Whose devices may hold what is in it besides this person's.
+    pub fn others(&self) -> Others {
+        match &self.whose {
+            Whose::Contact(c) => Others::Contact(c.identity),
+            Whose::Group(_) => Others::Group(self.space),
+        }
     }
 }
 
@@ -58,12 +108,26 @@ pub fn folder_name(name: &str) -> String {
     }
 }
 
-/// Each relationship the one folder lists. Refused contacts are left out, and
-/// a second of one name in a category is `name (2)`, in an order that does not
-/// change while the contacts do not.
+/// `name` made unique among `taken`: `name (2)`, or the next number free,
+/// before any extension.
+fn numbered(name: &str, taken: &HashSet<String>) -> String {
+    let (stem, ext) = split_ext(name);
+    let mut n = 2;
+    let mut out = format!("{stem} ({n}){ext}");
+    while taken.contains(&out) {
+        n += 1;
+        out = format!("{stem} ({n}){ext}");
+    }
+    out
+}
+
+/// Each shared folder the one folder lists: every relationship's, by
+/// category, refused contacts left out, and every group's the person is in,
+/// in `Groups`. A second of one name in a category is `name (2)`, in an order
+/// that does not change while the contacts and groups do not.
 pub fn relationships(d: &Daemon) -> Vec<Shown> {
-    let mut contacts: Vec<ContactRecord> = d
-        .core()
+    let core = d.core();
+    let mut contacts: Vec<ContactRecord> = core
         .contacts()
         .into_iter()
         // a recovery's relationship is no contact (`guardians.rs`)
@@ -77,25 +141,104 @@ pub fn relationships(d: &Daemon) -> Vec<Shown> {
         )
     };
     contacts.sort_by_key(key);
+    let groups = groups_in(&core);
+    drop(core);
+    // A contact category named as the groups' is shown as a files space
+    // entry of that name would be.
+    let typed: HashSet<String> = contacts.iter().map(|c| folder_name(&c.category)).collect();
+    let mut aside = typed.clone();
+    aside.insert(GROUPS.to_owned());
+    let moved_aside = numbered(GROUPS, &aside);
+    let category_of = |c: &ContactRecord| {
+        let typed = folder_name(&c.category);
+        if typed == GROUPS {
+            moved_aside.clone()
+        } else {
+            typed
+        }
+    };
     let mut taken = HashSet::new();
-    contacts
+    let mut unique = |category: &str, base: &str| {
+        let mut name = base.to_owned();
+        let mut n = 2;
+        while !taken.insert((category.to_owned(), name.clone())) {
+            name = format!("{base} ({n})");
+            n += 1;
+        }
+        name
+    };
+    let mut out: Vec<Shown> = contacts
         .into_iter()
         .map(|c| {
-            let category = folder_name(&c.category);
-            let base = folder_name(&c.petname);
-            let mut name = base.clone();
-            let mut n = 2;
-            while !taken.insert((category.clone(), name.clone())) {
-                name = format!("{base} ({n})");
-                n += 1;
-            }
+            let category = category_of(&c);
+            let name = unique(&category, &folder_name(&c.petname));
             Shown {
                 category,
                 name,
-                contact: c,
+                space: c.space,
+                whose: Whose::Contact(Box::new(c)),
             }
         })
-        .collect()
+        .collect();
+    for (_, name, space) in groups {
+        let base = match name.trim() {
+            "" => NO_NAME.to_owned(),
+            n => folder_name(n),
+        };
+        out.push(Shown {
+            category: GROUPS.to_owned(),
+            name: unique(GROUPS, &base),
+            space,
+            whose: Whose::Group(name),
+        });
+    }
+    out
+}
+
+/// The groups that have a folder: those the person joined and has not left,
+/// that another does not stand in place of here, and that have not ended
+/// with nothing in their place. Each with the id it was first made with, as
+/// far back as this device knows, and its name; sorted, so that two of one
+/// name are numbered the same way across a succession.
+fn groups_in(core: &crate::core::Core) -> Vec<(SpaceId, String, SpaceId)> {
+    let Some(me) = core.me() else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for (id, h) in &core.spaces {
+        let Some(sp) = h.space.as_ref().filter(|s| s.profile() == group::GROUP) else {
+            continue;
+        };
+        if sp.has_left(&me)
+            || sp.role_of(&me).is_none()
+            || !core.is_joined(id)
+            || core.is_superseded(id)
+            || core.succession_news(id).0.is_some()
+        {
+            continue;
+        }
+        let mut first = *id;
+        let mut at = sp;
+        for _ in 0..64 {
+            let Some(before) = at.succeeds() else {
+                break;
+            };
+            first = before;
+            match core.spaces.get(&before).and_then(|h| h.space.as_ref()) {
+                Some(b) => at = b,
+                None => break,
+            }
+        }
+        out.push((first, group::name(sp), *id));
+    }
+    out.sort_by(|a, b| {
+        let name = |x: &(SpaceId, String, SpaceId)| match x.1.trim() {
+            "" => NO_NAME.to_owned(),
+            n => folder_name(n),
+        };
+        (name(a), a.0).cmp(&(name(b), b.0))
+    });
+    out
 }
 
 /// The categories with someone in them, in order.
@@ -104,6 +247,17 @@ pub fn categories(shown: &[Shown]) -> Vec<String> {
     c.sort();
     c.dedup();
     c
+}
+
+/// The category a contact is listed under for the category folder shown
+/// as `shown`: the category typed for those already in it, or the name
+/// itself.
+fn category_typed(shown: &[Shown], folder: &str) -> String {
+    shown
+        .iter()
+        .filter(|s| s.category == folder)
+        .find_map(|s| s.contact().map(|c| c.category.clone()))
+        .unwrap_or_else(|| folder.to_owned())
 }
 
 fn split_ext(name: &str) -> (&str, &str) {
@@ -128,13 +282,7 @@ fn root_entries(files: &Files, categories: &[String]) -> Vec<(String, files::Dir
             if !categories.contains(&e.name) {
                 return (e.name.clone(), e);
             }
-            let (stem, ext) = split_ext(&e.name);
-            let mut n = 2;
-            let mut name = format!("{stem} ({n}){ext}");
-            while taken.contains(&name) {
-                n += 1;
-                name = format!("{stem} ({n}){ext}");
-            }
+            let name = numbered(&e.name, &taken);
             taken.insert(name.clone());
             (name, e)
         })
@@ -172,14 +320,15 @@ impl At {
         self.kind == FileKind::Folder && self.version.is_none()
     }
 
-    /// A relationship's own folder, which only renaming the contact moves.
+    /// A relationship's or a group's own folder, which only renaming the
+    /// contact or the group moves.
     fn is_relationship(&self) -> bool {
         self.shared.is_some() && self.node == ROOT
     }
 
     /// Whose devices may hold what is here besides this person's.
-    fn contact(&self) -> Option<[u8; 32]> {
-        self.shared.as_ref().map(|s| s.contact.identity)
+    fn others(&self) -> Option<Others> {
+        self.shared.as_ref().map(Shown::others)
     }
 }
 
@@ -237,10 +386,10 @@ pub fn resolve(d: &Daemon, path: &str) -> anyhow::Result<Place> {
             .into_iter()
             .find(|s| s.category == *first && s.name == *second)
             .ok_or_else(missing)?;
-        let files = Files::new(open(&core, &rel.contact.space)?);
+        let files = Files::new(open(&core, &rel.space)?);
         let (node, version, kind) = walk(&files, ROOT, &parts[2..]).ok_or_else(missing)?;
         return Ok(Place::In(At {
-            space: rel.contact.space,
+            space: rel.space,
             node,
             version,
             kind,
@@ -277,10 +426,12 @@ pub fn list(d: &Daemon, path: &str) -> anyhow::Result<Json> {
     match &place {
         Place::Category(c) => {
             for s in shown.iter().filter(|s| &s.category == c) {
-                found.push((
-                    false,
-                    json!({"name": s.name, "folder": true, "who": s.who()}),
-                ));
+                let mut e = json!({"name": s.name, "folder": true});
+                match s.group() {
+                    Some(g) => e["group"] = json!(hex::encode(g)),
+                    None => e["who"] = json!(s.who()),
+                }
+                found.push((false, e));
             }
         }
         Place::In(at) => {
@@ -344,7 +495,10 @@ pub fn list(d: &Daemon, path: &str) -> anyhow::Result<Json> {
         Place::Category(c) => json!({"kind": "category", "name": c}),
         Place::In(At {
             shared: Some(s), ..
-        }) => json!({"kind": "shared", "who": s.who(), "name": s.contact.petname}),
+        }) => match s.group() {
+            Some(g) => json!({"kind": "shared", "group": hex::encode(g), "name": s.called()}),
+            None => json!({"kind": "shared", "who": s.who(), "name": s.called()}),
+        },
         Place::In(_) => json!({"kind": "mine"}),
     };
     Ok(json!({"path": path, "place": place, "files": files}))
@@ -373,7 +527,7 @@ fn folder(d: &Daemon, path: &str) -> anyhow::Result<At> {
     match resolve(d, path)? {
         Place::In(at) if at.is_folder() => Ok(at),
         Place::Category(c) => {
-            anyhow::bail!("{c} lists the people you know: put files in the folder of one of them")
+            anyhow::bail!("{c} lists shared folders: put files in one of them")
         }
         Place::In(_) => anyhow::bail!("{path} is not a folder"),
     }
@@ -385,7 +539,7 @@ fn not_a_category(d: &Daemon, at: &At, name: &str) -> anyhow::Result<()> {
         let cats = categories(&relationships(d));
         anyhow::ensure!(
             !cats.iter().any(|c| c == name),
-            "{name} is where the people you know are listed; choose another name"
+            "{name} is where shared folders are listed; choose another name"
         );
     }
     Ok(())
@@ -441,9 +595,14 @@ pub fn mkdir(d: &Arc<Daemon>, path: &str) -> anyhow::Result<Json> {
 /// the main version, which settles the conflict (`profiles.md#files`).
 pub fn remove(d: &Arc<Daemon>, path: &str) -> anyhow::Result<Json> {
     let at = match resolve(d, path)? {
-        Place::In(at) if at.is_relationship() => {
-            anyhow::bail!("{path} is what you share with them, and goes only if you refuse them")
-        }
+        Place::In(at) if at.is_relationship() => match at.shared.and_then(|s| s.group()) {
+            Some(_) => anyhow::bail!("{path} is the group's, and goes only if you leave it"),
+            None => {
+                anyhow::bail!(
+                    "{path} is what you share with them, and goes only if you refuse them"
+                )
+            }
+        },
         Place::In(at) if at.node != ROOT => at,
         _ => anyhow::bail!("{path} cannot be removed"),
     };
@@ -494,12 +653,7 @@ pub async fn move_to(d: &Arc<Daemon>, from: &str, to: &str) -> anyhow::Result<Js
     match (src, dst) {
         (Place::In(s), Place::Category(c)) if s.is_relationship() => {
             let shown = s.shared.expect("shared");
-            if name != shown.name {
-                crate::contacts::rename(d, &shown.who(), &name)?;
-            }
-            if c != shown.category {
-                crate::contacts::set_category(d, &shown.who(), &c)?;
-            }
+            rename_shared(d, &shown, &c, &name)?;
         }
         (Place::In(s), Place::In(p)) if s.node != ROOT && s.version.is_none() && p.is_folder() => {
             not_a_category(d, &p, &name)?;
@@ -517,6 +671,77 @@ pub async fn move_to(d: &Arc<Daemon>, from: &str, to: &str) -> anyhow::Result<Js
         _ => anyhow::bail!("{from} cannot be moved there"),
     }
     Ok(json!({"path": to}))
+}
+
+/// Renames a shared folder, or moves it to the category folder `category`:
+/// renaming a relationship's renames the contact and moving it lists them
+/// there; renaming a group's renames the group, which only its owner and
+/// its admins may do (D88).
+pub fn rename_shared(
+    d: &Arc<Daemon>,
+    shown: &Shown,
+    category: &str,
+    name: &str,
+) -> Result<(), Refused> {
+    let into_groups = category == GROUPS;
+    match shown.group() {
+        Some(g) => {
+            if !into_groups {
+                return Err(Refused::NotPermitted(anyhow::anyhow!(
+                    "{} is a group's folder, and stays in {GROUPS}",
+                    shown.name
+                )));
+            }
+            if name != shown.name {
+                crate::groups::rename(d, &g, name)?;
+            }
+        }
+        None => {
+            if into_groups && shown.category != GROUPS {
+                return Err(Refused::NotPermitted(anyhow::anyhow!(
+                    "{GROUPS} holds your groups' folders; a contact's goes in another"
+                )));
+            }
+            let who = shown.who().unwrap_or_default();
+            if name != shown.name {
+                crate::contacts::rename(d, &who, name).map_err(Refused::Other)?;
+            }
+            if category != shown.category {
+                // `Groups (2)` lists them under `Groups` again
+                let typed = category_typed(&relationships(d), category);
+                crate::contacts::set_category(d, &who, &typed).map_err(Refused::NotPermitted)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Why a rename of a shared folder was refused, as a folder says it.
+#[derive(Debug)]
+pub enum Refused {
+    /// This person may not: a group's name is its admins'.
+    Denied(anyhow::Error),
+    /// Nobody may: the folder does not go there.
+    NotPermitted(anyhow::Error),
+    /// Anything else, such as a name already taken.
+    Other(anyhow::Error),
+}
+
+impl From<Refused> for anyhow::Error {
+    fn from(r: Refused) -> anyhow::Error {
+        match r {
+            Refused::Denied(e) | Refused::NotPermitted(e) | Refused::Other(e) => e,
+        }
+    }
+}
+
+impl From<crate::groups::NotAdmin> for Refused {
+    fn from(e: crate::groups::NotAdmin) -> Refused {
+        match e {
+            crate::groups::NotAdmin::No(e) => Refused::Denied(e),
+            crate::groups::NotAdmin::Other(e) => Refused::Other(e),
+        }
+    }
 }
 
 /// What is copied: a tree read out of a space.
@@ -565,7 +790,7 @@ fn read_tree(files: &Files, node: NodeId, version: Option<EntryId>, name: &str) 
 fn transfer(
     d: &Arc<Daemon>,
     content: &Content,
-    from: Option<[u8; 32]>,
+    from: Option<Others>,
     secret: &ConvergenceSecret,
     always_blob: bool,
 ) -> anyhow::Result<Content> {
@@ -582,10 +807,7 @@ fn transfer(
         }
         Content::Blob(b) => b.clone(),
     };
-    let fetcher = match from {
-        Some(who) => Fetcher::from_contact(d, Priority::Interactive, who),
-        None => Fetcher::new(d, Priority::Interactive),
-    };
+    let fetcher = Fetcher::from_others(d, Priority::Interactive, from);
     let mut reader = BlobReader::new(&*d.store, &fetcher, blob_ref(&blob));
     let size = blob.size;
     let mut source = Reading {
@@ -705,7 +927,7 @@ async fn copy_into(d: &Arc<Daemon>, src: &At, dst: &At, name: &str) -> anyhow::R
     };
     let same = src.space == dst.space;
     let secret = secret(d, &dst.space)?;
-    let (d, from, space, parent) = (d.clone(), src.contact(), dst.space, dst.node);
+    let (d, from, space, parent) = (d.clone(), src.others(), dst.space, dst.node);
     tokio::task::spawn_blocking(move || {
         write_tree(&d, &space, parent, vec![item], |c| {
             if same {
@@ -902,7 +1124,7 @@ pub async fn save(d: &Arc<Daemon>, path: &str, to: &str) -> anyhow::Result<Json>
             .ok_or_else(|| anyhow::anyhow!("{path} has nothing in it to save"))?
     };
     let to = PathBuf::from(to);
-    let (d, from, written) = (d.clone(), at.contact(), to.clone());
+    let (d, from, written) = (d.clone(), at.others(), to.clone());
     let size = tokio::task::spawn_blocking(move || -> anyhow::Result<u64> {
         crate::contacts::write_new(&written, |out| match &content {
             Content::Inline(b) => {
@@ -910,10 +1132,7 @@ pub async fn save(d: &Arc<Daemon>, path: &str, to: &str) -> anyhow::Result<Json>
                 Ok(b.len() as u64)
             }
             Content::Blob(b) => {
-                let fetcher = match from {
-                    Some(who) => Fetcher::from_contact(&d, Priority::Interactive, who),
-                    None => Fetcher::new(&d, Priority::Interactive),
-                };
+                let fetcher = Fetcher::from_others(&d, Priority::Interactive, from);
                 let mut reader = BlobReader::new(&*d.store, &fetcher, blob_ref(b));
                 crate::contacts::write_out(&mut reader, out)
             }
@@ -935,7 +1154,7 @@ pub async fn share(
     let contact = crate::contacts::listed(d, who)?;
     let shown = relationships(d)
         .into_iter()
-        .find(|s| s.contact.identity == contact.identity)
+        .find(|s| s.contact().is_some_and(|c| c.identity == contact.identity))
         .ok_or_else(|| anyhow::anyhow!("{who} is not listed"))?;
     let dst = At {
         space: contact.space,
@@ -980,7 +1199,7 @@ pub async fn share(
             v.and_then(|v| v.content)
                 .ok_or_else(|| anyhow::anyhow!("{p} has nothing in it to share"))?
         };
-        let (d2, from, secret) = (d.clone(), at.contact(), secret.clone());
+        let (d2, from, secret) = (d.clone(), at.others(), secret.clone());
         let blob =
             tokio::task::spawn_blocking(move || transfer(&d2, &content, from, &secret, true))
                 .await??;
