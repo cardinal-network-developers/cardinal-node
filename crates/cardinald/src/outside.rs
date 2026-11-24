@@ -18,8 +18,16 @@
 //! address that comes back, writes nothing, and nothing is written only to
 //! reorder. It takes itself out when the person turns port mapping off
 //! (`cardinal router off`), or when none of the addresses it names has been
-//! its own for a month. An explicit host (`cardinal host`) keeps the
-//! endpoints its person gave, and none of this applies to it.
+//! its own for a month. An address the router does not give it now is
+//! taken out sooner, once it is shown to have stopped working: on the
+//! network where it was last its own, the devices outside that network in
+//! direct session with it, of two different people, see its packets come
+//! from another IP address, and none sees them come from that one
+//! ([`shown_dead`]). One device's word is not enough, and nothing is said
+//! of an address while the device is anywhere else: a laptop away from
+//! home keeps its home address named, as before. An explicit host
+//! (`cardinal host`) keeps the endpoints its person gave, and none of this
+//! applies to it.
 
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
@@ -71,6 +79,51 @@ pub struct Named {
     pub addr: SocketAddr,
     /// Seconds since the epoch.
     pub own_at: u64,
+    /// The network (its router's hardware address, as `networks.rs`
+    /// writes it) it was last its own on, where known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub network: Option<String>,
+}
+
+/// Where a device outside this one's network, in a direct session with it,
+/// sees its packets come from: the person whose device that is (this
+/// device's own person, or a trusted contact), and the address.
+pub type View = ([u8; 32], SocketAddr);
+
+/// The addresses of `named` shown to have stopped working: each the router
+/// does not give now (`given`), last its own on the network this device is
+/// on now (`here`), that no view sees, while views of two different
+/// people see this device at another IP address of the same family. An
+/// address named on another network, or with nothing known of where, is
+/// left alone, as is one only a single person's devices say is gone.
+pub fn shown_dead(
+    named: &[Named],
+    here: Option<&str>,
+    given: Option<SocketAddr>,
+    views: &[View],
+) -> Vec<SocketAddr> {
+    let Some(here) = here else {
+        return Vec::new();
+    };
+    named
+        .iter()
+        .filter(|n| n.network.as_deref() == Some(here) && Some(n.addr) != given)
+        .filter(|n| {
+            let ip = n.addr.ip();
+            let same = views.iter().filter(|(_, a)| a.is_ipv4() == ip.is_ipv4());
+            let mut elsewhere: Vec<&[u8; 32]> = Vec::new();
+            for (who, a) in same {
+                if a.ip() == ip {
+                    return false;
+                }
+                if !elsewhere.contains(&who) {
+                    elsewhere.push(who);
+                }
+            }
+            elsewhere.len() >= 2
+        })
+        .map(|n| n.addr)
+        .collect()
 }
 
 /// Whether an address can be reached from outside the network it is on:
@@ -157,7 +210,14 @@ pub fn next(
                 let held = now.saturating_sub(since) >= hold;
                 let due = out.named.is_empty() || now.saturating_sub(out.last_new) >= DAY;
                 if held && due {
-                    out.named.insert(0, Named { addr, own_at: now });
+                    out.named.insert(
+                        0,
+                        Named {
+                            addr,
+                            own_at: now,
+                            network: None,
+                        },
+                    );
                     out.named.truncate(KEEP);
                     out.last_new = now;
                     out.seen = None;
@@ -282,9 +342,25 @@ pub fn tick(d: &Arc<Daemon>) {
     }
     let on = crate::networks::routers_on(d);
     let all = d.outside.lock().unwrap_or_else(|e| e.into_inner()).clone();
-    let have = crate::portmap::external(d).or_else(|| still_reached(d, &all.named));
+    let given = crate::portmap::external(d);
+    let have = given.or_else(|| still_reached(d, &all.named));
     let was = all.named.clone();
-    let (out, _) = next(&all, on, have, now(), hold());
+    let (mut out, _) = next(&all, on, have, now(), hold());
+    // Where it is its own now, it is so on this network.
+    let here = crate::networks::router_now().map(|r| crate::networks::router_text(&r));
+    for n in out.named.iter_mut().filter(|n| Some(n.addr) == have) {
+        n.network.clone_from(&here);
+    }
+    let dead = shown_dead(&out.named, here.as_deref(), given, &views(d));
+    if !dead.is_empty() {
+        for a in &dead {
+            tracing::info!(
+                "{a} no longer reaches this device: those in touch with it see it come from \
+                 elsewhere on this network"
+            );
+        }
+        out.named.retain(|n| !dead.contains(&n.addr));
+    }
     let list = out.named.clone();
     // What the grant gives is what decides: a crash between the two
     // writes, or a grant another version wrote, is put right here.
@@ -315,10 +391,9 @@ pub fn tick(d: &Arc<Daemon>) {
     }
     // Times change on every renewal; they are kept, an hour apart at most.
     let moved = was.len() != list.len()
-        || was
-            .iter()
-            .zip(&list)
-            .any(|(a, b)| a.addr != b.addr || b.own_at.saturating_sub(a.own_at) >= 3600);
+        || was.iter().zip(&list).any(|(a, b)| {
+            a.addr != b.addr || a.network != b.network || b.own_at.saturating_sub(a.own_at) >= 3600
+        });
     if moved || out.last_new != all.last_new {
         save(d, &out);
     }
@@ -417,6 +492,26 @@ fn still_reached(d: &Daemon, named: &[Named]) -> Option<SocketAddr> {
             && s.remote_addr().is_some_and(|a| is_outside(a.ip()))
     });
     from_outside.then_some(at)
+}
+
+/// Where the devices outside this one's network see it come from, on the
+/// direct sessions it has with its own person's devices and its trusted
+/// contacts' ([`View`]).
+fn views(d: &Daemon) -> Vec<View> {
+    let me = d.core().me();
+    let contacts = d.core().contacts();
+    d.endpoint
+        .sessions()
+        .iter()
+        .filter(|s| !s.is_closed() && !s.is_relayed())
+        .filter(|s| s.remote_addr().is_some_and(|a| is_outside(a.ip())))
+        .filter_map(|s| {
+            let who = s.peer_identity()?.identity;
+            let known = Some(who) == me || account::connects(&contacts, &who);
+            let seen = s.observed_addr().filter(|a| is_outside(a.ip()))?;
+            known.then_some((who, seen))
+        })
+        .collect()
 }
 
 /// For `status`: what this device names itself at.
@@ -587,5 +682,62 @@ mod tests {
         let e = endpoints(&o.named);
         assert_eq!(e[0].socket_addr(), Some(a("203.0.113.1:60001")));
         assert_eq!(e[0].to_record().get(1).and_then(Value::as_uint), Some(1));
+    }
+
+    /// An address kept only because someone dials in is taken out once it
+    /// is shown to have stopped working: on the network it was its own on,
+    /// those in touch with the device, of two different people, see it
+    /// come from another IP, and nobody sees it at that one.
+    #[test]
+    fn an_address_shown_to_have_stopped_working_is_taken_out() {
+        let home = "02:00:00:00:00:01";
+        let named = |at: &str, network: Option<&str>| Named {
+            addr: a(at),
+            own_at: 0,
+            network: network.map(str::to_owned),
+        };
+        let forwarded = named("203.0.113.5:7171", Some(home));
+        let list = [forwarded.clone()];
+        let (ana, bo) = ([1; 32], [2; 32]);
+        let moved = |who: [u8; 32], at: &str| (who, a(at));
+        // Two people see it at its new address: the old one is gone.
+        let views = [
+            moved(ana, "198.51.100.9:7171"),
+            moved(bo, "198.51.100.9:40000"),
+        ];
+        assert_eq!(
+            shown_dead(&list, Some(home), None, &views),
+            vec![a("203.0.113.5:7171")]
+        );
+        // One person's devices alone are not enough, however many.
+        let one = [
+            moved(ana, "198.51.100.9:7171"),
+            moved(ana, "198.51.100.9:7"),
+        ];
+        assert!(shown_dead(&list, Some(home), None, &one).is_empty());
+        // Anyone who sees it at that address shows it still works.
+        let mixed = [views[0], views[1], moved(ana, "203.0.113.5:7171")];
+        assert!(shown_dead(&list, Some(home), None, &mixed).is_empty());
+        // Somewhere else, or on a network not known, it says nothing of it:
+        // a laptop away keeps its home address named.
+        assert!(shown_dead(&list, Some("02:00:00:00:00:02"), None, &views).is_empty());
+        assert!(shown_dead(&list, None, None, &views).is_empty());
+        let unplaced = [named("203.0.113.5:7171", None)];
+        assert!(shown_dead(&unplaced, Some(home), None, &views).is_empty());
+        // The router's word for it holds over anyone's.
+        assert!(shown_dead(&list, Some(home), Some(a("203.0.113.5:7171")), &views).is_empty());
+        // What is seen over IPv4 says nothing of an IPv6 address.
+        let six = [named("[2001:470::5]:7171", Some(home))];
+        assert!(shown_dead(&six, Some(home), None, &views).is_empty());
+    }
+
+    /// What was saved before the network was kept still reads.
+    #[test]
+    fn an_address_saved_without_its_network_reads() {
+        let o: Outside = serde_json::from_str(
+            r#"{"named":[{"addr":"203.0.113.5:7171","own_at":5}],"last_new":5}"#,
+        )
+        .unwrap();
+        assert_eq!(o.named[0].network, None);
     }
 }

@@ -2830,7 +2830,12 @@ asks for around that is not built yet.
   - **When it takes itself out** of a list it leaves empty, that is no
     no: named again, it names itself there again.
   - **The month is kept on the device** (`outside.json`): the addresses it
-    names and when each was last its own, saved at most hourly.
+    names, when each was last its own, saved at most hourly, and the
+    network (its router's hardware address) it was last its own on, which
+    an address shown to have stopped working is judged on. What two
+    people's devices see is believed, as the text says; a session counts
+    only where it is direct, from outside the network, and with a device
+    of the person's or a trusted contact's.
   - **Not in the text: an address is named only once it has held, and
     seldom.** The router must have given it for ten minutes, and after
     the first, at most one new address is named a day (the newest waits
