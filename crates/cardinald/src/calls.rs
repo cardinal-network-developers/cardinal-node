@@ -204,6 +204,12 @@ pub struct Call {
     /// The shape of this person's window, while one shows the call: told to
     /// those who send it video (`basics/video.md`), and never kept.
     viewport: Option<Viewport>,
+    /// This person's camera is on, as their window says: told to the others
+    /// on the call (`basics/video.md#cameras`), and never kept.
+    camera: bool,
+    /// Between two people, when the other side last said its camera is on;
+    /// `None` while it is off, or was not said again in time.
+    their_camera: Option<Instant>,
 }
 
 impl Call {
@@ -230,6 +236,8 @@ impl Call {
             taken: None,
             they_take: None,
             viewport: None,
+            camera: false,
+            their_camera: None,
         }
     }
 
@@ -293,6 +301,9 @@ pub struct Group {
     /// The number of the newest viewport of each voice seen here, this
     /// device's own among them.
     viewports: HashMap<Voice, u32>,
+    /// The newest word of each voice on whether its camera is on
+    /// (`basics/video.md#cameras`), this device's own among them.
+    cameras: HashMap<Voice, Camera>,
     /// Its pictures (`basics/video.md#groups`): what is asked of whom.
     pictures: Pictures,
     /// The number of this device's next picture of each size.
@@ -415,6 +426,39 @@ fn viewport_in(b: &[u8]) -> Option<Viewport> {
     };
     let v = (u16::from_be_bytes([w0, w1]), u16::from_be_bytes([h0, h1]));
     (v.0 > 0 && v.1 > 0).then_some(v)
+}
+
+/// Whether a device's camera is on, on the video channel: `3 || on (1)`,
+/// on 0 or 1 (`basics/video.md#cameras`). No RTP packet, viewport or picture
+/// begins so.
+const CAMERA: u8 = 3;
+/// How long a camera said to be on is taken to be, unless said again.
+const CAMERA_FOR: Duration = Duration::from_secs(12);
+
+fn camera_frame(on: bool) -> [u8; 2] {
+    [CAMERA, u8::from(on)]
+}
+
+/// Whether the camera is on, if a frame on the video channel says so.
+fn camera_in(b: &[u8]) -> Option<bool> {
+    match *b {
+        [CAMERA, 0] => Some(false),
+        [CAMERA, 1] => Some(true),
+        _ => None,
+    }
+}
+
+/// The newest word of one voice on a group call about its camera.
+struct Camera {
+    n: u32,
+    on: bool,
+    at: Instant,
+}
+
+impl Camera {
+    fn on(&self, now: Instant) -> bool {
+        self.on && now.duration_since(self.at) < CAMERA_FOR
+    }
 }
 
 /// Formats in their order, each once.
@@ -705,6 +749,7 @@ pub async fn answer(d: &Arc<Daemon>, formats: Option<Vec<Format>>) -> anyhow::Re
         c.standing = Standing::Live;
         // Only what was offered can be taken; a ring that named nothing is
         // voice, and its answer names nothing either.
+        let formats = with_video(c, formats);
         c.taken = c
             .offered
             .as_deref()
@@ -741,6 +786,7 @@ async fn answer_again(d: &Arc<Daemon>, formats: Option<Vec<Format>>) -> anyhow::
             .offered
             .as_deref()
             .ok_or_else(|| anyhow::anyhow!("this call offered only voice"))?;
+        let formats = with_video(c, formats);
         let taken = taking(offered, formats.as_deref());
         c.taken = Some(taken.clone());
         let s = c.session.clone();
@@ -756,6 +802,18 @@ async fn answer_again(d: &Arc<Daemon>, formats: Option<Vec<Format>>) -> anyhow::
     // Taking video again, the sender has this window's shape at once.
     send_viewport(d);
     Ok(json!({}))
+}
+
+/// What an answer takes, with video added while this person's camera is
+/// on: a device whose camera is on takes the others' video
+/// (`basics/video.md#cameras`). An answer naming nothing is voice.
+fn with_video(c: &Call, formats: Option<Vec<Format>>) -> Option<Vec<Format>> {
+    if !c.camera || !c.offered.as_ref().is_some_and(|o| o.contains(&video())) {
+        return formats;
+    }
+    let mut f = formats.unwrap_or_else(|| vec![voice()]);
+    f.push(video());
+    Some(f)
 }
 
 /// Hangs up, or says no.
@@ -870,6 +928,11 @@ fn go_live(d: &Arc<Daemon>, s: &Session, id: [u8; 16]) {
                                 Some(v) if format == video() => {
                                     let _ = d.call_viewport.send((id, None, v));
                                 }
+                                // Heard whether or not this side takes video:
+                                // it is what its window asks by.
+                                _ if format == video() && camera_in(&frame).is_some() => {
+                                    their_camera(&d, &id, camera_in(&frame) == Some(true));
+                                }
                                 _ if !takes(&d, &id, &format) => {}
                                 _ => {
                                     let _ = d.call_video.send(Shown {
@@ -890,6 +953,8 @@ fn go_live(d: &Arc<Daemon>, s: &Session, id: [u8; 16]) {
         (s.channel(label, Priority::RealTime), c.over.subscribe())
     };
     d.bump();
+    // A camera already on is said at once.
+    send_camera(d, false);
     let d = d.clone();
     let s = s.clone();
     tokio::spawn(async move {
@@ -909,12 +974,50 @@ fn go_live(d: &Arc<Daemon>, s: &Session, id: [u8; 16]) {
                     }
                     // Said again, for one that was lost.
                     send_viewport(&d);
+                    send_camera(&d, false);
+                    their_camera_lapsed(&d, &id);
                 }
             }
         }
         // The session went, and the call with it.
         forget(&d, &id, Ending::Over);
     });
+}
+
+/// The other side of the call `id`, between two people, says whether its
+/// camera is on.
+fn their_camera(d: &Daemon, id: &[u8; 16], on: bool) {
+    let changed = {
+        let mut call = lock(d);
+        let Some(c) = call.as_mut().filter(|c| c.id == *id && !c.group) else {
+            return;
+        };
+        let was = c.their_camera.is_some();
+        c.their_camera = on.then(Instant::now);
+        was != on
+    };
+    if changed {
+        d.bump();
+    }
+}
+
+/// The other side's camera, not said to be on again in time, is taken to
+/// be off.
+fn their_camera_lapsed(d: &Daemon, id: &[u8; 16]) {
+    let lapsed = {
+        let mut call = lock(d);
+        let Some(c) = call.as_mut().filter(|c| c.id == *id) else {
+            return;
+        };
+        let lapsed = c.their_camera.is_some_and(|t| t.elapsed() >= CAMERA_FOR);
+        if lapsed {
+            c.their_camera = None;
+        }
+        lapsed
+    };
+    if lapsed {
+        d.bump();
+    }
 }
 
 /// Whether this device takes `format` on the call `id` now.
@@ -931,14 +1034,23 @@ pub fn current(d: &Daemon) -> Json {
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .clone();
-    let (offered, taken, they_take) = {
+    let (offered, taken, they_take, camera, own_camera) = {
         let call = lock(d);
         let hexes = |l: &Option<Vec<Format>>| {
             l.as_ref()
                 .map(|l| l.iter().map(hex::encode).collect::<Vec<_>>())
         };
-        call.as_ref().map_or((None, None, None), |c| {
-            (hexes(&c.offered), hexes(&c.taken), hexes(&c.they_take))
+        call.as_ref().map_or((None, None, None, None, false), |c| {
+            // between two, whether the other side's camera is on
+            let camera = (!c.group && c.standing == Standing::Live)
+                .then(|| c.their_camera.is_some_and(|t| t.elapsed() < CAMERA_FOR));
+            (
+                hexes(&c.offered),
+                hexes(&c.taken),
+                hexes(&c.they_take),
+                camera,
+                c.camera,
+            )
         })
     };
     let (who, name, standing, seconds, space, group, id) = {
@@ -961,20 +1073,31 @@ pub fn current(d: &Daemon) -> Json {
             c.id,
         )
     };
-    let (linked, people, frames, heard) = if group {
+    let (linked, people, frames, heard, cameras) = if group {
         let gs = groups(d);
         let g = gs.get(&id);
         let now = Instant::now();
+        // whose cameras are on: this device's own as its window says
+        let cameras: std::collections::HashSet<Voice> = g.map_or_else(Default::default, |g| {
+            let own = g.tree.own();
+            g.cameras
+                .iter()
+                .filter(|(v, c)| Some(**v) != own && c.on(now))
+                .map(|(v, _)| *v)
+                .chain(own.filter(|_| own_camera))
+                .collect()
+        });
         (
             Some(g.map_or(0, |g| g.tree.links())),
             Some(g.map_or(1, |g| g.tree.on_it(now))),
             g.map(|g| json!({"in": g.frames_in, "new": g.frames_new})),
             g.map(|g| g.tree.others_heard(now)),
+            cameras,
         )
     } else {
-        (None, None, None, None)
+        (None, None, None, None, Default::default())
     };
-    let voices = heard.map(|heard| voices(d, &space, &heard));
+    let voices = heard.map(|heard| voices(d, &space, &heard, &cameras));
     // the picture this person sees for them, if any
     let picture = {
         let contacts = d.core().contacts();
@@ -996,6 +1119,7 @@ pub fn current(d: &Daemon) -> Json {
         "offered": offered,
         "taken": taken,
         "they_take": they_take,
+        "camera": camera,
     }, "ended": ended})
 }
 
@@ -1003,11 +1127,17 @@ pub fn current(d: &Daemon) -> Json {
 /// `voice`, as a frame's `from` says it; `identity`, the start of the
 /// person's id, as `contacts` and `group-members` give it; `name`, this
 /// person's name for them, or else the group's; `contact`; `picture`,
-/// a contact's; and `you`, a device of this person's own. A voice is named
+/// a contact's; `you`, a device of this person's own; and `camera`, whether
+/// its camera is on (`basics/video.md#cameras`). A voice is named
 /// only for a device key in the log of a member of the group, as held here,
 /// the key its frames were checked against: a voice heard that no member's
 /// log has a key for is left out, since nothing says whose it is.
-fn voices(d: &Daemon, space: &SpaceId, heard: &[Voice]) -> Vec<Json> {
+fn voices(
+    d: &Daemon,
+    space: &SpaceId,
+    heard: &[Voice],
+    cameras: &std::collections::HashSet<Voice>,
+) -> Vec<Json> {
     let owners = device_owners(d, space);
     let core = d.core();
     let Some(sp) = core.spaces.get(space).and_then(|h| h.space.as_ref()) else {
@@ -1037,6 +1167,7 @@ fn voices(d: &Daemon, space: &SpaceId, heard: &[Voice]) -> Vec<Json> {
                 "contact": known.is_some(),
                 "picture": picture,
                 "you": you,
+                "camera": cameras.contains(v),
             }))
         })
         .collect()
@@ -1180,6 +1311,7 @@ fn new_group(space: SpaceId, own: Option<Voice>, waiting: bool) -> Group {
         thin_since: None,
         probe: None,
         viewports: HashMap::new(),
+        cameras: HashMap::new(),
         pictures: Pictures::default(),
         picture_next: [mesh::first_number(); 2],
         wanted: None,
@@ -1440,6 +1572,23 @@ async fn drive(d: Arc<Daemon>, id: [u8; 16], mut over: watch::Receiver<bool>) {
         }
         if here && on_it {
             send_viewport(&d);
+            send_camera(&d, false);
+        }
+        // A camera not said to be on again in time is taken to be off; its
+        // number is kept, so that an old word is not taken again.
+        let lapsed = groups(&d).get_mut(&id).is_some_and(|g| {
+            let own = g.tree.own();
+            let mut lapsed = false;
+            for (v, c) in &mut g.cameras {
+                if Some(*v) != own && c.on && !c.on(now) {
+                    c.on = false;
+                    lapsed = true;
+                }
+            }
+            lapsed
+        });
+        if lapsed && on_it {
+            d.bump();
         }
         if keepalive || here {
             say_asks(&d, &id, keepalive, here && on_it);
@@ -1996,6 +2145,10 @@ fn viewed(d: &Daemon, from: &Session, id: &[u8; 16], bytes: Bytes) {
         pictured(d, from, id, &f, &bytes);
         return;
     }
+    if let Some(on) = camera_in(f.payload) {
+        camera_came(d, from, id, &f, on, &bytes);
+        return;
+    }
     let Some(v) = viewport_in(f.payload) else {
         return;
     };
@@ -2042,6 +2195,63 @@ fn viewed(d: &Daemon, from: &Session, id: &[u8; 16], bytes: Bytes) {
     }
     if show {
         let _ = d.call_viewport.send((*id, Some(f.voice), v));
+    }
+}
+
+/// A group call's word on whether a voice's camera is on, come on the link
+/// `from` (`basics/video.md#cameras`): the newest of its voice, signed by its
+/// device, is kept and passed on to every other link, as a viewport is.
+fn camera_came(d: &Daemon, from: &Session, id: &[u8; 16], f: &Frame<'_>, on: bool, bytes: &Bytes) {
+    let ps = from.peer_static();
+    let newest = |g: &Group| {
+        g.cameras
+            .get(&f.voice)
+            .is_none_or(|c| mesh::after(f.n, c.n))
+    };
+    {
+        let mut gs = groups(d);
+        let Some(g) = gs.get_mut(id) else { return };
+        if !g.tree.admit(&ps, Instant::now()) || !newest(g) {
+            return;
+        }
+    }
+    let Some(key) = key_of(d, id, &f.voice) else {
+        return;
+    };
+    if !mesh::signed_as(mesh::CAMERA, f, id, &key) {
+        return;
+    }
+    let now = Instant::now();
+    let (to, label, changed) = {
+        let mut gs = groups(d);
+        let Some(g) = gs.get_mut(id) else { return };
+        if !newest(g) || !on_call(g, &ps) {
+            return;
+        }
+        let was = g.cameras.get(&f.voice).is_some_and(|c| c.on(now));
+        g.cameras.insert(
+            f.voice,
+            Camera {
+                n: f.n,
+                on,
+                at: now,
+            },
+        );
+        g.pictures.came(f.voice, ps, now);
+        let to: Vec<Session> = g
+            .sessions
+            .iter()
+            .filter(|(l, _)| **l != ps)
+            .map(|(_, (s, _))| s.clone())
+            .collect();
+        let changed = was != on && g.tree.own().is_some_and(|own| own != f.voice);
+        (to, format_label(&g.space, id, &video()), changed)
+    };
+    for s in to {
+        let _ = s.send_datagram(label, Priority::RealTime, bytes.clone());
+    }
+    if changed {
+        d.bump();
     }
 }
 
@@ -2414,6 +2624,9 @@ pub async fn serve(d: &Arc<Daemon>, s: &Session, mut st: Stream, v: Value) -> an
             go_live(d, s, id);
             // Their other devices can stop ringing.
             told_the_others(d, s, &them, &space, &id, Some(ANSWERED_ELSEWHERE)).await;
+            // A caller whose camera is on takes the video they answered
+            // without.
+            take_video_if_camera(d).await;
         }
         END => {
             let ended = {
@@ -2464,7 +2677,8 @@ fn answered_again(d: &Daemon, s: &Session, them: &[u8; 32], sig: &Signal) -> boo
             c.id == sig.id
                 && c.who == *them
                 && c.standing == Standing::Live
-                && c.carrying
+                // not yet carrying, as when this side answered a moment
+                // ago and the caller, its camera on, answers again at once
                 && !c.group
                 && c.session
                     .as_ref()
@@ -2523,10 +2737,16 @@ async fn told_the_others(
 pub async fn media(d: &Arc<Daemon>, spec: &crate::api::Request, r: Reader, w: Writer) {
     carry_media(d, spec, r, w).await;
     // The window's viewport goes with it, and what it asked for.
-    let group = lock(d).as_mut().and_then(|c| {
+    let (group, camera) = lock(d).as_mut().map_or((None, false), |c| {
         c.viewport = None;
-        c.group.then_some(c.id)
+        let camera = std::mem::take(&mut c.camera);
+        (c.group.then_some(c.id), camera)
     });
+    // A window that has gone sends nothing.
+    if camera {
+        d.bump();
+        send_camera(d, true);
+    }
     if let Some(id) = group {
         if let Some(g) = groups(d).get_mut(&id) {
             g.pictures.clear_window();
@@ -2638,6 +2858,12 @@ async fn carry_media(d: &Arc<Daemon>, spec: &crate::api::Request, mut r: Reader,
                 let crate::transport::Received::Message(msg) = got else { continue };
                 let Ok(rec) = Record::decode(&msg) else { continue };
                 let kind = rec.get(0).and_then(cardinal_encoding::Value::as_uint);
+                if kind == Some(crate::api::frame::CAMERA) {
+                    if let Some(on) = rec.get(1).and_then(cardinal_encoding::Value::as_bool) {
+                        set_camera(d, on).await;
+                    }
+                    continue;
+                }
                 if kind == Some(crate::api::frame::VIEWPORT) {
                     let side = |k| {
                         rec.get(k)
@@ -2733,6 +2959,97 @@ fn send_viewport(d: &Daemon) {
             .map_or_else(mesh::first_number, |n| n.wrapping_add(1));
         g.viewports.insert(own, n);
         let out = mesh::frame_of(mesh::VIEWPORT, &d.keys.signing, &id, &own, n, &v);
+        let to: Vec<Session> = g.sessions.values().map(|(s, _)| s.clone()).collect();
+        (Bytes::from(out), to)
+    };
+    for s in to {
+        let _ = s.send_datagram(label, Priority::RealTime, out.clone());
+    }
+}
+
+/// This person's window says whether their camera is on: those on the
+/// call are told now, and again every five seconds while it is. Between two
+/// people, a device whose camera comes on takes the other side's video, if
+/// the call offered it and it took none, so that its person is not asked
+/// (`basics/video.md#cameras`).
+async fn set_camera(d: &Arc<Daemon>, on: bool) {
+    let changed = {
+        let mut call = lock(d);
+        let Some(c) = call.as_mut() else { return };
+        let changed = c.camera != on;
+        c.camera = on;
+        changed
+    };
+    if !changed {
+        return;
+    }
+    d.bump();
+    send_camera(d, true);
+    take_video_if_camera(d).await;
+}
+
+/// Between two people, on a live call whose ring offered video: while this
+/// person's camera is on, this device takes the other side's video, and
+/// answers again to do so if it took none.
+async fn take_video_if_camera(d: &Arc<Daemon>) {
+    let take = lock(d).as_ref().and_then(|c| {
+        let take = c.camera
+            && !c.group
+            && c.standing == Standing::Live
+            && c.offered.as_ref().is_some_and(|o| o.contains(&video()))
+            && !c.taken.as_ref().is_some_and(|t| t.contains(&video()));
+        take.then(|| c.taken.clone().unwrap_or_default())
+    });
+    if let Some(taken) = take {
+        if let Err(e) = answer_again(d, Some(taken)).await {
+            tracing::debug!("taking video as the camera is on: {e}");
+        }
+    }
+}
+
+/// Tells those on the call whether this person's camera is on: between two
+/// people on the video channel, if the call offered video; in a group,
+/// signed, to every link. Said when it changes (`change`), and otherwise
+/// again only while it is on.
+fn send_camera(d: &Daemon, change: bool) {
+    let (id, group, session, label, on) = {
+        let call = lock(d);
+        let Some(c) = call.as_ref().filter(|c| c.standing == Standing::Live) else {
+            return;
+        };
+        if !change && !c.camera {
+            return;
+        }
+        if !c.group && !c.offered.as_ref().is_some_and(|o| o.contains(&video())) {
+            return;
+        }
+        let label = format_label(&c.space, &c.id, &video());
+        (c.id, c.group, c.session.clone(), label, c.camera)
+    };
+    let word = camera_frame(on);
+    if !group {
+        if let Some(s) = session {
+            let _ = s.send_datagram(label, Priority::RealTime, Bytes::copy_from_slice(&word));
+        }
+        return;
+    }
+    let (out, to) = {
+        let mut gs = groups(d);
+        let Some(g) = gs.get_mut(&id) else { return };
+        let Some(own) = g.tree.own() else { return };
+        let n = g
+            .cameras
+            .get(&own)
+            .map_or_else(mesh::first_number, |c| c.n.wrapping_add(1));
+        g.cameras.insert(
+            own,
+            Camera {
+                n,
+                on,
+                at: Instant::now(),
+            },
+        );
+        let out = mesh::frame_of(mesh::CAMERA, &d.keys.signing, &id, &own, n, &word);
         let to: Vec<Session> = g.sessions.values().map(|(s, _)| s.clone()).collect();
         (Bytes::from(out), to)
     };
@@ -2859,6 +3176,37 @@ mod tests {
             2,
             now
         ));
+    }
+
+    /// A word on a camera reads back, is neither a viewport nor RTP, and
+    /// one signed for a group is neither a viewport nor sound.
+    #[test]
+    fn a_camera_word_is_told_apart_from_viewports_and_video() {
+        assert_eq!(camera_frame(true), [3, 1]);
+        assert_eq!(camera_in(&camera_frame(true)), Some(true));
+        assert_eq!(camera_in(&camera_frame(false)), Some(false));
+        assert_eq!(camera_in(&[3, 2]), None);
+        assert_eq!(camera_in(&[3]), None);
+        assert_eq!(viewport_in(&camera_frame(true)), None);
+        assert_eq!(camera_in(&viewport_frame((3, 1))), None);
+        assert_eq!(camera_in(&[0x80, 1]), None);
+        let key = cardinal_crypto::SigningKey::generate();
+        let own = mesh::voice_of(&key.public_key());
+        let f = mesh::frame_of(mesh::CAMERA, &key, &[7; 16], &own, 3, &camera_frame(true));
+        let f = Frame::parse(&f).unwrap();
+        assert!(mesh::signed_as(
+            mesh::CAMERA,
+            &f,
+            &[7; 16],
+            &key.public_key()
+        ));
+        assert!(!mesh::signed_as(
+            mesh::VIEWPORT,
+            &f,
+            &[7; 16],
+            &key.public_key()
+        ));
+        assert!(!mesh::signed_by(&f, &[7; 16], &key.public_key()));
     }
 
     /// A viewport reads back, is never an RTP packet, and a viewport signed

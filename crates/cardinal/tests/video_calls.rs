@@ -330,3 +330,98 @@ fn a_viewport_reaches_the_one_sending_video() {
     assert!(viewports(&mut lb, 1).is_empty(), "not given back");
     ask(&a, json!({"cmd": "call-end"}));
 }
+
+/// Whether the other side's camera is on, as `call` says it.
+fn their_camera(d: &Dev) -> Value {
+    ask(d, json!({"cmd": "call"}))["call"]["camera"].clone()
+}
+
+/// A call asks nobody to take video until someone's camera is on
+/// (`basics/video.md#cameras`): with both cameras off neither side is told
+/// one is on; Ana's coming on is told to Bo; Bo's coming on takes Ana's
+/// video for him, unasked; and a camera going off, or its window going, is
+/// told too.
+#[test]
+fn a_camera_coming_on_is_told_to_the_other_side() {
+    if !fuse_available() {
+        eprintln!("skipping: /dev/fuse or fusermount3 is not available");
+        return;
+    }
+    let root = tempfile::tempdir().unwrap();
+    let (a, b, bo) = met(root.path());
+    let both = json!(["voice 1", "video vp8 1"]);
+    ask(
+        &a,
+        json!({"cmd": "call-start", "who": bo, "format_names": both}),
+    );
+    wait("bo's device rings", 10, || standing(&b) == "ringing");
+    ask(
+        &b,
+        json!({"cmd": "call-answer", "format_names": ["voice 1"]}),
+    );
+    wait("ana hears the answer", 10, || standing(&a) == "live");
+    let (mut la, mut lb) = (Line::open(&a), Line::open(&b));
+    std::thread::sleep(Duration::from_millis(300));
+
+    // Both off: nobody's camera is on, and a window says so.
+    la.m.send(&json!({"camera": false}));
+    std::thread::sleep(Duration::from_secs(1));
+    assert_eq!(their_camera(&a), false);
+    assert_eq!(their_camera(&b), false);
+
+    // Ana's comes on: Bo is told; Ana is told nothing of his.
+    la.m.send(&json!({"camera": true}));
+    wait("bo is told ana's camera is on", 10, || {
+        their_camera(&b) == true
+    });
+    assert_eq!(their_camera(&a), false);
+    assert_eq!(named(&b, "taken"), Some(1), "told, not taken");
+
+    // Bo's comes on: having his on, he takes hers without being asked.
+    lb.m.send(&json!({"camera": true}));
+    wait("bo takes video", 10, || named(&b, "taken") == Some(2));
+    wait("ana is told bo takes it", 10, || {
+        named(&a, "they_take") == Some(2)
+    });
+    wait("ana is told bo's camera is on", 10, || {
+        their_camera(&a) == true
+    });
+    // said again, so still on well past the time one is forgotten
+    std::thread::sleep(Duration::from_secs(13));
+    assert_eq!(their_camera(&b), true);
+    assert_eq!(their_camera(&a), true);
+
+    // Ana's goes off; Bo's window goes, and his camera with it.
+    la.m.send(&json!({"camera": false}));
+    wait("bo is told ana's is off", 10, || their_camera(&b) == false);
+    drop(lb);
+    wait("ana is told bo's is off", 10, || their_camera(&a) == false);
+    assert_eq!(standing(&a), "live");
+    ask(&a, json!({"cmd": "call-end"}));
+    wait("over", 10, || standing(&b).is_null());
+
+    // Ana calls with her camera on and Bo answers with voice only: her
+    // device takes his video at once, and the call goes on.
+    drop(la);
+    ask(
+        &a,
+        json!({"cmd": "call-start", "who": bo, "format_names": both}),
+    );
+    wait("rings", 10, || standing(&b) == "ringing");
+    let mut la = Line::open(&a);
+    la.m.send(&json!({"camera": true}));
+    std::thread::sleep(Duration::from_millis(300));
+    ask(
+        &b,
+        json!({"cmd": "call-answer", "format_names": ["voice 1"]}),
+    );
+    wait("ana takes video", 10, || named(&a, "taken") == Some(2));
+    wait("bo is told", 10, || named(&b, "they_take") == Some(2));
+    wait("bo is told ana's camera is on", 10, || {
+        their_camera(&b) == true
+    });
+    assert_eq!(named(&b, "taken"), Some(1));
+    assert_eq!(standing(&a), "live");
+    assert_eq!(standing(&b), "live");
+    ask(&a, json!({"cmd": "call-end"}));
+}

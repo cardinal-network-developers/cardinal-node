@@ -1088,3 +1088,73 @@ fn a_group_call_says_a_voice_is_another_device_of_ones_own() {
     assert!(bens.iter().all(|w| w.2 && !w.3));
     assert_eq!(own[0].1, bens[0].1, "the same person, as each names them");
 }
+
+/// The voices whose cameras `call` says are on.
+fn cameras_on(d: &Dev) -> Vec<String> {
+    let c = call(d);
+    c["voices"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|v| v["camera"] == true)
+        .filter_map(|v| v["voice"].as_str().map(str::to_owned))
+        .collect()
+}
+
+/// In a group whether a camera is on is told to everyone on the call
+/// (`basics/video.md#cameras`): Ben's comes on, and Ana, whom he reaches
+/// only through Carol's device, and Carol both see it on his voice and on
+/// no other; it goes off, and they see that too.
+#[test]
+fn a_camera_coming_on_is_seen_by_everyone_on_a_group_call() {
+    let root = tempfile::tempdir().unwrap();
+    let carol = person(root.path(), "carol");
+    let ana = person(root.path(), "ana");
+    let ben = person(root.path(), "ben");
+    plugged_in(&carol, true);
+    plugged_in(&ana, false);
+    plugged_in(&ben, false);
+    meet(&carol, &ana);
+    meet(&carol, &ben);
+    let g = group(&carol, &[&ana, &ben]);
+    ask(&carol, json!({"cmd": "call-start", "group": g}));
+    for d in [&ana, &ben] {
+        wait("rung", 20, || standing(d) == "ringing");
+        ask(d, json!({"cmd": "call-answer"}));
+    }
+    let mut lines = [
+        Line::open(&carol, 1),
+        Line::open(&ana, 2),
+        Line::open(&ben, 3),
+    ];
+    let all = [&carol, &ana, &ben];
+    wait("each hears the others", 30, || {
+        talk(&mut lines, &[true, true, true], 5);
+        all.iter().all(|d| voices(d).len() == 2)
+    });
+    assert!(all.iter().all(|d| cameras_on(d).is_empty()), "none on yet");
+
+    lines[2].m.send(&json!({"camera": true}));
+    let mut from = None;
+    wait("ana and carol see ben's camera on", 20, || {
+        lines[2].say();
+        std::thread::sleep(Duration::from_millis(20));
+        while let Some(f) = lines[1].m.next() {
+            if f["audio"].is_string() {
+                from = f["from"].as_str().map(str::to_owned);
+            }
+        }
+        cameras_on(&ana).len() == 1 && cameras_on(&carol).len() == 1
+    });
+    let ben_voice = cameras_on(&ana)[0].clone();
+    assert_eq!(cameras_on(&carol), vec![ben_voice.clone()]);
+    if let Some(from) = from {
+        assert_eq!(from, ben_voice, "the voice his sound comes from");
+    }
+    assert!(cameras_on(&ben).is_empty(), "{:?}", call(&ben));
+
+    lines[2].m.send(&json!({"camera": false}));
+    wait("they see it off", 20, || {
+        cameras_on(&ana).is_empty() && cameras_on(&carol).is_empty()
+    });
+}

@@ -90,6 +90,9 @@ const FRAME: &[u8] = b"cardinal call frame v1";
 /// A viewport on a group call's video channel (`basics/video.md`), signed
 /// apart so that it can never be taken for sound.
 pub const VIEWPORT: &[u8] = b"cardinal call viewport v1";
+/// A word on a group call's video channel on whether a device's camera is
+/// on (`basics/video.md#cameras`), signed apart as a viewport is.
+pub const CAMERA: &[u8] = b"cardinal call camera v1";
 
 /// What a frame's signature covers, so that it holds for this call only and
 /// for frames of the kind `what` says.

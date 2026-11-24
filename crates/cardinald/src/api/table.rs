@@ -275,7 +275,7 @@ rec!(BLUETOOTH "bluetooth":
 rec!(CALL "call":
     1 "frames" {CALL_FRAMES}, 2 "group" B, 3 "id" B, 4 "linked" U, 5 "name" T, 6 "offered" [B],
     7 "people" U, 8 "picture" T, 9 "seconds" U, 10 "state" T, 11 "taken" [B], 12 "who" B,
-    13 "voices" [VOICE], 14 "they_take" [B]);
+    13 "voices" [VOICE], 14 "they_take" [B], 15 "camera" BOOL);
 rec!(CALL_ENDED "call ended": 1 "group" B, 2 "how" T, 3 "id" B, 4 "name" T, 5 "who" B);
 rec!(CONDITIONS "conditions": 1 "helps" BOOL, 2 "metered" BOOL, 3 "plugged_in" BOOL);
 rec!(CONFLICT "conflict":
@@ -475,7 +475,8 @@ rec!(STARTED_BY "started by": 1 "author" B, 2 "entry" B, 3 "time" U);
 rec!(STATS "stats": 1 "appended" U, 2 "recomputed" U);
 rec!(STORE "store": 1 "bytes" U, 2 "objects" U);
 rec!(VOICE "voice":
-    1 "contact" BOOL, 2 "identity" B, 3 "name" T, 4 "picture" T, 5 "voice" B, 6 "you" BOOL);
+    1 "contact" BOOL, 2 "identity" B, 3 "name" T, 4 "picture" T, 5 "voice" B, 6 "you" BOOL,
+    7 "camera" BOOL);
 rec!(WEIGH "weight":
     1 "aead" U, 2 "ciphertext" U, 3 "fields" U, 4 "header" U, 5 "ops" [WEIGHED_OP],
     6 "sealed" U, 7 "signature" U, 8 "wraps" U);
@@ -805,4 +806,5 @@ pub static FRAMES: &[Request] = &[
     req!(4 "level" (1 "level" U, 3 "from" B) -> ()),
     req!(5 "asked" (1 "small" BOOL, 2 "large" BOOL) -> ()),
     req!(6 "key" (3 "from" B, 4 "size" U) -> ()),
+    req!(7 "camera" (1 "camera" BOOL) -> ()),
 ];

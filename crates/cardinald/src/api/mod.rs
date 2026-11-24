@@ -74,6 +74,9 @@ pub mod frame {
     /// A key picture of the size in key 4: from the window, asked of the
     /// sender in key 3; to it, asked of its own.
     pub const KEY: u64 = 6;
+    /// From the window: whether this person's camera is on, key 1
+    /// (`basics/video.md#cameras`).
+    pub const CAMERA: u64 = 7;
 }
 
 /// A reply's key 1 in an error: why, in words.
@@ -669,7 +672,8 @@ pub fn decode_event(msg: &[u8]) -> anyhow::Result<Option<Json>> {
 /// A `call-media` frame as a message: `{"audio": hex}` and in a group
 /// `from`, `{"frame": hex, "format": hex}` and in a group `size`,
 /// `{"width": n, "height": n}`, `{"level": n, "from": hex}`, `{"small": b,
-/// "large": b}`, or `{"from": hex, "size": n}` for a key picture.
+/// "large": b}`, `{"from": hex, "size": n}` for a key picture, or
+/// `{"camera": b}`.
 pub fn frame_message(frame: &Json) -> anyhow::Result<Vec<u8>> {
     let kind = if frame.get("frame").is_some() {
         "frame"
@@ -681,6 +685,8 @@ pub fn frame_message(frame: &Json) -> anyhow::Result<Vec<u8>> {
         "asked"
     } else if frame.get("size").is_some() {
         "key"
+    } else if frame.get("camera").is_some() {
+        "camera"
     } else {
         "audio"
     };
