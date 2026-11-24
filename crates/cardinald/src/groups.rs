@@ -1421,6 +1421,15 @@ pub fn set_member(
     Ok(json!({}))
 }
 
+/// That this person may write in a group they are in, by its id, and its
+/// members are being reached: before files are put in its folder.
+pub(crate) fn ready_to_write(d: &Daemon, id: &SpaceId) -> anyhow::Result<()> {
+    let g = joined(d, &hex::encode(id))?;
+    may_write_in(d, &g)?;
+    use_members(d, &g.id);
+    Ok(())
+}
+
 /// A group this person is in, by id or name, with its name: for a call.
 pub(crate) fn joined_group(d: &Daemon, group: &str) -> anyhow::Result<(SpaceId, String)> {
     let g = joined(d, group)?;

@@ -710,7 +710,9 @@ async fn handle(d: &Arc<Daemon>, req: &Value) -> anyhow::Result<Value> {
                 })
                 .unwrap_or_default();
             let text = req.get("text").and_then(|v| v.as_str());
-            crate::onefolder::share(d, arg(req, "who")?, &paths, text).await
+            let who = req.get("who").and_then(|v| v.as_str());
+            let group = req.get("group").and_then(|v| v.as_str());
+            crate::onefolder::share(d, who, group, &paths, text).await
         }
         "messages" => crate::contacts::messages(
             d,

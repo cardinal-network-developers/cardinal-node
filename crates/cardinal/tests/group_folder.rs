@@ -294,3 +294,111 @@ fn each_group_has_its_folder_in_groups() {
         names(&bo, "") == ["People"]
     });
 }
+
+/// The texts of a group's conversation here, oldest first.
+fn texts(d: &Dev, group: &str) -> Vec<String> {
+    let r = reply(d, &json!({"cmd": "messages", "group": group}));
+    let all = r["messages"].as_array().cloned().unwrap_or_default();
+    all.iter()
+        .map(|m| m["text"].as_str().unwrap_or("").to_owned())
+        .collect()
+}
+
+#[test]
+fn files_are_shared_with_a_group() {
+    let root = tempfile::tempdir().unwrap();
+    let ana = person(root.path(), "ana");
+    let bo = person(root.path(), "bo");
+    meet(&ana, &bo, "Bo");
+    let mut ids = Vec::new();
+    // Trip, and a group called Bo, as Ana's contact is
+    for name in ["Trip", "Bo"] {
+        let made = ask(
+            &ana,
+            json!({"cmd": "group-create", "name": name, "people": ["Bo"]}),
+        );
+        let g = made["group"].as_str().unwrap().to_owned();
+        wait("bo is offered it", 30, || offered(&bo, name));
+        ask(&bo, json!({"cmd": "group-join", "group": g}));
+        ids.push(g);
+    }
+    let (trip, bo_group) = (ids[0].clone(), ids[1].clone());
+    std::fs::write(root.path().join("plans.txt"), "tent").unwrap();
+    std::fs::write(root.path().join("map.txt"), "north").unwrap();
+    for f in ["plans.txt", "map.txt"] {
+        ask(
+            &ana,
+            json!({"cmd": "put", "from": root.path().join(f), "to": ""}),
+        );
+    }
+
+    // By the group's name: in its folder, and nothing said.
+    let r = ask(
+        &ana,
+        json!({"cmd": "share", "who": "Trip", "paths": ["plans.txt"]}),
+    );
+    assert_eq!(r["path"], "Groups/Trip");
+    assert_eq!(r["message"], false);
+    wait("in bo's folder for the group", 30, || {
+        names(&bo, "Groups/Trip") == ["plans.txt"]
+    });
+    assert!(texts(&bo, &trip).is_empty(), "{:?}", texts(&bo, &trip));
+    assert_eq!(saved(&bo, root.path(), "Groups/Trip/plans.txt"), b"tent");
+    // With a word: a message in the group's conversation carries it.
+    ask(
+        &ana,
+        json!({"cmd": "share", "group": trip, "paths": ["map.txt"], "text": "the way"}),
+    );
+    wait("the message reaches bo", 30, || {
+        texts(&bo, &trip) == ["the way"]
+    });
+    let m = ask(&bo, json!({"cmd": "messages", "group": trip}))["messages"][0].clone();
+    assert_eq!(m["attachments"][0]["name"], "map.txt", "{m}");
+    wait("and the folder", 30, || {
+        names(&bo, "Groups/Trip") == ["map.txt", "plans.txt"]
+    });
+
+    // Bo is a contact and a group: which is meant is Ana's to say.
+    let no = refused(
+        &ana,
+        json!({"cmd": "share", "who": "Bo", "paths": ["map.txt"]}),
+    );
+    assert!(no.contains("both a contact and a group"), "{no}");
+    let no = refused(
+        &ana,
+        json!({"cmd": "share", "who": "Bo", "group": "Bo", "paths": ["map.txt"]}),
+    );
+    assert!(no.contains("not both"), "{no}");
+    let r = ask(
+        &ana,
+        json!({"cmd": "share", "group": "Bo", "paths": ["map.txt"]}),
+    );
+    assert_eq!(r["path"], "Groups/Bo");
+    let contacts = ask(&ana, json!({"cmd": "contacts"}));
+    let id = contacts["contacts"][0]["identity"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let r = ask(
+        &ana,
+        json!({"cmd": "share", "who": id, "paths": ["plans.txt"]}),
+    );
+    assert_eq!(r["path"], "People/Bo");
+    wait("each where it was meant", 30, || {
+        names(&bo, "Groups/Bo") == ["map.txt"] && names(&bo, "People/Ana") == ["plans.txt"]
+    });
+
+    // The command line does the same.
+    let out = ana.cli(&["share", "--group", "Bo", "plans.txt", "--message", "both"]);
+    assert!(out.contains("Groups/Bo"), "{out}");
+    wait("the message in group Bo", 30, || {
+        texts(&bo, &bo_group) == ["both"]
+    });
+    std::fs::write(root.path().join("list.txt"), "eggs").unwrap();
+    ask(
+        &ana,
+        json!({"cmd": "put", "from": root.path().join("list.txt"), "to": ""}),
+    );
+    let out = ana.cli(&["share", "Trip", "list.txt"]);
+    assert!(out.contains("Groups/Trip"), "{out}");
+}

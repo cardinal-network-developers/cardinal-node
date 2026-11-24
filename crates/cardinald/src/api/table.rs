@@ -617,7 +617,7 @@ pub static REQUESTS: &[Request] = &[
     req!(125 "put" (1 "from" T, 2 "to" T) -> (2 "path" T)),
     req!(126 "save" (1 "path" T, 2 "to" T) -> (2 "path" T, 3 "size" U)),
     req!(127 "write" (1 "from" T, 2 "path" T) -> (2 "path" T)),
-    req!(128 "share" (1 "who" REF, 2 "paths" [T], 3 "text" T) -> (2 "message" BOOL, 3 "path" T)),
+    req!(128 "share" (1 "who" REF, 2 "paths" [T], 3 "text" T, 4 "group" REF) -> (2 "message" BOOL, 3 "path" T)),
     req!(129 "mount" (1 "path" T) -> (2 "path" T)),
     req!(130 "unmount" () -> ()),
     req!(131 "flush" () -> (2 "entries" U)),

@@ -240,15 +240,19 @@ enum Cmd {
         path: Option<String>,
     },
     /// Put files of your Cardinal folder in the folder you share with
-    /// someone. With --message they go in a message too; without, the
-    /// conversation shows nothing.
+    /// someone, or with a group. With --message they go in a message too;
+    /// without, the conversation shows nothing.
     Share {
-        /// Who, as `cardinal contacts` shows.
-        who: String,
-        /// What, as `cardinal files` shows it, such as `Photos/beach.jpg`.
-        #[arg(required = true)]
-        paths: Vec<String>,
-        /// A message to send them with it.
+        /// Who, as `cardinal contacts` shows, or a group, as `cardinal
+        /// groups` shows, then what, as `cardinal files` shows it, such as
+        /// `Photos/beach.jpg`. With --group, all of them are what.
+        #[arg(required = true, value_name = "WHO PATHS")]
+        items: Vec<String>,
+        /// The group to share with, by name or id: needed where a contact
+        /// has the same name.
+        #[arg(long)]
+        group: Option<String>,
+        /// A message to send with it, in the conversation.
         #[arg(long)]
         message: Option<String>,
     },
@@ -3280,11 +3284,20 @@ async fn client(cmd: Cmd) -> anyhow::Result<()> {
             Ok(())
         }
         Cmd::Share {
-            who,
-            paths: what,
+            mut items,
+            group,
             message,
         } => {
-            let req = json!({"cmd": "share", "who": who, "paths": what, "text": message});
+            let who = match group {
+                Some(_) => None,
+                None => Some(items.remove(0)),
+            };
+            if items.is_empty() {
+                anyhow::bail!("name something to share");
+            }
+            let req = json!({
+                "cmd": "share", "who": who, "group": group, "paths": items, "text": message,
+            });
             let v = call(&paths, req).await?;
             println!(
                 "In {}{}.",

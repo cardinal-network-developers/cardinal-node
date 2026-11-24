@@ -1142,22 +1142,46 @@ pub async fn save(d: &Arc<Daemon>, path: &str, to: &str) -> anyhow::Result<Json>
     Ok(json!({"path": to, "size": size}))
 }
 
-/// Puts files of the one folder in the folder shared with `who`. With
-/// `text`, they go in a message too, whose entry creates them in the folder
-/// (`profiles.md#shared-folder`); folders are only put in the folder.
+/// Puts files of the one folder in the folder shared with `who`, a contact
+/// or a group, or with `group`. With `text`, they go in a message too, in
+/// that relationship's or that group's conversation, whose entry creates
+/// them in the folder (`profiles.md#shared-folder`); folders are only put
+/// in the folder. A name that is both a contact's and a group's is refused:
+/// which is meant is the person's to say, by `group` or an id.
 pub async fn share(
     d: &Arc<Daemon>,
-    who: &str,
+    who: Option<&str>,
+    group: Option<&str>,
     paths: &[String],
     text: Option<&str>,
 ) -> anyhow::Result<Json> {
-    let contact = crate::contacts::listed(d, who)?;
+    let space = match (who, group) {
+        (Some(_), Some(_)) => anyhow::bail!("share with a contact or a group, not both"),
+        (None, None) => anyhow::bail!("name whom to share with: a contact or a group"),
+        (None, Some(g)) => crate::groups::joined_group(d, g)?.0,
+        (Some(w), None) => {
+            let contact = crate::contacts::find(d, w);
+            let in_group = crate::groups::joined_group(d, w);
+            match (contact, in_group) {
+                (Ok(_), Ok(_)) => anyhow::bail!(
+                    "{w} is both a contact and a group: say which, with --group for the \
+                     group, or by the contact's id"
+                ),
+                (Ok(_), Err(_)) => crate::contacts::listed(d, w)?.space,
+                (Err(_), Ok((g, _))) => g,
+                (Err(e), Err(_)) => return Err(e),
+            }
+        }
+    };
     let shown = relationships(d)
         .into_iter()
-        .find(|s| s.contact().is_some_and(|c| c.identity == contact.identity))
-        .ok_or_else(|| anyhow::anyhow!("{who} is not listed"))?;
+        .find(|s| s.space == space)
+        .ok_or_else(|| anyhow::anyhow!("that folder is not listed"))?;
+    if let Some(g) = shown.group() {
+        crate::groups::ready_to_write(d, &g)?;
+    }
     let dst = At {
-        space: contact.space,
+        space,
         node: ROOT,
         version: None,
         kind: FileKind::Folder,
@@ -1180,7 +1204,7 @@ pub async fn share(
         return Ok(json!({"path": shown.path(), "message": false}));
     };
     // The files of a message are blobs, whatever their size.
-    let secret = secret(d, &contact.space)?;
+    let secret = secret(d, &space)?;
     let mut attachments = Vec::new();
     for (p, at) in &sources {
         let name = parts(p).last().map(|n| n.to_string()).unwrap_or_default();
@@ -1214,7 +1238,7 @@ pub async fn share(
     }
     let conversation = {
         let core = d.core();
-        relationship::conversation(open(&core, &contact.space)?)
+        relationship::conversation(open(&core, &space)?)
     };
     let conversation = conversation.ok_or_else(|| anyhow::anyhow!("that space is not open yet"))?;
     let mut ops = vec![relationship::create_with(
@@ -1224,6 +1248,6 @@ pub async fn share(
         &attachments,
     )];
     ops.extend(relationship::shared_files(&attachments, Some(now_ms())));
-    d.write_and_push(&contact.space, ops)?;
+    d.write_and_push(&space, ops)?;
     Ok(json!({"path": shown.path(), "message": true}))
 }
