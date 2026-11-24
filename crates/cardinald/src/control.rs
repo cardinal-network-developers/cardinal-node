@@ -1339,6 +1339,9 @@ fn status(d: &Arc<Daemon>) -> Value {
         "listen": d.endpoint.tcp_addr().map(|a| a.to_string()),
         "devices": devices(d),
         "hosts": crate::host::sheet(d).ok().and_then(|v| v["hosts"].as_array().map(Vec::len)),
+        // the person's devices with a mailbox, reachable from outside: an
+        // explicit host, or one that names itself (D72)
+        "always_on": always_on(d),
         "spaces": spaces,
         "files_ready": files.is_some(),
         // whether this device may be inspected now, and until when
@@ -1956,6 +1959,25 @@ fn answer_in(req: &Value, key: &str) -> anyhow::Result<Option<bool>> {
         Some(Value::Bool(yes)) => Ok(Some(*yes)),
         Some(other) => anyhow::bail!("`{key}` is true or false, not {other}"),
     }
+}
+
+/// For `status`: the names of the person's devices that keep mail, reached
+/// from outside, as [`mailboxes`](crate::core::Core::mailboxes) has them.
+fn always_on(d: &Daemon) -> Vec<String> {
+    let keys: Vec<[u8; 32]> = d
+        .core()
+        .mailboxes()
+        .into_iter()
+        .filter(|(g, _)| {
+            g.endpoints
+                .iter()
+                .any(cardinal_space::grant::Endpoint::usable)
+        })
+        .map(|(_, k)| k)
+        .collect();
+    let mut names: Vec<String> = keys.iter().map(|k| d.device_name(k)).collect();
+    names.dedup();
+    names
 }
 
 #[cfg(test)]

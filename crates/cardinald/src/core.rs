@@ -1494,18 +1494,25 @@ impl Core {
     }
 
     /// This person's hosts with a mailbox: each grant and the device serving
-    /// it.
+    /// it. The grant is what says so: an explicit host's where its device
+    /// node says it is a host, and one a device of the person's made by
+    /// naming itself (D72) whatever its device node says, since only that
+    /// device writes or takes away its grant. Everything that asks whether
+    /// a device of the person's has a mailbox (`status`, `hosting`, the
+    /// reach nodes) asks this.
     pub fn mailboxes(&self) -> Vec<(cardinal_space::grant::Grant, KeyId)> {
         let Some(space) = self.account().and_then(|a| a.space.as_ref()) else {
             return Vec::new();
         };
         let devices = cardinal_space::account::devices(space.state());
         let hosting = |key: &KeyId| devices.iter().any(|d| d.key == *key && d.is_host);
+        let device = |key: &KeyId| devices.iter().any(|d| d.key == *key);
         cardinal_space::account::hosts(space.state())
             .iter()
             .filter_map(|h| cardinal_space::grant::Grant::open(&h.grant))
             .filter(|(g, signer)| {
-                g.services.contains(&cardinal_space::grant::MAILBOX) && hosting(signer)
+                g.services.contains(&cardinal_space::grant::MAILBOX)
+                    && (hosting(signer) || (crate::outside::is_self_named(g) && device(signer)))
             })
             .collect()
     }

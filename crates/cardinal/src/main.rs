@@ -1495,9 +1495,14 @@ fn print_router(router: &Value) {
             router["protocol"].as_str().unwrap_or("")
         );
     } else if let Some(why) = router["error"].as_str() {
-        println!(
-            "Router: gives no port: {why}. A forward set up by hand, or a host, does instead."
-        );
+        // a no in plain words says what to do already
+        if why.contains("by hand") || why.contains("is forwarded to") {
+            println!("Router: gives no port: {why}.");
+        } else {
+            println!(
+                "Router: gives no port: {why}. A forward set up by hand, or a host, does instead."
+            );
+        }
     }
     let named: Vec<&str> = router["named"]
         .as_array()
@@ -2278,7 +2283,20 @@ fn print_status(v: &Value) {
             "everything (full)"
         }
     );
-    if v["hosts"].as_u64() == Some(0) {
+    let always_on: Vec<&str> = v["always_on"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .collect();
+    if v["hosts"].as_u64() == Some(0) && !always_on.is_empty() {
+        println!(
+            "Always-on device: {}, reachable from outside, keeping your mail; not a restore",
+            always_on.join(", ")
+        );
+        println!("  point, so your words alone could not bring your files back if every device");
+        println!("  were lost (`cardinal host` on it makes it one)");
+    } else if v["hosts"].as_u64() == Some(0) {
         println!("Always-on device: none yet, so your words alone could not bring your");
         println!("  files back if every device were lost (`cardinal host` on one that stays on)");
     }

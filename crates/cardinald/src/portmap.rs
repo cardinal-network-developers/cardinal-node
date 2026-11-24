@@ -296,26 +296,37 @@ pub async fn map(
     let request = pcp_request(client, port, outside, lifetime, nonce);
     match ask(&sock, &request, |b| pcp_answer(b, port, nonce)).await {
         Some(Answer::Mapped(m)) => return Ok(m),
-        Some(Answer::Refused(code)) => {
-            return Err(format!("the router said no (PCP result {code})"))
-        }
+        Some(Answer::Refused(code)) => return Err(refused("PCP", code.into())),
         Some(Answer::TryNatPmp) | None => {}
     }
     let Some(address) = ask(&sock, &natpmp_address_request(), natpmp_address).await else {
         return upnp(gateway, client, port, outside, lifetime, held).await;
     };
-    let address = address.map_err(|c| format!("the router said no (NAT-PMP result {c})"))?;
+    let address = address.map_err(|c| refused("NAT-PMP", c))?;
     let request = natpmp_map_request(port, outside, lifetime);
     let mapped = ask(&sock, &request, |b| natpmp_mapped(b, port)).await;
     let (external, lifetime) = mapped
         .ok_or("the router gave its address but no port")?
-        .map_err(|c| format!("the router said no (NAT-PMP result {c})"))?;
+        .map_err(|c| refused("NAT-PMP", c))?;
     Ok(Mapping {
         protocol: Protocol::NatPmp,
         external: SocketAddr::new(IpAddr::V4(address), external),
         internal_port: port,
         lifetime,
     })
+}
+
+/// What a router's no says, in plain words: result 2, in PCP
+/// (NOT_AUTHORIZED) as in NAT-PMP (not authorized or refused), is a router
+/// that lets no application open a port.
+pub const NOT_AUTHORIZED: &str = "your router doesn't let apps open ports: set up a forward by \
+     hand, or turn on PCP/UPnP in the router";
+
+fn refused(protocol: &str, code: u16) -> String {
+    match code {
+        2 => NOT_AUTHORIZED.to_owned(),
+        _ => format!("the router said no ({protocol} result {code})"),
+    }
 }
 
 /// UPnP, last: finding the router by SSDP goes to the whole network, so
@@ -456,6 +467,12 @@ fn reached_there(d: &Daemon, at: SocketAddr) -> Option<String> {
     Some(d.device_name(&found))
 }
 
+/// What `status` says where the only port the router gives leads to
+/// another of the person's devices.
+pub fn forwarded_elsewhere(port: u16, who: &str) -> String {
+    format!("port {port} is forwarded to {who}; this device gets none")
+}
+
 /// Where to ask for a port outside other than the one the router gave:
 /// the same each time for a device and port, so a renewal asks for it.
 fn another_port(nonce: [u8; 12]) -> u16 {
@@ -545,10 +562,7 @@ async fn ask_mine(
         None => Some(Ok(m)),
         Some(who) => {
             release(&m, nonce).await;
-            Some(Err(format!(
-                "the router gives {}, where your {who} is reached, and no other port",
-                m.external
-            )))
+            Some(Err(forwarded_elsewhere(m.external.port(), &who)))
         }
     }
 }

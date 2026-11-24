@@ -281,14 +281,28 @@ pub fn tick(d: &Arc<Daemon>) {
         return;
     }
     let on = crate::networks::routers_on(d);
-    let have = crate::portmap::external(d);
     let all = d.outside.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    let have = crate::portmap::external(d).or_else(|| still_reached(d, &all.named));
     let was = all.named.clone();
     let (out, _) = next(&all, on, have, now(), hold());
     let list = out.named.clone();
     // What the grant gives is what decides: a crash between the two
     // writes, or a grant another version wrote, is put right here.
     let given = own_self_grant(d).map(|g| g.endpoints).unwrap_or_default();
+    // An explicit host's grant, from a run that was one, is not this one's.
+    let explicit = crate::host::own_grant(d).is_some_and(|g| !is_self_named(&g));
+    if endpoints(&list) == given && !explicit {
+        // Its device node says it is a host while it names itself, and not
+        // once it no longer does: put right here too, as when the node
+        // came after the grant.
+        let account = d.core().account().map(|a| a.id);
+        let flags = flag_ops(d, !list.is_empty()).unwrap_or_default();
+        if let (Some(space), false) = (account, flags.is_empty()) {
+            if let Err(e) = d.write_and_push(&space, flags) {
+                tracing::warn!("cannot say this device is a host: {e:#}");
+            }
+        }
+    }
     if endpoints(&list) != given {
         if let Err(e) = write_grant(d, &list) {
             tracing::warn!("cannot name this device as a host: {e:#}");
@@ -332,11 +346,7 @@ fn write_grant(d: &Arc<Daemon>, named: &[Named]) -> anyhow::Result<()> {
                 ops.push(SpaceOp::delete(h.node));
             }
         }
-        if let Some(n) = account::devices(st).into_iter().find(|n| n.key == me) {
-            if n.is_host == named.is_empty() {
-                ops.push(account::set_field(n.node, 4, !named.is_empty()));
-            }
-        }
+        ops.extend(host_flags(st, &me, !named.is_empty()));
         (acc.id, ops)
     };
     if !named.is_empty() {
@@ -371,6 +381,42 @@ fn write_grant(d: &Arc<Daemon>, named: &[Named]) -> anyhow::Result<()> {
     // its entry follows.
     crate::mailbox::keep_own_entry(d);
     Ok(())
+}
+
+/// The ops that make every device node of `me` say it is a host, or not:
+/// none where they all say so already.
+fn host_flags(st: &cardinal_space::State, me: &[u8; 32], host: bool) -> Vec<SpaceOp> {
+    account::devices(st)
+        .into_iter()
+        .filter(|n| n.key == *me && n.is_host != host)
+        .map(|n| account::set_field(n.node, 4, host))
+        .collect()
+}
+
+/// [`host_flags`] in the account space as this device holds it, if it
+/// holds it.
+fn flag_ops(d: &Daemon, host: bool) -> Option<Vec<SpaceOp>> {
+    let core = d.core();
+    let st = core.account()?.space.as_ref()?.state();
+    Some(host_flags(st, &d.keys.key(), host))
+}
+
+/// Where the router gives no port, as when it refuses (PCP result 2) a
+/// port forwarded to this device by hand: the address it names that has
+/// its own port, while someone is in a session with it that came in from
+/// outside, not through a host. That is its address all the same, and
+/// stays named; with nobody coming in from outside it lapses a month on,
+/// as any does.
+fn still_reached(d: &Daemon, named: &[Named]) -> Option<SocketAddr> {
+    let port = d.endpoint.udp_addr()?.port();
+    let at = named.iter().find(|n| n.addr.port() == port)?.addr;
+    let from_outside = d.endpoint.sessions().iter().any(|s| {
+        !s.is_closed()
+            && s.role() == cardinal_link::Role::Responder
+            && !s.is_relayed()
+            && s.remote_addr().is_some_and(|a| is_outside(a.ip()))
+    });
+    from_outside.then_some(at)
 }
 
 /// For `status`: what this device names itself at.

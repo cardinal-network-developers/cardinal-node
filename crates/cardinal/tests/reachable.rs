@@ -21,6 +21,14 @@ type Asked = Arc<Mutex<Vec<(u16, u32)>>>;
 /// A PCP router that gives 203.0.113.5 with the port outside asked for,
 /// and forgets a mapping given back (lifetime 0).
 fn router() -> (u16, Asked) {
+    router_with(None, false)
+}
+
+/// A stand-in router as [`router`], that gives only the port outside
+/// `fixed`, if named, as when a forward set up by hand holds every other,
+/// or says no to everything with PCP result 2 (NOT_AUTHORIZED), as the
+/// home pfSense did to the NUC whose port it forwards by hand.
+fn router_with(fixed: Option<u16>, refuse: bool) -> (u16, Asked) {
     let sock = UdpSocket::bind("127.0.0.1:0").unwrap();
     let port = sock.local_addr().unwrap().port();
     let asked: Asked = Default::default();
@@ -40,12 +48,13 @@ fn router() -> (u16, Asked) {
             log.lock()
                 .unwrap()
                 .push((u16::from_be_bytes(wanted), lifetime));
+            let wanted = fixed.map_or(wanted, u16::to_be_bytes);
             let outside = if lifetime == 0 {
                 held.remove(&internal).unwrap_or(wanted)
             } else {
                 *held.entry(internal).or_insert(wanted)
             };
-            let mut r = vec![2, 0x81, 0, 0];
+            let mut r = vec![2, 0x81, 0, if refuse { 2 } else { 0 }];
             r.extend(lifetime.min(3600).to_be_bytes());
             r.extend([0; 16]);
             r.extend(&b[24..36]); // nonce
@@ -155,6 +164,29 @@ fn a_device_the_router_gives_a_port_names_itself_to_a_trusted_contact() {
     );
     // No restore comes from it: it is not on the recovery sheet.
     assert_eq!(a.status()["hosts"], 0);
+    // It is the always-on device all the same, keeping mail, as `status`
+    // and `hosting` both say.
+    wait("status counts it", 20, || {
+        a.status()["always_on"] == json!(["ana"])
+    });
+    let said = a.cli(&["status"]);
+    assert!(
+        said.contains("Always-on device: ana, reachable from outside"),
+        "{said}"
+    );
+    assert!(!said.contains("none yet"), "{said}");
+    let h = ask(&a, json!({"cmd": "hosting"}));
+    let own = h["devices"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find(|d| d["name"] == "ana")
+        .cloned();
+    assert_eq!(
+        own.as_ref().map(|d| d["outside"].clone()),
+        Some(json!(true)),
+        "{h}"
+    );
 
     let mut b = Dev::new(root.path(), "bo", free_port());
     start_here(&mut b);
@@ -186,6 +218,18 @@ fn a_device_the_router_gives_a_port_names_itself_to_a_trusted_contact() {
     let r = &a.status()["router"];
     assert_eq!(r["on"], false, "{r}");
     assert_eq!(r["named"], json!([]), "{r}");
+    // and drops back: no longer the always-on device, nor keeping mail
+    assert_eq!(a.status()["always_on"], json!([]));
+    assert!(a.cli(&["status"]).contains("Always-on device: none yet"));
+    let h = ask(&a, json!({"cmd": "hosting"}));
+    assert!(
+        h["devices"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .all(|d| d["outside"] != true),
+        "{h}"
+    );
     // The port is given back at the loop's next look, within a second.
     wait("the port is given back", 10, || {
         a.status()["router"]["external"].is_null()
@@ -337,6 +381,79 @@ fn the_router_switch_set_on_one_device_holds_on_another() {
     desk.cli(&["router", "on"]);
     wait("the laptop asks again", 60, || given(&laptop));
     for d in [&mut desk, &mut laptop] {
+        let _ = d.try_cli(&["stop"]);
+        if let Some(mut c) = d.child.take() {
+            let _ = c.wait();
+        }
+    }
+}
+
+/// A router that lets no application open a port says so in plain words.
+#[test]
+fn a_router_that_lets_no_app_open_ports_is_said_so_plainly() {
+    let root = tempfile::tempdir().unwrap();
+    let (at, _) = router_with(None, true);
+    let mut a = Dev::new(root.path(), "ana", free_port());
+    start_behind(&mut a, at);
+    a.cli(&["init", "--yes", "--name", "Ana"]);
+    mine(&a);
+    let plain = "your router doesn't let apps open ports: set up a forward by hand, \
+                 or turn on PCP/UPnP in the router";
+    wait("the router's no", 20, || {
+        a.status()["router"]["error"] == plain
+    });
+    let said = a.cli(&["status"]);
+    assert!(
+        said.contains(&format!("Router: gives no port: {plain}.")),
+        "{said}"
+    );
+    assert!(!said.contains("PCP result"), "{said}");
+    assert_eq!(a.status()["router"]["named"], json!([]));
+    let _ = a.try_cli(&["stop"]);
+    if let Some(mut c) = a.child.take() {
+        let _ = c.wait();
+    }
+}
+
+/// A router whose only port is forwarded by hand to another of the
+/// person's devices: this one gets none, and `status` says where it goes.
+#[test]
+fn a_port_forwarded_to_another_device_is_said_so_plainly() {
+    if !fuse_available() {
+        eprintln!("skipped: no FUSE");
+        return;
+    }
+    let root = tempfile::tempdir().unwrap();
+    let mut host = Dev::new(root.path(), "host", free_port());
+    host.start();
+    host.cli(&["init", "--yes", "--name", "Ana"]);
+    let mut laptop = Dev::new(root.path(), "laptop", free_port());
+    let forwarded = free_port();
+    let (at, _) = router_with(Some(forwarded), false);
+    let forward = format!("203.0.113.5:{forwarded}");
+    host.cli(&[
+        "host",
+        "--address",
+        &format!("127.0.0.1:{}", host.port),
+        "--address",
+        &forward,
+    ]);
+    laptop.start();
+    pair(&host, &laptop);
+    wait("the laptop knows the host's grant", 30, || {
+        laptop.cli(&["recovery", "sheet"]).contains(&forward)
+    });
+    laptop.stop();
+    start_behind(&mut laptop, at);
+    mine(&laptop);
+    let want = format!("port {forwarded} is forwarded to host; this device gets none");
+    wait("the router's answer", 30, || {
+        laptop.status()["router"]["error"] == want.as_str()
+    });
+    assert!(laptop.status()["router"]["external"].is_null());
+    let said = laptop.cli(&["status"]);
+    assert!(said.contains(&want), "{said}");
+    for d in [&mut host, &mut laptop] {
         let _ = d.try_cli(&["stop"]);
         if let Some(mut c) = d.child.take() {
             let _ = c.wait();

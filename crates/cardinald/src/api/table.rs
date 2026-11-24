@@ -506,7 +506,7 @@ pub static REQUESTS: &[Request] = &[
         25 "pairing" {PAIRING}, 26 "peers" [T], 27 "pending_changes" BOOL,
         28 "progress" {PROGRESS}, 29 "read_markers" BOOL, 30 "removed" BOOL, 31 "retention" T,
         32 "router" {ROUTER}, 33 "spaces" [SPACE], 34 "uptime_s" U, 35 "more" BOOL,
-        36 "next" U, 37 "redial" {REDIAL})),
+        36 "next" U, 37 "redial" {REDIAL}, 38 "always_on" [T])),
     req!(3 "watch" (1 "window" BOOL) -> ()),
     req!(4 "stop" () -> ()),
     req!(5 "reload" () -> ()),
