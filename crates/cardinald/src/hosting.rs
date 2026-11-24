@@ -901,7 +901,7 @@ async fn keep_as_hosted(d: &Arc<Daemon>) {
         };
         if collect_now {
             tracing::debug!("collecting at {}'s device", short(&h.who));
-            let ok = match mailbox::collect_at(d, &s).await {
+            let ok = match mailbox::collect_at(d, &s, &short(&h.who)).await {
                 Ok((n, held_back)) => {
                     if n > 0 {
                         tracing::info!("took in {n} envelopes left with {}", short(&h.who));

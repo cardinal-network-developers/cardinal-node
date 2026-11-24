@@ -1857,8 +1857,15 @@ async fn collect(d: &Arc<Daemon>) {
 /// at a host of their own, and the host is told how far everything is
 /// taken. One that cannot be taken in yet holds back the acknowledgment of
 /// those after it, which are fetched again and taken in again, at no harm.
-/// Gives how many were taken in, and whether any is held back so.
-pub(crate) async fn collect_at(d: &Arc<Daemon>, s: &Session) -> anyhow::Result<(usize, bool)> {
+/// Gives how many were taken in, and whether any is held back so. What
+/// waits is said in the log, as left with `host`, before any is taken in:
+/// what an envelope carries is shown as soon as it is in, and the log says
+/// where it came from by then.
+pub(crate) async fn collect_at(
+    d: &Arc<Daemon>,
+    s: &Session,
+    host: &str,
+) -> anyhow::Result<(usize, bool)> {
     let mut after = 0;
     let mut acked = None;
     let mut blocked = false;
@@ -1872,6 +1879,9 @@ pub(crate) async fn collect_at(d: &Arc<Daemon>, s: &Session) -> anyhow::Result<(
             "the host did not let this device fetch"
         );
         let list = reply.record_list(1).unwrap_or_default();
+        if asked == 0 && !list.is_empty() {
+            tracing::info!("taking in envelopes left with {host}");
+        }
         for r in &list {
             let sequence = r.get(1).and_then(Value::as_uint);
             let token = read_token(r.get(2));
