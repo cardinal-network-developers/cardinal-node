@@ -1186,6 +1186,14 @@ fn origin_of(d: &Daemon) -> Voice {
     mesh::voice_of(&d.keys.key())
 }
 
+/// Whether a group call has people on it, as a ring is answered: two heard
+/// lately, its own person among them; or its own person and a device that
+/// linked to it as one whose person is on it, which counts before its
+/// first frame comes.
+fn has_people(g: &Group, now: Instant) -> bool {
+    g.tree.on_it(now) >= 2 || g.tree.own().is_some() && !g.waiting && g.tree.any_person()
+}
+
 /// Whether someone is on a group call, as far as this device can tell: its
 /// own person, or anyone heard lately.
 fn someone_on(g: &Group, now: Instant) -> bool {
@@ -1644,7 +1652,7 @@ async fn group_signal(
                 .find(|(other, g)| {
                     g.space == space && **other != id && g.probe.is_none() && someone_on(g, now)
                 })
-                .map(|(other, g)| (*other, g.tree.on_it(now) >= 2));
+                .map(|(other, g)| (*other, has_people(g, now)));
             if let Some((going, busy)) = going {
                 let says = Signal {
                     kind: ONGOING,
@@ -1812,7 +1820,9 @@ async fn group_signal(
             // This person is calling while the group has a call with people
             // on it going on: this device links to it, and once it hears
             // someone on it other than the device that said so, joins it.
-            if sig.flag != Some(1) {
+            // One of this person's own devices on it says so whatever the
+            // count: the call is theirs already.
+            if sig.flag != Some(1) && !own_device {
                 return Ok(());
             }
             let calling = lock(d).as_ref().is_some_and(|c| {
@@ -1872,8 +1882,10 @@ async fn switch_to(d: Arc<Daemon>, id: [u8; 16]) {
         c.live_since = Some(Instant::now());
         (old, c.space)
     };
-    leave(&d, &old).await;
+    // Part of the new call before the old one is left, so that at no
+    // moment is it a call this device only carries.
     take_part(&d, id, space, false);
+    leave(&d, &old).await;
     d.bump();
     relink(&d, &id, &space, true).await;
 }
@@ -2077,11 +2089,11 @@ fn passed(d: &Arc<Daemon>, from: &Session, id: &[u8; 16], bytes: Bytes) {
             g.waiting = false;
         }
         // Someone other than the device that said this call was going on
-        // is on it: this person can join it.
+        // is on it: this person can join it. The probe stays until they
+        // take part: without it, and with nobody of its own on it yet, the
+        // call would look carried here, and a device that does not help
+        // others would leave it at its next tick.
         let confirmed = got.fresh && g.probe.is_some_and(|(_, sender)| sender != voice);
-        if confirmed {
-            g.probe = None;
-        }
         let label = channel_label(&g.space, id);
         let routing = routing_label(&g.space, id);
         (got, to, hear, went_live, confirmed, label, routing)
