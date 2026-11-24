@@ -1943,7 +1943,7 @@ pub async fn status(
     } else {
         "now and then at the last address that worked, and every 30 s once you message or call them"
     };
-    let v = json!({
+    let mut v = json!({
         "identity": hex::encode(&c.identity[..8]),
         "trusted": c.regard.trusted,
         "introductions": c.regard.introductions,
@@ -1965,7 +1965,14 @@ pub async fn status(
         "nearby_tries": trail.nearby.iter().map(step_json).collect::<Vec<_>>(),
         "router": crate::portmap::status(d),
     });
-    Ok(crate::names::with_shown(d, &c, v))
+    // Who they are, as everywhere, but not their picture: this reply is
+    // about reaching them and has no field for it.
+    let mut shown = crate::names::shown(d, &c);
+    shown.remove("picture");
+    if let Some(o) = v.as_object_mut() {
+        o.extend(shown);
+    }
+    Ok(v)
 }
 
 #[cfg(test)]

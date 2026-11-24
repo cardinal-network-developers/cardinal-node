@@ -308,6 +308,9 @@ fn contacts_hear_the_persons_name_and_keep_their_own() {
     assert_eq!(listed["picture"], json!(shown));
     let line = cy.cli(&["contacts"]);
     assert!(line.contains("picture"), "{line}");
+    // contact-status, which has no field for it, still answers.
+    let status = ask(&cy, json!({"cmd": "contact-status", "who": "Ana"}));
+    assert_eq!(status["name"], json!("Ana"), "{status}");
     // It reaches Cy's other device, as a file there.
     wait("the picture on Cy's other device", 60, || {
         contact(&cy2, &ana_id)
