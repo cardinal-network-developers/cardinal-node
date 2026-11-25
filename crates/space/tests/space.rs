@@ -1785,3 +1785,167 @@ fn a_guardians_node_names_each_commitment() {
         ([5; 32], &named[..], Some(7))
     );
 }
+
+/// `profiles.md#mapping-to-a-disk-guidance` (D90): of the nodes of one name
+/// in a folder, the one there longest keeps the name. A file brought back
+/// from deleted arrives at its `restore`, and one moved in at its `move`,
+/// so each gives way to what is there; and a successor, starting from the
+/// canonical state, shows them as the space it succeeds did.
+#[test]
+fn what_comes_back_gives_way_to_what_is_there() {
+    use cardinal_encoding::Value;
+    use cardinal_space::entry::{derived_id, Succession};
+    use cardinal_space::group::OWNER;
+    use cardinal_space::{EpochKey, NodeId, State};
+    use std::collections::HashMap;
+    let p = person(24, 0);
+    let d0 = &p.devices[0];
+    let (mut a, _) = Space::create(
+        Profile::FILES,
+        Policy::default(),
+        &p.log,
+        &d0.signing,
+        &[p.enc.public_key()],
+        Some(1),
+    )
+    .unwrap();
+    let write = |s: &mut Space, ops: Vec<SpaceOp>| -> NodeId {
+        let (e, _) = s.write_entry(&p.log, &d0.signing, ops, None).unwrap();
+        derived_id(&e, 0)
+    };
+    let shown = |s: &Space, dir: &NodeId| -> HashMap<String, NodeId> {
+        Files::new(s)
+            .list(dir)
+            .into_iter()
+            .map(|e| (e.name, e.node))
+            .collect()
+    };
+    let docs = write(&mut a, vec![files::create_folder(ROOT, "docs")]);
+    let older = write(
+        &mut a,
+        vec![files::create_file(
+            ROOT,
+            "a.txt",
+            &file(b"old"),
+            0o644,
+            None,
+        )],
+    );
+    let away = write(
+        &mut a,
+        vec![files::create_file(
+            docs,
+            "b.txt",
+            &file(b"away"),
+            0o644,
+            None,
+        )],
+    );
+    write(&mut a, vec![SpaceOp::delete(older)]);
+    let newer = write(
+        &mut a,
+        vec![files::create_file(
+            ROOT,
+            "a.txt",
+            &file(b"new"),
+            0o644,
+            None,
+        )],
+    );
+    let here = write(
+        &mut a,
+        vec![files::create_file(
+            ROOT,
+            "b.txt",
+            &file(b"here"),
+            0o644,
+            None,
+        )],
+    );
+    // Before: the one made first had the name, and the restore changes
+    // that: the file already there keeps it.
+    write(&mut a, vec![SpaceOp::restore(older)]);
+    // moved in, a file gives way too, though it was made first
+    write(&mut a, vec![SpaceOp::mv(away, ROOT, "b.txt")]);
+    let want: HashMap<String, NodeId> = [
+        ("a.txt", newer),
+        ("a (2).txt", older),
+        ("b.txt", here),
+        ("b (2).txt", away),
+        ("docs", docs),
+    ]
+    .into_iter()
+    .map(|(n, id)| (n.to_owned(), id))
+    .collect();
+    assert_eq!(shown(&a, &ROOT), want);
+    // a full recomputation gives the same
+    let full = State::compute(Profile::FILES, a.dag(), &a.validity().valid);
+    assert_eq!(full.canonical(), a.state().canonical());
+
+    // The canonical state says the order of arrival where it is not that
+    // of creation (field 12), and reads back the same.
+    let canonical = a.state().canonical();
+    let records: Vec<Value> = canonical.list(1).unwrap().to_vec();
+    let field = |id: &NodeId, key: u64| {
+        records
+            .iter()
+            .filter_map(Value::as_record)
+            .find(|r| r.get(1).and_then(Value::as_bytes) == Some(&id[..]))
+            .unwrap()
+            .get(key)
+            .and_then(Value::as_uint)
+    };
+    // made in the order docs, older, away, newer, here; arrived in the
+    // order docs, newer, here, older (restored), away (moved)
+    let order = |key| [docs, older, away, newer, here].map(|n| field(&n, key));
+    assert_eq!(order(10), [0, 1, 2, 3, 4].map(Some));
+    assert_eq!(order(12), [None, Some(3), Some(4), Some(1), Some(2)]);
+    let back = State::from_canonical(Profile::FILES, &canonical).unwrap();
+    assert_eq!(back.canonical(), canonical);
+
+    // An arrival given equal to the rank is malformed: it is left out.
+    let bad: Vec<Value> = records
+        .iter()
+        .map(|v| {
+            let r = v.as_record().unwrap();
+            match r.get(10).and_then(Value::as_uint) {
+                Some(rank) if r.get(1).and_then(Value::as_bytes) == Some(&docs[..]) => {
+                    Value::from(r.clone().with(12, rank))
+                }
+                _ => v.clone(),
+            }
+        })
+        .collect();
+    let bad = Record::new().with(0, 13u32).with(1, Value::list(bad));
+    assert!(State::from_canonical(Profile::FILES, &bad).is_err());
+
+    // The successor shows them as the space did.
+    let from = Succession {
+        succeeds: Some(a.id()),
+        initial_state: Some(Record::new().with(1, a.state().root_hash())),
+        cut: a.heads(),
+        ..Succession::default()
+    };
+    let (mut s, _) = Space::create_successor(
+        Profile::FILES,
+        Policy::default(),
+        &from,
+        EpochKey::generate(),
+        back,
+        &p.log,
+        &d0.signing,
+        &[p.enc.public_key()],
+        vec![SpaceOp::add_member(p.log.id(), OWNER)],
+        Some(2),
+    )
+    .unwrap();
+    s.set_identities([p.log.state()]);
+    assert_eq!(shown(&s, &ROOT), want);
+    // and what comes back there gives way to what was carried
+    write(&mut s, vec![SpaceOp::delete(newer)]);
+    write(&mut s, vec![SpaceOp::restore(newer)]);
+    let names = shown(&s, &ROOT);
+    assert_eq!(names["a.txt"], older);
+    assert_eq!(names["a (2).txt"], newer);
+    assert_eq!(names["b.txt"], here);
+}

@@ -96,6 +96,10 @@ pub struct Node {
     pub created: Option<u64>,
     /// The position of its `create` in that entry.
     created_op: u32,
+    /// When it arrived where it is (`state.md#canonical-state`, field 12):
+    /// the `create` or `move` that set its position, or the `restore` of
+    /// it that last brought it back from deleted, where that came later.
+    arrived: Arrived,
     /// The delete that set its deleted flag, if it is set.
     deleted_by: Option<Took>,
     /// The delete of it that yielded to concurrent work and flagged it a
@@ -109,6 +113,17 @@ pub struct Node {
 /// initial state carried deleted, the number that state gave the delete,
 /// which every node that one delete took shares
 /// (`state.md#canonical-state`, field 6).
+/// When a node arrived where it is, for the order of nodes of one name in
+/// one folder (`state.md#canonical-state`, field 12).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Arrived {
+    /// In the space's initial state, at this place in the order that state
+    /// gave: before every arrival in the space's own entries.
+    Carried(u64),
+    /// By the op at this place in this entry of the space.
+    At(EntryId, u32),
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 enum Took {
     Op(EntryId, u32),
@@ -128,6 +143,13 @@ impl Node {
     /// delete is in this space's log: on it, or on a node above it. `None`
     /// where it is not deleted, or where a successor's initial state
     /// carried it deleted.
+    /// When it arrived where it is: what orders the nodes of one name in
+    /// one folder, the one there longest first
+    /// (`profiles.md#mapping-to-a-disk-guidance`).
+    pub fn arrived(&self) -> Arrived {
+        self.arrived
+    }
+
     pub fn deleted_in(&self) -> Option<EntryId> {
         match self.deleted_by {
             Some(Took::Op(e, _)) if self.deleted => Some(e),
@@ -592,6 +614,13 @@ impl State {
             let writer = r.get(7).and_then(id32).ok_or(bad.clone())?;
             let creator = r.get(9).and_then(id32).ok_or(bad.clone())?;
             let rank = r.uint(10)?;
+            // where it arrived in the order of arrivals: left out where it
+            // is its rank, and so never given equal to it
+            let arrival = match r.opt_uint(12)? {
+                Some(a) if a == rank => return Err(bad),
+                Some(a) => a,
+                None => rank,
+            };
             // the delete that took it, if it is deleted; or, for a node a
             // delete conflict kept, the delete that yielded there, so that
             // a restore of it brings back what that delete took beneath it
@@ -633,6 +662,7 @@ impl State {
                     created_in: writer,
                     created: r.opt_uint(11)?,
                     created_op: 0,
+                    arrived: Arrived::Carried(arrival),
                     deleted_by: took.map(Took::Carried),
                     conflict_by: number.filter(|_| delete_conflict).map(Took::Carried),
                 },
@@ -1106,6 +1136,7 @@ impl State {
                             created_in: id,
                             created: e.time(),
                             created_op: i,
+                            arrived: Arrived::At(id, i),
                             deleted_by: None,
                             conflict_by: None,
                         },
@@ -1163,6 +1194,7 @@ impl State {
                     n.parent = *parent;
                     n.name = name.clone();
                     n.position_writer = id;
+                    n.arrived = Arrived::At(id, i);
                 }
                 SpaceOpBody::Delete { node, beside: true } => {
                     // deletes nothing, and flags the node as a delete that
@@ -1217,6 +1249,13 @@ impl State {
                     for m in self.subtree(node) {
                         if let Some(n) = self.nodes.get_mut(&m) {
                             if m == *node || (by.is_some() && n.deleted_by == by) {
+                                // brought back from deleted, the node it
+                                // names arrives anew, and gives way to what
+                                // is there; what comes back beneath it
+                                // keeps its order
+                                if m == *node && n.deleted {
+                                    n.arrived = Arrived::At(id, i);
+                                }
                                 n.deleted = false;
                                 n.delete_conflict = false;
                                 n.deleted_by = None;
@@ -1354,7 +1393,9 @@ impl State {
     /// its creating entry says it was made (field 11), so that a device
     /// starting from a canonical state can show them as they were made; and
     /// a deleted node's, the number of the delete that took it (field 6),
-    /// which every node that delete took shares.
+    /// which every node that delete took shares; and, where it is not its
+    /// rank, its place in the order the nodes arrived where they are
+    /// (field 12), which orders the nodes of one name in a folder.
     pub fn canonical(&self) -> Record {
         fn fields(fields: &BTreeMap<u64, Vec<FieldValue>>) -> Value {
             let set = fields.iter().filter(|(_, vs)| !vs.is_empty());
@@ -1383,6 +1424,19 @@ impl State {
             .collect();
         made.sort_unstable();
         let rank: HashMap<NodeId, u64> = made.iter().map(|(_, _, _, id)| *id).zip(0..).collect();
+        // Its arrival is its place in the order the nodes arrived where
+        // they are, as their ranks are of creation; it is left out where
+        // it is the rank.
+        let mut came: Vec<(usize, usize, u32, NodeId)> = self
+            .nodes
+            .values()
+            .map(|n| match n.arrived {
+                Arrived::Carried(r) => (0, r as usize, 0, n.id),
+                Arrived::At(e, i) => (1, at[&e], i, n.id),
+            })
+            .collect();
+        came.sort_unstable();
+        let arrival: HashMap<NodeId, u64> = came.iter().map(|(_, _, _, id)| *id).zip(0..).collect();
         // Each delete that took a node is numbered from 1, in the order the
         // records list the first node it took: so a restore in a successor
         // clears exactly the flags one delete set. A node that a delete
@@ -1418,7 +1472,8 @@ impl State {
                 .with(8, n.delete_conflict)
                 .with(9, n.creator)
                 .with(10, rank[id])
-                .with_opt(11, n.created);
+                .with_opt(11, n.created)
+                .with_opt(12, Some(arrival[id]).filter(|a| *a != rank[id]));
             records.push((*id, r));
         }
         for (id, f) in &self.reach {

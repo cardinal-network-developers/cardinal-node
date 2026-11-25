@@ -10,7 +10,7 @@ use cardinal_identity::{EntryId, KeyId};
 
 use crate::entry::{derived_id, IdentityId, NodeId, NodeKind, Profile, SpaceOp, SpaceOpBody};
 use crate::space::Space;
-use crate::state::{Node, ROOT};
+use crate::state::{Arrived, Node, ROOT};
 
 /// Folder kind.
 pub const FOLDER: u64 = 1;
@@ -410,7 +410,15 @@ impl<'a> Files<'a> {
             .filter(|n| !n.deleted)
             .filter(|n| self.kinds.file_kind(n.kind) != FileKind::Other)
             .collect();
-        kids.sort_by_key(|n| (n.name.clone(), dag.position(&n.created_in), n.id));
+        // Of each name, the node there longest keeps it, and the others
+        // give way: a `create`, a `move` or a `restore` from deleted is
+        // when a node arrives, and what an initial state carried came
+        // first, in the order it gave (`profiles.md#mapping-to-a-disk-guidance`).
+        let came = |n: &Node| match n.arrived() {
+            Arrived::Carried(r) => (0, r as usize, 0),
+            Arrived::At(e, i) => (1, dag.position(&e).unwrap_or(usize::MAX), i),
+        };
+        kids.sort_by_key(|n| (n.name.clone(), came(n), n.id));
         // The first node of each name keeps it; the others take the next
         // free `name (n)`, from n = their rank among those of that name.
         let mut taken: std::collections::HashSet<String> = std::collections::HashSet::new();

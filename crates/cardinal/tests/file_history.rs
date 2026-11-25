@@ -144,15 +144,15 @@ fn own_files_deleted_and_brought_back() {
     let no = refused(&ana, json!({"cmd": "undelete", "path": "Notes/a.txt"}));
     assert!(no.contains("nothing named a.txt"), "{no}");
 
-    // Back beside a new file of its name, the two are shown as the folder
-    // shows any two of one name: the one made first keeps it.
+    // Back beside a new file of its name, it gives way to the one there
+    // (D90): the new file keeps the name, though the other was made first.
     ask(&ana, json!({"cmd": "remove", "path": "Notes/a.txt"}));
     put(&ana, r, "Notes/a.txt", "newer");
     let v = ask(&ana, json!({"cmd": "undelete", "path": "Notes/a.txt"}));
-    assert_eq!(v["path"], "Notes/a.txt", "{v}");
+    assert_eq!(v["path"], "Notes/a (2).txt", "{v}");
     assert_eq!(names(&ana, "Notes"), ["a (2).txt", "a.txt"]);
-    assert_eq!(saved(&ana, r, "Notes/a.txt", None), "two");
-    assert_eq!(saved(&ana, r, "Notes/a (2).txt", None), "newer");
+    assert_eq!(saved(&ana, r, "Notes/a.txt", None), "newer");
+    assert_eq!(saved(&ana, r, "Notes/a (2).txt", None), "two");
 
     // Two deleted of one name: which is the person's to say, by id.
     ask(&ana, json!({"cmd": "remove", "path": "Notes/a (2).txt"}));
