@@ -1496,7 +1496,9 @@ fn keep(d: &Arc<Daemon>) {
             match running {
                 Some(h) => h,
                 None => {
-                    let port = load_recovered(&d).and_then(|r| r.handing).and_then(|h| h.port);
+                    let port = load_recovered(&d)
+                        .and_then(|r| r.handing)
+                        .and_then(|h| h.port);
                     match crate::helper::start(&d, port).await {
                         Ok(h) => h,
                         Err(e) => {
@@ -1561,7 +1563,9 @@ async fn keep_handing(d: Arc<Daemon>, h: Arc<Helper>) {
     let mut stopping = d.stopping.subscribe();
     let mut tried: std::collections::HashMap<[u8; 32], std::time::Instant> = Default::default();
     let mut restricted = false;
-    tracing::info!("the recovery helper is kept for the guardians who have not heard of this device");
+    tracing::info!(
+        "the recovery helper is kept for the guardians who have not heard of this device"
+    );
     loop {
         let still = d
             .helper
@@ -1610,8 +1614,12 @@ async fn hand_round(
     let Some(handing) = load_recovered(d).and_then(|r| r.handing) else {
         return;
     };
-    let who: Option<EntryId> = hex::decode(&handing.identity).ok().and_then(|b| b.try_into().ok());
-    let root: Option<KeyId> = hex::decode(&handing.root).ok().and_then(|b| b.try_into().ok());
+    let who: Option<EntryId> = hex::decode(&handing.identity)
+        .ok()
+        .and_then(|b| b.try_into().ok());
+    let root: Option<KeyId> = hex::decode(&handing.root)
+        .ok()
+        .and_then(|b| b.try_into().ok());
     let (Some(who), Some(root)) = (who, root) else {
         tracing::warn!("what the recovery helper is kept for cannot be read: it goes");
         update_recovered(d, |r| r.handing = None);
@@ -1637,7 +1645,9 @@ async fn hand_round(
             continue;
         }
         if h.d.sessions_of(&persona).is_empty()
-            || tried.get(&persona).is_some_and(|t| t.elapsed() < HAND_AGAIN)
+            || tried
+                .get(&persona)
+                .is_some_and(|t| t.elapsed() < HAND_AGAIN)
         {
             continue;
         }
