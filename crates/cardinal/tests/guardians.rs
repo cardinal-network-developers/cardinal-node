@@ -1404,7 +1404,9 @@ fn a_kept_move_is_followed_with_nothing_more_arriving() {
         let m = ask(d, json!({"cmd": "group-members", "group": g}));
         let all = m["members"].as_array().cloned().unwrap_or_default();
         let found = all.iter().find(|m| m["name"] == "You");
-        found.map_or(String::new(), |m| m["role"].as_str().unwrap_or("").to_owned())
+        found.map_or(String::new(), |m| {
+            m["role"].as_str().unwrap_or("").to_owned()
+        })
     };
     wait("bo is in the group", 60, || stands(&bo, &g));
     wait("the phone holds the group", 60, || stands(&phone, &g));
@@ -1468,7 +1470,9 @@ fn a_kept_move_is_followed_with_nothing_more_arriving() {
     // The keep that makes the move count is this device's own, written as
     // the group came: it follows on it, from the trail, with nothing more
     // to come from bo.
-    wait("the successor stands for the person", 20, || stands(&new, &g2));
+    wait("the successor stands for the person", 20, || {
+        stands(&new, &g2)
+    });
     wait("and for bo", 20, || stands(&bo, &g2));
     let kept = ask(&new, json!({"cmd": "recover"}))["kept_changes"].clone();
     let listed = kept.as_array().cloned().unwrap_or_default();
