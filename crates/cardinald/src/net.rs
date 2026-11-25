@@ -1193,6 +1193,35 @@ pub async fn send_objects(s: &Session, label: Label, objects: Vec<Vec<u8>>) -> a
     Ok(())
 }
 
+/// Which of a space's entries `ids` (sealed ids) a peer holds: it serves
+/// only what it has stored.
+pub async fn held_by(
+    s: &Session,
+    space: Label,
+    ids: &[[u8; 32]],
+) -> anyhow::Result<std::collections::HashSet<[u8; 32]>> {
+    let mut held = std::collections::HashSet::new();
+    for chunk in ids.chunks(1024) {
+        let mut st = s.open_stream(Service::SYNC, Priority::Interactive)?;
+        let want = Message::Want {
+            label: space,
+            ids: chunk.to_vec(),
+        };
+        st.send_message(&to_value(&want)).await?;
+        let _ = st.shutdown().await;
+        while let Some(v) = st.recv_message_max(MAX_MESSAGE).await? {
+            if let Message::Objects { objects, .. } = from_value(v)? {
+                for o in objects {
+                    if let Ok(e) = cardinal_space::SealedEntry::decode(&o) {
+                        held.insert(e.sealed_id());
+                    }
+                }
+            }
+        }
+    }
+    Ok(held)
+}
+
 /// Sends one object to a peer and waits until it holds it: a peer serves
 /// only what it has stored.
 pub async fn deliver(

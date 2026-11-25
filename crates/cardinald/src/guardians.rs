@@ -2086,24 +2086,19 @@ pub(crate) async fn deliver(d: &Arc<Daemon>, guarded: &EntryId, objects: Vec<Vec
 /// contact's device takes it whole (`mailbox::TOKEN_MESSAGE`).
 const CARRY_BATCH: usize = 32 * 1024;
 
-/// Entries written in a space, sealed, by sealed id: the id a peer holds
-/// them by, and is asked for them by.
-pub(crate) type Written = Vec<([u8; 32], Vec<u8>)>;
-
 /// Writes in a relationship space, as `carried` nodes, each of `entries`
 /// that this person has not carried there yet. `recovered` is whom the
-/// recovery is of. Returns how many it carried, and the space entries
-/// that carry them, by id.
+/// recovery is of.
 pub(crate) fn carry(
     d: &Arc<Daemon>,
     space: &SpaceId,
     recovered: &EntryId,
     entries: &[Vec<u8>],
-) -> anyhow::Result<(usize, Written)> {
+) -> anyhow::Result<usize> {
     let ops: Vec<SpaceOp> = {
         let core = d.core();
         let Some(sp) = core.spaces.get(space).and_then(|h| h.space.as_ref()) else {
-            return Ok((0, Vec::new()));
+            return Ok(0);
         };
         // what this person carried there already: what the other carried
         // counts as theirs, as a helper's `recover` must be its own
@@ -2124,34 +2119,22 @@ pub(crate) fn carry(
             })
             .collect()
     };
-    let write = |batch: Vec<SpaceOp>| -> anyhow::Result<Written> {
-        let written = d.core().write(space, batch)?;
-        d.push(space, written.iter().map(|(_, b)| b.clone()).collect());
-        d.bump();
-        // by the sealed id, which the store and a `want` go by, not the
-        // entry's own
-        written
-            .into_iter()
-            .map(|(_, b)| Ok((cardinal_space::SealedEntry::decode(&b)?.sealed_id(), b)))
-            .collect()
-    };
     let n = ops.len();
-    let mut written = Vec::new();
     let mut batch = Vec::new();
     let mut size = 0;
     for op in ops {
         let len = op.record().encode().len();
         if !batch.is_empty() && size + len > CARRY_BATCH {
-            written.extend(write(std::mem::take(&mut batch))?);
+            d.write_and_push(space, std::mem::take(&mut batch))?;
             size = 0;
         }
         size += len;
         batch.push(op);
     }
     if !batch.is_empty() {
-        written.extend(write(batch)?);
+        d.write_and_push(space, batch)?;
     }
-    Ok((n, written))
+    Ok(n)
 }
 
 /// `cardinal guarding invite NAME [--address ADDR]`: an invitation for

@@ -146,9 +146,6 @@ struct NotHeard {
     /// their device answering this one, which then knows it.
     #[serde(default)]
     person: Option<String>,
-    /// The entries the helper wrote there for them (sealed ids, hex).
-    #[serde(default)]
-    entries: Vec<String>,
 }
 
 impl NotHeard {
@@ -479,16 +476,12 @@ fn choose<'a>(log: &IdentityLog, proposals: &'a [Proposal]) -> Option<(&'a Propo
     Some((p, had))
 }
 
-/// What the helper wrote in one guardian's relationship: the guardian, the
-/// space, and the space entries, by id.
-type Written = ([u8; 32], SpaceId, crate::guardians::Written);
-
 /// Signs the `recover`, on the first proposal that can be signed, and
 /// carries it and every guardian's acts on the person's log to every
-/// guardian. Returns what it wrote.
-async fn carry_round(d: &Arc<Daemon>, h: &Arc<Helper>) -> anyhow::Result<Vec<Written>> {
+/// guardian.
+async fn carry_round(d: &Arc<Daemon>, h: &Arc<Helper>) -> anyhow::Result<()> {
     let Some(mut u) = load(d) else {
-        return Ok(Vec::new());
+        return Ok(());
     };
     // Whom it recovers, if this device does not know yet: as the first
     // guardian to propose, through an invitation for whomever they named,
@@ -517,12 +510,12 @@ async fn carry_round(d: &Arc<Daemon>, h: &Arc<Helper>) -> anyhow::Result<Vec<Wri
         }
     }
     let Some(who) = identity_of(&u) else {
-        return Ok(Vec::new());
+        return Ok(());
     };
     // Nothing changed at the helper since the last round: nothing to do.
     let seq = *h.d.changed.borrow();
     if u.entry.is_some() && h.seen.swap(seq, std::sync::atomic::Ordering::SeqCst) == seq {
-        return Ok(Vec::new());
+        return Ok(());
     }
     let (entries, proposals) = gathered(&h.d, &who);
     if u.entry.is_none() {
@@ -552,7 +545,7 @@ async fn carry_round(d: &Arc<Daemon>, h: &Arc<Helper>) -> anyhow::Result<Vec<Wri
     // What goes to every guardian: the `recover`, and what the log keeps
     // of anyone else's: the causal pasts of acts on the person's log.
     let Some(mine) = entry_of(&u) else {
-        return Ok(Vec::new());
+        return Ok(());
     };
     let mine = mine.encode();
     let mut out: Vec<Vec<u8>> = vec![mine.clone()];
@@ -565,7 +558,6 @@ async fn carry_round(d: &Arc<Daemon>, h: &Arc<Helper>) -> anyhow::Result<Vec<Wri
         .into_iter()
         .filter_map(|b| Some((IdentityEntry::decode(&b).ok()?.id(), b)))
         .collect();
-    let mut written = Vec::new();
     for (guardian, space) in relationships(&h.d, &who) {
         // what was carried there already, by this run
         let new: Vec<(EntryId, Vec<u8>)> = {
@@ -580,16 +572,15 @@ async fn carry_round(d: &Arc<Daemon>, h: &Arc<Helper>) -> anyhow::Result<Vec<Wri
             continue;
         }
         let bytes: Vec<Vec<u8>> = new.iter().map(|(_, b)| b.clone()).collect();
-        let (n, entries) = h
+        let n = h
             .on(move |hd| async move {
-                let carried = crate::guardians::carry(&hd, &space, &who, &bytes)?;
+                let n = crate::guardians::carry(&hd, &space, &who, &bytes)?;
                 // and to the guardian now, over any session there is
                 let hd2 = hd.clone();
                 tokio::spawn(async move { sync_with(&hd2, &guardian, &space).await });
-                Ok(carried)
+                Ok(n)
             })
             .await?;
-        written.push((guardian, space, entries));
         tracing::debug!(
             "carried {n} of {} entries to a guardian, in {}",
             new.len(),
@@ -602,7 +593,7 @@ async fn carry_round(d: &Arc<Daemon>, h: &Arc<Helper>) -> anyhow::Result<Vec<Wri
             .or_default()
             .extend(new.into_iter().map(|(id, _)| id));
     }
-    Ok(written)
+    Ok(())
 }
 
 pub(crate) fn recover_entry(
@@ -1299,71 +1290,52 @@ fn lost_json(d: &Daemon) -> Vec<Json> {
         .collect()
 }
 
-/// Carries what is left to carry, hands each guardian's devices in touch
-/// what this wrote, and syncs each relationship with them, ten seconds at
-/// most each, so that every guardian sees the recovery in effect and
-/// knows this device. Who confirmed and took it is no longer waited for
-/// (`Recovered::handing`); who did not, is handed it as they come into
-/// reach ([`keep_handing`]).
+/// Carries what is left to carry, the new root's entries among it, and
+/// hands each guardian's devices in touch the relationship as the helper
+/// holds it, ten seconds at most each, so that every guardian sees the
+/// recovery in effect and knows this device. Who confirmed and took it is
+/// no longer waited for (`Recovered::handing`); who did not, is handed it
+/// as they come into reach ([`keep_handing`]).
 async fn last_carry(d: &Arc<Daemon>) {
     let h = d.helper.lock().unwrap_or_else(|e| e.into_inner()).clone();
     let (Some(h), Some(who)) = (h, load(d).as_ref().and_then(identity_of)) else {
         return;
     };
-    let mut written = carry_round(d, &h).await.unwrap_or_else(|e| {
+    if let Err(e) = carry_round(d, &h).await {
         tracing::debug!("carrying the recovery: {e:#}");
-        Vec::new()
-    });
+    }
     // What the new root wrote, taking the identity up: the guardians know
     // this device by it, and that their personas' purpose is over.
     let root = load(d).as_ref().and_then(entry_of).map(|e| e.signer());
     let mine = root.map(|r| new_root_entries(d, &r)).unwrap_or_default();
-    let handed = h
+    let held = h
         .on(move |hd| async move {
-            let mut handed = Vec::new();
+            let mut held = Vec::new();
             for (guardian, space) in relationships(&hd, &who) {
-                match crate::guardians::carry(&hd, &space, &who, &mine) {
-                    Ok((_, entries)) => written.push((guardian, space, entries)),
-                    Err(e) => tracing::debug!("carrying the new device's entries: {e:#}"),
+                if let Err(e) = crate::guardians::carry(&hd, &space, &who, &mine) {
+                    tracing::debug!("carrying the new device's entries: {e:#}");
                 }
-                let entries: crate::guardians::Written = written
-                    .iter()
-                    .filter(|(g, s, _)| *g == guardian && *s == space)
-                    .flat_map(|(_, _, e)| e.iter().cloned())
-                    .collect();
-                let held = hand_over(&hd, &guardian, &space, &entries).await;
-                sync_with(&hd, &guardian, &space).await;
-                let ids: Vec<String> = entries.iter().map(|(id, _)| hex::encode(id)).collect();
-                handed.push((guardian, ids, held));
+                if hand_over(&hd, &guardian, &space).await {
+                    held.push(guardian);
+                }
             }
-            Ok(handed)
+            Ok(held)
         })
         .await
         .unwrap_or_default();
     update_recovered(d, |r| {
         if let Some(handing) = r.handing.as_mut() {
-            for (guardian, ids, held) in handed {
-                note_handed(handing, &guardian, ids, held);
+            for guardian in held {
+                handed(handing, &guardian);
             }
         }
     });
 }
 
-/// After handing `ids` to `guardian`: kept to hand again, or, `held`,
-/// the guardian is no longer waited for.
-fn note_handed(handing: &mut Handing, guardian: &[u8; 32], ids: Vec<String>, held: bool) {
+/// `guardian` holds this device's first entries: no longer waited for.
+fn handed(handing: &mut Handing, guardian: &[u8; 32]) {
     let g = hex::encode(guardian);
-    if held {
-        handing.guardians.retain(|x| x.persona != g);
-        return;
-    }
-    if let Some(x) = handing.guardians.iter_mut().find(|x| x.persona == g) {
-        for id in ids {
-            if !x.entries.contains(&id) {
-                x.entries.push(id);
-            }
-        }
-    }
+    handing.guardians.retain(|x| x.persona != g);
 }
 
 /// The new root's entries in this device's log but the `recover`: this
@@ -1382,32 +1354,43 @@ fn new_root_entries(d: &Daemon, root: &KeyId) -> Vec<Vec<u8>> {
         .unwrap_or_default()
 }
 
-/// Hands each of a guardian's devices in touch the entries the helper
-/// wrote last in their relationship, and waits until it holds them, ten
-/// seconds at most each. Returns whether one of them took them all. A
-/// notice still on its way, or what the guardian asks for after a
-/// reconcile, is lost when the helper goes, and the helper goes only once
-/// every guardian who confirmed took them here. A guardian without the new
-/// root's entries never learns this device's link key, and so never
-/// answers it (`link.md#silence-and-cookies`): the person's new device
-/// could not reach that guardian, nor anyone who learns of it only from
-/// them.
-async fn hand_over(
-    hd: &Arc<Daemon>,
-    guardian: &[u8; 32],
-    space: &SpaceId,
-    entries: &[([u8; 32], Vec<u8>)],
-) -> bool {
-    if entries.is_empty() {
+/// Hands each of a guardian's devices in touch their relationship with the
+/// helper as the helper holds it, until that device holds every entry of
+/// it, ten seconds at most each: what the helper wrote last, and what it
+/// stands on, without which the guardian's device holds it but cannot take
+/// it up. Returns whether one of them holds it all. A notice still on its
+/// way, or what the guardian asks for after a reconcile, is lost when the
+/// helper goes, and the helper goes only once every guardian who confirmed
+/// holds it here. A guardian without the new root's entries never learns
+/// this device's link key, and so never answers it
+/// (`link.md#silence-and-cookies`): the person's new device could not reach
+/// that guardian, nor anyone who learns of it only from them.
+async fn hand_over(hd: &Arc<Daemon>, guardian: &[u8; 32], space: &SpaceId) -> bool {
+    let ids: Vec<[u8; 32]> = hd.core().set(space).iter().copied().collect();
+    if ids.is_empty() {
         return false;
     }
     let mut held = false;
     for s in hd.sessions_of(guardian) {
         let given = async {
-            for (id, entry) in entries {
-                net::deliver(&s, *space, entry.clone(), *id).await?;
+            for _ in 0..100 {
+                let theirs = net::held_by(&s, *space, &ids).await?;
+                let missing: Vec<Vec<u8>> = {
+                    let core = hd.core();
+                    ids.iter()
+                        .filter(|id| !theirs.contains(*id))
+                        .filter_map(|id| core.get(space, id))
+                        .collect()
+                };
+                if missing.is_empty() {
+                    return anyhow::Ok(());
+                }
+                for entry in missing {
+                    net::send_objects(&s, *space, vec![entry]).await?;
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
             }
-            anyhow::Ok(())
+            anyhow::bail!("that device did not take them")
         };
         match tokio::time::timeout(Duration::from_secs(10), given).await {
             Ok(Ok(())) => held = true,
@@ -1437,7 +1420,6 @@ fn handing_for(h: &Helper, log: &IdentityLog, mine: &IdentityEntry) -> Handing {
             persona: hex::encode(c.identity),
             space: hex::encode(c.space),
             person: guardian_of(&core, &c, &who).map(hex::encode),
-            entries: Vec::new(),
         })
         .collect();
     Handing {
@@ -1639,7 +1621,7 @@ async fn hand_round(
         if g.person().is_some_and(|p| !d.sessions_of(&p).is_empty()) {
             update_recovered(d, |r| {
                 if let Some(x) = r.handing.as_mut() {
-                    note_handed(x, &persona, Vec::new(), true);
+                    handed(x, &persona);
                 }
             });
             continue;
@@ -1651,37 +1633,26 @@ async fn hand_round(
         {
             continue;
         }
-        let (mine, stored) = (mine.clone(), g.entries.clone());
+        let mine = mine.clone();
         let r = h
             .on(move |hd| async move {
-                // carried here once, whatever stopped before
-                let (_, new) = crate::guardians::carry(&hd, &space, &who, &mine)?;
-                let mut ids: Vec<String> = stored;
-                ids.extend(new.iter().map(|(id, _)| hex::encode(id)));
-                let entries: crate::guardians::Written = {
-                    let core = hd.core();
-                    ids.iter()
-                        .filter_map(|i| <[u8; 32]>::try_from(hex::decode(i).ok()?).ok())
-                        .filter_map(|id| Some((id, core.get(&space, &id)?)))
-                        .collect()
-                };
-                let held = hand_over(&hd, &persona, &space, &entries).await;
-                Ok((ids, held))
+                // carried there once, whatever stopped before
+                crate::guardians::carry(&hd, &space, &who, &mine)?;
+                Ok(hand_over(&hd, &persona, &space).await)
             })
             .await;
         match r {
-            Ok((ids, held)) => {
-                if held {
-                    tracing::info!("a guardian who confirmed now knows this device");
-                    tried.remove(&persona);
-                } else {
-                    tried.insert(persona, std::time::Instant::now());
-                }
+            Ok(true) => {
+                tracing::info!("a guardian who confirmed now knows this device");
+                tried.remove(&persona);
                 update_recovered(d, |r| {
                     if let Some(x) = r.handing.as_mut() {
-                        note_handed(x, &persona, ids, held);
+                        handed(x, &persona);
                     }
                 });
+            }
+            Ok(false) => {
+                tried.insert(persona, std::time::Instant::now());
             }
             Err(e) => {
                 tracing::debug!("handing the recovery's end to a guardian: {e:#}");
