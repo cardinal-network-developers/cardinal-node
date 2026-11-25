@@ -1373,22 +1373,27 @@ fn the_guardian_knows_the_new_device_when_the_helper_goes() {
     laptop.start();
     let words = words_from(&laptop.cli(&["init", "--yes", "--name", "ana"]));
     laptop.wait_mounted();
-    // Bo's device and the new one are busy, as phones may be: what they
-    // send unasked, and what they ask for, goes late. Nothing is lost, and
-    // the recovery takes longer.
-    let late = [("CARDINAL_TEST_LATE_MS", "4000")];
-    let bo = person_with(root.path(), "bo", &late);
+    let mut bo = person(root.path(), "bo");
     meet(&laptop, &bo, "Ana");
     accept_guarding(&[&bo]);
     let o = name_accepted(&laptop, &words, &["bo", "--delay", "4s"]);
     assert!(o.status.success(), "{}", out(&o));
-    wait("the guardian knows", 60, || {
+    wait("the guardian knows", 30, || {
         bo.cli(&["guarding"]).contains("Ana: one of 1 guardians")
     });
     hold_account(&laptop, &[&bo]);
     laptop.stop();
     drop(laptop);
 
+    // From here bo's device and the new one are busy, as phones may be:
+    // what they send unasked, and what they ask for, goes late. Nothing is
+    // lost, and the recovery takes longer.
+    let late = [("CARDINAL_TEST_LATE_MS", "4000")];
+    bo.stop();
+    bo.env
+        .extend(late.map(|(k, v)| (k.to_owned(), v.to_owned())));
+    bo.start();
+    bo.wait_mounted();
     let mut new = Dev::new(root.path(), "new", free_port());
     new.env
         .extend(late.map(|(k, v)| (k.to_owned(), v.to_owned())));
