@@ -71,7 +71,9 @@ cardinal-calendar/bin/cardinal-calendar quick apps      0
 cardinal-calendar/document      quick   apps            1
 
 # --- quick: one device or a pair, under about 6 s ---
-cardinal/versions               quick   apps            1
+# versions takes about 1 s without CARDINAL_OLD_BIN (outside the release
+# tier its tests then skip), 91 s with it; nearby 9 s and 92 s.
+cardinal/versions               quick   apps            91
 cardinal/app_interface          quick   apps            4
 cardinal/applications           quick   apps            2
 cardinal/inspect                quick   apps            2
@@ -122,7 +124,7 @@ cardinal/roaming                branch  reach           30
 cardinal/reconnect              branch  reach           20
 cardinal/reachable              branch  reach,settings  8
 cardinal/router                 branch  reach,settings  9
-cardinal/nearby                 branch  reach           9
+cardinal/nearby                 branch  reach           92
 cardinal/network_change         branch  reach           11
 cardinal/contact_status         branch  reach           11
 cardinal/bluetooth              branch  reach,settings  10
