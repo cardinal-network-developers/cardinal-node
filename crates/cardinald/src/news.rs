@@ -21,6 +21,17 @@ const WAIT: Duration = Duration::from_millis(30);
 /// How many peers a notice goes to, when a device has more.
 const PEERS: usize = 8;
 
+/// Tests: how long what a device sends unasked, and what it asks for after
+/// a reconcile, waits before it goes, as on a device too busy to send it at
+/// once (`CARDINAL_TEST_LATE_MS`).
+pub(crate) fn late() -> Option<Duration> {
+    if !cfg!(debug_assertions) {
+        return None;
+    }
+    let ms = std::env::var("CARDINAL_TEST_LATE_MS").ok()?;
+    ms.parse().ok().map(Duration::from_millis)
+}
+
 /// News waiting to be passed on.
 #[derive(Default)]
 pub struct News {
@@ -88,9 +99,13 @@ impl Daemon {
         }
         let heads = self.core().heads(&label);
         let objects = Arc::new(objects);
+        let late = late();
         for s in peers {
             let (objects, heads) = (objects.clone(), heads.clone());
             self.rt.spawn(async move {
+                if let Some(t) = late {
+                    tokio::time::sleep(t).await;
+                }
                 if let Err(e) = net::notice(&s, label, &objects, heads).await {
                     tracing::debug!("notice to {}: {e:#}", short(&s.peer_static()));
                 }

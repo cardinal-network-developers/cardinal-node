@@ -1356,6 +1356,65 @@ fn two_devices_move_then_recovery(confirmed: bool) {
     wait("bo follows the undo", 60, || stands(&bo, &g3));
 }
 
+/// The recovery's end reaches the guardian before the helper goes: the
+/// entries by which the guardian knows the new device are handed over and
+/// held, not left to a notice, or to what the guardian asks for after a
+/// reconcile, that is still on its way when the helper stops. Without them
+/// the guardian never answers the new device, which tries it for ever.
+#[test]
+fn the_guardian_knows_the_new_device_when_the_helper_goes() {
+    use serde_json::json;
+    if !fuse_available() {
+        eprintln!("skipping: /dev/fuse or fusermount3 is not available");
+        return;
+    }
+    let root = tempfile::tempdir().unwrap();
+    let mut laptop = Dev::new(root.path(), "laptop", free_port());
+    laptop.start();
+    let words = words_from(&laptop.cli(&["init", "--yes", "--name", "ana"]));
+    laptop.wait_mounted();
+    // Bo's device and the new one are busy, as phones may be: what they
+    // send unasked, and what they ask for, goes late. Nothing is lost, and
+    // the recovery takes longer.
+    let late = [("CARDINAL_TEST_LATE_MS", "4000")];
+    let bo = person_with(root.path(), "bo", &late);
+    meet(&laptop, &bo, "Ana");
+    accept_guarding(&[&bo]);
+    let o = name_accepted(&laptop, &words, &["bo", "--delay", "4s"]);
+    assert!(o.status.success(), "{}", out(&o));
+    wait("the guardian knows", 60, || {
+        bo.cli(&["guarding"]).contains("Ana: one of 1 guardians")
+    });
+    hold_account(&laptop, &[&bo]);
+    laptop.stop();
+    drop(laptop);
+
+    let mut new = Dev::new(root.path(), "new", free_port());
+    new.env
+        .extend(late.map(|(k, v)| (k.to_owned(), v.to_owned())));
+    new.start();
+    let fp = fingerprint_from(&new.cli(&["recover", "start", &recovery_invitation(&bo, "Ana")]));
+    wait("bo sees the recovery", 60, || {
+        bo.cli(&["guarding"]).contains(&fp)
+    });
+    endorse_and_confirm(&[&bo], &fp);
+    wait("the account is given back", 60, || {
+        new.cli(&["recover"]).contains("your account among it")
+    });
+    let o = new.try_cli(&["recover", "finish"]);
+    assert!(o.status.success(), "{}", out(&o));
+    let bo_at = format!("127.0.0.1:{}", bo.port);
+    wait("the new device reaches bo", 60, || {
+        let r = ask(
+            &new,
+            json!({"cmd": "contact-status", "who": "bo", "at": bo_at}),
+        );
+        r["devices"]
+            .as_array()
+            .is_some_and(|d| d.iter().any(|x| x["online"] == true))
+    });
+}
+
 /// The same with nothing else to arrive after the group: Ana's laptop
 /// makes Bo an ordinary member again, which moves the group on, and her
 /// phone confirms it. Bo is the only other member, so the new device holds

@@ -2086,19 +2086,23 @@ pub(crate) async fn deliver(d: &Arc<Daemon>, guarded: &EntryId, objects: Vec<Vec
 /// contact's device takes it whole (`mailbox::TOKEN_MESSAGE`).
 const CARRY_BATCH: usize = 32 * 1024;
 
+/// Entries written in a space, by id.
+pub(crate) type Written = Vec<(EntryId, Vec<u8>)>;
+
 /// Writes in a relationship space, as `carried` nodes, each of `entries`
 /// that this person has not carried there yet. `recovered` is whom the
-/// recovery is of.
+/// recovery is of. Returns how many it carried, and the space entries
+/// that carry them, by id.
 pub(crate) fn carry(
     d: &Arc<Daemon>,
     space: &SpaceId,
     recovered: &EntryId,
     entries: &[Vec<u8>],
-) -> anyhow::Result<usize> {
+) -> anyhow::Result<(usize, Written)> {
     let ops: Vec<SpaceOp> = {
         let core = d.core();
         let Some(sp) = core.spaces.get(space).and_then(|h| h.space.as_ref()) else {
-            return Ok(0);
+            return Ok((0, Vec::new()));
         };
         // what this person carried there already: what the other carried
         // counts as theirs, as a helper's `recover` must be its own
@@ -2119,22 +2123,29 @@ pub(crate) fn carry(
             })
             .collect()
     };
+    let write = |batch: Vec<SpaceOp>| -> anyhow::Result<Written> {
+        let written = d.core().write(space, batch)?;
+        d.push(space, written.iter().map(|(_, b)| b.clone()).collect());
+        d.bump();
+        Ok(written)
+    };
     let n = ops.len();
+    let mut written = Vec::new();
     let mut batch = Vec::new();
     let mut size = 0;
     for op in ops {
         let len = op.record().encode().len();
         if !batch.is_empty() && size + len > CARRY_BATCH {
-            d.write_and_push(space, std::mem::take(&mut batch))?;
+            written.extend(write(std::mem::take(&mut batch))?);
             size = 0;
         }
         size += len;
         batch.push(op);
     }
     if !batch.is_empty() {
-        d.write_and_push(space, batch)?;
+        written.extend(write(batch)?);
     }
-    Ok(n)
+    Ok((n, written))
 }
 
 /// `cardinal guarding invite NAME [--address ADDR]`: an invitation for
