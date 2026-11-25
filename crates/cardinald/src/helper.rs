@@ -10,7 +10,11 @@
 //! its own, on a runtime of its own, so that stopping it ends all it does.
 //! It has no control socket, no mount, no discovery and no port mapping;
 //! the new device's service drives it (`recovering.rs`). Once the recovery
-//! is in effect, or given up, it is stopped and its directory removed.
+//! is given up, or in effect and every guardian who confirmed it holds the
+//! new device's first entries, it is stopped and its directory removed.
+//! Between those two it is kept only to hand those entries over: it keeps
+//! its port, so that a guardian's device coming back finds it, and holds
+//! nothing of the person's.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -35,6 +39,9 @@ pub struct Helper {
     >,
     /// The helper's change count when the new device last carried.
     pub seen: std::sync::atomic::AtomicU64,
+    /// It is kept after the finish, to hand the new device's first
+    /// entries to the guardians who do not hold them yet (`recovering.rs`).
+    pub handing: std::sync::atomic::AtomicBool,
 }
 
 impl Helper {
@@ -58,6 +65,15 @@ impl Helper {
     pub fn identity(&self) -> Option<[u8; 32]> {
         self.d.core().me()
     }
+
+    /// The port it listens on.
+    pub fn port(&self) -> Option<u16> {
+        self.d
+            .endpoint
+            .udp_addr()
+            .or(self.d.endpoint.tcp_addr())
+            .map(|a| a.port())
+    }
 }
 
 /// The paths of the helper of the device whose paths are `main`.
@@ -71,22 +87,22 @@ pub fn paths(main: &Paths) -> Paths {
 }
 
 /// Where the helper listens: on the address the new device listens on,
-/// at a port of its own.
-fn listen(main: &Daemon) -> String {
+/// at a port of its own, `port` if given.
+fn listen(main: &Daemon, port: u16) -> String {
     let ip = main
         .endpoint
         .udp_addr()
         .or(main.endpoint.tcp_addr())
         .map(|a| a.ip())
         .unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED));
-    std::net::SocketAddr::new(ip, 0).to_string()
+    std::net::SocketAddr::new(ip, port).to_string()
 }
 
 /// The settings of a persona's service, inside `main`'s.
 fn service_config(main: &Daemon, name: &str) -> Config {
     Config {
         name: name.to_owned(),
-        listen: listen(main),
+        listen: listen(main, 0),
         mount: None,
         discovery: false,
         port_mapping: false,
@@ -95,8 +111,9 @@ fn service_config(main: &Daemon, name: &str) -> Config {
     }
 }
 
-/// Starts the helper of `main`, making its identity first if it has none.
-pub async fn start(main: &Arc<Daemon>) -> anyhow::Result<Arc<Helper>> {
+/// Starts the helper of `main`, making its identity first if it has none,
+/// at `port` if given and free, else at a port of its own.
+pub async fn start(main: &Arc<Daemon>, port: Option<u16>) -> anyhow::Result<Arc<Helper>> {
     if let Some(h) = main
         .helper
         .lock()
@@ -115,7 +132,20 @@ pub async fn start(main: &Arc<Daemon>) -> anyhow::Result<Arc<Helper>> {
         crate::setup::install(&paths, prepared, &config, NAME)?;
     }
     config.this_run.helper = true;
-    let h = run_service(paths, config, "recovery-helper").await?;
+    let h = match port {
+        Some(p) => {
+            let mut at = config.clone();
+            at.listen = listen(main, p);
+            match run_service(paths.clone(), at, "recovery-helper").await {
+                Ok(h) => h,
+                Err(e) => {
+                    tracing::info!("the recovery helper's port {p} is taken ({e:#}): another");
+                    run_service(paths, config, "recovery-helper").await?
+                }
+            }
+        }
+        None => run_service(paths, config, "recovery-helper").await?,
+    };
     *main.helper.lock().unwrap_or_else(|e| e.into_inner()) = Some(h.clone());
     tracing::info!(
         "recovery helper {} started",
@@ -271,6 +301,7 @@ async fn run_service(
         thread: std::sync::Mutex::new(Some(thread)),
         carried: Default::default(),
         seen: std::sync::atomic::AtomicU64::new(u64::MAX),
+        handing: std::sync::atomic::AtomicBool::new(false),
     }))
 }
 
@@ -306,12 +337,13 @@ pub async fn stop_all(main: &Arc<Daemon>) {
     }
 }
 
-/// Removes a helper's directory, if there is one and no recovery is under
-/// way. What cannot be removed now (a file still open, on Windows) is
-/// removed when the service starts next.
+/// Removes a helper's directory, if there is one, no recovery is under
+/// way, and it is not kept to hand a finished one over. What cannot be
+/// removed now (a file still open, on Windows) is removed when the service
+/// starts next.
 pub fn remove_left(main: &Daemon) {
     let home = main.paths.recovery_helper();
-    if main.paths.recovering().exists() || !home.exists() {
+    if main.paths.recovering().exists() || crate::recovering::kept(main) || !home.exists() {
         return;
     }
     if let Err(e) = std::fs::remove_dir_all(&home) {

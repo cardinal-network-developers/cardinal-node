@@ -252,6 +252,25 @@ pub fn cancel_invitation(d: &Arc<Daemon>, id: &str) -> anyhow::Result<Json> {
     Ok(json!({}))
 }
 
+/// Cancels every invitation this person has outstanding: a recovery
+/// helper kept after the finish meets nobody new.
+pub(crate) fn cancel_outstanding(d: &Arc<Daemon>) -> anyhow::Result<()> {
+    let ops: Vec<_> = made(d)
+        .iter()
+        .filter(|m| m.outstanding())
+        .map(|m| account::cancel_invitation(m.record.node))
+        .collect();
+    if !ops.is_empty() {
+        let account = d
+            .core()
+            .account_id()
+            .ok_or_else(|| anyhow::anyhow!("the account space is not here yet"))?;
+        d.write_and_push(&account, ops)?;
+    }
+    admit_invitations(d);
+    Ok(())
+}
+
 /// Lets in whoever holds an invitation this person has outstanding, on this
 /// device as on all their others, and stops for one that is used up,
 /// cancelled or too old, wherever that happened.
