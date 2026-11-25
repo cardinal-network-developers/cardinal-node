@@ -411,12 +411,16 @@ fn choose<'a>(log: &IdentityLog, proposals: &'a [Proposal]) -> Option<(&'a Propo
     Some((p, had))
 }
 
+/// What the helper wrote in one guardian's relationship: the guardian, the
+/// space, and the space entries, by id.
+type Written = ([u8; 32], SpaceId, crate::guardians::Written);
+
 /// Signs the `recover`, on the first proposal that can be signed, and
 /// carries it and every guardian's acts on the person's log to every
-/// guardian.
-async fn carry_round(d: &Arc<Daemon>, h: &Arc<Helper>) -> anyhow::Result<()> {
+/// guardian. Returns what it wrote.
+async fn carry_round(d: &Arc<Daemon>, h: &Arc<Helper>) -> anyhow::Result<Vec<Written>> {
     let Some(mut u) = load(d) else {
-        return Ok(());
+        return Ok(Vec::new());
     };
     // Whom it recovers, if this device does not know yet: as the first
     // guardian to propose, through an invitation for whomever they named,
@@ -445,12 +449,12 @@ async fn carry_round(d: &Arc<Daemon>, h: &Arc<Helper>) -> anyhow::Result<()> {
         }
     }
     let Some(who) = identity_of(&u) else {
-        return Ok(());
+        return Ok(Vec::new());
     };
     // Nothing changed at the helper since the last round: nothing to do.
     let seq = *h.d.changed.borrow();
     if u.entry.is_some() && h.seen.swap(seq, std::sync::atomic::Ordering::SeqCst) == seq {
-        return Ok(());
+        return Ok(Vec::new());
     }
     let (entries, proposals) = gathered(&h.d, &who);
     if u.entry.is_none() {
@@ -480,7 +484,7 @@ async fn carry_round(d: &Arc<Daemon>, h: &Arc<Helper>) -> anyhow::Result<()> {
     // What goes to every guardian: the `recover`, and what the log keeps
     // of anyone else's: the causal pasts of acts on the person's log.
     let Some(mine) = entry_of(&u) else {
-        return Ok(());
+        return Ok(Vec::new());
     };
     let mine = mine.encode();
     let mut out: Vec<Vec<u8>> = vec![mine.clone()];
@@ -493,6 +497,7 @@ async fn carry_round(d: &Arc<Daemon>, h: &Arc<Helper>) -> anyhow::Result<()> {
         .into_iter()
         .filter_map(|b| Some((IdentityEntry::decode(&b).ok()?.id(), b)))
         .collect();
+    let mut written = Vec::new();
     for (guardian, space) in relationships(&h.d, &who) {
         // what was carried there already, by this run
         let new: Vec<(EntryId, Vec<u8>)> = {
@@ -507,15 +512,16 @@ async fn carry_round(d: &Arc<Daemon>, h: &Arc<Helper>) -> anyhow::Result<()> {
             continue;
         }
         let bytes: Vec<Vec<u8>> = new.iter().map(|(_, b)| b.clone()).collect();
-        let n = h
+        let (n, entries) = h
             .on(move |hd| async move {
-                let n = crate::guardians::carry(&hd, &space, &who, &bytes)?;
+                let carried = crate::guardians::carry(&hd, &space, &who, &bytes)?;
                 // and to the guardian now, over any session there is
                 let hd2 = hd.clone();
                 tokio::spawn(async move { sync_with(&hd2, &guardian, &space).await });
-                Ok(n)
+                Ok(carried)
             })
             .await?;
+        written.push((guardian, space, entries));
         tracing::debug!(
             "carried {n} of {} entries to a guardian, in {}",
             new.len(),
@@ -528,7 +534,7 @@ async fn carry_round(d: &Arc<Daemon>, h: &Arc<Helper>) -> anyhow::Result<()> {
             .or_default()
             .extend(new.into_iter().map(|(id, _)| id));
     }
-    Ok(())
+    Ok(written)
 }
 
 pub(crate) fn recover_entry(
@@ -1195,17 +1201,19 @@ fn lost_json(d: &Daemon) -> Vec<Json> {
         .collect()
 }
 
-/// Carries what is left to carry, and syncs each relationship with the
-/// guardian's devices in touch, ten seconds at most each, so that every
-/// guardian sees the recovery in effect.
+/// Carries what is left to carry, hands each guardian's devices in touch
+/// what this wrote, and syncs each relationship with them, ten seconds at
+/// most each, so that every guardian sees the recovery in effect and
+/// knows this device.
 async fn last_carry(d: &Arc<Daemon>) {
     let h = d.helper.lock().unwrap_or_else(|e| e.into_inner()).clone();
     let (Some(h), Some(who)) = (h, load(d).as_ref().and_then(identity_of)) else {
         return;
     };
-    if let Err(e) = carry_round(d, &h).await {
+    let mut written = carry_round(d, &h).await.unwrap_or_else(|e| {
         tracing::debug!("carrying the recovery: {e:#}");
-    }
+        Vec::new()
+    });
     // What the new root wrote, taking the identity up: the guardians know
     // this device by it, and that their personas' purpose is over.
     let root = load(d).as_ref().and_then(entry_of).map(|e| e.signer());
@@ -1225,14 +1233,55 @@ async fn last_carry(d: &Arc<Daemon>) {
     let _ = h
         .on(move |hd| async move {
             for (guardian, space) in relationships(&hd, &who) {
-                if let Err(e) = crate::guardians::carry(&hd, &space, &who, &mine) {
-                    tracing::debug!("carrying the new device's entries: {e:#}");
+                match crate::guardians::carry(&hd, &space, &who, &mine) {
+                    Ok((_, entries)) => written.push((guardian, space, entries)),
+                    Err(e) => tracing::debug!("carrying the new device's entries: {e:#}"),
                 }
+                let entries: crate::guardians::Written = written
+                    .iter()
+                    .filter(|(g, s, _)| *g == guardian && *s == space)
+                    .flat_map(|(_, _, e)| e.iter().cloned())
+                    .collect();
+                hand_over(&hd, &guardian, &space, &entries).await;
                 sync_with(&hd, &guardian, &space).await;
             }
             Ok(())
         })
         .await;
+}
+
+/// Hands each of a guardian's devices in touch the entries the helper
+/// wrote last in their relationship, and waits until it holds them, ten
+/// seconds at most each. The helper goes next, and with it the only way
+/// they come: a notice still on its way, or what the guardian asks for
+/// after a reconcile, is lost with it. A guardian without the new root's
+/// entries never learns this device's link key, and so never answers it
+/// (`link.md#silence-and-cookies`): the person's new device could not reach
+/// that guardian, nor anyone who learns of it only from them.
+async fn hand_over(
+    hd: &Arc<Daemon>,
+    guardian: &[u8; 32],
+    space: &SpaceId,
+    entries: &[(EntryId, Vec<u8>)],
+) {
+    if entries.is_empty() {
+        return;
+    }
+    for s in hd.sessions_of(guardian) {
+        let given = async {
+            for (id, entry) in entries {
+                net::deliver(&s, *space, entry.clone(), *id).await?;
+            }
+            anyhow::Ok(())
+        };
+        match tokio::time::timeout(Duration::from_secs(10), given).await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                tracing::warn!("a guardian's device did not take the recovery's end: {e:#}")
+            }
+            Err(_) => tracing::warn!("a guardian's device did not take the recovery's end in time"),
+        }
+    }
 }
 
 /// The sets the guardians' personas gave the helper to hold (D80): the
