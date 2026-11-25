@@ -211,7 +211,16 @@ pub(crate) fn offer_to(d: &Arc<Daemon>, id: &SpaceId, who: &[[u8; 32]]) -> anyho
 }
 
 /// Makes a group of this person and `who`, and offers it to each of them.
-pub fn create(d: &Arc<Daemon>, name: &str, who: &[String]) -> anyhow::Result<Json> {
+/// With `for_call` it is one [made for a call](`profiles.md#a-group-made-for-a-call`),
+/// and with `history` false its policy does not share its history with
+/// those added later; left out, it shares it, as before.
+pub fn create(
+    d: &Arc<Daemon>,
+    name: &str,
+    who: &[String],
+    for_call: bool,
+    history: bool,
+) -> anyhow::Result<Json> {
     let name = name.trim();
     anyhow::ensure!(!name.is_empty(), "a group needs a name");
     let theirs = people(d, who)?;
@@ -220,7 +229,9 @@ pub fn create(d: &Arc<Daemon>, name: &str, who: &[String]) -> anyhow::Result<Jso
         .iter()
         .map(|c| (c.identity, offered_as(c).to_owned()))
         .collect();
-    let id = d.core().create_group(name, &me_as, &members)?;
+    let id = d
+        .core()
+        .create_group_with(name, &me_as, &members, for_call, history)?;
     let genesis = {
         let core = d.core();
         let open = core.spaces.get(&id).and_then(|h| h.space.as_ref());
@@ -253,6 +264,7 @@ pub fn add(
             "only an admin of {} can add people",
             g.name
         );
+        shares_history(sp, &g.name)?;
     }
     let theirs = people(d, who)?;
     let members: Vec<([u8; 32], String)> = theirs
@@ -267,6 +279,18 @@ pub fn add(
     offer(d, &g.id, &g.name, &theirs)?;
     d.bump();
     Ok(json!({}))
+}
+
+/// Nobody is added to a group whose policy does not share its history, nor
+/// added back (`profiles.md#a-group-made-for-a-call`): someone added
+/// without the history could not judge it.
+fn shares_history(sp: &Space, name: &str) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        sp.policy().history_shared,
+        "{name} does not share its history with those added later, so nobody can be added to \
+         it: make a new group for them instead"
+    );
+    Ok(())
 }
 
 /// The member of a group someone means: typed, a contact by their
@@ -783,6 +807,12 @@ pub fn rejoin(d: &Arc<Daemon>, group: &str) -> anyhow::Result<Json> {
             return Err(e);
         }
     };
+    {
+        let core = d.core();
+        let sp = core.spaces.get(&g.id).and_then(|h| h.space.as_ref());
+        let sp = sp.ok_or_else(|| anyhow::anyhow!("that group is not open yet"))?;
+        shares_history(sp, &g.name)?;
+    }
     d.write_and_push(&g.id, vec![SpaceOp::add_member(me, group::ADMIN)])?;
     d.bump();
     Ok(json!({"group": hex::encode(g.id), "name": g.name}))
@@ -1279,6 +1309,8 @@ pub fn list_of(core: &Core) -> Json {
                     "members": how_many,
                     "public": sp.is_public(),
                     "reach": telling_json(core, id, &me),
+                    "for_call": group::for_call(sp),
+                    "last_call": core.last_call(id),
                 }));
             }
             continue;
@@ -1346,6 +1378,8 @@ pub fn list_of(core: &Core) -> Json {
             "admin": may_manage(sp, &me),
             "role": sp.role_of(&me).map(role_name),
             "introductions": group::introductions(sp),
+            "for_call": group::for_call(sp),
+            "last_call": core.last_call(id),
             "unread": unread,
             "last": last.map(|m| json!({
                 "mine": m.author == me,
@@ -1378,22 +1412,7 @@ pub fn members(d: &Daemon, group: &str) -> anyhow::Result<Json> {
             let known = contacts
                 .iter()
                 .find(|c| c.identity == m.identity && !c.refused);
-            let contact = known.is_some();
-            let mut v = json!({
-                "name": name_of(&me, &contacts, &members, &m.identity),
-                "shown": m.name,
-                "id": hex::encode(&m.identity[..8]),
-                "you": m.identity == me,
-                "contact": contact,
-                "role": match m.role {
-                    group::OWNER => "owner",
-                    group::ADMIN => "admin",
-                    group::READER => "reader",
-                    _ => "member",
-                },
-                "introduce": m.introduce,
-                "left": m.left,
-            });
+            let mut v = member_fields(&me, &contacts, &members, m);
             // what carries what this person writes to them, and theirs back
             // (D89): for someone in it who has joined, not this person
             if seen.others.contains(&m.identity) {
@@ -1407,15 +1426,7 @@ pub fn members(d: &Daemon, group: &str) -> anyhow::Result<Json> {
                 v["through"] = json!(through);
                 v["reaches_you"] = json!(seen.reaches_me(&m.identity));
             }
-            // a contact's as this person sees them: own name, picture
-            match known {
-                Some(c) => {
-                    let mut v = crate::names::with_shown(d, c, v);
-                    v["name"] = json!(name_of(&me, &contacts, &members, &m.identity));
-                    v
-                }
-                None => v,
-            }
+            shown_as_contact(d, &me, &contacts, &members, known, &m.identity, v)
         })
         .collect();
     // and whoever was taken out when it moved, marked: by the name the
@@ -1436,6 +1447,94 @@ pub fn members(d: &Daemon, group: &str) -> anyhow::Result<Json> {
         }));
     }
     Ok(json!({"group": hex::encode(g.id), "name": g.name, "members": out}))
+}
+
+/// A *member* as `group-members` gives one, without how they are reached.
+fn member_fields(
+    me: &[u8; 32],
+    contacts: &[ContactRecord],
+    members: &[Member],
+    m: &Member,
+) -> Json {
+    let contact = contacts
+        .iter()
+        .any(|c| c.identity == m.identity && !c.refused);
+    json!({
+        "name": name_of(me, contacts, members, &m.identity),
+        "shown": m.name,
+        "id": hex::encode(&m.identity[..8]),
+        "you": m.identity == *me,
+        "contact": contact,
+        "role": match m.role {
+            group::OWNER => "owner",
+            group::ADMIN => "admin",
+            group::READER => "reader",
+            _ => "member",
+        },
+        "introduce": m.introduce,
+        "left": m.left,
+    })
+}
+
+/// A contact's member record as this person sees them: their own name for
+/// them, and the picture.
+fn shown_as_contact(
+    d: &Daemon,
+    me: &[u8; 32],
+    contacts: &[ContactRecord],
+    members: &[Member],
+    known: Option<&ContactRecord>,
+    who: &[u8; 32],
+    v: Json,
+) -> Json {
+    match known {
+        Some(c) => {
+            let mut v = crate::names::with_shown(d, c, v);
+            v["name"] = json!(name_of(me, contacts, members, who));
+            v
+        }
+        None => v,
+    }
+}
+
+/// What a ringing or live call in a group says of it (`apps.md`, *call*):
+/// `name`, the group's; `for_call`; `admins`, its owner and its admins who
+/// have not left, the owner first, each a *member* without how they are
+/// reached; `caller`, who rang, as one, where given; and where the group is
+/// only offered to this person, `joins` true and the offer's `reach`.
+pub(crate) fn call_json(d: &Daemon, space: &SpaceId, caller: Option<&[u8; 32]>) -> Json {
+    let Ok(me) = identity(d) else {
+        return json!({});
+    };
+    let core = d.core();
+    let Some(sp) = core.spaces.get(space).and_then(|h| h.space.as_ref()) else {
+        return json!({});
+    };
+    let members = group::members(sp);
+    let contacts = core.contacts();
+    let person = |m: &Member| {
+        let known = contacts
+            .iter()
+            .find(|c| c.identity == m.identity && !c.refused);
+        let v = member_fields(&me, &contacts, &members, m);
+        shown_as_contact(d, &me, &contacts, &members, known, &m.identity, v)
+    };
+    let mut admins: Vec<&Member> = members
+        .iter()
+        .filter(|m| m.role >= group::ADMIN && !m.left)
+        .collect();
+    admins.sort_by_key(|m| std::cmp::Reverse(m.role == group::OWNER));
+    let admins: Vec<Json> = admins.into_iter().map(person).collect();
+    let caller = caller.and_then(|c| members.iter().find(|m| m.identity == *c).map(person));
+    let joins = !core.is_joined(space);
+    json!({
+        "name": group::name(sp),
+        "for_call": group::for_call(sp),
+        "admins": admins,
+        "caller": caller,
+        "joins": joins.then_some(true),
+        "reach": joins.then(|| telling_json(&core, space, &me)),
+    })
 }
 
 /// This person turned to a group: its members who are trusted contacts are
@@ -1679,7 +1778,14 @@ pub fn set(
     group: &str,
     name: Option<&str>,
     introductions: Option<bool>,
+    for_call: Option<bool>,
 ) -> anyhow::Result<Json> {
+    // Only a genesis makes a group one made for a call: refused before
+    // anything is written.
+    anyhow::ensure!(
+        for_call != Some(true),
+        "only a new group is made for a call: make one with group-create"
+    );
     let g = joined(d, group)?;
     let me = identity(d)?;
     let ops = {
@@ -1699,6 +1805,10 @@ pub fn set(
         }
         if let Some(on) = introductions {
             ops.push(group::set_introductions(c, on));
+        }
+        // "Keep this group": where it is not one made for a call, nothing
+        if for_call == Some(false) && group::for_call(sp) {
+            ops.push(group::keep_group(c));
         }
         ops
     };
@@ -1737,7 +1847,7 @@ pub fn rename(d: &Arc<Daemon>, group: &SpaceId, name: &str) -> Result<(), NotAdm
             )));
         }
     }
-    set(d, &hex::encode(group), Some(name), None).map_err(NotAdmin::Other)?;
+    set(d, &hex::encode(group), Some(name), None, None).map_err(NotAdmin::Other)?;
     Ok(())
 }
 
@@ -1815,6 +1925,105 @@ pub(crate) fn shared_group(d: &Daemon, space: &SpaceId, who: &[u8; 32]) -> Optio
         && sp.role_of(who).is_some()
         && !sp.has_left(who);
     ours.then(|| group::name(sp))
+}
+
+/// Those `call-start` `ring` names in group `space`, as contacts: each a
+/// member who has not left, not this person, and their contact, not
+/// refused. Where any is not, the request is refused, saying who and why
+/// (`apps.md`, `call-start`).
+pub(crate) fn to_ring(
+    d: &Daemon,
+    space: &SpaceId,
+    named: &[String],
+) -> anyhow::Result<Vec<ContactRecord>> {
+    anyhow::ensure!(!named.is_empty(), "`ring` names someone to ring");
+    let me = identity(d)?;
+    let core = d.core();
+    let sp = core.spaces.get(space).and_then(|h| h.space.as_ref());
+    let sp = sp.ok_or_else(|| anyhow::anyhow!("that group is not open yet"))?;
+    let contacts = core.contacts();
+    let mut out: Vec<ContactRecord> = Vec::new();
+    for who in named {
+        let shown = api::shown(who);
+        let them = member_named(&contacts, sp, who)
+            .map_err(|e| anyhow::anyhow!("{shown} cannot be rung: {e}"))?;
+        anyhow::ensure!(them != me, "{shown} is you: you are not rung");
+        anyhow::ensure!(
+            !sp.has_left(&them),
+            "{shown} has left {}, and is not rung",
+            group::name(sp)
+        );
+        let c = contacts
+            .iter()
+            .find(|c| c.identity == them && !c.refused && c.recovery_of.is_none())
+            .ok_or_else(|| {
+                anyhow::anyhow!("{shown} is not a contact of yours: only your contacts are rung")
+            })?;
+        if !out.iter().any(|o| o.identity == them) {
+            out.push(c.clone());
+        }
+    }
+    Ok(out)
+}
+
+/// Where a `ring` in `space`, a group this person has been offered and has
+/// not accepted, rings (`profiles.md#calls-guidance`, "Someone only offered
+/// the group"): `from` wrote an offer of it in the relationship the two
+/// share and is a contact not refused; the person has not declined it;
+/// and this device holds it, open, showing them both as members. Then the
+/// group's name. `None` where any of that does not hold, as before the
+/// offer or the group has come.
+pub(crate) fn offered_ring(d: &Daemon, space: &SpaceId, from: &[u8; 32]) -> Option<String> {
+    let me = identity(d).ok()?;
+    let core = d.core();
+    let contact = core
+        .contacts()
+        .into_iter()
+        .find(|c| c.identity == *from && !c.refused && c.recovery_of.is_none())?;
+    // offers_from leaves out what was declined
+    if !core
+        .offers_from(&contact.identity)
+        .iter()
+        .any(|o| o.space == *space)
+    {
+        return None;
+    }
+    if core.declined().contains(space) || core.is_joined(space) {
+        return None;
+    }
+    let sp = core.spaces.get(space)?.space.as_ref()?;
+    let member = |w: &[u8; 32]| sp.role_of(w).is_some() && !sp.has_left(w);
+    let ours = sp.profile() == group::GROUP && member(&me) && member(from);
+    ours.then(|| group::name(sp))
+}
+
+/// Whether `space` could still become a group whose ring from `from` rings
+/// here: it is not one this person declined, or joined, or holds open as
+/// something else. A ring for it is kept a while (`profiles.md#calls-guidance`).
+pub(crate) fn may_be_offered(d: &Daemon, space: &SpaceId, from: &[u8; 32]) -> bool {
+    let core = d.core();
+    let contact = core
+        .contacts()
+        .into_iter()
+        .any(|c| c.identity == *from && !c.refused && c.recovery_of.is_none());
+    if !contact || core.declined().contains(space) || core.is_joined(space) {
+        return false;
+    }
+    match core.spaces.get(space).and_then(|h| h.space.as_ref()) {
+        Some(sp) => sp.profile() == group::GROUP,
+        None => true,
+    }
+}
+
+/// Whether `space` is a group held here that this person has not joined.
+pub(crate) fn only_offered(d: &Daemon, space: &SpaceId) -> bool {
+    let core = d.core();
+    let group = core
+        .spaces
+        .get(space)
+        .and_then(|h| h.space.as_ref())
+        .is_some_and(|sp| sp.profile() == group::GROUP);
+    group && !core.is_joined(space)
 }
 
 /// The sessions with the devices of a group's members: the other members',

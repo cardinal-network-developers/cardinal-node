@@ -314,6 +314,10 @@ pub struct Daemon {
     pub rung_calls: Mutex<std::collections::VecDeque<[u8; 16]>>,
     /// The group calls whose ring this device passed on lately.
     pub passed_rings: Mutex<std::collections::VecDeque<[u8; 16]>>,
+    /// A `ring` in a group offered to this person that came before the
+    /// offer, or before the group opened: the last from each contact, kept
+    /// for no longer than a call rings (`profiles.md#calls-guidance`).
+    pub kept_rings: Mutex<HashMap<[u8; 32], crate::calls::Kept>>,
     /// Whether this device can help others now (`conditions.rs`).
     pub conditions: crate::conditions::Conditions,
     /// When each contact rang lately, so they can ring only so often.
@@ -595,6 +599,7 @@ impl Daemon {
             group_calls: Mutex::new(HashMap::new()),
             rung_calls: Mutex::new(std::collections::VecDeque::new()),
             passed_rings: Mutex::new(std::collections::VecDeque::new()),
+            kept_rings: Mutex::new(HashMap::new()),
             conditions: crate::conditions::Conditions::default(),
             rang: Mutex::new(HashMap::new()),
             spread: Mutex::new(cardinal_sync::Spread::new()),
@@ -2509,6 +2514,7 @@ impl Daemon {
         }
         crate::mailbox::start(self.clone());
         crate::groups::start(self.clone());
+        crate::calls::ring_kept(self.clone());
         crate::introductions::start(self.clone());
         crate::names::start(self.clone());
         // Report (never install) new releases, if the person allows it.

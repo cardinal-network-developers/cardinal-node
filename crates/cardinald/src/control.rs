@@ -30,7 +30,7 @@ use crate::transport::{self, Listener, Reader, Received, Writer, MAX_MESSAGE};
 
 /// The version of this interface. A client compares it with `hello`'s.
 /// 2: the base encoding, with numbered fields, in place of lines of JSON.
-const API: u64 = 2;
+const API: u64 = 3;
 /// How long news waits, so that a burst of changes is one event.
 const NEWS_GATHERS: Duration = Duration::from_millis(100);
 
@@ -595,7 +595,12 @@ async fn handle(d: &Arc<Daemon>, req: &Value) -> anyhow::Result<Value> {
             let note = req.get("note").and_then(|v| v.as_str());
             crate::introductions::ask_in_group(d, arg(req, "group")?, arg(req, "who")?, note)
         }
-        "group-create" => crate::groups::create(d, arg(req, "name")?, &strings(req, "people")),
+        "group-create" => {
+            let for_call = answer_in(req, "for_call")?.unwrap_or(false);
+            let history = answer_in(req, "history")?.unwrap_or(true);
+            let people = strings(req, "people");
+            crate::groups::create(d, arg(req, "name")?, &people, for_call, history)
+        }
         "group-add" => {
             let shown = req.get("shown").and_then(|v| v.as_str());
             crate::groups::add(d, arg(req, "group")?, &strings(req, "people"), shown)
@@ -637,7 +642,8 @@ async fn handle(d: &Arc<Daemon>, req: &Value) -> anyhow::Result<Value> {
         "group-set" => {
             let name = req.get("name").and_then(|v| v.as_str());
             let introductions = req.get("introductions").and_then(|v| v.as_bool());
-            crate::groups::set(d, arg(req, "group")?, name, introductions)
+            let for_call = answer_in(req, "for_call")?;
+            crate::groups::set(d, arg(req, "group")?, name, introductions, for_call)
         }
         "group-member" => {
             let shown = req.get("shown").and_then(|v| v.as_str());
@@ -674,8 +680,17 @@ async fn handle(d: &Arc<Daemon>, req: &Value) -> anyhow::Result<Value> {
         "react" => crate::contacts::react(d, arg(req, "who")?, arg(req, "id")?, arg(req, "text")?),
         "call" => Ok(crate::calls::current(d)),
         "conditions" => conditions(d, req),
+        "call-start" if req.get("ring").is_some_and(|r| !r.is_null()) => {
+            anyhow::ensure!(
+                req.get("who").is_none_or(Value::is_null),
+                "`ring` names members of a group: it is not for a call with one person"
+            );
+            let ring = strings(req, "ring");
+            anyhow::ensure!(!ring.is_empty(), "`ring` names someone to ring");
+            crate::calls::start_group(d, arg(req, "group")?, Some(&ring)).await
+        }
         "call-start" if req.get("group").is_some() => {
-            crate::calls::start_group(d, arg(req, "group")?).await
+            crate::calls::start_group(d, arg(req, "group")?, None).await
         }
         "call-start" => crate::calls::start(d, arg(req, "who")?, formats(req)?).await,
         "clip-copy" => crate::clipboard::copy(d, arg(req, "text")?).await,
@@ -688,7 +703,10 @@ async fn handle(d: &Arc<Daemon>, req: &Value) -> anyhow::Result<Value> {
         "approval-revoke" => crate::apps::revoke(d, arg(req, "id")?),
         "app-offers" => Ok(crate::apps::list_offers(d)),
         "app-join" => crate::apps::join(d, arg(req, "space")?),
-        "call-answer" => crate::calls::answer(d, formats(req)?).await,
+        "call-answer" => {
+            let reach = answer_in(req, "reach")?;
+            crate::calls::answer(d, formats(req)?, reach).await
+        }
         "call-end" => crate::calls::end(d).await,
         "conversations" => Ok(crate::contacts::conversations(d)),
         "mark-read" => crate::contacts::mark_read(d, arg(req, "who")?),

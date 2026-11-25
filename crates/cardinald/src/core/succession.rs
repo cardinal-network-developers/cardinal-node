@@ -87,6 +87,23 @@ pub struct Notes {
     /// [`super::RELAYED_FOR_MS`], and never sent anywhere.
     #[serde(default)]
     pub relayed: BTreeMap<String, u64>,
+    /// The last call in this group that ended on this device, as `call`
+    /// gives `ended`, with when (D92): kept here alone, across restarts,
+    /// and never sent anywhere. Nothing in a space records a call.
+    #[serde(default)]
+    pub last_call: Option<LastCall>,
+}
+
+/// A call that ended on this device, for a group's `last_call`.
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct LastCall {
+    pub id: String,
+    pub who: String,
+    pub name: String,
+    pub how: String,
+    /// When it ended here, in milliseconds since 1970, by this device's
+    /// clock.
+    pub at: u64,
 }
 
 /// What [`Core::succeed`] wrote, to send.
@@ -416,6 +433,28 @@ impl Core {
                 Some((id(a)?, id(b)?))
             })
             .collect()
+    }
+
+    /// Notes the last call in group `space` that ended on this device.
+    pub fn note_last_call(&mut self, space: &SpaceId, call: LastCall) {
+        if let Some(h) = self.spaces.get_mut(space) {
+            h.notes.last_call = Some(call);
+            h.save_notes();
+        }
+    }
+
+    /// The last call in group `space` that ended on this device, as `call`
+    /// gives `ended`, with `at`.
+    pub fn last_call(&self, space: &SpaceId) -> Option<serde_json::Value> {
+        let c = self.spaces.get(space)?.notes.last_call.as_ref()?;
+        Some(serde_json::json!({
+            "id": c.id,
+            "who": c.who,
+            "name": c.name,
+            "group": hex::encode(space),
+            "how": c.how,
+            "at": c.at,
+        }))
     }
 
     /// The person cleared the note of how the group moved to `space`.

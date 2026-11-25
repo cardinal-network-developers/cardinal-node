@@ -22,7 +22,7 @@ use crate::paths::Paths;
 mod succession;
 #[cfg(test)]
 use succession::ops_hash;
-pub use succession::{undo_named, Notes, Succeeded, Undo};
+pub use succession::{undo_named, LastCall, Notes, Succeeded, Undo};
 
 /// The account-space secret holding the discovery secret.
 pub const DISCOVERY_PURPOSE: &str = "discovery";
@@ -2750,6 +2750,21 @@ impl Core {
         me_as: &str,
         members: &[([u8; 32], String)],
     ) -> anyhow::Result<SpaceId> {
+        self.create_group_with(name, me_as, members, false, true)
+    }
+
+    /// [`Core::create_group`], and with `for_call` one made for a call (its
+    /// genesis creates the conversation node with field 3 true), and with
+    /// `history` false one whose policy does not share its history with
+    /// those added later (`profiles.md#a-group-made-for-a-call`).
+    pub fn create_group_with(
+        &mut self,
+        name: &str,
+        me_as: &str,
+        members: &[([u8; 32], String)],
+        for_call: bool,
+        history: bool,
+    ) -> anyhow::Result<SpaceId> {
         use cardinal_space::group;
         let ident = self
             .identity
@@ -2762,7 +2777,7 @@ impl Core {
             .public_key()
             .clone();
         let mut keys = vec![mine];
-        let mut ops = group::genesis_ops(ident.id(), name);
+        let mut ops = group::genesis_ops_for(ident.id(), name, for_call);
         for (who, _) in members {
             keys.push(self.encryption_key_of(who)?);
             ops.push(SpaceOp::add_member(*who, group::WRITER));
@@ -2774,7 +2789,10 @@ impl Core {
         let refs: Vec<&HybridPublicKey> = keys.iter().collect();
         let (space, sealed) = Space::create_with(
             group::GROUP,
-            cardinal_space::Policy::default(),
+            cardinal_space::Policy {
+                history_shared: history,
+                ..cardinal_space::Policy::default()
+            },
             &ident.log,
             &self.keys.device.signing,
             &refs,
