@@ -108,7 +108,7 @@ cardinal/copies                 branch  files           35
 cardinal/fetch_order            branch  files           11
 cardinal/restore                branch  files,recovery  8
 cardinal/groups                 branch  groups          15
-cardinal/guardians              branch  groups,recovery 39
+cardinal/guardians              branch  groups,recovery 59
 cardinal/group_calls            branch  groups,calls    52
 cardinal/call_groups            branch  groups,calls    60
 cardinal/invitations            branch  contacts        100

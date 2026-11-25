@@ -976,6 +976,9 @@ async fn fetch_worker(
                 }
                 continue;
             }
+            if let Some(t) = crate::news::late() {
+                tokio::time::sleep(t).await;
+            }
             let r = fetch_raw(d, s, label, &batch, access).await;
             asked.extend_from_slice(&batch);
             match r {
