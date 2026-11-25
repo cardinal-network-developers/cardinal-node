@@ -276,7 +276,9 @@ fn python(args: &[&str]) -> Option<String> {
 
 fn check(args: &[&str], label: &str) {
     let Some(json) = python(args) else {
-        eprintln!("{label}: python3 or core/model not available; skipping");
+        cardinal_identity::testutil::skipping(&format!(
+            "{label}: python3 or core/model not available"
+        ));
         return;
     };
     let mut stats = Stats::default();

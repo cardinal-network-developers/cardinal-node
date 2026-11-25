@@ -218,9 +218,27 @@ async fn meeting_a_person_exchanges_no_proofs() {
     assert_eq!(b.unwrap().peer_identity().unwrap().identity, [0x0a; 32]);
 }
 
-/// Multicast on loopback, on a private port; `None` if unavailable here.
+/// Says why a test cannot run here, before it returns: a skip, said; or,
+/// in the release tier (`CARDINAL_TEST_STRICT=1`, set by
+/// `scripts/test-tier release`), a failure.
+fn skipping(why: &str) {
+    let strict = std::env::var_os("CARDINAL_TEST_STRICT").is_some_and(|v| v == "1");
+    assert!(!strict, "cannot run in the release tier: {why}");
+    eprintln!("skipping: {why}");
+}
+
+/// Multicast on loopback, on a private port (and the next one); `None` if
+/// unavailable here. Run side by side with other binaries, the port is the
+/// first of the block `scripts/test-tier` gave this one
+/// (`CARDINAL_TEST_PORTS`), which no other binary uses.
 async fn loopback_mdns() -> Option<MdnsConfig> {
-    let port = 20000 + (std::process::id() % 20000) as u16;
+    let port = match std::env::var("CARDINAL_TEST_PORTS") {
+        Ok(v) => v
+            .split_once('-')
+            .and_then(|(a, _)| a.parse::<u16>().ok())
+            .unwrap_or_else(|| panic!("CARDINAL_TEST_PORTS={v} is not first-last")),
+        Err(_) => 20000 + (std::process::id() % 20000) as u16,
+    };
     let cfg = MdnsConfig {
         group: Ipv4Addr::new(224, 0, 0, 251),
         port,
@@ -241,7 +259,7 @@ async fn loopback_mdns() -> Option<MdnsConfig> {
 #[tokio::test]
 async fn discovery_on_loopback_multicast() {
     let Some(cfg) = loopback_mdns().await else {
-        eprintln!("skipping: multicast on loopback is unavailable");
+        skipping("multicast on loopback is unavailable");
         return;
     };
     let secret = [0x5c; 32];
@@ -272,7 +290,7 @@ async fn discovery_on_loopback_multicast() {
 #[tokio::test]
 async fn pairing_found_by_mdns() {
     let Some(cfg) = loopback_mdns().await else {
-        eprintln!("skipping: multicast on loopback is unavailable");
+        skipping("multicast on loopback is unavailable");
         return;
     };
     let cfg = MdnsConfig {

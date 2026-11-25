@@ -39,6 +39,11 @@ fn the_document_is_the_one_basics_describes() {
     assert_eq!(r.list(5).unwrap().len(), 3);
     let words = r.text(6).unwrap();
     let Some(spec) = core_path("basics/calendar.md") else {
+        let strict = std::env::var_os("CARDINAL_TEST_STRICT").is_some_and(|v| v == "1");
+        assert!(
+            !strict,
+            "cannot run in the release tier: no specification checkout found"
+        );
         eprintln!("skipping the words: no specification checkout found");
         return;
     };

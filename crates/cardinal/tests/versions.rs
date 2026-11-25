@@ -24,7 +24,7 @@ fn old_bin() -> Option<PathBuf> {
     }
     let old = std::env::var_os("CARDINAL_OLD_BIN").map(PathBuf::from);
     if old.is_none() {
-        eprintln!("skipping: CARDINAL_OLD_BIN is not set");
+        skipping("CARDINAL_OLD_BIN is not set");
     }
     old
 }
@@ -248,7 +248,7 @@ fn an_old_account_gets_a_name_of_its_own() {
         .output()
         .is_ok_and(|o| o.status.success());
     if knows_names {
-        eprintln!("skipping: the old version already keeps the person's name");
+        skipping("the old version already keeps the person's name");
         return;
     }
     let root = tempfile::tempdir().unwrap();

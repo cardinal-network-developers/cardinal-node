@@ -95,7 +95,7 @@ fn online(d: &Dev, who: &str) -> bool {
 #[test]
 fn trusted_contacts_with_no_host_find_each_other_on_the_local_network() {
     let Some(mdns) = loopback_mdns() else {
-        eprintln!("skipping: multicast on loopback is unavailable");
+        skipping("multicast on loopback is unavailable");
         return;
     };
     let root = tempfile::tempdir().unwrap();
@@ -226,11 +226,11 @@ fn forget_addresses(dir: &std::path::Path) {
 #[test]
 fn contacts_updated_one_after_the_other_find_each_other_again_on_the_lan() {
     let Some(old) = std::env::var_os("CARDINAL_OLD_BIN") else {
-        eprintln!("skipping: CARDINAL_OLD_BIN is not set");
+        skipping("CARDINAL_OLD_BIN is not set");
         return;
     };
     let Some(mdns) = loopback_mdns() else {
-        eprintln!("skipping: multicast on loopback is unavailable");
+        skipping("multicast on loopback is unavailable");
         return;
     };
     let root = tempfile::tempdir().unwrap();

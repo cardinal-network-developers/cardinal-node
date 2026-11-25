@@ -1,0 +1,395 @@
+#!/usr/bin/env python3
+"""Runs a tier of the node's tests, test binaries side by side.
+
+    scripts/test-tier quick   [word...] [options]
+    scripts/test-tier branch  [word...] [options]
+    scripts/test-tier release [word...] [options]
+
+Each word is an area (groups, calls, files, ...) or a binary as
+tests/tiers.txt names it (cardinal/guardians). Which binaries run:
+
+  quick     the quick binaries, plus those of the words given.
+  branch    the quick binaries, plus those of the words given, or with no
+            word every binary. Outside the release tier the slow tests of
+            tests/tiers.txt are left out, unless --slow.
+  release   every binary, every test, and the checks around them: fmt,
+            clippy, a build without a folder, the doc-tests and the API
+            tables. A test that cannot run here (no FUSE, no multicast, no
+            specification checkout, CARDINAL_OLD_BIN not set) fails rather
+            than skipping: CARDINAL_TEST_STRICT=1. With words, only those
+            binaries run, strictly, without the checks around them: for a
+            rerun.
+
+The workspace is built once (`cargo test --no-run`), then the chosen
+binaries run --jobs at a time (4 by default), longest first, each with a
+block of ports of its own (CARDINAL_TEST_PORTS) and a log of its own. It
+fails when a test binary has no line in tests/tiers.txt, or a line names
+none: a new test file cannot drop out of every tier.
+
+Options:
+  -j, --jobs N     binaries side by side (1 to 8; default 4)
+  --slow           keep the slow tests outside the release tier too
+  --logs DIR       where the logs go (default target/test-tier/<tier>-<time>)
+  --timeout SECS   most a binary may take (default 1200)
+  --list           print what would run, without building or running
+  --old-bin PATH   the release before, for the versions tests (release
+                   needs it here or in CARDINAL_OLD_BIN)
+
+Cargo's own environment holds (CARGO_TARGET_DIR, RUSTFLAGS). The tests'
+own settings pass through (CARDINAL_CORE).
+"""
+
+import argparse
+import json
+import os
+import re
+import signal
+import subprocess
+import sys
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+TIERS = ROOT / "tests" / "tiers.txt"
+TIER_NAMES = ("quick", "branch", "release")
+AREAS = {"all", "basics", "files", "groups", "recovery", "contacts", "reach",
+         "calls", "settings", "apps"}
+# Each binary running side by side gets PORT_BLOCK ports from PORT_BASE up,
+# all below the range Linux hands out for port 0 (32768 and up), so neither
+# another binary nor a daemon's outgoing socket takes a test's port between
+# its check and its bind.
+PORT_BASE, PORT_BLOCK, MAX_JOBS = 20000, 1500, 8
+
+
+def fail(msg):
+    print(f"test-tier: {msg}", file=sys.stderr)
+    sys.exit(2)
+
+
+class Line:
+    def __init__(self, key, tier, areas, secs):
+        self.key, self.tier, self.areas, self.secs = key, tier, areas, secs
+        self.slow = []
+
+
+def read_tiers():
+    lines, slow = {}, []
+    for n, raw in enumerate(TIERS.read_text().splitlines(), 1):
+        text = raw.split("#", 1)[0].split()
+        if not text:
+            continue
+        where = f"{TIERS.relative_to(ROOT)}:{n}"
+        if text[0] == "slow":
+            if len(text) != 3:
+                fail(f"{where}: a slow line is `slow <binary> <test>`")
+            slow.append((where, text[1], text[2]))
+            continue
+        if len(text) != 4:
+            fail(f"{where}: a line is `<binary> <tier> <areas> <seconds>`")
+        key, tier, areas, secs = text
+        if tier not in TIER_NAMES:
+            fail(f"{where}: no tier {tier!r}")
+        areas = areas.split(",")
+        for a in areas:
+            if a not in AREAS:
+                fail(f"{where}: no area {a!r}")
+        if not secs.isdigit():
+            fail(f"{where}: seconds {secs!r} is not a number")
+        if key in lines:
+            fail(f"{where}: {key} has a line already")
+        lines[key] = Line(key, tier, areas, int(secs))
+    for where, key, test in slow:
+        if key not in lines:
+            fail(f"{where}: no binary {key}")
+        lines[key].slow.append(test)
+    return lines
+
+
+def choose(lines, tier, words):
+    areas = [w for w in words if "/" not in w]
+    named = [w for w in words if "/" in w]
+    for a in areas:
+        if a not in AREAS:
+            fail(f"no area {a!r} (areas: {', '.join(sorted(AREAS))})")
+    for b in named:
+        if b not in lines:
+            fail(f"no binary {b!r} in {TIERS.relative_to(ROOT)}")
+
+    def of_words(l):
+        return l.key in named or any(a in l.areas for a in areas)
+
+    if tier == "release":
+        return [l for l in lines.values() if not words or of_words(l)]
+    if tier == "branch" and not words:
+        return list(lines.values())
+    return [l for l in lines.values() if l.tier == "quick" or of_words(l)]
+
+
+def key_of(artifact):
+    """The tiers.txt name of a test executable from cargo's JSON."""
+    t = artifact["target"]
+    crate = Path(t["src_path"]).resolve().relative_to(ROOT / "crates").parts[0]
+    kinds = t["kind"]
+    if "test" in kinds:
+        return f"{crate}/{t['name']}"
+    if "bin" in kinds:
+        return f"{crate}/bin/{t['name']}"
+    return f"{crate}/lib"
+
+
+def build(log):
+    """Builds every test binary once; their paths, by tiers.txt name."""
+    cmd = ["cargo", "test", "--workspace", "--locked", "--no-run",
+           "--message-format=json-render-diagnostics"]
+    print("building:", " ".join(cmd), flush=True)
+    found = {}
+    with open(log, "w") as err:
+        p = subprocess.Popen(cmd, cwd=ROOT, stdout=subprocess.PIPE, stderr=err,
+                             text=True)
+        for raw in p.stdout:
+            try:
+                m = json.loads(raw)
+            except json.JSONDecodeError:
+                continue
+            if m.get("reason") != "compiler-artifact":
+                continue
+            if not m.get("profile", {}).get("test") or not m.get("executable"):
+                continue
+            key = key_of(m)
+            if key in found and found[key] != m["executable"]:
+                fail(f"two test binaries are both {key}")
+            found[key] = m["executable"]
+        if p.wait() != 0:
+            sys.stderr.write(Path(log).read_text()[-4000:])
+            fail(f"the build failed (log: {log})")
+    return found
+
+
+def check_every_binary(lines, built):
+    missing = sorted(set(built) - set(lines))
+    gone = sorted(set(lines) - set(built))
+    msgs = [f"{k} has no line in tests/tiers.txt" for k in missing]
+    msgs += [f"tests/tiers.txt names {k}, which is no test binary" for k in gone]
+    if msgs:
+        fail("\n  ".join(["every test binary has one line in tests/tiers.txt:"] + msgs))
+
+
+def check_slow_names(chosen, built):
+    """A slow line must name a test the binary has: one renamed would
+    otherwise drop out quietly."""
+    for l in chosen:
+        if not l.slow:
+            continue
+        out = subprocess.run([built[l.key], "--list", "--format", "terse"],
+                             capture_output=True, text=True, check=True).stdout
+        have = {x.rsplit(": ", 1)[0] for x in out.splitlines() if x.endswith(": test")}
+        for t in l.slow:
+            if t not in have:
+                fail(f"tests/tiers.txt: {l.key} has no test {t}")
+
+
+RESULT = re.compile(r"test result: (\w+)\. (\d+) passed; (\d+) failed; (\d+) ignored")
+# What a test says when it does not run. The release tier fails it rather
+# than counting it as run; the tests' own checks fail first, this is the
+# net for a skip that goes around them.
+SKIPPED = re.compile(r"^.{0,40}\bskipp(?:ing|ed)\b", re.IGNORECASE | re.MULTILINE)
+
+
+class Run:
+    def __init__(self, line):
+        self.line = line
+        self.secs = 0.0
+        self.passed = self.failed = self.ignored = 0
+        self.why = None  # None when it passed
+
+    def __lt__(self, other):
+        return self.line.key < other.line.key
+
+
+def run_binary(line, exe, slot, args, env, logs, timeout):
+    r = Run(line)
+    log = logs / (line.key.replace("/", "__") + ".log")
+    first = PORT_BASE + slot * PORT_BLOCK
+    env = dict(env, CARDINAL_TEST_PORTS=f"{first}-{first + PORT_BLOCK - 1}")
+    cmd = [exe] + args
+    if not args_strict(env):
+        for t in line.slow:
+            cmd += ["--skip", t]
+        if line.slow:
+            cmd.append("--exact")
+    start = time.monotonic()
+    with open(log, "w") as out:
+        out.write(f"# {' '.join(cmd)}\n# CARDINAL_TEST_PORTS={env['CARDINAL_TEST_PORTS']}\n")
+        out.flush()
+        # The binary's own directory, as cargo runs it: some tests read
+        # files beside their crate.
+        p = subprocess.Popen(cmd, cwd=crate_dir(line.key), env=env, stdout=out,
+                             stderr=subprocess.STDOUT, start_new_session=True)
+        try:
+            code = p.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            os.killpg(p.pid, signal.SIGKILL)
+            p.wait()
+            code = None
+    r.secs = time.monotonic() - start
+    text = log.read_text(errors="replace")
+    results = RESULT.findall(text)
+    for _, passed, failed, ignored in results:
+        r.passed += int(passed)
+        r.failed += int(failed)
+        r.ignored += int(ignored)
+    if code is None:
+        r.why = f"timed out after {timeout} s"
+    elif code != 0:
+        r.why = f"exit {code}"
+    elif not results:
+        r.why = "no test result line"
+    elif args_strict(env) and SKIPPED.search(text):
+        r.why = "a test skipped: " + SKIPPED.search(text).group(0).strip()
+    with open(log, "a") as out:
+        out.write(f"\n# {r.secs:.1f} s, {'ok' if r.why is None else r.why}\n")
+    print(f"  {'ok  ' if r.why is None else 'FAIL'} {line.key:<40} {r.secs:7.1f} s"
+          f"  {r.passed} passed, {r.failed} failed, {r.ignored} ignored"
+          + ("" if r.why is None else f"  ({r.why})"), flush=True)
+    return r
+
+
+def args_strict(env):
+    return env.get("CARDINAL_TEST_STRICT") == "1"
+
+
+def crate_dir(key):
+    return ROOT / "crates" / key.split("/", 1)[0]
+
+
+def check(name, cmd, logs, env=None):
+    """One of the release checks around the tests."""
+    log = logs / f"{name}.log"
+    start = time.monotonic()
+    with open(log, "w") as out:
+        code = subprocess.call(cmd, cwd=ROOT, stdout=out, stderr=subprocess.STDOUT,
+                               env=env)
+    secs = time.monotonic() - start
+    print(f"  {'ok  ' if code == 0 else 'FAIL'} {name:<40} {secs:7.1f} s", flush=True)
+    return code == 0
+
+
+def main():
+    ap = argparse.ArgumentParser(add_help=False)
+    ap.add_argument("tier", nargs="?")
+    ap.add_argument("words", nargs="*")
+    ap.add_argument("-j", "--jobs", type=int, default=4)
+    ap.add_argument("--slow", action="store_true")
+    ap.add_argument("--logs")
+    ap.add_argument("--timeout", type=int, default=1200)
+    ap.add_argument("--list", action="store_true")
+    ap.add_argument("--old-bin")
+    ap.add_argument("-h", "--help", action="store_true")
+    a = ap.parse_args()
+    if a.help or a.tier is None:
+        print(__doc__.strip())
+        sys.exit(0 if a.help else 2)
+    if a.tier not in TIER_NAMES:
+        fail(f"no tier {a.tier!r}: quick, branch or release")
+    if not 1 <= a.jobs <= MAX_JOBS:
+        fail(f"--jobs is 1 to {MAX_JOBS}: each binary has a block of ports")
+
+    lines = read_tiers()
+    chosen = choose(lines, a.tier, a.words)
+    release = a.tier == "release"
+    keep_slow = release or a.slow
+    if a.list:
+        for l in sorted(chosen, key=lambda l: l.key):
+            slow = "" if keep_slow or not l.slow else f"  (without {len(l.slow)} slow)"
+            print(f"{l.key:<40} {l.tier:<8} {','.join(l.areas):<18} {l.secs:>4} s{slow}")
+        print(f"{len(chosen)} binaries")
+        return
+
+    env = dict(os.environ)
+    env.pop("CARDINAL_TEST_STRICT", None)
+    env.pop("CARDINAL_TEST_PORTS", None)
+    if release:
+        env["CARDINAL_TEST_STRICT"] = "1"
+        old = a.old_bin or env.get("CARDINAL_OLD_BIN")
+        if not old:
+            fail("release needs the release before: --old-bin or CARDINAL_OLD_BIN")
+        if not os.access(old, os.X_OK):
+            fail(f"the old binary {old} cannot be run")
+        env["CARDINAL_OLD_BIN"] = str(Path(old).resolve())
+
+    target = Path(env.get("CARGO_TARGET_DIR", ROOT / "target"))
+    logs = Path(a.logs) if a.logs else target / "test-tier" / (
+        f"{a.tier}-{time.strftime('%Y%m%d-%H%M%S')}")
+    logs.mkdir(parents=True, exist_ok=True)
+    logs = logs.resolve()
+    print(f"test-tier {a.tier} {' '.join(a.words)}: {len(chosen)} binaries, "
+          f"{a.jobs} at a time, logs in {logs}", flush=True)
+    if release:
+        env["CARDINAL_API_TABLES"] = str(logs / "api-tables.md")
+
+    began = time.monotonic()
+    built = build(logs / "build.log")
+    check_every_binary(lines, built)
+    check_slow_names(chosen, built)
+    built_secs = time.monotonic() - began
+
+    args = ["--show-output"] if release else []
+    order = sorted(chosen, key=lambda l: (-l.secs, l.key))
+    slots = list(range(a.jobs))
+    lock = threading.Lock()
+
+    def one(line):
+        with lock:
+            slot = slots.pop()
+        try:
+            return run_binary(line, built[line.key], slot, args, env, logs, a.timeout)
+        finally:
+            with lock:
+                slots.append(slot)
+
+    tests_began = time.monotonic()
+    with ThreadPoolExecutor(a.jobs) as pool:
+        runs = list(pool.map(one, order))
+    tests_secs = time.monotonic() - tests_began
+
+    checks_ok = True
+    if release and not a.words:
+        print("checks:", flush=True)
+        checks_ok &= check("fmt", ["cargo", "fmt", "--all", "--check"], logs)
+        checks_ok &= check("clippy", ["cargo", "clippy", "--workspace", "--all-targets",
+                                      "--locked", "--", "-D", "warnings"], logs)
+        checks_ok &= check("no-folder", ["cargo", "check", "-p", "cardinald",
+                                         "--no-default-features", "--bin", "cardinald",
+                                         "--locked"], logs)
+        checks_ok &= check("doc-tests", ["cargo", "test", "--workspace", "--doc",
+                                         "--locked"], logs, env)
+        tables = logs / "api-tables.md"
+        if not tables.is_file() or tables.stat().st_size == 0:
+            print(f"  FAIL api-tables: {tables} was not written", flush=True)
+            checks_ok = False
+        else:
+            print(f"  ok   api-tables: {tables}", flush=True)
+
+    bad = sorted(r for r in runs if r.why is not None)
+    passed = sum(r.passed for r in runs)
+    failed = sum(r.failed for r in runs)
+    ignored = sum(r.ignored for r in runs)
+    total = time.monotonic() - began
+    with open(logs / "times.txt", "w") as t:
+        for r in sorted(runs, key=lambda r: -r.secs):
+            t.write(f"{r.line.key} {r.secs:.1f} {r.passed} {r.failed} {r.ignored}"
+                    f" {'ok' if r.why is None else r.why}\n")
+    print(f"\n{a.tier}: {len(runs)} binaries, {passed} passed, {failed} failed, "
+          f"{ignored} ignored; tests {tests_secs:.0f} s ({a.jobs} at a time), "
+          f"build {built_secs:.0f} s, all {total:.0f} s")
+    for r in bad:
+        print(f"FAIL {r.line.key}: {r.why} (log: {logs / (r.line.key.replace('/', '__') + '.log')})")
+    if not checks_ok:
+        print("FAIL: a check around the tests (see above)")
+    sys.exit(1 if bad or not checks_ok else 0)
+
+
+if __name__ == "__main__":
+    main()
