@@ -387,11 +387,12 @@ pub async fn remove(d: &Arc<Daemon>, group: &str, who: &str) -> anyhow::Result<J
     }))
 }
 
-/// The role a client names: `reader`, `member` (a writer), or `admin`.
+/// The role a client names, as `group-members` says them: `reader`,
+/// `member` (a writer), or `admin`, and nothing else.
 fn role_named(role: &str) -> anyhow::Result<u64> {
     match role {
         "reader" => Ok(group::READER),
-        "member" | "writer" => Ok(group::WRITER),
+        "member" => Ok(group::WRITER),
         "admin" => Ok(group::ADMIN),
         "owner" => anyhow::bail!("a group has one owner, whoever made it, for good"),
         _ => anyhow::bail!("a role is reader, member or admin"),

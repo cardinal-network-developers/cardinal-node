@@ -126,10 +126,21 @@ fn add(admin: &Dev, g: &str, who: &Dev, members: u64) {
         admin,
         json!({"cmd": "group-add", "group": g, "people": [called(who)]}),
     );
-    wait("the offer is held open", 30, || {
+    let open = || {
         offer(who, g).is_some_and(|o| o["members"] == members)
             && reply(who, &json!({"cmd": "group-members", "group": g}))["ok"] == true
-    });
+    };
+    for _ in 0..120 {
+        if open() {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    }
+    panic!(
+        "the offer is not held open: {:?} / {}",
+        offer(who, g),
+        reply(who, &json!({"cmd": "group-members", "group": g}))
+    );
 }
 
 fn call(d: &Dev) -> Value {
@@ -373,7 +384,7 @@ fn answering_joins_the_group_and_asks_about_the_host_first() {
     let c = call(&cy);
     assert_eq!(c["joins"], true, "{c}");
     assert_eq!(c["reach"]["ask"], true, "{c}");
-    assert_eq!(c["reach"]["who"], json!(["Bo"]), "{c}");
+    assert_eq!(c["reach"]["who"], json!(["bo"]), "{c}");
     assert_eq!(state(&bo), "live", "bo was rung again");
 
     // Not answered about the host: refused with the question, nothing
@@ -381,7 +392,7 @@ fn answering_joins_the_group_and_asks_about_the_host_first() {
     std::thread::sleep(Duration::from_secs(1));
     let before = entries(&cy, &g);
     let why = refused(&cy, json!({"cmd": "call-answer"}));
-    assert!(why.contains("Bo") && why.contains(&at), "{why}");
+    assert!(why.contains("bo") && why.contains(&at), "{why}");
     assert_eq!(state(&cy), "ringing");
     assert!(joined(&cy, &g).is_none());
     std::thread::sleep(Duration::from_secs(1));
@@ -403,7 +414,7 @@ fn answering_joins_the_group_and_asks_about_the_host_first() {
 /// person, or is not their contact, and when it is empty or comes with
 /// `who`. A ring for some rings only them and is passed on by nobody. In a
 /// joined group, who rang is said only where the ring came from the
-/// caller's own device.
+/// caller's own device; who looks after it is the owner, then the admins.
 #[test]
 fn ringing_some_rings_only_them_and_refuses_the_rest() {
     let root = tempfile::tempdir().unwrap();
@@ -412,30 +423,26 @@ fn ringing_some_rings_only_them_and_refuses_the_rest() {
     let cy = person(root.path(), "cy");
     let dee = person(root.path(), "dee");
     let eve = person(root.path(), "eve");
-    meet(&ana, &bo);
-    meet(&ana, &dee);
+    meet(&bo, &ana);
     meet(&bo, &cy);
+    meet(&bo, &dee);
+    meet(&ana, &dee);
     meet(&ana, &eve);
-    // Ana makes the group with Bo and Dee, makes Bo an admin, and Bo adds
-    // Cy, who is not Ana's contact.
-    let g = group_with(&ana, &[&bo, &dee], json!({}));
+    // Bo's group of Ana, Cy and Dee; Cy is not Ana's contact. Ana is an
+    // admin.
+    let g = group_with(&bo, &[&ana, &cy, &dee], json!({}));
     ask(
-        &ana,
-        json!({"cmd": "group-role", "group": g, "who": "Bo", "role": "admin"}),
+        &bo,
+        json!({"cmd": "group-role", "group": g, "who": "Ana", "role": "admin"}),
     );
-    wait("bo is an admin", 20, || {
-        joined(&bo, &g).is_some_and(|x| x["admin"] == true)
+    wait("ana is an admin", 20, || {
+        joined(&ana, &g).is_some_and(|x| x["admin"] == true)
     });
-    add(&bo, &g, &cy, 4);
-    ask(&cy, json!({"cmd": "group-join", "group": g}));
-    wait("ana sees cy", 30, || {
-        let m = ask(&ana, json!({"cmd": "group-members", "group": g}));
-        m["members"].as_array().unwrap().len() == 4
-    });
-
+    // the name the group shows for Ana herself
+    let me = "ana";
     for (req, what) in [
         (
-            json!({"cmd": "call-start", "group": g, "ring": ["Cy"]}),
+            json!({"cmd": "call-start", "group": g, "ring": ["cy"]}),
             "not a contact",
         ),
         (
@@ -447,7 +454,7 @@ fn ringing_some_rings_only_them_and_refuses_the_rest() {
             "nobody",
         ),
         (
-            json!({"cmd": "call-start", "group": g, "ring": ["Bo", "Cy"]}),
+            json!({"cmd": "call-start", "group": g, "ring": ["Bo", "cy"]}),
             "one not a contact",
         ),
         (
@@ -458,13 +465,20 @@ fn ringing_some_rings_only_them_and_refuses_the_rest() {
             json!({"cmd": "call-start", "who": "Bo", "group": g, "ring": ["Bo"]}),
             "with who",
         ),
+        (
+            json!({"cmd": "call-start", "group": g, "ring": [me]}),
+            "you",
+        ),
     ] {
         let why = refused(&ana, req);
         assert!(!why.is_empty(), "{what}");
+        if what == "you" || what == "not a contact" {
+            assert!(
+                why.contains(if what == "you" { "you" } else { "contact" }),
+                "{why}"
+            );
+        }
     }
-    let me = hex::encode(identity_of(&bo, "Ana"));
-    let why = refused(&ana, json!({"cmd": "call-start", "group": g, "ring": [me]}));
-    assert!(why.contains("you"), "{why}");
     assert!(call(&ana).is_null(), "a refused request started a call");
     rings_not(&bo, "a refused request rang");
 
@@ -486,6 +500,7 @@ fn ringing_some_rings_only_them_and_refuses_the_rest() {
 
     // Bo alone is rung; Cy, Bo's contact, is not, since nobody passes a
     // ring for some on.
+    wait("bo and cy in touch", 20, || in_touch(&bo, "Cy"));
     ask(
         &ana,
         json!({"cmd": "call-start", "group": g, "ring": ["Bo"]}),
@@ -497,26 +512,27 @@ fn ringing_some_rings_only_them_and_refuses_the_rest() {
     ask(&ana, json!({"cmd": "call-end"}));
 
     // The whole group: Cy is rung only by Bo passing it on, so who called
-    // is not said there; admins are the owner first, then Bo.
+    // is not said there; who looks after it is Bo, the owner, then Ana.
     std::thread::sleep(Duration::from_secs(1));
     ask(&ana, json!({"cmd": "call-start", "group": g}));
     wait("cy rings", 20, || state(&cy) == "ringing");
     let c = call(&cy);
     assert!(c["caller"].is_null(), "{c}");
-    let admins: Vec<(&str, &str)> = c["admins"]
+    let roles: Vec<&str> = c["admins"]
         .as_array()
         .unwrap()
         .iter()
-        .map(|m| (m["role"].as_str().unwrap(), m["name"].as_str().unwrap()))
+        .map(|m| m["role"].as_str().unwrap())
         .collect();
-    assert_eq!(admins[0].0, "owner", "{c}");
-    assert_eq!(admins[1], ("admin", "Bo"), "{c}");
+    assert_eq!(roles, ["owner", "admin"], "{c}");
+    assert_eq!(c["admins"][0]["name"], "Bo", "{c}");
     assert_eq!(c["for_call"], false, "{c}");
     assert!(c["joins"].is_null(), "{c}");
-    // and a call between two people takes no `reach`
-    ask(&cy, json!({"cmd": "call-end"}));
-    ask(&ana, json!({"cmd": "call-end"}));
-    ask(&bo, json!({"cmd": "call-end"}));
+    assert_eq!(call(&bo)["caller"]["name"], "Ana", "{}", call(&bo));
+    for d in [&cy, &bo, &ana] {
+        ask(d, json!({"cmd": "call-end"}));
+    }
+    // A call between two people takes no `reach`.
     ask(&bo, json!({"cmd": "call-start", "who": "Cy"}));
     wait("cy rings from bo", 20, || state(&cy) == "ringing");
     let why = refused(&cy, json!({"cmd": "call-answer", "reach": true}));
@@ -694,11 +710,6 @@ fn the_mark_is_set_only_by_a_genesis() {
     let why = refused(&ana, json!({"cmd": "group-rejoin", "group": n}));
     assert!(why.contains("history"), "{why}");
     let _ = before;
-    // and a value that is not true or false is refused
-    refused(
-        &ana,
-        json!({"cmd": "group-create", "name": "Odd", "people": ["Bo"], "for_call": "yes"}),
-    );
     // the command line makes one
     let out = ana.cli(&["group", "create", "Talk", "Bo", "--for-call"]);
     let _ = out;

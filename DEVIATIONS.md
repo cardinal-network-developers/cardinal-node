@@ -2493,6 +2493,65 @@ asks for around that is not built yet.
   records the host as a fetcher that never acknowledges, so acknowledgements
   from the owner's other devices free nothing and retention does. Nothing asks
   a host for envelopes yet except itself, which lets go of them one by one.
+### Calls with several people (D92 to D94, `profiles.md#a-group-made-for-a-call`)
+
+Readings chosen where the specification is silent, and what is not built:
+
+- **`last_call` and *call ended* `at`** are milliseconds since 1970 by this
+  device's clock, as a message's `time` is; the specification says only
+  "when". `last_call` is kept in the space's notes on this device, so it is
+  there for every group this device holds (open or only offered); a ring
+  that came before the group was held never rang, so nothing is lost. It
+  counts the calls this person made, rang for or was on, never one the
+  device only carried.
+- **A kept ring** (one from a contact for a group not offered yet, or not
+  open) is kept only where it names its sender as caller and came from
+  their own device, for a space this person has not joined or declined
+  and does not hold as anything but a group. It counts towards how often
+  that contact may ring when it arrives, not again when it rings. Once
+  the rest holds it rings for what is left of the 45 s from its arrival,
+  not 45 s more. A ring from a member who did not offer the group is kept
+  too (the device cannot tell it will never ring) and lapses.
+- **"Fetched from that contact's devices"** is not checked: this device
+  fetches an offered group from whoever offered it, and from nobody else,
+  but does not record where the copy it holds came from.
+- **Own devices, in a group only offered**: of their signals only a `join`
+  that is not carrying is taken, to stop ringing here when another of the
+  person's devices answered. Every other signal there is ignored.
+- **`ring` names** are resolved as `group-members` names them (a contact's
+  petname, the group's name for a member, or an id). A refused contact, or
+  a recovery's relationship, is not "a contact" for this purpose: ringing
+  them is refused. The same person named twice is rung once.
+- **`call-start` `ring` while this person is on the group's call**, still
+  calling with nobody else on it (`calling`) as well as `live`: those named
+  are rung into it. With nobody named reachable after one look each, the
+  request fails and nobody is rung; otherwise those reachable are rung.
+- **A ring for some is ignored** unless it names its sender as caller,
+  before it counts towards how often anyone rings; so is any `ring` with a
+  `3:` other than 1, a value that is not a number included. Between two
+  people `3:` on a `ring` is not defined, and is not looked at there.
+- **`call` `caller`** is never given on the device that called, nor on one
+  that joined a call going on without being rung. It is set by the first
+  `ring` for the call that came from the caller's own device, even after
+  the device already rang for a ring passed on.
+- **`call-answer` on a group only offered**: if the call stopped ringing
+  while the group was being joined, the group stays joined and the answer
+  fails ("that call has stopped ringing").
+- **`group-set` `for_call` true** is refused before anything else in the
+  request is looked at, so a name given with it is not written either.
+  `for_call` false on a call group writes `set` field 3 false; on any other
+  group it writes nothing. Only an owner or admin may send it, as the rest
+  of `group-set`.
+- **`group-role`** matched the specification but for one leniency, now
+  gone: it took `writer` for `member`. It takes `admin`, `member` and
+  `reader` alone, as `group-members` says them.
+- **Not built**: anything in `later.md` "Calls with several people" (a move
+  nobody hears, a move over the live call, ringing a member who is not a
+  contact, who may send what, the note for the one in the middle); leaving
+  a call group by itself, which the specification leaves to software and
+  this service does not do; and what becomes of a call under way when its
+  group is succeeded.
+
 ## Hosts (`spec/hosts.md`)
 
 - **Known paths** (D86, `hosts.md#known-paths`; `known.rs`). The address

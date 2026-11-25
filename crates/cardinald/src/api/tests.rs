@@ -523,7 +523,6 @@ const NODE_ONLY: &[&str] = &[
     "remove-device",
     "contacts",
     "read-markers",
-    "group-role",
     "group-post-again",
     "group-moved-seen",
     "mount",
