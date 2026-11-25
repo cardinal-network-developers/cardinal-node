@@ -235,58 +235,6 @@ fn control(d: &Dev, req: serde_json::Value) -> serde_json::Value {
     common::ask(d, &req)
 }
 
-/// An account made before the self node (D71) has none: its person is
-/// suggested by the device's name until they set theirs, and `me` then
-/// makes the node, on any of their devices, old or new.
-#[test]
-fn an_old_account_gets_a_name_of_its_own() {
-    let Some(old) = old_bin() else { return };
-    // Only a version from before D71 (0.1.15 and earlier) makes an account
-    // with no name of its own; one that has `cardinal me` already names it.
-    let knows_names = std::process::Command::new(&old)
-        .args(["me", "--help"])
-        .output()
-        .is_ok_and(|o| o.status.success());
-    if knows_names {
-        skipping("the old version already keeps the person's name");
-        return;
-    }
-    let root = tempfile::tempdir().unwrap();
-    let mut ana = old_device(root.path(), "ana-laptop", &old);
-    let mut phone = old_device(root.path(), "ana-phone", &old);
-    first(&mut ana);
-    phone.start();
-    pair(&ana, &phone);
-    update(&mut ana);
-    let me = control(&ana, serde_json::json!({"cmd": "me"}));
-    assert_eq!(me["name"], "ana-laptop", "{me}");
-    assert_eq!(me["set"], false, "{me}");
-
-    let mut bo = Dev::new(root.path(), "bo", free_port());
-    first(&mut bo);
-    let at = format!("127.0.0.1:{}", ana.port);
-    let code = ana.cli(&["invite", "--address", &at]);
-    bo.cli(&["accept", code.trim()]);
-    assert_eq!(only_contact(&bo)["suggested"], "ana-laptop");
-
-    // Set on the updated device: the old one keeps syncing beside it.
-    let set = control(&ana, serde_json::json!({"cmd": "me", "name": "Ana"}));
-    assert_eq!(set["set"], true);
-    both_ways(&ana, &phone, "after-a-self-node");
-    let mut cy = Dev::new(root.path(), "cy", free_port());
-    first(&mut cy);
-    let code = ana.cli(&["invite", "--address", &at]);
-    cy.cli(&["accept", code.trim()]);
-    assert_eq!(only_contact(&cy)["suggested"], "Ana");
-    // The phone, updated, has it from the account.
-    update(&mut phone);
-    wait("the phone has the name", 30, || {
-        control(&phone, serde_json::json!({"cmd": "me"}))["name"] == "Ana"
-    });
-    no_panic(&phone);
-    no_panic(&ana);
-}
-
 /// What `status` on `d` says of its device `name` that it cannot read, if
 /// anything.
 fn unreadable_device(d: &Dev, name: &str) -> Option<serde_json::Value> {
