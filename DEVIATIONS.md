@@ -598,12 +598,23 @@ differs or was read:
   log), to every guardian, every second while the helper's state changes
   (it remembers what it carried where, and syncs a relationship with the
   guardian's devices in touch after carrying into it), and once more
-  before dropping the helper. A guardian's device carries its acts on a
+  at the finish, with the new root's entries after the `recover` (the new
+  device's `add_key` and `set_encryption_key`), handed to each guardian's
+  devices in touch. The helper is dropped only once every guardian who
+  confirmed, and whom it met, holds those entries (identity.md says "once
+  the recovery is in effect"): a guardian without them never answers the
+  new device. Until then it is kept, across restarts and at the port it
+  had (`recovered.json`, `handing`): its invitations cancelled, the copies
+  given back dropped and no more taken, it hands the entries to each such
+  guardian as their devices come into touch, and `cardinal recover` names
+  those who have not heard of the new device yet. A guardian who did not
+  confirm does not keep it. A guardian's device carries its acts on a
   recovery only into that recovery's relationships, and catches up with
   those done before the helper's `recover` reached it there (as when the
   person's host passed it on first). It takes from the helper, of the
   person's own log, only that `recover`, alone in its entry, signed by its
-  new root, under the policy it guards; of anyone else's, what
+  new root, under the policy it guards, and the entries that new root
+  signs (profiles.md names only the `recover`); of anyone else's, what
   `ingest_other` keeps; and delivers what is new to the person's devices
   and hosts, as its own acts.
 - **Reading: who makes the invitation.** `cardinal guarding invite NAME`

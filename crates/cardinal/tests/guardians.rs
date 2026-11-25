@@ -1526,7 +1526,6 @@ fn away_at_the_finish(restart: bool) {
     if restart {
         new.stop();
         new.start();
-        new.wait_mounted();
     }
     let shown_after = new.cli(&["recover"]);
     assert!(!reaches(&new, &bo), "bo is away");
@@ -1548,14 +1547,13 @@ fn away_at_the_finish(restart: bool) {
     // and it stays gone across a restart
     new.stop();
     new.start();
-    new.wait_mounted();
     assert!(!helper.exists());
     wait("the new device reaches bo again", 60, || reaches(&new, &bo));
 }
 
 /// A guardian who did not confirm, and is away at the finish, does not
-/// keep the helper: Bo confirmed and took the new device's first entries,
-/// so the helper goes at the finish though Cy never heard.
+/// keep the helper: Bo and Di confirmed and took the new device's first
+/// entries, so the helper goes at the finish though Cy never heard.
 #[test]
 fn a_guardian_who_did_not_confirm_does_not_keep_the_helper() {
     if !fuse_available() {
@@ -1569,18 +1567,20 @@ fn a_guardian_who_did_not_confirm_does_not_keep_the_helper() {
     laptop.wait_mounted();
     let bo = person(root.path(), "bo");
     let mut cy = person(root.path(), "cy");
-    meet(&laptop, &bo, "Ana");
-    meet(&laptop, &cy, "Ana");
-    accept_guarding(&[&bo, &cy]);
+    let di = person(root.path(), "di");
+    for g in [&bo, &cy, &di] {
+        meet(&laptop, g, "Ana");
+    }
+    accept_guarding(&[&bo, &cy, &di]);
     let o = name_accepted(
         &laptop,
         &words,
-        &["bo", "cy", "--threshold", "1", "--delay", "4s"],
+        &["bo", "cy", "di", "--threshold", "2", "--delay", "4s"],
     );
     assert!(o.status.success(), "{}", out(&o));
-    for g in [&bo, &cy] {
+    for g in [&bo, &cy, &di] {
         wait("the guardian knows", 30, || {
-            g.cli(&["guarding"]).contains("Ana: one of 2 guardians")
+            g.cli(&["guarding"]).contains("Ana: one of 3 guardians")
         });
     }
     hold_account(&laptop, &[&bo]);
@@ -1589,12 +1589,13 @@ fn a_guardian_who_did_not_confirm_does_not_keep_the_helper() {
     let new = new_device(root.path(), "new");
     let fp = fingerprint_from(&new.cli(&["recover", "start", &recovery_invitation(&bo, "Ana")]));
     new.cli(&["recover", "start", &recovery_invitation(&cy, "Ana")]);
-    for g in [&bo, &cy] {
+    new.cli(&["recover", "start", &recovery_invitation(&di, "Ana")]);
+    for g in [&bo, &cy, &di] {
         wait("the guardian sees the recovery", 60, || {
             g.cli(&["guarding"]).contains(&fp)
         });
     }
-    endorse_and_confirm(&[&bo], &fp);
+    endorse_and_confirm(&[&bo, &di], &fp);
     wait("the account is given back", 60, || {
         new.cli(&["recover"]).contains("your account among it")
     });
@@ -1606,6 +1607,7 @@ fn a_guardian_who_did_not_confirm_does_not_keep_the_helper() {
     let shown = new.cli(&["recover"]);
     assert!(!shown.contains("have not heard"), "{shown}");
     wait("the new device reaches bo", 60, || reaches(&new, &bo));
+    wait("the new device reaches di", 60, || reaches(&new, &di));
 }
 
 /// The same with nothing else to arrive after the group: Ana's laptop
