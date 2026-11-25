@@ -81,8 +81,13 @@ struct Three {
 
 /// Ana's group of three, where each has said hello.
 fn three() -> Three {
+    three_for(false)
+}
+
+/// [`three`], and with `for_call` a group made for a call.
+fn three_for(for_call: bool) -> Three {
     let (ana, bo, cy) = (person(1), person(2), person(3));
-    let mut ops = group::genesis_ops(ana.id(), "Family");
+    let mut ops = group::genesis_ops_for(ana.id(), "Family", for_call);
     ops.push(SpaceOp::add_member(bo.id(), WRITER));
     ops.push(SpaceOp::add_member(cy.id(), WRITER));
     ops.push(group::create_member(&bo.id(), "Bo", true));
@@ -137,6 +142,17 @@ fn succeed(
     named: &[([u8; 32], u64)],
     keys: &[&cardinal_crypto::HybridPublicKey],
 ) -> (Space, SealedEntry, State) {
+    succeed_as(t, named, keys, true)
+}
+
+/// [`succeed`]; without `reassert`, as software from before that sets
+/// nothing again in the genesis, or before field 3 was known.
+fn succeed_as(
+    t: &mut Three,
+    named: &[([u8; 32], u64)],
+    keys: &[&cardinal_crypto::HybridPublicKey],
+    reassert: bool,
+) -> (Space, SealedEntry, State) {
     let all = logs(&[&t.ana, &t.bo, &t.cy]);
     let a = &mut t.spaces[0];
     let cut = a.heads();
@@ -158,7 +174,9 @@ fn succeed(
         .collect();
     // The owner sets again, in the genesis, what only an admin's say counts
     // on: carried, it counts for nothing.
-    ops.extend(group::reassert_ops(a, &at_cut));
+    if reassert {
+        ops.extend(group::reassert_ops(a, &at_cut));
+    }
     let (mut s, g) = Space::create_successor(
         group::GROUP,
         a.policy().clone(),
@@ -540,4 +558,117 @@ fn a_node_whose_maker_can_no_longer_write_is_not_waited_for() {
         r.ops[0].record().get(2).and_then(|v| v.as_bytes()),
         Some(&c[..])
     );
+}
+
+/// Writes `ops` as `who`, in their copy `i` of the group, and gives it to
+/// the other two copies.
+fn write_as(t: &mut Three, i: usize, ops: Vec<SpaceOp>) {
+    let who = [&t.ana, &t.bo, &t.cy][i];
+    t.spaces[i]
+        .write(&who.log, &who.device.signing, ops, Some(5))
+        .unwrap();
+    let encs = [&t.ana.enc, &t.bo.enc, &t.cy.enc];
+    for j in 0..3 {
+        if j != i {
+            let (from, to) = if i < j {
+                let (l, r) = t.spaces.split_at_mut(j);
+                (&l[i], &mut r[0])
+            } else {
+                let (l, r) = t.spaces.split_at_mut(i);
+                (&r[0], &mut l[j])
+            };
+            sync(from, to, encs[j]);
+        }
+    }
+}
+
+/// D92, as the mark was settled: a group is made for a call while field 3
+/// of its conversation node holds only what its genesis wrote, true. Any
+/// later write there, by anyone, of any value, makes it an ordinary group,
+/// and nothing in that space makes it one again.
+#[test]
+fn only_a_genesis_makes_a_group_one_made_for_a_call() {
+    assert!(!group::for_call(&three().spaces[0]), "an ordinary group");
+    let t = three_for(true);
+    assert!(t.spaces.iter().all(group::for_call), "made for a call");
+    let value = |v: Option<bool>| v.map(cardinal_encoding::Value::from);
+    // (who writes, what): the owner keeping it, an admin's or a writer's
+    // true, a clearing set, and something that is not a bool
+    let writes: [(usize, Option<cardinal_encoding::Value>); 5] = [
+        (0, value(Some(false))),
+        (0, value(Some(true))),
+        (1, value(Some(true))),
+        (2, None),
+        (0, Some(cardinal_encoding::Value::from(1u64))),
+    ];
+    for (who, v) in writes {
+        let mut t = three_for(true);
+        let c = relationship::conversation(&t.spaces[0]).unwrap();
+        write_as(
+            &mut t,
+            who,
+            vec![SpaceOp::set(c, group::FOR_CALL, v.clone())],
+        );
+        for sp in &t.spaces {
+            assert!(!group::for_call(sp), "after {who} wrote {v:?}");
+        }
+        // and the owner's true after that does not make it one again
+        write_as(
+            &mut t,
+            0,
+            vec![SpaceOp::set(c, group::FOR_CALL, value(Some(true)))],
+        );
+        assert!(!group::for_call(&t.spaces[1]), "set again after {v:?}");
+    }
+    // Keep this group, as the node writes it
+    let mut t = three_for(true);
+    let c = relationship::conversation(&t.spaces[0]).unwrap();
+    write_as(&mut t, 0, vec![group::keep_group(c)]);
+    assert!(!group::for_call(&t.spaces[2]));
+    // the other fields are untouched by it
+    assert_eq!(group::name(&t.spaces[2]), "Family");
+}
+
+/// A successor is made for a call only where its own genesis sets field 3
+/// true: the owner's software does so where the group it succeeds was one
+/// at the cut, and not otherwise. What it carried counts for nothing.
+#[test]
+fn a_successor_is_made_for_a_call_only_by_its_own_genesis() {
+    let named = |t: &Three| [(t.ana.id(), OWNER), (t.bo.id(), WRITER)];
+    let keys = |t: &Three| {
+        [
+            t.ana.enc.public_key().clone(),
+            t.bo.enc.public_key().clone(),
+        ]
+    };
+    // a call group, succeeded by software that sets it again
+    let mut t = three_for(true);
+    let (n, k) = (named(&t), keys(&t));
+    let refs: Vec<_> = k.iter().collect();
+    let (s, g, at_cut) = succeed(&mut t, &n, &refs);
+    assert!(group::for_call(&s), "set again by the genesis");
+    let mut bare = Space::open_genesis(&g, &[&t.bo.enc], None).unwrap();
+    bare.set_initial_state(State::from_canonical(group::GROUP, &at_cut.canonical()).unwrap());
+    bare.set_identities([t.ana.log.state(), t.bo.log.state()]);
+    assert!(group::for_call(&bare), "as Bo reads it from the genesis");
+    // the same, by software that does not set it again: only carried
+    let mut t = three_for(true);
+    let (n, k) = (named(&t), keys(&t));
+    let refs: Vec<_> = k.iter().collect();
+    let (s, _, _) = succeed_as(&mut t, &n, &refs, false);
+    assert!(!group::for_call(&s), "a carried mark counts for nothing");
+    // a call group kept as an ordinary one stays ordinary when succeeded
+    let mut t = three_for(true);
+    let c = relationship::conversation(&t.spaces[0]).unwrap();
+    write_as(&mut t, 0, vec![group::keep_group(c)]);
+    let (n, k) = (named(&t), keys(&t));
+    let refs: Vec<_> = k.iter().collect();
+    let (s, _, _) = succeed(&mut t, &n, &refs);
+    assert!(!group::for_call(&s), "kept, then succeeded");
+    // and an ordinary one too
+    let mut t = three();
+    let (n, k) = (named(&t), keys(&t));
+    let refs: Vec<_> = k.iter().collect();
+    let (s, _, _) = succeed(&mut t, &n, &refs);
+    assert!(!group::for_call(&s));
 }
