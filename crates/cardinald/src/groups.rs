@@ -121,6 +121,13 @@ fn find_among(d: &Daemon, group: &str, in_it: bool) -> anyhow::Result<Found> {
 /// group, whatever another is called. By name, a group this person said no
 /// to is not meant.
 fn pick(all: Vec<Found>, asked: &str, declined: &[SpaceId]) -> anyhow::Result<Found> {
+    // given as bytes: the group whose id it is, and nothing else
+    if let id @ Ref::Id(_) = api::reference(asked) {
+        return all
+            .into_iter()
+            .find(|g| id.is_id(&g.id))
+            .ok_or_else(|| anyhow::anyhow!("there is no group {}", api::shown(asked)));
+    }
     let start = asked.to_ascii_lowercase();
     let by_id = |g: &Found| asked.len() >= 8 && hex::encode(g.id).starts_with(&start);
     let (mut ids, named): (Vec<Found>, Vec<Found>) = all.into_iter().partition(by_id);

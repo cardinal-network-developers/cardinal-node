@@ -1363,3 +1363,49 @@ fn a_member_who_left_is_added_back_by_someone_else() {
         .as_array()
         .is_none_or(|r| r.is_empty()));
 }
+
+/// `group-rejoin` takes the group's id as bytes, as every request that
+/// names a group does (`apps.md`, Types): a window sends the id it was
+/// given.
+#[test]
+fn a_group_is_rejoined_by_its_id_as_bytes() {
+    let root = tempfile::tempdir().unwrap();
+    let ana = person(root.path(), "ana");
+    let bo = person(root.path(), "bo");
+    meet(&ana, &bo, "Bo");
+    let made = ask(
+        &ana,
+        json!({"cmd": "group-create", "name": "Pair", "people": ["Bo"]}),
+    );
+    let g = made["group"].as_str().unwrap().to_owned();
+    wait("the offer arrives", 30, || !offers(&bo).is_empty());
+    ask(&bo, json!({"cmd": "group-join", "group": g}));
+    let bytes = format!("\u{0}{g}");
+    // still in it: said so, by the id as bytes
+    let no = reply(&ana, &json!({"cmd": "group-rejoin", "group": bytes}));
+    assert_eq!(no["ok"], false, "{no}");
+    assert!(no["error"].as_str().unwrap().contains("already"), "{no}");
+    ask(
+        &ana,
+        json!({"cmd": "group-leave", "group": g, "admins": ["Bo"]}),
+    );
+    // an id that is no group's is not taken for one
+    let other = format!("\u{0}{}", "ab".repeat(32));
+    let no = reply(&ana, &json!({"cmd": "group-rejoin", "group": other}));
+    assert_eq!(no["ok"], false, "{no}");
+    assert!(
+        no["error"].as_str().unwrap().contains("there is no group"),
+        "{no}"
+    );
+    let back = ask(&ana, json!({"cmd": "group-rejoin", "group": bytes}));
+    assert_eq!(back["group"], g.as_str(), "{back}");
+    assert_eq!(back["name"], "Pair", "{back}");
+    assert!(ask(&ana, json!({"cmd": "groups"}))["rejoin"]
+        .as_array()
+        .is_none_or(|r| r.is_empty()));
+
+    // Bo, whom she left in charge, comes back by the id as bytes too
+    ask(&bo, json!({"cmd": "group-leave", "group": g}));
+    let back = ask(&bo, json!({"cmd": "group-rejoin", "group": bytes}));
+    assert_eq!(back["group"], g.as_str(), "{back}");
+}
