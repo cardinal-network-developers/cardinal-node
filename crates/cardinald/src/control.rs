@@ -705,7 +705,8 @@ async fn handle(d: &Arc<Daemon>, req: &Value) -> anyhow::Result<Value> {
         "app-join" => crate::apps::join(d, arg(req, "space")?),
         "call-answer" => {
             let reach = answer_in(req, "reach")?;
-            crate::calls::answer(d, formats(req)?, reach).await
+            let join = answer_in(req, "join")?;
+            crate::calls::answer(d, formats(req)?, reach, join).await
         }
         "call-end" => crate::calls::end(d).await,
         "conversations" => Ok(crate::contacts::conversations(d)),

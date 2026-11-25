@@ -630,15 +630,30 @@ fn text_of(n: &Node) -> Option<String> {
     Some(text.as_text()?.to_owned())
 }
 
-/// The conversation of a relationship space.
+/// The conversation of a relationship space, where it is not deleted:
+/// what messages are written under and read from.
 pub fn conversation(space: &Space) -> Option<NodeId> {
-    let state = space.state();
-    let found = state.children(&ROOT).into_iter().find(is_conversation);
-    found.map(|n| n.id)
+    let c = the_conversation(space)?;
+    let n = space.state().node(&c)?;
+    (!n.deleted).then_some(c)
 }
 
-fn is_conversation(n: &&Node) -> bool {
-    n.kind == NodeKind::Uint(CONVERSATION) && !n.deleted
+/// The conversation node, deleted or not. "The genesis creates one
+/// conversation node" (`profiles.md#relationship`): in a space that
+/// succeeds none, it is the one its genesis created, and no other, so
+/// that a second one someone writes beside it stands for nothing. In a
+/// successor it was carried, and which carried node it is, the
+/// specification does not say: the first carried one not deleted, as
+/// before.
+pub fn the_conversation(space: &Space) -> Option<NodeId> {
+    let state = space.state();
+    let kids = state.children(&ROOT).into_iter();
+    let mut kids = kids.filter(|n| n.kind == NodeKind::Uint(CONVERSATION));
+    let found = match space.succeeds() {
+        None => kids.find(|n| n.created_in == space.id()),
+        Some(_) => kids.find(|n| state.is_carried(&n.id) && !n.deleted),
+    };
+    found.map(|n| n.id)
 }
 
 /// The messages of a relationship space, in log order, which every device

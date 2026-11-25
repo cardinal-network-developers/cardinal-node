@@ -642,9 +642,13 @@ enum CallCmd {
         ring: Vec<String>,
     },
     /// Answer the call ringing. In a group you were only offered,
-    /// answering joins it: say --share-host or --keep-host where you are
-    /// asked about your host.
+    /// answering joins it: say so with --join, and --share-host or
+    /// --keep-host where you are asked about your host.
     Answer {
+        /// Join the group the call rings in, which answering it does where
+        /// it was only offered to you.
+        #[arg(long)]
+        join: bool,
         /// Let the group's members have where your host is.
         #[arg(long, conflicts_with = "keep_host")]
         share_host: bool,
@@ -3801,10 +3805,14 @@ async fn client(cmd: Cmd) -> anyhow::Result<()> {
                     req
                 }
                 Some(CallCmd::Answer {
+                    join,
                     share_host,
                     keep_host,
                 }) => {
                     let mut req = json!({"cmd": "call-answer"});
+                    if *join {
+                        req["join"] = json!(true);
+                    }
                     match (*share_host, *keep_host) {
                         (true, _) => req["reach"] = json!(true),
                         (_, true) => req["reach"] = json!(false),

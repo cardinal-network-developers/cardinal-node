@@ -6,7 +6,7 @@
 use cardinal_encoding::{Record, Value};
 
 use crate::entry::{IdentityId, NodeId, NodeKind, Profile, SpaceId, SpaceOp};
-use crate::relationship::{conversation, CONVERSATION};
+use crate::relationship::{the_conversation as conversation, CONVERSATION};
 use crate::space::Space;
 use crate::state::{Node, State, ROOT};
 

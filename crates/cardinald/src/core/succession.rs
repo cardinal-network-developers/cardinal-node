@@ -435,18 +435,26 @@ impl Core {
             .collect()
     }
 
-    /// Notes the last call in group `space` that ended on this device.
-    pub fn note_last_call(&mut self, space: &SpaceId, call: LastCall) {
-        if let Some(h) = self.spaces.get_mut(space) {
-            h.notes.last_call = Some(call);
-            h.save_notes();
-        }
+    /// Notes the last call in group `space` that ended on this device, for
+    /// the group that stands in its place here where it was succeeded
+    /// meanwhile (D92): the note follows the group. What is noted is
+    /// given back to be written, which the caller does outside the lock.
+    #[must_use]
+    pub fn note_last_call(&mut self, space: &SpaceId, call: LastCall) -> Option<super::NotesSave> {
+        let now = self.current(space);
+        let h = self.spaces.get_mut(&now)?;
+        h.notes.last_call = Some(call);
+        Some(h.notes_to_save())
     }
 
     /// The last call in group `space` that ended on this device, as `call`
-    /// gives `ended`, with `at`.
+    /// gives `ended`, with `at`: the newest noted for it or for any group
+    /// it succeeds, since the note follows a group to its successor. Its
+    /// `group` is `space`, whichever it was noted for.
     pub fn last_call(&self, space: &SpaceId) -> Option<serde_json::Value> {
-        let c = self.spaces.get(space)?.notes.last_call.as_ref()?;
+        let noted = self.chain(space).into_iter();
+        let noted = noted.filter_map(|s| self.spaces.get(&s)?.notes.last_call.as_ref());
+        let c = noted.max_by_key(|c| c.at)?;
         Some(serde_json::json!({
             "id": c.id,
             "who": c.who,

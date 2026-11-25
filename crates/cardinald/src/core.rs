@@ -639,12 +639,57 @@ pub struct Holder {
     /// What this device noted of following and posting again here.
     notes: Notes,
     notes_at: PathBuf,
+    /// How many times the notes were changed here, and the newest change
+    /// written to disk: a write made outside the core's lock ([`NotesSave`])
+    /// never puts an older copy over a newer one.
+    notes_gen: u64,
+    notes_written: Arc<std::sync::Mutex<u64>>,
     /// The entries of the space this one succeeds that its initial state
     /// carried, worked out when first asked.
     carried: Option<std::collections::HashSet<EntryId>>,
     /// The initial state this successor waits for while it is not here:
     /// its profile, the space it succeeds, and the blob reference.
     wants_initial: Option<(Profile, Option<SpaceId>, Record)>,
+}
+
+/// A space's notes, to be written to disk where nothing waits on it, as
+/// outside the core's lock: a copy older than one written already is not
+/// written.
+pub struct NotesSave {
+    space: SpaceId,
+    at: PathBuf,
+    bytes: Result<Vec<u8>, String>,
+    gen: u64,
+    written: Arc<std::sync::Mutex<u64>>,
+}
+
+impl NotesSave {
+    /// Writes the notes, unless newer ones were written already.
+    pub fn write(self) {
+        let mut written = self.written.lock().unwrap_or_else(|e| e.into_inner());
+        if *written >= self.gen {
+            return;
+        }
+        let saved = self
+            .bytes
+            .map_err(std::io::Error::other)
+            .and_then(|bytes| crate::paths::write_private(&self.at, &bytes, 0o600));
+        match saved {
+            Ok(()) => *written = self.gen,
+            Err(e) => tracing::warn!("space {}: keeping its notes: {e}", short(&self.space)),
+        }
+    }
+
+    /// Writes the notes on a thread for blocking work, where there is a
+    /// runtime to give one, and else at once.
+    pub fn write_later(self) {
+        match tokio::runtime::Handle::try_current() {
+            Ok(rt) => {
+                rt.spawn_blocking(move || self.write());
+            }
+            Err(_) => self.write(),
+        }
+    }
 }
 
 /// What ingesting objects did.
@@ -702,6 +747,8 @@ impl Holder {
             initial_at: Self::dir(paths, &id).join("initial-state.bin"),
             notes: Notes::default(),
             notes_at: Self::dir(paths, &id).join("succession.json"),
+            notes_gen: 0,
+            notes_written: Arc::new(std::sync::Mutex::new(0)),
             carried: None,
             wants_initial: None,
         };
@@ -849,12 +896,20 @@ impl Holder {
     }
 
     fn save_notes(&mut self) {
+        self.notes_to_save().write();
+    }
+
+    /// The notes as they are now, to be written: by [`NotesSave::write`],
+    /// which may run once the core's lock is let go.
+    fn notes_to_save(&mut self) -> NotesSave {
         self.version += 1;
-        let saved = serde_json::to_vec(&self.notes)
-            .map_err(std::io::Error::other)
-            .and_then(|bytes| crate::paths::write_private(&self.notes_at, &bytes, 0o600));
-        if let Err(e) = saved {
-            tracing::warn!("space {}: keeping its notes: {e}", short(&self.id));
+        self.notes_gen += 1;
+        NotesSave {
+            space: self.id,
+            at: self.notes_at.clone(),
+            bytes: serde_json::to_vec(&self.notes).map_err(|e| e.to_string()),
+            gen: self.notes_gen,
+            written: self.notes_written.clone(),
         }
     }
 

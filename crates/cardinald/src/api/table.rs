@@ -619,7 +619,7 @@ pub static REQUESTS: &[Request] = &[
     req!(101 "call-start" (
         1 "who" REF, 2 "group" REF, 3 "formats" [B], 4 "format_names" [T], 5 "ring" [REF]
     ) -> ()),
-    req!(102 "call-answer" (1 "formats" [B], 2 "format_names" [T], 3 "reach" BOOL) -> ()),
+    req!(102 "call-answer" (1 "formats" [B], 2 "format_names" [T], 3 "reach" BOOL, 4 "join" BOOL) -> ()),
     req!(103 "call-end" () -> ()),
     req!(104 "call-media" () -> ()),
     req!(105 "clip-copy" (1 "text" T) -> (2 "devices" U)),

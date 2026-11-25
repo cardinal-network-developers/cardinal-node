@@ -487,6 +487,33 @@ impl Space {
         }
     }
 
+    /// Whether a valid entry of `by`'s added `who` here, with no `leave` of
+    /// `who`'s that stands descending from it: the genesis, where `by`
+    /// wrote it and it names `who`, or an `add_member` of theirs
+    /// (`profiles.md#calls-guidance`, "Someone only offered the group").
+    pub fn added_by_and_not_left(&self, who: &IdentityId, by: &IdentityId) -> bool {
+        let leaves = self.left();
+        let left_after = |add: &EntryId| {
+            leaves
+                .iter()
+                .any(|(w, leave)| w == who && self.dag.is_ancestor_or_self(add, leave))
+        };
+        let adds = self.judge.valid_adds().into_iter();
+        let theirs: Vec<EntryId> = adds
+            .filter(|(added, _)| added == who)
+            .map(|(_, add)| add)
+            .collect();
+        let by_add = theirs
+            .iter()
+            .any(|add| self.dag.get(add).is_some_and(|e| e.author() == *by) && !left_after(add));
+        // named by the genesis, which every leave descends from
+        let by_genesis = theirs.is_empty()
+            && self.creator == *by
+            && self.role_of(who).is_some()
+            && !self.has_left(who);
+        by_add || by_genesis
+    }
+
     /// The members a valid entry added that started the current epoch or
     /// descends from the entry that did: their `add_member` gave them its
     /// key (`spaces.md#when-to-rotate`). Anyone else in the space was a

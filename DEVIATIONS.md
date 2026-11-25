@@ -2524,19 +2524,54 @@ Readings chosen where the specification is silent, and what is not built:
   them is refused. The same person named twice is rung once.
 - **`call-start` `ring` while this person is on the group's call**, still
   calling with nobody else on it (`calling`) as well as `live`: those named
-  are rung into it. With nobody named reachable after one look each, the
-  request fails and nobody is rung; otherwise those reachable are rung.
+  are rung into it. The request is refused only as `apps.md` lists; that
+  none of those named can be reached now is not among them, on a call of
+  one's own or joining one going on. Each named is rung at once on a
+  session there is, one session to each device; one with none is looked
+  for once, after the request has answered, and rung if found while the
+  call is still this person's. A call started that way that reaches nobody
+  rings out as any call does.
 - **A ring for some is ignored** unless it names its sender as caller,
   before it counts towards how often anyone rings; so is any `ring` with a
   `3:` other than 1, a value that is not a number included. Between two
   people `3:` on a `ring` is not defined, and is not looked at there.
 - **`call` `caller`** is never given on the device that called, nor on one
-  that joined a call going on without being rung. It is set by the first
+  that joined a call going on without being rung, nor changed on one
+  already on the call. While the device rings it is set by the first
   `ring` for the call that came from the caller's own device, even after
   the device already rang for a ring passed on.
 - **`call-answer` on a group only offered**: if the call stopped ringing
   while the group was being joined, the group stays joined and the answer
-  fails ("that call has stopped ringing").
+  fails ("that call has stopped ringing"). `join` is looked at first, then
+  everything that let the call ring, then `reach`.
+- **A ring in a group only offered that stops holding**, as when the person
+  declines the group on another device, the adder leaves, or the group is
+  succeeded or ends while it rings, stops the ringing when this device
+  next looks (on any change): as `declined_elsewhere` where the group is
+  now declined, and else as `missed`. A ring naming a group that has been
+  succeeded does not ring, and the call ringing there when the successor
+  arrives stops.
+- **"An entry of that contact's added its person, with no `leave` of
+  theirs descending from it"** is read as: a valid `add_member` of the
+  person by that contact with no standing `leave` of the person's after it,
+  or, where nothing but the genesis names the person, a genesis that
+  contact wrote and no standing `leave` of theirs.
+- **A caller who gives up** sends its `end` to each device it rang directly
+  for the call, the whole group's `ring` and rings for some alike, when it
+  leaves (by `call-end`, or by ringing out) while nobody else was heard on
+  it. A ringing device that carries the call and hears someone on it other
+  than the caller takes such an `end` as the caller leaving a call going
+  on, and goes on ringing: on the wire the two are the same `end`.
+- **A group's ring from someone this device is on a call with between the
+  two** (the GTK client's "Add people": end the call with Bo, then ring a
+  group Bo is in) is not lost when it arrives before that call's `end`, as
+  it may: the two travel on streams of their own. Such a ring, from that
+  person's own device naming them, waits up to 3 s for the call between the
+  two to end, and rings then for what is left of its time; where it does
+  not end in that time, the ring is dropped, as any group ring to a device
+  on a call is. The specification does not say how a device orders the
+  two; this is the strictest simple reading that rings once that call is
+  over.
 - **`group-set` `for_call` true** is refused before anything else in the
   request is looked at, so a name given with it is not written either.
   `for_call` false on a call group writes `set` field 3 false; on any other
@@ -2544,7 +2579,16 @@ Readings chosen where the specification is silent, and what is not built:
   of `group-set`.
 - **`group-role`** matched the specification but for one leniency, now
   gone: it took `writer` for `member`. It takes `admin`, `member` and
-  `reader` alone, as `group-members` says them.
+  `reader` alone, as `group-members` says them, and is refused before
+  anything is written for a member who has left.
+- **The conversation node** is, in a group or relationship that succeeds
+  nothing, the one its genesis created ("The genesis creates one
+  conversation node"), and no other: its name and the call mark are read
+  from it whether or not it is deleted, and messages go under it while it
+  is not. In a successor it was carried, and which carried node it is the
+  specification does not say: the first carried one, by name, not
+  deleted, as before. A second conversation node a writer made in an
+  earlier space and that was carried could still be taken for it there.
 - **Found, not fixed: an admin adding someone the owner does not know.**
   The person added holds the group but cannot judge it, since nothing
   fetches the owner's log for a group they are only offered, and their
@@ -2557,7 +2601,7 @@ Readings chosen where the specification is silent, and what is not built:
   contact, who may send what, the note for the one in the middle); leaving
   a call group by itself, which the specification leaves to software and
   this service does not do; and what becomes of a call under way when its
-  group is succeeded.
+  group is succeeded, beyond noting it for the successor when it ends.
 
 ## Hosts (`spec/hosts.md`)
 

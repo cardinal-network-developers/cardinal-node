@@ -413,6 +413,15 @@ pub async fn set_role(d: &Arc<Daemon>, group: &str, who: &str, role: &str) -> an
         let sp = core.spaces.get(&g.id).and_then(|h| h.space.as_ref());
         let sp = sp.ok_or_else(|| anyhow::anyhow!("that group is not open yet"))?;
         let them = member_named(&contacts, sp, who)?;
+        // Someone who left comes back by `group-add` or `group-rejoin`,
+        // never by being given a role (`apps.md`, `group-role`).
+        anyhow::ensure!(
+            !sp.has_left(&them),
+            "{} has left {}: a role is not given to someone who left. They come back by being \
+             added again, or by rejoining",
+            api::shown(who),
+            g.name
+        );
         (them, sp.role_of(&them), sp.owner(), sp.role_of(&me))
     };
     anyhow::ensure!(them != me, "you cannot change your own role");
@@ -916,6 +925,34 @@ fn question(reach: &Json, name: &str) -> String {
 /// `shared` in what comes back says whether the list names a host.
 pub async fn join(d: &Arc<Daemon>, group: &str, reach: Option<bool>) -> anyhow::Result<Json> {
     let g = find(d, group)?;
+    join_found(d, g, reach).await
+}
+
+/// [`join`], of the group whose id is exactly `id`, and no other: not the
+/// one in its place, nor one found by name, as answering a call there joins
+/// that group alone (`profiles.md#calls-guidance`).
+pub(crate) async fn join_exact(
+    d: &Arc<Daemon>,
+    id: &SpaceId,
+    reach: Option<bool>,
+) -> anyhow::Result<Json> {
+    let me = identity(d)?;
+    let g = {
+        let core = d.core();
+        let sp = core.spaces.get(id).and_then(|h| h.space.as_ref());
+        let sp = sp.filter(|sp| sp.profile() == group::GROUP && !sp.has_left(&me));
+        let sp = sp.filter(|_| !core.is_superseded(id));
+        let sp = sp.ok_or_else(|| anyhow::anyhow!("that group is not here to join"))?;
+        Found {
+            id: *id,
+            name: group::name(sp),
+            joined: core.is_joined(id),
+        }
+    };
+    join_found(d, g, reach).await
+}
+
+async fn join_found(d: &Arc<Daemon>, g: Found, reach: Option<bool>) -> anyhow::Result<Json> {
     if g.joined {
         return Ok(json!({}));
     }
@@ -1017,6 +1054,10 @@ pub fn decline(d: &Arc<Daemon>, group: &str) -> anyhow::Result<Json> {
         .ok_or_else(|| anyhow::anyhow!("the account space is not here yet"))?;
     let op = cardinal_space::account::create_declined(&g.id, &g.name);
     d.write_and_push(&account, vec![op])?;
+    // A call there that rings stops: a ring in a declined group does not
+    // ring (`profiles.md#calls-guidance`). The person's other devices stop
+    // once the decline reaches them.
+    crate::calls::stop_ringing_in(d, &g.id, true);
     d.bump();
     Ok(json!({}))
 }
@@ -1969,49 +2010,60 @@ pub(crate) fn to_ring(
 
 /// Where a `ring` in `space`, a group this person has been offered and has
 /// not accepted, rings (`profiles.md#calls-guidance`, "Someone only offered
-/// the group"): `from` wrote an offer of it in the relationship the two
-/// share and is a contact not refused; the person has not declined it;
-/// and this device holds it, open, showing them both as members. Then the
-/// group's name. `None` where any of that does not hold, as before the
-/// offer or the group has come.
+/// the group"): `from` is a contact, not refused, who wrote an offer of it
+/// in the relationship the two share, and whose entry added this person in
+/// the space that offer names; `space` is that space, or the successor of
+/// it that this device follows, since an offer of a group is an offer of
+/// the group that succeeds it, and nothing stands in its place here: a
+/// ring naming a space that has ended does not ring; the person has not
+/// declined it, nor joined it; and this device holds it open, showing them
+/// both as members who have not left. Then the group's name. `None` where
+/// any of that does not hold, as before the offer or the group has come.
+///
+/// An offer node alone says only that its author wrote it, which any
+/// member who is a contact can do: who added this person is read from the
+/// group itself.
 pub(crate) fn offered_ring(d: &Daemon, space: &SpaceId, from: &[u8; 32]) -> Option<String> {
     let me = identity(d).ok()?;
     let core = d.core();
-    let contact = core
-        .contacts()
+    core.contacts()
         .into_iter()
         .find(|c| c.identity == *from && !c.refused && c.recovery_of.is_none())?;
-    // offers_from leaves out what was declined
-    if !core
-        .offers_from(&contact.identity)
-        .iter()
-        .any(|o| o.space == *space)
-    {
-        return None;
-    }
-    if core.declined().contains(space) || core.is_joined(space) {
+    if core.is_superseded(space) || core.is_declined(space) || core.is_joined(space) {
         return None;
     }
     let sp = core.spaces.get(space)?.space.as_ref()?;
-    let member = |w: &[u8; 32]| sp.role_of(w).is_some() && !sp.has_left(w);
-    let ours = sp.profile() == group::GROUP && member(&me) && member(from);
-    ours.then(|| group::name(sp))
+    let member = |sp: &Space, w: &[u8; 32]| sp.role_of(w).is_some() && !sp.has_left(w);
+    if sp.profile() != group::GROUP || sp.ended() || !member(sp, &me) || !member(sp, from) {
+        return None;
+    }
+    // offers_from leaves out what was declined
+    let offered = core.offers_from(from).into_iter().any(|o| {
+        let named = core.spaces.get(&o.space).and_then(|h| h.space.as_ref());
+        let added = named.is_some_and(|n| n.added_by_and_not_left(&me, from));
+        added && core.current(&o.space) == *space && !core.is_declined(&o.space)
+    });
+    offered.then(|| group::name(sp))
 }
 
 /// Whether `space` could still become a group whose ring from `from` rings
 /// here: it is not one this person declined, or joined, or holds open as
-/// something else. A ring for it is kept a while (`profiles.md#calls-guidance`).
+/// something else, or holds as one that has ended. A ring for it is kept a
+/// while (`profiles.md#calls-guidance`).
 pub(crate) fn may_be_offered(d: &Daemon, space: &SpaceId, from: &[u8; 32]) -> bool {
     let core = d.core();
     let contact = core
         .contacts()
         .into_iter()
         .any(|c| c.identity == *from && !c.refused && c.recovery_of.is_none());
-    if !contact || core.declined().contains(space) || core.is_joined(space) {
+    if !contact || core.is_declined(space) || core.is_joined(space) {
+        return false;
+    }
+    if core.is_superseded(space) {
         return false;
     }
     match core.spaces.get(space).and_then(|h| h.space.as_ref()) {
-        Some(sp) => sp.profile() == group::GROUP,
+        Some(sp) => sp.profile() == group::GROUP && !sp.ended(),
         None => true,
     }
 }

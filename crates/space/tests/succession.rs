@@ -672,3 +672,99 @@ fn a_successor_is_made_for_a_call_only_by_its_own_genesis() {
     let (s, _, _) = succeed(&mut t, &n, &refs);
     assert!(!group::for_call(&s));
 }
+
+/// D92: a `set` of field 3 written beside what the genesis wrote stands
+/// beside it, and the group is an ordinary one from then on; so are two
+/// writes made apart, by two members who had not seen each other's.
+#[test]
+fn a_write_beside_or_two_apart_make_a_call_group_ordinary() {
+    let value = |v: bool| Some(cardinal_encoding::Value::from(v));
+    // beside: the genesis's true is still there, with another
+    let mut t = three_for(true);
+    let c = relationship::conversation(&t.spaces[0]).unwrap();
+    write_as(
+        &mut t,
+        1,
+        vec![SpaceOp::set_beside(c, group::FOR_CALL, value(true))],
+    );
+    for sp in &t.spaces {
+        let n = sp.state().node(&c).unwrap();
+        assert_eq!(n.values(group::FOR_CALL).len(), 2, "beside, not over");
+        assert!(!group::for_call(sp), "a write beside the genesis's");
+    }
+    // apart: Bo and Cy each write, neither seeing the other's
+    let mut t = three_for(true);
+    let c = relationship::conversation(&t.spaces[0]).unwrap();
+    for (i, v) in [(1, true), (2, false)] {
+        let who = [&t.ana, &t.bo, &t.cy][i];
+        t.spaces[i]
+            .write(
+                &who.log,
+                &who.device.signing,
+                vec![SpaceOp::set(c, group::FOR_CALL, value(v))],
+                Some(5),
+            )
+            .unwrap();
+    }
+    let encs = [&t.ana.enc, &t.bo.enc, &t.cy.enc];
+    for (from, to) in [(1, 0), (2, 0), (1, 2), (2, 1)] {
+        let (f, tt) = if from < to {
+            let (l, r) = t.spaces.split_at_mut(to);
+            (&l[from], &mut r[0])
+        } else {
+            let (l, r) = t.spaces.split_at_mut(from);
+            (&r[0], &mut l[to])
+        };
+        sync(f, tt, encs[to]);
+    }
+    for sp in &t.spaces {
+        assert!(!group::for_call(sp), "two writes apart");
+    }
+}
+
+/// "The genesis creates one conversation node" (`profiles.md#relationship`):
+/// the group's name and its mark are read from that node and no other. A
+/// second conversation node a member writes under the root, whatever its
+/// name, displaces nothing, nor does deleting it, or writing the mark on
+/// it; and messages are still written under the genesis's.
+#[test]
+fn a_second_conversation_node_displaces_nothing() {
+    use cardinal_space::{NodeKind, ROOT};
+    let mut t = three_for(true);
+    let c = relationship::conversation(&t.spaces[0]).unwrap();
+    // Bo, a writer, makes one whose name sorts before "conversation"
+    let fields = Record::new().with(1, "Not Family");
+    let op = SpaceOp::create(
+        NodeKind::Uint(relationship::CONVERSATION),
+        ROOT,
+        "a",
+        fields,
+    );
+    write_as(&mut t, 1, vec![op]);
+    let other = {
+        let st = t.spaces[0].state();
+        let kids = st.children(&ROOT);
+        let found = kids
+            .into_iter()
+            .find(|n| n.kind == NodeKind::Uint(relationship::CONVERSATION) && n.id != c);
+        found.expect("the second one").id
+    };
+    for sp in &t.spaces {
+        assert_eq!(relationship::conversation(sp), Some(c));
+        assert_eq!(group::name(sp), "Family");
+        assert!(group::for_call(sp), "still a call group");
+    }
+    // the mark written on the second one: nothing changes
+    let keep = vec![group::keep_group(other)];
+    write_as(&mut t, 2, keep);
+    assert!(group::for_call(&t.spaces[0]), "kept on the wrong node");
+    // a group kept on its own node stays kept, with the second deleted
+    write_as(&mut t, 0, vec![group::keep_group(c)]);
+    write_as(&mut t, 1, vec![SpaceOp::delete(other)]);
+    for sp in &t.spaces {
+        assert!(!group::for_call(sp), "made a call group again");
+        assert_eq!(relationship::conversation(sp), Some(c));
+    }
+    t.cy.says(&mut t.spaces[2], "hello there");
+    assert!(said(&t.spaces[2]).contains(&"hello there".to_owned()));
+}
