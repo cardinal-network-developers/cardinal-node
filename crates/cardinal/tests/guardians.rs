@@ -1394,11 +1394,20 @@ fn the_guardian_knows_the_new_device_when_the_helper_goes() {
         .extend(late.map(|(k, v)| (k.to_owned(), v.to_owned())));
     bo.start();
     bo.wait_mounted();
+    // its persona's service starts a moment after the device's
+    let mut invitation = String::new();
+    wait("bo's persona is up again", 60, || {
+        let o = bo.try_cli(&["guarding", "invite", "Ana"]);
+        if o.status.success() {
+            invitation = code_in(&String::from_utf8_lossy(&o.stdout));
+        }
+        o.status.success()
+    });
     let mut new = Dev::new(root.path(), "new", free_port());
     new.env
         .extend(late.map(|(k, v)| (k.to_owned(), v.to_owned())));
     new.start();
-    let fp = fingerprint_from(&new.cli(&["recover", "start", &recovery_invitation(&bo, "Ana")]));
+    let fp = fingerprint_from(&new.cli(&["recover", "start", &invitation]));
     wait("bo sees the recovery", 60, || {
         bo.cli(&["guarding"]).contains(&fp)
     });
