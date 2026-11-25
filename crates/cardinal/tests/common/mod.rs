@@ -157,9 +157,26 @@ impl Dev {
             .spawn()
             .unwrap();
         self.child = Some(child);
-        wait(&format!("{} daemon up", self.name), 20, || {
-            self.try_cli(&["status"]).status.success()
-        });
+        // One that stops at once, as on a port another program took, says
+        // why now, rather than as a wait that ran out.
+        let start = Instant::now();
+        loop {
+            if let Some(Ok(Some(status))) = self.child.as_mut().map(Child::try_wait) {
+                self.child = None;
+                panic!(
+                    "{} daemon stopped before it was up ({status}):\n{}",
+                    self.name,
+                    self.log()
+                );
+            }
+            if self.try_cli(&["status"]).status.success() {
+                return;
+            }
+            if start.elapsed() > Duration::from_secs(20) {
+                panic!("timed out waiting for {} daemon up", self.name);
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
     }
 
     pub fn try_cli(&self, args: &[&str]) -> Output {
@@ -176,7 +193,12 @@ impl Dev {
             .stderr(Stdio::piped())
             .spawn()
             .unwrap();
-        std::io::Write::write_all(&mut c.stdin.take().unwrap(), input.as_bytes()).unwrap();
+        // One that stops before reading, as on a refusal, says why in its
+        // output, not as a broken pipe here.
+        let written = std::io::Write::write_all(&mut c.stdin.take().unwrap(), input.as_bytes());
+        if let Err(e) = written {
+            assert_eq!(e.kind(), std::io::ErrorKind::BrokenPipe, "{e}");
+        }
         c.wait_with_output().unwrap()
     }
 
