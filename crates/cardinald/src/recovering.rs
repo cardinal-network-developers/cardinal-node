@@ -1031,20 +1031,35 @@ fn after_removal(d: &Arc<Daemon>, links: &[[u8; 32]]) {
 /// after the finish a space comes: unkept, the person would be in every
 /// group they left again, and served it.
 pub fn tend_recovered(d: &Arc<Daemon>) {
+    // A keep written here can make a succession count that did not when
+    // its space arrived, and the space was judged then, before the keep
+    // (`Daemon::ingest` follows first): it is judged again now, or the
+    // device would wait for something else to arrive to move
+    // (`spaces.md#a-succession-by-a-device-that-is-later-removed`).
+    if keep_recovered(d) {
+        crate::following::follow(d);
+    }
+}
+
+/// What [`tend_recovered`] keeps, pushed; whether anything was written.
+fn keep_recovered(d: &Arc<Daemon>) -> bool {
     let Some(r) = load_recovered(d) else {
-        return;
+        return false;
     };
     if r.forgotten.is_empty() || d.core().identity.is_none() {
-        return;
+        return false;
     }
+    let mut any = false;
+    let mut push = |written: crate::core::Written| {
+        for (space, bytes) in written {
+            any = true;
+            d.push(&space, vec![bytes]);
+        }
+    };
     let keys = r.keys();
     let left = d.core().keep_leaves(&keys);
     match left {
-        Ok(written) => {
-            for (space, bytes) in written {
-                d.push(&space, vec![bytes]);
-            }
-        }
+        Ok(written) => push(written),
         Err(e) => tracing::debug!("keeping what the person left: {e:#}"),
     }
     // What the person kept before the loss stands, successions among it:
@@ -1052,31 +1067,23 @@ pub fn tend_recovered(d: &Arc<Daemon>) {
     // successor kept so is kept as ordinary work then
     let kept = d.core().keep_earlier_keeps(&keys);
     match kept {
-        Ok(written) => {
-            for (space, bytes) in written {
-                d.push(&space, vec![bytes]);
-            }
-        }
+        Ok(written) => push(written),
         Err(e) => tracing::debug!("keeping what the person kept before: {e:#}"),
     }
     // the rest as spaces arrive only for a while after the finish: then by
     // the person's own `keep-work` (a thief sets the clock those entries
     // give)
-    let Some(up_to) = r.lost_at.filter(|_| r.fresh()) else {
-        return;
-    };
-    for k in keys {
-        // the core is let go before what was written is pushed
-        let kept = d.core().keep_work(&k, Some(up_to));
-        match kept {
-            Ok((written, _)) => {
-                for (space, bytes) in written {
-                    d.push(&space, vec![bytes]);
-                }
+    if let Some(up_to) = r.lost_at.filter(|_| r.fresh()) {
+        for k in keys {
+            // the core is let go before what was written is pushed
+            let kept = d.core().keep_work(&k, Some(up_to));
+            match kept {
+                Ok((written, _)) => push(written),
+                Err(e) => tracing::debug!("keeping what a lost device wrote: {e:#}"),
             }
-            Err(e) => tracing::debug!("keeping what a lost device wrote: {e:#}"),
         }
     }
+    any
 }
 
 /// `recover-lost-at` (`lost_at`): when the person lost the devices the
