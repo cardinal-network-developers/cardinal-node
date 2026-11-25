@@ -530,8 +530,6 @@ const NODE_ONLY: &[&str] = &[
     "unmount",
     "flush",
     "conflicts",
-    "history",
-    "restore",
     "pin",
     "unpin",
     "retention",

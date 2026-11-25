@@ -174,7 +174,7 @@ pub async fn set_picture(d: &Arc<Daemon>, who: &str, from: &str) -> anyhow::Resu
         let r: [u8; 8] = cardinal_crypto::random_bytes();
         let tmp = dir.join(format!("incoming-{}", hex::encode(r)));
         let to = tmp.display().to_string();
-        crate::onefolder::save(d, from, &to)
+        crate::onefolder::save(d, from, &to, None)
             .await
             .map_err(|e| anyhow::anyhow!("{from} is not a file here: {e:#}"))?;
         (tmp, true)

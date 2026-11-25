@@ -327,12 +327,12 @@ impl At {
     }
 
     /// Whose devices may hold what is here besides this person's.
-    fn others(&self) -> Option<Others> {
+    pub(crate) fn others(&self) -> Option<Others> {
         self.shared.as_ref().map(Shown::others)
     }
 }
 
-fn open<'a>(core: &'a crate::core::Core, space: &SpaceId) -> anyhow::Result<&'a Space> {
+pub(crate) fn open<'a>(core: &'a crate::core::Core, space: &SpaceId) -> anyhow::Result<&'a Space> {
     core.spaces
         .get(space)
         .and_then(|h| h.space.as_ref())
@@ -355,7 +355,7 @@ fn walk(
     Some(cur)
 }
 
-fn parts(path: &str) -> Vec<&str> {
+pub(crate) fn parts(path: &str) -> Vec<&str> {
     path.split('/').filter(|p| !p.is_empty()).collect()
 }
 
@@ -505,7 +505,7 @@ pub fn list(d: &Daemon, path: &str) -> anyhow::Result<Json> {
 }
 
 /// The folder and the last name of a path.
-fn split_last(path: &str) -> anyhow::Result<(String, String)> {
+pub(crate) fn split_last(path: &str) -> anyhow::Result<(String, String)> {
     let p = parts(path);
     let (last, rest) = p
         .split_last()
@@ -523,7 +523,7 @@ fn name_ok(name: &str) -> anyhow::Result<()> {
 }
 
 /// The folder at `path`, to put something in.
-fn folder(d: &Daemon, path: &str) -> anyhow::Result<At> {
+pub(crate) fn folder(d: &Daemon, path: &str) -> anyhow::Result<At> {
     match resolve(d, path)? {
         Place::In(at) if at.is_folder() => Ok(at),
         Place::Category(c) => {
@@ -1106,22 +1106,33 @@ pub async fn write(d: &Arc<Daemon>, from: &str, path: &str) -> anyhow::Result<Js
 }
 
 /// Writes a file of the one folder to `to` on this device's disk, fetching
-/// what is not here.
-pub async fn save(d: &Arc<Daemon>, path: &str, to: &str) -> anyhow::Result<Json> {
+/// what is not here: the version shown, or with `version` an earlier one,
+/// numbered as `history` numbers them, which changes nothing in the folder.
+pub async fn save(
+    d: &Arc<Daemon>,
+    path: &str,
+    to: &str,
+    version: Option<u64>,
+) -> anyhow::Result<Json> {
     let at = match resolve(d, path)? {
         Place::In(at) if at.kind == FileKind::File => at,
         _ => anyhow::bail!("{path} is not a file; save one file at a time"),
     };
     let content = {
         let core = d.core();
-        let files = Files::new(open(&core, &at.space)?);
-        let versions = files.content(&at.node);
-        let v = match at.version {
-            Some(e) => versions.into_iter().find(|v| v.entry == e),
-            None => versions.into_iter().last(),
-        };
-        v.and_then(|v| v.content)
-            .ok_or_else(|| anyhow::anyhow!("{path} has nothing in it to save"))?
+        let sp = open(&core, &at.space)?;
+        match version {
+            Some(n) => crate::file_history::version_of(sp, &at.node, path, n)?,
+            None => {
+                let versions = Files::new(sp).content(&at.node);
+                let v = match at.version {
+                    Some(e) => versions.into_iter().find(|v| v.entry == e),
+                    None => versions.into_iter().last(),
+                };
+                v.and_then(|v| v.content)
+                    .ok_or_else(|| anyhow::anyhow!("{path} has nothing in it to save"))?
+            }
+        }
     };
     let to = PathBuf::from(to);
     let (d, from, written) = (d.clone(), at.others(), to.clone());

@@ -23,7 +23,8 @@ One person, several Linux devices, one folder that is the same everywhere:
   the device where they are made, such as build output: they show in
   your folder there and are never synced.
 - Deleted files and old versions are kept 30 days so you can restore them
-  (`cardinal history`, `cardinal restore`), then freed. `cardinal
+  (`cardinal history`, `cardinal restore`, `cardinal deleted`,
+  `cardinal undelete`), in shared folders too, then freed. `cardinal
   free-space` frees them now; `cardinal keep-old 90` or `forever` changes
   the period on a device.
 - Lost your admin device? On any device you still have, your recovery

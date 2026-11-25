@@ -124,6 +124,17 @@ impl Node {
         }
     }
 
+    /// The entry whose `delete` took it, where it is deleted and that
+    /// delete is in this space's log: on it, or on a node above it. `None`
+    /// where it is not deleted, or where a successor's initial state
+    /// carried it deleted.
+    pub fn deleted_in(&self) -> Option<EntryId> {
+        match self.deleted_by {
+            Some(Took::Op(e, _)) if self.deleted => Some(e),
+            _ => None,
+        }
+    }
+
     /// Every value of the field.
     pub fn values(&self, key: u64) -> &[FieldValue] {
         self.fields.get(&key).map_or(&[], |v| v.as_slice())

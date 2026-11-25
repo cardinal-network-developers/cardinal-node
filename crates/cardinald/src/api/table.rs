@@ -417,7 +417,10 @@ rec!(UNREADABLE "unreadable":
     1 "reason" T, 2 "retry_in_s" U, 3 "says" T, 4 "since" U, 5 "theirs" BOOL, 6 "version" T);
 rec!(UNSHOWN_NODE "unshown node": 1 "name" T, 2 "node" B);
 rec!(VERSION "version":
-    1 "current" BOOL, 2 "device" T, 3 "here" BOOL, 4 "size" U, 5 "time" U, 6 "version" U);
+    1 "current" BOOL, 2 "device" T, 3 "here" BOOL, 4 "size" U, 5 "time" U, 6 "version" U,
+    7 "by" T);
+rec!(DELETED_FILE "deleted file":
+    1 "by" T, 2 "folder" BOOL, 3 "id" B, 4 "mine" BOOL, 5 "name" T, 6 "size" U, 7 "time" U);
 
 // ---- Records of inspection ----
 
@@ -623,7 +626,7 @@ pub static REQUESTS: &[Request] = &[
     req!(123 "remove" (1 "path" T) -> (2 "path" T)),
     req!(124 "copy" (1 "from" T, 2 "to" T) -> (2 "path" T)),
     req!(125 "put" (1 "from" T, 2 "to" T) -> (2 "path" T)),
-    req!(126 "save" (1 "path" T, 2 "to" T) -> (2 "path" T, 3 "size" U)),
+    req!(126 "save" (1 "path" T, 2 "to" T, 3 "version" U) -> (2 "path" T, 3 "size" U)),
     req!(127 "write" (1 "from" T, 2 "path" T) -> (2 "path" T)),
     req!(128 "share" (1 "who" REF, 2 "paths" [T], 3 "text" T, 4 "group" REF) -> (2 "message" BOOL, 3 "path" T)),
     req!(129 "mount" (1 "path" T) -> (2 "path" T)),
@@ -775,6 +778,9 @@ pub static REQUESTS: &[Request] = &[
         2 "offers" [APP_OFFER], 3 "more" BOOL, 4 "next" U)),
     req!(225 "app-join" (1 "space" REF) -> (2 "space" B, 3 "name" T)),
     req!(226 "wake" () -> (2 "checking" U)),
+    paged!(after 227 "deleted" (1 "path" T, 2 "after" U, 3 "limit" U) -> (
+        2 "files" [DELETED_FILE], 3 "path" T, 4 "more" BOOL, 5 "next" U)),
+    req!(228 "undelete" (1 "path" T, 2 "id" REF) -> (2 "id" B, 3 "path" T)),
 ];
 
 // ---- What the service's program says without starting ----

@@ -269,6 +269,10 @@ enum Cmd {
         path: String,
         /// Where it goes on this computer.
         to: PathBuf,
+        /// An earlier version, as `cardinal history` numbers it, in place
+        /// of the one shown. The folder is left as it is.
+        #[arg(long)]
+        version: Option<u64>,
     },
     /// The invitations you made, and whether each can still be used. `cancel ID`
     /// ends one on all your devices. An invitation lasts 30 days.
@@ -506,10 +510,25 @@ enum Cmd {
         #[arg(long)]
         space: Option<String>,
     },
-    /// List the versions of a file.
+    /// List the versions of a file, yours or in a folder you share, such
+    /// as `People/Ana/notes.txt`.
     History {
         /// The file (in your Cardinal folder).
         path: PathBuf,
+    },
+    /// List what was deleted from a folder, the most recent first.
+    Deleted {
+        /// The folder, such as `People/Ana` (the top if left out).
+        path: Option<PathBuf>,
+    },
+    /// Bring back a deleted file or folder, with what was in it.
+    Undelete {
+        /// The folder and the name it had, such as `Photos/beach.jpg`.
+        path: PathBuf,
+        /// Which, where more than one of that name was deleted there: its
+        /// id, as `cardinal deleted` shows it.
+        #[arg(long)]
+        id: Option<String>,
     },
     /// Bring back an earlier version of a file.
     Restore {
@@ -3369,9 +3388,13 @@ async fn client(cmd: Cmd) -> anyhow::Result<()> {
             call(&paths, req).await?;
             Ok(())
         }
-        Cmd::Get { path, to } => {
+        Cmd::Get { path, to, version } => {
             let to = std::path::absolute(to)?;
-            call(&paths, json!({"cmd": "save", "path": path, "to": to})).await?;
+            let mut req = json!({"cmd": "save", "path": path, "to": to});
+            if let Some(n) = version {
+                req["version"] = json!(n);
+            }
+            call(&paths, req).await?;
             Ok(())
         }
         Cmd::Say { who, text, attach } => {
@@ -4082,6 +4105,59 @@ async fn client(cmd: Cmd) -> anyhow::Result<()> {
                 );
             }
             println!("Bring one back with: cardinal restore {p} --version N");
+            println!("or copy one out with: cardinal get {p} FILE --version N");
+            Ok(())
+        }
+        Cmd::Deleted { path } => {
+            let m = mount_path(&paths).await;
+            let p = path
+                .map(|p| space_path(&p, m.as_deref()))
+                .unwrap_or_default();
+            let v = call(&paths, json!({"cmd": "deleted", "path": p})).await?;
+            let list = v["files"].as_array().cloned().unwrap_or_default();
+            let top = if p.is_empty() { "your files" } else { &p };
+            if list.is_empty() {
+                println!("Nothing was deleted from {top}.");
+                return Ok(());
+            }
+            println!("Deleted from {top} (the most recent first):");
+            // an id only where a name is there more than once
+            let mut count: std::collections::HashMap<String, usize> = Default::default();
+            for x in &list {
+                *count
+                    .entry(x["name"].as_str().unwrap_or("").to_owned())
+                    .or_default() += 1;
+            }
+            for x in &list {
+                let name = x["name"].as_str().unwrap_or("");
+                let id = x["id"].as_str().unwrap_or("");
+                println!(
+                    "  {}{}  {}  {:<16} {:>10}{}",
+                    printable(name),
+                    if x["folder"] == true { "/" } else { "" },
+                    human_time(x["time"].as_u64()),
+                    x["by"].as_str().unwrap_or(""),
+                    x["size"].as_u64().map(human_size).unwrap_or_default(),
+                    if count.get(name).copied().unwrap_or(0) > 1 {
+                        format!("  --id {}", &id[..id.len().min(16)])
+                    } else {
+                        String::new()
+                    }
+                );
+            }
+            let at = if p.is_empty() {
+                String::new()
+            } else {
+                format!("{p}/")
+            };
+            println!("Bring one back with: cardinal undelete {at}NAME");
+            Ok(())
+        }
+        Cmd::Undelete { path, id } => {
+            let m = mount_path(&paths).await;
+            let p = space_path(&path, m.as_deref());
+            let v = call(&paths, json!({"cmd": "undelete", "path": p, "id": id})).await?;
+            println!("Brought back {}.", v["path"].as_str().unwrap_or(&p));
             Ok(())
         }
         Cmd::Clear {

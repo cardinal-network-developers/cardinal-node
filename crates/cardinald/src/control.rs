@@ -17,9 +17,9 @@ use std::time::Duration;
 
 use cardinal_identity::Power;
 use cardinal_space::account;
-use cardinal_space::files::{self, Content, Files, FILE_CONTENT};
+use cardinal_space::files::Files;
 use cardinal_space::state::State;
-use cardinal_space::{NodeId, SpaceId, SpaceOpBody, ROOT};
+use cardinal_space::{NodeId, SpaceId, ROOT};
 use serde_json::{json, Value};
 
 use crate::api::{self, status};
@@ -702,7 +702,10 @@ async fn handle(d: &Arc<Daemon>, req: &Value) -> anyhow::Result<Value> {
         "remove" => crate::onefolder::remove(d, arg(req, "path")?),
         "copy" => crate::onefolder::copy(d, arg(req, "from")?, arg(req, "to")?).await,
         "put" => crate::onefolder::put(d, arg(req, "from")?, arg(req, "to")?).await,
-        "save" => crate::onefolder::save(d, arg(req, "path")?, arg(req, "to")?).await,
+        "save" => {
+            let version = req.get("version").and_then(Value::as_u64);
+            crate::onefolder::save(d, arg(req, "path")?, arg(req, "to")?, version).await
+        }
         "write" => crate::onefolder::write(d, arg(req, "from")?, arg(req, "path")?).await,
         "share" => {
             let paths: Vec<String> = req
@@ -999,14 +1002,21 @@ async fn handle(d: &Arc<Daemon>, req: &Value) -> anyhow::Result<Value> {
             });
             Ok(json!({"keep": keep.to_string()}))
         }
-        "history" => history(d, arg(req, "path")?),
+        "history" => crate::file_history::history(d, arg(req, "path")?),
         "restore" => {
             let path = arg(req, "path")?.to_owned();
             let version = req
                 .get("version")
                 .and_then(|v| v.as_u64())
                 .ok_or_else(|| anyhow::anyhow!("missing --version"))?;
-            restore(d, &path, version).await
+            crate::file_history::restore(d, &path, version).await
+        }
+        "deleted" => {
+            crate::file_history::deleted(d, req.get("path").and_then(Value::as_str).unwrap_or(""))
+        }
+        "undelete" => {
+            let id = req.get("id").and_then(Value::as_str);
+            crate::file_history::undelete(d, arg(req, "path")?, id).await
         }
         "pin" | "unpin" => {
             let path = arg(req, "path")?.trim_matches('/').to_owned();
@@ -1442,158 +1452,6 @@ fn conflicts(d: &Daemon) -> anyhow::Result<Value> {
         }));
     }
     Ok(json!({"conflicts": out}))
-}
-
-/// One content version: entry, time, device, content.
-type VersionRow = ([u8; 32], Option<u64>, [u8; 32], Option<Content>);
-
-/// The content versions of a node, oldest first.
-fn versions(sp: &cardinal_space::Space, node: &NodeId) -> Vec<VersionRow> {
-    let f = Files::new(sp);
-    let mut out = Vec::new();
-    for h in f.history(node) {
-        let c = match &h.op {
-            SpaceOpBody::Create { fields, .. } => {
-                fields.get(FILE_CONTENT).and_then(Content::from_value)
-            }
-            SpaceOpBody::Set { key, value, .. } if *key == FILE_CONTENT => {
-                value.as_ref().and_then(Content::from_value)
-            }
-            _ => continue,
-        };
-        out.push((h.entry, h.time, h.device, c));
-    }
-    out
-}
-
-/// What is in a folder of this person's files, folders first.
-fn history(d: &Daemon, path: &str) -> anyhow::Result<Value> {
-    let files_id = require_files(d)?;
-    let core = d.core();
-    let names = core.device_names();
-    let sp = core.spaces[&files_id]
-        .space
-        .as_ref()
-        .ok_or_else(|| anyhow::anyhow!("files space not open"))?;
-    let r = Files::new(sp)
-        .resolve(path)
-        .ok_or_else(|| anyhow::anyhow!("{path} does not exist in your files"))?;
-    let vs = versions(sp, &r.node);
-    let current: HashMap<[u8; 32], ()> = Files::new(sp)
-        .content(&r.node)
-        .iter()
-        .map(|v| (v.entry, ()))
-        .collect();
-    let list: Vec<Value> = vs
-        .iter()
-        .enumerate()
-        .map(|(i, (e, t, dev, c))| {
-            json!({
-                "version": i + 1,
-                "time": t,
-                "device": names.get(dev).cloned().unwrap_or_else(|| account::short_key(dev)),
-                "size": c.as_ref().map(|c| c.size()),
-                "current": current.contains_key(e),
-                // whether its content is on this device (`cleanup.rs`)
-                "here": match c {
-                    Some(Content::Blob(b)) => {
-                        cardinal_blob::ObjectStore::has(&*d.store, &b.id).unwrap_or(false)
-                    }
-                    _ => true,
-                },
-            })
-        })
-        .collect();
-    Ok(json!({"path": path, "versions": list}))
-}
-
-async fn restore(d: &Arc<Daemon>, path: &str, version: u64) -> anyhow::Result<Value> {
-    let files_id = require_files(d)?;
-    // save anything pending first, so the restore descends from it
-    let d2 = d.clone();
-    tokio::task::spawn_blocking(move || {
-        let m = d2.mount.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(m) = m.as_ref() {
-            let _ = m.flush();
-        }
-    })
-    .await?;
-    let (node, content) = {
-        let core = d.core();
-        let sp = core.spaces[&files_id]
-            .space
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("files space not open"))?;
-        let r = Files::new(sp)
-            .resolve(path)
-            .ok_or_else(|| anyhow::anyhow!("{path} does not exist in your files"))?;
-        let vs = versions(sp, &r.node);
-        let (_, _, _, c) = vs
-            .get((version as usize).wrapping_sub(1))
-            .cloned()
-            .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "{path} has versions 1 to {}; see `cardinal history {path}`",
-                    vs.len()
-                )
-            })?;
-        (
-            r.node,
-            c.ok_or_else(|| anyhow::anyhow!("that version has no content"))?,
-        )
-    };
-    // Its content may have been freed here (`cleanup.rs`): get all of it
-    // first, or the restored file could not be read.
-    if let Content::Blob(b) = &content {
-        let (d2, b) = (d.clone(), crate::fetch::blob_ref(b));
-        let missing = tokio::task::spawn_blocking(move || held_or_fetched(&d2, b)).await??;
-        if missing > 0 {
-            anyhow::bail!(
-                "version {version} of {path} is no longer kept: this device freed it, and none \
-                 of your online devices has all of it"
-            );
-        }
-    }
-    d.write_and_push(&files_id, vec![files::set_content(node, &content)])?;
-    Ok(json!({"path": path, "version": version}))
-}
-
-/// Makes sure every object of `b` is on this device, fetching what is
-/// missing from the person's online devices (blocking). Returns how many
-/// objects are still missing.
-fn held_or_fetched(d: &Arc<Daemon>, b: cardinal_blob::BlobRef) -> anyhow::Result<usize> {
-    use cardinal_blob::{BlobReader, Fetch, ObjectStore};
-    let fetcher = crate::fetch::Fetcher::new(d, cardinal_link::Priority::Interactive);
-    // Listing fetches and keeps the indexes.
-    let mut chunks = Vec::new();
-    let listed = BlobReader::new(d.store.clone(), &fetcher, b).for_each_entry(|e, chunk| {
-        if chunk {
-            chunks.push(e.id)
-        }
-    });
-    if listed.is_err() {
-        return Ok(1);
-    }
-    let mut missing: Vec<[u8; 32]> = Vec::new();
-    for id in chunks {
-        if !d.store.has(&id)? {
-            missing.push(id);
-        }
-    }
-    for batch in missing.chunks(256) {
-        for (id, ct) in fetcher.fetch(batch)? {
-            if blake3::hash(&ct).as_bytes() == &id {
-                d.store.put(&id, &ct)?;
-            }
-        }
-    }
-    let mut left = 0;
-    for id in &missing {
-        if !d.store.has(id)? {
-            left += 1;
-        }
-    }
-    Ok(left)
 }
 
 /// For tests: a digest of the files space's heads, whether the mount has

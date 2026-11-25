@@ -24,6 +24,7 @@ pub mod core;
 pub mod daemon;
 pub mod directory;
 pub mod fetch;
+pub mod file_history;
 pub mod following;
 pub mod format;
 pub mod fs;
