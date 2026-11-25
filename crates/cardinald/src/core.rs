@@ -548,6 +548,17 @@ pub fn holds_for(contacts: &[account::ContactRecord], who: &[u8; 32]) -> bool {
     !nodes.is_empty() && nodes.iter().all(says)
 }
 
+/// How long a device remembers passing a group's messages between two
+/// other members (D89): thirty days. A family's or a club's group can be
+/// quiet for weeks, and a month still holds the last time two of its people
+/// spoke through this device; what is older says little about whether they
+/// need it now, and goes, so the record stays small and soon forgets
+/// people who have since found their own way to each other.
+pub const RELAYED_FOR_MS: u64 = 30 * 24 * 3600 * 1000;
+
+/// How often passing on between one pair is noted again: once an hour.
+const RELAY_NOTED_EVERY_MS: u64 = 3600 * 1000;
+
 /// [`Core::is_joined`], from the account and the space.
 pub fn joined_in(account: Option<&Space>, sp: &Space, space: &SpaceId, me: &[u8; 32]) -> bool {
     if sp.accepted_by(me) {
@@ -2218,6 +2229,16 @@ impl Core {
         }
         let open = self.spaces.get(label).and_then(|h| h.space.as_ref());
         open.is_some_and(|s| s.role_of(identity).is_some() && !s.has_left(identity))
+    }
+
+    /// Whether `identity` is a member of the space `label` who has left
+    /// it. Nothing of it is sent them, and what they send of it is taken:
+    /// a leave takes no role away, and an owner or admin who left comes
+    /// back by sending the entry that adds them again (D89). Whatever
+    /// they send is judged as anyone's is.
+    pub fn left_member(&self, identity: &[u8; 32], label: &[u8; 32]) -> bool {
+        let open = self.spaces.get(label).and_then(|h| h.space.as_ref());
+        open.is_some_and(|s| s.role_of(identity).is_some() && s.has_left(identity))
     }
 
     /// The held copy nodes this person and `who` wrote in their relationship
@@ -8421,5 +8442,103 @@ mod tests {
         let sp = ana.space(&started);
         assert!(sp.validity().unwitnessed.contains(&started));
         assert!(!ana.core.recovered_owns(&dee.id(), &new.key(), &started));
+    }
+
+    /// D89, the Test Group as it was left: Daniel owns it and left it with
+    /// nobody else an admin. Kids and Claude go on writing, under a key
+    /// that is not his. A leave takes no role away, so he adds himself
+    /// back, and has accepted it by doing so; whoever writes next starts a
+    /// key that is his too, and he reads what was written while he was
+    /// away.
+    #[test]
+    fn an_owner_who_left_adds_themselves_back() {
+        let [mut daniel, mut kids, mut claude, _] = four();
+        let both = [
+            (kids.id(), "Kids".to_owned()),
+            (claude.id(), "Claude".to_owned()),
+        ];
+        let g = daniel
+            .core
+            .create_group("Test Group", "Daniel", &both)
+            .unwrap();
+        for who in [&mut kids, &mut claude] {
+            who.takes(&g, &daniel.all_of(&g));
+        }
+        let hi = kids.says(&g, "hi");
+        daniel.takes(&g, std::slice::from_ref(&hi));
+        claude.takes(&g, &[hi]);
+        let (_, gone) = daniel
+            .core
+            .write_entry(&g, relationship::leave_ops(&daniel.id()))
+            .unwrap();
+        kids.takes(&g, std::slice::from_ref(&gone));
+        claude.takes(&g, &[gone]);
+        for who in [&kids, &claude] {
+            assert!(who.space(&g).has_left(&daniel.id()));
+            // nobody left in it can add anyone
+            let admins = group::members(who.space(&g));
+            let able = admins.iter().filter(|m| !m.left && m.role >= ADMIN);
+            assert_eq!(able.count(), 0);
+        }
+        assert!(kids.core.left_member(&daniel.id(), &g));
+        assert!(!kids.core.shares(&daniel.id(), &g));
+        let away = kids.says(&g, "while he was away");
+        claude.takes(&g, std::slice::from_ref(&away));
+        daniel.takes(&g, std::slice::from_ref(&away));
+        assert_eq!(daniel.said(&g), ["hi"], "a key not his");
+
+        // still the owner, he adds himself back
+        assert_eq!(daniel.role(&g, &daniel), Some(OWNER));
+        let (_, back) = daniel
+            .core
+            .write_entry(&g, vec![SpaceOp::add_member(daniel.id(), ADMIN)])
+            .unwrap();
+        assert!(!daniel.space(&g).has_left(&daniel.id()));
+        assert!(daniel.space(&g).accepted_by(&daniel.id()));
+        assert!(daniel.core.is_joined(&g));
+        kids.takes(&g, std::slice::from_ref(&back));
+        claude.takes(&g, &[back]);
+        for who in [&kids, &claude] {
+            assert!(!who.space(&g).has_left(&daniel.id()));
+            assert_eq!(who.role(&g, &daniel), Some(OWNER));
+            assert!(who.core.shares(&daniel.id(), &g));
+        }
+        assert!(!kids.core.left_member(&daniel.id(), &g));
+        let welcome = kids.says(&g, "welcome back");
+        claude.takes(&g, std::slice::from_ref(&welcome));
+        daniel.takes(&g, &kids.all_of(&g));
+        assert_eq!(daniel.said(&g), ["hi", "while he was away", "welcome back"]);
+        let thanks = daniel.says(&g, "thanks");
+        kids.takes(&g, std::slice::from_ref(&thanks));
+        claude.takes(&g, &[thanks]);
+        assert_eq!(claude.said(&g).last().unwrap(), "thanks");
+    }
+
+    /// D89: a device notes which members of a group it passed messages
+    /// between, and only members, and not its own person.
+    #[test]
+    fn passing_on_between_members_is_noted() {
+        let [mut daniel, mut kids, claude, other] = four();
+        let both = [
+            (kids.id(), "Kids".to_owned()),
+            (claude.id(), "Claude".to_owned()),
+        ];
+        let g = daniel
+            .core
+            .create_group("Test Group", "Daniel", &both)
+            .unwrap();
+        kids.takes(&g, &daniel.all_of(&g));
+        daniel.core.note_relayed(&g, &kids.id(), &claude.id());
+        daniel.core.note_relayed(&g, &claude.id(), &kids.id());
+        daniel.core.note_relayed(&g, &kids.id(), &other.id());
+        daniel.core.note_relayed(&g, &kids.id(), &daniel.id());
+        let pairs = daniel.core.relayed_for(&g);
+        assert_eq!(pairs.len(), 1, "{pairs:?}");
+        let (a, b) = pairs[0];
+        assert!([a, b].contains(&kids.id()) && [a, b].contains(&claude.id()));
+        // a relationship is no group
+        let rel = *kids.core.spaces.keys().find(|k| **k != g).unwrap();
+        kids.core.note_relayed(&rel, &daniel.id(), &claude.id());
+        assert!(kids.core.relayed_for(&rel).is_empty());
     }
 }

@@ -651,8 +651,22 @@ enum GroupCmd {
         /// The group, by name or id.
         group: String,
     },
-    /// Leave a group.
+    /// Leave a group. If you own it and nobody else in it is an admin, say
+    /// who looks after it with --admin. If two others reach each other only
+    /// through you, you are told who, and leave only with --anyway.
     Leave {
+        /// The group, by name or id.
+        group: String,
+        /// Make this member an admin as you leave, as the group's members
+        /// show them. Repeat it for more than one.
+        #[arg(long = "admin", value_name = "MEMBER")]
+        admins: Vec<String>,
+        /// Leave although others reach each other only through you.
+        #[arg(long)]
+        anyway: bool,
+    },
+    /// Come back to a group you own, or were an admin of, and left.
+    Rejoin {
         /// The group, by name or id.
         group: String,
     },
@@ -1662,6 +1676,45 @@ fn old_line(old: &Value) -> Option<String> {
         "Old versions: {}, kept {keep} (`cardinal free-space` frees them now)",
         human_size(bytes)
     ))
+}
+
+/// What `group members` says of how a member is reached (D89).
+fn reach_said(m: &Value) -> String {
+    let back = if m["reaches_you"] == false {
+        ", cannot reach you"
+    } else {
+        ""
+    };
+    match m["reach"].as_str() {
+        Some("contact") => format!("  reached directly{back}"),
+        Some("host") => format!("  reached through their host{back}"),
+        Some("through") => format!(
+            "  reached through {}{back}",
+            printable(m["through"].as_str().unwrap_or("someone"))
+        ),
+        Some("none") => format!("  not reachable: nobody in the group connects you{back}"),
+        _ => String::new(),
+    }
+}
+
+/// What a group's conversation says of members nothing connects this
+/// person with (D89): silence would be wrong.
+fn no_route_lines(members: &Value) -> Vec<String> {
+    let name = printable(members["name"].as_str().unwrap_or(""));
+    let mut out = Vec::new();
+    for m in members["members"].as_array().into_iter().flatten() {
+        let who = printable(m["name"].as_str().unwrap_or(""));
+        if m["reach"] == "none" {
+            out.push(format!(
+                "You can't reach {who} right now: nobody in {name} connects you."
+            ));
+        } else if m["reaches_you"] == false {
+            out.push(format!(
+                "{who} can't reach you right now: nobody in {name} connects you."
+            ));
+        }
+    }
+    out
 }
 
 /// Someone else's words, with nothing in them the terminal would act on.
@@ -3418,6 +3471,13 @@ async fn client(cmd: Cmd) -> anyhow::Result<()> {
                     );
                 }
             }
+            for r in v["rejoin"].as_array().into_iter().flatten() {
+                println!(
+                    "You left {}, which you look after: cardinal group rejoin {}",
+                    printable(r["name"].as_str().unwrap_or("")),
+                    &r["group"].as_str().unwrap_or("")[..16]
+                );
+            }
             Ok(())
         }
         Cmd::Approve { id, no, with, role } => {
@@ -3587,7 +3647,14 @@ async fn client(cmd: Cmd) -> anyhow::Result<()> {
                     req
                 }
                 GroupCmd::Decline { group } => json!({"cmd": "group-decline", "group": group}),
-                GroupCmd::Leave { group } => json!({"cmd": "group-leave", "group": group}),
+                GroupCmd::Leave {
+                    group,
+                    admins,
+                    anyway,
+                } => {
+                    json!({"cmd": "group-leave", "group": group, "admins": admins, "anyway": anyway})
+                }
+                GroupCmd::Rejoin { group } => json!({"cmd": "group-rejoin", "group": group}),
                 GroupCmd::Add {
                     group,
                     people,
@@ -3644,14 +3711,37 @@ async fn client(cmd: Cmd) -> anyhow::Result<()> {
                 ),
                 GroupCmd::Members { .. } => {
                     for m in v["members"].as_array().into_iter().flatten() {
+                        let left = if m["left"] == true { ", left" } else { "" };
                         println!(
-                            "{}  {}",
+                            "{}  {}{left}{}",
                             printable(m["name"].as_str().unwrap_or("")),
-                            m["role"].as_str().unwrap_or("")
+                            m["role"].as_str().unwrap_or(""),
+                            reach_said(m)
                         );
                     }
                 }
-                GroupCmd::Messages { .. } => {
+                GroupCmd::Leave { group, .. } => {
+                    let made: Vec<String> = v["admins"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .filter_map(|a| a.as_str().map(printable))
+                        .collect();
+                    if !made.is_empty() {
+                        println!("{} look after {} now.", made.join(", "), printable(&group));
+                    }
+                }
+                GroupCmd::Rejoin { .. } => println!(
+                    "You are back in {}.",
+                    printable(v["name"].as_str().unwrap_or(""))
+                ),
+                GroupCmd::Messages { group } => {
+                    // whom nothing carries what this person writes to (D89)
+                    let them =
+                        call(&paths, json!({"cmd": "group-members", "group": group})).await?;
+                    for line in no_route_lines(&them) {
+                        println!("{line}");
+                    }
                     for m in v["messages"].as_array().into_iter().flatten() {
                         let by = if m["mine"] == true {
                             "you"

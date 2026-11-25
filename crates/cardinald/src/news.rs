@@ -11,7 +11,7 @@ use cardinal_link::Session;
 use cardinal_sync::Label;
 
 use crate::core::short;
-use crate::daemon::Daemon;
+use crate::daemon::{Daemon, PeerKind};
 use crate::net;
 
 /// How long news waits, so that one notice covers a burst. Long enough to
@@ -98,6 +98,29 @@ impl Daemon {
         }
     }
 
+    /// Notes that news of a group from one member's device goes on from
+    /// here to other members' (D89): the pairs it passes between.
+    fn note_relaying(&self, label: &Label, from: &[u8; 32]) {
+        let Some(PeerKind::Contact(a, _)) = self.session_kind(from) else {
+            return;
+        };
+        let to: Vec<[u8; 32]> = self
+            .contact_sessions(label)
+            .iter()
+            .filter_map(|s| match self.session_kind(&s.peer_static()) {
+                Some(PeerKind::Contact(b, _)) if b != a => Some(b),
+                _ => None,
+            })
+            .collect();
+        if to.is_empty() {
+            return;
+        }
+        let mut core = self.core();
+        for b in to {
+            core.note_relayed(label, &a, &b);
+        }
+    }
+
     /// Passes on `complete` objects of `label` that `from` told this device
     /// of, `objects` being those that can go as they are. An identity log's
     /// go at once, so revocations travel first; others wait a moment.
@@ -111,6 +134,7 @@ impl Daemon {
         if complete == 0 {
             return;
         }
+        self.note_relaying(&label, &from);
         let first = {
             let mut waiting = self.news.lock().unwrap_or_else(|e| e.into_inner());
             let first = !waiting.contains_key(&label);

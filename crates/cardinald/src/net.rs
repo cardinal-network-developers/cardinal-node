@@ -146,7 +146,10 @@ impl Daemon {
                 } else if core.held_taken(&identity).contains(label) {
                     // one they give this person to hold
                     Access::Offered
-                } else if core.offered_here(&identity, label) {
+                } else if core.offered_here(&identity, label) || core.left_member(&identity, label)
+                {
+                    // and from a member who left, what they send: an
+                    // owner who left comes back so (D89)
                     Access::Offered
                 } else if let Some(m) = core
                     .members_shared_with(&identity)

@@ -613,7 +613,12 @@ async fn handle(d: &Arc<Daemon>, req: &Value) -> anyhow::Result<Value> {
             &strings(req, "moves"),
             &strings(req, "to"),
         ),
-        "group-leave" => crate::groups::leave(d, arg(req, "group")?),
+        "group-leave" => {
+            let anyway = req.get("anyway").and_then(|v| v.as_bool()) == Some(true);
+            crate::groups::leave(d, arg(req, "group")?, &strings(req, "admins"), anyway)
+        }
+        "group-leaving" => crate::groups::leaving(d, arg(req, "group")?),
+        "group-rejoin" => crate::groups::rejoin(d, arg(req, "group")?),
         "group-join" => {
             let reach = answer_in(req, "reach")?;
             crate::groups::join(d, arg(req, "group")?, reach).await

@@ -16,6 +16,13 @@
 //! send them nothing more, and whoever writes next starts a new key that
 //! is not wrapped for them.
 //!
+//! Software asks before a leave (D89): an owner names who looks after the
+//! group if nobody else does, and whoever's devices have been passing
+//! messages between two members who name no host there is told they may
+//! not reach each other after. Each member's own device says whom nothing
+//! connects it with. A leave takes no role away, so an owner or admin who
+//! left can come back.
+//!
 //! A member who is not a trusted contact of another reaches them through a
 //! member connected to both, who passes on what they write, or through their
 //! hosts (`spaces.md#holding-a-space`): being in a group opens no connection.
@@ -420,16 +427,77 @@ pub fn post_again(d: &Arc<Daemon>, group: &str) -> anyhow::Result<Json> {
 /// their hosts there: an offer of the group asks afresh. From then on this
 /// device does nothing with the group, and the others send it nothing
 /// more.
-pub fn leave(d: &Arc<Daemon>, group: &str) -> anyhow::Result<Json> {
+///
+/// Software asks first (D89). An owner leaves others behind only with
+/// someone among them who looks after it: `admins` are made admins, in
+/// the entry that leaves, and without one where nobody else is, leaving
+/// is refused with the question. And whoever's devices have lately been
+/// passing messages between two others who name no host there is told so
+/// by name, and leaves only `anyway`.
+pub fn leave(
+    d: &Arc<Daemon>,
+    group: &str,
+    admins: &[String],
+    anyway: bool,
+) -> anyhow::Result<Json> {
     let g = joined(d, group)?;
     let me = identity(d)?;
-    {
+    let (made, names) = {
         let core = d.core();
         let sp = core.spaces.get(&g.id).and_then(|h| h.space.as_ref());
         let sp = sp.ok_or_else(|| anyhow::anyhow!("that group is not open yet"))?;
         anyhow::ensure!(sp.role_of(&me).is_some(), "you are not in {}", g.name);
-    }
-    d.write_and_push(&g.id, relationship::leave_ops(&me))?;
+        let contacts = core.contacts();
+        let members = group::members(sp);
+        let mut made: Vec<[u8; 32]> = Vec::new();
+        for who in admins {
+            let them = member_named(&contacts, sp, who)?;
+            anyhow::ensure!(them != me, "you are leaving {}: name someone else", g.name);
+            anyhow::ensure!(
+                !sp.has_left(&them),
+                "{who} has left {}: name someone still in it",
+                g.name
+            );
+            if !made.contains(&them) {
+                made.push(them);
+            }
+        }
+        anyhow::ensure!(
+            made.is_empty() || may_manage(sp, &me),
+            "only an admin of {} can make someone an admin",
+            g.name
+        );
+        let names: Vec<String> = made
+            .iter()
+            .map(|m| name_of(&me, &contacts, &members, m))
+            .collect();
+        let left = Leaving::of(&core, &g.id, sp, &me);
+        if left.choose_admin && made.is_empty() {
+            let others: Vec<String> = left.others.iter().map(|(_, n)| n.clone()).collect();
+            anyhow::bail!(
+                "Who looks after {name}? You own it, and once you leave nobody in it can add \
+                 anyone, you included. Choose one or more of {who} to be its admins: \
+                 cardinal group leave {name} --admin <member>",
+                name = g.name,
+                who = others.join(", "),
+            );
+        }
+        if !left.relayed_for.is_empty() && !anyway {
+            anyhow::bail!(
+                "{} Introduce them first (cardinal introduce <who> <to>), or leave {} anyway: \
+                 --anyway",
+                relayed_warning(&left.relayed_for, &g.name),
+                g.name
+            );
+        }
+        (made, names)
+    };
+    let mut ops: Vec<SpaceOp> = made
+        .iter()
+        .map(|m| SpaceOp::add_member(*m, group::ADMIN))
+        .collect();
+    ops.extend(relationship::leave_ops(&me));
+    d.write_and_push(&g.id, ops)?;
     // The account's node for it goes, and with it any "no hosts here" or
     // "not this host here": an offer made again asks afresh (D75).
     let gone = {
@@ -451,7 +519,285 @@ pub fn leave(d: &Arc<Daemon>, group: &str) -> anyhow::Result<Json> {
     }
     crate::mailbox::revoke_left(d, &g.id);
     d.bump();
-    Ok(json!({}))
+    Ok(json!({"admins": names}))
+}
+
+/// How what this person writes in a group gets to another member, as
+/// their own device sees it (D89): only what this device itself can tell.
+/// It knows whom its person's devices talk to, and who names a host in the
+/// group; whether two others are each other's contacts lives in their own
+/// relationships, which the group never sees, and is nothing it guesses.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum Way {
+    /// A trusted contact: their devices talk.
+    Contact,
+    /// They name a host in the group's reach node.
+    Host,
+    /// Not directly, but what this person writes goes to this member, a
+    /// contact or one who names a host, who holds the group and passes it
+    /// on. Whether it reaches them from there is not this device's to know.
+    Through([u8; 32]),
+    /// Nothing at all carries it from here: they are not a contact and name
+    /// no host, and nobody else in the group is either.
+    None,
+}
+
+/// What this device knows of a group's members, for [`Way`]: its own
+/// person, whom the person's devices talk to, who names a host, and who is
+/// in it, joined and not left.
+pub(crate) struct Seen {
+    pub me: [u8; 32],
+    pub others: Vec<[u8; 32]>,
+    pub contacts: Vec<[u8; 32]>,
+    pub hosted: Vec<[u8; 32]>,
+}
+
+impl Seen {
+    pub fn of(core: &Core, sp: &Space, me: &[u8; 32]) -> Seen {
+        let all = core.contacts();
+        let others: Vec<[u8; 32]> = sp
+            .present()
+            .into_iter()
+            .filter(|m| m != me && sp.accepted_by(m))
+            .collect();
+        let contacts = others
+            .iter()
+            .filter(|m| cardinal_space::account::connects(&all, m))
+            .copied()
+            .collect();
+        let mut hosted: Vec<[u8; 32]> = others.clone();
+        hosted.push(*me);
+        hosted.retain(|m| !relationship::reach_of(sp, m).is_empty());
+        Seen {
+            me: *me,
+            others,
+            contacts,
+            hosted,
+        }
+    }
+
+    /// How what this person writes gets to `who`.
+    pub fn way_to(&self, who: &[u8; 32]) -> Way {
+        if self.contacts.contains(who) {
+            return Way::Contact;
+        }
+        if self.hosted.contains(who) {
+            return Way::Host;
+        }
+        let carries =
+            |m: &&[u8; 32]| *m != who && (self.contacts.contains(m) || self.hosted.contains(m));
+        match self.others.iter().find(carries) {
+            Some(m) => Way::Through(*m),
+            None => Way::None,
+        }
+    }
+
+    /// Whether anything could carry what `who` writes to this person: they
+    /// are a contact, or this person names a host there, or some other
+    /// contact of theirs is in it to pass it on. Without any of these
+    /// nothing does, for certain.
+    pub fn reaches_me(&self, who: &[u8; 32]) -> bool {
+        self.contacts.contains(who)
+            || self.hosted.contains(&self.me)
+            || self.contacts.iter().any(|m| m != who)
+    }
+}
+
+/// Two members, by identity and by what this person calls them.
+type Named = ([u8; 32], String);
+
+/// Two others this person's devices have been passing messages between.
+pub(crate) struct RelayedFor {
+    pub a: Named,
+    pub b: Named,
+}
+
+/// What leaving a group would leave behind (D89).
+pub(crate) struct Leaving {
+    /// The others still in it, offered or joined.
+    pub others: Vec<Named>,
+    /// Those among them who look after it: its owner and admins.
+    pub admins: Vec<Named>,
+    /// Whether this person must choose someone to look after it first: they
+    /// own it, others are in it, and none of them is an admin.
+    pub choose_admin: bool,
+    /// Pairs of others still in it whom this person's devices passed
+    /// messages between lately ([`crate::core::RELAYED_FOR_MS`]), neither
+    /// of whom names a host there: they may not reach each other once
+    /// this person goes. A leaver cannot know whether two others are
+    /// contacts; this is only what their devices saw.
+    pub relayed_for: Vec<RelayedFor>,
+}
+
+impl Leaving {
+    pub fn of(core: &Core, id: &SpaceId, sp: &Space, me: &[u8; 32]) -> Leaving {
+        let contacts = core.contacts();
+        let members = group::members(sp);
+        let named = |id: &[u8; 32]| (*id, name_of(me, &contacts, &members, id));
+        let others: Vec<&Member> = members
+            .iter()
+            .filter(|m| m.identity != *me && !m.left)
+            .collect();
+        let admins: Vec<Named> = others
+            .iter()
+            .filter(|m| m.role >= group::ADMIN)
+            .map(|m| named(&m.identity))
+            .collect();
+        let owner = sp.owner() == Some(*me);
+        let seen = Seen::of(core, sp, me);
+        let relayed_for = core
+            .relayed_for(id)
+            .into_iter()
+            .filter(|(a, b)| {
+                let here = |m: &[u8; 32]| seen.others.contains(m) && !seen.hosted.contains(m);
+                here(a) && here(b)
+            })
+            .map(|(a, b)| RelayedFor {
+                a: named(&a),
+                b: named(&b),
+            })
+            .collect();
+        Leaving {
+            choose_admin: owner && !others.is_empty() && admins.is_empty(),
+            others: others.iter().map(|m| named(&m.identity)).collect(),
+            admins,
+            relayed_for,
+        }
+    }
+}
+
+/// What leaving a group would leave behind, for a client to ask about
+/// before it leaves (D89): who looks after it, whether the person must
+/// choose someone to, and whom their devices have been passing messages
+/// between.
+pub fn leaving(d: &Daemon, group: &str) -> anyhow::Result<Json> {
+    let g = joined(d, group)?;
+    let me = identity(d)?;
+    let core = d.core();
+    let sp = core.spaces.get(&g.id).and_then(|h| h.space.as_ref());
+    let sp = sp.ok_or_else(|| anyhow::anyhow!("that group is not open yet"))?;
+    let l = Leaving::of(&core, &g.id, sp, &me);
+    let pairs: Vec<Json> = l
+        .relayed_for
+        .iter()
+        .map(|o| {
+            json!({
+                "a": o.a.1, "a_id": hex::encode(&o.a.0[..8]),
+                "b": o.b.1, "b_id": hex::encode(&o.b.0[..8]),
+            })
+        })
+        .collect();
+    let admins: Vec<&String> = l.admins.iter().map(|(_, n)| n).collect();
+    Ok(json!({
+        "group": hex::encode(g.id),
+        "name": g.name,
+        "admins": admins,
+        "choose_admin": l.choose_admin,
+        "relayed_for": pairs,
+    }))
+}
+
+/// What a person leaving is told of those their devices have been passing
+/// messages between (D89).
+fn relayed_warning(pairs: &[RelayedFor], group: &str) -> String {
+    let each: Vec<String> = pairs
+        .iter()
+        .map(|p| {
+            format!(
+                "Your devices have been passing messages between {} and {}, and neither has \
+                 named a host in {group}. They may not reach each other once you leave.",
+                p.a.1, p.b.1
+            )
+        })
+        .collect();
+    each.join(" ")
+}
+
+/// The groups this person left and may add themselves back to: they own
+/// them, or were an admin, and this device still holds them (D89).
+fn left_groups(core: &Core, me: &[u8; 32]) -> Vec<Found> {
+    let mut out = Vec::new();
+    for (id, h) in &core.spaces {
+        let Some(sp) = h.space.as_ref() else {
+            continue;
+        };
+        if sp.profile() != group::GROUP || !sp.has_left(me) || core.is_superseded(id) {
+            continue;
+        }
+        if may_manage(sp, me) && !sp.ended() {
+            out.push(Found {
+                id: *id,
+                name: group::name(sp),
+                joined: false,
+            });
+        }
+    }
+    out
+}
+
+/// The groups [`rejoin`] can take this person back to, for `groups`.
+fn rejoinable_json(core: &Core, me: &[u8; 32]) -> Vec<Json> {
+    left_groups(core, me)
+        .into_iter()
+        .map(|g| {
+            let sp = core.spaces.get(&g.id).and_then(|h| h.space.as_ref());
+            let members = sp.map_or(0, |sp| sp.present().len());
+            json!({"group": hex::encode(g.id), "name": g.name, "members": members})
+        })
+        .collect()
+}
+
+/// An owner, or an admin, who left a group comes back: a leave takes no
+/// role away, so they add themselves again, by an `add_member` that
+/// descends from their leave, and have accepted it by doing so
+/// (`spaces.md#holding-a-space`). Their reach node stays the empty list
+/// the leave left there until they share their host again. Whoever writes
+/// next in it starts a key that is theirs too, and with it they read what
+/// was written while they were away.
+pub fn rejoin(d: &Arc<Daemon>, group: &str) -> anyhow::Result<Json> {
+    let me = identity(d)?;
+    let (found, left_some) = {
+        let core = d.core();
+        let found = pick(left_groups(&core, &me), group, &[]);
+        (found, left_any(&core, &me, group))
+    };
+    let g = match found {
+        Ok(g) => g,
+        Err(e) => {
+            if let Ok(g) = find(d, group) {
+                anyhow::bail!("you are in {} already", g.name);
+            }
+            // left, and not one who looks after it
+            anyhow::ensure!(
+                !left_some,
+                "only an owner or admin of {group} can add themselves back: ask one of them \
+                 to add you"
+            );
+            return Err(e);
+        }
+    };
+    d.write_and_push(&g.id, vec![SpaceOp::add_member(me, group::ADMIN)])?;
+    d.bump();
+    Ok(json!({"group": hex::encode(g.id), "name": g.name}))
+}
+
+/// Whether this person left a group `group` names, whatever their role.
+fn left_any(core: &Core, me: &[u8; 32], group: &str) -> bool {
+    let all: Vec<Found> = core
+        .spaces
+        .iter()
+        .filter_map(|(id, h)| {
+            let sp = h.space.as_ref()?;
+            (sp.profile() == group::GROUP && sp.has_left(me) && !core.is_superseded(id)).then(
+                || Found {
+                    id: *id,
+                    name: group::name(sp),
+                    joined: false,
+                },
+            )
+        })
+        .collect();
+    pick(all, group, &[]).is_ok()
 }
 
 /// What is said of this person's reach node in a group, for a client to
@@ -1005,7 +1351,8 @@ pub fn list_of(core: &Core) -> Json {
     }
     groups.sort_by_key(|(when, _)| std::cmp::Reverse(*when));
     let groups: Vec<Json> = groups.into_iter().map(|(_, g)| g).collect();
-    json!({"groups": groups, "offers": offered})
+    let rejoin = rejoinable_json(core, &me);
+    json!({"groups": groups, "offers": offered, "rejoin": rejoin})
 }
 
 /// Who is in a group, as the others see them.
@@ -1017,6 +1364,7 @@ pub fn members(d: &Daemon, group: &str) -> anyhow::Result<Json> {
     let sp = sp.ok_or_else(|| anyhow::anyhow!("that group is not open yet"))?;
     let members = group::members(sp);
     let contacts = core.contacts();
+    let seen = Seen::of(&core, sp, &me);
     let out: Vec<Json> = members
         .iter()
         .map(|m| {
@@ -1024,7 +1372,7 @@ pub fn members(d: &Daemon, group: &str) -> anyhow::Result<Json> {
                 .iter()
                 .find(|c| c.identity == m.identity && !c.refused);
             let contact = known.is_some();
-            let v = json!({
+            let mut v = json!({
                 "name": name_of(&me, &contacts, &members, &m.identity),
                 "shown": m.name,
                 "id": hex::encode(&m.identity[..8]),
@@ -1039,6 +1387,19 @@ pub fn members(d: &Daemon, group: &str) -> anyhow::Result<Json> {
                 "introduce": m.introduce,
                 "left": m.left,
             });
+            // what carries what this person writes to them, and theirs back
+            // (D89): for someone in it who has joined, not this person
+            if seen.others.contains(&m.identity) {
+                let (reach, through) = match seen.way_to(&m.identity) {
+                    Way::Contact => ("contact", None),
+                    Way::Host => ("host", None),
+                    Way::Through(t) => ("through", Some(name_of(&me, &contacts, &members, &t))),
+                    Way::None => ("none", None),
+                };
+                v["reach"] = json!(reach);
+                v["through"] = json!(through);
+                v["reaches_you"] = json!(seen.reaches_me(&m.identity));
+            }
             // a contact's as this person sees them: own name, picture
             match known {
                 Some(c) => {
@@ -1588,5 +1949,42 @@ mod tests {
             found(&hex::encode([0xc3u8; 32]), &[[0xc3; 32]]).unwrap(),
             [0xc3; 32]
         );
+    }
+
+    fn seen(me: u8, others: &[u8], contacts: &[u8], hosted: &[u8]) -> Seen {
+        let id = |n: &u8| [*n; 32];
+        Seen {
+            me: [me; 32],
+            others: others.iter().map(id).collect(),
+            contacts: contacts.iter().map(id).collect(),
+            hosted: hosted.iter().map(id).collect(),
+        }
+    }
+
+    /// D89, Test Group, as Kids (2) sees it: Daniel (1) is a contact, and
+    /// Claude (3) is not and names no host. While Daniel is in it, what
+    /// Kids writes goes to him, who passes it on; once he has left,
+    /// nothing carries it either way, and that is certain.
+    #[test]
+    fn a_member_sees_whom_nothing_connects_them_with() {
+        let s = seen(2, &[1, 3], &[1], &[]);
+        assert_eq!(s.way_to(&[1; 32]), Way::Contact);
+        assert_eq!(s.way_to(&[3; 32]), Way::Through([1; 32]));
+        assert!(s.reaches_me(&[3; 32]));
+        // Daniel has left
+        let s = seen(2, &[3], &[], &[]);
+        assert_eq!(s.way_to(&[3; 32]), Way::None);
+        assert!(!s.reaches_me(&[3; 32]));
+        // Claude names a host: Kids reaches him there, and hears nothing
+        // back, since Kids names none
+        let s = seen(2, &[3], &[], &[3]);
+        assert_eq!(s.way_to(&[3; 32]), Way::Host);
+        assert!(!s.reaches_me(&[3; 32]));
+        // Kids names one too
+        let s = seen(2, &[3], &[], &[2, 3]);
+        assert!(s.reaches_me(&[3; 32]));
+        // someone else who names a host may pass it on
+        let s = seen(2, &[3, 4], &[], &[4]);
+        assert_eq!(s.way_to(&[3; 32]), Way::Through([4; 32]));
     }
 }

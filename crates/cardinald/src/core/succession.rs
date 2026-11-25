@@ -81,6 +81,12 @@ pub struct Notes {
     /// the note of how the group moved is aged from.
     #[serde(default)]
     pub first_seen_ms: Option<u64>,
+    /// Pairs of other members this device passed a group's messages
+    /// between, as "<identity> <identity>" in hex, the smaller first, with
+    /// when it last did, by its own clock (D89). Kept here alone, for
+    /// [`super::RELAYED_FOR_MS`], and never sent anywhere.
+    #[serde(default)]
+    pub relayed: BTreeMap<String, u64>,
 }
 
 /// What [`Core::succeed`] wrote, to send.
@@ -357,6 +363,59 @@ impl Core {
         let sp = self.spaces.get(new)?.space.as_ref()?;
         let old = self.spaces.get(&sp.succeeds()?)?.space.as_ref()?;
         Some(plan::changes(old, sp))
+    }
+
+    /// This device passed news of a group from `a`'s devices to `b`'s,
+    /// both members of it and neither this person (D89). Noted at most once
+    /// an hour for a pair, so that a busy group does not write the notes
+    /// with every message; what is older than [`RELAYED_FOR_MS`] goes.
+    pub fn note_relayed(&mut self, space: &SpaceId, a: &[u8; 32], b: &[u8; 32]) {
+        let me = self.me();
+        let Some(h) = self.spaces.get_mut(space) else {
+            return;
+        };
+        let Some(sp) = h.space.as_ref() else {
+            return;
+        };
+        let member = |w: &[u8; 32]| sp.role_of(w).is_some() && !sp.has_left(w);
+        let group = sp.profile() == cardinal_space::group::GROUP;
+        if !group || a == b || me == Some(*a) || me == Some(*b) || !member(a) || !member(b) {
+            return;
+        }
+        let (x, y) = if a < b { (a, b) } else { (b, a) };
+        let key = format!("{} {}", hex::encode(x), hex::encode(y));
+        let now = now_ms();
+        if h.notes
+            .relayed
+            .get(&key)
+            .is_some_and(|t| now.saturating_sub(*t) < RELAY_NOTED_EVERY_MS)
+        {
+            return;
+        }
+        h.notes.relayed.insert(key, now);
+        h.notes
+            .relayed
+            .retain(|_, t| now.saturating_sub(*t) < RELAYED_FOR_MS);
+        h.save_notes();
+    }
+
+    /// The pairs of members this device passed a group's messages between
+    /// within [`RELAYED_FOR_MS`] (D89).
+    pub fn relayed_for(&self, space: &SpaceId) -> Vec<([u8; 32], [u8; 32])> {
+        let Some(h) = self.spaces.get(space) else {
+            return Vec::new();
+        };
+        let now = now_ms();
+        let id = |s: &str| -> Option<[u8; 32]> { hex::decode(s).ok()?.try_into().ok() };
+        h.notes
+            .relayed
+            .iter()
+            .filter(|(_, t)| now.saturating_sub(**t) < RELAYED_FOR_MS)
+            .filter_map(|(k, _)| {
+                let (a, b) = k.split_once(' ')?;
+                Some((id(a)?, id(b)?))
+            })
+            .collect()
     }
 
     /// The person cleared the note of how the group moved to `space`.

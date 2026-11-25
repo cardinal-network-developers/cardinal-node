@@ -1178,3 +1178,188 @@ fn taking_someone_out_replaces_the_group_for_everyone_else() {
         all.contains(&"Ana: hello all".to_owned()) && all.contains(&"Bo: just us".to_owned())
     });
 }
+
+/// D89, the Test Group: Ana owns it, with Kids and Claude, her contacts and
+/// not each other's, who name no host there, so what either writes reaches
+/// the other through her. Her leaving is refused until she says who looks
+/// after it; then she is told her devices have been passing their messages
+/// on, and leaves only anyway. Afterwards each of them is told that nothing
+/// connects them with the other. Ana, still its owner, comes back, and the
+/// two reach each other through her again.
+#[test]
+fn an_owner_leaves_only_with_someone_in_charge_and_can_come_back() {
+    let root = tempfile::tempdir().unwrap();
+    let ana = person(root.path(), "ana");
+    let kids = person(root.path(), "kids");
+    let claude = person(root.path(), "claude");
+    meet(&ana, &kids, "Kids");
+    meet(&ana, &claude, "Claude");
+    let made = ask(
+        &ana,
+        json!({"cmd": "group-create", "name": "Test Group", "people": ["Kids", "Claude"]}),
+    );
+    let g = made["group"].as_str().unwrap().to_owned();
+    for d in [&kids, &claude] {
+        wait("the offer arrives", 30, || {
+            offers(d).iter().any(|o| o["name"] == "Test Group")
+        });
+        ask(d, json!({"cmd": "group-join", "group": g}));
+    }
+    ask(
+        &kids,
+        json!({"cmd": "say", "group": g, "text": "hi claude"}),
+    );
+    wait("kids's message reaches claude through ana", 30, || {
+        said(&claude, &g).contains(&"Kids: hi claude".to_owned())
+    });
+    ask(
+        &claude,
+        json!({"cmd": "say", "group": g, "text": "hi kids"}),
+    );
+    wait("and back", 30, || {
+        said(&kids, &g).contains(&"Claude: hi kids".to_owned())
+    });
+    let member = |d: &Dev, name: &str| -> Value {
+        let m = ask(d, json!({"cmd": "group-members", "group": g}));
+        let all = m["members"].as_array().cloned().unwrap_or_default();
+        all.into_iter()
+            .find(|x| x["name"] == name)
+            .unwrap_or_default()
+    };
+    // Kids sees Claude reached through Ana, and Ana directly
+    let c = member(&kids, "Claude");
+    assert_eq!(c["reach"], "through", "{c}");
+    assert_eq!(c["through"], "Ana", "{c}");
+    assert_eq!(c["reaches_you"], true, "{c}");
+    assert_eq!(member(&kids, "Ana")["reach"], "contact");
+
+    // What leaving would leave behind
+    let l = ask(&ana, json!({"cmd": "group-leaving", "group": g}));
+    assert_eq!(l["choose_admin"], true, "{l}");
+    assert_eq!(l["admins"], json!([]), "{l}");
+    let pairs = l["relayed_for"].as_array().unwrap();
+    assert_eq!(pairs.len(), 1, "{l}");
+    let mut two = [
+        pairs[0]["a"].as_str().unwrap(),
+        pairs[0]["b"].as_str().unwrap(),
+    ];
+    two.sort_unstable();
+    assert_eq!(two, ["Claude", "Kids"], "{l}");
+
+    // Refused: nobody would look after it
+    let no = reply(&ana, &json!({"cmd": "group-leave", "group": g}));
+    assert_eq!(no["ok"], false, "{no}");
+    let why = no["error"].as_str().unwrap();
+    assert!(why.contains("Who looks after Test Group?"), "{why}");
+    assert!(why.contains("--admin"), "{why}");
+    let out = ana.try_cli(&["group", "leave", "Test Group"]);
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("--admin"));
+    // With someone in charge, told whom her devices pass messages between
+    let no = reply(
+        &ana,
+        &json!({"cmd": "group-leave", "group": g, "admins": ["Kids"]}),
+    );
+    assert_eq!(no["ok"], false, "{no}");
+    let why = no["error"].as_str().unwrap();
+    assert!(
+        why.contains("Your devices have been passing messages between")
+            && why.contains("neither has named a host in Test Group")
+            && why.contains("They may not reach each other once you leave")
+            && why.contains("--anyway"),
+        "{why}"
+    );
+    assert_eq!(member(&kids, "Ana")["left"], false, "nothing was written");
+    let out = ana.cli(&[
+        "group",
+        "leave",
+        "Test Group",
+        "--admin",
+        "Kids",
+        "--anyway",
+    ]);
+    assert!(out.contains("Kids look after Test Group now"), "{out}");
+
+    for d in [&kids, &claude] {
+        wait("they see that ana left", 30, || {
+            member(d, "Ana")["left"] == true
+        });
+    }
+    wait("kids is its admin", 30, || {
+        member(&kids, "You")["role"] == "admin"
+    });
+    // Each is told nothing connects them with the other, and the group's
+    // conversation says so
+    let c = member(&kids, "Claude");
+    assert_eq!(c["reach"], "none", "{c}");
+    assert_eq!(c["reaches_you"], false, "{c}");
+    let k = member(&claude, "Kids");
+    assert_eq!(k["reach"], "none", "{k}");
+    let out = kids.cli(&["group", "messages", "Test Group"]);
+    assert!(
+        out.contains("You can't reach Claude right now: nobody in Test Group connects you."),
+        "{out}"
+    );
+    let out = kids.cli(&["group", "members", "Test Group"]);
+    assert!(out.contains("not reachable"), "{out}");
+
+    // Ana, still its owner, comes back
+    let listed = ask(&ana, json!({"cmd": "groups"}));
+    let back = listed["rejoin"].as_array().cloned().unwrap_or_default();
+    assert!(back.iter().any(|r| r["group"] == g.as_str()), "{listed}");
+    let out = ana.cli(&["groups"]);
+    assert!(out.contains("cardinal group rejoin"), "{out}");
+    let out = ana.cli(&["group", "rejoin", "Test Group"]);
+    assert!(out.contains("You are back in Test Group"), "{out}");
+    for d in [&kids, &claude] {
+        wait("they see ana back", 30, || {
+            member(d, "Ana")["left"] == false
+        });
+    }
+    assert_eq!(member(&kids, "Ana")["role"], "owner");
+    ask(
+        &kids,
+        json!({"cmd": "say", "group": g, "text": "welcome back"}),
+    );
+    wait("ana reads it", 60, || {
+        said(&ana, &g).contains(&"Kids: welcome back".to_owned())
+    });
+    wait("and claude, through her", 60, || {
+        said(&claude, &g).contains(&"Kids: welcome back".to_owned())
+    });
+    assert_eq!(member(&claude, "Kids")["reach"], "through");
+}
+
+/// D89: a member who did not look after a group cannot add themselves
+/// back to it once they leave.
+#[test]
+fn a_member_who_left_is_added_back_by_someone_else() {
+    let root = tempfile::tempdir().unwrap();
+    let ana = person(root.path(), "ana");
+    let bo = person(root.path(), "bo");
+    meet(&ana, &bo, "Bo");
+    let made = ask(
+        &ana,
+        json!({"cmd": "group-create", "name": "Pair", "people": ["Bo"]}),
+    );
+    let g = made["group"].as_str().unwrap().to_owned();
+    wait("the offer arrives", 30, || !offers(&bo).is_empty());
+    ask(&bo, json!({"cmd": "group-join", "group": g}));
+    // Bo is the only other: nobody else is left behind, and he links nobody
+    let l = ask(&bo, json!({"cmd": "group-leaving", "group": g}));
+    assert_eq!(l["choose_admin"], false, "{l}");
+    assert_eq!(l["admins"], json!(["Ana"]), "{l}");
+    ask(&bo, json!({"cmd": "group-leave", "group": g}));
+    let no = reply(&bo, &json!({"cmd": "group-rejoin", "group": g}));
+    assert_eq!(no["ok"], false, "{no}");
+    assert!(
+        no["error"]
+            .as_str()
+            .unwrap()
+            .contains("only an owner or admin"),
+        "{no}"
+    );
+    assert!(ask(&bo, json!({"cmd": "groups"}))["rejoin"]
+        .as_array()
+        .is_none_or(|r| r.is_empty()));
+}

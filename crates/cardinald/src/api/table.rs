@@ -355,7 +355,7 @@ rec!(LOST_DEVICE "lost device": 1 "key" B, 2 "name" T, 3 "set_aside" U);
 rec!(MEMBER "member":
     1 "contact" BOOL, 2 "id" B, 3 "introduce" BOOL, 4 "left" BOOL, 5 "name" T, 6 "own" BOOL,
     7 "picture" T, 8 "role" T, 9 "shown" T, 10 "suggested" T, 11 "taken_out" BOOL,
-    12 "you" BOOL);
+    12 "you" BOOL, 13 "reach" T, 14 "reaches_you" BOOL, 15 "through" T);
 rec!(MESSAGE "message":
     1 "attachments" [ATTACHMENT], 2 "edited" BOOL, 3 "from" T, 4 "id" B, 5 "mine" BOOL,
     6 "picture" T, 7 "reactions" [REACTION], 8 "read_by" U, 9 "reply_to" B, 10 "state" T,
@@ -386,6 +386,8 @@ rec!(RECOVERY "recovery":
     1 "caution" T, 2 "confirm_from_ms" U, 3 "confirmed" U, 4 "confirmed_by_me" BOOL,
     5 "endorsed" U, 6 "endorsed_by_me" BOOL, 7 "fingerprint" T, 8 "id" B, 9 "in_effect" BOOL,
     10 "keeps_keys" BOOL, 11 "objected" BOOL, 12 "pending" BOOL);
+rec!(RELAYED_FOR "relayed for": 1 "a" T, 2 "a_id" B, 3 "b" T, 4 "b_id" B);
+rec!(REJOIN "rejoin": 1 "group" B, 2 "members" U, 3 "name" T);
 rec!(ROLE_CHANGE "role change": 1 "from" T, 2 "name" T, 3 "to" T);
 rec!(REDIAL "redial": 1 "alone" BOOL, 2 "helps" BOOL, 3 "sparing" {SPARING});
 rec!(SPARING "sparing": 1 "next_s" U, 2 "wait_s" U);
@@ -579,12 +581,14 @@ pub static REQUESTS: &[Request] = &[
     req!(49 "introduction-decline" (1 "id" REF) -> ()),
     // ---- Groups: 70 to 99 ----
     paged!(after 70 "groups" (1 "after" U, 2 "limit" U) -> (
-        2 "groups" [GROUP], 3 "offers" [OFFER], 4 "more" BOOL, 5 "next" U)),
+        2 "groups" [GROUP], 3 "offers" [OFFER], 4 "more" BOOL, 5 "next" U,
+        6 "rejoin" [REJOIN])),
     req!(71 "group-create" (1 "name" T, 2 "people" [REF]) -> (2 "group" B, 3 "name" T)),
     req!(72 "group-join" (1 "group" REF, 2 "reach" BOOL) -> (
         2 "group" B, 3 "name" T, 4 "shared" BOOL, 5 "waiting" BOOL)),
     req!(73 "group-decline" (1 "group" REF) -> ()),
-    req!(74 "group-leave" (1 "group" REF) -> ()),
+    req!(74 "group-leave" (1 "group" REF, 2 "admins" [REF], 3 "anyway" BOOL) -> (
+        2 "admins" [T])),
     req!(75 "group-reach" (1 "group" REF, 2 "share" BOOL, 3 "host" T) -> (
         2 "shared" BOOL, 3 "waiting" BOOL, 4 "taken_out" BOOL)),
     req!(76 "group-add" (1 "group" REF, 2 "people" [REF], 3 "shown" T) -> ()),
@@ -599,6 +603,10 @@ pub static REQUESTS: &[Request] = &[
     req!(83 "group-post-again" (1 "group" REF) -> (2 "posted" U)),
     req!(84 "group-moved-seen" (1 "group" REF) -> ()),
     req!(85 "group-confirm-move" (1 "group" REF, 2 "moves" [B], 3 "to" [B]) -> (2 "kept" U)),
+    req!(86 "group-leaving" (1 "group" REF) -> (
+        2 "admins" [T], 3 "choose_admin" BOOL, 4 "group" B, 5 "name" T,
+        6 "relayed_for" [RELAYED_FOR])),
+    req!(87 "group-rejoin" (1 "group" REF) -> (2 "group" B, 3 "name" T)),
     // ---- Calls and the clipboard: 100 to 119 ----
     req!(100 "call" () -> (2 "call" {CALL}, 3 "ended" {CALL_ENDED})),
     req!(101 "call-start" (1 "who" REF, 2 "group" REF, 3 "formats" [B], 4 "format_names" [T]) -> ()),
