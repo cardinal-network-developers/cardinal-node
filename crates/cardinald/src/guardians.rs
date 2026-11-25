@@ -2086,8 +2086,9 @@ pub(crate) async fn deliver(d: &Arc<Daemon>, guarded: &EntryId, objects: Vec<Vec
 /// contact's device takes it whole (`mailbox::TOKEN_MESSAGE`).
 const CARRY_BATCH: usize = 32 * 1024;
 
-/// Entries written in a space, by id.
-pub(crate) type Written = Vec<(EntryId, Vec<u8>)>;
+/// Entries written in a space, sealed, by sealed id: the id a peer holds
+/// them by, and is asked for them by.
+pub(crate) type Written = Vec<([u8; 32], Vec<u8>)>;
 
 /// Writes in a relationship space, as `carried` nodes, each of `entries`
 /// that this person has not carried there yet. `recovered` is whom the
@@ -2127,7 +2128,12 @@ pub(crate) fn carry(
         let written = d.core().write(space, batch)?;
         d.push(space, written.iter().map(|(_, b)| b.clone()).collect());
         d.bump();
-        Ok(written)
+        // by the sealed id, which the store and a `want` go by, not the
+        // entry's own
+        written
+            .into_iter()
+            .map(|(_, b)| Ok((cardinal_space::SealedEntry::decode(&b)?.sealed_id(), b)))
+            .collect()
     };
     let n = ops.len();
     let mut written = Vec::new();

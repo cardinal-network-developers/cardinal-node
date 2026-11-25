@@ -1396,7 +1396,7 @@ async fn hand_over(
     hd: &Arc<Daemon>,
     guardian: &[u8; 32],
     space: &SpaceId,
-    entries: &[(EntryId, Vec<u8>)],
+    entries: &[([u8; 32], Vec<u8>)],
 ) -> bool {
     if entries.is_empty() {
         return false;
