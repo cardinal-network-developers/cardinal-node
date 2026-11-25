@@ -189,8 +189,10 @@ fn deleted_in(sp: &Space, at: &At) -> Vec<NodeId> {
 }
 
 /// What was deleted from a folder of the one folder: each file, folder and
-/// link, with when, by whom, and its size.
-pub fn deleted(d: &Daemon, path: &str) -> anyhow::Result<Json> {
+/// link, with when, by whom, and its size. A name starting with `.` is
+/// left out unless `hidden` asks for it: such names are mostly what
+/// programs make and remove again, as a lock file is (D91).
+pub fn deleted(d: &Daemon, path: &str, hidden: bool) -> anyhow::Result<Json> {
     let at = onefolder::folder(d, path)?;
     let core = d.core();
     let names = core.device_names();
@@ -201,6 +203,9 @@ pub fn deleted(d: &Daemon, path: &str) -> anyhow::Result<Json> {
     let mut out: Vec<(Option<u64>, Json)> = Vec::new();
     for id in deleted_in(sp, &at) {
         let Some(n) = st.node(&id) else { continue };
+        if !hidden && n.name.starts_with('.') {
+            continue;
+        }
         let kind = f.kinds().file_kind(n.kind);
         let mut v = json!({
             "id": hex::encode(id),

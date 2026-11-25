@@ -21,7 +21,12 @@ One person, several Linux devices, one folder that is the same everywhere:
   `cardinal peer add host:7171`.
 - A `.cardinalignore` file (gitignore syntax) lists paths that stay on
   the device where they are made, such as build output: they show in
-  your folder there and are never synced.
+  your folder there and are never synced. This node also keeps the lock
+  and scratch files programs write on the device they are made on, as if
+  a `.cardinalignore` at the top listed them: `.~lock.*#` (LibreOffice),
+  `~$*` (Microsoft Office), `.*.swp` and `.*.swo` (vim), `.#*` (emacs),
+  `.goutputstream-*` (GIO), `.DS_Store` and `Thumbs.db`. A `!` line in
+  your own `.cardinalignore`, such as `!Thumbs.db`, syncs one again.
 - Deleted files and old versions are kept 30 days so you can restore them
   (`cardinal history`, `cardinal restore`, `cardinal deleted`,
   `cardinal undelete`), in shared folders too, then freed. `cardinal

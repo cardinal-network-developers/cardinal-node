@@ -142,3 +142,40 @@ fn ignored_paths_stay_on_this_device() {
     );
     assert!(!b.p("proj").exists());
 }
+
+/// The lock files programs write beside a document stay on the device, with
+/// no `.cardinalignore` (`fs/local.rs`, `BUILT_IN_IGNORES`); a document
+/// beside one syncs.
+#[test]
+fn a_programs_lock_file_stays_here() {
+    if !fuse_available() {
+        eprintln!("skipping: /dev/fuse or fusermount3 is not available");
+        return;
+    }
+    let root = tempfile::tempdir().unwrap();
+    let mut a = Dev::new(root.path(), "alpha", free_port());
+    let mut b = Dev::new(root.path(), "beta", free_port());
+    a.start();
+    a.cli(&["init", "--yes", "--name", "alpha"]);
+    a.wait_mounted();
+    b.start();
+    pair(&a, &b);
+    std::fs::write(a.p(".~lock.x.odt#"), ",alpha,host,24.11.2026 10:00,\n").unwrap();
+    std::fs::write(a.p("x.odt"), "the document\n").unwrap();
+    a.cli(&["flush"]);
+    wait("beta has x.odt", 40, || {
+        read(&b.p("x.odt")).as_deref() == Some(b"the document\n")
+    });
+    assert!(a.p(".~lock.x.odt#").exists(), "shown where it was made");
+    assert!(!b.p(".~lock.x.odt#").exists());
+    let listed = common::reply(&a, &serde_json::json!({"cmd": "files"}));
+    let names: Vec<&str> = listed["files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|f| f["name"].as_str().unwrap())
+        .collect();
+    assert!(names.contains(&"x.odt"), "{names:?}");
+    assert!(!names.contains(&".~lock.x.odt#"), "{names:?}");
+    assert!(!pending(&a), "a local item is not a pending change");
+}

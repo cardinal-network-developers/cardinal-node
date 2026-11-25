@@ -184,3 +184,85 @@ fn a_groups_folder_is_renamed_only_by_its_admins() {
     ask(&b, serde_json::json!({"cmd": "group-leave", "group": g}));
     wait("bo's Groups goes", 30, || !b.p("Groups").exists());
 }
+
+/// A file manager's trash at the top of the one folder is refused (D91):
+/// `.Trash` and `.Trash-<uid>` cannot be made there, nor anything put in
+/// one already there, so that a file manager offers to delete for good,
+/// which `deleted` then lists. One already there stays, to be emptied by
+/// moving out what is in it, and deleted.
+#[test]
+fn a_file_managers_trash_is_refused_at_the_top() {
+    if !fuse_available() {
+        eprintln!("skipping: /dev/fuse or fusermount3 is not available");
+        return;
+    }
+    let root = tempfile::tempdir().unwrap();
+    let a = person(root.path(), "ana");
+    let refused = |r: std::io::Result<()>, what: &str| {
+        let e = r.expect_err(what);
+        assert_eq!(e.raw_os_error(), Some(libc::EPERM), "{what}: {e}");
+    };
+    refused(std::fs::create_dir(a.p(".Trash-1000")), "mkdir .Trash-1000");
+    refused(std::fs::create_dir(a.p(".Trash")), "mkdir .Trash");
+    refused(std::fs::write(a.p(".Trash-x"), "x"), "file .Trash-x");
+    std::fs::write(a.p("notes.txt"), "mine").unwrap();
+    refused(
+        std::fs::rename(a.p("notes.txt"), a.p(".Trash-1000")),
+        "rename to .Trash-1000",
+    );
+    // elsewhere, and other names, are anyone's
+    std::fs::create_dir(a.p(".Trashcan")).unwrap();
+    std::fs::create_dir_all(a.p("docs/.Trash-1000")).unwrap();
+    a.cli(&["flush"]);
+
+    // One made before, elsewhere: nothing more goes in, what is there
+    // comes out.
+    let ok = |r: serde_json::Value| assert_eq!(r["ok"], true, "{r}");
+    for p in [".Trash-1000", ".Trash-1000/files"] {
+        ok(reply(&a, &serde_json::json!({"cmd": "mkdir", "path": p})));
+    }
+    let old = root.path().join("old.txt");
+    std::fs::write(&old, "from before").unwrap();
+    ok(reply(
+        &a,
+        &serde_json::json!({"cmd": "put", "from": old, "to": ".Trash-1000/files"}),
+    ));
+    wait("the old trash in the mount", 30, || {
+        a.p(".Trash-1000/files/old.txt").exists()
+    });
+    refused(
+        std::fs::rename(a.p("notes.txt"), a.p(".Trash-1000/files/notes.txt")),
+        "move into the old trash",
+    );
+    refused(
+        std::fs::create_dir(a.p(".Trash-1000/info")),
+        "mkdir in the old trash",
+    );
+    refused(
+        std::fs::write(a.p(".Trash-1000/files/new.txt"), "x"),
+        "file in the old trash",
+    );
+    std::fs::rename(a.p(".Trash-1000/files/old.txt"), a.p("old.txt")).unwrap();
+    assert_eq!(read(&a.p("old.txt")).as_deref(), Some("from before"));
+    std::fs::remove_dir_all(a.p(".Trash-1000")).unwrap();
+
+    // Deleting for good is a delete, listed and brought back.
+    std::fs::remove_file(a.p("notes.txt")).unwrap();
+    a.cli(&["flush"]);
+    let gone = reply(&a, &serde_json::json!({"cmd": "deleted", "path": ""}));
+    let names: Vec<&str> = gone["files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|f| f["name"].as_str().unwrap())
+        .collect();
+    assert!(names.contains(&"notes.txt"), "{gone}");
+    assert!(
+        !names.contains(&".Trash-1000"),
+        "hidden unless asked: {gone}"
+    );
+    a.cli(&["undelete", "notes.txt"]);
+    wait("notes.txt back", 30, || {
+        read(&a.p("notes.txt")).as_deref() == Some("mine")
+    });
+}

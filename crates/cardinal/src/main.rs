@@ -495,8 +495,9 @@ enum Cmd {
         #[arg(long)]
         yes: bool,
         /// Also remove the files kept on this device only
-        /// (`.cardinalignore`). They are your own files and exist nowhere
-        /// else.
+        /// (`.cardinalignore`, and the lock files programs write, which
+        /// stay on the device they are made on). They are your own files
+        /// and exist nowhere else.
         #[arg(long)]
         including_local: bool,
     },
@@ -516,10 +517,15 @@ enum Cmd {
         /// The file (in your Cardinal folder).
         path: PathBuf,
     },
-    /// List what was deleted from a folder, the most recent first.
+    /// List what was deleted from a folder, the most recent first. Names
+    /// starting with `.`, such as a program's lock files, are left out
+    /// unless asked for; `undelete` brings one back by its name.
     Deleted {
         /// The folder, such as `People/Ana` (the top if left out).
         path: Option<PathBuf>,
+        /// Also list names starting with `.`.
+        #[arg(long)]
+        hidden: bool,
     },
     /// Bring back a deleted file or folder, with what was in it.
     Undelete {
@@ -4108,12 +4114,16 @@ async fn client(cmd: Cmd) -> anyhow::Result<()> {
             println!("or copy one out with: cardinal get {p} FILE --version N");
             Ok(())
         }
-        Cmd::Deleted { path } => {
+        Cmd::Deleted { path, hidden } => {
             let m = mount_path(&paths).await;
             let p = path
                 .map(|p| space_path(&p, m.as_deref()))
                 .unwrap_or_default();
-            let v = call(&paths, json!({"cmd": "deleted", "path": p})).await?;
+            let v = call(
+                &paths,
+                json!({"cmd": "deleted", "path": p, "hidden": hidden}),
+            )
+            .await?;
             let list = v["files"].as_array().cloned().unwrap_or_default();
             let top = if p.is_empty() { "your files" } else { &p };
             if list.is_empty() {

@@ -341,6 +341,17 @@ impl OneFs {
     }
 }
 
+/// What a refused trash folder is answered with (D91): a file manager
+/// that cannot make its trash offers to delete for good instead.
+const TRASH_REFUSED: i32 = EPERM;
+
+/// Whether a name at the root is one a file manager keeps its trash under:
+/// `.Trash`, or `.Trash-` and a user's number, as the freedesktop.org
+/// trash specification names them.
+fn is_trash(name: &str) -> bool {
+    name == ".Trash" || name.starts_with(".Trash-")
+}
+
 fn name_str(name: &OsStr) -> Option<&str> {
     std::str::from_utf8(name.as_bytes()).ok()
 }
@@ -547,6 +558,9 @@ impl Filesystem for OneFs {
             Ok(n) => n,
             Err(e) => return reply.error(e),
         };
+        if let Err(e) = self.not_trash(newparent, nn) {
+            return reply.error(e);
+        }
         if newparent == ROOT_INO {
             let g = lock(&self.parts);
             if g.category_named(nn).is_some() {
@@ -769,11 +783,47 @@ impl OneFs {
         if part_of(parent) == CATEGORIES {
             return Err(EPERM);
         }
+        let n = name_str(name).ok_or(EINVAL)?;
+        self.not_trash(parent, n)?;
+        if parent == ROOT_INO && !lock(&self.parts).free_at_root(n) {
+            return Err(EEXIST);
+        }
+        Ok(())
+    }
+
+    /// Refuses a new entry that would make a trash folder at the root, or
+    /// put something in one there: a file manager's trash in the one
+    /// folder would be a folder like any other, kept on every device,
+    /// and what went in it would not be in `deleted` (D91). A trash folder
+    /// already there stays as it is, so that what is in it can be moved
+    /// out and it deleted.
+    fn not_trash(&self, parent: u64, name: &str) -> Result<(), i32> {
         if parent == ROOT_INO {
-            let n = name_str(name).ok_or(EINVAL)?;
-            if !lock(&self.parts).free_at_root(n) {
-                return Err(EEXIST);
+            return match is_trash(name) {
+                true => Err(TRASH_REFUSED),
+                false => Ok(()),
+            };
+        }
+        if part_of(parent) != 0 {
+            return Ok(());
+        }
+        let g = lock(&self.parts);
+        let t = lock(&g.parts[&0].tree);
+        let mut ino = parent;
+        for _ in 0..10_000 {
+            let Some(i) = t.inodes.get(&ino) else {
+                return Ok(());
+            };
+            if i.parent == t.root {
+                return match is_trash(&i.name) {
+                    true => Err(TRASH_REFUSED),
+                    false => Ok(()),
+                };
             }
+            if ino == t.root || i.parent == 0 {
+                return Ok(());
+            }
+            ino = i.parent;
         }
         Ok(())
     }

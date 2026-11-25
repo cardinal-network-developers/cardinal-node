@@ -47,6 +47,29 @@ use crate::fetch::blob_ref;
 /// The name of the files that list paths to keep local.
 pub const IGNORE_FILE: &str = ".cardinalignore";
 
+/// Lock and scratch files that programs write beside a person's files,
+/// kept on this device as if a `.cardinalignore` at the top of each space's
+/// folder listed them, before its own lines: a person's `!` line, there or
+/// in any folder below, brings one back. This list is this implementation's
+/// choice, not the specification's, which has no defaults. Only files a
+/// program makes and removes again are here, never backups a person may
+/// want on their other devices.
+pub const BUILT_IN_IGNORES: &[&str] = &[
+    ".~lock.*#",        // LibreOffice's lock of an open document
+    "~$*",              // Microsoft Office's owner file of an open document
+    ".*.swp",           // vim's swap file
+    ".*.swo",           // vim's second swap file
+    ".#*",              // emacs's lock
+    ".goutputstream-*", // GIO's file being written, renamed when done
+    ".DS_Store",        // macOS Finder's folder settings
+    "Thumbs.db",        // Windows Explorer's thumbnails
+];
+
+fn built_in() -> &'static Gitignore {
+    static G: std::sync::OnceLock<Gitignore> = std::sync::OnceLock::new();
+    G.get_or_init(|| matcher(BUILT_IN_IGNORES.join("\n").as_bytes(), ""))
+}
+
 /// The most of a `.cardinalignore` file that is read.
 const MAX_IGNORE_FILE: u64 = 1 << 20;
 
@@ -173,7 +196,8 @@ impl Tree {
         // the path below `d`, longer at each folder up
         let mut rel = name.to_owned();
         let mut d = parent;
-        let mut out = false;
+        // what the nearest line that matches says, if one does
+        let mut out = None;
         for _ in 0..10_000 {
             if let Some(text) = text_of(self, d) {
                 {
@@ -191,15 +215,26 @@ impl Tree {
                     };
                     match gi.matched_path_or_any_parents(&rel, is_dir) {
                         Match::Ignore(_) => {
-                            out = true;
+                            out = Some(true);
                             break;
                         }
-                        Match::Whitelist(_) => break,
+                        Match::Whitelist(_) => {
+                            out = Some(false);
+                            break;
+                        }
                         Match::None => {}
                     }
                 }
             }
             if d == self.root {
+                // before the top folder's own lines, so they decide first
+                out = out.or_else(|| {
+                    Some(
+                        built_in()
+                            .matched_path_or_any_parents(&rel, is_dir)
+                            .is_ignore(),
+                    )
+                });
                 break;
             }
             let Some(i) = self.inodes.get(&d) else { break };
@@ -207,7 +242,7 @@ impl Tree {
             d = i.parent;
         }
         self.ignores = ignores;
-        out
+        out.unwrap_or(false)
     }
 
     /// The real path of a local item (`None` when it is detached).
@@ -639,6 +674,37 @@ mod tests {
     fn ignore_file(t: &mut Tree, parent: u64, text: &str) {
         let f = add(t, parent, IGNORE_FILE, Kind::File);
         t.inodes.get_mut(&f).unwrap().content = Some(Content::Inline(text.as_bytes().to_vec()));
+    }
+
+    #[test]
+    fn programs_lock_files_stay_here_unless_a_line_brings_them_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = FsStore::open(dir.path().join("blobs"), cardinal_blob::Fsync::Never).unwrap();
+        let mut t = tree(dir.path());
+        let docs = add(&mut t, ROOT_INO, "docs", Kind::Dir);
+        for name in [
+            ".~lock.x.odt#",
+            "~$report.docx",
+            ".notes.txt.swp",
+            ".notes.txt.swo",
+            ".#notes.org",
+            ".goutputstream-ABC123",
+            ".DS_Store",
+            "Thumbs.db",
+        ] {
+            assert!(t.ignored(&store, ROOT_INO, name, false), "{name}");
+            assert!(t.ignored(&store, docs, name, false), "{name} below");
+        }
+        for name in ["x.odt", "notes.txt", "notes.txt~", ".bashrc", "lock.odt#"] {
+            assert!(!t.ignored(&store, docs, name, false), "{name}");
+        }
+        // a person's line at the top, or nearer, brings one back
+        ignore_file(&mut t, ROOT_INO, "!Thumbs.db\n");
+        ignore_file(&mut t, docs, "!.DS_Store\n");
+        assert!(!t.ignored(&store, docs, "Thumbs.db", false));
+        assert!(!t.ignored(&store, docs, ".DS_Store", false));
+        assert!(t.ignored(&store, ROOT_INO, ".DS_Store", false));
+        assert!(t.ignored(&store, docs, ".~lock.x.odt#", false));
     }
 
     #[test]

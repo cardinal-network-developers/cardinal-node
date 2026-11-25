@@ -1011,9 +1011,11 @@ async fn handle(d: &Arc<Daemon>, req: &Value) -> anyhow::Result<Value> {
                 .ok_or_else(|| anyhow::anyhow!("missing --version"))?;
             crate::file_history::restore(d, &path, version).await
         }
-        "deleted" => {
-            crate::file_history::deleted(d, req.get("path").and_then(Value::as_str).unwrap_or(""))
-        }
+        "deleted" => crate::file_history::deleted(
+            d,
+            req.get("path").and_then(Value::as_str).unwrap_or(""),
+            req.get("hidden").and_then(Value::as_bool).unwrap_or(false),
+        ),
         "undelete" => {
             let id = req.get("id").and_then(Value::as_str);
             crate::file_history::undelete(d, arg(req, "path")?, id).await

@@ -778,7 +778,7 @@ pub static REQUESTS: &[Request] = &[
         2 "offers" [APP_OFFER], 3 "more" BOOL, 4 "next" U)),
     req!(225 "app-join" (1 "space" REF) -> (2 "space" B, 3 "name" T)),
     req!(226 "wake" () -> (2 "checking" U)),
-    paged!(after 227 "deleted" (1 "path" T, 2 "after" U, 3 "limit" U) -> (
+    paged!(after 227 "deleted" (1 "path" T, 2 "after" U, 3 "limit" U, 4 "hidden" BOOL) -> (
         2 "files" [DELETED_FILE], 3 "path" T, 4 "more" BOOL, 5 "next" U)),
     req!(228 "undelete" (1 "path" T, 2 "id" REF) -> (2 "id" B, 3 "path" T)),
 ];

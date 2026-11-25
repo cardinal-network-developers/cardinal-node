@@ -187,6 +187,54 @@ fn own_files_deleted_and_brought_back() {
     assert_eq!(deleted(&ana, "Notes").len(), 1);
 }
 
+/// Names starting with `.`, mostly what programs make and remove again,
+/// are left out of what was deleted unless asked for (D91); one is brought
+/// back by its name all the same.
+#[test]
+fn hidden_names_are_listed_only_when_asked() {
+    let root = tempfile::tempdir().unwrap();
+    let r = root.path();
+    let ana = person(r, "ana");
+    ask(&ana, json!({"cmd": "mkdir", "path": "Notes"}));
+    put(&ana, r, "Notes/a.odt", "doc");
+    put(&ana, r, "Notes/.~lock.a.odt#", "lock");
+    ask(&ana, json!({"cmd": "mkdir", "path": "Notes/.cache"}));
+    for p in ["Notes/a.odt", "Notes/.~lock.a.odt#", "Notes/.cache"] {
+        ask(&ana, json!({"cmd": "remove", "path": p}));
+    }
+    let shown: Vec<Value> = deleted(&ana, "Notes");
+    assert_eq!(shown.len(), 1, "{shown:?}");
+    assert_eq!(shown[0]["name"], "a.odt");
+    let v = ask(
+        &ana,
+        json!({"cmd": "deleted", "path": "Notes", "hidden": true}),
+    );
+    let mut all: Vec<String> = v["files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|f| f["name"].as_str().unwrap().to_owned())
+        .collect();
+    all.sort();
+    assert_eq!(all, [".cache", ".~lock.a.odt#", "a.odt"]);
+    let listed = ana.cli(&["deleted", "Notes"]);
+    assert!(
+        listed.contains("a.odt") && !listed.contains(".~lock"),
+        "{listed}"
+    );
+    let listed = ana.cli(&["deleted", "Notes", "--hidden"]);
+    assert!(
+        listed.contains(".~lock.a.odt#") && listed.contains(".cache/"),
+        "{listed}"
+    );
+    // given by its name, a hidden one comes back
+    ana.cli(&["undelete", "Notes/.~lock.a.odt#"]);
+    let mut there = names(&ana, "Notes");
+    there.sort();
+    assert_eq!(there, [".~lock.a.odt#"]);
+    assert_eq!(saved(&ana, r, "Notes/.~lock.a.odt#", None), "lock");
+}
+
 #[test]
 fn shared_folders_have_their_history() {
     let root = tempfile::tempdir().unwrap();
