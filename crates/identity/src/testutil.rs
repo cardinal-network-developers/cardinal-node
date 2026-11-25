@@ -21,3 +21,13 @@ pub fn core_path(rel: &str) -> Option<PathBuf> {
         }
     }
 }
+
+/// Says why a test cannot run here, before it returns: a skip, said; or,
+/// in the release tier (`CARDINAL_TEST_STRICT=1`, set by
+/// `scripts/test-tier release`), a failure, since a release run must run
+/// every test it counts.
+pub fn skipping(why: &str) {
+    let strict = std::env::var_os("CARDINAL_TEST_STRICT").is_some_and(|v| v == "1");
+    assert!(!strict, "cannot run in the release tier: {why}");
+    eprintln!("skipping: {why}");
+}

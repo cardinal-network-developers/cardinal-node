@@ -281,21 +281,82 @@ pub fn read(p: &Path) -> Option<String> {
     std::fs::read_to_string(p).ok()
 }
 
+/// Whether this run is the release tier (`scripts/test-tier release` sets
+/// `CARDINAL_TEST_STRICT=1`). There a test that cannot run here fails
+/// rather than passing as a skip: a release run must run every test it
+/// counts.
+pub fn strict() -> bool {
+    std::env::var_os("CARDINAL_TEST_STRICT").is_some_and(|v| v == "1")
+}
+
+/// Says why a test cannot run here, before it returns: a skip, said, or in
+/// the release tier ([`strict`]) a failure.
+pub fn skipping(why: &str) {
+    assert!(!strict(), "cannot run in the release tier: {why}");
+    eprintln!("skipping: {why}");
+}
+
+/// Whether FUSE can mount here. In the release tier ([`strict`]) it must:
+/// a test that would skip without it fails instead.
 pub fn fuse_available() -> bool {
-    Path::new("/dev/fuse").exists()
+    let here = Path::new("/dev/fuse").exists()
         && Command::new("fusermount3")
             .arg("-V")
             .output()
-            .is_ok_and(|o| o.status.success())
+            .is_ok_and(|o| o.status.success());
+    assert!(
+        here || !strict(),
+        "cannot run in the release tier: /dev/fuse or fusermount3 is not available"
+    );
+    here
 }
 
+/// The block of ports this test binary has to itself, `first-last` in
+/// `CARDINAL_TEST_PORTS`: `scripts/test-tier` gives each binary running
+/// side by side its own, below the range the system hands out for port 0.
+/// Malformed, it fails rather than falling back.
+fn port_block() -> Option<(u16, u16)> {
+    let v = std::env::var("CARDINAL_TEST_PORTS").ok()?;
+    let block = v.split_once('-').and_then(|(a, b)| {
+        let (a, b) = (a.parse::<u16>().ok()?, b.parse::<u16>().ok()?);
+        (a > 1024 && b > a + 200).then_some((a, b))
+    });
+    Some(block.unwrap_or_else(|| panic!("CARDINAL_TEST_PORTS={v} is not first-last")))
+}
+
+/// A port free on both carriers, given out once in this binary. A daemon
+/// takes it on both carriers, and tests run side by side.
+///
+/// With a block of its own ([`port_block`]) the binary takes its ports
+/// there, 101 apart so that a daemon moving off a taken port (it tries the
+/// next 99) does not land on one given to another test; the block's last
+/// hundred are never given, so it does not land in the next block either.
+/// Without one, the system chooses.
 pub fn free_port() -> u16 {
-    // A daemon takes the port on both carriers, and tests run side by side.
     static GIVEN: std::sync::Mutex<Vec<u16>> = std::sync::Mutex::new(Vec::new());
+    let free = |port: u16| {
+        std::net::TcpListener::bind(("127.0.0.1", port)).is_ok()
+            && std::net::UdpSocket::bind(("127.0.0.1", port)).is_ok()
+    };
+    let mut given = GIVEN.lock().unwrap();
+    if let Some((first, last)) = port_block() {
+        let size = u32::from(last - first + 1 - 100);
+        // 101 is prime, so the steps go through the whole block once, as
+        // long as the block's size is not a multiple of 101.
+        assert!(size % 101 != 0, "a block of {size} ports");
+        while (given.len() as u32) < size {
+            let k = given.len() as u32;
+            let port = first + ((k * 101) % size) as u16;
+            given.push(port);
+            if free(port) {
+                return port;
+            }
+        }
+        panic!("no free port left in {first}-{last}");
+    }
     loop {
         let tcp = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let port = tcp.local_addr().unwrap().port();
-        let mut given = GIVEN.lock().unwrap();
         if std::net::UdpSocket::bind(("127.0.0.1", port)).is_ok() && !given.contains(&port) {
             given.push(port);
             return port;

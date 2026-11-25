@@ -100,8 +100,10 @@ fn a_device_whose_port_is_taken_moves_and_is_found_again() {
 #[test]
 fn a_port_asked_for_is_held_to() {
     let root = tempfile::tempdir().unwrap();
-    let d = Dev::new(root.path(), "alpha", free_port());
-    let _taken = UdpSocket::bind(("127.0.0.1", d.port)).unwrap();
+    // Taken from the start: a port checked free and let go could be taken
+    // by another test before this one binds it.
+    let taken = UdpSocket::bind(("127.0.0.1", 0)).unwrap();
+    let d = Dev::new(root.path(), "alpha", taken.local_addr().unwrap().port());
     let o = d
         .cmd()
         .args(["daemon", "--no-discovery", "--no-mount", "--listen"])

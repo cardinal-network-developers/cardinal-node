@@ -95,6 +95,12 @@ cargo build --release
 cargo test --workspace
 ```
 
+`scripts/test-tier` runs the tests by tier, test binaries side by side:
+`quick` on every edit, `branch <area>` before merging (for example
+`branch groups`), and `release` once per release candidate, where a test
+that cannot run fails instead of skipping. `tests/tiers.txt` gives each
+test binary its tier and areas; `scripts/test-tier --help` says more.
+
 Releasing is described in [docs/releasing.md](docs/releasing.md).
 
 ## License

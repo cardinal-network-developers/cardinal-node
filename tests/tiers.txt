@@ -1,0 +1,139 @@
+# Test tiers: which test binary runs when. Read by scripts/test-tier.
+#
+# Every test binary of the workspace has one line here, and the script
+# fails when one is missing or a line names none: a new test file cannot
+# drop out of every tier.
+#
+#   <binary>  <tier>  <areas>  <seconds>
+#
+# binary   <crate dir>/lib for a library's unit tests, <crate dir>/bin/<name>
+#          for a program's, <crate dir>/<name> for tests/<name>.rs.
+# tier     quick    run on every edit, and in every tier
+#          branch   run before a branch is merged, for its areas
+#          release  run only for a release candidate (every binary runs
+#                   there anyway)
+# areas    comma-separated: basics, files, groups, recovery, contacts,
+#          reach, calls, settings, apps, or "all" for the logic every area
+#          stands on. The same words choose the drives' parts.
+# seconds  about how long the binary takes alone on Saint Joseph, from the
+#          last measured run; binaries side by side start longest first.
+#
+# A line "slow <binary> <test>" names a test that waits out real protocol
+# timers. Outside the release tier it is left out, unless `--slow` is
+# given (for a change to its own subject).
+
+# --- quick: pure logic, spec vectors and properties ---
+encoding/lib                    quick   all             1
+encoding/properties             quick   all             1
+encoding/vectors                quick   all             1
+crypto/lib                      quick   all             2
+crypto/properties               quick   all             1
+identity/lib                    quick   all,recovery    2
+identity/differential           quick   all,recovery    2
+space/lib                       quick   all,groups      2
+space/alloc                     quick   all             1
+space/application               quick   all,apps        1
+space/convergence               quick   all             1
+space/cost                      quick   all             1
+space/hosting                   quick   all,reach       1
+space/index                     quick   all,files       1
+space/messages                  quick   all,basics      1
+space/reach                     quick   all,reach       1
+space/read_markers              quick   all,basics      1
+space/space                     quick   all             1
+space/succession                quick   all,groups      1
+space/validity                  quick   all             6
+space/vectors                   quick   all             1
+blob/lib                        quick   all,files       1
+blob/blob                       quick   all,files       1
+blob/hostile_tree               quick   all,files       1
+blob/throughput                 quick   files           0
+blob/vectors                    quick   all,files       1
+sync/lib                        quick   all             1
+sync/converge                   quick   all             2
+sync/vectors                    quick   all             1
+link/lib                        quick   all,reach       2
+link/attached                   quick   reach           1
+link/endpoint                   quick   reach           6
+link/relay                      quick   reach           1
+link/sockets                    quick   reach           1
+link/udp_path                   quick   reach           1
+contact/lib                     quick   contacts        1
+contact/pairing                 quick   contacts        2
+update/lib                      quick   settings        1
+update/bin/cardinal-deploy      quick   settings        0
+update/bin/cardinal-release-sign quick  settings        0
+cardinald/lib                   quick   all             8
+cardinald/bin/cardinald         quick   all             0
+cardinald/store                 quick   files           1
+cardinal/bin/cardinal           quick   all             0
+cardinal-calendar/bin/cardinal-calendar quick apps      0
+cardinal-calendar/document      quick   apps            1
+
+# --- quick: one device or a pair, under about 6 s ---
+# versions takes about 1 s without CARDINAL_OLD_BIN (outside the release
+# tier its tests then skip), 91 s with it; nearby 9 s and 92 s.
+cardinal/versions               quick   apps            91
+cardinal/app_interface          quick   apps            4
+cardinal/applications           quick   apps            2
+cardinal/inspect                quick   apps            2
+cardinal/run_flags              quick   settings        2
+cardinal/ports                  quick   reach           3
+cardinal/forward                quick   reach,files     3
+cardinal/carriers               quick   reach           3
+cardinal/crash                  quick   recovery,files  4
+cardinal/eviction               quick   files           3
+cardinal/long_delay             quick   files           3
+cardinal/group_folder           quick   groups,files    4
+cardinal/device_names           quick   basics          3
+cardinal/names                  quick   basics          3
+cardinal/file_history           quick   files           4
+cardinal/shared_mount           quick   files           4
+cardinal/recovery               quick   recovery        4
+cardinal/clipboard              quick   basics          2
+cardinal/storage                quick   files           3
+cardinal/introductions          quick   contacts        4
+cardinal/group_call_attacks     quick   calls,groups    4
+cardinal/ignore                 quick   files           4
+cardinal/removal                quick   groups          4
+cardinal/cleanup                quick   files           5
+
+# --- branch, by area ---
+cardinal/two_devices            branch  basics,files    16
+cardinal/three_devices          branch  basics,files    8
+cardinal/shared_folder          branch  basics,files    6
+cardinal/contacts               branch  basics,contacts 24
+cardinal/stress                 branch  files           5
+cardinal/copies                 branch  files           35
+cardinal/fetch_order            branch  files           11
+cardinal/restore                branch  files,recovery  8
+cardinal/groups                 branch  groups          15
+cardinal/guardians              branch  groups,recovery 39
+cardinal/group_calls            branch  groups,calls    52
+cardinal/invitations            branch  contacts        100
+cardinal/mailbox                branch  contacts        16
+cardinal/hostile                branch  contacts,reach  132
+cardinal/calls                  branch  calls           15
+cardinal/call_attacks           branch  calls           31
+cardinal/video_calls            branch  calls           72
+cardinal/redial                 branch  calls,reach     123
+cardinal/nat                    branch  reach           204
+cardinal/hosting                branch  reach           182
+cardinal/known_paths            branch  reach           30
+cardinal/roaming                branch  reach           30
+cardinal/reconnect              branch  reach           20
+cardinal/reachable              branch  reach,settings  8
+cardinal/router                 branch  reach,settings  9
+cardinal/nearby                 branch  reach           92
+cardinal/network_change         branch  reach           11
+cardinal/contact_status         branch  reach           11
+cardinal/bluetooth              branch  reach,settings  10
+
+# --- slow tests: release only, unless --slow ---
+slow cardinal/nat           a_family_group_hears_each_other_through_its_neighbours
+slow cardinal/hosting       a_hosted_phone_is_told_and_otherwise_quiet
+slow cardinal/hostile       a_host_renews_each_reach_node_once
+slow cardinal/redial        a_phone_on_battery_spares_its_radio_and_dials_when_it_wakes
+slow cardinal/invitations   one_code_makes_one_exchange
+slow cardinal/video_calls   answering_again_turns_video_on_and_off
+slow cardinal/group_calls   a_device_back_after_its_sessions_ended_is_linked_again

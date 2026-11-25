@@ -1221,7 +1221,7 @@ mod tests {
         // The vendored copy must be byte-identical to core/model/rules.md
         // when the specification is checked out next to this repository.
         let Some(path) = crate::testutil::core_path("model/rules.md") else {
-            eprintln!("core/model/rules.md not found; skipping");
+            crate::testutil::skipping("core/model/rules.md not found");
             return;
         };
         let spec = std::fs::read(&path).unwrap();
