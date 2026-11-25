@@ -1014,7 +1014,8 @@ fn two_devices_of_one_person_offered_a_group() {
         .as_str()
         .unwrap()
         .to_owned();
-    add(&ana, &h, &cy, 2);
+    // Bo, offered it too, is counted among its members
+    add(&ana, &h, &cy, 3);
     wait("cy2 holds two open", 60, || {
         offer(&cy2, &h).is_some()
             && reply(&cy2, &json!({"cmd": "group-members", "group": h}))["ok"] == true

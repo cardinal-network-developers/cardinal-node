@@ -110,7 +110,7 @@ cardinal/restore                branch  files,recovery  8
 cardinal/groups                 branch  groups          15
 cardinal/guardians              branch  groups,recovery 59
 cardinal/group_calls            branch  groups,calls    52
-cardinal/call_groups            branch  groups,calls    60
+cardinal/call_groups            branch  groups,calls    90
 cardinal/invitations            branch  contacts        100
 cardinal/mailbox                branch  contacts        16
 cardinal/hostile                branch  contacts,reach  132
@@ -138,3 +138,4 @@ slow cardinal/redial        a_phone_on_battery_spares_its_radio_and_dials_when_i
 slow cardinal/invitations   one_code_makes_one_exchange
 slow cardinal/video_calls   answering_again_turns_video_on_and_off
 slow cardinal/group_calls   a_device_back_after_its_sessions_ended_is_linked_again
+slow cardinal/call_groups   a_kept_ring_lapses
