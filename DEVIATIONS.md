@@ -2545,6 +2545,13 @@ Readings chosen where the specification is silent, and what is not built:
 - **`group-role`** matched the specification but for one leniency, now
   gone: it took `writer` for `member`. It takes `admin`, `member` and
   `reader` alone, as `group-members` says them.
+- **Found, not fixed: an admin adding someone the owner does not know.**
+  The person added holds the group but cannot judge it, since nothing
+  fetches the owner's log for a group they are only offered, and their
+  device takes another member's log only for a group it can already
+  judge: the offer never shows. So an admin who is not the owner can add
+  to a call only people who are the owner's contacts too. Found by this
+  work's tests; it predates D92.
 - **Not built**: anything in `later.md` "Calls with several people" (a move
   nobody hears, a move over the live call, ringing a member who is not a
   contact, who may send what, the note for the one in the middle); leaving

@@ -56,7 +56,7 @@ fn says_which_version_it_speaks() {
     }
     let root = tempfile::tempdir().unwrap();
     let a = person(root.path(), "ana");
-    assert_eq!(ask(&a, json!({"cmd": "hello"}))["api"], 2);
+    assert_eq!(ask(&a, json!({"cmd": "hello"}))["api"], 3);
 }
 
 /// The messages themselves (`apps.md#the-local-interface`): one record
@@ -77,7 +77,7 @@ fn the_interface_is_records_with_numbers() {
     // hello is 1: status 0, then api (2) and version (3)
     let r = answer(&Record::new().with(0, 1u64).encode());
     assert_eq!(r.uint(0).unwrap(), 0);
-    assert_eq!(r.uint(2).unwrap(), 2);
+    assert_eq!(r.uint(2).unwrap(), 3);
     assert!(r.text(3).is_ok(), "{r}");
     // not one record: malformed (2), and why in key 1
     let r = answer(&[0x1d, 0x00]);
