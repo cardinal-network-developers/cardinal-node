@@ -845,12 +845,14 @@ fn someone_only_offered_is_rung_in_the_successor() {
     let g = group_with(&ana, &[&bo, &dee], json!({"for_call": true}));
     add(&ana, &g, &cy, 4);
     std::thread::sleep(Duration::from_secs(1));
+    // the entries of the account, as `status` counts them
     let account = |d: &Dev| {
-        let s = ask(d, json!({"cmd": "status"}));
-        s["account"].as_str().map(str::to_owned)
+        let st = d.status();
+        let all = st["spaces"].as_array().cloned().unwrap_or_default();
+        let acc = all.into_iter().find(|x| x["kind"] == "account");
+        acc.expect("an account")["entries"].as_u64().unwrap()
     };
-    let cy_account = account(&cy);
-    let before = cy_account.as_deref().map(|a| entries(&cy, a));
+    let before = account(&cy);
     let moved = ask(
         &ana,
         json!({"cmd": "group-remove", "group": g, "who": "Dee"}),
@@ -862,10 +864,9 @@ fn someone_only_offered_is_rung_in_the_successor() {
     });
     assert!(offer(&cy, &g).is_none(), "the ended group still offered");
     assert!(joined(&cy, &g2).is_none(), "following was accepting");
-    assert!(entries(&cy, &g2) == 0 || members(&cy, &g2).len() == 3);
-    if let (Some(a), Some(n)) = (cy_account.as_deref(), before) {
-        assert_eq!(entries(&cy, a), n, "following wrote in the account");
-    }
+    std::thread::sleep(Duration::from_secs(2));
+    assert_eq!(account(&cy), before, "following wrote in the account");
+    assert!(joined(&cy, &g2).is_none(), "following was accepting");
     // A ring naming the group that ended, from Ana's own device: nothing
     let space: [u8; 32] = unhex(&g);
     let space2: [u8; 32] = unhex(&g2);
@@ -970,8 +971,9 @@ fn two_devices_of_one_person_offered_a_group() {
     let ana = person(root.path(), "ana");
     let bo = person(root.path(), "bo");
     let cy = person(root.path(), "cy");
+    // pairing mounts the one folder on the new device
     let mut cy2 = Dev::new(root.path(), "cy2", free_port());
-    cy2.start_with(&["--no-mount"]);
+    cy2.start();
     ask(
         &cy2,
         json!({"cmd": "conditions", "plugged_in": false, "metered": false}),
@@ -1079,8 +1081,10 @@ fn a_kept_ring_is_the_last_and_counts_towards_the_limit() {
     let space: [u8; 32] = unhex(&g);
     let rt = tokio::runtime::Runtime::new().unwrap();
     let to_cy = rt.block_on(Speaker::open(&ana, ana_id, &cy, cy_id));
+    // one after another: each travels on a stream of its own
     for i in 0..5u8 {
         rt.block_on(to_cy.ring(space, [10 + i; 16], ana_id, Some(Wire::from(1u64))));
+        std::thread::sleep(Duration::from_millis(300));
     }
     rings_not(&cy, "before the offer");
     drop(to_cy);
@@ -1133,6 +1137,8 @@ fn a_kept_ring_is_dropped_by_its_callers_end() {
     rt.block_on(to_cy.ring(space, [20; 16], ana_id, Some(Wire::from(1u64))));
     std::thread::sleep(Duration::from_millis(500));
     rt.block_on(to_cy.end(space, [20; 16]));
+    // delivered before this end of the session goes
+    std::thread::sleep(Duration::from_secs(1));
     drop(to_cy);
     ana.start_with(&["--no-mount"]);
     add_seen(&cy, &g, 3);
@@ -1149,6 +1155,7 @@ fn a_kept_ring_lapses() {
     let rt = tokio::runtime::Runtime::new().unwrap();
     let to_cy = rt.block_on(Speaker::open(&ana, ana_id, &cy, cy_id));
     rt.block_on(to_cy.ring(space, [21; 16], ana_id, Some(Wire::from(1u64))));
+    std::thread::sleep(Duration::from_secs(1));
     drop(to_cy);
     std::thread::sleep(Duration::from_secs(46));
     ana.start_with(&["--no-mount"]);
