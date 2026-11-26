@@ -767,18 +767,61 @@ typed!(
         4 versions: Vec<Version>,
     }
 );
-rec!(CONTACT "contact":
-    1 "category" T, 2 "connected" BOOL, 3 "identity" B, 4 "introductions" BOOL, 5 "met" {MET},
-    6 "name" T, 7 "nearby" BOOL, 8 "own" BOOL, 9 "picture" T, 10 "recovered" T,
-    11 "refused" BOOL, 12 "relayed" BOOL, 13 "suggested" T, 14 "trusted" BOOL,
-    15 "recovered_seen" U, 16 "recovered_new_guardians" BOOL, 17 "recovered_delay" U,
-    18 "unreadable" T);
-rec!(CONTACT_REACH "contact reach":
-    1 "named" [T], 2 "said_no" BOOL, 3 "shared" BOOL, 4 "waiting" BOOL);
-rec!(CONVERSATION "conversation":
-    1 "connected" BOOL, 2 "id" B, 3 "introductions" BOOL, 4 "last" {LAST}, 5 "name" T,
-    6 "nearby" BOOL, 7 "own" BOOL, 8 "picture" T, 9 "reach" {CONTACT_REACH}, 10 "relayed" BOOL,
-    11 "suggested" T, 12 "trusted" BOOL, 13 "unread" U);
+typed!(
+    /// A contact of this person's.
+    CONTACT "contact" Contact {
+        1 category: String,
+        2 connected: bool,
+        /// The start of their identity.
+        3 identity: [u8; 8],
+        4 introductions: bool,
+        5 met: Option<Met>,
+        /// What this person calls them.
+        6 name: String,
+        7 nearby: bool,
+        /// Whether that name is this person's own.
+        8 own: bool,
+        9 picture: Option<String>,
+        /// What is said of them, recovered by guardians.
+        10 recovered: Option<String>,
+        11 refused: bool,
+        12 relayed: bool,
+        13 suggested: Option<String>,
+        14 trusted: bool,
+        15 recovered_seen: Option<u64>,
+        16 recovered_new_guardians: Option<bool>,
+        17 recovered_delay: Option<u64>,
+        18 unreadable: Option<String>,
+    }
+);
+typed!(
+    /// What this person's reach node says in a relationship.
+    CONTACT_REACH "contact reach" ContactReach {
+        1 named: Vec<String>,
+        2 said_no: bool,
+        3 shared: bool,
+        4 waiting: bool,
+    }
+);
+typed!(
+    /// A contact's conversation, as the list of them shows it.
+    CONVERSATION "conversation" Conversation {
+        1 connected: bool,
+        /// The start of their identity.
+        2 id: [u8; 8],
+        3 introductions: bool,
+        4 last: Option<Last>,
+        5 name: String,
+        6 nearby: bool,
+        7 own: bool,
+        8 picture: Option<String>,
+        9 reach: ContactReach,
+        10 relayed: bool,
+        11 suggested: Option<String>,
+        12 trusted: bool,
+        13 unread: u64,
+    }
+);
 rec!(COPIES "copies":
     1 "blobs" U, 2 "count" U, 3 "eligible" U, 4 "holders" [HOLDER], 5 "interval_ms" U,
     6 "now" U, 7 "older_than_ms" U);
@@ -920,7 +963,16 @@ typed!(
         9 uses: u64,
     }
 );
-rec!(LAST "last message": 1 "from" T, 2 "mine" BOOL, 3 "text" T, 4 "time" U);
+typed!(
+    /// The last message of a conversation.
+    LAST "last message" Last {
+        /// In a group: who said it.
+        1 from: Option<String>,
+        2 mine: bool,
+        3 text: String,
+        4 time: Option<u64>,
+    }
+);
 rec!(KEPT_CHANGE "kept change":
     1 "at" U, 2 "by" T, 3 "can_undo" BOOL, 4 "device" T, 5 "group" B, 6 "handed_to" T,
     7 "name" T, 8 "roles" [ROLE_CHANGE], 9 "taken_out" [T], 10 "to" B, 11 "undo" T,
@@ -969,7 +1021,17 @@ typed!(
     }
 );
 rec!(NO_LONGER_NEEDED "no longer needed": 1 "at_ms" U, 2 "id" B, 3 "name" T, 4 "text" T);
-rec!(MET "met": 1 "by" T, 2 "group" T, 3 "how" T, 4 "via" T);
+typed!(
+    /// How two people met.
+    MET "met" Met {
+        /// Who introduced them.
+        1 by: Option<String>,
+        /// The group the introduction came through.
+        2 group: Option<String>,
+        3 how: Cow<'static, str>,
+        4 via: Option<String>,
+    }
+);
 rec!(KNOWN_PATH "known path":
     1 "addr" T, 2 "checking" BOOL, 3 "confirmed_s_ago" U, 4 "misses" U, 5 "next_check_s" U,
     6 "probes" U, 7 "wait_s" U);
@@ -1644,6 +1706,28 @@ asks!(GROUP_REJOIN: 87 "group-rejoin" GroupRejoinArgs -> GroupCreateReply, write
 
 // ---- Listings ----
 
+typed!(fields ContactsArgs {
+    1 all: Option<bool>,
+    2 after: Option<u64>,
+    3 limit: Option<u64>,
+});
+typed!(fields ContactsReply {
+    2 contacts: Vec<Contact>,
+    3 more: bool,
+    4 next: Option<u64>,
+});
+asks!(CONTACTS: 30 "contacts" ContactsArgs -> ContactsReply, reads, after contacts);
+typed!(fields ConversationsArgs {
+    1 after: Option<u64>,
+    2 limit: Option<u64>,
+});
+typed!(fields ConversationsReply {
+    2 conversations: Vec<Conversation>,
+    3 more: bool,
+    4 next: Option<u64>,
+});
+asks!(CONVERSATIONS: 33 "conversations" ConversationsArgs -> ConversationsReply, reads,
+    after conversations by id);
 typed!(fields ConflictsArgs {
     1 after: Option<u64>,
     2 limit: Option<u64>,
@@ -1914,8 +1998,7 @@ pub static REQUESTS: &[Request] = &[
     PAIR_STATUS,
     PAIR_TYPE,
     // ---- People, conversations and invitations: 30 to 69 ----
-    paged!(after 30 "contacts" (1 "all" BOOL, 2 "after" U, 3 "limit" U) -> (
-        2 "contacts" [CONTACT], 3 "more" BOOL, 4 "next" U)),
+    CONTACTS,
     req!(31 "contact" (
         1 "who" REF, 2 "setting" T, 3 "name" T, 4 "picture" T, 5 "category" T, 6 "host" T
     ) -> (
@@ -1931,8 +2014,7 @@ pub static REQUESTS: &[Request] = &[
         16 "nearby_tries" [STEP], 17 "own" BOOL, 18 "refused" BOOL, 19 "router" {ROUTER},
         20 "sessions" [STEP], 21 "suggested" T, 22 "their_reach" [THEIR_REACH],
         23 "trusted" BOOL, 24 "your_reach" [THEIR_REACH], 25 "more" BOOL, 26 "next" U)),
-    paged!(after 33 "conversations" (1 "after" U, 2 "limit" U) -> (
-        2 "conversations" [CONVERSATION], 3 "more" BOOL, 4 "next" U)),
+    CONVERSATIONS,
     MESSAGES,
     SAY,
     SAVE_ATTACHMENT,

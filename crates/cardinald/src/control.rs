@@ -370,6 +370,7 @@ pub mod typed {
         WakeArgs,
     };
     use crate::api::{ConflictsArgs, ConflictsReply, DevicesArgs, DevicesReply};
+    use crate::api::{ContactsArgs, ContactsReply, ConversationsArgs, ConversationsReply};
     use crate::api::{
         CopyArgs, Done, FlushArgs, FlushReply, MkdirArgs, MountArgs, MoveArgs, PathReply, PinArgs,
         PinReply, PutArgs, RemoveArgs, RestoreArgs, RestoreReply, RetentionArgs, RetentionReply,
@@ -1114,6 +1115,18 @@ pub mod typed {
 
     // ---- Listings ----
 
+    impl Answer for ContactsArgs {
+        async fn answer(d: &Arc<Daemon>, a: &Self) -> anyhow::Result<ContactsReply> {
+            Ok(crate::contacts::list(d, a.all == Some(true)))
+        }
+    }
+
+    impl Answer for ConversationsArgs {
+        async fn answer(d: &Arc<Daemon>, _: &Self) -> anyhow::Result<ConversationsReply> {
+            Ok(crate::contacts::conversations(d))
+        }
+    }
+
     impl Answer for ConflictsArgs {
         async fn answer(d: &Arc<Daemon>, _: &Self) -> anyhow::Result<ConflictsReply> {
             Ok(ConflictsReply {
@@ -1606,9 +1619,10 @@ async fn handle(d: &Arc<Daemon>, req: &Value) -> anyhow::Result<Value> {
             };
             crate::contacts::status(d, arg(req, "who")?, look, at).await
         }
+        #[cfg(any(test, debug_assertions, feature = "by-name"))]
         "contacts" => {
             let all = req.get("all").and_then(|v| v.as_bool()) == Some(true);
-            Ok(crate::contacts::list(d, all))
+            Ok(crate::contacts::list_by_name(d, all))
         }
         "contact" => match (
             req.get("name").and_then(|v| v.as_str()),
@@ -1817,7 +1831,8 @@ async fn handle(d: &Arc<Daemon>, req: &Value) -> anyhow::Result<Value> {
         }
         #[cfg(any(test, debug_assertions, feature = "by-name"))]
         "call-end" => crate::calls::end_by_name(d).await,
-        "conversations" => Ok(crate::contacts::conversations(d)),
+        #[cfg(any(test, debug_assertions, feature = "by-name"))]
+        "conversations" => Ok(crate::contacts::conversations_by_name(d)),
         #[cfg(any(test, debug_assertions, feature = "by-name"))]
         "mark-read" => crate::contacts::mark_read_by_name(d, arg(req, "who")?),
         "read-markers" => {

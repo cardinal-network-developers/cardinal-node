@@ -3415,39 +3415,40 @@ async fn client(cmd: Cmd) -> anyhow::Result<()> {
             Ok(())
         }
         Cmd::Contacts { all, .. } => {
-            let v = call(&paths, json!({"cmd": "contacts", "all": all})).await?;
-            for c in v["contacts"].as_array().into_iter().flatten() {
-                let mut line = c["name"].as_str().unwrap_or("").to_owned();
-                if c["own"] == false {
+            let args = api::ContactsArgs {
+                all: Some(all),
+                ..api::ContactsArgs::new()
+            };
+            for c in ask(&paths, args).await?.contacts {
+                let mut line = c.name.clone();
+                if !c.own {
                     line.push_str(" (their name)");
                 }
-                if c["picture"].is_string() {
+                if c.picture.is_some() {
                     line.push_str("  picture");
                 }
-                line.push_str(if c["trusted"] == true {
+                line.push_str(if c.trusted {
                     "  trusted"
                 } else {
                     "  through hosts only"
                 });
-                if c["connected"] == true {
+                if c.connected {
                     line.push_str("  connected");
                 }
-                if c["introductions"] == false {
+                if !c.introductions {
                     line.push_str("  no introductions");
                 }
-                if c["refused"] == true {
+                if c.refused {
                     line.push_str("  refused");
                 }
-                println!("{line}  [{}]", c["identity"].as_str().unwrap_or(""));
-                if let Some(u) = c["unreadable"].as_str() {
+                println!("{line}  [{}]", hex::encode(c.identity));
+                if let Some(u) = &c.unreadable {
                     println!("  {}", printable(u));
                 }
-                if let Some(r) = c["recovered"].as_str() {
-                    let name = c["name"].as_str().unwrap_or("");
+                if let Some(r) = &c.recovered {
+                    let name = &c.name;
                     // the day in this person's own time, from the fields
-                    let local = c["recovered_seen"]
-                        .as_u64()
-                        .zip(c["recovered_delay"].as_u64());
+                    let local = c.recovered_seen.zip(c.recovered_delay);
                     match local {
                         Some((seen, delay)) => println!(
                             "  {name} was recovered by guardians they had chosen by {}, after \

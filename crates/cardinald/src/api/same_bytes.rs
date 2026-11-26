@@ -2307,6 +2307,31 @@ async fn messages_are_written_the_same() {
         t.same_as(req(o), req(n)).await;
         t.same_as(req(o), req(n)).await;
     }
+    // the listings of contacts and conversations, on one twin both ways
+    let lists = || {
+        let mut v = Vec::new();
+        for cmd in ["contacts", "conversations"] {
+            for (after, limit) in [
+                (None, None),
+                (None, Some(1)),
+                (Some(1), None),
+                (Some(5), Some(2)),
+            ] {
+                let mut r = json!({"cmd": cmd, "after": after, "limit": limit});
+                if cmd == "contacts" {
+                    v.push(r.clone());
+                    r["all"] = json!(true);
+                }
+                v.push(r);
+            }
+        }
+        v
+    };
+    for req in lists() {
+        t.same_here(req).await;
+    }
+    let r = typed_of::<ConversationsArgs>(&t.same_here(json!({"cmd": "conversations"})).await);
+    assert!(r.conversations.iter().any(|c| c.last.is_some()));
     // refused, by her id as bytes: named NUL first, as before
     for d in [&t.old, &t.new] {
         crate::contacts::set(d, "Bea", "refuse").unwrap();
@@ -2321,6 +2346,12 @@ async fn messages_are_written_the_same() {
         let msg = t.same_as(req(bea_id(0)), req(bea_id(1))).await;
         let why = failed_of::<SayArgs>(&msg).why;
         assert!(why.starts_with("you have refused \u{0}"), "{why:?}");
+    }
+    // refused: listed with `all` alone
+    let r = typed_of::<ContactsArgs>(&t.same_here(json!({"cmd": "contacts", "all": true})).await);
+    assert!(r.contacts.iter().any(|c| c.refused));
+    for req in lists() {
+        t.same_here(req).await;
     }
     for d in [&t.old, &t.new] {
         let _ = d.stopping.send(true);
