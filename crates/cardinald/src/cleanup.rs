@@ -966,10 +966,9 @@ pub fn usage(store: &dyn ObjectStore, spaces: &[SpaceBlobs]) -> io::Result<Vec<U
     Ok(out)
 }
 
-/// `space-usage`: what each space held here costs on this device, the
-/// largest first: live, history only, and log bytes, whether this device
-/// keeps the space in full, and its retention. Blocking.
-pub fn usage_of(d: &Daemon) -> anyhow::Result<Value> {
+/// What each space held here takes, the largest first: what its current
+/// files hold, what only older versions do, and its log.
+pub fn usage_of(d: &Daemon) -> anyhow::Result<crate::api::SpaceUsageReply> {
     let (spaces, logs, names) = {
         let core = d.core();
         let spaces = space_blobs(&core);
@@ -997,7 +996,7 @@ pub fn usage_of(d: &Daemon) -> anyhow::Result<Value> {
     used.sort_by_key(|u| std::cmp::Reverse(u.live + u.history + u.log));
     let cfg = d.config();
     let full = !cfg.on_demand();
-    let list: Vec<Value> = used
+    let spaces = used
         .iter()
         .map(|u| {
             let (retention, days) = match (cfg.on_demand(), cfg.keep_for(&u.space)) {
@@ -1006,19 +1005,24 @@ pub fn usage_of(d: &Daemon) -> anyhow::Result<Value> {
                 (false, Keep::Days(0)) => ("full", None),
                 (false, Keep::Days(n)) => ("history-days", Some(n)),
             };
-            json!({
-                "space": hex::encode(u.space),
-                "name": names.get(&u.space).cloned().unwrap_or_default(),
-                "live_bytes": u.live,
-                "history_bytes": u.history,
-                "log_bytes": u.log,
-                "full": full,
-                "retention": retention,
-                "history_days": days,
-            })
+            crate::api::SpaceUsage {
+                full,
+                history_bytes: u.history,
+                history_days: days,
+                live_bytes: u.live,
+                log_bytes: u.log,
+                name: names.get(&u.space).cloned().unwrap_or_default(),
+                retention: retention.into(),
+                space: u.space,
+            }
         })
         .collect();
-    Ok(json!({ "spaces": list }))
+    Ok(crate::api::SpaceUsageReply {
+        spaces,
+        // the page says
+        more: false,
+        next: None,
+    })
 }
 
 /// Starts the hourly pass (`CARDINAL_TEST_FREE_INTERVAL_MS` for tests),
@@ -1376,4 +1380,59 @@ mod tests {
             .sum();
         assert!(kept <= 512 << 10 && kept > 0, "{kept}");
     }
+}
+
+/// `usage_of` as main had it, by name.
+#[cfg(any(test, debug_assertions, feature = "by-name"))]
+#[allow(dead_code, clippy::all)]
+pub fn usage_of_by_name(d: &Daemon) -> anyhow::Result<Value> {
+    let (spaces, logs, names) = {
+        let core = d.core();
+        let spaces = space_blobs(&core);
+        let mut logs = HashMap::new();
+        let mut names = HashMap::new();
+        for (id, h) in &core.spaces {
+            logs.insert(*id, crate::inspect::sealed_total(h).1 as u64);
+            let label = crate::inspect::label_of(&core, id, h.space.as_ref());
+            names.insert(*id, label.unwrap_or_default());
+        }
+        (spaces, logs, names)
+    };
+    let mut used = usage(&*d.store, &spaces)?;
+    // a space that cannot be opened here holds its log all the same
+    for (id, log) in &logs {
+        match used.iter_mut().find(|u| u.space == *id) {
+            Some(u) => u.log = *log,
+            None => used.push(Usage {
+                space: *id,
+                log: *log,
+                ..Usage::default()
+            }),
+        }
+    }
+    used.sort_by_key(|u| std::cmp::Reverse(u.live + u.history + u.log));
+    let cfg = d.config();
+    let full = !cfg.on_demand();
+    let list: Vec<Value> = used
+        .iter()
+        .map(|u| {
+            let (retention, days) = match (cfg.on_demand(), cfg.keep_for(&u.space)) {
+                (true, _) => ("on-demand", None),
+                (false, Keep::Forever) => ("history", None),
+                (false, Keep::Days(0)) => ("full", None),
+                (false, Keep::Days(n)) => ("history-days", Some(n)),
+            };
+            json!({
+                "space": hex::encode(u.space),
+                "name": names.get(&u.space).cloned().unwrap_or_default(),
+                "live_bytes": u.live,
+                "history_bytes": u.history,
+                "log_bytes": u.log,
+                "full": full,
+                "retention": retention,
+                "history_days": days,
+            })
+        })
+        .collect();
+    Ok(json!({ "spaces": list }))
 }

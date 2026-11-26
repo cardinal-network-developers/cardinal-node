@@ -858,11 +858,34 @@ rec!(HOSTING "hosting":
     11 "serving" [HOSTABLE], 12 "offered_at" U, 13 "after" B, 14 "accepted_at" U,
     15 "ended_at" U, 16 "ended_by" B, 17 "declined" BOOL);
 rec!(INSPECTION "inspection": 1 "on" BOOL, 2 "until" U);
-rec!(INTRODUCTION "introduction":
-    1 "from" T, 2 "group" T, 3 "id" B, 4 "kind" T, 5 "name" T, 6 "note" T);
-rec!(INVITATION "invitation":
-    1 "cancelled" BOOL, 2 "expired" BOOL, 3 "hosts_only" BOOL, 4 "id" B, 5 "made" U,
-    6 "name" T, 7 "outstanding" BOOL, 8 "used" U, 9 "uses" U);
+typed!(
+    /// An introduction waiting for this person.
+    INTRODUCTION "introduction" Introduction {
+        /// Who introduces, by what this person calls them.
+        1 from: String,
+        /// The group it comes through.
+        2 group: Option<String>,
+        3 id: [u8; 16],
+        /// `meet` or `introduced`.
+        4 kind: Cow<'static, str>,
+        5 name: String,
+        6 note: Option<String>,
+    }
+);
+typed!(
+    /// An invitation this person made.
+    INVITATION "invitation" Invitation {
+        1 cancelled: bool,
+        2 expired: bool,
+        3 hosts_only: bool,
+        4 id: [u8; 16],
+        5 made: Option<u64>,
+        6 name: Option<String>,
+        7 outstanding: bool,
+        8 used: u64,
+        9 uses: u64,
+    }
+);
 rec!(LAST "last message": 1 "from" T, 2 "mine" BOOL, 3 "text" T, 4 "time" U);
 rec!(KEPT_CHANGE "kept change":
     1 "at" U, 2 "by" T, 3 "can_undo" BOOL, 4 "device" T, 5 "group" B, 6 "handed_to" T,
@@ -938,7 +961,14 @@ rec!(OLD "old versions":
 rec!(ONLY_HERE "only here": 1 "bytes" U, 2 "files" U);
 rec!(PAIR_AGAIN "pair again": 1 "key" B, 2 "name" T);
 rec!(PAIRING "pairing": 1 "admin" T, 2 "code" T, 3 "error" T, 4 "state" T, 5 "power" T);
-rec!(PEER "peer": 1 "addr" T, 2 "device" T);
+typed!(
+    /// An address this device looks for the person's devices at.
+    PEER "peer" Peer {
+        1 addr: String,
+        /// The device found there, by name.
+        2 device: Option<String>,
+    }
+);
 typed!(
     /// What a folder of the one folder is.
     PLACE "place" Place {
@@ -987,9 +1017,20 @@ rec!(SESSION_DEVICE "contact's device":
     15 "they_see_you_at" T, 16 "through" T, 17 "unreadable" {UNREADABLE},
     18 "kept_alive_s" U, 19 "path" {KNOWN_PATH}, 20 "neighbour" BOOL);
 rec!(SET_ASIDE "set aside": 1 "entry" B, 2 "space" B, 3 "time_ms" U);
-rec!(SPACE_USAGE "space usage":
-    1 "full" BOOL, 2 "history_bytes" U, 3 "history_days" U, 4 "live_bytes" U, 5 "log_bytes" U,
-    6 "name" T, 7 "retention" T, 8 "space" B);
+typed!(
+    /// What a space held here takes.
+    SPACE_USAGE "space usage" SpaceUsage {
+        1 full: bool,
+        2 history_bytes: u64,
+        3 history_days: Option<u64>,
+        4 live_bytes: u64,
+        5 log_bytes: u64,
+        6 name: String,
+        /// `on-demand`, `history`, `full` or `history-days`.
+        7 retention: Cow<'static, str>,
+        8 space: [u8; 32],
+    }
+);
 rec!(SPACE "space": 1 "entries" U, 2 "id" B, 3 "kind" T, 4 "set_aside" U, 5 "valid" U);
 rec!(STEP "step": 1 "at" U, 2 "ok" BOOL, 3 "text" T);
 rec!(SUCCESSION "succession": 1 "id" T, 2 "space" T);
@@ -1002,11 +1043,32 @@ rec!(STUCK_ITEM "stuck item":
 rec!(UNREADABLE "unreadable":
     1 "reason" T, 2 "retry_in_s" U, 3 "says" T, 4 "since" U, 5 "theirs" BOOL, 6 "version" T);
 rec!(UNSHOWN_NODE "unshown node": 1 "name" T, 2 "node" B);
-rec!(VERSION "version":
-    1 "current" BOOL, 2 "device" T, 3 "here" BOOL, 4 "size" U, 5 "time" U, 6 "version" U,
-    7 "by" T);
-rec!(DELETED_FILE "deleted file":
-    1 "by" T, 2 "folder" BOOL, 3 "id" B, 4 "mine" BOOL, 5 "name" T, 6 "size" U, 7 "time" U);
+typed!(
+    /// A version of a file of the one folder.
+    VERSION "version" Version {
+        1 current: bool,
+        2 device: String,
+        /// Whether its content is on this device.
+        3 here: bool,
+        4 size: Option<u64>,
+        5 time: Option<u64>,
+        6 version: u64,
+        /// Who wrote it, where someone else did.
+        7 by: Option<String>,
+    }
+);
+typed!(
+    /// A file or folder deleted from the one folder, which can be had back.
+    DELETED_FILE "deleted file" DeletedFile {
+        1 by: Option<String>,
+        2 folder: bool,
+        3 id: [u8; 16],
+        4 mine: Option<bool>,
+        5 name: String,
+        6 size: Option<u64>,
+        7 time: Option<u64>,
+    }
+);
 
 // ---- Records of inspection ----
 
@@ -1535,6 +1597,75 @@ typed!(fields GroupRejoinArgs {
 });
 asks!(GROUP_REJOIN: 87 "group-rejoin" GroupRejoinArgs -> GroupCreateReply, writes);
 
+// ---- Listings ----
+
+typed!(fields InvitationsArgs {
+    1 after: Option<u64>,
+    2 limit: Option<u64>,
+});
+typed!(fields InvitationsReply {
+    2 invitations: Vec<Invitation>,
+    3 more: bool,
+    4 next: Option<u64>,
+});
+asks!(INVITATIONS: 44 "invitations" InvitationsArgs -> InvitationsReply, reads, after invitations by id);
+typed!(fields IntroductionsArgs {
+    1 after: Option<u64>,
+    2 limit: Option<u64>,
+});
+typed!(fields IntroductionsReply {
+    2 introductions: Vec<Introduction>,
+    3 more: bool,
+    4 next: Option<u64>,
+});
+asks!(INTRODUCTIONS: 46 "introductions" IntroductionsArgs -> IntroductionsReply, reads,
+    after introductions by id);
+typed!(fields HistoryArgs {
+    1 path: Option<String>,
+    2 after: Option<u64>,
+    3 limit: Option<u64>,
+});
+typed!(fields HistoryReply {
+    2 path: String,
+    3 versions: Vec<Version>,
+    4 more: bool,
+    5 next: Option<u64>,
+});
+asks!(HISTORY: 133 "history" HistoryArgs -> HistoryReply, reads, after versions);
+typed!(fields SpaceUsageArgs {
+    1 after: Option<u64>,
+    2 limit: Option<u64>,
+});
+typed!(fields SpaceUsageReply {
+    2 spaces: Vec<SpaceUsage>,
+    3 more: bool,
+    4 next: Option<u64>,
+});
+asks!(SPACE_USAGE_NOW: 140 "space-usage" SpaceUsageArgs -> SpaceUsageReply, reads, after spaces);
+typed!(fields PeerListArgs {
+    1 after: Option<u64>,
+    2 limit: Option<u64>,
+});
+typed!(fields PeerListReply {
+    2 peers: Vec<Peer>,
+    3 more: bool,
+    4 next: Option<u64>,
+});
+asks!(PEER_LIST: 187 "peer-list" PeerListArgs -> PeerListReply, reads, after peers);
+typed!(fields DeletedArgs {
+    1 path: Option<String>,
+    2 after: Option<u64>,
+    3 limit: Option<u64>,
+    4 hidden: Option<bool>,
+});
+typed!(fields DeletedReply {
+    2 files: Vec<DeletedFile>,
+    3 path: String,
+    4 more: bool,
+    5 next: Option<u64>,
+});
+asks!(DELETED: 227 "deleted" DeletedArgs -> DeletedReply, reads, after files by id);
+
 // ---- Networks, hosts and peers ----
 
 typed!(fields RouterArgs {
@@ -1748,11 +1879,9 @@ pub static REQUESTS: &[Request] = &[
     req!(41 "read-markers" (1 "on" BOOL) -> (2 "on" BOOL)),
     INVITE,
     ACCEPT,
-    paged!(after 44 "invitations" (1 "after" U, 2 "limit" U) -> (
-        2 "invitations" [INVITATION], 3 "more" BOOL, 4 "next" U)),
+    INVITATIONS,
     req!(45 "cancel-invitation" (1 "id" REF) -> ()),
-    paged!(after 46 "introductions" (1 "after" U, 2 "limit" U) -> (
-        2 "introductions" [INTRODUCTION], 3 "more" BOOL, 4 "next" U)),
+    INTRODUCTIONS,
     req!(47 "introduce" (1 "who" REF, 2 "to" REF, 3 "note" T) -> ()),
     req!(48 "introduction-accept" (1 "id" REF) -> (2 "name" T, 3 "recovery_of" B)),
     req!(49 "introduction-decline" (1 "id" REF) -> ()),
@@ -1802,8 +1931,7 @@ pub static REQUESTS: &[Request] = &[
     FLUSH,
     paged!(after 132 "conflicts" (1 "after" U, 2 "limit" U) -> (
         2 "conflicts" [CONFLICT], 3 "more" BOOL, 4 "next" U)),
-    paged!(after 133 "history" (1 "path" T, 2 "after" U, 3 "limit" U) -> (
-        2 "path" T, 3 "versions" [VERSION], 4 "more" BOOL, 5 "next" U)),
+    HISTORY,
     RESTORE,
     PIN,
     UNPIN,
@@ -1812,8 +1940,7 @@ pub static REQUESTS: &[Request] = &[
     req!(139 "free-space" (1 "dry_run" BOOL, 2 "unnamed" BOOL, 3 "delete" BOOL) -> (
         2 "bytes" U, 3 "deleted" BOOL, 4 "left" U, 5 "objects" U, 6 "only_here" {ONLY_HERE},
         7 "unchecked" BOOL, 8 "unsure" [T])),
-    paged!(after 140 "space-usage" (1 "after" U, 2 "limit" U) -> (
-        2 "spaces" [SPACE_USAGE], 3 "more" BOOL, 4 "next" U)),
+    SPACE_USAGE_NOW,
     req!(141 "history-empty" (1 "space" REF) -> (2 "bytes" U, 3 "left" U, 4 "objects" U)),
     // ---- Guardians and recovery: 150 to 179 ----
     req!(150 "guardians" () -> (
@@ -1865,8 +1992,7 @@ pub static REQUESTS: &[Request] = &[
     HOST_OFF,
     PEER_ADD,
     PEER_REMOVE,
-    paged!(after 187 "peer-list" (1 "after" U, 2 "limit" U) -> (
-        2 "peers" [PEER], 3 "more" BOOL, 4 "next" U)),
+    PEER_LIST,
     req!(188 "host-offer" (1 "who" REF, 2 "devices" [T], 3 "envelopes" U, 4 "relay_mb" U) -> (
         2 "devices" [T], 3 "sees" T, 4 "on" [HOSTABLE])),
     req!(189 "host-accept" (1 "who" REF) -> (2 "sees" T)),
@@ -1941,8 +2067,7 @@ pub static REQUESTS: &[Request] = &[
         2 "offers" [APP_OFFER], 3 "more" BOOL, 4 "next" U)),
     req!(225 "app-join" (1 "space" REF) -> (2 "space" B, 3 "name" T)),
     WAKE,
-    paged!(after 227 "deleted" (1 "path" T, 2 "after" U, 3 "limit" U, 4 "hidden" BOOL) -> (
-        2 "files" [DELETED_FILE], 3 "path" T, 4 "more" BOOL, 5 "next" U)),
+    DELETED,
     req!(228 "undelete" (1 "path" T, 2 "id" REF) -> (2 "id" B, 3 "path" T)),
 ];
 

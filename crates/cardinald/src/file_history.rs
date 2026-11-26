@@ -95,7 +95,7 @@ fn person(core: &crate::core::Core, sp: &Space, at: &At, who: &[u8; 32]) -> Stri
 }
 
 /// The versions of a file of the one folder, oldest first.
-pub fn history(d: &Daemon, path: &str) -> anyhow::Result<Json> {
+pub fn history(d: &Daemon, path: &str) -> anyhow::Result<crate::api::HistoryReply> {
     let at = in_space(d, path)?;
     let core = d.core();
     let names = core.device_names();
@@ -106,32 +106,35 @@ pub fn history(d: &Daemon, path: &str) -> anyhow::Result<Json> {
         .iter()
         .map(|v| v.entry)
         .collect();
-    let list: Vec<Json> = versions(sp, &at.node)
+    let versions = versions(sp, &at.node)
         .iter()
         .enumerate()
-        .map(|(i, w)| {
-            let mut v = json!({
-                "version": i + 1,
-                "time": w.time,
-                "device": names.get(&w.device).cloned()
-                    .unwrap_or_else(|| account::short_key(&w.device)),
-                "size": w.content.as_ref().map(|c| c.size()),
-                "current": current.contains(&w.entry),
-                // whether its content is on this device (`cleanup.rs`)
-                "here": match &w.content {
-                    Some(Content::Blob(b)) => {
-                        cardinal_blob::ObjectStore::has(&*d.store, &b.id).unwrap_or(false)
-                    }
-                    _ => true,
-                },
-            });
-            if Some(w.author) != me {
-                v["by"] = json!(person(&core, sp, &at, &w.author));
-            }
-            v
+        .map(|(i, w)| crate::api::Version {
+            by: (Some(w.author) != me).then(|| person(&core, sp, &at, &w.author)),
+            current: current.contains(&w.entry),
+            device: names
+                .get(&w.device)
+                .cloned()
+                .unwrap_or_else(|| account::short_key(&w.device)),
+            // whether its content is on this device (`cleanup.rs`)
+            here: match &w.content {
+                Some(Content::Blob(b)) => {
+                    cardinal_blob::ObjectStore::has(&*d.store, &b.id).unwrap_or(false)
+                }
+                _ => true,
+            },
+            size: w.content.as_ref().map(|c| c.size()),
+            time: w.time,
+            version: i as u64 + 1,
         })
         .collect();
-    Ok(json!({"path": path, "versions": list}))
+    Ok(crate::api::HistoryReply {
+        path: path.to_owned(),
+        versions,
+        // the page says
+        more: false,
+        next: None,
+    })
 }
 
 /// Saves what is pending in the mounted folder, so that what is written
@@ -195,11 +198,11 @@ fn deleted_in(sp: &Space, at: &At) -> Vec<NodeId> {
         .collect()
 }
 
-/// What was deleted from a folder of the one folder: each file, folder and
-/// link, with when, by whom, and its size. A name starting with `.` is
+/// The files and folders deleted from the folder at `path` that can be
+/// had back, the most recently deleted first. A name beginning with a dot is
 /// left out unless `hidden` asks for it: such names are mostly what
 /// programs make and remove again, as a lock file is (D91).
-pub fn deleted(d: &Daemon, path: &str, hidden: bool) -> anyhow::Result<Json> {
+pub fn deleted(d: &Daemon, path: &str, hidden: bool) -> anyhow::Result<crate::api::DeletedReply> {
     let at = onefolder::folder(d, path)?;
     let core = d.core();
     let names = core.device_names();
@@ -207,29 +210,25 @@ pub fn deleted(d: &Daemon, path: &str, hidden: bool) -> anyhow::Result<Json> {
     let sp = onefolder::open(&core, &at.space)?;
     let f = Files::new(sp);
     let st = sp.state();
-    let mut out: Vec<(Option<u64>, Json)> = Vec::new();
+    let mut out: Vec<(Option<u64>, crate::api::DeletedFile)> = Vec::new();
     for id in deleted_in(sp, &at) {
         let Some(n) = st.node(&id) else { continue };
         if !hidden && n.name.starts_with('.') {
             continue;
         }
         let kind = f.kinds().file_kind(n.kind);
-        let mut v = json!({
-            "id": hex::encode(id),
-            "name": n.name,
-            "folder": kind == FileKind::Folder,
-        });
+        let mut v = crate::api::DeletedFile::new(kind == FileKind::Folder, id, n.name.clone());
         if kind == FileKind::File {
-            v["size"] = json!(f.stat(&id).and_then(|s| s.size));
+            v.size = f.stat(&id).and_then(|s| s.size);
         }
         // when, and by whom: the entry whose delete took it
         let by = n.deleted_in().and_then(|e| sp.entry(&e));
         let time = by.and_then(|e| e.time());
         if let Some(e) = by {
-            v["time"] = json!(time);
+            v.time = time;
             let mine = Some(e.author()) == me;
-            v["mine"] = json!(mine);
-            v["by"] = json!(if mine {
+            v.mine = Some(mine);
+            v.by = Some(if mine {
                 names
                     .get(&e.signer())
                     .cloned()
@@ -243,11 +242,16 @@ pub fn deleted(d: &Daemon, path: &str, hidden: bool) -> anyhow::Result<Json> {
     // the most recently deleted first; those with no time last
     out.sort_by(|(a, x), (b, y)| {
         b.cmp(a)
-            .then_with(|| x["name"].as_str().cmp(&y["name"].as_str()))
-            .then_with(|| x["id"].as_str().cmp(&y["id"].as_str()))
+            .then_with(|| x.name.cmp(&y.name))
+            .then_with(|| x.id.cmp(&y.id))
     });
-    let files: Vec<Json> = out.into_iter().map(|(_, v)| v).collect();
-    Ok(json!({"path": path, "files": files}))
+    Ok(crate::api::DeletedReply {
+        files: out.into_iter().map(|(_, v)| v).collect(),
+        path: path.to_owned(),
+        // the page says
+        more: false,
+        next: None,
+    })
 }
 
 /// Brings back a deleted file, folder or link: a `restore` of its node,
@@ -409,4 +413,100 @@ pub async fn restore_by_name(d: &Arc<Daemon>, path: &str, version: u64) -> anyho
     }
     d.write_and_push(&at.space, vec![files::set_content(at.node, &content)])?;
     Ok(json!({"path": path, "version": version}))
+}
+
+/// `history` as main had it, by name.
+#[cfg(any(test, debug_assertions, feature = "by-name"))]
+#[allow(dead_code, clippy::all)]
+pub fn history_by_name(d: &Daemon, path: &str) -> anyhow::Result<Json> {
+    let at = in_space(d, path)?;
+    let core = d.core();
+    let names = core.device_names();
+    let me = core.identity.as_ref().map(|i| i.id());
+    let sp = onefolder::open(&core, &at.space)?;
+    let current: HashSet<EntryId> = Files::new(sp)
+        .content(&at.node)
+        .iter()
+        .map(|v| v.entry)
+        .collect();
+    let list: Vec<Json> = versions(sp, &at.node)
+        .iter()
+        .enumerate()
+        .map(|(i, w)| {
+            let mut v = json!({
+                "version": i + 1,
+                "time": w.time,
+                "device": names.get(&w.device).cloned()
+                    .unwrap_or_else(|| account::short_key(&w.device)),
+                "size": w.content.as_ref().map(|c| c.size()),
+                "current": current.contains(&w.entry),
+                // whether its content is on this device (`cleanup.rs`)
+                "here": match &w.content {
+                    Some(Content::Blob(b)) => {
+                        cardinal_blob::ObjectStore::has(&*d.store, &b.id).unwrap_or(false)
+                    }
+                    _ => true,
+                },
+            });
+            if Some(w.author) != me {
+                v["by"] = json!(person(&core, sp, &at, &w.author));
+            }
+            v
+        })
+        .collect();
+    Ok(json!({"path": path, "versions": list}))
+}
+
+/// `deleted` as main had it, by name.
+#[cfg(any(test, debug_assertions, feature = "by-name"))]
+#[allow(dead_code, clippy::all)]
+pub fn deleted_by_name(d: &Daemon, path: &str, hidden: bool) -> anyhow::Result<Json> {
+    let at = onefolder::folder(d, path)?;
+    let core = d.core();
+    let names = core.device_names();
+    let me = core.identity.as_ref().map(|i| i.id());
+    let sp = onefolder::open(&core, &at.space)?;
+    let f = Files::new(sp);
+    let st = sp.state();
+    let mut out: Vec<(Option<u64>, Json)> = Vec::new();
+    for id in deleted_in(sp, &at) {
+        let Some(n) = st.node(&id) else { continue };
+        if !hidden && n.name.starts_with('.') {
+            continue;
+        }
+        let kind = f.kinds().file_kind(n.kind);
+        let mut v = json!({
+            "id": hex::encode(id),
+            "name": n.name,
+            "folder": kind == FileKind::Folder,
+        });
+        if kind == FileKind::File {
+            v["size"] = json!(f.stat(&id).and_then(|s| s.size));
+        }
+        // when, and by whom: the entry whose delete took it
+        let by = n.deleted_in().and_then(|e| sp.entry(&e));
+        let time = by.and_then(|e| e.time());
+        if let Some(e) = by {
+            v["time"] = json!(time);
+            let mine = Some(e.author()) == me;
+            v["mine"] = json!(mine);
+            v["by"] = json!(if mine {
+                names
+                    .get(&e.signer())
+                    .cloned()
+                    .unwrap_or_else(|| account::short_key(&e.signer()))
+            } else {
+                person(&core, sp, &at, &e.author())
+            });
+        }
+        out.push((time, v));
+    }
+    // the most recently deleted first; those with no time last
+    out.sort_by(|(a, x), (b, y)| {
+        b.cmp(a)
+            .then_with(|| x["name"].as_str().cmp(&y["name"].as_str()))
+            .then_with(|| x["id"].as_str().cmp(&y["id"].as_str()))
+    });
+    let files: Vec<Json> = out.into_iter().map(|(_, v)| v).collect();
+    Ok(json!({"path": path, "files": files}))
 }

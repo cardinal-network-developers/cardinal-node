@@ -223,23 +223,31 @@ fn group_name(d: &Daemon, g: Option<SpaceId>) -> Option<String> {
 }
 
 /// The introductions waiting for this person, as a window shows them.
-pub fn list(d: &Daemon) -> Json {
-    let all: Vec<Json> = waiting(d)
+pub fn list(d: &Daemon) -> crate::api::IntroductionsReply {
+    let introductions = waiting(d)
         .into_iter()
-        .map(|w| {
-            json!({
-                "id": hex::encode(w.intro.node),
-                "from": w.from.petname,
-                "name": w.intro.name,
-                "note": w.intro.note,
-                "group": group_name(d, w.intro.group),
-                // `meet`: say whether to meet them; `introduced`: they said
-                // yes already, and this connects.
-                "kind": if w.intro.invitation.is_some() { "introduced" } else { "meet" },
-            })
+        .map(|w| crate::api::Introduction {
+            from: w.from.petname,
+            group: group_name(d, w.intro.group),
+            id: w.intro.node,
+            // `meet`: say whether to meet them; `introduced`: they said
+            // yes already, and this connects.
+            kind: if w.intro.invitation.is_some() {
+                "introduced"
+            } else {
+                "meet"
+            }
+            .into(),
+            name: w.intro.name,
+            note: w.intro.note,
         })
         .collect();
-    json!({"introductions": all})
+    crate::api::IntroductionsReply {
+        introductions,
+        // the page says
+        more: false,
+        next: None,
+    }
 }
 
 fn find(d: &Daemon, id: &str) -> anyhow::Result<Waiting> {
@@ -596,4 +604,26 @@ mod tests {
         );
         assert_eq!(invitation_from(None, &ben, &ana), None);
     }
+}
+
+/// `list` as main had it, by name.
+#[cfg(any(test, debug_assertions, feature = "by-name"))]
+#[allow(dead_code, clippy::all)]
+pub fn list_by_name(d: &Daemon) -> Json {
+    let all: Vec<Json> = waiting(d)
+        .into_iter()
+        .map(|w| {
+            json!({
+                "id": hex::encode(w.intro.node),
+                "from": w.from.petname,
+                "name": w.intro.name,
+                "note": w.intro.note,
+                "group": group_name(d, w.intro.group),
+                // `meet`: say whether to meet them; `introduced`: they said
+                // yes already, and this connects.
+                "kind": if w.intro.invitation.is_some() { "introduced" } else { "meet" },
+            })
+        })
+        .collect();
+    json!({"introductions": all})
 }

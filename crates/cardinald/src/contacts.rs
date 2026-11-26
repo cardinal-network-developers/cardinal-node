@@ -217,25 +217,28 @@ pub fn answered_here(d: &Daemon) -> Vec<[u8; 16]> {
         .collect()
 }
 
-/// The invitations this person made, as a window shows them.
-pub fn invitations(d: &Daemon) -> Json {
-    let all: Vec<Json> = made(d)
+/// The invitations this person made, on any device, as a window shows them.
+pub fn invitations(d: &Daemon) -> crate::api::InvitationsReply {
+    let invitations = made(d)
         .iter()
-        .map(|m| {
-            json!({
-                "id": hex::encode(m.record.node),
-                "name": m.invitation.name,
-                "made": m.at,
-                "used": m.record.used,
-                "uses": m.invitation.uses,
-                "hosts_only": !m.record.regard.trusted,
-                "outstanding": m.outstanding(),
-                "cancelled": m.record.cancelled,
-                "expired": m.expired(),
-            })
+        .map(|m| crate::api::Invitation {
+            cancelled: m.record.cancelled,
+            expired: m.expired(),
+            hosts_only: !m.record.regard.trusted,
+            id: m.record.node,
+            made: m.at,
+            name: m.invitation.name.clone(),
+            outstanding: m.outstanding(),
+            used: m.record.used as u64,
+            uses: m.invitation.uses,
         })
         .collect();
-    json!({"invitations": all})
+    crate::api::InvitationsReply {
+        invitations,
+        // the page says
+        more: false,
+        next: None,
+    }
 }
 
 /// Cancels an invitation on every device of this person.
@@ -2651,4 +2654,27 @@ pub(crate) fn mark_read_in_by_name(
         }));
     }
     Ok(json!({"marked": moved, "kept": false}))
+}
+
+/// `invitations` as main had it, by name.
+#[cfg(any(test, debug_assertions, feature = "by-name"))]
+#[allow(dead_code, clippy::all)]
+pub fn invitations_by_name(d: &Daemon) -> Json {
+    let all: Vec<Json> = made(d)
+        .iter()
+        .map(|m| {
+            json!({
+                "id": hex::encode(m.record.node),
+                "name": m.invitation.name,
+                "made": m.at,
+                "used": m.record.used,
+                "uses": m.invitation.uses,
+                "hosts_only": !m.record.regard.trusted,
+                "outstanding": m.outstanding(),
+                "cancelled": m.record.cancelled,
+                "expired": m.expired(),
+            })
+        })
+        .collect();
+    json!({"invitations": all})
 }

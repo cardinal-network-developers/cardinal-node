@@ -2329,3 +2329,117 @@ async fn messages_are_written_the_same() {
         let _ = d.stopping.send(true);
     }
 }
+
+/// Listings of one device, typed against main's handlers on the same data:
+/// invitations, introductions, peers, space usage, a file's versions and
+/// what was deleted, with their pages.
+#[tokio::test]
+async fn listings_are_the_bytes_they_were() {
+    let dir = tempfile::tempdir().unwrap();
+    let (paths, config) = crate::testing::set_up(dir.path());
+    let d = Daemon::start(paths, config).await.unwrap();
+    let pages = |cmd: &str, rest: Json| {
+        let mut out = Vec::new();
+        for (after, limit) in [
+            (None, None),
+            (None, Some(1)),
+            (Some(1), Some(1)),
+            (Some(2), None),
+            (Some(9), Some(0)),
+        ] {
+            let mut r = rest.clone();
+            r["cmd"] = json!(cmd);
+            if let Some(a) = after {
+                r["after"] = json!(a);
+            }
+            if let Some(l) = limit {
+                r["limit"] = json!(l);
+            }
+            out.push(r);
+        }
+        out
+    };
+    for cmd in ["invitations", "introductions", "peer-list", "space-usage"] {
+        for req in pages(cmd, json!({})) {
+            same(&d, req).await;
+        }
+    }
+    for (name, hosts_only) in [(Some("Ann"), false), (None, true), (Some(""), false)] {
+        crate::contacts::invite(
+            &d,
+            None,
+            name,
+            cardinal_space::account::Regard {
+                trusted: !hosts_only,
+                introductions: true,
+            },
+        )
+        .unwrap();
+    }
+    let all = typed_of::<InvitationsArgs>(&same(&d, json!({"cmd": "invitations"})).await);
+    crate::contacts::cancel_invitation(&d, &hex::encode(all.invitations[0].id)).unwrap();
+    {
+        let mut c = d.config();
+        c.peers = vec!["192.0.2.1:7171".into(), "host.example.org:7171".into()];
+    }
+    d.book
+        .lock()
+        .unwrap()
+        .manual
+        .insert("192.0.2.1:7171".into(), hex::encode(d.keys.key()));
+    let local = dir.path().join("a.txt");
+    std::fs::write(&local, b"one").unwrap();
+    let local = local.to_str().unwrap();
+    crate::onefolder::mkdir(&d, "Docs").unwrap();
+    for name in ["a.txt", "b.txt", ".lock", "a.txt", "a.txt"] {
+        crate::onefolder::write(&d, local, &format!("Docs/{name}"))
+            .await
+            .unwrap();
+    }
+    crate::onefolder::mkdir(&d, "Docs/inner").unwrap();
+    for gone in ["Docs/b.txt", "Docs/.lock", "Docs/inner"] {
+        crate::onefolder::remove(&d, gone).unwrap();
+    }
+    crate::onefolder::write(&d, local, "Docs/b.txt")
+        .await
+        .unwrap();
+    crate::onefolder::remove(&d, "Docs/b.txt").unwrap();
+    for cmd in ["invitations", "peer-list", "space-usage"] {
+        for req in pages(cmd, json!({})) {
+            same(&d, req).await;
+        }
+    }
+    for req in pages("history", json!({"path": "Docs/a.txt"})) {
+        same(&d, req).await;
+    }
+    for rest in [
+        json!({"path": "Docs"}),
+        json!({"path": "Docs", "hidden": true}),
+        json!({}),
+        json!({"hidden": false}),
+    ] {
+        for req in pages("deleted", rest) {
+            same(&d, req).await;
+        }
+    }
+    for req in [
+        json!({"cmd": "history"}),
+        json!({"cmd": "history", "path": "Docs"}),
+        json!({"cmd": "history", "path": "Nowhere/x"}),
+        json!({"cmd": "deleted", "path": "Docs/a.txt"}),
+        json!({"cmd": "deleted", "path": "Nowhere"}),
+    ] {
+        same(&d, req).await;
+    }
+    let r = typed_of::<DeletedArgs>(
+        &same(
+            &d,
+            json!({"cmd": "deleted", "path": "Docs", "hidden": true}),
+        )
+        .await,
+    );
+    assert_eq!(r.files.len(), 4, "{r:?}");
+    let r =
+        typed_of::<HistoryArgs>(&same(&d, json!({"cmd": "history", "path": "Docs/a.txt"})).await);
+    assert_eq!(r.versions.len(), 3);
+}

@@ -3548,31 +3548,27 @@ async fn client(cmd: Cmd) -> anyhow::Result<()> {
             }
             (Some(_), None) => anyhow::bail!("say which: `cardinal invitations cancel ID`"),
             _ => {
-                let v = call(&paths, json!({"cmd": "invitations"})).await?;
-                let all = v["invitations"].as_array().cloned().unwrap_or_default();
-                if all.is_empty() {
+                let v = ask(&paths, api::InvitationsArgs::new()).await?;
+                if v.invitations.is_empty() {
                     println!("You have made no invitations.");
                 }
-                for i in all {
-                    let standing = if i["outstanding"] == true {
+                for i in v.invitations {
+                    let standing = if i.outstanding {
                         "can be used"
-                    } else if i["cancelled"] == true {
+                    } else if i.cancelled {
                         "cancelled"
-                    } else if i["expired"] == true {
+                    } else if i.expired {
                         "expired"
                     } else {
                         "used"
                     };
-                    let name = i["name"].as_str().unwrap_or("(no name)");
-                    let only = if i["hosts_only"] == true {
+                    let name = i.name.as_deref().unwrap_or("(no name)");
+                    let only = if i.hosts_only {
                         "  through hosts only"
                     } else {
                         ""
                     };
-                    println!(
-                        "{}  {name}  {standing}{only}",
-                        i["id"].as_str().unwrap_or("")
-                    );
+                    println!("{}  {name}  {standing}{only}", hex::encode(i.id));
                 }
                 Ok(())
             }
@@ -3691,14 +3687,11 @@ async fn client(cmd: Cmd) -> anyhow::Result<()> {
                     call(&paths, json!({"cmd": "introduction-decline", "id": id})).await?;
                 }
                 (None, _) => {
-                    let v = call(&paths, json!({"cmd": "introductions"})).await?;
-                    for i in v["introductions"].as_array().into_iter().flatten() {
-                        let (from, name) = (
-                            printable(i["from"].as_str().unwrap_or("")),
-                            printable(i["name"].as_str().unwrap_or("")),
-                        );
-                        let id = i["id"].as_str().unwrap_or("");
-                        if i["kind"] == "meet" {
+                    let v = ask(&paths, api::IntroductionsArgs::new()).await?;
+                    for i in &v.introductions {
+                        let (from, name) = (printable(&i.from), printable(&i.name));
+                        let id = hex::encode(i.id);
+                        if i.kind == "meet" {
                             println!("{from} would like you to meet {name}: cardinal introductions yes {id}");
                         } else {
                             println!(
@@ -4437,17 +4430,16 @@ async fn client(cmd: Cmd) -> anyhow::Result<()> {
                 Ok(())
             }
             PeerCmd::List => {
-                let v = call(&paths, json!({"cmd": "peer-list"})).await?;
-                let list = v["peers"].as_array().cloned().unwrap_or_default();
-                if list.is_empty() {
+                let v = ask(&paths, api::PeerListArgs::new()).await?;
+                if v.peers.is_empty() {
                     println!("No addresses. Add one with `cardinal peer add host:port`.");
                 }
-                for p in list {
+                for p in v.peers {
                     println!(
                         "  {}  {}",
-                        p["addr"].as_str().unwrap_or(""),
-                        p["device"]
-                            .as_str()
+                        p.addr,
+                        p.device
+                            .as_deref()
                             .map(|d| format!("({d})"))
                             .unwrap_or_else(|| "(not reached yet)".into())
                     );
@@ -4479,18 +4471,24 @@ async fn client(cmd: Cmd) -> anyhow::Result<()> {
         Cmd::History { path } => {
             let m = mount_path(&paths).await;
             let p = space_path(&path, m.as_deref());
-            let v = call(&paths, json!({"cmd": "history", "path": p})).await?;
+            let args = api::HistoryArgs {
+                path: Some(p.clone()),
+                ..api::HistoryArgs::new()
+            };
+            let v = ask(&paths, args).await?;
             println!("Versions of {p} (oldest first):");
-            for x in v["versions"].as_array().cloned().unwrap_or_default() {
+            for x in v.versions {
+                // the version as it always was shown: the width given here
+                // was never applied to it
                 println!(
-                    "  {:>3}  {}  {:<16} {:>10}{}",
-                    x["version"],
-                    human_time(x["time"].as_u64()),
-                    x["device"].as_str().unwrap_or(""),
-                    x["size"].as_u64().map(human_size).unwrap_or_default(),
-                    if x["current"].as_bool() == Some(true) {
+                    "  {}  {}  {:<16} {:>10}{}",
+                    x.version,
+                    human_time(x.time),
+                    x.device,
+                    x.size.map(human_size).unwrap_or_default(),
+                    if x.current {
                         "  (current)"
-                    } else if x["here"].as_bool() == Some(false) {
+                    } else if !x.here {
                         "  (not on this device)"
                     } else {
                         ""
@@ -4506,12 +4504,12 @@ async fn client(cmd: Cmd) -> anyhow::Result<()> {
             let p = path
                 .map(|p| space_path(&p, m.as_deref()))
                 .unwrap_or_default();
-            let v = call(
-                &paths,
-                json!({"cmd": "deleted", "path": p, "hidden": hidden}),
-            )
-            .await?;
-            let list = v["files"].as_array().cloned().unwrap_or_default();
+            let args = api::DeletedArgs {
+                path: Some(p.clone()),
+                hidden: Some(hidden),
+                ..api::DeletedArgs::new()
+            };
+            let list = ask(&paths, args).await?.files;
             let top = if p.is_empty() { "your files" } else { &p };
             if list.is_empty() {
                 println!("Nothing was deleted from {top}.");
@@ -4521,20 +4519,18 @@ async fn client(cmd: Cmd) -> anyhow::Result<()> {
             // an id only where a name is there more than once
             let mut count: std::collections::HashMap<String, usize> = Default::default();
             for x in &list {
-                *count
-                    .entry(x["name"].as_str().unwrap_or("").to_owned())
-                    .or_default() += 1;
+                *count.entry(x.name.clone()).or_default() += 1;
             }
             for x in &list {
-                let name = x["name"].as_str().unwrap_or("");
-                let id = x["id"].as_str().unwrap_or("");
+                let name = x.name.as_str();
+                let id = hex::encode(x.id);
                 println!(
                     "  {}{}  {}  {:<16} {:>10}{}",
                     printable(name),
-                    if x["folder"] == true { "/" } else { "" },
-                    human_time(x["time"].as_u64()),
-                    x["by"].as_str().unwrap_or(""),
-                    x["size"].as_u64().map(human_size).unwrap_or_default(),
+                    if x.folder { "/" } else { "" },
+                    human_time(x.time),
+                    x.by.as_deref().unwrap_or(""),
+                    x.size.map(human_size).unwrap_or_default(),
                     if count.get(name).copied().unwrap_or(0) > 1 {
                         format!("  --id {}", &id[..id.len().min(16)])
                     } else {

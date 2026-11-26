@@ -379,6 +379,11 @@ pub mod typed {
         SaveAttachmentArgs, SayArgs, SayReply,
     };
     use crate::api::{
+        DeletedArgs, DeletedReply, HistoryArgs, HistoryReply, IntroductionsArgs,
+        IntroductionsReply, InvitationsArgs, InvitationsReply, PeerListArgs, PeerListReply,
+        SpaceUsageArgs, SpaceUsageReply,
+    };
+    use crate::api::{
         GroupAddArgs, GroupCreateArgs, GroupCreateReply, GroupDeclineArgs, GroupJoinArgs,
         GroupJoinReply, GroupLeaveArgs, GroupLeaveReply, GroupMemberArgs, GroupMembersArgs,
         GroupMembersReply, GroupReachArgs, GroupReachReply, GroupRejoinArgs, GroupRemoveArgs,
@@ -1106,6 +1111,72 @@ pub mod typed {
         }
     }
 
+    // ---- Listings ----
+
+    impl Answer for InvitationsArgs {
+        async fn answer(d: &Arc<Daemon>, _: &Self) -> anyhow::Result<InvitationsReply> {
+            Ok(crate::contacts::invitations(d))
+        }
+    }
+
+    impl Answer for IntroductionsArgs {
+        async fn answer(d: &Arc<Daemon>, _: &Self) -> anyhow::Result<IntroductionsReply> {
+            Ok(crate::introductions::list(d))
+        }
+    }
+
+    impl Answer for HistoryArgs {
+        async fn answer(d: &Arc<Daemon>, a: &Self) -> anyhow::Result<HistoryReply> {
+            crate::file_history::history(d, needed(a.path.as_deref(), "path")?)
+        }
+    }
+
+    impl Answer for DeletedArgs {
+        async fn answer(d: &Arc<Daemon>, a: &Self) -> anyhow::Result<DeletedReply> {
+            let path = a.path.as_deref().unwrap_or("");
+            crate::file_history::deleted(d, path, a.hidden.unwrap_or(false))
+        }
+    }
+
+    impl Answer for SpaceUsageArgs {
+        async fn answer(d: &Arc<Daemon>, _: &Self) -> anyhow::Result<SpaceUsageReply> {
+            let d2 = d.clone();
+            tokio::task::spawn_blocking(move || crate::cleanup::usage_of(&d2)).await?
+        }
+    }
+
+    impl Answer for PeerListArgs {
+        async fn answer(d: &Arc<Daemon>, _: &Self) -> anyhow::Result<PeerListReply> {
+            let peers = d.config().peers.clone();
+            let book = d.book.lock().unwrap_or_else(|e| e.into_inner()).clone();
+            let names = d.core().device_names();
+            let peers = peers
+                .iter()
+                .map(|p| {
+                    let dev = book.manual.get(p).and_then(|h| {
+                        let b = hex::decode(h).ok()?;
+                        <[u8; 32]>::try_from(&b[..]).ok()
+                    });
+                    api::Peer {
+                        addr: p.clone(),
+                        device: dev.map(|k| {
+                            names
+                                .get(&k)
+                                .cloned()
+                                .unwrap_or_else(|| super::account::short_key(&k))
+                        }),
+                    }
+                })
+                .collect();
+            Ok(PeerListReply {
+                peers,
+                // the page says
+                more: false,
+                next: None,
+            })
+        }
+    }
+
     // ---- Networks, hosts and peers ----
 
     impl Answer for RouterArgs {
@@ -1496,7 +1567,8 @@ async fn handle(d: &Arc<Daemon>, req: &Value) -> anyhow::Result<Value> {
             )
             .await
         }
-        "invitations" => Ok(crate::contacts::invitations(d)),
+        #[cfg(any(test, debug_assertions, feature = "by-name"))]
+        "invitations" => Ok(crate::contacts::invitations_by_name(d)),
         "cancel-invitation" => crate::contacts::cancel_invitation(d, arg(req, "id")?),
         "contact-status" => {
             // looking is done with the first page, never again for the next
@@ -1558,7 +1630,8 @@ async fn handle(d: &Arc<Daemon>, req: &Value) -> anyhow::Result<Value> {
             crate::groups::delete_message_by_name(d, arg(req, "group")?, arg(req, "id")?)
         }
         "groups" => Ok(crate::groups::list(d)),
-        "introductions" => Ok(crate::introductions::list(d)),
+        #[cfg(any(test, debug_assertions, feature = "by-name"))]
+        "introductions" => Ok(crate::introductions::list_by_name(d)),
         "introduce" => {
             let note = req.get("note").and_then(|v| v.as_str());
             crate::introductions::introduce(d, arg(req, "who")?, arg(req, "to")?, note)
@@ -1883,6 +1956,7 @@ async fn handle(d: &Arc<Daemon>, req: &Value) -> anyhow::Result<Value> {
             d.save_config()?;
             Ok(json!({}))
         }
+        #[cfg(any(test, debug_assertions, feature = "by-name"))]
         "peer-list" => {
             let peers = d.config().peers.clone();
             let book = d.book.lock().unwrap_or_else(|e| e.into_inner()).clone();
@@ -1932,9 +2006,10 @@ async fn handle(d: &Arc<Daemon>, req: &Value) -> anyhow::Result<Value> {
                 "unchecked": crate::cleanup::status(d)["unchecked"],
             }))
         }
+        #[cfg(any(test, debug_assertions, feature = "by-name"))]
         "space-usage" => {
             let d2 = d.clone();
-            tokio::task::spawn_blocking(move || crate::cleanup::usage_of(&d2)).await?
+            tokio::task::spawn_blocking(move || crate::cleanup::usage_of_by_name(&d2)).await?
         }
         "history-empty" => {
             let empty = match req.get("space").and_then(Value::as_str) {
@@ -1971,8 +2046,10 @@ async fn handle(d: &Arc<Daemon>, req: &Value) -> anyhow::Result<Value> {
             });
             Ok(json!({"keep": keep.to_string()}))
         }
-        "history" => crate::file_history::history(d, arg(req, "path")?),
-        "deleted" => crate::file_history::deleted(
+        #[cfg(any(test, debug_assertions, feature = "by-name"))]
+        "history" => crate::file_history::history_by_name(d, arg(req, "path")?),
+        #[cfg(any(test, debug_assertions, feature = "by-name"))]
+        "deleted" => crate::file_history::deleted_by_name(
             d,
             req.get("path").and_then(Value::as_str).unwrap_or(""),
             req.get("hidden").and_then(Value::as_bool).unwrap_or(false),
