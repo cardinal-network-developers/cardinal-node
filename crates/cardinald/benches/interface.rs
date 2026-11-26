@@ -164,14 +164,20 @@ async fn fill(d: &Arc<Daemon>, dir: &std::path::Path) -> String {
     );
     let t = Instant::now();
     let g = cardinald::groups::create(d, "Bench", &[], false, true).unwrap();
-    let group = g["group"].as_str().unwrap().to_owned();
+    let group = hex::encode(g.group);
     let text: String = "word ".repeat(MESSAGE_TEXT / 5);
     // more than a page: a page holds about 256 KiB
     let n = transport::MAX_MESSAGE / (MESSAGE_TEXT + 40) + 200;
     for i in 0..n {
-        cardinald::groups::say(d, &group, &format!("{i} {text}"), None, &[])
-            .await
-            .unwrap();
+        cardinald::groups::say(
+            d,
+            cardinald::api::Ref::Typed(&group),
+            &format!("{i} {text}"),
+            None,
+            &[],
+        )
+        .await
+        .unwrap();
     }
     eprintln!("{n} messages written in {:.1} s", t.elapsed().as_secs_f64());
     group
