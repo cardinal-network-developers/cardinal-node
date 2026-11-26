@@ -362,3 +362,88 @@ fn an_old_contact_that_cannot_be_read_is_named() {
     assert!(bo.cli(&["contacts", "Ana"]).contains(&says));
     no_panic(&bo);
 }
+
+/// D92, D93: a device on the release before groups made for a call sees
+/// one as an ordinary group. Offered it and rung there, it drops the ring
+/// and shows the offer; joined, it syncs both ways, and goes on syncing
+/// after the mark is set false ("Keep this group").
+#[test]
+fn an_old_device_in_a_call_group_sees_an_ordinary_group() {
+    let Some(old) = old_bin() else { return };
+    use serde_json::json;
+    let root = tempfile::tempdir().unwrap();
+    let mut ana = Dev::new(root.path(), "ana", free_port());
+    ana.start_with(&["--no-mount"]);
+    ana.cli(&["init", "--yes", "--name", "ana"]);
+    let mut bo = old_device(root.path(), "bo", &old);
+    bo.start_with(&["--no-mount"]);
+    bo.cli(&["init", "--yes", "--name", "bo"]);
+    let at = format!("127.0.0.1:{}", ana.port);
+    let code = ana.cli(&["invite", "--address", &at, "--name", "Ana"]);
+    bo.cli(&["accept", code.trim(), "--name", "Ana"]);
+    wait("they meet", 30, || ana.cli(&["contacts"]).contains("bo"));
+    common::ask(&ana, &json!({"cmd": "contact", "who": "bo", "name": "Bo"}));
+    let made = common::ask(
+        &ana,
+        &json!({"cmd": "group-create", "name": "Call", "people": ["Bo"], "for_call": true}),
+    );
+    let g = made["group"].as_str().unwrap().to_owned();
+    let offered = |d: &Dev| {
+        let v = common::ask(d, &json!({"cmd": "groups"}));
+        v["offers"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .any(|o| o["group"] == g.as_str())
+    };
+    wait("bo is offered it", 30, || offered(&bo));
+    // rung there, only offered: the old device drops the ring
+    common::ask(
+        &ana,
+        &json!({"cmd": "call-start", "group": g, "ring": ["Bo"]}),
+    );
+    for _ in 0..8 {
+        let c = common::ask(&bo, &json!({"cmd": "call"}));
+        assert!(c["call"].is_null(), "{c}");
+        std::thread::sleep(std::time::Duration::from_millis(250));
+    }
+    common::ask(&ana, &json!({"cmd": "call-end"}));
+    assert!(offered(&bo));
+    common::ask(&bo, &json!({"cmd": "group-join", "group": g}));
+    let says = |d: &Dev, text: &str| {
+        common::ask(d, &json!({"cmd": "say", "group": g, "text": text}));
+    };
+    let reads = |d: &Dev, text: &str| {
+        wait(&format!("{} reads {text}", d.name), 30, || {
+            common::ask(d, &json!({"cmd": "messages", "group": g}))
+                .to_string()
+                .contains(text)
+        });
+    };
+    says(&ana, "from ana");
+    reads(&bo, "from ana");
+    says(&bo, "from bo");
+    reads(&ana, "from bo");
+    let listed = common::ask(&bo, &json!({"cmd": "groups"}));
+    let mine = listed["groups"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|x| x["group"] == g.as_str())
+        .cloned()
+        .unwrap();
+    assert!(
+        mine.get("for_call").is_none(),
+        "an old device knows no mark: {mine}"
+    );
+    common::ask(
+        &ana,
+        &json!({"cmd": "group-set", "group": g, "for_call": false}),
+    );
+    says(&ana, "kept");
+    reads(&bo, "kept");
+    says(&bo, "still here");
+    reads(&ana, "still here");
+    no_panic(&bo);
+    no_panic(&ana);
+}

@@ -87,6 +87,23 @@ pub struct Notes {
     /// [`super::RELAYED_FOR_MS`], and never sent anywhere.
     #[serde(default)]
     pub relayed: BTreeMap<String, u64>,
+    /// The last call in this group that ended on this device, as `call`
+    /// gives `ended`, with when (D92): kept here alone, across restarts,
+    /// and never sent anywhere. Nothing in a space records a call.
+    #[serde(default)]
+    pub last_call: Option<LastCall>,
+}
+
+/// A call that ended on this device, for a group's `last_call`.
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct LastCall {
+    pub id: String,
+    pub who: String,
+    pub name: String,
+    pub how: String,
+    /// When it ended here, in milliseconds since 1970, by this device's
+    /// clock.
+    pub at: u64,
 }
 
 /// What [`Core::succeed`] wrote, to send.
@@ -416,6 +433,36 @@ impl Core {
                 Some((id(a)?, id(b)?))
             })
             .collect()
+    }
+
+    /// Notes the last call in group `space` that ended on this device, for
+    /// the group that stands in its place here where it was succeeded
+    /// meanwhile (D92): the note follows the group. What is noted is
+    /// given back to be written, which the caller does outside the lock.
+    #[must_use]
+    pub fn note_last_call(&mut self, space: &SpaceId, call: LastCall) -> Option<super::NotesSave> {
+        let now = self.current(space);
+        let h = self.spaces.get_mut(&now)?;
+        h.notes.last_call = Some(call);
+        Some(h.notes_to_save())
+    }
+
+    /// The last call in group `space` that ended on this device, as `call`
+    /// gives `ended`, with `at`: the newest noted for it or for any group
+    /// it succeeds, since the note follows a group to its successor. Its
+    /// `group` is `space`, whichever it was noted for.
+    pub fn last_call(&self, space: &SpaceId) -> Option<serde_json::Value> {
+        let noted = self.chain(space).into_iter();
+        let noted = noted.filter_map(|s| self.spaces.get(&s)?.notes.last_call.as_ref());
+        let c = noted.max_by_key(|c| c.at)?;
+        Some(serde_json::json!({
+            "id": c.id,
+            "who": c.who,
+            "name": c.name,
+            "group": hex::encode(space),
+            "how": c.how,
+            "at": c.at,
+        }))
     }
 
     /// The person cleared the note of how the group moved to `space`.

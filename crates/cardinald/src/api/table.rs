@@ -275,8 +275,10 @@ rec!(BLUETOOTH "bluetooth":
 rec!(CALL "call":
     1 "frames" {CALL_FRAMES}, 2 "group" B, 3 "id" B, 4 "linked" U, 5 "name" T, 6 "offered" [B],
     7 "people" U, 8 "picture" T, 9 "seconds" U, 10 "state" T, 11 "taken" [B], 12 "who" B,
-    13 "voices" [VOICE], 14 "they_take" [B], 15 "camera" BOOL);
-rec!(CALL_ENDED "call ended": 1 "group" B, 2 "how" T, 3 "id" B, 4 "name" T, 5 "who" B);
+    13 "voices" [VOICE], 14 "they_take" [B], 15 "camera" BOOL, 16 "caller" {MEMBER},
+    17 "admins" [MEMBER], 18 "joins" BOOL, 19 "reach" {GROUP_REACH}, 20 "for_call" BOOL);
+rec!(CALL_ENDED "call ended":
+    1 "group" B, 2 "how" T, 3 "id" B, 4 "name" T, 5 "who" B, 6 "at" U);
 rec!(CONDITIONS "conditions": 1 "helps" BOOL, 2 "metered" BOOL, 3 "plugged_in" BOOL);
 rec!(CONFLICT "conflict":
     1 "copies" [T], 2 "delete_conflict" BOOL, 3 "path" T, 4 "versions" [VERSION]);
@@ -310,7 +312,7 @@ rec!(GROUP "group":
     4 "ended" T, 5 "group" B, 6 "held_back" U, 7 "introductions" BOOL, 8 "last" {LAST},
     9 "members" U, 10 "moved" {GROUP_CHANGE}, 11 "name" T, 12 "not_posted" U, 13 "public" BOOL,
     14 "reach" {GROUP_REACH}, 15 "role" T, 16 "unread" U, 17 "was" B, 18 "confirm" [B],
-    19 "to_confirm" [GROUP_CHANGE]);
+    19 "to_confirm" [GROUP_CHANGE], 20 "for_call" BOOL, 21 "last_call" {CALL_ENDED});
 rec!(GROUP_CHANGE "group change":
     1 "at" U, 2 "by" T, 3 "group" B, 4 "roles" [ROLE_CHANGE], 5 "seen" U, 6 "taken_out" [T],
     7 "device" T, 8 "to" B);
@@ -370,7 +372,8 @@ rec!(NETWORK "network":
     1 "answered" BOOL, 2 "ask" BOOL, 3 "known" BOOL, 4 "mine" BOOL, 5 "name" T, 6 "router" T,
     7 "routers" BOOL);
 rec!(OFFER "offer":
-    1 "from" T, 2 "group" B, 3 "members" U, 4 "name" T, 5 "public" BOOL, 6 "reach" {GROUP_REACH});
+    1 "from" T, 2 "group" B, 3 "members" U, 4 "name" T, 5 "public" BOOL, 6 "reach" {GROUP_REACH},
+    7 "for_call" BOOL, 8 "last_call" {CALL_ENDED});
 rec!(OLD "old versions":
     1 "at" U, 2 "bytes" U, 3 "keep" T, 4 "only_here" {ONLY_HERE}, 5 "unchecked" BOOL);
 rec!(ONLY_HERE "only here": 1 "bytes" U, 2 "files" U);
@@ -586,7 +589,8 @@ pub static REQUESTS: &[Request] = &[
     paged!(after 70 "groups" (1 "after" U, 2 "limit" U) -> (
         2 "groups" [GROUP], 3 "offers" [OFFER], 4 "more" BOOL, 5 "next" U,
         6 "rejoin" [REJOIN])),
-    req!(71 "group-create" (1 "name" T, 2 "people" [REF]) -> (2 "group" B, 3 "name" T)),
+    req!(71 "group-create" (1 "name" T, 2 "people" [REF], 3 "for_call" BOOL, 4 "history" BOOL) -> (
+        2 "group" B, 3 "name" T)),
     req!(72 "group-join" (1 "group" REF, 2 "reach" BOOL) -> (
         2 "group" B, 3 "name" T, 4 "shared" BOOL, 5 "waiting" BOOL)),
     req!(73 "group-decline" (1 "group" REF) -> ()),
@@ -599,7 +603,7 @@ pub static REQUESTS: &[Request] = &[
         2 "group" B, 3 "left_out" [B], 4 "was" B)),
     paged!(after 78 "group-members" (1 "group" REF, 2 "after" U, 3 "limit" U) -> (
         2 "group" B, 3 "members" [MEMBER], 4 "name" T, 5 "more" BOOL, 6 "next" U)),
-    req!(79 "group-set" (1 "group" REF, 2 "name" T, 3 "introductions" BOOL) -> ()),
+    req!(79 "group-set" (1 "group" REF, 2 "name" T, 3 "introductions" BOOL, 4 "for_call" BOOL) -> ()),
     req!(80 "group-member" (1 "group" REF, 2 "who" REF, 3 "shown" T, 4 "introduce" BOOL) -> ()),
     req!(81 "group-connect" (1 "group" REF, 2 "who" REF, 3 "note" T) -> (2 "asked" BOOL)),
     req!(82 "group-role" (1 "group" REF, 2 "who" REF, 3 "role" T) -> (2 "group" B, 3 "was" B)),
@@ -612,8 +616,10 @@ pub static REQUESTS: &[Request] = &[
     req!(87 "group-rejoin" (1 "group" REF) -> (2 "group" B, 3 "name" T)),
     // ---- Calls and the clipboard: 100 to 119 ----
     req!(100 "call" () -> (2 "call" {CALL}, 3 "ended" {CALL_ENDED})),
-    req!(101 "call-start" (1 "who" REF, 2 "group" REF, 3 "formats" [B], 4 "format_names" [T]) -> ()),
-    req!(102 "call-answer" (1 "formats" [B], 2 "format_names" [T]) -> ()),
+    req!(101 "call-start" (
+        1 "who" REF, 2 "group" REF, 3 "formats" [B], 4 "format_names" [T], 5 "ring" [REF]
+    ) -> ()),
+    req!(102 "call-answer" (1 "formats" [B], 2 "format_names" [T], 3 "reach" BOOL, 4 "join" BOOL) -> ()),
     req!(103 "call-end" () -> ()),
     req!(104 "call-media" () -> ()),
     req!(105 "clip-copy" (1 "text" T) -> (2 "devices" U)),

@@ -335,6 +335,12 @@ enum Cmd {
         #[command(subcommand)]
         cmd: GroupCmd,
     },
+    /// The call under way, or ring, answer or end one. Only the signalling:
+    /// sound and video go through a window (`call-media`).
+    Call {
+        #[command(subcommand)]
+        cmd: Option<CallCmd>,
+    },
     /// Answer what a program asks of you: to see or change an
     /// application's spaces, to start one, or whom to share one with. With
     /// nothing, lists what is waiting; with its number, says yes, or no
@@ -619,6 +625,42 @@ enum InspectCmd {
 }
 
 #[derive(Subcommand)]
+enum CallCmd {
+    /// Ring a contact, or with --group a group: its whole membership, or
+    /// with --ring only those named, who nobody else's ring reaches. On a
+    /// group's call already, --ring rings those named into it.
+    Start {
+        /// The contact, as `cardinal contacts` shows them.
+        #[arg(required_unless_present = "group", conflicts_with = "group")]
+        who: Option<String>,
+        /// The group, by name or id.
+        #[arg(long)]
+        group: Option<String>,
+        /// Ring only this member of the group, as its members show them.
+        /// Repeat it for more than one.
+        #[arg(long = "ring", value_name = "MEMBER", requires = "group")]
+        ring: Vec<String>,
+    },
+    /// Answer the call ringing. In a group you were only offered,
+    /// answering joins it: say so with --join, and --share-host or
+    /// --keep-host where you are asked about your host.
+    Answer {
+        /// Join the group the call rings in, which answering it does where
+        /// it was only offered to you.
+        #[arg(long)]
+        join: bool,
+        /// Let the group's members have where your host is.
+        #[arg(long, conflicts_with = "keep_host")]
+        share_host: bool,
+        /// Do not: they reach you only through someone in touch with both.
+        #[arg(long)]
+        keep_host: bool,
+    },
+    /// Hang up, or say no to the call ringing.
+    End,
+}
+
+#[derive(Subcommand)]
 enum ClipCmd {
     /// Copy text to your other devices: the text given, or what comes on
     /// standard input (`some-command | cardinal clip copy`).
@@ -647,6 +689,19 @@ enum GroupCmd {
         name: String,
         /// Who to offer it to, as `cardinal contacts` shows them.
         people: Vec<String>,
+        /// Make it for a call: listed with calls, not with groups.
+        #[arg(long)]
+        for_call: bool,
+        /// Do not share its history with anyone added later. Nobody can
+        /// be added to such a group.
+        #[arg(long)]
+        no_history: bool,
+    },
+    /// Keep a group made for a call as an ordinary group, for everyone in
+    /// it. It cannot be made one for a call again.
+    Keep {
+        /// The group, by name or id.
+        group: String,
     },
     /// Join a group offered to you.
     Join {
@@ -1854,6 +1909,88 @@ fn names(v: &Value) -> String {
     let all = v.as_array().into_iter().flatten();
     let all: Vec<String> = all.map(|x| printable(x.as_str().unwrap_or(""))).collect();
     all.join(", ")
+}
+
+/// The last call in a group that ended on this device, if any.
+fn tell_last_call(last: &Value) {
+    if let (Some(how), Some(at)) = (last["how"].as_str(), last["at"].as_u64()) {
+        let ago = now_secs().saturating_sub(at / 1000);
+        println!(
+            "    Last call: {}, {} ago.",
+            how.replace('_', " "),
+            ago_words(ago)
+        );
+    }
+}
+
+fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
+}
+
+fn ago_words(s: u64) -> String {
+    match s {
+        0..=59 => format!("{s} s"),
+        60..=3599 => format!("{} min", s / 60),
+        3600..=86399 => format!("{} h", s / 3600),
+        _ => format!("{} days", s / 86400),
+    }
+}
+
+/// The call under way, as `call` gives it.
+fn tell_call(v: &Value) {
+    let c = &v["call"];
+    if c.is_null() {
+        println!("No call.");
+    } else {
+        let name = printable(c["name"].as_str().unwrap_or(""));
+        let state = c["state"].as_str().unwrap_or("");
+        match c["group"].as_str() {
+            Some(_) => {
+                let what = match c["for_call"] == true {
+                    true => "call group",
+                    false => "group",
+                };
+                println!("{name} ({what}): {state}");
+                if let Some(by) = c["caller"]["name"].as_str() {
+                    println!("    {} is calling.", printable(by));
+                }
+                let admins: Vec<String> = c["admins"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|m| m["name"].as_str().map(printable))
+                    .collect();
+                if !admins.is_empty() {
+                    println!("    Looked after by {}.", admins.join(", "));
+                }
+                if c["joins"] == true {
+                    println!("    Answering adds you to {name}.");
+                    if c["reach"]["ask"] == true {
+                        println!(
+                            "    Not contacts of yours in it: {}. Answer with --share-host to \
+                             tell them, and anyone added later, where your host is ({}), or \
+                             with --keep-host not to.",
+                            names(&c["reach"]["who"]),
+                            names(&c["reach"]["what"]),
+                        );
+                    }
+                }
+                if let Some(n) = c["people"].as_u64() {
+                    println!("    {n} on the call.");
+                }
+            }
+            None => println!("{name}: {state}"),
+        }
+    }
+    if let Some(how) = v["ended"]["how"].as_str() {
+        println!(
+            "Last ended: {}, {}.",
+            printable(v["ended"]["name"].as_str().unwrap_or("")),
+            how.replace('_', " ")
+        );
+    }
 }
 
 /// Tells the person who reads where their hosts are in a group without
@@ -3494,21 +3631,31 @@ async fn client(cmd: Cmd) -> anyhow::Result<()> {
                     true => ", public",
                     false => "",
                 };
+                let for_call = match g["for_call"] == true {
+                    true => ", made for a call",
+                    false => "",
+                };
                 println!(
-                    "{}  ({} members{unread}{public})  {}",
+                    "{}  ({} members{unread}{public}{for_call})  {}",
                     printable(g["name"].as_str().unwrap_or("")),
                     g["members"],
                     &g["group"].as_str().unwrap_or("")[..16]
                 );
+                tell_last_call(&g["last_call"]);
                 tell_who_reads_reach(g);
             }
             for o in v["offers"].as_array().into_iter().flatten() {
+                let what = match o["for_call"] == true {
+                    true => "a call group, ",
+                    false => "",
+                };
                 println!(
-                    "{} added you to {}: cardinal group join {}",
+                    "{} added you to {what}{}: cardinal group join {}",
                     printable(o["from"].as_str().unwrap_or("")),
                     printable(o["name"].as_str().unwrap_or("")),
                     &o["group"].as_str().unwrap_or("")[..16]
                 );
+                tell_last_call(&o["last_call"]);
                 if o["public"] == true {
                     println!(
                         "    It is public: anyone who gets what is written in it can read it."
@@ -3662,10 +3809,65 @@ async fn client(cmd: Cmd) -> anyhow::Result<()> {
                 }
             }
         },
+        Cmd::Call { cmd } => {
+            let req = match &cmd {
+                None => {
+                    let v = call(&paths, json!({"cmd": "call"})).await?;
+                    tell_call(&v);
+                    return Ok(());
+                }
+                Some(CallCmd::Start { who, group, ring }) => {
+                    let mut req = json!({"cmd": "call-start"});
+                    match (who, group) {
+                        (_, Some(g)) => req["group"] = json!(g),
+                        (Some(w), None) => req["who"] = json!(w),
+                        (None, None) => anyhow::bail!("say whom to call, or --group"),
+                    }
+                    if !ring.is_empty() {
+                        req["ring"] = json!(ring);
+                    }
+                    req
+                }
+                Some(CallCmd::Answer {
+                    join,
+                    share_host,
+                    keep_host,
+                }) => {
+                    let mut req = json!({"cmd": "call-answer"});
+                    if *join {
+                        req["join"] = json!(true);
+                    }
+                    match (*share_host, *keep_host) {
+                        (true, _) => req["reach"] = json!(true),
+                        (_, true) => req["reach"] = json!(false),
+                        _ => {}
+                    }
+                    req
+                }
+                Some(CallCmd::End) => json!({"cmd": "call-end"}),
+            };
+            call(&paths, req).await?;
+            Ok(())
+        }
         Cmd::Group { cmd } => {
             let req = match &cmd {
-                GroupCmd::Create { name, people } => {
-                    json!({"cmd": "group-create", "name": name, "people": people})
+                GroupCmd::Create {
+                    name,
+                    people,
+                    for_call,
+                    no_history,
+                } => {
+                    let mut req = json!({"cmd": "group-create", "name": name, "people": people});
+                    if *for_call {
+                        req["for_call"] = json!(true);
+                    }
+                    if *no_history {
+                        req["history"] = json!(false);
+                    }
+                    req
+                }
+                GroupCmd::Keep { group } => {
+                    json!({"cmd": "group-set", "group": group, "for_call": false})
                 }
                 GroupCmd::Join {
                     group,

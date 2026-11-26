@@ -34,6 +34,11 @@ Options:
   --list           print what would run, without building or running
   --old-bin PATH   the release before, for the versions tests (release
                    needs it here or in CARDINAL_OLD_BIN)
+  --port-base N    the first port of the blocks (default 20000, or
+                   CARDINAL_TEST_PORT_BASE): two runs on one machine at
+                   once each need blocks of their own, --jobs x 1500 ports
+                   from N, all below 32768
+  --self-test      check this script's own arithmetic, and run nothing
 
 Cargo's own environment holds (CARGO_TARGET_DIR, RUSTFLAGS). The tests'
 own settings pass through (CARDINAL_CORE).
@@ -61,6 +66,32 @@ AREAS = {"all", "basics", "files", "groups", "recovery", "contacts", "reach",
 # another binary nor a daemon's outgoing socket takes a test's port between
 # its check and its bind.
 PORT_BASE, PORT_BLOCK, MAX_JOBS = 20000, 1500, 8
+# Where Linux starts handing out ports for port 0.
+EPHEMERAL = 32768
+
+
+def port_blocks(base, jobs):
+    """The block of ports of each slot, first to last: below EPHEMERAL,
+    and at 1024 or above, or a message saying why not."""
+    if base < 1024:
+        return f"--port-base {base} is below 1024"
+    last = base + jobs * PORT_BLOCK - 1
+    if last >= EPHEMERAL:
+        return (f"--port-base {base} with --jobs {jobs} reaches port {last}: "
+                f"the blocks must end below {EPHEMERAL}")
+    return [(base + i * PORT_BLOCK, base + (i + 1) * PORT_BLOCK - 1) for i in range(jobs)]
+
+
+def self_test():
+    assert port_blocks(20000, 1) == [(20000, 21499)]
+    assert port_blocks(20000, 4)[3] == (24500, 25999)
+    assert port_blocks(26000, 4)[0] == (26000, 27499)
+    assert port_blocks(26000, 4)[3] == (30500, 31999)
+    assert isinstance(port_blocks(26000, 5), str)
+    assert isinstance(port_blocks(500, 1), str)
+    assert port_blocks(32768 - PORT_BLOCK, 1) == [(31268, 32767)]
+    assert isinstance(port_blocks(32768 - PORT_BLOCK + 1, 1), str)
+    print("test-tier: self-test passed")
 
 
 def fail(msg):
@@ -208,11 +239,11 @@ class Run:
         return self.line.key < other.line.key
 
 
-def run_binary(line, exe, slot, args, env, logs, timeout):
+def run_binary(line, exe, block, args, env, logs, timeout):
     r = Run(line)
     log = logs / (line.key.replace("/", "__") + ".log")
-    first = PORT_BASE + slot * PORT_BLOCK
-    env = dict(env, CARDINAL_TEST_PORTS=f"{first}-{first + PORT_BLOCK - 1}")
+    first, last = block
+    env = dict(env, CARDINAL_TEST_PORTS=f"{first}-{last}")
     cmd = [exe] + args
     if not args_strict(env):
         for t in line.slow:
@@ -286,8 +317,13 @@ def main():
     ap.add_argument("--timeout", type=int, default=1200)
     ap.add_argument("--list", action="store_true")
     ap.add_argument("--old-bin")
+    ap.add_argument("--port-base", type=int)
+    ap.add_argument("--self-test", action="store_true")
     ap.add_argument("-h", "--help", action="store_true")
     a = ap.parse_args()
+    if a.self_test:
+        self_test()
+        return
     if a.help or a.tier is None:
         print(__doc__.strip())
         sys.exit(0 if a.help else 2)
@@ -295,6 +331,15 @@ def main():
         fail(f"no tier {a.tier!r}: quick, branch or release")
     if not 1 <= a.jobs <= MAX_JOBS:
         fail(f"--jobs is 1 to {MAX_JOBS}: each binary has a block of ports")
+    base = a.port_base
+    if base is None:
+        given = os.environ.get("CARDINAL_TEST_PORT_BASE")
+        if given is not None and not given.isdigit():
+            fail(f"CARDINAL_TEST_PORT_BASE={given} is not a number")
+        base = int(given) if given else PORT_BASE
+    blocks = port_blocks(base, a.jobs)
+    if isinstance(blocks, str):
+        fail(blocks)
 
     lines = read_tiers()
     chosen = choose(lines, a.tier, a.words)
@@ -304,7 +349,7 @@ def main():
         for l in sorted(chosen, key=lambda l: l.key):
             slow = "" if keep_slow or not l.slow else f"  (without {len(l.slow)} slow)"
             print(f"{l.key:<40} {l.tier:<8} {','.join(l.areas):<18} {l.secs:>4} s{slow}")
-        print(f"{len(chosen)} binaries")
+        print(f"{len(chosen)} binaries; ports {blocks[0][0]}-{blocks[-1][1]}")
         return
 
     env = dict(os.environ)
@@ -325,7 +370,8 @@ def main():
     logs.mkdir(parents=True, exist_ok=True)
     logs = logs.resolve()
     print(f"test-tier {a.tier} {' '.join(a.words)}: {len(chosen)} binaries, "
-          f"{a.jobs} at a time, logs in {logs}", flush=True)
+          f"{a.jobs} at a time, ports {blocks[0][0]}-{blocks[-1][1]}, logs in {logs}",
+          flush=True)
     if release:
         env["CARDINAL_API_TABLES"] = str(logs / "api-tables.md")
 
@@ -344,7 +390,8 @@ def main():
         with lock:
             slot = slots.pop()
         try:
-            return run_binary(line, built[line.key], slot, args, env, logs, a.timeout)
+            return run_binary(line, built[line.key], blocks[slot], args, env, logs,
+                              a.timeout)
         finally:
             with lock:
                 slots.append(slot)

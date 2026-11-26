@@ -1300,6 +1300,25 @@ impl State {
         self.reach.iter()
     }
 
+    /// The node of `kind` created first, deleted or not and wherever it
+    /// is now: the lowest in rank (`state.md#canonical-state`, field 10),
+    /// the nodes an initial state carried first, in the order it ranked
+    /// them, then by log order, and within an entry by the order of its
+    /// ops.
+    pub fn first_of_kind(&self, kind: &NodeKind) -> Option<&Node> {
+        let rank = |n: &Node| match self.carried.get(&n.id) {
+            Some(r) => (0, *r as usize, 0),
+            None => {
+                let at = self.applied.iter().position(|e| *e == n.created_in);
+                (1, at.unwrap_or(usize::MAX), n.created_op)
+            }
+        };
+        self.nodes
+            .values()
+            .filter(|n| n.kind == *kind)
+            .min_by_key(|n| (rank(n), n.id))
+    }
+
     /// Every node.
     pub fn nodes(&self) -> impl Iterator<Item = &Node> {
         self.nodes.values()

@@ -630,15 +630,28 @@ fn text_of(n: &Node) -> Option<String> {
     Some(text.as_text()?.to_owned())
 }
 
-/// The conversation of a relationship space.
+/// The conversation of a relationship space, where it is not deleted:
+/// what messages are written under and read from.
 pub fn conversation(space: &Space) -> Option<NodeId> {
-    let state = space.state();
-    let found = state.children(&ROOT).into_iter().find(is_conversation);
-    found.map(|n| n.id)
+    let c = the_conversation(space)?;
+    let n = space.state().node(&c)?;
+    (!n.deleted).then_some(c)
 }
 
-fn is_conversation(n: &&Node) -> bool {
-    n.kind == NodeKind::Uint(CONVERSATION) && !n.deleted
+/// The conversation node, deleted or not (`profiles.md#relationship`,
+/// "Which node is the conversation"): the one the genesis created, of the
+/// nodes of kind 1 the one created first, the lowest in rank, wherever it
+/// has been moved. A successor carries it with its rank, so there it is
+/// the lowest-ranked of kind 1, and carried; one made in the successor is
+/// never it. Another a writer made is not it, and nothing is read from it.
+pub fn the_conversation(space: &Space) -> Option<NodeId> {
+    let state = space.state();
+    let n = state.first_of_kind(&NodeKind::Uint(CONVERSATION))?;
+    let it = match space.succeeds() {
+        None => n.created_in == space.id(),
+        Some(_) => state.is_carried(&n.id),
+    };
+    it.then_some(n.id)
 }
 
 /// The messages of a relationship space, in log order, which every device

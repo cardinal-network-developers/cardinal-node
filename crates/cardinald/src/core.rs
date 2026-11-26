@@ -22,7 +22,7 @@ use crate::paths::Paths;
 mod succession;
 #[cfg(test)]
 use succession::ops_hash;
-pub use succession::{undo_named, Notes, Succeeded, Undo};
+pub use succession::{undo_named, LastCall, Notes, Succeeded, Undo};
 
 /// The account-space secret holding the discovery secret.
 pub const DISCOVERY_PURPOSE: &str = "discovery";
@@ -639,12 +639,57 @@ pub struct Holder {
     /// What this device noted of following and posting again here.
     notes: Notes,
     notes_at: PathBuf,
+    /// How many times the notes were changed here, and the newest change
+    /// written to disk: a write made outside the core's lock ([`NotesSave`])
+    /// never puts an older copy over a newer one.
+    notes_gen: u64,
+    notes_written: Arc<std::sync::Mutex<u64>>,
     /// The entries of the space this one succeeds that its initial state
     /// carried, worked out when first asked.
     carried: Option<std::collections::HashSet<EntryId>>,
     /// The initial state this successor waits for while it is not here:
     /// its profile, the space it succeeds, and the blob reference.
     wants_initial: Option<(Profile, Option<SpaceId>, Record)>,
+}
+
+/// A space's notes, to be written to disk where nothing waits on it, as
+/// outside the core's lock: a copy older than one written already is not
+/// written.
+pub struct NotesSave {
+    space: SpaceId,
+    at: PathBuf,
+    bytes: Result<Vec<u8>, String>,
+    gen: u64,
+    written: Arc<std::sync::Mutex<u64>>,
+}
+
+impl NotesSave {
+    /// Writes the notes, unless newer ones were written already.
+    pub fn write(self) {
+        let mut written = self.written.lock().unwrap_or_else(|e| e.into_inner());
+        if *written >= self.gen {
+            return;
+        }
+        let saved = self
+            .bytes
+            .map_err(std::io::Error::other)
+            .and_then(|bytes| crate::paths::write_private(&self.at, &bytes, 0o600));
+        match saved {
+            Ok(()) => *written = self.gen,
+            Err(e) => tracing::warn!("space {}: keeping its notes: {e}", short(&self.space)),
+        }
+    }
+
+    /// Writes the notes on a thread for blocking work, where there is a
+    /// runtime to give one, and else at once.
+    pub fn write_later(self) {
+        match tokio::runtime::Handle::try_current() {
+            Ok(rt) => {
+                rt.spawn_blocking(move || self.write());
+            }
+            Err(_) => self.write(),
+        }
+    }
 }
 
 /// What ingesting objects did.
@@ -702,6 +747,8 @@ impl Holder {
             initial_at: Self::dir(paths, &id).join("initial-state.bin"),
             notes: Notes::default(),
             notes_at: Self::dir(paths, &id).join("succession.json"),
+            notes_gen: 0,
+            notes_written: Arc::new(std::sync::Mutex::new(0)),
             carried: None,
             wants_initial: None,
         };
@@ -849,12 +896,20 @@ impl Holder {
     }
 
     fn save_notes(&mut self) {
+        self.notes_to_save().write();
+    }
+
+    /// The notes as they are now, to be written: by [`NotesSave::write`],
+    /// which may run once the core's lock is let go.
+    fn notes_to_save(&mut self) -> NotesSave {
         self.version += 1;
-        let saved = serde_json::to_vec(&self.notes)
-            .map_err(std::io::Error::other)
-            .and_then(|bytes| crate::paths::write_private(&self.notes_at, &bytes, 0o600));
-        if let Err(e) = saved {
-            tracing::warn!("space {}: keeping its notes: {e}", short(&self.id));
+        self.notes_gen += 1;
+        NotesSave {
+            space: self.id,
+            at: self.notes_at.clone(),
+            bytes: serde_json::to_vec(&self.notes).map_err(|e| e.to_string()),
+            gen: self.notes_gen,
+            written: self.notes_written.clone(),
         }
     }
 
@@ -2533,12 +2588,18 @@ impl Core {
                 v.push(o.space);
             }
         }
-        // The other members' logs, for what they write to be judged.
-        v.extend(
-            self.members_shared_with(identity)
-                .iter()
-                .map(identity_log_label),
-        );
+        // The other members' logs, for what they write to be judged; and
+        // with a group only offered, the logs of everyone it names.
+        for m in self
+            .members_shared_with(identity)
+            .into_iter()
+            .chain(self.offer_logs(identity))
+        {
+            let l = identity_log_label(&m);
+            if !v.contains(&l) {
+                v.push(l);
+            }
+        }
         v
     }
 
@@ -2750,6 +2811,21 @@ impl Core {
         me_as: &str,
         members: &[([u8; 32], String)],
     ) -> anyhow::Result<SpaceId> {
+        self.create_group_with(name, me_as, members, false, true)
+    }
+
+    /// [`Core::create_group`], and with `for_call` one made for a call (its
+    /// genesis creates the conversation node with field 3 true), and with
+    /// `history` false one whose policy does not share its history with
+    /// those added later (`profiles.md#a-group-made-for-a-call`).
+    pub fn create_group_with(
+        &mut self,
+        name: &str,
+        me_as: &str,
+        members: &[([u8; 32], String)],
+        for_call: bool,
+        history: bool,
+    ) -> anyhow::Result<SpaceId> {
         use cardinal_space::group;
         let ident = self
             .identity
@@ -2762,7 +2838,7 @@ impl Core {
             .public_key()
             .clone();
         let mut keys = vec![mine];
-        let mut ops = group::genesis_ops(ident.id(), name);
+        let mut ops = group::genesis_ops_for(ident.id(), name, for_call);
         for (who, _) in members {
             keys.push(self.encryption_key_of(who)?);
             ops.push(SpaceOp::add_member(*who, group::WRITER));
@@ -2774,7 +2850,10 @@ impl Core {
         let refs: Vec<&HybridPublicKey> = keys.iter().collect();
         let (space, sealed) = Space::create_with(
             group::GROUP,
-            cardinal_space::Policy::default(),
+            cardinal_space::Policy {
+                history_shared: history,
+                ..cardinal_space::Policy::default()
+            },
             &ident.log,
             &self.keys.device.signing,
             &refs,
@@ -2966,6 +3045,60 @@ impl Core {
             for m in sp.validity().identities() {
                 if m != *identity && Some(m) != me && !out.contains(&m) {
                     out.push(m);
+                }
+            }
+        }
+        out
+    }
+
+    /// The identities whose logs go between this person and `contact` with
+    /// a group only offered (`spaces.md#holding-a-space`,
+    /// `profiles.md#group`): everyone the entries name of each group
+    /// `contact` offered this person, held here, and not joined or declined;
+    /// and of each group held here that this person offered `contact`. Not
+    /// the two of them, and nothing of any other space.
+    pub fn offer_logs(&self, contact: &[u8; 32]) -> Vec<[u8; 32]> {
+        let Some(me) = self.me() else {
+            return Vec::new();
+        };
+        let contacts = self.contacts();
+        let Some(c) = contacts
+            .iter()
+            .find(|c| c.identity == *contact && !c.refused && c.recovery_of.is_none())
+        else {
+            return Vec::new();
+        };
+        let Some(rel) = self.spaces.get(&c.space).and_then(|h| h.space.as_ref()) else {
+            return Vec::new();
+        };
+        let declined = self.declined();
+        let mut groups: Vec<SpaceId> = Vec::new();
+        for o in cardinal_space::group::offers(rel.state()) {
+            let taking = o.from == *contact;
+            if !(taking || o.from == me) || declined.contains(&o.space) {
+                continue;
+            }
+            // an offer of a group is an offer of the group that succeeds it
+            for g in [o.space, self.current(&o.space)] {
+                if taking && self.is_joined(&g) {
+                    continue;
+                }
+                if !groups.contains(&g) {
+                    groups.push(g);
+                }
+            }
+        }
+        let mut out: Vec<[u8; 32]> = Vec::new();
+        for g in groups {
+            let Some(sp) = self.spaces.get(&g).and_then(|h| h.space.as_ref()) else {
+                continue;
+            };
+            if sp.profile() != cardinal_space::group::GROUP {
+                continue;
+            }
+            for w in sp.named_identities() {
+                if w != me && w != *contact && !out.contains(&w) {
+                    out.push(w);
                 }
             }
         }

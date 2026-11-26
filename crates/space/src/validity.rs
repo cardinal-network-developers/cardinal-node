@@ -1384,6 +1384,12 @@ impl Judge {
         })
     }
 
+    /// Whether the genesis, well formed, names `who` as a member.
+    pub fn genesis_names(&self, who: &IdentityId) -> bool {
+        let g = self.genesis.as_ref().filter(|g| g.formed);
+        g.is_some_and(|g| g.top.contains_key(who))
+    }
+
     /// Every `leave` `who` wrote, valid or not, in the order they arrived.
     pub fn leaves_of(&self, who: &IdentityId) -> &[EntryId] {
         self.leaves.get(who).map_or(&[][..], |v| v.as_slice())

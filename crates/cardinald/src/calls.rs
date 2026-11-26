@@ -91,6 +91,23 @@ const DECLINED_ELSEWHERE: u64 = 2;
 /// said no: their other devices' ringing then ends as unanswered.
 const BUSY: u64 = 3;
 
+/// A `3:` that is not a number: none of the numbers any signal names.
+const NOT_A_NUMBER: u64 = u64::MAX;
+/// On a `ring` in a group, `3:` 1: for the devices it is sent to and nobody
+/// else, never passed on (`profiles.md#calls-guidance`, Ringing some).
+const FOR_SOME: u64 = 1;
+
+/// What a `ring` in a group is, by its `3:`: `Some(false)` one for the
+/// whole group, `Some(true)` one for some only, and `None` one with any
+/// other `3:`, which is ignored.
+fn ring_kind(sig: &Signal) -> Option<bool> {
+    match sig.flag {
+        None => Some(false),
+        Some(FOR_SOME) => Some(true),
+        Some(_) => None,
+    }
+}
+
 /// Turns a ring away as busy.
 async fn busy(s: &Session, space: &SpaceId, id: &[u8; 16]) -> anyhow::Result<()> {
     let end = Signal {
@@ -210,6 +227,9 @@ pub struct Call {
     /// Between two people, when the other side last said its camera is on;
     /// `None` while it is off, or was not said again in time.
     their_camera: Option<Instant>,
+    /// In a group, who rang this device: known only once a `ring` for the
+    /// call came from one of the caller's own devices.
+    caller: Option<[u8; 32]>,
 }
 
 impl Call {
@@ -238,6 +258,7 @@ impl Call {
             viewport: None,
             camera: false,
             their_camera: None,
+            caller: None,
         }
     }
 
@@ -250,14 +271,31 @@ impl Call {
 /// it ended kept for whoever looks.
 fn finished(d: &Daemon, call: &Call, how: Ending) {
     call.close();
+    let at = crate::core::now_ms();
     let ended = json!({
         "id": hex::encode(call.id),
         "who": hex::encode(&call.who[..8]),
         "name": call.name,
         "group": call.group.then(|| hex::encode(call.space)),
         "how": how.name(),
+        "at": at,
     });
     *d.call_ended.lock().unwrap_or_else(|e| e.into_inner()) = Some(ended);
+    // A group's last call, kept on this device for itself (D92).
+    if call.group {
+        let last = crate::core::LastCall {
+            id: hex::encode(call.id),
+            who: hex::encode(&call.who[..8]),
+            name: call.name.clone(),
+            how: how.name().to_owned(),
+            at,
+        };
+        // written outside the core's lock, and off this task
+        let save = d.core().note_last_call(&call.space, last);
+        if let Some(save) = save {
+            save.write_later();
+        }
+    }
     d.bump();
 }
 
@@ -289,6 +327,10 @@ pub struct Group {
     next: u32,
     /// Its person called, and nobody else is on it yet.
     waiting: bool,
+    /// The devices this one rang for the call, by their link key, each
+    /// with the session it was rung on: told when its person gives up
+    /// (`profiles.md#calls-guidance`, A caller who gives up).
+    rang: HashMap<[u8; 32], Session>,
     /// When each session was last asked to link, by handshake.
     asked: HashMap<[u8; 32], Instant>,
     /// When each session was last answered on a link it already had.
@@ -525,7 +567,8 @@ impl Signal {
             kind: r.get(0)?.as_uint()?,
             space: r.get(1)?.as_bytes()?.try_into().ok()?,
             id: r.get(2)?.as_bytes()?.try_into().ok()?,
-            flag: r.get(3).and_then(|f| f.as_uint()),
+            // one that is not a number is none of the numbers a kind has
+            flag: r.get(3).map(|f| f.as_uint().unwrap_or(NOT_A_NUMBER)),
             caller: r
                 .get(4)
                 .and_then(|c| c.as_bytes())
@@ -592,9 +635,14 @@ async fn send(s: &Session, signal: &Signal) -> anyhow::Result<()> {
 
 /// Ends a call that has run out of time, if it is still that call.
 fn ring_out(d: &Arc<Daemon>, id: [u8; 16]) {
+    ring_out_after(d, id, RINGS_FOR);
+}
+
+/// [`ring_out`], after `rings_for`.
+fn ring_out_after(d: &Arc<Daemon>, id: [u8; 16], rings_for: Duration) {
     let d = d.clone();
     tokio::spawn(async move {
-        tokio::time::sleep(RINGS_FOR).await;
+        tokio::time::sleep(rings_for).await;
         let unanswered = lock(&d)
             .as_ref()
             .is_some_and(|c| c.id == id && c.standing != Standing::Live);
@@ -666,7 +714,9 @@ pub async fn start(
     };
     if let Some(old) = gave_way {
         finished(d, &old, self::gave_way(&old));
-        if let Some(s) = &old.session {
+        // A ring in a group is said no to by nothing sent: there may be
+        // nothing the person accepted there to say it in.
+        if let Some(s) = old.session.as_ref().filter(|_| !old.group) {
             let _ = tell(s, END, &old.space, &old.id).await;
         }
     }
@@ -718,7 +768,32 @@ async fn ring_where_found(
 /// Takes the call that is ringing here; on a call already live between two
 /// people, changes what this device takes of what was offered
 /// ([`answer_again`]).
-pub async fn answer(d: &Arc<Daemon>, formats: Option<Vec<Format>>) -> anyhow::Result<Json> {
+///
+/// In a group only offered to this person, answering joins it first, as
+/// `group-join` does, with `reach` their answer about their hosts, and only
+/// with `join` true, their word that answering joins it: consent to join is
+/// said, not implied. Every condition that let the call ring there is
+/// looked at again first (`profiles.md#calls-guidance`, "Someone only
+/// offered the group"); where any no longer holds, or the group cannot be
+/// joined, as when the answer about hosts is needed and not given, nothing
+/// is written and nothing is joined. `reach` and `join` are refused for a
+/// call between two people, and change nothing in a group joined already.
+pub async fn answer(
+    d: &Arc<Daemon>,
+    formats: Option<Vec<Format>>,
+    reach: Option<bool>,
+    join_too: Option<bool>,
+) -> anyhow::Result<Json> {
+    let two = lock(d).as_ref().is_some_and(|c| !c.group);
+    anyhow::ensure!(
+        !(two && reach.is_some()),
+        "`reach` is for a call in a group: a call between two people joins nothing"
+    );
+    anyhow::ensure!(
+        !(two && join_too.is_some()),
+        "`join` is for a call that rings in a group only offered to you: a call between two \
+         people joins nothing"
+    );
     let live = lock(d)
         .as_ref()
         .is_some_and(|c| c.standing == Standing::Live && !c.group);
@@ -728,12 +803,42 @@ pub async fn answer(d: &Arc<Daemon>, formats: Option<Vec<Format>>) -> anyhow::Re
     let group = lock(d)
         .as_ref()
         .filter(|c| c.standing == Standing::Ringing && c.group)
-        .map(|c| (c.space, c.id));
-    if let Some((space, id)) = group {
-        if let Some(c) = lock(d).as_mut() {
-            c.standing = Standing::Live;
-            c.live_since = Some(Instant::now());
+        .map(|c| (c.space, c.id, c.caller, c.name.clone()));
+    if let Some((space, id, caller, name)) = group {
+        // Answering is accepting the group: joined first, or not answered.
+        if crate::groups::only_offered(d, &space) {
+            anyhow::ensure!(
+                join_too == Some(true),
+                "answering this call adds you to {name}: say so with `join`. Nothing was \
+                 written, and the call goes on ringing"
+            );
+            let still =
+                caller.is_some_and(|c| crate::groups::offered_ring(d, &space, &c).is_some());
+            if !still {
+                offered_ring_still(d);
+                anyhow::bail!(
+                    "{name} can no longer be joined by answering this call, so it was not \
+                     answered and nothing was written"
+                );
+            }
+            crate::groups::join_exact(d, &space, reach).await?;
         }
+        // In a group joined already, as when another of this person's
+        // devices joined it meanwhile, `join` and `reach` change nothing.
+        let still = {
+            let mut call = lock(d);
+            match call.as_mut().filter(|c| {
+                c.id == id && c.space == space && c.group && c.standing == Standing::Ringing
+            }) {
+                Some(c) => {
+                    c.standing = Standing::Live;
+                    c.live_since = Some(Instant::now());
+                    true
+                }
+                None => false,
+            }
+        };
+        anyhow::ensure!(still, "that call has stopped ringing");
         take_part(d, id, space, false);
         d.bump();
         relink(d, &id, &space, true).await;
@@ -843,6 +948,7 @@ async fn end_call(d: &Arc<Daemon>, may_carry: bool, timed_out: bool) -> anyhow::
         if call.standing == Standing::Ringing {
             return Ok(json!({}));
         }
+        gave_up(d, &call).await;
         let carry_on = may_carry
             && d.conditions.helps()
             && groups(d).get(&call.id).is_some_and(|g| g.tree.links() >= 2);
@@ -872,6 +978,57 @@ async fn end_call(d: &Arc<Daemon>, may_carry: bool, timed_out: bool) -> anyhow::
         let _ = tell(&s, END, &call.space, &call.id).await;
     }
     Ok(json!({}))
+}
+
+/// A caller who leaves group call `call` having heard nobody else on it
+/// tells each device it rang, with an `end` with no `3:`, so that they stop
+/// ringing (`profiles.md#calls-guidance`, A caller who gives up). Where
+/// someone else was heard, leaving ends nothing for those still ringing.
+async fn gave_up(d: &Daemon, call: &Call) {
+    let rang: Vec<Session> = {
+        let gs = groups(d);
+        match gs.get(&call.id) {
+            Some(g) if g.waiting => g.rang.values().cloned().collect(),
+            _ => Vec::new(),
+        }
+    };
+    for s in rang {
+        let _ = tokio::time::timeout(SIGNAL_WITHIN, tell(&s, END, &call.space, &call.id)).await;
+    }
+}
+
+/// A ringing device takes an `end` for group call `id` from `them` as its
+/// caller giving up only where `them` is who rang it, from one of their own
+/// devices: the call is then one nobody answered. A ring kept for it is
+/// dropped. An `end` from anyone else stops no ringing.
+fn caller_gave_up(d: &Daemon, from: &Session, them: &[u8; 32], space: &SpaceId, id: &[u8; 16]) {
+    drop_after_call(d, them, space, id);
+    {
+        let mut kept = d.kept_rings.lock().unwrap_or_else(|e| e.into_inner());
+        if kept
+            .get(them)
+            .is_some_and(|k| k.id == *id && k.space == *space)
+        {
+            kept.remove(them);
+        }
+    }
+    let theirs = lock(d).as_ref().is_some_and(|c| {
+        c.id == *id
+            && c.group
+            && c.space == *space
+            && c.standing == Standing::Ringing
+            && c.caller == Some(*them)
+    });
+    // A device that carries the call and hears others on it takes the
+    // `end` as the caller leaving a call going on, which ends nothing.
+    let sender = from.peer_identity().map(|p| mesh::voice_of(&p.signing_key));
+    let others = groups(d).get(id).is_some_and(|g| match &sender {
+        Some(v) => g.tree.others_but(v, Instant::now()) >= 1,
+        None => g.tree.others(Instant::now()) >= 1,
+    });
+    if theirs && !others {
+        forget(d, id, Ending::Missed);
+    }
 }
 
 /// Forgets a call that has ended by itself.
@@ -1053,7 +1210,7 @@ pub fn current(d: &Daemon) -> Json {
             )
         })
     };
-    let (who, name, standing, seconds, space, group, id) = {
+    let (who, name, standing, seconds, space, group, id, caller) = {
         let call = lock(d);
         let Some(c) = call.as_ref() else {
             return json!({"call": null, "ended": ended});
@@ -1071,6 +1228,7 @@ pub fn current(d: &Daemon) -> Json {
             c.space,
             c.group,
             c.id,
+            c.caller,
         )
     };
     let (linked, people, frames, heard, cameras) = if group {
@@ -1104,7 +1262,7 @@ pub fn current(d: &Daemon) -> Json {
         let c = contacts.into_iter().find(|c| c.identity == who);
         c.and_then(|c| crate::names::shown(d, &c).remove("picture"))
     };
-    json!({"call": {
+    let mut call = json!({
         "id": hex::encode(id),
         "who": hex::encode(&who[..8]),
         "name": name,
@@ -1120,7 +1278,21 @@ pub fn current(d: &Daemon) -> Json {
         "taken": taken,
         "they_take": they_take,
         "camera": camera,
-    }, "ended": ended})
+    });
+    // In a group: its name, whether it was made for a call, who looks after
+    // it, who rang, and whether answering joins it (D92, D93).
+    if group {
+        let about = crate::groups::call_json(d, &space, caller.as_ref());
+        if let Some(about) = about.as_object() {
+            for (k, v) in about {
+                if k == "name" && v.as_str().is_some_and(str::is_empty) {
+                    continue;
+                }
+                call[k] = v.clone();
+            }
+        }
+    }
+    json!({"call": call, "ended": ended})
 }
 
 /// Who each voice heard on a group call is, as this person knows them:
@@ -1203,8 +1375,42 @@ fn someone_on(g: &Group, now: Instant) -> bool {
 /// Rings a group: each member device this one has a session with, and
 /// each of those passes the ring on to theirs. If a call with someone on it
 /// is going on in it already, that is the one this person joins.
-pub async fn start_group(d: &Arc<Daemon>, group: &str) -> anyhow::Result<Json> {
+///
+/// With `ring`, only those members are rung, with a `ring` for some that
+/// nobody passes on (`profiles.md#calls-guidance`, Ringing some): into the
+/// group's call where this person is on it already, and otherwise into the
+/// call this starts or joins. Each must be a member who has not left, not
+/// this person, and their contact; where any is not, nobody is rung.
+pub async fn start_group(
+    d: &Arc<Daemon>,
+    group: &str,
+    ring: Option<&[String]>,
+) -> anyhow::Result<Json> {
     let (space, name) = crate::groups::joined_group(d, group)?;
+    let some = match ring {
+        Some(named) => Some(crate::groups::to_ring(d, &space, named)?),
+        None => None,
+    };
+    // On the group's call already: those named are rung into it.
+    let on_it = lock(d)
+        .as_ref()
+        .filter(|c| c.group && c.space == space && c.standing != Standing::Ringing)
+        .map(|c| c.id);
+    if let Some(id) = on_it {
+        if let Some(named) = some {
+            ring_some(d, space, id, named);
+            return Ok(json!({}));
+        }
+    }
+    // Refused before anything is touched: the call this person is on, or
+    // the one they are calling alone, keeps its routing.
+    {
+        let held = lock(d);
+        let ringing = held
+            .as_ref()
+            .is_some_and(|c| c.standing == Standing::Ringing);
+        anyhow::ensure!(held.is_none() || ringing, "you are already on a call");
+    }
     let now = Instant::now();
     let (going, stale) = {
         let gs = groups(d);
@@ -1225,10 +1431,15 @@ pub async fn start_group(d: &Arc<Daemon>, group: &str) -> anyhow::Result<Json> {
         leave(d, &old).await;
     }
     let theirs = crate::groups::member_sessions(d, &space);
-    anyhow::ensure!(
-        going.is_some() || !theirs.is_empty(),
-        "nobody in {name} can be reached right now"
-    );
+    // Ringing some is refused only as the specification says
+    // (`apps.md`, `call-start`): those not reachable now are looked for
+    // once the request has been answered.
+    if some.is_none() {
+        anyhow::ensure!(
+            going.is_some() || !theirs.is_empty(),
+            "nobody in {name} can be reached right now"
+        );
+    }
     let id = going.unwrap_or_else(cardinal_crypto::random_bytes);
     let mut call = Call::new(id, space, name, space, Standing::Calling, None);
     call.group = true;
@@ -1236,26 +1447,36 @@ pub async fn start_group(d: &Arc<Daemon>, group: &str) -> anyhow::Result<Json> {
         call.standing = Standing::Live;
         call.live_since = Some(Instant::now());
     }
-    {
+    let gave = {
         let mut held = lock(d);
         let ringing = held
             .as_ref()
             .is_some_and(|c| c.standing == Standing::Ringing);
         anyhow::ensure!(held.is_none() || ringing, "you are already on a call");
-        if let Some(old) = held.replace(call) {
-            finished(d, &old, gave_way(&old));
-        }
+        held.replace(call)
+    };
+    if let Some(old) = gave {
+        finished(d, &old, gave_way(&old));
     }
     take_part(d, id, space, going.is_none());
     d.bump();
     if going.is_some() {
         relink(d, &id, &space, true).await;
+        if let Some(named) = some {
+            ring_some(d, space, id, named);
+        }
         return Ok(json!({}));
     }
     let me = contacts::identity(d).ok();
     remember(&d.rung_calls, id);
     remember(&d.passed_rings, id);
+    if let Some(named) = some {
+        ring_some(d, space, id, named);
+        ring_out(d, id);
+        return Ok(json!({}));
+    }
     for s in &theirs {
+        rang_on(d, &id, s);
         let ring = Signal {
             kind: RING,
             space,
@@ -1270,6 +1491,81 @@ pub async fn start_group(d: &Arc<Daemon>, group: &str) -> anyhow::Result<Json> {
     }
     ring_out(d, id);
     Ok(json!({}))
+}
+
+/// Rings `named` into group call `id` with a `ring` for some, once to each
+/// of their devices for this asking, on one session however many it has
+/// with that device (`profiles.md#calls-guidance`, Ringing some). Nothing
+/// waits on it: those with a session are rung at once, and each named who
+/// has none is looked for meanwhile, without holding the request. Before
+/// each ring goes out, the call is checked to be still this person's.
+fn ring_some(d: &Arc<Daemon>, space: SpaceId, id: [u8; 16], named: Vec<ContactRecord>) {
+    let sent = Arc::new(std::sync::Mutex::new(std::collections::HashSet::new()));
+    for c in named {
+        let (d, sent) = (d.clone(), sent.clone());
+        tokio::spawn(async move {
+            let now = d.sessions_of(&c.identity);
+            if !now.is_empty() || !c.connects() {
+                send_some(&d, space, id, &now, &sent).await;
+                return;
+            }
+            crate::rendezvous::reach_now(&d, c.identity, c.space).await;
+            send_some(&d, space, id, &d.sessions_of(&c.identity), &sent).await;
+        });
+    }
+}
+
+/// Whether group call `id` in `space` is still the call this person made or
+/// is on: a ring for it goes out only then.
+fn still_mine(d: &Daemon, space: &SpaceId, id: &[u8; 16]) -> bool {
+    lock(d).as_ref().is_some_and(|c| {
+        c.id == *id && c.group && c.space == *space && c.standing != Standing::Ringing
+    })
+}
+
+/// Sends a `ring` for some, `3:` 1, naming this person as the caller, on
+/// one of `sessions` for each device, where none was sent to that device
+/// for this asking (`sent`, by link key).
+async fn send_some(
+    d: &Arc<Daemon>,
+    space: SpaceId,
+    id: [u8; 16],
+    sessions: &[Session],
+    sent: &std::sync::Mutex<std::collections::HashSet<[u8; 32]>>,
+) {
+    let me = contacts::identity(d).ok();
+    for s in sessions {
+        if !still_mine(d, &space, &id) {
+            return;
+        }
+        let first = sent
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(s.peer_static());
+        if !first {
+            continue;
+        }
+        let ring = Signal {
+            kind: RING,
+            space,
+            id,
+            flag: Some(FOR_SOME),
+            caller: me,
+            formats: None,
+        };
+        rang_on(d, &id, s);
+        let sent = tokio::time::timeout(SIGNAL_WITHIN, send(s, &ring)).await;
+        if let Ok(Err(e)) = sent {
+            tracing::debug!("ringing: {e:#}");
+        }
+    }
+}
+
+/// Notes that this device rang a device for group call `id` on `s`.
+fn rang_on(d: &Daemon, id: &[u8; 16], s: &Session) {
+    if let Some(g) = groups(d).get_mut(id) {
+        g.rang.insert(s.peer_static(), s.clone());
+    }
 }
 
 /// Remembers a call among the last few; whether it was there already.
@@ -1314,6 +1610,7 @@ fn new_group(space: SpaceId, own: Option<Voice>, waiting: bool) -> Group {
         members: std::collections::HashSet::new(),
         next: mesh::first_number(),
         waiting,
+        rang: HashMap::new(),
         asked: HashMap::new(),
         answered: HashMap::new(),
         thin_since: None,
@@ -1641,6 +1938,14 @@ async fn group_signal(
     let now = Instant::now();
     match kind {
         RING => {
+            // A `3:` other than 1 makes the ring ignored; one for some is
+            // taken only from a device of the caller it names.
+            let Some(some) = ring_kind(&sig) else {
+                return Ok(());
+            };
+            if some && sig.caller != Some(them) {
+                return Ok(());
+            }
             // Rings from one member, passed on or not, only so often.
             if !own_device && !may_ring(d, &them) {
                 return Ok(());
@@ -1666,8 +1971,8 @@ async fn group_signal(
                 return Ok(());
             }
             // Passed on once, to the members only this device reaches,
-            // whether or not it rings here.
-            if !remember(&d.passed_rings, id) {
+            // whether or not it rings here; one for some, never.
+            if !some && !remember(&d.passed_rings, id) {
                 for other in crate::groups::member_sessions(d, &space) {
                     if other.peer_static() != s.peer_static() {
                         let on = Signal {
@@ -1687,29 +1992,20 @@ async fn group_signal(
             if mine {
                 remember(&d.rung_calls, id);
             } else {
+                // Who rang is known only from the caller's own device: one
+                // that passed the ring on could name anyone.
+                let caller = sig.caller.filter(|c| *c == them && !own_device);
                 // Rung once for a call is enough: it can come again by
-                // another member, after this person said no.
-                let rang_before = d
-                    .rung_calls
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .contains(&id);
-                let fresh = !rang_before && {
-                    let mut call = lock(d);
-                    if call.is_some() {
-                        false
-                    } else {
-                        let mut c =
-                            Call::new(id, space, name, space, Standing::Ringing, Some(s.clone()));
-                        c.group = true;
-                        *call = Some(c);
-                        true
-                    }
-                };
-                if fresh {
-                    remember(&d.rung_calls, id);
-                    d.bump();
-                    ring_out(d, id);
+                // another member, after this person said no. A ring for
+                // some is its caller asking, each time.
+                let rang_before = !some
+                    && d.rung_calls
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .contains(&id);
+                let rings = !rang_before && ring_here(d, s, id, space, name, caller, RINGS_FOR);
+                if !rings && caller.is_some() {
+                    caller_known(d, &id, caller);
                 }
             }
             maybe_carry(d, id, space).await;
@@ -1801,6 +2097,9 @@ async fn group_signal(
             d.bump();
         }
         END => {
+            if !own_device {
+                caller_gave_up(d, s, &them, &space, &id);
+            }
             {
                 let mut gs = groups(d);
                 if let Some(g) = gs.get_mut(&id) {
@@ -1863,6 +2162,322 @@ async fn group_signal(
         _ => {}
     }
     Ok(())
+}
+
+/// The ring kept on a device on a call between two, from the person it is
+/// on that call with, until that call ends (`profiles.md#calls-guidance`,
+/// "A ring that comes before a call has ended"): only the last one, told
+/// from those it replaced by how many came before it.
+#[derive(Default)]
+pub struct AfterCall {
+    count: u64,
+    kept: Option<([u8; 16], SpaceId, [u8; 32])>,
+}
+
+/// Rings here for group call `id`, for `rings_for`, if no call is held:
+/// whether it does. Where the call held is one between this person and
+/// `caller`, rung from `caller`'s own device, it is the call they are
+/// ending: the ring is kept, the last such one alone, until that call ends,
+/// and rings then for what is left of `rings_for`; where the call has not
+/// ended by then, it is dropped and nothing rings. Kept counts as ringing.
+fn ring_here(
+    d: &Arc<Daemon>,
+    s: &Session,
+    id: [u8; 16],
+    space: SpaceId,
+    name: String,
+    caller: Option<[u8; 32]>,
+    rings_for: Duration,
+) -> bool {
+    let ending = {
+        let call = lock(d);
+        call.as_ref()
+            .filter(|c| !c.group && caller.is_some_and(|w| c.who == w))
+            .map(|c| c.over.subscribe())
+    };
+    let (Some(mut over), Some(them)) = (ending, caller) else {
+        return ring_now(d, s, id, space, name, caller, rings_for);
+    };
+    let mine = {
+        let mut after = d.after_call.lock().unwrap_or_else(|e| e.into_inner());
+        after.count += 1;
+        after.kept = Some((id, space, them));
+        after.count
+    };
+    let (d, s) = (d.clone(), s.clone());
+    tokio::spawn(async move {
+        let began = Instant::now();
+        let ended = tokio::time::timeout(rings_for, over.wait_for(|o| *o)).await;
+        let left = rings_for.saturating_sub(began.elapsed());
+        // still the one kept: not replaced by a later ring, nor dropped by
+        // its caller's `end`
+        let kept = {
+            let mut after = d.after_call.lock().unwrap_or_else(|e| e.into_inner());
+            let still = after.count == mine && after.kept.is_some();
+            if still {
+                after.kept = None;
+            }
+            still
+        };
+        // over, or gone: either way that call is not held now. Whatever let
+        // the ring ring must hold still.
+        let holds = crate::groups::shared_group(&d, &space, &them).is_some()
+            || crate::groups::offered_ring(&d, &space, &them).is_some();
+        if kept && ended.is_ok() && left > Duration::ZERO && holds {
+            ring_now(&d, &s, id, space, name, caller, left);
+        }
+    });
+    true
+}
+
+/// Drops the ring kept until a call between two ends, where it is for
+/// group call `id` in `space` and `them` rang it.
+fn drop_after_call(d: &Daemon, them: &[u8; 32], space: &SpaceId, id: &[u8; 16]) {
+    let mut after = d.after_call.lock().unwrap_or_else(|e| e.into_inner());
+    if after.kept == Some((*id, *space, *them)) {
+        after.kept = None;
+    }
+}
+
+/// [`ring_here`], where nothing is waited for.
+fn ring_now(
+    d: &Arc<Daemon>,
+    s: &Session,
+    id: [u8; 16],
+    space: SpaceId,
+    name: String,
+    caller: Option<[u8; 32]>,
+    rings_for: Duration,
+) -> bool {
+    let fresh = {
+        let mut call = lock(d);
+        if call.is_some() {
+            false
+        } else {
+            let mut c = Call::new(id, space, name, space, Standing::Ringing, Some(s.clone()));
+            c.group = true;
+            c.caller = caller;
+            *call = Some(c);
+            true
+        }
+    };
+    if fresh {
+        remember(&d.rung_calls, id);
+        d.bump();
+        ring_out_after(d, id, rings_for);
+    }
+    fresh
+}
+
+/// Who rang for group call `id` here is known now, from the caller's own
+/// device: a change to `watch`. Only while it rings here: on the device
+/// that made the call, and on one already on it, as one that joined
+/// without being rung, a ring for some from another member changes
+/// nothing (`apps.md`, `call`).
+fn caller_known(d: &Daemon, id: &[u8; 16], caller: Option<[u8; 32]>) {
+    let changed = {
+        let mut call = lock(d);
+        match call.as_mut().filter(|c| {
+            c.id == *id && c.group && c.caller.is_none() && c.standing == Standing::Ringing
+        }) {
+            Some(c) => {
+                c.caller = caller;
+                true
+            }
+            None => false,
+        }
+    };
+    if changed {
+        d.bump();
+    }
+}
+
+/// The person declined group `space` here: a call there that rings stops,
+/// as one they said no to (`profiles.md#calls-guidance`). With `here`
+/// false, the decline came from another of their devices.
+pub(crate) fn stop_ringing_in(d: &Daemon, space: &SpaceId, here: bool) {
+    let ringing = lock(d)
+        .as_ref()
+        .filter(|c| c.group && c.space == *space && c.standing == Standing::Ringing)
+        .map(|c| c.id);
+    if let Some(id) = ringing {
+        let how = match here {
+            true => Ending::Declined,
+            false => Ending::DeclinedElsewhere,
+        };
+        forget(d, &id, how);
+    }
+}
+
+/// A call ringing in a group only offered to this person rings only while
+/// all that let it ring still holds (`profiles.md#calls-guidance`, "Someone
+/// only offered the group"): where the person has declined the group since,
+/// on any device, or whoever rang has left it, or it has ended, it stops.
+/// Looked at whenever something changes.
+fn offered_ring_still(d: &Daemon) {
+    let ringing = lock(d)
+        .as_ref()
+        .filter(|c| c.group && c.standing == Standing::Ringing)
+        .map(|c| (c.id, c.space, c.caller));
+    let Some((id, space, caller)) = ringing else {
+        return;
+    };
+    if !crate::groups::only_offered(d, &space) {
+        return;
+    }
+    let holds = caller.is_some_and(|c| crate::groups::offered_ring(d, &space, &c).is_some());
+    if holds {
+        return;
+    }
+    if d.core().is_declined(&space) {
+        stop_ringing_in(d, &space, false);
+    } else {
+        forget(d, &id, Ending::Missed);
+    }
+}
+
+/// A ring kept for a group offered to this person, until the offer has
+/// come and the group opened (`profiles.md#calls-guidance`).
+pub struct Kept {
+    space: SpaceId,
+    id: [u8; 16],
+    some: bool,
+    session: Session,
+    at: Instant,
+}
+
+/// A signal about a call in a group this person has been offered and has
+/// not accepted, from `them`, the contact who offered it: only their
+/// `ring` reaches the person, and only from a device of theirs, naming
+/// them as its caller. Nothing is passed on, linked or carried.
+async fn offered_signal(
+    d: &Arc<Daemon>,
+    s: &Session,
+    them: [u8; 32],
+    sig: Signal,
+    name: String,
+) -> anyhow::Result<()> {
+    if sig.kind == END {
+        caller_gave_up(d, s, &them, &sig.space, &sig.id);
+        return Ok(());
+    }
+    if sig.kind != RING {
+        return Ok(());
+    }
+    let Some(some) = ring_kind(&sig) else {
+        return Ok(());
+    };
+    if sig.caller != Some(them) || !may_ring(d, &them) {
+        return Ok(());
+    }
+    offered_ring_here(d, s, them, sig.space, sig.id, some, name, RINGS_FOR);
+    Ok(())
+}
+
+/// Rings for a call in a group only offered to this person, rung by `them`
+/// who offered it.
+#[allow(clippy::too_many_arguments)]
+fn offered_ring_here(
+    d: &Arc<Daemon>,
+    s: &Session,
+    them: [u8; 32],
+    space: SpaceId,
+    id: [u8; 16],
+    some: bool,
+    name: String,
+    rings_for: Duration,
+) {
+    let rang_before = !some
+        && d.rung_calls
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains(&id);
+    if !rang_before && !ring_here(d, s, id, space, name, Some(them), rings_for) {
+        caller_known(d, &id, Some(them));
+    }
+}
+
+/// Keeps a `ring` from a contact for a group not yet offered here, or not
+/// yet open: the last from each, for as long as a call rings. Whether it
+/// was one to keep.
+fn keep(d: &Daemon, s: &Session, them: [u8; 32], sig: &Signal) -> bool {
+    let Some(some) = (sig.kind == RING).then(|| ring_kind(sig)).flatten() else {
+        return false;
+    };
+    if sig.caller != Some(them) || !crate::groups::may_be_offered(d, &sig.space, &them) {
+        return false;
+    }
+    if !may_ring(d, &them) {
+        return true;
+    }
+    let kept = Kept {
+        space: sig.space,
+        id: sig.id,
+        some,
+        session: s.clone(),
+        at: Instant::now(),
+    };
+    d.kept_rings
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(them, kept);
+    d.bump();
+    true
+}
+
+/// Rings each kept ring once the rest holds: its offer has come, and its
+/// group has opened showing both as members. Looked at whenever something
+/// changes, and each is let go once it has rung as long as a call rings.
+pub fn ring_kept(d: Arc<Daemon>) {
+    tokio::spawn(async move {
+        let mut changed = d.changed.subscribe();
+        loop {
+            let waiting = {
+                let mut kept = d.kept_rings.lock().unwrap_or_else(|e| e.into_inner());
+                kept.retain(|_, k| k.at.elapsed() < RINGS_FOR);
+                !kept.is_empty()
+            };
+            let next = if waiting {
+                Duration::from_secs(1)
+            } else {
+                Duration::from_secs(3600)
+            };
+            tokio::select! {
+                c = changed.changed() => if c.is_err() { return },
+                _ = tokio::time::sleep(next) => {}
+            }
+            let all: Vec<([u8; 32], SpaceId)> = d
+                .kept_rings
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .iter()
+                .map(|(w, k)| (*w, k.space))
+                .collect();
+            offered_ring_still(&d);
+            for (them, space) in all {
+                let Some(name) = crate::groups::offered_ring(&d, &space, &them) else {
+                    continue;
+                };
+                // Taken only where it is still the ring for the space just
+                // checked: one kept since in its place waits for its own
+                // check.
+                let k = {
+                    let mut kept = d.kept_rings.lock().unwrap_or_else(|e| e.into_inner());
+                    match kept.get(&them) {
+                        Some(k) if k.space == space => kept.remove(&them),
+                        _ => None,
+                    }
+                };
+                let Some(k) = k else {
+                    continue;
+                };
+                let left = RINGS_FOR.saturating_sub(k.at.elapsed());
+                if left > Duration::ZERO {
+                    offered_ring_here(&d, &k.session, them, k.space, k.id, k.some, name, left);
+                }
+            }
+        }
+    });
 }
 
 /// This person, calling with nobody else on their call yet, joins call
@@ -2565,10 +3180,38 @@ pub async fn serve(d: &Arc<Daemon>, s: &Session, mut st: Stream, v: Value) -> an
     if let Some(name) = crate::groups::shared_group(d, &space, &them) {
         return group_signal(d, s, them, sig, name).await;
     }
+    let own = matches!(d.classify(s), PeerKind::Own(_));
+    // A group only offered to this person: from their own devices, only
+    // that one of them answered (`join`), which stops the ringing here.
+    if own && crate::groups::only_offered(d, &space) {
+        let answered = kind == JOIN && sig.flag != Some(1);
+        if answered
+            && lock(d)
+                .as_ref()
+                .is_some_and(|c| c.id == id && c.space == space && c.standing == Standing::Ringing)
+        {
+            forget(d, &id, Ending::AnsweredElsewhere);
+        }
+        return Ok(());
+    }
+    if !own {
+        if let Some(name) = crate::groups::offered_ring(d, &space, &them) {
+            return offered_signal(d, s, them, sig, name).await;
+        }
+    }
     let contacts = d.core().contacts();
     let found = contacts
         .iter()
         .find(|c| c.identity == them && c.space == space);
+    // A ring from a contact before the offer of its group, or before the
+    // group opened, is kept a while; its caller's `end` drops it.
+    if found.is_none() && !own && keep(d, s, them, &sig) {
+        return Ok(());
+    }
+    if found.is_none() && !own && kind == END {
+        caller_gave_up(d, s, &them, &space, &id);
+        return Ok(());
+    }
     // a recovery's relationship is for the recovery alone (`guardians.rs`)
     let Some(contact) = found.filter(|c| !c.refused && c.recovery_of.is_none()) else {
         st.reset(0);

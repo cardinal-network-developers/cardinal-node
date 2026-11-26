@@ -6,7 +6,7 @@
 use cardinal_encoding::{Record, Value};
 
 use crate::entry::{IdentityId, NodeId, NodeKind, Profile, SpaceId, SpaceOp};
-use crate::relationship::{conversation, CONVERSATION};
+use crate::relationship::{the_conversation as conversation, CONVERSATION};
 use crate::space::Space;
 use crate::state::{Node, State, ROOT};
 
@@ -22,15 +22,52 @@ pub use crate::entry::{ADMIN, OWNER, READER, WRITER};
 /// owner, the conversation, named for the group, and then the members it
 /// starts with.
 pub fn genesis_ops(owner: IdentityId, name: &str) -> Vec<SpaceOp> {
+    genesis_ops_for(owner, name, false)
+}
+
+/// [`genesis_ops`], and with `for_call` a group [made for a
+/// call](`profiles.md#a-group-made-for-a-call`): the conversation node is
+/// created with field 3 true.
+pub fn genesis_ops_for(owner: IdentityId, name: &str, for_call: bool) -> Vec<SpaceOp> {
+    let fields = Record::new().with(1, name);
+    let fields = if for_call {
+        fields.with(FOR_CALL, true)
+    } else {
+        fields
+    };
     vec![
         SpaceOp::add_member(owner, OWNER),
-        SpaceOp::create(
-            NodeKind::Uint(CONVERSATION),
-            ROOT,
-            "conversation",
-            Record::new().with(1, name),
-        ),
+        SpaceOp::create(NodeKind::Uint(CONVERSATION), ROOT, "conversation", fields),
     ]
+}
+
+/// The conversation node's field that says a group was made for a call.
+pub const FOR_CALL: u64 = 3;
+
+/// Whether a group was [made for a call](`profiles.md#a-group-made-for-a-call`):
+/// field 3 of its conversation node holds exactly one value, the group's
+/// own genesis (the entry whose id is the space's) wrote it, and it is the
+/// bool true. Any other write there, by anyone and of any value, a clearing
+/// `set` among them, makes it an ordinary group; and a value a successor
+/// carried was written in another space, so counts for nothing here.
+pub fn for_call(space: &Space) -> bool {
+    let Some(c) = conversation(space) else {
+        return false;
+    };
+    let state = space.state();
+    let Some(n) = state.node(&c) else {
+        return false;
+    };
+    match n.values(FOR_CALL) {
+        [only] => only.entry == space.id() && only.value == Some(Value::from(true)),
+        _ => false,
+    }
+}
+
+/// "Keep this group": field 3 of the conversation node set to false, which
+/// nothing in the group undoes.
+pub fn keep_group(conversation: NodeId) -> SpaceOp {
+    SpaceOp::set(conversation, FOR_CALL, Some(Value::from(false)))
 }
 
 /// `create` of a member node: the name the others see, and whether they are
@@ -171,6 +208,13 @@ pub fn reassert_ops(old: &Space, carried: &State) -> Vec<SpaceOp> {
         }
     }
     let mut ops = Vec::new();
+    // Made for a call at the cut, the successor is one too, by its own
+    // genesis: what it carried there counts for nothing.
+    if for_call(old) {
+        if let Some(c) = conversation(old).filter(|c| carried.node(c).is_some()) {
+            ops.push(SpaceOp::set(c, FOR_CALL, Some(Value::from(true))));
+        }
+    }
     for (n, keys) in fields {
         let Some(there) = carried.node(&n.id) else {
             continue;

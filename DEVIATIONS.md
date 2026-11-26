@@ -1375,8 +1375,9 @@ Readings:
   space steps over what it has no meaning for, with everything beneath
   it: the files view lists only folders, files and links, and only in the
   root or in folders all the way up (`Files::list`, `Files::belongs`); a
-  conversation is a conversation node at the top, a message a message in
-  it, a reaction a reaction under a message; an account's devices,
+  conversation is the conversation node, wherever it has been moved
+  (`profiles.md#relationship`, "Which node is the conversation"), a
+  message a message in it, a reaction a reaction under a message; an account's devices,
   contacts, hosts and spaces are those at the top, and a placement one
   under a space node. An op the profile does not define still puts its
   entry out of the state.
@@ -2396,8 +2397,8 @@ asks for around that is not built yet.
   inviter's after receiving `genesis`.
 - **Spec gap: the conversation is not its creator's alone.** `profiles.md`
   makes messages, reactions and read markers author-owned, but not the
-  conversation node, so a contact can delete or move it, which hides every
-  message until it is restored.
+  conversation node, so a contact can delete it, which hides every
+  message until it is restored. Moved, it is the conversation still.
 - **Groups are made with an owner and writers only.** Nothing makes anyone
   an admin or a reader. A group is offered only
   to the creator's or an admin's contacts, since the offer goes in a
@@ -2504,6 +2505,56 @@ asks for around that is not built yet.
   records the host as a fetcher that never acknowledges, so acknowledgements
   from the owner's other devices free nothing and retention does. Nothing asks
   a host for envelopes yet except itself, which lets go of them one by one.
+### Calls with several people (D92 to D94, `profiles.md#a-group-made-for-a-call`)
+
+Readings chosen where the specification is silent, and what is not built:
+
+- **`last_call` and *call ended* `at`** are milliseconds since 1970 by this
+  device's clock, as a message's `time` is. `last_call` is kept in the
+  space's notes on this device, so it is there for every group this device
+  holds (open or only offered); a ring that came before the group was held
+  never rang, so nothing is lost.
+- **A kept ring** (one for a group not offered yet, or not open) is kept
+  only for a space this person has not joined or declined and does not
+  hold as anything but a group. A ring from a member who did not offer the
+  group is kept too, since the device cannot tell yet that it will never
+  ring, and lapses.
+- **"Fetched from that contact's devices"** is not checked: this device
+  fetches an offered group, and the identity logs of those it names, from
+  whoever offered it and from nobody else, but does not record where the
+  copy it holds came from.
+- **The identity logs that go with an offer** ("everyone the space's
+  entries name", `spaces.md#holding-a-space`) are read from the entries
+  held, judged or not: their authors, whom an `add_member` adds, and whom
+  a successor's genesis says it was judged with (`start` field 8), but not
+  `agent_of`, which is display only. They go between two contacts only for
+  a group one of them offered the other, held, and on the side offered
+  not joined or declined; any other space gives nothing.
+- **"A device on a call between two"**, for a group's ring that comes
+  before that call has ended, is one whose call held is between this
+  person and the caller, whatever it stands at: calling, ringing or live.
+  The kept ring rings only if what let it ring still holds when that call
+  ends.
+- **`ring` names** are resolved as `group-members` names them (a contact's
+  petname, the group's name for a member, or an id). A recovery's
+  relationship is not "a contact" for this purpose: ringing it is refused.
+- **`3:` on a `ring` between two people** is not defined, and is not
+  looked at there.
+- **`call` `caller`**, while the device rings, is set by the first `ring`
+  for the call that came from the caller's own device, even after the
+  device already rang for a ring passed on.
+- **`group-set` `for_call` true** is refused before anything else in the
+  request is looked at, so a name given with it is not written either.
+  `for_call` false on a call group writes `set` field 3 false; on any other
+  group it writes nothing. Only an owner or admin may send it, as the rest
+  of `group-set`.
+- **Not built**: anything in `later.md` "Calls with several people" (a move
+  nobody hears, a move over the live call, ringing a member who is not a
+  contact, who may send what, the note for the one in the middle); leaving
+  a call group by itself, which the specification leaves to software and
+  this service does not do; and what becomes of a call under way when its
+  group is succeeded, beyond noting it for the successor when it ends.
+
 ## Hosts (`spec/hosts.md`)
 
 - **Known paths** (D86, `hosts.md#known-paths`; `known.rs`). The address
