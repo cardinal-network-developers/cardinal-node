@@ -1371,6 +1371,25 @@ typed!(fields MessagesReply {
 });
 asks!(MESSAGES: 34 "messages" MessagesArgs -> MessagesReply, reads, before messages by id);
 
+typed!(fields CallStartArgs {
+    1 who: Option<Reference>,
+    2 group: Option<Reference>,
+    /// Each 32 bytes; another length is refused by the handler, as it was.
+    3 formats: Option<Vec<bytes::Bytes>>,
+    4 format_names: Option<Vec<String>>,
+    5 ring: Option<Vec<Reference>>,
+});
+asks!(CALL_START: 101 "call-start" CallStartArgs -> Done, writes);
+typed!(fields CallAnswerArgs {
+    1 formats: Option<Vec<bytes::Bytes>>,
+    2 format_names: Option<Vec<String>>,
+    3 reach: Option<bool>,
+    4 join: Option<bool>,
+});
+asks!(CALL_ANSWER: 102 "call-answer" CallAnswerArgs -> Done, writes);
+typed!(fields CallEndArgs {});
+asks!(CALL_END: 103 "call-end" CallEndArgs -> Done, writes);
+
 typed!(fields CallArgs {});
 typed!(fields CallReply {
     2 call: Option<Call>,
@@ -1503,11 +1522,9 @@ pub static REQUESTS: &[Request] = &[
     req!(87 "group-rejoin" (1 "group" REF) -> (2 "group" B, 3 "name" T)),
     // ---- Calls and the clipboard: 100 to 119 ----
     CALL_NOW,
-    req!(101 "call-start" (
-        1 "who" REF, 2 "group" REF, 3 "formats" [B], 4 "format_names" [T], 5 "ring" [REF]
-    ) -> ()),
-    req!(102 "call-answer" (1 "formats" [B], 2 "format_names" [T], 3 "reach" BOOL, 4 "join" BOOL) -> ()),
-    req!(103 "call-end" () -> ()),
+    CALL_START,
+    CALL_ANSWER,
+    CALL_END,
     CALL_MEDIA,
     CLIP_COPY,
     CLIP,

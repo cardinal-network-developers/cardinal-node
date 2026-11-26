@@ -166,6 +166,24 @@ fn joined(d: &Daemon, group: &str) -> anyhow::Result<Found> {
     }
 }
 
+/// [`joined`], by a `ref` as it came.
+fn joined_ref(d: &Daemon, group: Ref<'_>) -> anyhow::Result<Found> {
+    match find_among(d, group, true) {
+        Ok(g) => {
+            // one that ended and has nothing here in its place
+            if let (Some(why), _) = d.core().succession_news(&g.id) {
+                anyhow::bail!("{} has ended: {why}", g.name);
+            }
+            Ok(g)
+        }
+        // say which it is: not there at all, or there and not joined
+        Err(none) => match find_among(d, group, false) {
+            Ok(g) => anyhow::bail!("you have not joined {}", g.name),
+            Err(_) => Err(none),
+        },
+    }
+}
+
 /// Whether this person may add to a group and change what it is called: its
 /// owner, and its admins.
 fn may_manage(sp: &Space, me: &[u8; 32]) -> bool {
@@ -314,6 +332,46 @@ fn member_named(contacts: &[ContactRecord], sp: &Space, who: &str) -> anyhow::Re
             _ => anyhow::bail!("more than one in it has an id starting {who}: give it whole"),
         };
     }
+    if let Some(c) = contacts
+        .iter()
+        .find(|c| c.petname == who && in_it(&c.identity))
+    {
+        return Ok(c.identity);
+    }
+    let found: Vec<Member> = group::members(sp)
+        .into_iter()
+        .filter(|m| m.name.as_deref() == Some(who))
+        .collect();
+    match found.as_slice() {
+        [m] => Ok(m.identity),
+        [] => anyhow::bail!("nobody in it is called {who}"),
+        _ => anyhow::bail!("more than one in it is called {who}"),
+    }
+}
+
+/// [`member_named`], by a `ref` as it came.
+fn member_named_ref(
+    contacts: &[ContactRecord],
+    sp: &Space,
+    who: Ref<'_>,
+) -> anyhow::Result<[u8; 32]> {
+    let in_it = |id: &[u8; 32]| sp.validity().members.iter().any(|m| m.identity == *id);
+    let who = match who {
+        Ref::Typed(t) => t,
+        asked @ Ref::Id(_) => {
+            // one identity may be named with several roles
+            let mut found: Vec<[u8; 32]> =
+                sp.validity().members.iter().map(|m| m.identity).collect();
+            found.retain(|id| asked.is_id(id));
+            found.sort();
+            found.dedup();
+            return match found.as_slice() {
+                [id] => Ok(*id),
+                [] => anyhow::bail!("nobody in it has the id {asked}"),
+                _ => anyhow::bail!("more than one in it has an id starting {asked}: give it whole"),
+            };
+        }
+    };
     if let Some(c) = contacts
         .iter()
         .find(|c| c.petname == who && in_it(&c.identity))
@@ -2045,6 +2103,12 @@ pub(crate) fn joined_group(d: &Daemon, group: &str) -> anyhow::Result<(SpaceId, 
     Ok((g.id, g.name))
 }
 
+/// [`joined_group`], by a `ref` as it came.
+pub(crate) fn joined_group_ref(d: &Daemon, group: Ref<'_>) -> anyhow::Result<(SpaceId, String)> {
+    let g = joined_ref(d, group)?;
+    Ok((g.id, g.name))
+}
+
 /// The name of a group this person joined that `who` is in, if `space` is
 /// one: what a call in it is called.
 pub(crate) fn shared_group(d: &Daemon, space: &SpaceId, who: &[u8; 32]) -> Option<String> {
@@ -2065,7 +2129,7 @@ pub(crate) fn shared_group(d: &Daemon, space: &SpaceId, who: &[u8; 32]) -> Optio
 pub(crate) fn to_ring(
     d: &Daemon,
     space: &SpaceId,
-    named: &[String],
+    named: &[api::typed::Reference],
 ) -> anyhow::Result<Vec<ContactRecord>> {
     anyhow::ensure!(!named.is_empty(), "`ring` names someone to ring");
     let me = identity(d)?;
@@ -2075,8 +2139,9 @@ pub(crate) fn to_ring(
     let contacts = core.contacts();
     let mut out: Vec<ContactRecord> = Vec::new();
     for who in named {
-        let shown = api::shown(who);
-        let them = member_named(&contacts, sp, who)
+        let who = who.as_ref();
+        let shown = who;
+        let them = member_named_ref(&contacts, sp, who)
             .map_err(|e| anyhow::anyhow!("{shown} cannot be rung: {e}"))?;
         anyhow::ensure!(them != me, "{shown} is you: you are not rung");
         anyhow::ensure!(
@@ -2599,4 +2664,42 @@ pub fn messages_by_name(d: &Daemon, group: &str, before: Option<&str>) -> anyhow
         })
         .collect();
     Ok(json!({"group": hex::encode(g.id), "name": g.name, "messages": said}))
+}
+
+/// `to_ring` as main had it, by name.
+#[cfg(any(test, debug_assertions, feature = "by-name"))]
+#[allow(dead_code, clippy::all)]
+pub(crate) fn to_ring_by_name(
+    d: &Daemon,
+    space: &SpaceId,
+    named: &[String],
+) -> anyhow::Result<Vec<ContactRecord>> {
+    anyhow::ensure!(!named.is_empty(), "`ring` names someone to ring");
+    let me = identity(d)?;
+    let core = d.core();
+    let sp = core.spaces.get(space).and_then(|h| h.space.as_ref());
+    let sp = sp.ok_or_else(|| anyhow::anyhow!("that group is not open yet"))?;
+    let contacts = core.contacts();
+    let mut out: Vec<ContactRecord> = Vec::new();
+    for who in named {
+        let shown = api::shown(who);
+        let them = member_named(&contacts, sp, who)
+            .map_err(|e| anyhow::anyhow!("{shown} cannot be rung: {e}"))?;
+        anyhow::ensure!(them != me, "{shown} is you: you are not rung");
+        anyhow::ensure!(
+            !sp.has_left(&them),
+            "{shown} has left {}, and is not rung",
+            group::name(sp)
+        );
+        let c = contacts
+            .iter()
+            .find(|c| c.identity == them && !c.refused && c.recovery_of.is_none())
+            .ok_or_else(|| {
+                anyhow::anyhow!("{shown} is not a contact of yours: only your contacts are rung")
+            })?;
+        if !out.iter().any(|o| o.identity == them) {
+            out.push(c.clone());
+        }
+    }
+    Ok(out)
 }

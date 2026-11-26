@@ -1417,3 +1417,116 @@ async fn networks_hosts_and_peers_are_answered_the_same() {
     t.same_message(&message_of(186, vec![(1, Value::from(false))]))
         .await;
 }
+
+/// A contact on both twins, as `a_contact_and_before_are_the_bytes_they_were`
+/// makes one: its identity.
+fn a_contact(t: &Twins, name: &str, n: u8) -> [u8; 32] {
+    let them = [n; 32];
+    for d in [&t.old, &t.new] {
+        let acc = d.core().account_id().unwrap();
+        let op = cardinal_space::account::create_contact(
+            &them,
+            name,
+            &[n.wrapping_add(1); 32],
+            cardinal_space::account::Regard::default(),
+        );
+        d.write_and_push(&acc, vec![op]).unwrap();
+    }
+    them
+}
+
+/// A group made on each twin, the two told alike: the old one's id and the
+/// new one's.
+fn a_group(t: &mut Twins, name: &str) -> (Vec<u8>, Vec<u8>) {
+    let made = |d: &Arc<Daemon>| {
+        let g = crate::groups::create(d, name, &[], false, true).unwrap();
+        hex::decode(g["group"].as_str().unwrap()).unwrap()
+    };
+    let (go, gn) = (made(&t.old), made(&t.new));
+    t.alike(&go, &gn);
+    (go, gn)
+}
+
+/// A `ref` given as bytes, as the way by name holds it.
+fn exact(b: &[u8]) -> String {
+    format!("{EXACT}{}", hex::encode(b))
+}
+
+/// Starting, answering and ending a call, where nobody can be reached:
+/// every refusal before a call is made.
+#[tokio::test]
+async fn calls_are_started_answered_and_ended_the_same() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut t = Twins::start(dir.path()).await;
+    let ann = a_contact(&t, "Ann", 9);
+    let (go, gn) = a_group(&mut t, "Kin");
+    let me = t.old.core().identity.as_ref().unwrap().id();
+    let format = hex::encode([5u8; 32]);
+    for req in [
+        json!({"cmd": "call-end"}),
+        json!({"cmd": "call-answer"}),
+        json!({"cmd": "call-answer", "reach": true, "join": false}),
+        json!({"cmd": "call-answer", "formats": [format]}),
+        json!({"cmd": "call-answer", "formats": ["0011"]}),
+        json!({"cmd": "call-answer", "format_names": ["voice"]}),
+        json!({"cmd": "call-start"}),
+        json!({"cmd": "call-start", "who": "Nobody"}),
+        json!({"cmd": "call-start", "who": exact(&[1; 8])}),
+        json!({"cmd": "call-start", "who": "Ann", "formats": []}),
+        json!({"cmd": "call-start", "who": "Ann", "formats": ["0011"]}),
+        json!({"cmd": "call-start", "who": "Ann", "formats": vec![format.clone(); 40]}),
+        json!({"cmd": "call-start", "who": "Nobody", "formats": ["0011"]}),
+        json!({"cmd": "call-start", "who": "Ann", "format_names": []}),
+        json!({"cmd": "call-start", "ring": []}),
+        json!({"cmd": "call-start", "ring": ["Ann"], "who": "Ann"}),
+        json!({"cmd": "call-start", "ring": ["Ann"]}),
+        json!({"cmd": "call-start", "ring": ["Ann"], "group": "Nobody"}),
+        json!({"cmd": "call-start", "ring": ["Ann"], "group": "Kin"}),
+        json!({"cmd": "call-start", "ring": [exact(&ann)], "group": "Kin"}),
+        json!({"cmd": "call-start", "ring": [exact(&ann[..8])], "group": "Kin"}),
+        json!({"cmd": "call-start", "ring": ["Me"], "group": "Kin"}),
+        json!({"cmd": "call-start", "ring": [exact(&me)], "group": "Kin"}),
+        json!({"cmd": "call-start", "ring": [exact(&me[..8]), "Ann"], "group": "Kin"}),
+        json!({"cmd": "call-start", "group": "Kin"}),
+        json!({"cmd": "call-start", "group": "Nobody", "who": "Ann"}),
+        json!({"cmd": "call-start", "group": exact(&[3; 32])}),
+    ] {
+        t.same(req).await;
+    }
+    let by_id = |g: &[u8]| json!({"cmd": "call-start", "group": exact(g)});
+    t.same_as(by_id(&go), by_id(&gn)).await;
+    let by_id = |g: &[u8]| json!({"cmd": "call-start", "group": exact(g), "ring": ["Ann"]});
+    t.same_as(by_id(&go), by_id(&gn)).await;
+    // nobody to reach: Ann, by name, by the start of her id, as bytes
+    for who in [
+        "Ann",
+        &hex::encode(&ann[..8]),
+        &exact(&ann[..8]),
+        &exact(&ann),
+    ] {
+        let msg = t.same(json!({"cmd": "call-start", "who": who})).await;
+        let why = failed_of::<CallStartArgs>(&msg).why;
+        assert_eq!(why, "Ann cannot be reached right now");
+    }
+    // refused: named NUL first where given as bytes, as before
+    for d in [&t.old, &t.new] {
+        crate::contacts::set(d, "Ann", "refuse").unwrap();
+    }
+    for who in ["Ann", &exact(&ann[..8])] {
+        t.same(json!({"cmd": "call-start", "who": who})).await;
+    }
+    let msg = t
+        .same(json!({"cmd": "call-start", "who": exact(&ann[..8])}))
+        .await;
+    assert!(failed_of::<CallStartArgs>(&msg)
+        .why
+        .starts_with("you have refused \u{0}"));
+    // what is refused before any handler
+    t.same_message(&message_of(101, vec![(5, Value::from("Ann"))]))
+        .await;
+    t.same_message(&message_of(102, vec![(3, Value::from(2u64))]))
+        .await;
+    t.same_message(&message_of(103, vec![(1, Value::from(true))]))
+        .await;
+    t.same(json!({"cmd": "call-end"})).await;
+}

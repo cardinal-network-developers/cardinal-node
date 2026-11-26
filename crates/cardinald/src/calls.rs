@@ -19,6 +19,7 @@ use bytes::Bytes;
 use cardinal_encoding::{Record, Value};
 use cardinal_link::{Priority, Service, Session, Stream};
 use cardinal_space::SpaceId;
+#[cfg(any(test, debug_assertions, feature = "by-name"))]
 use serde_json::{json, Value as Json};
 use tokio::io::AsyncWriteExt;
 use tokio::sync::watch;
@@ -657,9 +658,9 @@ fn ring_out_after(d: &Arc<Daemon>, id: [u8; 16], rings_for: Duration) {
 /// a call that is only ringing gives way.
 pub async fn start(
     d: &Arc<Daemon>,
-    who: &str,
+    who: api::Ref<'_>,
     formats: Option<Vec<Format>>,
-) -> anyhow::Result<Json> {
+) -> anyhow::Result<()> {
     let formats = formats.map(dedup);
     if let Some(f) = &formats {
         anyhow::ensure!(!f.is_empty(), "a call offers at least one format");
@@ -668,7 +669,7 @@ pub async fn start(
             "a call offers at most {MAX_FORMATS} formats"
         );
     }
-    let contact = contacts::listed(d, who)?;
+    let contact = contacts::listed_ref(d, who)?;
     let mut theirs = d.sessions_of(&contact.identity);
     // A session that looks open may be one left on a network their device
     // has since left (`profiles.md#calls-guidance`): each is asked for an
@@ -732,7 +733,7 @@ pub async fn start(
         tokio::spawn(ring_where_found(d.clone(), contact, id, rung, formats));
     }
     ring_out(d, id);
-    Ok(json!({}))
+    Ok(())
 }
 
 /// Looks for the person called while it rings, at once and again once any
@@ -784,7 +785,7 @@ pub async fn answer(
     formats: Option<Vec<Format>>,
     reach: Option<bool>,
     join_too: Option<bool>,
-) -> anyhow::Result<Json> {
+) -> anyhow::Result<()> {
     let two = lock(d).as_ref().is_some_and(|c| !c.group);
     anyhow::ensure!(
         !(two && reach.is_some()),
@@ -843,7 +844,7 @@ pub async fn answer(
         take_part(d, id, space, false);
         d.bump();
         relink(d, &id, &space, true).await;
-        return Ok(json!({}));
+        return Ok(());
     }
     let (s, space, id, taken) = {
         let mut call = lock(d);
@@ -874,14 +875,14 @@ pub async fn answer(
         return Err(e);
     }
     go_live(d, &s, id);
-    Ok(json!({}))
+    Ok(())
 }
 
 /// A new `answer` on a live call between two people (`basics/video.md`):
 /// what this device takes now, of what the ring offered. The other side is
 /// told, and sends only that from then on; what this device no longer takes
 /// is not given to its window either.
-async fn answer_again(d: &Arc<Daemon>, formats: Option<Vec<Format>>) -> anyhow::Result<Json> {
+async fn answer_again(d: &Arc<Daemon>, formats: Option<Vec<Format>>) -> anyhow::Result<()> {
     let (s, space, id, taken) = {
         let mut call = lock(d);
         let c = call
@@ -907,7 +908,7 @@ async fn answer_again(d: &Arc<Daemon>, formats: Option<Vec<Format>>) -> anyhow::
     tell_formats(&s, ANSWER, &space, &id, Some(&taken)).await?;
     // Taking video again, the sender has this window's shape at once.
     send_viewport(d);
-    Ok(json!({}))
+    Ok(())
 }
 
 /// What an answer takes, with video added while this person's camera is
@@ -923,7 +924,7 @@ fn with_video(c: &Call, formats: Option<Vec<Format>>) -> Option<Vec<Format>> {
 }
 
 /// Hangs up, or says no.
-pub async fn end(d: &Arc<Daemon>) -> anyhow::Result<Json> {
+pub async fn end(d: &Arc<Daemon>) -> anyhow::Result<()> {
     end_call(d, true, false).await
 }
 
@@ -931,9 +932,9 @@ pub async fn end(d: &Arc<Daemon>) -> anyhow::Result<Json> {
 /// `may_carry`, a device that helps others goes on carrying the call for
 /// them while it joins two or more of them. With `timed_out`, it rang or
 /// called for as long as a call rings, unanswered.
-async fn end_call(d: &Arc<Daemon>, may_carry: bool, timed_out: bool) -> anyhow::Result<Json> {
+async fn end_call(d: &Arc<Daemon>, may_carry: bool, timed_out: bool) -> anyhow::Result<()> {
     let Some(call) = lock(d).take() else {
-        return Ok(json!({}));
+        return Ok(());
     };
     let how = match (call.standing, timed_out) {
         (Standing::Ringing, true) => Ending::Missed,
@@ -947,7 +948,7 @@ async fn end_call(d: &Arc<Daemon>, may_carry: bool, timed_out: bool) -> anyhow::
         // Saying no to a ring is this person's: what the device carries
         // goes on.
         if call.standing == Standing::Ringing {
-            return Ok(json!({}));
+            return Ok(());
         }
         gave_up(d, &call).await;
         let carry_on = may_carry
@@ -955,12 +956,12 @@ async fn end_call(d: &Arc<Daemon>, may_carry: bool, timed_out: bool) -> anyhow::
             && groups(d).get(&call.id).is_some_and(|g| g.tree.links() >= 2);
         if !carry_on {
             leave(d, &call.id).await;
-            return Ok(json!({}));
+            return Ok(());
         }
         let links: Vec<Session> = {
             let mut gs = groups(d);
             let Some(g) = gs.get_mut(&call.id) else {
-                return Ok(json!({}));
+                return Ok(());
             };
             g.tree.set_own(None);
             g.waiting = false;
@@ -969,7 +970,7 @@ async fn end_call(d: &Arc<Daemon>, may_carry: bool, timed_out: bool) -> anyhow::
         for s in links {
             let _ = join(&s, &call.space, &call.id, true).await;
         }
-        return Ok(json!({}));
+        return Ok(());
     }
     let told = match call.session {
         Some(s) => vec![s],
@@ -978,7 +979,7 @@ async fn end_call(d: &Arc<Daemon>, may_carry: bool, timed_out: bool) -> anyhow::
     for s in told {
         let _ = tell(&s, END, &call.space, &call.id).await;
     }
-    Ok(json!({}))
+    Ok(())
 }
 
 /// A caller who leaves group call `call` having heard nobody else on it
@@ -1392,10 +1393,10 @@ fn someone_on(g: &Group, now: Instant) -> bool {
 /// this person, and their contact; where any is not, nobody is rung.
 pub async fn start_group(
     d: &Arc<Daemon>,
-    group: &str,
-    ring: Option<&[String]>,
-) -> anyhow::Result<Json> {
-    let (space, name) = crate::groups::joined_group(d, group)?;
+    group: api::Ref<'_>,
+    ring: Option<&[api::typed::Reference]>,
+) -> anyhow::Result<()> {
+    let (space, name) = crate::groups::joined_group_ref(d, group)?;
     let some = match ring {
         Some(named) => Some(crate::groups::to_ring(d, &space, named)?),
         None => None,
@@ -1408,7 +1409,7 @@ pub async fn start_group(
     if let Some(id) = on_it {
         if let Some(named) = some {
             ring_some(d, space, id, named);
-            return Ok(json!({}));
+            return Ok(());
         }
     }
     // Refused before anything is touched: the call this person is on, or
@@ -1474,7 +1475,7 @@ pub async fn start_group(
         if let Some(named) = some {
             ring_some(d, space, id, named);
         }
-        return Ok(json!({}));
+        return Ok(());
     }
     let me = contacts::identity(d).ok();
     remember(&d.rung_calls, id);
@@ -1482,7 +1483,7 @@ pub async fn start_group(
     if let Some(named) = some {
         ring_some(d, space, id, named);
         ring_out(d, id);
-        return Ok(json!({}));
+        return Ok(());
     }
     for s in &theirs {
         rang_on(d, &id, s);
@@ -1499,7 +1500,7 @@ pub async fn start_group(
         }
     }
     ring_out(d, id);
-    Ok(json!({}))
+    Ok(())
 }
 
 /// Rings `named` into group call `id` with a `ring` for some, once to each
@@ -4135,4 +4136,407 @@ fn voices_by_name(
             }))
         })
         .collect()
+}
+
+// ---- The handlers as they were by name ----
+//
+// What main had, whole, kept only to show that the typed handlers send the
+// same bytes (`api/same_bytes.rs`). They go with the way by name.
+
+/// `start` as main had it, by name.
+#[cfg(any(test, debug_assertions, feature = "by-name"))]
+#[allow(dead_code, clippy::all)]
+pub async fn start_by_name(
+    d: &Arc<Daemon>,
+    who: &str,
+    formats: Option<Vec<Format>>,
+) -> anyhow::Result<Json> {
+    let formats = formats.map(dedup);
+    if let Some(f) = &formats {
+        anyhow::ensure!(!f.is_empty(), "a call offers at least one format");
+        anyhow::ensure!(
+            f.len() <= MAX_FORMATS,
+            "a call offers at most {MAX_FORMATS} formats"
+        );
+    }
+    let contact = contacts::listed_by_name(d, who)?;
+    let mut theirs = d.sessions_of(&contact.identity);
+    // A session that looks open may be one left on a network their device
+    // has since left (`profiles.md#calls-guidance`): each is asked for an
+    // answer, and one that gives none is looked past.
+    let asked = Instant::now();
+    for s in &theirs {
+        s.check();
+    }
+    while !theirs.is_empty()
+        && asked.elapsed() < ANSWER_WITHIN
+        && theirs.iter().any(|s| s.last_heard() < asked)
+    {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    for s in theirs.iter().filter(|s| s.last_heard() < asked) {
+        d.rendezvous.suspect(&s.peer_static());
+    }
+    if theirs.is_empty() && contact.connects() {
+        crate::rendezvous::reach_now(d, contact.identity, contact.space).await;
+        theirs = d.sessions_of(&contact.identity);
+    }
+    anyhow::ensure!(
+        !theirs.is_empty(),
+        "{} cannot be reached right now",
+        contact.petname
+    );
+    let id: [u8; 16] = cardinal_crypto::random_bytes();
+    let mut call = Call::new(
+        id,
+        contact.identity,
+        contact.petname.clone(),
+        contact.space,
+        Standing::Calling,
+        None,
+    );
+    call.offered = formats.clone();
+    let gave_way = {
+        let mut held = lock(d);
+        let ringing = held
+            .as_ref()
+            .is_some_and(|c| c.standing == Standing::Ringing);
+        anyhow::ensure!(held.is_none() || ringing, "you are already on a call");
+        held.replace(call)
+    };
+    if let Some(old) = gave_way {
+        finished(d, &old, self::gave_way(&old));
+        // A ring in a group is said no to by nothing sent: there may be
+        // nothing the person accepted there to say it in.
+        if let Some(s) = old.session.as_ref().filter(|_| !old.group) {
+            let _ = tell(s, END, &old.space, &old.id).await;
+        }
+    }
+    d.bump();
+    for s in &theirs {
+        if let Err(e) = tell_formats(s, RING, &contact.space, &id, formats.as_deref()).await {
+            tracing::debug!("ringing: {e:#}");
+        }
+    }
+    if contact.connects() {
+        let rung: Vec<[u8; 32]> = theirs.iter().map(Session::handshake_hash).collect();
+        tokio::spawn(ring_where_found(d.clone(), contact, id, rung, formats));
+    }
+    ring_out(d, id);
+    Ok(json!({}))
+}
+
+/// `start_group` as main had it, by name.
+#[cfg(any(test, debug_assertions, feature = "by-name"))]
+#[allow(dead_code, clippy::all)]
+pub async fn start_group_by_name(
+    d: &Arc<Daemon>,
+    group: &str,
+    ring: Option<&[String]>,
+) -> anyhow::Result<Json> {
+    let (space, name) = crate::groups::joined_group_by_name(d, group)?;
+    let some = match ring {
+        Some(named) => Some(crate::groups::to_ring_by_name(d, &space, named)?),
+        None => None,
+    };
+    // On the group's call already: those named are rung into it.
+    let on_it = lock(d)
+        .as_ref()
+        .filter(|c| c.group && c.space == space && c.standing != Standing::Ringing)
+        .map(|c| c.id);
+    if let Some(id) = on_it {
+        if let Some(named) = some {
+            ring_some(d, space, id, named);
+            return Ok(json!({}));
+        }
+    }
+    // Refused before anything is touched: the call this person is on, or
+    // the one they are calling alone, keeps its routing.
+    {
+        let held = lock(d);
+        let ringing = held
+            .as_ref()
+            .is_some_and(|c| c.standing == Standing::Ringing);
+        anyhow::ensure!(held.is_none() || ringing, "you are already on a call");
+    }
+    let now = Instant::now();
+    let (going, stale) = {
+        let gs = groups(d);
+        let in_it: Vec<(&[u8; 16], &Group)> = gs.iter().filter(|(_, g)| g.space == space).collect();
+        let going = in_it
+            .iter()
+            .find(|(_, g)| g.probe.is_none() && someone_on(g, now))
+            .map(|(id, _)| **id);
+        let stale: Vec<[u8; 16]> = in_it
+            .iter()
+            .filter(|(id, _)| Some(**id) != going)
+            .map(|(id, _)| **id)
+            .collect();
+        (going, stale)
+    };
+    // A call nobody is heard on is over, whatever this device carried.
+    for old in stale {
+        leave(d, &old).await;
+    }
+    let theirs = crate::groups::member_sessions(d, &space);
+    // Ringing some is refused only as the specification says
+    // (`apps.md`, `call-start`): those not reachable now are looked for
+    // once the request has been answered.
+    if some.is_none() {
+        anyhow::ensure!(
+            going.is_some() || !theirs.is_empty(),
+            "nobody in {name} can be reached right now"
+        );
+    }
+    let id = going.unwrap_or_else(cardinal_crypto::random_bytes);
+    let mut call = Call::new(id, space, name, space, Standing::Calling, None);
+    call.group = true;
+    if going.is_some() {
+        call.standing = Standing::Live;
+        call.live_since = Some(Instant::now());
+    }
+    let gave = {
+        let mut held = lock(d);
+        let ringing = held
+            .as_ref()
+            .is_some_and(|c| c.standing == Standing::Ringing);
+        anyhow::ensure!(held.is_none() || ringing, "you are already on a call");
+        held.replace(call)
+    };
+    if let Some(old) = gave {
+        finished(d, &old, gave_way(&old));
+    }
+    take_part(d, id, space, going.is_none());
+    d.bump();
+    if going.is_some() {
+        relink(d, &id, &space, true).await;
+        if let Some(named) = some {
+            ring_some(d, space, id, named);
+        }
+        return Ok(json!({}));
+    }
+    let me = contacts::identity(d).ok();
+    remember(&d.rung_calls, id);
+    remember(&d.passed_rings, id);
+    if let Some(named) = some {
+        ring_some(d, space, id, named);
+        ring_out(d, id);
+        return Ok(json!({}));
+    }
+    for s in &theirs {
+        rang_on(d, &id, s);
+        let ring = Signal {
+            kind: RING,
+            space,
+            id,
+            flag: None,
+            caller: me,
+            formats: None,
+        };
+        if let Err(e) = send(s, &ring).await {
+            tracing::debug!("ringing: {e:#}");
+        }
+    }
+    ring_out(d, id);
+    Ok(json!({}))
+}
+
+/// `answer` as main had it, by name.
+#[cfg(any(test, debug_assertions, feature = "by-name"))]
+#[allow(dead_code, clippy::all)]
+pub async fn answer_by_name(
+    d: &Arc<Daemon>,
+    formats: Option<Vec<Format>>,
+    reach: Option<bool>,
+    join_too: Option<bool>,
+) -> anyhow::Result<Json> {
+    let two = lock(d).as_ref().is_some_and(|c| !c.group);
+    anyhow::ensure!(
+        !(two && reach.is_some()),
+        "`reach` is for a call in a group: a call between two people joins nothing"
+    );
+    anyhow::ensure!(
+        !(two && join_too.is_some()),
+        "`join` is for a call that rings in a group only offered to you: a call between two \
+         people joins nothing"
+    );
+    let live = lock(d)
+        .as_ref()
+        .is_some_and(|c| c.standing == Standing::Live && !c.group);
+    if live {
+        return answer_again_by_name(d, formats).await;
+    }
+    let group = lock(d)
+        .as_ref()
+        .filter(|c| c.standing == Standing::Ringing && c.group)
+        .map(|c| (c.space, c.id, c.caller, c.name.clone()));
+    if let Some((space, id, caller, name)) = group {
+        // Answering is accepting the group: joined first, or not answered.
+        if crate::groups::only_offered(d, &space) {
+            anyhow::ensure!(
+                join_too == Some(true),
+                "answering this call adds you to {name}: say so with `join`. Nothing was \
+                 written, and the call goes on ringing"
+            );
+            let still =
+                caller.is_some_and(|c| crate::groups::offered_ring(d, &space, &c).is_some());
+            if !still {
+                offered_ring_still(d);
+                anyhow::bail!(
+                    "{name} can no longer be joined by answering this call, so it was not \
+                     answered and nothing was written"
+                );
+            }
+            crate::groups::join_exact(d, &space, reach).await?;
+        }
+        // In a group joined already, as when another of this person's
+        // devices joined it meanwhile, `join` and `reach` change nothing.
+        let still = {
+            let mut call = lock(d);
+            match call.as_mut().filter(|c| {
+                c.id == id && c.space == space && c.group && c.standing == Standing::Ringing
+            }) {
+                Some(c) => {
+                    c.standing = Standing::Live;
+                    c.live_since = Some(Instant::now());
+                    true
+                }
+                None => false,
+            }
+        };
+        anyhow::ensure!(still, "that call has stopped ringing");
+        take_part(d, id, space, false);
+        d.bump();
+        relink(d, &id, &space, true).await;
+        return Ok(json!({}));
+    }
+    let (s, space, id, taken) = {
+        let mut call = lock(d);
+        let c = call
+            .as_mut()
+            .filter(|c| c.standing == Standing::Ringing)
+            .ok_or_else(|| anyhow::anyhow!("nothing is ringing"))?;
+        // Taken now, so a second answer finds nothing ringing.
+        c.standing = Standing::Live;
+        // Only what was offered can be taken; a ring that named nothing is
+        // voice, and its answer names nothing either.
+        let formats = with_video(c, formats);
+        c.taken = c
+            .offered
+            .as_deref()
+            .map(|offered| taking(offered, formats.as_deref()));
+        c.they_take = c.taken.clone();
+        let s = c.session.clone();
+        (
+            s.ok_or_else(|| anyhow::anyhow!("that call has gone"))?,
+            c.space,
+            c.id,
+            c.taken.clone(),
+        )
+    };
+    if let Err(e) = tell_formats(&s, ANSWER, &space, &id, taken.as_deref()).await {
+        let _ = end_by_name(d).await;
+        return Err(e);
+    }
+    go_live(d, &s, id);
+    Ok(json!({}))
+}
+
+/// `answer_again` as main had it, by name.
+#[cfg(any(test, debug_assertions, feature = "by-name"))]
+#[allow(dead_code, clippy::all)]
+async fn answer_again_by_name(
+    d: &Arc<Daemon>,
+    formats: Option<Vec<Format>>,
+) -> anyhow::Result<Json> {
+    let (s, space, id, taken) = {
+        let mut call = lock(d);
+        let c = call
+            .as_mut()
+            .filter(|c| c.standing == Standing::Live && !c.group)
+            .ok_or_else(|| anyhow::anyhow!("there is no call to answer"))?;
+        let offered = c
+            .offered
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("this call offered only voice"))?;
+        let formats = with_video(c, formats);
+        let taken = taking(offered, formats.as_deref());
+        c.taken = Some(taken.clone());
+        let s = c.session.clone();
+        (
+            s.ok_or_else(|| anyhow::anyhow!("that call has gone"))?,
+            c.space,
+            c.id,
+            taken,
+        )
+    };
+    d.bump();
+    tell_formats(&s, ANSWER, &space, &id, Some(&taken)).await?;
+    // Taking video again, the sender has this window's shape at once.
+    send_viewport(d);
+    Ok(json!({}))
+}
+
+/// `end` as main had it, by name.
+#[cfg(any(test, debug_assertions, feature = "by-name"))]
+#[allow(dead_code, clippy::all)]
+pub async fn end_by_name(d: &Arc<Daemon>) -> anyhow::Result<Json> {
+    end_call_by_name(d, true, false).await
+}
+
+/// `end_call` as main had it, by name.
+#[cfg(any(test, debug_assertions, feature = "by-name"))]
+#[allow(dead_code, clippy::all)]
+async fn end_call_by_name(
+    d: &Arc<Daemon>,
+    may_carry: bool,
+    timed_out: bool,
+) -> anyhow::Result<Json> {
+    let Some(call) = lock(d).take() else {
+        return Ok(json!({}));
+    };
+    let how = match (call.standing, timed_out) {
+        (Standing::Ringing, true) => Ending::Missed,
+        (Standing::Ringing, false) => Ending::Declined,
+        (Standing::Calling, true) => Ending::NotAnswered,
+        (Standing::Calling, false) => Ending::Cancelled,
+        (Standing::Live, _) => Ending::Over,
+    };
+    finished(d, &call, how);
+    if call.group {
+        // Saying no to a ring is this person's: what the device carries
+        // goes on.
+        if call.standing == Standing::Ringing {
+            return Ok(json!({}));
+        }
+        gave_up(d, &call).await;
+        let carry_on = may_carry
+            && d.conditions.helps()
+            && groups(d).get(&call.id).is_some_and(|g| g.tree.links() >= 2);
+        if !carry_on {
+            leave(d, &call.id).await;
+            return Ok(json!({}));
+        }
+        let links: Vec<Session> = {
+            let mut gs = groups(d);
+            let Some(g) = gs.get_mut(&call.id) else {
+                return Ok(json!({}));
+            };
+            g.tree.set_own(None);
+            g.waiting = false;
+            g.sessions.values().map(|(s, _)| s.clone()).collect()
+        };
+        for s in links {
+            let _ = join(&s, &call.space, &call.id, true).await;
+        }
+        return Ok(json!({}));
+    }
+    let told = match call.session {
+        Some(s) => vec![s],
+        None => d.sessions_of(&call.who),
+    };
+    for s in told {
+        let _ = tell(&s, END, &call.space, &call.id).await;
+    }
+    Ok(json!({}))
 }

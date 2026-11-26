@@ -3879,43 +3879,44 @@ async fn client(cmd: Cmd) -> anyhow::Result<()> {
             }
         },
         Cmd::Call { cmd } => {
-            let req = match &cmd {
+            let typed = |t: &String| api::typed::Reference::Typed(t.clone());
+            match &cmd {
                 None => {
                     let v = ask(&paths, api::CallArgs {}).await?;
                     tell_call(&v);
-                    return Ok(());
                 }
                 Some(CallCmd::Start { who, group, ring }) => {
-                    let mut req = json!({"cmd": "call-start"});
+                    let mut args = api::CallStartArgs::new();
                     match (who, group) {
-                        (_, Some(g)) => req["group"] = json!(g),
-                        (Some(w), None) => req["who"] = json!(w),
+                        (_, Some(g)) => args.group = Some(typed(g)),
+                        (Some(w), None) => args.who = Some(typed(w)),
                         (None, None) => anyhow::bail!("say whom to call, or --group"),
                     }
                     if !ring.is_empty() {
-                        req["ring"] = json!(ring);
+                        args.ring = Some(ring.iter().map(typed).collect());
                     }
-                    req
+                    ask(&paths, args).await?;
                 }
                 Some(CallCmd::Answer {
                     join,
                     share_host,
                     keep_host,
                 }) => {
-                    let mut req = json!({"cmd": "call-answer"});
+                    let mut args = api::CallAnswerArgs::new();
                     if *join {
-                        req["join"] = json!(true);
+                        args.join = Some(true);
                     }
                     match (*share_host, *keep_host) {
-                        (true, _) => req["reach"] = json!(true),
-                        (_, true) => req["reach"] = json!(false),
+                        (true, _) => args.reach = Some(true),
+                        (_, true) => args.reach = Some(false),
                         _ => {}
                     }
-                    req
+                    ask(&paths, args).await?;
                 }
-                Some(CallCmd::End) => json!({"cmd": "call-end"}),
-            };
-            call(&paths, req).await?;
+                Some(CallCmd::End) => {
+                    ask(&paths, api::CallEndArgs {}).await?;
+                }
+            }
             Ok(())
         }
         Cmd::Group {

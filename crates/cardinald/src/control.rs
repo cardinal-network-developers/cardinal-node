@@ -361,6 +361,7 @@ pub mod typed {
         BluetoothArgs, BluetoothReply, HostArgs, HostOffArgs, HostReply, HostsReply, NetworkArgs,
         NetworkReply, PeerAddArgs, PeerAddReply, PeerRemoveArgs, RouterArgs, RouterReply,
     };
+    use crate::api::{CallAnswerArgs, CallEndArgs, CallStartArgs};
     use crate::api::{
         Checking, ClipArgs, ClipCopyArgs, ClipCopyReply, ClipReply, ConditionsArgs,
         ConditionsReply, DeviceRenameArgs, DeviceRenameReply, MeArgs, MeReply, NetworkChangedArgs,
@@ -768,6 +769,70 @@ pub mod typed {
         }
     }
 
+    // ---- Calls ----
+
+    /// The formats a call offers or takes: by name, of the draft, or 32
+    /// bytes each; neither, voice.
+    fn formats(
+        formats: &Option<Vec<bytes::Bytes>>,
+        names: &Option<Vec<String>>,
+    ) -> anyhow::Result<Option<Vec<crate::calls::Format>>> {
+        if let Some(names) = names {
+            return Ok(Some(
+                names
+                    .iter()
+                    .map(|n| crate::calls::draft_format(n))
+                    .collect(),
+            ));
+        }
+        let Some(list) = formats else {
+            return Ok(None);
+        };
+        list.iter()
+            .map(|f| {
+                <[u8; 32]>::try_from(&f[..])
+                    .map_err(|_| anyhow::anyhow!("a format is 32 bytes of hex"))
+            })
+            .collect::<anyhow::Result<Vec<_>>>()
+            .map(Some)
+    }
+
+    impl Answer for CallStartArgs {
+        async fn answer(d: &Arc<Daemon>, a: &Self) -> anyhow::Result<Done> {
+            if let Some(ring) = &a.ring {
+                anyhow::ensure!(
+                    a.who.is_none(),
+                    "`ring` names members of a group: it is not for a call with one person"
+                );
+                anyhow::ensure!(!ring.is_empty(), "`ring` names someone to ring");
+                let group = needed(a.group.as_ref(), "group")?;
+                crate::calls::start_group(d, group.as_ref(), Some(ring)).await?;
+            } else if let Some(group) = &a.group {
+                crate::calls::start_group(d, group.as_ref(), None).await?;
+            } else {
+                let who = needed(a.who.as_ref(), "who")?;
+                let formats = formats(&a.formats, &a.format_names)?;
+                crate::calls::start(d, who.as_ref(), formats).await?;
+            }
+            Ok(Done {})
+        }
+    }
+
+    impl Answer for CallAnswerArgs {
+        async fn answer(d: &Arc<Daemon>, a: &Self) -> anyhow::Result<Done> {
+            let formats = formats(&a.formats, &a.format_names)?;
+            crate::calls::answer(d, formats, a.reach, a.join).await?;
+            Ok(Done {})
+        }
+    }
+
+    impl Answer for CallEndArgs {
+        async fn answer(d: &Arc<Daemon>, _: &Self) -> anyhow::Result<Done> {
+            crate::calls::end(d).await?;
+            Ok(Done {})
+        }
+    }
+
     // ---- Networks, hosts and peers ----
 
     impl Answer for RouterArgs {
@@ -974,6 +1039,7 @@ fn conditions(d: &Arc<Daemon>, req: &Value) -> anyhow::Result<Value> {
 
 /// The formats a window offers or takes, as hex names (`formats`), or by
 /// their draft short names (`format_names`, such as "video vp8 1").
+#[cfg(any(test, debug_assertions, feature = "by-name"))]
 fn formats(req: &Value) -> anyhow::Result<Option<Vec<crate::calls::Format>>> {
     if let Some(names) = req.get("format_names").and_then(|v| v.as_array()) {
         let names = names.iter().filter_map(|n| n.as_str());
@@ -1293,6 +1359,7 @@ async fn handle(d: &Arc<Daemon>, req: &Value) -> anyhow::Result<Value> {
         }
         "delete-message" => crate::contacts::delete_message(d, arg(req, "who")?, arg(req, "id")?),
         "react" => crate::contacts::react(d, arg(req, "who")?, arg(req, "id")?, arg(req, "text")?),
+        #[cfg(any(test, debug_assertions, feature = "by-name"))]
         "call-start" if req.get("ring").is_some_and(|r| !r.is_null()) => {
             anyhow::ensure!(
                 req.get("who").is_none_or(Value::is_null),
@@ -1300,12 +1367,14 @@ async fn handle(d: &Arc<Daemon>, req: &Value) -> anyhow::Result<Value> {
             );
             let ring = strings(req, "ring");
             anyhow::ensure!(!ring.is_empty(), "`ring` names someone to ring");
-            crate::calls::start_group(d, arg(req, "group")?, Some(&ring)).await
+            crate::calls::start_group_by_name(d, arg(req, "group")?, Some(&ring)).await
         }
+        #[cfg(any(test, debug_assertions, feature = "by-name"))]
         "call-start" if req.get("group").is_some() => {
-            crate::calls::start_group(d, arg(req, "group")?, None).await
+            crate::calls::start_group_by_name(d, arg(req, "group")?, None).await
         }
-        "call-start" => crate::calls::start(d, arg(req, "who")?, formats(req)?).await,
+        #[cfg(any(test, debug_assertions, feature = "by-name"))]
+        "call-start" => crate::calls::start_by_name(d, arg(req, "who")?, formats(req)?).await,
         // What programs ask through the application interface, and the
         // person's approvals (`apps.rs`).
         "app-questions" => Ok(crate::apps::questions(d)),
@@ -1314,12 +1383,14 @@ async fn handle(d: &Arc<Daemon>, req: &Value) -> anyhow::Result<Value> {
         "approval-revoke" => crate::apps::revoke(d, arg(req, "id")?),
         "app-offers" => Ok(crate::apps::list_offers(d)),
         "app-join" => crate::apps::join(d, arg(req, "space")?),
+        #[cfg(any(test, debug_assertions, feature = "by-name"))]
         "call-answer" => {
             let reach = answer_in(req, "reach")?;
             let join = answer_in(req, "join")?;
-            crate::calls::answer(d, formats(req)?, reach, join).await
+            crate::calls::answer_by_name(d, formats(req)?, reach, join).await
         }
-        "call-end" => crate::calls::end(d).await,
+        #[cfg(any(test, debug_assertions, feature = "by-name"))]
+        "call-end" => crate::calls::end_by_name(d).await,
         "conversations" => Ok(crate::contacts::conversations(d)),
         "mark-read" => crate::contacts::mark_read(d, arg(req, "who")?),
         "read-markers" => {
