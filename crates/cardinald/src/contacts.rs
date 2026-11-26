@@ -63,9 +63,11 @@ pub fn invite(
     address: Option<&str>,
     name: Option<&str>,
     regard: Regard,
-) -> anyhow::Result<Json> {
+) -> anyhow::Result<crate::api::InviteReply> {
     let invitation = invite_for(d, address, name, regard, None, None)?;
-    Ok(json!({"code": invitation.to_text()}))
+    Ok(crate::api::InviteReply {
+        code: invitation.to_text(),
+    })
 }
 
 /// Makes an invitation, for one identity alone if `for_identity` is given,
@@ -425,7 +427,7 @@ pub async fn accept(
     regard: Regard,
     met: account::Met,
     recovery: bool,
-) -> anyhow::Result<Json> {
+) -> anyhow::Result<crate::api::AcceptReply> {
     accept_for(d, code, name, regard, met, recovery, None).await
 }
 
@@ -440,7 +442,7 @@ pub async fn accept_for(
     met: account::Met,
     recovery: bool,
     whom: Option<[u8; 32]>,
-) -> anyhow::Result<Json> {
+) -> anyhow::Result<crate::api::AcceptReply> {
     let mut invitation = Invitation::from_text(code.trim())
         .map_err(|_| anyhow::anyhow!("that is not an invitation"))?;
     if invitation.recovery_of == Some(crate::recovering::ANYONE) {
@@ -536,10 +538,10 @@ pub async fn accept_for(
         s.abandon();
     }
     done?;
-    Ok(json!({
-        "name": petname,
-        "recovery_of": invitation.recovery_of.map(hex::encode),
-    }))
+    Ok(crate::api::AcceptReply {
+        name: petname,
+        recovery_of: invitation.recovery_of,
+    })
 }
 
 async fn accept_exchange(
@@ -2121,6 +2123,146 @@ mod tests {
 // What main had, whole, kept only to show that the typed handlers send the
 // same bytes (`control::typed::answering`, `api/same_bytes.rs`), and to
 // measure the two. They go with the way by name.
+
+/// `invite` as main had it, by name.
+#[cfg(any(test, debug_assertions, feature = "by-name"))]
+#[allow(dead_code, clippy::all)]
+pub fn invite_by_name(
+    d: &Arc<Daemon>,
+    address: Option<&str>,
+    name: Option<&str>,
+    regard: Regard,
+) -> anyhow::Result<Json> {
+    let invitation = invite_for(d, address, name, regard, None, None)?;
+    Ok(json!({"code": invitation.to_text()}))
+}
+
+/// `accept` as main had it, by name.
+#[cfg(any(test, debug_assertions, feature = "by-name"))]
+#[allow(dead_code, clippy::all)]
+pub async fn accept_by_name(
+    d: &Arc<Daemon>,
+    code: &str,
+    name: Option<&str>,
+    regard: Regard,
+    met: account::Met,
+    recovery: bool,
+) -> anyhow::Result<Json> {
+    accept_for_by_name(d, code, name, regard, met, recovery, None).await
+}
+
+/// `accept_for` as main had it, by name.
+#[cfg(any(test, debug_assertions, feature = "by-name"))]
+#[allow(dead_code, clippy::all)]
+pub async fn accept_for_by_name(
+    d: &Arc<Daemon>,
+    code: &str,
+    name: Option<&str>,
+    regard: Regard,
+    met: account::Met,
+    recovery: bool,
+    whom: Option<[u8; 32]>,
+) -> anyhow::Result<Json> {
+    let mut invitation = Invitation::from_text(code.trim())
+        .map_err(|_| anyhow::anyhow!("that is not an invitation"))?;
+    if invitation.recovery_of == Some(crate::recovering::ANYONE) {
+        let whom = whom.ok_or_else(|| {
+            anyhow::Error::new(NeedsFor(
+                "That invitation is to help someone recover their identity: say whom, of \
+                 those you guard"
+                    .to_owned(),
+            ))
+        })?;
+        invitation.recovery_of = Some(whom);
+    }
+    let me = identity(d)?;
+    anyhow::ensure!(
+        invitation.recovery_of.is_none() || recovery,
+        "that is an invitation to help someone recover their identity; only you, using it \
+         yourself, can take it up. Nothing was sent."
+    );
+    // Neither side of a recovery's relationship is the person recovered.
+    anyhow::ensure!(
+        invitation.recovery_of != Some(invitation.inviter) && invitation.recovery_of != Some(me),
+        "that recovery invitation names its own maker or you; nothing was sent"
+    );
+    // A recovery invitation is answered only by a guardian of whoever it
+    // names, or by a recovery helper; anyone else's device tells its
+    // person so and sends nothing back (`identity.md#how-guardians-act`).
+    // A guardian answers through their persona for that person (D79),
+    // whose service takes it up from here.
+    let inside = d.config().this_run.inside();
+    match invitation.recovery_of {
+        Some(p) if !inside => {
+            crate::guardians::may_answer(d, &p)?;
+            return crate::guardians::accept_recovery_by_name(d, code, &p).await;
+        }
+        None if inside => anyhow::bail!("that is not a recovery invitation"),
+        _ => {}
+    }
+    // A helper and a guardian trust each other for the recovery's sake.
+    let regard = match invitation.recovery_of {
+        Some(_) => Regard {
+            trusted: true,
+            introductions: false,
+        },
+        None => regard,
+    };
+    anyhow::ensure!(invitation.inviter != me, "that invitation is your own");
+    anyhow::ensure!(
+        !is_refused(d, &invitation.inviter),
+        "you have refused whoever made that invitation"
+    );
+    anyhow::ensure!(
+        !is_contact(d, &invitation.inviter),
+        "you already know whoever made that invitation"
+    );
+    let dialled = match invitation.endpoint.socket_addr() {
+        Some(addr) => d
+            .dial(|c| Target::invitation(addr, c, invitation.responder_static, &invitation.secret))
+            .await
+            .map_err(|e| anyhow::anyhow!("could not reach them at {addr} ({e})")),
+        None => Err(anyhow::anyhow!(
+            "that invitation has no address this version can use"
+        )),
+    };
+    // Nobody at the address: they may be in Bluetooth range, advertising
+    // the tag the invitation's secret makes (`carriers/ble.md`).
+    let s = match dialled {
+        Ok(s) => s,
+        Err(e) => match crate::bluetooth::find_invitation(d, &invitation).await {
+            Some(Ok(s)) => s,
+            Some(Err(b)) => anyhow::bail!("{e:#}, nor over Bluetooth ({b:#})"),
+            None if crate::bluetooth::mode(d) != crate::bluetooth::Mode::Off
+                && d.bluetooth.is_on() =>
+            {
+                anyhow::bail!("{e:#}, nor anyone nearby over Bluetooth")
+            }
+            None => return Err(e),
+        },
+    };
+    d.on_session(s.clone());
+    let petname = match invitation.recovery_of {
+        Some(p) if !inside => crate::guardians::helper_petname(d, &p),
+        _ => name
+            .map(str::to_owned)
+            .or(invitation.name.clone())
+            .unwrap_or_else(|| account::short_key(&invitation.inviter)),
+    };
+    let exchange = accept_exchange(d, &s, me, &invitation, &petname, regard, &met);
+    let done = tokio::time::timeout(EXCHANGE_WITHIN, exchange)
+        .await
+        .map_err(|_| anyhow::anyhow!("they stopped answering"))
+        .and_then(|done| done);
+    if done.is_err() {
+        s.abandon();
+    }
+    done?;
+    Ok(json!({
+        "name": petname,
+        "recovery_of": invitation.recovery_of.map(hex::encode),
+    }))
+}
 
 /// `find` as main had it, by name.
 #[cfg(any(test, debug_assertions, feature = "by-name"))]

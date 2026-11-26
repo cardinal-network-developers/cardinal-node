@@ -1261,6 +1261,37 @@ typed!(fields RetentionReply {
 });
 asks!(RETENTION: 137 "retention" RetentionArgs -> RetentionReply, writes);
 
+// ---- People, conversations and invitations ----
+
+typed!(fields InviteArgs {
+    1 address: Option<String>,
+    2 name: Option<String>,
+    3 hosts_only: Option<bool>,
+    4 no_introductions: Option<bool>,
+});
+typed!(fields InviteReply {
+    2 code: String,
+});
+asks!(INVITE: 42 "invite" InviteArgs -> InviteReply, writes);
+typed!(fields AcceptArgs {
+    1 code: Option<String>,
+    2 name: Option<String>,
+    3 via: Option<String>,
+    4 hosts_only: Option<bool>,
+    5 no_introductions: Option<bool>,
+    6 r#for: Option<Reference>,
+});
+typed!(
+    fields
+    /// Whom an invitation made a contact of, by the name this person gave
+    /// them; of a recovery's, whose recovery it helps.
+    AcceptReply {
+        2 name: String,
+        3 recovery_of: Option<[u8; 32]>,
+    }
+);
+asks!(ACCEPT: 43 "accept" AcceptArgs -> AcceptReply, writes);
+
 // ---- Networks, hosts and peers ----
 
 typed!(fields RouterArgs {
@@ -1476,13 +1507,8 @@ pub static REQUESTS: &[Request] = &[
     req!(40 "mark-read" (1 "who" REF, 2 "group" REF) -> (
         2 "kept" BOOL, 3 "marked" BOOL, 4 "why" T)),
     req!(41 "read-markers" (1 "on" BOOL) -> (2 "on" BOOL)),
-    req!(42 "invite" (
-        1 "address" T, 2 "name" T, 3 "hosts_only" BOOL, 4 "no_introductions" BOOL
-    ) -> (2 "code" T)),
-    req!(43 "accept" (
-        1 "code" T, 2 "name" T, 3 "via" T, 4 "hosts_only" BOOL, 5 "no_introductions" BOOL,
-        6 "for" REF
-    ) -> (2 "name" T, 3 "recovery_of" B)),
+    INVITE,
+    ACCEPT,
     paged!(after 44 "invitations" (1 "after" U, 2 "limit" U) -> (
         2 "invitations" [INVITATION], 3 "more" BOOL, 4 "next" U)),
     req!(45 "cancel-invitation" (1 "id" REF) -> ()),

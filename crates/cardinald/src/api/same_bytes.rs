@@ -1530,3 +1530,126 @@ async fn calls_are_started_answered_and_ended_the_same() {
         .await;
     t.same(json!({"cmd": "call-end"})).await;
 }
+
+/// Making an invitation and taking one up: refused, made (each twin's code
+/// its own, told alike), and taken up from a third device, one invitation
+/// of its for each twin.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn invitations_are_made_and_taken_up_the_same() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut t = Twins::start(dir.path()).await;
+    let ann = a_contact(&t, "Ann", 9);
+
+    // ---- invite ----
+    for req in [
+        json!({"cmd": "invite", "address": "not an address"}),
+        json!({"cmd": "invite", "address": ""}),
+    ] {
+        t.same(req).await;
+    }
+    for req in [
+        json!({"cmd": "invite"}),
+        json!({"cmd": "invite", "address": "203.0.113.9:7171", "name": "Dan"}),
+        json!({"cmd": "invite", "hosts_only": true, "no_introductions": false}),
+        json!({"cmd": "invite", "hosts_only": false, "no_introductions": true, "name": ""}),
+    ] {
+        let (_, msg) = encode_request(&req).unwrap();
+        let old = crate::control::by_name(&t.old, &msg).await;
+        let new = crate::control::typed::reply(&t.new, &msg).await.unwrap();
+        let (o, n) = (
+            typed_of::<InviteArgs>(&old).code,
+            typed_of::<InviteArgs>(&new).code,
+        );
+        // the secret is each one's own: the rest of the code is the same
+        assert_ne!(o, n);
+        t.alike(o.as_bytes(), n.as_bytes());
+        assert_eq!(t.swapped(old), new, "{req}");
+    }
+    t.same_message(&message_of(42, vec![(3, Value::from("yes"))]))
+        .await;
+
+    // ---- accept: refused ----
+    let own = typed_of::<InviteArgs>(
+        &crate::control::typed::reply(
+            &t.new,
+            &encode_request(&json!({"cmd": "invite"})).unwrap().1,
+        )
+        .await
+        .unwrap(),
+    )
+    .code;
+    for req in [
+        json!({"cmd": "accept"}),
+        json!({"cmd": "accept", "code": "not a code"}),
+        json!({"cmd": "accept", "code": "  "}),
+        json!({"cmd": "accept", "code": own}),
+        json!({"cmd": "accept", "code": own, "for": "Nobody"}),
+        json!({"cmd": "accept", "for": "Nobody"}),
+        json!({"cmd": "accept", "for": exact(&[4; 8])}),
+        json!({"cmd": "accept", "code": "x", "for": "Ann"}),
+        json!({"cmd": "accept", "code": "x", "for": exact(&ann)}),
+        json!({"cmd": "accept", "code": "x", "for": exact(&ann[..8])}),
+        json!({"cmd": "accept", "code": "x", "for": hex::encode(&ann[..8])}),
+    ] {
+        t.same(req).await;
+    }
+    t.same_message(&message_of(43, vec![(6, Value::from(5u64))]))
+        .await;
+    t.same_message(&message_of(
+        43,
+        vec![
+            (1, Value::from("x")),
+            (6, Value::from(format!("{EXACT}00"))),
+        ],
+    ))
+    .await;
+
+    // ---- accept: taken up from other devices, one for each twin (two
+    // sessions of one device's keys are one session to whoever answers),
+    // new ones for each case ----
+    let cases: [(Option<&str>, Option<&str>, Option<bool>); 3] = [
+        (Some("Bea"), None, None),
+        (None, Some("a QR code"), Some(true)),
+        (Some(" "), Some(""), Some(false)),
+    ];
+    for (i, (name, via, hosts_only)) in cases.into_iter().enumerate() {
+        let mut inviters = Vec::new();
+        for twin in ["old", "new"] {
+            let (paths, config) =
+                crate::testing::set_up(&dir.path().join(format!("inviter-{twin}-{i}")));
+            let inviter = Daemon::start(paths, config).await.unwrap();
+            // it answers its invitations: sessions are taken
+            tokio::spawn(inviter.clone().run());
+            inviters.push(inviter);
+        }
+        let code = |inviter: &Arc<Daemon>, name: &str| {
+            crate::contacts::invite(inviter, None, Some(name), Default::default())
+                .unwrap()
+                .code
+        };
+        let req = |code: String| {
+            json!({"cmd": "accept", "code": code, "name": name, "via": via,
+                   "hosts_only": hosts_only, "no_introductions": hosts_only})
+        };
+        let (a, b) = (&inviters[0], &inviters[1]);
+        let msg = t
+            .same_as(req(code(a, "Inviter")), req(code(b, "Inviter")))
+            .await;
+        let r = typed_of::<AcceptArgs>(&msg);
+        assert_eq!(r.name, name.unwrap_or("Inviter"));
+        assert_eq!(r.recovery_of, None);
+        // taken up already: the same person again
+        t.same_as(req(code(a, "Again")), req(code(b, "Again")))
+            .await;
+        // refused, by their id as bytes
+        for (d, inviter) in [(&t.old, a), (&t.new, b)] {
+            let them = inviter.core().identity.as_ref().unwrap().id();
+            crate::contacts::set(d, &exact(&them), "refuse").unwrap();
+        }
+        t.same_as(req(code(a, "Refused")), req(code(b, "Refused")))
+            .await;
+        for d in inviters {
+            let _ = d.stopping.send(true);
+        }
+    }
+}

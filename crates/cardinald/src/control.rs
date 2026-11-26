@@ -357,6 +357,7 @@ pub mod typed {
     use crate::api::typed::Ask;
     use crate::api::typed::Reference;
     use crate::api::{self, CallArgs, FilesArgs, FilesReply, MessagesArgs, MessagesReply};
+    use crate::api::{AcceptArgs, AcceptReply, InviteArgs, InviteReply};
     use crate::api::{
         BluetoothArgs, BluetoothReply, HostArgs, HostOffArgs, HostReply, HostsReply, NetworkArgs,
         NetworkReply, PeerAddArgs, PeerAddReply, PeerRemoveArgs, RouterArgs, RouterReply,
@@ -375,6 +376,7 @@ pub mod typed {
     };
     use crate::daemon::Daemon;
     use crate::daemon::PairState;
+    use cardinal_space::account;
 
     /// How a typed request is answered: its handler, given its arguments
     /// as they came. `asks!` takes the request's answering from here, so a
@@ -769,6 +771,44 @@ pub mod typed {
         }
     }
 
+    // ---- People, conversations and invitations ----
+
+    /// How a contact made by an invitation is regarded: trusted unless
+    /// `hosts_only`, introducing unless `no_introductions`.
+    fn regard(hosts_only: Option<bool>, no_introductions: Option<bool>) -> account::Regard {
+        account::Regard {
+            trusted: hosts_only != Some(true),
+            introductions: no_introductions != Some(true),
+        }
+    }
+
+    impl Answer for InviteArgs {
+        async fn answer(d: &Arc<Daemon>, a: &Self) -> anyhow::Result<InviteReply> {
+            let regard = regard(a.hosts_only, a.no_introductions);
+            crate::contacts::invite(d, a.address.as_deref(), a.name.as_deref(), regard)
+        }
+    }
+
+    impl Answer for AcceptArgs {
+        async fn answer(d: &Arc<Daemon>, a: &Self) -> anyhow::Result<AcceptReply> {
+            let met = account::Met {
+                how: account::MET_THEIR_INVITATION,
+                via: a.via.clone(),
+                ..Default::default()
+            };
+            // the person's own accept: the only one that takes a recovery's;
+            // `for`, whom a recovery invitation made for whomever this
+            // guardian names is for, as their contacts call them
+            let whom = match &a.r#for {
+                Some(w) => Some(crate::contacts::find_ref(d, w.as_ref())?.identity),
+                None => None,
+            };
+            let code = needed(a.code.as_deref(), "code")?;
+            let regard = regard(a.hosts_only, a.no_introductions);
+            crate::contacts::accept_for(d, code, a.name.as_deref(), regard, met, true, whom).await
+        }
+    }
+
     // ---- Calls ----
 
     /// The formats a call offers or takes: by name, of the draft, or 32
@@ -1083,6 +1123,7 @@ fn arg<'a>(req: &'a Value, name: &str) -> anyhow::Result<&'a str> {
 }
 
 /// How someone added by this request starts out.
+#[cfg(any(test, debug_assertions, feature = "by-name"))]
 fn regard(req: &Value) -> account::Regard {
     let says = |name| req.get(name).and_then(|v| v.as_bool()) == Some(true);
     account::Regard {
@@ -1190,11 +1231,13 @@ async fn handle(d: &Arc<Daemon>, req: &Value) -> anyhow::Result<Value> {
             let lost = req.get("lost").and_then(|v| v.as_bool()).unwrap_or(false);
             remove_device(d, arg(req, "who")?, words(req), lost).await
         }
+        #[cfg(any(test, debug_assertions, feature = "by-name"))]
         "invite" => {
             let address = req.get("address").and_then(|v| v.as_str());
             let name = req.get("name").and_then(|v| v.as_str());
-            crate::contacts::invite(d, address, name, regard(req))
+            crate::contacts::invite_by_name(d, address, name, regard(req))
         }
+        #[cfg(any(test, debug_assertions, feature = "by-name"))]
         "accept" => {
             let name = req.get("name").and_then(|v| v.as_str());
             let met = cardinal_space::account::Met {
@@ -1206,11 +1249,19 @@ async fn handle(d: &Arc<Daemon>, req: &Value) -> anyhow::Result<Value> {
             // `for`, whom a recovery invitation made for whomever this
             // guardian names is for, as their contacts call them
             let whom = match req.get("for").and_then(Value::as_str) {
-                Some(w) => Some(crate::contacts::find(d, w)?.identity),
+                Some(w) => Some(crate::contacts::find_by_name(d, w)?.identity),
                 None => None,
             };
-            crate::contacts::accept_for(d, arg(req, "code")?, name, regard(req), met, true, whom)
-                .await
+            crate::contacts::accept_for_by_name(
+                d,
+                arg(req, "code")?,
+                name,
+                regard(req),
+                met,
+                true,
+                whom,
+            )
+            .await
         }
         "invitations" => Ok(crate::contacts::invitations(d)),
         "cancel-invitation" => crate::contacts::cancel_invitation(d, arg(req, "id")?),

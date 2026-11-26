@@ -288,7 +288,7 @@ async fn use_invitation(
         "that introduction carries a recovery invitation, which is never used for one"
     );
     let name = (!name.is_empty()).then_some(name);
-    contacts::accept(
+    let r = contacts::accept(
         d,
         &invitation.to_text(),
         name,
@@ -296,7 +296,9 @@ async fn use_invitation(
         met,
         false,
     )
-    .await
+    .await?;
+    // by name, until `introduction-accept` is typed
+    Ok(json!({"name": r.name, "recovery_of": r.recovery_of.map(hex::encode)}))
 }
 
 /// Says no to an introduction. The introducer sees that.

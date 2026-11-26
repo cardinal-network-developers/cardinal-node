@@ -3351,15 +3351,14 @@ async fn client(cmd: Cmd) -> anyhow::Result<()> {
             hosts_only,
             no_introductions,
         } => {
-            let req = json!({
-                "cmd": "invite",
-                "address": address,
-                "name": name,
-                "hosts_only": hosts_only,
-                "no_introductions": no_introductions,
-            });
-            let v = call(&paths, req).await?;
-            println!("{}", v["code"].as_str().unwrap_or(""));
+            let args = api::InviteArgs {
+                address,
+                name,
+                hosts_only: Some(hosts_only),
+                no_introductions: Some(no_introductions),
+            };
+            let v = ask(&paths, args).await?;
+            println!("{}", v.code);
             Ok(())
         }
         Cmd::Accept {
@@ -3369,23 +3368,23 @@ async fn client(cmd: Cmd) -> anyhow::Result<()> {
             no_introductions,
             for_whom,
         } => {
-            let req = json!({
-                "cmd": "accept",
-                "code": code,
-                "for": for_whom,
-                "name": name,
-                "hosts_only": hosts_only,
-                "no_introductions": no_introductions,
-            });
-            let v = call(&paths, req).await?;
-            if v["recovery_of"].is_string() {
+            let args = api::AcceptArgs {
+                code: Some(code),
+                name,
+                via: None,
+                hosts_only: Some(hosts_only),
+                no_introductions: Some(no_introductions),
+                r#for: for_whom.map(api::typed::Reference::Typed),
+            };
+            let v = ask(&paths, args).await?;
+            if v.recovery_of.is_some() {
                 println!(
                     "In touch, as {}. It is no contact: see it with `cardinal guarding`, \
                      and check the fingerprint with them before you endorse.",
-                    v["name"].as_str().unwrap_or("")
+                    v.name
                 );
             } else {
-                println!("Connected to {}.", v["name"].as_str().unwrap_or(""));
+                println!("Connected to {}.", v.name);
             }
             Ok(())
         }

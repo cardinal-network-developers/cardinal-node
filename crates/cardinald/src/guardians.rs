@@ -2165,11 +2165,17 @@ pub(crate) fn accept_recovery<'a>(
     d: &'a Arc<Daemon>,
     code: &'a str,
     who: &'a EntryId,
-) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<Json>> + Send + 'a>> {
+) -> std::pin::Pin<
+    Box<dyn std::future::Future<Output = anyhow::Result<crate::api::AcceptReply>> + Send + 'a>,
+> {
     Box::pin(accept_recovery_now(d, code, who))
 }
 
-async fn accept_recovery_now(d: &Arc<Daemon>, code: &str, who: &EntryId) -> anyhow::Result<Json> {
+async fn accept_recovery_now(
+    d: &Arc<Daemon>,
+    code: &str,
+    who: &EntryId,
+) -> anyhow::Result<crate::api::AcceptReply> {
     let g = guarded(d)
         .into_iter()
         .find(|g| g.identity == *who)
@@ -2200,7 +2206,10 @@ async fn accept_recovery_now(d: &Arc<Daemon>, code: &str, who: &EntryId) -> anyh
         .await
     })
     .await?;
-    Ok(json!({"name": helper_petname(d, who), "recovery_of": hex::encode(who)}))
+    Ok(crate::api::AcceptReply {
+        name: helper_petname(d, who),
+        recovery_of: Some(*who),
+    })
 }
 
 /// The proposal this guardian's persona makes for a recovery of `g`
@@ -3040,4 +3049,61 @@ mod tests {
         let e = chain_allows(&mine, &theirs, &salt, &recovery, "Ana").unwrap_err();
         assert!(e.to_string().contains("does not hold"), "{e}");
     }
+}
+
+// ---- The handlers as they were by name ----
+//
+// What main had, whole, kept only to show that the typed handlers send the
+// same bytes (`api/same_bytes.rs`). They go with the way by name.
+
+/// `accept_recovery` as main had it, by name.
+#[cfg(any(test, debug_assertions, feature = "by-name"))]
+#[allow(dead_code, clippy::all)]
+pub(crate) fn accept_recovery_by_name<'a>(
+    d: &'a Arc<Daemon>,
+    code: &'a str,
+    who: &'a EntryId,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<Json>> + Send + 'a>> {
+    Box::pin(accept_recovery_now_by_name(d, code, who))
+}
+
+/// `accept_recovery_now` as main had it, by name.
+#[cfg(any(test, debug_assertions, feature = "by-name"))]
+#[allow(dead_code, clippy::all)]
+async fn accept_recovery_now_by_name(
+    d: &Arc<Daemon>,
+    code: &str,
+    who: &EntryId,
+) -> anyhow::Result<Json> {
+    let g = guarded(d)
+        .into_iter()
+        .find(|g| g.identity == *who)
+        .ok_or_else(|| anyhow::anyhow!("you do not guard them"))?;
+    let h = service(d, &g.persona.identity).ok_or_else(|| {
+        anyhow::anyhow!(
+            "your persona for {} acts from the device on which you accepted being their \
+             guardian; use that one",
+            g.name
+        )
+    })?;
+    let code = code.to_owned();
+    let met = account::Met {
+        how: account::MET_THEIR_INVITATION,
+        ..Default::default()
+    };
+    let whom = *who;
+    h.on(move |pd| async move {
+        crate::contacts::accept_for_by_name(
+            &pd,
+            &code,
+            None,
+            account::Regard::default(),
+            met,
+            true,
+            Some(whom),
+        )
+        .await
+    })
+    .await?;
+    Ok(json!({"name": helper_petname(d, who), "recovery_of": hex::encode(who)}))
 }
