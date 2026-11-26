@@ -4866,7 +4866,6 @@ fn reach_lines(out: &mut String, list: &[api::ReachSeen], whose: &str) {
     }
 }
 
-/// `cardinal contacts NAME`, in words.
 /// What a device that could not be read says, on lines of its own, or
 /// nothing.
 fn unreadable_line(u: Option<&api::Unreadable>) -> String {
@@ -4901,6 +4900,7 @@ fn path_line(p: Option<&api::KnownPath>) -> String {
     )
 }
 
+/// `cardinal contacts NAME`, in words.
 fn contact_status(v: &api::ContactStatusReply) -> String {
     let mut out = String::new();
     let mut head = printable(&v.name);
