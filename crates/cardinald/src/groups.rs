@@ -2144,6 +2144,14 @@ pub fn start(d: Arc<Daemon>) {
                             v.push((o.space, c.identity));
                         }
                     }
+                    // and the logs of everyone it names that are not here:
+                    // without the owner's, the group cannot be judged, nor
+                    // the offer shown (`spaces.md#holding-a-space`)
+                    for w in core.offer_logs(&c.identity) {
+                        if !core.others.contains_key(&w) {
+                            v.push((cardinal_sync::identity_log_label(&w), c.identity));
+                        }
+                    }
                 }
                 v
             };

@@ -768,3 +768,83 @@ fn a_second_conversation_node_displaces_nothing() {
     t.cy.says(&mut t.spaces[2], "hello there");
     assert!(said(&t.spaces[2]).contains(&"hello there".to_owned()));
 }
+
+/// "Which node is the conversation" (`profiles.md#relationship`): the one
+/// the genesis created, the lowest in rank of kind 1, wherever it has been
+/// moved; a successor carries it with its rank, so it is the same node
+/// there, deleted or not. A second one a writer made, whatever its name,
+/// is not it, in the space or in a successor.
+#[test]
+fn a_successor_reads_the_conversation_its_first_genesis_made() {
+    use cardinal_space::{NodeKind, ROOT};
+    let mut t = three();
+    let c = relationship::conversation(&t.spaces[0]).unwrap();
+    // Bo makes another, named to come first among the root's children
+    let fields = Record::new().with(1, "Not Family");
+    let kind = NodeKind::Uint(relationship::CONVERSATION);
+    write_as(&mut t, 1, vec![SpaceOp::create(kind, ROOT, "a", fields)]);
+    // Ana moves the real one into a folder of its own
+    write_as(
+        &mut t,
+        0,
+        vec![SpaceOp::create(NodeKind::Uint(7), ROOT, "folder", Record::new())],
+    );
+    let folder = {
+        let st = t.spaces[0].state();
+        let kids = st.children(&ROOT);
+        kids.into_iter().find(|n| n.name == "folder").unwrap().id
+    };
+    write_as(&mut t, 0, vec![SpaceOp::mv(c, folder, "conversation")]);
+    for sp in &t.spaces {
+        assert_eq!(relationship::conversation(sp), Some(c), "moved");
+        assert_eq!(group::name(sp), "Family");
+    }
+    let named = [(t.ana.id(), OWNER), (t.bo.id(), WRITER)];
+    let keys = [
+        t.ana.enc.public_key().clone(),
+        t.bo.enc.public_key().clone(),
+    ];
+    let refs: Vec<_> = keys.iter().collect();
+    let (mut s, _, _) = succeed(&mut t, &named, &refs);
+    assert_eq!(relationship::conversation(&s), Some(c), "in the successor");
+    assert_eq!(group::name(&s), "Family");
+    // deleted there, it is still the node the name is read from, and
+    // nothing is written under it
+    s.write(
+        &t.ana.log,
+        &t.ana.device.signing,
+        vec![SpaceOp::delete(c)],
+        Some(4),
+    )
+    .unwrap();
+    assert_eq!(relationship::the_conversation(&s), Some(c));
+    assert_eq!(relationship::conversation(&s), None);
+    assert_eq!(group::name(&s), "Family");
+}
+
+/// Who may ring someone only offered a group (`profiles.md#calls-guidance`,
+/// "Someone only offered the group"): a contact a valid entry of whose
+/// added them, the genesis included, with no valid `leave` of theirs
+/// descending from it. The genesis counts even where another addition of
+/// them came since; and a leave taken back by a later addition still
+/// stands between the person and the addition before it.
+#[test]
+fn whoever_added_someone_is_read_from_every_valid_addition_and_leave() {
+    let mut t = three();
+    let (ana, bo, cy) = (t.ana.id(), t.bo.id(), t.cy.id());
+    write_as(&mut t, 0, vec![SpaceOp::add_member(bo, ADMIN)]);
+    // Bo adds Cy, whom Ana's genesis named, again
+    write_as(&mut t, 1, vec![SpaceOp::add_member(cy, WRITER)]);
+    for sp in &t.spaces {
+        assert!(sp.added_by_and_not_left(&cy, &ana), "by the genesis");
+        assert!(sp.added_by_and_not_left(&cy, &bo), "by Bo's");
+    }
+    // Ana adds him once more; he leaves; Bo adds him back
+    write_as(&mut t, 0, vec![SpaceOp::add_member(cy, WRITER)]);
+    write_as(&mut t, 2, vec![SpaceOp::leave()]);
+    write_as(&mut t, 1, vec![SpaceOp::add_member(cy, WRITER)]);
+    for sp in &t.spaces {
+        assert!(!sp.added_by_and_not_left(&cy, &ana), "he left after Ana's");
+        assert!(sp.added_by_and_not_left(&cy, &bo), "Bo's came after");
+    }
+}

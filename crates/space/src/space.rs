@@ -487,30 +487,56 @@ impl Space {
         }
     }
 
-    /// Whether a valid entry of `by`'s added `who` here, with no `leave` of
-    /// `who`'s that stands descending from it: the genesis, where `by`
-    /// wrote it and it names `who`, or an `add_member` of theirs
+    /// Everyone the entries held here name, judged or not: their authors,
+    /// whom an `add_member` adds, and whom a successor's genesis says it was
+    /// judged with. Someone only offered the space needs their logs to
+    /// judge it (`spaces.md#holding-a-space`). Sorted.
+    pub fn named_identities(&self) -> Vec<IdentityId> {
+        let mut out = Vec::new();
+        for id in self.dag.log_order() {
+            let Some(e) = self.dag.get(id) else {
+                continue;
+            };
+            out.push(e.author());
+            for op in e.ops() {
+                match op.body() {
+                    SpaceOpBody::AddMember { identity, .. } => out.push(*identity),
+                    SpaceOpBody::Start { succession, .. } => {
+                        out.extend(succession.judged_with.iter().map(|(w, _)| *w));
+                    }
+                    _ => {}
+                }
+            }
+        }
+        out.sort();
+        out.dedup();
+        out
+    }
+
+    /// Whether a valid entry of `by`'s added `who` here, with no valid
+    /// `leave` of `who`'s descending from it: an `add_member` of theirs, or
+    /// the genesis, where `by` wrote it and it names `who`
     /// (`profiles.md#calls-guidance`, "Someone only offered the group").
+    /// Any valid leave counts, one that a later addition took back
+    /// included: that addition is then the one to look at.
     pub fn added_by_and_not_left(&self, who: &IdentityId, by: &IdentityId) -> bool {
-        let leaves = self.left();
-        let left_after = |add: &EntryId| {
-            leaves
-                .iter()
-                .any(|(w, leave)| w == who && self.dag.is_ancestor_or_self(add, leave))
-        };
-        let adds = self.judge.valid_adds().into_iter();
-        let theirs: Vec<EntryId> = adds
-            .filter(|(added, _)| added == who)
-            .map(|(_, add)| add)
-            .collect();
-        let by_add = theirs
+        let validity = self.validity();
+        let leaves: Vec<EntryId> = self
+            .judge
+            .leaves_of(who)
             .iter()
-            .any(|add| self.dag.get(add).is_some_and(|e| e.author() == *by) && !left_after(add));
-        // named by the genesis, which every leave descends from
-        let by_genesis = theirs.is_empty()
-            && self.creator == *by
-            && self.role_of(who).is_some()
-            && !self.has_left(who);
+            .filter(|l| validity.is_valid(l))
+            .copied()
+            .collect();
+        let free = |add: &EntryId| !leaves.iter().any(|l| self.dag.is_ancestor_or_self(add, l));
+        let by_add = self.judge.valid_adds().into_iter().any(|(added, add)| {
+            added == *who && self.dag.get(&add).is_some_and(|e| e.author() == *by) && free(&add)
+        });
+        // every leave descends from the genesis
+        let by_genesis = self.creator == *by
+            && validity.is_valid(&self.id)
+            && self.judge.genesis_names(who)
+            && leaves.is_empty();
         by_add || by_genesis
     }
 

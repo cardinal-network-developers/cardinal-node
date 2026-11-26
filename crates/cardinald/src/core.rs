@@ -2588,12 +2588,18 @@ impl Core {
                 v.push(o.space);
             }
         }
-        // The other members' logs, for what they write to be judged.
-        v.extend(
-            self.members_shared_with(identity)
-                .iter()
-                .map(identity_log_label),
-        );
+        // The other members' logs, for what they write to be judged; and
+        // with a group only offered, the logs of everyone it names.
+        for m in self
+            .members_shared_with(identity)
+            .into_iter()
+            .chain(self.offer_logs(identity))
+        {
+            let l = identity_log_label(&m);
+            if !v.contains(&l) {
+                v.push(l);
+            }
+        }
         v
     }
 
@@ -3039,6 +3045,60 @@ impl Core {
             for m in sp.validity().identities() {
                 if m != *identity && Some(m) != me && !out.contains(&m) {
                     out.push(m);
+                }
+            }
+        }
+        out
+    }
+
+    /// The identities whose logs go between this person and `contact` with
+    /// a group only offered (`spaces.md#holding-a-space`,
+    /// `profiles.md#group`): everyone the entries name of each group
+    /// `contact` offered this person, held here, and not joined or declined;
+    /// and of each group held here that this person offered `contact`. Not
+    /// the two of them, and nothing of any other space.
+    pub fn offer_logs(&self, contact: &[u8; 32]) -> Vec<[u8; 32]> {
+        let Some(me) = self.me() else {
+            return Vec::new();
+        };
+        let contacts = self.contacts();
+        let Some(c) = contacts
+            .iter()
+            .find(|c| c.identity == *contact && !c.refused && c.recovery_of.is_none())
+        else {
+            return Vec::new();
+        };
+        let Some(rel) = self.spaces.get(&c.space).and_then(|h| h.space.as_ref()) else {
+            return Vec::new();
+        };
+        let declined = self.declined();
+        let mut groups: Vec<SpaceId> = Vec::new();
+        for o in cardinal_space::group::offers(rel.state()) {
+            let taking = o.from == *contact;
+            if !(taking || o.from == me) || declined.contains(&o.space) {
+                continue;
+            }
+            // an offer of a group is an offer of the group that succeeds it
+            for g in [o.space, self.current(&o.space)] {
+                if taking && self.is_joined(&g) {
+                    continue;
+                }
+                if !groups.contains(&g) {
+                    groups.push(g);
+                }
+            }
+        }
+        let mut out: Vec<[u8; 32]> = Vec::new();
+        for g in groups {
+            let Some(sp) = self.spaces.get(&g).and_then(|h| h.space.as_ref()) else {
+                continue;
+            };
+            if sp.profile() != cardinal_space::group::GROUP {
+                continue;
+            }
+            for w in sp.named_identities() {
+                if w != me && w != *contact && !out.contains(&w) {
+                    out.push(w);
                 }
             }
         }

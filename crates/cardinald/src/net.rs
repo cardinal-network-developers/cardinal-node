@@ -158,6 +158,14 @@ impl Daemon {
                 {
                     // Another member's log, for what they write to be judged.
                     Access::Other(m)
+                } else if let Some(m) = core
+                    .offer_logs(&identity)
+                    .into_iter()
+                    .find(|m| identity_log_label(m) == *label)
+                {
+                    // With a group only offered, the log of someone it
+                    // names: without the owner's it cannot be judged.
+                    Access::Other(m)
                 } else {
                     Access::None
                 }

@@ -1528,3 +1528,158 @@ fn adding_people_to_a_call_between_two_rings_both() {
         "(round, bo rang, cy rang) where one did not: {missed:?}"
     );
 }
+
+/// "A ring that comes before a call has ended" (`profiles.md#calls-guidance`):
+/// Bo's device, rung by Ana between the two of them, keeps a ring of
+/// Ana's in a group, from her own device and naming her, until that call
+/// has ended, however long that takes within the time a call rings; then
+/// it rings, for what is left of that time. Only the last such ring is
+/// kept, and Ana's `end` of it drops it, so that nothing rings.
+#[test]
+fn a_group_ring_from_whom_a_call_between_two_is_with_waits_for_it_to_end() {
+    let root = tempfile::tempdir().unwrap();
+    let mut ana = person(root.path(), "ana");
+    let bo = person(root.path(), "bo");
+    meet(&ana, &bo);
+    let g = group_with(&ana, &[&bo], json!({"for_call": true}));
+    let space: [u8; 32] = unhex(&g);
+    let (ana_id, bo_id) = (identity_of(&bo, "Ana"), identity_of(&ana, "Bo"));
+    ana.stop();
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let to_bo = rt.block_on(Speaker::open(&ana, ana_id, &bo, bo_id));
+    // Ana's relationship with Bo: of Bo's spaces, the one a ring between
+    // two rings in (the account space takes no ring, and counts none)
+    let dir = std::fs::read_dir(bo.home.join("spaces")).unwrap();
+    let spaces: Vec<[u8; 32]> = dir
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|n| n.len() == 64 && *n != g)
+        .map(|n| unhex(&n))
+        .collect();
+    let rel = spaces
+        .into_iter()
+        .find(|s| {
+            rt.block_on(to_bo.ring(*s, [1; 16], ana_id, None));
+            (0..12).any(|_| {
+                std::thread::sleep(Duration::from_millis(250));
+                state(&bo) == "ringing"
+            })
+        })
+        .expect("no relationship took the ring");
+    assert!(call(&bo)["group"].is_null(), "{}", call(&bo));
+    // two rings in the group while Bo's device rings between the two
+    rt.block_on(to_bo.ring(space, [11; 16], ana_id, None));
+    std::thread::sleep(Duration::from_millis(300));
+    rt.block_on(to_bo.ring(space, [12; 16], ana_id, None));
+    // longer than a signal may take: the call between the two ends late
+    std::thread::sleep(Duration::from_secs(5));
+    assert!(call(&bo)["group"].is_null(), "{}", call(&bo));
+    rt.block_on(to_bo.end(rel, [1; 16]));
+    wait("the kept ring rings", 10, || {
+        call(&bo)["group"] == g.as_str() && state(&bo) == "ringing"
+    });
+    assert_eq!(call(&bo)["id"], hex::encode([12u8; 16]), "not the last");
+    assert_eq!(call(&bo)["caller"]["name"], "Ana", "{}", call(&bo));
+    ask(&bo, json!({"cmd": "call-end"}));
+    rings_not(&bo, "the ring the last one replaced");
+
+    // again, and Ana gives up before the call between the two ends
+    rt.block_on(to_bo.ring(rel, [2; 16], ana_id, None));
+    wait("bo rings between the two", 10, || state(&bo) == "ringing");
+    rt.block_on(to_bo.ring(space, [13; 16], ana_id, None));
+    std::thread::sleep(Duration::from_millis(500));
+    rt.block_on(to_bo.end(space, [13; 16]));
+    std::thread::sleep(Duration::from_millis(500));
+    rt.block_on(to_bo.end(rel, [2; 16]));
+    wait("the call between the two ends", 10, || call(&bo).is_null());
+    rings_not(&bo, "a kept ring its caller ended");
+}
+
+/// D93, "Holding a space": an admin who is not the owner adds a contact of
+/// theirs whom the owner does not know. The person added takes the group
+/// from the admin's devices, and with it the logs of everyone it names,
+/// the owner's among them: the offer shows, the admin's ring rings, and
+/// answering joins the group.
+#[test]
+fn an_admin_adds_someone_the_owner_does_not_know() {
+    let root = tempfile::tempdir().unwrap();
+    let ana = person(root.path(), "ana");
+    let bo = person(root.path(), "bo");
+    let cy = person(root.path(), "cy");
+    meet(&ana, &bo);
+    meet(&bo, &cy);
+    let g = group_with(&ana, &[&bo], json!({"for_call": true}));
+    ask(
+        &ana,
+        json!({"cmd": "group-role", "group": g, "who": "Bo", "role": "admin"}),
+    );
+    wait("bo is an admin there", 30, || {
+        let m = reply(&bo, &json!({"cmd": "group-members", "group": g}));
+        m["members"]
+            .as_array()
+            .is_some_and(|m| m.iter().any(|m| m["role"] == "admin"))
+    });
+    add(&bo, &g, &cy, 3);
+    let o = offer(&cy, &g).unwrap();
+    assert_eq!(o["for_call"], true, "{o}");
+    wait("bo and cy in touch", 20, || in_touch(&bo, "Cy"));
+    ask(
+        &bo,
+        json!({"cmd": "call-start", "group": g, "ring": ["Cy"]}),
+    );
+    wait("cy rings", 20, || state(&cy) == "ringing");
+    let c = call(&cy);
+    assert_eq!(c["joins"], true, "{c}");
+    assert_eq!(c["caller"]["name"], "Bo", "{c}");
+    ask(&cy, json!({"cmd": "call-answer", "join": true}));
+    wait("cy joined", 20, || joined(&cy, &g).is_some());
+    assert_eq!(state(&cy), "live");
+    wait("cy linked", 20, || call(&cy)["linked"].as_u64() >= Some(1));
+    for d in [&bo, &cy] {
+        ask(d, json!({"cmd": "call-end"}));
+    }
+}
+
+/// D93: a group the person joins on another of their devices while its
+/// call rings here is no lapse: the call rings on, as a call in a group
+/// they are in, and is answered without `join`.
+#[test]
+fn a_group_joined_on_another_device_while_its_call_rings_rings_on() {
+    let root = tempfile::tempdir().unwrap();
+    let ana = person(root.path(), "ana");
+    let bo = person(root.path(), "bo");
+    let cy = person(root.path(), "cy");
+    let mut cy2 = Dev::new(root.path(), "cy2", free_port());
+    cy2.start();
+    ask(
+        &cy2,
+        json!({"cmd": "conditions", "plugged_in": false, "metered": false}),
+    );
+    pair(&cy, &cy2);
+    meet(&ana, &bo);
+    meet(&ana, &cy);
+    let g = group_with(&ana, &[&bo], json!({"for_call": true}));
+    add(&ana, &g, &cy, 3);
+    wait("cy2 holds the offer open", 60, || {
+        offer(&cy2, &g).is_some_and(|o| o["members"] == 3)
+            && reply(&cy2, &json!({"cmd": "group-members", "group": g}))["ok"] == true
+    });
+    ask(
+        &ana,
+        json!({"cmd": "call-start", "group": g, "ring": ["Cy"]}),
+    );
+    wait("cy rings", 20, || state(&cy) == "ringing");
+    assert_eq!(call(&cy)["joins"], true, "{}", call(&cy));
+    ask(&cy2, json!({"cmd": "group-join", "group": g}));
+    wait("the join reaches cy", 30, || joined(&cy, &g).is_some());
+    for _ in 0..8 {
+        assert_eq!(state(&cy), "ringing", "{} / {}", call(&cy), ended(&cy));
+        std::thread::sleep(Duration::from_millis(250));
+    }
+    assert!(call(&cy).get("joins").is_none_or(|j| j != true), "{}", call(&cy));
+    ask(&cy, json!({"cmd": "call-answer"}));
+    assert_eq!(state(&cy), "live");
+    for d in [&ana, &cy, &cy2] {
+        let _ = reply(d, &json!({"cmd": "call-end"}));
+    }
+}

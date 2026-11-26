@@ -1364,8 +1364,9 @@ Readings:
   space steps over what it has no meaning for, with everything beneath
   it: the files view lists only folders, files and links, and only in the
   root or in folders all the way up (`Files::list`, `Files::belongs`); a
-  conversation is a conversation node at the top, a message a message in
-  it, a reaction a reaction under a message; an account's devices,
+  conversation is the conversation node, wherever it has been moved
+  (`profiles.md#relationship`, "Which node is the conversation"), a
+  message a message in it, a reaction a reaction under a message; an account's devices,
   contacts, hosts and spaces are those at the top, and a placement one
   under a space node. An op the profile does not define still puts its
   entry out of the state.
@@ -2385,8 +2386,8 @@ asks for around that is not built yet.
   inviter's after receiving `genesis`.
 - **Spec gap: the conversation is not its creator's alone.** `profiles.md`
   makes messages, reactions and read markers author-owned, but not the
-  conversation node, so a contact can delete or move it, which hides every
-  message until it is restored.
+  conversation node, so a contact can delete it, which hides every
+  message until it is restored. Moved, it is the conversation still.
 - **Groups are made with an owner and writers only.** Nothing makes anyone
   an admin or a reader. A group is offered only
   to the creator's or an admin's contacts, since the offer goes in a
@@ -2498,104 +2499,44 @@ asks for around that is not built yet.
 Readings chosen where the specification is silent, and what is not built:
 
 - **`last_call` and *call ended* `at`** are milliseconds since 1970 by this
-  device's clock, as a message's `time` is; the specification says only
-  "when". `last_call` is kept in the space's notes on this device, so it is
-  there for every group this device holds (open or only offered); a ring
-  that came before the group was held never rang, so nothing is lost. It
-  counts the calls this person made, rang for or was on, never one the
-  device only carried.
-- **A kept ring** (one from a contact for a group not offered yet, or not
-  open) is kept only where it names its sender as caller and came from
-  their own device, for a space this person has not joined or declined
-  and does not hold as anything but a group. It counts towards how often
-  that contact may ring when it arrives, not again when it rings. Once
-  the rest holds it rings for what is left of the 45 s from its arrival,
-  not 45 s more. A ring from a member who did not offer the group is kept
-  too (the device cannot tell it will never ring) and lapses.
+  device's clock, as a message's `time` is. `last_call` is kept in the
+  space's notes on this device, so it is there for every group this device
+  holds (open or only offered); a ring that came before the group was held
+  never rang, so nothing is lost.
+- **A kept ring** (one for a group not offered yet, or not open) is kept
+  only for a space this person has not joined or declined and does not
+  hold as anything but a group. A ring from a member who did not offer the
+  group is kept too, since the device cannot tell yet that it will never
+  ring, and lapses.
 - **"Fetched from that contact's devices"** is not checked: this device
-  fetches an offered group from whoever offered it, and from nobody else,
-  but does not record where the copy it holds came from.
-- **Own devices, in a group only offered**: of their signals only a `join`
-  that is not carrying is taken, to stop ringing here when another of the
-  person's devices answered. Every other signal there is ignored.
+  fetches an offered group, and the identity logs of those it names, from
+  whoever offered it and from nobody else, but does not record where the
+  copy it holds came from.
+- **The identity logs that go with an offer** ("everyone the space's
+  entries name", `spaces.md#holding-a-space`) are read from the entries
+  held, judged or not: their authors, whom an `add_member` adds, and whom
+  a successor's genesis says it was judged with (`start` field 8), but not
+  `agent_of`, which is display only. They go between two contacts only for
+  a group one of them offered the other, held, and on the side offered
+  not joined or declined; any other space gives nothing.
+- **"A device on a call between two"**, for a group's ring that comes
+  before that call has ended, is one whose call held is between this
+  person and the caller, whatever it stands at: calling, ringing or live.
+  The kept ring rings only if what let it ring still holds when that call
+  ends.
 - **`ring` names** are resolved as `group-members` names them (a contact's
-  petname, the group's name for a member, or an id). A refused contact, or
-  a recovery's relationship, is not "a contact" for this purpose: ringing
-  them is refused. The same person named twice is rung once.
-- **`call-start` `ring` while this person is on the group's call**, still
-  calling with nobody else on it (`calling`) as well as `live`: those named
-  are rung into it. The request is refused only as `apps.md` lists; that
-  none of those named can be reached now is not among them, on a call of
-  one's own or joining one going on. Each named is rung at once on a
-  session there is, one session to each device; one with none is looked
-  for once, after the request has answered, and rung if found while the
-  call is still this person's. A call started that way that reaches nobody
-  rings out as any call does.
-- **A ring for some is ignored** unless it names its sender as caller,
-  before it counts towards how often anyone rings; so is any `ring` with a
-  `3:` other than 1, a value that is not a number included. Between two
-  people `3:` on a `ring` is not defined, and is not looked at there.
-- **`call` `caller`** is never given on the device that called, nor on one
-  that joined a call going on without being rung, nor changed on one
-  already on the call. While the device rings it is set by the first
-  `ring` for the call that came from the caller's own device, even after
-  the device already rang for a ring passed on.
-- **`call-answer` on a group only offered**: if the call stopped ringing
-  while the group was being joined, the group stays joined and the answer
-  fails ("that call has stopped ringing"). `join` is looked at first, then
-  everything that let the call ring, then `reach`.
-- **A ring in a group only offered that stops holding**, as when the person
-  declines the group on another device, the adder leaves, or the group is
-  succeeded or ends while it rings, stops the ringing when this device
-  next looks (on any change): as `declined_elsewhere` where the group is
-  now declined, and else as `missed`. A ring naming a group that has been
-  succeeded does not ring, and the call ringing there when the successor
-  arrives stops.
-- **"An entry of that contact's added its person, with no `leave` of
-  theirs descending from it"** is read as: a valid `add_member` of the
-  person by that contact with no standing `leave` of the person's after it,
-  or, where nothing but the genesis names the person, a genesis that
-  contact wrote and no standing `leave` of theirs.
-- **A caller who gives up** sends its `end` to each device it rang directly
-  for the call, the whole group's `ring` and rings for some alike, when it
-  leaves (by `call-end`, or by ringing out) while nobody else was heard on
-  it. A ringing device that carries the call and hears someone on it other
-  than the caller takes such an `end` as the caller leaving a call going
-  on, and goes on ringing: on the wire the two are the same `end`.
-- **A group's ring from someone this device is on a call with between the
-  two** (the GTK client's "Add people": end the call with Bo, then ring a
-  group Bo is in) is not lost when it arrives before that call's `end`, as
-  it may: the two travel on streams of their own. Such a ring, from that
-  person's own device naming them, waits up to 3 s for the call between the
-  two to end, and rings then for what is left of its time; where it does
-  not end in that time, the ring is dropped, as any group ring to a device
-  on a call is. The specification does not say how a device orders the
-  two; this is the strictest simple reading that rings once that call is
-  over.
+  petname, the group's name for a member, or an id). A recovery's
+  relationship is not "a contact" for this purpose: ringing it is refused.
+- **`3:` on a `ring` between two people** is not defined, and is not
+  looked at there.
+- **`call` `caller`**, while the device rings, is set by the first `ring`
+  for the call that came from the caller's own device, even after the
+  device already rang for a ring passed on.
 - **`group-set` `for_call` true** is refused before anything else in the
   request is looked at, so a name given with it is not written either.
   `for_call` false on a call group writes `set` field 3 false; on any other
   group it writes nothing. Only an owner or admin may send it, as the rest
   of `group-set`.
-- **`group-role`** matched the specification but for one leniency, now
-  gone: it took `writer` for `member`. It takes `admin`, `member` and
-  `reader` alone, as `group-members` says them, and is refused before
-  anything is written for a member who has left.
-- **The conversation node** is, in a group or relationship that succeeds
-  nothing, the one its genesis created ("The genesis creates one
-  conversation node"), and no other: its name and the call mark are read
-  from it whether or not it is deleted, and messages go under it while it
-  is not. In a successor it was carried, and which carried node it is the
-  specification does not say: the first carried one, by name, not
-  deleted, as before. A second conversation node a writer made in an
-  earlier space and that was carried could still be taken for it there.
-- **Found, not fixed: an admin adding someone the owner does not know.**
-  The person added holds the group but cannot judge it, since nothing
-  fetches the owner's log for a group they are only offered, and their
-  device takes another member's log only for a group it can already
-  judge: the offer never shows. So an admin who is not the owner can add
-  to a call only people who are the owner's contacts too. Found by this
-  work's tests; it predates D92.
 - **Not built**: anything in `later.md` "Calls with several people" (a move
   nobody hears, a move over the live call, ringing a member who is not a
   contact, who may send what, the note for the one in the middle); leaving

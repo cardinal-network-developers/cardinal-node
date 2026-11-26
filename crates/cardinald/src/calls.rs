@@ -1002,6 +1002,7 @@ async fn gave_up(d: &Daemon, call: &Call) {
 /// devices: the call is then one nobody answered. A ring kept for it is
 /// dropped. An `end` from anyone else stops no ringing.
 fn caller_gave_up(d: &Daemon, from: &Session, them: &[u8; 32], space: &SpaceId, id: &[u8; 16]) {
+    drop_after_call(d, them, space, id);
     {
         let mut kept = d.kept_rings.lock().unwrap_or_else(|e| e.into_inner());
         if kept
@@ -2163,17 +2164,22 @@ async fn group_signal(
     Ok(())
 }
 
-/// How long a ring from someone this device is on a call with between the
-/// two waits for that call's `end`: the two travel apart, on streams of
-/// their own, as when someone ends a call with this person and at once
-/// rings them in a group made to bring another in.
-const THEIR_END_WITHIN: Duration = SIGNAL_WITHIN;
+/// The ring kept on a device on a call between two, from the person it is
+/// on that call with, until that call ends (`profiles.md#calls-guidance`,
+/// "A ring that comes before a call has ended"): only the last one, told
+/// from those it replaced by how many came before it.
+#[derive(Default)]
+pub struct AfterCall {
+    count: u64,
+    kept: Option<([u8; 16], SpaceId, [u8; 32])>,
+}
 
 /// Rings here for group call `id`, for `rings_for`, if no call is held:
 /// whether it does. Where the call held is one between this person and
 /// `caller`, rung from `caller`'s own device, it is the call they are
-/// ending: the ring waits for it to end, for [`THEIR_END_WITHIN`] at most,
-/// and rings then, for what is left of `rings_for`; that counts as ringing.
+/// ending: the ring is kept, the last such one alone, until that call ends,
+/// and rings then for what is left of `rings_for`; where the call has not
+/// ended by then, it is dropped and nothing rings. Kept counts as ringing.
 fn ring_here(
     d: &Arc<Daemon>,
     s: &Session,
@@ -2189,20 +2195,48 @@ fn ring_here(
             .filter(|c| !c.group && caller.is_some_and(|w| c.who == w))
             .map(|c| c.over.subscribe())
     };
-    if let Some(mut over) = ending {
-        let (d, s) = (d.clone(), s.clone());
-        tokio::spawn(async move {
-            let began = Instant::now();
-            let ended = tokio::time::timeout(THEIR_END_WITHIN, over.wait_for(|o| *o)).await;
-            let left = rings_for.saturating_sub(began.elapsed());
-            // over, or gone: either way that call is not held now
-            if ended.is_ok() && left > Duration::ZERO {
-                ring_now(&d, &s, id, space, name, caller, left);
+    let (Some(mut over), Some(them)) = (ending, caller) else {
+        return ring_now(d, s, id, space, name, caller, rings_for);
+    };
+    let mine = {
+        let mut after = d.after_call.lock().unwrap_or_else(|e| e.into_inner());
+        after.count += 1;
+        after.kept = Some((id, space, them));
+        after.count
+    };
+    let (d, s) = (d.clone(), s.clone());
+    tokio::spawn(async move {
+        let began = Instant::now();
+        let ended = tokio::time::timeout(rings_for, over.wait_for(|o| *o)).await;
+        let left = rings_for.saturating_sub(began.elapsed());
+        // still the one kept: not replaced by a later ring, nor dropped by
+        // its caller's `end`
+        let kept = {
+            let mut after = d.after_call.lock().unwrap_or_else(|e| e.into_inner());
+            let still = after.count == mine && after.kept.is_some();
+            if still {
+                after.kept = None;
             }
-        });
-        return true;
+            still
+        };
+        // over, or gone: either way that call is not held now. Whatever let
+        // the ring ring must hold still.
+        let holds = crate::groups::shared_group(&d, &space, &them).is_some()
+            || crate::groups::offered_ring(&d, &space, &them).is_some();
+        if kept && ended.is_ok() && left > Duration::ZERO && holds {
+            ring_now(&d, &s, id, space, name, caller, left);
+        }
+    });
+    true
+}
+
+/// Drops the ring kept until a call between two ends, where it is for
+/// group call `id` in `space` and `them` rang it.
+fn drop_after_call(d: &Daemon, them: &[u8; 32], space: &SpaceId, id: &[u8; 16]) {
+    let mut after = d.after_call.lock().unwrap_or_else(|e| e.into_inner());
+    if after.kept == Some((*id, *space, *them)) {
+        after.kept = None;
     }
-    ring_now(d, s, id, space, name, caller, rings_for)
 }
 
 /// [`ring_here`], where nothing is waited for.

@@ -638,22 +638,20 @@ pub fn conversation(space: &Space) -> Option<NodeId> {
     (!n.deleted).then_some(c)
 }
 
-/// The conversation node, deleted or not. "The genesis creates one
-/// conversation node" (`profiles.md#relationship`): in a space that
-/// succeeds none, it is the one its genesis created, and no other, so
-/// that a second one someone writes beside it stands for nothing. In a
-/// successor it was carried, and which carried node it is, the
-/// specification does not say: the first carried one not deleted, as
-/// before.
+/// The conversation node, deleted or not (`profiles.md#relationship`,
+/// "Which node is the conversation"): the one the genesis created, of the
+/// nodes of kind 1 the one created first, the lowest in rank, wherever it
+/// has been moved. A successor carries it with its rank, so there it is
+/// the lowest-ranked of kind 1, and carried; one made in the successor is
+/// never it. Another a writer made is not it, and nothing is read from it.
 pub fn the_conversation(space: &Space) -> Option<NodeId> {
     let state = space.state();
-    let kids = state.children(&ROOT).into_iter();
-    let mut kids = kids.filter(|n| n.kind == NodeKind::Uint(CONVERSATION));
-    let found = match space.succeeds() {
-        None => kids.find(|n| n.created_in == space.id()),
-        Some(_) => kids.find(|n| state.is_carried(&n.id) && !n.deleted),
+    let n = state.first_of_kind(&NodeKind::Uint(CONVERSATION))?;
+    let it = match space.succeeds() {
+        None => n.created_in == space.id(),
+        Some(_) => state.is_carried(&n.id),
     };
-    found.map(|n| n.id)
+    it.then_some(n.id)
 }
 
 /// The messages of a relationship space, in log order, which every device
