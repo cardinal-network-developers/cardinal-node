@@ -143,50 +143,127 @@ pub async fn ask<A: Ask>(
     socket: &std::path::Path,
     args: &A,
 ) -> anyhow::Result<Result<A::Reply, api::typed::Failed>> {
-    let mut all = match ask_one(socket, args).await? {
-        Ok(r) => r,
-        Err(f) => return Ok(Err(f)),
-    };
-    if args.one_page() {
-        return Ok(Ok(all));
-    }
-    let mut asked = args.clone();
-    while let Some(next) = asked.next_page(&all) {
-        let page = match ask_one(socket, &next).await? {
-            Ok(r) => r,
-            Err(f) => return Ok(Err(f)),
-        };
-        let grew = A::join(&mut all, page);
-        asked = next;
-        if !grew {
-            break;
-        }
-    }
-    A::whole(&mut all);
-    Ok(Ok(all))
+    let mut pages = Box::new(Pages {
+        one_page: args.one_page(),
+        asked: args.clone(),
+        all: None,
+        failed: None,
+    });
+    asking(socket, &mut *pages).await?;
+    pages.done()
 }
 
-/// [`ask`], one page of it.
-async fn ask_one<A: Ask>(
+/// A typed request asked page after page ([`ask`]): what was asked last,
+/// and the pages joined so far, or how one failed.
+struct Pages<A: Ask> {
+    /// Whether the arguments asked for one page themselves.
+    one_page: bool,
+    asked: A,
+    all: Option<A::Reply>,
+    failed: Option<api::typed::Failed>,
+}
+
+/// What [`asking`] does with a request, whatever its type: the message to
+/// send next, and what to make of its reply.
+trait Paging {
+    /// Its row.
+    fn request(&self) -> &'static api::Request;
+    /// The next page's request, as a message, if one is to be asked.
+    fn next(&mut self) -> anyhow::Result<Option<Vec<u8>>>;
+    /// Takes the reply to the message [`Paging::next`] gave: whether to
+    /// go on.
+    fn took(&mut self, reply: &[u8]) -> anyhow::Result<bool>;
+}
+
+impl<A: Ask> Paging for Pages<A> {
+    fn request(&self) -> &'static api::Request {
+        A::REQUEST
+    }
+    fn next(&mut self) -> anyhow::Result<Option<Vec<u8>>> {
+        match &self.all {
+            None => self.asked.encode().map(Some),
+            Some(_) if self.one_page => Ok(None),
+            Some(all) => match self.asked.next_page(all) {
+                Some(next) => {
+                    let msg = next.encode()?;
+                    self.asked = next;
+                    Ok(Some(msg))
+                }
+                None => Ok(None),
+            },
+        }
+    }
+    fn took(&mut self, reply: &[u8]) -> anyhow::Result<bool> {
+        let page = match api::typed::read_reply::<A>(reply)? {
+            Ok(r) => r,
+            Err(f) => {
+                self.failed = Some(f);
+                return Ok(false);
+            }
+        };
+        match &mut self.all {
+            None => {
+                self.all = Some(page);
+                Ok(true)
+            }
+            Some(all) => Ok(A::join(all, page)),
+        }
+    }
+}
+
+impl<A: Ask> Pages<A> {
+    /// The reply, every page joined, or how a page failed.
+    #[inline(never)]
+    fn done(self) -> anyhow::Result<Result<A::Reply, api::typed::Failed>> {
+        if let Some(f) = self.failed {
+            return Ok(Err(f));
+        }
+        let mut all = self.all.expect("a reply was read");
+        if !self.one_page {
+            A::whole(&mut all);
+        }
+        Ok(Ok(all))
+    }
+}
+
+/// [`ask`], written once for every request: each page asked in turn.
+/// Boxed, so that each request's [`ask`] only waits for it.
+fn asking<'a>(
+    socket: &'a std::path::Path,
+    p: &'a mut (dyn Paging + Send),
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<()>> + Send + 'a>> {
+    Box::pin(async move {
+        while let Some(msg) = p.next()? {
+            let reply = ask_one(socket, p.request(), &msg).await?;
+            if !p.took(&reply)? {
+                break;
+            }
+        }
+        Ok(())
+    })
+}
+
+/// [`ask`], one page of it: its reply's bytes.
+async fn ask_one(
     socket: &std::path::Path,
-    args: &A,
-) -> anyhow::Result<Result<A::Reply, api::typed::Failed>> {
-    let msg = args.encode()?;
+    spec: &'static api::Request,
+    msg: &[u8],
+) -> anyhow::Result<Vec<u8>> {
     let tracing = TRACE.load(Ordering::Relaxed);
     if tracing {
-        eprintln!("> {}", api::render_request(&msg));
+        eprintln!("> {}", api::render_request(msg));
     }
     let (mut r, mut w) = transport::connect(socket).await?;
-    w.send(&msg).await?;
+    w.send(msg).await?;
     let reply = match r.recv().await? {
         Some(Received::Message(m)) => m,
         Some(Received::TooLarge) => anyhow::bail!("the daemon's reply was larger than a message"),
         None => anyhow::bail!("the daemon closed the connection"),
     };
     if tracing {
-        eprintln!("< {}", api::render_reply(A::REQUEST, &reply));
+        eprintln!("< {}", api::render_reply(spec, &reply));
     }
-    api::typed::read_reply::<A>(&reply)
+    Ok(reply)
 }
 
 /// Starts serving the local interface.
@@ -512,11 +589,19 @@ pub mod typed {
 
     /// The reply to `a`, as a message.
     pub async fn answer_of<A: Answer>(d: &Arc<Daemon>, a: &A) -> Vec<u8> {
-        let reply = match A::answer(d, a).await {
-            Ok(reply) => a.reply_bytes(reply),
-            Err(e) => super::failed(&super::capitalized(A::REQUEST.name, e)),
+        let reply = A::answer(d, a).await.map(|reply| a.reply_bytes(reply));
+        answered(A::REQUEST, reply)
+    }
+
+    /// The reply's bytes, or the message saying why there is none:
+    /// [`answer_of`], written once for every request.
+    #[inline(never)]
+    fn answered(spec: &'static api::Request, reply: anyhow::Result<Vec<u8>>) -> Vec<u8> {
+        let reply = match reply {
+            Ok(reply) => reply,
+            Err(e) => super::failed(&super::capitalized(spec.name, e)),
         };
-        super::checked(A::REQUEST, reply)
+        super::checked(spec, reply)
     }
 
     /// `reply`, typed, against the request's answer by name: the same

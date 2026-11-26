@@ -1411,10 +1411,14 @@ fn utf8(p: &std::path::Path) -> anyhow::Result<String> {
 /// Asks the service (`cardinald::api::typed`): the reply as its own
 /// value, or why it was not done.
 async fn ask<A: api::typed::Ask>(paths: &Paths, args: A) -> anyhow::Result<A::Reply> {
-    match ask_or_failed(paths, &args).await? {
-        Ok(r) => Ok(r),
-        Err(failed) => anyhow::bail!("{}", failed.why),
-    }
+    ask_or_failed(paths, &args).await?.map_err(not_done)
+}
+
+/// A reply that did not do what was asked, as an error: why.
+#[cold]
+#[inline(never)]
+fn not_done(failed: api::typed::Failed) -> anyhow::Error {
+    anyhow::anyhow!("{}", failed.why)
 }
 
 /// The service's reply, whether it did what was asked or not.
@@ -1422,15 +1426,21 @@ async fn ask_or_failed<A: api::typed::Ask>(
     paths: &Paths,
     args: &A,
 ) -> anyhow::Result<Result<A::Reply, api::typed::Failed>> {
-    let reply = control::ask(&paths.socket, args).await;
-    // The service answered, with what this command line cannot read: say
-    // so, and not that none is running.
-    if let Err(e) = &reply {
-        if let Some(u) = e.downcast_ref::<api::typed::Unreadable>() {
-            anyhow::bail!("{u} to {}", A::REQUEST.name);
-        }
+    control::ask(&paths.socket, args)
+        .await
+        .map_err(|e| unanswered(paths, A::REQUEST.name, e))
+}
+
+/// Why `request` had no reply that could be read: the service answered
+/// with what this command line cannot read (said so, and not that none is
+/// running), or as [`not_answering`] says.
+#[cold]
+#[inline(never)]
+fn unanswered(paths: &Paths, request: &str, e: anyhow::Error) -> anyhow::Error {
+    if let Some(u) = e.downcast_ref::<api::typed::Unreadable>() {
+        return anyhow::anyhow!("{u} to {request}");
     }
-    not_answering(paths, reply)
+    not_answering(paths)
 }
 
 /// What a person typed to name something: a ref as text.
@@ -1443,25 +1453,26 @@ fn or_null<T: std::fmt::Display>(v: Option<T>) -> String {
     v.map_or_else(|| "null".to_owned(), |x| x.to_string())
 }
 
-/// A reply, or why there was none: what holds the data, if no daemon
-/// answered.
-fn not_answering<T>(paths: &Paths, reply: anyhow::Result<T>) -> anyhow::Result<T> {
-    if reply.is_err() {
-        // A daemon refuses to start on a store this version cannot read:
-        // say that, and not only that none is running.
-        cardinald::format::check(paths)?;
-        // One that holds the data and does not answer is not "not
-        // running": it has not bound its socket yet, or listens elsewhere.
-        if held(paths)? {
-            return Err(starting(paths));
-        }
+/// Why there was no reply: what holds the data, if no daemon answered.
+#[cold]
+#[inline(never)]
+fn not_answering(paths: &Paths) -> anyhow::Error {
+    // A daemon refuses to start on a store this version cannot read:
+    // say that, and not only that none is running.
+    if let Err(e) = cardinald::format::check(paths) {
+        return e;
     }
-    reply.map_err(|_| {
-        anyhow::anyhow!(
-            "the cardinal daemon is not running. Start it with `cardinal daemon` (or \
-             `systemctl --user start cardinal` if you installed it with `cardinal install`)."
-        )
-    })
+    // One that holds the data and does not answer is not "not
+    // running": it has not bound its socket yet, or listens elsewhere.
+    match held(paths) {
+        Err(e) => return e,
+        Ok(true) => return starting(paths),
+        Ok(false) => {}
+    }
+    anyhow::anyhow!(
+        "the cardinal daemon is not running. Start it with `cardinal daemon` (or \
+         `systemctl --user start cardinal` if you installed it with `cardinal install`)."
+    )
 }
 
 /// Asks the service; when this device lacks the power for the action,
