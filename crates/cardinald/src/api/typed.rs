@@ -24,6 +24,7 @@
 //! | `Vec<T>` | a list of T | always, empty or not |
 //! | a typed record | its record | always |
 //! | `Option<T>` | as T | only when it is `Some` |
+//! | `Box<T>` | as T | as T: for a record that holds itself |
 //! | `n gone name: T` | a number no longer used, once T | never; passed over when read |
 //!
 //! A field that is not an `Option` is one this service always sends; read
@@ -471,6 +472,30 @@ impl<T: Wire> Wire for Vec<T> {
     }
 }
 
+/// A value held on the heap, as a record that holds itself holds itself:
+/// on the wire it is the value. Its row is named in the declaration
+/// (`n field: Option<Box<T>> as {ROW}`), since a row that holds itself
+/// cannot be had from the type.
+impl<T: Wire> Wire for Box<T> {
+    const TY: Ty = T::TY;
+    const LIST: Ty = T::LIST;
+    fn sent(&self) -> bool {
+        (**self).sent()
+    }
+    fn check(&self, at: &At) -> Result<(), String> {
+        (**self).check(at)
+    }
+    fn encode_into(&self, out: &mut Vec<u8>) {
+        (**self).encode_into(out)
+    }
+    fn encoded_len(&self) -> usize {
+        (**self).encoded_len()
+    }
+    fn take(v: Value, at: &At) -> Result<Self, String> {
+        T::take(v, at).map(Box::new)
+    }
+}
+
 /// A `ref` (`apps.md`, Types): what a person typed, or the bytes of an id,
 /// which only that id answers.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -568,6 +593,10 @@ pub trait Ask: Fields + Clone + Send + Sync + 'static {
     /// Its row in [`REQUESTS`](super::REQUESTS).
     const REQUEST: &'static Request;
     type Reply: Fields + Send;
+    /// What its handler answers: the reply, or (of a reply the handler
+    /// cuts to the page itself, `precut`) the reply with where its page
+    /// begins and how many there are in all, [`Precut`].
+    type Answered: Send;
 
     /// Whether answering it changes nothing, so that it may be answered
     /// twice: where the tests run, by name beside typed, and compared.
@@ -576,9 +605,7 @@ pub trait Ask: Fields + Clone + Send + Sync + 'static {
     }
 
     /// The reply as a message: the page asked for, of a paged request.
-    fn reply_bytes(&self, reply: Self::Reply) -> Vec<u8> {
-        reply_message(Self::REQUEST.name, &reply)
-    }
+    fn reply_bytes(&self, reply: Self::Answered) -> Vec<u8>;
 
     /// Whether it asks for one page itself (a client's).
     fn one_page(&self) -> bool {
@@ -769,7 +796,10 @@ fn room(spec: &Request, base: usize) -> usize {
     MAX_MESSAGE.saturating_sub(base + page_room(spec))
 }
 
-fn too_large(spec: &Request, list: &str, at: usize, n: usize, id: Option<&[u8]>) -> Unpaged {
+/// Error 4 for item `at` of `list`, `n` bytes, too large for a message
+/// beside the rest of the answer, by its place and its `id` where its
+/// records have one.
+pub fn too_large(spec: &Request, list: &str, at: usize, n: usize, id: Option<&[u8]>) -> Unpaged {
     let why = format!(
         "item {at} of {list} is {n} bytes, more than a message may hold beside the rest of the \
          answer to {}",
@@ -822,6 +852,65 @@ pub fn page_after<T: Wire>(
     })
 }
 
+/// A reply its handler cut itself: the items from `from` on, rendered for
+/// the page asked for and no further, of `total` in all. The page is then
+/// cut to what fits, as the old pager cut a reply that said `_page_from`
+/// and `_page_total`.
+pub struct Precut<R> {
+    pub reply: R,
+    pub from: u64,
+    pub total: u64,
+}
+
+/// Cuts `items`, the one list of a reply the handler cut itself, from its
+/// item `from` of `total`, to the page asked for: as [`page_after`], and
+/// with the arithmetic the old pager had for it (`api::page`, with
+/// `_page_from` and `_page_total`).
+#[allow(clippy::too_many_arguments)]
+pub fn page_precut<T: Wire>(
+    spec: &Request,
+    list: &str,
+    items: &mut Vec<T>,
+    base: usize,
+    after: Option<u64>,
+    limit: Option<u64>,
+    from: u64,
+    total: u64,
+    id: impl Fn(&T) -> Option<&[u8]>,
+) -> Result<Cut, Unpaged> {
+    debug_assert_eq!(spec.page, Page::After);
+    let limit = limit.filter(|n| *n > 0).map_or(usize::MAX, |n| n as usize);
+    let from = from as usize;
+    let start = (after.unwrap_or(0) as usize).max(from);
+    let len = items.len();
+    let all = (total as usize).max(from + len);
+    let room = room(spec, base);
+    let skip = start - from;
+    let (mut used, mut taken) = (0usize, 0usize);
+    for x in items.iter().skip(skip) {
+        if taken >= limit {
+            break;
+        }
+        let n = x.encoded_len();
+        if used + n > room {
+            if taken == 0 {
+                return Err(too_large(spec, list, start, n, id(x)));
+            }
+            break;
+        }
+        used += n;
+        taken += 1;
+    }
+    items.drain(..skip.min(len));
+    items.truncate(taken);
+    let at = start + taken;
+    let more = at < all;
+    Ok(Cut {
+        more,
+        next: more.then_some(at as u64),
+    })
+}
+
 /// Cuts `items`, the one list of a reply paged back from the newest, to
 /// the page asked for: the newest of them, at most `limit`, and as many as
 /// fit; oldest first. `next` is then the place of the oldest given, which
@@ -860,6 +949,12 @@ pub fn page_before<T: Wire>(
 /// A list of a reply paged by position through several lists in turn: a
 /// list always sent, or one sent only when it is `Some`.
 pub trait PagedList {
+    /// What it lists.
+    type Item;
+    /// How many it holds.
+    fn count(&self) -> usize;
+    /// Its item `i`.
+    fn item(&self, i: usize) -> Option<&Self::Item>;
     /// Each item's encoded length, in order, after those of the lists
     /// before, each with its list's name.
     fn lens(&self, name: &'static str, out: &mut Vec<(&'static str, usize)>);
@@ -872,6 +967,13 @@ pub trait PagedList {
 }
 
 impl<T: Wire> PagedList for Vec<T> {
+    type Item = T;
+    fn count(&self) -> usize {
+        self.len()
+    }
+    fn item(&self, i: usize) -> Option<&T> {
+        self.get(i)
+    }
     fn lens(&self, name: &'static str, out: &mut Vec<(&'static str, usize)>) {
         out.extend(self.iter().map(|x| (name, x.encoded_len())));
     }
@@ -891,6 +993,13 @@ impl<T: Wire> PagedList for Vec<T> {
 }
 
 impl<T: Wire> PagedList for Option<Vec<T>> {
+    type Item = T;
+    fn count(&self) -> usize {
+        self.as_ref().map_or(0, Vec::len)
+    }
+    fn item(&self, i: usize) -> Option<&T> {
+        self.as_ref().and_then(|v| v.get(i))
+    }
     fn lens(&self, name: &'static str, out: &mut Vec<(&'static str, usize)>) {
         if let Some(v) = self {
             v.lens(name, out);
@@ -920,27 +1029,28 @@ impl<T: Wire> PagedList for Option<Vec<T>> {
 /// `after` on, at most `limit` of them, and as many as fit beside the
 /// reply's other fields, whose length is `base`. The page is the items
 /// from the first returned, as many as the second; an item too large for
-/// a message alone is error 4, which says which by its place.
+/// a message alone is [`TooLarge`], to be said as error 4, by its place
+/// and its id where its list's records have one.
 pub fn cut_after(
     spec: &Request,
     items: &[(&'static str, usize)],
     base: usize,
     after: Option<u64>,
     limit: Option<u64>,
-) -> Result<(usize, usize, Cut), Unpaged> {
+) -> Result<(usize, usize, Cut), TooLarge> {
     debug_assert_eq!(spec.page, Page::After);
     let limit = limit.filter(|n| *n > 0).map_or(usize::MAX, |n| n as usize);
     let start = after.unwrap_or(0) as usize;
     let all = items.len();
     let room = room(spec, base);
     let (mut used, mut taken) = (0usize, 0usize);
-    for (list, n) in items.iter().skip(start) {
+    for &(list, n) in items.iter().skip(start) {
         if taken >= limit {
             break;
         }
         if used + n > room {
             if taken == 0 {
-                return Err(too_large(spec, list, start, *n, None));
+                return Err(TooLarge { list, at: start, n });
             }
             break;
         }
@@ -957,4 +1067,13 @@ pub fn cut_after(
             next: more.then_some(at as u64),
         },
     ))
+}
+
+/// An item of a reply paged through several lists in turn too large for a
+/// message beside the rest of the answer: its list, its place among all
+/// the lists' items, and its length.
+pub struct TooLarge {
+    pub list: &'static str,
+    pub at: usize,
+    pub n: usize,
 }

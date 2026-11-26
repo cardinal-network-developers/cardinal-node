@@ -2321,8 +2321,11 @@ asks for around that is not built yet.
     typed record, and `Option<T>` a field sent only when it is `Some`.
     `n gone name: T` is a number no longer used: its row stays, with the
     type it had, and there is no struct field. A record that holds itself
-    (inspection's `value`) cannot be declared yet; it will need a boxed
-    field type.
+    (inspection's `value`, which holds values and lists of them, and the
+    `value field` that holds one) names its row outright, `n field:
+    Option<Box<T>> as {ROW}` or `as [ROW]`, since that row cannot be had
+    from the type; `Box<T>` is T on the wire. A record's row is written
+    out in its static, so that it can name itself.
   - **What a record must have.** A field that is not an `Option` is one
     this service always sends: there is no `Default`, and `Name::new` takes
     exactly those fields, so a handler cannot forget one; read back, its
@@ -2343,7 +2346,13 @@ asks for around that is not built yet.
     `writes`, or `stream` (`watch`, `call-media`, answered by the
     connection itself); a paged one adds `after <list>` (with `by <id>`
     where its records have one), `after <list>, <list>, ...` for a reply
-    paged through several lists in turn (`groups`), or `before <list> by
+    paged through several lists in turn (`groups`), each `by <id>` where
+    its records have one, `after <list> precut` for a reply the handler
+    cuts itself (inspection's entries and nodes, which it renders only for
+    the page: it answers with where the page begins and how many there
+    are in all, `api::typed::Precut`, cut by `page_precut` as the old
+    pager cut a reply that said `_page_from` and `_page_total`), or
+    `before <list> by
     <id>`. The row holds the request's answering, made from `impl
     Answer for Args` (`control::typed`), so a typed request without a
     handler does not compile; handlers are async. The page's list, `more`
@@ -2436,7 +2445,13 @@ asks for around that is not built yet.
     space named by bytes in `keep-old` and `history-empty` is the start of
     an id, any length, as the way by name read its hex, where a `ref` as
     bytes is otherwise an id alone (empty bytes start every id, and are
-    refused as naming more than one). `contact` with `setting`
+    refused as naming more than one). `inspect-space` of a space with
+    sealed entries waiting to be opened said so in each epoch's `pending`,
+    a field with no number: the reply was this build's mistake, so in a
+    debug build the request fails (`internal: inspect-space.epochs[<i>].pending
+    has no number`) and in a release build the whole list of epochs is
+    left out, and the old pager counted such an epoch as no bytes; typed,
+    the same (`api::EpochShown`). `contact` with `setting`
     `name-hosts` or `no-hosts`, for someone refused, names a contact given
     as bytes NUL first ("you have refused \0<hex>"). `approval-revoke`
     and `app-join` read an id given as bytes as the start of one, any

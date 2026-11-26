@@ -13,7 +13,7 @@
 
 use std::borrow::Cow;
 
-use super::typed::{Fields, Reference};
+use super::typed::{Fields, Kind, Reference, Scalar};
 
 /// What a field holds.
 #[derive(Debug)]
@@ -414,10 +414,54 @@ macro_rules! asks {
     (@page) => { Page::Whole };
     (@page after $list:ident $($rest:tt)*) => { Page::After };
     (@page before $list:ident $($rest:tt)*) => { Page::Before { list: stringify!($list) } };
-    (@paging $args:ident $reply:ident) => {};
+    (@paging $args:ident $reply:ident) => {
+        type Answered = $reply;
+        fn reply_bytes(&self, reply: $reply) -> Vec<u8> {
+            super::typed::reply_message(Self::REQUEST.name, &reply)
+        }
+    };
     (@id) => { |_| None };
     (@id $id:ident) => { |x| Some(&x.$id[..]) };
+    // An item of a list paged in turn, by its place in that list, named
+    // by its id where it has one.
+    (@item_id $list:expr, $i:expr) => { None };
+    (@item_id $list:expr, $i:expr, $id:ident) => {
+        $list.item($i).map(|x| &x.$id[..])
+    };
+    // A reply its handler cut itself, from where the page begins
+    // (`Precut`): the old pager's `_page_from` and `_page_total`.
+    (@paging $args:ident $reply:ident after $list:ident $(by $id:ident)? precut) => {
+        type Answered = super::typed::Precut<$reply>;
+        fn reply_bytes(&self, cut: super::typed::Precut<$reply>) -> Vec<u8> {
+            let super::typed::Precut { mut reply, from, total } = cut;
+            const SKIP: [u64; 3] = super::typed::paged_numbers(
+                <$reply as Fields>::FIELDS,
+                stringify!($list),
+            );
+            let base = reply.record_len_except(&SKIP);
+            match super::typed::page_precut(
+                Self::REQUEST,
+                stringify!($list),
+                &mut reply.$list,
+                base,
+                self.after,
+                self.limit,
+                from,
+                total,
+                asks!(@id $($id)?),
+            ) {
+                Ok(cut) => {
+                    reply.more = cut.more;
+                    reply.next = cut.next;
+                    super::typed::reply_message(Self::REQUEST.name, &reply)
+                }
+                Err(super::typed::Unpaged(msg)) => msg,
+            }
+        }
+        asks!(@pages $args $reply $list);
+    };
     (@paging $args:ident $reply:ident after $list:ident $(by $id:ident)?) => {
+        type Answered = $reply;
         fn reply_bytes(&self, mut reply: $reply) -> Vec<u8> {
             // beside the reply's other fields: without the list, `more`, `next`
             const SKIP: [u64; 3] = super::typed::paged_numbers(
@@ -442,6 +486,10 @@ macro_rules! asks {
                 Err(super::typed::Unpaged(msg)) => msg,
             }
         }
+        asks!(@pages $args $reply $list);
+    };
+    // How a client asks for one list page after page.
+    (@pages $args:ident $reply:ident $list:ident) => {
         fn one_page(&self) -> bool {
             self.after.is_some() || self.limit.is_some()
         }
@@ -462,7 +510,9 @@ macro_rules! asks {
             (all.more, all.next) = (false, None);
         }
     };
-    (@paging $args:ident $reply:ident after $first:ident, $($list:ident),+) => {
+    (@paging $args:ident $reply:ident
+        after $first:ident $(by $fid:ident)?, $($list:ident $(by $id:ident)?),+) => {
+        type Answered = $reply;
         fn reply_bytes(&self, mut reply: $reply) -> Vec<u8> {
             use super::typed::PagedList;
             // beside the reply's other fields: without its lists, `more`, `next`
@@ -488,7 +538,27 @@ macro_rules! asks {
                     reply.next = cut.next;
                     super::typed::reply_message(Self::REQUEST.name, &reply)
                 }
-                Err(super::typed::Unpaged(msg)) => msg,
+                Err(super::typed::TooLarge { list, at, n }) => {
+                    // its id, where its list's records have one
+                    let mut id: Option<&[u8]> = None;
+                    let mut from = 0;
+                    {
+                        let count = reply.$first.count();
+                        if (from..from + count).contains(&at) {
+                            id = asks!(@item_id reply.$first, at - from $(, $fid)?);
+                        }
+                        from += count;
+                    }
+                    $({
+                        let count = reply.$list.count();
+                        if (from..from + count).contains(&at) {
+                            id = asks!(@item_id reply.$list, at - from $(, $id)?);
+                        }
+                        from += count;
+                    })+
+                    let _ = from;
+                    super::typed::too_large(Self::REQUEST, list, at, n, id).0
+                }
             }
         }
         fn one_page(&self) -> bool {
@@ -513,6 +583,7 @@ macro_rules! asks {
         }
     };
     (@paging $args:ident $reply:ident before $list:ident by $id:ident) => {
+        type Answered = $reply;
         fn reply_bytes(&self, mut reply: $reply) -> Vec<u8> {
             const SKIP: [u64; 3] = super::typed::paged_numbers(
                 <$reply as Fields>::FIELDS,
@@ -680,12 +751,6 @@ macro_rules! f {
     };
 }
 
-macro_rules! rec {
-    ($id:ident $name:literal: $($n:literal $f:literal $t:tt),* $(,)?) => {
-        pub static $id: Rec = Rec { name: $name, fields: &[$(f!($n $f $t)),*] };
-    };
-}
-
 macro_rules! req {
     ($n:literal $name:literal ($($an:literal $af:literal $at:tt),*) -> ($($rn:literal $rf:literal $rt:tt),*)) => {
         Request {
@@ -696,23 +761,6 @@ macro_rules! req {
             page: Page::Whole,
             gone: false,
             answer: None,
-        }
-    };
-}
-
-/// A request whose answer comes in pages, written as `req!` writes one
-/// after how: `after`, or `before` and the list paged.
-macro_rules! paged {
-    (after $($t:tt)*) => {
-        Request {
-            page: Page::After,
-            ..req!($($t)*)
-        }
-    };
-    (before $list:literal $($t:tt)*) => {
-        Request {
-            page: Page::Before { list: $list },
-            ..req!($($t)*)
         }
     };
 }
@@ -1653,62 +1701,304 @@ typed!(
 
 // ---- Records of inspection ----
 
-rec!(VALUE "value":
-    1 "cut" BOOL, 2 "fields" [VALUE_FIELD], 3 "data" B, 4 "inner" {VALUE}, 5 "items" [VALUE],
-    6 "len" U, 7 "n" U, 8 "shape" {SHAPE}, 9 "t" T, 10 "v" SCALAR, 11 "what" T,
-    12 "withheld" T);
-rec!(VALUE_FIELD "value field": 1 "k" U, 2 "v" {VALUE});
-rec!(SHAPE "shape": 1 "here" BOOL, 2 "id" B, 3 "is" T, 4 "levels" U, 5 "size" U);
-rec!(ATTACHED_LOG "attached log": 1 "bytes" U, 2 "entries" U, 3 "id" B);
-rec!(ENCRYPTION_KEY "encryption key": 1 "entry" B, 2 "len" U, 3 "x25519" B);
-rec!(EPOCH "epoch": 1 "entries" U, 2 "held" BOOL, 3 "id" B, 4 "started_by" {STARTED_BY});
-rec!(IDENTITY_ENTRY "identity entry":
-    1 "body" U, 2 "bytes" U, 3 "header" {VALUE}, 4 "id" B, 5 "in_effect" BOOL, 6 "ops" [OP],
-    7 "parents" [B], 8 "signatures" U, 9 "signer" B, 10 "signer_power" T, 11 "valid" BOOL);
-rec!(INSPECT_DEVICE "this device": 1 "key" B, 2 "link_x25519" B, 3 "name" T);
-rec!(INSPECT_ENTRY "entry":
-    1 "accepted" BOOL, 2 "author" B, 3 "author_ok" BOOL, 4 "bytes" U, 5 "entry" B,
-    6 "epoch" B, 7 "genesis" BOOL, 8 "open_key" BOOL, 9 "parents" [B], 10 "position" U,
-    11 "sealed_id" B, 12 "signer" B, 13 "starts_epoch" BOOL, 14 "time" U,
-    15 "unwitnessed" BOOL, 16 "valid" BOOL, 17 "weigh" {WEIGH}, 18 "wraps" U);
-rec!(INSPECT_IDENTITY "identity":
-    1 "bytes" U, 2 "contested" BOOL, 3 "encryption_key" {ENCRYPTION_KEY},
-    4 "encryption_keys_held" U, 5 "entries" U, 6 "frozen" BOOL, 7 "heads" [B], 8 "id" B,
-    9 "keys" [INSPECT_KEY], 10 "recovery_policies" U, 11 "removed" [B]);
-rec!(INSPECT_KEY "key":
-    1 "added_in" B, 2 "key" B, 3 "link_key" {LINK_KEY}, 4 "name" T, 5 "power" T,
-    6 "recovery_key" U, 7 "this_device" BOOL);
-rec!(INSPECT_SPACE "space held":
-    1 "account" BOOL, 2 "bytes" U, 3 "entries" U, 4 "epochs" U, 5 "files" BOOL, 6 "id" B,
-    7 "label" T, 8 "members" U, 9 "my_role" U, 10 "nodes" U, 11 "opened" BOOL, 12 "pending" U,
-    13 "profile" KIND, 14 "sealed" U, 15 "successor" B, 16 "valid" U);
-rec!(KIND_COUNT "kind count":
-    1 "bytes" U, 2 "conflicts" U, 3 "deleted" U, 4 "kind" KIND, 5 "nodes" U);
-rec!(LINK_KEY "link key": 1 "len" U, 2 "x25519" B);
-rec!(NODE_BRIEF "node":
-    1 "bytes" U, 2 "children" U, 3 "created" U, 4 "created_in" B, 5 "creator" B,
-    6 "delete_conflict" BOOL, 7 "deleted" BOOL, 8 "fields" [[U]], 9 "id" B, 10 "kind" KIND,
-    11 "name" T, 12 "parent" B, 13 "position" U);
-rec!(NODE_FIELD "node field":
-    1 "conflict" BOOL, 2 "k" U, 3 "values" [NODE_VALUE]);
-rec!(NODE_HISTORY "node history":
-    1 "accepted" BOOL, 2 "author" B, 3 "bytes" U, 4 "entry" B, 5 "index" U, 6 "op" U,
-    7 "time" U, 8 "valid" BOOL);
-rec!(NODE_VALUE "node value": 1 "entry" B, 2 "op" U, 3 "v" {VALUE});
-rec!(OP "op":
-    1 "bytes" U, 2 "creates" B, 3 "index" U, 4 "kind" KIND, 5 "op" {VALUE}, 6 "reach" BOOL);
-rec!(OTHER_LOG "other log": 1 "bytes" U, 2 "entries" U, 3 "id" B, 4 "name" T);
-rec!(POLICY "policy": 1 "history_shared" BOOL, 2 "public" BOOL, 3 "rotate_after" U);
-rec!(REACH_NODE "reach node":
-    1 "bytes" U, 2 "fields" [NODE_FIELD], 3 "id" B, 4 "identity" B);
-rec!(ROOT "root": 1 "children" U, 2 "id" B);
-rec!(SIGNATURE "signature": 1 "key" B, 2 "signature" (gone U), 3 "signature" B);
-rec!(SPACE_MEMBER "space member":
-    1 "added_by" B, 2 "identity" B, 3 "left" BOOL, 4 "log_held" BOOL, 5 "name" T,
-    6 "reach_node" B, 7 "role" U);
-rec!(STARTED_BY "started by": 1 "author" B, 2 "entry" B, 3 "time" U);
-rec!(STATS "stats": 1 "appended" U, 2 "recomputed" U);
-rec!(STORE "store": 1 "bytes" U, 2 "objects" U);
+typed!(
+    /// A value of the base encoding, rendered: what it is (`t`: `int`,
+    /// `bytes`, `text`, `list`, `record`, `secret`, `deep`, `cleared`),
+    /// how long it is, and as much of it as was asked for. It holds values
+    /// of its own, so its rows are named outright.
+    VALUE "value" InspectValue {
+        1 cut: Option<bool>,
+        2 fields: Option<Vec<ValueField>> as [VALUE_FIELD],
+        3 data: Option<bytes::Bytes>,
+        /// The record bytes encode.
+        4 inner: Option<Box<InspectValue>> as {VALUE},
+        5 items: Option<Vec<InspectValue>> as [VALUE],
+        6 len: Option<u64>,
+        7 n: Option<u64>,
+        8 shape: Option<Shape>,
+        9 t: Cow<'static, str>,
+        10 v: Option<Scalar>,
+        /// Of a secret: what it is.
+        11 what: Option<String>,
+        12 withheld: Option<Cow<'static, str>>,
+    }
+);
+typed!(
+    /// A field of a rendered record: its key, and its value.
+    VALUE_FIELD "value field" ValueField {
+        1 k: u64,
+        2 v: InspectValue as {VALUE},
+    }
+);
+typed!(
+    /// What shape a record has that the explorer can name.
+    SHAPE "shape" Shape {
+        1 here: Option<bool>,
+        2 id: Option<[u8; 32]>,
+        /// `blob reference` or `epoch key`.
+        3 is: Cow<'static, str>,
+        4 levels: Option<u64>,
+        5 size: Option<u64>,
+    }
+);
+typed!(ATTACHED_LOG "attached log" AttachedLog {
+    1 bytes: u64,
+    2 entries: u64,
+    3 id: [u8; 32],
+});
+typed!(ENCRYPTION_KEY "encryption key" EncryptionKey {
+    1 entry: [u8; 32],
+    2 len: u64,
+    3 x25519: [u8; 32],
+});
+typed!(EPOCH "epoch" InspectEpoch {
+    1 entries: u64,
+    2 held: bool,
+    3 id: [u8; 16],
+    4 started_by: Option<StartedBy>,
+});
+/// An epoch of a space as inspection shows it, and how many of its
+/// sealed entries wait here to be opened. An old oddity, kept to the byte
+/// (DEVIATIONS.md, Old oddities kept): by name an epoch with entries
+/// waiting said so in a field that has no number, so that the reply was
+/// this build's mistake, which fails the request where the tests run and
+/// leaves out the whole list of epochs elsewhere; the old pager counted
+/// such an epoch as no bytes.
+#[derive(Clone, Debug, PartialEq)]
+pub struct EpochShown {
+    pub epoch: InspectEpoch,
+    pub pending: Option<u64>,
+}
+
+impl std::ops::Deref for EpochShown {
+    type Target = InspectEpoch;
+    fn deref(&self) -> &InspectEpoch {
+        &self.epoch
+    }
+}
+
+impl super::typed::Wire for EpochShown {
+    const TY: Ty = Ty::Rec(&EPOCH);
+    const LIST: Ty = Ty::Recs(&EPOCH);
+    fn check(&self, at: &super::typed::At) -> Result<(), String> {
+        match self.pending {
+            Some(_) => Err(format!("{at}.pending has no number")),
+            None => self.epoch.check(at),
+        }
+    }
+    fn encode_into(&self, out: &mut Vec<u8>) {
+        self.epoch.encode_into(out)
+    }
+    fn encoded_len(&self) -> usize {
+        match self.pending {
+            Some(_) => 0,
+            None => self.epoch.encoded_len(),
+        }
+    }
+    fn take(v: cardinal_encoding::Value, at: &super::typed::At) -> Result<Self, String> {
+        Ok(EpochShown {
+            epoch: InspectEpoch::take(v, at)?,
+            pending: None,
+        })
+    }
+}
+
+typed!(IDENTITY_ENTRY "identity entry" IdentityEntry {
+    1 body: u64,
+    2 bytes: u64,
+    3 header: InspectValue,
+    4 id: [u8; 32],
+    5 in_effect: bool,
+    6 ops: Vec<InspectOp>,
+    7 parents: Vec<[u8; 32]>,
+    8 signatures: u64,
+    9 signer: [u8; 32],
+    10 signer_power: Option<String>,
+    11 valid: bool,
+});
+typed!(INSPECT_DEVICE "this device" InspectDevice {
+    1 key: [u8; 32],
+    2 link_x25519: [u8; 32],
+    3 name: Option<String>,
+});
+typed!(
+    /// An entry of a space: as a host holds it, sealed, or as a member
+    /// reads it.
+    INSPECT_ENTRY "entry" InspectEntry {
+        1 accepted: Option<bool>,
+        2 author: Option<[u8; 32]>,
+        3 author_ok: Option<bool>,
+        4 bytes: Option<u64>,
+        5 entry: Option<[u8; 32]>,
+        6 epoch: Option<[u8; 16]>,
+        7 genesis: Option<bool>,
+        8 open_key: Option<bool>,
+        9 parents: Option<Vec<[u8; 32]>>,
+        10 position: Option<u64>,
+        11 sealed_id: Option<[u8; 32]>,
+        12 signer: Option<[u8; 32]>,
+        13 starts_epoch: Option<bool>,
+        14 time: Option<u64>,
+        15 unwitnessed: Option<bool>,
+        16 valid: Option<bool>,
+        17 weigh: Weight,
+        18 wraps: Option<u64>,
+    }
+);
+typed!(INSPECT_IDENTITY "identity" InspectIdentity {
+    1 bytes: u64,
+    2 contested: bool,
+    3 encryption_key: Option<EncryptionKey>,
+    4 encryption_keys_held: u64,
+    5 entries: u64,
+    6 frozen: bool,
+    7 heads: Vec<[u8; 32]>,
+    8 id: [u8; 32],
+    9 keys: Vec<InspectKey>,
+    10 recovery_policies: u64,
+    11 removed: Vec<[u8; 32]>,
+});
+typed!(INSPECT_KEY "key" InspectKey {
+    1 added_in: [u8; 32],
+    2 key: [u8; 32],
+    3 link_key: Option<LinkKey>,
+    4 name: Option<String>,
+    5 power: String,
+    6 recovery_key: Option<u64>,
+    7 this_device: bool,
+});
+typed!(
+    /// A space held here, in brief: what an overview lists, and what a
+    /// space's view begins with.
+    INSPECT_SPACE "space held" InspectSpace {
+        1 account: bool,
+        2 bytes: u64,
+        3 entries: Option<u64>,
+        4 epochs: Option<u64>,
+        5 files: bool,
+        6 id: [u8; 32],
+        7 label: Option<String>,
+        8 members: Option<u64>,
+        9 my_role: Option<u64>,
+        10 nodes: Option<u64>,
+        11 opened: bool,
+        12 pending: u64,
+        13 profile: Option<Kind>,
+        14 sealed: u64,
+        15 successor: Option<[u8; 32]>,
+        16 valid: Option<u64>,
+    }
+);
+typed!(KIND_COUNT "kind count" KindCount {
+    1 bytes: u64,
+    2 conflicts: u64,
+    3 deleted: u64,
+    4 kind: Kind,
+    5 nodes: u64,
+});
+typed!(LINK_KEY "link key" LinkKey {
+    1 len: u64,
+    2 x25519: [u8; 32],
+});
+typed!(
+    /// A node of a space, in brief.
+    NODE_BRIEF "node" NodeBrief {
+        1 bytes: u64,
+        2 children: u64,
+        3 created: Option<u64>,
+        4 created_in: [u8; 32],
+        5 creator: [u8; 32],
+        6 delete_conflict: bool,
+        7 deleted: bool,
+        /// Each field: its key, its values' bytes, how many values.
+        8 fields: Vec<Vec<u64>>,
+        9 id: [u8; 16],
+        10 kind: Kind,
+        11 name: String,
+        12 parent: [u8; 16],
+        13 position: Option<u64>,
+    }
+);
+typed!(NODE_FIELD "node field" NodeField {
+    1 conflict: bool,
+    2 k: u64,
+    3 values: Vec<NodeValue>,
+});
+typed!(NODE_HISTORY "node history" NodeHistory {
+    1 accepted: bool,
+    2 author: [u8; 32],
+    3 bytes: u64,
+    4 entry: [u8; 32],
+    5 index: u64,
+    6 op: Option<u64>,
+    7 time: Option<u64>,
+    8 valid: bool,
+});
+typed!(NODE_VALUE "node value" NodeValue {
+    1 entry: [u8; 32],
+    2 op: u64,
+    3 v: InspectValue,
+});
+typed!(
+    /// An op, rendered, and what it is about: the kind of the node it makes
+    /// or names, or `reach` for its author's reach node.
+    OP "op" InspectOp {
+        1 bytes: u64,
+        2 creates: Option<[u8; 16]>,
+        3 index: Option<u64>,
+        4 kind: Option<Kind>,
+        5 op: InspectValue,
+        6 reach: Option<bool>,
+    }
+);
+typed!(OTHER_LOG "other log" OtherLog {
+    1 bytes: u64,
+    2 entries: u64,
+    3 id: [u8; 32],
+    4 name: Option<String>,
+});
+typed!(POLICY "policy" PolicyShown {
+    1 history_shared: bool,
+    2 public: bool,
+    3 rotate_after: u64,
+});
+typed!(REACH_NODE "reach node" ReachNode {
+    1 bytes: u64,
+    2 fields: Vec<NodeField>,
+    3 id: [u8; 16],
+    4 identity: Option<[u8; 32]>,
+});
+typed!(ROOT "root" RootShown {
+    1 children: u64,
+    2 id: [u8; 16],
+});
+typed!(SIGNATURE "signature" SignatureShown {
+    1 key: [u8; 32],
+    2 gone signature: u64,
+    3 signature: bytes::Bytes,
+});
+typed!(SPACE_MEMBER "space member" SpaceMember {
+    1 added_by: Option<[u8; 32]>,
+    2 identity: [u8; 32],
+    3 left: bool,
+    4 log_held: bool,
+    5 name: Option<String>,
+    6 reach_node: [u8; 16],
+    7 role: u64,
+});
+typed!(STARTED_BY "started by" StartedBy {
+    1 author: [u8; 32],
+    2 entry: [u8; 32],
+    3 time: Option<u64>,
+});
+typed!(STATS "stats" StatsShown {
+    1 appended: u64,
+    2 recomputed: u64,
+});
+typed!(STORE "store" StoreShown {
+    1 bytes: u64,
+    2 objects: u64,
+});
 typed!(
     /// Who a voice heard on a group call is.
     VOICE "voice" Voice {
@@ -1722,10 +2012,25 @@ typed!(
         7 camera: bool,
     }
 );
-rec!(WEIGH "weight":
-    1 "aead" U, 2 "ciphertext" U, 3 "fields" U, 4 "header" U, 5 "ops" [WEIGHED_OP],
-    6 "sealed" U, 7 "signature" U, 8 "wraps" U);
-rec!(WEIGHED_OP "weighed op": 1 "bytes" U, 2 "kind" KIND, 3 "op" KIND, 4 "reach" BOOL);
+typed!(
+    /// Where an entry's bytes go, from its sealed form in.
+    WEIGH "weight" Weight {
+        1 aead: u64,
+        2 ciphertext: u64,
+        3 fields: Option<u64>,
+        4 header: u64,
+        5 ops: Option<Vec<WeighedOp>>,
+        6 sealed: u64,
+        7 signature: Option<u64>,
+        8 wraps: u64,
+    }
+);
+typed!(WEIGHED_OP "weighed op" WeighedOp {
+    1 bytes: u64,
+    2 kind: Option<Kind>,
+    3 op: Option<Kind>,
+    4 reach: Option<bool>,
+});
 
 // ---- Typed requests (`api::typed`) ----
 
@@ -3055,6 +3360,228 @@ typed!(
 );
 asks!(CONTACT_CHANGE: 31 "contact" ContactArgs -> ContactReply, writes);
 
+// ---- Inspection ----
+
+typed!(fields InspectOnArgs {
+    1 minutes: Option<u64>,
+});
+typed!(fields InspectOnReply {
+    2 token: [u8; 32],
+    3 until: u64,
+});
+asks!(INSPECT_ON: 200 "inspect-on" InspectOnArgs -> InspectOnReply, writes);
+typed!(fields InspectOffArgs {});
+typed!(fields InspectOffReply {
+    2 was_on: bool,
+});
+asks!(INSPECT_OFF: 201 "inspect-off" InspectOffArgs -> InspectOffReply, writes);
+typed!(fields InspectArgs {
+    1 token: Option<Reference>,
+    2 after: Option<u64>,
+    3 limit: Option<u64>,
+});
+typed!(
+    fields
+    /// The overview: this device, its identity, the other logs and the
+    /// spaces held here, and the store.
+    InspectReply {
+        2 device: InspectDevice,
+        3 identity: Option<InspectIdentity>,
+        4 others: Vec<OtherLog>,
+        5 spaces: Vec<InspectSpace>,
+        6 store: StoreShown,
+        7 version: Cow<'static, str>,
+        8 more: bool,
+        9 next: Option<u64>,
+    }
+);
+asks!(INSPECT: 202 "inspect" InspectArgs -> InspectReply, reads,
+    after others by id, spaces by id);
+typed!(fields InspectIdentityArgs {
+    1 token: Option<Reference>,
+    2 who: Option<Reference>,
+    3 entry: Option<Reference>,
+    4 path: Option<Vec<Scalar>>,
+    5 value_bytes: Option<u64>,
+    6 items: Option<u64>,
+    7 after: Option<u64>,
+    8 limit: Option<u64>,
+});
+typed!(
+    fields
+    /// An identity log, or (with `entry`) the value at `path` in one of
+    /// its entries.
+    InspectIdentityReply {
+        2 attached: Option<Vec<AttachedLog>>,
+        3 entries: Option<Vec<IdentityEntry>>,
+        4 id: Option<[u8; 32]>,
+        5 stalled: Option<Vec<[u8; 32]>>,
+        6 value: Option<InspectValue>,
+        7 more: bool,
+        8 next: Option<u64>,
+    }
+);
+asks!(INSPECT_IDENTITY_VIEW: 203 "inspect-identity" InspectIdentityArgs
+    -> InspectIdentityReply, reads, after attached by id, entries by id, stalled);
+typed!(fields InspectSpaceArgs {
+    1 token: Option<Reference>,
+    2 space: Option<Reference>,
+    3 value_bytes: Option<u64>,
+    4 items: Option<u64>,
+    5 after: Option<u64>,
+    6 limit: Option<u64>,
+});
+typed!(
+    fields
+    /// One space: what it is, who is in it, its epochs, and how its state
+    /// is made up; of a space this device cannot open, its brief alone.
+    InspectSpaceReply {
+        2 account: bool,
+        3 bytes: u64,
+        4 conflicts: Option<u64>,
+        5 created: Option<u64>,
+        6 creator: Option<[u8; 32]>,
+        7 current_epoch: Option<[u8; 16]>,
+        8 entries: Option<u64>,
+        9 epochs: Option<Vec<EpochShown>>,
+        10 files: bool,
+        11 heads: Option<Vec<[u8; 32]>>,
+        12 id: [u8; 32],
+        13 kinds: Option<Vec<KindCount>>,
+        14 label: Option<String>,
+        15 members: Option<Vec<SpaceMember>>,
+        16 my_role: Option<u64>,
+        17 nodes: Option<u64>,
+        18 opened: bool,
+        19 owner: Option<[u8; 32]>,
+        20 pending: u64,
+        21 policy: Option<PolicyShown>,
+        22 profile: Option<Kind>,
+        23 reach: Option<Vec<ReachNode>>,
+        24 rejected: Option<u64>,
+        25 root: Option<RootShown>,
+        26 sealed: u64,
+        27 stats: Option<StatsShown>,
+        28 successor: Option<[u8; 32]>,
+        29 unwitnessed: Option<u64>,
+        30 valid: Option<u64>,
+        31 more: bool,
+        32 next: Option<u64>,
+    }
+);
+asks!(INSPECT_SPACE_VIEW: 204 "inspect-space" InspectSpaceArgs -> InspectSpaceReply, reads,
+    after epochs by id, heads, kinds, members, reach by id);
+typed!(fields InspectEntriesArgs {
+    1 token: Option<Reference>,
+    2 space: Option<Reference>,
+    /// `sealed`, as a host holds them, or else as a member reads them.
+    3 view: Option<String>,
+    4 gone offset: u64,
+    5 gone count: u64,
+    6 after: Option<u64>,
+    7 limit: Option<u64>,
+});
+typed!(fields InspectEntriesReply {
+    2 entries: Vec<InspectEntry>,
+    3 gone offset: u64,
+    4 pending: Option<u64>,
+    5 total: u64,
+    6 more: bool,
+    7 next: Option<u64>,
+});
+asks!(INSPECT_ENTRIES: 205 "inspect-entries" InspectEntriesArgs -> InspectEntriesReply, reads,
+    after entries precut);
+typed!(fields InspectEntryArgs {
+    1 token: Option<Reference>,
+    2 space: Option<Reference>,
+    3 entry: Option<Reference>,
+    4 sealed_id: Option<Reference>,
+    5 path: Option<Vec<Scalar>>,
+    6 value_bytes: Option<u64>,
+    7 items: Option<u64>,
+    8 after: Option<u64>,
+    9 limit: Option<u64>,
+});
+typed!(
+    fields
+    /// One entry whole, or (with `path`) the value at `path` within it.
+    InspectEntryReply {
+        2 accepted: Option<bool>,
+        3 children: Option<Vec<[u8; 32]>>,
+        4 entry: Option<[u8; 32]>,
+        5 header: Option<InspectValue>,
+        6 ops: Option<Vec<InspectOp>>,
+        7 position: Option<u64>,
+        8 sealed: Option<InspectValue>,
+        9 sealed_id: Option<[u8; 32]>,
+        10 signatures: Option<Vec<SignatureShown>>,
+        11 valid: Option<bool>,
+        12 weigh: Option<Weight>,
+        13 value: Option<InspectValue>,
+        14 more: bool,
+        15 next: Option<u64>,
+    }
+);
+asks!(INSPECT_ENTRY_VIEW: 206 "inspect-entry" InspectEntryArgs -> InspectEntryReply, reads,
+    after children, ops, signatures);
+typed!(fields InspectNodesArgs {
+    1 token: Option<Reference>,
+    2 space: Option<Reference>,
+    3 kind: Option<Kind>,
+    4 parent: Option<Reference>,
+    5 gone offset: u64,
+    6 gone count: u64,
+    7 after: Option<u64>,
+    8 limit: Option<u64>,
+});
+typed!(fields InspectNodesReply {
+    2 nodes: Vec<NodeBrief>,
+    3 gone offset: u64,
+    4 total: u64,
+    5 more: bool,
+    6 next: Option<u64>,
+});
+asks!(INSPECT_NODES: 207 "inspect-nodes" InspectNodesArgs -> InspectNodesReply, reads,
+    after nodes by id precut);
+typed!(fields InspectNodeArgs {
+    1 token: Option<Reference>,
+    2 space: Option<Reference>,
+    3 node: Option<Reference>,
+    4 path: Option<Vec<Scalar>>,
+    5 value_bytes: Option<u64>,
+    6 items: Option<u64>,
+    7 after: Option<u64>,
+    8 limit: Option<u64>,
+});
+typed!(
+    fields
+    /// One node whole, or (with `path`) one of its values; the root and a
+    /// reach node, which are no node of the state, as `special`.
+    InspectNodeReply {
+        2 bytes: Option<u64>,
+        3 children: Option<u64>,
+        4 created: Option<u64>,
+        5 created_in: Option<[u8; 32]>,
+        6 creator: Option<[u8; 32]>,
+        7 delete_conflict: Option<bool>,
+        8 deleted: Option<bool>,
+        9 fields: Option<Vec<Vec<u64>>>,
+        10 history: Option<Vec<NodeHistory>>,
+        11 id: Option<[u8; 16]>,
+        12 kind: Option<Kind>,
+        13 name: Option<String>,
+        14 parent: Option<[u8; 16]>,
+        15 position: Option<u64>,
+        16 special: Option<Cow<'static, str>>,
+        17 values: Option<Vec<NodeField>>,
+        18 value: Option<InspectValue>,
+        19 more: bool,
+        20 next: Option<u64>,
+    }
+);
+asks!(INSPECT_NODE: 208 "inspect-node" InspectNodeArgs -> InspectNodeReply, reads,
+    after fields, history, values);
+
 // ---- Measuring, and the files brought back ----
 
 typed!(fields DebugTreeArgs {
@@ -3294,55 +3821,15 @@ pub static REQUESTS: &[Request] = &[
     HOST_END,
     HOSTING_NOW,
     // ---- Inspection and measuring: 200 to 219 ----
-    req!(200 "inspect-on" (1 "minutes" U) -> (2 "token" B, 3 "until" U)),
-    req!(201 "inspect-off" () -> (2 "was_on" BOOL)),
-    paged!(after 202 "inspect" (1 "token" REF, 2 "after" U, 3 "limit" U) -> (
-        2 "device" {INSPECT_DEVICE}, 3 "identity" {INSPECT_IDENTITY}, 4 "others" [OTHER_LOG],
-        5 "spaces" [INSPECT_SPACE], 6 "store" {STORE}, 7 "version" T, 8 "more" BOOL,
-        9 "next" U)),
-    paged!(after 203 "inspect-identity" (
-        1 "token" REF, 2 "who" REF, 3 "entry" REF, 4 "path" [SCALAR], 5 "value_bytes" U,
-        6 "items" U, 7 "after" U, 8 "limit" U
-    ) -> (
-        2 "attached" [ATTACHED_LOG], 3 "entries" [IDENTITY_ENTRY], 4 "id" B, 5 "stalled" [B],
-        6 "value" {VALUE}, 7 "more" BOOL, 8 "next" U)),
-    paged!(after 204 "inspect-space" (
-        1 "token" REF, 2 "space" REF, 3 "value_bytes" U, 4 "items" U, 5 "after" U, 6 "limit" U
-    ) -> (
-        2 "account" BOOL, 3 "bytes" U, 4 "conflicts" U, 5 "created" U, 6 "creator" B,
-        7 "current_epoch" B, 8 "entries" U, 9 "epochs" [EPOCH], 10 "files" BOOL, 11 "heads" [B],
-        12 "id" B, 13 "kinds" [KIND_COUNT], 14 "label" T, 15 "members" [SPACE_MEMBER],
-        16 "my_role" U, 17 "nodes" U, 18 "opened" BOOL, 19 "owner" B, 20 "pending" U,
-        21 "policy" {POLICY}, 22 "profile" KIND, 23 "reach" [REACH_NODE], 24 "rejected" U,
-        25 "root" {ROOT}, 26 "sealed" U, 27 "stats" {STATS}, 28 "successor" B,
-        29 "unwitnessed" U, 30 "valid" U, 31 "more" BOOL, 32 "next" U)),
-    paged!(after 205 "inspect-entries" (
-        1 "token" REF, 2 "space" REF, 3 "view" T, 4 "offset" (gone U), 5 "count" (gone U),
-        6 "after" U, 7 "limit" U
-    ) -> (
-        2 "entries" [INSPECT_ENTRY], 3 "offset" (gone U), 4 "pending" U, 5 "total" U,
-        6 "more" BOOL, 7 "next" U)),
-    paged!(after 206 "inspect-entry" (
-        1 "token" REF, 2 "space" REF, 3 "entry" REF, 4 "sealed_id" REF, 5 "path" [SCALAR],
-        6 "value_bytes" U, 7 "items" U, 8 "after" U, 9 "limit" U
-    ) -> (
-        2 "accepted" BOOL, 3 "children" [B], 4 "entry" B, 5 "header" {VALUE}, 6 "ops" [OP],
-        7 "position" U, 8 "sealed" {VALUE}, 9 "sealed_id" B, 10 "signatures" [SIGNATURE],
-        11 "valid" BOOL, 12 "weigh" {WEIGH}, 13 "value" {VALUE}, 14 "more" BOOL, 15 "next" U)),
-    paged!(after 207 "inspect-nodes" (
-        1 "token" REF, 2 "space" REF, 3 "kind" KIND, 4 "parent" REF, 5 "offset" (gone U),
-        6 "count" (gone U), 7 "after" U, 8 "limit" U
-    ) -> (
-        2 "nodes" [NODE_BRIEF], 3 "offset" (gone U), 4 "total" U, 5 "more" BOOL, 6 "next" U)),
-    paged!(after 208 "inspect-node" (
-        1 "token" REF, 2 "space" REF, 3 "node" REF, 4 "path" [SCALAR], 5 "value_bytes" U,
-        6 "items" U, 7 "after" U, 8 "limit" U
-    ) -> (
-        2 "bytes" U, 3 "children" U, 4 "created" U, 5 "created_in" B, 6 "creator" B,
-        7 "delete_conflict" BOOL, 8 "deleted" BOOL, 9 "fields" [[U]],
-        10 "history" [NODE_HISTORY], 11 "id" B, 12 "kind" KIND, 13 "name" T, 14 "parent" B,
-        15 "position" U, 16 "special" T, 17 "values" [NODE_FIELD], 18 "value" {VALUE},
-        19 "more" BOOL, 20 "next" U)),
+    INSPECT_ON,
+    INSPECT_OFF,
+    INSPECT,
+    INSPECT_IDENTITY_VIEW,
+    INSPECT_SPACE_VIEW,
+    INSPECT_ENTRIES,
+    INSPECT_ENTRY_VIEW,
+    INSPECT_NODES,
+    INSPECT_NODE,
     DEBUG_TREE,
     SPEEDTEST,
     // ---- Applications: 220 to 239 ----

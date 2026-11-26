@@ -3811,3 +3811,304 @@ async fn the_tree_is_answered_the_same() {
     let t = bare_twins(dir.path()).await;
     t.same(json!({"cmd": "debug-tree"})).await;
 }
+
+/// Inspection turned on and off. The token is random and the time it ends
+/// is read off each twin's clock: `inspect-on` is compared with the new
+/// one's token and time put in the old one's reply, and the rest byte for
+/// byte; what it is asked of the views is compared both ways on one
+/// service, as every request that changes nothing is where the tests run.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn inspection_is_turned_on_and_off_the_same() {
+    let dir = tempfile::tempdir().unwrap();
+    let t = Twins::start(dir.path()).await;
+    for req in [
+        json!({"cmd": "inspect-off"}),
+        json!({"cmd": "inspect-on", "minutes": 0}),
+        json!({"cmd": "inspect-on", "minutes": 24 * 60 + 1}),
+        json!({"cmd": "inspect", "token": "00"}),
+        json!({"cmd": "inspect"}),
+    ] {
+        t.same(req).await;
+    }
+    let on = |t: &Twins, req: Json| {
+        let (o, n) = (t.old.clone(), t.new.clone());
+        async move {
+            let (_, msg) = encode_request(&req).unwrap();
+            let old = crate::control::by_name(&o, &msg).await;
+            let new = crate::control::typed::reply(&n, &msg).await.unwrap();
+            let (ro, rn) = (Record::decode(&old).unwrap(), Record::decode(&new).unwrap());
+            assert_eq!(ro.encode(), old);
+            let mut swapped = ro.clone();
+            for k in [2, 3] {
+                swapped.insert(k, rn.get(k).unwrap().clone());
+            }
+            assert_eq!(swapped.encode(), new, "{req}, the token and time swapped");
+            let read = typed_of::<InspectOnArgs>(&new);
+            let until = |r: &Record| r.get(3).unwrap().as_uint().unwrap();
+            assert!(until(&ro).abs_diff(until(&rn)) < 5_000);
+            let minutes = req["minutes"].as_u64().unwrap_or(60);
+            let now = crate::core::now_ms();
+            assert!(read.until.abs_diff(now + minutes * 60_000) < 5_000);
+            let token = |r: &Record| r.get(2).unwrap().as_bytes().unwrap().to_vec();
+            (token(&ro), token(&rn))
+        }
+    };
+    let (to, tn) = on(&t, json!({"cmd": "inspect-on"})).await;
+    let (to, tn) = (exact(&to), exact(&tn));
+    // each twin's own token, typed in hex or as bytes, and another's
+    let typed_hex = |t: &str| t.trim_start_matches(EXACT).to_uppercase();
+    for (o, n) in [
+        (to.clone(), tn.clone()),
+        (typed_hex(&to), typed_hex(&tn)),
+        (tn.clone(), to.clone()),
+    ] {
+        t.same_as(
+            json!({"cmd": "inspect-nodes", "token": o, "space": exact(&[0; 32])}),
+            json!({"cmd": "inspect-nodes", "token": n, "space": exact(&[0; 32])}),
+        )
+        .await;
+    }
+    on(&t, json!({"cmd": "inspect-on", "minutes": 5})).await;
+    for req in [
+        json!({"cmd": "inspect-off"}),
+        json!({"cmd": "inspect-off"}),
+        json!({"cmd": "inspect", "token": to}),
+    ] {
+        t.same(req).await;
+    }
+}
+
+/// The old pager's answer to `req` by name, as the way by name sent it.
+fn paged_by_name(spec: &Request, req: &Json, tree: Json) -> Vec<u8> {
+    match page(spec, req, tree) {
+        Ok(v) => encode_reply(spec, Ok(&v)),
+        Err((st, why, item)) => error_reply_with(st, &why, &item),
+    }
+}
+
+/// A reply the handler cut itself (`precut`) is paged as the old pager
+/// paged one that said `_page_from` and `_page_total`: in every page of
+/// made-up answers, of items of every size up to one too large.
+#[test]
+fn a_reply_cut_by_its_handler_pages_as_it_did() {
+    let node = |i: usize, size: usize| NodeBrief {
+        bytes: i as u64,
+        children: 0,
+        created: Some(7),
+        created_in: [1; 32],
+        creator: [2; 32],
+        delete_conflict: false,
+        deleted: i % 2 == 0,
+        fields: vec![vec![1, 2, 3]],
+        id: [i as u8; 16],
+        kind: typed::Kind::Number(3),
+        name: "n".repeat(size),
+        parent: [0; 16],
+        position: (i % 3 != 0).then_some(i as u64),
+    };
+    let as_tree = |n: &NodeBrief| {
+        json!({"bytes": n.bytes, "children": n.children, "created": n.created,
+            "created_in": hex::encode(n.created_in), "creator": hex::encode(n.creator),
+            "delete_conflict": n.delete_conflict, "deleted": n.deleted, "fields": n.fields,
+            "id": hex::encode(n.id), "kind": 3, "name": n.name, "parent": hex::encode(n.parent),
+            "position": n.position})
+    };
+    let spec = InspectNodesArgs::REQUEST;
+    let mut seed = 7u64;
+    let mut next = |n: u64| {
+        seed = seed
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        (seed >> 33) % n
+    };
+    let mut cases = 0;
+    for round in 0..400 {
+        let len = next(12) as usize;
+        let total = len + next(6) as usize;
+        let after = next(8);
+        let limit = [None, Some(0), Some(1), Some(2), Some(5)][next(5) as usize];
+        // now and then an item near or past what a message holds
+        let sizes: Vec<usize> = (0..len)
+            .map(|_| match next(10) {
+                0 => 262_000 + next(300) as usize,
+                1 => 90_000,
+                _ => next(40) as usize,
+            })
+            .collect();
+        let nodes: Vec<NodeBrief> = sizes.iter().enumerate().map(|(i, s)| node(i, *s)).collect();
+        let from = after;
+        let mut req = json!({"cmd": "inspect-nodes"});
+        if round % 3 != 0 {
+            req["after"] = json!(after);
+        }
+        if let Some(l) = limit {
+            req["limit"] = json!(l);
+        }
+        let given_after = req.get("after").map(|_| after);
+        let from = if given_after.is_some() { from } else { 0 };
+        let tree = json!({"total": total, PAGE_FROM: from, PAGE_TOTAL: total,
+            "nodes": nodes.iter().map(as_tree).collect::<Vec<_>>()});
+        let old = paged_by_name(spec, &req, tree);
+        let args = InspectNodesArgs {
+            token: None,
+            space: None,
+            kind: None,
+            parent: None,
+            after: given_after,
+            limit,
+        };
+        let new = args.reply_bytes(typed::Precut {
+            reply: InspectNodesReply::new(nodes, total as u64, false),
+            from,
+            total: total as u64,
+        });
+        assert_eq!(
+            old,
+            new,
+            "round {round}: {req}\n by name {}\n typed   {}",
+            render_reply(spec, &old),
+            render_reply(spec, &new)
+        );
+        cases += 1;
+    }
+    assert_eq!(cases, 400);
+}
+
+/// An item too large alone in a reply paged through several lists in turn
+/// is named by its id, where its list's records have one, as the old pager
+/// named it; and a list without ids names none.
+#[test]
+fn an_item_too_large_among_several_lists_is_named_by_its_id() {
+    let big = "z".repeat(300_000);
+    let space = |n: u8, label: &str| {
+        let mut s = InspectSpace::new(false, 1, false, [n; 32], true, 0, 2);
+        s.label = Some(label.to_owned());
+        s
+    };
+    let other = |n: u8, name: &str| OtherLog {
+        bytes: 1,
+        entries: 2,
+        id: [n; 32],
+        name: Some(name.to_owned()),
+    };
+    let tree_space = |s: &InspectSpace| {
+        json!({"account": s.account, "bytes": s.bytes, "files": s.files, "id": hex::encode(s.id),
+            "opened": s.opened, "pending": s.pending, "sealed": s.sealed, "label": s.label})
+    };
+    let tree_other = |o: &OtherLog| json!({"bytes": o.bytes, "entries": o.entries, "id": hex::encode(o.id), "name": o.name});
+    let spec = InspectArgs::REQUEST;
+    for (others, spaces) in [
+        (vec![other(1, "a")], vec![space(2, "b"), space(3, &big)]),
+        (vec![other(1, &big)], vec![space(2, "b")]),
+        (vec![other(1, "a"), other(4, "c")], vec![space(5, &big)]),
+    ] {
+        for after in [None, Some(1), Some(2)] {
+            let mut req = json!({"cmd": "inspect"});
+            if let Some(a) = after {
+                req["after"] = json!(a);
+            }
+            let tree = json!({
+                "device": {"key": hex::encode([9u8; 32]), "link_x25519": hex::encode([8u8; 32])},
+                "others": others.iter().map(tree_other).collect::<Vec<_>>(),
+                "spaces": spaces.iter().map(tree_space).collect::<Vec<_>>(),
+                "store": {"bytes": 1, "objects": 2},
+                "version": "x",
+            });
+            let old = paged_by_name(spec, &req, tree);
+            let reply = InspectReply::new(
+                InspectDevice {
+                    key: [9; 32],
+                    link_x25519: [8; 32],
+                    name: None,
+                },
+                others.clone(),
+                spaces.clone(),
+                StoreShown {
+                    bytes: 1,
+                    objects: 2,
+                },
+                "x".into(),
+                false,
+            );
+            let args = InspectArgs {
+                token: None,
+                after,
+                limit: None,
+            };
+            let new = args.reply_bytes(reply);
+            assert_eq!(old, new, "{req}: {}", render_reply(spec, &new));
+        }
+    }
+    // a node's history names nothing: its records have no id
+    let spec = InspectNodeArgs::REQUEST;
+    let hist = |n: u8| NodeHistory {
+        accepted: true,
+        author: [n; 32],
+        bytes: 1,
+        entry: [n; 32],
+        index: 0,
+        op: Some(1),
+        time: None,
+        valid: true,
+    };
+    let mut reply = InspectNodeReply::new(false);
+    reply.history = Some(vec![hist(1)]);
+    reply.name = Some(big.clone());
+    reply.values = Some(vec![]);
+    let tree = json!({"history": [{"accepted": true, "author": hex::encode([1u8; 32]),
+        "bytes": 1, "entry": hex::encode([1u8; 32]), "index": 0, "op": 1, "valid": true}],
+        "name": big, "values": []});
+    let old = paged_by_name(spec, &json!({}), tree);
+    let new = InspectNodeArgs::new().reply_bytes(reply);
+    assert_eq!(old, new, "{}", render_reply(spec, &new));
+}
+
+/// An epoch with entries waiting to be opened: an old oddity, kept to the
+/// byte (DEVIATIONS.md). By name it said so in a field with no number, so
+/// the reply was this build's mistake: in a debug build the request fails,
+/// naming the field; and the old pager counted the epoch as no bytes.
+#[test]
+fn an_epoch_with_entries_waiting_is_the_mistake_it_was() {
+    let spec = InspectSpaceArgs::REQUEST;
+    let epoch = |n: u8, pending: Option<u64>| EpochShown {
+        epoch: InspectEpoch::new(3, true, [n; 16]),
+        pending,
+    };
+    let tree_epoch = |e: &EpochShown| {
+        let mut t = json!({"entries": 3, "held": true, "id": hex::encode(e.id)});
+        if let Some(p) = e.pending {
+            t["pending"] = json!(p);
+        }
+        t
+    };
+    for epochs in [
+        vec![epoch(1, None), epoch(2, Some(4))],
+        vec![epoch(1, Some(1))],
+        vec![epoch(1, None)],
+    ] {
+        for limit in [None, Some(1)] {
+            let mut req = json!({"cmd": "inspect-space"});
+            if let Some(l) = limit {
+                req["limit"] = json!(l);
+            }
+            let tree = json!({"account": false, "bytes": 1, "files": false,
+                "id": hex::encode([7u8; 32]), "opened": true, "pending": 1, "sealed": 2,
+                "epochs": epochs.iter().map(tree_epoch).collect::<Vec<_>>(),
+                "heads": [hex::encode([5u8; 32])]});
+            let old = paged_by_name(spec, &req, tree);
+            let mut reply = InspectSpaceReply::new(false, 1, false, [7; 32], true, 1, 2, false);
+            reply.epochs = Some(epochs.clone());
+            reply.heads = Some(vec![[5; 32]]);
+            let args = InspectSpaceArgs {
+                token: None,
+                space: None,
+                value_bytes: None,
+                items: None,
+                after: None,
+                limit,
+            };
+            let new = args.reply_bytes(reply);
+            assert_eq!(old, new, "{req}: {}", render_reply(spec, &new));
+        }
+    }
+}

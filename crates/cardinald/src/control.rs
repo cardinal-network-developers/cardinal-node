@@ -466,6 +466,11 @@ pub mod typed {
         HostAcceptArgs, HostAcceptReply, HostEndArgs, HostEndReply, HostOfferArgs, HostOfferReply,
         HostingArgs, HostingReply,
     };
+    use crate::api::{InspectArgs, InspectEntriesArgs, InspectEntriesReply, InspectEntryArgs};
+    use crate::api::{InspectEntryReply, InspectIdentityArgs, InspectIdentityReply};
+    use crate::api::{InspectNodeArgs, InspectNodeReply, InspectNodesArgs, InspectNodesReply};
+    use crate::api::{InspectOffArgs, InspectOffReply, InspectOnArgs, InspectOnReply};
+    use crate::api::{InspectReply, InspectSpaceArgs, InspectSpaceReply};
     use crate::api::{
         KeepWorkArgs, KeepWorkReply, KeptChangesReply, LostDevicesReply, RecoverArgs,
         RecoverCancelArgs, RecoverCancelReply, RecoverFinishArgs, RecoverFinishReply,
@@ -488,7 +493,7 @@ pub mod typed {
         fn answer(
             d: &Arc<Daemon>,
             a: &Self,
-        ) -> impl std::future::Future<Output = anyhow::Result<Self::Reply>> + Send;
+        ) -> impl std::future::Future<Output = anyhow::Result<Self::Answered>> + Send;
     }
 
     /// The reply to `A`'s request `r`: its arguments as they came, the
@@ -1885,6 +1890,74 @@ pub mod typed {
         }
     }
 
+    // ---- Inspection (`inspect.rs`): the person turns it on, on this
+    // device, and only whoever holds the token it gives may look ----
+
+    impl Answer for InspectOnArgs {
+        async fn answer(d: &Arc<Daemon>, a: &Self) -> anyhow::Result<InspectOnReply> {
+            let minutes = a.minutes.unwrap_or(crate::inspect::DEFAULT_MINUTES);
+            let (token, until) = d.inspection.grant(minutes)?;
+            d.bump();
+            Ok(InspectOnReply { token, until })
+        }
+    }
+
+    impl Answer for InspectOffArgs {
+        async fn answer(d: &Arc<Daemon>, _: &Self) -> anyhow::Result<InspectOffReply> {
+            let was = d.inspection.revoke();
+            d.bump();
+            Ok(InspectOffReply { was_on: was })
+        }
+    }
+
+    impl Answer for InspectArgs {
+        async fn answer(d: &Arc<Daemon>, a: &Self) -> anyhow::Result<InspectReply> {
+            crate::inspect::answers::overview(d, a)
+        }
+    }
+
+    impl Answer for InspectIdentityArgs {
+        async fn answer(d: &Arc<Daemon>, a: &Self) -> anyhow::Result<InspectIdentityReply> {
+            crate::inspect::answers::identity(d, a)
+        }
+    }
+
+    impl Answer for InspectSpaceArgs {
+        async fn answer(d: &Arc<Daemon>, a: &Self) -> anyhow::Result<InspectSpaceReply> {
+            crate::inspect::answers::space(d, a)
+        }
+    }
+
+    impl Answer for InspectEntriesArgs {
+        async fn answer(
+            d: &Arc<Daemon>,
+            a: &Self,
+        ) -> anyhow::Result<api::typed::Precut<InspectEntriesReply>> {
+            crate::inspect::answers::entries(d, a)
+        }
+    }
+
+    impl Answer for InspectEntryArgs {
+        async fn answer(d: &Arc<Daemon>, a: &Self) -> anyhow::Result<InspectEntryReply> {
+            crate::inspect::answers::entry(d, a)
+        }
+    }
+
+    impl Answer for InspectNodesArgs {
+        async fn answer(
+            d: &Arc<Daemon>,
+            a: &Self,
+        ) -> anyhow::Result<api::typed::Precut<InspectNodesReply>> {
+            crate::inspect::answers::nodes(d, a)
+        }
+    }
+
+    impl Answer for InspectNodeArgs {
+        async fn answer(d: &Arc<Daemon>, a: &Self) -> anyhow::Result<InspectNodeReply> {
+            crate::inspect::answers::node(d, a)
+        }
+    }
+
     // ---- Measuring, and the files brought back ----
 
     impl Answer for DebugTreeArgs {
@@ -2154,6 +2227,8 @@ fn require_files(d: &Daemon) -> anyhow::Result<[u8; 32]> {
 }
 
 async fn handle(d: &Arc<Daemon>, req: &Value) -> anyhow::Result<Value> {
+    #[cfg(not(any(test, debug_assertions, feature = "by-name")))]
+    let _ = d;
     let cmd = arg(req, "cmd")?;
     match cmd {
         #[cfg(any(test, debug_assertions, feature = "by-name"))]
@@ -2166,27 +2241,30 @@ async fn handle(d: &Arc<Daemon>, req: &Value) -> anyhow::Result<Value> {
         "status" => Ok(status(d)),
         // Inspection (`inspect.rs`): the person turns it on, on this
         // device, and only whoever holds the token it gives may look.
+        #[cfg(any(test, debug_assertions, feature = "by-name"))]
         "inspect-on" => {
             let minutes = req.get("minutes").and_then(Value::as_u64);
             let (token, until) = d
                 .inspection
-                .grant(minutes.unwrap_or(crate::inspect::DEFAULT_MINUTES))?;
+                .grant_by_name(minutes.unwrap_or(crate::inspect::DEFAULT_MINUTES))?;
             d.bump();
             Ok(json!({"token": token, "until": until}))
         }
+        #[cfg(any(test, debug_assertions, feature = "by-name"))]
         "inspect-off" => {
             let was = d.inspection.revoke();
             d.bump();
             Ok(json!({"was_on": was}))
         }
         // One request for each view, which `inspect.rs` tells by `what`.
+        #[cfg(any(test, debug_assertions, feature = "by-name"))]
         "inspect" | "inspect-identity" | "inspect-space" | "inspect-entries" | "inspect-entry"
         | "inspect-nodes" | "inspect-node" => {
             d.inspection
-                .check(req.get("token").and_then(Value::as_str))?;
+                .check_by_name(req.get("token").and_then(Value::as_str))?;
             let mut req = req.clone();
             req["what"] = json!(cmd.strip_prefix("inspect-").unwrap_or("overview"));
-            crate::inspect::handle(d, &req)
+            crate::inspect::by_name::handle(d, &req)
         }
         #[cfg(any(test, debug_assertions, feature = "by-name"))]
         "devices" => Ok(json!({"devices": devices(d)})),
