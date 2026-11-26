@@ -19,7 +19,7 @@
 //! | [`Scalar`] | int or text | as the record says |
 //! | `u64` | uint | always (one at 2^60 or more is this build's mistake) |
 //! | `[u8; N]` | bytes | always; read back only at exactly N bytes |
-//! | `bytes::Bytes` | bytes | always, of any length; taken without a copy |
+//! | `Bytes` (`bytes::Bytes`, re-exported) | bytes | always, of any length |
 //! | [`Reference`] | ref | text, or an id's bytes |
 //! | `Vec<T>` | a list of T | always, empty or not |
 //! | a typed record | its record | always |
@@ -30,12 +30,26 @@
 //! A field that is not an `Option` is one this service always sends; read
 //! back, its absence is an error, as is a value of the wrong type. Fields a
 //! later version may add are passed over, as before.
+//!
+//! A message is read straight from its bytes ([`Wire::read`], a record's
+//! [`Fields::read_fields`]), field after field, with no tree between: each
+//! field's value is made once, from the bytes, and nothing else is. The
+//! checks are the decoder's own ([`Cursor`], which the decoder also reads
+//! with) and the tree's, in the same order, so that a message is refused
+//! exactly when, and in exactly the words with which, decoding it into the
+//! encoding's tree and taking the fields from that refuses it: a message
+//! that is not one canonical record is refused for that before any field
+//! is (where a field is found wrong first, the rest is checked before it
+//! is said); then the first field wrong, in the order of their numbers.
+//! The way through the tree ([`Wire::take`], [`Fields::take_fields`],
+//! [`read_reply_tree`]) is kept, as what the direct reading is held to.
 
 use std::borrow::Cow;
 use std::fmt;
 
 use cardinal_encoding::varint::varint_len;
-use cardinal_encoding::{write_varint, Record, Value};
+use cardinal_encoding::{check_record, write_varint, Cursor, DecodeError, Head, Major};
+use cardinal_encoding::{Record, Value};
 
 use crate::table::{Field, Request, Ty};
 use crate::{page_room, status, Page, Refused, MAX_MESSAGE, WHY};
@@ -142,6 +156,44 @@ pub const fn number(fields: &[Field], name: &str) -> u64 {
     panic!("a paged reply has its list, `more` and `next`")
 }
 
+/// Whether two names are the same, at compile time.
+const fn same(a: &str, b: &str) -> bool {
+    let (a, b) = (a.as_bytes(), b.as_bytes());
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut i = 0;
+    while i < a.len() && a[i] == b[i] {
+        i += 1;
+    }
+    i == a.len()
+}
+
+/// Fails the build unless `given` names exactly the fields a record always
+/// has, `required`, in the order of their numbers: what
+/// [`new!`](crate::new) checks.
+pub const fn named(required: &[&'static str], given: &[&'static str]) {
+    let mut i = 0;
+    while i < required.len() && i < given.len() {
+        if !same(field_name(given[i]), required[i]) {
+            panic!(
+                "new!: give the fields the record always has by their names, each once, in \
+                 the order of their numbers (as its declaration lists them)"
+            );
+        }
+        i += 1;
+    }
+    if given.len() < required.len() {
+        panic!("new!: a field the record always has is not given");
+    }
+    if given.len() > required.len() {
+        panic!(
+            "new!: a field given is not one the record always has: set it after, \
+             as `Name {{ field, ..new!(Name {{ .. }}) }}`"
+        );
+    }
+}
+
 /// Fails the build unless the fields are numbered in order, each once: the
 /// order the encoding writes them in.
 pub const fn ascending(fields: &[Field]) {
@@ -206,18 +258,265 @@ pub trait Wire: Sized {
     }
     /// Reads it from what came, taking what it holds.
     fn take(v: Value, at: &At) -> Result<Self, String>;
+    /// Reads it straight from the bytes, as the value at nesting `depth`
+    /// (the message itself is 0): what [`Wire::take`] makes of the same
+    /// value, or the same refusal ([`Bad`]).
+    fn read(c: &mut Cursor<'_>, depth: usize, at: &At) -> Result<Self, Bad>;
     /// What it is when its field did not come.
     fn absent(at: &At) -> Result<Self, String> {
         Err(format!("{at} is missing"))
     }
+    /// Of text, where the tests run: itself, if it is not one of `known`,
+    /// the values its row names (none, of another type).
+    #[cfg(debug_assertions)]
+    fn unknown(&self, _known: &[&str]) -> Option<String> {
+        None
+    }
+}
+
+/// Text that is not one of `known`.
+#[cfg(debug_assertions)]
+fn unknown_text(t: &str, known: &[&str]) -> Option<String> {
+    (!known.contains(&t)).then(|| t.to_owned())
 }
 
 fn wrong(at: &At, what: &str) -> String {
     format!("{at} should be {what}")
 }
 
+/// [`wrong`], as a refusal of the direct reading: said once.
+#[cold]
+#[inline(never)]
+fn bad(at: &At, what: &str) -> Bad {
+    Bad::Field(wrong(at, what))
+}
+
+/// An unsigned integer whose header is `h`, as [`u64::take`] reads one.
+#[inline]
+fn uint_of(h: &Head, at: &At) -> Result<u64, Bad> {
+    match h.major {
+        Major::Uint => Ok(h.n),
+        _ => Err(bad(at, "an unsigned integer")),
+    }
+}
+
+/// An integer whose header is `h`, as [`i64::take`] reads one.
+#[inline]
+fn int_of(h: &Head, at: &At) -> Result<i64, Bad> {
+    match h.major {
+        // below 2^60 either way, as the decoder's headers are
+        Major::Uint => Ok(h.n as i64),
+        Major::Neg => Ok(-1 - h.n as i64),
+        _ => Err(bad(at, "an integer")),
+    }
+}
+
+/// Why a message could not be read straight from its bytes: what the way
+/// through the tree refuses it with.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Bad {
+    /// It is not one canonical record: the decoder's error, which the
+    /// tree's decoding refuses it with first.
+    Form(DecodeError),
+    /// A field is not what its row says, or one always sent is missing:
+    /// in the words the tree's reading says it in.
+    Field(String),
+}
+
+impl From<DecodeError> for Bad {
+    #[inline]
+    fn from(e: DecodeError) -> Bad {
+        Bad::Form(e)
+    }
+}
+
+impl fmt::Display for Bad {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Bad::Form(e) => write!(f, "not one record: {e}"),
+            Bad::Field(why) => f.write_str(why),
+        }
+    }
+}
+
+/// A record being read straight from the bytes, field after field in the
+/// order of their numbers, as its declaration lists them
+/// ([`Fields::read_fields`]): the keys that come before a field asked for
+/// (one this build does not know, or a number no longer used) are passed
+/// over, checked as the decoder checks them.
+pub struct Walk<'c, 'a> {
+    c: &'c mut Cursor<'a>,
+    /// The record's own nesting; its fields are one deeper.
+    depth: usize,
+    /// Fields not yet come to.
+    left: usize,
+    /// The key read last, whose value comes next, if any is left.
+    next: Option<u64>,
+}
+
+impl<'c, 'a> Walk<'c, 'a> {
+    /// A record whose header `h` was just read, at nesting `depth`.
+    #[inline(never)]
+    pub fn start(c: &'c mut Cursor<'a>, h: &Head, depth: usize) -> Result<Self, Bad> {
+        let left = c.count(h, depth)?;
+        let mut w = Walk {
+            c,
+            depth,
+            left,
+            next: None,
+        };
+        w.key()?;
+        Ok(w)
+    }
+
+    /// Reads the next field's key, if one is left.
+    #[inline]
+    fn key(&mut self) -> Result<(), DecodeError> {
+        let last = self.next;
+        self.next = match self.left {
+            0 => None,
+            _ => {
+                self.left -= 1;
+                Some(self.c.key(last)?)
+            }
+        };
+        Ok(())
+    }
+
+    /// Passes over the fields numbered below `n`: whether the next is
+    /// numbered `n`, its value then the next thing read.
+    #[inline(never)]
+    pub fn to(&mut self, n: u64) -> Result<bool, Bad> {
+        while let Some(k) = self.next {
+            if k >= n {
+                return Ok(k == n);
+            }
+            self.c.skip(self.depth + 1)?;
+            self.key()?;
+        }
+        Ok(false)
+    }
+
+    /// The value of field `n`, which [`Walk::to`] came to, read by `read`.
+    #[inline]
+    fn value<T>(
+        &mut self,
+        read: impl FnOnce(&mut Cursor<'a>, usize) -> Result<T, Bad>,
+    ) -> Result<T, Bad> {
+        let v = read(self.c, self.depth + 1)?;
+        self.key()?;
+        Ok(v)
+    }
+
+    /// Passes over the fields left, to the end of the record.
+    #[inline(never)]
+    pub fn finish(mut self) -> Result<(), Bad> {
+        self.to(u64::MAX).map(drop)
+    }
+}
+
+/// Reads field `row` of the record `w` is in, straight from the bytes, as
+/// [`take_field`] reads it from the tree: once per field type.
+#[inline(never)]
+pub fn read_field<T: Wire>(w: &mut Walk, row: &'static Field, at: &At) -> Result<T, Bad> {
+    let at = At::Field(at, row.name);
+    if w.to(row.n)? {
+        w.value(|c, depth| T::read(c, depth, &at))
+    } else {
+        T::absent(&at).map_err(Bad::Field)
+    }
+}
+
+/// A typed record held in another, read straight from the bytes.
+#[inline]
+pub fn record_read<R: Fields>(c: &mut Cursor<'_>, depth: usize, at: &At) -> Result<R, Bad> {
+    let h = c.head()?;
+    let mut w = record_walk(c, &h, depth, at)?;
+    let r = R::read_fields(&mut w, at)?;
+    w.finish()?;
+    Ok(r)
+}
+
+/// The walk of a record whose header `h` was just read, or why it is no
+/// record: written once.
+#[inline(never)]
+fn record_walk<'c, 'a>(
+    c: &'c mut Cursor<'a>,
+    h: &Head,
+    depth: usize,
+    at: &At,
+) -> Result<Walk<'c, 'a>, Bad> {
+    if h.major != Major::Record {
+        return Err(Bad::Field(format!("{at} should be a record")));
+    }
+    Walk::start(c, h, depth)
+}
+
+/// Reads a whole message straight from its bytes: `body` reads its
+/// fields, on the walk through its record; then the rest is passed over,
+/// and nothing may follow. Its refusal is the tree's: where a field is
+/// found wrong, the whole message is checked first, and if it is not one
+/// canonical record that is said instead, as decoding it whole first says
+/// it.
+#[inline]
+pub fn read_message<T>(
+    msg: &[u8],
+    body: impl FnOnce(&mut Walk) -> Result<T, Bad>,
+) -> Result<T, Bad> {
+    let mut c = Cursor::new(msg);
+    let got = match opened(&mut c, msg) {
+        Ok(mut w) => match body(&mut w) {
+            Ok(v) => closed(w).map(|()| v),
+            Err(e) => Err(e),
+        },
+        Err(e) => Err(e),
+    };
+    got.map_err(|e| settled(msg, e))
+}
+
+/// The walk through a message's record, or why it is none.
+#[inline(never)]
+fn opened<'c, 'a>(c: &'c mut Cursor<'a>, msg: &[u8]) -> Result<Walk<'c, 'a>, Bad> {
+    let h = c.head()?;
+    if h.major != Major::Record {
+        // the tree's decoding says first what else is wrong with it
+        return Err(Bad::Form(check_record(msg).err().unwrap_or(
+            DecodeError::NotARecord {
+                found: h.major.name(),
+            },
+        )));
+    }
+    Walk::start(c, &h, 0)
+}
+
+/// The rest of a message's record passed over, and nothing after it.
+#[inline(never)]
+fn closed(mut w: Walk) -> Result<(), Bad> {
+    w.to(u64::MAX)?;
+    w.c.end()?;
+    Ok(())
+}
+
+/// A refusal, as the tree's: a field found wrong is said only if the
+/// whole message is one canonical record.
+#[cold]
+#[inline(never)]
+fn settled(msg: &[u8], e: Bad) -> Bad {
+    match e {
+        Bad::Field(why) => match check_record(msg) {
+            Err(form) => Bad::Form(form),
+            Ok(()) => Bad::Field(why),
+        },
+        form => form,
+    }
+}
+
 impl Wire for String {
     const TY: Ty = Ty::Text;
+    #[cfg(debug_assertions)]
+    fn unknown(&self, known: &[&str]) -> Option<String> {
+        unknown_text(self, known)
+    }
     #[inline]
     fn encode_into(&self, out: &mut Vec<u8>) {
         header(T_TEXT, self.len() as u64, out);
@@ -233,10 +532,22 @@ impl Wire for String {
             _ => Err(wrong(at, "text")),
         }
     }
+    #[inline]
+    fn read(c: &mut Cursor<'_>, _: usize, at: &At) -> Result<Self, Bad> {
+        let h = c.head()?;
+        match h.major {
+            Major::Text => Ok(c.text(&h)?.to_owned()),
+            _ => Err(bad(at, "text")),
+        }
+    }
 }
 
 impl Wire for Cow<'static, str> {
     const TY: Ty = Ty::Text;
+    #[cfg(debug_assertions)]
+    fn unknown(&self, known: &[&str]) -> Option<String> {
+        unknown_text(self, known)
+    }
     #[inline]
     fn encode_into(&self, out: &mut Vec<u8>) {
         header(T_TEXT, self.len() as u64, out);
@@ -248,6 +559,10 @@ impl Wire for Cow<'static, str> {
     }
     fn take(v: Value, at: &At) -> Result<Self, String> {
         String::take(v, at).map(Cow::Owned)
+    }
+    #[inline]
+    fn read(c: &mut Cursor<'_>, depth: usize, at: &At) -> Result<Self, Bad> {
+        String::read(c, depth, at).map(Cow::Owned)
     }
 }
 
@@ -263,6 +578,17 @@ impl Wire for bool {
     }
     fn take(v: Value, at: &At) -> Result<Self, String> {
         v.as_bool().ok_or_else(|| wrong(at, "0 or 1"))
+    }
+    #[inline]
+    fn read(c: &mut Cursor<'_>, _: usize, at: &At) -> Result<Self, Bad> {
+        match c.head()? {
+            Head {
+                major: Major::Uint,
+                n: n @ (0 | 1),
+                ..
+            } => Ok(n == 1),
+            _ => Err(bad(at, "0 or 1")),
+        }
     }
 }
 
@@ -292,6 +618,11 @@ impl Wire for u64 {
     fn take(v: Value, at: &At) -> Result<Self, String> {
         v.as_uint().ok_or_else(|| wrong(at, "an unsigned integer"))
     }
+    #[inline]
+    fn read(c: &mut Cursor<'_>, _: usize, at: &At) -> Result<Self, Bad> {
+        let h = c.head()?;
+        uint_of(&h, at)
+    }
 }
 
 impl<const N: usize> Wire for [u8; N] {
@@ -311,6 +642,17 @@ impl<const N: usize> Wire for [u8; N] {
             _ => Err(wrong(at, "bytes")),
         }
     }
+    #[inline]
+    fn read(c: &mut Cursor<'_>, _: usize, at: &At) -> Result<Self, Bad> {
+        let h = c.head()?;
+        match h.major {
+            Major::Bytes => c
+                .bytes(&h)?
+                .try_into()
+                .map_err(|_| Bad::Field(wrong(at, &format!("{N} bytes")))),
+            _ => Err(bad(at, "bytes")),
+        }
+    }
 }
 
 impl Wire for bytes::Bytes {
@@ -328,6 +670,14 @@ impl Wire for bytes::Bytes {
         match v {
             Value::Bytes(b) => Ok(b.into()),
             _ => Err(wrong(at, "bytes")),
+        }
+    }
+    #[inline]
+    fn read(c: &mut Cursor<'_>, _: usize, at: &At) -> Result<Self, Bad> {
+        let h = c.head()?;
+        match h.major {
+            Major::Bytes => Ok(bytes::Bytes::copy_from_slice(c.bytes(&h)?)),
+            _ => Err(bad(at, "bytes")),
         }
     }
 }
@@ -364,6 +714,11 @@ impl Wire for i64 {
     }
     fn take(v: Value, at: &At) -> Result<Self, String> {
         v.as_int().ok_or_else(|| wrong(at, "an integer"))
+    }
+    #[inline]
+    fn read(c: &mut Cursor<'_>, _: usize, at: &At) -> Result<Self, Bad> {
+        let h = c.head()?;
+        int_of(&h, at)
     }
 }
 
@@ -407,6 +762,13 @@ impl Wire for Kind {
             v => u64::take(v, at).map(Kind::Number),
         }
     }
+    fn read(c: &mut Cursor<'_>, _: usize, at: &At) -> Result<Self, Bad> {
+        let h = c.head()?;
+        match h.major {
+            Major::Bytes => Ok(Kind::Named(bytes::Bytes::copy_from_slice(c.bytes(&h)?))),
+            _ => uint_of(&h, at).map(Kind::Number),
+        }
+    }
 }
 
 /// An integer or text, as the record it is in says.
@@ -448,6 +810,13 @@ impl Wire for Scalar {
             v => i64::take(v, at).map(Scalar::Int),
         }
     }
+    fn read(c: &mut Cursor<'_>, _: usize, at: &At) -> Result<Self, Bad> {
+        let h = c.head()?;
+        match h.major {
+            Major::Text => Ok(Scalar::Text(c.text(&h)?.to_owned())),
+            _ => int_of(&h, at).map(Scalar::Int),
+        }
+    }
 }
 
 impl<T: Wire> Wire for Option<T> {
@@ -459,6 +828,10 @@ impl<T: Wire> Wire for Option<T> {
     #[inline]
     fn sent(&self) -> bool {
         self.as_ref().is_some_and(Wire::sent)
+    }
+    #[cfg(debug_assertions)]
+    fn unknown(&self, known: &[&str]) -> Option<String> {
+        self.as_ref().and_then(|v| v.unknown(known))
     }
     fn check(&self, at: &At) -> Result<(), String> {
         self.as_ref().map_or(Ok(()), |v| v.check(at))
@@ -479,6 +852,10 @@ impl<T: Wire> Wire for Option<T> {
     }
     fn take(v: Value, at: &At) -> Result<Self, String> {
         T::take(v, at).map(Some)
+    }
+    #[inline]
+    fn read(c: &mut Cursor<'_>, depth: usize, at: &At) -> Result<Self, Bad> {
+        T::read(c, depth, at).map(Some)
     }
     fn absent(_: &At) -> Result<Self, String> {
         Ok(None)
@@ -528,6 +905,19 @@ impl<T: Wire> Wire for Vec<T> {
         }
         Ok(out)
     }
+    fn read(c: &mut Cursor<'_>, depth: usize, at: &At) -> Result<Self, Bad> {
+        let h = c.head()?;
+        if h.major != Major::List {
+            return Err(bad(at, "a list"));
+        }
+        let count = c.count(&h, depth)?;
+        // no more room first than the decoder itself keeps for a list
+        let mut out = Vec::with_capacity(count.min(MOST_RESERVED));
+        for i in 0..count {
+            out.push(T::read(c, depth + 1, &At::Item(at, i))?);
+        }
+        Ok(out)
+    }
 }
 
 /// A value held on the heap, as a record that holds itself holds itself:
@@ -554,6 +944,9 @@ impl<T: Wire> Wire for Box<T> {
     }
     fn take(v: Value, at: &At) -> Result<Self, String> {
         T::take(v, at).map(Box::new)
+    }
+    fn read(c: &mut Cursor<'_>, depth: usize, at: &At) -> Result<Self, Bad> {
+        T::read(c, depth, at).map(Box::new)
     }
 }
 
@@ -615,6 +1008,20 @@ impl Wire for Reference {
             _ => Err(wrong(at, "text or bytes")),
         }
     }
+    fn read(c: &mut Cursor<'_>, _: usize, at: &At) -> Result<Self, Bad> {
+        let h = c.head()?;
+        match h.major {
+            Major::Bytes => Ok(Reference::Id(c.bytes(&h)?.to_vec())),
+            Major::Text => {
+                let t = c.text(&h)?;
+                if t.starts_with(crate::EXACT) {
+                    return Err(Bad::Field(format!("{at} is text that begins with NUL")));
+                }
+                Ok(Reference::Typed(t.to_owned()))
+            }
+            _ => Err(bad(at, "text or bytes")),
+        }
+    }
 }
 
 /// The fields of a typed record, as [`typed!`](crate::typed) writes them:
@@ -631,9 +1038,16 @@ pub trait Fields: Sized {
     /// Shows `v` each field this build has, in the order of their
     /// numbers, with its row.
     fn each<V: Visit>(&self, v: &mut V);
+    /// The names of the fields it always has, in the order of their
+    /// numbers: what [`new!`](crate::new) is given, by name.
+    const REQUIRED: &'static [&'static str];
     /// Reads its fields from `r`, taking what they hold; keys this build
     /// does not know are passed over.
     fn take_fields(r: Record, at: &At) -> Result<Self, String>;
+    /// Reads its fields straight from the bytes, on the walk through its
+    /// record: what [`Fields::take_fields`] makes of the same record, or
+    /// the same refusal.
+    fn read_fields(w: &mut Walk, at: &At) -> Result<Self, Bad>;
 }
 
 /// What is done with each field of a record ([`Fields::each`]), given its
@@ -671,6 +1085,11 @@ impl Visit for Measure<'_> {
             self.n += 1;
             self.len += key_len(row.n) + len;
             self.ok &= ok;
+            // where the tests run, text of a closed set holds one of its values
+            #[cfg(debug_assertions)]
+            {
+                self.ok &= row.known.is_empty() || v.unknown(row.known).is_none();
+            }
         }
     }
 }
@@ -705,6 +1124,11 @@ impl Visit for Invalid<'_> {
         if v.sent() {
             let at = At::Field(self.at, row.name);
             if let Err(e) = v.check(&at) {
+                self.out.push((row.n, row.name, e));
+            }
+            #[cfg(debug_assertions)]
+            if let Some(t) = v.unknown(row.known).filter(|_| !row.known.is_empty()) {
+                let e = format!("{at} is {t:?}, which is none of the values its row names");
                 self.out.push((row.n, row.name, e));
             }
         }
@@ -870,6 +1294,10 @@ pub trait Ask: Fields + Clone + Send + Sync + 'static {
     /// Whether the connection carries a stream after it, answered by the
     /// connection itself (`watch`, `call-media`).
     const STREAM: bool = false;
+    /// Whether answering it changes nothing (`reads`), unless one of
+    /// `UNLESS` is given (`reads unless a or b`): as it is declared.
+    const READS: bool = false;
+    const UNLESS: &'static [&'static str] = &[];
     /// The lists of its reply that come in pages, in turn, each with the
     /// field of its records that names one too large for a message: none
     /// for a reply that comes whole.
@@ -904,6 +1332,14 @@ pub trait Ask: Fields + Clone + Send + Sync + 'static {
     }
     /// Every page joined: no `more` or `next` left.
     fn whole(_all: &mut Self::Reply) {}
+    /// The same arguments asked past an item too large for a message on
+    /// its own, which error 4, `failed`, names (`apps.md`, Pages): with
+    /// `after` one more than its place, or `before` its id. None for a
+    /// request that does not page, for another error, or for one that names
+    /// no item, or one before where this page began.
+    fn past(&self, _failed: &Failed) -> Option<Self> {
+        None
+    }
 
     /// It as a message, numbered; or why the encoding cannot hold it, as
     /// the tables by name said.
@@ -912,10 +1348,26 @@ pub trait Ask: Fields + Clone + Send + Sync + 'static {
     }
 
     /// Its arguments from a request off the wire, already read as one
-    /// record whose key 0 is this request's number.
+    /// record whose key 0 is this request's number: the way through the
+    /// tree, which [`Ask::read_request`] is held to.
     fn from_request(r: Record) -> Result<Self, Refused> {
         Self::take_fields(r, &At::Top(Self::REQUEST.name)).map_err(Refused::malformed)
     }
+
+    /// Its arguments from a request's message, whose key 0 is this
+    /// request's number ([`crate::request_of`]), read straight from its
+    /// bytes: what [`crate::decode_record`] and [`Ask::from_request`] make
+    /// of it, or their refusal, in their words.
+    fn read_request(msg: &[u8]) -> Result<Self, Refused> {
+        read_message(msg, |w| Self::read_fields(w, &At::Top(Self::REQUEST.name))).map_err(malformed)
+    }
+}
+
+/// A request that could not be read, as error 2.
+#[cold]
+#[inline(never)]
+fn malformed(b: Bad) -> Refused {
+    Refused::malformed(b.to_string())
 }
 
 /// A message of a stream, typed: an event of `watch` or a frame of
@@ -1023,19 +1475,91 @@ impl fmt::Display for Unencodable {
 
 impl std::error::Error for Unencodable {}
 
-/// A reply that did not do what was asked, as a client reads it.
+/// Where a request paged by position goes on past the item error 4,
+/// `failed`, names: one more than its place, where that place is in the
+/// page asked for, from `after`.
+pub fn past_after(failed: &Failed, after: Option<u64>) -> Option<u64> {
+    if failed.status != status::TOO_LARGE {
+        return None;
+    }
+    let at = failed.at.filter(|at| *at >= after.unwrap_or(0))?;
+    at.checked_add(1)
+}
+
+/// Where a request paged back from the newest goes on past the item error
+/// 4, `failed`, names: before its id, where that is not where the page
+/// asked for began.
+pub fn past_before(failed: &Failed, before: &Option<Reference>) -> Option<Reference> {
+    if failed.status != status::TOO_LARGE {
+        return None;
+    }
+    let id = failed.id.as_ref()?;
+    match before {
+        Some(Reference::Id(b)) if b == id => None,
+        _ => Some(Reference::Id(id.clone())),
+    }
+}
+
+/// What a stream's message's key 0 must be.
+const KIND: &str = "key 0 of a stream's message says what it is";
+
+/// The number in a stream's message's key 0, which says what it is: read
+/// straight from the bytes.
+#[inline(never)]
+pub fn kind_of(w: &mut Walk) -> Result<u64, Bad> {
+    if !w.to(0)? {
+        return Err(Bad::Field(KIND.into()));
+    }
+    w.value(|c, _| match c.head()? {
+        Head {
+            major: Major::Uint,
+            n,
+            ..
+        } => Ok(n),
+        _ => Err(Bad::Field(KIND.into())),
+    })
+}
+
+/// A stream's message decoded into the encoding's tree, and its key 0:
+/// the way through the tree, which [`kind_of`] is held to.
+pub fn stream_record(msg: &[u8]) -> Result<(u64, Record), Unreadable> {
+    let r = Record::decode(msg).map_err(|e| Unreadable(format!("not one record: {e}")))?;
+    let n = r
+        .get(0)
+        .and_then(Value::as_uint)
+        .ok_or_else(|| Unreadable(KIND.into()))?;
+    Ok((n, r))
+}
+
+/// A reply that did not do what was asked, as a client reads it: exactly
+/// what the reply said.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Failed {
     pub status: u64,
+    /// Key 1, as it came: empty where the service said nothing more. A
+    /// client shows it as [`Failed`]'s `Display` does, or words an empty
+    /// one its own way.
     pub why: String,
     /// Of error 4 to a paged request: which item was too large.
     pub at: Option<u64>,
     pub id: Option<Vec<u8>>,
 }
 
+impl Failed {
+    /// Why, for a person: key 1, or, where it is empty, the status's name
+    /// (`failed` for a status this build has no name for).
+    pub fn words(&self) -> &str {
+        match self.why.as_str() {
+            "" => status::name(self.status).unwrap_or("failed"),
+            why => why,
+        }
+    }
+}
+
+/// [`Failed::words`].
 impl fmt::Display for Failed {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.why)
+        f.write_str(self.words())
     }
 }
 
@@ -1055,9 +1579,80 @@ impl fmt::Display for Unreadable {
 
 impl std::error::Error for Unreadable {}
 
-/// A reply off the wire: what it says, or how it failed. An error is
-/// [`Unreadable`].
+impl From<Bad> for Unreadable {
+    #[cold]
+    fn from(b: Bad) -> Unreadable {
+        Unreadable(b.to_string())
+    }
+}
+
+/// Key 1 of an error's reply, why (`apps.md`, Replies): text, always.
+pub static WHY_ROW: Field = Field {
+    n: WHY,
+    name: "why",
+    ty: Ty::Text,
+    #[cfg(test)]
+    optional: false,
+    #[cfg(any(test, debug_assertions))]
+    known: &[],
+};
+
+/// Where in an error's reply a field is, for what an unreadable one says.
+const IN_AN_ERROR: At<'static> = At::Top("error");
+
+/// What a reply's key 0 must be.
+const STATUS: &str = "a reply's key 0 is its status";
+
+/// A reply off the wire, read straight from its bytes: what it says, or
+/// how it failed. An error is [`Unreadable`], in the words the way
+/// through the tree ([`read_reply_tree`]) says it in.
 pub fn read_reply<A: Ask>(msg: &[u8]) -> Result<Result<A::Reply, Failed>, Unreadable> {
+    read_message(msg, |w| match status_of(w)? {
+        status::OK => A::Reply::read_fields(w, &At::Top(A::REQUEST.name)).map(Ok),
+        st => refusal(w, st).map(Err),
+    })
+    .map_err(Unreadable::from)
+}
+
+/// A reply's status, key 0, read straight from the bytes.
+#[inline(never)]
+fn status_of(w: &mut Walk) -> Result<u64, Bad> {
+    if !w.to(0)? {
+        return Err(Bad::Field(STATUS.into()));
+    }
+    w.value(|c, _| match c.head()? {
+        Head {
+            major: Major::Uint,
+            n,
+            ..
+        } => Ok(n),
+        _ => Err(Bad::Field(STATUS.into())),
+    })
+}
+
+/// An error's reply after its status, read straight from the bytes: why,
+/// and what more it says ([`ErrorMore`](crate::table::ErrorMore)).
+#[cold]
+#[inline(never)]
+fn refusal(w: &mut Walk, status: u64) -> Result<Failed, Bad> {
+    let why = read_field::<String>(w, &WHY_ROW, &IN_AN_ERROR)?;
+    let more = crate::table::ErrorMore::read_fields(w, &IN_AN_ERROR)?;
+    Ok(failed(status, why, more))
+}
+
+fn failed(status: u64, why: String, more: crate::table::ErrorMore) -> Failed {
+    Failed {
+        status,
+        why,
+        at: more.at,
+        id: more.id.map(|b| b.to_vec()),
+    }
+}
+
+/// A reply off the wire, read the way through the encoding's tree: the
+/// message decoded whole into its `Record`, then each field taken from it.
+/// What [`read_reply`] is held to, in the tests; nothing else needs it.
+pub fn read_reply_tree<A: Ask>(msg: &[u8]) -> Result<Result<A::Reply, Failed>, Unreadable> {
     match reply_record(msg)? {
         Ok(r) => A::Reply::take_fields(r, &At::Top(A::REQUEST.name))
             .map(Ok)
@@ -1066,31 +1661,20 @@ pub fn read_reply<A: Ask>(msg: &[u8]) -> Result<Result<A::Reply, Failed>, Unread
     }
 }
 
-/// A reply off the wire, read as far as its status: the record of what
-/// it says, without why, or how it failed. An error is [`Unreadable`].
+/// A reply off the wire, decoded into the encoding's tree and read as far
+/// as its status: the record of what it says, without why, or how it
+/// failed. An error is [`Unreadable`].
 pub fn reply_record(msg: &[u8]) -> Result<Result<Record, Failed>, Unreadable> {
     let unreadable = Unreadable;
     let mut r = Record::decode(msg).map_err(|e| unreadable(format!("not one record: {e}")))?;
     let st = r
         .remove(0)
         .and_then(|v| v.as_uint())
-        .ok_or_else(|| unreadable("a reply's key 0 is its status".into()))?;
+        .ok_or_else(|| unreadable(STATUS.into()))?;
     if st != status::OK {
-        let why = match r.remove(WHY) {
-            Some(Value::Text(t)) if !t.is_empty() => t,
-            _ => status::name(st).unwrap_or("failed").to_owned(),
-        };
-        let at = r.get(2).and_then(Value::as_uint);
-        let id = match r.remove(3) {
-            Some(Value::Bytes(b)) => Some(b),
-            _ => None,
-        };
-        return Ok(Err(Failed {
-            status: st,
-            why,
-            at,
-            id,
-        }));
+        let why = take_field::<String>(&mut r, &WHY_ROW, &IN_AN_ERROR).map_err(Unreadable)?;
+        let more = crate::table::ErrorMore::take_fields(r, &IN_AN_ERROR).map_err(Unreadable)?;
+        return Ok(Err(failed(st, why, more)));
     }
     r.remove(WHY);
     Ok(Ok(r))

@@ -1423,7 +1423,7 @@ async fn ask<A: api::typed::Ask>(paths: &Paths, args: A) -> anyhow::Result<A::Re
 #[cold]
 #[inline(never)]
 fn not_done(failed: api::typed::Failed) -> anyhow::Error {
-    anyhow::anyhow!("{}", failed.why)
+    anyhow::anyhow!("{}", failed.words())
 }
 
 /// The service's reply, whether it did what was asked or not.
@@ -1493,9 +1493,9 @@ async fn ask_with_words<A: api::typed::Ask>(
         Err(f) => f,
     };
     if failed.status != api::status::NEEDS_WORDS {
-        anyhow::bail!("{}", failed.why);
+        anyhow::bail!("{}", failed.words());
     }
-    println!("{}.", capitalized(&failed.why));
+    println!("{}.", capitalized(failed.words()));
     let typed = ask_words(paths, "Your recovery words can approve it instead.").await?;
     words(&mut args, typed.as_str().to_owned());
     ask(paths, args).await
@@ -1561,7 +1561,7 @@ async fn read_words(
                     };
                     match ask_or_failed(paths, &args).await? {
                         Ok(_) => return Ok(words),
-                        Err(failed) => failed.why,
+                        Err(failed) => failed.words().to_owned(),
                     }
                 }
                 None => match cardinal_crypto::RecoveryPhrase::parse(&words) {
@@ -5137,26 +5137,38 @@ mod tests {
 
     #[test]
     fn fetch_status_line() {
-        let p = api::ProgressShown::new(0, 1_800_000_000, 2_000_000_000, 412, 31_000_000);
+        let p = cardinal_interface::new!(api::ProgressShown {
+            bytes_fetched: 0,
+            bytes_pending: 1_800_000_000,
+            bytes_wanted: 2_000_000_000,
+            files_pending: 412,
+            rate: 31_000_000
+        });
         assert_eq!(
             fetch_line(&p),
             "fetching 412 files, 1.8 GB left of 2.0 GB, 31.0 MB/s"
         );
-        let p = api::ProgressShown::new(0, 500, 0, 1, 0);
+        let p = cardinal_interface::new!(api::ProgressShown {
+            bytes_fetched: 0,
+            bytes_pending: 500,
+            bytes_wanted: 0,
+            files_pending: 1,
+            rate: 0
+        });
         assert_eq!(fetch_line(&p), "fetching 1 file, 500 B left");
     }
 
     fn holder(name: &str, this: bool, state: &str, last_pass: Option<u64>) -> api::Holder {
-        let h = api::Holder::new(
-            false,
-            state == "passed",
-            [0; 8],
-            0,
-            name.to_owned(),
-            true,
-            state.to_owned().into(),
-            this,
-        );
+        let h = cardinal_interface::new!(api::Holder {
+            checking: false,
+            counted: state == "passed",
+            key: [0; 8],
+            missed: 0,
+            name: name.to_owned(),
+            online: true,
+            state: state.to_owned().into(),
+            this
+        });
         api::Holder { last_pass, ..h }
     }
 
@@ -5164,7 +5176,15 @@ mod tests {
     fn copies_status_lines() {
         let now = 10_000_000u64;
         let c = |holders: Vec<api::Holder>| {
-            api::Copies::new(12, 0, 10, holders, 600_000, now, 3_600_000)
+            cardinal_interface::new!(api::Copies {
+                blobs: 12,
+                count: 0,
+                eligible: 10,
+                holders,
+                interval_ms: 600_000,
+                now,
+                older_than_ms: 3_600_000
+            })
         };
         // Alone.
         let alone = c(vec![holder("carbonite", true, "passed", Some(now - 1000))]);
@@ -5237,7 +5257,15 @@ mod tests {
             vec!["Copies: checking nuc… (nothing older than an hour yet)"]
         );
         // No content yet: nothing to say.
-        let none = api::Copies::new(0, 0, 0, Vec::new(), 600_000, now, 3_600_000);
+        let none = cardinal_interface::new!(api::Copies {
+            blobs: 0,
+            count: 0,
+            eligible: 0,
+            holders: Vec::new(),
+            interval_ms: 600_000,
+            now,
+            older_than_ms: 3_600_000
+        });
         assert!(copies_lines(Some(&none), 1).is_empty());
         assert!(copies_lines(None, 1).is_empty());
     }
@@ -5251,16 +5279,16 @@ mod tests {
 
     #[test]
     fn speedtest_line() {
-        let v = api::SpeedtestReply::new(
-            "saint-joseph".into(),
-            0,
-            38_200_000,
-            0,
-            610,
-            420,
-            36_900_000,
-            0,
-        );
+        let v = cardinal_interface::new!(api::SpeedtestReply {
+            device: "saint-joseph".into(),
+            ms: 0,
+            receive: 38_200_000,
+            received_bytes: 0,
+            rtt_median_us: 610,
+            rtt_min_us: 420,
+            send: 36_900_000,
+            sent_bytes: 0
+        });
         assert_eq!(
             speed_line(&v),
             "saint-joseph: receive 38.2 MB/s, send 36.9 MB/s, round trip 0.4 ms (median 0.6 ms)"
@@ -5281,11 +5309,24 @@ mod tests {
 
     #[test]
     fn source_status_line() {
-        let f = api::Fetch::new(3, 38_000_000, 1_100_000_000, 412);
+        let f = cardinal_interface::new!(api::Fetch {
+            latency_ms: 3,
+            rate: 38_000_000,
+            received: 1_100_000_000,
+            replies: 412
+        });
         assert_eq!(
             source_line(&f).unwrap(),
             "sent 1.1 GB to this device; now 38.0 MB/s, 3 ms"
         );
-        assert_eq!(source_line(&api::Fetch::new(0, 0, 0, 0)), None);
+        assert_eq!(
+            source_line(&cardinal_interface::new!(api::Fetch {
+                latency_ms: 0,
+                rate: 0,
+                received: 0,
+                replies: 0
+            })),
+            None
+        );
     }
 }

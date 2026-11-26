@@ -2060,7 +2060,10 @@ pub(crate) fn mark_read_in(
             why: Some("read markers are off: others do not see what you have read".into()),
         });
     }
-    Ok(crate::api::MarkReadReply::new(false, moved))
+    Ok(cardinal_interface::new!(crate::api::MarkReadReply {
+        kept: false,
+        marked: moved
+    }))
 }
 
 /// A length of time in words, to the largest unit that matters.

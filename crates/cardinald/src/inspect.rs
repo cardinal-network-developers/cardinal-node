@@ -327,7 +327,7 @@ fn profile_of(p: Profile) -> Kind {
 
 /// A value rendered as only what it is: `t` alone.
 fn only(t: &'static str) -> InspectValue {
-    InspectValue::new(t.into())
+    cardinal_interface::new!(InspectValue { t: t.into() })
 }
 
 /// A key or secret, shown as what it is and how long, never as its bytes.
@@ -342,7 +342,9 @@ fn secret(what: &str, len: usize) -> InspectValue {
 fn shape(r: &Record, store: Option<&dyn ObjectStore>) -> Option<Shape> {
     if let Ok(b) = BlobRef::from_record(r) {
         let here = store.map(|s| s.has(&b.id).unwrap_or(false));
-        let mut out = Shape::new("blob reference".into());
+        let mut out = cardinal_interface::new!(Shape {
+            is: "blob reference".into()
+        });
         out.id = Some(b.id);
         out.size = Some(b.size);
         out.levels = Some(b.levels);
@@ -350,7 +352,9 @@ fn shape(r: &Record, store: Option<&dyn ObjectStore>) -> Option<Shape> {
         return Some(out);
     }
     if is_epoch_key_pair(r) {
-        return Some(Shape::new("epoch key".into()));
+        return Some(cardinal_interface::new!(Shape {
+            is: "epoch key".into()
+        }));
     }
     None
 }
@@ -598,14 +602,14 @@ fn weigh(sealed_bytes: &[u8], sp: Option<&Space>, e: Option<&SpaceEntry>) -> Wei
         .and_then(|r| r.get(3))
         .and_then(Value::as_bytes)
         .map_or(0, <[u8]>::len);
-    let mut out = Weight::new(
-        if cipher >= 16 { 16 } else { 0 },
-        cipher as u64,
+    let mut out = cardinal_interface::new!(Weight {
+        aead: if cipher >= 16 { 16 } else { 0 },
+        ciphertext: cipher as u64,
         // the sealed record's own fields and framing: epoch, nonce, open key
-        sealed_len.saturating_sub(cipher + wraps) as u64,
-        sealed_len as u64,
-        wraps as u64,
-    );
+        header: sealed_len.saturating_sub(cipher + wraps) as u64,
+        sealed: sealed_len as u64,
+        wraps: wraps as u64,
+    });
     let (Some(sp), Some(e)) = (sp, e) else {
         return out;
     };
@@ -623,7 +627,7 @@ fn weigh(sealed_bytes: &[u8], sp: Option<&Space>, e: Option<&SpaceEntry>) -> Wei
                 .map(|b| Kind::Named(bytes::Bytes::copy_from_slice(b))),
         });
         let (kind, reach) = op_about(sp, e, i);
-        let mut weighed = WeighedOp::new(n as u64);
+        let mut weighed = cardinal_interface::new!(WeighedOp { bytes: n as u64 });
         weighed.kind = kind;
         weighed.reach = reach;
         weighed.op = number;
@@ -639,15 +643,15 @@ fn space_brief(core: &Core, hd: &Holder) -> InspectSpace {
     let (n, bytes) = sealed_total(hd);
     let sp = hd.space.as_ref();
     let me = core.me();
-    let mut out = InspectSpace::new(
-        core.account_id() == Some(hd.id),
-        bytes as u64,
-        core.files_id() == Some(hd.id),
-        hd.id,
-        sp.is_some(),
-        hd.pending().len() as u64,
-        n as u64,
-    );
+    let mut out = cardinal_interface::new!(InspectSpace {
+        account: core.account_id() == Some(hd.id),
+        bytes: bytes as u64,
+        files: core.files_id() == Some(hd.id),
+        id: hd.id,
+        opened: sp.is_some(),
+        pending: hd.pending().len() as u64,
+        sealed: n as u64
+    });
     out.label = label_of(core, &hd.id, sp);
     out.profile = sp.map(|s| profile_of(s.profile()));
     out.entries = sp.map(|s| s.dag().len() as u64);
@@ -740,21 +744,21 @@ fn overview(d: &Daemon) -> crate::api::InspectReply {
         .map(|hd| space_brief(&core, hd))
         .collect();
     let usage = d.store.usage();
-    let mut reply = crate::api::InspectReply::new(
-        InspectDevice {
+    let mut reply = cardinal_interface::new!(crate::api::InspectReply {
+        device: InspectDevice {
             key: device,
             link_x25519: *core.keys.link.public_key().x25519(),
             name: names.get(&device).cloned(),
         },
         others,
         spaces,
-        StoreShown {
+        store: StoreShown {
             bytes: usage.bytes,
             objects: usage.objects,
         },
-        env!("CARGO_PKG_VERSION").into(),
-        false,
-    );
+        version: env!("CARGO_PKG_VERSION").into(),
+        more: false
+    });
     reply.identity = identity;
     reply
 }
@@ -794,7 +798,7 @@ fn identity(
     };
     let o = Opts::given(a.value_bytes, a.items);
     let r = Render { o, store: None };
-    let mut reply = crate::api::InspectIdentityReply::new(false);
+    let mut reply = cardinal_interface::new!(crate::api::InspectIdentityReply { more: false });
     if let Some(e) = a.entry.as_ref() {
         let id: [u8; 32] = match e {
             Reference::Typed(t) => hex::decode(t).ok(),
@@ -820,7 +824,10 @@ fn identity(
                 .ops()
                 .iter()
                 .map(|op| {
-                    InspectOp::new(op.record().encoded_len() as u64, r.record(op.record(), 0))
+                    cardinal_interface::new!(InspectOp {
+                        bytes: op.record().encoded_len() as u64,
+                        op: r.record(op.record(), 0)
+                    })
                 })
                 .collect();
             IdentityEntry {
@@ -871,16 +878,16 @@ fn space(
     let core = d.core();
     let hd = holder(&core, a.space.as_ref())?;
     let brief = space_brief(&core, hd);
-    let mut out = crate::api::InspectSpaceReply::new(
-        brief.account,
-        brief.bytes,
-        brief.files,
-        brief.id,
-        brief.opened,
-        brief.pending,
-        brief.sealed,
-        false,
-    );
+    let mut out = cardinal_interface::new!(crate::api::InspectSpaceReply {
+        account: brief.account,
+        bytes: brief.bytes,
+        files: brief.files,
+        id: brief.id,
+        opened: brief.opened,
+        pending: brief.pending,
+        sealed: brief.sealed,
+        more: false
+    });
     out.entries = brief.entries;
     out.label = brief.label;
     out.my_role = brief.my_role;
@@ -927,7 +934,11 @@ fn space(
     for id in sp.dag().log_order() {
         let Some(e) = sp.entry(id) else { continue };
         let ep = epochs.entry(e.epoch()).or_insert_with(|| EpochShown {
-            epoch: InspectEpoch::new(0, sp.keyring().get(&e.epoch()).is_some(), e.epoch()),
+            epoch: cardinal_interface::new!(InspectEpoch {
+                entries: 0,
+                held: sp.keyring().get(&e.epoch()).is_some(),
+                id: e.epoch()
+            }),
             pending: None,
         });
         ep.epoch.entries += 1;
@@ -941,7 +952,11 @@ fn space(
     }
     for s in hd.pending() {
         let ep = epochs.entry(s.epoch()).or_insert_with(|| EpochShown {
-            epoch: InspectEpoch::new(0, false, s.epoch()),
+            epoch: cardinal_interface::new!(InspectEpoch {
+                entries: 0,
+                held: false,
+                id: s.epoch()
+            }),
             pending: None,
         });
         ep.pending = Some(ep.pending.unwrap_or(0) + 1);
@@ -1092,7 +1107,9 @@ fn entries(
                 let s = SealedEntry::decode(&bytes).ok();
                 let entry = opened.get(sid);
                 let e = entry.and_then(|id| sp.and_then(|sp| sp.entry(id)));
-                let mut out = InspectEntry::new(weigh(&bytes, sp, e));
+                let mut out = cardinal_interface::new!(InspectEntry {
+                    weigh: weigh(&bytes, sp, e)
+                });
                 out.sealed_id = Some(*sid);
                 out.bytes = Some(bytes.len() as u64);
                 out.epoch = s.as_ref().map(|s| s.epoch());
@@ -1106,7 +1123,11 @@ fn entries(
             })
             .collect();
         return Ok(precut(
-            crate::api::InspectEntriesReply::new(list, total as u64, false),
+            cardinal_interface::new!(crate::api::InspectEntriesReply {
+                entries: list,
+                total: total as u64,
+                more: false
+            }),
             total,
         ));
     }
@@ -1126,7 +1147,9 @@ fn entries(
             let e = sp.entry(id)?;
             let sid = sealed_of.get(id);
             let bytes = sid.and_then(|s| hd.get(s)).unwrap_or_default();
-            let mut out = InspectEntry::new(weigh(&bytes, Some(sp), Some(e)));
+            let mut out = cardinal_interface::new!(InspectEntry {
+                weigh: weigh(&bytes, Some(sp), Some(e))
+            });
             out.entry = Some(*id);
             out.position = Some(pos as u64);
             out.sealed_id = sid.copied();
@@ -1144,7 +1167,11 @@ fn entries(
             Some(out)
         })
         .collect();
-    let mut reply = crate::api::InspectEntriesReply::new(list, order.len() as u64, false);
+    let mut reply = cardinal_interface::new!(crate::api::InspectEntriesReply {
+        entries: list,
+        total: order.len() as u64,
+        more: false
+    });
     reply.pending = Some(hd.pending().len() as u64);
     Ok(precut(reply, order.len()))
 }
@@ -1188,7 +1215,7 @@ fn entry(
     let bytes = sid.and_then(|s| hd.get(&s));
     let sealed_value = bytes.as_ref().and_then(|b| Record::decode(b).ok());
     let e = eid.and_then(|id| sp.and_then(|sp| sp.entry(&id)));
-    let mut out = crate::api::InspectEntryReply::new(false);
+    let mut out = cardinal_interface::new!(crate::api::InspectEntryReply { more: false });
     if let Some(path) = a.path.as_deref() {
         let (root, rest) = path
             .split_first()
@@ -1253,10 +1280,10 @@ fn entry(
                 let made = matches!(op.body(), SpaceOpBody::Create { .. })
                     .then(|| cardinal_space::entry::derived_id(&e.id(), i));
                 let (kind, reach) = op_about(sp, e, i);
-                let mut out = InspectOp::new(
-                    op.record().encoded_len() as u64,
-                    render_op(&r, sp, &secrets, op),
-                );
+                let mut out = cardinal_interface::new!(InspectOp {
+                    bytes: op.record().encoded_len() as u64,
+                    op: render_op(&r, sp, &secrets, op)
+                });
                 out.kind = kind;
                 out.reach = reach;
                 out.index = Some(i as u64);
@@ -1347,7 +1374,11 @@ fn nodes(
         .map(|n| node_brief(n, sp))
         .collect();
     Ok(crate::api::typed::Precut {
-        reply: crate::api::InspectNodesReply::new(out, total as u64, false),
+        reply: cardinal_interface::new!(crate::api::InspectNodesReply {
+            nodes: out,
+            total: total as u64,
+            more: false
+        }),
         from: offset as u64,
         total: total as u64,
     })
@@ -1386,7 +1417,7 @@ fn node(
         (None, None) if id == ROOT => &BTreeMap::new(),
         _ => anyhow::bail!("no such node in that space"),
     };
-    let mut out = crate::api::InspectNodeReply::new(false);
+    let mut out = cardinal_interface::new!(crate::api::InspectNodeReply { more: false });
     if let Some(path) = a.path.as_deref() {
         let key = path
             .first()

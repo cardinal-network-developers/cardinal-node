@@ -2322,7 +2322,7 @@ asks for around that is not built yet.
     `Cow<'static, str>` text, `bool`, `u64` uint, `i64` int,
     `api::typed::Kind` a kind, `api::typed::Scalar` int or text, `[u8; N]`
     bytes of that length (read back only at exactly N), `bytes::Bytes`
-    bytes of any length, `api::typed::Reference` a ref, `Vec<T>` a list, a
+    (re-exported as `cardinal_interface::Bytes`) bytes of any length, `api::typed::Reference` a ref, `Vec<T>` a list, a
     typed record, and `Option<T>` a field sent only when it is `Some`.
     `n gone name: T` is a number no longer used: its row stays, with the
     type it had, and there is no struct field. A record that holds itself
@@ -2332,9 +2332,14 @@ asks for around that is not built yet.
     from the type; `Box<T>` is T on the wire. A record's row is written
     out in its static, so that it can name itself.
   - **What a record must have.** A field that is not an `Option` is one
-    this service always sends: there is no `Default`, and `Name::new` takes
-    exactly those fields, so a handler cannot forget one; read back, its
-    absence is an error. **A field added to a record after it was first
+    this service always sends: there is no `Default`, and a record is made
+    with `new!(Name { field: value, .. })`, which names exactly those
+    fields, each once, in the order of their numbers, or does not compile
+    (a const check of the names against the declaration's, `Fields::REQUIRED`),
+    so a handler cannot forget one, nor give two fields of one type each
+    other's values; it compiles to the struct itself. A record with none
+    of them is also `Name::new()`; the positional constructor `new!` calls
+    is hidden (`__new`). Read back, a missing one is an error. **A field added to a record after it was first
     released is an `Option` for ever**, so that a newer client reads an
     older service still running (the state after every update until the
     service restarts).
@@ -2419,7 +2424,15 @@ asks for around that is not built yet.
     the export's own names beside it, `interface.txt`; both are written by
     `CARDINAL_INTERFACE_EXPORT=write cargo test -p cardinal-interface --lib
     export`, and a test fails while they are not what the declarations
-    give (`crates/interface/src/export.rs` says what they hold).
+    give (`crates/interface/src/export.rs` says what they hold). Besides
+    the requests and records, the export holds every status with its name,
+    the layout of a message (the keys of a request's number and first
+    argument, a reply's status, why and first field, a stream's kind and
+    first field), the largest message, whether each request `reads`
+    (`unless` some argument is given), and a text field's `known` values.
+    The program's options, numbered apart from the requests, had been given
+    the paging of the requests of their numbers (`--clear` that of
+    `status`); they have none.
   - **The way by name, kept to compare.** While requests are converted,
     main's handlers of the typed requests are kept whole, as `*_by_name`
     (with main's lookups and main's arms in `control::handle`), compiled
@@ -2525,6 +2538,49 @@ asks for around that is not built yet.
     `host-offer` to a trusted contact with a `relay_mb` of about 1.8e13 or
     more multiplies past a u64 (`mb * 1_000_000`), which in a debug build
     panics in the connection's task and in a release build wraps.
+  - **Read straight from the bytes.** A request in the service, and a
+    reply, an event or a frame in a client, is read field by field from
+    its bytes (`Wire::read`, `Fields::read_fields` on a `Walk` through the
+    record; `request_of` then `Ask::read_request`; `read_reply`;
+    `Event::read`, `Frame::read`), with no `Record` tree between, so the
+    only allocations are the values' own. Every check is the tree's: the
+    structural ones are `cardinal_encoding::Cursor`'s, which the encoding's
+    own decoder now reads with too, and the fields' are those of
+    `Wire::take`, with the same words; a message found wrong in a field is
+    checked whole (`check_record`, no tree) before that is said, so a
+    message that is not one canonical record is refused for that first,
+    as decoding it whole first refuses it. The way through the tree is kept
+    (`decode_record`, `Ask::from_request`, `read_reply_tree`,
+    `Event::read_tree`, `Frame::read_tree`), and a property test holds the
+    two alike for random and mutated messages of every request, reply,
+    event, frame and program reply (`crates/interface/src/direct.rs`).
+    The service still reads the frames a window sends through the tree
+    and field by field, leniently (`calls::media`): typed, a malformed one
+    would be passed over whole, which is a change of what it takes.
+  - **A refusal as the reply said it.** `Failed::why` is key 1 exactly,
+    empty where the service said nothing more; `Failed::words` (and its
+    `Display`, which the command line prints) gives the status's name for
+    an empty one, as `why` held before. An error's reply without text in
+    key 1, or whose `at` or `id` is not of its row's type, is unreadable:
+    the spec says key 1 says why.
+  - **Going on past an item too large.** `Ask::past`, made from each paged
+    request's declaration, is the same arguments with `after` one more than
+    error 4's `at`, or `before` its `id` (none for another error, or one
+    naming an item before where the page began). `client::ask` and
+    `Pages::new` stop at error 4, as before (the command line's choice);
+    `client::ask_past` and `Pages::past_too_large` go on past it, leaving
+    the item out and keeping each error 4 that named one (`Whole::left_out`),
+    for a window to say how many were left out: no message can hold such
+    an item, so it cannot be had at all. `Pages::every_page`, `so_far` and
+    `more` let a client read pages as they come and stop when it has
+    enough (a conversation back from the newest).
+  - **Closed sets of text.** A text field whose values are a closed set
+    says so in its declaration (`10 state: Cow<'static, str> where "calling"
+    | "ringing" | "live"`): exported as the field's `known` values for
+    generators, still text on the wire. In a debug build a reply holding
+    another value is this build's mistake, as a uint of 2^60 is: the
+    request fails, `internal: <where> is "<value>", which is none of the
+    values its row names`; a release build sends it as it is.
   - **A reply field without a number** is this build's mistake. In a debug
     build, where the tests run, the request then fails; in a release build
     the field is left out and the service logs an error. A field no test

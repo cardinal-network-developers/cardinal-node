@@ -12,11 +12,16 @@
 //!   program says; [`each_request!`] lists every request once, from which
 //!   [`REQUESTS`] is made, and the service its answering.
 //! - [`typed`]: the [`Wire`](typed::Wire) trait and the field types,
-//!   writing and reading messages, and paging, both its sides.
+//!   writing messages and reading them straight from their bytes, and
+//!   paging, both its sides.
 //! - [`client`]: what a client needs to ask a request and read its reply
-//!   typed, page after page, over a transport it supplies.
-//! - Here: the numbers every message shares (status, why), `ref`s, the
-//!   lookups in the tables, and the text rendering by the tables' names.
+//!   typed, page after page (going past an item too large for a message,
+//!   where it asks to), over a transport it supplies.
+//! - [`new!`]: a record made with the fields it always has named.
+//! - [`Event`], [`Frame`]: a stream's message read by its key 0.
+//! - Here: the numbers every message shares (status, why, [`key`]),
+//!   [`request_of`], `ref`s, the lookups in the tables, the text rendering
+//!   by the tables' names, and [`Bytes`], the type of a field of bytes.
 //!
 //! The same declarations are exported for clients in other languages as
 //! one file, `interface.bin` (the base encoding) with its text rendering
@@ -36,12 +41,13 @@
 //! impl Transport for Empty {
 //!     type Error = Box<dyn std::error::Error>;
 //!     fn exchange(&mut self, request: &[u8]) -> Result<Vec<u8>, Self::Error> {
-//!         let (_, record) = cardinal_interface::decode_record(request).map_err(|r| r.why)?;
-//!         let args = <FilesArgs as cardinal_interface::typed::Ask>::from_request(record)
-//!             .map_err(|r| r.why)?;
-//!         let mine = cardinal_interface::Place::new("mine".into());
-//!         let reply = cardinal_interface::FilesReply::new(Vec::new(), String::new(), mine, false);
-//!         Ok(cardinal_interface::typed::Ask::reply_bytes(&args, reply))
+//!         use cardinal_interface::{new, typed::Ask, FilesReply, Place};
+//!         cardinal_interface::request_of(request).map_err(|r| r.why)?;
+//!         let args = FilesArgs::read_request(request).map_err(|r| r.why)?;
+//!         let place = new!(Place { kind: "mine".into() });
+//!         let files = Vec::new();
+//!         let reply = new!(FilesReply { files, path: String::new(), place, more: false });
+//!         Ok(args.reply_bytes(reply))
 //!     }
 //! }
 //!
@@ -54,6 +60,8 @@ pub mod table;
 pub mod typed;
 
 #[cfg(test)]
+mod direct;
+#[cfg(test)]
 mod export;
 #[cfg(test)]
 mod tests;
@@ -63,10 +71,15 @@ use cardinal_encoding::{Record, Value};
 // The typed records, requests and replies, and the tables' rows.
 pub use table::*;
 
+/// The `bytes` crate, whose [`Bytes`] the records' fields of bytes of any
+/// length are: named from here, a client's is always this crate's.
+pub use bytes;
+pub use bytes::Bytes;
+
 /// What the macros name, from wherever they are used.
 #[doc(hidden)]
 pub mod __private {
-    pub use cardinal_encoding::{Record, Value};
+    pub use cardinal_encoding::{Cursor, Record, Value};
 }
 
 /// The version of this interface. A client compares it with `hello`'s.
@@ -93,6 +106,17 @@ pub mod status {
     pub const NEEDS_WORDS: u64 = 5;
     /// A recovery invitation that a guardian accepts needs `for`.
     pub const NEEDS_FOR: u64 = 6;
+
+    /// Every status, in order.
+    pub const ALL: &[u64] = &[
+        OK,
+        FAILED,
+        MALFORMED,
+        UNKNOWN,
+        TOO_LARGE,
+        NEEDS_WORDS,
+        NEEDS_FOR,
+    ];
 
     /// The name a tool shows for a status.
     pub fn name(n: u64) -> Option<&'static str> {
@@ -138,6 +162,20 @@ pub mod frame {
 
 /// A reply's key 1 in an error: why, in words.
 pub const WHY: u64 = 1;
+
+/// Where a message's parts are (`apps.md`, The local interface): a
+/// request's number in key 0 and its arguments from key 1; a reply's
+/// status in key 0, an error's why in key 1, and its fields from key 2; a
+/// stream's message's kind in key 0 and its fields from key 1.
+pub mod key {
+    pub const NUMBER: u64 = 0;
+    pub const FIRST_ARGUMENT: u64 = 1;
+    pub const STATUS: u64 = 0;
+    pub const WHY: u64 = super::WHY;
+    pub const FIRST_REPLY_FIELD: u64 = 2;
+    pub const KIND: u64 = 0;
+    pub const FIRST_STREAM_FIELD: u64 = 1;
+}
 
 /// A failure to turn a message into a request: the status to answer with,
 /// and why.
@@ -330,6 +368,63 @@ pub fn decode_record(msg: &[u8]) -> Result<(&'static Request, Record), Refused> 
         });
     }
     Ok((spec, r))
+}
+
+/// The request a message is, read straight from its bytes as far as its
+/// key 0: the row of one this service answers, whose arguments
+/// [`Ask::read_request`](typed::Ask::read_request) then reads, checking
+/// the rest. The two together refuse what [`decode_record`] and
+/// [`Ask::from_request`](typed::Ask::from_request) refuse, in their words:
+/// a message that is not one canonical record for that first (said here
+/// where key 0 is not a request answered, and otherwise by the arguments'
+/// reading), then key 0, then a request not answered, then its arguments.
+pub fn request_of(msg: &[u8]) -> Result<&'static Request, Refused> {
+    let n = match number_of(msg) {
+        Ok(Some(n)) => n,
+        Ok(None) => {
+            checked(msg)?;
+            return Err(Refused::malformed("key 0 should be the request's number"));
+        }
+        Err(e) => return Err(Refused::malformed(format!("not one record: {e}"))),
+    };
+    match by_number(n) {
+        Some(spec) if !spec.gone => Ok(spec),
+        spec => {
+            checked(msg)?;
+            Err(match spec {
+                None => Refused {
+                    status: status::UNKNOWN,
+                    why: format!("this service has no request {n}"),
+                },
+                Some(spec) => Refused {
+                    status: status::UNKNOWN,
+                    why: format!("this service no longer answers request {n}, {}", spec.name),
+                },
+            })
+        }
+    }
+}
+
+/// A request's key 0, as a uint, where its record begins with it; nothing
+/// where it does not (the rest is not read).
+fn number_of(msg: &[u8]) -> Result<Option<u64>, cardinal_encoding::DecodeError> {
+    use cardinal_encoding::{Cursor, Major};
+    let mut c = Cursor::new(msg);
+    let h = c.head()?;
+    if h.major != Major::Record || c.count(&h, 0)? == 0 || c.key(None)? != 0 {
+        return Ok(None);
+    }
+    let v = c.head()?;
+    Ok((v.major == Major::Uint).then_some(v.n))
+}
+
+/// Whether a message is one canonical record, refused as
+/// [`decode_record`] refuses one that is not.
+#[cold]
+#[inline(never)]
+fn checked(msg: &[u8]) -> Result<(), Refused> {
+    cardinal_encoding::check_record(msg)
+        .map_err(|e| Refused::malformed(format!("not one record: {e}")))
 }
 
 /// Room kept in a message beside a page's items: the status, `more`,

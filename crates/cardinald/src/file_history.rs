@@ -218,7 +218,11 @@ pub fn deleted(d: &Daemon, path: &str, hidden: bool) -> anyhow::Result<crate::ap
             continue;
         }
         let kind = f.kinds().file_kind(n.kind);
-        let mut v = crate::api::DeletedFile::new(kind == FileKind::Folder, id, n.name.clone());
+        let mut v = cardinal_interface::new!(crate::api::DeletedFile {
+            folder: kind == FileKind::Folder,
+            id,
+            name: n.name.clone()
+        });
         if kind == FileKind::File {
             v.size = f.stat(&id).and_then(|s| s.size);
         }

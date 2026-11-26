@@ -38,6 +38,21 @@
 //! page themselves (`limit`, `after` or `before`). The paging is written
 //! once over `dyn` [`Paging`], so a client's code does not grow with each
 //! request it asks.
+//!
+//! **An item too large for a message on its own** is error 4, which names
+//! it by its place (`at`) and its `id` (`apps.md`, Pages). [`ask`] stops
+//! there, and the reply is that failure. [`ask_past`] (or
+//! [`Pages::past_too_large`]) goes on past it, as a window does: it asks
+//! again from one more than its place, or before its id
+//! ([`Ask::past`], made from each request's declaration), and the reply
+//! holds every other item. The item left out cannot be had through the
+//! interface at all, since no message can hold it: a client shows the
+//! rest and says that so many were left out ([`Whole::left_out`], each the
+//! error 4 that named one, with its `at`, `id` and why).
+//!
+//! **Replies are read straight from their bytes** ([`read_reply`]), and a
+//! stream's messages by their key 0 ([`Event::read`](crate::Event::read),
+//! [`Frame::read`](crate::Frame::read)): no tree of the encoding between.
 
 use crate::typed::{read_reply, Ask, Failed, Unencodable, Unreadable};
 use crate::Request;
@@ -66,6 +81,26 @@ pub fn ask<A: Ask, T: Transport + ?Sized>(
     Ok(pages.done())
 }
 
+/// Asks `args` over `t` as [`ask`] does, going on past each item too large
+/// for a message on its own: the reply holds every other item, and says
+/// which were left out.
+pub fn ask_past<A: Ask, T: Transport + ?Sized>(
+    t: &mut T,
+    args: &A,
+) -> Result<Result<Whole<A::Reply>, Failed>, T::Error> {
+    let mut pages = Pages::new(args).past_too_large();
+    asking(t, &mut pages)?;
+    Ok(pages.whole())
+}
+
+/// A reply, every page of it joined, and the items left out of it: each
+/// too large for a message on its own, named by the error 4 that said so.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Whole<R> {
+    pub reply: R,
+    pub left_out: Vec<Failed>,
+}
+
 /// [`ask`], written once for every request.
 fn asking<T: Transport + ?Sized>(t: &mut T, p: &mut dyn Paging) -> Result<(), T::Error> {
     while let Some(msg) = p.next()? {
@@ -82,9 +117,18 @@ fn asking<T: Transport + ?Sized>(t: &mut T, p: &mut dyn Paging) -> Result<(), T:
 pub struct Pages<A: Ask> {
     /// Whether the arguments asked for one page themselves.
     one_page: bool,
+    /// How an item too large for a message is passed (and left out), when
+    /// it is: named here only then, so that a client that never goes past
+    /// one has none of its code.
+    #[allow(clippy::type_complexity)]
+    past: Option<fn(&A, &Failed) -> Option<A>>,
+    /// Whether what is asked next is `asked` again, moved past such an
+    /// item, rather than the page after the last.
+    moved: bool,
     asked: A,
     all: Option<A::Reply>,
     failed: Option<Failed>,
+    left_out: Vec<Failed>,
 }
 
 /// What is done with a request asked page after page, whatever its type:
@@ -102,14 +146,64 @@ pub trait Paging {
 }
 
 impl<A: Ask> Pages<A> {
-    /// `args`, not yet asked.
+    /// `args`, not yet asked. An item too large for a message on its own
+    /// ends the asking, as the reply's failure.
     pub fn new(args: &A) -> Self {
         Pages {
             one_page: args.one_page(),
+            past: None,
+            moved: false,
             asked: args.clone(),
             all: None,
             failed: None,
+            left_out: Vec::new(),
         }
+    }
+
+    /// Goes on past each item too large for a message on its own, which
+    /// error 4 names, leaving it out ([`Pages::left_out`]): from one more
+    /// than its place, or before its id ([`Ask::past`]). Of a page asked
+    /// for itself, the page is then the one from past it.
+    pub fn past_too_large(mut self) -> Self {
+        self.past = Some(A::past);
+        self
+    }
+
+    /// Asks page after page even where the arguments give `limit`, which
+    /// is then the most each page holds: for a client that reads the
+    /// pages as they come ([`Pages::so_far`]) and stops when it has enough.
+    pub fn every_page(mut self) -> Self {
+        self.one_page = false;
+        self
+    }
+
+    /// The pages joined so far, if one has come.
+    pub fn so_far(&self) -> Option<&A::Reply> {
+        self.all.as_ref()
+    }
+
+    /// Whether the last page said more comes after it (or, back from the
+    /// newest, before it).
+    pub fn more(&self) -> bool {
+        self.all
+            .as_ref()
+            .is_some_and(|all| self.asked.next_page(all).is_some())
+    }
+
+    /// The items left out so far, each too large for a message on its own:
+    /// the error 4 that named it.
+    pub fn left_out(&self) -> &[Failed] {
+        &self.left_out
+    }
+
+    /// [`Pages::done`], with the items left out.
+    ///
+    /// # Panics
+    ///
+    /// Before a reply was taken.
+    pub fn whole(mut self) -> Result<Whole<A::Reply>, Failed> {
+        let left_out = std::mem::take(&mut self.left_out);
+        self.done().map(|reply| Whole { reply, left_out })
     }
 
     /// The reply, every page joined, or how a page failed; once
@@ -131,11 +225,32 @@ impl<A: Ask> Pages<A> {
     }
 }
 
+impl<A: Ask> Pages<A> {
+    /// A page refused: moved past the item it names, where that is asked
+    /// for; whether to go on.
+    fn refused(&mut self, f: Failed) -> bool {
+        if let Some(next) = self.past.and_then(|past| past(&self.asked, &f)) {
+            self.left_out.push(f);
+            self.asked = next;
+            self.moved = true;
+            return true;
+        }
+        self.failed = Some(f);
+        false
+    }
+}
+
 impl<A: Ask> Paging for Pages<A> {
     fn request(&self) -> &'static Request {
         A::REQUEST
     }
     fn next(&mut self) -> Result<Option<Vec<u8>>, Unencodable> {
+        if self.failed.is_some() {
+            return Ok(None);
+        }
+        if std::mem::take(&mut self.moved) {
+            return self.asked.encode().map(Some);
+        }
         match &self.all {
             None => self.asked.encode().map(Some),
             Some(_) if self.one_page => Ok(None),
@@ -152,10 +267,7 @@ impl<A: Ask> Paging for Pages<A> {
     fn took(&mut self, reply: &[u8]) -> Result<bool, Unreadable> {
         let page = match read_reply::<A>(reply)? {
             Ok(r) => r,
-            Err(f) => {
-                self.failed = Some(f);
-                return Ok(false);
-            }
+            Err(f) => return Ok(self.refused(f)),
         };
         match &mut self.all {
             None => {
@@ -192,8 +304,15 @@ mod tests {
             let reply = match spec.name {
                 "files" => {
                     let a = FilesArgs::from_request(r).map_err(|e| e.why)?;
-                    let place = Place::new("mine".into());
-                    let reply = FilesReply::new(self.entries.clone(), String::new(), place, false);
+                    let place = crate::new!(Place {
+                        kind: "mine".into()
+                    });
+                    let reply = crate::new!(FilesReply {
+                        files: self.entries.clone(),
+                        path: String::new(),
+                        place,
+                        more: false
+                    });
                     a.reply_bytes(reply)
                 }
                 "messages" => {
@@ -205,7 +324,10 @@ mod tests {
                         }
                         _ => self.said.len(),
                     };
-                    let mut reply = MessagesReply::new(self.said[..upto].to_vec(), false);
+                    let mut reply = crate::new!(MessagesReply {
+                        messages: self.said[..upto].to_vec(),
+                        more: false
+                    });
                     reply.name = Some("Ana".into());
                     a.reply_bytes(reply)
                 }
@@ -229,11 +351,21 @@ mod tests {
     }
 
     fn entry(i: usize) -> File {
-        File::new(false, format!("{i:05} {}", "x".repeat(200)))
+        crate::new!(File {
+            folder: false,
+            name: format!("{i:05} {}", "x".repeat(200))
+        })
     }
 
     fn said(i: u8, text: String) -> Message {
-        Message::new(Vec::new(), false, [i; 16], i % 2 == 0, Vec::new(), text)
+        crate::new!(Message {
+            attachments: Vec::new(),
+            edited: false,
+            id: [i; 16],
+            mine: i % 2 == 0,
+            reactions: Vec::new(),
+            text
+        })
     }
 
     /// A folder too large for one message comes in pages, asked one after
