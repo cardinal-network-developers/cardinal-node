@@ -358,6 +358,10 @@ pub mod typed {
     use crate::api::typed::Reference;
     use crate::api::{self, CallArgs, FilesArgs, FilesReply, MessagesArgs, MessagesReply};
     use crate::api::{
+        BluetoothArgs, BluetoothReply, HostArgs, HostOffArgs, HostReply, HostsReply, NetworkArgs,
+        NetworkReply, PeerAddArgs, PeerAddReply, PeerRemoveArgs, RouterArgs, RouterReply,
+    };
+    use crate::api::{
         Checking, ClipArgs, ClipCopyArgs, ClipCopyReply, ClipReply, ConditionsArgs,
         ConditionsReply, DeviceRenameArgs, DeviceRenameReply, MeArgs, MeReply, NetworkChangedArgs,
         PairShowArgs, PairShowReply, PairStatusArgs, PairStatusReply, PairTypeArgs, PairTypeReply,
@@ -761,6 +765,128 @@ pub mod typed {
             let mode = needed(a.mode.clone(), "mode")?;
             super::set_retention(d, &mode)?;
             Ok(RetentionReply { retention: mode })
+        }
+    }
+
+    // ---- Networks, hosts and peers ----
+
+    impl Answer for RouterArgs {
+        async fn answer(d: &Arc<Daemon>, a: &Self) -> anyhow::Result<RouterReply> {
+            if let Some(on) = a.on {
+                let here = a.this_device == Some(true);
+                crate::portmap::set_on(d, on, here)?;
+            }
+            let r = crate::portmap::router(d);
+            Ok(RouterReply {
+                error: r.error,
+                everywhere: r.everywhere,
+                external: r.external,
+                named: r.named,
+                network: r.network,
+                on: r.on,
+                protocol: r.protocol,
+                seconds_left: r.seconds_left,
+                this_device: r.this_device,
+            })
+        }
+    }
+
+    impl Answer for BluetoothArgs {
+        async fn answer(d: &Arc<Daemon>, a: &Self) -> anyhow::Result<BluetoothReply> {
+            let b = match a.mode.as_deref() {
+                Some(m) => {
+                    let m = crate::bluetooth::Mode::parse(m)
+                        .ok_or_else(|| anyhow::anyhow!("Bluetooth is `off`, `open` or `always`"))?;
+                    crate::bluetooth::set(d, m)?
+                }
+                None => crate::bluetooth::check(d).await,
+            };
+            Ok(BluetoothReply {
+                available: b.available,
+                channels_in: b.channels_in,
+                error: b.error,
+                mode: b.mode,
+                on: b.on,
+                psm: b.psm,
+                radio: b.radio,
+                recognized: b.recognized,
+                seen: b.seen,
+                why_not: b.why_not,
+                windows: b.windows,
+                too_old: b.too_old,
+            })
+        }
+    }
+
+    impl Answer for NetworkArgs {
+        async fn answer(d: &Arc<Daemon>, a: &Self) -> anyhow::Result<NetworkReply> {
+            let n = match a.mine {
+                Some(mine) => crate::networks::mark(d, mine, a.name.as_deref())?,
+                None => crate::networks::network(d),
+            };
+            Ok(NetworkReply {
+                answered: n.answered,
+                ask: n.ask,
+                known: n.known,
+                mine: n.mine,
+                name: n.name,
+                router: n.router,
+                routers: n.routers,
+            })
+        }
+    }
+
+    impl Answer for HostArgs {
+        async fn answer(d: &Arc<Daemon>, a: &Self) -> anyhow::Result<HostReply> {
+            let addresses = a.addresses.as_deref().unwrap_or_default();
+            crate::host::enable(d, addresses)
+        }
+    }
+
+    impl Answer for HostOffArgs {
+        async fn answer(d: &Arc<Daemon>, _: &Self) -> anyhow::Result<HostsReply> {
+            crate::host::disable(d)
+        }
+    }
+
+    impl Answer for PeerAddArgs {
+        async fn answer(d: &Arc<Daemon>, a: &Self) -> anyhow::Result<PeerAddReply> {
+            let addr = needed(a.addr.as_deref(), "addr")?.trim().to_owned();
+            if !addr.contains(':') {
+                anyhow::bail!("give the address as host:port, e.g. myserver.example.com:7171");
+            }
+            {
+                let mut c = d.config();
+                if !c.peers.contains(&addr) {
+                    c.peers.push(addr.clone());
+                }
+            }
+            d.save_config()?;
+            let d2 = d.clone();
+            tokio::spawn(async move { d2.connect_all().await });
+            Ok(PeerAddReply { addr })
+        }
+    }
+
+    impl Answer for PeerRemoveArgs {
+        async fn answer(d: &Arc<Daemon>, a: &Self) -> anyhow::Result<Done> {
+            let addr = needed(a.addr.as_deref(), "addr")?;
+            let found = {
+                let mut c = d.config();
+                let before = c.peers.len();
+                c.peers.retain(|p| p != addr);
+                before != c.peers.len()
+            };
+            if !found {
+                anyhow::bail!("{addr} is not in the list; see `cardinal peer list`");
+            }
+            d.book
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .manual
+                .remove(addr);
+            d.save_config()?;
+            Ok(Done {})
         }
     }
 
@@ -1204,6 +1330,7 @@ async fn handle(d: &Arc<Daemon>, req: &Value) -> anyhow::Result<Value> {
             crate::recovery::root_from_words(d, arg(req, "words")?)?;
             Ok(json!({}))
         }
+        #[cfg(any(test, debug_assertions, feature = "by-name"))]
         "host" => {
             let addresses: Vec<String> = req
                 .get("addresses")
@@ -1214,9 +1341,10 @@ async fn handle(d: &Arc<Daemon>, req: &Value) -> anyhow::Result<Value> {
                         .collect()
                 })
                 .unwrap_or_default();
-            crate::host::enable(d, &addresses)
+            crate::host::enable_by_name(d, &addresses)
         }
-        "host-off" => crate::host::disable(d),
+        #[cfg(any(test, debug_assertions, feature = "by-name"))]
+        "host-off" => crate::host::disable_by_name(d),
         "host-offer" => {
             let devices = strings(req, "devices");
             let n = |k: &str| req.get(k).and_then(|v| v.as_u64());
@@ -1225,6 +1353,7 @@ async fn handle(d: &Arc<Daemon>, req: &Value) -> anyhow::Result<Value> {
         "host-accept" => crate::hosting::accept(d, arg(req, "who")?),
         "host-end" => crate::hosting::end(d, arg(req, "who")?),
         "hosting" => Ok(crate::hosting::list(d)),
+        #[cfg(any(test, debug_assertions, feature = "by-name"))]
         "router" => {
             if let Some(on) = req.get("on").and_then(|v| v.as_bool()) {
                 let here = req.get("this_device").and_then(|v| v.as_bool()) == Some(true);
@@ -1232,18 +1361,20 @@ async fn handle(d: &Arc<Daemon>, req: &Value) -> anyhow::Result<Value> {
             }
             Ok(crate::portmap::status(d))
         }
+        #[cfg(any(test, debug_assertions, feature = "by-name"))]
         "bluetooth" => match req.get("mode").and_then(|v| v.as_str()) {
             Some(m) => {
                 let m = crate::bluetooth::Mode::parse(m)
                     .ok_or_else(|| anyhow::anyhow!("Bluetooth is `off`, `open` or `always`"))?;
-                crate::bluetooth::set(d, m)
+                crate::bluetooth::set_by_name(d, m)
             }
-            None => Ok(crate::bluetooth::check(d).await),
+            None => Ok(crate::bluetooth::check_by_name(d).await),
         },
+        #[cfg(any(test, debug_assertions, feature = "by-name"))]
         "network" => match req.get("mine").and_then(|v| v.as_bool()) {
             Some(mine) => {
                 let name = req.get("name").and_then(|v| v.as_str());
-                crate::networks::mark(d, mine, name)
+                crate::networks::mark_by_name(d, mine, name)
             }
             None => Ok(crate::networks::status(d)),
         },
@@ -1314,6 +1445,7 @@ async fn handle(d: &Arc<Daemon>, req: &Value) -> anyhow::Result<Value> {
         "restore-from-host" => {
             crate::host::restore(d, arg(req, "words")?, arg(req, "at")?, arg(req, "key")?).await
         }
+        #[cfg(any(test, debug_assertions, feature = "by-name"))]
         "peer-add" => {
             let addr = arg(req, "addr")?.trim().to_owned();
             if !addr.contains(':') {
@@ -1330,6 +1462,7 @@ async fn handle(d: &Arc<Daemon>, req: &Value) -> anyhow::Result<Value> {
             tokio::spawn(async move { d2.connect_all().await });
             Ok(json!({"addr": addr}))
         }
+        #[cfg(any(test, debug_assertions, feature = "by-name"))]
         "peer-remove" => {
             let addr = arg(req, "addr")?;
             let found = {

@@ -4335,7 +4335,13 @@ async fn client(cmd: Cmd) -> anyhow::Result<()> {
         }
         Cmd::Peer { cmd } => match cmd {
             PeerCmd::Add { addr } => {
-                call(&paths, json!({"cmd": "peer-add", "addr": addr})).await?;
+                ask(
+                    &paths,
+                    api::PeerAddArgs {
+                        addr: Some(addr.clone()),
+                    },
+                )
+                .await?;
                 println!(
                     "Will look for your devices at {addr} too. `cardinal devices` shows when one \
                      is online."
@@ -4343,7 +4349,13 @@ async fn client(cmd: Cmd) -> anyhow::Result<()> {
                 Ok(())
             }
             PeerCmd::Remove { addr } => {
-                call(&paths, json!({"cmd": "peer-remove", "addr": addr})).await?;
+                ask(
+                    &paths,
+                    api::PeerRemoveArgs {
+                        addr: Some(addr.clone()),
+                    },
+                )
+                .await?;
                 println!("Forgot {addr}.");
                 Ok(())
             }

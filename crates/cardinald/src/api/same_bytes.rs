@@ -1268,3 +1268,152 @@ fn the_other_types_are_the_base_encodings() {
         assert_eq!(typed::Scalar::take(v, &at).unwrap(), x);
     }
 }
+
+/// What a message that is not a request's arguments by name says: key 0,
+/// the request's number, and `fields` under their numbers.
+fn message_of(n: u64, fields: Vec<(u64, Value)>) -> Vec<u8> {
+    let mut r = Record::new().with(0, n);
+    for (k, v) in fields {
+        r.insert(k, v);
+    }
+    r.encode()
+}
+
+/// The router, Bluetooth, the network, hosting this person's devices, and
+/// the peers asked by address.
+#[tokio::test]
+async fn networks_hosts_and_peers_are_answered_the_same() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut t = Twins::start(dir.path()).await;
+    // what each listens on, which an error or a warning names
+    let port = |d: &Arc<Daemon>| d.endpoint.tcp_addr().unwrap().port().to_string();
+    let (po, pn) = (port(&t.old), port(&t.new));
+    t.alike(po.as_bytes(), pn.as_bytes());
+
+    // ---- router: without a mapping, refused, and given one ----
+    for req in [
+        json!({"cmd": "router"}),
+        json!({"cmd": "router", "this_device": true}),
+        json!({"cmd": "router", "on": true, "this_device": true}),
+        json!({"cmd": "router", "on": false, "this_device": true}),
+        json!({"cmd": "router", "on": true}),
+        json!({"cmd": "router", "on": false}),
+        json!({"cmd": "router", "on": false, "this_device": false}),
+    ] {
+        t.same(req).await;
+    }
+    let at = std::time::Instant::now();
+    for state in [
+        crate::portmap::State {
+            mapping: None,
+            why_not: Some("the router said no".into()),
+            running: false,
+        },
+        crate::portmap::State {
+            mapping: Some((
+                crate::portmap::Mapping {
+                    protocol: crate::portmap::Protocol::NatPmp,
+                    external: "203.0.113.9:40000".parse().unwrap(),
+                    internal_port: 7171,
+                    lifetime: 7200,
+                },
+                at,
+            )),
+            why_not: Some("ignored beside a mapping".into()),
+            running: false,
+        },
+    ] {
+        for d in [&t.old, &t.new] {
+            *d.portmap.lock().unwrap() = state.clone();
+        }
+        let r = typed_of::<RouterArgs>(&t.same(json!({"cmd": "router"})).await);
+        assert!(r.error.is_some() || r.protocol.as_deref() == Some("NAT-PMP"));
+    }
+    t.same_message(&message_of(180, vec![(1, Value::from("yes"))]))
+        .await;
+
+    // ---- network: what this device's network is, and the person's answer ----
+    let r = typed_of::<NetworkArgs>(&t.same(json!({"cmd": "network"})).await);
+    for req in [
+        json!({"cmd": "network", "mine": true}),
+        json!({"cmd": "network", "mine": true, "name": "  Home  "}),
+        json!({"cmd": "network", "mine": false, "name": ""}),
+        json!({"cmd": "network", "name": "only a name"}),
+        json!({"cmd": "network"}),
+    ] {
+        t.same(req).await;
+    }
+    // which of the two this machine shows, both are compared above
+    let _ = r.known;
+    t.same_message(&message_of(182, vec![(2, Value::from(true))]))
+        .await;
+
+    // ---- bluetooth: asked, set off and open, refused ----
+    for req in [
+        json!({"cmd": "bluetooth"}),
+        json!({"cmd": "bluetooth", "mode": "off"}),
+        json!({"cmd": "bluetooth", "mode": "sometimes"}),
+        json!({"cmd": "bluetooth", "mode": ""}),
+        json!({"cmd": "bluetooth", "mode": "open"}),
+        json!({"cmd": "bluetooth"}),
+        json!({"cmd": "bluetooth", "mode": "off"}),
+    ] {
+        t.same(req).await;
+    }
+    let r = typed_of::<BluetoothArgs>(&t.same(json!({"cmd": "bluetooth"})).await);
+    assert_eq!(r.mode, "off");
+    t.same_message(&message_of(181, vec![(1, Value::from(3u64))]))
+        .await;
+
+    // ---- host and host-off ----
+    for req in [
+        json!({"cmd": "host"}),
+        json!({"cmd": "host", "addresses": []}),
+        json!({"cmd": "host", "addresses": ["not an address"]}),
+        json!({"cmd": "host", "addresses": ["203.0.113.5:7171", "nowhere"]}),
+        json!({"cmd": "host-off"}),
+        json!({"cmd": "host", "addresses": ["127.0.0.1:7171"]}),
+        json!({"cmd": "host", "addresses": ["203.0.113.5:7171", "host.example.org:7171"]}),
+        json!({"cmd": "host", "addresses": ["host.example.org:7171"]}),
+        json!({"cmd": "host-off"}),
+        json!({"cmd": "host-off"}),
+    ] {
+        t.same(req).await;
+    }
+    let r = typed_of::<HostArgs>(
+        &t.same(json!({"cmd": "host", "addresses": ["203.0.113.5:7171"]}))
+            .await,
+    );
+    assert_eq!(r.hosts.len(), 1);
+    assert_eq!(r.hosts[0].addresses, ["203.0.113.5:7171"]);
+    t.same_message(&message_of(183, vec![(1, Value::from("203.0.113.5:7171"))]))
+        .await;
+    t.same_message(&message_of(
+        183,
+        vec![(1, Value::List(vec![Value::from(true)]))],
+    ))
+    .await;
+    let r = typed_of::<HostOffArgs>(&t.same(json!({"cmd": "host-off"})).await);
+    assert!(r.hosts.is_empty());
+    t.same_message(&message_of(184, vec![(1, Value::from(true))]))
+        .await;
+
+    // ---- peer-add and peer-remove ----
+    for req in [
+        json!({"cmd": "peer-add"}),
+        json!({"cmd": "peer-add", "addr": "no-port"}),
+        json!({"cmd": "peer-add", "addr": "  192.0.2.1:7171  "}),
+        json!({"cmd": "peer-add", "addr": "192.0.2.1:7171"}),
+        json!({"cmd": "peer-remove"}),
+        json!({"cmd": "peer-remove", "addr": "192.0.2.2:7171"}),
+        json!({"cmd": "peer-remove", "addr": " 192.0.2.1:7171"}),
+        json!({"cmd": "peer-remove", "addr": "192.0.2.1:7171"}),
+        json!({"cmd": "peer-remove", "addr": "192.0.2.1:7171"}),
+    ] {
+        t.same(req).await;
+    }
+    t.same_message(&message_of(185, vec![(1, Value::from(5u64))]))
+        .await;
+    t.same_message(&message_of(186, vec![(1, Value::from(false))]))
+        .await;
+}

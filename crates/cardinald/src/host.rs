@@ -100,7 +100,7 @@ pub fn is_unproven(d: &Daemon, s: &Session) -> bool {
 }
 
 /// Makes this device a host for its own identity, at `addresses`.
-pub fn enable(d: &Arc<Daemon>, addresses: &[String]) -> anyhow::Result<Json> {
+pub fn enable(d: &Arc<Daemon>, addresses: &[String]) -> anyhow::Result<crate::api::HostReply> {
     if addresses.is_empty() {
         let port = d.endpoint.tcp_addr().map_or(0, |a| a.port());
         anyhow::bail!("{}", no_address(port, &crate::daemon::local_ips()));
@@ -133,7 +133,7 @@ fn no_address(port: u16, ips: &[IpAddr]) -> String {
 }
 
 /// [`enable`], at endpoints already read.
-fn enable_at(d: &Arc<Daemon>, endpoints: Vec<Endpoint>) -> anyhow::Result<Json> {
+fn enable_at(d: &Arc<Daemon>, endpoints: Vec<Endpoint>) -> anyhow::Result<crate::api::HostReply> {
     let listening = d.endpoint.tcp_addr().map_or(0, |a| a.port());
     let mut warnings: Vec<String> = endpoints
         .iter()
@@ -166,9 +166,10 @@ fn enable_at(d: &Arc<Daemon>, endpoints: Vec<Endpoint>) -> anyhow::Result<Json> 
     d.endpoint.set_allow_public(true);
     crate::mailbox::open(d);
     d.housekeeping();
-    let mut out = sheet(d)?;
-    out["warnings"] = json!(warnings);
-    Ok(out)
+    Ok(crate::api::HostReply {
+        hosts: hosts(d)?,
+        warnings,
+    })
 }
 
 /// Why a restore would not reach this device at `e`, as far as this device
@@ -348,7 +349,7 @@ fn is_this_device(host: &str) -> bool {
 
 /// Stops being a host: this device keeps what it has, and no longer offers
 /// to restore anyone.
-pub fn disable(d: &Arc<Daemon>) -> anyhow::Result<Json> {
+pub fn disable(d: &Arc<Daemon>) -> anyhow::Result<crate::api::HostsReply> {
     let (space, ops) = own_nodes(d, false)?;
     d.write_and_push(&space, ops)?;
     d.config().host = false;
@@ -362,7 +363,7 @@ pub fn disable(d: &Arc<Daemon>) -> anyhow::Result<Json> {
     // It serves no longer, and takes itself out of the lists that name it.
     // Nobody else does: whether a device still serves is its own to know.
     crate::mailbox::keep_own_entry(d);
-    sheet(d)
+    Ok(crate::api::HostsReply { hosts: hosts(d)? })
 }
 
 fn own_identity(d: &Daemon) -> anyhow::Result<[u8; 32]> {
@@ -430,6 +431,37 @@ pub fn sheet(d: &Daemon) -> anyhow::Result<Json> {
         })
         .collect();
     Ok(json!({"hosts": hosts}))
+}
+
+/// [`sheet`], typed: the hosts it names.
+pub fn hosts(d: &Daemon) -> anyhow::Result<Vec<crate::api::Host>> {
+    let core = d.core();
+    let ident = core
+        .identity
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("this device does not belong to anyone"))?;
+    let st = ident.state();
+    let names = core.device_names();
+    let hosts = core
+        .account()
+        .and_then(|a| a.space.as_ref())
+        .map(|sp| account::hosts(sp.state()))
+        .unwrap_or_default();
+    Ok(hosts
+        .iter()
+        .filter_map(|h| Grant::open(&h.grant))
+        .filter(|(g, signer)| {
+            g.services.contains(&STORAGE) && g.served == ident.id() && st.power(signer).is_some()
+        })
+        .map(|(g, signer)| crate::api::Host {
+            name: names
+                .get(&signer)
+                .cloned()
+                .unwrap_or_else(|| account::short_key(&signer)),
+            addresses: g.endpoints.iter().map(Endpoint::to_string).collect(),
+            key: *g.link_key.x25519(),
+        })
+        .collect())
 }
 
 /// Why a host closes a session from a device it does not know, until it
@@ -613,6 +645,89 @@ pub(crate) async fn open_restore(
         .ok_or_else(|| anyhow::anyhow!("that device did not say who it is"))?
         .signing_key;
     Ok((s, addr, host, host_key))
+}
+
+// ---- The handlers as they were by name ----
+//
+// What main had, whole, kept only to show that the typed handlers send the
+// same bytes (`api/same_bytes.rs`). They go with the way by name.
+
+/// Makes this device a host for its own identity, at `addresses`.
+#[cfg(any(test, debug_assertions, feature = "by-name"))]
+pub fn enable_by_name(d: &Arc<Daemon>, addresses: &[String]) -> anyhow::Result<Json> {
+    if addresses.is_empty() {
+        let port = d.endpoint.tcp_addr().map_or(0, |a| a.port());
+        anyhow::bail!("{}", no_address(port, &crate::daemon::local_ips()));
+    }
+    let endpoints = addresses
+        .iter()
+        .map(|a| {
+            Endpoint::parse(a).ok_or_else(|| {
+                anyhow::anyhow!("{a} is not an address; it looks like 192.168.1.20:7171")
+            })
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    enable_at_by_name(d, endpoints)
+}
+
+/// [`enable`], at endpoints already read.
+#[cfg(any(test, debug_assertions, feature = "by-name"))]
+fn enable_at_by_name(d: &Arc<Daemon>, endpoints: Vec<Endpoint>) -> anyhow::Result<Json> {
+    let listening = d.endpoint.tcp_addr().map_or(0, |a| a.port());
+    let mut warnings: Vec<String> = endpoints
+        .iter()
+        .filter_map(|e| address_warning(e, listening))
+        .collect();
+    warnings.extend(names_warning(&endpoints, listening));
+    warnings.extend(away_warning(&endpoints));
+    warnings.extend(logout_warning());
+    let (space, mut ops) = own_nodes(d, true)?;
+    let identity = own_identity(d)?;
+    let grant = Grant {
+        host: identity,
+        served: identity,
+        services: vec![MAILBOX, STORAGE, RENDEZVOUS, RELAY],
+        classes: Vec::new(),
+        storage_bytes: None,
+        retention_days: None,
+        endpoints,
+        link_key: d.keys.link.public_key().clone(),
+    }
+    .sign(&d.keys.signing);
+    ops.push(account::create_host(&grant));
+    d.write_and_push(&space, ops)?;
+    {
+        let mut c = d.config();
+        c.host = true;
+        c.retention = "full".into();
+    }
+    d.save_config()?;
+    d.endpoint.set_allow_public(true);
+    crate::mailbox::open(d);
+    d.housekeeping();
+    let mut out = sheet(d)?;
+    out["warnings"] = json!(warnings);
+    Ok(out)
+}
+
+/// Stops being a host: this device keeps what it has, and no longer offers
+/// to restore anyone.
+#[cfg(any(test, debug_assertions, feature = "by-name"))]
+pub fn disable_by_name(d: &Arc<Daemon>) -> anyhow::Result<Json> {
+    let (space, ops) = own_nodes(d, false)?;
+    d.write_and_push(&space, ops)?;
+    d.config().host = false;
+    d.save_config()?;
+    d.endpoint.set_allow_public(false);
+    crate::mailbox::close(d);
+    // Nor is it named as a device that named itself (D72) where it was
+    // named as the person's host: that starts again, with the next address
+    // the router gives, and only where every other member is trusted.
+    crate::outside::forget(d);
+    // It serves no longer, and takes itself out of the lists that name it.
+    // Nobody else does: whether a device still serves is its own to know.
+    crate::mailbox::keep_own_entry(d);
+    sheet(d)
 }
 
 #[cfg(test)]

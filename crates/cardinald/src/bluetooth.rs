@@ -267,13 +267,13 @@ fn wanted(d: &Daemon) -> bool {
 }
 
 /// Sets this device's choice, and acts on it.
-pub fn set(d: &Arc<Daemon>, m: Mode) -> anyhow::Result<Value> {
+pub fn set(d: &Arc<Daemon>, m: Mode) -> anyhow::Result<crate::api::BluetoothShown> {
     d.config().bluetooth = m.as_str().to_owned();
     d.save_config()?;
     start(d);
     d.bluetooth.poke.notify_one();
     d.bump();
-    Ok(status(d))
+    Ok(shown(d))
 }
 
 /// The radio this device uses, made the first time.
@@ -1003,9 +1003,77 @@ pub fn status(d: &Daemon) -> Value {
     })
 }
 
+/// [`status`], typed: what the `bluetooth` request answers.
+pub fn shown(d: &Daemon) -> crate::api::BluetoothShown {
+    let b = &d.bluetooth;
+    let shown = lock(&b.shown);
+    let (available, why_not) = match &shown.available {
+        None => (None, None),
+        Some(Ok(())) => (Some(true), None),
+        Some(Err(e)) => (Some(false), Some(e.to_string())),
+    };
+    let too_old = shown.available == Some(Err(NotAvailable::TooOld));
+    crate::api::BluetoothShown {
+        mode: mode(d).as_str().into(),
+        on: shown.on,
+        windows: b.windows.load(Ordering::SeqCst) as u64,
+        radio: shown.radio.clone(),
+        available,
+        why_not,
+        error: shown.error.clone(),
+        psm: shown.psm.map(u64::from),
+        seen: b.seen.load(Ordering::Relaxed),
+        recognized: b.recognized.load(Ordering::Relaxed),
+        channels_in: lock(&b.incoming)
+            .iter()
+            .filter(|c| !c.on.is_closed())
+            .count() as u64,
+        too_old: Some(too_old),
+    }
+}
+
 /// Asks the radio whether it can be used, without turning it on, and
 /// says where Bluetooth stands.
-pub async fn check(d: &Daemon) -> Value {
+pub async fn check(d: &Daemon) -> crate::api::BluetoothShown {
+    ask_radio(d).await;
+    shown(d)
+}
+
+/// What [`check`] asks of the radio.
+async fn ask_radio(d: &Daemon) {
+    if !lock(&d.bluetooth.shown).on {
+        let r = match radio(d) {
+            Ok(r) => match tokio::time::timeout(Duration::from_secs(3), r.available()).await {
+                Ok(Ok(a)) => a,
+                Ok(Err(e)) => Err(e.to_string().into()),
+                Err(_) => Err("the radio did not answer".to_owned().into()),
+            },
+            Err(e) => Err(e.into()),
+        };
+        show(d, |s| s.available = Some(r));
+    }
+}
+
+// ---- The handlers as they were by name ----
+//
+// What main had, whole, kept only to show that the typed handlers send the
+// same bytes (`control::typed::answering`, `api/same_bytes.rs`). They go
+// with the way by name.
+
+/// `set` as main had it, by name.
+#[cfg(any(test, debug_assertions, feature = "by-name"))]
+pub fn set_by_name(d: &Arc<Daemon>, m: Mode) -> anyhow::Result<Value> {
+    d.config().bluetooth = m.as_str().to_owned();
+    d.save_config()?;
+    start(d);
+    d.bluetooth.poke.notify_one();
+    d.bump();
+    Ok(status(d))
+}
+
+/// `check` as main had it, by name.
+#[cfg(any(test, debug_assertions, feature = "by-name"))]
+pub async fn check_by_name(d: &Daemon) -> Value {
     if !lock(&d.bluetooth.shown).on {
         let r = match radio(d) {
             Ok(r) => match tokio::time::timeout(Duration::from_secs(3), r.available()).await {

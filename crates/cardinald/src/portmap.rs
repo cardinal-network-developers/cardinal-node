@@ -435,6 +435,45 @@ pub fn status(d: &Daemon) -> Json {
     v
 }
 
+/// [`status`], typed: what the `router` request answers.
+pub fn router(d: &Daemon) -> crate::api::Router {
+    let on = crate::networks::routers_on(d);
+    let (protocol, external, seconds_left, error) = {
+        let st = d.portmap.lock().unwrap_or_else(|e| e.into_inner());
+        match (&st.mapping, &st.why_not) {
+            (Some((m, at)), _) => (
+                Some(m.protocol.name().into()),
+                Some(m.external.to_string()),
+                Some(u64::from(m.lifetime).saturating_sub(at.elapsed().as_secs())),
+                None,
+            ),
+            (None, Some(why)) => (None, None, None, Some(why.clone())),
+            (None, None) => (None, None, None, None),
+        }
+    };
+    let this_device = d.config().port_mapping;
+    let everywhere = {
+        let core = d.core();
+        let acc = core.account().and_then(|a| a.space.as_ref());
+        acc.is_none_or(|a| crate::networks::account_allows(a.state()))
+    };
+    let named = crate::outside::named(d)
+        .iter()
+        .map(|n| n.addr.to_string())
+        .collect();
+    crate::api::Router {
+        error,
+        everywhere,
+        external,
+        named,
+        network: crate::networks::network(d),
+        on,
+        protocol,
+        seconds_left,
+        this_device,
+    }
+}
+
 /// Turns port mapping, and with it naming this device as a host at the
 /// address the router gives (D72), on or off, for good: on this device
 /// alone, or on every device of the person's. Off, the port is given back

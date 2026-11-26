@@ -646,10 +646,26 @@ typed!(ATTACHMENT "attachment" Attachment {
     2 size: Option<u64>,
     3 r#type: String,
 });
-rec!(BLUETOOTH "bluetooth":
-    1 "available" BOOL, 2 "channels_in" U, 3 "error" T, 4 "mode" T, 5 "on" BOOL, 6 "psm" U,
-    7 "radio" T, 8 "recognized" U, 9 "seen" U, 10 "why_not" T, 11 "windows" U,
-    12 "too_old" BOOL);
+typed!(
+    /// Where Bluetooth stands on this device.
+    BLUETOOTH "bluetooth" BluetoothShown {
+        /// Whether the radio could be used, the last time it was asked.
+        1 available: Option<bool>,
+        2 channels_in: u64,
+        3 error: Option<String>,
+        /// `off`, `open` or `always`.
+        4 mode: Cow<'static, str>,
+        5 on: bool,
+        6 psm: Option<u64>,
+        7 radio: Option<String>,
+        8 recognized: u64,
+        9 seen: u64,
+        10 why_not: Option<String>,
+        11 windows: u64,
+        /// This device's Bluetooth cannot send extended advertisements.
+        12 too_old: Option<bool>,
+    }
+);
 typed!(
     /// The call under way (`apps.md`, *call*).
     CALL "call" Call {
@@ -775,7 +791,16 @@ rec!(HOLDER "holder":
     1 "checking" BOOL, 2 "counted" BOOL, 3 "key" B, 4 "last_check" U, 5 "last_fail" U,
     6 "last_pass" U, 7 "missed" U, 8 "name" T, 9 "online" BOOL, 10 "reason" T, 11 "state" T,
     12 "this" BOOL);
-rec!(HOST "host": 1 "addresses" [T], 2 "key" (gone T), 3 "name" T, 4 "key" B);
+typed!(
+    /// A host of this person's, as the recovery sheet names it.
+    HOST "host" Host {
+        1 addresses: Vec<String>,
+        2 gone key: String,
+        3 name: String,
+        /// Its link key's X25519 half.
+        4 key: [u8; 32],
+    }
+);
 rec!(HOSTABLE "hostable": 1 "name" T, 2 "outside" BOOL, 3 "sees" T, 4 "services" [T]);
 rec!(HOSTING "hosting":
     1 "accepted" BOOL, 2 "devices" [T], 3 "ended" BOOL, 4 "envelopes" U, 5 "mine" BOOL,
@@ -842,9 +867,19 @@ rec!(KNOWN_PATH "known path":
     1 "addr" T, 2 "checking" BOOL, 3 "confirmed_s_ago" U, 4 "misses" U, 5 "next_check_s" U,
     6 "probes" U, 7 "wait_s" U);
 rec!(NEARBY "nearby": 1 "they_give_secret" BOOL, 2 "you_give_secret" BOOL);
-rec!(NETWORK "network":
-    1 "answered" BOOL, 2 "ask" BOOL, 3 "known" BOOL, 4 "mine" BOOL, 5 "name" T, 6 "router" T,
-    7 "routers" BOOL);
+typed!(
+    /// The network this device is on, by its router, and what its person
+    /// said of it.
+    NETWORK "network" Network {
+        1 answered: Option<bool>,
+        2 ask: bool,
+        3 known: bool,
+        4 mine: bool,
+        5 name: Option<String>,
+        6 router: Option<String>,
+        7 routers: bool,
+    }
+);
 rec!(OFFER "offer":
     1 "from" T, 2 "group" B, 3 "members" U, 4 "name" T, 5 "public" BOOL, 6 "reach" {GROUP_REACH},
     7 "for_call" BOOL, 8 "last_call" {CALL_ENDED});
@@ -881,9 +916,20 @@ rec!(REJOIN "rejoin": 1 "group" B, 2 "members" U, 3 "name" T);
 rec!(ROLE_CHANGE "role change": 1 "from" T, 2 "name" T, 3 "to" T);
 rec!(REDIAL "redial": 1 "alone" BOOL, 2 "helps" BOOL, 3 "sparing" {SPARING});
 rec!(SPARING "sparing": 1 "next_s" U, 2 "wait_s" U);
-rec!(ROUTER "router":
-    1 "error" T, 2 "everywhere" BOOL, 3 "external" T, 4 "named" [T], 5 "network" {NETWORK},
-    6 "on" BOOL, 7 "protocol" T, 8 "seconds_left" U, 9 "this_device" BOOL);
+typed!(
+    /// What this device asks of routers, and what the router gave.
+    ROUTER "router" Router {
+        1 error: Option<String>,
+        2 everywhere: bool,
+        3 external: Option<String>,
+        4 named: Vec<String>,
+        5 network: Network,
+        6 on: bool,
+        7 protocol: Option<Cow<'static, str>>,
+        8 seconds_left: Option<u64>,
+        9 this_device: bool,
+    }
+);
 rec!(SESSION_DEVICE "contact's device":
     1 "addr" T, 2 "bytes_received" U, 3 "bytes_sent" U, 4 "carrier" T, 5 "heard_ms_ago" U,
     6 "kept_in_touch" BOOL, 7 "key" B, 8 "online" BOOL, 9 "open_for_s" U, 10 "opened_by" T,
@@ -1215,6 +1261,101 @@ typed!(fields RetentionReply {
 });
 asks!(RETENTION: 137 "retention" RetentionArgs -> RetentionReply, writes);
 
+// ---- Networks, hosts and peers ----
+
+typed!(fields RouterArgs {
+    1 on: Option<bool>,
+    2 this_device: Option<bool>,
+});
+typed!(
+    fields
+    /// [`Router`], as a reply.
+    RouterReply {
+        2 error: Option<String>,
+        3 everywhere: bool,
+        4 external: Option<String>,
+        5 named: Vec<String>,
+        6 network: Network,
+        7 on: bool,
+        8 protocol: Option<Cow<'static, str>>,
+        9 seconds_left: Option<u64>,
+        10 this_device: bool,
+    }
+);
+asks!(ROUTER_NOW: 180 "router" RouterArgs -> RouterReply, reads unless on);
+
+typed!(fields BluetoothArgs {
+    1 mode: Option<String>,
+});
+typed!(
+    fields
+    /// [`BluetoothShown`], as a reply.
+    BluetoothReply {
+        2 available: Option<bool>,
+        3 channels_in: u64,
+        4 error: Option<String>,
+        5 mode: Cow<'static, str>,
+        6 on: bool,
+        7 psm: Option<u64>,
+        8 radio: Option<String>,
+        9 recognized: u64,
+        10 seen: u64,
+        11 why_not: Option<String>,
+        12 windows: u64,
+        13 too_old: Option<bool>,
+    }
+);
+asks!(BLUETOOTH_NOW: 181 "bluetooth" BluetoothArgs -> BluetoothReply, reads unless mode);
+
+typed!(fields NetworkArgs {
+    1 mine: Option<bool>,
+    2 name: Option<String>,
+});
+typed!(
+    fields
+    /// [`Network`], as a reply.
+    NetworkReply {
+        2 answered: Option<bool>,
+        3 ask: bool,
+        4 known: bool,
+        5 mine: bool,
+        6 name: Option<String>,
+        7 router: Option<String>,
+        8 routers: bool,
+    }
+);
+asks!(NETWORK_NOW: 182 "network" NetworkArgs -> NetworkReply, reads unless mine);
+
+typed!(fields HostArgs {
+    1 addresses: Option<Vec<String>>,
+});
+typed!(fields HostReply {
+    2 hosts: Vec<Host>,
+    3 warnings: Vec<String>,
+});
+asks!(HOST_ON: 183 "host" HostArgs -> HostReply, writes);
+typed!(fields HostOffArgs {});
+typed!(
+    fields
+    /// The hosts the recovery sheet names.
+    HostsReply {
+        2 hosts: Vec<Host>,
+    }
+);
+asks!(HOST_OFF: 184 "host-off" HostOffArgs -> HostsReply, writes);
+
+typed!(fields PeerAddArgs {
+    1 addr: Option<String>,
+});
+typed!(fields PeerAddReply {
+    2 addr: String,
+});
+asks!(PEER_ADD: 185 "peer-add" PeerAddArgs -> PeerAddReply, writes);
+typed!(fields PeerRemoveArgs {
+    1 addr: Option<String>,
+});
+asks!(PEER_REMOVE: 186 "peer-remove" PeerRemoveArgs -> Done, writes);
+
 typed!(fields MessagesArgs {
     1 who: Option<Reference>,
     2 group: Option<Reference>,
@@ -1441,20 +1582,13 @@ pub static REQUESTS: &[Request] = &[
     req!(175 "recover-stop-waiting" (1 "all" BOOL, 2 "who" REF) -> (
         2 "not_heard" [T], 3 "stopped" [T])),
     // ---- Networks, hosts and peers: 180 to 199 ----
-    req!(180 "router" (1 "on" BOOL, 2 "this_device" BOOL) -> (
-        2 "error" T, 3 "everywhere" BOOL, 4 "external" T, 5 "named" [T], 6 "network" {NETWORK},
-        7 "on" BOOL, 8 "protocol" T, 9 "seconds_left" U, 10 "this_device" BOOL)),
-    req!(181 "bluetooth" (1 "mode" T) -> (
-        2 "available" BOOL, 3 "channels_in" U, 4 "error" T, 5 "mode" T, 6 "on" BOOL, 7 "psm" U,
-        8 "radio" T, 9 "recognized" U, 10 "seen" U, 11 "why_not" T, 12 "windows" U,
-        13 "too_old" BOOL)),
-    req!(182 "network" (1 "mine" BOOL, 2 "name" T) -> (
-        2 "answered" BOOL, 3 "ask" BOOL, 4 "known" BOOL, 5 "mine" BOOL, 6 "name" T,
-        7 "router" T, 8 "routers" BOOL)),
-    req!(183 "host" (1 "addresses" [T]) -> (2 "hosts" [HOST], 3 "warnings" [T])),
-    req!(184 "host-off" () -> (2 "hosts" [HOST])),
-    req!(185 "peer-add" (1 "addr" T) -> (2 "addr" T)),
-    req!(186 "peer-remove" (1 "addr" T) -> ()),
+    ROUTER_NOW,
+    BLUETOOTH_NOW,
+    NETWORK_NOW,
+    HOST_ON,
+    HOST_OFF,
+    PEER_ADD,
+    PEER_REMOVE,
     paged!(after 187 "peer-list" (1 "after" U, 2 "limit" U) -> (
         2 "peers" [PEER], 3 "more" BOOL, 4 "next" U)),
     req!(188 "host-offer" (1 "who" REF, 2 "devices" [T], 3 "envelopes" U, 4 "relay_mb" U) -> (
