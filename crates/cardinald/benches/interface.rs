@@ -272,10 +272,10 @@ fn typed<A: Ask + Clone>(
     rt: &tokio::runtime::Runtime,
     d: &Arc<Daemon>,
     msg: &[u8],
-    answer: fn(&Arc<Daemon>, &A) -> anyhow::Result<A::Reply>,
+    answer: fn(&Arc<Daemon>, &A) -> anyhow::Result<A::Answered>,
 ) -> Steps
 where
-    A::Reply: Clone,
+    A::Answered: Clone,
 {
     let args = || {
         let (_, r) = api::decode_record(msg).unwrap();
