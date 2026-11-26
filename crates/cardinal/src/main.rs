@@ -10,11 +10,11 @@ use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+mod output;
 mod overview;
 
 use cardinald::{api, control, setup, Config, Paths};
 use clap::{Parser, Subcommand};
-use serde_json::{json, Value};
 
 #[derive(Parser)]
 #[command(
@@ -867,29 +867,19 @@ enum HostingCmd {
 }
 
 /// What a device gives someone hosted, as `hosting` and `host-offer` say.
-fn services_of(d: &Value) -> String {
-    let all: Vec<&str> = d["services"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .filter_map(|s| s.as_str())
-        .collect();
-    all.join(", ")
+fn services_of(d: &api::Hostable) -> String {
+    d.services.join(", ")
 }
 
 /// One device that can host someone, on a line: what it gives, and how it
 /// is reached.
-fn hostable_line(d: &Value) -> String {
-    let how = if d["outside"] == true {
+fn hostable_line(d: &api::Hostable) -> String {
+    let how = if d.outside {
         "reachable from outside its network"
     } else {
         "reached only through its own sessions: no mailbox"
     };
-    format!(
-        "{}: {} ({how})",
-        d["name"].as_str().unwrap_or(""),
-        services_of(d)
-    )
+    format!("{}: {} ({how})", d.name, services_of(d))
 }
 
 #[derive(Subcommand)]
@@ -1100,97 +1090,73 @@ fn show_words(words: &str) {
     }
 }
 
-fn print_guardians(v: &Value) {
-    let n = v["guardians"].as_u64().unwrap_or(0);
+fn print_guardians(v: &api::GuardiansReply) {
+    let n = v.guardians;
     if n == 0 {
         println!("You have no guardians. If you lose every device and your words, nobody can");
         println!("give your identity back. Name some: cardinal guardians set NAME... ");
     } else {
-        let names: Vec<&str> = v["names"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .filter_map(Value::as_str)
-            .collect();
         println!(
             "{} of your {n} guardians can give your identity back, after {}.",
-            v["threshold"],
-            v["delay_text"].as_str().unwrap_or("")
+            v.threshold, v.delay_text
         );
-        if !names.is_empty() {
-            println!("Guardians: {}", names.join(", "));
+        if !v.names.is_empty() {
+            println!("Guardians: {}", v.names.join(", "));
         }
     }
-    let list = |k: &str| -> Vec<String> {
-        v[k].as_array()
-            .into_iter()
-            .flatten()
-            .filter_map(|x| x.as_str().map(str::to_owned))
-            .collect()
-    };
-    if !list("asked").is_empty() {
-        println!("Asked to be your guardian: {}.", list("asked").join(", "));
+    if !v.asked.is_empty() {
+        println!("Asked to be your guardian: {}.", v.asked.join(", "));
     }
-    if !list("ready").is_empty() {
+    if !v.ready.is_empty() {
         println!(
             "Ready to be named (`cardinal guardians set`): {}.",
-            list("ready").join(", ")
+            v.ready.join(", ")
         );
     }
-    for n in v["copy_full"].as_array().into_iter().flatten() {
+    for n in &v.copy_full {
         println!(
-            "{} holds as much of your account as a guardian takes: their copy no longer updates.",
-            n.as_str().unwrap_or("")
+            "{n} holds as much of your account as a guardian takes: their copy no longer updates."
         );
     }
-    for c in v["changes"].as_array().into_iter().flatten() {
-        let fp = c["fingerprint"].as_str().unwrap_or("");
+    for c in &v.changes {
+        let fp = &c.fingerprint;
         println!(
             "A change of your guardians is under way (fingerprint \"{fp}\"): {} of them, \
              recovering after {}; {} confirmed{}. If it is not yours, or you gave it up, run \
              `cardinal guardians object {fp}`.",
-            c["guardians"],
-            c["delay_text"].as_str().unwrap_or(""),
-            c["confirmed"],
-            if c["objected"] == true {
-                "; you objected"
-            } else {
-                ""
-            }
+            c.guardians,
+            c.delay_text,
+            c.confirmed,
+            if c.objected { "; you objected" } else { "" }
         );
     }
-    for r in v["recoveries"].as_array().into_iter().flatten() {
-        let fp = r["fingerprint"].as_str().unwrap_or("");
-        if r["in_effect"] == true {
+    for r in &v.recoveries {
+        let fp = &r.fingerprint;
+        if r.in_effect {
             println!("Recovered to the device with fingerprint \"{fp}\".");
         } else {
             println!(
                 "WARNING: someone asked your guardians to recover your identity (fingerprint \"{fp}\"): \
                  {} endorsed, {} confirmed{}. If it is not you, tell your guardians, and run \
                  `cardinal guardians object`.",
-                r["endorsed"],
-                r["confirmed"],
-                if r["objected"] == true {
-                    "; you objected"
-                } else {
-                    ""
-                }
+                r.endorsed,
+                r.confirmed,
+                if r.objected { "; you objected" } else { "" }
             );
         }
     }
 }
 
 /// The devices a recovery removed, to pair again.
-fn print_pair_again(v: &Value) {
-    let again = v["pair_again"].as_array().cloned().unwrap_or_default();
+fn print_pair_again(again: &[api::PairAgain]) {
     if again.is_empty() {
         return;
     }
     println!("Pair your other devices again (`cardinal pair`): the recovery kept none of");
     println!("them, hosts included. Forget any that was lost:");
     for k in again {
-        let key = k["key"].as_str().unwrap_or("");
-        match k["name"].as_str() {
+        let key = hex::encode(k.key);
+        match &k.name {
             Some(name) => println!("  {name}  [{key}]"),
             None => println!("  [{key}]"),
         }
@@ -1199,13 +1165,7 @@ fn print_pair_again(v: &Value) {
 
 /// The guardians who confirmed a finished recovery and have not heard of
 /// this device yet: they do not answer it until they do.
-fn print_not_heard(v: &Value) {
-    let names: Vec<&str> = v["not_heard"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .filter_map(Value::as_str)
-        .collect();
+fn print_not_heard(names: &[String]) {
     if names.is_empty() {
         return;
     }
@@ -1216,118 +1176,113 @@ fn print_not_heard(v: &Value) {
     println!("coming back: `cardinal recover stop-waiting NAME`, or replace them as a guardian.");
 }
 
-fn print_recover(v: &Value) {
-    if v["finished"] == true {
+fn print_recover(v: &api::RecoverReply) {
+    let pair_again = v.pair_again.as_deref().unwrap_or_default();
+    let not_heard = v.not_heard.as_deref().unwrap_or_default();
+    if v.finished == Some(true) {
         println!("Recovered. This device became yours before the recovery could finish tidying");
         println!("up. Your new recovery words, shown this once: write them down, in order, and");
         println!("keep them safe. The old ones no longer work.");
         println!();
-        show_words(v["words"].as_str().unwrap_or(""));
+        show_words(v.words.as_deref().unwrap_or(""));
         println!();
-        print_pair_again(v);
-        print_not_heard(v);
+        print_pair_again(pair_again);
+        print_not_heard(not_heard);
         return;
     }
-    if v["under_way"] != true {
-        if v["not_heard"].as_array().is_some_and(|n| !n.is_empty()) {
-            print_not_heard(v);
+    if !v.under_way {
+        if !not_heard.is_empty() {
+            print_not_heard(not_heard);
         } else {
             println!("No recovery is under way. Ask a guardian for an invitation (`cardinal guarding invite`).");
         }
-        print_pair_again(v);
+        print_pair_again(pair_again);
         return;
     }
     println!(
         "Recovering. Read each guardian this fingerprint: {}",
-        v["fingerprint"].as_str().unwrap_or("")
+        v.fingerprint.as_deref().unwrap_or("")
     );
-    let lost = v["lost_devices"].as_array().map_or(0, Vec::len);
+    let lost = v.lost_devices.as_ref().map_or(0, Vec::len);
     if lost > 0 {
         println!("The recovery removes your {lost} other device(s); you pair them again after.");
     }
-    let met = v["guardians"].as_u64().unwrap_or(0);
+    let met = v.guardians.unwrap_or(0);
     if met == 0 {
         println!("No guardian is in touch yet: use a guardian's invitation (`cardinal recover start CODE`).");
-    } else if v["asked"] != true {
+    } else if v.asked != Some(true) {
         println!("{met} guardian(s) in touch; waiting for one to propose the recovery.");
-    } else if v["in_effect"] == true {
+    } else if v.in_effect == Some(true) {
         println!("Your guardians have confirmed. Run `cardinal recover finish`.");
-        if v["held"].as_u64().unwrap_or(0) > 0 {
+        if v.held.unwrap_or(0) > 0 {
             println!("They gave back what they hold of yours, your account among it.");
         }
     } else {
         println!(
             "{met} guardian(s) in touch: {} endorsed, {} confirmed, of {} needed.",
-            v["endorsed"], v["confirmed"], v["threshold"]
+            or_null(v.endorsed),
+            or_null(v.confirmed),
+            or_null(v.threshold)
         );
     }
-    print_pair_again(v);
+    print_pair_again(pair_again);
 }
 
-fn print_guarding(v: &Value) {
-    let people = v["guarding"].as_array().cloned().unwrap_or_default();
-    for a in v["asked"].as_array().into_iter().flatten() {
-        let n = a.as_str().unwrap_or("");
+fn print_guarding(v: &api::GuardingReply) {
+    for n in &v.asked {
         println!("{n} asked you to be their guardian: `cardinal guarding accept {n}`.");
     }
-    for a in v["named_in_change"].as_array().into_iter().flatten() {
+    for a in &v.named_in_change {
         println!(
-            "{} named you in a change of guardians, waiting for their guardians to confirm it.",
-            a.as_str().unwrap_or("")
+            "{a} named you in a change of guardians, waiting for their guardians to confirm it."
         );
     }
-    for a in v["accepted"].as_array().into_iter().flatten() {
-        println!(
-            "You accepted guarding {}; they have not named you yet.",
-            a.as_str().unwrap_or("")
-        );
+    for a in &v.accepted {
+        println!("You accepted guarding {a}; they have not named you yet.");
     }
-    for a in v["no_longer_needed"].as_array().into_iter().flatten() {
-        println!("{}.", a["text"].as_str().unwrap_or(""));
+    for a in &v.no_longer_needed {
+        println!("{}.", a.text);
     }
-    if people.is_empty() {
+    if v.guarding.is_empty() {
         println!("You guard nobody.");
         return;
     }
-    let now = v["now_ms"].as_u64().unwrap_or(0);
-    for p in people {
+    let now = v.now_ms;
+    for p in &v.guarding {
         println!(
             "{}: one of {} guardians, {} of whom must agree, after {}.",
-            p["name"].as_str().unwrap_or(""),
-            p["guardians"],
-            p["threshold"],
-            p["delay_text"].as_str().unwrap_or("")
+            p.name, p.guardians, p.threshold, p.delay_text
         );
-        for r in p["recoveries"].as_array().into_iter().flatten() {
-            let fp = r["fingerprint"].as_str().unwrap_or("");
-            let state = if r["in_effect"] == true {
+        for r in &p.recoveries {
+            let fp = &r.fingerprint;
+            let state = if r.in_effect {
                 "done".to_owned()
-            } else if r["confirmed_by_me"] == true {
-                format!("you confirmed; {} have", r["confirmed"])
-            } else if r["pending"] == true {
-                match r["confirm_from_ms"].as_u64() {
+            } else if r.confirmed_by_me == Some(true) {
+                format!("you confirmed; {} have", r.confirmed)
+            } else if r.pending == Some(true) {
+                match r.confirm_from_ms {
                     Some(t) if t > now => {
                         format!("pending: you can confirm in {} s", (t - now).div_ceil(1000))
                     }
                     _ => "pending: you can confirm now, after checking with them again".to_owned(),
                 }
-            } else if r["endorsed_by_me"] == true {
-                format!("you endorsed; {} have", r["endorsed"])
+            } else if r.endorsed_by_me == Some(true) {
+                format!("you endorsed; {} have", r.endorsed)
             } else {
                 format!(
                     "asked for; {} endorsed. Check with them before you endorse",
-                    r["endorsed"]
+                    r.endorsed
                 )
             };
             println!("  recovery \"{fp}\": {state}");
         }
-        for ch in p["changes"].as_array().into_iter().flatten() {
-            let state = if ch["in_effect"] == true {
+        for ch in &p.changes {
+            let state = if ch.in_effect == Some(true) {
                 "in effect".to_owned()
-            } else if ch["confirmed_by_me"] == true {
-                format!("you confirmed; {} have", ch["confirmed"])
+            } else if ch.confirmed_by_me == Some(true) {
+                format!("you confirmed; {} have", ch.confirmed)
             } else {
-                match ch["confirm_from_ms"].as_u64() {
+                match ch.confirm_from_ms {
                     Some(t) if t > now => {
                         format!("you can confirm in {} s", (t - now).div_ceil(1000))
                     }
@@ -1336,23 +1291,17 @@ fn print_guarding(v: &Value) {
             };
             println!(
                 "  change of guardians \"{}\" ({} of {}, after {}): {state}",
-                ch["fingerprint"].as_str().unwrap_or(""),
-                ch["threshold"],
-                ch["guardians"],
-                ch["delay_text"].as_str().unwrap_or("")
+                ch.fingerprint, ch.threshold, ch.guardians, ch.delay_text
             );
         }
-        if p["account_copy"] == true {
+        if p.account_copy {
             println!("  You hold a sealed copy of their account, which you cannot read.");
         }
-        if let Some(w) = p["warning"].as_str() {
+        if let Some(w) = &p.warning {
             println!("  WARNING: {w}");
         }
-        for fp in p["never"].as_array().into_iter().flatten() {
-            println!(
-                "  recovery \"{}\": you said never to confirm it",
-                fp.as_str().unwrap_or("")
-            );
+        for fp in &p.never {
+            println!("  recovery \"{fp}\": you said never to confirm it");
         }
     }
 }
@@ -1365,8 +1314,11 @@ fn typed_fingerprint(words: &[String]) -> String {
 /// Shows a guardian the warning before they endorse or confirm, and asks
 /// them to go on, unless they said so already.
 async fn cautioned(paths: &Paths, who: &str, yes: bool) -> anyhow::Result<()> {
-    let v = call(paths, json!({"cmd": "guarding-caution", "who": who})).await?;
-    println!("{}", v["caution"].as_str().unwrap_or(""));
+    let args = api::GuardingCautionArgs {
+        who: Some(typed_ref(who)),
+    };
+    let v = ask(paths, args).await?;
+    println!("{}", v.caution);
     if yes {
         return Ok(());
     }
@@ -1441,15 +1393,6 @@ fn main() {
     }
 }
 
-async fn call(paths: &Paths, req: Value) -> anyhow::Result<Value> {
-    let v = request(paths, &req).await?;
-    if v["ok"].as_bool() == Some(true) {
-        Ok(v)
-    } else {
-        anyhow::bail!("{}", v["error"].as_str().unwrap_or("the daemon failed"))
-    }
-}
-
 /// A host that could not be reached to share with a group: it will be.
 fn host_waits(group: &str) {
     println!(
@@ -1465,10 +1408,21 @@ fn utf8(p: &std::path::Path) -> anyhow::Result<String> {
         .ok_or_else(|| anyhow::anyhow!("{} is not a path in UTF-8", p.display()))
 }
 
-/// [`call`], typed (`cardinald::api::typed`): the reply as its own value,
-/// with no tree of names.
+/// Asks the service (`cardinald::api::typed`): the reply as its own
+/// value, or why it was not done.
 async fn ask<A: api::typed::Ask>(paths: &Paths, args: A) -> anyhow::Result<A::Reply> {
-    let reply = control::ask(&paths.socket, &args).await;
+    match ask_or_failed(paths, &args).await? {
+        Ok(r) => Ok(r),
+        Err(failed) => anyhow::bail!("{}", failed.why),
+    }
+}
+
+/// The service's reply, whether it did what was asked or not.
+async fn ask_or_failed<A: api::typed::Ask>(
+    paths: &Paths,
+    args: &A,
+) -> anyhow::Result<Result<A::Reply, api::typed::Failed>> {
+    let reply = control::ask(&paths.socket, args).await;
     // The service answered, with what this command line cannot read: say
     // so, and not that none is running.
     if let Err(e) = &reply {
@@ -1476,15 +1430,17 @@ async fn ask<A: api::typed::Ask>(paths: &Paths, args: A) -> anyhow::Result<A::Re
             anyhow::bail!("{u} to {}", A::REQUEST.name);
         }
     }
-    match not_answering(paths, reply)? {
-        Ok(r) => Ok(r),
-        Err(failed) => anyhow::bail!("{}", failed.why),
-    }
+    not_answering(paths, reply)
 }
 
-/// The daemon's reply, whether it succeeded or not.
-async fn request(paths: &Paths, req: &Value) -> anyhow::Result<Value> {
-    not_answering(paths, control::request(&paths.socket, req).await)
+/// What a person typed to name something: a ref as text.
+fn typed_ref(s: &str) -> api::typed::Reference {
+    api::typed::Reference::Typed(s.to_owned())
+}
+
+/// A number the reply may leave out, as the reply by name printed it.
+fn or_null<T: std::fmt::Display>(v: Option<T>) -> String {
+    v.map_or_else(|| "null".to_owned(), |x| x.to_string())
 }
 
 /// A reply, or why there was none: what holds the data, if no daemon
@@ -1508,21 +1464,25 @@ fn not_answering<T>(paths: &Paths, reply: anyhow::Result<T>) -> anyhow::Result<T
     })
 }
 
-/// Calls the daemon; when this device lacks the power for the action,
-/// says why, asks for the recovery words, and calls again with them.
-async fn call_with_words(paths: &Paths, mut req: Value) -> anyhow::Result<Value> {
-    let v = request(paths, &req).await?;
-    if v["ok"].as_bool() == Some(true) {
-        return Ok(v);
+/// Asks the service; when this device lacks the power for the action,
+/// says why, asks for the recovery words, and asks again with them, set
+/// in the arguments by `words`.
+async fn ask_with_words<A: api::typed::Ask>(
+    paths: &Paths,
+    mut args: A,
+    words: impl FnOnce(&mut A, String),
+) -> anyhow::Result<A::Reply> {
+    let failed = match ask_or_failed(paths, &args).await? {
+        Ok(r) => return Ok(r),
+        Err(f) => f,
+    };
+    if failed.status != api::status::NEEDS_WORDS {
+        anyhow::bail!("{}", failed.why);
     }
-    let why = v["error"].as_str().unwrap_or("the daemon failed");
-    if v["needs_words"].as_bool() != Some(true) {
-        anyhow::bail!("{why}");
-    }
-    println!("{}.", capitalized(why));
-    let words = ask_words(paths, "Your recovery words can approve it instead.").await?;
-    req["words"] = json!(words.as_str());
-    call(paths, req).await
+    println!("{}.", capitalized(&failed.why));
+    let typed = ask_words(paths, "Your recovery words can approve it instead.").await?;
+    words(&mut args, typed.as_str().to_owned());
+    ask(paths, args).await
 }
 
 fn capitalized(s: &str) -> String {
@@ -1579,18 +1539,15 @@ async fn read_words(
         let problem = match bad {
             Some(i) => format!("word {} is not a recovery word; check its spelling", i + 1),
             None => match paths {
-                Some(paths) => match request(
-                    paths,
-                    &json!({"cmd": "recovery-check", "words": words.as_str()}),
-                )
-                .await?
-                {
-                    v if v["ok"].as_bool() == Some(true) => return Ok(words),
-                    v => v["error"]
-                        .as_str()
-                        .unwrap_or("the words were not accepted")
-                        .to_owned(),
-                },
+                Some(paths) => {
+                    let args = api::RecoveryCheckArgs {
+                        words: Some(words.as_str().to_owned()),
+                    };
+                    match ask_or_failed(paths, &args).await? {
+                        Ok(_) => return Ok(words),
+                        Err(failed) => failed.why,
+                    }
+                }
                 None => match cardinal_crypto::RecoveryPhrase::parse(&words) {
                     Ok(_) => return Ok(words),
                     Err(_) => "the words do not fit together: one is wrong or out of place".into(),
@@ -1607,67 +1564,62 @@ async fn read_words(
 
 /// What belongs on the recovery sheet.
 /// Where Bluetooth stands on this device.
-fn print_bluetooth(b: &Value) {
-    let mode = b["mode"].as_str().unwrap_or("off");
-    let when = match mode {
+fn print_bluetooth(b: &api::BluetoothShown) {
+    let when = match &*b.mode {
         "open" => "on while a window is open",
         "always" => "on, open or closed",
         _ => "off",
     };
-    let now = if b["on"] == json!(true) {
-        let psm = b["psm"]
-            .as_u64()
-            .map(|p| format!(", PSM {p}"))
-            .unwrap_or_default();
+    let now = if b.on {
+        let psm = b.psm.map(|p| format!(", PSM {p}")).unwrap_or_default();
         format!("on now{psm}")
     } else {
         "not on now".to_owned()
     };
     println!("Bluetooth: {when} (`cardinal bluetooth off|open|always`); {now}.");
-    if b["too_old"] == json!(true) {
+    if b.too_old == Some(true) {
         println!(
             "  This device's Bluetooth is too old for Cardinal to find people nearby. Wi-Fi and \
              the internet still work."
         );
         return;
     }
-    match (&b["available"], b["why_not"].as_str()) {
-        (Value::Bool(true), _) => {
-            let radio = b["radio"].as_str().unwrap_or("a radio");
+    match (b.available, b.why_not.as_deref()) {
+        (Some(true), _) => {
+            let radio = b.radio.as_deref().unwrap_or("a radio");
             println!("  Available: {radio}.");
         }
         (_, Some(why)) => println!("  Not available: {why}."),
         _ => {}
     }
-    if let Some(e) = b["error"].as_str() {
+    if let Some(e) = &b.error {
         println!("  Last problem: {e}.");
     }
-    let seen = b["seen"].as_u64().unwrap_or(0);
-    if seen > 0 {
+    if b.seen > 0 {
         println!(
-            "  Seen {seen} advertisements of Cardinal devices, {} of them yours or your trusted \
+            "  Seen {} advertisements of Cardinal devices, {} of them yours or your trusted \
              contacts'.",
-            b["recognized"].as_u64().unwrap_or(0)
+            b.seen, b.recognized
         );
     }
 }
 
 /// What the router gave, or why it gave nothing, whether it is asked at
 /// all, and where this device names itself.
-fn print_router(router: &Value) {
-    if router["on"] == json!(false) {
+fn print_router(router: &api::Router) {
+    if !router.on {
         println!("Router: not asked for a port (`cardinal router on` asks it).");
-    } else if router["network"]["mine"] != json!(true) {
+    } else if !router.network.mine {
         println!(
             "Router: not asked for a port: this is not a network you said is yours \
              (`cardinal network mine` if it is)."
         );
-    } else if let Some(at) = router["external"].as_str() {
+    } else if let Some(at) = &router.external {
         println!(
             "Router: reaches this device from outside at {at} ({}).",
-            router["protocol"].as_str().unwrap_or("")
+            router.protocol.as_deref().unwrap_or("")
         );
-    } else if let Some(why) = router["error"].as_str() {
+    } else if let Some(why) = &router.error {
         // a no in plain words says what to do already
         if why.contains("by hand") || why.contains("is forwarded to") {
             println!("Router: gives no port: {why}.");
@@ -1677,33 +1629,28 @@ fn print_router(router: &Value) {
             );
         }
     }
-    let named: Vec<&str> = router["named"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .filter_map(Value::as_str)
-        .collect();
-    if !named.is_empty() {
+    if !router.named.is_empty() {
         println!(
             "        named as a host at {}, for your trusted contacts (`cardinal router off` \
              stops it).",
-            named.join(", ")
+            router.named.join(", ")
         );
     }
 }
 
 /// The network this device is on, and whether it is the person's.
-fn print_network(v: &Value) {
-    if v["known"] != json!(true) {
+fn print_network(v: &api::Network) {
+    if !v.known {
         println!("This device cannot tell which network it is on: it sees no router.");
         return;
     }
-    let router = v["router"].as_str().unwrap_or("");
-    let called = v["name"]
-        .as_str()
+    let router = v.router.as_deref().unwrap_or("");
+    let called = v
+        .name
+        .as_deref()
         .map(|n| format!(" ({n})"))
         .unwrap_or_default();
-    match (v["answered"] == json!(true), v["mine"] == json!(true)) {
+    match (v.answered == Some(true), v.mine) {
         (_, true) => println!(
             "This network{called}, router {router}, is yours: your devices ask its router for \
              a port here."
@@ -1719,8 +1666,53 @@ fn print_network(v: &Value) {
     }
 }
 
-fn print_sheet(v: &Value) {
-    let hosts = v["hosts"].as_array().cloned().unwrap_or_default();
+/// `bluetooth`'s reply, as `status` holds it.
+fn bluetooth_shown(b: api::BluetoothReply) -> api::BluetoothShown {
+    api::BluetoothShown {
+        available: b.available,
+        channels_in: b.channels_in,
+        error: b.error,
+        mode: b.mode,
+        on: b.on,
+        psm: b.psm,
+        radio: b.radio,
+        recognized: b.recognized,
+        seen: b.seen,
+        why_not: b.why_not,
+        windows: b.windows,
+        too_old: b.too_old,
+    }
+}
+
+/// `router`'s reply, as `status` holds it.
+fn router_shown(r: api::RouterReply) -> api::Router {
+    api::Router {
+        error: r.error,
+        everywhere: r.everywhere,
+        external: r.external,
+        named: r.named,
+        network: r.network,
+        on: r.on,
+        protocol: r.protocol,
+        seconds_left: r.seconds_left,
+        this_device: r.this_device,
+    }
+}
+
+/// `network`'s reply, as `router` holds it.
+fn network_shown(n: api::NetworkReply) -> api::Network {
+    api::Network {
+        answered: n.answered,
+        ask: n.ask,
+        known: n.known,
+        mine: n.mine,
+        name: n.name,
+        router: n.router,
+        routers: n.routers,
+    }
+}
+
+fn print_sheet(hosts: &[api::Host]) {
     if hosts.is_empty() {
         println!();
         println!("You have no always-on device yet, so your recovery sheet has only your");
@@ -1730,17 +1722,13 @@ fn print_sheet(v: &Value) {
     }
     println!();
     println!("Write this on your recovery sheet, with your 24 words:");
-    for h in &hosts {
+    for h in hosts {
         println!();
-        println!("  Always-on device: {}", h["name"].as_str().unwrap_or(""));
+        println!("  Always-on device: {}", h.name);
         // the key's bytes, written for a person to copy
-        let key = h["key"]
-            .as_str()
-            .and_then(|k| <[u8; 32]>::try_from(hex::decode(k).ok()?).ok())
-            .map(|k| cardinald::host::sheet_key(&k))
-            .unwrap_or_default();
-        for a in h["addresses"].as_array().into_iter().flatten() {
-            println!("  Address:          {}", a.as_str().unwrap_or(""));
+        let key = cardinald::host::sheet_key(&h.key);
+        for a in &h.addresses {
+            println!("  Address:          {a}");
         }
         println!("  Key:              {key}");
     }
@@ -1758,8 +1746,11 @@ async fn running(paths: &Paths) -> anyhow::Result<bool> {
 
 /// Whether a service answers on the socket.
 async fn answers(paths: &Paths) -> bool {
-    let status = control::request(&paths.socket, &json!({"cmd": "status"})).await;
-    status.is_ok()
+    match control::ask(&paths.socket, &api::StatusArgs::new()).await {
+        Ok(_) => true,
+        // one answered, with what this command line cannot read
+        Err(e) => e.downcast_ref::<api::typed::Unreadable>().is_some(),
+    }
 }
 
 /// Whether a process holds the data directory. A directory that cannot be
@@ -1817,19 +1808,16 @@ fn space_path(p: &Path, mount: Option<&str>) -> String {
 }
 
 async fn mount_path(paths: &Paths) -> Option<String> {
-    call(paths, json!({"cmd": "status"}))
-        .await
-        .ok()
-        .and_then(|v| v["mount"].as_str().map(str::to_owned))
+    ask(paths, api::StatusArgs::new()).await.ok()?.mount
 }
 
 /// The `Old versions:` line of `cardinal status`, if any are kept.
-fn old_line(old: &Value) -> Option<String> {
-    let bytes = old["bytes"].as_u64().filter(|b| *b > 0)?;
-    let keep = old["keep"].as_str().unwrap_or("30 days");
+fn old_line(old: &api::OldVersions) -> Option<String> {
+    let bytes = old.bytes.filter(|b| *b > 0)?;
     Some(format!(
-        "Old versions: {}, kept {keep} (`cardinal free-space` frees them now)",
-        human_size(bytes)
+        "Old versions: {}, kept {} (`cardinal free-space` frees them now)",
+        human_size(bytes),
+        old.keep
     ))
 }
 
@@ -1901,21 +1889,19 @@ fn human_size(n: u64) -> String {
 }
 
 /// `fetching 412 files, 1.8 GB left, 31.0 MB/s` from `progress`.
-fn fetch_line(p: &Value) -> String {
-    let files = p["files_pending"].as_u64().unwrap_or(0);
+fn fetch_line(p: &api::ProgressShown) -> String {
+    let files = p.files_pending;
     let mut line = format!(
         "fetching {} file{}, {} left",
         files,
         if files == 1 { "" } else { "s" },
-        human_size(p["bytes_pending"].as_u64().unwrap_or(0))
+        human_size(p.bytes_pending)
     );
-    let wanted = p["bytes_wanted"].as_u64().unwrap_or(0);
-    if wanted > 0 {
-        line += &format!(" of {}", human_size(wanted));
+    if p.bytes_wanted > 0 {
+        line += &format!(" of {}", human_size(p.bytes_wanted));
     }
-    let rate = p["rate"].as_u64().unwrap_or(0);
-    if rate > 0 {
-        line += &format!(", {}/s", human_size(rate));
+    if p.rate > 0 {
+        line += &format!(", {}/s", human_size(p.rate));
     }
     line
 }
@@ -1957,19 +1943,18 @@ fn prompt(q: &str) -> anyhow::Result<String> {
 }
 
 /// A list of names from the daemon, for a line of output.
-fn names(v: &Value) -> String {
-    let all = v.as_array().into_iter().flatten();
-    let all: Vec<String> = all.map(|x| printable(x.as_str().unwrap_or(""))).collect();
+fn names(v: &[String]) -> String {
+    let all: Vec<String> = v.iter().map(|x| printable(x)).collect();
     all.join(", ")
 }
 
 /// The last call in a group that ended on this device, if any.
-fn tell_last_call(last: &Value) {
-    if let (Some(how), Some(at)) = (last["how"].as_str(), last["at"].as_u64()) {
-        let ago = now_secs().saturating_sub(at / 1000);
+fn tell_last_call(last: Option<&api::CallEnded>) {
+    if let Some(last) = last {
+        let ago = now_secs().saturating_sub(last.at / 1000);
         println!(
             "    Last call: {}, {} ago.",
-            how.replace('_', " "),
+            last.how.replace('_', " "),
             ago_words(ago)
         );
     }
@@ -2056,16 +2041,16 @@ fn tell_call(v: &api::CallReply) {
 /// added there while it named them. They are told, and offered to stop
 /// (`hosts.md#telling-others-where-to-reach-you`). Nothing waits for
 /// them: a yes was to the group, whoever is added to it.
-fn tell_who_reads_reach(g: &Value) {
-    let added = names(&g["reach"]["added"]);
+fn tell_who_reads_reach(g: &api::Group) {
+    let added = names(&g.reach.added);
     if added.is_empty() {
         return;
     }
-    let name = printable(g["name"].as_str().unwrap_or(""));
+    let name = printable(&g.name);
     println!(
         "    {added} was added to {name} and is not a contact of yours. They can see where \
          your host is ({}).",
-        names(&g["reach"]["what"])
+        names(&g.reach.what)
     );
     println!(
         "    To stop sharing it there: cardinal group reach {name} keep. To keep sharing it: \
@@ -2076,12 +2061,12 @@ fn tell_who_reads_reach(g: &Value) {
 /// Asks, as part of refusing someone, about each group they are in where
 /// this person's hosts are named: they can still see the address there.
 /// Nothing asks again afterwards.
-fn tell_where_refused_reads_reach(who: &str, refused: &Value) {
-    for g in refused["reach"].as_array().into_iter().flatten() {
-        let name = printable(g["name"].as_str().unwrap_or(""));
+fn tell_where_refused_reads_reach(who: &str, refused: &api::ContactReply) {
+    for g in refused.reach.iter().flatten() {
+        let name = printable(&g.name);
         println!(
             "{who} is in {name} and can still see your host's address there ({}).",
-            names(&g["what"])
+            names(&g.what)
         );
         println!(
             "    To stop sharing it there: cardinal group reach {name} keep. To keep sharing \
@@ -2208,28 +2193,29 @@ async fn clear(
 /// `cardinal free-space --unnamed`: what the store holds that nothing this
 /// device holds names, and with `--delete` its removal.
 async fn free_unnamed(paths: &Paths, delete: bool) -> anyhow::Result<()> {
-    let req = json!({"cmd": "free-space", "unnamed": true, "delete": delete});
-    let v = call(paths, req).await?;
-    let objects = v["objects"].as_u64().unwrap_or(0);
+    let args = api::FreeSpaceArgs {
+        unnamed: Some(true),
+        delete: Some(delete),
+        ..api::FreeSpaceArgs::new()
+    };
+    let v = ask(paths, args).await?;
+    let objects = v.objects;
     let s = if objects == 1 { "" } else { "s" };
-    let size = human_size(v["bytes"].as_u64().unwrap_or(0));
-    let unsure: Vec<&str> = v["unsure"]
-        .as_array()
-        .map(|a| a.iter().filter_map(|x| x.as_str()).collect())
-        .unwrap_or_default();
+    let size = human_size(v.bytes);
+    let unsure = v.unsure.as_deref().unwrap_or_default();
     if !unsure.is_empty() {
         println!(
             "{objects} object{s} ({size}) on this device look as if nothing names them. That \
              count may be too high:"
         );
-        for why in &unsure {
+        for why in unsure {
             println!("  {}", printable(why));
         }
         if delete {
             anyhow::bail!("nothing was deleted: some of them may be named after all");
         }
         println!("So `--delete` would delete nothing.");
-    } else if v["deleted"].as_bool() == Some(true) {
+    } else if v.deleted == Some(true) {
         println!("Deleted {objects} object{s} ({size}) that nothing named.");
     } else if objects == 0 {
         println!("Everything this device stores is named by something it holds.");
@@ -2253,8 +2239,8 @@ async fn init(
 ) -> anyhow::Result<()> {
     let daemon = service(paths).await?;
     if daemon {
-        let st = call(paths, json!({"cmd": "status"})).await?;
-        if !st["identity"].is_null() {
+        let st = ask(paths, api::StatusArgs::new()).await?;
+        if st.identity.is_some() {
             anyhow::bail!("this device is already set up. See `cardinal status`.");
         }
     }
@@ -2369,7 +2355,7 @@ async fn init(
         );
     }
     if daemon {
-        call(paths, json!({"cmd": "reload"})).await?;
+        ask(paths, api::ReloadArgs {}).await?;
         if let Some(m) = &config.mount {
             println!("Your files are in {}.", m.display());
         }
@@ -2407,13 +2393,9 @@ async fn pair(
         };
         // Only an admin device adds devices; elsewhere the recovery words
         // approve it. Ask before the code times out on the new device.
-        let st = call(paths, json!({"cmd": "status"})).await?;
-        let mine = st["devices"]
-            .as_array()
-            .and_then(|a| a.iter().find(|x| x["this"] == true))
-            .and_then(|x| x["power"].as_str())
-            .unwrap_or("");
-        if !st["identity"].is_null() && mine != "admin" && mine != "root" {
+        let st = ask(paths, api::StatusArgs::new()).await?;
+        let mine = st.devices.iter().find(|x| x.this).map_or("", |x| &*x.power);
+        if st.identity.is_some() && mine != "admin" && mine != "root" {
             println!("This device cannot add devices (it is not an admin device).");
             let words = ask_words(paths, "Your recovery words can approve it instead.").await?;
             args.words = Some(words.as_str().to_owned());
@@ -2468,11 +2450,11 @@ async fn pair(
         match state {
             "joined" => {
                 if s.files == Some(true) {
-                    let st = call(paths, json!({"cmd": "status"})).await?;
+                    let st = ask(paths, api::StatusArgs::new()).await?;
                     println!(
                         "Done. This device now belongs to you{}.",
-                        st["mount"]
-                            .as_str()
+                        st.mount
+                            .as_deref()
                             .map(|m| format!("; your files are in {m}"))
                             .unwrap_or_default()
                     );
@@ -2493,60 +2475,56 @@ async fn pair(
     }
 }
 
-fn print_devices(devs: &Value) {
-    for d in devs.as_array().cloned().unwrap_or_default() {
-        let online = d["online"].as_bool().unwrap_or(false);
-        let mut line = format!(
-            "  {} {}",
-            if online { "●" } else { "○" },
-            d["name"].as_str().unwrap_or("?")
-        );
-        if d["this"].as_bool() == Some(true) {
+fn print_devices(devs: &[api::Device]) {
+    for d in devs {
+        let online = d.online;
+        let mut line = format!("  {} {}", if online { "●" } else { "○" }, d.name);
+        if d.this {
             line.push_str(" (this device)");
         } else {
             line.push_str(if online { "  online" } else { "  offline" });
         }
-        line.push_str(&format!("  {}", d["power"].as_str().unwrap_or("")));
-        if let Some(a) = d["addr"].as_str() {
+        line.push_str(&format!("  {}", d.power));
+        if let Some(a) = &d.addr {
             line.push_str(&format!("  {a}"));
         }
-        if let Some(c) = d["carrier"].as_str() {
+        if let Some(c) = &d.carrier {
             line.push_str(&format!("  {c}"));
         }
-        if let Some(t) = d["through"].as_str() {
+        if let Some(t) = &d.through {
             line.push_str(&format!(" through {t}"));
         }
-        line.push_str(&format!("  [{}]", d["key"].as_str().unwrap_or("")));
+        line.push_str(&format!("  [{}]", hex::encode(d.key)));
         println!("{line}");
-        if let Some(f) = source_line(&d["fetch"]) {
+        if let Some(f) = d.fetch.as_ref().and_then(source_line) {
             println!("      {f}");
         }
-        print!("{}", unreadable_line(&d["unreadable"]));
+        print!("{}", unreadable_line(d.unreadable.as_ref()));
     }
 }
 
 /// `sent 1.1 GB to this device; now 38.0 MB/s, 3 ms` from a device's
 /// `fetch` statistics, if it has sent anything.
-fn source_line(f: &Value) -> Option<String> {
-    if f["replies"].as_u64().unwrap_or(0) == 0 {
+fn source_line(f: &api::Fetch) -> Option<String> {
+    if f.replies == 0 {
         return None;
     }
     Some(format!(
         "sent {} to this device; now {}/s, {} ms",
-        human_size(f["received"].as_u64().unwrap_or(0)),
-        human_size(f["rate"].as_u64().unwrap_or(0)),
-        f["latency_ms"].as_u64().unwrap_or(0)
+        human_size(f.received),
+        human_size(f.rate),
+        f.latency_ms
     ))
 }
 
-fn print_status(v: &Value) {
-    if v["identity"].is_null() {
+fn print_status(v: &api::StatusReply) {
+    if v.identity.is_none() {
         println!(
             "This device (\"{}\") does not belong to anyone yet.",
-            v["name"].as_str().unwrap_or("")
+            v.name
         );
-        if let Some(s) = v["pairing"]["state"].as_str() {
-            println!("Pairing: {s}");
+        if let Some(p) = &v.pairing {
+            println!("Pairing: {}", p.state);
         }
         println!(
             "Run `cardinal init` if it is your first device, or `cardinal pair` to add it to \
@@ -2554,18 +2532,18 @@ fn print_status(v: &Value) {
         );
         return;
     }
-    println!("This device: {}", v["name"].as_str().unwrap_or(""));
-    if v["removed"] == true {
+    println!("This device: {}", v.name);
+    if v.removed {
         println!("It was removed from your devices: it no longer syncs, and what is here stays.");
     }
-    match (v["mounted"].as_str(), v["mount"].as_str()) {
+    match (v.mounted.as_deref(), v.mount.as_deref()) {
         (Some(m), _) => println!("Your files: {m}"),
-        (None, Some(_)) if v["mount_unavailable"].is_string() => println!(
+        (None, Some(_)) if v.mount_unavailable.is_some() => println!(
             "Your files: FUSE is not available here ({}); syncing without a mount \
              (`cardinal unmount` stops trying)",
-            v["mount_unavailable"].as_str().unwrap_or("")
+            v.mount_unavailable.as_deref().unwrap_or("")
         ),
-        (None, Some(m)) if v["files_ready"].as_bool() == Some(true) => {
+        (None, Some(m)) if v.files_ready => {
             println!("Your files: not mounted at {m}; see `cardinal log`")
         }
         (None, Some(_)) => println!("Your files: still arriving from your other devices"),
@@ -2573,66 +2551,58 @@ fn print_status(v: &Value) {
     }
     println!(
         "Keeping: {}",
-        if v["retention"] == "on-demand" {
+        if v.retention == "on-demand" {
             "files you open (on demand)"
         } else {
             "everything (full)"
         }
     );
-    let always_on: Vec<&str> = v["always_on"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .filter_map(Value::as_str)
-        .collect();
-    if v["hosts"].as_u64() == Some(0) && !always_on.is_empty() {
+    if v.hosts == Some(0) && !v.always_on.is_empty() {
         println!(
             "Always-on device: {}, reachable from outside, keeping your mail; not a restore",
-            always_on.join(", ")
+            v.always_on.join(", ")
         );
         println!("  point, so your words alone could not bring your files back if every device");
         println!("  were lost (`cardinal host` on it makes it one)");
-    } else if v["hosts"].as_u64() == Some(0) {
+    } else if v.hosts == Some(0) {
         println!("Always-on device: none yet, so your words alone could not bring your");
         println!("  files back if every device were lost (`cardinal host` on one that stays on)");
     }
-    if let Some(line) = old_line(&v["old"]) {
+    if let Some(line) = old_line(&v.old) {
         println!("{line}");
     }
-    if let Some(old) = v["moved_from"].as_u64() {
-        let now = v["listen"].as_str().unwrap_or("");
+    if let Some(old) = v.moved_from {
+        let now = v.listen.as_str();
         let port = now.rsplit(':').next().unwrap_or(now);
         println!(
             "Port: {old} was in use by another program, so this device listens on {port} now."
         );
-        for a in v["left_behind"].as_array().into_iter().flatten() {
+        for a in &v.left_behind {
             println!(
-                "  {} still names port {old}: point your router's forward at {port}, then give the \
-                 addresses again with `cardinal host --address`.",
-                a.as_str().unwrap_or("")
+                "  {a} still names port {old}: point your router's forward at {port}, then give the \
+                 addresses again with `cardinal host --address`."
             );
         }
     }
-    print_router(&v["router"]);
-    if v["bluetooth"]["mode"].as_str().is_some_and(|m| m != "off") {
-        print_bluetooth(&v["bluetooth"]);
+    print_router(&v.router);
+    if v.bluetooth.mode != "off" {
+        print_bluetooth(&v.bluetooth);
     }
-    if v["network"]["ask"] == json!(true) {
+    if v.network.ask {
         println!(
             "Network: is this your network? `cardinal network mine` lets your devices ask its \
              router for a port; until then they leave it alone."
         );
     }
     println!("Devices:");
-    print_devices(&v["devices"]);
-    let p = &v["progress"];
-    let files = p["files_pending"].as_u64().unwrap_or(0);
-    if files > 0 {
+    print_devices(&v.devices);
+    let p = &v.progress;
+    if p.files_pending > 0 {
         println!("Sync: {}", fetch_line(p));
-        if let Some(e) = p["last_error"].as_str() {
+        if let Some(e) = &p.last_error {
             println!("      {e}");
         }
-    } else if v["pending_changes"].as_bool() == Some(true) {
+    } else if v.pending_changes {
         println!("Sync: saving changes...");
     } else {
         println!("Sync: up to date");
@@ -2640,8 +2610,8 @@ fn print_status(v: &Value) {
     // What an entry that was not accepted carried is kept, and not saved.
     // What was deleted, or chosen between two versions, in such an entry
     // is undone: there is nothing of it to keep.
-    let not_saved = v["not_saved"].as_u64().unwrap_or(0);
-    let undone = v["not_saved_undone"].as_u64().unwrap_or(0).min(not_saved);
+    let not_saved = v.not_saved;
+    let undone = v.not_saved_undone.min(not_saved);
     let kept = not_saved - undone;
     if kept > 0 {
         println!(
@@ -2656,10 +2626,10 @@ fn print_status(v: &Value) {
              are undone: those files are as they were."
         );
     }
-    for line in copies_lines(&v["copies"], v["devices"].as_array().map_or(0, |d| d.len())) {
+    for line in copies_lines(v.copies.as_ref(), v.devices.len()) {
         println!("{line}");
     }
-    let c = v["conflicts"].as_u64().unwrap_or(0);
+    let c = v.conflicts;
     if c > 0 {
         println!(
             "Two versions: {c} file{} — see `cardinal conflicts`",
@@ -2703,27 +2673,26 @@ fn span(ms: u64) -> String {
 /// The `Copies:` lines of `cardinal status`, from its `copies` object
 /// (`blobs.md#counting-copies`). `devices`: how many devices the person
 /// has. Says what was seen, never that files are safe.
-fn copies_lines(c: &Value, devices: usize) -> Vec<String> {
-    if c.is_null() || c["blobs"].as_u64().unwrap_or(0) == 0 {
+fn copies_lines(c: Option<&api::Copies>, devices: usize) -> Vec<String> {
+    let Some(c) = c.filter(|c| c.blobs > 0) else {
         return Vec::new();
-    }
-    let now = c["now"].as_u64().unwrap_or(0);
-    let age = |t: &Value| t.as_u64().map(|t| ago(now.saturating_sub(t)));
-    let holders = c["holders"].as_array().cloned().unwrap_or_default();
-    let name = |h: &Value| {
-        if h["this"] == true {
+    };
+    let now = c.now;
+    let age = |t: Option<u64>| t.map(|t| ago(now.saturating_sub(t)));
+    let holders = &c.holders;
+    let name = |h: &api::Holder| {
+        if h.this {
             "this device".to_owned()
         } else {
-            h["name"].as_str().unwrap_or("?").to_owned()
+            h.name.clone()
         }
     };
-    let is = |h: &Value, k: &str| h[k].as_bool() == Some(true);
-    let counted: Vec<&Value> = holders.iter().filter(|h| is(h, "counted")).collect();
-    let pending: Vec<&Value> = holders
+    let counted: Vec<&api::Holder> = holders.iter().filter(|h| h.counted).collect();
+    let pending: Vec<&api::Holder> = holders
         .iter()
-        .filter(|h| h["state"] == "unchecked" && is(h, "online") && !is(h, "this"))
+        .filter(|h| h.state == "unchecked" && h.online && !h.this)
         .collect();
-    let older = span(c["older_than_ms"].as_u64().unwrap_or(3_600_000));
+    let older = span(c.older_than_ms);
     let mut out = Vec::new();
     if holders.is_empty() {
         out.push(
@@ -2738,7 +2707,7 @@ fn copies_lines(c: &Value, devices: usize) -> Vec<String> {
         .join(", ");
     if counted.is_empty() && !pending.is_empty() {
         let mut l = format!("Copies: checking {pending_names}…");
-        if c["eligible"].as_u64() == Some(0) {
+        if c.eligible == 0 {
             l += &format!(" (nothing older than {older} yet)");
         }
         out.push(l);
@@ -2749,16 +2718,16 @@ fn copies_lines(c: &Value, devices: usize) -> Vec<String> {
         // once; else per device.
         let ages: Vec<u64> = counted
             .iter()
-            .filter(|h| !is(h, "this"))
-            .filter_map(|h| h["last_pass"].as_u64())
+            .filter(|h| !h.this)
+            .filter_map(|h| h.last_pass)
             .map(|t| now.saturating_sub(t))
             .collect();
-        let interval = c["interval_ms"].as_u64().unwrap_or(600_000);
+        let interval = c.interval_ms;
         let spread = ages.iter().max().unwrap_or(&0) - ages.iter().min().unwrap_or(&0) > interval;
         let list: Vec<String> = counted
             .iter()
-            .map(|h| match age(&h["last_pass"]) {
-                Some(a) if spread && !is(h, "this") => format!("{} (spot-checked {a})", name(h)),
+            .map(|h| match age(h.last_pass) {
+                Some(a) if spread && !h.this => format!("{} (spot-checked {a})", name(h)),
                 _ => name(h),
             })
             .collect();
@@ -2777,43 +2746,43 @@ fn copies_lines(c: &Value, devices: usize) -> Vec<String> {
     }
     for h in holders
         .iter()
-        .filter(|h| !is(h, "counted") && !pending.iter().any(|p| std::ptr::eq(*p, *h)))
+        .filter(|h| !h.counted && !pending.iter().any(|p| std::ptr::eq(*p, *h)))
     {
-        let when = |k: &str| age(&h[k]).map(|a| format!(" ({a})")).unwrap_or_default();
-        let why = match h["state"].as_str().unwrap_or("") {
+        let when = |t: Option<u64>| age(t).map(|a| format!(" ({a})")).unwrap_or_default();
+        let why = match &*h.state {
             // silent: nothing confirmed, nothing lost
             "unconfirmed" => format!(
                 "not confirmed: {}{}",
-                h["reason"].as_str().unwrap_or("did not answer"),
-                when("last_check")
+                h.reason.as_deref().unwrap_or("did not answer"),
+                when(h.last_check)
             ),
             // passed once, and its last check found pieces gone
             "missing" => format!(
                 "missing pieces: {}{}",
-                h["reason"].as_str().unwrap_or("failed a check"),
-                when("last_fail")
+                h.reason.as_deref().unwrap_or("failed a check"),
+                when(h.last_fail)
             ),
             // never passed yet
-            "copying" => match h["reason"].as_str() {
+            "copying" => match &h.reason {
                 Some(why) => format!("still copying: {why}"),
                 None => "still copying".to_owned(),
             },
             "stale" => {
-                let mut w = format!("last checked {}", age(&h["last_pass"]).unwrap_or_default());
-                if !is(h, "online") {
+                let mut w = format!("last checked {}", age(h.last_pass).unwrap_or_default());
+                if !h.online {
                     w += ", offline";
                 }
                 w
             }
             "unchecked" => "offline, not checked yet".to_owned(),
-            _ => h["reason"].as_str().unwrap_or("").to_owned(),
+            _ => h.reason.clone().unwrap_or_default(),
         };
         out.push(format!("  {}: not counted — {why}", name(h)));
     }
     if counted.len() == 1 && pending.is_empty() {
         let only = counted[0];
         let others_expected = holders.len() > 1;
-        out.push(if !is(only, "this") {
+        out.push(if !only.this {
             format!(
                 "Your files are only on {}. Keep a second copy: `cardinal retention full` here, \
                  or run `cardinal pair` on another device.",
@@ -2847,17 +2816,14 @@ fn rtt(ms: f64) -> String {
 
 /// `saint-joseph: receive 38.2 MB/s, send 36.9 MB/s, round trip 0.4 ms
 /// (median 0.6 ms)` from a speed test result.
-fn speed_line(v: &Value) -> String {
-    let name = v["device"].as_str().unwrap_or("?");
-    if let Some(e) = v["error"].as_str() {
-        return e.to_owned();
-    }
+fn speed_line(v: &api::SpeedtestReply) -> String {
     format!(
-        "{name}: receive {}/s, send {}/s, round trip {} (median {})",
-        human_size(v["receive"].as_u64().unwrap_or(0)),
-        human_size(v["send"].as_u64().unwrap_or(0)),
-        rtt(v["rtt_min_us"].as_u64().unwrap_or(0) as f64 / 1000.0),
-        rtt(v["rtt_median_us"].as_u64().unwrap_or(0) as f64 / 1000.0),
+        "{}: receive {}/s, send {}/s, round trip {} (median {})",
+        v.device,
+        human_size(v.receive),
+        human_size(v.send),
+        rtt(v.rtt_min_us as f64 / 1000.0),
+        rtt(v.rtt_median_us as f64 / 1000.0),
     )
 }
 
@@ -2885,21 +2851,33 @@ async fn speedtest(paths: &Paths, device: Option<String>, raw: bool) -> anyhow::
         if !raw {
             eprintln!("Measuring the link to {name}...");
         }
-        let r = call(paths, json!({"cmd": "speedtest", "device": who})).await;
-        let v = match r {
-            Ok(mut v) => {
-                if let Some(o) = v.as_object_mut() {
-                    o.remove("ok");
+        let args = api::SpeedtestArgs {
+            device: Some(typed_ref(&who)),
+        };
+        let line = match ask(paths, args.clone()).await {
+            Ok(v) => {
+                let line = speed_line(&v);
+                if raw {
+                    let mut o = output::reply_json(&args, &v)?;
+                    if let Some(o) = o.as_object_mut() {
+                        o.remove("ok");
+                    }
+                    results.push(o);
                 }
-                v
+                line
             }
             Err(e) if named => return Err(e),
-            Err(e) => json!({"device": name, "error": format!("{e:#}")}),
+            Err(e) => {
+                let e = format!("{e:#}");
+                if raw {
+                    results.push(serde_json::json!({"device": name, "error": e}));
+                }
+                e
+            }
         };
         if !raw {
-            println!("{}", speed_line(&v));
+            println!("{line}");
         }
-        results.push(v);
     }
     if raw {
         println!("{}", serde_json::to_string_pretty(&results)?);
@@ -2928,9 +2906,11 @@ async fn client(cmd: Cmd) -> anyhow::Result<()> {
             Ok(())
         }
         Cmd::Status { json: raw } => {
-            let v = call(&paths, json!({"cmd": "status"})).await?;
+            let args = api::StatusArgs::new();
+            let v = ask(&paths, args.clone()).await?;
             if raw {
-                println!("{}", serde_json::to_string_pretty(&v)?);
+                let json = output::reply_json(&args, &v)?;
+                println!("{}", serde_json::to_string_pretty(&json)?);
             } else {
                 print_status(&v);
             }
@@ -2943,8 +2923,8 @@ async fn client(cmd: Cmd) -> anyhow::Result<()> {
             device_name,
         } => pair(&paths, code, at, admin, device_name).await,
         Cmd::Devices => {
-            let v = call(&paths, json!({"cmd": "devices"})).await?;
-            print_devices(&v["devices"]);
+            let v = ask(&paths, api::DevicesArgs::new()).await?;
+            print_devices(&v.devices);
             Ok(())
         }
         Cmd::Speedtest { device, json: raw } => speedtest(&paths, device, raw).await,
@@ -2958,14 +2938,18 @@ async fn client(cmd: Cmd) -> anyhow::Result<()> {
             Ok(())
         }
         Cmd::RemoveDevice { who, lost } => {
-            let req = json!({"cmd": "remove-device", "who": who, "lost": lost});
-            let v = call_with_words(&paths, req).await?;
-            let name = v["name"].as_str().unwrap_or(&who);
+            let args = api::RemoveDeviceArgs {
+                who: Some(typed_ref(&who)),
+                lost: Some(lost),
+                words: None,
+            };
+            let v = ask_with_words(&paths, args, |a, w| a.words = Some(w)).await?;
+            let name = &v.name;
             if lost {
                 println!(
                     "Removed \"{name}\". It can no longer read or change your files. Changes of \
                      its that your other devices had not built on are not kept: {}.",
-                    v["dropped"].as_u64().unwrap_or(0)
+                    v.dropped
                 );
             } else {
                 println!(
@@ -2998,7 +2982,7 @@ async fn client(cmd: Cmd) -> anyhow::Result<()> {
         Cmd::Recovery {
             cmd: RecoveryCmd::Sheet,
         } => {
-            print_sheet(&call(&paths, json!({"cmd": "recovery-sheet"})).await?);
+            print_sheet(&ask(&paths, api::RecoverySheetArgs {}).await?.hosts);
             Ok(())
         }
         Cmd::Recovery {
@@ -3010,12 +2994,12 @@ async fn client(cmd: Cmd) -> anyhow::Result<()> {
             })?;
             let words = read_words(None, "Type your 24 recovery words.").await?;
             println!("Reaching {host}...");
-            let key = hex::encode(key);
-            call(
-                &paths,
-                json!({"cmd": "restore-from-host", "words": words.as_str(), "at": host, "key": key}),
-            )
-            .await?;
+            let args = api::RestoreFromHostArgs {
+                words: Some(words.as_str().to_owned()),
+                at: Some(host),
+                key: Some(key.to_vec().into()),
+            };
+            ask(&paths, args).await?;
             println!("Restored. Your files are coming back.");
             println!(
                 "Your old devices are still listed under `cardinal devices`; remove any you \
@@ -3024,7 +3008,7 @@ async fn client(cmd: Cmd) -> anyhow::Result<()> {
             Ok(())
         }
         Cmd::Guardians { cmd: None } => {
-            print_guardians(&call(&paths, json!({"cmd": "guardians"})).await?);
+            print_guardians(&ask(&paths, api::GuardiansArgs {}).await?);
             Ok(())
         }
         Cmd::Guardians {
@@ -3036,15 +3020,15 @@ async fn client(cmd: Cmd) -> anyhow::Result<()> {
                 }),
         } => {
             let delay = delay.as_deref().map(parse_delay).transpose()?;
-            let req = json!({"cmd": "guardians-set", "who": names, "threshold": threshold, "delay": delay});
-            let v = call_with_words(&paths, req).await?;
-            let names: Vec<&str> = v["names"]
-                .as_array()
-                .into_iter()
-                .flatten()
-                .filter_map(Value::as_str)
-                .collect();
-            if v["pending"] == true {
+            let args = api::GuardiansSetArgs {
+                who: Some(names.iter().map(|n| typed_ref(n)).collect()),
+                threshold,
+                delay,
+                words: None,
+            };
+            let v = ask_with_words(&paths, args, |a, w| a.words = Some(w)).await?;
+            let names = &v.names;
+            if v.pending {
                 println!(
                     "Asked your guardians to confirm the change to {}: once enough of them \
                      have, after the wait, they are your guardians.",
@@ -3055,8 +3039,8 @@ async fn client(cmd: Cmd) -> anyhow::Result<()> {
             println!(
                 "Your guardians are {}. {} of them together can give your identity back, after {}.",
                 names.join(", "),
-                v["threshold"],
-                v["delay_text"].as_str().unwrap_or("")
+                v.threshold,
+                v.delay_text
             );
             println!("Nobody but you and them knows who they are. Tell them you named them.");
             Ok(())
@@ -3064,31 +3048,30 @@ async fn client(cmd: Cmd) -> anyhow::Result<()> {
         Cmd::Guardians {
             cmd: Some(GuardiansCmd::Object { fingerprint }),
         } => {
-            call(
-                &paths,
-                json!({"cmd": "guardians-object", "fingerprint": (!fingerprint.is_empty()).then(|| typed_fingerprint(&fingerprint))}),
-            )
-            .await?;
+            let args = api::GuardiansObjectArgs {
+                fingerprint: (!fingerprint.is_empty()).then(|| typed_fingerprint(&fingerprint)),
+            };
+            ask(&paths, args).await?;
             println!("Objected. Your guardians now wait twice as long; tell them it is not you.");
             Ok(())
         }
         Cmd::KeepWork { name, up_to } => {
-            let v = call(
-                &paths,
-                json!({"cmd": "keep-work", "name": name, "up_to": up_to}),
-            )
-            .await?;
+            let args = api::KeepWorkArgs {
+                name: Some(name.clone()),
+                up_to: up_to.clone(),
+            };
+            let v = ask(&paths, args).await?;
             if up_to.is_some() {
-                println!("Kept {} changes.", v["kept"]);
+                println!("Kept {} changes.", v.kept);
             } else {
-                let listed = v["set_aside"].as_array().cloned().unwrap_or_default();
+                let listed = &v.set_aside;
                 println!("{} changes of {name} are set aside:", listed.len());
                 for e in listed {
                     println!(
                         "  {}  in space {}  written at {}",
-                        e["entry"].as_str().unwrap_or(""),
-                        e["space"].as_str().unwrap_or(""),
-                        e["time_ms"]
+                        hex::encode(e.entry),
+                        hex::encode(e.space),
+                        or_null(e.time_ms)
                     );
                 }
                 println!("Keep those you recognize, up to a time: cardinal keep-work {name} --up-to TIME (or all)");
@@ -3096,17 +3079,20 @@ async fn client(cmd: Cmd) -> anyhow::Result<()> {
             Ok(())
         }
         Cmd::Guarding { cmd: None } => {
-            print_guarding(&call(&paths, json!({"cmd": "guarding"})).await?);
+            print_guarding(&ask(&paths, api::GuardingArgs {}).await?);
             Ok(())
         }
         Cmd::Guardians {
             cmd: Some(GuardiansCmd::Ask { who }),
         } => {
-            let v = call(&paths, json!({"cmd": "guardians-ask", "who": who})).await?;
+            let args = api::GuardiansAskArgs {
+                who: Some(typed_ref(&who)),
+            };
+            let v = ask(&paths, args).await?;
             println!(
                 "Asked {} to be your guardian. Once they accept, name them with \
                  `cardinal guardians set`.",
-                v["name"].as_str().unwrap_or(&who)
+                v.name
             );
             Ok(())
         }
@@ -3126,12 +3112,12 @@ async fn client(cmd: Cmd) -> anyhow::Result<()> {
                 let said = prompt("Go on? Type yes: ")?;
                 anyhow::ensure!(said.eq_ignore_ascii_case("yes"), "nothing was done");
             }
-            let v = call(
-                &paths,
-                json!({"cmd": "guarding-confirm-change", "who": who, "understood": true,
-                    "fingerprint": (!fingerprint.is_empty()).then(|| typed_fingerprint(&fingerprint))}),
-            )
-            .await?;
+            let args = api::GuardingConfirmChangeArgs {
+                who: Some(typed_ref(&who)),
+                fingerprint: (!fingerprint.is_empty()).then(|| typed_fingerprint(&fingerprint)),
+                understood: Some(true),
+            };
+            let v = ask(&paths, args).await?;
             println!("Confirmed the change.");
             print_guarding(&v);
             Ok(())
@@ -3139,9 +3125,12 @@ async fn client(cmd: Cmd) -> anyhow::Result<()> {
         Cmd::Guarding {
             cmd: Some(GuardingCmd::Accept { who }),
         } => {
-            let v = call(&paths, json!({"cmd": "guarding-accept", "who": who})).await?;
-            let name = v["name"].as_str().unwrap_or(&who);
-            if v["already"] == true {
+            let args = api::GuardingAcceptArgs {
+                who: Some(typed_ref(&who)),
+            };
+            let v = ask(&paths, args).await?;
+            let name = &v.name;
+            if v.already {
                 println!("You had accepted already: {name} can name you a guardian.");
             } else {
                 println!(
@@ -3154,17 +3143,17 @@ async fn client(cmd: Cmd) -> anyhow::Result<()> {
         Cmd::Guarding {
             cmd: Some(GuardingCmd::Invite { who, address }),
         } => {
-            let v = call(
-                &paths,
-                json!({"cmd": "guarding-invite", "who": who, "at": address}),
-            )
-            .await?;
+            let args = api::GuardingInviteArgs {
+                who: Some(typed_ref(&who)),
+                at: address,
+            };
+            let v = ask(&paths, args).await?;
             println!(
                 "Give {} this invitation, for their new device (`cardinal recover start CODE`). \
                  It meets your device for their recovery alone:",
-                v["name"].as_str().unwrap_or(&who)
+                v.name
             );
-            println!("{}", v["code"].as_str().unwrap_or(""));
+            println!("{}", v.code);
             Ok(())
         }
         Cmd::Guarding {
@@ -3176,11 +3165,12 @@ async fn client(cmd: Cmd) -> anyhow::Result<()> {
                 }),
         } => {
             cautioned(&paths, &who, yes).await?;
-            let v = call(
-                &paths,
-                json!({"cmd": "guarding-endorse", "who": who, "fingerprint": typed_fingerprint(&fingerprint), "understood": true}),
-            )
-            .await?;
+            let args = api::GuardingEndorseArgs {
+                who: Some(typed_ref(&who)),
+                fingerprint: Some(typed_fingerprint(&fingerprint)),
+                understood: Some(true),
+            };
+            let v = ask(&paths, args).await?;
             println!("Endorsed. Once enough guardians have, everyone waits, and then confirms.");
             print_guarding(&v);
             Ok(())
@@ -3194,11 +3184,12 @@ async fn client(cmd: Cmd) -> anyhow::Result<()> {
                 }),
         } => {
             cautioned(&paths, &who, yes).await?;
-            let v = call(
-                &paths,
-                json!({"cmd": "guarding-confirm", "who": who, "fingerprint": typed_fingerprint(&fingerprint), "understood": true}),
-            )
-            .await?;
+            let args = api::GuardingConfirmArgs {
+                who: Some(typed_ref(&who)),
+                fingerprint: Some(typed_fingerprint(&fingerprint)),
+                understood: Some(true),
+            };
+            let v = ask(&paths, args).await?;
             println!("Confirmed.");
             print_guarding(&v);
             Ok(())
@@ -3206,28 +3197,28 @@ async fn client(cmd: Cmd) -> anyhow::Result<()> {
         Cmd::Guarding {
             cmd: Some(GuardingCmd::Never { who, fingerprint }),
         } => {
-            let v = call(
-                &paths,
-                json!({"cmd": "guarding-never", "who": who, "fingerprint": typed_fingerprint(&fingerprint)}),
-            )
-            .await?;
+            let args = api::GuardingNeverArgs {
+                who: Some(typed_ref(&who)),
+                fingerprint: Some(typed_fingerprint(&fingerprint)),
+            };
+            let v = ask(&paths, args).await?;
             println!("You will never endorse or confirm that recovery, on any of your devices.");
             print_guarding(&v);
             Ok(())
         }
         Cmd::Recover { cmd: None } => {
-            let v = call(&paths, json!({"cmd": "recover"})).await?;
+            let v = ask(&paths, api::RecoverArgs {}).await?;
             print_recover(&v);
             Ok(())
         }
         Cmd::Recover {
             cmd: Some(RecoverCmd::Start { code, identity }),
         } => {
-            let v = call(
-                &paths,
-                json!({"cmd": "recover-start", "code": code, "identity": identity}),
-            )
-            .await?;
+            let args = api::RecoverStartArgs {
+                code: code.clone(),
+                identity: identity.as_deref().map(typed_ref),
+            };
+            let v = ask(&paths, args).await?;
             if code.is_some() {
                 println!(
                     "You are in touch with that guardian. Read each guardian this fingerprint:"
@@ -3235,7 +3226,7 @@ async fn client(cmd: Cmd) -> anyhow::Result<()> {
             } else {
                 println!("Recovering. Read each guardian this fingerprint:");
             }
-            println!("    {}", v["fingerprint"].as_str().unwrap_or(""));
+            println!("    {}", v.fingerprint);
             println!("Bring each guardian's invitation the same way. Once enough have confirmed,");
             println!("run `cardinal recover finish`.");
             Ok(())
@@ -3243,13 +3234,10 @@ async fn client(cmd: Cmd) -> anyhow::Result<()> {
         Cmd::Recover {
             cmd: Some(RecoverCmd::Invite { address }),
         } => {
-            let v = call(&paths, json!({"cmd": "recover-invite", "at": address})).await?;
+            let v = ask(&paths, api::RecoverInviteArgs { at: address }).await?;
             println!("Have your guardian use this on their device (`cardinal accept CODE`):");
-            println!("{}", v["code"].as_str().unwrap_or(""));
-            println!(
-                "Then read them this fingerprint: {}",
-                v["fingerprint"].as_str().unwrap_or("")
-            );
+            println!("{}", v.code);
+            println!("Then read them this fingerprint: {}", v.fingerprint);
             Ok(())
         }
         Cmd::Recover {
@@ -3268,14 +3256,14 @@ async fn client(cmd: Cmd) -> anyhow::Result<()> {
                 let said = prompt("Go on? Type yes: ")?;
                 anyhow::ensure!(said.eq_ignore_ascii_case("yes"), "nothing was done");
             }
-            let v = call(
-                &paths,
-                json!({"cmd": "recover-stop-waiting", "who": who, "all": all}),
-            )
-            .await?;
-            println!("No longer waiting for {}.", names(&v["stopped"]));
-            if v["not_heard"].as_array().is_some_and(|n| !n.is_empty()) {
-                print_not_heard(&v);
+            let args = api::RecoverStopWaitingArgs {
+                all: Some(all),
+                who: who.as_deref().map(typed_ref),
+            };
+            let v = ask(&paths, args).await?;
+            println!("No longer waiting for {}.", names(&v.stopped));
+            if !v.not_heard.is_empty() {
+                print_not_heard(&v.not_heard);
             } else {
                 println!("Nobody is waited for now.");
             }
@@ -3284,8 +3272,8 @@ async fn client(cmd: Cmd) -> anyhow::Result<()> {
         Cmd::Recover {
             cmd: Some(RecoverCmd::Cancel),
         } => {
-            let v = call(&paths, json!({"cmd": "recover-cancel"})).await?;
-            match v["fingerprint"].as_str() {
+            let v = ask(&paths, api::RecoverCancelArgs {}).await?;
+            match v.fingerprint.as_deref() {
                 Some(fp) => println!(
                     "Given up. Tell each guardian never to confirm the recovery \"{fp}\" \
                      (`cardinal guarding never`)."
@@ -3301,12 +3289,12 @@ async fn client(cmd: Cmd) -> anyhow::Result<()> {
                     lost_at,
                 }),
         } => {
-            let v = call(
-                &paths,
-                json!({"cmd": "recover-finish", "without_account": without_account, "lost_at": lost_at}),
-            )
-            .await?;
-            if v["account"] == true {
+            let args = api::RecoverFinishArgs {
+                without_account: Some(without_account),
+                lost_at,
+            };
+            let v = ask(&paths, args).await?;
+            if v.account {
                 println!("Recovered, from what your guardians hold: your account, contacts and");
                 println!(
                     "settings are back. Your other spaces come back as their holders are reached."
@@ -3315,25 +3303,22 @@ async fn client(cmd: Cmd) -> anyhow::Result<()> {
                 println!("Recovered, from what your guardians hold. They held no copy of your");
                 println!("account, so this device starts with an empty one.");
             }
-            print_pair_again(&v);
-            print_not_heard(&v);
-            let lost: Vec<&Value> = v["lost_devices"]
-                .as_array()
-                .into_iter()
-                .flatten()
-                .filter(|l| l["set_aside"].as_u64().unwrap_or(0) > 0)
+            print_pair_again(&v.pair_again);
+            print_not_heard(&v.not_heard);
+            let lost: Vec<&api::LostDevice> = v
+                .lost_devices
+                .iter()
+                .filter(|l| l.set_aside.unwrap_or(0) > 0)
                 .collect();
             if !lost.is_empty() {
                 println!();
                 println!("When did you lose your devices? What they wrote is set aside, since a");
                 println!("thief may have written with them. Keep what they wrote up to then:");
                 for l in lost {
-                    let name = l["name"]
-                        .as_str()
-                        .unwrap_or_else(|| l["key"].as_str().unwrap_or(""));
+                    let name = l.name.clone().unwrap_or_else(|| hex::encode(l.key));
                     println!(
                         "  cardinal keep-work {name} --up-to TIME   ({} set aside)",
-                        l["set_aside"]
+                        or_null(l.set_aside)
                     );
                 }
                 println!("The time is each device's own clock, which a thief can set.");
@@ -3348,7 +3333,7 @@ async fn client(cmd: Cmd) -> anyhow::Result<()> {
             println!("Your new recovery words. Write them down, in order, and keep them safe:");
             println!("the old ones no longer work.");
             println!();
-            show_words(v["words"].as_str().unwrap_or(""));
+            show_words(&v.words);
             println!();
             Ok(())
         }
@@ -3402,13 +3387,16 @@ async fn client(cmd: Cmd) -> anyhow::Result<()> {
             json,
             ..
         } => {
-            let v = call(
-                &paths,
-                json!({"cmd": "contact-status", "who": who, "look": look, "at": at}),
-            )
-            .await?;
+            let args = api::ContactStatusArgs {
+                who: Some(typed_ref(&who)),
+                look: Some(look),
+                at,
+                ..api::ContactStatusArgs::new()
+            };
+            let v = ask(&paths, args.clone()).await?;
             if json {
-                println!("{}", serde_json::to_string_pretty(&v)?);
+                let json = output::reply_json(&args, &v)?;
+                println!("{}", serde_json::to_string_pretty(&json)?);
             } else {
                 print!("{}", contact_status(&v));
             }
@@ -3467,8 +3455,15 @@ async fn client(cmd: Cmd) -> anyhow::Result<()> {
             setting,
             new_name,
         } => {
-            let req = match (setting.as_str(), new_name) {
-                ("name", Some(name)) => json!({"cmd": "contact", "who": who, "name": name}),
+            let base = api::ContactArgs {
+                who: Some(typed_ref(&who)),
+                ..api::ContactArgs::new()
+            };
+            let args = match (setting.as_str(), new_name) {
+                ("name", Some(name)) => api::ContactArgs {
+                    name: Some(name),
+                    ..base
+                },
                 ("picture", Some(p)) => {
                     // a file on this computer, as the service sees it
                     let here = std::path::Path::new(&p);
@@ -3478,7 +3473,10 @@ async fn client(cmd: Cmd) -> anyhow::Result<()> {
                         }
                         _ => p,
                     };
-                    json!({"cmd": "contact", "who": who, "picture": p})
+                    api::ContactArgs {
+                        picture: Some(p),
+                        ..base
+                    }
                 }
                 ("picture", None) => anyhow::bail!(
                     "say which file: `cardinal contact {who} picture People/{who}/photo.jpg`, \
@@ -3487,31 +3485,39 @@ async fn client(cmd: Cmd) -> anyhow::Result<()> {
                 ("name", None) => {
                     anyhow::bail!("say what to call them: `cardinal contact {who} name NEW`")
                 }
-                ("category", Some(c)) => json!({"cmd": "contact", "who": who, "category": c}),
+                ("category", Some(c)) => api::ContactArgs {
+                    category: Some(c),
+                    ..base
+                },
                 ("category", None) => {
                     anyhow::bail!(
                         "say where to list them: `cardinal contact {who} category Family`"
                     )
                 }
-                ("no-host", Some(h)) => {
-                    json!({"cmd": "contact", "who": who, "setting": "no-host", "host": h})
-                }
+                ("no-host", Some(h)) => api::ContactArgs {
+                    setting: Some("no-host".to_owned()),
+                    host: Some(h),
+                    ..base
+                },
                 ("no-host", None) => {
                     anyhow::bail!("say which host: `cardinal contact {who} no-host DEVICE`")
                 }
                 (_, Some(_)) => {
                     anyhow::bail!("only `name`, `picture`, `category` and `no-host` take a value")
                 }
-                (_, None) => json!({"cmd": "contact", "who": who, "setting": setting}),
+                (_, None) => api::ContactArgs {
+                    setting: Some(setting.clone()),
+                    ..base
+                },
             };
-            let done = call(&paths, req).await?;
+            let done = ask(&paths, args).await?;
             // Someone refused may be in a group where this person's hosts
             // are named: they are asked about it now, and only now.
             if setting == "refuse" {
                 tell_where_refused_reads_reach(&printable(&who), &done);
             }
             let who = printable(&who);
-            match done["named"].as_str() {
+            match done.named.as_deref() {
                 Some("named") => println!("{who} can now find your devices through your hosts."),
                 Some("waiting") => println!(
                     "Your host cannot be reached from here now. It is named for {who} as soon as it can be."
@@ -3535,7 +3541,10 @@ async fn client(cmd: Cmd) -> anyhow::Result<()> {
         }
         Cmd::Invitations { action, id } => match (action.as_deref(), id) {
             (Some("cancel"), Some(id)) => {
-                call(&paths, json!({"cmd": "cancel-invitation", "id": id})).await?;
+                let args = api::CancelInvitationArgs {
+                    id: Some(typed_ref(&id)),
+                };
+                ask(&paths, args).await?;
                 println!("Cancelled: nobody can use it now, on any of your devices.");
                 Ok(())
             }
@@ -3663,21 +3672,28 @@ async fn client(cmd: Cmd) -> anyhow::Result<()> {
             Ok(())
         }
         Cmd::Introduce { who, to, note } => {
-            call(
-                &paths,
-                json!({"cmd": "introduce", "who": who, "to": to, "note": note}),
-            )
-            .await?;
+            let args = api::IntroduceArgs {
+                who: Some(typed_ref(&who)),
+                to: Some(typed_ref(&to)),
+                note,
+            };
+            ask(&paths, args).await?;
             println!("Asked {to} whether to meet {who}.");
             Ok(())
         }
         Cmd::Introductions { answer, id } => {
             match (answer.as_deref(), id) {
                 (Some("yes"), Some(id)) => {
-                    call(&paths, json!({"cmd": "introduction-accept", "id": id})).await?;
+                    let args = api::IntroductionAcceptArgs {
+                        id: Some(typed_ref(&id)),
+                    };
+                    ask(&paths, args).await?;
                 }
                 (Some("no"), Some(id)) => {
-                    call(&paths, json!({"cmd": "introduction-decline", "id": id})).await?;
+                    let args = api::IntroductionDeclineArgs {
+                        id: Some(typed_ref(&id)),
+                    };
+                    ask(&paths, args).await?;
                 }
                 (None, _) => {
                     let v = ask(&paths, api::IntroductionsArgs::new()).await?;
@@ -3698,82 +3714,77 @@ async fn client(cmd: Cmd) -> anyhow::Result<()> {
             Ok(())
         }
         Cmd::Groups => {
-            let v = call(&paths, json!({"cmd": "groups"})).await?;
-            for g in v["groups"].as_array().into_iter().flatten() {
-                let unread = g["unread"].as_u64().unwrap_or(0);
+            let v = ask(&paths, api::GroupsArgs::new()).await?;
+            for g in &v.groups {
+                let unread = g.unread;
                 let unread = if unread > 0 {
                     format!(", {unread} unread")
                 } else {
                     String::new()
                 };
-                let public = match g["public"] == true {
+                let public = match g.public {
                     true => ", public",
                     false => "",
                 };
-                let for_call = match g["for_call"] == true {
+                let for_call = match g.for_call == Some(true) {
                     true => ", made for a call",
                     false => "",
                 };
                 println!(
                     "{}  ({} members{unread}{public}{for_call})  {}",
-                    printable(g["name"].as_str().unwrap_or("")),
-                    g["members"],
-                    &g["group"].as_str().unwrap_or("")[..16]
+                    printable(&g.name),
+                    g.members,
+                    &hex::encode(g.group)[..16]
                 );
-                tell_last_call(&g["last_call"]);
+                tell_last_call(g.last_call.as_ref());
                 tell_who_reads_reach(g);
             }
-            for o in v["offers"].as_array().into_iter().flatten() {
-                let what = match o["for_call"] == true {
+            for o in &v.offers {
+                let what = match o.for_call == Some(true) {
                     true => "a call group, ",
                     false => "",
                 };
                 println!(
                     "{} added you to {what}{}: cardinal group join {}",
-                    printable(o["from"].as_str().unwrap_or("")),
-                    printable(o["name"].as_str().unwrap_or("")),
-                    &o["group"].as_str().unwrap_or("")[..16]
+                    printable(&o.from),
+                    printable(&o.name),
+                    &hex::encode(o.group)[..16]
                 );
-                tell_last_call(&o["last_call"]);
-                if o["public"] == true {
+                tell_last_call(o.last_call.as_ref());
+                if o.public {
                     println!(
                         "    It is public: anyone who gets what is written in it can read it."
                     );
                 }
-                if o["reach"]["ask"] == true {
+                if o.reach.ask {
                     println!(
                         "    Not contacts of yours in it: {}. Joining with --share-host tells \
                          them, and anyone added later, where your host is ({}); with \
                          --keep-host it does not.",
-                        names(&o["reach"]["who"]),
-                        names(&o["reach"]["what"]),
+                        names(&o.reach.who),
+                        names(&o.reach.what),
                     );
                 }
             }
-            for r in v["rejoin"].as_array().into_iter().flatten() {
+            for r in v.rejoin.iter().flatten() {
                 println!(
                     "You left {}, which you look after: cardinal group rejoin {}",
-                    printable(r["name"].as_str().unwrap_or("")),
-                    &r["group"].as_str().unwrap_or("")[..16]
+                    printable(&r.name),
+                    &hex::encode(r.group)[..16]
                 );
             }
             Ok(())
         }
         Cmd::Approve { id, no, with, role } => {
             let Some(id) = id else {
-                let v = call(&paths, json!({"cmd": "app-questions"})).await?;
-                let qs = v["questions"].as_array().cloned().unwrap_or_default();
+                let qs = ask(&paths, api::AppQuestionsArgs::new()).await?.questions;
                 if qs.is_empty() {
                     println!("Nothing is waiting for you.");
                 }
                 for q in qs {
-                    println!("{}. {}", q["id"], q["what"].as_str().unwrap_or(""));
-                    println!(
-                        "   ({}: {})",
-                        q["name"].as_str().unwrap_or(""),
-                        q["program"].as_str().unwrap_or("")
-                    );
-                    if q["asks"] == "share" {
+                    println!("{}. {}", q.id, q.what);
+                    println!("   ({}: {})", q.name, q.program);
+                    if q.asks == "share" {
                         println!(
                             "   Answer with --with and the people, and --role reader or writer."
                         );
@@ -3781,72 +3792,71 @@ async fn client(cmd: Cmd) -> anyhow::Result<()> {
                 }
                 return Ok(());
             };
-            let req =
-                json!({"cmd": "app-answer", "id": id, "yes": !no, "people": with, "role": role});
-            call(&paths, req).await?;
+            let args = api::AppAnswerArgs {
+                id: Some(id),
+                yes: Some(!no),
+                people: Some(with.iter().map(|w| typed_ref(w)).collect()),
+                role,
+            };
+            ask(&paths, args).await?;
             println!("{}", if no { "Said no." } else { "Said yes." });
             Ok(())
         }
         Cmd::Apps { cmd } => match cmd {
             AppsCmd::Approvals => {
-                let v = call(&paths, json!({"cmd": "approvals"})).await?;
-                let all = v["approvals"].as_array().cloned().unwrap_or_default();
+                let all = ask(&paths, api::ApprovalsArgs::new()).await?.approvals;
                 if all.is_empty() {
                     println!("No program is approved for anything.");
                 }
                 for a in all {
-                    let how = if a["change"] == true {
-                        "see and change"
-                    } else {
-                        "see"
-                    };
-                    let off = if a["revoked"] == true {
-                        "  (revoked)"
-                    } else {
-                        ""
-                    };
-                    let here = if a["this_device"] == true {
+                    let how = if a.change { "see and change" } else { "see" };
+                    let off = if a.revoked { "  (revoked)" } else { "" };
+                    let here = if a.this_device {
                         "this device".to_owned()
                     } else {
-                        a["device"].as_str().unwrap_or("another device").to_owned()
+                        a.device.as_deref().unwrap_or("another device").to_owned()
                     };
                     println!(
                         "{}  {} may {how} every {}, on {here}: {}{off}",
-                        &a["id"].as_str().unwrap_or("")
-                            [..8.min(a["id"].as_str().unwrap_or("").len())],
-                        a["name"].as_str().unwrap_or(""),
-                        a["covers"].as_str().unwrap_or(""),
-                        a["program"].as_str().unwrap_or(""),
+                        &hex::encode(a.id)[..8],
+                        a.name,
+                        a.covers,
+                        a.program,
                     );
                 }
                 Ok(())
             }
             AppsCmd::Revoke { id } => {
-                call(&paths, json!({"cmd": "approval-revoke", "id": id})).await?;
+                let args = api::ApprovalRevokeArgs {
+                    id: Some(typed_ref(&id)),
+                };
+                ask(&paths, args).await?;
                 println!("Revoked.");
                 Ok(())
             }
             AppsCmd::Offers => {
-                let v = call(&paths, json!({"cmd": "app-offers"})).await?;
-                let all = v["offers"].as_array().cloned().unwrap_or_default();
+                let all = ask(&paths, api::AppOffersArgs::new()).await?.offers;
                 if all.is_empty() {
                     println!("Nothing is offered to you.");
                 }
                 for o in all {
-                    let app = o["application"].as_str().unwrap_or("something");
+                    let app = o.application.as_deref().unwrap_or("something");
                     println!(
                         "{}  {} shares a {} with you: {}",
-                        &o["space"].as_str().unwrap_or("")[..16],
-                        o["from"].as_str().unwrap_or(""),
+                        &hex::encode(o.space)[..16],
+                        o.from,
                         app.to_lowercase(),
-                        o["name"].as_str().unwrap_or(""),
+                        o.name,
                     );
                 }
                 Ok(())
             }
             AppsCmd::Join { space } => {
-                let v = call(&paths, json!({"cmd": "app-join", "space": space})).await?;
-                println!("Joined {}.", v["name"].as_str().unwrap_or(""));
+                let args = api::AppJoinArgs {
+                    space: Some(typed_ref(&space)),
+                };
+                let v = ask(&paths, args).await?;
+                println!("Joined {}.", v.name);
                 Ok(())
             }
         },
@@ -4086,7 +4096,10 @@ async fn client(cmd: Cmd) -> anyhow::Result<()> {
                     ask(&paths, args).await?;
                 }
                 GroupCmd::PostAgain { group } => {
-                    call(&paths, json!({"cmd": "group-post-again", "group": group})).await?;
+                    let args = api::GroupPostAgainArgs {
+                        group: Some(r(group)),
+                    };
+                    ask(&paths, args).await?;
                 }
                 GroupCmd::Members { group } => {
                     let args = api::GroupMembersArgs {
@@ -4153,11 +4166,15 @@ async fn client(cmd: Cmd) -> anyhow::Result<()> {
             Ok(())
         }
         Cmd::Messages { who: None } => {
-            let conversations = call(&paths, json!({"cmd": "conversations"})).await?;
-            let groups = call(&paths, json!({"cmd": "groups"})).await?;
+            let conversations = ask(&paths, api::ConversationsArgs::new()).await?;
+            let groups = ask(&paths, api::GroupsArgs::new()).await?;
             print!(
                 "{}",
-                overview::render(&conversations, &groups, &overview::Style::here())
+                overview::render(
+                    &conversations.conversations,
+                    &groups.groups,
+                    &overview::Style::here()
+                )
             );
             Ok(())
         }
@@ -4208,11 +4225,10 @@ async fn client(cmd: Cmd) -> anyhow::Result<()> {
             Ok(())
         }
         Cmd::Bluetooth { setting } => {
-            let mut req = json!({"cmd": "bluetooth"});
-            if let Some(s) = &setting {
-                req["mode"] = json!(s);
-            }
-            let v = call(&paths, req).await?;
+            let args = api::BluetoothArgs {
+                mode: setting.clone(),
+            };
+            let v = bluetooth_shown(ask(&paths, args).await?);
             match setting.as_deref() {
                 Some("off") => println!("Bluetooth is off on this device."),
                 Some("open") => {
@@ -4231,12 +4247,11 @@ async fn client(cmd: Cmd) -> anyhow::Result<()> {
             setting,
             this_device,
         } => {
-            let mut req = json!({"cmd": "router"});
-            if let Some(s) = &setting {
-                req["on"] = json!(s == "on");
-                req["this_device"] = json!(this_device);
-            }
-            let v = call(&paths, req).await?;
+            let args = api::RouterArgs {
+                on: setting.as_ref().map(|s| s == "on"),
+                this_device: setting.as_ref().map(|_| this_device),
+            };
+            let v = router_shown(ask(&paths, args).await?);
             let which = if this_device {
                 "This device"
             } else {
@@ -4258,14 +4273,11 @@ async fn client(cmd: Cmd) -> anyhow::Result<()> {
             Ok(())
         }
         Cmd::Network { setting, name } => {
-            let mut req = json!({"cmd": "network"});
-            if let Some(s) = &setting {
-                req["mine"] = json!(s == "mine");
-            }
-            if let Some(n) = &name {
-                req["name"] = json!(n);
-            }
-            let v = call(&paths, req).await?;
+            let args = api::NetworkArgs {
+                mine: setting.as_ref().map(|s| s == "mine"),
+                name: name.clone(),
+            };
+            let v = network_shown(ask(&paths, args).await?);
             print_network(&v);
             Ok(())
         }
@@ -4278,43 +4290,47 @@ async fn client(cmd: Cmd) -> anyhow::Result<()> {
                     envelopes,
                     relay_mb,
                 }) => {
-                    let mut req = json!({"cmd": "host-offer", "who": who, "devices": devices});
-                    if let Some(n) = envelopes {
-                        req["envelopes"] = json!(n);
-                    }
-                    if let Some(n) = relay_mb {
-                        req["relay_mb"] = json!(n);
-                    }
-                    let v = call(&paths, req).await?;
+                    let args = api::HostOfferArgs {
+                        who: Some(typed_ref(&who)),
+                        devices: Some(devices),
+                        envelopes,
+                        relay_mb,
+                    };
+                    let v = ask(&paths, args).await?;
                     println!("Offered to host {who} on:");
-                    for d in v["on"].as_array().into_iter().flatten() {
+                    for d in &v.on {
                         println!("  {}", hostable_line(d));
                     }
-                    println!("They are told: {}", v["sees"].as_str().unwrap_or(""));
+                    println!("They are told: {}", v.sees);
                     return Ok(());
                 }
                 Some(HostingCmd::Accept { who }) => {
-                    let v = call(&paths, json!({"cmd": "host-accept", "who": who})).await?;
-                    println!("{who} hosts you now. {}", v["sees"].as_str().unwrap_or(""));
+                    let args = api::HostAcceptArgs {
+                        who: Some(typed_ref(&who)),
+                    };
+                    let v = ask(&paths, args).await?;
+                    println!("{who} hosts you now. {}", v.sees);
                     return Ok(());
                 }
                 Some(HostingCmd::End { who }) => {
-                    call(&paths, json!({"cmd": "host-end", "who": who})).await?;
+                    let args = api::HostEndArgs {
+                        who: Some(typed_ref(&who)),
+                    };
+                    ask(&paths, args).await?;
                     println!("Hosting between you and {who} has ended.");
                     return Ok(());
                 }
             }
-            let v = call(&paths, json!({"cmd": "hosting"})).await?;
-            let all = v["hosting"].as_array().cloned().unwrap_or_default();
+            let v = ask(&paths, api::HostingArgs {}).await?;
             // what has ended or was declined is said in one line each
-            let (list, over): (Vec<Value>, Vec<Value>) =
-                all.into_iter().partition(|h| h["ended"] != true);
+            let (list, over): (Vec<&api::Hosting>, Vec<&api::Hosting>) =
+                v.hosting.iter().partition(|h| !h.ended);
             if list.is_empty() {
                 println!("You host nobody, and nobody hosts you.");
             }
             for h in &over {
-                let name = h["name"].as_str().unwrap_or("");
-                let line = match (h["mine"] == true, h["declined"] == true) {
+                let name = &h.name;
+                let line = match (h.mine, h.declined) {
                     (true, true) => format!("{name} declined your offer to host them"),
                     (false, true) => format!("You declined {name}'s offer to host you"),
                     (true, false) => format!("Your hosting of {name} ended"),
@@ -4323,9 +4339,9 @@ async fn client(cmd: Cmd) -> anyhow::Result<()> {
                 println!("  {line}");
             }
             for h in list {
-                let name = h["name"].as_str().unwrap_or("");
-                let mine = h["mine"] == true;
-                let accepted = h["accepted"] == true;
+                let name = &h.name;
+                let mine = h.mine;
+                let accepted = h.accepted;
                 let line = match (mine, accepted) {
                     (true, true) => format!("You host {name}"),
                     (true, false) => format!("You offered to host {name}"),
@@ -4334,40 +4350,33 @@ async fn client(cmd: Cmd) -> anyhow::Result<()> {
                         format!("{name} offers to host you: `cardinal hosting accept {name}`")
                     }
                 };
-                let on: Vec<String> = h["serving"]
-                    .as_array()
-                    .into_iter()
-                    .flatten()
+                let on: Vec<String> = h
+                    .serving
+                    .iter()
                     .filter(|_| mine)
-                    .map(|d| {
-                        let name = d["name"].as_str().unwrap_or("");
-                        format!("{name} ({})", services_of(d))
-                    })
+                    .map(|d| format!("{} ({})", d.name, services_of(d)))
                     .collect();
                 let on = if on.is_empty() {
                     String::new()
                 } else {
                     format!(" on {}", on.join(", "))
                 };
-                let waiting = h["waiting"]
-                    .as_u64()
+                let waiting = h
+                    .waiting
                     .map(|n| format!(", {n} envelopes waiting here"))
                     .unwrap_or_default();
                 println!(
                     "  {line}{on} ({} envelopes, {} MB relayed a day{waiting})",
-                    h["envelopes"]
-                        .as_u64()
-                        .map_or("any".into(), |n| n.to_string()),
-                    h["relay_bytes"]
-                        .as_u64()
+                    h.envelopes.map_or("any".into(), |n| n.to_string()),
+                    h.relay_bytes
                         .map_or("any".into(), |n| (n / 1_000_000).to_string()),
                 );
             }
-            match v["why_not"].as_str() {
+            match v.why_not.as_deref() {
                 Some(why) => println!("{why}"),
                 None => {
                     println!("Your devices that can host someone:");
-                    for d in v["devices"].as_array().into_iter().flatten() {
+                    for d in &v.devices {
                         println!("  {}", hostable_line(d));
                     }
                 }
@@ -4375,12 +4384,15 @@ async fn client(cmd: Cmd) -> anyhow::Result<()> {
             Ok(())
         }
         Cmd::Host { addresses, off } => {
-            let req = if off {
-                json!({"cmd": "host-off"})
+            let (hosts, warnings) = if off {
+                (ask(&paths, api::HostOffArgs {}).await?.hosts, Vec::new())
             } else {
-                json!({"cmd": "host", "addresses": addresses})
+                let args = api::HostArgs {
+                    addresses: Some(addresses),
+                };
+                let v = ask(&paths, args).await?;
+                (v.hosts, v.warnings)
             };
-            let v = call(&paths, req).await?;
             println!(
                 "{}",
                 if off {
@@ -4389,10 +4401,10 @@ async fn client(cmd: Cmd) -> anyhow::Result<()> {
                     "This device now keeps a full copy of your files and can restore them."
                 }
             );
-            print_sheet(&v);
-            for w in v["warnings"].as_array().into_iter().flatten() {
+            print_sheet(&hosts);
+            for w in warnings {
                 println!();
-                println!("Warning: {}", w.as_str().unwrap_or(""));
+                println!("Warning: {w}");
             }
             Ok(())
         }
@@ -4542,8 +4554,12 @@ async fn client(cmd: Cmd) -> anyhow::Result<()> {
         Cmd::Undelete { path, id } => {
             let m = mount_path(&paths).await;
             let p = space_path(&path, m.as_deref());
-            let v = call(&paths, json!({"cmd": "undelete", "path": p, "id": id})).await?;
-            println!("Brought back {}.", v["path"].as_str().unwrap_or(&p));
+            let args = api::UndeleteArgs {
+                path: Some(p.clone()),
+                id: id.as_deref().map(typed_ref),
+            };
+            let v = ask(&paths, args).await?;
+            println!("Brought back {}.", v.path);
             Ok(())
         }
         Cmd::Clear {
@@ -4557,8 +4573,12 @@ async fn client(cmd: Cmd) -> anyhow::Result<()> {
             ..
         } => free_unnamed(&paths, delete).await,
         Cmd::FreeSpace { yes, .. } => {
-            let mut v = call(&paths, json!({"cmd": "free-space", "dry_run": true})).await?;
-            let bytes = v["bytes"].as_u64().unwrap_or(0);
+            let args = api::FreeSpaceArgs {
+                dry_run: Some(true),
+                ..api::FreeSpaceArgs::new()
+            };
+            let mut v = ask(&paths, args).await?;
+            let bytes = v.bytes;
             if bytes == 0 {
                 println!("Nothing to free now.");
             } else {
@@ -4571,23 +4591,23 @@ async fn client(cmd: Cmd) -> anyhow::Result<()> {
                     println!("Nothing was freed.");
                     return Ok(());
                 }
-                v = call(&paths, json!({"cmd": "free-space"})).await?;
-                println!("Freed {}.", human_size(v["bytes"].as_u64().unwrap_or(0)));
+                v = ask(&paths, api::FreeSpaceArgs::new()).await?;
+                println!("Freed {}.", human_size(v.bytes));
             }
             // Over the budget, but on no device that keeps everything yet.
-            if let Some(n) = v["only_here"]["files"].as_u64().filter(|n| *n > 0) {
+            if let Some(n) = v.only_here.as_ref().map(|o| o.files).filter(|n| *n > 0) {
                 println!(
                     "{n} files here are not on your other devices yet, so removing them to make \
                      room would lose them. They stay."
                 );
-            } else if v["unchecked"].as_bool() == Some(true) {
+            } else if v.unchecked == Some(true) {
                 println!(
                     "Your devices that keep everything cannot be reached now, so nothing more \
                      was removed to make room."
                 );
             }
             // What changed in the last hour is not freed yet.
-            if let Some(b) = v["left"].as_u64().filter(|b| *b > 0) {
+            if let Some(b) = v.left.filter(|b| *b > 0) {
                 println!(
                     "{} changed in the last hour stays until it is an hour old.",
                     human_size(b)
@@ -4596,11 +4616,11 @@ async fn client(cmd: Cmd) -> anyhow::Result<()> {
             Ok(())
         }
         Cmd::KeepOld { keep, space } => {
-            let mut req = json!({"cmd": "keep-old", "keep": keep});
-            if let Some(s) = &space {
-                req["space"] = json!(s);
-            }
-            let v = call(&paths, req).await?;
+            let args = api::KeepOldArgs {
+                keep: Some(keep),
+                space: space.as_deref().map(typed_ref),
+            };
+            let v = ask(&paths, args).await?;
             println!(
                 "This device now keeps deleted files and old versions{} {}.",
                 if space.is_some() {
@@ -4608,7 +4628,7 @@ async fn client(cmd: Cmd) -> anyhow::Result<()> {
                 } else {
                     ""
                 },
-                match v["keep"].as_str().unwrap_or("") {
+                match v.keep.as_str() {
                     "forever" => "forever".to_owned(),
                     k => format!("for {k}"),
                 }
@@ -4742,23 +4762,23 @@ async fn client(cmd: Cmd) -> anyhow::Result<()> {
                         anyhow::bail!("inspection stays off");
                     }
                 }
-                let v = call(&paths, json!({"cmd": "inspect-on", "minutes": minutes})).await?;
-                let token = v["token"].as_str().unwrap_or_default();
+                let args = api::InspectOnArgs {
+                    minutes: Some(minutes),
+                };
+                let v = ask(&paths, args).await?;
+                let token = hex::encode(v.token);
                 if quiet {
                     println!("{token}");
                 } else {
-                    println!(
-                        "Inspection is on until {}.",
-                        clock(v["until"].as_u64().unwrap_or(0))
-                    );
+                    println!("Inspection is on until {}.", clock(v.until));
                     println!("Token: {token}");
                     println!("`cardinal inspect off` ends it.");
                 }
                 Ok(())
             }
             InspectCmd::Off => {
-                let v = call(&paths, json!({"cmd": "inspect-off"})).await?;
-                if v["was_on"] == true {
+                let v = ask(&paths, api::InspectOffArgs {}).await?;
+                if v.was_on {
                     println!("Inspection is off.");
                 } else {
                     println!("Inspection was not on.");
@@ -4766,8 +4786,8 @@ async fn client(cmd: Cmd) -> anyhow::Result<()> {
                 Ok(())
             }
             InspectCmd::Status => {
-                let v = call(&paths, json!({"cmd": "status"})).await?;
-                match v["inspection"]["until"].as_u64() {
+                let v = ask(&paths, api::StatusArgs::new()).await?;
+                match v.inspection.until {
                     Some(until) => println!("Inspection is on until {}.", clock(until)),
                     None => println!("Inspection is off."),
                 }
@@ -4775,7 +4795,7 @@ async fn client(cmd: Cmd) -> anyhow::Result<()> {
             }
         },
         Cmd::Stop => {
-            call(&paths, json!({"cmd": "stop"})).await?;
+            ask(&paths, api::StopArgs {}).await?;
             println!("Stopping the daemon.");
             Ok(())
         }
@@ -4797,51 +4817,46 @@ fn secs_ago(s: u64) -> String {
     }
 }
 
-fn steps(out: &mut String, list: &serde_json::Value) {
-    for s in list.as_array().into_iter().flatten() {
-        let mark = match s["ok"].as_bool() {
+fn steps(out: &mut String, list: &[api::Step]) {
+    for s in list {
+        let mark = match s.ok {
             Some(true) => "ok  ",
             Some(false) => "no  ",
             None => "    ",
         };
         out.push_str(&format!(
             "  {}  {mark}{}\n",
-            clock(s["at"].as_u64().unwrap_or(0)),
-            printable(s["text"].as_str().unwrap_or(""))
+            clock(s.at),
+            printable(&s.text)
         ));
     }
 }
 
-fn reach_lines(out: &mut String, list: &serde_json::Value, whose: &str) {
-    let list = list.as_array().cloned().unwrap_or_default();
+fn reach_lines(out: &mut String, list: &[api::ReachSeen], whose: &str) {
     if list.is_empty() {
         out.push_str("  nothing: no host named, which says nothing either way\n");
         return;
     }
-    for r in &list {
-        let who = if r["this_device"] == true {
+    for r in list {
+        let who = if r.this_device {
             "this device".to_owned()
-        } else if let Some(k) = r["device"].as_str() {
-            format!("{whose} device {k}")
+        } else if let Some(k) = r.device {
+            format!("{whose} device {}", hex::encode(k))
         } else {
             "a host that is not one of their devices".to_owned()
         };
-        let session = if r["session"] == true {
-            ", in touch now"
-        } else {
-            ""
-        };
-        let key = if r["device"].is_string() {
+        let session = if r.session { ", in touch now" } else { "" };
+        let key = if r.device.is_some() {
             String::new()
         } else {
-            format!("  [{}]", r["host"].as_str().unwrap_or(""))
+            format!("  [{}]", hex::encode(r.host))
         };
         out.push_str(&format!("  {who}{key}{session}\n"));
-        for e in r["endpoints"].as_array().into_iter().flatten() {
-            let ep = printable(e["endpoint"].as_str().unwrap_or(""));
-            let note = match e["why_not"].as_str() {
+        for e in &r.endpoints {
+            let ep = printable(&e.endpoint);
+            let note = match e.why_not.as_deref() {
                 Some(w) => format!("not tried: {w}"),
-                None if e["local"] == true => {
+                None if e.local => {
                     "used when looking; local, so it works only on that network".into()
                 }
                 None => "used when looking".into(),
@@ -4854,155 +4869,145 @@ fn reach_lines(out: &mut String, list: &serde_json::Value, whose: &str) {
 /// `cardinal contacts NAME`, in words.
 /// What a device that could not be read says, on lines of its own, or
 /// nothing.
-fn unreadable_line(u: &serde_json::Value) -> String {
-    let Some(says) = u["says"].as_str() else {
+fn unreadable_line(u: Option<&api::Unreadable>) -> String {
+    let Some(u) = u else {
         return String::new();
     };
-    let mut out = format!("      {}\n", printable(says));
+    let mut out = format!("      {}\n", printable(&u.says));
     out.push_str(&format!(
         "      ({}; trying again in {})\n",
-        printable(u["reason"].as_str().unwrap_or("")),
-        secs_ago(u["retry_in_s"].as_u64().unwrap_or(0)).trim_end_matches(" ago")
+        printable(&u.reason),
+        secs_ago(u.retry_in_s).trim_end_matches(" ago")
     ));
     out
 }
 
 /// The known path to a contact's device (D86), as a line.
-fn path_line(p: &serde_json::Value) -> String {
-    let Some(addr) = p["addr"].as_str() else {
+fn path_line(p: Option<&api::KnownPath>) -> String {
+    let Some(p) = p else {
         return "      no known path\n".to_owned();
     };
-    let confirmed = match p["confirmed_s_ago"].as_u64() {
+    let confirmed = match p.confirmed_s_ago {
         Some(s) => format!("confirmed {}", secs_ago(s)),
         None => "not confirmed yet".to_owned(),
     };
-    let misses = match p["misses"].as_u64().unwrap_or(0) {
+    let misses = match p.misses {
         0 => String::new(),
         n => format!(", {n} checks unanswered"),
     };
     format!(
-        "      known path {addr}, {confirmed}{misses}; next check in {} s\n",
-        p["next_check_s"].as_u64().unwrap_or(0)
+        "      known path {}, {confirmed}{misses}; next check in {} s\n",
+        p.addr, p.next_check_s
     )
 }
 
-fn contact_status(v: &serde_json::Value) -> String {
+fn contact_status(v: &api::ContactStatusReply) -> String {
     let mut out = String::new();
-    let mut head = printable(v["name"].as_str().unwrap_or(""));
-    head.push_str(if v["trusted"] == true {
+    let mut head = printable(&v.name);
+    head.push_str(if v.trusted {
         "  trusted"
     } else {
         "  through hosts only"
     });
-    if v["introductions"] == false {
+    if !v.introductions {
         head.push_str("  no introductions");
     }
-    if v["refused"] == true {
+    if v.refused {
         head.push_str("  refused");
     }
-    out.push_str(&format!(
-        "{head}  [{}]\n",
-        v["identity"].as_str().unwrap_or("")
-    ));
+    out.push_str(&format!("{head}  [{}]\n", hex::encode(v.identity)));
     out.push_str("Their devices:\n");
-    let devices = v["devices"].as_array().cloned().unwrap_or_default();
-    if devices.is_empty() {
+    if v.devices.is_empty() {
         out.push_str("  none known yet\n");
     }
-    for dv in &devices {
-        let key = dv["key"].as_str().unwrap_or("");
-        let kept = if dv["kept_in_touch"] == true {
+    for dv in &v.devices {
+        let key = hex::encode(dv.key);
+        let kept = if dv.kept_in_touch {
             "  (kept in touch: you have no host)"
         } else {
             ""
         };
-        let unread = unreadable_line(&dv["unreadable"]);
-        if dv["online"] != true {
+        let unread = unreadable_line(dv.unreadable.as_ref());
+        if !dv.online {
             out.push_str(&format!("  ○ {key}  no session{kept}\n"));
-            out.push_str(&path_line(&dv["path"]));
+            out.push_str(&path_line(dv.path.as_ref()));
             out.push_str(&unread);
             continue;
         }
         let route = match (
-            dv["route"].as_str(),
-            dv["addr"].as_str(),
-            dv["through"].as_str(),
+            dv.route.as_deref(),
+            dv.addr.as_deref(),
+            dv.through.as_deref(),
         ) {
             (Some("relay"), _, Some(t)) => format!("relayed through {t}"),
             (Some("relay"), _, None) => "relayed".to_owned(),
-            (_, Some(a), _) => format!("direct  {a}  {}", dv["carrier"].as_str().unwrap_or("")),
+            (_, Some(a), _) => format!("direct  {a}  {}", dv.carrier.as_deref().unwrap_or("")),
             _ => "direct".to_owned(),
         };
-        let rtt = dv["rtt_ms"]
-            .as_u64()
-            .map(|r| format!(", {r} ms"))
-            .unwrap_or_default();
+        let rtt = dv.rtt_ms.map(|r| format!(", {r} ms")).unwrap_or_default();
         out.push_str(&format!("  ● {key}  {route}{rtt}{kept}\n"));
         out.push_str(&format!(
             "      opened by {} {} ago, heard {} ms ago; sent {}, received {}",
-            dv["opened_by"].as_str().unwrap_or("?"),
-            secs_ago(dv["open_for_s"].as_u64().unwrap_or(0)).trim_end_matches(" ago"),
-            dv["heard_ms_ago"].as_u64().unwrap_or(0),
-            human_size(dv["bytes_sent"].as_u64().unwrap_or(0)),
-            human_size(dv["bytes_received"].as_u64().unwrap_or(0)),
+            dv.opened_by.as_deref().unwrap_or("?"),
+            secs_ago(dv.open_for_s.unwrap_or(0)).trim_end_matches(" ago"),
+            dv.heard_ms_ago.unwrap_or(0),
+            human_size(dv.bytes_sent.unwrap_or(0)),
+            human_size(dv.bytes_received.unwrap_or(0)),
         ));
-        let lost = dv["packets_lost"].as_u64().unwrap_or(0);
+        let lost = dv.packets_lost.unwrap_or(0);
         if lost > 0 {
             out.push_str(&format!(", {lost} packets lost"));
         }
         out.push('\n');
-        if let Some(a) = dv["they_see_you_at"].as_str() {
+        if let Some(a) = &dv.they_see_you_at {
             out.push_str(&format!("      they see you at {a}\n"));
         }
-        if dv["kept_alive_s"].is_u64() {
+        if dv.kept_alive_s.is_some() {
             out.push_str("      kept open: this device pings it\n");
         }
-        if dv["neighbour"] == true {
+        if dv.neighbour {
             out.push_str("      a neighbour: kept in touch with\n");
         }
         out.push_str(&unread);
     }
     out.push_str("Where they say to find them, in the space you share:\n");
-    reach_lines(&mut out, &v["their_reach"], "their");
-    out.push_str(&format!(
-        "Looked for: {}\n",
-        v["looked_for"].as_str().unwrap_or("")
-    ));
-    if let Some(s) = v["in_use_for_s"].as_u64() {
+    reach_lines(&mut out, &v.their_reach, "their");
+    out.push_str(&format!("Looked for: {}\n", v.looked_for));
+    if let Some(s) = v.in_use_for_s {
         out.push_str(&format!(
             "  in use for {} more\n",
             secs_ago(s).trim_end_matches(" ago")
         ));
     }
-    match (v["looked_s_ago"].as_u64(), v["looking"] == true) {
+    match (v.looked_s_ago, v.looking) {
         (_, true) => out.push_str("  looking now\n"),
         (Some(s), _) => out.push_str(&format!("  last looked {}\n", secs_ago(s))),
         (None, _) => out.push_str("  not looked for since this service started\n"),
     }
-    let looks = v["looks_without_session"].as_u64().unwrap_or(0);
+    let looks = v.looks_without_session;
     if looks > 1 {
-        if let Some(since) = v["looking_since"].as_u64() {
+        if let Some(since) = v.looking_since {
             out.push_str(&format!(
                 "  {looks} looks since {} without a new session\n",
                 clock(since)
             ));
         }
     }
-    if v["last_look"].as_array().is_some_and(|a| !a.is_empty()) {
+    if !v.last_look.is_empty() {
         out.push_str("The last look:\n");
-        steps(&mut out, &v["last_look"]);
+        steps(&mut out, &v.last_look);
     }
-    if v["nearby_tries"].as_array().is_some_and(|a| !a.is_empty()) {
+    if !v.nearby_tries.is_empty() {
         out.push_str("Where their tag was seen on the local network:\n");
-        steps(&mut out, &v["nearby_tries"]);
+        steps(&mut out, &v.nearby_tries);
     }
-    if v["sessions"].as_array().is_some_and(|a| !a.is_empty()) {
+    if !v.sessions.is_empty() {
         out.push_str("Sessions with them since this service started:\n");
-        steps(&mut out, &v["sessions"]);
+        steps(&mut out, &v.sessions);
     }
     out.push_str("Where you tell them to find you:\n");
-    reach_lines(&mut out, &v["your_reach"], "your");
-    if let Some(e) = v["router"]["external"].as_str() {
+    reach_lines(&mut out, &v.your_reach, "your");
+    if let Some(e) = &v.router.external {
         out.push_str(&format!("  (your router gives this device {e})\n"));
     }
     out
@@ -5115,32 +5120,39 @@ mod tests {
 
     #[test]
     fn fetch_status_line() {
-        let p = json!({"files_pending": 412, "bytes_pending": 1_800_000_000u64,
-            "bytes_wanted": 2_000_000_000u64, "rate": 31_000_000});
+        let p = api::ProgressShown::new(0, 1_800_000_000, 2_000_000_000, 412, 31_000_000);
         assert_eq!(
             fetch_line(&p),
             "fetching 412 files, 1.8 GB left of 2.0 GB, 31.0 MB/s"
         );
-        let p = json!({"files_pending": 1, "bytes_pending": 500});
+        let p = api::ProgressShown::new(0, 500, 0, 1, 0);
         assert_eq!(fetch_line(&p), "fetching 1 file, 500 B left");
     }
 
-    fn holder(name: &str, this: bool, state: &str, last_pass: Option<u64>) -> Value {
-        json!({"name": name, "this": this, "online": true, "counted": state == "passed",
-            "state": state, "last_pass": last_pass, "reason": null})
+    fn holder(name: &str, this: bool, state: &str, last_pass: Option<u64>) -> api::Holder {
+        let h = api::Holder::new(
+            false,
+            state == "passed",
+            [0; 8],
+            0,
+            name.to_owned(),
+            true,
+            state.to_owned().into(),
+            this,
+        );
+        api::Holder { last_pass, ..h }
     }
 
     #[test]
     fn copies_status_lines() {
         let now = 10_000_000u64;
-        let c = |holders: Vec<Value>| {
-            json!({"now": now, "blobs": 12, "eligible": 10, "older_than_ms": 3_600_000,
-                "interval_ms": 600_000, "holders": holders})
+        let c = |holders: Vec<api::Holder>| {
+            api::Copies::new(12, 0, 10, holders, 600_000, now, 3_600_000)
         };
         // Alone.
         let alone = c(vec![holder("carbonite", true, "passed", Some(now - 1000))]);
         assert_eq!(
-            copies_lines(&alone, 1),
+            copies_lines(Some(&alone), 1),
             vec![
                 "Copies: 1 — this device (files older than an hour)",
                 "Your files are only on this device. Keep a copy on another device: run \
@@ -5154,7 +5166,7 @@ mod tests {
             holder("nuc", false, "passed", Some(now - 200_000)),
         ]);
         assert_eq!(
-            copies_lines(&three, 3),
+            copies_lines(Some(&three), 3),
             vec![
                 "Copies: 3 — this device, saint-joseph, nuc (files older than an hour, \
                  spot-checked 4 minutes ago)"
@@ -5167,13 +5179,13 @@ mod tests {
             holder("saint-joseph", false, "passed", Some(now - 60_000)),
             {
                 let mut h = holder("laptop", false, "passed", Some(now - 7_200_000));
-                h["online"] = json!(false);
+                h.online = false;
                 h
             },
             failed_holder(now),
         ]);
         assert_eq!(
-            copies_lines(&mixed, 4),
+            copies_lines(Some(&mixed), 4),
             vec![
                 "Copies: 3 — this device, saint-joseph (spot-checked 1 minute ago), laptop \
                  (spot-checked 2 hours ago); files older than an hour",
@@ -5186,7 +5198,7 @@ mod tests {
             holder("carbonite", true, "passed", Some(now - 1000)),
             failed_holder(now),
         ]);
-        let lines = copies_lines(&one, 2);
+        let lines = copies_lines(Some(&one), 2);
         assert_eq!(
             lines.last().unwrap(),
             "Your files are only on this device until another device passes its checks."
@@ -5197,40 +5209,44 @@ mod tests {
             holder("nuc", false, "unchecked", None),
         ]);
         assert_eq!(
-            copies_lines(&start, 2),
+            copies_lines(Some(&start), 2),
             vec!["Copies: 1 — this device (files older than an hour); checking nuc…"]
         );
         // On demand here, nothing old enough to check yet.
-        start["holders"] = json!([holder("nuc", false, "unchecked", None)]);
-        start["eligible"] = json!(0);
+        start.holders = vec![holder("nuc", false, "unchecked", None)];
+        start.eligible = 0;
         assert_eq!(
-            copies_lines(&start, 2),
+            copies_lines(Some(&start), 2),
             vec!["Copies: checking nuc… (nothing older than an hour yet)"]
         );
         // No content yet: nothing to say.
-        assert!(copies_lines(&json!({"blobs": 0}), 1).is_empty());
-        assert!(copies_lines(&Value::Null, 1).is_empty());
+        let none = api::Copies::new(0, 0, 0, Vec::new(), 600_000, now, 3_600_000);
+        assert!(copies_lines(Some(&none), 1).is_empty());
+        assert!(copies_lines(None, 1).is_empty());
     }
 
-    fn failed_holder(now: u64) -> Value {
+    fn failed_holder(now: u64) -> api::Holder {
         let mut h = holder("nuc", false, "unconfirmed", Some(now - 3_000_000));
-        h["reason"] = json!("did not answer its last check (not within 4 s)");
-        h["last_check"] = json!(now - 120_000);
+        h.reason = Some("did not answer its last check (not within 4 s)".into());
+        h.last_check = Some(now - 120_000);
         h
     }
 
     #[test]
     fn speedtest_line() {
-        let v = json!({"device": "saint-joseph", "receive": 38_200_000u64,
-            "send": 36_900_000u64, "rtt_min_us": 420, "rtt_median_us": 610});
+        let v = api::SpeedtestReply::new(
+            "saint-joseph".into(),
+            0,
+            38_200_000,
+            0,
+            610,
+            420,
+            36_900_000,
+            0,
+        );
         assert_eq!(
             speed_line(&v),
             "saint-joseph: receive 38.2 MB/s, send 36.9 MB/s, round trip 0.4 ms (median 0.6 ms)"
-        );
-        let e = json!({"device": "nuc", "error": "nuc runs an older version without speedtest"});
-        assert_eq!(
-            speed_line(&e),
-            "nuc runs an older version without speedtest"
         );
         assert_eq!(
             (ago(500), ago(4 * 60_000), ago(3 * 86_400_000)),
@@ -5248,13 +5264,11 @@ mod tests {
 
     #[test]
     fn source_status_line() {
-        let f = serde_json::json!({"rate": 38_000_000u64, "latency_ms": 3,
-            "replies": 412, "received": 1_100_000_000u64});
+        let f = api::Fetch::new(3, 38_000_000, 1_100_000_000, 412);
         assert_eq!(
             source_line(&f).unwrap(),
             "sent 1.1 GB to this device; now 38.0 MB/s, 3 ms"
         );
-        assert_eq!(source_line(&serde_json::json!({"replies": 0})), None);
-        assert_eq!(source_line(&Value::Null), None);
+        assert_eq!(source_line(&api::Fetch::new(0, 0, 0, 0)), None);
     }
 }
