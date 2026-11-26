@@ -793,6 +793,54 @@ asks!(WATCH: 3 "watch" WatchArgs -> Done, Page::Whole);
 typed!(fields CallMediaArgs {});
 asks!(CALL_MEDIA: 104 "call-media" CallMediaArgs -> Done, Page::Whole);
 
+// ---- The service, this device, and the person's devices ----
+
+typed!(fields ConditionsArgs {
+    1 plugged_in: Option<bool>,
+    2 metered: Option<bool>,
+});
+typed!(fields ConditionsReply {
+    2 helps: bool,
+    3 metered: bool,
+    4 plugged_in: Option<bool>,
+});
+asks!(CONDITIONS_NOW: 6 "conditions" ConditionsArgs -> ConditionsReply, Page::Whole);
+
+typed!(fields NetworkChangedArgs {
+    1 why: Option<String>,
+});
+typed!(
+    fields
+    /// How many sessions are checked.
+    Checking {
+        2 checking: u64,
+    }
+);
+asks!(NETWORK_CHANGED: 7 "network-changed" NetworkChangedArgs -> Checking, Page::Whole);
+
+typed!(fields MeArgs {
+    1 name: Option<String>,
+});
+typed!(fields MeReply {
+    2 name: String,
+    3 set: bool,
+});
+asks!(ME: 10 "me" MeArgs -> MeReply, Page::Whole);
+
+typed!(fields DeviceRenameArgs {
+    1 device: Option<Reference>,
+    2 name: Option<String>,
+});
+typed!(fields DeviceRenameReply {
+    /// The start of the device's key.
+    2 key: [u8; 8],
+    3 name: String,
+});
+asks!(DEVICE_RENAME: 12 "device-rename" DeviceRenameArgs -> DeviceRenameReply, Page::Whole);
+
+typed!(fields WakeArgs {});
+asks!(WAKE: 226 "wake" WakeArgs -> Checking, Page::Whole);
+
 typed!(fields MessagesArgs {
     1 who: Option<Reference>,
     2 group: Option<Reference>,
@@ -848,16 +896,15 @@ pub static REQUESTS: &[Request] = &[
     WATCH,
     req!(4 "stop" () -> ()),
     req!(5 "reload" () -> ()),
-    req!(6 "conditions" (1 "plugged_in" BOOL, 2 "metered" BOOL) -> (
-        2 "helps" BOOL, 3 "metered" BOOL, 4 "plugged_in" BOOL)),
-    req!(7 "network-changed" (1 "why" T) -> (2 "checking" U)),
+    CONDITIONS_NOW,
+    NETWORK_CHANGED,
     req!(8 "setup-begin" () -> (2 "ask" [U], 3 "words" [T])),
     req!(9 "setup-finish" (1 "name" T, 2 "answers" [T], 3 "device" T) -> (
         2 "device" T, 3 "name" T)),
-    req!(10 "me" (1 "name" T) -> (2 "name" T, 3 "set" BOOL)),
+    ME,
     paged!(after 11 "devices" (1 "after" U, 2 "limit" U) -> (
         2 "devices" [DEVICE], 3 "more" BOOL, 4 "next" U)),
-    req!(12 "device-rename" (1 "device" REF, 2 "name" T) -> (2 "key" B, 3 "name" T)),
+    DEVICE_RENAME,
     req!(13 "remove-device" (1 "who" REF, 2 "lost" BOOL, 3 "words" T) -> (
         2 "dropped" U, 3 "name" T)),
     req!(14 "pair-show" (1 "admin" (gone BOOL), 2 "device" T) -> (2 "addrs" [T], 3 "code" T)),
@@ -1111,7 +1158,7 @@ pub static REQUESTS: &[Request] = &[
     paged!(after 224 "app-offers" (1 "after" U, 2 "limit" U) -> (
         2 "offers" [APP_OFFER], 3 "more" BOOL, 4 "next" U)),
     req!(225 "app-join" (1 "space" REF) -> (2 "space" B, 3 "name" T)),
-    req!(226 "wake" () -> (2 "checking" U)),
+    WAKE,
     paged!(after 227 "deleted" (1 "path" T, 2 "after" U, 3 "limit" U, 4 "hidden" BOOL) -> (
         2 "files" [DELETED_FILE], 3 "path" T, 4 "more" BOOL, 5 "next" U)),
     req!(228 "undelete" (1 "path" T, 2 "id" REF) -> (2 "id" B, 3 "path" T)),

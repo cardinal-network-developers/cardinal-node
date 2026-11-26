@@ -38,11 +38,14 @@ pub fn my_name(d: &Daemon) -> String {
 
 /// `me`: the name the person suggests for themselves, and with `name`
 /// sets it, creating the self node where the account has none.
-pub fn me(d: &Arc<Daemon>, name: Option<&str>) -> anyhow::Result<Json> {
+pub fn me(d: &Arc<Daemon>, name: Option<&str>) -> anyhow::Result<crate::api::MeReply> {
     let Some(name) = name else {
         let set = d.core().self_name();
         let name = my_name(d);
-        return Ok(json!({"name": name, "set": set.is_some()}));
+        return Ok(crate::api::MeReply {
+            name,
+            set: set.is_some(),
+        });
     };
     let name = name.trim();
     anyhow::ensure!(!name.is_empty(), "a name cannot be empty");
@@ -63,7 +66,18 @@ pub fn me(d: &Arc<Daemon>, name: Option<&str>) -> anyhow::Result<Json> {
         None => account::create_self(name),
     };
     d.write_and_push(&acc, vec![op])?;
-    Ok(json!({"name": name, "set": true}))
+    Ok(crate::api::MeReply {
+        name: name.to_owned(),
+        set: true,
+    })
+}
+
+/// [`me`] as it answered by name: kept only to show the typed one sends
+/// the same bytes.
+#[cfg(any(test, feature = "by-name"))]
+pub fn me_by_name(d: &Arc<Daemon>, name: Option<&str>) -> anyhow::Result<Json> {
+    let r = me(d, name)?;
+    Ok(json!({"name": r.name, "set": r.set}))
 }
 
 /// What a window is given of a contact's name and picture: `name`, the

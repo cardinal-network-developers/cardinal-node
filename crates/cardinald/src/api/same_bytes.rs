@@ -61,6 +61,129 @@ fn same(d: &Arc<Daemon>, req: Json) -> Vec<u8> {
     new
 }
 
+// ---- Twins: for the requests that change what they find ----
+
+/// Copies a folder, all of it.
+fn copy_all(from: &std::path::Path, to: &std::path::Path) {
+    std::fs::create_dir_all(to).unwrap();
+    for e in std::fs::read_dir(from).unwrap() {
+        let e = e.unwrap();
+        let to = to.join(e.file_name());
+        if e.file_type().unwrap().is_dir() {
+            copy_all(&e.path(), &to);
+        } else {
+            std::fs::copy(e.path(), to).unwrap();
+        }
+    }
+}
+
+/// Two services on copies of one device, set up as `cardinal init` leaves
+/// it: one to be asked by name, one typed. What either is asked, the other
+/// is asked too, so they hold the same; only what each makes since (a
+/// group's id, a message's) differs, which [`Twins::same`] is told.
+struct Twins {
+    old: Arc<Daemon>,
+    new: Arc<Daemon>,
+    /// What the old one made, beside what the new one made in its place.
+    swap: Vec<(Vec<u8>, Vec<u8>)>,
+}
+
+impl Twins {
+    async fn start(dir: &std::path::Path) -> Twins {
+        let (paths, config) = crate::testing::set_up(&dir.join("old"));
+        copy_all(&dir.join("old"), &dir.join("new"));
+        let twin = crate::paths::Paths::at(&dir.join("new"));
+        let new = Daemon::start(twin, config.clone()).await.unwrap();
+        let old = Daemon::start(paths, config).await.unwrap();
+        Twins {
+            old,
+            new,
+            swap: Vec::new(),
+        }
+    }
+
+    /// `old` and `new` are the same, made apart.
+    #[allow(dead_code)]
+    fn alike(&mut self, old: &[u8], new: &[u8]) {
+        assert_eq!(old.len(), new.len());
+        self.swap.push((old.to_vec(), new.to_vec()));
+        let (o, n) = (hex::encode(old), hex::encode(new));
+        self.swap.push((o.into_bytes(), n.into_bytes()));
+    }
+
+    /// The old one's message, its ids as the new one's.
+    fn swapped(&self, mut msg: Vec<u8>) -> Vec<u8> {
+        for (o, n) in &self.swap {
+            let mut i = 0;
+            while i + o.len() <= msg.len() {
+                if msg[i..i + o.len()] == o[..] {
+                    msg[i..i + o.len()].copy_from_slice(n);
+                    i += o.len();
+                } else {
+                    i += 1;
+                }
+            }
+        }
+        msg
+    }
+
+    /// The request, by name to the old one and typed to the new one, is
+    /// answered with the same bytes: the reply typed.
+    async fn same(&self, req: Json) -> Vec<u8> {
+        self.same_as(req.clone(), req).await
+    }
+
+    /// As [`Twins::same`], each its own request: `old` names what the old
+    /// one made, and `new` the new one's.
+    async fn same_as(&self, old: Json, new: Json) -> Vec<u8> {
+        let (_, msg) = encode_request(&old).unwrap();
+        let by_name = self.swapped(crate::control::by_name(&self.old, &msg).await);
+        let (_, msg) = encode_request(&new).unwrap();
+        let typed = crate::control::typed::reply(&self.new, &msg)
+            .await
+            .expect("a typed request");
+        let spec = by_name_or_first(&new);
+        assert_eq!(
+            by_name,
+            typed,
+            "{new}\n by name {}\n typed   {}",
+            render_reply(spec, &by_name),
+            render_reply(spec, &typed)
+        );
+        typed
+    }
+
+    /// A message, not by name, to both: the same bytes back.
+    async fn same_message(&self, msg: &[u8]) -> Vec<u8> {
+        let by_name = crate::control::by_name(&self.old, msg).await;
+        let typed = crate::control::typed::reply(&self.new, msg)
+            .await
+            .expect("a typed request");
+        assert_eq!(by_name, typed);
+        typed
+    }
+}
+
+fn by_name_or_first(req: &Json) -> &'static Request {
+    req.get("cmd")
+        .and_then(Json::as_str)
+        .and_then(super::by_name)
+        .unwrap_or(&REQUESTS[0])
+}
+
+/// What a reply says, typed.
+fn typed_of<A: Ask>(msg: &[u8]) -> A::Reply {
+    read_reply::<A>(msg).unwrap().unwrap()
+}
+
+/// How a reply failed.
+fn failed_of<A: Ask>(msg: &[u8]) -> typed::Failed
+where
+    A::Reply: std::fmt::Debug,
+{
+    read_reply::<A>(msg).unwrap().unwrap_err()
+}
+
 fn files_of(msg: &[u8]) -> FilesReply {
     read_reply::<FilesArgs>(msg).unwrap().unwrap()
 }
@@ -578,4 +701,89 @@ fn frames_events_and_errors_are_the_bytes_they_were() {
     // an id not in hex was left out, `at` with it
     let old = error_reply_with_by_name(4, "w", &json!({"at": 1, "id": "not hex"}));
     assert_eq!(old, error_reply(4, "w"));
+}
+
+/// The requests of the service, this device and the person's devices.
+#[tokio::test]
+async fn this_device_is_answered_the_same() {
+    let dir = tempfile::tempdir().unwrap();
+    let t = Twins::start(dir.path()).await;
+
+    // ---- me ----
+    let r = typed_of::<MeArgs>(&t.same(json!({"cmd": "me"})).await);
+    assert_eq!((r.name.as_str(), r.set), ("Me", true));
+    for name in ["", "  ", "a\nb", "Ann", "  Ann Lee  "] {
+        t.same(json!({"cmd": "me", "name": name})).await;
+    }
+    let r = typed_of::<MeArgs>(&t.same(json!({"cmd": "me"})).await);
+    assert_eq!((r.name.as_str(), r.set), ("Ann Lee", true));
+    let wrong = Record::new().with(0, 10u64).with(1, 5u64).encode();
+    let f = failed_of::<MeArgs>(&t.same_message(&wrong).await);
+    assert_eq!(
+        (f.status, f.why.as_str()),
+        (status::MALFORMED, "me.name should be text")
+    );
+
+    // ---- conditions ----
+    t.same(json!({"cmd": "conditions"})).await;
+    for req in [
+        json!({"cmd": "conditions", "metered": true}),
+        json!({"cmd": "conditions", "plugged_in": true}),
+        json!({"cmd": "conditions", "plugged_in": true, "metered": true}),
+        json!({"cmd": "conditions"}),
+        json!({"cmd": "conditions", "plugged_in": false, "metered": false}),
+        json!({"cmd": "conditions", "plugged_in": true, "metered": false}),
+    ] {
+        t.same(req).await;
+    }
+    let r = typed_of::<ConditionsArgs>(&t.same(json!({"cmd": "conditions"})).await);
+    assert_eq!(
+        (r.plugged_in, r.metered, r.helps),
+        (Some(true), false, true)
+    );
+    let wrong = Record::new().with(0, 6u64).with(1, 2u64).encode();
+    t.same_message(&wrong).await;
+
+    // ---- network-changed and wake ----
+    t.same(json!({"cmd": "network-changed"})).await;
+    t.same(json!({"cmd": "network-changed", "why": "wifi"}))
+        .await;
+    let r = typed_of::<WakeArgs>(&t.same(json!({"cmd": "wake"})).await);
+    assert_eq!(r.checking, 0);
+    t.same_message(&Record::new().with(0, 7u64).with(1, true).encode())
+        .await;
+
+    // ---- device-rename ----
+    let key = t.old.keys.key();
+    assert_eq!(key, t.new.keys.key());
+    let full = format!("{EXACT}{}", hex::encode(key));
+    let short = format!("{EXACT}{}", hex::encode(&key[..8]));
+    for req in [
+        json!({"cmd": "device-rename"}),
+        json!({"cmd": "device-rename", "device": full}),
+        json!({"cmd": "device-rename", "name": "Laptop"}),
+        json!({"cmd": "device-rename", "device": "Nobody", "name": "Laptop"}),
+        json!({"cmd": "device-rename", "device": format!("{EXACT}0011"), "name": "Laptop"}),
+        json!({"cmd": "device-rename", "device": full, "name": ""}),
+        json!({"cmd": "device-rename", "device": full, "name": "a\tb"}),
+        json!({"cmd": "device-rename", "device": full, "name": " Laptop "}),
+        json!({"cmd": "device-rename", "device": short, "name": "Desk"}),
+        json!({"cmd": "device-rename", "device": "desk", "name": "Desk 2"}),
+        json!({"cmd": "device-rename", "device": &hex::encode(key)[..6], "name": "Desk 3"}),
+        json!({"cmd": "device-rename", "device": "", "name": "Desk 4"}),
+    ] {
+        t.same(req).await;
+    }
+    let r = typed_of::<DeviceRenameArgs>(
+        &t.same(json!({"cmd": "device-rename", "device": "Desk 3", "name": "Mine"}))
+            .await,
+    );
+    assert_eq!((r.key, r.name.as_str()), (short_id(&key), "Mine"));
+    // text that begins as an id given as bytes does
+    let nul = Record::new()
+        .with(0, 12u64)
+        .with(1, format!("{EXACT}{}", hex::encode(key)))
+        .with(2, "X")
+        .encode();
+    t.same_message(&nul).await;
 }

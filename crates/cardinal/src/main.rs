@@ -2906,8 +2906,8 @@ async fn client(cmd: Cmd) -> anyhow::Result<()> {
             mount,
         } => init(&paths, name, device_name, yes, on_demand, mount).await,
         Cmd::Me { name } => {
-            let v = call(&paths, json!({"cmd": "me", "name": name})).await?;
-            let shown = printable(v["name"].as_str().unwrap_or(""));
+            let v = ask(&paths, api::MeArgs { name: name.clone() }).await?;
+            let shown = printable(&v.name);
             if name.is_some() {
                 println!("You are \"{shown}\" to the people you invite from now on.");
             } else {
@@ -2937,15 +2937,12 @@ async fn client(cmd: Cmd) -> anyhow::Result<()> {
         }
         Cmd::Speedtest { device, json: raw } => speedtest(&paths, device, raw).await,
         Cmd::RenameDevice { device, name } => {
-            let v = call(
-                &paths,
-                json!({"cmd": "device-rename", "device": device, "name": name}),
-            )
-            .await?;
-            println!(
-                "Renamed {device} to {}.",
-                v["name"].as_str().unwrap_or(&name)
-            );
+            let args = api::DeviceRenameArgs {
+                device: Some(api::typed::Reference::Typed(device.clone())),
+                name: Some(name),
+            };
+            let v = ask(&paths, args).await?;
+            println!("Renamed {device} to {}.", v.name);
             Ok(())
         }
         Cmd::RemoveDevice { who, lost } => {

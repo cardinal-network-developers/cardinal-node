@@ -257,6 +257,32 @@ impl Pages for api::CallArgs {
     fn whole(_: &mut api::CallReply) {}
 }
 
+/// Typed requests answered whole: one page is all of it.
+macro_rules! whole_pages {
+    ($($args:ty),* $(,)?) => {$(
+        impl Pages for $args {
+            fn one_page(&self) -> bool {
+                true
+            }
+            fn next_page(&self, _: &Self::Reply) -> Option<Self> {
+                None
+            }
+            fn join(_: &mut Self::Reply, _: Self::Reply) -> bool {
+                false
+            }
+            fn whole(_: &mut Self::Reply) {}
+        }
+    )*};
+}
+
+whole_pages!(
+    api::ConditionsArgs,
+    api::NetworkChangedArgs,
+    api::MeArgs,
+    api::DeviceRenameArgs,
+    api::WakeArgs,
+);
+
 /// Starts serving the local interface.
 pub fn serve(d: Arc<Daemon>) -> anyhow::Result<tokio::task::JoinHandle<()>> {
     let mut listener = Listener::bind(&d.paths.socket)
@@ -375,6 +401,27 @@ async fn connection(d: Arc<Daemon>, mut r: Reader, mut w: Writer) {
     }
 }
 
+/// The reply the way by name gives to a request's message, as the service
+/// answered it before its request was typed: the handlers typed since are
+/// kept by name for it. Only to show the typed way sends the same bytes,
+/// and to measure the two.
+#[cfg(any(test, feature = "by-name"))]
+#[doc(hidden)]
+pub async fn by_name(d: &Arc<Daemon>, msg: &[u8]) -> Vec<u8> {
+    let (spec, req) = match api::decode_request(msg) {
+        Ok(x) => x,
+        Err(refused) => return api::error_reply(refused.status, &refused.why),
+    };
+    let reply = match handle(d, &req).await.map_err(|e| capitalized(spec.name, e)) {
+        Ok(v) => match api::page(spec, &req, v) {
+            Ok(v) => api::encode_reply(spec, Ok(&v)),
+            Err((st, why, item)) => api::error_reply_with(st, &why, &item),
+        },
+        Err(e) => failed(&e),
+    };
+    checked(spec, reply)
+}
+
 /// A reply that failed, as a message.
 fn failed(e: &anyhow::Error) -> Vec<u8> {
     let st = if e.is::<crate::recovery::NeedsWords>() {
@@ -411,6 +458,10 @@ pub mod typed {
 
     use crate::api::typed::{page_after, page_before, reply_message, Ask, Fields, Unpaged};
     use crate::api::{self, CallArgs, FilesArgs, FilesReply, MessagesArgs, MessagesReply, Request};
+    use crate::api::{
+        Checking, ConditionsArgs, ConditionsReply, DeviceRenameArgs, DeviceRenameReply, MeArgs,
+        MeReply, NetworkChangedArgs, WakeArgs,
+    };
     use crate::daemon::Daemon;
 
     type Answer = fn(&Arc<Daemon>, Record) -> Vec<u8>;
@@ -516,7 +567,94 @@ pub mod typed {
         if let Some(answer) = answers(spec) {
             return Ok(answer(d, r));
         }
+        /// Each typed request answered whole, and its handler, which may
+        /// wait: `async fn(&Arc<Daemon>, Args) -> anyhow::Result<Reply>`.
+        macro_rules! whole {
+            ($($args:ty => $handler:path),* $(,)?) => {
+                $( if spec.n == <$args as Ask>::REQUEST.n {
+                    let answer = run::<$args, _>(d, r, |d, a| async move { $handler(&d, a).await });
+                    return Ok(answer.await);
+                } )*
+            };
+        }
+        whole! {
+            ConditionsArgs => conditions,
+            NetworkChangedArgs => network_changed,
+            MeArgs => me,
+            DeviceRenameArgs => device_rename,
+            WakeArgs => wake,
+        }
         Err(r)
+    }
+
+    /// The reply to `A`'s request `r`, answered whole: its arguments as
+    /// they came, the handler's answer, and the reply's bytes; or the
+    /// message refusing it.
+    async fn run<A: Ask, F>(
+        d: &Arc<Daemon>,
+        r: Record,
+        handler: impl FnOnce(Arc<Daemon>, A) -> F,
+    ) -> Vec<u8>
+    where
+        F: std::future::Future<Output = anyhow::Result<A::Reply>>,
+    {
+        let a = match A::from_request(r) {
+            Ok(a) => a,
+            Err(refused) => return api::error_reply(refused.status, &refused.why),
+        };
+        match handler(d.clone(), a).await {
+            Ok(reply) => reply_message(&reply),
+            Err(e) => super::failed(&super::capitalized(A::REQUEST.name, e)),
+        }
+    }
+
+    /// An argument a request cannot go without, as the handlers by name
+    /// said it was missing.
+    fn needed<T>(v: Option<T>, name: &str) -> anyhow::Result<T> {
+        v.ok_or_else(|| anyhow::anyhow!("missing argument {name}"))
+    }
+
+    // ---- The service, this device, and the person's devices ----
+
+    async fn conditions(d: &Arc<Daemon>, a: ConditionsArgs) -> anyhow::Result<ConditionsReply> {
+        if let Some(plugged_in) = a.plugged_in {
+            let metered = a.metered.unwrap_or(false);
+            d.conditions.tell(crate::conditions::Told {
+                plugged_in,
+                metered,
+            });
+            d.bump();
+        }
+        Ok(d.conditions.reply())
+    }
+
+    async fn network_changed(d: &Arc<Daemon>, a: NetworkChangedArgs) -> anyhow::Result<Checking> {
+        let checking = d.network_changed(a.why.as_deref().unwrap_or("told"));
+        Ok(Checking {
+            checking: checking as u64,
+        })
+    }
+
+    /// The device woke (D86): what a network change does, said by
+    /// whatever sees it wake, as Android does for the app.
+    async fn wake(d: &Arc<Daemon>, _: WakeArgs) -> anyhow::Result<Checking> {
+        let checking = d.network_changed("woke");
+        Ok(Checking {
+            checking: checking as u64,
+        })
+    }
+
+    async fn me(d: &Arc<Daemon>, a: MeArgs) -> anyhow::Result<MeReply> {
+        crate::names::me(d, a.name.as_deref())
+    }
+
+    async fn device_rename(
+        d: &Arc<Daemon>,
+        a: DeviceRenameArgs,
+    ) -> anyhow::Result<DeviceRenameReply> {
+        let device = needed(a.device.as_ref(), "device")?;
+        let name = needed(a.name.as_deref(), "name")?;
+        super::rename_device(d, device.as_ref(), name)
     }
 
     /// The reply to a typed request's message, or `None` for a request not
@@ -602,6 +740,7 @@ fn strings(req: &Value, name: &str) -> Vec<String> {
 
 /// What a client knows of this device's power and network
 /// (`apps.md#the-local-interface`), and what the service makes of it.
+#[cfg(any(test, feature = "by-name"))]
 fn conditions(d: &Arc<Daemon>, req: &Value) -> anyhow::Result<Value> {
     let flag = |name| req.get(name).and_then(|v| v.as_bool());
     if let Some(plugged_in) = flag("plugged_in") {
@@ -720,7 +859,8 @@ async fn handle(d: &Arc<Daemon>, req: &Value) -> anyhow::Result<Value> {
         "hello" => Ok(json!({"api": API, "version": env!("CARGO_PKG_VERSION")})),
         "setup-begin" => setup_begin(d),
         "setup-finish" => setup_finish(d, req),
-        "me" => crate::names::me(d, req.get("name").and_then(|v| v.as_str())),
+        #[cfg(any(test, feature = "by-name"))]
+        "me" => crate::names::me_by_name(d, req.get("name").and_then(|v| v.as_str())),
         "status" => Ok(status(d)),
         // Inspection (`inspect.rs`): the person turns it on, on this
         // device, and only whoever holds the token it gives may look.
@@ -755,12 +895,14 @@ async fn handle(d: &Arc<Daemon>, req: &Value) -> anyhow::Result<Value> {
             reload(d)?;
             Ok(json!({}))
         }
-        "network-changed" => {
-            Ok(d.network_changed(req.get("why").and_then(|v| v.as_str()).unwrap_or("told")))
-        }
+        #[cfg(any(test, feature = "by-name"))]
+        "network-changed" => Ok(json!({
+            "checking": d.network_changed(req.get("why").and_then(|v| v.as_str()).unwrap_or("told"))
+        })),
         // The device woke (D86): what a network change does, said by
         // whatever sees it wake, as Android does for the app.
-        "wake" => Ok(d.network_changed("woke")),
+        #[cfg(any(test, feature = "by-name"))]
+        "wake" => Ok(json!({"checking": d.network_changed("woke")})),
         "flush" => {
             let d2 = d.clone();
             let n = tokio::task::spawn_blocking(move || -> anyhow::Result<usize> {
@@ -819,7 +961,8 @@ async fn handle(d: &Arc<Daemon>, req: &Value) -> anyhow::Result<Value> {
                 crate::pair::type_code(d, code, at, admin, words(req), device.as_deref()).await?;
             Ok(json!({"name": name}))
         }
-        "device-rename" => rename_device(d, arg(req, "device")?, arg(req, "name")?),
+        #[cfg(any(test, feature = "by-name"))]
+        "device-rename" => rename_device_by_name(d, arg(req, "device")?, arg(req, "name")?),
         "remove-device" => {
             let lost = req.get("lost").and_then(|v| v.as_bool()).unwrap_or(false);
             remove_device(d, arg(req, "who")?, words(req), lost).await
@@ -993,6 +1136,7 @@ async fn handle(d: &Arc<Daemon>, req: &Value) -> anyhow::Result<Value> {
         }
         "delete-message" => crate::contacts::delete_message(d, arg(req, "who")?, arg(req, "id")?),
         "react" => crate::contacts::react(d, arg(req, "who")?, arg(req, "id")?, arg(req, "text")?),
+        #[cfg(any(test, feature = "by-name"))]
         "conditions" => conditions(d, req),
         "call-start" if req.get("ring").is_some_and(|r| !r.is_null()) => {
             anyhow::ensure!(
@@ -1924,7 +2068,7 @@ async fn keep_work_of(d: &Arc<Daemon>, key: &[u8; 32]) -> anyhow::Result<()> {
 /// One of this person's devices, typed by its name or the start of its
 /// key, or as bytes by its key (as `devices` gives it, or whole), and what
 /// it is called.
-fn find_device(d: &Daemon, who: &str) -> anyhow::Result<([u8; 32], String)> {
+fn find_device(d: &Daemon, asked: api::Ref) -> anyhow::Result<([u8; 32], String)> {
     let core = d.core();
     let ident = core
         .identity
@@ -1932,9 +2076,11 @@ fn find_device(d: &Daemon, who: &str) -> anyhow::Result<([u8; 32], String)> {
         .ok_or_else(|| anyhow::anyhow!("this device does not belong to anyone"))?;
     let names = core.device_names();
     let st = ident.state();
-    let w = who.trim().to_lowercase();
-    let asked = api::reference(who);
-    let who = api::shown(who);
+    let w = match asked {
+        api::Ref::Typed(t) => t.trim().to_lowercase(),
+        api::Ref::Id(_) => String::new(),
+    };
+    let who = asked.to_string();
     let matches: Vec<[u8; 32]> = st
         .keys
         .keys()
@@ -1967,7 +2113,11 @@ fn find_device(d: &Daemon, who: &str) -> anyhow::Result<([u8; 32], String)> {
 /// person's own devices read and any of them may set. Every node naming the
 /// device is set, should two have been made at once. No two of a person's
 /// devices share a name, since a device is also found by its name.
-fn rename_device(d: &Arc<Daemon>, which: &str, name: &str) -> anyhow::Result<Value> {
+fn rename_device(
+    d: &Arc<Daemon>,
+    which: api::Ref,
+    name: &str,
+) -> anyhow::Result<api::DeviceRenameReply> {
     let name = name.trim();
     anyhow::ensure!(!name.is_empty(), "a name cannot be empty");
     anyhow::ensure!(
@@ -2003,7 +2153,18 @@ fn rename_device(d: &Arc<Daemon>, which: &str, name: &str) -> anyhow::Result<Val
         .map(|n| account::set_field(n, account::DEVICE_NAME, name))
         .collect();
     d.write_and_push(&acc, ops)?;
-    Ok(json!({"name": name, "key": hex::encode(&key[..8])}))
+    Ok(api::DeviceRenameReply {
+        key: api::short_id(&key),
+        name: name.to_owned(),
+    })
+}
+
+/// [`rename_device`] as it answered by name: kept only to show the typed
+/// one sends the same bytes.
+#[cfg(any(test, feature = "by-name"))]
+fn rename_device_by_name(d: &Arc<Daemon>, which: &str, name: &str) -> anyhow::Result<Value> {
+    let r = rename_device(d, api::reference(which), name)?;
+    Ok(json!({"name": r.name, "key": hex::encode(r.key)}))
 }
 
 async fn remove_device(
@@ -2013,7 +2174,7 @@ async fn remove_device(
     lost: bool,
 ) -> anyhow::Result<Value> {
     let me = d.keys.key();
-    let (key, name) = find_device(d, who)?;
+    let (key, name) = find_device(d, api::reference(who))?;
     if key == me {
         anyhow::bail!("this is the device you are using; remove it from another of your devices");
     }

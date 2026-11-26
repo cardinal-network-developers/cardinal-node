@@ -27,13 +27,8 @@ pub mod blocking;
 use cardinal_encoding::{Record, Value};
 use serde_json::{json, Map, Value as Json};
 
-pub use table::{
-    AskedFrame, Attachment, AudioFrame, Call, CallArgs, CallEnded, CallFrames, CallMediaArgs,
-    CallReply, CameraFrame, Changed, Done, ErrorMore, File, FilesArgs, FilesReply, GroupReach,
-    KeyFrame, LevelFrame, Member, Message, MessagesArgs, MessagesReply, OtherFrame, Place,
-    Reaction, ViewportFrame, Voice, WatchArgs,
-};
-pub use table::{Field, Page, Rec, Request, Ty, ERROR_FIELDS, EVENTS, FRAMES, PROGRAM, REQUESTS};
+// The typed records, requests and replies, and the tables' rows.
+pub use table::*;
 
 use crate::transport::MAX_MESSAGE;
 

@@ -759,7 +759,7 @@ impl Daemon {
     /// seconds, and then this device looks again for its own devices and its
     /// contacts', through hosts where it must. Said by whatever sees the
     /// change, since a phone asleep keeps no timers of its own running.
-    pub fn network_changed(self: &Arc<Self>, why: &str) -> serde_json::Value {
+    pub fn network_changed(self: &Arc<Self>, why: &str) -> usize {
         let sessions = self.endpoint.sessions();
         tracing::info!(
             "{why}: checking {} sessions, then looking again",
@@ -799,7 +799,7 @@ impl Daemon {
             d.connect_all().await;
             crate::rendezvous::reach_contacts(d.clone()).await;
         });
-        serde_json::json!({"checking": sessions.len()})
+        sessions.len()
     }
 
     pub fn own_sessions(&self) -> Vec<Session> {
