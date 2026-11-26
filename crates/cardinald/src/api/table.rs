@@ -66,7 +66,7 @@ pub struct Rec {
 /// A request: its number, its name, its arguments and its reply's fields.
 /// The events of `watch` and the frames of `call-media` are written the
 /// same way, with their fields as `args`.
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 pub struct Request {
     pub n: u64,
     pub name: &'static str,
@@ -213,7 +213,7 @@ macro_rules! typed {
     (@munch [$(#[$m:meta])* $name:ident] [$stat:ident $title:literal]
         $s:tt $r:tt $o:tt $l:tt [$($a:tt)*]
     ) => {
-        $crate::typed!(@munch [$(#[$m])* $name] [] $s $r $o $l [$($a)*]);
+        $crate::typed!(@body [$(#[$m])* $name] ($stat.fields) $s $r $o $l);
 
         #[doc = concat!("The *", $title, "* record's row in the tables.")]
         pub static $stat: $crate::api::table::Rec = $crate::api::table::Rec {
@@ -225,38 +225,38 @@ macro_rules! typed {
             const TY: $crate::api::table::Ty = $crate::api::table::Ty::Rec(&$stat);
             const LIST: $crate::api::table::Ty = $crate::api::table::Ty::Recs(&$stat);
             fn encode_into(&self, out: &mut Vec<u8>) {
-                use $crate::api::typed::Fields;
-                $crate::api::typed::record_header(self.present_except(&[]), out);
-                self.encode_fields_except(&[], out);
+                $crate::api::typed::record_into(self, out)
             }
             fn encoded_len(&self) -> usize {
-                $crate::api::typed::Fields::record_len_except(self, &[])
+                $crate::api::typed::record_len(self)
+            }
+            fn measured(&self) -> (usize, bool) {
+                $crate::api::typed::record_measured(self)
             }
             fn check(&self, at: &$crate::api::typed::At) -> Result<(), String> {
-                match $crate::api::typed::Fields::invalid(self, at).into_iter().next() {
-                    Some((_, _, e)) => Err(e),
-                    None => Ok(()),
-                }
+                $crate::api::typed::record_check(self, at)
             }
             fn take(
                 v: cardinal_encoding::Value,
                 at: &$crate::api::typed::At,
             ) -> Result<Self, String> {
-                match v {
-                    cardinal_encoding::Value::Record(r) => {
-                        <$name as $crate::api::typed::Fields>::take_fields(r, at)
-                    }
-                    _ => Err(format!("{at} should be a record")),
-                }
+                $crate::api::typed::record_take(v, at)
             }
         }
     };
-    (@munch [$(#[$m:meta])* $name:ident] []
+    // The arguments or the reply of a request: its rows in a static of
+    // their own, so that every crate that names them names the one.
+    (@munch [$(#[$m:meta])* $name:ident] [] $s:tt $r:tt $o:tt $l:tt [$($a:tt)*]) => {
+        $crate::typed!(@body [$(#[$m])* $name] ({
+            static FIELDS: &[$crate::api::table::Field] = &[ $( $crate::typed!(@row $a) ),* ];
+            FIELDS
+        }) $s $r $o $l);
+    };
+    (@body [$(#[$m:meta])* $name:ident] ($fields:expr)
         [$(($(#[$fm:meta])* $sf:ident : $st:ty))*]
         [$(($rf:ident : $rt:ty))*]
         [$($of:ident)*]
         [$(($ln:literal $lf:ident))*]
-        [$($a:tt)*]
     ) => {
         $(#[$m])*
         #[derive(Clone, Debug, PartialEq)]
@@ -274,56 +274,21 @@ macro_rules! typed {
         }
 
         impl $crate::api::typed::Fields for $name {
-            const FIELDS: &'static [$crate::api::table::Field] = &[
-                $( $crate::typed!(@row $a) ),*
-            ];
+            const FIELDS: &'static [$crate::api::table::Field] = $fields;
 
-            #[allow(unused_mut)]
-            fn present_except(&self, skip: &[u64]) -> u64 {
-                let mut n = 0;
-                $( if $crate::api::typed::Wire::sent(&self.$lf) && !skip.contains(&$ln) {
-                    n += 1;
-                } )*
-                let _ = skip;
-                n
-            }
-
-            fn encode_fields_except(&self, skip: &[u64], out: &mut Vec<u8>) {
-                $( if $crate::api::typed::Wire::sent(&self.$lf) && !skip.contains(&$ln) {
-                    $crate::api::typed::key($ln, out);
-                    $crate::api::typed::Wire::encode_into(&self.$lf, out);
-                } )*
-                let _ = (skip, out);
-            }
-
-            #[allow(unused_mut)]
-            fn fields_len_except(&self, skip: &[u64]) -> usize {
-                let mut n = 0;
-                $( if $crate::api::typed::Wire::sent(&self.$lf) && !skip.contains(&$ln) {
-                    n += $crate::api::typed::key_len($ln)
-                        + $crate::api::typed::Wire::encoded_len(&self.$lf);
-                } )*
-                let _ = skip;
-                n
-            }
-
-            #[allow(unused_mut)]
-            fn invalid(
-                &self,
-                at: &$crate::api::typed::At,
-            ) -> Vec<(u64, &'static str, String)> {
-                let mut out = Vec::new();
-                $( if $crate::api::typed::Wire::sent(&self.$lf) {
-                    let name = $crate::api::typed::field_name(stringify!($lf));
-                    let at = $crate::api::typed::At::Field(at, name);
-                    if let Err(e) = $crate::api::typed::Wire::check(&self.$lf, &at) {
-                        out.push(($ln, name, e));
-                    }
-                } )*
-                let _ = at;
-                // in the order of their names, as the tables by name met them
-                out.sort_by_key(|(_, name, _)| *name);
-                out
+            fn each<V: $crate::api::typed::Visit>(&self, v: &mut V) {
+                $( v.field(
+                    const {
+                        &<$name as $crate::api::typed::Fields>::FIELDS[
+                            $crate::api::typed::index(
+                                <$name as $crate::api::typed::Fields>::FIELDS,
+                                $ln,
+                            )
+                        ]
+                    },
+                    &self.$lf,
+                ); )*
+                let _ = v;
             }
 
             #[allow(unused_mut, unused_variables)]
@@ -332,16 +297,18 @@ macro_rules! typed {
                 at: &$crate::api::typed::At,
             ) -> Result<Self, String> {
                 Ok($name { $(
-                    $lf: {
-                        let at = $crate::api::typed::At::Field(
-                            at,
-                            $crate::api::typed::field_name(stringify!($lf)),
-                        );
-                        match r.remove($ln) {
-                            Some(v) => $crate::api::typed::Wire::take(v, &at)?,
-                            None => $crate::api::typed::Wire::absent(&at)?,
-                        }
-                    },
+                    $lf: $crate::api::typed::take_field(
+                        &mut r,
+                        const {
+                            &<$name as $crate::api::typed::Fields>::FIELDS[
+                                $crate::api::typed::index(
+                                    <$name as $crate::api::typed::Fields>::FIELDS,
+                                    $ln,
+                                )
+                            ]
+                        },
+                        at,
+                    )?,
                 )* })
             }
         }
@@ -378,7 +345,7 @@ macro_rules! asks {
     ($row:ident: $n:literal $name:literal $args:ident -> $reply:ident,
         $how:ident $(unless $unless:ident $(or $or:ident)*)? $(, $($page:tt)*)?) => {
         #[doc = concat!("The row of `", $name, "`, typed.")]
-        pub const $row: Request = Request {
+        pub static $row: Request = Request {
             n: $n,
             name: $name,
             args: <$args as Fields>::FIELDS,
@@ -438,7 +405,7 @@ macro_rules! asks {
                 <$reply as Fields>::FIELDS,
                 stringify!($list),
             );
-            let base = reply.record_len_except(&SKIP);
+            let base = super::typed::record_len_except(&reply, &SKIP);
             match super::typed::page_precut(
                 Self::REQUEST,
                 stringify!($list),
@@ -468,7 +435,7 @@ macro_rules! asks {
                 <$reply as Fields>::FIELDS,
                 stringify!($list),
             );
-            let base = reply.record_len_except(&SKIP);
+            let base = super::typed::record_len_except(&reply, &SKIP);
             match super::typed::page_after(
                 Self::REQUEST,
                 stringify!($list),
@@ -525,7 +492,7 @@ macro_rules! asks {
                 super::typed::number(<$reply as Fields>::FIELDS, "next"),
             ];
             let skip: Vec<u64> = LISTS.iter().chain(&MORE_NEXT).copied().collect();
-            let base = reply.record_len_except(&skip);
+            let base = super::typed::record_len_except(&reply, &skip);
             let mut items = Vec::new();
             reply.$first.lens(stringify!($first), &mut items);
             $(reply.$list.lens(stringify!($list), &mut items);)+
@@ -589,7 +556,7 @@ macro_rules! asks {
                 <$reply as Fields>::FIELDS,
                 stringify!($list),
             );
-            let base = reply.record_len_except(&SKIP);
+            let base = super::typed::record_len_except(&reply, &SKIP);
             match super::typed::page_before(
                 Self::REQUEST,
                 stringify!($list),
@@ -3877,7 +3844,7 @@ typed!(
 macro_rules! program {
     ($row:ident: $n:literal $name:literal -> $reply:ident) => {
         #[doc = concat!("The row of `", $name, "`, typed.")]
-        pub const $row: Request = Request {
+        pub static $row: Request = Request {
             n: $n,
             name: $name,
             args: &[],
@@ -3921,7 +3888,7 @@ pub static ERROR_FIELDS: &[Field] = <ErrorMore as Fields>::FIELDS;
 macro_rules! streams {
     ($row:ident: $n:literal $name:literal $fields:ident) => {
         #[doc = concat!("The row of `", $name, "`, typed.")]
-        pub const $row: Request = Request {
+        pub static $row: Request = Request {
             n: $n,
             name: $name,
             args: <$fields as Fields>::FIELDS,

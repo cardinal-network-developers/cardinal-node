@@ -58,7 +58,23 @@ const MOST_RESERVED: usize = 256;
 
 #[inline]
 pub(crate) fn header(t: u64, n: u64, out: &mut Vec<u8>) {
-    write_varint((n << 3) | t, out);
+    varint((n << 3) | t, out);
+}
+
+/// A varint, as `write_varint` writes it: the one byte of most inline,
+/// the others out of line.
+#[inline]
+fn varint(v: u64, out: &mut Vec<u8>) {
+    if v < 0x80 {
+        out.push(v as u8);
+    } else {
+        long_varint(v, out);
+    }
+}
+
+#[inline(never)]
+fn long_varint(v: u64, out: &mut Vec<u8>) {
+    write_varint(v, out);
 }
 
 #[inline]
@@ -75,7 +91,7 @@ pub fn record_header(n: u64, out: &mut Vec<u8>) {
 /// A field's number, before its value.
 #[inline]
 pub fn key(n: u64, out: &mut Vec<u8>) {
-    write_varint(n, out);
+    varint(n, out);
 }
 
 /// The length of a field's number.
@@ -182,6 +198,13 @@ pub trait Wire: Sized {
     fn encode_into(&self, out: &mut Vec<u8>);
     /// The length of its encoding.
     fn encoded_len(&self) -> usize;
+    /// The length of its encoding, and whether the encoding can hold it
+    /// ([`Wire::check`] passes): both in one pass. A type that overrides
+    /// it answers as its `check` would.
+    #[inline]
+    fn measured(&self) -> (usize, bool) {
+        (self.encoded_len(), self.check(&At::Top("")).is_ok())
+    }
     /// Reads it from what came, taking what it holds.
     fn take(v: Value, at: &At) -> Result<Self, String>;
     /// What it is when its field did not come.
@@ -263,6 +286,10 @@ impl Wire for u64 {
     fn encoded_len(&self) -> usize {
         header_len(*self)
     }
+    #[inline]
+    fn measured(&self) -> (usize, bool) {
+        (header_len(*self), *self < LIMIT)
+    }
     fn take(v: Value, at: &At) -> Result<Self, String> {
         v.as_uint().ok_or_else(|| wrong(at, "an unsigned integer"))
     }
@@ -329,6 +356,13 @@ impl Wire for i64 {
         let v = (*self).clamp(-(LIMIT as i64), LIMIT as i64 - 1);
         header_len(if v >= 0 { v as u64 } else { (-1 - v) as u64 })
     }
+    #[inline]
+    fn measured(&self) -> (usize, bool) {
+        (
+            self.encoded_len(),
+            (-(LIMIT as i64)..LIMIT as i64).contains(self),
+        )
+    }
     fn take(v: Value, at: &At) -> Result<Self, String> {
         v.as_int().ok_or_else(|| wrong(at, "an integer"))
     }
@@ -360,6 +394,12 @@ impl Wire for Kind {
         match self {
             Kind::Number(n) => n.encoded_len(),
             Kind::Named(b) => b.encoded_len(),
+        }
+    }
+    fn measured(&self) -> (usize, bool) {
+        match self {
+            Kind::Number(n) => n.measured(),
+            Kind::Named(b) => b.measured(),
         }
     }
     fn take(v: Value, at: &At) -> Result<Self, String> {
@@ -397,6 +437,12 @@ impl Wire for Scalar {
             Scalar::Text(t) => t.encoded_len(),
         }
     }
+    fn measured(&self) -> (usize, bool) {
+        match self {
+            Scalar::Int(n) => n.measured(),
+            Scalar::Text(t) => t.measured(),
+        }
+    }
     fn take(v: Value, at: &At) -> Result<Self, String> {
         match v {
             Value::Text(t) => Ok(Scalar::Text(t)),
@@ -427,6 +473,10 @@ impl<T: Wire> Wire for Option<T> {
     #[inline]
     fn encoded_len(&self) -> usize {
         self.as_ref().map_or(0, Wire::encoded_len)
+    }
+    #[inline]
+    fn measured(&self) -> (usize, bool) {
+        self.as_ref().map_or((0, true), Wire::measured)
     }
     fn take(v: Value, at: &At) -> Result<Self, String> {
         T::take(v, at).map(Some)
@@ -459,6 +509,15 @@ impl<T: Wire> Wire for Vec<T> {
     fn encoded_len(&self) -> usize {
         header_len(self.len() as u64) + self.iter().map(Wire::encoded_len).sum::<usize>()
     }
+    fn measured(&self) -> (usize, bool) {
+        let (mut len, mut ok) = (header_len(self.len() as u64), true);
+        for x in self {
+            let (l, o) = x.measured();
+            len += l;
+            ok &= o;
+        }
+        (len, ok)
+    }
     fn take(v: Value, at: &At) -> Result<Self, String> {
         let Value::List(items) = v else {
             return Err(wrong(at, "a list"));
@@ -490,6 +549,9 @@ impl<T: Wire> Wire for Box<T> {
     }
     fn encoded_len(&self) -> usize {
         (**self).encoded_len()
+    }
+    fn measured(&self) -> (usize, bool) {
+        (**self).measured()
     }
     fn take(v: Value, at: &At) -> Result<Self, String> {
         T::take(v, at).map(Box::new)
@@ -557,32 +619,242 @@ impl Wire for Reference {
 }
 
 /// The fields of a typed record, as [`typed!`](crate::typed) writes them:
-/// how many are sent, their encoding, and reading them back.
+/// the list of its fields, which the shared code below walks to measure,
+/// check and write them ([`Body`]), and reading them back.
+///
+/// A record's own code is only that list ([`Fields::each`]) and its
+/// reading ([`Fields::take_fields`]), each a call per field; what is done
+/// with a field is written once per field type, in the visitors here,
+/// rather than once per record, which is what keeps the binaries small.
 pub trait Fields: Sized {
     /// Every field, numbered, as the tables give them.
     const FIELDS: &'static [Field];
-    /// How many of its fields are sent, leaving out those numbered in `skip`.
-    fn present_except(&self, skip: &[u64]) -> u64;
-    /// The encodings of its fields, in order, each after its number,
-    /// leaving out those numbered in `skip`.
-    fn encode_fields_except(&self, skip: &[u64], out: &mut Vec<u8>);
-    /// The encodings of all its fields.
-    fn encode_fields(&self, out: &mut Vec<u8>) {
-        self.encode_fields_except(&[], out)
+    /// Shows `v` each field this build has, in the order of their
+    /// numbers, with its row.
+    fn each<V: Visit>(&self, v: &mut V);
+    /// Reads its fields from `r`, taking what they hold; keys this build
+    /// does not know are passed over.
+    fn take_fields(r: Record, at: &At) -> Result<Self, String>;
+}
+
+/// What is done with each field of a record ([`Fields::each`]), given its
+/// row and its value.
+pub trait Visit {
+    fn field<T: Wire>(&mut self, row: &'static Field, v: &T);
+}
+
+/// Counts the fields sent and adds up their encoded lengths, each with
+/// its number.
+struct Measure<'a> {
+    skip: &'a [u64],
+    n: u64,
+    len: usize,
+    /// Whether the encoding can hold every field measured.
+    ok: bool,
+}
+
+/// Whether `n` is one of the fields left out: rarely any are.
+#[inline]
+fn skipped(skip: &[u64], n: u64) -> bool {
+    !skip.is_empty() && listed(skip, n)
+}
+
+#[inline(never)]
+fn listed(skip: &[u64], n: u64) -> bool {
+    skip.contains(&n)
+}
+
+impl Visit for Measure<'_> {
+    #[inline(never)]
+    fn field<T: Wire>(&mut self, row: &'static Field, v: &T) {
+        if v.sent() && !skipped(self.skip, row.n) {
+            let (len, ok) = v.measured();
+            self.n += 1;
+            self.len += key_len(row.n) + len;
+            self.ok &= ok;
+        }
     }
+}
+
+/// Writes the fields sent, each after its number, and counts them.
+struct Encode<'a> {
+    skip: &'a [u64],
+    out: &'a mut Vec<u8>,
+    n: u64,
+}
+
+impl Visit for Encode<'_> {
+    #[inline(never)]
+    fn field<T: Wire>(&mut self, row: &'static Field, v: &T) {
+        if v.sent() && !skipped(self.skip, row.n) {
+            key(row.n, self.out);
+            v.encode_into(self.out);
+            self.n += 1;
+        }
+    }
+}
+
+/// Finds the fields the encoding cannot hold.
+struct Invalid<'a> {
+    at: &'a At<'a>,
+    out: Vec<(u64, &'static str, String)>,
+}
+
+impl Visit for Invalid<'_> {
+    #[inline(never)]
+    fn field<T: Wire>(&mut self, row: &'static Field, v: &T) {
+        if v.sent() {
+            let at = At::Field(self.at, row.name);
+            if let Err(e) = v.check(&at) {
+                self.out.push((row.n, row.name, e));
+            }
+        }
+    }
+}
+
+/// A record's fields seen without its type: what the shared code that
+/// writes a message takes, so that it is written once.
+pub trait Body {
+    /// How many of its fields are sent, leaving out those numbered in
+    /// `skip`; their length, each with its number; and whether the
+    /// encoding can hold them all (whether [`Body::invalid`] finds none).
+    fn measure(&self, skip: &[u64]) -> (u64, usize, bool);
+    /// Writes the encodings of its fields, in order, each after its
+    /// number, leaving out those numbered in `skip`: how many.
+    fn write(&self, skip: &[u64], out: &mut Vec<u8>) -> u64;
     /// Its fields that the encoding cannot hold, each with why, in the
     /// order of their names: none, unless this build has made a mistake.
     fn invalid(&self, at: &At) -> Vec<(u64, &'static str, String)>;
-    /// Their length, leaving out those numbered in `skip`.
-    fn fields_len_except(&self, skip: &[u64]) -> usize;
-    /// Reads its fields from `r`, from key `first` up, taking what they
-    /// hold; keys this build does not know are passed over.
-    fn take_fields(r: Record, at: &At) -> Result<Self, String>;
+}
 
-    /// Its length as a record of its own, leaving out the fields numbered
-    /// in `skip`.
-    fn record_len_except(&self, skip: &[u64]) -> usize {
-        header_len(self.present_except(skip)) + self.fields_len_except(skip)
+impl<R: Fields> Body for R {
+    fn measure(&self, skip: &[u64]) -> (u64, usize, bool) {
+        let mut v = Measure {
+            skip,
+            n: 0,
+            len: 0,
+            ok: true,
+        };
+        self.each(&mut v);
+        (v.n, v.len, v.ok)
+    }
+    fn write(&self, skip: &[u64], out: &mut Vec<u8>) -> u64 {
+        let mut v = Encode { skip, out, n: 0 };
+        self.each(&mut v);
+        v.n
+    }
+    fn invalid(&self, at: &At) -> Vec<(u64, &'static str, String)> {
+        let mut v = Invalid { at, out: Vec::new() };
+        self.each(&mut v);
+        by_name(v.out)
+    }
+}
+
+/// Its length as a record of its own, leaving out the fields numbered in
+/// `skip`.
+pub fn record_len_except(r: &dyn Body, skip: &[u64]) -> usize {
+    let (n, len, _) = r.measure(skip);
+    header_len(n) + len
+}
+
+/// In the order of their names, as the tables by name met them.
+/// Stable, and by hand: there are at most a few, and a sort of the
+/// standard library's is some 15 KB of code.
+fn by_name(mut v: Vec<(u64, &'static str, String)>) -> Vec<(u64, &'static str, String)> {
+    for i in 1..v.len() {
+        let mut j = i;
+        while j > 0 && v[j - 1].1 > v[j].1 {
+            v.swap(j - 1, j);
+            j -= 1;
+        }
+    }
+    v
+}
+
+/// Reads field `row` of a record, taking what it holds: for each
+/// record's [`Fields::take_fields`], once per field type.
+#[inline(never)]
+pub fn take_field<T: Wire>(r: &mut Record, row: &'static Field, at: &At) -> Result<T, String> {
+    let at = At::Field(at, row.name);
+    match r.remove(row.n) {
+        Some(v) => T::take(v, &at),
+        None => T::absent(&at),
+    }
+}
+
+/// The place of the field numbered `n` in `fields`; the build fails
+/// without one.
+pub const fn index(fields: &[Field], n: u64) -> usize {
+    let mut i = 0;
+    while i < fields.len() {
+        if fields[i].n == n {
+            return i;
+        }
+        i += 1;
+    }
+    panic!("a typed record's field has its row")
+}
+
+/// A typed record held in another (`typed!` with a row): its encoding
+/// as a value. The header, which says how many fields follow, is written
+/// once they are: one byte is kept for it, as many as a record of fewer
+/// than 16 fields needs.
+pub fn record_into(r: &dyn Body, out: &mut Vec<u8>) {
+    let at = out.len();
+    out.push(0);
+    let n = r.write(&[], out);
+    header_at(at, n, out);
+}
+
+/// Writes at `at`, where one byte was kept for it, the header of a record
+/// of `n` fields.
+fn header_at(at: usize, n: u64, out: &mut Vec<u8>) {
+    let h = (n << 3) | T_RECORD;
+    if h < 0x80 {
+        out[at] = h as u8;
+        return;
+    }
+    // a varint, as `write_varint` writes it, without a vector for it
+    let (mut b, mut len, mut v) = ([0u8; 10], 0, h);
+    loop {
+        b[len] = (v & 0x7f) as u8;
+        v >>= 7;
+        len += 1;
+        if v == 0 {
+            break;
+        }
+        b[len - 1] |= 0x80;
+    }
+    out.splice(at..at + 1, b[..len].iter().copied());
+}
+
+/// The length of a typed record held in another.
+pub fn record_len(r: &dyn Body) -> usize {
+    let (n, len, _) = r.measure(&[]);
+    header_len(n) + len
+}
+
+/// The length of a typed record held in another, and whether the
+/// encoding can hold it.
+pub fn record_measured(r: &dyn Body) -> (usize, bool) {
+    let (n, len, ok) = r.measure(&[]);
+    (header_len(n) + len, ok)
+}
+
+/// Whether a record held in another can be encoded: its first field
+/// that cannot, with why.
+pub fn record_check(r: &dyn Body, at: &At) -> Result<(), String> {
+    match r.invalid(at).into_iter().next() {
+        Some((_, _, e)) => Err(e),
+        None => Ok(()),
+    }
+}
+
+/// A record held in another, read back.
+pub fn record_take<R: Fields>(v: Value, at: &At) -> Result<R, String> {
+    match v {
+        Value::Record(r) => R::take_fields(r, at),
+        _ => Err(format!("{at} should be a record")),
     }
 }
 
@@ -627,15 +899,7 @@ pub trait Ask: Fields + Clone + Send + Sync + 'static {
     /// It as a message, numbered; or why the encoding cannot hold it, as
     /// the tables by name said.
     fn encode(&self) -> anyhow::Result<Vec<u8>> {
-        if let Some((_, _, e)) = self.invalid(&At::Top(Self::REQUEST.name)).first() {
-            anyhow::bail!("{e}");
-        }
-        let mut out = Vec::with_capacity(16 + self.fields_len_except(&[]));
-        header(T_RECORD, 1 + self.present_except(&[]), &mut out);
-        write_varint(0, &mut out);
-        Self::REQUEST.n.encode_into(&mut out);
-        self.encode_fields(&mut out);
-        Ok(out)
+        request_message(Self::REQUEST, self)
     }
 
     /// Its arguments from a request off the wire, already read as one
@@ -655,18 +919,45 @@ pub trait Streamed: Fields {
     /// A field the encoding cannot hold is this build's mistake: it is
     /// left out, and said.
     fn message(&self) -> Vec<u8> {
-        let invalid = self.invalid(&At::Top(Self::KIND.name));
-        let skip: Vec<u64> = invalid.iter().map(|(n, _, _)| *n).collect();
+        stream_message(Self::KIND, self)
+    }
+}
+
+/// A request as a message, numbered; or why the encoding cannot hold it,
+/// as the tables by name said.
+fn request_message(spec: &Request, args: &dyn Body) -> anyhow::Result<Vec<u8>> {
+    let (n, len, ok) = args.measure(&[]);
+    if !ok {
+        if let Some((_, _, e)) = args.invalid(&At::Top(spec.name)).first() {
+            anyhow::bail!("{e}");
+        }
+    }
+    let mut out = Vec::with_capacity(16 + len);
+    header(T_RECORD, 1 + n, &mut out);
+    write_varint(0, &mut out);
+    spec.n.encode_into(&mut out);
+    args.write(&[], &mut out);
+    Ok(out)
+}
+
+/// A message of a stream: [`Streamed::message`].
+fn stream_message(kind: &Request, m: &dyn Body) -> Vec<u8> {
+    let (mut n, mut len, ok) = m.measure(&[]);
+    let mut skip = Vec::new();
+    if !ok {
+        let invalid = m.invalid(&At::Top(kind.name));
+        skip = invalid.iter().map(|(n, _, _)| *n).collect();
         if let Some((_, _, e)) = invalid.first() {
             tracing::error!("{e}; left out");
         }
-        let mut out = Vec::with_capacity(4 + self.fields_len_except(&skip));
-        header(T_RECORD, 1 + self.present_except(&skip), &mut out);
-        write_varint(0, &mut out);
-        Self::KIND.n.encode_into(&mut out);
-        self.encode_fields_except(&skip, &mut out);
-        out
+        (n, len, _) = m.measure(&skip);
     }
+    let mut out = Vec::with_capacity(4 + len);
+    header(T_RECORD, 1 + n, &mut out);
+    write_varint(0, &mut out);
+    kind.n.encode_into(&mut out);
+    m.write(&skip, &mut out);
+    out
 }
 
 /// A reply that says it was done, with `reply`'s fields: as a message. A
@@ -675,19 +966,29 @@ pub trait Streamed: Fields {
 /// fails, `internal: ...`; elsewhere that field is left out; either way the
 /// service says so in its log.
 pub fn reply_message<R: Fields>(name: &str, reply: &R) -> Vec<u8> {
-    let invalid = reply.invalid(&At::Top(name));
-    let skip: Vec<u64> = invalid.iter().map(|(n, _, _)| *n).collect();
-    if let Some((_, _, e)) = invalid.first() {
-        tracing::error!("reply to {name}: {e}");
-        if cfg!(debug_assertions) {
-            return super::error_reply(status::FAILED, &format!("internal: {e}"));
+    reply_body(name, reply)
+}
+
+/// [`reply_message`], written once.
+fn reply_body(name: &str, reply: &dyn Body) -> Vec<u8> {
+    let (mut n, mut len, ok) = reply.measure(&[]);
+    let mut skip = Vec::new();
+    if !ok {
+        let invalid = reply.invalid(&At::Top(name));
+        skip = invalid.iter().map(|(n, _, _)| *n).collect();
+        if let Some((_, _, e)) = invalid.first() {
+            tracing::error!("reply to {name}: {e}");
+            if cfg!(debug_assertions) {
+                return super::error_reply(status::FAILED, &format!("internal: {e}"));
+            }
         }
+        (n, len, _) = reply.measure(&skip);
     }
-    let mut out = Vec::with_capacity(4 + reply.fields_len_except(&skip));
-    header(T_RECORD, 1 + reply.present_except(&skip), &mut out);
+    let mut out = Vec::with_capacity(4 + len);
+    header(T_RECORD, 1 + n, &mut out);
     write_varint(0, &mut out);
     status::OK.encode_into(&mut out);
-    reply.encode_fields_except(&skip, &mut out);
+    reply.write(&skip, &mut out);
     out
 }
 
@@ -726,6 +1027,17 @@ impl std::error::Error for Unreadable {}
 /// A reply off the wire: what it says, or how it failed. An error is
 /// [`Unreadable`].
 pub fn read_reply<A: Ask>(msg: &[u8]) -> anyhow::Result<Result<A::Reply, Failed>> {
+    match reply_record(msg)? {
+        Ok(r) => A::Reply::take_fields(r, &At::Top(A::REQUEST.name))
+            .map(Ok)
+            .map_err(|e| anyhow::Error::new(Unreadable(e))),
+        Err(failed) => Ok(Err(failed)),
+    }
+}
+
+/// A reply off the wire, read as far as its status: the record of what
+/// it says, without why, or how it failed. An error is [`Unreadable`].
+pub fn reply_record(msg: &[u8]) -> anyhow::Result<Result<Record, Failed>> {
     let unreadable = |e: String| anyhow::Error::new(Unreadable(e));
     let mut r = Record::decode(msg).map_err(|e| unreadable(format!("not one record: {e}")))?;
     let st = r
@@ -750,21 +1062,21 @@ pub fn read_reply<A: Ask>(msg: &[u8]) -> anyhow::Result<Result<A::Reply, Failed>
         }));
     }
     r.remove(WHY);
-    let reply = A::Reply::take_fields(r, &At::Top(A::REQUEST.name)).map_err(unreadable)?;
-    Ok(Ok(reply))
+    Ok(Ok(r))
 }
 
 /// A reply that did not do what was asked: its status, why, and what more
 /// an error says ([`ErrorMore`](super::table::ErrorMore)), as a message.
 pub fn error_message(status: u64, why: &str, more: &super::table::ErrorMore) -> Vec<u8> {
-    let mut out = Vec::with_capacity(8 + why.len() + more.fields_len_except(&[]));
-    header(T_RECORD, 2 + more.present_except(&[]), &mut out);
+    let (n, len, _) = Body::measure(more, &[]);
+    let mut out = Vec::with_capacity(8 + why.len() + len);
+    header(T_RECORD, 2 + n, &mut out);
     write_varint(0, &mut out);
     status.encode_into(&mut out);
     write_varint(WHY, &mut out);
     header(T_TEXT, why.len() as u64, &mut out);
     out.extend_from_slice(why.as_bytes());
-    more.encode_fields(&mut out);
+    Body::write(more, &[], &mut out);
     out
 }
 
@@ -823,25 +1135,17 @@ pub fn page_after<T: Wire>(
     id: impl Fn(&T) -> Option<&[u8]>,
 ) -> Result<Cut, Unpaged> {
     debug_assert_eq!(spec.page, Page::After);
-    let limit = limit.filter(|n| *n > 0).map_or(usize::MAX, |n| n as usize);
     let start = after.unwrap_or(0) as usize;
     let all = items.len();
-    let room = room(spec, base);
-    let (mut used, mut taken) = (0usize, 0usize);
-    for x in items.iter().skip(start) {
-        if taken >= limit {
-            break;
-        }
-        let n = x.encoded_len();
-        if used + n > room {
-            if taken == 0 {
-                return Err(too_large(spec, list, start, n, id(x)));
-            }
-            break;
-        }
-        used += n;
-        taken += 1;
-    }
+    let taken = cut_forward(
+        spec,
+        list,
+        (start, all, start),
+        base,
+        limit,
+        &|i| items[i].encoded_len(),
+        &|i| id(&items[i]),
+    )?;
     items.drain(..start.min(all));
     items.truncate(taken);
     let at = start + taken;
@@ -879,28 +1183,20 @@ pub fn page_precut<T: Wire>(
     id: impl Fn(&T) -> Option<&[u8]>,
 ) -> Result<Cut, Unpaged> {
     debug_assert_eq!(spec.page, Page::After);
-    let limit = limit.filter(|n| *n > 0).map_or(usize::MAX, |n| n as usize);
     let from = from as usize;
     let start = (after.unwrap_or(0) as usize).max(from);
     let len = items.len();
     let all = (total as usize).max(from + len);
-    let room = room(spec, base);
     let skip = start - from;
-    let (mut used, mut taken) = (0usize, 0usize);
-    for x in items.iter().skip(skip) {
-        if taken >= limit {
-            break;
-        }
-        let n = x.encoded_len();
-        if used + n > room {
-            if taken == 0 {
-                return Err(too_large(spec, list, start, n, id(x)));
-            }
-            break;
-        }
-        used += n;
-        taken += 1;
-    }
+    let taken = cut_forward(
+        spec,
+        list,
+        (skip, len, start),
+        base,
+        limit,
+        &|i| items[i].encoded_len(),
+        &|i| id(&items[i]),
+    )?;
     items.drain(..skip.min(len));
     items.truncate(taken);
     let at = start + taken;
@@ -924,26 +1220,82 @@ pub fn page_before<T: Wire>(
     id: impl Fn(&T) -> Option<&[u8]>,
 ) -> Result<bool, Unpaged> {
     debug_assert!(matches!(spec.page, Page::Before { .. }));
+    let taken = cut_back(
+        spec,
+        list,
+        items.len(),
+        base,
+        limit,
+        &|i| items[i].encoded_len(),
+        &|i| id(&items[i]),
+    )?;
+    let left = items.len() - taken;
+    items.drain(..left);
+    Ok(left > 0)
+}
+
+/// How many of the items `first` up to `len` (by their place in the list)
+/// fit in a page, at most `limit`, beside the reply's other fields, whose
+/// length is `base`; or error 4 for the first, at `place` in the answer,
+/// if it does not fit alone. Written once for every list.
+fn cut_forward<'a>(
+    spec: &Request,
+    list: &str,
+    (first, len, place): (usize, usize, usize),
+    base: usize,
+    limit: Option<u64>,
+    len_of: &dyn Fn(usize) -> usize,
+    id_of: &dyn Fn(usize) -> Option<&'a [u8]>,
+) -> Result<usize, Unpaged> {
     let limit = limit.filter(|n| *n > 0).map_or(usize::MAX, |n| n as usize);
     let room = room(spec, base);
     let (mut used, mut taken) = (0usize, 0usize);
-    for x in items.iter().rev() {
+    for i in first..len {
         if taken >= limit {
             break;
         }
-        let n = x.encoded_len();
+        let n = len_of(i);
         if used + n > room {
             if taken == 0 {
-                return Err(too_large(spec, list, items.len() - 1, n, id(x)));
+                return Err(too_large(spec, list, place, n, id_of(i)));
             }
             break;
         }
         used += n;
         taken += 1;
     }
-    let left = items.len() - taken;
-    items.drain(..left);
-    Ok(left > 0)
+    Ok(taken)
+}
+
+/// How many of the `len` items, newest (last) first, fit in a page, as
+/// [`cut_forward`]; error 4 names the newest.
+fn cut_back<'a>(
+    spec: &Request,
+    list: &str,
+    len: usize,
+    base: usize,
+    limit: Option<u64>,
+    len_of: &dyn Fn(usize) -> usize,
+    id_of: &dyn Fn(usize) -> Option<&'a [u8]>,
+) -> Result<usize, Unpaged> {
+    let limit = limit.filter(|n| *n > 0).map_or(usize::MAX, |n| n as usize);
+    let room = room(spec, base);
+    let (mut used, mut taken) = (0usize, 0usize);
+    for i in (0..len).rev() {
+        if taken >= limit {
+            break;
+        }
+        let n = len_of(i);
+        if used + n > room {
+            if taken == 0 {
+                return Err(too_large(spec, list, len - 1, n, id_of(i)));
+            }
+            break;
+        }
+        used += n;
+        taken += 1;
+    }
+    Ok(taken)
 }
 
 /// A list of a reply paged by position through several lists in turn: a
