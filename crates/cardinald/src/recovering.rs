@@ -1601,7 +1601,10 @@ pub async fn stop_waiting(d: &Arc<Daemon>, who: Option<&str>, all: bool) -> anyh
                 .retain(|g| !stopped.iter().any(|s| s.persona == g.persona));
         }
     });
-    tracing::info!("on the person's word, {} guardian(s) no longer waited for", names.len());
+    tracing::info!(
+        "on the person's word, {} guardian(s) no longer waited for",
+        names.len()
+    );
     if !kept(d) {
         drop_kept(d).await;
     }

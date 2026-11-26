@@ -110,9 +110,14 @@ fn guarding(g: &Dev, verb: &str, fp: &str) -> std::process::Output {
 }
 
 /// Whether one of `d`'s sessions is with a device of `who` (as `d` names
-/// them). An error, as for a contact whose log `d` does not hold, is no.
-fn online(d: &Dev, who: &str) -> bool {
-    let r = reply(d, &json!({"cmd": "contact-status", "who": who}));
+/// them), looking for them at `at` too: with discovery off, as here, a
+/// device learns a contact's address from a session or is told it, and
+/// each side is told the other's, so that what is left to find out is
+/// whether they answer. An error, as for a contact whose log `d` does not
+/// hold, is no.
+fn online(d: &Dev, who: &str, at: &Dev) -> bool {
+    let at = format!("127.0.0.1:{}", at.port);
+    let r = reply(d, &json!({"cmd": "contact-status", "who": who, "at": at}));
     r["devices"]
         .as_array()
         .is_some_and(|x| x.iter().any(|x| x["online"] == true))
@@ -217,7 +222,8 @@ fn recovered(s: Scenario) -> After {
     });
     laptop.cli(&["say", "bo", "you guard me now"]);
     wait("bo holds the account", 60, || {
-        bo.cli(&["guarding"]).contains("sealed copy of their account")
+        bo.cli(&["guarding"])
+            .contains("sealed copy of their account")
     });
     // what the laptop wrote has reached them before the loss
     std::thread::sleep(Duration::from_secs(3));
@@ -242,8 +248,9 @@ fn recovered(s: Scenario) -> After {
     let o = new.try_cli(&["recover", "finish"]);
     assert!(o.status.success(), "{}", out(&o));
     assert!(!out(&o).contains("have not heard"), "{}", out(&o));
-    new.wait_mounted();
-    wait("the new device and bo are in touch", 60, || online(&new, "bo"));
+    wait("the new device and bo are in touch", 60, || {
+        online(&new, "bo", &bo)
+    });
     if s.new_host {
         let at = format!("127.0.0.1:{}", new.port);
         new.cli(&["host", "--address", &at]);
@@ -291,8 +298,8 @@ fn watch(a: &After, round: &str, long: Duration) -> Seen {
     let mut seen = Seen::default();
     let began = Instant::now();
     while began.elapsed() < long {
-        seen.new_to_eve |= online(&a.new, "eve");
-        seen.eve_to_ana |= eves.iter().any(|d| online(d, "Ana"));
+        seen.new_to_eve |= eves.iter().any(|d| online(&a.new, "eve", d));
+        seen.eve_to_ana |= eves.iter().any(|d| online(d, "Ana", &a.new));
         seen.to_eve |= eves.iter().any(|d| has_message(d, "Ana", &to_eve));
         seen.from_eve |= has_message(&a.new, "eve", &from_eve);
         if seen.all() {
@@ -310,7 +317,6 @@ fn watch_with_restarts(a: &mut After) -> [Seen; 3] {
     let first = watch(a, "first", WATCH);
     a.new.stop();
     a.new.start();
-    a.new.wait_mounted();
     let second = watch(a, "after the new device restarted", WATCH_AGAIN);
     a.eve.stop();
     a.eve.start();
