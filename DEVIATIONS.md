@@ -2340,8 +2340,10 @@ asks for around that is not built yet.
   - **A request, declared once.** `asks!(ROW: n "name" Args -> Reply,
     how)` gives its row, and `how` is `reads`, `reads unless <field>`,
     `writes`, or `stream` (`watch`, `call-media`, answered by the
-    connection itself); a paged one adds `after <list>` or `before <list>
-    by <id>`. The row holds the request's answering, made from `impl
+    connection itself); a paged one adds `after <list>` (with `by <id>`
+    where its records have one), `after <list>, <list>, ...` for a reply
+    paged through several lists in turn (`groups`), or `before <list> by
+    <id>`. The row holds the request's answering, made from `impl
     Answer for Args` (`control::typed`), so a typed request without a
     handler does not compile; handlers are async. The page's list, `more`
     and `next` are found by their names in the declaration, the page cut by
@@ -2392,7 +2394,11 @@ asks for around that is not built yet.
     admin of <group> can add themselves back"; and `group-member` without
     `shown`, for a member with no node of their own, writes the ref as the
     way by name held it as the name the others see: NUL and hex, for an id
-    given as bytes.
+    given as bytes. One reply differs, only from data this software never
+    writes: a group's last call is noted with its ids in hex, and one not
+    in hex failed `groups` by name in a debug build (and in a release
+    build left the whole list of groups out); typed, that call alone is
+    left out, and logged.
   - **A reply field without a number** is this build's mistake. In a debug
     build, where the tests run, the request then fails; in a release build
     the field is left out and the service logs an error. A field no test

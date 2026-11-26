@@ -326,8 +326,11 @@ macro_rules! typed {
 ///
 /// Every request but a stream is answered by `impl Answer for Args`
 /// (`control::typed`): one declared without it does not compile. A paged
-/// one says how after `how`: `after list` (by position) or `before list
-/// by id` (back from the newest, `next` the `id` of the oldest given);
+/// one says how after `how`: `after list` (by position; `after list by
+/// id` where an item too large names its `id`), `after a, b, c` (by
+/// position through several lists in turn, each a `Vec` or an
+/// `Option<Vec>`, as `groups` is), or `before list by id` (back from the
+/// newest, `next` the `id` of the oldest given);
 /// its arguments then have `after` or `before`, and `limit`, and its
 /// reply the list, `more` and `next`, which the page is cut by.
 macro_rules! asks {
