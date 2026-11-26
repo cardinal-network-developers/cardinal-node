@@ -1965,8 +1965,9 @@ fn names(v: &[String]) -> String {
 
 /// The last call in a group that ended on this device, if any.
 fn tell_last_call(last: Option<&api::CallEnded>) {
-    if let Some(last) = last {
-        let ago = now_secs().saturating_sub(last.at / 1000);
+    // a service of v0.1.27 says no time: as by name, nothing is said
+    if let Some((last, at)) = last.and_then(|l| Some((l, l.at?))) {
+        let ago = now_secs().saturating_sub(at / 1000);
         println!(
             "    Last call: {}, {} ago.",
             last.how.replace('_', " "),
@@ -3319,7 +3320,7 @@ async fn client(cmd: Cmd) -> anyhow::Result<()> {
                 println!("account, so this device starts with an empty one.");
             }
             print_pair_again(&v.pair_again);
-            print_not_heard(&v.not_heard);
+            print_not_heard(v.not_heard.as_deref().unwrap_or_default());
             let lost: Vec<&api::LostDevice> = v
                 .lost_devices
                 .iter()

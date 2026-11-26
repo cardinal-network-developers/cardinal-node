@@ -280,7 +280,7 @@ fn finished(d: &Daemon, call: &Call, how: Ending) {
         name: call.name.clone(),
         group: call.group.then_some(call.space),
         how: how.name().into(),
-        at,
+        at: Some(at),
     };
     *d.call_ended.lock().unwrap_or_else(|e| e.into_inner()) = Some(ended);
     // A group's last call, kept on this device for itself (D92).

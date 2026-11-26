@@ -843,7 +843,8 @@ typed!(
         3 id: [u8; 16],
         4 name: String,
         5 who: [u8; 8],
-        6 at: u64,
+        /// Added after v0.1.27: an `Option` for ever, though always sent.
+        6 at: Option<u64>,
     }
 );
 typed!(
@@ -2805,7 +2806,8 @@ typed!(fields RecoverFinishReply {
     3 lost_devices: Vec<LostDevice>,
     4 pair_again: Vec<PairAgain>,
     5 words: String,
-    6 not_heard: Vec<String>,
+    /// Added after v0.1.27: an `Option` for ever, though always sent.
+    6 not_heard: Option<Vec<String>>,
 });
 asks!(RECOVER_FINISH: 168 "recover-finish" RecoverFinishArgs -> RecoverFinishReply, writes);
 

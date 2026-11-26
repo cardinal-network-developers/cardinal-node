@@ -406,7 +406,7 @@ async fn typed_replies_are_the_bytes_they_were_by_name() {
         id: [1; 16],
         name: "Kin".into(),
         who: [2; 8],
-        at: 1_790_000_000_000,
+        at: Some(1_790_000_000_000),
     });
     same(&d, json!({"cmd": "call"})).await;
     *d.call_ended.lock().unwrap() = Some(CallEnded {
@@ -415,7 +415,7 @@ async fn typed_replies_are_the_bytes_they_were_by_name() {
         id: [3; 16],
         name: "Ann".into(),
         who: [4; 8],
-        at: 5,
+        at: Some(5),
     });
     let msg = same(&d, json!({"cmd": "call"})).await;
     let r = read_reply::<CallArgs>(&msg).unwrap().unwrap();

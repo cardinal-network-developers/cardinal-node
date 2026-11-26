@@ -1044,7 +1044,7 @@ pub async fn finish(
         account: back,
         pair_again: pair_again_of(d, &pair_again),
         lost_devices: set_aside,
-        not_heard: not_heard_of(d, &r),
+        not_heard: Some(not_heard_of(d, &r)),
     })
 }
 

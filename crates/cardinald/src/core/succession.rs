@@ -487,7 +487,7 @@ impl Core {
             id,
             name: c.name.clone(),
             who,
-            at: c.at,
+            at: Some(c.at),
         })
     }
 
