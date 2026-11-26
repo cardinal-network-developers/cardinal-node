@@ -1956,6 +1956,31 @@ async fn groups_are_changed_the_same() {
     t.same_as(by_id(&other[0]), by_id(&other[1])).await;
     t.same(json!({"cmd": "group-join", "group": "Other"})).await;
 
+    // ---- group-members: a listing, compared beside too wherever asked ----
+    for req in [
+        json!({"cmd": "group-members"}),
+        json!({"cmd": "group-members", "group": "Nobody"}),
+        json!({"cmd": "group-members", "group": "Mine"}),
+        json!({"cmd": "group-members", "group": "Theirs"}),
+        json!({"cmd": "group-members", "group": "Club"}),
+        json!({"cmd": "group-members", "group": "Club", "limit": 1}),
+        json!({"cmd": "group-members", "group": "Club", "after": 1, "limit": 1}),
+        json!({"cmd": "group-members", "group": "Club", "after": 9}),
+        json!({"cmd": "group-members", "group": "Lone", "limit": 0}),
+    ] {
+        t.same(req).await;
+    }
+    t.same_as(
+        json!({"cmd": "group-members", "group": exact(&club[0])}),
+        json!({"cmd": "group-members", "group": exact(&club[1])}),
+    )
+    .await;
+    let r = typed_of::<GroupMembersArgs>(
+        &t.same(json!({"cmd": "group-members", "group": "Theirs"}))
+            .await,
+    );
+    assert!(r.members.iter().any(|m| m.taken_out == Some(true)), "{r:?}");
+
     // ---- group-leave and group-rejoin ----
     for req in [
         json!({"cmd": "group-leave"}),

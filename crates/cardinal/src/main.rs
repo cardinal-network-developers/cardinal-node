@@ -1450,6 +1450,14 @@ async fn call(paths: &Paths, req: Value) -> anyhow::Result<Value> {
     }
 }
 
+/// A host that could not be reached to share with a group: it will be.
+fn host_waits(group: &str) {
+    println!(
+        "Your host cannot be reached right now. It will be shared with {} when it can.",
+        printable(group)
+    );
+}
+
 /// A path as the service is given it: text, or refused.
 fn utf8(p: &std::path::Path) -> anyhow::Result<String> {
     p.to_str()
@@ -1826,18 +1834,18 @@ fn old_line(old: &Value) -> Option<String> {
 }
 
 /// What `group members` says of how a member is reached (D89).
-fn reach_said(m: &Value) -> String {
-    let back = if m["reaches_you"] == false {
+fn reach_said(m: &api::Member) -> String {
+    let back = if m.reaches_you == Some(false) {
         ", cannot reach you"
     } else {
         ""
     };
-    match m["reach"].as_str() {
+    match m.reach.as_deref() {
         Some("contact") => format!("  reached directly{back}"),
         Some("host") => format!("  reached through their host{back}"),
         Some("through") => format!(
             "  reached through {}{back}",
-            printable(m["through"].as_str().unwrap_or("someone"))
+            printable(m.through.as_deref().unwrap_or("someone"))
         ),
         Some("none") => format!("  not reachable: nobody in the group connects you{back}"),
         _ => String::new(),
@@ -1846,16 +1854,16 @@ fn reach_said(m: &Value) -> String {
 
 /// What a group's conversation says of members nothing connects this
 /// person with (D89): silence would be wrong.
-fn no_route_lines(members: &Value) -> Vec<String> {
-    let name = printable(members["name"].as_str().unwrap_or(""));
+fn no_route_lines(members: &api::GroupMembersReply) -> Vec<String> {
+    let name = printable(&members.name);
     let mut out = Vec::new();
-    for m in members["members"].as_array().into_iter().flatten() {
-        let who = printable(m["name"].as_str().unwrap_or(""));
-        if m["reach"] == "none" {
+    for m in &members.members {
+        let who = printable(&m.name);
+        if m.reach.as_deref() == Some("none") {
             out.push(format!(
                 "You can't reach {who} right now: nobody in {name} connects you."
             ));
-        } else if m["reaches_you"] == false {
+        } else if m.reaches_you == Some(false) {
             out.push(format!(
                 "{who} can't reach you right now: nobody in {name} connects you."
             ));
@@ -3944,7 +3952,14 @@ async fn client(cmd: Cmd) -> anyhow::Result<()> {
             };
             let v = ask(&paths, args).await?;
             // whom nothing carries what this person writes to (D89)
-            let them = call(&paths, json!({"cmd": "group-members", "group": group})).await?;
+            let them = ask(
+                &paths,
+                api::GroupMembersArgs {
+                    group: Some(api::typed::Reference::Typed(group.clone())),
+                    ..api::GroupMembersArgs::new()
+                },
+            )
+            .await?;
             for line in no_route_lines(&them) {
                 println!("{line}");
             }
@@ -3959,24 +3974,31 @@ async fn client(cmd: Cmd) -> anyhow::Result<()> {
             Ok(())
         }
         Cmd::Group { cmd } => {
-            let req = match &cmd {
+            let r = |t: &String| api::typed::Reference::Typed(t.clone());
+            let rs = |ts: &Vec<String>| Some(ts.iter().map(r).collect::<Vec<_>>());
+            match &cmd {
                 GroupCmd::Create {
                     name,
                     people,
                     for_call,
                     no_history,
                 } => {
-                    let mut req = json!({"cmd": "group-create", "name": name, "people": people});
-                    if *for_call {
-                        req["for_call"] = json!(true);
-                    }
-                    if *no_history {
-                        req["history"] = json!(false);
-                    }
-                    req
+                    let args = api::GroupCreateArgs {
+                        name: Some(name.clone()),
+                        people: rs(people),
+                        for_call: for_call.then_some(true),
+                        history: no_history.then_some(false),
+                    };
+                    let v = ask(&paths, args).await?;
+                    println!("Made {}: {}", printable(&v.name), hex::encode(v.group));
                 }
                 GroupCmd::Keep { group } => {
-                    json!({"cmd": "group-set", "group": group, "for_call": false})
+                    let args = api::GroupSetArgs {
+                        group: Some(r(group)),
+                        for_call: Some(false),
+                        ..api::GroupSetArgs::new()
+                    };
+                    ask(&paths, args).await?;
                 }
                 GroupCmd::Join {
                     group,
@@ -3988,7 +4010,14 @@ async fn client(cmd: Cmd) -> anyhow::Result<()> {
                         (_, true) => Some(false),
                         _ => None,
                     };
-                    json!({"cmd": "group-join", "group": group, "reach": reach})
+                    let args = api::GroupJoinArgs {
+                        group: Some(r(group)),
+                        reach,
+                    };
+                    let v = ask(&paths, args).await?;
+                    if v.waiting == Some(true) {
+                        host_waits(group);
+                    }
                 }
                 GroupCmd::Reach {
                     group,
@@ -4004,44 +4033,102 @@ async fn client(cmd: Cmd) -> anyhow::Result<()> {
                         !(share && host.is_some()),
                         "`--host` goes with keep: share names every host of yours"
                     );
-                    let mut req = json!({"cmd": "group-reach", "group": group, "share": share});
-                    if let Some(h) = host {
-                        req["host"] = json!(h);
+                    let args = api::GroupReachArgs {
+                        group: Some(r(group)),
+                        share: Some(share),
+                        host: host.clone(),
+                    };
+                    let v = ask(&paths, args).await?;
+                    if v.waiting == Some(true) {
+                        host_waits(group);
                     }
-                    req
                 }
-                GroupCmd::Decline { group } => json!({"cmd": "group-decline", "group": group}),
+                GroupCmd::Decline { group } => {
+                    let args = api::GroupDeclineArgs {
+                        group: Some(r(group)),
+                    };
+                    ask(&paths, args).await?;
+                }
                 GroupCmd::Leave {
                     group,
                     admins,
                     anyway,
                 } => {
-                    json!({"cmd": "group-leave", "group": group, "admins": admins, "anyway": anyway})
+                    let args = api::GroupLeaveArgs {
+                        group: Some(r(group)),
+                        admins: rs(admins),
+                        anyway: Some(*anyway),
+                    };
+                    let v = ask(&paths, args).await?;
+                    let made: Vec<String> = v.admins.iter().map(|a| printable(a)).collect();
+                    if !made.is_empty() {
+                        println!("{} look after {} now.", made.join(", "), printable(group));
+                    }
                 }
-                GroupCmd::Rejoin { group } => json!({"cmd": "group-rejoin", "group": group}),
+                GroupCmd::Rejoin { group } => {
+                    let args = api::GroupRejoinArgs {
+                        group: Some(r(group)),
+                    };
+                    let v = ask(&paths, args).await?;
+                    println!("You are back in {}.", printable(&v.name));
+                }
                 GroupCmd::Add {
                     group,
                     people,
                     shown,
                 } => {
-                    json!({"cmd": "group-add", "group": group, "people": people, "shown": shown})
+                    let args = api::GroupAddArgs {
+                        group: Some(r(group)),
+                        people: rs(people),
+                        shown: shown.clone(),
+                    };
+                    ask(&paths, args).await?;
                 }
                 GroupCmd::Remove { group, who } => {
-                    json!({"cmd": "group-remove", "group": group, "who": who})
+                    let args = api::GroupRemoveArgs {
+                        group: Some(r(group)),
+                        who: Some(r(who)),
+                    };
+                    ask(&paths, args).await?;
                 }
                 GroupCmd::Role { group, who, role } => {
-                    json!({"cmd": "group-role", "group": group, "who": who, "role": role})
+                    let args = api::GroupRoleArgs {
+                        group: Some(r(group)),
+                        who: Some(r(who)),
+                        role: Some(role.clone()),
+                    };
+                    ask(&paths, args).await?;
                 }
                 GroupCmd::PostAgain { group } => {
-                    json!({"cmd": "group-post-again", "group": group})
+                    call(&paths, json!({"cmd": "group-post-again", "group": group})).await?;
                 }
-                GroupCmd::Members { group } => json!({"cmd": "group-members", "group": group}),
+                GroupCmd::Members { group } => {
+                    let args = api::GroupMembersArgs {
+                        group: Some(r(group)),
+                        ..api::GroupMembersArgs::new()
+                    };
+                    let v = ask(&paths, args).await?;
+                    for m in &v.members {
+                        let left = if m.left { ", left" } else { "" };
+                        println!("{}  {}{left}{}", printable(&m.name), m.role, reach_said(m));
+                    }
+                }
                 GroupCmd::Say { group, text } => {
-                    json!({"cmd": "say", "group": group, "text": text})
+                    let args = api::SayArgs {
+                        group: Some(r(group)),
+                        text: Some(text.clone()),
+                        ..api::SayArgs::new()
+                    };
+                    ask(&paths, args).await?;
                 }
                 GroupCmd::Messages { .. } => unreachable!("asked typed above"),
                 GroupCmd::Rename { group, name } => {
-                    json!({"cmd": "group-set", "group": group, "name": name})
+                    let args = api::GroupSetArgs {
+                        group: Some(r(group)),
+                        name: Some(name.clone()),
+                        ..api::GroupSetArgs::new()
+                    };
+                    ask(&paths, args).await?;
                 }
                 GroupCmd::Introductions { group, setting } => {
                     let on = match setting.as_str() {
@@ -4049,7 +4136,12 @@ async fn client(cmd: Cmd) -> anyhow::Result<()> {
                         "off" => false,
                         _ => anyhow::bail!("say on or off"),
                     };
-                    json!({"cmd": "group-set", "group": group, "introductions": on})
+                    let args = api::GroupSetArgs {
+                        group: Some(r(group)),
+                        introductions: Some(on),
+                        ..api::GroupSetArgs::new()
+                    };
+                    ask(&paths, args).await?;
                 }
                 GroupCmd::Member {
                     group,
@@ -4063,52 +4155,14 @@ async fn client(cmd: Cmd) -> anyhow::Result<()> {
                         (_, true) => Some(true),
                         _ => None,
                     };
-                    json!({"cmd": "group-member", "group": group, "who": who, "shown": shown, "introduce": introduce})
+                    let args = api::GroupMemberArgs {
+                        group: Some(r(group)),
+                        who: Some(r(who)),
+                        shown: shown.clone(),
+                        introduce,
+                    };
+                    ask(&paths, args).await?;
                 }
-            };
-            let v = call(&paths, req).await?;
-            match cmd {
-                GroupCmd::Create { .. } => println!(
-                    "Made {}: {}",
-                    printable(v["name"].as_str().unwrap_or("")),
-                    v["group"].as_str().unwrap_or("")
-                ),
-                GroupCmd::Members { .. } => {
-                    for m in v["members"].as_array().into_iter().flatten() {
-                        let left = if m["left"] == true { ", left" } else { "" };
-                        println!(
-                            "{}  {}{left}{}",
-                            printable(m["name"].as_str().unwrap_or("")),
-                            m["role"].as_str().unwrap_or(""),
-                            reach_said(m)
-                        );
-                    }
-                }
-                GroupCmd::Leave { group, .. } => {
-                    let made: Vec<String> = v["admins"]
-                        .as_array()
-                        .into_iter()
-                        .flatten()
-                        .filter_map(|a| a.as_str().map(printable))
-                        .collect();
-                    if !made.is_empty() {
-                        println!("{} look after {} now.", made.join(", "), printable(&group));
-                    }
-                }
-                GroupCmd::Rejoin { .. } => println!(
-                    "You are back in {}.",
-                    printable(v["name"].as_str().unwrap_or(""))
-                ),
-                GroupCmd::Join { group, .. } | GroupCmd::Reach { group, .. }
-                    if v["waiting"] == true =>
-                {
-                    println!(
-                        "Your host cannot be reached right now. It will be shared with {} when \
-                         it can.",
-                        printable(&group)
-                    );
-                }
-                _ => {}
             }
             Ok(())
         }

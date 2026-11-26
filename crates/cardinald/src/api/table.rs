@@ -418,6 +418,56 @@ macro_rules! asks {
             (all.more, all.next) = (false, None);
         }
     };
+    (@paging $args:ident $reply:ident after $first:ident, $($list:ident),+) => {
+        fn reply_bytes(&self, mut reply: $reply) -> Vec<u8> {
+            use super::typed::PagedList;
+            // beside the reply's other fields: without its lists, `more`, `next`
+            const LISTS: &[u64] = &[
+                super::typed::number(<$reply as Fields>::FIELDS, stringify!($first)),
+                $(super::typed::number(<$reply as Fields>::FIELDS, stringify!($list)),)+
+            ];
+            const MORE_NEXT: [u64; 2] = [
+                super::typed::number(<$reply as Fields>::FIELDS, "more"),
+                super::typed::number(<$reply as Fields>::FIELDS, "next"),
+            ];
+            let skip: Vec<u64> = LISTS.iter().chain(&MORE_NEXT).copied().collect();
+            let base = reply.record_len_except(&skip);
+            let mut items = Vec::new();
+            reply.$first.lens(stringify!($first), &mut items);
+            $(reply.$list.lens(stringify!($list), &mut items);)+
+            match super::typed::cut_after(Self::REQUEST, &items, base, self.after, self.limit) {
+                Ok((start, taken, cut)) => {
+                    let mut at = 0;
+                    reply.$first.keep(&mut at, start, taken);
+                    $(reply.$list.keep(&mut at, start, taken);)+
+                    reply.more = cut.more;
+                    reply.next = cut.next;
+                    super::typed::reply_message(Self::REQUEST.name, &reply)
+                }
+                Err(super::typed::Unpaged(msg)) => msg,
+            }
+        }
+        fn one_page(&self) -> bool {
+            self.after.is_some() || self.limit.is_some()
+        }
+        fn next_page(&self, had: &$reply) -> Option<Self> {
+            let next = had.next.filter(|_| had.more)?;
+            Some($args {
+                after: Some(next),
+                ..self.clone()
+            })
+        }
+        fn join(all: &mut $reply, page: $reply) -> bool {
+            use super::typed::PagedList;
+            let mut grew = all.$first.extend_with(page.$first);
+            $(grew |= all.$list.extend_with(page.$list);)+
+            (all.more, all.next) = (page.more, page.next);
+            grew
+        }
+        fn whole(all: &mut $reply) {
+            (all.more, all.next) = (false, None);
+        }
+    };
     (@paging $args:ident $reply:ident before $list:ident by $id:ident) => {
         fn reply_bytes(&self, mut reply: $reply) -> Vec<u8> {
             const SKIP: [u64; 3] = super::typed::paged_numbers(
@@ -1439,6 +1489,19 @@ typed!(
     }
 );
 asks!(GROUP_REMOVE: 77 "group-remove" GroupRemoveArgs -> GroupRemoveReply, writes);
+typed!(fields GroupMembersArgs {
+    1 group: Option<Reference>,
+    2 after: Option<u64>,
+    3 limit: Option<u64>,
+});
+typed!(fields GroupMembersReply {
+    2 group: [u8; 32],
+    3 members: Vec<Member>,
+    4 name: String,
+    5 more: bool,
+    6 next: Option<u64>,
+});
+asks!(GROUP_MEMBERS: 78 "group-members" GroupMembersArgs -> GroupMembersReply, reads, after members by id);
 typed!(fields GroupSetArgs {
     1 group: Option<Reference>,
     2 name: Option<String>,
@@ -1704,8 +1767,7 @@ pub static REQUESTS: &[Request] = &[
     GROUP_REACH_SET,
     GROUP_ADD,
     GROUP_REMOVE,
-    paged!(after 78 "group-members" (1 "group" REF, 2 "after" U, 3 "limit" U) -> (
-        2 "group" B, 3 "members" [MEMBER], 4 "name" T, 5 "more" BOOL, 6 "next" U)),
+    GROUP_MEMBERS,
     GROUP_SET,
     GROUP_MEMBER,
     req!(81 "group-connect" (1 "group" REF, 2 "who" REF, 3 "note" T) -> (2 "asked" BOOL)),

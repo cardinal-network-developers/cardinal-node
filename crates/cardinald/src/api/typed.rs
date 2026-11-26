@@ -107,7 +107,8 @@ pub const fn paged_numbers(fields: &[Field], list: &str) -> [u64; 3] {
     ]
 }
 
-const fn number(fields: &[Field], name: &str) -> u64 {
+/// The number of the field called `name`; the build fails without one.
+pub const fn number(fields: &[Field], name: &str) -> u64 {
     let mut i = 0;
     while i < fields.len() {
         let (a, b) = (fields[i].name.as_bytes(), name.as_bytes());
@@ -854,4 +855,106 @@ pub fn page_before<T: Wire>(
     let left = items.len() - taken;
     items.drain(..left);
     Ok(left > 0)
+}
+
+/// A list of a reply paged by position through several lists in turn: a
+/// list always sent, or one sent only when it is `Some`.
+pub trait PagedList {
+    /// Each item's encoded length, in order, after those of the lists
+    /// before, each with its list's name.
+    fn lens(&self, name: &'static str, out: &mut Vec<(&'static str, usize)>);
+    /// Keeps of it what falls in the page: the items `start` to `start +
+    /// taken` of all the lists together, where this one's begin at `at`,
+    /// which is moved past it.
+    fn keep(&mut self, at: &mut usize, start: usize, taken: usize);
+    /// Adds a page's items after its own; whether there were any.
+    fn extend_with(&mut self, page: Self) -> bool;
+}
+
+impl<T: Wire> PagedList for Vec<T> {
+    fn lens(&self, name: &'static str, out: &mut Vec<(&'static str, usize)>) {
+        out.extend(self.iter().map(|x| (name, x.encoded_len())));
+    }
+    fn keep(&mut self, at: &mut usize, start: usize, taken: usize) {
+        let (from, len) = (*at, self.len());
+        *at += len;
+        let lo = start.clamp(from, from + len) - from;
+        let hi = (start + taken).clamp(from, from + len) - from;
+        self.truncate(hi);
+        self.drain(..lo);
+    }
+    fn extend_with(&mut self, page: Self) -> bool {
+        let grew = !page.is_empty();
+        self.extend(page);
+        grew
+    }
+}
+
+impl<T: Wire> PagedList for Option<Vec<T>> {
+    fn lens(&self, name: &'static str, out: &mut Vec<(&'static str, usize)>) {
+        if let Some(v) = self {
+            v.lens(name, out);
+        }
+    }
+    fn keep(&mut self, at: &mut usize, start: usize, taken: usize) {
+        if let Some(v) = self {
+            v.keep(at, start, taken);
+        }
+    }
+    fn extend_with(&mut self, page: Self) -> bool {
+        match (self.as_mut(), page) {
+            (_, None) => false,
+            (Some(v), Some(p)) => v.extend_with(p),
+            (None, Some(p)) => {
+                let grew = !p.is_empty();
+                *self = Some(p);
+                grew
+            }
+        }
+    }
+}
+
+/// Cuts a reply paged by position through several lists in turn, as the
+/// old pager did (`api::page`): `items` are every item's list and length,
+/// the lists one after another in the order of their numbers; from
+/// `after` on, at most `limit` of them, and as many as fit beside the
+/// reply's other fields, whose length is `base`. The page is the items
+/// from the first returned, as many as the second; an item too large for
+/// a message alone is error 4, which says which by its place.
+pub fn cut_after(
+    spec: &Request,
+    items: &[(&'static str, usize)],
+    base: usize,
+    after: Option<u64>,
+    limit: Option<u64>,
+) -> Result<(usize, usize, Cut), Unpaged> {
+    debug_assert_eq!(spec.page, Page::After);
+    let limit = limit.filter(|n| *n > 0).map_or(usize::MAX, |n| n as usize);
+    let start = after.unwrap_or(0) as usize;
+    let all = items.len();
+    let room = room(spec, base);
+    let (mut used, mut taken) = (0usize, 0usize);
+    for (list, n) in items.iter().skip(start) {
+        if taken >= limit {
+            break;
+        }
+        if used + n > room {
+            if taken == 0 {
+                return Err(too_large(spec, list, start, *n, None));
+            }
+            break;
+        }
+        used += n;
+        taken += 1;
+    }
+    let at = start + taken;
+    let more = at < all;
+    Ok((
+        start,
+        taken,
+        Cut {
+            more,
+            next: more.then_some(at as u64),
+        },
+    ))
 }

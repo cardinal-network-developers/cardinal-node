@@ -1554,9 +1554,10 @@ pub fn list_of(core: &Core) -> Json {
     json!({"groups": groups, "offers": offered, "rejoin": rejoin})
 }
 
-/// Who is in a group, as the others see them.
-pub fn members(d: &Daemon, group: &str) -> anyhow::Result<Json> {
-    let g = find(d, group)?;
+/// Who is in a group, as this person sees them, and whoever was taken out
+/// of it: all of them, which the request's page is cut from.
+pub fn members(d: &Daemon, group: Ref<'_>) -> anyhow::Result<api::GroupMembersReply> {
+    let g = find_among(d, group, false)?;
     let me = identity(d)?;
     let core = d.core();
     let sp = core.spaces.get(&g.id).and_then(|h| h.space.as_ref());
@@ -1564,13 +1565,13 @@ pub fn members(d: &Daemon, group: &str) -> anyhow::Result<Json> {
     let members = group::members(sp);
     let contacts = core.contacts();
     let seen = Seen::of(&core, sp, &me);
-    let out: Vec<Json> = members
+    let mut out: Vec<api::Member> = members
         .iter()
         .map(|m| {
             let known = contacts
                 .iter()
                 .find(|c| c.identity == m.identity && !c.refused);
-            let mut v = member_fields(&me, &contacts, &members, m);
+            let mut v = member_of(&me, &contacts, &members, m);
             // what carries what this person writes to them, and theirs back
             // (D89): for someone in it who has joined, not this person
             if seen.others.contains(&m.identity) {
@@ -1580,31 +1581,41 @@ pub fn members(d: &Daemon, group: &str) -> anyhow::Result<Json> {
                     Way::Through(t) => ("through", Some(name_of(&me, &contacts, &members, &t))),
                     Way::None => ("none", None),
                 };
-                v["reach"] = json!(reach);
-                v["through"] = json!(through);
-                v["reaches_you"] = json!(seen.reaches_me(&m.identity));
+                v.reach = Some(reach.to_owned());
+                v.through = through;
+                v.reaches_you = Some(seen.reaches_me(&m.identity));
             }
-            shown_as_contact(d, &me, &contacts, &members, known, &m.identity, v)
+            known_as_contact(d, &me, &contacts, &members, known, v)
         })
         .collect();
     // and whoever was taken out when it moved, marked: by the name the
     // others saw
     let named = named_in(sp);
-    let mut out = out;
     for m in group::taken_out(sp) {
-        out.push(json!({
-            "name": name_of(&me, &contacts, &named, &m.identity),
-            "shown": m.name,
-            "id": hex::encode(&m.identity[..8]),
-            "you": m.identity == me,
-            "contact": contacts.iter().any(|c| c.identity == m.identity && !c.refused),
-            "role": "taken out",
-            "taken_out": true,
-            "introduce": false,
-            "left": false,
-        }));
+        out.push(api::Member {
+            taken_out: Some(true),
+            shown: m.name.clone(),
+            ..api::Member::new(
+                contacts
+                    .iter()
+                    .any(|c| c.identity == m.identity && !c.refused),
+                api::short_id(&m.identity),
+                false,
+                false,
+                name_of(&me, &contacts, &named, &m.identity),
+                "taken out".into(),
+                m.identity == me,
+            )
+        });
     }
-    Ok(json!({"group": hex::encode(g.id), "name": g.name, "members": out}))
+    Ok(api::GroupMembersReply {
+        group: g.id,
+        members: out,
+        name: g.name,
+        // the page says
+        more: false,
+        next: None,
+    })
 }
 
 /// A *member* as `group-members` gives one, without how they are reached.
@@ -1642,48 +1653,8 @@ fn member_of(
     }
 }
 
-/// [`member_of`], by name, for the requests not yet typed.
-fn member_fields(
-    me: &[u8; 32],
-    contacts: &[ContactRecord],
-    members: &[Member],
-    m: &Member,
-) -> Json {
-    let m = member_of(me, contacts, members, m);
-    json!({
-        "name": m.name,
-        "shown": m.shown,
-        "id": hex::encode(m.id),
-        "you": m.you,
-        "contact": m.contact,
-        "role": m.role,
-        "introduce": m.introduce,
-        "left": m.left,
-    })
-}
-
-/// A contact's member record as this person sees them: their own name for
-/// them, and the picture.
-fn shown_as_contact(
-    d: &Daemon,
-    me: &[u8; 32],
-    contacts: &[ContactRecord],
-    members: &[Member],
-    known: Option<&ContactRecord>,
-    who: &[u8; 32],
-    v: Json,
-) -> Json {
-    match known {
-        Some(c) => {
-            let mut v = crate::names::with_shown(d, c, v);
-            v["name"] = json!(name_of(me, contacts, members, who));
-            v
-        }
-        None => v,
-    }
-}
-
-/// [`shown_as_contact`], typed.
+/// A *member* as `group-members` gives one, with what this person calls
+/// them where they are a contact.
 fn known_as_contact(
     d: &Daemon,
     me: &[u8; 32],
@@ -2633,7 +2604,7 @@ pub(crate) fn call_json_by_name(d: &Daemon, space: &SpaceId, caller: Option<&[u8
             .iter()
             .find(|c| c.identity == m.identity && !c.refused);
         let v = member_fields_by_name(&me, &contacts, &members, m);
-        shown_as_contact(d, &me, &contacts, &members, known, &m.identity, v)
+        shown_as_contact_by_name(d, &me, &contacts, &members, known, &m.identity, v)
     };
     let mut admins: Vec<&Member> = members
         .iter()
@@ -3565,4 +3536,87 @@ pub fn react_by_name(d: &Arc<Daemon>, group: &str, id: &str, text: &str) -> anyh
 pub fn mark_read_by_name(d: &Arc<Daemon>, group: &str) -> anyhow::Result<Json> {
     let g = joined_by_name(d, group)?;
     contacts::mark_read_in_by_name(d, &g.id, &g.name)
+}
+
+/// `members` as main had it, by name.
+#[cfg(any(test, debug_assertions, feature = "by-name"))]
+#[allow(dead_code, clippy::all)]
+pub fn members_by_name(d: &Daemon, group: &str) -> anyhow::Result<Json> {
+    let g = find_by_name(d, group)?;
+    let me = identity(d)?;
+    let core = d.core();
+    let sp = core.spaces.get(&g.id).and_then(|h| h.space.as_ref());
+    let sp = sp.ok_or_else(|| anyhow::anyhow!("that group is not open yet"))?;
+    let members = group::members(sp);
+    let contacts = core.contacts();
+    let seen = Seen::of(&core, sp, &me);
+    let out: Vec<Json> = members
+        .iter()
+        .map(|m| {
+            let known = contacts
+                .iter()
+                .find(|c| c.identity == m.identity && !c.refused);
+            let mut v = member_fields_by_name(&me, &contacts, &members, m);
+            // what carries what this person writes to them, and theirs back
+            // (D89): for someone in it who has joined, not this person
+            if seen.others.contains(&m.identity) {
+                let (reach, through) = match seen.way_to(&m.identity) {
+                    Way::Contact => ("contact", None),
+                    Way::Host => ("host", None),
+                    Way::Through(t) => ("through", Some(name_of(&me, &contacts, &members, &t))),
+                    Way::None => ("none", None),
+                };
+                v["reach"] = json!(reach);
+                v["through"] = json!(through);
+                v["reaches_you"] = json!(seen.reaches_me(&m.identity));
+            }
+            shown_as_contact_by_name(d, &me, &contacts, &members, known, &m.identity, v)
+        })
+        .collect();
+    // and whoever was taken out when it moved, marked: by the name the
+    // others saw
+    let named = named_in(sp);
+    let mut out = out;
+    for m in group::taken_out(sp) {
+        out.push(json!({
+            "name": name_of(&me, &contacts, &named, &m.identity),
+            "shown": m.name,
+            "id": hex::encode(&m.identity[..8]),
+            "you": m.identity == me,
+            "contact": contacts.iter().any(|c| c.identity == m.identity && !c.refused),
+            "role": "taken out",
+            "taken_out": true,
+            "introduce": false,
+            "left": false,
+        }));
+    }
+    Ok(json!({"group": hex::encode(g.id), "name": g.name, "members": out}))
+}
+
+/// `shown_as_contact` as main had it, by name.
+#[cfg(any(test, debug_assertions, feature = "by-name"))]
+#[allow(dead_code, clippy::all)]
+fn shown_as_contact_by_name(
+    d: &Daemon,
+    me: &[u8; 32],
+    contacts: &[ContactRecord],
+    members: &[Member],
+    known: Option<&ContactRecord>,
+    who: &[u8; 32],
+    v: Json,
+) -> Json {
+    match known {
+        Some(c) => {
+            let mut v = {
+                let mut v = v;
+                if let Some(o) = v.as_object_mut() {
+                    o.extend(crate::names::shown_by_name(d, c));
+                }
+                v
+            };
+            v["name"] = json!(name_of(me, contacts, members, who));
+            v
+        }
+        None => v,
+    }
 }

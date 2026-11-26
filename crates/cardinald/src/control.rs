@@ -380,9 +380,9 @@ pub mod typed {
     };
     use crate::api::{
         GroupAddArgs, GroupCreateArgs, GroupCreateReply, GroupDeclineArgs, GroupJoinArgs,
-        GroupJoinReply, GroupLeaveArgs, GroupLeaveReply, GroupMemberArgs, GroupReachArgs,
-        GroupReachReply, GroupRejoinArgs, GroupRemoveArgs, GroupRemoveReply, GroupRoleArgs,
-        GroupRoleReply, GroupSetArgs,
+        GroupJoinReply, GroupLeaveArgs, GroupLeaveReply, GroupMemberArgs, GroupMembersArgs,
+        GroupMembersReply, GroupReachArgs, GroupReachReply, GroupRejoinArgs, GroupRemoveArgs,
+        GroupRemoveReply, GroupRoleArgs, GroupRoleReply, GroupSetArgs,
     };
     use crate::daemon::Daemon;
     use crate::daemon::PairState;
@@ -1017,6 +1017,12 @@ pub mod typed {
         }
     }
 
+    impl Answer for GroupMembersArgs {
+        async fn answer(d: &Arc<Daemon>, a: &Self) -> anyhow::Result<GroupMembersReply> {
+            crate::groups::members(d, needed(a.group.as_ref(), "group")?.as_ref())
+        }
+    }
+
     impl Answer for GroupSetArgs {
         async fn answer(d: &Arc<Daemon>, a: &Self) -> anyhow::Result<Done> {
             let group = needed(a.group.as_ref(), "group")?;
@@ -1619,7 +1625,8 @@ async fn handle(d: &Arc<Daemon>, req: &Value) -> anyhow::Result<Value> {
         }
         #[cfg(any(test, debug_assertions, feature = "by-name"))]
         "group-decline" => crate::groups::decline_by_name(d, arg(req, "group")?),
-        "group-members" => crate::groups::members(d, arg(req, "group")?),
+        #[cfg(any(test, debug_assertions, feature = "by-name"))]
+        "group-members" => crate::groups::members_by_name(d, arg(req, "group")?),
         #[cfg(any(test, debug_assertions, feature = "by-name"))]
         "group-set" => {
             let name = req.get("name").and_then(|v| v.as_str());
