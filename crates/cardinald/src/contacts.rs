@@ -1189,7 +1189,13 @@ pub(crate) fn listed(d: &Daemon, who: &str) -> anyhow::Result<ContactRecord> {
 /// [`listed`], by a `ref` as it came.
 pub(crate) fn listed_ref(d: &Daemon, who: Ref<'_>) -> anyhow::Result<ContactRecord> {
     let contact = find_ref(d, who)?;
-    anyhow::ensure!(!contact.refused, "you have refused {who}");
+    // An old oddity, kept to the byte (DEVIATIONS.md, Old oddities kept):
+    // an id given as bytes is named as the way by name held it, NUL first.
+    let held = match who {
+        Ref::Id(id) => format!("{}{}", crate::api::EXACT, id.hex()),
+        Ref::Typed(t) => t.to_owned(),
+    };
+    anyhow::ensure!(!contact.refused, "you have refused {held}");
     d.rendezvous.use_contact(&contact.identity);
     Ok(contact)
 }
@@ -1519,15 +1525,6 @@ pub(crate) fn reactions_of(m: &relationship::Message, me: Option<[u8; 32]>) -> V
         .collect()
 }
 
-/// [`reactions_of`], by name, for the handlers kept by name.
-#[cfg(any(test, feature = "by-name"))]
-pub(crate) fn reactions_by_name(m: &relationship::Message, me: Option<[u8; 32]>) -> Vec<Json> {
-    reactions_of(m, me)
-        .into_iter()
-        .map(|r| json!({"text": r.text, "count": r.count, "mine": r.mine}))
-        .collect()
-}
-
 /// A notice is not acknowledged, and a session that looks open may be gone, so
 /// a message counts as with someone only once a reconcile with one of their
 /// devices has gone through.
@@ -1586,6 +1583,16 @@ pub(crate) fn upto(
     let Some(b) = before else {
         return Ok(all.len());
     };
+    // An old oddity, kept to the byte (DEVIATIONS.md, Old oddities kept):
+    // text that is NUL and an id's hex once trimmed is taken as that id
+    // given as bytes, as the way by name trimmed before it told them apart.
+    let b = match b {
+        Ref::Typed(t) => match t.trim().strip_prefix(crate::api::EXACT) {
+            Some(h) => Ref::Id(crate::api::IdGiven::Hex(h)),
+            None => b,
+        },
+        b => b,
+    };
     let id: Option<NodeId> = match b {
         Ref::Id(given) => given.bytes().and_then(|v| <[u8; 16]>::try_from(&*v).ok()),
         Ref::Typed(t) => {
@@ -1643,13 +1650,19 @@ pub fn messages(
                 reactions: reactions_of(&m, me),
                 text: m.text,
                 time: m.time,
-                ..Message::default()
+                from: None,
+                picture: None,
+                read_by: None,
             }
         })
         .collect();
     Ok(MessagesReply {
         messages,
-        ..MessagesReply::default()
+        group: None,
+        name: None,
+        // the page says
+        more: false,
+        next: None,
     })
 }
 
@@ -1663,49 +1676,6 @@ pub(crate) fn attachments_of(m: &relationship::Message) -> Vec<Attachment> {
             size: BlobRef::from_record(&a.blob).map(|b| b.size).ok(),
         })
         .collect()
-}
-
-/// [`messages`] as it was before it was typed, by name: kept only to show
-/// that the typed one sends the same bytes, and to measure the two. It
-/// goes with the way by name.
-#[cfg(any(test, feature = "by-name"))]
-#[doc(hidden)]
-pub fn messages_by_name(d: &Daemon, who: &str, before: Option<&str>) -> anyhow::Result<Json> {
-    let contact = listed(d, who)?;
-    let (space, them) = (contact.space, contact.identity);
-    let here = mailbox::written_here(d, &space);
-    let unsent = d.mailbox.not_sent(&space, &them, here);
-    let core = d.core();
-    let me = core.identity.as_ref().map(|i| i.id());
-    let open = core.spaces.get(&space).and_then(|h| h.space.as_ref());
-    let open = open.ok_or_else(|| anyhow::anyhow!("that space is not open yet"))?;
-    let all = relationship::messages(open);
-    let read = relationship::read_by(open, &them, &all);
-    let upto = upto(open, &all, before.map(crate::api::reference))?;
-    let said: Vec<Json> = all
-        .iter()
-        .zip(read)
-        .take(upto)
-        .map(|(m, read)| {
-            let mine = Some(m.author) == me;
-            json!({
-                "id": hex::encode(m.id),
-                "mine": mine,
-                "text": m.text,
-                "time": m.time,
-                "state": mine.then(|| state_of(read, unsent.contains(&m.entry))),
-                "reply_to": m.reply_to.map(hex::encode),
-                "attachments": m.attachments.iter().map(|a| json!({
-                    "name": a.name,
-                    "type": a.media_type,
-                    "size": BlobRef::from_record(&a.blob).map(|b| b.size).ok(),
-                })).collect::<Vec<_>>(),
-                "edited": m.edited,
-                "reactions": reactions_by_name(m, me),
-            })
-        })
-        .collect();
-    Ok(json!({"messages": said}))
 }
 
 /// Whether one of a contact's devices is nearby: a direct session with it
@@ -2144,4 +2114,151 @@ mod tests {
         assert!(made(Some(old), 0, false).expired());
         assert!(!made(Some(old), 0, false).outstanding());
     }
+}
+
+// ---- The handlers as they were by name ----
+//
+// What main had, whole, kept only to show that the typed handlers send the
+// same bytes (`control::typed::answering`, `api/same_bytes.rs`), and to
+// measure the two. They go with the way by name.
+
+/// `find` as main had it, by name.
+#[cfg(any(test, debug_assertions, feature = "by-name"))]
+#[allow(dead_code, clippy::all)]
+pub(crate) fn find_by_name(d: &Daemon, who: &str) -> anyhow::Result<ContactRecord> {
+    let asked = crate::api::reference(who);
+    let w = who.to_lowercase();
+    let mut contacts = d.core().contacts();
+    // a recovery's relationship is no contact (`guardians.rs`)
+    contacts.retain(|c| c.recovery_of.is_none());
+    let named = |c: &ContactRecord| match asked {
+        crate::api::Ref::Id(_) => asked.is_id(&c.identity),
+        crate::api::Ref::Typed(_) => {
+            c.petname.to_lowercase() == w || hex::encode(&c.identity[..8]) == w
+        }
+    };
+    let mut found = contacts.into_iter().filter(named);
+    let who = crate::api::shown(who);
+    let contact = found
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("no contact called {who:?}"))?;
+    // A name is what someone suggested, and it may be a name already here.
+    // Two nodes for one identity, made at once on two devices, are one
+    // contact.
+    anyhow::ensure!(
+        found.all(|c| c.identity == contact.identity),
+        "more than one contact is called {who:?}: give their id instead"
+    );
+    Ok(contact)
+}
+
+/// `listed` as main had it, by name.
+#[cfg(any(test, debug_assertions, feature = "by-name"))]
+#[allow(dead_code, clippy::all)]
+pub(crate) fn listed_by_name(d: &Daemon, who: &str) -> anyhow::Result<ContactRecord> {
+    let contact = find_by_name(d, who)?;
+    anyhow::ensure!(!contact.refused, "you have refused {who}");
+    d.rendezvous.use_contact(&contact.identity);
+    Ok(contact)
+}
+
+/// `reactions_of` as main had it, by name.
+#[cfg(any(test, debug_assertions, feature = "by-name"))]
+#[allow(dead_code, clippy::all)]
+pub(crate) fn reactions_of_by_name(m: &relationship::Message, me: Option<[u8; 32]>) -> Vec<Json> {
+    // One for each person, the last they gave, however many they wrote, and
+    // no longer than this software lets anyone make one.
+    let mut theirs: Vec<&relationship::Reaction> = Vec::new();
+    for r in &m.reactions {
+        match theirs.iter_mut().find(|x| x.author == r.author) {
+            Some(x) => *x = r,
+            None => theirs.push(r),
+        }
+    }
+    let mut shown: Vec<(String, usize, bool)> = Vec::new();
+    for r in theirs {
+        let mine = Some(r.author) == me;
+        let text: String = r.text.chars().take(MAX_REACTION).collect();
+        match shown.iter_mut().find(|(t, ..)| *t == text) {
+            Some((_, n, m)) => {
+                *n += 1;
+                *m |= mine;
+            }
+            None => shown.push((text, 1, mine)),
+        }
+    }
+    shown
+        .into_iter()
+        .map(|(text, count, mine)| json!({"text": text, "count": count, "mine": mine}))
+        .collect()
+}
+
+/// `upto` as main had it, by name.
+#[cfg(any(test, debug_assertions, feature = "by-name"))]
+#[allow(dead_code, clippy::all)]
+pub(crate) fn upto_by_name(
+    sp: &Space,
+    all: &[relationship::Message],
+    before: Option<&str>,
+) -> anyhow::Result<usize> {
+    let Some(b) = before.map(str::trim) else {
+        return Ok(all.len());
+    };
+    let given = matches!(crate::api::reference(b), crate::api::Ref::Id(_));
+    let b = crate::api::id_hex(b);
+    let id: Option<NodeId> = hex::decode(b).ok().and_then(|v| v.try_into().ok());
+    let id = id.or_else(|| {
+        if given {
+            return None;
+        }
+        let mut shown = all.iter().filter(|m| hex::encode(m.id).starts_with(b));
+        match (shown.next(), shown.next()) {
+            (Some(m), None) if !b.is_empty() => Some(m.id),
+            _ => None,
+        }
+    });
+    let place = id.and_then(|id| relationship::message_place(sp, &id));
+    let place = place.ok_or_else(|| anyhow::anyhow!("there is no message {b} here"))?;
+    Ok(relationship::before_place(sp, all, &place))
+}
+
+/// `messages` as main had it, by name.
+#[cfg(any(test, debug_assertions, feature = "by-name"))]
+#[allow(dead_code, clippy::all)]
+pub fn messages_by_name(d: &Daemon, who: &str, before: Option<&str>) -> anyhow::Result<Json> {
+    let contact = listed_by_name(d, who)?;
+    let (space, them) = (contact.space, contact.identity);
+    let here = mailbox::written_here(d, &space);
+    let unsent = d.mailbox.not_sent(&space, &them, here);
+    let core = d.core();
+    let me = core.identity.as_ref().map(|i| i.id());
+    let open = core.spaces.get(&space).and_then(|h| h.space.as_ref());
+    let open = open.ok_or_else(|| anyhow::anyhow!("that space is not open yet"))?;
+    let all = relationship::messages(open);
+    let read = relationship::read_by(open, &them, &all);
+    let upto = upto_by_name(open, &all, before)?;
+    let said: Vec<Json> = all
+        .iter()
+        .zip(read)
+        .take(upto)
+        .map(|(m, read)| {
+            let mine = Some(m.author) == me;
+            json!({
+                "id": hex::encode(m.id),
+                "mine": mine,
+                "text": m.text,
+                "time": m.time,
+                "state": mine.then(|| state_of(read, unsent.contains(&m.entry))),
+                "reply_to": m.reply_to.map(hex::encode),
+                "attachments": m.attachments.iter().map(|a| json!({
+                    "name": a.name,
+                    "type": a.media_type,
+                    "size": BlobRef::from_record(&a.blob).map(|b| b.size).ok(),
+                })).collect::<Vec<_>>(),
+                "edited": m.edited,
+                "reactions": reactions_of_by_name(m, me),
+            })
+        })
+        .collect();
+    Ok(json!({"messages": said}))
 }

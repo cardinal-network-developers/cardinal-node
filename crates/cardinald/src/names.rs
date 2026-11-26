@@ -72,14 +72,6 @@ pub fn me(d: &Arc<Daemon>, name: Option<&str>) -> anyhow::Result<crate::api::MeR
     })
 }
 
-/// [`me`] as it answered by name: kept only to show the typed one sends
-/// the same bytes.
-#[cfg(any(test, feature = "by-name"))]
-pub fn me_by_name(d: &Arc<Daemon>, name: Option<&str>) -> anyhow::Result<Json> {
-    let r = me(d, name)?;
-    Ok(json!({"name": r.name, "set": r.set}))
-}
-
 /// What a window is given of a contact's name and picture: `name`, the
 /// petname or else the name they suggest; `own`, whether it is this
 /// person's petname; `suggested`; and `picture`, a file on this device,
@@ -342,4 +334,55 @@ mod tests {
         b.got(&id);
         assert!(b.due(&id, t));
     }
+}
+
+// ---- The handlers as they were by name ----
+//
+// What main had, whole, kept only to show that the typed handlers send the
+// same bytes (`control::typed::answering`, `api/same_bytes.rs`), and to
+// measure the two. They go with the way by name.
+
+/// `me` as main had it, by name.
+#[cfg(any(test, debug_assertions, feature = "by-name"))]
+#[allow(dead_code, clippy::all)]
+pub fn me_by_name(d: &Arc<Daemon>, name: Option<&str>) -> anyhow::Result<Json> {
+    let Some(name) = name else {
+        let set = d.core().self_name();
+        let name = my_name(d);
+        return Ok(json!({"name": name, "set": set.is_some()}));
+    };
+    let name = name.trim();
+    anyhow::ensure!(!name.is_empty(), "a name cannot be empty");
+    anyhow::ensure!(!name.contains('\n'), "a name is one line");
+    let (acc, node) = {
+        let core = d.core();
+        let acc = core
+            .account_id()
+            .ok_or_else(|| anyhow::anyhow!("the account space is not here yet"))?;
+        let st = core
+            .account()
+            .and_then(|a| a.space.as_ref())
+            .map(|s| s.state());
+        (acc, st.and_then(account::self_node).map(|(n, _)| n))
+    };
+    let op = match node {
+        Some(node) => account::set_field(node, 1, name),
+        None => account::create_self(name),
+    };
+    d.write_and_push(&acc, vec![op])?;
+    Ok(json!({"name": name, "set": true}))
+}
+
+/// `shown` as main had it, by name.
+#[cfg(any(test, debug_assertions, feature = "by-name"))]
+#[allow(dead_code, clippy::all)]
+pub fn shown_by_name(d: &Daemon, c: &ContactRecord) -> serde_json::Map<String, Json> {
+    let mut m = serde_json::Map::new();
+    m.insert("name".into(), json!(c.petname));
+    m.insert("own".into(), json!(c.own));
+    m.insert("suggested".into(), json!(c.suggested));
+    if let Some(p) = c.picture.as_ref().and_then(|r| cached(d, r)) {
+        m.insert("picture".into(), json!(p.display().to_string()));
+    }
+    m
 }

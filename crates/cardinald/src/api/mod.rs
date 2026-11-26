@@ -554,7 +554,7 @@ pub fn page(spec: &Request, req: &Json, mut reply: Json) -> Result<Json, Unpaged
         let more = match id.map(hex::decode) {
             Some(Err(_)) => {
                 tracing::error!("an error's fields: {}.id is not hex", lists[li].name);
-                ErrorMore::default()
+                ErrorMore::new()
             }
             id => ErrorMore {
                 at: Some(at as u64),

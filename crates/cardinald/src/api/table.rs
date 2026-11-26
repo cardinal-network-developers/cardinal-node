@@ -13,7 +13,7 @@
 
 use std::borrow::Cow;
 
-use super::typed::{Fields, Gone, Reference};
+use super::typed::{Fields, Reference};
 
 /// What a field holds.
 #[derive(Debug)]
@@ -77,7 +77,17 @@ pub struct Request {
     /// A request no longer answered: the service says it has no such
     /// request, and its number stays taken.
     pub gone: bool,
+    /// How a typed request is answered, from its message to its reply's;
+    /// `None` for one answered by name, or by the connection itself.
+    pub answer: Option<Answerer>,
 }
+
+/// How a typed request is answered (`control::typed::answering`).
+pub type Answerer =
+    for<'a> fn(
+        &'a std::sync::Arc<crate::daemon::Daemon>,
+        cardinal_encoding::Record,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Vec<u8>> + Send + 'a>>;
 
 /// How a request's answer comes in pages (`apps.md`, Pages). The lists of
 /// a paged reply are its fields that are lists, in the order of their
@@ -107,16 +117,23 @@ pub enum Page {
 /// record held in replies, with its row as `STATIC`;
 /// `typed!(fields Name { ... })` the arguments or the reply of a request,
 /// which [`asks!`] then numbers.
+///
+/// - A field that is not an `Option` is one the service always sends: the
+///   handler must give it, since `Name::new` takes these fields, in order,
+///   and there is no `Default`; read back, its absence is an error. A
+///   field added to a record after it was first released is an `Option`
+///   for ever, so that a newer client reads an older service.
+/// - `n gone name: Type` is a number no longer used: it keeps its row, with
+///   the type it had, and no struct field; it is never sent, and what
+///   comes under it is passed over.
 #[macro_export]
 #[doc(hidden)]
 macro_rules! typed {
     (
         $(#[$m:meta])*
-        $stat:ident $title:literal $name:ident {
-            $( $(#[$fm:meta])* $n:literal $f:ident : $t:ty ),* $(,)?
-        }
+        $stat:ident $title:literal $name:ident { $($body:tt)* }
     ) => {
-        $crate::typed!(fields $(#[$m])* $name { $( $(#[$fm])* $n $f : $t ),* });
+        $crate::typed!(fields $(#[$m])* $name { $($body)* });
 
         #[doc = concat!("The *", $title, "* record's row in the tables.")]
         pub static $stat: $crate::api::table::Rec = $crate::api::table::Rec {
@@ -130,10 +147,16 @@ macro_rules! typed {
             fn encode_into(&self, out: &mut Vec<u8>) {
                 use $crate::api::typed::Fields;
                 $crate::api::typed::record_header(self.present_except(&[]), out);
-                self.encode_fields(out);
+                self.encode_fields_except(&[], out);
             }
             fn encoded_len(&self) -> usize {
                 $crate::api::typed::Fields::record_len_except(self, &[])
+            }
+            fn check(&self, at: &$crate::api::typed::At) -> Result<(), String> {
+                match $crate::api::typed::Fields::invalid(self, at).into_iter().next() {
+                    Some((_, _, e)) => Err(e),
+                    None => Ok(()),
+                }
             }
             fn take(
                 v: cardinal_encoding::Value,
@@ -148,53 +171,119 @@ macro_rules! typed {
             }
         }
     };
-    (
-        fields $(#[$m:meta])* $name:ident {
-            $( $(#[$fm:meta])* $n:literal $f:ident : $t:ty ),* $(,)?
+    (fields $(#[$m:meta])* $name:ident { $($body:tt)* }) => {
+        $crate::typed!(@munch [$(#[$m])* $name] [] [] [] [] [] $($body)*);
+    };
+    // A number no longer used.
+    (@munch $h:tt [$($s:tt)*] [$($r:tt)*] [$($o:tt)*] [$($l:tt)*] [$($a:tt)*]
+        $n:literal gone $f:ident : $t:ty $(, $($rest:tt)*)?
+    ) => {
+        $crate::typed!(@munch $h [$($s)*] [$($r)*] [$($o)*] [$($l)*]
+            [$($a)* ($n $f (gone $t))] $($($rest)*)?);
+    };
+    // A field sent only when it is `Some`.
+    (@munch $h:tt [$($s:tt)*] [$($r:tt)*] [$($o:tt)*] [$($l:tt)*] [$($a:tt)*]
+        $(#[$fm:meta])* $n:literal $f:ident : Option<$t:ty> $(, $($rest:tt)*)?
+    ) => {
+        $crate::typed!(@munch $h
+            [$($s)* ($(#[$fm])* $f : Option<$t>)] [$($r)*] [$($o)* $f]
+            [$($l)* ($n $f)] [$($a)* ($n $f (Option<$t>))] $($($rest)*)?);
+    };
+    // A field always sent.
+    (@munch $h:tt [$($s:tt)*] [$($r:tt)*] [$($o:tt)*] [$($l:tt)*] [$($a:tt)*]
+        $(#[$fm:meta])* $n:literal $f:ident : $t:ty $(, $($rest:tt)*)?
+    ) => {
+        $crate::typed!(@munch $h
+            [$($s)* ($(#[$fm])* $f : $t)] [$($r)* ($f : $t)] [$($o)*]
+            [$($l)* ($n $f)] [$($a)* ($n $f ($t))] $($($rest)*)?);
+    };
+    (@row ($n:literal $f:ident (gone $t:ty))) => {
+        $crate::api::table::Field {
+            n: $n,
+            name: $crate::api::typed::field_name(stringify!($f)),
+            ty: $crate::api::table::Ty::Gone(&<$t as $crate::api::typed::Wire>::TY),
         }
+    };
+    (@row ($n:literal $f:ident ($t:ty))) => {
+        $crate::api::table::Field {
+            n: $n,
+            name: $crate::api::typed::field_name(stringify!($f)),
+            ty: <$t as $crate::api::typed::Wire>::TY,
+        }
+    };
+    (@munch [$(#[$m:meta])* $name:ident]
+        [$(($(#[$fm:meta])* $sf:ident : $st:ty))*]
+        [$(($rf:ident : $rt:ty))*]
+        [$($of:ident)*]
+        [$(($ln:literal $lf:ident))*]
+        [$($a:tt)*]
     ) => {
         $(#[$m])*
-        #[derive(Clone, Debug, Default, PartialEq)]
+        #[derive(Clone, Debug, PartialEq)]
         pub struct $name {
-            $( $(#[$fm])* pub $f: $t, )*
+            $( $(#[$fm])* pub $sf: $st, )*
+        }
+
+        impl $name {
+            /// It, with the fields it always has, in order; the others
+            /// absent.
+            #[allow(clippy::new_without_default, clippy::too_many_arguments)]
+            pub fn new($($rf: $rt),*) -> Self {
+                $name { $($rf,)* $($of: None,)* }
+            }
         }
 
         impl $crate::api::typed::Fields for $name {
-            const FIELDS: &'static [$crate::api::table::Field] = &[$(
-                $crate::api::table::Field {
-                    n: $n,
-                    name: $crate::api::typed::field_name(stringify!($f)),
-                    ty: <$t as $crate::api::typed::Wire>::TY,
-                }
-            ),*];
+            const FIELDS: &'static [$crate::api::table::Field] = &[
+                $( $crate::typed!(@row $a) ),*
+            ];
 
             #[allow(unused_mut)]
             fn present_except(&self, skip: &[u64]) -> u64 {
                 let mut n = 0;
-                $( if $crate::api::typed::Wire::sent(&self.$f) && !skip.contains(&$n) {
+                $( if $crate::api::typed::Wire::sent(&self.$lf) && !skip.contains(&$ln) {
                     n += 1;
                 } )*
                 let _ = skip;
                 n
             }
 
-            fn encode_fields(&self, out: &mut Vec<u8>) {
-                $( if $crate::api::typed::Wire::sent(&self.$f) {
-                    $crate::api::typed::key($n, out);
-                    $crate::api::typed::Wire::encode_into(&self.$f, out);
+            fn encode_fields_except(&self, skip: &[u64], out: &mut Vec<u8>) {
+                $( if $crate::api::typed::Wire::sent(&self.$lf) && !skip.contains(&$ln) {
+                    $crate::api::typed::key($ln, out);
+                    $crate::api::typed::Wire::encode_into(&self.$lf, out);
                 } )*
-                let _ = out;
+                let _ = (skip, out);
             }
 
             #[allow(unused_mut)]
             fn fields_len_except(&self, skip: &[u64]) -> usize {
                 let mut n = 0;
-                $( if $crate::api::typed::Wire::sent(&self.$f) && !skip.contains(&$n) {
-                    n += $crate::api::typed::key_len($n)
-                        + $crate::api::typed::Wire::encoded_len(&self.$f);
+                $( if $crate::api::typed::Wire::sent(&self.$lf) && !skip.contains(&$ln) {
+                    n += $crate::api::typed::key_len($ln)
+                        + $crate::api::typed::Wire::encoded_len(&self.$lf);
                 } )*
                 let _ = skip;
                 n
+            }
+
+            #[allow(unused_mut)]
+            fn invalid(
+                &self,
+                at: &$crate::api::typed::At,
+            ) -> Vec<(u64, &'static str, String)> {
+                let mut out = Vec::new();
+                $( if $crate::api::typed::Wire::sent(&self.$lf) {
+                    let name = $crate::api::typed::field_name(stringify!($lf));
+                    let at = $crate::api::typed::At::Field(at, name);
+                    if let Err(e) = $crate::api::typed::Wire::check(&self.$lf, &at) {
+                        out.push(($ln, name, e));
+                    }
+                } )*
+                let _ = at;
+                // in the order of their names, as the tables by name met them
+                out.sort_by_key(|(_, name, _)| *name);
+                out
             }
 
             #[allow(unused_mut, unused_variables)]
@@ -203,12 +292,12 @@ macro_rules! typed {
                 at: &$crate::api::typed::At,
             ) -> Result<Self, String> {
                 Ok($name { $(
-                    $f: {
+                    $lf: {
                         let at = $crate::api::typed::At::Field(
                             at,
-                            $crate::api::typed::field_name(stringify!($f)),
+                            $crate::api::typed::field_name(stringify!($lf)),
                         );
-                        match r.remove($n) {
+                        match r.remove($ln) {
                             Some(v) => $crate::api::typed::Wire::take(v, &at)?,
                             None => $crate::api::typed::Wire::absent(&at)?,
                         }
@@ -224,22 +313,153 @@ macro_rules! typed {
 }
 
 /// A typed request: its row, `ROW`, for [`REQUESTS`], from its typed
-/// arguments and reply, and how it pages.
+/// arguments and reply; how it is answered; and how it pages.
+///
+/// `asks!(ROW: n "name" Args -> Reply, how)`, where `how` is
+///
+/// - `reads`: it changes nothing, so where the tests run the service
+///   answers it by name too and fails it if the two differ;
+/// - `reads unless field`: the same while `field` is not given;
+/// - `writes`: answered once; same-bytes cases written by hand cover it;
+/// - `stream`: answered by the connection itself, which then carries a
+///   stream (`watch`, `call-media`).
+///
+/// Every request but a stream is answered by `impl Answer for Args`
+/// (`control::typed`): one declared without it does not compile. A paged
+/// one says how after `how`: `after list` (by position) or `before list
+/// by id` (back from the newest, `next` the `id` of the oldest given);
+/// its arguments then have `after` or `before`, and `limit`, and its
+/// reply the list, `more` and `next`, which the page is cut by.
 macro_rules! asks {
-    ($row:ident: $n:literal $name:literal $args:ident -> $reply:ident, $page:expr) => {
+    ($row:ident: $n:literal $name:literal $args:ident -> $reply:ident,
+        $how:ident $(unless $unless:ident)? $(, $($page:tt)*)?) => {
         #[doc = concat!("The row of `", $name, "`, typed.")]
         pub const $row: Request = Request {
             n: $n,
             name: $name,
             args: <$args as Fields>::FIELDS,
             reply: <$reply as Fields>::FIELDS,
-            page: $page,
+            page: asks!(@page $($($page)*)?),
             gone: false,
+            answer: asks!(@answer $how $args),
         };
 
         impl super::typed::Ask for $args {
             const REQUEST: &'static Request = &$row;
             type Reply = $reply;
+            asks!(@reads $how $($unless)?);
+            asks!(@paging $args $reply $($($page)*)?);
+        }
+    };
+    (@answer stream $args:ident) => { None };
+    (@answer $how:ident $args:ident) => {
+        Some(crate::control::typed::answering::<$args> as super::table::Answerer)
+    };
+    (@reads reads) => {
+        fn reads(&self) -> bool {
+            true
+        }
+    };
+    (@reads reads $unless:ident) => {
+        fn reads(&self) -> bool {
+            self.$unless.is_none()
+        }
+    };
+    (@reads writes) => {};
+    (@reads stream) => {};
+    (@page) => { Page::Whole };
+    (@page after $list:ident $($rest:tt)*) => { Page::After };
+    (@page before $list:ident $($rest:tt)*) => { Page::Before { list: stringify!($list) } };
+    (@paging $args:ident $reply:ident) => {};
+    (@id) => { |_| None };
+    (@id $id:ident) => { |x| Some(&x.$id[..]) };
+    (@paging $args:ident $reply:ident after $list:ident $(by $id:ident)?) => {
+        fn reply_bytes(&self, mut reply: $reply) -> Vec<u8> {
+            // beside the reply's other fields: without the list, `more`, `next`
+            const SKIP: [u64; 3] = super::typed::paged_numbers(
+                <$reply as Fields>::FIELDS,
+                stringify!($list),
+            );
+            let base = reply.record_len_except(&SKIP);
+            match super::typed::page_after(
+                Self::REQUEST,
+                stringify!($list),
+                &mut reply.$list,
+                base,
+                self.after,
+                self.limit,
+                asks!(@id $($id)?),
+            ) {
+                Ok(cut) => {
+                    reply.more = cut.more;
+                    reply.next = cut.next;
+                    super::typed::reply_message(Self::REQUEST.name, &reply)
+                }
+                Err(super::typed::Unpaged(msg)) => msg,
+            }
+        }
+        fn one_page(&self) -> bool {
+            self.after.is_some() || self.limit.is_some()
+        }
+        fn next_page(&self, had: &$reply) -> Option<Self> {
+            let next = had.next.filter(|_| had.more)?;
+            Some($args {
+                after: Some(next),
+                ..self.clone()
+            })
+        }
+        fn join(all: &mut $reply, page: $reply) -> bool {
+            let grew = !page.$list.is_empty();
+            all.$list.extend(page.$list);
+            (all.more, all.next) = (page.more, page.next);
+            grew
+        }
+        fn whole(all: &mut $reply) {
+            (all.more, all.next) = (false, None);
+        }
+    };
+    (@paging $args:ident $reply:ident before $list:ident by $id:ident) => {
+        fn reply_bytes(&self, mut reply: $reply) -> Vec<u8> {
+            const SKIP: [u64; 3] = super::typed::paged_numbers(
+                <$reply as Fields>::FIELDS,
+                stringify!($list),
+            );
+            let base = reply.record_len_except(&SKIP);
+            match super::typed::page_before(
+                Self::REQUEST,
+                stringify!($list),
+                &mut reply.$list,
+                base,
+                self.limit,
+                |x| Some(&x.$id[..]),
+            ) {
+                Ok(more) => {
+                    reply.more = more;
+                    reply.next = more.then(|| reply.$list.first().map(|x| x.$id)).flatten();
+                    super::typed::reply_message(Self::REQUEST.name, &reply)
+                }
+                Err(super::typed::Unpaged(msg)) => msg,
+            }
+        }
+        fn one_page(&self) -> bool {
+            self.before.is_some() || self.limit.is_some()
+        }
+        fn next_page(&self, had: &$reply) -> Option<Self> {
+            let next = had.next.filter(|_| had.more)?;
+            Some($args {
+                before: Some(super::typed::Reference::Id(next.to_vec())),
+                ..self.clone()
+            })
+        }
+        fn join(all: &mut $reply, mut page: $reply) -> bool {
+            let grew = !page.$list.is_empty();
+            page.$list.append(&mut all.$list);
+            all.$list = page.$list;
+            (all.more, all.next) = (page.more, page.next);
+            grew
+        }
+        fn whole(all: &mut $reply) {
+            (all.more, all.next) = (false, None);
         }
     };
 }
@@ -381,6 +601,7 @@ macro_rules! req {
             reply: &[$(f!($rn $rf $rt)),*],
             page: Page::Whole,
             gone: false,
+            answer: None,
         }
     };
 }
@@ -788,10 +1009,10 @@ typed!(fields WatchArgs {
     /// A window watching: while one does, Cardinal is open.
     1 window: Option<bool>,
 });
-asks!(WATCH: 3 "watch" WatchArgs -> Done, Page::Whole);
+asks!(WATCH: 3 "watch" WatchArgs -> Done, stream);
 
 typed!(fields CallMediaArgs {});
-asks!(CALL_MEDIA: 104 "call-media" CallMediaArgs -> Done, Page::Whole);
+asks!(CALL_MEDIA: 104 "call-media" CallMediaArgs -> Done, stream);
 
 // ---- The service, this device, and the person's devices ----
 
@@ -804,7 +1025,7 @@ typed!(fields ConditionsReply {
     3 metered: bool,
     4 plugged_in: Option<bool>,
 });
-asks!(CONDITIONS_NOW: 6 "conditions" ConditionsArgs -> ConditionsReply, Page::Whole);
+asks!(CONDITIONS_NOW: 6 "conditions" ConditionsArgs -> ConditionsReply, reads unless plugged_in);
 
 typed!(fields NetworkChangedArgs {
     1 why: Option<String>,
@@ -816,7 +1037,7 @@ typed!(
         2 checking: u64,
     }
 );
-asks!(NETWORK_CHANGED: 7 "network-changed" NetworkChangedArgs -> Checking, Page::Whole);
+asks!(NETWORK_CHANGED: 7 "network-changed" NetworkChangedArgs -> Checking, writes);
 
 typed!(fields MeArgs {
     1 name: Option<String>,
@@ -825,7 +1046,7 @@ typed!(fields MeReply {
     2 name: String,
     3 set: bool,
 });
-asks!(ME: 10 "me" MeArgs -> MeReply, Page::Whole);
+asks!(ME: 10 "me" MeArgs -> MeReply, reads unless name);
 
 typed!(fields DeviceRenameArgs {
     1 device: Option<Reference>,
@@ -836,17 +1057,17 @@ typed!(fields DeviceRenameReply {
     2 key: [u8; 8],
     3 name: String,
 });
-asks!(DEVICE_RENAME: 12 "device-rename" DeviceRenameArgs -> DeviceRenameReply, Page::Whole);
+asks!(DEVICE_RENAME: 12 "device-rename" DeviceRenameArgs -> DeviceRenameReply, writes);
 
 typed!(fields PairShowArgs {
-    1 admin: Gone<bool>,
+    1 gone admin: bool,
     2 device: Option<String>,
 });
 typed!(fields PairShowReply {
     2 addrs: Vec<String>,
     3 code: String,
 });
-asks!(PAIR_SHOW: 14 "pair-show" PairShowArgs -> PairShowReply, Page::Whole);
+asks!(PAIR_SHOW: 14 "pair-show" PairShowArgs -> PairShowReply, writes);
 
 typed!(fields PairStatusArgs {});
 typed!(fields PairStatusReply {
@@ -859,7 +1080,7 @@ typed!(fields PairStatusReply {
     /// `device` or `admin`.
     7 power: Option<Cow<'static, str>>,
 });
-asks!(PAIR_STATUS: 15 "pair-status" PairStatusArgs -> PairStatusReply, Page::Whole);
+asks!(PAIR_STATUS: 15 "pair-status" PairStatusArgs -> PairStatusReply, reads);
 
 typed!(fields PairTypeArgs {
     1 code: Option<String>,
@@ -871,10 +1092,10 @@ typed!(fields PairTypeArgs {
 typed!(fields PairTypeReply {
     2 name: String,
 });
-asks!(PAIR_TYPE: 16 "pair-type" PairTypeArgs -> PairTypeReply, Page::Whole);
+asks!(PAIR_TYPE: 16 "pair-type" PairTypeArgs -> PairTypeReply, writes);
 
 typed!(fields WakeArgs {});
-asks!(WAKE: 226 "wake" WakeArgs -> Checking, Page::Whole);
+asks!(WAKE: 226 "wake" WakeArgs -> Checking, writes);
 
 // ---- The clipboard ----
 
@@ -884,7 +1105,7 @@ typed!(fields ClipCopyArgs {
 typed!(fields ClipCopyReply {
     2 devices: u64,
 });
-asks!(CLIP_COPY: 105 "clip-copy" ClipCopyArgs -> ClipCopyReply, Page::Whole);
+asks!(CLIP_COPY: 105 "clip-copy" ClipCopyArgs -> ClipCopyReply, writes);
 
 typed!(fields ClipArgs {});
 typed!(fields ClipReply {
@@ -894,7 +1115,7 @@ typed!(fields ClipReply {
     /// None when nothing was copied in the last ten minutes.
     5 text: Option<String>,
 });
-asks!(CLIP: 106 "clip" ClipArgs -> ClipReply, Page::Whole);
+asks!(CLIP: 106 "clip" ClipArgs -> ClipReply, reads);
 
 // ---- The one folder ----
 
@@ -908,26 +1129,26 @@ typed!(
 typed!(fields MkdirArgs {
     1 path: Option<String>,
 });
-asks!(MKDIR: 121 "mkdir" MkdirArgs -> PathReply, Page::Whole);
+asks!(MKDIR: 121 "mkdir" MkdirArgs -> PathReply, writes);
 typed!(fields MoveArgs {
     1 from: Option<String>,
     2 to: Option<String>,
 });
-asks!(MOVE: 122 "move" MoveArgs -> PathReply, Page::Whole);
+asks!(MOVE: 122 "move" MoveArgs -> PathReply, writes);
 typed!(fields RemoveArgs {
     1 path: Option<String>,
 });
-asks!(REMOVE: 123 "remove" RemoveArgs -> PathReply, Page::Whole);
+asks!(REMOVE: 123 "remove" RemoveArgs -> PathReply, writes);
 typed!(fields CopyArgs {
     1 from: Option<String>,
     2 to: Option<String>,
 });
-asks!(COPY: 124 "copy" CopyArgs -> PathReply, Page::Whole);
+asks!(COPY: 124 "copy" CopyArgs -> PathReply, writes);
 typed!(fields PutArgs {
     1 from: Option<String>,
     2 to: Option<String>,
 });
-asks!(PUT: 125 "put" PutArgs -> PathReply, Page::Whole);
+asks!(PUT: 125 "put" PutArgs -> PathReply, writes);
 typed!(fields SaveArgs {
     1 path: Option<String>,
     2 to: Option<String>,
@@ -937,12 +1158,12 @@ typed!(fields SaveReply {
     2 path: String,
     3 size: u64,
 });
-asks!(SAVE: 126 "save" SaveArgs -> SaveReply, Page::Whole);
+asks!(SAVE: 126 "save" SaveArgs -> SaveReply, writes);
 typed!(fields WriteArgs {
     1 from: Option<String>,
     2 path: Option<String>,
 });
-asks!(WRITE: 127 "write" WriteArgs -> PathReply, Page::Whole);
+asks!(WRITE: 127 "write" WriteArgs -> PathReply, writes);
 typed!(fields ShareArgs {
     1 who: Option<Reference>,
     2 paths: Option<Vec<String>>,
@@ -953,18 +1174,18 @@ typed!(fields ShareReply {
     2 message: bool,
     3 path: String,
 });
-asks!(SHARE: 128 "share" ShareArgs -> ShareReply, Page::Whole);
+asks!(SHARE: 128 "share" ShareArgs -> ShareReply, writes);
 typed!(fields MountArgs {
     1 path: Option<String>,
 });
-asks!(MOUNT: 129 "mount" MountArgs -> PathReply, Page::Whole);
+asks!(MOUNT: 129 "mount" MountArgs -> PathReply, writes);
 typed!(fields UnmountArgs {});
-asks!(UNMOUNT: 130 "unmount" UnmountArgs -> Done, Page::Whole);
+asks!(UNMOUNT: 130 "unmount" UnmountArgs -> Done, writes);
 typed!(fields FlushArgs {});
 typed!(fields FlushReply {
     2 entries: u64,
 });
-asks!(FLUSH: 131 "flush" FlushArgs -> FlushReply, Page::Whole);
+asks!(FLUSH: 131 "flush" FlushArgs -> FlushReply, writes);
 typed!(fields RestoreArgs {
     1 path: Option<String>,
     2 version: Option<u64>,
@@ -973,7 +1194,7 @@ typed!(fields RestoreReply {
     2 path: String,
     3 version: u64,
 });
-asks!(RESTORE: 134 "restore" RestoreArgs -> RestoreReply, Page::Whole);
+asks!(RESTORE: 134 "restore" RestoreArgs -> RestoreReply, writes);
 typed!(fields PinArgs {
     1 path: Option<String>,
 });
@@ -981,18 +1202,18 @@ typed!(fields PinReply {
     2 on_demand: bool,
     3 path: String,
 });
-asks!(PIN: 135 "pin" PinArgs -> PinReply, Page::Whole);
+asks!(PIN: 135 "pin" PinArgs -> PinReply, writes);
 typed!(fields UnpinArgs {
     1 path: Option<String>,
 });
-asks!(UNPIN: 136 "unpin" UnpinArgs -> PinReply, Page::Whole);
+asks!(UNPIN: 136 "unpin" UnpinArgs -> PinReply, writes);
 typed!(fields RetentionArgs {
     1 mode: Option<String>,
 });
 typed!(fields RetentionReply {
     2 retention: String,
 });
-asks!(RETENTION: 137 "retention" RetentionArgs -> RetentionReply, Page::Whole);
+asks!(RETENTION: 137 "retention" RetentionArgs -> RetentionReply, writes);
 
 typed!(fields MessagesArgs {
     1 who: Option<Reference>,
@@ -1007,14 +1228,14 @@ typed!(fields MessagesReply {
     5 more: bool,
     6 next: Option<[u8; 16]>,
 });
-asks!(MESSAGES: 34 "messages" MessagesArgs -> MessagesReply, Page::Before { list: "messages" });
+asks!(MESSAGES: 34 "messages" MessagesArgs -> MessagesReply, reads, before messages by id);
 
 typed!(fields CallArgs {});
 typed!(fields CallReply {
     2 call: Option<Call>,
     3 ended: Option<CallEnded>,
 });
-asks!(CALL_NOW: 100 "call" CallArgs -> CallReply, Page::Whole);
+asks!(CALL_NOW: 100 "call" CallArgs -> CallReply, reads);
 
 typed!(fields FilesArgs {
     1 path: Option<String>,
@@ -1028,7 +1249,7 @@ typed!(fields FilesReply {
     5 more: bool,
     6 next: Option<u64>,
 });
-asks!(FILES: 120 "files" FilesArgs -> FilesReply, Page::After);
+asks!(FILES: 120 "files" FilesArgs -> FilesReply, reads, after files);
 
 /// Every request, by number. Numbers are grouped by what they are about,
 /// with room in each group.
@@ -1361,6 +1582,7 @@ macro_rules! streams {
             reply: &[],
             page: Page::Whole,
             gone: false,
+            answer: None,
         };
 
         impl super::typed::Streamed for $fields {

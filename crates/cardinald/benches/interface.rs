@@ -267,7 +267,6 @@ fn typed<A: Ask + Clone>(
     d: &Arc<Daemon>,
     msg: &[u8],
     answer: fn(&Arc<Daemon>, &A) -> anyhow::Result<A::Reply>,
-    reply_of: fn(&A, A::Reply) -> Vec<u8>,
 ) -> Steps
 where
     A::Reply: Clone,
@@ -281,10 +280,10 @@ where
     let handler = rt.block_on(async { measure(|| answer(d, &a).unwrap()) });
     let value = rt.block_on(async { answer(d, &a).unwrap() });
     let encode = less(
-        measure(|| reply_of(&a, value.clone())),
+        measure(|| a.reply_bytes(value.clone())),
         measure(|| value.clone()),
     );
-    let reply = reply_of(&a, value.clone());
+    let reply = a.reply_bytes(value.clone());
     let read = measure(|| api::typed::read_reply::<A>(&reply).unwrap().unwrap());
     Steps {
         decode,
@@ -348,9 +347,9 @@ fn main() {
             _ => cardinald::calls::current_by_name(&d),
         });
         let new = match name {
-            "files" => typed::<FilesArgs>(&rt, &d, &msg, t::files, t::files_reply),
-            "messages" => typed::<MessagesArgs>(&rt, &d, &msg, t::messages, t::messages_reply),
-            _ => typed::<CallArgs>(&rt, &d, &msg, t::call, t::call_reply),
+            "files" => typed::<FilesArgs>(&rt, &d, &msg, t::files),
+            "messages" => typed::<MessagesArgs>(&rt, &d, &msg, t::messages),
+            _ => typed::<CallArgs>(&rt, &d, &msg, t::call),
         };
         assert_eq!(old.reply, new.reply, "{name}: the two ways differ");
         show_steps("by name", &old);

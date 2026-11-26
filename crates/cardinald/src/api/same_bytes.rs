@@ -11,46 +11,26 @@ use super::typed::{read_reply, Ask, Fields, Wire};
 use super::*;
 use crate::daemon::Daemon;
 
-/// The reply the way by name gives to `req`.
-fn by_name(d: &Arc<Daemon>, req: &Json) -> Vec<u8> {
+/// The reply the way by name gives to `req`: as the service answered it
+/// before its request was typed, by main's handler.
+async fn by_name(d: &Arc<Daemon>, req: &Json) -> Vec<u8> {
     let (_, msg) = encode_request(req).unwrap();
-    let (spec, args) = match decode_request(&msg) {
-        Ok(x) => x,
-        Err(r) => return error_reply(r.status, &r.why),
-    };
-    let s = |k: &str| args.get(k).and_then(Json::as_str);
-    let answer = match spec.name {
-        "files" => crate::onefolder::list_by_name(d, s("path").unwrap_or("")),
-        "messages" if args.get("group").is_some() => {
-            crate::groups::messages_by_name(d, s("group").unwrap(), s("before"))
-        }
-        "messages" => match s("who") {
-            Some(who) => crate::contacts::messages_by_name(d, who, s("before")),
-            None => Err(anyhow::anyhow!("missing argument who")),
-        },
-        "call" => Ok(crate::calls::current_by_name(d)),
-        other => panic!("{other} is not typed"),
-    };
-    match answer {
-        Ok(v) => match page(spec, &args, v) {
-            Ok(v) => encode_reply(spec, Ok(&v)),
-            Err((st, why, item)) => error_reply_with(st, &why, &item),
-        },
-        Err(e) => error_reply(status::FAILED, &format!("{e:#}")),
-    }
+    crate::control::by_name(d, &msg).await
 }
 
 /// The reply the service gives to `req` now, typed.
-fn typed(d: &Arc<Daemon>, req: &Json) -> Vec<u8> {
+async fn typed(d: &Arc<Daemon>, req: &Json) -> Vec<u8> {
     let (_, msg) = encode_request(req).unwrap();
-    crate::control::typed::reply_to(d, &msg).expect("a typed request")
+    crate::control::typed::reply(d, &msg)
+        .await
+        .expect("a typed request")
 }
 
 /// Both ways give `req` the same bytes; and the reply, read typed, is
 /// what it says.
-fn same(d: &Arc<Daemon>, req: Json) -> Vec<u8> {
-    let old = by_name(d, &req);
-    let new = typed(d, &req);
+async fn same(d: &Arc<Daemon>, req: Json) -> Vec<u8> {
+    let old = by_name(d, &req).await;
+    let new = typed(d, &req).await;
     assert_eq!(
         old,
         new,
@@ -110,20 +90,39 @@ impl Twins {
         self.swap.push((o.into_bytes(), n.into_bytes()));
     }
 
-    /// The old one's message, its ids as the new one's.
-    fn swapped(&self, mut msg: Vec<u8>) -> Vec<u8> {
-        for (o, n) in &self.swap {
-            let mut i = 0;
-            while i + o.len() <= msg.len() {
-                if msg[i..i + o.len()] == o[..] {
-                    msg[i..i + o.len()].copy_from_slice(n);
+    /// `old` and `new` are the same time, made apart: their encodings,
+    /// after the key of `time` in a message record (12).
+    fn alike_time(&mut self, old: u64, new: u64) {
+        let enc = |n: u64| {
+            let mut v = vec![12u8];
+            n.encode_into(&mut v);
+            v
+        };
+        let (o, n) = (enc(old), enc(new));
+        assert_eq!(o.len(), n.len());
+        self.swap.push((o, n));
+    }
+
+    /// The old one's message, its ids as the new one's: every swap at
+    /// once, the longest first where two begin at one place, so that one
+    /// swapped is never swapped again.
+    fn swapped(&self, msg: Vec<u8>) -> Vec<u8> {
+        let mut swaps: Vec<&(Vec<u8>, Vec<u8>)> = self.swap.iter().collect();
+        swaps.sort_by_key(|(o, _)| std::cmp::Reverse(o.len()));
+        let mut out = Vec::with_capacity(msg.len());
+        let mut i = 0;
+        'at: while i < msg.len() {
+            for (o, n) in &swaps {
+                if msg[i..].starts_with(o) {
+                    out.extend_from_slice(n);
                     i += o.len();
-                } else {
-                    i += 1;
+                    continue 'at;
                 }
             }
+            out.push(msg[i]);
+            i += 1;
         }
-        msg
+        out
     }
 
     /// The request, by name to the old one and typed to the new one, is
@@ -215,48 +214,52 @@ async fn typed_replies_are_the_bytes_they_were_by_name() {
     let g = crate::groups::create(&d, "Kin", &[], false, true).unwrap();
     let group = g["group"].as_str().unwrap().to_owned();
     for path in ["", "Docs", "Docs/inner", "Groups", "Groups/Kin"] {
-        same(&d, json!({"cmd": "files", "path": path}));
+        same(&d, json!({"cmd": "files", "path": path})).await;
     }
-    same(&d, json!({"cmd": "files"}));
-    let all = files_of(&same(&d, json!({"cmd": "files", "path": "Docs"})));
+    same(&d, json!({"cmd": "files"})).await;
+    let all = files_of(&same(&d, json!({"cmd": "files", "path": "Docs"})).await);
     assert_eq!(all.files.len(), 7);
     assert_eq!(all.files[0].name, "inner");
     assert!(all.files[0].folder);
     assert_eq!(all.place.kind, "mine");
-    let page = files_of(&same(
-        &d,
-        json!({"cmd": "files", "path": "Docs", "after": 2, "limit": 3}),
-    ));
+    let page = files_of(
+        &same(
+            &d,
+            json!({"cmd": "files", "path": "Docs", "after": 2, "limit": 3}),
+        )
+        .await,
+    );
     assert_eq!((page.files.len(), page.more, page.next), (3, true, Some(5)));
     for (after, limit) in [(0, 0), (6, 0), (7, 0), (9, 2), (0, 100)] {
         same(
             &d,
             json!({"cmd": "files", "path": "Docs", "after": after, "limit": limit}),
-        );
+        )
+        .await;
     }
     // errors, and what is refused before any handler
-    same(&d, json!({"cmd": "files", "path": "Nowhere"}));
-    same(&d, json!({"cmd": "files", "path": "Docs/a.txt"}));
+    same(&d, json!({"cmd": "files", "path": "Nowhere"})).await;
+    same(&d, json!({"cmd": "files", "path": "Docs/a.txt"})).await;
     let wrong = Record::new().with(0, 120u64).with(1, vec![1u8, 2]).encode();
     assert_eq!(
-        crate::control::typed::reply_to(&d, &wrong),
+        crate::control::typed::reply(&d, &wrong).await,
         Some(error_reply(status::MALFORMED, "files.path should be text"))
     );
-    let groups = files_of(&same(&d, json!({"cmd": "files", "path": "Groups"})));
+    let groups = files_of(&same(&d, json!({"cmd": "files", "path": "Groups"})).await);
     assert_eq!(groups.files[0].group.map(hex::encode), Some(group.clone()));
-    let shared = files_of(&same(&d, json!({"cmd": "files", "path": "Groups/Kin"})));
+    let shared = files_of(&same(&d, json!({"cmd": "files", "path": "Groups/Kin"})).await);
     assert_eq!(shared.place.kind, "shared");
 
     // ---- messages ----
     let by_id = format!("{EXACT}{group}");
-    same(&d, json!({"cmd": "messages", "group": by_id}));
+    same(&d, json!({"cmd": "messages", "group": by_id})).await;
     for i in 0..30 {
         let text = format!("message {i} {}", "word ".repeat(i));
         crate::groups::say(&d, &group, &text, None, &[])
             .await
             .unwrap();
     }
-    let all = messages_of(&same(&d, json!({"cmd": "messages", "group": by_id})));
+    let all = messages_of(&same(&d, json!({"cmd": "messages", "group": by_id})).await);
     assert_eq!(all.messages.len(), 30);
     let first = hex::encode(all.messages[0].id);
     let tenth = hex::encode(all.messages[10].id);
@@ -268,7 +271,7 @@ async fn typed_replies_are_the_bytes_they_were_by_name() {
     crate::groups::say(&d, &group, "with a file", None, &[local.to_owned()])
         .await
         .unwrap();
-    let all = messages_of(&same(&d, json!({"cmd": "messages", "group": "Kin"})));
+    let all = messages_of(&same(&d, json!({"cmd": "messages", "group": "Kin"})).await);
     assert_eq!(all.messages.len(), 32);
     assert_eq!(all.messages[30].reply_to, Some(all_first(&all)));
     assert_eq!(all.messages[10].reactions.len(), 1);
@@ -287,12 +290,9 @@ async fn typed_replies_are_the_bytes_they_were_by_name() {
         json!({"cmd": "messages", "who": format!("{EXACT}0011223344556677")}),
         json!({"cmd": "messages"}),
     ] {
-        same(&d, req);
+        same(&d, req).await;
     }
-    let page = messages_of(&same(
-        &d,
-        json!({"cmd": "messages", "group": by_id, "limit": 5}),
-    ));
+    let page = messages_of(&same(&d, json!({"cmd": "messages", "group": by_id, "limit": 5})).await);
     assert!(page.more);
     assert_eq!(page.next, Some(page.messages[0].id));
     // more than a message holds: cut by size, and one too large alone
@@ -302,7 +302,7 @@ async fn typed_replies_are_the_bytes_they_were_by_name() {
             .await
             .unwrap();
     }
-    let page = messages_of(&same(&d, json!({"cmd": "messages", "group": by_id})));
+    let page = messages_of(&same(&d, json!({"cmd": "messages", "group": by_id})).await);
     assert!(
         page.more && page.messages.len() == 4,
         "{}",
@@ -314,7 +314,7 @@ async fn typed_replies_are_the_bytes_they_were_by_name() {
         .with(2, format!("{EXACT}{group}"))
         .encode();
     assert_eq!(
-        crate::control::typed::reply_to(&d, &nul),
+        crate::control::typed::reply(&d, &nul).await,
         Some(error_reply(
             status::MALFORMED,
             "messages.group is text that begins with NUL"
@@ -322,7 +322,7 @@ async fn typed_replies_are_the_bytes_they_were_by_name() {
     );
 
     // ---- call ----
-    same(&d, json!({"cmd": "call"}));
+    same(&d, json!({"cmd": "call"})).await;
     *d.call_ended.lock().unwrap() = Some(CallEnded {
         group: Some([7; 32]),
         how: "declined".into(),
@@ -331,7 +331,7 @@ async fn typed_replies_are_the_bytes_they_were_by_name() {
         who: [2; 8],
         at: 1_790_000_000_000,
     });
-    same(&d, json!({"cmd": "call"}));
+    same(&d, json!({"cmd": "call"})).await;
     *d.call_ended.lock().unwrap() = Some(CallEnded {
         group: None,
         how: "ended".into(),
@@ -340,7 +340,7 @@ async fn typed_replies_are_the_bytes_they_were_by_name() {
         who: [4; 8],
         at: 5,
     });
-    let msg = same(&d, json!({"cmd": "call"}));
+    let msg = same(&d, json!({"cmd": "call"})).await;
     let r = read_reply::<CallArgs>(&msg).unwrap().unwrap();
     assert_eq!(r.ended.unwrap().name, "Ann");
 }
@@ -449,7 +449,7 @@ fn a_full_call_is_what_its_tree_was() {
         ended: None,
     };
     let spec = CallArgs::REQUEST;
-    let msg = typed::reply_message(&reply);
+    let msg = typed::reply_message("call", &reply);
     assert_eq!(msg, encode_reply(spec, Ok(&tree)));
     assert_eq!(read_reply::<CallArgs>(&msg).unwrap().unwrap(), reply);
     // the reply's record: its count, then status 0 and `call` by their keys
@@ -503,7 +503,14 @@ fn an_item_too_large_alone_is_named_the_same_way() {
         mine: true,
         text,
         state: Some("sent".into()),
-        ..Message::default()
+        attachments: vec![],
+        edited: false,
+        reactions: vec![],
+        from: None,
+        picture: None,
+        read_by: None,
+        reply_to: None,
+        time: None,
     };
     let as_tree = |m: &Message| {
         json!({"id": hex::encode(m.id), "mine": m.mine, "text": m.text, "state": m.state,
@@ -526,24 +533,33 @@ fn an_item_too_large_alone_is_named_the_same_way() {
             .map(|(i, t)| message(i as u8, t))
             .collect();
         let tree = json!({"messages": messages.iter().map(as_tree).collect::<Vec<_>>()});
-        let args = MessagesArgs::default();
+        let args = MessagesArgs::new();
         let reply = MessagesReply {
             messages,
-            ..MessagesReply::default()
+            group: None,
+            name: None,
+            more: false,
+            next: None,
         };
         let spec = MessagesArgs::REQUEST;
         let old = match page(spec, &json!({}), tree) {
             Ok(v) => encode_reply(spec, Ok(&v)),
             Err((st, why, item)) => error_reply_with(st, &why, &item),
         };
-        let new = crate::control::typed::messages_reply(&args, reply);
+        let new = args.reply_bytes(reply);
         assert_eq!(old, new, "{}", render_reply(spec, &new));
     }
     let file = |name: String| File {
         name,
         folder: false,
         versions: Some(1),
-        ..File::default()
+        added_by: None,
+        category: None,
+        mine: None,
+        size: None,
+        time: None,
+        who: None,
+        group: None,
     };
     for names in [
         vec!["a".to_owned(), big.clone()],
@@ -555,21 +571,26 @@ fn an_item_too_large_alone_is_named_the_same_way() {
             files: names.into_iter().map(file).collect(),
             place: Place {
                 kind: "mine".into(),
-                ..Place::default()
+                name: None,
+                who: None,
+                group: None,
             },
-            ..FilesReply::default()
+            path: String::new(),
+            more: false,
+            next: None,
         };
         for after in [0u64, 1] {
             let args = FilesArgs {
                 after: Some(after),
-                ..FilesArgs::default()
+                path: None,
+                limit: None,
             };
             let spec = FilesArgs::REQUEST;
             let old = match page(spec, &json!({"after": after}), tree.clone()) {
                 Ok(v) => encode_reply(spec, Ok(&v)),
                 Err((st, why, item)) => error_reply_with(st, &why, &item),
             };
-            let new = crate::control::typed::files_reply(&args, reply.clone());
+            let new = args.reply_bytes(reply.clone());
             assert_eq!(old, new, "{}", render_reply(spec, &new));
         }
     }
@@ -692,7 +713,7 @@ fn frames_events_and_errors_are_the_bytes_they_were() {
                 id: id.map(bytes::Bytes::copy_from_slice),
             };
             assert_eq!(old, error_reply_with(st, why, &more));
-            if more == ErrorMore::default() {
+            if more == ErrorMore::new() {
                 assert_eq!(old, error_reply(st, why));
             }
         }
@@ -860,7 +881,7 @@ async fn pairing_and_the_clipboard_are_answered_the_same() {
 
     // ---- the clipboard ----
     let r = typed_of::<ClipArgs>(&t.same(json!({"cmd": "clip"})).await);
-    assert_eq!(r, ClipReply::default());
+    assert_eq!(r, ClipReply::new());
     for req in [
         json!({"cmd": "clip-copy"}),
         json!({"cmd": "clip-copy", "text": ""}),
@@ -893,7 +914,7 @@ fn a_shown_code_is_what_its_tree_was() {
         };
         let tree = json!({"code": "ab12-cd34", "addrs": addrs});
         assert_eq!(
-            typed::reply_message(&reply),
+            typed::reply_message("pair-show", &reply),
             encode_reply(PairShowArgs::REQUEST, Ok(&tree))
         );
     }
@@ -1046,4 +1067,111 @@ async fn the_one_folder_is_changed_the_same() {
     }
     let r = typed_of::<PinArgs>(&t.same(json!({"cmd": "pin", "path": "Docs"})).await);
     assert_eq!((r.path.as_str(), r.on_demand), ("Docs", false));
+}
+
+/// A contact named by name, by the start of their id and by their id as
+/// bytes, and `before` in each form, typed against main's handlers; with
+/// the two old oddities kept to the byte (DEVIATIONS.md, Old oddities
+/// kept): a refused contact named by bytes is named NUL first, and
+/// `before` as text that is NUL and an id once trimmed finds that id. The
+/// contact's conversation is not held here (a relationship needs the
+/// other's identity); a group's is, and takes `before` the same way.
+#[tokio::test]
+async fn a_contact_and_before_are_the_bytes_they_were() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut t = Twins::start(dir.path()).await;
+    let them = [9u8; 32];
+    for d in [&t.old, &t.new] {
+        let acc = d.core().account_id().unwrap();
+        let op = cardinal_space::account::create_contact(
+            &them,
+            "Ann",
+            &[7; 32],
+            cardinal_space::account::Regard::default(),
+        );
+        d.write_and_push(&acc, vec![op]).unwrap();
+    }
+    let short = format!("{EXACT}{}", hex::encode(&them[..8]));
+    let whole = format!("{EXACT}{}", hex::encode(them));
+    let forms = [
+        "Ann",
+        "ann",
+        &hex::encode(&them[..8]),
+        &short,
+        &whole,
+        "Bob",
+    ];
+    for who in forms {
+        t.same(json!({"cmd": "messages", "who": who})).await;
+        t.same(json!({"cmd": "messages", "who": who, "before": "00"}))
+            .await;
+    }
+    // refused, and named by bytes: NUL first in the words, as before
+    for d in [&t.old, &t.new] {
+        crate::contacts::set(d, "Ann", "refuse").unwrap();
+    }
+    for who in forms {
+        let msg = t.same(json!({"cmd": "messages", "who": who})).await;
+        if who.starts_with(EXACT) {
+            let why = failed_of::<MessagesArgs>(&msg).why;
+            assert!(why.starts_with("you have refused \u{0}"), "{why:?}");
+        }
+    }
+
+    // `before`, in a group's conversation
+    let made = |d: &Arc<Daemon>| {
+        let g = crate::groups::create(d, "Kin", &[], false, true).unwrap();
+        hex::decode(g["group"].as_str().unwrap()).unwrap()
+    };
+    let (go, gn) = (made(&t.old), made(&t.new));
+    t.alike(&go, &gn);
+    for i in 0..3 {
+        for d in [&t.old, &t.new] {
+            crate::groups::say(d, "Kin", &format!("m{i}"), None, &[])
+                .await
+                .unwrap();
+        }
+    }
+    let ids = |d: &Arc<Daemon>| {
+        let r = crate::control::typed::messages(
+            d,
+            &MessagesArgs {
+                who: None,
+                group: Some(typed::Reference::Typed("Kin".into())),
+                before: None,
+                limit: None,
+            },
+        )
+        .unwrap();
+        r.messages
+            .iter()
+            .map(|m| (m.id, m.time.unwrap()))
+            .collect::<Vec<_>>()
+    };
+    let (io, inew) = (ids(&t.old), ids(&t.new));
+    for ((o, ot), (n, nt)) in io.iter().zip(&inew) {
+        t.alike(o, n);
+        t.alike_time(*ot, *nt);
+    }
+    let (o, n) = (io[2].0, inew[2].0);
+    // what an error names of them: their starts
+    t.alike(&o[..8], &n[..8]);
+    t.alike(&o[..5], &n[..5]);
+    let forms: [fn([u8; 16]) -> String; 7] = [
+        |id| format!("{EXACT}{}", hex::encode(id)),
+        |id| hex::encode(id),
+        |id| format!("  {}  ", hex::encode(id)),
+        |id| hex::encode(&id[..5]),
+        // the oddity: a space, then NUL and the id
+        |id| format!(" {EXACT}{}", hex::encode(id)),
+        |id| format!(" {EXACT}{}", hex::encode(&id[..5])),
+        |id| format!("{EXACT}{}", hex::encode(&id[..8])),
+    ];
+    for (i, form) in forms.iter().enumerate() {
+        let req = |id| json!({"cmd": "messages", "group": "Kin", "before": form(id)});
+        let msg = t.same_as(req(o), req(n)).await;
+        if i == 4 {
+            assert_eq!(typed_of::<MessagesArgs>(&msg).messages.len(), 2);
+        }
+    }
 }

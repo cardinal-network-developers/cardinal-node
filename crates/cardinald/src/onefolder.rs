@@ -16,7 +16,7 @@ use cardinal_link::Priority;
 use cardinal_space::account::ContactRecord;
 use cardinal_space::files::{self, Content, FileKind, Files, Kinds};
 use cardinal_space::{group, relationship, NodeId, Space, SpaceId, SpaceOp, ROOT};
-#[cfg(any(test, feature = "by-name"))]
+#[cfg(any(test, debug_assertions, feature = "by-name"))]
 use serde_json::{json, Value as Json};
 
 use crate::api::short_id;
@@ -445,7 +445,12 @@ pub fn list(d: &Daemon, path: &str) -> anyhow::Result<FilesReply> {
                         folder: true,
                         group,
                         who: group.is_none().then(|| s.who_id()).flatten(),
-                        ..File::default()
+                        added_by: None,
+                        category: None,
+                        mine: None,
+                        size: None,
+                        time: None,
+                        versions: None,
                     },
                 ));
             }
@@ -475,7 +480,13 @@ pub fn list(d: &Daemon, path: &str) -> anyhow::Result<FilesReply> {
                             name: c.clone(),
                             folder: true,
                             category: Some(true),
-                            ..File::default()
+                            added_by: None,
+                            mine: None,
+                            size: None,
+                            time: None,
+                            versions: None,
+                            who: None,
+                            group: None,
                         },
                     ));
                 }
@@ -510,7 +521,9 @@ pub fn list(d: &Daemon, path: &str) -> anyhow::Result<FilesReply> {
                             .is_some()
                             .then(|| shown.is_some_and(|v| Some(v.author) == me)),
                         added_by: first.map(|v| called(&v.author)),
-                        ..File::default()
+                        category: None,
+                        who: None,
+                        group: None,
                     },
                 ));
             }
@@ -523,7 +536,8 @@ pub fn list(d: &Daemon, path: &str) -> anyhow::Result<FilesReply> {
         Place::Category(c) => api::Place {
             kind: "category".into(),
             name: Some(c.clone()),
-            ..api::Place::default()
+            who: None,
+            group: None,
         },
         Place::In(At {
             shared: Some(s), ..
@@ -538,7 +552,9 @@ pub fn list(d: &Daemon, path: &str) -> anyhow::Result<FilesReply> {
         }
         Place::In(_) => api::Place {
             kind: "mine".into(),
-            ..api::Place::default()
+            name: None,
+            who: None,
+            group: None,
         },
     };
     Ok(FilesReply {
@@ -548,96 +564,6 @@ pub fn list(d: &Daemon, path: &str) -> anyhow::Result<FilesReply> {
         more: false,
         next: None,
     })
-}
-
-/// [`list`] as it was before it was typed, by name: kept only to show that
-/// the typed one sends the same bytes (`api::typed_tests`) and to measure
-/// the two (`benches/interface.rs`). It goes with the way by name.
-#[cfg(any(test, feature = "by-name"))]
-#[doc(hidden)]
-pub fn list_by_name(d: &Daemon, path: &str) -> anyhow::Result<Json> {
-    let place = resolve(d, path)?;
-    let shown = relationships(d);
-    let mut found: Vec<(bool, Json)> = Vec::new();
-    match &place {
-        Place::Category(c) => {
-            for s in shown.iter().filter(|s| &s.category == c) {
-                let mut e = json!({"name": s.name, "folder": true});
-                match s.group() {
-                    Some(g) => e["group"] = json!(hex::encode(g)),
-                    None => e["who"] = json!(s.who()),
-                }
-                found.push((false, e));
-            }
-        }
-        Place::In(at) => {
-            anyhow::ensure!(at.is_folder(), "{path} is not a folder");
-            let cats = categories(&shown);
-            let core = d.core();
-            let me = core.identity.as_ref().map(|i| i.id());
-            let files = Files::new(open(&core, &at.space)?);
-            // Who added a file, where it was someone else: by what this
-            // person calls them.
-            let called = |who: &[u8; 32]| {
-                core.contacts()
-                    .into_iter()
-                    .find(|c| &c.identity == who)
-                    .map(|c| c.petname)
-                    .unwrap_or_else(|| cardinal_space::account::short_key(who))
-            };
-            let at_root = at.shared.is_none() && at.node == ROOT;
-            if at_root {
-                for c in &cats {
-                    found.push((false, json!({"name": c, "folder": true, "category": true})));
-                }
-            }
-            let entries = if at_root {
-                root_entries(&files, &cats)
-            } else {
-                files
-                    .list(&at.node)
-                    .into_iter()
-                    .map(|e| (e.name.clone(), e))
-                    .collect()
-            };
-            for (name, e) in entries {
-                let is_folder = e.kind == FileKind::Folder;
-                let versions = files.content(&e.node);
-                let shown = match e.conflict_version {
-                    Some(v) => versions.iter().find(|x| x.entry == v),
-                    None => versions.last(),
-                };
-                let mut entry = json!({
-                    "name": name,
-                    "folder": is_folder,
-                    "size": shown.and_then(|v| v.content.as_ref()).map(|c| c.size()),
-                    "time": shown.and_then(|v| v.time),
-                    "versions": versions.len(),
-                });
-                if at.shared.is_some() {
-                    entry["mine"] = json!(shown.is_some_and(|v| Some(v.author) == me));
-                }
-                if let Some(first) = versions.first().filter(|v| Some(v.author) != me) {
-                    entry["added_by"] = json!(called(&first.author));
-                }
-                found.push((!is_folder, entry));
-            }
-        }
-    }
-    found.sort_by_key(|(is_file, e)| (*is_file, e["name"].as_str().map(str::to_lowercase)));
-    let files: Vec<Json> = found.into_iter().map(|(_, e)| e).collect();
-    // What the folder is, so a window need not work it out.
-    let place = match &place {
-        Place::Category(c) => json!({"kind": "category", "name": c}),
-        Place::In(At {
-            shared: Some(s), ..
-        }) => match s.group() {
-            Some(g) => json!({"kind": "shared", "group": hex::encode(g), "name": s.called()}),
-            None => json!({"kind": "shared", "who": s.who(), "name": s.called()}),
-        },
-        Place::In(_) => json!({"kind": "mine"}),
-    };
-    Ok(json!({"path": path, "place": place, "files": files}))
 }
 
 /// The folder and the last name of a path.
@@ -1416,4 +1342,438 @@ pub async fn share(
         path: shown.path(),
         message: true,
     })
+}
+
+// ---- The handlers as they were by name ----
+//
+// What main had, whole, kept only to show that the typed handlers send the
+// same bytes (`control::typed::answering`, `api/same_bytes.rs`), and to
+// measure the two. They go with the way by name.
+
+/// `list` as main had it, by name.
+#[cfg(any(test, debug_assertions, feature = "by-name"))]
+#[allow(dead_code, clippy::all)]
+pub fn list_by_name(d: &Daemon, path: &str) -> anyhow::Result<Json> {
+    let place = resolve(d, path)?;
+    let shown = relationships(d);
+    let mut found: Vec<(bool, Json)> = Vec::new();
+    match &place {
+        Place::Category(c) => {
+            for s in shown.iter().filter(|s| &s.category == c) {
+                let mut e = json!({"name": s.name, "folder": true});
+                match s.group() {
+                    Some(g) => e["group"] = json!(hex::encode(g)),
+                    None => e["who"] = json!(s.who()),
+                }
+                found.push((false, e));
+            }
+        }
+        Place::In(at) => {
+            anyhow::ensure!(at.is_folder(), "{path} is not a folder");
+            let cats = categories(&shown);
+            let core = d.core();
+            let me = core.identity.as_ref().map(|i| i.id());
+            let files = Files::new(open(&core, &at.space)?);
+            // Who added a file, where it was someone else: by what this
+            // person calls them.
+            let called = |who: &[u8; 32]| {
+                core.contacts()
+                    .into_iter()
+                    .find(|c| &c.identity == who)
+                    .map(|c| c.petname)
+                    .unwrap_or_else(|| cardinal_space::account::short_key(who))
+            };
+            let at_root = at.shared.is_none() && at.node == ROOT;
+            if at_root {
+                for c in &cats {
+                    found.push((false, json!({"name": c, "folder": true, "category": true})));
+                }
+            }
+            let entries = if at_root {
+                root_entries(&files, &cats)
+            } else {
+                files
+                    .list(&at.node)
+                    .into_iter()
+                    .map(|e| (e.name.clone(), e))
+                    .collect()
+            };
+            for (name, e) in entries {
+                let is_folder = e.kind == FileKind::Folder;
+                let versions = files.content(&e.node);
+                let shown = match e.conflict_version {
+                    Some(v) => versions.iter().find(|x| x.entry == v),
+                    None => versions.last(),
+                };
+                let mut entry = json!({
+                    "name": name,
+                    "folder": is_folder,
+                    "size": shown.and_then(|v| v.content.as_ref()).map(|c| c.size()),
+                    "time": shown.and_then(|v| v.time),
+                    "versions": versions.len(),
+                });
+                if at.shared.is_some() {
+                    entry["mine"] = json!(shown.is_some_and(|v| Some(v.author) == me));
+                }
+                if let Some(first) = versions.first().filter(|v| Some(v.author) != me) {
+                    entry["added_by"] = json!(called(&first.author));
+                }
+                found.push((!is_folder, entry));
+            }
+        }
+    }
+    found.sort_by_key(|(is_file, e)| (*is_file, e["name"].as_str().map(str::to_lowercase)));
+    let files: Vec<Json> = found.into_iter().map(|(_, e)| e).collect();
+    // What the folder is, so a window need not work it out.
+    let place = match &place {
+        Place::Category(c) => json!({"kind": "category", "name": c}),
+        Place::In(At {
+            shared: Some(s), ..
+        }) => match s.group() {
+            Some(g) => json!({"kind": "shared", "group": hex::encode(g), "name": s.called()}),
+            None => json!({"kind": "shared", "who": s.who(), "name": s.called()}),
+        },
+        Place::In(_) => json!({"kind": "mine"}),
+    };
+    Ok(json!({"path": path, "place": place, "files": files}))
+}
+
+/// `mkdir` as main had it, by name.
+#[cfg(any(test, debug_assertions, feature = "by-name"))]
+#[allow(dead_code, clippy::all)]
+pub fn mkdir_by_name(d: &Arc<Daemon>, path: &str) -> anyhow::Result<Json> {
+    let (parent, name) = split_last(path)?;
+    let at = folder(d, &parent)?;
+    not_a_category(d, &at, &name)?;
+    let op = kinds(d, &at.space)?.create_folder(at.node, &name);
+    d.write_and_push(&at.space, vec![op])?;
+    Ok(json!({"path": path}))
+}
+
+/// `remove` as main had it, by name.
+#[cfg(any(test, debug_assertions, feature = "by-name"))]
+#[allow(dead_code, clippy::all)]
+pub fn remove_by_name(d: &Arc<Daemon>, path: &str) -> anyhow::Result<Json> {
+    let at = match resolve(d, path)? {
+        Place::In(at) if at.is_relationship() => match at.shared.and_then(|s| s.group()) {
+            Some(_) => anyhow::bail!("{path} is the group's, and goes only if you leave it"),
+            None => {
+                anyhow::bail!(
+                    "{path} is what you share with them, and goes only if you refuse them"
+                )
+            }
+        },
+        Place::In(at) if at.node != ROOT => at,
+        _ => anyhow::bail!("{path} cannot be removed"),
+    };
+    let op = match at.version {
+        Some(_) => {
+            let core = d.core();
+            let files = Files::new(open(&core, &at.space)?);
+            let main = files.content(&at.node).pop().and_then(|v| v.content);
+            let main = main.ok_or_else(|| anyhow::anyhow!("{path} has no version to keep"))?;
+            files::set_content(at.node, &main)
+        }
+        None => SpaceOp::delete(at.node),
+    };
+    d.write_and_push(&at.space, vec![op])?;
+    Ok(json!({"path": path}))
+}
+
+/// `move_to` as main had it, by name.
+#[cfg(any(test, debug_assertions, feature = "by-name"))]
+#[allow(dead_code, clippy::all)]
+pub async fn move_to_by_name(d: &Arc<Daemon>, from: &str, to: &str) -> anyhow::Result<Json> {
+    let src = resolve(d, from)?;
+    let (parent, name) = split_last(to)?;
+    let dst = resolve(d, &parent)?;
+    match (src, dst) {
+        (Place::In(s), Place::Category(c)) if s.is_relationship() => {
+            let shown = s.shared.expect("shared");
+            rename_shared(d, &shown, &c, &name)?;
+        }
+        (Place::In(s), Place::In(p)) if s.node != ROOT && s.version.is_none() && p.is_folder() => {
+            not_a_category(d, &p, &name)?;
+            if s.space == p.space {
+                anyhow::ensure!(
+                    !within(d, &p.space, p.node, s.node),
+                    "a folder cannot go inside itself"
+                );
+                d.write_and_push(&s.space, vec![SpaceOp::mv(s.node, p.node, &name)])?;
+            } else {
+                copy_into(d, &s, &p, &name).await?;
+                d.write_and_push(&s.space, vec![SpaceOp::delete(s.node)])?;
+            }
+        }
+        _ => anyhow::bail!("{from} cannot be moved there"),
+    }
+    Ok(json!({"path": to}))
+}
+
+/// `copy` as main had it, by name.
+#[cfg(any(test, debug_assertions, feature = "by-name"))]
+#[allow(dead_code, clippy::all)]
+pub async fn copy_by_name(d: &Arc<Daemon>, from: &str, to: &str) -> anyhow::Result<Json> {
+    let src = match resolve(d, from)? {
+        Place::In(at) => at,
+        Place::Category(_) => anyhow::bail!("{from} lists people, and is no folder to copy"),
+    };
+    let name = parts(from)
+        .last()
+        .map(|n| n.to_string())
+        .ok_or_else(|| anyhow::anyhow!("name something to copy"))?;
+    let dst = folder(d, to)?;
+    not_a_category(d, &dst, &name)?;
+    if src.space == dst.space && src.version.is_none() && src.kind == FileKind::Folder {
+        anyhow::ensure!(
+            !within(d, &dst.space, dst.node, src.node),
+            "a folder cannot be copied into itself"
+        );
+    }
+    copy_into(d, &src, &dst, &name).await?;
+    Ok(json!({"path": format!("{}/{name}", to.trim_end_matches('/'))}))
+}
+
+/// `put` as main had it, by name.
+#[cfg(any(test, debug_assertions, feature = "by-name"))]
+#[allow(dead_code, clippy::all)]
+pub async fn put_by_name(d: &Arc<Daemon>, from: &str, to: &str) -> anyhow::Result<Json> {
+    let path = PathBuf::from(from);
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .ok_or_else(|| anyhow::anyhow!("{from} has no name"))?;
+    let dst = folder(d, to)?;
+    not_a_category(d, &dst, &name)?;
+    let secret = secret(d, &dst.space)?;
+    let d = d.clone();
+    tokio::task::spawn_blocking(move || {
+        let local = read_local(&path, &name)?;
+        // Read now, so a file that cannot be read stops it before anything
+        // is written.
+        fn items(l: LocalItem, d: &Daemon, secret: &ConvergenceSecret) -> anyhow::Result<Item> {
+            Ok(match l {
+                LocalItem::Folder(n, kids) => Item::Folder(
+                    n,
+                    kids.into_iter()
+                        .map(|k| items(k, d, secret))
+                        .collect::<anyhow::Result<_>>()?,
+                ),
+                LocalItem::File(n, p, mode, mtime) => {
+                    let mut f = std::fs::File::open(&p)
+                        .map_err(|e| anyhow::anyhow!("cannot read {}: {e}", p.display()))?;
+                    let size = f.metadata()?.len();
+                    Item::File {
+                        name: n,
+                        content: encode(&mut f, secret, d, size, false)?,
+                        mode,
+                        mtime,
+                    }
+                }
+                LocalItem::Link(n, t) => Item::Link(n, t),
+            })
+        }
+        let item = items(local, &d, &secret)?;
+        write_tree(&d, &dst.space, dst.node, vec![item], |c| Ok(c.clone()))?;
+        Ok(json!({"path": format!("{}/{name}", dst_path_hint(&dst))}))
+    })
+    .await?
+}
+
+/// `write` as main had it, by name.
+#[cfg(any(test, debug_assertions, feature = "by-name"))]
+#[allow(dead_code, clippy::all)]
+pub async fn write_by_name(d: &Arc<Daemon>, from: &str, path: &str) -> anyhow::Result<Json> {
+    let (parent, name) = split_last(path)?;
+    let dst = folder(d, &parent)?;
+    let existing = {
+        let core = d.core();
+        let files = Files::new(open(&core, &dst.space)?);
+        files
+            .list(&dst.node)
+            .into_iter()
+            .find(|e| e.name == name && e.conflict_version.is_none())
+            .map(|e| (e.node, e.kind))
+    };
+    let secret = secret(d, &dst.space)?;
+    let (d2, local) = (d.clone(), PathBuf::from(from));
+    let content = tokio::task::spawn_blocking(move || -> anyhow::Result<Content> {
+        let mut f = std::fs::File::open(&local)
+            .map_err(|e| anyhow::anyhow!("cannot read {}: {e}", local.display()))?;
+        let size = f.metadata()?.len();
+        encode(&mut f, &secret, &d2, size, false)
+    })
+    .await??;
+    match existing {
+        Some((node, FileKind::File)) => {
+            let ops = vec![
+                files::set_content(node, &content),
+                files::set_mtime(node, now_ms()),
+            ];
+            d.write_and_push(&dst.space, ops)?;
+        }
+        Some(_) => anyhow::bail!("{path} is a folder"),
+        None => {
+            not_a_category(d, &dst, &name)?;
+            let op =
+                kinds(d, &dst.space)?.create_file(dst.node, &name, &content, 0o644, Some(now_ms()));
+            d.write_and_push(&dst.space, vec![op])?;
+        }
+    }
+    Ok(json!({"path": path}))
+}
+
+/// `save` as main had it, by name.
+#[cfg(any(test, debug_assertions, feature = "by-name"))]
+#[allow(dead_code, clippy::all)]
+pub async fn save_by_name(
+    d: &Arc<Daemon>,
+    path: &str,
+    to: &str,
+    version: Option<u64>,
+) -> anyhow::Result<Json> {
+    let at = match resolve(d, path)? {
+        Place::In(at) if at.kind == FileKind::File => at,
+        _ => anyhow::bail!("{path} is not a file; save one file at a time"),
+    };
+    let content = {
+        let core = d.core();
+        let sp = open(&core, &at.space)?;
+        match version {
+            Some(n) => crate::file_history::version_of(sp, &at.node, path, n)?,
+            None => {
+                let versions = Files::new(sp).content(&at.node);
+                let v = match at.version {
+                    Some(e) => versions.into_iter().find(|v| v.entry == e),
+                    None => versions.into_iter().last(),
+                };
+                v.and_then(|v| v.content)
+                    .ok_or_else(|| anyhow::anyhow!("{path} has nothing in it to save"))?
+            }
+        }
+    };
+    let to = PathBuf::from(to);
+    let (d, from, written) = (d.clone(), at.others(), to.clone());
+    let size = tokio::task::spawn_blocking(move || -> anyhow::Result<u64> {
+        crate::contacts::write_new(&written, |out| match &content {
+            Content::Inline(b) => {
+                std::io::Write::write_all(out, b)?;
+                Ok(b.len() as u64)
+            }
+            Content::Blob(b) => {
+                let fetcher = Fetcher::from_others(&d, Priority::Interactive, from);
+                let mut reader = BlobReader::new(&*d.store, &fetcher, blob_ref(b));
+                crate::contacts::write_out(&mut reader, out)
+            }
+        })
+    })
+    .await??;
+    Ok(json!({"path": to, "size": size}))
+}
+
+/// `share` as main had it, by name.
+#[cfg(any(test, debug_assertions, feature = "by-name"))]
+#[allow(dead_code, clippy::all)]
+pub async fn share_by_name(
+    d: &Arc<Daemon>,
+    who: Option<&str>,
+    group: Option<&str>,
+    paths: &[String],
+    text: Option<&str>,
+) -> anyhow::Result<Json> {
+    let space = match (who, group) {
+        (Some(_), Some(_)) => anyhow::bail!("share with a contact or a group, not both"),
+        (None, None) => anyhow::bail!("name whom to share with: a contact or a group"),
+        (None, Some(g)) => crate::groups::joined_group_by_name(d, g)?.0,
+        (Some(w), None) => {
+            let contact = crate::contacts::find_by_name(d, w);
+            let in_group = crate::groups::joined_group_by_name(d, w);
+            match (contact, in_group) {
+                (Ok(_), Ok(_)) => anyhow::bail!(
+                    "{w} is both a contact and a group: say which, with --group for the \
+                     group, or by the contact's id"
+                ),
+                (Ok(_), Err(_)) => crate::contacts::listed_by_name(d, w)?.space,
+                (Err(_), Ok((g, _))) => g,
+                (Err(e), Err(_)) => return Err(e),
+            }
+        }
+    };
+    let shown = relationships(d)
+        .into_iter()
+        .find(|s| s.space == space)
+        .ok_or_else(|| anyhow::anyhow!("that folder is not listed"))?;
+    if let Some(g) = shown.group() {
+        crate::groups::ready_to_write(d, &g)?;
+    }
+    let dst = At {
+        space,
+        node: ROOT,
+        version: None,
+        kind: FileKind::Folder,
+        shared: Some(shown.clone()),
+    };
+    let mut sources = Vec::new();
+    for p in paths {
+        match resolve(d, p)? {
+            Place::In(at) if !(at.shared.is_none() && at.node == ROOT) => sources.push((p, at)),
+            _ => anyhow::bail!("{p} cannot be shared"),
+        }
+    }
+    anyhow::ensure!(!sources.is_empty(), "name something to share");
+    let text = text.map(str::trim).filter(|t| !t.is_empty());
+    let Some(text) = text else {
+        for (p, at) in &sources {
+            let name = parts(p).last().map(|n| n.to_string()).unwrap_or_default();
+            copy_into(d, at, &dst, &name).await?;
+        }
+        return Ok(json!({"path": shown.path(), "message": false}));
+    };
+    // The files of a message are blobs, whatever their size.
+    let secret = secret(d, &space)?;
+    let mut attachments = Vec::new();
+    for (p, at) in &sources {
+        let name = parts(p).last().map(|n| n.to_string()).unwrap_or_default();
+        if at.kind != FileKind::File {
+            copy_into(d, at, &dst, &name).await?;
+            continue;
+        }
+        let content = {
+            let core = d.core();
+            let files = Files::new(open(&core, &at.space)?);
+            let versions = files.content(&at.node);
+            let v = match at.version {
+                Some(e) => versions.into_iter().find(|v| v.entry == e),
+                None => versions.into_iter().last(),
+            };
+            v.and_then(|v| v.content)
+                .ok_or_else(|| anyhow::anyhow!("{p} has nothing in it to share"))?
+        };
+        let (d2, from, secret) = (d.clone(), at.others(), secret.clone());
+        let blob =
+            tokio::task::spawn_blocking(move || transfer(&d2, &content, from, &secret, true))
+                .await??;
+        let Content::Blob(blob) = blob else {
+            anyhow::bail!("{p} could not be stored to send");
+        };
+        attachments.push(relationship::Attachment {
+            media_type: crate::contacts::media_type(&name).to_owned(),
+            name,
+            blob: blob.to_record(),
+        });
+    }
+    let conversation = {
+        let core = d.core();
+        relationship::conversation(open(&core, &space)?)
+    };
+    let conversation = conversation.ok_or_else(|| anyhow::anyhow!("that space is not open yet"))?;
+    let mut ops = vec![relationship::create_with(
+        conversation,
+        text,
+        None,
+        &attachments,
+    )];
+    ops.extend(relationship::shared_files(&attachments, Some(now_ms())));
+    d.write_and_push(&space, ops)?;
+    Ok(json!({"path": shown.path(), "message": true}))
 }

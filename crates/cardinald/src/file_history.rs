@@ -376,3 +376,37 @@ pub fn held_or_fetched(
     }
     Ok(left)
 }
+
+// ---- The handlers as they were by name ----
+//
+// What main had, whole, kept only to show that the typed handlers send the
+// same bytes (`control::typed::answering`, `api/same_bytes.rs`), and to
+// measure the two. They go with the way by name.
+
+/// `restore` as main had it, by name.
+#[cfg(any(test, debug_assertions, feature = "by-name"))]
+#[allow(dead_code, clippy::all)]
+pub async fn restore_by_name(d: &Arc<Daemon>, path: &str, version: u64) -> anyhow::Result<Json> {
+    flush_mount(d).await?;
+    let at = in_space(d, path)?;
+    anyhow::ensure!(at.kind == FileKind::File, "{path} is not a file");
+    let content = {
+        let core = d.core();
+        version_of(onefolder::open(&core, &at.space)?, &at.node, path, version)?
+    };
+    // Its content may have been freed here (`cleanup.rs`): get all of it
+    // first, or the restored file could not be read.
+    if let Content::Blob(b) = &content {
+        let (d2, b, others) = (d.clone(), crate::fetch::blob_ref(b), at.others());
+        let missing =
+            tokio::task::spawn_blocking(move || held_or_fetched(&d2, b, others)).await??;
+        if missing > 0 {
+            anyhow::bail!(
+                "version {version} of {path} is no longer kept: this device freed it, and no \
+                 device online now has all of it"
+            );
+        }
+    }
+    d.write_and_push(&at.space, vec![files::set_content(at.node, &content)])?;
+    Ok(json!({"path": path, "version": version}))
+}

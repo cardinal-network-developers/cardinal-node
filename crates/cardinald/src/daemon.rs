@@ -802,6 +802,52 @@ impl Daemon {
         sessions.len()
     }
 
+    /// `network_changed` as main had it, by name: kept only to show the typed
+    /// handler sends the same bytes.
+    #[cfg(any(test, debug_assertions, feature = "by-name"))]
+    pub fn network_changed_by_name(self: &Arc<Self>, why: &str) -> serde_json::Value {
+        let sessions = self.endpoint.sessions();
+        tracing::info!(
+            "{why}: checking {} sessions, then looking again",
+            sessions.len()
+        );
+        for s in &sessions {
+            s.check();
+        }
+        self.unreadable.network_changed();
+        self.known.woke();
+        // What was not reached on the old network may be on this one.
+        lock(&self.backoff).clear();
+        lock(&self.sparing).start_over(Instant::now());
+        crate::hosting::network_changed(self);
+        // A permit is kept if discovery is between rounds.
+        self.rediscover.notify_one();
+        // and the services of the personas this device acts as, which
+        // listen on the same network
+        let inside: Vec<Arc<crate::helper::Helper>> = lock(&self.helper)
+            .iter()
+            .cloned()
+            .chain(lock(&self.personas).values().cloned())
+            .collect();
+        for h in inside {
+            let (hd, why) = (h.d.clone(), why.to_owned());
+            h.d.rt.spawn(async move {
+                hd.network_changed(&why);
+            });
+        }
+        let d = self.clone();
+        tokio::spawn(async move {
+            // At once what has no session, and those whose sessions were
+            // over the old network once they have had time to say so:
+            // long enough for an answer to be missed (`answer_timeout`).
+            d.connect_all().await;
+            tokio::time::sleep(Duration::from_secs(11)).await;
+            d.connect_all().await;
+            crate::rendezvous::reach_contacts(d.clone()).await;
+        });
+        serde_json::json!({"checking": sessions.len()})
+    }
+
     pub fn own_sessions(&self) -> Vec<Session> {
         // Never locks the core: callers may hold the mount's tree.
         let mut v: Vec<Conn> = lock(&self.sessions)

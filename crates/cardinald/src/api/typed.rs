@@ -14,6 +14,9 @@
 //! |---|---|---|
 //! | `String`, `Cow<'static, str>` | text | always |
 //! | `bool` | bool | always, 0 or 1 |
+//! | `i64` | int | always |
+//! | [`Kind`] | kind | a number, or the bytes that name it |
+//! | [`Scalar`] | int or text | as the record says |
 //! | `u64` | uint | always (one at 2^60 or more is this build's mistake) |
 //! | `[u8; N]` | bytes | always; read back only at exactly N bytes |
 //! | `bytes::Bytes` | bytes | always, of any length; taken without a copy |
@@ -21,7 +24,7 @@
 //! | `Vec<T>` | a list of T | always, empty or not |
 //! | a typed record | its record | always |
 //! | `Option<T>` | as T | only when it is `Some` |
-//! | [`Gone<T>`] | a number no longer used, once T | never; passed over when read |
+//! | `n gone name: T` | a number no longer used, once T | never; passed over when read |
 //!
 //! A field that is not an `Option` is one this service always sends; read
 //! back, its absence is an error, as is a value of the wrong type. Fields a
@@ -39,6 +42,7 @@ use crate::transport::MAX_MESSAGE;
 
 // The base encoding's major types (`encoding.md`).
 const T_UINT: u64 = 0;
+const T_NEG: u64 = 1;
 const T_BYTES: u64 = 2;
 const T_TEXT: u64 = 3;
 const T_LIST: u64 = 4;
@@ -46,6 +50,10 @@ const T_RECORD: u64 = 5;
 
 /// The largest integer the base encoding holds, plus one.
 const LIMIT: u64 = 1 << 60;
+
+/// The most items a list read is given room for before they are read, as
+/// the decoder does (`cardinal_encoding`'s codec).
+const MOST_RESERVED: usize = 256;
 
 #[inline]
 pub(crate) fn header(t: u64, n: u64, out: &mut Vec<u8>) {
@@ -89,6 +97,34 @@ pub const fn field_name(s: &'static str) -> &'static str {
     }
 }
 
+/// The numbers of a paged reply's list, `more` and `next`, by their names;
+/// the build fails without one of them.
+pub const fn paged_numbers(fields: &[Field], list: &str) -> [u64; 3] {
+    [
+        number(fields, list),
+        number(fields, "more"),
+        number(fields, "next"),
+    ]
+}
+
+const fn number(fields: &[Field], name: &str) -> u64 {
+    let mut i = 0;
+    while i < fields.len() {
+        let (a, b) = (fields[i].name.as_bytes(), name.as_bytes());
+        if a.len() == b.len() {
+            let mut j = 0;
+            while j < a.len() && a[j] == b[j] {
+                j += 1;
+            }
+            if j == a.len() {
+                return fields[i].n;
+            }
+        }
+        i += 1;
+    }
+    panic!("a paged reply has its list, `more` and `next`")
+}
+
 /// Fails the build unless the fields are numbered in order, each once: the
 /// order the encoding writes them in.
 pub const fn ascending(fields: &[Field]) {
@@ -127,10 +163,18 @@ pub trait Wire: Sized {
     const TY: Ty;
     /// The type of a list of them in the tables.
     const LIST: Ty = Ty::List(&Self::TY);
+    /// Whether it is an `Option`, which only a record's field may be.
+    const OPTIONAL: bool = false;
     /// Whether it is sent: an `Option` that is `None` is not.
     #[inline]
     fn sent(&self) -> bool {
         true
+    }
+    /// Whether the encoding can hold it: an integer it cannot is this
+    /// build's mistake, said as the tables by name said it.
+    #[inline]
+    fn check(&self, _: &At) -> Result<(), String> {
+        Ok(())
     }
     /// Appends its encoding.
     fn encode_into(&self, out: &mut Vec<u8>);
@@ -200,19 +244,18 @@ impl Wire for bool {
 
 impl Wire for u64 {
     const TY: Ty = Ty::Uint;
-    /// One the encoding cannot hold is this build's mistake: it is left
-    /// out, and said, as the service did with a field without a number.
-    fn sent(&self) -> bool {
+    fn check(&self, at: &At) -> Result<(), String> {
         if *self < LIMIT {
-            return true;
+            Ok(())
+        } else {
+            Err(format!("{at} should be below 2^60, not {self}"))
         }
-        tracing::error!("{self} is too large for the local interface; left out");
-        debug_assert!(false, "{self} is too large for the local interface");
-        false
     }
+    /// Only one [`Wire::check`] passed is written: the reply's own fields
+    /// are checked before, and the others are no reply's.
     #[inline]
     fn encode_into(&self, out: &mut Vec<u8>) {
-        header(T_UINT, *self, out);
+        header(T_UINT, (*self).min(LIMIT - 1), out);
     }
     #[inline]
     fn encoded_len(&self) -> usize {
@@ -261,38 +304,117 @@ impl Wire for bytes::Bytes {
     }
 }
 
-/// A field whose number is no longer used (`Ty::Gone`): it keeps its row
-/// in the tables, with the type it had, and is never sent; what comes
-/// under it is passed over, as fields a later version adds are.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct Gone<T>(std::marker::PhantomData<T>);
-
-impl<T: Wire> Wire for Gone<T> {
-    const TY: Ty = Ty::Gone(&T::TY);
-    #[inline]
-    fn sent(&self) -> bool {
-        false
+impl Wire for i64 {
+    const TY: Ty = Ty::Int;
+    fn check(&self, at: &At) -> Result<(), String> {
+        if (-(LIMIT as i64)..LIMIT as i64).contains(self) {
+            Ok(())
+        } else {
+            Err(format!("{at} should be within 2^60, not {self}"))
+        }
     }
     #[inline]
-    fn encode_into(&self, _: &mut Vec<u8>) {}
+    fn encode_into(&self, out: &mut Vec<u8>) {
+        let v = (*self).clamp(-(LIMIT as i64), LIMIT as i64 - 1);
+        if v >= 0 {
+            header(T_UINT, v as u64, out);
+        } else {
+            header(T_NEG, (-1 - v) as u64, out);
+        }
+    }
     #[inline]
     fn encoded_len(&self) -> usize {
-        0
+        let v = (*self).clamp(-(LIMIT as i64), LIMIT as i64 - 1);
+        header_len(if v >= 0 { v as u64 } else { (-1 - v) as u64 })
     }
-    fn take(_: Value, _: &At) -> Result<Self, String> {
-        Ok(Gone(std::marker::PhantomData))
+    fn take(v: Value, at: &At) -> Result<Self, String> {
+        v.as_int().ok_or_else(|| wrong(at, "an integer"))
     }
-    fn absent(_: &At) -> Result<Self, String> {
-        Ok(Gone(std::marker::PhantomData))
+}
+
+/// A kind or a profile (`encoding.md#kinds`): a small number, or the bytes
+/// that name it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Kind {
+    Number(u64),
+    Named(bytes::Bytes),
+}
+
+impl Wire for Kind {
+    const TY: Ty = Ty::Kind;
+    fn check(&self, at: &At) -> Result<(), String> {
+        match self {
+            Kind::Number(n) => n.check(at),
+            Kind::Named(_) => Ok(()),
+        }
+    }
+    fn encode_into(&self, out: &mut Vec<u8>) {
+        match self {
+            Kind::Number(n) => n.encode_into(out),
+            Kind::Named(b) => b.encode_into(out),
+        }
+    }
+    fn encoded_len(&self) -> usize {
+        match self {
+            Kind::Number(n) => n.encoded_len(),
+            Kind::Named(b) => b.encoded_len(),
+        }
+    }
+    fn take(v: Value, at: &At) -> Result<Self, String> {
+        match v {
+            Value::Bytes(b) => Ok(Kind::Named(b.into())),
+            v => u64::take(v, at).map(Kind::Number),
+        }
+    }
+}
+
+/// An integer or text, as the record it is in says.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Scalar {
+    Int(i64),
+    Text(String),
+}
+
+impl Wire for Scalar {
+    const TY: Ty = Ty::Scalar;
+    fn check(&self, at: &At) -> Result<(), String> {
+        match self {
+            Scalar::Int(n) => n.check(at),
+            Scalar::Text(_) => Ok(()),
+        }
+    }
+    fn encode_into(&self, out: &mut Vec<u8>) {
+        match self {
+            Scalar::Int(n) => n.encode_into(out),
+            Scalar::Text(t) => t.encode_into(out),
+        }
+    }
+    fn encoded_len(&self) -> usize {
+        match self {
+            Scalar::Int(n) => n.encoded_len(),
+            Scalar::Text(t) => t.encoded_len(),
+        }
+    }
+    fn take(v: Value, at: &At) -> Result<Self, String> {
+        match v {
+            Value::Text(t) => Ok(Scalar::Text(t)),
+            v => i64::take(v, at).map(Scalar::Int),
+        }
     }
 }
 
 impl<T: Wire> Wire for Option<T> {
-    const TY: Ty = T::TY;
-    const LIST: Ty = T::LIST;
+    const TY: Ty = {
+        assert!(!T::OPTIONAL, "an Option holds no Option");
+        T::TY
+    };
+    const OPTIONAL: bool = true;
     #[inline]
     fn sent(&self) -> bool {
         self.as_ref().is_some_and(Wire::sent)
+    }
+    fn check(&self, at: &At) -> Result<(), String> {
+        self.as_ref().map_or(Ok(()), |v| v.check(at))
     }
     #[inline]
     fn encode_into(&self, out: &mut Vec<u8>) {
@@ -313,7 +435,19 @@ impl<T: Wire> Wire for Option<T> {
 }
 
 impl<T: Wire> Wire for Vec<T> {
-    const TY: Ty = T::LIST;
+    const TY: Ty = {
+        assert!(
+            !T::OPTIONAL,
+            "a list's items are never optional: Option is only a record's field"
+        );
+        T::LIST
+    };
+    fn check(&self, at: &At) -> Result<(), String> {
+        for (i, x) in self.iter().enumerate() {
+            x.check(&At::Item(at, i))?;
+        }
+        Ok(())
+    }
     fn encode_into(&self, out: &mut Vec<u8>) {
         header(T_LIST, self.len() as u64, out);
         for x in self {
@@ -327,7 +461,8 @@ impl<T: Wire> Wire for Vec<T> {
         let Value::List(items) = v else {
             return Err(wrong(at, "a list"));
         };
-        let mut out = Vec::with_capacity(items.len());
+        // no more room first than the decoder itself keeps for a list
+        let mut out = Vec::with_capacity(items.len().min(MOST_RESERVED));
         for (i, x) in items.into_iter().enumerate() {
             out.push(T::take(x, &At::Item(at, i))?);
         }
@@ -402,8 +537,16 @@ pub trait Fields: Sized {
     const FIELDS: &'static [Field];
     /// How many of its fields are sent, leaving out those numbered in `skip`.
     fn present_except(&self, skip: &[u64]) -> u64;
-    /// The encodings of its fields, in order, each after its number.
-    fn encode_fields(&self, out: &mut Vec<u8>);
+    /// The encodings of its fields, in order, each after its number,
+    /// leaving out those numbered in `skip`.
+    fn encode_fields_except(&self, skip: &[u64], out: &mut Vec<u8>);
+    /// The encodings of all its fields.
+    fn encode_fields(&self, out: &mut Vec<u8>) {
+        self.encode_fields_except(&[], out)
+    }
+    /// Its fields that the encoding cannot hold, each with why, in the
+    /// order of their names: none, unless this build has made a mistake.
+    fn invalid(&self, at: &At) -> Vec<(u64, &'static str, String)>;
     /// Their length, leaving out those numbered in `skip`.
     fn fields_len_except(&self, skip: &[u64]) -> usize;
     /// Reads its fields from `r`, from key `first` up, taking what they
@@ -418,19 +561,53 @@ pub trait Fields: Sized {
 }
 
 /// A typed request: its arguments are `Self`, and it answers `Reply`.
-pub trait Ask: Fields {
+/// [`asks!`](super::table) writes it, with how the reply pages, from the
+/// declaration; nothing about a request is written twice.
+pub trait Ask: Fields + Clone + Send + Sync + 'static {
     /// Its row in [`REQUESTS`](super::REQUESTS).
     const REQUEST: &'static Request;
-    type Reply: Fields;
+    type Reply: Fields + Send;
 
-    /// It as a message, numbered.
-    fn encode(&self) -> Vec<u8> {
+    /// Whether answering it changes nothing, so that it may be answered
+    /// twice: where the tests run, by name beside typed, and compared.
+    fn reads(&self) -> bool {
+        false
+    }
+
+    /// The reply as a message: the page asked for, of a paged request.
+    fn reply_bytes(&self, reply: Self::Reply) -> Vec<u8> {
+        reply_message(Self::REQUEST.name, &reply)
+    }
+
+    /// Whether it asks for one page itself (a client's).
+    fn one_page(&self) -> bool {
+        true
+    }
+    /// The request for the page after `had`, the pages so far, if there
+    /// is more.
+    fn next_page(&self, _had: &Self::Reply) -> Option<Self> {
+        None
+    }
+    /// Adds `page`'s items to `all`'s, with its `more` and `next`: whether
+    /// it had any.
+    fn join(_all: &mut Self::Reply, _page: Self::Reply) -> bool {
+        false
+    }
+    /// Every page joined: no `more` or `next` left.
+    fn whole(_all: &mut Self::Reply) {}
+
+    /// It as a message, numbered; or why the encoding cannot hold it, as
+    /// the tables by name said.
+    fn encode(&self) -> anyhow::Result<Vec<u8>> {
+        if let Some((_, _, e)) = self.invalid(&At::Top(Self::REQUEST.name)).first() {
+            anyhow::bail!("{e}");
+        }
         let mut out = Vec::with_capacity(16 + self.fields_len_except(&[]));
         header(T_RECORD, 1 + self.present_except(&[]), &mut out);
         write_varint(0, &mut out);
         Self::REQUEST.n.encode_into(&mut out);
         self.encode_fields(&mut out);
-        out
+        Ok(out)
     }
 
     /// Its arguments from a request off the wire, already read as one
@@ -447,23 +624,42 @@ pub trait Streamed: Fields {
     const KIND: &'static Request;
 
     /// It as a message.
+    /// A field the encoding cannot hold is this build's mistake: it is
+    /// left out, and said.
     fn message(&self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(4 + self.fields_len_except(&[]));
-        header(T_RECORD, 1 + self.present_except(&[]), &mut out);
+        let invalid = self.invalid(&At::Top(Self::KIND.name));
+        let skip: Vec<u64> = invalid.iter().map(|(n, _, _)| *n).collect();
+        if let Some((_, _, e)) = invalid.first() {
+            tracing::error!("{e}; left out");
+        }
+        let mut out = Vec::with_capacity(4 + self.fields_len_except(&skip));
+        header(T_RECORD, 1 + self.present_except(&skip), &mut out);
         write_varint(0, &mut out);
         Self::KIND.n.encode_into(&mut out);
-        self.encode_fields(&mut out);
+        self.encode_fields_except(&skip, &mut out);
         out
     }
 }
 
-/// A reply that says it was done, with `reply`'s fields: as a message.
-pub fn reply_message<R: Fields>(reply: &R) -> Vec<u8> {
-    let mut out = Vec::with_capacity(4 + reply.fields_len_except(&[]));
-    header(T_RECORD, 1 + reply.present_except(&[]), &mut out);
+/// A reply that says it was done, with `reply`'s fields: as a message. A
+/// field the encoding cannot hold is this build's mistake, met as the
+/// tables by name met it: where the tests run (a debug build) the request
+/// fails, `internal: ...`; elsewhere that field is left out; either way the
+/// service says so in its log.
+pub fn reply_message<R: Fields>(name: &str, reply: &R) -> Vec<u8> {
+    let invalid = reply.invalid(&At::Top(name));
+    let skip: Vec<u64> = invalid.iter().map(|(n, _, _)| *n).collect();
+    if let Some((_, _, e)) = invalid.first() {
+        tracing::error!("reply to {name}: {e}");
+        if cfg!(debug_assertions) {
+            return super::error_reply(status::FAILED, &format!("internal: {e}"));
+        }
+    }
+    let mut out = Vec::with_capacity(4 + reply.fields_len_except(&skip));
+    header(T_RECORD, 1 + reply.present_except(&skip), &mut out);
     write_varint(0, &mut out);
     status::OK.encode_into(&mut out);
-    reply.encode_fields(&mut out);
+    reply.encode_fields_except(&skip, &mut out);
     out
 }
 
@@ -485,13 +681,29 @@ impl fmt::Display for Failed {
 
 impl std::error::Error for Failed {}
 
-/// A reply off the wire: what it says, or how it failed.
+/// A reply that could not be read: not one record, or not what the
+/// request answers (a field it always has missing, or of another type).
+/// The service answered; a client says so, and not that none is running.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Unreadable(pub String);
+
+impl fmt::Display for Unreadable {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "could not read the service's reply: {}", self.0)
+    }
+}
+
+impl std::error::Error for Unreadable {}
+
+/// A reply off the wire: what it says, or how it failed. An error is
+/// [`Unreadable`].
 pub fn read_reply<A: Ask>(msg: &[u8]) -> anyhow::Result<Result<A::Reply, Failed>> {
-    let mut r = Record::decode(msg)?;
+    let unreadable = |e: String| anyhow::Error::new(Unreadable(e));
+    let mut r = Record::decode(msg).map_err(|e| unreadable(format!("not one record: {e}")))?;
     let st = r
         .remove(0)
         .and_then(|v| v.as_uint())
-        .ok_or_else(|| anyhow::anyhow!("a reply's key 0 is its status"))?;
+        .ok_or_else(|| unreadable("a reply's key 0 is its status".into()))?;
     if st != status::OK {
         let why = match r.remove(WHY) {
             Some(Value::Text(t)) if !t.is_empty() => t,
@@ -510,7 +722,7 @@ pub fn read_reply<A: Ask>(msg: &[u8]) -> anyhow::Result<Result<A::Reply, Failed>
         }));
     }
     r.remove(WHY);
-    let reply = A::Reply::take_fields(r, &At::Top(A::REQUEST.name)).map_err(anyhow::Error::msg)?;
+    let reply = A::Reply::take_fields(r, &At::Top(A::REQUEST.name)).map_err(unreadable)?;
     Ok(Ok(reply))
 }
 

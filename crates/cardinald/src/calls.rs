@@ -1263,6 +1263,11 @@ pub fn current(d: &Daemon) -> api::CallReply {
         c.and_then(|c| crate::names::picture(d, &c))
     };
     let mut call = api::Call {
+        admins: None,
+        caller: None,
+        for_call: None,
+        joins: None,
+        reach: None,
         id,
         who: api::short_id(&who),
         name,
@@ -1278,7 +1283,6 @@ pub fn current(d: &Daemon) -> api::CallReply {
         taken,
         they_take,
         camera,
-        ..api::Call::default()
     };
     // In a group: its name, whether it was made for a call, who looks after
     // it, who rang, and whether answering joins it (D92, D93).
@@ -1298,32 +1302,6 @@ pub fn current(d: &Daemon) -> api::CallReply {
         call: Some(call),
         ended,
     }
-}
-
-/// [`current`] as it was before it was typed, by name, without a call
-/// under way (the benchmark's case): kept only to show that the typed one
-/// sends the same bytes, and to measure the two. It goes with the way by
-/// name.
-#[cfg(any(test, feature = "by-name"))]
-#[doc(hidden)]
-pub fn current_by_name(d: &Daemon) -> Json {
-    assert!(lock(d).is_none(), "by name only without a call");
-    let ended = d
-        .call_ended
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .clone()
-        .map(|e| {
-            json!({
-                "id": hex::encode(e.id),
-                "who": hex::encode(e.who),
-                "name": e.name,
-                "group": e.group.map(hex::encode),
-                "how": e.how,
-                "at": e.at,
-            })
-        });
-    json!({"call": null, "ended": ended})
 }
 
 /// Who each voice heard on a group call is, as this person knows them:
@@ -3456,7 +3434,10 @@ async fn carry_media(d: &Arc<Daemon>, mut r: Reader, mut w: Writer) {
         let _ = w.send(&no).await;
         return;
     };
-    if w.send(&reply_message(&api::Done {})).await.is_err() {
+    if w.send(&reply_message("call-media", &api::Done {}))
+        .await
+        .is_err()
+    {
         return;
     }
     if let Some(id) = group_call(d).filter(|id| *id == call) {
@@ -3980,4 +3961,178 @@ mod tests {
         let o = Signal::of(&old).unwrap();
         assert_eq!((o.kind, o.flag, o.caller), (END, None, None));
     }
+}
+
+// ---- The handlers as they were by name ----
+//
+// What main had, whole, kept only to show that the typed handlers send the
+// same bytes (`control::typed::answering`, `api/same_bytes.rs`), and to
+// measure the two. They go with the way by name.
+
+/// `current` as main had it, by name.
+#[cfg(any(test, debug_assertions, feature = "by-name"))]
+#[allow(dead_code, clippy::all)]
+pub fn current_by_name(d: &Daemon) -> Json {
+    // held typed now: as main's `finished` held it, by name
+    let ended = d
+        .call_ended
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
+        .map(|e| {
+            json!({
+                "id": hex::encode(e.id),
+                "who": hex::encode(e.who),
+                "name": e.name,
+                "group": e.group.map(hex::encode),
+                "how": e.how,
+                "at": e.at,
+            })
+        });
+    let (offered, taken, they_take, camera, own_camera) = {
+        let call = lock(d);
+        let hexes = |l: &Option<Vec<Format>>| {
+            l.as_ref()
+                .map(|l| l.iter().map(hex::encode).collect::<Vec<_>>())
+        };
+        call.as_ref().map_or((None, None, None, None, false), |c| {
+            // between two, whether the other side's camera is on
+            let camera = (!c.group && c.standing == Standing::Live)
+                .then(|| c.their_camera.is_some_and(|t| t.elapsed() < CAMERA_FOR));
+            (
+                hexes(&c.offered),
+                hexes(&c.taken),
+                hexes(&c.they_take),
+                camera,
+                c.camera,
+            )
+        })
+    };
+    let (who, name, standing, seconds, space, group, id, caller) = {
+        let call = lock(d);
+        let Some(c) = call.as_ref() else {
+            return json!({"call": null, "ended": ended});
+        };
+        let standing = match c.standing {
+            Standing::Calling => "calling",
+            Standing::Ringing => "ringing",
+            Standing::Live => "live",
+        };
+        (
+            c.who,
+            c.name.clone(),
+            standing,
+            c.live_since.map(|t| t.elapsed().as_secs()),
+            c.space,
+            c.group,
+            c.id,
+            c.caller,
+        )
+    };
+    let (linked, people, frames, heard, cameras) = if group {
+        let gs = groups(d);
+        let g = gs.get(&id);
+        let now = Instant::now();
+        // whose cameras are on: this device's own as its window says
+        let cameras: std::collections::HashSet<Voice> = g.map_or_else(Default::default, |g| {
+            let own = g.tree.own();
+            g.cameras
+                .iter()
+                .filter(|(v, c)| Some(**v) != own && c.on(now))
+                .map(|(v, _)| *v)
+                .chain(own.filter(|_| own_camera))
+                .collect()
+        });
+        (
+            Some(g.map_or(0, |g| g.tree.links())),
+            Some(g.map_or(1, |g| g.tree.on_it(now))),
+            g.map(|g| json!({"in": g.frames_in, "new": g.frames_new})),
+            g.map(|g| g.tree.others_heard(now)),
+            cameras,
+        )
+    } else {
+        (None, None, None, None, Default::default())
+    };
+    let voices = heard.map(|heard| voices_by_name(d, &space, &heard, &cameras));
+    // the picture this person sees for them, if any
+    let picture = {
+        let contacts = d.core().contacts();
+        let c = contacts.into_iter().find(|c| c.identity == who);
+        c.and_then(|c| crate::names::shown_by_name(d, &c).remove("picture"))
+    };
+    let mut call = json!({
+        "id": hex::encode(id),
+        "who": hex::encode(&who[..8]),
+        "name": name,
+        "picture": picture,
+        "state": standing,
+        "seconds": seconds,
+        "group": group.then(|| hex::encode(space)),
+        "linked": linked,
+        "people": people,
+        "frames": frames,
+        "voices": voices,
+        "offered": offered,
+        "taken": taken,
+        "they_take": they_take,
+        "camera": camera,
+    });
+    // In a group: its name, whether it was made for a call, who looks after
+    // it, who rang, and whether answering joins it (D92, D93).
+    if group {
+        let about = crate::groups::call_json_by_name(d, &space, caller.as_ref());
+        if let Some(about) = about.as_object() {
+            for (k, v) in about {
+                if k == "name" && v.as_str().is_some_and(str::is_empty) {
+                    continue;
+                }
+                call[k] = v.clone();
+            }
+        }
+    }
+    json!({"call": call, "ended": ended})
+}
+
+/// `voices` as main had it, by name.
+#[cfg(any(test, debug_assertions, feature = "by-name"))]
+#[allow(dead_code, clippy::all)]
+fn voices_by_name(
+    d: &Daemon,
+    space: &SpaceId,
+    heard: &[Voice],
+    cameras: &std::collections::HashSet<Voice>,
+) -> Vec<Json> {
+    let owners = device_owners(d, space);
+    let core = d.core();
+    let Some(sp) = core.spaces.get(space).and_then(|h| h.space.as_ref()) else {
+        return Vec::new();
+    };
+    let Some(me) = core.identity.as_ref().map(|i| i.id()) else {
+        return Vec::new();
+    };
+    let members = cardinal_space::group::members(sp);
+    let contacts = core.contacts();
+    heard
+        .iter()
+        .filter_map(|v| {
+            let who = owners.get(v)?;
+            let you = *who == me;
+            // named as `group-members` names them: "You", this person's
+            // name for a contact not refused, or else the group's
+            let name = crate::groups::name_of(&me, &contacts, &members, who);
+            let known = (!you && !cardinal_space::account::refused(&contacts, who))
+                .then(|| contacts.iter().find(|c| c.identity == *who))
+                .flatten();
+            let picture = known.and_then(|c| crate::names::shown_by_name(d, c).remove("picture"));
+            Some(json!({
+                "voice": hex::encode(v),
+                "identity": hex::encode(&who[..8]),
+                "name": name,
+                "contact": known.is_some(),
+                "picture": picture,
+                "you": you,
+                "camera": cameras.contains(v),
+            }))
+        })
+        .collect()
 }

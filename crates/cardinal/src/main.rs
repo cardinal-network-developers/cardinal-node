@@ -1452,8 +1452,15 @@ async fn call(paths: &Paths, req: Value) -> anyhow::Result<Value> {
 
 /// [`call`], typed (`cardinald::api::typed`): the reply as its own value,
 /// with no tree of names.
-async fn ask<A: control::Pages>(paths: &Paths, args: A) -> anyhow::Result<A::Reply> {
+async fn ask<A: api::typed::Ask>(paths: &Paths, args: A) -> anyhow::Result<A::Reply> {
     let reply = control::ask(&paths.socket, &args).await;
+    // The service answered, with what this command line cannot read: say
+    // so, and not that none is running.
+    if let Err(e) = &reply {
+        if let Some(u) = e.downcast_ref::<api::typed::Unreadable>() {
+            anyhow::bail!("{u} to {}", A::REQUEST.name);
+        }
+    }
     match not_answering(paths, reply)? {
         Ok(r) => Ok(r),
         Err(failed) => anyhow::bail!("{}", failed.why),
@@ -2381,7 +2388,7 @@ async fn pair(
             at,
             admin: Some(admin),
             device: device.clone(),
-            ..Default::default()
+            ..api::PairTypeArgs::new()
         };
         // Only an admin device adds devices; elsewhere the recovery words
         // approve it. Ask before the code times out on the new device.
@@ -2410,10 +2417,7 @@ async fn pair(
              device you already use. This device is told, and shows it."
         );
     }
-    let args = api::PairShowArgs {
-        device,
-        ..Default::default()
-    };
+    let args = api::PairShowArgs { device };
     let v = ask(paths, args).await?;
     let code = &v.code;
     println!();
@@ -3563,7 +3567,7 @@ async fn client(cmd: Cmd) -> anyhow::Result<()> {
             let path = path.unwrap_or_default();
             let args = api::FilesArgs {
                 path: Some(path),
-                ..Default::default()
+                ..api::FilesArgs::new()
             };
             let v = ask(&paths, args).await?;
             if let Some(name) = v.place.name.as_deref().filter(|_| v.place.kind == "shared") {
@@ -3919,7 +3923,7 @@ async fn client(cmd: Cmd) -> anyhow::Result<()> {
         } => {
             let args = api::MessagesArgs {
                 group: Some(api::typed::Reference::Typed(group.clone())),
-                ..Default::default()
+                ..api::MessagesArgs::new()
             };
             let v = ask(&paths, args).await?;
             // whom nothing carries what this person writes to (D89)
@@ -4103,7 +4107,7 @@ async fn client(cmd: Cmd) -> anyhow::Result<()> {
         Cmd::Messages { who: Some(who) } => {
             let args = api::MessagesArgs {
                 who: Some(api::typed::Reference::Typed(who.clone())),
-                ..Default::default()
+                ..api::MessagesArgs::new()
             };
             let v = ask(&paths, args).await?;
             for m in &v.messages {

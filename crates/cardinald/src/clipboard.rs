@@ -14,7 +14,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use cardinal_encoding::{Record, Value};
 use cardinal_link::{Priority, Service, Session};
-#[cfg(any(test, feature = "by-name"))]
+#[cfg(any(test, debug_assertions, feature = "by-name"))]
 use serde_json::{json, Value as Json};
 use tokio::io::AsyncWriteExt;
 
@@ -111,14 +111,6 @@ pub async fn copy(d: &Arc<Daemon>, text: &str) -> anyhow::Result<crate::api::Cli
     Ok(crate::api::ClipCopyReply { devices: sent })
 }
 
-/// [`copy`] as it answered by name: kept only to show the typed one sends
-/// the same bytes.
-#[cfg(any(test, feature = "by-name"))]
-pub async fn copy_by_name(d: &Arc<Daemon>, text: &str) -> anyhow::Result<Json> {
-    let sent = copy(d, text).await?.devices;
-    Ok(json!({"devices": sent}))
-}
-
 async fn send(s: &Session, message: &Record) -> anyhow::Result<()> {
     let mut st = s.open_stream(Service::EPHEMERAL, Priority::Interactive)?;
     st.send_message(&Value::Record(message.clone())).await?;
@@ -137,22 +129,7 @@ pub fn paste(d: &Daemon) -> crate::api::ClipReply {
             from: Some(c.from),
             here: Some(c.here),
         },
-        None => crate::api::ClipReply::default(),
-    }
-}
-
-/// [`paste`] as it answered by name: kept only to show the typed one sends
-/// the same bytes.
-#[cfg(any(test, feature = "by-name"))]
-pub fn paste_by_name(d: &Daemon) -> Json {
-    let clip = d.clip.lock().unwrap_or_else(|e| e.into_inner()).clone();
-    let now = now_ms();
-    match clip.filter(|c| now.saturating_sub(c.at) <= KEEP.as_millis() as u64) {
-        Some(c) => {
-            let seconds = now.saturating_sub(c.at) / 1000;
-            json!({"text": c.text, "from": c.from, "here": c.here, "seconds": seconds})
-        }
-        None => json!({"text": null}),
+        None => crate::api::ClipReply::new(),
     }
 }
 
@@ -193,4 +170,58 @@ pub fn take(d: &Daemon, s: &Session, v: &Value) {
     });
     drop(clip);
     d.bump();
+}
+
+// ---- The handlers as they were by name ----
+//
+// What main had, whole, kept only to show that the typed handlers send the
+// same bytes (`control::typed::answering`, `api/same_bytes.rs`), and to
+// measure the two. They go with the way by name.
+
+/// `copy` as main had it, by name.
+#[cfg(any(test, debug_assertions, feature = "by-name"))]
+#[allow(dead_code, clippy::all)]
+pub async fn copy_by_name(d: &Arc<Daemon>, text: &str) -> anyhow::Result<Json> {
+    anyhow::ensure!(!text.is_empty(), "nothing to copy");
+    anyhow::ensure!(
+        text.len() <= MAX_TEXT,
+        "too much for the clipboard: {} KiB at most; share a file instead",
+        MAX_TEXT / 1024
+    );
+    let space =
+        account_id(d).ok_or_else(|| anyhow::anyhow!("this device belongs to nobody yet"))?;
+    let at = now_ms();
+    *d.clip.lock().unwrap_or_else(|e| e.into_inner()) = Some(Clip {
+        text: text.to_owned(),
+        from: this_device(d),
+        at,
+        here: true,
+    });
+    let message = Record::new()
+        .with(0, draft_name())
+        .with(1, space)
+        .with(2, text.as_bytes().to_vec())
+        .with(3, at);
+    let mut sent = 0;
+    for s in d.own_sessions() {
+        if send(&s, &message).await.is_ok() {
+            sent += 1;
+        }
+    }
+    Ok(json!({"devices": sent}))
+}
+
+/// `paste` as main had it, by name.
+#[cfg(any(test, debug_assertions, feature = "by-name"))]
+#[allow(dead_code, clippy::all)]
+pub fn paste_by_name(d: &Daemon) -> Json {
+    let clip = d.clip.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    let now = now_ms();
+    match clip.filter(|c| now.saturating_sub(c.at) <= KEEP.as_millis() as u64) {
+        Some(c) => {
+            let seconds = now.saturating_sub(c.at) / 1000;
+            json!({"text": c.text, "from": c.from, "here": c.here, "seconds": seconds})
+        }
+        None => json!({"text": null}),
+    }
 }

@@ -134,7 +134,7 @@ async fn request_one(socket: &std::path::Path, req: &Value) -> anyhow::Result<Va
 /// page after page, and the reply holds every page's items, unless `args`
 /// asks for one page itself, with `limit`, `after` or `before`; as
 /// [`request`] does by name.
-pub async fn ask<A: Pages>(
+pub async fn ask<A: Ask>(
     socket: &std::path::Path,
     args: &A,
 ) -> anyhow::Result<Result<A::Reply, api::typed::Failed>> {
@@ -166,7 +166,7 @@ async fn ask_one<A: Ask>(
     socket: &std::path::Path,
     args: &A,
 ) -> anyhow::Result<Result<A::Reply, api::typed::Failed>> {
-    let msg = args.encode();
+    let msg = args.encode()?;
     let tracing = TRACE.load(Ordering::Relaxed);
     if tracing {
         eprintln!("> {}", api::render_request(&msg));
@@ -183,125 +183,6 @@ async fn ask_one<A: Ask>(
     }
     api::typed::read_reply::<A>(&reply)
 }
-
-/// A typed request whose answer may come in pages (`apps.md`, Pages), for
-/// [`ask`].
-pub trait Pages: Ask + Clone {
-    /// Whether it asks for one page itself.
-    fn one_page(&self) -> bool;
-    /// The request for the page after `had`, the pages so far, if there
-    /// is more.
-    fn next_page(&self, had: &Self::Reply) -> Option<Self>;
-    /// Adds `page`'s items to `all`'s, with its `more` and `next`: whether
-    /// it had any.
-    fn join(all: &mut Self::Reply, page: Self::Reply) -> bool;
-    /// Every page joined: no `more` or `next` left.
-    fn whole(all: &mut Self::Reply);
-}
-
-impl Pages for api::FilesArgs {
-    fn one_page(&self) -> bool {
-        self.after.is_some() || self.limit.is_some()
-    }
-    fn next_page(&self, had: &api::FilesReply) -> Option<Self> {
-        let next = had.next.filter(|_| had.more)?;
-        Some(api::FilesArgs {
-            after: Some(next),
-            ..self.clone()
-        })
-    }
-    fn join(all: &mut api::FilesReply, page: api::FilesReply) -> bool {
-        let grew = !page.files.is_empty();
-        all.files.extend(page.files);
-        (all.more, all.next) = (page.more, page.next);
-        grew
-    }
-    fn whole(all: &mut api::FilesReply) {
-        (all.more, all.next) = (false, None);
-    }
-}
-
-impl Pages for api::MessagesArgs {
-    fn one_page(&self) -> bool {
-        self.before.is_some() || self.limit.is_some()
-    }
-    fn next_page(&self, had: &api::MessagesReply) -> Option<Self> {
-        let next = had.next.filter(|_| had.more)?;
-        Some(api::MessagesArgs {
-            before: Some(api::typed::Reference::Id(next.to_vec())),
-            ..self.clone()
-        })
-    }
-    fn join(all: &mut api::MessagesReply, mut page: api::MessagesReply) -> bool {
-        let grew = !page.messages.is_empty();
-        page.messages.append(&mut all.messages);
-        all.messages = page.messages;
-        (all.more, all.next) = (page.more, page.next);
-        grew
-    }
-    fn whole(all: &mut api::MessagesReply) {
-        (all.more, all.next) = (false, None);
-    }
-}
-
-impl Pages for api::CallArgs {
-    fn one_page(&self) -> bool {
-        true
-    }
-    fn next_page(&self, _: &api::CallReply) -> Option<Self> {
-        None
-    }
-    fn join(_: &mut api::CallReply, _: api::CallReply) -> bool {
-        false
-    }
-    fn whole(_: &mut api::CallReply) {}
-}
-
-/// Typed requests answered whole: one page is all of it.
-macro_rules! whole_pages {
-    ($($args:ty),* $(,)?) => {$(
-        impl Pages for $args {
-            fn one_page(&self) -> bool {
-                true
-            }
-            fn next_page(&self, _: &Self::Reply) -> Option<Self> {
-                None
-            }
-            fn join(_: &mut Self::Reply, _: Self::Reply) -> bool {
-                false
-            }
-            fn whole(_: &mut Self::Reply) {}
-        }
-    )*};
-}
-
-whole_pages!(
-    api::MkdirArgs,
-    api::MoveArgs,
-    api::RemoveArgs,
-    api::CopyArgs,
-    api::PutArgs,
-    api::SaveArgs,
-    api::WriteArgs,
-    api::ShareArgs,
-    api::MountArgs,
-    api::UnmountArgs,
-    api::FlushArgs,
-    api::RestoreArgs,
-    api::PinArgs,
-    api::UnpinArgs,
-    api::RetentionArgs,
-    api::PairShowArgs,
-    api::PairStatusArgs,
-    api::PairTypeArgs,
-    api::ClipCopyArgs,
-    api::ClipArgs,
-    api::ConditionsArgs,
-    api::NetworkChangedArgs,
-    api::MeArgs,
-    api::DeviceRenameArgs,
-    api::WakeArgs,
-);
 
 /// Starts serving the local interface.
 pub fn serve(d: Arc<Daemon>) -> anyhow::Result<tokio::task::JoinHandle<()>> {
@@ -362,7 +243,7 @@ async fn connection(d: Arc<Daemon>, mut r: Reader, mut w: Writer) {
             };
             // A window watching: "on while open" is on while it does.
             let _window = (a.window == Some(true)).then(|| crate::bluetooth::window(&d));
-            if w.send(&api::typed::reply_message(&api::Done {}))
+            if w.send(&api::typed::reply_message("watch", &api::Done {}))
                 .await
                 .is_ok()
             {
@@ -384,15 +265,12 @@ async fn connection(d: Arc<Daemon>, mut r: Reader, mut w: Writer) {
             return;
         }
         // a typed request is answered on its own way, with no names
-        let rec = match typed::dispatch(&d, spec, rec).await {
-            Ok(reply) => {
-                if w.send(&checked(spec, reply)).await.is_err() {
-                    return;
-                }
-                continue;
+        if let Some(answer) = spec.answer {
+            if w.send(&answer(&d, rec).await).await.is_err() {
+                return;
             }
-            Err(rec) => rec,
-        };
+            continue;
+        }
         let req = match api::by_name_from(spec, &rec) {
             Ok(req) => req,
             Err(refused) => {
@@ -425,7 +303,7 @@ async fn connection(d: Arc<Daemon>, mut r: Reader, mut w: Writer) {
 /// answered it before its request was typed: the handlers typed since are
 /// kept by name for it. Only to show the typed way sends the same bytes,
 /// and to measure the two.
-#[cfg(any(test, feature = "by-name"))]
+#[cfg(any(test, debug_assertions, feature = "by-name"))]
 #[doc(hidden)]
 pub async fn by_name(d: &Arc<Daemon>, msg: &[u8]) -> Vec<u8> {
     let (spec, req) = match api::decode_request(msg) {
@@ -476,9 +354,9 @@ pub mod typed {
 
     use cardinal_encoding::Record;
 
+    use crate::api::typed::Ask;
     use crate::api::typed::Reference;
-    use crate::api::typed::{page_after, page_before, reply_message, Ask, Fields, Unpaged};
-    use crate::api::{self, CallArgs, FilesArgs, FilesReply, MessagesArgs, MessagesReply, Request};
+    use crate::api::{self, CallArgs, FilesArgs, FilesReply, MessagesArgs, MessagesReply};
     use crate::api::{
         Checking, ClipArgs, ClipCopyArgs, ClipCopyReply, ClipReply, ConditionsArgs,
         ConditionsReply, DeviceRenameArgs, DeviceRenameReply, MeArgs, MeReply, NetworkChangedArgs,
@@ -493,35 +371,80 @@ pub mod typed {
     use crate::daemon::Daemon;
     use crate::daemon::PairState;
 
-    type Answer = fn(&Arc<Daemon>, Record) -> Vec<u8>;
-
-    /// How a typed request is answered, if it is one.
-    pub(super) fn answers(spec: &Request) -> Option<Answer> {
-        Some(match spec.n {
-            n if n == FilesArgs::REQUEST.n => |d, r| answer::<FilesArgs>(d, r, files, files_reply),
-            n if n == MessagesArgs::REQUEST.n => {
-                |d, r| answer::<MessagesArgs>(d, r, messages, messages_reply)
-            }
-            n if n == CallArgs::REQUEST.n => |d, r| answer::<CallArgs>(d, r, call, call_reply),
-            _ => return None,
-        })
+    /// How a typed request is answered: its handler, given its arguments
+    /// as they came. `asks!` takes the request's answering from here, so a
+    /// typed request with no handler does not compile.
+    pub trait Answer: Ask {
+        fn answer(
+            d: &Arc<Daemon>,
+            a: &Self,
+        ) -> impl std::future::Future<Output = anyhow::Result<Self::Reply>> + Send;
     }
 
     /// The reply to `A`'s request `r`: its arguments as they came, the
     /// handler's answer, and the reply's bytes; or the message refusing it.
-    fn answer<A: Ask>(
+    /// Where the tests run, a request that changes nothing is answered by
+    /// name too, beside, and fails if the two are not the same bytes.
+    pub fn answering<A: Answer>(
         d: &Arc<Daemon>,
         r: Record,
-        handler: fn(&Arc<Daemon>, &A) -> anyhow::Result<A::Reply>,
-        reply: fn(&A, A::Reply) -> Vec<u8>,
-    ) -> Vec<u8> {
-        let a = match A::from_request(r) {
-            Ok(a) => a,
-            Err(refused) => return api::error_reply(refused.status, &refused.why),
-        };
-        match handler(d, &a) {
-            Ok(r) => reply(&a, r),
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Vec<u8>> + Send + '_>> {
+        Box::pin(async move {
+            let a = match A::from_request(r) {
+                Ok(a) => a,
+                Err(refused) => return api::error_reply(refused.status, &refused.why),
+            };
+            let reply = answer_of(d, &a).await;
+            #[cfg(any(test, debug_assertions, feature = "by-name"))]
+            if a.reads() {
+                return beside(d, &a, reply).await;
+            }
+            reply
+        })
+    }
+
+    /// The reply to `a`, as a message.
+    pub async fn answer_of<A: Answer>(d: &Arc<Daemon>, a: &A) -> Vec<u8> {
+        let reply = match A::answer(d, a).await {
+            Ok(reply) => a.reply_bytes(reply),
             Err(e) => super::failed(&super::capitalized(A::REQUEST.name, e)),
+        };
+        super::checked(A::REQUEST, reply)
+    }
+
+    /// `reply`, typed, against the request's answer by name: the same
+    /// bytes, or an error that says how they differ. Each is asked again
+    /// once before they are taken to differ, for what changes between two
+    /// asks (a call's seconds).
+    #[cfg(any(test, debug_assertions, feature = "by-name"))]
+    async fn beside<A: Answer>(d: &Arc<Daemon>, a: &A, reply: Vec<u8>) -> Vec<u8> {
+        let Ok(msg) = a.encode() else {
+            return reply;
+        };
+        let old = super::by_name(d, &msg).await;
+        if old == reply {
+            return reply;
+        }
+        let again = answer_of(d, a).await;
+        let old_again = super::by_name(d, &msg).await;
+        if again == old_again || again == old {
+            return again;
+        }
+        let spec = A::REQUEST;
+        let why = format!(
+            "internal: the typed reply to {} is not the bytes it was by name: typed {}, by \
+             name {}",
+            spec.name,
+            api::render_reply(spec, &again),
+            api::render_reply(spec, &old_again)
+        );
+        tracing::error!("{why}");
+        api::error_reply(api::status::FAILED, &why)
+    }
+
+    impl Answer for FilesArgs {
+        async fn answer(d: &Arc<Daemon>, a: &Self) -> anyhow::Result<FilesReply> {
+            files(d, a)
         }
     }
 
@@ -530,26 +453,9 @@ pub mod typed {
         crate::onefolder::list(d, a.path.as_deref().unwrap_or(""))
     }
 
-    /// `files`: the page asked for, as a message.
-    pub fn files_reply(a: &FilesArgs, mut reply: FilesReply) -> Vec<u8> {
-        // beside the reply's other fields: without the list, `more`, `next`
-        let base = reply.record_len_except(&[2, 5, 6]);
-        let spec = FilesArgs::REQUEST;
-        match page_after(
-            spec,
-            "files",
-            &mut reply.files,
-            base,
-            a.after,
-            a.limit,
-            |_| None,
-        ) {
-            Ok(cut) => {
-                reply.more = cut.more;
-                reply.next = cut.next;
-                reply_message(&reply)
-            }
-            Err(Unpaged(msg)) => msg,
+    impl Answer for MessagesArgs {
+        async fn answer(d: &Arc<Daemon>, a: &Self) -> anyhow::Result<MessagesReply> {
+            messages(d, a)
         }
     }
 
@@ -563,20 +469,9 @@ pub mod typed {
         }
     }
 
-    /// `messages`: the page asked for, the newest first, as a message.
-    pub fn messages_reply(a: &MessagesArgs, mut reply: MessagesReply) -> Vec<u8> {
-        let base = reply.record_len_except(&[3, 5, 6]);
-        let spec = MessagesArgs::REQUEST;
-        let page = page_before(spec, "messages", &mut reply.messages, base, a.limit, |m| {
-            Some(&m.id[..])
-        });
-        match page {
-            Ok(more) => {
-                reply.more = more;
-                reply.next = more.then(|| reply.messages.first().map(|m| m.id)).flatten();
-                reply_message(&reply)
-            }
-            Err(Unpaged(msg)) => msg,
+    impl Answer for CallArgs {
+        async fn answer(d: &Arc<Daemon>, a: &Self) -> anyhow::Result<api::CallReply> {
+            call(d, a)
         }
     }
 
@@ -585,76 +480,15 @@ pub mod typed {
         Ok(crate::calls::current(d))
     }
 
-    /// `call` as a message.
-    pub fn call_reply(_: &CallArgs, reply: api::CallReply) -> Vec<u8> {
-        reply_message(&reply)
-    }
-
-    /// The reply to `spec`'s request `r`, if it is typed; `r` back if it is
-    /// not.
-    pub async fn dispatch(d: &Arc<Daemon>, spec: &Request, r: Record) -> Result<Vec<u8>, Record> {
-        if let Some(answer) = answers(spec) {
-            return Ok(answer(d, r));
-        }
-        /// Each typed request answered whole, and its handler, which may
-        /// wait: `async fn(&Arc<Daemon>, Args) -> anyhow::Result<Reply>`.
-        macro_rules! whole {
-            ($($args:ty => $handler:path),* $(,)?) => {
-                $( if spec.n == <$args as Ask>::REQUEST.n {
-                    let answer = run::<$args, _>(d, r, |d, a| async move { $handler(&d, a).await });
-                    return Ok(answer.await);
-                } )*
-            };
-        }
-        whole! {
-            ConditionsArgs => conditions,
-            NetworkChangedArgs => network_changed,
-            MeArgs => me,
-            DeviceRenameArgs => device_rename,
-            PairShowArgs => pair_show,
-            PairStatusArgs => pair_status,
-            PairTypeArgs => pair_type,
-            WakeArgs => wake,
-            ClipCopyArgs => clip_copy,
-            ClipArgs => clip,
-            MkdirArgs => mkdir,
-            MoveArgs => move_to,
-            RemoveArgs => remove,
-            CopyArgs => copy,
-            PutArgs => put,
-            SaveArgs => save,
-            WriteArgs => write,
-            ShareArgs => share,
-            MountArgs => mount,
-            UnmountArgs => unmount,
-            FlushArgs => flush,
-            RestoreArgs => restore,
-            PinArgs => pin,
-            UnpinArgs => unpin,
-            RetentionArgs => retention,
-        }
-        Err(r)
-    }
-
-    /// The reply to `A`'s request `r`, answered whole: its arguments as
-    /// they came, the handler's answer, and the reply's bytes; or the
-    /// message refusing it.
-    async fn run<A: Ask, F>(
-        d: &Arc<Daemon>,
-        r: Record,
-        handler: impl FnOnce(Arc<Daemon>, A) -> F,
-    ) -> Vec<u8>
-    where
-        F: std::future::Future<Output = anyhow::Result<A::Reply>>,
-    {
-        let a = match A::from_request(r) {
-            Ok(a) => a,
-            Err(refused) => return api::error_reply(refused.status, &refused.why),
+    /// The reply to a typed request's message, or `None` for a request not
+    /// typed: as the service answers it.
+    pub async fn reply(d: &Arc<Daemon>, msg: &[u8]) -> Option<Vec<u8>> {
+        let (spec, r) = match api::decode_record(msg) {
+            Ok(x) => x,
+            Err(refused) => return Some(api::error_reply(refused.status, &refused.why)),
         };
-        match handler(d.clone(), a).await {
-            Ok(reply) => reply_message(&reply),
-            Err(e) => super::failed(&super::capitalized(A::REQUEST.name, e)),
-        }
+        let answer = spec.answer?;
+        Some(answer(d, r).await)
     }
 
     /// An argument a request cannot go without, as the handlers by name
@@ -665,245 +499,266 @@ pub mod typed {
 
     // ---- The service, this device, and the person's devices ----
 
-    async fn conditions(d: &Arc<Daemon>, a: ConditionsArgs) -> anyhow::Result<ConditionsReply> {
-        if let Some(plugged_in) = a.plugged_in {
-            let metered = a.metered.unwrap_or(false);
-            d.conditions.tell(crate::conditions::Told {
-                plugged_in,
-                metered,
-            });
-            d.bump();
+    impl Answer for ConditionsArgs {
+        async fn answer(d: &Arc<Daemon>, a: &Self) -> anyhow::Result<ConditionsReply> {
+            if let Some(plugged_in) = a.plugged_in {
+                let metered = a.metered.unwrap_or(false);
+                d.conditions.tell(crate::conditions::Told {
+                    plugged_in,
+                    metered,
+                });
+                d.bump();
+            }
+            Ok(d.conditions.reply())
         }
-        Ok(d.conditions.reply())
     }
 
-    async fn network_changed(d: &Arc<Daemon>, a: NetworkChangedArgs) -> anyhow::Result<Checking> {
-        let checking = d.network_changed(a.why.as_deref().unwrap_or("told"));
-        Ok(Checking {
-            checking: checking as u64,
-        })
+    impl Answer for NetworkChangedArgs {
+        async fn answer(d: &Arc<Daemon>, a: &Self) -> anyhow::Result<Checking> {
+            let checking = d.network_changed(a.why.as_deref().unwrap_or("told"));
+            Ok(Checking {
+                checking: checking as u64,
+            })
+        }
     }
 
     /// The device woke (D86): what a network change does, said by
     /// whatever sees it wake, as Android does for the app.
-    async fn wake(d: &Arc<Daemon>, _: WakeArgs) -> anyhow::Result<Checking> {
-        let checking = d.network_changed("woke");
-        Ok(Checking {
-            checking: checking as u64,
-        })
-    }
-
-    async fn me(d: &Arc<Daemon>, a: MeArgs) -> anyhow::Result<MeReply> {
-        crate::names::me(d, a.name.as_deref())
-    }
-
-    async fn pair_show(d: &Arc<Daemon>, a: PairShowArgs) -> anyhow::Result<PairShowReply> {
-        // what to call this device, where the window knows better
-        if let Some(name) = super::device_name_given(a.device.as_deref())? {
-            super::rename_this_device(d, &name)?;
+    impl Answer for WakeArgs {
+        async fn answer(d: &Arc<Daemon>, _: &Self) -> anyhow::Result<Checking> {
+            let checking = d.network_changed("woke");
+            Ok(Checking {
+                checking: checking as u64,
+            })
         }
-        let s = crate::pair::show(d).await?;
-        Ok(PairShowReply {
-            code: s.code,
-            addrs: s.addrs.iter().map(|a| a.to_string()).collect(),
-        })
     }
 
-    async fn pair_status(d: &Arc<Daemon>, _: PairStatusArgs) -> anyhow::Result<PairStatusReply> {
-        let ps = d.pairing.lock().unwrap_or_else(|e| e.into_inner()).clone();
-        let state = |state: &'static str| PairStatusReply {
-            state: state.into(),
-            ..PairStatusReply::default()
-        };
-        let power = |p| super::joins_as_name(p).map(Into::into);
-        Ok(match ps {
-            PairState::Idle => state("idle"),
-            PairState::Showing { code } => PairStatusReply {
-                code: Some(code),
-                ..state("showing")
-            },
-            PairState::Joining {
-                admin_name,
-                power: p,
-                ..
-            } => PairStatusReply {
-                admin: Some(admin_name),
-                power: power(p),
-                ..state("joining")
-            },
-            PairState::Joined {
-                admin_name,
-                power: p,
-            } => PairStatusReply {
-                admin: Some(admin_name),
-                files: Some(d.core().files_id().is_some()),
-                power: power(p),
-                ..state("joined")
-            },
-            PairState::Failed(e) => PairStatusReply {
-                error: Some(e),
-                ..state("failed")
-            },
-        })
+    impl Answer for MeArgs {
+        async fn answer(d: &Arc<Daemon>, a: &Self) -> anyhow::Result<MeReply> {
+            crate::names::me(d, a.name.as_deref())
+        }
     }
 
-    async fn pair_type(d: &Arc<Daemon>, a: PairTypeArgs) -> anyhow::Result<PairTypeReply> {
-        let code = needed(a.code.as_deref(), "code")?;
-        let at = match a.at.as_deref() {
-            Some(at) => Some(
-                tokio::net::lookup_host(at)
-                    .await
-                    .ok()
-                    .and_then(|mut i| i.next())
-                    .ok_or_else(|| anyhow::anyhow!("{at} is not an address (ip:port)"))?,
-            ),
-            None => None,
-        };
-        let admin = a.admin.unwrap_or(false);
-        let device = super::device_name_given(a.device.as_deref())?;
-        let words = a.words.as_deref();
-        let name = crate::pair::type_code(d, code, at, admin, words, device.as_deref()).await?;
-        Ok(PairTypeReply { name })
+    impl Answer for PairShowArgs {
+        async fn answer(d: &Arc<Daemon>, a: &Self) -> anyhow::Result<PairShowReply> {
+            // what to call this device, where the window knows better
+            if let Some(name) = super::device_name_given(a.device.as_deref())? {
+                super::rename_this_device(d, &name)?;
+            }
+            let s = crate::pair::show(d).await?;
+            Ok(PairShowReply {
+                code: s.code,
+                addrs: s.addrs.iter().map(|a| a.to_string()).collect(),
+            })
+        }
+    }
+
+    impl Answer for PairStatusArgs {
+        async fn answer(d: &Arc<Daemon>, _: &Self) -> anyhow::Result<PairStatusReply> {
+            let ps = d.pairing.lock().unwrap_or_else(|e| e.into_inner()).clone();
+            let state = |state: &'static str| PairStatusReply::new(state.into());
+            let power = |p| super::joins_as_name(p).map(Into::into);
+            Ok(match ps {
+                PairState::Idle => state("idle"),
+                PairState::Showing { code } => PairStatusReply {
+                    code: Some(code),
+                    ..state("showing")
+                },
+                PairState::Joining {
+                    admin_name,
+                    power: p,
+                    ..
+                } => PairStatusReply {
+                    admin: Some(admin_name),
+                    power: power(p),
+                    ..state("joining")
+                },
+                PairState::Joined {
+                    admin_name,
+                    power: p,
+                } => PairStatusReply {
+                    admin: Some(admin_name),
+                    files: Some(d.core().files_id().is_some()),
+                    power: power(p),
+                    ..state("joined")
+                },
+                PairState::Failed(e) => PairStatusReply {
+                    error: Some(e),
+                    ..state("failed")
+                },
+            })
+        }
+    }
+
+    impl Answer for PairTypeArgs {
+        async fn answer(d: &Arc<Daemon>, a: &Self) -> anyhow::Result<PairTypeReply> {
+            let code = needed(a.code.as_deref(), "code")?;
+            let at = match a.at.as_deref() {
+                Some(at) => Some(
+                    tokio::net::lookup_host(at)
+                        .await
+                        .ok()
+                        .and_then(|mut i| i.next())
+                        .ok_or_else(|| anyhow::anyhow!("{at} is not an address (ip:port)"))?,
+                ),
+                None => None,
+            };
+            let admin = a.admin.unwrap_or(false);
+            let device = super::device_name_given(a.device.as_deref())?;
+            let words = a.words.as_deref();
+            let name = crate::pair::type_code(d, code, at, admin, words, device.as_deref()).await?;
+            Ok(PairTypeReply { name })
+        }
     }
 
     // ---- The clipboard ----
 
-    async fn clip_copy(d: &Arc<Daemon>, a: ClipCopyArgs) -> anyhow::Result<ClipCopyReply> {
-        crate::clipboard::copy(d, needed(a.text.as_deref(), "text")?).await
+    impl Answer for ClipCopyArgs {
+        async fn answer(d: &Arc<Daemon>, a: &Self) -> anyhow::Result<ClipCopyReply> {
+            crate::clipboard::copy(d, needed(a.text.as_deref(), "text")?).await
+        }
     }
 
-    async fn clip(d: &Arc<Daemon>, _: ClipArgs) -> anyhow::Result<ClipReply> {
-        Ok(crate::clipboard::paste(d))
+    impl Answer for ClipArgs {
+        async fn answer(d: &Arc<Daemon>, _: &Self) -> anyhow::Result<ClipReply> {
+            Ok(crate::clipboard::paste(d))
+        }
     }
 
     // ---- The one folder ----
 
-    async fn mkdir(d: &Arc<Daemon>, a: MkdirArgs) -> anyhow::Result<PathReply> {
-        crate::onefolder::mkdir(d, needed(a.path.as_deref(), "path")?)
+    impl Answer for MkdirArgs {
+        async fn answer(d: &Arc<Daemon>, a: &Self) -> anyhow::Result<PathReply> {
+            crate::onefolder::mkdir(d, needed(a.path.as_deref(), "path")?)
+        }
     }
 
-    async fn move_to(d: &Arc<Daemon>, a: MoveArgs) -> anyhow::Result<PathReply> {
-        let (from, to) = (
-            needed(a.from.as_deref(), "from")?,
-            needed(a.to.as_deref(), "to")?,
-        );
-        crate::onefolder::move_to(d, from, to).await
+    impl Answer for MoveArgs {
+        async fn answer(d: &Arc<Daemon>, a: &Self) -> anyhow::Result<PathReply> {
+            let (from, to) = (
+                needed(a.from.as_deref(), "from")?,
+                needed(a.to.as_deref(), "to")?,
+            );
+            crate::onefolder::move_to(d, from, to).await
+        }
     }
 
-    async fn remove(d: &Arc<Daemon>, a: RemoveArgs) -> anyhow::Result<PathReply> {
-        crate::onefolder::remove(d, needed(a.path.as_deref(), "path")?)
+    impl Answer for RemoveArgs {
+        async fn answer(d: &Arc<Daemon>, a: &Self) -> anyhow::Result<PathReply> {
+            crate::onefolder::remove(d, needed(a.path.as_deref(), "path")?)
+        }
     }
 
-    async fn copy(d: &Arc<Daemon>, a: CopyArgs) -> anyhow::Result<PathReply> {
-        let (from, to) = (
-            needed(a.from.as_deref(), "from")?,
-            needed(a.to.as_deref(), "to")?,
-        );
-        crate::onefolder::copy(d, from, to).await
+    impl Answer for CopyArgs {
+        async fn answer(d: &Arc<Daemon>, a: &Self) -> anyhow::Result<PathReply> {
+            let (from, to) = (
+                needed(a.from.as_deref(), "from")?,
+                needed(a.to.as_deref(), "to")?,
+            );
+            crate::onefolder::copy(d, from, to).await
+        }
     }
 
-    async fn put(d: &Arc<Daemon>, a: PutArgs) -> anyhow::Result<PathReply> {
-        let (from, to) = (
-            needed(a.from.as_deref(), "from")?,
-            needed(a.to.as_deref(), "to")?,
-        );
-        crate::onefolder::put(d, from, to).await
+    impl Answer for PutArgs {
+        async fn answer(d: &Arc<Daemon>, a: &Self) -> anyhow::Result<PathReply> {
+            let (from, to) = (
+                needed(a.from.as_deref(), "from")?,
+                needed(a.to.as_deref(), "to")?,
+            );
+            crate::onefolder::put(d, from, to).await
+        }
     }
 
-    async fn save(d: &Arc<Daemon>, a: SaveArgs) -> anyhow::Result<SaveReply> {
-        let (path, to) = (
-            needed(a.path.as_deref(), "path")?,
-            needed(a.to.as_deref(), "to")?,
-        );
-        crate::onefolder::save(d, path, to, a.version).await
+    impl Answer for SaveArgs {
+        async fn answer(d: &Arc<Daemon>, a: &Self) -> anyhow::Result<SaveReply> {
+            let (path, to) = (
+                needed(a.path.as_deref(), "path")?,
+                needed(a.to.as_deref(), "to")?,
+            );
+            crate::onefolder::save(d, path, to, a.version).await
+        }
     }
 
-    async fn write(d: &Arc<Daemon>, a: WriteArgs) -> anyhow::Result<PathReply> {
-        let from = needed(a.from.as_deref(), "from")?;
-        let path = needed(a.path.as_deref(), "path")?;
-        crate::onefolder::write(d, from, path).await
+    impl Answer for WriteArgs {
+        async fn answer(d: &Arc<Daemon>, a: &Self) -> anyhow::Result<PathReply> {
+            let from = needed(a.from.as_deref(), "from")?;
+            let path = needed(a.path.as_deref(), "path")?;
+            crate::onefolder::write(d, from, path).await
+        }
     }
 
-    async fn share(d: &Arc<Daemon>, a: ShareArgs) -> anyhow::Result<ShareReply> {
-        let paths = a.paths.unwrap_or_default();
-        // `share`'s lookups still take a ref as held by name
-        let who = a.who.as_ref().map(Reference::held);
-        let group = a.group.as_ref().map(Reference::held);
-        let text = a.text.as_deref();
-        crate::onefolder::share(d, who.as_deref(), group.as_deref(), &paths, text).await
+    impl Answer for ShareArgs {
+        async fn answer(d: &Arc<Daemon>, a: &Self) -> anyhow::Result<ShareReply> {
+            let paths = a.paths.clone().unwrap_or_default();
+            // `share`'s lookups still take a ref as held by name
+            let who = a.who.as_ref().map(Reference::held);
+            let group = a.group.as_ref().map(Reference::held);
+            let text = a.text.as_deref();
+            crate::onefolder::share(d, who.as_deref(), group.as_deref(), &paths, text).await
+        }
     }
 
-    async fn mount(d: &Arc<Daemon>, a: MountArgs) -> anyhow::Result<PathReply> {
-        let path = super::mount_at(d, a.path.as_deref()).await?;
-        Ok(PathReply {
-            path: path.to_string_lossy().into_owned(),
-        })
+    impl Answer for MountArgs {
+        async fn answer(d: &Arc<Daemon>, a: &Self) -> anyhow::Result<PathReply> {
+            let path = super::mount_at(d, a.path.as_deref()).await?;
+            Ok(PathReply {
+                path: path.to_string_lossy().into_owned(),
+            })
+        }
     }
 
-    async fn unmount(d: &Arc<Daemon>, _: UnmountArgs) -> anyhow::Result<Done> {
-        super::unmount(d).await?;
-        Ok(Done {})
+    impl Answer for UnmountArgs {
+        async fn answer(d: &Arc<Daemon>, _: &Self) -> anyhow::Result<Done> {
+            super::unmount(d).await?;
+            Ok(Done {})
+        }
     }
 
-    async fn flush(d: &Arc<Daemon>, _: FlushArgs) -> anyhow::Result<FlushReply> {
-        let entries = super::flush(d).await? as u64;
-        Ok(FlushReply { entries })
+    impl Answer for FlushArgs {
+        async fn answer(d: &Arc<Daemon>, _: &Self) -> anyhow::Result<FlushReply> {
+            let entries = super::flush(d).await? as u64;
+            Ok(FlushReply { entries })
+        }
     }
 
-    async fn restore(d: &Arc<Daemon>, a: RestoreArgs) -> anyhow::Result<RestoreReply> {
-        let path = needed(a.path.as_deref(), "path")?;
-        let version = a
-            .version
-            .ok_or_else(|| anyhow::anyhow!("missing --version"))?;
-        crate::file_history::restore(d, path, version).await
+    impl Answer for RestoreArgs {
+        async fn answer(d: &Arc<Daemon>, a: &Self) -> anyhow::Result<RestoreReply> {
+            let path = needed(a.path.as_deref(), "path")?;
+            let version = a
+                .version
+                .ok_or_else(|| anyhow::anyhow!("missing --version"))?;
+            crate::file_history::restore(d, path, version).await
+        }
     }
 
-    async fn pin(d: &Arc<Daemon>, a: PinArgs) -> anyhow::Result<PinReply> {
-        let (path, on_demand) = super::pin(d, needed(a.path.as_deref(), "path")?, true)?;
-        Ok(PinReply { on_demand, path })
+    impl Answer for PinArgs {
+        async fn answer(d: &Arc<Daemon>, a: &Self) -> anyhow::Result<PinReply> {
+            let (path, on_demand) = super::pin(d, needed(a.path.as_deref(), "path")?, true)?;
+            Ok(PinReply { on_demand, path })
+        }
     }
 
-    async fn unpin(d: &Arc<Daemon>, a: UnpinArgs) -> anyhow::Result<PinReply> {
-        let (path, on_demand) = super::pin(d, needed(a.path.as_deref(), "path")?, false)?;
-        Ok(PinReply { on_demand, path })
+    impl Answer for UnpinArgs {
+        async fn answer(d: &Arc<Daemon>, a: &Self) -> anyhow::Result<PinReply> {
+            let (path, on_demand) = super::pin(d, needed(a.path.as_deref(), "path")?, false)?;
+            Ok(PinReply { on_demand, path })
+        }
     }
 
-    async fn retention(d: &Arc<Daemon>, a: RetentionArgs) -> anyhow::Result<RetentionReply> {
-        let mode = needed(a.mode, "mode")?;
-        super::set_retention(d, &mode)?;
-        Ok(RetentionReply { retention: mode })
+    impl Answer for RetentionArgs {
+        async fn answer(d: &Arc<Daemon>, a: &Self) -> anyhow::Result<RetentionReply> {
+            let mode = needed(a.mode.clone(), "mode")?;
+            super::set_retention(d, &mode)?;
+            Ok(RetentionReply { retention: mode })
+        }
     }
 
-    async fn device_rename(
-        d: &Arc<Daemon>,
-        a: DeviceRenameArgs,
-    ) -> anyhow::Result<DeviceRenameReply> {
-        let device = needed(a.device.as_ref(), "device")?;
-        let name = needed(a.name.as_deref(), "name")?;
-        super::rename_device(d, device.as_ref(), name)
-    }
-
-    /// The reply to a typed request's message, or `None` for a request not
-    /// typed: as the service answers it, the requests that wait included.
-    pub async fn reply(d: &Arc<Daemon>, msg: &[u8]) -> Option<Vec<u8>> {
-        let (spec, r) = match api::decode_record(msg) {
-            Ok(x) => x,
-            Err(refused) => return Some(api::error_reply(refused.status, &refused.why)),
-        };
-        dispatch(d, spec, r)
-            .await
-            .ok()
-            .map(|reply| super::checked(spec, reply))
-    }
-
-    /// The reply to a typed request's message, or `None` for a request not
-    /// typed: as the service answers it.
-    pub fn reply_to(d: &Arc<Daemon>, msg: &[u8]) -> Option<Vec<u8>> {
-        let (spec, r) = match api::decode_record(msg) {
-            Ok(x) => x,
-            Err(refused) => return Some(api::error_reply(refused.status, &refused.why)),
-        };
-        answers(spec).map(|answer| super::checked(spec, answer(d, r)))
+    impl Answer for DeviceRenameArgs {
+        async fn answer(d: &Arc<Daemon>, a: &Self) -> anyhow::Result<DeviceRenameReply> {
+            let device = needed(a.device.as_ref(), "device")?;
+            let name = needed(a.name.as_deref(), "name")?;
+            super::rename_device(d, device.as_ref(), name)
+        }
     }
 }
 
@@ -966,7 +821,7 @@ fn strings(req: &Value, name: &str) -> Vec<String> {
 
 /// What a client knows of this device's power and network
 /// (`apps.md#the-local-interface`), and what the service makes of it.
-#[cfg(any(test, feature = "by-name"))]
+#[cfg(any(test, debug_assertions, feature = "by-name"))]
 fn conditions(d: &Arc<Daemon>, req: &Value) -> anyhow::Result<Value> {
     let flag = |name| req.get(name).and_then(|v| v.as_bool());
     if let Some(plugged_in) = flag("plugged_in") {
@@ -1060,12 +915,6 @@ fn power_name(p: Power) -> &'static str {
     }
 }
 
-/// A reply that is a path, as it was by name.
-#[cfg(any(test, feature = "by-name"))]
-fn path_json(r: api::PathReply) -> Value {
-    json!({"path": r.path})
-}
-
 /// The path of a node in a files space's state.
 pub fn node_path(st: &State, node: &NodeId) -> String {
     let mut parts = Vec::new();
@@ -1100,8 +949,6 @@ async fn handle(d: &Arc<Daemon>, req: &Value) -> anyhow::Result<Value> {
         "hello" => Ok(json!({"api": API, "version": env!("CARGO_PKG_VERSION")})),
         "setup-begin" => setup_begin(d),
         "setup-finish" => setup_finish(d, req),
-        #[cfg(any(test, feature = "by-name"))]
-        "me" => crate::names::me_by_name(d, req.get("name").and_then(|v| v.as_str())),
         "status" => Ok(status(d)),
         // Inspection (`inspect.rs`): the person turns it on, on this
         // device, and only whoever holds the token it gives may look.
@@ -1136,67 +983,6 @@ async fn handle(d: &Arc<Daemon>, req: &Value) -> anyhow::Result<Value> {
             reload(d)?;
             Ok(json!({}))
         }
-        #[cfg(any(test, feature = "by-name"))]
-        "network-changed" => Ok(json!({
-            "checking": d.network_changed(req.get("why").and_then(|v| v.as_str()).unwrap_or("told"))
-        })),
-        // The device woke (D86): what a network change does, said by
-        // whatever sees it wake, as Android does for the app.
-        #[cfg(any(test, feature = "by-name"))]
-        "wake" => Ok(json!({"checking": d.network_changed("woke")})),
-        #[cfg(any(test, feature = "by-name"))]
-        "flush" => Ok(json!({"entries": flush(d).await?})),
-        #[cfg(any(test, feature = "by-name"))]
-        "pair-show" => {
-            // what to call this device, where the window knows better
-            if let Some(name) = device_name(req)? {
-                rename_this_device(d, &name)?;
-            }
-            let s = crate::pair::show(d).await?;
-            Ok(
-                json!({"code": s.code, "addrs": s.addrs.iter().map(|a| a.to_string()).collect::<Vec<_>>() }),
-            )
-        }
-        #[cfg(any(test, feature = "by-name"))]
-        "pair-status" => {
-            let ps = d.pairing.lock().unwrap_or_else(|e| e.into_inner()).clone();
-            Ok(match ps {
-                PairState::Idle => json!({"state": "idle"}),
-                PairState::Showing { code } => json!({"state": "showing", "code": code}),
-                PairState::Joining {
-                    admin_name, power, ..
-                } => {
-                    json!({"state": "joining", "admin": admin_name, "power": joins_as(power)})
-                }
-                PairState::Joined { admin_name, power } => {
-                    let files = d.core().files_id().is_some();
-                    json!({"state": "joined", "admin": admin_name, "files": files,
-                        "power": joins_as(power)})
-                }
-                PairState::Failed(e) => json!({"state": "failed", "error": e}),
-            })
-        }
-        #[cfg(any(test, feature = "by-name"))]
-        "pair-type" => {
-            let code = arg(req, "code")?;
-            let at = match req.get("at").and_then(|v| v.as_str()) {
-                Some(a) => Some(
-                    tokio::net::lookup_host(a)
-                        .await
-                        .ok()
-                        .and_then(|mut i| i.next())
-                        .ok_or_else(|| anyhow::anyhow!("{a} is not an address (ip:port)"))?,
-                ),
-                None => None,
-            };
-            let admin = req.get("admin").and_then(|v| v.as_bool()).unwrap_or(false);
-            let device = device_name(req)?;
-            let name =
-                crate::pair::type_code(d, code, at, admin, words(req), device.as_deref()).await?;
-            Ok(json!({"name": name}))
-        }
-        #[cfg(any(test, feature = "by-name"))]
-        "device-rename" => rename_device_by_name(d, arg(req, "device")?, arg(req, "name")?),
         "remove-device" => {
             let lost = req.get("lost").and_then(|v| v.as_bool()).unwrap_or(false);
             remove_device(d, arg(req, "who")?, words(req), lost).await
@@ -1370,8 +1156,6 @@ async fn handle(d: &Arc<Daemon>, req: &Value) -> anyhow::Result<Value> {
         }
         "delete-message" => crate::contacts::delete_message(d, arg(req, "who")?, arg(req, "id")?),
         "react" => crate::contacts::react(d, arg(req, "who")?, arg(req, "id")?, arg(req, "text")?),
-        #[cfg(any(test, feature = "by-name"))]
-        "conditions" => conditions(d, req),
         "call-start" if req.get("ring").is_some_and(|r| !r.is_null()) => {
             anyhow::ensure!(
                 req.get("who").is_none_or(Value::is_null),
@@ -1385,10 +1169,6 @@ async fn handle(d: &Arc<Daemon>, req: &Value) -> anyhow::Result<Value> {
             crate::calls::start_group(d, arg(req, "group")?, None).await
         }
         "call-start" => crate::calls::start(d, arg(req, "who")?, formats(req)?).await,
-        #[cfg(any(test, feature = "by-name"))]
-        "clip-copy" => crate::clipboard::copy_by_name(d, arg(req, "text")?).await,
-        #[cfg(any(test, feature = "by-name"))]
-        "clip" => Ok(crate::clipboard::paste_by_name(d)),
         // What programs ask through the application interface, and the
         // person's approvals (`apps.rs`).
         "app-questions" => Ok(crate::apps::questions(d)),
@@ -1408,51 +1188,6 @@ async fn handle(d: &Arc<Daemon>, req: &Value) -> anyhow::Result<Value> {
         "read-markers" => {
             let on = req.get("on").and_then(|v| v.as_bool());
             crate::settings::read_markers(d, on)
-        }
-        #[cfg(any(test, feature = "by-name"))]
-        "mkdir" => crate::onefolder::mkdir(d, arg(req, "path")?).map(path_json),
-        #[cfg(any(test, feature = "by-name"))]
-        "move" => crate::onefolder::move_to(d, arg(req, "from")?, arg(req, "to")?)
-            .await
-            .map(path_json),
-        #[cfg(any(test, feature = "by-name"))]
-        "remove" => crate::onefolder::remove(d, arg(req, "path")?).map(path_json),
-        #[cfg(any(test, feature = "by-name"))]
-        "copy" => crate::onefolder::copy(d, arg(req, "from")?, arg(req, "to")?)
-            .await
-            .map(path_json),
-        #[cfg(any(test, feature = "by-name"))]
-        "put" => crate::onefolder::put(d, arg(req, "from")?, arg(req, "to")?)
-            .await
-            .map(path_json),
-        #[cfg(any(test, feature = "by-name"))]
-        "save" => {
-            let version = req.get("version").and_then(Value::as_u64);
-            crate::onefolder::save(d, arg(req, "path")?, arg(req, "to")?, version)
-                .await
-                .map(|r| json!({"path": r.path, "size": r.size}))
-        }
-        #[cfg(any(test, feature = "by-name"))]
-        "write" => crate::onefolder::write(d, arg(req, "from")?, arg(req, "path")?)
-            .await
-            .map(path_json),
-        #[cfg(any(test, feature = "by-name"))]
-        "share" => {
-            let paths: Vec<String> = req
-                .get("paths")
-                .and_then(|v| v.as_array())
-                .map(|a| {
-                    a.iter()
-                        .filter_map(|p| p.as_str().map(str::to_owned))
-                        .collect()
-                })
-                .unwrap_or_default();
-            let text = req.get("text").and_then(|v| v.as_str());
-            let who = req.get("who").and_then(|v| v.as_str());
-            let group = req.get("group").and_then(|v| v.as_str());
-            crate::onefolder::share(d, who, group, &paths, text)
-                .await
-                .map(|r| json!({"path": r.path, "message": r.message}))
         }
         "recovery-check" => {
             crate::recovery::root_from_words(d, arg(req, "words")?)?;
@@ -1622,16 +1357,6 @@ async fn handle(d: &Arc<Daemon>, req: &Value) -> anyhow::Result<Value> {
                 .collect();
             Ok(json!({"peers": list}))
         }
-        #[cfg(any(test, feature = "by-name"))]
-        "mount" => {
-            let path = mount_at(d, req.get("path").and_then(|v| v.as_str())).await?;
-            Ok(json!({"path": path}))
-        }
-        #[cfg(any(test, feature = "by-name"))]
-        "unmount" => {
-            unmount(d).await?;
-            Ok(json!({}))
-        }
         "conflicts" => conflicts(d),
         "debug-tree" => debug_tree(d),
         "free-space" if req.get("unnamed").and_then(|v| v.as_bool()) == Some(true) => {
@@ -1702,17 +1427,6 @@ async fn handle(d: &Arc<Daemon>, req: &Value) -> anyhow::Result<Value> {
             Ok(json!({"keep": keep.to_string()}))
         }
         "history" => crate::file_history::history(d, arg(req, "path")?),
-        #[cfg(any(test, feature = "by-name"))]
-        "restore" => {
-            let path = arg(req, "path")?.to_owned();
-            let version = req
-                .get("version")
-                .and_then(|v| v.as_u64())
-                .ok_or_else(|| anyhow::anyhow!("missing --version"))?;
-            crate::file_history::restore(d, &path, version)
-                .await
-                .map(|r| json!({"path": r.path, "version": r.version}))
-        }
         "deleted" => crate::file_history::deleted(
             d,
             req.get("path").and_then(Value::as_str).unwrap_or(""),
@@ -1722,18 +1436,217 @@ async fn handle(d: &Arc<Daemon>, req: &Value) -> anyhow::Result<Value> {
             let id = req.get("id").and_then(Value::as_str);
             crate::file_history::undelete(d, arg(req, "path")?, id).await
         }
-        #[cfg(any(test, feature = "by-name"))]
+        "speedtest" => speedtest(d, arg(req, "device")?).await,
+        #[cfg(any(test, debug_assertions, feature = "by-name"))]
+        "me" => crate::names::me_by_name(d, req.get("name").and_then(|v| v.as_str())),
+        #[cfg(any(test, debug_assertions, feature = "by-name"))]
+        "network-changed" => Ok(
+            d.network_changed_by_name(req.get("why").and_then(|v| v.as_str()).unwrap_or("told"))
+        ),
+        #[cfg(any(test, debug_assertions, feature = "by-name"))]
+        "wake" => Ok(d.network_changed_by_name("woke")),
+        #[cfg(any(test, debug_assertions, feature = "by-name"))]
+        "flush" => {
+            let d2 = d.clone();
+            let n = tokio::task::spawn_blocking(move || -> anyhow::Result<usize> {
+                let m = d2.mount.lock().unwrap_or_else(|e| e.into_inner());
+                match m.as_ref() {
+                    Some(m) => m.flush(),
+                    None => Ok(0),
+                }
+            })
+            .await??;
+            Ok(json!({"entries": n}))
+        }
+        #[cfg(any(test, debug_assertions, feature = "by-name"))]
+        "pair-show" => {
+            // what to call this device, where the window knows better
+            if let Some(name) = device_name_by_name(req)? {
+                rename_this_device(d, &name)?;
+            }
+            let s = crate::pair::show(d).await?;
+            Ok(
+                json!({"code": s.code, "addrs": s.addrs.iter().map(|a| a.to_string()).collect::<Vec<_>>() }),
+            )
+        }
+        #[cfg(any(test, debug_assertions, feature = "by-name"))]
+        "pair-status" => {
+            let ps = d.pairing.lock().unwrap_or_else(|e| e.into_inner()).clone();
+            Ok(match ps {
+                PairState::Idle => json!({"state": "idle"}),
+                PairState::Showing { code } => json!({"state": "showing", "code": code}),
+                PairState::Joining {
+                    admin_name, power, ..
+                } => {
+                    json!({"state": "joining", "admin": admin_name, "power": joins_as(power)})
+                }
+                PairState::Joined { admin_name, power } => {
+                    let files = d.core().files_id().is_some();
+                    json!({"state": "joined", "admin": admin_name, "files": files,
+                        "power": joins_as(power)})
+                }
+                PairState::Failed(e) => json!({"state": "failed", "error": e}),
+            })
+        }
+        #[cfg(any(test, debug_assertions, feature = "by-name"))]
+        "pair-type" => {
+            let code = arg(req, "code")?;
+            let at = match req.get("at").and_then(|v| v.as_str()) {
+                Some(a) => Some(
+                    tokio::net::lookup_host(a)
+                        .await
+                        .ok()
+                        .and_then(|mut i| i.next())
+                        .ok_or_else(|| anyhow::anyhow!("{a} is not an address (ip:port)"))?,
+                ),
+                None => None,
+            };
+            let admin = req.get("admin").and_then(|v| v.as_bool()).unwrap_or(false);
+            let device = device_name_by_name(req)?;
+            let name =
+                crate::pair::type_code(d, code, at, admin, words(req), device.as_deref()).await?;
+            Ok(json!({"name": name}))
+        }
+        #[cfg(any(test, debug_assertions, feature = "by-name"))]
+        "device-rename" => rename_device_by_name(d, arg(req, "device")?, arg(req, "name")?),
+        #[cfg(any(test, debug_assertions, feature = "by-name"))]
+        "messages" if req.get("group").is_some() => crate::groups::messages_by_name(
+            d,
+            arg(req, "group")?,
+            req.get("before").and_then(Value::as_str),
+        ),
+        #[cfg(any(test, debug_assertions, feature = "by-name"))]
+        "call" => Ok(crate::calls::current_by_name(d)),
+        #[cfg(any(test, debug_assertions, feature = "by-name"))]
+        "conditions" => conditions(d, req),
+        #[cfg(any(test, debug_assertions, feature = "by-name"))]
+        "clip-copy" => crate::clipboard::copy_by_name(d, arg(req, "text")?).await,
+        #[cfg(any(test, debug_assertions, feature = "by-name"))]
+        "clip" => Ok(crate::clipboard::paste_by_name(d)),
+        #[cfg(any(test, debug_assertions, feature = "by-name"))]
+        "files" => {
+            crate::onefolder::list_by_name(d, req.get("path").and_then(Value::as_str).unwrap_or(""))
+        }
+        #[cfg(any(test, debug_assertions, feature = "by-name"))]
+        "mkdir" => crate::onefolder::mkdir_by_name(d, arg(req, "path")?),
+        #[cfg(any(test, debug_assertions, feature = "by-name"))]
+        "move" => crate::onefolder::move_to_by_name(d, arg(req, "from")?, arg(req, "to")?).await,
+        #[cfg(any(test, debug_assertions, feature = "by-name"))]
+        "remove" => crate::onefolder::remove_by_name(d, arg(req, "path")?),
+        #[cfg(any(test, debug_assertions, feature = "by-name"))]
+        "copy" => crate::onefolder::copy_by_name(d, arg(req, "from")?, arg(req, "to")?).await,
+        #[cfg(any(test, debug_assertions, feature = "by-name"))]
+        "put" => crate::onefolder::put_by_name(d, arg(req, "from")?, arg(req, "to")?).await,
+        #[cfg(any(test, debug_assertions, feature = "by-name"))]
+        "save" => {
+            let version = req.get("version").and_then(Value::as_u64);
+            crate::onefolder::save_by_name(d, arg(req, "path")?, arg(req, "to")?, version).await
+        }
+        #[cfg(any(test, debug_assertions, feature = "by-name"))]
+        "write" => crate::onefolder::write_by_name(d, arg(req, "from")?, arg(req, "path")?).await,
+        #[cfg(any(test, debug_assertions, feature = "by-name"))]
+        "share" => {
+            let paths: Vec<String> = req
+                .get("paths")
+                .and_then(|v| v.as_array())
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|p| p.as_str().map(str::to_owned))
+                        .collect()
+                })
+                .unwrap_or_default();
+            let text = req.get("text").and_then(|v| v.as_str());
+            let who = req.get("who").and_then(|v| v.as_str());
+            let group = req.get("group").and_then(|v| v.as_str());
+            crate::onefolder::share_by_name(d, who, group, &paths, text).await
+        }
+        #[cfg(any(test, debug_assertions, feature = "by-name"))]
+        "messages" => crate::contacts::messages_by_name(
+            d,
+            arg(req, "who")?,
+            req.get("before").and_then(Value::as_str),
+        ),
+        #[cfg(any(test, debug_assertions, feature = "by-name"))]
+        "mount" => {
+            let path = req
+                .get("path")
+                .and_then(|v| v.as_str())
+                .map(std::path::PathBuf::from)
+                .or_else(|| d.config().mount.clone())
+                .unwrap_or_else(|| crate::paths::home_dir().join("Cardinal"));
+            let d2 = d.clone();
+            let p2 = path.clone();
+            tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+                d2.unmount();
+                {
+                    let mut c = d2.config();
+                    c.mount = Some(p2.clone());
+                    c.this_run.no_mount = false;
+                }
+                d2.save_config()?;
+                if d2.core().files_id().is_none() {
+                    return Ok(());
+                }
+                if let Err(e) = crate::daemon::fuse_usable() {
+                    anyhow::bail!("cannot mount: FUSE is not available here ({e})");
+                }
+                d2.ensure_mounted();
+                if d2.mount.lock().unwrap_or_else(|e| e.into_inner()).is_none() {
+                    anyhow::bail!("could not mount at {}; see `cardinal log`", p2.display());
+                }
+                Ok(())
+            })
+            .await??;
+            Ok(json!({"path": path}))
+        }
+        #[cfg(any(test, debug_assertions, feature = "by-name"))]
+        "unmount" => {
+            let d2 = d.clone();
+            tokio::task::spawn_blocking(move || {
+                d2.unmount();
+                d2.config().mount = None;
+                d2.save_config()
+            })
+            .await??;
+            Ok(json!({}))
+        }
+        #[cfg(any(test, debug_assertions, feature = "by-name"))]
+        "restore" => {
+            let path = arg(req, "path")?.to_owned();
+            let version = req
+                .get("version")
+                .and_then(|v| v.as_u64())
+                .ok_or_else(|| anyhow::anyhow!("missing --version"))?;
+            crate::file_history::restore_by_name(d, &path, version).await
+        }
+        #[cfg(any(test, debug_assertions, feature = "by-name"))]
         "pin" | "unpin" => {
-            let (path, on_demand) = pin(d, arg(req, "path")?, cmd == "pin")?;
+            let path = arg(req, "path")?.trim_matches('/').to_owned();
+            {
+                let mut c = d.config();
+                c.pins.retain(|p| *p != path);
+                if cmd == "pin" {
+                    c.pins.push(path.clone());
+                }
+            }
+            d.save_config()?;
+            d.bump();
+            let on_demand = d.config().on_demand();
             Ok(json!({"path": path, "on_demand": on_demand}))
         }
-        #[cfg(any(test, feature = "by-name"))]
+        #[cfg(any(test, debug_assertions, feature = "by-name"))]
         "retention" => {
             let mode = arg(req, "mode")?;
-            set_retention(d, mode)?;
+            if mode != "full" && mode != "on-demand" {
+                anyhow::bail!("retention is `full` or `on-demand`");
+            }
+            d.config().retention = mode.to_owned();
+            d.save_config()?;
+            d.bump();
+            // Record it in the account space for the other devices.
+            d.housekeeping();
             Ok(json!({"retention": mode}))
         }
-        "speedtest" => speedtest(d, arg(req, "device")?).await,
         other => anyhow::bail!("unknown command {other:?}"),
     }
 }
@@ -2464,14 +2377,6 @@ fn rename_device(
     })
 }
 
-/// [`rename_device`] as it answered by name: kept only to show the typed
-/// one sends the same bytes.
-#[cfg(any(test, feature = "by-name"))]
-fn rename_device_by_name(d: &Arc<Daemon>, which: &str, name: &str) -> anyhow::Result<Value> {
-    let r = rename_device(d, api::reference(which), name)?;
-    Ok(json!({"name": r.name, "key": hex::encode(r.key)}))
-}
-
 async fn remove_device(
     d: &Arc<Daemon>,
     who: &str,
@@ -2672,4 +2577,108 @@ mod tests {
             assert!(why.contains("true or false"), "{why}");
         }
     }
+}
+
+// ---- The handlers as they were by name ----
+//
+// What main had, whole, kept only to show that the typed handlers send the
+// same bytes (`control::typed::answering`, `api/same_bytes.rs`), and to
+// measure the two. They go with the way by name.
+
+/// `device_name` as main had it, by name.
+#[cfg(any(test, debug_assertions, feature = "by-name"))]
+#[allow(dead_code, clippy::all)]
+fn device_name_by_name(req: &Value) -> anyhow::Result<Option<String>> {
+    let Some(name) = req.get("device").and_then(|v| v.as_str()) else {
+        return Ok(None);
+    };
+    let name = name.trim();
+    if name.is_empty() {
+        return Ok(None);
+    }
+    anyhow::ensure!(!name.contains('\n'), "a device's name is one line");
+    Ok(Some(name.to_owned()))
+}
+
+/// `find_device` as main had it, by name.
+#[cfg(any(test, debug_assertions, feature = "by-name"))]
+#[allow(dead_code, clippy::all)]
+fn find_device_by_name(d: &Daemon, who: &str) -> anyhow::Result<([u8; 32], String)> {
+    let core = d.core();
+    let ident = core
+        .identity
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("this device does not belong to anyone"))?;
+    let names = core.device_names();
+    let st = ident.state();
+    let w = who.trim().to_lowercase();
+    let asked = api::reference(who);
+    let who = api::shown(who);
+    let matches: Vec<[u8; 32]> = st
+        .keys
+        .keys()
+        .filter(|k| match asked {
+            api::Ref::Id(_) => asked.is_id(k.as_slice()),
+            api::Ref::Typed(_) => {
+                names.get(*k).is_some_and(|n| n.to_lowercase() == w)
+                    || (!w.is_empty() && hex::encode(k).starts_with(&w))
+            }
+        })
+        .copied()
+        .collect();
+    match matches.as_slice() {
+        [] => anyhow::bail!("no device called {who:?}; see `cardinal devices`"),
+        [k] => Ok((
+            *k,
+            names
+                .get(k)
+                .cloned()
+                .unwrap_or_else(|| account::short_key(k)),
+        )),
+        _ => {
+            anyhow::bail!("several devices match {who:?}; use the key shown by `cardinal devices`")
+        }
+    }
+}
+
+/// `rename_device` as main had it, by name.
+#[cfg(any(test, debug_assertions, feature = "by-name"))]
+#[allow(dead_code, clippy::all)]
+fn rename_device_by_name(d: &Arc<Daemon>, which: &str, name: &str) -> anyhow::Result<Value> {
+    let name = name.trim();
+    anyhow::ensure!(!name.is_empty(), "a name cannot be empty");
+    anyhow::ensure!(
+        !name.chars().any(char::is_control),
+        "a device's name is one line"
+    );
+    let (key, _) = find_device_by_name(d, which)?;
+    let (acc, nodes, taken) = {
+        let core = d.core();
+        let acc = core
+            .account_id()
+            .ok_or_else(|| anyhow::anyhow!("the account space is not here yet"))?;
+        let held = core.account().and_then(|h| h.space.as_ref());
+        let held = held.ok_or_else(|| anyhow::anyhow!("the account space is not here yet"))?;
+        let all = account::devices(held.state());
+        let nodes: Vec<_> = all
+            .iter()
+            .filter(|r| r.key == key)
+            .map(|r| r.node)
+            .collect();
+        let taken = all
+            .iter()
+            .any(|r| r.key != key && r.name.to_lowercase() == name.to_lowercase());
+        (acc, nodes, taken)
+    };
+    anyhow::ensure!(!taken, "another of your devices is called {name:?}");
+    anyhow::ensure!(
+        !nodes.is_empty(),
+        "that device is not named in your account yet; try again once it has synced"
+    );
+    let ops = nodes
+        .into_iter()
+        .map(|n| account::set_field(n, account::DEVICE_NAME, name))
+        .collect();
+    d.write_and_push(&acc, ops)?;
+    Ok(json!({"name": name, "key": hex::encode(&key[..8])}))
 }

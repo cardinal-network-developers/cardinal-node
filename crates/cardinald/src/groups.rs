@@ -1536,7 +1536,13 @@ fn member_of(
         .into(),
         introduce: m.introduce,
         left: m.left,
-        ..api::Member::default()
+        own: None,
+        picture: None,
+        suggested: None,
+        taken_out: None,
+        reach: None,
+        reaches_you: None,
+        through: None,
     }
 }
 
@@ -1775,69 +1781,10 @@ pub fn messages(
         group: Some(g.id),
         name: Some(g.name),
         messages,
-        ..api::MessagesReply::default()
+        // the page says
+        more: false,
+        next: None,
     })
-}
-
-/// [`messages`] as it was before it was typed, by name: kept only to show
-/// that the typed one sends the same bytes, and to measure the two. It
-/// goes with the way by name.
-#[cfg(any(test, feature = "by-name"))]
-#[doc(hidden)]
-pub fn messages_by_name(d: &Daemon, group: &str, before: Option<&str>) -> anyhow::Result<Json> {
-    let g = find(d, group)?;
-    use_members(d, &g.id);
-    let me = identity(d)?;
-    let core = d.core();
-    let sp = core.spaces.get(&g.id).and_then(|h| h.space.as_ref());
-    let sp = sp.ok_or_else(|| anyhow::anyhow!("that group is not open yet"))?;
-    let all = relationship::messages(sp);
-    let members = group::members(sp);
-    let named = named_in(sp);
-    // someone who left reads nothing more, and is not waited for
-    let others: Vec<[u8; 32]> = members
-        .iter()
-        .filter(|m| m.identity != me && !m.left)
-        .map(|m| m.identity)
-        .collect();
-    let mut read_by: HashMap<[u8; 32], Vec<bool>> = HashMap::new();
-    for m in &others {
-        read_by.insert(*m, relationship::read_by(sp, m, &all));
-    }
-    let contacts = core.contacts();
-    let upto = contacts::upto(sp, &all, before.map(api::reference))?;
-    let said: Vec<Json> = all
-        .iter()
-        .take(upto)
-        .enumerate()
-        .map(|(i, m)| {
-            let mine = m.author == me;
-            let read = others.iter().filter(|o| read_by[*o][i]).count();
-            let picture = contacts
-                .iter()
-                .find(|c| c.identity == m.author && !c.refused && !mine)
-                .and_then(|c| crate::names::shown(d, c).remove("picture"));
-            json!({
-                "picture": picture,
-                "id": hex::encode(m.id),
-                "mine": mine,
-                "from": name_of(&me, &contacts, &named, &m.author),
-                "text": m.text,
-                "time": m.time,
-                "state": mine.then_some(if read == others.len() && !others.is_empty() { "read" } else { "sent" }),
-                "read_by": mine.then_some(read),
-                "reply_to": m.reply_to.map(hex::encode),
-                "attachments": m.attachments.iter().map(|a| json!({
-                    "name": a.name,
-                    "type": a.media_type,
-                    "size": BlobRef::from_record(&a.blob).map(|b| b.size).ok(),
-                })).collect::<Vec<_>>(),
-                "edited": m.edited,
-                "reactions": contacts::reactions_by_name(m, Some(me)),
-            })
-        })
-        .collect();
-    Ok(json!({"group": hex::encode(g.id), "name": g.name, "messages": said}))
 }
 
 /// Saves a file that came with a message in a group, fetching it from the
@@ -2406,4 +2353,250 @@ mod tests {
         let s = seen(2, &[3, 4], &[], &[4]);
         assert_eq!(s.way_to(&[3; 32]), Way::Through([4; 32]));
     }
+}
+
+// ---- The handlers as they were by name ----
+//
+// What main had, whole, kept only to show that the typed handlers send the
+// same bytes (`control::typed::answering`, `api/same_bytes.rs`), and to
+// measure the two. They go with the way by name.
+
+/// `find` as main had it, by name.
+#[cfg(any(test, debug_assertions, feature = "by-name"))]
+#[allow(dead_code, clippy::all)]
+fn find_by_name(d: &Daemon, group: &str) -> anyhow::Result<Found> {
+    find_among_by_name(d, group, false)
+}
+
+/// `find_among` as main had it, by name.
+#[cfg(any(test, debug_assertions, feature = "by-name"))]
+#[allow(dead_code, clippy::all)]
+fn find_among_by_name(d: &Daemon, group: &str, in_it: bool) -> anyhow::Result<Found> {
+    let me = identity(d)?;
+    let core = d.core();
+    let mut all: Vec<Found> = Vec::new();
+    // what an id this group had before stands for
+    let mut was: Vec<(SpaceId, SpaceId)> = Vec::new();
+    for (id, h) in &core.spaces {
+        let Some(sp) = h.space.as_ref() else {
+            continue;
+        };
+        // A group this person left is not theirs to find, until someone
+        // adds them again.
+        if sp.profile() != group::GROUP || sp.has_left(&me) {
+            continue;
+        }
+        if core.is_superseded(id) {
+            was.push((*id, core.current(id)));
+            continue;
+        }
+        all.push(Found {
+            id: *id,
+            name: group::name(sp),
+            joined: core.is_joined(id),
+        });
+    }
+    all.retain(|g| g.joined || !in_it);
+    // given as bytes: the group whose id it is, or the one in its place
+    if let asked @ Ref::Id(_) = api::reference(group) {
+        let now = was
+            .iter()
+            .find(|(old, _)| asked.is_id(old))
+            .map(|(_, now)| *now);
+        let id = now.or_else(|| all.iter().find(|g| asked.is_id(&g.id)).map(|g| g.id));
+        return id
+            .and_then(|id| all.into_iter().find(|g| g.id == id))
+            .ok_or_else(|| anyhow::anyhow!("there is no group {}", api::shown(group)));
+    }
+    let start = group.to_ascii_lowercase();
+    if group.len() >= 8 {
+        let now = was
+            .iter()
+            .filter(|(old, _)| hex::encode(old).starts_with(&start));
+        let now: Vec<SpaceId> = now.map(|(_, now)| *now).collect();
+        if let Some(g) = now.first().and_then(|n| all.iter().find(|g| g.id == *n)) {
+            return Ok(g.clone());
+        }
+    }
+    pick(all, group, &core.declined())
+}
+
+/// `joined` as main had it, by name.
+#[cfg(any(test, debug_assertions, feature = "by-name"))]
+#[allow(dead_code, clippy::all)]
+fn joined_by_name(d: &Daemon, group: &str) -> anyhow::Result<Found> {
+    match find_among_by_name(d, group, true) {
+        Ok(g) => {
+            // one that ended and has nothing here in its place
+            if let (Some(why), _) = d.core().succession_news(&g.id) {
+                anyhow::bail!("{} has ended: {why}", g.name);
+            }
+            Ok(g)
+        }
+        // say which it is: not there at all, or there and not joined
+        Err(none) => match find_by_name(d, group) {
+            Ok(g) => anyhow::bail!("you have not joined {}", g.name),
+            Err(_) => Err(none),
+        },
+    }
+}
+
+/// `joined_group` as main had it, by name.
+#[cfg(any(test, debug_assertions, feature = "by-name"))]
+#[allow(dead_code, clippy::all)]
+pub(crate) fn joined_group_by_name(d: &Daemon, group: &str) -> anyhow::Result<(SpaceId, String)> {
+    let g = joined_by_name(d, group)?;
+    Ok((g.id, g.name))
+}
+
+/// `telling_json` as main had it, by name.
+#[cfg(any(test, debug_assertions, feature = "by-name"))]
+#[allow(dead_code, clippy::all)]
+fn telling_json_by_name(core: &Core, id: &SpaceId, me: &[u8; 32]) -> Json {
+    let t = core.telling(id);
+    let contacts = core.contacts();
+    let open = core.spaces.get(id).and_then(|h| h.space.as_ref());
+    let members = open.map(group::members).unwrap_or_default();
+    let names = |who: &[[u8; 32]]| -> Vec<String> {
+        who.iter()
+            .map(|m| name_of(me, &contacts, &members, m))
+            .collect()
+    };
+    json!({
+        "shared": t.shared,
+        "ask": t.ask(),
+        "who": names(&t.who),
+        "what": t.what,
+        "added": names(t.added()),
+        "public": t.public,
+        "waiting": t.waiting,
+        "said_no": t.said_no,
+        "set": t.set,
+    })
+}
+
+/// `member_fields` as main had it, by name.
+#[cfg(any(test, debug_assertions, feature = "by-name"))]
+#[allow(dead_code, clippy::all)]
+fn member_fields_by_name(
+    me: &[u8; 32],
+    contacts: &[ContactRecord],
+    members: &[Member],
+    m: &Member,
+) -> Json {
+    let contact = contacts
+        .iter()
+        .any(|c| c.identity == m.identity && !c.refused);
+    json!({
+        "name": name_of(me, contacts, members, &m.identity),
+        "shown": m.name,
+        "id": hex::encode(&m.identity[..8]),
+        "you": m.identity == *me,
+        "contact": contact,
+        "role": match m.role {
+            group::OWNER => "owner",
+            group::ADMIN => "admin",
+            group::READER => "reader",
+            _ => "member",
+        },
+        "introduce": m.introduce,
+        "left": m.left,
+    })
+}
+
+/// `call_json` as main had it, by name.
+#[cfg(any(test, debug_assertions, feature = "by-name"))]
+#[allow(dead_code, clippy::all)]
+pub(crate) fn call_json_by_name(d: &Daemon, space: &SpaceId, caller: Option<&[u8; 32]>) -> Json {
+    let Ok(me) = identity(d) else {
+        return json!({});
+    };
+    let core = d.core();
+    let Some(sp) = core.spaces.get(space).and_then(|h| h.space.as_ref()) else {
+        return json!({});
+    };
+    let members = group::members(sp);
+    let contacts = core.contacts();
+    let person = |m: &Member| {
+        let known = contacts
+            .iter()
+            .find(|c| c.identity == m.identity && !c.refused);
+        let v = member_fields_by_name(&me, &contacts, &members, m);
+        shown_as_contact(d, &me, &contacts, &members, known, &m.identity, v)
+    };
+    let mut admins: Vec<&Member> = members
+        .iter()
+        .filter(|m| m.role >= group::ADMIN && !m.left)
+        .collect();
+    admins.sort_by_key(|m| std::cmp::Reverse(m.role == group::OWNER));
+    let admins: Vec<Json> = admins.into_iter().map(person).collect();
+    let caller = caller.and_then(|c| members.iter().find(|m| m.identity == *c).map(person));
+    let joins = !core.is_joined(space);
+    json!({
+        "name": group::name(sp),
+        "for_call": group::for_call(sp),
+        "admins": admins,
+        "caller": caller,
+        "joins": joins.then_some(true),
+        "reach": joins.then(|| telling_json_by_name(&core, space, &me)),
+    })
+}
+
+/// `messages` as main had it, by name.
+#[cfg(any(test, debug_assertions, feature = "by-name"))]
+#[allow(dead_code, clippy::all)]
+pub fn messages_by_name(d: &Daemon, group: &str, before: Option<&str>) -> anyhow::Result<Json> {
+    let g = find_by_name(d, group)?;
+    use_members(d, &g.id);
+    let me = identity(d)?;
+    let core = d.core();
+    let sp = core.spaces.get(&g.id).and_then(|h| h.space.as_ref());
+    let sp = sp.ok_or_else(|| anyhow::anyhow!("that group is not open yet"))?;
+    let all = relationship::messages(sp);
+    let members = group::members(sp);
+    let named = named_in(sp);
+    // someone who left reads nothing more, and is not waited for
+    let others: Vec<[u8; 32]> = members
+        .iter()
+        .filter(|m| m.identity != me && !m.left)
+        .map(|m| m.identity)
+        .collect();
+    let mut read_by: HashMap<[u8; 32], Vec<bool>> = HashMap::new();
+    for m in &others {
+        read_by.insert(*m, relationship::read_by(sp, m, &all));
+    }
+    let contacts = core.contacts();
+    let upto = contacts::upto_by_name(sp, &all, before)?;
+    let said: Vec<Json> = all
+        .iter()
+        .take(upto)
+        .enumerate()
+        .map(|(i, m)| {
+            let mine = m.author == me;
+            let read = others.iter().filter(|o| read_by[*o][i]).count();
+            let picture = contacts
+                .iter()
+                .find(|c| c.identity == m.author && !c.refused && !mine)
+                .and_then(|c| crate::names::shown_by_name(d, c).remove("picture"));
+            json!({
+                "picture": picture,
+                "id": hex::encode(m.id),
+                "mine": mine,
+                "from": name_of(&me, &contacts, &named, &m.author),
+                "text": m.text,
+                "time": m.time,
+                "state": mine.then_some(if read == others.len() && !others.is_empty() { "read" } else { "sent" }),
+                "read_by": mine.then_some(read),
+                "reply_to": m.reply_to.map(hex::encode),
+                "attachments": m.attachments.iter().map(|a| json!({
+                    "name": a.name,
+                    "type": a.media_type,
+                    "size": BlobRef::from_record(&a.blob).map(|b| b.size).ok(),
+                })).collect::<Vec<_>>(),
+                "edited": m.edited,
+                "reactions": contacts::reactions_of_by_name(m, Some(me)),
+            })
+        })
+        .collect();
+    Ok(json!({"group": hex::encode(g.id), "name": g.name, "messages": said}))
 }
