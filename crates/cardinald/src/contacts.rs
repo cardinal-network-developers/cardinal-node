@@ -1205,12 +1205,12 @@ pub(crate) fn listed_ref(d: &Daemon, who: Ref<'_>) -> anyhow::Result<ContactReco
 /// Writes a message to a contact.
 pub async fn say(
     d: &Arc<Daemon>,
-    who: &str,
+    who: Ref<'_>,
     text: &str,
-    reply_to: Option<&str>,
+    reply_to: Option<Ref<'_>>,
     attach: &[String],
-) -> anyhow::Result<Json> {
-    let contact = listed(d, who)?;
+) -> anyhow::Result<crate::api::SayReply> {
+    let contact = listed_ref(d, who)?;
     let to = match reply_to {
         Some(id) => Some(message_in(d, &contact, id)?.id),
         None => None,
@@ -1234,7 +1234,9 @@ pub async fn say(
     ops.extend(relationship::shared_files(&attachments, Some(now_ms())));
     d.write_and_push(&space, ops)?;
     confirm(d, space, contact.identity);
-    Ok(json!({"reachable": reachable(d, &contact, text) && attachments.is_empty()}))
+    Ok(crate::api::SayReply {
+        reachable: Some(reachable(d, &contact, text) && attachments.is_empty()),
+    })
 }
 
 /// What kind of file a name says it is, by its ending.
@@ -1331,17 +1333,18 @@ pub(crate) fn write_out<S: cardinal_blob::ObjectStore, F: cardinal_blob::Fetch>(
 /// unless all of it arrived.
 pub async fn save_attachment(
     d: &Arc<Daemon>,
-    who: &str,
-    id: &str,
+    who: Ref<'_>,
+    id: Ref<'_>,
     index: usize,
     to: &str,
-) -> anyhow::Result<Json> {
-    let contact = listed(d, who)?;
+) -> anyhow::Result<crate::api::SaveReply> {
+    let contact = listed_ref(d, who)?;
     let m = message_in(d, &contact, id)?;
     let a = m.attachments.get(index);
     let a = a.ok_or_else(|| anyhow::anyhow!("that message has no such attachment"))?;
     let blob = BlobRef::from_record(&a.blob)
         .map_err(|_| anyhow::anyhow!("that attachment cannot be read"))?;
+    let shown = to.to_owned();
     let to = std::path::PathBuf::from(to);
     let (d, them) = (d.clone(), contact.identity);
     let written = to.clone();
@@ -1351,7 +1354,7 @@ pub async fn save_attachment(
         write_new(&written, |out| write_out(&mut reader, out))
     })
     .await??;
-    Ok(json!({"path": to, "size": size}))
+    Ok(crate::api::SaveReply { path: shown, size })
 }
 
 /// Writes a new file at `to` with what `fill` writes. It is written beside,
@@ -1397,15 +1400,23 @@ pub(crate) fn write_new(
     wrote
 }
 
+/// The id of a message a `ref` names: 16 bytes, given as bytes or typed
+/// in hex.
+pub(crate) fn message_id(id: Ref<'_>) -> Option<[u8; 16]> {
+    let b = match id {
+        Ref::Typed(t) => hex::decode(t).ok()?,
+        Ref::Id(given) => given.bytes()?.into_owned(),
+    };
+    b.try_into().ok()
+}
+
 /// A message in the conversation with a contact, by the id `messages` gives.
 fn message_in(
     d: &Daemon,
     contact: &ContactRecord,
-    id: &str,
+    id: Ref<'_>,
 ) -> anyhow::Result<relationship::Message> {
-    let id = hex::decode(crate::api::id_hex(id)).ok();
-    let id = id.and_then(|b| <[u8; 16]>::try_from(b.as_slice()).ok());
-    let id = id.ok_or_else(|| anyhow::anyhow!("that is not a message"))?;
+    let id = message_id(id).ok_or_else(|| anyhow::anyhow!("that is not a message"))?;
     let core = d.core();
     let open = core
         .spaces
@@ -1421,10 +1432,10 @@ fn message_in(
 /// can be changed or taken back, which the space itself holds to as well.
 fn own_message(
     d: &Daemon,
-    who: &str,
-    id: &str,
+    who: Ref<'_>,
+    id: Ref<'_>,
 ) -> anyhow::Result<(ContactRecord, relationship::Message)> {
-    let contact = listed(d, who)?;
+    let contact = listed_ref(d, who)?;
     let m = message_in(d, &contact, id)?;
     anyhow::ensure!(
         Some(m.author) == d.core().identity.as_ref().map(|i| i.id()),
@@ -1434,22 +1445,22 @@ fn own_message(
 }
 
 /// Changes what a message of this person's says.
-pub fn edit_message(d: &Arc<Daemon>, who: &str, id: &str, text: &str) -> anyhow::Result<Json> {
+pub fn edit_message(d: &Arc<Daemon>, who: Ref<'_>, id: Ref<'_>, text: &str) -> anyhow::Result<()> {
     let (contact, m) = own_message(d, who, id)?;
     anyhow::ensure!(!text.trim().is_empty(), "a message cannot be empty");
     let op = relationship::edit_message(m.id, text);
     d.write_and_push(&contact.space, vec![op])?;
     confirm(d, contact.space, contact.identity);
-    Ok(json!({}))
+    Ok(())
 }
 
 /// Takes back a message of this person's. The other person may have read it
 /// already, and the space's history keeps it.
-pub fn delete_message(d: &Arc<Daemon>, who: &str, id: &str) -> anyhow::Result<Json> {
+pub fn delete_message(d: &Arc<Daemon>, who: Ref<'_>, id: Ref<'_>) -> anyhow::Result<()> {
     let (contact, m) = own_message(d, who, id)?;
     d.write_and_push(&contact.space, vec![SpaceOp::delete(m.id)])?;
     confirm(d, contact.space, contact.identity);
-    Ok(json!({}))
+    Ok(())
 }
 
 /// The longest reaction: an emoji, or a few of them.
@@ -1457,8 +1468,8 @@ const MAX_REACTION: usize = 16;
 
 /// Reacts to a message, replacing this person's reaction, or taking it away
 /// with nothing.
-pub fn react(d: &Arc<Daemon>, who: &str, id: &str, text: &str) -> anyhow::Result<Json> {
-    let contact = listed(d, who)?;
+pub fn react(d: &Arc<Daemon>, who: Ref<'_>, id: Ref<'_>, text: &str) -> anyhow::Result<()> {
+    let contact = listed_ref(d, who)?;
     let m = message_in(d, &contact, id)?;
     let text = text.trim();
     anyhow::ensure!(
@@ -1486,11 +1497,11 @@ pub fn react(d: &Arc<Daemon>, who: &str, id: &str, text: &str) -> anyhow::Result
         (None, false) => ops.push(relationship::create_reaction(m.id, text)),
     }
     if ops.is_empty() {
-        return Ok(json!({}));
+        return Ok(());
     }
     d.write_and_push(&contact.space, ops)?;
     confirm(d, contact.space, contact.identity);
-    Ok(json!({}))
+    Ok(())
 }
 
 /// Reactions as a window shows them: each one once, with how many gave it
@@ -1769,8 +1780,8 @@ pub fn conversations(d: &Daemon) -> Json {
 /// Marks a conversation read up to its last message from the contact. Their
 /// devices see the marker too (`profiles.md#relationship`), unless read
 /// markers are off.
-pub fn mark_read(d: &Arc<Daemon>, who: &str) -> anyhow::Result<Json> {
-    let contact = listed(d, who)?;
+pub fn mark_read(d: &Arc<Daemon>, who: Ref<'_>) -> anyhow::Result<crate::api::MarkReadReply> {
+    let contact = listed_ref(d, who)?;
     mark_read_in(d, &contact.space, &contact.petname)
 }
 
@@ -1779,7 +1790,11 @@ pub fn mark_read(d: &Arc<Daemon>, who: &str) -> anyhow::Result<Json> {
 /// every member sees; off, it moves the position the account keeps,
 /// which only their own devices see. Answers `marked` (a marker moved)
 /// and `kept` (the private position moved).
-pub(crate) fn mark_read_in(d: &Arc<Daemon>, space: &SpaceId, name: &str) -> anyhow::Result<Json> {
+pub(crate) fn mark_read_in(
+    d: &Arc<Daemon>,
+    space: &SpaceId,
+    name: &str,
+) -> anyhow::Result<crate::api::MarkReadReply> {
     let me = identity(d)?;
     let markers = crate::settings::read_markers_on(&d.core());
     let (op, account) = {
@@ -1818,13 +1833,13 @@ pub(crate) fn mark_read_in(d: &Arc<Daemon>, space: &SpaceId, name: &str) -> anyh
         d.write_and_push(&target, ops)?;
     }
     if account {
-        return Ok(json!({
-            "marked": false,
-            "kept": moved,
-            "why": "read markers are off: others do not see what you have read",
-        }));
+        return Ok(crate::api::MarkReadReply {
+            kept: moved,
+            marked: false,
+            why: Some("read markers are off: others do not see what you have read".into()),
+        });
     }
-    Ok(json!({"marked": moved, "kept": false}))
+    Ok(crate::api::MarkReadReply::new(false, moved))
 }
 
 /// A length of time in words, to the largest unit that matters.
@@ -2403,4 +2418,237 @@ pub fn messages_by_name(d: &Daemon, who: &str, before: Option<&str>) -> anyhow::
         })
         .collect();
     Ok(json!({"messages": said}))
+}
+
+/// `say` as main had it, by name.
+#[cfg(any(test, debug_assertions, feature = "by-name"))]
+#[allow(dead_code, clippy::all)]
+pub async fn say_by_name(
+    d: &Arc<Daemon>,
+    who: &str,
+    text: &str,
+    reply_to: Option<&str>,
+    attach: &[String],
+) -> anyhow::Result<Json> {
+    let contact = listed_by_name(d, who)?;
+    let to = match reply_to {
+        Some(id) => Some(message_in_by_name(d, &contact, id)?.id),
+        None => None,
+    };
+    let attachments = encode_attachments(d, &contact.space, attach).await?;
+    let space = contact.space;
+    let conversation = {
+        let core = d.core();
+        core.spaces
+            .get(&space)
+            .and_then(|h| h.space.as_ref())
+            .and_then(relationship::conversation)
+    };
+    let conversation = conversation.ok_or_else(|| anyhow::anyhow!("that space is not open yet"))?;
+    let mut ops = vec![relationship::create_with(
+        conversation,
+        text,
+        to,
+        &attachments,
+    )];
+    ops.extend(relationship::shared_files(&attachments, Some(now_ms())));
+    d.write_and_push(&space, ops)?;
+    confirm(d, space, contact.identity);
+    Ok(json!({"reachable": reachable(d, &contact, text) && attachments.is_empty()}))
+}
+
+/// `save_attachment` as main had it, by name.
+#[cfg(any(test, debug_assertions, feature = "by-name"))]
+#[allow(dead_code, clippy::all)]
+pub async fn save_attachment_by_name(
+    d: &Arc<Daemon>,
+    who: &str,
+    id: &str,
+    index: usize,
+    to: &str,
+) -> anyhow::Result<Json> {
+    let contact = listed_by_name(d, who)?;
+    let m = message_in_by_name(d, &contact, id)?;
+    let a = m.attachments.get(index);
+    let a = a.ok_or_else(|| anyhow::anyhow!("that message has no such attachment"))?;
+    let blob = BlobRef::from_record(&a.blob)
+        .map_err(|_| anyhow::anyhow!("that attachment cannot be read"))?;
+    let to = std::path::PathBuf::from(to);
+    let (d, them) = (d.clone(), contact.identity);
+    let written = to.clone();
+    let size = tokio::task::spawn_blocking(move || -> anyhow::Result<u64> {
+        let fetch = crate::fetch::Fetcher::from_contact(&d, Priority::Interactive, them);
+        let mut reader = BlobReader::new(&*d.store, &fetch, blob);
+        write_new(&written, |out| write_out(&mut reader, out))
+    })
+    .await??;
+    Ok(json!({"path": to, "size": size}))
+}
+
+/// `message_in` as main had it, by name.
+#[cfg(any(test, debug_assertions, feature = "by-name"))]
+#[allow(dead_code, clippy::all)]
+fn message_in_by_name(
+    d: &Daemon,
+    contact: &ContactRecord,
+    id: &str,
+) -> anyhow::Result<relationship::Message> {
+    let id = hex::decode(crate::api::id_hex(id)).ok();
+    let id = id.and_then(|b| <[u8; 16]>::try_from(b.as_slice()).ok());
+    let id = id.ok_or_else(|| anyhow::anyhow!("that is not a message"))?;
+    let core = d.core();
+    let open = core
+        .spaces
+        .get(&contact.space)
+        .and_then(|h| h.space.as_ref());
+    let open = open.ok_or_else(|| anyhow::anyhow!("that space is not open yet"))?;
+    let all = relationship::messages(open);
+    let found = all.into_iter().find(|m| m.id == id);
+    found.ok_or_else(|| anyhow::anyhow!("there is no such message"))
+}
+
+/// `own_message` as main had it, by name.
+#[cfg(any(test, debug_assertions, feature = "by-name"))]
+#[allow(dead_code, clippy::all)]
+fn own_message_by_name(
+    d: &Daemon,
+    who: &str,
+    id: &str,
+) -> anyhow::Result<(ContactRecord, relationship::Message)> {
+    let contact = listed_by_name(d, who)?;
+    let m = message_in_by_name(d, &contact, id)?;
+    anyhow::ensure!(
+        Some(m.author) == d.core().identity.as_ref().map(|i| i.id()),
+        "only what you wrote can be changed"
+    );
+    Ok((contact, m))
+}
+
+/// `edit_message` as main had it, by name.
+#[cfg(any(test, debug_assertions, feature = "by-name"))]
+#[allow(dead_code, clippy::all)]
+pub fn edit_message_by_name(
+    d: &Arc<Daemon>,
+    who: &str,
+    id: &str,
+    text: &str,
+) -> anyhow::Result<Json> {
+    let (contact, m) = own_message_by_name(d, who, id)?;
+    anyhow::ensure!(!text.trim().is_empty(), "a message cannot be empty");
+    let op = relationship::edit_message(m.id, text);
+    d.write_and_push(&contact.space, vec![op])?;
+    confirm(d, contact.space, contact.identity);
+    Ok(json!({}))
+}
+
+/// `delete_message` as main had it, by name.
+#[cfg(any(test, debug_assertions, feature = "by-name"))]
+#[allow(dead_code, clippy::all)]
+pub fn delete_message_by_name(d: &Arc<Daemon>, who: &str, id: &str) -> anyhow::Result<Json> {
+    let (contact, m) = own_message_by_name(d, who, id)?;
+    d.write_and_push(&contact.space, vec![SpaceOp::delete(m.id)])?;
+    confirm(d, contact.space, contact.identity);
+    Ok(json!({}))
+}
+
+/// `react` as main had it, by name.
+#[cfg(any(test, debug_assertions, feature = "by-name"))]
+#[allow(dead_code, clippy::all)]
+pub fn react_by_name(d: &Arc<Daemon>, who: &str, id: &str, text: &str) -> anyhow::Result<Json> {
+    let contact = listed_by_name(d, who)?;
+    let m = message_in_by_name(d, &contact, id)?;
+    let text = text.trim();
+    anyhow::ensure!(
+        text.chars().count() <= MAX_REACTION,
+        "that is too long for a reaction"
+    );
+    let me = d.core().identity.as_ref().map(|i| i.id());
+    // The one shown is the last of this person's (`reactions_of`); any
+    // others, from devices apart, go when this one changes.
+    let mine: Vec<&relationship::Reaction> = m
+        .reactions
+        .iter()
+        .filter(|r| Some(r.author) == me)
+        .collect();
+    let mut ops: Vec<SpaceOp> = Vec::new();
+    match (mine.last(), text.is_empty()) {
+        (Some(_), true) => ops.extend(mine.iter().map(|r| SpaceOp::delete(r.id))),
+        (Some(r), false) => {
+            ops.extend(mine[..mine.len() - 1].iter().map(|r| SpaceOp::delete(r.id)));
+            if r.text != text {
+                ops.push(relationship::set_reaction(r.id, text));
+            }
+        }
+        (None, true) => {}
+        (None, false) => ops.push(relationship::create_reaction(m.id, text)),
+    }
+    if ops.is_empty() {
+        return Ok(json!({}));
+    }
+    d.write_and_push(&contact.space, ops)?;
+    confirm(d, contact.space, contact.identity);
+    Ok(json!({}))
+}
+
+/// `mark_read` as main had it, by name.
+#[cfg(any(test, debug_assertions, feature = "by-name"))]
+#[allow(dead_code, clippy::all)]
+pub fn mark_read_by_name(d: &Arc<Daemon>, who: &str) -> anyhow::Result<Json> {
+    let contact = listed_by_name(d, who)?;
+    mark_read_in_by_name(d, &contact.space, &contact.petname)
+}
+
+/// `mark_read_in` as main had it, by name.
+#[cfg(any(test, debug_assertions, feature = "by-name"))]
+#[allow(dead_code, clippy::all)]
+pub(crate) fn mark_read_in_by_name(
+    d: &Arc<Daemon>,
+    space: &SpaceId,
+    name: &str,
+) -> anyhow::Result<Json> {
+    let me = identity(d)?;
+    let markers = crate::settings::read_markers_on(&d.core());
+    let (op, account) = {
+        let core = d.core();
+        let open = core.spaces.get(space).and_then(|h| h.space.as_ref());
+        let open = open.ok_or_else(|| anyhow::anyhow!("that space is not open yet"))?;
+        let all = relationship::messages(open);
+        let read = core.read_here(space, &all);
+        let new = all
+            .iter()
+            .zip(&read)
+            .any(|(m, read)| m.author != me && !read);
+        let theirs = all.iter().rposition(|m| m.author != me);
+        match theirs {
+            Some(at) if new && markers => {
+                let last = all[at].id;
+                let op = match relationship::read_marker(open, &me) {
+                    Some(marker) => Some(relationship::set_read_marker(marker, last)),
+                    None => relationship::conversation(open)
+                        .map(|c| relationship::create_read_marker(c, last)),
+                };
+                (op.map(|op| (*space, vec![op])), false)
+            }
+            Some(at) if new => {
+                let acc = core.account();
+                let st = acc.and_then(|a| Some((a.id, a.space.as_ref()?.state())));
+                let ops =
+                    st.map(|(id, st)| (id, account::read_up_to_ops(st, space, name, &all[at].id)));
+                (ops, true)
+            }
+            _ => (None, !markers),
+        }
+    };
+    let moved = op.is_some();
+    if let Some((target, ops)) = op {
+        d.write_and_push(&target, ops)?;
+    }
+    if account {
+        return Ok(json!({
+            "marked": false,
+            "kept": moved,
+            "why": "read markers are off: others do not see what you have read",
+        }));
+    }
+    Ok(json!({"marked": moved, "kept": false}))
 }

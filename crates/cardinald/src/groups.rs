@@ -1769,12 +1769,12 @@ pub(crate) fn use_members(d: &Daemon, id: &SpaceId) {
 /// Writes a message to a group.
 pub async fn say(
     d: &Arc<Daemon>,
-    group: &str,
+    group: Ref<'_>,
     text: &str,
-    reply_to: Option<&str>,
+    reply_to: Option<Ref<'_>>,
     attach: &[String],
-) -> anyhow::Result<Json> {
-    let g = joined(d, group)?;
+) -> anyhow::Result<()> {
+    let g = joined_ref(d, group)?;
     may_write_in(d, &g)?;
     use_members(d, &g.id);
     let to = match reply_to {
@@ -1796,13 +1796,11 @@ pub async fn say(
     )];
     ops.extend(relationship::shared_files(&attachments, Some(now_ms())));
     d.write_and_push(&g.id, ops)?;
-    Ok(json!({}))
+    Ok(())
 }
 
-fn message_in(d: &Daemon, space: &SpaceId, id: &str) -> anyhow::Result<relationship::Message> {
-    let id = hex::decode(api::id_hex(id)).ok();
-    let id = id.and_then(|b| <[u8; 16]>::try_from(b.as_slice()).ok());
-    let id = id.ok_or_else(|| anyhow::anyhow!("that is not a message"))?;
+fn message_in(d: &Daemon, space: &SpaceId, id: Ref<'_>) -> anyhow::Result<relationship::Message> {
+    let id = contacts::message_id(id).ok_or_else(|| anyhow::anyhow!("that is not a message"))?;
     let core = d.core();
     let sp = core.spaces.get(space).and_then(|h| h.space.as_ref());
     let sp = sp.ok_or_else(|| anyhow::anyhow!("that group is not open yet"))?;
@@ -1887,12 +1885,12 @@ pub fn messages(
 /// members in touch: its sender if they are, or anyone else who has it.
 pub async fn save_attachment(
     d: &Arc<Daemon>,
-    group: &str,
-    id: &str,
+    group: Ref<'_>,
+    id: Ref<'_>,
     index: usize,
     to: &str,
-) -> anyhow::Result<Json> {
-    let g = find(d, group)?;
+) -> anyhow::Result<api::SaveReply> {
+    let g = find_among(d, group, false)?;
     let m = message_in(d, &g.id, id)?;
     let a = m.attachments.get(index);
     let a = a.ok_or_else(|| anyhow::anyhow!("that message has no such attachment"))?;
@@ -1910,6 +1908,7 @@ pub async fn save_attachment(
         .collect();
     // The sender first.
     from.sort_by_key(|w| *w != m.author);
+    let shown = to.to_owned();
     let to = std::path::PathBuf::from(to);
     let mut last = anyhow::anyhow!("nobody who has it is in touch right now");
     for who in from.into_iter().map(Some).chain([None]) {
@@ -1924,7 +1923,7 @@ pub async fn save_attachment(
         })
         .await?;
         match got {
-            Ok(size) => return Ok(json!({"path": to, "size": size})),
+            Ok(size) => return Ok(api::SaveReply { path: shown, size }),
             Err(e) => last = e,
         }
     }
@@ -1933,7 +1932,7 @@ pub async fn save_attachment(
 
 /// A message of this person's own in a group: only that can be changed or
 /// taken back.
-fn own_message(d: &Daemon, space: &SpaceId, id: &str) -> anyhow::Result<relationship::Message> {
+fn own_message(d: &Daemon, space: &SpaceId, id: Ref<'_>) -> anyhow::Result<relationship::Message> {
     let m = message_in(d, space, id)?;
     anyhow::ensure!(
         m.author == identity(d)?,
@@ -1943,28 +1942,33 @@ fn own_message(d: &Daemon, space: &SpaceId, id: &str) -> anyhow::Result<relation
 }
 
 /// Changes what a message of this person's in a group says.
-pub fn edit_message(d: &Arc<Daemon>, group: &str, id: &str, text: &str) -> anyhow::Result<Json> {
-    let g = joined(d, group)?;
+pub fn edit_message(
+    d: &Arc<Daemon>,
+    group: Ref<'_>,
+    id: Ref<'_>,
+    text: &str,
+) -> anyhow::Result<()> {
+    let g = joined_ref(d, group)?;
     may_write_in(d, &g)?;
     let m = own_message(d, &g.id, id)?;
     anyhow::ensure!(!text.trim().is_empty(), "a message cannot be empty");
     d.write_and_push(&g.id, vec![relationship::edit_message(m.id, text)])?;
-    Ok(json!({}))
+    Ok(())
 }
 
 /// Takes back a message of this person's in a group.
-pub fn delete_message(d: &Arc<Daemon>, group: &str, id: &str) -> anyhow::Result<Json> {
-    let g = joined(d, group)?;
+pub fn delete_message(d: &Arc<Daemon>, group: Ref<'_>, id: Ref<'_>) -> anyhow::Result<()> {
+    let g = joined_ref(d, group)?;
     may_write_in(d, &g)?;
     let m = own_message(d, &g.id, id)?;
     d.write_and_push(&g.id, vec![SpaceOp::delete(m.id)])?;
-    Ok(json!({}))
+    Ok(())
 }
 
 /// Reacts to a message in a group, replacing this person's reaction, or
 /// taking it away with nothing.
-pub fn react(d: &Arc<Daemon>, group: &str, id: &str, text: &str) -> anyhow::Result<Json> {
-    let g = joined(d, group)?;
+pub fn react(d: &Arc<Daemon>, group: Ref<'_>, id: Ref<'_>, text: &str) -> anyhow::Result<()> {
+    let g = joined_ref(d, group)?;
     may_write_in(d, &g)?;
     let m = message_in(d, &g.id, id)?;
     let text = text.trim();
@@ -1990,12 +1994,12 @@ pub fn react(d: &Arc<Daemon>, group: &str, id: &str, text: &str) -> anyhow::Resu
     if !ops.is_empty() {
         d.write_and_push(&g.id, ops)?;
     }
-    Ok(json!({}))
+    Ok(())
 }
 
 /// Marks a group's conversation read up to its last message from anyone else.
-pub fn mark_read(d: &Arc<Daemon>, group: &str) -> anyhow::Result<Json> {
-    let g = joined(d, group)?;
+pub fn mark_read(d: &Arc<Daemon>, group: Ref<'_>) -> anyhow::Result<api::MarkReadReply> {
+    let g = joined_ref(d, group)?;
     contacts::mark_read_in(d, &g.id, &g.name)
 }
 
@@ -3372,4 +3376,193 @@ pub fn set_member_by_name(
     d.write_and_push(&g.id, ops)?;
     d.bump();
     Ok(json!({}))
+}
+
+/// `say` as main had it, by name.
+#[cfg(any(test, debug_assertions, feature = "by-name"))]
+#[allow(dead_code, clippy::all)]
+pub async fn say_by_name(
+    d: &Arc<Daemon>,
+    group: &str,
+    text: &str,
+    reply_to: Option<&str>,
+    attach: &[String],
+) -> anyhow::Result<Json> {
+    let g = joined_by_name(d, group)?;
+    may_write_in(d, &g)?;
+    use_members(d, &g.id);
+    let to = match reply_to {
+        Some(id) => Some(message_in_by_name(d, &g.id, id)?.id),
+        None => None,
+    };
+    let attachments = contacts::encode_attachments(d, &g.id, attach).await?;
+    let conversation = {
+        let core = d.core();
+        let sp = core.spaces.get(&g.id).and_then(|h| h.space.as_ref());
+        sp.and_then(relationship::conversation)
+    };
+    let conversation = conversation.ok_or_else(|| anyhow::anyhow!("that group is not open yet"))?;
+    let mut ops = vec![relationship::create_with(
+        conversation,
+        text,
+        to,
+        &attachments,
+    )];
+    ops.extend(relationship::shared_files(&attachments, Some(now_ms())));
+    d.write_and_push(&g.id, ops)?;
+    Ok(json!({}))
+}
+
+/// `message_in` as main had it, by name.
+#[cfg(any(test, debug_assertions, feature = "by-name"))]
+#[allow(dead_code, clippy::all)]
+fn message_in_by_name(
+    d: &Daemon,
+    space: &SpaceId,
+    id: &str,
+) -> anyhow::Result<relationship::Message> {
+    let id = hex::decode(api::id_hex(id)).ok();
+    let id = id.and_then(|b| <[u8; 16]>::try_from(b.as_slice()).ok());
+    let id = id.ok_or_else(|| anyhow::anyhow!("that is not a message"))?;
+    let core = d.core();
+    let sp = core.spaces.get(space).and_then(|h| h.space.as_ref());
+    let sp = sp.ok_or_else(|| anyhow::anyhow!("that group is not open yet"))?;
+    // a message posted again has a new id, and the old one names it
+    let now = sp.state().now_called(&id).unwrap_or(id);
+    let found = relationship::messages(sp).into_iter().find(|m| m.id == now);
+    found.ok_or_else(|| anyhow::anyhow!("there is no such message"))
+}
+
+/// `save_attachment` as main had it, by name.
+#[cfg(any(test, debug_assertions, feature = "by-name"))]
+#[allow(dead_code, clippy::all)]
+pub async fn save_attachment_by_name(
+    d: &Arc<Daemon>,
+    group: &str,
+    id: &str,
+    index: usize,
+    to: &str,
+) -> anyhow::Result<Json> {
+    let g = find_by_name(d, group)?;
+    let m = message_in_by_name(d, &g.id, id)?;
+    let a = m.attachments.get(index);
+    let a = a.ok_or_else(|| anyhow::anyhow!("that message has no such attachment"))?;
+    let blob = BlobRef::from_record(&a.blob)
+        .map_err(|_| anyhow::anyhow!("that attachment cannot be read"))?;
+    let members: Vec<[u8; 32]> = {
+        let core = d.core();
+        let sp = core.spaces.get(&g.id).and_then(|h| h.space.as_ref());
+        sp.map(|sp| sp.present()).unwrap_or_default()
+    };
+    let in_touch = d.people_in_touch();
+    let mut from: Vec<[u8; 32]> = members
+        .into_iter()
+        .filter(|w| in_touch.contains(w))
+        .collect();
+    // The sender first.
+    from.sort_by_key(|w| *w != m.author);
+    let to = std::path::PathBuf::from(to);
+    let mut last = anyhow::anyhow!("nobody who has it is in touch right now");
+    for who in from.into_iter().map(Some).chain([None]) {
+        let (d, written) = (d.clone(), to.clone());
+        let got = tokio::task::spawn_blocking(move || -> anyhow::Result<u64> {
+            let fetch = match who {
+                Some(w) => crate::fetch::Fetcher::from_contact(&d, Priority::Interactive, w),
+                None => crate::fetch::Fetcher::new(&d, Priority::Interactive),
+            };
+            let mut reader = cardinal_blob::BlobReader::new(&*d.store, &fetch, blob);
+            contacts::write_new(&written, |out| contacts::write_out(&mut reader, out))
+        })
+        .await?;
+        match got {
+            Ok(size) => return Ok(json!({"path": to, "size": size})),
+            Err(e) => last = e,
+        }
+    }
+    Err(last)
+}
+
+/// `own_message` as main had it, by name.
+#[cfg(any(test, debug_assertions, feature = "by-name"))]
+#[allow(dead_code, clippy::all)]
+fn own_message_by_name(
+    d: &Daemon,
+    space: &SpaceId,
+    id: &str,
+) -> anyhow::Result<relationship::Message> {
+    let m = message_in_by_name(d, space, id)?;
+    anyhow::ensure!(
+        m.author == identity(d)?,
+        "only what you wrote can be changed"
+    );
+    Ok(m)
+}
+
+/// `edit_message` as main had it, by name.
+#[cfg(any(test, debug_assertions, feature = "by-name"))]
+#[allow(dead_code, clippy::all)]
+pub fn edit_message_by_name(
+    d: &Arc<Daemon>,
+    group: &str,
+    id: &str,
+    text: &str,
+) -> anyhow::Result<Json> {
+    let g = joined_by_name(d, group)?;
+    may_write_in(d, &g)?;
+    let m = own_message_by_name(d, &g.id, id)?;
+    anyhow::ensure!(!text.trim().is_empty(), "a message cannot be empty");
+    d.write_and_push(&g.id, vec![relationship::edit_message(m.id, text)])?;
+    Ok(json!({}))
+}
+
+/// `delete_message` as main had it, by name.
+#[cfg(any(test, debug_assertions, feature = "by-name"))]
+#[allow(dead_code, clippy::all)]
+pub fn delete_message_by_name(d: &Arc<Daemon>, group: &str, id: &str) -> anyhow::Result<Json> {
+    let g = joined_by_name(d, group)?;
+    may_write_in(d, &g)?;
+    let m = own_message_by_name(d, &g.id, id)?;
+    d.write_and_push(&g.id, vec![SpaceOp::delete(m.id)])?;
+    Ok(json!({}))
+}
+
+/// `react` as main had it, by name.
+#[cfg(any(test, debug_assertions, feature = "by-name"))]
+#[allow(dead_code, clippy::all)]
+pub fn react_by_name(d: &Arc<Daemon>, group: &str, id: &str, text: &str) -> anyhow::Result<Json> {
+    let g = joined_by_name(d, group)?;
+    may_write_in(d, &g)?;
+    let m = message_in_by_name(d, &g.id, id)?;
+    let text = text.trim();
+    anyhow::ensure!(
+        text.chars().count() <= 16,
+        "that is too long for a reaction"
+    );
+    let me = identity(d)?;
+    let mine: Vec<&relationship::Reaction> =
+        m.reactions.iter().filter(|r| r.author == me).collect();
+    let mut ops: Vec<SpaceOp> = Vec::new();
+    match (mine.last(), text.is_empty()) {
+        (Some(_), true) => ops.extend(mine.iter().map(|r| SpaceOp::delete(r.id))),
+        (Some(r), false) => {
+            ops.extend(mine[..mine.len() - 1].iter().map(|r| SpaceOp::delete(r.id)));
+            if r.text != text {
+                ops.push(relationship::set_reaction(r.id, text));
+            }
+        }
+        (None, true) => {}
+        (None, false) => ops.push(relationship::create_reaction(m.id, text)),
+    }
+    if !ops.is_empty() {
+        d.write_and_push(&g.id, ops)?;
+    }
+    Ok(json!({}))
+}
+
+/// `mark_read` as main had it, by name.
+#[cfg(any(test, debug_assertions, feature = "by-name"))]
+#[allow(dead_code, clippy::all)]
+pub fn mark_read_by_name(d: &Arc<Daemon>, group: &str) -> anyhow::Result<Json> {
+    let g = joined_by_name(d, group)?;
+    contacts::mark_read_in_by_name(d, &g.id, &g.name)
 }

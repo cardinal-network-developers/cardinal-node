@@ -1292,6 +1292,67 @@ typed!(
 );
 asks!(ACCEPT: 43 "accept" AcceptArgs -> AcceptReply, writes);
 
+// ---- Messages, with a contact or in a group ----
+
+typed!(fields SayArgs {
+    1 who: Option<Reference>,
+    2 text: Option<String>,
+    3 reply_to: Option<Reference>,
+    4 attach: Option<Vec<String>>,
+    5 group: Option<Reference>,
+});
+typed!(
+    fields
+    /// To a contact: whether it can reach them now.
+    SayReply {
+        2 reachable: Option<bool>,
+    }
+);
+asks!(SAY: 35 "say" SayArgs -> SayReply, writes);
+typed!(fields SaveAttachmentArgs {
+    1 who: Option<Reference>,
+    2 id: Option<Reference>,
+    3 index: Option<u64>,
+    4 to: Option<String>,
+    5 group: Option<Reference>,
+});
+asks!(SAVE_ATTACHMENT: 36 "save-attachment" SaveAttachmentArgs -> SaveReply, writes);
+typed!(fields EditMessageArgs {
+    1 who: Option<Reference>,
+    2 id: Option<Reference>,
+    3 text: Option<String>,
+    4 group: Option<Reference>,
+});
+asks!(EDIT_MESSAGE: 37 "edit-message" EditMessageArgs -> Done, writes);
+typed!(fields DeleteMessageArgs {
+    1 who: Option<Reference>,
+    2 id: Option<Reference>,
+    3 group: Option<Reference>,
+});
+asks!(DELETE_MESSAGE: 38 "delete-message" DeleteMessageArgs -> Done, writes);
+typed!(fields ReactArgs {
+    1 who: Option<Reference>,
+    2 id: Option<Reference>,
+    3 text: Option<String>,
+    4 group: Option<Reference>,
+});
+asks!(REACT: 39 "react" ReactArgs -> Done, writes);
+typed!(fields MarkReadArgs {
+    1 who: Option<Reference>,
+    2 group: Option<Reference>,
+});
+typed!(
+    fields
+    /// Whether this person's marker moved, which the others see, or the
+    /// place only their own devices keep, and why.
+    MarkReadReply {
+        2 kept: bool,
+        3 marked: bool,
+        4 why: Option<String>,
+    }
+);
+asks!(MARK_READ: 40 "mark-read" MarkReadArgs -> MarkReadReply, writes);
+
 // ---- Groups ----
 
 typed!(fields GroupCreateArgs {
@@ -1615,16 +1676,12 @@ pub static REQUESTS: &[Request] = &[
     paged!(after 33 "conversations" (1 "after" U, 2 "limit" U) -> (
         2 "conversations" [CONVERSATION], 3 "more" BOOL, 4 "next" U)),
     MESSAGES,
-    req!(35 "say" (1 "who" REF, 2 "text" T, 3 "reply_to" REF, 4 "attach" [T], 5 "group" REF) -> (
-        2 "reachable" BOOL)),
-    req!(36 "save-attachment" (
-        1 "who" REF, 2 "id" REF, 3 "index" U, 4 "to" T, 5 "group" REF
-    ) -> (2 "path" T, 3 "size" U)),
-    req!(37 "edit-message" (1 "who" REF, 2 "id" REF, 3 "text" T, 4 "group" REF) -> ()),
-    req!(38 "delete-message" (1 "who" REF, 2 "id" REF, 3 "group" REF) -> ()),
-    req!(39 "react" (1 "who" REF, 2 "id" REF, 3 "text" T, 4 "group" REF) -> ()),
-    req!(40 "mark-read" (1 "who" REF, 2 "group" REF) -> (
-        2 "kept" BOOL, 3 "marked" BOOL, 4 "why" T)),
+    SAY,
+    SAVE_ATTACHMENT,
+    EDIT_MESSAGE,
+    DELETE_MESSAGE,
+    REACT,
+    MARK_READ,
     req!(41 "read-markers" (1 "on" BOOL) -> (2 "on" BOOL)),
     INVITE,
     ACCEPT,

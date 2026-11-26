@@ -1450,6 +1450,13 @@ async fn call(paths: &Paths, req: Value) -> anyhow::Result<Value> {
     }
 }
 
+/// A path as the service is given it: text, or refused.
+fn utf8(p: &std::path::Path) -> anyhow::Result<String> {
+    p.to_str()
+        .map(str::to_owned)
+        .ok_or_else(|| anyhow::anyhow!("{} is not a path in UTF-8", p.display()))
+}
+
 /// [`call`], typed (`cardinald::api::typed`): the reply as its own value,
 /// with no tree of names.
 async fn ask<A: api::typed::Ask>(paths: &Paths, args: A) -> anyhow::Result<A::Reply> {
@@ -3638,9 +3645,19 @@ async fn client(cmd: Cmd) -> anyhow::Result<()> {
                 .iter()
                 .map(std::path::absolute)
                 .collect::<Result<_, _>>()?;
-            let req = json!({"cmd": "say", "who": who, "text": text, "attach": attach});
-            let v = call(&paths, req).await?;
-            if v["reachable"] == false {
+            let args = api::SayArgs {
+                who: Some(api::typed::Reference::Typed(who.clone())),
+                text: Some(text),
+                attach: Some(
+                    attach
+                        .iter()
+                        .map(|p| utf8(p))
+                        .collect::<anyhow::Result<_>>()?,
+                ),
+                ..api::SayArgs::new()
+            };
+            let v = ask(&paths, args).await?;
+            if v.reachable == Some(false) {
                 println!(
                     "Kept here: this cannot reach {who} through a host, so it waits \
                      until you connect."
@@ -4124,7 +4141,11 @@ async fn client(cmd: Cmd) -> anyhow::Result<()> {
                 }
             }
             // Shown is read, as in a window; their devices see it too.
-            call(&paths, json!({"cmd": "mark-read", "who": who})).await?;
+            let args = api::MarkReadArgs {
+                who: Some(api::typed::Reference::Typed(who.clone())),
+                group: None,
+            };
+            ask(&paths, args).await?;
             Ok(())
         }
         Cmd::Save {
@@ -4135,13 +4156,15 @@ async fn client(cmd: Cmd) -> anyhow::Result<()> {
         } => {
             anyhow::ensure!(n >= 1, "files are counted from 1");
             let to = std::path::absolute(&to)?;
-            let req = json!({"cmd": "save-attachment", "who": who, "id": message, "index": n - 1, "to": to});
-            let v = call(&paths, req).await?;
-            println!(
-                "Saved {} at {}.",
-                human_size(v["size"].as_u64().unwrap_or(0)),
-                to.display()
-            );
+            let args = api::SaveAttachmentArgs {
+                who: Some(api::typed::Reference::Typed(who)),
+                id: Some(api::typed::Reference::Typed(message)),
+                index: Some(n as u64 - 1),
+                to: Some(utf8(&to)?),
+                group: None,
+            };
+            let v = ask(&paths, args).await?;
+            println!("Saved {} at {}.", human_size(v.size), to.display());
             Ok(())
         }
         Cmd::Bluetooth { setting } => {

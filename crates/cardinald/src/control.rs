@@ -375,6 +375,10 @@ pub mod typed {
         SaveArgs, SaveReply, ShareArgs, ShareReply, UnmountArgs, UnpinArgs, WriteArgs,
     };
     use crate::api::{
+        DeleteMessageArgs, EditMessageArgs, MarkReadArgs, MarkReadReply, ReactArgs,
+        SaveAttachmentArgs, SayArgs, SayReply,
+    };
+    use crate::api::{
         GroupAddArgs, GroupCreateArgs, GroupCreateReply, GroupDeclineArgs, GroupJoinArgs,
         GroupJoinReply, GroupLeaveArgs, GroupLeaveReply, GroupMemberArgs, GroupReachArgs,
         GroupReachReply, GroupRejoinArgs, GroupRemoveArgs, GroupRemoveReply, GroupRoleArgs,
@@ -812,6 +816,118 @@ pub mod typed {
             let code = needed(a.code.as_deref(), "code")?;
             let regard = regard(a.hosts_only, a.no_introductions);
             crate::contacts::accept_for(d, code, a.name.as_deref(), regard, met, true, whom).await
+        }
+    }
+
+    // ---- Messages, with a contact or in a group ----
+
+    impl Answer for SayArgs {
+        async fn answer(d: &Arc<Daemon>, a: &Self) -> anyhow::Result<SayReply> {
+            let reply_to = a.reply_to.as_ref().map(Reference::as_ref);
+            let attach = a.attach.as_deref().unwrap_or_default();
+            match &a.group {
+                Some(group) => {
+                    let text = needed(a.text.as_deref(), "text")?;
+                    crate::groups::say(d, group.as_ref(), text, reply_to, attach).await?;
+                    Ok(SayReply::new())
+                }
+                None => {
+                    let who = needed(a.who.as_ref(), "who")?;
+                    let text = needed(a.text.as_deref(), "text")?;
+                    crate::contacts::say(d, who.as_ref(), text, reply_to, attach).await
+                }
+            }
+        }
+    }
+
+    impl Answer for SaveAttachmentArgs {
+        async fn answer(d: &Arc<Daemon>, a: &Self) -> anyhow::Result<api::SaveReply> {
+            let index = a.index.unwrap_or(0) as usize;
+            let (place, id, to) = match &a.group {
+                Some(group) => (
+                    group,
+                    needed(a.id.as_ref(), "id")?,
+                    needed(a.to.as_deref(), "to")?,
+                ),
+                None => (
+                    needed(a.who.as_ref(), "who")?,
+                    needed(a.id.as_ref(), "id")?,
+                    needed(a.to.as_deref(), "to")?,
+                ),
+            };
+            match a.group {
+                Some(_) => {
+                    crate::groups::save_attachment(d, place.as_ref(), id.as_ref(), index, to).await
+                }
+                None => {
+                    crate::contacts::save_attachment(d, place.as_ref(), id.as_ref(), index, to)
+                        .await
+                }
+            }
+        }
+    }
+
+    impl Answer for EditMessageArgs {
+        async fn answer(d: &Arc<Daemon>, a: &Self) -> anyhow::Result<Done> {
+            match &a.group {
+                Some(group) => {
+                    let id = needed(a.id.as_ref(), "id")?;
+                    let text = needed(a.text.as_deref(), "text")?;
+                    crate::groups::edit_message(d, group.as_ref(), id.as_ref(), text)?;
+                }
+                None => {
+                    let who = needed(a.who.as_ref(), "who")?;
+                    let id = needed(a.id.as_ref(), "id")?;
+                    let text = needed(a.text.as_deref(), "text")?;
+                    crate::contacts::edit_message(d, who.as_ref(), id.as_ref(), text)?;
+                }
+            }
+            Ok(Done {})
+        }
+    }
+
+    impl Answer for DeleteMessageArgs {
+        async fn answer(d: &Arc<Daemon>, a: &Self) -> anyhow::Result<Done> {
+            match &a.group {
+                Some(group) => {
+                    let id = needed(a.id.as_ref(), "id")?;
+                    crate::groups::delete_message(d, group.as_ref(), id.as_ref())?;
+                }
+                None => {
+                    let who = needed(a.who.as_ref(), "who")?;
+                    let id = needed(a.id.as_ref(), "id")?;
+                    crate::contacts::delete_message(d, who.as_ref(), id.as_ref())?;
+                }
+            }
+            Ok(Done {})
+        }
+    }
+
+    impl Answer for ReactArgs {
+        async fn answer(d: &Arc<Daemon>, a: &Self) -> anyhow::Result<Done> {
+            match &a.group {
+                Some(group) => {
+                    let id = needed(a.id.as_ref(), "id")?;
+                    let text = needed(a.text.as_deref(), "text")?;
+                    crate::groups::react(d, group.as_ref(), id.as_ref(), text)?;
+                }
+                None => {
+                    let who = needed(a.who.as_ref(), "who")?;
+                    let id = needed(a.id.as_ref(), "id")?;
+                    let text = needed(a.text.as_deref(), "text")?;
+                    crate::contacts::react(d, who.as_ref(), id.as_ref(), text)?;
+                }
+            }
+            Ok(Done {})
+        }
+    }
+
+    impl Answer for MarkReadArgs {
+        async fn answer(d: &Arc<Daemon>, a: &Self) -> anyhow::Result<MarkReadReply> {
+            match &a.group {
+                Some(group) => crate::groups::mark_read(d, group.as_ref()),
+                None => crate::contacts::mark_read(d, needed(a.who.as_ref(), "who")?.as_ref()),
+            }
         }
     }
 
@@ -1409,22 +1525,31 @@ async fn handle(d: &Arc<Daemon>, req: &Value) -> anyhow::Result<Value> {
                 setting => crate::contacts::set(d, arg(req, "who")?, setting),
             },
         },
+        #[cfg(any(test, debug_assertions, feature = "by-name"))]
         "say" if req.get("group").is_some() => {
             let reply_to = req.get("reply_to").and_then(|v| v.as_str());
             let attach = strings(req, "attach");
-            crate::groups::say(d, arg(req, "group")?, arg(req, "text")?, reply_to, &attach).await
+            crate::groups::say_by_name(d, arg(req, "group")?, arg(req, "text")?, reply_to, &attach)
+                .await
         }
+        #[cfg(any(test, debug_assertions, feature = "by-name"))]
         "mark-read" if req.get("group").is_some() => {
-            crate::groups::mark_read(d, arg(req, "group")?)
+            crate::groups::mark_read_by_name(d, arg(req, "group")?)
         }
+        #[cfg(any(test, debug_assertions, feature = "by-name"))]
         "react" if req.get("group").is_some() => {
-            crate::groups::react(d, arg(req, "group")?, arg(req, "id")?, arg(req, "text")?)
+            crate::groups::react_by_name(d, arg(req, "group")?, arg(req, "id")?, arg(req, "text")?)
         }
-        "edit-message" if req.get("group").is_some() => {
-            crate::groups::edit_message(d, arg(req, "group")?, arg(req, "id")?, arg(req, "text")?)
-        }
+        #[cfg(any(test, debug_assertions, feature = "by-name"))]
+        "edit-message" if req.get("group").is_some() => crate::groups::edit_message_by_name(
+            d,
+            arg(req, "group")?,
+            arg(req, "id")?,
+            arg(req, "text")?,
+        ),
+        #[cfg(any(test, debug_assertions, feature = "by-name"))]
         "delete-message" if req.get("group").is_some() => {
-            crate::groups::delete_message(d, arg(req, "group")?, arg(req, "id")?)
+            crate::groups::delete_message_by_name(d, arg(req, "group")?, arg(req, "id")?)
         }
         "groups" => Ok(crate::groups::list(d)),
         "introductions" => Ok(crate::introductions::list(d)),
@@ -1514,6 +1639,7 @@ async fn handle(d: &Arc<Daemon>, req: &Value) -> anyhow::Result<Value> {
                 introduce,
             )
         }
+        #[cfg(any(test, debug_assertions, feature = "by-name"))]
         "say" => {
             let reply_to = req.get("reply_to").and_then(|v| v.as_str());
             let attach: Vec<String> = req
@@ -1525,23 +1651,36 @@ async fn handle(d: &Arc<Daemon>, req: &Value) -> anyhow::Result<Value> {
                         .collect()
                 })
                 .unwrap_or_default();
-            crate::contacts::say(d, arg(req, "who")?, arg(req, "text")?, reply_to, &attach).await
+            crate::contacts::say_by_name(d, arg(req, "who")?, arg(req, "text")?, reply_to, &attach)
+                .await
         }
+        #[cfg(any(test, debug_assertions, feature = "by-name"))]
         "save-attachment" if req.get("group").is_some() => {
             let index = req.get("index").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
             let (group, id, to) = (arg(req, "group")?, arg(req, "id")?, arg(req, "to")?);
-            crate::groups::save_attachment(d, group, id, index, to).await
+            crate::groups::save_attachment_by_name(d, group, id, index, to).await
         }
+        #[cfg(any(test, debug_assertions, feature = "by-name"))]
         "save-attachment" => {
             let index = req.get("index").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
             let (who, id, to) = (arg(req, "who")?, arg(req, "id")?, arg(req, "to")?);
-            crate::contacts::save_attachment(d, who, id, index, to).await
+            crate::contacts::save_attachment_by_name(d, who, id, index, to).await
         }
-        "edit-message" => {
-            crate::contacts::edit_message(d, arg(req, "who")?, arg(req, "id")?, arg(req, "text")?)
+        #[cfg(any(test, debug_assertions, feature = "by-name"))]
+        "edit-message" => crate::contacts::edit_message_by_name(
+            d,
+            arg(req, "who")?,
+            arg(req, "id")?,
+            arg(req, "text")?,
+        ),
+        #[cfg(any(test, debug_assertions, feature = "by-name"))]
+        "delete-message" => {
+            crate::contacts::delete_message_by_name(d, arg(req, "who")?, arg(req, "id")?)
         }
-        "delete-message" => crate::contacts::delete_message(d, arg(req, "who")?, arg(req, "id")?),
-        "react" => crate::contacts::react(d, arg(req, "who")?, arg(req, "id")?, arg(req, "text")?),
+        #[cfg(any(test, debug_assertions, feature = "by-name"))]
+        "react" => {
+            crate::contacts::react_by_name(d, arg(req, "who")?, arg(req, "id")?, arg(req, "text")?)
+        }
         #[cfg(any(test, debug_assertions, feature = "by-name"))]
         "call-start" if req.get("ring").is_some_and(|r| !r.is_null()) => {
             anyhow::ensure!(
@@ -1575,7 +1714,8 @@ async fn handle(d: &Arc<Daemon>, req: &Value) -> anyhow::Result<Value> {
         #[cfg(any(test, debug_assertions, feature = "by-name"))]
         "call-end" => crate::calls::end_by_name(d).await,
         "conversations" => Ok(crate::contacts::conversations(d)),
-        "mark-read" => crate::contacts::mark_read(d, arg(req, "who")?),
+        #[cfg(any(test, debug_assertions, feature = "by-name"))]
+        "mark-read" => crate::contacts::mark_read_by_name(d, arg(req, "who")?),
         "read-markers" => {
             let on = req.get("on").and_then(|v| v.as_bool());
             crate::settings::read_markers(d, on)

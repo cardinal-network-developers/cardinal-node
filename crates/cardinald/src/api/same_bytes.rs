@@ -289,7 +289,7 @@ async fn typed_replies_are_the_bytes_they_were_by_name() {
     same(&d, json!({"cmd": "messages", "group": by_id})).await;
     for i in 0..30 {
         let text = format!("message {i} {}", "word ".repeat(i));
-        crate::groups::say(&d, &group, &text, None, &[])
+        crate::groups::say(&d, Ref::Typed(&group), &text, None, &[])
             .await
             .unwrap();
     }
@@ -297,14 +297,26 @@ async fn typed_replies_are_the_bytes_they_were_by_name() {
     assert_eq!(all.messages.len(), 30);
     let first = hex::encode(all.messages[0].id);
     let tenth = hex::encode(all.messages[10].id);
-    crate::groups::say(&d, &group, "an answer", Some(&first), &[])
-        .await
-        .unwrap();
-    crate::groups::react(&d, &group, &tenth, "👍").unwrap();
-    crate::groups::edit_message(&d, &group, &tenth, "said again").unwrap();
-    crate::groups::say(&d, &group, "with a file", None, &[local.to_owned()])
-        .await
-        .unwrap();
+    crate::groups::say(
+        &d,
+        Ref::Typed(&group),
+        "an answer",
+        Some(Ref::Typed(&first)),
+        &[],
+    )
+    .await
+    .unwrap();
+    crate::groups::react(&d, Ref::Typed(&group), Ref::Typed(&tenth), "👍").unwrap();
+    crate::groups::edit_message(&d, Ref::Typed(&group), Ref::Typed(&tenth), "said again").unwrap();
+    crate::groups::say(
+        &d,
+        Ref::Typed(&group),
+        "with a file",
+        None,
+        &[local.to_owned()],
+    )
+    .await
+    .unwrap();
     let all = messages_of(&same(&d, json!({"cmd": "messages", "group": "Kin"})).await);
     assert_eq!(all.messages.len(), 32);
     assert_eq!(all.messages[30].reply_to, Some(all_first(&all)));
@@ -332,7 +344,7 @@ async fn typed_replies_are_the_bytes_they_were_by_name() {
     // more than a message holds: cut by size, and one too large alone
     let long = "x".repeat(60_000);
     for _ in 0..5 {
-        crate::groups::say(&d, &group, &long, None, &[])
+        crate::groups::say(&d, Ref::Typed(&group), &long, None, &[])
             .await
             .unwrap();
     }
@@ -1161,7 +1173,7 @@ async fn a_contact_and_before_are_the_bytes_they_were() {
     t.alike(&go, &gn);
     for i in 0..3 {
         for d in [&t.old, &t.new] {
-            crate::groups::say(d, "Kin", &format!("m{i}"), None, &[])
+            crate::groups::say(d, Ref::Typed("Kin"), &format!("m{i}"), None, &[])
                 .await
                 .unwrap();
         }
@@ -1988,6 +2000,299 @@ async fn groups_are_changed_the_same() {
     .await;
     t.same_message(&message_of(87, vec![(1, Value::from(1u64))]))
         .await;
+    for d in [&t.old, &t.new] {
+        let _ = d.stopping.send(true);
+    }
+    for d in bea {
+        let _ = d.stopping.send(true);
+    }
+}
+
+/// The ids and times of the messages of a conversation, oldest first.
+fn said_in(d: &Arc<Daemon>, who: Option<&str>, group: Option<&str>) -> Vec<([u8; 16], u64)> {
+    let r = crate::control::typed::messages(
+        d,
+        &MessagesArgs {
+            who: who.map(|w| typed::Reference::Typed(w.into())),
+            group: group.map(|g| typed::Reference::Typed(g.into())),
+            before: None,
+            limit: None,
+        },
+    )
+    .unwrap();
+    r.messages
+        .iter()
+        .map(|m| (m.id, m.time.unwrap_or(0)))
+        .collect()
+}
+
+/// Writing, saving what came with a message, changing and taking back
+/// what was said, reacting and marking read: with a contact (a device of
+/// someone else's for each twin) and in a group.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn messages_are_written_the_same() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut t = Twins::start(dir.path()).await;
+    tokio::spawn(t.old.clone().run());
+    tokio::spawn(t.new.clone().run());
+    let bea = befriended(&mut t, dir.path(), "Bea").await;
+    let (go, gn) = a_group(&mut t, "Kin");
+    let local = dir.path().join("note.txt");
+    std::fs::write(&local, b"a note").unwrap();
+    let local = local.to_str().unwrap().to_owned();
+
+    // ---- say: refused, then said ----
+    for req in [
+        json!({"cmd": "say"}),
+        json!({"cmd": "say", "who": "Bea"}),
+        json!({"cmd": "say", "text": "hi"}),
+        json!({"cmd": "say", "who": "Nobody", "text": "hi"}),
+        json!({"cmd": "say", "who": exact(&[3; 8]), "text": "hi"}),
+        json!({"cmd": "say", "group": "Kin"}),
+        json!({"cmd": "say", "group": "Nobody", "text": "hi"}),
+        json!({"cmd": "say", "group": "Kin", "text": "hi", "reply_to": "nothing"}),
+        json!({"cmd": "say", "group": "Kin", "text": "hi", "reply_to": exact(&[1; 16])}),
+        json!({"cmd": "say", "group": "Kin", "text": "hi", "reply_to": exact(&[1; 15])}),
+        json!({"cmd": "say", "who": "Bea", "text": "hi", "reply_to": hex::encode([1; 16])}),
+        json!({"cmd": "say", "group": "Kin", "text": "hi", "attach": ["/no/such/file"]}),
+        json!({"cmd": "say", "group": "Kin", "text": "hi", "attach": [dir.path().to_str().unwrap()]}),
+        json!({"cmd": "say", "group": "Kin", "text": "first"}),
+        json!({"cmd": "say", "group": "Kin", "who": "Nobody", "text": "to the group"}),
+        json!({"cmd": "say", "group": "Kin", "text": "with a note", "attach": [local]}),
+        json!({"cmd": "say", "who": "Bea", "text": "hello"}),
+        json!({"cmd": "say", "who": "bea", "text": "with a note", "attach": [local]}),
+    ] {
+        t.same(req).await;
+    }
+    let by_id = |g: &[u8]| json!({"cmd": "say", "group": exact(g), "text": "by its id"});
+    t.same_as(by_id(&go), by_id(&gn)).await;
+    let bea_id = |i: usize| bea[i].core().identity.as_ref().unwrap().id();
+    for short in [false, true] {
+        let req = |id: [u8; 32]| {
+            let id = if short { exact(&id[..8]) } else { exact(&id) };
+            json!({"cmd": "say", "who": id, "text": "by hers"})
+        };
+        t.same_as(req(bea_id(0)), req(bea_id(1))).await;
+    }
+    // what each twin said, told alike
+    let (ko, kn) = (
+        said_in(&t.old, None, Some("Kin")),
+        said_in(&t.new, None, Some("Kin")),
+    );
+    let (bo, bn) = (
+        said_in(&t.old, Some("Bea"), None),
+        said_in(&t.new, Some("Bea"), None),
+    );
+    assert_eq!((ko.len(), bo.len()), (kn.len(), bn.len()));
+    for ((o, ot), (n, nt)) in ko.iter().chain(&bo).zip(kn.iter().chain(&bn)) {
+        t.alike(o, n);
+        t.alike_time(*ot, *nt);
+    }
+    // in reply, by an id as bytes and typed
+    for (o, n) in [(ko[0].0, kn[0].0), (bo[0].0, bn[0].0)] {
+        for form in [exact as fn(&[u8]) -> String, |b: &[u8]| hex::encode(b)] {
+            let req = |id: [u8; 16], g: bool| {
+                if g {
+                    json!({"cmd": "say", "group": "Kin", "text": "yes", "reply_to": form(&id)})
+                } else {
+                    json!({"cmd": "say", "who": "Bea", "text": "yes", "reply_to": form(&id)})
+                }
+            };
+            t.same_as(req(o, true), req(n, true)).await;
+            t.same_as(req(o, false), req(n, false)).await;
+        }
+    }
+    t.same_message(&message_of(
+        35,
+        vec![(1, Value::from("Bea")), (2, Value::from(1u64))],
+    ))
+    .await;
+
+    // ---- save-attachment ----
+    let note = |list: &[([u8; 16], u64)], at: usize| list[at].0;
+    for (i, (o, n, group)) in [
+        (note(&ko, 2), note(&kn, 2), true),
+        (note(&bo, 1), note(&bn, 1), false),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let to = |who: &str| dir.path().join(format!("saved-{who}-{i}.txt"));
+        let (to_o, to_n) = (to("old"), to("new"));
+        t.alike(
+            to_o.to_str().unwrap().as_bytes(),
+            to_n.to_str().unwrap().as_bytes(),
+        );
+        let req = |id: [u8; 16], to: &std::path::Path, index: Option<u64>| {
+            let mut r = json!({"cmd": "save-attachment", "id": exact(&id), "to": to.to_str().unwrap(), "index": index});
+            if group {
+                r["group"] = json!("Kin");
+            } else {
+                r["who"] = json!("Bea");
+            }
+            r
+        };
+        t.same_as(req(o, &to_o, Some(1)), req(n, &to_n, Some(1)))
+            .await;
+        let msg = t.same_as(req(o, &to_o, None), req(n, &to_n, None)).await;
+        assert_eq!(typed_of::<SaveAttachmentArgs>(&msg).size, 6);
+        // there already
+        t.same_as(req(o, &to_o, Some(0)), req(n, &to_n, Some(0)))
+            .await;
+    }
+    for req in [
+        json!({"cmd": "save-attachment"}),
+        json!({"cmd": "save-attachment", "who": "Bea"}),
+        json!({"cmd": "save-attachment", "who": "Bea", "id": "00"}),
+        json!({"cmd": "save-attachment", "who": "Bea", "id": "00", "to": "/tmp/x"}),
+        json!({"cmd": "save-attachment", "group": "Kin", "to": "/tmp/x"}),
+        json!({"cmd": "save-attachment", "group": "Nobody", "id": "00", "to": "/tmp/x"}),
+        json!({"cmd": "save-attachment", "group": "Kin", "id": exact(&[1; 16]), "to": "/tmp/x"}),
+    ] {
+        t.same(req).await;
+    }
+
+    // ---- what Bea says comes, and is not this person's to change ----
+    for (i, d) in bea.iter().enumerate() {
+        let twin = if i == 0 { &t.old } else { &t.new };
+        let had = said_in(twin, Some("Bea"), None).len();
+        crate::contacts::say(d, Ref::Typed("Me"), "from Bea", None, &[])
+            .await
+            .unwrap();
+        until("Bea's message", || {
+            said_in(twin, Some("Bea"), None).len() > had
+        })
+        .await;
+    }
+    let (bo, bn) = (
+        said_in(&t.old, Some("Bea"), None),
+        said_in(&t.new, Some("Bea"), None),
+    );
+    let (theirs_o, theirs_n) = (bo.last().unwrap(), bn.last().unwrap());
+    t.alike(&theirs_o.0, &theirs_n.0);
+    t.alike_time(theirs_o.1, theirs_n.1);
+
+    // ---- edit-message, react, delete-message, mark-read ----
+    let (mo, mn) = (ko[0].0, kn[0].0);
+    let (co, cn) = (bo[0].0, bn[0].0);
+    let pairs: Vec<(Json, Json)> = {
+        let mut v = Vec::new();
+        for (field, place) in [("group", "Kin"), ("who", "Bea")] {
+            let (o, n) = if field == "group" { (mo, mn) } else { (co, cn) };
+            let with = |id: String, rest: Json| {
+                let mut r = rest;
+                r[field] = json!(place);
+                r["id"] = json!(id);
+                r
+            };
+            for (id_o, id_n) in [(exact(&o), exact(&n)), (hex::encode(o), hex::encode(n))] {
+                for rest in [
+                    json!({"cmd": "edit-message", "text": "said again"}),
+                    json!({"cmd": "edit-message", "text": "  "}),
+                    json!({"cmd": "react", "text": "👍"}),
+                    json!({"cmd": "react", "text": " 👍 "}),
+                    json!({"cmd": "react", "text": "x".repeat(17)}),
+                    json!({"cmd": "react", "text": "🎉"}),
+                    json!({"cmd": "react", "text": ""}),
+                    json!({"cmd": "react", "text": ""}),
+                ] {
+                    v.push((with(id_o.clone(), rest.clone()), with(id_n.clone(), rest)));
+                }
+            }
+            v.push((
+                with(exact(&o), json!({"cmd": "edit-message"})),
+                with(exact(&n), json!({"cmd": "edit-message"})),
+            ));
+            v.push((
+                with(exact(&o), json!({"cmd": "react"})),
+                with(exact(&n), json!({"cmd": "react"})),
+            ));
+        }
+        // Bea's: reacted to, not changed
+        for rest in [
+            json!({"cmd": "react", "text": "👋"}),
+            json!({"cmd": "edit-message", "text": "mine now"}),
+            json!({"cmd": "delete-message"}),
+        ] {
+            let with = |id: [u8; 16]| {
+                let mut r = rest.clone();
+                r["who"] = json!("Bea");
+                r["id"] = json!(exact(&id));
+                r
+            };
+            v.push((with(theirs_o.0), with(theirs_n.0)));
+        }
+        v
+    };
+    for (o, n) in pairs {
+        t.same_as(o, n).await;
+    }
+    for req in [
+        json!({"cmd": "edit-message"}),
+        json!({"cmd": "edit-message", "who": "Bea", "text": "x"}),
+        json!({"cmd": "edit-message", "group": "Kin", "id": "zz", "text": "x"}),
+        json!({"cmd": "delete-message"}),
+        json!({"cmd": "delete-message", "group": "Kin"}),
+        json!({"cmd": "delete-message", "who": "Nobody", "id": "00"}),
+        json!({"cmd": "react"}),
+        json!({"cmd": "react", "group": "Kin", "id": exact(&[2; 16]), "text": "x"}),
+        json!({"cmd": "mark-read"}),
+        json!({"cmd": "mark-read", "who": "Nobody"}),
+        json!({"cmd": "mark-read", "group": "Nobody"}),
+        json!({"cmd": "mark-read", "who": "Bea"}),
+        json!({"cmd": "mark-read", "who": "Bea"}),
+        json!({"cmd": "mark-read", "group": "Kin"}),
+    ] {
+        t.same(req).await;
+    }
+    for d in [&t.old, &t.new] {
+        crate::settings::read_markers(d, Some(false)).unwrap();
+    }
+    for (i, d) in bea.iter().enumerate() {
+        let twin = if i == 0 { &t.old } else { &t.new };
+        let had = said_in(twin, Some("Bea"), None).len();
+        crate::contacts::say(d, Ref::Typed("Me"), "again", None, &[])
+            .await
+            .unwrap();
+        until("Bea's second message", || {
+            said_in(twin, Some("Bea"), None).len() > had
+        })
+        .await;
+    }
+    let (bo, bn) = (
+        said_in(&t.old, Some("Bea"), None),
+        said_in(&t.new, Some("Bea"), None),
+    );
+    t.alike(&bo.last().unwrap().0, &bn.last().unwrap().0);
+    t.alike_time(bo.last().unwrap().1, bn.last().unwrap().1);
+    let msg = t.same(json!({"cmd": "mark-read", "who": "Bea"})).await;
+    assert!(typed_of::<MarkReadArgs>(&msg).why.is_some());
+    t.same(json!({"cmd": "mark-read", "who": "Bea"})).await;
+    for (field, o, n) in [("group", mo, mn), ("who", co, cn)] {
+        let place = if field == "group" { "Kin" } else { "Bea" };
+        let req = |id: [u8; 16]| {
+            let mut r = json!({"cmd": "delete-message", "id": exact(&id)});
+            r[field] = json!(place);
+            r
+        };
+        t.same_as(req(o), req(n)).await;
+        t.same_as(req(o), req(n)).await;
+    }
+    // refused, by her id as bytes: named NUL first, as before
+    for d in [&t.old, &t.new] {
+        crate::contacts::set(d, "Bea", "refuse").unwrap();
+    }
+    for req in [
+        |id: [u8; 32]| json!({"cmd": "say", "who": exact(&id[..8]), "text": "hi"}),
+        |id: [u8; 32]| json!({"cmd": "react", "who": exact(&id), "id": "00", "text": "hi"}),
+        |id: [u8; 32]| json!({"cmd": "mark-read", "who": exact(&id)}),
+        |id: [u8; 32]| json!({"cmd": "edit-message", "who": exact(&id), "id": "00", "text": "x"}),
+        |id: [u8; 32]| json!({"cmd": "save-attachment", "who": exact(&id), "id": "00", "to": "/x"}),
+    ] {
+        let msg = t.same_as(req(bea_id(0)), req(bea_id(1))).await;
+        let why = failed_of::<SayArgs>(&msg).why;
+        assert!(why.starts_with("you have refused \u{0}"), "{why:?}");
+    }
     for d in [&t.old, &t.new] {
         let _ = d.stopping.send(true);
     }
