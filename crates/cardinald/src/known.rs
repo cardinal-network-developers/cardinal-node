@@ -32,6 +32,7 @@ use cardinal_contact::discovery as disc;
 use cardinal_crypto::{random_bytes, HybridPublicKey};
 use cardinal_identity::KeyId;
 use cardinal_link::{LinkError, Target};
+#[cfg(any(test, debug_assertions, feature = "by-name"))]
 use serde_json::{json, Value as Json};
 use zeroize::Zeroizing;
 
@@ -262,6 +263,22 @@ impl Known {
     }
 
     /// A device's path as `contact-status` shows it.
+    pub fn shown(&self, device: &KeyId) -> Option<crate::api::KnownPath> {
+        let p = self.path(device)?;
+        let now = Instant::now();
+        Some(crate::api::KnownPath {
+            addr: p.addr.to_string(),
+            confirmed_s_ago: p.confirmed.map(|t| unix_ms().saturating_sub(t) / 1000),
+            next_check_s: p.next.saturating_duration_since(now).as_secs(),
+            wait_s: p.wait.as_secs(),
+            misses: u64::from(p.misses),
+            probes: p.probes,
+            checking: p.checking.is_some(),
+        })
+    }
+
+    /// [`Known::shown`] as main had it, by name.
+    #[cfg(any(test, debug_assertions, feature = "by-name"))]
     pub fn json(&self, device: &KeyId) -> Json {
         let Some(p) = self.path(device) else {
             return Json::Null;

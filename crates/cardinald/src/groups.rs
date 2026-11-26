@@ -511,12 +511,12 @@ pub async fn set_role(
 /// Posts again in a group what this device wrote before it moved on and
 /// held back, because someone is there it was written without: its person
 /// says to (`spaces.md#what-the-successor-does-not-carry`).
-pub fn post_again(d: &Arc<Daemon>, group: &str) -> anyhow::Result<Json> {
-    let g = joined(d, group)?;
+pub fn post_again(d: &Arc<Daemon>, group: Ref<'_>) -> anyhow::Result<api::GroupPostAgainReply> {
+    let g = joined_ref(d, group)?;
     let held = d.core().held_back(&g.id);
     anyhow::ensure!(held > 0, "nothing of yours is held back from {}", g.name);
     let n = crate::following::post_held_back(d, &g.id);
-    Ok(json!({"posted": n}))
+    Ok(api::GroupPostAgainReply { posted: n as u64 })
 }
 
 /// Leaves a group: says so in it, and in the same entry sets this person's
@@ -773,31 +773,30 @@ impl Leaving {
 /// before it leaves (D89): who looks after it, whether the person must
 /// choose someone to, and whom their devices have been passing messages
 /// between.
-pub fn leaving(d: &Daemon, group: &str) -> anyhow::Result<Json> {
-    let g = joined(d, group)?;
+pub fn leaving(d: &Daemon, group: Ref<'_>) -> anyhow::Result<api::GroupLeavingReply> {
+    let g = joined_ref(d, group)?;
     let me = identity(d)?;
     let core = d.core();
     let sp = core.spaces.get(&g.id).and_then(|h| h.space.as_ref());
     let sp = sp.ok_or_else(|| anyhow::anyhow!("that group is not open yet"))?;
     let l = Leaving::of(&core, &g.id, sp, &me);
-    let pairs: Vec<Json> = l
+    let relayed_for = l
         .relayed_for
         .iter()
-        .map(|o| {
-            json!({
-                "a": o.a.1, "a_id": hex::encode(&o.a.0[..8]),
-                "b": o.b.1, "b_id": hex::encode(&o.b.0[..8]),
-            })
+        .map(|o| api::RelayedFor {
+            a: o.a.1.clone(),
+            a_id: api::short_id(&o.a.0),
+            b: o.b.1.clone(),
+            b_id: api::short_id(&o.b.0),
         })
         .collect();
-    let admins: Vec<&String> = l.admins.iter().map(|(_, n)| n).collect();
-    Ok(json!({
-        "group": hex::encode(g.id),
-        "name": g.name,
-        "admins": admins,
-        "choose_admin": l.choose_admin,
-        "relayed_for": pairs,
-    }))
+    Ok(api::GroupLeavingReply {
+        group: g.id,
+        name: g.name,
+        admins: l.admins.iter().map(|(_, n)| n.clone()).collect(),
+        choose_admin: l.choose_admin,
+        relayed_for,
+    })
 }
 
 /// What a person leaving is told of those their devices have been passing
@@ -1345,11 +1344,11 @@ fn may_write_in(d: &Daemon, g: &Found) -> anyhow::Result<()> {
 }
 
 /// The person cleared the note of how a group moved.
-pub fn moved_seen(d: &Daemon, group: &str) -> anyhow::Result<Json> {
-    let g = find(d, group)?;
+pub fn moved_seen(d: &Daemon, group: Ref<'_>) -> anyhow::Result<api::Done> {
+    let g = find_among(d, group, false)?;
     d.core().moved_seen(&g.id);
     d.bump();
-    Ok(json!({}))
+    Ok(api::Done {})
 }
 
 /// The person's OK to how another of their devices moved a group
@@ -1364,11 +1363,11 @@ pub fn moved_seen(d: &Daemon, group: &str) -> anyhow::Result<Json> {
 /// two places. Answers how many entries it wrote.
 pub fn confirm_move(
     d: &Arc<Daemon>,
-    group: &str,
-    moves: &[String],
-    to: &[String],
-) -> anyhow::Result<Json> {
-    let g = find(d, group)?;
+    group: Ref<'_>,
+    moves: &[bytes::Bytes],
+    to: &[bytes::Bytes],
+) -> anyhow::Result<api::GroupConfirmMoveReply> {
+    let g = find_among(d, group, false)?;
     anyhow::ensure!(
         !moves.is_empty(),
         "say which moves the person saw (moves: the groups to_confirm gives)"
@@ -1377,9 +1376,9 @@ pub fn confirm_move(
         to.is_empty() || to.len() == moves.len(),
         "to names where each move went, one for each of moves"
     );
-    let id_of = |m: &String| -> anyhow::Result<SpaceId> {
-        let id: Option<SpaceId> = hex::decode(m).ok().and_then(|b| b.try_into().ok());
-        id.ok_or_else(|| anyhow::anyhow!("a move is a group id in hex: {m}"))
+    let id_of = |m: &bytes::Bytes| -> anyhow::Result<SpaceId> {
+        let id: Option<SpaceId> = m[..].try_into().ok();
+        id.ok_or_else(|| anyhow::anyhow!("a move is a group id in hex: {}", hex::encode(m)))
     };
     let seen = moves
         .iter()
@@ -1392,12 +1391,12 @@ pub fn confirm_move(
         let pairs: Vec<(SpaceId, SpaceId)> = seen.into_iter().zip(to).collect();
         d.core().confirm_moves_to(&g.id, &pairs)?
     };
-    let kept = written.len();
+    let kept = written.len() as u64;
     for (space, bytes) in written {
         d.push(&space, vec![bytes]);
     }
     d.bump();
-    Ok(json!({ "kept": kept }))
+    Ok(api::GroupConfirmMoveReply { kept })
 }
 
 /// [`to_confirm_json`], typed.
@@ -3818,4 +3817,96 @@ fn rejoinable_json_by_name(core: &Core, me: &[u8; 32]) -> Vec<Json> {
             json!({"group": hex::encode(g.id), "name": g.name, "members": members})
         })
         .collect()
+}
+
+/// `post_again` as main had it, by name.
+#[cfg(any(test, debug_assertions, feature = "by-name"))]
+#[allow(dead_code, clippy::all)]
+pub fn post_again_by_name(d: &Arc<Daemon>, group: &str) -> anyhow::Result<Json> {
+    let g = joined_by_name(d, group)?;
+    let held = d.core().held_back(&g.id);
+    anyhow::ensure!(held > 0, "nothing of yours is held back from {}", g.name);
+    let n = crate::following::post_held_back(d, &g.id);
+    Ok(json!({"posted": n}))
+}
+
+/// `leaving` as main had it, by name.
+#[cfg(any(test, debug_assertions, feature = "by-name"))]
+#[allow(dead_code, clippy::all)]
+pub fn leaving_by_name(d: &Daemon, group: &str) -> anyhow::Result<Json> {
+    let g = joined_by_name(d, group)?;
+    let me = identity(d)?;
+    let core = d.core();
+    let sp = core.spaces.get(&g.id).and_then(|h| h.space.as_ref());
+    let sp = sp.ok_or_else(|| anyhow::anyhow!("that group is not open yet"))?;
+    let l = Leaving::of(&core, &g.id, sp, &me);
+    let pairs: Vec<Json> = l
+        .relayed_for
+        .iter()
+        .map(|o| {
+            json!({
+                "a": o.a.1, "a_id": hex::encode(&o.a.0[..8]),
+                "b": o.b.1, "b_id": hex::encode(&o.b.0[..8]),
+            })
+        })
+        .collect();
+    let admins: Vec<&String> = l.admins.iter().map(|(_, n)| n).collect();
+    Ok(json!({
+        "group": hex::encode(g.id),
+        "name": g.name,
+        "admins": admins,
+        "choose_admin": l.choose_admin,
+        "relayed_for": pairs,
+    }))
+}
+
+/// `moved_seen` as main had it, by name.
+#[cfg(any(test, debug_assertions, feature = "by-name"))]
+#[allow(dead_code, clippy::all)]
+pub fn moved_seen_by_name(d: &Daemon, group: &str) -> anyhow::Result<Json> {
+    let g = find_by_name(d, group)?;
+    d.core().moved_seen(&g.id);
+    d.bump();
+    Ok(json!({}))
+}
+
+/// `confirm_move` as main had it, by name.
+#[cfg(any(test, debug_assertions, feature = "by-name"))]
+#[allow(dead_code, clippy::all)]
+pub fn confirm_move_by_name(
+    d: &Arc<Daemon>,
+    group: &str,
+    moves: &[String],
+    to: &[String],
+) -> anyhow::Result<Json> {
+    let g = find_by_name(d, group)?;
+    anyhow::ensure!(
+        !moves.is_empty(),
+        "say which moves the person saw (moves: the groups to_confirm gives)"
+    );
+    anyhow::ensure!(
+        to.is_empty() || to.len() == moves.len(),
+        "to names where each move went, one for each of moves"
+    );
+    let id_of = |m: &String| -> anyhow::Result<SpaceId> {
+        let id: Option<SpaceId> = hex::decode(m).ok().and_then(|b| b.try_into().ok());
+        id.ok_or_else(|| anyhow::anyhow!("a move is a group id in hex: {m}"))
+    };
+    let seen = moves
+        .iter()
+        .map(id_of)
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    let written = if to.is_empty() {
+        d.core().confirm_moves(&g.id, &seen)?
+    } else {
+        let to = to.iter().map(id_of).collect::<anyhow::Result<Vec<_>>>()?;
+        let pairs: Vec<(SpaceId, SpaceId)> = seen.into_iter().zip(to).collect();
+        d.core().confirm_moves_to(&g.id, &pairs)?
+    };
+    let kept = written.len();
+    for (space, bytes) in written {
+        d.push(&space, vec![bytes]);
+    }
+    d.bump();
+    Ok(json!({ "kept": kept }))
 }

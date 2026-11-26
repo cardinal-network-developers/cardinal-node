@@ -1301,12 +1301,12 @@ impl Daemon {
             // Said once, not at each session that closes the same way.
             if let Some((kind, k)) = unread {
                 let name = self.unreadable_name(&kind);
-                if let Some(v) = self.unreadable.json(&k, &name) {
+                if let Some(u) = self.unreadable.of(&k, &name) {
                     tracing::warn!(
                         "{} ({}; they do not sync until then, and this device dials \
                          them less often)",
-                        v["says"].as_str().unwrap_or(""),
-                        v["reason"].as_str().unwrap_or("")
+                        u.says,
+                        u.reason
                     );
                 }
             }
@@ -1850,6 +1850,17 @@ impl Daemon {
     }
 
     /// When the reconnect loop dials next (`redial.rs`).
+    pub fn redial(&self) -> crate::api::Redial {
+        let helps = self.conditions.helps();
+        crate::api::Redial {
+            helps,
+            alone: self.own_sessions().is_empty() && !self.known.anchored(),
+            sparing: (!helps).then(|| lock(&self.sparing).shown(Instant::now())),
+        }
+    }
+
+    /// [`Daemon::redial`] as main had it, by name.
+    #[cfg(any(test, debug_assertions, feature = "by-name"))]
     pub fn redial_json(&self) -> serde_json::Value {
         let helps = self.conditions.helps();
         serde_json::json!({

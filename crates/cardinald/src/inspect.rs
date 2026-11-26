@@ -108,6 +108,21 @@ impl Inspection {
 
     /// Whether inspection is on, and until when: for `status`, so that a
     /// window can say so.
+    pub fn shown(&self) -> crate::api::Inspection {
+        match &*self.lock() {
+            Some(g) if g.until > Instant::now() => crate::api::Inspection {
+                on: true,
+                until: Some(g.until_ms),
+            },
+            _ => crate::api::Inspection {
+                on: false,
+                until: None,
+            },
+        }
+    }
+
+    /// [`Inspection::shown`] as main had it, by name.
+    #[cfg(any(test, debug_assertions, feature = "by-name"))]
     pub fn status(&self) -> Json {
         match &*self.lock() {
             Some(g) if g.until > Instant::now() => json!({"on": true, "until": g.until_ms}),

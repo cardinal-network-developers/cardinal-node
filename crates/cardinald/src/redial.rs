@@ -71,6 +71,16 @@ impl Sparing {
         true
     }
 
+    /// When it dials next, and the wait, as `status` gives them.
+    pub fn shown(&self, now: Instant) -> crate::api::Sparing {
+        crate::api::Sparing {
+            next_s: self.next.saturating_duration_since(now).as_secs(),
+            wait_s: self.wait.as_secs(),
+        }
+    }
+
+    /// [`Sparing::shown`] as main had it, by name.
+    #[cfg(any(test, debug_assertions, feature = "by-name"))]
     pub fn json(&self, now: Instant) -> serde_json::Value {
         serde_json::json!({
             "next_s": self.next.saturating_duration_since(now).as_secs(),

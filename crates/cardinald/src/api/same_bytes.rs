@@ -29,8 +29,10 @@ async fn typed(d: &Arc<Daemon>, req: &Json) -> Vec<u8> {
 /// Both ways give `req` the same bytes; and the reply, read typed, is
 /// what it says.
 async fn same(d: &Arc<Daemon>, req: Json) -> Vec<u8> {
-    let old = by_name(d, &req).await;
-    let new = typed(d, &req).await;
+    // the clock held still, as the service holds it to compare the two
+    let (old, new) =
+        crate::control::clock::still(async { (by_name(d, &req).await, typed(d, &req).await) })
+            .await;
     assert_eq!(
         old,
         new,
@@ -2438,7 +2440,8 @@ async fn listings_are_the_bytes_they_were() {
         .unwrap();
     }
     let all = typed_of::<InvitationsArgs>(&same(&d, json!({"cmd": "invitations"})).await);
-    crate::contacts::cancel_invitation(&d, &hex::encode(all.invitations[0].id)).unwrap();
+    crate::contacts::cancel_invitation(&d, Ref::Typed(&hex::encode(all.invitations[0].id)))
+        .unwrap();
     {
         let mut c = d.config();
         c.peers = vec!["192.0.2.1:7171".into(), "host.example.org:7171".into()];
@@ -2509,4 +2512,382 @@ async fn listings_are_the_bytes_they_were() {
     let r =
         typed_of::<HistoryArgs>(&same(&d, json!({"cmd": "history", "path": "Docs/a.txt"})).await);
     assert_eq!(r.versions.len(), 3);
+}
+
+/// The pages of `cmd`, as `after` and `limit` cut them: the whole, a page
+/// of one, the second of one, from the third, and past the end.
+fn pages_of(cmd: &str, rest: Json) -> Vec<Json> {
+    let mut out = Vec::new();
+    for (after, limit) in [
+        (None, None),
+        (None, Some(1)),
+        (Some(1), Some(1)),
+        (Some(2), None),
+        (Some(3), Some(2)),
+        (Some(40), Some(0)),
+    ] {
+        let mut r = rest.clone();
+        r["cmd"] = json!(cmd);
+        if let Some(a) = after {
+            r["after"] = json!(a);
+        }
+        if let Some(l) = limit {
+            r["limit"] = json!(l);
+        }
+        out.push(r);
+    }
+    out
+}
+
+/// `status` and `contact-status`, paged through their lists in turn, on a
+/// running service with a contact connected, one known only by their node,
+/// and one refused: by name and typed beside on one twin, and what looks
+/// or tries an address on both, where that does nothing that differs.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn status_and_reaching_are_the_bytes_they_were() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut t = Twins::start(dir.path()).await;
+    // before it runs: no copies counted yet, nothing set aside
+    for req in pages_of("status", json!({})) {
+        t.same_here(req).await;
+    }
+    tokio::spawn(t.old.clone().run());
+    tokio::spawn(t.new.clone().run());
+    let bea = befriended(&mut t, dir.path(), "Bea").await;
+    let bea_id = bea[1].core().identity.as_ref().unwrap().id();
+    let cy = a_contact(&t, "Cy", 7);
+    let dee = a_contact(&t, "Dee", 9);
+    for d in [&t.old, &t.new] {
+        crate::contacts::set(d, "Dee", "refuse").unwrap();
+    }
+    {
+        let mut c = t.new.config();
+        c.peers = vec!["192.0.2.1:7171".into(), "host.example.org:7171".into()];
+        c.this_run.left_behind = vec!["Docs/x.txt".into()];
+    }
+    crate::groups::create(&t.new, "Kin", &[], false, true).unwrap();
+    until("Bea's devices in a session", || {
+        t.new
+            .core()
+            .others
+            .get(&bea_id)
+            .is_some_and(|o| !o.log.state().keys.is_empty())
+    })
+    .await;
+    for req in pages_of("status", json!({})) {
+        t.same_here(req).await;
+    }
+    let st = typed_of::<StatusArgs>(&t.same_here(json!({"cmd": "status"})).await);
+    assert_eq!(st.peers.len(), 2, "{st:?}");
+    assert!(st.spaces.len() >= 3, "{st:?}");
+    assert!(st.copies.is_some(), "{st:?}");
+    let short = |id: &[u8; 32]| hex::encode(&id[..8]);
+    for who in [
+        json!("Bea"),
+        json!("bea"),
+        json!(short(&bea_id)),
+        json!(exact(&bea_id)),
+        json!(exact(&bea_id[..8])),
+        json!("Cy"),
+        json!("Dee"),
+    ] {
+        for req in pages_of("contact-status", json!({"who": who})) {
+            t.same_here(req).await;
+        }
+    }
+    let r = typed_of::<ContactStatusArgs>(
+        &t.same_here(json!({"cmd": "contact-status", "who": "Bea"}))
+            .await,
+    );
+    assert_eq!(r.name, "Bea");
+    assert!(!r.devices.is_empty(), "{r:?}");
+    // refused, missing and malformed, the same on both
+    for req in [
+        json!({"cmd": "contact-status"}),
+        json!({"cmd": "contact-status", "who": "Nobody"}),
+        json!({"cmd": "contact-status", "who": exact(&[3; 32])}),
+        json!({"cmd": "contact-status", "who": "Bea", "at": "nowhere"}),
+        json!({"cmd": "contact-status", "at": "nowhere"}),
+        json!({"cmd": "contact-status", "who": "Dee", "at": "192.0.2.9:7171"}),
+        json!({"cmd": "contact-status", "who": exact(&dee), "at": "192.0.2.9:7171"}),
+        json!({"cmd": "contact-status", "who": exact(&dee[..8]), "look": true}),
+        json!({"cmd": "contact-status", "who": "Dee", "look": false}),
+        json!({"cmd": "contact-status", "who": "Dee", "look": true, "after": 1}),
+        json!({"cmd": "contact-status", "who": "Cy", "at": "nowhere", "after": 2}),
+    ] {
+        t.same(req).await;
+    }
+    let _ = cy;
+    for x in bea {
+        let _ = x.stopping.send(true);
+    }
+}
+
+/// The introductions this person may answer, by id, oldest first.
+fn waiting_ids(d: &Arc<Daemon>) -> Vec<[u8; 16]> {
+    crate::introductions::list(d)
+        .introductions
+        .iter()
+        .map(|i| i.id)
+        .collect()
+}
+
+/// The rest of the requests outside the families: `hello`, read markers,
+/// cancelling an invitation, introducing, answering an introduction, and
+/// the groups' asking to meet, posting again, moves and leaving. Each
+/// refusal, a missing and a malformed argument, a ref as text, as the
+/// start of an id and as bytes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_rest_are_answered_the_same() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut t = Twins::start(dir.path()).await;
+    tokio::spawn(t.old.clone().run());
+    tokio::spawn(t.new.clone().run());
+
+    // ---- hello, read-markers ----
+    t.same_here(json!({"cmd": "hello"})).await;
+    for req in [
+        json!({"cmd": "read-markers"}),
+        json!({"cmd": "read-markers", "on": false}),
+        json!({"cmd": "read-markers"}),
+        json!({"cmd": "read-markers", "on": true}),
+        json!({"cmd": "read-markers", "on": true}),
+    ] {
+        t.same(req).await;
+    }
+    t.same_message(&message_of(41, vec![(1, Value::from("yes"))]))
+        .await;
+
+    // ---- cancel-invitation ----
+    let made = |d: &Arc<Daemon>| {
+        crate::contacts::invite(d, None, Some("Ann"), Default::default()).unwrap();
+        let list = crate::contacts::invitations(d).invitations;
+        list.last().unwrap().id
+    };
+    let (io, inew) = (made(&t.old), made(&t.new));
+    t.alike(&io, &inew);
+    let (jo, jnew) = (made(&t.old), made(&t.new));
+    t.alike(&jo, &jnew);
+    for req in [
+        json!({"cmd": "cancel-invitation"}),
+        json!({"cmd": "cancel-invitation", "id": "zz"}),
+        json!({"cmd": "cancel-invitation", "id": "00112233"}),
+        json!({"cmd": "cancel-invitation", "id": hex::encode([7; 16])}),
+        json!({"cmd": "cancel-invitation", "id": exact(&[7; 16])}),
+        json!({"cmd": "cancel-invitation", "id": exact(&[7; 3])}),
+    ] {
+        t.same(req).await;
+    }
+    t.same_as(
+        json!({"cmd": "cancel-invitation", "id": hex::encode(io).to_uppercase()}),
+        json!({"cmd": "cancel-invitation", "id": hex::encode(inew).to_uppercase()}),
+    )
+    .await;
+    t.same_as(
+        json!({"cmd": "cancel-invitation", "id": exact(&jo)}),
+        json!({"cmd": "cancel-invitation", "id": exact(&jnew)}),
+    )
+    .await;
+    // cancelled already: cancelled again
+    t.same_as(
+        json!({"cmd": "cancel-invitation", "id": hex::encode(jo)}),
+        json!({"cmd": "cancel-invitation", "id": hex::encode(jnew)}),
+    )
+    .await;
+    t.same_message(&message_of(45, vec![(1, Value::from(7u64))]))
+        .await;
+
+    // ---- introduce ----
+    let bea = befriended(&mut t, dir.path(), "Bea").await;
+    let cy = befriended(&mut t, dir.path(), "Cy").await;
+    let id = |d: &Arc<Daemon>| d.core().identity.as_ref().unwrap().id();
+    let (bea_o, bea_n) = (id(&bea[0]), id(&bea[1]));
+    let dee = a_contact(&t, "Dee", 9);
+    for d in [&t.old, &t.new] {
+        crate::contacts::set(d, "Dee", "refuse").unwrap();
+    }
+    let eve = a_contact(&t, "Eve", 11);
+    for d in [&t.old, &t.new] {
+        crate::contacts::set(d, "Eve", "no-introductions").unwrap();
+    }
+    for req in [
+        json!({"cmd": "introduce"}),
+        json!({"cmd": "introduce", "who": "Bea"}),
+        json!({"cmd": "introduce", "to": "Bea"}),
+        json!({"cmd": "introduce", "who": "Nobody", "to": "Bea"}),
+        json!({"cmd": "introduce", "who": "Bea", "to": "Nobody"}),
+        json!({"cmd": "introduce", "who": "Bea", "to": "bea"}),
+        json!({"cmd": "introduce", "who": "Dee", "to": "Bea"}),
+        json!({"cmd": "introduce", "who": exact(&dee), "to": "Bea"}),
+        json!({"cmd": "introduce", "who": "Bea", "to": exact(&dee[..8])}),
+        json!({"cmd": "introduce", "who": "Eve", "to": "Bea"}),
+        json!({"cmd": "introduce", "who": "Bea", "to": hex::encode(&eve[..8])}),
+        json!({"cmd": "introduce", "who": exact(&[5; 32]), "to": "Bea"}),
+        json!({"cmd": "introduce", "who": "Bea", "to": "Cy", "note": "you two"}),
+        json!({"cmd": "introduce", "who": "Cy", "to": "Bea"}),
+    ] {
+        t.same(req).await;
+    }
+    t.same_as(
+        json!({"cmd": "introduce", "who": exact(&bea_o), "to": "Cy", "note": ""}),
+        json!({"cmd": "introduce", "who": exact(&bea_n), "to": "Cy", "note": ""}),
+    )
+    .await;
+    t.same_message(&message_of(47, vec![(1, Value::from(3u64))]))
+        .await;
+
+    // ---- introduction-accept, introduction-decline ----
+    for cmd in ["introduction-accept", "introduction-decline"] {
+        for req in [
+            json!({"cmd": cmd}),
+            json!({"cmd": cmd, "id": "zz"}),
+            json!({"cmd": cmd, "id": hex::encode([4; 16])}),
+            json!({"cmd": cmd, "id": exact(&[4; 16])}),
+            json!({"cmd": cmd, "id": exact(&[4; 2])}),
+        ] {
+            t.same(req).await;
+        }
+    }
+    // Bea introduces each twin to someone, twice: one to say yes to and
+    // one to say no to
+    let twin = [t.old.clone(), t.new.clone()];
+    for (i, x) in bea.iter().enumerate() {
+        let me = id(&twin[i]);
+        let space = crate::contacts::find(x, "Me").unwrap().space;
+        for (n, name) in [(21u8, "Fay"), (22, "Gus")] {
+            let op = cardinal_space::relationship::create_introduction(
+                &id(x),
+                &[n; 32],
+                name,
+                Some("a friend"),
+                None,
+                None,
+            );
+            x.write_and_push(&space, vec![op]).unwrap();
+        }
+        let _ = me;
+    }
+    until("Bea's introductions", || {
+        twin.iter().all(|d| waiting_ids(d).len() == 2)
+    })
+    .await;
+    let names = |d: &Arc<Daemon>| {
+        let mut v: Vec<(String, [u8; 16])> = crate::introductions::list(d)
+            .introductions
+            .into_iter()
+            .map(|i| (i.name, i.id))
+            .collect();
+        v.sort();
+        v
+    };
+    let (wo, wn) = (names(&t.old), names(&t.new));
+    for ((_, o), (_, n)) in wo.iter().zip(&wn) {
+        t.alike(o, n);
+    }
+    // Fay: as text, upper case (not an id here), then as bytes
+    t.same_as(
+        json!({"cmd": "introduction-accept", "id": hex::encode(wo[0].1).to_uppercase()}),
+        json!({"cmd": "introduction-accept", "id": hex::encode(wn[0].1).to_uppercase()}),
+    )
+    .await;
+    t.same_as(
+        json!({"cmd": "introduction-accept", "id": exact(&wo[0].1)}),
+        json!({"cmd": "introduction-accept", "id": exact(&wn[0].1)}),
+    )
+    .await;
+    // Gus: no, as text
+    t.same_as(
+        json!({"cmd": "introduction-decline", "id": hex::encode(wo[1].1)}),
+        json!({"cmd": "introduction-decline", "id": hex::encode(wn[1].1)}),
+    )
+    .await;
+    t.same_as(
+        json!({"cmd": "introduction-decline", "id": hex::encode(wo[1].1)}),
+        json!({"cmd": "introduction-decline", "id": hex::encode(wn[1].1)}),
+    )
+    .await;
+
+    // ---- the groups' ----
+    let (go, gn) = a_group(&mut t, "Kin");
+    for req in [
+        json!({"cmd": "group-connect"}),
+        json!({"cmd": "group-connect", "group": "Kin"}),
+        json!({"cmd": "group-connect", "who": "Bea"}),
+        json!({"cmd": "group-connect", "group": "Nowhere", "who": "Bea"}),
+        json!({"cmd": "group-connect", "group": exact(&[6; 32]), "who": "Bea"}),
+        json!({"cmd": "group-connect", "group": "Kin", "who": "Bea"}),
+        json!({"cmd": "group-post-again"}),
+        json!({"cmd": "group-post-again", "group": "Nowhere"}),
+        json!({"cmd": "group-post-again", "group": "Kin"}),
+        json!({"cmd": "group-post-again", "group": exact(&[6; 32])}),
+        json!({"cmd": "group-moved-seen"}),
+        json!({"cmd": "group-moved-seen", "group": "Nowhere"}),
+        json!({"cmd": "group-moved-seen", "group": "Kin"}),
+        json!({"cmd": "group-confirm-move"}),
+        json!({"cmd": "group-confirm-move", "group": "Kin"}),
+        json!({"cmd": "group-confirm-move", "group": "Kin", "moves": []}),
+        json!({"cmd": "group-confirm-move", "group": "Kin", "moves": [hex::encode([1; 3])]}),
+        json!({"cmd": "group-confirm-move", "group": "Kin", "moves": [hex::encode([1; 32])]}),
+        json!({"cmd": "group-confirm-move", "group": "Kin", "moves": [hex::encode([1; 32])],
+            "to": [hex::encode([2; 32]), hex::encode([3; 32])]}),
+        json!({"cmd": "group-confirm-move", "group": "Kin", "moves": [hex::encode([1; 32])],
+            "to": [hex::encode([2; 5])]}),
+        json!({"cmd": "group-confirm-move", "group": "Kin", "moves": [hex::encode([1; 32])],
+            "to": [hex::encode([2; 32])]}),
+        json!({"cmd": "group-leaving"}),
+        json!({"cmd": "group-leaving", "group": "Nowhere"}),
+    ] {
+        t.same(req).await;
+    }
+    t.same_as(
+        json!({"cmd": "group-connect", "group": "Kin", "who": exact(&bea_o)}),
+        json!({"cmd": "group-connect", "group": "Kin", "who": exact(&bea_n)}),
+    )
+    .await;
+    for group in [
+        json!("Kin"),
+        json!(hex::encode(&gn[..8])),
+        json!(exact(&gn)),
+    ] {
+        t.same_here(json!({"cmd": "group-leaving", "group": group}))
+            .await;
+    }
+    t.same_as(
+        json!({"cmd": "group-moved-seen", "group": exact(&go)}),
+        json!({"cmd": "group-moved-seen", "group": exact(&gn)}),
+    )
+    .await;
+    t.same_as(
+        json!({"cmd": "group-post-again", "group": exact(&go)}),
+        json!({"cmd": "group-post-again", "group": exact(&gn)}),
+    )
+    .await;
+    // a group of Bea's, which introduces its members
+    let bea_group = |x: &Arc<Daemon>| {
+        let me = vec![typed::Reference::Typed("Me".into())];
+        crate::groups::create(x, "Club", &me, false, true)
+            .unwrap()
+            .group
+    };
+    let (co, cn) = (bea_group(&bea[0]), bea_group(&bea[1]));
+    t.alike(&co, &cn);
+    until("the offers of Club", || {
+        twin.iter().all(|d| {
+            crate::groups::list(d)
+                .offers
+                .iter()
+                .any(|o| o.name == "Club")
+        })
+    })
+    .await;
+    for req in [
+        json!({"cmd": "group-connect", "group": "Club", "who": "Bea"}),
+        json!({"cmd": "group-leaving", "group": "Club"}),
+        json!({"cmd": "group-post-again", "group": "Club"}),
+    ] {
+        t.same(req).await;
+    }
+    for x in bea.iter().chain(&cy) {
+        let _ = x.stopping.send(true);
+    }
 }

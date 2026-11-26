@@ -12,6 +12,7 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+#[cfg(any(test, debug_assertions, feature = "by-name"))]
 use serde_json::{json, Value as Json};
 use tokio::net::UdpSocket;
 
@@ -70,6 +71,7 @@ pub struct State {
 }
 
 impl State {
+    #[cfg(any(test, debug_assertions, feature = "by-name"))]
     pub fn status(&self) -> Json {
         match (&self.mapping, &self.why_not) {
             (Some((m, at)), _) => json!({
@@ -416,6 +418,7 @@ pub fn external(d: &Daemon) -> Option<SocketAddr> {
 /// (`this_device`) and the account's, for every device (`everywhere`),
 /// both on. It asks only on a network its person said is theirs (D76):
 /// `network` says which this is.
+#[cfg(any(test, debug_assertions, feature = "by-name"))]
 pub fn status(d: &Daemon) -> Json {
     let on = crate::networks::routers_on(d);
     let mut v = d.portmap.lock().unwrap_or_else(|e| e.into_inner()).status();

@@ -14,6 +14,7 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use cardinal_link::CloseReason;
+#[cfg(any(test, debug_assertions, feature = "by-name"))]
 use serde_json::{json, Value};
 
 use cardinal_identity::KeyId;
@@ -232,6 +233,7 @@ impl Unreadables {
     }
 
     /// [`Unreadables::of`], by name, for the requests not yet typed.
+    #[cfg(any(test, debug_assertions, feature = "by-name"))]
     pub fn json(&self, key: &KeyId, name: &str) -> Option<Value> {
         let (u, left) = {
             let m = self.lock();

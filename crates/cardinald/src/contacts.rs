@@ -242,7 +242,30 @@ pub fn invitations(d: &Daemon) -> crate::api::InvitationsReply {
 }
 
 /// Cancels an invitation on every device of this person.
-pub fn cancel_invitation(d: &Arc<Daemon>, id: &str) -> anyhow::Result<Json> {
+pub fn cancel_invitation(d: &Arc<Daemon>, id: Ref<'_>) -> anyhow::Result<crate::api::Done> {
+    // an id whole, in hex as text, as `invitations` gives it
+    let node = match id {
+        Ref::Typed(t) => hex::decode(t).ok(),
+        Ref::Id(given) => given.bytes().map(|b| b.into_owned()),
+    };
+    let node = node.and_then(|b| <[u8; 16]>::try_from(b.as_slice()).ok());
+    let node = node.ok_or_else(|| anyhow::anyhow!("that is not an invitation"))?;
+    anyhow::ensure!(
+        made(d).iter().any(|m| m.record.node == node),
+        "there is no such invitation"
+    );
+    let account = d
+        .core()
+        .account_id()
+        .ok_or_else(|| anyhow::anyhow!("the account space is not here yet"))?;
+    d.write_and_push(&account, vec![account::cancel_invitation(node)])?;
+    admit_invitations(d);
+    Ok(crate::api::Done {})
+}
+
+/// [`cancel_invitation`] as main had it, by name.
+#[cfg(any(test, debug_assertions, feature = "by-name"))]
+pub fn cancel_invitation_by_name(d: &Arc<Daemon>, id: &str) -> anyhow::Result<Json> {
     let node = hex::decode(crate::api::id_hex(id)).ok();
     let node = node.and_then(|b| <[u8; 16]>::try_from(b.as_slice()).ok());
     let node = node.ok_or_else(|| anyhow::anyhow!("that is not an invitation"))?;
@@ -1908,6 +1931,232 @@ fn local_only(a: &SocketAddr) -> bool {
     }
 }
 
+/// What a reach node names, as this device sees it: each host, whose
+/// device it is where it is theirs, and each address and whether it was
+/// tried.
+fn reach_seen(
+    d: &Daemon,
+    reach: &[relationship::Reach],
+    theirs: &[([u8; 32], [u8; 32])],
+) -> Vec<crate::api::ReachSeen> {
+    let me = *d.keys.link.public_key().x25519();
+    reach
+        .iter()
+        .map(|r| {
+            let device = theirs
+                .iter()
+                .find(|(x, _)| *x == r.host)
+                .map(|(_, k)| crate::api::short_id(k));
+            let endpoints = r
+                .endpoints
+                .iter()
+                .map(|e| {
+                    let why = not_tried(e);
+                    let local = e.socket_addr().is_some_and(|a| local_only(&a));
+                    crate::api::EndpointSeen {
+                        endpoint: e.to_string(),
+                        tried: why.is_none(),
+                        why_not: why.map(Into::into),
+                        local,
+                    }
+                })
+                .collect();
+            crate::api::ReachSeen {
+                host: crate::api::short_id(&r.host),
+                device,
+                this_device: r.host == me,
+                session: d.session_kind(&r.host).is_some(),
+                endpoints,
+            }
+        })
+        .collect()
+}
+
+fn step(s: &crate::rendezvous::Step) -> crate::api::Step {
+    crate::api::Step {
+        at: s.at,
+        ok: s.ok,
+        text: s.text.clone(),
+    }
+}
+
+/// Everything this device knows of reaching one contact, as
+/// `contact-status` gives it: their devices and the sessions with them,
+/// what their reach node says and what became of each address, how they
+/// were last looked for, and what this person's own reach node tells them.
+/// With `look`, looks for them first; with `at`, tries them there first.
+/// `held` is `who` as an error names it.
+pub async fn reaching(
+    d: &Arc<Daemon>,
+    who: Ref<'_>,
+    held: &str,
+    look: bool,
+    at: Option<SocketAddr>,
+) -> anyhow::Result<crate::api::ContactStatusReply> {
+    let c = find_ref(d, who)?;
+    if let Some(addr) = at {
+        // the ref as it was held by name: an id given as bytes, NUL first
+        anyhow::ensure!(
+            c.connects(),
+            "you do not trust {held}, so your devices do not connect to theirs"
+        );
+        crate::rendezvous::try_at(d, c.identity, addr).await;
+    } else if look && c.connects() {
+        crate::rendezvous::reach_now(d, c.identity, c.space).await;
+    }
+    let (theirs, reach, mine, name_of, nearby) = {
+        let core = d.core();
+        let theirs: Vec<([u8; 32], [u8; 32])> = core
+            .others
+            .get(&c.identity)
+            .map(|o| {
+                let st = o.log.state();
+                st.keys
+                    .values()
+                    .filter_map(|k| Some((*k.link_key.as_ref()?.x25519(), k.key)))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let reach = core.reach_of(&c.space, &c.identity);
+        let mine = core
+            .me()
+            .map(|me| core.reach_of(&c.space, &me))
+            .unwrap_or_default();
+        // Whether each gave the other a presence secret here (D74).
+        let sp = core.spaces.get(&c.space).and_then(|h| h.space.as_ref());
+        let gives = |who: &[u8; 32]| {
+            sp.is_some_and(|sp| !relationship::presence_of(sp.state(), who).is_empty())
+        };
+        let nearby = crate::api::Nearby {
+            they_give_secret: gives(&c.identity),
+            you_give_secret: core.me().is_some_and(|me| gives(&me)),
+        };
+        (theirs, reach, mine, core.device_names(), nearby)
+    };
+    let label = |x: &[u8; 32]| -> String {
+        if let Some(k) = d.core().is_own_device(x) {
+            return format!(
+                "your {}",
+                name_of
+                    .get(&k)
+                    .cloned()
+                    .unwrap_or_else(|| account::short_key(&k))
+            );
+        }
+        if reach.iter().any(|r| r.host == *x) {
+            return "their host".into();
+        }
+        short(x)
+    };
+    let standing: HashSet<[u8; 32]> = crate::rendezvous::standing(d)
+        .into_iter()
+        .map(|(k, _)| k)
+        .collect();
+    let their_device = d.unreadable_name(&PeerKind::Contact(c.identity, [0; 32]));
+    let devices = theirs
+        .iter()
+        .map(|(x, k)| {
+            let unreadable = d.unreadable.of(k, &their_device);
+            let off = crate::api::SessionDevice {
+                addr: None,
+                bytes_received: None,
+                bytes_sent: None,
+                carrier: None,
+                heard_ms_ago: None,
+                kept_in_touch: standing.contains(k),
+                key: crate::api::short_id(k),
+                online: false,
+                open_for_s: None,
+                opened_by: None,
+                packets_dropped: None,
+                packets_lost: None,
+                route: None,
+                rtt_ms: None,
+                they_see_you_at: None,
+                through: None,
+                unreadable,
+                kept_alive_s: None,
+                path: d.known.shown(k),
+                neighbour: d.neighbours.is(k),
+            };
+            let Some((s, open_for)) = d.session_since(x) else {
+                return off;
+            };
+            let st = s.stats();
+            let relayed = s.is_relayed();
+            crate::api::SessionDevice {
+                online: true,
+                route: Some(if relayed { "relay" } else { "direct" }.into()),
+                carrier: d.session_carrier(x).map(Into::into),
+                addr: (!relayed)
+                    .then(|| s.remote_addr())
+                    .flatten()
+                    .map(|a| a.to_string()),
+                through: d.relayed_through(x).map(|h| label(&h)),
+                opened_by: Some(
+                    if s.role() == cardinal_link::Role::Initiator {
+                        "you"
+                    } else {
+                        "them"
+                    }
+                    .into(),
+                ),
+                open_for_s: Some(open_for.as_secs()),
+                heard_ms_ago: Some(crate::control::clock::since(s.last_heard()).as_millis() as u64),
+                rtt_ms: st.srtt.map(|t| t.as_millis() as u64),
+                bytes_sent: Some(st.bytes_sent),
+                bytes_received: Some(st.bytes_received),
+                packets_lost: Some(st.packets_lost),
+                packets_dropped: Some(st.packets_dropped),
+                they_see_you_at: s.observed_addr().map(|a| a.to_string()),
+                kept_alive_s: s.keepalive().map(|t| t.as_secs()),
+                ..off
+            }
+        })
+        .collect();
+    let (looked, looking) = d.rendezvous.looked(&c.identity);
+    let trail = d.rendezvous.trail(&c.identity);
+    let in_use = d.rendezvous.in_use_left(&c.identity);
+    let looked_for = if !c.connects() {
+        "never: you do not trust them, so your devices reach them only through hosts"
+    } else if in_use.is_some() {
+        "while in use, every 30 s, until each of their devices has a session"
+    } else {
+        "now and then at the last address that worked, and every 30 s once you message or call them"
+    };
+    Ok(crate::api::ContactStatusReply {
+        identity: crate::api::short_id(&c.identity),
+        trusted: c.regard.trusted,
+        introductions: c.regard.introductions,
+        refused: c.refused,
+        direct_sessions: c.connects(),
+        devices,
+        their_reach: reach_seen(d, &reach, &theirs),
+        nearby,
+        your_reach: reach_seen(d, &mine, &[]),
+        in_use_for_s: in_use.map(|t| t.as_secs()),
+        looked_for: looked_for.into(),
+        look_every_s: crate::rendezvous::Rendezvous::look_every().as_secs(),
+        looked_s_ago: looked.map(|t| t.as_secs()),
+        looking,
+        looks_without_session: trail.looks,
+        looking_since: trail.looking_since,
+        last_look: trail.look.iter().map(step).collect(),
+        sessions: trail.events.iter().map(step).collect(),
+        nearby_tries: trail.nearby.iter().map(step).collect(),
+        router: crate::portmap::router(d),
+        // who they are, as everywhere, but not their picture: this reply
+        // is about reaching them and has no field for it
+        name: c.petname.clone(),
+        own: c.own,
+        suggested: c.suggested.clone(),
+        // the page says
+        more: false,
+        next: None,
+    })
+}
+
+#[cfg(any(test, debug_assertions, feature = "by-name"))]
 fn reach_json(
     d: &Daemon,
     reach: &[relationship::Reach],
@@ -1946,6 +2195,7 @@ fn reach_json(
         .collect()
 }
 
+#[cfg(any(test, debug_assertions, feature = "by-name"))]
 fn step_json(s: &crate::rendezvous::Step) -> Json {
     json!({"at": s.at, "ok": s.ok, "text": s.text})
 }
@@ -1953,7 +2203,9 @@ fn step_json(s: &crate::rendezvous::Step) -> Json {
 /// Everything this device knows of reaching one contact: their devices and
 /// the sessions with them, what their reach node says and what became of
 /// each address, how they were last looked for, and what this person's own
-/// reach node tells them. With `look`, looks for them first.
+/// reach node tells them. With `look`, looks for them first. As main had
+/// it, by name.
+#[cfg(any(test, debug_assertions, feature = "by-name"))]
 pub async fn status(
     d: &Arc<Daemon>,
     who: &str,
@@ -2045,7 +2297,7 @@ pub async fn status(
                 "through": d.relayed_through(x).map(|h| label(&h)),
                 "opened_by": if s.role() == cardinal_link::Role::Initiator { "you" } else { "them" },
                 "open_for_s": open_for.as_secs(),
-                "heard_ms_ago": s.last_heard().elapsed().as_millis() as u64,
+                "heard_ms_ago": crate::control::clock::since(s.last_heard()).as_millis() as u64,
                 "rtt_ms": st.srtt.map(|t| t.as_millis() as u64),
                 "bytes_sent": st.bytes_sent,
                 "bytes_received": st.bytes_received,

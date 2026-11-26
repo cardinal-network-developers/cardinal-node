@@ -39,6 +39,7 @@ use cardinal_contact::Invitation;
 use cardinal_crypto::HybridPublicKey;
 use cardinal_identity::KeyId;
 use cardinal_link::{Attached, CarrierKind, Session, Target};
+#[cfg(any(test, debug_assertions, feature = "by-name"))]
 use serde_json::{json, Value};
 use tokio::sync::{mpsc, watch, Notify};
 use zeroize::Zeroizing;
@@ -976,6 +977,7 @@ pub async fn find_invitation(
 }
 
 /// Where Bluetooth stands on this device.
+#[cfg(any(test, debug_assertions, feature = "by-name"))]
 pub fn status(d: &Daemon) -> Value {
     let b = &d.bluetooth;
     let shown = lock(&b.shown);

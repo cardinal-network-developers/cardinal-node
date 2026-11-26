@@ -1058,6 +1058,32 @@ pub fn start(d: std::sync::Arc<Daemon>) {
 
 /// The `old` object of `cardinal status`: bytes held for deleted files and
 /// old versions, as of the last pass, and how long they are kept.
+pub fn shown(d: &Daemon) -> crate::api::OldVersions {
+    let keep = Keep::parse(&d.config().keep_old).unwrap_or(Keep::Days(30));
+    match d.cleanup.seen() {
+        Some(s) => crate::api::OldVersions {
+            bytes: Some(s.old_bytes),
+            at: Some(s.at),
+            keep: keep.to_string(),
+            // over the budget, and on no device that keeps everything yet
+            only_here: Some(crate::api::OnlyHere {
+                files: s.only_here.0,
+                bytes: s.only_here.1,
+            }),
+            // over the budget, and no device that keeps everything reachable
+            unchecked: Some(s.unasked),
+        },
+        None => crate::api::OldVersions {
+            bytes: None,
+            at: None,
+            keep: keep.to_string(),
+            only_here: None,
+            unchecked: None,
+        },
+    }
+}
+
+/// [`shown`], by name.
 pub fn status(d: &Daemon) -> Value {
     let keep = Keep::parse(&d.config().keep_old).unwrap_or(Keep::Days(30));
     match d.cleanup.seen() {

@@ -53,7 +53,9 @@ use cardinal_space::account;
 use cardinal_space::SpaceId;
 use cardinal_sync::{BlobItem, BlobReply};
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::json;
+#[cfg(any(test, debug_assertions, feature = "by-name"))]
+use serde_json::Value;
 
 use crate::core::{now_ms, short};
 use crate::daemon::Daemon;
@@ -939,13 +941,81 @@ pub fn start(d: Arc<Daemon>) {
 }
 
 /// The copy count for `cardinal status`: per device meant to keep
-/// everything, whether it counts and why. `null` before the files space
-/// is known.
+/// everything, whether it counts and why. None before the files space is
+/// known.
+pub fn shown(d: &Daemon) -> Option<crate::api::Copies> {
+    let names = d.core().device_names();
+    let t = &d.copies;
+    let rules = t.rules;
+    let now = crate::control::clock::now_ms();
+    let view = t.lock().view.clone()?;
+    let online: Vec<bool> = view.remote.iter().map(|(_, x)| d.is_online(x)).collect();
+    let name = |k: &KeyId| {
+        names
+            .get(k)
+            .cloned()
+            .filter(|n| !n.is_empty())
+            .unwrap_or_else(|| account::short_key(k))
+    };
+    let inner = t.lock();
+    let empty = Holder::default();
+    let entry = |k: &KeyId, this: bool, online: bool| {
+        let h = inner.holders.get(k).unwrap_or(&empty);
+        let verdict = if this {
+            h.own_verdict()
+        } else {
+            h.verdict(&rules, now)
+        };
+        let reason = match &verdict {
+            Verdict::Counted { .. } => None,
+            Verdict::Unconfirmed { reason }
+            | Verdict::Missing { reason, .. }
+            | Verdict::Copying { reason } => Some(reason.clone()),
+            Verdict::Stale { .. } => Some("not checked recently".to_owned()),
+            Verdict::Unchecked => Some("not checked yet".to_owned()),
+        };
+        crate::api::Holder {
+            name: name(k),
+            key: crate::api::short_id(k),
+            this,
+            online,
+            counted: verdict.counted(),
+            state: verdict.state().into(),
+            reason,
+            checking: inner.checking.contains(k),
+            last_check: h.last_check,
+            last_pass: h.last_pass,
+            last_fail: h.last_fail,
+            missed: u64::from(h.missed),
+        }
+    };
+    let mut holders = Vec::new();
+    if view.self_full {
+        holders.push(entry(&view.me, true, true));
+    }
+    for ((k, _), on) in view.remote.iter().zip(online) {
+        holders.push(entry(k, false, on));
+    }
+    drop(inner);
+    let count = holders.iter().filter(|e| e.counted).count() as u64;
+    Some(crate::api::Copies {
+        now,
+        count,
+        older_than_ms: rules.min_age_ms,
+        interval_ms: rules.interval_ms,
+        blobs: view.blobs as u64,
+        eligible: view.eligible as u64,
+        holders,
+    })
+}
+
+/// [`shown`] as main had it, by name.
+#[cfg(any(test, debug_assertions, feature = "by-name"))]
 pub fn status(d: &Daemon) -> Value {
     let names = d.core().device_names();
     let t = &d.copies;
     let rules = t.rules;
-    let now = now_ms();
+    let now = crate::control::clock::now_ms();
     let Some(view) = t.lock().view.clone() else {
         return Value::Null;
     };

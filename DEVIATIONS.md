@@ -2338,7 +2338,8 @@ asks for around that is not built yet.
     should be below 2^60, not <n>`), in a release build that field is left
     out and logged; a client's arguments are refused before they are sent.
   - **A request, declared once.** `asks!(ROW: n "name" Args -> Reply,
-    how)` gives its row, and `how` is `reads`, `reads unless <field>`,
+    how)` gives its row, and `how` is `reads`, `reads unless <field>`
+    (or `reads unless <a> or <b>`, while neither is given),
     `writes`, or `stream` (`watch`, `call-media`, answered by the
     connection itself); a paged one adds `after <list>` (with `by <id>`
     where its records have one), `after <list>, <list>, ...` for a reply
@@ -2369,7 +2370,11 @@ asks for around that is not built yet.
     was by name`, both shown) if the bytes differ: every test that asks it
     compares; the two ways are asked in turn, up to eight times, until one
     answer is the other's before it, for what changes between two asks (a
-    live call's counts). A request that writes cannot be answered twice; its cases are
+    live call's counts). The clock a reply reads its times in
+    milliseconds by (`control::clock`: `status`'s copies, when a
+    contact's device was last heard) is held still while the two are
+    asked, so that a time read twice is one time; elsewhere it is the
+    clock. A request that writes cannot be answered twice; its cases are
     written by hand in `api/same_bytes.rs`, on twins (two services on
     copies of one device, one asked by name, one typed), covering success,
     each refusal, and optional fields present and absent. What the twins
@@ -2401,6 +2406,19 @@ asks for around that is not built yet.
     noted with its ids in hex, and one not in hex failed `groups` by name
     in a debug build (and in a release build left the whole list of
     groups out); typed, that call alone is left out, and logged.
+    `status` sends the setting `listen` (as `host:port` written in the
+    config), not the address the service listens at: main wrote both under
+    the one name, and the setting, written second, replaced the other.
+    `contact-status` with `at`, for someone not trusted, names an id given
+    as bytes NUL first ("you do not trust \0<hex>"), and `group-connect`
+    the same in "you know <who> already" and "no admin of <group> that you
+    know can introduce you" (its earlier errors name it in hex). An
+    introduction's id as text is its id in lower-case hex, whole: in upper
+    case `introduction-accept` and `-decline` find nothing, where
+    `cancel-invitation` takes either case. Error 4 for one item of
+    `status` too large for a message names no `id` typed, where by name an
+    item of `spaces` would have; a space's record is some 40 bytes, so it
+    cannot happen.
   - **A reply field without a number** is this build's mistake. In a debug
     build, where the tests run, the request then fails; in a release build
     the field is left out and the service logs an error. A field no test

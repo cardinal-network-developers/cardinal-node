@@ -24,6 +24,7 @@ use cardinal_encoding::{Record, Value};
 use cardinal_space::account;
 use cardinal_space::entry::{NodeKind, SpaceOp};
 use cardinal_space::ROOT;
+#[cfg(any(test, debug_assertions, feature = "by-name"))]
 use serde_json::{json, Value as Json};
 
 use crate::daemon::Daemon;
@@ -513,6 +514,7 @@ pub fn on_mine(d: &Daemon) -> bool {
 /// its router, whether the person said it is theirs, and whether to ask
 /// them ("Is this your network?"): a network known, not answered for, on
 /// a device that would ask its router.
+#[cfg(any(test, debug_assertions, feature = "by-name"))]
 pub fn status(d: &Daemon) -> Json {
     let on = routers_on(d);
     let Some(r) = router_now() else {

@@ -319,7 +319,8 @@ macro_rules! typed {
 ///
 /// - `reads`: it changes nothing, so where the tests run the service
 ///   answers it by name too and fails it if the two differ;
-/// - `reads unless field`: the same while `field` is not given;
+/// - `reads unless field`: the same while `field` is not given (`reads
+///   unless a or b`: while neither is);
 /// - `writes`: answered once; same-bytes cases written by hand cover it;
 /// - `stream`: answered by the connection itself, which then carries a
 ///   stream (`watch`, `call-media`).
@@ -335,7 +336,7 @@ macro_rules! typed {
 /// reply the list, `more` and `next`, which the page is cut by.
 macro_rules! asks {
     ($row:ident: $n:literal $name:literal $args:ident -> $reply:ident,
-        $how:ident $(unless $unless:ident)? $(, $($page:tt)*)?) => {
+        $how:ident $(unless $unless:ident $(or $or:ident)*)? $(, $($page:tt)*)?) => {
         #[doc = concat!("The row of `", $name, "`, typed.")]
         pub const $row: Request = Request {
             n: $n,
@@ -350,7 +351,7 @@ macro_rules! asks {
         impl super::typed::Ask for $args {
             const REQUEST: &'static Request = &$row;
             type Reply = $reply;
-            asks!(@reads $how $($unless)?);
+            asks!(@reads $how $($unless $($or)*)?);
             asks!(@paging $args $reply $($($page)*)?);
         }
     };
@@ -363,9 +364,9 @@ macro_rules! asks {
             true
         }
     };
-    (@reads reads $unless:ident) => {
+    (@reads reads $unless:ident $($or:ident)*) => {
         fn reads(&self) -> bool {
-            self.$unless.is_none()
+            self.$unless.is_none() $(&& self.$or.is_none())*
         }
     };
     (@reads writes) => {};
@@ -759,7 +760,15 @@ typed!(
         6 at: u64,
     }
 );
-rec!(CONDITIONS "conditions": 1 "helps" BOOL, 2 "metered" BOOL, 3 "plugged_in" BOOL);
+typed!(
+    /// What this device knows of its power and its network.
+    CONDITIONS "conditions" ConditionsShown {
+        1 helps: bool,
+        2 metered: bool,
+        /// Unknown where nothing says.
+        3 plugged_in: Option<bool>,
+    }
+);
 typed!(
     /// A file whose versions conflict.
     CONFLICT "conflict" Conflict {
@@ -825,9 +834,18 @@ typed!(
         13 unread: u64,
     }
 );
-rec!(COPIES "copies":
-    1 "blobs" U, 2 "count" U, 3 "eligible" U, 4 "holders" [HOLDER], 5 "interval_ms" U,
-    6 "now" U, 7 "older_than_ms" U);
+typed!(
+    /// The copies of the files on the devices meant to keep everything.
+    COPIES "copies" Copies {
+        1 blobs: u64,
+        2 count: u64,
+        3 eligible: u64,
+        4 holders: Vec<Holder>,
+        5 interval_ms: u64,
+        6 now: u64,
+        7 older_than_ms: u64,
+    }
+);
 typed!(
     /// One of the person's devices.
     DEVICE "device" Device {
@@ -850,7 +868,15 @@ typed!(
         12 redial_s: Option<u64>,
     }
 );
-rec!(ENDPOINT "endpoint": 1 "endpoint" T, 2 "local" BOOL, 3 "tried" BOOL, 4 "why_not" T);
+typed!(
+    /// An address a reach node gives, and whether it was tried.
+    ENDPOINT "endpoint" EndpointSeen {
+        1 endpoint: String,
+        2 local: bool,
+        3 tried: bool,
+        4 why_not: Option<Cow<'static, str>>,
+    }
+);
 typed!(
     /// What this device's fetcher thinks of another as a source.
     FETCH "fetch" Fetch {
@@ -952,10 +978,25 @@ rec!(GUARDED "guarded":
     5 "guardians" U, 6 "helpers" U, 7 "id" B, 8 "name" T, 9 "never" [T], 10 "persona" B,
     11 "persona_at" T, 12 "recoveries" [RECOVERY], 13 "threshold" U, 14 "waiting" U,
     15 "warning" T);
-rec!(HOLDER "holder":
-    1 "checking" BOOL, 2 "counted" BOOL, 3 "key" B, 4 "last_check" U, 5 "last_fail" U,
-    6 "last_pass" U, 7 "missed" U, 8 "name" T, 9 "online" BOOL, 10 "reason" T, 11 "state" T,
-    12 "this" BOOL);
+typed!(
+    /// A device meant to keep everything, as a copy of the files.
+    HOLDER "holder" Holder {
+        1 checking: bool,
+        2 counted: bool,
+        /// The start of its key.
+        3 key: [u8; 8],
+        4 last_check: Option<u64>,
+        5 last_fail: Option<u64>,
+        6 last_pass: Option<u64>,
+        7 missed: u64,
+        8 name: String,
+        9 online: bool,
+        /// Why it does not count, where it does not.
+        10 reason: Option<String>,
+        11 state: Cow<'static, str>,
+        12 this: bool,
+    }
+);
 typed!(
     /// A host of this person's, as the recovery sheet names it.
     HOST "host" Host {
@@ -972,7 +1013,13 @@ rec!(HOSTING "hosting":
     6 "name" T, 7 "relay_bytes" U, 8 "sees" T, 9 "waiting" U, 10 "who" B,
     11 "serving" [HOSTABLE], 12 "offered_at" U, 13 "after" B, 14 "accepted_at" U,
     15 "ended_at" U, 16 "ended_by" B, 17 "declined" BOOL);
-rec!(INSPECTION "inspection": 1 "on" BOOL, 2 "until" U);
+typed!(
+    /// Whether this device may be inspected now, and until when.
+    INSPECTION "inspection" Inspection {
+        1 on: bool,
+        2 until: Option<u64>,
+    }
+);
 typed!(
     /// An introduction waiting for this person.
     INTRODUCTION "introduction" Introduction {
@@ -1070,10 +1117,25 @@ typed!(
         4 via: Option<String>,
     }
 );
-rec!(KNOWN_PATH "known path":
-    1 "addr" T, 2 "checking" BOOL, 3 "confirmed_s_ago" U, 4 "misses" U, 5 "next_check_s" U,
-    6 "probes" U, 7 "wait_s" U);
-rec!(NEARBY "nearby": 1 "they_give_secret" BOOL, 2 "you_give_secret" BOOL);
+typed!(
+    /// The last address a direct session with a device worked at.
+    KNOWN_PATH "known path" KnownPath {
+        1 addr: String,
+        2 checking: bool,
+        3 confirmed_s_ago: Option<u64>,
+        4 misses: u64,
+        5 next_check_s: u64,
+        6 probes: u64,
+        7 wait_s: u64,
+    }
+);
+typed!(
+    /// Whether each gave the other a presence secret (D74).
+    NEARBY "nearby" Nearby {
+        1 they_give_secret: bool,
+        2 you_give_secret: bool,
+    }
+);
 typed!(
     /// The network this device is on, by its router, and what its person
     /// said of it.
@@ -1100,11 +1162,35 @@ typed!(
         8 last_call: Option<CallEnded>,
     }
 );
-rec!(OLD "old versions":
-    1 "at" U, 2 "bytes" U, 3 "keep" T, 4 "only_here" {ONLY_HERE}, 5 "unchecked" BOOL);
-rec!(ONLY_HERE "only here": 1 "bytes" U, 2 "files" U);
+typed!(
+    /// What deleted files and old versions take, and how long they stay.
+    OLD "old versions" OldVersions {
+        1 at: Option<u64>,
+        2 bytes: Option<u64>,
+        3 keep: String,
+        4 only_here: Option<OnlyHere>,
+        5 unchecked: Option<bool>,
+    }
+);
+typed!(
+    /// Over the budget, and on no device that keeps everything yet.
+    ONLY_HERE "only here" OnlyHere {
+        1 bytes: u64,
+        2 files: u64,
+    }
+);
 rec!(PAIR_AGAIN "pair again": 1 "key" B, 2 "name" T);
-rec!(PAIRING "pairing": 1 "admin" T, 2 "code" T, 3 "error" T, 4 "state" T, 5 "power" T);
+typed!(
+    /// Pairing under way on this device.
+    PAIRING "pairing" Pairing {
+        1 admin: Option<String>,
+        2 code: Option<String>,
+        3 error: Option<String>,
+        /// `showing`, `joining` or `failed`.
+        4 state: Cow<'static, str>,
+        5 power: Option<Cow<'static, str>>,
+    }
+);
 typed!(
     /// An address this device looks for the person's devices at.
     PEER "peer" Peer {
@@ -1123,9 +1209,17 @@ typed!(
         4 group: Option<[u8; 32]>,
     }
 );
-rec!(PROGRESS "progress":
-    1 "bytes_fetched" U, 2 "bytes_pending" U, 3 "bytes_wanted" U, 4 "files_pending" U,
-    5 "last_error" T, 6 "rate" U);
+typed!(
+    /// Fetching the files' content in the background.
+    PROGRESS "progress" ProgressShown {
+        1 bytes_fetched: u64,
+        2 bytes_pending: u64,
+        3 bytes_wanted: u64,
+        4 files_pending: u64,
+        5 last_error: Option<String>,
+        6 rate: u64,
+    }
+);
 typed!(REACTION "reaction" Reaction {
     1 count: u64,
     2 mine: bool,
@@ -1135,7 +1229,17 @@ rec!(RECOVERY "recovery":
     1 "caution" T, 2 "confirm_from_ms" U, 3 "confirmed" U, 4 "confirmed_by_me" BOOL,
     5 "endorsed" U, 6 "endorsed_by_me" BOOL, 7 "fingerprint" T, 8 "id" B, 9 "in_effect" BOOL,
     10 "keeps_keys" BOOL, 11 "objected" BOOL, 12 "pending" BOOL);
-rec!(RELAYED_FOR "relayed for": 1 "a" T, 2 "a_id" B, 3 "b" T, 4 "b_id" B);
+typed!(
+    /// Two members whose messages this person's devices have been passing
+    /// on, and who name no host in the group.
+    RELAYED_FOR "relayed for" RelayedFor {
+        1 a: String,
+        /// The start of their identity.
+        2 a_id: [u8; 8],
+        3 b: String,
+        4 b_id: [u8; 8],
+    }
+);
 typed!(
     /// A group this person left and can come back to.
     REJOIN "rejoin" Rejoin {
@@ -1152,8 +1256,21 @@ typed!(
         3 to: Cow<'static, str>,
     }
 );
-rec!(REDIAL "redial": 1 "alone" BOOL, 2 "helps" BOOL, 3 "sparing" {SPARING});
-rec!(SPARING "sparing": 1 "next_s" U, 2 "wait_s" U);
+typed!(
+    /// When the reconnect loop dials next.
+    REDIAL "redial" Redial {
+        1 alone: bool,
+        2 helps: bool,
+        3 sparing: Option<Sparing>,
+    }
+);
+typed!(
+    /// A device sparing its battery: when it dials next, and the wait.
+    SPARING "sparing" Sparing {
+        1 next_s: u64,
+        2 wait_s: u64,
+    }
+);
 typed!(
     /// What this device asks of routers, and what the router gave.
     ROUTER "router" Router {
@@ -1168,12 +1285,34 @@ typed!(
         9 this_device: bool,
     }
 );
-rec!(SESSION_DEVICE "contact's device":
-    1 "addr" T, 2 "bytes_received" U, 3 "bytes_sent" U, 4 "carrier" T, 5 "heard_ms_ago" U,
-    6 "kept_in_touch" BOOL, 7 "key" B, 8 "online" BOOL, 9 "open_for_s" U, 10 "opened_by" T,
-    11 "packets_dropped" U, 12 "packets_lost" U, 13 "route" T, 14 "rtt_ms" U,
-    15 "they_see_you_at" T, 16 "through" T, 17 "unreadable" {UNREADABLE},
-    18 "kept_alive_s" U, 19 "path" {KNOWN_PATH}, 20 "neighbour" BOOL);
+typed!(
+    /// One of a contact's devices, and the session with it, if any.
+    SESSION_DEVICE "contact's device" SessionDevice {
+        1 addr: Option<String>,
+        2 bytes_received: Option<u64>,
+        3 bytes_sent: Option<u64>,
+        4 carrier: Option<Cow<'static, str>>,
+        5 heard_ms_ago: Option<u64>,
+        6 kept_in_touch: bool,
+        /// The start of its key.
+        7 key: [u8; 8],
+        8 online: bool,
+        9 open_for_s: Option<u64>,
+        /// `you` or `them`.
+        10 opened_by: Option<Cow<'static, str>>,
+        11 packets_dropped: Option<u64>,
+        12 packets_lost: Option<u64>,
+        /// `direct` or `relay`.
+        13 route: Option<Cow<'static, str>>,
+        14 rtt_ms: Option<u64>,
+        15 they_see_you_at: Option<String>,
+        16 through: Option<String>,
+        17 unreadable: Option<Unreadable>,
+        18 kept_alive_s: Option<u64>,
+        19 path: Option<KnownPath>,
+        20 neighbour: bool,
+    }
+);
 rec!(SET_ASIDE "set aside": 1 "entry" B, 2 "space" B, 3 "time_ms" U);
 typed!(
     /// What a space held here takes.
@@ -1189,11 +1328,40 @@ typed!(
         8 space: [u8; 32],
     }
 );
-rec!(SPACE "space": 1 "entries" U, 2 "id" B, 3 "kind" T, 4 "set_aside" U, 5 "valid" U);
-rec!(STEP "step": 1 "at" U, 2 "ok" BOOL, 3 "text" T);
+typed!(
+    /// A space this device holds, as `status` gives it.
+    SPACE "space" SpaceShown {
+        1 entries: u64,
+        /// The start of its id.
+        2 id: [u8; 8],
+        /// `account`, `files`, `other` or `arriving`.
+        3 kind: Cow<'static, str>,
+        4 set_aside: u64,
+        5 valid: u64,
+    }
+);
+typed!(
+    /// A step of looking for someone, or of their sessions.
+    STEP "step" Step {
+        /// In milliseconds since 1970.
+        1 at: u64,
+        2 ok: Option<bool>,
+        3 text: String,
+    }
+);
 rec!(SUCCESSION "succession": 1 "id" T, 2 "space" T);
-rec!(THEIR_REACH "reach seen":
-    1 "device" B, 2 "endpoints" [ENDPOINT], 3 "host" B, 4 "session" BOOL, 5 "this_device" BOOL);
+typed!(
+    /// A host a reach node names, as this device sees it.
+    THEIR_REACH "reach seen" ReachSeen {
+        /// The start of the key of the device it is, where it is theirs.
+        1 device: Option<[u8; 8]>,
+        2 endpoints: Vec<EndpointSeen>,
+        /// The start of its link key.
+        3 host: [u8; 8],
+        4 session: bool,
+        5 this_device: bool,
+    }
+);
 rec!(TREE_ITEM "tree item":
     1 "dirty" BOOL, 2 "ino" U, 3 "kind" T, 4 "local" BOOL, 5 "node" B, 6 "path" T, 7 "size" U);
 rec!(STUCK_ITEM "stuck item":
@@ -1342,6 +1510,61 @@ typed!(fields CallMediaArgs {});
 asks!(CALL_MEDIA: 104 "call-media" CallMediaArgs -> Done, stream);
 
 // ---- The service, this device, and the person's devices ----
+
+typed!(fields StatusArgs {
+    1 after: Option<u64>,
+    2 limit: Option<u64>,
+});
+typed!(
+    fields
+    /// Where this device stands: its settings, its spaces, its devices,
+    /// and what it is doing.
+    StatusReply {
+        2 bluetooth: BluetoothShown,
+        3 carrying_calls: u64,
+        4 conditions: ConditionsShown,
+        5 conflicts: u64,
+        /// Before the files space is known, none.
+        6 copies: Option<Copies>,
+        7 devices: Vec<Device>,
+        8 files_ready: bool,
+        9 home: String,
+        /// The hosts the recovery sheet names, where it can be made.
+        10 hosts: Option<u64>,
+        /// The start of the person's identity.
+        11 identity: Option<[u8; 8]>,
+        12 identity_id: Option<[u8; 32]>,
+        13 inspection: Inspection,
+        14 left_behind: Vec<String>,
+        15 listen: String,
+        16 mount: Option<String>,
+        17 mount_unavailable: Option<String>,
+        18 mounted: Option<String>,
+        19 moved_from: Option<u64>,
+        20 name: String,
+        21 network: Network,
+        22 not_saved: u64,
+        23 not_saved_undone: u64,
+        24 old: OldVersions,
+        25 pairing: Option<Pairing>,
+        26 peers: Vec<String>,
+        27 pending_changes: bool,
+        28 progress: ProgressShown,
+        29 read_markers: bool,
+        30 removed: bool,
+        31 retention: String,
+        32 router: Router,
+        33 spaces: Vec<SpaceShown>,
+        34 uptime_s: u64,
+        35 more: bool,
+        36 next: Option<u64>,
+        37 redial: Redial,
+        /// The person's devices with a mailbox, reachable from outside.
+        38 always_on: Vec<String>,
+    }
+);
+asks!(STATUS: 2 "status" StatusArgs -> StatusReply, reads,
+    after devices, left_behind, peers, spaces, always_on);
 
 typed!(fields ConditionsArgs {
     1 plugged_in: Option<bool>,
@@ -1778,6 +2001,154 @@ typed!(fields GroupRejoinArgs {
 });
 asks!(GROUP_REJOIN: 87 "group-rejoin" GroupRejoinArgs -> GroupCreateReply, writes);
 
+// ---- The service, people, introductions and groups: the rest ----
+
+typed!(fields HelloArgs {});
+typed!(fields HelloReply {
+    2 api: u64,
+    3 version: Cow<'static, str>,
+});
+asks!(HELLO: 1 "hello" HelloArgs -> HelloReply, reads);
+
+typed!(fields ReadMarkersArgs {
+    1 on: Option<bool>,
+});
+typed!(fields ReadMarkersReply {
+    2 on: bool,
+});
+asks!(READ_MARKERS: 41 "read-markers" ReadMarkersArgs -> ReadMarkersReply, reads unless on);
+
+typed!(fields CancelInvitationArgs {
+    1 id: Option<Reference>,
+});
+asks!(CANCEL_INVITATION: 45 "cancel-invitation" CancelInvitationArgs -> Done, writes);
+
+typed!(fields IntroduceArgs {
+    1 who: Option<Reference>,
+    2 to: Option<Reference>,
+    3 note: Option<String>,
+});
+asks!(INTRODUCE: 47 "introduce" IntroduceArgs -> Done, writes);
+
+typed!(fields IntroductionAcceptArgs {
+    1 id: Option<Reference>,
+});
+typed!(
+    fields
+    /// Where both said yes: whom the invitation made a contact of.
+    IntroductionAcceptReply {
+        2 name: Option<String>,
+        3 recovery_of: Option<[u8; 32]>,
+    }
+);
+asks!(INTRODUCTION_ACCEPT: 48 "introduction-accept" IntroductionAcceptArgs -> IntroductionAcceptReply,
+    writes);
+typed!(fields IntroductionDeclineArgs {
+    1 id: Option<Reference>,
+});
+asks!(INTRODUCTION_DECLINE: 49 "introduction-decline" IntroductionDeclineArgs -> Done, writes);
+
+typed!(fields GroupConnectArgs {
+    1 group: Option<Reference>,
+    2 who: Option<Reference>,
+    3 note: Option<String>,
+});
+typed!(
+    fields
+    /// Asked already, and not answered.
+    GroupConnectReply {
+        2 asked: Option<bool>,
+    }
+);
+asks!(GROUP_CONNECT: 81 "group-connect" GroupConnectArgs -> GroupConnectReply, writes);
+
+typed!(fields GroupPostAgainArgs {
+    1 group: Option<Reference>,
+});
+typed!(fields GroupPostAgainReply {
+    2 posted: u64,
+});
+asks!(GROUP_POST_AGAIN: 83 "group-post-again" GroupPostAgainArgs -> GroupPostAgainReply, writes);
+
+typed!(fields GroupMovedSeenArgs {
+    1 group: Option<Reference>,
+});
+asks!(GROUP_MOVED_SEEN: 84 "group-moved-seen" GroupMovedSeenArgs -> Done, writes);
+
+typed!(fields GroupConfirmMoveArgs {
+    1 group: Option<Reference>,
+    2 moves: Option<Vec<bytes::Bytes>>,
+    3 to: Option<Vec<bytes::Bytes>>,
+});
+typed!(fields GroupConfirmMoveReply {
+    2 kept: u64,
+});
+asks!(GROUP_CONFIRM_MOVE: 85 "group-confirm-move" GroupConfirmMoveArgs -> GroupConfirmMoveReply,
+    writes);
+
+typed!(fields GroupLeavingArgs {
+    1 group: Option<Reference>,
+});
+typed!(
+    fields
+    /// What leaving a group would leave behind (D89).
+    GroupLeavingReply {
+        2 admins: Vec<String>,
+        3 choose_admin: bool,
+        4 group: [u8; 32],
+        5 name: String,
+        6 relayed_for: Vec<RelayedFor>,
+    }
+);
+asks!(GROUP_LEAVING: 86 "group-leaving" GroupLeavingArgs -> GroupLeavingReply, reads);
+
+// ---- Reaching a contact ----
+
+typed!(fields ContactStatusArgs {
+    1 who: Option<Reference>,
+    /// Look for them first.
+    2 look: Option<bool>,
+    /// Try them at this address first.
+    3 at: Option<String>,
+    4 after: Option<u64>,
+    5 limit: Option<u64>,
+});
+typed!(
+    fields
+    /// Everything this device knows of reaching one contact.
+    ContactStatusReply {
+        2 devices: Vec<SessionDevice>,
+        3 direct_sessions: bool,
+        /// The start of their identity.
+        4 identity: [u8; 8],
+        5 in_use_for_s: Option<u64>,
+        6 introductions: bool,
+        7 last_look: Vec<Step>,
+        8 look_every_s: u64,
+        9 looked_for: Cow<'static, str>,
+        10 looked_s_ago: Option<u64>,
+        11 looking: bool,
+        12 looking_since: Option<u64>,
+        13 looks_without_session: u64,
+        14 name: String,
+        15 nearby: Nearby,
+        16 nearby_tries: Vec<Step>,
+        17 own: bool,
+        18 refused: bool,
+        19 router: Router,
+        20 sessions: Vec<Step>,
+        21 suggested: Option<String>,
+        22 their_reach: Vec<ReachSeen>,
+        23 trusted: bool,
+        24 your_reach: Vec<ReachSeen>,
+        25 more: bool,
+        26 next: Option<u64>,
+    }
+);
+asks!(CONTACT_STATUS: 32 "contact-status" ContactStatusArgs -> ContactStatusReply,
+    reads unless look or at,
+    after devices, last_look, nearby_tries, sessions, their_reach, your_reach);
+
 // ---- Listings ----
 
 typed!(fields ContactsArgs {
@@ -2043,18 +2414,8 @@ asks!(FILES: 120 "files" FilesArgs -> FilesReply, reads, after files);
 /// with room in each group.
 pub static REQUESTS: &[Request] = &[
     // ---- The service, this device, and the person's devices: 1 to 29 ----
-    req!(1 "hello" () -> (2 "api" U, 3 "version" T)),
-    paged!(after 2 "status" (1 "after" U, 2 "limit" U) -> (
-        2 "bluetooth" {BLUETOOTH}, 3 "carrying_calls" U, 4 "conditions" {CONDITIONS},
-        5 "conflicts" U, 6 "copies" {COPIES}, 7 "devices" [DEVICE], 8 "files_ready" BOOL,
-        9 "home" T, 10 "hosts" U, 11 "identity" B, 12 "identity_id" B,
-        13 "inspection" {INSPECTION}, 14 "left_behind" [T], 15 "listen" T, 16 "mount" T,
-        17 "mount_unavailable" T, 18 "mounted" T, 19 "moved_from" U, 20 "name" T,
-        21 "network" {NETWORK}, 22 "not_saved" U, 23 "not_saved_undone" U, 24 "old" {OLD},
-        25 "pairing" {PAIRING}, 26 "peers" [T], 27 "pending_changes" BOOL,
-        28 "progress" {PROGRESS}, 29 "read_markers" BOOL, 30 "removed" BOOL, 31 "retention" T,
-        32 "router" {ROUTER}, 33 "spaces" [SPACE], 34 "uptime_s" U, 35 "more" BOOL,
-        36 "next" U, 37 "redial" {REDIAL}, 38 "always_on" [T])),
+    HELLO,
+    STATUS,
     WATCH,
     req!(4 "stop" () -> ()),
     req!(5 "reload" () -> ()),
@@ -2078,16 +2439,7 @@ pub static REQUESTS: &[Request] = &[
     ) -> (
         2 "category" T, 3 "name" T, 4 "own" BOOL, 5 "picture" T, 6 "reach" [GROUP_SHOWN],
         7 "suggested" T, 8 "named" T)),
-    paged!(after 32 "contact-status" (
-        1 "who" REF, 2 "look" BOOL, 3 "at" T, 4 "after" U, 5 "limit" U
-    ) -> (
-        2 "devices" [SESSION_DEVICE], 3 "direct_sessions" BOOL, 4 "identity" B,
-        5 "in_use_for_s" U, 6 "introductions" BOOL, 7 "last_look" [STEP], 8 "look_every_s" U,
-        9 "looked_for" T, 10 "looked_s_ago" U, 11 "looking" BOOL, 12 "looking_since" U,
-        13 "looks_without_session" U, 14 "name" T, 15 "nearby" {NEARBY},
-        16 "nearby_tries" [STEP], 17 "own" BOOL, 18 "refused" BOOL, 19 "router" {ROUTER},
-        20 "sessions" [STEP], 21 "suggested" T, 22 "their_reach" [THEIR_REACH],
-        23 "trusted" BOOL, 24 "your_reach" [THEIR_REACH], 25 "more" BOOL, 26 "next" U)),
+    CONTACT_STATUS,
     CONVERSATIONS,
     MESSAGES,
     SAY,
@@ -2096,15 +2448,15 @@ pub static REQUESTS: &[Request] = &[
     DELETE_MESSAGE,
     REACT,
     MARK_READ,
-    req!(41 "read-markers" (1 "on" BOOL) -> (2 "on" BOOL)),
+    READ_MARKERS,
     INVITE,
     ACCEPT,
     INVITATIONS,
-    req!(45 "cancel-invitation" (1 "id" REF) -> ()),
+    CANCEL_INVITATION,
     INTRODUCTIONS,
-    req!(47 "introduce" (1 "who" REF, 2 "to" REF, 3 "note" T) -> ()),
-    req!(48 "introduction-accept" (1 "id" REF) -> (2 "name" T, 3 "recovery_of" B)),
-    req!(49 "introduction-decline" (1 "id" REF) -> ()),
+    INTRODUCE,
+    INTRODUCTION_ACCEPT,
+    INTRODUCTION_DECLINE,
     // ---- Groups: 70 to 99 ----
     GROUPS,
     GROUP_CREATE,
@@ -2117,14 +2469,12 @@ pub static REQUESTS: &[Request] = &[
     GROUP_MEMBERS,
     GROUP_SET,
     GROUP_MEMBER,
-    req!(81 "group-connect" (1 "group" REF, 2 "who" REF, 3 "note" T) -> (2 "asked" BOOL)),
+    GROUP_CONNECT,
     GROUP_ROLE,
-    req!(83 "group-post-again" (1 "group" REF) -> (2 "posted" U)),
-    req!(84 "group-moved-seen" (1 "group" REF) -> ()),
-    req!(85 "group-confirm-move" (1 "group" REF, 2 "moves" [B], 3 "to" [B]) -> (2 "kept" U)),
-    req!(86 "group-leaving" (1 "group" REF) -> (
-        2 "admins" [T], 3 "choose_admin" BOOL, 4 "group" B, 5 "name" T,
-        6 "relayed_for" [RELAYED_FOR])),
+    GROUP_POST_AGAIN,
+    GROUP_MOVED_SEEN,
+    GROUP_CONFIRM_MOVE,
+    GROUP_LEAVING,
     GROUP_REJOIN,
     // ---- Calls and the clipboard: 100 to 119 ----
     CALL_NOW,

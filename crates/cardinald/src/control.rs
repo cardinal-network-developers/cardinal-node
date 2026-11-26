@@ -310,7 +310,12 @@ pub async fn by_name(d: &Arc<Daemon>, msg: &[u8]) -> Vec<u8> {
         Ok(x) => x,
         Err(refused) => return api::error_reply(refused.status, &refused.why),
     };
-    let reply = match handle(d, &req).await.map_err(|e| capitalized(spec.name, e)) {
+    // on the heap: the handlers by name, all in one, make a large future,
+    // which a caller holding it on its stack (a test) would overflow
+    let reply = match Box::pin(handle(d, &req))
+        .await
+        .map_err(|e| capitalized(spec.name, e))
+    {
         Ok(v) => match api::page(spec, &req, v) {
             Ok(v) => api::encode_reply(spec, Ok(&v)),
             Err((st, why, item)) => api::error_reply_with(st, &why, &item),
@@ -345,6 +350,50 @@ fn checked(spec: &api::Request, reply: Vec<u8>) -> Vec<u8> {
     api::error_reply(status::TOO_LARGE, &why)
 }
 
+/// The clock a reply reads its times by. Where the tests run, a request
+/// that changes nothing is answered twice, by name and typed, and the two
+/// compared byte for byte (`typed::answering`): the clock is held still
+/// for the length of that, so that a time in milliseconds (`status`'s
+/// copies, when a contact's device was last heard) reads the same both
+/// ways. Elsewhere it is the clock.
+pub mod clock {
+    use std::time::{Duration, Instant};
+
+    #[cfg(any(test, debug_assertions))]
+    tokio::task_local! {
+        static STILL: (u64, Instant);
+    }
+
+    /// Milliseconds since 1970.
+    pub fn now_ms() -> u64 {
+        #[cfg(any(test, debug_assertions))]
+        if let Ok((ms, _)) = STILL.try_with(|s| *s) {
+            return ms;
+        }
+        crate::core::now_ms()
+    }
+
+    /// How long ago `t` was.
+    pub fn since(t: Instant) -> Duration {
+        #[cfg(any(test, debug_assertions))]
+        if let Ok((_, now)) = STILL.try_with(|s| *s) {
+            return now.saturating_duration_since(t);
+        }
+        t.elapsed()
+    }
+
+    /// `f`, with the clock held still while it runs (where it is held
+    /// still already, where it was); on the heap, since what is answered
+    /// twice can be large.
+    #[cfg(any(test, debug_assertions))]
+    pub async fn still<F: std::future::Future>(f: F) -> F::Output {
+        let now = STILL
+            .try_with(|s| *s)
+            .unwrap_or_else(|_| (crate::core::now_ms(), Instant::now()));
+        STILL.scope(now, Box::pin(f)).await
+    }
+}
+
 /// The requests answered typed (`api::typed`): each from its arguments as
 /// they came to the reply's bytes, with no tree of names between. Each in
 /// two steps, which `benches/interface.rs` measures apart: the handler's
@@ -364,12 +413,20 @@ pub mod typed {
     };
     use crate::api::{CallAnswerArgs, CallEndArgs, CallStartArgs};
     use crate::api::{
+        CancelInvitationArgs, GroupConfirmMoveArgs, GroupConfirmMoveReply, GroupConnectArgs,
+        GroupConnectReply, GroupLeavingArgs, GroupLeavingReply, GroupMovedSeenArgs,
+        GroupPostAgainArgs, GroupPostAgainReply, HelloArgs, HelloReply, IntroduceArgs,
+        IntroductionAcceptArgs, IntroductionAcceptReply, IntroductionDeclineArgs, ReadMarkersArgs,
+        ReadMarkersReply,
+    };
+    use crate::api::{
         Checking, ClipArgs, ClipCopyArgs, ClipCopyReply, ClipReply, ConditionsArgs,
         ConditionsReply, DeviceRenameArgs, DeviceRenameReply, MeArgs, MeReply, NetworkChangedArgs,
         PairShowArgs, PairShowReply, PairStatusArgs, PairStatusReply, PairTypeArgs, PairTypeReply,
         WakeArgs,
     };
     use crate::api::{ConflictsArgs, ConflictsReply, DevicesArgs, DevicesReply};
+    use crate::api::{ContactStatusArgs, ContactStatusReply, StatusArgs, StatusReply};
     use crate::api::{ContactsArgs, ContactsReply, ConversationsArgs, ConversationsReply};
     use crate::api::{
         CopyArgs, Done, FlushArgs, FlushReply, MkdirArgs, MountArgs, MoveArgs, PathReply, PinArgs,
@@ -418,14 +475,18 @@ pub mod typed {
                 Ok(a) => a,
                 Err(refused) => return api::error_reply(refused.status, &refused.why),
             };
-            let reply = answer_of(d, &a).await;
             // not in the benchmark's build (`by-name` alone), which measures
-            // the typed way only
+            // the typed way only; with the clock held still, so that a
+            // time read twice is the same
             #[cfg(any(test, debug_assertions))]
             if a.reads() {
-                return beside(d, &a, reply).await;
+                return super::clock::still(async {
+                    let reply = answer_of(d, &a).await;
+                    beside(d, &a, reply).await
+                })
+                .await;
             }
-            reply
+            answer_of(d, &a).await
         })
     }
 
@@ -565,6 +626,105 @@ pub mod typed {
             Ok(Checking {
                 checking: checking as u64,
             })
+        }
+    }
+
+    impl Answer for StatusArgs {
+        async fn answer(d: &Arc<Daemon>, _: &Self) -> anyhow::Result<StatusReply> {
+            Ok(super::status_reply(d))
+        }
+    }
+
+    impl Answer for ContactStatusArgs {
+        async fn answer(d: &Arc<Daemon>, a: &Self) -> anyhow::Result<ContactStatusReply> {
+            // looking is done with the first page, never again for the next
+            let first = a.after.unwrap_or(0) == 0;
+            let look = first && a.look == Some(true);
+            let at = match a.at.as_deref().filter(|_| first) {
+                Some(at) => Some(at.parse().map_err(|_| {
+                    anyhow::anyhow!("{at} is not an address; it looks like 192.168.1.20:7171")
+                })?),
+                None => None,
+            };
+            let who = needed(a.who.as_ref(), "who")?;
+            crate::contacts::reaching(d, who.as_ref(), &who.held(), look, at).await
+        }
+    }
+
+    impl Answer for HelloArgs {
+        async fn answer(_: &Arc<Daemon>, _: &Self) -> anyhow::Result<HelloReply> {
+            Ok(HelloReply {
+                api: super::API,
+                version: env!("CARGO_PKG_VERSION").into(),
+            })
+        }
+    }
+
+    impl Answer for ReadMarkersArgs {
+        async fn answer(d: &Arc<Daemon>, a: &Self) -> anyhow::Result<ReadMarkersReply> {
+            crate::settings::read_markers(d, a.on)
+        }
+    }
+
+    impl Answer for CancelInvitationArgs {
+        async fn answer(d: &Arc<Daemon>, a: &Self) -> anyhow::Result<Done> {
+            crate::contacts::cancel_invitation(d, needed(a.id.as_ref(), "id")?.as_ref())
+        }
+    }
+
+    impl Answer for IntroduceArgs {
+        async fn answer(d: &Arc<Daemon>, a: &Self) -> anyhow::Result<Done> {
+            let who = needed(a.who.as_ref(), "who")?;
+            let to = needed(a.to.as_ref(), "to")?;
+            crate::introductions::introduce(d, who.as_ref(), to.as_ref(), a.note.as_deref())
+        }
+    }
+
+    impl Answer for IntroductionAcceptArgs {
+        async fn answer(d: &Arc<Daemon>, a: &Self) -> anyhow::Result<IntroductionAcceptReply> {
+            crate::introductions::accept(d, needed(a.id.as_ref(), "id")?.as_ref()).await
+        }
+    }
+
+    impl Answer for IntroductionDeclineArgs {
+        async fn answer(d: &Arc<Daemon>, a: &Self) -> anyhow::Result<Done> {
+            crate::introductions::decline(d, needed(a.id.as_ref(), "id")?.as_ref())
+        }
+    }
+
+    impl Answer for GroupConnectArgs {
+        async fn answer(d: &Arc<Daemon>, a: &Self) -> anyhow::Result<GroupConnectReply> {
+            let group = needed(a.group.as_ref(), "group")?;
+            let who = needed(a.who.as_ref(), "who")?;
+            crate::introductions::ask_in_group(d, group.as_ref(), who.as_ref(), a.note.as_deref())
+        }
+    }
+
+    impl Answer for GroupPostAgainArgs {
+        async fn answer(d: &Arc<Daemon>, a: &Self) -> anyhow::Result<GroupPostAgainReply> {
+            crate::groups::post_again(d, needed(a.group.as_ref(), "group")?.as_ref())
+        }
+    }
+
+    impl Answer for GroupMovedSeenArgs {
+        async fn answer(d: &Arc<Daemon>, a: &Self) -> anyhow::Result<Done> {
+            crate::groups::moved_seen(d, needed(a.group.as_ref(), "group")?.as_ref())
+        }
+    }
+
+    impl Answer for GroupConfirmMoveArgs {
+        async fn answer(d: &Arc<Daemon>, a: &Self) -> anyhow::Result<GroupConfirmMoveReply> {
+            let group = needed(a.group.as_ref(), "group")?;
+            let none = Vec::new();
+            let moves = a.moves.as_ref().unwrap_or(&none);
+            let to = a.to.as_ref().unwrap_or(&none);
+            crate::groups::confirm_move(d, group.as_ref(), moves, to)
+        }
+    }
+
+    impl Answer for GroupLeavingArgs {
+        async fn answer(d: &Arc<Daemon>, a: &Self) -> anyhow::Result<GroupLeavingReply> {
+            crate::groups::leaving(d, needed(a.group.as_ref(), "group")?.as_ref())
         }
     }
 
@@ -1480,6 +1640,7 @@ fn regard(req: &Value) -> account::Regard {
 
 /// The power a pairing joins this device at, as `pair-status` says it:
 /// `device` or `admin`, as the admin device named it.
+#[cfg(any(test, debug_assertions, feature = "by-name"))]
 fn joins_as(p: Option<cardinal_identity::Power>) -> Value {
     match p {
         Some(cardinal_identity::Power::Admin) => json!("admin"),
@@ -1536,9 +1697,11 @@ fn require_files(d: &Daemon) -> anyhow::Result<[u8; 32]> {
 async fn handle(d: &Arc<Daemon>, req: &Value) -> anyhow::Result<Value> {
     let cmd = arg(req, "cmd")?;
     match cmd {
+        #[cfg(any(test, debug_assertions, feature = "by-name"))]
         "hello" => Ok(json!({"api": API, "version": env!("CARGO_PKG_VERSION")})),
         "setup-begin" => setup_begin(d),
         "setup-finish" => setup_finish(d, req),
+        #[cfg(any(test, debug_assertions, feature = "by-name"))]
         "status" => Ok(status(d)),
         // Inspection (`inspect.rs`): the person turns it on, on this
         // device, and only whoever holds the token it gives may look.
@@ -1612,7 +1775,9 @@ async fn handle(d: &Arc<Daemon>, req: &Value) -> anyhow::Result<Value> {
         }
         #[cfg(any(test, debug_assertions, feature = "by-name"))]
         "invitations" => Ok(crate::contacts::invitations_by_name(d)),
-        "cancel-invitation" => crate::contacts::cancel_invitation(d, arg(req, "id")?),
+        #[cfg(any(test, debug_assertions, feature = "by-name"))]
+        "cancel-invitation" => crate::contacts::cancel_invitation_by_name(d, arg(req, "id")?),
+        #[cfg(any(test, debug_assertions, feature = "by-name"))]
         "contact-status" => {
             // looking is done with the first page, never again for the next
             let first = req.get("after").and_then(Value::as_u64).unwrap_or(0) == 0;
@@ -1677,15 +1842,24 @@ async fn handle(d: &Arc<Daemon>, req: &Value) -> anyhow::Result<Value> {
         "groups" => Ok(crate::groups::list_by_name(d)),
         #[cfg(any(test, debug_assertions, feature = "by-name"))]
         "introductions" => Ok(crate::introductions::list_by_name(d)),
+        #[cfg(any(test, debug_assertions, feature = "by-name"))]
         "introduce" => {
             let note = req.get("note").and_then(|v| v.as_str());
-            crate::introductions::introduce(d, arg(req, "who")?, arg(req, "to")?, note)
+            crate::introductions::introduce_by_name(d, arg(req, "who")?, arg(req, "to")?, note)
         }
-        "introduction-accept" => crate::introductions::accept(d, arg(req, "id")?).await,
-        "introduction-decline" => crate::introductions::decline(d, arg(req, "id")?),
+        #[cfg(any(test, debug_assertions, feature = "by-name"))]
+        "introduction-accept" => crate::introductions::accept_by_name(d, arg(req, "id")?).await,
+        #[cfg(any(test, debug_assertions, feature = "by-name"))]
+        "introduction-decline" => crate::introductions::decline_by_name(d, arg(req, "id")?),
+        #[cfg(any(test, debug_assertions, feature = "by-name"))]
         "group-connect" => {
             let note = req.get("note").and_then(|v| v.as_str());
-            crate::introductions::ask_in_group(d, arg(req, "group")?, arg(req, "who")?, note)
+            crate::introductions::ask_in_group_by_name(
+                d,
+                arg(req, "group")?,
+                arg(req, "who")?,
+                note,
+            )
         }
         #[cfg(any(test, debug_assertions, feature = "by-name"))]
         "group-create" => {
@@ -1708,9 +1882,12 @@ async fn handle(d: &Arc<Daemon>, req: &Value) -> anyhow::Result<Value> {
             let (group, who) = (arg(req, "group")?, arg(req, "who")?);
             crate::groups::set_role_by_name(d, group, who, arg(req, "role")?).await
         }
-        "group-post-again" => crate::groups::post_again(d, arg(req, "group")?),
-        "group-moved-seen" => crate::groups::moved_seen(d, arg(req, "group")?),
-        "group-confirm-move" => crate::groups::confirm_move(
+        #[cfg(any(test, debug_assertions, feature = "by-name"))]
+        "group-post-again" => crate::groups::post_again_by_name(d, arg(req, "group")?),
+        #[cfg(any(test, debug_assertions, feature = "by-name"))]
+        "group-moved-seen" => crate::groups::moved_seen_by_name(d, arg(req, "group")?),
+        #[cfg(any(test, debug_assertions, feature = "by-name"))]
+        "group-confirm-move" => crate::groups::confirm_move_by_name(
             d,
             arg(req, "group")?,
             &strings(req, "moves"),
@@ -1721,7 +1898,8 @@ async fn handle(d: &Arc<Daemon>, req: &Value) -> anyhow::Result<Value> {
             let anyway = req.get("anyway").and_then(|v| v.as_bool()) == Some(true);
             crate::groups::leave_by_name(d, arg(req, "group")?, &strings(req, "admins"), anyway)
         }
-        "group-leaving" => crate::groups::leaving(d, arg(req, "group")?),
+        #[cfg(any(test, debug_assertions, feature = "by-name"))]
+        "group-leaving" => crate::groups::leaving_by_name(d, arg(req, "group")?),
         #[cfg(any(test, debug_assertions, feature = "by-name"))]
         "group-rejoin" => crate::groups::rejoin_by_name(d, arg(req, "group")?),
         #[cfg(any(test, debug_assertions, feature = "by-name"))]
@@ -1842,9 +2020,10 @@ async fn handle(d: &Arc<Daemon>, req: &Value) -> anyhow::Result<Value> {
         "conversations" => Ok(crate::contacts::conversations_by_name(d)),
         #[cfg(any(test, debug_assertions, feature = "by-name"))]
         "mark-read" => crate::contacts::mark_read_by_name(d, arg(req, "who")?),
+        #[cfg(any(test, debug_assertions, feature = "by-name"))]
         "read-markers" => {
             let on = req.get("on").and_then(|v| v.as_bool());
-            crate::settings::read_markers(d, on)
+            crate::settings::read_markers_by_name(d, on)
         }
         "recovery-check" => {
             crate::recovery::root_from_words(d, arg(req, "words")?)?;
@@ -2654,6 +2833,8 @@ pub(crate) fn device_list(d: &Daemon) -> Vec<api::Device> {
     v
 }
 
+/// [`device_list`] as main had it, by name.
+#[cfg(any(test, debug_assertions, feature = "by-name"))]
 fn devices(d: &Daemon) -> Vec<Value> {
     let (st, names) = {
         let core = d.core();
@@ -2737,6 +2918,149 @@ fn devices(d: &Daemon) -> Vec<Value> {
     v
 }
 
+/// Where this device stands, as `status` gives it: all of it, which the
+/// page cuts.
+pub(crate) fn status_reply(d: &Arc<Daemon>) -> api::StatusReply {
+    let cfg = d.config().clone();
+    let (identity, spaces, conflicts, files) = {
+        let core = d.core();
+        let identity = core.identity.as_ref().map(|i| api::short_id(&i.id()));
+        let files = core.files_id();
+        let spaces: Vec<api::SpaceShown> = core
+            .spaces
+            .values()
+            .map(|h| api::SpaceShown {
+                id: api::short_id(&h.id),
+                kind: match h.profile() {
+                    Some(cardinal_space::Profile::ACCOUNT) => "account",
+                    Some(cardinal_space::Profile::FILES) => "files",
+                    Some(_) => "other",
+                    None => "arriving",
+                }
+                .into(),
+                entries: h.set_len() as u64,
+                // set aside for want of a witness (`spaces.md#authors`)
+                set_aside: h
+                    .space
+                    .as_ref()
+                    .map_or(0, |s| s.validity().unwitnessed.len())
+                    as u64,
+                valid: h.space.as_ref().map_or(0, |s| s.validity().valid.len()) as u64,
+            })
+            .collect();
+        let conflicts = files
+            .and_then(|f| core.spaces.get(&f))
+            .and_then(|h| h.space.as_ref())
+            .map(|s| shown_conflicts(s).len())
+            .unwrap_or(0);
+        (identity, spaces, conflicts, files)
+    };
+    // the whole id, beside the short one shown
+    let identity_id = d.core().identity.as_ref().map(|i| i.id());
+    let (mounted, pending, not_saved, undone) = {
+        let m = d.mount.lock().unwrap_or_else(|e| e.into_inner());
+        match m.as_ref() {
+            Some(m) => (
+                Some(m.path.display().to_string()),
+                m.has_pending(),
+                m.refused_count(),
+                m.undone_count(),
+            ),
+            None => (None, false, 0, 0),
+        }
+    };
+    let progress = d.progress.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    let pairing = |state: &'static str| api::Pairing {
+        admin: None,
+        code: None,
+        error: None,
+        state: state.into(),
+        power: None,
+    };
+    let pairing = match d.pairing.lock().unwrap_or_else(|e| e.into_inner()).clone() {
+        PairState::Idle => None,
+        PairState::Showing { code } => Some(api::Pairing {
+            code: Some(code),
+            ..pairing("showing")
+        }),
+        PairState::Joining {
+            admin_name, power, ..
+        } => Some(api::Pairing {
+            admin: Some(admin_name),
+            power: joins_as_name(power).map(Into::into),
+            ..pairing("joining")
+        }),
+        PairState::Joined { .. } => None,
+        PairState::Failed(e) => Some(api::Pairing {
+            error: Some(e),
+            ..pairing("failed")
+        }),
+    };
+    // each lock taken and let go before the next: a guard in the reply's
+    // expression would be held to its end
+    let read_markers = crate::settings::read_markers_on(&d.core());
+    let removed = d.core().removed();
+    let mount_unavailable = d
+        .mount_unavailable
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
+    api::StatusReply {
+        name: cfg.name.clone(),
+        router: crate::portmap::router(d),
+        bluetooth: crate::bluetooth::shown(d),
+        network: crate::networks::network(d),
+        read_markers,
+        home: d.paths.home.display().to_string(),
+        identity,
+        identity_id,
+        devices: device_list(d),
+        hosts: crate::host::hosts(d).ok().map(|h| h.len() as u64),
+        // the person's devices with a mailbox, reachable from outside: an
+        // explicit host, or one that names itself (D72)
+        always_on: always_on(d),
+        spaces,
+        files_ready: files.is_some(),
+        // whether this device may be inspected now, and until when
+        inspection: d.inspection.shown(),
+        mount: cfg.mount_here().map(|p| p.display().to_string()),
+        mounted,
+        removed,
+        mount_unavailable,
+        pending_changes: pending,
+        not_saved: not_saved as u64,
+        not_saved_undone: undone as u64,
+        retention: cfg.retention.clone(),
+        conflicts: conflicts as u64,
+        // the setting, which is what main sent: the address it listens at
+        // was written first under the same name, and the setting replaced it
+        listen: cfg.listen.clone(),
+        moved_from: cfg.this_run.moved_from.map(u64::from),
+        left_behind: cfg.this_run.left_behind.clone(),
+        progress: api::ProgressShown {
+            bytes_fetched: progress.bytes_fetched,
+            bytes_pending: progress.bytes_pending,
+            bytes_wanted: progress.bytes_wanted,
+            files_pending: progress.files_pending,
+            last_error: progress.last_error,
+            rate: progress.rate,
+        },
+        copies: crate::copies::shown(d),
+        conditions: d.conditions.shown(),
+        redial: d.redial(),
+        carrying_calls: crate::calls::carried(d) as u64,
+        old: crate::cleanup::shown(d),
+        pairing,
+        peers: cfg.peers,
+        uptime_s: d.uptime().as_secs(),
+        // the page says
+        more: false,
+        next: None,
+    }
+}
+
+/// `status` as main had it, by name.
+#[cfg(any(test, debug_assertions, feature = "by-name"))]
 fn status(d: &Arc<Daemon>) -> Value {
     let cfg = d.config().clone();
     let (identity, spaces, conflicts, files) = {
