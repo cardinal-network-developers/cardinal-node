@@ -1085,10 +1085,15 @@ impl Visit for Measure<'_> {
             self.n += 1;
             self.len += key_len(row.n) + len;
             self.ok &= ok;
-            // where the tests run, text of a closed set holds one of its values
+            // where the tests run, text of a closed set that holds none of
+            // its values is said, as this build's mistake; it is sent as it
+            // is, as a release build sends it
             #[cfg(debug_assertions)]
-            {
-                self.ok &= row.known.is_empty() || v.unknown(row.known).is_none();
+            if let Some(t) = v.unknown(row.known).filter(|_| !row.known.is_empty()) {
+                mistake(format_args!(
+                    "{} is {t:?}, which is none of the values its row names",
+                    row.name
+                ));
             }
         }
     }
@@ -1124,11 +1129,6 @@ impl Visit for Invalid<'_> {
         if v.sent() {
             let at = At::Field(self.at, row.name);
             if let Err(e) = v.check(&at) {
-                self.out.push((row.n, row.name, e));
-            }
-            #[cfg(debug_assertions)]
-            if let Some(t) = v.unknown(row.known).filter(|_| !row.known.is_empty()) {
-                let e = format!("{at} is {t:?}, which is none of the values its row names");
                 self.out.push((row.n, row.name, e));
             }
         }

@@ -2577,10 +2577,12 @@ asks for around that is not built yet.
   - **Closed sets of text.** A text field whose values are a closed set
     says so in its declaration (`10 state: Cow<'static, str> where "calling"
     | "ringing" | "live"`): exported as the field's `known` values for
-    generators, still text on the wire. In a debug build a reply holding
-    another value is this build's mistake, as a uint of 2^60 is: the
-    request fails, `internal: <where> is "<value>", which is none of the
-    values its row names`; a release build sends it as it is.
+    generators, still text on the wire. In a debug build one holding
+    another value is said in the log as this build's mistake (`<field> is
+    "<value>", which is none of the values its row names`), and sent as it
+    is. (Failing the request there instead, as a uint of 2^60 does, found
+    one value outside the sets in the whole release tier: a same-bytes
+    test's own `how: "ended"`, which the service never writes.)
   - **A reply field without a number** is this build's mistake. In a debug
     build, where the tests run, the request then fails; in a release build
     the field is left out and the service logs an error. A field no test
