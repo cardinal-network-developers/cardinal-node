@@ -2394,11 +2394,13 @@ asks for around that is not built yet.
     admin of <group> can add themselves back"; and `group-member` without
     `shown`, for a member with no node of their own, writes the ref as the
     way by name held it as the name the others see: NUL and hex, for an id
-    given as bytes. One reply differs, only from data this software never
-    writes: a group's last call is noted with its ids in hex, and one not
-    in hex failed `groups` by name in a debug build (and in a release
-    build left the whole list of groups out); typed, that call alone is
-    left out, and logged.
+    given as bytes; `accept` with a `name` of spaces answers that name,
+    while the contact it made reads back by the name the invitation
+    suggests (a blank petname is none), not their own. One reply differs,
+    only from data this software never writes: a group's last call is
+    noted with its ids in hex, and one not in hex failed `groups` by name
+    in a debug build (and in a release build left the whole list of
+    groups out); typed, that call alone is left out, and logged.
   - **A reply field without a number** is this build's mistake. In a debug
     build, where the tests run, the request then fails; in a release build
     the field is left out and the service logs an error. A field no test
