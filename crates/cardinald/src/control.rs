@@ -645,7 +645,15 @@ pub mod typed {
             Ok(x) => x,
             Err(refused) => return Some(api::error_reply(refused.status, &refused.why)),
         };
-        let answer = answerer(spec.n)?;
+        let Some(answer) = answerer(spec.n) else {
+            // a stream's, which the connection answers; as `decode_record`
+            // refused one that is not one record
+            let refused = cardinal_encoding::check_record(msg).err()?;
+            return Some(api::error_reply(
+                api::status::MALFORMED,
+                &format!("not one record: {refused}"),
+            ));
+        };
         Some(answer(d, msg).await)
     }
 
