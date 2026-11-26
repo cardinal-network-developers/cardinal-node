@@ -109,7 +109,7 @@ cardinal/fetch_order            branch  files           11
 cardinal/restore                branch  files,recovery  8
 cardinal/groups                 branch  groups          15
 cardinal/guardians              branch  groups,recovery 40
-cardinal/recovered_contacts     branch  contacts,recovery 60
+cardinal/recovered_contacts     branch  contacts,recovery 230
 cardinal/group_calls            branch  groups,calls    52
 cardinal/invitations            branch  contacts        100
 cardinal/mailbox                branch  contacts        16
@@ -136,5 +136,6 @@ slow cardinal/hosting       a_hosted_phone_is_told_and_otherwise_quiet
 slow cardinal/hostile       a_host_renews_each_reach_node_once
 slow cardinal/redial        a_phone_on_battery_spares_its_radio_and_dials_when_it_wakes
 slow cardinal/invitations   one_code_makes_one_exchange
+slow cardinal/recovered_contacts a_contact_of_the_guardian_in_a_group_with_both_learns_the_new_device
 slow cardinal/video_calls   answering_again_turns_video_on_and_off
 slow cardinal/group_calls   a_device_back_after_its_sessions_ended_is_linked_again
