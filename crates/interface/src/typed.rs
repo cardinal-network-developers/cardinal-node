@@ -37,9 +37,8 @@ use std::fmt;
 use cardinal_encoding::varint::varint_len;
 use cardinal_encoding::{write_varint, Record, Value};
 
-use super::table::{Field, Request, Ty};
-use super::{page_room, status, Page, Refused, WHY};
-use crate::transport::MAX_MESSAGE;
+use crate::table::{Field, Request, Ty};
+use crate::{page_room, status, Page, Refused, MAX_MESSAGE, WHY};
 
 // The base encoding's major types (`encoding.md`).
 const T_UINT: u64 = 0;
@@ -296,7 +295,7 @@ impl Wire for u64 {
 }
 
 impl<const N: usize> Wire for [u8; N] {
-    const TY: Ty = Ty::Bytes;
+    const TY: Ty = Ty::BytesOf(N);
     #[inline]
     fn encode_into(&self, out: &mut Vec<u8>) {
         header(T_BYTES, N as u64, out);
@@ -568,23 +567,23 @@ pub enum Reference {
 
 impl Reference {
     /// The view of it that the lookups take.
-    pub fn as_ref(&self) -> super::Ref<'_> {
+    pub fn as_ref(&self) -> crate::Ref<'_> {
         match self {
-            Reference::Typed(t) => super::Ref::Typed(t),
-            Reference::Id(b) => super::Ref::Id(super::IdGiven::Bytes(b)),
+            Reference::Typed(t) => crate::Ref::Typed(t),
+            Reference::Id(b) => crate::Ref::Id(crate::IdGiven::Bytes(b)),
         }
     }
 }
 
 impl Reference {
-    /// The ref as the handlers not yet given [`super::Ref`] hold it: text
-    /// as it was typed, an id given as bytes as [`super::EXACT`] then its
+    /// The ref as the handlers not yet given [`crate::Ref`] hold it: text
+    /// as it was typed, an id given as bytes as [`crate::EXACT`] then its
     /// hex. Only for those handlers, whose words (an error naming the ref
     /// as it came) are kept as they were.
     pub fn held(&self) -> Cow<'_, str> {
         match self {
             Reference::Typed(t) => Cow::Borrowed(t),
-            Reference::Id(b) => Cow::Owned(format!("{}{}", super::EXACT, hex::encode(b))),
+            Reference::Id(b) => Cow::Owned(format!("{}{}", crate::EXACT, crate::hex(b))),
         }
     }
 }
@@ -609,7 +608,7 @@ impl Wire for Reference {
     fn take(v: Value, at: &At) -> Result<Self, String> {
         match v {
             Value::Bytes(b) => Ok(Reference::Id(b)),
-            Value::Text(t) if t.starts_with(super::EXACT) => {
+            Value::Text(t) if t.starts_with(crate::EXACT) => {
                 Err(format!("{at} is text that begins with NUL"))
             }
             Value::Text(t) => Ok(Reference::Typed(t)),
@@ -862,12 +861,19 @@ pub fn record_take<R: Fields>(v: Value, at: &At) -> Result<R, String> {
 }
 
 /// A typed request: its arguments are `Self`, and it answers `Reply`.
-/// [`asks!`](super::table) writes it, with how the reply pages, from the
+/// `asks!` (in [`table`](crate::table)) writes it, with how the reply pages, from the
 /// declaration; nothing about a request is written twice.
 pub trait Ask: Fields + Clone + Send + Sync + 'static {
-    /// Its row in [`REQUESTS`](super::REQUESTS).
+    /// Its row in [`REQUESTS`](crate::REQUESTS).
     const REQUEST: &'static Request;
     type Reply: Fields + Send;
+    /// Whether the connection carries a stream after it, answered by the
+    /// connection itself (`watch`, `call-media`).
+    const STREAM: bool = false;
+    /// The lists of its reply that come in pages, in turn, each with the
+    /// field of its records that names one too large for a message: none
+    /// for a reply that comes whole.
+    const LISTS: &'static [(&'static str, Option<&'static str>)] = &[];
     /// What its handler answers: the reply, or (of a reply the handler
     /// cuts to the page itself, `precut`) the reply with where its page
     /// begins and how many there are in all, [`Precut`].
@@ -901,7 +907,7 @@ pub trait Ask: Fields + Clone + Send + Sync + 'static {
 
     /// It as a message, numbered; or why the encoding cannot hold it, as
     /// the tables by name said.
-    fn encode(&self) -> anyhow::Result<Vec<u8>> {
+    fn encode(&self) -> Result<Vec<u8>, Unencodable> {
         request_message(Self::REQUEST, self)
     }
 
@@ -915,7 +921,7 @@ pub trait Ask: Fields + Clone + Send + Sync + 'static {
 /// A message of a stream, typed: an event of `watch` or a frame of
 /// `call-media` (`apps.md`, The local interface), whose key 0 says which.
 pub trait Streamed: Fields {
-    /// Its row in [`EVENTS`](super::EVENTS) or [`FRAMES`](super::FRAMES).
+    /// Its row in [`EVENTS`](crate::EVENTS) or [`FRAMES`](crate::FRAMES).
     const KIND: &'static Request;
 
     /// It as a message.
@@ -928,11 +934,11 @@ pub trait Streamed: Fields {
 
 /// A request as a message, numbered; or why the encoding cannot hold it,
 /// as the tables by name said.
-fn request_message(spec: &Request, args: &dyn Body) -> anyhow::Result<Vec<u8>> {
+fn request_message(spec: &Request, args: &dyn Body) -> Result<Vec<u8>, Unencodable> {
     let (n, len, ok) = args.measure(&[]);
     if !ok {
         if let Some((_, _, e)) = args.invalid(&At::Top(spec.name)).first() {
-            anyhow::bail!("{e}");
+            return Err(Unencodable(e.clone()));
         }
     }
     let mut out = Vec::with_capacity(16 + len);
@@ -951,7 +957,7 @@ fn stream_message(kind: &Request, m: &dyn Body) -> Vec<u8> {
         let invalid = m.invalid(&At::Top(kind.name));
         skip = invalid.iter().map(|(n, _, _)| *n).collect();
         if let Some((_, _, e)) = invalid.first() {
-            tracing::error!("{e}; left out");
+            mistake(format_args!("{e}; left out"));
         }
         (n, len, _) = m.measure(&skip);
     }
@@ -980,9 +986,9 @@ fn reply_body(name: &str, reply: &dyn Body) -> Vec<u8> {
         let invalid = reply.invalid(&At::Top(name));
         skip = invalid.iter().map(|(n, _, _)| *n).collect();
         if let Some((_, _, e)) = invalid.first() {
-            tracing::error!("reply to {name}: {e}");
+            mistake(format_args!("reply to {name}: {e}"));
             if cfg!(debug_assertions) {
-                return super::error_reply(status::FAILED, &format!("internal: {e}"));
+                return crate::error_reply(status::FAILED, &format!("internal: {e}"));
             }
         }
         (n, len, _) = reply.measure(&skip);
@@ -994,6 +1000,28 @@ fn reply_body(name: &str, reply: &dyn Body) -> Vec<u8> {
     reply.write(&skip, &mut out);
     out
 }
+
+/// This build's mistake, a value the encoding cannot hold, said in the
+/// log of a program that has one (the `tracing` feature, which the service
+/// turns on); a message is written without it either way.
+#[inline(never)]
+fn mistake(_what: fmt::Arguments) {
+    #[cfg(feature = "tracing")]
+    tracing::error!("{_what}");
+}
+
+/// A request a client could not send: a value of its arguments the
+/// encoding cannot hold, said as the tables by name said it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Unencodable(pub String);
+
+impl fmt::Display for Unencodable {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for Unencodable {}
 
 /// A reply that did not do what was asked, as a client reads it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1029,19 +1057,19 @@ impl std::error::Error for Unreadable {}
 
 /// A reply off the wire: what it says, or how it failed. An error is
 /// [`Unreadable`].
-pub fn read_reply<A: Ask>(msg: &[u8]) -> anyhow::Result<Result<A::Reply, Failed>> {
+pub fn read_reply<A: Ask>(msg: &[u8]) -> Result<Result<A::Reply, Failed>, Unreadable> {
     match reply_record(msg)? {
         Ok(r) => A::Reply::take_fields(r, &At::Top(A::REQUEST.name))
             .map(Ok)
-            .map_err(|e| anyhow::Error::new(Unreadable(e))),
+            .map_err(Unreadable),
         Err(failed) => Ok(Err(failed)),
     }
 }
 
 /// A reply off the wire, read as far as its status: the record of what
 /// it says, without why, or how it failed. An error is [`Unreadable`].
-pub fn reply_record(msg: &[u8]) -> anyhow::Result<Result<Record, Failed>> {
-    let unreadable = |e: String| anyhow::Error::new(Unreadable(e));
+pub fn reply_record(msg: &[u8]) -> Result<Result<Record, Failed>, Unreadable> {
+    let unreadable = Unreadable;
     let mut r = Record::decode(msg).map_err(|e| unreadable(format!("not one record: {e}")))?;
     let st = r
         .remove(0)
@@ -1069,8 +1097,8 @@ pub fn reply_record(msg: &[u8]) -> anyhow::Result<Result<Record, Failed>> {
 }
 
 /// A reply that did not do what was asked: its status, why, and what more
-/// an error says ([`ErrorMore`](super::table::ErrorMore)), as a message.
-pub fn error_message(status: u64, why: &str, more: &super::table::ErrorMore) -> Vec<u8> {
+/// an error says ([`ErrorMore`](crate::table::ErrorMore)), as a message.
+pub fn error_message(status: u64, why: &str, more: &crate::table::ErrorMore) -> Vec<u8> {
     let (n, len, _) = Body::measure(more, &[]);
     let mut out = Vec::with_capacity(8 + why.len() + len);
     header(T_RECORD, 2 + n, &mut out);
@@ -1086,7 +1114,7 @@ pub fn error_message(status: u64, why: &str, more: &super::table::ErrorMore) -> 
 /// An error that says which item of a paged answer was too large for a
 /// message on its own (`apps.md`, Errors).
 pub fn too_large_message(why: &str, at: u64, id: Option<&[u8]>) -> Vec<u8> {
-    let more = super::table::ErrorMore {
+    let more = crate::table::ErrorMore {
         at: Some(at),
         id: id.map(bytes::Bytes::copy_from_slice),
     };

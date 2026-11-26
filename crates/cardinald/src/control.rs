@@ -25,6 +25,7 @@ use serde_json::json;
 #[cfg(any(test, debug_assertions, feature = "by-name"))]
 use serde_json::Value;
 
+use crate::api::client::{Pages, Paging};
 use crate::api::typed::Ask;
 use crate::api::{self, status};
 use crate::core::short;
@@ -33,8 +34,7 @@ use crate::net;
 use crate::transport::{self, Listener, Reader, Received, Writer, MAX_MESSAGE};
 
 /// The version of this interface. A client compares it with `hello`'s.
-/// 2: the base encoding, with numbered fields, in place of lines of JSON.
-const API: u64 = 3;
+const API: u64 = cardinal_interface::VERSION;
 /// How long news waits, so that a burst of changes is one event.
 const NEWS_GATHERS: Duration = Duration::from_millis(100);
 
@@ -143,87 +143,9 @@ pub async fn ask<A: Ask>(
     socket: &std::path::Path,
     args: &A,
 ) -> anyhow::Result<Result<A::Reply, api::typed::Failed>> {
-    let mut pages = Box::new(Pages {
-        one_page: args.one_page(),
-        asked: args.clone(),
-        all: None,
-        failed: None,
-    });
+    let mut pages = Box::new(Pages::new(args));
     asking(socket, &mut *pages).await?;
-    pages.done()
-}
-
-/// A typed request asked page after page ([`ask`]): what was asked last,
-/// and the pages joined so far, or how one failed.
-struct Pages<A: Ask> {
-    /// Whether the arguments asked for one page themselves.
-    one_page: bool,
-    asked: A,
-    all: Option<A::Reply>,
-    failed: Option<api::typed::Failed>,
-}
-
-/// What [`asking`] does with a request, whatever its type: the message to
-/// send next, and what to make of its reply.
-trait Paging {
-    /// Its row.
-    fn request(&self) -> &'static api::Request;
-    /// The next page's request, as a message, if one is to be asked.
-    fn next(&mut self) -> anyhow::Result<Option<Vec<u8>>>;
-    /// Takes the reply to the message [`Paging::next`] gave: whether to
-    /// go on.
-    fn took(&mut self, reply: &[u8]) -> anyhow::Result<bool>;
-}
-
-impl<A: Ask> Paging for Pages<A> {
-    fn request(&self) -> &'static api::Request {
-        A::REQUEST
-    }
-    fn next(&mut self) -> anyhow::Result<Option<Vec<u8>>> {
-        match &self.all {
-            None => self.asked.encode().map(Some),
-            Some(_) if self.one_page => Ok(None),
-            Some(all) => match self.asked.next_page(all) {
-                Some(next) => {
-                    let msg = next.encode()?;
-                    self.asked = next;
-                    Ok(Some(msg))
-                }
-                None => Ok(None),
-            },
-        }
-    }
-    fn took(&mut self, reply: &[u8]) -> anyhow::Result<bool> {
-        let page = match api::typed::read_reply::<A>(reply)? {
-            Ok(r) => r,
-            Err(f) => {
-                self.failed = Some(f);
-                return Ok(false);
-            }
-        };
-        match &mut self.all {
-            None => {
-                self.all = Some(page);
-                Ok(true)
-            }
-            Some(all) => Ok(A::join(all, page)),
-        }
-    }
-}
-
-impl<A: Ask> Pages<A> {
-    /// The reply, every page joined, or how a page failed.
-    #[inline(never)]
-    fn done(self) -> anyhow::Result<Result<A::Reply, api::typed::Failed>> {
-        if let Some(f) = self.failed {
-            return Ok(Err(f));
-        }
-        let mut all = self.all.expect("a reply was read");
-        if !self.one_page {
-            A::whole(&mut all);
-        }
-        Ok(Ok(all))
-    }
+    Ok(pages.done())
 }
 
 /// [`ask`], written once for every request: each page asked in turn.
@@ -349,7 +271,7 @@ async fn connection(d: Arc<Daemon>, mut r: Reader, mut w: Writer) {
         // Every request is typed, answered on its own way, with no names.
         // One with no answering is a stream's, answered above, or one no
         // longer answered, refused by `decode_record`.
-        let reply = match spec.answer {
+        let reply = match typed::answerer(spec.n) {
             Some(answer) => answer(&d, rec).await,
             None => api::error_reply(
                 status::FAILED,
@@ -549,9 +471,43 @@ pub mod typed {
     use crate::daemon::PairState;
     use cardinal_space::account;
 
+    /// How a typed request is answered, from its message to its reply's.
+    pub type Answerer = for<'a> fn(
+        &'a Arc<Daemon>,
+        Record,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Vec<u8>> + Send + 'a>,
+    >;
+
+    /// Every request's answering, by its number, made from the interface's
+    /// list of every request (`each_request!`): `answering::<Args>` for
+    /// each that is answered by a reply, which takes `Args: Answer`, so a
+    /// request without a handler does not compile; none for a stream's
+    /// (answered by the connection itself) or one no longer answered.
+    macro_rules! answerers {
+        ($($how:ident $x:ident,)*) => {
+            static ANSWERERS: &[(u64, Option<Answerer>)] = &[$(answerers!(@one $how $x)),*];
+        };
+        (@one ask $args:ident) => {
+            (<api::$args as Ask>::REQUEST.n, Some(answering::<api::$args> as Answerer))
+        };
+        (@one stream $args:ident) => { (<api::$args as Ask>::REQUEST.n, None) };
+        (@one gone $row:ident) => { (api::$row.n, None) };
+    }
+    cardinal_interface::each_request!(answerers);
+
+    /// How the request numbered `n` is answered: `None` for a stream's, one
+    /// no longer answered, or a number no request has.
+    pub fn answerer(n: u64) -> Option<Answerer> {
+        ANSWERERS
+            .iter()
+            .find(|(m, _)| *m == n)
+            .and_then(|(_, a)| *a)
+    }
+
     /// How a typed request is answered: its handler, given its arguments
-    /// as they came. `asks!` takes the request's answering from here, so a
-    /// typed request with no handler does not compile.
+    /// as they came. [`ANSWERERS`] takes each request's answering from
+    /// here, so a typed request with no handler does not compile.
     pub trait Answer: Ask {
         fn answer(
             d: &Arc<Daemon>,
@@ -688,7 +644,7 @@ pub mod typed {
             Ok(x) => x,
             Err(refused) => return Some(api::error_reply(refused.status, &refused.why)),
         };
-        let answer = spec.answer?;
+        let answer = answerer(spec.n)?;
         Some(answer(d, r).await)
     }
 

@@ -7,7 +7,7 @@
 //! `next`. JSON is only this output; nothing here talks to the service.
 
 use cardinal_encoding::{Record, Value};
-use cardinald::api::{self, typed::Ask, Field, Ty};
+use cardinal_interface::{self as api, typed::Ask, Field, Ty};
 use serde_json::{json, Map, Value as Json};
 
 /// The reply to `args`, as JSON.
@@ -58,7 +58,9 @@ fn value(ty: &Ty, v: &Value, at: &str) -> Result<Json, String> {
     let wrong = |what: &str| format!("{at} should be {what}");
     Ok(match ty {
         Ty::Text => json!(v.as_text().ok_or_else(|| wrong("text"))?),
-        Ty::Bytes => json!(hex::encode(v.as_bytes().ok_or_else(|| wrong("bytes"))?)),
+        Ty::Bytes | Ty::BytesOf(_) => {
+            json!(hex::encode(v.as_bytes().ok_or_else(|| wrong("bytes"))?))
+        }
         Ty::Uint => json!(v.as_uint().ok_or_else(|| wrong("an unsigned integer"))?),
         Ty::Int => json!(v.as_int().ok_or_else(|| wrong("an integer"))?),
         Ty::Bool => json!(v.as_bool().ok_or_else(|| wrong("0 or 1"))?),

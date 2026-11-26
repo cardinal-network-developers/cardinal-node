@@ -254,6 +254,7 @@ dependencies = [
  "cardinal-crypto",
  "cardinal-encoding",
  "cardinal-identity",
+ "cardinal-interface",
  "cardinal-link",
  "cardinal-space",
  "cardinal-sync",
@@ -353,6 +354,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "cardinal-interface"
+version = "0.1.27"
+dependencies = [
+ "bytes",
+ "cardinal-encoding",
+ "tracing",
+]
+
+[[package]]
 name = "cardinal-link"
 version = "0.1.27"
 dependencies = [
@@ -420,6 +430,7 @@ dependencies = [
  "cardinal-crypto",
  "cardinal-encoding",
  "cardinal-identity",
+ "cardinal-interface",
  "cardinal-link",
  "cardinal-space",
  "cardinal-sync",

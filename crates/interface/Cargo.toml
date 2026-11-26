@@ -1,0 +1,20 @@
+[package]
+name = "cardinal-interface"
+description = "The local interface of a Cardinal node, as typed records: its requests, replies, records, events and frames, declared once, with their encoding both ways and their tables"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+cardinal-encoding.workspace = true
+# `bytes::Bytes`: a field of bytes of any length, taken without a copy.
+bytes = "1"
+# Where a program has a log (the service), this build's mistakes are said
+# in it; a client without it writes the message without the field all the
+# same.
+tracing = { version = "0.1", optional = true }
+
+[features]
+tracing = ["dep:tracing"]

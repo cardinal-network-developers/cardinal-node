@@ -13,7 +13,8 @@ use std::time::{Duration, Instant};
 mod output;
 mod overview;
 
-use cardinald::{api, control, setup, Config, Paths};
+use cardinal_interface as api;
+use cardinald::{control, setup, Config, Paths};
 use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
@@ -1412,7 +1413,7 @@ fn utf8(p: &std::path::Path) -> anyhow::Result<String> {
         .ok_or_else(|| anyhow::anyhow!("{} is not a path in UTF-8", p.display()))
 }
 
-/// Asks the service (`cardinald::api::typed`): the reply as its own
+/// Asks the service (`cardinal_interface::typed`): the reply as its own
 /// value, or why it was not done.
 async fn ask<A: api::typed::Ask>(paths: &Paths, args: A) -> anyhow::Result<A::Reply> {
     ask_or_failed(paths, &args).await?.map_err(not_done)
@@ -4750,8 +4751,8 @@ async fn client(cmd: Cmd) -> anyhow::Result<()> {
             let report = cardinald::format::report(&paths);
             let mut out = std::io::stdout().lock();
             if out.is_terminal() {
-                let spec = cardinald::api::program("--store").expect("the table has it");
-                writeln!(out, "{}", cardinald::api::render_reply(spec, &report))?;
+                let spec = api::program("--store").expect("the table has it");
+                writeln!(out, "{}", api::render_reply(spec, &report))?;
             } else {
                 out.write_all(&report)?;
             }
@@ -5066,7 +5067,7 @@ async fn trace_connection(
     mut sr: cardinald::transport::Reader,
     mut sw: cardinald::transport::Writer,
 ) {
-    use cardinald::api::{self, Zero};
+    use cardinal_interface::{self as api, Zero};
     use cardinald::transport::Received;
     // the request a reply answers, and what the connection carries after it
     let mut asked: std::collections::VecDeque<&'static api::Request> = Default::default();

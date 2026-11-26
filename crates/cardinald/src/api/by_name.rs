@@ -25,7 +25,7 @@ fn to_wire(ty: &Ty, v: &Json, at: &str) -> Result<Value, String> {
     let wrong = |what: &str| format!("{at} should be {what}, not {v}");
     Ok(match ty {
         Ty::Text => Value::from(v.as_str().ok_or_else(|| wrong("text"))?),
-        Ty::Bytes => {
+        Ty::Bytes | Ty::BytesOf(_) => {
             let s = v.as_str().ok_or_else(|| wrong("hex"))?;
             Value::from(hex::decode(s).map_err(|_| wrong("hex"))?)
         }
@@ -100,7 +100,9 @@ fn from_wire(ty: &Ty, v: &Value, at: &str) -> Result<Json, String> {
     let wrong = |what: &str| format!("{at} should be {what}");
     Ok(match ty {
         Ty::Text => json!(v.as_text().ok_or_else(|| wrong("text"))?),
-        Ty::Bytes => json!(hex::encode(v.as_bytes().ok_or_else(|| wrong("bytes"))?)),
+        Ty::Bytes | Ty::BytesOf(_) => {
+            json!(hex::encode(v.as_bytes().ok_or_else(|| wrong("bytes"))?))
+        }
         Ty::Uint => json!(v.as_uint().ok_or_else(|| wrong("an unsigned integer"))?),
         Ty::Int => json!(v.as_int().ok_or_else(|| wrong("an integer"))?),
         Ty::Bool => json!(v.as_bool().ok_or_else(|| wrong("0 or 1"))?),
@@ -283,7 +285,8 @@ pub fn page(spec: &Request, req: &Json, mut reply: Json) -> Result<Json, Unpaged
         // its id, where its records have one
         let id = match &lists[li].ty {
             Ty::Recs(r)
-                if field_by_name(r.fields, "id").is_some_and(|f| matches!(f.ty, Ty::Bytes)) =>
+                if field_by_name(r.fields, "id")
+                    .is_some_and(|f| matches!(f.ty, Ty::Bytes | Ty::BytesOf(_))) =>
             {
                 x.get("id").and_then(Json::as_str)
             }

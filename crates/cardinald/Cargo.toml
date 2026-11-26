@@ -17,6 +17,7 @@ cardinal-sync.workspace = true
 cardinal-link.workspace = true
 cardinal-contact.workspace = true
 cardinal-update.workspace = true
+cardinal-interface = { workspace = true, features = ["tracing"] }
 toml.workspace = true
 toml_edit = "0.25"
 blake3.workspace = true

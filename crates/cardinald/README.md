@@ -357,7 +357,7 @@ One base-encoded record per message each way, on a `SOCK_SEQPACKET`
 socket (on Windows a named pipe in message mode), as
 `apps.md#the-local-interface` says: a request's number in key 0 and its
 arguments by number; a reply's status in key 0 (0 done, else an error
-number, with why in key 1) and its fields from key 2. `src/api/table.rs`
+number, with why in key 1) and its fields from key 2. `crates/interface`
 numbers everything; inside, and in what follows, requests and fields go by
 the names it gives them. Error 5 (`needs words`) means the recovery words,
 as `words`, would let the same request through; 6 (`needs for`), that an
