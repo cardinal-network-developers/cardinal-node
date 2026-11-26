@@ -219,7 +219,9 @@ async fn connection(d: Arc<Daemon>, mut r: Reader, mut w: Writer) {
                 continue;
             }
         };
-        let (spec, rec) = match api::decode_record(&msg) {
+        // read straight from the bytes: the request's number, then its
+        // arguments, with no tree of the encoding between
+        let spec = match api::request_of(&msg) {
             Ok(x) => x,
             Err(refused) => {
                 if w.send(&api::error_reply(refused.status, &refused.why))
@@ -233,7 +235,7 @@ async fn connection(d: Arc<Daemon>, mut r: Reader, mut w: Writer) {
         };
         // the two requests after which a connection is a stream
         if spec.n == api::WatchArgs::REQUEST.n {
-            let a = match api::WatchArgs::from_request(rec) {
+            let a = match api::WatchArgs::read_request(&msg) {
                 Ok(a) => a,
                 Err(refused) => {
                     if w.send(&api::error_reply(refused.status, &refused.why))
@@ -256,7 +258,7 @@ async fn connection(d: Arc<Daemon>, mut r: Reader, mut w: Writer) {
             return;
         }
         if spec.n == api::CallMediaArgs::REQUEST.n {
-            if let Err(refused) = api::CallMediaArgs::from_request(rec) {
+            if let Err(refused) = api::CallMediaArgs::read_request(&msg) {
                 if w.send(&api::error_reply(refused.status, &refused.why))
                     .await
                     .is_err()
@@ -270,9 +272,15 @@ async fn connection(d: Arc<Daemon>, mut r: Reader, mut w: Writer) {
         }
         // Every request is typed, answered on its own way, with no names.
         // One with no answering is a stream's, answered above, or one no
-        // longer answered, refused by `decode_record`.
+        // longer answered, refused by `request_of`.
         let reply = match typed::answerer(spec.n) {
-            Some(answer) => answer(&d, rec).await,
+            Some(answer) => {
+                // the message opened once, for every request; its
+                // arguments read by its own answering
+                let mut c = cardinal_encoding::Cursor::new(&msg);
+                let answered = answer(&d, &mut api::typed::Walk::open(&mut c), &msg);
+                answered.await
+            }
             None => api::error_reply(
                 status::FAILED,
                 &format!("internal: {} has no answer", spec.name),
@@ -386,8 +394,6 @@ pub mod clock {
 pub mod typed {
     use std::sync::Arc;
 
-    use cardinal_encoding::Record;
-
     use crate::api::typed::Ask;
     use crate::api::typed::Reference;
     use crate::api::{self, CallArgs, FilesArgs, FilesReply, MessagesArgs, MessagesReply};
@@ -472,9 +478,10 @@ pub mod typed {
     use cardinal_space::account;
 
     /// How a typed request is answered, from its message to its reply's.
-    pub type Answerer = for<'a> fn(
+    pub type Answerer = for<'a, 'w, 'c, 'm> fn(
         &'a Arc<Daemon>,
-        Record,
+        &'w mut api::typed::Walk<'c, 'm>,
+        &'m [u8],
     ) -> std::pin::Pin<
         Box<dyn std::future::Future<Output = Vec<u8>> + Send + 'a>,
     >;
@@ -515,19 +522,21 @@ pub mod typed {
         ) -> impl std::future::Future<Output = anyhow::Result<Self::Answered>> + Send;
     }
 
-    /// The reply to `A`'s request `r`: its arguments as they came, the
-    /// handler's answer, and the reply's bytes; or the message refusing it.
-    /// Where the tests run, a request that changes nothing is answered by
-    /// name too, beside, and fails if the two are not the same bytes.
-    pub fn answering<A: Answer>(
-        d: &Arc<Daemon>,
-        r: Record,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Vec<u8>> + Send + '_>> {
+    /// The reply to `A`'s request `msg`: its arguments as they came, read
+    /// straight from its bytes, the handler's answer, and the reply's
+    /// bytes; or the message refusing it. Where the tests run, a request
+    /// that changes nothing is answered by name too, beside, and fails if
+    /// the two are not the same bytes.
+    pub fn answering<'a, A: Answer>(
+        d: &'a Arc<Daemon>,
+        w: &mut api::typed::Walk,
+        msg: &[u8],
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Vec<u8>> + Send + 'a>> {
+        let a = match A::read_args(w, msg) {
+            Ok(a) => a,
+            Err(refused) => return refusing(refused),
+        };
         Box::pin(async move {
-            let a = match A::from_request(r) {
-                Ok(a) => a,
-                Err(refused) => return api::error_reply(refused.status, &refused.why),
-            };
             // not in the benchmark's build (`by-name` alone), which measures
             // the typed way only; with the clock held still, so that a
             // time read twice is the same
@@ -541,6 +550,18 @@ pub mod typed {
             }
             answer_of(d, &a).await
         })
+    }
+
+    /// The answer to a request whose arguments could not be read: written
+    /// once, not for each request.
+    #[inline(never)]
+    fn refusing<'a>(
+        refused: api::Refused,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Vec<u8>> + Send + 'a>> {
+        Box::pin(std::future::ready(api::error_reply(
+            refused.status,
+            &refused.why,
+        )))
     }
 
     /// The reply to `a`, as a message.
@@ -640,12 +661,22 @@ pub mod typed {
     /// The reply to a typed request's message, or `None` for a request not
     /// typed: as the service answers it.
     pub async fn reply(d: &Arc<Daemon>, msg: &[u8]) -> Option<Vec<u8>> {
-        let (spec, r) = match api::decode_record(msg) {
+        let spec = match api::request_of(msg) {
             Ok(x) => x,
             Err(refused) => return Some(api::error_reply(refused.status, &refused.why)),
         };
-        let answer = answerer(spec.n)?;
-        Some(answer(d, r).await)
+        let Some(answer) = answerer(spec.n) else {
+            // a stream's, which the connection answers; as `decode_record`
+            // refused one that is not one record
+            let refused = cardinal_encoding::check_record(msg).err()?;
+            return Some(api::error_reply(
+                api::status::MALFORMED,
+                &format!("not one record: {refused}"),
+            ));
+        };
+        let mut c = cardinal_encoding::Cursor::new(msg);
+        let answered = answer(d, &mut api::typed::Walk::open(&mut c), msg);
+        Some(answered.await)
     }
 
     /// An argument a request cannot go without, as the handlers by name
@@ -1119,7 +1150,11 @@ pub mod typed {
     impl Answer for PairStatusArgs {
         async fn answer(d: &Arc<Daemon>, _: &Self) -> anyhow::Result<PairStatusReply> {
             let ps = d.pairing.lock().unwrap_or_else(|e| e.into_inner()).clone();
-            let state = |state: &'static str| PairStatusReply::new(state.into());
+            let state = |state: &'static str| {
+                cardinal_interface::new!(PairStatusReply {
+                    state: state.into()
+                })
+            };
             let power = |p| super::joins_as_name(p).map(Into::into);
             Ok(match ps {
                 PairState::Idle => state("idle"),
@@ -2010,7 +2045,10 @@ pub mod typed {
 
     impl Answer for AppQuestionsArgs {
         async fn answer(d: &Arc<Daemon>, _: &Self) -> anyhow::Result<AppQuestionsReply> {
-            Ok(AppQuestionsReply::new(crate::apps::questions(d), false))
+            Ok(cardinal_interface::new!(AppQuestionsReply {
+                questions: crate::apps::questions(d),
+                more: false
+            }))
         }
     }
 
@@ -2022,7 +2060,10 @@ pub mod typed {
 
     impl Answer for ApprovalsArgs {
         async fn answer(d: &Arc<Daemon>, _: &Self) -> anyhow::Result<ApprovalsReply> {
-            Ok(ApprovalsReply::new(crate::apps::list_approvals(d), false))
+            Ok(cardinal_interface::new!(ApprovalsReply {
+                approvals: crate::apps::list_approvals(d),
+                more: false
+            }))
         }
     }
 
@@ -2034,7 +2075,10 @@ pub mod typed {
 
     impl Answer for AppOffersArgs {
         async fn answer(d: &Arc<Daemon>, _: &Self) -> anyhow::Result<AppOffersReply> {
-            Ok(AppOffersReply::new(crate::apps::list_offers(d), false))
+            Ok(cardinal_interface::new!(AppOffersReply {
+                offers: crate::apps::list_offers(d),
+                more: false
+            }))
         }
     }
 
@@ -3961,7 +4005,9 @@ fn conflict_list(d: &Daemon) -> anyhow::Result<Vec<api::Conflict>> {
                     .unwrap_or_else(|| account::short_key(&v.device)),
                 time: v.time,
                 size: v.content.as_ref().map(|c| c.size()),
-                ..api::Version::new(String::new())
+                ..cardinal_interface::new!(api::Version {
+                    device: String::new()
+                })
             })
             .collect();
         let copies: Vec<String> = {
@@ -4090,7 +4136,11 @@ fn debug_tree(d: &Daemon) -> anyhow::Result<api::DebugTreeReply> {
         out.copy_from_slice(&n[..6]);
         out
     };
-    let mut reply = api::DebugTreeReply::new(heads, false, false);
+    let mut reply = cardinal_interface::new!(api::DebugTreeReply {
+        heads,
+        mounted: false,
+        more: false
+    });
     reply.epoch = epoch;
     let m = d.mount.lock().unwrap_or_else(|e| e.into_inner());
     let Some(m) = m.as_ref() else {

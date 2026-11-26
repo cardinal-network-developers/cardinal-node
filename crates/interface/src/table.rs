@@ -62,6 +62,12 @@ pub struct Field {
     /// since the last release to that (`api::tests`).
     #[cfg(test)]
     pub optional: bool,
+    /// The values a text field holds, where they are a closed set its
+    /// declaration names (`where "a" | "b"`): for generators, in the export,
+    /// and where the tests run, a reply holding another is this build's
+    /// mistake. On the wire it is text all the same.
+    #[cfg(any(test, debug_assertions))]
+    pub known: &'static [&'static str],
 }
 
 /// A record held inside a reply.
@@ -165,6 +171,24 @@ macro_rules! typed {
             [$($s)* ($(#[$fm])* $f : $t)] [$($r)* ($f : $t)] [$($o)*]
             [$($l)* ($n $f)] [$($a)* ($n $f (as $row))] $($($rest)*)?);
     };
+    // A field of text sent only when it is `Some`, whose values are a
+    // closed set: `where "a" | "b"`.
+    (@munch $h:tt $st:tt [$($s:tt)*] [$($r:tt)*] [$($o:tt)*] [$($l:tt)*] [$($a:tt)*]
+        $(#[$fm:meta])* $n:literal $f:ident : Option<$t:ty> where $($k:literal)|+
+        $(, $($rest:tt)*)?
+    ) => {
+        $crate::typed!(@munch $h $st
+            [$($s)* ($(#[$fm])* $f : Option<$t>)] [$($r)*] [$($o)* $f]
+            [$($l)* ($n $f)] [$($a)* ($n $f (Option<$t>) [$($k),+])] $($($rest)*)?);
+    };
+    // A field of text always sent, whose values are a closed set.
+    (@munch $h:tt $st:tt [$($s:tt)*] [$($r:tt)*] [$($o:tt)*] [$($l:tt)*] [$($a:tt)*]
+        $(#[$fm:meta])* $n:literal $f:ident : $t:ty where $($k:literal)|+ $(, $($rest:tt)*)?
+    ) => {
+        $crate::typed!(@munch $h $st
+            [$($s)* ($(#[$fm])* $f : $t)] [$($r)* ($f : $t)] [$($o)*]
+            [$($l)* ($n $f)] [$($a)* ($n $f ($t) [$($k),+])] $($($rest)*)?);
+    };
     // A field sent only when it is `Some`.
     (@munch $h:tt $st:tt [$($s:tt)*] [$($r:tt)*] [$($o:tt)*] [$($l:tt)*] [$($a:tt)*]
         $(#[$fm:meta])* $n:literal $f:ident : Option<$t:ty> $(, $($rest:tt)*)?
@@ -188,6 +212,8 @@ macro_rules! typed {
             ty: $crate::table::Ty::Rec(&$row),
             #[cfg(test)]
             optional: $crate::typed!(@opt $($opt)?),
+            #[cfg(any(test, debug_assertions))]
+            known: &[],
         }
     };
     (@row ($n:literal $f:ident (as [$row:ident] $($opt:tt)?))) => {
@@ -197,6 +223,8 @@ macro_rules! typed {
             ty: $crate::table::Ty::Recs(&$row),
             #[cfg(test)]
             optional: $crate::typed!(@opt $($opt)?),
+            #[cfg(any(test, debug_assertions))]
+            known: &[],
         }
     };
     (@opt ?) => { true };
@@ -208,6 +236,19 @@ macro_rules! typed {
             ty: $crate::table::Ty::Gone(&<$t as $crate::typed::Wire>::TY),
             #[cfg(test)]
             optional: true,
+            #[cfg(any(test, debug_assertions))]
+            known: &[],
+        }
+    };
+    (@row ($n:literal $f:ident ($t:ty) [$($k:literal),+])) => {
+        $crate::table::Field {
+            n: $n,
+            name: $crate::typed::field_name(stringify!($f)),
+            ty: <$t as $crate::typed::Wire>::TY,
+            #[cfg(test)]
+            optional: <$t as $crate::typed::Wire>::OPTIONAL,
+            #[cfg(any(test, debug_assertions))]
+            known: &[$($k),+],
         }
     };
     (@row ($n:literal $f:ident ($t:ty))) => {
@@ -217,6 +258,8 @@ macro_rules! typed {
             ty: <$t as $crate::typed::Wire>::TY,
             #[cfg(test)]
             optional: <$t as $crate::typed::Wire>::OPTIONAL,
+            #[cfg(any(test, debug_assertions))]
+            known: &[],
         }
     };
     // A record held in replies: its row, `$stat`, written out in the
@@ -225,7 +268,8 @@ macro_rules! typed {
     (@munch [$(#[$m:meta])* $name:ident] [$stat:ident $title:literal]
         $s:tt $r:tt $o:tt $l:tt [$($a:tt)*]
     ) => {
-        $crate::typed!(@body [$(#[$m])* $name] ($stat.fields) $s $r $o $l);
+        // read where it is held, once (`typed::record_read`)
+        $crate::typed!(@body [$(#[$m])* $name] ($stat.fields) [inline] $s $r $o $l);
 
         #[doc = concat!("The *", $title, "* record's row in the tables.")]
         pub static $stat: $crate::table::Rec = $crate::table::Rec {
@@ -265,21 +309,44 @@ macro_rules! typed {
             ) -> Result<Self, String> {
                 $crate::typed::record_take(v, at)
             }
+            #[inline]
+            fn read(
+                c: &mut $crate::__private::Cursor<'_>,
+                depth: usize,
+                at: &$crate::typed::At,
+            ) -> Result<Self, $crate::typed::Bad> {
+                $crate::typed::record_read(c, depth, at)
+            }
         }
     };
     // The arguments or the reply of a request: its rows in a static of
     // their own, so that every crate that names them names the one.
     (@munch [$(#[$m:meta])* $name:ident] [] $s:tt $r:tt $o:tt $l:tt [$($a:tt)*]) => {
+        // read from a whole message, once
         $crate::typed!(@body [$(#[$m])* $name] ({
             static FIELDS: [$crate::table::Field; $crate::typed!(@count $($a)*)] =
                 [ $( $crate::typed!(@row $a) ),* ];
             &FIELDS
-        }) $s $r $o $l);
+        }) [inline] $s $r $o $l);
     };
+    // A record that always has none of its fields is had with `new()`;
+    // one that has some, with `new!`, which names them.
+    (@new $name:ident []) => {
+        impl $name {
+            /// It, with none of its fields: all are sent only when they
+            /// are `Some`.
+            #[allow(clippy::new_without_default)]
+            #[inline]
+            pub fn new() -> Self {
+                Self::__new()
+            }
+        }
+    };
+    (@new $name:ident [$($rf:ident)+]) => {};
     // How many rows: one for each field, gone or not.
     (@count $($a:tt)*) => { <[()]>::len(&[$($crate::typed!(@unit $a)),*]) };
     (@unit $a:tt) => { () };
-    (@body [$(#[$m:meta])* $name:ident] ($fields:expr)
+    (@body [$(#[$m:meta])* $name:ident] ($fields:expr) [$inl:meta]
         [$(($(#[$fm:meta])* $sf:ident : $st:ty))*]
         [$(($rf:ident : $rt:ty))*]
         [$($of:ident)*]
@@ -293,15 +360,20 @@ macro_rules! typed {
 
         impl $name {
             /// It, with the fields it always has, in order; the others
-            /// absent.
-            #[allow(clippy::new_without_default, clippy::too_many_arguments)]
-            pub fn new($($rf: $rt),*) -> Self {
+            /// absent. Made by [`new!`](crate::new), which names each.
+            #[doc(hidden)]
+            #[allow(clippy::too_many_arguments)]
+            pub fn __new($($rf: $rt),*) -> Self {
                 $name { $($rf,)* $($of: None,)* }
             }
         }
 
+        $crate::typed!(@new $name [$($rf)*]);
+
         impl $crate::typed::Fields for $name {
             const FIELDS: &'static [$crate::table::Field] = $fields;
+            const REQUIRED: &'static [&'static str] =
+                &[$($crate::typed::field_name(stringify!($rf))),*];
 
             #[inline]
 
@@ -341,12 +413,88 @@ macro_rules! typed {
                     )?,
                 )* })
             }
+
+            // once for each record: a record held in others in the one
+            // place it is read from wherever it is held, the arguments or
+            // the reply of a request where a whole message is read
+            #[$inl]
+            #[allow(unused_variables)]
+            fn read_fields(
+                w: &mut $crate::typed::Walk,
+                at: &$crate::typed::At,
+            ) -> Result<Self, $crate::typed::Bad> {
+                // in the order of their numbers, as they come
+                Ok($name { $(
+                    $lf: $crate::typed::read_field(
+                        w,
+                        const {
+                            &<$name as $crate::typed::Fields>::FIELDS[
+                                $crate::typed::index(
+                                    <$name as $crate::typed::Fields>::FIELDS,
+                                    $ln,
+                                )
+                            ]
+                        },
+                        at,
+                    )?,
+                )* })
+            }
         }
 
         const _: () = $crate::typed::ascending(
             <$name as $crate::typed::Fields>::FIELDS,
         );
     };
+}
+
+/// A typed record, with the fields it always has given by name:
+/// `new!(Message { attachments, edited: false, id, mine: true, reactions,
+/// text })`, each once, in the order of their numbers (as the declaration
+/// lists them), the others absent; a field given by its own name may be
+/// written alone. A name missing, one too many, or one out of its place
+/// does not compile, so two fields of one type cannot be given each
+/// other's values; it costs nothing beyond the record itself. A field
+/// sent only when it is `Some` is set after, by name:
+/// `Message { from: Some(f), ..new!(Message { .. }) }`. A record that
+/// always has none of its fields is also `Name::new()`.
+///
+/// ```
+/// use cardinal_interface::{new, ViewportFrame};
+/// let (width, height) = (1280, 720);
+/// let v = new!(ViewportFrame { width, height });
+/// let from = ViewportFrame { from: Some([1; 8]), ..new!(ViewportFrame { width: 3, height: 4 }) };
+/// assert_eq!((v.width, v.height, from.from), (1280, 720, Some([1; 8])));
+/// ```
+///
+/// Two fields of one type in each other's places do not compile:
+///
+/// ```compile_fail
+/// use cardinal_interface::{new, ViewportFrame};
+/// let v = new!(ViewportFrame { height: 720, width: 1280 });
+/// ```
+///
+/// Nor does one missing, or one it does not always have:
+///
+/// ```compile_fail
+/// use cardinal_interface::{new, ViewportFrame};
+/// let v = new!(ViewportFrame { width: 1280 });
+/// ```
+///
+/// ```compile_fail
+/// use cardinal_interface::{new, ViewportFrame};
+/// let v = new!(ViewportFrame { width: 1280, height: 720, from: None });
+/// ```
+#[macro_export]
+macro_rules! new {
+    (@value $f:ident $v:expr) => { $v };
+    (@value $f:ident) => { $f };
+    ($t:path { $($f:ident $(: $v:expr)?),* $(,)? }) => {{
+        const _: () = $crate::typed::named(
+            <$t as $crate::typed::Fields>::REQUIRED,
+            &[$(stringify!($f)),*],
+        );
+        <$t>::__new($($crate::new!(@value $f $($v)?)),*)
+    }};
 }
 
 /// A typed request: its row, `ROW`, for [`REQUESTS`], from its typed
@@ -412,12 +560,15 @@ macro_rules! asks {
     (@by) => { None };
     (@by $id:ident) => { Some(stringify!($id)) };
     (@reads reads) => {
+        const READS: bool = true;
         #[inline]
         fn reads(&self) -> bool {
             true
         }
     };
     (@reads reads $unless:ident $($or:ident)*) => {
+        const READS: bool = true;
+        const UNLESS: &'static [&'static str] = &[stringify!($unless) $(, stringify!($or))*];
         #[inline]
         fn reads(&self) -> bool {
             self.$unless.is_none() $(&& self.$or.is_none())*
@@ -507,6 +658,7 @@ macro_rules! asks {
     };
     // How a client asks for one list page after page.
     (@pages $args:ident $reply:ident $list:ident) => {
+        const ONE_PAGE: &'static [&'static str] = &["after", "limit"];
         #[inline]
         fn one_page(&self) -> bool {
             self.after.is_some() || self.limit.is_some()
@@ -529,6 +681,13 @@ macro_rules! asks {
         #[inline]
         fn whole(all: &mut $reply) {
             (all.more, all.next) = (false, None);
+        }
+        #[inline]
+        fn past(&self, failed: &super::typed::Failed) -> Option<Self> {
+            Some($args {
+                after: Some(super::typed::past_after(failed, self.after)?),
+                ..self.clone()
+            })
         }
     };
     (@paging $args:ident $reply:ident
@@ -583,6 +742,7 @@ macro_rules! asks {
                 }
             }
         }
+        const ONE_PAGE: &'static [&'static str] = &["after", "limit"];
         #[inline]
         fn one_page(&self) -> bool {
             self.after.is_some() || self.limit.is_some()
@@ -606,6 +766,13 @@ macro_rules! asks {
         #[inline]
         fn whole(all: &mut $reply) {
             (all.more, all.next) = (false, None);
+        }
+        #[inline]
+        fn past(&self, failed: &super::typed::Failed) -> Option<Self> {
+            Some($args {
+                after: Some(super::typed::past_after(failed, self.after)?),
+                ..self.clone()
+            })
         }
     };
     (@paging $args:ident $reply:ident before $list:ident by $id:ident) => {
@@ -633,6 +800,7 @@ macro_rules! asks {
                 Err(super::typed::Unpaged(msg)) => msg,
             }
         }
+        const ONE_PAGE: &'static [&'static str] = &["before", "limit"];
         #[inline]
         fn one_page(&self) -> bool {
             self.before.is_some() || self.limit.is_some()
@@ -657,6 +825,13 @@ macro_rules! asks {
         fn whole(all: &mut $reply) {
             (all.more, all.next) = (false, None);
         }
+        #[inline]
+        fn past(&self, failed: &super::typed::Failed) -> Option<Self> {
+            Some($args {
+                before: Some(super::typed::past_before(failed, &self.before)?),
+                ..self.clone()
+            })
+        }
     };
 }
 
@@ -668,6 +843,8 @@ macro_rules! f {
             ty: Ty::Gone(&f!(0 "" $t).ty),
             #[cfg(test)]
             optional: false,
+            #[cfg(any(test, debug_assertions))]
+            known: &[],
         }
     };
     ($n:literal $name:literal T) => {
@@ -677,6 +854,8 @@ macro_rules! f {
             ty: Ty::Text,
             #[cfg(test)]
             optional: false,
+            #[cfg(any(test, debug_assertions))]
+            known: &[],
         }
     };
     ($n:literal $name:literal B) => {
@@ -686,6 +865,8 @@ macro_rules! f {
             ty: Ty::Bytes,
             #[cfg(test)]
             optional: false,
+            #[cfg(any(test, debug_assertions))]
+            known: &[],
         }
     };
     ($n:literal $name:literal U) => {
@@ -695,6 +876,8 @@ macro_rules! f {
             ty: Ty::Uint,
             #[cfg(test)]
             optional: false,
+            #[cfg(any(test, debug_assertions))]
+            known: &[],
         }
     };
     ($n:literal $name:literal I) => {
@@ -704,6 +887,8 @@ macro_rules! f {
             ty: Ty::Int,
             #[cfg(test)]
             optional: false,
+            #[cfg(any(test, debug_assertions))]
+            known: &[],
         }
     };
     ($n:literal $name:literal BOOL) => {
@@ -713,6 +898,8 @@ macro_rules! f {
             ty: Ty::Bool,
             #[cfg(test)]
             optional: false,
+            #[cfg(any(test, debug_assertions))]
+            known: &[],
         }
     };
     ($n:literal $name:literal REF) => {
@@ -722,6 +909,8 @@ macro_rules! f {
             ty: Ty::Ref,
             #[cfg(test)]
             optional: false,
+            #[cfg(any(test, debug_assertions))]
+            known: &[],
         }
     };
     ($n:literal $name:literal KIND) => {
@@ -731,6 +920,8 @@ macro_rules! f {
             ty: Ty::Kind,
             #[cfg(test)]
             optional: false,
+            #[cfg(any(test, debug_assertions))]
+            known: &[],
         }
     };
     ($n:literal $name:literal SCALAR) => {
@@ -740,6 +931,8 @@ macro_rules! f {
             ty: Ty::Scalar,
             #[cfg(test)]
             optional: false,
+            #[cfg(any(test, debug_assertions))]
+            known: &[],
         }
     };
     ($n:literal $name:literal [T]) => {
@@ -749,6 +942,8 @@ macro_rules! f {
             ty: Ty::List(&Ty::Text),
             #[cfg(test)]
             optional: false,
+            #[cfg(any(test, debug_assertions))]
+            known: &[],
         }
     };
     ($n:literal $name:literal [B]) => {
@@ -758,6 +953,8 @@ macro_rules! f {
             ty: Ty::List(&Ty::Bytes),
             #[cfg(test)]
             optional: false,
+            #[cfg(any(test, debug_assertions))]
+            known: &[],
         }
     };
     ($n:literal $name:literal [U]) => {
@@ -767,6 +964,8 @@ macro_rules! f {
             ty: Ty::List(&Ty::Uint),
             #[cfg(test)]
             optional: false,
+            #[cfg(any(test, debug_assertions))]
+            known: &[],
         }
     };
     ($n:literal $name:literal [REF]) => {
@@ -776,6 +975,8 @@ macro_rules! f {
             ty: Ty::List(&Ty::Ref),
             #[cfg(test)]
             optional: false,
+            #[cfg(any(test, debug_assertions))]
+            known: &[],
         }
     };
     ($n:literal $name:literal [SCALAR]) => {
@@ -785,6 +986,8 @@ macro_rules! f {
             ty: Ty::List(&Ty::Scalar),
             #[cfg(test)]
             optional: false,
+            #[cfg(any(test, debug_assertions))]
+            known: &[],
         }
     };
     ($n:literal $name:literal [[U]]) => {
@@ -794,6 +997,8 @@ macro_rules! f {
             ty: Ty::List(&Ty::List(&Ty::Uint)),
             #[cfg(test)]
             optional: false,
+            #[cfg(any(test, debug_assertions))]
+            known: &[],
         }
     };
     ($n:literal $name:literal {$r:ident}) => {
@@ -803,6 +1008,8 @@ macro_rules! f {
             ty: Ty::Rec(&$r),
             #[cfg(test)]
             optional: false,
+            #[cfg(any(test, debug_assertions))]
+            known: &[],
         }
     };
     ($n:literal $name:literal [$r:ident]) => {
@@ -812,6 +1019,8 @@ macro_rules! f {
             ty: Ty::Recs(&$r),
             #[cfg(test)]
             optional: false,
+            #[cfg(any(test, debug_assertions))]
+            known: &[],
         }
     };
 }
@@ -844,12 +1053,12 @@ typed!(
     /// What a program asks the person, waiting for their answer.
     APP_QUESTION "app question" AppQuestion {
         /// `family`, `new-space` or `share`.
-        1 asks: Cow<'static, str>,
+        1 asks: Cow<'static, str> where "family" | "new-space" | "share",
         2 id: u64,
         3 name: String,
         4 program: String,
         /// Of `share`: `reader` or `writer`.
-        5 role: Option<Cow<'static, str>>,
+        5 role: Option<Cow<'static, str>> where "reader" | "writer",
         6 what: String,
     }
 );
@@ -892,7 +1101,7 @@ typed!(
         2 channels_in: u64,
         3 error: Option<String>,
         /// `off`, `open` or `always`.
-        4 mode: Cow<'static, str>,
+        4 mode: Cow<'static, str> where "off" | "open" | "always",
         5 on: bool,
         6 psm: Option<u64>,
         7 radio: Option<String>,
@@ -919,7 +1128,7 @@ typed!(
         8 picture: Option<String>,
         9 seconds: Option<u64>,
         /// `calling`, `ringing` or `live`.
-        10 state: Cow<'static, str>,
+        10 state: Cow<'static, str> where "calling" | "ringing" | "live",
         11 taken: Option<Vec<[u8; 32]>>,
         /// The start of the other person's id (or the ringer's, in a group).
         12 who: [u8; 8],
@@ -937,7 +1146,8 @@ typed!(
     /// How the last call ended.
     CALL_ENDED "call ended" CallEnded {
         1 group: Option<[u8; 32]>,
-        2 how: Cow<'static, str>,
+        2 how: Cow<'static, str> where "missed" | "answered_elsewhere" | "declined_elsewhere"
+            | "declined" | "over" | "not_answered" | "they_declined" | "busy" | "cancelled",
         3 id: [u8; 16],
         4 name: String,
         5 who: [u8; 8],
@@ -1044,7 +1254,7 @@ typed!(
         5 name: String,
         6 online: bool,
         /// `device`, `admin` or `root`.
-        7 power: Cow<'static, str>,
+        7 power: Cow<'static, str> where "device" | "admin" | "root",
         8 this: bool,
         /// The device a relayed session with it runs through.
         9 through: Option<String>,
@@ -1291,7 +1501,7 @@ typed!(
         2 group: Option<String>,
         3 id: [u8; 16],
         /// `meet` or `introduced`.
-        4 kind: Cow<'static, str>,
+        4 kind: Cow<'static, str> where "meet" | "introduced",
         5 name: String,
         6 note: Option<String>,
     }
@@ -1362,7 +1572,7 @@ typed!(
         6 own: Option<bool>,
         7 picture: Option<String>,
         /// `owner`, `admin`, `member`, `reader` or `taken out`.
-        8 role: Cow<'static, str>,
+        8 role: Cow<'static, str> where "owner" | "admin" | "member" | "reader" | "taken out",
         9 shown: Option<String>,
         10 suggested: Option<String>,
         11 taken_out: Option<bool>,
@@ -1387,7 +1597,7 @@ typed!(
         8 read_by: Option<u64>,
         9 reply_to: Option<[u8; 16]>,
         /// Of this person's own: `sent`, `waiting` or `read`.
-        10 state: Option<Cow<'static, str>>,
+        10 state: Option<Cow<'static, str>> where "sent" | "waiting" | "read",
         11 text: String,
         12 time: Option<u64>,
     }
@@ -1489,7 +1699,7 @@ typed!(
         2 code: Option<String>,
         3 error: Option<String>,
         /// `showing`, `joining` or `failed`.
-        4 state: Cow<'static, str>,
+        4 state: Cow<'static, str> where "showing" | "joining" | "failed",
         5 power: Option<Cow<'static, str>>,
     }
 );
@@ -1505,7 +1715,7 @@ typed!(
     /// What a folder of the one folder is.
     PLACE "place" Place {
         /// `mine`, `category` or `shared`.
-        1 kind: Cow<'static, str>,
+        1 kind: Cow<'static, str> where "mine" | "category" | "shared",
         2 name: Option<String>,
         3 who: Option<[u8; 8]>,
         4 group: Option<[u8; 32]>,
@@ -1616,11 +1826,11 @@ typed!(
         8 online: bool,
         9 open_for_s: Option<u64>,
         /// `you` or `them`.
-        10 opened_by: Option<Cow<'static, str>>,
+        10 opened_by: Option<Cow<'static, str>> where "you" | "them",
         11 packets_dropped: Option<u64>,
         12 packets_lost: Option<u64>,
         /// `direct` or `relay`.
-        13 route: Option<Cow<'static, str>>,
+        13 route: Option<Cow<'static, str>> where "direct" | "relay",
         14 rtt_ms: Option<u64>,
         15 they_see_you_at: Option<String>,
         16 through: Option<String>,
@@ -1649,7 +1859,7 @@ typed!(
         5 log_bytes: u64,
         6 name: String,
         /// `on-demand`, `history`, `full` or `history-days`.
-        7 retention: Cow<'static, str>,
+        7 retention: Cow<'static, str> where "on-demand" | "history" | "full" | "history-days",
         8 space: [u8; 32],
     }
 );
@@ -1660,7 +1870,7 @@ typed!(
         /// The start of its id.
         2 id: [u8; 8],
         /// `account`, `files`, `other` or `arriving`.
-        3 kind: Cow<'static, str>,
+        3 kind: Cow<'static, str> where "account" | "files" | "other" | "arriving",
         4 set_aside: u64,
         5 valid: u64,
     }
@@ -1699,7 +1909,7 @@ typed!(
         1 dirty: bool,
         2 ino: u64,
         /// `dir`, `file`, `link` or `conflict`.
-        3 kind: Cow<'static, str>,
+        3 kind: Cow<'static, str> where "dir" | "file" | "link" | "conflict",
         4 local: bool,
         /// The start of its node's id.
         5 node: Option<[u8; 6]>,
@@ -1782,7 +1992,7 @@ typed!(
         6 len: Option<u64>,
         7 n: Option<u64>,
         8 shape: Option<Shape>,
-        9 t: Cow<'static, str>,
+        9 t: Cow<'static, str> where "int" | "bytes" | "text" | "list" | "record" | "secret" | "deep" | "cleared",
         10 v: Option<Scalar>,
         /// Of a secret: what it is.
         11 what: Option<String>,
@@ -1802,7 +2012,7 @@ typed!(
         1 here: Option<bool>,
         2 id: Option<[u8; 32]>,
         /// `blob reference` or `epoch key`.
-        3 is: Cow<'static, str>,
+        3 is: Cow<'static, str> where "blob reference" | "epoch key",
         4 levels: Option<u64>,
         5 size: Option<u64>,
     }
@@ -1868,6 +2078,17 @@ impl super::typed::Wire for EpochShown {
     fn take(v: cardinal_encoding::Value, at: &super::typed::At) -> Result<Self, String> {
         Ok(EpochShown {
             epoch: InspectEpoch::take(v, at)?,
+            pending: None,
+        })
+    }
+    #[inline]
+    fn read(
+        c: &mut cardinal_encoding::Cursor<'_>,
+        depth: usize,
+        at: &super::typed::At,
+    ) -> Result<Self, super::typed::Bad> {
+        Ok(EpochShown {
+            epoch: InspectEpoch::read(c, depth, at)?,
             pending: None,
         })
     }
@@ -2236,9 +2457,9 @@ typed!(fields PairStatusReply {
     4 error: Option<String>,
     5 files: Option<bool>,
     /// `idle`, `showing`, `joining`, `joined` or `failed`.
-    6 state: Cow<'static, str>,
+    6 state: Cow<'static, str> where "idle" | "showing" | "joining" | "joined" | "failed",
     /// `device` or `admin`.
-    7 power: Option<Cow<'static, str>>,
+    7 power: Option<Cow<'static, str>> where "device" | "admin",
 });
 asks!(PAIR_STATUS: 15 "pair-status" PairStatusArgs -> PairStatusReply, reads);
 
@@ -4048,7 +4269,7 @@ typed!(
     StoreReply {
         2 holds: DataHeld,
         3 refusal: Option<String>,
-        4 store: Cow<'static, str>,
+        4 store: Cow<'static, str> where "empty" | "current" | "other" | "unreadable",
         5 written_by: Option<Cow<'static, str>>,
     }
 );
@@ -4098,23 +4319,94 @@ typed!(
 /// [`ErrorMore`]'s fields, as the tables give them.
 pub static ERROR_FIELDS: &[Field] = <ErrorMore as Fields>::FIELDS;
 
-/// A message of a stream, typed: its row, `ROW`, for [`EVENTS`] or
-/// [`FRAMES`], from its typed fields.
+/// The messages of a stream, typed: each one's row, `ROW`, from its typed
+/// fields; the table of them all, `TABLE` ([`EVENTS`], [`FRAMES`]); and
+/// `Enum`, one of them read by its key 0, written once for every stream.
 macro_rules! streams {
-    ($row:ident: $n:literal $name:literal $fields:ident) => {
-        #[doc = concat!("The row of `", $name, "`, typed.")]
-        pub static $row: Request = Request {
-            n: $n,
-            name: $name,
-            args: <$fields as Fields>::FIELDS,
-            reply: &[],
-            page: Page::Whole,
-            gone: false,
-            stream: false,
-        };
+    (
+        $(#[$m:meta])*
+        $table:ident $enum:ident {
+            $($n:literal $name:literal $variant:ident($fields:ident) as $row:ident),* $(,)?
+        }
+    ) => {
+        $(
+            #[doc = concat!("The row of `", $name, "`, typed.")]
+            pub static $row: Request = Request {
+                n: $n,
+                name: $name,
+                args: <$fields as Fields>::FIELDS,
+                reply: &[],
+                page: Page::Whole,
+                gone: false,
+                stream: false,
+            };
 
-        impl super::typed::Streamed for $fields {
-            const KIND: &'static Request = &$row;
+            impl super::typed::Streamed for $fields {
+                const KIND: &'static Request = &$row;
+            }
+        )*
+
+        $(#[$m])*
+        pub static $table: &[Request] = &[$($row),*];
+
+        #[doc = concat!(
+            "A message of the stream [`", stringify!($table), "`] lists, typed by its key 0."
+        )]
+        #[derive(Clone, Debug, PartialEq)]
+        pub enum $enum {
+            $(
+                #[doc = concat!("`", $name, "`.")]
+                $variant($fields),
+            )*
+        }
+
+        impl $enum {
+            /// A message off the wire, read straight from its bytes as the
+            /// record its key 0 names; none, for one this build does not
+            /// know (a later service's), passed over. One that is not one
+            /// canonical record, has no number in key 0, or is not what
+            /// its number says is [`Unreadable`](super::typed::Unreadable),
+            /// in the words [`Self::read_tree`] says it in.
+            pub fn read(msg: &[u8]) -> Result<Option<Self>, super::typed::Unreadable> {
+                super::typed::read_message(msg, |w| {
+                    Ok(match super::typed::kind_of(w)? {
+                        $($n => Some($enum::$variant(<$fields as Fields>::read_fields(
+                            w,
+                            &super::typed::At::Top($name),
+                        )?)),)*
+                        _ => None,
+                    })
+                })
+                .map_err(super::typed::Unreadable)
+            }
+
+            /// The same, the way through the encoding's tree: what
+            /// [`Self::read`] is held to.
+            pub fn read_tree(msg: &[u8]) -> Result<Option<Self>, super::typed::Unreadable> {
+                let (n, r) = super::typed::stream_record(msg)?;
+                let at = |name| super::typed::At::Top(name);
+                Ok(match n {
+                    $($n => Some($enum::$variant(
+                        <$fields as Fields>::take_fields(r, &at($name))
+                            .map_err(super::typed::Unreadable)?,
+                    )),)*
+                    _ => None,
+                })
+            }
+
+            /// It as a message.
+            pub fn message(&self) -> Vec<u8> {
+                match self {
+                    $($enum::$variant(m) => super::typed::Streamed::message(m),)*
+                }
+            }
+
+            /// Its row.
+            pub fn kind(&self) -> &'static Request {
+                match self {
+                    $($enum::$variant(_) => &$row,)*
+                }
+            }
         }
     };
 }
@@ -4128,10 +4420,12 @@ typed!(
         1 seq: u64,
     }
 );
-streams!(EVENT_CHANGED: 1 "changed" Changed);
-
-/// The events of a `watch` connection: key 0 says which.
-pub static EVENTS: &[Request] = &[EVENT_CHANGED];
+streams! {
+    /// The events of a `watch` connection: key 0 says which.
+    EVENTS Event {
+        1 "changed" Changed(Changed) as EVENT_CHANGED,
+    }
+}
 
 // ---- The frames of `call-media` ----
 
@@ -4144,7 +4438,6 @@ typed!(
         3 from: Option<[u8; 8]>,
     }
 );
-streams!(FRAME_AUDIO: 1 "audio" AudioFrame);
 typed!(
     fields
     /// A frame of another format the call took.
@@ -4155,7 +4448,6 @@ typed!(
         4 size: Option<u64>,
     }
 );
-streams!(FRAME_OTHER: 2 "frame" OtherFrame);
 typed!(
     fields
     /// The shape of a window's viewport (`basics/video.md`): from the
@@ -4166,7 +4458,6 @@ typed!(
         3 from: Option<[u8; 8]>,
     }
 );
-streams!(FRAME_VIEWPORT: 3 "viewport" ViewportFrame);
 typed!(
     fields
     /// From the window, in a group: the level it asks of the sender `from`
@@ -4176,7 +4467,6 @@ typed!(
         3 from: Option<[u8; 8]>,
     }
 );
-streams!(FRAME_LEVEL: 4 "level" LevelFrame);
 typed!(
     fields
     /// To the window, in a group: whether small and large pictures of its
@@ -4186,7 +4476,6 @@ typed!(
         2 large: bool,
     }
 );
-streams!(FRAME_ASKED: 5 "asked" AskedFrame);
 typed!(
     fields
     /// A key picture of the size `size`: from the window, asked of the
@@ -4196,7 +4485,6 @@ typed!(
         4 size: u64,
     }
 );
-streams!(FRAME_KEY: 6 "key" KeyFrame);
 typed!(
     fields
     /// From the window: whether this person's camera is on
@@ -4205,17 +4493,18 @@ typed!(
         1 camera: bool,
     }
 );
-streams!(FRAME_CAMERA: 7 "camera" CameraFrame);
 
-/// The frames of a `call-media` connection, both ways: key 0 says which.
-/// `from` is the voice a frame of a group call is, from the service, or
-/// the sender a window's level or key picture is asked of.
-pub static FRAMES: &[Request] = &[
-    FRAME_AUDIO,
-    FRAME_OTHER,
-    FRAME_VIEWPORT,
-    FRAME_LEVEL,
-    FRAME_ASKED,
-    FRAME_KEY,
-    FRAME_CAMERA,
-];
+streams! {
+    /// The frames of a `call-media` connection, both ways: key 0 says which.
+    /// `from` is the voice a frame of a group call is, from the service, or
+    /// the sender a window's level or key picture is asked of.
+    FRAMES Frame {
+        1 "audio" Audio(AudioFrame) as FRAME_AUDIO,
+        2 "frame" Other(OtherFrame) as FRAME_OTHER,
+        3 "viewport" Viewport(ViewportFrame) as FRAME_VIEWPORT,
+        4 "level" Level(LevelFrame) as FRAME_LEVEL,
+        5 "asked" Asked(AskedFrame) as FRAME_ASKED,
+        6 "key" Key(KeyFrame) as FRAME_KEY,
+        7 "camera" Camera(CameraFrame) as FRAME_CAMERA,
+    }
+}

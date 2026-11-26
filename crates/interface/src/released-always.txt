@@ -1,0 +1,726 @@
+hello reply	2	api	uint
+hello reply	3	version	text
+status reply	2	bluetooth	*bluetooth*
+status reply	3	carrying_calls	uint
+status reply	4	conditions	*conditions*
+status reply	5	conflicts	uint
+status reply	7	devices	[*device*]
+status reply	8	files_ready	bool
+status reply	9	home	text
+status reply	13	inspection	*inspection*
+status reply	14	left_behind	[text]
+status reply	15	listen	text
+status reply	20	name	text
+status reply	21	network	*network*
+status reply	22	not_saved	uint
+status reply	23	not_saved_undone	uint
+status reply	24	old	*old versions*
+status reply	26	peers	[text]
+status reply	27	pending_changes	bool
+status reply	28	progress	*progress*
+status reply	29	read_markers	bool
+status reply	30	removed	bool
+status reply	31	retention	text
+status reply	32	router	*router*
+status reply	33	spaces	[*space*]
+status reply	34	uptime_s	uint
+status reply	35	more	bool
+status reply	37	redial	*redial*
+status reply	38	always_on	[text]
+conditions reply	2	helps	bool
+conditions reply	3	metered	bool
+network-changed reply	2	checking	uint
+setup-begin reply	2	ask	[uint]
+setup-begin reply	3	words	[text]
+setup-finish reply	2	device	text
+setup-finish reply	3	name	text
+me reply	2	name	text
+me reply	3	set	bool
+devices reply	2	devices	[*device*]
+devices reply	3	more	bool
+device-rename reply	2	key	bytes8
+device-rename reply	3	name	text
+remove-device reply	2	dropped	uint
+remove-device reply	3	name	text
+pair-show reply	2	addrs	[text]
+pair-show reply	3	code	text
+pair-status reply	6	state	text
+pair-type reply	2	name	text
+contacts reply	2	contacts	[*contact*]
+contacts reply	3	more	bool
+contact-status reply	2	devices	[*contact's device*]
+contact-status reply	3	direct_sessions	bool
+contact-status reply	4	identity	bytes8
+contact-status reply	6	introductions	bool
+contact-status reply	7	last_look	[*step*]
+contact-status reply	8	look_every_s	uint
+contact-status reply	9	looked_for	text
+contact-status reply	11	looking	bool
+contact-status reply	13	looks_without_session	uint
+contact-status reply	14	name	text
+contact-status reply	15	nearby	*nearby*
+contact-status reply	16	nearby_tries	[*step*]
+contact-status reply	17	own	bool
+contact-status reply	18	refused	bool
+contact-status reply	19	router	*router*
+contact-status reply	20	sessions	[*step*]
+contact-status reply	22	their_reach	[*reach seen*]
+contact-status reply	23	trusted	bool
+contact-status reply	24	your_reach	[*reach seen*]
+contact-status reply	25	more	bool
+conversations reply	2	conversations	[*conversation*]
+conversations reply	3	more	bool
+messages reply	3	messages	[*message*]
+messages reply	5	more	bool
+save-attachment reply	2	path	text
+save-attachment reply	3	size	uint
+mark-read reply	2	kept	bool
+mark-read reply	3	marked	bool
+read-markers reply	2	on	bool
+invite reply	2	code	text
+accept reply	2	name	text
+invitations reply	2	invitations	[*invitation*]
+invitations reply	3	more	bool
+introductions reply	2	introductions	[*introduction*]
+introductions reply	3	more	bool
+groups reply	2	groups	[*group*]
+groups reply	3	offers	[*offer*]
+groups reply	4	more	bool
+group-create reply	2	group	bytes32
+group-create reply	3	name	text
+group-leave reply	2	admins	[text]
+group-remove reply	2	group	bytes32
+group-remove reply	3	left_out	[bytes32]
+group-remove reply	4	was	bytes32
+group-members reply	2	group	bytes32
+group-members reply	3	members	[*member*]
+group-members reply	4	name	text
+group-members reply	5	more	bool
+group-role reply	2	group	bytes32
+group-post-again reply	2	posted	uint
+group-confirm-move reply	2	kept	uint
+group-leaving reply	2	admins	[text]
+group-leaving reply	3	choose_admin	bool
+group-leaving reply	4	group	bytes32
+group-leaving reply	5	name	text
+group-leaving reply	6	relayed_for	[*relayed for*]
+group-rejoin reply	2	group	bytes32
+group-rejoin reply	3	name	text
+clip-copy reply	2	devices	uint
+files reply	2	files	[*file*]
+files reply	3	path	text
+files reply	4	place	*place*
+files reply	5	more	bool
+mkdir reply	2	path	text
+move reply	2	path	text
+remove reply	2	path	text
+copy reply	2	path	text
+put reply	2	path	text
+save reply	2	path	text
+save reply	3	size	uint
+write reply	2	path	text
+share reply	2	message	bool
+share reply	3	path	text
+mount reply	2	path	text
+flush reply	2	entries	uint
+conflicts reply	2	conflicts	[*conflict*]
+conflicts reply	3	more	bool
+history reply	2	path	text
+history reply	3	versions	[*version*]
+history reply	4	more	bool
+restore reply	2	path	text
+restore reply	3	version	uint
+pin reply	2	on_demand	bool
+pin reply	3	path	text
+unpin reply	2	on_demand	bool
+unpin reply	3	path	text
+retention reply	2	retention	text
+keep-old reply	2	keep	text
+free-space reply	2	bytes	uint
+free-space reply	5	objects	uint
+space-usage reply	2	spaces	[*space usage*]
+space-usage reply	3	more	bool
+history-empty reply	2	bytes	uint
+history-empty reply	3	left	uint
+history-empty reply	4	objects	uint
+guardians reply	2	asked	[text]
+guardians reply	3	changes	[*guardian change*]
+guardians reply	4	copy_full	[text]
+guardians reply	5	data	bool
+guardians reply	6	delay	uint
+guardians reply	7	delay_text	text
+guardians reply	8	frozen	bool
+guardians reply	9	guardians	uint
+guardians reply	10	names	[text]
+guardians reply	11	ready	[text]
+guardians reply	12	recoveries	[*recovery*]
+guardians reply	13	threshold	uint
+guardians-set reply	2	delay	uint
+guardians-set reply	3	delay_text	text
+guardians-set reply	4	names	[text]
+guardians-set reply	5	pending	bool
+guardians-set reply	6	threshold	uint
+guardians-ask reply	2	name	text
+guarding reply	2	accepted	[text]
+guarding reply	3	asked	[text]
+guarding reply	4	guarding	[*guarded*]
+guarding reply	5	named_in_change	[text]
+guarding reply	6	now_ms	uint
+guarding reply	7	no_longer_needed	[*no longer needed*]
+guarding-invite reply	2	code	text
+guarding-invite reply	3	name	text
+guarding-accept reply	2	already	bool
+guarding-accept reply	3	name	text
+guarding-accept reply	4	persona	bytes32
+guarding-confirm-change reply	2	accepted	[text]
+guarding-confirm-change reply	3	asked	[text]
+guarding-confirm-change reply	4	guarding	[*guarded*]
+guarding-confirm-change reply	5	named_in_change	[text]
+guarding-confirm-change reply	6	now_ms	uint
+guarding-confirm-change reply	7	no_longer_needed	[*no longer needed*]
+guarding-never reply	2	accepted	[text]
+guarding-never reply	3	asked	[text]
+guarding-never reply	4	guarding	[*guarded*]
+guarding-never reply	5	named_in_change	[text]
+guarding-never reply	6	now_ms	uint
+guarding-never reply	7	no_longer_needed	[*no longer needed*]
+guarding-caution reply	2	caution	text
+guarding-caution reply	3	name	text
+guarding-endorse reply	2	accepted	[text]
+guarding-endorse reply	3	asked	[text]
+guarding-endorse reply	4	guarding	[*guarded*]
+guarding-endorse reply	5	named_in_change	[text]
+guarding-endorse reply	6	now_ms	uint
+guarding-endorse reply	7	no_longer_needed	[*no longer needed*]
+guarding-confirm reply	2	accepted	[text]
+guarding-confirm reply	3	asked	[text]
+guarding-confirm reply	4	guarding	[*guarded*]
+guarding-confirm reply	5	named_in_change	[text]
+guarding-confirm reply	6	now_ms	uint
+guarding-confirm reply	7	no_longer_needed	[*no longer needed*]
+recover reply	17	under_way	bool
+recover-start reply	2	fingerprint	text
+recover-invite reply	2	code	text
+recover-invite reply	3	fingerprint	text
+recover-lost-at reply	2	lost_devices	[*lost device*]
+recover-finish reply	2	account	bool
+recover-finish reply	3	lost_devices	[*lost device*]
+recover-finish reply	4	pair_again	[*pair again*]
+recover-finish reply	5	words	text
+keep-work reply	2	kept	uint
+keep-work reply	3	set_aside	[*set aside*]
+recovery-sheet reply	2	hosts	[*host*]
+restore-from-host reply	2	at	text
+recover-undo reply	2	group	bytes32
+recover-undo reply	3	kept_changes	[*kept change*]
+recover-kept-seen reply	2	kept_changes	[*kept change*]
+router reply	3	everywhere	bool
+router reply	5	named	[text]
+router reply	6	network	*network*
+router reply	7	on	bool
+router reply	10	this_device	bool
+bluetooth reply	3	channels_in	uint
+bluetooth reply	5	mode	text
+bluetooth reply	6	on	bool
+bluetooth reply	9	recognized	uint
+bluetooth reply	10	seen	uint
+bluetooth reply	12	windows	uint
+network reply	3	ask	bool
+network reply	4	known	bool
+network reply	5	mine	bool
+network reply	8	routers	bool
+host reply	2	hosts	[*host*]
+host reply	3	warnings	[text]
+host-off reply	2	hosts	[*host*]
+peer-add reply	2	addr	text
+peer-list reply	2	peers	[*peer*]
+peer-list reply	3	more	bool
+host-offer reply	2	devices	[text]
+host-offer reply	3	sees	text
+host-offer reply	4	on	[*hostable*]
+host-accept reply	2	sees	text
+host-end reply	2	ended	bool
+hosting reply	2	can	[text]
+hosting reply	3	hosting	[*hosting*]
+hosting reply	5	devices	[*hostable*]
+inspect-on reply	2	token	bytes32
+inspect-on reply	3	until	uint
+inspect-off reply	2	was_on	bool
+inspect reply	2	device	*this device*
+inspect reply	4	others	[*other log*]
+inspect reply	5	spaces	[*space held*]
+inspect reply	6	store	*store*
+inspect reply	7	version	text
+inspect reply	8	more	bool
+inspect-identity reply	7	more	bool
+inspect-space reply	2	account	bool
+inspect-space reply	3	bytes	uint
+inspect-space reply	10	files	bool
+inspect-space reply	12	id	bytes32
+inspect-space reply	18	opened	bool
+inspect-space reply	20	pending	uint
+inspect-space reply	26	sealed	uint
+inspect-space reply	31	more	bool
+inspect-entries reply	2	entries	[*entry*]
+inspect-entries reply	5	total	uint
+inspect-entries reply	6	more	bool
+inspect-entry reply	14	more	bool
+inspect-nodes reply	2	nodes	[*node*]
+inspect-nodes reply	4	total	uint
+inspect-nodes reply	5	more	bool
+inspect-node reply	19	more	bool
+debug-tree reply	4	heads	bytes16
+debug-tree reply	6	mounted	bool
+debug-tree reply	12	more	bool
+speedtest reply	2	device	text
+speedtest reply	3	ms	uint
+speedtest reply	4	receive	uint
+speedtest reply	5	received_bytes	uint
+speedtest reply	6	rtt_median_us	uint
+speedtest reply	7	rtt_min_us	uint
+speedtest reply	8	send	uint
+speedtest reply	9	sent_bytes	uint
+app-questions reply	2	questions	[*app question*]
+app-questions reply	3	more	bool
+approvals reply	2	approvals	[*approval*]
+approvals reply	3	more	bool
+app-offers reply	2	offers	[*app offer*]
+app-offers reply	3	more	bool
+app-join reply	2	space	bytes32
+app-join reply	3	name	text
+wake reply	2	checking	uint
+deleted reply	2	files	[*deleted file*]
+deleted reply	3	path	text
+deleted reply	4	more	bool
+undelete reply	2	id	bytes16
+undelete reply	3	path	text
+--store reply	2	holds	*data held*
+--store reply	4	store	text
+*app offer*	2	from	text
+*app offer*	3	name	text
+*app offer*	5	space	bytes32
+*app question*	1	asks	text
+*app question*	2	id	uint
+*app question*	3	name	text
+*app question*	4	program	text
+*app question*	6	what	text
+*approval*	1	change	bool
+*approval*	2	covers	text
+*approval*	4	family	bytes32
+*approval*	5	id	bytes16
+*approval*	6	name	text
+*approval*	7	program	text
+*approval*	8	revoked	bool
+*approval*	9	this_device	bool
+*attached log*	1	bytes	uint
+*attached log*	2	entries	uint
+*attached log*	3	id	bytes32
+*attachment*	1	name	text
+*attachment*	3	type	text
+*bluetooth*	2	channels_in	uint
+*bluetooth*	4	mode	text
+*bluetooth*	5	on	bool
+*bluetooth*	8	recognized	uint
+*bluetooth*	9	seen	uint
+*bluetooth*	11	windows	uint
+*call*	3	id	bytes16
+*call*	5	name	text
+*call*	10	state	text
+*call*	12	who	bytes8
+*call ended*	2	how	text
+*call ended*	3	id	bytes16
+*call ended*	4	name	text
+*call ended*	5	who	bytes8
+*conditions*	1	helps	bool
+*conditions*	2	metered	bool
+*conflict*	1	copies	[text]
+*conflict*	2	delete_conflict	bool
+*conflict*	3	path	text
+*conflict*	4	versions	[*version*]
+*contact*	1	category	text
+*contact*	2	connected	bool
+*contact*	3	identity	bytes8
+*contact*	4	introductions	bool
+*contact*	6	name	text
+*contact*	7	nearby	bool
+*contact*	8	own	bool
+*contact*	11	refused	bool
+*contact*	12	relayed	bool
+*contact*	14	trusted	bool
+*contact reach*	1	named	[text]
+*contact reach*	2	said_no	bool
+*contact reach*	3	shared	bool
+*contact reach*	4	waiting	bool
+*contact's device*	6	kept_in_touch	bool
+*contact's device*	7	key	bytes8
+*contact's device*	8	online	bool
+*contact's device*	20	neighbour	bool
+*conversation*	1	connected	bool
+*conversation*	2	id	bytes8
+*conversation*	3	introductions	bool
+*conversation*	5	name	text
+*conversation*	6	nearby	bool
+*conversation*	7	own	bool
+*conversation*	9	reach	*contact reach*
+*conversation*	10	relayed	bool
+*conversation*	12	trusted	bool
+*conversation*	13	unread	uint
+*copies*	1	blobs	uint
+*copies*	2	count	uint
+*copies*	3	eligible	uint
+*copies*	4	holders	[*holder*]
+*copies*	5	interval_ms	uint
+*copies*	6	now	uint
+*copies*	7	older_than_ms	uint
+*data held*	1	bytes	uint
+*data held*	2	identity	bool
+*data held*	3	local	uint
+*data held*	4	local_bytes	uint
+*data held*	5	objects	uint
+*data held*	6	other	bool
+*data held*	7	spaces	uint
+*data held*	8	unsaved	uint
+*data held*	9	unsaved_bytes	uint
+*deleted file*	2	folder	bool
+*deleted file*	3	id	bytes16
+*deleted file*	5	name	text
+*device*	4	key	bytes8
+*device*	5	name	text
+*device*	6	online	bool
+*device*	7	power	text
+*device*	8	this	bool
+*encryption key*	1	entry	bytes32
+*encryption key*	2	len	uint
+*encryption key*	3	x25519	bytes32
+*endpoint*	1	endpoint	text
+*endpoint*	2	local	bool
+*endpoint*	3	tried	bool
+*entry*	17	weigh	*weight*
+*epoch*	1	entries	uint
+*epoch*	2	held	bool
+*epoch*	3	id	bytes16
+*fetch*	1	latency_ms	uint
+*fetch*	2	rate	uint
+*fetch*	3	received	uint
+*fetch*	4	replies	uint
+*file*	3	folder	bool
+*file*	5	name	text
+*frames*	1	in	uint
+*frames*	2	new	uint
+*group*	1	admin	bool
+*group*	2	did_not_stand	[bytes32]
+*group*	3	did_not_stand_changes	[*group change*]
+*group*	5	group	bytes32
+*group*	6	held_back	uint
+*group*	7	introductions	bool
+*group*	9	members	uint
+*group*	11	name	text
+*group*	12	not_posted	uint
+*group*	13	public	bool
+*group*	14	reach	*group reach*
+*group*	16	unread	uint
+*group change*	4	roles	[*role change*]
+*group change*	6	taken_out	[text]
+*group reach*	1	added	[text]
+*group reach*	2	ask	bool
+*group reach*	3	public	bool
+*group reach*	4	said_no	bool
+*group reach*	5	set	bool
+*group reach*	6	shared	bool
+*group reach*	7	waiting	bool
+*group reach*	8	what	[text]
+*group reach*	9	who	[text]
+*group shown*	1	group	bytes32
+*group shown*	2	name	text
+*group shown*	3	what	[text]
+*guarded*	1	account_copy	bool
+*guarded*	2	changes	[*guardian change*]
+*guarded*	3	delay	uint
+*guarded*	4	delay_text	text
+*guarded*	5	guardians	uint
+*guarded*	6	helpers	uint
+*guarded*	7	id	bytes32
+*guarded*	8	name	text
+*guarded*	9	never	[text]
+*guarded*	10	persona	bytes32
+*guarded*	12	recoveries	[*recovery*]
+*guarded*	13	threshold	uint
+*guarded*	14	waiting	uint
+*guardian change*	2	confirm_delay	uint
+*guardian change*	3	confirm_delay_text	text
+*guardian change*	5	confirmed	uint
+*guardian change*	7	delay	uint
+*guardian change*	8	delay_text	text
+*guardian change*	9	fingerprint	text
+*guardian change*	10	guardians	uint
+*guardian change*	11	id	bytes
+*guardian change*	16	objected	bool
+*guardian change*	17	threshold	uint
+*holder*	1	checking	bool
+*holder*	2	counted	bool
+*holder*	3	key	bytes8
+*holder*	7	missed	uint
+*holder*	8	name	text
+*holder*	9	online	bool
+*holder*	11	state	text
+*holder*	12	this	bool
+*host*	1	addresses	[text]
+*host*	3	name	text
+*host*	4	key	bytes32
+*hostable*	1	name	text
+*hostable*	2	outside	bool
+*hostable*	3	sees	text
+*hostable*	4	services	[text]
+*hosting*	1	accepted	bool
+*hosting*	2	devices	[text]
+*hosting*	3	ended	bool
+*hosting*	5	mine	bool
+*hosting*	6	name	text
+*hosting*	8	sees	text
+*hosting*	10	who	bytes32
+*hosting*	11	serving	[*hostable*]
+*hosting*	17	declined	bool
+*identity*	1	bytes	uint
+*identity*	2	contested	bool
+*identity*	4	encryption_keys_held	uint
+*identity*	5	entries	uint
+*identity*	6	frozen	bool
+*identity*	7	heads	[bytes32]
+*identity*	8	id	bytes32
+*identity*	9	keys	[*key*]
+*identity*	10	recovery_policies	uint
+*identity*	11	removed	[bytes32]
+*identity entry*	1	body	uint
+*identity entry*	2	bytes	uint
+*identity entry*	3	header	*value*
+*identity entry*	4	id	bytes32
+*identity entry*	5	in_effect	bool
+*identity entry*	6	ops	[*op*]
+*identity entry*	7	parents	[bytes32]
+*identity entry*	8	signatures	uint
+*identity entry*	9	signer	bytes32
+*identity entry*	11	valid	bool
+*inspection*	1	on	bool
+*introduction*	1	from	text
+*introduction*	3	id	bytes16
+*introduction*	4	kind	text
+*introduction*	5	name	text
+*invitation*	1	cancelled	bool
+*invitation*	2	expired	bool
+*invitation*	3	hosts_only	bool
+*invitation*	4	id	bytes16
+*invitation*	7	outstanding	bool
+*invitation*	8	used	uint
+*invitation*	9	uses	uint
+*kept change*	2	by	text
+*kept change*	3	can_undo	bool
+*kept change*	5	group	bytes32
+*kept change*	7	name	text
+*kept change*	8	roles	[*role change*]
+*kept change*	9	taken_out	[text]
+*kept change*	10	to	bytes32
+*kept change*	11	undo	text
+*key*	1	added_in	bytes32
+*key*	2	key	bytes32
+*key*	5	power	text
+*key*	7	this_device	bool
+*kind count*	1	bytes	uint
+*kind count*	2	conflicts	uint
+*kind count*	3	deleted	uint
+*kind count*	4	kind	kind
+*kind count*	5	nodes	uint
+*known path*	1	addr	text
+*known path*	2	checking	bool
+*known path*	4	misses	uint
+*known path*	5	next_check_s	uint
+*known path*	6	probes	uint
+*known path*	7	wait_s	uint
+*last message*	2	mine	bool
+*last message*	3	text	text
+*link key*	1	len	uint
+*link key*	2	x25519	bytes32
+*lost device*	1	key	bytes8
+*member*	1	contact	bool
+*member*	2	id	bytes8
+*member*	3	introduce	bool
+*member*	4	left	bool
+*member*	5	name	text
+*member*	8	role	text
+*member*	12	you	bool
+*message*	1	attachments	[*attachment*]
+*message*	2	edited	bool
+*message*	4	id	bytes16
+*message*	5	mine	bool
+*message*	7	reactions	[*reaction*]
+*message*	11	text	text
+*met*	3	how	text
+*nearby*	1	they_give_secret	bool
+*nearby*	2	you_give_secret	bool
+*network*	2	ask	bool
+*network*	3	known	bool
+*network*	4	mine	bool
+*network*	7	routers	bool
+*no longer needed*	1	at_ms	uint
+*no longer needed*	2	id	bytes32
+*no longer needed*	3	name	text
+*no longer needed*	4	text	text
+*node*	1	bytes	uint
+*node*	2	children	uint
+*node*	4	created_in	bytes32
+*node*	5	creator	bytes32
+*node*	6	delete_conflict	bool
+*node*	7	deleted	bool
+*node*	8	fields	[[uint]]
+*node*	9	id	bytes16
+*node*	10	kind	kind
+*node*	11	name	text
+*node*	12	parent	bytes16
+*node field*	1	conflict	bool
+*node field*	2	k	uint
+*node field*	3	values	[*node value*]
+*node history*	1	accepted	bool
+*node history*	2	author	bytes32
+*node history*	3	bytes	uint
+*node history*	4	entry	bytes32
+*node history*	5	index	uint
+*node history*	8	valid	bool
+*node value*	1	entry	bytes32
+*node value*	2	op	uint
+*node value*	3	v	*value*
+*offer*	1	from	text
+*offer*	2	group	bytes32
+*offer*	3	members	uint
+*offer*	4	name	text
+*offer*	5	public	bool
+*offer*	6	reach	*group reach*
+*old versions*	3	keep	text
+*only here*	1	bytes	uint
+*only here*	2	files	uint
+*op*	1	bytes	uint
+*op*	5	op	*value*
+*other log*	1	bytes	uint
+*other log*	2	entries	uint
+*other log*	3	id	bytes32
+*pair again*	1	key	bytes8
+*pairing*	4	state	text
+*peer*	1	addr	text
+*place*	1	kind	text
+*policy*	1	history_shared	bool
+*policy*	2	public	bool
+*policy*	3	rotate_after	uint
+*progress*	1	bytes_fetched	uint
+*progress*	2	bytes_pending	uint
+*progress*	3	bytes_wanted	uint
+*progress*	4	files_pending	uint
+*progress*	6	rate	uint
+*reach node*	1	bytes	uint
+*reach node*	2	fields	[*node field*]
+*reach node*	3	id	bytes16
+*reach seen*	2	endpoints	[*endpoint*]
+*reach seen*	3	host	bytes8
+*reach seen*	4	session	bool
+*reach seen*	5	this_device	bool
+*reaction*	1	count	uint
+*reaction*	2	mine	bool
+*reaction*	3	text	text
+*recovery*	3	confirmed	uint
+*recovery*	5	endorsed	uint
+*recovery*	7	fingerprint	text
+*recovery*	9	in_effect	bool
+*recovery*	11	objected	bool
+*redial*	1	alone	bool
+*redial*	2	helps	bool
+*rejoin*	1	group	bytes32
+*rejoin*	2	members	uint
+*rejoin*	3	name	text
+*relayed for*	1	a	text
+*relayed for*	2	a_id	bytes8
+*relayed for*	3	b	text
+*relayed for*	4	b_id	bytes8
+*role change*	1	from	text
+*role change*	2	name	text
+*role change*	3	to	text
+*root*	1	children	uint
+*root*	2	id	bytes16
+*router*	2	everywhere	bool
+*router*	4	named	[text]
+*router*	5	network	*network*
+*router*	6	on	bool
+*router*	9	this_device	bool
+*set aside*	1	entry	bytes8
+*set aside*	2	space	bytes8
+*shape*	3	is	text
+*signature*	1	key	bytes32
+*signature*	3	signature	bytes
+*space*	1	entries	uint
+*space*	2	id	bytes8
+*space*	3	kind	text
+*space*	4	set_aside	uint
+*space*	5	valid	uint
+*space held*	1	account	bool
+*space held*	2	bytes	uint
+*space held*	5	files	bool
+*space held*	6	id	bytes32
+*space held*	11	opened	bool
+*space held*	12	pending	uint
+*space held*	14	sealed	uint
+*space member*	2	identity	bytes32
+*space member*	3	left	bool
+*space member*	4	log_held	bool
+*space member*	6	reach_node	bytes16
+*space member*	7	role	uint
+*space usage*	1	full	bool
+*space usage*	2	history_bytes	uint
+*space usage*	4	live_bytes	uint
+*space usage*	5	log_bytes	uint
+*space usage*	6	name	text
+*space usage*	7	retention	text
+*space usage*	8	space	bytes32
+*sparing*	1	next_s	uint
+*sparing*	2	wait_s	uint
+*started by*	1	author	bytes32
+*started by*	2	entry	bytes32
+*stats*	1	appended	uint
+*stats*	2	recomputed	uint
+*step*	1	at	uint
+*step*	3	text	text
+*store*	1	bytes	uint
+*store*	2	objects	uint
+*stuck item*	1	dirty	text
+*stuck item*	2	kind	text
+*stuck item*	3	opens	uint
+*stuck item*	4	path	text
+*stuck item*	5	staged	bool
+*succession*	1	id	text
+*succession*	2	space	text
+*this device*	1	key	bytes32
+*this device*	2	link_x25519	bytes32
+*tree item*	1	dirty	bool
+*tree item*	2	ino	uint
+*tree item*	3	kind	text
+*tree item*	4	local	bool
+*tree item*	6	path	text
+*tree item*	7	size	uint
+*unreadable*	1	reason	text
+*unreadable*	2	retry_in_s	uint
+*unreadable*	3	says	text
+*unreadable*	4	since	uint
+*unreadable*	5	theirs	bool
+*unshown node*	1	name	text
+*unshown node*	2	node	bytes6
+*value*	9	t	text
+*value field*	1	k	uint
+*value field*	2	v	*value*
+*version*	2	device	text
+*voice*	1	contact	bool
+*voice*	2	identity	bytes8
+*voice*	3	name	text
+*voice*	5	voice	bytes8
+*voice*	6	you	bool
+*voice*	7	camera	bool
+*weighed op*	1	bytes	uint
+*weight*	1	aead	uint
+*weight*	2	ciphertext	uint
+*weight*	4	header	uint
+*weight*	6	sealed	uint
+*weight*	8	wraps	uint

@@ -166,7 +166,10 @@ pub fn report(paths: &Paths) -> Vec<u8> {
         local_bytes: found.local.1,
         other: found.other,
     };
-    let mut out = crate::api::StoreReply::new(holds, "current".into());
+    let mut out = cardinal_interface::new!(crate::api::StoreReply {
+        holds,
+        store: "current".into()
+    });
     match of(paths) {
         Store::Current => {}
         Store::Empty => out.store = "empty".into(),

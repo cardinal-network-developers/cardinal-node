@@ -1,7 +1,13 @@
 //! What answering the local interface costs, for answers that grow with
 //! what the person holds: a folder of 5,000 entries (`files`), a full page
 //! of a group's conversation (`messages`), and one small request asked
-//! often (`call`, with no call under way).
+//! often (`call`, with no call under way); and what a client's reading of
+//! a call's frames costs (`call-media`: sound, a picture, a viewport).
+//!
+//! Requests, replies and frames are read straight from their bytes, as the
+//! service and a client now read them, and beside it the way through the
+//! encoding's tree (the message decoded whole into its `Record`, then each
+//! field taken from it), as they were read before.
 //!
 //! For each: the time in the service from the handler's answer to the
 //! reply's bytes, and from a request's bytes to its arguments; what that
@@ -235,13 +241,15 @@ fn over_socket(
 }
 
 /// One request's steps on one way: from its bytes to its arguments, the
-/// handler, the reply's bytes, and the client's reading.
+/// handler, the reply's bytes, and the client's reading; and, typed, the
+/// two readings the way through the tree.
 struct Steps {
     decode: Cost,
     handler: Cost,
     encode: Cost,
     read: Cost,
     reply: Vec<u8>,
+    tree: Option<(Cost, Cost)>,
 }
 
 fn less(a: Cost, b: Cost) -> Cost {
@@ -276,6 +284,7 @@ fn by_name(
         encode,
         read,
         reply,
+        tree: None,
     }
 }
 
@@ -290,11 +299,18 @@ fn typed<A: Ask + Clone>(
 where
     A::Answered: Clone,
 {
+    // as the service reads it: its number, then its arguments, straight
+    // from the bytes
     let args = || {
-        let (_, r) = api::decode_record(msg).unwrap();
-        A::from_request(r).unwrap()
+        let spec = api::request_of(msg).unwrap();
+        assert_eq!(spec.n, A::REQUEST.n);
+        A::read_request(msg).unwrap()
     };
     let decode = measure(args);
+    let decode_tree = measure(|| {
+        let (_, r) = api::decode_record(msg).unwrap();
+        A::from_request(r).unwrap()
+    });
     let a = args();
     let handler = rt.block_on(async { measure(|| answer(d, &a).unwrap()) });
     let value = rt.block_on(async { answer(d, &a).unwrap() });
@@ -304,12 +320,14 @@ where
     );
     let reply = a.reply_bytes(value.clone());
     let read = measure(|| api::typed::read_reply::<A>(&reply).unwrap().unwrap());
+    let read_tree = measure(|| api::typed::read_reply_tree::<A>(&reply).unwrap().unwrap());
     Steps {
         decode,
         handler,
         encode,
         read,
         reply,
+        tree: Some((decode_tree, read_tree)),
     }
 }
 
@@ -327,6 +345,50 @@ fn show_steps(way: &str, s: &Steps) {
         },
     );
     show("client: reply bytes -> what it reads", s.read);
+    if let Some((decode, read)) = s.tree {
+        show("request bytes -> arguments, through the tree", decode);
+        show("client: reply -> what it reads, through tree", read);
+    }
+}
+
+/// A client reading a call's frames: each frame's bytes to its typed
+/// record, straight from the bytes and through the tree.
+fn frames() {
+    use api::{AudioFrame, Frame, OtherFrame, ViewportFrame};
+    // a voice's 20 ms of sound, a picture of a video call, the window's shape
+    let audio = AudioFrame {
+        from: Some([3; 8]),
+        ..api::new!(AudioFrame {
+            audio: api::Bytes::from(vec![7u8; 120])
+        })
+    };
+    let picture = OtherFrame {
+        from: Some([3; 8]),
+        size: Some(1),
+        ..api::new!(OtherFrame {
+            frame: api::Bytes::from(vec![9u8; 24_000]),
+            format: [5; 32]
+        })
+    };
+    let viewport = api::new!(ViewportFrame {
+        width: 1280,
+        height: 720
+    });
+    let cases = [
+        ("audio", Frame::Audio(audio)),
+        ("picture", Frame::Other(picture)),
+        ("viewport", Frame::Viewport(viewport)),
+    ];
+    println!("call-media frames, read by a client:");
+    for (name, f) in cases {
+        let msg = f.message();
+        let direct = measure(|| Frame::read(&msg).unwrap().unwrap());
+        let tree = measure(|| Frame::read_tree(&msg).unwrap().unwrap());
+        assert_eq!(Frame::read(&msg).unwrap(), Some(f));
+        println!(" {name} ({} bytes):", msg.len());
+        show("straight from the bytes", direct);
+        show("through the tree", tree);
+    }
 }
 
 fn main() {
@@ -343,6 +405,7 @@ fn main() {
     };
     let socket = d.paths.socket.clone();
     println!("rounds: {} (median shown)", rounds());
+    frames();
 
     let asks = [
         ("files", json!({"cmd": "files", "path": "Big"})),

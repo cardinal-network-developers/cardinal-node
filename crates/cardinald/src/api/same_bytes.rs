@@ -1276,7 +1276,9 @@ fn a_uint_too_large_is_the_error_it_was() {
         let reply = FilesReply {
             files: sizes.iter().map(|s| file(*s)).collect(),
             path: "p".into(),
-            place: Place::new("mine".into()),
+            place: cardinal_interface::new!(Place {
+                kind: "mine".into()
+            }),
             more: false,
             next: None,
         };
@@ -4019,7 +4021,11 @@ fn a_reply_cut_by_its_handler_pages_as_it_did() {
             limit,
         };
         let new = args.reply_bytes(typed::Precut {
-            reply: InspectNodesReply::new(nodes, total as u64, false),
+            reply: cardinal_interface::new!(InspectNodesReply {
+                nodes,
+                total: total as u64,
+                more: false
+            }),
             from,
             total: total as u64,
         });
@@ -4042,7 +4048,15 @@ fn a_reply_cut_by_its_handler_pages_as_it_did() {
 fn an_item_too_large_among_several_lists_is_named_by_its_id() {
     let big = "z".repeat(300_000);
     let space = |n: u8, label: &str| {
-        let mut s = InspectSpace::new(false, 1, false, [n; 32], true, 0, 2);
+        let mut s = cardinal_interface::new!(InspectSpace {
+            account: false,
+            bytes: 1,
+            files: false,
+            id: [n; 32],
+            opened: true,
+            pending: 0,
+            sealed: 2
+        });
         s.label = Some(label.to_owned());
         s
     };
@@ -4076,21 +4090,21 @@ fn an_item_too_large_among_several_lists_is_named_by_its_id() {
                 "version": "x",
             });
             let old = paged_by_name(spec, &req, tree);
-            let reply = InspectReply::new(
-                InspectDevice {
+            let reply = cardinal_interface::new!(InspectReply {
+                device: InspectDevice {
                     key: [9; 32],
                     link_x25519: [8; 32],
                     name: None,
                 },
-                others.clone(),
-                spaces.clone(),
-                StoreShown {
+                others: others.clone(),
+                spaces: spaces.clone(),
+                store: StoreShown {
                     bytes: 1,
                     objects: 2,
                 },
-                "x".into(),
-                false,
-            );
+                version: "x".into(),
+                more: false
+            });
             let args = InspectArgs {
                 token: None,
                 after,
@@ -4112,7 +4126,7 @@ fn an_item_too_large_among_several_lists_is_named_by_its_id() {
         time: None,
         valid: true,
     };
-    let mut reply = InspectNodeReply::new(false);
+    let mut reply = cardinal_interface::new!(InspectNodeReply { more: false });
     reply.history = Some(vec![hist(1)]);
     reply.name = Some(big.clone());
     reply.values = Some(vec![]);
@@ -4132,7 +4146,11 @@ fn an_item_too_large_among_several_lists_is_named_by_its_id() {
 fn an_epoch_with_entries_waiting_is_the_mistake_it_was() {
     let spec = InspectSpaceArgs::REQUEST;
     let epoch = |n: u8, pending: Option<u64>| EpochShown {
-        epoch: InspectEpoch::new(3, true, [n; 16]),
+        epoch: cardinal_interface::new!(InspectEpoch {
+            entries: 3,
+            held: true,
+            id: [n; 16]
+        }),
         pending,
     };
     let tree_epoch = |e: &EpochShown| {
@@ -4157,7 +4175,16 @@ fn an_epoch_with_entries_waiting_is_the_mistake_it_was() {
                 "epochs": epochs.iter().map(tree_epoch).collect::<Vec<_>>(),
                 "heads": [hex::encode([5u8; 32])]});
             let old = paged_by_name(spec, &req, tree);
-            let mut reply = InspectSpaceReply::new(false, 1, false, [7; 32], true, 1, 2, false);
+            let mut reply = cardinal_interface::new!(InspectSpaceReply {
+                account: false,
+                bytes: 1,
+                files: false,
+                id: [7; 32],
+                opened: true,
+                pending: 1,
+                sealed: 2,
+                more: false
+            });
             reply.epochs = Some(epochs.clone());
             reply.heads = Some(vec![[5; 32]]);
             let args = InspectSpaceArgs {

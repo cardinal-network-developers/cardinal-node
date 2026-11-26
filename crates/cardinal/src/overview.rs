@@ -323,52 +323,57 @@ mod tests {
     }
 
     fn conversation(name: &str, unread: u64, last: Option<api::Last>) -> api::Conversation {
-        let reach = api::ContactReach::new(Vec::new(), false, false, false);
+        let reach = cardinal_interface::new!(api::ContactReach {
+            named: Vec::new(),
+            said_no: false,
+            shared: false,
+            waiting: false
+        });
         api::Conversation {
             last,
-            ..api::Conversation::new(
-                false,
-                [0; 8],
-                true,
-                name.to_owned(),
-                false,
-                true,
+            ..cardinal_interface::new!(api::Conversation {
+                connected: false,
+                id: [0; 8],
+                introductions: true,
+                name: name.to_owned(),
+                nearby: false,
+                own: true,
                 reach,
-                false,
-                true,
-                unread,
-            )
+                relayed: false,
+                trusted: true,
+                unread
+            })
         }
     }
 
     fn group(name: &str, members: u64, unread: u64, last: Option<api::Last>) -> api::Group {
-        let reach = api::GroupReach::new(
-            Vec::new(),
-            false,
-            false,
-            false,
-            false,
-            false,
-            false,
-            Vec::new(),
-            Vec::new(),
-        );
+        let reach = cardinal_interface::new!(api::GroupReach {
+            added: Vec::new(),
+            ask: false,
+            public: false,
+            said_no: false,
+            set: false,
+            shared: false,
+            waiting: false,
+            what: Vec::new(),
+            who: Vec::new()
+        });
         api::Group {
             last,
-            ..api::Group::new(
-                false,
-                Vec::new(),
-                Vec::new(),
-                [0; 32],
-                0,
-                true,
+            ..cardinal_interface::new!(api::Group {
+                admin: false,
+                did_not_stand: Vec::new(),
+                did_not_stand_changes: Vec::new(),
+                group: [0; 32],
+                held_back: 0,
+                introductions: true,
                 members,
-                name.to_owned(),
-                0,
-                false,
+                name: name.to_owned(),
+                not_posted: 0,
+                public: false,
                 reach,
-                unread,
-            )
+                unread
+            })
         }
     }
 

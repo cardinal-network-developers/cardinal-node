@@ -701,7 +701,7 @@ pub fn status(d: &Arc<Daemon>) -> anyhow::Result<crate::api::RecoverReply> {
             lost_at: r.lost_at,
             kept_changes: Some(kept_of(d, &r)),
             not_heard: Some(not_heard_of(d, &r)),
-            ..crate::api::RecoverReply::new(false)
+            ..cardinal_interface::new!(crate::api::RecoverReply { under_way: false })
         });
     };
     // `finish` made this device the person's but did not get to the end, as
@@ -732,7 +732,7 @@ pub fn status(d: &Arc<Daemon>) -> anyhow::Result<crate::api::RecoverReply> {
             pair_again: Some(pair_again_of(d, &u.forgotten)),
             words: Some(u.words),
             not_heard: Some(not_heard_of(d, &r)),
-            ..crate::api::RecoverReply::new(false)
+            ..cardinal_interface::new!(crate::api::RecoverReply { under_way: false })
         });
     }
     let phrase = phrase_of(&u)?;
@@ -767,7 +767,7 @@ pub fn status(d: &Arc<Daemon>) -> anyhow::Result<crate::api::RecoverReply> {
                 })
                 .collect(),
         ),
-        ..crate::api::RecoverReply::new(true)
+        ..cardinal_interface::new!(crate::api::RecoverReply { under_way: true })
     })
 }
 

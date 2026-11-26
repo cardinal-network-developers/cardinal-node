@@ -136,75 +136,248 @@ pub fn decode(input: &[u8]) -> Result<Value, DecodeError> {
 /// Decodes one value from the start of `input`, returning it and the number
 /// of bytes it occupied. For contexts that carry several values in a row.
 pub fn decode_prefix(input: &[u8]) -> Result<(Value, usize), DecodeError> {
-    let mut d = Decoder { input, pos: 0 };
+    let mut d = Decoder {
+        c: Cursor::new(input),
+    };
     let v = d.value(0)?;
-    Ok((v, d.pos))
+    Ok((v, d.c.pos))
 }
 
 /// Checks that `input` is exactly one canonical value, without building it.
 pub fn validate(input: &[u8]) -> Result<(), DecodeError> {
-    decode(input).map(|_| ())
+    let mut c = Cursor::new(input);
+    c.skip(0)?;
+    c.end()
 }
 
-struct Decoder<'a> {
+/// Checks that `input` is exactly one canonical record, without building
+/// it: what [`Record::decode`] refuses, refused with the same error.
+pub fn check_record(input: &[u8]) -> Result<(), DecodeError> {
+    let mut c = Cursor::new(input);
+    let first = c.head()?;
+    c.pos = first.at;
+    c.skip(0)?;
+    c.end()?;
+    if first.major != Major::Record {
+        return Err(DecodeError::NotARecord {
+            found: first.major.name(),
+        });
+    }
+    Ok(())
+}
+
+/// A value's major type (`encoding.md#values`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Major {
+    Uint,
+    Neg,
+    Bytes,
+    Text,
+    List,
+    Record,
+}
+
+impl Major {
+    /// The name [`Value::type_name`] gives a value of this type.
+    pub fn name(self) -> &'static str {
+        match self {
+            Major::Uint => "uint",
+            Major::Neg => "neg",
+            Major::Bytes => "bytes",
+            Major::Text => "text",
+            Major::List => "list",
+            Major::Record => "record",
+        }
+    }
+}
+
+/// A value's header, as read: where it starts, its type, and its number
+/// (an integer's value, or a length, or a count).
+#[derive(Clone, Copy, Debug)]
+pub struct Head {
+    pub at: usize,
+    pub major: Major,
+    pub n: u64,
+}
+
+/// Reads a message straight from its bytes, one value at a time, for a
+/// reader that makes its own values rather than a tree (the local
+/// interface's typed records). Every check the decoder makes is made here,
+/// and the decoder makes them here too, so the two refuse the same bytes
+/// with the same errors: each value's header a minimal varint of a type
+/// not reserved, lengths and counts within the input, text UTF-8, nesting
+/// no deeper than [`MAX_DEPTH`], a record's keys ascending and not
+/// repeated, and nothing after the value ([`Cursor::end`]).
+pub struct Cursor<'a> {
     input: &'a [u8],
     pos: usize,
 }
 
-impl Decoder<'_> {
+impl<'a> Cursor<'a> {
+    /// At the start of `input`.
+    #[inline]
+    pub fn new(input: &'a [u8]) -> Self {
+        Cursor { input, pos: 0 }
+    }
+
+    /// Where it is in the input.
+    #[inline]
+    pub fn pos(&self) -> usize {
+        self.pos
+    }
+
+    #[inline]
     fn remaining(&self) -> usize {
         self.input.len() - self.pos
     }
 
+    #[inline]
     fn varint(&mut self) -> Result<u64, DecodeError> {
         let (v, n) = read_varint(&self.input[self.pos..], self.pos)?;
         self.pos += n;
         Ok(v)
     }
 
-    fn take(&mut self, n: u64, at: usize) -> Result<&[u8], DecodeError> {
-        if n > self.remaining() as u64 {
-            return Err(DecodeError::LengthExceedsInput { offset: at });
+    /// The next value's header.
+    #[inline]
+    pub fn head(&mut self) -> Result<Head, DecodeError> {
+        let at = self.pos;
+        let h = self.varint()?;
+        let n = h >> 3;
+        let major = match h & 7 {
+            T_UINT => Major::Uint,
+            T_NEG => Major::Neg,
+            T_BYTES => Major::Bytes,
+            T_TEXT => Major::Text,
+            T_LIST => Major::List,
+            T_RECORD => Major::Record,
+            t => {
+                return Err(DecodeError::ReservedType {
+                    offset: at,
+                    t: t as u8,
+                })
+            }
+        };
+        Ok(Head { at, major, n })
+    }
+
+    /// The bytes of a value of bytes or text whose header is `h`, which
+    /// the input must hold.
+    #[inline]
+    pub fn bytes(&mut self, h: &Head) -> Result<&'a [u8], DecodeError> {
+        if h.n > self.remaining() as u64 {
+            return Err(DecodeError::LengthExceedsInput { offset: h.at });
         }
         let start = self.pos;
-        self.pos += n as usize;
+        self.pos += h.n as usize;
         Ok(&self.input[start..self.pos])
     }
 
-    /// Each item takes at least one byte, so a count larger than the
-    /// remaining input is malformed, and is rejected on reading the header,
-    /// before anything is allocated (`encoding.md#limits`).
-    fn check_count(&self, n: u64, at: usize) -> Result<usize, DecodeError> {
-        if n > self.remaining() as u64 {
-            return Err(DecodeError::LengthExceedsInput { offset: at });
-        }
-        Ok(n as usize)
+    /// The text of a value of text whose header is `h`: in the input, and
+    /// UTF-8.
+    #[inline]
+    pub fn text(&mut self, h: &Head) -> Result<&'a str, DecodeError> {
+        let bytes = self.bytes(h)?;
+        std::str::from_utf8(bytes).map_err(|_| DecodeError::InvalidUtf8 { offset: h.at })
     }
 
-    fn value(&mut self, depth: usize) -> Result<Value, DecodeError> {
-        let at = self.pos;
-        let h = self.varint()?;
-        let t = h & 7;
-        let n = h >> 3;
-        match t {
-            T_UINT => Ok(Value::Int(
-                Int::from_u64(n).expect("n < 2^60 by varint bound"),
-            )),
-            T_NEG => Ok(Value::Int(
-                Int::new(-1 - n as i64).expect("n < 2^60 by varint bound"),
-            )),
-            T_BYTES => Ok(Value::Bytes(self.take(n, at)?.to_vec())),
-            T_TEXT => {
-                let bytes = self.take(n, at)?;
-                let s = std::str::from_utf8(bytes)
-                    .map_err(|_| DecodeError::InvalidUtf8 { offset: at })?;
-                Ok(Value::Text(s.to_owned()))
+    /// How many items a list, or fields a record, whose header is `h`
+    /// holds, at nesting `depth` (0 for the message itself): within
+    /// [`MAX_DEPTH`], and no more than the bytes left, since each takes one
+    /// at least, so that a count is refused before anything is reserved for
+    /// it (`encoding.md#limits`).
+    #[inline]
+    pub fn count(&self, h: &Head, depth: usize) -> Result<usize, DecodeError> {
+        if depth >= MAX_DEPTH {
+            return Err(DecodeError::TooDeep { offset: h.at });
+        }
+        if h.n > self.remaining() as u64 {
+            return Err(DecodeError::LengthExceedsInput { offset: h.at });
+        }
+        Ok(h.n as usize)
+    }
+
+    /// A record's next key, after `last`, the key before it: ascending,
+    /// and not repeated.
+    #[inline]
+    pub fn key(&mut self, last: Option<u64>) -> Result<u64, DecodeError> {
+        let key_at = self.pos;
+        let key = self.varint()?;
+        if let Some(prev) = last {
+            if key == prev {
+                return Err(DecodeError::DuplicateKey {
+                    offset: key_at,
+                    key,
+                });
             }
-            T_LIST => {
-                if depth >= MAX_DEPTH {
-                    return Err(DecodeError::TooDeep { offset: at });
+            if key < prev {
+                return Err(DecodeError::UnsortedKeys {
+                    offset: key_at,
+                    key,
+                });
+            }
+        }
+        Ok(key)
+    }
+
+    /// Passes over the next value, at nesting `depth`, checked as the
+    /// decoder checks it.
+    pub fn skip(&mut self, depth: usize) -> Result<(), DecodeError> {
+        let h = self.head()?;
+        self.skip_after(&h, depth)
+    }
+
+    /// Passes over the rest of the value whose header `h` was just read.
+    pub fn skip_after(&mut self, h: &Head, depth: usize) -> Result<(), DecodeError> {
+        match h.major {
+            Major::Uint | Major::Neg => Ok(()),
+            Major::Bytes => self.bytes(h).map(drop),
+            Major::Text => self.text(h).map(drop),
+            Major::List => {
+                for _ in 0..self.count(h, depth)? {
+                    self.skip(depth + 1)?;
                 }
-                let count = self.check_count(n, at)?;
+                Ok(())
+            }
+            Major::Record => {
+                let mut last = None;
+                for _ in 0..self.count(h, depth)? {
+                    last = Some(self.key(last)?);
+                    self.skip(depth + 1)?;
+                }
+                Ok(())
+            }
+        }
+    }
+
+    /// Nothing is left after the value read: trailing bytes are an error.
+    #[inline]
+    pub fn end(&self) -> Result<(), DecodeError> {
+        if self.pos != self.input.len() {
+            return Err(DecodeError::TrailingBytes { offset: self.pos });
+        }
+        Ok(())
+    }
+}
+
+struct Decoder<'a> {
+    c: Cursor<'a>,
+}
+
+impl Decoder<'_> {
+    fn value(&mut self, depth: usize) -> Result<Value, DecodeError> {
+        let h = self.c.head()?;
+        match h.major {
+            Major::Uint => Ok(Value::Int(
+                Int::from_u64(h.n).expect("n < 2^60 by varint bound"),
+            )),
+            Major::Neg => Ok(Value::Int(
+                Int::new(-1 - h.n as i64).expect("n < 2^60 by varint bound"),
+            )),
+            Major::Bytes => Ok(Value::Bytes(self.c.bytes(&h)?.to_vec())),
+            Major::Text => Ok(Value::Text(self.c.text(&h)?.to_owned())),
+            Major::List => {
+                let count = self.c.count(&h, depth)?;
                 // A count within the input can still be many times the
                 // memory of the bytes it claims, nested 32 deep, so the
                 // list grows with what is actually read.
@@ -214,40 +387,18 @@ impl Decoder<'_> {
                 }
                 Ok(Value::List(items))
             }
-            T_RECORD => {
-                if depth >= MAX_DEPTH {
-                    return Err(DecodeError::TooDeep { offset: at });
-                }
-                let count = self.check_count(n, at)?;
+            Major::Record => {
+                let count = self.c.count(&h, depth)?;
                 let mut record = Record::new();
                 let mut last: Option<u64> = None;
                 for _ in 0..count {
-                    let key_at = self.pos;
-                    let key = self.varint()?;
-                    if let Some(prev) = last {
-                        if key == prev {
-                            return Err(DecodeError::DuplicateKey {
-                                offset: key_at,
-                                key,
-                            });
-                        }
-                        if key < prev {
-                            return Err(DecodeError::UnsortedKeys {
-                                offset: key_at,
-                                key,
-                            });
-                        }
-                    }
+                    let key = self.c.key(last)?;
                     last = Some(key);
                     let v = self.value(depth + 1)?;
                     record.insert(key, v);
                 }
                 Ok(Value::Record(record))
             }
-            _ => Err(DecodeError::ReservedType {
-                offset: at,
-                t: t as u8,
-            }),
         }
     }
 }
@@ -314,6 +465,7 @@ mod tests {
         ];
         for (h, err) in cases {
             assert_eq!(decode(&hex(h)), Err(err.clone()), "{h}");
+            assert_eq!(validate(&hex(h)), Err(err.clone()), "{h}");
         }
         // Record key encoded non-minimally.
         assert_eq!(
@@ -332,7 +484,7 @@ mod tests {
         }
         assert_eq!(v.depth(), MAX_DEPTH);
         assert_eq!(decode(&v.encode()).unwrap(), v);
-        let too_deep = Value::List(vec![v]);
+        let too_deep = Value::List(vec![v.clone()]);
         assert!(matches!(
             decode(&too_deep.encode()),
             Err(DecodeError::TooDeep { .. })
@@ -346,6 +498,16 @@ mod tests {
             decode(&r.encode()),
             Err(DecodeError::TooDeep { .. })
         ));
+        // checked without building, the same
+        assert_eq!(
+            validate(&too_deep.encode()),
+            decode(&too_deep.encode()).map(drop)
+        );
+        assert_eq!(
+            check_record(&r.encode()),
+            Record::decode(&r.encode()).map(drop)
+        );
+        assert_eq!(validate(&v.encode()), Ok(()));
     }
 
     #[test]

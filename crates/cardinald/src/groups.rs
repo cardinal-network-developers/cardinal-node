@@ -484,7 +484,9 @@ pub async fn set_role(
     // they are named as the way by name held them, NUL first as bytes.
     let now = now.ok_or_else(|| anyhow::anyhow!("{} is not in {}", who.held(), g.name))?;
     if role == now {
-        return Ok(api::GroupRoleReply::new(g.id));
+        return Ok(cardinal_interface::new!(api::GroupRoleReply {
+            group: g.id
+        }));
     }
     if role > now {
         anyhow::ensure!(
@@ -494,7 +496,9 @@ pub async fn set_role(
         );
         d.write_and_push(&g.id, vec![SpaceOp::add_member(them, role)])?;
         d.bump();
-        return Ok(api::GroupRoleReply::new(g.id));
+        return Ok(cardinal_interface::new!(api::GroupRoleReply {
+            group: g.id
+        }));
     }
     anyhow::ensure!(
         owner == Some(me),
@@ -1248,7 +1252,10 @@ fn change_of(
     named: &[Member],
     succ: &SpaceId,
 ) -> api::GroupChange {
-    let mut c = api::GroupChange::new(Vec::new(), Vec::new());
+    let mut c = cardinal_interface::new!(api::GroupChange {
+        roles: Vec::new(),
+        taken_out: Vec::new()
+    });
     let Some((out, roles)) = core.changes_of(succ) else {
         return c;
     };
@@ -1708,17 +1715,17 @@ pub fn members(d: &Daemon, group: Ref<'_>) -> anyhow::Result<api::GroupMembersRe
         out.push(api::Member {
             taken_out: Some(true),
             shown: m.name.clone(),
-            ..api::Member::new(
-                contacts
+            ..cardinal_interface::new!(api::Member {
+                contact: contacts
                     .iter()
                     .any(|c| c.identity == m.identity && !c.refused),
-                api::short_id(&m.identity),
-                false,
-                false,
-                name_of(&me, &contacts, &named, &m.identity),
-                "taken out".into(),
-                m.identity == me,
-            )
+                id: api::short_id(&m.identity),
+                introduce: false,
+                left: false,
+                name: name_of(&me, &contacts, &named, &m.identity),
+                role: "taken out".into(),
+                you: m.identity == me
+            })
         });
     }
     Ok(api::GroupMembersReply {
