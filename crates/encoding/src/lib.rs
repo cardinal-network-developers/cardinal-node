@@ -29,7 +29,7 @@ mod text;
 mod value;
 pub mod varint;
 
-pub use codec::{decode, decode_prefix, validate, MAX_DEPTH};
+pub use codec::{check_record, decode, decode_prefix, validate, Cursor, Head, Major, MAX_DEPTH};
 pub use error::{DecodeError, Error, SchemaError};
 pub use kind::Kind;
 pub use signed::{

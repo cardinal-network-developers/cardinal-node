@@ -1,6 +1,8 @@
 //! Property tests: round trips, and every accepted encoding is canonical.
 
-use cardinal_encoding::{decode, decode_prefix, Int, Record, Value, MAX_DEPTH};
+use cardinal_encoding::{
+    check_record, decode, decode_prefix, validate, Int, Record, Value, MAX_DEPTH,
+};
 use proptest::prelude::*;
 
 fn arb_int() -> impl Strategy<Value = Int> {
@@ -96,5 +98,31 @@ proptest! {
         let back = Record::decode(&bytes).unwrap();
         let keys: Vec<u64> = back.keys().collect();
         prop_assert!(keys.windows(2).all(|w| w[0] < w[1]));
+    }
+
+    /// Checking without building refuses what decoding refuses, with the
+    /// same error: the two share every check (`Cursor`).
+    #[test]
+    fn checking_refuses_what_decoding_refuses(
+        v in arb_value(),
+        edits in proptest::collection::vec((any::<prop::sample::Index>(), any::<u8>(), 0u8..3), 0..4),
+    ) {
+        let mut bytes = v.encode();
+        for (idx, byte, op) in edits {
+            match op {
+                0 if !bytes.is_empty() => { let i = idx.index(bytes.len()); bytes[i] = byte; }
+                1 => { let i = idx.index(bytes.len() + 1); bytes.insert(i, byte); }
+                _ if !bytes.is_empty() => { let i = idx.index(bytes.len()); bytes.remove(i); }
+                _ => {}
+            }
+        }
+        prop_assert_eq!(validate(&bytes), decode(&bytes).map(drop));
+        prop_assert_eq!(check_record(&bytes), Record::decode(&bytes).map(drop));
+    }
+
+    #[test]
+    fn checking_random_bytes_refuses_what_decoding_refuses(bytes in proptest::collection::vec(any::<u8>(), 0..64)) {
+        prop_assert_eq!(validate(&bytes), decode(&bytes).map(drop));
+        prop_assert_eq!(check_record(&bytes), Record::decode(&bytes).map(drop));
     }
 }
