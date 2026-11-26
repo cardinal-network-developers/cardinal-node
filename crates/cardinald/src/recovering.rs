@@ -809,7 +809,13 @@ pub async fn start(
     let named = match identity {
         Some(i) => {
             let b = match i {
-                crate::api::typed::Reference::Typed(t) => hex::decode(t.trim()).ok(),
+                // An old oddity, kept to the byte (DEVIATIONS.md, Old
+                // oddities kept): text that is NUL and an id's hex once
+                // trimmed is taken as that id, as the way by name trimmed
+                // before it told text from an id given as bytes.
+                crate::api::typed::Reference::Typed(t) => {
+                    hex::decode(crate::api::id_hex(t.trim())).ok()
+                }
                 crate::api::typed::Reference::Id(b) => Some(b.clone()),
             };
             // named as the way by name held it: an id given as bytes, NUL

@@ -3155,6 +3155,51 @@ async fn recovery_is_answered_the_same() {
     }
 }
 
+/// An old oddity, kept (DEVIATIONS.md, Old oddities kept): `recover-start`
+/// with an `identity` given as text that is a space, NUL, then an id's 64
+/// hex digits starts a recovery of that identity, as main did, trimming
+/// before it told text from an id given as bytes. Each device makes words
+/// of its own, so the two replies are the same but for the fingerprint.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn recover_start_with_spaced_exact_text_is_the_id() {
+    let dir = tempfile::tempdir().unwrap();
+    let fresh = |at: &str| {
+        let paths = crate::paths::Paths::at(&dir.path().join(at));
+        let mut config = crate::config::Config {
+            listen: "127.0.0.1:0".into(),
+            ..Default::default()
+        };
+        config.this_run.no_mount = true;
+        config.this_run.no_discovery = true;
+        config.this_run.no_udp = true;
+        (paths, config)
+    };
+    let (po, co) = fresh("bare-old");
+    let (pn, cn) = fresh("bare-new");
+    let (old, new) = (
+        Daemon::start(po, co).await.unwrap(),
+        Daemon::start(pn, cn).await.unwrap(),
+    );
+    let req = json!({"cmd": "recover-start", "identity": format!(" {}", exact(&[0xab; 32]))});
+    let (_, msg) = encode_request(&req).unwrap();
+    let by_name = crate::control::by_name(&old, &msg).await;
+    let typed = crate::control::typed::reply(&new, &msg)
+        .await
+        .expect("a typed request");
+    let o = read_reply::<crate::api::RecoverStartArgs>(&by_name)
+        .unwrap()
+        .unwrap();
+    let n = read_reply::<crate::api::RecoverStartArgs>(&typed)
+        .unwrap()
+        .unwrap();
+    assert_eq!(o.identity, Some([0xab; 32]));
+    assert_eq!(n.identity, o.identity);
+    assert!(!n.fingerprint.is_empty() && !o.fingerprint.is_empty());
+    for d in [&old, &new] {
+        let _ = d.stopping.send(true);
+    }
+}
+
 /// Hosting a contact: offered by each twin to its Bea, taken up by each
 /// Bea, the one by name and the other typed, and ended; with every refusal
 /// before, a ref as text and as bytes, and `hosting` on both sides.

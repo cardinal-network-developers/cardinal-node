@@ -2488,6 +2488,10 @@ asks for around that is not built yet.
     is <space>". `app-answer` saying yes to a question of sharing without
     `people` is refused, and the question is gone all the same: the
     program asking it is told nothing, as if the person had not answered.
+    `recover-start` with an `identity` given as text that is a space, NUL,
+    then an id's 64 hex digits takes it as that id and starts a recovery,
+    as the way by name trimmed before it told text from an id given as
+    bytes (as `before` above).
   - **A reply field without a number** is this build's mistake. In a debug
     build, where the tests run, the request then fails; in a release build
     the field is left out and the service logs an error. A field no test
