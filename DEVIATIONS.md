@@ -2309,13 +2309,34 @@ asks for around that is not built yet.
   `api/`, `transport.rs`). Each message is one base-encoded record on a
   `SOCK_SEQPACKET` socket (a named pipe in message mode on Windows), at most
   256 KiB. Readings and choices:
-  - **Inside, by name.** The handlers build and read JSON trees by field
-    name as before; `api/table.rs` gives every request, argument, reply
-    field and record its number and type, and `api` turns one form into the
-    other at the socket. A value the service holds as hex (a key, an id, a
-    hash) is bytes on the wire. `apps.md`'s tables of numbers are generated
-    from that file (`CARDINAL_API_TABLES=<file> cargo test -p cardinald
-    --lib api::tests::tables`).
+  - **Typed records, replacing the way by name.** A request's arguments,
+    its reply and each record in it are Rust values, declared once in
+    `api/table.rs` with `typed!`: the declaration is the struct, its row in
+    the tables, and its encoding both ways (`api/typed.rs`), so they cannot
+    drift. A field's Rust type gives its type in the tables: `String` or
+    `Cow<'static, str>` text, `bool`, `u64`, `[u8; N]` bytes (read back only
+    at exactly N), `api::typed::Reference` a ref, `Vec<T>` a list, a typed
+    record, and `Option<T>` a field sent only when it is `Some`; any other
+    field is always sent, and missing when read back is an error. `asks!`
+    makes a request's row from its typed arguments and reply, and
+    `control::typed` answers it: the record's fields straight into the
+    arguments, the handler's typed answer, the page cut by encoded length
+    (`api::typed::page_after`, `page_before`, counting as `api::page`
+    did), and the reply written straight to bytes. No JSON tree and no hex
+    on that way; ids stay bytes from the store to the socket. `files`,
+    `messages` and `call` go this way. The command line reads them typed
+    (`control::ask`, which also joins pages), and `--trace` is unchanged.
+    `api/same_bytes.rs` shows the bytes are what they were by name.
+  - **By name, for the rest until they are typed.** Their handlers build
+    and read JSON trees by field name; `api` turns one form into the other
+    at the socket by the same tables, hex becoming bytes. The handlers
+    already typed are kept by name only as `*_by_name`, for the tests and
+    `cargo bench -p cardinald --bench interface --features by-name`, which
+    measures the two ways side by side. All of it goes once every request
+    is typed. `apps.md`'s tables of numbers are generated from
+    `api/table.rs`, typed rows and rows by name alike
+    (`CARDINAL_API_TABLES=<file> cargo test -p cardinald --lib
+    api::tests::tables`).
   - **A reply field without a number** is this build's mistake. In a debug
     build, where the tests run, the request then fails; in a release build
     the field is left out and the service logs an error. A field no test

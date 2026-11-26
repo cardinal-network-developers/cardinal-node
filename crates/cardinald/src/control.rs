@@ -22,6 +22,7 @@ use cardinal_space::state::State;
 use cardinal_space::{NodeId, SpaceId, ROOT};
 use serde_json::{json, Value};
 
+use crate::api::typed::Ask;
 use crate::api::{self, status};
 use crate::core::short;
 use crate::daemon::{Daemon, PairState};
@@ -126,6 +127,134 @@ async fn request_one(socket: &std::path::Path, req: &Value) -> anyhow::Result<Va
         eprintln!("< {}", api::render_reply(spec, &reply));
     }
     api::decode_reply(spec, &reply)
+}
+
+/// Sends a typed request to a running daemon and returns its reply, typed,
+/// or how it failed. A request whose answer comes in pages is asked for
+/// page after page, and the reply holds every page's items, unless `args`
+/// asks for one page itself, with `limit`, `after` or `before`; as
+/// [`request`] does by name.
+pub async fn ask<A: Pages>(
+    socket: &std::path::Path,
+    args: &A,
+) -> anyhow::Result<Result<A::Reply, api::typed::Failed>> {
+    let mut all = match ask_one(socket, args).await? {
+        Ok(r) => r,
+        Err(f) => return Ok(Err(f)),
+    };
+    if args.one_page() {
+        return Ok(Ok(all));
+    }
+    let mut asked = args.clone();
+    while let Some(next) = asked.next_page(&all) {
+        let page = match ask_one(socket, &next).await? {
+            Ok(r) => r,
+            Err(f) => return Ok(Err(f)),
+        };
+        let grew = A::join(&mut all, page);
+        asked = next;
+        if !grew {
+            break;
+        }
+    }
+    A::whole(&mut all);
+    Ok(Ok(all))
+}
+
+/// [`ask`], one page of it.
+async fn ask_one<A: Ask>(
+    socket: &std::path::Path,
+    args: &A,
+) -> anyhow::Result<Result<A::Reply, api::typed::Failed>> {
+    let msg = args.encode();
+    let tracing = TRACE.load(Ordering::Relaxed);
+    if tracing {
+        eprintln!("> {}", api::render_request(&msg));
+    }
+    let (mut r, mut w) = transport::connect(socket).await?;
+    w.send(&msg).await?;
+    let reply = match r.recv().await? {
+        Some(Received::Message(m)) => m,
+        Some(Received::TooLarge) => anyhow::bail!("the daemon's reply was larger than a message"),
+        None => anyhow::bail!("the daemon closed the connection"),
+    };
+    if tracing {
+        eprintln!("< {}", api::render_reply(A::REQUEST, &reply));
+    }
+    api::typed::read_reply::<A>(&reply)
+}
+
+/// A typed request whose answer may come in pages (`apps.md`, Pages), for
+/// [`ask`].
+pub trait Pages: Ask + Clone {
+    /// Whether it asks for one page itself.
+    fn one_page(&self) -> bool;
+    /// The request for the page after `had`, the pages so far, if there
+    /// is more.
+    fn next_page(&self, had: &Self::Reply) -> Option<Self>;
+    /// Adds `page`'s items to `all`'s, with its `more` and `next`: whether
+    /// it had any.
+    fn join(all: &mut Self::Reply, page: Self::Reply) -> bool;
+    /// Every page joined: no `more` or `next` left.
+    fn whole(all: &mut Self::Reply);
+}
+
+impl Pages for api::FilesArgs {
+    fn one_page(&self) -> bool {
+        self.after.is_some() || self.limit.is_some()
+    }
+    fn next_page(&self, had: &api::FilesReply) -> Option<Self> {
+        let next = had.next.filter(|_| had.more)?;
+        Some(api::FilesArgs {
+            after: Some(next),
+            ..self.clone()
+        })
+    }
+    fn join(all: &mut api::FilesReply, page: api::FilesReply) -> bool {
+        let grew = !page.files.is_empty();
+        all.files.extend(page.files);
+        (all.more, all.next) = (page.more, page.next);
+        grew
+    }
+    fn whole(all: &mut api::FilesReply) {
+        (all.more, all.next) = (false, None);
+    }
+}
+
+impl Pages for api::MessagesArgs {
+    fn one_page(&self) -> bool {
+        self.before.is_some() || self.limit.is_some()
+    }
+    fn next_page(&self, had: &api::MessagesReply) -> Option<Self> {
+        let next = had.next.filter(|_| had.more)?;
+        Some(api::MessagesArgs {
+            before: Some(api::typed::Reference::Id(next.to_vec())),
+            ..self.clone()
+        })
+    }
+    fn join(all: &mut api::MessagesReply, mut page: api::MessagesReply) -> bool {
+        let grew = !page.messages.is_empty();
+        page.messages.append(&mut all.messages);
+        all.messages = page.messages;
+        (all.more, all.next) = (page.more, page.next);
+        grew
+    }
+    fn whole(all: &mut api::MessagesReply) {
+        (all.more, all.next) = (false, None);
+    }
+}
+
+impl Pages for api::CallArgs {
+    fn one_page(&self) -> bool {
+        true
+    }
+    fn next_page(&self, _: &api::CallReply) -> Option<Self> {
+        None
+    }
+    fn join(_: &mut api::CallReply, _: api::CallReply) -> bool {
+        false
+    }
+    fn whole(_: &mut api::CallReply) {}
 }
 
 /// Starts serving the local interface.

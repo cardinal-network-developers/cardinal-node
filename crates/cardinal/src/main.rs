@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 
 mod overview;
 
-use cardinald::{control, setup, Config, Paths};
+use cardinald::{api, control, setup, Config, Paths};
 use clap::{Parser, Subcommand};
 use serde_json::{json, Value};
 
@@ -1450,9 +1450,24 @@ async fn call(paths: &Paths, req: Value) -> anyhow::Result<Value> {
     }
 }
 
+/// [`call`], typed (`cardinald::api::typed`): the reply as its own value,
+/// with no tree of names.
+async fn ask<A: control::Pages>(paths: &Paths, args: A) -> anyhow::Result<A::Reply> {
+    let reply = control::ask(&paths.socket, &args).await;
+    match not_answering(paths, reply)? {
+        Ok(r) => Ok(r),
+        Err(failed) => anyhow::bail!("{}", failed.why),
+    }
+}
+
 /// The daemon's reply, whether it succeeded or not.
 async fn request(paths: &Paths, req: &Value) -> anyhow::Result<Value> {
-    let reply = control::request(&paths.socket, req).await;
+    not_answering(paths, control::request(&paths.socket, req).await)
+}
+
+/// A reply, or why there was none: what holds the data, if no daemon
+/// answered.
+fn not_answering<T>(paths: &Paths, reply: anyhow::Result<T>) -> anyhow::Result<T> {
     if reply.is_err() {
         // A daemon refuses to start on a store this version cannot read:
         // say that, and not only that none is running.
@@ -1954,56 +1969,62 @@ fn ago_words(s: u64) -> String {
 }
 
 /// The call under way, as `call` gives it.
-fn tell_call(v: &Value) {
-    let c = &v["call"];
-    if c.is_null() {
-        println!("No call.");
-    } else {
-        let name = printable(c["name"].as_str().unwrap_or(""));
-        let state = c["state"].as_str().unwrap_or("");
-        match c["group"].as_str() {
-            Some(_) => {
-                let what = match c["for_call"] == true {
-                    true => "call group",
-                    false => "group",
-                };
-                println!("{name} ({what}): {state}");
-                if let Some(by) = c["caller"]["name"].as_str() {
-                    println!("    {} is calling.", printable(by));
-                }
-                let admins: Vec<String> = c["admins"]
-                    .as_array()
-                    .into_iter()
-                    .flatten()
-                    .filter_map(|m| m["name"].as_str().map(printable))
-                    .collect();
-                if !admins.is_empty() {
-                    println!("    Looked after by {}.", admins.join(", "));
-                }
-                if c["joins"] == true {
-                    println!("    Answering adds you to {name}.");
-                    if c["reach"]["ask"] == true {
-                        println!(
-                            "    Not contacts of yours in it: {}. Answer with --share-host to \
-                             tell them, and anyone added later, where your host is ({}), or \
-                             with --keep-host not to.",
-                            names(&c["reach"]["who"]),
-                            names(&c["reach"]["what"]),
-                        );
+fn tell_call(v: &api::CallReply) {
+    match &v.call {
+        None => println!("No call."),
+        Some(c) => {
+            let name = printable(&c.name);
+            let state = &c.state;
+            match c.group {
+                Some(_) => {
+                    let what = match c.for_call == Some(true) {
+                        true => "call group",
+                        false => "group",
+                    };
+                    println!("{name} ({what}): {state}");
+                    if let Some(by) = &c.caller {
+                        println!("    {} is calling.", printable(&by.name));
+                    }
+                    let admins: Vec<String> = c
+                        .admins
+                        .iter()
+                        .flatten()
+                        .map(|m| printable(&m.name))
+                        .collect();
+                    if !admins.is_empty() {
+                        println!("    Looked after by {}.", admins.join(", "));
+                    }
+                    if c.joins == Some(true) {
+                        println!("    Answering adds you to {name}.");
+                        if let Some(reach) = c.reach.as_ref().filter(|r| r.ask) {
+                            let names = |l: &[String]| {
+                                l.iter()
+                                    .map(|x| printable(x))
+                                    .collect::<Vec<_>>()
+                                    .join(", ")
+                            };
+                            println!(
+                                "    Not contacts of yours in it: {}. Answer with --share-host to \
+                                 tell them, and anyone added later, where your host is ({}), or \
+                                 with --keep-host not to.",
+                                names(&reach.who),
+                                names(&reach.what),
+                            );
+                        }
+                    }
+                    if let Some(n) = c.people {
+                        println!("    {n} on the call.");
                     }
                 }
-                if let Some(n) = c["people"].as_u64() {
-                    println!("    {n} on the call.");
-                }
+                None => println!("{name}: {state}"),
             }
-            None => println!("{name}: {state}"),
         }
     }
-    if let Some(how) = v["ended"]["how"].as_str() {
+    if let Some(e) = &v.ended {
         println!(
             "Last ended: {}, {}.",
-            printable(v["ended"]["name"].as_str().unwrap_or("")),
-            how.replace('_', " ")
+            printable(&e.name),
+            e.how.replace('_', " ")
         );
     }
 }
@@ -3544,23 +3565,24 @@ async fn client(cmd: Cmd) -> anyhow::Result<()> {
         },
         Cmd::Files { path } => {
             let path = path.unwrap_or_default();
-            let v = call(&paths, json!({"cmd": "files", "path": path})).await?;
-            if let Some(name) = v["place"]["name"]
-                .as_str()
-                .filter(|_| v["place"]["kind"] == "shared")
-            {
-                if v["place"]["group"].is_string() {
+            let args = api::FilesArgs {
+                path: Some(path),
+                ..Default::default()
+            };
+            let v = ask(&paths, args).await?;
+            if let Some(name) = v.place.name.as_deref().filter(|_| v.place.kind == "shared") {
+                if v.place.group.is_some() {
                     println!("Shared in {name}: everyone in the group sees what is here.");
                 } else {
                     println!("Shared with {name}: you both see what is here.");
                 }
             }
-            for f in v["files"].as_array().into_iter().flatten() {
-                let name = printable(f["name"].as_str().unwrap_or("?"));
-                if f["folder"] == true {
+            for f in &v.files {
+                let name = printable(&f.name);
+                if f.folder {
                     println!("{name}/");
                 } else {
-                    let size = f["size"].as_u64().map(human_size).unwrap_or_default();
+                    let size = f.size.map(human_size).unwrap_or_default();
                     println!("{name}  {size}");
                 }
             }
@@ -3856,7 +3878,7 @@ async fn client(cmd: Cmd) -> anyhow::Result<()> {
         Cmd::Call { cmd } => {
             let req = match &cmd {
                 None => {
-                    let v = call(&paths, json!({"cmd": "call"})).await?;
+                    let v = ask(&paths, api::CallArgs {}).await?;
                     tell_call(&v);
                     return Ok(());
                 }
@@ -3891,6 +3913,29 @@ async fn client(cmd: Cmd) -> anyhow::Result<()> {
                 Some(CallCmd::End) => json!({"cmd": "call-end"}),
             };
             call(&paths, req).await?;
+            Ok(())
+        }
+        Cmd::Group {
+            cmd: GroupCmd::Messages { group },
+        } => {
+            let args = api::MessagesArgs {
+                group: Some(api::typed::Reference::Typed(group.clone())),
+                ..Default::default()
+            };
+            let v = ask(&paths, args).await?;
+            // whom nothing carries what this person writes to (D89)
+            let them = call(&paths, json!({"cmd": "group-members", "group": group})).await?;
+            for line in no_route_lines(&them) {
+                println!("{line}");
+            }
+            for m in &v.messages {
+                let by = match (&m.from, m.mine) {
+                    (_, true) => "you",
+                    (Some(from), false) => from.as_str(),
+                    (None, false) => "",
+                };
+                println!("{}: {}", printable(by), printable(&m.text));
+            }
             Ok(())
         }
         Cmd::Group { cmd } => {
@@ -3974,7 +4019,7 @@ async fn client(cmd: Cmd) -> anyhow::Result<()> {
                 GroupCmd::Say { group, text } => {
                     json!({"cmd": "say", "group": group, "text": text})
                 }
-                GroupCmd::Messages { group } => json!({"cmd": "messages", "group": group}),
+                GroupCmd::Messages { .. } => unreachable!("asked typed above"),
                 GroupCmd::Rename { group, name } => {
                     json!({"cmd": "group-set", "group": group, "name": name})
                 }
@@ -4034,26 +4079,6 @@ async fn client(cmd: Cmd) -> anyhow::Result<()> {
                     "You are back in {}.",
                     printable(v["name"].as_str().unwrap_or(""))
                 ),
-                GroupCmd::Messages { group } => {
-                    // whom nothing carries what this person writes to (D89)
-                    let them =
-                        call(&paths, json!({"cmd": "group-members", "group": group})).await?;
-                    for line in no_route_lines(&them) {
-                        println!("{line}");
-                    }
-                    for m in v["messages"].as_array().into_iter().flatten() {
-                        let by = if m["mine"] == true {
-                            "you"
-                        } else {
-                            m["from"].as_str().unwrap_or("")
-                        };
-                        println!(
-                            "{}: {}",
-                            printable(by),
-                            printable(m["text"].as_str().unwrap_or(""))
-                        );
-                    }
-                }
                 GroupCmd::Join { group, .. } | GroupCmd::Reach { group, .. }
                     if v["waiting"] == true =>
                 {
@@ -4077,21 +4102,20 @@ async fn client(cmd: Cmd) -> anyhow::Result<()> {
             Ok(())
         }
         Cmd::Messages { who: Some(who) } => {
-            let v = call(&paths, json!({"cmd": "messages", "who": who})).await?;
-            for m in v["messages"].as_array().into_iter().flatten() {
-                let by = if m["mine"] == true {
-                    "you"
-                } else {
-                    who.as_str()
-                };
-                println!("{by}: {}", printable(m["text"].as_str().unwrap_or("")));
-                let files = m["attachments"].as_array().cloned().unwrap_or_default();
-                for (n, a) in files.iter().enumerate() {
-                    let size = a["size"].as_u64().map(human_size).unwrap_or_default();
+            let args = api::MessagesArgs {
+                who: Some(api::typed::Reference::Typed(who.clone())),
+                ..Default::default()
+            };
+            let v = ask(&paths, args).await?;
+            for m in &v.messages {
+                let by = if m.mine { "you" } else { who.as_str() };
+                println!("{by}: {}", printable(&m.text));
+                for (n, a) in m.attachments.iter().enumerate() {
+                    let size = a.size.map(human_size).unwrap_or_default();
                     println!(
                         "    {} ({size}): cardinal save {who} {} {} PATH",
-                        printable(a["name"].as_str().unwrap_or("")),
-                        m["id"].as_str().unwrap_or(""),
+                        printable(&a.name),
+                        hex::encode(m.id),
                         n + 1
                     );
                 }
