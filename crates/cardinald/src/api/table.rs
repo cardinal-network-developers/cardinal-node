@@ -54,6 +54,11 @@ pub struct Field {
     pub n: u64,
     pub name: &'static str,
     pub ty: Ty,
+    /// Whether it is read back as an `Option`, its absence no error: of a
+    /// typed record's field, where the tests run, to hold the fields added
+    /// since the last release to that (`api::tests`).
+    #[cfg(test)]
+    pub optional: bool,
 }
 
 /// A record held inside a reply.
@@ -153,7 +158,7 @@ macro_rules! typed {
     ) => {
         $crate::typed!(@munch $h $st
             [$($s)* ($(#[$fm])* $f : Option<$t>)] [$($r)*] [$($o)* $f]
-            [$($l)* ($n $f)] [$($a)* ($n $f (as $row))] $($($rest)*)?);
+            [$($l)* ($n $f)] [$($a)* ($n $f (as $row ?))] $($($rest)*)?);
     };
     // A field always sent, of a record that holds itself.
     (@munch $h:tt $st:tt [$($s:tt)*] [$($r:tt)*] [$($o:tt)*] [$($l:tt)*] [$($a:tt)*]
@@ -179,25 +184,33 @@ macro_rules! typed {
             [$($s)* ($(#[$fm])* $f : $t)] [$($r)* ($f : $t)] [$($o)*]
             [$($l)* ($n $f)] [$($a)* ($n $f ($t))] $($($rest)*)?);
     };
-    (@row ($n:literal $f:ident (as {$row:ident}))) => {
+    (@row ($n:literal $f:ident (as {$row:ident} $($opt:tt)?))) => {
         $crate::api::table::Field {
             n: $n,
             name: $crate::api::typed::field_name(stringify!($f)),
             ty: $crate::api::table::Ty::Rec(&$row),
+            #[cfg(test)]
+            optional: $crate::typed!(@opt $($opt)?),
         }
     };
-    (@row ($n:literal $f:ident (as [$row:ident]))) => {
+    (@row ($n:literal $f:ident (as [$row:ident] $($opt:tt)?))) => {
         $crate::api::table::Field {
             n: $n,
             name: $crate::api::typed::field_name(stringify!($f)),
             ty: $crate::api::table::Ty::Recs(&$row),
+            #[cfg(test)]
+            optional: $crate::typed!(@opt $($opt)?),
         }
     };
+    (@opt ?) => { true };
+    (@opt) => { false };
     (@row ($n:literal $f:ident (gone $t:ty))) => {
         $crate::api::table::Field {
             n: $n,
             name: $crate::api::typed::field_name(stringify!($f)),
             ty: $crate::api::table::Ty::Gone(&<$t as $crate::api::typed::Wire>::TY),
+            #[cfg(test)]
+            optional: true,
         }
     };
     (@row ($n:literal $f:ident ($t:ty))) => {
@@ -205,6 +218,8 @@ macro_rules! typed {
             n: $n,
             name: $crate::api::typed::field_name(stringify!($f)),
             ty: <$t as $crate::api::typed::Wire>::TY,
+            #[cfg(test)]
+            optional: <$t as $crate::api::typed::Wire>::OPTIONAL,
         }
     };
     // A record held in replies: its row, `$stat`, written out in the
@@ -602,6 +617,8 @@ macro_rules! f {
             n: $n,
             name: $name,
             ty: Ty::Gone(&f!(0 "" $t).ty),
+            #[cfg(test)]
+            optional: false,
         }
     };
     ($n:literal $name:literal T) => {
@@ -609,6 +626,8 @@ macro_rules! f {
             n: $n,
             name: $name,
             ty: Ty::Text,
+            #[cfg(test)]
+            optional: false,
         }
     };
     ($n:literal $name:literal B) => {
@@ -616,6 +635,8 @@ macro_rules! f {
             n: $n,
             name: $name,
             ty: Ty::Bytes,
+            #[cfg(test)]
+            optional: false,
         }
     };
     ($n:literal $name:literal U) => {
@@ -623,6 +644,8 @@ macro_rules! f {
             n: $n,
             name: $name,
             ty: Ty::Uint,
+            #[cfg(test)]
+            optional: false,
         }
     };
     ($n:literal $name:literal I) => {
@@ -630,6 +653,8 @@ macro_rules! f {
             n: $n,
             name: $name,
             ty: Ty::Int,
+            #[cfg(test)]
+            optional: false,
         }
     };
     ($n:literal $name:literal BOOL) => {
@@ -637,6 +662,8 @@ macro_rules! f {
             n: $n,
             name: $name,
             ty: Ty::Bool,
+            #[cfg(test)]
+            optional: false,
         }
     };
     ($n:literal $name:literal REF) => {
@@ -644,6 +671,8 @@ macro_rules! f {
             n: $n,
             name: $name,
             ty: Ty::Ref,
+            #[cfg(test)]
+            optional: false,
         }
     };
     ($n:literal $name:literal KIND) => {
@@ -651,6 +680,8 @@ macro_rules! f {
             n: $n,
             name: $name,
             ty: Ty::Kind,
+            #[cfg(test)]
+            optional: false,
         }
     };
     ($n:literal $name:literal SCALAR) => {
@@ -658,6 +689,8 @@ macro_rules! f {
             n: $n,
             name: $name,
             ty: Ty::Scalar,
+            #[cfg(test)]
+            optional: false,
         }
     };
     ($n:literal $name:literal [T]) => {
@@ -665,6 +698,8 @@ macro_rules! f {
             n: $n,
             name: $name,
             ty: Ty::List(&Ty::Text),
+            #[cfg(test)]
+            optional: false,
         }
     };
     ($n:literal $name:literal [B]) => {
@@ -672,6 +707,8 @@ macro_rules! f {
             n: $n,
             name: $name,
             ty: Ty::List(&Ty::Bytes),
+            #[cfg(test)]
+            optional: false,
         }
     };
     ($n:literal $name:literal [U]) => {
@@ -679,6 +716,8 @@ macro_rules! f {
             n: $n,
             name: $name,
             ty: Ty::List(&Ty::Uint),
+            #[cfg(test)]
+            optional: false,
         }
     };
     ($n:literal $name:literal [REF]) => {
@@ -686,6 +725,8 @@ macro_rules! f {
             n: $n,
             name: $name,
             ty: Ty::List(&Ty::Ref),
+            #[cfg(test)]
+            optional: false,
         }
     };
     ($n:literal $name:literal [SCALAR]) => {
@@ -693,6 +734,8 @@ macro_rules! f {
             n: $n,
             name: $name,
             ty: Ty::List(&Ty::Scalar),
+            #[cfg(test)]
+            optional: false,
         }
     };
     ($n:literal $name:literal [[U]]) => {
@@ -700,6 +743,8 @@ macro_rules! f {
             n: $n,
             name: $name,
             ty: Ty::List(&Ty::List(&Ty::Uint)),
+            #[cfg(test)]
+            optional: false,
         }
     };
     ($n:literal $name:literal {$r:ident}) => {
@@ -707,6 +752,8 @@ macro_rules! f {
             n: $n,
             name: $name,
             ty: Ty::Rec(&$r),
+            #[cfg(test)]
+            optional: false,
         }
     };
     ($n:literal $name:literal [$r:ident]) => {
@@ -714,6 +761,8 @@ macro_rules! f {
             n: $n,
             name: $name,
             ty: Ty::Recs(&$r),
+            #[cfg(test)]
+            optional: false,
         }
     };
 }

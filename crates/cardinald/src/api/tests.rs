@@ -665,3 +665,112 @@ fn markdown() -> String {
     }
     out
 }
+
+/// The tables of the last release (`released-tables.md`, as
+/// `CARDINAL_API_TABLES` wrote them from that release's source): what a
+/// client newer than a service still running may be answered with.
+const RELEASED: &str = include_str!("released-tables.md");
+
+/// A request's arguments and reply, by its name, as numbers.
+type Asked = std::collections::HashMap<String, (HashSet<u64>, HashSet<u64>)>;
+/// A record's fields, by its name, as numbers.
+type Held = std::collections::HashMap<String, HashSet<u64>>;
+
+/// Every request's arguments and reply, and every record's fields, in the
+/// tables `RELEASED` gives.
+fn released() -> (Asked, Held) {
+    fn numbers(cell: &str) -> HashSet<u64> {
+        let mut out = HashSet::new();
+        for part in cell.split(", ") {
+            let part = part.trim();
+            if let Some((n, rest)) = part.split_once(' ') {
+                if rest.starts_with('`') {
+                    out.insert(n.parse().expect("a field's number"));
+                }
+            }
+        }
+        out
+    }
+    let (mut requests, mut records) = (Asked::new(), Held::new());
+    let mut in_records = false;
+    for line in RELEASED.lines() {
+        if line.starts_with("#### ") {
+            in_records = line == "#### Records";
+            continue;
+        }
+        let cells: Vec<&str> = line.split(" | ").collect();
+        if !line.starts_with("| ")
+            || line.starts_with("| # ")
+            || line.starts_with("| Record ")
+            || line.starts_with("| Asked ")
+        {
+            continue;
+        }
+        if in_records {
+            let name = cells[0].trim_start_matches("| *").trim_end_matches('*');
+            let fields = cells.get(1).map_or("", |c| c.trim_end_matches(" |"));
+            records.insert(name.to_owned(), numbers(fields));
+        } else if cells.len() == 4 {
+            let name = cells[1].split('`').nth(1).expect("a request's name");
+            let reply = cells[3].trim_end_matches(" |");
+            requests.insert(name.to_owned(), (numbers(cells[2]), numbers(reply)));
+        } else if cells.len() == 2 && cells[0].starts_with("| `") {
+            // what the program says, by the option that asks it
+            let name = cells[0].split('`').nth(1).expect("an option");
+            let reply = cells[1].trim_end_matches(" |");
+            requests.insert(name.to_owned(), (HashSet::new(), numbers(reply)));
+        }
+    }
+    (requests, records)
+}
+
+/// A field added to a record after it was first released is an `Option`
+/// for ever (DEVIATIONS.md, Typed records): a newer client reads an older
+/// service still running, and a newer service an older client's request.
+/// Held against the last release's tables, for the requests and records it
+/// had.
+#[test]
+fn what_the_last_release_lacked_is_an_option() {
+    let (requests, records) = released();
+    assert!(requests.contains_key("call") && records.contains_key("call ended"));
+    let mut wrong = Vec::new();
+    let mut held: Vec<&'static Rec> = Vec::new();
+    fn walk(ty: &'static Ty, held: &mut Vec<&'static Rec>) {
+        match ty {
+            Ty::List(t) | Ty::Gone(t) => walk(t, held),
+            Ty::Rec(r) | Ty::Recs(r) if !held.iter().any(|h| std::ptr::eq(*h, *r)) => {
+                held.push(r);
+                for f in r.fields {
+                    walk(&f.ty, held);
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut strict = |at: &str, fields: &'static [Field], had: &HashSet<u64>| {
+        for f in fields {
+            if !had.contains(&f.n) && !f.optional {
+                wrong.push(format!("{at}: {} `{}`", f.n, f.name));
+            }
+        }
+    };
+    for r in REQUESTS.iter().chain(PROGRAM).filter(|r| !r.gone) {
+        for f in r.args.iter().chain(r.reply) {
+            walk(&f.ty, &mut held);
+        }
+        if let Some((args, reply)) = requests.get(r.name) {
+            strict(&format!("{} arguments", r.name), r.args, args);
+            strict(&format!("{} reply", r.name), r.reply, reply);
+        }
+    }
+    for rec in held {
+        if let Some(had) = records.get(rec.name) {
+            strict(&format!("*{}*", rec.name), rec.fields, had);
+        }
+    }
+    assert!(
+        wrong.is_empty(),
+        "fields the last release did not have, read back as required (make each an \
+         Option): {wrong:?}"
+    );
+}

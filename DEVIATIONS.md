@@ -2337,7 +2337,15 @@ asks for around that is not built yet.
     absence is an error. **A field added to a record after it was first
     released is an `Option` for ever**, so that a newer client reads an
     older service still running (the state after every update until the
-    service restarts). A reply a client cannot read is
+    service restarts).
+    `api::tests::what_the_last_release_lacked_is_an_option` holds
+    every field the last release's tables lack (requests' arguments and
+    replies, the program's replies, records) to that, against a copy of
+    those tables, `api/released-tables.md` (now v0.1.27's), which moves
+    forward with each release: written from the released source with
+    `CARDINAL_API_TABLES=<file> cargo test -p cardinald --lib
+    tables_for_the_specification`.
+    A reply a client cannot read is
     `api::typed::Unreadable`, and the command line says it could not read
     it, naming the field, not that the service is not running. `Option` is
     only a record's field: an `Option` in a list, or of an `Option`, does
