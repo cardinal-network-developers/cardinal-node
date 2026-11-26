@@ -413,30 +413,39 @@ pub mod typed {
     }
 
     /// `reply`, typed, against the request's answer by name: the same
-    /// bytes, or an error that says how they differ. Each is asked again
-    /// once before they are taken to differ, for what changes between two
-    /// asks (a call's seconds).
+    /// bytes, or an error that says how they differ. What changes between
+    /// two asks (a call's seconds, the frames a live call counts) can make
+    /// two answers differ that are not wrong: the two ways are asked in
+    /// turn, a few times, until one answer is the same as the one before
+    /// it, the other way's.
     #[cfg(any(test, debug_assertions, feature = "by-name"))]
     async fn beside<A: Answer>(d: &Arc<Daemon>, a: &A, reply: Vec<u8>) -> Vec<u8> {
+        const ASKS: usize = 8;
         let Ok(msg) = a.encode() else {
             return reply;
         };
-        let old = super::by_name(d, &msg).await;
-        if old == reply {
-            return reply;
+        let mut typed = reply;
+        let mut old = super::by_name(d, &msg).await;
+        for _ in 0..ASKS {
+            if old == typed {
+                return typed;
+            }
+            typed = answer_of(d, a).await;
+            if old == typed {
+                return typed;
+            }
+            old = super::by_name(d, &msg).await;
         }
-        let again = answer_of(d, a).await;
-        let old_again = super::by_name(d, &msg).await;
-        if again == old_again || again == old {
-            return again;
+        if old == typed {
+            return typed;
         }
         let spec = A::REQUEST;
         let why = format!(
             "internal: the typed reply to {} is not the bytes it was by name: typed {}, by \
              name {}",
             spec.name,
-            api::render_reply(spec, &again),
-            api::render_reply(spec, &old_again)
+            api::render_reply(spec, &typed),
+            api::render_reply(spec, &old)
         );
         tracing::error!("{why}");
         api::error_reply(api::status::FAILED, &why)
