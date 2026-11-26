@@ -23,6 +23,7 @@ use cardinal_space::account;
 use cardinal_space::grant::{Endpoint, Grant, MAILBOX, RELAY, RENDEZVOUS, STORAGE};
 use cardinal_space::SpaceOp;
 use cardinal_sync::identity_log_label;
+#[cfg(any(test, debug_assertions, feature = "by-name"))]
 use serde_json::{json, Value as Json};
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
@@ -403,6 +404,8 @@ fn own_nodes(d: &Daemon, host: bool) -> anyhow::Result<([u8; 32], Vec<SpaceOp>)>
 
 /// What belongs on the recovery sheet: this identity's hosts, each with
 /// its static key as bytes, which a sheet writes as [`sheet_key`] does.
+/// As main had it, by name.
+#[cfg(any(test, debug_assertions, feature = "by-name"))]
 pub fn sheet(d: &Daemon) -> anyhow::Result<Json> {
     let core = d.core();
     let ident = core
@@ -576,7 +579,12 @@ async fn not_reached(at: &str, addr: SocketAddr, e: LinkError) -> anyhow::Error 
 /// Restores this device from a host (`hosts.md#restore`): the recovery
 /// words and the host's address and static key, from the recovery sheet,
 /// the key as bytes (hex here), as [`read_sheet_key`] reads it off one.
-pub async fn restore(d: &Arc<Daemon>, words: &str, at: &str, key: &str) -> anyhow::Result<Json> {
+pub async fn restore(
+    d: &Arc<Daemon>,
+    words: &str,
+    at: &str,
+    key: &[u8],
+) -> anyhow::Result<crate::api::RestoreFromHostReply> {
     if d.core().identity.is_some() {
         anyhow::bail!("this device already belongs to someone. Nothing was changed.");
     }
@@ -601,20 +609,56 @@ pub async fn restore(d: &Arc<Daemon>, words: &str, at: &str, key: &str) -> anyho
     let (entry, id) = d.core().add_restoring_device(&identity, &phrase)?;
     net::deliver(&s, label, entry.clone(), id).await?;
     d.ingest(label, vec![entry], Access::Join(identity))?;
+    Ok(crate::api::RestoreFromHostReply { at: at.to_owned() })
+}
+
+/// [`restore`] as main had it, by name: its key, held in hex, as bytes.
+#[cfg(any(test, debug_assertions, feature = "by-name"))]
+pub async fn restore_by_name(
+    d: &Arc<Daemon>,
+    words: &str,
+    at: &str,
+    key: &str,
+) -> anyhow::Result<Json> {
+    if d.core().identity.is_some() {
+        anyhow::bail!("this device already belongs to someone. Nothing was changed.");
+    }
+    let phrase = RecoveryPhrase::parse(words).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let root = phrase.root_signing_key();
+    let (s, addr, host, host_key) =
+        open_restore(d, at, &hex::decode(key).unwrap_or_default()).await?;
+    let identity = send_proof(&s, &root).await?.ok_or_else(|| {
+        anyhow::anyhow!("that device does not know these recovery words; nothing was changed")
+    })?;
+    *d.pairing.lock().unwrap_or_else(|e| e.into_inner()) = PairState::Joining {
+        identity,
+        admin_static: host,
+        admin_name: at.to_owned(),
+        admin_key: host_key,
+        admin_addr: Some(addr),
+        power: None,
+    };
+    d.on_session(s.clone());
+    // The log, then this device in it, signed by the root.
+    let label = identity_log_label(&identity);
+    net::reconcile(d, &s, label).await?;
+    let (entry, id) = d.core().add_restoring_device(&identity, &phrase)?;
+    net::deliver(&s, label, entry.clone(), id).await?;
+    d.ingest(label, vec![entry], Access::Join(identity))?;
     Ok(json!({"at": at}))
 }
 
 /// A restore session with the host at `at` whose static key is `key`, its
-/// 32 bytes in hex: the session, the address it reached, the host's static
+/// 32 bytes: the session, the address it reached, the host's static
 /// key, and its signing key.
 pub(crate) async fn open_restore(
     d: &Arc<Daemon>,
     at: &str,
-    key: &str,
+    key: &[u8],
 ) -> anyhow::Result<(Session, SocketAddr, [u8; 32], [u8; 32])> {
-    let host: [u8; 32] = hex::decode(key)
+    let host: [u8; 32] = key
+        .try_into()
         .ok()
-        .and_then(|b| b.try_into().ok())
         .ok_or_else(|| anyhow::anyhow!("a host's key is its 32 bytes"))?;
     let endpoint = Endpoint::parse(at).ok_or_else(|| {
         anyhow::anyhow!("{at} is not an address; it looks like 192.168.1.20:7171")

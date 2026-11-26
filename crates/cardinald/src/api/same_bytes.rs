@@ -3044,3 +3044,222 @@ async fn guardians_are_answered_the_same() {
         let _ = x.stopping.send(true);
     }
 }
+
+/// Recovery's requests: on the twins, which belong to someone, and on two
+/// devices that do not, each a copy of the other. A recovery under way and
+/// its finish make words and a helper of each one's own, so what they
+/// answer then is compared up to its refusals here; the whole is asked in
+/// `tests/guardians.rs`, where `recovery-sheet` and `recovery-check` are
+/// compared beside.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn recovery_is_answered_the_same() {
+    let dir = tempfile::tempdir().unwrap();
+    let (t, words) = Twins::start_words(dir.path()).await;
+    let device = t.old.config().name.clone();
+    t.same_here(json!({"cmd": "recovery-sheet"})).await;
+    for req in [
+        json!({"cmd": "recover"}),
+        json!({"cmd": "recovery-check"}),
+        json!({"cmd": "recovery-check", "words": "not the words"}),
+        json!({"cmd": "recovery-check", "words": words}),
+        json!({"cmd": "recover-start"}),
+        json!({"cmd": "recover-start", "identity": "zz"}),
+        json!({"cmd": "recover-invite"}),
+        json!({"cmd": "recover-cancel"}),
+        json!({"cmd": "recover-finish"}),
+        json!({"cmd": "recover-finish", "without_account": true, "lost_at": 5}),
+        json!({"cmd": "recover-lost-at"}),
+        json!({"cmd": "recover-lost-at", "lost_at": 5}),
+        json!({"cmd": "keep-work"}),
+        json!({"cmd": "keep-work", "name": "Nobody"}),
+        json!({"cmd": "keep-work", "name": device}),
+        json!({"cmd": "keep-work", "name": device, "up_to": "soon"}),
+        json!({"cmd": "keep-work", "name": device, "up_to": "all"}),
+        json!({"cmd": "keep-work", "name": device, "up_to": "17"}),
+        json!({"cmd": "restore-from-host"}),
+        json!({"cmd": "restore-from-host", "words": words, "at": "nowhere"}),
+        json!({"cmd": "restore-from-host", "words": words, "at": "nowhere", "key": hex::encode([1; 32])}),
+        json!({"cmd": "recover-undo"}),
+        json!({"cmd": "recover-undo", "to": hex::encode([2; 32])}),
+        json!({"cmd": "recover-kept-seen"}),
+        json!({"cmd": "recover-kept-seen", "to": [hex::encode([2; 32])]}),
+        json!({"cmd": "recover-stop-waiting"}),
+        json!({"cmd": "recover-stop-waiting", "all": true, "who": "Bea"}),
+        json!({"cmd": "recover-stop-waiting", "all": true}),
+        json!({"cmd": "recover-stop-waiting", "who": exact(&[4; 32])}),
+    ] {
+        t.same(req).await;
+    }
+    t.same_message(&message_of(170, vec![(1, Value::from(5u64))]))
+        .await;
+    for d in [&t.old, &t.new] {
+        let _ = d.stopping.send(true);
+    }
+
+    // two devices that belong to nobody
+    let fresh = |at: &str| {
+        let paths = crate::paths::Paths::at(&dir.path().join(at));
+        let mut config = crate::config::Config {
+            listen: "127.0.0.1:0".into(),
+            ..Default::default()
+        };
+        config.this_run.no_mount = true;
+        config.this_run.no_discovery = true;
+        config.this_run.no_udp = true;
+        (paths, config)
+    };
+    let (po, co) = fresh("bare-old");
+    let (pn, cn) = fresh("bare-new");
+    let u = Twins {
+        old: Daemon::start(po, co).await.unwrap(),
+        new: Daemon::start(pn, cn).await.unwrap(),
+        swap: Vec::new(),
+    };
+    for req in [
+        json!({"cmd": "recover"}),
+        json!({"cmd": "recovery-sheet"}),
+        json!({"cmd": "recovery-check", "words": words}),
+        json!({"cmd": "recover-start", "code": "not a code"}),
+        json!({"cmd": "recover-start", "identity": "zz"}),
+        json!({"cmd": "recover-start", "identity": " 00ff "}),
+        json!({"cmd": "recover-start", "identity": exact(&[3; 5])}),
+        json!({"cmd": "recover-invite"}),
+        json!({"cmd": "recover-invite", "at": "192.0.2.1:7171"}),
+        json!({"cmd": "recover-cancel"}),
+        json!({"cmd": "recover-finish"}),
+        json!({"cmd": "recover-lost-at", "lost_at": 5}),
+        json!({"cmd": "restore-from-host", "words": "not the words", "at": "x", "key": hex::encode([1; 32])}),
+        json!({"cmd": "restore-from-host", "words": words, "at": "nowhere", "key": hex::encode([1; 31])}),
+        json!({"cmd": "restore-from-host", "words": words, "at": "nowhere", "key": hex::encode([1; 32])}),
+        json!({"cmd": "restore-from-host", "words": words, "key": hex::encode([1; 32])}),
+        json!({"cmd": "recover-undo", "to": hex::encode([2; 32])}),
+        json!({"cmd": "recover-stop-waiting", "all": true}),
+    ] {
+        u.same(req).await;
+    }
+}
+
+/// Hosting a contact: offered by each twin to its Bea, taken up by each
+/// Bea, the one by name and the other typed, and ended; with every refusal
+/// before, a ref as text and as bytes, and `hosting` on both sides.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn hosting_is_answered_the_same() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut t = Twins::start(dir.path()).await;
+    tokio::spawn(t.old.clone().run());
+    tokio::spawn(t.new.clone().run());
+    let bea = befriended(&mut t, dir.path(), "Bea").await;
+    let bea_id = |i: usize| bea[i].core().identity.as_ref().unwrap().id();
+    let cy = a_contact(&t, "Cy", 7);
+    for d in [&t.old, &t.new] {
+        crate::contacts::set(d, "Cy", "hosts-only").unwrap();
+    }
+    t.same_here(json!({"cmd": "hosting"})).await;
+    for req in [
+        json!({"cmd": "host-offer"}),
+        json!({"cmd": "host-offer", "who": "Nobody"}),
+        json!({"cmd": "host-offer", "who": "Cy"}),
+        json!({"cmd": "host-offer", "who": exact(&cy)}),
+        json!({"cmd": "host-offer", "who": "Bea"}),
+        json!({"cmd": "host-accept"}),
+        json!({"cmd": "host-accept", "who": "Cy"}),
+        json!({"cmd": "host-accept", "who": exact(&cy)}),
+        json!({"cmd": "host-accept", "who": "Bea"}),
+        json!({"cmd": "host-end"}),
+        json!({"cmd": "host-end", "who": "Nobody"}),
+        json!({"cmd": "host-end", "who": "Bea"}),
+    ] {
+        t.same(req).await;
+    }
+    t.same_as(
+        json!({"cmd": "host-accept", "who": exact(&bea_id(0))}),
+        json!({"cmd": "host-accept", "who": exact(&bea_id(1))}),
+    )
+    .await;
+    // each twin plugged in on a network not metered: it can host
+    for d in [&t.old, &t.new] {
+        d.conditions.tell(crate::conditions::Told {
+            plugged_in: true,
+            metered: false,
+        });
+    }
+    t.same_here(json!({"cmd": "hosting"})).await;
+    for req in [
+        json!({"cmd": "host-offer", "who": "Bea", "devices": ["Nowhere"]}),
+        json!({"cmd": "host-offer", "who": "Bea", "envelopes": 10, "relay_mb": 5}),
+        json!({"cmd": "host-offer", "who": "bea", "devices": [], "envelopes": 20}),
+        json!({"cmd": "host-offer", "who": "Bea"}),
+    ] {
+        t.same(req).await;
+    }
+    t.same_here(json!({"cmd": "hosting"})).await;
+    let mut b = Twins {
+        old: bea[0].clone(),
+        new: bea[1].clone(),
+        swap: t.swap.clone(),
+    };
+    until("the offers to host Bea", || {
+        bea.iter()
+            .all(|x| !crate::hosting::list(x).hosting.is_empty())
+    })
+    .await;
+    b.same_here(json!({"cmd": "hosting"})).await;
+    for req in [
+        json!({"cmd": "host-accept", "who": "Me"}),
+        json!({"cmd": "host-accept", "who": "me"}),
+    ] {
+        b.same(req).await;
+    }
+    b.same_here(json!({"cmd": "hosting"})).await;
+    b.same(json!({"cmd": "host-end", "who": "Me"})).await;
+    b.same_here(json!({"cmd": "hosting"})).await;
+    t.same(json!({"cmd": "host-end", "who": "Bea"})).await;
+    b.swap.clear();
+    t.same_here(json!({"cmd": "hosting"})).await;
+    for x in &bea {
+        let _ = x.stopping.send(true);
+    }
+}
+
+/// Freeing space and the service's own: how long old versions are kept,
+/// freeing what is past it or what nothing names, emptying a history, a
+/// reload, and stopping; with a space named as text, as the start of its
+/// id in any case, and as bytes.
+#[tokio::test]
+async fn freeing_space_is_answered_the_same() {
+    let dir = tempfile::tempdir().unwrap();
+    let t = Twins::start(dir.path()).await;
+    let files = t.new.core().files_id().unwrap();
+    let start = hex::encode(&files[..4]);
+    for req in [
+        json!({"cmd": "keep-old"}),
+        json!({"cmd": "keep-old", "keep": "never ever"}),
+        json!({"cmd": "keep-old", "keep": "7d"}),
+        json!({"cmd": "keep-old", "keep": "forever", "space": ""}),
+        json!({"cmd": "keep-old", "keep": "3 days", "space": start}),
+        json!({"cmd": "keep-old", "keep": "3 days", "space": start.to_uppercase()}),
+        json!({"cmd": "keep-old", "keep": "3 days", "space": format!(" {start} ")}),
+        json!({"cmd": "keep-old", "keep": "1", "space": exact(&files)}),
+        json!({"cmd": "keep-old", "keep": "1", "space": exact(&files[..2])}),
+        json!({"cmd": "keep-old", "keep": "1", "space": exact(&[])}),
+        json!({"cmd": "keep-old", "keep": "1", "space": "ffffffffff"}),
+        json!({"cmd": "free-space"}),
+        json!({"cmd": "free-space", "dry_run": true}),
+        json!({"cmd": "free-space", "dry_run": false}),
+        json!({"cmd": "free-space", "unnamed": true}),
+        json!({"cmd": "free-space", "unnamed": true, "delete": true}),
+        json!({"cmd": "free-space", "unnamed": false, "delete": true}),
+        json!({"cmd": "history-empty"}),
+        json!({"cmd": "history-empty", "space": ""}),
+        json!({"cmd": "history-empty", "space": start}),
+        json!({"cmd": "history-empty", "space": exact(&files)}),
+        json!({"cmd": "history-empty", "space": "ffffffffff"}),
+        json!({"cmd": "reload"}),
+    ] {
+        t.same(req).await;
+    }
+    t.same_message(&message_of(138, vec![(1, Value::from(3u64))]))
+        .await;
+    t.same(json!({"cmd": "stop"})).await;
+    assert!(*t.new.stopping.subscribe().borrow());
+}

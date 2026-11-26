@@ -1188,6 +1188,7 @@ fn role_name(role: u64) -> &'static str {
 
 /// What a successor changed, as this person names those it concerns:
 /// `taken_out`, names, and `roles`, each `{name, from, to}`.
+#[cfg(any(test, debug_assertions, feature = "by-name"))]
 fn change_json(
     core: &Core,
     me: &[u8; 32],
@@ -1263,6 +1264,71 @@ fn change_of(
 /// what it changed, who it was handed on to if it was, whether undo can
 /// put it right and what undo does, in words, and `undone`, the group an
 /// undo made.
+pub(crate) fn kept_change_of(
+    core: &Core,
+    old: &SpaceId,
+    new: &SpaceId,
+    undone: Option<&str>,
+) -> Option<api::KeptChange> {
+    let me = core.me()?;
+    let contacts = core.contacts();
+    let sp = core.spaces.get(new)?.space.as_ref()?;
+    let mut all = named_in(sp);
+    if let Some(o) = core.spaces.get(old).and_then(|h| h.space.as_ref()) {
+        all.extend(named_in(o));
+    }
+    let c = change_of(core, &me, &contacts, &all, new);
+    let name = |w: &[u8; 32]| name_of(&me, &contacts, &all, w);
+    let group_name = group::name(sp);
+    let handed = sp.owner().filter(|o| *o != me).map(|o| name(&o));
+    let undo = match &handed {
+        Some(h) => format!(
+            "Undo cannot take {group_name} back: it was handed on to {h}, who holds it now. \
+             Only they can hand it back."
+        ),
+        None => {
+            let mut parts = Vec::new();
+            if !c.taken_out.is_empty() {
+                parts.push(format!("adds back {}", c.taken_out.join(", ")));
+            }
+            for r in &c.roles {
+                parts.push(format!("gives {} back the role of {}", r.name, r.from));
+            }
+            format!(
+                "Undo moves {group_name} on again: it {}.",
+                parts.join(", and ")
+            )
+        }
+    };
+    // the group an undo made, kept in hex: one not in hex this software
+    // never writes, and is left out
+    let undone = undone.and_then(|u| {
+        let id = hex::decode(u)
+            .ok()
+            .and_then(|b| <[u8; 32]>::try_from(b).ok());
+        if id.is_none() {
+            tracing::error!("the group an undo made, {u:?}, is not one");
+        }
+        id
+    });
+    Some(api::KeptChange {
+        group: *old,
+        to: *new,
+        name: group_name,
+        by: name(&sp.creator()),
+        at: sp.entry(new).and_then(|g| g.time()),
+        device: core.moved_by_device(new),
+        can_undo: handed.is_none(),
+        handed_to: handed,
+        undo,
+        undone,
+        roles: c.roles,
+        taken_out: c.taken_out,
+    })
+}
+
+/// [`kept_change_of`] as main had it, by name.
+#[cfg(any(test, debug_assertions, feature = "by-name"))]
 pub(crate) fn kept_change_json(
     core: &Core,
     old: &SpaceId,

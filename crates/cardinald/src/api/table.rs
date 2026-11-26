@@ -1047,12 +1047,41 @@ typed!(
         4 key: [u8; 32],
     }
 );
-rec!(HOSTABLE "hostable": 1 "name" T, 2 "outside" BOOL, 3 "sees" T, 4 "services" [T]);
-rec!(HOSTING "hosting":
-    1 "accepted" BOOL, 2 "devices" [T], 3 "ended" BOOL, 4 "envelopes" U, 5 "mine" BOOL,
-    6 "name" T, 7 "relay_bytes" U, 8 "sees" T, 9 "waiting" U, 10 "who" B,
-    11 "serving" [HOSTABLE], 12 "offered_at" U, 13 "after" B, 14 "accepted_at" U,
-    15 "ended_at" U, 16 "ended_by" B, 17 "declined" BOOL);
+typed!(
+    /// A device that serves, or can: whether it is reached from outside
+    /// its network, what it gives, and what it sees.
+    HOSTABLE "hostable" Hostable {
+        1 name: String,
+        2 outside: bool,
+        3 sees: Cow<'static, str>,
+        4 services: Vec<Cow<'static, str>>,
+    }
+);
+typed!(
+    /// A hosting between this person and a contact, or an offer of one.
+    HOSTING "hosting" Hosting {
+        1 accepted: bool,
+        2 devices: Vec<String>,
+        3 ended: bool,
+        4 envelopes: Option<u64>,
+        /// This person hosts them.
+        5 mine: bool,
+        6 name: String,
+        7 relay_bytes: Option<u64>,
+        8 sees: Cow<'static, str>,
+        /// Envelopes held for them on this device, where it serves them.
+        9 waiting: Option<u64>,
+        10 who: [u8; 32],
+        11 serving: Vec<Hostable>,
+        12 offered_at: Option<u64>,
+        /// The message in the conversation it comes just after.
+        13 after: Option<[u8; 16]>,
+        14 accepted_at: Option<u64>,
+        15 ended_at: Option<u64>,
+        16 ended_by: Option<[u8; 32]>,
+        17 declined: bool,
+    }
+);
 typed!(
     /// Whether this device may be inspected now, and until when.
     INSPECTION "inspection" Inspection {
@@ -1098,11 +1127,36 @@ typed!(
         4 time: Option<u64>,
     }
 );
-rec!(KEPT_CHANGE "kept change":
-    1 "at" U, 2 "by" T, 3 "can_undo" BOOL, 4 "device" T, 5 "group" B, 6 "handed_to" T,
-    7 "name" T, 8 "roles" [ROLE_CHANGE], 9 "taken_out" [T], 10 "to" B, 11 "undo" T,
-    12 "undone" B);
-rec!(LOST_DEVICE "lost device": 1 "key" B, 2 "name" T, 3 "set_aside" U);
+typed!(
+    /// A group change kept after a recovery by guardians (D84).
+    KEPT_CHANGE "kept change" KeptChange {
+        1 at: Option<u64>,
+        2 by: String,
+        3 can_undo: bool,
+        4 device: Option<String>,
+        /// The group it left.
+        5 group: [u8; 32],
+        6 handed_to: Option<String>,
+        7 name: String,
+        8 roles: Vec<RoleChange>,
+        9 taken_out: Vec<String>,
+        /// The group it moved to.
+        10 to: [u8; 32],
+        11 undo: String,
+        /// The group an undo made.
+        12 undone: Option<[u8; 32]>,
+    }
+);
+typed!(
+    /// A device a recovery removed.
+    LOST_DEVICE "lost device" LostDevice {
+        /// The start of its key.
+        1 key: [u8; 8],
+        2 name: Option<String>,
+        /// What it wrote that is set aside in the spaces held now.
+        3 set_aside: Option<u64>,
+    }
+);
 typed!(
     /// A member of a group, as this person sees them.
     MEMBER "member" Member {
@@ -1227,7 +1281,14 @@ typed!(
         2 files: u64,
     }
 );
-rec!(PAIR_AGAIN "pair again": 1 "key" B, 2 "name" T);
+typed!(
+    /// A device to pair again after a recovery.
+    PAIR_AGAIN "pair again" PairAgain {
+        /// The start of its key.
+        1 key: [u8; 8],
+        2 name: Option<String>,
+    }
+);
 typed!(
     /// Pairing under way on this device.
     PAIRING "pairing" Pairing {
@@ -1376,7 +1437,15 @@ typed!(
         20 neighbour: bool,
     }
 );
-rec!(SET_ASIDE "set aside": 1 "entry" B, 2 "space" B, 3 "time_ms" U);
+typed!(
+    /// An entry set aside for want of a witness: the starts of its id and
+    /// its space's.
+    SET_ASIDE "set aside" SetAside {
+        1 entry: [u8; 8],
+        2 space: [u8; 8],
+        3 time_ms: Option<u64>,
+    }
+);
 typed!(
     /// What a space held here takes.
     SPACE_USAGE "space usage" SpaceUsage {
@@ -1412,7 +1481,13 @@ typed!(
         3 text: String,
     }
 );
-rec!(SUCCESSION "succession": 1 "id" T, 2 "space" T);
+typed!(
+    /// No longer sent: a succession a recovery asked about.
+    SUCCESSION "succession" Succession {
+        1 id: String,
+        2 space: String,
+    }
+);
 typed!(
     /// A host a reach node names, as this device sees it.
     THEIR_REACH "reach seen" ReachSeen {
@@ -2279,6 +2354,238 @@ typed!(fields GuardingConfirmArgs {
 });
 asks!(GUARDING_CONFIRM: 161 "guarding-confirm" GuardingConfirmArgs -> GuardingReply, writes);
 
+// ---- Recovery ----
+
+typed!(fields RecoverArgs {});
+typed!(
+    fields
+    /// What is under way on this device, or what the last recovery left.
+    RecoverReply {
+        2 asked: Option<bool>,
+        3 confirmed: Option<u64>,
+        4 endorsed: Option<u64>,
+        5 fingerprint: Option<String>,
+        6 guardians: Option<u64>,
+        7 held: Option<u64>,
+        8 helper: Option<bool>,
+        9 identity: Option<[u8; 32]>,
+        10 in_effect: Option<bool>,
+        11 lost_at: Option<u64>,
+        12 lost_devices: Option<Vec<LostDevice>>,
+        13 pair_again: Option<Vec<PairAgain>>,
+        14 proposed: Option<u64>,
+        15 gone successions: Vec<Succession>,
+        16 threshold: Option<u64>,
+        17 under_way: bool,
+        18 finished: Option<bool>,
+        19 words: Option<String>,
+        20 kept_changes: Option<Vec<KeptChange>>,
+        21 not_heard: Option<Vec<String>>,
+    }
+);
+asks!(RECOVER: 162 "recover" RecoverArgs -> RecoverReply, writes);
+
+typed!(fields RecoverStartArgs {
+    1 code: Option<String>,
+    2 identity: Option<Reference>,
+});
+typed!(fields RecoverStartReply {
+    2 fingerprint: String,
+    3 identity: Option<[u8; 32]>,
+});
+asks!(RECOVER_START: 163 "recover-start" RecoverStartArgs -> RecoverStartReply, writes);
+
+typed!(fields RecoverInviteArgs {
+    1 at: Option<String>,
+});
+typed!(fields RecoverInviteReply {
+    2 code: String,
+    3 fingerprint: String,
+});
+asks!(RECOVER_INVITE: 164 "recover-invite" RecoverInviteArgs -> RecoverInviteReply, writes);
+
+typed!(fields RecoverLostAtArgs {
+    1 lost_at: Option<u64>,
+});
+typed!(fields LostDevicesReply {
+    2 lost_devices: Vec<LostDevice>,
+});
+asks!(RECOVER_LOST_AT: 166 "recover-lost-at" RecoverLostAtArgs -> LostDevicesReply, writes);
+
+typed!(fields RecoverCancelArgs {});
+typed!(fields RecoverCancelReply {
+    2 fingerprint: Option<String>,
+});
+asks!(RECOVER_CANCEL: 167 "recover-cancel" RecoverCancelArgs -> RecoverCancelReply, writes);
+
+typed!(fields RecoverFinishArgs {
+    1 without_account: Option<bool>,
+    2 lost_at: Option<u64>,
+});
+typed!(fields RecoverFinishReply {
+    2 account: bool,
+    3 lost_devices: Vec<LostDevice>,
+    4 pair_again: Vec<PairAgain>,
+    5 words: String,
+    6 not_heard: Vec<String>,
+});
+asks!(RECOVER_FINISH: 168 "recover-finish" RecoverFinishArgs -> RecoverFinishReply, writes);
+
+typed!(fields KeepWorkArgs {
+    1 name: Option<String>,
+    2 up_to: Option<String>,
+});
+typed!(fields KeepWorkReply {
+    2 kept: u64,
+    3 set_aside: Vec<SetAside>,
+});
+asks!(KEEP_WORK: 169 "keep-work" KeepWorkArgs -> KeepWorkReply, writes);
+
+typed!(fields RecoveryCheckArgs {
+    1 words: Option<String>,
+});
+asks!(RECOVERY_CHECK: 170 "recovery-check" RecoveryCheckArgs -> Done, reads);
+
+typed!(fields RecoverySheetArgs {});
+typed!(fields RecoverySheetReply {
+    2 hosts: Vec<Host>,
+});
+asks!(RECOVERY_SHEET: 171 "recovery-sheet" RecoverySheetArgs -> RecoverySheetReply, reads);
+
+typed!(fields RestoreFromHostArgs {
+    1 words: Option<String>,
+    2 at: Option<String>,
+    3 gone key: String,
+    4 key: Option<bytes::Bytes>,
+});
+typed!(fields RestoreFromHostReply {
+    2 at: String,
+});
+asks!(RESTORE_FROM_HOST: 172 "restore-from-host" RestoreFromHostArgs -> RestoreFromHostReply,
+    writes);
+
+typed!(fields RecoverUndoArgs {
+    1 to: Option<bytes::Bytes>,
+});
+typed!(fields RecoverUndoReply {
+    2 group: [u8; 32],
+    3 kept_changes: Vec<KeptChange>,
+});
+asks!(RECOVER_UNDO: 173 "recover-undo" RecoverUndoArgs -> RecoverUndoReply, writes);
+
+typed!(fields RecoverKeptSeenArgs {
+    1 to: Option<Vec<bytes::Bytes>>,
+});
+typed!(fields KeptChangesReply {
+    2 kept_changes: Vec<KeptChange>,
+});
+asks!(RECOVER_KEPT_SEEN: 174 "recover-kept-seen" RecoverKeptSeenArgs -> KeptChangesReply, writes);
+
+typed!(fields RecoverStopWaitingArgs {
+    1 all: Option<bool>,
+    2 who: Option<Reference>,
+});
+typed!(fields RecoverStopWaitingReply {
+    2 not_heard: Vec<String>,
+    3 stopped: Vec<String>,
+});
+asks!(RECOVER_STOP_WAITING: 175 "recover-stop-waiting" RecoverStopWaitingArgs
+    -> RecoverStopWaitingReply, writes);
+
+// ---- Hosting contacts ----
+
+typed!(fields HostOfferArgs {
+    1 who: Option<Reference>,
+    2 devices: Option<Vec<String>>,
+    3 envelopes: Option<u64>,
+    4 relay_mb: Option<u64>,
+});
+typed!(fields HostOfferReply {
+    2 devices: Vec<String>,
+    3 sees: Cow<'static, str>,
+    4 on: Vec<Hostable>,
+});
+asks!(HOST_OFFER: 188 "host-offer" HostOfferArgs -> HostOfferReply, writes);
+
+typed!(fields HostAcceptArgs {
+    1 who: Option<Reference>,
+});
+typed!(fields HostAcceptReply {
+    2 sees: Cow<'static, str>,
+});
+asks!(HOST_ACCEPT: 189 "host-accept" HostAcceptArgs -> HostAcceptReply, writes);
+
+typed!(fields HostEndArgs {
+    1 who: Option<Reference>,
+});
+typed!(fields HostEndReply {
+    2 ended: bool,
+});
+asks!(HOST_END: 190 "host-end" HostEndArgs -> HostEndReply, writes);
+
+typed!(fields HostingArgs {});
+typed!(
+    fields
+    /// Whom this person hosts, who hosts them, and the offers between,
+    /// with the devices that can host someone now, or why none can.
+    HostingReply {
+        2 can: Vec<String>,
+        3 hosting: Vec<Hosting>,
+        4 why_not: Option<Cow<'static, str>>,
+        5 devices: Vec<Hostable>,
+    }
+);
+asks!(HOSTING_NOW: 191 "hosting" HostingArgs -> HostingReply, reads);
+
+// ---- The service, and freeing space ----
+
+typed!(fields StopArgs {});
+asks!(STOP: 4 "stop" StopArgs -> Done, writes);
+
+typed!(fields ReloadArgs {});
+asks!(RELOAD: 5 "reload" ReloadArgs -> Done, writes);
+
+typed!(fields KeepOldArgs {
+    1 keep: Option<String>,
+    2 space: Option<Reference>,
+});
+typed!(fields KeepOldReply {
+    2 keep: String,
+});
+asks!(KEEP_OLD: 138 "keep-old" KeepOldArgs -> KeepOldReply, writes);
+
+typed!(fields FreeSpaceArgs {
+    1 dry_run: Option<bool>,
+    /// Content that nothing names, in place of old versions.
+    2 unnamed: Option<bool>,
+    3 delete: Option<bool>,
+});
+typed!(
+    fields
+    /// What was freed: of old versions, with what is over the budget; of
+    /// content nothing names, whether it was deleted and what is unsure.
+    FreeSpaceReply {
+        2 bytes: u64,
+        3 deleted: Option<bool>,
+        4 left: Option<u64>,
+        5 objects: u64,
+        6 only_here: Option<OnlyHere>,
+        7 unchecked: Option<bool>,
+        8 unsure: Option<Vec<String>>,
+    }
+);
+asks!(FREE_SPACE: 139 "free-space" FreeSpaceArgs -> FreeSpaceReply, writes);
+
+typed!(fields HistoryEmptyArgs {
+    1 space: Option<Reference>,
+});
+typed!(fields HistoryEmptyReply {
+    2 bytes: u64,
+    3 left: u64,
+    4 objects: u64,
+});
+asks!(HISTORY_EMPTY: 141 "history-empty" HistoryEmptyArgs -> HistoryEmptyReply, writes);
+
 // ---- Reaching a contact ----
 
 typed!(fields ContactStatusArgs {
@@ -2594,8 +2901,8 @@ pub static REQUESTS: &[Request] = &[
     HELLO,
     STATUS,
     WATCH,
-    req!(4 "stop" () -> ()),
-    req!(5 "reload" () -> ()),
+    STOP,
+    RELOAD,
     CONDITIONS_NOW,
     NETWORK_CHANGED,
     req!(8 "setup-begin" () -> (2 "ask" [U], 3 "words" [T])),
@@ -2680,12 +2987,10 @@ pub static REQUESTS: &[Request] = &[
     PIN,
     UNPIN,
     RETENTION,
-    req!(138 "keep-old" (1 "keep" T, 2 "space" REF) -> (2 "keep" T)),
-    req!(139 "free-space" (1 "dry_run" BOOL, 2 "unnamed" BOOL, 3 "delete" BOOL) -> (
-        2 "bytes" U, 3 "deleted" BOOL, 4 "left" U, 5 "objects" U, 6 "only_here" {ONLY_HERE},
-        7 "unchecked" BOOL, 8 "unsure" [T])),
+    KEEP_OLD,
+    FREE_SPACE,
     SPACE_USAGE_NOW,
-    req!(141 "history-empty" (1 "space" REF) -> (2 "bytes" U, 3 "left" U, 4 "objects" U)),
+    HISTORY_EMPTY,
     // ---- Guardians and recovery: 150 to 179 ----
     GUARDIANS,
     GUARDIANS_SET,
@@ -2699,30 +3004,21 @@ pub static REQUESTS: &[Request] = &[
     GUARDING_CAUTION,
     GUARDING_ENDORSE,
     GUARDING_CONFIRM,
-    req!(162 "recover" () -> (
-        2 "asked" BOOL, 3 "confirmed" U, 4 "endorsed" U, 5 "fingerprint" T, 6 "guardians" U,
-        7 "held" U, 8 "helper" BOOL, 9 "identity" B, 10 "in_effect" BOOL, 11 "lost_at" U,
-        12 "lost_devices" [LOST_DEVICE], 13 "pair_again" [PAIR_AGAIN], 14 "proposed" U,
-        15 "successions" (gone [SUCCESSION]), 16 "threshold" U, 17 "under_way" BOOL,
-        18 "finished" BOOL, 19 "words" T, 20 "kept_changes" [KEPT_CHANGE], 21 "not_heard" [T])),
-    req!(163 "recover-start" (1 "code" T, 2 "identity" REF) -> (
-        2 "fingerprint" T, 3 "identity" B)),
-    req!(164 "recover-invite" (1 "at" T) -> (2 "code" T, 3 "fingerprint" T)),
+    RECOVER,
+    RECOVER_START,
+    RECOVER_INVITE,
     gone!(165 "recover-keep-succession" (1 "id" T, 2 "keep" BOOL) -> (
         2 "answered" U, 3 "kept" BOOL)),
-    req!(166 "recover-lost-at" (1 "lost_at" U) -> (2 "lost_devices" [LOST_DEVICE])),
-    req!(167 "recover-cancel" () -> (2 "fingerprint" T)),
-    req!(168 "recover-finish" (1 "without_account" BOOL, 2 "lost_at" U) -> (
-        2 "account" BOOL, 3 "lost_devices" [LOST_DEVICE], 4 "pair_again" [PAIR_AGAIN],
-        5 "words" T, 6 "not_heard" [T])),
-    req!(169 "keep-work" (1 "name" T, 2 "up_to" T) -> (2 "kept" U, 3 "set_aside" [SET_ASIDE])),
-    req!(170 "recovery-check" (1 "words" T) -> ()),
-    req!(171 "recovery-sheet" () -> (2 "hosts" [HOST])),
-    req!(172 "restore-from-host" (1 "words" T, 2 "at" T, 3 "key" (gone T), 4 "key" B) -> (2 "at" T)),
-    req!(173 "recover-undo" (1 "to" B) -> (2 "group" B, 3 "kept_changes" [KEPT_CHANGE])),
-    req!(174 "recover-kept-seen" (1 "to" [B]) -> (2 "kept_changes" [KEPT_CHANGE])),
-    req!(175 "recover-stop-waiting" (1 "all" BOOL, 2 "who" REF) -> (
-        2 "not_heard" [T], 3 "stopped" [T])),
+    RECOVER_LOST_AT,
+    RECOVER_CANCEL,
+    RECOVER_FINISH,
+    KEEP_WORK,
+    RECOVERY_CHECK,
+    RECOVERY_SHEET,
+    RESTORE_FROM_HOST,
+    RECOVER_UNDO,
+    RECOVER_KEPT_SEEN,
+    RECOVER_STOP_WAITING,
     // ---- Networks, hosts and peers: 180 to 199 ----
     ROUTER_NOW,
     BLUETOOTH_NOW,
@@ -2732,12 +3028,10 @@ pub static REQUESTS: &[Request] = &[
     PEER_ADD,
     PEER_REMOVE,
     PEER_LIST,
-    req!(188 "host-offer" (1 "who" REF, 2 "devices" [T], 3 "envelopes" U, 4 "relay_mb" U) -> (
-        2 "devices" [T], 3 "sees" T, 4 "on" [HOSTABLE])),
-    req!(189 "host-accept" (1 "who" REF) -> (2 "sees" T)),
-    req!(190 "host-end" (1 "who" REF) -> (2 "ended" BOOL)),
-    req!(191 "hosting" () -> (
-        2 "can" [T], 3 "hosting" [HOSTING], 4 "why_not" T, 5 "devices" [HOSTABLE])),
+    HOST_OFFER,
+    HOST_ACCEPT,
+    HOST_END,
+    HOSTING_NOW,
     // ---- Inspection and measuring: 200 to 219 ----
     req!(200 "inspect-on" (1 "minutes" U) -> (2 "token" B, 3 "until" U)),
     req!(201 "inspect-off" () -> (2 "was_on" BOOL)),

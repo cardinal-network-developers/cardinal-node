@@ -443,6 +443,10 @@ pub mod typed {
         SpaceUsageArgs, SpaceUsageReply,
     };
     use crate::api::{
+        FreeSpaceArgs, FreeSpaceReply, HistoryEmptyArgs, HistoryEmptyReply, KeepOldArgs,
+        KeepOldReply, ReloadArgs, StopArgs,
+    };
+    use crate::api::{
         GroupAddArgs, GroupCreateArgs, GroupCreateReply, GroupDeclineArgs, GroupJoinArgs,
         GroupJoinReply, GroupLeaveArgs, GroupLeaveReply, GroupMemberArgs, GroupMembersArgs,
         GroupMembersReply, GroupReachArgs, GroupReachReply, GroupRejoinArgs, GroupRemoveArgs,
@@ -454,6 +458,18 @@ pub mod typed {
         GuardingCautionArgs, GuardingCautionReply, GuardingConfirmArgs, GuardingConfirmChangeArgs,
         GuardingEndorseArgs, GuardingInviteArgs, GuardingInviteReply, GuardingNeverArgs,
         GuardingReply, NameReply,
+    };
+    use crate::api::{
+        HostAcceptArgs, HostAcceptReply, HostEndArgs, HostEndReply, HostOfferArgs, HostOfferReply,
+        HostingArgs, HostingReply,
+    };
+    use crate::api::{
+        KeepWorkArgs, KeepWorkReply, KeptChangesReply, LostDevicesReply, RecoverArgs,
+        RecoverCancelArgs, RecoverCancelReply, RecoverFinishArgs, RecoverFinishReply,
+        RecoverInviteArgs, RecoverInviteReply, RecoverKeptSeenArgs, RecoverLostAtArgs,
+        RecoverReply, RecoverStartArgs, RecoverStartReply, RecoverStopWaitingArgs,
+        RecoverStopWaitingReply, RecoverUndoArgs, RecoverUndoReply, RecoveryCheckArgs,
+        RecoverySheetArgs, RecoverySheetReply, RestoreFromHostArgs, RestoreFromHostReply,
     };
     use crate::daemon::Daemon;
     use crate::daemon::PairState;
@@ -820,6 +836,225 @@ pub mod typed {
             let who = needed(a.who.as_ref(), "who")?;
             let fp = needed(a.fingerprint.as_deref(), "fingerprint")?;
             crate::guardians::confirm(d, who.as_ref(), fp, understood).await
+        }
+    }
+
+    // ---- Recovery ----
+
+    impl Answer for RecoverArgs {
+        async fn answer(d: &Arc<Daemon>, _: &Self) -> anyhow::Result<RecoverReply> {
+            crate::recovering::status(d)
+        }
+    }
+
+    impl Answer for RecoverStartArgs {
+        async fn answer(d: &Arc<Daemon>, a: &Self) -> anyhow::Result<RecoverStartReply> {
+            crate::recovering::start(d, a.code.as_deref(), a.identity.as_ref()).await
+        }
+    }
+
+    impl Answer for RecoverInviteArgs {
+        async fn answer(d: &Arc<Daemon>, a: &Self) -> anyhow::Result<RecoverInviteReply> {
+            crate::recovering::invite(d, a.at.as_deref()).await
+        }
+    }
+
+    impl Answer for RecoverLostAtArgs {
+        async fn answer(d: &Arc<Daemon>, a: &Self) -> anyhow::Result<LostDevicesReply> {
+            crate::recovering::set_lost_at(d, a.lost_at)
+        }
+    }
+
+    impl Answer for RecoverCancelArgs {
+        async fn answer(d: &Arc<Daemon>, _: &Self) -> anyhow::Result<RecoverCancelReply> {
+            crate::recovering::cancel(d).await
+        }
+    }
+
+    impl Answer for RecoverFinishArgs {
+        async fn answer(d: &Arc<Daemon>, a: &Self) -> anyhow::Result<RecoverFinishReply> {
+            let without = a.without_account == Some(true);
+            crate::recovering::finish(d, without, a.lost_at).await
+        }
+    }
+
+    impl Answer for KeepWorkArgs {
+        async fn answer(d: &Arc<Daemon>, a: &Self) -> anyhow::Result<KeepWorkReply> {
+            let name = needed(a.name.as_deref(), "name")?;
+            crate::recovering::keep_work(d, name, a.up_to.as_deref())
+        }
+    }
+
+    impl Answer for RecoveryCheckArgs {
+        async fn answer(d: &Arc<Daemon>, a: &Self) -> anyhow::Result<Done> {
+            crate::recovery::root_from_words(d, needed(a.words.as_deref(), "words")?)?;
+            Ok(Done {})
+        }
+    }
+
+    impl Answer for RecoverySheetArgs {
+        async fn answer(d: &Arc<Daemon>, _: &Self) -> anyhow::Result<RecoverySheetReply> {
+            Ok(RecoverySheetReply {
+                hosts: crate::host::hosts(d)?,
+            })
+        }
+    }
+
+    impl Answer for RestoreFromHostArgs {
+        async fn answer(d: &Arc<Daemon>, a: &Self) -> anyhow::Result<RestoreFromHostReply> {
+            let words = needed(a.words.as_deref(), "words")?;
+            let at = needed(a.at.as_deref(), "at")?;
+            let key = needed(a.key.as_ref(), "key")?;
+            crate::host::restore(d, words, at, key).await
+        }
+    }
+
+    impl Answer for RecoverUndoArgs {
+        async fn answer(d: &Arc<Daemon>, a: &Self) -> anyhow::Result<RecoverUndoReply> {
+            crate::recovering::undo_kept(d, needed(a.to.as_ref(), "to")?).await
+        }
+    }
+
+    impl Answer for RecoverKeptSeenArgs {
+        async fn answer(d: &Arc<Daemon>, a: &Self) -> anyhow::Result<KeptChangesReply> {
+            let none = Vec::new();
+            crate::recovering::kept_seen(d, a.to.as_ref().unwrap_or(&none))
+        }
+    }
+
+    impl Answer for RecoverStopWaitingArgs {
+        async fn answer(d: &Arc<Daemon>, a: &Self) -> anyhow::Result<RecoverStopWaitingReply> {
+            let all = a.all == Some(true);
+            let who = a.who.as_ref().map(|w| w.as_ref());
+            crate::recovering::stop_waiting(d, who, all).await
+        }
+    }
+
+    // ---- Hosting contacts ----
+
+    impl Answer for HostOfferArgs {
+        async fn answer(d: &Arc<Daemon>, a: &Self) -> anyhow::Result<HostOfferReply> {
+            let who = needed(a.who.as_ref(), "who")?;
+            let none = Vec::new();
+            let devices = a.devices.as_ref().unwrap_or(&none);
+            crate::hosting::offer(d, who.as_ref(), devices, a.envelopes, a.relay_mb)
+        }
+    }
+
+    impl Answer for HostAcceptArgs {
+        async fn answer(d: &Arc<Daemon>, a: &Self) -> anyhow::Result<HostAcceptReply> {
+            crate::hosting::accept(d, needed(a.who.as_ref(), "who")?.as_ref())
+        }
+    }
+
+    impl Answer for HostEndArgs {
+        async fn answer(d: &Arc<Daemon>, a: &Self) -> anyhow::Result<HostEndReply> {
+            crate::hosting::end(d, needed(a.who.as_ref(), "who")?.as_ref())
+        }
+    }
+
+    impl Answer for HostingArgs {
+        async fn answer(d: &Arc<Daemon>, _: &Self) -> anyhow::Result<HostingReply> {
+            Ok(crate::hosting::list(d))
+        }
+    }
+
+    // ---- The service, and freeing space ----
+
+    impl Answer for StopArgs {
+        async fn answer(d: &Arc<Daemon>, _: &Self) -> anyhow::Result<Done> {
+            let _ = d.stopping.send(true);
+            Ok(Done {})
+        }
+    }
+
+    impl Answer for ReloadArgs {
+        async fn answer(d: &Arc<Daemon>, _: &Self) -> anyhow::Result<Done> {
+            super::reload(d)?;
+            Ok(Done {})
+        }
+    }
+
+    impl Answer for KeepOldArgs {
+        async fn answer(d: &Arc<Daemon>, a: &Self) -> anyhow::Result<KeepOldReply> {
+            let keep = crate::cleanup::Keep::parse(needed(a.keep.as_deref(), "keep")?)?;
+            // for one space, in place of the device's period; without
+            // one, the device's, for every space not set otherwise
+            match a.space.as_ref() {
+                None => d.config().keep_old = keep.to_string(),
+                Some(Reference::Typed(t)) if t.is_empty() => d.config().keep_old = keep.to_string(),
+                Some(s) => {
+                    let space = hex::encode(super::space_held_ref(d, s.as_ref())?);
+                    d.config().keep_old_spaces.insert(space, keep.to_string());
+                }
+            }
+            d.save_config()?;
+            // Forever is history retention: record it for the other devices.
+            d.housekeeping();
+            // A shorter period applies now, not at the next hourly pass.
+            let d2 = d.clone();
+            tokio::task::spawn_blocking(move || {
+                if let Err(e) = crate::cleanup::pass(&d2, false, false) {
+                    tracing::warn!("freeing old versions: {e:#}");
+                }
+            });
+            Ok(KeepOldReply {
+                keep: keep.to_string(),
+            })
+        }
+    }
+
+    impl Answer for FreeSpaceArgs {
+        async fn answer(d: &Arc<Daemon>, a: &Self) -> anyhow::Result<FreeSpaceReply> {
+            let d2 = d.clone();
+            if a.unnamed == Some(true) {
+                let delete = a.delete == Some(true);
+                let found =
+                    tokio::task::spawn_blocking(move || crate::cleanup::unnamed(&d2, delete))
+                        .await??;
+                return Ok(FreeSpaceReply {
+                    objects: found.objects,
+                    bytes: found.bytes,
+                    deleted: Some(found.deleted),
+                    unsure: Some(found.unsure),
+                    left: None,
+                    only_here: None,
+                    unchecked: None,
+                });
+            }
+            let dry_run = a.dry_run.unwrap_or(false);
+            let f = tokio::task::spawn_blocking(move || crate::cleanup::pass(&d2, true, dry_run))
+                .await??;
+            let old = crate::cleanup::shown(d);
+            Ok(FreeSpaceReply {
+                objects: f.objects,
+                bytes: f.bytes,
+                left: Some(f.left),
+                only_here: old.only_here,
+                unchecked: old.unchecked,
+                deleted: None,
+                unsure: None,
+            })
+        }
+    }
+
+    impl Answer for HistoryEmptyArgs {
+        async fn answer(d: &Arc<Daemon>, a: &Self) -> anyhow::Result<HistoryEmptyReply> {
+            let empty = match a.space.as_ref() {
+                None => crate::cleanup::Empty::All,
+                Some(Reference::Typed(t)) if t.is_empty() => crate::cleanup::Empty::All,
+                Some(s) => crate::cleanup::Empty::Space(super::space_held_ref(d, s.as_ref())?),
+            };
+            let d2 = d.clone();
+            let f = tokio::task::spawn_blocking(move || {
+                crate::cleanup::pass_emptying(&d2, empty, false)
+            })
+            .await??;
+            Ok(HistoryEmptyReply {
+                objects: f.objects,
+                bytes: f.bytes,
+                left: f.left,
+            })
         }
     }
 
@@ -1654,6 +1889,7 @@ async fn watch(d: &Daemon, mut r: Reader, mut w: Writer) {
 }
 
 /// A field that is a list of text, or nothing.
+#[cfg(any(test, debug_assertions, feature = "by-name"))]
 fn strings(req: &Value, name: &str) -> Vec<String> {
     let list = req.get(name).and_then(|v| v.as_array());
     let items = list.into_iter().flatten();
@@ -1701,8 +1937,23 @@ fn formats(req: &Value) -> anyhow::Result<Option<Vec<crate::calls::Format>>> {
 }
 
 /// A space held here, by its id in hex or the start of it.
+#[cfg(any(test, debug_assertions, feature = "by-name"))]
 fn space_held(d: &Daemon, s: &str) -> anyhow::Result<cardinal_space::SpaceId> {
-    let s = crate::api::id_hex(s).trim().to_ascii_lowercase();
+    space_starting(d, crate::api::id_hex(s).trim().to_ascii_lowercase())
+}
+
+/// The space held here whose id starts with `s`, a `ref` as it came. An
+/// old oddity, kept (DEVIATIONS.md): an id given as bytes is the start of
+/// one here too, as the way by name read its hex.
+fn space_held_ref(d: &Daemon, s: api::Ref<'_>) -> anyhow::Result<cardinal_space::SpaceId> {
+    let s = match s {
+        api::Ref::Typed(t) => t.trim().to_ascii_lowercase(),
+        api::Ref::Id(id) => id.hex().into_owned(),
+    };
+    space_starting(d, s)
+}
+
+fn space_starting(d: &Daemon, s: String) -> anyhow::Result<cardinal_space::SpaceId> {
     let core = d.core();
     let found: Vec<cardinal_space::SpaceId> = core
         .spaces
@@ -1824,10 +2075,12 @@ async fn handle(d: &Arc<Daemon>, req: &Value) -> anyhow::Result<Value> {
         }
         #[cfg(any(test, debug_assertions, feature = "by-name"))]
         "devices" => Ok(json!({"devices": devices(d)})),
+        #[cfg(any(test, debug_assertions, feature = "by-name"))]
         "stop" => {
             let _ = d.stopping.send(true);
             Ok(json!({}))
         }
+        #[cfg(any(test, debug_assertions, feature = "by-name"))]
         "reload" => {
             reload(d)?;
             Ok(json!({}))
@@ -2120,6 +2373,7 @@ async fn handle(d: &Arc<Daemon>, req: &Value) -> anyhow::Result<Value> {
             let on = req.get("on").and_then(|v| v.as_bool());
             crate::settings::read_markers_by_name(d, on)
         }
+        #[cfg(any(test, debug_assertions, feature = "by-name"))]
         "recovery-check" => {
             crate::recovery::root_from_words(d, arg(req, "words")?)?;
             Ok(json!({}))
@@ -2139,14 +2393,19 @@ async fn handle(d: &Arc<Daemon>, req: &Value) -> anyhow::Result<Value> {
         }
         #[cfg(any(test, debug_assertions, feature = "by-name"))]
         "host-off" => crate::host::disable_by_name(d),
+        #[cfg(any(test, debug_assertions, feature = "by-name"))]
         "host-offer" => {
             let devices = strings(req, "devices");
             let n = |k: &str| req.get(k).and_then(|v| v.as_u64());
-            crate::hosting::offer(d, arg(req, "who")?, &devices, n("envelopes"), n("relay_mb"))
+            let who = arg(req, "who")?;
+            crate::hosting::offer_by_name(d, who, &devices, n("envelopes"), n("relay_mb"))
         }
-        "host-accept" => crate::hosting::accept(d, arg(req, "who")?),
-        "host-end" => crate::hosting::end(d, arg(req, "who")?),
-        "hosting" => Ok(crate::hosting::list(d)),
+        #[cfg(any(test, debug_assertions, feature = "by-name"))]
+        "host-accept" => crate::hosting::accept_by_name(d, arg(req, "who")?),
+        #[cfg(any(test, debug_assertions, feature = "by-name"))]
+        "host-end" => crate::hosting::end_by_name(d, arg(req, "who")?),
+        #[cfg(any(test, debug_assertions, feature = "by-name"))]
+        "hosting" => Ok(crate::hosting::list_by_name(d)),
         #[cfg(any(test, debug_assertions, feature = "by-name"))]
         "router" => {
             if let Some(on) = req.get("on").and_then(|v| v.as_bool()) {
@@ -2172,6 +2431,7 @@ async fn handle(d: &Arc<Daemon>, req: &Value) -> anyhow::Result<Value> {
             }
             None => Ok(crate::networks::status(d)),
         },
+        #[cfg(any(test, debug_assertions, feature = "by-name"))]
         "recovery-sheet" => crate::host::sheet(d),
         #[cfg(any(test, debug_assertions, feature = "by-name"))]
         "guardians" => crate::guardians::show_by_name(d),
@@ -2236,36 +2496,49 @@ async fn handle(d: &Arc<Daemon>, req: &Value) -> anyhow::Result<Value> {
             )
             .await
         }
-        "recover" => crate::recovering::status(d),
-        "keep-work" => crate::recovering::keep_work(
+        #[cfg(any(test, debug_assertions, feature = "by-name"))]
+        "recover" => crate::recovering::status_by_name(d),
+        #[cfg(any(test, debug_assertions, feature = "by-name"))]
+        "keep-work" => crate::recovering::keep_work_by_name(
             d,
             arg(req, "name")?,
             req.get("up_to").and_then(Value::as_str),
         ),
+        #[cfg(any(test, debug_assertions, feature = "by-name"))]
         "recover-start" => {
             let opt = |k: &str| req.get(k).and_then(Value::as_str);
-            crate::recovering::start(d, opt("code"), opt("identity")).await
+            crate::recovering::start_by_name(d, opt("code"), opt("identity")).await
         }
+        #[cfg(any(test, debug_assertions, feature = "by-name"))]
         "recover-invite" => {
-            crate::recovering::invite(d, req.get("at").and_then(Value::as_str)).await
+            crate::recovering::invite_by_name(d, req.get("at").and_then(Value::as_str)).await
         }
+        #[cfg(any(test, debug_assertions, feature = "by-name"))]
         "recover-lost-at" => {
-            crate::recovering::set_lost_at(d, req.get("lost_at").and_then(Value::as_u64))
+            crate::recovering::set_lost_at_by_name(d, req.get("lost_at").and_then(Value::as_u64))
         }
-        "recover-cancel" => crate::recovering::cancel(d).await,
-        "recover-undo" => crate::recovering::undo_kept(d, arg(req, "to")?).await,
-        "recover-kept-seen" => crate::recovering::kept_seen(d, &strings(req, "to")),
+        #[cfg(any(test, debug_assertions, feature = "by-name"))]
+        "recover-cancel" => crate::recovering::cancel_by_name(d).await,
+        #[cfg(any(test, debug_assertions, feature = "by-name"))]
+        "recover-undo" => crate::recovering::undo_kept_by_name(d, arg(req, "to")?).await,
+        #[cfg(any(test, debug_assertions, feature = "by-name"))]
+        "recover-kept-seen" => crate::recovering::kept_seen_by_name(d, &strings(req, "to")),
+        #[cfg(any(test, debug_assertions, feature = "by-name"))]
         "recover-stop-waiting" => {
             let all = req.get("all").and_then(Value::as_bool) == Some(true);
-            crate::recovering::stop_waiting(d, req.get("who").and_then(Value::as_str), all).await
+            crate::recovering::stop_waiting_by_name(d, req.get("who").and_then(Value::as_str), all)
+                .await
         }
+        #[cfg(any(test, debug_assertions, feature = "by-name"))]
         "recover-finish" => {
             let without = req.get("without_account").and_then(Value::as_bool) == Some(true);
             let lost_at = req.get("lost_at").and_then(Value::as_u64);
-            crate::recovering::finish(d, without, lost_at).await
+            crate::recovering::finish_by_name(d, without, lost_at).await
         }
+        #[cfg(any(test, debug_assertions, feature = "by-name"))]
         "restore-from-host" => {
-            crate::host::restore(d, arg(req, "words")?, arg(req, "at")?, arg(req, "key")?).await
+            crate::host::restore_by_name(d, arg(req, "words")?, arg(req, "at")?, arg(req, "key")?)
+                .await
         }
         #[cfg(any(test, debug_assertions, feature = "by-name"))]
         "peer-add" => {
@@ -2327,6 +2600,7 @@ async fn handle(d: &Arc<Daemon>, req: &Value) -> anyhow::Result<Value> {
         #[cfg(any(test, debug_assertions, feature = "by-name"))]
         "conflicts" => conflicts(d),
         "debug-tree" => debug_tree(d),
+        #[cfg(any(test, debug_assertions, feature = "by-name"))]
         "free-space" if req.get("unnamed").and_then(|v| v.as_bool()) == Some(true) => {
             let delete = req.get("delete").and_then(|v| v.as_bool()) == Some(true);
             let d2 = d.clone();
@@ -2339,6 +2613,7 @@ async fn handle(d: &Arc<Daemon>, req: &Value) -> anyhow::Result<Value> {
                 "unsure": found.unsure,
             }))
         }
+        #[cfg(any(test, debug_assertions, feature = "by-name"))]
         "free-space" => {
             let dry_run = req
                 .get("dry_run")
@@ -2360,6 +2635,7 @@ async fn handle(d: &Arc<Daemon>, req: &Value) -> anyhow::Result<Value> {
             let d2 = d.clone();
             tokio::task::spawn_blocking(move || crate::cleanup::usage_of_by_name(&d2)).await?
         }
+        #[cfg(any(test, debug_assertions, feature = "by-name"))]
         "history-empty" => {
             let empty = match req.get("space").and_then(Value::as_str) {
                 None | Some("") => crate::cleanup::Empty::All,
@@ -2372,6 +2648,7 @@ async fn handle(d: &Arc<Daemon>, req: &Value) -> anyhow::Result<Value> {
             .await??;
             Ok(json!({"objects": f.objects, "bytes": f.bytes, "left": f.left}))
         }
+        #[cfg(any(test, debug_assertions, feature = "by-name"))]
         "keep-old" => {
             let keep = crate::cleanup::Keep::parse(arg(req, "keep")?)?;
             // for one space, in place of the device's period; without

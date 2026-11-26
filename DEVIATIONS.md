@@ -2421,7 +2421,22 @@ asks for around that is not built yet.
     cannot happen. A change of guardians names its entry by all 32 bytes in
     `guardians` and by its first eight in `guarding`, in one record
     (`guardian change`, field 11), so typed that field is bytes of any
-    length.
+    length. `recover-start` names an `identity` given as bytes that is
+    not 32 of them NUL first ("\0<hex> is not an identity id"). `recover`
+    is not answered twice where the tests run: asked after a finish cut
+    short, it shows the words once and clears what was kept. A key, an
+    identity or a group the service keeps in hex in its own files
+    (`recovering.json`, `recovered.json`) and is asked for in a reply is
+    read back to bytes; one not in hex, which this software never writes,
+    failed the request by name in a debug build, and in a release build
+    left out the whole field it was in; typed, that item alone is left out,
+    and logged. `host-offer` ("only a trusted contact can be hosted: trust
+    <who> first") and `host-accept` ("you do not trust <who>", "<who> has
+    not offered to host you") name a contact given as bytes NUL first. A
+    space named by bytes in `keep-old` and `history-empty` is the start of
+    an id, any length, as the way by name read its hex, where a `ref` as
+    bytes is otherwise an id alone (empty bytes start every id, and are
+    refused as naming more than one).
   - **A reply field without a number** is this build's mistake. In a debug
     build, where the tests run, the request then fails; in a release build
     the field is left out and the service logs an error. A field no test

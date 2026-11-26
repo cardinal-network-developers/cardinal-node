@@ -38,6 +38,7 @@ use cardinal_blob::{decrypt, BlobRef, Id, Index, ObjectStore};
 use cardinal_space::files::{Content, FILE_CONTENT};
 use cardinal_space::{Space, SpaceId, SpaceOpBody};
 use serde::{Deserialize, Serialize};
+#[cfg(any(test, debug_assertions, feature = "by-name"))]
 use serde_json::{json, Value};
 
 use crate::core::now_ms;
@@ -1084,6 +1085,7 @@ pub fn shown(d: &Daemon) -> crate::api::OldVersions {
 }
 
 /// [`shown`], by name.
+#[cfg(any(test, debug_assertions, feature = "by-name"))]
 pub fn status(d: &Daemon) -> Value {
     let keep = Keep::parse(&d.config().keep_old).unwrap_or(Keep::Days(30));
     match d.cleanup.seen() {
