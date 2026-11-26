@@ -967,17 +967,57 @@ typed!(
     }
 );
 rec!(GROUP_SHOWN "group shown": 1 "group" B, 2 "name" T, 3 "what" [T]);
-rec!(GUARDIAN_CHANGE "guardian change":
-    1 "caution" T, 2 "confirm_delay" U, 3 "confirm_delay_text" T, 4 "confirm_from_ms" U,
-    5 "confirmed" U, 6 "confirmed_by_me" BOOL, 7 "delay" U, 8 "delay_text" T,
-    9 "fingerprint" T, 10 "guardians" U, 11 "id" B, 12 "in_effect" BOOL, 13 "names" [T],
-    14 "needed" U, 15 "never" BOOL, 16 "objected" BOOL, 17 "threshold" U,
-    18 "waits_until_ms" U);
-rec!(GUARDED "guarded":
-    1 "account_copy" BOOL, 2 "changes" [GUARDIAN_CHANGE], 3 "delay" U, 4 "delay_text" T,
-    5 "guardians" U, 6 "helpers" U, 7 "id" B, 8 "name" T, 9 "never" [T], 10 "persona" B,
-    11 "persona_at" T, 12 "recoveries" [RECOVERY], 13 "threshold" U, 14 "waiting" U,
-    15 "warning" T);
+typed!(
+    /// A change of guardians under way: to the person whose it is (in
+    /// `guardians`), or to one of their guardians (in `guarding`), each
+    /// with fields of its own.
+    GUARDIAN_CHANGE "guardian change" GuardianChange {
+        /// To a guardian, before it is in effect.
+        1 caution: Option<String>,
+        2 confirm_delay: u64,
+        3 confirm_delay_text: String,
+        /// To a guardian: from when they may confirm it.
+        4 confirm_from_ms: Option<u64>,
+        5 confirmed: u64,
+        6 confirmed_by_me: Option<bool>,
+        7 delay: u64,
+        8 delay_text: String,
+        9 fingerprint: String,
+        10 guardians: u64,
+        /// Its entry: whole to the person, its first eight bytes to a
+        /// guardian.
+        11 id: bytes::Bytes,
+        12 in_effect: Option<bool>,
+        /// To the person: whom it names.
+        13 names: Option<Vec<String>>,
+        14 needed: Option<u64>,
+        15 never: Option<bool>,
+        16 objected: bool,
+        17 threshold: u64,
+        18 waits_until_ms: Option<u64>,
+    }
+);
+typed!(
+    /// Someone this person guards.
+    GUARDED "guarded" Guarded {
+        1 account_copy: bool,
+        2 changes: Vec<GuardianChange>,
+        3 delay: u64,
+        4 delay_text: String,
+        5 guardians: u64,
+        6 helpers: u64,
+        7 id: [u8; 32],
+        8 name: String,
+        9 never: Vec<String>,
+        10 persona: [u8; 32],
+        /// Where the persona's service listens, where it runs here.
+        11 persona_at: Option<String>,
+        12 recoveries: Vec<RecoveryShown>,
+        13 threshold: u64,
+        14 waiting: u64,
+        15 warning: Option<String>,
+    }
+);
 typed!(
     /// A device meant to keep everything, as a copy of the files.
     HOLDER "holder" Holder {
@@ -1105,7 +1145,15 @@ typed!(
         12 time: Option<u64>,
     }
 );
-rec!(NO_LONGER_NEEDED "no longer needed": 1 "at_ms" U, 2 "id" B, 3 "name" T, 4 "text" T);
+typed!(
+    /// Someone who no longer needs this person as a guardian.
+    NO_LONGER_NEEDED "no longer needed" NoLongerNeeded {
+        1 at_ms: u64,
+        2 id: [u8; 32],
+        3 name: String,
+        4 text: String,
+    }
+);
 typed!(
     /// How two people met.
     MET "met" Met {
@@ -1225,10 +1273,25 @@ typed!(REACTION "reaction" Reaction {
     2 mine: bool,
     3 text: String,
 });
-rec!(RECOVERY "recovery":
-    1 "caution" T, 2 "confirm_from_ms" U, 3 "confirmed" U, 4 "confirmed_by_me" BOOL,
-    5 "endorsed" U, 6 "endorsed_by_me" BOOL, 7 "fingerprint" T, 8 "id" B, 9 "in_effect" BOOL,
-    10 "keeps_keys" BOOL, 11 "objected" BOOL, 12 "pending" BOOL);
+typed!(
+    /// A recovery: of this person (in `guardians`), or of someone they
+    /// guard (in `guarding`), each with fields of its own.
+    RECOVERY "recovery" RecoveryShown {
+        1 caution: Option<String>,
+        2 confirm_from_ms: Option<u64>,
+        3 confirmed: u64,
+        4 confirmed_by_me: Option<bool>,
+        5 endorsed: u64,
+        6 endorsed_by_me: Option<bool>,
+        7 fingerprint: String,
+        /// Of this person's: its entry.
+        8 id: Option<[u8; 32]>,
+        9 in_effect: bool,
+        10 keeps_keys: Option<bool>,
+        11 objected: bool,
+        12 pending: Option<bool>,
+    }
+);
 typed!(
     /// Two members whose messages this person's devices have been passing
     /// on, and who name no host in the group.
@@ -1482,15 +1545,6 @@ rec!(WEIGH "weight":
     1 "aead" U, 2 "ciphertext" U, 3 "fields" U, 4 "header" U, 5 "ops" [WEIGHED_OP],
     6 "sealed" U, 7 "signature" U, 8 "wraps" U);
 rec!(WEIGHED_OP "weighed op": 1 "bytes" U, 2 "kind" KIND, 3 "op" KIND, 4 "reach" BOOL);
-
-/// The reply of the requests that answer with what this person guards.
-macro_rules! guarding_reply {
-    ($name:literal $n:literal ($($an:literal $af:literal $at:tt),*)) => {
-        req!($n $name ($($an $af $at),*) -> (
-            2 "accepted" [T], 3 "asked" [T], 4 "guarding" [GUARDED], 5 "named_in_change" [T],
-            6 "now_ms" U, 7 "no_longer_needed" [NO_LONGER_NEEDED]))
-    };
-}
 
 // ---- Typed requests (`api::typed`) ----
 
@@ -2102,6 +2156,129 @@ typed!(
 );
 asks!(GROUP_LEAVING: 86 "group-leaving" GroupLeavingArgs -> GroupLeavingReply, reads);
 
+// ---- Guardians: of this person, and those this person guards ----
+
+typed!(fields GuardiansArgs {});
+typed!(
+    fields
+    /// This person's guardians, and what is under way.
+    GuardiansReply {
+        2 asked: Vec<String>,
+        3 changes: Vec<GuardianChange>,
+        4 copy_full: Vec<String>,
+        5 data: bool,
+        6 delay: u64,
+        7 delay_text: String,
+        8 frozen: bool,
+        9 guardians: u64,
+        10 names: Vec<String>,
+        11 ready: Vec<String>,
+        12 recoveries: Vec<RecoveryShown>,
+        13 threshold: u64,
+    }
+);
+asks!(GUARDIANS: 150 "guardians" GuardiansArgs -> GuardiansReply, reads);
+
+typed!(fields GuardiansSetArgs {
+    1 who: Option<Vec<Reference>>,
+    2 threshold: Option<u64>,
+    3 delay: Option<u64>,
+    4 words: Option<String>,
+});
+typed!(fields GuardiansSetReply {
+    2 delay: u64,
+    3 delay_text: String,
+    4 names: Vec<String>,
+    5 pending: bool,
+    6 threshold: u64,
+});
+asks!(GUARDIANS_SET: 151 "guardians-set" GuardiansSetArgs -> GuardiansSetReply, writes);
+
+typed!(fields GuardiansObjectArgs {
+    1 fingerprint: Option<String>,
+});
+asks!(GUARDIANS_OBJECT: 152 "guardians-object" GuardiansObjectArgs -> Done, writes);
+
+typed!(fields GuardiansAskArgs {
+    1 who: Option<Reference>,
+});
+typed!(fields NameReply {
+    2 name: String,
+});
+asks!(GUARDIANS_ASK: 153 "guardians-ask" GuardiansAskArgs -> NameReply, writes);
+
+typed!(
+    fields
+    /// Those this person guards, and what they are asked.
+    GuardingReply {
+        2 accepted: Vec<String>,
+        3 asked: Vec<String>,
+        4 guarding: Vec<Guarded>,
+        5 named_in_change: Vec<String>,
+        6 now_ms: u64,
+        7 no_longer_needed: Vec<NoLongerNeeded>,
+    }
+);
+typed!(fields GuardingArgs {});
+asks!(GUARDING: 154 "guarding" GuardingArgs -> GuardingReply, reads);
+
+typed!(fields GuardingInviteArgs {
+    1 who: Option<Reference>,
+    2 at: Option<String>,
+});
+typed!(fields GuardingInviteReply {
+    2 code: String,
+    3 name: String,
+});
+asks!(GUARDING_INVITE: 155 "guarding-invite" GuardingInviteArgs -> GuardingInviteReply, writes);
+
+typed!(fields GuardingAcceptArgs {
+    1 who: Option<Reference>,
+});
+typed!(fields GuardingAcceptReply {
+    2 already: bool,
+    3 name: String,
+    4 persona: [u8; 32],
+});
+asks!(GUARDING_ACCEPT: 156 "guarding-accept" GuardingAcceptArgs -> GuardingAcceptReply, writes);
+
+typed!(fields GuardingConfirmChangeArgs {
+    1 who: Option<Reference>,
+    2 fingerprint: Option<String>,
+    3 understood: Option<bool>,
+});
+asks!(GUARDING_CONFIRM_CHANGE: 157 "guarding-confirm-change" GuardingConfirmChangeArgs
+    -> GuardingReply, writes);
+
+typed!(fields GuardingNeverArgs {
+    1 who: Option<Reference>,
+    2 fingerprint: Option<String>,
+});
+asks!(GUARDING_NEVER: 158 "guarding-never" GuardingNeverArgs -> GuardingReply, writes);
+
+typed!(fields GuardingCautionArgs {
+    1 who: Option<Reference>,
+});
+typed!(fields GuardingCautionReply {
+    2 caution: String,
+    3 name: String,
+});
+asks!(GUARDING_CAUTION: 159 "guarding-caution" GuardingCautionArgs -> GuardingCautionReply, reads);
+
+typed!(fields GuardingEndorseArgs {
+    1 who: Option<Reference>,
+    2 fingerprint: Option<String>,
+    3 understood: Option<bool>,
+});
+asks!(GUARDING_ENDORSE: 160 "guarding-endorse" GuardingEndorseArgs -> GuardingReply, writes);
+
+typed!(fields GuardingConfirmArgs {
+    1 who: Option<Reference>,
+    2 fingerprint: Option<String>,
+    3 understood: Option<bool>,
+});
+asks!(GUARDING_CONFIRM: 161 "guarding-confirm" GuardingConfirmArgs -> GuardingReply, writes);
+
 // ---- Reaching a contact ----
 
 typed!(fields ContactStatusArgs {
@@ -2510,23 +2687,18 @@ pub static REQUESTS: &[Request] = &[
     SPACE_USAGE_NOW,
     req!(141 "history-empty" (1 "space" REF) -> (2 "bytes" U, 3 "left" U, 4 "objects" U)),
     // ---- Guardians and recovery: 150 to 179 ----
-    req!(150 "guardians" () -> (
-        2 "asked" [T], 3 "changes" [GUARDIAN_CHANGE], 4 "copy_full" [T], 5 "data" BOOL,
-        6 "delay" U, 7 "delay_text" T, 8 "frozen" BOOL, 9 "guardians" U, 10 "names" [T],
-        11 "ready" [T], 12 "recoveries" [RECOVERY], 13 "threshold" U)),
-    req!(151 "guardians-set" (1 "who" [REF], 2 "threshold" U, 3 "delay" U, 4 "words" T) -> (
-        2 "delay" U, 3 "delay_text" T, 4 "names" [T], 5 "pending" BOOL, 6 "threshold" U)),
-    req!(152 "guardians-object" (1 "fingerprint" T) -> ()),
-    req!(153 "guardians-ask" (1 "who" REF) -> (2 "name" T)),
-    guarding_reply!("guarding" 154 ()),
-    req!(155 "guarding-invite" (1 "who" REF, 2 "at" T) -> (2 "code" T, 3 "name" T)),
-    req!(156 "guarding-accept" (1 "who" REF) -> (2 "already" BOOL, 3 "name" T, 4 "persona" B)),
-    guarding_reply!("guarding-confirm-change" 157 (
-        1 "who" REF, 2 "fingerprint" T, 3 "understood" BOOL)),
-    guarding_reply!("guarding-never" 158 (1 "who" REF, 2 "fingerprint" T)),
-    req!(159 "guarding-caution" (1 "who" REF) -> (2 "caution" T, 3 "name" T)),
-    guarding_reply!("guarding-endorse" 160 (1 "who" REF, 2 "fingerprint" T, 3 "understood" BOOL)),
-    guarding_reply!("guarding-confirm" 161 (1 "who" REF, 2 "fingerprint" T, 3 "understood" BOOL)),
+    GUARDIANS,
+    GUARDIANS_SET,
+    GUARDIANS_OBJECT,
+    GUARDIANS_ASK,
+    GUARDING,
+    GUARDING_INVITE,
+    GUARDING_ACCEPT,
+    GUARDING_CONFIRM_CHANGE,
+    GUARDING_NEVER,
+    GUARDING_CAUTION,
+    GUARDING_ENDORSE,
+    GUARDING_CONFIRM,
     req!(162 "recover" () -> (
         2 "asked" BOOL, 3 "confirmed" U, 4 "endorsed" U, 5 "fingerprint" T, 6 "guardians" U,
         7 "held" U, 8 "helper" BOOL, 9 "identity" B, 10 "in_effect" BOOL, 11 "lost_at" U,

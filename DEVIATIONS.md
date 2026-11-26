@@ -2418,7 +2418,10 @@ asks for around that is not built yet.
     `cancel-invitation` takes either case. Error 4 for one item of
     `status` too large for a message names no `id` typed, where by name an
     item of `spaces` would have; a space's record is some 40 bytes, so it
-    cannot happen.
+    cannot happen. A change of guardians names its entry by all 32 bytes in
+    `guardians` and by its first eight in `guarding`, in one record
+    (`guardian change`, field 11), so typed that field is bytes of any
+    length.
   - **A reply field without a number** is this build's mistake. In a debug
     build, where the tests run, the request then fails; in a release build
     the field is left out and the service logs an error. A field no test

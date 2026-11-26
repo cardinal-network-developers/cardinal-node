@@ -72,16 +72,22 @@ struct Twins {
 
 impl Twins {
     async fn start(dir: &std::path::Path) -> Twins {
-        let (paths, config) = crate::testing::set_up(&dir.join("old"));
+        Twins::start_words(dir).await.0
+    }
+
+    /// [`Twins::start`], and their recovery words.
+    async fn start_words(dir: &std::path::Path) -> (Twins, String) {
+        let (paths, config, words) = crate::testing::set_up_words(&dir.join("old"));
         copy_all(&dir.join("old"), &dir.join("new"));
         let twin = crate::paths::Paths::at(&dir.join("new"));
         let new = Daemon::start(twin, config.clone()).await.unwrap();
         let old = Daemon::start(paths, config).await.unwrap();
-        Twins {
+        let t = Twins {
             old,
             new,
             swap: Vec::new(),
-        }
+        };
+        (t, words)
     }
 
     /// `old` and `new` are the same, made apart.
@@ -2888,6 +2894,153 @@ async fn the_rest_are_answered_the_same() {
         t.same(req).await;
     }
     for x in bea.iter().chain(&cy) {
+        let _ = x.stopping.send(true);
+    }
+}
+
+/// The guardians' requests: the person's (naming guardians, asking one,
+/// objecting) on the twins, and a guardian's (accepting, what they guard,
+/// the caution, and every refusal before a recovery) on the two who are
+/// asked, Bea of each twin, the one by name and the other typed. What
+/// needs a recovery or a change of guardians under way (endorsing,
+/// confirming, saying never, confirming a change, an invitation for a
+/// helper) is compared up to its refusals here; the whole is asked in
+/// `tests/guardians.rs`, where `guardians` and `guarding` are compared
+/// beside.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn guardians_are_answered_the_same() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut t, words) = Twins::start_words(dir.path()).await;
+    tokio::spawn(t.old.clone().run());
+    tokio::spawn(t.new.clone().run());
+    t.same_here(json!({"cmd": "guardians"})).await;
+    t.same_here(json!({"cmd": "guarding"})).await;
+    let bea = befriended(&mut t, dir.path(), "Bea").await;
+    let bea_id = |i: usize| bea[i].core().identity.as_ref().unwrap().id();
+    let cy = a_contact(&t, "Cy", 7);
+    for d in [&t.old, &t.new] {
+        crate::contacts::set(d, "Cy", "hosts-only").unwrap();
+    }
+    let twin = [t.old.clone(), t.new.clone()];
+
+    // ---- the person's, before anyone accepted ----
+    for req in [
+        json!({"cmd": "guardians-set"}),
+        json!({"cmd": "guardians-set", "who": []}),
+        json!({"cmd": "guardians-set", "who": ["Nobody"]}),
+        json!({"cmd": "guardians-set", "who": ["Cy"]}),
+        json!({"cmd": "guardians-set", "who": [exact(&cy)]}),
+        json!({"cmd": "guardians-set", "who": ["Bea", "bea"]}),
+        json!({"cmd": "guardians-set", "who": ["Bea"], "threshold": 2}),
+        json!({"cmd": "guardians-set", "who": ["Bea"], "threshold": 0}),
+        json!({"cmd": "guardians-ask"}),
+        json!({"cmd": "guardians-ask", "who": "Nobody"}),
+        json!({"cmd": "guardians-ask", "who": "Cy"}),
+        json!({"cmd": "guardians-object"}),
+        json!({"cmd": "guardians-object", "fingerprint": "a b c"}),
+    ] {
+        t.same(req).await;
+    }
+    // not accepted yet: asked, and refused
+    t.same(json!({"cmd": "guardians-set", "who": ["Bea"]}))
+        .await;
+    t.same_here(json!({"cmd": "guardians"})).await;
+    t.same_as(
+        json!({"cmd": "guardians-ask", "who": exact(&bea_id(0))}),
+        json!({"cmd": "guardians-ask", "who": exact(&bea_id(1))}),
+    )
+    .await;
+    t.same(json!({"cmd": "guardians-ask", "who": "Bea"})).await;
+
+    // ---- Bea's, each twin's: the old one asked by name ----
+    let mut b = Twins {
+        old: bea[0].clone(),
+        new: bea[1].clone(),
+        swap: t.swap.clone(),
+    };
+    until("the asking of Bea", || {
+        bea.iter()
+            .all(|x| !crate::guardians::list(x).asked.is_empty())
+    })
+    .await;
+    b.same_here(json!({"cmd": "guarding"})).await;
+    for req in [
+        json!({"cmd": "guarding-accept"}),
+        json!({"cmd": "guarding-accept", "who": "Nobody"}),
+        json!({"cmd": "guarding-caution", "who": "Me"}),
+        json!({"cmd": "guarding-caution"}),
+        json!({"cmd": "guarding-invite", "who": "Me"}),
+        json!({"cmd": "guarding-invite"}),
+        json!({"cmd": "guarding-never", "who": "Me", "fingerprint": "x"}),
+        json!({"cmd": "guarding-endorse", "who": "Me", "fingerprint": "x"}),
+        json!({"cmd": "guarding-confirm", "who": "Me", "fingerprint": "x", "understood": true}),
+        json!({"cmd": "guarding-confirm-change", "who": "Me"}),
+    ] {
+        b.same(req).await;
+    }
+    let persona = |r: &GuardingAcceptReply| vec![r.persona.to_vec()];
+    b.same_made::<GuardingAcceptArgs>(
+        json!({"cmd": "guarding-accept", "who": "Me"}),
+        json!({"cmd": "guarding-accept", "who": "Me"}),
+        persona,
+    )
+    .await;
+    let r = typed_of::<GuardingAcceptArgs>(
+        &b.same(json!({"cmd": "guarding-accept", "who": "me"})).await,
+    );
+    assert!(r.already, "{r:?}");
+    b.same_here(json!({"cmd": "guarding"})).await;
+
+    // ---- the person's, Bea accepted ----
+    until("Bea's persona", || {
+        twin.iter()
+            .all(|d| crate::guardians::show(d).is_ok_and(|g| g.ready.iter().any(|n| n == "Bea")))
+    })
+    .await;
+    t.swap = b.swap.clone();
+    t.same_here(json!({"cmd": "guardians"})).await;
+    // the first guardians need the words
+    t.same(json!({"cmd": "guardians-set", "who": ["Bea"], "words": "not the words"}))
+        .await;
+    t.same(json!({"cmd": "guardians-set", "who": ["Bea"]}))
+        .await;
+    let r = typed_of::<GuardiansSetArgs>(
+        &t.same(json!({"cmd": "guardians-set", "who": ["Bea"], "words": words, "delay": 60}))
+            .await,
+    );
+    assert_eq!(r.names, ["Bea"]);
+    t.same_here(json!({"cmd": "guardians"})).await;
+    // a change under way, of guardians named again
+    t.same(json!({"cmd": "guardians-set", "who": ["Bea"], "threshold": 1}))
+        .await;
+    t.same_here(json!({"cmd": "guardians"})).await;
+    t.same(json!({"cmd": "guardians-set", "who": ["Bea"]}))
+        .await;
+    t.same(json!({"cmd": "guardians-object", "fingerprint": "not it"}))
+        .await;
+    // ---- Bea's, guarding ----
+    until("Bea guards each twin", || {
+        bea.iter()
+            .all(|x| !crate::guardians::list(x).guarding.is_empty())
+    })
+    .await;
+    b.swap = t.swap.clone();
+    b.same_here(json!({"cmd": "guarding"})).await;
+    for req in [
+        json!({"cmd": "guarding-caution", "who": "Me"}),
+        json!({"cmd": "guarding-never", "who": "Me"}),
+        json!({"cmd": "guarding-never", "who": "Me", "fingerprint": "x"}),
+        json!({"cmd": "guarding-endorse", "who": "Me", "fingerprint": "x"}),
+        json!({"cmd": "guarding-endorse", "who": "Me", "fingerprint": "x", "understood": true}),
+        json!({"cmd": "guarding-confirm", "who": "Me", "fingerprint": "x", "understood": true}),
+        json!({"cmd": "guarding-confirm", "who": "Me"}),
+        json!({"cmd": "guarding-confirm-change", "who": "Me"}),
+        json!({"cmd": "guarding-confirm-change", "who": "Me", "understood": true}),
+        json!({"cmd": "guarding-invite", "who": "Nobody"}),
+    ] {
+        b.same(req).await;
+    }
+    for x in &bea {
         let _ = x.stopping.send(true);
     }
 }

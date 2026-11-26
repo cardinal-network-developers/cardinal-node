@@ -448,6 +448,13 @@ pub mod typed {
         GroupMembersReply, GroupReachArgs, GroupReachReply, GroupRejoinArgs, GroupRemoveArgs,
         GroupRemoveReply, GroupRoleArgs, GroupRoleReply, GroupSetArgs, GroupsArgs, GroupsReply,
     };
+    use crate::api::{
+        GuardiansArgs, GuardiansAskArgs, GuardiansObjectArgs, GuardiansReply, GuardiansSetArgs,
+        GuardiansSetReply, GuardingAcceptArgs, GuardingAcceptReply, GuardingArgs,
+        GuardingCautionArgs, GuardingCautionReply, GuardingConfirmArgs, GuardingConfirmChangeArgs,
+        GuardingEndorseArgs, GuardingInviteArgs, GuardingInviteReply, GuardingNeverArgs,
+        GuardingReply, NameReply,
+    };
     use crate::daemon::Daemon;
     use crate::daemon::PairState;
     use cardinal_space::account;
@@ -725,6 +732,94 @@ pub mod typed {
     impl Answer for GroupLeavingArgs {
         async fn answer(d: &Arc<Daemon>, a: &Self) -> anyhow::Result<GroupLeavingReply> {
             crate::groups::leaving(d, needed(a.group.as_ref(), "group")?.as_ref())
+        }
+    }
+
+    // ---- Guardians ----
+
+    impl Answer for GuardiansArgs {
+        async fn answer(d: &Arc<Daemon>, _: &Self) -> anyhow::Result<GuardiansReply> {
+            crate::guardians::show(d)
+        }
+    }
+
+    impl Answer for GuardiansSetArgs {
+        async fn answer(d: &Arc<Daemon>, a: &Self) -> anyhow::Result<GuardiansSetReply> {
+            let none = Vec::new();
+            let who = a.who.as_ref().unwrap_or(&none);
+            crate::guardians::set(d, who, a.threshold, a.delay, a.words.as_deref())
+        }
+    }
+
+    impl Answer for GuardiansObjectArgs {
+        async fn answer(d: &Arc<Daemon>, a: &Self) -> anyhow::Result<Done> {
+            crate::guardians::object(d, a.fingerprint.as_deref())
+        }
+    }
+
+    impl Answer for GuardiansAskArgs {
+        async fn answer(d: &Arc<Daemon>, a: &Self) -> anyhow::Result<NameReply> {
+            crate::guardians::ask(d, needed(a.who.as_ref(), "who")?.as_ref())
+        }
+    }
+
+    impl Answer for GuardingArgs {
+        async fn answer(d: &Arc<Daemon>, _: &Self) -> anyhow::Result<GuardingReply> {
+            Ok(crate::guardians::list(d))
+        }
+    }
+
+    impl Answer for GuardingInviteArgs {
+        async fn answer(d: &Arc<Daemon>, a: &Self) -> anyhow::Result<GuardingInviteReply> {
+            let who = needed(a.who.as_ref(), "who")?;
+            crate::guardians::invite(d, who.as_ref(), a.at.as_deref()).await
+        }
+    }
+
+    impl Answer for GuardingAcceptArgs {
+        async fn answer(d: &Arc<Daemon>, a: &Self) -> anyhow::Result<GuardingAcceptReply> {
+            crate::guardians::accept_role(d, needed(a.who.as_ref(), "who")?.as_ref()).await
+        }
+    }
+
+    impl Answer for GuardingConfirmChangeArgs {
+        async fn answer(d: &Arc<Daemon>, a: &Self) -> anyhow::Result<GuardingReply> {
+            let understood = a.understood == Some(true);
+            let who = needed(a.who.as_ref(), "who")?;
+            let fp = a.fingerprint.as_deref();
+            crate::guardians::confirm_change(d, who.as_ref(), fp, understood).await
+        }
+    }
+
+    impl Answer for GuardingNeverArgs {
+        async fn answer(d: &Arc<Daemon>, a: &Self) -> anyhow::Result<GuardingReply> {
+            let who = needed(a.who.as_ref(), "who")?;
+            let fp = needed(a.fingerprint.as_deref(), "fingerprint")?;
+            crate::guardians::never(d, who.as_ref(), fp)
+        }
+    }
+
+    impl Answer for GuardingCautionArgs {
+        async fn answer(d: &Arc<Daemon>, a: &Self) -> anyhow::Result<GuardingCautionReply> {
+            crate::guardians::caution_for(d, needed(a.who.as_ref(), "who")?.as_ref())
+        }
+    }
+
+    impl Answer for GuardingEndorseArgs {
+        async fn answer(d: &Arc<Daemon>, a: &Self) -> anyhow::Result<GuardingReply> {
+            let understood = a.understood == Some(true);
+            let who = needed(a.who.as_ref(), "who")?;
+            let fp = needed(a.fingerprint.as_deref(), "fingerprint")?;
+            crate::guardians::endorse(d, who.as_ref(), fp, understood).await
+        }
+    }
+
+    impl Answer for GuardingConfirmArgs {
+        async fn answer(d: &Arc<Daemon>, a: &Self) -> anyhow::Result<GuardingReply> {
+            let understood = a.understood == Some(true);
+            let who = needed(a.who.as_ref(), "who")?;
+            let fp = needed(a.fingerprint.as_deref(), "fingerprint")?;
+            crate::guardians::confirm(d, who.as_ref(), fp, understood).await
         }
     }
 
@@ -2078,40 +2173,68 @@ async fn handle(d: &Arc<Daemon>, req: &Value) -> anyhow::Result<Value> {
             None => Ok(crate::networks::status(d)),
         },
         "recovery-sheet" => crate::host::sheet(d),
-        "guardians" => crate::guardians::show(d),
-        "guardians-set" => crate::guardians::set(
+        #[cfg(any(test, debug_assertions, feature = "by-name"))]
+        "guardians" => crate::guardians::show_by_name(d),
+        #[cfg(any(test, debug_assertions, feature = "by-name"))]
+        "guardians-set" => crate::guardians::set_by_name(
             d,
             &strings(req, "who"),
             req.get("threshold").and_then(Value::as_u64),
             req.get("delay").and_then(Value::as_u64),
             words(req),
         ),
+        #[cfg(any(test, debug_assertions, feature = "by-name"))]
         "guardians-object" => {
-            crate::guardians::object(d, req.get("fingerprint").and_then(Value::as_str))
+            crate::guardians::object_by_name(d, req.get("fingerprint").and_then(Value::as_str))
         }
-        "guarding" => Ok(crate::guardians::list(d)),
+        #[cfg(any(test, debug_assertions, feature = "by-name"))]
+        "guarding" => Ok(crate::guardians::list_by_name(d)),
+        #[cfg(any(test, debug_assertions, feature = "by-name"))]
         "guarding-invite" => {
-            crate::guardians::invite(d, arg(req, "who")?, req.get("at").and_then(Value::as_str))
-                .await
+            crate::guardians::invite_by_name(
+                d,
+                arg(req, "who")?,
+                req.get("at").and_then(Value::as_str),
+            )
+            .await
         }
-        "guarding-accept" => crate::guardians::accept_role(d, arg(req, "who")?).await,
-        "guardians-ask" => crate::guardians::ask(d, arg(req, "who")?),
+        #[cfg(any(test, debug_assertions, feature = "by-name"))]
+        "guarding-accept" => crate::guardians::accept_role_by_name(d, arg(req, "who")?).await,
+        #[cfg(any(test, debug_assertions, feature = "by-name"))]
+        "guardians-ask" => crate::guardians::ask_by_name(d, arg(req, "who")?),
+        #[cfg(any(test, debug_assertions, feature = "by-name"))]
         "guarding-confirm-change" => {
             let understood = req.get("understood").and_then(Value::as_bool) == Some(true);
             let fp = req.get("fingerprint").and_then(Value::as_str);
-            crate::guardians::confirm_change(d, arg(req, "who")?, fp, understood).await
+            crate::guardians::confirm_change_by_name(d, arg(req, "who")?, fp, understood).await
         }
-        "guarding-never" => crate::guardians::never(d, arg(req, "who")?, arg(req, "fingerprint")?),
-        "guarding-caution" => crate::guardians::caution_for(d, arg(req, "who")?),
+        #[cfg(any(test, debug_assertions, feature = "by-name"))]
+        "guarding-never" => {
+            crate::guardians::never_by_name(d, arg(req, "who")?, arg(req, "fingerprint")?)
+        }
+        #[cfg(any(test, debug_assertions, feature = "by-name"))]
+        "guarding-caution" => crate::guardians::caution_for_by_name(d, arg(req, "who")?),
+        #[cfg(any(test, debug_assertions, feature = "by-name"))]
         "guarding-endorse" => {
             let understood = req.get("understood").and_then(Value::as_bool) == Some(true);
-            crate::guardians::endorse(d, arg(req, "who")?, arg(req, "fingerprint")?, understood)
-                .await
+            crate::guardians::endorse_by_name(
+                d,
+                arg(req, "who")?,
+                arg(req, "fingerprint")?,
+                understood,
+            )
+            .await
         }
+        #[cfg(any(test, debug_assertions, feature = "by-name"))]
         "guarding-confirm" => {
             let understood = req.get("understood").and_then(Value::as_bool) == Some(true);
-            crate::guardians::confirm(d, arg(req, "who")?, arg(req, "fingerprint")?, understood)
-                .await
+            crate::guardians::confirm_by_name(
+                d,
+                arg(req, "who")?,
+                arg(req, "fingerprint")?,
+                understood,
+            )
+            .await
         }
         "recover" => crate::recovering::status(d),
         "keep-work" => crate::recovering::keep_work(

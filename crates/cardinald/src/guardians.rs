@@ -47,8 +47,10 @@ use cardinal_space::relationship;
 use cardinal_space::{SpaceId, SpaceOp};
 use cardinal_sync::identity_log_label;
 use serde::{Deserialize, Serialize};
+#[cfg(any(test, debug_assertions, feature = "by-name"))]
 use serde_json::{json, Value as Json};
 
+use crate::api::Ref;
 use crate::core::{now_ms, short};
 use crate::daemon::Daemon;
 use crate::helper::Helper;
@@ -142,7 +144,7 @@ pub fn delay_text(secs: u64) -> String {
 
 /// `cardinal guardians`: who guards this person, as their own devices know
 /// it from the account space, and the policy as everyone sees it.
-pub fn show(d: &Daemon) -> anyhow::Result<Json> {
+pub fn show(d: &Daemon) -> anyhow::Result<crate::api::GuardiansReply> {
     // whom this person asked, and who accepted, ready to be named
     let (asked, ready) = {
         let contacts: Vec<account::ContactRecord> = d
@@ -177,20 +179,26 @@ pub fn show(d: &Daemon) -> anyhow::Result<Json> {
     names.sort_by_key(|n| n.to_lowercase());
     let st = ident.state();
     let others: Vec<&IdentityLog> = core.others.values().map(|o| &o.log).collect();
-    let recoveries: Vec<Json> = ident
+    let recoveries: Vec<crate::api::RecoveryShown> = ident
         .log
         .recoveries()
         .into_iter()
         .filter_map(|r| {
             let p = ident.log.policy(&r.policy)?;
-            Some(json!({
-                "fingerprint": r.fingerprint(),
-                "endorsed": ident.log.endorsed_by(&r.entry, &p, &others).len(),
-                "confirmed": ident.log.confirmed_by(&r.entry, &p, &others).len(),
-                "in_effect": st.in_effect.contains(&r.entry),
-                "objected": objected(&ident.log, &r.entry),
-                "id": hex::encode(r.entry),
-            }))
+            Some(crate::api::RecoveryShown {
+                fingerprint: r.fingerprint(),
+                endorsed: ident.log.endorsed_by(&r.entry, &p, &others).len() as u64,
+                confirmed: ident.log.confirmed_by(&r.entry, &p, &others).len() as u64,
+                in_effect: st.in_effect.contains(&r.entry),
+                objected: objected(&ident.log, &r.entry),
+                id: Some(r.entry),
+                caution: None,
+                confirm_from_ms: None,
+                confirmed_by_me: None,
+                endorsed_by_me: None,
+                keeps_keys: None,
+                pending: None,
+            })
         })
         .collect();
     // whom each change names, and when this person made it
@@ -200,7 +208,7 @@ pub fn show(d: &Daemon) -> anyhow::Result<Json> {
         .map(|sp| account::guardians_named(sp.state()))
         .unwrap_or_default();
     let contacts = core.contacts();
-    let changes: Vec<Json> = policy
+    let changes: Vec<crate::api::GuardianChange> = policy
         .as_ref()
         .map(|cur| {
             changes_of(&ident.log, &cur.entry)
@@ -226,26 +234,31 @@ pub fn show(d: &Daemon) -> anyhow::Result<Json> {
                         .unwrap_or_default();
                     let objected = objected(&ident.log, &id);
                     let wait = cur.delay.saturating_mul(if objected { 2 } else { 1 });
-                    json!({
-                        "fingerprint": change_fingerprint(&p),
-                        "names": names,
-                        "guardians": p.commitments.len(),
-                        "threshold": p.threshold,
+                    crate::api::GuardianChange {
+                        fingerprint: change_fingerprint(&p),
+                        names: Some(names),
+                        guardians: p.commitments.len() as u64,
+                        threshold: p.threshold,
                         // the change's own delay, for recoveries under it,
                         // and the wait before its guardians confirm it,
                         // which is the current policy's
-                        "delay": p.delay,
-                        "delay_text": delay_text(p.delay),
-                        "confirm_delay": wait,
-                        "confirm_delay_text": delay_text(wait),
-                        "confirmed": ident.log.confirmed_by(&id, cur, &others).len(),
-                        "needed": cur.threshold,
+                        delay: p.delay,
+                        delay_text: delay_text(p.delay),
+                        confirm_delay: wait,
+                        confirm_delay_text: delay_text(wait),
+                        confirmed: ident.log.confirmed_by(&id, cur, &others).len() as u64,
+                        needed: Some(cur.threshold),
                         // when this person made it, plus the wait: each
                         // guardian waits from when their device saw it
-                        "waits_until_ms": since.map(|t| t.saturating_add(wait.saturating_mul(1000))),
-                        "objected": objected,
-                        "id": hex::encode(id),
-                    })
+                        waits_until_ms: since.map(|t| t.saturating_add(wait.saturating_mul(1000))),
+                        objected,
+                        id: bytes::Bytes::copy_from_slice(&id),
+                        caution: None,
+                        confirm_from_ms: None,
+                        confirmed_by_me: None,
+                        in_effect: None,
+                        never: None,
+                    }
                 })
                 .collect()
         })
@@ -266,30 +279,30 @@ pub fn show(d: &Daemon) -> anyhow::Result<Json> {
         })
         .map(|c| c.petname)
         .collect();
-    Ok(json!({
-        "asked": asked,
-        "ready": ready,
-        "copy_full": full,
-        "changes": changes,
-        "guardians": policy.as_ref().map_or(0, |p| p.commitments.len()),
-        "threshold": policy.as_ref().map_or(0, |p| p.threshold),
-        "delay": policy.as_ref().map_or(0, |p| p.delay),
-        "delay_text": delay_text(policy.as_ref().map_or(0, |p| p.delay)),
-        "data": policy.as_ref().is_some_and(|p| p.guardian_key.is_some()),
-        "names": names,
-        "recoveries": recoveries,
-        "frozen": st.frozen,
-    }))
+    Ok(crate::api::GuardiansReply {
+        asked,
+        ready,
+        copy_full: full,
+        changes,
+        guardians: policy.as_ref().map_or(0, |p| p.commitments.len()) as u64,
+        threshold: policy.as_ref().map_or(0, |p| p.threshold),
+        delay: policy.as_ref().map_or(0, |p| p.delay),
+        delay_text: delay_text(policy.as_ref().map_or(0, |p| p.delay)),
+        data: policy.as_ref().is_some_and(|p| p.guardian_key.is_some()),
+        names,
+        recoveries,
+        frozen: st.frozen,
+    })
 }
 
 /// `cardinal guardians set NAME... --threshold N [--delay SECONDS]`.
 pub fn set(
     d: &Arc<Daemon>,
-    who: &[String],
+    who: &[crate::api::typed::Reference],
     threshold: Option<u64>,
     delay: Option<u64>,
     words: Option<&str>,
-) -> anyhow::Result<Json> {
+) -> anyhow::Result<crate::api::GuardiansSetReply> {
     anyhow::ensure!(!who.is_empty(), "name at least one guardian");
     // One change at a time: a change under way takes effect, or the person
     // gives it up by objecting to it, before another is made.
@@ -315,7 +328,7 @@ pub fn set(
     }
     let mut chosen = Vec::new();
     for w in who {
-        let c = crate::contacts::find(d, w)?;
+        let c = crate::contacts::find_ref(d, w.as_ref())?;
         anyhow::ensure!(
             c.connects(),
             "{} is not someone you trust: a guardian must be",
@@ -446,13 +459,13 @@ pub fn set(
     tend_person(d);
     tell_full(d);
     crate::recovering::tend_recovered(d);
-    Ok(json!({
-        "names": chosen.iter().map(|c| c.petname.clone()).collect::<Vec<_>>(),
-        "threshold": threshold,
-        "delay": delay,
-        "delay_text": delay_text(delay),
-        "pending": !unguarded,
-    }))
+    Ok(crate::api::GuardiansSetReply {
+        names: chosen.iter().map(|c| c.petname.clone()).collect(),
+        threshold,
+        delay,
+        delay_text: delay_text(delay),
+        pending: !unguarded,
+    })
 }
 
 /// The account setting by which a person's devices say a policy's
@@ -643,15 +656,15 @@ fn asked_already(d: &Daemon, c: &account::ContactRecord) -> bool {
 /// `cardinal guardians ask NAME`: asks a contact to guard this person, in
 /// the relationship the two share. Their device shows it, and their
 /// `guarding accept` answers it with a fresh persona.
-pub fn ask(d: &Arc<Daemon>, who: &str) -> anyhow::Result<Json> {
-    let c = crate::contacts::find(d, who)?;
+pub fn ask(d: &Arc<Daemon>, who: Ref<'_>) -> anyhow::Result<crate::api::NameReply> {
+    let c = crate::contacts::find_ref(d, who)?;
     anyhow::ensure!(
         c.connects(),
         "{} is not someone you trust: a guardian must be",
         c.petname
     );
     d.write_and_push(&c.space, vec![relationship::create_guardian_request()])?;
-    Ok(json!({"name": c.petname}))
+    Ok(crate::api::NameReply { name: c.petname })
 }
 
 /// The persona `c` guards this person through, from the guardian persona
@@ -870,7 +883,7 @@ fn mark_guardians(d: &Arc<Daemon>, chosen: &[account::ContactRecord]) -> anyhow:
 
 /// `cardinal guardians object`: a device the person holds disagrees with a
 /// recovery under way. It cancels nothing; it doubles the guardians' wait.
-pub fn object(d: &Arc<Daemon>, which: Option<&str>) -> anyhow::Result<Json> {
+pub fn object(d: &Arc<Daemon>, which: Option<&str>) -> anyhow::Result<crate::api::Done> {
     let entry = {
         let mut core = d.core();
         let ident = core
@@ -912,7 +925,7 @@ pub fn object(d: &Arc<Daemon>, which: Option<&str>) -> anyhow::Result<Json> {
     };
     d.identity_changed();
     d.push_identity(vec![entry]);
-    Ok(json!({}))
+    Ok(crate::api::Done {})
 }
 
 fn objected(log: &IdentityLog, decision: &EntryId) -> bool {
@@ -1095,8 +1108,11 @@ pub(crate) fn helper_petname(d: &Daemon, who: &EntryId) -> String {
 /// `cardinal guarding accept NAME`: accepts being NAME's guardian. Makes a
 /// persona for guarding them alone (D79), keeps it in the account, writes
 /// its id and log in the relationship the two share, and runs it here.
-pub async fn accept_role(d: &Arc<Daemon>, who: &str) -> anyhow::Result<Json> {
-    let c = crate::contacts::find(d, who)?;
+pub async fn accept_role(
+    d: &Arc<Daemon>,
+    who: Ref<'_>,
+) -> anyhow::Result<crate::api::GuardingAcceptReply> {
+    let c = crate::contacts::find_ref(d, who)?;
     anyhow::ensure!(
         c.connects(),
         "{} is not someone you trust: trust them first",
@@ -1138,7 +1154,11 @@ pub async fn accept_role(d: &Arc<Daemon>, who: &str) -> anyhow::Result<Json> {
                 )?;
             }
         }
-        return Ok(json!({"name": c.petname, "persona": hex::encode(p.identity), "already": true}));
+        return Ok(crate::api::GuardingAcceptReply {
+            name: c.petname,
+            persona: p.identity,
+            already: true,
+        });
     }
     let d2 = d.clone();
     let (entropy, id, log) =
@@ -1162,7 +1182,11 @@ pub async fn accept_role(d: &Arc<Daemon>, who: &str) -> anyhow::Result<Json> {
     )?;
     crate::helper::start_persona(d, &id).await?;
     tracing::info!("guarding {} through persona {}", c.petname, short(&id));
-    Ok(json!({"name": c.petname, "persona": hex::encode(id), "already": false}))
+    Ok(crate::api::GuardingAcceptReply {
+        name: c.petname,
+        persona: id,
+        already: false,
+    })
 }
 
 /// A recovery of someone this person guards, as this device sees it.
@@ -1282,11 +1306,11 @@ pub fn change_caution(name: &str) -> String {
 /// their guardians under way (the first this device saw).
 pub async fn confirm_change(
     d: &Arc<Daemon>,
-    who: &str,
+    who: Ref<'_>,
     fingerprint: Option<&str>,
     understood: bool,
-) -> anyhow::Result<Json> {
-    let c = crate::contacts::find(d, who)?;
+) -> anyhow::Result<crate::api::GuardingReply> {
+    let c = crate::contacts::find_ref(d, who)?;
     let current = {
         let core = d.core();
         core.others
@@ -1529,38 +1553,37 @@ fn helpers_of(pd: &Daemon, who: &EntryId) -> Vec<account::ContactRecord> {
 /// `cardinal guarding`: whom this person guards, and the recovery of each
 /// shown, with any others that wait behind it; and those this person
 /// accepted to guard who have not named them yet.
-pub fn list(d: &Daemon) -> Json {
+pub fn list(d: &Daemon) -> crate::api::GuardingReply {
     observe(d);
     let seen = load_seen(d);
     let all = guarded(d);
-    let people: Vec<Json> = all
+    let people: Vec<crate::api::Guarded> = all
         .iter()
         .map(|g| {
             let s = shown(d, &seen, g);
             let me = g.persona.identity;
             let mine = |set: &BTreeSet<EntryId>| set.contains(&me);
-            let recoveries: Vec<Json> = s
+            let recoveries: Vec<crate::api::RecoveryShown> = s
                 .shown
                 .iter()
-                .map(|w| {
-                    json!({
-                        "fingerprint": w.recovery.fingerprint(),
-                        "endorsed": w.endorsed.len(),
-                        "confirmed": w.confirmed.len(),
-                        "endorsed_by_me": mine(&w.endorsed),
-                        "confirmed_by_me": mine(&w.confirmed),
-                        "pending": w.endorsed.len() as u64 >= g.policy.threshold,
-                        "confirm_from_ms": confirm_from(&seen, g, w),
-                        "objected": w.objected,
-                        "in_effect": w.in_effect,
-                        "keeps_keys": !w.recovery.keep.is_empty(),
-                        "caution": (!w.in_effect).then(|| caution(&g.name)),
-                    })
+                .map(|w| crate::api::RecoveryShown {
+                    fingerprint: w.recovery.fingerprint(),
+                    endorsed: w.endorsed.len() as u64,
+                    confirmed: w.confirmed.len() as u64,
+                    endorsed_by_me: Some(mine(&w.endorsed)),
+                    confirmed_by_me: Some(mine(&w.confirmed)),
+                    pending: Some(w.endorsed.len() as u64 >= g.policy.threshold),
+                    confirm_from_ms: confirm_from(&seen, g, w),
+                    objected: w.objected,
+                    in_effect: w.in_effect,
+                    keeps_keys: Some(!w.recovery.keep.is_empty()),
+                    caution: (!w.in_effect).then(|| caution(&g.name)),
+                    id: None,
                 })
                 .collect();
             let never: Vec<String> = s.never.iter().map(|w| w.recovery.fingerprint()).collect();
-            let helpers = service(d, &g.persona.identity)
-                .map_or(0, |h| helpers_of(&h.d, &g.identity).len());
+            let helpers =
+                service(d, &g.persona.identity).map_or(0, |h| helpers_of(&h.d, &g.identity).len());
             // where the persona's own service listens, for an invitation
             // to name (`guarding-invite` `at`): null if it does not run here
             let persona_at = service(d, &g.persona.identity).and_then(|h| {
@@ -1578,23 +1601,23 @@ pub fn list(d: &Daemon) -> Json {
                     .iter()
                     .any(|l| core.set(l).iter().next().is_some())
             };
-            json!({
-                "name": g.name,
-                "id": hex::encode(g.identity),
-                "persona": hex::encode(g.persona.identity),
-                "guardians": g.policy.commitments.len(),
-                "threshold": g.policy.threshold,
-                "delay": g.policy.delay,
-                "delay_text": delay_text(g.policy.delay),
-                "recoveries": recoveries,
-                "waiting": s.waiting.len(),
-                "warning": (!s.waiting.is_empty()).then(|| second_warning(&g.name, s.waiting.len())),
-                "never": never,
-                "helpers": helpers,
-                "persona_at": persona_at,
-                "account_copy": account_copy,
-                "changes": changes_json(d, &seen, g),
-            })
+            crate::api::Guarded {
+                name: g.name.clone(),
+                id: g.identity,
+                persona: g.persona.identity,
+                guardians: g.policy.commitments.len() as u64,
+                threshold: g.policy.threshold,
+                delay: g.policy.delay,
+                delay_text: delay_text(g.policy.delay),
+                recoveries,
+                waiting: s.waiting.len() as u64,
+                warning: (!s.waiting.is_empty()).then(|| second_warning(&g.name, s.waiting.len())),
+                never,
+                helpers: helpers as u64,
+                persona_at,
+                account_copy,
+                changes: changes_shown(d, &seen, g),
+            }
         })
         .collect();
     let (accepted, in_change): (Vec<String>, Vec<String>) = {
@@ -1621,14 +1644,14 @@ pub fn list(d: &Daemon) -> Json {
         }
         (accepted, in_change)
     };
-    json!({
-        "guarding": people,
-        "accepted": accepted,
-        "named_in_change": in_change,
-        "no_longer_needed": no_longer_json(d, &seen),
-        "asked": asked(d),
-        "now_ms": now_ms(),
-    })
+    crate::api::GuardingReply {
+        guarding: people,
+        accepted,
+        named_in_change: in_change,
+        no_longer_needed: no_longer_shown(d, &seen),
+        asked: asked(d),
+        now_ms: crate::control::clock::now_ms(),
+    }
 }
 
 /// Whether a change of the person's guardians under way names persona `p`:
@@ -1656,7 +1679,7 @@ fn named_in_change(d: &Daemon, p: &account::PersonaRecord) -> bool {
 }
 
 /// The changes of `g`'s person's guardians, as a guardian is shown them.
-fn changes_json(d: &Daemon, seen: &Seen, g: &Guarded) -> Vec<Json> {
+fn changes_shown(d: &Daemon, seen: &Seen, g: &Guarded) -> Vec<crate::api::GuardianChange> {
     changes(d, g)
         .iter()
         .map(|ch| {
@@ -1665,23 +1688,26 @@ fn changes_json(d: &Daemon, seen: &Seen, g: &Guarded) -> Vec<Json> {
                 .policy
                 .delay
                 .saturating_mul(if ch.objected { 2 } else { 1 });
-            json!({
-                "id": hex::encode(&ch.entry[..8]),
-                "fingerprint": change_fingerprint(&ch.policy),
-                "never": nevers(d).contains(&ch.entry),
-                "guardians": ch.policy.commitments.len(),
-                "threshold": ch.policy.threshold,
-                "delay": ch.policy.delay,
-                "delay_text": delay_text(ch.policy.delay),
-                "confirm_delay": wait,
-                "confirm_delay_text": delay_text(wait),
-                "confirmed": ch.confirmed.len(),
-                "confirmed_by_me": ch.confirmed.contains(&g.persona.identity),
-                "in_effect": ch.in_effect,
-                "objected": ch.objected,
-                "confirm_from_ms": since.map(|t| t.saturating_add(wait.saturating_mul(1000))),
-                "caution": (!ch.in_effect).then(|| change_caution(&g.name)),
-            })
+            crate::api::GuardianChange {
+                id: bytes::Bytes::copy_from_slice(&ch.entry[..8]),
+                fingerprint: change_fingerprint(&ch.policy),
+                never: Some(nevers(d).contains(&ch.entry)),
+                guardians: ch.policy.commitments.len() as u64,
+                threshold: ch.policy.threshold,
+                delay: ch.policy.delay,
+                delay_text: delay_text(ch.policy.delay),
+                confirm_delay: wait,
+                confirm_delay_text: delay_text(wait),
+                confirmed: ch.confirmed.len() as u64,
+                confirmed_by_me: Some(ch.confirmed.contains(&g.persona.identity)),
+                in_effect: Some(ch.in_effect),
+                objected: ch.objected,
+                confirm_from_ms: since.map(|t| t.saturating_add(wait.saturating_mul(1000))),
+                caution: (!ch.in_effect).then(|| change_caution(&g.name)),
+                names: None,
+                needed: None,
+                waits_until_ms: None,
+            }
         })
         .collect()
 }
@@ -1711,6 +1737,18 @@ fn asked(d: &Daemon) -> Vec<String> {
         .collect()
 }
 
+/// The person this person guards that `who` names, by a `ref` as it came.
+fn find_guarded_ref(d: &Daemon, who: Ref<'_>) -> anyhow::Result<Guarded> {
+    let c = crate::contacts::find_ref(d, who)?;
+    let mut all = guarded(d);
+    let at = all
+        .iter()
+        .rposition(|g| g.identity == c.identity)
+        .ok_or_else(|| anyhow::anyhow!("you do not guard {}", c.petname))?;
+    Ok(all.swap_remove(at))
+}
+
+#[cfg(any(test, debug_assertions, feature = "by-name"))]
 fn find_guarded(d: &Daemon, who: &str) -> anyhow::Result<Guarded> {
     let c = crate::contacts::find(d, who)?;
     let mut all = guarded(d);
@@ -1800,20 +1838,23 @@ fn heeded(g: &Guarded, understood: bool) -> anyhow::Result<()> {
 
 /// `guarding-caution`: what to show a guardian before they endorse or
 /// confirm a recovery of `who`, however `who` is named.
-pub fn caution_for(d: &Daemon, who: &str) -> anyhow::Result<Json> {
-    let g = find_guarded(d, who)?;
-    Ok(json!({"name": g.name, "caution": caution(&g.name)}))
+pub fn caution_for(d: &Daemon, who: Ref<'_>) -> anyhow::Result<crate::api::GuardingCautionReply> {
+    let g = find_guarded_ref(d, who)?;
+    Ok(crate::api::GuardingCautionReply {
+        caution: caution(&g.name),
+        name: g.name,
+    })
 }
 
 /// `cardinal guarding endorse NAME FINGERPRINT`: after checking with the
 /// person by whatever means they trust, says a recovery is wanted.
 pub async fn endorse(
     d: &Arc<Daemon>,
-    who: &str,
+    who: Ref<'_>,
     fingerprint: &str,
     understood: bool,
-) -> anyhow::Result<Json> {
-    let g = find_guarded(d, who)?;
+) -> anyhow::Result<crate::api::GuardingReply> {
+    let g = find_guarded_ref(d, who)?;
     heeded(&g, understood)?;
     let w = find_wanted(d, &g, fingerprint)?;
     if !w.endorsed.contains(&g.persona.identity) {
@@ -1834,11 +1875,11 @@ pub async fn endorse(
 /// with this guardian's share sealed to the new device.
 pub async fn confirm(
     d: &Arc<Daemon>,
-    who: &str,
+    who: Ref<'_>,
     fingerprint: &str,
     understood: bool,
-) -> anyhow::Result<Json> {
-    let g = find_guarded(d, who)?;
+) -> anyhow::Result<crate::api::GuardingReply> {
+    let g = find_guarded_ref(d, who)?;
     heeded(&g, understood)?;
     // Own devices first, so this person's phone and laptop do not confirm
     // opposite decisions unawares, nor one said never to on the other.
@@ -1891,8 +1932,12 @@ pub async fn confirm(
 /// recovery be started over (their new device was lost before it took
 /// effect), so this guardian never endorses or confirms the old one, on
 /// any of their devices (`identity.md#how-guardians-act`).
-pub fn never(d: &Arc<Daemon>, who: &str, fingerprint: &str) -> anyhow::Result<Json> {
-    let g = find_guarded(d, who)?;
+pub fn never(
+    d: &Arc<Daemon>,
+    who: Ref<'_>,
+    fingerprint: &str,
+) -> anyhow::Result<crate::api::GuardingReply> {
+    let g = find_guarded_ref(d, who)?;
     // a recovery, or a change of guardians
     let mut all: Vec<(EntryId, String, bool)> = wanted(d, &g)
         .iter()
@@ -2141,8 +2186,12 @@ pub(crate) fn carry(
 /// NAME's new device, made by this person's persona for NAME and naming
 /// NAME in field 9, so that it meets the persona in a relationship of its
 /// own. It is the persona's: neither side learns the other's identity.
-pub async fn invite(d: &Arc<Daemon>, who: &str, at: Option<&str>) -> anyhow::Result<Json> {
-    let g = find_guarded(d, who)?;
+pub async fn invite(
+    d: &Arc<Daemon>,
+    who: Ref<'_>,
+    at: Option<&str>,
+) -> anyhow::Result<crate::api::GuardingInviteReply> {
+    let g = find_guarded_ref(d, who)?;
     let h = service(d, &g.persona.identity).ok_or_else(|| {
         anyhow::anyhow!(
             "your persona for {} acts from the device on which you accepted being their \
@@ -2156,7 +2205,7 @@ pub async fn invite(d: &Arc<Daemon>, who: &str, at: Option<&str>) -> anyhow::Res
             crate::contacts::invite_recovery(&pd, at.as_deref(), recovered).map(|i| i.to_text())
         })
         .await?;
-    Ok(json!({"code": code, "name": g.name}))
+    Ok(crate::api::GuardingInviteReply { code, name: g.name })
 }
 
 /// `accept` of a helper's recovery invitation, on a guardian's device: the
@@ -2795,7 +2844,7 @@ async fn burn_spent(d: &Arc<Daemon>) {
 /// persona for them, and whom no other persona of theirs guards, as a
 /// window shows them: "Ana no longer needs you as a guardian". Each stays
 /// listed until this person guards them again.
-fn no_longer_json(d: &Daemon, seen: &Seen) -> Vec<Json> {
+fn no_longer_shown(d: &Daemon, seen: &Seen) -> Vec<crate::api::NoLongerNeeded> {
     let mine = my_personas(d);
     let core = d.core();
     seen.no_longer
@@ -2810,12 +2859,12 @@ fn no_longer_json(d: &Daemon, seen: &Seen) -> Vec<Json> {
                 .into_iter()
                 .find(|c| c.identity == id && c.recovery_of.is_none())
                 .map_or_else(|| account::short_key(&id), |c| c.petname);
-            Some(json!({
-                "name": name,
-                "id": who,
-                "at_ms": at,
-                "text": format!("{name} no longer needs you as a guardian"),
-            }))
+            Some(crate::api::NoLongerNeeded {
+                text: format!("{name} no longer needs you as a guardian"),
+                name,
+                id,
+                at_ms: *at,
+            })
         })
         .collect()
 }
@@ -3106,4 +3155,879 @@ async fn accept_recovery_now_by_name(
     })
     .await?;
     Ok(json!({"name": helper_petname(d, who), "recovery_of": hex::encode(who)}))
+}
+
+// ---- The handlers as they were by name ----
+//
+// What main had, whole, kept only to show that the typed handlers send the
+// same bytes (`control::typed::answering`, `api/same_bytes.rs`). They go
+// with the way by name.
+
+/// `show` as main had it, by name.
+#[cfg(any(test, debug_assertions, feature = "by-name"))]
+#[allow(dead_code, clippy::all)]
+pub fn show_by_name(d: &Daemon) -> anyhow::Result<Json> {
+    // whom this person asked, and who accepted, ready to be named
+    let (asked, ready) = {
+        let contacts: Vec<account::ContactRecord> = d
+            .core()
+            .contacts()
+            .into_iter()
+            .filter(|c| c.recovery_of.is_none() && !c.refused)
+            .collect();
+        let mut asked = Vec::new();
+        let mut ready = Vec::new();
+        for c in contacts {
+            if persona_of(&d.core(), &c).is_some() {
+                ready.push(c.petname.clone());
+            } else if asked_already(d, &c) {
+                asked.push(c.petname.clone());
+            }
+        }
+        (asked, ready)
+    };
+    let core = d.core();
+    let ident = core
+        .identity
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("this device does not belong to anyone"))?;
+    let policy = ident.log.current_policy();
+    let mut names: Vec<String> = core
+        .contacts()
+        .into_iter()
+        .filter(|c| c.guardian)
+        .map(|c| c.petname)
+        .collect();
+    names.sort_by_key(|n| n.to_lowercase());
+    let st = ident.state();
+    let others: Vec<&IdentityLog> = core.others.values().map(|o| &o.log).collect();
+    let recoveries: Vec<Json> = ident
+        .log
+        .recoveries()
+        .into_iter()
+        .filter_map(|r| {
+            let p = ident.log.policy(&r.policy)?;
+            Some(json!({
+                "fingerprint": r.fingerprint(),
+                "endorsed": ident.log.endorsed_by(&r.entry, &p, &others).len(),
+                "confirmed": ident.log.confirmed_by(&r.entry, &p, &others).len(),
+                "in_effect": st.in_effect.contains(&r.entry),
+                "objected": objected(&ident.log, &r.entry),
+                "id": hex::encode(r.entry),
+            }))
+        })
+        .collect();
+    // whom each change names, and when this person made it
+    let made: Vec<account::GuardiansRecord> = core
+        .account()
+        .and_then(|a| a.space.as_ref())
+        .map(|sp| account::guardians_named(sp.state()))
+        .unwrap_or_default();
+    let contacts = core.contacts();
+    let changes: Vec<Json> = policy
+        .as_ref()
+        .map(|cur| {
+            changes_of(&ident.log, &cur.entry)
+                .into_iter()
+                .filter(|(id, _)| !st.in_effect.contains(id))
+                .map(|(id, p)| {
+                    let (names, since) = made
+                        .iter()
+                        .find(|g| g.policy == id)
+                        .map(|g| {
+                            let names: Vec<String> = g
+                                .named
+                                .iter()
+                                .filter_map(|(c, _)| {
+                                    contacts
+                                        .iter()
+                                        .find(|x| x.identity == *c)
+                                        .map(|x| x.petname.clone())
+                                })
+                                .collect();
+                            (names, g.made)
+                        })
+                        .unwrap_or_default();
+                    let objected = objected(&ident.log, &id);
+                    let wait = cur.delay.saturating_mul(if objected { 2 } else { 1 });
+                    json!({
+                        "fingerprint": change_fingerprint(&p),
+                        "names": names,
+                        "guardians": p.commitments.len(),
+                        "threshold": p.threshold,
+                        // the change's own delay, for recoveries under it,
+                        // and the wait before its guardians confirm it,
+                        // which is the current policy's
+                        "delay": p.delay,
+                        "delay_text": delay_text(p.delay),
+                        "confirm_delay": wait,
+                        "confirm_delay_text": delay_text(wait),
+                        "confirmed": ident.log.confirmed_by(&id, cur, &others).len(),
+                        "needed": cur.threshold,
+                        // when this person made it, plus the wait: each
+                        // guardian waits from when their device saw it
+                        "waits_until_ms": since.map(|t| t.saturating_add(wait.saturating_mul(1000))),
+                        "objected": objected,
+                        "id": hex::encode(id),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let full: Vec<String> = core
+        .contacts()
+        .into_iter()
+        .filter(|c| c.guardian)
+        .filter(|c| {
+            core.spaces
+                .get(&c.space)
+                .and_then(|h| h.space.as_ref())
+                .is_some_and(|sp| {
+                    relationship::held_full(sp)
+                        .iter()
+                        .any(|(a, l)| *a == c.identity && core.account_id() == Some(*l))
+                })
+        })
+        .map(|c| c.petname)
+        .collect();
+    Ok(json!({
+        "asked": asked,
+        "ready": ready,
+        "copy_full": full,
+        "changes": changes,
+        "guardians": policy.as_ref().map_or(0, |p| p.commitments.len()),
+        "threshold": policy.as_ref().map_or(0, |p| p.threshold),
+        "delay": policy.as_ref().map_or(0, |p| p.delay),
+        "delay_text": delay_text(policy.as_ref().map_or(0, |p| p.delay)),
+        "data": policy.as_ref().is_some_and(|p| p.guardian_key.is_some()),
+        "names": names,
+        "recoveries": recoveries,
+        "frozen": st.frozen,
+    }))
+}
+
+/// `set` as main had it, by name.
+#[cfg(any(test, debug_assertions, feature = "by-name"))]
+#[allow(dead_code, clippy::all)]
+pub fn set_by_name(
+    d: &Arc<Daemon>,
+    who: &[String],
+    threshold: Option<u64>,
+    delay: Option<u64>,
+    words: Option<&str>,
+) -> anyhow::Result<Json> {
+    anyhow::ensure!(!who.is_empty(), "name at least one guardian");
+    // One change at a time: a change under way takes effect, or the person
+    // gives it up by objecting to it, before another is made.
+    {
+        let core = d.core();
+        let ident = core
+            .identity
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("this device does not belong to anyone"))?;
+        let st = ident.state();
+        if let Some(cur) = ident.log.current_policy() {
+            let pending = changes_of(&ident.log, &cur.entry)
+                .into_iter()
+                .find(|(id, _)| !st.in_effect.contains(id) && !objected(&ident.log, id));
+            if let Some((_, p)) = pending {
+                anyhow::bail!(
+                    "a change of your guardians is under way (fingerprint \"{fp}\"): it must \
+                     take effect first, or you give it up by objecting to it",
+                    fp = change_fingerprint(&p)
+                );
+            }
+        }
+    }
+    let mut chosen = Vec::new();
+    for w in who {
+        let c = crate::contacts::find(d, w)?;
+        anyhow::ensure!(
+            c.connects(),
+            "{} is not someone you trust: a guardian must be",
+            c.petname
+        );
+        anyhow::ensure!(
+            !chosen
+                .iter()
+                .any(|x: &account::ContactRecord| x.identity == c.identity),
+            "{} is named twice",
+            c.petname
+        );
+        chosen.push(c);
+    }
+    let n = chosen.len() as u64;
+    let threshold = threshold.unwrap_or(n / 2 + 1);
+    anyhow::ensure!(
+        threshold * 2 > n && threshold <= n,
+        "with {n} guardians the threshold is between {} and {n}: more than half of them",
+        n / 2 + 1
+    );
+    let delay = delay.unwrap_or(DEFAULT_DELAY);
+    let (unguarded, named, missing) = {
+        let core = d.core();
+        let ident = core
+            .identity
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("this device does not belong to anyone"))?;
+        let policy = ident
+            .log
+            .current_policy()
+            .ok_or_else(|| anyhow::anyhow!("your identity has no recovery policy in effect"))?;
+        // Each guardian is named by the persona they made for guarding this
+        // person, in the relationship the two share (D79).
+        let mut named = Vec::new();
+        let mut missing = Vec::new();
+        for c in &chosen {
+            match persona_of(&core, c) {
+                Some(p) => named.push(p),
+                None => missing.push(c.clone()),
+            }
+        }
+        (!policy.guarded(), named, missing)
+    };
+    if !missing.is_empty() {
+        // Each who has no persona to be named with is asked, now: a
+        // guardian named again accepts again, with a fresh one.
+        for c in &missing {
+            if !asked_already(d, c) {
+                d.write_and_push(&c.space, vec![relationship::create_guardian_request()])?;
+            }
+        }
+        let names: Vec<String> = missing.iter().map(|c| c.petname.clone()).collect();
+        anyhow::bail!(
+            "{} must accept being your guardian{} first. They have been asked; once they \
+             have accepted, and your devices have been in touch with theirs, try again.",
+            names.join(", "),
+            if names.len() > 1 { "s" } else { "" }
+        );
+    }
+    // The first guardians are named by the policy's controller, the root;
+    // a change, by any key of this person's, and the guardians in office
+    // decide it (`identity.md#guardian-decisions`).
+    let root = match unguarded {
+        true => Some(
+            crate::recovery::signer(
+                d,
+                words,
+                |_| false,
+                || "your first guardians are named with your recovery words".to_owned(),
+            )?
+            .expect("asked for the words"),
+        ),
+        false => None,
+    };
+    let acc = d
+        .core()
+        .account_id()
+        .ok_or_else(|| anyhow::anyhow!("the account space is not here yet"))?;
+    let pairs: Vec<([u8; 32], [u8; 32])> = chosen
+        .iter()
+        .zip(&named)
+        .map(|(c, (p, _))| (c.identity, *p))
+        .collect();
+    let (entries, written) = {
+        let mut core = d.core();
+        let ident = core.identity.as_mut().expect("identity");
+        let current = ident
+            .enc
+            .first()
+            .map(|k| HybridKeyPair::from_secret_bytes(&k.secret_bytes()));
+        let author = root.as_ref().unwrap_or(&d.keys.device.signing);
+        let e1 = ident
+            .log
+            .set_guardians(author, &named, threshold, delay, true, current.as_ref())
+            .map_err(|e| anyhow::anyhow!("cannot name these guardians: {e}"))?;
+        // Whom it names, kept in the account before the entry itself, so
+        // that a stop between the two never leaves a policy nobody here
+        // can map to its guardians.
+        let written = core.write(&acc, vec![account::create_guardians(&e1.id(), &pairs)])?;
+        let ident = core.identity.as_mut().expect("identity");
+        ident.record_own(&e1)?;
+        let mut entries = vec![e1.encode()];
+        if let Some(root) = &root {
+            // After a change of guardians, a fresh encryption key, wrapped to
+            // the new guardian key (`identity.md#the-identity-encryption-key`).
+            // A change waits for its guardians: [`tend_person`] does it then.
+            let mine = ident.state().power(&d.keys.key());
+            let signer = if mine >= Some(Power::Admin) {
+                &d.keys.device.signing
+            } else {
+                root
+            };
+            let fresh = HybridKeyPair::generate();
+            let e2 = ident
+                .log
+                .set_encryption_key(signer, &fresh, current.as_ref())?;
+            ident.record_own(&e2)?;
+            entries.push(e2.encode());
+        }
+        (entries, written)
+    };
+    d.push(&acc, written.into_iter().map(|(_, b)| b).collect());
+    d.identity_changed();
+    d.push_identity(entries);
+    // The first guardians are in office at once: marked, and given the
+    // account, the same way a change's are once it is in effect.
+    tend_person(d);
+    tell_full(d);
+    crate::recovering::tend_recovered(d);
+    Ok(json!({
+        "names": chosen.iter().map(|c| c.petname.clone()).collect::<Vec<_>>(),
+        "threshold": threshold,
+        "delay": delay,
+        "delay_text": delay_text(delay),
+        "pending": !unguarded,
+    }))
+}
+
+/// `ask` as main had it, by name.
+#[cfg(any(test, debug_assertions, feature = "by-name"))]
+#[allow(dead_code, clippy::all)]
+pub fn ask_by_name(d: &Arc<Daemon>, who: &str) -> anyhow::Result<Json> {
+    let c = crate::contacts::find(d, who)?;
+    anyhow::ensure!(
+        c.connects(),
+        "{} is not someone you trust: a guardian must be",
+        c.petname
+    );
+    d.write_and_push(&c.space, vec![relationship::create_guardian_request()])?;
+    Ok(json!({"name": c.petname}))
+}
+
+/// `object` as main had it, by name.
+#[cfg(any(test, debug_assertions, feature = "by-name"))]
+#[allow(dead_code, clippy::all)]
+pub fn object_by_name(d: &Arc<Daemon>, which: Option<&str>) -> anyhow::Result<Json> {
+    let entry = {
+        let mut core = d.core();
+        let ident = core
+            .identity
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("this device does not belong to anyone"))?;
+        let st = ident.state();
+        anyhow::ensure!(
+            st.power(&d.keys.key()) >= Some(Power::Admin),
+            "only an admin device may object"
+        );
+        // a recovery under way, or a change of guardians
+        let mut pending: Vec<(EntryId, String)> = ident
+            .log
+            .recoveries()
+            .into_iter()
+            .filter(|r| !st.in_effect.contains(&r.entry))
+            .map(|r| (r.entry, r.fingerprint()))
+            .collect();
+        if let Some(cur) = ident.log.current_policy() {
+            pending.extend(
+                changes_of(&ident.log, &cur.entry)
+                    .into_iter()
+                    .filter(|(id, _)| !st.in_effect.contains(id))
+                    .map(|(id, p)| (id, change_fingerprint(&p))),
+            );
+        }
+        pending.retain(|(_, fp)| which.is_none_or(|w| same_fingerprint(w, fp)));
+        let decision = match pending.as_slice() {
+            [] => anyhow::bail!("no recovery or change of your guardians is under way"),
+            [(id, _)] => *id,
+            _ => anyhow::bail!("more than one is under way; give its fingerprint"),
+        };
+        let e = ident
+            .log
+            .append(&d.keys.device.signing, vec![IdentityOp::object(decision)])?;
+        ident.record_own(&e)?;
+        e.encode()
+    };
+    d.identity_changed();
+    d.push_identity(vec![entry]);
+    Ok(json!({}))
+}
+
+/// `accept_role` as main had it, by name.
+#[cfg(any(test, debug_assertions, feature = "by-name"))]
+#[allow(dead_code, clippy::all)]
+pub async fn accept_role_by_name(d: &Arc<Daemon>, who: &str) -> anyhow::Result<Json> {
+    let c = crate::contacts::find(d, who)?;
+    anyhow::ensure!(
+        c.connects(),
+        "{} is not someone you trust: trust them first",
+        c.petname
+    );
+    // One not named by any policy yet serves; a persona named before is
+    // never offered again, so each change of guardians gets a fresh one.
+    let seen = load_seen(d);
+    let fresh = my_personas(d).into_iter().find(|p| {
+        p.for_identity == Some(c.identity)
+            && !seen
+                .named
+                .iter()
+                .any(|n| n.starts_with(&format!("{}:", hex::encode(p.identity))))
+    });
+    if let Some(p) = fresh {
+        // repaired, if the relationship lacks its node (a crash, or a write
+        // that failed, between the two)
+        let (me, written) = {
+            let core = d.core();
+            let me = core.me();
+            let written = core
+                .spaces
+                .get(&c.space)
+                .and_then(|h| h.space.as_ref())
+                .is_some_and(|sp| {
+                    relationship::guardian_personas(sp)
+                        .iter()
+                        .any(|n| Some(n.author) == me && n.persona == p.identity)
+                });
+            (me, written)
+        };
+        if !written && me.is_some() {
+            if let Some(log) = persona_log(d, &p) {
+                let bytes = crate::core::log_bytes(&log);
+                d.write_and_push(
+                    &c.space,
+                    vec![relationship::create_guardian_persona(&p.identity, &bytes)],
+                )?;
+            }
+        }
+        return Ok(json!({"name": c.petname, "persona": hex::encode(p.identity), "already": true}));
+    }
+    let d2 = d.clone();
+    let (entropy, id, log) =
+        tokio::task::spawn_blocking(move || crate::helper::make_persona(&d2)).await??;
+    let acc = d
+        .core()
+        .account_id()
+        .ok_or_else(|| anyhow::anyhow!("the account space is not here yet"))?;
+    d.write_and_push(
+        &acc,
+        vec![account::create_persona(
+            account::GUARDIAN_PURPOSE,
+            &entropy,
+            &id,
+            Some(&c.identity),
+        )],
+    )?;
+    d.write_and_push(
+        &c.space,
+        vec![relationship::create_guardian_persona(&id, &log)],
+    )?;
+    crate::helper::start_persona(d, &id).await?;
+    tracing::info!("guarding {} through persona {}", c.petname, short(&id));
+    Ok(json!({"name": c.petname, "persona": hex::encode(id), "already": false}))
+}
+
+/// `confirm_change` as main had it, by name.
+#[cfg(any(test, debug_assertions, feature = "by-name"))]
+#[allow(dead_code, clippy::all)]
+pub async fn confirm_change_by_name(
+    d: &Arc<Daemon>,
+    who: &str,
+    fingerprint: Option<&str>,
+    understood: bool,
+) -> anyhow::Result<Json> {
+    let c = crate::contacts::find(d, who)?;
+    let current = {
+        let core = d.core();
+        core.others
+            .get(&c.identity)
+            .and_then(|o| o.log.current_policy())
+            .map(|p| p.entry)
+    };
+    let g = guarded(d)
+        .into_iter()
+        .find(|g| g.identity == c.identity && Some(g.policy.entry) == current)
+        .ok_or_else(|| anyhow::anyhow!("you do not guard {} under their policy now", c.petname))?;
+    anyhow::ensure!(
+        understood,
+        "{} (Ask again saying you understood.)",
+        change_caution(&g.name)
+    );
+    sync_own_log(d).await;
+    observe(d);
+    let seen = load_seen(d);
+    let never = nevers(d);
+    let mut all: Vec<Change> = changes(d, &g)
+        .into_iter()
+        .filter(|x| !x.in_effect && !never.contains(&x.entry))
+        .collect();
+    anyhow::ensure!(
+        !all.is_empty(),
+        "no change of {}'s guardians is under way",
+        g.name
+    );
+    let ch = match fingerprint {
+        Some(f) => {
+            let fps: Vec<String> = all.iter().map(|x| change_fingerprint(&x.policy)).collect();
+            let at = pick_fingerprint(&fps, f, &g.name)?;
+            all.swap_remove(at)
+        }
+        None if all.len() == 1 => all.remove(0),
+        None => anyhow::bail!(
+            "more than one change of {}'s guardians is under way: give the fingerprint they \
+             read you, of the one that is theirs",
+            g.name
+        ),
+    };
+    // Never two changes under one policy (DEVIATIONS.md): once this
+    // guardian confirmed one not in effect, it confirms no other.
+    if let Some(other) = changes(d, &g)
+        .iter()
+        .find(|x| x.entry != ch.entry && !x.in_effect && x.confirmed.contains(&g.persona.identity))
+    {
+        anyhow::bail!(
+            "you confirmed another change of {}'s guardians ({}), not in effect: you confirm no \
+             other under this policy",
+            g.name,
+            change_fingerprint(&other.policy)
+        );
+    }
+    if ch.confirmed.contains(&g.persona.identity) {
+        return Ok(list_by_name(d));
+    }
+    let since = seen
+        .first
+        .get(&hex::encode(ch.entry))
+        .copied()
+        .unwrap_or(u64::MAX);
+    let wait = g
+        .policy
+        .delay
+        .saturating_mul(if ch.objected { 2 } else { 1 });
+    let from = since.saturating_add(wait.saturating_mul(1000));
+    let now = now_ms();
+    anyhow::ensure!(
+        now >= from,
+        "the wait is not over: you can confirm in {}",
+        delay_text(from.saturating_sub(now).div_ceil(1000))
+    );
+    // the chain rule, as for a recovery: and, more strictly, never a second
+    // change under the same policy (DEVIATIONS.md)
+    let r = Recovery {
+        entry: ch.entry,
+        root: [0; 32],
+        keep: Vec::new(),
+        link_key: None,
+        policy: g.policy.entry,
+    };
+    check_chain(d, &g, &r)?;
+    act(
+        d,
+        &g,
+        ch.entry,
+        IdentityOp::confirm(ch.entry, g.position, g.salt, None),
+    )
+    .await?;
+    Ok(list_by_name(d))
+}
+
+/// `list` as main had it, by name.
+#[cfg(any(test, debug_assertions, feature = "by-name"))]
+#[allow(dead_code, clippy::all)]
+pub fn list_by_name(d: &Daemon) -> Json {
+    observe(d);
+    let seen = load_seen(d);
+    let all = guarded(d);
+    let people: Vec<Json> = all
+        .iter()
+        .map(|g| {
+            let s = shown(d, &seen, g);
+            let me = g.persona.identity;
+            let mine = |set: &BTreeSet<EntryId>| set.contains(&me);
+            let recoveries: Vec<Json> = s
+                .shown
+                .iter()
+                .map(|w| {
+                    json!({
+                        "fingerprint": w.recovery.fingerprint(),
+                        "endorsed": w.endorsed.len(),
+                        "confirmed": w.confirmed.len(),
+                        "endorsed_by_me": mine(&w.endorsed),
+                        "confirmed_by_me": mine(&w.confirmed),
+                        "pending": w.endorsed.len() as u64 >= g.policy.threshold,
+                        "confirm_from_ms": confirm_from(&seen, g, w),
+                        "objected": w.objected,
+                        "in_effect": w.in_effect,
+                        "keeps_keys": !w.recovery.keep.is_empty(),
+                        "caution": (!w.in_effect).then(|| caution(&g.name)),
+                    })
+                })
+                .collect();
+            let never: Vec<String> = s.never.iter().map(|w| w.recovery.fingerprint()).collect();
+            let helpers = service(d, &g.persona.identity)
+                .map_or(0, |h| helpers_of(&h.d, &g.identity).len());
+            // where the persona's own service listens, for an invitation
+            // to name (`guarding-invite` `at`): null if it does not run here
+            let persona_at = service(d, &g.persona.identity).and_then(|h| {
+                let a = h.d.endpoint.udp_addr().or(h.d.endpoint.tcp_addr())?;
+                let ip = if a.ip().is_unspecified() {
+                    crate::daemon::local_ips().into_iter().next()?
+                } else {
+                    a.ip()
+                };
+                Some(std::net::SocketAddr::new(ip, a.port()).to_string())
+            });
+            let account_copy = {
+                let core = d.core();
+                core.held_taken(&g.identity)
+                    .iter()
+                    .any(|l| core.set(l).iter().next().is_some())
+            };
+            json!({
+                "name": g.name,
+                "id": hex::encode(g.identity),
+                "persona": hex::encode(g.persona.identity),
+                "guardians": g.policy.commitments.len(),
+                "threshold": g.policy.threshold,
+                "delay": g.policy.delay,
+                "delay_text": delay_text(g.policy.delay),
+                "recoveries": recoveries,
+                "waiting": s.waiting.len(),
+                "warning": (!s.waiting.is_empty()).then(|| second_warning(&g.name, s.waiting.len())),
+                "never": never,
+                "helpers": helpers,
+                "persona_at": persona_at,
+                "account_copy": account_copy,
+                "changes": changes_json_by_name(d, &seen, g),
+            })
+        })
+        .collect();
+    let (accepted, in_change): (Vec<String>, Vec<String>) = {
+        let named: HashSet<EntryId> = all.iter().map(|g| g.persona.identity).collect();
+        let personas = my_personas(d);
+        let mut accepted = Vec::new();
+        let mut in_change = Vec::new();
+        for p in personas.iter().filter(|p| !named.contains(&p.identity)) {
+            let Some(who) = p.for_identity else { continue };
+            let waiting = named_in_change(d, p);
+            let core = d.core();
+            let Some(c) = core
+                .contacts()
+                .into_iter()
+                .find(|c| c.identity == who && c.recovery_of.is_none())
+            else {
+                continue;
+            };
+            if waiting {
+                in_change.push(c.petname);
+            } else {
+                accepted.push(c.petname);
+            }
+        }
+        (accepted, in_change)
+    };
+    json!({
+        "guarding": people,
+        "accepted": accepted,
+        "named_in_change": in_change,
+        "no_longer_needed": no_longer_json_by_name(d, &seen),
+        "asked": asked(d),
+        "now_ms": crate::control::clock::now_ms(),
+    })
+}
+
+/// `changes_json` as main had it, by name.
+#[cfg(any(test, debug_assertions, feature = "by-name"))]
+#[allow(dead_code, clippy::all)]
+fn changes_json_by_name(d: &Daemon, seen: &Seen, g: &Guarded) -> Vec<Json> {
+    changes(d, g)
+        .iter()
+        .map(|ch| {
+            let since = seen.first.get(&hex::encode(ch.entry)).copied();
+            let wait = g
+                .policy
+                .delay
+                .saturating_mul(if ch.objected { 2 } else { 1 });
+            json!({
+                "id": hex::encode(&ch.entry[..8]),
+                "fingerprint": change_fingerprint(&ch.policy),
+                "never": nevers(d).contains(&ch.entry),
+                "guardians": ch.policy.commitments.len(),
+                "threshold": ch.policy.threshold,
+                "delay": ch.policy.delay,
+                "delay_text": delay_text(ch.policy.delay),
+                "confirm_delay": wait,
+                "confirm_delay_text": delay_text(wait),
+                "confirmed": ch.confirmed.len(),
+                "confirmed_by_me": ch.confirmed.contains(&g.persona.identity),
+                "in_effect": ch.in_effect,
+                "objected": ch.objected,
+                "confirm_from_ms": since.map(|t| t.saturating_add(wait.saturating_mul(1000))),
+                "caution": (!ch.in_effect).then(|| change_caution(&g.name)),
+            })
+        })
+        .collect()
+}
+
+/// `caution_for` as main had it, by name.
+#[cfg(any(test, debug_assertions, feature = "by-name"))]
+#[allow(dead_code, clippy::all)]
+pub fn caution_for_by_name(d: &Daemon, who: &str) -> anyhow::Result<Json> {
+    let g = find_guarded(d, who)?;
+    Ok(json!({"name": g.name, "caution": caution(&g.name)}))
+}
+
+/// `endorse` as main had it, by name.
+#[cfg(any(test, debug_assertions, feature = "by-name"))]
+#[allow(dead_code, clippy::all)]
+pub async fn endorse_by_name(
+    d: &Arc<Daemon>,
+    who: &str,
+    fingerprint: &str,
+    understood: bool,
+) -> anyhow::Result<Json> {
+    let g = find_guarded(d, who)?;
+    heeded(&g, understood)?;
+    let w = find_wanted(d, &g, fingerprint)?;
+    if !w.endorsed.contains(&g.persona.identity) {
+        act(
+            d,
+            &g,
+            w.recovery.entry,
+            IdentityOp::endorse(w.recovery.entry, g.position, g.salt),
+        )
+        .await?;
+    }
+    observe(d);
+    Ok(list_by_name(d))
+}
+
+/// `confirm` as main had it, by name.
+#[cfg(any(test, debug_assertions, feature = "by-name"))]
+#[allow(dead_code, clippy::all)]
+pub async fn confirm_by_name(
+    d: &Arc<Daemon>,
+    who: &str,
+    fingerprint: &str,
+    understood: bool,
+) -> anyhow::Result<Json> {
+    let g = find_guarded(d, who)?;
+    heeded(&g, understood)?;
+    // Own devices first, so this person's phone and laptop do not confirm
+    // opposite decisions unawares, nor one said never to on the other.
+    sync_own_log(d).await;
+    observe(d);
+    let w = find_wanted(d, &g, fingerprint)?;
+    if w.confirmed.contains(&g.persona.identity) {
+        return Ok(list_by_name(d));
+    }
+    anyhow::ensure!(
+        w.endorsed.len() as u64 >= g.policy.threshold,
+        "{} of {} guardians have endorsed this recovery; it waits for {}",
+        w.endorsed.len(),
+        g.policy.commitments.len(),
+        g.policy.threshold
+    );
+    let from = confirm_from(&load_seen(d), &g, &w).unwrap_or(u64::MAX);
+    let now = now_ms();
+    anyhow::ensure!(
+        now >= from,
+        "the wait is not over: you can confirm in {}{}",
+        delay_text((from - now).div_ceil(1000)),
+        if w.objected {
+            " (twice the delay: one of their devices objected)"
+        } else {
+            ""
+        }
+    );
+    check_chain(d, &g, &w.recovery)?;
+    let share = g
+        .share
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("this policy gave you no share"))?;
+    let sealed = {
+        let core = d.core();
+        let other = core.others.get(&g.identity).expect("guarded");
+        other.log.seal_share(&w.recovery, share)?
+    };
+    act(
+        d,
+        &g,
+        w.recovery.entry,
+        IdentityOp::confirm(w.recovery.entry, g.position, g.salt, Some(&sealed)),
+    )
+    .await?;
+    Ok(list_by_name(d))
+}
+
+/// `never` as main had it, by name.
+#[cfg(any(test, debug_assertions, feature = "by-name"))]
+#[allow(dead_code, clippy::all)]
+pub fn never_by_name(d: &Arc<Daemon>, who: &str, fingerprint: &str) -> anyhow::Result<Json> {
+    let g = find_guarded(d, who)?;
+    // a recovery, or a change of guardians
+    let mut all: Vec<(EntryId, String, bool)> = wanted(d, &g)
+        .iter()
+        .map(|w| (w.recovery.entry, w.recovery.fingerprint(), w.in_effect))
+        .collect();
+    all.extend(
+        changes(d, &g)
+            .iter()
+            .map(|c| (c.entry, change_fingerprint(&c.policy), c.in_effect)),
+    );
+    let fps: Vec<String> = all.iter().map(|x| x.1.clone()).collect();
+    let (entry, _, in_effect) = all[pick_fingerprint(&fps, fingerprint, &g.name)?].clone();
+    anyhow::ensure!(
+        !in_effect,
+        "that decision about {} is in effect already; nothing undoes it",
+        g.name
+    );
+    if !nevers(d).contains(&entry) {
+        let acc = d
+            .core()
+            .account_id()
+            .ok_or_else(|| anyhow::anyhow!("the account space is not here yet"))?;
+        let name = format!("{NEVER_SETTING}{}", hex::encode(entry));
+        d.write_and_push(&acc, vec![account::create_setting(&name, true)])?;
+    }
+    retire_moot(d);
+    Ok(list_by_name(d))
+}
+
+/// `invite` as main had it, by name.
+#[cfg(any(test, debug_assertions, feature = "by-name"))]
+#[allow(dead_code, clippy::all)]
+pub async fn invite_by_name(d: &Arc<Daemon>, who: &str, at: Option<&str>) -> anyhow::Result<Json> {
+    let g = find_guarded(d, who)?;
+    let h = service(d, &g.persona.identity).ok_or_else(|| {
+        anyhow::anyhow!(
+            "your persona for {} acts from the device on which you accepted being their \
+             guardian; use that one",
+            g.name
+        )
+    })?;
+    let (at, recovered) = (at.map(str::to_owned), g.identity);
+    let code = h
+        .on(move |pd| async move {
+            crate::contacts::invite_recovery(&pd, at.as_deref(), recovered).map(|i| i.to_text())
+        })
+        .await?;
+    Ok(json!({"code": code, "name": g.name}))
+}
+
+/// `no_longer_json` as main had it, by name.
+#[cfg(any(test, debug_assertions, feature = "by-name"))]
+#[allow(dead_code, clippy::all)]
+fn no_longer_json_by_name(d: &Daemon, seen: &Seen) -> Vec<Json> {
+    let mine = my_personas(d);
+    let core = d.core();
+    seen.no_longer
+        .iter()
+        .filter_map(|(who, at)| {
+            let id: EntryId = hex::decode(who).ok()?.try_into().ok()?;
+            if mine.iter().any(|p| p.for_identity == Some(id)) {
+                return None;
+            }
+            let name = core
+                .contacts()
+                .into_iter()
+                .find(|c| c.identity == id && c.recovery_of.is_none())
+                .map_or_else(|| account::short_key(&id), |c| c.petname);
+            Some(json!({
+                "name": name,
+                "id": who,
+                "at_ms": at,
+                "text": format!("{name} no longer needs you as a guardian"),
+            }))
+        })
+        .collect()
 }
