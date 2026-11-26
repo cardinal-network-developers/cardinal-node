@@ -23,6 +23,7 @@ use serde_json::{json, Value as Json};
 use tokio::io::AsyncWriteExt;
 use tokio::sync::watch;
 
+use crate::api;
 use crate::contacts;
 use crate::daemon::{Daemon, PeerKind};
 use crate::mesh::{self, Frame, LinkId, Tree, Voice, Word};
@@ -272,14 +273,14 @@ impl Call {
 fn finished(d: &Daemon, call: &Call, how: Ending) {
     call.close();
     let at = crate::core::now_ms();
-    let ended = json!({
-        "id": hex::encode(call.id),
-        "who": hex::encode(&call.who[..8]),
-        "name": call.name,
-        "group": call.group.then(|| hex::encode(call.space)),
-        "how": how.name(),
-        "at": at,
-    });
+    let ended = api::CallEnded {
+        id: call.id,
+        who: api::short_id(&call.who),
+        name: call.name.clone(),
+        group: call.group.then_some(call.space),
+        how: how.name().into(),
+        at,
+    };
     *d.call_ended.lock().unwrap_or_else(|e| e.into_inner()) = Some(ended);
     // A group's last call, kept on this device for itself (D92).
     if call.group {
@@ -1185,7 +1186,7 @@ fn takes(d: &Daemon, id: &[u8; 16], format: &Format) -> bool {
 }
 
 /// What is known of the call under way.
-pub fn current(d: &Daemon) -> Json {
+pub fn current(d: &Daemon) -> api::CallReply {
     let ended = d
         .call_ended
         .lock()
@@ -1193,18 +1194,14 @@ pub fn current(d: &Daemon) -> Json {
         .clone();
     let (offered, taken, they_take, camera, own_camera) = {
         let call = lock(d);
-        let hexes = |l: &Option<Vec<Format>>| {
-            l.as_ref()
-                .map(|l| l.iter().map(hex::encode).collect::<Vec<_>>())
-        };
         call.as_ref().map_or((None, None, None, None, false), |c| {
             // between two, whether the other side's camera is on
             let camera = (!c.group && c.standing == Standing::Live)
                 .then(|| c.their_camera.is_some_and(|t| t.elapsed() < CAMERA_FOR));
             (
-                hexes(&c.offered),
-                hexes(&c.taken),
-                hexes(&c.they_take),
+                c.offered.clone(),
+                c.taken.clone(),
+                c.they_take.clone(),
                 camera,
                 c.camera,
             )
@@ -1213,7 +1210,7 @@ pub fn current(d: &Daemon) -> Json {
     let (who, name, standing, seconds, space, group, id, caller) = {
         let call = lock(d);
         let Some(c) = call.as_ref() else {
-            return json!({"call": null, "ended": ended});
+            return api::CallReply { call: None, ended };
         };
         let standing = match c.standing {
             Standing::Calling => "calling",
@@ -1246,9 +1243,12 @@ pub fn current(d: &Daemon) -> Json {
                 .collect()
         });
         (
-            Some(g.map_or(0, |g| g.tree.links())),
-            Some(g.map_or(1, |g| g.tree.on_it(now))),
-            g.map(|g| json!({"in": g.frames_in, "new": g.frames_new})),
+            Some(g.map_or(0, |g| g.tree.links()) as u64),
+            Some(g.map_or(1, |g| g.tree.on_it(now)) as u64),
+            g.map(|g| api::CallFrames {
+                r#in: g.frames_in,
+                new: g.frames_new,
+            }),
             g.map(|g| g.tree.others_heard(now)),
             cameras,
         )
@@ -1260,39 +1260,70 @@ pub fn current(d: &Daemon) -> Json {
     let picture = {
         let contacts = d.core().contacts();
         let c = contacts.into_iter().find(|c| c.identity == who);
-        c.and_then(|c| crate::names::shown(d, &c).remove("picture"))
+        c.and_then(|c| crate::names::picture(d, &c))
     };
-    let mut call = json!({
-        "id": hex::encode(id),
-        "who": hex::encode(&who[..8]),
-        "name": name,
-        "picture": picture,
-        "state": standing,
-        "seconds": seconds,
-        "group": group.then(|| hex::encode(space)),
-        "linked": linked,
-        "people": people,
-        "frames": frames,
-        "voices": voices,
-        "offered": offered,
-        "taken": taken,
-        "they_take": they_take,
-        "camera": camera,
-    });
+    let mut call = api::Call {
+        id,
+        who: api::short_id(&who),
+        name,
+        picture,
+        state: standing.into(),
+        seconds,
+        group: group.then_some(space),
+        linked,
+        people,
+        frames,
+        voices,
+        offered,
+        taken,
+        they_take,
+        camera,
+        ..api::Call::default()
+    };
     // In a group: its name, whether it was made for a call, who looks after
     // it, who rang, and whether answering joins it (D92, D93).
     if group {
-        let about = crate::groups::call_json(d, &space, caller.as_ref());
-        if let Some(about) = about.as_object() {
-            for (k, v) in about {
-                if k == "name" && v.as_str().is_some_and(str::is_empty) {
-                    continue;
-                }
-                call[k] = v.clone();
+        if let Some(about) = crate::groups::call_about(d, &space, caller.as_ref()) {
+            if !about.name.is_empty() {
+                call.name = about.name;
             }
+            call.for_call = Some(about.for_call);
+            call.admins = Some(about.admins);
+            call.caller = about.caller;
+            call.joins = about.joins.then_some(true);
+            call.reach = about.reach;
         }
     }
-    json!({"call": call, "ended": ended})
+    api::CallReply {
+        call: Some(call),
+        ended,
+    }
+}
+
+/// [`current`] as it was before it was typed, by name, without a call
+/// under way (the benchmark's case): kept only to show that the typed one
+/// sends the same bytes, and to measure the two. It goes with the way by
+/// name.
+#[cfg(any(test, feature = "by-name"))]
+#[doc(hidden)]
+pub fn current_by_name(d: &Daemon) -> Json {
+    assert!(lock(d).is_none(), "by name only without a call");
+    let ended = d
+        .call_ended
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
+        .map(|e| {
+            json!({
+                "id": hex::encode(e.id),
+                "who": hex::encode(e.who),
+                "name": e.name,
+                "group": e.group.map(hex::encode),
+                "how": e.how,
+                "at": e.at,
+            })
+        });
+    json!({"call": null, "ended": ended})
 }
 
 /// Who each voice heard on a group call is, as this person knows them:
@@ -1309,7 +1340,7 @@ fn voices(
     space: &SpaceId,
     heard: &[Voice],
     cameras: &std::collections::HashSet<Voice>,
-) -> Vec<Json> {
+) -> Vec<api::Voice> {
     let owners = device_owners(d, space);
     let core = d.core();
     let Some(sp) = core.spaces.get(space).and_then(|h| h.space.as_ref()) else {
@@ -1331,16 +1362,16 @@ fn voices(
             let known = (!you && !cardinal_space::account::refused(&contacts, who))
                 .then(|| contacts.iter().find(|c| c.identity == *who))
                 .flatten();
-            let picture = known.and_then(|c| crate::names::shown(d, c).remove("picture"));
-            Some(json!({
-                "voice": hex::encode(v),
-                "identity": hex::encode(&who[..8]),
-                "name": name,
-                "contact": known.is_some(),
-                "picture": picture,
-                "you": you,
-                "camera": cameras.contains(v),
-            }))
+            let picture = known.and_then(|c| crate::names::picture(d, c));
+            Some(api::Voice {
+                voice: *v,
+                identity: api::short_id(who),
+                name,
+                contact: known.is_some(),
+                picture,
+                you,
+                camera: cameras.contains(v),
+            })
         })
         .collect()
 }

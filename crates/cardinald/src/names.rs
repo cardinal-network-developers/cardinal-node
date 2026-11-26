@@ -75,10 +75,16 @@ pub fn shown(d: &Daemon, c: &ContactRecord) -> serde_json::Map<String, Json> {
     m.insert("name".into(), json!(c.petname));
     m.insert("own".into(), json!(c.own));
     m.insert("suggested".into(), json!(c.suggested));
-    if let Some(p) = c.picture.as_ref().and_then(|r| cached(d, r)) {
-        m.insert("picture".into(), json!(p.display().to_string()));
+    if let Some(p) = picture(d, c) {
+        m.insert("picture".into(), json!(p));
     }
     m
+}
+
+/// The file of this person's picture for a contact, where it is here.
+pub fn picture(d: &Daemon, c: &ContactRecord) -> Option<String> {
+    let p = c.picture.as_ref().and_then(|r| cached(d, r))?;
+    Some(p.display().to_string())
 }
 
 /// Adds [`shown`] to an object describing a contact.

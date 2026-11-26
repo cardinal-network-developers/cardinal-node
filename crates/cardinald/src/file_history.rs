@@ -265,7 +265,7 @@ pub async fn undelete(d: &Arc<Daemon>, path: &str, id: Option<&str>) -> anyhow::
             None => named,
             Some(asked) => {
                 let (exact, hex_given) = match crate::api::reference(asked) {
-                    crate::api::Ref::Id(h) => (true, h.to_ascii_lowercase()),
+                    crate::api::Ref::Id(h) => (true, h.hex().to_ascii_lowercase()),
                     crate::api::Ref::Typed(h) => (false, h.to_ascii_lowercase()),
                 };
                 anyhow::ensure!(!hex_given.is_empty(), "name the id to bring back");

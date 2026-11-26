@@ -1,16 +1,25 @@
 //! The local interface's messages (`apps.md#the-local-interface`): each one
 //! record in the base encoding, with numbered fields.
 //!
-//! Inside the service a request and its reply are JSON trees with field
-//! names, as the handlers have always built them; the tables in [`table`]
-//! give every request, argument and reply field its number and type, and
-//! this module turns one form into the other at the edge. A value the
-//! service keeps as hex (a key, an id, a hash) is bytes on the wire.
+//! Two ways lead from a handler to the wire, while the one replaces the
+//! other (`DEVIATIONS.md`, Typed records):
+//!
+//! - **Typed** ([`typed`]): a request's arguments, its reply and each record
+//!   in it are Rust values, declared once in [`table`] with `typed!`, which
+//!   gives both the struct and its table row. Ids, keys and hashes are
+//!   bytes; a value goes to the wire and back with no tree of names and no
+//!   hex. `files`, `messages` and `call` go this way.
+//! - **By name** (the rest, for now): the handler builds a JSON tree with
+//!   field names, and this module turns it into a record at the edge by the
+//!   tables in [`table`], hex becoming bytes. It goes once every request is
+//!   typed.
 //!
 //! The command line and the tests speak the same tables, through
-//! [`encode_request`] and [`decode_reply`].
+//! [`encode_request`] and [`decode_reply`] by name, or the typed values'
+//! own encodings.
 
 pub mod table;
+pub mod typed;
 
 #[cfg(unix)]
 pub mod blocking;
@@ -18,6 +27,10 @@ pub mod blocking;
 use cardinal_encoding::{Record, Value};
 use serde_json::{json, Map, Value as Json};
 
+pub use table::{
+    Attachment, Call, CallArgs, CallEnded, CallFrames, CallReply, File, FilesArgs, FilesReply,
+    GroupReach, Member, Message, MessagesArgs, MessagesReply, Place, Reaction, Voice,
+};
 pub use table::{Field, Page, Rec, Request, Ty, ERROR_FIELDS, EVENTS, FRAMES, PROGRAM, REQUESTS};
 
 use crate::transport::MAX_MESSAGE;
@@ -91,7 +104,7 @@ pub struct Refused {
 }
 
 impl Refused {
-    fn malformed(why: impl Into<String>) -> Refused {
+    pub(crate) fn malformed(why: impl Into<String>) -> Refused {
         Refused {
             status: status::MALFORMED,
             why: why.into(),
@@ -112,14 +125,40 @@ pub enum Ref<'a> {
     /// Text, as a person types it: a name, or the start of an id in hex,
     /// read by whatever rules the request has for it.
     Typed(&'a str),
-    /// The bytes of an id, in hex: that id and nothing else.
-    Id(&'a str),
+    /// The bytes of an id: that id and nothing else.
+    Id(IdGiven<'a>),
 }
 
-/// A `ref` argument as the service holds it, told apart.
+/// The bytes of an id given as a `ref`: as they came, on the typed way, or
+/// held as hex, on the way by name.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum IdGiven<'a> {
+    Bytes(&'a [u8]),
+    Hex(&'a str),
+}
+
+impl IdGiven<'_> {
+    /// The id in hex, as an error shows it.
+    pub fn hex(&self) -> std::borrow::Cow<'_, str> {
+        match self {
+            IdGiven::Bytes(b) => hex::encode(b).into(),
+            IdGiven::Hex(h) => (*h).into(),
+        }
+    }
+
+    /// Its bytes, where they are bytes of hex.
+    pub fn bytes(&self) -> Option<std::borrow::Cow<'_, [u8]>> {
+        match self {
+            IdGiven::Bytes(b) => Some((*b).into()),
+            IdGiven::Hex(h) => hex::decode(h).ok().map(Into::into),
+        }
+    }
+}
+
+/// A `ref` argument as the service holds it on the way by name, told apart.
 pub fn reference(s: &str) -> Ref<'_> {
     match s.strip_prefix(EXACT) {
-        Some(h) => Ref::Id(h),
+        Some(h) => Ref::Id(IdGiven::Hex(h)),
         None => Ref::Typed(s),
     }
 }
@@ -141,12 +180,36 @@ impl Ref<'_> {
     /// eight bytes, as the service gives the ids of people and devices
     /// (`identity`, `key`, `id`). Text is never an id here.
     pub fn is_id(&self, id: &[u8]) -> bool {
-        let Ref::Id(h) = self else {
-            return false;
-        };
-        let full = hex::encode(id);
-        *h == full || (h.len() == 16 && id.len() > 8 && full.starts_with(h))
+        match self {
+            Ref::Typed(_) => false,
+            Ref::Id(IdGiven::Bytes(b)) => {
+                *b == id || (b.len() == 8 && id.len() > 8 && id.starts_with(b))
+            }
+            Ref::Id(IdGiven::Hex(h)) => {
+                let full = hex::encode(id);
+                *h == full || (h.len() == 16 && id.len() > 8 && full.starts_with(h))
+            }
+        }
     }
+}
+
+/// A `ref` as an error shows it: an id given as bytes in hex, text as it
+/// was typed.
+impl std::fmt::Display for Ref<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Ref::Typed(t) => f.write_str(t),
+            Ref::Id(id) => f.write_str(&id.hex()),
+        }
+    }
+}
+
+/// The first eight bytes of an id, as the service gives the ids of people
+/// and devices.
+pub fn short_id(id: &[u8; 32]) -> [u8; 8] {
+    let mut out = [0; 8];
+    out.copy_from_slice(&id[..8]);
+    out
 }
 
 /// The request with this name, if it is answered.
@@ -198,9 +261,9 @@ fn to_wire(ty: &Ty, v: &Json, at: &str) -> Result<Value, String> {
         Ty::Bool => Value::from(v.as_bool().ok_or_else(|| wrong("true or false"))?),
         Ty::Ref => {
             let s = v.as_str().ok_or_else(|| wrong("text"))?;
-            match reference(s) {
-                Ref::Typed(t) => Value::from(t),
-                Ref::Id(h) => Value::from(hex::decode(h).map_err(|_| wrong("hex"))?),
+            match s.strip_prefix(EXACT) {
+                None => Value::from(s),
+                Some(h) => Value::from(hex::decode(h).map_err(|_| wrong("hex"))?),
             }
         }
         Ty::Kind => match v {
@@ -350,6 +413,13 @@ pub fn encode_request(req: &Json) -> anyhow::Result<(&'static Request, Vec<u8>)>
 /// A request off the wire, as the handlers take it: `cmd` and the
 /// arguments by name.
 pub fn decode_request(msg: &[u8]) -> Result<(&'static Request, Json), Refused> {
+    let (spec, r) = decode_record(msg)?;
+    Ok((spec, by_name_from(spec, &r)?))
+}
+
+/// A request off the wire as one record, and the row of the request its
+/// key 0 names: one this service answers.
+pub fn decode_record(msg: &[u8]) -> Result<(&'static Request, Record), Refused> {
     let r = Record::decode(msg).map_err(|e| Refused::malformed(format!("not one record: {e}")))?;
     let n = r
         .get(0)
@@ -365,9 +435,15 @@ pub fn decode_request(msg: &[u8]) -> Result<(&'static Request, Json), Refused> {
             why: format!("this service no longer answers request {n}, {}", spec.name),
         });
     }
-    let mut o = record_from_wire(spec.args, &r, spec.name, 1).map_err(Refused::malformed)?;
+    Ok((spec, r))
+}
+
+/// A request's arguments by name, as the handlers not yet typed take them,
+/// with `cmd`.
+pub fn by_name_from(spec: &'static Request, r: &Record) -> Result<Json, Refused> {
+    let mut o = record_from_wire(spec.args, r, spec.name, 1).map_err(Refused::malformed)?;
     o.insert("cmd".into(), json!(spec.name));
-    Ok((spec, Json::Object(o)))
+    Ok(Json::Object(o))
 }
 
 /// What a handler may add to a paged reply when it gave only some of its
@@ -382,6 +458,20 @@ pub const PAGE_OLDER: &str = "_page_older";
 /// `next`, and each list's key and length.
 const PAGE_ROOM: usize = 64;
 const LIST_ROOM: usize = 12;
+
+/// The room a page of `spec` keeps beside its items: [`PAGE_ROOM`], and
+/// [`LIST_ROOM`] for each list paged.
+pub(crate) fn page_room(spec: &Request) -> usize {
+    let lists = match spec.page {
+        Page::Before { list } => spec.reply.iter().filter(|f| f.name == list).count(),
+        _ => spec
+            .reply
+            .iter()
+            .filter(|f| matches!(f.ty, Ty::List(_) | Ty::Recs(_)))
+            .count(),
+    };
+    PAGE_ROOM + LIST_ROOM * lists
+}
 
 /// A paged answer that could not be given: the status, why, and the
 /// fields of [`ERROR_FIELDS`] that say which item, by name.
@@ -834,3 +924,6 @@ fn render_value(ty: &Ty, v: &Value) -> String {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod same_bytes;

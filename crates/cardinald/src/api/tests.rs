@@ -114,7 +114,7 @@ fn a_reference_may_be_bytes_and_is_then_an_id_alone() {
         .encode();
     let (_, named) = decode_request(&msg).unwrap();
     let id = named["id"].as_str().unwrap();
-    assert_eq!(reference(id), Ref::Id("abcd"));
+    assert_eq!(reference(id), Ref::Id(IdGiven::Hex("abcd")));
     assert_eq!(id_hex(id), "abcd");
     // the same as text is typed
     let typed = Record::new().with(0, 45u64).with(1, "abcd").encode();

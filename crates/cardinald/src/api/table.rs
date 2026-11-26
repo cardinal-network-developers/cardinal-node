@@ -11,12 +11,17 @@
 //! change keeps its number, no longer used, and its name is given again
 //! with a new number and the new type.
 
+use std::borrow::Cow;
+
+use super::typed::{Fields, Reference};
+
 /// What a field holds.
 #[derive(Debug)]
 pub enum Ty {
     /// Text.
     Text,
-    /// Bytes: a key, an id or a hash. The service holds them as hex.
+    /// Bytes: a key, an id or a hash. Typed, they are bytes; by name, the
+    /// service holds them as hex.
     Bytes,
     /// An unsigned integer.
     Uint,
@@ -89,6 +94,154 @@ pub enum Page {
     /// page: `before` is the id (field `id` of its records) of the oldest
     /// item had, and `next` the oldest of this page.
     Before { list: &'static str },
+}
+
+/// A record of the interface, typed (`api::typed`): one declaration gives
+/// the struct, its row in the tables, and its encoding both ways, so what
+/// the tables say and what the service sends cannot differ. Each field is
+/// its number, its name (the Rust name without `r#`), and its Rust type,
+/// which says its type in the tables ([`typed::Wire`](super::typed::Wire)),
+/// in the order of the numbers.
+///
+/// `typed!(STATIC "record name" Name { 1 field: Type, ... })` declares a
+/// record held in replies, with its row as `STATIC`;
+/// `typed!(fields Name { ... })` the arguments or the reply of a request,
+/// which [`asks!`] then numbers.
+#[macro_export]
+#[doc(hidden)]
+macro_rules! typed {
+    (
+        $(#[$m:meta])*
+        $stat:ident $title:literal $name:ident {
+            $( $(#[$fm:meta])* $n:literal $f:ident : $t:ty ),* $(,)?
+        }
+    ) => {
+        $crate::typed!(fields $(#[$m])* $name { $( $(#[$fm])* $n $f : $t ),* });
+
+        #[doc = concat!("The *", $title, "* record's row in the tables.")]
+        pub static $stat: $crate::api::table::Rec = $crate::api::table::Rec {
+            name: $title,
+            fields: <$name as $crate::api::typed::Fields>::FIELDS,
+        };
+
+        impl $crate::api::typed::Wire for $name {
+            const TY: $crate::api::table::Ty = $crate::api::table::Ty::Rec(&$stat);
+            const LIST: $crate::api::table::Ty = $crate::api::table::Ty::Recs(&$stat);
+            fn encode_into(&self, out: &mut Vec<u8>) {
+                use $crate::api::typed::Fields;
+                $crate::api::typed::record_header(self.present_except(&[]), out);
+                self.encode_fields(out);
+            }
+            fn encoded_len(&self) -> usize {
+                $crate::api::typed::Fields::record_len_except(self, &[])
+            }
+            fn take(
+                v: cardinal_encoding::Value,
+                at: &$crate::api::typed::At,
+            ) -> Result<Self, String> {
+                match v {
+                    cardinal_encoding::Value::Record(r) => {
+                        <$name as $crate::api::typed::Fields>::take_fields(r, at)
+                    }
+                    _ => Err(format!("{at} should be a record")),
+                }
+            }
+        }
+    };
+    (
+        fields $(#[$m:meta])* $name:ident {
+            $( $(#[$fm:meta])* $n:literal $f:ident : $t:ty ),* $(,)?
+        }
+    ) => {
+        $(#[$m])*
+        #[derive(Clone, Debug, Default, PartialEq)]
+        pub struct $name {
+            $( $(#[$fm])* pub $f: $t, )*
+        }
+
+        impl $crate::api::typed::Fields for $name {
+            const FIELDS: &'static [$crate::api::table::Field] = &[$(
+                $crate::api::table::Field {
+                    n: $n,
+                    name: $crate::api::typed::field_name(stringify!($f)),
+                    ty: <$t as $crate::api::typed::Wire>::TY,
+                }
+            ),*];
+
+            #[allow(unused_mut)]
+            fn present_except(&self, skip: &[u64]) -> u64 {
+                let mut n = 0;
+                $( if $crate::api::typed::Wire::sent(&self.$f) && !skip.contains(&$n) {
+                    n += 1;
+                } )*
+                let _ = skip;
+                n
+            }
+
+            fn encode_fields(&self, out: &mut Vec<u8>) {
+                $( if $crate::api::typed::Wire::sent(&self.$f) {
+                    $crate::api::typed::key($n, out);
+                    $crate::api::typed::Wire::encode_into(&self.$f, out);
+                } )*
+                let _ = out;
+            }
+
+            #[allow(unused_mut)]
+            fn fields_len_except(&self, skip: &[u64]) -> usize {
+                let mut n = 0;
+                $( if $crate::api::typed::Wire::sent(&self.$f) && !skip.contains(&$n) {
+                    n += $crate::api::typed::key_len($n)
+                        + $crate::api::typed::Wire::encoded_len(&self.$f);
+                } )*
+                let _ = skip;
+                n
+            }
+
+            #[allow(unused_mut, unused_variables)]
+            fn take_fields(
+                mut r: cardinal_encoding::Record,
+                at: &$crate::api::typed::At,
+            ) -> Result<Self, String> {
+                Ok($name { $(
+                    $f: {
+                        let at = $crate::api::typed::At::Field(
+                            at,
+                            $crate::api::typed::field_name(stringify!($f)),
+                        );
+                        match r.remove($n) {
+                            Some(v) => $crate::api::typed::Wire::take(v, &at)?,
+                            None => $crate::api::typed::Wire::absent(&at)?,
+                        }
+                    },
+                )* })
+            }
+        }
+
+        const _: () = $crate::api::typed::ascending(
+            <$name as $crate::api::typed::Fields>::FIELDS,
+        );
+    };
+}
+
+/// A typed request: its row, `ROW`, for [`REQUESTS`], from its typed
+/// arguments and reply, and how it pages.
+macro_rules! asks {
+    ($row:ident: $n:literal $name:literal $args:ident -> $reply:ident, $page:expr) => {
+        #[doc = concat!("The row of `", $name, "`, typed.")]
+        pub const $row: Request = Request {
+            n: $n,
+            name: $name,
+            args: <$args as Fields>::FIELDS,
+            reply: <$reply as Fields>::FIELDS,
+            page: $page,
+            gone: false,
+        };
+
+        impl super::typed::Ask for $args {
+            const REQUEST: &'static Request = &$row;
+            type Reply = $reply;
+        }
+    };
 }
 
 macro_rules! f {
@@ -267,18 +420,55 @@ rec!(APPROVAL "approval":
 rec!(APP_OFFER "app offer":
     1 "application" T, 2 "from" T, 3 "name" T, 4 "sentence" T, 5 "space" B);
 
-rec!(ATTACHMENT "attachment": 1 "name" T, 2 "size" U, 3 "type" T);
+typed!(ATTACHMENT "attachment" Attachment {
+    1 name: String,
+    2 size: Option<u64>,
+    3 r#type: String,
+});
 rec!(BLUETOOTH "bluetooth":
     1 "available" BOOL, 2 "channels_in" U, 3 "error" T, 4 "mode" T, 5 "on" BOOL, 6 "psm" U,
     7 "radio" T, 8 "recognized" U, 9 "seen" U, 10 "why_not" T, 11 "windows" U,
     12 "too_old" BOOL);
-rec!(CALL "call":
-    1 "frames" {CALL_FRAMES}, 2 "group" B, 3 "id" B, 4 "linked" U, 5 "name" T, 6 "offered" [B],
-    7 "people" U, 8 "picture" T, 9 "seconds" U, 10 "state" T, 11 "taken" [B], 12 "who" B,
-    13 "voices" [VOICE], 14 "they_take" [B], 15 "camera" BOOL, 16 "caller" {MEMBER},
-    17 "admins" [MEMBER], 18 "joins" BOOL, 19 "reach" {GROUP_REACH}, 20 "for_call" BOOL);
-rec!(CALL_ENDED "call ended":
-    1 "group" B, 2 "how" T, 3 "id" B, 4 "name" T, 5 "who" B, 6 "at" U);
+typed!(
+    /// The call under way (`apps.md`, *call*).
+    CALL "call" Call {
+        /// In a group: how many frames came, and how many of them new.
+        1 frames: Option<CallFrames>,
+        /// In a group: the group's id.
+        2 group: Option<[u8; 32]>,
+        3 id: [u8; 16],
+        4 linked: Option<u64>,
+        5 name: String,
+        6 offered: Option<Vec<[u8; 32]>>,
+        7 people: Option<u64>,
+        8 picture: Option<String>,
+        9 seconds: Option<u64>,
+        /// `calling`, `ringing` or `live`.
+        10 state: Cow<'static, str>,
+        11 taken: Option<Vec<[u8; 32]>>,
+        /// The start of the other person's id (or the ringer's, in a group).
+        12 who: [u8; 8],
+        13 voices: Option<Vec<Voice>>,
+        14 they_take: Option<Vec<[u8; 32]>>,
+        15 camera: Option<bool>,
+        16 caller: Option<Member>,
+        17 admins: Option<Vec<Member>>,
+        18 joins: Option<bool>,
+        19 reach: Option<GroupReach>,
+        20 for_call: Option<bool>,
+    }
+);
+typed!(
+    /// How the last call ended.
+    CALL_ENDED "call ended" CallEnded {
+        1 group: Option<[u8; 32]>,
+        2 how: Cow<'static, str>,
+        3 id: [u8; 16],
+        4 name: String,
+        5 who: [u8; 8],
+        6 at: u64,
+    }
+);
 rec!(CONDITIONS "conditions": 1 "helps" BOOL, 2 "metered" BOOL, 3 "plugged_in" BOOL);
 rec!(CONFLICT "conflict":
     1 "copies" [T], 2 "delete_conflict" BOOL, 3 "path" T, 4 "versions" [VERSION]);
@@ -303,10 +493,27 @@ rec!(DEVICE "device":
     12 "redial_s" U);
 rec!(ENDPOINT "endpoint": 1 "endpoint" T, 2 "local" BOOL, 3 "tried" BOOL, 4 "why_not" T);
 rec!(FETCH "fetch": 1 "latency_ms" U, 2 "rate" U, 3 "received" U, 4 "replies" U);
-rec!(FILE "file":
-    1 "added_by" T, 2 "category" BOOL, 3 "folder" BOOL, 4 "mine" BOOL, 5 "name" T, 6 "size" U,
-    7 "time" U, 8 "versions" U, 9 "who" B, 10 "group" B);
-rec!(CALL_FRAMES "frames": 1 "in" U, 2 "new" U);
+typed!(
+    /// An entry of a folder of the one folder.
+    FILE "file" File {
+        1 added_by: Option<String>,
+        2 category: Option<bool>,
+        3 folder: bool,
+        4 mine: Option<bool>,
+        5 name: String,
+        6 size: Option<u64>,
+        7 time: Option<u64>,
+        8 versions: Option<u64>,
+        /// A contact's shared folder: the start of their id.
+        9 who: Option<[u8; 8]>,
+        /// A group's shared folder: its id.
+        10 group: Option<[u8; 32]>,
+    }
+);
+typed!(CALL_FRAMES "frames" CallFrames {
+    1 r#in: u64,
+    2 new: u64,
+});
 rec!(GROUP "group":
     1 "admin" BOOL, 2 "did_not_stand" [B], 3 "did_not_stand_changes" [GROUP_CHANGE],
     4 "ended" T, 5 "group" B, 6 "held_back" U, 7 "introductions" BOOL, 8 "last" {LAST},
@@ -316,9 +523,21 @@ rec!(GROUP "group":
 rec!(GROUP_CHANGE "group change":
     1 "at" U, 2 "by" T, 3 "group" B, 4 "roles" [ROLE_CHANGE], 5 "seen" U, 6 "taken_out" [T],
     7 "device" T, 8 "to" B);
-rec!(GROUP_REACH "group reach":
-    1 "added" [T], 2 "ask" BOOL, 3 "public" BOOL, 4 "said_no" BOOL, 5 "set" BOOL,
-    6 "shared" BOOL, 7 "waiting" BOOL, 8 "what" [T], 9 "who" [T], 10 "named" [T]);
+typed!(
+    /// What this person's reach node says in a group, and to whom.
+    GROUP_REACH "group reach" GroupReach {
+        1 added: Vec<String>,
+        2 ask: bool,
+        3 public: bool,
+        4 said_no: bool,
+        5 set: bool,
+        6 shared: bool,
+        7 waiting: bool,
+        8 what: Vec<String>,
+        9 who: Vec<String>,
+        10 named: Option<Vec<String>>,
+    }
+);
 rec!(GROUP_SHOWN "group shown": 1 "group" B, 2 "name" T, 3 "what" [T]);
 rec!(GUARDIAN_CHANGE "guardian change":
     1 "caution" T, 2 "confirm_delay" U, 3 "confirm_delay_text" T, 4 "confirm_from_ms" U,
@@ -354,14 +573,48 @@ rec!(KEPT_CHANGE "kept change":
     7 "name" T, 8 "roles" [ROLE_CHANGE], 9 "taken_out" [T], 10 "to" B, 11 "undo" T,
     12 "undone" B);
 rec!(LOST_DEVICE "lost device": 1 "key" B, 2 "name" T, 3 "set_aside" U);
-rec!(MEMBER "member":
-    1 "contact" BOOL, 2 "id" B, 3 "introduce" BOOL, 4 "left" BOOL, 5 "name" T, 6 "own" BOOL,
-    7 "picture" T, 8 "role" T, 9 "shown" T, 10 "suggested" T, 11 "taken_out" BOOL,
-    12 "you" BOOL, 13 "reach" T, 14 "reaches_you" BOOL, 15 "through" T);
-rec!(MESSAGE "message":
-    1 "attachments" [ATTACHMENT], 2 "edited" BOOL, 3 "from" T, 4 "id" B, 5 "mine" BOOL,
-    6 "picture" T, 7 "reactions" [REACTION], 8 "read_by" U, 9 "reply_to" B, 10 "state" T,
-    11 "text" T, 12 "time" U);
+typed!(
+    /// A member of a group, as this person sees them.
+    MEMBER "member" Member {
+        1 contact: bool,
+        /// The start of their id.
+        2 id: [u8; 8],
+        3 introduce: bool,
+        4 left: bool,
+        5 name: String,
+        6 own: Option<bool>,
+        7 picture: Option<String>,
+        /// `owner`, `admin`, `member`, `reader` or `taken out`.
+        8 role: Cow<'static, str>,
+        9 shown: Option<String>,
+        10 suggested: Option<String>,
+        11 taken_out: Option<bool>,
+        12 you: bool,
+        13 reach: Option<String>,
+        14 reaches_you: Option<bool>,
+        15 through: Option<String>,
+    }
+);
+typed!(
+    /// A message of a conversation, with a contact or in a group.
+    MESSAGE "message" Message {
+        1 attachments: Vec<Attachment>,
+        2 edited: bool,
+        /// In a group: who said it, by the name this person sees.
+        3 from: Option<String>,
+        4 id: [u8; 16],
+        5 mine: bool,
+        6 picture: Option<String>,
+        7 reactions: Vec<Reaction>,
+        /// In a group, of this person's own: how many of the others read it.
+        8 read_by: Option<u64>,
+        9 reply_to: Option<[u8; 16]>,
+        /// Of this person's own: `sent`, `waiting` or `read`.
+        10 state: Option<Cow<'static, str>>,
+        11 text: String,
+        12 time: Option<u64>,
+    }
+);
 rec!(NO_LONGER_NEEDED "no longer needed": 1 "at_ms" U, 2 "id" B, 3 "name" T, 4 "text" T);
 rec!(MET "met": 1 "by" T, 2 "group" T, 3 "how" T, 4 "via" T);
 rec!(KNOWN_PATH "known path":
@@ -380,11 +633,24 @@ rec!(ONLY_HERE "only here": 1 "bytes" U, 2 "files" U);
 rec!(PAIR_AGAIN "pair again": 1 "key" B, 2 "name" T);
 rec!(PAIRING "pairing": 1 "admin" T, 2 "code" T, 3 "error" T, 4 "state" T, 5 "power" T);
 rec!(PEER "peer": 1 "addr" T, 2 "device" T);
-rec!(PLACE "place": 1 "kind" T, 2 "name" T, 3 "who" B, 4 "group" B);
+typed!(
+    /// What a folder of the one folder is.
+    PLACE "place" Place {
+        /// `mine`, `category` or `shared`.
+        1 kind: Cow<'static, str>,
+        2 name: Option<String>,
+        3 who: Option<[u8; 8]>,
+        4 group: Option<[u8; 32]>,
+    }
+);
 rec!(PROGRESS "progress":
     1 "bytes_fetched" U, 2 "bytes_pending" U, 3 "bytes_wanted" U, 4 "files_pending" U,
     5 "last_error" T, 6 "rate" U);
-rec!(REACTION "reaction": 1 "count" U, 2 "mine" BOOL, 3 "text" T);
+typed!(REACTION "reaction" Reaction {
+    1 count: u64,
+    2 mine: bool,
+    3 text: String,
+});
 rec!(RECOVERY "recovery":
     1 "caution" T, 2 "confirm_from_ms" U, 3 "confirmed" U, 4 "confirmed_by_me" BOOL,
     5 "endorsed" U, 6 "endorsed_by_me" BOOL, 7 "fingerprint" T, 8 "id" B, 9 "in_effect" BOOL,
@@ -483,9 +749,19 @@ rec!(SPACE_MEMBER "space member":
 rec!(STARTED_BY "started by": 1 "author" B, 2 "entry" B, 3 "time" U);
 rec!(STATS "stats": 1 "appended" U, 2 "recomputed" U);
 rec!(STORE "store": 1 "bytes" U, 2 "objects" U);
-rec!(VOICE "voice":
-    1 "contact" BOOL, 2 "identity" B, 3 "name" T, 4 "picture" T, 5 "voice" B, 6 "you" BOOL,
-    7 "camera" BOOL);
+typed!(
+    /// Who a voice heard on a group call is.
+    VOICE "voice" Voice {
+        1 contact: bool,
+        /// The start of the person's id.
+        2 identity: [u8; 8],
+        3 name: String,
+        4 picture: Option<String>,
+        5 voice: [u8; 8],
+        6 you: bool,
+        7 camera: bool,
+    }
+);
 rec!(WEIGH "weight":
     1 "aead" U, 2 "ciphertext" U, 3 "fields" U, 4 "header" U, 5 "ops" [WEIGHED_OP],
     6 "sealed" U, 7 "signature" U, 8 "wraps" U);
@@ -499,6 +775,44 @@ macro_rules! guarding_reply {
             6 "now_ms" U, 7 "no_longer_needed" [NO_LONGER_NEEDED]))
     };
 }
+
+// ---- Typed requests (`api::typed`) ----
+
+typed!(fields MessagesArgs {
+    1 who: Option<Reference>,
+    2 group: Option<Reference>,
+    3 before: Option<Reference>,
+    4 limit: Option<u64>,
+});
+typed!(fields MessagesReply {
+    2 group: Option<[u8; 32]>,
+    3 messages: Vec<Message>,
+    4 name: Option<String>,
+    5 more: bool,
+    6 next: Option<[u8; 16]>,
+});
+asks!(MESSAGES: 34 "messages" MessagesArgs -> MessagesReply, Page::Before { list: "messages" });
+
+typed!(fields CallArgs {});
+typed!(fields CallReply {
+    2 call: Option<Call>,
+    3 ended: Option<CallEnded>,
+});
+asks!(CALL_NOW: 100 "call" CallArgs -> CallReply, Page::Whole);
+
+typed!(fields FilesArgs {
+    1 path: Option<String>,
+    2 after: Option<u64>,
+    3 limit: Option<u64>,
+});
+typed!(fields FilesReply {
+    2 files: Vec<File>,
+    3 path: String,
+    4 place: Place,
+    5 more: bool,
+    6 next: Option<u64>,
+});
+asks!(FILES: 120 "files" FilesArgs -> FilesReply, Page::After);
 
 /// Every request, by number. Numbers are grouped by what they are about,
 /// with room in each group.
@@ -556,9 +870,7 @@ pub static REQUESTS: &[Request] = &[
         23 "trusted" BOOL, 24 "your_reach" [THEIR_REACH], 25 "more" BOOL, 26 "next" U)),
     paged!(after 33 "conversations" (1 "after" U, 2 "limit" U) -> (
         2 "conversations" [CONVERSATION], 3 "more" BOOL, 4 "next" U)),
-    paged!(before "messages" 34 "messages" (
-        1 "who" REF, 2 "group" REF, 3 "before" REF, 4 "limit" U
-    ) -> (2 "group" B, 3 "messages" [MESSAGE], 4 "name" T, 5 "more" BOOL, 6 "next" B)),
+    MESSAGES,
     req!(35 "say" (1 "who" REF, 2 "text" T, 3 "reply_to" REF, 4 "attach" [T], 5 "group" REF) -> (
         2 "reachable" BOOL)),
     req!(36 "save-attachment" (
@@ -615,7 +927,7 @@ pub static REQUESTS: &[Request] = &[
         6 "relayed_for" [RELAYED_FOR])),
     req!(87 "group-rejoin" (1 "group" REF) -> (2 "group" B, 3 "name" T)),
     // ---- Calls and the clipboard: 100 to 119 ----
-    req!(100 "call" () -> (2 "call" {CALL}, 3 "ended" {CALL_ENDED})),
+    CALL_NOW,
     req!(101 "call-start" (
         1 "who" REF, 2 "group" REF, 3 "formats" [B], 4 "format_names" [T], 5 "ring" [REF]
     ) -> ()),
@@ -625,8 +937,7 @@ pub static REQUESTS: &[Request] = &[
     req!(105 "clip-copy" (1 "text" T) -> (2 "devices" U)),
     req!(106 "clip" () -> (2 "from" T, 3 "here" BOOL, 4 "seconds" U, 5 "text" T)),
     // ---- The one folder: 120 to 149 ----
-    paged!(after 120 "files" (1 "path" T, 2 "after" U, 3 "limit" U) -> (
-        2 "files" [FILE], 3 "path" T, 4 "place" {PLACE}, 5 "more" BOOL, 6 "next" U)),
+    FILES,
     req!(121 "mkdir" (1 "path" T) -> (2 "path" T)),
     req!(122 "move" (1 "from" T, 2 "to" T) -> (2 "path" T)),
     req!(123 "remove" (1 "path" T) -> (2 "path" T)),

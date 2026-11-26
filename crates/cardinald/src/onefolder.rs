@@ -18,6 +18,8 @@ use cardinal_space::files::{self, Content, FileKind, Files, Kinds};
 use cardinal_space::{group, relationship, NodeId, Space, SpaceId, SpaceOp, ROOT};
 use serde_json::{json, Value as Json};
 
+use crate::api::short_id;
+use crate::api::table::{self as api, File, FilesReply};
 use crate::core::now_ms;
 use crate::daemon::Daemon;
 use crate::fetch::{blob_ref, Fetcher, Others};
@@ -73,7 +75,13 @@ impl Shown {
 
     /// The contact's id, as the local interface names people.
     pub fn who(&self) -> Option<String> {
-        self.contact().map(|c| hex::encode(&c.identity[..8]))
+        self.who_id().map(hex::encode)
+    }
+
+    /// The contact's id as the local interface names people: its first
+    /// eight bytes.
+    pub fn who_id(&self) -> Option<[u8; 8]> {
+        self.contact().map(|c| short_id(&c.identity))
     }
 
     /// What the folder is named after: the contact's petname, or the
@@ -418,8 +426,134 @@ pub fn resolve(d: &Daemon, path: &str) -> anyhow::Result<Place> {
 }
 
 /// A folder of the one folder: the person's files, a category, or a shared
-/// folder, folders first.
-pub fn list(d: &Daemon, path: &str) -> anyhow::Result<Json> {
+/// folder, folders first. All of it: the request's page is cut from it.
+pub fn list(d: &Daemon, path: &str) -> anyhow::Result<FilesReply> {
+    let place = resolve(d, path)?;
+    let shown = relationships(d);
+    // each with whether it is a file, folders first
+    let mut found: Vec<(bool, File)> = Vec::new();
+    match &place {
+        Place::Category(c) => {
+            for s in shown.iter().filter(|s| &s.category == c) {
+                let group = s.group();
+                found.push((
+                    false,
+                    File {
+                        name: s.name.clone(),
+                        folder: true,
+                        group,
+                        who: group.is_none().then(|| s.who_id()).flatten(),
+                        ..File::default()
+                    },
+                ));
+            }
+        }
+        Place::In(at) => {
+            anyhow::ensure!(at.is_folder(), "{path} is not a folder");
+            let cats = categories(&shown);
+            let core = d.core();
+            let me = core.identity.as_ref().map(|i| i.id());
+            let files = Files::new(open(&core, &at.space)?);
+            // Who added a file, where it was someone else: by what this
+            // person calls them.
+            let contacts = core.contacts();
+            let called = |who: &[u8; 32]| {
+                contacts
+                    .iter()
+                    .find(|c| &c.identity == who)
+                    .map(|c| c.petname.clone())
+                    .unwrap_or_else(|| cardinal_space::account::short_key(who))
+            };
+            let at_root = at.shared.is_none() && at.node == ROOT;
+            if at_root {
+                for c in &cats {
+                    found.push((
+                        false,
+                        File {
+                            name: c.clone(),
+                            folder: true,
+                            category: Some(true),
+                            ..File::default()
+                        },
+                    ));
+                }
+            }
+            let entries = if at_root {
+                root_entries(&files, &cats)
+            } else {
+                files
+                    .list(&at.node)
+                    .into_iter()
+                    .map(|e| (e.name.clone(), e))
+                    .collect()
+            };
+            for (name, e) in entries {
+                let is_folder = e.kind == FileKind::Folder;
+                let versions = files.content(&e.node);
+                let shown = match e.conflict_version {
+                    Some(v) => versions.iter().find(|x| x.entry == v),
+                    None => versions.last(),
+                };
+                let first = versions.first().filter(|v| Some(v.author) != me);
+                found.push((
+                    !is_folder,
+                    File {
+                        name,
+                        folder: is_folder,
+                        size: shown.and_then(|v| v.content.as_ref()).map(|c| c.size()),
+                        time: shown.and_then(|v| v.time),
+                        versions: Some(versions.len() as u64),
+                        mine: at
+                            .shared
+                            .is_some()
+                            .then(|| shown.is_some_and(|v| Some(v.author) == me)),
+                        added_by: first.map(|v| called(&v.author)),
+                        ..File::default()
+                    },
+                ));
+            }
+        }
+    }
+    found.sort_by_cached_key(|(is_file, e)| (*is_file, e.name.to_lowercase()));
+    let files: Vec<File> = found.into_iter().map(|(_, e)| e).collect();
+    // What the folder is, so a window need not work it out.
+    let place = match &place {
+        Place::Category(c) => api::Place {
+            kind: "category".into(),
+            name: Some(c.clone()),
+            ..api::Place::default()
+        },
+        Place::In(At {
+            shared: Some(s), ..
+        }) => {
+            let group = s.group();
+            api::Place {
+                kind: "shared".into(),
+                name: Some(s.called().to_owned()),
+                group,
+                who: group.is_none().then(|| s.who_id()).flatten(),
+            }
+        }
+        Place::In(_) => api::Place {
+            kind: "mine".into(),
+            ..api::Place::default()
+        },
+    };
+    Ok(FilesReply {
+        files,
+        path: path.to_owned(),
+        place,
+        more: false,
+        next: None,
+    })
+}
+
+/// [`list`] as it was before it was typed, by name: kept only to show that
+/// the typed one sends the same bytes (`api::typed_tests`) and to measure
+/// the two (`benches/interface.rs`). It goes with the way by name.
+#[cfg(any(test, feature = "by-name"))]
+#[doc(hidden)]
+pub fn list_by_name(d: &Daemon, path: &str) -> anyhow::Result<Json> {
     let place = resolve(d, path)?;
     let shown = relationships(d);
     let mut found: Vec<(bool, Json)> = Vec::new();

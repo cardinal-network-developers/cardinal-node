@@ -64,6 +64,9 @@ windows-sys = { version = "0.61", features = [
 default = ["mount"]
 # Show the files space as a folder, through FUSE.
 mount = ["dep:fuser"]
+# The handlers typed since, as they were by name: only to measure the two
+# ways side by side (`benches/interface.rs`). The tests have them anyway.
+by-name = []
 
 [dev-dependencies]
 tempfile.workspace = true
@@ -73,3 +76,4 @@ tempfile.workspace = true
 [[bench]]
 name = "interface"
 harness = false
+required-features = ["by-name"]

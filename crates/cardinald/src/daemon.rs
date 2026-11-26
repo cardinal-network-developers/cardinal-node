@@ -301,7 +301,7 @@ pub struct Daemon {
     /// The call under way.
     pub call: Mutex<Option<crate::calls::Call>>,
     /// How the last call here ended, for whoever looks after it has gone.
-    pub call_ended: Mutex<Option<serde_json::Value>>,
+    pub call_ended: Mutex<Option<crate::api::CallEnded>>,
     /// The last thing copied on any of this person's devices (`clipboard.rs`).
     pub clip: Mutex<Option<crate::clipboard::Clip>>,
     /// The port the router gave, if it gave one (`portmap.rs`).

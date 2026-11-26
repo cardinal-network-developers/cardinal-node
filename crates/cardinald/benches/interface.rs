@@ -9,16 +9,23 @@
 //! service's own tasks do not count); and the time of one request over the
 //! real socket, with and without the client reading the reply.
 //!
+//! Both ways are measured side by side, on the same data and in the same
+//! run: by name (the handler's JSON tree, turned into a record at the edge
+//! by the tables) and typed (`api::typed`); the two replies are checked to
+//! be the same bytes. The socket is served typed, as the service is now.
+//!
 //! Not part of any test tier. Run it with
-//! `cargo bench -p cardinald --bench interface`; `BENCH_ROUNDS` sets how
-//! many times each step runs (the median is shown).
+//! `cargo bench -p cardinald --bench interface --features by-name`;
+//! `BENCH_ROUNDS` sets how many times each step runs (the median is shown).
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use cardinald::api;
+use cardinald::api::typed::Ask;
+use cardinald::api::{self, CallArgs, FilesArgs, MessagesArgs};
+use cardinald::control::typed as t;
 use cardinald::transport::{self, Received};
 use cardinald::{Config, Daemon, Paths};
 use serde_json::json;
@@ -151,7 +158,10 @@ async fn fill(d: &Arc<Daemon>, dir: &std::path::Path) -> String {
             .await
             .unwrap();
     }
-    eprintln!("{FILES} files written in {:.1} s", t.elapsed().as_secs_f64());
+    eprintln!(
+        "{FILES} files written in {:.1} s",
+        t.elapsed().as_secs_f64()
+    );
     let t = Instant::now();
     let g = cardinald::groups::create(d, "Bench", &[], false, true).unwrap();
     let group = g["group"].as_str().unwrap().to_owned();
@@ -205,6 +215,102 @@ fn over_socket(
     (raw[raw.len() / 2], read_too[read_too.len() / 2], len)
 }
 
+/// One request's steps on one way: from its bytes to its arguments, the
+/// handler, the reply's bytes, and the client's reading.
+struct Steps {
+    decode: Cost,
+    handler: Cost,
+    encode: Cost,
+    read: Cost,
+    reply: Vec<u8>,
+}
+
+fn less(a: Cost, b: Cost) -> Cost {
+    Cost {
+        time: a.time.saturating_sub(b.time),
+        allocs: a.allocs.saturating_sub(b.allocs),
+        bytes: a.bytes.saturating_sub(b.bytes),
+    }
+}
+
+/// The way by name: a JSON tree from the handler, cut and turned into a
+/// record at the edge by the tables.
+fn by_name(
+    rt: &tokio::runtime::Runtime,
+    msg: &[u8],
+    answer: impl Fn(&serde_json::Value) -> serde_json::Value,
+) -> Steps {
+    let decode = measure(|| api::decode_request(msg).unwrap());
+    let (spec, args) = api::decode_request(msg).unwrap();
+    let handler = rt.block_on(async { measure(|| answer(&args)) });
+    let value = rt.block_on(async { answer(&args) });
+    let encode = measure(|| {
+        let v = api::page(spec, &args, value.clone()).unwrap();
+        api::encode_reply(spec, Ok(&v))
+    });
+    let encode = less(encode, measure(|| value.clone()));
+    let reply = api::encode_reply(spec, Ok(&api::page(spec, &args, value.clone()).unwrap()));
+    let read = measure(|| api::decode_reply(spec, &reply).unwrap());
+    Steps {
+        decode,
+        handler,
+        encode,
+        read,
+        reply,
+    }
+}
+
+/// The typed way: typed values from the handler, written straight to the
+/// encoding.
+fn typed<A: Ask + Clone>(
+    rt: &tokio::runtime::Runtime,
+    d: &Arc<Daemon>,
+    msg: &[u8],
+    answer: fn(&Arc<Daemon>, &A) -> anyhow::Result<A::Reply>,
+    reply_of: fn(&A, A::Reply) -> Vec<u8>,
+) -> Steps
+where
+    A::Reply: Clone,
+{
+    let args = || {
+        let (_, r) = api::decode_record(msg).unwrap();
+        A::from_request(r).unwrap()
+    };
+    let decode = measure(args);
+    let a = args();
+    let handler = rt.block_on(async { measure(|| answer(d, &a).unwrap()) });
+    let value = rt.block_on(async { answer(d, &a).unwrap() });
+    let encode = less(
+        measure(|| reply_of(&a, value.clone())),
+        measure(|| value.clone()),
+    );
+    let reply = reply_of(&a, value.clone());
+    let read = measure(|| api::typed::read_reply::<A>(&reply).unwrap().unwrap());
+    Steps {
+        decode,
+        handler,
+        encode,
+        read,
+        reply,
+    }
+}
+
+fn show_steps(way: &str, s: &Steps) {
+    println!(" {way}:");
+    show("request bytes -> arguments", s.decode);
+    show("handler -> answer", s.handler);
+    show("answer -> reply bytes (page, encode)", s.encode);
+    show(
+        "in the service, all",
+        Cost {
+            time: s.decode.time + s.handler.time + s.encode.time,
+            allocs: s.decode.allocs + s.handler.allocs + s.encode.allocs,
+            bytes: s.decode.bytes + s.handler.bytes + s.encode.bytes,
+        },
+    );
+    show("client: reply bytes -> what it reads", s.read);
+}
+
 fn main() {
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -213,7 +319,10 @@ fn main() {
     let dir = tempfile::tempdir().unwrap();
     let d = rt.block_on(device(dir.path()));
     let group = rt.block_on(fill(&d, dir.path()));
-    let _serving = rt.block_on(async { cardinald::control::serve(d.clone()).unwrap() });
+    let _serving = {
+        let _in = rt.enter();
+        cardinald::control::serve(d.clone()).unwrap()
+    };
     let socket = d.paths.socket.clone();
     println!("rounds: {} (median shown)", rounds());
 
@@ -228,49 +337,40 @@ fn main() {
     for (name, req) in asks {
         let (spec, msg) = api::encode_request(&req).unwrap();
         println!("{name}: request {} bytes", msg.len());
-        // the request's bytes to what the handler takes
-        let decode = measure(|| api::decode_request(&msg).unwrap());
-        let (_, args) = api::decode_request(&msg).unwrap();
-        // the handler: what the person holds, to its answer
-        let answer = || match name {
-            "files" => cardinald::onefolder::list(&d, "Big").unwrap(),
-            "messages" => cardinald::groups::messages(&d, &group, None).unwrap(),
-            _ => cardinald::calls::current(&d),
-        };
-        let handler = rt.block_on(async { measure(answer) });
-        let value = rt.block_on(async { answer() });
-        // the answer to the reply's bytes: a page of it, encoded
-        let encode = measure(|| {
-            let v = api::page(spec, &args, value.clone()).unwrap();
-            api::encode_reply(spec, Ok(&v))
+        let old = by_name(&rt, &msg, |args| match name {
+            "files" => {
+                cardinald::onefolder::list_by_name(&d, args["path"].as_str().unwrap()).unwrap()
+            }
+            "messages" => {
+                cardinald::groups::messages_by_name(&d, args["group"].as_str().unwrap(), None)
+                    .unwrap()
+            }
+            _ => cardinald::calls::current_by_name(&d),
         });
-        let clone = measure(|| value.clone());
-        let encode = Cost {
-            time: encode.time.saturating_sub(clone.time),
-            allocs: encode.allocs - clone.allocs,
-            bytes: encode.bytes - clone.bytes,
+        let new = match name {
+            "files" => typed::<FilesArgs>(&rt, &d, &msg, t::files, t::files_reply),
+            "messages" => typed::<MessagesArgs>(&rt, &d, &msg, t::messages, t::messages_reply),
+            _ => typed::<CallArgs>(&rt, &d, &msg, t::call, t::call_reply),
         };
-        let reply = api::encode_reply(spec, Ok(&api::page(spec, &args, value.clone()).unwrap()));
-        // the client: the reply's bytes to what it reads
-        let read = measure(|| api::decode_reply(spec, &reply).unwrap());
-        show("request bytes -> arguments", decode);
-        show("handler -> answer", handler);
-        show("answer -> reply bytes (page, encode)", encode);
-        show(
-            "in the service, all",
-            Cost {
-                time: decode.time + handler.time + encode.time,
-                allocs: decode.allocs + handler.allocs + encode.allocs,
-                bytes: decode.bytes + handler.bytes + encode.bytes,
-            },
+        assert_eq!(old.reply, new.reply, "{name}: the two ways differ");
+        show_steps("by name", &old);
+        show_steps("typed", &new);
+        let (raw, with_read, len) = over_socket(&rt, &socket, &msg, |r| match name {
+            "files" => drop(api::typed::read_reply::<FilesArgs>(r).unwrap().unwrap()),
+            "messages" => drop(api::typed::read_reply::<MessagesArgs>(r).unwrap().unwrap()),
+            _ => drop(api::typed::read_reply::<CallArgs>(r).unwrap().unwrap()),
+        });
+        println!(
+            "  over the socket (typed): {:.1} µs, {:.1} µs with the client reading typed; \
+             reply {len} bytes",
+            raw.as_secs_f64() * 1e6,
+            with_read.as_secs_f64() * 1e6
         );
-        show("client: reply bytes -> what it reads", read);
-        let (raw, with_read, len) = over_socket(&rt, &socket, &msg, |r| {
+        let (_, with_read, _) = over_socket(&rt, &socket, &msg, |r| {
             api::decode_reply(spec, r).unwrap();
         });
         println!(
-            "  over the socket: {:.1} µs, {:.1} µs with the client reading; reply {len} bytes",
-            raw.as_secs_f64() * 1e6,
+            "  over the socket, the client reading by name: {:.1} µs",
             with_read.as_secs_f64() * 1e6
         );
     }

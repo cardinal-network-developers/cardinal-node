@@ -159,8 +159,21 @@ async fn connection(d: Arc<Daemon>, mut r: Reader, mut w: Writer) {
                 continue;
             }
         };
-        let (spec, req) = match api::decode_request(&msg) {
-            Ok(x) => x,
+        let decoded = api::decode_record(&msg).and_then(|(spec, r)| {
+            // a typed request is answered on its own way, with no names
+            if let Some(reply) = typed::answers(spec) {
+                return Ok(Err((spec, reply(&d, r))));
+            }
+            Ok(Ok((spec, api::by_name_from(spec, &r)?)))
+        });
+        let (spec, req) = match decoded {
+            Ok(Ok(x)) => x,
+            Ok(Err((spec, reply))) => {
+                if w.send(&checked(spec, reply)).await.is_err() {
+                    return;
+                }
+                continue;
+            }
             Err(refused) => {
                 if w.send(&api::error_reply(refused.status, &refused.why))
                     .await
@@ -190,43 +203,172 @@ async fn connection(d: Arc<Daemon>, mut r: Reader, mut w: Writer) {
             }
             _ => {}
         }
-        let reply = match handle(&d, &req).await.map_err(|e| capitalized(&req, e)) {
+        let reply = match handle(&d, &req)
+            .await
+            .map_err(|e| capitalized(spec.name, e))
+        {
             Ok(v) => match api::page(spec, &req, v) {
                 Ok(v) => api::encode_reply(spec, Ok(&v)),
                 Err((st, why, item)) => api::error_reply_with(st, &why, &item),
             },
-            Err(e) => {
-                let st = if e.is::<crate::recovery::NeedsWords>() {
-                    status::NEEDS_WORDS
-                } else if e.is::<crate::contacts::NeedsFor>() {
-                    status::NEEDS_FOR
-                } else {
-                    status::FAILED
-                };
-                api::encode_reply(spec, Err((st, &format!("{e:#}"))))
-            }
+            Err(e) => failed(&e),
         };
-        let reply = if reply.len() > MAX_MESSAGE {
-            let why = format!(
-                "the answer to {} would be {} bytes, and a message is at most {MAX_MESSAGE}",
-                spec.name,
-                reply.len()
-            );
-            api::error_reply(status::TOO_LARGE, &why)
-        } else {
-            reply
-        };
-        if w.send(&reply).await.is_err() {
+        if w.send(&checked(spec, reply)).await.is_err() {
             return;
         }
+    }
+}
+
+/// A reply that failed, as a message.
+fn failed(e: &anyhow::Error) -> Vec<u8> {
+    let st = if e.is::<crate::recovery::NeedsWords>() {
+        status::NEEDS_WORDS
+    } else if e.is::<crate::contacts::NeedsFor>() {
+        status::NEEDS_FOR
+    } else {
+        status::FAILED
+    };
+    api::error_reply(st, &format!("{e:#}"))
+}
+
+/// A reply, or error 4 where it would be larger than a message may be.
+fn checked(spec: &api::Request, reply: Vec<u8>) -> Vec<u8> {
+    if reply.len() <= MAX_MESSAGE {
+        return reply;
+    }
+    let why = format!(
+        "the answer to {} would be {} bytes, and a message is at most {MAX_MESSAGE}",
+        spec.name,
+        reply.len()
+    );
+    api::error_reply(status::TOO_LARGE, &why)
+}
+
+/// The requests answered typed (`api::typed`): each from its arguments as
+/// they came to the reply's bytes, with no tree of names between. Each in
+/// two steps, which `benches/interface.rs` measures apart: the handler's
+/// answer, all of it, and then the reply's bytes, a page of it.
+pub mod typed {
+    use std::sync::Arc;
+
+    use cardinal_encoding::Record;
+
+    use crate::api::typed::{page_after, page_before, reply_message, Ask, Fields, Unpaged};
+    use crate::api::{self, CallArgs, FilesArgs, FilesReply, MessagesArgs, MessagesReply, Request};
+    use crate::daemon::Daemon;
+
+    type Answer = fn(&Arc<Daemon>, Record) -> Vec<u8>;
+
+    /// How a typed request is answered, if it is one.
+    pub(super) fn answers(spec: &Request) -> Option<Answer> {
+        Some(match spec.n {
+            n if n == FilesArgs::REQUEST.n => |d, r| answer::<FilesArgs>(d, r, files, files_reply),
+            n if n == MessagesArgs::REQUEST.n => {
+                |d, r| answer::<MessagesArgs>(d, r, messages, messages_reply)
+            }
+            n if n == CallArgs::REQUEST.n => |d, r| answer::<CallArgs>(d, r, call, call_reply),
+            _ => return None,
+        })
+    }
+
+    /// The reply to `A`'s request `r`: its arguments as they came, the
+    /// handler's answer, and the reply's bytes; or the message refusing it.
+    fn answer<A: Ask>(
+        d: &Arc<Daemon>,
+        r: Record,
+        handler: fn(&Arc<Daemon>, &A) -> anyhow::Result<A::Reply>,
+        reply: fn(&A, A::Reply) -> Vec<u8>,
+    ) -> Vec<u8> {
+        let a = match A::from_request(r) {
+            Ok(a) => a,
+            Err(refused) => return api::error_reply(refused.status, &refused.why),
+        };
+        match handler(d, &a) {
+            Ok(r) => reply(&a, r),
+            Err(e) => super::failed(&super::capitalized(A::REQUEST.name, e)),
+        }
+    }
+
+    /// `files`: the folder, all of it.
+    pub fn files(d: &Arc<Daemon>, a: &FilesArgs) -> anyhow::Result<FilesReply> {
+        crate::onefolder::list(d, a.path.as_deref().unwrap_or(""))
+    }
+
+    /// `files`: the page asked for, as a message.
+    pub fn files_reply(a: &FilesArgs, mut reply: FilesReply) -> Vec<u8> {
+        // beside the reply's other fields: without the list, `more`, `next`
+        let base = reply.record_len_except(&[2, 5, 6]);
+        let spec = FilesArgs::REQUEST;
+        match page_after(
+            spec,
+            "files",
+            &mut reply.files,
+            base,
+            a.after,
+            a.limit,
+            |_| None,
+        ) {
+            Ok(cut) => {
+                reply.more = cut.more;
+                reply.next = cut.next;
+                reply_message(&reply)
+            }
+            Err(Unpaged(msg)) => msg,
+        }
+    }
+
+    /// `messages`: the conversation, all of it before `before`.
+    pub fn messages(d: &Arc<Daemon>, a: &MessagesArgs) -> anyhow::Result<MessagesReply> {
+        let before = a.before.as_ref().map(|b| b.as_ref());
+        match (&a.group, &a.who) {
+            (Some(group), _) => crate::groups::messages(d, group.as_ref(), before),
+            (None, Some(who)) => crate::contacts::messages(d, who.as_ref(), before),
+            (None, None) => anyhow::bail!("missing argument who"),
+        }
+    }
+
+    /// `messages`: the page asked for, the newest first, as a message.
+    pub fn messages_reply(a: &MessagesArgs, mut reply: MessagesReply) -> Vec<u8> {
+        let base = reply.record_len_except(&[3, 5, 6]);
+        let spec = MessagesArgs::REQUEST;
+        let page = page_before(spec, "messages", &mut reply.messages, base, a.limit, |m| {
+            Some(&m.id[..])
+        });
+        match page {
+            Ok(more) => {
+                reply.more = more;
+                reply.next = more.then(|| reply.messages.first().map(|m| m.id)).flatten();
+                reply_message(&reply)
+            }
+            Err(Unpaged(msg)) => msg,
+        }
+    }
+
+    /// `call`: what is known of the call under way.
+    pub fn call(d: &Arc<Daemon>, _: &CallArgs) -> anyhow::Result<api::CallReply> {
+        Ok(crate::calls::current(d))
+    }
+
+    /// `call` as a message.
+    pub fn call_reply(_: &CallArgs, reply: api::CallReply) -> Vec<u8> {
+        reply_message(&reply)
+    }
+
+    /// The reply to a typed request's message, or `None` for a request not
+    /// typed: as the service answers it.
+    pub fn reply_to(d: &Arc<Daemon>, msg: &[u8]) -> Option<Vec<u8>> {
+        let (spec, r) = match api::decode_record(msg) {
+            Ok(x) => x,
+            Err(refused) => return Some(api::error_reply(refused.status, &refused.why)),
+        };
+        answers(spec).map(|answer| super::checked(spec, answer(d, r)))
     }
 }
 
 /// An error of the guardians' and recovery requests, starting with a
 /// capital letter, as a window shows it word for word. Others are as
 /// they were.
-fn capitalized(req: &Value, e: anyhow::Error) -> anyhow::Error {
-    let cmd = req["cmd"].as_str().unwrap_or("");
+fn capitalized(cmd: &str, e: anyhow::Error) -> anyhow::Error {
     let ours = cmd.starts_with("guardians")
         || cmd.starts_with("guarding")
         || cmd.starts_with("recover-")
@@ -566,11 +708,6 @@ async fn handle(d: &Arc<Daemon>, req: &Value) -> anyhow::Result<Value> {
             let attach = strings(req, "attach");
             crate::groups::say(d, arg(req, "group")?, arg(req, "text")?, reply_to, &attach).await
         }
-        "messages" if req.get("group").is_some() => crate::groups::messages(
-            d,
-            arg(req, "group")?,
-            req.get("before").and_then(Value::as_str),
-        ),
         "mark-read" if req.get("group").is_some() => {
             crate::groups::mark_read(d, arg(req, "group")?)
         }
@@ -678,7 +815,6 @@ async fn handle(d: &Arc<Daemon>, req: &Value) -> anyhow::Result<Value> {
         }
         "delete-message" => crate::contacts::delete_message(d, arg(req, "who")?, arg(req, "id")?),
         "react" => crate::contacts::react(d, arg(req, "who")?, arg(req, "id")?, arg(req, "text")?),
-        "call" => Ok(crate::calls::current(d)),
         "conditions" => conditions(d, req),
         "call-start" if req.get("ring").is_some_and(|r| !r.is_null()) => {
             anyhow::ensure!(
@@ -715,7 +851,6 @@ async fn handle(d: &Arc<Daemon>, req: &Value) -> anyhow::Result<Value> {
             let on = req.get("on").and_then(|v| v.as_bool());
             crate::settings::read_markers(d, on)
         }
-        "files" => crate::onefolder::list(d, req.get("path").and_then(Value::as_str).unwrap_or("")),
         "mkdir" => crate::onefolder::mkdir(d, arg(req, "path")?),
         "move" => crate::onefolder::move_to(d, arg(req, "from")?, arg(req, "to")?).await,
         "remove" => crate::onefolder::remove(d, arg(req, "path")?),
@@ -741,11 +876,6 @@ async fn handle(d: &Arc<Daemon>, req: &Value) -> anyhow::Result<Value> {
             let group = req.get("group").and_then(|v| v.as_str());
             crate::onefolder::share(d, who, group, &paths, text).await
         }
-        "messages" => crate::contacts::messages(
-            d,
-            arg(req, "who")?,
-            req.get("before").and_then(Value::as_str),
-        ),
         "recovery-check" => {
             crate::recovery::root_from_words(d, arg(req, "words")?)?;
             Ok(json!({}))

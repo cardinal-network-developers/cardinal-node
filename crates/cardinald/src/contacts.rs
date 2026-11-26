@@ -24,6 +24,8 @@ use cardinal_sync::identity_log_label;
 use serde_json::{json, Value as Json};
 use tokio::io::AsyncWriteExt;
 
+use crate::api::table::{Attachment, Message, MessagesReply, Reaction};
+use crate::api::Ref;
 use crate::core::{now_ms, short, Core};
 use crate::daemon::{Daemon, PeerKind};
 use crate::net::Access;
@@ -1143,19 +1145,24 @@ fn met_json(m: &account::Met, contacts: &[ContactRecord], groups: &[(SpaceId, St
 /// id `contacts` gives them; as bytes, by that id or their identity whole,
 /// and never by a name.
 pub(crate) fn find(d: &Daemon, who: &str) -> anyhow::Result<ContactRecord> {
-    let asked = crate::api::reference(who);
-    let w = who.to_lowercase();
+    find_ref(d, crate::api::reference(who))
+}
+
+/// [`find`], by a `ref` as it came.
+pub(crate) fn find_ref(d: &Daemon, asked: Ref<'_>) -> anyhow::Result<ContactRecord> {
+    let w = match asked {
+        Ref::Typed(t) => t.to_lowercase(),
+        Ref::Id(_) => String::new(),
+    };
     let mut contacts = d.core().contacts();
     // a recovery's relationship is no contact (`guardians.rs`)
     contacts.retain(|c| c.recovery_of.is_none());
     let named = |c: &ContactRecord| match asked {
-        crate::api::Ref::Id(_) => asked.is_id(&c.identity),
-        crate::api::Ref::Typed(_) => {
-            c.petname.to_lowercase() == w || hex::encode(&c.identity[..8]) == w
-        }
+        Ref::Id(_) => asked.is_id(&c.identity),
+        Ref::Typed(_) => c.petname.to_lowercase() == w || hex::encode(&c.identity[..8]) == w,
     };
     let mut found = contacts.into_iter().filter(named);
-    let who = crate::api::shown(who);
+    let who = asked.to_string();
     let contact = found
         .next()
         .ok_or_else(|| anyhow::anyhow!("no contact called {who:?}"))?;
@@ -1174,6 +1181,14 @@ pub(crate) fn find(d: &Daemon, who: &str) -> anyhow::Result<ContactRecord> {
 /// from now on (`sync.md#neighbours`), and so looked for.
 pub(crate) fn listed(d: &Daemon, who: &str) -> anyhow::Result<ContactRecord> {
     let contact = find(d, who)?;
+    anyhow::ensure!(!contact.refused, "you have refused {who}");
+    d.rendezvous.use_contact(&contact.identity);
+    Ok(contact)
+}
+
+/// [`listed`], by a `ref` as it came.
+pub(crate) fn listed_ref(d: &Daemon, who: Ref<'_>) -> anyhow::Result<ContactRecord> {
+    let contact = find_ref(d, who)?;
     anyhow::ensure!(!contact.refused, "you have refused {who}");
     d.rendezvous.use_contact(&contact.identity);
     Ok(contact)
@@ -1472,7 +1487,7 @@ pub fn react(d: &Arc<Daemon>, who: &str, id: &str, text: &str) -> anyhow::Result
 
 /// Reactions as a window shows them: each one once, with how many gave it
 /// and whether this person did.
-pub(crate) fn reactions_of(m: &relationship::Message, me: Option<[u8; 32]>) -> Vec<Json> {
+pub(crate) fn reactions_of(m: &relationship::Message, me: Option<[u8; 32]>) -> Vec<Reaction> {
     // One for each person, the last they gave, however many they wrote, and
     // no longer than this software lets anyone make one.
     let mut theirs: Vec<&relationship::Reaction> = Vec::new();
@@ -1496,7 +1511,20 @@ pub(crate) fn reactions_of(m: &relationship::Message, me: Option<[u8; 32]>) -> V
     }
     shown
         .into_iter()
-        .map(|(text, count, mine)| json!({"text": text, "count": count, "mine": mine}))
+        .map(|(text, count, mine)| Reaction {
+            text,
+            count: count as u64,
+            mine,
+        })
+        .collect()
+}
+
+/// [`reactions_of`], by name, for the handlers kept by name.
+#[cfg(any(test, feature = "by-name"))]
+pub(crate) fn reactions_by_name(m: &relationship::Message, me: Option<[u8; 32]>) -> Vec<Json> {
+    reactions_of(m, me)
+        .into_iter()
+        .map(|r| json!({"text": r.text, "count": r.count, "mine": r.mine}))
         .collect()
 }
 
@@ -1553,33 +1581,41 @@ fn state_of(read: bool, waiting: bool) -> &'static str {
 pub(crate) fn upto(
     sp: &Space,
     all: &[relationship::Message],
-    before: Option<&str>,
+    before: Option<Ref<'_>>,
 ) -> anyhow::Result<usize> {
-    let Some(b) = before.map(str::trim) else {
+    let Some(b) = before else {
         return Ok(all.len());
     };
-    let given = matches!(crate::api::reference(b), crate::api::Ref::Id(_));
-    let b = crate::api::id_hex(b);
-    let id: Option<NodeId> = hex::decode(b).ok().and_then(|v| v.try_into().ok());
-    let id = id.or_else(|| {
-        if given {
-            return None;
+    let id: Option<NodeId> = match b {
+        Ref::Id(given) => given.bytes().and_then(|v| <[u8; 16]>::try_from(&*v).ok()),
+        Ref::Typed(t) => {
+            let t = t.trim();
+            let whole: Option<NodeId> = hex::decode(t).ok().and_then(|v| v.try_into().ok());
+            whole.or_else(|| {
+                let mut shown = all.iter().filter(|m| hex::encode(m.id).starts_with(t));
+                match (shown.next(), shown.next()) {
+                    (Some(m), None) if !t.is_empty() => Some(m.id),
+                    _ => None,
+                }
+            })
         }
-        let mut shown = all.iter().filter(|m| hex::encode(m.id).starts_with(b));
-        match (shown.next(), shown.next()) {
-            (Some(m), None) if !b.is_empty() => Some(m.id),
-            _ => None,
-        }
-    });
+    };
     let place = id.and_then(|id| relationship::message_place(sp, &id));
-    let place = place.ok_or_else(|| anyhow::anyhow!("there is no message {b} here"))?;
+    let place = place.ok_or_else(|| match b {
+        Ref::Typed(t) => anyhow::anyhow!("there is no message {} here", t.trim()),
+        Ref::Id(_) => anyhow::anyhow!("there is no message {b} here"),
+    })?;
     Ok(relationship::before_place(sp, all, &place))
 }
 
 /// The conversation with a contact, oldest first: those before `before`,
-/// if it names one.
-pub fn messages(d: &Daemon, who: &str, before: Option<&str>) -> anyhow::Result<Json> {
-    let contact = listed(d, who)?;
+/// if it names one. All of them: the request's page is cut from it.
+pub fn messages(
+    d: &Daemon,
+    who: Ref<'_>,
+    before: Option<Ref<'_>>,
+) -> anyhow::Result<MessagesReply> {
+    let contact = listed_ref(d, who)?;
     let (space, them) = (contact.space, contact.identity);
     let here = mailbox::written_here(d, &space);
     let unsent = d.mailbox.not_sent(&space, &them, here);
@@ -1590,6 +1626,62 @@ pub fn messages(d: &Daemon, who: &str, before: Option<&str>) -> anyhow::Result<J
     let all = relationship::messages(open);
     let read = relationship::read_by(open, &them, &all);
     let upto = upto(open, &all, before)?;
+    let messages: Vec<Message> = all
+        .into_iter()
+        .zip(read)
+        .take(upto)
+        .map(|(m, read)| {
+            let mine = Some(m.author) == me;
+            let state = mine.then(|| state_of(read, unsent.contains(&m.entry)).into());
+            Message {
+                id: m.id,
+                mine,
+                state,
+                reply_to: m.reply_to,
+                attachments: attachments_of(&m),
+                edited: m.edited,
+                reactions: reactions_of(&m, me),
+                text: m.text,
+                time: m.time,
+                ..Message::default()
+            }
+        })
+        .collect();
+    Ok(MessagesReply {
+        messages,
+        ..MessagesReply::default()
+    })
+}
+
+/// The files that came with a message, as a conversation shows them.
+pub(crate) fn attachments_of(m: &relationship::Message) -> Vec<Attachment> {
+    m.attachments
+        .iter()
+        .map(|a| Attachment {
+            name: a.name.clone(),
+            r#type: a.media_type.clone(),
+            size: BlobRef::from_record(&a.blob).map(|b| b.size).ok(),
+        })
+        .collect()
+}
+
+/// [`messages`] as it was before it was typed, by name: kept only to show
+/// that the typed one sends the same bytes, and to measure the two. It
+/// goes with the way by name.
+#[cfg(any(test, feature = "by-name"))]
+#[doc(hidden)]
+pub fn messages_by_name(d: &Daemon, who: &str, before: Option<&str>) -> anyhow::Result<Json> {
+    let contact = listed(d, who)?;
+    let (space, them) = (contact.space, contact.identity);
+    let here = mailbox::written_here(d, &space);
+    let unsent = d.mailbox.not_sent(&space, &them, here);
+    let core = d.core();
+    let me = core.identity.as_ref().map(|i| i.id());
+    let open = core.spaces.get(&space).and_then(|h| h.space.as_ref());
+    let open = open.ok_or_else(|| anyhow::anyhow!("that space is not open yet"))?;
+    let all = relationship::messages(open);
+    let read = relationship::read_by(open, &them, &all);
+    let upto = upto(open, &all, before.map(crate::api::reference))?;
     let said: Vec<Json> = all
         .iter()
         .zip(read)
@@ -1609,7 +1701,7 @@ pub fn messages(d: &Daemon, who: &str, before: Option<&str>) -> anyhow::Result<J
                     "size": BlobRef::from_record(&a.blob).map(|b| b.size).ok(),
                 })).collect::<Vec<_>>(),
                 "edited": m.edited,
-                "reactions": reactions_of(m, me),
+                "reactions": reactions_by_name(m, me),
             })
         })
         .collect();
