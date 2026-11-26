@@ -24,7 +24,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use cardinald::api::typed::Ask;
-use cardinald::api::{self, CallArgs, FilesArgs, MessagesArgs};
+use cardinald::api::{self, CallArgs, FilesArgs, GroupsArgs, MessagesArgs};
 use cardinald::control::typed as t;
 use cardinald::transport::{self, Received};
 use cardinald::{Config, Daemon, Paths};
@@ -130,6 +130,9 @@ fn show(what: &str, c: Cost) {
 
 const FILES: usize = 5_000;
 const MESSAGE_TEXT: usize = 160;
+/// The groups of `groups`: each one made here, a listing paged through
+/// three lists in turn.
+const GROUPS: usize = 300;
 
 async fn device(dir: &std::path::Path) -> Arc<Daemon> {
     let paths = Paths::at(dir);
@@ -180,7 +183,17 @@ async fn fill(d: &Arc<Daemon>, dir: &std::path::Path) -> String {
         .unwrap();
     }
     eprintln!("{n} messages written in {:.1} s", t.elapsed().as_secs_f64());
+    let t = Instant::now();
+    for i in 0..GROUPS {
+        cardinald::groups::create(d, &format!("Group {i:03}"), &[], false, true).unwrap();
+    }
+    eprintln!("{GROUPS} groups made in {:.1} s", t.elapsed().as_secs_f64());
     group
+}
+
+/// `groups`, typed: what the handler answers, all of it.
+fn groups(d: &Arc<Daemon>, _: &GroupsArgs) -> anyhow::Result<api::GroupsReply> {
+    Ok(cardinald::groups::list(d))
 }
 
 // ---- Over the socket ----
@@ -338,6 +351,7 @@ fn main() {
             json!({"cmd": "messages", "group": format!("{}{group}", api::EXACT)}),
         ),
         ("call", json!({"cmd": "call"})),
+        ("groups", json!({"cmd": "groups"})),
     ];
     for (name, req) in asks {
         let (spec, msg) = api::encode_request(&req).unwrap();
@@ -350,11 +364,13 @@ fn main() {
                 cardinald::groups::messages_by_name(&d, args["group"].as_str().unwrap(), None)
                     .unwrap()
             }
+            "groups" => cardinald::groups::list_by_name(&d),
             _ => cardinald::calls::current_by_name(&d),
         });
         let new = match name {
             "files" => typed::<FilesArgs>(&rt, &d, &msg, t::files),
             "messages" => typed::<MessagesArgs>(&rt, &d, &msg, t::messages),
+            "groups" => typed::<GroupsArgs>(&rt, &d, &msg, groups),
             _ => typed::<CallArgs>(&rt, &d, &msg, t::call),
         };
         assert_eq!(old.reply, new.reply, "{name}: the two ways differ");
@@ -363,6 +379,7 @@ fn main() {
         let (raw, with_read, len) = over_socket(&rt, &socket, &msg, |r| match name {
             "files" => drop(api::typed::read_reply::<FilesArgs>(r).unwrap().unwrap()),
             "messages" => drop(api::typed::read_reply::<MessagesArgs>(r).unwrap().unwrap()),
+            "groups" => drop(api::typed::read_reply::<GroupsArgs>(r).unwrap().unwrap()),
             _ => drop(api::typed::read_reply::<CallArgs>(r).unwrap().unwrap()),
         });
         println!(
