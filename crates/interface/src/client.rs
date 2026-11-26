@@ -50,11 +50,13 @@
 //! rest and says that so many were left out ([`Whole::left_out`], each the
 //! error 4 that named one, with its `at`, `id` and why).
 //!
-//! **Replies are read straight from their bytes** ([`read_reply`]), and a
+//! **Replies are read straight from their bytes** ([`read_reply`](crate::typed::read_reply)), and a
 //! stream's messages by their key 0 ([`Event::read`](crate::Event::read),
 //! [`Frame::read`](crate::Frame::read)): no tree of the encoding between.
 
-use crate::typed::{read_reply, Ask, Failed, Unencodable, Unreadable};
+use cardinal_encoding::Cursor;
+
+use crate::typed::{reply_done, reply_fields, Ask, At, Failed, Unencodable, Unreadable, Walk};
 use crate::Request;
 
 /// Carries one request's message to the service and its reply's back: a
@@ -113,22 +115,69 @@ fn asking<T: Transport + ?Sized>(t: &mut T, p: &mut dyn Paging) -> Result<(), T:
 }
 
 /// A typed request asked page after page: what was asked last, and the
-/// pages joined so far, or how one failed.
-pub struct Pages<A: Ask> {
+/// pages joined so far, or how one failed. What is done with an item too
+/// large for a message on its own is `P`: by default [`Stop`], which ends
+/// the asking with that refusal, as before, and costs nothing; or
+/// [`GoPast`] ([`Pages::past_too_large`]).
+pub struct Pages<A: Ask, P: Past<A> = Stop> {
     /// Whether the arguments asked for one page themselves.
     one_page: bool,
-    /// How an item too large for a message is passed (and left out), when
-    /// it is: named here only then, so that a client that never goes past
-    /// one has none of its code.
-    #[allow(clippy::type_complexity)]
-    past: Option<fn(&A, &Failed) -> Option<A>>,
-    /// Whether what is asked next is `asked` again, moved past such an
-    /// item, rather than the page after the last.
-    moved: bool,
     asked: A,
     all: Option<A::Reply>,
+    /// The refusal read last, which ended the asking unless it was gone
+    /// past.
     failed: Option<Failed>,
+    past: P,
+}
+
+/// What a request asked page after page does with an item too large for
+/// a message on its own, which error 4 names.
+pub trait Past<A> {
+    /// Whether the refusal just read, `failed`, was gone past: `asked`
+    /// then moved past the item, and the refusal taken out of `failed`.
+    fn went_past(&mut self, asked: &mut A, failed: &mut Option<Failed>) -> bool;
+    /// Whether what is asked next is `asked` again, moved past such an
+    /// item, rather than the page after the last.
+    fn moved(&mut self) -> bool;
+}
+
+/// An item too large ends the asking, as the reply's failure.
+pub struct Stop;
+
+impl<A> Past<A> for Stop {
+    #[inline]
+    fn went_past(&mut self, _: &mut A, _: &mut Option<Failed>) -> bool {
+        false
+    }
+    #[inline]
+    fn moved(&mut self) -> bool {
+        false
+    }
+}
+
+/// An item too large is left out, and the asking goes on past it, from one
+/// more than its place or before its id ([`Ask::past`]); the refusals that
+/// named the items left out are kept.
+#[derive(Default)]
+pub struct GoPast {
     left_out: Vec<Failed>,
+    moved: bool,
+}
+
+impl<A: Ask> Past<A> for GoPast {
+    fn went_past(&mut self, asked: &mut A, failed: &mut Option<Failed>) -> bool {
+        let Some(next) = failed.as_ref().and_then(|f| asked.past(f)) else {
+            return false;
+        };
+        *asked = next;
+        self.left_out.extend(failed.take());
+        self.moved = true;
+        true
+    }
+    #[inline]
+    fn moved(&mut self) -> bool {
+        std::mem::take(&mut self.moved)
+    }
 }
 
 /// What is done with a request asked page after page, whatever its type:
@@ -151,12 +200,10 @@ impl<A: Ask> Pages<A> {
     pub fn new(args: &A) -> Self {
         Pages {
             one_page: args.one_page(),
-            past: None,
-            moved: false,
             asked: args.clone(),
             all: None,
             failed: None,
-            left_out: Vec::new(),
+            past: Stop,
         }
     }
 
@@ -164,11 +211,18 @@ impl<A: Ask> Pages<A> {
     /// error 4 names, leaving it out ([`Pages::left_out`]): from one more
     /// than its place, or before its id ([`Ask::past`]). Of a page asked
     /// for itself, the page is then the one from past it.
-    pub fn past_too_large(mut self) -> Self {
-        self.past = Some(A::past);
-        self
+    pub fn past_too_large(self) -> Pages<A, GoPast> {
+        Pages {
+            one_page: self.one_page,
+            asked: self.asked,
+            all: self.all,
+            failed: self.failed,
+            past: GoPast::default(),
+        }
     }
+}
 
+impl<A: Ask, P: Past<A>> Pages<A, P> {
     /// Asks page after page even where the arguments give `limit`, which
     /// is then the most each page holds: for a client that reads the
     /// pages as they come ([`Pages::so_far`]) and stops when it has enough.
@@ -190,22 +244,6 @@ impl<A: Ask> Pages<A> {
             .is_some_and(|all| self.asked.next_page(all).is_some())
     }
 
-    /// The items left out so far, each too large for a message on its own:
-    /// the error 4 that named it.
-    pub fn left_out(&self) -> &[Failed] {
-        &self.left_out
-    }
-
-    /// [`Pages::done`], with the items left out.
-    ///
-    /// # Panics
-    ///
-    /// Before a reply was taken.
-    pub fn whole(mut self) -> Result<Whole<A::Reply>, Failed> {
-        let left_out = std::mem::take(&mut self.left_out);
-        self.done().map(|reply| Whole { reply, left_out })
-    }
-
     /// The reply, every page joined, or how a page failed; once
     /// [`Paging::next`] has given none, or [`Paging::took`] said to stop.
     ///
@@ -225,22 +263,25 @@ impl<A: Ask> Pages<A> {
     }
 }
 
-impl<A: Ask> Pages<A> {
-    /// A page refused: moved past the item it names, where that is asked
-    /// for; whether to go on.
-    fn refused(&mut self, f: Failed) -> bool {
-        if let Some(next) = self.past.and_then(|past| past(&self.asked, &f)) {
-            self.left_out.push(f);
-            self.asked = next;
-            self.moved = true;
-            return true;
-        }
-        self.failed = Some(f);
-        false
+impl<A: Ask> Pages<A, GoPast> {
+    /// The items left out so far, each too large for a message on its own:
+    /// the error 4 that named it.
+    pub fn left_out(&self) -> &[Failed] {
+        &self.past.left_out
+    }
+
+    /// [`Pages::done`], with the items left out.
+    ///
+    /// # Panics
+    ///
+    /// Before a reply was taken.
+    pub fn whole(mut self) -> Result<Whole<A::Reply>, Failed> {
+        let left_out = std::mem::take(&mut self.past.left_out);
+        self.done().map(|reply| Whole { reply, left_out })
     }
 }
 
-impl<A: Ask> Paging for Pages<A> {
+impl<A: Ask, P: Past<A>> Paging for Pages<A, P> {
     fn request(&self) -> &'static Request {
         A::REQUEST
     }
@@ -248,7 +289,7 @@ impl<A: Ask> Paging for Pages<A> {
         if self.failed.is_some() {
             return Ok(None);
         }
-        if std::mem::take(&mut self.moved) {
+        if self.past.moved() {
             return self.asked.encode().map(Some);
         }
         match &self.all {
@@ -265,10 +306,13 @@ impl<A: Ask> Paging for Pages<A> {
         }
     }
     fn took(&mut self, reply: &[u8]) -> Result<bool, Unreadable> {
-        let page = match read_reply::<A>(reply)? {
-            Ok(r) => r,
-            Err(f) => return Ok(self.refused(f)),
-        };
+        // a refusal is read into `failed` by code written once
+        let mut c = Cursor::new(reply);
+        let mut w = Walk::open(&mut c);
+        if !reply_done(&mut w, reply, &mut self.failed)? {
+            return Ok(self.past.went_past(&mut self.asked, &mut self.failed));
+        }
+        let page = reply_fields(&mut w, reply, &At::Top(A::REQUEST.name))?;
         match &mut self.all {
             None => {
                 self.all = Some(page);
@@ -506,6 +550,45 @@ mod tests {
         // asked: the newest two; before 8, 7 alone (6 does not fit beside
         // it); before 7, error 4 for 6; before 6, two more
         assert_eq!(s.asked.len(), 4);
+    }
+
+    /// A listing whose every item is too large for a message is answered
+    /// empty, every item left out, as the old pagers did; and an error 4
+    /// naming an item before where the page began ends the asking.
+    #[test]
+    fn every_item_too_large_is_an_empty_answer() {
+        let huge = |i: usize| {
+            crate::new!(File {
+                folder: false,
+                name: format!("{i} {}", "z".repeat(MAX_MESSAGE))
+            })
+        };
+        let mut s = Service {
+            entries: (0..3).map(huge).collect(),
+            said: Vec::new(),
+            asked: Vec::new(),
+        };
+        let whole = ask_past(&mut s, &FilesArgs::new()).unwrap().unwrap();
+        assert!(whole.reply.files.is_empty());
+        let at: Vec<Option<u64>> = whole.left_out.iter().map(|f| f.at).collect();
+        assert_eq!(at, [Some(0), Some(1), Some(2)]);
+        // a service naming an item before the page: no going back
+        struct Behind;
+        impl Transport for Behind {
+            type Error = String;
+            fn exchange(&mut self, _: &[u8]) -> Result<Vec<u8>, String> {
+                Ok(crate::typed::too_large_message("too large", 0, None))
+            }
+        }
+        let args = FilesArgs {
+            after: Some(5),
+            ..FilesArgs::new()
+        };
+        let failed = ask_past(&mut Behind, &args).unwrap().unwrap_err();
+        assert_eq!(
+            (failed.status, failed.at),
+            (crate::status::TOO_LARGE, Some(0))
+        );
     }
 
     /// A refusal is what the reply said: an empty why stays empty, and is

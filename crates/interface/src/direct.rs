@@ -294,7 +294,7 @@ fn whole<R: Fields + PartialEq + Debug>(rng: &mut Rng, name: &'static str, first
         }
         let msg = mutated(rng, r.encode());
         let at = At::Top(name);
-        let direct = read_message(&msg, |w| R::read_fields(w, &at)).map_err(|b| b.to_string());
+        let direct = read_message(&msg, |w| R::read_fields(w, &at));
         let tree = Record::decode(&msg)
             .map_err(|e| format!("not one record: {e}"))
             .and_then(|r| R::take_fields(r, &at));
@@ -368,4 +368,50 @@ fn reading_straight_from_the_bytes_is_reading_through_the_tree() {
     whole::<crate::StoreReply>(&mut rng, "--store", 2);
     whole::<crate::Done>(&mut rng, "--clear", 2);
     whole::<crate::ErrorMore>(&mut rng, "error", 2);
+}
+
+/// Replies of real v0.1.27 services, as an independent review captured
+/// them (`replies-0127.txt`: the request, its message and its reply, in
+/// hex), read straight from the bytes and through the tree: every one read,
+/// and alike; and their requests too.
+#[test]
+fn replies_of_a_release_read_alike_both_ways() {
+    fn both<A: Ask + PartialEq + Debug>(request: &[u8], reply: &[u8]) -> bool
+    where
+        A::Reply: PartialEq + Debug,
+    {
+        let direct = read_reply::<A>(reply);
+        assert_eq!(direct, read_reply_tree::<A>(reply), "{}", A::REQUEST.name);
+        assert!(
+            matches!(direct, Ok(Ok(_))),
+            "{}: {direct:?}",
+            A::REQUEST.name
+        );
+        let asked = request_of(request).map(|s| s.n).map_err(said);
+        assert_eq!(asked, Ok(A::REQUEST.n));
+        let tree = A::from_request(decode_record(request).unwrap().1).map_err(said);
+        assert_eq!(A::read_request(request).map_err(said), tree);
+        true
+    }
+    let unhex = |h: &str| crate::unhex(h).expect("hex");
+    let mut read = 0;
+    for line in include_str!("replies-0127.txt").lines() {
+        let mut parts = line.split('\t');
+        let (name, request, reply) = (
+            parts.next().unwrap(),
+            unhex(parts.next().unwrap()),
+            unhex(parts.next().unwrap()),
+        );
+        read += match name {
+            "hello" => both::<crate::HelloArgs>(&request, &reply),
+            "call" => both::<crate::CallArgs>(&request, &reply),
+            "conversations" => both::<crate::ConversationsArgs>(&request, &reply),
+            "groups" => both::<crate::GroupsArgs>(&request, &reply),
+            "contacts" => both::<crate::ContactsArgs>(&request, &reply),
+            "files" => both::<crate::FilesArgs>(&request, &reply),
+            "messages" => both::<crate::MessagesArgs>(&request, &reply),
+            other => panic!("a reply to {other}"),
+        } as usize;
+    }
+    assert_eq!(read, 57);
 }

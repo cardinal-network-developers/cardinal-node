@@ -1,0 +1,53 @@
+schema 1
+field 1 gone bool
+field 2 n uint
+field 3 name text
+field 4 optional bool
+field 5 type {type}
+field 6 known [text] optional
+interface 1 error [{field}]
+interface 2 events [{message}]
+interface 3 frames [{message}]
+interface 4 program [{request}]
+interface 5 records [{record}]
+interface 6 requests [{request}]
+interface 7 version uint
+interface 8 layout {layout}
+interface 9 max_message uint
+interface 10 statuses [{status}]
+interface 11 schema uint
+interface 12 min_service text
+interface 13 unnamed_status text
+interface 14 why {field}
+layout 1 arguments_from uint
+layout 2 fields_from uint
+layout 3 kind uint
+layout 4 number uint
+layout 5 status uint
+layout 6 stream_fields_from uint
+layout 7 why uint
+list 1 id text optional
+list 2 name text
+message 1 fields [{field}]
+message 2 n uint
+message 3 name text
+record 1 fields [{field}]
+record 2 name text
+request 1 args [{field}]
+request 2 gone bool
+request 3 lists [{list}]
+request 4 n uint
+request 5 name text
+request 6 own bool
+request 7 page text
+request 8 reply [{field}]
+request 9 stream bool
+request 10 reads bool
+request 11 unless [text] optional
+request 12 one_page [text] optional
+status 1 n uint
+status 2 name text
+type 1 is text
+type 2 item {type} optional
+type 3 record text optional
+type 4 size uint optional

@@ -274,7 +274,13 @@ async fn connection(d: Arc<Daemon>, mut r: Reader, mut w: Writer) {
         // One with no answering is a stream's, answered above, or one no
         // longer answered, refused by `request_of`.
         let reply = match typed::answerer(spec.n) {
-            Some(answer) => answer(&d, &msg).await,
+            Some(answer) => {
+                // the message opened once, for every request; its
+                // arguments read by its own answering
+                let mut c = cardinal_encoding::Cursor::new(&msg);
+                let answered = answer(&d, &mut api::typed::Walk::open(&mut c), &msg);
+                answered.await
+            }
             None => api::error_reply(
                 status::FAILED,
                 &format!("internal: {} has no answer", spec.name),
@@ -472,9 +478,10 @@ pub mod typed {
     use cardinal_space::account;
 
     /// How a typed request is answered, from its message to its reply's.
-    pub type Answerer = for<'a> fn(
+    pub type Answerer = for<'a, 'w, 'c, 'm> fn(
         &'a Arc<Daemon>,
-        &'a [u8],
+        &'w mut api::typed::Walk<'c, 'm>,
+        &'m [u8],
     ) -> std::pin::Pin<
         Box<dyn std::future::Future<Output = Vec<u8>> + Send + 'a>,
     >;
@@ -522,13 +529,14 @@ pub mod typed {
     /// the two are not the same bytes.
     pub fn answering<'a, A: Answer>(
         d: &'a Arc<Daemon>,
-        msg: &'a [u8],
+        w: &mut api::typed::Walk,
+        msg: &[u8],
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Vec<u8>> + Send + 'a>> {
+        let a = match A::read_args(w, msg) {
+            Ok(a) => a,
+            Err(refused) => return refusing(refused),
+        };
         Box::pin(async move {
-            let a = match A::read_request(msg) {
-                Ok(a) => a,
-                Err(refused) => return api::error_reply(refused.status, &refused.why),
-            };
             // not in the benchmark's build (`by-name` alone), which measures
             // the typed way only; with the clock held still, so that a
             // time read twice is the same
@@ -542,6 +550,18 @@ pub mod typed {
             }
             answer_of(d, &a).await
         })
+    }
+
+    /// The answer to a request whose arguments could not be read: written
+    /// once, not for each request.
+    #[inline(never)]
+    fn refusing<'a>(
+        refused: api::Refused,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Vec<u8>> + Send + 'a>> {
+        Box::pin(std::future::ready(api::error_reply(
+            refused.status,
+            &refused.why,
+        )))
     }
 
     /// The reply to `a`, as a message.
@@ -654,7 +674,9 @@ pub mod typed {
                 &format!("not one record: {refused}"),
             ));
         };
-        Some(answer(d, msg).await)
+        let mut c = cardinal_encoding::Cursor::new(msg);
+        let answered = answer(d, &mut api::typed::Walk::open(&mut c), msg);
+        Some(answered.await)
     }
 
     /// An argument a request cannot go without, as the handlers by name

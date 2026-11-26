@@ -89,6 +89,53 @@ pub const VERSION: u64 = 3;
 /// The most a message may be, either way (`apps.md`, The local interface).
 pub const MAX_MESSAGE: usize = 256 * 1024;
 
+/// The oldest service a client of this interface works with, as `hello`'s
+/// `version` gives it: every field it has always sent since is held to be
+/// always sent ([`new_enough`]).
+pub const MIN_SERVICE: &str = "0.1.27";
+
+/// Whether `version`, as `hello` gives it, is of a service this interface
+/// works with: [`MIN_SERVICE`] or later. The service gives its version as
+/// its package's, three numbers, `0.1.27`. A version is read strictly:
+/// three decimal numbers separated by dots, nothing before them (no `v`),
+/// with no leading zeros, then nothing, or a pre-release (`-` and dot-
+/// separated parts of letters, digits and `-`, as semver writes one), which
+/// comes before the release of the same three numbers, so `0.1.27-rc1` is
+/// older than `0.1.27`. Anything else is no version this build can read,
+/// and not new enough.
+pub fn new_enough(version: &str) -> bool {
+    fn three(v: &str) -> Option<[u64; 3]> {
+        let mut out = [0; 3];
+        let mut parts = v.split('.');
+        for n in &mut out {
+            let p = parts.next()?;
+            let digits = !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit());
+            if !digits || (p.len() > 1 && p.starts_with('0')) {
+                return None;
+            }
+            *n = p.parse().ok()?;
+        }
+        parts.next().is_none().then_some(out)
+    }
+    let (numbers, pre) = match version.split_once('-') {
+        Some((n, pre)) => (n, Some(pre)),
+        None => (version, None),
+    };
+    let ok_pre = pre.is_none_or(|p| {
+        p.split('.').all(|part| {
+            !part.is_empty() && part.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+        })
+    });
+    let (Some(have), Some(least), true) = (three(numbers), three(MIN_SERVICE), ok_pre) else {
+        return false;
+    };
+    match have.cmp(&least) {
+        std::cmp::Ordering::Greater => true,
+        std::cmp::Ordering::Equal => pre.is_none(),
+        std::cmp::Ordering::Less => false,
+    }
+}
+
 /// A reply's key 0, and the numbers of the errors (`apps.md`, Errors).
 pub mod status {
     /// The request was done.
@@ -117,6 +164,10 @@ pub mod status {
         NEEDS_WORDS,
         NEEDS_FOR,
     ];
+
+    /// What a refusal of a status that has no name here is called, where
+    /// it says no more (`why` empty): one of a later service's.
+    pub const UNNAMED: &str = "failed";
 
     /// The name a tool shows for a status.
     pub fn name(n: u64) -> Option<&'static str> {

@@ -2432,7 +2432,13 @@ asks for around that is not built yet.
     (`unless` some argument is given), and a text field's `known` values.
     The program's options, numbered apart from the requests, had been given
     the paging of the requests of their numbers (`--clear` that of
-    `status`); they have none.
+    `status`); they have none. The export's own records have a `schema`
+    version, which rises when a generator must change; their field numbers
+    are only added (`export-schema.txt`, and a test that fails when one is
+    moved, retyped or given again). It does not say what each id
+    identifies: the names do not settle it (38 fields called `id` name
+    messages, calls, devices and more), so it would need a declaration on
+    each of some 260 fields of ids and refs.
   - **The way by name, kept to compare.** While requests are converted,
     main's handlers of the typed requests are kept whole, as `*_by_name`
     (with main's lookups and main's arms in `control::handle`), compiled
@@ -2560,20 +2566,43 @@ asks for around that is not built yet.
   - **A refusal as the reply said it.** `Failed::why` is key 1 exactly,
     empty where the service said nothing more; `Failed::words` (and its
     `Display`, which the command line prints) gives the status's name for
-    an empty one, as `why` held before. An error's reply without text in
-    key 1, or whose `at` or `id` is not of its row's type, is unreadable:
-    the spec says key 1 says why.
+    an empty one, or `failed` (`status::UNNAMED`) for a status with no
+    name here, as `why` held before. An error's reply without text in key
+    1, or whose `at` or `id` is not of its row's type, is unreadable, said
+    as such (the old readers passed over the field and showed the status):
+    the spec says key 1 says why, and strict is the rule. The export holds
+    `why`'s row and `unnamed_status`, so that every client words it alike.
   - **Going on past an item too large.** `Ask::past`, made from each paged
     request's declaration, is the same arguments with `after` one more than
     error 4's `at`, or `before` its `id` (none for another error, or one
-    naming an item before where the page began). `client::ask` and
-    `Pages::new` stop at error 4, as before (the command line's choice);
-    `client::ask_past` and `Pages::past_too_large` go on past it, leaving
-    the item out and keeping each error 4 that named one (`Whole::left_out`),
-    for a window to say how many were left out: no message can hold such
-    an item, so it cannot be had at all. `Pages::every_page`, `so_far` and
-    `more` let a client read pages as they come and stop when it has
-    enough (a conversation back from the newest).
+    naming an item before where the page began: its place must move on, or
+    the asking ends with that error). `client::ask` and `Pages::new` stop at
+    error 4, as before (the command line's choice); `client::ask_past` and
+    `Pages::past_too_large` (a `Pages<A, GoPast>`; the default `Stop` costs
+    nothing) go on past it, leaving the item out and keeping each error 4
+    that named one (`Whole::left_out`), for a window to say how many were
+    left out: no message can hold such an item, so it cannot be had at all.
+    A listing whose every item is too large is answered empty, as the old
+    pagers answered it. A page that adds no item ends the asking. A request
+    asks for one page when its arguments give its cursor or `limit`
+    (`Ask::ONE_PAGE`, in the export as `one_page`). `Pages::every_page`,
+    `so_far` and `more` let a client read pages as they come and stop when
+    it has enough (a conversation back from the newest).
+  - **The oldest service a client works with** is `MIN_SERVICE`, 0.1.27,
+    in the export as `min_service`, and `new_enough` compares `hello`'s
+    `version` with it strictly: three decimal numbers with no leading zeros
+    and nothing before them (`v0.1.27` is refused), then nothing or a
+    semver pre-release, which comes before its release (`0.1.27-rc1` is
+    older than 0.1.27); anything else is not new enough. The service says
+    its package's version, three numbers.
+  - **What the last release always sent stays always sent.**
+    `tests::what_the_last_release_sent_always_is_still_sent_always` holds
+    every field of the last release's tables that is always sent to stay
+    always sent, by the same number, name and exact type, against
+    `crates/interface/src/released-always.txt` (written with
+    `CARDINAL_API_RELEASED=write cargo test -p cardinal-interface --lib
+    sent_always` from the release's source, as `released-tables.md` is,
+    and moved forward with it): a client reads such a field strictly.
   - **Closed sets of text.** A text field whose values are a closed set
     says so in its declaration (`10 state: Cow<'static, str> where "calling"
     | "ringing" | "live"`): exported as the field's `known` values for

@@ -23,7 +23,18 @@
 //!   parts (a request's `number` and the key its arguments are numbered
 //!   from, `arguments_from`; a reply's `status`, an error's `why`, and
 //!   `fields_from`; a stream's message's `kind` and `stream_fields_from`);
-//!   and the largest message either way, `max_message`, in bytes.
+//!   the largest message either way, `max_message`, in bytes; the
+//!   oldest service a client works with, `min_service` (`hello`'s
+//!   `version`, compared as `new_enough` in the crate's lib.rs says); key 1
+//!   of an error, `why` (a field: text, always there, so that an error's
+//!   reply without it, or with any of its fields of another type, is
+//!   unreadable, as a reply that was done is); what a refusal whose `why`
+//!   is empty is shown as when its status has no name in `statuses`,
+//!   `unnamed_status` (one that has a name is shown by it); and the
+//!   version of these records themselves, `schema`, which rises when a
+//!   generator must change. Their numbers are only ever added, as the
+//!   interface's are; `export-schema.txt` holds every one given, and a test
+//!   fails when one is moved, retyped or given again.
 //! - *request*: its number `n`, `name`, `args` and `reply` (fields; a
 //!   reply's numbered from 2, after the status, 0, and why, 1, as
 //!   `apps.md` says), `page` (`whole`, `after`: by position, through the
@@ -36,7 +47,15 @@
 //!   is the node's `own` (not in `apps.md`), and whether it `reads`:
 //!   answering it changes nothing, `unless` one of the arguments named
 //!   there is given (a request that writes, a stream's, or one no longer
-//!   answered does not).
+//!   answered does not); of a paged request, `one_page`, the arguments that
+//!   ask for one page when any is given (its cursor and `limit`), and
+//!   otherwise a client asks page after page. Asking page after page, a
+//!   page that adds no item ends the asking; going on past an item too
+//!   large for a message, error 4 must name one at or after where the page
+//!   began (`at` no less than `after`, or an `id` other than `before`), or
+//!   the asking ends with that error; and a listing whose every item is too
+//!   large is answered empty, its items left out, as a page past the last
+//!   one is.
 //! - *message* (an event or a frame): its number `n` (key 0 of the
 //!   message), `name` and `fields`, numbered from 1.
 //! - *field*: its number `n`, `name`, `type`, whether it is `optional` (it
@@ -61,7 +80,7 @@
 use crate::table::{Field, Page, Request, Ty};
 use crate::typed::{Ask, Wire};
 use crate::{each_request, typed};
-use crate::{key, status, MAX_MESSAGE};
+use crate::{key, status, MAX_MESSAGE, MIN_SERVICE};
 use crate::{ERROR_FIELDS, EVENTS, FRAMES, NODE_ONLY, PROGRAM, REQUESTS, VERSION};
 
 typed!(
@@ -97,6 +116,7 @@ typed!(REQUEST "request" RequestOf {
     9 stream: bool,
     10 reads: bool,
     11 unless: Option<Vec<String>>,
+    12 one_page: Option<Vec<String>>,
 });
 typed!(MESSAGE "message" MessageOf {
     1 fields: Vec<FieldOf>,
@@ -131,7 +151,18 @@ typed!(INTERFACE "interface" Interface {
     8 layout: LayoutOf,
     9 max_message: u64,
     10 statuses: Vec<StatusOf>,
+    11 schema: u64,
+    12 min_service: String,
+    13 unnamed_status: String,
+    14 why: FieldOf,
 });
+
+/// The version of the export's own records, above: it rises when a
+/// generator that reads them must change. Their field numbers are only
+/// added, never moved, retyped or given to another field
+/// ([`the_exports_own_numbers_are_only_added`], against `export-schema.txt`),
+/// so a field added is no change a generator must make.
+const SCHEMA: u64 = 1;
 
 fn type_of(ty: &Ty) -> TypeOf {
     let is = |s: &str| crate::new!(TypeOf { is: s.to_owned() });
@@ -193,6 +224,7 @@ type Declared = (
     &'static [(&'static str, Option<&'static str>)],
     bool,
     &'static [&'static str],
+    &'static [&'static str],
 );
 
 /// [`Declared`], of each request, by its number.
@@ -202,7 +234,7 @@ macro_rules! declared {
             $(if let Some(l) = declared!(@one n $how $x) {
                 return l;
             })*
-            (&[], false, &[])
+            (&[], false, &[], &[])
         }
     };
     (@one $n:ident gone $row:ident) => { None };
@@ -211,12 +243,13 @@ macro_rules! declared {
             <crate::$args as Ask>::LISTS,
             <crate::$args as Ask>::READS,
             <crate::$args as Ask>::UNLESS,
+            <crate::$args as Ask>::ONE_PAGE,
         ))
     };
 }
 each_request!(declared);
 
-fn request_of(r: &Request, own: bool, (lists, reads, unless): Declared) -> RequestOf {
+fn request_of(r: &Request, own: bool, (lists, reads, unless, one_page): Declared) -> RequestOf {
     let page = match r.page {
         Page::Whole => "whole",
         Page::After => "after",
@@ -231,8 +264,10 @@ fn request_of(r: &Request, own: bool, (lists, reads, unless): Declared) -> Reque
             .with_id(*id)
         })
         .collect();
+    let names = |n: &[&str]| (!n.is_empty()).then(|| n.iter().map(|u| (*u).to_owned()).collect());
     RequestOf {
-        unless: (!unless.is_empty()).then(|| unless.iter().map(|u| (*u).to_owned()).collect()),
+        unless: names(unless),
+        one_page: names(one_page),
         ..crate::new!(RequestOf {
             args: fields_of(r.args),
             gone: r.gone,
@@ -310,7 +345,7 @@ fn interface() -> Interface {
         // and declare nothing beyond their rows
         program: PROGRAM
             .iter()
-            .map(|r| request_of(r, false, (&[], false, &[])))
+            .map(|r| request_of(r, false, (&[], false, &[], &[])))
             .collect(),
         records: records(),
         requests: REQUESTS
@@ -337,6 +372,12 @@ fn interface() -> Interface {
                     .to_owned(),
             }))
             .collect(),
+        schema: SCHEMA,
+        min_service: MIN_SERVICE.to_owned(),
+        unnamed_status: status::UNNAMED.to_owned(),
+        why: fields_of(std::slice::from_ref(&crate::typed::WHY_ROW))
+            .pop()
+            .expect("why's row"),
     })
 }
 
@@ -483,4 +524,117 @@ fn the_export_reads_back_and_holds_every_request() {
     );
     let name = call.fields.iter().find(|f| f.name == "name").unwrap();
     assert_eq!(name.known, None);
+    // what a client must agree on
+    assert_eq!(back.min_service, MIN_SERVICE);
+    assert_eq!(
+        (back.why.n, back.why.optional, back.why.r#type.is.as_str()),
+        (1, false, "text")
+    );
+    assert_eq!(back.unnamed_status, "failed");
+    let one = |r: &str| by(r).one_page.clone().unwrap_or_default().join(" ");
+    assert_eq!(
+        (one("files"), one("messages"), one("say")),
+        ("after limit".into(), "before limit".into(), String::new())
+    );
+}
+
+/// The export's own records, one field to a line: `<record> <n> <name>
+/// <type>`, and `optional` where it may be left out, after the line
+/// `schema <n>`.
+fn schema_text() -> String {
+    let mut held: Vec<&'static crate::table::Rec> = Vec::new();
+    fn walk(r: &'static crate::table::Rec, held: &mut Vec<&'static crate::table::Rec>) {
+        if held.iter().any(|h| std::ptr::eq(*h, r)) {
+            return;
+        }
+        held.push(r);
+        for f in r.fields {
+            let mut t = &f.ty;
+            while let Ty::List(i) = t {
+                t = i;
+            }
+            if let Ty::Rec(r) | Ty::Recs(r) = t {
+                walk(r, held);
+            }
+        }
+    }
+    walk(&INTERFACE, &mut held);
+    held.sort_by_key(|r| r.name);
+    let mut out = format!("schema {SCHEMA}\n");
+    for r in held {
+        for f in r.fields {
+            let optional = if f.optional { " optional" } else { "" };
+            out += &format!(
+                "{} {} {} {}{optional}\n",
+                r.name,
+                f.n,
+                f.name,
+                ty_name(&f.ty)
+            );
+        }
+    }
+    out
+}
+
+/// A type as the schema's copy writes it.
+fn ty_name(ty: &Ty) -> String {
+    match ty {
+        Ty::List(t) => format!("[{}]", ty_name(t)),
+        Ty::Rec(r) => format!("{{{}}}", r.name.replace(' ', "_")),
+        Ty::Recs(r) => format!("[{{{}}}]", r.name.replace(' ', "_")),
+        Ty::BytesOf(n) => format!("bytes{n}"),
+        Ty::Gone(t) => format!("gone:{}", ty_name(t)),
+        t => format!("{t:?}").to_lowercase(),
+    }
+}
+
+/// The export's own numbers are only ever added: every field the
+/// checked-in copy (`export-schema.txt`) gives keeps its number, name and
+/// type, and the copy gives every field there is (writing it anew, with
+/// `CARDINAL_INTERFACE_EXPORT=write`, only adds). A change a generator must
+/// make raises [`SCHEMA`], but moves no number either.
+#[test]
+fn the_exports_own_numbers_are_only_added() {
+    // record names may hold a space: the copy's lines split at the number
+    let now = schema_text();
+    let split = |text: &str| -> Vec<((String, u64), String)> {
+        text.lines()
+            .skip(1)
+            .map(|l| {
+                let words: Vec<&str> = l.split(' ').collect();
+                let at = words.iter().position(|w| w.parse::<u64>().is_ok()).unwrap();
+                let rec = words[..at].join(" ");
+                let n = words[at].parse().unwrap();
+                ((rec, n), words[at + 1..].join(" "))
+            })
+            .collect()
+    };
+    let had = std::fs::read_to_string(path("export-schema.txt")).unwrap_or_default();
+    let (old, new) = (split(&had), split(&now));
+    let moved: Vec<String> = old
+        .iter()
+        .filter(|(k, v)| new.iter().find(|(n, _)| n == k).map(|(_, w)| w) != Some(v))
+        .map(|((r, n), v)| format!("{r} {n} {v}"))
+        .collect();
+    assert!(
+        moved.is_empty(),
+        "the export's own fields given before were moved, retyped or taken away (numbers are \
+         only added): {moved:?}"
+    );
+    if std::env::var("CARDINAL_INTERFACE_EXPORT").as_deref() == Ok("write") {
+        std::fs::write(path("export-schema.txt"), &now).unwrap();
+        return;
+    }
+    assert_eq!(
+        had.lines().next(),
+        Some(format!("schema {SCHEMA}").as_str()),
+        "export-schema.txt is of another schema: write it anew with \
+         CARDINAL_INTERFACE_EXPORT=write cargo test -p cardinal-interface --lib export"
+    );
+    assert_eq!(
+        old.len(),
+        new.len(),
+        "export-schema.txt lacks fields the export now has: write it anew with \
+         CARDINAL_INTERFACE_EXPORT=write cargo test -p cardinal-interface --lib export"
+    );
 }

@@ -350,6 +350,90 @@ fn what_the_last_release_lacked_is_an_option() {
     );
 }
 
+/// A field's type, exactly: what a reader holds it to.
+fn ty_exact(ty: &Ty) -> String {
+    match ty {
+        Ty::BytesOf(n) => format!("bytes{n}"),
+        Ty::List(t) => format!("[{}]", ty_exact(t)),
+        Ty::Rec(r) => format!("*{}*", r.name),
+        Ty::Recs(r) => format!("[*{}*]", r.name),
+        Ty::Gone(t) => format!("gone {}", ty_exact(t)),
+        t => ty_text(t),
+    }
+}
+
+/// Every field the last release had (`released-tables.md`) that is always
+/// sent, one to a line: where it is (`<request> arguments`, `<request>
+/// reply` or `*<record>*`), its number, name and exact type.
+fn always_sent() -> String {
+    let (requests, records) = released();
+    let mut out = String::new();
+    let mut held: Vec<&'static Rec> = Vec::new();
+    fn walk(ty: &'static Ty, held: &mut Vec<&'static Rec>) {
+        match ty {
+            Ty::List(t) | Ty::Gone(t) => walk(t, held),
+            Ty::Rec(r) | Ty::Recs(r) if !held.iter().any(|h| std::ptr::eq(*h, *r)) => {
+                held.push(r);
+                for f in r.fields {
+                    walk(&f.ty, held);
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut lines = |at: &str, fields: &'static [Field], had: &HashSet<u64>| {
+        for f in fields {
+            if had.contains(&f.n) && !f.optional && !matches!(f.ty, Ty::Gone(_)) {
+                out += &format!("{at}\t{}\t{}\t{}\n", f.n, f.name, ty_exact(&f.ty));
+            }
+        }
+    };
+    for r in REQUESTS.iter().chain(PROGRAM).filter(|r| !r.gone) {
+        for f in r.args.iter().chain(r.reply) {
+            walk(&f.ty, &mut held);
+        }
+        if let Some((args, reply)) = requests.get(r.name) {
+            lines(&format!("{} arguments", r.name), r.args, args);
+            lines(&format!("{} reply", r.name), r.reply, reply);
+        }
+    }
+    held.sort_by_key(|r| r.name);
+    for rec in held {
+        if let Some(had) = records.get(rec.name) {
+            lines(&format!("*{}*", rec.name), rec.fields, had);
+        }
+    }
+    out
+}
+
+/// What the last release always sent is always sent still, by the same
+/// number, name and type (`released-always.txt`, written from the tables of
+/// that release's source with `CARDINAL_API_RELEASED=write cargo test -p
+/// cardinal-interface --lib released`, as `released-tables.md` is): a
+/// client reads a field the export calls always sent strictly, so a newer
+/// service that left one out, or made it optional, would have every older
+/// window refuse that reply.
+#[test]
+fn what_the_last_release_sent_always_is_still_sent_always() {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/released-always.txt");
+    if std::env::var("CARDINAL_API_RELEASED").as_deref() == Ok("write") {
+        std::fs::write(&path, always_sent()).unwrap();
+    }
+    let had = std::fs::read_to_string(&path).expect("released-always.txt");
+    let now = always_sent();
+    let now: HashSet<&str> = now.lines().collect();
+    let lost: Vec<&str> = had.lines().filter(|l| !now.contains(l)).collect();
+    assert!(
+        lost.is_empty(),
+        "fields the last release always sent are no longer always sent, by the same number, \
+         name and type: {lost:?}"
+    );
+    assert!(
+        had.lines().count() > 500,
+        "released-always.txt holds what it should"
+    );
+}
+
 /// An error reply is the record it always was: its status and why.
 #[test]
 fn an_error_reply_is_status_and_why() {
@@ -360,4 +444,40 @@ fn an_error_reply_is_status_and_why() {
             .encode();
         assert_eq!(error_reply(st, why), built);
     }
+}
+
+/// The oldest service a client works with, read strictly: three numbers,
+/// a pre-release before its release, anything else no version at all.
+#[test]
+fn a_service_is_new_enough_from_the_oldest_this_interface_works_with() {
+    for v in [
+        "0.1.27",
+        "0.1.28",
+        "0.2.0",
+        "1.0.0",
+        "0.1.28-dev.20261126",
+        "0.10.0",
+    ] {
+        assert!(new_enough(v), "{v}");
+    }
+    for v in [
+        "0.1.26",
+        "0.1.27-rc1",
+        "0.0.99",
+        "v0.1.27",
+        "0.1",
+        "0.1.27.1",
+        "0.1.027",
+        "",
+        "0.1.x",
+        "0.1.27+build",
+        "0.1.27-",
+        "0.1.27-a..b",
+        " 0.1.27",
+        "-0.1.27",
+    ] {
+        assert!(!new_enough(v), "{v}");
+    }
+    // the service says its package's version, which is three numbers
+    assert!(new_enough(env!("CARGO_PKG_VERSION")));
 }

@@ -268,7 +268,8 @@ macro_rules! typed {
     (@munch [$(#[$m:meta])* $name:ident] [$stat:ident $title:literal]
         $s:tt $r:tt $o:tt $l:tt [$($a:tt)*]
     ) => {
-        $crate::typed!(@body [$(#[$m])* $name] ($stat.fields) $s $r $o $l);
+        // read where it is held, once (`typed::record_read`)
+        $crate::typed!(@body [$(#[$m])* $name] ($stat.fields) [inline] $s $r $o $l);
 
         #[doc = concat!("The *", $title, "* record's row in the tables.")]
         pub static $stat: $crate::table::Rec = $crate::table::Rec {
@@ -321,11 +322,12 @@ macro_rules! typed {
     // The arguments or the reply of a request: its rows in a static of
     // their own, so that every crate that names them names the one.
     (@munch [$(#[$m:meta])* $name:ident] [] $s:tt $r:tt $o:tt $l:tt [$($a:tt)*]) => {
+        // read from a whole message, once
         $crate::typed!(@body [$(#[$m])* $name] ({
             static FIELDS: [$crate::table::Field; $crate::typed!(@count $($a)*)] =
                 [ $( $crate::typed!(@row $a) ),* ];
             &FIELDS
-        }) $s $r $o $l);
+        }) [inline] $s $r $o $l);
     };
     // A record that always has none of its fields is had with `new()`;
     // one that has some, with `new!`, which names them.
@@ -344,7 +346,7 @@ macro_rules! typed {
     // How many rows: one for each field, gone or not.
     (@count $($a:tt)*) => { <[()]>::len(&[$($crate::typed!(@unit $a)),*]) };
     (@unit $a:tt) => { () };
-    (@body [$(#[$m:meta])* $name:ident] ($fields:expr)
+    (@body [$(#[$m:meta])* $name:ident] ($fields:expr) [$inl:meta]
         [$(($(#[$fm:meta])* $sf:ident : $st:ty))*]
         [$(($rf:ident : $rt:ty))*]
         [$($of:ident)*]
@@ -360,7 +362,6 @@ macro_rules! typed {
             /// It, with the fields it always has, in order; the others
             /// absent. Made by [`new!`](crate::new), which names each.
             #[doc(hidden)]
-            #[inline]
             #[allow(clippy::too_many_arguments)]
             pub fn __new($($rf: $rt),*) -> Self {
                 $name { $($rf,)* $($of: None,)* }
@@ -413,7 +414,10 @@ macro_rules! typed {
                 )* })
             }
 
-            #[inline]
+            // once for each record: a record held in others in the one
+            // place it is read from wherever it is held, the arguments or
+            // the reply of a request where a whole message is read
+            #[$inl]
             #[allow(unused_variables)]
             fn read_fields(
                 w: &mut $crate::typed::Walk,
@@ -654,6 +658,7 @@ macro_rules! asks {
     };
     // How a client asks for one list page after page.
     (@pages $args:ident $reply:ident $list:ident) => {
+        const ONE_PAGE: &'static [&'static str] = &["after", "limit"];
         #[inline]
         fn one_page(&self) -> bool {
             self.after.is_some() || self.limit.is_some()
@@ -737,6 +742,7 @@ macro_rules! asks {
                 }
             }
         }
+        const ONE_PAGE: &'static [&'static str] = &["after", "limit"];
         #[inline]
         fn one_page(&self) -> bool {
             self.after.is_some() || self.limit.is_some()
@@ -794,6 +800,7 @@ macro_rules! asks {
                 Err(super::typed::Unpaged(msg)) => msg,
             }
         }
+        const ONE_PAGE: &'static [&'static str] = &["before", "limit"];
         #[inline]
         fn one_page(&self) -> bool {
             self.before.is_some() || self.limit.is_some()
@@ -4370,7 +4377,7 @@ macro_rules! streams {
                         _ => None,
                     })
                 })
-                .map_err(Into::into)
+                .map_err(super::typed::Unreadable)
             }
 
             /// The same, the way through the encoding's tree: what
