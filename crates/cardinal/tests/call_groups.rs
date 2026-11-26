@@ -1676,7 +1676,11 @@ fn a_group_joined_on_another_device_while_its_call_rings_rings_on() {
         assert_eq!(state(&cy), "ringing", "{} / {}", call(&cy), ended(&cy));
         std::thread::sleep(Duration::from_millis(250));
     }
-    assert!(call(&cy).get("joins").is_none_or(|j| j != true), "{}", call(&cy));
+    assert!(
+        call(&cy).get("joins").is_none_or(|j| j != true),
+        "{}",
+        call(&cy)
+    );
     ask(&cy, json!({"cmd": "call-answer"}));
     assert_eq!(state(&cy), "live");
     for d in [&ana, &cy, &cy2] {

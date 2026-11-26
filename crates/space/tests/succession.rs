@@ -787,7 +787,12 @@ fn a_successor_reads_the_conversation_its_first_genesis_made() {
     write_as(
         &mut t,
         0,
-        vec![SpaceOp::create(NodeKind::Uint(7), ROOT, "folder", Record::new())],
+        vec![SpaceOp::create(
+            NodeKind::Uint(7),
+            ROOT,
+            "folder",
+            Record::new(),
+        )],
     );
     let folder = {
         let st = t.spaces[0].state();
