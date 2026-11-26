@@ -21,9 +21,12 @@ use cardinal_link::{CarrierKind, Priority, SecretEntry, Service, Session, Stream
 use cardinal_space::account::{self, ContactRecord, Regard};
 use cardinal_space::{relationship, NodeId, Space, SpaceId, SpaceOp};
 use cardinal_sync::identity_log_label;
+#[cfg(any(test, debug_assertions, feature = "by-name"))]
 use serde_json::{json, Value as Json};
 use tokio::io::AsyncWriteExt;
 
+use crate::api::table::{Attachment, ContactReply, Message, MessagesReply, Reaction};
+use crate::api::Ref;
 use crate::core::{now_ms, short, Core};
 use crate::daemon::{Daemon, PeerKind};
 use crate::net::Access;
@@ -61,9 +64,11 @@ pub fn invite(
     address: Option<&str>,
     name: Option<&str>,
     regard: Regard,
-) -> anyhow::Result<Json> {
+) -> anyhow::Result<crate::api::InviteReply> {
     let invitation = invite_for(d, address, name, regard, None, None)?;
-    Ok(json!({"code": invitation.to_text()}))
+    Ok(crate::api::InviteReply {
+        code: invitation.to_text(),
+    })
 }
 
 /// Makes an invitation, for one identity alone if `for_identity` is given,
@@ -213,29 +218,55 @@ pub fn answered_here(d: &Daemon) -> Vec<[u8; 16]> {
         .collect()
 }
 
-/// The invitations this person made, as a window shows them.
-pub fn invitations(d: &Daemon) -> Json {
-    let all: Vec<Json> = made(d)
+/// The invitations this person made, on any device, as a window shows them.
+pub fn invitations(d: &Daemon) -> crate::api::InvitationsReply {
+    let invitations = made(d)
         .iter()
-        .map(|m| {
-            json!({
-                "id": hex::encode(m.record.node),
-                "name": m.invitation.name,
-                "made": m.at,
-                "used": m.record.used,
-                "uses": m.invitation.uses,
-                "hosts_only": !m.record.regard.trusted,
-                "outstanding": m.outstanding(),
-                "cancelled": m.record.cancelled,
-                "expired": m.expired(),
-            })
+        .map(|m| crate::api::Invitation {
+            cancelled: m.record.cancelled,
+            expired: m.expired(),
+            hosts_only: !m.record.regard.trusted,
+            id: m.record.node,
+            made: m.at,
+            name: m.invitation.name.clone(),
+            outstanding: m.outstanding(),
+            used: m.record.used as u64,
+            uses: m.invitation.uses,
         })
         .collect();
-    json!({"invitations": all})
+    crate::api::InvitationsReply {
+        invitations,
+        // the page says
+        more: false,
+        next: None,
+    }
 }
 
 /// Cancels an invitation on every device of this person.
-pub fn cancel_invitation(d: &Arc<Daemon>, id: &str) -> anyhow::Result<Json> {
+pub fn cancel_invitation(d: &Arc<Daemon>, id: Ref<'_>) -> anyhow::Result<crate::api::Done> {
+    // an id whole, in hex as text, as `invitations` gives it
+    let node = match id {
+        Ref::Typed(t) => hex::decode(t).ok(),
+        Ref::Id(given) => given.bytes().map(|b| b.into_owned()),
+    };
+    let node = node.and_then(|b| <[u8; 16]>::try_from(b.as_slice()).ok());
+    let node = node.ok_or_else(|| anyhow::anyhow!("that is not an invitation"))?;
+    anyhow::ensure!(
+        made(d).iter().any(|m| m.record.node == node),
+        "there is no such invitation"
+    );
+    let account = d
+        .core()
+        .account_id()
+        .ok_or_else(|| anyhow::anyhow!("the account space is not here yet"))?;
+    d.write_and_push(&account, vec![account::cancel_invitation(node)])?;
+    admit_invitations(d);
+    Ok(crate::api::Done {})
+}
+
+/// [`cancel_invitation`] as main had it, by name.
+#[cfg(any(test, debug_assertions, feature = "by-name"))]
+pub fn cancel_invitation_by_name(d: &Arc<Daemon>, id: &str) -> anyhow::Result<Json> {
     let node = hex::decode(crate::api::id_hex(id)).ok();
     let node = node.and_then(|b| <[u8; 16]>::try_from(b.as_slice()).ok());
     let node = node.ok_or_else(|| anyhow::anyhow!("that is not an invitation"))?;
@@ -423,7 +454,7 @@ pub async fn accept(
     regard: Regard,
     met: account::Met,
     recovery: bool,
-) -> anyhow::Result<Json> {
+) -> anyhow::Result<crate::api::AcceptReply> {
     accept_for(d, code, name, regard, met, recovery, None).await
 }
 
@@ -438,7 +469,7 @@ pub async fn accept_for(
     met: account::Met,
     recovery: bool,
     whom: Option<[u8; 32]>,
-) -> anyhow::Result<Json> {
+) -> anyhow::Result<crate::api::AcceptReply> {
     let mut invitation = Invitation::from_text(code.trim())
         .map_err(|_| anyhow::anyhow!("that is not an invitation"))?;
     if invitation.recovery_of == Some(crate::recovering::ANYONE) {
@@ -534,10 +565,10 @@ pub async fn accept_for(
         s.abandon();
     }
     done?;
-    Ok(json!({
-        "name": petname,
-        "recovery_of": invitation.recovery_of.map(hex::encode),
-    }))
+    Ok(crate::api::AcceptReply {
+        name: petname,
+        recovery_of: invitation.recovery_of,
+    })
 }
 
 async fn accept_exchange(
@@ -770,8 +801,169 @@ fn record_contact(
 /// that as part of refusing, on this device, and nowhere else afterwards
 /// (`hosts.md#telling-others-where-to-reach-you`): `group-reach` with
 /// `share` false stops it in a group.
-pub fn set(d: &Arc<Daemon>, who: &str, setting: &str) -> anyhow::Result<Json> {
-    let contact = find(d, who)?;
+pub fn set(d: &Arc<Daemon>, who: Ref<'_>, setting: &str) -> anyhow::Result<ContactReply> {
+    let contact = find_ref(d, who)?;
+    let (key, value) = match setting {
+        "trust" => (account::TRUSTED, true),
+        "hosts-only" => (account::TRUSTED, false),
+        "introductions" => (account::INTRODUCTIONS, true),
+        "no-introductions" => (account::INTRODUCTIONS, false),
+        "refuse" => (account::REFUSED, true),
+        "unrefuse" => (account::REFUSED, false),
+        _ => anyhow::bail!("{setting:?} is not a setting"),
+    };
+    let account = d
+        .core()
+        .account_id()
+        .ok_or_else(|| anyhow::anyhow!("the account space is not here yet"))?;
+    let ops = d
+        .core()
+        .contact_ops(&contact.identity, &[(key, Some(value.into()))]);
+    d.write_and_push(&account, ops)?;
+    d.peers_changed();
+    let mut reply = ContactReply::new();
+    if setting == "refuse" {
+        reply.reach = Some(crate::groups::naming_hosts_shown(
+            &d.core(),
+            &contact.identity,
+        ));
+    }
+    Ok(reply)
+}
+
+/// The person says, in their relationship with a contact, whether the
+/// contact may have where their hosts are: `name-hosts` names each host
+/// of theirs (a host that cannot be reached now is named once it can),
+/// and `no-hosts` empties the list. Nothing else writes a yes where the
+/// list is empty, so this is how a list emptied before is filled.
+pub async fn name_hosts(
+    d: &Arc<Daemon>,
+    who: Ref<'_>,
+    share: bool,
+) -> anyhow::Result<ContactReply> {
+    let contact = find_ref(d, who)?;
+    // An old oddity, kept to the byte (DEVIATIONS.md, Old oddities kept):
+    // an id given as bytes is named as the way by name held it, NUL first.
+    anyhow::ensure!(!contact.refused, "you have refused {}", held(who));
+    let named = if !share {
+        mailbox::say_reach(d, &contact.space, false).await?;
+        "none"
+    } else {
+        match mailbox::share_reach(d, &contact.space).await? {
+            mailbox::Shared::Named => "named",
+            mailbox::Shared::NoHost => "no host",
+            mailbox::Shared::Waiting => "waiting",
+        }
+    };
+    let mut reply = ContactReply::new();
+    reply.named = Some(named.into());
+    Ok(reply)
+}
+
+/// The person takes one host of theirs out of the relationship with a
+/// contact (`no-host`, D75): the account records "not this host here",
+/// so it does not name itself there again until they say `name-hosts`.
+pub async fn no_host(d: &Arc<Daemon>, who: Ref<'_>, host: &str) -> anyhow::Result<ContactReply> {
+    let contact = find_ref(d, who)?;
+    let key = mailbox::host_by_name(d, host)?;
+    let named = mailbox::take_out_host(d, &contact.space, &key).await?;
+    let mut reply = ContactReply::new();
+    reply.named = Some(if named { "taken out" } else { "not named" }.into());
+    Ok(reply)
+}
+
+/// Changes what this person calls a contact. Only their own devices hear of
+/// it, and the contact is told nothing. An empty name clears the petname:
+/// the contact is then shown by the name they suggest, as theirs.
+pub fn rename(d: &Arc<Daemon>, who: Ref<'_>, name: &str) -> anyhow::Result<ContactReply> {
+    let contact = find_ref(d, who)?;
+    let name = name.trim();
+    if name.is_empty() {
+        let account = d
+            .core()
+            .account_id()
+            .ok_or_else(|| anyhow::anyhow!("the account space is not here yet"))?;
+        // Empty, not absent: a release before this one reads a contact
+        // without a petname as no contact at all.
+        let ops = d
+            .core()
+            .contact_ops(&contact.identity, &[(account::PETNAME, Some("".into()))]);
+        d.write_and_push(&account, ops)?;
+        let c = find_ref(d, Ref::Typed(&hex::encode(&contact.identity[..8])))?;
+        let mut reply = ContactReply::new();
+        reply.name = Some(c.petname.clone());
+        reply.own = Some(c.own);
+        reply.suggested = c.suggested.clone();
+        reply.picture = crate::names::picture(d, &c);
+        return Ok(reply);
+    }
+    anyhow::ensure!(!name.contains('\n'), "a name is one line");
+    // Two people with one name could be told apart only by their ids.
+    let taken =
+        d.core().contacts().into_iter().any(|c| {
+            c.identity != contact.identity && c.petname.to_lowercase() == name.to_lowercase()
+        });
+    anyhow::ensure!(!taken, "you already call someone else {name:?}");
+    let account = d
+        .core()
+        .account_id()
+        .ok_or_else(|| anyhow::anyhow!("the account space is not here yet"))?;
+    let ops = d
+        .core()
+        .contact_ops(&contact.identity, &[(account::PETNAME, Some(name.into()))]);
+    d.write_and_push(&account, ops)?;
+    let mut reply = ContactReply::new();
+    reply.name = Some(name.to_owned());
+    Ok(reply)
+}
+
+/// Lists a contact under another category, such as `Family`, which is the
+/// folder their shared folder appears in.
+pub fn set_category(d: &Arc<Daemon>, who: Ref<'_>, category: &str) -> anyhow::Result<ContactReply> {
+    let contact = find_ref(d, who)?;
+    let category = category.trim();
+    anyhow::ensure!(!category.is_empty(), "a category cannot be empty");
+    anyhow::ensure!(
+        !category.contains('/') && category != "." && category != "..",
+        "a category is a folder's name, so it cannot be {category:?}"
+    );
+    let account = d
+        .core()
+        .account_id()
+        .ok_or_else(|| anyhow::anyhow!("the account space is not here yet"))?;
+    let ops = d.core().contact_ops(
+        &contact.identity,
+        &[(account::CATEGORY, Some(category.into()))],
+    );
+    d.write_and_push(&account, ops)?;
+    let mut reply = ContactReply::new();
+    reply.category = Some(category.to_owned());
+    Ok(reply)
+}
+
+/// A `ref` as the way by name held it: text as typed, an id given as
+/// bytes NUL first and in hex. Only for words kept to the byte
+/// (DEVIATIONS.md, Old oddities kept).
+pub(crate) fn held(who: Ref<'_>) -> String {
+    match who {
+        Ref::Id(id) => format!("{}{}", crate::api::EXACT, id.hex()),
+        Ref::Typed(t) => t.to_owned(),
+    }
+}
+
+/// Changes how this person regards a contact. Only their own devices hear of
+/// it, and the contact is told nothing.
+///
+/// Refusing someone answers with `reach`: the groups they are in where
+/// this person's reach node names their hosts, each with its `name` and
+/// `what` they can see there. They still read it, and software asks about
+/// that as part of refusing, on this device, and nowhere else afterwards
+/// (`hosts.md#telling-others-where-to-reach-you`): `group-reach` with
+/// `share` false stops it in a group.
+#[cfg(any(test, debug_assertions, feature = "by-name"))]
+#[allow(dead_code, clippy::all)]
+pub fn set_by_name(d: &Arc<Daemon>, who: &str, setting: &str) -> anyhow::Result<Json> {
+    let contact = find_by_name(d, who)?;
     let (key, value) = match setting {
         "trust" => (account::TRUSTED, true),
         "hosts-only" => (account::TRUSTED, false),
@@ -791,7 +983,7 @@ pub fn set(d: &Arc<Daemon>, who: &str, setting: &str) -> anyhow::Result<Json> {
     d.write_and_push(&account, ops)?;
     d.peers_changed();
     if setting == "refuse" {
-        let reach = crate::groups::naming_hosts_to(&d.core(), &contact.identity);
+        let reach = crate::groups::naming_hosts_to_by_name(&d.core(), &contact.identity);
         return Ok(json!({"reach": reach}));
     }
     Ok(json!({}))
@@ -802,8 +994,10 @@ pub fn set(d: &Arc<Daemon>, who: &str, setting: &str) -> anyhow::Result<Json> {
 /// of theirs (a host that cannot be reached now is named once it can),
 /// and `no-hosts` empties the list. Nothing else writes a yes where the
 /// list is empty, so this is how a list emptied before is filled.
-pub async fn name_hosts(d: &Arc<Daemon>, who: &str, share: bool) -> anyhow::Result<Json> {
-    let contact = find(d, who)?;
+#[cfg(any(test, debug_assertions, feature = "by-name"))]
+#[allow(dead_code, clippy::all)]
+pub async fn name_hosts_by_name(d: &Arc<Daemon>, who: &str, share: bool) -> anyhow::Result<Json> {
+    let contact = find_by_name(d, who)?;
     anyhow::ensure!(!contact.refused, "you have refused {who}");
     if !share {
         mailbox::say_reach(d, &contact.space, false).await?;
@@ -820,8 +1014,10 @@ pub async fn name_hosts(d: &Arc<Daemon>, who: &str, share: bool) -> anyhow::Resu
 /// The person takes one host of theirs out of the relationship with a
 /// contact (`no-host`, D75): the account records "not this host here",
 /// so it does not name itself there again until they say `name-hosts`.
-pub async fn no_host(d: &Arc<Daemon>, who: &str, host: &str) -> anyhow::Result<Json> {
-    let contact = find(d, who)?;
+#[cfg(any(test, debug_assertions, feature = "by-name"))]
+#[allow(dead_code, clippy::all)]
+pub async fn no_host_by_name(d: &Arc<Daemon>, who: &str, host: &str) -> anyhow::Result<Json> {
+    let contact = find_by_name(d, who)?;
     let key = mailbox::host_by_name(d, host)?;
     let named = mailbox::take_out_host(d, &contact.space, &key).await?;
     Ok(json!({"named": if named { "taken out" } else { "not named" }}))
@@ -830,8 +1026,10 @@ pub async fn no_host(d: &Arc<Daemon>, who: &str, host: &str) -> anyhow::Result<J
 /// Changes what this person calls a contact. Only their own devices hear of
 /// it, and the contact is told nothing. An empty name clears the petname:
 /// the contact is then shown by the name they suggest, as theirs.
-pub fn rename(d: &Arc<Daemon>, who: &str, name: &str) -> anyhow::Result<Json> {
-    let contact = find(d, who)?;
+#[cfg(any(test, debug_assertions, feature = "by-name"))]
+#[allow(dead_code, clippy::all)]
+pub fn rename_by_name(d: &Arc<Daemon>, who: &str, name: &str) -> anyhow::Result<Json> {
+    let contact = find_by_name(d, who)?;
     let name = name.trim();
     if name.is_empty() {
         let account = d
@@ -844,8 +1042,8 @@ pub fn rename(d: &Arc<Daemon>, who: &str, name: &str) -> anyhow::Result<Json> {
             .core()
             .contact_ops(&contact.identity, &[(account::PETNAME, Some("".into()))]);
         d.write_and_push(&account, ops)?;
-        let c = find(d, &hex::encode(&contact.identity[..8]))?;
-        return Ok(Json::Object(crate::names::shown(d, &c)));
+        let c = find_by_name(d, &hex::encode(&contact.identity[..8]))?;
+        return Ok(Json::Object(crate::names::shown_by_name(d, &c)));
     }
     anyhow::ensure!(!name.contains('\n'), "a name is one line");
     // Two people with one name could be told apart only by their ids.
@@ -867,8 +1065,10 @@ pub fn rename(d: &Arc<Daemon>, who: &str, name: &str) -> anyhow::Result<Json> {
 
 /// Lists a contact under another category, such as `Family`, which is the
 /// folder their shared folder appears in.
-pub fn set_category(d: &Arc<Daemon>, who: &str, category: &str) -> anyhow::Result<Json> {
-    let contact = find(d, who)?;
+#[cfg(any(test, debug_assertions, feature = "by-name"))]
+#[allow(dead_code, clippy::all)]
+pub fn set_category_by_name(d: &Arc<Daemon>, who: &str, category: &str) -> anyhow::Result<Json> {
+    let contact = find_by_name(d, who)?;
     let category = category.trim();
     anyhow::ensure!(!category.is_empty(), "a category cannot be empty");
     anyhow::ensure!(
@@ -904,8 +1104,9 @@ async fn receive(st: &mut Stream) -> anyhow::Result<Option<ContactMessage>> {
         .map_err(|_| anyhow::anyhow!("not a contact message"))
 }
 
-/// This person's contacts, and with `all` those they have refused.
-pub fn list(d: &Daemon, all: bool) -> Json {
+/// This person's contacts, as a window shows them; with `all`, those they
+/// refused too.
+pub fn list(d: &Daemon, all: bool) -> crate::api::ContactsReply {
     let connected = d.connected_people();
     let relayed = d.relayed_people();
     let near: HashSet<[u8; 32]> = connected.iter().copied().filter(|w| nearby(d, w)).collect();
@@ -921,33 +1122,41 @@ pub fn list(d: &Daemon, all: bool) -> Json {
             })
             .collect()
     };
-    let contacts: Vec<Json> = everyone
+    let contacts = everyone
         .iter()
         // a recovery's relationship is no contact (`guardians.rs`)
         .filter(|c| c.recovery_of.is_none())
         .filter(|c| all || !c.refused)
         .map(|c| {
             let recovered = recovered_note(d, &c.identity, &c.petname);
-            let v = json!({
-                "recovered": recovered.as_ref().map(|r| r.text.clone()),
-                "recovered_seen": recovered.as_ref().and_then(|r| r.seen),
-                "recovered_new_guardians": recovered.as_ref().map(|r| r.new_guardians),
-                "recovered_delay": recovered.as_ref().map(|r| r.delay),
-                "met": c.met.as_ref().map(|m| met_json(m, &everyone, &group_names)),
-                "identity": hex::encode(&c.identity[..8]),
-                "trusted": c.regard.trusted,
-                "introductions": c.regard.introductions,
-                "refused": c.refused,
-                "category": c.category,
-                "connected": connected.contains(&c.identity),
-                "relayed": relayed.contains(&c.identity),
-                "nearby": near.contains(&c.identity),
-                "unreadable": unreadable(d, c),
-            });
-            crate::names::with_shown(d, c, v)
+            crate::api::Contact {
+                recovered_seen: recovered.as_ref().and_then(|r| r.seen),
+                recovered_new_guardians: recovered.as_ref().map(|r| r.new_guardians),
+                recovered_delay: recovered.as_ref().map(|r| r.delay),
+                recovered: recovered.map(|r| r.text),
+                met: c.met.as_ref().map(|m| met_of(m, &everyone, &group_names)),
+                identity: crate::api::short_id(&c.identity),
+                trusted: c.regard.trusted,
+                introductions: c.regard.introductions,
+                refused: c.refused,
+                category: c.category.clone(),
+                connected: connected.contains(&c.identity),
+                relayed: relayed.contains(&c.identity),
+                nearby: near.contains(&c.identity),
+                unreadable: unreadable(d, c),
+                name: c.petname.clone(),
+                own: c.own,
+                suggested: c.suggested.clone(),
+                picture: crate::names::picture(d, c),
+            }
         })
         .collect();
-    json!({"contacts": contacts})
+    crate::api::ContactsReply {
+        contacts,
+        // the page says
+        more: false,
+        next: None,
+    }
 }
 
 /// What is said of the first of a contact's devices that sent what this
@@ -961,8 +1170,8 @@ fn unreadable(d: &Daemon, c: &ContactRecord) -> Option<String> {
     };
     let name = format!("One of {}'s devices", c.petname);
     keys.iter()
-        .find_map(|k| d.unreadable.json(k, &name))
-        .and_then(|v| v["says"].as_str().map(str::to_owned))
+        .find_map(|k| d.unreadable.of(k, &name))
+        .map(|u| u.says)
 }
 
 /// What a contact's software says of someone recovered by guardians
@@ -1119,7 +1328,11 @@ fn day_text(ms: u64) -> String {
 }
 
 /// How two people met, as a window shows it.
-fn met_json(m: &account::Met, contacts: &[ContactRecord], groups: &[(SpaceId, String)]) -> Json {
+fn met_of(
+    m: &account::Met,
+    contacts: &[ContactRecord],
+    groups: &[(SpaceId, String)],
+) -> crate::api::Met {
     let how = match m.how {
         account::MET_THEIR_INVITATION => "their invitation",
         account::MET_MY_INVITATION => "your invitation",
@@ -1136,26 +1349,36 @@ fn met_json(m: &account::Met, contacts: &[ContactRecord], groups: &[(SpaceId, St
             .find(|(id, _)| *id == g)
             .map(|(_, n)| n.clone())
     });
-    json!({"how": how, "by": by, "group": group, "via": m.via})
+    crate::api::Met {
+        by,
+        group,
+        how: how.into(),
+        via: m.via.clone(),
+    }
 }
 
 /// The contact `who` names: typed, by what this person calls them or the
 /// id `contacts` gives them; as bytes, by that id or their identity whole,
 /// and never by a name.
 pub(crate) fn find(d: &Daemon, who: &str) -> anyhow::Result<ContactRecord> {
-    let asked = crate::api::reference(who);
-    let w = who.to_lowercase();
+    find_ref(d, crate::api::reference(who))
+}
+
+/// [`find`], by a `ref` as it came.
+pub(crate) fn find_ref(d: &Daemon, asked: Ref<'_>) -> anyhow::Result<ContactRecord> {
+    let w = match asked {
+        Ref::Typed(t) => t.to_lowercase(),
+        Ref::Id(_) => String::new(),
+    };
     let mut contacts = d.core().contacts();
     // a recovery's relationship is no contact (`guardians.rs`)
     contacts.retain(|c| c.recovery_of.is_none());
     let named = |c: &ContactRecord| match asked {
-        crate::api::Ref::Id(_) => asked.is_id(&c.identity),
-        crate::api::Ref::Typed(_) => {
-            c.petname.to_lowercase() == w || hex::encode(&c.identity[..8]) == w
-        }
+        Ref::Id(_) => asked.is_id(&c.identity),
+        Ref::Typed(_) => c.petname.to_lowercase() == w || hex::encode(&c.identity[..8]) == w,
     };
     let mut found = contacts.into_iter().filter(named);
-    let who = crate::api::shown(who);
+    let who = asked.to_string();
     let contact = found
         .next()
         .ok_or_else(|| anyhow::anyhow!("no contact called {who:?}"))?;
@@ -1179,15 +1402,29 @@ pub(crate) fn listed(d: &Daemon, who: &str) -> anyhow::Result<ContactRecord> {
     Ok(contact)
 }
 
+/// [`listed`], by a `ref` as it came.
+pub(crate) fn listed_ref(d: &Daemon, who: Ref<'_>) -> anyhow::Result<ContactRecord> {
+    let contact = find_ref(d, who)?;
+    // An old oddity, kept to the byte (DEVIATIONS.md, Old oddities kept):
+    // an id given as bytes is named as the way by name held it, NUL first.
+    let held = match who {
+        Ref::Id(id) => format!("{}{}", crate::api::EXACT, id.hex()),
+        Ref::Typed(t) => t.to_owned(),
+    };
+    anyhow::ensure!(!contact.refused, "you have refused {held}");
+    d.rendezvous.use_contact(&contact.identity);
+    Ok(contact)
+}
+
 /// Writes a message to a contact.
 pub async fn say(
     d: &Arc<Daemon>,
-    who: &str,
+    who: Ref<'_>,
     text: &str,
-    reply_to: Option<&str>,
+    reply_to: Option<Ref<'_>>,
     attach: &[String],
-) -> anyhow::Result<Json> {
-    let contact = listed(d, who)?;
+) -> anyhow::Result<crate::api::SayReply> {
+    let contact = listed_ref(d, who)?;
     let to = match reply_to {
         Some(id) => Some(message_in(d, &contact, id)?.id),
         None => None,
@@ -1211,7 +1448,9 @@ pub async fn say(
     ops.extend(relationship::shared_files(&attachments, Some(now_ms())));
     d.write_and_push(&space, ops)?;
     confirm(d, space, contact.identity);
-    Ok(json!({"reachable": reachable(d, &contact, text) && attachments.is_empty()}))
+    Ok(crate::api::SayReply {
+        reachable: Some(reachable(d, &contact, text) && attachments.is_empty()),
+    })
 }
 
 /// What kind of file a name says it is, by its ending.
@@ -1308,17 +1547,18 @@ pub(crate) fn write_out<S: cardinal_blob::ObjectStore, F: cardinal_blob::Fetch>(
 /// unless all of it arrived.
 pub async fn save_attachment(
     d: &Arc<Daemon>,
-    who: &str,
-    id: &str,
+    who: Ref<'_>,
+    id: Ref<'_>,
     index: usize,
     to: &str,
-) -> anyhow::Result<Json> {
-    let contact = listed(d, who)?;
+) -> anyhow::Result<crate::api::SaveReply> {
+    let contact = listed_ref(d, who)?;
     let m = message_in(d, &contact, id)?;
     let a = m.attachments.get(index);
     let a = a.ok_or_else(|| anyhow::anyhow!("that message has no such attachment"))?;
     let blob = BlobRef::from_record(&a.blob)
         .map_err(|_| anyhow::anyhow!("that attachment cannot be read"))?;
+    let shown = to.to_owned();
     let to = std::path::PathBuf::from(to);
     let (d, them) = (d.clone(), contact.identity);
     let written = to.clone();
@@ -1328,7 +1568,7 @@ pub async fn save_attachment(
         write_new(&written, |out| write_out(&mut reader, out))
     })
     .await??;
-    Ok(json!({"path": to, "size": size}))
+    Ok(crate::api::SaveReply { path: shown, size })
 }
 
 /// Writes a new file at `to` with what `fill` writes. It is written beside,
@@ -1374,15 +1614,23 @@ pub(crate) fn write_new(
     wrote
 }
 
+/// The id of a message a `ref` names: 16 bytes, given as bytes or typed
+/// in hex.
+pub(crate) fn message_id(id: Ref<'_>) -> Option<[u8; 16]> {
+    let b = match id {
+        Ref::Typed(t) => hex::decode(t).ok()?,
+        Ref::Id(given) => given.bytes()?.into_owned(),
+    };
+    b.try_into().ok()
+}
+
 /// A message in the conversation with a contact, by the id `messages` gives.
 fn message_in(
     d: &Daemon,
     contact: &ContactRecord,
-    id: &str,
+    id: Ref<'_>,
 ) -> anyhow::Result<relationship::Message> {
-    let id = hex::decode(crate::api::id_hex(id)).ok();
-    let id = id.and_then(|b| <[u8; 16]>::try_from(b.as_slice()).ok());
-    let id = id.ok_or_else(|| anyhow::anyhow!("that is not a message"))?;
+    let id = message_id(id).ok_or_else(|| anyhow::anyhow!("that is not a message"))?;
     let core = d.core();
     let open = core
         .spaces
@@ -1398,10 +1646,10 @@ fn message_in(
 /// can be changed or taken back, which the space itself holds to as well.
 fn own_message(
     d: &Daemon,
-    who: &str,
-    id: &str,
+    who: Ref<'_>,
+    id: Ref<'_>,
 ) -> anyhow::Result<(ContactRecord, relationship::Message)> {
-    let contact = listed(d, who)?;
+    let contact = listed_ref(d, who)?;
     let m = message_in(d, &contact, id)?;
     anyhow::ensure!(
         Some(m.author) == d.core().identity.as_ref().map(|i| i.id()),
@@ -1411,22 +1659,22 @@ fn own_message(
 }
 
 /// Changes what a message of this person's says.
-pub fn edit_message(d: &Arc<Daemon>, who: &str, id: &str, text: &str) -> anyhow::Result<Json> {
+pub fn edit_message(d: &Arc<Daemon>, who: Ref<'_>, id: Ref<'_>, text: &str) -> anyhow::Result<()> {
     let (contact, m) = own_message(d, who, id)?;
     anyhow::ensure!(!text.trim().is_empty(), "a message cannot be empty");
     let op = relationship::edit_message(m.id, text);
     d.write_and_push(&contact.space, vec![op])?;
     confirm(d, contact.space, contact.identity);
-    Ok(json!({}))
+    Ok(())
 }
 
 /// Takes back a message of this person's. The other person may have read it
 /// already, and the space's history keeps it.
-pub fn delete_message(d: &Arc<Daemon>, who: &str, id: &str) -> anyhow::Result<Json> {
+pub fn delete_message(d: &Arc<Daemon>, who: Ref<'_>, id: Ref<'_>) -> anyhow::Result<()> {
     let (contact, m) = own_message(d, who, id)?;
     d.write_and_push(&contact.space, vec![SpaceOp::delete(m.id)])?;
     confirm(d, contact.space, contact.identity);
-    Ok(json!({}))
+    Ok(())
 }
 
 /// The longest reaction: an emoji, or a few of them.
@@ -1434,8 +1682,8 @@ const MAX_REACTION: usize = 16;
 
 /// Reacts to a message, replacing this person's reaction, or taking it away
 /// with nothing.
-pub fn react(d: &Arc<Daemon>, who: &str, id: &str, text: &str) -> anyhow::Result<Json> {
-    let contact = listed(d, who)?;
+pub fn react(d: &Arc<Daemon>, who: Ref<'_>, id: Ref<'_>, text: &str) -> anyhow::Result<()> {
+    let contact = listed_ref(d, who)?;
     let m = message_in(d, &contact, id)?;
     let text = text.trim();
     anyhow::ensure!(
@@ -1463,16 +1711,16 @@ pub fn react(d: &Arc<Daemon>, who: &str, id: &str, text: &str) -> anyhow::Result
         (None, false) => ops.push(relationship::create_reaction(m.id, text)),
     }
     if ops.is_empty() {
-        return Ok(json!({}));
+        return Ok(());
     }
     d.write_and_push(&contact.space, ops)?;
     confirm(d, contact.space, contact.identity);
-    Ok(json!({}))
+    Ok(())
 }
 
 /// Reactions as a window shows them: each one once, with how many gave it
 /// and whether this person did.
-pub(crate) fn reactions_of(m: &relationship::Message, me: Option<[u8; 32]>) -> Vec<Json> {
+pub(crate) fn reactions_of(m: &relationship::Message, me: Option<[u8; 32]>) -> Vec<Reaction> {
     // One for each person, the last they gave, however many they wrote, and
     // no longer than this software lets anyone make one.
     let mut theirs: Vec<&relationship::Reaction> = Vec::new();
@@ -1496,7 +1744,11 @@ pub(crate) fn reactions_of(m: &relationship::Message, me: Option<[u8; 32]>) -> V
     }
     shown
         .into_iter()
-        .map(|(text, count, mine)| json!({"text": text, "count": count, "mine": mine}))
+        .map(|(text, count, mine)| Reaction {
+            text,
+            count: count as u64,
+            mine,
+        })
         .collect()
 }
 
@@ -1553,33 +1805,51 @@ fn state_of(read: bool, waiting: bool) -> &'static str {
 pub(crate) fn upto(
     sp: &Space,
     all: &[relationship::Message],
-    before: Option<&str>,
+    before: Option<Ref<'_>>,
 ) -> anyhow::Result<usize> {
-    let Some(b) = before.map(str::trim) else {
+    let Some(b) = before else {
         return Ok(all.len());
     };
-    let given = matches!(crate::api::reference(b), crate::api::Ref::Id(_));
-    let b = crate::api::id_hex(b);
-    let id: Option<NodeId> = hex::decode(b).ok().and_then(|v| v.try_into().ok());
-    let id = id.or_else(|| {
-        if given {
-            return None;
+    // An old oddity, kept to the byte (DEVIATIONS.md, Old oddities kept):
+    // text that is NUL and an id's hex once trimmed is taken as that id
+    // given as bytes, as the way by name trimmed before it told them apart.
+    let b = match b {
+        Ref::Typed(t) => match t.trim().strip_prefix(crate::api::EXACT) {
+            Some(h) => Ref::Id(crate::api::IdGiven::Hex(h)),
+            None => b,
+        },
+        b => b,
+    };
+    let id: Option<NodeId> = match b {
+        Ref::Id(given) => given.bytes().and_then(|v| <[u8; 16]>::try_from(&*v).ok()),
+        Ref::Typed(t) => {
+            let t = t.trim();
+            let whole: Option<NodeId> = hex::decode(t).ok().and_then(|v| v.try_into().ok());
+            whole.or_else(|| {
+                let mut shown = all.iter().filter(|m| hex::encode(m.id).starts_with(t));
+                match (shown.next(), shown.next()) {
+                    (Some(m), None) if !t.is_empty() => Some(m.id),
+                    _ => None,
+                }
+            })
         }
-        let mut shown = all.iter().filter(|m| hex::encode(m.id).starts_with(b));
-        match (shown.next(), shown.next()) {
-            (Some(m), None) if !b.is_empty() => Some(m.id),
-            _ => None,
-        }
-    });
+    };
     let place = id.and_then(|id| relationship::message_place(sp, &id));
-    let place = place.ok_or_else(|| anyhow::anyhow!("there is no message {b} here"))?;
+    let place = place.ok_or_else(|| match b {
+        Ref::Typed(t) => anyhow::anyhow!("there is no message {} here", t.trim()),
+        Ref::Id(_) => anyhow::anyhow!("there is no message {b} here"),
+    })?;
     Ok(relationship::before_place(sp, all, &place))
 }
 
 /// The conversation with a contact, oldest first: those before `before`,
-/// if it names one.
-pub fn messages(d: &Daemon, who: &str, before: Option<&str>) -> anyhow::Result<Json> {
-    let contact = listed(d, who)?;
+/// if it names one. All of them: the request's page is cut from it.
+pub fn messages(
+    d: &Daemon,
+    who: Ref<'_>,
+    before: Option<Ref<'_>>,
+) -> anyhow::Result<MessagesReply> {
+    let contact = listed_ref(d, who)?;
     let (space, them) = (contact.space, contact.identity);
     let here = mailbox::written_here(d, &space);
     let unsent = d.mailbox.not_sent(&space, &them, here);
@@ -1590,30 +1860,49 @@ pub fn messages(d: &Daemon, who: &str, before: Option<&str>) -> anyhow::Result<J
     let all = relationship::messages(open);
     let read = relationship::read_by(open, &them, &all);
     let upto = upto(open, &all, before)?;
-    let said: Vec<Json> = all
-        .iter()
+    let messages: Vec<Message> = all
+        .into_iter()
         .zip(read)
         .take(upto)
         .map(|(m, read)| {
             let mine = Some(m.author) == me;
-            json!({
-                "id": hex::encode(m.id),
-                "mine": mine,
-                "text": m.text,
-                "time": m.time,
-                "state": mine.then(|| state_of(read, unsent.contains(&m.entry))),
-                "reply_to": m.reply_to.map(hex::encode),
-                "attachments": m.attachments.iter().map(|a| json!({
-                    "name": a.name,
-                    "type": a.media_type,
-                    "size": BlobRef::from_record(&a.blob).map(|b| b.size).ok(),
-                })).collect::<Vec<_>>(),
-                "edited": m.edited,
-                "reactions": reactions_of(m, me),
-            })
+            let state = mine.then(|| state_of(read, unsent.contains(&m.entry)).into());
+            Message {
+                id: m.id,
+                mine,
+                state,
+                reply_to: m.reply_to,
+                attachments: attachments_of(&m),
+                edited: m.edited,
+                reactions: reactions_of(&m, me),
+                text: m.text,
+                time: m.time,
+                from: None,
+                picture: None,
+                read_by: None,
+            }
         })
         .collect();
-    Ok(json!({"messages": said}))
+    Ok(MessagesReply {
+        messages,
+        group: None,
+        name: None,
+        // the page says
+        more: false,
+        next: None,
+    })
+}
+
+/// The files that came with a message, as a conversation shows them.
+pub(crate) fn attachments_of(m: &relationship::Message) -> Vec<Attachment> {
+    m.attachments
+        .iter()
+        .map(|a| Attachment {
+            name: a.name.clone(),
+            r#type: a.media_type.clone(),
+            size: BlobRef::from_record(&a.blob).map(|b| b.size).ok(),
+        })
+        .collect()
 }
 
 /// Whether one of a contact's devices is nearby: a direct session with it
@@ -1626,10 +1915,8 @@ pub(crate) fn nearby(d: &Daemon, who: &[u8; 32]) -> bool {
     })
 }
 
-/// What a relationship's reach node says of this person's hosts, shaped as
-/// a group's `reach`: `shared`, `waiting`, `said_no`, and `named`, the
-/// hosts it names by the device names `no-host` takes.
-fn reach_summary(core: &Core, space: &SpaceId) -> Json {
+/// What this person's reach node says in a relationship.
+fn reach_summary(core: &Core, space: &SpaceId) -> crate::api::ContactReach {
     let t = core.telling(space);
     let names = core.device_names();
     let hosts = core.mailboxes();
@@ -1650,24 +1937,24 @@ fn reach_summary(core: &Core, space: &SpaceId) -> Json {
             }
         })
         .collect();
-    json!({
-        "shared": t.shared,
-        "waiting": t.waiting,
-        "said_no": t.said_no,
-        "named": named,
-    })
+    crate::api::ContactReach {
+        shared: t.shared,
+        waiting: t.waiting,
+        said_no: t.said_no,
+        named,
+    }
 }
 
 /// Everyone this person talks to, the most recent first: what they last said
 /// and how many messages from them are not yet read here.
-pub fn conversations(d: &Daemon) -> Json {
+pub fn conversations(d: &Daemon) -> crate::api::ConversationsReply {
     let connected = d.connected_people();
     let relayed = d.relayed_people();
     let near: HashSet<[u8; 32]> = connected.iter().copied().filter(|w| nearby(d, w)).collect();
     let core = d.core();
     let me = core.identity.as_ref().map(|i| i.id());
     let contacts = core.contacts();
-    let mut found: Vec<(Option<u64>, Json)> = contacts
+    let mut found: Vec<(Option<u64>, crate::api::Conversation)> = contacts
         .iter()
         .filter(|c| !c.refused && c.recovery_of.is_none())
         .map(|c| {
@@ -1679,34 +1966,43 @@ pub fn conversations(d: &Daemon) -> Json {
             let last = said.last();
             // The author's own clock: it may not pin them to the top.
             let when = last.and_then(|m| m.time).map(|t| t.min(now_ms()));
-            let conversation = json!({
-                "id": hex::encode(&c.identity[..8]),
-                "trusted": c.regard.trusted,
-                "introductions": c.regard.introductions,
-                "connected": connected.contains(&c.identity),
-                "relayed": relayed.contains(&c.identity),
-                "nearby": near.contains(&c.identity),
-                "reach": reach_summary(&core, &c.space),
-                "unread": unread.count(),
-                "last": last.map(|m| json!({
-                    "mine": Some(m.author) == me,
-                    "text": m.text,
-                    "time": m.time,
-                })),
-            });
-            (when, crate::names::with_shown(d, c, conversation))
+            let conversation = crate::api::Conversation {
+                id: crate::api::short_id(&c.identity),
+                trusted: c.regard.trusted,
+                introductions: c.regard.introductions,
+                connected: connected.contains(&c.identity),
+                relayed: relayed.contains(&c.identity),
+                nearby: near.contains(&c.identity),
+                reach: reach_summary(&core, &c.space),
+                unread: unread.count() as u64,
+                last: last.map(|m| crate::api::Last {
+                    from: None,
+                    mine: Some(m.author) == me,
+                    text: m.text.clone(),
+                    time: m.time,
+                }),
+                name: c.petname.clone(),
+                own: c.own,
+                suggested: c.suggested.clone(),
+                picture: crate::names::picture(d, c),
+            };
+            (when, conversation)
         })
         .collect();
     found.sort_by_key(|(when, _)| std::cmp::Reverse(*when));
-    let conversations: Vec<Json> = found.into_iter().map(|(_, c)| c).collect();
-    json!({"conversations": conversations})
+    crate::api::ConversationsReply {
+        conversations: found.into_iter().map(|(_, c)| c).collect(),
+        // the page says
+        more: false,
+        next: None,
+    }
 }
 
 /// Marks a conversation read up to its last message from the contact. Their
 /// devices see the marker too (`profiles.md#relationship`), unless read
 /// markers are off.
-pub fn mark_read(d: &Arc<Daemon>, who: &str) -> anyhow::Result<Json> {
-    let contact = listed(d, who)?;
+pub fn mark_read(d: &Arc<Daemon>, who: Ref<'_>) -> anyhow::Result<crate::api::MarkReadReply> {
+    let contact = listed_ref(d, who)?;
     mark_read_in(d, &contact.space, &contact.petname)
 }
 
@@ -1715,7 +2011,11 @@ pub fn mark_read(d: &Arc<Daemon>, who: &str) -> anyhow::Result<Json> {
 /// every member sees; off, it moves the position the account keeps,
 /// which only their own devices see. Answers `marked` (a marker moved)
 /// and `kept` (the private position moved).
-pub(crate) fn mark_read_in(d: &Arc<Daemon>, space: &SpaceId, name: &str) -> anyhow::Result<Json> {
+pub(crate) fn mark_read_in(
+    d: &Arc<Daemon>,
+    space: &SpaceId,
+    name: &str,
+) -> anyhow::Result<crate::api::MarkReadReply> {
     let me = identity(d)?;
     let markers = crate::settings::read_markers_on(&d.core());
     let (op, account) = {
@@ -1754,13 +2054,13 @@ pub(crate) fn mark_read_in(d: &Arc<Daemon>, space: &SpaceId, name: &str) -> anyh
         d.write_and_push(&target, ops)?;
     }
     if account {
-        return Ok(json!({
-            "marked": false,
-            "kept": moved,
-            "why": "read markers are off: others do not see what you have read",
-        }));
+        return Ok(crate::api::MarkReadReply {
+            kept: moved,
+            marked: false,
+            why: Some("read markers are off: others do not see what you have read".into()),
+        });
     }
-    Ok(json!({"marked": moved, "kept": false}))
+    Ok(crate::api::MarkReadReply::new(false, moved))
 }
 
 /// A length of time in words, to the largest unit that matters.
@@ -1801,6 +2101,232 @@ fn local_only(a: &SocketAddr) -> bool {
     }
 }
 
+/// What a reach node names, as this device sees it: each host, whose
+/// device it is where it is theirs, and each address and whether it was
+/// tried.
+fn reach_seen(
+    d: &Daemon,
+    reach: &[relationship::Reach],
+    theirs: &[([u8; 32], [u8; 32])],
+) -> Vec<crate::api::ReachSeen> {
+    let me = *d.keys.link.public_key().x25519();
+    reach
+        .iter()
+        .map(|r| {
+            let device = theirs
+                .iter()
+                .find(|(x, _)| *x == r.host)
+                .map(|(_, k)| crate::api::short_id(k));
+            let endpoints = r
+                .endpoints
+                .iter()
+                .map(|e| {
+                    let why = not_tried(e);
+                    let local = e.socket_addr().is_some_and(|a| local_only(&a));
+                    crate::api::EndpointSeen {
+                        endpoint: e.to_string(),
+                        tried: why.is_none(),
+                        why_not: why.map(Into::into),
+                        local,
+                    }
+                })
+                .collect();
+            crate::api::ReachSeen {
+                host: crate::api::short_id(&r.host),
+                device,
+                this_device: r.host == me,
+                session: d.session_kind(&r.host).is_some(),
+                endpoints,
+            }
+        })
+        .collect()
+}
+
+fn step(s: &crate::rendezvous::Step) -> crate::api::Step {
+    crate::api::Step {
+        at: s.at,
+        ok: s.ok,
+        text: s.text.clone(),
+    }
+}
+
+/// Everything this device knows of reaching one contact, as
+/// `contact-status` gives it: their devices and the sessions with them,
+/// what their reach node says and what became of each address, how they
+/// were last looked for, and what this person's own reach node tells them.
+/// With `look`, looks for them first; with `at`, tries them there first.
+/// `held` is `who` as an error names it.
+pub async fn reaching(
+    d: &Arc<Daemon>,
+    who: Ref<'_>,
+    held: &str,
+    look: bool,
+    at: Option<SocketAddr>,
+) -> anyhow::Result<crate::api::ContactStatusReply> {
+    let c = find_ref(d, who)?;
+    if let Some(addr) = at {
+        // the ref as it was held by name: an id given as bytes, NUL first
+        anyhow::ensure!(
+            c.connects(),
+            "you do not trust {held}, so your devices do not connect to theirs"
+        );
+        crate::rendezvous::try_at(d, c.identity, addr).await;
+    } else if look && c.connects() {
+        crate::rendezvous::reach_now(d, c.identity, c.space).await;
+    }
+    let (theirs, reach, mine, name_of, nearby) = {
+        let core = d.core();
+        let theirs: Vec<([u8; 32], [u8; 32])> = core
+            .others
+            .get(&c.identity)
+            .map(|o| {
+                let st = o.log.state();
+                st.keys
+                    .values()
+                    .filter_map(|k| Some((*k.link_key.as_ref()?.x25519(), k.key)))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let reach = core.reach_of(&c.space, &c.identity);
+        let mine = core
+            .me()
+            .map(|me| core.reach_of(&c.space, &me))
+            .unwrap_or_default();
+        // Whether each gave the other a presence secret here (D74).
+        let sp = core.spaces.get(&c.space).and_then(|h| h.space.as_ref());
+        let gives = |who: &[u8; 32]| {
+            sp.is_some_and(|sp| !relationship::presence_of(sp.state(), who).is_empty())
+        };
+        let nearby = crate::api::Nearby {
+            they_give_secret: gives(&c.identity),
+            you_give_secret: core.me().is_some_and(|me| gives(&me)),
+        };
+        (theirs, reach, mine, core.device_names(), nearby)
+    };
+    let label = |x: &[u8; 32]| -> String {
+        if let Some(k) = d.core().is_own_device(x) {
+            return format!(
+                "your {}",
+                name_of
+                    .get(&k)
+                    .cloned()
+                    .unwrap_or_else(|| account::short_key(&k))
+            );
+        }
+        if reach.iter().any(|r| r.host == *x) {
+            return "their host".into();
+        }
+        short(x)
+    };
+    let standing: HashSet<[u8; 32]> = crate::rendezvous::standing(d)
+        .into_iter()
+        .map(|(k, _)| k)
+        .collect();
+    let their_device = d.unreadable_name(&PeerKind::Contact(c.identity, [0; 32]));
+    let devices = theirs
+        .iter()
+        .map(|(x, k)| {
+            let unreadable = d.unreadable.of(k, &their_device);
+            let off = crate::api::SessionDevice {
+                addr: None,
+                bytes_received: None,
+                bytes_sent: None,
+                carrier: None,
+                heard_ms_ago: None,
+                kept_in_touch: standing.contains(k),
+                key: crate::api::short_id(k),
+                online: false,
+                open_for_s: None,
+                opened_by: None,
+                packets_dropped: None,
+                packets_lost: None,
+                route: None,
+                rtt_ms: None,
+                they_see_you_at: None,
+                through: None,
+                unreadable,
+                kept_alive_s: None,
+                path: d.known.shown(k),
+                neighbour: d.neighbours.is(k),
+            };
+            let Some((s, open_for)) = d.session_since(x) else {
+                return off;
+            };
+            let st = s.stats();
+            let relayed = s.is_relayed();
+            crate::api::SessionDevice {
+                online: true,
+                route: Some(if relayed { "relay" } else { "direct" }.into()),
+                carrier: d.session_carrier(x).map(Into::into),
+                addr: (!relayed)
+                    .then(|| s.remote_addr())
+                    .flatten()
+                    .map(|a| a.to_string()),
+                through: d.relayed_through(x).map(|h| label(&h)),
+                opened_by: Some(
+                    if s.role() == cardinal_link::Role::Initiator {
+                        "you"
+                    } else {
+                        "them"
+                    }
+                    .into(),
+                ),
+                open_for_s: Some(open_for.as_secs()),
+                heard_ms_ago: Some(crate::control::clock::since(s.last_heard()).as_millis() as u64),
+                rtt_ms: st.srtt.map(|t| t.as_millis() as u64),
+                bytes_sent: Some(st.bytes_sent),
+                bytes_received: Some(st.bytes_received),
+                packets_lost: Some(st.packets_lost),
+                packets_dropped: Some(st.packets_dropped),
+                they_see_you_at: s.observed_addr().map(|a| a.to_string()),
+                kept_alive_s: s.keepalive().map(|t| t.as_secs()),
+                ..off
+            }
+        })
+        .collect();
+    let (looked, looking) = d.rendezvous.looked(&c.identity);
+    let trail = d.rendezvous.trail(&c.identity);
+    let in_use = d.rendezvous.in_use_left(&c.identity);
+    let looked_for = if !c.connects() {
+        "never: you do not trust them, so your devices reach them only through hosts"
+    } else if in_use.is_some() {
+        "while in use, every 30 s, until each of their devices has a session"
+    } else {
+        "now and then at the last address that worked, and every 30 s once you message or call them"
+    };
+    Ok(crate::api::ContactStatusReply {
+        identity: crate::api::short_id(&c.identity),
+        trusted: c.regard.trusted,
+        introductions: c.regard.introductions,
+        refused: c.refused,
+        direct_sessions: c.connects(),
+        devices,
+        their_reach: reach_seen(d, &reach, &theirs),
+        nearby,
+        your_reach: reach_seen(d, &mine, &[]),
+        in_use_for_s: in_use.map(|t| t.as_secs()),
+        looked_for: looked_for.into(),
+        look_every_s: crate::rendezvous::Rendezvous::look_every().as_secs(),
+        looked_s_ago: looked.map(|t| t.as_secs()),
+        looking,
+        looks_without_session: trail.looks,
+        looking_since: trail.looking_since,
+        last_look: trail.look.iter().map(step).collect(),
+        sessions: trail.events.iter().map(step).collect(),
+        nearby_tries: trail.nearby.iter().map(step).collect(),
+        router: crate::portmap::router(d),
+        // who they are, as everywhere, but not their picture: this reply
+        // is about reaching them and has no field for it
+        name: c.petname.clone(),
+        own: c.own,
+        suggested: c.suggested.clone(),
+        // the page says
+        more: false,
+        next: None,
+    })
+}
+
+#[cfg(any(test, debug_assertions, feature = "by-name"))]
 fn reach_json(
     d: &Daemon,
     reach: &[relationship::Reach],
@@ -1839,6 +2365,7 @@ fn reach_json(
         .collect()
 }
 
+#[cfg(any(test, debug_assertions, feature = "by-name"))]
 fn step_json(s: &crate::rendezvous::Step) -> Json {
     json!({"at": s.at, "ok": s.ok, "text": s.text})
 }
@@ -1846,7 +2373,9 @@ fn step_json(s: &crate::rendezvous::Step) -> Json {
 /// Everything this device knows of reaching one contact: their devices and
 /// the sessions with them, what their reach node says and what became of
 /// each address, how they were last looked for, and what this person's own
-/// reach node tells them. With `look`, looks for them first.
+/// reach node tells them. With `look`, looks for them first. As main had
+/// it, by name.
+#[cfg(any(test, debug_assertions, feature = "by-name"))]
 pub async fn status(
     d: &Arc<Daemon>,
     who: &str,
@@ -1938,7 +2467,7 @@ pub async fn status(
                 "through": d.relayed_through(x).map(|h| label(&h)),
                 "opened_by": if s.role() == cardinal_link::Role::Initiator { "you" } else { "them" },
                 "open_for_s": open_for.as_secs(),
-                "heard_ms_ago": s.last_heard().elapsed().as_millis() as u64,
+                "heard_ms_ago": crate::control::clock::since(s.last_heard()).as_millis() as u64,
                 "rtt_ms": st.srtt.map(|t| t.as_millis() as u64),
                 "bytes_sent": st.bytes_sent,
                 "bytes_received": st.bytes_received,
@@ -2052,4 +2581,727 @@ mod tests {
         assert!(made(Some(old), 0, false).expired());
         assert!(!made(Some(old), 0, false).outstanding());
     }
+}
+
+// ---- The handlers as they were by name ----
+//
+// What main had, whole, kept only to show that the typed handlers send the
+// same bytes (`control::typed::answering`, `api/same_bytes.rs`), and to
+// measure the two. They go with the way by name.
+
+/// `list` as main had it, by name.
+#[cfg(any(test, debug_assertions, feature = "by-name"))]
+#[allow(dead_code, clippy::all)]
+pub fn list_by_name(d: &Daemon, all: bool) -> Json {
+    let connected = d.connected_people();
+    let relayed = d.relayed_people();
+    let near: HashSet<[u8; 32]> = connected.iter().copied().filter(|w| nearby(d, w)).collect();
+    let everyone = d.core().contacts();
+    let group_names: Vec<(SpaceId, String)> = {
+        let core = d.core();
+        let spaces = core.spaces.iter();
+        spaces
+            .filter_map(|(id, h)| {
+                let sp = h.space.as_ref()?;
+                (sp.profile() == cardinal_space::group::GROUP)
+                    .then(|| (*id, cardinal_space::group::name(sp)))
+            })
+            .collect()
+    };
+    let contacts: Vec<Json> = everyone
+        .iter()
+        // a recovery's relationship is no contact (`guardians.rs`)
+        .filter(|c| c.recovery_of.is_none())
+        .filter(|c| all || !c.refused)
+        .map(|c| {
+            let recovered = recovered_note(d, &c.identity, &c.petname);
+            let v = json!({
+                "recovered": recovered.as_ref().map(|r| r.text.clone()),
+                "recovered_seen": recovered.as_ref().and_then(|r| r.seen),
+                "recovered_new_guardians": recovered.as_ref().map(|r| r.new_guardians),
+                "recovered_delay": recovered.as_ref().map(|r| r.delay),
+                "met": c.met.as_ref().map(|m| met_json_by_name(m, &everyone, &group_names)),
+                "identity": hex::encode(&c.identity[..8]),
+                "trusted": c.regard.trusted,
+                "introductions": c.regard.introductions,
+                "refused": c.refused,
+                "category": c.category,
+                "connected": connected.contains(&c.identity),
+                "relayed": relayed.contains(&c.identity),
+                "nearby": near.contains(&c.identity),
+                "unreadable": unreadable_by_name(d, c),
+            });
+            {
+                let mut v = v;
+                if let Some(o) = v.as_object_mut() {
+                    o.extend(crate::names::shown_by_name(d, c));
+                }
+                v
+            }
+        })
+        .collect();
+    json!({"contacts": contacts})
+}
+
+/// `unreadable` as main had it, by name.
+#[cfg(any(test, debug_assertions, feature = "by-name"))]
+#[allow(dead_code, clippy::all)]
+fn unreadable_by_name(d: &Daemon, c: &ContactRecord) -> Option<String> {
+    let keys: Vec<[u8; 32]> = {
+        let core = d.core();
+        let o = core.others.get(&c.identity)?;
+        let st = o.log.state();
+        st.keys.values().map(|k| k.key).collect()
+    };
+    let name = format!("One of {}'s devices", c.petname);
+    keys.iter()
+        .find_map(|k| d.unreadable.json(k, &name))
+        .and_then(|v| v["says"].as_str().map(str::to_owned))
+}
+
+/// `met_json` as main had it, by name.
+#[cfg(any(test, debug_assertions, feature = "by-name"))]
+#[allow(dead_code, clippy::all)]
+fn met_json_by_name(
+    m: &account::Met,
+    contacts: &[ContactRecord],
+    groups: &[(SpaceId, String)],
+) -> Json {
+    let how = match m.how {
+        account::MET_THEIR_INVITATION => "their invitation",
+        account::MET_MY_INVITATION => "your invitation",
+        account::MET_INTRODUCED => "introduced",
+        _ => "their front door",
+    };
+    let by = m.introducer.map(|i| {
+        let c = contacts.iter().find(|c| c.identity == i);
+        c.map_or_else(|| account::short_key(&i), |c| c.petname.clone())
+    });
+    let group = m.group.and_then(|g| {
+        groups
+            .iter()
+            .find(|(id, _)| *id == g)
+            .map(|(_, n)| n.clone())
+    });
+    json!({"how": how, "by": by, "group": group, "via": m.via})
+}
+
+/// `reach_summary` as main had it, by name.
+#[cfg(any(test, debug_assertions, feature = "by-name"))]
+#[allow(dead_code, clippy::all)]
+fn reach_summary_by_name(core: &Core, space: &SpaceId) -> Json {
+    let t = core.telling(space);
+    let names = core.device_names();
+    let hosts = core.mailboxes();
+    let named: Vec<String> = core
+        .me()
+        .map(|me| core.reach_of(space, &me))
+        .unwrap_or_default()
+        .iter()
+        .map(|r| {
+            let device = hosts.iter().find(|(g, _)| *g.link_key.x25519() == r.host);
+            match device {
+                Some((_, key)) => names
+                    .get(key)
+                    .cloned()
+                    .filter(|n| !n.is_empty())
+                    .unwrap_or_else(|| account::short_key(key)),
+                None => hex::encode(&r.host[..4]),
+            }
+        })
+        .collect();
+    json!({
+        "shared": t.shared,
+        "waiting": t.waiting,
+        "said_no": t.said_no,
+        "named": named,
+    })
+}
+
+/// `conversations` as main had it, by name.
+#[cfg(any(test, debug_assertions, feature = "by-name"))]
+#[allow(dead_code, clippy::all)]
+pub fn conversations_by_name(d: &Daemon) -> Json {
+    let connected = d.connected_people();
+    let relayed = d.relayed_people();
+    let near: HashSet<[u8; 32]> = connected.iter().copied().filter(|w| nearby(d, w)).collect();
+    let core = d.core();
+    let me = core.identity.as_ref().map(|i| i.id());
+    let contacts = core.contacts();
+    let mut found: Vec<(Option<u64>, Json)> = contacts
+        .iter()
+        .filter(|c| !c.refused && c.recovery_of.is_none())
+        .map(|c| {
+            let open = core.spaces.get(&c.space).and_then(|h| h.space.as_ref());
+            let said = open.map(relationship::messages).unwrap_or_default();
+            let read = core.read_here(&c.space, &said);
+            let both = said.iter().zip(read);
+            let unread = both.filter(|(m, read)| Some(m.author) != me && !read);
+            let last = said.last();
+            // The author's own clock: it may not pin them to the top.
+            let when = last.and_then(|m| m.time).map(|t| t.min(now_ms()));
+            let conversation = json!({
+                "id": hex::encode(&c.identity[..8]),
+                "trusted": c.regard.trusted,
+                "introductions": c.regard.introductions,
+                "connected": connected.contains(&c.identity),
+                "relayed": relayed.contains(&c.identity),
+                "nearby": near.contains(&c.identity),
+                "reach": reach_summary_by_name(&core, &c.space),
+                "unread": unread.count(),
+                "last": last.map(|m| json!({
+                    "mine": Some(m.author) == me,
+                    "text": m.text,
+                    "time": m.time,
+                })),
+            });
+            (when, {
+                let mut v = conversation;
+                if let Some(o) = v.as_object_mut() {
+                    o.extend(crate::names::shown_by_name(d, c));
+                }
+                v
+            })
+        })
+        .collect();
+    found.sort_by_key(|(when, _)| std::cmp::Reverse(*when));
+    let conversations: Vec<Json> = found.into_iter().map(|(_, c)| c).collect();
+    json!({"conversations": conversations})
+}
+
+/// `invite` as main had it, by name.
+#[cfg(any(test, debug_assertions, feature = "by-name"))]
+#[allow(dead_code, clippy::all)]
+pub fn invite_by_name(
+    d: &Arc<Daemon>,
+    address: Option<&str>,
+    name: Option<&str>,
+    regard: Regard,
+) -> anyhow::Result<Json> {
+    let invitation = invite_for(d, address, name, regard, None, None)?;
+    Ok(json!({"code": invitation.to_text()}))
+}
+
+/// `accept` as main had it, by name.
+#[cfg(any(test, debug_assertions, feature = "by-name"))]
+#[allow(dead_code, clippy::all)]
+pub async fn accept_by_name(
+    d: &Arc<Daemon>,
+    code: &str,
+    name: Option<&str>,
+    regard: Regard,
+    met: account::Met,
+    recovery: bool,
+) -> anyhow::Result<Json> {
+    accept_for_by_name(d, code, name, regard, met, recovery, None).await
+}
+
+/// `accept_for` as main had it, by name.
+#[cfg(any(test, debug_assertions, feature = "by-name"))]
+#[allow(dead_code, clippy::all)]
+pub async fn accept_for_by_name(
+    d: &Arc<Daemon>,
+    code: &str,
+    name: Option<&str>,
+    regard: Regard,
+    met: account::Met,
+    recovery: bool,
+    whom: Option<[u8; 32]>,
+) -> anyhow::Result<Json> {
+    let mut invitation = Invitation::from_text(code.trim())
+        .map_err(|_| anyhow::anyhow!("that is not an invitation"))?;
+    if invitation.recovery_of == Some(crate::recovering::ANYONE) {
+        let whom = whom.ok_or_else(|| {
+            anyhow::Error::new(NeedsFor(
+                "That invitation is to help someone recover their identity: say whom, of \
+                 those you guard"
+                    .to_owned(),
+            ))
+        })?;
+        invitation.recovery_of = Some(whom);
+    }
+    let me = identity(d)?;
+    anyhow::ensure!(
+        invitation.recovery_of.is_none() || recovery,
+        "that is an invitation to help someone recover their identity; only you, using it \
+         yourself, can take it up. Nothing was sent."
+    );
+    // Neither side of a recovery's relationship is the person recovered.
+    anyhow::ensure!(
+        invitation.recovery_of != Some(invitation.inviter) && invitation.recovery_of != Some(me),
+        "that recovery invitation names its own maker or you; nothing was sent"
+    );
+    // A recovery invitation is answered only by a guardian of whoever it
+    // names, or by a recovery helper; anyone else's device tells its
+    // person so and sends nothing back (`identity.md#how-guardians-act`).
+    // A guardian answers through their persona for that person (D79),
+    // whose service takes it up from here.
+    let inside = d.config().this_run.inside();
+    match invitation.recovery_of {
+        Some(p) if !inside => {
+            crate::guardians::may_answer(d, &p)?;
+            return crate::guardians::accept_recovery_by_name(d, code, &p).await;
+        }
+        None if inside => anyhow::bail!("that is not a recovery invitation"),
+        _ => {}
+    }
+    // A helper and a guardian trust each other for the recovery's sake.
+    let regard = match invitation.recovery_of {
+        Some(_) => Regard {
+            trusted: true,
+            introductions: false,
+        },
+        None => regard,
+    };
+    anyhow::ensure!(invitation.inviter != me, "that invitation is your own");
+    anyhow::ensure!(
+        !is_refused(d, &invitation.inviter),
+        "you have refused whoever made that invitation"
+    );
+    anyhow::ensure!(
+        !is_contact(d, &invitation.inviter),
+        "you already know whoever made that invitation"
+    );
+    let dialled = match invitation.endpoint.socket_addr() {
+        Some(addr) => d
+            .dial(|c| Target::invitation(addr, c, invitation.responder_static, &invitation.secret))
+            .await
+            .map_err(|e| anyhow::anyhow!("could not reach them at {addr} ({e})")),
+        None => Err(anyhow::anyhow!(
+            "that invitation has no address this version can use"
+        )),
+    };
+    // Nobody at the address: they may be in Bluetooth range, advertising
+    // the tag the invitation's secret makes (`carriers/ble.md`).
+    let s = match dialled {
+        Ok(s) => s,
+        Err(e) => match crate::bluetooth::find_invitation(d, &invitation).await {
+            Some(Ok(s)) => s,
+            Some(Err(b)) => anyhow::bail!("{e:#}, nor over Bluetooth ({b:#})"),
+            None if crate::bluetooth::mode(d) != crate::bluetooth::Mode::Off
+                && d.bluetooth.is_on() =>
+            {
+                anyhow::bail!("{e:#}, nor anyone nearby over Bluetooth")
+            }
+            None => return Err(e),
+        },
+    };
+    d.on_session(s.clone());
+    let petname = match invitation.recovery_of {
+        Some(p) if !inside => crate::guardians::helper_petname(d, &p),
+        _ => name
+            .map(str::to_owned)
+            .or(invitation.name.clone())
+            .unwrap_or_else(|| account::short_key(&invitation.inviter)),
+    };
+    let exchange = accept_exchange(d, &s, me, &invitation, &petname, regard, &met);
+    let done = tokio::time::timeout(EXCHANGE_WITHIN, exchange)
+        .await
+        .map_err(|_| anyhow::anyhow!("they stopped answering"))
+        .and_then(|done| done);
+    if done.is_err() {
+        s.abandon();
+    }
+    done?;
+    Ok(json!({
+        "name": petname,
+        "recovery_of": invitation.recovery_of.map(hex::encode),
+    }))
+}
+
+/// `find` as main had it, by name.
+#[cfg(any(test, debug_assertions, feature = "by-name"))]
+#[allow(dead_code, clippy::all)]
+pub(crate) fn find_by_name(d: &Daemon, who: &str) -> anyhow::Result<ContactRecord> {
+    let asked = crate::api::reference(who);
+    let w = who.to_lowercase();
+    let mut contacts = d.core().contacts();
+    // a recovery's relationship is no contact (`guardians.rs`)
+    contacts.retain(|c| c.recovery_of.is_none());
+    let named = |c: &ContactRecord| match asked {
+        crate::api::Ref::Id(_) => asked.is_id(&c.identity),
+        crate::api::Ref::Typed(_) => {
+            c.petname.to_lowercase() == w || hex::encode(&c.identity[..8]) == w
+        }
+    };
+    let mut found = contacts.into_iter().filter(named);
+    let who = crate::api::shown(who);
+    let contact = found
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("no contact called {who:?}"))?;
+    // A name is what someone suggested, and it may be a name already here.
+    // Two nodes for one identity, made at once on two devices, are one
+    // contact.
+    anyhow::ensure!(
+        found.all(|c| c.identity == contact.identity),
+        "more than one contact is called {who:?}: give their id instead"
+    );
+    Ok(contact)
+}
+
+/// `listed` as main had it, by name.
+#[cfg(any(test, debug_assertions, feature = "by-name"))]
+#[allow(dead_code, clippy::all)]
+pub(crate) fn listed_by_name(d: &Daemon, who: &str) -> anyhow::Result<ContactRecord> {
+    let contact = find_by_name(d, who)?;
+    anyhow::ensure!(!contact.refused, "you have refused {who}");
+    d.rendezvous.use_contact(&contact.identity);
+    Ok(contact)
+}
+
+/// `reactions_of` as main had it, by name.
+#[cfg(any(test, debug_assertions, feature = "by-name"))]
+#[allow(dead_code, clippy::all)]
+pub(crate) fn reactions_of_by_name(m: &relationship::Message, me: Option<[u8; 32]>) -> Vec<Json> {
+    // One for each person, the last they gave, however many they wrote, and
+    // no longer than this software lets anyone make one.
+    let mut theirs: Vec<&relationship::Reaction> = Vec::new();
+    for r in &m.reactions {
+        match theirs.iter_mut().find(|x| x.author == r.author) {
+            Some(x) => *x = r,
+            None => theirs.push(r),
+        }
+    }
+    let mut shown: Vec<(String, usize, bool)> = Vec::new();
+    for r in theirs {
+        let mine = Some(r.author) == me;
+        let text: String = r.text.chars().take(MAX_REACTION).collect();
+        match shown.iter_mut().find(|(t, ..)| *t == text) {
+            Some((_, n, m)) => {
+                *n += 1;
+                *m |= mine;
+            }
+            None => shown.push((text, 1, mine)),
+        }
+    }
+    shown
+        .into_iter()
+        .map(|(text, count, mine)| json!({"text": text, "count": count, "mine": mine}))
+        .collect()
+}
+
+/// `upto` as main had it, by name.
+#[cfg(any(test, debug_assertions, feature = "by-name"))]
+#[allow(dead_code, clippy::all)]
+pub(crate) fn upto_by_name(
+    sp: &Space,
+    all: &[relationship::Message],
+    before: Option<&str>,
+) -> anyhow::Result<usize> {
+    let Some(b) = before.map(str::trim) else {
+        return Ok(all.len());
+    };
+    let given = matches!(crate::api::reference(b), crate::api::Ref::Id(_));
+    let b = crate::api::id_hex(b);
+    let id: Option<NodeId> = hex::decode(b).ok().and_then(|v| v.try_into().ok());
+    let id = id.or_else(|| {
+        if given {
+            return None;
+        }
+        let mut shown = all.iter().filter(|m| hex::encode(m.id).starts_with(b));
+        match (shown.next(), shown.next()) {
+            (Some(m), None) if !b.is_empty() => Some(m.id),
+            _ => None,
+        }
+    });
+    let place = id.and_then(|id| relationship::message_place(sp, &id));
+    let place = place.ok_or_else(|| anyhow::anyhow!("there is no message {b} here"))?;
+    Ok(relationship::before_place(sp, all, &place))
+}
+
+/// `messages` as main had it, by name.
+#[cfg(any(test, debug_assertions, feature = "by-name"))]
+#[allow(dead_code, clippy::all)]
+pub fn messages_by_name(d: &Daemon, who: &str, before: Option<&str>) -> anyhow::Result<Json> {
+    let contact = listed_by_name(d, who)?;
+    let (space, them) = (contact.space, contact.identity);
+    let here = mailbox::written_here(d, &space);
+    let unsent = d.mailbox.not_sent(&space, &them, here);
+    let core = d.core();
+    let me = core.identity.as_ref().map(|i| i.id());
+    let open = core.spaces.get(&space).and_then(|h| h.space.as_ref());
+    let open = open.ok_or_else(|| anyhow::anyhow!("that space is not open yet"))?;
+    let all = relationship::messages(open);
+    let read = relationship::read_by(open, &them, &all);
+    let upto = upto_by_name(open, &all, before)?;
+    let said: Vec<Json> = all
+        .iter()
+        .zip(read)
+        .take(upto)
+        .map(|(m, read)| {
+            let mine = Some(m.author) == me;
+            json!({
+                "id": hex::encode(m.id),
+                "mine": mine,
+                "text": m.text,
+                "time": m.time,
+                "state": mine.then(|| state_of(read, unsent.contains(&m.entry))),
+                "reply_to": m.reply_to.map(hex::encode),
+                "attachments": m.attachments.iter().map(|a| json!({
+                    "name": a.name,
+                    "type": a.media_type,
+                    "size": BlobRef::from_record(&a.blob).map(|b| b.size).ok(),
+                })).collect::<Vec<_>>(),
+                "edited": m.edited,
+                "reactions": reactions_of_by_name(m, me),
+            })
+        })
+        .collect();
+    Ok(json!({"messages": said}))
+}
+
+/// `say` as main had it, by name.
+#[cfg(any(test, debug_assertions, feature = "by-name"))]
+#[allow(dead_code, clippy::all)]
+pub async fn say_by_name(
+    d: &Arc<Daemon>,
+    who: &str,
+    text: &str,
+    reply_to: Option<&str>,
+    attach: &[String],
+) -> anyhow::Result<Json> {
+    let contact = listed_by_name(d, who)?;
+    let to = match reply_to {
+        Some(id) => Some(message_in_by_name(d, &contact, id)?.id),
+        None => None,
+    };
+    let attachments = encode_attachments(d, &contact.space, attach).await?;
+    let space = contact.space;
+    let conversation = {
+        let core = d.core();
+        core.spaces
+            .get(&space)
+            .and_then(|h| h.space.as_ref())
+            .and_then(relationship::conversation)
+    };
+    let conversation = conversation.ok_or_else(|| anyhow::anyhow!("that space is not open yet"))?;
+    let mut ops = vec![relationship::create_with(
+        conversation,
+        text,
+        to,
+        &attachments,
+    )];
+    ops.extend(relationship::shared_files(&attachments, Some(now_ms())));
+    d.write_and_push(&space, ops)?;
+    confirm(d, space, contact.identity);
+    Ok(json!({"reachable": reachable(d, &contact, text) && attachments.is_empty()}))
+}
+
+/// `save_attachment` as main had it, by name.
+#[cfg(any(test, debug_assertions, feature = "by-name"))]
+#[allow(dead_code, clippy::all)]
+pub async fn save_attachment_by_name(
+    d: &Arc<Daemon>,
+    who: &str,
+    id: &str,
+    index: usize,
+    to: &str,
+) -> anyhow::Result<Json> {
+    let contact = listed_by_name(d, who)?;
+    let m = message_in_by_name(d, &contact, id)?;
+    let a = m.attachments.get(index);
+    let a = a.ok_or_else(|| anyhow::anyhow!("that message has no such attachment"))?;
+    let blob = BlobRef::from_record(&a.blob)
+        .map_err(|_| anyhow::anyhow!("that attachment cannot be read"))?;
+    let to = std::path::PathBuf::from(to);
+    let (d, them) = (d.clone(), contact.identity);
+    let written = to.clone();
+    let size = tokio::task::spawn_blocking(move || -> anyhow::Result<u64> {
+        let fetch = crate::fetch::Fetcher::from_contact(&d, Priority::Interactive, them);
+        let mut reader = BlobReader::new(&*d.store, &fetch, blob);
+        write_new(&written, |out| write_out(&mut reader, out))
+    })
+    .await??;
+    Ok(json!({"path": to, "size": size}))
+}
+
+/// `message_in` as main had it, by name.
+#[cfg(any(test, debug_assertions, feature = "by-name"))]
+#[allow(dead_code, clippy::all)]
+fn message_in_by_name(
+    d: &Daemon,
+    contact: &ContactRecord,
+    id: &str,
+) -> anyhow::Result<relationship::Message> {
+    let id = hex::decode(crate::api::id_hex(id)).ok();
+    let id = id.and_then(|b| <[u8; 16]>::try_from(b.as_slice()).ok());
+    let id = id.ok_or_else(|| anyhow::anyhow!("that is not a message"))?;
+    let core = d.core();
+    let open = core
+        .spaces
+        .get(&contact.space)
+        .and_then(|h| h.space.as_ref());
+    let open = open.ok_or_else(|| anyhow::anyhow!("that space is not open yet"))?;
+    let all = relationship::messages(open);
+    let found = all.into_iter().find(|m| m.id == id);
+    found.ok_or_else(|| anyhow::anyhow!("there is no such message"))
+}
+
+/// `own_message` as main had it, by name.
+#[cfg(any(test, debug_assertions, feature = "by-name"))]
+#[allow(dead_code, clippy::all)]
+fn own_message_by_name(
+    d: &Daemon,
+    who: &str,
+    id: &str,
+) -> anyhow::Result<(ContactRecord, relationship::Message)> {
+    let contact = listed_by_name(d, who)?;
+    let m = message_in_by_name(d, &contact, id)?;
+    anyhow::ensure!(
+        Some(m.author) == d.core().identity.as_ref().map(|i| i.id()),
+        "only what you wrote can be changed"
+    );
+    Ok((contact, m))
+}
+
+/// `edit_message` as main had it, by name.
+#[cfg(any(test, debug_assertions, feature = "by-name"))]
+#[allow(dead_code, clippy::all)]
+pub fn edit_message_by_name(
+    d: &Arc<Daemon>,
+    who: &str,
+    id: &str,
+    text: &str,
+) -> anyhow::Result<Json> {
+    let (contact, m) = own_message_by_name(d, who, id)?;
+    anyhow::ensure!(!text.trim().is_empty(), "a message cannot be empty");
+    let op = relationship::edit_message(m.id, text);
+    d.write_and_push(&contact.space, vec![op])?;
+    confirm(d, contact.space, contact.identity);
+    Ok(json!({}))
+}
+
+/// `delete_message` as main had it, by name.
+#[cfg(any(test, debug_assertions, feature = "by-name"))]
+#[allow(dead_code, clippy::all)]
+pub fn delete_message_by_name(d: &Arc<Daemon>, who: &str, id: &str) -> anyhow::Result<Json> {
+    let (contact, m) = own_message_by_name(d, who, id)?;
+    d.write_and_push(&contact.space, vec![SpaceOp::delete(m.id)])?;
+    confirm(d, contact.space, contact.identity);
+    Ok(json!({}))
+}
+
+/// `react` as main had it, by name.
+#[cfg(any(test, debug_assertions, feature = "by-name"))]
+#[allow(dead_code, clippy::all)]
+pub fn react_by_name(d: &Arc<Daemon>, who: &str, id: &str, text: &str) -> anyhow::Result<Json> {
+    let contact = listed_by_name(d, who)?;
+    let m = message_in_by_name(d, &contact, id)?;
+    let text = text.trim();
+    anyhow::ensure!(
+        text.chars().count() <= MAX_REACTION,
+        "that is too long for a reaction"
+    );
+    let me = d.core().identity.as_ref().map(|i| i.id());
+    // The one shown is the last of this person's (`reactions_of`); any
+    // others, from devices apart, go when this one changes.
+    let mine: Vec<&relationship::Reaction> = m
+        .reactions
+        .iter()
+        .filter(|r| Some(r.author) == me)
+        .collect();
+    let mut ops: Vec<SpaceOp> = Vec::new();
+    match (mine.last(), text.is_empty()) {
+        (Some(_), true) => ops.extend(mine.iter().map(|r| SpaceOp::delete(r.id))),
+        (Some(r), false) => {
+            ops.extend(mine[..mine.len() - 1].iter().map(|r| SpaceOp::delete(r.id)));
+            if r.text != text {
+                ops.push(relationship::set_reaction(r.id, text));
+            }
+        }
+        (None, true) => {}
+        (None, false) => ops.push(relationship::create_reaction(m.id, text)),
+    }
+    if ops.is_empty() {
+        return Ok(json!({}));
+    }
+    d.write_and_push(&contact.space, ops)?;
+    confirm(d, contact.space, contact.identity);
+    Ok(json!({}))
+}
+
+/// `mark_read` as main had it, by name.
+#[cfg(any(test, debug_assertions, feature = "by-name"))]
+#[allow(dead_code, clippy::all)]
+pub fn mark_read_by_name(d: &Arc<Daemon>, who: &str) -> anyhow::Result<Json> {
+    let contact = listed_by_name(d, who)?;
+    mark_read_in_by_name(d, &contact.space, &contact.petname)
+}
+
+/// `mark_read_in` as main had it, by name.
+#[cfg(any(test, debug_assertions, feature = "by-name"))]
+#[allow(dead_code, clippy::all)]
+pub(crate) fn mark_read_in_by_name(
+    d: &Arc<Daemon>,
+    space: &SpaceId,
+    name: &str,
+) -> anyhow::Result<Json> {
+    let me = identity(d)?;
+    let markers = crate::settings::read_markers_on(&d.core());
+    let (op, account) = {
+        let core = d.core();
+        let open = core.spaces.get(space).and_then(|h| h.space.as_ref());
+        let open = open.ok_or_else(|| anyhow::anyhow!("that space is not open yet"))?;
+        let all = relationship::messages(open);
+        let read = core.read_here(space, &all);
+        let new = all
+            .iter()
+            .zip(&read)
+            .any(|(m, read)| m.author != me && !read);
+        let theirs = all.iter().rposition(|m| m.author != me);
+        match theirs {
+            Some(at) if new && markers => {
+                let last = all[at].id;
+                let op = match relationship::read_marker(open, &me) {
+                    Some(marker) => Some(relationship::set_read_marker(marker, last)),
+                    None => relationship::conversation(open)
+                        .map(|c| relationship::create_read_marker(c, last)),
+                };
+                (op.map(|op| (*space, vec![op])), false)
+            }
+            Some(at) if new => {
+                let acc = core.account();
+                let st = acc.and_then(|a| Some((a.id, a.space.as_ref()?.state())));
+                let ops =
+                    st.map(|(id, st)| (id, account::read_up_to_ops(st, space, name, &all[at].id)));
+                (ops, true)
+            }
+            _ => (None, !markers),
+        }
+    };
+    let moved = op.is_some();
+    if let Some((target, ops)) = op {
+        d.write_and_push(&target, ops)?;
+    }
+    if account {
+        return Ok(json!({
+            "marked": false,
+            "kept": moved,
+            "why": "read markers are off: others do not see what you have read",
+        }));
+    }
+    Ok(json!({"marked": moved, "kept": false}))
+}
+
+/// `invitations` as main had it, by name.
+#[cfg(any(test, debug_assertions, feature = "by-name"))]
+#[allow(dead_code, clippy::all)]
+pub fn invitations_by_name(d: &Daemon) -> Json {
+    let all: Vec<Json> = made(d)
+        .iter()
+        .map(|m| {
+            json!({
+                "id": hex::encode(m.record.node),
+                "name": m.invitation.name,
+                "made": m.at,
+                "used": m.record.used,
+                "uses": m.invitation.uses,
+                "hosts_only": !m.record.regard.trusted,
+                "outstanding": m.outstanding(),
+                "cancelled": m.record.cancelled,
+                "expired": m.expired(),
+            })
+        })
+        .collect();
+    json!({"invitations": all})
 }

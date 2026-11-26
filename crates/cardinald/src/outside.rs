@@ -515,6 +515,7 @@ fn views(d: &Daemon) -> Vec<View> {
 }
 
 /// For `status`: what this device names itself at.
+#[cfg(any(test, debug_assertions, feature = "by-name"))]
 pub fn status(d: &Daemon) -> serde_json::Value {
     let list = named(d);
     serde_json::json!(list.iter().map(|n| n.addr.to_string()).collect::<Vec<_>>())

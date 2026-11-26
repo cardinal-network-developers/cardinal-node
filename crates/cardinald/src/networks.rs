@@ -24,6 +24,7 @@ use cardinal_encoding::{Record, Value};
 use cardinal_space::account;
 use cardinal_space::entry::{NodeKind, SpaceOp};
 use cardinal_space::ROOT;
+#[cfg(any(test, debug_assertions, feature = "by-name"))]
 use serde_json::{json, Value as Json};
 
 use crate::daemon::Daemon;
@@ -513,6 +514,7 @@ pub fn on_mine(d: &Daemon) -> bool {
 /// its router, whether the person said it is theirs, and whether to ask
 /// them ("Is this your network?"): a network known, not answered for, on
 /// a device that would ask its router.
+#[cfg(any(test, debug_assertions, feature = "by-name"))]
 pub fn status(d: &Daemon) -> Json {
     let on = routers_on(d);
     let Some(r) = router_now() else {
@@ -534,9 +536,74 @@ pub fn status(d: &Daemon) -> Json {
     })
 }
 
+/// [`status`], typed: what the `network` request answers.
+pub fn network(d: &Daemon) -> crate::api::Network {
+    let on = routers_on(d);
+    let Some(r) = router_now() else {
+        return crate::api::Network {
+            answered: None,
+            ask: false,
+            known: false,
+            mine: false,
+            name: None,
+            router: None,
+            routers: on,
+        };
+    };
+    let m = {
+        let core = d.core();
+        let acc = core.account().and_then(|a| a.space.as_ref());
+        acc.map(|a| marked(a.state(), &r)).unwrap_or_default()
+    };
+    crate::api::Network {
+        answered: Some(m.answered),
+        ask: on && !m.answered,
+        known: true,
+        mine: m.mine,
+        name: m.name,
+        router: Some(router_text(&r)),
+        routers: on,
+    }
+}
+
 /// The person answers "Is this your network?" for the one this device is
 /// on now, with what to call it.
-pub fn mark(d: &Arc<Daemon>, mine: bool, name: Option<&str>) -> anyhow::Result<Json> {
+pub fn mark(
+    d: &Arc<Daemon>,
+    mine: bool,
+    name: Option<&str>,
+) -> anyhow::Result<crate::api::Network> {
+    mark_ops_written(d, mine, name)?;
+    Ok(network(d))
+}
+
+/// What [`mark`] writes.
+fn mark_ops_written(d: &Arc<Daemon>, mine: bool, name: Option<&str>) -> anyhow::Result<()> {
+    let r = router_now().ok_or_else(|| {
+        anyhow::anyhow!("this device cannot tell which network it is on: it sees no router")
+    })?;
+    let name = name.map(str::trim).filter(|n| !n.is_empty());
+    let (account, ops) = {
+        let core = d.core();
+        let acc = core
+            .account()
+            .ok_or_else(|| anyhow::anyhow!("the account space is not here yet"))?;
+        let st = acc
+            .space
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("the account space is not open yet"))?
+            .state();
+        (acc.id, mark_ops(st, &r, mine, name))
+    };
+    d.write_and_push(&account, ops)?;
+    changed(d);
+    Ok(())
+}
+
+/// `mark` as main had it, by name: kept only to show the typed one sends
+/// the same bytes. It goes with the way by name.
+#[cfg(any(test, debug_assertions, feature = "by-name"))]
+pub fn mark_by_name(d: &Arc<Daemon>, mine: bool, name: Option<&str>) -> anyhow::Result<Json> {
     let r = router_now().ok_or_else(|| {
         anyhow::anyhow!("this device cannot tell which network it is on: it sees no router")
     })?;

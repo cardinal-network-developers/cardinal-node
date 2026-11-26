@@ -75,6 +75,12 @@ pub(crate) mod testing {
     /// settings for a service on it that listens on a port of its own
     /// and does nothing else by itself: start it with `Daemon::start`.
     pub fn set_up(dir: &std::path::Path) -> (Paths, Config) {
+        let (paths, config, _) = set_up_words(dir);
+        (paths, config)
+    }
+
+    /// [`set_up`], and the device's recovery words.
+    pub fn set_up_words(dir: &std::path::Path) -> (Paths, Config, String) {
         let paths = Paths::at(dir);
         let mut config = Config {
             listen: "127.0.0.1:0".into(),
@@ -84,8 +90,9 @@ pub(crate) mod testing {
         config.this_run.no_discovery = true;
         config.this_run.no_udp = true;
         let p = crate::setup::prepare(&paths).unwrap();
+        let words = p.phrase().to_words().to_string();
         crate::setup::install(&paths, p, &config, "Me").unwrap();
-        (paths, config)
+        (paths, config, words)
     }
 }
 
@@ -259,8 +266,17 @@ pub struct Overrides {
     pub name: Option<String>,
 }
 
-/// Runs the daemon until it is stopped.
-pub async fn run(paths: Paths, o: Overrides) -> anyhow::Result<()> {
+/// Runs the daemon until it is stopped. Through a pointer: polled where
+/// the runtime polls it, its body would be compiled once for each place.
+pub fn run(
+    paths: Paths,
+    o: Overrides,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<()>> + Send>> {
+    Box::pin(running(paths, o))
+}
+
+/// [`run`].
+async fn running(paths: Paths, o: Overrides) -> anyhow::Result<()> {
     // Tests: let a debugger attach to a daemon that hangs (Yama allows only
     // ancestors otherwise).
     #[cfg(target_os = "linux")]

@@ -19,6 +19,7 @@ use cardinal_space::account::{self, ContactRecord, Met, Regard};
 use cardinal_space::group;
 use cardinal_space::relationship::{self, Introduction};
 use cardinal_space::{SpaceId, SpaceOp};
+#[cfg(any(test, debug_assertions, feature = "by-name"))]
 use serde_json::{json, Value as Json};
 
 use crate::api::Ref;
@@ -60,10 +61,15 @@ fn met_through(introducer: [u8; 32], group: Option<SpaceId>) -> Met {
 }
 
 /// Introduces the contact `who` to the contact `to`.
-pub fn introduce(d: &Arc<Daemon>, who: &str, to: &str, note: Option<&str>) -> anyhow::Result<Json> {
+pub fn introduce(
+    d: &Arc<Daemon>,
+    who: Ref<'_>,
+    to: Ref<'_>,
+    note: Option<&str>,
+) -> anyhow::Result<crate::api::Done> {
     let me = identity(d)?;
-    let x = contacts::listed(d, who)?;
-    let b = contacts::listed(d, to)?;
+    let x = contacts::listed_ref(d, who)?;
+    let b = contacts::listed_ref(d, to)?;
     anyhow::ensure!(x.identity != b.identity, "that is one person");
     let all = d.core().contacts();
     for c in [&x, &b] {
@@ -77,28 +83,36 @@ pub fn introduce(d: &Arc<Daemon>, who: &str, to: &str, note: Option<&str>) -> an
     let suggested = x.suggested.as_deref().unwrap_or(&x.petname);
     let op = relationship::create_introduction(&me, &x.identity, suggested, note, None, None);
     d.write_and_push(&b.space, vec![op])?;
-    Ok(json!({}))
+    Ok(crate::api::Done {})
 }
 
 /// Asks to meet a member of a group, through an admin of it who knows both.
 pub fn ask_in_group(
     d: &Arc<Daemon>,
-    group_name: &str,
-    who: &str,
+    asked: Ref<'_>,
+    person: Ref<'_>,
     note: Option<&str>,
-) -> anyhow::Result<Json> {
+) -> anyhow::Result<crate::api::GroupConnectReply> {
     let me = identity(d)?;
+    // An old oddity, kept to the byte (DEVIATIONS.md, Old oddities kept):
+    // past the group's members, the two are named as the way by name held
+    // them, an id given as bytes NUL first.
+    let held = |r: Ref<'_>| match r {
+        Ref::Typed(t) => t.to_owned(),
+        Ref::Id(id) => format!("{}{}", crate::api::EXACT, id.hex()),
+    };
+    let (held_group, held_who) = (held(asked), held(person));
     let (space, them, shown, admins) = {
         let core = d.core();
         let groups = core.spaces.iter().filter_map(|(id, h)| {
             let sp = h.space.as_ref()?;
             (sp.profile() == group::GROUP).then_some((id, sp))
         });
-        // as bytes, the group and the member whose ids they are
-        let (asked, person) = (
-            crate::api::reference(group_name),
-            crate::api::reference(who),
-        );
+        // the group as text, what was typed; as bytes, its id
+        let group_name = match asked {
+            Ref::Typed(g) => g,
+            Ref::Id(_) => "",
+        };
         let found: Vec<_> = groups
             .filter(|(id, sp)| match asked {
                 Ref::Id(_) => asked.is_id(id.as_slice()),
@@ -108,7 +122,8 @@ pub fn ask_in_group(
                 }
             })
             .collect();
-        let (group_name, who) = (crate::api::shown(group_name), crate::api::shown(who));
+        // named as they came: text as typed, an id in hex
+        let (group_name, who) = (asked.to_string(), person.to_string());
         let [(id, sp)] = found.as_slice() else {
             anyhow::bail!("there is no one group {group_name}");
         };
@@ -118,7 +133,7 @@ pub fn ask_in_group(
             .find(|m| {
                 let meant = match person {
                     Ref::Id(_) => person.is_id(&m.identity),
-                    Ref::Typed(_) => m.name.as_deref() == Some(who),
+                    Ref::Typed(_) => m.name.as_deref() == Some(who.as_str()),
                 };
                 meant && m.identity != me
             })
@@ -145,14 +160,14 @@ pub fn ask_in_group(
     };
     anyhow::ensure!(
         !d.core().contacts().iter().any(|c| c.identity == them),
-        "you know {who} already"
+        "you know {held_who} already"
     );
     let contacts = d.core().contacts();
     let admin = contacts
         .iter()
         .find(|c| admins.contains(&c.identity) && introduces(&contacts, c))
         .ok_or_else(|| {
-            anyhow::anyhow!("no admin of {group_name} that you know can introduce you")
+            anyhow::anyhow!("no admin of {held_group} that you know can introduce you")
         })?;
     // Asked already, and not answered: asking again changes nothing.
     let asked = {
@@ -165,12 +180,12 @@ pub fn ask_in_group(
         })
     };
     if asked {
-        return Ok(json!({"asked": true}));
+        return Ok(crate::api::GroupConnectReply { asked: Some(true) });
     }
     let op =
         relationship::create_introduction(&admin.identity, &them, &shown, note, Some(&space), None);
     d.write_and_push(&admin.space, vec![op])?;
-    Ok(json!({}))
+    Ok(crate::api::GroupConnectReply { asked: None })
 }
 
 /// An introduction this person may answer, where it is, and what it is.
@@ -223,36 +238,48 @@ fn group_name(d: &Daemon, g: Option<SpaceId>) -> Option<String> {
 }
 
 /// The introductions waiting for this person, as a window shows them.
-pub fn list(d: &Daemon) -> Json {
-    let all: Vec<Json> = waiting(d)
+pub fn list(d: &Daemon) -> crate::api::IntroductionsReply {
+    let introductions = waiting(d)
         .into_iter()
-        .map(|w| {
-            json!({
-                "id": hex::encode(w.intro.node),
-                "from": w.from.petname,
-                "name": w.intro.name,
-                "note": w.intro.note,
-                "group": group_name(d, w.intro.group),
-                // `meet`: say whether to meet them; `introduced`: they said
-                // yes already, and this connects.
-                "kind": if w.intro.invitation.is_some() { "introduced" } else { "meet" },
-            })
+        .map(|w| crate::api::Introduction {
+            from: w.from.petname,
+            group: group_name(d, w.intro.group),
+            id: w.intro.node,
+            // `meet`: say whether to meet them; `introduced`: they said
+            // yes already, and this connects.
+            kind: if w.intro.invitation.is_some() {
+                "introduced"
+            } else {
+                "meet"
+            }
+            .into(),
+            name: w.intro.name,
+            note: w.intro.note,
         })
         .collect();
-    json!({"introductions": all})
+    crate::api::IntroductionsReply {
+        introductions,
+        // the page says
+        more: false,
+        next: None,
+    }
 }
 
-fn find(d: &Daemon, id: &str) -> anyhow::Result<Waiting> {
-    let id = crate::api::id_hex(id);
-    let found = waiting(d)
-        .into_iter()
-        .find(|w| hex::encode(w.intro.node) == id);
+fn find(d: &Daemon, id: Ref<'_>) -> anyhow::Result<Waiting> {
+    // an id whole: as text, in hex as `introductions` gives it
+    let found = waiting(d).into_iter().find(|w| match id {
+        Ref::Typed(t) => hex::encode(w.intro.node) == t,
+        Ref::Id(given) => given.bytes().is_some_and(|b| *b == w.intro.node),
+    });
     found.ok_or_else(|| anyhow::anyhow!("there is no such introduction"))
 }
 
 /// Says yes to an introduction: an invitation for the one introduced, or,
 /// once they said yes too, using theirs.
-pub async fn accept(d: &Arc<Daemon>, id: &str) -> anyhow::Result<Json> {
+pub async fn accept(
+    d: &Arc<Daemon>,
+    id: Ref<'_>,
+) -> anyhow::Result<crate::api::IntroductionAcceptReply> {
     let w = find(d, id)?;
     let met = met_through(w.from.identity, w.intro.group);
     match &w.intro.invitation {
@@ -268,9 +295,18 @@ pub async fn accept(d: &Arc<Daemon>, id: &str) -> anyhow::Result<Json> {
             )?;
             let ops = relationship::answer_introduction(w.intro.node, invitation.to_record(), None);
             d.write_and_push(&w.space, ops)?;
-            Ok(json!({}))
+            Ok(crate::api::IntroductionAcceptReply {
+                name: None,
+                recovery_of: None,
+            })
         }
-        Some(record) => use_invitation(d, record, &w.intro.name, met).await,
+        Some(record) => {
+            let r = use_invitation(d, record, &w.intro.name, met).await?;
+            Ok(crate::api::IntroductionAcceptReply {
+                name: Some(r.name),
+                recovery_of: r.recovery_of,
+            })
+        }
     }
 }
 
@@ -279,7 +315,7 @@ async fn use_invitation(
     record: &cardinal_encoding::Record,
     name: &str,
     met: Met,
-) -> anyhow::Result<Json> {
+) -> anyhow::Result<crate::api::AcceptReply> {
     let invitation = Invitation::from_record(record)
         .map_err(|_| anyhow::anyhow!("that invitation cannot be read"))?;
     // A recovery's invitation is never an introduction's (`guardians.rs`).
@@ -288,7 +324,7 @@ async fn use_invitation(
         "that introduction carries a recovery invitation, which is never used for one"
     );
     let name = (!name.is_empty()).then_some(name);
-    contacts::accept(
+    let r = contacts::accept(
         d,
         &invitation.to_text(),
         name,
@@ -296,17 +332,18 @@ async fn use_invitation(
         met,
         false,
     )
-    .await
+    .await?;
+    Ok(r)
 }
 
 /// Says no to an introduction. The introducer sees that.
-pub fn decline(d: &Arc<Daemon>, id: &str) -> anyhow::Result<Json> {
+pub fn decline(d: &Arc<Daemon>, id: Ref<'_>) -> anyhow::Result<crate::api::Done> {
     let w = find(d, id)?;
     d.write_and_push(
         &w.space,
         vec![relationship::decline_introduction(w.intro.node)],
     )?;
-    Ok(json!({}))
+    Ok(crate::api::Done {})
 }
 
 /// What this person's devices do of themselves: pass on the yes of someone
@@ -594,4 +631,200 @@ mod tests {
         );
         assert_eq!(invitation_from(None, &ben, &ana), None);
     }
+}
+
+/// `list` as main had it, by name.
+#[cfg(any(test, debug_assertions, feature = "by-name"))]
+#[allow(dead_code, clippy::all)]
+pub fn list_by_name(d: &Daemon) -> Json {
+    let all: Vec<Json> = waiting(d)
+        .into_iter()
+        .map(|w| {
+            json!({
+                "id": hex::encode(w.intro.node),
+                "from": w.from.petname,
+                "name": w.intro.name,
+                "note": w.intro.note,
+                "group": group_name(d, w.intro.group),
+                // `meet`: say whether to meet them; `introduced`: they said
+                // yes already, and this connects.
+                "kind": if w.intro.invitation.is_some() { "introduced" } else { "meet" },
+            })
+        })
+        .collect();
+    json!({"introductions": all})
+}
+
+/// `introduce` as main had it, by name.
+#[cfg(any(test, debug_assertions, feature = "by-name"))]
+#[allow(dead_code, clippy::all)]
+pub fn introduce_by_name(
+    d: &Arc<Daemon>,
+    who: &str,
+    to: &str,
+    note: Option<&str>,
+) -> anyhow::Result<Json> {
+    let me = identity(d)?;
+    let x = contacts::listed_by_name(d, who)?;
+    let b = contacts::listed_by_name(d, to)?;
+    anyhow::ensure!(x.identity != b.identity, "that is one person");
+    let all = d.core().contacts();
+    for c in [&x, &b] {
+        anyhow::ensure!(
+            introduces(&all, c),
+            "you do not introduce {}: they are not trusted, or set to no introductions",
+            c.petname
+        );
+    }
+    // the name they suggest, never this person's own for them
+    let suggested = x.suggested.as_deref().unwrap_or(&x.petname);
+    let op = relationship::create_introduction(&me, &x.identity, suggested, note, None, None);
+    d.write_and_push(&b.space, vec![op])?;
+    Ok(json!({}))
+}
+
+/// `ask_in_group` as main had it, by name.
+#[cfg(any(test, debug_assertions, feature = "by-name"))]
+#[allow(dead_code, clippy::all)]
+pub fn ask_in_group_by_name(
+    d: &Arc<Daemon>,
+    group_name: &str,
+    who: &str,
+    note: Option<&str>,
+) -> anyhow::Result<Json> {
+    let me = identity(d)?;
+    let (space, them, shown, admins) = {
+        let core = d.core();
+        let groups = core.spaces.iter().filter_map(|(id, h)| {
+            let sp = h.space.as_ref()?;
+            (sp.profile() == group::GROUP).then_some((id, sp))
+        });
+        // as bytes, the group and the member whose ids they are
+        let (asked, person) = (
+            crate::api::reference(group_name),
+            crate::api::reference(who),
+        );
+        let found: Vec<_> = groups
+            .filter(|(id, sp)| match asked {
+                Ref::Id(_) => asked.is_id(id.as_slice()),
+                Ref::Typed(_) => {
+                    group::name(sp) == group_name
+                        || (group_name.len() >= 8 && hex::encode(id).starts_with(group_name))
+                }
+            })
+            .collect();
+        let (group_name, who) = (crate::api::shown(group_name), crate::api::shown(who));
+        let [(id, sp)] = found.as_slice() else {
+            anyhow::bail!("there is no one group {group_name}");
+        };
+        let members = group::members(sp);
+        let them = members
+            .iter()
+            .find(|m| {
+                let meant = match person {
+                    Ref::Id(_) => person.is_id(&m.identity),
+                    Ref::Typed(_) => m.name.as_deref() == Some(who),
+                };
+                meant && m.identity != me
+            })
+            .ok_or_else(|| anyhow::anyhow!("nobody in it is called {who}"))?;
+        anyhow::ensure!(
+            group::introductions(sp),
+            "{group_name} does not introduce its members"
+        );
+        anyhow::ensure!(
+            them.introduce,
+            "{who} is not introduced through {group_name}"
+        );
+        let admins: Vec<[u8; 32]> = members
+            .iter()
+            .filter(|m| m.role >= group::ADMIN && m.identity != me)
+            .map(|m| m.identity)
+            .collect();
+        (
+            **id,
+            them.identity,
+            them.name.clone().unwrap_or_default(),
+            admins,
+        )
+    };
+    anyhow::ensure!(
+        !d.core().contacts().iter().any(|c| c.identity == them),
+        "you know {who} already"
+    );
+    let contacts = d.core().contacts();
+    let admin = contacts
+        .iter()
+        .find(|c| admins.contains(&c.identity) && introduces(&contacts, c))
+        .ok_or_else(|| {
+            anyhow::anyhow!("no admin of {group_name} that you know can introduce you")
+        })?;
+    // Asked already, and not answered: asking again changes nothing.
+    let asked = {
+        let core = d.core();
+        let sp = core.spaces.get(&admin.space).and_then(|h| h.space.as_ref());
+        sp.is_some_and(|sp| {
+            relationship::introductions(sp).iter().any(|i| {
+                i.creator == me && i.introduced == them && i.group == Some(space) && !i.declined
+            })
+        })
+    };
+    if asked {
+        return Ok(json!({"asked": true}));
+    }
+    let op =
+        relationship::create_introduction(&admin.identity, &them, &shown, note, Some(&space), None);
+    d.write_and_push(&admin.space, vec![op])?;
+    Ok(json!({}))
+}
+
+/// `find` as main had it, by name.
+#[cfg(any(test, debug_assertions, feature = "by-name"))]
+#[allow(dead_code, clippy::all)]
+fn find_by_name(d: &Daemon, id: &str) -> anyhow::Result<Waiting> {
+    let id = crate::api::id_hex(id);
+    let found = waiting(d)
+        .into_iter()
+        .find(|w| hex::encode(w.intro.node) == id);
+    found.ok_or_else(|| anyhow::anyhow!("there is no such introduction"))
+}
+
+/// `accept` as main had it, by name.
+#[cfg(any(test, debug_assertions, feature = "by-name"))]
+#[allow(dead_code, clippy::all)]
+pub async fn accept_by_name(d: &Arc<Daemon>, id: &str) -> anyhow::Result<Json> {
+    let w = find_by_name(d, id)?;
+    let met = met_through(w.from.identity, w.intro.group);
+    match &w.intro.invitation {
+        None => {
+            let me_as = crate::names::my_name(d);
+            let invitation = contacts::invite_for(
+                d,
+                None,
+                Some(&me_as),
+                Regard::default(),
+                Some(w.intro.introduced),
+                Some(&met),
+            )?;
+            let ops = relationship::answer_introduction(w.intro.node, invitation.to_record(), None);
+            d.write_and_push(&w.space, ops)?;
+            Ok(json!({}))
+        }
+        Some(record) => {
+            let r = use_invitation(d, record, &w.intro.name, met).await?;
+            Ok(json!({"name": r.name, "recovery_of": r.recovery_of.map(hex::encode)}))
+        }
+    }
+}
+
+/// `decline` as main had it, by name.
+#[cfg(any(test, debug_assertions, feature = "by-name"))]
+#[allow(dead_code, clippy::all)]
+pub fn decline_by_name(d: &Arc<Daemon>, id: &str) -> anyhow::Result<Json> {
+    let w = find_by_name(d, id)?;
+    d.write_and_push(
+        &w.space,
+        vec![relationship::decline_introduction(w.intro.node)],
+    )?;
+    Ok(json!({}))
 }

@@ -14,6 +14,7 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use cardinal_link::CloseReason;
+#[cfg(any(test, debug_assertions, feature = "by-name"))]
 use serde_json::{json, Value};
 
 use cardinal_identity::KeyId;
@@ -214,6 +215,25 @@ impl Unreadables {
     /// What `status` and `contact-status` say of `key`, if anything:
     /// `says`, a sentence for the person, with `name` the device's (or
     /// the contact's) name.
+    pub fn of(&self, key: &KeyId, name: &str) -> Option<crate::api::Unreadable> {
+        let (u, left) = {
+            let m = self.lock();
+            let u = m.get(key)?.clone();
+            let left = u.backoff.left(Instant::now());
+            (u, left)
+        };
+        Some(crate::api::Unreadable {
+            says: says(&u, name, cardinal_update::VERSION),
+            reason: u.reason,
+            theirs: u.theirs,
+            version: u.version,
+            since: u.since,
+            retry_in_s: left.as_secs(),
+        })
+    }
+
+    /// [`Unreadables::of`], by name, for the requests not yet typed.
+    #[cfg(any(test, debug_assertions, feature = "by-name"))]
     pub fn json(&self, key: &KeyId, name: &str) -> Option<Value> {
         let (u, left) = {
             let m = self.lock();

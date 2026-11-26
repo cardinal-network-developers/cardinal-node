@@ -31,7 +31,6 @@ use cardinald::api::{self, status};
 use cardinald::format::{self, Store};
 use cardinald::paths::Paths;
 use cardinald::Overrides;
-use serde_json::{json, Value};
 
 /// Writes a report on standard output, and nothing else.
 fn write_out(report: &[u8]) -> anyhow::Result<()> {
@@ -42,35 +41,33 @@ fn write_out(report: &[u8]) -> anyhow::Result<()> {
 }
 
 /// `--clear`'s answer as a record: done, or failed and why.
-fn cleared(said: &Value) -> Vec<u8> {
-    match said["error"].as_str() {
-        None => {
-            let spec = api::program("--clear").expect("the table has it");
-            api::encode_reply(spec, Ok(&json!({})))
-        }
-        Some(why) => api::error_reply(status::FAILED, why),
+fn cleared(said: &Result<(), String>) -> Vec<u8> {
+    match said {
+        Ok(()) => api::typed::reply_message("--clear", &api::Done {}),
+        Err(why) => api::error_reply(status::FAILED, why),
     }
 }
 
 /// Removes what the service wrote, for `--clear`, unless one is running.
-async fn clear(paths: &Paths) -> Value {
-    let status = json!({"cmd": "status"});
-    let answers = cardinald::control::request(&paths.socket, &status).await;
+async fn clear(paths: &Paths) -> Result<(), String> {
+    // A service that answers at all, whatever it says, is running: one
+    // whose reply cannot be read answered too.
+    let answers = match cardinald::control::ask(&paths.socket, &api::StatusArgs::new()).await {
+        Ok(_) => true,
+        Err(e) => e.is::<api::typed::Unreadable>(),
+    };
     let held = match cardinald::lock::held(paths) {
         Ok(held) => held,
-        Err(e) => return json!({"ok": false, "error": cardinald::lock::cannot(paths, &e)}),
+        Err(e) => return Err(cardinald::lock::cannot(paths, &e)),
     };
-    if answers.is_ok() || held {
-        return json!({
-            "ok": false,
-            "error": "Cardinal is running on this data. Stop it first. Nothing was changed.",
-        });
+    if answers || held {
+        return Err("Cardinal is running on this data. Stop it first. Nothing was changed.".into());
     }
     // Only what this version cannot read goes this way. A client offers it
     // when the service will not start, and a store that works is never
     // that. Nor is a directory with no store in it, or one whose marker
     // cannot be read.
-    let refuse = |why: String| json!({"ok": false, "error": why});
+    let refuse = Err;
     match format::of(paths) {
         Store::Current => {
             return refuse(
@@ -90,12 +87,11 @@ async fn clear(paths: &Paths) -> Value {
         _ => {}
     }
     match cardinald::clear::clear(paths, false) {
-        Ok(()) => json!({"ok": true}),
-        Err(e) if e.kind() == std::io::ErrorKind::ResourceBusy => json!({
-            "ok": false,
-            "error": "Cardinal is running on this data. Stop it first. Nothing was changed.",
-        }),
-        Err(e) => json!({"ok": false, "error": format!("Not all of it could be removed: {e}")}),
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::ResourceBusy => {
+            Err("Cardinal is running on this data. Stop it first. Nothing was changed.".into())
+        }
+        Err(e) => Err(format!("Not all of it could be removed: {e}")),
     }
 }
 
@@ -125,7 +121,7 @@ fn main() -> anyhow::Result<()> {
     if asked.is_some() {
         let said = rt.block_on(clear(&paths));
         write_out(&cleared(&said))?;
-        std::process::exit(if said["ok"] == true { 0 } else { 1 });
+        std::process::exit(if said.is_ok() { 0 } else { 1 });
     }
     cardinald::init_logging();
     rt.block_on(cardinald::run(paths, o))

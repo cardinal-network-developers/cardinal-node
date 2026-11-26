@@ -11,6 +11,7 @@ use cardinal_encoding::{Record, Value};
 use cardinal_space::account;
 use cardinal_space::entry::{NodeKind, SpaceOp};
 use cardinal_space::ROOT;
+#[cfg(any(test, debug_assertions, feature = "by-name"))]
 use serde_json::{json, Value as Json};
 
 use crate::core::Core;
@@ -65,7 +66,33 @@ pub fn read_markers_on(core: &Core) -> bool {
 
 /// `read-markers`: whether others see what this person has read, and with
 /// `on`, the person's answer, for every device of theirs.
-pub fn read_markers(d: &Arc<Daemon>, set: Option<bool>) -> anyhow::Result<Json> {
+pub fn read_markers(
+    d: &Arc<Daemon>,
+    set: Option<bool>,
+) -> anyhow::Result<crate::api::ReadMarkersReply> {
+    if let Some(want) = set {
+        let (account, ops) = {
+            let core = d.core();
+            let acc = core
+                .account()
+                .ok_or_else(|| anyhow::anyhow!("the account space is not here yet"))?;
+            let st = acc
+                .space
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("the account space is not open yet"))?
+                .state();
+            (acc.id, set_ops(st, READ_MARKERS, want))
+        };
+        d.write_and_push(&account, ops)?;
+    }
+    Ok(crate::api::ReadMarkersReply {
+        on: read_markers_on(&d.core()),
+    })
+}
+
+/// [`read_markers`] as main had it, by name.
+#[cfg(any(test, debug_assertions, feature = "by-name"))]
+pub fn read_markers_by_name(d: &Arc<Daemon>, set: Option<bool>) -> anyhow::Result<Json> {
     if let Some(want) = set {
         let (account, ops) = {
             let core = d.core();

@@ -2,7 +2,7 @@
 //! groups together, newest first, with what is new in each, laid out for a
 //! person reading a terminal.
 
-use serde_json::Value;
+use cardinald::api;
 
 /// How the overview is drawn.
 pub struct Style {
@@ -55,39 +55,31 @@ struct Row {
     last: String,
 }
 
-fn rows(conversations: &Value, groups: &Value) -> Vec<Row> {
+fn rows(conversations: &[api::Conversation], groups: &[api::Group]) -> Vec<Row> {
     let mut rows = Vec::new();
-    for c in conversations["conversations"]
-        .as_array()
-        .into_iter()
-        .flatten()
-    {
-        let mut name = crate::printable(c["name"].as_str().unwrap_or(""));
+    for c in conversations {
+        let mut name = crate::printable(&c.name);
         if name.is_empty() {
-            name = crate::printable(c["suggested"].as_str().unwrap_or("?"));
+            name = crate::printable(c.suggested.as_deref().unwrap_or("?"));
         }
-        let last = &c["last"];
+        let last = c.last.as_ref();
         rows.push(Row {
             name,
             kind: String::new(),
-            unread: c["unread"].as_u64().unwrap_or(0),
-            when: last["time"].as_u64(),
+            unread: c.unread,
+            when: last.and_then(|l| l.time),
             last: said(last, None),
         });
     }
     // Groups this person is in; offers are listed by `cardinal groups`.
-    for g in groups["groups"].as_array().into_iter().flatten() {
-        if g.get("unread").is_none() {
-            continue;
-        }
-        let last = &g["last"];
-        let n = g["members"].as_u64().unwrap_or(0);
+    for g in groups {
+        let last = g.last.as_ref();
         rows.push(Row {
-            name: crate::printable(g["name"].as_str().unwrap_or("")),
-            kind: format!("group of {n}"),
-            unread: g["unread"].as_u64().unwrap_or(0),
-            when: last["time"].as_u64(),
-            last: said(last, last["from"].as_str()),
+            name: crate::printable(&g.name),
+            kind: format!("group of {}", g.members),
+            unread: g.unread,
+            when: last.and_then(|l| l.time),
+            last: said(last, last.and_then(|l| l.from.as_deref())),
         });
     }
     // Newest first; a conversation with nothing said goes last.
@@ -96,18 +88,18 @@ fn rows(conversations: &Value, groups: &Value) -> Vec<Row> {
 }
 
 /// The last thing said, with who said it where that is not plain.
-fn said(last: &Value, from: Option<&str>) -> String {
-    if last.is_null() {
+fn said(last: Option<&api::Last>, from: Option<&str>) -> String {
+    let Some(last) = last else {
         return "nothing said yet".into();
-    }
-    let text = crate::printable(last["text"].as_str().unwrap_or(""));
+    };
+    let text = crate::printable(&last.text);
     let text = text.split_whitespace().collect::<Vec<_>>().join(" ");
     let text = if text.is_empty() {
         "(a file)".to_owned()
     } else {
         text
     };
-    if last["mine"] == true {
+    if last.mine {
         format!("you: {text}")
     } else if let Some(from) = from {
         format!("{}: {text}", crate::printable(from))
@@ -117,7 +109,7 @@ fn said(last: &Value, from: Option<&str>) -> String {
 }
 
 /// The overview, as text.
-pub fn render(conversations: &Value, groups: &Value, s: &Style) -> String {
+pub fn render(conversations: &[api::Conversation], groups: &[api::Group], s: &Style) -> String {
     let rows = rows(conversations, groups);
     if rows.is_empty() {
         return "No conversations yet. To start one, invite someone: cardinal invite\n".into();
@@ -310,7 +302,6 @@ fn utc(ms: u64) -> Local {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::json;
 
     const NOW: u64 = 1_794_995_000_000; // 2026-11-18, mid-morning UTC
 
@@ -322,20 +313,96 @@ mod tests {
         }
     }
 
+    fn last(mine: bool, from: Option<&str>, text: &str, time: u64) -> Option<api::Last> {
+        Some(api::Last {
+            from: from.map(str::to_owned),
+            mine,
+            text: text.to_owned(),
+            time: Some(time),
+        })
+    }
+
+    fn conversation(name: &str, unread: u64, last: Option<api::Last>) -> api::Conversation {
+        let reach = api::ContactReach::new(Vec::new(), false, false, false);
+        api::Conversation {
+            last,
+            ..api::Conversation::new(
+                false,
+                [0; 8],
+                true,
+                name.to_owned(),
+                false,
+                true,
+                reach,
+                false,
+                true,
+                unread,
+            )
+        }
+    }
+
+    fn group(name: &str, members: u64, unread: u64, last: Option<api::Last>) -> api::Group {
+        let reach = api::GroupReach::new(
+            Vec::new(),
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            Vec::new(),
+            Vec::new(),
+        );
+        api::Group {
+            last,
+            ..api::Group::new(
+                false,
+                Vec::new(),
+                Vec::new(),
+                [0; 32],
+                0,
+                true,
+                members,
+                name.to_owned(),
+                0,
+                false,
+                reach,
+                unread,
+            )
+        }
+    }
+
     #[test]
     fn people_and_groups_newest_first_with_what_is_new() {
-        let conversations = json!({"conversations": [
-            {"name": "Ana", "own": true, "unread": 0,
-             "last": {"mine": true, "text": "see you sunday", "time": NOW - 3 * 86_400_000}},
-            {"name": "Daniel Wigton", "own": true, "unread": 2,
-             "last": {"mine": false, "text": "At some point we'll need a harness so arriving chats submit a turn. But I'll leave speccing software", "time": NOW - 60_000}},
-            {"name": "", "suggested": "Cousin Al", "own": false, "unread": 0, "last": null},
-        ]});
-        let groups = json!({"groups": [
-            {"name": "Choir", "members": 4, "unread": 1,
-             "last": {"mine": false, "from": "Bo", "text": "thanks\nall", "time": NOW - 3_600_000}},
-            {"name": "Offered", "from": "Ana", "members": 3},
-        ]});
+        let conversations = [
+            conversation(
+                "Ana",
+                0,
+                last(true, None, "see you sunday", NOW - 3 * 86_400_000),
+            ),
+            conversation(
+                "Daniel Wigton",
+                2,
+                last(
+                    false,
+                    None,
+                    "At some point we'll need a harness so arriving chats submit a turn. But I'll leave speccing software",
+                    NOW - 60_000,
+                ),
+            ),
+            api::Conversation {
+                suggested: Some("Cousin Al".into()),
+                own: false,
+                ..conversation("", 0, None)
+            },
+        ];
+        // offers are another list, which the overview is not given
+        let groups = [group(
+            "Choir",
+            4,
+            1,
+            last(false, Some("Bo"), "thanks\nall", NOW - 3_600_000),
+        )];
         let out = render(&conversations, &groups, &style());
         let lines: Vec<&str> = out.lines().collect();
         assert!(lines[0].starts_with("● Daniel Wigton"), "{out}");
@@ -362,11 +429,7 @@ mod tests {
 
     #[test]
     fn nothing_yet_says_how_to_begin() {
-        let out = render(
-            &json!({"conversations": []}),
-            &json!({"groups": []}),
-            &style(),
-        );
+        let out = render(&[], &[], &style());
         assert!(out.contains("cardinal invite"));
     }
 

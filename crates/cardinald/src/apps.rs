@@ -26,6 +26,7 @@ use cardinal_space::entry::derived_id;
 use cardinal_space::{
     account, NodeId, NodeKind, Profile, Space, SpaceId, SpaceOp, SpaceOpBody, ROOT,
 };
+#[cfg(any(test, debug_assertions, feature = "by-name"))]
 use serde_json::{json, Value as Json};
 use tokio::sync::oneshot;
 
@@ -369,7 +370,7 @@ fn approved(d: &Daemon, program: &str) -> HashMap<[u8; 32], bool> {
     out
 }
 
-fn record_approval(
+pub(crate) fn record_approval(
     d: &Arc<Daemon>,
     program: &str,
     named: &str,
@@ -1519,6 +1520,31 @@ async fn watch(d: &Arc<Daemon>, conn: &Conn, mut r: Reader, mut w: Writer) {
 
 // ---- The person's side (`apps.md`, numbers 220 to 229) ----
 
+/// A question waiting for the person, as a program's connection leaves
+/// one: for tests, which have no program to ask.
+#[cfg(test)]
+pub(crate) fn ask_for_test(
+    d: &Daemon,
+    program: &str,
+    named: &str,
+    asks: Asks,
+    what: &str,
+) -> oneshot::Receiver<Said> {
+    let (tx, rx) = oneshot::channel();
+    let mut q = lock(&d.apps.questions);
+    let id = q.0;
+    q.0 += 1;
+    q.1.push(Question {
+        id,
+        program: program.into(),
+        named: named.into(),
+        asks,
+        what: what.into(),
+        answer: Some(tx),
+    });
+    rx
+}
+
 fn asks_name(a: &Asks) -> &'static str {
     match a {
         Asks::Family { .. } => "family",
@@ -1528,7 +1554,31 @@ fn asks_name(a: &Asks) -> &'static str {
 }
 
 /// `app-questions`: what programs ask the person, waiting.
-pub fn questions(d: &Daemon) -> Json {
+pub fn questions(d: &Daemon) -> Vec<crate::api::AppQuestion> {
+    let mut q = lock(&d.apps.questions);
+    q.1.retain(|q| q.answer.as_ref().is_some_and(|a| !a.is_closed()));
+    q.1.iter()
+        .map(|q| {
+            let role = match q.asks {
+                Asks::Share { role, .. } => Some(role_name(role).into()),
+                _ => None,
+            };
+            crate::api::AppQuestion {
+                asks: asks_name(&q.asks).into(),
+                id: q.id,
+                name: q.named.clone(),
+                program: q.program.clone(),
+                role,
+                what: q.what.clone(),
+            }
+        })
+        .collect()
+}
+
+/// `app-questions`: what programs ask the person, waiting.
+#[cfg(any(test, debug_assertions, feature = "by-name"))]
+#[allow(dead_code, clippy::all)]
+pub fn questions_by_name(d: &Daemon) -> Json {
     let mut q = lock(&d.apps.questions);
     q.1.retain(|q| q.answer.as_ref().is_some_and(|a| !a.is_closed()));
     let all: Vec<Json> =
@@ -1546,7 +1596,46 @@ pub fn questions(d: &Daemon) -> Json {
 }
 
 /// `app-answer`: the person's answer to a question.
-pub fn answer(d: &Daemon, req: &Json) -> anyhow::Result<Json> {
+pub fn answer(d: &Daemon, a: &crate::api::AppAnswerArgs) -> anyhow::Result<crate::api::Done> {
+    let id = a.id.ok_or_else(|| anyhow::anyhow!("missing argument id"))?;
+    let yes = a.yes == Some(true);
+    // as the window gives them: text as typed, an id given as bytes in hex
+    let people: Vec<String> = a
+        .people
+        .iter()
+        .flatten()
+        .map(|p| match p {
+            crate::api::typed::Reference::Typed(t) => t.clone(),
+            crate::api::typed::Reference::Id(b) => hex::encode(b),
+        })
+        .collect();
+    let role = match a.role.as_deref() {
+        None | Some("") => None,
+        Some("reader") => Some(cardinal_space::group::READER),
+        Some("writer") => Some(cardinal_space::group::WRITER),
+        Some(r) => anyhow::bail!("a role is reader or writer, not {r}"),
+    };
+    let tx = {
+        let mut q = lock(&d.apps.questions);
+        let at = q.1.iter().position(|q| q.id == id);
+        let at = at.ok_or_else(|| anyhow::anyhow!("no question {id} is waiting"))?;
+        let q = q.1.remove(at);
+        if let Asks::Share { .. } = q.asks {
+            anyhow::ensure!(!yes || !people.is_empty(), "say whom to share it with");
+        }
+        q.answer
+    };
+    if let Some(tx) = tx {
+        let _ = tx.send(Said { yes, people, role });
+    }
+    d.bump();
+    Ok(crate::api::Done {})
+}
+
+/// `app-answer`: the person's answer to a question.
+#[cfg(any(test, debug_assertions, feature = "by-name"))]
+#[allow(dead_code, clippy::all)]
+pub fn answer_by_name(d: &Daemon, req: &Json) -> anyhow::Result<Json> {
     let id = req["id"]
         .as_u64()
         .ok_or_else(|| anyhow::anyhow!("missing argument id"))?;
@@ -1596,7 +1685,36 @@ fn family_title(core: &Core, root: &[u8; 32]) -> Option<(String, String)> {
 }
 
 /// `approvals`: every approval of the person's, on every device.
-pub fn list_approvals(d: &Daemon) -> Json {
+pub fn list_approvals(d: &Daemon) -> Vec<crate::api::ApprovalShown> {
+    let core = d.core();
+    let acc = core.account().and_then(|a| a.space.as_ref());
+    let me = d.keys.key();
+    approvals(&core)
+        .into_iter()
+        .map(|a| {
+            let device = acc.and_then(|s| account::device_name(s.state(), &a.device));
+            let covers = family_title(&core, &a.family)
+                .map(|t| t.0)
+                .unwrap_or_else(|| hex::encode(&a.family[..8]));
+            crate::api::ApprovalShown {
+                change: a.change,
+                covers,
+                device,
+                family: a.family,
+                id: a.node,
+                name: a.named,
+                program: a.program,
+                revoked: a.revoked,
+                this_device: a.device == me,
+            }
+        })
+        .collect()
+}
+
+/// `approvals`: every approval of the person's, on every device.
+#[cfg(any(test, debug_assertions, feature = "by-name"))]
+#[allow(dead_code, clippy::all)]
+pub fn list_approvals_by_name(d: &Daemon) -> Json {
     let core = d.core();
     let acc = core.account().and_then(|a| a.space.as_ref());
     let me = d.keys.key();
@@ -1614,7 +1732,38 @@ pub fn list_approvals(d: &Daemon) -> Json {
 }
 
 /// `approval-revoke`: sets an approval's field 6.
-pub fn revoke(d: &Arc<Daemon>, id: &str) -> anyhow::Result<Json> {
+pub fn revoke(d: &Arc<Daemon>, id: crate::api::Ref<'_>) -> anyhow::Result<crate::api::Done> {
+    // the start of its id in hex, as the way by name read it, given as
+    // bytes too (DEVIATIONS.md, Old oddities kept)
+    let id = match id {
+        crate::api::Ref::Typed(t) => t.to_ascii_lowercase(),
+        crate::api::Ref::Id(b) => b.hex().to_ascii_lowercase(),
+    };
+    let (account, node) = {
+        let core = d.core();
+        let found: Vec<NodeId> = approvals(&core)
+            .into_iter()
+            .map(|a| a.node)
+            .filter(|n| !id.is_empty() && hex::encode(n).starts_with(&id))
+            .collect();
+        let node = match found[..] {
+            [one] => one,
+            [] => anyhow::bail!("there is no approval {id}"),
+            _ => anyhow::bail!("more than one approval starts with {id}"),
+        };
+        let account = core
+            .account_id()
+            .ok_or_else(|| anyhow::anyhow!("the account space is not here yet"))?;
+        (account, node)
+    };
+    d.write_and_push(&account, vec![account::set_field(node, 6, true)])?;
+    Ok(crate::api::Done {})
+}
+
+/// `approval-revoke`: sets an approval's field 6.
+#[cfg(any(test, debug_assertions, feature = "by-name"))]
+#[allow(dead_code, clippy::all)]
+pub fn revoke_by_name(d: &Arc<Daemon>, id: &str) -> anyhow::Result<Json> {
     let id = crate::api::id_hex(id).to_ascii_lowercase();
     let (account, node) = {
         let core = d.core();
@@ -1676,7 +1825,26 @@ fn offers(core: &Core) -> Vec<Offered> {
 }
 
 /// `app-offers`: spaces of applications offered to this person.
-pub fn list_offers(d: &Daemon) -> Json {
+pub fn list_offers(d: &Daemon) -> Vec<crate::api::AppOffer> {
+    offers(&d.core())
+        .into_iter()
+        .map(|(id, name, from, doc)| {
+            let (application, sentence) = doc.unzip();
+            crate::api::AppOffer {
+                application,
+                from,
+                name,
+                sentence,
+                space: id,
+            }
+        })
+        .collect()
+}
+
+/// `app-offers`: spaces of applications offered to this person.
+#[cfg(any(test, debug_assertions, feature = "by-name"))]
+#[allow(dead_code, clippy::all)]
+pub fn list_offers_by_name(d: &Daemon) -> Json {
     let all: Vec<Json> = offers(&d.core())
         .into_iter()
         .map(|(id, name, from, doc)| {
@@ -1690,7 +1858,48 @@ pub fn list_offers(d: &Daemon) -> Json {
 
 /// `app-join`: the person takes a space offered them; it is kept in the
 /// account, as a group joined with nothing to say there is (D75).
-pub fn join(d: &Arc<Daemon>, space: &str) -> anyhow::Result<Json> {
+pub fn join(
+    d: &Arc<Daemon>,
+    space: crate::api::Ref<'_>,
+) -> anyhow::Result<crate::api::AppJoinReply> {
+    // The start of its id in hex, given as bytes too, or its name; an id
+    // given as bytes is named NUL first, as the way by name held it
+    // (DEVIATIONS.md, Old oddities kept).
+    let (s, held) = match space {
+        crate::api::Ref::Typed(t) => (t.to_ascii_lowercase(), t.to_owned()),
+        crate::api::Ref::Id(b) => (
+            b.hex().to_ascii_lowercase(),
+            format!("{}{}", crate::api::EXACT, b.hex()),
+        ),
+    };
+    let space = held.as_str();
+    let (id, name, account) = {
+        let core = d.core();
+        let all = offers(&core);
+        let found: Vec<_> = all
+            .into_iter()
+            .filter(|o| (!s.is_empty() && hex::encode(o.0).starts_with(&s)) || o.1 == space)
+            .collect();
+        let (id, name) = match &found[..] {
+            [one] => (one.0, one.1.clone()),
+            [] => anyhow::bail!("nothing offered to you is {space}"),
+            _ => anyhow::bail!("more than one offer is {space}: give its id"),
+        };
+        let account = core
+            .account_id()
+            .ok_or_else(|| anyhow::anyhow!("the account space is not here yet"))?;
+        (id, name, account)
+    };
+    d.write_and_push(&account, vec![account::create_space(&id, &name)])?;
+    d.bump();
+    Ok(crate::api::AppJoinReply { space: id, name })
+}
+
+/// `app-join`: the person takes a space offered them; it is kept in the
+/// account, as a group joined with nothing to say there is (D75).
+#[cfg(any(test, debug_assertions, feature = "by-name"))]
+#[allow(dead_code, clippy::all)]
+pub fn join_by_name(d: &Arc<Daemon>, space: &str) -> anyhow::Result<Json> {
     let s = crate::api::id_hex(space).to_ascii_lowercase();
     let (id, name, account) = {
         let core = d.core();

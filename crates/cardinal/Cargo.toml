@@ -24,6 +24,9 @@ hex.workspace = true
 libc = "0.2"
 
 [dev-dependencies]
+# The tests ask the service by name (`cardinald::api::blocking`), which a
+# release build of the service and the command line has none of.
+cardinald = { path = "../cardinald", features = ["by-name"] }
 tempfile.workspace = true
 socket2.workspace = true
 blake3.workspace = true

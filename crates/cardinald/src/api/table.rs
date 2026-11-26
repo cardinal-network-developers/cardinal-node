@@ -11,12 +11,17 @@
 //! change keeps its number, no longer used, and its name is given again
 //! with a new number and the new type.
 
+use std::borrow::Cow;
+
+use super::typed::{Fields, Kind, Reference, Scalar};
+
 /// What a field holds.
 #[derive(Debug)]
 pub enum Ty {
     /// Text.
     Text,
-    /// Bytes: a key, an id or a hash. The service holds them as hex.
+    /// Bytes: a key, an id or a hash. Typed, they are bytes; by name, the
+    /// service holds them as hex.
     Bytes,
     /// An unsigned integer.
     Uint,
@@ -49,6 +54,11 @@ pub struct Field {
     pub n: u64,
     pub name: &'static str,
     pub ty: Ty,
+    /// Whether it is read back as an `Option`, its absence no error: of a
+    /// typed record's field, where the tests run, to hold the fields added
+    /// since the last release to that (`api::tests`).
+    #[cfg(test)]
+    pub optional: bool,
 }
 
 /// A record held inside a reply.
@@ -61,7 +71,7 @@ pub struct Rec {
 /// A request: its number, its name, its arguments and its reply's fields.
 /// The events of `watch` and the frames of `call-media` are written the
 /// same way, with their fields as `args`.
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 pub struct Request {
     pub n: u64,
     pub name: &'static str,
@@ -72,7 +82,17 @@ pub struct Request {
     /// A request no longer answered: the service says it has no such
     /// request, and its number stays taken.
     pub gone: bool,
+    /// How a typed request is answered, from its message to its reply's;
+    /// `None` for one answered by name, or by the connection itself.
+    pub answer: Option<Answerer>,
 }
+
+/// How a typed request is answered (`control::typed::answering`).
+pub type Answerer =
+    for<'a> fn(
+        &'a std::sync::Arc<crate::daemon::Daemon>,
+        cardinal_encoding::Record,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Vec<u8>> + Send + 'a>>;
 
 /// How a request's answer comes in pages (`apps.md`, Pages). The lists of
 /// a paged reply are its fields that are lists, in the order of their
@@ -91,12 +111,514 @@ pub enum Page {
     Before { list: &'static str },
 }
 
+/// A record of the interface, typed (`api::typed`): one declaration gives
+/// the struct, its row in the tables, and its encoding both ways, so what
+/// the tables say and what the service sends cannot differ. Each field is
+/// its number, its name (the Rust name without `r#`), and its Rust type,
+/// which says its type in the tables ([`typed::Wire`](super::typed::Wire)),
+/// in the order of the numbers.
+///
+/// `typed!(STATIC "record name" Name { 1 field: Type, ... })` declares a
+/// record held in replies, with its row as `STATIC`;
+/// `typed!(fields Name { ... })` the arguments or the reply of a request,
+/// which [`asks!`] then numbers.
+///
+/// - A field that is not an `Option` is one the service always sends: the
+///   handler must give it, since `Name::new` takes these fields, in order,
+///   and there is no `Default`; read back, its absence is an error. A
+///   field added to a record after it was first released is an `Option`
+///   for ever, so that a newer client reads an older service.
+/// - `n gone name: Type` is a number no longer used: it keeps its row, with
+///   the type it had, and no struct field; it is never sent, and what
+///   comes under it is passed over.
+#[macro_export]
+#[doc(hidden)]
+macro_rules! typed {
+    (
+        $(#[$m:meta])*
+        $stat:ident $title:literal $name:ident { $($body:tt)* }
+    ) => {
+        $crate::typed!(@munch [$(#[$m])* $name] [$stat $title] [] [] [] [] [] $($body)*);
+    };
+    (fields $(#[$m:meta])* $name:ident { $($body:tt)* }) => {
+        $crate::typed!(@munch [$(#[$m])* $name] [] [] [] [] [] [] $($body)*);
+    };
+    // A number no longer used.
+    (@munch $h:tt $st:tt [$($s:tt)*] [$($r:tt)*] [$($o:tt)*] [$($l:tt)*] [$($a:tt)*]
+        $n:literal gone $f:ident : $t:ty $(, $($rest:tt)*)?
+    ) => {
+        $crate::typed!(@munch $h $st [$($s)*] [$($r)*] [$($o)*] [$($l)*]
+            [$($a)* ($n $f (gone $t))] $($($rest)*)?);
+    };
+    // A field sent only when it is `Some`, of a record that holds itself
+    // (or one that holds it): its row names the record, `as {ROW}` or a
+    // list of them `as [ROW]`, since the row cannot be had from the type.
+    (@munch $h:tt $st:tt [$($s:tt)*] [$($r:tt)*] [$($o:tt)*] [$($l:tt)*] [$($a:tt)*]
+        $(#[$fm:meta])* $n:literal $f:ident : Option<$t:ty> as $row:tt $(, $($rest:tt)*)?
+    ) => {
+        $crate::typed!(@munch $h $st
+            [$($s)* ($(#[$fm])* $f : Option<$t>)] [$($r)*] [$($o)* $f]
+            [$($l)* ($n $f)] [$($a)* ($n $f (as $row ?))] $($($rest)*)?);
+    };
+    // A field always sent, of a record that holds itself.
+    (@munch $h:tt $st:tt [$($s:tt)*] [$($r:tt)*] [$($o:tt)*] [$($l:tt)*] [$($a:tt)*]
+        $(#[$fm:meta])* $n:literal $f:ident : $t:ty as $row:tt $(, $($rest:tt)*)?
+    ) => {
+        $crate::typed!(@munch $h $st
+            [$($s)* ($(#[$fm])* $f : $t)] [$($r)* ($f : $t)] [$($o)*]
+            [$($l)* ($n $f)] [$($a)* ($n $f (as $row))] $($($rest)*)?);
+    };
+    // A field sent only when it is `Some`.
+    (@munch $h:tt $st:tt [$($s:tt)*] [$($r:tt)*] [$($o:tt)*] [$($l:tt)*] [$($a:tt)*]
+        $(#[$fm:meta])* $n:literal $f:ident : Option<$t:ty> $(, $($rest:tt)*)?
+    ) => {
+        $crate::typed!(@munch $h $st
+            [$($s)* ($(#[$fm])* $f : Option<$t>)] [$($r)*] [$($o)* $f]
+            [$($l)* ($n $f)] [$($a)* ($n $f (Option<$t>))] $($($rest)*)?);
+    };
+    // A field always sent.
+    (@munch $h:tt $st:tt [$($s:tt)*] [$($r:tt)*] [$($o:tt)*] [$($l:tt)*] [$($a:tt)*]
+        $(#[$fm:meta])* $n:literal $f:ident : $t:ty $(, $($rest:tt)*)?
+    ) => {
+        $crate::typed!(@munch $h $st
+            [$($s)* ($(#[$fm])* $f : $t)] [$($r)* ($f : $t)] [$($o)*]
+            [$($l)* ($n $f)] [$($a)* ($n $f ($t))] $($($rest)*)?);
+    };
+    (@row ($n:literal $f:ident (as {$row:ident} $($opt:tt)?))) => {
+        $crate::api::table::Field {
+            n: $n,
+            name: $crate::api::typed::field_name(stringify!($f)),
+            ty: $crate::api::table::Ty::Rec(&$row),
+            #[cfg(test)]
+            optional: $crate::typed!(@opt $($opt)?),
+        }
+    };
+    (@row ($n:literal $f:ident (as [$row:ident] $($opt:tt)?))) => {
+        $crate::api::table::Field {
+            n: $n,
+            name: $crate::api::typed::field_name(stringify!($f)),
+            ty: $crate::api::table::Ty::Recs(&$row),
+            #[cfg(test)]
+            optional: $crate::typed!(@opt $($opt)?),
+        }
+    };
+    (@opt ?) => { true };
+    (@opt) => { false };
+    (@row ($n:literal $f:ident (gone $t:ty))) => {
+        $crate::api::table::Field {
+            n: $n,
+            name: $crate::api::typed::field_name(stringify!($f)),
+            ty: $crate::api::table::Ty::Gone(&<$t as $crate::api::typed::Wire>::TY),
+            #[cfg(test)]
+            optional: true,
+        }
+    };
+    (@row ($n:literal $f:ident ($t:ty))) => {
+        $crate::api::table::Field {
+            n: $n,
+            name: $crate::api::typed::field_name(stringify!($f)),
+            ty: <$t as $crate::api::typed::Wire>::TY,
+            #[cfg(test)]
+            optional: <$t as $crate::api::typed::Wire>::OPTIONAL,
+        }
+    };
+    // A record held in replies: its row, `$stat`, written out in the
+    // static itself, so that a record that holds itself can name its own
+    // row; and its place as a field or a list's item.
+    (@munch [$(#[$m:meta])* $name:ident] [$stat:ident $title:literal]
+        $s:tt $r:tt $o:tt $l:tt [$($a:tt)*]
+    ) => {
+        $crate::typed!(@body [$(#[$m])* $name] ($stat.fields) $s $r $o $l);
+
+        #[doc = concat!("The *", $title, "* record's row in the tables.")]
+        pub static $stat: $crate::api::table::Rec = $crate::api::table::Rec {
+            name: $title,
+            fields: &[ $( $crate::typed!(@row $a) ),* ],
+        };
+
+        impl $crate::api::typed::Wire for $name {
+            const TY: $crate::api::table::Ty = $crate::api::table::Ty::Rec(&$stat);
+            const LIST: $crate::api::table::Ty = $crate::api::table::Ty::Recs(&$stat);
+            fn encode_into(&self, out: &mut Vec<u8>) {
+                $crate::api::typed::record_into(self, out)
+            }
+            fn encoded_len(&self) -> usize {
+                $crate::api::typed::record_len(self)
+            }
+            fn measured(&self) -> (usize, bool) {
+                $crate::api::typed::record_measured(self)
+            }
+            fn check(&self, at: &$crate::api::typed::At) -> Result<(), String> {
+                $crate::api::typed::record_check(self, at)
+            }
+            fn take(
+                v: cardinal_encoding::Value,
+                at: &$crate::api::typed::At,
+            ) -> Result<Self, String> {
+                $crate::api::typed::record_take(v, at)
+            }
+        }
+    };
+    // The arguments or the reply of a request: its rows in a static of
+    // their own, so that every crate that names them names the one.
+    (@munch [$(#[$m:meta])* $name:ident] [] $s:tt $r:tt $o:tt $l:tt [$($a:tt)*]) => {
+        $crate::typed!(@body [$(#[$m])* $name] ({
+            static FIELDS: &[$crate::api::table::Field] = &[ $( $crate::typed!(@row $a) ),* ];
+            FIELDS
+        }) $s $r $o $l);
+    };
+    (@body [$(#[$m:meta])* $name:ident] ($fields:expr)
+        [$(($(#[$fm:meta])* $sf:ident : $st:ty))*]
+        [$(($rf:ident : $rt:ty))*]
+        [$($of:ident)*]
+        [$(($ln:literal $lf:ident))*]
+    ) => {
+        $(#[$m])*
+        #[derive(Clone, Debug, PartialEq)]
+        pub struct $name {
+            $( $(#[$fm])* pub $sf: $st, )*
+        }
+
+        impl $name {
+            /// It, with the fields it always has, in order; the others
+            /// absent.
+            #[allow(clippy::new_without_default, clippy::too_many_arguments)]
+            pub fn new($($rf: $rt),*) -> Self {
+                $name { $($rf,)* $($of: None,)* }
+            }
+        }
+
+        impl $crate::api::typed::Fields for $name {
+            const FIELDS: &'static [$crate::api::table::Field] = $fields;
+
+            fn each<V: $crate::api::typed::Visit>(&self, v: &mut V) {
+                $( v.field(
+                    const {
+                        &<$name as $crate::api::typed::Fields>::FIELDS[
+                            $crate::api::typed::index(
+                                <$name as $crate::api::typed::Fields>::FIELDS,
+                                $ln,
+                            )
+                        ]
+                    },
+                    &self.$lf,
+                ); )*
+                let _ = v;
+            }
+
+            #[allow(unused_mut, unused_variables)]
+            fn take_fields(
+                mut r: cardinal_encoding::Record,
+                at: &$crate::api::typed::At,
+            ) -> Result<Self, String> {
+                Ok($name { $(
+                    $lf: $crate::api::typed::take_field(
+                        &mut r,
+                        const {
+                            &<$name as $crate::api::typed::Fields>::FIELDS[
+                                $crate::api::typed::index(
+                                    <$name as $crate::api::typed::Fields>::FIELDS,
+                                    $ln,
+                                )
+                            ]
+                        },
+                        at,
+                    )?,
+                )* })
+            }
+        }
+
+        const _: () = $crate::api::typed::ascending(
+            <$name as $crate::api::typed::Fields>::FIELDS,
+        );
+    };
+}
+
+/// A typed request: its row, `ROW`, for [`REQUESTS`], from its typed
+/// arguments and reply; how it is answered; and how it pages.
+///
+/// `asks!(ROW: n "name" Args -> Reply, how)`, where `how` is
+///
+/// - `reads`: it changes nothing, so where the tests run the service
+///   answers it by name too and fails it if the two differ;
+/// - `reads unless field`: the same while `field` is not given (`reads
+///   unless a or b`: while neither is);
+/// - `writes`: answered once; same-bytes cases written by hand cover it;
+/// - `stream`: answered by the connection itself, which then carries a
+///   stream (`watch`, `call-media`).
+///
+/// Every request but a stream is answered by `impl Answer for Args`
+/// (`control::typed`): one declared without it does not compile. A paged
+/// one says how after `how`: `after list` (by position; `after list by
+/// id` where an item too large names its `id`), `after a, b, c` (by
+/// position through several lists in turn, each a `Vec` or an
+/// `Option<Vec>`, as `groups` is), or `before list by id` (back from the
+/// newest, `next` the `id` of the oldest given);
+/// its arguments then have `after` or `before`, and `limit`, and its
+/// reply the list, `more` and `next`, which the page is cut by.
+macro_rules! asks {
+    ($row:ident: $n:literal $name:literal $args:ident -> $reply:ident,
+        $how:ident $(unless $unless:ident $(or $or:ident)*)? $(, $($page:tt)*)?) => {
+        #[doc = concat!("The row of `", $name, "`, typed.")]
+        pub static $row: Request = Request {
+            n: $n,
+            name: $name,
+            args: <$args as Fields>::FIELDS,
+            reply: <$reply as Fields>::FIELDS,
+            page: asks!(@page $($($page)*)?),
+            gone: false,
+            answer: asks!(@answer $how $args),
+        };
+
+        impl super::typed::Ask for $args {
+            const REQUEST: &'static Request = &$row;
+            type Reply = $reply;
+            asks!(@reads $how $($unless $($or)*)?);
+            asks!(@paging $args $reply $($($page)*)?);
+        }
+    };
+    (@answer stream $args:ident) => { None };
+    (@answer $how:ident $args:ident) => {
+        Some(crate::control::typed::answering::<$args> as super::table::Answerer)
+    };
+    (@reads reads) => {
+        fn reads(&self) -> bool {
+            true
+        }
+    };
+    (@reads reads $unless:ident $($or:ident)*) => {
+        fn reads(&self) -> bool {
+            self.$unless.is_none() $(&& self.$or.is_none())*
+        }
+    };
+    (@reads writes) => {};
+    (@reads stream) => {};
+    (@page) => { Page::Whole };
+    (@page after $list:ident $($rest:tt)*) => { Page::After };
+    (@page before $list:ident $($rest:tt)*) => { Page::Before { list: stringify!($list) } };
+    (@paging $args:ident $reply:ident) => {
+        type Answered = $reply;
+        fn reply_bytes(&self, reply: $reply) -> Vec<u8> {
+            super::typed::reply_message(Self::REQUEST.name, &reply)
+        }
+    };
+    (@id) => { |_| None };
+    (@id $id:ident) => { |x| Some(&x.$id[..]) };
+    // An item of a list paged in turn, by its place in that list, named
+    // by its id where it has one.
+    (@item_id $list:expr, $i:expr) => { None };
+    (@item_id $list:expr, $i:expr, $id:ident) => {
+        $list.item($i).map(|x| &x.$id[..])
+    };
+    // A reply its handler cut itself, from where the page begins
+    // (`Precut`): the old pager's `_page_from` and `_page_total`.
+    (@paging $args:ident $reply:ident after $list:ident $(by $id:ident)? precut) => {
+        type Answered = super::typed::Precut<$reply>;
+        fn reply_bytes(&self, cut: super::typed::Precut<$reply>) -> Vec<u8> {
+            let super::typed::Precut { mut reply, from, total } = cut;
+            const SKIP: [u64; 3] = super::typed::paged_numbers(
+                <$reply as Fields>::FIELDS,
+                stringify!($list),
+            );
+            let base = super::typed::record_len_except(&reply, &SKIP);
+            match super::typed::page_precut(
+                Self::REQUEST,
+                stringify!($list),
+                &mut reply.$list,
+                base,
+                self.after,
+                self.limit,
+                from,
+                total,
+                asks!(@id $($id)?),
+            ) {
+                Ok(cut) => {
+                    reply.more = cut.more;
+                    reply.next = cut.next;
+                    super::typed::reply_message(Self::REQUEST.name, &reply)
+                }
+                Err(super::typed::Unpaged(msg)) => msg,
+            }
+        }
+        asks!(@pages $args $reply $list);
+    };
+    (@paging $args:ident $reply:ident after $list:ident $(by $id:ident)?) => {
+        type Answered = $reply;
+        fn reply_bytes(&self, mut reply: $reply) -> Vec<u8> {
+            // beside the reply's other fields: without the list, `more`, `next`
+            const SKIP: [u64; 3] = super::typed::paged_numbers(
+                <$reply as Fields>::FIELDS,
+                stringify!($list),
+            );
+            let base = super::typed::record_len_except(&reply, &SKIP);
+            match super::typed::page_after(
+                Self::REQUEST,
+                stringify!($list),
+                &mut reply.$list,
+                base,
+                self.after,
+                self.limit,
+                asks!(@id $($id)?),
+            ) {
+                Ok(cut) => {
+                    reply.more = cut.more;
+                    reply.next = cut.next;
+                    super::typed::reply_message(Self::REQUEST.name, &reply)
+                }
+                Err(super::typed::Unpaged(msg)) => msg,
+            }
+        }
+        asks!(@pages $args $reply $list);
+    };
+    // How a client asks for one list page after page.
+    (@pages $args:ident $reply:ident $list:ident) => {
+        fn one_page(&self) -> bool {
+            self.after.is_some() || self.limit.is_some()
+        }
+        fn next_page(&self, had: &$reply) -> Option<Self> {
+            let next = had.next.filter(|_| had.more)?;
+            Some($args {
+                after: Some(next),
+                ..self.clone()
+            })
+        }
+        fn join(all: &mut $reply, page: $reply) -> bool {
+            let grew = !page.$list.is_empty();
+            all.$list.extend(page.$list);
+            (all.more, all.next) = (page.more, page.next);
+            grew
+        }
+        fn whole(all: &mut $reply) {
+            (all.more, all.next) = (false, None);
+        }
+    };
+    (@paging $args:ident $reply:ident
+        after $first:ident $(by $fid:ident)?, $($list:ident $(by $id:ident)?),+) => {
+        type Answered = $reply;
+        fn reply_bytes(&self, mut reply: $reply) -> Vec<u8> {
+            use super::typed::PagedList;
+            // beside the reply's other fields: without its lists, `more`, `next`
+            const LISTS: &[u64] = &[
+                super::typed::number(<$reply as Fields>::FIELDS, stringify!($first)),
+                $(super::typed::number(<$reply as Fields>::FIELDS, stringify!($list)),)+
+            ];
+            const MORE_NEXT: [u64; 2] = [
+                super::typed::number(<$reply as Fields>::FIELDS, "more"),
+                super::typed::number(<$reply as Fields>::FIELDS, "next"),
+            ];
+            let skip: Vec<u64> = LISTS.iter().chain(&MORE_NEXT).copied().collect();
+            let base = super::typed::record_len_except(&reply, &skip);
+            let mut items = Vec::new();
+            reply.$first.lens(stringify!($first), &mut items);
+            $(reply.$list.lens(stringify!($list), &mut items);)+
+            match super::typed::cut_after(Self::REQUEST, &items, base, self.after, self.limit) {
+                Ok((start, taken, cut)) => {
+                    let mut at = 0;
+                    reply.$first.keep(&mut at, start, taken);
+                    $(reply.$list.keep(&mut at, start, taken);)+
+                    reply.more = cut.more;
+                    reply.next = cut.next;
+                    super::typed::reply_message(Self::REQUEST.name, &reply)
+                }
+                Err(super::typed::TooLarge { list, at, n }) => {
+                    // its id, where its list's records have one
+                    let mut id: Option<&[u8]> = None;
+                    let mut from = 0;
+                    {
+                        let count = reply.$first.count();
+                        if (from..from + count).contains(&at) {
+                            id = asks!(@item_id reply.$first, at - from $(, $fid)?);
+                        }
+                        from += count;
+                    }
+                    $({
+                        let count = reply.$list.count();
+                        if (from..from + count).contains(&at) {
+                            id = asks!(@item_id reply.$list, at - from $(, $id)?);
+                        }
+                        from += count;
+                    })+
+                    let _ = from;
+                    super::typed::too_large(Self::REQUEST, list, at, n, id).0
+                }
+            }
+        }
+        fn one_page(&self) -> bool {
+            self.after.is_some() || self.limit.is_some()
+        }
+        fn next_page(&self, had: &$reply) -> Option<Self> {
+            let next = had.next.filter(|_| had.more)?;
+            Some($args {
+                after: Some(next),
+                ..self.clone()
+            })
+        }
+        fn join(all: &mut $reply, page: $reply) -> bool {
+            use super::typed::PagedList;
+            let mut grew = all.$first.extend_with(page.$first);
+            $(grew |= all.$list.extend_with(page.$list);)+
+            (all.more, all.next) = (page.more, page.next);
+            grew
+        }
+        fn whole(all: &mut $reply) {
+            (all.more, all.next) = (false, None);
+        }
+    };
+    (@paging $args:ident $reply:ident before $list:ident by $id:ident) => {
+        type Answered = $reply;
+        fn reply_bytes(&self, mut reply: $reply) -> Vec<u8> {
+            const SKIP: [u64; 3] = super::typed::paged_numbers(
+                <$reply as Fields>::FIELDS,
+                stringify!($list),
+            );
+            let base = super::typed::record_len_except(&reply, &SKIP);
+            match super::typed::page_before(
+                Self::REQUEST,
+                stringify!($list),
+                &mut reply.$list,
+                base,
+                self.limit,
+                |x| Some(&x.$id[..]),
+            ) {
+                Ok(more) => {
+                    reply.more = more;
+                    reply.next = more.then(|| reply.$list.first().map(|x| x.$id)).flatten();
+                    super::typed::reply_message(Self::REQUEST.name, &reply)
+                }
+                Err(super::typed::Unpaged(msg)) => msg,
+            }
+        }
+        fn one_page(&self) -> bool {
+            self.before.is_some() || self.limit.is_some()
+        }
+        fn next_page(&self, had: &$reply) -> Option<Self> {
+            let next = had.next.filter(|_| had.more)?;
+            Some($args {
+                before: Some(super::typed::Reference::Id(next.to_vec())),
+                ..self.clone()
+            })
+        }
+        fn join(all: &mut $reply, mut page: $reply) -> bool {
+            let grew = !page.$list.is_empty();
+            page.$list.append(&mut all.$list);
+            all.$list = page.$list;
+            (all.more, all.next) = (page.more, page.next);
+            grew
+        }
+        fn whole(all: &mut $reply) {
+            (all.more, all.next) = (false, None);
+        }
+    };
+}
+
 macro_rules! f {
     ($n:literal $name:literal (gone $t:tt)) => {
         Field {
             n: $n,
             name: $name,
             ty: Ty::Gone(&f!(0 "" $t).ty),
+            #[cfg(test)]
+            optional: false,
         }
     };
     ($n:literal $name:literal T) => {
@@ -104,6 +626,8 @@ macro_rules! f {
             n: $n,
             name: $name,
             ty: Ty::Text,
+            #[cfg(test)]
+            optional: false,
         }
     };
     ($n:literal $name:literal B) => {
@@ -111,6 +635,8 @@ macro_rules! f {
             n: $n,
             name: $name,
             ty: Ty::Bytes,
+            #[cfg(test)]
+            optional: false,
         }
     };
     ($n:literal $name:literal U) => {
@@ -118,6 +644,8 @@ macro_rules! f {
             n: $n,
             name: $name,
             ty: Ty::Uint,
+            #[cfg(test)]
+            optional: false,
         }
     };
     ($n:literal $name:literal I) => {
@@ -125,6 +653,8 @@ macro_rules! f {
             n: $n,
             name: $name,
             ty: Ty::Int,
+            #[cfg(test)]
+            optional: false,
         }
     };
     ($n:literal $name:literal BOOL) => {
@@ -132,6 +662,8 @@ macro_rules! f {
             n: $n,
             name: $name,
             ty: Ty::Bool,
+            #[cfg(test)]
+            optional: false,
         }
     };
     ($n:literal $name:literal REF) => {
@@ -139,6 +671,8 @@ macro_rules! f {
             n: $n,
             name: $name,
             ty: Ty::Ref,
+            #[cfg(test)]
+            optional: false,
         }
     };
     ($n:literal $name:literal KIND) => {
@@ -146,6 +680,8 @@ macro_rules! f {
             n: $n,
             name: $name,
             ty: Ty::Kind,
+            #[cfg(test)]
+            optional: false,
         }
     };
     ($n:literal $name:literal SCALAR) => {
@@ -153,6 +689,8 @@ macro_rules! f {
             n: $n,
             name: $name,
             ty: Ty::Scalar,
+            #[cfg(test)]
+            optional: false,
         }
     };
     ($n:literal $name:literal [T]) => {
@@ -160,6 +698,8 @@ macro_rules! f {
             n: $n,
             name: $name,
             ty: Ty::List(&Ty::Text),
+            #[cfg(test)]
+            optional: false,
         }
     };
     ($n:literal $name:literal [B]) => {
@@ -167,6 +707,8 @@ macro_rules! f {
             n: $n,
             name: $name,
             ty: Ty::List(&Ty::Bytes),
+            #[cfg(test)]
+            optional: false,
         }
     };
     ($n:literal $name:literal [U]) => {
@@ -174,6 +716,8 @@ macro_rules! f {
             n: $n,
             name: $name,
             ty: Ty::List(&Ty::Uint),
+            #[cfg(test)]
+            optional: false,
         }
     };
     ($n:literal $name:literal [REF]) => {
@@ -181,6 +725,8 @@ macro_rules! f {
             n: $n,
             name: $name,
             ty: Ty::List(&Ty::Ref),
+            #[cfg(test)]
+            optional: false,
         }
     };
     ($n:literal $name:literal [SCALAR]) => {
@@ -188,6 +734,8 @@ macro_rules! f {
             n: $n,
             name: $name,
             ty: Ty::List(&Ty::Scalar),
+            #[cfg(test)]
+            optional: false,
         }
     };
     ($n:literal $name:literal [[U]]) => {
@@ -195,6 +743,8 @@ macro_rules! f {
             n: $n,
             name: $name,
             ty: Ty::List(&Ty::List(&Ty::Uint)),
+            #[cfg(test)]
+            optional: false,
         }
     };
     ($n:literal $name:literal {$r:ident}) => {
@@ -202,6 +752,8 @@ macro_rules! f {
             n: $n,
             name: $name,
             ty: Ty::Rec(&$r),
+            #[cfg(test)]
+            optional: false,
         }
     };
     ($n:literal $name:literal [$r:ident]) => {
@@ -209,13 +761,9 @@ macro_rules! f {
             n: $n,
             name: $name,
             ty: Ty::Recs(&$r),
+            #[cfg(test)]
+            optional: false,
         }
-    };
-}
-
-macro_rules! rec {
-    ($id:ident $name:literal: $($n:literal $f:literal $t:tt),* $(,)?) => {
-        pub static $id: Rec = Rec { name: $name, fields: &[$(f!($n $f $t)),*] };
     };
 }
 
@@ -228,23 +776,7 @@ macro_rules! req {
             reply: &[$(f!($rn $rf $rt)),*],
             page: Page::Whole,
             gone: false,
-        }
-    };
-}
-
-/// A request whose answer comes in pages, written as `req!` writes one
-/// after how: `after`, or `before` and the list paged.
-macro_rules! paged {
-    (after $($t:tt)*) => {
-        Request {
-            page: Page::After,
-            ..req!($($t)*)
-        }
-    };
-    (before $list:literal $($t:tt)*) => {
-        Request {
-            page: Page::Before { list: $list },
-            ..req!($($t)*)
+            answer: None,
         }
     };
 }
@@ -259,543 +791,3124 @@ macro_rules! gone {
 
 // ---- Records in replies ----
 
-rec!(APP_QUESTION "app question":
-    1 "asks" T, 2 "id" U, 3 "name" T, 4 "program" T, 5 "role" T, 6 "what" T);
-rec!(APPROVAL "approval":
-    1 "change" BOOL, 2 "covers" T, 3 "device" T, 4 "family" B, 5 "id" B, 6 "name" T,
-    7 "program" T, 8 "revoked" BOOL, 9 "this_device" BOOL);
-rec!(APP_OFFER "app offer":
-    1 "application" T, 2 "from" T, 3 "name" T, 4 "sentence" T, 5 "space" B);
+typed!(
+    /// What a program asks the person, waiting for their answer.
+    APP_QUESTION "app question" AppQuestion {
+        /// `family`, `new-space` or `share`.
+        1 asks: Cow<'static, str>,
+        2 id: u64,
+        3 name: String,
+        4 program: String,
+        /// Of `share`: `reader` or `writer`.
+        5 role: Option<Cow<'static, str>>,
+        6 what: String,
+    }
+);
+typed!(
+    /// An approval of the person's, made on one of their devices.
+    APPROVAL "approval" ApprovalShown {
+        1 change: bool,
+        /// The family's title, or the start of its root in hex.
+        2 covers: String,
+        3 device: Option<String>,
+        4 family: [u8; 32],
+        5 id: [u8; 16],
+        6 name: String,
+        7 program: String,
+        8 revoked: bool,
+        9 this_device: bool,
+    }
+);
+typed!(
+    /// A space of an application offered to this person.
+    APP_OFFER "app offer" AppOffer {
+        1 application: Option<String>,
+        2 from: String,
+        3 name: String,
+        4 sentence: Option<String>,
+        5 space: [u8; 32],
+    }
+);
 
-rec!(ATTACHMENT "attachment": 1 "name" T, 2 "size" U, 3 "type" T);
-rec!(BLUETOOTH "bluetooth":
-    1 "available" BOOL, 2 "channels_in" U, 3 "error" T, 4 "mode" T, 5 "on" BOOL, 6 "psm" U,
-    7 "radio" T, 8 "recognized" U, 9 "seen" U, 10 "why_not" T, 11 "windows" U,
-    12 "too_old" BOOL);
-rec!(CALL "call":
-    1 "frames" {CALL_FRAMES}, 2 "group" B, 3 "id" B, 4 "linked" U, 5 "name" T, 6 "offered" [B],
-    7 "people" U, 8 "picture" T, 9 "seconds" U, 10 "state" T, 11 "taken" [B], 12 "who" B,
-    13 "voices" [VOICE], 14 "they_take" [B], 15 "camera" BOOL, 16 "caller" {MEMBER},
-    17 "admins" [MEMBER], 18 "joins" BOOL, 19 "reach" {GROUP_REACH}, 20 "for_call" BOOL);
-rec!(CALL_ENDED "call ended":
-    1 "group" B, 2 "how" T, 3 "id" B, 4 "name" T, 5 "who" B, 6 "at" U);
-rec!(CONDITIONS "conditions": 1 "helps" BOOL, 2 "metered" BOOL, 3 "plugged_in" BOOL);
-rec!(CONFLICT "conflict":
-    1 "copies" [T], 2 "delete_conflict" BOOL, 3 "path" T, 4 "versions" [VERSION]);
-rec!(CONTACT "contact":
-    1 "category" T, 2 "connected" BOOL, 3 "identity" B, 4 "introductions" BOOL, 5 "met" {MET},
-    6 "name" T, 7 "nearby" BOOL, 8 "own" BOOL, 9 "picture" T, 10 "recovered" T,
-    11 "refused" BOOL, 12 "relayed" BOOL, 13 "suggested" T, 14 "trusted" BOOL,
-    15 "recovered_seen" U, 16 "recovered_new_guardians" BOOL, 17 "recovered_delay" U,
-    18 "unreadable" T);
-rec!(CONTACT_REACH "contact reach":
-    1 "named" [T], 2 "said_no" BOOL, 3 "shared" BOOL, 4 "waiting" BOOL);
-rec!(CONVERSATION "conversation":
-    1 "connected" BOOL, 2 "id" B, 3 "introductions" BOOL, 4 "last" {LAST}, 5 "name" T,
-    6 "nearby" BOOL, 7 "own" BOOL, 8 "picture" T, 9 "reach" {CONTACT_REACH}, 10 "relayed" BOOL,
-    11 "suggested" T, 12 "trusted" BOOL, 13 "unread" U);
-rec!(COPIES "copies":
-    1 "blobs" U, 2 "count" U, 3 "eligible" U, 4 "holders" [HOLDER], 5 "interval_ms" U,
-    6 "now" U, 7 "older_than_ms" U);
-rec!(DEVICE "device":
-    1 "addr" T, 2 "carrier" T, 3 "fetch" {FETCH}, 4 "key" B, 5 "name" T, 6 "online" BOOL,
-    7 "power" T, 8 "this" BOOL, 9 "through" T, 10 "unreadable" {UNREADABLE}, 11 "dials" U,
-    12 "redial_s" U);
-rec!(ENDPOINT "endpoint": 1 "endpoint" T, 2 "local" BOOL, 3 "tried" BOOL, 4 "why_not" T);
-rec!(FETCH "fetch": 1 "latency_ms" U, 2 "rate" U, 3 "received" U, 4 "replies" U);
-rec!(FILE "file":
-    1 "added_by" T, 2 "category" BOOL, 3 "folder" BOOL, 4 "mine" BOOL, 5 "name" T, 6 "size" U,
-    7 "time" U, 8 "versions" U, 9 "who" B, 10 "group" B);
-rec!(CALL_FRAMES "frames": 1 "in" U, 2 "new" U);
-rec!(GROUP "group":
-    1 "admin" BOOL, 2 "did_not_stand" [B], 3 "did_not_stand_changes" [GROUP_CHANGE],
-    4 "ended" T, 5 "group" B, 6 "held_back" U, 7 "introductions" BOOL, 8 "last" {LAST},
-    9 "members" U, 10 "moved" {GROUP_CHANGE}, 11 "name" T, 12 "not_posted" U, 13 "public" BOOL,
-    14 "reach" {GROUP_REACH}, 15 "role" T, 16 "unread" U, 17 "was" B, 18 "confirm" [B],
-    19 "to_confirm" [GROUP_CHANGE], 20 "for_call" BOOL, 21 "last_call" {CALL_ENDED});
-rec!(GROUP_CHANGE "group change":
-    1 "at" U, 2 "by" T, 3 "group" B, 4 "roles" [ROLE_CHANGE], 5 "seen" U, 6 "taken_out" [T],
-    7 "device" T, 8 "to" B);
-rec!(GROUP_REACH "group reach":
-    1 "added" [T], 2 "ask" BOOL, 3 "public" BOOL, 4 "said_no" BOOL, 5 "set" BOOL,
-    6 "shared" BOOL, 7 "waiting" BOOL, 8 "what" [T], 9 "who" [T], 10 "named" [T]);
-rec!(GROUP_SHOWN "group shown": 1 "group" B, 2 "name" T, 3 "what" [T]);
-rec!(GUARDIAN_CHANGE "guardian change":
-    1 "caution" T, 2 "confirm_delay" U, 3 "confirm_delay_text" T, 4 "confirm_from_ms" U,
-    5 "confirmed" U, 6 "confirmed_by_me" BOOL, 7 "delay" U, 8 "delay_text" T,
-    9 "fingerprint" T, 10 "guardians" U, 11 "id" B, 12 "in_effect" BOOL, 13 "names" [T],
-    14 "needed" U, 15 "never" BOOL, 16 "objected" BOOL, 17 "threshold" U,
-    18 "waits_until_ms" U);
-rec!(GUARDED "guarded":
-    1 "account_copy" BOOL, 2 "changes" [GUARDIAN_CHANGE], 3 "delay" U, 4 "delay_text" T,
-    5 "guardians" U, 6 "helpers" U, 7 "id" B, 8 "name" T, 9 "never" [T], 10 "persona" B,
-    11 "persona_at" T, 12 "recoveries" [RECOVERY], 13 "threshold" U, 14 "waiting" U,
-    15 "warning" T);
-rec!(HOLDER "holder":
-    1 "checking" BOOL, 2 "counted" BOOL, 3 "key" B, 4 "last_check" U, 5 "last_fail" U,
-    6 "last_pass" U, 7 "missed" U, 8 "name" T, 9 "online" BOOL, 10 "reason" T, 11 "state" T,
-    12 "this" BOOL);
-rec!(HOST "host": 1 "addresses" [T], 2 "key" (gone T), 3 "name" T, 4 "key" B);
-rec!(HOSTABLE "hostable": 1 "name" T, 2 "outside" BOOL, 3 "sees" T, 4 "services" [T]);
-rec!(HOSTING "hosting":
-    1 "accepted" BOOL, 2 "devices" [T], 3 "ended" BOOL, 4 "envelopes" U, 5 "mine" BOOL,
-    6 "name" T, 7 "relay_bytes" U, 8 "sees" T, 9 "waiting" U, 10 "who" B,
-    11 "serving" [HOSTABLE], 12 "offered_at" U, 13 "after" B, 14 "accepted_at" U,
-    15 "ended_at" U, 16 "ended_by" B, 17 "declined" BOOL);
-rec!(INSPECTION "inspection": 1 "on" BOOL, 2 "until" U);
-rec!(INTRODUCTION "introduction":
-    1 "from" T, 2 "group" T, 3 "id" B, 4 "kind" T, 5 "name" T, 6 "note" T);
-rec!(INVITATION "invitation":
-    1 "cancelled" BOOL, 2 "expired" BOOL, 3 "hosts_only" BOOL, 4 "id" B, 5 "made" U,
-    6 "name" T, 7 "outstanding" BOOL, 8 "used" U, 9 "uses" U);
-rec!(LAST "last message": 1 "from" T, 2 "mine" BOOL, 3 "text" T, 4 "time" U);
-rec!(KEPT_CHANGE "kept change":
-    1 "at" U, 2 "by" T, 3 "can_undo" BOOL, 4 "device" T, 5 "group" B, 6 "handed_to" T,
-    7 "name" T, 8 "roles" [ROLE_CHANGE], 9 "taken_out" [T], 10 "to" B, 11 "undo" T,
-    12 "undone" B);
-rec!(LOST_DEVICE "lost device": 1 "key" B, 2 "name" T, 3 "set_aside" U);
-rec!(MEMBER "member":
-    1 "contact" BOOL, 2 "id" B, 3 "introduce" BOOL, 4 "left" BOOL, 5 "name" T, 6 "own" BOOL,
-    7 "picture" T, 8 "role" T, 9 "shown" T, 10 "suggested" T, 11 "taken_out" BOOL,
-    12 "you" BOOL, 13 "reach" T, 14 "reaches_you" BOOL, 15 "through" T);
-rec!(MESSAGE "message":
-    1 "attachments" [ATTACHMENT], 2 "edited" BOOL, 3 "from" T, 4 "id" B, 5 "mine" BOOL,
-    6 "picture" T, 7 "reactions" [REACTION], 8 "read_by" U, 9 "reply_to" B, 10 "state" T,
-    11 "text" T, 12 "time" U);
-rec!(NO_LONGER_NEEDED "no longer needed": 1 "at_ms" U, 2 "id" B, 3 "name" T, 4 "text" T);
-rec!(MET "met": 1 "by" T, 2 "group" T, 3 "how" T, 4 "via" T);
-rec!(KNOWN_PATH "known path":
-    1 "addr" T, 2 "checking" BOOL, 3 "confirmed_s_ago" U, 4 "misses" U, 5 "next_check_s" U,
-    6 "probes" U, 7 "wait_s" U);
-rec!(NEARBY "nearby": 1 "they_give_secret" BOOL, 2 "you_give_secret" BOOL);
-rec!(NETWORK "network":
-    1 "answered" BOOL, 2 "ask" BOOL, 3 "known" BOOL, 4 "mine" BOOL, 5 "name" T, 6 "router" T,
-    7 "routers" BOOL);
-rec!(OFFER "offer":
-    1 "from" T, 2 "group" B, 3 "members" U, 4 "name" T, 5 "public" BOOL, 6 "reach" {GROUP_REACH},
-    7 "for_call" BOOL, 8 "last_call" {CALL_ENDED});
-rec!(OLD "old versions":
-    1 "at" U, 2 "bytes" U, 3 "keep" T, 4 "only_here" {ONLY_HERE}, 5 "unchecked" BOOL);
-rec!(ONLY_HERE "only here": 1 "bytes" U, 2 "files" U);
-rec!(PAIR_AGAIN "pair again": 1 "key" B, 2 "name" T);
-rec!(PAIRING "pairing": 1 "admin" T, 2 "code" T, 3 "error" T, 4 "state" T, 5 "power" T);
-rec!(PEER "peer": 1 "addr" T, 2 "device" T);
-rec!(PLACE "place": 1 "kind" T, 2 "name" T, 3 "who" B, 4 "group" B);
-rec!(PROGRESS "progress":
-    1 "bytes_fetched" U, 2 "bytes_pending" U, 3 "bytes_wanted" U, 4 "files_pending" U,
-    5 "last_error" T, 6 "rate" U);
-rec!(REACTION "reaction": 1 "count" U, 2 "mine" BOOL, 3 "text" T);
-rec!(RECOVERY "recovery":
-    1 "caution" T, 2 "confirm_from_ms" U, 3 "confirmed" U, 4 "confirmed_by_me" BOOL,
-    5 "endorsed" U, 6 "endorsed_by_me" BOOL, 7 "fingerprint" T, 8 "id" B, 9 "in_effect" BOOL,
-    10 "keeps_keys" BOOL, 11 "objected" BOOL, 12 "pending" BOOL);
-rec!(RELAYED_FOR "relayed for": 1 "a" T, 2 "a_id" B, 3 "b" T, 4 "b_id" B);
-rec!(REJOIN "rejoin": 1 "group" B, 2 "members" U, 3 "name" T);
-rec!(ROLE_CHANGE "role change": 1 "from" T, 2 "name" T, 3 "to" T);
-rec!(REDIAL "redial": 1 "alone" BOOL, 2 "helps" BOOL, 3 "sparing" {SPARING});
-rec!(SPARING "sparing": 1 "next_s" U, 2 "wait_s" U);
-rec!(ROUTER "router":
-    1 "error" T, 2 "everywhere" BOOL, 3 "external" T, 4 "named" [T], 5 "network" {NETWORK},
-    6 "on" BOOL, 7 "protocol" T, 8 "seconds_left" U, 9 "this_device" BOOL);
-rec!(SESSION_DEVICE "contact's device":
-    1 "addr" T, 2 "bytes_received" U, 3 "bytes_sent" U, 4 "carrier" T, 5 "heard_ms_ago" U,
-    6 "kept_in_touch" BOOL, 7 "key" B, 8 "online" BOOL, 9 "open_for_s" U, 10 "opened_by" T,
-    11 "packets_dropped" U, 12 "packets_lost" U, 13 "route" T, 14 "rtt_ms" U,
-    15 "they_see_you_at" T, 16 "through" T, 17 "unreadable" {UNREADABLE},
-    18 "kept_alive_s" U, 19 "path" {KNOWN_PATH}, 20 "neighbour" BOOL);
-rec!(SET_ASIDE "set aside": 1 "entry" B, 2 "space" B, 3 "time_ms" U);
-rec!(SPACE_USAGE "space usage":
-    1 "full" BOOL, 2 "history_bytes" U, 3 "history_days" U, 4 "live_bytes" U, 5 "log_bytes" U,
-    6 "name" T, 7 "retention" T, 8 "space" B);
-rec!(SPACE "space": 1 "entries" U, 2 "id" B, 3 "kind" T, 4 "set_aside" U, 5 "valid" U);
-rec!(STEP "step": 1 "at" U, 2 "ok" BOOL, 3 "text" T);
-rec!(SUCCESSION "succession": 1 "id" T, 2 "space" T);
-rec!(THEIR_REACH "reach seen":
-    1 "device" B, 2 "endpoints" [ENDPOINT], 3 "host" B, 4 "session" BOOL, 5 "this_device" BOOL);
-rec!(TREE_ITEM "tree item":
-    1 "dirty" BOOL, 2 "ino" U, 3 "kind" T, 4 "local" BOOL, 5 "node" B, 6 "path" T, 7 "size" U);
-rec!(STUCK_ITEM "stuck item":
-    1 "dirty" T, 2 "kind" T, 3 "opens" U, 4 "path" T, 5 "staged" BOOL);
-rec!(UNREADABLE "unreadable":
-    1 "reason" T, 2 "retry_in_s" U, 3 "says" T, 4 "since" U, 5 "theirs" BOOL, 6 "version" T);
-rec!(UNSHOWN_NODE "unshown node": 1 "name" T, 2 "node" B);
-rec!(VERSION "version":
-    1 "current" BOOL, 2 "device" T, 3 "here" BOOL, 4 "size" U, 5 "time" U, 6 "version" U,
-    7 "by" T);
-rec!(DELETED_FILE "deleted file":
-    1 "by" T, 2 "folder" BOOL, 3 "id" B, 4 "mine" BOOL, 5 "name" T, 6 "size" U, 7 "time" U);
+typed!(ATTACHMENT "attachment" Attachment {
+    1 name: String,
+    2 size: Option<u64>,
+    3 r#type: String,
+});
+typed!(
+    /// Where Bluetooth stands on this device.
+    BLUETOOTH "bluetooth" BluetoothShown {
+        /// Whether the radio could be used, the last time it was asked.
+        1 available: Option<bool>,
+        2 channels_in: u64,
+        3 error: Option<String>,
+        /// `off`, `open` or `always`.
+        4 mode: Cow<'static, str>,
+        5 on: bool,
+        6 psm: Option<u64>,
+        7 radio: Option<String>,
+        8 recognized: u64,
+        9 seen: u64,
+        10 why_not: Option<String>,
+        11 windows: u64,
+        /// This device's Bluetooth cannot send extended advertisements.
+        12 too_old: Option<bool>,
+    }
+);
+typed!(
+    /// The call under way (`apps.md`, *call*).
+    CALL "call" Call {
+        /// In a group: how many frames came, and how many of them new.
+        1 frames: Option<CallFrames>,
+        /// In a group: the group's id.
+        2 group: Option<[u8; 32]>,
+        3 id: [u8; 16],
+        4 linked: Option<u64>,
+        5 name: String,
+        6 offered: Option<Vec<[u8; 32]>>,
+        7 people: Option<u64>,
+        8 picture: Option<String>,
+        9 seconds: Option<u64>,
+        /// `calling`, `ringing` or `live`.
+        10 state: Cow<'static, str>,
+        11 taken: Option<Vec<[u8; 32]>>,
+        /// The start of the other person's id (or the ringer's, in a group).
+        12 who: [u8; 8],
+        13 voices: Option<Vec<Voice>>,
+        14 they_take: Option<Vec<[u8; 32]>>,
+        15 camera: Option<bool>,
+        16 caller: Option<Member>,
+        17 admins: Option<Vec<Member>>,
+        18 joins: Option<bool>,
+        19 reach: Option<GroupReach>,
+        20 for_call: Option<bool>,
+    }
+);
+typed!(
+    /// How the last call ended.
+    CALL_ENDED "call ended" CallEnded {
+        1 group: Option<[u8; 32]>,
+        2 how: Cow<'static, str>,
+        3 id: [u8; 16],
+        4 name: String,
+        5 who: [u8; 8],
+        /// Added after v0.1.27: an `Option` for ever, though always sent.
+        6 at: Option<u64>,
+    }
+);
+typed!(
+    /// What this device knows of its power and its network.
+    CONDITIONS "conditions" ConditionsShown {
+        1 helps: bool,
+        2 metered: bool,
+        /// Unknown where nothing says.
+        3 plugged_in: Option<bool>,
+    }
+);
+typed!(
+    /// A file whose versions conflict.
+    CONFLICT "conflict" Conflict {
+        /// The copies that show each version, by path.
+        1 copies: Vec<String>,
+        2 delete_conflict: bool,
+        3 path: String,
+        4 versions: Vec<Version>,
+    }
+);
+typed!(
+    /// A contact of this person's.
+    CONTACT "contact" Contact {
+        1 category: String,
+        2 connected: bool,
+        /// The start of their identity.
+        3 identity: [u8; 8],
+        4 introductions: bool,
+        5 met: Option<Met>,
+        /// What this person calls them.
+        6 name: String,
+        7 nearby: bool,
+        /// Whether that name is this person's own.
+        8 own: bool,
+        9 picture: Option<String>,
+        /// What is said of them, recovered by guardians.
+        10 recovered: Option<String>,
+        11 refused: bool,
+        12 relayed: bool,
+        13 suggested: Option<String>,
+        14 trusted: bool,
+        15 recovered_seen: Option<u64>,
+        16 recovered_new_guardians: Option<bool>,
+        17 recovered_delay: Option<u64>,
+        18 unreadable: Option<String>,
+    }
+);
+typed!(
+    /// What this person's reach node says in a relationship.
+    CONTACT_REACH "contact reach" ContactReach {
+        1 named: Vec<String>,
+        2 said_no: bool,
+        3 shared: bool,
+        4 waiting: bool,
+    }
+);
+typed!(
+    /// A contact's conversation, as the list of them shows it.
+    CONVERSATION "conversation" Conversation {
+        1 connected: bool,
+        /// The start of their identity.
+        2 id: [u8; 8],
+        3 introductions: bool,
+        4 last: Option<Last>,
+        5 name: String,
+        6 nearby: bool,
+        7 own: bool,
+        8 picture: Option<String>,
+        9 reach: ContactReach,
+        10 relayed: bool,
+        11 suggested: Option<String>,
+        12 trusted: bool,
+        13 unread: u64,
+    }
+);
+typed!(
+    /// The copies of the files on the devices meant to keep everything.
+    COPIES "copies" Copies {
+        1 blobs: u64,
+        2 count: u64,
+        3 eligible: u64,
+        4 holders: Vec<Holder>,
+        5 interval_ms: u64,
+        6 now: u64,
+        7 older_than_ms: u64,
+    }
+);
+typed!(
+    /// One of the person's devices.
+    DEVICE "device" Device {
+        /// Where its session runs, or where it was last known.
+        1 addr: Option<String>,
+        2 carrier: Option<Cow<'static, str>>,
+        /// What this device's fetcher thinks of it as a source.
+        3 fetch: Option<Fetch>,
+        /// The start of its key.
+        4 key: [u8; 8],
+        5 name: String,
+        6 online: bool,
+        /// `device`, `admin` or `root`.
+        7 power: Cow<'static, str>,
+        8 this: bool,
+        /// The device a relayed session with it runs through.
+        9 through: Option<String>,
+        10 unreadable: Option<Unreadable>,
+        11 dials: Option<u64>,
+        12 redial_s: Option<u64>,
+    }
+);
+typed!(
+    /// An address a reach node gives, and whether it was tried.
+    ENDPOINT "endpoint" EndpointSeen {
+        1 endpoint: String,
+        2 local: bool,
+        3 tried: bool,
+        4 why_not: Option<Cow<'static, str>>,
+    }
+);
+typed!(
+    /// What this device's fetcher thinks of another as a source.
+    FETCH "fetch" Fetch {
+        1 latency_ms: u64,
+        2 rate: u64,
+        3 received: u64,
+        4 replies: u64,
+    }
+);
+typed!(
+    /// An entry of a folder of the one folder.
+    FILE "file" File {
+        1 added_by: Option<String>,
+        2 category: Option<bool>,
+        3 folder: bool,
+        4 mine: Option<bool>,
+        5 name: String,
+        6 size: Option<u64>,
+        7 time: Option<u64>,
+        8 versions: Option<u64>,
+        /// A contact's shared folder: the start of their id.
+        9 who: Option<[u8; 8]>,
+        /// A group's shared folder: its id.
+        10 group: Option<[u8; 32]>,
+    }
+);
+typed!(CALL_FRAMES "frames" CallFrames {
+    1 r#in: u64,
+    2 new: u64,
+});
+typed!(
+    /// A group this person is in, as the list of them shows it.
+    GROUP "group" Group {
+        /// Whether this person may manage it.
+        1 admin: bool,
+        /// The successors that did not stand.
+        2 did_not_stand: Vec<[u8; 32]>,
+        3 did_not_stand_changes: Vec<GroupChange>,
+        /// Why it ended, where nothing stands in its place.
+        4 ended: Option<String>,
+        5 group: [u8; 32],
+        6 held_back: u64,
+        7 introductions: bool,
+        8 last: Option<Last>,
+        9 members: u64,
+        /// Who moved it here, and what that changed.
+        10 moved: Option<GroupChange>,
+        11 name: String,
+        12 not_posted: u64,
+        13 public: bool,
+        14 reach: GroupReach,
+        15 role: Option<Cow<'static, str>>,
+        16 unread: u64,
+        /// The group it succeeded.
+        17 was: Option<[u8; 32]>,
+        18 confirm: Option<Vec<[u8; 32]>>,
+        19 to_confirm: Option<Vec<GroupChange>>,
+        20 for_call: Option<bool>,
+        21 last_call: Option<CallEnded>,
+    }
+);
+typed!(
+    /// What a group's move changed: who was taken out, and whose role.
+    GROUP_CHANGE "group change" GroupChange {
+        1 at: Option<u64>,
+        2 by: Option<String>,
+        3 group: Option<[u8; 32]>,
+        4 roles: Vec<RoleChange>,
+        5 seen: Option<u64>,
+        6 taken_out: Vec<String>,
+        7 device: Option<String>,
+        8 to: Option<[u8; 32]>,
+    }
+);
+typed!(
+    /// What this person's reach node says in a group, and to whom.
+    GROUP_REACH "group reach" GroupReach {
+        1 added: Vec<String>,
+        2 ask: bool,
+        3 public: bool,
+        4 said_no: bool,
+        5 set: bool,
+        6 shared: bool,
+        7 waiting: bool,
+        8 what: Vec<String>,
+        9 who: Vec<String>,
+        10 named: Option<Vec<String>>,
+    }
+);
+typed!(
+    /// A group where someone refused still reads where this person's hosts
+    /// are, and what they see there.
+    GROUP_SHOWN "group shown" GroupShown {
+        1 group: [u8; 32],
+        2 name: String,
+        3 what: Vec<String>,
+    }
+);
+typed!(
+    /// A change of guardians under way: to the person whose it is (in
+    /// `guardians`), or to one of their guardians (in `guarding`), each
+    /// with fields of its own.
+    GUARDIAN_CHANGE "guardian change" GuardianChange {
+        /// To a guardian, before it is in effect.
+        1 caution: Option<String>,
+        2 confirm_delay: u64,
+        3 confirm_delay_text: String,
+        /// To a guardian: from when they may confirm it.
+        4 confirm_from_ms: Option<u64>,
+        5 confirmed: u64,
+        6 confirmed_by_me: Option<bool>,
+        7 delay: u64,
+        8 delay_text: String,
+        9 fingerprint: String,
+        10 guardians: u64,
+        /// Its entry: whole to the person, its first eight bytes to a
+        /// guardian.
+        11 id: bytes::Bytes,
+        12 in_effect: Option<bool>,
+        /// To the person: whom it names.
+        13 names: Option<Vec<String>>,
+        14 needed: Option<u64>,
+        15 never: Option<bool>,
+        16 objected: bool,
+        17 threshold: u64,
+        18 waits_until_ms: Option<u64>,
+    }
+);
+typed!(
+    /// Someone this person guards.
+    GUARDED "guarded" Guarded {
+        1 account_copy: bool,
+        2 changes: Vec<GuardianChange>,
+        3 delay: u64,
+        4 delay_text: String,
+        5 guardians: u64,
+        6 helpers: u64,
+        7 id: [u8; 32],
+        8 name: String,
+        9 never: Vec<String>,
+        10 persona: [u8; 32],
+        /// Where the persona's service listens, where it runs here.
+        11 persona_at: Option<String>,
+        12 recoveries: Vec<RecoveryShown>,
+        13 threshold: u64,
+        14 waiting: u64,
+        15 warning: Option<String>,
+    }
+);
+typed!(
+    /// A device meant to keep everything, as a copy of the files.
+    HOLDER "holder" Holder {
+        1 checking: bool,
+        2 counted: bool,
+        /// The start of its key.
+        3 key: [u8; 8],
+        4 last_check: Option<u64>,
+        5 last_fail: Option<u64>,
+        6 last_pass: Option<u64>,
+        7 missed: u64,
+        8 name: String,
+        9 online: bool,
+        /// Why it does not count, where it does not.
+        10 reason: Option<String>,
+        11 state: Cow<'static, str>,
+        12 this: bool,
+    }
+);
+typed!(
+    /// A host of this person's, as the recovery sheet names it.
+    HOST "host" Host {
+        1 addresses: Vec<String>,
+        2 gone key: String,
+        3 name: String,
+        /// Its link key's X25519 half.
+        4 key: [u8; 32],
+    }
+);
+typed!(
+    /// A device that serves, or can: whether it is reached from outside
+    /// its network, what it gives, and what it sees.
+    HOSTABLE "hostable" Hostable {
+        1 name: String,
+        2 outside: bool,
+        3 sees: Cow<'static, str>,
+        4 services: Vec<Cow<'static, str>>,
+    }
+);
+typed!(
+    /// A hosting between this person and a contact, or an offer of one.
+    HOSTING "hosting" Hosting {
+        1 accepted: bool,
+        2 devices: Vec<String>,
+        3 ended: bool,
+        4 envelopes: Option<u64>,
+        /// This person hosts them.
+        5 mine: bool,
+        6 name: String,
+        7 relay_bytes: Option<u64>,
+        8 sees: Cow<'static, str>,
+        /// Envelopes held for them on this device, where it serves them.
+        9 waiting: Option<u64>,
+        10 who: [u8; 32],
+        11 serving: Vec<Hostable>,
+        12 offered_at: Option<u64>,
+        /// The message in the conversation it comes just after.
+        13 after: Option<[u8; 16]>,
+        14 accepted_at: Option<u64>,
+        15 ended_at: Option<u64>,
+        16 ended_by: Option<[u8; 32]>,
+        17 declined: bool,
+    }
+);
+typed!(
+    /// Whether this device may be inspected now, and until when.
+    INSPECTION "inspection" Inspection {
+        1 on: bool,
+        2 until: Option<u64>,
+    }
+);
+typed!(
+    /// An introduction waiting for this person.
+    INTRODUCTION "introduction" Introduction {
+        /// Who introduces, by what this person calls them.
+        1 from: String,
+        /// The group it comes through.
+        2 group: Option<String>,
+        3 id: [u8; 16],
+        /// `meet` or `introduced`.
+        4 kind: Cow<'static, str>,
+        5 name: String,
+        6 note: Option<String>,
+    }
+);
+typed!(
+    /// An invitation this person made.
+    INVITATION "invitation" Invitation {
+        1 cancelled: bool,
+        2 expired: bool,
+        3 hosts_only: bool,
+        4 id: [u8; 16],
+        5 made: Option<u64>,
+        6 name: Option<String>,
+        7 outstanding: bool,
+        8 used: u64,
+        9 uses: u64,
+    }
+);
+typed!(
+    /// The last message of a conversation.
+    LAST "last message" Last {
+        /// In a group: who said it.
+        1 from: Option<String>,
+        2 mine: bool,
+        3 text: String,
+        4 time: Option<u64>,
+    }
+);
+typed!(
+    /// A group change kept after a recovery by guardians (D84).
+    KEPT_CHANGE "kept change" KeptChange {
+        1 at: Option<u64>,
+        2 by: String,
+        3 can_undo: bool,
+        4 device: Option<String>,
+        /// The group it left.
+        5 group: [u8; 32],
+        6 handed_to: Option<String>,
+        7 name: String,
+        8 roles: Vec<RoleChange>,
+        9 taken_out: Vec<String>,
+        /// The group it moved to.
+        10 to: [u8; 32],
+        11 undo: String,
+        /// The group an undo made.
+        12 undone: Option<[u8; 32]>,
+    }
+);
+typed!(
+    /// A device a recovery removed.
+    LOST_DEVICE "lost device" LostDevice {
+        /// The start of its key.
+        1 key: [u8; 8],
+        2 name: Option<String>,
+        /// What it wrote that is set aside in the spaces held now.
+        3 set_aside: Option<u64>,
+    }
+);
+typed!(
+    /// A member of a group, as this person sees them.
+    MEMBER "member" Member {
+        1 contact: bool,
+        /// The start of their id.
+        2 id: [u8; 8],
+        3 introduce: bool,
+        4 left: bool,
+        5 name: String,
+        6 own: Option<bool>,
+        7 picture: Option<String>,
+        /// `owner`, `admin`, `member`, `reader` or `taken out`.
+        8 role: Cow<'static, str>,
+        9 shown: Option<String>,
+        10 suggested: Option<String>,
+        11 taken_out: Option<bool>,
+        12 you: bool,
+        13 reach: Option<String>,
+        14 reaches_you: Option<bool>,
+        15 through: Option<String>,
+    }
+);
+typed!(
+    /// A message of a conversation, with a contact or in a group.
+    MESSAGE "message" Message {
+        1 attachments: Vec<Attachment>,
+        2 edited: bool,
+        /// In a group: who said it, by the name this person sees.
+        3 from: Option<String>,
+        4 id: [u8; 16],
+        5 mine: bool,
+        6 picture: Option<String>,
+        7 reactions: Vec<Reaction>,
+        /// In a group, of this person's own: how many of the others read it.
+        8 read_by: Option<u64>,
+        9 reply_to: Option<[u8; 16]>,
+        /// Of this person's own: `sent`, `waiting` or `read`.
+        10 state: Option<Cow<'static, str>>,
+        11 text: String,
+        12 time: Option<u64>,
+    }
+);
+typed!(
+    /// Someone who no longer needs this person as a guardian.
+    NO_LONGER_NEEDED "no longer needed" NoLongerNeeded {
+        1 at_ms: u64,
+        2 id: [u8; 32],
+        3 name: String,
+        4 text: String,
+    }
+);
+typed!(
+    /// How two people met.
+    MET "met" Met {
+        /// Who introduced them.
+        1 by: Option<String>,
+        /// The group the introduction came through.
+        2 group: Option<String>,
+        3 how: Cow<'static, str>,
+        4 via: Option<String>,
+    }
+);
+typed!(
+    /// The last address a direct session with a device worked at.
+    KNOWN_PATH "known path" KnownPath {
+        1 addr: String,
+        2 checking: bool,
+        3 confirmed_s_ago: Option<u64>,
+        4 misses: u64,
+        5 next_check_s: u64,
+        6 probes: u64,
+        7 wait_s: u64,
+    }
+);
+typed!(
+    /// Whether each gave the other a presence secret (D74).
+    NEARBY "nearby" Nearby {
+        1 they_give_secret: bool,
+        2 you_give_secret: bool,
+    }
+);
+typed!(
+    /// The network this device is on, by its router, and what its person
+    /// said of it.
+    NETWORK "network" Network {
+        1 answered: Option<bool>,
+        2 ask: bool,
+        3 known: bool,
+        4 mine: bool,
+        5 name: Option<String>,
+        6 router: Option<String>,
+        7 routers: bool,
+    }
+);
+typed!(
+    /// A group offered to this person.
+    OFFER "offer" Offer {
+        1 from: String,
+        2 group: [u8; 32],
+        3 members: u64,
+        4 name: String,
+        5 public: bool,
+        6 reach: GroupReach,
+        7 for_call: Option<bool>,
+        8 last_call: Option<CallEnded>,
+    }
+);
+typed!(
+    /// What deleted files and old versions take, and how long they stay.
+    OLD "old versions" OldVersions {
+        1 at: Option<u64>,
+        2 bytes: Option<u64>,
+        3 keep: String,
+        4 only_here: Option<OnlyHere>,
+        5 unchecked: Option<bool>,
+    }
+);
+typed!(
+    /// Over the budget, and on no device that keeps everything yet.
+    ONLY_HERE "only here" OnlyHere {
+        1 bytes: u64,
+        2 files: u64,
+    }
+);
+typed!(
+    /// A device to pair again after a recovery.
+    PAIR_AGAIN "pair again" PairAgain {
+        /// The start of its key.
+        1 key: [u8; 8],
+        2 name: Option<String>,
+    }
+);
+typed!(
+    /// Pairing under way on this device.
+    PAIRING "pairing" Pairing {
+        1 admin: Option<String>,
+        2 code: Option<String>,
+        3 error: Option<String>,
+        /// `showing`, `joining` or `failed`.
+        4 state: Cow<'static, str>,
+        5 power: Option<Cow<'static, str>>,
+    }
+);
+typed!(
+    /// An address this device looks for the person's devices at.
+    PEER "peer" Peer {
+        1 addr: String,
+        /// The device found there, by name.
+        2 device: Option<String>,
+    }
+);
+typed!(
+    /// What a folder of the one folder is.
+    PLACE "place" Place {
+        /// `mine`, `category` or `shared`.
+        1 kind: Cow<'static, str>,
+        2 name: Option<String>,
+        3 who: Option<[u8; 8]>,
+        4 group: Option<[u8; 32]>,
+    }
+);
+typed!(
+    /// Fetching the files' content in the background.
+    PROGRESS "progress" ProgressShown {
+        1 bytes_fetched: u64,
+        2 bytes_pending: u64,
+        3 bytes_wanted: u64,
+        4 files_pending: u64,
+        5 last_error: Option<String>,
+        6 rate: u64,
+    }
+);
+typed!(REACTION "reaction" Reaction {
+    1 count: u64,
+    2 mine: bool,
+    3 text: String,
+});
+typed!(
+    /// A recovery: of this person (in `guardians`), or of someone they
+    /// guard (in `guarding`), each with fields of its own.
+    RECOVERY "recovery" RecoveryShown {
+        1 caution: Option<String>,
+        2 confirm_from_ms: Option<u64>,
+        3 confirmed: u64,
+        4 confirmed_by_me: Option<bool>,
+        5 endorsed: u64,
+        6 endorsed_by_me: Option<bool>,
+        7 fingerprint: String,
+        /// Of this person's: its entry.
+        8 id: Option<[u8; 32]>,
+        9 in_effect: bool,
+        10 keeps_keys: Option<bool>,
+        11 objected: bool,
+        12 pending: Option<bool>,
+    }
+);
+typed!(
+    /// Two members whose messages this person's devices have been passing
+    /// on, and who name no host in the group.
+    RELAYED_FOR "relayed for" RelayedFor {
+        1 a: String,
+        /// The start of their identity.
+        2 a_id: [u8; 8],
+        3 b: String,
+        4 b_id: [u8; 8],
+    }
+);
+typed!(
+    /// A group this person left and can come back to.
+    REJOIN "rejoin" Rejoin {
+        1 group: [u8; 32],
+        2 members: u64,
+        3 name: String,
+    }
+);
+typed!(
+    /// A role a group's move changed.
+    ROLE_CHANGE "role change" RoleChange {
+        1 from: Cow<'static, str>,
+        2 name: String,
+        3 to: Cow<'static, str>,
+    }
+);
+typed!(
+    /// When the reconnect loop dials next.
+    REDIAL "redial" Redial {
+        1 alone: bool,
+        2 helps: bool,
+        3 sparing: Option<Sparing>,
+    }
+);
+typed!(
+    /// A device sparing its battery: when it dials next, and the wait.
+    SPARING "sparing" Sparing {
+        1 next_s: u64,
+        2 wait_s: u64,
+    }
+);
+typed!(
+    /// What this device asks of routers, and what the router gave.
+    ROUTER "router" Router {
+        1 error: Option<String>,
+        2 everywhere: bool,
+        3 external: Option<String>,
+        4 named: Vec<String>,
+        5 network: Network,
+        6 on: bool,
+        7 protocol: Option<Cow<'static, str>>,
+        8 seconds_left: Option<u64>,
+        9 this_device: bool,
+    }
+);
+typed!(
+    /// One of a contact's devices, and the session with it, if any.
+    SESSION_DEVICE "contact's device" SessionDevice {
+        1 addr: Option<String>,
+        2 bytes_received: Option<u64>,
+        3 bytes_sent: Option<u64>,
+        4 carrier: Option<Cow<'static, str>>,
+        5 heard_ms_ago: Option<u64>,
+        6 kept_in_touch: bool,
+        /// The start of its key.
+        7 key: [u8; 8],
+        8 online: bool,
+        9 open_for_s: Option<u64>,
+        /// `you` or `them`.
+        10 opened_by: Option<Cow<'static, str>>,
+        11 packets_dropped: Option<u64>,
+        12 packets_lost: Option<u64>,
+        /// `direct` or `relay`.
+        13 route: Option<Cow<'static, str>>,
+        14 rtt_ms: Option<u64>,
+        15 they_see_you_at: Option<String>,
+        16 through: Option<String>,
+        17 unreadable: Option<Unreadable>,
+        18 kept_alive_s: Option<u64>,
+        19 path: Option<KnownPath>,
+        20 neighbour: bool,
+    }
+);
+typed!(
+    /// An entry set aside for want of a witness: the starts of its id and
+    /// its space's.
+    SET_ASIDE "set aside" SetAside {
+        1 entry: [u8; 8],
+        2 space: [u8; 8],
+        3 time_ms: Option<u64>,
+    }
+);
+typed!(
+    /// What a space held here takes.
+    SPACE_USAGE "space usage" SpaceUsage {
+        1 full: bool,
+        2 history_bytes: u64,
+        3 history_days: Option<u64>,
+        4 live_bytes: u64,
+        5 log_bytes: u64,
+        6 name: String,
+        /// `on-demand`, `history`, `full` or `history-days`.
+        7 retention: Cow<'static, str>,
+        8 space: [u8; 32],
+    }
+);
+typed!(
+    /// A space this device holds, as `status` gives it.
+    SPACE "space" SpaceShown {
+        1 entries: u64,
+        /// The start of its id.
+        2 id: [u8; 8],
+        /// `account`, `files`, `other` or `arriving`.
+        3 kind: Cow<'static, str>,
+        4 set_aside: u64,
+        5 valid: u64,
+    }
+);
+typed!(
+    /// A step of looking for someone, or of their sessions.
+    STEP "step" Step {
+        /// In milliseconds since 1970.
+        1 at: u64,
+        2 ok: Option<bool>,
+        3 text: String,
+    }
+);
+typed!(
+    /// No longer sent: a succession a recovery asked about.
+    SUCCESSION "succession" Succession {
+        1 id: String,
+        2 space: String,
+    }
+);
+typed!(
+    /// A host a reach node names, as this device sees it.
+    THEIR_REACH "reach seen" ReachSeen {
+        /// The start of the key of the device it is, where it is theirs.
+        1 device: Option<[u8; 8]>,
+        2 endpoints: Vec<EndpointSeen>,
+        /// The start of its link key.
+        3 host: [u8; 8],
+        4 session: bool,
+        5 this_device: bool,
+    }
+);
+typed!(
+    /// An item of the mounted folder's tree.
+    TREE_ITEM "tree item" TreeItem {
+        1 dirty: bool,
+        2 ino: u64,
+        /// `dir`, `file`, `link` or `conflict`.
+        3 kind: Cow<'static, str>,
+        4 local: bool,
+        /// The start of its node's id.
+        5 node: Option<[u8; 6]>,
+        6 path: String,
+        7 size: u64,
+    }
+);
+typed!(
+    /// An item of the tree that keeps the device from settling.
+    STUCK_ITEM "stuck item" StuckItem {
+        1 dirty: String,
+        2 kind: String,
+        3 opens: u64,
+        4 path: String,
+        5 staged: bool,
+    }
+);
+typed!(
+    /// What a device sent that this one cannot read, or the other way round.
+    UNREADABLE "unreadable" Unreadable {
+        1 reason: String,
+        2 retry_in_s: u64,
+        /// A sentence for the person.
+        3 says: String,
+        4 since: u64,
+        5 theirs: bool,
+        6 version: Option<String>,
+    }
+);
+typed!(
+    /// A file the state holds that the tree does not show.
+    UNSHOWN_NODE "unshown node" UnshownNode {
+        1 name: String,
+        /// The start of its node's id.
+        2 node: [u8; 6],
+    }
+);
+typed!(
+    /// A version of a file of the one folder: of its history, all of it;
+    /// of a conflict, its device, time and size.
+    VERSION "version" Version {
+        1 current: Option<bool>,
+        2 device: String,
+        /// Whether its content is on this device.
+        3 here: Option<bool>,
+        4 size: Option<u64>,
+        5 time: Option<u64>,
+        6 version: Option<u64>,
+        /// Who wrote it, where someone else did.
+        7 by: Option<String>,
+    }
+);
+typed!(
+    /// A file or folder deleted from the one folder, which can be had back.
+    DELETED_FILE "deleted file" DeletedFile {
+        1 by: Option<String>,
+        2 folder: bool,
+        3 id: [u8; 16],
+        4 mine: Option<bool>,
+        5 name: String,
+        6 size: Option<u64>,
+        7 time: Option<u64>,
+    }
+);
 
 // ---- Records of inspection ----
 
-rec!(VALUE "value":
-    1 "cut" BOOL, 2 "fields" [VALUE_FIELD], 3 "data" B, 4 "inner" {VALUE}, 5 "items" [VALUE],
-    6 "len" U, 7 "n" U, 8 "shape" {SHAPE}, 9 "t" T, 10 "v" SCALAR, 11 "what" T,
-    12 "withheld" T);
-rec!(VALUE_FIELD "value field": 1 "k" U, 2 "v" {VALUE});
-rec!(SHAPE "shape": 1 "here" BOOL, 2 "id" B, 3 "is" T, 4 "levels" U, 5 "size" U);
-rec!(ATTACHED_LOG "attached log": 1 "bytes" U, 2 "entries" U, 3 "id" B);
-rec!(ENCRYPTION_KEY "encryption key": 1 "entry" B, 2 "len" U, 3 "x25519" B);
-rec!(EPOCH "epoch": 1 "entries" U, 2 "held" BOOL, 3 "id" B, 4 "started_by" {STARTED_BY});
-rec!(IDENTITY_ENTRY "identity entry":
-    1 "body" U, 2 "bytes" U, 3 "header" {VALUE}, 4 "id" B, 5 "in_effect" BOOL, 6 "ops" [OP],
-    7 "parents" [B], 8 "signatures" U, 9 "signer" B, 10 "signer_power" T, 11 "valid" BOOL);
-rec!(INSPECT_DEVICE "this device": 1 "key" B, 2 "link_x25519" B, 3 "name" T);
-rec!(INSPECT_ENTRY "entry":
-    1 "accepted" BOOL, 2 "author" B, 3 "author_ok" BOOL, 4 "bytes" U, 5 "entry" B,
-    6 "epoch" B, 7 "genesis" BOOL, 8 "open_key" BOOL, 9 "parents" [B], 10 "position" U,
-    11 "sealed_id" B, 12 "signer" B, 13 "starts_epoch" BOOL, 14 "time" U,
-    15 "unwitnessed" BOOL, 16 "valid" BOOL, 17 "weigh" {WEIGH}, 18 "wraps" U);
-rec!(INSPECT_IDENTITY "identity":
-    1 "bytes" U, 2 "contested" BOOL, 3 "encryption_key" {ENCRYPTION_KEY},
-    4 "encryption_keys_held" U, 5 "entries" U, 6 "frozen" BOOL, 7 "heads" [B], 8 "id" B,
-    9 "keys" [INSPECT_KEY], 10 "recovery_policies" U, 11 "removed" [B]);
-rec!(INSPECT_KEY "key":
-    1 "added_in" B, 2 "key" B, 3 "link_key" {LINK_KEY}, 4 "name" T, 5 "power" T,
-    6 "recovery_key" U, 7 "this_device" BOOL);
-rec!(INSPECT_SPACE "space held":
-    1 "account" BOOL, 2 "bytes" U, 3 "entries" U, 4 "epochs" U, 5 "files" BOOL, 6 "id" B,
-    7 "label" T, 8 "members" U, 9 "my_role" U, 10 "nodes" U, 11 "opened" BOOL, 12 "pending" U,
-    13 "profile" KIND, 14 "sealed" U, 15 "successor" B, 16 "valid" U);
-rec!(KIND_COUNT "kind count":
-    1 "bytes" U, 2 "conflicts" U, 3 "deleted" U, 4 "kind" KIND, 5 "nodes" U);
-rec!(LINK_KEY "link key": 1 "len" U, 2 "x25519" B);
-rec!(NODE_BRIEF "node":
-    1 "bytes" U, 2 "children" U, 3 "created" U, 4 "created_in" B, 5 "creator" B,
-    6 "delete_conflict" BOOL, 7 "deleted" BOOL, 8 "fields" [[U]], 9 "id" B, 10 "kind" KIND,
-    11 "name" T, 12 "parent" B, 13 "position" U);
-rec!(NODE_FIELD "node field":
-    1 "conflict" BOOL, 2 "k" U, 3 "values" [NODE_VALUE]);
-rec!(NODE_HISTORY "node history":
-    1 "accepted" BOOL, 2 "author" B, 3 "bytes" U, 4 "entry" B, 5 "index" U, 6 "op" U,
-    7 "time" U, 8 "valid" BOOL);
-rec!(NODE_VALUE "node value": 1 "entry" B, 2 "op" U, 3 "v" {VALUE});
-rec!(OP "op":
-    1 "bytes" U, 2 "creates" B, 3 "index" U, 4 "kind" KIND, 5 "op" {VALUE}, 6 "reach" BOOL);
-rec!(OTHER_LOG "other log": 1 "bytes" U, 2 "entries" U, 3 "id" B, 4 "name" T);
-rec!(POLICY "policy": 1 "history_shared" BOOL, 2 "public" BOOL, 3 "rotate_after" U);
-rec!(REACH_NODE "reach node":
-    1 "bytes" U, 2 "fields" [NODE_FIELD], 3 "id" B, 4 "identity" B);
-rec!(ROOT "root": 1 "children" U, 2 "id" B);
-rec!(SIGNATURE "signature": 1 "key" B, 2 "signature" (gone U), 3 "signature" B);
-rec!(SPACE_MEMBER "space member":
-    1 "added_by" B, 2 "identity" B, 3 "left" BOOL, 4 "log_held" BOOL, 5 "name" T,
-    6 "reach_node" B, 7 "role" U);
-rec!(STARTED_BY "started by": 1 "author" B, 2 "entry" B, 3 "time" U);
-rec!(STATS "stats": 1 "appended" U, 2 "recomputed" U);
-rec!(STORE "store": 1 "bytes" U, 2 "objects" U);
-rec!(VOICE "voice":
-    1 "contact" BOOL, 2 "identity" B, 3 "name" T, 4 "picture" T, 5 "voice" B, 6 "you" BOOL,
-    7 "camera" BOOL);
-rec!(WEIGH "weight":
-    1 "aead" U, 2 "ciphertext" U, 3 "fields" U, 4 "header" U, 5 "ops" [WEIGHED_OP],
-    6 "sealed" U, 7 "signature" U, 8 "wraps" U);
-rec!(WEIGHED_OP "weighed op": 1 "bytes" U, 2 "kind" KIND, 3 "op" KIND, 4 "reach" BOOL);
-
-/// The reply of the requests that answer with what this person guards.
-macro_rules! guarding_reply {
-    ($name:literal $n:literal ($($an:literal $af:literal $at:tt),*)) => {
-        req!($n $name ($($an $af $at),*) -> (
-            2 "accepted" [T], 3 "asked" [T], 4 "guarding" [GUARDED], 5 "named_in_change" [T],
-            6 "now_ms" U, 7 "no_longer_needed" [NO_LONGER_NEEDED]))
-    };
+typed!(
+    /// A value of the base encoding, rendered: what it is (`t`: `int`,
+    /// `bytes`, `text`, `list`, `record`, `secret`, `deep`, `cleared`),
+    /// how long it is, and as much of it as was asked for. It holds values
+    /// of its own, so its rows are named outright.
+    VALUE "value" InspectValue {
+        1 cut: Option<bool>,
+        2 fields: Option<Vec<ValueField>> as [VALUE_FIELD],
+        3 data: Option<bytes::Bytes>,
+        /// The record bytes encode.
+        4 inner: Option<Box<InspectValue>> as {VALUE},
+        5 items: Option<Vec<InspectValue>> as [VALUE],
+        6 len: Option<u64>,
+        7 n: Option<u64>,
+        8 shape: Option<Shape>,
+        9 t: Cow<'static, str>,
+        10 v: Option<Scalar>,
+        /// Of a secret: what it is.
+        11 what: Option<String>,
+        12 withheld: Option<Cow<'static, str>>,
+    }
+);
+typed!(
+    /// A field of a rendered record: its key, and its value.
+    VALUE_FIELD "value field" ValueField {
+        1 k: u64,
+        2 v: InspectValue as {VALUE},
+    }
+);
+typed!(
+    /// What shape a record has that the explorer can name.
+    SHAPE "shape" Shape {
+        1 here: Option<bool>,
+        2 id: Option<[u8; 32]>,
+        /// `blob reference` or `epoch key`.
+        3 is: Cow<'static, str>,
+        4 levels: Option<u64>,
+        5 size: Option<u64>,
+    }
+);
+typed!(ATTACHED_LOG "attached log" AttachedLog {
+    1 bytes: u64,
+    2 entries: u64,
+    3 id: [u8; 32],
+});
+typed!(ENCRYPTION_KEY "encryption key" EncryptionKey {
+    1 entry: [u8; 32],
+    2 len: u64,
+    3 x25519: [u8; 32],
+});
+typed!(EPOCH "epoch" InspectEpoch {
+    1 entries: u64,
+    2 held: bool,
+    3 id: [u8; 16],
+    4 started_by: Option<StartedBy>,
+});
+/// An epoch of a space as inspection shows it, and how many of its
+/// sealed entries wait here to be opened. An old oddity, kept to the byte
+/// (DEVIATIONS.md, Old oddities kept): by name an epoch with entries
+/// waiting said so in a field that has no number, so that the reply was
+/// this build's mistake, which fails the request where the tests run and
+/// leaves out the whole list of epochs elsewhere; the old pager counted
+/// such an epoch as no bytes.
+#[derive(Clone, Debug, PartialEq)]
+pub struct EpochShown {
+    pub epoch: InspectEpoch,
+    pub pending: Option<u64>,
 }
+
+impl std::ops::Deref for EpochShown {
+    type Target = InspectEpoch;
+    fn deref(&self) -> &InspectEpoch {
+        &self.epoch
+    }
+}
+
+impl super::typed::Wire for EpochShown {
+    const TY: Ty = Ty::Rec(&EPOCH);
+    const LIST: Ty = Ty::Recs(&EPOCH);
+    fn check(&self, at: &super::typed::At) -> Result<(), String> {
+        match self.pending {
+            Some(_) => Err(format!("{at}.pending has no number")),
+            None => self.epoch.check(at),
+        }
+    }
+    fn encode_into(&self, out: &mut Vec<u8>) {
+        self.epoch.encode_into(out)
+    }
+    fn encoded_len(&self) -> usize {
+        match self.pending {
+            Some(_) => 0,
+            None => self.epoch.encoded_len(),
+        }
+    }
+    fn take(v: cardinal_encoding::Value, at: &super::typed::At) -> Result<Self, String> {
+        Ok(EpochShown {
+            epoch: InspectEpoch::take(v, at)?,
+            pending: None,
+        })
+    }
+}
+
+typed!(IDENTITY_ENTRY "identity entry" IdentityEntry {
+    1 body: u64,
+    2 bytes: u64,
+    3 header: InspectValue,
+    4 id: [u8; 32],
+    5 in_effect: bool,
+    6 ops: Vec<InspectOp>,
+    7 parents: Vec<[u8; 32]>,
+    8 signatures: u64,
+    9 signer: [u8; 32],
+    10 signer_power: Option<String>,
+    11 valid: bool,
+});
+typed!(INSPECT_DEVICE "this device" InspectDevice {
+    1 key: [u8; 32],
+    2 link_x25519: [u8; 32],
+    3 name: Option<String>,
+});
+typed!(
+    /// An entry of a space: as a host holds it, sealed, or as a member
+    /// reads it.
+    INSPECT_ENTRY "entry" InspectEntry {
+        1 accepted: Option<bool>,
+        2 author: Option<[u8; 32]>,
+        3 author_ok: Option<bool>,
+        4 bytes: Option<u64>,
+        5 entry: Option<[u8; 32]>,
+        6 epoch: Option<[u8; 16]>,
+        7 genesis: Option<bool>,
+        8 open_key: Option<bool>,
+        9 parents: Option<Vec<[u8; 32]>>,
+        10 position: Option<u64>,
+        11 sealed_id: Option<[u8; 32]>,
+        12 signer: Option<[u8; 32]>,
+        13 starts_epoch: Option<bool>,
+        14 time: Option<u64>,
+        15 unwitnessed: Option<bool>,
+        16 valid: Option<bool>,
+        17 weigh: Weight,
+        18 wraps: Option<u64>,
+    }
+);
+typed!(INSPECT_IDENTITY "identity" InspectIdentity {
+    1 bytes: u64,
+    2 contested: bool,
+    3 encryption_key: Option<EncryptionKey>,
+    4 encryption_keys_held: u64,
+    5 entries: u64,
+    6 frozen: bool,
+    7 heads: Vec<[u8; 32]>,
+    8 id: [u8; 32],
+    9 keys: Vec<InspectKey>,
+    10 recovery_policies: u64,
+    11 removed: Vec<[u8; 32]>,
+});
+typed!(INSPECT_KEY "key" InspectKey {
+    1 added_in: [u8; 32],
+    2 key: [u8; 32],
+    3 link_key: Option<LinkKey>,
+    4 name: Option<String>,
+    5 power: String,
+    6 recovery_key: Option<u64>,
+    7 this_device: bool,
+});
+typed!(
+    /// A space held here, in brief: what an overview lists, and what a
+    /// space's view begins with.
+    INSPECT_SPACE "space held" InspectSpace {
+        1 account: bool,
+        2 bytes: u64,
+        3 entries: Option<u64>,
+        4 epochs: Option<u64>,
+        5 files: bool,
+        6 id: [u8; 32],
+        7 label: Option<String>,
+        8 members: Option<u64>,
+        9 my_role: Option<u64>,
+        10 nodes: Option<u64>,
+        11 opened: bool,
+        12 pending: u64,
+        13 profile: Option<Kind>,
+        14 sealed: u64,
+        15 successor: Option<[u8; 32]>,
+        16 valid: Option<u64>,
+    }
+);
+typed!(KIND_COUNT "kind count" KindCount {
+    1 bytes: u64,
+    2 conflicts: u64,
+    3 deleted: u64,
+    4 kind: Kind,
+    5 nodes: u64,
+});
+typed!(LINK_KEY "link key" LinkKey {
+    1 len: u64,
+    2 x25519: [u8; 32],
+});
+typed!(
+    /// A node of a space, in brief.
+    NODE_BRIEF "node" NodeBrief {
+        1 bytes: u64,
+        2 children: u64,
+        3 created: Option<u64>,
+        4 created_in: [u8; 32],
+        5 creator: [u8; 32],
+        6 delete_conflict: bool,
+        7 deleted: bool,
+        /// Each field: its key, its values' bytes, how many values.
+        8 fields: Vec<Vec<u64>>,
+        9 id: [u8; 16],
+        10 kind: Kind,
+        11 name: String,
+        12 parent: [u8; 16],
+        13 position: Option<u64>,
+    }
+);
+typed!(NODE_FIELD "node field" NodeField {
+    1 conflict: bool,
+    2 k: u64,
+    3 values: Vec<NodeValue>,
+});
+typed!(NODE_HISTORY "node history" NodeHistory {
+    1 accepted: bool,
+    2 author: [u8; 32],
+    3 bytes: u64,
+    4 entry: [u8; 32],
+    5 index: u64,
+    6 op: Option<u64>,
+    7 time: Option<u64>,
+    8 valid: bool,
+});
+typed!(NODE_VALUE "node value" NodeValue {
+    1 entry: [u8; 32],
+    2 op: u64,
+    3 v: InspectValue,
+});
+typed!(
+    /// An op, rendered, and what it is about: the kind of the node it makes
+    /// or names, or `reach` for its author's reach node.
+    OP "op" InspectOp {
+        1 bytes: u64,
+        2 creates: Option<[u8; 16]>,
+        3 index: Option<u64>,
+        4 kind: Option<Kind>,
+        5 op: InspectValue,
+        6 reach: Option<bool>,
+    }
+);
+typed!(OTHER_LOG "other log" OtherLog {
+    1 bytes: u64,
+    2 entries: u64,
+    3 id: [u8; 32],
+    4 name: Option<String>,
+});
+typed!(POLICY "policy" PolicyShown {
+    1 history_shared: bool,
+    2 public: bool,
+    3 rotate_after: u64,
+});
+typed!(REACH_NODE "reach node" ReachNode {
+    1 bytes: u64,
+    2 fields: Vec<NodeField>,
+    3 id: [u8; 16],
+    4 identity: Option<[u8; 32]>,
+});
+typed!(ROOT "root" RootShown {
+    1 children: u64,
+    2 id: [u8; 16],
+});
+typed!(SIGNATURE "signature" SignatureShown {
+    1 key: [u8; 32],
+    2 gone signature: u64,
+    3 signature: bytes::Bytes,
+});
+typed!(SPACE_MEMBER "space member" SpaceMember {
+    1 added_by: Option<[u8; 32]>,
+    2 identity: [u8; 32],
+    3 left: bool,
+    4 log_held: bool,
+    5 name: Option<String>,
+    6 reach_node: [u8; 16],
+    7 role: u64,
+});
+typed!(STARTED_BY "started by" StartedBy {
+    1 author: [u8; 32],
+    2 entry: [u8; 32],
+    3 time: Option<u64>,
+});
+typed!(STATS "stats" StatsShown {
+    1 appended: u64,
+    2 recomputed: u64,
+});
+typed!(STORE "store" StoreShown {
+    1 bytes: u64,
+    2 objects: u64,
+});
+typed!(
+    /// Who a voice heard on a group call is.
+    VOICE "voice" Voice {
+        1 contact: bool,
+        /// The start of the person's id.
+        2 identity: [u8; 8],
+        3 name: String,
+        4 picture: Option<String>,
+        5 voice: [u8; 8],
+        6 you: bool,
+        7 camera: bool,
+    }
+);
+typed!(
+    /// Where an entry's bytes go, from its sealed form in.
+    WEIGH "weight" Weight {
+        1 aead: u64,
+        2 ciphertext: u64,
+        3 fields: Option<u64>,
+        4 header: u64,
+        5 ops: Option<Vec<WeighedOp>>,
+        6 sealed: u64,
+        7 signature: Option<u64>,
+        8 wraps: u64,
+    }
+);
+typed!(WEIGHED_OP "weighed op" WeighedOp {
+    1 bytes: u64,
+    2 kind: Option<Kind>,
+    3 op: Option<Kind>,
+    4 reach: Option<bool>,
+});
+
+// ---- Typed requests (`api::typed`) ----
+
+typed!(
+    fields
+    /// The reply of a request that says only that it was done.
+    Done {}
+);
+
+typed!(fields WatchArgs {
+    /// A window watching: while one does, Cardinal is open.
+    1 window: Option<bool>,
+});
+asks!(WATCH: 3 "watch" WatchArgs -> Done, stream);
+
+typed!(fields CallMediaArgs {});
+asks!(CALL_MEDIA: 104 "call-media" CallMediaArgs -> Done, stream);
+
+// ---- The service, this device, and the person's devices ----
+
+typed!(fields StatusArgs {
+    1 after: Option<u64>,
+    2 limit: Option<u64>,
+});
+typed!(
+    fields
+    /// Where this device stands: its settings, its spaces, its devices,
+    /// and what it is doing.
+    StatusReply {
+        2 bluetooth: BluetoothShown,
+        3 carrying_calls: u64,
+        4 conditions: ConditionsShown,
+        5 conflicts: u64,
+        /// Before the files space is known, none.
+        6 copies: Option<Copies>,
+        7 devices: Vec<Device>,
+        8 files_ready: bool,
+        9 home: String,
+        /// The hosts the recovery sheet names, where it can be made.
+        10 hosts: Option<u64>,
+        /// The start of the person's identity.
+        11 identity: Option<[u8; 8]>,
+        12 identity_id: Option<[u8; 32]>,
+        13 inspection: Inspection,
+        14 left_behind: Vec<String>,
+        15 listen: String,
+        16 mount: Option<String>,
+        17 mount_unavailable: Option<String>,
+        18 mounted: Option<String>,
+        19 moved_from: Option<u64>,
+        20 name: String,
+        21 network: Network,
+        22 not_saved: u64,
+        23 not_saved_undone: u64,
+        24 old: OldVersions,
+        25 pairing: Option<Pairing>,
+        26 peers: Vec<String>,
+        27 pending_changes: bool,
+        28 progress: ProgressShown,
+        29 read_markers: bool,
+        30 removed: bool,
+        31 retention: String,
+        32 router: Router,
+        33 spaces: Vec<SpaceShown>,
+        34 uptime_s: u64,
+        35 more: bool,
+        36 next: Option<u64>,
+        37 redial: Redial,
+        /// The person's devices with a mailbox, reachable from outside.
+        38 always_on: Vec<String>,
+    }
+);
+asks!(STATUS: 2 "status" StatusArgs -> StatusReply, reads,
+    after devices, left_behind, peers, spaces, always_on);
+
+typed!(fields ConditionsArgs {
+    1 plugged_in: Option<bool>,
+    2 metered: Option<bool>,
+});
+typed!(fields ConditionsReply {
+    2 helps: bool,
+    3 metered: bool,
+    4 plugged_in: Option<bool>,
+});
+asks!(CONDITIONS_NOW: 6 "conditions" ConditionsArgs -> ConditionsReply, reads unless plugged_in);
+
+typed!(fields NetworkChangedArgs {
+    1 why: Option<String>,
+});
+typed!(
+    fields
+    /// How many sessions are checked.
+    Checking {
+        2 checking: u64,
+    }
+);
+asks!(NETWORK_CHANGED: 7 "network-changed" NetworkChangedArgs -> Checking, writes);
+
+typed!(fields MeArgs {
+    1 name: Option<String>,
+});
+typed!(fields MeReply {
+    2 name: String,
+    3 set: bool,
+});
+asks!(ME: 10 "me" MeArgs -> MeReply, reads unless name);
+
+typed!(fields DeviceRenameArgs {
+    1 device: Option<Reference>,
+    2 name: Option<String>,
+});
+typed!(fields DeviceRenameReply {
+    /// The start of the device's key.
+    2 key: [u8; 8],
+    3 name: String,
+});
+asks!(DEVICE_RENAME: 12 "device-rename" DeviceRenameArgs -> DeviceRenameReply, writes);
+
+typed!(fields PairShowArgs {
+    1 gone admin: bool,
+    2 device: Option<String>,
+});
+typed!(fields PairShowReply {
+    2 addrs: Vec<String>,
+    3 code: String,
+});
+asks!(PAIR_SHOW: 14 "pair-show" PairShowArgs -> PairShowReply, writes);
+
+typed!(fields PairStatusArgs {});
+typed!(fields PairStatusReply {
+    2 admin: Option<String>,
+    3 code: Option<String>,
+    4 error: Option<String>,
+    5 files: Option<bool>,
+    /// `idle`, `showing`, `joining`, `joined` or `failed`.
+    6 state: Cow<'static, str>,
+    /// `device` or `admin`.
+    7 power: Option<Cow<'static, str>>,
+});
+asks!(PAIR_STATUS: 15 "pair-status" PairStatusArgs -> PairStatusReply, reads);
+
+typed!(fields PairTypeArgs {
+    1 code: Option<String>,
+    2 at: Option<String>,
+    3 admin: Option<bool>,
+    4 words: Option<String>,
+    5 device: Option<String>,
+});
+typed!(fields PairTypeReply {
+    2 name: String,
+});
+asks!(PAIR_TYPE: 16 "pair-type" PairTypeArgs -> PairTypeReply, writes);
+
+typed!(fields WakeArgs {});
+asks!(WAKE: 226 "wake" WakeArgs -> Checking, writes);
+
+// ---- The clipboard ----
+
+typed!(fields ClipCopyArgs {
+    1 text: Option<String>,
+});
+typed!(fields ClipCopyReply {
+    2 devices: u64,
+});
+asks!(CLIP_COPY: 105 "clip-copy" ClipCopyArgs -> ClipCopyReply, writes);
+
+typed!(fields ClipArgs {});
+typed!(fields ClipReply {
+    2 from: Option<String>,
+    3 here: Option<bool>,
+    4 seconds: Option<u64>,
+    /// None when nothing was copied in the last ten minutes.
+    5 text: Option<String>,
+});
+asks!(CLIP: 106 "clip" ClipArgs -> ClipReply, reads);
+
+// ---- The one folder ----
+
+typed!(
+    fields
+    /// The path in the one folder a request made or changed.
+    PathReply {
+        2 path: String,
+    }
+);
+typed!(fields MkdirArgs {
+    1 path: Option<String>,
+});
+asks!(MKDIR: 121 "mkdir" MkdirArgs -> PathReply, writes);
+typed!(fields MoveArgs {
+    1 from: Option<String>,
+    2 to: Option<String>,
+});
+asks!(MOVE: 122 "move" MoveArgs -> PathReply, writes);
+typed!(fields RemoveArgs {
+    1 path: Option<String>,
+});
+asks!(REMOVE: 123 "remove" RemoveArgs -> PathReply, writes);
+typed!(fields CopyArgs {
+    1 from: Option<String>,
+    2 to: Option<String>,
+});
+asks!(COPY: 124 "copy" CopyArgs -> PathReply, writes);
+typed!(fields PutArgs {
+    1 from: Option<String>,
+    2 to: Option<String>,
+});
+asks!(PUT: 125 "put" PutArgs -> PathReply, writes);
+typed!(fields SaveArgs {
+    1 path: Option<String>,
+    2 to: Option<String>,
+    3 version: Option<u64>,
+});
+typed!(fields SaveReply {
+    2 path: String,
+    3 size: u64,
+});
+asks!(SAVE: 126 "save" SaveArgs -> SaveReply, writes);
+typed!(fields WriteArgs {
+    1 from: Option<String>,
+    2 path: Option<String>,
+});
+asks!(WRITE: 127 "write" WriteArgs -> PathReply, writes);
+typed!(fields ShareArgs {
+    1 who: Option<Reference>,
+    2 paths: Option<Vec<String>>,
+    3 text: Option<String>,
+    4 group: Option<Reference>,
+});
+typed!(fields ShareReply {
+    2 message: bool,
+    3 path: String,
+});
+asks!(SHARE: 128 "share" ShareArgs -> ShareReply, writes);
+typed!(fields MountArgs {
+    1 path: Option<String>,
+});
+asks!(MOUNT: 129 "mount" MountArgs -> PathReply, writes);
+typed!(fields UnmountArgs {});
+asks!(UNMOUNT: 130 "unmount" UnmountArgs -> Done, writes);
+typed!(fields FlushArgs {});
+typed!(fields FlushReply {
+    2 entries: u64,
+});
+asks!(FLUSH: 131 "flush" FlushArgs -> FlushReply, writes);
+typed!(fields RestoreArgs {
+    1 path: Option<String>,
+    2 version: Option<u64>,
+});
+typed!(fields RestoreReply {
+    2 path: String,
+    3 version: u64,
+});
+asks!(RESTORE: 134 "restore" RestoreArgs -> RestoreReply, writes);
+typed!(fields PinArgs {
+    1 path: Option<String>,
+});
+typed!(fields PinReply {
+    2 on_demand: bool,
+    3 path: String,
+});
+asks!(PIN: 135 "pin" PinArgs -> PinReply, writes);
+typed!(fields UnpinArgs {
+    1 path: Option<String>,
+});
+asks!(UNPIN: 136 "unpin" UnpinArgs -> PinReply, writes);
+typed!(fields RetentionArgs {
+    1 mode: Option<String>,
+});
+typed!(fields RetentionReply {
+    2 retention: String,
+});
+asks!(RETENTION: 137 "retention" RetentionArgs -> RetentionReply, writes);
+
+// ---- People, conversations and invitations ----
+
+typed!(fields InviteArgs {
+    1 address: Option<String>,
+    2 name: Option<String>,
+    3 hosts_only: Option<bool>,
+    4 no_introductions: Option<bool>,
+});
+typed!(fields InviteReply {
+    2 code: String,
+});
+asks!(INVITE: 42 "invite" InviteArgs -> InviteReply, writes);
+typed!(fields AcceptArgs {
+    1 code: Option<String>,
+    2 name: Option<String>,
+    3 via: Option<String>,
+    4 hosts_only: Option<bool>,
+    5 no_introductions: Option<bool>,
+    6 r#for: Option<Reference>,
+});
+typed!(
+    fields
+    /// Whom an invitation made a contact of, by the name this person gave
+    /// them; of a recovery's, whose recovery it helps.
+    AcceptReply {
+        2 name: String,
+        3 recovery_of: Option<[u8; 32]>,
+    }
+);
+asks!(ACCEPT: 43 "accept" AcceptArgs -> AcceptReply, writes);
+
+// ---- Messages, with a contact or in a group ----
+
+typed!(fields SayArgs {
+    1 who: Option<Reference>,
+    2 text: Option<String>,
+    3 reply_to: Option<Reference>,
+    4 attach: Option<Vec<String>>,
+    5 group: Option<Reference>,
+});
+typed!(
+    fields
+    /// To a contact: whether it can reach them now.
+    SayReply {
+        2 reachable: Option<bool>,
+    }
+);
+asks!(SAY: 35 "say" SayArgs -> SayReply, writes);
+typed!(fields SaveAttachmentArgs {
+    1 who: Option<Reference>,
+    2 id: Option<Reference>,
+    3 index: Option<u64>,
+    4 to: Option<String>,
+    5 group: Option<Reference>,
+});
+asks!(SAVE_ATTACHMENT: 36 "save-attachment" SaveAttachmentArgs -> SaveReply, writes);
+typed!(fields EditMessageArgs {
+    1 who: Option<Reference>,
+    2 id: Option<Reference>,
+    3 text: Option<String>,
+    4 group: Option<Reference>,
+});
+asks!(EDIT_MESSAGE: 37 "edit-message" EditMessageArgs -> Done, writes);
+typed!(fields DeleteMessageArgs {
+    1 who: Option<Reference>,
+    2 id: Option<Reference>,
+    3 group: Option<Reference>,
+});
+asks!(DELETE_MESSAGE: 38 "delete-message" DeleteMessageArgs -> Done, writes);
+typed!(fields ReactArgs {
+    1 who: Option<Reference>,
+    2 id: Option<Reference>,
+    3 text: Option<String>,
+    4 group: Option<Reference>,
+});
+asks!(REACT: 39 "react" ReactArgs -> Done, writes);
+typed!(fields MarkReadArgs {
+    1 who: Option<Reference>,
+    2 group: Option<Reference>,
+});
+typed!(
+    fields
+    /// Whether this person's marker moved, which the others see, or the
+    /// place only their own devices keep, and why.
+    MarkReadReply {
+        2 kept: bool,
+        3 marked: bool,
+        4 why: Option<String>,
+    }
+);
+asks!(MARK_READ: 40 "mark-read" MarkReadArgs -> MarkReadReply, writes);
+
+// ---- Groups ----
+
+typed!(fields GroupsArgs {
+    1 after: Option<u64>,
+    2 limit: Option<u64>,
+});
+typed!(fields GroupsReply {
+    2 groups: Vec<Group>,
+    3 offers: Vec<Offer>,
+    4 more: bool,
+    5 next: Option<u64>,
+    6 rejoin: Option<Vec<Rejoin>>,
+});
+asks!(GROUPS: 70 "groups" GroupsArgs -> GroupsReply, reads, after groups, offers, rejoin);
+typed!(fields GroupCreateArgs {
+    1 name: Option<String>,
+    2 people: Option<Vec<Reference>>,
+    3 for_call: Option<bool>,
+    4 history: Option<bool>,
+});
+typed!(
+    fields
+    /// A group, by its id, and what it is called.
+    GroupCreateReply {
+        2 group: [u8; 32],
+        3 name: String,
+    }
+);
+asks!(GROUP_CREATE: 71 "group-create" GroupCreateArgs -> GroupCreateReply, writes);
+typed!(fields GroupJoinArgs {
+    1 group: Option<Reference>,
+    2 reach: Option<bool>,
+});
+typed!(
+    fields
+    /// Nothing, of a group joined already.
+    GroupJoinReply {
+        2 group: Option<[u8; 32]>,
+        3 name: Option<String>,
+        4 shared: Option<bool>,
+        5 waiting: Option<bool>,
+    }
+);
+asks!(GROUP_JOIN: 72 "group-join" GroupJoinArgs -> GroupJoinReply, writes);
+typed!(fields GroupDeclineArgs {
+    1 group: Option<Reference>,
+});
+asks!(GROUP_DECLINE: 73 "group-decline" GroupDeclineArgs -> Done, writes);
+typed!(fields GroupLeaveArgs {
+    1 group: Option<Reference>,
+    2 admins: Option<Vec<Reference>>,
+    3 anyway: Option<bool>,
+});
+typed!(
+    fields
+    /// Whom leaving made admins, by the names this person sees.
+    GroupLeaveReply {
+        2 admins: Vec<String>,
+    }
+);
+asks!(GROUP_LEAVE: 74 "group-leave" GroupLeaveArgs -> GroupLeaveReply, writes);
+typed!(fields GroupReachArgs {
+    1 group: Option<Reference>,
+    2 share: Option<bool>,
+    3 host: Option<String>,
+});
+typed!(
+    fields
+    /// Of a share or not: whether the hosts are named, or waiting to be;
+    /// of one host taken out: whether it was named there.
+    GroupReachReply {
+        2 shared: Option<bool>,
+        3 waiting: Option<bool>,
+        4 taken_out: Option<bool>,
+    }
+);
+asks!(GROUP_REACH_SET: 75 "group-reach" GroupReachArgs -> GroupReachReply, writes);
+typed!(fields GroupAddArgs {
+    1 group: Option<Reference>,
+    2 people: Option<Vec<Reference>>,
+    3 shown: Option<String>,
+});
+asks!(GROUP_ADD: 76 "group-add" GroupAddArgs -> Done, writes);
+typed!(fields GroupRemoveArgs {
+    1 group: Option<Reference>,
+    2 who: Option<Reference>,
+});
+typed!(
+    fields
+    /// The group that stands in its place, those it left out, and the one
+    /// it was.
+    GroupRemoveReply {
+        2 group: [u8; 32],
+        3 left_out: Vec<[u8; 32]>,
+        4 was: [u8; 32],
+    }
+);
+asks!(GROUP_REMOVE: 77 "group-remove" GroupRemoveArgs -> GroupRemoveReply, writes);
+typed!(fields GroupMembersArgs {
+    1 group: Option<Reference>,
+    2 after: Option<u64>,
+    3 limit: Option<u64>,
+});
+typed!(fields GroupMembersReply {
+    2 group: [u8; 32],
+    3 members: Vec<Member>,
+    4 name: String,
+    5 more: bool,
+    6 next: Option<u64>,
+});
+asks!(GROUP_MEMBERS: 78 "group-members" GroupMembersArgs -> GroupMembersReply, reads, after members by id);
+typed!(fields GroupSetArgs {
+    1 group: Option<Reference>,
+    2 name: Option<String>,
+    3 introductions: Option<bool>,
+    4 for_call: Option<bool>,
+});
+asks!(GROUP_SET: 79 "group-set" GroupSetArgs -> Done, writes);
+typed!(fields GroupMemberArgs {
+    1 group: Option<Reference>,
+    2 who: Option<Reference>,
+    3 shown: Option<String>,
+    4 introduce: Option<bool>,
+});
+asks!(GROUP_MEMBER: 80 "group-member" GroupMemberArgs -> Done, writes);
+typed!(fields GroupRoleArgs {
+    1 group: Option<Reference>,
+    2 who: Option<Reference>,
+    3 role: Option<String>,
+});
+typed!(
+    fields
+    /// The group, and of a role lowered, the one it succeeded.
+    GroupRoleReply {
+        2 group: [u8; 32],
+        3 was: Option<[u8; 32]>,
+    }
+);
+asks!(GROUP_ROLE: 82 "group-role" GroupRoleArgs -> GroupRoleReply, writes);
+typed!(fields GroupRejoinArgs {
+    1 group: Option<Reference>,
+});
+asks!(GROUP_REJOIN: 87 "group-rejoin" GroupRejoinArgs -> GroupCreateReply, writes);
+
+// ---- The service, people, introductions and groups: the rest ----
+
+typed!(fields HelloArgs {});
+typed!(fields HelloReply {
+    2 api: u64,
+    3 version: Cow<'static, str>,
+});
+asks!(HELLO: 1 "hello" HelloArgs -> HelloReply, reads);
+
+typed!(fields ReadMarkersArgs {
+    1 on: Option<bool>,
+});
+typed!(fields ReadMarkersReply {
+    2 on: bool,
+});
+asks!(READ_MARKERS: 41 "read-markers" ReadMarkersArgs -> ReadMarkersReply, reads unless on);
+
+typed!(fields CancelInvitationArgs {
+    1 id: Option<Reference>,
+});
+asks!(CANCEL_INVITATION: 45 "cancel-invitation" CancelInvitationArgs -> Done, writes);
+
+typed!(fields IntroduceArgs {
+    1 who: Option<Reference>,
+    2 to: Option<Reference>,
+    3 note: Option<String>,
+});
+asks!(INTRODUCE: 47 "introduce" IntroduceArgs -> Done, writes);
+
+typed!(fields IntroductionAcceptArgs {
+    1 id: Option<Reference>,
+});
+typed!(
+    fields
+    /// Where both said yes: whom the invitation made a contact of.
+    IntroductionAcceptReply {
+        2 name: Option<String>,
+        3 recovery_of: Option<[u8; 32]>,
+    }
+);
+asks!(INTRODUCTION_ACCEPT: 48 "introduction-accept" IntroductionAcceptArgs -> IntroductionAcceptReply,
+    writes);
+typed!(fields IntroductionDeclineArgs {
+    1 id: Option<Reference>,
+});
+asks!(INTRODUCTION_DECLINE: 49 "introduction-decline" IntroductionDeclineArgs -> Done, writes);
+
+typed!(fields GroupConnectArgs {
+    1 group: Option<Reference>,
+    2 who: Option<Reference>,
+    3 note: Option<String>,
+});
+typed!(
+    fields
+    /// Asked already, and not answered.
+    GroupConnectReply {
+        2 asked: Option<bool>,
+    }
+);
+asks!(GROUP_CONNECT: 81 "group-connect" GroupConnectArgs -> GroupConnectReply, writes);
+
+typed!(fields GroupPostAgainArgs {
+    1 group: Option<Reference>,
+});
+typed!(fields GroupPostAgainReply {
+    2 posted: u64,
+});
+asks!(GROUP_POST_AGAIN: 83 "group-post-again" GroupPostAgainArgs -> GroupPostAgainReply, writes);
+
+typed!(fields GroupMovedSeenArgs {
+    1 group: Option<Reference>,
+});
+asks!(GROUP_MOVED_SEEN: 84 "group-moved-seen" GroupMovedSeenArgs -> Done, writes);
+
+typed!(fields GroupConfirmMoveArgs {
+    1 group: Option<Reference>,
+    2 moves: Option<Vec<bytes::Bytes>>,
+    3 to: Option<Vec<bytes::Bytes>>,
+});
+typed!(fields GroupConfirmMoveReply {
+    2 kept: u64,
+});
+asks!(GROUP_CONFIRM_MOVE: 85 "group-confirm-move" GroupConfirmMoveArgs -> GroupConfirmMoveReply,
+    writes);
+
+typed!(fields GroupLeavingArgs {
+    1 group: Option<Reference>,
+});
+typed!(
+    fields
+    /// What leaving a group would leave behind (D89).
+    GroupLeavingReply {
+        2 admins: Vec<String>,
+        3 choose_admin: bool,
+        4 group: [u8; 32],
+        5 name: String,
+        6 relayed_for: Vec<RelayedFor>,
+    }
+);
+asks!(GROUP_LEAVING: 86 "group-leaving" GroupLeavingArgs -> GroupLeavingReply, reads);
+
+// ---- Guardians: of this person, and those this person guards ----
+
+typed!(fields GuardiansArgs {});
+typed!(
+    fields
+    /// This person's guardians, and what is under way.
+    GuardiansReply {
+        2 asked: Vec<String>,
+        3 changes: Vec<GuardianChange>,
+        4 copy_full: Vec<String>,
+        5 data: bool,
+        6 delay: u64,
+        7 delay_text: String,
+        8 frozen: bool,
+        9 guardians: u64,
+        10 names: Vec<String>,
+        11 ready: Vec<String>,
+        12 recoveries: Vec<RecoveryShown>,
+        13 threshold: u64,
+    }
+);
+asks!(GUARDIANS: 150 "guardians" GuardiansArgs -> GuardiansReply, reads);
+
+typed!(fields GuardiansSetArgs {
+    1 who: Option<Vec<Reference>>,
+    2 threshold: Option<u64>,
+    3 delay: Option<u64>,
+    4 words: Option<String>,
+});
+typed!(fields GuardiansSetReply {
+    2 delay: u64,
+    3 delay_text: String,
+    4 names: Vec<String>,
+    5 pending: bool,
+    6 threshold: u64,
+});
+asks!(GUARDIANS_SET: 151 "guardians-set" GuardiansSetArgs -> GuardiansSetReply, writes);
+
+typed!(fields GuardiansObjectArgs {
+    1 fingerprint: Option<String>,
+});
+asks!(GUARDIANS_OBJECT: 152 "guardians-object" GuardiansObjectArgs -> Done, writes);
+
+typed!(fields GuardiansAskArgs {
+    1 who: Option<Reference>,
+});
+typed!(fields NameReply {
+    2 name: String,
+});
+asks!(GUARDIANS_ASK: 153 "guardians-ask" GuardiansAskArgs -> NameReply, writes);
+
+typed!(
+    fields
+    /// Those this person guards, and what they are asked.
+    GuardingReply {
+        2 accepted: Vec<String>,
+        3 asked: Vec<String>,
+        4 guarding: Vec<Guarded>,
+        5 named_in_change: Vec<String>,
+        6 now_ms: u64,
+        7 no_longer_needed: Vec<NoLongerNeeded>,
+    }
+);
+typed!(fields GuardingArgs {});
+asks!(GUARDING: 154 "guarding" GuardingArgs -> GuardingReply, reads);
+
+typed!(fields GuardingInviteArgs {
+    1 who: Option<Reference>,
+    2 at: Option<String>,
+});
+typed!(fields GuardingInviteReply {
+    2 code: String,
+    3 name: String,
+});
+asks!(GUARDING_INVITE: 155 "guarding-invite" GuardingInviteArgs -> GuardingInviteReply, writes);
+
+typed!(fields GuardingAcceptArgs {
+    1 who: Option<Reference>,
+});
+typed!(fields GuardingAcceptReply {
+    2 already: bool,
+    3 name: String,
+    4 persona: [u8; 32],
+});
+asks!(GUARDING_ACCEPT: 156 "guarding-accept" GuardingAcceptArgs -> GuardingAcceptReply, writes);
+
+typed!(fields GuardingConfirmChangeArgs {
+    1 who: Option<Reference>,
+    2 fingerprint: Option<String>,
+    3 understood: Option<bool>,
+});
+asks!(GUARDING_CONFIRM_CHANGE: 157 "guarding-confirm-change" GuardingConfirmChangeArgs
+    -> GuardingReply, writes);
+
+typed!(fields GuardingNeverArgs {
+    1 who: Option<Reference>,
+    2 fingerprint: Option<String>,
+});
+asks!(GUARDING_NEVER: 158 "guarding-never" GuardingNeverArgs -> GuardingReply, writes);
+
+typed!(fields GuardingCautionArgs {
+    1 who: Option<Reference>,
+});
+typed!(fields GuardingCautionReply {
+    2 caution: String,
+    3 name: String,
+});
+asks!(GUARDING_CAUTION: 159 "guarding-caution" GuardingCautionArgs -> GuardingCautionReply, reads);
+
+typed!(fields GuardingEndorseArgs {
+    1 who: Option<Reference>,
+    2 fingerprint: Option<String>,
+    3 understood: Option<bool>,
+});
+asks!(GUARDING_ENDORSE: 160 "guarding-endorse" GuardingEndorseArgs -> GuardingReply, writes);
+
+typed!(fields GuardingConfirmArgs {
+    1 who: Option<Reference>,
+    2 fingerprint: Option<String>,
+    3 understood: Option<bool>,
+});
+asks!(GUARDING_CONFIRM: 161 "guarding-confirm" GuardingConfirmArgs -> GuardingReply, writes);
+
+// ---- Recovery ----
+
+typed!(fields RecoverArgs {});
+typed!(
+    fields
+    /// What is under way on this device, or what the last recovery left.
+    RecoverReply {
+        2 asked: Option<bool>,
+        3 confirmed: Option<u64>,
+        4 endorsed: Option<u64>,
+        5 fingerprint: Option<String>,
+        6 guardians: Option<u64>,
+        7 held: Option<u64>,
+        8 helper: Option<bool>,
+        9 identity: Option<[u8; 32]>,
+        10 in_effect: Option<bool>,
+        11 lost_at: Option<u64>,
+        12 lost_devices: Option<Vec<LostDevice>>,
+        13 pair_again: Option<Vec<PairAgain>>,
+        14 proposed: Option<u64>,
+        15 gone successions: Vec<Succession>,
+        16 threshold: Option<u64>,
+        17 under_way: bool,
+        18 finished: Option<bool>,
+        19 words: Option<String>,
+        20 kept_changes: Option<Vec<KeptChange>>,
+        21 not_heard: Option<Vec<String>>,
+    }
+);
+asks!(RECOVER: 162 "recover" RecoverArgs -> RecoverReply, writes);
+
+typed!(fields RecoverStartArgs {
+    1 code: Option<String>,
+    2 identity: Option<Reference>,
+});
+typed!(fields RecoverStartReply {
+    2 fingerprint: String,
+    3 identity: Option<[u8; 32]>,
+});
+asks!(RECOVER_START: 163 "recover-start" RecoverStartArgs -> RecoverStartReply, writes);
+
+typed!(fields RecoverInviteArgs {
+    1 at: Option<String>,
+});
+typed!(fields RecoverInviteReply {
+    2 code: String,
+    3 fingerprint: String,
+});
+asks!(RECOVER_INVITE: 164 "recover-invite" RecoverInviteArgs -> RecoverInviteReply, writes);
+
+typed!(fields RecoverLostAtArgs {
+    1 lost_at: Option<u64>,
+});
+typed!(fields LostDevicesReply {
+    2 lost_devices: Vec<LostDevice>,
+});
+asks!(RECOVER_LOST_AT: 166 "recover-lost-at" RecoverLostAtArgs -> LostDevicesReply, writes);
+
+typed!(fields RecoverCancelArgs {});
+typed!(fields RecoverCancelReply {
+    2 fingerprint: Option<String>,
+});
+asks!(RECOVER_CANCEL: 167 "recover-cancel" RecoverCancelArgs -> RecoverCancelReply, writes);
+
+typed!(fields RecoverFinishArgs {
+    1 without_account: Option<bool>,
+    2 lost_at: Option<u64>,
+});
+typed!(fields RecoverFinishReply {
+    2 account: bool,
+    3 lost_devices: Vec<LostDevice>,
+    4 pair_again: Vec<PairAgain>,
+    5 words: String,
+    /// Added after v0.1.27: an `Option` for ever, though always sent.
+    6 not_heard: Option<Vec<String>>,
+});
+asks!(RECOVER_FINISH: 168 "recover-finish" RecoverFinishArgs -> RecoverFinishReply, writes);
+
+typed!(fields KeepWorkArgs {
+    1 name: Option<String>,
+    2 up_to: Option<String>,
+});
+typed!(fields KeepWorkReply {
+    2 kept: u64,
+    3 set_aside: Vec<SetAside>,
+});
+asks!(KEEP_WORK: 169 "keep-work" KeepWorkArgs -> KeepWorkReply, writes);
+
+typed!(fields RecoveryCheckArgs {
+    1 words: Option<String>,
+});
+asks!(RECOVERY_CHECK: 170 "recovery-check" RecoveryCheckArgs -> Done, reads);
+
+typed!(fields RecoverySheetArgs {});
+typed!(fields RecoverySheetReply {
+    2 hosts: Vec<Host>,
+});
+asks!(RECOVERY_SHEET: 171 "recovery-sheet" RecoverySheetArgs -> RecoverySheetReply, reads);
+
+typed!(fields RestoreFromHostArgs {
+    1 words: Option<String>,
+    2 at: Option<String>,
+    3 gone key: String,
+    4 key: Option<bytes::Bytes>,
+});
+typed!(fields RestoreFromHostReply {
+    2 at: String,
+});
+asks!(RESTORE_FROM_HOST: 172 "restore-from-host" RestoreFromHostArgs -> RestoreFromHostReply,
+    writes);
+
+typed!(fields RecoverUndoArgs {
+    1 to: Option<bytes::Bytes>,
+});
+typed!(fields RecoverUndoReply {
+    2 group: [u8; 32],
+    3 kept_changes: Vec<KeptChange>,
+});
+asks!(RECOVER_UNDO: 173 "recover-undo" RecoverUndoArgs -> RecoverUndoReply, writes);
+
+typed!(fields RecoverKeptSeenArgs {
+    1 to: Option<Vec<bytes::Bytes>>,
+});
+typed!(fields KeptChangesReply {
+    2 kept_changes: Vec<KeptChange>,
+});
+asks!(RECOVER_KEPT_SEEN: 174 "recover-kept-seen" RecoverKeptSeenArgs -> KeptChangesReply, writes);
+
+typed!(fields RecoverStopWaitingArgs {
+    1 all: Option<bool>,
+    2 who: Option<Reference>,
+});
+typed!(fields RecoverStopWaitingReply {
+    2 not_heard: Vec<String>,
+    3 stopped: Vec<String>,
+});
+asks!(RECOVER_STOP_WAITING: 175 "recover-stop-waiting" RecoverStopWaitingArgs
+    -> RecoverStopWaitingReply, writes);
+
+// ---- Hosting contacts ----
+
+typed!(fields HostOfferArgs {
+    1 who: Option<Reference>,
+    2 devices: Option<Vec<String>>,
+    3 envelopes: Option<u64>,
+    4 relay_mb: Option<u64>,
+});
+typed!(fields HostOfferReply {
+    2 devices: Vec<String>,
+    3 sees: Cow<'static, str>,
+    4 on: Vec<Hostable>,
+});
+asks!(HOST_OFFER: 188 "host-offer" HostOfferArgs -> HostOfferReply, writes);
+
+typed!(fields HostAcceptArgs {
+    1 who: Option<Reference>,
+});
+typed!(fields HostAcceptReply {
+    2 sees: Cow<'static, str>,
+});
+asks!(HOST_ACCEPT: 189 "host-accept" HostAcceptArgs -> HostAcceptReply, writes);
+
+typed!(fields HostEndArgs {
+    1 who: Option<Reference>,
+});
+typed!(fields HostEndReply {
+    2 ended: bool,
+});
+asks!(HOST_END: 190 "host-end" HostEndArgs -> HostEndReply, writes);
+
+typed!(fields HostingArgs {});
+typed!(
+    fields
+    /// Whom this person hosts, who hosts them, and the offers between,
+    /// with the devices that can host someone now, or why none can.
+    HostingReply {
+        2 can: Vec<String>,
+        3 hosting: Vec<Hosting>,
+        4 why_not: Option<Cow<'static, str>>,
+        5 devices: Vec<Hostable>,
+    }
+);
+asks!(HOSTING_NOW: 191 "hosting" HostingArgs -> HostingReply, reads);
+
+// ---- The service, and freeing space ----
+
+typed!(fields StopArgs {});
+asks!(STOP: 4 "stop" StopArgs -> Done, writes);
+
+typed!(fields ReloadArgs {});
+asks!(RELOAD: 5 "reload" ReloadArgs -> Done, writes);
+
+typed!(fields KeepOldArgs {
+    1 keep: Option<String>,
+    2 space: Option<Reference>,
+});
+typed!(fields KeepOldReply {
+    2 keep: String,
+});
+asks!(KEEP_OLD: 138 "keep-old" KeepOldArgs -> KeepOldReply, writes);
+
+typed!(fields FreeSpaceArgs {
+    1 dry_run: Option<bool>,
+    /// Content that nothing names, in place of old versions.
+    2 unnamed: Option<bool>,
+    3 delete: Option<bool>,
+});
+typed!(
+    fields
+    /// What was freed: of old versions, with what is over the budget; of
+    /// content nothing names, whether it was deleted and what is unsure.
+    FreeSpaceReply {
+        2 bytes: u64,
+        3 deleted: Option<bool>,
+        4 left: Option<u64>,
+        5 objects: u64,
+        6 only_here: Option<OnlyHere>,
+        7 unchecked: Option<bool>,
+        8 unsure: Option<Vec<String>>,
+    }
+);
+asks!(FREE_SPACE: 139 "free-space" FreeSpaceArgs -> FreeSpaceReply, writes);
+
+typed!(fields HistoryEmptyArgs {
+    1 space: Option<Reference>,
+});
+typed!(fields HistoryEmptyReply {
+    2 bytes: u64,
+    3 left: u64,
+    4 objects: u64,
+});
+asks!(HISTORY_EMPTY: 141 "history-empty" HistoryEmptyArgs -> HistoryEmptyReply, writes);
+
+// ---- Reaching a contact ----
+
+typed!(fields ContactStatusArgs {
+    1 who: Option<Reference>,
+    /// Look for them first.
+    2 look: Option<bool>,
+    /// Try them at this address first.
+    3 at: Option<String>,
+    4 after: Option<u64>,
+    5 limit: Option<u64>,
+});
+typed!(
+    fields
+    /// Everything this device knows of reaching one contact.
+    ContactStatusReply {
+        2 devices: Vec<SessionDevice>,
+        3 direct_sessions: bool,
+        /// The start of their identity.
+        4 identity: [u8; 8],
+        5 in_use_for_s: Option<u64>,
+        6 introductions: bool,
+        7 last_look: Vec<Step>,
+        8 look_every_s: u64,
+        9 looked_for: Cow<'static, str>,
+        10 looked_s_ago: Option<u64>,
+        11 looking: bool,
+        12 looking_since: Option<u64>,
+        13 looks_without_session: u64,
+        14 name: String,
+        15 nearby: Nearby,
+        16 nearby_tries: Vec<Step>,
+        17 own: bool,
+        18 refused: bool,
+        19 router: Router,
+        20 sessions: Vec<Step>,
+        21 suggested: Option<String>,
+        22 their_reach: Vec<ReachSeen>,
+        23 trusted: bool,
+        24 your_reach: Vec<ReachSeen>,
+        25 more: bool,
+        26 next: Option<u64>,
+    }
+);
+asks!(CONTACT_STATUS: 32 "contact-status" ContactStatusArgs -> ContactStatusReply,
+    reads unless look or at,
+    after devices, last_look, nearby_tries, sessions, their_reach, your_reach);
+
+// ---- Listings ----
+
+typed!(fields ContactsArgs {
+    1 all: Option<bool>,
+    2 after: Option<u64>,
+    3 limit: Option<u64>,
+});
+typed!(fields ContactsReply {
+    2 contacts: Vec<Contact>,
+    3 more: bool,
+    4 next: Option<u64>,
+});
+asks!(CONTACTS: 30 "contacts" ContactsArgs -> ContactsReply, reads, after contacts);
+typed!(fields ConversationsArgs {
+    1 after: Option<u64>,
+    2 limit: Option<u64>,
+});
+typed!(fields ConversationsReply {
+    2 conversations: Vec<Conversation>,
+    3 more: bool,
+    4 next: Option<u64>,
+});
+asks!(CONVERSATIONS: 33 "conversations" ConversationsArgs -> ConversationsReply, reads,
+    after conversations by id);
+typed!(fields ConflictsArgs {
+    1 after: Option<u64>,
+    2 limit: Option<u64>,
+});
+typed!(fields ConflictsReply {
+    2 conflicts: Vec<Conflict>,
+    3 more: bool,
+    4 next: Option<u64>,
+});
+asks!(CONFLICTS: 132 "conflicts" ConflictsArgs -> ConflictsReply, reads, after conflicts);
+typed!(fields DevicesArgs {
+    1 after: Option<u64>,
+    2 limit: Option<u64>,
+});
+typed!(fields DevicesReply {
+    2 devices: Vec<Device>,
+    3 more: bool,
+    4 next: Option<u64>,
+});
+asks!(DEVICES: 11 "devices" DevicesArgs -> DevicesReply, reads, after devices);
+typed!(fields InvitationsArgs {
+    1 after: Option<u64>,
+    2 limit: Option<u64>,
+});
+typed!(fields InvitationsReply {
+    2 invitations: Vec<Invitation>,
+    3 more: bool,
+    4 next: Option<u64>,
+});
+asks!(INVITATIONS: 44 "invitations" InvitationsArgs -> InvitationsReply, reads, after invitations by id);
+typed!(fields IntroductionsArgs {
+    1 after: Option<u64>,
+    2 limit: Option<u64>,
+});
+typed!(fields IntroductionsReply {
+    2 introductions: Vec<Introduction>,
+    3 more: bool,
+    4 next: Option<u64>,
+});
+asks!(INTRODUCTIONS: 46 "introductions" IntroductionsArgs -> IntroductionsReply, reads,
+    after introductions by id);
+typed!(fields HistoryArgs {
+    1 path: Option<String>,
+    2 after: Option<u64>,
+    3 limit: Option<u64>,
+});
+typed!(fields HistoryReply {
+    2 path: String,
+    3 versions: Vec<Version>,
+    4 more: bool,
+    5 next: Option<u64>,
+});
+asks!(HISTORY: 133 "history" HistoryArgs -> HistoryReply, reads, after versions);
+typed!(fields SpaceUsageArgs {
+    1 after: Option<u64>,
+    2 limit: Option<u64>,
+});
+typed!(fields SpaceUsageReply {
+    2 spaces: Vec<SpaceUsage>,
+    3 more: bool,
+    4 next: Option<u64>,
+});
+asks!(SPACE_USAGE_NOW: 140 "space-usage" SpaceUsageArgs -> SpaceUsageReply, reads, after spaces);
+typed!(fields PeerListArgs {
+    1 after: Option<u64>,
+    2 limit: Option<u64>,
+});
+typed!(fields PeerListReply {
+    2 peers: Vec<Peer>,
+    3 more: bool,
+    4 next: Option<u64>,
+});
+asks!(PEER_LIST: 187 "peer-list" PeerListArgs -> PeerListReply, reads, after peers);
+typed!(fields DeletedArgs {
+    1 path: Option<String>,
+    2 after: Option<u64>,
+    3 limit: Option<u64>,
+    4 hidden: Option<bool>,
+});
+typed!(fields DeletedReply {
+    2 files: Vec<DeletedFile>,
+    3 path: String,
+    4 more: bool,
+    5 next: Option<u64>,
+});
+asks!(DELETED: 227 "deleted" DeletedArgs -> DeletedReply, reads, after files by id);
+
+// ---- Networks, hosts and peers ----
+
+typed!(fields RouterArgs {
+    1 on: Option<bool>,
+    2 this_device: Option<bool>,
+});
+typed!(
+    fields
+    /// [`Router`], as a reply.
+    RouterReply {
+        2 error: Option<String>,
+        3 everywhere: bool,
+        4 external: Option<String>,
+        5 named: Vec<String>,
+        6 network: Network,
+        7 on: bool,
+        8 protocol: Option<Cow<'static, str>>,
+        9 seconds_left: Option<u64>,
+        10 this_device: bool,
+    }
+);
+asks!(ROUTER_NOW: 180 "router" RouterArgs -> RouterReply, reads unless on);
+
+typed!(fields BluetoothArgs {
+    1 mode: Option<String>,
+});
+typed!(
+    fields
+    /// [`BluetoothShown`], as a reply.
+    BluetoothReply {
+        2 available: Option<bool>,
+        3 channels_in: u64,
+        4 error: Option<String>,
+        5 mode: Cow<'static, str>,
+        6 on: bool,
+        7 psm: Option<u64>,
+        8 radio: Option<String>,
+        9 recognized: u64,
+        10 seen: u64,
+        11 why_not: Option<String>,
+        12 windows: u64,
+        13 too_old: Option<bool>,
+    }
+);
+asks!(BLUETOOTH_NOW: 181 "bluetooth" BluetoothArgs -> BluetoothReply, reads unless mode);
+
+typed!(fields NetworkArgs {
+    1 mine: Option<bool>,
+    2 name: Option<String>,
+});
+typed!(
+    fields
+    /// [`Network`], as a reply.
+    NetworkReply {
+        2 answered: Option<bool>,
+        3 ask: bool,
+        4 known: bool,
+        5 mine: bool,
+        6 name: Option<String>,
+        7 router: Option<String>,
+        8 routers: bool,
+    }
+);
+asks!(NETWORK_NOW: 182 "network" NetworkArgs -> NetworkReply, reads unless mine);
+
+typed!(fields HostArgs {
+    1 addresses: Option<Vec<String>>,
+});
+typed!(fields HostReply {
+    2 hosts: Vec<Host>,
+    3 warnings: Vec<String>,
+});
+asks!(HOST_ON: 183 "host" HostArgs -> HostReply, writes);
+typed!(fields HostOffArgs {});
+typed!(
+    fields
+    /// The hosts the recovery sheet names.
+    HostsReply {
+        2 hosts: Vec<Host>,
+    }
+);
+asks!(HOST_OFF: 184 "host-off" HostOffArgs -> HostsReply, writes);
+
+typed!(fields PeerAddArgs {
+    1 addr: Option<String>,
+});
+typed!(fields PeerAddReply {
+    2 addr: String,
+});
+asks!(PEER_ADD: 185 "peer-add" PeerAddArgs -> PeerAddReply, writes);
+typed!(fields PeerRemoveArgs {
+    1 addr: Option<String>,
+});
+asks!(PEER_REMOVE: 186 "peer-remove" PeerRemoveArgs -> Done, writes);
+
+typed!(fields MessagesArgs {
+    1 who: Option<Reference>,
+    2 group: Option<Reference>,
+    3 before: Option<Reference>,
+    4 limit: Option<u64>,
+});
+typed!(fields MessagesReply {
+    2 group: Option<[u8; 32]>,
+    3 messages: Vec<Message>,
+    4 name: Option<String>,
+    5 more: bool,
+    6 next: Option<[u8; 16]>,
+});
+asks!(MESSAGES: 34 "messages" MessagesArgs -> MessagesReply, reads, before messages by id);
+
+typed!(fields CallStartArgs {
+    1 who: Option<Reference>,
+    2 group: Option<Reference>,
+    /// Each 32 bytes; another length is refused by the handler, as it was.
+    3 formats: Option<Vec<bytes::Bytes>>,
+    4 format_names: Option<Vec<String>>,
+    5 ring: Option<Vec<Reference>>,
+});
+asks!(CALL_START: 101 "call-start" CallStartArgs -> Done, writes);
+typed!(fields CallAnswerArgs {
+    1 formats: Option<Vec<bytes::Bytes>>,
+    2 format_names: Option<Vec<String>>,
+    3 reach: Option<bool>,
+    4 join: Option<bool>,
+});
+asks!(CALL_ANSWER: 102 "call-answer" CallAnswerArgs -> Done, writes);
+typed!(fields CallEndArgs {});
+asks!(CALL_END: 103 "call-end" CallEndArgs -> Done, writes);
+
+typed!(fields CallArgs {});
+typed!(fields CallReply {
+    2 call: Option<Call>,
+    3 ended: Option<CallEnded>,
+});
+asks!(CALL_NOW: 100 "call" CallArgs -> CallReply, reads);
+
+typed!(fields FilesArgs {
+    1 path: Option<String>,
+    2 after: Option<u64>,
+    3 limit: Option<u64>,
+});
+typed!(fields FilesReply {
+    2 files: Vec<File>,
+    3 path: String,
+    4 place: Place,
+    5 more: bool,
+    6 next: Option<u64>,
+});
+asks!(FILES: 120 "files" FilesArgs -> FilesReply, reads, after files);
+
+// ---- Setting up, removing a device, a contact's settings ----
+
+typed!(fields SetupBeginArgs {});
+typed!(fields SetupBeginReply {
+    /// The places, from 0, of the two words the person is asked back.
+    2 ask: Vec<u64>,
+    3 words: Vec<String>,
+});
+asks!(SETUP_BEGIN: 8 "setup-begin" SetupBeginArgs -> SetupBeginReply, writes);
+typed!(fields SetupFinishArgs {
+    1 name: Option<String>,
+    2 answers: Option<Vec<String>>,
+    3 device: Option<String>,
+});
+typed!(fields SetupFinishReply {
+    2 device: String,
+    3 name: String,
+});
+asks!(SETUP_FINISH: 9 "setup-finish" SetupFinishArgs -> SetupFinishReply, writes);
+typed!(fields RemoveDeviceArgs {
+    1 who: Option<Reference>,
+    2 lost: Option<bool>,
+    3 words: Option<String>,
+});
+typed!(fields RemoveDeviceReply {
+    2 dropped: u64,
+    3 name: String,
+});
+asks!(REMOVE_DEVICE: 13 "remove-device" RemoveDeviceArgs -> RemoveDeviceReply, writes);
+typed!(fields ContactArgs {
+    1 who: Option<Reference>,
+    2 setting: Option<String>,
+    3 name: Option<String>,
+    4 picture: Option<String>,
+    5 category: Option<String>,
+    6 host: Option<String>,
+});
+typed!(
+    fields
+    /// What changed: of a new name, the name (or, cleared, the name shown
+    /// and whose it is); of a picture, the contact as shown; of a
+    /// category, the category; of refusing, where they still read this
+    /// person's hosts; of the hosts named to them, what is named now.
+    ContactReply {
+        2 category: Option<String>,
+        3 name: Option<String>,
+        4 own: Option<bool>,
+        5 picture: Option<String>,
+        6 reach: Option<Vec<GroupShown>>,
+        7 suggested: Option<String>,
+        8 named: Option<Cow<'static, str>>,
+    }
+);
+asks!(CONTACT_CHANGE: 31 "contact" ContactArgs -> ContactReply, writes);
+
+// ---- Inspection ----
+
+typed!(fields InspectOnArgs {
+    1 minutes: Option<u64>,
+});
+typed!(fields InspectOnReply {
+    2 token: [u8; 32],
+    3 until: u64,
+});
+asks!(INSPECT_ON: 200 "inspect-on" InspectOnArgs -> InspectOnReply, writes);
+typed!(fields InspectOffArgs {});
+typed!(fields InspectOffReply {
+    2 was_on: bool,
+});
+asks!(INSPECT_OFF: 201 "inspect-off" InspectOffArgs -> InspectOffReply, writes);
+typed!(fields InspectArgs {
+    1 token: Option<Reference>,
+    2 after: Option<u64>,
+    3 limit: Option<u64>,
+});
+typed!(
+    fields
+    /// The overview: this device, its identity, the other logs and the
+    /// spaces held here, and the store.
+    InspectReply {
+        2 device: InspectDevice,
+        3 identity: Option<InspectIdentity>,
+        4 others: Vec<OtherLog>,
+        5 spaces: Vec<InspectSpace>,
+        6 store: StoreShown,
+        7 version: Cow<'static, str>,
+        8 more: bool,
+        9 next: Option<u64>,
+    }
+);
+asks!(INSPECT: 202 "inspect" InspectArgs -> InspectReply, reads,
+    after others by id, spaces by id);
+typed!(fields InspectIdentityArgs {
+    1 token: Option<Reference>,
+    2 who: Option<Reference>,
+    3 entry: Option<Reference>,
+    4 path: Option<Vec<Scalar>>,
+    5 value_bytes: Option<u64>,
+    6 items: Option<u64>,
+    7 after: Option<u64>,
+    8 limit: Option<u64>,
+});
+typed!(
+    fields
+    /// An identity log, or (with `entry`) the value at `path` in one of
+    /// its entries.
+    InspectIdentityReply {
+        2 attached: Option<Vec<AttachedLog>>,
+        3 entries: Option<Vec<IdentityEntry>>,
+        4 id: Option<[u8; 32]>,
+        5 stalled: Option<Vec<[u8; 32]>>,
+        6 value: Option<InspectValue>,
+        7 more: bool,
+        8 next: Option<u64>,
+    }
+);
+asks!(INSPECT_IDENTITY_VIEW: 203 "inspect-identity" InspectIdentityArgs
+    -> InspectIdentityReply, reads, after attached by id, entries by id, stalled);
+typed!(fields InspectSpaceArgs {
+    1 token: Option<Reference>,
+    2 space: Option<Reference>,
+    3 value_bytes: Option<u64>,
+    4 items: Option<u64>,
+    5 after: Option<u64>,
+    6 limit: Option<u64>,
+});
+typed!(
+    fields
+    /// One space: what it is, who is in it, its epochs, and how its state
+    /// is made up; of a space this device cannot open, its brief alone.
+    InspectSpaceReply {
+        2 account: bool,
+        3 bytes: u64,
+        4 conflicts: Option<u64>,
+        5 created: Option<u64>,
+        6 creator: Option<[u8; 32]>,
+        7 current_epoch: Option<[u8; 16]>,
+        8 entries: Option<u64>,
+        9 epochs: Option<Vec<EpochShown>>,
+        10 files: bool,
+        11 heads: Option<Vec<[u8; 32]>>,
+        12 id: [u8; 32],
+        13 kinds: Option<Vec<KindCount>>,
+        14 label: Option<String>,
+        15 members: Option<Vec<SpaceMember>>,
+        16 my_role: Option<u64>,
+        17 nodes: Option<u64>,
+        18 opened: bool,
+        19 owner: Option<[u8; 32]>,
+        20 pending: u64,
+        21 policy: Option<PolicyShown>,
+        22 profile: Option<Kind>,
+        23 reach: Option<Vec<ReachNode>>,
+        24 rejected: Option<u64>,
+        25 root: Option<RootShown>,
+        26 sealed: u64,
+        27 stats: Option<StatsShown>,
+        28 successor: Option<[u8; 32]>,
+        29 unwitnessed: Option<u64>,
+        30 valid: Option<u64>,
+        31 more: bool,
+        32 next: Option<u64>,
+    }
+);
+asks!(INSPECT_SPACE_VIEW: 204 "inspect-space" InspectSpaceArgs -> InspectSpaceReply, reads,
+    after epochs by id, heads, kinds, members, reach by id);
+typed!(fields InspectEntriesArgs {
+    1 token: Option<Reference>,
+    2 space: Option<Reference>,
+    /// `sealed`, as a host holds them, or else as a member reads them.
+    3 view: Option<String>,
+    4 gone offset: u64,
+    5 gone count: u64,
+    6 after: Option<u64>,
+    7 limit: Option<u64>,
+});
+typed!(fields InspectEntriesReply {
+    2 entries: Vec<InspectEntry>,
+    3 gone offset: u64,
+    4 pending: Option<u64>,
+    5 total: u64,
+    6 more: bool,
+    7 next: Option<u64>,
+});
+asks!(INSPECT_ENTRIES: 205 "inspect-entries" InspectEntriesArgs -> InspectEntriesReply, reads,
+    after entries precut);
+typed!(fields InspectEntryArgs {
+    1 token: Option<Reference>,
+    2 space: Option<Reference>,
+    3 entry: Option<Reference>,
+    4 sealed_id: Option<Reference>,
+    5 path: Option<Vec<Scalar>>,
+    6 value_bytes: Option<u64>,
+    7 items: Option<u64>,
+    8 after: Option<u64>,
+    9 limit: Option<u64>,
+});
+typed!(
+    fields
+    /// One entry whole, or (with `path`) the value at `path` within it.
+    InspectEntryReply {
+        2 accepted: Option<bool>,
+        3 children: Option<Vec<[u8; 32]>>,
+        4 entry: Option<[u8; 32]>,
+        5 header: Option<InspectValue>,
+        6 ops: Option<Vec<InspectOp>>,
+        7 position: Option<u64>,
+        8 sealed: Option<InspectValue>,
+        9 sealed_id: Option<[u8; 32]>,
+        10 signatures: Option<Vec<SignatureShown>>,
+        11 valid: Option<bool>,
+        12 weigh: Option<Weight>,
+        13 value: Option<InspectValue>,
+        14 more: bool,
+        15 next: Option<u64>,
+    }
+);
+asks!(INSPECT_ENTRY_VIEW: 206 "inspect-entry" InspectEntryArgs -> InspectEntryReply, reads,
+    after children, ops, signatures);
+typed!(fields InspectNodesArgs {
+    1 token: Option<Reference>,
+    2 space: Option<Reference>,
+    3 kind: Option<Kind>,
+    4 parent: Option<Reference>,
+    5 gone offset: u64,
+    6 gone count: u64,
+    7 after: Option<u64>,
+    8 limit: Option<u64>,
+});
+typed!(fields InspectNodesReply {
+    2 nodes: Vec<NodeBrief>,
+    3 gone offset: u64,
+    4 total: u64,
+    5 more: bool,
+    6 next: Option<u64>,
+});
+asks!(INSPECT_NODES: 207 "inspect-nodes" InspectNodesArgs -> InspectNodesReply, reads,
+    after nodes by id precut);
+typed!(fields InspectNodeArgs {
+    1 token: Option<Reference>,
+    2 space: Option<Reference>,
+    3 node: Option<Reference>,
+    4 path: Option<Vec<Scalar>>,
+    5 value_bytes: Option<u64>,
+    6 items: Option<u64>,
+    7 after: Option<u64>,
+    8 limit: Option<u64>,
+});
+typed!(
+    fields
+    /// One node whole, or (with `path`) one of its values; the root and a
+    /// reach node, which are no node of the state, as `special`.
+    InspectNodeReply {
+        2 bytes: Option<u64>,
+        3 children: Option<u64>,
+        4 created: Option<u64>,
+        5 created_in: Option<[u8; 32]>,
+        6 creator: Option<[u8; 32]>,
+        7 delete_conflict: Option<bool>,
+        8 deleted: Option<bool>,
+        9 fields: Option<Vec<Vec<u64>>>,
+        10 history: Option<Vec<NodeHistory>>,
+        11 id: Option<[u8; 16]>,
+        12 kind: Option<Kind>,
+        13 name: Option<String>,
+        14 parent: Option<[u8; 16]>,
+        15 position: Option<u64>,
+        16 special: Option<Cow<'static, str>>,
+        17 values: Option<Vec<NodeField>>,
+        18 value: Option<InspectValue>,
+        19 more: bool,
+        20 next: Option<u64>,
+    }
+);
+asks!(INSPECT_NODE: 208 "inspect-node" InspectNodeArgs -> InspectNodeReply, reads,
+    after fields, history, values);
+
+// ---- Measuring, and the files brought back ----
+
+typed!(fields DebugTreeArgs {
+    1 after: Option<u64>,
+    2 limit: Option<u64>,
+});
+typed!(
+    fields
+    /// The mounted folder's tree as the service holds it; unmounted, the
+    /// files space's heads and epoch alone.
+    DebugTreeReply {
+        2 deleted: Option<u64>,
+        3 epoch: Option<[u8; 16]>,
+        4 heads: [u8; 16],
+        5 items: Option<Vec<TreeItem>>,
+        6 mounted: bool,
+        7 pending: Option<bool>,
+        8 settle: Option<u64>,
+        9 state: Option<[u8; 8]>,
+        10 stuck: Option<Vec<StuckItem>>,
+        11 unshown: Option<Vec<UnshownNode>>,
+        12 more: bool,
+        13 next: Option<u64>,
+    }
+);
+asks!(DEBUG_TREE: 209 "debug-tree" DebugTreeArgs -> DebugTreeReply, reads,
+    after items, stuck, unshown);
+typed!(fields SpeedtestArgs {
+    1 device: Option<Reference>,
+});
+typed!(fields SpeedtestReply {
+    2 device: String,
+    3 ms: u64,
+    4 receive: u64,
+    5 received_bytes: u64,
+    6 rtt_median_us: u64,
+    7 rtt_min_us: u64,
+    8 send: u64,
+    9 sent_bytes: u64,
+});
+// Changes nothing, but measures: a second answer is another measurement,
+// never the same bytes, so it is answered once, as a writer is.
+asks!(SPEEDTEST: 210 "speedtest" SpeedtestArgs -> SpeedtestReply, writes);
+typed!(fields UndeleteArgs {
+    1 path: Option<String>,
+    2 id: Option<Reference>,
+});
+typed!(fields UndeleteReply {
+    2 id: [u8; 16],
+    3 path: String,
+});
+asks!(UNDELETE: 228 "undelete" UndeleteArgs -> UndeleteReply, writes);
+
+// ---- Applications: what programs ask the person ----
+
+typed!(fields AppQuestionsArgs {
+    1 after: Option<u64>,
+    2 limit: Option<u64>,
+});
+typed!(fields AppQuestionsReply {
+    2 questions: Vec<AppQuestion>,
+    3 more: bool,
+    4 next: Option<u64>,
+});
+asks!(APP_QUESTIONS: 220 "app-questions" AppQuestionsArgs -> AppQuestionsReply, reads,
+    after questions);
+typed!(fields AppAnswerArgs {
+    1 id: Option<u64>,
+    2 yes: Option<bool>,
+    3 people: Option<Vec<Reference>>,
+    4 role: Option<String>,
+});
+asks!(APP_ANSWER: 221 "app-answer" AppAnswerArgs -> Done, writes);
+typed!(fields ApprovalsArgs {
+    1 after: Option<u64>,
+    2 limit: Option<u64>,
+});
+typed!(fields ApprovalsReply {
+    2 approvals: Vec<ApprovalShown>,
+    3 more: bool,
+    4 next: Option<u64>,
+});
+asks!(APPROVALS: 222 "approvals" ApprovalsArgs -> ApprovalsReply, reads, after approvals by id);
+typed!(fields ApprovalRevokeArgs {
+    1 id: Option<Reference>,
+});
+asks!(APPROVAL_REVOKE: 223 "approval-revoke" ApprovalRevokeArgs -> Done, writes);
+typed!(fields AppOffersArgs {
+    1 after: Option<u64>,
+    2 limit: Option<u64>,
+});
+typed!(fields AppOffersReply {
+    2 offers: Vec<AppOffer>,
+    3 more: bool,
+    4 next: Option<u64>,
+});
+asks!(APP_OFFERS: 224 "app-offers" AppOffersArgs -> AppOffersReply, reads, after offers);
+typed!(fields AppJoinArgs {
+    1 space: Option<Reference>,
+});
+typed!(fields AppJoinReply {
+    2 space: [u8; 32],
+    3 name: String,
+});
+asks!(APP_JOIN: 225 "app-join" AppJoinArgs -> AppJoinReply, writes);
 
 /// Every request, by number. Numbers are grouped by what they are about,
 /// with room in each group.
 pub static REQUESTS: &[Request] = &[
     // ---- The service, this device, and the person's devices: 1 to 29 ----
-    req!(1 "hello" () -> (2 "api" U, 3 "version" T)),
-    paged!(after 2 "status" (1 "after" U, 2 "limit" U) -> (
-        2 "bluetooth" {BLUETOOTH}, 3 "carrying_calls" U, 4 "conditions" {CONDITIONS},
-        5 "conflicts" U, 6 "copies" {COPIES}, 7 "devices" [DEVICE], 8 "files_ready" BOOL,
-        9 "home" T, 10 "hosts" U, 11 "identity" B, 12 "identity_id" B,
-        13 "inspection" {INSPECTION}, 14 "left_behind" [T], 15 "listen" T, 16 "mount" T,
-        17 "mount_unavailable" T, 18 "mounted" T, 19 "moved_from" U, 20 "name" T,
-        21 "network" {NETWORK}, 22 "not_saved" U, 23 "not_saved_undone" U, 24 "old" {OLD},
-        25 "pairing" {PAIRING}, 26 "peers" [T], 27 "pending_changes" BOOL,
-        28 "progress" {PROGRESS}, 29 "read_markers" BOOL, 30 "removed" BOOL, 31 "retention" T,
-        32 "router" {ROUTER}, 33 "spaces" [SPACE], 34 "uptime_s" U, 35 "more" BOOL,
-        36 "next" U, 37 "redial" {REDIAL}, 38 "always_on" [T])),
-    req!(3 "watch" (1 "window" BOOL) -> ()),
-    req!(4 "stop" () -> ()),
-    req!(5 "reload" () -> ()),
-    req!(6 "conditions" (1 "plugged_in" BOOL, 2 "metered" BOOL) -> (
-        2 "helps" BOOL, 3 "metered" BOOL, 4 "plugged_in" BOOL)),
-    req!(7 "network-changed" (1 "why" T) -> (2 "checking" U)),
-    req!(8 "setup-begin" () -> (2 "ask" [U], 3 "words" [T])),
-    req!(9 "setup-finish" (1 "name" T, 2 "answers" [T], 3 "device" T) -> (
-        2 "device" T, 3 "name" T)),
-    req!(10 "me" (1 "name" T) -> (2 "name" T, 3 "set" BOOL)),
-    paged!(after 11 "devices" (1 "after" U, 2 "limit" U) -> (
-        2 "devices" [DEVICE], 3 "more" BOOL, 4 "next" U)),
-    req!(12 "device-rename" (1 "device" REF, 2 "name" T) -> (2 "key" B, 3 "name" T)),
-    req!(13 "remove-device" (1 "who" REF, 2 "lost" BOOL, 3 "words" T) -> (
-        2 "dropped" U, 3 "name" T)),
-    req!(14 "pair-show" (1 "admin" (gone BOOL), 2 "device" T) -> (2 "addrs" [T], 3 "code" T)),
-    req!(15 "pair-status" () -> (
-        2 "admin" T, 3 "code" T, 4 "error" T, 5 "files" BOOL, 6 "state" T, 7 "power" T)),
-    req!(16 "pair-type" (1 "code" T, 2 "at" T, 3 "admin" BOOL, 4 "words" T, 5 "device" T) -> (
-        2 "name" T)),
+    HELLO,
+    STATUS,
+    WATCH,
+    STOP,
+    RELOAD,
+    CONDITIONS_NOW,
+    NETWORK_CHANGED,
+    SETUP_BEGIN,
+    SETUP_FINISH,
+    ME,
+    DEVICES,
+    DEVICE_RENAME,
+    REMOVE_DEVICE,
+    PAIR_SHOW,
+    PAIR_STATUS,
+    PAIR_TYPE,
     // ---- People, conversations and invitations: 30 to 69 ----
-    paged!(after 30 "contacts" (1 "all" BOOL, 2 "after" U, 3 "limit" U) -> (
-        2 "contacts" [CONTACT], 3 "more" BOOL, 4 "next" U)),
-    req!(31 "contact" (
-        1 "who" REF, 2 "setting" T, 3 "name" T, 4 "picture" T, 5 "category" T, 6 "host" T
-    ) -> (
-        2 "category" T, 3 "name" T, 4 "own" BOOL, 5 "picture" T, 6 "reach" [GROUP_SHOWN],
-        7 "suggested" T, 8 "named" T)),
-    paged!(after 32 "contact-status" (
-        1 "who" REF, 2 "look" BOOL, 3 "at" T, 4 "after" U, 5 "limit" U
-    ) -> (
-        2 "devices" [SESSION_DEVICE], 3 "direct_sessions" BOOL, 4 "identity" B,
-        5 "in_use_for_s" U, 6 "introductions" BOOL, 7 "last_look" [STEP], 8 "look_every_s" U,
-        9 "looked_for" T, 10 "looked_s_ago" U, 11 "looking" BOOL, 12 "looking_since" U,
-        13 "looks_without_session" U, 14 "name" T, 15 "nearby" {NEARBY},
-        16 "nearby_tries" [STEP], 17 "own" BOOL, 18 "refused" BOOL, 19 "router" {ROUTER},
-        20 "sessions" [STEP], 21 "suggested" T, 22 "their_reach" [THEIR_REACH],
-        23 "trusted" BOOL, 24 "your_reach" [THEIR_REACH], 25 "more" BOOL, 26 "next" U)),
-    paged!(after 33 "conversations" (1 "after" U, 2 "limit" U) -> (
-        2 "conversations" [CONVERSATION], 3 "more" BOOL, 4 "next" U)),
-    paged!(before "messages" 34 "messages" (
-        1 "who" REF, 2 "group" REF, 3 "before" REF, 4 "limit" U
-    ) -> (2 "group" B, 3 "messages" [MESSAGE], 4 "name" T, 5 "more" BOOL, 6 "next" B)),
-    req!(35 "say" (1 "who" REF, 2 "text" T, 3 "reply_to" REF, 4 "attach" [T], 5 "group" REF) -> (
-        2 "reachable" BOOL)),
-    req!(36 "save-attachment" (
-        1 "who" REF, 2 "id" REF, 3 "index" U, 4 "to" T, 5 "group" REF
-    ) -> (2 "path" T, 3 "size" U)),
-    req!(37 "edit-message" (1 "who" REF, 2 "id" REF, 3 "text" T, 4 "group" REF) -> ()),
-    req!(38 "delete-message" (1 "who" REF, 2 "id" REF, 3 "group" REF) -> ()),
-    req!(39 "react" (1 "who" REF, 2 "id" REF, 3 "text" T, 4 "group" REF) -> ()),
-    req!(40 "mark-read" (1 "who" REF, 2 "group" REF) -> (
-        2 "kept" BOOL, 3 "marked" BOOL, 4 "why" T)),
-    req!(41 "read-markers" (1 "on" BOOL) -> (2 "on" BOOL)),
-    req!(42 "invite" (
-        1 "address" T, 2 "name" T, 3 "hosts_only" BOOL, 4 "no_introductions" BOOL
-    ) -> (2 "code" T)),
-    req!(43 "accept" (
-        1 "code" T, 2 "name" T, 3 "via" T, 4 "hosts_only" BOOL, 5 "no_introductions" BOOL,
-        6 "for" REF
-    ) -> (2 "name" T, 3 "recovery_of" B)),
-    paged!(after 44 "invitations" (1 "after" U, 2 "limit" U) -> (
-        2 "invitations" [INVITATION], 3 "more" BOOL, 4 "next" U)),
-    req!(45 "cancel-invitation" (1 "id" REF) -> ()),
-    paged!(after 46 "introductions" (1 "after" U, 2 "limit" U) -> (
-        2 "introductions" [INTRODUCTION], 3 "more" BOOL, 4 "next" U)),
-    req!(47 "introduce" (1 "who" REF, 2 "to" REF, 3 "note" T) -> ()),
-    req!(48 "introduction-accept" (1 "id" REF) -> (2 "name" T, 3 "recovery_of" B)),
-    req!(49 "introduction-decline" (1 "id" REF) -> ()),
+    CONTACTS,
+    CONTACT_CHANGE,
+    CONTACT_STATUS,
+    CONVERSATIONS,
+    MESSAGES,
+    SAY,
+    SAVE_ATTACHMENT,
+    EDIT_MESSAGE,
+    DELETE_MESSAGE,
+    REACT,
+    MARK_READ,
+    READ_MARKERS,
+    INVITE,
+    ACCEPT,
+    INVITATIONS,
+    CANCEL_INVITATION,
+    INTRODUCTIONS,
+    INTRODUCE,
+    INTRODUCTION_ACCEPT,
+    INTRODUCTION_DECLINE,
     // ---- Groups: 70 to 99 ----
-    paged!(after 70 "groups" (1 "after" U, 2 "limit" U) -> (
-        2 "groups" [GROUP], 3 "offers" [OFFER], 4 "more" BOOL, 5 "next" U,
-        6 "rejoin" [REJOIN])),
-    req!(71 "group-create" (1 "name" T, 2 "people" [REF], 3 "for_call" BOOL, 4 "history" BOOL) -> (
-        2 "group" B, 3 "name" T)),
-    req!(72 "group-join" (1 "group" REF, 2 "reach" BOOL) -> (
-        2 "group" B, 3 "name" T, 4 "shared" BOOL, 5 "waiting" BOOL)),
-    req!(73 "group-decline" (1 "group" REF) -> ()),
-    req!(74 "group-leave" (1 "group" REF, 2 "admins" [REF], 3 "anyway" BOOL) -> (
-        2 "admins" [T])),
-    req!(75 "group-reach" (1 "group" REF, 2 "share" BOOL, 3 "host" T) -> (
-        2 "shared" BOOL, 3 "waiting" BOOL, 4 "taken_out" BOOL)),
-    req!(76 "group-add" (1 "group" REF, 2 "people" [REF], 3 "shown" T) -> ()),
-    req!(77 "group-remove" (1 "group" REF, 2 "who" REF) -> (
-        2 "group" B, 3 "left_out" [B], 4 "was" B)),
-    paged!(after 78 "group-members" (1 "group" REF, 2 "after" U, 3 "limit" U) -> (
-        2 "group" B, 3 "members" [MEMBER], 4 "name" T, 5 "more" BOOL, 6 "next" U)),
-    req!(79 "group-set" (1 "group" REF, 2 "name" T, 3 "introductions" BOOL, 4 "for_call" BOOL) -> ()),
-    req!(80 "group-member" (1 "group" REF, 2 "who" REF, 3 "shown" T, 4 "introduce" BOOL) -> ()),
-    req!(81 "group-connect" (1 "group" REF, 2 "who" REF, 3 "note" T) -> (2 "asked" BOOL)),
-    req!(82 "group-role" (1 "group" REF, 2 "who" REF, 3 "role" T) -> (2 "group" B, 3 "was" B)),
-    req!(83 "group-post-again" (1 "group" REF) -> (2 "posted" U)),
-    req!(84 "group-moved-seen" (1 "group" REF) -> ()),
-    req!(85 "group-confirm-move" (1 "group" REF, 2 "moves" [B], 3 "to" [B]) -> (2 "kept" U)),
-    req!(86 "group-leaving" (1 "group" REF) -> (
-        2 "admins" [T], 3 "choose_admin" BOOL, 4 "group" B, 5 "name" T,
-        6 "relayed_for" [RELAYED_FOR])),
-    req!(87 "group-rejoin" (1 "group" REF) -> (2 "group" B, 3 "name" T)),
+    GROUPS,
+    GROUP_CREATE,
+    GROUP_JOIN,
+    GROUP_DECLINE,
+    GROUP_LEAVE,
+    GROUP_REACH_SET,
+    GROUP_ADD,
+    GROUP_REMOVE,
+    GROUP_MEMBERS,
+    GROUP_SET,
+    GROUP_MEMBER,
+    GROUP_CONNECT,
+    GROUP_ROLE,
+    GROUP_POST_AGAIN,
+    GROUP_MOVED_SEEN,
+    GROUP_CONFIRM_MOVE,
+    GROUP_LEAVING,
+    GROUP_REJOIN,
     // ---- Calls and the clipboard: 100 to 119 ----
-    req!(100 "call" () -> (2 "call" {CALL}, 3 "ended" {CALL_ENDED})),
-    req!(101 "call-start" (
-        1 "who" REF, 2 "group" REF, 3 "formats" [B], 4 "format_names" [T], 5 "ring" [REF]
-    ) -> ()),
-    req!(102 "call-answer" (1 "formats" [B], 2 "format_names" [T], 3 "reach" BOOL, 4 "join" BOOL) -> ()),
-    req!(103 "call-end" () -> ()),
-    req!(104 "call-media" () -> ()),
-    req!(105 "clip-copy" (1 "text" T) -> (2 "devices" U)),
-    req!(106 "clip" () -> (2 "from" T, 3 "here" BOOL, 4 "seconds" U, 5 "text" T)),
+    CALL_NOW,
+    CALL_START,
+    CALL_ANSWER,
+    CALL_END,
+    CALL_MEDIA,
+    CLIP_COPY,
+    CLIP,
     // ---- The one folder: 120 to 149 ----
-    paged!(after 120 "files" (1 "path" T, 2 "after" U, 3 "limit" U) -> (
-        2 "files" [FILE], 3 "path" T, 4 "place" {PLACE}, 5 "more" BOOL, 6 "next" U)),
-    req!(121 "mkdir" (1 "path" T) -> (2 "path" T)),
-    req!(122 "move" (1 "from" T, 2 "to" T) -> (2 "path" T)),
-    req!(123 "remove" (1 "path" T) -> (2 "path" T)),
-    req!(124 "copy" (1 "from" T, 2 "to" T) -> (2 "path" T)),
-    req!(125 "put" (1 "from" T, 2 "to" T) -> (2 "path" T)),
-    req!(126 "save" (1 "path" T, 2 "to" T, 3 "version" U) -> (2 "path" T, 3 "size" U)),
-    req!(127 "write" (1 "from" T, 2 "path" T) -> (2 "path" T)),
-    req!(128 "share" (1 "who" REF, 2 "paths" [T], 3 "text" T, 4 "group" REF) -> (2 "message" BOOL, 3 "path" T)),
-    req!(129 "mount" (1 "path" T) -> (2 "path" T)),
-    req!(130 "unmount" () -> ()),
-    req!(131 "flush" () -> (2 "entries" U)),
-    paged!(after 132 "conflicts" (1 "after" U, 2 "limit" U) -> (
-        2 "conflicts" [CONFLICT], 3 "more" BOOL, 4 "next" U)),
-    paged!(after 133 "history" (1 "path" T, 2 "after" U, 3 "limit" U) -> (
-        2 "path" T, 3 "versions" [VERSION], 4 "more" BOOL, 5 "next" U)),
-    req!(134 "restore" (1 "path" T, 2 "version" U) -> (2 "path" T, 3 "version" U)),
-    req!(135 "pin" (1 "path" T) -> (2 "on_demand" BOOL, 3 "path" T)),
-    req!(136 "unpin" (1 "path" T) -> (2 "on_demand" BOOL, 3 "path" T)),
-    req!(137 "retention" (1 "mode" T) -> (2 "retention" T)),
-    req!(138 "keep-old" (1 "keep" T, 2 "space" REF) -> (2 "keep" T)),
-    req!(139 "free-space" (1 "dry_run" BOOL, 2 "unnamed" BOOL, 3 "delete" BOOL) -> (
-        2 "bytes" U, 3 "deleted" BOOL, 4 "left" U, 5 "objects" U, 6 "only_here" {ONLY_HERE},
-        7 "unchecked" BOOL, 8 "unsure" [T])),
-    paged!(after 140 "space-usage" (1 "after" U, 2 "limit" U) -> (
-        2 "spaces" [SPACE_USAGE], 3 "more" BOOL, 4 "next" U)),
-    req!(141 "history-empty" (1 "space" REF) -> (2 "bytes" U, 3 "left" U, 4 "objects" U)),
+    FILES,
+    MKDIR,
+    MOVE,
+    REMOVE,
+    COPY,
+    PUT,
+    SAVE,
+    WRITE,
+    SHARE,
+    MOUNT,
+    UNMOUNT,
+    FLUSH,
+    CONFLICTS,
+    HISTORY,
+    RESTORE,
+    PIN,
+    UNPIN,
+    RETENTION,
+    KEEP_OLD,
+    FREE_SPACE,
+    SPACE_USAGE_NOW,
+    HISTORY_EMPTY,
     // ---- Guardians and recovery: 150 to 179 ----
-    req!(150 "guardians" () -> (
-        2 "asked" [T], 3 "changes" [GUARDIAN_CHANGE], 4 "copy_full" [T], 5 "data" BOOL,
-        6 "delay" U, 7 "delay_text" T, 8 "frozen" BOOL, 9 "guardians" U, 10 "names" [T],
-        11 "ready" [T], 12 "recoveries" [RECOVERY], 13 "threshold" U)),
-    req!(151 "guardians-set" (1 "who" [REF], 2 "threshold" U, 3 "delay" U, 4 "words" T) -> (
-        2 "delay" U, 3 "delay_text" T, 4 "names" [T], 5 "pending" BOOL, 6 "threshold" U)),
-    req!(152 "guardians-object" (1 "fingerprint" T) -> ()),
-    req!(153 "guardians-ask" (1 "who" REF) -> (2 "name" T)),
-    guarding_reply!("guarding" 154 ()),
-    req!(155 "guarding-invite" (1 "who" REF, 2 "at" T) -> (2 "code" T, 3 "name" T)),
-    req!(156 "guarding-accept" (1 "who" REF) -> (2 "already" BOOL, 3 "name" T, 4 "persona" B)),
-    guarding_reply!("guarding-confirm-change" 157 (
-        1 "who" REF, 2 "fingerprint" T, 3 "understood" BOOL)),
-    guarding_reply!("guarding-never" 158 (1 "who" REF, 2 "fingerprint" T)),
-    req!(159 "guarding-caution" (1 "who" REF) -> (2 "caution" T, 3 "name" T)),
-    guarding_reply!("guarding-endorse" 160 (1 "who" REF, 2 "fingerprint" T, 3 "understood" BOOL)),
-    guarding_reply!("guarding-confirm" 161 (1 "who" REF, 2 "fingerprint" T, 3 "understood" BOOL)),
-    req!(162 "recover" () -> (
-        2 "asked" BOOL, 3 "confirmed" U, 4 "endorsed" U, 5 "fingerprint" T, 6 "guardians" U,
-        7 "held" U, 8 "helper" BOOL, 9 "identity" B, 10 "in_effect" BOOL, 11 "lost_at" U,
-        12 "lost_devices" [LOST_DEVICE], 13 "pair_again" [PAIR_AGAIN], 14 "proposed" U,
-        15 "successions" (gone [SUCCESSION]), 16 "threshold" U, 17 "under_way" BOOL,
-        18 "finished" BOOL, 19 "words" T, 20 "kept_changes" [KEPT_CHANGE], 21 "not_heard" [T])),
-    req!(163 "recover-start" (1 "code" T, 2 "identity" REF) -> (
-        2 "fingerprint" T, 3 "identity" B)),
-    req!(164 "recover-invite" (1 "at" T) -> (2 "code" T, 3 "fingerprint" T)),
+    GUARDIANS,
+    GUARDIANS_SET,
+    GUARDIANS_OBJECT,
+    GUARDIANS_ASK,
+    GUARDING,
+    GUARDING_INVITE,
+    GUARDING_ACCEPT,
+    GUARDING_CONFIRM_CHANGE,
+    GUARDING_NEVER,
+    GUARDING_CAUTION,
+    GUARDING_ENDORSE,
+    GUARDING_CONFIRM,
+    RECOVER,
+    RECOVER_START,
+    RECOVER_INVITE,
     gone!(165 "recover-keep-succession" (1 "id" T, 2 "keep" BOOL) -> (
         2 "answered" U, 3 "kept" BOOL)),
-    req!(166 "recover-lost-at" (1 "lost_at" U) -> (2 "lost_devices" [LOST_DEVICE])),
-    req!(167 "recover-cancel" () -> (2 "fingerprint" T)),
-    req!(168 "recover-finish" (1 "without_account" BOOL, 2 "lost_at" U) -> (
-        2 "account" BOOL, 3 "lost_devices" [LOST_DEVICE], 4 "pair_again" [PAIR_AGAIN],
-        5 "words" T, 6 "not_heard" [T])),
-    req!(169 "keep-work" (1 "name" T, 2 "up_to" T) -> (2 "kept" U, 3 "set_aside" [SET_ASIDE])),
-    req!(170 "recovery-check" (1 "words" T) -> ()),
-    req!(171 "recovery-sheet" () -> (2 "hosts" [HOST])),
-    req!(172 "restore-from-host" (1 "words" T, 2 "at" T, 3 "key" (gone T), 4 "key" B) -> (2 "at" T)),
-    req!(173 "recover-undo" (1 "to" B) -> (2 "group" B, 3 "kept_changes" [KEPT_CHANGE])),
-    req!(174 "recover-kept-seen" (1 "to" [B]) -> (2 "kept_changes" [KEPT_CHANGE])),
-    req!(175 "recover-stop-waiting" (1 "all" BOOL, 2 "who" REF) -> (
-        2 "not_heard" [T], 3 "stopped" [T])),
+    RECOVER_LOST_AT,
+    RECOVER_CANCEL,
+    RECOVER_FINISH,
+    KEEP_WORK,
+    RECOVERY_CHECK,
+    RECOVERY_SHEET,
+    RESTORE_FROM_HOST,
+    RECOVER_UNDO,
+    RECOVER_KEPT_SEEN,
+    RECOVER_STOP_WAITING,
     // ---- Networks, hosts and peers: 180 to 199 ----
-    req!(180 "router" (1 "on" BOOL, 2 "this_device" BOOL) -> (
-        2 "error" T, 3 "everywhere" BOOL, 4 "external" T, 5 "named" [T], 6 "network" {NETWORK},
-        7 "on" BOOL, 8 "protocol" T, 9 "seconds_left" U, 10 "this_device" BOOL)),
-    req!(181 "bluetooth" (1 "mode" T) -> (
-        2 "available" BOOL, 3 "channels_in" U, 4 "error" T, 5 "mode" T, 6 "on" BOOL, 7 "psm" U,
-        8 "radio" T, 9 "recognized" U, 10 "seen" U, 11 "why_not" T, 12 "windows" U,
-        13 "too_old" BOOL)),
-    req!(182 "network" (1 "mine" BOOL, 2 "name" T) -> (
-        2 "answered" BOOL, 3 "ask" BOOL, 4 "known" BOOL, 5 "mine" BOOL, 6 "name" T,
-        7 "router" T, 8 "routers" BOOL)),
-    req!(183 "host" (1 "addresses" [T]) -> (2 "hosts" [HOST], 3 "warnings" [T])),
-    req!(184 "host-off" () -> (2 "hosts" [HOST])),
-    req!(185 "peer-add" (1 "addr" T) -> (2 "addr" T)),
-    req!(186 "peer-remove" (1 "addr" T) -> ()),
-    paged!(after 187 "peer-list" (1 "after" U, 2 "limit" U) -> (
-        2 "peers" [PEER], 3 "more" BOOL, 4 "next" U)),
-    req!(188 "host-offer" (1 "who" REF, 2 "devices" [T], 3 "envelopes" U, 4 "relay_mb" U) -> (
-        2 "devices" [T], 3 "sees" T, 4 "on" [HOSTABLE])),
-    req!(189 "host-accept" (1 "who" REF) -> (2 "sees" T)),
-    req!(190 "host-end" (1 "who" REF) -> (2 "ended" BOOL)),
-    req!(191 "hosting" () -> (
-        2 "can" [T], 3 "hosting" [HOSTING], 4 "why_not" T, 5 "devices" [HOSTABLE])),
+    ROUTER_NOW,
+    BLUETOOTH_NOW,
+    NETWORK_NOW,
+    HOST_ON,
+    HOST_OFF,
+    PEER_ADD,
+    PEER_REMOVE,
+    PEER_LIST,
+    HOST_OFFER,
+    HOST_ACCEPT,
+    HOST_END,
+    HOSTING_NOW,
     // ---- Inspection and measuring: 200 to 219 ----
-    req!(200 "inspect-on" (1 "minutes" U) -> (2 "token" B, 3 "until" U)),
-    req!(201 "inspect-off" () -> (2 "was_on" BOOL)),
-    paged!(after 202 "inspect" (1 "token" REF, 2 "after" U, 3 "limit" U) -> (
-        2 "device" {INSPECT_DEVICE}, 3 "identity" {INSPECT_IDENTITY}, 4 "others" [OTHER_LOG],
-        5 "spaces" [INSPECT_SPACE], 6 "store" {STORE}, 7 "version" T, 8 "more" BOOL,
-        9 "next" U)),
-    paged!(after 203 "inspect-identity" (
-        1 "token" REF, 2 "who" REF, 3 "entry" REF, 4 "path" [SCALAR], 5 "value_bytes" U,
-        6 "items" U, 7 "after" U, 8 "limit" U
-    ) -> (
-        2 "attached" [ATTACHED_LOG], 3 "entries" [IDENTITY_ENTRY], 4 "id" B, 5 "stalled" [B],
-        6 "value" {VALUE}, 7 "more" BOOL, 8 "next" U)),
-    paged!(after 204 "inspect-space" (
-        1 "token" REF, 2 "space" REF, 3 "value_bytes" U, 4 "items" U, 5 "after" U, 6 "limit" U
-    ) -> (
-        2 "account" BOOL, 3 "bytes" U, 4 "conflicts" U, 5 "created" U, 6 "creator" B,
-        7 "current_epoch" B, 8 "entries" U, 9 "epochs" [EPOCH], 10 "files" BOOL, 11 "heads" [B],
-        12 "id" B, 13 "kinds" [KIND_COUNT], 14 "label" T, 15 "members" [SPACE_MEMBER],
-        16 "my_role" U, 17 "nodes" U, 18 "opened" BOOL, 19 "owner" B, 20 "pending" U,
-        21 "policy" {POLICY}, 22 "profile" KIND, 23 "reach" [REACH_NODE], 24 "rejected" U,
-        25 "root" {ROOT}, 26 "sealed" U, 27 "stats" {STATS}, 28 "successor" B,
-        29 "unwitnessed" U, 30 "valid" U, 31 "more" BOOL, 32 "next" U)),
-    paged!(after 205 "inspect-entries" (
-        1 "token" REF, 2 "space" REF, 3 "view" T, 4 "offset" (gone U), 5 "count" (gone U),
-        6 "after" U, 7 "limit" U
-    ) -> (
-        2 "entries" [INSPECT_ENTRY], 3 "offset" (gone U), 4 "pending" U, 5 "total" U,
-        6 "more" BOOL, 7 "next" U)),
-    paged!(after 206 "inspect-entry" (
-        1 "token" REF, 2 "space" REF, 3 "entry" REF, 4 "sealed_id" REF, 5 "path" [SCALAR],
-        6 "value_bytes" U, 7 "items" U, 8 "after" U, 9 "limit" U
-    ) -> (
-        2 "accepted" BOOL, 3 "children" [B], 4 "entry" B, 5 "header" {VALUE}, 6 "ops" [OP],
-        7 "position" U, 8 "sealed" {VALUE}, 9 "sealed_id" B, 10 "signatures" [SIGNATURE],
-        11 "valid" BOOL, 12 "weigh" {WEIGH}, 13 "value" {VALUE}, 14 "more" BOOL, 15 "next" U)),
-    paged!(after 207 "inspect-nodes" (
-        1 "token" REF, 2 "space" REF, 3 "kind" KIND, 4 "parent" REF, 5 "offset" (gone U),
-        6 "count" (gone U), 7 "after" U, 8 "limit" U
-    ) -> (
-        2 "nodes" [NODE_BRIEF], 3 "offset" (gone U), 4 "total" U, 5 "more" BOOL, 6 "next" U)),
-    paged!(after 208 "inspect-node" (
-        1 "token" REF, 2 "space" REF, 3 "node" REF, 4 "path" [SCALAR], 5 "value_bytes" U,
-        6 "items" U, 7 "after" U, 8 "limit" U
-    ) -> (
-        2 "bytes" U, 3 "children" U, 4 "created" U, 5 "created_in" B, 6 "creator" B,
-        7 "delete_conflict" BOOL, 8 "deleted" BOOL, 9 "fields" [[U]],
-        10 "history" [NODE_HISTORY], 11 "id" B, 12 "kind" KIND, 13 "name" T, 14 "parent" B,
-        15 "position" U, 16 "special" T, 17 "values" [NODE_FIELD], 18 "value" {VALUE},
-        19 "more" BOOL, 20 "next" U)),
-    paged!(after 209 "debug-tree" (1 "after" U, 2 "limit" U) -> (
-        2 "deleted" U, 3 "epoch" B, 4 "heads" B, 5 "items" [TREE_ITEM], 6 "mounted" BOOL,
-        7 "pending" BOOL, 8 "settle" U, 9 "state" B, 10 "stuck" [STUCK_ITEM],
-        11 "unshown" [UNSHOWN_NODE], 12 "more" BOOL, 13 "next" U)),
-    req!(210 "speedtest" (1 "device" REF) -> (
-        2 "device" T, 3 "ms" U, 4 "receive" U, 5 "received_bytes" U, 6 "rtt_median_us" U,
-        7 "rtt_min_us" U, 8 "send" U, 9 "sent_bytes" U)),
+    INSPECT_ON,
+    INSPECT_OFF,
+    INSPECT,
+    INSPECT_IDENTITY_VIEW,
+    INSPECT_SPACE_VIEW,
+    INSPECT_ENTRIES,
+    INSPECT_ENTRY_VIEW,
+    INSPECT_NODES,
+    INSPECT_NODE,
+    DEBUG_TREE,
+    SPEEDTEST,
     // ---- Applications: 220 to 239 ----
-    paged!(after 220 "app-questions" (1 "after" U, 2 "limit" U) -> (
-        2 "questions" [APP_QUESTION], 3 "more" BOOL, 4 "next" U)),
-    req!(221 "app-answer" (1 "id" U, 2 "yes" BOOL, 3 "people" [REF], 4 "role" T) -> ()),
-    paged!(after 222 "approvals" (1 "after" U, 2 "limit" U) -> (
-        2 "approvals" [APPROVAL], 3 "more" BOOL, 4 "next" U)),
-    req!(223 "approval-revoke" (1 "id" REF) -> ()),
-    paged!(after 224 "app-offers" (1 "after" U, 2 "limit" U) -> (
-        2 "offers" [APP_OFFER], 3 "more" BOOL, 4 "next" U)),
-    req!(225 "app-join" (1 "space" REF) -> (2 "space" B, 3 "name" T)),
-    req!(226 "wake" () -> (2 "checking" U)),
-    paged!(after 227 "deleted" (1 "path" T, 2 "after" U, 3 "limit" U, 4 "hidden" BOOL) -> (
-        2 "files" [DELETED_FILE], 3 "path" T, 4 "more" BOOL, 5 "next" U)),
-    req!(228 "undelete" (1 "path" T, 2 "id" REF) -> (2 "id" B, 3 "path" T)),
+    APP_QUESTIONS,
+    APP_ANSWER,
+    APPROVALS,
+    APPROVAL_REVOKE,
+    APP_OFFERS,
+    APP_JOIN,
+    WAKE,
+    DELETED,
+    UNDELETE,
 ];
 
 // ---- What the service's program says without starting ----
 
-rec!(DATA_HELD "data held":
-    1 "bytes" U, 2 "identity" BOOL, 3 "local" U, 4 "local_bytes" U, 5 "objects" U,
-    6 "other" BOOL, 7 "spaces" U, 8 "unsaved" U, 9 "unsaved_bytes" U);
+typed!(DATA_HELD "data held" DataHeld {
+    1 bytes: u64,
+    2 identity: bool,
+    3 local: u64,
+    4 local_bytes: u64,
+    5 objects: u64,
+    6 other: bool,
+    7 spaces: u64,
+    8 unsaved: u64,
+    9 unsaved_bytes: u64,
+});
+
+typed!(
+    fields
+    /// `--store`: which data is there (`empty`, `current`, `other` or
+    /// `unreadable`) and what it holds; of another version's, who wrote it
+    /// and the refusal in words.
+    StoreReply {
+        2 holds: DataHeld,
+        3 refusal: Option<String>,
+        4 store: Cow<'static, str>,
+        5 written_by: Option<Cow<'static, str>>,
+    }
+);
+
+/// What the service's program says when asked, typed: its row, `ROW`, for
+/// [`PROGRAM`], from its reply's declaration. The program writes it and
+/// exits; nothing answers it on the socket.
+macro_rules! program {
+    ($row:ident: $n:literal $name:literal -> $reply:ident) => {
+        #[doc = concat!("The row of `", $name, "`, typed.")]
+        pub static $row: Request = Request {
+            n: $n,
+            name: $name,
+            args: &[],
+            reply: <$reply as Fields>::FIELDS,
+            page: Page::Whole,
+            gone: false,
+            answer: None,
+        };
+    };
+}
+
+program!(PROGRAM_STORE: 1 "--store" -> StoreReply);
+program!(PROGRAM_CLEAR: 2 "--clear" -> Done);
 
 /// What the service's program says without starting (`apps.md`, The local
 /// interface), by the option that asks it: one record on its standard
@@ -803,31 +3916,142 @@ rec!(DATA_HELD "data held":
 /// which data is there and what it holds, counted without reading any of
 /// it; `--clear` removes data this version cannot read, or fails, saying
 /// why.
-pub static PROGRAM: &[Request] = &[
-    req!(1 "--store" () -> (
-        2 "holds" {DATA_HELD}, 3 "refusal" T, 4 "store" T, 5 "written_by" T)),
-    req!(2 "--clear" () -> ()),
-];
+pub static PROGRAM: &[Request] = &[PROGRAM_STORE, PROGRAM_CLEAR];
 
-/// What an error's reply says besides why, in key 1, numbered as a reply's
-/// fields are (`apps.md`, Errors): of error 4 to a paged request, which item
-/// was too large for a message on its own, by its place in the answer as
-/// `after` counts (`at`), and by its `id` where it has one, so that a
-/// client can ask for what comes after it.
-pub static ERROR_FIELDS: &[Field] = &[f!(2 "at" U), f!(3 "id" B)];
+typed!(
+    fields
+    /// What an error's reply says besides why, in key 1, numbered as a
+    /// reply's fields are (`apps.md`, Errors): of error 4 to a paged
+    /// request, which item was too large for a message on its own, by its
+    /// place in the answer as `after` counts (`at`), and by its `id` where
+    /// it has one, so that a client can ask for what comes after it.
+    ErrorMore {
+        2 at: Option<u64>,
+        3 id: Option<bytes::Bytes>,
+    }
+);
+
+/// [`ErrorMore`]'s fields, as the tables give them.
+pub static ERROR_FIELDS: &[Field] = <ErrorMore as Fields>::FIELDS;
+
+/// A message of a stream, typed: its row, `ROW`, for [`EVENTS`] or
+/// [`FRAMES`], from its typed fields.
+macro_rules! streams {
+    ($row:ident: $n:literal $name:literal $fields:ident) => {
+        #[doc = concat!("The row of `", $name, "`, typed.")]
+        pub static $row: Request = Request {
+            n: $n,
+            name: $name,
+            args: <$fields as Fields>::FIELDS,
+            reply: &[],
+            page: Page::Whole,
+            gone: false,
+            answer: None,
+        };
+
+        impl super::typed::Streamed for $fields {
+            const KIND: &'static Request = &$row;
+        }
+    };
+}
+
+// ---- The events of `watch` ----
+
+typed!(
+    fields
+    /// Something changed, and this is the count of changes.
+    Changed {
+        1 seq: u64,
+    }
+);
+streams!(EVENT_CHANGED: 1 "changed" Changed);
 
 /// The events of a `watch` connection: key 0 says which.
-pub static EVENTS: &[Request] = &[req!(1 "changed" (1 "seq" U) -> ())];
+pub static EVENTS: &[Request] = &[EVENT_CHANGED];
+
+// ---- The frames of `call-media` ----
+
+typed!(
+    fields
+    /// Audio of the call, in the codec its client chose; from the service,
+    /// in a group, the voice it is.
+    AudioFrame {
+        1 audio: bytes::Bytes,
+        3 from: Option<[u8; 8]>,
+    }
+);
+streams!(FRAME_AUDIO: 1 "audio" AudioFrame);
+typed!(
+    fields
+    /// A frame of another format the call took.
+    OtherFrame {
+        1 frame: bytes::Bytes,
+        2 format: [u8; 32],
+        3 from: Option<[u8; 8]>,
+        4 size: Option<u64>,
+    }
+);
+streams!(FRAME_OTHER: 2 "frame" OtherFrame);
+typed!(
+    fields
+    /// The shape of a window's viewport (`basics/video.md`): from the
+    /// window, its own; from the service, a receiver's, `from` in a group.
+    ViewportFrame {
+        1 width: u64,
+        2 height: u64,
+        3 from: Option<[u8; 8]>,
+    }
+);
+streams!(FRAME_VIEWPORT: 3 "viewport" ViewportFrame);
+typed!(
+    fields
+    /// From the window, in a group: the level it asks of the sender `from`
+    /// (`basics/video.md#groups`).
+    LevelFrame {
+        1 level: u64,
+        3 from: Option<[u8; 8]>,
+    }
+);
+streams!(FRAME_LEVEL: 4 "level" LevelFrame);
+typed!(
+    fields
+    /// To the window, in a group: whether small and large pictures of its
+    /// own are asked for.
+    AskedFrame {
+        1 small: bool,
+        2 large: bool,
+    }
+);
+streams!(FRAME_ASKED: 5 "asked" AskedFrame);
+typed!(
+    fields
+    /// A key picture of the size `size`: from the window, asked of the
+    /// sender `from`; to it, asked of its own.
+    KeyFrame {
+        3 from: Option<[u8; 8]>,
+        4 size: u64,
+    }
+);
+streams!(FRAME_KEY: 6 "key" KeyFrame);
+typed!(
+    fields
+    /// From the window: whether this person's camera is on
+    /// (`basics/video.md#cameras`).
+    CameraFrame {
+        1 camera: bool,
+    }
+);
+streams!(FRAME_CAMERA: 7 "camera" CameraFrame);
 
 /// The frames of a `call-media` connection, both ways: key 0 says which.
 /// `from` is the voice a frame of a group call is, from the service, or
 /// the sender a window's level or key picture is asked of.
 pub static FRAMES: &[Request] = &[
-    req!(1 "audio" (1 "audio" B, 3 "from" B) -> ()),
-    req!(2 "frame" (1 "frame" B, 2 "format" B, 3 "from" B, 4 "size" U) -> ()),
-    req!(3 "viewport" (1 "width" U, 2 "height" U, 3 "from" B) -> ()),
-    req!(4 "level" (1 "level" U, 3 "from" B) -> ()),
-    req!(5 "asked" (1 "small" BOOL, 2 "large" BOOL) -> ()),
-    req!(6 "key" (3 "from" B, 4 "size" U) -> ()),
-    req!(7 "camera" (1 "camera" BOOL) -> ()),
+    FRAME_AUDIO,
+    FRAME_OTHER,
+    FRAME_VIEWPORT,
+    FRAME_LEVEL,
+    FRAME_ASKED,
+    FRAME_KEY,
+    FRAME_CAMERA,
 ];

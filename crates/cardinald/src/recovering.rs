@@ -44,6 +44,7 @@ use cardinal_space::account::{self, Regard};
 use cardinal_space::relationship::{self, Proposal};
 use cardinal_space::SpaceId;
 use serde::{Deserialize, Serialize};
+#[cfg(any(test, debug_assertions, feature = "by-name"))]
 use serde_json::{json, Value as Json};
 
 use crate::daemon::Daemon;
@@ -657,37 +658,51 @@ fn standing(h: Option<&Arc<Helper>>, u: &Under) -> Option<(Standing, Option<Iden
 
 /// The devices to pair again, by the name the account gives each, if it
 /// remembers one.
-fn pair_again_json(d: &Daemon, keys: &[String]) -> Vec<Json> {
+fn pair_again_of(d: &Daemon, keys: &[String]) -> Vec<crate::api::PairAgain> {
     let names = d.core().device_names();
     keys.iter()
-        .map(|k| {
+        .filter_map(|k| {
             let key: Option<KeyId> = hex::decode(k).ok().and_then(|b| b.try_into().ok());
-            json!({
-                "key": k.get(..16).unwrap_or(k),
-                "name": key.and_then(|key| names.get(&key).cloned()),
+            Some(crate::api::PairAgain {
+                key: short_key(k)?,
+                name: key.and_then(|key| names.get(&key).cloned()),
             })
         })
         .collect()
 }
 
+/// The start of a key kept in hex, as a reply gives it: its first eight
+/// bytes. One that is not hex this software never writes, and is left
+/// out.
+fn short_key(k: &str) -> Option<[u8; 8]> {
+    let b = hex::decode(k.get(..16).unwrap_or(k)).ok()?;
+    match <[u8; 8]>::try_from(b.as_slice()) {
+        Ok(key) => Some(key),
+        Err(_) => {
+            tracing::error!("a device's key, {k:?}, is not one");
+            None
+        }
+    }
+}
+
 /// `cardinal recover`: what is under way on this device, or the devices
 /// the last recovery left to pair again.
-pub fn status(d: &Arc<Daemon>) -> anyhow::Result<Json> {
+pub fn status(d: &Arc<Daemon>) -> anyhow::Result<crate::api::RecoverReply> {
     let Some(u) = load(d) else {
         // the kept helper's work wakes for one no longer a guardian
         if let_go_removed(d) {
             d.bump();
         }
         let r = load_recovered(d).unwrap_or_default();
-        return Ok(json!({
-            "under_way": false,
-            "pair_again": pair_again_json(d, &r.pair_again),
+        return Ok(crate::api::RecoverReply {
+            pair_again: Some(pair_again_of(d, &r.pair_again)),
             // as the spaces arrive, after the finish
-            "lost_devices": lost_json(d),
-            "lost_at": r.lost_at,
-            "kept_changes": kept_json(d, &r),
-            "not_heard": not_heard_json(d, &r),
-        }));
+            lost_devices: Some(lost_of(d)),
+            lost_at: r.lost_at,
+            kept_changes: Some(kept_of(d, &r)),
+            not_heard: Some(not_heard_of(d, &r)),
+            ..crate::api::RecoverReply::new(false)
+        });
     };
     // `finish` made this device the person's but did not get to the end, as
     // when the service stopped: the words are shown this once, and what was
@@ -712,13 +727,13 @@ pub fn status(d: &Arc<Daemon>) -> anyhow::Result<Json> {
             });
         }
         let r = load_recovered(d).unwrap_or_default();
-        return Ok(json!({
-            "under_way": false,
-            "finished": true,
-            "words": u.words,
-            "pair_again": pair_again_json(d, &u.forgotten),
-            "not_heard": not_heard_json(d, &r),
-        }));
+        return Ok(crate::api::RecoverReply {
+            finished: Some(true),
+            pair_again: Some(pair_again_of(d, &u.forgotten)),
+            words: Some(u.words),
+            not_heard: Some(not_heard_of(d, &r)),
+            ..crate::api::RecoverReply::new(false)
+        });
     }
     let phrase = phrase_of(&u)?;
     let h = d.helper.lock().unwrap_or_else(|e| e.into_inner()).clone();
@@ -727,26 +742,45 @@ pub fn status(d: &Arc<Daemon>) -> anyhow::Result<Json> {
         (Some(h), Some(who)) => usize::from(account_back(&h.d.core(), &who)),
         _ => 0,
     };
-    Ok(json!({
-        "under_way": true,
-        "identity": u.identity,
-        "fingerprint": the_fingerprint(d, &phrase),
-        "helper": h.is_some(),
-        "guardians": s.as_ref().map_or(0, |s| s.guardians),
-        "proposed": s.as_ref().map_or(0, |s| s.proposed),
-        "asked": u.entry.is_some(),
-        "endorsed": s.as_ref().map_or(0, |s| s.endorsed),
-        "confirmed": s.as_ref().map_or(0, |s| s.confirmed),
-        "threshold": s.as_ref().map_or(0, |s| s.threshold),
-        "in_effect": s.as_ref().is_some_and(|s| s.in_effect),
-        "held": held,
+    Ok(crate::api::RecoverReply {
+        identity: u.identity.as_deref().and_then(identity_bytes),
+        fingerprint: Some(the_fingerprint(d, &phrase)),
+        helper: Some(h.is_some()),
+        guardians: Some(s.as_ref().map_or(0, |s| s.guardians) as u64),
+        proposed: Some(s.as_ref().map_or(0, |s| s.proposed) as u64),
+        asked: Some(u.entry.is_some()),
+        endorsed: Some(s.as_ref().map_or(0, |s| s.endorsed) as u64),
+        confirmed: Some(s.as_ref().map_or(0, |s| s.confirmed) as u64),
+        threshold: Some(s.as_ref().map_or(0, |s| s.threshold)),
+        in_effect: Some(s.as_ref().is_some_and(|s| s.in_effect)),
+        held: Some(held as u64),
         // the devices the recovery removes: before finishing, by key alone
-        "lost_devices": u
-            .forgotten
-            .iter()
-            .map(|k| json!({"key": k.get(..16).unwrap_or(k), "name": null}))
-            .collect::<Vec<_>>(),
-    }))
+        lost_devices: Some(
+            u.forgotten
+                .iter()
+                .filter_map(|k| {
+                    Some(crate::api::LostDevice {
+                        key: short_key(k)?,
+                        name: None,
+                        set_aside: None,
+                    })
+                })
+                .collect(),
+        ),
+        ..crate::api::RecoverReply::new(true)
+    })
+}
+
+/// The identity being recovered, kept in hex, as a reply gives it. One
+/// that is not hex this software never writes, and is left out.
+fn identity_bytes(h: &str) -> Option<[u8; 32]> {
+    let id = hex::decode(h)
+        .ok()
+        .and_then(|b| <[u8; 32]>::try_from(b).ok());
+    if id.is_none() {
+        tracing::error!("the identity being recovered, {h:?}, is not one");
+    }
+    id
 }
 
 /// `cardinal recover start [CODE] [--identity ID]`: starts a recovery if
@@ -756,8 +790,8 @@ pub fn status(d: &Arc<Daemon>) -> anyhow::Result<Json> {
 pub async fn start(
     d: &Arc<Daemon>,
     code: Option<&str>,
-    identity: Option<&str>,
-) -> anyhow::Result<Json> {
+    identity: Option<&crate::api::typed::Reference>,
+) -> anyhow::Result<crate::api::RecoverStartReply> {
     not_set_up(d)?;
     let invitation = match code {
         Some(c) => {
@@ -773,12 +807,26 @@ pub async fn start(
         None => None,
     };
     let named = match identity {
-        Some(i) => Some(
-            hex::decode(crate::api::id_hex(i.trim()))
-                .ok()
-                .and_then(|b| <[u8; 32]>::try_from(b).ok())
-                .ok_or_else(|| anyhow::anyhow!("{i} is not an identity id (64 hex digits)"))?,
-        ),
+        Some(i) => {
+            let b = match i {
+                // An old oddity, kept to the byte (DEVIATIONS.md, Old
+                // oddities kept): text that is NUL and an id's hex once
+                // trimmed is taken as that id, as the way by name trimmed
+                // before it told text from an id given as bytes.
+                crate::api::typed::Reference::Typed(t) => {
+                    hex::decode(crate::api::id_hex(t.trim())).ok()
+                }
+                crate::api::typed::Reference::Id(b) => Some(b.clone()),
+            };
+            // named as the way by name held it: an id given as bytes, NUL
+            // first (DEVIATIONS.md, Old oddities kept)
+            Some(
+                b.and_then(|b| <[u8; 32]>::try_from(b).ok())
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("{} is not an identity id (64 hex digits)", i.held())
+                    })?,
+            )
+        }
         None => None,
     };
     let mut u = load(d).unwrap_or_else(|| Under {
@@ -816,17 +864,20 @@ pub async fn start(
         .map_err(|e| anyhow::anyhow!("could not reach that guardian: {e:#}"))?;
     }
     let phrase = phrase_of(&u)?;
-    Ok(json!({
-        "fingerprint": the_fingerprint(d, &phrase),
-        "identity": u.identity,
-    }))
+    Ok(crate::api::RecoverStartReply {
+        fingerprint: the_fingerprint(d, &phrase),
+        identity: u.identity.as_deref().and_then(identity_bytes),
+    })
 }
 
 /// `cardinal recover invite [--address ADDR]`: an invitation for a
 /// guardian to take up on their device, where the two are together. It
 /// names whom this device recovers, so only a guardian of theirs answers
 /// it.
-pub async fn invite(d: &Arc<Daemon>, at: Option<&str>) -> anyhow::Result<Json> {
+pub async fn invite(
+    d: &Arc<Daemon>,
+    at: Option<&str>,
+) -> anyhow::Result<crate::api::RecoverInviteReply> {
     not_set_up(d)?;
     let u =
         load(d).ok_or_else(|| anyhow::anyhow!("no recovery is under way here: start one first"))?;
@@ -841,17 +892,20 @@ pub async fn invite(d: &Arc<Daemon>, at: Option<&str>) -> anyhow::Result<Json> {
         })
         .await?;
     let phrase = phrase_of(&u)?;
-    Ok(json!({"code": code, "fingerprint": the_fingerprint(d, &phrase)}))
+    Ok(crate::api::RecoverInviteReply {
+        code,
+        fingerprint: the_fingerprint(d, &phrase),
+    })
 }
 
 /// `cardinal recover cancel`: gives up the recovery under way on this
 /// device: the words, the `recover`, and the helper with everything it
 /// had go. The person tells each guardian not to confirm it.
-pub async fn cancel(d: &Arc<Daemon>) -> anyhow::Result<Json> {
+pub async fn cancel(d: &Arc<Daemon>) -> anyhow::Result<crate::api::RecoverCancelReply> {
     let u = load(d);
     // nothing under way: a helper kept after the finish stays
     if u.is_none() {
-        return Ok(json!({"fingerprint": null}));
+        return Ok(crate::api::RecoverCancelReply { fingerprint: None });
     }
     let fp = u
         .as_ref()
@@ -860,7 +914,7 @@ pub async fn cancel(d: &Arc<Daemon>) -> anyhow::Result<Json> {
     crate::helper::stop(d).await?;
     let _ = std::fs::remove_file(d.paths.recovering());
     crate::helper::remove_left(d);
-    Ok(json!({"fingerprint": fp}))
+    Ok(crate::api::RecoverCancelReply { fingerprint: fp })
 }
 
 /// `cardinal recover finish`: becomes the person's device once the
@@ -871,7 +925,7 @@ pub async fn finish(
     d: &Arc<Daemon>,
     without_account: bool,
     lost_at: Option<u64>,
-) -> anyhow::Result<Json> {
+) -> anyhow::Result<crate::api::RecoverFinishReply> {
     not_set_up(d)?;
     let mut u = load(d).ok_or_else(|| {
         anyhow::anyhow!("no recovery is under way here; start one with a guardian's invitation")
@@ -977,7 +1031,7 @@ pub async fn finish(
     // that kept none of them: kept up to when they were lost, if the
     // person says, as each space arrives ([`tend_recovered`]).
     tend_recovered(d);
-    let set_aside = lost_json(d);
+    let set_aside = lost_of(d);
     // The guardians see each other's confirmations before the helper goes.
     last_carry(d).await;
     let _ = std::fs::remove_file(d.paths.recovering());
@@ -991,13 +1045,13 @@ pub async fn finish(
         crate::helper::remove_left(d);
     }
     let r = load_recovered(d).unwrap_or_default();
-    Ok(json!({
-        "words": u.words,
-        "account": back,
-        "pair_again": pair_again_json(d, &pair_again),
-        "lost_devices": set_aside,
-        "not_heard": not_heard_json(d, &r),
-    }))
+    Ok(crate::api::RecoverFinishReply {
+        words: u.words,
+        account: back,
+        pair_again: pair_again_of(d, &pair_again),
+        lost_devices: set_aside,
+        not_heard: Some(not_heard_of(d, &r)),
+    })
 }
 
 /// After a `finish` cut short once the device became the person's: takes
@@ -1188,17 +1242,22 @@ fn keep_recovered(d: &Arc<Daemon>) -> bool {
 /// `recover-lost-at` (`lost_at`): when the person lost the devices the
 /// recovery removed, said after the finish: what they wrote up to then is
 /// kept, as each space arrives.
-pub fn set_lost_at(d: &Arc<Daemon>, lost_at: Option<u64>) -> anyhow::Result<Json> {
+pub fn set_lost_at(
+    d: &Arc<Daemon>,
+    lost_at: Option<u64>,
+) -> anyhow::Result<crate::api::LostDevicesReply> {
     update_recovered(d, |r| r.lost_at = lost_at)
         .ok_or_else(|| anyhow::anyhow!("no recovery took place here"))?;
     tend_recovered(d);
-    Ok(json!({"lost_devices": lost_json(d)}))
+    Ok(crate::api::LostDevicesReply {
+        lost_devices: lost_of(d),
+    })
 }
 
 /// The group changes kept after the recovery (D84) that the person has not
 /// dismissed: "These changes were confirmed by your old devices before you
 /// lost them. Undo any you don't recognise."
-fn kept_json(d: &Daemon, r: &Recovered) -> Vec<Json> {
+fn kept_of(d: &Daemon, r: &Recovered) -> Vec<crate::api::KeptChange> {
     if r.forgotten.is_empty() {
         return Vec::new();
     }
@@ -1208,20 +1267,17 @@ fn kept_json(d: &Daemon, r: &Recovered) -> Vec<Json> {
         .filter(|(_, new)| !r.kept_seen.contains(&hex::encode(new)))
         .filter_map(|(old, new)| {
             let undone = r.undone.get(&hex::encode(new)).map(String::as_str);
-            crate::groups::kept_change_json(&core, &old, &new, undone)
+            crate::groups::kept_change_of(&core, &old, &new, undone)
         })
         .collect()
 }
 
 /// The group change kept after the recovery that moved a group to `to`
 /// (hex), as [`kept_json`] lists it, whether dismissed or not.
-fn kept_change(d: &Daemon, r: &Recovered, to: &str) -> anyhow::Result<SpaceId> {
-    let to: SpaceId = hex::decode(to.trim())
-        .ok()
-        .and_then(|b| b.try_into().ok())
-        .ok_or_else(|| {
-            anyhow::anyhow!("a kept change is named by the group it moved to, in hex")
-        })?;
+fn kept_change(d: &Daemon, r: &Recovered, to: &[u8]) -> anyhow::Result<SpaceId> {
+    let to: SpaceId = to.try_into().ok().ok_or_else(|| {
+        anyhow::anyhow!("a kept change is named by the group it moved to, in hex")
+    })?;
     let kept = d.core().kept_after_recovery(&r.keys());
     anyhow::ensure!(
         kept.iter().any(|(_, new)| *new == to),
@@ -1236,7 +1292,7 @@ fn kept_change(d: &Daemon, r: &Recovered, to: &str) -> anyhow::Result<SpaceId> {
 /// before back. A group handed on cannot be taken back: its new owner holds
 /// it. Nothing is asked of anyone, and the change stays listed, undone,
 /// until the person dismisses it.
-pub async fn undo_kept(d: &Arc<Daemon>, to: &str) -> anyhow::Result<Json> {
+pub async fn undo_kept(d: &Arc<Daemon>, to: &[u8]) -> anyhow::Result<crate::api::RecoverUndoReply> {
     let r = load_recovered(d).ok_or_else(|| anyhow::anyhow!("no recovery took place here"))?;
     let to = kept_change(d, &r, to)?;
     let undo = d.core().undo_of(&to)?;
@@ -1250,13 +1306,16 @@ pub async fn undo_kept(d: &Arc<Daemon>, to: &str) -> anyhow::Result<Json> {
     });
     d.bump();
     let r = load_recovered(d).unwrap_or_default();
-    Ok(json!({"group": hex::encode(done.new), "kept_changes": kept_json(d, &r)}))
+    Ok(crate::api::RecoverUndoReply {
+        group: done.new,
+        kept_changes: kept_of(d, &r),
+    })
 }
 
 /// `recover-kept-seen`: the person dismissed the kept group changes `to`
 /// names (each by the group it moved to): they are no longer listed. One
 /// they were not shown, which came after, stays.
-pub fn kept_seen(d: &Daemon, to: &[String]) -> anyhow::Result<Json> {
+pub fn kept_seen(d: &Daemon, to: &[bytes::Bytes]) -> anyhow::Result<crate::api::KeptChangesReply> {
     let r = load_recovered(d).ok_or_else(|| anyhow::anyhow!("no recovery took place here"))?;
     let mut seen = Vec::new();
     for t in to {
@@ -1271,12 +1330,14 @@ pub fn kept_seen(d: &Daemon, to: &[String]) -> anyhow::Result<Json> {
     });
     d.bump();
     let r = load_recovered(d).unwrap_or_default();
-    Ok(json!({"kept_changes": kept_json(d, &r)}))
+    Ok(crate::api::KeptChangesReply {
+        kept_changes: kept_of(d, &r),
+    })
 }
 
 /// The devices the recovery removed, with how much of what each wrote is
 /// set aside in the spaces held now.
-fn lost_json(d: &Daemon) -> Vec<Json> {
+fn lost_of(d: &Daemon) -> Vec<crate::api::LostDevice> {
     let Some(r) = load_recovered(d) else {
         return Vec::new();
     };
@@ -1285,11 +1346,11 @@ fn lost_json(d: &Daemon) -> Vec<Json> {
         .filter_map(|k| hex::decode(k).ok()?.try_into().ok())
         .map(|k: KeyId| {
             let left = d.core().unwitnessed_work(&k).map(|w| w.len()).unwrap_or(0);
-            json!({
-                "key": hex::encode(&k[..8]),
-                "name": d.core().device_names().get(&k).cloned(),
-                "set_aside": left,
-            })
+            crate::api::LostDevice {
+                key: crate::api::short_id(&k),
+                name: d.core().device_names().get(&k).cloned(),
+                set_aside: Some(left as u64),
+            }
         })
         .collect()
 }
@@ -1450,7 +1511,7 @@ fn guardian_of(
 
 /// The guardians who confirmed and have not heard of this device yet, by
 /// the names this person gives them.
-fn not_heard_json(d: &Daemon, r: &Recovered) -> Vec<Json> {
+fn not_heard_of(d: &Daemon, r: &Recovered) -> Vec<String> {
     let Some(handing) = r.handing.as_ref() else {
         return Vec::new();
     };
@@ -1458,7 +1519,7 @@ fn not_heard_json(d: &Daemon, r: &Recovered) -> Vec<Json> {
     handing
         .guardians
         .iter()
-        .map(|g| Json::from(guardian_name(&core, g)))
+        .map(|g| guardian_name(&core, g))
         .collect()
 }
 
@@ -1561,7 +1622,11 @@ fn let_go_removed(d: &Daemon) -> bool {
 /// heard of this device, or for all of them. Their devices then do not
 /// answer this one until they learn of it some other way; nothing else is
 /// given up. Once nobody is waited for, the helper goes.
-pub async fn stop_waiting(d: &Arc<Daemon>, who: Option<&str>, all: bool) -> anyhow::Result<Json> {
+pub async fn stop_waiting(
+    d: &Arc<Daemon>,
+    who: Option<crate::api::Ref<'_>>,
+    all: bool,
+) -> anyhow::Result<crate::api::RecoverStopWaitingReply> {
     anyhow::ensure!(
         who.is_some() != all,
         "name one guardian who has not heard of this device, or say all of them"
@@ -1575,7 +1640,7 @@ pub async fn stop_waiting(d: &Arc<Daemon>, who: Option<&str>, all: bool) -> anyh
     let stopped: Vec<NotHeard> = match who {
         None => handing.guardians.clone(),
         Some(w) => {
-            let c = crate::contacts::find(d, w)?;
+            let c = crate::contacts::find_ref(d, w)?;
             let core = d.core();
             let found: Vec<NotHeard> = handing
                 .guardians
@@ -1609,7 +1674,10 @@ pub async fn stop_waiting(d: &Arc<Daemon>, who: Option<&str>, all: bool) -> anyh
         drop_kept(d).await;
     }
     let r = load_recovered(d).unwrap_or_default();
-    Ok(json!({"not_heard": not_heard_json(d, &r), "stopped": names}))
+    Ok(crate::api::RecoverStopWaitingReply {
+        not_heard: not_heard_of(d, &r),
+        stopped: names,
+    })
 }
 
 /// Drops the helper kept after the finish, once nobody is waited for.
@@ -1948,7 +2016,11 @@ fn remembered(d: &Daemon) -> Vec<String> {
 /// the epoch, or "all"), as after a recovery that kept none of the old
 /// keys. Only what the person recognizes should be kept: a thief's writes
 /// with a stolen device are among them (`spaces.md#authors`).
-pub fn keep_work(d: &Arc<Daemon>, name: &str, up_to: Option<&str>) -> anyhow::Result<Json> {
+pub fn keep_work(
+    d: &Arc<Daemon>,
+    name: &str,
+    up_to: Option<&str>,
+) -> anyhow::Result<crate::api::KeepWorkReply> {
     let w = name.trim().to_lowercase();
     let keys: Vec<KeyId> = d
         .core()
@@ -1963,14 +2035,19 @@ pub fn keep_work(d: &Arc<Daemon>, name: &str, up_to: Option<&str>) -> anyhow::Re
         _ => anyhow::bail!("more than one device was called {name:?}; give the start of its key"),
     };
     let work = d.core().unwitnessed_work(&key)?;
-    let listed: Vec<Json> = work
+    let listed: Vec<crate::api::SetAside> = work
         .iter()
-        .map(|(s, x, t)| {
-            json!({"space": hex::encode(&s[..8]), "entry": hex::encode(&x[..8]), "time_ms": t})
+        .map(|(s, x, t)| crate::api::SetAside {
+            space: crate::api::short_id(s),
+            entry: crate::api::short_id(x),
+            time_ms: *t,
         })
         .collect();
     let Some(up_to) = up_to else {
-        return Ok(json!({"kept": 0, "set_aside": listed}));
+        return Ok(crate::api::KeepWorkReply {
+            kept: 0,
+            set_aside: listed,
+        });
     };
     let up_to = match up_to.trim() {
         "all" => None,
@@ -1983,7 +2060,10 @@ pub fn keep_work(d: &Arc<Daemon>, name: &str, up_to: Option<&str>) -> anyhow::Re
         d.push(&space, vec![bytes]);
     }
     d.bump();
-    Ok(json!({"kept": kept, "set_aside": listed}))
+    Ok(crate::api::KeepWorkReply {
+        kept: kept as u64,
+        set_aside: listed,
+    })
 }
 
 #[cfg(test)]
@@ -2127,12 +2207,12 @@ mod tests {
         save(&d, &u).unwrap();
         std::fs::create_dir_all(d.paths.recovery_helper()).unwrap();
         let v = status(&d).unwrap();
-        assert_eq!(v["finished"], true);
-        assert_eq!(v["words"].as_str(), Some(words.as_str()));
-        assert_eq!(v["pair_again"].as_array().map(Vec::len), Some(1));
+        assert_eq!(v.finished, Some(true));
+        assert_eq!(v.words.as_deref(), Some(words.as_str()));
+        assert_eq!(v.pair_again.as_ref().map(Vec::len), Some(1));
         let v = status(&d).unwrap();
-        assert!(v["words"].is_null(), "{v}");
-        assert_eq!(v["under_way"], false);
+        assert!(v.words.is_none(), "{v:?}");
+        assert!(!v.under_way);
         assert!(!d.paths.recovering().exists());
         for _ in 0..50 {
             if !d.paths.recovery_helper().exists() {
@@ -2145,4 +2225,576 @@ mod tests {
         let e = start(&d, None, None).await.unwrap_err();
         assert!(e.to_string().contains("already belongs"), "{e}");
     }
+}
+
+// ---- The handlers as they were by name ----
+//
+// What main had, whole, kept only to show that the typed handlers send the
+// same bytes (`control::typed::answering`, `api/same_bytes.rs`). They go
+// with the way by name.
+
+/// `pair_again_json` as main had it, by name.
+#[cfg(any(test, debug_assertions, feature = "by-name"))]
+#[allow(dead_code, clippy::all)]
+fn pair_again_json_by_name(d: &Daemon, keys: &[String]) -> Vec<Json> {
+    let names = d.core().device_names();
+    keys.iter()
+        .map(|k| {
+            let key: Option<KeyId> = hex::decode(k).ok().and_then(|b| b.try_into().ok());
+            json!({
+                "key": k.get(..16).unwrap_or(k),
+                "name": key.and_then(|key| names.get(&key).cloned()),
+            })
+        })
+        .collect()
+}
+
+/// `status` as main had it, by name.
+#[cfg(any(test, debug_assertions, feature = "by-name"))]
+#[allow(dead_code, clippy::all)]
+pub fn status_by_name(d: &Arc<Daemon>) -> anyhow::Result<Json> {
+    let Some(u) = load(d) else {
+        // the kept helper's work wakes for one no longer a guardian
+        if let_go_removed(d) {
+            d.bump();
+        }
+        let r = load_recovered(d).unwrap_or_default();
+        return Ok(json!({
+            "under_way": false,
+            "pair_again": pair_again_json_by_name(d, &r.pair_again),
+            // as the spaces arrive, after the finish
+            "lost_devices": lost_json_by_name(d),
+            "lost_at": r.lost_at,
+            "kept_changes": kept_json_by_name(d, &r),
+            "not_heard": not_heard_json_by_name(d, &r),
+        }));
+    };
+    // `finish` made this device the person's but did not get to the end, as
+    // when the service stopped: the words are shown this once, and what was
+    // kept for the recovery goes.
+    if d.core().identity.is_some() {
+        // what the guardians gave back is taken up first: the helper's store
+        // goes only after
+        // the words are shown whatever happens here
+        if let Err(e) = complete_install(d, &u) {
+            tracing::warn!("taking up what the guardians gave back: {e:#}");
+        }
+        let _ = std::fs::remove_file(d.paths.recovering());
+        // kept for the guardians who confirmed, until each holds this
+        // device's first entries
+        if kept(d) {
+            keep(d);
+        } else {
+            let d2 = d.clone();
+            tokio::spawn(async move {
+                let _ = crate::helper::stop(&d2).await;
+                crate::helper::remove_left(&d2);
+            });
+        }
+        let r = load_recovered(d).unwrap_or_default();
+        return Ok(json!({
+            "under_way": false,
+            "finished": true,
+            "words": u.words,
+            "pair_again": pair_again_json_by_name(d, &u.forgotten),
+            "not_heard": not_heard_json_by_name(d, &r),
+        }));
+    }
+    let phrase = phrase_of(&u)?;
+    let h = d.helper.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    let s = standing(h.as_ref(), &u).map(|(s, _)| s);
+    let held = match (h.as_ref(), identity_of(&u)) {
+        (Some(h), Some(who)) => usize::from(account_back(&h.d.core(), &who)),
+        _ => 0,
+    };
+    Ok(json!({
+        "under_way": true,
+        "identity": u.identity,
+        "fingerprint": the_fingerprint(d, &phrase),
+        "helper": h.is_some(),
+        "guardians": s.as_ref().map_or(0, |s| s.guardians),
+        "proposed": s.as_ref().map_or(0, |s| s.proposed),
+        "asked": u.entry.is_some(),
+        "endorsed": s.as_ref().map_or(0, |s| s.endorsed),
+        "confirmed": s.as_ref().map_or(0, |s| s.confirmed),
+        "threshold": s.as_ref().map_or(0, |s| s.threshold),
+        "in_effect": s.as_ref().is_some_and(|s| s.in_effect),
+        "held": held,
+        // the devices the recovery removes: before finishing, by key alone
+        "lost_devices": u
+            .forgotten
+            .iter()
+            .map(|k| json!({"key": k.get(..16).unwrap_or(k), "name": null}))
+            .collect::<Vec<_>>(),
+    }))
+}
+
+/// `start` as main had it, by name.
+#[cfg(any(test, debug_assertions, feature = "by-name"))]
+#[allow(dead_code, clippy::all)]
+pub async fn start_by_name(
+    d: &Arc<Daemon>,
+    code: Option<&str>,
+    identity: Option<&str>,
+) -> anyhow::Result<Json> {
+    not_set_up(d)?;
+    let invitation = match code {
+        Some(c) => {
+            let inv = cardinal_contact::Invitation::from_text(c.trim())
+                .map_err(|_| anyhow::anyhow!("that is not an invitation"))?;
+            anyhow::ensure!(
+                inv.recovery_of.is_some(),
+                "that is not a recovery invitation. Ask a guardian for one: their device \
+                 makes it."
+            );
+            Some(inv)
+        }
+        None => None,
+    };
+    let named = match identity {
+        Some(i) => Some(
+            hex::decode(crate::api::id_hex(i.trim()))
+                .ok()
+                .and_then(|b| <[u8; 32]>::try_from(b).ok())
+                .ok_or_else(|| anyhow::anyhow!("{i} is not an identity id (64 hex digits)"))?,
+        ),
+        None => None,
+    };
+    let mut u = load(d).unwrap_or_else(|| Under {
+        words: RecoveryPhrase::generate().to_words().to_string(),
+        identity: None,
+        entry: None,
+        forgotten: Vec::new(),
+        finishing: false,
+    });
+    let who = invitation.as_ref().and_then(|i| i.recovery_of).or(named);
+    if let Some(who) = who {
+        if let Some(was) = identity_of(&u) {
+            anyhow::ensure!(
+                was == who,
+                "this device is recovering someone else; that is for another person"
+            );
+        }
+        if let (Some(i), Some(n)) = (invitation.as_ref().and_then(|i| i.recovery_of), named) {
+            anyhow::ensure!(i == n, "that invitation is for someone else");
+        }
+        u.identity = Some(hex::encode(who));
+    }
+    save(d, &u)?;
+    let h = helper(d).await?;
+    if let Some(inv) = invitation {
+        let code = inv.to_text();
+        let met = account::Met {
+            how: account::MET_THEIR_INVITATION,
+            ..Default::default()
+        };
+        h.on(move |hd| async move {
+            crate::contacts::accept(&hd, &code, None, Regard::default(), met, true).await
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("could not reach that guardian: {e:#}"))?;
+    }
+    let phrase = phrase_of(&u)?;
+    Ok(json!({
+        "fingerprint": the_fingerprint(d, &phrase),
+        "identity": u.identity,
+    }))
+}
+
+/// `invite` as main had it, by name.
+#[cfg(any(test, debug_assertions, feature = "by-name"))]
+#[allow(dead_code, clippy::all)]
+pub async fn invite_by_name(d: &Arc<Daemon>, at: Option<&str>) -> anyhow::Result<Json> {
+    not_set_up(d)?;
+    let u =
+        load(d).ok_or_else(|| anyhow::anyhow!("no recovery is under way here: start one first"))?;
+    // With no identity known yet, the invitation is for whomever the
+    // guardian who takes it up says (DEVIATIONS.md).
+    let who = identity_of(&u).unwrap_or(ANYONE);
+    let h = helper(d).await?;
+    let at = at.map(str::to_owned);
+    let code = h
+        .on(move |hd| async move {
+            crate::contacts::invite_recovery(&hd, at.as_deref(), who).map(|i| i.to_text())
+        })
+        .await?;
+    let phrase = phrase_of(&u)?;
+    Ok(json!({"code": code, "fingerprint": the_fingerprint(d, &phrase)}))
+}
+
+/// `cancel` as main had it, by name.
+#[cfg(any(test, debug_assertions, feature = "by-name"))]
+#[allow(dead_code, clippy::all)]
+pub async fn cancel_by_name(d: &Arc<Daemon>) -> anyhow::Result<Json> {
+    let u = load(d);
+    // nothing under way: a helper kept after the finish stays
+    if u.is_none() {
+        return Ok(json!({"fingerprint": null}));
+    }
+    let fp = u
+        .as_ref()
+        .and_then(|u| phrase_of(u).ok())
+        .map(|p| the_fingerprint(d, &p));
+    crate::helper::stop(d).await?;
+    let _ = std::fs::remove_file(d.paths.recovering());
+    crate::helper::remove_left(d);
+    Ok(json!({"fingerprint": fp}))
+}
+
+/// `finish` as main had it, by name.
+#[cfg(any(test, debug_assertions, feature = "by-name"))]
+#[allow(dead_code, clippy::all)]
+pub async fn finish_by_name(
+    d: &Arc<Daemon>,
+    without_account: bool,
+    lost_at: Option<u64>,
+) -> anyhow::Result<Json> {
+    not_set_up(d)?;
+    let mut u = load(d).ok_or_else(|| {
+        anyhow::anyhow!("no recovery is under way here; start one with a guardian's invitation")
+    })?;
+    phrase_of(&u)?;
+    anyhow::ensure!(
+        identity_of(&u).is_some(),
+        "no guardian has been reached yet"
+    );
+    anyhow::ensure!(
+        u.entry.is_some(),
+        "no guardian has proposed your recovery yet; wait for one, or bring another's \
+         invitation"
+    );
+    let h = d.helper.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    let Some((s, log)) = standing(h.as_ref(), &u) else {
+        anyhow::bail!("the recovery helper is not running; try again in a moment");
+    };
+    if !s.in_effect {
+        anyhow::bail!(
+            "your guardians have not all confirmed yet: {} endorsed, {} confirmed, of {} \
+             needed. Try again later.",
+            s.endorsed,
+            s.confirmed,
+            s.threshold
+        );
+    }
+    let log = log.expect("in effect");
+    let given = copies(
+        h.as_ref().expect("running"),
+        &identity_of(&u).expect("checked"),
+    );
+    tracing::info!(
+        "the guardians gave back {} sets, {} entries",
+        given.len(),
+        given.iter().map(|(_, e)| e.len()).sum::<usize>()
+    );
+    // Without the account the person starts with an empty one, for good:
+    // only on their word.
+    let back = account_back(
+        &h.as_ref().expect("running").d.core(),
+        &identity_of(&u).expect("checked"),
+    );
+    anyhow::ensure!(
+        without_account || back,
+        "your guardians have not given back your account yet: it comes once one of them and \
+         this device are in touch. Try again in a moment. If none of them holds it, you can \
+         go on without it, and start with an empty account."
+    );
+    // From here this device may become the person's at any moment: if it
+    // stops before the end, `cardinal recover` shows the words.
+    u.finishing = true;
+    save(d, &u)?;
+    save_recovered(
+        d,
+        &Recovered {
+            pair_again: u.forgotten.clone(),
+            forgotten: u.forgotten.clone(),
+            lost_at,
+            finished_ms: Some(crate::core::now_ms()),
+            ..Recovered::default()
+        },
+    );
+    // the link keys the removed devices had, by their keys
+    let log_links: Vec<(KeyId, [u8; 32])> = log
+        .entries()
+        .flat_map(|e| e.ops().to_vec())
+        .filter_map(|o| match o.body() {
+            cardinal_identity::OpBody::AddKey {
+                key,
+                link_key: Some(l),
+                ..
+            } => Some((*key, *l.x25519())),
+            _ => None,
+        })
+        .collect();
+    let logs = guardians_logs(
+        h.as_ref().expect("running"),
+        &identity_of(&u).expect("checked"),
+    );
+    // The guardians who confirmed: the helper is kept until each holds
+    // this device's first entries, written next.
+    let handing = handing_for(
+        h.as_ref().expect("running"),
+        &log,
+        &entry_of(&u).expect("checked"),
+    );
+    update_recovered(d, |r| r.handing = Some(handing));
+    let back = from_guardians(d, log, &u.words, given, logs).await?;
+    // What the account remembers, if it came back; else the keys removed.
+    let pair_again = match back {
+        true => remembered(d),
+        false => u.forgotten.clone(),
+    };
+    update_recovered(d, |r| {
+        r.pair_again = pair_again.clone();
+        r.finished_ms = Some(crate::core::now_ms());
+    });
+    // The removed devices' hosts leave the lists that name them, and the
+    // secrets they held are made anew (`hosts.md#local-discovery`).
+    after_removal(d, &forgotten_links(&log_links, &u.forgotten));
+    // What the removed devices wrote is set aside, as after any recovery
+    // that kept none of them: kept up to when they were lost, if the
+    // person says, as each space arrives ([`tend_recovered`]).
+    tend_recovered(d);
+    let set_aside = lost_json_by_name(d);
+    // The guardians see each other's confirmations before the helper goes.
+    last_carry(d).await;
+    let _ = std::fs::remove_file(d.paths.recovering());
+    // and each who confirmed holds this device's first entries, or the
+    // helper is kept until they do
+    if kept(d) {
+        keep(d);
+    } else {
+        update_recovered(d, |r| r.handing = None);
+        crate::helper::stop(d).await?;
+        crate::helper::remove_left(d);
+    }
+    let r = load_recovered(d).unwrap_or_default();
+    Ok(json!({
+        "words": u.words,
+        "account": back,
+        "pair_again": pair_again_json_by_name(d, &pair_again),
+        "lost_devices": set_aside,
+        "not_heard": not_heard_json_by_name(d, &r),
+    }))
+}
+
+/// `set_lost_at` as main had it, by name.
+#[cfg(any(test, debug_assertions, feature = "by-name"))]
+#[allow(dead_code, clippy::all)]
+pub fn set_lost_at_by_name(d: &Arc<Daemon>, lost_at: Option<u64>) -> anyhow::Result<Json> {
+    update_recovered(d, |r| r.lost_at = lost_at)
+        .ok_or_else(|| anyhow::anyhow!("no recovery took place here"))?;
+    tend_recovered(d);
+    Ok(json!({"lost_devices": lost_json_by_name(d)}))
+}
+
+/// `kept_json` as main had it, by name.
+#[cfg(any(test, debug_assertions, feature = "by-name"))]
+#[allow(dead_code, clippy::all)]
+fn kept_json_by_name(d: &Daemon, r: &Recovered) -> Vec<Json> {
+    if r.forgotten.is_empty() {
+        return Vec::new();
+    }
+    let core = d.core();
+    core.kept_after_recovery(&r.keys())
+        .into_iter()
+        .filter(|(_, new)| !r.kept_seen.contains(&hex::encode(new)))
+        .filter_map(|(old, new)| {
+            let undone = r.undone.get(&hex::encode(new)).map(String::as_str);
+            crate::groups::kept_change_json(&core, &old, &new, undone)
+        })
+        .collect()
+}
+
+/// `kept_change` as main had it, by name.
+#[cfg(any(test, debug_assertions, feature = "by-name"))]
+#[allow(dead_code, clippy::all)]
+fn kept_change_by_name(d: &Daemon, r: &Recovered, to: &str) -> anyhow::Result<SpaceId> {
+    let to: SpaceId = hex::decode(to.trim())
+        .ok()
+        .and_then(|b| b.try_into().ok())
+        .ok_or_else(|| {
+            anyhow::anyhow!("a kept change is named by the group it moved to, in hex")
+        })?;
+    let kept = d.core().kept_after_recovery(&r.keys());
+    anyhow::ensure!(
+        kept.iter().any(|(_, new)| *new == to),
+        "that is not a change your old devices confirmed before the recovery"
+    );
+    Ok(to)
+}
+
+/// `undo_kept` as main had it, by name.
+#[cfg(any(test, debug_assertions, feature = "by-name"))]
+#[allow(dead_code, clippy::all)]
+pub async fn undo_kept_by_name(d: &Arc<Daemon>, to: &str) -> anyhow::Result<Json> {
+    let r = load_recovered(d).ok_or_else(|| anyhow::anyhow!("no recovery took place here"))?;
+    let to = kept_change_by_name(d, &r, to)?;
+    let undo = d.core().undo_of(&to)?;
+    let done = crate::following::succeed(d, &to, |sp| crate::core::undo_named(sp, &undo)).await?;
+    // Whoever it left out holds nothing that leads to the new group: it is
+    // offered to them, as an addition is.
+    let back: Vec<[u8; 32]> = undo.out.iter().map(|(w, _)| *w).collect();
+    crate::groups::offer_to(d, &done.new, &back)?;
+    update_recovered(d, |r| {
+        r.undone.insert(hex::encode(to), hex::encode(done.new));
+    });
+    d.bump();
+    let r = load_recovered(d).unwrap_or_default();
+    Ok(json!({"group": hex::encode(done.new), "kept_changes": kept_json_by_name(d, &r)}))
+}
+
+/// `kept_seen` as main had it, by name.
+#[cfg(any(test, debug_assertions, feature = "by-name"))]
+#[allow(dead_code, clippy::all)]
+pub fn kept_seen_by_name(d: &Daemon, to: &[String]) -> anyhow::Result<Json> {
+    let r = load_recovered(d).ok_or_else(|| anyhow::anyhow!("no recovery took place here"))?;
+    let mut seen = Vec::new();
+    for t in to {
+        seen.push(hex::encode(kept_change_by_name(d, &r, t)?));
+    }
+    update_recovered(d, |r| {
+        for s in seen {
+            if !r.kept_seen.contains(&s) {
+                r.kept_seen.push(s);
+            }
+        }
+    });
+    d.bump();
+    let r = load_recovered(d).unwrap_or_default();
+    Ok(json!({"kept_changes": kept_json_by_name(d, &r)}))
+}
+
+/// `lost_json` as main had it, by name.
+#[cfg(any(test, debug_assertions, feature = "by-name"))]
+#[allow(dead_code, clippy::all)]
+fn lost_json_by_name(d: &Daemon) -> Vec<Json> {
+    let Some(r) = load_recovered(d) else {
+        return Vec::new();
+    };
+    r.forgotten
+        .iter()
+        .filter_map(|k| hex::decode(k).ok()?.try_into().ok())
+        .map(|k: KeyId| {
+            let left = d.core().unwitnessed_work(&k).map(|w| w.len()).unwrap_or(0);
+            json!({
+                "key": hex::encode(&k[..8]),
+                "name": d.core().device_names().get(&k).cloned(),
+                "set_aside": left,
+            })
+        })
+        .collect()
+}
+
+/// `not_heard_json` as main had it, by name.
+#[cfg(any(test, debug_assertions, feature = "by-name"))]
+#[allow(dead_code, clippy::all)]
+fn not_heard_json_by_name(d: &Daemon, r: &Recovered) -> Vec<Json> {
+    let Some(handing) = r.handing.as_ref() else {
+        return Vec::new();
+    };
+    let core = d.core();
+    handing
+        .guardians
+        .iter()
+        .map(|g| Json::from(guardian_name(&core, g)))
+        .collect()
+}
+
+/// `stop_waiting` as main had it, by name.
+#[cfg(any(test, debug_assertions, feature = "by-name"))]
+#[allow(dead_code, clippy::all)]
+pub async fn stop_waiting_by_name(
+    d: &Arc<Daemon>,
+    who: Option<&str>,
+    all: bool,
+) -> anyhow::Result<Json> {
+    anyhow::ensure!(
+        who.is_some() != all,
+        "name one guardian who has not heard of this device, or say all of them"
+    );
+    let handing = load_recovered(d)
+        .and_then(|r| r.handing)
+        .filter(|h| !h.guardians.is_empty())
+        .ok_or_else(|| {
+            anyhow::anyhow!("no guardian is waited for: every one who confirmed has heard")
+        })?;
+    let stopped: Vec<NotHeard> = match who {
+        None => handing.guardians.clone(),
+        Some(w) => {
+            let c = crate::contacts::find(d, w)?;
+            let core = d.core();
+            let found: Vec<NotHeard> = handing
+                .guardians
+                .iter()
+                .filter(|g| guardian_person(&core, g) == Some(c.identity))
+                .cloned()
+                .collect();
+            anyhow::ensure!(
+                !found.is_empty(),
+                "{} is not among the guardians who have not heard of this device",
+                c.petname
+            );
+            found
+        }
+    };
+    let names: Vec<String> = {
+        let core = d.core();
+        stopped.iter().map(|g| guardian_name(&core, g)).collect()
+    };
+    update_recovered(d, |r| {
+        if let Some(x) = r.handing.as_mut() {
+            x.guardians
+                .retain(|g| !stopped.iter().any(|s| s.persona == g.persona));
+        }
+    });
+    tracing::info!(
+        "on the person's word, {} guardian(s) no longer waited for",
+        names.len()
+    );
+    if !kept(d) {
+        drop_kept(d).await;
+    }
+    let r = load_recovered(d).unwrap_or_default();
+    Ok(json!({"not_heard": not_heard_json_by_name(d, &r), "stopped": names}))
+}
+
+/// `keep_work` as main had it, by name.
+#[cfg(any(test, debug_assertions, feature = "by-name"))]
+#[allow(dead_code, clippy::all)]
+pub fn keep_work_by_name(d: &Arc<Daemon>, name: &str, up_to: Option<&str>) -> anyhow::Result<Json> {
+    let w = name.trim().to_lowercase();
+    let keys: Vec<KeyId> = d
+        .core()
+        .device_names()
+        .into_iter()
+        .filter(|(k, v)| v.to_lowercase() == w || (!w.is_empty() && hex::encode(k).starts_with(&w)))
+        .map(|(k, _)| k)
+        .collect();
+    let key = match keys.as_slice() {
+        [] => anyhow::bail!("no device was called {name:?}"),
+        [k] => *k,
+        _ => anyhow::bail!("more than one device was called {name:?}; give the start of its key"),
+    };
+    let work = d.core().unwitnessed_work(&key)?;
+    let listed: Vec<Json> = work
+        .iter()
+        .map(|(s, x, t)| {
+            json!({"space": hex::encode(&s[..8]), "entry": hex::encode(&x[..8]), "time_ms": t})
+        })
+        .collect();
+    let Some(up_to) = up_to else {
+        return Ok(json!({"kept": 0, "set_aside": listed}));
+    };
+    let up_to = match up_to.trim() {
+        "all" => None,
+        t => Some(t.parse::<u64>().map_err(|_| {
+            anyhow::anyhow!("give the point as \"all\" or as a time in milliseconds, as listed")
+        })?),
+    };
+    let (written, kept) = d.core().keep_work(&key, up_to)?;
+    for (space, bytes) in written {
+        d.push(&space, vec![bytes]);
+    }
+    d.bump();
+    Ok(json!({"kept": kept, "set_aside": listed}))
 }

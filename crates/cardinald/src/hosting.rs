@@ -39,8 +39,10 @@ use cardinal_space::account;
 use cardinal_space::grant::{Endpoint, Grant, QuotaClass, MAILBOX, RELAY, RENDEZVOUS};
 use cardinal_space::relationship::{self, Hosting, Reach};
 use cardinal_space::{NodeId, SpaceId, SpaceOp};
+#[cfg(any(test, debug_assertions, feature = "by-name"))]
 use serde_json::{json, Value as Json};
 
+use crate::api::Ref;
 use crate::core::short;
 use crate::daemon::{Daemon, PeerKind};
 use crate::mailbox::{self, Refused, Store, Token};
@@ -1285,14 +1287,17 @@ pub const WHY_NOT: &str = "None of your devices can host anyone now: none is plu
 
 /// A serving device, for windows: its name, whether it can be reached from
 /// outside its network, what it gives, and what it sees.
-fn hostable(name: String, services: &[u64], endpoints: &[Endpoint]) -> Json {
+fn hostable(name: String, services: &[u64], endpoints: &[Endpoint]) -> crate::api::Hostable {
     let outside = services.contains(&MAILBOX) && endpoints.iter().any(Endpoint::usable);
-    json!({
-        "name": name,
-        "outside": outside,
-        "sees": device_sees(services),
-        "services": service_names(services),
-    })
+    crate::api::Hostable {
+        name,
+        outside,
+        sees: device_sees(services).into(),
+        services: service_names(services)
+            .into_iter()
+            .map(Into::into)
+            .collect(),
+    }
 }
 
 fn device_name(d: &Daemon, key: &KeyId) -> String {
@@ -1314,11 +1319,302 @@ fn offered_to(d: &Daemon, who: &[u8; 32]) -> Option<(SpaceId, Hosting)> {
         .next_back()
 }
 
+/// A `ref` as the way by name held it: text as typed, an id given as
+/// bytes NUL first, then its hex.
+fn held(r: Ref<'_>) -> String {
+    match r {
+        Ref::Typed(t) => t.to_owned(),
+        Ref::Id(id) => format!("{}{}", crate::api::EXACT, id.hex()),
+    }
+}
+
 /// Offers to host a trusted contact on this person's devices that can
 /// (`devices`, by name; all of them if none is named), each with what it
 /// can give, with a quota; or, where an offer stands, adds the devices
 /// named and sets the quota.
 pub fn offer(
+    d: &Arc<Daemon>,
+    asked: Ref<'_>,
+    devices: &[String],
+    envelopes: Option<u64>,
+    relay_mb: Option<u64>,
+) -> anyhow::Result<crate::api::HostOfferReply> {
+    let contact = crate::contacts::find_ref(d, asked)?;
+    // An old oddity, kept to the byte (DEVIATIONS.md, Old oddities kept):
+    // named as the way by name held it, an id given as bytes NUL first.
+    let who = held(asked);
+    anyhow::ensure!(
+        contact.connects(),
+        "only a trusted contact can be hosted: trust {who} first"
+    );
+    let me = d
+        .core()
+        .me()
+        .ok_or_else(|| anyhow::anyhow!("this device does not belong to anyone"))?;
+    let able = can_host(d);
+    anyhow::ensure!(!able.is_empty(), "{WHY_NOT}");
+    let chosen: Vec<Able> = if devices.is_empty() {
+        able.clone()
+    } else {
+        let mut out = Vec::new();
+        for name in devices {
+            let found = able
+                .iter()
+                .find(|a| device_name(d, &a.key).eq_ignore_ascii_case(name));
+            match found {
+                Some(x) => out.push(x.clone()),
+                None => anyhow::bail!(
+                    "{name} cannot host anyone now: it is not plugged in on a network that is \
+                     not metered, and it is not a host"
+                ),
+            }
+        }
+        out
+    };
+    let standing = offered_to(d, &contact.identity);
+    let was = standing
+        .as_ref()
+        .and_then(|(_, h)| grants(d, &me, &contact.identity, h).into_iter().next())
+        .and_then(|(_, g)| g.classes.first().cloned());
+    let mut class = was.unwrap_or_else(default_class);
+    if let Some(n) = envelopes {
+        class.outstanding = Some(n);
+        class.per_day = Some(n);
+    }
+    if let Some(mb) = relay_mb {
+        class.relay_bytes = Some(mb * 1_000_000);
+    }
+    let grant_for = |services: Vec<u64>, endpoints: &[Endpoint], link_key: &HybridPublicKey| {
+        Grant {
+            host: me,
+            served: contact.identity,
+            services,
+            classes: vec![class.clone()],
+            storage_bytes: Some(0),
+            retention_days: None,
+            endpoints: endpoints.to_vec(),
+            link_key: link_key.clone(),
+        }
+        .sign(&d.keys.signing)
+    };
+    let new_grant = |a: &Able| grant_for(a.services(), &a.endpoints, &a.link_key);
+    let ops = match &standing {
+        None => {
+            let grants: Vec<Vec<u8>> = chosen.iter().map(new_grant).collect();
+            relationship::create_host_offer(&grants)
+        }
+        Some((_, h)) => {
+            let have = grants(d, &me, &contact.identity, h);
+            let mut ops = Vec::new();
+            // the quota, on every device already serving
+            for (node, g) in &have {
+                if g.classes.first() != Some(&class) {
+                    let again = grant_for(g.services.clone(), &g.endpoints, &g.link_key);
+                    ops.push(relationship::set_host_serving(*node, &again));
+                }
+            }
+            for a in &chosen {
+                if !have.iter().any(|(_, o)| o.link_key == a.link_key) {
+                    ops.push(relationship::create_host_serving(h.offer, &new_grant(a)));
+                }
+            }
+            ops
+        }
+    };
+    if !ops.is_empty() {
+        d.write_and_push(&contact.space, ops)?;
+    }
+    let names: Vec<String> = chosen.iter().map(|a| device_name(d, &a.key)).collect();
+    let on: Vec<crate::api::Hostable> = chosen
+        .iter()
+        .map(|a| hostable(device_name(d, &a.key), &a.services(), &a.endpoints))
+        .collect();
+    let given: Vec<Vec<u64>> = chosen.iter().map(Able::services).collect();
+    let sees = sees(given.iter().map(Vec::as_slice));
+    Ok(crate::api::HostOfferReply {
+        devices: names,
+        on,
+        sees: sees.into(),
+    })
+}
+
+/// The person says yes to a contact's offer to host them.
+pub fn accept(d: &Arc<Daemon>, asked: Ref<'_>) -> anyhow::Result<crate::api::HostAcceptReply> {
+    let contact = crate::contacts::find_ref(d, asked)?;
+    // An old oddity, kept to the byte (DEVIATIONS.md, Old oddities kept):
+    // named as the way by name held it, an id given as bytes NUL first.
+    let who = held(asked);
+    anyhow::ensure!(contact.connects(), "you do not trust {who}");
+    let offer = all(d)
+        .into_iter()
+        .filter(|(w, _, _, h)| *w == contact.identity && h.host == contact.identity && !h.ended)
+        .map(|(_, _, _, h)| h)
+        .next_back()
+        .ok_or_else(|| anyhow::anyhow!("{who} has not offered to host you"))?;
+    if !offer.accepted {
+        let op = relationship::create_host_accept(offer.offer);
+        d.write_and_push(&contact.space, vec![op])?;
+    }
+    let me = d.core().me().unwrap_or_default();
+    let gs = grants(d, &contact.identity, &me, &offer);
+    let sees = sees(gs.iter().map(|(_, g)| g.services.as_slice()));
+    Ok(crate::api::HostAcceptReply { sees: sees.into() })
+}
+
+/// Either side ends a hosting, or an offer not yet answered.
+pub fn end(d: &Arc<Daemon>, who: Ref<'_>) -> anyhow::Result<crate::api::HostEndReply> {
+    let contact = crate::contacts::find_ref(d, who)?;
+    let me = d
+        .core()
+        .me()
+        .ok_or_else(|| anyhow::anyhow!("this device does not belong to anyone"))?;
+    let open: Vec<NodeId> = all(d)
+        .into_iter()
+        .filter(|(w, _, _, h)| *w == contact.identity && !h.ended)
+        .filter(|(_, _, _, h)| h.host == me || h.host == contact.identity)
+        .map(|(_, _, _, h)| h.offer)
+        .collect();
+    if !open.is_empty() {
+        let ops = open
+            .into_iter()
+            .map(relationship::create_host_end)
+            .collect();
+        d.write_and_push(&contact.space, ops)?;
+    }
+    Ok(crate::api::HostEndReply { ended: true })
+}
+
+/// The message in the conversation of `space` that an offer at `place`
+/// comes just after, in the order `messages` gives them; `None` where it
+/// comes before every one.
+fn after_message(d: &Daemon, space: &SpaceId, place: &relationship::Place) -> Option<NodeId> {
+    let core = d.core();
+    let sp = core.spaces.get(space)?.space.as_ref()?;
+    let said = relationship::messages(sp);
+    let before = relationship::before_place(sp, &said, place);
+    before.checked_sub(1).map(|i| said[i].id)
+}
+
+/// Whom this person hosts, who hosts them, and the offers between, ended
+/// ones too, in the order they were offered, with the devices that can host
+/// someone now, or why none can.
+pub fn list(d: &Daemon) -> crate::api::HostingReply {
+    let me = d.core().me();
+    let contacts = d.core().contacts();
+    let here = *d.keys.link.public_key().x25519();
+    let name_of = |who: &[u8; 32]| {
+        contacts
+            .iter()
+            .find(|c| c.identity == *who)
+            .map_or_else(|| short(who), |c| c.petname.clone())
+    };
+    let mine: HashMap<[u8; 32], KeyId> = d
+        .core()
+        .identity
+        .as_ref()
+        .map(|i| {
+            let st = i.state();
+            let keys = st.keys.values();
+            keys.filter_map(|k| Some((*k.link_key.as_ref()?.x25519(), k.key)))
+                .collect()
+        })
+        .unwrap_or_default();
+    let mut out = Vec::new();
+    // Ended and declined ones too, so that every device of the person shows
+    // the same last state for each.
+    for (who, space, _, h) in all(d) {
+        let by_me = Some(h.host) == me;
+        let (host, served) = if by_me {
+            (me.unwrap_or_default(), who)
+        } else {
+            (who, me.unwrap_or_default())
+        };
+        let gs = grants(d, &host, &served, &h);
+        let class = gs
+            .first()
+            .and_then(|(_, g)| g.classes.first().cloned())
+            .unwrap_or_default();
+        let name = |g: &Grant| match mine.get(g.link_key.x25519()) {
+            Some(k) if by_me => device_name(d, k),
+            _ => hex::encode(&g.link_key.x25519()[..4]),
+        };
+        let devices: Vec<String> = match by_me {
+            true => gs.iter().map(|(_, g)| name(g)).collect(),
+            false => Vec::new(),
+        };
+        let on: Vec<crate::api::Hostable> = gs
+            .iter()
+            .map(|(_, g)| hostable(name(g), &g.services, &g.endpoints))
+            .collect();
+        let sees = sees(gs.iter().map(|(_, g)| g.services.as_slice()));
+        let serves_here = by_me && gs.iter().any(|(_, g)| *g.link_key.x25519() == here);
+        let waiting = serves_here.then(|| {
+            lock(&d.mailbox.hosted.stores)
+                .get(&who)
+                .map_or(0, Store::waiting)
+        });
+        let after = h
+            .place
+            .as_ref()
+            .and_then(|place| after_message(d, &space, place));
+        let declined = h.ended && !h.accepted && h.ended_by == Some(served);
+        out.push(crate::api::Hosting {
+            accepted: h.accepted,
+            accepted_at: h.accepted_at.filter(|_| h.accepted),
+            after,
+            declined,
+            devices,
+            ended: h.ended,
+            ended_at: h.ended_at,
+            ended_by: h.ended_by,
+            offered_at: h.offered_at,
+            envelopes: class.outstanding,
+            mine: by_me,
+            name: name_of(&who),
+            relay_bytes: class.relay_bytes,
+            sees: sees.into(),
+            serving: on,
+            waiting: waiting.map(|n| n as u64),
+            who,
+        });
+    }
+    let able = can_host(d);
+    let can: Vec<String> = able.iter().map(|a| device_name(d, &a.key)).collect();
+    let devices: Vec<crate::api::Hostable> = able
+        .iter()
+        .map(|a| hostable(device_name(d, &a.key), &a.services(), &a.endpoints))
+        .collect();
+    let why_not = can.is_empty().then_some(WHY_NOT);
+    crate::api::HostingReply {
+        can,
+        devices,
+        hosting: out,
+        why_not: why_not.map(Into::into),
+    }
+}
+
+// ---- The handlers as they were by name ----
+//
+// What main had, whole, kept only to show that the typed handlers send the
+// same bytes. They go with the way by name.
+
+/// `hostable` as main had it, by name.
+#[cfg(any(test, debug_assertions, feature = "by-name"))]
+#[allow(dead_code, clippy::all)]
+fn hostable_by_name(name: String, services: &[u64], endpoints: &[Endpoint]) -> Json {
+    let outside = services.contains(&MAILBOX) && endpoints.iter().any(Endpoint::usable);
+    json!({
+        "name": name,
+        "outside": outside,
+        "sees": device_sees(services),
+        "services": service_names(services),
+    })
+}
+
+/// `offer` as main had it, by name.
+#[cfg(any(test, debug_assertions, feature = "by-name"))]
+#[allow(dead_code, clippy::all)]
+pub fn offer_by_name(
     d: &Arc<Daemon>,
     who: &str,
     devices: &[String],
@@ -1410,15 +1706,17 @@ pub fn offer(
     let names: Vec<String> = chosen.iter().map(|a| device_name(d, &a.key)).collect();
     let on: Vec<Json> = chosen
         .iter()
-        .map(|a| hostable(device_name(d, &a.key), &a.services(), &a.endpoints))
+        .map(|a| hostable_by_name(device_name(d, &a.key), &a.services(), &a.endpoints))
         .collect();
     let given: Vec<Vec<u64>> = chosen.iter().map(Able::services).collect();
     let sees = sees(given.iter().map(Vec::as_slice));
     Ok(json!({"devices": names, "on": on, "sees": sees}))
 }
 
-/// The person says yes to a contact's offer to host them.
-pub fn accept(d: &Arc<Daemon>, who: &str) -> anyhow::Result<Json> {
+/// `accept` as main had it, by name.
+#[cfg(any(test, debug_assertions, feature = "by-name"))]
+#[allow(dead_code, clippy::all)]
+pub fn accept_by_name(d: &Arc<Daemon>, who: &str) -> anyhow::Result<Json> {
     let contact = crate::contacts::find(d, who)?;
     anyhow::ensure!(contact.connects(), "you do not trust {who}");
     let offer = all(d)
@@ -1437,8 +1735,10 @@ pub fn accept(d: &Arc<Daemon>, who: &str) -> anyhow::Result<Json> {
     Ok(json!({"sees": sees}))
 }
 
-/// Either side ends a hosting, or an offer not yet answered.
-pub fn end(d: &Arc<Daemon>, who: &str) -> anyhow::Result<Json> {
+/// `end` as main had it, by name.
+#[cfg(any(test, debug_assertions, feature = "by-name"))]
+#[allow(dead_code, clippy::all)]
+pub fn end_by_name(d: &Arc<Daemon>, who: &str) -> anyhow::Result<Json> {
     let contact = crate::contacts::find(d, who)?;
     let me = d
         .core()
@@ -1460,21 +1760,10 @@ pub fn end(d: &Arc<Daemon>, who: &str) -> anyhow::Result<Json> {
     Ok(json!({"ended": true}))
 }
 
-/// The message in the conversation of `space` that an offer at `place`
-/// comes just after, in the order `messages` gives them; `None` where it
-/// comes before every one.
-fn after_message(d: &Daemon, space: &SpaceId, place: &relationship::Place) -> Option<NodeId> {
-    let core = d.core();
-    let sp = core.spaces.get(space)?.space.as_ref()?;
-    let said = relationship::messages(sp);
-    let before = relationship::before_place(sp, &said, place);
-    before.checked_sub(1).map(|i| said[i].id)
-}
-
-/// Whom this person hosts, who hosts them, and the offers between, ended
-/// ones too, in the order they were offered, with the devices that can host
-/// someone now, or why none can.
-pub fn list(d: &Daemon) -> Json {
+/// `list` as main had it, by name.
+#[cfg(any(test, debug_assertions, feature = "by-name"))]
+#[allow(dead_code, clippy::all)]
+pub fn list_by_name(d: &Daemon) -> Json {
     let me = d.core().me();
     let contacts = d.core().contacts();
     let here = *d.keys.link.public_key().x25519();
@@ -1520,7 +1809,7 @@ pub fn list(d: &Daemon) -> Json {
         };
         let on: Vec<Json> = gs
             .iter()
-            .map(|(_, g)| hostable(name(g), &g.services, &g.endpoints))
+            .map(|(_, g)| hostable_by_name(name(g), &g.services, &g.endpoints))
             .collect();
         let sees = sees(gs.iter().map(|(_, g)| g.services.as_slice()));
         let serves_here = by_me && gs.iter().any(|(_, g)| *g.link_key.x25519() == here);
@@ -1558,7 +1847,7 @@ pub fn list(d: &Daemon) -> Json {
     let can: Vec<String> = able.iter().map(|a| device_name(d, &a.key)).collect();
     let devices: Vec<Json> = able
         .iter()
-        .map(|a| hostable(device_name(d, &a.key), &a.services(), &a.endpoints))
+        .map(|a| hostable_by_name(device_name(d, &a.key), &a.services(), &a.endpoints))
         .collect();
     let why_not = can.is_empty().then_some(WHY_NOT);
     json!({"can": can, "devices": devices, "hosting": out, "why_not": why_not})
@@ -1639,7 +1928,7 @@ mod tests {
         /// This device offers to host Bo on what it can give now, and he
         /// says yes.
         fn offers_bo(&mut self, envelopes: Option<u64>) {
-            offer(&self.d, "Bo", &[], envelopes, None).unwrap();
+            offer_by_name(&self.d, "Bo", &[], envelopes, None).unwrap();
             self.bo_hears();
             let offer = self.hostings().last().unwrap().offer;
             self.bo_writes(vec![relationship::create_host_accept(offer)]);
@@ -1716,17 +2005,17 @@ mod tests {
     async fn a_device_behind_a_router_hosts_without_a_mailbox() {
         let mut h = Two::new().await;
         plugged_in(&h.d, false);
-        let v = list(&h.d);
+        let v = list_by_name(&h.d);
         assert_eq!(v["why_not"], WHY_NOT, "{v}");
-        assert!(offer(&h.d, "Bo", &[], None, None).is_err());
+        assert!(offer_by_name(&h.d, "Bo", &[], None, None).is_err());
         plugged_in(&h.d, true);
-        let v = list(&h.d);
+        let v = list_by_name(&h.d);
         assert!(v["why_not"].is_null(), "{v}");
         let dv = &v["devices"][0];
         assert_eq!(dv["outside"], false, "{v}");
         assert_eq!(dv["services"], json!(["rendezvous", "relay"]), "{v}");
         assert_eq!(dv["sees"], DEVICE_SEES_NO_MAILBOX);
-        let said = offer(&h.d, "Bo", &[], None, None).unwrap();
+        let said = offer_by_name(&h.d, "Bo", &[], None, None).unwrap();
         assert_eq!(said["sees"], SEES_NO_MAILBOX, "{said}");
         assert_eq!(said["on"][0]["services"], json!(["rendezvous", "relay"]));
         h.bo_hears();
@@ -1748,7 +2037,7 @@ mod tests {
         // Its upkeep keeps the grant as it is: it serves on.
         keep_as_host(&h.d);
         assert_eq!(served(&h), g);
-        let listed = list(&h.d);
+        let listed = list_by_name(&h.d);
         let mine = &listed["hosting"][0];
         assert_eq!(mine["sees"], SEES_NO_MAILBOX, "{listed}");
         assert_eq!(mine["serving"][0]["outside"], false, "{listed}");
@@ -1763,7 +2052,7 @@ mod tests {
         let mut h = Two::new().await;
         plugged_in(&h.d, false);
         crate::host::enable(&h.d, &["203.0.113.5:7171".to_owned()]).unwrap();
-        let v = list(&h.d);
+        let v = list_by_name(&h.d);
         let dv = &v["devices"][0];
         assert_eq!(dv["outside"], true, "{v}");
         assert_eq!(dv["services"], json!(["mailbox", "rendezvous", "relay"]));
@@ -1871,7 +2160,7 @@ mod tests {
         }
         .sign(&h.bo_keys.signing);
         h.bo_writes(relationship::create_host_offer(&[grant]));
-        let said = accept(&h.d, "Bo").unwrap();
+        let said = accept_by_name(&h.d, "Bo").unwrap();
         assert_eq!(said["sees"], SEES_NO_MAILBOX, "{said}");
         let hosts = my_hosts(&h.d);
         assert_eq!(hosts.len(), 1);
@@ -2025,7 +2314,7 @@ mod tests {
         }
         .sign(&h.bo_keys.signing);
         h.bo_writes(relationship::create_host_offer(&[grant]));
-        accept(&h.d, "Bo").unwrap();
+        accept_by_name(&h.d, "Bo").unwrap();
         assert_eq!(my_hosts(&h.d).len(), 1);
         end_untrusted(&h.d);
         assert!(!h.hostings()[0].ended, "ended while trusted");

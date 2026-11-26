@@ -55,6 +55,28 @@ impl Conditions {
         plugged_in == Some(true) && !metered
     }
 
+    /// What `conditions` answers.
+    pub fn reply(&self) -> crate::api::ConditionsReply {
+        let (plugged_in, metered) = self.now();
+        crate::api::ConditionsReply {
+            plugged_in,
+            metered,
+            helps: self.helps(),
+        }
+    }
+
+    /// What `status` says of them.
+    pub fn shown(&self) -> crate::api::ConditionsShown {
+        let (plugged_in, metered) = self.now();
+        crate::api::ConditionsShown {
+            plugged_in,
+            metered,
+            helps: self.helps(),
+        }
+    }
+
+    /// [`Conditions::shown`] as main had it, by name.
+    #[cfg(any(test, debug_assertions, feature = "by-name"))]
     pub fn json(&self) -> serde_json::Value {
         let (plugged_in, metered) = self.now();
         serde_json::json!({

@@ -110,6 +110,11 @@ fi
 date="$(date -u +%Y-%m-%d)"
 export CARDINAL_VERSION="$version" CARDINAL_GIT_COMMIT="$commit" CARDINAL_BUILD_DATE="$date"
 export CARGO_PROFILE_RELEASE_STRIP=symbols
+# One codegen unit: the compiler optimizes each crate as a whole, instead
+# of in sixteen parts that cannot share or inline across each other. The
+# binaries come out about an eighth smaller, for about 100 s more build.
+# Set here and not in Cargo.toml, so that only a release pays for it.
+export CARGO_PROFILE_RELEASE_CODEGEN_UNITS=1
 
 # ring (TLS for update downloads) compiles C. Without a musl cross
 # compiler, the host's gcc serves: ring's C uses no libc headers.

@@ -2309,13 +2309,192 @@ asks for around that is not built yet.
   `api/`, `transport.rs`). Each message is one base-encoded record on a
   `SOCK_SEQPACKET` socket (a named pipe in message mode on Windows), at most
   256 KiB. Readings and choices:
-  - **Inside, by name.** The handlers build and read JSON trees by field
-    name as before; `api/table.rs` gives every request, argument, reply
-    field and record its number and type, and `api` turns one form into the
-    other at the socket. A value the service holds as hex (a key, an id, a
-    hash) is bytes on the wire. `apps.md`'s tables of numbers are generated
-    from that file (`CARDINAL_API_TABLES=<file> cargo test -p cardinald
-    --lib api::tests::tables`).
+  - **Typed records, replacing the way by name.** A request's arguments,
+    its reply and each record in it are Rust values, declared once in
+    `api/table.rs` with `typed!`: the declaration is the struct, its row in
+    the tables, and its encoding both ways (`api/typed.rs`), so they cannot
+    drift. What the declaration compiles to is the list of its fields
+    (`Fields::each`, a call per field with its row) and their reading
+    (`take_field` per field); measuring, checking, writing and paging
+    are written once per field type or once in all, so that the release
+    binaries are no larger than they were by name.
+    A field's Rust type gives its type in the tables: `String` or
+    `Cow<'static, str>` text, `bool`, `u64` uint, `i64` int,
+    `api::typed::Kind` a kind, `api::typed::Scalar` int or text, `[u8; N]`
+    bytes of that length (read back only at exactly N), `bytes::Bytes`
+    bytes of any length, `api::typed::Reference` a ref, `Vec<T>` a list, a
+    typed record, and `Option<T>` a field sent only when it is `Some`.
+    `n gone name: T` is a number no longer used: its row stays, with the
+    type it had, and there is no struct field. A record that holds itself
+    (inspection's `value`, which holds values and lists of them, and the
+    `value field` that holds one) names its row outright, `n field:
+    Option<Box<T>> as {ROW}` or `as [ROW]`, since that row cannot be had
+    from the type; `Box<T>` is T on the wire. A record's row is written
+    out in its static, so that it can name itself.
+  - **What a record must have.** A field that is not an `Option` is one
+    this service always sends: there is no `Default`, and `Name::new` takes
+    exactly those fields, so a handler cannot forget one; read back, its
+    absence is an error. **A field added to a record after it was first
+    released is an `Option` for ever**, so that a newer client reads an
+    older service still running (the state after every update until the
+    service restarts).
+    `api::tests::what_the_last_release_lacked_is_an_option` holds
+    every field the last release's tables lack (requests' arguments and
+    replies, the program's replies, records) to that, against a copy of
+    those tables, `api/released-tables.md` (now v0.1.27's), which moves
+    forward with each release: written from the released source with
+    `CARDINAL_API_TABLES=<file> cargo test -p cardinald --lib
+    tables_for_the_specification`.
+    A reply a client cannot read is
+    `api::typed::Unreadable`, and the command line says it could not read
+    it, naming the field, not that the service is not running. `Option` is
+    only a record's field: an `Option` in a list, or of an `Option`, does
+    not compile. A uint of 2^60 or more anywhere in a reply is the error it
+    was by name: in a debug build the request fails (`internal: <where>
+    should be below 2^60, not <n>`), in a release build that field is left
+    out and logged; a client's arguments are refused before they are sent.
+  - **A request, declared once.** `asks!(ROW: n "name" Args -> Reply,
+    how)` gives its row, and `how` is `reads`, `reads unless <field>`
+    (or `reads unless <a> or <b>`, while neither is given),
+    `writes`, or `stream` (`watch`, `call-media`, answered by the
+    connection itself); a paged one adds `after <list>` (with `by <id>`
+    where its records have one), `after <list>, <list>, ...` for a reply
+    paged through several lists in turn (`groups`), each `by <id>` where
+    its records have one, `after <list> precut` for a reply the handler
+    cuts itself (inspection's entries and nodes, which it renders only for
+    the page: it answers with where the page begins and how many there
+    are in all, `api::typed::Precut`, cut by `page_precut` as the old
+    pager cut a reply that said `_page_from` and `_page_total`), or
+    `before <list> by
+    <id>`. The row holds the request's answering, made from `impl
+    Answer for Args` (`control::typed`), so a typed request without a
+    handler does not compile; handlers are async. The page's list, `more`
+    and `next` are found by their names in the declaration, the page cut by
+    encoded length (`api::typed::page_after`, `page_before`, counting as
+    `api::page` did), and the command line's paging (`Ask::next_page`,
+    `join`) comes from the same declaration. The frames of `call-media`
+    and the events of `watch` are declared with `streams!`, the program's
+    replies (`--store`, `--clear`) with `program!`. No JSON tree and no hex
+    on the typed way; ids stay bytes from the store to the socket. The
+    command line reads typed replies with `control::ask`, which also joins
+    pages; `--trace` is unchanged.
+  - **Every request is typed; a release build has no way by name.** The
+    service decodes and encodes typed only, and the command line asks and
+    reads typed only. The converter by name (`api/by_name.rs`: a request
+    and its reply as JSON trees by the tables' names, hex for bytes,
+    `encode_request`, `decode_request`, `page`, `encode_reply`,
+    `error_reply_with`, `decode_reply`, the streams' by name) and the
+    client by name the tests use (`api/blocking.rs`) are compiled only in
+    test and debug builds and with the `by-name` feature, which the
+    command line's tests turn on as a dev-dependency. In a release build
+    `serde_json` is left only for the service's own files (what it keeps
+    on disk between runs) and the command line's `--json` output, which
+    it writes from the typed reply by the tables (`cardinal/src/output.rs`).
+  - **The way by name, kept to compare.** While requests are converted,
+    main's handlers of the typed requests are kept whole, as `*_by_name`
+    (with main's lookups and main's arms in `control::handle`), compiled
+    only in test and debug builds and with the `by-name` feature, and
+    sharing nothing of the new code. In test and debug builds (not with
+    `by-name` alone, which the benchmark uses) a request declared `reads`
+    is answered by name too, beside the typed answer, and fails
+    (error 1, `internal: the typed reply to <request> is not the bytes it
+    was by name`, both shown) if the bytes differ: every test that asks it
+    compares; the two ways are asked in turn, up to eight times, until one
+    answer is the other's before it, for what changes between two asks (a
+    live call's counts). The clock a reply reads its times in
+    milliseconds by (`control::clock`: `status`'s copies, when a
+    contact's device was last heard) is held still while the two are
+    asked, so that a time read twice is one time; elsewhere it is the
+    clock. A request that writes cannot be answered twice; its cases are
+    written by hand in `api/same_bytes.rs`, on twins (two services on
+    copies of one device, one asked by name, one typed), covering success,
+    each refusal, and optional fields present and absent. What the twins
+    make apart (a group's id, a message's id and time, a path of each) is
+    swapped before the bytes are compared. The kept copies and the
+    comparison stay until the typed way has been released once; they are
+    every item gated `#[cfg(any(test, debug_assertions, feature =
+    "by-name"))]` but the two `mod` lines in `api/mod.rs` that keep the
+    converter and the client by name for the tests, with
+    `inspect/by_name.rs`, `api/same_bytes.rs`, and `control::typed::beside`
+    with what holds the clock still for it (`#[cfg(any(test,
+    debug_assertions))]`): removing them is deleting those. `apps.md`'s tables of numbers are generated
+    from `api/table.rs`, typed rows and rows by name alike
+    (`CARDINAL_API_TABLES=<file> cargo test -p cardinald --lib
+    api::tests::tables`).
+  - **Old oddities kept, to be fixed one by one.** No byte changes while a
+    request is typed, even to something better. Kept so far, each with its
+    test in `api/same_bytes.rs`: a refused contact named by an id given as
+    bytes is named in the error NUL first ("you have refused \0<hex>");
+    `before` as text that is a space, then NUL and an id, is taken as that
+    id given as bytes (the way by name trimmed before telling them apart);
+    a `mount` reply of a path that is not UTF-8, which by name ended the
+    connection (a serializing panic), is sent with the bytes replaced; a
+    member named by an id given as bytes is named NUL first in
+    `group-remove`'s "<who> is not in <group> any more", `group-role`'s
+    "<who> is not in <group>" and `group-leave`'s "<who> has left
+    <group>", and a group so given in `group-rejoin`'s "only an owner or
+    admin of <group> can add themselves back"; and `group-member` without
+    `shown`, for a member with no node of their own, writes the ref as the
+    way by name held it as the name the others see: NUL and hex, for an id
+    given as bytes; `accept` with a `name` of spaces answers that name,
+    while the contact it made reads back by the name the invitation
+    suggests (a blank petname is none), not their own. One reply differs,
+    only from data this software never writes: a group's last call is
+    noted with its ids in hex, and one not in hex failed `groups` by name
+    in a debug build (and in a release build left the whole list of
+    groups out); typed, that call alone is left out, and logged.
+    `status` sends the setting `listen` (as `host:port` written in the
+    config), not the address the service listens at: main wrote both under
+    the one name, and the setting, written second, replaced the other.
+    `contact-status` with `at`, for someone not trusted, names an id given
+    as bytes NUL first ("you do not trust \0<hex>"), and `group-connect`
+    the same in "you know <who> already" and "no admin of <group> that you
+    know can introduce you" (its earlier errors name it in hex). An
+    introduction's id as text is its id in lower-case hex, whole: in upper
+    case `introduction-accept` and `-decline` find nothing, where
+    `cancel-invitation` takes either case. Error 4 for one item of
+    `status` too large for a message names no `id` typed, where by name an
+    item of `spaces` would have; a space's record is some 40 bytes, so it
+    cannot happen. A change of guardians names its entry by all 32 bytes in
+    `guardians` and by its first eight in `guarding`, in one record
+    (`guardian change`, field 11), so typed that field is bytes of any
+    length. `recover-start` names an `identity` given as bytes that is
+    not 32 of them NUL first ("\0<hex> is not an identity id"). `recover`
+    is not answered twice where the tests run: asked after a finish cut
+    short, it shows the words once and clears what was kept. A key, an
+    identity or a group the service keeps in hex in its own files
+    (`recovering.json`, `recovered.json`) and is asked for in a reply is
+    read back to bytes; one not in hex, which this software never writes,
+    failed the request by name in a debug build, and in a release build
+    left out the whole field it was in; typed, that item alone is left out,
+    and logged. `host-offer` ("only a trusted contact can be hosted: trust
+    <who> first") and `host-accept` ("you do not trust <who>", "<who> has
+    not offered to host you") name a contact given as bytes NUL first. A
+    space named by bytes in `keep-old` and `history-empty` is the start of
+    an id, any length, as the way by name read its hex, where a `ref` as
+    bytes is otherwise an id alone (empty bytes start every id, and are
+    refused as naming more than one). `inspect-space` of a space with
+    sealed entries waiting to be opened said so in each epoch's `pending`,
+    a field with no number: the reply was this build's mistake, so in a
+    debug build the request fails (`internal: inspect-space.epochs[<i>].pending
+    has no number`) and in a release build the whole list of epochs is
+    left out, and the old pager counted such an epoch as no bytes; typed,
+    the same (`api::EpochShown`). `contact` with `setting`
+    `name-hosts` or `no-hosts`, for someone refused, names a contact given
+    as bytes NUL first ("you have refused \0<hex>"). `approval-revoke`
+    and `app-join` read an id given as bytes as the start of one, any
+    length, as the way by name read its hex, and `app-join` names it NUL
+    first in "nothing offered to you is <space>" and "more than one offer
+    is <space>". `app-answer` saying yes to a question of sharing without
+    `people` is refused, and the question is gone all the same: the
+    program asking it is told nothing, as if the person had not answered.
+    `recover-start` with an `identity` given as text that is a space, NUL,
+    then an id's 64 hex digits takes it as that id and starts a recovery,
+    as the way by name trimmed before it told text from an id given as
+    bytes (as `before` above). Kept and not fixed, the same on main:
+    `host-offer` to a trusted contact with a `relay_mb` of about 1.8e13 or
+    more multiplies past a u64 (`mb * 1_000_000`), which in a debug build
+    panics in the connection's task and in a release build wraps.
   - **A reply field without a number** is this build's mistake. In a debug
     build, where the tests run, the request then fails; in a release build
     the field is left out and the service logs an error. A field no test

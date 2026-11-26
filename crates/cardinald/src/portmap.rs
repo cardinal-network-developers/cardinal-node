@@ -12,6 +12,7 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+#[cfg(any(test, debug_assertions, feature = "by-name"))]
 use serde_json::{json, Value as Json};
 use tokio::net::UdpSocket;
 
@@ -70,6 +71,7 @@ pub struct State {
 }
 
 impl State {
+    #[cfg(any(test, debug_assertions, feature = "by-name"))]
     pub fn status(&self) -> Json {
         match (&self.mapping, &self.why_not) {
             (Some((m, at)), _) => json!({
@@ -416,6 +418,7 @@ pub fn external(d: &Daemon) -> Option<SocketAddr> {
 /// (`this_device`) and the account's, for every device (`everywhere`),
 /// both on. It asks only on a network its person said is theirs (D76):
 /// `network` says which this is.
+#[cfg(any(test, debug_assertions, feature = "by-name"))]
 pub fn status(d: &Daemon) -> Json {
     let on = crate::networks::routers_on(d);
     let mut v = d.portmap.lock().unwrap_or_else(|e| e.into_inner()).status();
@@ -433,6 +436,45 @@ pub fn status(d: &Daemon) -> Json {
     v["named"] = crate::outside::status(d);
     v["network"] = crate::networks::status(d);
     v
+}
+
+/// [`status`], typed: what the `router` request answers.
+pub fn router(d: &Daemon) -> crate::api::Router {
+    let on = crate::networks::routers_on(d);
+    let (protocol, external, seconds_left, error) = {
+        let st = d.portmap.lock().unwrap_or_else(|e| e.into_inner());
+        match (&st.mapping, &st.why_not) {
+            (Some((m, at)), _) => (
+                Some(m.protocol.name().into()),
+                Some(m.external.to_string()),
+                Some(u64::from(m.lifetime).saturating_sub(at.elapsed().as_secs())),
+                None,
+            ),
+            (None, Some(why)) => (None, None, None, Some(why.clone())),
+            (None, None) => (None, None, None, None),
+        }
+    };
+    let this_device = d.config().port_mapping;
+    let everywhere = {
+        let core = d.core();
+        let acc = core.account().and_then(|a| a.space.as_ref());
+        acc.is_none_or(|a| crate::networks::account_allows(a.state()))
+    };
+    let named = crate::outside::named(d)
+        .iter()
+        .map(|n| n.addr.to_string())
+        .collect();
+    crate::api::Router {
+        error,
+        everywhere,
+        external,
+        named,
+        network: crate::networks::network(d),
+        on,
+        protocol,
+        seconds_left,
+        this_device,
+    }
 }
 
 /// Turns port mapping, and with it naming this device as a host at the

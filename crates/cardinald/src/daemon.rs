@@ -301,7 +301,7 @@ pub struct Daemon {
     /// The call under way.
     pub call: Mutex<Option<crate::calls::Call>>,
     /// How the last call here ended, for whoever looks after it has gone.
-    pub call_ended: Mutex<Option<serde_json::Value>>,
+    pub call_ended: Mutex<Option<crate::api::CallEnded>>,
     /// The last thing copied on any of this person's devices (`clipboard.rs`).
     pub clip: Mutex<Option<crate::clipboard::Clip>>,
     /// The port the router gave, if it gave one (`portmap.rs`).
@@ -759,7 +759,53 @@ impl Daemon {
     /// seconds, and then this device looks again for its own devices and its
     /// contacts', through hosts where it must. Said by whatever sees the
     /// change, since a phone asleep keeps no timers of its own running.
-    pub fn network_changed(self: &Arc<Self>, why: &str) -> serde_json::Value {
+    pub fn network_changed(self: &Arc<Self>, why: &str) -> usize {
+        let sessions = self.endpoint.sessions();
+        tracing::info!(
+            "{why}: checking {} sessions, then looking again",
+            sessions.len()
+        );
+        for s in &sessions {
+            s.check();
+        }
+        self.unreadable.network_changed();
+        self.known.woke();
+        // What was not reached on the old network may be on this one.
+        lock(&self.backoff).clear();
+        lock(&self.sparing).start_over(Instant::now());
+        crate::hosting::network_changed(self);
+        // A permit is kept if discovery is between rounds.
+        self.rediscover.notify_one();
+        // and the services of the personas this device acts as, which
+        // listen on the same network
+        let inside: Vec<Arc<crate::helper::Helper>> = lock(&self.helper)
+            .iter()
+            .cloned()
+            .chain(lock(&self.personas).values().cloned())
+            .collect();
+        for h in inside {
+            let (hd, why) = (h.d.clone(), why.to_owned());
+            h.d.rt.spawn(async move {
+                hd.network_changed(&why);
+            });
+        }
+        let d = self.clone();
+        tokio::spawn(async move {
+            // At once what has no session, and those whose sessions were
+            // over the old network once they have had time to say so:
+            // long enough for an answer to be missed (`answer_timeout`).
+            d.connect_all().await;
+            tokio::time::sleep(Duration::from_secs(11)).await;
+            d.connect_all().await;
+            crate::rendezvous::reach_contacts(d.clone()).await;
+        });
+        sessions.len()
+    }
+
+    /// `network_changed` as main had it, by name: kept only to show the typed
+    /// handler sends the same bytes.
+    #[cfg(any(test, debug_assertions, feature = "by-name"))]
+    pub fn network_changed_by_name(self: &Arc<Self>, why: &str) -> serde_json::Value {
         let sessions = self.endpoint.sessions();
         tracing::info!(
             "{why}: checking {} sessions, then looking again",
@@ -1255,12 +1301,12 @@ impl Daemon {
             // Said once, not at each session that closes the same way.
             if let Some((kind, k)) = unread {
                 let name = self.unreadable_name(&kind);
-                if let Some(v) = self.unreadable.json(&k, &name) {
+                if let Some(u) = self.unreadable.of(&k, &name) {
                     tracing::warn!(
                         "{} ({}; they do not sync until then, and this device dials \
                          them less often)",
-                        v["says"].as_str().unwrap_or(""),
-                        v["reason"].as_str().unwrap_or("")
+                        u.says,
+                        u.reason
                     );
                 }
             }
@@ -1804,6 +1850,17 @@ impl Daemon {
     }
 
     /// When the reconnect loop dials next (`redial.rs`).
+    pub fn redial(&self) -> crate::api::Redial {
+        let helps = self.conditions.helps();
+        crate::api::Redial {
+            helps,
+            alone: self.own_sessions().is_empty() && !self.known.anchored(),
+            sparing: (!helps).then(|| lock(&self.sparing).shown(Instant::now())),
+        }
+    }
+
+    /// [`Daemon::redial`] as main had it, by name.
+    #[cfg(any(test, debug_assertions, feature = "by-name"))]
     pub fn redial_json(&self) -> serde_json::Value {
         let helps = self.conditions.helps();
         serde_json::json!({

@@ -19,8 +19,10 @@ use cardinal_blob::{BlobReader, BlobRef, NoFetch};
 use cardinal_encoding::Value;
 use cardinal_link::Priority;
 use cardinal_space::account::{self, ContactRecord};
+#[cfg(any(test, debug_assertions, feature = "by-name"))]
 use serde_json::{json, Value as Json};
 
+use crate::api::{ContactReply, Ref};
 use crate::daemon::Daemon;
 use crate::fetch::Fetcher;
 
@@ -38,11 +40,14 @@ pub fn my_name(d: &Daemon) -> String {
 
 /// `me`: the name the person suggests for themselves, and with `name`
 /// sets it, creating the self node where the account has none.
-pub fn me(d: &Arc<Daemon>, name: Option<&str>) -> anyhow::Result<Json> {
+pub fn me(d: &Arc<Daemon>, name: Option<&str>) -> anyhow::Result<crate::api::MeReply> {
     let Some(name) = name else {
         let set = d.core().self_name();
         let name = my_name(d);
-        return Ok(json!({"name": name, "set": set.is_some()}));
+        return Ok(crate::api::MeReply {
+            name,
+            set: set.is_some(),
+        });
     };
     let name = name.trim();
     anyhow::ensure!(!name.is_empty(), "a name cannot be empty");
@@ -63,25 +68,36 @@ pub fn me(d: &Arc<Daemon>, name: Option<&str>) -> anyhow::Result<Json> {
         None => account::create_self(name),
     };
     d.write_and_push(&acc, vec![op])?;
-    Ok(json!({"name": name, "set": true}))
+    Ok(crate::api::MeReply {
+        name: name.to_owned(),
+        set: true,
+    })
 }
 
 /// What a window is given of a contact's name and picture: `name`, the
 /// petname or else the name they suggest; `own`, whether it is this
 /// person's petname; `suggested`; and `picture`, a file on this device,
 /// where there is one and it is here.
+#[cfg(any(test, debug_assertions, feature = "by-name"))]
 pub fn shown(d: &Daemon, c: &ContactRecord) -> serde_json::Map<String, Json> {
     let mut m = serde_json::Map::new();
     m.insert("name".into(), json!(c.petname));
     m.insert("own".into(), json!(c.own));
     m.insert("suggested".into(), json!(c.suggested));
-    if let Some(p) = c.picture.as_ref().and_then(|r| cached(d, r)) {
-        m.insert("picture".into(), json!(p.display().to_string()));
+    if let Some(p) = picture(d, c) {
+        m.insert("picture".into(), json!(p));
     }
     m
 }
 
+/// The file of this person's picture for a contact, where it is here.
+pub fn picture(d: &Daemon, c: &ContactRecord) -> Option<String> {
+    let p = c.picture.as_ref().and_then(|r| cached(d, r))?;
+    Some(p.display().to_string())
+}
+
 /// Adds [`shown`] to an object describing a contact.
+#[cfg(any(test, debug_assertions, feature = "by-name"))]
 pub fn with_shown(d: &Daemon, c: &ContactRecord, mut v: Json) -> Json {
     if let Some(o) = v.as_object_mut() {
         o.extend(shown(d, c));
@@ -149,8 +165,80 @@ fn write_cache<F: cardinal_blob::Fetch>(d: &Daemon, b: BlobRef, fetch: &F) -> an
 /// folder, such as `People/Ana/beach.jpg`, or one on this device's disk.
 /// It is copied into the account space, so it stays as it was whatever
 /// happens to the file. An empty `from` clears it.
-pub async fn set_picture(d: &Arc<Daemon>, who: &str, from: &str) -> anyhow::Result<Json> {
-    let contact = crate::contacts::find(d, who)?;
+pub async fn set_picture(
+    d: &Arc<Daemon>,
+    who: Ref<'_>,
+    from: &str,
+) -> anyhow::Result<ContactReply> {
+    let contact = crate::contacts::find_ref(d, who)?;
+    let acc = d
+        .core()
+        .account_id()
+        .ok_or_else(|| anyhow::anyhow!("the account space is not here yet"))?;
+    let from = from.trim();
+    if from.is_empty() {
+        let ops = d
+            .core()
+            .contact_ops(&contact.identity, &[(account::PICTURE, None)]);
+        d.write_and_push(&acc, ops)?;
+        return Ok(ContactReply::new());
+    }
+    // A file of the one folder is saved out first; one on the disk is read
+    // where it is.
+    let on_disk = Path::new(from);
+    let (path, saved) = if on_disk.is_absolute() && on_disk.is_file() {
+        (on_disk.to_path_buf(), false)
+    } else {
+        let dir = d.paths.pictures();
+        std::fs::create_dir_all(&dir)?;
+        let r: [u8; 8] = cardinal_crypto::random_bytes();
+        let tmp = dir.join(format!("incoming-{}", hex::encode(r)));
+        let to = tmp.display().to_string();
+        crate::onefolder::save(d, from, &to, None)
+            .await
+            .map_err(|e| anyhow::anyhow!("{from} is not a file here: {e:#}"))?;
+        (tmp, true)
+    };
+    let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+    let encoded = if size > PICTURE_AT_MOST {
+        Err(anyhow::anyhow!(
+            "that file is too big for a picture ({} MB at most)",
+            PICTURE_AT_MOST >> 20
+        ))
+    } else {
+        let paths = [path.display().to_string()];
+        crate::contacts::encode_attachments(d, &acc, &paths).await
+    };
+    if saved {
+        let _ = std::fs::remove_file(&path);
+    }
+    let attached = encoded?
+        .pop()
+        .ok_or_else(|| anyhow::anyhow!("nothing was read"))?;
+    let blob = BlobRef::from_record(&attached.blob)?;
+    let d2 = d.clone();
+    tokio::task::spawn_blocking(move || write_cache(&d2, blob, &NoFetch)).await??;
+    let picture = Some(Value::Record(attached.blob));
+    let ops = d
+        .core()
+        .contact_ops(&contact.identity, &[(account::PICTURE, picture)]);
+    d.write_and_push(&acc, ops)?;
+    let c = crate::contacts::find_ref(d, who).unwrap_or(contact);
+    let mut reply = ContactReply::new();
+    reply.name = Some(c.petname.clone());
+    reply.own = Some(c.own);
+    reply.suggested = c.suggested.clone();
+    reply.picture = self::picture(d, &c);
+    Ok(reply)
+}
+/// Sets this person's picture for a contact from a file: one of the one
+/// folder, such as `People/Ana/beach.jpg`, or one on this device's disk.
+/// It is copied into the account space, so it stays as it was whatever
+/// happens to the file. An empty `from` clears it.
+#[cfg(any(test, debug_assertions, feature = "by-name"))]
+#[allow(dead_code, clippy::all)]
+pub async fn set_picture_by_name(d: &Arc<Daemon>, who: &str, from: &str) -> anyhow::Result<Json> {
+    let contact = crate::contacts::find_by_name(d, who)?;
     let acc = d
         .core()
         .account_id()
@@ -203,8 +291,8 @@ pub async fn set_picture(d: &Arc<Daemon>, who: &str, from: &str) -> anyhow::Resu
         .core()
         .contact_ops(&contact.identity, &[(account::PICTURE, picture)]);
     d.write_and_push(&acc, ops)?;
-    let c = crate::contacts::find(d, who).unwrap_or(contact);
-    Ok(Json::Object(shown(d, &c)))
+    let c = crate::contacts::find_by_name(d, who).unwrap_or(contact);
+    Ok(Json::Object(shown_by_name(d, &c)))
 }
 
 /// When to ask again for a picture that could not be had: 10 s after the
@@ -322,4 +410,55 @@ mod tests {
         b.got(&id);
         assert!(b.due(&id, t));
     }
+}
+
+// ---- The handlers as they were by name ----
+//
+// What main had, whole, kept only to show that the typed handlers send the
+// same bytes (`control::typed::answering`, `api/same_bytes.rs`), and to
+// measure the two. They go with the way by name.
+
+/// `me` as main had it, by name.
+#[cfg(any(test, debug_assertions, feature = "by-name"))]
+#[allow(dead_code, clippy::all)]
+pub fn me_by_name(d: &Arc<Daemon>, name: Option<&str>) -> anyhow::Result<Json> {
+    let Some(name) = name else {
+        let set = d.core().self_name();
+        let name = my_name(d);
+        return Ok(json!({"name": name, "set": set.is_some()}));
+    };
+    let name = name.trim();
+    anyhow::ensure!(!name.is_empty(), "a name cannot be empty");
+    anyhow::ensure!(!name.contains('\n'), "a name is one line");
+    let (acc, node) = {
+        let core = d.core();
+        let acc = core
+            .account_id()
+            .ok_or_else(|| anyhow::anyhow!("the account space is not here yet"))?;
+        let st = core
+            .account()
+            .and_then(|a| a.space.as_ref())
+            .map(|s| s.state());
+        (acc, st.and_then(account::self_node).map(|(n, _)| n))
+    };
+    let op = match node {
+        Some(node) => account::set_field(node, 1, name),
+        None => account::create_self(name),
+    };
+    d.write_and_push(&acc, vec![op])?;
+    Ok(json!({"name": name, "set": true}))
+}
+
+/// `shown` as main had it, by name.
+#[cfg(any(test, debug_assertions, feature = "by-name"))]
+#[allow(dead_code, clippy::all)]
+pub fn shown_by_name(d: &Daemon, c: &ContactRecord) -> serde_json::Map<String, Json> {
+    let mut m = serde_json::Map::new();
+    m.insert("name".into(), json!(c.petname));
+    m.insert("own".into(), json!(c.own));
+    m.insert("suggested".into(), json!(c.suggested));
+    if let Some(p) = c.picture.as_ref().and_then(|r| cached(d, r)) {
+        m.insert("picture".into(), json!(p.display().to_string()));
+    }
+    m
 }
