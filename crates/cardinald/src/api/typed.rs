@@ -744,7 +744,10 @@ impl<R: Fields> Body for R {
         v.n
     }
     fn invalid(&self, at: &At) -> Vec<(u64, &'static str, String)> {
-        let mut v = Invalid { at, out: Vec::new() };
+        let mut v = Invalid {
+            at,
+            out: Vec::new(),
+        };
         self.each(&mut v);
         by_name(v.out)
     }

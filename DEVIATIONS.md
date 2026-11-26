@@ -2313,7 +2313,12 @@ asks for around that is not built yet.
     its reply and each record in it are Rust values, declared once in
     `api/table.rs` with `typed!`: the declaration is the struct, its row in
     the tables, and its encoding both ways (`api/typed.rs`), so they cannot
-    drift. A field's Rust type gives its type in the tables: `String` or
+    drift. What the declaration compiles to is the list of its fields
+    (`Fields::each`, a call per field with its row) and their reading
+    (`take_field` per field); measuring, checking, writing and paging
+    are written once per field type or once in all, so that the release
+    binaries are no larger than they were by name.
+    A field's Rust type gives its type in the tables: `String` or
     `Cow<'static, str>` text, `bool`, `u64` uint, `i64` int,
     `api::typed::Kind` a kind, `api::typed::Scalar` int or text, `[u8; N]`
     bytes of that length (read back only at exactly N), `bytes::Bytes`
