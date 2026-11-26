@@ -276,6 +276,11 @@ macro_rules! whole_pages {
 }
 
 whole_pages!(
+    api::PairShowArgs,
+    api::PairStatusArgs,
+    api::PairTypeArgs,
+    api::ClipCopyArgs,
+    api::ClipArgs,
     api::ConditionsArgs,
     api::NetworkChangedArgs,
     api::MeArgs,
@@ -459,10 +464,13 @@ pub mod typed {
     use crate::api::typed::{page_after, page_before, reply_message, Ask, Fields, Unpaged};
     use crate::api::{self, CallArgs, FilesArgs, FilesReply, MessagesArgs, MessagesReply, Request};
     use crate::api::{
-        Checking, ConditionsArgs, ConditionsReply, DeviceRenameArgs, DeviceRenameReply, MeArgs,
-        MeReply, NetworkChangedArgs, WakeArgs,
+        Checking, ClipArgs, ClipCopyArgs, ClipCopyReply, ClipReply, ConditionsArgs,
+        ConditionsReply, DeviceRenameArgs, DeviceRenameReply, MeArgs, MeReply, NetworkChangedArgs,
+        PairShowArgs, PairShowReply, PairStatusArgs, PairStatusReply, PairTypeArgs, PairTypeReply,
+        WakeArgs,
     };
     use crate::daemon::Daemon;
+    use crate::daemon::PairState;
 
     type Answer = fn(&Arc<Daemon>, Record) -> Vec<u8>;
 
@@ -582,7 +590,12 @@ pub mod typed {
             NetworkChangedArgs => network_changed,
             MeArgs => me,
             DeviceRenameArgs => device_rename,
+            PairShowArgs => pair_show,
+            PairStatusArgs => pair_status,
+            PairTypeArgs => pair_type,
             WakeArgs => wake,
+            ClipCopyArgs => clip_copy,
+            ClipArgs => clip,
         }
         Err(r)
     }
@@ -646,6 +659,85 @@ pub mod typed {
 
     async fn me(d: &Arc<Daemon>, a: MeArgs) -> anyhow::Result<MeReply> {
         crate::names::me(d, a.name.as_deref())
+    }
+
+    async fn pair_show(d: &Arc<Daemon>, a: PairShowArgs) -> anyhow::Result<PairShowReply> {
+        // what to call this device, where the window knows better
+        if let Some(name) = super::device_name_given(a.device.as_deref())? {
+            super::rename_this_device(d, &name)?;
+        }
+        let s = crate::pair::show(d).await?;
+        Ok(PairShowReply {
+            code: s.code,
+            addrs: s.addrs.iter().map(|a| a.to_string()).collect(),
+        })
+    }
+
+    async fn pair_status(d: &Arc<Daemon>, _: PairStatusArgs) -> anyhow::Result<PairStatusReply> {
+        let ps = d.pairing.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let state = |state: &'static str| PairStatusReply {
+            state: state.into(),
+            ..PairStatusReply::default()
+        };
+        let power = |p| super::joins_as_name(p).map(Into::into);
+        Ok(match ps {
+            PairState::Idle => state("idle"),
+            PairState::Showing { code } => PairStatusReply {
+                code: Some(code),
+                ..state("showing")
+            },
+            PairState::Joining {
+                admin_name,
+                power: p,
+                ..
+            } => PairStatusReply {
+                admin: Some(admin_name),
+                power: power(p),
+                ..state("joining")
+            },
+            PairState::Joined {
+                admin_name,
+                power: p,
+            } => PairStatusReply {
+                admin: Some(admin_name),
+                files: Some(d.core().files_id().is_some()),
+                power: power(p),
+                ..state("joined")
+            },
+            PairState::Failed(e) => PairStatusReply {
+                error: Some(e),
+                ..state("failed")
+            },
+        })
+    }
+
+    async fn pair_type(d: &Arc<Daemon>, a: PairTypeArgs) -> anyhow::Result<PairTypeReply> {
+        let code = needed(a.code.as_deref(), "code")?;
+        let at = match a.at.as_deref() {
+            Some(at) => Some(
+                tokio::net::lookup_host(at)
+                    .await
+                    .ok()
+                    .and_then(|mut i| i.next())
+                    .ok_or_else(|| anyhow::anyhow!("{at} is not an address (ip:port)"))?,
+            ),
+            None => None,
+        };
+        let admin = a.admin.unwrap_or(false);
+        let device = super::device_name_given(a.device.as_deref())?;
+        let words = a.words.as_deref();
+        let name = crate::pair::type_code(d, code, at, admin, words, device.as_deref()).await?;
+        Ok(PairTypeReply { name })
+    }
+
+    // ---- The clipboard ----
+
+    async fn clip_copy(d: &Arc<Daemon>, a: ClipCopyArgs) -> anyhow::Result<ClipCopyReply> {
+        crate::clipboard::copy(d, needed(a.text.as_deref(), "text")?).await
+    }
+
+    async fn clip(d: &Arc<Daemon>, _: ClipArgs) -> anyhow::Result<ClipReply> {
+        Ok(crate::clipboard::paste(d))
     }
 
     async fn device_rename(
@@ -817,6 +909,15 @@ fn joins_as(p: Option<cardinal_identity::Power>) -> Value {
     }
 }
 
+/// [`joins_as`], typed.
+fn joins_as_name(p: Option<cardinal_identity::Power>) -> Option<&'static str> {
+    match p {
+        Some(cardinal_identity::Power::Admin) => Some("admin"),
+        Some(cardinal_identity::Power::Device) => Some("device"),
+        _ => None,
+    }
+}
+
 fn power_name(p: Power) -> &'static str {
     match p {
         Power::Device => "device",
@@ -915,6 +1016,7 @@ async fn handle(d: &Arc<Daemon>, req: &Value) -> anyhow::Result<Value> {
             .await??;
             Ok(json!({"entries": n}))
         }
+        #[cfg(any(test, feature = "by-name"))]
         "pair-show" => {
             // what to call this device, where the window knows better
             if let Some(name) = device_name(req)? {
@@ -925,6 +1027,7 @@ async fn handle(d: &Arc<Daemon>, req: &Value) -> anyhow::Result<Value> {
                 json!({"code": s.code, "addrs": s.addrs.iter().map(|a| a.to_string()).collect::<Vec<_>>() }),
             )
         }
+        #[cfg(any(test, feature = "by-name"))]
         "pair-status" => {
             let ps = d.pairing.lock().unwrap_or_else(|e| e.into_inner()).clone();
             Ok(match ps {
@@ -943,6 +1046,7 @@ async fn handle(d: &Arc<Daemon>, req: &Value) -> anyhow::Result<Value> {
                 PairState::Failed(e) => json!({"state": "failed", "error": e}),
             })
         }
+        #[cfg(any(test, feature = "by-name"))]
         "pair-type" => {
             let code = arg(req, "code")?;
             let at = match req.get("at").and_then(|v| v.as_str()) {
@@ -1151,8 +1255,10 @@ async fn handle(d: &Arc<Daemon>, req: &Value) -> anyhow::Result<Value> {
             crate::calls::start_group(d, arg(req, "group")?, None).await
         }
         "call-start" => crate::calls::start(d, arg(req, "who")?, formats(req)?).await,
-        "clip-copy" => crate::clipboard::copy(d, arg(req, "text")?).await,
-        "clip" => Ok(crate::clipboard::paste(d)),
+        #[cfg(any(test, feature = "by-name"))]
+        "clip-copy" => crate::clipboard::copy_by_name(d, arg(req, "text")?).await,
+        #[cfg(any(test, feature = "by-name"))]
+        "clip" => Ok(crate::clipboard::paste_by_name(d)),
         // What programs ask through the application interface, and the
         // person's approvals (`apps.rs`).
         "app-questions" => Ok(crate::apps::questions(d)),
@@ -1660,7 +1766,12 @@ fn setup_finish(d: &Arc<Daemon>, req: &Value) -> anyhow::Result<Value> {
 /// The `device` a window gives, the name it knows this device by: one
 /// line, and not empty if given.
 fn device_name(req: &Value) -> anyhow::Result<Option<String>> {
-    let Some(name) = req.get("device").and_then(|v| v.as_str()) else {
+    device_name_given(req.get("device").and_then(|v| v.as_str()))
+}
+
+/// What to call this device, where a request says.
+fn device_name_given(name: Option<&str>) -> anyhow::Result<Option<String>> {
+    let Some(name) = name else {
         return Ok(None);
     };
     let name = name.trim();

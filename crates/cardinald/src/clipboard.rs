@@ -14,6 +14,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use cardinal_encoding::{Record, Value};
 use cardinal_link::{Priority, Service, Session};
+#[cfg(any(test, feature = "by-name"))]
 use serde_json::{json, Value as Json};
 use tokio::io::AsyncWriteExt;
 
@@ -80,7 +81,7 @@ fn this_device(d: &Daemon) -> String {
 
 /// Copies `text` to this person's other devices that are online, and keeps
 /// it here too.
-pub async fn copy(d: &Arc<Daemon>, text: &str) -> anyhow::Result<Json> {
+pub async fn copy(d: &Arc<Daemon>, text: &str) -> anyhow::Result<crate::api::ClipCopyReply> {
     anyhow::ensure!(!text.is_empty(), "nothing to copy");
     anyhow::ensure!(
         text.len() <= MAX_TEXT,
@@ -107,6 +108,14 @@ pub async fn copy(d: &Arc<Daemon>, text: &str) -> anyhow::Result<Json> {
             sent += 1;
         }
     }
+    Ok(crate::api::ClipCopyReply { devices: sent })
+}
+
+/// [`copy`] as it answered by name: kept only to show the typed one sends
+/// the same bytes.
+#[cfg(any(test, feature = "by-name"))]
+pub async fn copy_by_name(d: &Arc<Daemon>, text: &str) -> anyhow::Result<Json> {
+    let sent = copy(d, text).await?.devices;
     Ok(json!({"devices": sent}))
 }
 
@@ -118,7 +127,24 @@ async fn send(s: &Session, message: &Record) -> anyhow::Result<()> {
 }
 
 /// The last copy on any of this person's devices, while it can be pasted.
-pub fn paste(d: &Daemon) -> Json {
+pub fn paste(d: &Daemon) -> crate::api::ClipReply {
+    let clip = d.clip.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    let now = now_ms();
+    match clip.filter(|c| now.saturating_sub(c.at) <= KEEP.as_millis() as u64) {
+        Some(c) => crate::api::ClipReply {
+            seconds: Some(now.saturating_sub(c.at) / 1000),
+            text: Some(c.text),
+            from: Some(c.from),
+            here: Some(c.here),
+        },
+        None => crate::api::ClipReply::default(),
+    }
+}
+
+/// [`paste`] as it answered by name: kept only to show the typed one sends
+/// the same bytes.
+#[cfg(any(test, feature = "by-name"))]
+pub fn paste_by_name(d: &Daemon) -> Json {
     let clip = d.clip.lock().unwrap_or_else(|e| e.into_inner()).clone();
     let now = now_ms();
     match clip.filter(|c| now.saturating_sub(c.at) <= KEEP.as_millis() as u64) {

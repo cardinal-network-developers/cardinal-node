@@ -787,3 +787,115 @@ async fn this_device_is_answered_the_same() {
         .encode();
     t.same_message(&nul).await;
 }
+
+/// Pairing and the clipboard.
+#[tokio::test]
+async fn pairing_and_the_clipboard_are_answered_the_same() {
+    use crate::daemon::PairState;
+    let dir = tempfile::tempdir().unwrap();
+    let t = Twins::start(dir.path()).await;
+
+    // ---- pair-show: this device belongs to someone already ----
+    for req in [
+        json!({"cmd": "pair-show"}),
+        json!({"cmd": "pair-show", "device": "  "}),
+        json!({"cmd": "pair-show", "device": "a\nb"}),
+        json!({"cmd": "pair-show", "device": " Kitchen "}),
+    ] {
+        t.same(req).await;
+    }
+    assert_eq!(t.new.config().name, "Kitchen");
+    // a number no longer used is passed over
+    let gone = Record::new().with(0, 14u64).with(1, "anything").encode();
+    t.same_message(&gone).await;
+
+    // ---- pair-status, in each state ----
+    let power = [
+        None,
+        Some(cardinal_identity::Power::Admin),
+        Some(cardinal_identity::Power::Device),
+    ];
+    let mut states = vec![
+        PairState::Idle,
+        PairState::Showing {
+            code: "ab12-cd34".into(),
+        },
+        PairState::Failed("the code timed out".into()),
+    ];
+    for power in power {
+        states.push(PairState::Joining {
+            identity: [1; 32],
+            admin_static: [2; 32],
+            admin_name: "Desk".into(),
+            admin_key: [3; 32],
+            admin_addr: None,
+            power,
+        });
+        states.push(PairState::Joined {
+            admin_name: "Desk".into(),
+            power,
+        });
+    }
+    for st in states {
+        for d in [&t.old, &t.new] {
+            *d.pairing.lock().unwrap() = st.clone();
+        }
+        t.same(json!({"cmd": "pair-status"})).await;
+    }
+
+    // ---- pair-type: what is refused before any device is looked for ----
+    for req in [
+        json!({"cmd": "pair-type"}),
+        json!({"cmd": "pair-type", "admin": true}),
+        json!({"cmd": "pair-type", "code": "x", "at": "not an address"}),
+        json!({"cmd": "pair-type", "code": "x", "at": "127.0.0.1:1", "device": "a\nb"}),
+    ] {
+        t.same(req).await;
+    }
+    let wrong = Record::new()
+        .with(0, 16u64)
+        .with(1, "x")
+        .with(3, "yes")
+        .encode();
+    t.same_message(&wrong).await;
+
+    // ---- the clipboard ----
+    let r = typed_of::<ClipArgs>(&t.same(json!({"cmd": "clip"})).await);
+    assert_eq!(r, ClipReply::default());
+    for req in [
+        json!({"cmd": "clip-copy"}),
+        json!({"cmd": "clip-copy", "text": ""}),
+        json!({"cmd": "clip-copy", "text": "x".repeat(crate::clipboard::MAX_TEXT + 1)}),
+        json!({"cmd": "clip-copy", "text": "to paste"}),
+    ] {
+        t.same(req).await;
+    }
+    let r = typed_of::<ClipArgs>(&t.same(json!({"cmd": "clip"})).await);
+    assert_eq!(r.text.as_deref(), Some("to paste"));
+    assert_eq!((r.here, r.seconds), (Some(true), Some(0)));
+    let r = typed_of::<ClipCopyArgs>(
+        &t.same(json!({"cmd": "clip-copy", "text": "x".repeat(crate::clipboard::MAX_TEXT)}))
+            .await,
+    );
+    assert_eq!(r.devices, 0);
+}
+
+/// What pair-show answers, typed, is the record its tree was by name: the
+/// code a device shows cannot be the same on twins, so it is made up here.
+#[test]
+fn a_shown_code_is_what_its_tree_was() {
+    for addrs in [
+        vec![],
+        vec!["192.168.1.20:7171".to_owned(), "[::1]:7171".into()],
+    ] {
+        let reply = PairShowReply {
+            addrs: addrs.clone(),
+            code: "ab12-cd34".into(),
+        };
+        let tree = json!({"code": "ab12-cd34", "addrs": addrs});
+        assert_eq!(
+            typed::reply_message(&reply),
+            encode_reply(PairShowArgs::REQUEST, Ok(&tree))
+        );
+    }
+}

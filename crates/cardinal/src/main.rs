@@ -2376,10 +2376,13 @@ async fn pair(
     device: Option<String>,
 ) -> anyhow::Result<()> {
     if let Some(code) = code {
-        let mut req = json!({"cmd": "pair-type", "code": code, "at": at, "admin": admin});
-        if let Some(d) = &device {
-            req["device"] = json!(d);
-        }
+        let mut args = api::PairTypeArgs {
+            code: Some(code),
+            at,
+            admin: Some(admin),
+            device: device.clone(),
+            ..Default::default()
+        };
         // Only an admin device adds devices; elsewhere the recovery words
         // approve it. Ask before the code times out on the new device.
         let st = call(paths, json!({"cmd": "status"})).await?;
@@ -2391,13 +2394,13 @@ async fn pair(
         if !st["identity"].is_null() && mine != "admin" && mine != "root" {
             println!("This device cannot add devices (it is not an admin device).");
             let words = ask_words(paths, "Your recovery words can approve it instead.").await?;
-            req["words"] = json!(words.as_str());
+            args.words = Some(words.as_str().to_owned());
         }
         println!("Looking for the new device...");
-        let v = call(paths, req).await?;
+        let v = ask(paths, args).await?;
         println!(
             "Added \"{}\". It is getting your files now; see `cardinal status`.",
-            v["name"].as_str().unwrap_or("the device")
+            v.name
         );
         return Ok(());
     }
@@ -2407,12 +2410,12 @@ async fn pair(
              device you already use. This device is told, and shows it."
         );
     }
-    let mut req = json!({"cmd": "pair-show"});
-    if let Some(d) = &device {
-        req["device"] = json!(d);
-    }
-    let v = call(paths, req).await?;
-    let code = v["code"].as_str().unwrap_or("?");
+    let args = api::PairShowArgs {
+        device,
+        ..Default::default()
+    };
+    let v = ask(paths, args).await?;
+    let code = &v.code;
     println!();
     println!("    {code}");
     println!();
@@ -2420,11 +2423,7 @@ async fn pair(
     println!();
     println!("    cardinal pair {code}");
     println!();
-    if let Some(a) = v["addrs"]
-        .as_array()
-        .and_then(|a| a.first())
-        .and_then(|a| a.as_str())
-    {
+    if let Some(a) = v.addrs.first() {
         println!("(If it cannot find this device, add `--at {a}`.)");
     }
     println!("Waiting...");
@@ -2432,24 +2431,24 @@ async fn pair(
     let mut said_joining = false;
     loop {
         tokio::time::sleep(Duration::from_millis(400)).await;
-        let s = call(paths, json!({"cmd": "pair-status"})).await?;
-        let state = s["state"].as_str().unwrap_or("");
+        let s = ask(paths, api::PairStatusArgs {}).await?;
+        let state = &*s.state;
         // Said once, even where joining was over before it was asked.
         if (state == "joining" || state == "joined") && !said_joining {
             said_joining = true;
-            let power = match s["power"].as_str() {
+            let power = match s.power.as_deref() {
                 Some("admin") => "an admin device (it can add and remove devices)",
                 _ => "a device",
             };
             println!(
                 "Paired with \"{}\". This device will join as {power}. Receiving your \
                  identity...",
-                s["admin"].as_str().unwrap_or("your device")
+                s.admin.as_deref().unwrap_or("your device")
             );
         }
         match state {
             "joined" => {
-                if s["files"].as_bool() == Some(true) {
+                if s.files == Some(true) {
                     let st = call(paths, json!({"cmd": "status"})).await?;
                     println!(
                         "Done. This device now belongs to you{}.",
@@ -2465,7 +2464,7 @@ async fn pair(
                     return Ok(());
                 }
             }
-            "failed" => anyhow::bail!("{}", s["error"].as_str().unwrap_or("pairing failed")),
+            "failed" => anyhow::bail!("{}", s.error.as_deref().unwrap_or("pairing failed")),
             "idle" => anyhow::bail!("pairing stopped; run `cardinal pair` again"),
             _ => {}
         }
@@ -3845,8 +3844,8 @@ async fn client(cmd: Cmd) -> anyhow::Result<()> {
                         t
                     }
                 };
-                let v = call(&paths, json!({"cmd": "clip-copy", "text": text})).await?;
-                match v["devices"].as_u64().unwrap_or(0) {
+                let v = ask(&paths, api::ClipCopyArgs { text: Some(text) }).await?;
+                match v.devices {
                     0 => eprintln!(
                         "Copied here. None of your other devices is online; \
                          one that comes online within ten minutes does not get it."
@@ -3857,8 +3856,8 @@ async fn client(cmd: Cmd) -> anyhow::Result<()> {
                 Ok(())
             }
             ClipCmd::Paste => {
-                let v = call(&paths, json!({"cmd": "clip"})).await?;
-                match v["text"].as_str() {
+                let v = ask(&paths, api::ClipArgs {}).await?;
+                match v.text.as_deref() {
                     Some(text) => {
                         print!("{text}");
                         if std::io::IsTerminal::is_terminal(&std::io::stdout())

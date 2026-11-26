@@ -13,7 +13,7 @@
 
 use std::borrow::Cow;
 
-use super::typed::{Fields, Reference};
+use super::typed::{Fields, Gone, Reference};
 
 /// What a field holds.
 #[derive(Debug)]
@@ -838,8 +838,63 @@ typed!(fields DeviceRenameReply {
 });
 asks!(DEVICE_RENAME: 12 "device-rename" DeviceRenameArgs -> DeviceRenameReply, Page::Whole);
 
+typed!(fields PairShowArgs {
+    1 admin: Gone<bool>,
+    2 device: Option<String>,
+});
+typed!(fields PairShowReply {
+    2 addrs: Vec<String>,
+    3 code: String,
+});
+asks!(PAIR_SHOW: 14 "pair-show" PairShowArgs -> PairShowReply, Page::Whole);
+
+typed!(fields PairStatusArgs {});
+typed!(fields PairStatusReply {
+    2 admin: Option<String>,
+    3 code: Option<String>,
+    4 error: Option<String>,
+    5 files: Option<bool>,
+    /// `idle`, `showing`, `joining`, `joined` or `failed`.
+    6 state: Cow<'static, str>,
+    /// `device` or `admin`.
+    7 power: Option<Cow<'static, str>>,
+});
+asks!(PAIR_STATUS: 15 "pair-status" PairStatusArgs -> PairStatusReply, Page::Whole);
+
+typed!(fields PairTypeArgs {
+    1 code: Option<String>,
+    2 at: Option<String>,
+    3 admin: Option<bool>,
+    4 words: Option<String>,
+    5 device: Option<String>,
+});
+typed!(fields PairTypeReply {
+    2 name: String,
+});
+asks!(PAIR_TYPE: 16 "pair-type" PairTypeArgs -> PairTypeReply, Page::Whole);
+
 typed!(fields WakeArgs {});
 asks!(WAKE: 226 "wake" WakeArgs -> Checking, Page::Whole);
+
+// ---- The clipboard ----
+
+typed!(fields ClipCopyArgs {
+    1 text: Option<String>,
+});
+typed!(fields ClipCopyReply {
+    2 devices: u64,
+});
+asks!(CLIP_COPY: 105 "clip-copy" ClipCopyArgs -> ClipCopyReply, Page::Whole);
+
+typed!(fields ClipArgs {});
+typed!(fields ClipReply {
+    2 from: Option<String>,
+    3 here: Option<bool>,
+    4 seconds: Option<u64>,
+    /// None when nothing was copied in the last ten minutes.
+    5 text: Option<String>,
+});
+asks!(CLIP: 106 "clip" ClipArgs -> ClipReply, Page::Whole);
 
 typed!(fields MessagesArgs {
     1 who: Option<Reference>,
@@ -907,11 +962,9 @@ pub static REQUESTS: &[Request] = &[
     DEVICE_RENAME,
     req!(13 "remove-device" (1 "who" REF, 2 "lost" BOOL, 3 "words" T) -> (
         2 "dropped" U, 3 "name" T)),
-    req!(14 "pair-show" (1 "admin" (gone BOOL), 2 "device" T) -> (2 "addrs" [T], 3 "code" T)),
-    req!(15 "pair-status" () -> (
-        2 "admin" T, 3 "code" T, 4 "error" T, 5 "files" BOOL, 6 "state" T, 7 "power" T)),
-    req!(16 "pair-type" (1 "code" T, 2 "at" T, 3 "admin" BOOL, 4 "words" T, 5 "device" T) -> (
-        2 "name" T)),
+    PAIR_SHOW,
+    PAIR_STATUS,
+    PAIR_TYPE,
     // ---- People, conversations and invitations: 30 to 69 ----
     paged!(after 30 "contacts" (1 "all" BOOL, 2 "after" U, 3 "limit" U) -> (
         2 "contacts" [CONTACT], 3 "more" BOOL, 4 "next" U)),
@@ -996,8 +1049,8 @@ pub static REQUESTS: &[Request] = &[
     req!(102 "call-answer" (1 "formats" [B], 2 "format_names" [T], 3 "reach" BOOL, 4 "join" BOOL) -> ()),
     req!(103 "call-end" () -> ()),
     CALL_MEDIA,
-    req!(105 "clip-copy" (1 "text" T) -> (2 "devices" U)),
-    req!(106 "clip" () -> (2 "from" T, 3 "here" BOOL, 4 "seconds" U, 5 "text" T)),
+    CLIP_COPY,
+    CLIP,
     // ---- The one folder: 120 to 149 ----
     FILES,
     req!(121 "mkdir" (1 "path" T) -> (2 "path" T)),
