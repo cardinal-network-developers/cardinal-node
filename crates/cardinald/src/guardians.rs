@@ -461,7 +461,7 @@ pub const APPLIED_SETTING: &str = "guardians: applied ";
 
 /// The policies this person named, by entry, with the contact and persona
 /// of each guardian.
-fn named_policies(core: &crate::core::Core) -> Vec<(EntryId, Vec<(EntryId, EntryId)>)> {
+pub(crate) fn named_policies(core: &crate::core::Core) -> Vec<(EntryId, Vec<(EntryId, EntryId)>)> {
     let Some(acc) = core.account().and_then(|a| a.space.as_ref()) else {
         return Vec::new();
     };

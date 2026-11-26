@@ -687,6 +687,8 @@ pub static REQUESTS: &[Request] = &[
     req!(172 "restore-from-host" (1 "words" T, 2 "at" T, 3 "key" (gone T), 4 "key" B) -> (2 "at" T)),
     req!(173 "recover-undo" (1 "to" B) -> (2 "group" B, 3 "kept_changes" [KEPT_CHANGE])),
     req!(174 "recover-kept-seen" (1 "to" [B]) -> (2 "kept_changes" [KEPT_CHANGE])),
+    req!(175 "recover-stop-waiting" (1 "all" BOOL, 2 "who" REF) -> (
+        2 "not_heard" [T], 3 "stopped" [T])),
     // ---- Networks, hosts and peers: 180 to 199 ----
     req!(180 "router" (1 "on" BOOL, 2 "this_device" BOOL) -> (
         2 "error" T, 3 "everywhere" BOOL, 4 "external" T, 5 "named" [T], 6 "network" {NETWORK},

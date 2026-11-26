@@ -674,6 +674,10 @@ fn pair_again_json(d: &Daemon, keys: &[String]) -> Vec<Json> {
 /// the last recovery left to pair again.
 pub fn status(d: &Arc<Daemon>) -> anyhow::Result<Json> {
     let Some(u) = load(d) else {
+        // the kept helper's work wakes for one no longer a guardian
+        if let_go_removed(d) {
+            d.bump();
+        }
         let r = load_recovered(d).unwrap_or_default();
         return Ok(json!({
             "under_way": false,
@@ -1450,20 +1454,169 @@ fn not_heard_json(d: &Daemon, r: &Recovered) -> Vec<Json> {
     let Some(handing) = r.handing.as_ref() else {
         return Vec::new();
     };
-    let contacts = d.core().contacts();
+    let core = d.core();
     handing
         .guardians
         .iter()
-        .map(|g| {
-            let name = g.person().and_then(|p| {
-                contacts
-                    .iter()
-                    .find(|c| c.identity == p && c.recovery_of.is_none())
-                    .map(|c| c.petname.clone())
-            });
-            Json::from(name.unwrap_or_else(|| "a guardian".to_owned()))
-        })
+        .map(|g| Json::from(guardian_name(&core, g)))
         .collect()
+}
+
+/// What this person calls a guardian who has not heard of this device.
+fn guardian_name(core: &crate::core::Core, g: &NotHeard) -> String {
+    guardian_person(core, g)
+        .and_then(|p| {
+            core.contacts()
+                .into_iter()
+                .find(|c| c.identity == p && c.recovery_of.is_none())
+                .map(|c| c.petname)
+        })
+        .unwrap_or_else(|| "a guardian".to_owned())
+}
+
+/// The guardian a persona not heard from acts for: by the log it carried,
+/// or else by whom the account says this person named with that persona.
+fn guardian_person(core: &crate::core::Core, g: &NotHeard) -> Option<[u8; 32]> {
+    g.person().or_else(|| {
+        let persona = g.persona()?;
+        crate::guardians::named_policies(core)
+            .into_iter()
+            .flat_map(|(_, named)| named)
+            .find(|(_, p)| *p == persona)
+            .map(|(c, _)| c)
+    })
+}
+
+/// The guardians not heard from that this person's guardians no longer
+/// include, by persona (hex): a change of guardians in effect since the
+/// recovery, as this person named it, names neither them nor their
+/// persona. While the policy the recovery acted under is still the
+/// current one, or the account does not say whom the current one names,
+/// nobody is let go.
+fn no_longer_guardians(d: &Daemon, handing: &Handing) -> Vec<String> {
+    let core = d.core();
+    let Some(ident) = core.identity.as_ref() else {
+        return Vec::new();
+    };
+    let Some(current) = ident.log.current_policy() else {
+        return Vec::new();
+    };
+    let root: Option<KeyId> = hex::decode(&handing.root)
+        .ok()
+        .and_then(|b| b.try_into().ok());
+    let under = ident
+        .log
+        .recoveries()
+        .into_iter()
+        .find(|r| Some(r.root) == root)
+        .map(|r| r.policy);
+    if under.is_none_or(|p| p == current.entry) {
+        return Vec::new();
+    }
+    let Some(named) = crate::guardians::named_policies(&core)
+        .into_iter()
+        .find(|(p, _)| *p == current.entry)
+        .map(|(_, named)| named)
+    else {
+        return Vec::new();
+    };
+    handing
+        .guardians
+        .iter()
+        .filter(|g| {
+            let person = guardian_person(&core, g);
+            !named
+                .iter()
+                .any(|(c, p)| Some(*c) == person || g.persona() == Some(*p))
+        })
+        .map(|g| g.persona.clone())
+        .collect()
+}
+
+/// Stops waiting for each guardian not heard from whom this person's
+/// guardians no longer include ([`no_longer_guardians`]). Returns whether
+/// any was let go.
+fn let_go_removed(d: &Daemon) -> bool {
+    let Some(handing) = load_recovered(d).and_then(|r| r.handing) else {
+        return false;
+    };
+    let gone = no_longer_guardians(d, &handing);
+    if gone.is_empty() {
+        return false;
+    }
+    tracing::info!(
+        "{} guardian(s) not heard from are no longer guardians: not waited for",
+        gone.len()
+    );
+    update_recovered(d, |r| {
+        if let Some(x) = r.handing.as_mut() {
+            x.guardians.retain(|g| !gone.contains(&g.persona));
+        }
+    });
+    true
+}
+
+/// `cardinal recover stop-waiting NAME|--all`: on the person's word, the
+/// helper kept after the finish stops waiting for one guardian who has not
+/// heard of this device, or for all of them. Their devices then do not
+/// answer this one until they learn of it some other way; nothing else is
+/// given up. Once nobody is waited for, the helper goes.
+pub async fn stop_waiting(d: &Arc<Daemon>, who: Option<&str>, all: bool) -> anyhow::Result<Json> {
+    anyhow::ensure!(
+        who.is_some() != all,
+        "name one guardian who has not heard of this device, or say all of them"
+    );
+    let handing = load_recovered(d)
+        .and_then(|r| r.handing)
+        .filter(|h| !h.guardians.is_empty())
+        .ok_or_else(|| {
+            anyhow::anyhow!("no guardian is waited for: every one who confirmed has heard")
+        })?;
+    let stopped: Vec<NotHeard> = match who {
+        None => handing.guardians.clone(),
+        Some(w) => {
+            let c = crate::contacts::find(d, w)?;
+            let core = d.core();
+            let found: Vec<NotHeard> = handing
+                .guardians
+                .iter()
+                .filter(|g| guardian_person(&core, g) == Some(c.identity))
+                .cloned()
+                .collect();
+            anyhow::ensure!(
+                !found.is_empty(),
+                "{} is not among the guardians who have not heard of this device",
+                c.petname
+            );
+            found
+        }
+    };
+    let names: Vec<String> = {
+        let core = d.core();
+        stopped.iter().map(|g| guardian_name(&core, g)).collect()
+    };
+    update_recovered(d, |r| {
+        if let Some(x) = r.handing.as_mut() {
+            x.guardians
+                .retain(|g| !stopped.iter().any(|s| s.persona == g.persona));
+        }
+    });
+    tracing::info!("on the person's word, {} guardian(s) no longer waited for", names.len());
+    if !kept(d) {
+        drop_kept(d).await;
+    }
+    let r = load_recovered(d).unwrap_or_default();
+    Ok(json!({"not_heard": not_heard_json(d, &r), "stopped": names}))
+}
+
+/// Drops the helper kept after the finish, once nobody is waited for.
+async fn drop_kept(d: &Arc<Daemon>) {
+    update_recovered(d, |r| r.handing = None);
+    // a finish cut short goes on in `status`, which drops it then
+    if load(d).is_none() {
+        let _ = crate::helper::stop(d).await;
+        crate::helper::remove_left(d);
+    }
 }
 
 /// Keeps the helper after the finish, started again if it is not
@@ -1558,6 +1711,8 @@ async fn keep_handing(d: Arc<Daemon>, h: Arc<Helper>) {
         if !still || *d.stopping.borrow() {
             return;
         }
+        // who is no longer a guardian is not waited for
+        let_go_removed(&d);
         if !kept(&d) {
             break;
         }
@@ -1577,13 +1732,8 @@ async fn keep_handing(d: Arc<Daemon>, h: Arc<Helper>) {
             _ = tokio::time::sleep(Duration::from_secs(60)) => {}
         }
     }
-    update_recovered(&d, |r| r.handing = None);
-    tracing::info!("every guardian who confirmed knows this device: the recovery helper goes");
-    // a finish cut short goes on in `status`, which drops it then
-    if load(&d).is_none() {
-        let _ = crate::helper::stop(&d).await;
-        crate::helper::remove_left(&d);
-    }
+    tracing::info!("nobody who confirmed is waited for: the recovery helper goes");
+    drop_kept(&d).await;
 }
 
 /// One round of [`keep_handing`]: each guardian not known to hold this

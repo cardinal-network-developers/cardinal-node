@@ -1734,3 +1734,201 @@ fn a_kept_move_is_followed_with_nothing_more_arriving() {
     assert_eq!(listed[0]["group"], g.as_str(), "{kept}");
     assert_eq!(listed[0]["to"], g2.as_str(), "{kept}");
 }
+
+/// Ana, her laptop lost, with Bo, Cy and Di guarding her, two of them
+/// needed, Bo holding her account; all three confirmed her recovery on a
+/// new device, its account given back, ready to finish. Returns the new
+/// device.
+fn three_confirm(root: &std::path::Path, bo: &Dev, cy: &Dev, di: &Dev) -> Dev {
+    let mut laptop = Dev::new(root, "laptop", free_port());
+    laptop.start();
+    let words = words_from(&laptop.cli(&["init", "--yes", "--name", "ana"]));
+    laptop.wait_mounted();
+    for g in [bo, cy, di] {
+        meet(&laptop, g, "Ana");
+    }
+    accept_guarding(&[bo, cy, di]);
+    let o = name_accepted(
+        &laptop,
+        &words,
+        &["bo", "cy", "di", "--threshold", "2", "--delay", "4s"],
+    );
+    assert!(o.status.success(), "{}", out(&o));
+    for g in [bo, cy, di] {
+        wait("the guardian knows", 30, || {
+            g.cli(&["guarding"]).contains("Ana: one of 3 guardians")
+        });
+    }
+    hold_account(&laptop, &[bo]);
+    laptop.stop();
+    drop(laptop);
+    let new = new_device(root, "new");
+    let fp = fingerprint_from(&new.cli(&["recover", "start", &recovery_invitation(bo, "Ana")]));
+    new.cli(&["recover", "start", &recovery_invitation(cy, "Ana")]);
+    new.cli(&["recover", "start", &recovery_invitation(di, "Ana")]);
+    for g in [bo, cy, di] {
+        wait("the guardian sees the recovery", 60, || {
+            g.cli(&["guarding"]).contains(&fp)
+        });
+    }
+    endorse_and_confirm(&[bo, cy, di], &fp);
+    wait("the account is given back", 60, || {
+        new.cli(&["recover"]).contains("your account among it")
+    });
+    new
+}
+
+/// A guardian who confirmed and never comes back: Cy is away at the
+/// finish, so the helper is kept for him and `cardinal recover` names him.
+/// Ana replaces him with nobody, naming Bo and Di alone, and Bo and Di, in
+/// office, confirm the change. Once it is in effect her guardians no longer
+/// include Cy: the helper stops waiting for him, nobody is left, and it
+/// goes, with the notice. Without that exit it would wait for Cy for good.
+#[test]
+fn replacing_a_guardian_who_never_comes_back_lets_the_helper_go() {
+    if !fuse_available() {
+        eprintln!("skipping: /dev/fuse or fusermount3 is not available");
+        return;
+    }
+    let root = tempfile::tempdir().unwrap();
+    let bo = person(root.path(), "bo");
+    let mut cy = person(root.path(), "cy");
+    let di = person(root.path(), "di");
+    let new = three_confirm(root.path(), &bo, &cy, &di);
+    cy.stop();
+    let o = new.try_cli(&["recover", "finish"]);
+    assert!(o.status.success(), "{}", out(&o));
+    assert!(out(&o).contains("yet: cy."), "{}", out(&o));
+    let helper = new.home.join("recovery-helper");
+    assert!(helper.exists(), "the helper is kept for cy");
+    let port = kept_helper_port(&new);
+    wait("the new device reaches bo", 60, || reaches(&new, &bo));
+    wait("the new device reaches di", 60, || reaches(&new, &di));
+    // still waited for while the change is under way
+    ask_and_accept(&new, &[&bo, &di]);
+    let o = name_accepted(&new, "", &["bo", "di", "--delay", "4s"]);
+    assert!(
+        out(&o).contains("Asked your guardians to confirm"),
+        "{}",
+        out(&o)
+    );
+    assert!(new.cli(&["recover"]).contains("yet: cy."));
+    assert!(helper.exists());
+    for g in [&bo, &di] {
+        wait("the guardian confirms the change", 60, || {
+            g.try_cli(&["guarding", "confirm-change", "Ana", "--yes"])
+                .status
+                .success()
+        });
+    }
+    wait("ana sees her new guardians", 60, || {
+        new.cli(&["guardians"]).contains("Guardians: bo, di")
+    });
+    wait("the notice clears", 60, || {
+        !new.cli(&["recover"]).contains("have not heard")
+    });
+    wait("the helper goes", 60, || !helper.exists());
+    wait("nothing listens at the helper's port", 30, || {
+        nothing_listens(port)
+    });
+}
+
+/// The same guardian, let go on the person's word: Cy and Di are both away
+/// at the finish. `cardinal recover stop-waiting cy` says first what it
+/// means, does nothing without a yes, and with one stops waiting for Cy
+/// alone: the helper stays for Di. `--all` then lets Di go too, and the
+/// helper goes, with the notice. Someone who heard is not waited for, and
+/// cannot be named.
+#[test]
+fn the_person_stops_waiting_for_a_guardian_who_never_comes_back() {
+    use serde_json::json;
+    if !fuse_available() {
+        eprintln!("skipping: /dev/fuse or fusermount3 is not available");
+        return;
+    }
+    let root = tempfile::tempdir().unwrap();
+    let bo = person(root.path(), "bo");
+    let mut cy = person(root.path(), "cy");
+    let mut di = person(root.path(), "di");
+    let new = three_confirm(root.path(), &bo, &cy, &di);
+    cy.stop();
+    di.stop();
+    let o = new.try_cli(&["recover", "finish"]);
+    assert!(o.status.success(), "{}", out(&o));
+    let said = out(&o);
+    assert!(said.contains("have not heard of this device"), "{said}");
+    assert!(said.contains("stop-waiting"), "{said}");
+    let helper = new.home.join("recovery-helper");
+    assert!(helper.exists());
+    let waited = |new: &Dev| -> Vec<String> {
+        let r = ask(new, json!({"cmd": "recover"}));
+        let mut v: Vec<String> = r["not_heard"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|x| x.as_str().map(str::to_owned))
+            .collect();
+        v.sort();
+        v
+    };
+    assert_eq!(waited(&new), ["cy", "di"]);
+    // Plainly said first; without a yes, nothing is done.
+    let o = new.cli_input(&["recover", "stop-waiting", "cy"], "no\n");
+    assert!(!o.status.success(), "{}", out(&o));
+    let said = out(&o);
+    assert!(
+        said.contains("will not answer this device until they learn of it some other way"),
+        "{said}"
+    );
+    assert!(said.contains("Nothing else is given up"), "{said}");
+    assert!(said.contains("nothing was done"), "{said}");
+    assert_eq!(waited(&new), ["cy", "di"]);
+    // Bo heard: he is not among them.
+    wait("the new device reaches bo", 60, || reaches(&new, &bo));
+    let r = reply(&new, &json!({"cmd": "recover-stop-waiting", "who": "bo"}));
+    assert_ne!(r["ok"], true, "{r}");
+    assert!(
+        r["error"]
+            .as_str()
+            .is_some_and(|e| e.contains("not among the guardians who have not heard")),
+        "{r}"
+    );
+    // One, and not both at once.
+    let r = reply(
+        &new,
+        &json!({"cmd": "recover-stop-waiting", "who": "cy", "all": true}),
+    );
+    assert_ne!(r["ok"], true, "{r}");
+    let o = new.cli_input(&["recover", "stop-waiting", "cy"], "yes\n");
+    assert!(o.status.success(), "{}", out(&o));
+    let said = out(&o);
+    assert!(said.contains("No longer waiting for cy."), "{said}");
+    assert!(said.contains("yet: di."), "{said}");
+    assert_eq!(waited(&new), ["di"]);
+    // the helper stays for Di, across a restart too
+    std::thread::sleep(Duration::from_secs(2));
+    assert!(helper.exists(), "the helper is kept for di");
+    let mut new = new;
+    new.stop();
+    new.start();
+    assert_eq!(waited(&new), ["di"]);
+    assert!(helper.exists());
+    let port = kept_helper_port(&new);
+    let o = new.try_cli(&["recover", "stop-waiting", "--all", "--yes"]);
+    assert!(o.status.success(), "{}", out(&o));
+    let said = out(&o);
+    assert!(said.contains("No longer waiting for di."), "{said}");
+    assert!(said.contains("Nobody is waited for now."), "{said}");
+    assert!(waited(&new).is_empty());
+    assert!(!new.cli(&["recover"]).contains("have not heard"));
+    wait("the helper goes", 30, || !helper.exists());
+    wait("nothing listens at the helper's port", 30, || {
+        nothing_listens(port)
+    });
+    // and nothing is left to stop waiting for
+    let r = reply(&new, &json!({"cmd": "recover-stop-waiting", "all": true}));
+    assert_ne!(r["ok"], true, "{r}");
+    new.stop();
+    new.start();
+    assert!(!helper.exists());
+}
