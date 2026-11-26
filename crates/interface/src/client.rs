@@ -438,4 +438,144 @@ mod tests {
         let e = ask(&mut Garbled, &FilesArgs::new()).unwrap_err();
         assert!(e.contains("files.files is missing"), "{e}");
     }
+
+    /// An item too large for a message on its own stops `ask`, as the
+    /// reply's failure; `ask_past` goes on past it, after one more than its
+    /// place, or before its id, and says which it left out.
+    #[test]
+    fn an_item_too_large_is_gone_past_where_asked() {
+        let mut entries: Vec<File> = (0..2_000).map(entry).collect();
+        entries[1_500] = crate::new!(File {
+            folder: false,
+            name: "y".repeat(MAX_MESSAGE)
+        });
+        let mut s = Service {
+            entries,
+            said: Vec::new(),
+            asked: Vec::new(),
+        };
+        let failed = ask(&mut s, &FilesArgs::new()).unwrap().unwrap_err();
+        assert_eq!(
+            (failed.status, failed.at),
+            (crate::status::TOO_LARGE, Some(1_500))
+        );
+        let whole = ask_past(&mut s, &FilesArgs::new()).unwrap().unwrap();
+        assert_eq!(whole.reply.files.len(), 1_999);
+        assert!(whole.reply.files.iter().all(|f| f.name.len() < 300));
+        assert_eq!(whole.reply.files[1_500], entry(1_501));
+        assert_eq!(whole.left_out.len(), 1);
+        assert_eq!(whole.left_out[0].at, Some(1_500));
+        assert_eq!((whole.reply.more, whole.reply.next), (false, None));
+
+        // back from the newest: before the id of the one too large
+        let small = |i: u8| said(i, format!("{i}"));
+        let mut said_all: Vec<Message> = (0..10).map(small).collect();
+        said_all[6] = said(6, "z".repeat(MAX_MESSAGE));
+        let mut s = Service {
+            entries: Vec::new(),
+            said: said_all,
+            asked: Vec::new(),
+        };
+        let args = MessagesArgs {
+            who: Some(Reference::Typed("Ana".into())),
+            limit: Some(2),
+            ..MessagesArgs::new()
+        };
+        // a page asked for itself: the two newest
+        let one = ask_past(&mut s, &args).unwrap().unwrap();
+        assert_eq!(one.reply.messages, [small(8), small(9)]);
+        assert!(one.reply.more);
+        // page after page, two at a time, until enough
+        s.asked.clear();
+        let mut pages = Pages::new(&args).every_page().past_too_large();
+        while let Some(msg) = pages.next().unwrap() {
+            let reply = s.exchange(&msg).unwrap();
+            if !pages.took(&reply).unwrap() {
+                break;
+            }
+            if pages.so_far().is_some_and(|r| r.messages.len() >= 5) {
+                break;
+            }
+        }
+        assert!(pages.more(), "older ones are left");
+        let whole = pages.whole().unwrap();
+        let ids: Vec<u8> = whole.reply.messages.iter().map(|m| m.id[0]).collect();
+        assert_eq!(ids, [4, 5, 7, 8, 9]);
+        assert_eq!(whole.left_out.len(), 1);
+        assert_eq!(whole.left_out[0].id.as_deref(), Some(&[6u8; 16][..]));
+        // asked: the newest two; before 8, 7 alone (6 does not fit beside
+        // it); before 7, error 4 for 6; before 6, two more
+        assert_eq!(s.asked.len(), 4);
+    }
+
+    /// A refusal is what the reply said: an empty why stays empty, and is
+    /// worded by its status's name only for a person.
+    #[test]
+    fn a_refusal_keeps_what_it_said() {
+        struct Saying(&'static str);
+        impl Transport for Saying {
+            type Error = String;
+            fn exchange(&mut self, _: &[u8]) -> Result<Vec<u8>, String> {
+                Ok(crate::error_reply(crate::status::TOO_LARGE, self.0))
+            }
+        }
+        let failed = ask(&mut Saying(""), &FilesArgs::new())
+            .unwrap()
+            .unwrap_err();
+        assert_eq!((failed.why.as_str(), failed.words()), ("", "too large"));
+        assert_eq!(failed.to_string(), "too large");
+        let failed = ask(&mut Saying("too large"), &FilesArgs::new())
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(
+            (failed.why.as_str(), failed.words()),
+            ("too large", "too large")
+        );
+        // an error without why, or whose `at` is not a uint, is unreadable
+        struct Odd(crate::__private::Record);
+        impl Transport for Odd {
+            type Error = String;
+            fn exchange(&mut self, _: &[u8]) -> Result<Vec<u8>, String> {
+                Ok(self.0.encode())
+            }
+        }
+        let r = crate::__private::Record::new().with(0, 1u64);
+        let e = ask(&mut Odd(r.clone()), &FilesArgs::new()).unwrap_err();
+        assert!(e.contains("error.why is missing"), "{e}");
+        let e = ask(&mut Odd(r.with(1, "x").with(2, "two")), &FilesArgs::new()).unwrap_err();
+        assert!(e.contains("error.at should be an unsigned integer"), "{e}");
+    }
+
+    /// A stream's message is read by its key 0 as its own record; one of a
+    /// kind this build does not know is passed over, and one that is not
+    /// what its kind says is unreadable.
+    #[test]
+    fn a_streams_message_is_read_by_its_key_0() {
+        use crate::{AudioFrame, Event, Frame, ViewportFrame};
+        let v = crate::new!(ViewportFrame {
+            width: 640,
+            height: 480
+        });
+        let msg = Frame::Viewport(v.clone()).message();
+        assert_eq!(Frame::read(&msg).unwrap(), Some(Frame::Viewport(v)));
+        let audio = AudioFrame {
+            from: Some([2; 8]),
+            ..crate::new!(AudioFrame {
+                audio: crate::Bytes::from_static(b"opus")
+            })
+        };
+        let msg = Frame::Audio(audio.clone()).message();
+        assert_eq!(Frame::read(&msg).unwrap(), Some(Frame::Audio(audio)));
+        assert_eq!(
+            Event::read(&crate::event_message(7)).unwrap(),
+            Some(Event::Changed(crate::Changed { seq: 7 }))
+        );
+        let later = crate::__private::Record::new().with(0, 99u64).with(1, "x");
+        assert_eq!(Frame::read(&later.encode()).unwrap(), None);
+        let wrong = crate::__private::Record::new()
+            .with(0, 3u64)
+            .with(1, "wide");
+        let e = Frame::read(&wrong.encode()).unwrap_err();
+        assert_eq!(e.0, "viewport.width should be an unsigned integer");
+    }
 }
