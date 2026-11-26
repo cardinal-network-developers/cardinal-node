@@ -839,13 +839,17 @@ fn left_groups(core: &Core, me: &[u8; 32]) -> Vec<Found> {
 }
 
 /// The groups [`rejoin`] can take this person back to, for `groups`.
-fn rejoinable_json(core: &Core, me: &[u8; 32]) -> Vec<Json> {
+fn rejoinable(core: &Core, me: &[u8; 32]) -> Vec<api::Rejoin> {
     left_groups(core, me)
         .into_iter()
         .map(|g| {
             let sp = core.spaces.get(&g.id).and_then(|h| h.space.as_ref());
-            let members = sp.map_or(0, |sp| sp.present().len());
-            json!({"group": hex::encode(g.id), "name": g.name, "members": members})
+            let members = sp.map_or(0, |sp| sp.present().len()) as u64;
+            api::Rejoin {
+                group: g.id,
+                members,
+                name: g.name,
+            }
         })
         .collect()
 }
@@ -942,22 +946,6 @@ fn telling_of(core: &Core, id: &SpaceId, me: &[u8; 32]) -> api::GroupReach {
         what: t.what,
         named: None,
     }
-}
-
-/// [`telling_of`], by name, for the requests not yet typed.
-fn telling_json(core: &Core, id: &SpaceId, me: &[u8; 32]) -> Json {
-    let t = telling_of(core, id, me);
-    json!({
-        "shared": t.shared,
-        "ask": t.ask,
-        "who": t.who,
-        "what": t.what,
-        "added": t.added,
-        "public": t.public,
-        "waiting": t.waiting,
-        "said_no": t.said_no,
-        "set": t.set,
-    })
 }
 
 /// The groups where someone this person refuses still reads where their
@@ -1232,6 +1220,42 @@ fn change_json(
     })
 }
 
+/// [`change_json`], typed: what a group's move changed, by the names this
+/// person sees.
+fn change_of(
+    core: &Core,
+    me: &[u8; 32],
+    contacts: &[ContactRecord],
+    named: &[Member],
+    succ: &SpaceId,
+) -> api::GroupChange {
+    let mut c = api::GroupChange::new(Vec::new(), Vec::new());
+    let Some((out, roles)) = core.changes_of(succ) else {
+        return c;
+    };
+    // the old space knows them all by name
+    let old = core
+        .spaces
+        .get(succ)
+        .and_then(|h| h.space.as_ref()?.succeeds());
+    let old = old.and_then(|o| core.spaces.get(&o)?.space.as_ref());
+    let mut all: Vec<Member> = named.to_vec();
+    if let Some(o) = old {
+        all.extend(named_in(o));
+    }
+    let name = |w: &[u8; 32]| name_of(me, contacts, &all, w);
+    c.taken_out = out.iter().map(name).collect();
+    c.roles = roles
+        .iter()
+        .map(|(w, from, to)| api::RoleChange {
+            name: name(w),
+            from: role_name(*from).into(),
+            to: role_name(*to).into(),
+        })
+        .collect();
+    c
+}
+
 /// A group change kept after a recovery by guardians (D84): another of
 /// the person's old devices made it and one confirmed it before the loss,
 /// so it stands, and the recovered device lists it for the person to undo
@@ -1376,30 +1400,28 @@ pub fn confirm_move(
     Ok(json!({ "kept": kept }))
 }
 
-/// Each move on the way to `id` that awaits this person's word, nearest
-/// first: `group`, the earlier group it left (what `group-confirm-move`
-/// takes), `to`, the group it moved to, who moved it and on which device,
-/// when, and what it changed.
-fn to_confirm_json(
+/// [`to_confirm_json`], typed.
+fn to_confirm_of(
     core: &Core,
     me: &[u8; 32],
     contacts: &[ContactRecord],
     named: &[Member],
     id: &SpaceId,
-) -> Vec<Json> {
+) -> Vec<api::GroupChange> {
     core.moves_to_confirm(id)
         .iter()
         .filter_map(|(old, new)| {
             let new = *new;
             let sp = core.spaces.get(&new)?.space.as_ref()?;
-            let mut c = change_json(core, me, contacts, named, &new);
-            c["group"] = json!(hex::encode(old));
-            c["to"] = json!(hex::encode(new));
-            c["by"] = json!(name_of(me, contacts, named, &sp.creator()));
-            c["at"] = json!(sp.entry(&new).and_then(|g| g.time()));
-            c["seen"] = json!(core.spaces.get(&new).and_then(|h| h.notes().first_seen_ms));
-            c["device"] = json!(core.moved_by_device(&new));
-            Some(c)
+            Some(api::GroupChange {
+                group: Some(*old),
+                to: Some(new),
+                by: Some(name_of(me, contacts, named, &sp.creator())),
+                at: sp.entry(&new).and_then(|g| g.time()),
+                seen: core.spaces.get(&new).and_then(|h| h.notes().first_seen_ms),
+                device: core.moved_by_device(&new),
+                ..change_of(core, me, contacts, named, &new)
+            })
         })
         .collect()
 }
@@ -1427,22 +1449,31 @@ pub(crate) fn name_of(
     shown.unwrap_or_else(|| "Someone".into())
 }
 
-/// The groups this person is in, the most recent first, and those offered.
-pub fn list(d: &Daemon) -> Json {
+/// The groups this person is in, most recent first, those offered to them,
+/// and those they left and can come back to: all of them, which the
+/// request's page is cut from.
+pub fn list(d: &Daemon) -> api::GroupsReply {
     list_of(&d.core())
 }
 
 /// [`list`], from what a device holds: each group and each offer says
 /// whether the group is public, and what this person's reach node tells
 /// there and whom.
-pub fn list_of(core: &Core) -> Json {
+pub fn list_of(core: &Core) -> api::GroupsReply {
+    let mut out = api::GroupsReply {
+        groups: Vec::new(),
+        offers: Vec::new(),
+        // the page says
+        more: false,
+        next: None,
+        rejoin: None,
+    };
     let Some(me) = core.identity.as_ref().map(|i| i.id()) else {
-        return json!({"groups": [], "offers": []});
+        return out;
     };
     let declined = core.declined();
     let contacts = core.contacts();
-    let mut groups: Vec<(Option<u64>, Json)> = Vec::new();
-    let mut offered: Vec<Json> = Vec::new();
+    let mut groups: Vec<(Option<u64>, api::Group)> = Vec::new();
     for (id, h) in &core.spaces {
         let Some(sp) = h.space.as_ref().filter(|s| s.profile() == group::GROUP) else {
             continue;
@@ -1455,21 +1486,21 @@ pub fn list_of(core: &Core) -> Json {
         let named = named_in(sp);
         let in_it = members.iter().any(|m| m.identity == me);
         // how many are in it: someone who has left is not
-        let how_many = members.iter().filter(|m| !m.left).count();
+        let how_many = members.iter().filter(|m| !m.left).count() as u64;
         let name = group::name(sp);
         if !core.is_joined(id) {
             if in_it && !declined.contains(id) {
                 let from = sp.added_by(&me).unwrap_or(sp.creator());
-                offered.push(json!({
-                    "group": hex::encode(id),
-                    "name": name,
-                    "from": name_of(&me, &contacts, &members, &from),
-                    "members": how_many,
-                    "public": sp.is_public(),
-                    "reach": telling_json(core, id, &me),
-                    "for_call": group::for_call(sp),
-                    "last_call": core.last_call(id),
-                }));
+                out.offers.push(api::Offer {
+                    group: *id,
+                    from: name_of(&me, &contacts, &members, &from),
+                    members: how_many,
+                    public: sp.is_public(),
+                    reach: telling_of(core, id, &me),
+                    for_call: Some(group::for_call(sp)),
+                    last_call: core.last_call_typed(id),
+                    name,
+                });
             }
             continue;
         }
@@ -1482,7 +1513,7 @@ pub fn list_of(core: &Core) -> Json {
             .iter()
             .zip(read)
             .filter(|(m, read)| m.author != me && !read)
-            .count();
+            .count() as u64;
         let last = said.last().cloned();
         let when = last.as_ref().and_then(|m| m.time).map(|t| t.min(now_ms()));
         let (ended, mut lost) = core.succession_news(id);
@@ -1498,60 +1529,58 @@ pub fn list_of(core: &Core) -> Json {
         let seen = notes.and_then(|n| n.first_seen_ms);
         let fresh = seen.is_none_or(|t| now_ms().saturating_sub(t) < MOVED_FOR_MS);
         // what another device of the person's moved, until they say OK
-        let to_confirm = to_confirm_json(core, &me, &contacts, &named, id);
-        let confirm: Vec<Json> = to_confirm.iter().map(|c| c["group"].clone()).collect();
+        let to_confirm = to_confirm_of(core, &me, &contacts, &named, id);
+        let confirm: Vec<[u8; 32]> = to_confirm.iter().filter_map(|c| c.group).collect();
         let told = fresh && !notes.is_some_and(|n| n.moved_seen);
-        let moved = (sp.succeeds().is_some() && (told || !confirm.is_empty())).then(|| {
-            let mut c = change_json(core, &me, &contacts, &named, id);
-            c["by"] = json!(name_of(&me, &contacts, &named, &sp.creator()));
-            c["at"] = json!(at);
-            c["seen"] = json!(seen);
-            c["device"] = json!(core.moved_by_device(id));
-            c
-        });
-        let lost_ids: Vec<String> = lost.iter().map(hex::encode).collect();
-        let lost: Vec<Json> = lost
+        let moved =
+            (sp.succeeds().is_some() && (told || !confirm.is_empty())).then(|| api::GroupChange {
+                by: Some(name_of(&me, &contacts, &named, &sp.creator())),
+                at,
+                seen,
+                device: core.moved_by_device(id),
+                ..change_of(core, &me, &contacts, &named, id)
+            });
+        let did_not_stand_changes = lost
             .iter()
-            .map(|l| {
-                let mut c = change_json(core, &me, &contacts, &named, l);
-                c["group"] = json!(hex::encode(l));
-                c
+            .map(|l| api::GroupChange {
+                group: Some(*l),
+                ..change_of(core, &me, &contacts, &named, l)
             })
             .collect();
-        let group = json!({
-            "ended": ended,
-            "moved": moved,
-            "confirm": confirm,
-            "to_confirm": to_confirm,
-            "did_not_stand": lost_ids,
-            "did_not_stand_changes": lost,
-            "held_back": core.held_back(id),
-            "not_posted": core.spaces.get(id).map_or(0, |h| h.notes().not_posted),
-            "was": sp.succeeds().map(hex::encode),
-            "group": hex::encode(id),
-            "name": name,
-            "members": how_many,
-            "public": sp.is_public(),
-            "reach": telling_json(core, id, &me),
-            "admin": may_manage(sp, &me),
-            "role": sp.role_of(&me).map(role_name),
-            "introductions": group::introductions(sp),
-            "for_call": group::for_call(sp),
-            "last_call": core.last_call(id),
-            "unread": unread,
-            "last": last.map(|m| json!({
-                "mine": m.author == me,
-                "from": name_of(&me, &contacts, &named, &m.author),
-                "text": m.text,
-                "time": m.time,
-            })),
-        });
+        let group = api::Group {
+            ended,
+            moved,
+            confirm: Some(confirm),
+            to_confirm: Some(to_confirm),
+            did_not_stand: lost,
+            did_not_stand_changes,
+            held_back: core.held_back(id) as u64,
+            not_posted: core.spaces.get(id).map_or(0, |h| h.notes().not_posted) as u64,
+            was: sp.succeeds(),
+            group: *id,
+            name,
+            members: how_many,
+            public: sp.is_public(),
+            reach: telling_of(core, id, &me),
+            admin: may_manage(sp, &me),
+            role: sp.role_of(&me).map(|r| role_name(r).into()),
+            introductions: group::introductions(sp),
+            for_call: Some(group::for_call(sp)),
+            last_call: core.last_call_typed(id),
+            unread,
+            last: last.map(|m| api::Last {
+                mine: m.author == me,
+                from: Some(name_of(&me, &contacts, &named, &m.author)),
+                text: m.text,
+                time: m.time,
+            }),
+        };
         groups.push((when, group));
     }
     groups.sort_by_key(|(when, _)| std::cmp::Reverse(*when));
-    let groups: Vec<Json> = groups.into_iter().map(|(_, g)| g).collect();
-    let rejoin = rejoinable_json(core, &me);
-    json!({"groups": groups, "offers": offered, "rejoin": rejoin})
+    out.groups = groups.into_iter().map(|(_, g)| g).collect();
+    out.rejoin = Some(rejoinable(core, &me));
+    out
 }
 
 /// Who is in a group, as this person sees them, and whoever was taken out
@@ -3619,4 +3648,174 @@ fn shown_as_contact_by_name(
         }
         None => v,
     }
+}
+
+/// `list` as main had it, by name.
+#[cfg(any(test, debug_assertions, feature = "by-name"))]
+#[allow(dead_code, clippy::all)]
+pub fn list_by_name(d: &Daemon) -> Json {
+    list_of_by_name(&d.core())
+}
+
+/// `list_of` as main had it, by name.
+#[cfg(any(test, debug_assertions, feature = "by-name"))]
+#[allow(dead_code, clippy::all)]
+pub fn list_of_by_name(core: &Core) -> Json {
+    let Some(me) = core.identity.as_ref().map(|i| i.id()) else {
+        return json!({"groups": [], "offers": []});
+    };
+    let declined = core.declined();
+    let contacts = core.contacts();
+    let mut groups: Vec<(Option<u64>, Json)> = Vec::new();
+    let mut offered: Vec<Json> = Vec::new();
+    for (id, h) in &core.spaces {
+        let Some(sp) = h.space.as_ref().filter(|s| s.profile() == group::GROUP) else {
+            continue;
+        };
+        // Another stands in its place, and is listed instead.
+        if sp.has_left(&me) || core.is_superseded(id) {
+            continue;
+        }
+        let members = group::members(sp);
+        let named = named_in(sp);
+        let in_it = members.iter().any(|m| m.identity == me);
+        // how many are in it: someone who has left is not
+        let how_many = members.iter().filter(|m| !m.left).count();
+        let name = group::name(sp);
+        if !core.is_joined(id) {
+            if in_it && !declined.contains(id) {
+                let from = sp.added_by(&me).unwrap_or(sp.creator());
+                offered.push(json!({
+                    "group": hex::encode(id),
+                    "name": name,
+                    "from": name_of(&me, &contacts, &members, &from),
+                    "members": how_many,
+                    "public": sp.is_public(),
+                    "reach": telling_json_by_name(core, id, &me),
+                    "for_call": group::for_call(sp),
+                    "last_call": core.last_call(id),
+                }));
+            }
+            continue;
+        }
+        if !in_it {
+            continue;
+        }
+        let said = relationship::messages(sp);
+        let read = core.read_here(id, &said);
+        let unread = said
+            .iter()
+            .zip(read)
+            .filter(|(m, read)| m.author != me && !read)
+            .count();
+        let last = said.last().cloned();
+        let when = last.as_ref().and_then(|m| m.time).map(|t| t.min(now_ms()));
+        let (ended, mut lost) = core.succession_news(id);
+        // what did not stand is noted in the space it would have succeeded
+        if let Some(o) = sp.succeeds() {
+            lost.extend(core.succession_news(&o).1);
+        }
+        // who moved it here, and what that changed, until it is cleared or
+        // a week has gone
+        let notes = core.spaces.get(id).map(|h| h.notes());
+        let at = sp.entry(id).and_then(|g| g.time());
+        // aged from when this device first held it, not by the mover's clock
+        let seen = notes.and_then(|n| n.first_seen_ms);
+        let fresh = seen.is_none_or(|t| now_ms().saturating_sub(t) < MOVED_FOR_MS);
+        // what another device of the person's moved, until they say OK
+        let to_confirm = to_confirm_json_by_name(core, &me, &contacts, &named, id);
+        let confirm: Vec<Json> = to_confirm.iter().map(|c| c["group"].clone()).collect();
+        let told = fresh && !notes.is_some_and(|n| n.moved_seen);
+        let moved = (sp.succeeds().is_some() && (told || !confirm.is_empty())).then(|| {
+            let mut c = change_json(core, &me, &contacts, &named, id);
+            c["by"] = json!(name_of(&me, &contacts, &named, &sp.creator()));
+            c["at"] = json!(at);
+            c["seen"] = json!(seen);
+            c["device"] = json!(core.moved_by_device(id));
+            c
+        });
+        let lost_ids: Vec<String> = lost.iter().map(hex::encode).collect();
+        let lost: Vec<Json> = lost
+            .iter()
+            .map(|l| {
+                let mut c = change_json(core, &me, &contacts, &named, l);
+                c["group"] = json!(hex::encode(l));
+                c
+            })
+            .collect();
+        let group = json!({
+            "ended": ended,
+            "moved": moved,
+            "confirm": confirm,
+            "to_confirm": to_confirm,
+            "did_not_stand": lost_ids,
+            "did_not_stand_changes": lost,
+            "held_back": core.held_back(id),
+            "not_posted": core.spaces.get(id).map_or(0, |h| h.notes().not_posted),
+            "was": sp.succeeds().map(hex::encode),
+            "group": hex::encode(id),
+            "name": name,
+            "members": how_many,
+            "public": sp.is_public(),
+            "reach": telling_json_by_name(core, id, &me),
+            "admin": may_manage(sp, &me),
+            "role": sp.role_of(&me).map(role_name),
+            "introductions": group::introductions(sp),
+            "for_call": group::for_call(sp),
+            "last_call": core.last_call(id),
+            "unread": unread,
+            "last": last.map(|m| json!({
+                "mine": m.author == me,
+                "from": name_of(&me, &contacts, &named, &m.author),
+                "text": m.text,
+                "time": m.time,
+            })),
+        });
+        groups.push((when, group));
+    }
+    groups.sort_by_key(|(when, _)| std::cmp::Reverse(*when));
+    let groups: Vec<Json> = groups.into_iter().map(|(_, g)| g).collect();
+    let rejoin = rejoinable_json_by_name(core, &me);
+    json!({"groups": groups, "offers": offered, "rejoin": rejoin})
+}
+
+/// `to_confirm_json` as main had it, by name.
+#[cfg(any(test, debug_assertions, feature = "by-name"))]
+#[allow(dead_code, clippy::all)]
+fn to_confirm_json_by_name(
+    core: &Core,
+    me: &[u8; 32],
+    contacts: &[ContactRecord],
+    named: &[Member],
+    id: &SpaceId,
+) -> Vec<Json> {
+    core.moves_to_confirm(id)
+        .iter()
+        .filter_map(|(old, new)| {
+            let new = *new;
+            let sp = core.spaces.get(&new)?.space.as_ref()?;
+            let mut c = change_json(core, me, contacts, named, &new);
+            c["group"] = json!(hex::encode(old));
+            c["to"] = json!(hex::encode(new));
+            c["by"] = json!(name_of(me, contacts, named, &sp.creator()));
+            c["at"] = json!(sp.entry(&new).and_then(|g| g.time()));
+            c["seen"] = json!(core.spaces.get(&new).and_then(|h| h.notes().first_seen_ms));
+            c["device"] = json!(core.moved_by_device(&new));
+            Some(c)
+        })
+        .collect()
+}
+
+/// `rejoinable_json` as main had it, by name.
+#[cfg(any(test, debug_assertions, feature = "by-name"))]
+#[allow(dead_code, clippy::all)]
+fn rejoinable_json_by_name(core: &Core, me: &[u8; 32]) -> Vec<Json> {
+    left_groups(core, me)
+        .into_iter()
+        .map(|g| {
+            let sp = core.spaces.get(&g.id).and_then(|h| h.space.as_ref());
+            let members = sp.map_or(0, |sp| sp.present().len());
+            json!({"group": hex::encode(g.id), "name": g.name, "members": members})
+        })
+        .collect()
 }

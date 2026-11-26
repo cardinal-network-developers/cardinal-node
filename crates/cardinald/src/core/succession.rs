@@ -465,6 +465,31 @@ impl Core {
         }))
     }
 
+    /// [`Core::last_call`], typed. Its ids were written here in hex, from
+    /// bytes; one that is not is left out, and logged.
+    pub fn last_call_typed(&self, space: &SpaceId) -> Option<crate::api::CallEnded> {
+        let noted = self.chain(space).into_iter();
+        let noted = noted.filter_map(|s| self.spaces.get(&s)?.notes.last_call.as_ref());
+        let c = noted.max_by_key(|c| c.at)?;
+        let id = hex::decode(&c.id).ok().and_then(|b| b.try_into().ok());
+        let who = hex::decode(&c.who).ok().and_then(|b| b.try_into().ok());
+        let (Some(id), Some(who)) = (id, who) else {
+            tracing::error!(
+                "the last call noted for {} has an id not in hex",
+                hex::encode(space)
+            );
+            return None;
+        };
+        Some(crate::api::CallEnded {
+            group: Some(*space),
+            how: c.how.clone().into(),
+            id,
+            name: c.name.clone(),
+            who,
+            at: c.at,
+        })
+    }
+
     /// The person cleared the note of how the group moved to `space`.
     pub fn moved_seen(&mut self, space: &SpaceId) {
         if let Some(h) = self.spaces.get_mut(space) {

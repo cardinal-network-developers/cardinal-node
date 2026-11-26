@@ -878,15 +878,50 @@ typed!(CALL_FRAMES "frames" CallFrames {
     1 r#in: u64,
     2 new: u64,
 });
-rec!(GROUP "group":
-    1 "admin" BOOL, 2 "did_not_stand" [B], 3 "did_not_stand_changes" [GROUP_CHANGE],
-    4 "ended" T, 5 "group" B, 6 "held_back" U, 7 "introductions" BOOL, 8 "last" {LAST},
-    9 "members" U, 10 "moved" {GROUP_CHANGE}, 11 "name" T, 12 "not_posted" U, 13 "public" BOOL,
-    14 "reach" {GROUP_REACH}, 15 "role" T, 16 "unread" U, 17 "was" B, 18 "confirm" [B],
-    19 "to_confirm" [GROUP_CHANGE], 20 "for_call" BOOL, 21 "last_call" {CALL_ENDED});
-rec!(GROUP_CHANGE "group change":
-    1 "at" U, 2 "by" T, 3 "group" B, 4 "roles" [ROLE_CHANGE], 5 "seen" U, 6 "taken_out" [T],
-    7 "device" T, 8 "to" B);
+typed!(
+    /// A group this person is in, as the list of them shows it.
+    GROUP "group" Group {
+        /// Whether this person may manage it.
+        1 admin: bool,
+        /// The successors that did not stand.
+        2 did_not_stand: Vec<[u8; 32]>,
+        3 did_not_stand_changes: Vec<GroupChange>,
+        /// Why it ended, where nothing stands in its place.
+        4 ended: Option<String>,
+        5 group: [u8; 32],
+        6 held_back: u64,
+        7 introductions: bool,
+        8 last: Option<Last>,
+        9 members: u64,
+        /// Who moved it here, and what that changed.
+        10 moved: Option<GroupChange>,
+        11 name: String,
+        12 not_posted: u64,
+        13 public: bool,
+        14 reach: GroupReach,
+        15 role: Option<Cow<'static, str>>,
+        16 unread: u64,
+        /// The group it succeeded.
+        17 was: Option<[u8; 32]>,
+        18 confirm: Option<Vec<[u8; 32]>>,
+        19 to_confirm: Option<Vec<GroupChange>>,
+        20 for_call: Option<bool>,
+        21 last_call: Option<CallEnded>,
+    }
+);
+typed!(
+    /// What a group's move changed: who was taken out, and whose role.
+    GROUP_CHANGE "group change" GroupChange {
+        1 at: Option<u64>,
+        2 by: Option<String>,
+        3 group: Option<[u8; 32]>,
+        4 roles: Vec<RoleChange>,
+        5 seen: Option<u64>,
+        6 taken_out: Vec<String>,
+        7 device: Option<String>,
+        8 to: Option<[u8; 32]>,
+    }
+);
 typed!(
     /// What this person's reach node says in a group, and to whom.
     GROUP_REACH "group reach" GroupReach {
@@ -1049,9 +1084,19 @@ typed!(
         7 routers: bool,
     }
 );
-rec!(OFFER "offer":
-    1 "from" T, 2 "group" B, 3 "members" U, 4 "name" T, 5 "public" BOOL, 6 "reach" {GROUP_REACH},
-    7 "for_call" BOOL, 8 "last_call" {CALL_ENDED});
+typed!(
+    /// A group offered to this person.
+    OFFER "offer" Offer {
+        1 from: String,
+        2 group: [u8; 32],
+        3 members: u64,
+        4 name: String,
+        5 public: bool,
+        6 reach: GroupReach,
+        7 for_call: Option<bool>,
+        8 last_call: Option<CallEnded>,
+    }
+);
 rec!(OLD "old versions":
     1 "at" U, 2 "bytes" U, 3 "keep" T, 4 "only_here" {ONLY_HERE}, 5 "unchecked" BOOL);
 rec!(ONLY_HERE "only here": 1 "bytes" U, 2 "files" U);
@@ -1088,8 +1133,22 @@ rec!(RECOVERY "recovery":
     5 "endorsed" U, 6 "endorsed_by_me" BOOL, 7 "fingerprint" T, 8 "id" B, 9 "in_effect" BOOL,
     10 "keeps_keys" BOOL, 11 "objected" BOOL, 12 "pending" BOOL);
 rec!(RELAYED_FOR "relayed for": 1 "a" T, 2 "a_id" B, 3 "b" T, 4 "b_id" B);
-rec!(REJOIN "rejoin": 1 "group" B, 2 "members" U, 3 "name" T);
-rec!(ROLE_CHANGE "role change": 1 "from" T, 2 "name" T, 3 "to" T);
+typed!(
+    /// A group this person left and can come back to.
+    REJOIN "rejoin" Rejoin {
+        1 group: [u8; 32],
+        2 members: u64,
+        3 name: String,
+    }
+);
+typed!(
+    /// A role a group's move changed.
+    ROLE_CHANGE "role change" RoleChange {
+        1 from: Cow<'static, str>,
+        2 name: String,
+        3 to: Cow<'static, str>,
+    }
+);
 rec!(REDIAL "redial": 1 "alone" BOOL, 2 "helps" BOOL, 3 "sparing" {SPARING});
 rec!(SPARING "sparing": 1 "next_s" U, 2 "wait_s" U);
 typed!(
@@ -1574,6 +1633,18 @@ asks!(MARK_READ: 40 "mark-read" MarkReadArgs -> MarkReadReply, writes);
 
 // ---- Groups ----
 
+typed!(fields GroupsArgs {
+    1 after: Option<u64>,
+    2 limit: Option<u64>,
+});
+typed!(fields GroupsReply {
+    2 groups: Vec<Group>,
+    3 offers: Vec<Offer>,
+    4 more: bool,
+    5 next: Option<u64>,
+    6 rejoin: Option<Vec<Rejoin>>,
+});
+asks!(GROUPS: 70 "groups" GroupsArgs -> GroupsReply, reads, after groups, offers, rejoin);
 typed!(fields GroupCreateArgs {
     1 name: Option<String>,
     2 people: Option<Vec<Reference>>,
@@ -2032,9 +2103,7 @@ pub static REQUESTS: &[Request] = &[
     req!(48 "introduction-accept" (1 "id" REF) -> (2 "name" T, 3 "recovery_of" B)),
     req!(49 "introduction-decline" (1 "id" REF) -> ()),
     // ---- Groups: 70 to 99 ----
-    paged!(after 70 "groups" (1 "after" U, 2 "limit" U) -> (
-        2 "groups" [GROUP], 3 "offers" [OFFER], 4 "more" BOOL, 5 "next" U,
-        6 "rejoin" [REJOIN])),
+    GROUPS,
     GROUP_CREATE,
     GROUP_JOIN,
     GROUP_DECLINE,

@@ -1753,8 +1753,7 @@ async fn offered(x: &Arc<Daemon>, twin: &Arc<Daemon>, name: &str) -> [u8; 32] {
     let g = crate::groups::create(x, name, &me, false, true).unwrap();
     until(&format!("the offer of {name}"), || {
         let list = crate::groups::list(twin);
-        let offers = list["offers"].as_array().cloned().unwrap_or_default();
-        offers.iter().any(|o| o["name"] == name)
+        list.offers.iter().any(|o| o.name == name)
             && twin
                 .core()
                 .spaces
@@ -1985,6 +1984,25 @@ async fn groups_are_changed_the_same() {
     );
     assert!(r.members.iter().any(|m| m.taken_out == Some(true)), "{r:?}");
 
+    // ---- groups: joined, offered and left, through its three lists ----
+    let groups = || {
+        let mut v = Vec::new();
+        for (after, limit) in [
+            (None, None),
+            (None, Some(1)),
+            (Some(1), Some(2)),
+            (Some(3), None),
+            (Some(4), Some(1)),
+            (Some(40), None),
+        ] {
+            v.push(json!({"cmd": "groups", "after": after, "limit": limit}));
+        }
+        v
+    };
+    for req in groups() {
+        t.same_here(req).await;
+    }
+
     // ---- group-leave and group-rejoin ----
     for req in [
         json!({"cmd": "group-leave"}),
@@ -2022,6 +2040,11 @@ async fn groups_are_changed_the_same() {
             .await,
     );
     assert_eq!(r.name, "Mine");
+    for req in groups() {
+        t.same_here(req).await;
+    }
+    let r = typed_of::<GroupsArgs>(&t.same_here(json!({"cmd": "groups"})).await);
+    assert!(!r.groups.is_empty() && r.rejoin.is_some(), "{r:?}");
     t.same_message(&message_of(
         74,
         vec![(1, Value::from("Mine")), (3, Value::from("yes"))],

@@ -389,7 +389,7 @@ pub mod typed {
         GroupAddArgs, GroupCreateArgs, GroupCreateReply, GroupDeclineArgs, GroupJoinArgs,
         GroupJoinReply, GroupLeaveArgs, GroupLeaveReply, GroupMemberArgs, GroupMembersArgs,
         GroupMembersReply, GroupReachArgs, GroupReachReply, GroupRejoinArgs, GroupRemoveArgs,
-        GroupRemoveReply, GroupRoleArgs, GroupRoleReply, GroupSetArgs,
+        GroupRemoveReply, GroupRoleArgs, GroupRoleReply, GroupSetArgs, GroupsArgs, GroupsReply,
     };
     use crate::daemon::Daemon;
     use crate::daemon::PairState;
@@ -939,6 +939,12 @@ pub mod typed {
     }
 
     // ---- Groups ----
+
+    impl Answer for GroupsArgs {
+        async fn answer(d: &Arc<Daemon>, _: &Self) -> anyhow::Result<GroupsReply> {
+            Ok(crate::groups::list(d))
+        }
+    }
 
     impl Answer for GroupCreateArgs {
         async fn answer(d: &Arc<Daemon>, a: &Self) -> anyhow::Result<GroupCreateReply> {
@@ -1667,7 +1673,8 @@ async fn handle(d: &Arc<Daemon>, req: &Value) -> anyhow::Result<Value> {
         "delete-message" if req.get("group").is_some() => {
             crate::groups::delete_message_by_name(d, arg(req, "group")?, arg(req, "id")?)
         }
-        "groups" => Ok(crate::groups::list(d)),
+        #[cfg(any(test, debug_assertions, feature = "by-name"))]
+        "groups" => Ok(crate::groups::list_by_name(d)),
         #[cfg(any(test, debug_assertions, feature = "by-name"))]
         "introductions" => Ok(crate::introductions::list_by_name(d)),
         "introduce" => {

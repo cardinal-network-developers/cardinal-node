@@ -4565,7 +4565,7 @@ mod tests {
         let (fake, genesis) =
             made(Profile::RELATIONSHIP, &[(a, WRITER), (b, WRITER)], &top).unwrap();
         bo.core.ingest_space(fake, &[genesis]).unwrap();
-        let listed = crate::groups::list_of(&bo.core);
+        let listed = crate::groups::list_of_by_name(&bo.core);
         assert_eq!(listed["offers"], serde_json::json!([]), "{listed}");
         assert_eq!(listed["groups"], serde_json::json!([]), "{listed}");
         assert_eq!(bo.core.contacts().len(), 2);
@@ -5628,7 +5628,7 @@ mod tests {
         // Nothing waits for him: what the list names is kept current,
         // and nothing asks him as if it were not yet shared.
         assert!(t.keeps_current() && !t.ask() && !t.sets_unasked());
-        let listed = crate::groups::list_of(&bo.core);
+        let listed = crate::groups::list_of_by_name(&bo.core);
         let reach = &listed["groups"][0]["reach"];
         assert_eq!(reach["added"], serde_json::json!(["Cy"]), "{listed}");
         assert_eq!(reach["shared"], true);
@@ -5735,7 +5735,7 @@ mod tests {
         assert_eq!(t.who, [cy.id()]);
         assert!(t.added().is_empty() && t.late.is_empty());
         assert!(t.keeps_current() && !t.ask() && !t.sets_unasked() && !t.empties_unasked());
-        let listed = crate::groups::list_of(&bo.core);
+        let listed = crate::groups::list_of_by_name(&bo.core);
         let of = |name: &str| {
             let all = listed["groups"].as_array().unwrap().iter();
             let mut found = all
@@ -5793,7 +5793,7 @@ mod tests {
         assert!(bo.began_an_epoch(&joined));
         assert!(!bo.space(&offered).accepted_by(&me));
         assert!(!bo.space(&declined).accepted_by(&me));
-        let listed = crate::groups::list_of(&bo.core);
+        let listed = crate::groups::list_of_by_name(&bo.core);
         let names = |k: &str| -> Vec<String> {
             let all = listed[k].as_array().cloned().unwrap_or_default();
             all.iter()
@@ -5883,7 +5883,7 @@ mod tests {
         assert_eq!(t.who, [cy.id()]);
         assert_eq!(t.added(), [cy.id()], "he is not told that Cy is back");
         assert!(t.keeps_current());
-        let listed = crate::groups::list_of(&bo.core);
+        let listed = crate::groups::list_of_by_name(&bo.core);
         assert_eq!(
             listed["groups"][0]["reach"]["added"],
             serde_json::json!(["Cy"])
@@ -5966,10 +5966,10 @@ mod tests {
         bo.core.add_to_group(&g, &cy_shown).unwrap();
         cy.takes(&g, &bo.all_of(&g));
         assert_eq!(cy.space(&g).creator(), ana.id());
-        let listed = crate::groups::list_of(&cy.core);
+        let listed = crate::groups::list_of_by_name(&cy.core);
         assert_eq!(listed["offers"][0]["from"], "Bo", "{listed}");
         // Whom the genesis names, its author added.
-        let listed = crate::groups::list_of(&bo.core);
+        let listed = crate::groups::list_of_by_name(&bo.core);
         assert_eq!(
             listed["groups"].as_array().map(Vec::len),
             Some(1),
@@ -6116,7 +6116,7 @@ mod tests {
         let mut ana = ana;
         ana.meets(&bo);
         bo.meets(&ana);
-        let offered = |bo: &Person| crate::groups::list_of(&bo.core)["offers"].clone();
+        let offered = |bo: &Person| crate::groups::list_of_by_name(&bo.core)["offers"].clone();
         for public in [false, true] {
             let policy = Policy {
                 public,
@@ -7519,7 +7519,7 @@ mod tests {
         assert!(!writer.said(&win).contains(&lost_text.to_owned()));
         assert_eq!(writer.core.held_back(&win), 1);
         // and the owner is told what the one that did not stand changed
-        let listed = crate::groups::list_of(&writer.core);
+        let listed = crate::groups::list_of_by_name(&writer.core);
         let lost = listed["groups"][0]["did_not_stand_changes"].clone();
         assert_eq!(
             lost[0]["taken_out"].as_array().unwrap().len(),
@@ -7800,7 +7800,8 @@ mod tests {
             .unwrap()
             .new;
         bo.syncs(&ana, &g, &store);
-        let moved = |p: &Person| crate::groups::list_of(&p.core)["groups"][0]["moved"].clone();
+        let moved =
+            |p: &Person| crate::groups::list_of_by_name(&p.core)["groups"][0]["moved"].clone();
         let now = moved(&bo);
         assert_eq!(now["taken_out"].as_array().unwrap().len(), 1, "{now}");
         assert!(now["seen"].as_u64().is_some());
@@ -7910,7 +7911,7 @@ mod tests {
             .new;
         bo.syncs(&ana, &g, &store);
         assert!(!bo.holds(&s), "a declined offer is not followed");
-        let listed = crate::groups::list_of(&bo.core);
+        let listed = crate::groups::list_of_by_name(&bo.core);
         assert_eq!(listed["offers"].as_array().unwrap().len(), 0, "{listed}");
         assert!(bo.core.is_declined(&g));
         // known by the account alone, as another device's node says
@@ -8179,7 +8180,7 @@ mod tests {
         assert_eq!(laptop.core.successions_to_confirm(&s), vec![g]);
         assert!(ana.core.successions_to_confirm(&s).is_empty());
         let listed = |p: &Person| {
-            let all = crate::groups::list_of(&p.core);
+            let all = crate::groups::list_of_by_name(&p.core);
             let mut one = all["groups"].as_array().unwrap().iter();
             let one = one.find(|x| x["group"] == hex::encode(s)).cloned();
             one.unwrap_or_else(|| panic!("{all}"))
@@ -8366,7 +8367,7 @@ mod tests {
         laptop.syncs(&ana, &g, &store);
         assert!(laptop.holds(&s));
         let listed = |p: &Person, id: &SpaceId| {
-            let all = crate::groups::list_of(&p.core);
+            let all = crate::groups::list_of_by_name(&p.core);
             let mut one = all["groups"].as_array().unwrap().iter();
             let one = one.find(|x| x["group"] == hex::encode(id)).cloned();
             one.unwrap_or_else(|| panic!("{all}"))
@@ -8438,7 +8439,7 @@ mod tests {
             .new;
         laptop.syncs(&ana, &g, &store);
         assert!(laptop.holds(&s1));
-        let all = crate::groups::list_of(&laptop.core);
+        let all = crate::groups::list_of_by_name(&laptop.core);
         let mut one = all["groups"].as_array().unwrap().iter();
         let shown = one.find(|x| x["group"] == hex::encode(s1)).unwrap()["to_confirm"].clone();
         assert_eq!(shown[0]["group"], hex::encode(g), "{shown}");
