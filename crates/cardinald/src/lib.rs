@@ -266,8 +266,17 @@ pub struct Overrides {
     pub name: Option<String>,
 }
 
-/// Runs the daemon until it is stopped.
-pub async fn run(paths: Paths, o: Overrides) -> anyhow::Result<()> {
+/// Runs the daemon until it is stopped. Through a pointer: polled where
+/// the runtime polls it, its body would be compiled once for each place.
+pub fn run(
+    paths: Paths,
+    o: Overrides,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<()>> + Send>> {
+    Box::pin(running(paths, o))
+}
+
+/// [`run`].
+async fn running(paths: Paths, o: Overrides) -> anyhow::Result<()> {
     // Tests: let a debugger attach to a daemon that hangs (Yama allows only
     // ancestors otherwise).
     #[cfg(target_os = "linux")]

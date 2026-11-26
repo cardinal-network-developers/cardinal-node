@@ -1384,7 +1384,11 @@ fn main() {
                 .enable_all()
                 .build()
                 .expect("runtime");
-            rt.block_on(client(cmd))
+            // through a pointer: polled where tokio polls it, the command
+            // line's every request was compiled once for each place
+            let client: std::pin::Pin<Box<dyn std::future::Future<Output = _>>> =
+                Box::pin(client(cmd));
+            rt.block_on(client)
         }
     };
     if let Err(e) = r {
