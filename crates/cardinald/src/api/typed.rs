@@ -16,10 +16,12 @@
 //! | `bool` | bool | always, 0 or 1 |
 //! | `u64` | uint | always (one at 2^60 or more is this build's mistake) |
 //! | `[u8; N]` | bytes | always; read back only at exactly N bytes |
+//! | `bytes::Bytes` | bytes | always, of any length; taken without a copy |
 //! | [`Reference`] | ref | text, or an id's bytes |
 //! | `Vec<T>` | a list of T | always, empty or not |
 //! | a typed record | its record | always |
 //! | `Option<T>` | as T | only when it is `Some` |
+//! | [`Gone<T>`] | a number no longer used, once T | never; passed over when read |
 //!
 //! A field that is not an `Option` is one this service always sends; read
 //! back, its absence is an error, as is a value of the wrong type. Fields a
@@ -240,6 +242,51 @@ impl<const N: usize> Wire for [u8; N] {
     }
 }
 
+impl Wire for bytes::Bytes {
+    const TY: Ty = Ty::Bytes;
+    #[inline]
+    fn encode_into(&self, out: &mut Vec<u8>) {
+        header(T_BYTES, self.len() as u64, out);
+        out.extend_from_slice(self);
+    }
+    #[inline]
+    fn encoded_len(&self) -> usize {
+        header_len(self.len() as u64) + self.len()
+    }
+    fn take(v: Value, at: &At) -> Result<Self, String> {
+        match v {
+            Value::Bytes(b) => Ok(b.into()),
+            _ => Err(wrong(at, "bytes")),
+        }
+    }
+}
+
+/// A field whose number is no longer used (`Ty::Gone`): it keeps its row
+/// in the tables, with the type it had, and is never sent; what comes
+/// under it is passed over, as fields a later version adds are.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Gone<T>(std::marker::PhantomData<T>);
+
+impl<T: Wire> Wire for Gone<T> {
+    const TY: Ty = Ty::Gone(&T::TY);
+    #[inline]
+    fn sent(&self) -> bool {
+        false
+    }
+    #[inline]
+    fn encode_into(&self, _: &mut Vec<u8>) {}
+    #[inline]
+    fn encoded_len(&self) -> usize {
+        0
+    }
+    fn take(_: Value, _: &At) -> Result<Self, String> {
+        Ok(Gone(std::marker::PhantomData))
+    }
+    fn absent(_: &At) -> Result<Self, String> {
+        Ok(Gone(std::marker::PhantomData))
+    }
+}
+
 impl<T: Wire> Wire for Option<T> {
     const TY: Ty = T::TY;
     const LIST: Ty = T::LIST;
@@ -380,6 +427,23 @@ pub trait Ask: Fields {
     }
 }
 
+/// A message of a stream, typed: an event of `watch` or a frame of
+/// `call-media` (`apps.md`, The local interface), whose key 0 says which.
+pub trait Streamed: Fields {
+    /// Its row in [`EVENTS`](super::EVENTS) or [`FRAMES`](super::FRAMES).
+    const KIND: &'static Request;
+
+    /// It as a message.
+    fn message(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(4 + self.fields_len_except(&[]));
+        header(T_RECORD, 1 + self.present_except(&[]), &mut out);
+        write_varint(0, &mut out);
+        Self::KIND.n.encode_into(&mut out);
+        self.encode_fields(&mut out);
+        out
+    }
+}
+
 /// A reply that says it was done, with `reply`'s fields: as a message.
 pub fn reply_message<R: Fields>(reply: &R) -> Vec<u8> {
     let mut out = Vec::with_capacity(4 + reply.fields_len_except(&[]));
@@ -437,15 +501,28 @@ pub fn read_reply<A: Ask>(msg: &[u8]) -> anyhow::Result<Result<A::Reply, Failed>
     Ok(Ok(reply))
 }
 
+/// A reply that did not do what was asked: its status, why, and what more
+/// an error says ([`ErrorMore`](super::table::ErrorMore)), as a message.
+pub fn error_message(status: u64, why: &str, more: &super::table::ErrorMore) -> Vec<u8> {
+    let mut out = Vec::with_capacity(8 + why.len() + more.fields_len_except(&[]));
+    header(T_RECORD, 2 + more.present_except(&[]), &mut out);
+    write_varint(0, &mut out);
+    status.encode_into(&mut out);
+    write_varint(WHY, &mut out);
+    header(T_TEXT, why.len() as u64, &mut out);
+    out.extend_from_slice(why.as_bytes());
+    more.encode_fields(&mut out);
+    out
+}
+
 /// An error that says which item of a paged answer was too large for a
 /// message on its own (`apps.md`, Errors).
 pub fn too_large_message(why: &str, at: u64, id: Option<&[u8]>) -> Vec<u8> {
-    Record::new()
-        .with(0, status::TOO_LARGE)
-        .with(WHY, why)
-        .with(2, at)
-        .with_opt(3, id.map(<[u8]>::to_vec))
-        .encode()
+    let more = super::table::ErrorMore {
+        at: Some(at),
+        id: id.map(bytes::Bytes::copy_from_slice),
+    };
+    error_message(status::TOO_LARGE, why, &more)
 }
 
 /// A paged answer cut to its page, or the item that cannot be given.

@@ -28,8 +28,10 @@ use cardinal_encoding::{Record, Value};
 use serde_json::{json, Map, Value as Json};
 
 pub use table::{
-    Attachment, Call, CallArgs, CallEnded, CallFrames, CallReply, File, FilesArgs, FilesReply,
-    GroupReach, Member, Message, MessagesArgs, MessagesReply, Place, Reaction, Voice,
+    AskedFrame, Attachment, AudioFrame, Call, CallArgs, CallEnded, CallFrames, CallMediaArgs,
+    CallReply, CameraFrame, Changed, Done, ErrorMore, File, FilesArgs, FilesReply, GroupReach,
+    KeyFrame, LevelFrame, Member, Message, MessagesArgs, MessagesReply, OtherFrame, Place,
+    Reaction, ViewportFrame, Voice, WatchArgs,
 };
 pub use table::{Field, Page, Rec, Request, Ty, ERROR_FIELDS, EVENTS, FRAMES, PROGRAM, REQUESTS};
 
@@ -68,28 +70,31 @@ pub mod status {
     }
 }
 
-/// What key 0 of a `call-media` frame says it is.
+/// What key 0 of a `call-media` frame says it is: the frames' rows, typed
+/// in [`table`].
 pub mod frame {
+    use super::table;
+
     /// Audio of the call, in the codec its client chose.
-    pub const AUDIO: u64 = 1;
+    pub const AUDIO: u64 = table::FRAME_AUDIO.n;
     /// A frame of another format the call took, named in key 2.
-    pub const OTHER: u64 = 2;
+    pub const OTHER: u64 = table::FRAME_OTHER.n;
     /// The shape of a window's viewport, width and height in keys 1 and 2
     /// (`basics/video.md`): from the window, its own; from the service, a
     /// receiver's, with key 3 in a group.
-    pub const VIEWPORT: u64 = 3;
+    pub const VIEWPORT: u64 = table::FRAME_VIEWPORT.n;
     /// From the window, in a group: the level, key 1, it asks of the sender
     /// in key 3 (`basics/video.md#groups`).
-    pub const LEVEL: u64 = 4;
+    pub const LEVEL: u64 = table::FRAME_LEVEL.n;
     /// To the window, in a group: whether small (key 1) and large (key 2)
     /// pictures of its own are asked for.
-    pub const ASKED: u64 = 5;
+    pub const ASKED: u64 = table::FRAME_ASKED.n;
     /// A key picture of the size in key 4: from the window, asked of the
     /// sender in key 3; to it, asked of its own.
-    pub const KEY: u64 = 6;
+    pub const KEY: u64 = table::FRAME_KEY.n;
     /// From the window: whether this person's camera is on, key 1
     /// (`basics/video.md#cameras`).
-    pub const CAMERA: u64 = 7;
+    pub const CAMERA: u64 = table::FRAME_CAMERA.n;
 }
 
 /// A reply's key 1 in an error: why, in words.
@@ -473,9 +478,9 @@ pub(crate) fn page_room(spec: &Request) -> usize {
     PAGE_ROOM + LIST_ROOM * lists
 }
 
-/// A paged answer that could not be given: the status, why, and the
-/// fields of [`ERROR_FIELDS`] that say which item, by name.
-pub type Unpaged = (u64, String, Json);
+/// A paged answer that could not be given: the status, why, and what
+/// says which item.
+pub type Unpaged = (u64, String, ErrorMore);
 
 /// Cuts a paged reply (`apps.md`, Pages) to the page the request asks
 /// for: at most `limit` items, and as many as fit in a message with the
@@ -546,9 +551,20 @@ pub fn page(spec: &Request, req: &Json, mut reply: Json) -> Result<Json, Unpaged
             Ty::Recs(r)
                 if field_by_name(r.fields, "id").is_some_and(|f| matches!(f.ty, Ty::Bytes)) =>
             {
-                x.get("id").filter(|v| v.is_string()).cloned()
+                x.get("id").and_then(Json::as_str)
             }
             _ => None,
+        };
+        // An id not in hex was left out with `at`, as the tables did.
+        let more = match id.map(hex::decode) {
+            Some(Err(_)) => {
+                tracing::error!("an error's fields: {}.id is not hex", lists[li].name);
+                ErrorMore::default()
+            }
+            id => ErrorMore {
+                at: Some(at as u64),
+                id: id.and_then(Result::ok).map(Into::into),
+            },
         };
         (
             status::TOO_LARGE,
@@ -557,7 +573,7 @@ pub fn page(spec: &Request, req: &Json, mut reply: Json) -> Result<Json, Unpaged
                  of the answer to {}",
                 lists[li].name, spec.name
             ),
-            json!({"at": at, "id": id}),
+            more,
         )
     };
     let mut used = 0usize;
@@ -666,9 +682,16 @@ pub fn error_reply(status: u64, why: &str) -> Vec<u8> {
     Record::new().with(0, status).with(WHY, why).encode()
 }
 
-/// An error reply that says more than why: the fields of
-/// [`ERROR_FIELDS`] in `more`, by name.
-pub fn error_reply_with(status: u64, why: &str, more: &Json) -> Vec<u8> {
+/// An error reply that says more than why, typed.
+pub fn error_reply_with(status: u64, why: &str, more: &ErrorMore) -> Vec<u8> {
+    typed::error_message(status, why, more)
+}
+
+/// [`error_reply_with`] as it was by name, taking the fields of
+/// [`ERROR_FIELDS`] as a tree: kept only to show the typed one sends the
+/// same bytes.
+#[cfg(test)]
+pub(crate) fn error_reply_with_by_name(status: u64, why: &str, more: &Json) -> Vec<u8> {
     let empty = Map::new();
     let o = more.as_object().unwrap_or(&empty);
     let mut r = record_to_wire(ERROR_FIELDS, o, "error").unwrap_or_else(|e| {
@@ -747,7 +770,7 @@ pub fn decode_stream(
 
 /// A `watch` event: something changed, and this is the count of changes.
 pub fn event_message(seq: u64) -> Vec<u8> {
-    encode_stream(EVENTS, "changed", &json!({"seq": seq})).expect("the table has it")
+    typed::Streamed::message(&Changed { seq })
 }
 
 /// A `watch` event off the wire: `{"event": "changed", "seq": n}`, or

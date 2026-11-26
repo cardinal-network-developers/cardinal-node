@@ -452,3 +452,130 @@ fn an_item_too_large_alone_is_named_the_same_way() {
         }
     }
 }
+
+/// The frames of `call-media`, the events of `watch` and an error's
+/// fields, typed, are the bytes the service built by hand (frames, by their
+/// numbers) or by name (events, errors) before; and the frames are those
+/// the tables give them by name.
+#[test]
+fn frames_events_and_errors_are_the_bytes_they_were() {
+    use super::typed::Streamed;
+    let voice = Some([9u8; 8]);
+    let bytes = bytes::Bytes::from_static(&[1, 2, 3, 250]);
+    for from in [None, voice] {
+        // as `calls.rs` wrote them by hand
+        let old = Record::new()
+            .with(0, frame::AUDIO)
+            .with(1, bytes.to_vec())
+            .with_opt(3, from.map(|v| v.to_vec()))
+            .encode();
+        let new = AudioFrame {
+            audio: bytes.clone(),
+            from,
+        }
+        .message();
+        assert_eq!(old, new);
+        let named = json!({"audio": hex::encode(&bytes), "from": from.map(hex::encode)});
+        assert_eq!(frame_message(&named).unwrap(), new);
+        for size in [None, Some(0u64), Some(3)] {
+            let old = Record::new()
+                .with(0, frame::OTHER)
+                .with(1, bytes.to_vec())
+                .with(2, [7u8; 32].to_vec())
+                .with_opt(3, from.map(|v| v.to_vec()))
+                .with_opt(4, size)
+                .encode();
+            let new = OtherFrame {
+                frame: bytes.clone(),
+                format: [7; 32],
+                from,
+                size,
+            }
+            .message();
+            assert_eq!(old, new);
+            let named = json!({"frame": hex::encode(&bytes), "format": hex::encode([7u8; 32]),
+                               "from": from.map(hex::encode), "size": size});
+            assert_eq!(frame_message(&named).unwrap(), new);
+        }
+        for (width, height) in [(0u64, 0u64), (640, 480), (65535, 1)] {
+            let old = Record::new()
+                .with(0, frame::VIEWPORT)
+                .with(1, width)
+                .with(2, height)
+                .with_opt(3, from.map(|v| v.to_vec()))
+                .encode();
+            let new = ViewportFrame {
+                width,
+                height,
+                from,
+            }
+            .message();
+            assert_eq!(old, new);
+        }
+    }
+    for (small, large) in [(false, false), (true, false), (false, true), (true, true)] {
+        let old = Record::new()
+            .with(0, frame::ASKED)
+            .with(1, small)
+            .with(2, large)
+            .encode();
+        assert_eq!(old, AskedFrame { small, large }.message());
+        let named = json!({"small": small, "large": large});
+        assert_eq!(frame_message(&named).unwrap(), old);
+    }
+    for size in [0u64, 1, 2, 255] {
+        let old = Record::new().with(0, frame::KEY).with(4, size).encode();
+        assert_eq!(old, KeyFrame { from: None, size }.message());
+    }
+    // what a window sends, as the service reads it
+    let level = LevelFrame {
+        level: 2,
+        from: voice,
+    }
+    .message();
+    assert_eq!(
+        level,
+        frame_message(&json!({"level": 2, "from": hex::encode([9u8; 8])})).unwrap()
+    );
+    for camera in [false, true] {
+        let msg = CameraFrame { camera }.message();
+        assert_eq!(msg, frame_message(&json!({"camera": camera})).unwrap());
+    }
+    // the rows are the frames' and events' declarations, in the tables
+    assert_eq!(FRAMES.len(), 7);
+    for (row, n) in FRAMES.iter().zip(1u64..) {
+        assert_eq!(row.n, n);
+    }
+
+    // ---- events ----
+    for seq in [0u64, 1, 127, 128, 1 << 40] {
+        let old = encode_stream(EVENTS, "changed", &json!({ "seq": seq })).unwrap();
+        assert_eq!(event_message(seq), old);
+        assert_eq!(old, Changed { seq }.message());
+    }
+
+    // ---- errors ----
+    let id = [7u8; 16];
+    for (why, at, id) in [
+        ("", None, None),
+        ("too large", Some(0u64), None),
+        ("too large", Some(3), Some(&id[..])),
+        ("an id alone", None, Some(&id[..8])),
+    ] {
+        for st in [status::FAILED, status::TOO_LARGE, status::NEEDS_WORDS] {
+            let tree = json!({"at": at, "id": id.map(hex::encode)});
+            let old = error_reply_with_by_name(st, why, &tree);
+            let more = ErrorMore {
+                at,
+                id: id.map(bytes::Bytes::copy_from_slice),
+            };
+            assert_eq!(old, error_reply_with(st, why, &more));
+            if more == ErrorMore::default() {
+                assert_eq!(old, error_reply(st, why));
+            }
+        }
+    }
+    // an id not in hex was left out, `at` with it
+    let old = error_reply_with_by_name(4, "w", &json!({"at": 1, "id": "not hex"}));
+    assert_eq!(old, error_reply(4, "w"));
+}

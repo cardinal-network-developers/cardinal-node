@@ -288,21 +288,8 @@ async fn connection(d: Arc<Daemon>, mut r: Reader, mut w: Writer) {
                 continue;
             }
         };
-        let decoded = api::decode_record(&msg).and_then(|(spec, r)| {
-            // a typed request is answered on its own way, with no names
-            if let Some(reply) = typed::answers(spec) {
-                return Ok(Err((spec, reply(&d, r))));
-            }
-            Ok(Ok((spec, api::by_name_from(spec, &r)?)))
-        });
-        let (spec, req) = match decoded {
-            Ok(Ok(x)) => x,
-            Ok(Err((spec, reply))) => {
-                if w.send(&checked(spec, reply)).await.is_err() {
-                    return;
-                }
-                continue;
-            }
+        let (spec, rec) = match api::decode_record(&msg) {
+            Ok(x) => x,
             Err(refused) => {
                 if w.send(&api::error_reply(refused.status, &refused.why))
                     .await
@@ -313,25 +300,65 @@ async fn connection(d: Arc<Daemon>, mut r: Reader, mut w: Writer) {
                 continue;
             }
         };
-        match spec.name {
-            "watch" => {
-                // A window watching: "on while open" is on while it does.
-                let window = req["window"].as_bool() == Some(true);
-                let _window = window.then(|| crate::bluetooth::window(&d));
-                if w.send(&api::encode_reply(spec, Ok(&json!({}))))
-                    .await
-                    .is_ok()
-                {
-                    watch(&d, r, w).await;
+        // the two requests after which a connection is a stream
+        if spec.n == api::WatchArgs::REQUEST.n {
+            let a = match api::WatchArgs::from_request(rec) {
+                Ok(a) => a,
+                Err(refused) => {
+                    if w.send(&api::error_reply(refused.status, &refused.why))
+                        .await
+                        .is_err()
+                    {
+                        return;
+                    }
+                    continue;
                 }
-                return;
+            };
+            // A window watching: "on while open" is on while it does.
+            let _window = (a.window == Some(true)).then(|| crate::bluetooth::window(&d));
+            if w.send(&api::typed::reply_message(&api::Done {}))
+                .await
+                .is_ok()
+            {
+                watch(&d, r, w).await;
             }
-            "call-media" => {
-                crate::calls::media(&d, spec, r, w).await;
-                return;
-            }
-            _ => {}
+            return;
         }
+        if spec.n == api::CallMediaArgs::REQUEST.n {
+            if let Err(refused) = api::CallMediaArgs::from_request(rec) {
+                if w.send(&api::error_reply(refused.status, &refused.why))
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
+                continue;
+            }
+            crate::calls::media(&d, r, w).await;
+            return;
+        }
+        // a typed request is answered on its own way, with no names
+        let rec = match typed::dispatch(&d, spec, rec).await {
+            Ok(reply) => {
+                if w.send(&checked(spec, reply)).await.is_err() {
+                    return;
+                }
+                continue;
+            }
+            Err(rec) => rec,
+        };
+        let req = match api::by_name_from(spec, &rec) {
+            Ok(req) => req,
+            Err(refused) => {
+                if w.send(&api::error_reply(refused.status, &refused.why))
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
+                continue;
+            }
+        };
         let reply = match handle(&d, &req)
             .await
             .map_err(|e| capitalized(spec.name, e))
@@ -481,6 +508,28 @@ pub mod typed {
     /// `call` as a message.
     pub fn call_reply(_: &CallArgs, reply: api::CallReply) -> Vec<u8> {
         reply_message(&reply)
+    }
+
+    /// The reply to `spec`'s request `r`, if it is typed; `r` back if it is
+    /// not.
+    pub async fn dispatch(d: &Arc<Daemon>, spec: &Request, r: Record) -> Result<Vec<u8>, Record> {
+        if let Some(answer) = answers(spec) {
+            return Ok(answer(d, r));
+        }
+        Err(r)
+    }
+
+    /// The reply to a typed request's message, or `None` for a request not
+    /// typed: as the service answers it, the requests that wait included.
+    pub async fn reply(d: &Arc<Daemon>, msg: &[u8]) -> Option<Vec<u8>> {
+        let (spec, r) = match api::decode_record(msg) {
+            Ok(x) => x,
+            Err(refused) => return Some(api::error_reply(refused.status, &refused.why)),
+        };
+        dispatch(d, spec, r)
+            .await
+            .ok()
+            .map(|reply| super::checked(spec, reply))
     }
 
     /// The reply to a typed request's message, or `None` for a request not

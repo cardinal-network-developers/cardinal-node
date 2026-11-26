@@ -3420,8 +3420,8 @@ async fn told_the_others(
 /// Audio and the call's other formats for and from a client, one frame per
 /// message (`apps.md#the-local-interface`), after a reply that there is a
 /// call to carry; until the client goes or the call does.
-pub async fn media(d: &Arc<Daemon>, spec: &crate::api::Request, r: Reader, w: Writer) {
-    carry_media(d, spec, r, w).await;
+pub async fn media(d: &Arc<Daemon>, r: Reader, w: Writer) {
+    carry_media(d, r, w).await;
     // The window's viewport goes with it, and what it asked for.
     let (group, camera) = lock(d).as_mut().map_or((None, false), |c| {
         c.viewport = None;
@@ -3442,7 +3442,8 @@ pub async fn media(d: &Arc<Daemon>, spec: &crate::api::Request, r: Reader, w: Wr
     }
 }
 
-async fn carry_media(d: &Arc<Daemon>, spec: &crate::api::Request, mut r: Reader, mut w: Writer) {
+async fn carry_media(d: &Arc<Daemon>, mut r: Reader, mut w: Writer) {
+    use crate::api::typed::{reply_message, Streamed};
     use cardinal_encoding::Record;
     let mut heard = d.call_audio.subscribe();
     let mut seen = d.call_video.subscribe();
@@ -3455,10 +3456,7 @@ async fn carry_media(d: &Arc<Daemon>, spec: &crate::api::Request, mut r: Reader,
         let _ = w.send(&no).await;
         return;
     };
-    if w.send(&crate::api::encode_reply(spec, Ok(&json!({}))))
-        .await
-        .is_err()
-    {
+    if w.send(&reply_message(&api::Done {})).await.is_err() {
         return;
     }
     if let Some(id) = group_call(d).filter(|id| *id == call) {
@@ -3481,12 +3479,9 @@ async fn carry_media(d: &Arc<Daemon>, spec: &crate::api::Request, mut r: Reader,
                 if of != call {
                     continue;
                 }
-                // `apps.md`, Calls' media: audio is frame 1, `from` key 3
-                let out = Record::new()
-                    .with(0, crate::api::frame::AUDIO)
-                    .with(1, frame.to_vec())
-                    .with_opt(3, voice.map(|v| v.to_vec()));
-                if w.send(&out.encode()).await.is_err() {
+                // `apps.md`, Calls' media
+                let out = api::AudioFrame { audio: frame, from: voice };
+                if w.send(&out.message()).await.is_err() {
                     return;
                 }
             }
@@ -3495,13 +3490,13 @@ async fn carry_media(d: &Arc<Daemon>, spec: &crate::api::Request, mut r: Reader,
                 if shown.call != call {
                     continue;
                 }
-                let out = Record::new()
-                    .with(0, crate::api::frame::OTHER)
-                    .with(1, shown.frame.to_vec())
-                    .with(2, shown.format.to_vec())
-                    .with_opt(3, shown.from.map(|v| v.to_vec()))
-                    .with_opt(4, shown.size.map(u64::from));
-                if w.send(&out.encode()).await.is_err() {
+                let out = api::OtherFrame {
+                    frame: shown.frame,
+                    format: shown.format,
+                    from: shown.from,
+                    size: shown.size.map(u64::from),
+                };
+                if w.send(&out.message()).await.is_err() {
                     return;
                 }
             }
@@ -3513,15 +3508,14 @@ async fn carry_media(d: &Arc<Daemon>, spec: &crate::api::Request, mut r: Reader,
                 // `basics/video.md#groups`: the sizes asked of this window,
                 // or a key picture of one
                 let out = match want {
-                    Want::Sizes { small, large } => Record::new()
-                        .with(0, crate::api::frame::ASKED)
-                        .with(1, small)
-                        .with(2, large),
-                    Want::Key(size) => Record::new()
-                        .with(0, crate::api::frame::KEY)
-                        .with(4, u64::from(size)),
+                    Want::Sizes { small, large } => api::AskedFrame { small, large }.message(),
+                    Want::Key(size) => api::KeyFrame {
+                        from: None,
+                        size: u64::from(size),
+                    }
+                    .message(),
                 };
-                if w.send(&out.encode()).await.is_err() {
+                if w.send(&out).await.is_err() {
                     return;
                 }
             }
@@ -3530,19 +3524,19 @@ async fn carry_media(d: &Arc<Daemon>, spec: &crate::api::Request, mut r: Reader,
                 if of != call {
                     continue;
                 }
-                let out = Record::new()
-                    .with(0, crate::api::frame::VIEWPORT)
-                    .with(1, u64::from(width))
-                    .with(2, u64::from(height))
-                    .with_opt(3, voice.map(|v| v.to_vec()));
-                if w.send(&out.encode()).await.is_err() {
+                let out = api::ViewportFrame {
+                    width: u64::from(width),
+                    height: u64::from(height),
+                    from: voice,
+                };
+                if w.send(&out.message()).await.is_err() {
                     return;
                 }
             }
             got = r.recv() => {
                 let Ok(Some(got)) = got else { return };
                 let crate::transport::Received::Message(msg) = got else { continue };
-                let Ok(rec) = Record::decode(&msg) else { continue };
+                let Ok(mut rec) = Record::decode(&msg) else { continue };
                 let kind = rec.get(0).and_then(cardinal_encoding::Value::as_uint);
                 if kind == Some(crate::api::frame::CAMERA) {
                     if let Some(on) = rec.get(1).and_then(cardinal_encoding::Value::as_bool) {
@@ -3583,18 +3577,20 @@ async fn carry_media(d: &Arc<Daemon>, spec: &crate::api::Request, mut r: Reader,
                     }
                     continue;
                 }
-                let Some(bytes) = rec.get(1).and_then(cardinal_encoding::Value::as_bytes) else {
+                let size = small_uint(4);
+                let format = rec
+                    .get(2)
+                    .and_then(cardinal_encoding::Value::as_bytes)
+                    .and_then(|f| <Format>::try_from(f).ok());
+                // the frame's bytes as they came, without a copy
+                let Some(cardinal_encoding::Value::Bytes(bytes)) = rec.remove(1) else {
                     continue;
                 };
                 match kind {
-                    Some(crate::api::frame::AUDIO) => send_audio(d, bytes.to_vec()),
+                    Some(crate::api::frame::AUDIO) => send_audio(d, bytes),
                     Some(crate::api::frame::OTHER) => {
-                        let format = rec
-                            .get(2)
-                            .and_then(cardinal_encoding::Value::as_bytes)
-                            .and_then(|f| <Format>::try_from(f).ok());
                         if let Some(format) = format {
-                            send_frame(d, format, bytes.to_vec(), small_uint(4));
+                            send_frame(d, format, bytes, size);
                         }
                     }
                     _ => {}

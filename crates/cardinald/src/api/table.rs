@@ -778,6 +778,21 @@ macro_rules! guarding_reply {
 
 // ---- Typed requests (`api::typed`) ----
 
+typed!(
+    fields
+    /// The reply of a request that says only that it was done.
+    Done {}
+);
+
+typed!(fields WatchArgs {
+    /// A window watching: while one does, Cardinal is open.
+    1 window: Option<bool>,
+});
+asks!(WATCH: 3 "watch" WatchArgs -> Done, Page::Whole);
+
+typed!(fields CallMediaArgs {});
+asks!(CALL_MEDIA: 104 "call-media" CallMediaArgs -> Done, Page::Whole);
+
 typed!(fields MessagesArgs {
     1 who: Option<Reference>,
     2 group: Option<Reference>,
@@ -830,7 +845,7 @@ pub static REQUESTS: &[Request] = &[
         28 "progress" {PROGRESS}, 29 "read_markers" BOOL, 30 "removed" BOOL, 31 "retention" T,
         32 "router" {ROUTER}, 33 "spaces" [SPACE], 34 "uptime_s" U, 35 "more" BOOL,
         36 "next" U, 37 "redial" {REDIAL}, 38 "always_on" [T])),
-    req!(3 "watch" (1 "window" BOOL) -> ()),
+    WATCH,
     req!(4 "stop" () -> ()),
     req!(5 "reload" () -> ()),
     req!(6 "conditions" (1 "plugged_in" BOOL, 2 "metered" BOOL) -> (
@@ -933,7 +948,7 @@ pub static REQUESTS: &[Request] = &[
     ) -> ()),
     req!(102 "call-answer" (1 "formats" [B], 2 "format_names" [T], 3 "reach" BOOL, 4 "join" BOOL) -> ()),
     req!(103 "call-end" () -> ()),
-    req!(104 "call-media" () -> ()),
+    CALL_MEDIA,
     req!(105 "clip-copy" (1 "text" T) -> (2 "devices" U)),
     req!(106 "clip" () -> (2 "from" T, 3 "here" BOOL, 4 "seconds" U, 5 "text" T)),
     // ---- The one folder: 120 to 149 ----
@@ -1120,25 +1135,139 @@ pub static PROGRAM: &[Request] = &[
     req!(2 "--clear" () -> ()),
 ];
 
-/// What an error's reply says besides why, in key 1, numbered as a reply's
-/// fields are (`apps.md`, Errors): of error 4 to a paged request, which item
-/// was too large for a message on its own, by its place in the answer as
-/// `after` counts (`at`), and by its `id` where it has one, so that a
-/// client can ask for what comes after it.
-pub static ERROR_FIELDS: &[Field] = &[f!(2 "at" U), f!(3 "id" B)];
+typed!(
+    fields
+    /// What an error's reply says besides why, in key 1, numbered as a
+    /// reply's fields are (`apps.md`, Errors): of error 4 to a paged
+    /// request, which item was too large for a message on its own, by its
+    /// place in the answer as `after` counts (`at`), and by its `id` where
+    /// it has one, so that a client can ask for what comes after it.
+    ErrorMore {
+        2 at: Option<u64>,
+        3 id: Option<bytes::Bytes>,
+    }
+);
+
+/// [`ErrorMore`]'s fields, as the tables give them.
+pub static ERROR_FIELDS: &[Field] = <ErrorMore as Fields>::FIELDS;
+
+/// A message of a stream, typed: its row, `ROW`, for [`EVENTS`] or
+/// [`FRAMES`], from its typed fields.
+macro_rules! streams {
+    ($row:ident: $n:literal $name:literal $fields:ident) => {
+        #[doc = concat!("The row of `", $name, "`, typed.")]
+        pub const $row: Request = Request {
+            n: $n,
+            name: $name,
+            args: <$fields as Fields>::FIELDS,
+            reply: &[],
+            page: Page::Whole,
+            gone: false,
+        };
+
+        impl super::typed::Streamed for $fields {
+            const KIND: &'static Request = &$row;
+        }
+    };
+}
+
+// ---- The events of `watch` ----
+
+typed!(
+    fields
+    /// Something changed, and this is the count of changes.
+    Changed {
+        1 seq: u64,
+    }
+);
+streams!(EVENT_CHANGED: 1 "changed" Changed);
 
 /// The events of a `watch` connection: key 0 says which.
-pub static EVENTS: &[Request] = &[req!(1 "changed" (1 "seq" U) -> ())];
+pub static EVENTS: &[Request] = &[EVENT_CHANGED];
+
+// ---- The frames of `call-media` ----
+
+typed!(
+    fields
+    /// Audio of the call, in the codec its client chose; from the service,
+    /// in a group, the voice it is.
+    AudioFrame {
+        1 audio: bytes::Bytes,
+        3 from: Option<[u8; 8]>,
+    }
+);
+streams!(FRAME_AUDIO: 1 "audio" AudioFrame);
+typed!(
+    fields
+    /// A frame of another format the call took.
+    OtherFrame {
+        1 frame: bytes::Bytes,
+        2 format: [u8; 32],
+        3 from: Option<[u8; 8]>,
+        4 size: Option<u64>,
+    }
+);
+streams!(FRAME_OTHER: 2 "frame" OtherFrame);
+typed!(
+    fields
+    /// The shape of a window's viewport (`basics/video.md`): from the
+    /// window, its own; from the service, a receiver's, `from` in a group.
+    ViewportFrame {
+        1 width: u64,
+        2 height: u64,
+        3 from: Option<[u8; 8]>,
+    }
+);
+streams!(FRAME_VIEWPORT: 3 "viewport" ViewportFrame);
+typed!(
+    fields
+    /// From the window, in a group: the level it asks of the sender `from`
+    /// (`basics/video.md#groups`).
+    LevelFrame {
+        1 level: u64,
+        3 from: Option<[u8; 8]>,
+    }
+);
+streams!(FRAME_LEVEL: 4 "level" LevelFrame);
+typed!(
+    fields
+    /// To the window, in a group: whether small and large pictures of its
+    /// own are asked for.
+    AskedFrame {
+        1 small: bool,
+        2 large: bool,
+    }
+);
+streams!(FRAME_ASKED: 5 "asked" AskedFrame);
+typed!(
+    fields
+    /// A key picture of the size `size`: from the window, asked of the
+    /// sender `from`; to it, asked of its own.
+    KeyFrame {
+        3 from: Option<[u8; 8]>,
+        4 size: u64,
+    }
+);
+streams!(FRAME_KEY: 6 "key" KeyFrame);
+typed!(
+    fields
+    /// From the window: whether this person's camera is on
+    /// (`basics/video.md#cameras`).
+    CameraFrame {
+        1 camera: bool,
+    }
+);
+streams!(FRAME_CAMERA: 7 "camera" CameraFrame);
 
 /// The frames of a `call-media` connection, both ways: key 0 says which.
 /// `from` is the voice a frame of a group call is, from the service, or
 /// the sender a window's level or key picture is asked of.
 pub static FRAMES: &[Request] = &[
-    req!(1 "audio" (1 "audio" B, 3 "from" B) -> ()),
-    req!(2 "frame" (1 "frame" B, 2 "format" B, 3 "from" B, 4 "size" U) -> ()),
-    req!(3 "viewport" (1 "width" U, 2 "height" U, 3 "from" B) -> ()),
-    req!(4 "level" (1 "level" U, 3 "from" B) -> ()),
-    req!(5 "asked" (1 "small" BOOL, 2 "large" BOOL) -> ()),
-    req!(6 "key" (3 "from" B, 4 "size" U) -> ()),
-    req!(7 "camera" (1 "camera" BOOL) -> ()),
+    FRAME_AUDIO,
+    FRAME_OTHER,
+    FRAME_VIEWPORT,
+    FRAME_LEVEL,
+    FRAME_ASKED,
+    FRAME_KEY,
+    FRAME_CAMERA,
 ];

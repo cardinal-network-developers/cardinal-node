@@ -413,7 +413,13 @@ fn an_item_too_large_is_named_so_that_it_can_be_paged_past() {
     let p = page(spec, &json!({"limit": 1}), peers.clone()).unwrap();
     assert_eq!(p["next"], 1);
     let (st, why, item) = page(spec, &json!({"after": 1}), peers.clone()).unwrap_err();
-    assert_eq!(item, json!({"at": 1, "id": null}));
+    assert_eq!(
+        item,
+        ErrorMore {
+            at: Some(1),
+            id: None
+        }
+    );
     let msg = error_reply_with(st, &why, &item);
     let r = Record::decode(&msg).unwrap();
     assert_eq!(r.uint(0).unwrap(), status::TOO_LARGE);
@@ -441,7 +447,13 @@ fn an_item_too_large_is_named_so_that_it_can_be_paged_past() {
         {"id": id, "text": "x".repeat(MAX_MESSAGE)},
     ]});
     let (st, why, item) = page(spec, &json!({}), said).unwrap_err();
-    assert_eq!(item, json!({"at": 1, "id": id}));
+    assert_eq!(
+        item,
+        ErrorMore {
+            at: Some(1),
+            id: Some([7u8; 16].to_vec().into())
+        }
+    );
     let r = Record::decode(&error_reply_with(st, &why, &item)).unwrap();
     assert_eq!(r.bytes(3).unwrap(), [7u8; 16]);
 }
