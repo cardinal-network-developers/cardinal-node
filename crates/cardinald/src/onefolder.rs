@@ -16,10 +16,12 @@ use cardinal_link::Priority;
 use cardinal_space::account::ContactRecord;
 use cardinal_space::files::{self, Content, FileKind, Files, Kinds};
 use cardinal_space::{group, relationship, NodeId, Space, SpaceId, SpaceOp, ROOT};
+#[cfg(any(test, feature = "by-name"))]
 use serde_json::{json, Value as Json};
 
 use crate::api::short_id;
 use crate::api::table::{self as api, File, FilesReply};
+use crate::api::PathReply;
 use crate::core::now_ms;
 use crate::daemon::Daemon;
 use crate::fetch::{blob_ref, Fetcher, Others};
@@ -716,18 +718,20 @@ fn write_creating(
 }
 
 /// Makes a folder.
-pub fn mkdir(d: &Arc<Daemon>, path: &str) -> anyhow::Result<Json> {
+pub fn mkdir(d: &Arc<Daemon>, path: &str) -> anyhow::Result<PathReply> {
     let (parent, name) = split_last(path)?;
     let at = folder(d, &parent)?;
     not_a_category(d, &at, &name)?;
     let op = kinds(d, &at.space)?.create_folder(at.node, &name);
     d.write_and_push(&at.space, vec![op])?;
-    Ok(json!({"path": path}))
+    Ok(PathReply {
+        path: path.to_string(),
+    })
 }
 
 /// Removes a file or a folder. Removing a copy of a file in conflict keeps
 /// the main version, which settles the conflict (`profiles.md#files`).
-pub fn remove(d: &Arc<Daemon>, path: &str) -> anyhow::Result<Json> {
+pub fn remove(d: &Arc<Daemon>, path: &str) -> anyhow::Result<PathReply> {
     let at = match resolve(d, path)? {
         Place::In(at) if at.is_relationship() => match at.shared.and_then(|s| s.group()) {
             Some(_) => anyhow::bail!("{path} is the group's, and goes only if you leave it"),
@@ -751,7 +755,9 @@ pub fn remove(d: &Arc<Daemon>, path: &str) -> anyhow::Result<Json> {
         None => SpaceOp::delete(at.node),
     };
     d.write_and_push(&at.space, vec![op])?;
-    Ok(json!({"path": path}))
+    Ok(PathReply {
+        path: path.to_string(),
+    })
 }
 
 /// Whether `node` is `ancestor` or inside it.
@@ -780,7 +786,7 @@ fn within(d: &Daemon, space: &SpaceId, node: NodeId, ancestor: NodeId) -> bool {
 /// Moves or renames. A relationship's folder moves only by renaming the
 /// contact or listing them under another category; between spaces, the
 /// content is copied and the original removed.
-pub async fn move_to(d: &Arc<Daemon>, from: &str, to: &str) -> anyhow::Result<Json> {
+pub async fn move_to(d: &Arc<Daemon>, from: &str, to: &str) -> anyhow::Result<PathReply> {
     let src = resolve(d, from)?;
     let (parent, name) = split_last(to)?;
     let dst = resolve(d, &parent)?;
@@ -804,7 +810,9 @@ pub async fn move_to(d: &Arc<Daemon>, from: &str, to: &str) -> anyhow::Result<Js
         }
         _ => anyhow::bail!("{from} cannot be moved there"),
     }
-    Ok(json!({"path": to}))
+    Ok(PathReply {
+        path: to.to_string(),
+    })
 }
 
 /// Renames a shared folder, or moves it to the category folder `category`:
@@ -1075,7 +1083,7 @@ async fn copy_into(d: &Arc<Daemon>, src: &At, dst: &At, name: &str) -> anyhow::R
 }
 
 /// Copies a file or folder into the folder `to`, keeping its name.
-pub async fn copy(d: &Arc<Daemon>, from: &str, to: &str) -> anyhow::Result<Json> {
+pub async fn copy(d: &Arc<Daemon>, from: &str, to: &str) -> anyhow::Result<PathReply> {
     let src = match resolve(d, from)? {
         Place::In(at) => at,
         Place::Category(_) => anyhow::bail!("{from} lists people, and is no folder to copy"),
@@ -1093,7 +1101,9 @@ pub async fn copy(d: &Arc<Daemon>, from: &str, to: &str) -> anyhow::Result<Json>
         );
     }
     copy_into(d, &src, &dst, &name).await?;
-    Ok(json!({"path": format!("{}/{name}", to.trim_end_matches('/'))}))
+    Ok(PathReply {
+        path: format!("{}/{name}", to.trim_end_matches('/')),
+    })
 }
 
 fn read_local(path: &Path, name: &str) -> anyhow::Result<LocalItem> {
@@ -1149,7 +1159,7 @@ enum LocalItem {
 }
 
 /// Copies a file or folder from this device's disk into the folder `to`.
-pub async fn put(d: &Arc<Daemon>, from: &str, to: &str) -> anyhow::Result<Json> {
+pub async fn put(d: &Arc<Daemon>, from: &str, to: &str) -> anyhow::Result<PathReply> {
     let path = PathBuf::from(from);
     let name = path
         .file_name()
@@ -1187,7 +1197,9 @@ pub async fn put(d: &Arc<Daemon>, from: &str, to: &str) -> anyhow::Result<Json> 
         }
         let item = items(local, &d, &secret)?;
         write_tree(&d, &dst.space, dst.node, vec![item], |c| Ok(c.clone()))?;
-        Ok(json!({"path": format!("{}/{name}", dst_path_hint(&dst))}))
+        Ok(PathReply {
+            path: format!("{}/{name}", dst_path_hint(&dst)),
+        })
     })
     .await?
 }
@@ -1199,7 +1211,7 @@ fn dst_path_hint(at: &At) -> String {
 /// Makes the file at `path` hold what `from` on this device's disk holds: a
 /// new version of it if it is there, and a new file if not. This is how an
 /// application that edited a copy saves it back.
-pub async fn write(d: &Arc<Daemon>, from: &str, path: &str) -> anyhow::Result<Json> {
+pub async fn write(d: &Arc<Daemon>, from: &str, path: &str) -> anyhow::Result<PathReply> {
     let (parent, name) = split_last(path)?;
     let dst = folder(d, &parent)?;
     let existing = {
@@ -1236,7 +1248,9 @@ pub async fn write(d: &Arc<Daemon>, from: &str, path: &str) -> anyhow::Result<Js
             d.write_and_push(&dst.space, vec![op])?;
         }
     }
-    Ok(json!({"path": path}))
+    Ok(PathReply {
+        path: path.to_string(),
+    })
 }
 
 /// Writes a file of the one folder to `to` on this device's disk, fetching
@@ -1247,7 +1261,7 @@ pub async fn save(
     path: &str,
     to: &str,
     version: Option<u64>,
-) -> anyhow::Result<Json> {
+) -> anyhow::Result<crate::api::SaveReply> {
     let at = match resolve(d, path)? {
         Place::In(at) if at.kind == FileKind::File => at,
         _ => anyhow::bail!("{path} is not a file; save one file at a time"),
@@ -1268,6 +1282,7 @@ pub async fn save(
             }
         }
     };
+    let shown = to.to_owned();
     let to = PathBuf::from(to);
     let (d, from, written) = (d.clone(), at.others(), to.clone());
     let size = tokio::task::spawn_blocking(move || -> anyhow::Result<u64> {
@@ -1284,7 +1299,7 @@ pub async fn save(
         })
     })
     .await??;
-    Ok(json!({"path": to, "size": size}))
+    Ok(crate::api::SaveReply { path: shown, size })
 }
 
 /// Puts files of the one folder in the folder shared with `who`, a contact
@@ -1299,7 +1314,7 @@ pub async fn share(
     group: Option<&str>,
     paths: &[String],
     text: Option<&str>,
-) -> anyhow::Result<Json> {
+) -> anyhow::Result<crate::api::ShareReply> {
     let space = match (who, group) {
         (Some(_), Some(_)) => anyhow::bail!("share with a contact or a group, not both"),
         (None, None) => anyhow::bail!("name whom to share with: a contact or a group"),
@@ -1346,7 +1361,10 @@ pub async fn share(
             let name = parts(p).last().map(|n| n.to_string()).unwrap_or_default();
             copy_into(d, at, &dst, &name).await?;
         }
-        return Ok(json!({"path": shown.path(), "message": false}));
+        return Ok(crate::api::ShareReply {
+            path: shown.path(),
+            message: false,
+        });
     };
     // The files of a message are blobs, whatever their size.
     let secret = secret(d, &space)?;
@@ -1394,5 +1412,8 @@ pub async fn share(
     )];
     ops.extend(relationship::shared_files(&attachments, Some(now_ms())));
     d.write_and_push(&space, ops)?;
-    Ok(json!({"path": shown.path(), "message": true}))
+    Ok(crate::api::ShareReply {
+        path: shown.path(),
+        message: true,
+    })
 }

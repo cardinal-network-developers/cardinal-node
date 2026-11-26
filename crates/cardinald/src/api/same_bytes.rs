@@ -103,7 +103,6 @@ impl Twins {
     }
 
     /// `old` and `new` are the same, made apart.
-    #[allow(dead_code)]
     fn alike(&mut self, old: &[u8], new: &[u8]) {
         assert_eq!(old.len(), new.len());
         self.swap.push((old.to_vec(), new.to_vec()));
@@ -898,4 +897,153 @@ fn a_shown_code_is_what_its_tree_was() {
             encode_reply(PairShowArgs::REQUEST, Ok(&tree))
         );
     }
+}
+
+/// The one folder's requests that are not listings.
+#[tokio::test]
+async fn the_one_folder_is_changed_the_same() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut t = Twins::start(dir.path()).await;
+    let local = dir.path().join("local.txt");
+    std::fs::write(&local, b"some bytes").unwrap();
+    let local = local.to_str().unwrap().to_owned();
+
+    // ---- mkdir, write, move, copy, put, remove ----
+    for req in [
+        json!({"cmd": "mkdir"}),
+        json!({"cmd": "mkdir", "path": "Docs"}),
+        json!({"cmd": "mkdir", "path": "Docs"}),
+        json!({"cmd": "mkdir", "path": "Docs/inner/"}),
+        json!({"cmd": "mkdir", "path": ""}),
+        json!({"cmd": "mkdir", "path": "Nowhere/x"}),
+        json!({"cmd": "write"}),
+        json!({"cmd": "write", "from": local}),
+        json!({"cmd": "write", "path": "Docs/a.txt"}),
+        json!({"cmd": "write", "from": "/no/such/file", "path": "Docs/a.txt"}),
+        json!({"cmd": "write", "from": local, "path": "Docs/a.txt"}),
+        json!({"cmd": "write", "from": local, "path": "Docs/a.txt"}),
+        json!({"cmd": "write", "from": local, "path": "Docs"}),
+        json!({"cmd": "move", "from": "Docs/a.txt"}),
+        json!({"cmd": "move", "to": "Docs/b.txt"}),
+        json!({"cmd": "move", "from": "Docs/none.txt", "to": "Docs/b.txt"}),
+        json!({"cmd": "move", "from": "Docs/a.txt", "to": "Docs/b.txt"}),
+        json!({"cmd": "copy", "from": "Docs/b.txt", "to": "Docs/inner"}),
+        json!({"cmd": "copy", "from": "Docs/b.txt", "to": "Docs/inner/"}),
+        json!({"cmd": "copy", "from": "Docs/none.txt", "to": "Docs"}),
+        json!({"cmd": "copy", "from": "Docs/b.txt"}),
+        json!({"cmd": "put", "from": local, "to": "Docs"}),
+        json!({"cmd": "put", "from": local, "to": ""}),
+        json!({"cmd": "put", "from": "/no/such/file", "to": "Docs"}),
+        json!({"cmd": "put", "to": "Docs"}),
+        json!({"cmd": "remove"}),
+        json!({"cmd": "remove", "path": "Docs/none.txt"}),
+        json!({"cmd": "remove", "path": "local.txt"}),
+    ] {
+        t.same(req).await;
+    }
+    let r = typed_of::<CopyArgs>(
+        &t.same(json!({"cmd": "copy", "from": "Docs/b.txt", "to": "Docs"}))
+            .await,
+    );
+    assert_eq!(r.path, "Docs/b.txt");
+    let wrong = Record::new()
+        .with(0, 122u64)
+        .with(1, "a")
+        .with(2, 3u64)
+        .encode();
+    t.same_message(&wrong).await;
+
+    // ---- save: each twin to a file of its own ----
+    let out = |who: &str, n: u8| dir.path().join(format!("{who}-out-{n}.txt"));
+    for (n, path, version) in [
+        (1u8, "Docs/b.txt", None),
+        (2, "Docs/b.txt", Some(1u64)),
+        (3, "Docs/b.txt", Some(99)),
+        (4, "Docs", None),
+        (5, "Docs/none.txt", None),
+        (1, "Docs/b.txt", None),
+    ] {
+        let (o, n) = (out("old", n), out("new", n));
+        t.alike(
+            o.to_str().unwrap().as_bytes(),
+            n.to_str().unwrap().as_bytes(),
+        );
+        let req = |to: &std::path::Path| json!({"cmd": "save", "path": path, "to": to.to_str().unwrap(), "version": version});
+        t.same_as(req(&o), req(&n)).await;
+    }
+    assert_eq!(std::fs::read(out("new", 1)).unwrap(), b"some bytes");
+    t.same(json!({"cmd": "save", "path": "Docs/b.txt"})).await;
+    t.same(json!({"cmd": "save", "to": "/tmp/x"})).await;
+
+    // ---- restore ----
+    for req in [
+        json!({"cmd": "restore"}),
+        json!({"cmd": "restore", "path": "Docs/b.txt"}),
+        json!({"cmd": "restore", "path": "Docs/b.txt", "version": 99}),
+        json!({"cmd": "restore", "path": "Docs", "version": 1}),
+        json!({"cmd": "restore", "path": "Docs/b.txt", "version": 1}),
+    ] {
+        t.same(req).await;
+    }
+
+    // ---- share, with a group made on each twin ----
+    let made = |d: &Arc<Daemon>| {
+        let g = crate::groups::create(d, "Kin", &[], false, true).unwrap();
+        hex::decode(g["group"].as_str().unwrap()).unwrap()
+    };
+    let (go, gn) = (made(&t.old), made(&t.new));
+    t.alike(&go, &gn);
+    for req in [
+        json!({"cmd": "share"}),
+        json!({"cmd": "share", "paths": ["Docs/b.txt"]}),
+        json!({"cmd": "share", "who": "Nobody", "paths": ["Docs/b.txt"]}),
+        json!({"cmd": "share", "who": "Kin", "group": "Kin", "paths": ["Docs/b.txt"]}),
+        json!({"cmd": "share", "group": "Kin"}),
+        json!({"cmd": "share", "group": "Kin", "paths": ["Docs/none.txt"]}),
+        json!({"cmd": "share", "group": "Kin", "paths": [""]}),
+        json!({"cmd": "share", "who": "Kin", "paths": ["Docs/b.txt"]}),
+        json!({"cmd": "share", "group": "Kin", "paths": ["Docs/inner"], "text": "  "}),
+        json!({"cmd": "share", "group": "Nobody", "paths": ["Docs/b.txt"]}),
+    ] {
+        t.same(req).await;
+    }
+    let by_id = |g: &[u8]| {
+        json!({"cmd": "share", "group": format!("{EXACT}{}", hex::encode(g)),
+               "paths": ["Docs/b.txt"], "text": "for you"})
+    };
+    let r = typed_of::<ShareArgs>(&t.same_as(by_id(&go), by_id(&gn)).await);
+    assert_eq!((r.path.as_str(), r.message), ("Groups/Kin", true));
+    let by_id = |g: &[u8]| {
+        json!({"cmd": "share", "who": format!("{EXACT}{}", hex::encode(&g[..8])),
+               "paths": ["Docs/b.txt"]})
+    };
+    t.same_as(by_id(&go), by_id(&gn)).await;
+    t.same(json!({"cmd": "share", "who": format!("{EXACT}0011"), "paths": ["Docs/b.txt"]}))
+        .await;
+
+    // ---- mount (refused only: a test mounts nothing), unmount, flush ----
+    let wrong = Record::new().with(0, 129u64).with(1, true).encode();
+    t.same_message(&wrong).await;
+    t.same(json!({"cmd": "unmount"})).await;
+    let r = typed_of::<FlushArgs>(&t.same(json!({"cmd": "flush"})).await);
+    assert_eq!(r.entries, 0);
+
+    // ---- pin, unpin, retention ----
+    for req in [
+        json!({"cmd": "pin"}),
+        json!({"cmd": "pin", "path": "/Docs/"}),
+        json!({"cmd": "pin", "path": "Docs/b.txt"}),
+        json!({"cmd": "unpin", "path": "Docs/none.txt"}),
+        json!({"cmd": "retention"}),
+        json!({"cmd": "retention", "mode": "some"}),
+        json!({"cmd": "retention", "mode": "on-demand"}),
+        json!({"cmd": "pin", "path": "Docs/inner"}),
+        json!({"cmd": "unpin", "path": "/Docs"}),
+        json!({"cmd": "unpin"}),
+        json!({"cmd": "retention", "mode": "full"}),
+    ] {
+        t.same(req).await;
+    }
+    let r = typed_of::<PinArgs>(&t.same(json!({"cmd": "pin", "path": "Docs"})).await);
+    assert_eq!((r.path.as_str(), r.on_demand), ("Docs", false));
 }

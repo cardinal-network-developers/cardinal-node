@@ -353,6 +353,19 @@ impl Reference {
     }
 }
 
+impl Reference {
+    /// The ref as the handlers not yet given [`super::Ref`] hold it: text
+    /// as it was typed, an id given as bytes as [`super::EXACT`] then its
+    /// hex. Only for those handlers, whose words (an error naming the ref
+    /// as it came) are kept as they were.
+    pub fn held(&self) -> Cow<'_, str> {
+        match self {
+            Reference::Typed(t) => Cow::Borrowed(t),
+            Reference::Id(b) => Cow::Owned(format!("{}{}", super::EXACT, hex::encode(b))),
+        }
+    }
+}
+
 impl Wire for Reference {
     const TY: Ty = Ty::Ref;
     fn encode_into(&self, out: &mut Vec<u8>) {

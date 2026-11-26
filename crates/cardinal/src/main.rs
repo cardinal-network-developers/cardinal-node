@@ -3596,34 +3596,37 @@ async fn client(cmd: Cmd) -> anyhow::Result<()> {
             if items.is_empty() {
                 anyhow::bail!("name something to share");
             }
-            let req = json!({
-                "cmd": "share", "who": who, "group": group, "paths": items, "text": message,
-            });
-            let v = call(&paths, req).await?;
+            let args = api::ShareArgs {
+                who: who.map(api::typed::Reference::Typed),
+                group: group.map(api::typed::Reference::Typed),
+                paths: Some(items),
+                text: message,
+            };
+            let v = ask(&paths, args).await?;
             println!(
                 "In {}{}.",
-                v["path"].as_str().unwrap_or(""),
-                if v["message"] == true {
-                    ", with your message"
-                } else {
-                    ""
-                }
+                v.path,
+                if v.message { ", with your message" } else { "" }
             );
             Ok(())
         }
         Cmd::Put { from, to } => {
             let from = std::path::absolute(from)?;
-            let req = json!({"cmd": "put", "from": from, "to": to.unwrap_or_default()});
-            call(&paths, req).await?;
+            let args = api::PutArgs {
+                from: Some(from.to_string_lossy().into_owned()),
+                to: Some(to.unwrap_or_default()),
+            };
+            ask(&paths, args).await?;
             Ok(())
         }
         Cmd::Get { path, to, version } => {
             let to = std::path::absolute(to)?;
-            let mut req = json!({"cmd": "save", "path": path, "to": to});
-            if let Some(n) = version {
-                req["version"] = json!(n);
-            }
-            call(&paths, req).await?;
+            let args = api::SaveArgs {
+                path: Some(path),
+                to: Some(to.to_string_lossy().into_owned()),
+                version,
+            };
+            ask(&paths, args).await?;
             Ok(())
         }
         Cmd::Say { who, text, attach } => {
@@ -4367,12 +4370,13 @@ async fn client(cmd: Cmd) -> anyhow::Result<()> {
                     std::env::current_dir().unwrap_or_default().join(p)
                 }
             });
-            let v = call(&paths, json!({"cmd": "mount", "path": path})).await?;
-            println!("Your files are in {}.", v["path"].as_str().unwrap_or(""));
+            let path = path.map(|p| p.to_string_lossy().into_owned());
+            let v = ask(&paths, api::MountArgs { path }).await?;
+            println!("Your files are in {}.", v.path);
             Ok(())
         }
         Cmd::Unmount => {
-            call(&paths, json!({"cmd": "unmount"})).await?;
+            ask(&paths, api::UnmountArgs {}).await?;
             println!(
                 "Unmounted, and the daemon will not mount again (saved as `mount = \"\"` in \
                  config.toml). Your files still sync; `cardinal mount` shows them again."
@@ -4532,11 +4536,11 @@ async fn client(cmd: Cmd) -> anyhow::Result<()> {
         Cmd::Restore { path, version } => {
             let m = mount_path(&paths).await;
             let p = space_path(&path, m.as_deref());
-            call(
-                &paths,
-                json!({"cmd": "restore", "path": p, "version": version}),
-            )
-            .await?;
+            let args = api::RestoreArgs {
+                path: Some(p.clone()),
+                version: Some(version),
+            };
+            ask(&paths, args).await?;
             println!("Restored version {version} of {p}.");
             Ok(())
         }
@@ -4570,8 +4574,14 @@ async fn client(cmd: Cmd) -> anyhow::Result<()> {
         Cmd::Pin { path } => {
             let m = mount_path(&paths).await;
             let p = space_path(&path, m.as_deref());
-            let v = call(&paths, json!({"cmd": "pin", "path": p})).await?;
-            if v["on_demand"].as_bool() == Some(true) {
+            let v = ask(
+                &paths,
+                api::PinArgs {
+                    path: Some(p.clone()),
+                },
+            )
+            .await?;
+            if v.on_demand {
                 println!("{p} will be kept on this device.");
             } else {
                 println!(
@@ -4584,12 +4594,21 @@ async fn client(cmd: Cmd) -> anyhow::Result<()> {
         Cmd::Unpin { path } => {
             let m = mount_path(&paths).await;
             let p = space_path(&path, m.as_deref());
-            call(&paths, json!({"cmd": "unpin", "path": p})).await?;
+            ask(
+                &paths,
+                api::UnpinArgs {
+                    path: Some(p.clone()),
+                },
+            )
+            .await?;
             println!("Unpinned {p}.");
             Ok(())
         }
         Cmd::Retention { mode } => {
-            call(&paths, json!({"cmd": "retention", "mode": mode})).await?;
+            let args = api::RetentionArgs {
+                mode: Some(mode.to_string()),
+            };
+            ask(&paths, args).await?;
             println!("Retention is now {mode}.");
             Ok(())
         }
@@ -4609,8 +4628,8 @@ async fn client(cmd: Cmd) -> anyhow::Result<()> {
         }
         Cmd::ApiTrace { listen } => api_trace(&paths, &listen).await,
         Cmd::Flush => {
-            let v = call(&paths, json!({"cmd": "flush"})).await?;
-            println!("Saved ({} entries).", v["entries"]);
+            let v = ask(&paths, api::FlushArgs {}).await?;
+            println!("Saved ({} entries).", v.entries);
             Ok(())
         }
         Cmd::Store => {

@@ -149,7 +149,11 @@ async fn flush_mount(d: &Arc<Daemon>) -> anyhow::Result<()> {
 }
 
 /// Brings back an earlier version of a file: a `set` of the old value.
-pub async fn restore(d: &Arc<Daemon>, path: &str, version: u64) -> anyhow::Result<Json> {
+pub async fn restore(
+    d: &Arc<Daemon>,
+    path: &str,
+    version: u64,
+) -> anyhow::Result<crate::api::RestoreReply> {
     flush_mount(d).await?;
     let at = in_space(d, path)?;
     anyhow::ensure!(at.kind == FileKind::File, "{path} is not a file");
@@ -171,7 +175,10 @@ pub async fn restore(d: &Arc<Daemon>, path: &str, version: u64) -> anyhow::Resul
         }
     }
     d.write_and_push(&at.space, vec![files::set_content(at.node, &content)])?;
-    Ok(json!({"path": path, "version": version}))
+    Ok(crate::api::RestoreReply {
+        path: path.to_owned(),
+        version,
+    })
 }
 
 /// The deleted children of a folder of the one folder, by name: files,

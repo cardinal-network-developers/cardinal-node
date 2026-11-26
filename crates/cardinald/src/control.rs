@@ -276,6 +276,21 @@ macro_rules! whole_pages {
 }
 
 whole_pages!(
+    api::MkdirArgs,
+    api::MoveArgs,
+    api::RemoveArgs,
+    api::CopyArgs,
+    api::PutArgs,
+    api::SaveArgs,
+    api::WriteArgs,
+    api::ShareArgs,
+    api::MountArgs,
+    api::UnmountArgs,
+    api::FlushArgs,
+    api::RestoreArgs,
+    api::PinArgs,
+    api::UnpinArgs,
+    api::RetentionArgs,
     api::PairShowArgs,
     api::PairStatusArgs,
     api::PairTypeArgs,
@@ -461,6 +476,7 @@ pub mod typed {
 
     use cardinal_encoding::Record;
 
+    use crate::api::typed::Reference;
     use crate::api::typed::{page_after, page_before, reply_message, Ask, Fields, Unpaged};
     use crate::api::{self, CallArgs, FilesArgs, FilesReply, MessagesArgs, MessagesReply, Request};
     use crate::api::{
@@ -468,6 +484,11 @@ pub mod typed {
         ConditionsReply, DeviceRenameArgs, DeviceRenameReply, MeArgs, MeReply, NetworkChangedArgs,
         PairShowArgs, PairShowReply, PairStatusArgs, PairStatusReply, PairTypeArgs, PairTypeReply,
         WakeArgs,
+    };
+    use crate::api::{
+        CopyArgs, Done, FlushArgs, FlushReply, MkdirArgs, MountArgs, MoveArgs, PathReply, PinArgs,
+        PinReply, PutArgs, RemoveArgs, RestoreArgs, RestoreReply, RetentionArgs, RetentionReply,
+        SaveArgs, SaveReply, ShareArgs, ShareReply, UnmountArgs, UnpinArgs, WriteArgs,
     };
     use crate::daemon::Daemon;
     use crate::daemon::PairState;
@@ -596,6 +617,21 @@ pub mod typed {
             WakeArgs => wake,
             ClipCopyArgs => clip_copy,
             ClipArgs => clip,
+            MkdirArgs => mkdir,
+            MoveArgs => move_to,
+            RemoveArgs => remove,
+            CopyArgs => copy,
+            PutArgs => put,
+            SaveArgs => save,
+            WriteArgs => write,
+            ShareArgs => share,
+            MountArgs => mount,
+            UnmountArgs => unmount,
+            FlushArgs => flush,
+            RestoreArgs => restore,
+            PinArgs => pin,
+            UnpinArgs => unpin,
+            RetentionArgs => retention,
         }
         Err(r)
     }
@@ -738,6 +774,104 @@ pub mod typed {
 
     async fn clip(d: &Arc<Daemon>, _: ClipArgs) -> anyhow::Result<ClipReply> {
         Ok(crate::clipboard::paste(d))
+    }
+
+    // ---- The one folder ----
+
+    async fn mkdir(d: &Arc<Daemon>, a: MkdirArgs) -> anyhow::Result<PathReply> {
+        crate::onefolder::mkdir(d, needed(a.path.as_deref(), "path")?)
+    }
+
+    async fn move_to(d: &Arc<Daemon>, a: MoveArgs) -> anyhow::Result<PathReply> {
+        let (from, to) = (
+            needed(a.from.as_deref(), "from")?,
+            needed(a.to.as_deref(), "to")?,
+        );
+        crate::onefolder::move_to(d, from, to).await
+    }
+
+    async fn remove(d: &Arc<Daemon>, a: RemoveArgs) -> anyhow::Result<PathReply> {
+        crate::onefolder::remove(d, needed(a.path.as_deref(), "path")?)
+    }
+
+    async fn copy(d: &Arc<Daemon>, a: CopyArgs) -> anyhow::Result<PathReply> {
+        let (from, to) = (
+            needed(a.from.as_deref(), "from")?,
+            needed(a.to.as_deref(), "to")?,
+        );
+        crate::onefolder::copy(d, from, to).await
+    }
+
+    async fn put(d: &Arc<Daemon>, a: PutArgs) -> anyhow::Result<PathReply> {
+        let (from, to) = (
+            needed(a.from.as_deref(), "from")?,
+            needed(a.to.as_deref(), "to")?,
+        );
+        crate::onefolder::put(d, from, to).await
+    }
+
+    async fn save(d: &Arc<Daemon>, a: SaveArgs) -> anyhow::Result<SaveReply> {
+        let (path, to) = (
+            needed(a.path.as_deref(), "path")?,
+            needed(a.to.as_deref(), "to")?,
+        );
+        crate::onefolder::save(d, path, to, a.version).await
+    }
+
+    async fn write(d: &Arc<Daemon>, a: WriteArgs) -> anyhow::Result<PathReply> {
+        let from = needed(a.from.as_deref(), "from")?;
+        let path = needed(a.path.as_deref(), "path")?;
+        crate::onefolder::write(d, from, path).await
+    }
+
+    async fn share(d: &Arc<Daemon>, a: ShareArgs) -> anyhow::Result<ShareReply> {
+        let paths = a.paths.unwrap_or_default();
+        // `share`'s lookups still take a ref as held by name
+        let who = a.who.as_ref().map(Reference::held);
+        let group = a.group.as_ref().map(Reference::held);
+        let text = a.text.as_deref();
+        crate::onefolder::share(d, who.as_deref(), group.as_deref(), &paths, text).await
+    }
+
+    async fn mount(d: &Arc<Daemon>, a: MountArgs) -> anyhow::Result<PathReply> {
+        let path = super::mount_at(d, a.path.as_deref()).await?;
+        Ok(PathReply {
+            path: path.to_string_lossy().into_owned(),
+        })
+    }
+
+    async fn unmount(d: &Arc<Daemon>, _: UnmountArgs) -> anyhow::Result<Done> {
+        super::unmount(d).await?;
+        Ok(Done {})
+    }
+
+    async fn flush(d: &Arc<Daemon>, _: FlushArgs) -> anyhow::Result<FlushReply> {
+        let entries = super::flush(d).await? as u64;
+        Ok(FlushReply { entries })
+    }
+
+    async fn restore(d: &Arc<Daemon>, a: RestoreArgs) -> anyhow::Result<RestoreReply> {
+        let path = needed(a.path.as_deref(), "path")?;
+        let version = a
+            .version
+            .ok_or_else(|| anyhow::anyhow!("missing --version"))?;
+        crate::file_history::restore(d, path, version).await
+    }
+
+    async fn pin(d: &Arc<Daemon>, a: PinArgs) -> anyhow::Result<PinReply> {
+        let (path, on_demand) = super::pin(d, needed(a.path.as_deref(), "path")?, true)?;
+        Ok(PinReply { on_demand, path })
+    }
+
+    async fn unpin(d: &Arc<Daemon>, a: UnpinArgs) -> anyhow::Result<PinReply> {
+        let (path, on_demand) = super::pin(d, needed(a.path.as_deref(), "path")?, false)?;
+        Ok(PinReply { on_demand, path })
+    }
+
+    async fn retention(d: &Arc<Daemon>, a: RetentionArgs) -> anyhow::Result<RetentionReply> {
+        let mode = needed(a.mode, "mode")?;
+        super::set_retention(d, &mode)?;
+        Ok(RetentionReply { retention: mode })
     }
 
     async fn device_rename(
@@ -926,6 +1060,12 @@ fn power_name(p: Power) -> &'static str {
     }
 }
 
+/// A reply that is a path, as it was by name.
+#[cfg(any(test, feature = "by-name"))]
+fn path_json(r: api::PathReply) -> Value {
+    json!({"path": r.path})
+}
+
 /// The path of a node in a files space's state.
 pub fn node_path(st: &State, node: &NodeId) -> String {
     let mut parts = Vec::new();
@@ -1004,18 +1144,8 @@ async fn handle(d: &Arc<Daemon>, req: &Value) -> anyhow::Result<Value> {
         // whatever sees it wake, as Android does for the app.
         #[cfg(any(test, feature = "by-name"))]
         "wake" => Ok(json!({"checking": d.network_changed("woke")})),
-        "flush" => {
-            let d2 = d.clone();
-            let n = tokio::task::spawn_blocking(move || -> anyhow::Result<usize> {
-                let m = d2.mount.lock().unwrap_or_else(|e| e.into_inner());
-                match m.as_ref() {
-                    Some(m) => m.flush(),
-                    None => Ok(0),
-                }
-            })
-            .await??;
-            Ok(json!({"entries": n}))
-        }
+        #[cfg(any(test, feature = "by-name"))]
+        "flush" => Ok(json!({"entries": flush(d).await?})),
         #[cfg(any(test, feature = "by-name"))]
         "pair-show" => {
             // what to call this device, where the window knows better
@@ -1279,16 +1409,34 @@ async fn handle(d: &Arc<Daemon>, req: &Value) -> anyhow::Result<Value> {
             let on = req.get("on").and_then(|v| v.as_bool());
             crate::settings::read_markers(d, on)
         }
-        "mkdir" => crate::onefolder::mkdir(d, arg(req, "path")?),
-        "move" => crate::onefolder::move_to(d, arg(req, "from")?, arg(req, "to")?).await,
-        "remove" => crate::onefolder::remove(d, arg(req, "path")?),
-        "copy" => crate::onefolder::copy(d, arg(req, "from")?, arg(req, "to")?).await,
-        "put" => crate::onefolder::put(d, arg(req, "from")?, arg(req, "to")?).await,
+        #[cfg(any(test, feature = "by-name"))]
+        "mkdir" => crate::onefolder::mkdir(d, arg(req, "path")?).map(path_json),
+        #[cfg(any(test, feature = "by-name"))]
+        "move" => crate::onefolder::move_to(d, arg(req, "from")?, arg(req, "to")?)
+            .await
+            .map(path_json),
+        #[cfg(any(test, feature = "by-name"))]
+        "remove" => crate::onefolder::remove(d, arg(req, "path")?).map(path_json),
+        #[cfg(any(test, feature = "by-name"))]
+        "copy" => crate::onefolder::copy(d, arg(req, "from")?, arg(req, "to")?)
+            .await
+            .map(path_json),
+        #[cfg(any(test, feature = "by-name"))]
+        "put" => crate::onefolder::put(d, arg(req, "from")?, arg(req, "to")?)
+            .await
+            .map(path_json),
+        #[cfg(any(test, feature = "by-name"))]
         "save" => {
             let version = req.get("version").and_then(Value::as_u64);
-            crate::onefolder::save(d, arg(req, "path")?, arg(req, "to")?, version).await
+            crate::onefolder::save(d, arg(req, "path")?, arg(req, "to")?, version)
+                .await
+                .map(|r| json!({"path": r.path, "size": r.size}))
         }
-        "write" => crate::onefolder::write(d, arg(req, "from")?, arg(req, "path")?).await,
+        #[cfg(any(test, feature = "by-name"))]
+        "write" => crate::onefolder::write(d, arg(req, "from")?, arg(req, "path")?)
+            .await
+            .map(path_json),
+        #[cfg(any(test, feature = "by-name"))]
         "share" => {
             let paths: Vec<String> = req
                 .get("paths")
@@ -1302,7 +1450,9 @@ async fn handle(d: &Arc<Daemon>, req: &Value) -> anyhow::Result<Value> {
             let text = req.get("text").and_then(|v| v.as_str());
             let who = req.get("who").and_then(|v| v.as_str());
             let group = req.get("group").and_then(|v| v.as_str());
-            crate::onefolder::share(d, who, group, &paths, text).await
+            crate::onefolder::share(d, who, group, &paths, text)
+                .await
+                .map(|r| json!({"path": r.path, "message": r.message}))
         }
         "recovery-check" => {
             crate::recovery::root_from_words(d, arg(req, "words")?)?;
@@ -1472,46 +1622,14 @@ async fn handle(d: &Arc<Daemon>, req: &Value) -> anyhow::Result<Value> {
                 .collect();
             Ok(json!({"peers": list}))
         }
+        #[cfg(any(test, feature = "by-name"))]
         "mount" => {
-            let path = req
-                .get("path")
-                .and_then(|v| v.as_str())
-                .map(std::path::PathBuf::from)
-                .or_else(|| d.config().mount.clone())
-                .unwrap_or_else(|| crate::paths::home_dir().join("Cardinal"));
-            let d2 = d.clone();
-            let p2 = path.clone();
-            tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
-                d2.unmount();
-                {
-                    let mut c = d2.config();
-                    c.mount = Some(p2.clone());
-                    c.this_run.no_mount = false;
-                }
-                d2.save_config()?;
-                if d2.core().files_id().is_none() {
-                    return Ok(());
-                }
-                if let Err(e) = crate::daemon::fuse_usable() {
-                    anyhow::bail!("cannot mount: FUSE is not available here ({e})");
-                }
-                d2.ensure_mounted();
-                if d2.mount.lock().unwrap_or_else(|e| e.into_inner()).is_none() {
-                    anyhow::bail!("could not mount at {}; see `cardinal log`", p2.display());
-                }
-                Ok(())
-            })
-            .await??;
+            let path = mount_at(d, req.get("path").and_then(|v| v.as_str())).await?;
             Ok(json!({"path": path}))
         }
+        #[cfg(any(test, feature = "by-name"))]
         "unmount" => {
-            let d2 = d.clone();
-            tokio::task::spawn_blocking(move || {
-                d2.unmount();
-                d2.config().mount = None;
-                d2.save_config()
-            })
-            .await??;
+            unmount(d).await?;
             Ok(json!({}))
         }
         "conflicts" => conflicts(d),
@@ -1584,13 +1702,16 @@ async fn handle(d: &Arc<Daemon>, req: &Value) -> anyhow::Result<Value> {
             Ok(json!({"keep": keep.to_string()}))
         }
         "history" => crate::file_history::history(d, arg(req, "path")?),
+        #[cfg(any(test, feature = "by-name"))]
         "restore" => {
             let path = arg(req, "path")?.to_owned();
             let version = req
                 .get("version")
                 .and_then(|v| v.as_u64())
                 .ok_or_else(|| anyhow::anyhow!("missing --version"))?;
-            crate::file_history::restore(d, &path, version).await
+            crate::file_history::restore(d, &path, version)
+                .await
+                .map(|r| json!({"path": r.path, "version": r.version}))
         }
         "deleted" => crate::file_history::deleted(
             d,
@@ -1601,35 +1722,108 @@ async fn handle(d: &Arc<Daemon>, req: &Value) -> anyhow::Result<Value> {
             let id = req.get("id").and_then(Value::as_str);
             crate::file_history::undelete(d, arg(req, "path")?, id).await
         }
+        #[cfg(any(test, feature = "by-name"))]
         "pin" | "unpin" => {
-            let path = arg(req, "path")?.trim_matches('/').to_owned();
-            {
-                let mut c = d.config();
-                c.pins.retain(|p| *p != path);
-                if cmd == "pin" {
-                    c.pins.push(path.clone());
-                }
-            }
-            d.save_config()?;
-            d.bump();
-            let on_demand = d.config().on_demand();
+            let (path, on_demand) = pin(d, arg(req, "path")?, cmd == "pin")?;
             Ok(json!({"path": path, "on_demand": on_demand}))
         }
+        #[cfg(any(test, feature = "by-name"))]
         "retention" => {
             let mode = arg(req, "mode")?;
-            if mode != "full" && mode != "on-demand" {
-                anyhow::bail!("retention is `full` or `on-demand`");
-            }
-            d.config().retention = mode.to_owned();
-            d.save_config()?;
-            d.bump();
-            // Record it in the account space for the other devices.
-            d.housekeeping();
+            set_retention(d, mode)?;
             Ok(json!({"retention": mode}))
         }
         "speedtest" => speedtest(d, arg(req, "device")?).await,
         other => anyhow::bail!("unknown command {other:?}"),
     }
+}
+
+/// Shows the one folder at `path`, or where it was last, or at
+/// ~/Cardinal; where.
+async fn mount_at(d: &Arc<Daemon>, path: Option<&str>) -> anyhow::Result<std::path::PathBuf> {
+    let path = path
+        .map(std::path::PathBuf::from)
+        .or_else(|| d.config().mount.clone())
+        .unwrap_or_else(|| crate::paths::home_dir().join("Cardinal"));
+    let d2 = d.clone();
+    let p2 = path.clone();
+    tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+        d2.unmount();
+        {
+            let mut c = d2.config();
+            c.mount = Some(p2.clone());
+            c.this_run.no_mount = false;
+        }
+        d2.save_config()?;
+        if d2.core().files_id().is_none() {
+            return Ok(());
+        }
+        if let Err(e) = crate::daemon::fuse_usable() {
+            anyhow::bail!("cannot mount: FUSE is not available here ({e})");
+        }
+        d2.ensure_mounted();
+        if d2.mount.lock().unwrap_or_else(|e| e.into_inner()).is_none() {
+            anyhow::bail!("could not mount at {}; see `cardinal log`", p2.display());
+        }
+        Ok(())
+    })
+    .await??;
+    Ok(path)
+}
+
+/// Shows the one folder nowhere, from now on.
+async fn unmount(d: &Arc<Daemon>) -> anyhow::Result<()> {
+    let d2 = d.clone();
+    tokio::task::spawn_blocking(move || {
+        d2.unmount();
+        d2.config().mount = None;
+        d2.save_config()
+    })
+    .await?
+}
+
+/// Writes what the folder shown holds that is not written yet: how many
+/// entries.
+async fn flush(d: &Arc<Daemon>) -> anyhow::Result<usize> {
+    let d2 = d.clone();
+    tokio::task::spawn_blocking(move || -> anyhow::Result<usize> {
+        let m = d2.mount.lock().unwrap_or_else(|e| e.into_inner());
+        match m.as_ref() {
+            Some(m) => m.flush(),
+            None => Ok(0),
+        }
+    })
+    .await?
+}
+
+/// Keeps `path` on this device, or (`on` false) no longer: the path as
+/// kept, and whether this device keeps only what is pinned.
+fn pin(d: &Arc<Daemon>, path: &str, on: bool) -> anyhow::Result<(String, bool)> {
+    let path = path.trim_matches('/').to_owned();
+    {
+        let mut c = d.config();
+        c.pins.retain(|p| *p != path);
+        if on {
+            c.pins.push(path.clone());
+        }
+    }
+    d.save_config()?;
+    d.bump();
+    let on_demand = d.config().on_demand();
+    Ok((path, on_demand))
+}
+
+/// What this device keeps of the one folder: `full` or `on-demand`.
+fn set_retention(d: &Arc<Daemon>, mode: &str) -> anyhow::Result<()> {
+    if mode != "full" && mode != "on-demand" {
+        anyhow::bail!("retention is `full` or `on-demand`");
+    }
+    d.config().retention = mode.to_owned();
+    d.save_config()?;
+    d.bump();
+    // Record it in the account space for the other devices.
+    d.housekeeping();
+    Ok(())
 }
 
 /// Measures the link to one of the person's devices (`speedtest.rs`).

@@ -896,6 +896,104 @@ typed!(fields ClipReply {
 });
 asks!(CLIP: 106 "clip" ClipArgs -> ClipReply, Page::Whole);
 
+// ---- The one folder ----
+
+typed!(
+    fields
+    /// The path in the one folder a request made or changed.
+    PathReply {
+        2 path: String,
+    }
+);
+typed!(fields MkdirArgs {
+    1 path: Option<String>,
+});
+asks!(MKDIR: 121 "mkdir" MkdirArgs -> PathReply, Page::Whole);
+typed!(fields MoveArgs {
+    1 from: Option<String>,
+    2 to: Option<String>,
+});
+asks!(MOVE: 122 "move" MoveArgs -> PathReply, Page::Whole);
+typed!(fields RemoveArgs {
+    1 path: Option<String>,
+});
+asks!(REMOVE: 123 "remove" RemoveArgs -> PathReply, Page::Whole);
+typed!(fields CopyArgs {
+    1 from: Option<String>,
+    2 to: Option<String>,
+});
+asks!(COPY: 124 "copy" CopyArgs -> PathReply, Page::Whole);
+typed!(fields PutArgs {
+    1 from: Option<String>,
+    2 to: Option<String>,
+});
+asks!(PUT: 125 "put" PutArgs -> PathReply, Page::Whole);
+typed!(fields SaveArgs {
+    1 path: Option<String>,
+    2 to: Option<String>,
+    3 version: Option<u64>,
+});
+typed!(fields SaveReply {
+    2 path: String,
+    3 size: u64,
+});
+asks!(SAVE: 126 "save" SaveArgs -> SaveReply, Page::Whole);
+typed!(fields WriteArgs {
+    1 from: Option<String>,
+    2 path: Option<String>,
+});
+asks!(WRITE: 127 "write" WriteArgs -> PathReply, Page::Whole);
+typed!(fields ShareArgs {
+    1 who: Option<Reference>,
+    2 paths: Option<Vec<String>>,
+    3 text: Option<String>,
+    4 group: Option<Reference>,
+});
+typed!(fields ShareReply {
+    2 message: bool,
+    3 path: String,
+});
+asks!(SHARE: 128 "share" ShareArgs -> ShareReply, Page::Whole);
+typed!(fields MountArgs {
+    1 path: Option<String>,
+});
+asks!(MOUNT: 129 "mount" MountArgs -> PathReply, Page::Whole);
+typed!(fields UnmountArgs {});
+asks!(UNMOUNT: 130 "unmount" UnmountArgs -> Done, Page::Whole);
+typed!(fields FlushArgs {});
+typed!(fields FlushReply {
+    2 entries: u64,
+});
+asks!(FLUSH: 131 "flush" FlushArgs -> FlushReply, Page::Whole);
+typed!(fields RestoreArgs {
+    1 path: Option<String>,
+    2 version: Option<u64>,
+});
+typed!(fields RestoreReply {
+    2 path: String,
+    3 version: u64,
+});
+asks!(RESTORE: 134 "restore" RestoreArgs -> RestoreReply, Page::Whole);
+typed!(fields PinArgs {
+    1 path: Option<String>,
+});
+typed!(fields PinReply {
+    2 on_demand: bool,
+    3 path: String,
+});
+asks!(PIN: 135 "pin" PinArgs -> PinReply, Page::Whole);
+typed!(fields UnpinArgs {
+    1 path: Option<String>,
+});
+asks!(UNPIN: 136 "unpin" UnpinArgs -> PinReply, Page::Whole);
+typed!(fields RetentionArgs {
+    1 mode: Option<String>,
+});
+typed!(fields RetentionReply {
+    2 retention: String,
+});
+asks!(RETENTION: 137 "retention" RetentionArgs -> RetentionReply, Page::Whole);
+
 typed!(fields MessagesArgs {
     1 who: Option<Reference>,
     2 group: Option<Reference>,
@@ -1053,25 +1151,25 @@ pub static REQUESTS: &[Request] = &[
     CLIP,
     // ---- The one folder: 120 to 149 ----
     FILES,
-    req!(121 "mkdir" (1 "path" T) -> (2 "path" T)),
-    req!(122 "move" (1 "from" T, 2 "to" T) -> (2 "path" T)),
-    req!(123 "remove" (1 "path" T) -> (2 "path" T)),
-    req!(124 "copy" (1 "from" T, 2 "to" T) -> (2 "path" T)),
-    req!(125 "put" (1 "from" T, 2 "to" T) -> (2 "path" T)),
-    req!(126 "save" (1 "path" T, 2 "to" T, 3 "version" U) -> (2 "path" T, 3 "size" U)),
-    req!(127 "write" (1 "from" T, 2 "path" T) -> (2 "path" T)),
-    req!(128 "share" (1 "who" REF, 2 "paths" [T], 3 "text" T, 4 "group" REF) -> (2 "message" BOOL, 3 "path" T)),
-    req!(129 "mount" (1 "path" T) -> (2 "path" T)),
-    req!(130 "unmount" () -> ()),
-    req!(131 "flush" () -> (2 "entries" U)),
+    MKDIR,
+    MOVE,
+    REMOVE,
+    COPY,
+    PUT,
+    SAVE,
+    WRITE,
+    SHARE,
+    MOUNT,
+    UNMOUNT,
+    FLUSH,
     paged!(after 132 "conflicts" (1 "after" U, 2 "limit" U) -> (
         2 "conflicts" [CONFLICT], 3 "more" BOOL, 4 "next" U)),
     paged!(after 133 "history" (1 "path" T, 2 "after" U, 3 "limit" U) -> (
         2 "path" T, 3 "versions" [VERSION], 4 "more" BOOL, 5 "next" U)),
-    req!(134 "restore" (1 "path" T, 2 "version" U) -> (2 "path" T, 3 "version" U)),
-    req!(135 "pin" (1 "path" T) -> (2 "on_demand" BOOL, 3 "path" T)),
-    req!(136 "unpin" (1 "path" T) -> (2 "on_demand" BOOL, 3 "path" T)),
-    req!(137 "retention" (1 "mode" T) -> (2 "retention" T)),
+    RESTORE,
+    PIN,
+    UNPIN,
+    RETENTION,
     req!(138 "keep-old" (1 "keep" T, 2 "space" REF) -> (2 "keep" T)),
     req!(139 "free-space" (1 "dry_run" BOOL, 2 "unnamed" BOOL, 3 "delete" BOOL) -> (
         2 "bytes" U, 3 "deleted" BOOL, 4 "left" U, 5 "objects" U, 6 "only_here" {ONLY_HERE},
