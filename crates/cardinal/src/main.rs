@@ -1128,6 +1128,24 @@ fn print_pair_again(v: &Value) {
     }
 }
 
+/// The guardians who confirmed a finished recovery and have not heard of
+/// this device yet: they do not answer it until they do.
+fn print_not_heard(v: &Value) {
+    let names: Vec<&str> = v["not_heard"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .collect();
+    if names.is_empty() {
+        return;
+    }
+    println!("Your recovery is in effect, but these guardians have not heard of this device");
+    println!("yet: {}.", names.join(", "));
+    println!("Until they do, their devices do not answer it. It tells each of them the next");
+    println!("time a device of theirs is in touch; nothing needs doing.");
+}
+
 fn print_recover(v: &Value) {
     if v["finished"] == true {
         println!("Recovered. This device became yours before the recovery could finish tidying");
@@ -1137,10 +1155,15 @@ fn print_recover(v: &Value) {
         show_words(v["words"].as_str().unwrap_or(""));
         println!();
         print_pair_again(v);
+        print_not_heard(v);
         return;
     }
     if v["under_way"] != true {
-        println!("No recovery is under way. Ask a guardian for an invitation (`cardinal guarding invite`).");
+        if v["not_heard"].as_array().is_some_and(|n| !n.is_empty()) {
+            print_not_heard(v);
+        } else {
+            println!("No recovery is under way. Ask a guardian for an invitation (`cardinal guarding invite`).");
+        }
         print_pair_again(v);
         return;
     }
@@ -3084,6 +3107,7 @@ async fn client(cmd: Cmd) -> anyhow::Result<()> {
                 println!("account, so this device starts with an empty one.");
             }
             print_pair_again(&v);
+            print_not_heard(&v);
             let lost: Vec<&Value> = v["lost_devices"]
                 .as_array()
                 .into_iter()

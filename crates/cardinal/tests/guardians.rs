@@ -1429,6 +1429,187 @@ fn the_guardian_knows_the_new_device_when_the_helper_goes() {
     });
 }
 
+/// Ana, her laptop lost, with Bo as her one guardian holding her account,
+/// and a new device on which Bo confirmed her recovery, its account given
+/// back, ready to finish. Returns the new device.
+fn ready_to_finish(root: &std::path::Path, bo: &mut Dev) -> Dev {
+    let mut laptop = Dev::new(root, "laptop", free_port());
+    laptop.start();
+    let words = words_from(&laptop.cli(&["init", "--yes", "--name", "ana"]));
+    laptop.wait_mounted();
+    meet(&laptop, bo, "Ana");
+    accept_guarding(&[&*bo]);
+    let o = name_accepted(&laptop, &words, &["bo", "--delay", "4s"]);
+    assert!(o.status.success(), "{}", out(&o));
+    wait("the guardian knows", 30, || {
+        bo.cli(&["guarding"]).contains("Ana: one of 1 guardians")
+    });
+    hold_account(&laptop, &[&*bo]);
+    laptop.stop();
+    drop(laptop);
+    let new = new_device(root, "new");
+    let fp = fingerprint_from(&new.cli(&["recover", "start", &recovery_invitation(bo, "Ana")]));
+    wait("bo sees the recovery", 60, || {
+        bo.cli(&["guarding"]).contains(&fp)
+    });
+    endorse_and_confirm(&[&*bo], &fp);
+    wait("the account is given back", 60, || {
+        new.cli(&["recover"]).contains("your account among it")
+    });
+    new
+}
+
+/// Whether `new` has a session with one of `who`'s devices.
+fn reaches(new: &Dev, who: &Dev) -> bool {
+    let at = format!("127.0.0.1:{}", who.port);
+    let r = ask(
+        new,
+        serde_json::json!({"cmd": "contact-status", "who": who.name, "at": at}),
+    );
+    r["devices"]
+        .as_array()
+        .is_some_and(|d| d.iter().any(|x| x["online"] == true))
+}
+
+/// The port the kept recovery helper of `new` listens on.
+fn kept_helper_port(new: &Dev) -> u16 {
+    let r: serde_json::Value =
+        serde_json::from_str(&read(&new.home.join("recovered.json")).unwrap_or_default())
+            .unwrap_or_default();
+    r["handing"]["port"]
+        .as_u64()
+        .unwrap_or_else(|| panic!("no kept helper's port in {r}")) as u16
+}
+
+/// Whether nothing listens on `port` here, on either carrier.
+fn nothing_listens(port: u16) -> bool {
+    std::net::TcpListener::bind(("127.0.0.1", port)).is_ok()
+        && std::net::UdpSocket::bind(("127.0.0.1", port)).is_ok()
+}
+
+/// A guardian who confirmed is out of reach when the recovery finishes,
+/// their device stopped: the helper is kept, and `cardinal recover` says
+/// who has not heard of the new device. When the guardian's device comes
+/// back, the kept helper hands it the new device's first entries, the two
+/// devices connect, and the helper goes, leaving nothing on disk or
+/// listening.
+#[test]
+fn a_guardian_away_at_the_finish_learns_the_new_device_later() {
+    away_at_the_finish(false);
+}
+
+/// The same, with the new device restarted between the finish and the
+/// guardian's return: the kept helper comes back with it, at its port.
+#[test]
+fn a_guardian_away_at_the_finish_learns_the_new_device_after_a_restart() {
+    away_at_the_finish(true);
+}
+
+fn away_at_the_finish(restart: bool) {
+    if !fuse_available() {
+        eprintln!("skipping: /dev/fuse or fusermount3 is not available");
+        return;
+    }
+    let root = tempfile::tempdir().unwrap();
+    let mut bo = person(root.path(), "bo");
+    let mut new = ready_to_finish(root.path(), &mut bo);
+    bo.stop();
+    let o = new.try_cli(&["recover", "finish"]);
+    assert!(o.status.success(), "{}", out(&o));
+    // Said, and checked once Bo is back: without the helper kept, the new
+    // device never reaches him, and that is the first thing to fail.
+    let finished = out(&o);
+    let shown = new.cli(&["recover"]);
+    let helper = new.home.join("recovery-helper");
+    let kept = helper.exists();
+    let port = kept.then(|| kept_helper_port(&new));
+    if restart {
+        new.stop();
+        new.start();
+    }
+    let shown_after = new.cli(&["recover"]);
+    assert!(!reaches(&new, &bo), "bo is away");
+    bo.start();
+    bo.wait_mounted();
+    wait("the new device reaches bo", 120, || reaches(&new, &bo));
+    for said in [&finished, &shown, &shown_after] {
+        assert!(said.contains("have not heard of this device"), "{said}");
+        assert!(said.contains("yet: bo."), "{said}");
+    }
+    assert!(kept, "the helper was kept");
+    wait("the helper goes", 60, || !helper.exists());
+    let port = port.expect("kept");
+    wait("nothing listens at the helper's port", 30, || {
+        nothing_listens(port)
+    });
+    let shown = new.cli(&["recover"]);
+    assert!(!shown.contains("have not heard"), "{shown}");
+    // and it stays gone across a restart
+    new.stop();
+    new.start();
+    assert!(!helper.exists());
+    wait("the new device reaches bo again", 60, || reaches(&new, &bo));
+}
+
+/// A guardian who did not confirm, and is away at the finish, does not
+/// keep the helper: Bo and Di confirmed and took the new device's first
+/// entries, so the helper goes at the finish though Cy never heard.
+#[test]
+fn a_guardian_who_did_not_confirm_does_not_keep_the_helper() {
+    if !fuse_available() {
+        eprintln!("skipping: /dev/fuse or fusermount3 is not available");
+        return;
+    }
+    let root = tempfile::tempdir().unwrap();
+    let mut laptop = Dev::new(root.path(), "laptop", free_port());
+    laptop.start();
+    let words = words_from(&laptop.cli(&["init", "--yes", "--name", "ana"]));
+    laptop.wait_mounted();
+    let bo = person(root.path(), "bo");
+    let mut cy = person(root.path(), "cy");
+    let di = person(root.path(), "di");
+    for g in [&bo, &cy, &di] {
+        meet(&laptop, g, "Ana");
+    }
+    accept_guarding(&[&bo, &cy, &di]);
+    let o = name_accepted(
+        &laptop,
+        &words,
+        &["bo", "cy", "di", "--threshold", "2", "--delay", "4s"],
+    );
+    assert!(o.status.success(), "{}", out(&o));
+    for g in [&bo, &cy, &di] {
+        wait("the guardian knows", 30, || {
+            g.cli(&["guarding"]).contains("Ana: one of 3 guardians")
+        });
+    }
+    hold_account(&laptop, &[&bo]);
+    laptop.stop();
+    drop(laptop);
+    let new = new_device(root.path(), "new");
+    let fp = fingerprint_from(&new.cli(&["recover", "start", &recovery_invitation(&bo, "Ana")]));
+    new.cli(&["recover", "start", &recovery_invitation(&cy, "Ana")]);
+    new.cli(&["recover", "start", &recovery_invitation(&di, "Ana")]);
+    for g in [&bo, &cy, &di] {
+        wait("the guardian sees the recovery", 60, || {
+            g.cli(&["guarding"]).contains(&fp)
+        });
+    }
+    endorse_and_confirm(&[&bo, &di], &fp);
+    wait("the account is given back", 60, || {
+        new.cli(&["recover"]).contains("your account among it")
+    });
+    cy.stop();
+    let o = new.try_cli(&["recover", "finish"]);
+    assert!(o.status.success(), "{}", out(&o));
+    assert!(!out(&o).contains("have not heard"), "{}", out(&o));
+    assert!(!new.home.join("recovery-helper").exists());
+    let shown = new.cli(&["recover"]);
+    assert!(!shown.contains("have not heard"), "{shown}");
+    wait("the new device reaches bo", 60, || reaches(&new, &bo));
+    wait("the new device reaches di", 60, || reaches(&new, &di));
+}
+
 /// The same with nothing else to arrive after the group: Ana's laptop
 /// makes Bo an ordinary member again, which moves the group on, and her
 /// phone confirms it. Bo is the only other member, so the new device holds

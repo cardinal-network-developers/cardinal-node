@@ -670,7 +670,7 @@ pub static REQUESTS: &[Request] = &[
         7 "held" U, 8 "helper" BOOL, 9 "identity" B, 10 "in_effect" BOOL, 11 "lost_at" U,
         12 "lost_devices" [LOST_DEVICE], 13 "pair_again" [PAIR_AGAIN], 14 "proposed" U,
         15 "successions" (gone [SUCCESSION]), 16 "threshold" U, 17 "under_way" BOOL,
-        18 "finished" BOOL, 19 "words" T, 20 "kept_changes" [KEPT_CHANGE])),
+        18 "finished" BOOL, 19 "words" T, 20 "kept_changes" [KEPT_CHANGE], 21 "not_heard" [T])),
     req!(163 "recover-start" (1 "code" T, 2 "identity" REF) -> (
         2 "fingerprint" T, 3 "identity" B)),
     req!(164 "recover-invite" (1 "at" T) -> (2 "code" T, 3 "fingerprint" T)),
@@ -680,7 +680,7 @@ pub static REQUESTS: &[Request] = &[
     req!(167 "recover-cancel" () -> (2 "fingerprint" T)),
     req!(168 "recover-finish" (1 "without_account" BOOL, 2 "lost_at" U) -> (
         2 "account" BOOL, 3 "lost_devices" [LOST_DEVICE], 4 "pair_again" [PAIR_AGAIN],
-        5 "words" T)),
+        5 "words" T, 6 "not_heard" [T])),
     req!(169 "keep-work" (1 "name" T, 2 "up_to" T) -> (2 "kept" U, 3 "set_aside" [SET_ASIDE])),
     req!(170 "recovery-check" (1 "words" T) -> ()),
     req!(171 "recovery-sheet" () -> (2 "hosts" [HOST])),
