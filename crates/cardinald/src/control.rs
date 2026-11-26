@@ -369,6 +369,7 @@ pub mod typed {
         PairShowArgs, PairShowReply, PairStatusArgs, PairStatusReply, PairTypeArgs, PairTypeReply,
         WakeArgs,
     };
+    use crate::api::{ConflictsArgs, ConflictsReply, DevicesArgs, DevicesReply};
     use crate::api::{
         CopyArgs, Done, FlushArgs, FlushReply, MkdirArgs, MountArgs, MoveArgs, PathReply, PinArgs,
         PinReply, PutArgs, RemoveArgs, RestoreArgs, RestoreReply, RetentionArgs, RetentionReply,
@@ -1113,6 +1114,28 @@ pub mod typed {
 
     // ---- Listings ----
 
+    impl Answer for ConflictsArgs {
+        async fn answer(d: &Arc<Daemon>, _: &Self) -> anyhow::Result<ConflictsReply> {
+            Ok(ConflictsReply {
+                conflicts: super::conflict_list(d)?,
+                // the page says
+                more: false,
+                next: None,
+            })
+        }
+    }
+
+    impl Answer for DevicesArgs {
+        async fn answer(d: &Arc<Daemon>, _: &Self) -> anyhow::Result<DevicesReply> {
+            Ok(DevicesReply {
+                devices: super::device_list(d),
+                // the page says
+                more: false,
+                next: None,
+            })
+        }
+    }
+
     impl Answer for InvitationsArgs {
         async fn answer(d: &Arc<Daemon>, _: &Self) -> anyhow::Result<InvitationsReply> {
             Ok(crate::contacts::invitations(d))
@@ -1522,6 +1545,7 @@ async fn handle(d: &Arc<Daemon>, req: &Value) -> anyhow::Result<Value> {
             req["what"] = json!(cmd.strip_prefix("inspect-").unwrap_or("overview"));
             crate::inspect::handle(d, &req)
         }
+        #[cfg(any(test, debug_assertions, feature = "by-name"))]
         "devices" => Ok(json!({"devices": devices(d)})),
         "stop" => {
             let _ = d.stopping.send(true);
@@ -1976,6 +2000,7 @@ async fn handle(d: &Arc<Daemon>, req: &Value) -> anyhow::Result<Value> {
                 .collect();
             Ok(json!({"peers": list}))
         }
+        #[cfg(any(test, debug_assertions, feature = "by-name"))]
         "conflicts" => conflicts(d),
         "debug-tree" => debug_tree(d),
         "free-space" if req.get("unnamed").and_then(|v| v.as_bool()) == Some(true) => {
@@ -2522,6 +2547,91 @@ fn rename_this_device(d: &Daemon, name: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// The person's devices, this one first and then by name, as `devices`
+/// gives them.
+pub(crate) fn device_list(d: &Daemon) -> Vec<api::Device> {
+    let (st, names) = {
+        let core = d.core();
+        let Some(i) = core.identity.as_ref() else {
+            return Vec::new();
+        };
+        (i.state(), core.device_names())
+    };
+    let me = d.keys.key();
+    let book = d.book.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    let stats = d
+        .blob_stats
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
+    let name_of = |k: &[u8; 32]| {
+        names
+            .get(k)
+            .cloned()
+            .unwrap_or_else(|| account::short_key(k))
+    };
+    let by_link: HashMap<[u8; 32], String> = st
+        .keys
+        .values()
+        .filter_map(|k| Some((*k.link_key.as_ref()?.x25519(), name_of(&k.key))))
+        .collect();
+    let mut v: Vec<api::Device> = st
+        .keys
+        .values()
+        .map(|k| {
+            let x = k.link_key.as_ref().map(|l| *l.x25519());
+            let online = k.key == me || x.is_some_and(|x| d.is_online(&x));
+            let carrier = x.and_then(|x| d.session_carrier(&x));
+            let (dials, redial) = d.dialled(&k.key);
+            let through = x
+                .and_then(|x| d.relayed_through(&x))
+                .and_then(|h| by_link.get(&h))
+                .cloned();
+            // Where its session runs, or else where it was last known. A
+            // relayed session's address is the relay's.
+            let addr = x
+                .filter(|x| d.is_direct(x))
+                .and_then(|x| d.session_addr(&x))
+                .map(|a| a.to_string())
+                .or_else(|| {
+                    book.addrs
+                        .get(&hex::encode(k.key))
+                        .and_then(|v| v.first().cloned())
+                });
+            api::Device {
+                name: name_of(&k.key),
+                // what it sent that this device cannot read, or the other
+                // way round (`unreadable.rs`)
+                unreadable: d.unreadable.of(&k.key, &name_of(&k.key)),
+                key: api::short_id(&k.key),
+                power: power_name(k.power).into(),
+                this: k.key == me,
+                online,
+                addr: if k.key == me || carrier == Some("relay") {
+                    None
+                } else {
+                    addr
+                },
+                carrier: carrier.map(Into::into),
+                through,
+                // how often this device dialled it, and the wait before
+                // the next try (`redial.rs`)
+                dials: Some(dials),
+                redial_s: redial.map(|w| w.as_secs()),
+                // what this device's fetcher thinks of it as a source
+                fetch: x.and_then(|x| stats.get(&x)).map(|s| api::Fetch {
+                    rate: s.rate as u64,
+                    latency_ms: (s.latency * 1000.0) as u64,
+                    replies: s.samples,
+                    received: s.bytes_total,
+                }),
+            }
+        })
+        .collect();
+    v.sort_by_key(|x| (!x.this, x.name.clone()));
+    v
+}
+
 fn devices(d: &Daemon) -> Vec<Value> {
     let (st, names) = {
         let core = d.core();
@@ -2717,6 +2827,66 @@ fn shown_conflicts(sp: &cardinal_space::Space) -> Vec<&cardinal_space::Node> {
         .collect()
 }
 
+/// The files that conflict, each with its versions and the copies that
+/// show them, as `conflicts` gives them.
+fn conflict_list(d: &Daemon) -> anyhow::Result<Vec<api::Conflict>> {
+    let files_id = require_files(d)?;
+    let core = d.core();
+    let names = core.device_names();
+    let sp = core.spaces[&files_id]
+        .space
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("files space not open"))?;
+    let f = Files::with_device_names(sp, |k| {
+        names
+            .get(k)
+            .cloned()
+            .unwrap_or_else(|| account::short_key(k))
+    });
+    let st = sp.state();
+    let mut out = Vec::new();
+    for n in shown_conflicts(sp) {
+        let path = node_path(st, &n.id);
+        let versions = f
+            .content(&n.id)
+            .iter()
+            .map(|v| api::Version {
+                device: names
+                    .get(&v.device)
+                    .cloned()
+                    .unwrap_or_else(|| account::short_key(&v.device)),
+                time: v.time,
+                size: v.content.as_ref().map(|c| c.size()),
+                ..api::Version::new(String::new())
+            })
+            .collect();
+        let copies: Vec<String> = {
+            let parent = path.rsplit_once('/').map(|(p, _)| p).unwrap_or("");
+            f.list_path(parent)
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|e| e.node == n.id && e.conflict_version.is_some())
+                .map(|e| {
+                    if parent.is_empty() {
+                        e.name
+                    } else {
+                        format!("{parent}/{}", e.name)
+                    }
+                })
+                .collect()
+        };
+        out.push(api::Conflict {
+            copies,
+            delete_conflict: n.delete_conflict,
+            path,
+            versions,
+        });
+    }
+    Ok(out)
+}
+
+/// `conflicts` as main had it, by name.
+#[cfg(any(test, debug_assertions, feature = "by-name"))]
 fn conflicts(d: &Daemon) -> anyhow::Result<Value> {
     let files_id = require_files(d)?;
     let core = d.core();

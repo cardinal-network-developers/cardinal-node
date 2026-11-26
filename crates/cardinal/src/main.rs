@@ -2866,17 +2866,11 @@ async fn speedtest(paths: &Paths, device: Option<String>, raw: bool) -> anyhow::
     let targets: Vec<(String, String)> = match device {
         Some(d) => vec![(d.clone(), d)],
         None => {
-            let v = call(paths, json!({"cmd": "devices"})).await?;
-            let all = v["devices"].as_array().cloned().unwrap_or_default();
+            let all = ask(paths, api::DevicesArgs::new()).await?.devices;
             let t: Vec<(String, String)> = all
                 .iter()
-                .filter(|d| d["this"] != true && d["online"] == true)
-                .map(|d| {
-                    (
-                        d["key"].as_str().unwrap_or("").to_owned(),
-                        d["name"].as_str().unwrap_or("?").to_owned(),
-                    )
-                })
+                .filter(|d| !d.this && d.online)
+                .map(|d| (hex::encode(d.key), d.name.clone()))
                 .collect();
             if t.is_empty() {
                 anyhow::bail!(
@@ -2979,10 +2973,8 @@ async fn client(cmd: Cmd) -> anyhow::Result<()> {
                      of its that reached your other devices is kept."
                 );
             }
-            let devs = call(&paths, json!({"cmd": "devices"})).await?;
-            let admins = devs["devices"]
-                .as_array()
-                .map_or(0, |a| a.iter().filter(|d| d["power"] == "admin").count());
+            let devs = ask(&paths, api::DevicesArgs::new()).await?.devices;
+            let admins = devs.iter().filter(|d| d.power == "admin").count();
             if admins == 0 {
                 println!(
                     "None of your devices is an admin device now, so adding a device will ask for\n\
@@ -4482,13 +4474,13 @@ async fn client(cmd: Cmd) -> anyhow::Result<()> {
                 // was never applied to it
                 println!(
                     "  {}  {}  {:<16} {:>10}{}",
-                    x.version,
+                    x.version.unwrap_or_default(),
                     human_time(x.time),
                     x.device,
                     x.size.map(human_size).unwrap_or_default(),
-                    if x.current {
+                    if x.current == Some(true) {
                         "  (current)"
-                    } else if !x.here {
+                    } else if x.here == Some(false) {
                         "  (not on this device)"
                     } else {
                         ""
@@ -4634,26 +4626,21 @@ async fn client(cmd: Cmd) -> anyhow::Result<()> {
             Ok(())
         }
         Cmd::Conflicts => {
-            let v = call(&paths, json!({"cmd": "conflicts"})).await?;
-            let list = v["conflicts"].as_array().cloned().unwrap_or_default();
+            let list = ask(&paths, api::ConflictsArgs::new()).await?.conflicts;
             if list.is_empty() {
                 println!("No file has two versions.");
                 return Ok(());
             }
             for c in list {
-                println!("{}", c["path"].as_str().unwrap_or(""));
-                if c["delete_conflict"].as_bool() == Some(true) {
+                println!("{}", c.path);
+                if c.delete_conflict {
                     println!("  deleted on one device while changed on another; kept");
                 }
-                for x in c["versions"].as_array().cloned().unwrap_or_default() {
-                    println!(
-                        "  version from {} at {}",
-                        x["device"].as_str().unwrap_or("?"),
-                        human_time(x["time"].as_u64())
-                    );
+                for x in c.versions {
+                    println!("  version from {} at {}", x.device, human_time(x.time));
                 }
-                for copy in c["copies"].as_array().cloned().unwrap_or_default() {
-                    println!("  other version shown as: {}", copy.as_str().unwrap_or(""));
+                for copy in c.copies {
+                    println!("  other version shown as: {copy}");
                 }
             }
             println!("Keep the version under the file's own name by deleting the other copies,");

@@ -2359,7 +2359,14 @@ async fn listings_are_the_bytes_they_were() {
         }
         out
     };
-    for cmd in ["invitations", "introductions", "peer-list", "space-usage"] {
+    for cmd in [
+        "invitations",
+        "introductions",
+        "peer-list",
+        "space-usage",
+        "devices",
+        "conflicts",
+    ] {
         for req in pages(cmd, json!({})) {
             same(&d, req).await;
         }
@@ -2404,7 +2411,13 @@ async fn listings_are_the_bytes_they_were() {
         .await
         .unwrap();
     crate::onefolder::remove(&d, "Docs/b.txt").unwrap();
-    for cmd in ["invitations", "peer-list", "space-usage"] {
+    for cmd in [
+        "invitations",
+        "peer-list",
+        "space-usage",
+        "devices",
+        "conflicts",
+    ] {
         for req in pages(cmd, json!({})) {
             same(&d, req).await;
         }

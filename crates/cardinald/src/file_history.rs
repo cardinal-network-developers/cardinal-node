@@ -111,21 +111,21 @@ pub fn history(d: &Daemon, path: &str) -> anyhow::Result<crate::api::HistoryRepl
         .enumerate()
         .map(|(i, w)| crate::api::Version {
             by: (Some(w.author) != me).then(|| person(&core, sp, &at, &w.author)),
-            current: current.contains(&w.entry),
+            current: Some(current.contains(&w.entry)),
             device: names
                 .get(&w.device)
                 .cloned()
                 .unwrap_or_else(|| account::short_key(&w.device)),
             // whether its content is on this device (`cleanup.rs`)
-            here: match &w.content {
+            here: Some(match &w.content {
                 Some(Content::Blob(b)) => {
                     cardinal_blob::ObjectStore::has(&*d.store, &b.id).unwrap_or(false)
                 }
                 _ => true,
-            },
+            }),
             size: w.content.as_ref().map(|c| c.size()),
             time: w.time,
-            version: i as u64 + 1,
+            version: Some(i as u64 + 1),
         })
         .collect();
     Ok(crate::api::HistoryReply {

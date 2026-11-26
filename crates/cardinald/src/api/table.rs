@@ -757,8 +757,16 @@ typed!(
     }
 );
 rec!(CONDITIONS "conditions": 1 "helps" BOOL, 2 "metered" BOOL, 3 "plugged_in" BOOL);
-rec!(CONFLICT "conflict":
-    1 "copies" [T], 2 "delete_conflict" BOOL, 3 "path" T, 4 "versions" [VERSION]);
+typed!(
+    /// A file whose versions conflict.
+    CONFLICT "conflict" Conflict {
+        /// The copies that show each version, by path.
+        1 copies: Vec<String>,
+        2 delete_conflict: bool,
+        3 path: String,
+        4 versions: Vec<Version>,
+    }
+);
 rec!(CONTACT "contact":
     1 "category" T, 2 "connected" BOOL, 3 "identity" B, 4 "introductions" BOOL, 5 "met" {MET},
     6 "name" T, 7 "nearby" BOOL, 8 "own" BOOL, 9 "picture" T, 10 "recovered" T,
@@ -774,12 +782,38 @@ rec!(CONVERSATION "conversation":
 rec!(COPIES "copies":
     1 "blobs" U, 2 "count" U, 3 "eligible" U, 4 "holders" [HOLDER], 5 "interval_ms" U,
     6 "now" U, 7 "older_than_ms" U);
-rec!(DEVICE "device":
-    1 "addr" T, 2 "carrier" T, 3 "fetch" {FETCH}, 4 "key" B, 5 "name" T, 6 "online" BOOL,
-    7 "power" T, 8 "this" BOOL, 9 "through" T, 10 "unreadable" {UNREADABLE}, 11 "dials" U,
-    12 "redial_s" U);
+typed!(
+    /// One of the person's devices.
+    DEVICE "device" Device {
+        /// Where its session runs, or where it was last known.
+        1 addr: Option<String>,
+        2 carrier: Option<Cow<'static, str>>,
+        /// What this device's fetcher thinks of it as a source.
+        3 fetch: Option<Fetch>,
+        /// The start of its key.
+        4 key: [u8; 8],
+        5 name: String,
+        6 online: bool,
+        /// `device`, `admin` or `root`.
+        7 power: Cow<'static, str>,
+        8 this: bool,
+        /// The device a relayed session with it runs through.
+        9 through: Option<String>,
+        10 unreadable: Option<Unreadable>,
+        11 dials: Option<u64>,
+        12 redial_s: Option<u64>,
+    }
+);
 rec!(ENDPOINT "endpoint": 1 "endpoint" T, 2 "local" BOOL, 3 "tried" BOOL, 4 "why_not" T);
-rec!(FETCH "fetch": 1 "latency_ms" U, 2 "rate" U, 3 "received" U, 4 "replies" U);
+typed!(
+    /// What this device's fetcher thinks of another as a source.
+    FETCH "fetch" Fetch {
+        1 latency_ms: u64,
+        2 rate: u64,
+        3 received: u64,
+        4 replies: u64,
+    }
+);
 typed!(
     /// An entry of a folder of the one folder.
     FILE "file" File {
@@ -1040,19 +1074,30 @@ rec!(TREE_ITEM "tree item":
     1 "dirty" BOOL, 2 "ino" U, 3 "kind" T, 4 "local" BOOL, 5 "node" B, 6 "path" T, 7 "size" U);
 rec!(STUCK_ITEM "stuck item":
     1 "dirty" T, 2 "kind" T, 3 "opens" U, 4 "path" T, 5 "staged" BOOL);
-rec!(UNREADABLE "unreadable":
-    1 "reason" T, 2 "retry_in_s" U, 3 "says" T, 4 "since" U, 5 "theirs" BOOL, 6 "version" T);
+typed!(
+    /// What a device sent that this one cannot read, or the other way round.
+    UNREADABLE "unreadable" Unreadable {
+        1 reason: String,
+        2 retry_in_s: u64,
+        /// A sentence for the person.
+        3 says: String,
+        4 since: u64,
+        5 theirs: bool,
+        6 version: Option<String>,
+    }
+);
 rec!(UNSHOWN_NODE "unshown node": 1 "name" T, 2 "node" B);
 typed!(
-    /// A version of a file of the one folder.
+    /// A version of a file of the one folder: of its history, all of it;
+    /// of a conflict, its device, time and size.
     VERSION "version" Version {
-        1 current: bool,
+        1 current: Option<bool>,
         2 device: String,
         /// Whether its content is on this device.
-        3 here: bool,
+        3 here: Option<bool>,
         4 size: Option<u64>,
         5 time: Option<u64>,
-        6 version: u64,
+        6 version: Option<u64>,
         /// Who wrote it, where someone else did.
         7 by: Option<String>,
     }
@@ -1599,6 +1644,26 @@ asks!(GROUP_REJOIN: 87 "group-rejoin" GroupRejoinArgs -> GroupCreateReply, write
 
 // ---- Listings ----
 
+typed!(fields ConflictsArgs {
+    1 after: Option<u64>,
+    2 limit: Option<u64>,
+});
+typed!(fields ConflictsReply {
+    2 conflicts: Vec<Conflict>,
+    3 more: bool,
+    4 next: Option<u64>,
+});
+asks!(CONFLICTS: 132 "conflicts" ConflictsArgs -> ConflictsReply, reads, after conflicts);
+typed!(fields DevicesArgs {
+    1 after: Option<u64>,
+    2 limit: Option<u64>,
+});
+typed!(fields DevicesReply {
+    2 devices: Vec<Device>,
+    3 more: bool,
+    4 next: Option<u64>,
+});
+asks!(DEVICES: 11 "devices" DevicesArgs -> DevicesReply, reads, after devices);
 typed!(fields InvitationsArgs {
     1 after: Option<u64>,
     2 limit: Option<u64>,
@@ -1841,8 +1906,7 @@ pub static REQUESTS: &[Request] = &[
     req!(9 "setup-finish" (1 "name" T, 2 "answers" [T], 3 "device" T) -> (
         2 "device" T, 3 "name" T)),
     ME,
-    paged!(after 11 "devices" (1 "after" U, 2 "limit" U) -> (
-        2 "devices" [DEVICE], 3 "more" BOOL, 4 "next" U)),
+    DEVICES,
     DEVICE_RENAME,
     req!(13 "remove-device" (1 "who" REF, 2 "lost" BOOL, 3 "words" T) -> (
         2 "dropped" U, 3 "name" T)),
@@ -1929,8 +1993,7 @@ pub static REQUESTS: &[Request] = &[
     MOUNT,
     UNMOUNT,
     FLUSH,
-    paged!(after 132 "conflicts" (1 "after" U, 2 "limit" U) -> (
-        2 "conflicts" [CONFLICT], 3 "more" BOOL, 4 "next" U)),
+    CONFLICTS,
     HISTORY,
     RESTORE,
     PIN,
