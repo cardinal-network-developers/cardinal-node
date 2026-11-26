@@ -848,6 +848,10 @@ async fn handle(d: &Arc<Daemon>, req: &Value) -> anyhow::Result<Value> {
         "recover-cancel" => crate::recovering::cancel(d).await,
         "recover-undo" => crate::recovering::undo_kept(d, arg(req, "to")?).await,
         "recover-kept-seen" => crate::recovering::kept_seen(d, &strings(req, "to")),
+        "recover-stop-waiting" => {
+            let all = req.get("all").and_then(Value::as_bool) == Some(true);
+            crate::recovering::stop_waiting(d, req.get("who").and_then(Value::as_str), all).await
+        }
         "recover-finish" => {
             let without = req.get("without_account").and_then(Value::as_bool) == Some(true);
             let lost_at = req.get("lost_at").and_then(Value::as_u64);

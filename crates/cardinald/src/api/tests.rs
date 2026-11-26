@@ -554,6 +554,7 @@ const NODE_ONLY: &[&str] = &[
     "recover-lost-at",
     "recover-undo",
     "recover-kept-seen",
+    "recover-stop-waiting",
     "recover-cancel",
     "recover-finish",
     "keep-work",

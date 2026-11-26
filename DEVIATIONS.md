@@ -608,7 +608,15 @@ differs or was read:
   given back dropped and no more taken, it hands the entries to each such
   guardian as their devices come into touch, and `cardinal recover` names
   those who have not heard of the new device yet. A guardian who did not
-  confirm does not keep it. A guardian's device carries its acts on a
+  confirm does not keep it. Two ways out for a guardian who never comes
+  back (Daniel, 2026-11-25), and no others: once a change of guardians is
+  in effect whose guardians, as the account says the person named them,
+  include neither that guardian nor their persona, the helper stops
+  waiting for them; and on the person's word, `cardinal recover
+  stop-waiting NAME|--all` (`recover-stop-waiting`, this implementation's
+  own request until `apps.md` has it), which says first that their devices
+  will not answer this one until they learn of it some other way, and
+  gives up nothing else. When nobody is left, the helper goes as before. A guardian's device carries its acts on a
   recovery only into that recovery's relationships, and catches up with
   those done before the helper's `recover` reached it there (as when the
   person's host passed it on first). It takes from the helper, of the

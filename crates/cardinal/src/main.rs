@@ -1050,6 +1050,20 @@ enum RecoverCmd {
         #[arg(long)]
         lost_at: Option<u64>,
     },
+    /// After a recovery: stop waiting for a guardian who has not heard of
+    /// this device (`cardinal recover` names them). Their devices will not
+    /// answer this one until they learn of it some other way.
+    StopWaiting {
+        /// The guardian, as `cardinal recover` names them.
+        #[arg(required_unless_present = "all", conflicts_with = "all")]
+        who: Option<String>,
+        /// Every guardian who has not heard of this device yet.
+        #[arg(long)]
+        all: bool,
+        /// Do not ask first.
+        #[arg(long)]
+        yes: bool,
+    },
 }
 
 /// A delay as typed: 7d, 12h, 30m, 45s, or seconds.
@@ -1198,7 +1212,8 @@ fn print_not_heard(v: &Value) {
     println!("Your recovery is in effect, but these guardians have not heard of this device");
     println!("yet: {}.", names.join(", "));
     println!("Until they do, their devices do not answer it. It tells each of them the next");
-    println!("time a device of theirs is in touch; nothing needs doing.");
+    println!("time a device of theirs is in touch; nothing needs doing. For one who is not");
+    println!("coming back: `cardinal recover stop-waiting NAME`, or replace them as a guardian.");
 }
 
 fn print_recover(v: &Value) {
@@ -3207,6 +3222,35 @@ async fn client(cmd: Cmd) -> anyhow::Result<()> {
                 "Then read them this fingerprint: {}",
                 v["fingerprint"].as_str().unwrap_or("")
             );
+            Ok(())
+        }
+        Cmd::Recover {
+            cmd: Some(RecoverCmd::StopWaiting { who, all, yes }),
+        } => {
+            if !yes {
+                let whom = match &who {
+                    Some(w) => w.clone(),
+                    None => "the guardians who have not heard of this device".to_owned(),
+                };
+                println!(
+                    "This stops waiting for {whom}. Their devices will not answer this device \
+                     until they learn of it some other way. Nothing else is given up: they \
+                     stay your guardians and your contacts, as they were."
+                );
+                let said = prompt("Go on? Type yes: ")?;
+                anyhow::ensure!(said.eq_ignore_ascii_case("yes"), "nothing was done");
+            }
+            let v = call(
+                &paths,
+                json!({"cmd": "recover-stop-waiting", "who": who, "all": all}),
+            )
+            .await?;
+            println!("No longer waiting for {}.", names(&v["stopped"]));
+            if v["not_heard"].as_array().is_some_and(|n| !n.is_empty()) {
+                print_not_heard(&v);
+            } else {
+                println!("Nobody is waited for now.");
+            }
             Ok(())
         }
         Cmd::Recover {
