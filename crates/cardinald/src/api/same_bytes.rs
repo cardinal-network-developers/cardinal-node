@@ -1175,3 +1175,96 @@ async fn a_contact_and_before_are_the_bytes_they_were() {
         }
     }
 }
+
+/// A uint the encoding cannot hold is the error it was by name, wherever
+/// it is: in a debug build the request fails, `internal: ...`, naming it
+/// by its place; a list's are checked as a field's are; and a client's
+/// arguments are refused before they are sent.
+#[test]
+fn a_uint_too_large_is_the_error_it_was() {
+    let too = 1u64 << 60;
+    let file = |size| File {
+        added_by: None,
+        category: None,
+        folder: false,
+        mine: None,
+        name: "a".into(),
+        size: Some(size),
+        time: None,
+        versions: None,
+        who: None,
+        group: None,
+    };
+    for sizes in [vec![too], vec![1, too + 5], vec![u64::MAX, 2]] {
+        let reply = FilesReply {
+            files: sizes.iter().map(|s| file(*s)).collect(),
+            path: "p".into(),
+            place: Place::new("mine".into()),
+            more: false,
+            next: None,
+        };
+        let tree = json!({"path": "p", "place": {"kind": "mine"}, "more": false,
+            "files": sizes.iter().map(|s| json!({"name": "a", "folder": false, "size": s}))
+                .collect::<Vec<_>>()});
+        let spec = FilesArgs::REQUEST;
+        assert_eq!(
+            typed::reply_message(spec.name, &reply),
+            encode_reply(spec, Ok(&tree))
+        );
+    }
+    let at = typed::At::Top("t");
+    assert_eq!(
+        Wire::check(&vec![1u64, too], &at).unwrap_err(),
+        format!("t[1] should be below 2^60, not {too}")
+    );
+    let args = FilesArgs {
+        path: None,
+        after: Some(too),
+        limit: None,
+    };
+    let old = encode_request(&json!({"cmd": "files", "after": too})).unwrap_err();
+    assert_eq!(args.encode().unwrap_err().to_string(), old.to_string());
+    // an i64 as an int is
+    assert!(Wire::check(&(-(1i64 << 60)), &at).is_ok());
+    assert!(Wire::check(&(1i64 << 60), &at).is_err());
+}
+
+/// The kinds, ints and int-or-text values encode as the base encoding's
+/// values do, and read back as themselves.
+#[test]
+fn the_other_types_are_the_base_encodings() {
+    let at = typed::At::Top("t");
+    for n in [
+        0i64,
+        1,
+        -1,
+        23,
+        -24,
+        1 << 40,
+        -(1 << 59),
+        (1 << 60) - 1,
+        -(1 << 60),
+    ] {
+        let mut out = Vec::new();
+        n.encode_into(&mut out);
+        let v = Value::from(cardinal_encoding::Int::new(n).unwrap());
+        assert_eq!(out, v.encode(), "{n}");
+        assert_eq!(out.len(), n.encoded_len());
+        assert_eq!(i64::take(v, &at).unwrap(), n);
+    }
+    for k in [
+        typed::Kind::Number(4),
+        typed::Kind::Named(vec![7u8; 32].into()),
+    ] {
+        let mut out = Vec::new();
+        k.encode_into(&mut out);
+        let v = cardinal_encoding::decode(&out).unwrap();
+        assert_eq!(typed::Kind::take(v, &at).unwrap(), k);
+    }
+    for x in [typed::Scalar::Int(-3), typed::Scalar::Text("x".into())] {
+        let mut out = Vec::new();
+        x.encode_into(&mut out);
+        let v = cardinal_encoding::decode(&out).unwrap();
+        assert_eq!(typed::Scalar::take(v, &at).unwrap(), x);
+    }
+}

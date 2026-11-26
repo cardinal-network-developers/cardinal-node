@@ -6,13 +6,17 @@
 //!
 //! - **Typed** ([`typed`]): a request's arguments, its reply and each record
 //!   in it are Rust values, declared once in [`table`] with `typed!`, which
-//!   gives both the struct and its table row. Ids, keys and hashes are
+//!   gives both the struct and its table row; `asks!` declares the request
+//!   (how it is answered and paged), `streams!` a frame or an event,
+//!   `program!` what the service's program says. Ids, keys and hashes are
 //!   bytes; a value goes to the wire and back with no tree of names and no
-//!   hex. `files`, `messages` and `call` go this way.
+//!   hex. The connection answers a typed request from its row
+//!   ([`Request::answer`]).
 //! - **By name** (the rest, for now): the handler builds a JSON tree with
 //!   field names, and this module turns it into a record at the edge by the
-//!   tables in [`table`], hex becoming bytes. It goes once every request is
-//!   typed.
+//!   tables in [`table`], hex becoming bytes. Main's handlers of the typed
+//!   requests are kept by name too, in test and debug builds, to compare
+//!   with. It goes once every request is typed.
 //!
 //! The command line and the tests speak the same tables, through
 //! [`encode_request`] and [`decode_reply`] by name, or the typed values'

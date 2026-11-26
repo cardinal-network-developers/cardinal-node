@@ -44,10 +44,7 @@ fn write_out(report: &[u8]) -> anyhow::Result<()> {
 /// `--clear`'s answer as a record: done, or failed and why.
 fn cleared(said: &Value) -> Vec<u8> {
     match said["error"].as_str() {
-        None => {
-            let spec = api::program("--clear").expect("the table has it");
-            api::encode_reply(spec, Ok(&json!({})))
-        }
+        None => api::typed::reply_message("--clear", &api::Done {}),
         Some(why) => api::error_reply(status::FAILED, why),
     }
 }

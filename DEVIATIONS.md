@@ -2314,29 +2314,74 @@ asks for around that is not built yet.
     `api/table.rs` with `typed!`: the declaration is the struct, its row in
     the tables, and its encoding both ways (`api/typed.rs`), so they cannot
     drift. A field's Rust type gives its type in the tables: `String` or
-    `Cow<'static, str>` text, `bool`, `u64`, `[u8; N]` bytes (read back only
-    at exactly N), `api::typed::Reference` a ref, `Vec<T>` a list, a typed
-    record, and `Option<T>` a field sent only when it is `Some`; any other
-    field is always sent, and missing when read back is an error. `asks!`
-    makes a request's row from its typed arguments and reply, and
-    `control::typed` answers it: the record's fields straight into the
-    arguments, the handler's typed answer, the page cut by encoded length
-    (`api::typed::page_after`, `page_before`, counting as `api::page`
-    did), and the reply written straight to bytes. No JSON tree and no hex
-    on that way; ids stay bytes from the store to the socket. `files`,
-    `messages` and `call` go this way. The command line reads them typed
-    (`control::ask`, which also joins pages), and `--trace` is unchanged.
-    `api/same_bytes.rs` shows the bytes are what they were by name.
+    `Cow<'static, str>` text, `bool`, `u64` uint, `i64` int,
+    `api::typed::Kind` a kind, `api::typed::Scalar` int or text, `[u8; N]`
+    bytes of that length (read back only at exactly N), `bytes::Bytes`
+    bytes of any length, `api::typed::Reference` a ref, `Vec<T>` a list, a
+    typed record, and `Option<T>` a field sent only when it is `Some`.
+    `n gone name: T` is a number no longer used: its row stays, with the
+    type it had, and there is no struct field. A record that holds itself
+    (inspection's `value`) cannot be declared yet; it will need a boxed
+    field type.
+  - **What a record must have.** A field that is not an `Option` is one
+    this service always sends: there is no `Default`, and `Name::new` takes
+    exactly those fields, so a handler cannot forget one; read back, its
+    absence is an error. **A field added to a record after it was first
+    released is an `Option` for ever**, so that a newer client reads an
+    older service still running (the state after every update until the
+    service restarts). A reply a client cannot read is
+    `api::typed::Unreadable`, and the command line says it could not read
+    it, naming the field, not that the service is not running. `Option` is
+    only a record's field: an `Option` in a list, or of an `Option`, does
+    not compile. A uint of 2^60 or more anywhere in a reply is the error it
+    was by name: in a debug build the request fails (`internal: <where>
+    should be below 2^60, not <n>`), in a release build that field is left
+    out and logged; a client's arguments are refused before they are sent.
+  - **A request, declared once.** `asks!(ROW: n "name" Args -> Reply,
+    how)` gives its row, and `how` is `reads`, `reads unless <field>`,
+    `writes`, or `stream` (`watch`, `call-media`, answered by the
+    connection itself); a paged one adds `after <list>` or `before <list>
+    by <id>`. The row holds the request's answering, made from `impl
+    Answer for Args` (`control::typed`), so a typed request without a
+    handler does not compile; handlers are async. The page's list, `more`
+    and `next` are found by their names in the declaration, the page cut by
+    encoded length (`api::typed::page_after`, `page_before`, counting as
+    `api::page` did), and the command line's paging (`Ask::next_page`,
+    `join`) comes from the same declaration. The frames of `call-media`
+    and the events of `watch` are declared with `streams!`, the program's
+    replies (`--store`, `--clear`) with `program!`. No JSON tree and no hex
+    on the typed way; ids stay bytes from the store to the socket. The
+    command line reads typed replies with `control::ask`, which also joins
+    pages; `--trace` is unchanged.
   - **By name, for the rest until they are typed.** Their handlers build
     and read JSON trees by field name; `api` turns one form into the other
-    at the socket by the same tables, hex becoming bytes. The handlers
-    already typed are kept by name only as `*_by_name`, for the tests and
-    `cargo bench -p cardinald --bench interface --features by-name`, which
-    measures the two ways side by side. All of it goes once every request
-    is typed. `apps.md`'s tables of numbers are generated from
-    `api/table.rs`, typed rows and rows by name alike
+    at the socket by the same tables, hex becoming bytes.
+  - **The way by name, kept to compare.** While requests are converted,
+    main's handlers of the typed requests are kept whole, as `*_by_name`
+    (with main's lookups and main's arms in `control::handle`), compiled
+    only in test and debug builds and with the `by-name` feature, and
+    sharing nothing of the new code. In those builds a request declared
+    `reads` is answered by name too, beside the typed answer, and fails
+    (error 1, `internal: the typed reply to <request> is not the bytes it
+    was by name`, both shown) if the bytes differ: every test that asks it
+    compares. A request that writes cannot be answered twice; its cases are
+    written by hand in `api/same_bytes.rs`, on twins (two services on
+    copies of one device, one asked by name, one typed), covering success,
+    each refusal, and optional fields present and absent. What the twins
+    make apart (a group's id, a message's id and time, a path of each) is
+    swapped before the bytes are compared. All of the way by name goes once
+    every request is typed. `apps.md`'s tables of numbers are generated
+    from `api/table.rs`, typed rows and rows by name alike
     (`CARDINAL_API_TABLES=<file> cargo test -p cardinald --lib
     api::tests::tables`).
+  - **Old oddities kept, to be fixed one by one.** No byte changes while a
+    request is typed, even to something better. Kept so far, each with its
+    test in `api/same_bytes.rs`: a refused contact named by an id given as
+    bytes is named in the error NUL first ("you have refused \0<hex>");
+    `before` as text that is a space, then NUL and an id, is taken as that
+    id given as bytes (the way by name trimmed before telling them apart);
+    a `mount` reply of a path that is not UTF-8, which by name ended the
+    connection (a serializing panic), is sent with the bytes replaced.
   - **A reply field without a number** is this build's mistake. In a debug
     build, where the tests run, the request then fails; in a release build
     the field is left out and the service logs an error. A field no test

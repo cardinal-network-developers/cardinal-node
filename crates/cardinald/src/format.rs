@@ -153,6 +153,39 @@ pub fn says(paths: &Paths) -> serde_json::Value {
 /// interface): one record in the base encoding, numbered as the table
 /// [`crate::api::PROGRAM`] gives `--store`'s reply.
 pub fn report(paths: &Paths) -> Vec<u8> {
+    let found = crate::clear::found(paths);
+    let holds = crate::api::DataHeld {
+        identity: found.identity,
+        spaces: found.spaces,
+        objects: found.objects.0,
+        bytes: found.objects.1,
+        unsaved: found.staged.0,
+        unsaved_bytes: found.staged.1,
+        local: found.local.0,
+        local_bytes: found.local.1,
+        other: found.other,
+    };
+    let mut out = crate::api::StoreReply::new(holds, "current".into());
+    match of(paths) {
+        Store::Current => {}
+        Store::Empty => out.store = "empty".into(),
+        Store::Other(n) => {
+            out.store = "other".into();
+            out.written_by = Some(written_by(n).into());
+            out.refusal = Some(refusal(&paths.home, n));
+        }
+        Store::Unreadable => {
+            out.store = "unreadable".into();
+            out.refusal = Some(cannot_tell(&paths.home));
+        }
+    }
+    crate::api::typed::reply_message("--store", &out)
+}
+
+/// [`report`] as it was by name, from [`says`]: kept only to show the
+/// typed one writes the same bytes.
+#[cfg(test)]
+pub(crate) fn report_by_name(paths: &Paths) -> Vec<u8> {
     let spec = crate::api::program("--store").expect("the table has it");
     crate::api::encode_reply(spec, Ok(&says(paths)))
 }
@@ -303,6 +336,23 @@ mod tests {
                 unreachable!()
             };
             assert!(by.contains(written_by(n)), "{text:?}: {by}");
+        }
+    }
+
+    /// `--store`'s report, typed, is the bytes it was by name, for each
+    /// kind of store.
+    #[test]
+    fn the_report_is_the_bytes_it_was() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = at(&dir);
+        assert_eq!(report(&paths), report_by_name(&paths));
+        std::fs::write(paths.identity_log(), b"x").unwrap();
+        assert_eq!(report(&paths), report_by_name(&paths));
+        write(&paths).unwrap();
+        assert_eq!(report(&paths), report_by_name(&paths));
+        for text in ["1\n", "99\n", "not a number"] {
+            std::fs::write(marker(&paths), text).unwrap();
+            assert_eq!(report(&paths), report_by_name(&paths), "{text:?}");
         }
     }
 }

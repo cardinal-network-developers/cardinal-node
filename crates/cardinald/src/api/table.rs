@@ -1538,9 +1538,51 @@ pub static REQUESTS: &[Request] = &[
 
 // ---- What the service's program says without starting ----
 
-rec!(DATA_HELD "data held":
-    1 "bytes" U, 2 "identity" BOOL, 3 "local" U, 4 "local_bytes" U, 5 "objects" U,
-    6 "other" BOOL, 7 "spaces" U, 8 "unsaved" U, 9 "unsaved_bytes" U);
+typed!(DATA_HELD "data held" DataHeld {
+    1 bytes: u64,
+    2 identity: bool,
+    3 local: u64,
+    4 local_bytes: u64,
+    5 objects: u64,
+    6 other: bool,
+    7 spaces: u64,
+    8 unsaved: u64,
+    9 unsaved_bytes: u64,
+});
+
+typed!(
+    fields
+    /// `--store`: which data is there (`empty`, `current`, `other` or
+    /// `unreadable`) and what it holds; of another version's, who wrote it
+    /// and the refusal in words.
+    StoreReply {
+        2 holds: DataHeld,
+        3 refusal: Option<String>,
+        4 store: Cow<'static, str>,
+        5 written_by: Option<Cow<'static, str>>,
+    }
+);
+
+/// What the service's program says when asked, typed: its row, `ROW`, for
+/// [`PROGRAM`], from its reply's declaration. The program writes it and
+/// exits; nothing answers it on the socket.
+macro_rules! program {
+    ($row:ident: $n:literal $name:literal -> $reply:ident) => {
+        #[doc = concat!("The row of `", $name, "`, typed.")]
+        pub const $row: Request = Request {
+            n: $n,
+            name: $name,
+            args: &[],
+            reply: <$reply as Fields>::FIELDS,
+            page: Page::Whole,
+            gone: false,
+            answer: None,
+        };
+    };
+}
+
+program!(PROGRAM_STORE: 1 "--store" -> StoreReply);
+program!(PROGRAM_CLEAR: 2 "--clear" -> Done);
 
 /// What the service's program says without starting (`apps.md`, The local
 /// interface), by the option that asks it: one record on its standard
@@ -1548,11 +1590,7 @@ rec!(DATA_HELD "data held":
 /// which data is there and what it holds, counted without reading any of
 /// it; `--clear` removes data this version cannot read, or fails, saying
 /// why.
-pub static PROGRAM: &[Request] = &[
-    req!(1 "--store" () -> (
-        2 "holds" {DATA_HELD}, 3 "refusal" T, 4 "store" T, 5 "written_by" T)),
-    req!(2 "--clear" () -> ()),
-];
+pub static PROGRAM: &[Request] = &[PROGRAM_STORE, PROGRAM_CLEAR];
 
 typed!(
     fields
