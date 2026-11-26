@@ -230,24 +230,35 @@ macro_rules! typed {
         #[doc = concat!("The *", $title, "* record's row in the tables.")]
         pub static $stat: $crate::table::Rec = $crate::table::Rec {
             name: $title,
-            fields: &[ $( $crate::typed!(@row $a) ),* ],
+            // an item of its own, which every crate that names a row
+            // names, rather than a copy of it in each
+            fields: {
+                static FIELDS: [$crate::table::Field; $crate::typed!(@count $($a)*)] =
+                    [ $( $crate::typed!(@row $a) ),* ];
+                &FIELDS
+            },
         };
 
         impl $crate::typed::Wire for $name {
             const TY: $crate::table::Ty = $crate::table::Ty::Rec(&$stat);
             const LIST: $crate::table::Ty = $crate::table::Ty::Recs(&$stat);
+            #[inline]
             fn encode_into(&self, out: &mut Vec<u8>) {
                 $crate::typed::record_into(self, out)
             }
+            #[inline]
             fn encoded_len(&self) -> usize {
                 $crate::typed::record_len(self)
             }
+            #[inline]
             fn measured(&self) -> (usize, bool) {
                 $crate::typed::record_measured(self)
             }
+            #[inline]
             fn check(&self, at: &$crate::typed::At) -> Result<(), String> {
                 $crate::typed::record_check(self, at)
             }
+            #[inline]
             fn take(
                 v: $crate::__private::Value,
                 at: &$crate::typed::At,
@@ -260,10 +271,14 @@ macro_rules! typed {
     // their own, so that every crate that names them names the one.
     (@munch [$(#[$m:meta])* $name:ident] [] $s:tt $r:tt $o:tt $l:tt [$($a:tt)*]) => {
         $crate::typed!(@body [$(#[$m])* $name] ({
-            static FIELDS: &[$crate::table::Field] = &[ $( $crate::typed!(@row $a) ),* ];
-            FIELDS
+            static FIELDS: [$crate::table::Field; $crate::typed!(@count $($a)*)] =
+                [ $( $crate::typed!(@row $a) ),* ];
+            &FIELDS
         }) $s $r $o $l);
     };
+    // How many rows: one for each field, gone or not.
+    (@count $($a:tt)*) => { <[()]>::len(&[$($crate::typed!(@unit $a)),*]) };
+    (@unit $a:tt) => { () };
     (@body [$(#[$m:meta])* $name:ident] ($fields:expr)
         [$(($(#[$fm:meta])* $sf:ident : $st:ty))*]
         [$(($rf:ident : $rt:ty))*]
@@ -288,6 +303,8 @@ macro_rules! typed {
         impl $crate::typed::Fields for $name {
             const FIELDS: &'static [$crate::table::Field] = $fields;
 
+            #[inline]
+
             fn each<V: $crate::typed::Visit>(&self, v: &mut V) {
                 $( v.field(
                     const {
@@ -303,6 +320,7 @@ macro_rules! typed {
                 let _ = v;
             }
 
+            #[inline]
             #[allow(unused_mut, unused_variables)]
             fn take_fields(
                 mut r: $crate::__private::Record,
@@ -394,11 +412,13 @@ macro_rules! asks {
     (@by) => { None };
     (@by $id:ident) => { Some(stringify!($id)) };
     (@reads reads) => {
+        #[inline]
         fn reads(&self) -> bool {
             true
         }
     };
     (@reads reads $unless:ident $($or:ident)*) => {
+        #[inline]
         fn reads(&self) -> bool {
             self.$unless.is_none() $(&& self.$or.is_none())*
         }
@@ -410,6 +430,7 @@ macro_rules! asks {
     (@page before $list:ident $($rest:tt)*) => { Page::Before { list: stringify!($list) } };
     (@paging $args:ident $reply:ident) => {
         type Answered = $reply;
+        #[inline]
         fn reply_bytes(&self, reply: $reply) -> Vec<u8> {
             super::typed::reply_message(Self::REQUEST.name, &reply)
         }
@@ -426,6 +447,7 @@ macro_rules! asks {
     // (`Precut`): the old pager's `_page_from` and `_page_total`.
     (@paging $args:ident $reply:ident after $list:ident $(by $id:ident)? precut) => {
         type Answered = super::typed::Precut<$reply>;
+        #[inline]
         fn reply_bytes(&self, cut: super::typed::Precut<$reply>) -> Vec<u8> {
             let super::typed::Precut { mut reply, from, total } = cut;
             const SKIP: [u64; 3] = super::typed::paged_numbers(
@@ -456,6 +478,7 @@ macro_rules! asks {
     };
     (@paging $args:ident $reply:ident after $list:ident $(by $id:ident)?) => {
         type Answered = $reply;
+        #[inline]
         fn reply_bytes(&self, mut reply: $reply) -> Vec<u8> {
             // beside the reply's other fields: without the list, `more`, `next`
             const SKIP: [u64; 3] = super::typed::paged_numbers(
@@ -484,9 +507,11 @@ macro_rules! asks {
     };
     // How a client asks for one list page after page.
     (@pages $args:ident $reply:ident $list:ident) => {
+        #[inline]
         fn one_page(&self) -> bool {
             self.after.is_some() || self.limit.is_some()
         }
+        #[inline]
         fn next_page(&self, had: &$reply) -> Option<Self> {
             let next = had.next.filter(|_| had.more)?;
             Some($args {
@@ -494,12 +519,14 @@ macro_rules! asks {
                 ..self.clone()
             })
         }
+        #[inline]
         fn join(all: &mut $reply, page: $reply) -> bool {
             let grew = !page.$list.is_empty();
             all.$list.extend(page.$list);
             (all.more, all.next) = (page.more, page.next);
             grew
         }
+        #[inline]
         fn whole(all: &mut $reply) {
             (all.more, all.next) = (false, None);
         }
@@ -507,6 +534,7 @@ macro_rules! asks {
     (@paging $args:ident $reply:ident
         after $first:ident $(by $fid:ident)?, $($list:ident $(by $id:ident)?),+) => {
         type Answered = $reply;
+        #[inline]
         fn reply_bytes(&self, mut reply: $reply) -> Vec<u8> {
             use super::typed::PagedList;
             // beside the reply's other fields: without its lists, `more`, `next`
@@ -555,9 +583,11 @@ macro_rules! asks {
                 }
             }
         }
+        #[inline]
         fn one_page(&self) -> bool {
             self.after.is_some() || self.limit.is_some()
         }
+        #[inline]
         fn next_page(&self, had: &$reply) -> Option<Self> {
             let next = had.next.filter(|_| had.more)?;
             Some($args {
@@ -565,6 +595,7 @@ macro_rules! asks {
                 ..self.clone()
             })
         }
+        #[inline]
         fn join(all: &mut $reply, page: $reply) -> bool {
             use super::typed::PagedList;
             let mut grew = all.$first.extend_with(page.$first);
@@ -572,12 +603,14 @@ macro_rules! asks {
             (all.more, all.next) = (page.more, page.next);
             grew
         }
+        #[inline]
         fn whole(all: &mut $reply) {
             (all.more, all.next) = (false, None);
         }
     };
     (@paging $args:ident $reply:ident before $list:ident by $id:ident) => {
         type Answered = $reply;
+        #[inline]
         fn reply_bytes(&self, mut reply: $reply) -> Vec<u8> {
             const SKIP: [u64; 3] = super::typed::paged_numbers(
                 <$reply as Fields>::FIELDS,
@@ -600,9 +633,11 @@ macro_rules! asks {
                 Err(super::typed::Unpaged(msg)) => msg,
             }
         }
+        #[inline]
         fn one_page(&self) -> bool {
             self.before.is_some() || self.limit.is_some()
         }
+        #[inline]
         fn next_page(&self, had: &$reply) -> Option<Self> {
             let next = had.next.filter(|_| had.more)?;
             Some($args {
@@ -610,6 +645,7 @@ macro_rules! asks {
                 ..self.clone()
             })
         }
+        #[inline]
         fn join(all: &mut $reply, mut page: $reply) -> bool {
             let grew = !page.$list.is_empty();
             page.$list.append(&mut all.$list);
@@ -617,6 +653,7 @@ macro_rules! asks {
             (all.more, all.next) = (page.more, page.next);
             grew
         }
+        #[inline]
         fn whole(all: &mut $reply) {
             (all.more, all.next) = (false, None);
         }
@@ -1809,21 +1846,25 @@ impl std::ops::Deref for EpochShown {
 impl super::typed::Wire for EpochShown {
     const TY: Ty = Ty::Rec(&EPOCH);
     const LIST: Ty = Ty::Recs(&EPOCH);
+    #[inline]
     fn check(&self, at: &super::typed::At) -> Result<(), String> {
         match self.pending {
             Some(_) => Err(format!("{at}.pending has no number")),
             None => self.epoch.check(at),
         }
     }
+    #[inline]
     fn encode_into(&self, out: &mut Vec<u8>) {
         self.epoch.encode_into(out)
     }
+    #[inline]
     fn encoded_len(&self) -> usize {
         match self.pending {
             Some(_) => 0,
             None => self.epoch.encoded_len(),
         }
     }
+    #[inline]
     fn take(v: cardinal_encoding::Value, at: &super::typed::At) -> Result<Self, String> {
         Ok(EpochShown {
             epoch: InspectEpoch::take(v, at)?,

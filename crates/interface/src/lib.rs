@@ -258,6 +258,7 @@ pub fn short_id(id: &[u8; 32]) -> [u8; 8] {
 }
 
 /// Bytes in lower-case hex, as an error or a tool shows them.
+#[inline]
 pub fn hex(b: &[u8]) -> String {
     const DIGITS: &[u8; 16] = b"0123456789abcdef";
     let mut s = String::with_capacity(b.len() * 2);
@@ -269,6 +270,7 @@ pub fn hex(b: &[u8]) -> String {
 }
 
 /// The bytes of hex, of either case; `None` for anything else.
+#[inline]
 pub fn unhex(h: &str) -> Option<Vec<u8>> {
     fn digit(c: u8) -> Option<u8> {
         match c {
@@ -354,7 +356,7 @@ pub fn page_room(spec: &Request) -> usize {
 
 /// An error reply.
 pub fn error_reply(status: u64, why: &str) -> Vec<u8> {
-    Record::new().with(0, status).with(WHY, why).encode()
+    typed::error_message(status, why, &ErrorMore { at: None, id: None })
 }
 
 /// A `watch` event: something changed, and this is the count of changes.
@@ -365,6 +367,7 @@ pub fn event_message(seq: u64) -> Vec<u8> {
 /// The display form of a message, in the text rendering with the tables'
 /// names (`encoding.md#text-rendering`): for a tool that shows traffic.
 /// `fields` are the message's own, and `zero` names what key 0 holds.
+#[inline]
 pub fn render(msg: &[u8], zero: Zero, fields: &[Field], first: u64) -> String {
     let r = match Record::decode(msg) {
         Ok(r) => r,
@@ -413,6 +416,7 @@ pub enum Zero {
 }
 
 /// A request as a tool shows it.
+#[inline]
 pub fn render_request(msg: &[u8]) -> String {
     let fields = Record::decode(msg)
         .ok()
@@ -424,6 +428,7 @@ pub fn render_request(msg: &[u8]) -> String {
 
 /// A reply to `spec` as a tool shows it: an error's with the fields an
 /// error has.
+#[inline]
 pub fn render_reply(spec: &Request, msg: &[u8]) -> String {
     let failed = Record::decode(msg)
         .ok()
@@ -435,6 +440,7 @@ pub fn render_reply(spec: &Request, msg: &[u8]) -> String {
 
 /// A message of a stream (`watch`'s events, `call-media`'s frames) as a
 /// tool shows it.
+#[inline]
 pub fn render_stream(table: &'static [Request], msg: &[u8]) -> String {
     let fields = Record::decode(msg)
         .ok()
@@ -447,6 +453,7 @@ pub fn render_stream(table: &'static [Request], msg: &[u8]) -> String {
 /// Bytes longer than this are shown by their length and first bytes.
 const SHOWN_BYTES: usize = 32;
 
+#[inline]
 fn short(v: &Value) -> String {
     match v {
         Value::Bytes(b) if b.len() > SHOWN_BYTES => {
@@ -467,6 +474,7 @@ fn short(v: &Value) -> String {
     }
 }
 
+#[inline]
 fn render_value(ty: &Ty, v: &Value) -> String {
     match (ty, v) {
         (Ty::List(item), Value::List(items)) => {

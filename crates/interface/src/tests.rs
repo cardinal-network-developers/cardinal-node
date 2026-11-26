@@ -349,3 +349,15 @@ fn what_the_last_release_lacked_is_an_option() {
          Option): {wrong:?}"
     );
 }
+
+/// An error reply is the record it always was: its status and why.
+#[test]
+fn an_error_reply_is_status_and_why() {
+    for (st, why) in [(1u64, "no such folder"), (4, ""), (6, "ü\u{0}x")] {
+        let built = cardinal_encoding::Record::new()
+            .with(0, st)
+            .with(WHY, why)
+            .encode();
+        assert_eq!(error_reply(st, why), built);
+    }
+}
