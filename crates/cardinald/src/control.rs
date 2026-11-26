@@ -395,7 +395,9 @@ pub mod typed {
                 Err(refused) => return api::error_reply(refused.status, &refused.why),
             };
             let reply = answer_of(d, &a).await;
-            #[cfg(any(test, debug_assertions, feature = "by-name"))]
+            // not in the benchmark's build (`by-name` alone), which measures
+            // the typed way only
+            #[cfg(any(test, debug_assertions))]
             if a.reads() {
                 return beside(d, &a, reply).await;
             }
@@ -418,7 +420,7 @@ pub mod typed {
     /// two answers differ that are not wrong: the two ways are asked in
     /// turn, a few times, until one answer is the same as the one before
     /// it, the other way's.
-    #[cfg(any(test, debug_assertions, feature = "by-name"))]
+    #[cfg(any(test, debug_assertions))]
     async fn beside<A: Answer>(d: &Arc<Daemon>, a: &A, reply: Vec<u8>) -> Vec<u8> {
         const ASKS: usize = 8;
         let Ok(msg) = a.encode() else {

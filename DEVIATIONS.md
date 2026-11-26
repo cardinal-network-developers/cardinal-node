@@ -2360,11 +2360,14 @@ asks for around that is not built yet.
     main's handlers of the typed requests are kept whole, as `*_by_name`
     (with main's lookups and main's arms in `control::handle`), compiled
     only in test and debug builds and with the `by-name` feature, and
-    sharing nothing of the new code. In those builds a request declared
-    `reads` is answered by name too, beside the typed answer, and fails
+    sharing nothing of the new code. In test and debug builds (not with
+    `by-name` alone, which the benchmark uses) a request declared `reads`
+    is answered by name too, beside the typed answer, and fails
     (error 1, `internal: the typed reply to <request> is not the bytes it
     was by name`, both shown) if the bytes differ: every test that asks it
-    compares. A request that writes cannot be answered twice; its cases are
+    compares; the two ways are asked in turn, up to eight times, until one
+    answer is the other's before it, for what changes between two asks (a
+    live call's counts). A request that writes cannot be answered twice; its cases are
     written by hand in `api/same_bytes.rs`, on twins (two services on
     copies of one device, one asked by name, one typed), covering success,
     each refusal, and optional fields present and absent. What the twins
