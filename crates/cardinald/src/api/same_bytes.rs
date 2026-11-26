@@ -151,6 +151,40 @@ impl Twins {
         typed
     }
 
+    /// As [`Twins::same_as`], for a request each twin answers with what it
+    /// makes its own of (a group's id): `made` reads those from a reply,
+    /// and they are told alike before the two are compared.
+    async fn same_made<A: Ask>(
+        &mut self,
+        old: Json,
+        new: Json,
+        made: impl Fn(&A::Reply) -> Vec<Vec<u8>>,
+    ) -> Vec<u8> {
+        let (_, msg) = encode_request(&old).unwrap();
+        let by_name = crate::control::by_name(&self.old, &msg).await;
+        let (_, msg) = encode_request(&new).unwrap();
+        let typed = crate::control::typed::reply(&self.new, &msg)
+            .await
+            .expect("a typed request");
+        if let (Ok(Ok(o)), Ok(Ok(n))) = (read_reply::<A>(&by_name), read_reply::<A>(&typed)) {
+            for (o, n) in made(&o).into_iter().zip(made(&n)) {
+                if o != n {
+                    self.alike(&o, &n);
+                }
+            }
+        }
+        let by_name = self.swapped(by_name);
+        let spec = by_name_or_first(&new);
+        assert_eq!(
+            by_name,
+            typed,
+            "{new}\n by name {}\n typed   {}",
+            render_reply(spec, &by_name),
+            render_reply(spec, &typed)
+        );
+        typed
+    }
+
     /// A message, not by name, to both: the same bytes back.
     async fn same_message(&self, msg: &[u8]) -> Vec<u8> {
         let by_name = crate::control::by_name(&self.old, msg).await;
@@ -212,7 +246,7 @@ async fn typed_replies_are_the_bytes_they_were_by_name() {
         .await
         .unwrap();
     let g = crate::groups::create(&d, "Kin", &[], false, true).unwrap();
-    let group = g["group"].as_str().unwrap().to_owned();
+    let group = hex::encode(g.group);
     for path in ["", "Docs", "Docs/inner", "Groups", "Groups/Kin"] {
         same(&d, json!({"cmd": "files", "path": path})).await;
     }
@@ -1010,7 +1044,7 @@ async fn the_one_folder_is_changed_the_same() {
     // ---- share, with a group made on each twin ----
     let made = |d: &Arc<Daemon>| {
         let g = crate::groups::create(d, "Kin", &[], false, true).unwrap();
-        hex::decode(g["group"].as_str().unwrap()).unwrap()
+        g.group.to_vec()
     };
     let (go, gn) = (made(&t.old), made(&t.new));
     t.alike(&go, &gn);
@@ -1121,7 +1155,7 @@ async fn a_contact_and_before_are_the_bytes_they_were() {
     // `before`, in a group's conversation
     let made = |d: &Arc<Daemon>| {
         let g = crate::groups::create(d, "Kin", &[], false, true).unwrap();
-        hex::decode(g["group"].as_str().unwrap()).unwrap()
+        g.group.to_vec()
     };
     let (go, gn) = (made(&t.old), made(&t.new));
     t.alike(&go, &gn);
@@ -1440,7 +1474,7 @@ fn a_contact(t: &Twins, name: &str, n: u8) -> [u8; 32] {
 fn a_group(t: &mut Twins, name: &str) -> (Vec<u8>, Vec<u8>) {
     let made = |d: &Arc<Daemon>| {
         let g = crate::groups::create(d, name, &[], false, true).unwrap();
-        hex::decode(g["group"].as_str().unwrap()).unwrap()
+        g.group.to_vec()
     };
     let (go, gn) = (made(&t.old), made(&t.new));
     t.alike(&go, &gn);
@@ -1651,5 +1685,313 @@ async fn invitations_are_made_and_taken_up_the_same() {
         for d in inviters {
             let _ = d.stopping.send(true);
         }
+    }
+}
+
+/// Waits until `now` holds, a few seconds at most.
+async fn until(what: &str, now: impl Fn() -> bool) {
+    for _ in 0..300 {
+        if now() {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    panic!("{what} did not happen");
+}
+
+/// For each twin a device of someone else's, a contact of that twin's
+/// called `name` (they call the twin "Me"), made by an invitation taken up:
+/// both running, with the twins, so that what they offer comes. Their
+/// identities are told alike.
+async fn befriended(t: &mut Twins, dir: &std::path::Path, name: &str) -> [Arc<Daemon>; 2] {
+    let mut them = Vec::new();
+    for (twin, d) in [("old", t.old.clone()), ("new", t.new.clone())] {
+        let (paths, config) = crate::testing::set_up(&dir.join(format!("{name}-{twin}")));
+        let x = Daemon::start(paths, config).await.unwrap();
+        tokio::spawn(x.clone().run());
+        let code = crate::contacts::invite(&x, None, None, Default::default())
+            .unwrap()
+            .code;
+        let met = cardinal_space::account::Met {
+            how: cardinal_space::account::MET_THEIR_INVITATION,
+            ..Default::default()
+        };
+        crate::contacts::accept(&d, &code, Some(name), Default::default(), met, true)
+            .await
+            .unwrap();
+        them.push(x);
+    }
+    let id = |d: &Arc<Daemon>| d.core().identity.as_ref().unwrap().id();
+    t.alike(&id(&them[0]), &id(&them[1]));
+    t.alike(&id(&them[0])[..8], &id(&them[1])[..8]);
+    [them[0].clone(), them[1].clone()]
+}
+
+/// A group of `x`'s, offered to the twin they know as "Me", once it is
+/// on that twin: its id.
+async fn offered(x: &Arc<Daemon>, twin: &Arc<Daemon>, name: &str) -> [u8; 32] {
+    let me = vec![typed::Reference::Typed("Me".into())];
+    let g = crate::groups::create(x, name, &me, false, true).unwrap();
+    until(&format!("the offer of {name}"), || {
+        let list = crate::groups::list(twin);
+        let offers = list["offers"].as_array().cloned().unwrap_or_default();
+        offers.iter().any(|o| o["name"] == name)
+            && twin
+                .core()
+                .spaces
+                .get(&g.group)
+                .is_some_and(|h| h.space.is_some())
+    })
+    .await;
+    g.group
+}
+
+/// The groups' requests that are not listings: made, offered, joined,
+/// declined, changed, left and come back to; with every refusal before
+/// them, a ref as text, as the start of an id and as bytes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn groups_are_changed_the_same() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut t = Twins::start(dir.path()).await;
+    tokio::spawn(t.old.clone().run());
+    tokio::spawn(t.new.clone().run());
+    let bea = befriended(&mut t, dir.path(), "Bea").await;
+    let bea_id = |i: usize| bea[i].core().identity.as_ref().unwrap().id();
+    let g32 = |r: &GroupCreateReply| vec![r.group.to_vec()];
+
+    // ---- group-create ----
+    for req in [
+        json!({"cmd": "group-create"}),
+        json!({"cmd": "group-create", "name": "  "}),
+        json!({"cmd": "group-create", "name": "X", "people": ["Nobody"]}),
+        json!({"cmd": "group-create", "name": "X", "people": [exact(&[1; 8])]}),
+        json!({"cmd": "group-create", "people": ["Bea"]}),
+    ] {
+        t.same(req).await;
+    }
+    let made = |name: &str, extra: Json| {
+        let mut r = json!({"cmd": "group-create", "name": name});
+        for (k, v) in extra.as_object().unwrap() {
+            r[k] = v.clone();
+        }
+        r
+    };
+    t.same_made::<GroupCreateArgs>(made("Alone", json!({})), made("Alone", json!({})), g32)
+        .await;
+    t.same_made::<GroupCreateArgs>(
+        made(" Call ", json!({"for_call": true, "history": false})),
+        made(" Call ", json!({"for_call": true, "history": false})),
+        g32,
+    )
+    .await;
+    let mine = |i: usize| {
+        made(
+            "Mine",
+            json!({"people": [if i == 0 { exact(&bea_id(0)[..8]) } else { exact(&bea_id(1)[..8]) }], "for_call": false}),
+        )
+    };
+    t.same_made::<GroupCreateArgs>(mine(0), mine(1), g32).await;
+    t.same_made::<GroupCreateArgs>(
+        made("Theirs", json!({"people": ["Bea"], "history": true})),
+        made("Theirs", json!({"people": ["Bea"], "history": true})),
+        g32,
+    )
+    .await;
+    t.same_message(&message_of(
+        71,
+        vec![(1, Value::from("X")), (2, Value::from("Bea"))],
+    ))
+    .await;
+    t.same_message(&message_of(
+        71,
+        vec![
+            (1, Value::from("X")),
+            (2, Value::List(vec![Value::from(1u64)])),
+        ],
+    ))
+    .await;
+
+    // ---- group-add, group-set, group-member, group-role ----
+    for req in [
+        json!({"cmd": "group-add"}),
+        json!({"cmd": "group-add", "group": "Nobody", "people": ["Bea"]}),
+        json!({"cmd": "group-add", "group": "Call", "people": ["Bea"]}),
+        json!({"cmd": "group-add", "group": "Mine", "people": ["Nobody"]}),
+        json!({"cmd": "group-add", "group": "Mine"}),
+        json!({"cmd": "group-add", "group": "Mine", "people": ["Bea"], "shown": "B"}),
+        json!({"cmd": "group-add", "group": "Mine", "people": ["Bea"]}),
+        json!({"cmd": "group-set"}),
+        json!({"cmd": "group-set", "group": "Nobody"}),
+        json!({"cmd": "group-set", "group": "Mine", "for_call": true}),
+        json!({"cmd": "group-set", "group": "Mine"}),
+        json!({"cmd": "group-set", "group": "Mine", "name": "  "}),
+        json!({"cmd": "group-set", "group": "Mine", "introductions": false}),
+        json!({"cmd": "group-set", "group": "Call", "for_call": false}),
+        json!({"cmd": "group-set", "group": "Alone", "name": " Lone ", "introductions": true, "for_call": false}),
+        json!({"cmd": "group-member"}),
+        json!({"cmd": "group-member", "group": "Mine"}),
+        json!({"cmd": "group-member", "group": "Mine", "who": "Nobody"}),
+        json!({"cmd": "group-member", "group": "Mine", "who": "Bea", "shown": "Bee"}),
+        json!({"cmd": "group-member", "group": "Mine", "who": "Bee", "introduce": false}),
+        json!({"cmd": "group-member", "group": "Mine", "who": "Bea", "shown": "B2", "introduce": true}),
+        json!({"cmd": "group-role"}),
+        json!({"cmd": "group-role", "group": "Mine", "who": "Bea"}),
+        json!({"cmd": "group-role", "group": "Mine", "who": "Bea", "role": "owner"}),
+        json!({"cmd": "group-role", "group": "Mine", "who": "Bea", "role": "boss"}),
+        json!({"cmd": "group-role", "group": "Mine", "who": "Nobody", "role": "admin"}),
+        json!({"cmd": "group-role", "group": "Mine", "who": "Me", "role": "admin"}),
+        json!({"cmd": "group-role", "group": "Mine", "who": "Bea", "role": "member"}),
+        json!({"cmd": "group-role", "group": "Mine", "who": "Bea", "role": "admin"}),
+        json!({"cmd": "group-role", "group": "Lone", "who": "Bea", "role": "admin"}),
+    ] {
+        t.same(req).await;
+    }
+    // by the member's id, whole and its start, as bytes and typed
+    for (o, n) in [
+        (exact(&bea_id(0)), exact(&bea_id(1))),
+        (exact(&bea_id(0)[..8]), exact(&bea_id(1)[..8])),
+        (hex::encode(&bea_id(0)[..8]), hex::encode(&bea_id(1)[..8])),
+    ] {
+        let req = |who: &str| json!({"cmd": "group-member", "group": "Mine", "who": who, "introduce": true});
+        t.same_as(req(&o), req(&n)).await;
+        let req =
+            |who: &str| json!({"cmd": "group-role", "group": "Mine", "who": who, "role": "admin"});
+        t.same_as(req(&o), req(&n)).await;
+    }
+    // a member without a node of their own is shown by the ref as given
+    let me = t.old.core().identity.as_ref().unwrap().id();
+    t.same(json!({"cmd": "group-member", "group": "Lone", "who": exact(&me)}))
+        .await;
+    t.same(json!({"cmd": "group-member", "group": "Lone", "who": exact(&[2; 32])}))
+        .await;
+    let ids = |r: &GroupRoleReply| {
+        let mut v = vec![r.group.to_vec()];
+        v.extend(r.was.map(|w| w.to_vec()));
+        v
+    };
+    // lowered: the group goes on under a new id
+    let req = json!({"cmd": "group-role", "group": "Mine", "who": "Bea", "role": "reader"});
+    t.same_made::<GroupRoleArgs>(req.clone(), req, ids).await;
+    t.same(json!({"cmd": "group-role", "group": exact(&[7; 32]), "who": "Bea", "role": "member"}))
+        .await;
+    t.same_message(&message_of(82, vec![(3, Value::from(true))]))
+        .await;
+
+    // ---- group-remove ----
+    for req in [
+        json!({"cmd": "group-remove"}),
+        json!({"cmd": "group-remove", "group": "Mine"}),
+        json!({"cmd": "group-remove", "group": "Mine", "who": "Nobody"}),
+        json!({"cmd": "group-remove", "group": "Mine", "who": "Me"}),
+        json!({"cmd": "group-remove", "group": "Lone", "who": "Bea"}),
+    ] {
+        t.same(req).await;
+    }
+    let ids = |r: &GroupRemoveReply| vec![r.group.to_vec(), r.was.to_vec()];
+    let msg = t
+        .same_made::<GroupRemoveArgs>(
+            json!({"cmd": "group-remove", "group": "Theirs", "who": exact(&bea_id(0))}),
+            json!({"cmd": "group-remove", "group": "Theirs", "who": exact(&bea_id(1))}),
+            ids,
+        )
+        .await;
+    assert_eq!(typed_of::<GroupRemoveArgs>(&msg).left_out.len(), 1);
+    // taken out already: named as given, NUL first as bytes
+    t.same_as(
+        json!({"cmd": "group-remove", "group": "Theirs", "who": exact(&bea_id(0))}),
+        json!({"cmd": "group-remove", "group": "Theirs", "who": exact(&bea_id(1))}),
+    )
+    .await;
+
+    // ---- offered: group-join, group-reach, group-decline ----
+    let club = [
+        offered(&bea[0], &t.old, "Club").await,
+        offered(&bea[1], &t.new, "Club").await,
+    ];
+    t.alike(&club[0], &club[1]);
+    let other = [
+        offered(&bea[0], &t.old, "Other").await,
+        offered(&bea[1], &t.new, "Other").await,
+    ];
+    t.alike(&other[0], &other[1]);
+    for req in [
+        json!({"cmd": "group-reach", "group": "Club", "share": true}),
+        json!({"cmd": "group-join"}),
+        json!({"cmd": "group-join", "group": "Nobody"}),
+        json!({"cmd": "group-join", "group": "Alone"}),
+        json!({"cmd": "group-join", "group": "Club", "reach": true}),
+        json!({"cmd": "group-join", "group": "Club"}),
+        json!({"cmd": "group-reach"}),
+        json!({"cmd": "group-reach", "share": true}),
+        json!({"cmd": "group-reach", "group": "Club"}),
+        json!({"cmd": "group-reach", "group": "Club", "share": true}),
+        json!({"cmd": "group-reach", "group": "Club", "share": true, "host": "Desk"}),
+        json!({"cmd": "group-reach", "group": "Club", "share": false, "host": "Desk"}),
+        json!({"cmd": "group-reach", "group": "Club", "share": false}),
+        json!({"cmd": "group-reach", "group": "Nobody", "share": false}),
+        json!({"cmd": "group-decline"}),
+        json!({"cmd": "group-decline", "group": "Club"}),
+        json!({"cmd": "group-decline", "group": "Nobody"}),
+    ] {
+        t.same(req).await;
+    }
+    // what the above did: joined, said no to sharing, refused declining
+    let r = typed_of::<GroupJoinArgs>(&t.same(json!({"cmd": "group-join", "group": "Club"})).await);
+    assert_eq!(r, GroupJoinReply::new(), "joined already");
+    let by_id = |g: &[u8]| json!({"cmd": "group-decline", "group": exact(g)});
+    let r = t.same_as(by_id(&other[0]), by_id(&other[1])).await;
+    typed_of::<GroupDeclineArgs>(&r);
+    t.same_as(by_id(&other[0]), by_id(&other[1])).await;
+    t.same(json!({"cmd": "group-join", "group": "Other"})).await;
+
+    // ---- group-leave and group-rejoin ----
+    for req in [
+        json!({"cmd": "group-leave"}),
+        json!({"cmd": "group-leave", "group": "Nobody"}),
+        json!({"cmd": "group-leave", "group": "Mine"}),
+        json!({"cmd": "group-leave", "group": "Mine", "admins": ["Nobody"]}),
+        json!({"cmd": "group-leave", "group": "Mine", "admins": ["Me"]}),
+        json!({"cmd": "group-leave", "group": "Club", "admins": ["Bea"]}),
+        json!({"cmd": "group-rejoin"}),
+        json!({"cmd": "group-rejoin", "group": "Nobody"}),
+        json!({"cmd": "group-rejoin", "group": "Mine"}),
+        json!({"cmd": "group-leave", "group": "Club", "anyway": false}),
+        json!({"cmd": "group-rejoin", "group": "Club"}),
+        json!({"cmd": "group-leave", "group": "Mine", "admins": ["Bea", "Bea"], "anyway": true}),
+        json!({"cmd": "group-rejoin", "group": "Mine"}),
+        json!({"cmd": "group-leave", "group": "Alone"}),
+        json!({"cmd": "group-rejoin", "group": "Lone"}),
+        json!({"cmd": "group-rejoin", "group": exact(&[6; 32])}),
+    ] {
+        t.same(req).await;
+    }
+    t.same_as(
+        json!({"cmd": "group-rejoin", "group": exact(&club[0])}),
+        json!({"cmd": "group-rejoin", "group": exact(&club[1])}),
+    )
+    .await;
+    // Mine was left and come back to, by its owner
+    let r = typed_of::<GroupLeaveArgs>(
+        &t.same(json!({"cmd": "group-leave", "group": "Mine", "admins": ["Bea"]}))
+            .await,
+    );
+    assert_eq!(r.admins, ["Bea"]);
+    let r = typed_of::<GroupRejoinArgs>(
+        &t.same(json!({"cmd": "group-rejoin", "group": "Mine"}))
+            .await,
+    );
+    assert_eq!(r.name, "Mine");
+    t.same_message(&message_of(
+        74,
+        vec![(1, Value::from("Mine")), (3, Value::from("yes"))],
+    ))
+    .await;
+    t.same_message(&message_of(87, vec![(1, Value::from(1u64))]))
+        .await;
+    for d in [&t.old, &t.new] {
+        let _ = d.stopping.send(true);
+    }
+    for d in bea {
+        let _ = d.stopping.send(true);
     }
 }

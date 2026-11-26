@@ -1292,6 +1292,125 @@ typed!(
 );
 asks!(ACCEPT: 43 "accept" AcceptArgs -> AcceptReply, writes);
 
+// ---- Groups ----
+
+typed!(fields GroupCreateArgs {
+    1 name: Option<String>,
+    2 people: Option<Vec<Reference>>,
+    3 for_call: Option<bool>,
+    4 history: Option<bool>,
+});
+typed!(
+    fields
+    /// A group, by its id, and what it is called.
+    GroupCreateReply {
+        2 group: [u8; 32],
+        3 name: String,
+    }
+);
+asks!(GROUP_CREATE: 71 "group-create" GroupCreateArgs -> GroupCreateReply, writes);
+typed!(fields GroupJoinArgs {
+    1 group: Option<Reference>,
+    2 reach: Option<bool>,
+});
+typed!(
+    fields
+    /// Nothing, of a group joined already.
+    GroupJoinReply {
+        2 group: Option<[u8; 32]>,
+        3 name: Option<String>,
+        4 shared: Option<bool>,
+        5 waiting: Option<bool>,
+    }
+);
+asks!(GROUP_JOIN: 72 "group-join" GroupJoinArgs -> GroupJoinReply, writes);
+typed!(fields GroupDeclineArgs {
+    1 group: Option<Reference>,
+});
+asks!(GROUP_DECLINE: 73 "group-decline" GroupDeclineArgs -> Done, writes);
+typed!(fields GroupLeaveArgs {
+    1 group: Option<Reference>,
+    2 admins: Option<Vec<Reference>>,
+    3 anyway: Option<bool>,
+});
+typed!(
+    fields
+    /// Whom leaving made admins, by the names this person sees.
+    GroupLeaveReply {
+        2 admins: Vec<String>,
+    }
+);
+asks!(GROUP_LEAVE: 74 "group-leave" GroupLeaveArgs -> GroupLeaveReply, writes);
+typed!(fields GroupReachArgs {
+    1 group: Option<Reference>,
+    2 share: Option<bool>,
+    3 host: Option<String>,
+});
+typed!(
+    fields
+    /// Of a share or not: whether the hosts are named, or waiting to be;
+    /// of one host taken out: whether it was named there.
+    GroupReachReply {
+        2 shared: Option<bool>,
+        3 waiting: Option<bool>,
+        4 taken_out: Option<bool>,
+    }
+);
+asks!(GROUP_REACH_SET: 75 "group-reach" GroupReachArgs -> GroupReachReply, writes);
+typed!(fields GroupAddArgs {
+    1 group: Option<Reference>,
+    2 people: Option<Vec<Reference>>,
+    3 shown: Option<String>,
+});
+asks!(GROUP_ADD: 76 "group-add" GroupAddArgs -> Done, writes);
+typed!(fields GroupRemoveArgs {
+    1 group: Option<Reference>,
+    2 who: Option<Reference>,
+});
+typed!(
+    fields
+    /// The group that stands in its place, those it left out, and the one
+    /// it was.
+    GroupRemoveReply {
+        2 group: [u8; 32],
+        3 left_out: Vec<[u8; 32]>,
+        4 was: [u8; 32],
+    }
+);
+asks!(GROUP_REMOVE: 77 "group-remove" GroupRemoveArgs -> GroupRemoveReply, writes);
+typed!(fields GroupSetArgs {
+    1 group: Option<Reference>,
+    2 name: Option<String>,
+    3 introductions: Option<bool>,
+    4 for_call: Option<bool>,
+});
+asks!(GROUP_SET: 79 "group-set" GroupSetArgs -> Done, writes);
+typed!(fields GroupMemberArgs {
+    1 group: Option<Reference>,
+    2 who: Option<Reference>,
+    3 shown: Option<String>,
+    4 introduce: Option<bool>,
+});
+asks!(GROUP_MEMBER: 80 "group-member" GroupMemberArgs -> Done, writes);
+typed!(fields GroupRoleArgs {
+    1 group: Option<Reference>,
+    2 who: Option<Reference>,
+    3 role: Option<String>,
+});
+typed!(
+    fields
+    /// The group, and of a role lowered, the one it succeeded.
+    GroupRoleReply {
+        2 group: [u8; 32],
+        3 was: Option<[u8; 32]>,
+    }
+);
+asks!(GROUP_ROLE: 82 "group-role" GroupRoleArgs -> GroupRoleReply, writes);
+typed!(fields GroupRejoinArgs {
+    1 group: Option<Reference>,
+});
+asks!(GROUP_REJOIN: 87 "group-rejoin" GroupRejoinArgs -> GroupCreateReply, writes);
+
 // ---- Networks, hosts and peers ----
 
 typed!(fields RouterArgs {
@@ -1521,31 +1640,26 @@ pub static REQUESTS: &[Request] = &[
     paged!(after 70 "groups" (1 "after" U, 2 "limit" U) -> (
         2 "groups" [GROUP], 3 "offers" [OFFER], 4 "more" BOOL, 5 "next" U,
         6 "rejoin" [REJOIN])),
-    req!(71 "group-create" (1 "name" T, 2 "people" [REF], 3 "for_call" BOOL, 4 "history" BOOL) -> (
-        2 "group" B, 3 "name" T)),
-    req!(72 "group-join" (1 "group" REF, 2 "reach" BOOL) -> (
-        2 "group" B, 3 "name" T, 4 "shared" BOOL, 5 "waiting" BOOL)),
-    req!(73 "group-decline" (1 "group" REF) -> ()),
-    req!(74 "group-leave" (1 "group" REF, 2 "admins" [REF], 3 "anyway" BOOL) -> (
-        2 "admins" [T])),
-    req!(75 "group-reach" (1 "group" REF, 2 "share" BOOL, 3 "host" T) -> (
-        2 "shared" BOOL, 3 "waiting" BOOL, 4 "taken_out" BOOL)),
-    req!(76 "group-add" (1 "group" REF, 2 "people" [REF], 3 "shown" T) -> ()),
-    req!(77 "group-remove" (1 "group" REF, 2 "who" REF) -> (
-        2 "group" B, 3 "left_out" [B], 4 "was" B)),
+    GROUP_CREATE,
+    GROUP_JOIN,
+    GROUP_DECLINE,
+    GROUP_LEAVE,
+    GROUP_REACH_SET,
+    GROUP_ADD,
+    GROUP_REMOVE,
     paged!(after 78 "group-members" (1 "group" REF, 2 "after" U, 3 "limit" U) -> (
         2 "group" B, 3 "members" [MEMBER], 4 "name" T, 5 "more" BOOL, 6 "next" U)),
-    req!(79 "group-set" (1 "group" REF, 2 "name" T, 3 "introductions" BOOL, 4 "for_call" BOOL) -> ()),
-    req!(80 "group-member" (1 "group" REF, 2 "who" REF, 3 "shown" T, 4 "introduce" BOOL) -> ()),
+    GROUP_SET,
+    GROUP_MEMBER,
     req!(81 "group-connect" (1 "group" REF, 2 "who" REF, 3 "note" T) -> (2 "asked" BOOL)),
-    req!(82 "group-role" (1 "group" REF, 2 "who" REF, 3 "role" T) -> (2 "group" B, 3 "was" B)),
+    GROUP_ROLE,
     req!(83 "group-post-again" (1 "group" REF) -> (2 "posted" U)),
     req!(84 "group-moved-seen" (1 "group" REF) -> ()),
     req!(85 "group-confirm-move" (1 "group" REF, 2 "moves" [B], 3 "to" [B]) -> (2 "kept" U)),
     req!(86 "group-leaving" (1 "group" REF) -> (
         2 "admins" [T], 3 "choose_admin" BOOL, 4 "group" B, 5 "name" T,
         6 "relayed_for" [RELAYED_FOR])),
-    req!(87 "group-rejoin" (1 "group" REF) -> (2 "group" B, 3 "name" T)),
+    GROUP_REJOIN,
     // ---- Calls and the clipboard: 100 to 119 ----
     CALL_NOW,
     CALL_START,

@@ -148,6 +148,17 @@ fn pick(all: Vec<Found>, asked: &str, declined: &[SpaceId]) -> anyhow::Result<Fo
     }
 }
 
+/// [`pick`], by a `ref` as it came.
+fn pick_ref(all: Vec<Found>, asked: Ref<'_>, declined: &[SpaceId]) -> anyhow::Result<Found> {
+    match asked {
+        Ref::Typed(t) => pick(all, t, declined),
+        id @ Ref::Id(_) => all
+            .into_iter()
+            .find(|g| id.is_id(&g.id))
+            .ok_or_else(|| anyhow::anyhow!("there is no group {id}")),
+    }
+}
+
 /// A joined group, to write in.
 fn joined(d: &Daemon, group: &str) -> anyhow::Result<Found> {
     match find_among(d, api::reference(group), true) {
@@ -192,8 +203,10 @@ fn may_manage(sp: &Space, me: &[u8; 32]) -> bool {
 
 /// Contacts by what this person calls them; refused ones are not offered
 /// anything.
-fn people(d: &Daemon, who: &[String]) -> anyhow::Result<Vec<ContactRecord>> {
-    who.iter().map(|w| contacts::listed(d, w)).collect()
+fn people(d: &Daemon, who: &[api::typed::Reference]) -> anyhow::Result<Vec<ContactRecord>> {
+    who.iter()
+        .map(|w| contacts::listed_ref(d, w.as_ref()))
+        .collect()
 }
 
 /// The name the others in a group are shown for a contact, unless the adder
@@ -238,10 +251,10 @@ pub(crate) fn offer_to(d: &Arc<Daemon>, id: &SpaceId, who: &[[u8; 32]]) -> anyho
 pub fn create(
     d: &Arc<Daemon>,
     name: &str,
-    who: &[String],
+    who: &[api::typed::Reference],
     for_call: bool,
     history: bool,
-) -> anyhow::Result<Json> {
+) -> anyhow::Result<api::GroupCreateReply> {
     let name = name.trim();
     anyhow::ensure!(!name.is_empty(), "a group needs a name");
     let theirs = people(d, who)?;
@@ -263,18 +276,21 @@ pub fn create(
         d.push(&id, vec![g]);
     }
     d.bump();
-    Ok(json!({"group": hex::encode(id), "name": name}))
+    Ok(api::GroupCreateReply {
+        group: id,
+        name: name.to_owned(),
+    })
 }
 
 /// Adds contacts to a group, with the names the others will see, and offers
 /// it to them.
 pub fn add(
     d: &Arc<Daemon>,
-    group: &str,
-    who: &[String],
+    group: Ref<'_>,
+    who: &[api::typed::Reference],
     shown: Option<&str>,
-) -> anyhow::Result<Json> {
-    let g = joined(d, group)?;
+) -> anyhow::Result<()> {
+    let g = joined_ref(d, group)?;
     let me = identity(d)?;
     {
         let core = d.core();
@@ -299,7 +315,7 @@ pub fn add(
     d.push(&g.id, vec![bytes]);
     offer(d, &g.id, &g.name, &theirs)?;
     d.bump();
-    Ok(json!({}))
+    Ok(())
 }
 
 /// Nobody is added to a group whose policy does not share its history, nor
@@ -312,41 +328,6 @@ fn shares_history(sp: &Space, name: &str) -> anyhow::Result<()> {
          it: make a new group for them instead"
     );
     Ok(())
-}
-
-/// The member of a group someone means: typed, a contact by their
-/// petname, or anyone by the name the group shows for them; as bytes, the
-/// member with that id (as `group-members` gives it) or identity.
-fn member_named(contacts: &[ContactRecord], sp: &Space, who: &str) -> anyhow::Result<[u8; 32]> {
-    let in_it = |id: &[u8; 32]| sp.validity().members.iter().any(|m| m.identity == *id);
-    if let asked @ Ref::Id(_) = api::reference(who) {
-        // one identity may be named with several roles
-        let mut found: Vec<[u8; 32]> = sp.validity().members.iter().map(|m| m.identity).collect();
-        found.retain(|id| asked.is_id(id));
-        found.sort();
-        found.dedup();
-        let who = api::shown(who);
-        return match found.as_slice() {
-            [id] => Ok(*id),
-            [] => anyhow::bail!("nobody in it has the id {who}"),
-            _ => anyhow::bail!("more than one in it has an id starting {who}: give it whole"),
-        };
-    }
-    if let Some(c) = contacts
-        .iter()
-        .find(|c| c.petname == who && in_it(&c.identity))
-    {
-        return Ok(c.identity);
-    }
-    let found: Vec<Member> = group::members(sp)
-        .into_iter()
-        .filter(|m| m.name.as_deref() == Some(who))
-        .collect();
-    match found.as_slice() {
-        [m] => Ok(m.identity),
-        [] => anyhow::bail!("nobody in it is called {who}"),
-        _ => anyhow::bail!("more than one in it is called {who}"),
-    }
 }
 
 /// [`member_named`], by a `ref` as it came.
@@ -416,15 +397,19 @@ fn staying(
 /// owner succeeds the group with one that leaves them out, and the others'
 /// devices follow (`profiles.md#group`). The group goes on under a new id;
 /// the old one still finds it here.
-pub async fn remove(d: &Arc<Daemon>, group: &str, who: &str) -> anyhow::Result<Json> {
-    let g = joined(d, group)?;
+pub async fn remove(
+    d: &Arc<Daemon>,
+    group: Ref<'_>,
+    who: &api::typed::Reference,
+) -> anyhow::Result<api::GroupRemoveReply> {
+    let g = joined_ref(d, group)?;
     let me = identity(d)?;
     let (them, owner) = {
         let core = d.core();
         let contacts = core.contacts();
         let sp = core.spaces.get(&g.id).and_then(|h| h.space.as_ref());
         let sp = sp.ok_or_else(|| anyhow::anyhow!("that group is not open yet"))?;
-        (member_named(&contacts, sp, who)?, sp.owner())
+        (member_named_ref(&contacts, sp, who.as_ref())?, sp.owner())
     };
     anyhow::ensure!(them != me, "to leave {}, leave it", g.name);
     anyhow::ensure!(
@@ -432,20 +417,23 @@ pub async fn remove(d: &Arc<Daemon>, group: &str, who: &str) -> anyhow::Result<J
         "only the owner of {} can take someone out of it",
         g.name
     );
+    // An old oddity, kept to the byte (DEVIATIONS.md, Old oddities kept):
+    // they are named as the way by name held them, NUL first as bytes.
+    let held = who.held();
     let done = crate::following::succeed(d, &g.id, |sp| {
         anyhow::ensure!(
             sp.role_of(&them).is_some(),
-            "{who} is not in {} any more",
+            "{held} is not in {} any more",
             g.name
         );
         Ok(staying(sp, Some(&them), None))
     })
     .await?;
-    Ok(json!({
-        "group": hex::encode(done.new),
-        "was": hex::encode(g.id),
-        "left_out": done.left_out.iter().map(hex::encode).collect::<Vec<_>>(),
-    }))
+    Ok(api::GroupRemoveReply {
+        group: done.new,
+        left_out: done.left_out,
+        was: g.id,
+    })
 }
 
 /// The role a client names, as `group-members` says them: `reader`,
@@ -464,31 +452,38 @@ fn role_named(role: &str) -> anyhow::Result<u64> {
 /// admin or the owner, as an addition is: roles are only given. A lower one
 /// is the owner succeeding the group with one that names them with it
 /// (`profiles.md#group`, "Making an admin an ordinary member again").
-pub async fn set_role(d: &Arc<Daemon>, group: &str, who: &str, role: &str) -> anyhow::Result<Json> {
+pub async fn set_role(
+    d: &Arc<Daemon>,
+    group: Ref<'_>,
+    who: &api::typed::Reference,
+    role: &str,
+) -> anyhow::Result<api::GroupRoleReply> {
     let role = role_named(role)?;
-    let g = joined(d, group)?;
+    let g = joined_ref(d, group)?;
     let me = identity(d)?;
     let (them, now, owner, mine) = {
         let core = d.core();
         let contacts = core.contacts();
         let sp = core.spaces.get(&g.id).and_then(|h| h.space.as_ref());
         let sp = sp.ok_or_else(|| anyhow::anyhow!("that group is not open yet"))?;
-        let them = member_named(&contacts, sp, who)?;
+        let them = member_named_ref(&contacts, sp, who.as_ref())?;
         // Someone who left comes back by `group-add` or `group-rejoin`,
         // never by being given a role (`apps.md`, `group-role`).
         anyhow::ensure!(
             !sp.has_left(&them),
             "{} has left {}: a role is not given to someone who left. They come back by being \
              added again, or by rejoining",
-            api::shown(who),
+            who.as_ref(),
             g.name
         );
         (them, sp.role_of(&them), sp.owner(), sp.role_of(&me))
     };
     anyhow::ensure!(them != me, "you cannot change your own role");
-    let now = now.ok_or_else(|| anyhow::anyhow!("{who} is not in {}", g.name))?;
+    // An old oddity, kept to the byte (DEVIATIONS.md, Old oddities kept):
+    // they are named as the way by name held them, NUL first as bytes.
+    let now = now.ok_or_else(|| anyhow::anyhow!("{} is not in {}", who.held(), g.name))?;
     if role == now {
-        return Ok(json!({"group": hex::encode(g.id)}));
+        return Ok(api::GroupRoleReply::new(g.id));
     }
     if role > now {
         anyhow::ensure!(
@@ -498,7 +493,7 @@ pub async fn set_role(d: &Arc<Daemon>, group: &str, who: &str, role: &str) -> an
         );
         d.write_and_push(&g.id, vec![SpaceOp::add_member(them, role)])?;
         d.bump();
-        return Ok(json!({"group": hex::encode(g.id)}));
+        return Ok(api::GroupRoleReply::new(g.id));
     }
     anyhow::ensure!(
         owner == Some(me),
@@ -507,7 +502,10 @@ pub async fn set_role(d: &Arc<Daemon>, group: &str, who: &str, role: &str) -> an
     );
     let done = crate::following::succeed(d, &g.id, |sp| Ok(staying(sp, None, Some((&them, role)))))
         .await?;
-    Ok(json!({"group": hex::encode(done.new), "was": hex::encode(g.id)}))
+    Ok(api::GroupRoleReply {
+        group: done.new,
+        was: Some(g.id),
+    })
 }
 
 /// Posts again in a group what this device wrote before it moved on and
@@ -538,11 +536,11 @@ pub fn post_again(d: &Arc<Daemon>, group: &str) -> anyhow::Result<Json> {
 /// by name, and leaves only `anyway`.
 pub fn leave(
     d: &Arc<Daemon>,
-    group: &str,
-    admins: &[String],
+    group: Ref<'_>,
+    admins: &[api::typed::Reference],
     anyway: bool,
-) -> anyhow::Result<Json> {
-    let g = joined(d, group)?;
+) -> anyhow::Result<api::GroupLeaveReply> {
+    let g = joined_ref(d, group)?;
     let me = identity(d)?;
     let (made, names) = {
         let core = d.core();
@@ -553,11 +551,14 @@ pub fn leave(
         let members = group::members(sp);
         let mut made: Vec<[u8; 32]> = Vec::new();
         for who in admins {
-            let them = member_named(&contacts, sp, who)?;
+            let them = member_named_ref(&contacts, sp, who.as_ref())?;
             anyhow::ensure!(them != me, "you are leaving {}: name someone else", g.name);
+            // An old oddity, kept to the byte (DEVIATIONS.md, Old oddities
+            // kept): named as the way by name held them, NUL first as bytes.
             anyhow::ensure!(
                 !sp.has_left(&them),
-                "{who} has left {}: name someone still in it",
+                "{} has left {}: name someone still in it",
+                who.held(),
                 g.name
             );
             if !made.contains(&them) {
@@ -621,7 +622,7 @@ pub fn leave(
     }
     crate::mailbox::revoke_left(d, &g.id);
     d.bump();
-    Ok(json!({"admins": names}))
+    Ok(api::GroupLeaveReply { admins: names })
 }
 
 /// How what this person writes in a group gets to another member, as
@@ -856,23 +857,29 @@ fn rejoinable_json(core: &Core, me: &[u8; 32]) -> Vec<Json> {
 /// the leave left there until they share their host again. Whoever writes
 /// next in it starts a key that is theirs too, and with it they read what
 /// was written while they were away.
-pub fn rejoin(d: &Arc<Daemon>, group: &str) -> anyhow::Result<Json> {
+pub fn rejoin(
+    d: &Arc<Daemon>,
+    group: &api::typed::Reference,
+) -> anyhow::Result<api::GroupCreateReply> {
+    let (held, group) = (group.held(), group.as_ref());
     let me = identity(d)?;
     let (found, left_some) = {
         let core = d.core();
-        let found = pick(left_groups(&core, &me), group, &[]);
+        let found = pick_ref(left_groups(&core, &me), group, &[]);
         (found, left_any(&core, &me, group))
     };
     let g = match found {
         Ok(g) => g,
         Err(e) => {
-            if let Ok(g) = find(d, group) {
+            if let Ok(g) = find_among(d, group, false) {
                 anyhow::bail!("you are in {} already", g.name);
             }
-            // left, and not one who looks after it
+            // left, and not one who looks after it; an old oddity, kept to
+            // the byte (DEVIATIONS.md, Old oddities kept): the group named
+            // as the way by name held it, NUL first as bytes
             anyhow::ensure!(
                 !left_some,
-                "only an owner or admin of {group} can add themselves back: ask one of them \
+                "only an owner or admin of {held} can add themselves back: ask one of them \
                  to add you"
             );
             return Err(e);
@@ -886,11 +893,14 @@ pub fn rejoin(d: &Arc<Daemon>, group: &str) -> anyhow::Result<Json> {
     }
     d.write_and_push(&g.id, vec![SpaceOp::add_member(me, group::ADMIN)])?;
     d.bump();
-    Ok(json!({"group": hex::encode(g.id), "name": g.name}))
+    Ok(api::GroupCreateReply {
+        group: g.id,
+        name: g.name,
+    })
 }
 
 /// Whether this person left a group `group` names, whatever their role.
-fn left_any(core: &Core, me: &[u8; 32], group: &str) -> bool {
+fn left_any(core: &Core, me: &[u8; 32], group: Ref<'_>) -> bool {
     let all: Vec<Found> = core
         .spaces
         .iter()
@@ -905,7 +915,7 @@ fn left_any(core: &Core, me: &[u8; 32], group: &str) -> bool {
             )
         })
         .collect();
-    pick(all, group, &[]).is_ok()
+    pick_ref(all, group, &[]).is_ok()
 }
 
 /// What is said of this person's reach node in a group, for a client to
@@ -966,16 +976,12 @@ pub fn naming_hosts_to(core: &Core, who: &[u8; 32]) -> Json {
 }
 
 /// What the person has to be asked, in words.
-fn question(reach: &Json, name: &str) -> String {
-    let list = |v: &Json| -> Vec<String> {
-        let all = v.as_array().into_iter().flatten();
-        all.filter_map(|x| x.as_str().map(str::to_owned)).collect()
-    };
-    let who = list(&reach["who"]);
-    let what = list(&reach["what"]).join(", ");
+fn question(reach: &api::GroupReach, name: &str) -> String {
+    let who = &reach.who;
+    let what = reach.what.join(", ");
     // A public space is read by anyone at all, whoever is in it now, and
     // the question says so.
-    if reach["public"] == true {
+    if reach.public {
         return format!(
             "{name} is public: anyone at all can read it, and would learn where your host is \
              ({what}), now and whoever joins it later. Say whether to share it there: with \
@@ -1001,8 +1007,12 @@ fn question(reach: &Json, name: &str) -> String {
 /// to say: `reach` is their answer, and without it nothing is written.
 /// Anywhere, among contacts too, `reach` is their answer if they give one.
 /// `shared` in what comes back says whether the list names a host.
-pub async fn join(d: &Arc<Daemon>, group: &str, reach: Option<bool>) -> anyhow::Result<Json> {
-    let g = find(d, group)?;
+pub async fn join(
+    d: &Arc<Daemon>,
+    group: Ref<'_>,
+    reach: Option<bool>,
+) -> anyhow::Result<api::GroupJoinReply> {
+    let g = find_among(d, group, false)?;
     join_found(d, g, reach).await
 }
 
@@ -1013,7 +1023,7 @@ pub(crate) async fn join_exact(
     d: &Arc<Daemon>,
     id: &SpaceId,
     reach: Option<bool>,
-) -> anyhow::Result<Json> {
+) -> anyhow::Result<api::GroupJoinReply> {
     let me = identity(d)?;
     let g = {
         let core = d.core();
@@ -1030,14 +1040,18 @@ pub(crate) async fn join_exact(
     join_found(d, g, reach).await
 }
 
-async fn join_found(d: &Arc<Daemon>, g: Found, reach: Option<bool>) -> anyhow::Result<Json> {
+async fn join_found(
+    d: &Arc<Daemon>,
+    g: Found,
+    reach: Option<bool>,
+) -> anyhow::Result<api::GroupJoinReply> {
     if g.joined {
-        return Ok(json!({}));
+        return Ok(api::GroupJoinReply::new());
     }
     let me = identity(d)?;
     let (t, telling) = {
         let core = d.core();
-        (core.telling(&g.id), telling_json(&core, &g.id, &me))
+        (core.telling(&g.id), telling_of(&core, &g.id, &me))
     };
     anyhow::ensure!(
         !t.ask() || reach.is_some(),
@@ -1069,8 +1083,12 @@ async fn join_found(d: &Arc<Daemon>, g: Found, reach: Option<bool>) -> anyhow::R
         d.core().keep_yes(&g.id);
     }
     d.bump();
-    let (group, name) = (hex::encode(g.id), g.name);
-    Ok(json!({"group": group, "name": name, "shared": shared, "waiting": waiting}))
+    Ok(api::GroupJoinReply {
+        group: Some(g.id),
+        name: Some(g.name),
+        shared: Some(shared),
+        waiting: Some(waiting),
+    })
 }
 
 /// Says whether the members of a group have where this person's hosts are,
@@ -1083,9 +1101,13 @@ async fn join_found(d: &Arc<Daemon>, g: Found, reach: Option<bool>) -> anyhow::R
 /// With no host a yes has nothing to share, and fails saying so: nothing
 /// is kept for when there is one. With a host that cannot be reached now
 /// the yes is kept on this device, and `waiting` says so.
-pub async fn set_reach(d: &Arc<Daemon>, group: &str, share: bool) -> anyhow::Result<Json> {
+pub async fn set_reach(
+    d: &Arc<Daemon>,
+    group: Ref<'_>,
+    share: bool,
+) -> anyhow::Result<api::GroupReachReply> {
     use crate::mailbox::Shared;
-    let g = joined(d, group)?;
+    let g = joined_ref(d, group)?;
     if !share {
         // Written even where the list is empty already: a yes that
         // another of their devices keeps for later gives way to a list
@@ -1094,7 +1116,11 @@ pub async fn set_reach(d: &Arc<Daemon>, group: &str, share: bool) -> anyhow::Res
         d.core().drop_yes(&g.id);
         d.core().told_of_all(&g.id);
         d.bump();
-        return Ok(json!({"shared": false, "waiting": false}));
+        return Ok(api::GroupReachReply {
+            shared: Some(false),
+            waiting: Some(false),
+            taken_out: None,
+        });
     }
     let waiting = match crate::mailbox::share_reach(d, &g.id).await? {
         Shared::Named => false,
@@ -1107,24 +1133,36 @@ pub async fn set_reach(d: &Arc<Daemon>, group: &str, share: bool) -> anyhow::Res
     };
     d.core().told_of_all(&g.id);
     d.bump();
-    Ok(json!({"shared": !waiting, "waiting": waiting}))
+    Ok(api::GroupReachReply {
+        shared: Some(!waiting),
+        waiting: Some(waiting),
+        taken_out: None,
+    })
 }
 
 /// The person takes one host of theirs out of a group's list (D75): the
 /// account records "not this host here", so it does not name itself there
 /// again until they say `share`.
-pub async fn no_host(d: &Arc<Daemon>, group: &str, host: &str) -> anyhow::Result<Json> {
-    let g = joined(d, group)?;
+pub async fn no_host(
+    d: &Arc<Daemon>,
+    group: Ref<'_>,
+    host: &str,
+) -> anyhow::Result<api::GroupReachReply> {
+    let g = joined_ref(d, group)?;
     let key = crate::mailbox::host_by_name(d, host)?;
     let named = crate::mailbox::take_out_host(d, &g.id, &key).await?;
     d.bump();
-    Ok(json!({"taken_out": named}))
+    Ok(api::GroupReachReply {
+        shared: None,
+        waiting: None,
+        taken_out: Some(named),
+    })
 }
 
 /// Says no to a group offered to this person. Nothing is written in it, and
 /// it is not offered again.
-pub fn decline(d: &Arc<Daemon>, group: &str) -> anyhow::Result<Json> {
-    let g = find(d, group)?;
+pub fn decline(d: &Arc<Daemon>, group: Ref<'_>) -> anyhow::Result<()> {
+    let g = find_among(d, group, false)?;
     anyhow::ensure!(!g.joined, "you are in {}: leave it instead", g.name);
     let account = d
         .core()
@@ -1137,7 +1175,7 @@ pub fn decline(d: &Arc<Daemon>, group: &str) -> anyhow::Result<Json> {
     // once the decline reaches them.
     crate::calls::stop_ringing_in(d, &g.id, true);
     d.bump();
-    Ok(json!({}))
+    Ok(())
 }
 
 /// What this person calls a member: themselves, a contact's petname, or the
@@ -1964,18 +2002,18 @@ pub fn mark_read(d: &Arc<Daemon>, group: &str) -> anyhow::Result<Json> {
 /// Renames a group, or says whether its members are introduced through it.
 pub fn set(
     d: &Arc<Daemon>,
-    group: &str,
+    group: Ref<'_>,
     name: Option<&str>,
     introductions: Option<bool>,
     for_call: Option<bool>,
-) -> anyhow::Result<Json> {
+) -> anyhow::Result<()> {
     // Only a genesis makes a group one made for a call: refused before
     // anything is written.
     anyhow::ensure!(
         for_call != Some(true),
         "only a new group is made for a call: make one with group-create"
     );
-    let g = joined(d, group)?;
+    let g = joined_ref(d, group)?;
     let me = identity(d)?;
     let ops = {
         let core = d.core();
@@ -2005,7 +2043,7 @@ pub fn set(
         d.write_and_push(&g.id, ops)?;
     }
     d.bump();
-    Ok(json!({}))
+    Ok(())
 }
 
 /// Why a group was not renamed.
@@ -2036,7 +2074,8 @@ pub fn rename(d: &Arc<Daemon>, group: &SpaceId, name: &str) -> Result<(), NotAdm
             )));
         }
     }
-    set(d, &hex::encode(group), Some(name), None, None).map_err(NotAdmin::Other)?;
+    let id = hex::encode(group);
+    set(d, Ref::Typed(&id), Some(name), None, None).map_err(NotAdmin::Other)?;
     Ok(())
 }
 
@@ -2044,12 +2083,12 @@ pub fn rename(d: &Arc<Daemon>, group: &SpaceId, name: &str) -> Result<(), NotAdm
 /// introduced through the group.
 pub fn set_member(
     d: &Arc<Daemon>,
-    group: &str,
-    who: &str,
+    group: Ref<'_>,
+    who: &api::typed::Reference,
     shown: Option<&str>,
     introduce: Option<bool>,
-) -> anyhow::Result<Json> {
-    let g = joined(d, group)?;
+) -> anyhow::Result<()> {
+    let g = joined_ref(d, group)?;
     let me = identity(d)?;
     let ops = {
         let core = d.core();
@@ -2060,7 +2099,7 @@ pub fn set_member(
             "only an admin of {} can change that",
             g.name
         );
-        let them = member_named(&core.contacts(), sp, who)?;
+        let them = member_named_ref(&core.contacts(), sp, who.as_ref())?;
         let node = group::members(sp)
             .into_iter()
             .find(|m| m.identity == them)
@@ -2075,9 +2114,12 @@ pub fn set_member(
                     ops.push(group::set_member_introduce(node, i));
                 }
             }
+            // An old oddity, kept to the byte (DEVIATIONS.md, Old oddities
+            // kept): without `shown`, the member is shown by the ref as the
+            // way by name held it, NUL and hex where it came as bytes.
             None => ops.push(group::create_member(
                 &them,
-                shown.unwrap_or(who),
+                shown.unwrap_or(&who.held()),
                 introduce.unwrap_or(true),
             )),
         }
@@ -2085,7 +2127,7 @@ pub fn set_member(
     };
     d.write_and_push(&g.id, ops)?;
     d.bump();
-    Ok(json!({}))
+    Ok(())
 }
 
 /// That this person may write in a group they are in, by its id, and its
@@ -2683,7 +2725,7 @@ pub(crate) fn to_ring_by_name(
     let mut out: Vec<ContactRecord> = Vec::new();
     for who in named {
         let shown = api::shown(who);
-        let them = member_named(&contacts, sp, who)
+        let them = member_named_by_name(&contacts, sp, who)
             .map_err(|e| anyhow::anyhow!("{shown} cannot be rung: {e}"))?;
         anyhow::ensure!(them != me, "{shown} is you: you are not rung");
         anyhow::ensure!(
@@ -2702,4 +2744,632 @@ pub(crate) fn to_ring_by_name(
         }
     }
     Ok(out)
+}
+
+/// `people` as main had it, by name.
+#[cfg(any(test, debug_assertions, feature = "by-name"))]
+#[allow(dead_code, clippy::all)]
+fn people_by_name(d: &Daemon, who: &[String]) -> anyhow::Result<Vec<ContactRecord>> {
+    who.iter().map(|w| contacts::listed_by_name(d, w)).collect()
+}
+
+/// `create` as main had it, by name.
+#[cfg(any(test, debug_assertions, feature = "by-name"))]
+#[allow(dead_code, clippy::all)]
+pub fn create_by_name(
+    d: &Arc<Daemon>,
+    name: &str,
+    who: &[String],
+    for_call: bool,
+    history: bool,
+) -> anyhow::Result<Json> {
+    let name = name.trim();
+    anyhow::ensure!(!name.is_empty(), "a group needs a name");
+    let theirs = people_by_name(d, who)?;
+    let me_as = crate::names::my_name(d);
+    let members: Vec<([u8; 32], String)> = theirs
+        .iter()
+        .map(|c| (c.identity, offered_as(c).to_owned()))
+        .collect();
+    let id = d
+        .core()
+        .create_group_with(name, &me_as, &members, for_call, history)?;
+    let genesis = {
+        let core = d.core();
+        let open = core.spaces.get(&id).and_then(|h| h.space.as_ref());
+        open.and_then(|s| s.sealed(&id).map(|s| s.encode()))
+    };
+    offer(d, &id, name, &theirs)?;
+    if let Some(g) = genesis {
+        d.push(&id, vec![g]);
+    }
+    d.bump();
+    Ok(json!({"group": hex::encode(id), "name": name}))
+}
+
+/// `add` as main had it, by name.
+#[cfg(any(test, debug_assertions, feature = "by-name"))]
+#[allow(dead_code, clippy::all)]
+pub fn add_by_name(
+    d: &Arc<Daemon>,
+    group: &str,
+    who: &[String],
+    shown: Option<&str>,
+) -> anyhow::Result<Json> {
+    let g = joined_by_name(d, group)?;
+    let me = identity(d)?;
+    {
+        let core = d.core();
+        let sp = core.spaces.get(&g.id).and_then(|h| h.space.as_ref());
+        let sp = sp.ok_or_else(|| anyhow::anyhow!("that group is not open yet"))?;
+        anyhow::ensure!(
+            may_manage(sp, &me),
+            "only an admin of {} can add people",
+            g.name
+        );
+        shares_history(sp, &g.name)?;
+    }
+    let theirs = people_by_name(d, who)?;
+    let members: Vec<([u8; 32], String)> = theirs
+        .iter()
+        .map(|c| {
+            let name = shown.filter(|_| theirs.len() == 1).unwrap_or(offered_as(c));
+            (c.identity, name.to_owned())
+        })
+        .collect();
+    let bytes = d.core().add_to_group(&g.id, &members)?;
+    d.push(&g.id, vec![bytes]);
+    offer(d, &g.id, &g.name, &theirs)?;
+    d.bump();
+    Ok(json!({}))
+}
+
+/// `member_named` as main had it, by name.
+#[cfg(any(test, debug_assertions, feature = "by-name"))]
+#[allow(dead_code, clippy::all)]
+fn member_named_by_name(
+    contacts: &[ContactRecord],
+    sp: &Space,
+    who: &str,
+) -> anyhow::Result<[u8; 32]> {
+    let in_it = |id: &[u8; 32]| sp.validity().members.iter().any(|m| m.identity == *id);
+    if let asked @ Ref::Id(_) = api::reference(who) {
+        // one identity may be named with several roles
+        let mut found: Vec<[u8; 32]> = sp.validity().members.iter().map(|m| m.identity).collect();
+        found.retain(|id| asked.is_id(id));
+        found.sort();
+        found.dedup();
+        let who = api::shown(who);
+        return match found.as_slice() {
+            [id] => Ok(*id),
+            [] => anyhow::bail!("nobody in it has the id {who}"),
+            _ => anyhow::bail!("more than one in it has an id starting {who}: give it whole"),
+        };
+    }
+    if let Some(c) = contacts
+        .iter()
+        .find(|c| c.petname == who && in_it(&c.identity))
+    {
+        return Ok(c.identity);
+    }
+    let found: Vec<Member> = group::members(sp)
+        .into_iter()
+        .filter(|m| m.name.as_deref() == Some(who))
+        .collect();
+    match found.as_slice() {
+        [m] => Ok(m.identity),
+        [] => anyhow::bail!("nobody in it is called {who}"),
+        _ => anyhow::bail!("more than one in it is called {who}"),
+    }
+}
+
+/// `remove` as main had it, by name.
+#[cfg(any(test, debug_assertions, feature = "by-name"))]
+#[allow(dead_code, clippy::all)]
+pub async fn remove_by_name(d: &Arc<Daemon>, group: &str, who: &str) -> anyhow::Result<Json> {
+    let g = joined_by_name(d, group)?;
+    let me = identity(d)?;
+    let (them, owner) = {
+        let core = d.core();
+        let contacts = core.contacts();
+        let sp = core.spaces.get(&g.id).and_then(|h| h.space.as_ref());
+        let sp = sp.ok_or_else(|| anyhow::anyhow!("that group is not open yet"))?;
+        (member_named_by_name(&contacts, sp, who)?, sp.owner())
+    };
+    anyhow::ensure!(them != me, "to leave {}, leave it", g.name);
+    anyhow::ensure!(
+        owner == Some(me),
+        "only the owner of {} can take someone out of it",
+        g.name
+    );
+    let done = crate::following::succeed(d, &g.id, |sp| {
+        anyhow::ensure!(
+            sp.role_of(&them).is_some(),
+            "{who} is not in {} any more",
+            g.name
+        );
+        Ok(staying(sp, Some(&them), None))
+    })
+    .await?;
+    Ok(json!({
+        "group": hex::encode(done.new),
+        "was": hex::encode(g.id),
+        "left_out": done.left_out.iter().map(hex::encode).collect::<Vec<_>>(),
+    }))
+}
+
+/// `set_role` as main had it, by name.
+#[cfg(any(test, debug_assertions, feature = "by-name"))]
+#[allow(dead_code, clippy::all)]
+pub async fn set_role_by_name(
+    d: &Arc<Daemon>,
+    group: &str,
+    who: &str,
+    role: &str,
+) -> anyhow::Result<Json> {
+    let role = role_named(role)?;
+    let g = joined_by_name(d, group)?;
+    let me = identity(d)?;
+    let (them, now, owner, mine) = {
+        let core = d.core();
+        let contacts = core.contacts();
+        let sp = core.spaces.get(&g.id).and_then(|h| h.space.as_ref());
+        let sp = sp.ok_or_else(|| anyhow::anyhow!("that group is not open yet"))?;
+        let them = member_named_by_name(&contacts, sp, who)?;
+        // Someone who left comes back by `group-add` or `group-rejoin`,
+        // never by being given a role (`apps.md`, `group-role`).
+        anyhow::ensure!(
+            !sp.has_left(&them),
+            "{} has left {}: a role is not given to someone who left. They come back by being \
+             added again, or by rejoining",
+            api::shown(who),
+            g.name
+        );
+        (them, sp.role_of(&them), sp.owner(), sp.role_of(&me))
+    };
+    anyhow::ensure!(them != me, "you cannot change your own role");
+    let now = now.ok_or_else(|| anyhow::anyhow!("{who} is not in {}", g.name))?;
+    if role == now {
+        return Ok(json!({"group": hex::encode(g.id)}));
+    }
+    if role > now {
+        anyhow::ensure!(
+            mine.is_some_and(|r| r >= group::ADMIN),
+            "only an admin of {} can give someone a role",
+            g.name
+        );
+        d.write_and_push(&g.id, vec![SpaceOp::add_member(them, role)])?;
+        d.bump();
+        return Ok(json!({"group": hex::encode(g.id)}));
+    }
+    anyhow::ensure!(
+        owner == Some(me),
+        "only the owner of {} can lower someone's role",
+        g.name
+    );
+    let done = crate::following::succeed(d, &g.id, |sp| Ok(staying(sp, None, Some((&them, role)))))
+        .await?;
+    Ok(json!({"group": hex::encode(done.new), "was": hex::encode(g.id)}))
+}
+
+/// `leave` as main had it, by name.
+#[cfg(any(test, debug_assertions, feature = "by-name"))]
+#[allow(dead_code, clippy::all)]
+pub fn leave_by_name(
+    d: &Arc<Daemon>,
+    group: &str,
+    admins: &[String],
+    anyway: bool,
+) -> anyhow::Result<Json> {
+    let g = joined_by_name(d, group)?;
+    let me = identity(d)?;
+    let (made, names) = {
+        let core = d.core();
+        let sp = core.spaces.get(&g.id).and_then(|h| h.space.as_ref());
+        let sp = sp.ok_or_else(|| anyhow::anyhow!("that group is not open yet"))?;
+        anyhow::ensure!(sp.role_of(&me).is_some(), "you are not in {}", g.name);
+        let contacts = core.contacts();
+        let members = group::members(sp);
+        let mut made: Vec<[u8; 32]> = Vec::new();
+        for who in admins {
+            let them = member_named_by_name(&contacts, sp, who)?;
+            anyhow::ensure!(them != me, "you are leaving {}: name someone else", g.name);
+            anyhow::ensure!(
+                !sp.has_left(&them),
+                "{who} has left {}: name someone still in it",
+                g.name
+            );
+            if !made.contains(&them) {
+                made.push(them);
+            }
+        }
+        anyhow::ensure!(
+            made.is_empty() || may_manage(sp, &me),
+            "only an admin of {} can make someone an admin",
+            g.name
+        );
+        let names: Vec<String> = made
+            .iter()
+            .map(|m| name_of(&me, &contacts, &members, m))
+            .collect();
+        let left = Leaving::of(&core, &g.id, sp, &me);
+        if left.choose_admin && made.is_empty() {
+            let others: Vec<String> = left.others.iter().map(|(_, n)| n.clone()).collect();
+            anyhow::bail!(
+                "Who looks after {name}? You own it, and once you leave nobody in it can add \
+                 anyone, you included. Choose one or more of {who} to be its admins: \
+                 cardinal group leave {name} --admin <member>",
+                name = g.name,
+                who = others.join(", "),
+            );
+        }
+        if !left.relayed_for.is_empty() && !anyway {
+            anyhow::bail!(
+                "{} Introduce them first (cardinal introduce <who> <to>), or leave {} anyway: \
+                 --anyway",
+                relayed_warning(&left.relayed_for, &g.name),
+                g.name
+            );
+        }
+        (made, names)
+    };
+    let mut ops: Vec<SpaceOp> = made
+        .iter()
+        .map(|m| SpaceOp::add_member(*m, group::ADMIN))
+        .collect();
+    ops.extend(relationship::leave_ops(&me));
+    d.write_and_push(&g.id, ops)?;
+    // The account's node for it goes, and with it any "no hosts here" or
+    // "not this host here": an offer made again asks afresh (D75).
+    let gone = {
+        let core = d.core();
+        let acc = core
+            .account()
+            .and_then(|a| a.space.as_ref().map(|s| (a.id, s)));
+        acc.map(|(id, st)| {
+            let nodes = cardinal_space::account::spaces(st.state()).into_iter();
+            let ops: Vec<_> = nodes
+                .filter(|r| r.space == g.id && !r.declined)
+                .map(|r| SpaceOp::delete(r.node))
+                .collect();
+            (id, ops)
+        })
+    };
+    if let Some((account, ops)) = gone.filter(|(_, ops)| !ops.is_empty()) {
+        d.write_and_push(&account, ops)?;
+    }
+    crate::mailbox::revoke_left(d, &g.id);
+    d.bump();
+    Ok(json!({"admins": names}))
+}
+
+/// `left_any` as main had it, by name.
+#[cfg(any(test, debug_assertions, feature = "by-name"))]
+#[allow(dead_code, clippy::all)]
+fn left_any_by_name(core: &Core, me: &[u8; 32], group: &str) -> bool {
+    let all: Vec<Found> = core
+        .spaces
+        .iter()
+        .filter_map(|(id, h)| {
+            let sp = h.space.as_ref()?;
+            (sp.profile() == group::GROUP && sp.has_left(me) && !core.is_superseded(id)).then(
+                || Found {
+                    id: *id,
+                    name: group::name(sp),
+                    joined: false,
+                },
+            )
+        })
+        .collect();
+    pick(all, group, &[]).is_ok()
+}
+
+/// `rejoin` as main had it, by name.
+#[cfg(any(test, debug_assertions, feature = "by-name"))]
+#[allow(dead_code, clippy::all)]
+pub fn rejoin_by_name(d: &Arc<Daemon>, group: &str) -> anyhow::Result<Json> {
+    let me = identity(d)?;
+    let (found, left_some) = {
+        let core = d.core();
+        let found = pick(left_groups(&core, &me), group, &[]);
+        (found, left_any_by_name(&core, &me, group))
+    };
+    let g = match found {
+        Ok(g) => g,
+        Err(e) => {
+            if let Ok(g) = find_by_name(d, group) {
+                anyhow::bail!("you are in {} already", g.name);
+            }
+            // left, and not one who looks after it
+            anyhow::ensure!(
+                !left_some,
+                "only an owner or admin of {group} can add themselves back: ask one of them \
+                 to add you"
+            );
+            return Err(e);
+        }
+    };
+    {
+        let core = d.core();
+        let sp = core.spaces.get(&g.id).and_then(|h| h.space.as_ref());
+        let sp = sp.ok_or_else(|| anyhow::anyhow!("that group is not open yet"))?;
+        shares_history(sp, &g.name)?;
+    }
+    d.write_and_push(&g.id, vec![SpaceOp::add_member(me, group::ADMIN)])?;
+    d.bump();
+    Ok(json!({"group": hex::encode(g.id), "name": g.name}))
+}
+
+/// `question` as main had it, by name.
+#[cfg(any(test, debug_assertions, feature = "by-name"))]
+#[allow(dead_code, clippy::all)]
+fn question_by_name(reach: &Json, name: &str) -> String {
+    let list = |v: &Json| -> Vec<String> {
+        let all = v.as_array().into_iter().flatten();
+        all.filter_map(|x| x.as_str().map(str::to_owned)).collect()
+    };
+    let who = list(&reach["who"]);
+    let what = list(&reach["what"]).join(", ");
+    // A public space is read by anyone at all, whoever is in it now, and
+    // the question says so.
+    if reach["public"] == true {
+        return format!(
+            "{name} is public: anyone at all can read it, and would learn where your host is \
+             ({what}), now and whoever joins it later. Say whether to share it there: with \
+             it the members can leave you messages while you are away, and without it they reach you only through someone \
+             in touch with both"
+        );
+    }
+    format!(
+        "{} in {name} {} not a contact of yours, and would learn where your host is ({what}), \
+         as would anyone added later. Say whether to share it there: with it they can leave you messages while you \
+         are away, and without it they reach you only through someone in touch with both",
+        who.join(", "),
+        if who.len() == 1 { "is" } else { "are" },
+    )
+}
+
+/// `join` as main had it, by name.
+#[cfg(any(test, debug_assertions, feature = "by-name"))]
+#[allow(dead_code, clippy::all)]
+pub async fn join_by_name(
+    d: &Arc<Daemon>,
+    group: &str,
+    reach: Option<bool>,
+) -> anyhow::Result<Json> {
+    let g = find_by_name(d, group)?;
+    join_found_by_name(d, g, reach).await
+}
+
+/// `join_exact` as main had it, by name.
+#[cfg(any(test, debug_assertions, feature = "by-name"))]
+#[allow(dead_code, clippy::all)]
+pub(crate) async fn join_exact_by_name(
+    d: &Arc<Daemon>,
+    id: &SpaceId,
+    reach: Option<bool>,
+) -> anyhow::Result<Json> {
+    let me = identity(d)?;
+    let g = {
+        let core = d.core();
+        let sp = core.spaces.get(id).and_then(|h| h.space.as_ref());
+        let sp = sp.filter(|sp| sp.profile() == group::GROUP && !sp.has_left(&me));
+        let sp = sp.filter(|_| !core.is_superseded(id));
+        let sp = sp.ok_or_else(|| anyhow::anyhow!("that group is not here to join"))?;
+        Found {
+            id: *id,
+            name: group::name(sp),
+            joined: core.is_joined(id),
+        }
+    };
+    join_found_by_name(d, g, reach).await
+}
+
+/// `join_found` as main had it, by name.
+#[cfg(any(test, debug_assertions, feature = "by-name"))]
+#[allow(dead_code, clippy::all)]
+async fn join_found_by_name(
+    d: &Arc<Daemon>,
+    g: Found,
+    reach: Option<bool>,
+) -> anyhow::Result<Json> {
+    if g.joined {
+        return Ok(json!({}));
+    }
+    let me = identity(d)?;
+    let (t, telling) = {
+        let core = d.core();
+        (core.telling(&g.id), telling_json_by_name(&core, &g.id, &me))
+    };
+    anyhow::ensure!(
+        !t.ask() || reach.is_some(),
+        "{}",
+        question_by_name(&telling, &g.name)
+    );
+    let share = t.joins_sharing(reach);
+    // A no is the person's to say: with no host and nothing said, there is
+    // nothing to say, and joining leaves the list unset (D75).
+    let no = !share && (t.hosted || reach == Some(false));
+    let shared = match share || no {
+        true => crate::mailbox::say_reach(d, &g.id, share).await?,
+        false => false,
+    };
+    if !d.core().is_joined(&g.id) {
+        // With nothing to say in the group, nothing is written there: the
+        // joining is kept in the account, as a node for the space (D75).
+        let account = d
+            .core()
+            .account_id()
+            .ok_or_else(|| anyhow::anyhow!("the account space is not here yet"))?;
+        let op = cardinal_space::account::create_space(&g.id, &g.name);
+        d.write_and_push(&account, vec![op])?;
+    }
+    // A yes with a host that could not be reached for a token is kept on
+    // this device, against the list as it is, and finished later.
+    let waiting = share && !shared && t.hosted;
+    if waiting {
+        d.core().keep_yes(&g.id);
+    }
+    d.bump();
+    let (group, name) = (hex::encode(g.id), g.name);
+    Ok(json!({"group": group, "name": name, "shared": shared, "waiting": waiting}))
+}
+
+/// `set_reach` as main had it, by name.
+#[cfg(any(test, debug_assertions, feature = "by-name"))]
+#[allow(dead_code, clippy::all)]
+pub async fn set_reach_by_name(d: &Arc<Daemon>, group: &str, share: bool) -> anyhow::Result<Json> {
+    use crate::mailbox::Shared;
+    let g = joined_by_name(d, group)?;
+    if !share {
+        // Written even where the list is empty already: a yes that
+        // another of their devices keeps for later gives way to a list
+        // set after it, and to nothing else.
+        crate::mailbox::say_reach(d, &g.id, false).await?;
+        d.core().drop_yes(&g.id);
+        d.core().told_of_all(&g.id);
+        d.bump();
+        return Ok(json!({"shared": false, "waiting": false}));
+    }
+    let waiting = match crate::mailbox::share_reach(d, &g.id).await? {
+        Shared::Named => false,
+        Shared::Waiting => true,
+        Shared::NoHost => anyhow::bail!(
+            "you have no always-on device, so there is nothing to share with {}. Nothing was \
+             changed, and nothing is kept for later: say so again once you have one",
+            g.name
+        ),
+    };
+    d.core().told_of_all(&g.id);
+    d.bump();
+    Ok(json!({"shared": !waiting, "waiting": waiting}))
+}
+
+/// `no_host` as main had it, by name.
+#[cfg(any(test, debug_assertions, feature = "by-name"))]
+#[allow(dead_code, clippy::all)]
+pub async fn no_host_by_name(d: &Arc<Daemon>, group: &str, host: &str) -> anyhow::Result<Json> {
+    let g = joined_by_name(d, group)?;
+    let key = crate::mailbox::host_by_name(d, host)?;
+    let named = crate::mailbox::take_out_host(d, &g.id, &key).await?;
+    d.bump();
+    Ok(json!({"taken_out": named}))
+}
+
+/// `decline` as main had it, by name.
+#[cfg(any(test, debug_assertions, feature = "by-name"))]
+#[allow(dead_code, clippy::all)]
+pub fn decline_by_name(d: &Arc<Daemon>, group: &str) -> anyhow::Result<Json> {
+    let g = find_by_name(d, group)?;
+    anyhow::ensure!(!g.joined, "you are in {}: leave it instead", g.name);
+    let account = d
+        .core()
+        .account_id()
+        .ok_or_else(|| anyhow::anyhow!("the account space is not here yet"))?;
+    let op = cardinal_space::account::create_declined(&g.id, &g.name);
+    d.write_and_push(&account, vec![op])?;
+    // A call there that rings stops: a ring in a declined group does not
+    // ring (`profiles.md#calls-guidance`). The person's other devices stop
+    // once the decline reaches them.
+    crate::calls::stop_ringing_in(d, &g.id, true);
+    d.bump();
+    Ok(json!({}))
+}
+
+/// `set` as main had it, by name.
+#[cfg(any(test, debug_assertions, feature = "by-name"))]
+#[allow(dead_code, clippy::all)]
+pub fn set_by_name(
+    d: &Arc<Daemon>,
+    group: &str,
+    name: Option<&str>,
+    introductions: Option<bool>,
+    for_call: Option<bool>,
+) -> anyhow::Result<Json> {
+    // Only a genesis makes a group one made for a call: refused before
+    // anything is written.
+    anyhow::ensure!(
+        for_call != Some(true),
+        "only a new group is made for a call: make one with group-create"
+    );
+    let g = joined_by_name(d, group)?;
+    let me = identity(d)?;
+    let ops = {
+        let core = d.core();
+        let sp = core.spaces.get(&g.id).and_then(|h| h.space.as_ref());
+        let sp = sp.ok_or_else(|| anyhow::anyhow!("that group is not open yet"))?;
+        anyhow::ensure!(
+            may_manage(sp, &me),
+            "only an admin of {} can change it",
+            g.name
+        );
+        let c = relationship::conversation(sp)
+            .ok_or_else(|| anyhow::anyhow!("that group has no conversation"))?;
+        let mut ops = Vec::new();
+        if let Some(n) = name.map(str::trim).filter(|n| !n.is_empty()) {
+            ops.push(group::rename(c, n));
+        }
+        if let Some(on) = introductions {
+            ops.push(group::set_introductions(c, on));
+        }
+        // "Keep this group": where it is not one made for a call, nothing
+        if for_call == Some(false) && group::for_call(sp) {
+            ops.push(group::keep_group(c));
+        }
+        ops
+    };
+    if !ops.is_empty() {
+        d.write_and_push(&g.id, ops)?;
+    }
+    d.bump();
+    Ok(json!({}))
+}
+
+/// `set_member` as main had it, by name.
+#[cfg(any(test, debug_assertions, feature = "by-name"))]
+#[allow(dead_code, clippy::all)]
+pub fn set_member_by_name(
+    d: &Arc<Daemon>,
+    group: &str,
+    who: &str,
+    shown: Option<&str>,
+    introduce: Option<bool>,
+) -> anyhow::Result<Json> {
+    let g = joined_by_name(d, group)?;
+    let me = identity(d)?;
+    let ops = {
+        let core = d.core();
+        let sp = core.spaces.get(&g.id).and_then(|h| h.space.as_ref());
+        let sp = sp.ok_or_else(|| anyhow::anyhow!("that group is not open yet"))?;
+        anyhow::ensure!(
+            may_manage(sp, &me),
+            "only an admin of {} can change that",
+            g.name
+        );
+        let them = member_named_by_name(&core.contacts(), sp, who)?;
+        let node = group::members(sp)
+            .into_iter()
+            .find(|m| m.identity == them)
+            .and_then(|m| m.node);
+        let mut ops = Vec::new();
+        match node {
+            Some(node) => {
+                if let Some(n) = shown {
+                    ops.push(group::set_member_name(node, n));
+                }
+                if let Some(i) = introduce {
+                    ops.push(group::set_member_introduce(node, i));
+                }
+            }
+            None => ops.push(group::create_member(
+                &them,
+                shown.unwrap_or(who),
+                introduce.unwrap_or(true),
+            )),
+        }
+        ops
+    };
+    d.write_and_push(&g.id, ops)?;
+    d.bump();
+    Ok(json!({}))
 }

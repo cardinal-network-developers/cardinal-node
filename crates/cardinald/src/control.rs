@@ -374,6 +374,12 @@ pub mod typed {
         PinReply, PutArgs, RemoveArgs, RestoreArgs, RestoreReply, RetentionArgs, RetentionReply,
         SaveArgs, SaveReply, ShareArgs, ShareReply, UnmountArgs, UnpinArgs, WriteArgs,
     };
+    use crate::api::{
+        GroupAddArgs, GroupCreateArgs, GroupCreateReply, GroupDeclineArgs, GroupJoinArgs,
+        GroupJoinReply, GroupLeaveArgs, GroupLeaveReply, GroupMemberArgs, GroupReachArgs,
+        GroupReachReply, GroupRejoinArgs, GroupRemoveArgs, GroupRemoveReply, GroupRoleArgs,
+        GroupRoleReply, GroupSetArgs,
+    };
     use crate::daemon::Daemon;
     use crate::daemon::PairState;
     use cardinal_space::account;
@@ -806,6 +812,111 @@ pub mod typed {
             let code = needed(a.code.as_deref(), "code")?;
             let regard = regard(a.hosts_only, a.no_introductions);
             crate::contacts::accept_for(d, code, a.name.as_deref(), regard, met, true, whom).await
+        }
+    }
+
+    // ---- Groups ----
+
+    impl Answer for GroupCreateArgs {
+        async fn answer(d: &Arc<Daemon>, a: &Self) -> anyhow::Result<GroupCreateReply> {
+            let for_call = a.for_call.unwrap_or(false);
+            let history = a.history.unwrap_or(true);
+            let people = a.people.as_deref().unwrap_or_default();
+            let name = needed(a.name.as_deref(), "name")?;
+            crate::groups::create(d, name, people, for_call, history)
+        }
+    }
+
+    impl Answer for GroupAddArgs {
+        async fn answer(d: &Arc<Daemon>, a: &Self) -> anyhow::Result<Done> {
+            let group = needed(a.group.as_ref(), "group")?;
+            let people = a.people.as_deref().unwrap_or_default();
+            crate::groups::add(d, group.as_ref(), people, a.shown.as_deref())?;
+            Ok(Done {})
+        }
+    }
+
+    impl Answer for GroupRemoveArgs {
+        async fn answer(d: &Arc<Daemon>, a: &Self) -> anyhow::Result<GroupRemoveReply> {
+            let group = needed(a.group.as_ref(), "group")?;
+            let who = needed(a.who.as_ref(), "who")?;
+            crate::groups::remove(d, group.as_ref(), who).await
+        }
+    }
+
+    impl Answer for GroupRoleArgs {
+        async fn answer(d: &Arc<Daemon>, a: &Self) -> anyhow::Result<GroupRoleReply> {
+            let group = needed(a.group.as_ref(), "group")?;
+            let who = needed(a.who.as_ref(), "who")?;
+            let role = needed(a.role.as_deref(), "role")?;
+            crate::groups::set_role(d, group.as_ref(), who, role).await
+        }
+    }
+
+    impl Answer for GroupLeaveArgs {
+        async fn answer(d: &Arc<Daemon>, a: &Self) -> anyhow::Result<GroupLeaveReply> {
+            let anyway = a.anyway == Some(true);
+            let group = needed(a.group.as_ref(), "group")?;
+            let admins = a.admins.as_deref().unwrap_or_default();
+            crate::groups::leave(d, group.as_ref(), admins, anyway)
+        }
+    }
+
+    impl Answer for GroupRejoinArgs {
+        async fn answer(d: &Arc<Daemon>, a: &Self) -> anyhow::Result<GroupCreateReply> {
+            crate::groups::rejoin(d, needed(a.group.as_ref(), "group")?)
+        }
+    }
+
+    impl Answer for GroupJoinArgs {
+        async fn answer(d: &Arc<Daemon>, a: &Self) -> anyhow::Result<GroupJoinReply> {
+            let group = needed(a.group.as_ref(), "group")?;
+            crate::groups::join(d, group.as_ref(), a.reach).await
+        }
+    }
+
+    impl Answer for GroupReachArgs {
+        async fn answer(d: &Arc<Daemon>, a: &Self) -> anyhow::Result<GroupReachReply> {
+            let share = a
+                .share
+                .ok_or_else(|| anyhow::anyhow!("say whether to share: share"))?;
+            match a.host.as_deref() {
+                Some(host) if !share => {
+                    let group = needed(a.group.as_ref(), "group")?;
+                    crate::groups::no_host(d, group.as_ref(), host).await
+                }
+                Some(_) => anyhow::bail!("a host is taken out with share false"),
+                None => {
+                    let group = needed(a.group.as_ref(), "group")?;
+                    crate::groups::set_reach(d, group.as_ref(), share).await
+                }
+            }
+        }
+    }
+
+    impl Answer for GroupDeclineArgs {
+        async fn answer(d: &Arc<Daemon>, a: &Self) -> anyhow::Result<Done> {
+            crate::groups::decline(d, needed(a.group.as_ref(), "group")?.as_ref())?;
+            Ok(Done {})
+        }
+    }
+
+    impl Answer for GroupSetArgs {
+        async fn answer(d: &Arc<Daemon>, a: &Self) -> anyhow::Result<Done> {
+            let group = needed(a.group.as_ref(), "group")?;
+            let (name, introductions) = (a.name.as_deref(), a.introductions);
+            crate::groups::set(d, group.as_ref(), name, introductions, a.for_call)?;
+            Ok(Done {})
+        }
+    }
+
+    impl Answer for GroupMemberArgs {
+        async fn answer(d: &Arc<Daemon>, a: &Self) -> anyhow::Result<Done> {
+            let group = needed(a.group.as_ref(), "group")?;
+            let who = needed(a.who.as_ref(), "who")?;
+            let (shown, introduce) = (a.shown.as_deref(), a.introduce);
+            crate::groups::set_member(d, group.as_ref(), who, shown, introduce)?;
+            Ok(Done {})
         }
     }
 
@@ -1327,20 +1438,26 @@ async fn handle(d: &Arc<Daemon>, req: &Value) -> anyhow::Result<Value> {
             let note = req.get("note").and_then(|v| v.as_str());
             crate::introductions::ask_in_group(d, arg(req, "group")?, arg(req, "who")?, note)
         }
+        #[cfg(any(test, debug_assertions, feature = "by-name"))]
         "group-create" => {
             let for_call = answer_in(req, "for_call")?.unwrap_or(false);
             let history = answer_in(req, "history")?.unwrap_or(true);
             let people = strings(req, "people");
-            crate::groups::create(d, arg(req, "name")?, &people, for_call, history)
+            crate::groups::create_by_name(d, arg(req, "name")?, &people, for_call, history)
         }
+        #[cfg(any(test, debug_assertions, feature = "by-name"))]
         "group-add" => {
             let shown = req.get("shown").and_then(|v| v.as_str());
-            crate::groups::add(d, arg(req, "group")?, &strings(req, "people"), shown)
+            crate::groups::add_by_name(d, arg(req, "group")?, &strings(req, "people"), shown)
         }
-        "group-remove" => crate::groups::remove(d, arg(req, "group")?, arg(req, "who")?).await,
+        #[cfg(any(test, debug_assertions, feature = "by-name"))]
+        "group-remove" => {
+            crate::groups::remove_by_name(d, arg(req, "group")?, arg(req, "who")?).await
+        }
+        #[cfg(any(test, debug_assertions, feature = "by-name"))]
         "group-role" => {
             let (group, who) = (arg(req, "group")?, arg(req, "who")?);
-            crate::groups::set_role(d, group, who, arg(req, "role")?).await
+            crate::groups::set_role_by_name(d, group, who, arg(req, "role")?).await
         }
         "group-post-again" => crate::groups::post_again(d, arg(req, "group")?),
         "group-moved-seen" => crate::groups::moved_seen(d, arg(req, "group")?),
@@ -1350,37 +1467,52 @@ async fn handle(d: &Arc<Daemon>, req: &Value) -> anyhow::Result<Value> {
             &strings(req, "moves"),
             &strings(req, "to"),
         ),
+        #[cfg(any(test, debug_assertions, feature = "by-name"))]
         "group-leave" => {
             let anyway = req.get("anyway").and_then(|v| v.as_bool()) == Some(true);
-            crate::groups::leave(d, arg(req, "group")?, &strings(req, "admins"), anyway)
+            crate::groups::leave_by_name(d, arg(req, "group")?, &strings(req, "admins"), anyway)
         }
         "group-leaving" => crate::groups::leaving(d, arg(req, "group")?),
-        "group-rejoin" => crate::groups::rejoin(d, arg(req, "group")?),
+        #[cfg(any(test, debug_assertions, feature = "by-name"))]
+        "group-rejoin" => crate::groups::rejoin_by_name(d, arg(req, "group")?),
+        #[cfg(any(test, debug_assertions, feature = "by-name"))]
         "group-join" => {
             let reach = answer_in(req, "reach")?;
-            crate::groups::join(d, arg(req, "group")?, reach).await
+            crate::groups::join_by_name(d, arg(req, "group")?, reach).await
         }
+        #[cfg(any(test, debug_assertions, feature = "by-name"))]
         "group-reach" => {
             let share = req.get("share").and_then(|v| v.as_bool());
             let share = share.ok_or_else(|| anyhow::anyhow!("say whether to share: share"))?;
             match req.get("host").and_then(|v| v.as_str()) {
-                Some(host) if !share => crate::groups::no_host(d, arg(req, "group")?, host).await,
+                Some(host) if !share => {
+                    crate::groups::no_host_by_name(d, arg(req, "group")?, host).await
+                }
                 Some(_) => anyhow::bail!("a host is taken out with share false"),
-                None => crate::groups::set_reach(d, arg(req, "group")?, share).await,
+                None => crate::groups::set_reach_by_name(d, arg(req, "group")?, share).await,
             }
         }
-        "group-decline" => crate::groups::decline(d, arg(req, "group")?),
+        #[cfg(any(test, debug_assertions, feature = "by-name"))]
+        "group-decline" => crate::groups::decline_by_name(d, arg(req, "group")?),
         "group-members" => crate::groups::members(d, arg(req, "group")?),
+        #[cfg(any(test, debug_assertions, feature = "by-name"))]
         "group-set" => {
             let name = req.get("name").and_then(|v| v.as_str());
             let introductions = req.get("introductions").and_then(|v| v.as_bool());
             let for_call = answer_in(req, "for_call")?;
-            crate::groups::set(d, arg(req, "group")?, name, introductions, for_call)
+            crate::groups::set_by_name(d, arg(req, "group")?, name, introductions, for_call)
         }
+        #[cfg(any(test, debug_assertions, feature = "by-name"))]
         "group-member" => {
             let shown = req.get("shown").and_then(|v| v.as_str());
             let introduce = req.get("introduce").and_then(|v| v.as_bool());
-            crate::groups::set_member(d, arg(req, "group")?, arg(req, "who")?, shown, introduce)
+            crate::groups::set_member_by_name(
+                d,
+                arg(req, "group")?,
+                arg(req, "who")?,
+                shown,
+                introduce,
+            )
         }
         "say" => {
             let reply_to = req.get("reply_to").and_then(|v| v.as_str());
@@ -2788,6 +2920,7 @@ async fn remove_device(
 }
 
 /// A person's yes or no in a request, if it holds one.
+#[cfg(any(test, debug_assertions, feature = "by-name"))]
 fn answer_in(req: &Value, key: &str) -> anyhow::Result<Option<bool>> {
     match req.get(key) {
         None | Some(Value::Null) => Ok(None),

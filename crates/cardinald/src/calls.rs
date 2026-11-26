@@ -4387,7 +4387,7 @@ pub async fn answer_by_name(
                      answered and nothing was written"
                 );
             }
-            crate::groups::join_exact(d, &space, reach).await?;
+            crate::groups::join_exact_by_name(d, &space, reach).await?;
         }
         // In a group joined already, as when another of this person's
         // devices joined it meanwhile, `join` and `reach` change nothing.

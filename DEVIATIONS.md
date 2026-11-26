@@ -2384,7 +2384,15 @@ asks for around that is not built yet.
     `before` as text that is a space, then NUL and an id, is taken as that
     id given as bytes (the way by name trimmed before telling them apart);
     a `mount` reply of a path that is not UTF-8, which by name ended the
-    connection (a serializing panic), is sent with the bytes replaced.
+    connection (a serializing panic), is sent with the bytes replaced; a
+    member named by an id given as bytes is named NUL first in
+    `group-remove`'s "<who> is not in <group> any more", `group-role`'s
+    "<who> is not in <group>" and `group-leave`'s "<who> has left
+    <group>", and a group so given in `group-rejoin`'s "only an owner or
+    admin of <group> can add themselves back"; and `group-member` without
+    `shown`, for a member with no node of their own, writes the ref as the
+    way by name held it as the name the others see: NUL and hex, for an id
+    given as bytes.
   - **A reply field without a number** is this build's mistake. In a debug
     build, where the tests run, the request then fails; in a release build
     the field is left out and the service logs an error. A field no test
