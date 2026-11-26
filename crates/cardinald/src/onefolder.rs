@@ -772,12 +772,14 @@ pub fn rename_shared(
             }
             let who = shown.who().unwrap_or_default();
             if name != shown.name {
-                crate::contacts::rename(d, &who, name).map_err(Refused::Other)?;
+                crate::contacts::rename(d, crate::api::Ref::Typed(&who), name)
+                    .map_err(Refused::Other)?;
             }
             if category != shown.category {
                 // `Groups (2)` lists them under `Groups` again
                 let typed = category_typed(&relationships(d), category);
-                crate::contacts::set_category(d, &who, &typed).map_err(Refused::NotPermitted)?;
+                crate::contacts::set_category(d, crate::api::Ref::Typed(&who), &typed)
+                    .map_err(Refused::NotPermitted)?;
             }
         }
     }

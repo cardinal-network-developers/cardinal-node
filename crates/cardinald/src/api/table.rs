@@ -133,12 +133,92 @@ macro_rules! typed {
         $(#[$m:meta])*
         $stat:ident $title:literal $name:ident { $($body:tt)* }
     ) => {
-        $crate::typed!(fields $(#[$m])* $name { $($body)* });
+        $crate::typed!(@munch [$(#[$m])* $name] [$stat $title] [] [] [] [] [] $($body)*);
+    };
+    (fields $(#[$m:meta])* $name:ident { $($body:tt)* }) => {
+        $crate::typed!(@munch [$(#[$m])* $name] [] [] [] [] [] [] $($body)*);
+    };
+    // A number no longer used.
+    (@munch $h:tt $st:tt [$($s:tt)*] [$($r:tt)*] [$($o:tt)*] [$($l:tt)*] [$($a:tt)*]
+        $n:literal gone $f:ident : $t:ty $(, $($rest:tt)*)?
+    ) => {
+        $crate::typed!(@munch $h $st [$($s)*] [$($r)*] [$($o)*] [$($l)*]
+            [$($a)* ($n $f (gone $t))] $($($rest)*)?);
+    };
+    // A field sent only when it is `Some`, of a record that holds itself
+    // (or one that holds it): its row names the record, `as {ROW}` or a
+    // list of them `as [ROW]`, since the row cannot be had from the type.
+    (@munch $h:tt $st:tt [$($s:tt)*] [$($r:tt)*] [$($o:tt)*] [$($l:tt)*] [$($a:tt)*]
+        $(#[$fm:meta])* $n:literal $f:ident : Option<$t:ty> as $row:tt $(, $($rest:tt)*)?
+    ) => {
+        $crate::typed!(@munch $h $st
+            [$($s)* ($(#[$fm])* $f : Option<$t>)] [$($r)*] [$($o)* $f]
+            [$($l)* ($n $f)] [$($a)* ($n $f (as $row))] $($($rest)*)?);
+    };
+    // A field always sent, of a record that holds itself.
+    (@munch $h:tt $st:tt [$($s:tt)*] [$($r:tt)*] [$($o:tt)*] [$($l:tt)*] [$($a:tt)*]
+        $(#[$fm:meta])* $n:literal $f:ident : $t:ty as $row:tt $(, $($rest:tt)*)?
+    ) => {
+        $crate::typed!(@munch $h $st
+            [$($s)* ($(#[$fm])* $f : $t)] [$($r)* ($f : $t)] [$($o)*]
+            [$($l)* ($n $f)] [$($a)* ($n $f (as $row))] $($($rest)*)?);
+    };
+    // A field sent only when it is `Some`.
+    (@munch $h:tt $st:tt [$($s:tt)*] [$($r:tt)*] [$($o:tt)*] [$($l:tt)*] [$($a:tt)*]
+        $(#[$fm:meta])* $n:literal $f:ident : Option<$t:ty> $(, $($rest:tt)*)?
+    ) => {
+        $crate::typed!(@munch $h $st
+            [$($s)* ($(#[$fm])* $f : Option<$t>)] [$($r)*] [$($o)* $f]
+            [$($l)* ($n $f)] [$($a)* ($n $f (Option<$t>))] $($($rest)*)?);
+    };
+    // A field always sent.
+    (@munch $h:tt $st:tt [$($s:tt)*] [$($r:tt)*] [$($o:tt)*] [$($l:tt)*] [$($a:tt)*]
+        $(#[$fm:meta])* $n:literal $f:ident : $t:ty $(, $($rest:tt)*)?
+    ) => {
+        $crate::typed!(@munch $h $st
+            [$($s)* ($(#[$fm])* $f : $t)] [$($r)* ($f : $t)] [$($o)*]
+            [$($l)* ($n $f)] [$($a)* ($n $f ($t))] $($($rest)*)?);
+    };
+    (@row ($n:literal $f:ident (as {$row:ident}))) => {
+        $crate::api::table::Field {
+            n: $n,
+            name: $crate::api::typed::field_name(stringify!($f)),
+            ty: $crate::api::table::Ty::Rec(&$row),
+        }
+    };
+    (@row ($n:literal $f:ident (as [$row:ident]))) => {
+        $crate::api::table::Field {
+            n: $n,
+            name: $crate::api::typed::field_name(stringify!($f)),
+            ty: $crate::api::table::Ty::Recs(&$row),
+        }
+    };
+    (@row ($n:literal $f:ident (gone $t:ty))) => {
+        $crate::api::table::Field {
+            n: $n,
+            name: $crate::api::typed::field_name(stringify!($f)),
+            ty: $crate::api::table::Ty::Gone(&<$t as $crate::api::typed::Wire>::TY),
+        }
+    };
+    (@row ($n:literal $f:ident ($t:ty))) => {
+        $crate::api::table::Field {
+            n: $n,
+            name: $crate::api::typed::field_name(stringify!($f)),
+            ty: <$t as $crate::api::typed::Wire>::TY,
+        }
+    };
+    // A record held in replies: its row, `$stat`, written out in the
+    // static itself, so that a record that holds itself can name its own
+    // row; and its place as a field or a list's item.
+    (@munch [$(#[$m:meta])* $name:ident] [$stat:ident $title:literal]
+        $s:tt $r:tt $o:tt $l:tt [$($a:tt)*]
+    ) => {
+        $crate::typed!(@munch [$(#[$m])* $name] [] $s $r $o $l [$($a)*]);
 
         #[doc = concat!("The *", $title, "* record's row in the tables.")]
         pub static $stat: $crate::api::table::Rec = $crate::api::table::Rec {
             name: $title,
-            fields: <$name as $crate::api::typed::Fields>::FIELDS,
+            fields: &[ $( $crate::typed!(@row $a) ),* ],
         };
 
         impl $crate::api::typed::Wire for $name {
@@ -171,47 +251,7 @@ macro_rules! typed {
             }
         }
     };
-    (fields $(#[$m:meta])* $name:ident { $($body:tt)* }) => {
-        $crate::typed!(@munch [$(#[$m])* $name] [] [] [] [] [] $($body)*);
-    };
-    // A number no longer used.
-    (@munch $h:tt [$($s:tt)*] [$($r:tt)*] [$($o:tt)*] [$($l:tt)*] [$($a:tt)*]
-        $n:literal gone $f:ident : $t:ty $(, $($rest:tt)*)?
-    ) => {
-        $crate::typed!(@munch $h [$($s)*] [$($r)*] [$($o)*] [$($l)*]
-            [$($a)* ($n $f (gone $t))] $($($rest)*)?);
-    };
-    // A field sent only when it is `Some`.
-    (@munch $h:tt [$($s:tt)*] [$($r:tt)*] [$($o:tt)*] [$($l:tt)*] [$($a:tt)*]
-        $(#[$fm:meta])* $n:literal $f:ident : Option<$t:ty> $(, $($rest:tt)*)?
-    ) => {
-        $crate::typed!(@munch $h
-            [$($s)* ($(#[$fm])* $f : Option<$t>)] [$($r)*] [$($o)* $f]
-            [$($l)* ($n $f)] [$($a)* ($n $f (Option<$t>))] $($($rest)*)?);
-    };
-    // A field always sent.
-    (@munch $h:tt [$($s:tt)*] [$($r:tt)*] [$($o:tt)*] [$($l:tt)*] [$($a:tt)*]
-        $(#[$fm:meta])* $n:literal $f:ident : $t:ty $(, $($rest:tt)*)?
-    ) => {
-        $crate::typed!(@munch $h
-            [$($s)* ($(#[$fm])* $f : $t)] [$($r)* ($f : $t)] [$($o)*]
-            [$($l)* ($n $f)] [$($a)* ($n $f ($t))] $($($rest)*)?);
-    };
-    (@row ($n:literal $f:ident (gone $t:ty))) => {
-        $crate::api::table::Field {
-            n: $n,
-            name: $crate::api::typed::field_name(stringify!($f)),
-            ty: $crate::api::table::Ty::Gone(&<$t as $crate::api::typed::Wire>::TY),
-        }
-    };
-    (@row ($n:literal $f:ident ($t:ty))) => {
-        $crate::api::table::Field {
-            n: $n,
-            name: $crate::api::typed::field_name(stringify!($f)),
-            ty: <$t as $crate::api::typed::Wire>::TY,
-        }
-    };
-    (@munch [$(#[$m:meta])* $name:ident]
+    (@munch [$(#[$m:meta])* $name:ident] []
         [$(($(#[$fm:meta])* $sf:ident : $st:ty))*]
         [$(($rf:ident : $rt:ty))*]
         [$($of:ident)*]
@@ -687,13 +727,44 @@ macro_rules! gone {
 
 // ---- Records in replies ----
 
-rec!(APP_QUESTION "app question":
-    1 "asks" T, 2 "id" U, 3 "name" T, 4 "program" T, 5 "role" T, 6 "what" T);
-rec!(APPROVAL "approval":
-    1 "change" BOOL, 2 "covers" T, 3 "device" T, 4 "family" B, 5 "id" B, 6 "name" T,
-    7 "program" T, 8 "revoked" BOOL, 9 "this_device" BOOL);
-rec!(APP_OFFER "app offer":
-    1 "application" T, 2 "from" T, 3 "name" T, 4 "sentence" T, 5 "space" B);
+typed!(
+    /// What a program asks the person, waiting for their answer.
+    APP_QUESTION "app question" AppQuestion {
+        /// `family`, `new-space` or `share`.
+        1 asks: Cow<'static, str>,
+        2 id: u64,
+        3 name: String,
+        4 program: String,
+        /// Of `share`: `reader` or `writer`.
+        5 role: Option<Cow<'static, str>>,
+        6 what: String,
+    }
+);
+typed!(
+    /// An approval of the person's, made on one of their devices.
+    APPROVAL "approval" ApprovalShown {
+        1 change: bool,
+        /// The family's title, or the start of its root in hex.
+        2 covers: String,
+        3 device: Option<String>,
+        4 family: [u8; 32],
+        5 id: [u8; 16],
+        6 name: String,
+        7 program: String,
+        8 revoked: bool,
+        9 this_device: bool,
+    }
+);
+typed!(
+    /// A space of an application offered to this person.
+    APP_OFFER "app offer" AppOffer {
+        1 application: Option<String>,
+        2 from: String,
+        3 name: String,
+        4 sentence: Option<String>,
+        5 space: [u8; 32],
+    }
+);
 
 typed!(ATTACHMENT "attachment" Attachment {
     1 name: String,
@@ -966,7 +1037,15 @@ typed!(
         10 named: Option<Vec<String>>,
     }
 );
-rec!(GROUP_SHOWN "group shown": 1 "group" B, 2 "name" T, 3 "what" [T]);
+typed!(
+    /// A group where someone refused still reads where this person's hosts
+    /// are, and what they see there.
+    GROUP_SHOWN "group shown" GroupShown {
+        1 group: [u8; 32],
+        2 name: String,
+        3 what: Vec<String>,
+    }
+);
 typed!(
     /// A change of guardians under way: to the person whose it is (in
     /// `guardians`), or to one of their guardians (in `guarding`), each
@@ -1500,10 +1579,30 @@ typed!(
         5 this_device: bool,
     }
 );
-rec!(TREE_ITEM "tree item":
-    1 "dirty" BOOL, 2 "ino" U, 3 "kind" T, 4 "local" BOOL, 5 "node" B, 6 "path" T, 7 "size" U);
-rec!(STUCK_ITEM "stuck item":
-    1 "dirty" T, 2 "kind" T, 3 "opens" U, 4 "path" T, 5 "staged" BOOL);
+typed!(
+    /// An item of the mounted folder's tree.
+    TREE_ITEM "tree item" TreeItem {
+        1 dirty: bool,
+        2 ino: u64,
+        /// `dir`, `file`, `link` or `conflict`.
+        3 kind: Cow<'static, str>,
+        4 local: bool,
+        /// The start of its node's id.
+        5 node: Option<[u8; 6]>,
+        6 path: String,
+        7 size: u64,
+    }
+);
+typed!(
+    /// An item of the tree that keeps the device from settling.
+    STUCK_ITEM "stuck item" StuckItem {
+        1 dirty: String,
+        2 kind: String,
+        3 opens: u64,
+        4 path: String,
+        5 staged: bool,
+    }
+);
 typed!(
     /// What a device sent that this one cannot read, or the other way round.
     UNREADABLE "unreadable" Unreadable {
@@ -1516,7 +1615,14 @@ typed!(
         6 version: Option<String>,
     }
 );
-rec!(UNSHOWN_NODE "unshown node": 1 "name" T, 2 "node" B);
+typed!(
+    /// A file the state holds that the tree does not show.
+    UNSHOWN_NODE "unshown node" UnshownNode {
+        1 name: String,
+        /// The start of its node's id.
+        2 node: [u8; 6],
+    }
+);
 typed!(
     /// A version of a file of the one folder: of its history, all of it;
     /// of a conflict, its device, time and size.
@@ -2894,6 +3000,167 @@ typed!(fields FilesReply {
 });
 asks!(FILES: 120 "files" FilesArgs -> FilesReply, reads, after files);
 
+// ---- Setting up, removing a device, a contact's settings ----
+
+typed!(fields SetupBeginArgs {});
+typed!(fields SetupBeginReply {
+    /// The places, from 0, of the two words the person is asked back.
+    2 ask: Vec<u64>,
+    3 words: Vec<String>,
+});
+asks!(SETUP_BEGIN: 8 "setup-begin" SetupBeginArgs -> SetupBeginReply, writes);
+typed!(fields SetupFinishArgs {
+    1 name: Option<String>,
+    2 answers: Option<Vec<String>>,
+    3 device: Option<String>,
+});
+typed!(fields SetupFinishReply {
+    2 device: String,
+    3 name: String,
+});
+asks!(SETUP_FINISH: 9 "setup-finish" SetupFinishArgs -> SetupFinishReply, writes);
+typed!(fields RemoveDeviceArgs {
+    1 who: Option<Reference>,
+    2 lost: Option<bool>,
+    3 words: Option<String>,
+});
+typed!(fields RemoveDeviceReply {
+    2 dropped: u64,
+    3 name: String,
+});
+asks!(REMOVE_DEVICE: 13 "remove-device" RemoveDeviceArgs -> RemoveDeviceReply, writes);
+typed!(fields ContactArgs {
+    1 who: Option<Reference>,
+    2 setting: Option<String>,
+    3 name: Option<String>,
+    4 picture: Option<String>,
+    5 category: Option<String>,
+    6 host: Option<String>,
+});
+typed!(
+    fields
+    /// What changed: of a new name, the name (or, cleared, the name shown
+    /// and whose it is); of a picture, the contact as shown; of a
+    /// category, the category; of refusing, where they still read this
+    /// person's hosts; of the hosts named to them, what is named now.
+    ContactReply {
+        2 category: Option<String>,
+        3 name: Option<String>,
+        4 own: Option<bool>,
+        5 picture: Option<String>,
+        6 reach: Option<Vec<GroupShown>>,
+        7 suggested: Option<String>,
+        8 named: Option<Cow<'static, str>>,
+    }
+);
+asks!(CONTACT_CHANGE: 31 "contact" ContactArgs -> ContactReply, writes);
+
+// ---- Measuring, and the files brought back ----
+
+typed!(fields DebugTreeArgs {
+    1 after: Option<u64>,
+    2 limit: Option<u64>,
+});
+typed!(
+    fields
+    /// The mounted folder's tree as the service holds it; unmounted, the
+    /// files space's heads and epoch alone.
+    DebugTreeReply {
+        2 deleted: Option<u64>,
+        3 epoch: Option<[u8; 16]>,
+        4 heads: [u8; 16],
+        5 items: Option<Vec<TreeItem>>,
+        6 mounted: bool,
+        7 pending: Option<bool>,
+        8 settle: Option<u64>,
+        9 state: Option<[u8; 8]>,
+        10 stuck: Option<Vec<StuckItem>>,
+        11 unshown: Option<Vec<UnshownNode>>,
+        12 more: bool,
+        13 next: Option<u64>,
+    }
+);
+asks!(DEBUG_TREE: 209 "debug-tree" DebugTreeArgs -> DebugTreeReply, reads,
+    after items, stuck, unshown);
+typed!(fields SpeedtestArgs {
+    1 device: Option<Reference>,
+});
+typed!(fields SpeedtestReply {
+    2 device: String,
+    3 ms: u64,
+    4 receive: u64,
+    5 received_bytes: u64,
+    6 rtt_median_us: u64,
+    7 rtt_min_us: u64,
+    8 send: u64,
+    9 sent_bytes: u64,
+});
+// Changes nothing, but measures: a second answer is another measurement,
+// never the same bytes, so it is answered once, as a writer is.
+asks!(SPEEDTEST: 210 "speedtest" SpeedtestArgs -> SpeedtestReply, writes);
+typed!(fields UndeleteArgs {
+    1 path: Option<String>,
+    2 id: Option<Reference>,
+});
+typed!(fields UndeleteReply {
+    2 id: [u8; 16],
+    3 path: String,
+});
+asks!(UNDELETE: 228 "undelete" UndeleteArgs -> UndeleteReply, writes);
+
+// ---- Applications: what programs ask the person ----
+
+typed!(fields AppQuestionsArgs {
+    1 after: Option<u64>,
+    2 limit: Option<u64>,
+});
+typed!(fields AppQuestionsReply {
+    2 questions: Vec<AppQuestion>,
+    3 more: bool,
+    4 next: Option<u64>,
+});
+asks!(APP_QUESTIONS: 220 "app-questions" AppQuestionsArgs -> AppQuestionsReply, reads,
+    after questions);
+typed!(fields AppAnswerArgs {
+    1 id: Option<u64>,
+    2 yes: Option<bool>,
+    3 people: Option<Vec<Reference>>,
+    4 role: Option<String>,
+});
+asks!(APP_ANSWER: 221 "app-answer" AppAnswerArgs -> Done, writes);
+typed!(fields ApprovalsArgs {
+    1 after: Option<u64>,
+    2 limit: Option<u64>,
+});
+typed!(fields ApprovalsReply {
+    2 approvals: Vec<ApprovalShown>,
+    3 more: bool,
+    4 next: Option<u64>,
+});
+asks!(APPROVALS: 222 "approvals" ApprovalsArgs -> ApprovalsReply, reads, after approvals by id);
+typed!(fields ApprovalRevokeArgs {
+    1 id: Option<Reference>,
+});
+asks!(APPROVAL_REVOKE: 223 "approval-revoke" ApprovalRevokeArgs -> Done, writes);
+typed!(fields AppOffersArgs {
+    1 after: Option<u64>,
+    2 limit: Option<u64>,
+});
+typed!(fields AppOffersReply {
+    2 offers: Vec<AppOffer>,
+    3 more: bool,
+    4 next: Option<u64>,
+});
+asks!(APP_OFFERS: 224 "app-offers" AppOffersArgs -> AppOffersReply, reads, after offers);
+typed!(fields AppJoinArgs {
+    1 space: Option<Reference>,
+});
+typed!(fields AppJoinReply {
+    2 space: [u8; 32],
+    3 name: String,
+});
+asks!(APP_JOIN: 225 "app-join" AppJoinArgs -> AppJoinReply, writes);
+
 /// Every request, by number. Numbers are grouped by what they are about,
 /// with room in each group.
 pub static REQUESTS: &[Request] = &[
@@ -2905,24 +3172,18 @@ pub static REQUESTS: &[Request] = &[
     RELOAD,
     CONDITIONS_NOW,
     NETWORK_CHANGED,
-    req!(8 "setup-begin" () -> (2 "ask" [U], 3 "words" [T])),
-    req!(9 "setup-finish" (1 "name" T, 2 "answers" [T], 3 "device" T) -> (
-        2 "device" T, 3 "name" T)),
+    SETUP_BEGIN,
+    SETUP_FINISH,
     ME,
     DEVICES,
     DEVICE_RENAME,
-    req!(13 "remove-device" (1 "who" REF, 2 "lost" BOOL, 3 "words" T) -> (
-        2 "dropped" U, 3 "name" T)),
+    REMOVE_DEVICE,
     PAIR_SHOW,
     PAIR_STATUS,
     PAIR_TYPE,
     // ---- People, conversations and invitations: 30 to 69 ----
     CONTACTS,
-    req!(31 "contact" (
-        1 "who" REF, 2 "setting" T, 3 "name" T, 4 "picture" T, 5 "category" T, 6 "host" T
-    ) -> (
-        2 "category" T, 3 "name" T, 4 "own" BOOL, 5 "picture" T, 6 "reach" [GROUP_SHOWN],
-        7 "suggested" T, 8 "named" T)),
+    CONTACT_CHANGE,
     CONTACT_STATUS,
     CONVERSATIONS,
     MESSAGES,
@@ -3082,26 +3343,18 @@ pub static REQUESTS: &[Request] = &[
         10 "history" [NODE_HISTORY], 11 "id" B, 12 "kind" KIND, 13 "name" T, 14 "parent" B,
         15 "position" U, 16 "special" T, 17 "values" [NODE_FIELD], 18 "value" {VALUE},
         19 "more" BOOL, 20 "next" U)),
-    paged!(after 209 "debug-tree" (1 "after" U, 2 "limit" U) -> (
-        2 "deleted" U, 3 "epoch" B, 4 "heads" B, 5 "items" [TREE_ITEM], 6 "mounted" BOOL,
-        7 "pending" BOOL, 8 "settle" U, 9 "state" B, 10 "stuck" [STUCK_ITEM],
-        11 "unshown" [UNSHOWN_NODE], 12 "more" BOOL, 13 "next" U)),
-    req!(210 "speedtest" (1 "device" REF) -> (
-        2 "device" T, 3 "ms" U, 4 "receive" U, 5 "received_bytes" U, 6 "rtt_median_us" U,
-        7 "rtt_min_us" U, 8 "send" U, 9 "sent_bytes" U)),
+    DEBUG_TREE,
+    SPEEDTEST,
     // ---- Applications: 220 to 239 ----
-    paged!(after 220 "app-questions" (1 "after" U, 2 "limit" U) -> (
-        2 "questions" [APP_QUESTION], 3 "more" BOOL, 4 "next" U)),
-    req!(221 "app-answer" (1 "id" U, 2 "yes" BOOL, 3 "people" [REF], 4 "role" T) -> ()),
-    paged!(after 222 "approvals" (1 "after" U, 2 "limit" U) -> (
-        2 "approvals" [APPROVAL], 3 "more" BOOL, 4 "next" U)),
-    req!(223 "approval-revoke" (1 "id" REF) -> ()),
-    paged!(after 224 "app-offers" (1 "after" U, 2 "limit" U) -> (
-        2 "offers" [APP_OFFER], 3 "more" BOOL, 4 "next" U)),
-    req!(225 "app-join" (1 "space" REF) -> (2 "space" B, 3 "name" T)),
+    APP_QUESTIONS,
+    APP_ANSWER,
+    APPROVALS,
+    APPROVAL_REVOKE,
+    APP_OFFERS,
+    APP_JOIN,
     WAKE,
     DELETED,
-    req!(228 "undelete" (1 "path" T, 2 "id" REF) -> (2 "id" B, 3 "path" T)),
+    UNDELETE,
 ];
 
 // ---- What the service's program says without starting ----

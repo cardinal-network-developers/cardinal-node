@@ -13,6 +13,7 @@ use cardinal_identity::EntryId;
 use cardinal_link::Priority;
 use cardinal_space::files::{self, Content, FileKind, Files, FILE_CONTENT};
 use cardinal_space::{account, group, NodeId, Space, SpaceOp, SpaceOpBody};
+#[cfg(any(test, debug_assertions, feature = "by-name"))]
 use serde_json::{json, Value as Json};
 
 use crate::daemon::Daemon;
@@ -260,7 +261,93 @@ pub fn deleted(d: &Daemon, path: &str, hidden: bool) -> anyhow::Result<crate::ap
 /// it, picks one where more than one of that name was deleted there. Back
 /// beside another of its name, it is shown as the folder shows any two
 /// nodes of one name, and the reply says the path it is shown at.
-pub async fn undelete(d: &Arc<Daemon>, path: &str, id: Option<&str>) -> anyhow::Result<Json> {
+pub async fn undelete(
+    d: &Arc<Daemon>,
+    path: &str,
+    id: Option<crate::api::Ref<'_>>,
+) -> anyhow::Result<crate::api::UndeleteReply> {
+    flush_mount(d).await?;
+    let (parent, name) = onefolder::split_last(path)?;
+    let at = onefolder::folder(d, &parent)?;
+    let node = {
+        let core = d.core();
+        let sp = onefolder::open(&core, &at.space)?;
+        let st = sp.state();
+        let named: Vec<NodeId> = deleted_in(sp, &at)
+            .into_iter()
+            .filter(|n| st.node(n).is_some_and(|n| n.name == name))
+            .collect();
+        let picked: Vec<NodeId> = match id {
+            None => named,
+            Some(asked) => {
+                let (exact, hex_given) = match asked {
+                    crate::api::Ref::Id(h) => (true, h.hex().to_ascii_lowercase()),
+                    crate::api::Ref::Typed(h) => (false, h.to_ascii_lowercase()),
+                };
+                anyhow::ensure!(!hex_given.is_empty(), "name the id to bring back");
+                named
+                    .into_iter()
+                    .filter(|n| {
+                        let h = hex::encode(n);
+                        if exact {
+                            h == hex_given
+                        } else {
+                            h.starts_with(&hex_given)
+                        }
+                    })
+                    .collect()
+            }
+        };
+        match picked.as_slice() {
+            [one] => *one,
+            [] if id.is_some() => anyhow::bail!(
+                "no deleted {name} in {} has that id; see `cardinal deleted {parent}`",
+                shown_folder(&parent)
+            ),
+            [] => anyhow::bail!(
+                "nothing named {name} was deleted in {}; see `cardinal deleted {parent}`",
+                shown_folder(&parent)
+            ),
+            more => anyhow::bail!(
+                "{} deleted items in {} were named {name}: say which by its id, as \
+                 `cardinal deleted {parent}` gives it",
+                more.len(),
+                shown_folder(&parent)
+            ),
+        }
+    };
+    d.write_and_push(&at.space, vec![SpaceOp::restore(node)])?;
+    // where it is shown now
+    let shown = {
+        let core = d.core();
+        let sp = onefolder::open(&core, &at.space)?;
+        let entries = Files::new(sp).list(&at.node);
+        entries
+            .into_iter()
+            .find(|e| e.node == node && e.conflict_version.is_none())
+            .map(|e| e.name)
+            .unwrap_or(name)
+    };
+    let path = if parent.is_empty() {
+        shown
+    } else {
+        format!("{parent}/{shown}")
+    };
+    Ok(crate::api::UndeleteReply { id: node, path })
+}
+/// Brings back a deleted file, folder or link: a `restore` of its node,
+/// which brings back what the same delete took beneath it. `path` is the
+/// folder and the name it had; `id`, as `deleted` gives it or the start of
+/// it, picks one where more than one of that name was deleted there. Back
+/// beside another of its name, it is shown as the folder shows any two
+/// nodes of one name, and the reply says the path it is shown at.
+#[cfg(any(test, debug_assertions, feature = "by-name"))]
+#[allow(dead_code, clippy::all)]
+pub async fn undelete_by_name(
+    d: &Arc<Daemon>,
+    path: &str,
+    id: Option<&str>,
+) -> anyhow::Result<Json> {
     flush_mount(d).await?;
     let (parent, name) = onefolder::split_last(path)?;
     let at = onefolder::folder(d, &parent)?;

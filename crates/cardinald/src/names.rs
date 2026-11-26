@@ -21,6 +21,7 @@ use cardinal_link::Priority;
 use cardinal_space::account::{self, ContactRecord};
 use serde_json::{json, Value as Json};
 
+use crate::api::{ContactReply, Ref};
 use crate::daemon::Daemon;
 use crate::fetch::Fetcher;
 
@@ -161,8 +162,80 @@ fn write_cache<F: cardinal_blob::Fetch>(d: &Daemon, b: BlobRef, fetch: &F) -> an
 /// folder, such as `People/Ana/beach.jpg`, or one on this device's disk.
 /// It is copied into the account space, so it stays as it was whatever
 /// happens to the file. An empty `from` clears it.
-pub async fn set_picture(d: &Arc<Daemon>, who: &str, from: &str) -> anyhow::Result<Json> {
-    let contact = crate::contacts::find(d, who)?;
+pub async fn set_picture(
+    d: &Arc<Daemon>,
+    who: Ref<'_>,
+    from: &str,
+) -> anyhow::Result<ContactReply> {
+    let contact = crate::contacts::find_ref(d, who)?;
+    let acc = d
+        .core()
+        .account_id()
+        .ok_or_else(|| anyhow::anyhow!("the account space is not here yet"))?;
+    let from = from.trim();
+    if from.is_empty() {
+        let ops = d
+            .core()
+            .contact_ops(&contact.identity, &[(account::PICTURE, None)]);
+        d.write_and_push(&acc, ops)?;
+        return Ok(ContactReply::new());
+    }
+    // A file of the one folder is saved out first; one on the disk is read
+    // where it is.
+    let on_disk = Path::new(from);
+    let (path, saved) = if on_disk.is_absolute() && on_disk.is_file() {
+        (on_disk.to_path_buf(), false)
+    } else {
+        let dir = d.paths.pictures();
+        std::fs::create_dir_all(&dir)?;
+        let r: [u8; 8] = cardinal_crypto::random_bytes();
+        let tmp = dir.join(format!("incoming-{}", hex::encode(r)));
+        let to = tmp.display().to_string();
+        crate::onefolder::save(d, from, &to, None)
+            .await
+            .map_err(|e| anyhow::anyhow!("{from} is not a file here: {e:#}"))?;
+        (tmp, true)
+    };
+    let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+    let encoded = if size > PICTURE_AT_MOST {
+        Err(anyhow::anyhow!(
+            "that file is too big for a picture ({} MB at most)",
+            PICTURE_AT_MOST >> 20
+        ))
+    } else {
+        let paths = [path.display().to_string()];
+        crate::contacts::encode_attachments(d, &acc, &paths).await
+    };
+    if saved {
+        let _ = std::fs::remove_file(&path);
+    }
+    let attached = encoded?
+        .pop()
+        .ok_or_else(|| anyhow::anyhow!("nothing was read"))?;
+    let blob = BlobRef::from_record(&attached.blob)?;
+    let d2 = d.clone();
+    tokio::task::spawn_blocking(move || write_cache(&d2, blob, &NoFetch)).await??;
+    let picture = Some(Value::Record(attached.blob));
+    let ops = d
+        .core()
+        .contact_ops(&contact.identity, &[(account::PICTURE, picture)]);
+    d.write_and_push(&acc, ops)?;
+    let c = crate::contacts::find_ref(d, who).unwrap_or(contact);
+    let mut reply = ContactReply::new();
+    reply.name = Some(c.petname.clone());
+    reply.own = Some(c.own);
+    reply.suggested = c.suggested.clone();
+    reply.picture = self::picture(d, &c);
+    Ok(reply)
+}
+/// Sets this person's picture for a contact from a file: one of the one
+/// folder, such as `People/Ana/beach.jpg`, or one on this device's disk.
+/// It is copied into the account space, so it stays as it was whatever
+/// happens to the file. An empty `from` clears it.
+#[cfg(any(test, debug_assertions, feature = "by-name"))]
+#[allow(dead_code, clippy::all)]
+pub async fn set_picture_by_name(d: &Arc<Daemon>, who: &str, from: &str) -> anyhow::Result<Json> {
+    let contact = crate::contacts::find_by_name(d, who)?;
     let acc = d
         .core()
         .account_id()
@@ -215,8 +288,8 @@ pub async fn set_picture(d: &Arc<Daemon>, who: &str, from: &str) -> anyhow::Resu
         .core()
         .contact_ops(&contact.identity, &[(account::PICTURE, picture)]);
     d.write_and_push(&acc, ops)?;
-    let c = crate::contacts::find(d, who).unwrap_or(contact);
-    Ok(Json::Object(shown(d, &c)))
+    let c = crate::contacts::find_by_name(d, who).unwrap_or(contact);
+    Ok(Json::Object(shown_by_name(d, &c)))
 }
 
 /// When to ask again for a picture that could not be had: 10 s after the

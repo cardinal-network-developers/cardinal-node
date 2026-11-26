@@ -21,10 +21,11 @@ use cardinal_link::{CarrierKind, Priority, SecretEntry, Service, Session, Stream
 use cardinal_space::account::{self, ContactRecord, Regard};
 use cardinal_space::{relationship, NodeId, Space, SpaceId, SpaceOp};
 use cardinal_sync::identity_log_label;
+#[cfg(any(test, debug_assertions, feature = "by-name"))]
 use serde_json::{json, Value as Json};
 use tokio::io::AsyncWriteExt;
 
-use crate::api::table::{Attachment, Message, MessagesReply, Reaction};
+use crate::api::table::{Attachment, ContactReply, Message, MessagesReply, Reaction};
 use crate::api::Ref;
 use crate::core::{now_ms, short, Core};
 use crate::daemon::{Daemon, PeerKind};
@@ -800,8 +801,169 @@ fn record_contact(
 /// that as part of refusing, on this device, and nowhere else afterwards
 /// (`hosts.md#telling-others-where-to-reach-you`): `group-reach` with
 /// `share` false stops it in a group.
-pub fn set(d: &Arc<Daemon>, who: &str, setting: &str) -> anyhow::Result<Json> {
-    let contact = find(d, who)?;
+pub fn set(d: &Arc<Daemon>, who: Ref<'_>, setting: &str) -> anyhow::Result<ContactReply> {
+    let contact = find_ref(d, who)?;
+    let (key, value) = match setting {
+        "trust" => (account::TRUSTED, true),
+        "hosts-only" => (account::TRUSTED, false),
+        "introductions" => (account::INTRODUCTIONS, true),
+        "no-introductions" => (account::INTRODUCTIONS, false),
+        "refuse" => (account::REFUSED, true),
+        "unrefuse" => (account::REFUSED, false),
+        _ => anyhow::bail!("{setting:?} is not a setting"),
+    };
+    let account = d
+        .core()
+        .account_id()
+        .ok_or_else(|| anyhow::anyhow!("the account space is not here yet"))?;
+    let ops = d
+        .core()
+        .contact_ops(&contact.identity, &[(key, Some(value.into()))]);
+    d.write_and_push(&account, ops)?;
+    d.peers_changed();
+    let mut reply = ContactReply::new();
+    if setting == "refuse" {
+        reply.reach = Some(crate::groups::naming_hosts_shown(
+            &d.core(),
+            &contact.identity,
+        ));
+    }
+    Ok(reply)
+}
+
+/// The person says, in their relationship with a contact, whether the
+/// contact may have where their hosts are: `name-hosts` names each host
+/// of theirs (a host that cannot be reached now is named once it can),
+/// and `no-hosts` empties the list. Nothing else writes a yes where the
+/// list is empty, so this is how a list emptied before is filled.
+pub async fn name_hosts(
+    d: &Arc<Daemon>,
+    who: Ref<'_>,
+    share: bool,
+) -> anyhow::Result<ContactReply> {
+    let contact = find_ref(d, who)?;
+    // An old oddity, kept to the byte (DEVIATIONS.md, Old oddities kept):
+    // an id given as bytes is named as the way by name held it, NUL first.
+    anyhow::ensure!(!contact.refused, "you have refused {}", held(who));
+    let named = if !share {
+        mailbox::say_reach(d, &contact.space, false).await?;
+        "none"
+    } else {
+        match mailbox::share_reach(d, &contact.space).await? {
+            mailbox::Shared::Named => "named",
+            mailbox::Shared::NoHost => "no host",
+            mailbox::Shared::Waiting => "waiting",
+        }
+    };
+    let mut reply = ContactReply::new();
+    reply.named = Some(named.into());
+    Ok(reply)
+}
+
+/// The person takes one host of theirs out of the relationship with a
+/// contact (`no-host`, D75): the account records "not this host here",
+/// so it does not name itself there again until they say `name-hosts`.
+pub async fn no_host(d: &Arc<Daemon>, who: Ref<'_>, host: &str) -> anyhow::Result<ContactReply> {
+    let contact = find_ref(d, who)?;
+    let key = mailbox::host_by_name(d, host)?;
+    let named = mailbox::take_out_host(d, &contact.space, &key).await?;
+    let mut reply = ContactReply::new();
+    reply.named = Some(if named { "taken out" } else { "not named" }.into());
+    Ok(reply)
+}
+
+/// Changes what this person calls a contact. Only their own devices hear of
+/// it, and the contact is told nothing. An empty name clears the petname:
+/// the contact is then shown by the name they suggest, as theirs.
+pub fn rename(d: &Arc<Daemon>, who: Ref<'_>, name: &str) -> anyhow::Result<ContactReply> {
+    let contact = find_ref(d, who)?;
+    let name = name.trim();
+    if name.is_empty() {
+        let account = d
+            .core()
+            .account_id()
+            .ok_or_else(|| anyhow::anyhow!("the account space is not here yet"))?;
+        // Empty, not absent: a release before this one reads a contact
+        // without a petname as no contact at all.
+        let ops = d
+            .core()
+            .contact_ops(&contact.identity, &[(account::PETNAME, Some("".into()))]);
+        d.write_and_push(&account, ops)?;
+        let c = find_ref(d, Ref::Typed(&hex::encode(&contact.identity[..8])))?;
+        let mut reply = ContactReply::new();
+        reply.name = Some(c.petname.clone());
+        reply.own = Some(c.own);
+        reply.suggested = c.suggested.clone();
+        reply.picture = crate::names::picture(d, &c);
+        return Ok(reply);
+    }
+    anyhow::ensure!(!name.contains('\n'), "a name is one line");
+    // Two people with one name could be told apart only by their ids.
+    let taken =
+        d.core().contacts().into_iter().any(|c| {
+            c.identity != contact.identity && c.petname.to_lowercase() == name.to_lowercase()
+        });
+    anyhow::ensure!(!taken, "you already call someone else {name:?}");
+    let account = d
+        .core()
+        .account_id()
+        .ok_or_else(|| anyhow::anyhow!("the account space is not here yet"))?;
+    let ops = d
+        .core()
+        .contact_ops(&contact.identity, &[(account::PETNAME, Some(name.into()))]);
+    d.write_and_push(&account, ops)?;
+    let mut reply = ContactReply::new();
+    reply.name = Some(name.to_owned());
+    Ok(reply)
+}
+
+/// Lists a contact under another category, such as `Family`, which is the
+/// folder their shared folder appears in.
+pub fn set_category(d: &Arc<Daemon>, who: Ref<'_>, category: &str) -> anyhow::Result<ContactReply> {
+    let contact = find_ref(d, who)?;
+    let category = category.trim();
+    anyhow::ensure!(!category.is_empty(), "a category cannot be empty");
+    anyhow::ensure!(
+        !category.contains('/') && category != "." && category != "..",
+        "a category is a folder's name, so it cannot be {category:?}"
+    );
+    let account = d
+        .core()
+        .account_id()
+        .ok_or_else(|| anyhow::anyhow!("the account space is not here yet"))?;
+    let ops = d.core().contact_ops(
+        &contact.identity,
+        &[(account::CATEGORY, Some(category.into()))],
+    );
+    d.write_and_push(&account, ops)?;
+    let mut reply = ContactReply::new();
+    reply.category = Some(category.to_owned());
+    Ok(reply)
+}
+
+/// A `ref` as the way by name held it: text as typed, an id given as
+/// bytes NUL first and in hex. Only for words kept to the byte
+/// (DEVIATIONS.md, Old oddities kept).
+pub(crate) fn held(who: Ref<'_>) -> String {
+    match who {
+        Ref::Id(id) => format!("{}{}", crate::api::EXACT, id.hex()),
+        Ref::Typed(t) => t.to_owned(),
+    }
+}
+
+/// Changes how this person regards a contact. Only their own devices hear of
+/// it, and the contact is told nothing.
+///
+/// Refusing someone answers with `reach`: the groups they are in where
+/// this person's reach node names their hosts, each with its `name` and
+/// `what` they can see there. They still read it, and software asks about
+/// that as part of refusing, on this device, and nowhere else afterwards
+/// (`hosts.md#telling-others-where-to-reach-you`): `group-reach` with
+/// `share` false stops it in a group.
+#[cfg(any(test, debug_assertions, feature = "by-name"))]
+#[allow(dead_code, clippy::all)]
+pub fn set_by_name(d: &Arc<Daemon>, who: &str, setting: &str) -> anyhow::Result<Json> {
+    let contact = find_by_name(d, who)?;
     let (key, value) = match setting {
         "trust" => (account::TRUSTED, true),
         "hosts-only" => (account::TRUSTED, false),
@@ -821,7 +983,7 @@ pub fn set(d: &Arc<Daemon>, who: &str, setting: &str) -> anyhow::Result<Json> {
     d.write_and_push(&account, ops)?;
     d.peers_changed();
     if setting == "refuse" {
-        let reach = crate::groups::naming_hosts_to(&d.core(), &contact.identity);
+        let reach = crate::groups::naming_hosts_to_by_name(&d.core(), &contact.identity);
         return Ok(json!({"reach": reach}));
     }
     Ok(json!({}))
@@ -832,8 +994,10 @@ pub fn set(d: &Arc<Daemon>, who: &str, setting: &str) -> anyhow::Result<Json> {
 /// of theirs (a host that cannot be reached now is named once it can),
 /// and `no-hosts` empties the list. Nothing else writes a yes where the
 /// list is empty, so this is how a list emptied before is filled.
-pub async fn name_hosts(d: &Arc<Daemon>, who: &str, share: bool) -> anyhow::Result<Json> {
-    let contact = find(d, who)?;
+#[cfg(any(test, debug_assertions, feature = "by-name"))]
+#[allow(dead_code, clippy::all)]
+pub async fn name_hosts_by_name(d: &Arc<Daemon>, who: &str, share: bool) -> anyhow::Result<Json> {
+    let contact = find_by_name(d, who)?;
     anyhow::ensure!(!contact.refused, "you have refused {who}");
     if !share {
         mailbox::say_reach(d, &contact.space, false).await?;
@@ -850,8 +1014,10 @@ pub async fn name_hosts(d: &Arc<Daemon>, who: &str, share: bool) -> anyhow::Resu
 /// The person takes one host of theirs out of the relationship with a
 /// contact (`no-host`, D75): the account records "not this host here",
 /// so it does not name itself there again until they say `name-hosts`.
-pub async fn no_host(d: &Arc<Daemon>, who: &str, host: &str) -> anyhow::Result<Json> {
-    let contact = find(d, who)?;
+#[cfg(any(test, debug_assertions, feature = "by-name"))]
+#[allow(dead_code, clippy::all)]
+pub async fn no_host_by_name(d: &Arc<Daemon>, who: &str, host: &str) -> anyhow::Result<Json> {
+    let contact = find_by_name(d, who)?;
     let key = mailbox::host_by_name(d, host)?;
     let named = mailbox::take_out_host(d, &contact.space, &key).await?;
     Ok(json!({"named": if named { "taken out" } else { "not named" }}))
@@ -860,8 +1026,10 @@ pub async fn no_host(d: &Arc<Daemon>, who: &str, host: &str) -> anyhow::Result<J
 /// Changes what this person calls a contact. Only their own devices hear of
 /// it, and the contact is told nothing. An empty name clears the petname:
 /// the contact is then shown by the name they suggest, as theirs.
-pub fn rename(d: &Arc<Daemon>, who: &str, name: &str) -> anyhow::Result<Json> {
-    let contact = find(d, who)?;
+#[cfg(any(test, debug_assertions, feature = "by-name"))]
+#[allow(dead_code, clippy::all)]
+pub fn rename_by_name(d: &Arc<Daemon>, who: &str, name: &str) -> anyhow::Result<Json> {
+    let contact = find_by_name(d, who)?;
     let name = name.trim();
     if name.is_empty() {
         let account = d
@@ -874,8 +1042,8 @@ pub fn rename(d: &Arc<Daemon>, who: &str, name: &str) -> anyhow::Result<Json> {
             .core()
             .contact_ops(&contact.identity, &[(account::PETNAME, Some("".into()))]);
         d.write_and_push(&account, ops)?;
-        let c = find(d, &hex::encode(&contact.identity[..8]))?;
-        return Ok(Json::Object(crate::names::shown(d, &c)));
+        let c = find_by_name(d, &hex::encode(&contact.identity[..8]))?;
+        return Ok(Json::Object(crate::names::shown_by_name(d, &c)));
     }
     anyhow::ensure!(!name.contains('\n'), "a name is one line");
     // Two people with one name could be told apart only by their ids.
@@ -897,8 +1065,10 @@ pub fn rename(d: &Arc<Daemon>, who: &str, name: &str) -> anyhow::Result<Json> {
 
 /// Lists a contact under another category, such as `Family`, which is the
 /// folder their shared folder appears in.
-pub fn set_category(d: &Arc<Daemon>, who: &str, category: &str) -> anyhow::Result<Json> {
-    let contact = find(d, who)?;
+#[cfg(any(test, debug_assertions, feature = "by-name"))]
+#[allow(dead_code, clippy::all)]
+pub fn set_category_by_name(d: &Arc<Daemon>, who: &str, category: &str) -> anyhow::Result<Json> {
+    let contact = find_by_name(d, who)?;
     let category = category.trim();
     anyhow::ensure!(!category.is_empty(), "a category cannot be empty");
     anyhow::ensure!(

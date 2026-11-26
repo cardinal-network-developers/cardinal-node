@@ -407,6 +407,9 @@ pub mod typed {
     use crate::api::typed::Reference;
     use crate::api::{self, CallArgs, FilesArgs, FilesReply, MessagesArgs, MessagesReply};
     use crate::api::{AcceptArgs, AcceptReply, InviteArgs, InviteReply};
+    use crate::api::{AppAnswerArgs, AppJoinArgs, AppJoinReply, AppOffersArgs, AppOffersReply};
+    use crate::api::{AppQuestionsArgs, AppQuestionsReply, ApprovalRevokeArgs, ApprovalsArgs};
+    use crate::api::{ApprovalsReply, ContactArgs, ContactReply, DebugTreeArgs, DebugTreeReply};
     use crate::api::{
         BluetoothArgs, BluetoothReply, HostArgs, HostOffArgs, HostReply, HostsReply, NetworkArgs,
         NetworkReply, PeerAddArgs, PeerAddReply, PeerRemoveArgs, RouterArgs, RouterReply,
@@ -471,6 +474,9 @@ pub mod typed {
         RecoverStopWaitingReply, RecoverUndoArgs, RecoverUndoReply, RecoveryCheckArgs,
         RecoverySheetArgs, RecoverySheetReply, RestoreFromHostArgs, RestoreFromHostReply,
     };
+    use crate::api::{RemoveDeviceArgs, RemoveDeviceReply, SetupBeginArgs, SetupBeginReply};
+    use crate::api::{SetupFinishArgs, SetupFinishReply, SpeedtestArgs, SpeedtestReply};
+    use crate::api::{UndeleteArgs, UndeleteReply};
     use crate::daemon::Daemon;
     use crate::daemon::PairState;
     use cardinal_space::account;
@@ -1831,6 +1837,113 @@ pub mod typed {
         }
     }
 
+    // ---- Setting up, this person's devices, and their contacts ----
+
+    impl Answer for SetupBeginArgs {
+        async fn answer(d: &Arc<Daemon>, _: &Self) -> anyhow::Result<SetupBeginReply> {
+            super::setup_begin(d)
+        }
+    }
+
+    impl Answer for SetupFinishArgs {
+        async fn answer(d: &Arc<Daemon>, a: &Self) -> anyhow::Result<SetupFinishReply> {
+            super::setup_finish(d, a)
+        }
+    }
+
+    impl Answer for RemoveDeviceArgs {
+        async fn answer(d: &Arc<Daemon>, a: &Self) -> anyhow::Result<RemoveDeviceReply> {
+            let who = needed(a.who.as_ref(), "who")?;
+            let lost = a.lost.unwrap_or(false);
+            super::remove_device(d, who.as_ref(), a.words.as_deref(), lost).await
+        }
+    }
+
+    /// `contact`: a new name, a picture, a category, or a setting, in that
+    /// order of what is given.
+    impl Answer for ContactArgs {
+        async fn answer(d: &Arc<Daemon>, a: &Self) -> anyhow::Result<ContactReply> {
+            let who = || needed(a.who.as_ref(), "who").map(Reference::as_ref);
+            if let Some(name) = a.name.as_deref() {
+                return crate::contacts::rename(d, who()?, name);
+            }
+            if let Some(from) = a.picture.as_deref() {
+                return crate::names::set_picture(d, who()?, from).await;
+            }
+            if let Some(category) = a.category.as_deref() {
+                return crate::contacts::set_category(d, who()?, category);
+            }
+            match needed(a.setting.as_deref(), "setting")? {
+                "name-hosts" => crate::contacts::name_hosts(d, who()?, true).await,
+                "no-hosts" => crate::contacts::name_hosts(d, who()?, false).await,
+                "no-host" => {
+                    let who = who()?;
+                    crate::contacts::no_host(d, who, needed(a.host.as_deref(), "host")?).await
+                }
+                setting => crate::contacts::set(d, who()?, setting),
+            }
+        }
+    }
+
+    // ---- Measuring, and the files brought back ----
+
+    impl Answer for DebugTreeArgs {
+        async fn answer(d: &Arc<Daemon>, _: &Self) -> anyhow::Result<DebugTreeReply> {
+            super::debug_tree(d)
+        }
+    }
+
+    impl Answer for SpeedtestArgs {
+        async fn answer(d: &Arc<Daemon>, a: &Self) -> anyhow::Result<SpeedtestReply> {
+            super::speedtest(d, needed(a.device.as_ref(), "device")?.as_ref()).await
+        }
+    }
+
+    impl Answer for UndeleteArgs {
+        async fn answer(d: &Arc<Daemon>, a: &Self) -> anyhow::Result<UndeleteReply> {
+            let path = needed(a.path.as_deref(), "path")?;
+            crate::file_history::undelete(d, path, a.id.as_ref().map(Reference::as_ref)).await
+        }
+    }
+
+    // ---- What programs ask the person ----
+
+    impl Answer for AppQuestionsArgs {
+        async fn answer(d: &Arc<Daemon>, _: &Self) -> anyhow::Result<AppQuestionsReply> {
+            Ok(AppQuestionsReply::new(crate::apps::questions(d), false))
+        }
+    }
+
+    impl Answer for AppAnswerArgs {
+        async fn answer(d: &Arc<Daemon>, a: &Self) -> anyhow::Result<Done> {
+            crate::apps::answer(d, a)
+        }
+    }
+
+    impl Answer for ApprovalsArgs {
+        async fn answer(d: &Arc<Daemon>, _: &Self) -> anyhow::Result<ApprovalsReply> {
+            Ok(ApprovalsReply::new(crate::apps::list_approvals(d), false))
+        }
+    }
+
+    impl Answer for ApprovalRevokeArgs {
+        async fn answer(d: &Arc<Daemon>, a: &Self) -> anyhow::Result<Done> {
+            crate::apps::revoke(d, needed(a.id.as_ref(), "id")?.as_ref())
+        }
+    }
+
+    impl Answer for AppOffersArgs {
+        async fn answer(d: &Arc<Daemon>, _: &Self) -> anyhow::Result<AppOffersReply> {
+            Ok(AppOffersReply::new(crate::apps::list_offers(d), false))
+        }
+    }
+
+    impl Answer for AppJoinArgs {
+        async fn answer(d: &Arc<Daemon>, a: &Self) -> anyhow::Result<AppJoinReply> {
+            crate::apps::join(d, needed(a.space.as_ref(), "space")?.as_ref())
+        }
+    }
+
     impl Answer for DeviceRenameArgs {
         async fn answer(d: &Arc<Daemon>, a: &Self) -> anyhow::Result<DeviceRenameReply> {
             let device = needed(a.device.as_ref(), "device")?;
@@ -2045,8 +2158,10 @@ async fn handle(d: &Arc<Daemon>, req: &Value) -> anyhow::Result<Value> {
     match cmd {
         #[cfg(any(test, debug_assertions, feature = "by-name"))]
         "hello" => Ok(json!({"api": API, "version": env!("CARGO_PKG_VERSION")})),
-        "setup-begin" => setup_begin(d),
-        "setup-finish" => setup_finish(d, req),
+        #[cfg(any(test, debug_assertions, feature = "by-name"))]
+        "setup-begin" => setup_begin_by_name(d),
+        #[cfg(any(test, debug_assertions, feature = "by-name"))]
+        "setup-finish" => setup_finish_by_name(d, req),
         #[cfg(any(test, debug_assertions, feature = "by-name"))]
         "status" => Ok(status(d)),
         // Inspection (`inspect.rs`): the person turns it on, on this
@@ -2085,9 +2200,10 @@ async fn handle(d: &Arc<Daemon>, req: &Value) -> anyhow::Result<Value> {
             reload(d)?;
             Ok(json!({}))
         }
+        #[cfg(any(test, debug_assertions, feature = "by-name"))]
         "remove-device" => {
             let lost = req.get("lost").and_then(|v| v.as_bool()).unwrap_or(false);
-            remove_device(d, arg(req, "who")?, words(req), lost).await
+            remove_device_by_name(d, arg(req, "who")?, words(req), lost).await
         }
         #[cfg(any(test, debug_assertions, feature = "by-name"))]
         "invite" => {
@@ -2143,21 +2259,28 @@ async fn handle(d: &Arc<Daemon>, req: &Value) -> anyhow::Result<Value> {
             let all = req.get("all").and_then(|v| v.as_bool()) == Some(true);
             Ok(crate::contacts::list_by_name(d, all))
         }
+        #[cfg(any(test, debug_assertions, feature = "by-name"))]
         "contact" => match (
             req.get("name").and_then(|v| v.as_str()),
             req.get("category").and_then(|v| v.as_str()),
         ) {
-            (Some(name), _) => crate::contacts::rename(d, arg(req, "who")?, name),
+            (Some(name), _) => crate::contacts::rename_by_name(d, arg(req, "who")?, name),
             (None, _) if req.get("picture").is_some() => {
                 let from = req.get("picture").and_then(|v| v.as_str()).unwrap_or("");
-                crate::names::set_picture(d, arg(req, "who")?, from).await
+                crate::names::set_picture_by_name(d, arg(req, "who")?, from).await
             }
-            (None, Some(category)) => crate::contacts::set_category(d, arg(req, "who")?, category),
+            (None, Some(category)) => {
+                crate::contacts::set_category_by_name(d, arg(req, "who")?, category)
+            }
             (None, None) => match arg(req, "setting")? {
-                "name-hosts" => crate::contacts::name_hosts(d, arg(req, "who")?, true).await,
-                "no-hosts" => crate::contacts::name_hosts(d, arg(req, "who")?, false).await,
-                "no-host" => crate::contacts::no_host(d, arg(req, "who")?, arg(req, "host")?).await,
-                setting => crate::contacts::set(d, arg(req, "who")?, setting),
+                "name-hosts" => {
+                    crate::contacts::name_hosts_by_name(d, arg(req, "who")?, true).await
+                }
+                "no-hosts" => crate::contacts::name_hosts_by_name(d, arg(req, "who")?, false).await,
+                "no-host" => {
+                    crate::contacts::no_host_by_name(d, arg(req, "who")?, arg(req, "host")?).await
+                }
+                setting => crate::contacts::set_by_name(d, arg(req, "who")?, setting),
             },
         },
         #[cfg(any(test, debug_assertions, feature = "by-name"))]
@@ -2350,12 +2473,18 @@ async fn handle(d: &Arc<Daemon>, req: &Value) -> anyhow::Result<Value> {
         "call-start" => crate::calls::start_by_name(d, arg(req, "who")?, formats(req)?).await,
         // What programs ask through the application interface, and the
         // person's approvals (`apps.rs`).
-        "app-questions" => Ok(crate::apps::questions(d)),
-        "app-answer" => crate::apps::answer(d, req),
-        "approvals" => Ok(crate::apps::list_approvals(d)),
-        "approval-revoke" => crate::apps::revoke(d, arg(req, "id")?),
-        "app-offers" => Ok(crate::apps::list_offers(d)),
-        "app-join" => crate::apps::join(d, arg(req, "space")?),
+        #[cfg(any(test, debug_assertions, feature = "by-name"))]
+        "app-questions" => Ok(crate::apps::questions_by_name(d)),
+        #[cfg(any(test, debug_assertions, feature = "by-name"))]
+        "app-answer" => crate::apps::answer_by_name(d, req),
+        #[cfg(any(test, debug_assertions, feature = "by-name"))]
+        "approvals" => Ok(crate::apps::list_approvals_by_name(d)),
+        #[cfg(any(test, debug_assertions, feature = "by-name"))]
+        "approval-revoke" => crate::apps::revoke_by_name(d, arg(req, "id")?),
+        #[cfg(any(test, debug_assertions, feature = "by-name"))]
+        "app-offers" => Ok(crate::apps::list_offers_by_name(d)),
+        #[cfg(any(test, debug_assertions, feature = "by-name"))]
+        "app-join" => crate::apps::join_by_name(d, arg(req, "space")?),
         #[cfg(any(test, debug_assertions, feature = "by-name"))]
         "call-answer" => {
             let reach = answer_in(req, "reach")?;
@@ -2599,7 +2728,8 @@ async fn handle(d: &Arc<Daemon>, req: &Value) -> anyhow::Result<Value> {
         }
         #[cfg(any(test, debug_assertions, feature = "by-name"))]
         "conflicts" => conflicts(d),
-        "debug-tree" => debug_tree(d),
+        #[cfg(any(test, debug_assertions, feature = "by-name"))]
+        "debug-tree" => debug_tree_by_name(d),
         #[cfg(any(test, debug_assertions, feature = "by-name"))]
         "free-space" if req.get("unnamed").and_then(|v| v.as_bool()) == Some(true) => {
             let delete = req.get("delete").and_then(|v| v.as_bool()) == Some(true);
@@ -2680,11 +2810,13 @@ async fn handle(d: &Arc<Daemon>, req: &Value) -> anyhow::Result<Value> {
             req.get("path").and_then(Value::as_str).unwrap_or(""),
             req.get("hidden").and_then(Value::as_bool).unwrap_or(false),
         ),
+        #[cfg(any(test, debug_assertions, feature = "by-name"))]
         "undelete" => {
             let id = req.get("id").and_then(Value::as_str);
-            crate::file_history::undelete(d, arg(req, "path")?, id).await
+            crate::file_history::undelete_by_name(d, arg(req, "path")?, id).await
         }
-        "speedtest" => speedtest(d, arg(req, "device")?).await,
+        #[cfg(any(test, debug_assertions, feature = "by-name"))]
+        "speedtest" => speedtest_by_name(d, arg(req, "device")?).await,
         #[cfg(any(test, debug_assertions, feature = "by-name"))]
         "me" => crate::names::me_by_name(d, req.get("name").and_then(|v| v.as_str())),
         #[cfg(any(test, debug_assertions, feature = "by-name"))]
@@ -2988,7 +3120,69 @@ fn set_retention(d: &Arc<Daemon>, mode: &str) -> anyhow::Result<()> {
 }
 
 /// Measures the link to one of the person's devices (`speedtest.rs`).
-async fn speedtest(d: &Arc<Daemon>, who: &str) -> anyhow::Result<Value> {
+async fn speedtest(d: &Arc<Daemon>, asked: api::Ref<'_>) -> anyhow::Result<api::SpeedtestReply> {
+    let me = d.keys.key();
+    let (key, name, x) = {
+        let core = d.core();
+        let ident = core
+            .identity
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("this device does not belong to anyone yet"))?;
+        let names = core.device_names();
+        let st = ident.state();
+        // text as typed, lower case; an id given as bytes is matched as one
+        let w = match asked {
+            api::Ref::Typed(t) => t.to_lowercase(),
+            api::Ref::Id(_) => String::new(),
+        };
+        let who = asked.to_string();
+        let matches: Vec<_> = st
+            .keys
+            .values()
+            .filter(|k| match asked {
+                api::Ref::Id(_) => asked.is_id(&k.key),
+                api::Ref::Typed(_) => {
+                    names.get(&k.key).is_some_and(|n| n.to_lowercase() == w)
+                        || hex::encode(k.key).starts_with(&w)
+                }
+            })
+            .collect();
+        let k = match matches.as_slice() {
+            [] => anyhow::bail!("no device called {who:?}; see `cardinal devices`"),
+            [k] => *k,
+            _ => anyhow::bail!(
+                "several devices match {who:?}; use the key shown by `cardinal devices`"
+            ),
+        };
+        let name = names
+            .get(&k.key)
+            .cloned()
+            .filter(|n| !n.is_empty())
+            .unwrap_or_else(|| account::short_key(&k.key));
+        (k.key, name, k.link_key.as_ref().map(|l| *l.x25519()))
+    };
+    if key == me {
+        anyhow::bail!("{name} is this device; name one of your others");
+    }
+    let session = x
+        .and_then(|x| d.own_sessions().into_iter().find(|s| s.peer_static() == x))
+        .ok_or_else(|| anyhow::anyhow!("{name} is offline"))?;
+    let m = crate::speedtest::run(&session, &name).await?;
+    Ok(api::SpeedtestReply {
+        device: name,
+        ms: m.phase.as_millis() as u64,
+        receive: m.receive.round() as u64,
+        received_bytes: m.received,
+        rtt_median_us: m.rtt_median.as_micros() as u64,
+        rtt_min_us: m.rtt_min.as_micros() as u64,
+        send: m.send.round() as u64,
+        sent_bytes: m.sent,
+    })
+}
+/// Measures the link to one of the person's devices (`speedtest.rs`).
+#[cfg(any(test, debug_assertions, feature = "by-name"))]
+#[allow(dead_code, clippy::all)]
+async fn speedtest_by_name(d: &Arc<Daemon>, who: &str) -> anyhow::Result<Value> {
     let me = d.keys.key();
     let (key, name, x) = {
         let core = d.core();
@@ -3068,7 +3262,28 @@ pub(crate) fn reload(d: &Arc<Daemon>) -> anyhow::Result<()> {
 
 /// Makes an identity for a client to set up, and says which two of its words
 /// to ask for back. Nothing is saved until [`setup_finish`].
-fn setup_begin(d: &Daemon) -> anyhow::Result<Value> {
+fn setup_begin(d: &Daemon) -> anyhow::Result<api::SetupBeginReply> {
+    let prepared = crate::setup::prepare(&d.paths)?;
+    let phrase = prepared.phrase().to_words();
+    let words: Vec<&str> = phrase.split(' ').collect();
+    let r: [u8; 2] = cardinal_crypto::random_bytes();
+    let (a, mut b) = (r[0] as usize % words.len(), r[1] as usize % words.len());
+    if b == a {
+        b = (a + 7) % words.len();
+    }
+    let ask = [a.min(b), a.max(b)];
+    let reply = api::SetupBeginReply {
+        ask: ask.iter().map(|&n| n as u64).collect(),
+        words: words.iter().map(|&w| w.to_owned()).collect(),
+    };
+    *d.setting_up.lock().unwrap_or_else(|e| e.into_inner()) = Some((prepared, ask));
+    Ok(reply)
+}
+/// Makes an identity for a client to set up, and says which two of its words
+/// to ask for back. Nothing is saved until [`setup_finish`].
+#[cfg(any(test, debug_assertions, feature = "by-name"))]
+#[allow(dead_code, clippy::all)]
+fn setup_begin_by_name(d: &Daemon) -> anyhow::Result<Value> {
     let prepared = crate::setup::prepare(&d.paths)?;
     let phrase = prepared.phrase().to_words();
     let words: Vec<&str> = phrase.split(' ').collect();
@@ -3084,7 +3299,51 @@ fn setup_begin(d: &Daemon) -> anyhow::Result<Value> {
 }
 
 /// Saves the identity once its person has shown they have the words.
-fn setup_finish(d: &Arc<Daemon>, req: &Value) -> anyhow::Result<Value> {
+fn setup_finish(
+    d: &Arc<Daemon>,
+    a: &api::SetupFinishArgs,
+) -> anyhow::Result<api::SetupFinishReply> {
+    let mut held = d.setting_up.lock().unwrap_or_else(|e| e.into_inner());
+    let (prepared, ask) = held
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("nothing is being set up"))?;
+    let words_are = prepared.phrase().to_words();
+    let words: Vec<&str> = words_are.split(' ').collect();
+    let none = Vec::new();
+    let answers = a.answers.as_ref().unwrap_or(&none);
+    let matches = ask.iter().enumerate().all(|(i, at)| {
+        let answer = answers.get(i).map_or("", String::as_str);
+        answer.trim().eq_ignore_ascii_case(words[*at])
+    });
+    anyhow::ensure!(matches, "that does not match; check what you wrote down");
+    let mut config = crate::config::Config::load(&d.paths.config())?;
+    // `name` is the person's, the name they suggest for themselves; the
+    // device keeps its machine's name unless the window knows a better one.
+    if let Some(device) = device_name_given(a.device.as_deref())? {
+        config.name = device;
+    }
+    let person = a
+        .name
+        .as_deref()
+        .map(str::trim)
+        .filter(|n| !n.is_empty())
+        .map(str::to_owned)
+        .unwrap_or_else(crate::config::default_person);
+    anyhow::ensure!(!person.contains('\n'), "a name is one line");
+    let (prepared, _) = held.take().expect("checked above");
+    drop(held);
+    crate::setup::install(&d.paths, prepared, &config, &person)?;
+    config.save(&d.paths.config())?;
+    reload(d)?;
+    Ok(api::SetupFinishReply {
+        device: config.name,
+        name: person,
+    })
+}
+/// Saves the identity once its person has shown they have the words.
+#[cfg(any(test, debug_assertions, feature = "by-name"))]
+#[allow(dead_code, clippy::all)]
+fn setup_finish_by_name(d: &Arc<Daemon>, req: &Value) -> anyhow::Result<Value> {
     let mut held = d.setting_up.lock().unwrap_or_else(|e| e.into_inner());
     let (prepared, ask) = held
         .as_ref()
@@ -3100,7 +3359,7 @@ fn setup_finish(d: &Arc<Daemon>, req: &Value) -> anyhow::Result<Value> {
     let mut config = crate::config::Config::load(&d.paths.config())?;
     // `name` is the person's, the name they suggest for themselves; the
     // device keeps its machine's name unless the window knows a better one.
-    if let Some(device) = device_name(req)? {
+    if let Some(device) = device_name_by_name(req)? {
         config.name = device;
     }
     let person = req["name"]
@@ -3116,12 +3375,6 @@ fn setup_finish(d: &Arc<Daemon>, req: &Value) -> anyhow::Result<Value> {
     config.save(&d.paths.config())?;
     reload(d)?;
     Ok(json!({"name": person, "device": config.name}))
-}
-
-/// The `device` a window gives, the name it knows this device by: one
-/// line, and not empty if given.
-fn device_name(req: &Value) -> anyhow::Result<Option<String>> {
-    device_name_given(req.get("device").and_then(|v| v.as_str()))
 }
 
 /// What to call this device, where a request says.
@@ -3687,10 +3940,125 @@ fn conflicts(d: &Daemon) -> anyhow::Result<Value> {
     Ok(json!({"conflicts": out}))
 }
 
+/// `debug-tree`: the mounted folder's tree as the service holds it, and
+/// what keeps it from settling.
+fn debug_tree(d: &Daemon) -> anyhow::Result<api::DebugTreeReply> {
+    let files = require_files(d)?;
+    let heads = {
+        let core = d.core();
+        let mut hs = core.spaces[&files]
+            .space
+            .as_ref()
+            .map(|s| s.heads())
+            .unwrap_or_default();
+        hs.sort();
+        let mut h = blake3::Hasher::new();
+        for x in &hs {
+            h.update(x);
+        }
+        let mut out = [0u8; 16];
+        out.copy_from_slice(&h.finalize().as_bytes()[..16]);
+        out
+    };
+    let epoch = {
+        let core = d.core();
+        core.spaces[&files]
+            .space
+            .as_ref()
+            .and_then(|s| s.current_epoch())
+    };
+    let (state, snap) = {
+        let core = d.core();
+        let h = &core.spaces[&files];
+        let sp = h.space.as_ref();
+        (
+            sp.map(|s| {
+                let mut out = [0u8; 8];
+                out.copy_from_slice(&blake3::hash(&s.state().canonical().encode()).as_bytes()[..8]);
+                out
+            }),
+            sp.map(|s| crate::fs::tree::Snapshot::take(s, h.version, &core.device_names())),
+        )
+    };
+    let start = |n: &NodeId| {
+        let mut out = [0u8; 6];
+        out.copy_from_slice(&n[..6]);
+        out
+    };
+    let mut reply = api::DebugTreeReply::new(heads, false, false);
+    reply.epoch = epoch;
+    let m = d.mount.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(m) = m.as_ref() else {
+        return Ok(reply);
+    };
+    let tree = m.tree();
+    let t = tree.lock().unwrap_or_else(|e| e.into_inner());
+    let mut items = Vec::new();
+    let mut stack = vec![t.root];
+    while let Some(ino) = stack.pop() {
+        let Some(i) = t.inodes.get(&ino) else {
+            continue;
+        };
+        for c in i.children.values() {
+            let Some(x) = t.inodes.get(c) else { continue };
+            let kind = match x.kind {
+                crate::fs::tree::Kind::Dir => "dir",
+                crate::fs::tree::Kind::File => "file",
+                crate::fs::tree::Kind::Symlink => "link",
+                crate::fs::tree::Kind::Conflict(_) => "conflict",
+            };
+            items.push(api::TreeItem {
+                dirty: x.dirty.any_change(),
+                ino: x.ino,
+                kind: kind.into(),
+                local: x.local,
+                node: x.node.as_ref().map(start),
+                path: t.path(*c),
+                size: x.size,
+            });
+            stack.push(*c);
+        }
+    }
+    // What keeps a device from settling, and what its state holds that its
+    // tree does not show.
+    let stuck: Vec<api::StuckItem> = t
+        .inodes
+        .values()
+        .filter(|x| x.parent != 0 && !x.local && (x.node.is_none() || x.dirty.any_change()))
+        .map(|x| api::StuckItem {
+            dirty: format!("{:?}", x.dirty),
+            kind: format!("{:?}", x.kind),
+            opens: x.opens as u64,
+            path: t.path(x.ino),
+            staged: x.staged.is_some(),
+        })
+        .collect();
+    let unshown: Vec<api::UnshownNode> = snap
+        .iter()
+        .flat_map(|s| s.entries.iter())
+        .filter(|e| e.version.is_none() && !t.by_node.contains_key(&e.node))
+        .map(|e| api::UnshownNode {
+            name: e.name.clone(),
+            node: start(&e.node),
+        })
+        .collect();
+    reply.state = state;
+    reply.mounted = true;
+    reply.pending = Some(t.has_pending());
+    reply.items = Some(items);
+    reply.stuck = Some(stuck);
+    reply.unshown = Some(unshown);
+    reply.deleted = Some(t.deleted.len() as u64);
+    reply.settle = Some(t.settle.len() as u64);
+    Ok(reply)
+}
+
 /// For tests: a digest of the files space's heads, whether the mount has
 /// changes to commit, and every item the mount shows, with whether it is
 /// local (`fs/local.rs`).
-fn debug_tree(d: &Daemon) -> anyhow::Result<Value> {
+#[cfg(any(test, debug_assertions, feature = "by-name"))]
+#[allow(dead_code, clippy::all)]
+fn debug_tree_by_name(d: &Daemon) -> anyhow::Result<Value> {
     let files = require_files(d)?;
     let heads = {
         let core = d.core();
@@ -3778,6 +4146,7 @@ fn debug_tree(d: &Daemon) -> anyhow::Result<Value> {
 }
 
 /// The recovery words of a request, if given ([`crate::recovery`]).
+#[cfg(any(test, debug_assertions, feature = "by-name"))]
 fn words(req: &Value) -> Option<&str> {
     req.get("words").and_then(|v| v.as_str())
 }
@@ -3917,12 +4286,160 @@ fn rename_device(
 
 async fn remove_device(
     d: &Arc<Daemon>,
+    who: api::Ref<'_>,
+    words: Option<&str>,
+    lost: bool,
+) -> anyhow::Result<api::RemoveDeviceReply> {
+    let me = d.keys.key();
+    let (key, name) = find_device(d, who)?;
+    if key == me {
+        anyhow::bail!("this is the device you are using; remove it from another of your devices");
+    }
+    // Its link key, which is what a list of hosts names it by, while the
+    // log still has it.
+    let link = d.core().identity.as_ref().and_then(|i| {
+        let st = i.state();
+        let k = st.keys.values().find(|k| k.key == key)?;
+        k.link_key.as_ref().map(|l| *l.x25519())
+    });
+    // Removals go strictly down in power: an admin removes devices, and
+    // only the root (the recovery words) removes an admin.
+    let target = d
+        .core()
+        .identity
+        .as_ref()
+        .and_then(|i| i.state().power(&key));
+    let root = crate::recovery::signer(
+        d,
+        words,
+        |mine| mine >= Some(Power::Admin) && mine > target,
+        || {
+            if target >= Some(Power::Admin) {
+                format!("{name} is an admin device: no device can remove it")
+            } else {
+                format!("this device cannot remove {name} (it is not an admin device)")
+            }
+        },
+    )?;
+    if !lost {
+        keep_work_of(d, &key).await?;
+    }
+    let signer = root.as_ref().unwrap_or(&d.keys.device.signing);
+    let (entries, label) = {
+        let mut core = d.core();
+        let ident = core.identity.as_mut().expect("identity");
+        let current = ident
+            .enc
+            .first()
+            .map(|k| cardinal_crypto::HybridKeyPair::from_secret_bytes(&k.secret_bytes()));
+        let removal = if lost {
+            ident.log.remove_lost_key(signer, &key)
+        } else {
+            ident.log.remove_key(signer, &key)
+        };
+        let e1 = removal.map_err(|e| {
+            anyhow::anyhow!(
+                "cannot remove {name}: {e} (only a device with more power can remove it)"
+            )
+        })?;
+        ident.record_own(&e1)?;
+        let new = cardinal_crypto::HybridKeyPair::generate();
+        let e2 = ident
+            .log
+            .set_encryption_key(signer, &new, current.as_ref())?;
+        ident.record_own(&e2)?;
+        drop(core);
+        let mut core = d.core();
+        let keys = d.keys.clone();
+        if let Some(i) = core.identity.as_mut() {
+            if let Ok(k) = i.log.open_encryption_key(&keys.device) {
+                i.enc = i.log.key_chain(k);
+            }
+        }
+        let entries = vec![(e1.encode(), e1.id()), (e2.encode(), e2.id())];
+        (entries, core.identity_label())
+    };
+    let session = d
+        .own_sessions()
+        .into_iter()
+        .find(|s| s.peer_identity().map(|p| p.signing_key) == Some(key));
+    if let (Some(s), Some(label)) = (session, label) {
+        let tell = async {
+            for (entry, id) in &entries {
+                net::deliver(&s, label, entry.clone(), *id).await?;
+            }
+            anyhow::Ok(())
+        };
+        match tokio::time::timeout(TELL_WITHIN, tell).await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => tracing::debug!("telling {name} of its removal: {e:#}"),
+            Err(_) => tracing::debug!("telling {name} of its removal took too long"),
+        }
+    }
+    d.identity_changed();
+    d.push_identity(entries.into_iter().map(|(entry, _)| entry).collect());
+    // Every space moves to keys it never held, now rather than at the next
+    // write here. Any device's next write would do it, so one that fails
+    // is not lost.
+    let spaces: Vec<SpaceId> = d.core().spaces.keys().copied().collect();
+    for space in &spaces {
+        let rotated = d.core().rotate_if_due(space);
+        match rotated {
+            Ok(Some(entry)) => d.push(space, vec![entry]),
+            Ok(None) => {}
+            Err(e) => tracing::warn!("no new keys yet for {}: {e:#}", short(space)),
+        }
+    }
+    // forget its device node and its placements
+    let acc = {
+        let core = d.core();
+        core.account_id().and_then(|a| {
+            let st = core.spaces[&a].space.as_ref()?.state();
+            let mut nodes: Vec<NodeId> = account::devices(st)
+                .into_iter()
+                .filter(|x| x.key == key)
+                .map(|x| x.node)
+                .collect();
+            for rec in account::spaces(st) {
+                nodes.extend(
+                    rec.placements
+                        .iter()
+                        .filter(|p| p.device == key)
+                        .map(|p| p.node),
+                );
+            }
+            Some((a, nodes))
+        })
+    };
+    if let Some((a, nodes)) = acc {
+        if !nodes.is_empty() {
+            let ops = nodes
+                .into_iter()
+                .map(cardinal_space::SpaceOp::delete)
+                .collect();
+            d.write_and_push(&a, ops)?;
+        }
+    }
+    // The person removed it: it leaves the lists that name it.
+    if let Some(link) = link {
+        crate::mailbox::take_out_removed(d, &link);
+    }
+    let dropped = d.core().unwitnessed_by(&key);
+    Ok(api::RemoveDeviceReply {
+        dropped: dropped as u64,
+        name,
+    })
+}
+#[cfg(any(test, debug_assertions, feature = "by-name"))]
+#[allow(dead_code, clippy::all)]
+async fn remove_device_by_name(
+    d: &Arc<Daemon>,
     who: &str,
     words: Option<&str>,
     lost: bool,
 ) -> anyhow::Result<Value> {
     let me = d.keys.key();
-    let (key, name) = find_device(d, api::reference(who))?;
+    let (key, name) = find_device_by_name(d, who)?;
     if key == me {
         anyhow::bail!("this is the device you are using; remove it from another of your devices");
     }

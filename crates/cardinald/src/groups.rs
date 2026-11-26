@@ -36,6 +36,7 @@ use cardinal_link::Priority;
 use cardinal_space::account::ContactRecord;
 use cardinal_space::group::{self, Member};
 use cardinal_space::{relationship, Space, SpaceId, SpaceOp};
+#[cfg(any(test, debug_assertions, feature = "by-name"))]
 use serde_json::{json, Value as Json};
 
 use crate::api::{self, Ref};
@@ -950,7 +951,25 @@ fn telling_of(core: &Core, id: &SpaceId, me: &[u8; 32]) -> api::GroupReach {
 /// The groups where someone this person refuses still reads where their
 /// hosts are, for a client to ask about as part of refusing: each group's
 /// id and name, and what is seen there.
-pub fn naming_hosts_to(core: &Core, who: &[u8; 32]) -> Json {
+pub fn naming_hosts_shown(core: &Core, who: &[u8; 32]) -> Vec<api::GroupShown> {
+    let groups = core.groups_naming_hosts_to(who).into_iter();
+    groups
+        .filter_map(|id| {
+            let sp = core.spaces.get(&id)?.space.as_ref()?;
+            let name = group::name(sp);
+            Some(api::GroupShown {
+                group: id,
+                name,
+                what: core.telling(&id).what,
+            })
+        })
+        .collect()
+}
+
+/// [`naming_hosts_shown`] as main had it, by name.
+#[cfg(any(test, debug_assertions, feature = "by-name"))]
+#[allow(dead_code, clippy::all)]
+pub fn naming_hosts_to_by_name(core: &Core, who: &[u8; 32]) -> Json {
     let groups = core.groups_naming_hosts_to(who).into_iter();
     let all: Vec<Json> = groups
         .filter_map(|id| {

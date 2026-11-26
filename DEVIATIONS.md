@@ -2436,7 +2436,15 @@ asks for around that is not built yet.
     space named by bytes in `keep-old` and `history-empty` is the start of
     an id, any length, as the way by name read its hex, where a `ref` as
     bytes is otherwise an id alone (empty bytes start every id, and are
-    refused as naming more than one).
+    refused as naming more than one). `contact` with `setting`
+    `name-hosts` or `no-hosts`, for someone refused, names a contact given
+    as bytes NUL first ("you have refused \0<hex>"). `approval-revoke`
+    and `app-join` read an id given as bytes as the start of one, any
+    length, as the way by name read its hex, and `app-join` names it NUL
+    first in "nothing offered to you is <space>" and "more than one offer
+    is <space>". `app-answer` saying yes to a question of sharing without
+    `people` is refused, and the question is gone all the same: the
+    program asking it is told nothing, as if the person had not answered.
   - **A reply field without a number** is this build's mistake. In a debug
     build, where the tests run, the request then fails; in a release build
     the field is left out and the service logs an error. A field no test

@@ -1169,7 +1169,7 @@ async fn a_contact_and_before_are_the_bytes_they_were() {
     }
     // refused, and named by bytes: NUL first in the words, as before
     for d in [&t.old, &t.new] {
-        crate::contacts::set(d, "Ann", "refuse").unwrap();
+        crate::contacts::set_by_name(d, "Ann", "refuse").unwrap();
     }
     for who in forms {
         let msg = t.same(json!({"cmd": "messages", "who": who})).await;
@@ -1571,7 +1571,7 @@ async fn calls_are_started_answered_and_ended_the_same() {
     }
     // refused: named NUL first where given as bytes, as before
     for d in [&t.old, &t.new] {
-        crate::contacts::set(d, "Ann", "refuse").unwrap();
+        crate::contacts::set_by_name(d, "Ann", "refuse").unwrap();
     }
     for who in ["Ann", &exact(&ann[..8])] {
         t.same(json!({"cmd": "call-start", "who": who})).await;
@@ -1705,7 +1705,7 @@ async fn invitations_are_made_and_taken_up_the_same() {
         // refused, by their id as bytes
         for (d, inviter) in [(&t.old, a), (&t.new, b)] {
             let them = inviter.core().identity.as_ref().unwrap().id();
-            crate::contacts::set(d, &exact(&them), "refuse").unwrap();
+            crate::contacts::set_by_name(d, &exact(&them), "refuse").unwrap();
         }
         t.same_as(req(code(a, "Refused")), req(code(b, "Refused")))
             .await;
@@ -2365,7 +2365,7 @@ async fn messages_are_written_the_same() {
     assert!(r.conversations.iter().any(|c| c.last.is_some()));
     // refused, by her id as bytes: named NUL first, as before
     for d in [&t.old, &t.new] {
-        crate::contacts::set(d, "Bea", "refuse").unwrap();
+        crate::contacts::set_by_name(d, "Bea", "refuse").unwrap();
     }
     for req in [
         |id: [u8; 32]| json!({"cmd": "say", "who": exact(&id[..8]), "text": "hi"}),
@@ -2564,7 +2564,7 @@ async fn status_and_reaching_are_the_bytes_they_were() {
     let cy = a_contact(&t, "Cy", 7);
     let dee = a_contact(&t, "Dee", 9);
     for d in [&t.old, &t.new] {
-        crate::contacts::set(d, "Dee", "refuse").unwrap();
+        crate::contacts::set_by_name(d, "Dee", "refuse").unwrap();
     }
     {
         let mut c = t.new.config();
@@ -2710,11 +2710,11 @@ async fn the_rest_are_answered_the_same() {
     let (bea_o, bea_n) = (id(&bea[0]), id(&bea[1]));
     let dee = a_contact(&t, "Dee", 9);
     for d in [&t.old, &t.new] {
-        crate::contacts::set(d, "Dee", "refuse").unwrap();
+        crate::contacts::set_by_name(d, "Dee", "refuse").unwrap();
     }
     let eve = a_contact(&t, "Eve", 11);
     for d in [&t.old, &t.new] {
-        crate::contacts::set(d, "Eve", "no-introductions").unwrap();
+        crate::contacts::set_by_name(d, "Eve", "no-introductions").unwrap();
     }
     for req in [
         json!({"cmd": "introduce"}),
@@ -2919,7 +2919,7 @@ async fn guardians_are_answered_the_same() {
     let bea_id = |i: usize| bea[i].core().identity.as_ref().unwrap().id();
     let cy = a_contact(&t, "Cy", 7);
     for d in [&t.old, &t.new] {
-        crate::contacts::set(d, "Cy", "hosts-only").unwrap();
+        crate::contacts::set_by_name(d, "Cy", "hosts-only").unwrap();
     }
     let twin = [t.old.clone(), t.new.clone()];
 
@@ -3152,7 +3152,7 @@ async fn hosting_is_answered_the_same() {
     let bea_id = |i: usize| bea[i].core().identity.as_ref().unwrap().id();
     let cy = a_contact(&t, "Cy", 7);
     for d in [&t.old, &t.new] {
-        crate::contacts::set(d, "Cy", "hosts-only").unwrap();
+        crate::contacts::set_by_name(d, "Cy", "hosts-only").unwrap();
     }
     t.same_here(json!({"cmd": "hosting"})).await;
     for req in [
@@ -3262,4 +3262,552 @@ async fn freeing_space_is_answered_the_same() {
         .await;
     t.same(json!({"cmd": "stop"})).await;
     assert!(*t.new.stopping.subscribe().borrow());
+}
+
+// ---- Setting up, removing a device, contacts, measuring, programs ----
+
+/// Whether a reply says it was done.
+fn done(msg: &[u8]) -> bool {
+    Record::decode(msg).unwrap().get(0).and_then(Value::as_uint) == Some(status::OK)
+}
+
+/// Asks each of `reqs` of both twins, and says which were done.
+async fn done_of(t: &Twins, reqs: Vec<Json>) -> Vec<bool> {
+    let mut out = Vec::new();
+    for req in reqs {
+        out.push(done(&t.same(req).await));
+    }
+    out
+}
+
+/// Two services on copies of one device that belongs to nobody yet, as a
+/// window finds one before it is set up.
+async fn bare_twins(dir: &std::path::Path) -> Twins {
+    let start = |at: &str| {
+        let paths = crate::paths::Paths::at(&dir.join(at));
+        let mut config = crate::config::Config {
+            listen: "127.0.0.1:0".into(),
+            ..Default::default()
+        };
+        config.this_run.no_mount = true;
+        config.this_run.no_discovery = true;
+        config.this_run.no_udp = true;
+        (paths, config)
+    };
+    let (po, co) = start("old");
+    let (pn, cn) = start("new");
+    let old = Daemon::start(po, co).await.unwrap();
+    let new = Daemon::start(pn, cn).await.unwrap();
+    let mut t = Twins {
+        old,
+        new,
+        swap: Vec::new(),
+    };
+    // each one's folder, named in a refusal
+    let (o, n) = (
+        dir.join("old").display().to_string(),
+        dir.join("new").display().to_string(),
+    );
+    t.swap.push((o.into_bytes(), n.into_bytes()));
+    t
+}
+
+/// `setup-begin` gives words of its own on each twin, made at random: the
+/// replies are compared with the new one's words and places put in the
+/// old one's reply, which must then be the new one's bytes, and each is
+/// checked for what it holds. `setup-finish` is then compared byte for
+/// byte, each twin answered with its own words.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn setting_up_is_answered_the_same() {
+    let dir = tempfile::tempdir().unwrap();
+    let t = bare_twins(dir.path()).await;
+    // before anything is begun
+    for req in [
+        json!({"cmd": "setup-finish"}),
+        json!({"cmd": "setup-finish", "answers": ["a", "b"]}),
+    ] {
+        t.same(req).await;
+    }
+    let begun = |t: &Twins| {
+        let (o, n) = (t.old.clone(), t.new.clone());
+        async move {
+            let (_, msg) = encode_request(&json!({"cmd": "setup-begin"})).unwrap();
+            let old = crate::control::by_name(&o, &msg).await;
+            let new = crate::control::typed::reply(&n, &msg).await.unwrap();
+            // one record each, canonical, its words and places as begun
+            let (ro, rn) = (Record::decode(&old).unwrap(), Record::decode(&new).unwrap());
+            assert_eq!(ro.encode(), old);
+            let mut swapped = ro.clone();
+            for k in [2, 3] {
+                swapped.insert(k, rn.get(k).unwrap().clone());
+            }
+            assert_eq!(swapped.encode(), new, "setup-begin, the words swapped");
+            let words = |r: &Record| -> Vec<String> {
+                let l = r.get(3).unwrap().as_list().unwrap();
+                l.iter().map(|w| w.as_text().unwrap().to_owned()).collect()
+            };
+            let ask = |r: &Record| -> Vec<u64> {
+                let l = r.get(2).unwrap().as_list().unwrap();
+                l.iter().map(|n| n.as_uint().unwrap()).collect()
+            };
+            for r in [&ro, &rn] {
+                assert_eq!(r.len(), 3);
+                assert_eq!(r.get(0).and_then(Value::as_uint), Some(0));
+                assert_eq!(words(r).len(), 24);
+                let a = ask(r);
+                assert!(a.len() == 2 && a[0] < a[1] && a[1] < 24, "{a:?}");
+            }
+            let read = typed_of::<SetupBeginArgs>(&new);
+            assert_eq!(read.words, words(&rn));
+            let answers = |r: &Record| -> Vec<String> {
+                let w = words(r);
+                ask(r).iter().map(|&i| w[i as usize].clone()).collect()
+            };
+            (answers(&ro), answers(&rn))
+        }
+    };
+    let (ao, an) = begun(&t).await;
+    for (old, new) in [
+        (json!(["no", "no"]), json!(["no", "no"])),
+        (json!([ao[0]]), json!([an[0]])),
+        (json!([]), json!([])),
+    ] {
+        t.same_as(
+            json!({"cmd": "setup-finish", "answers": old}),
+            json!({"cmd": "setup-finish", "answers": new}),
+        )
+        .await;
+    }
+    t.same(json!({"cmd": "setup-finish"})).await;
+    let up =
+        |w: &[String]| -> Vec<String> { vec![format!("  {}", w[0].to_uppercase()), w[1].clone()] };
+    // a name or a device's name of two lines, refused before anything
+    // is kept
+    for (name, device) in [
+        (json!("Ann\nB"), json!(null)),
+        (json!("Ann"), json!("a\nb")),
+    ] {
+        t.same_as(
+            json!({"cmd": "setup-finish", "answers": up(&ao), "name": name, "device": device}),
+            json!({"cmd": "setup-finish", "answers": up(&an), "name": name, "device": device}),
+        )
+        .await;
+    }
+    // begun again: the words before go
+    let (ao, an) = begun(&t).await;
+    t.same_as(
+        json!({"cmd": "setup-finish", "answers": up(&ao), "name": "  Ann  ", "device": " Desk "}),
+        json!({"cmd": "setup-finish", "answers": up(&an), "name": "  Ann  ", "device": " Desk "}),
+    )
+    .await;
+    // done: nothing is being set up, and the device belongs to someone
+    t.same(json!({"cmd": "setup-finish", "answers": ["a", "b"]}))
+        .await;
+    t.same(json!({"cmd": "setup-begin"})).await;
+
+    // the person's own name, and the device's, as the machine has them
+    let dir = tempfile::tempdir().unwrap();
+    let t = bare_twins(dir.path()).await;
+    let (ao, an) = begun(&t).await;
+    t.same_as(
+        json!({"cmd": "setup-finish", "answers": ao, "name": " ", "device": ""}),
+        json!({"cmd": "setup-finish", "answers": an, "name": " ", "device": ""}),
+    )
+    .await;
+    let dir = tempfile::tempdir().unwrap();
+    let t = bare_twins(dir.path()).await;
+    let (ao, an) = begun(&t).await;
+    t.same_as(
+        json!({"cmd": "setup-finish", "answers": ao}),
+        json!({"cmd": "setup-finish", "answers": an}),
+    )
+    .await;
+}
+
+/// A device of this person's, the same on each twin, named `name` in the
+/// account where a name is given.
+fn a_device(t: &Twins, power: cardinal_identity::Power) -> [u8; 32] {
+    let k = cardinal_identity::DeviceKeys::generate();
+    for d in [&t.old, &t.new] {
+        {
+            let mut core = d.core();
+            let ident = core.identity.as_mut().unwrap();
+            let enc = ident.enc.first().unwrap();
+            let enc = cardinal_crypto::HybridKeyPair::from_secret_bytes(&enc.secret_bytes());
+            let req = k.request(&ident.id(), power);
+            let e = ident
+                .log
+                .add_key(&d.keys.device.signing, &req, Some(&enc))
+                .unwrap();
+            ident.record_own(&e).unwrap();
+        }
+        d.identity_changed();
+    }
+    k.key()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_device_is_removed_the_same() {
+    let dir = tempfile::tempdir().unwrap();
+    let (t, words) = Twins::start_words(dir.path()).await;
+    let me = t.new.keys.key();
+    let one = a_device(&t, cardinal_identity::Power::Device);
+    let two = a_device(&t, cardinal_identity::Power::Device);
+    let admin = a_device(&t, cardinal_identity::Power::Admin);
+    let short = |k: &[u8; 32]| hex::encode(&k[..8]);
+    let reqs = vec![
+        json!({"cmd": "remove-device"}),
+        json!({"cmd": "remove-device", "lost": true}),
+        json!({"cmd": "remove-device", "who": "nobody"}),
+        json!({"cmd": "remove-device", "who": ""}),
+        json!({"cmd": "remove-device", "who": exact(&[])}),
+        json!({"cmd": "remove-device", "who": exact(&one[..4])}),
+        json!({"cmd": "remove-device", "who": exact(&me)}),
+        json!({"cmd": "remove-device", "who": short(&me)}),
+        json!({"cmd": "remove-device", "who": short(&admin)}),
+        json!({"cmd": "remove-device", "who": short(&admin), "words": "not the words"}),
+        json!({"cmd": "remove-device", "who": short(&one).to_uppercase(), "lost": true}),
+        json!({"cmd": "remove-device", "who": exact(&two[..8])}),
+        json!({"cmd": "remove-device", "who": exact(&two)}),
+        json!({"cmd": "remove-device", "who": short(&admin), "words": words, "lost": false}),
+    ];
+    let done = done_of(&t, reqs).await;
+    // the three removals, and nothing else
+    assert_eq!(done.iter().filter(|x| **x).count(), 3, "{done:?}");
+    assert!(done[10] && done[11] && done[13], "{done:?}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_contact_is_changed_the_same() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut t = Twins::start(dir.path()).await;
+    let ann = a_contact(&t, "Ann", 7);
+    a_contact(&t, "Bea", 9);
+    // a picture on the disk, and one too large for a picture
+    let png = dir.path().join("ann.png");
+    std::fs::write(&png, b"\x89PNG\r\n\x1a\n a picture").unwrap();
+    let big = dir.path().join("big.png");
+    std::fs::File::create(&big)
+        .unwrap()
+        .set_len((16 << 20) + 1)
+        .unwrap();
+    // each twin's folder of pictures, named in what it shows
+    let (o, n) = (
+        t.old.paths.pictures().display().to_string(),
+        t.new.paths.pictures().display().to_string(),
+    );
+    t.swap.push((o.into_bytes(), n.into_bytes()));
+    let short = hex::encode(&ann[..8]);
+    let reqs = vec![
+        json!({"cmd": "contact"}),
+        json!({"cmd": "contact", "who": "Ann"}),
+        json!({"cmd": "contact", "name": "Ann"}),
+        json!({"cmd": "contact", "who": "nobody", "name": "x"}),
+        json!({"cmd": "contact", "who": exact(&[1, 2]), "name": "x"}),
+        json!({"cmd": "contact", "who": "Ann", "name": "Bea"}),
+        json!({"cmd": "contact", "who": "Ann", "name": "two\nlines"}),
+        json!({"cmd": "contact", "who": "Ann", "name": "  Anna  "}),
+        json!({"cmd": "contact", "who": exact(&ann), "name": ""}),
+        json!({"cmd": "contact", "who": short, "name": "Ann", "category": "Work"}),
+        json!({"cmd": "contact", "who": "Ann", "category": ""}),
+        json!({"cmd": "contact", "who": "Ann", "category": "a/b"}),
+        json!({"cmd": "contact", "who": "Ann", "category": ".."}),
+        json!({"cmd": "contact", "who": exact(&ann[..8]), "category": " Family "}),
+        json!({"cmd": "contact", "who": "Ann", "picture": ""}),
+        json!({"cmd": "contact", "who": "Ann", "picture": "People/none.png"}),
+        json!({"cmd": "contact", "who": "Ann", "picture": big.display().to_string()}),
+        json!({"cmd": "contact", "who": "Ann", "picture": png.display().to_string()}),
+        json!({"cmd": "contact", "who": "Ann", "name": ""}),
+        json!({"cmd": "contact", "who": exact(&ann), "name": "Ann"}),
+        json!({"cmd": "contact", "who": "Ann", "picture": " ", "category": "Work"}),
+        json!({"cmd": "contact", "who": "Ann", "setting": "bogus"}),
+        json!({"cmd": "contact", "setting": "trust"}),
+        json!({"cmd": "contact", "who": "Ann", "setting": "trust"}),
+        json!({"cmd": "contact", "who": "Ann", "setting": "hosts-only"}),
+        json!({"cmd": "contact", "who": "Ann", "setting": "no-introductions"}),
+        json!({"cmd": "contact", "who": "Ann", "setting": "introductions"}),
+        json!({"cmd": "contact", "who": "Ann", "setting": "name-hosts"}),
+        json!({"cmd": "contact", "who": "Ann", "setting": "no-hosts"}),
+        json!({"cmd": "contact", "who": "Ann", "setting": "name-hosts"}),
+        json!({"cmd": "contact", "who": "Ann", "setting": "no-host"}),
+        json!({"cmd": "contact", "who": "Ann", "setting": "no-host", "host": "nowhere"}),
+        json!({"cmd": "contact", "who": exact(&ann), "setting": "refuse"}),
+        json!({"cmd": "contact", "who": exact(&ann), "setting": "name-hosts"}),
+        json!({"cmd": "contact", "who": "Ann", "setting": "no-hosts"}),
+        json!({"cmd": "contact", "who": exact(&ann[..8]), "setting": "unrefuse"}),
+    ];
+    let done = done_of(&t, reqs).await;
+    let yes = [
+        7, 8, 9, 13, 14, 17, 18, 19, 20, 23, 24, 25, 26, 27, 29, 32, 35,
+    ];
+    let said: Vec<usize> = (0..done.len()).filter(|i| done[*i]).collect();
+    assert_eq!(said, yes);
+    // the picture, read back as the contacts give it
+    t.same_here(json!({"cmd": "contacts"})).await;
+    let _ = &mut t;
+}
+
+/// What the files bring back: each twin's deleted file has an id of its
+/// own, told alike.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn files_are_brought_back_the_same() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut t = Twins::start(dir.path()).await;
+    let local = dir.path().join("local.txt");
+    std::fs::write(&local, b"some bytes").unwrap();
+    let local = local.to_str().unwrap().to_owned();
+    for req in [
+        json!({"cmd": "mkdir", "path": "Docs"}),
+        json!({"cmd": "write", "from": local, "path": "Docs/a.txt"}),
+        json!({"cmd": "remove", "path": "Docs/a.txt"}),
+        json!({"cmd": "write", "from": local, "path": "Docs/a.txt"}),
+        json!({"cmd": "remove", "path": "Docs/a.txt"}),
+        json!({"cmd": "write", "from": local, "path": "b.txt"}),
+        json!({"cmd": "remove", "path": "b.txt"}),
+    ] {
+        t.same(req).await;
+    }
+    let ids = |d: &Arc<Daemon>, path: &str| -> Vec<[u8; 16]> {
+        let r = crate::file_history::deleted(d, path, false).unwrap();
+        r.files.iter().map(|f| f.id).collect()
+    };
+    let (o, n) = (ids(&t.old, "Docs"), ids(&t.new, "Docs"));
+    for (a, b) in o.iter().zip(&n) {
+        t.alike(a, b);
+    }
+    let (ob, nb) = (ids(&t.old, ""), ids(&t.new, ""));
+    for (a, b) in ob.iter().zip(&nb) {
+        t.alike(a, b);
+    }
+    for req in [
+        json!({"cmd": "undelete"}),
+        json!({"cmd": "undelete", "path": "Docs/none.txt"}),
+        json!({"cmd": "undelete", "path": "Nowhere/a.txt"}),
+        json!({"cmd": "undelete", "path": "Docs/a.txt"}),
+        json!({"cmd": "undelete", "path": "Docs/a.txt", "id": ""}),
+        json!({"cmd": "undelete", "path": "Docs/a.txt", "id": exact(&[])}),
+        json!({"cmd": "undelete", "path": "Docs/a.txt", "id": "ffffffff"}),
+        json!({"cmd": "undelete", "path": "Docs/a.txt", "id": exact(&[0xff; 16])}),
+    ] {
+        t.same(req).await;
+    }
+    // by the start of its id, typed, and by its id as bytes
+    let typed_start = |id: &[u8; 16]| hex::encode(&id[..6]).to_uppercase();
+    t.same_as(
+        json!({"cmd": "undelete", "path": "Docs/a.txt", "id": exact(&o[0][..8])}),
+        json!({"cmd": "undelete", "path": "Docs/a.txt", "id": exact(&n[0][..8])}),
+    )
+    .await;
+    let back = t
+        .same_as(
+            json!({"cmd": "undelete", "path": "Docs/a.txt", "id": typed_start(&o[0])}),
+            json!({"cmd": "undelete", "path": "Docs/a.txt", "id": typed_start(&n[0])}),
+        )
+        .await;
+    assert_eq!(typed_of::<UndeleteArgs>(&back).id, n[0]);
+    let back = t
+        .same_as(
+            json!({"cmd": "undelete", "path": "Docs/a.txt", "id": exact(&o[1])}),
+            json!({"cmd": "undelete", "path": "Docs/a.txt", "id": exact(&n[1])}),
+        )
+        .await;
+    // the first is back, so its name is taken: the second comes back
+    // beside it
+    assert_eq!(typed_of::<UndeleteArgs>(&back).id, n[1]);
+    assert!(done(
+        &t.same(json!({"cmd": "undelete", "path": "b.txt"})).await
+    ));
+    assert!(!done(
+        &t.same(json!({"cmd": "undelete", "path": "b.txt"})).await
+    ));
+    // what was brought back is in the folder again
+    t.same_here(json!({"cmd": "files", "path": "Docs"})).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn what_programs_ask_is_answered_the_same() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut t = Twins::start(dir.path()).await;
+    let pages = |cmd: &str| {
+        [
+            json!({"cmd": cmd}),
+            json!({"cmd": cmd, "limit": 1}),
+            json!({"cmd": cmd, "after": 1, "limit": 1}),
+            json!({"cmd": cmd, "after": 9}),
+        ]
+    };
+    for cmd in ["app-questions", "approvals", "app-offers"] {
+        for req in pages(cmd) {
+            t.same(req).await;
+        }
+    }
+    // questions waiting, alike on both
+    let mut waiting = Vec::new();
+    for d in [&t.old, &t.new] {
+        use crate::apps::Asks;
+        waiting.push(crate::apps::ask_for_test(
+            d,
+            "/usr/bin/cal",
+            "Calendar",
+            Asks::Family {
+                root: [5; 32],
+                change: true,
+            },
+            "see and change your calendars",
+        ));
+        waiting.push(crate::apps::ask_for_test(
+            d,
+            "/usr/bin/cal",
+            "Calendar",
+            Asks::Share {
+                space: [6; 32],
+                role: cardinal_space::group::WRITER,
+            },
+            "share Family",
+        ));
+        waiting.push(crate::apps::ask_for_test(
+            d,
+            "/usr/bin/notes",
+            "Notes",
+            Asks::NewSpace {
+                root: [7; 32],
+                name: "Notes".into(),
+            },
+            "start a space",
+        ));
+    }
+    for cmd in ["app-questions"] {
+        for req in pages(cmd) {
+            t.same(req).await;
+        }
+    }
+    // approvals, each twin's node its own, told alike
+    for d in [&t.old, &t.new] {
+        crate::apps::record_approval(d, "/usr/bin/cal", "Calendar", [5; 32], true).unwrap();
+        crate::apps::record_approval(d, "/usr/bin/notes", "Notes", [7; 32], false).unwrap();
+    }
+    let nodes = |d: &Arc<Daemon>| -> Vec<[u8; 16]> {
+        crate::apps::list_approvals(d)
+            .iter()
+            .map(|a| a.id)
+            .collect()
+    };
+    let (on, nn) = (nodes(&t.old), nodes(&t.new));
+    for (a, b) in on.iter().zip(&nn) {
+        t.alike(a, b);
+    }
+    for req in pages("approvals") {
+        t.same_here(req).await;
+    }
+    let reqs = vec![
+        json!({"cmd": "app-answer"}),
+        json!({"cmd": "app-answer", "id": 99, "yes": true}),
+        json!({"cmd": "app-answer", "id": 1, "role": "owner"}),
+        json!({"cmd": "app-answer", "id": 2, "yes": true}),
+        json!({"cmd": "app-answer", "id": 2, "yes": true, "people": []}),
+        json!({"cmd": "app-answer", "id": 1, "yes": true, "role": ""}),
+        json!({"cmd": "app-answer", "id": 3, "yes": false}),
+        json!({"cmd": "app-answer", "id": 1, "yes": true}),
+        json!({"cmd": "approval-revoke"}),
+        json!({"cmd": "approval-revoke", "id": ""}),
+        json!({"cmd": "approval-revoke", "id": exact(&[])}),
+        json!({"cmd": "approval-revoke", "id": "ffffffffff"}),
+        json!({"cmd": "approval-revoke", "id": exact(&[0xff; 4])}),
+        json!({"cmd": "app-join"}),
+        json!({"cmd": "app-join", "space": ""}),
+        json!({"cmd": "app-join", "space": "Calendar"}),
+        json!({"cmd": "app-join", "space": exact(&[1; 32])}),
+        json!({"cmd": "app-join", "space": exact(&[])}),
+    ];
+    let answered = done_of(&t, reqs).await;
+    let said: Vec<usize> = (0..answered.len()).filter(|i| answered[*i]).collect();
+    assert_eq!(said, [5, 6]);
+    // the share question again, answered with whom and as what, by name
+    // and by bytes; what each program was told
+    for d in [&t.old, &t.new] {
+        use crate::apps::Asks;
+        waiting.push(crate::apps::ask_for_test(
+            d,
+            "/usr/bin/cal",
+            "Calendar",
+            Asks::Share {
+                space: [6; 32],
+                role: cardinal_space::group::READER,
+            },
+            "share Work",
+        ));
+    }
+    let answered = t
+        .same(json!({"cmd": "app-answer", "id": 4, "yes": true,
+            "people": ["Ann", exact(&[3; 8])], "role": "reader"}))
+        .await;
+    assert!(done(&answered));
+    // asked of the old one, then the new one: three, then one more
+    let said: Vec<String> = waiting
+        .into_iter()
+        .map(|mut w| format!("{:?}", w.try_recv().ok()))
+        .collect();
+    assert_eq!(said[0..3], said[3..6]);
+    assert_eq!(said[6], said[7]);
+    assert!(said[7].contains("0303030303030303"), "{said:?}");
+    // revoked by the start of its id, typed and as bytes
+    t.same_as(
+        json!({"cmd": "approval-revoke", "id": hex::encode(&on[0][..5]).to_uppercase()}),
+        json!({"cmd": "approval-revoke", "id": hex::encode(&nn[0][..5]).to_uppercase()}),
+    )
+    .await;
+    let revoked = t
+        .same_as(
+            json!({"cmd": "approval-revoke", "id": exact(&on[1][..3])}),
+            json!({"cmd": "approval-revoke", "id": exact(&nn[1][..3])}),
+        )
+        .await;
+    assert!(done(&revoked));
+    assert!(crate::apps::list_approvals(&t.new)
+        .iter()
+        .all(|a| a.revoked));
+    for req in pages("approvals") {
+        t.same_here(req).await;
+    }
+}
+
+/// `speedtest` measures, and so is answered once: compared where it is
+/// refused, every way, the measuring itself is not.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn speedtest_is_refused_the_same() {
+    let dir = tempfile::tempdir().unwrap();
+    let t = Twins::start(dir.path()).await;
+    let me = t.new.keys.key();
+    let other = a_device(&t, cardinal_identity::Power::Device);
+    for req in [
+        json!({"cmd": "speedtest"}),
+        json!({"cmd": "speedtest", "device": "nowhere"}),
+        json!({"cmd": "speedtest", "device": ""}),
+        json!({"cmd": "speedtest", "device": exact(&[])}),
+        json!({"cmd": "speedtest", "device": exact(&me)}),
+        json!({"cmd": "speedtest", "device": hex::encode(&me[..8])}),
+        json!({"cmd": "speedtest", "device": hex::encode(&other[..3]).to_uppercase()}),
+        json!({"cmd": "speedtest", "device": exact(&other[..8])}),
+        json!({"cmd": "speedtest", "device": exact(&other)}),
+    ] {
+        t.same(req).await;
+    }
+}
+
+/// The tree, unmounted where the tests run, and on a device that holds no
+/// files space.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_tree_is_answered_the_same() {
+    let dir = tempfile::tempdir().unwrap();
+    let t = Twins::start(dir.path()).await;
+    for req in [
+        json!({"cmd": "debug-tree"}),
+        json!({"cmd": "debug-tree", "limit": 1}),
+        json!({"cmd": "debug-tree", "after": 3}),
+    ] {
+        t.same_here(req).await;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let t = bare_twins(dir.path()).await;
+    t.same(json!({"cmd": "debug-tree"})).await;
 }
