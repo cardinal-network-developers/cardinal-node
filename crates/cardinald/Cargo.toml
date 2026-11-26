@@ -67,3 +67,9 @@ mount = ["dep:fuser"]
 
 [dev-dependencies]
 tempfile.workspace = true
+
+# What the local interface costs (`benches/interface.rs`): outside the test
+# tiers, run by hand with `cargo bench -p cardinald --bench interface`.
+[[bench]]
+name = "interface"
+harness = false
