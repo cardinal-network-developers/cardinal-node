@@ -1442,7 +1442,7 @@ async fn ask_or_failed<A: api::typed::Ask>(
 #[inline(never)]
 fn unanswered(paths: &Paths, request: &str, e: anyhow::Error) -> anyhow::Error {
     if let Some(u) = e.downcast_ref::<api::typed::Unreadable>() {
-        return anyhow::anyhow!("{u} to {request}");
+        return anyhow::anyhow!("could not read the service's reply to {request}: {}", u.0);
     }
     not_answering(paths)
 }

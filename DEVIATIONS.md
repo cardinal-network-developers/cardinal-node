@@ -2491,7 +2491,10 @@ asks for around that is not built yet.
     `recover-start` with an `identity` given as text that is a space, NUL,
     then an id's 64 hex digits takes it as that id and starts a recovery,
     as the way by name trimmed before it told text from an id given as
-    bytes (as `before` above).
+    bytes (as `before` above). Kept and not fixed, the same on main:
+    `host-offer` to a trusted contact with a `relay_mb` of about 1.8e13 or
+    more multiplies past a u64 (`mb * 1_000_000`), which in a debug build
+    panics in the connection's task and in a release build wraps.
   - **A reply field without a number** is this build's mistake. In a debug
     build, where the tests run, the request then fails; in a release build
     the field is left out and the service logs an error. A field no test
