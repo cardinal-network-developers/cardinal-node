@@ -1,5 +1,9 @@
 use super::*;
+#[allow(unused_imports)]
+use serde_json::{json, Map, Value as Json};
 use std::collections::HashSet;
+
+use crate::transport::MAX_MESSAGE;
 
 fn check_fields(fields: &[Field], first: u64, at: &str, seen: &mut HashSet<&'static str>) {
     let mut numbers = HashSet::new();

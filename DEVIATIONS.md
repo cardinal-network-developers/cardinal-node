@@ -2365,9 +2365,18 @@ asks for around that is not built yet.
     on the typed way; ids stay bytes from the store to the socket. The
     command line reads typed replies with `control::ask`, which also joins
     pages; `--trace` is unchanged.
-  - **By name, for the rest until they are typed.** Their handlers build
-    and read JSON trees by field name; `api` turns one form into the other
-    at the socket by the same tables, hex becoming bytes.
+  - **Every request is typed; a release build has no way by name.** The
+    service decodes and encodes typed only, and the command line asks and
+    reads typed only. The converter by name (`api/by_name.rs`: a request
+    and its reply as JSON trees by the tables' names, hex for bytes,
+    `encode_request`, `decode_request`, `page`, `encode_reply`,
+    `error_reply_with`, `decode_reply`, the streams' by name) and the
+    client by name the tests use (`api/blocking.rs`) are compiled only in
+    test and debug builds and with the `by-name` feature, which the
+    command line's tests turn on as a dev-dependency. In a release build
+    `serde_json` is left only for the service's own files (what it keeps
+    on disk between runs) and the command line's `--json` output, which
+    it writes from the typed reply by the tables (`cardinal/src/output.rs`).
   - **The way by name, kept to compare.** While requests are converted,
     main's handlers of the typed requests are kept whole, as `*_by_name`
     (with main's lookups and main's arms in `control::handle`), compiled
@@ -2388,8 +2397,14 @@ asks for around that is not built yet.
     copies of one device, one asked by name, one typed), covering success,
     each refusal, and optional fields present and absent. What the twins
     make apart (a group's id, a message's id and time, a path of each) is
-    swapped before the bytes are compared. All of the way by name goes once
-    every request is typed. `apps.md`'s tables of numbers are generated
+    swapped before the bytes are compared. The kept copies and the
+    comparison stay until the typed way has been released once; they are
+    every item gated `#[cfg(any(test, debug_assertions, feature =
+    "by-name"))]` but the two `mod` lines in `api/mod.rs` that keep the
+    converter and the client by name for the tests, with
+    `inspect/by_name.rs`, `api/same_bytes.rs`, and `control::typed::beside`
+    with what holds the clock still for it (`#[cfg(any(test,
+    debug_assertions))]`): removing them is deleting those. `apps.md`'s tables of numbers are generated
     from `api/table.rs`, typed rows and rows by name alike
     (`CARDINAL_API_TABLES=<file> cargo test -p cardinald --lib
     api::tests::tables`).

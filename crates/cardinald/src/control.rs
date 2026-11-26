@@ -20,7 +20,10 @@ use cardinal_space::account;
 use cardinal_space::files::Files;
 use cardinal_space::state::State;
 use cardinal_space::{NodeId, SpaceId, ROOT};
-use serde_json::{json, Value};
+#[cfg(any(test, debug_assertions, feature = "by-name"))]
+use serde_json::json;
+#[cfg(any(test, debug_assertions, feature = "by-name"))]
+use serde_json::Value;
 
 use crate::api::typed::Ask;
 use crate::api::{self, status};
@@ -44,6 +47,7 @@ pub fn trace(on: bool) {
     TRACE.store(on, Ordering::Relaxed);
 }
 
+#[cfg(any(test, debug_assertions, feature = "by-name"))]
 /// Sends a request to a running daemon and returns its reply. Both are by
 /// name: `req` names the request in `cmd`, and the reply has `ok`, and
 /// `error` when it is not. A request whose answer comes in pages is asked
@@ -109,6 +113,7 @@ pub async fn request(socket: &std::path::Path, req: &Value) -> anyhow::Result<Va
     Ok(all)
 }
 
+#[cfg(any(test, debug_assertions, feature = "by-name"))]
 /// [`request`], one page of it.
 async fn request_one(socket: &std::path::Path, req: &Value) -> anyhow::Result<Value> {
     let (spec, msg) = api::encode_request(req)?;
@@ -264,36 +269,17 @@ async fn connection(d: Arc<Daemon>, mut r: Reader, mut w: Writer) {
             crate::calls::media(&d, r, w).await;
             return;
         }
-        // a typed request is answered on its own way, with no names
-        if let Some(answer) = spec.answer {
-            if w.send(&answer(&d, rec).await).await.is_err() {
-                return;
-            }
-            continue;
-        }
-        let req = match api::by_name_from(spec, &rec) {
-            Ok(req) => req,
-            Err(refused) => {
-                if w.send(&api::error_reply(refused.status, &refused.why))
-                    .await
-                    .is_err()
-                {
-                    return;
-                }
-                continue;
-            }
+        // Every request is typed, answered on its own way, with no names.
+        // One with no answering is a stream's, answered above, or one no
+        // longer answered, refused by `decode_record`.
+        let reply = match spec.answer {
+            Some(answer) => answer(&d, rec).await,
+            None => api::error_reply(
+                status::FAILED,
+                &format!("internal: {} has no answer", spec.name),
+            ),
         };
-        let reply = match handle(&d, &req)
-            .await
-            .map_err(|e| capitalized(spec.name, e))
-        {
-            Ok(v) => match api::page(spec, &req, v) {
-                Ok(v) => api::encode_reply(spec, Ok(&v)),
-                Err((st, why, item)) => api::error_reply_with(st, &why, &item),
-            },
-            Err(e) => failed(&e),
-        };
-        if w.send(&checked(spec, reply)).await.is_err() {
+        if w.send(&reply).await.is_err() {
             return;
         }
     }
@@ -2154,6 +2140,7 @@ fn space_starting(d: &Daemon, s: String) -> anyhow::Result<cardinal_space::Space
     }
 }
 
+#[cfg(any(test, debug_assertions, feature = "by-name"))]
 fn arg<'a>(req: &'a Value, name: &str) -> anyhow::Result<&'a str> {
     req.get(name)
         .and_then(|v| v.as_str())
@@ -2226,9 +2213,8 @@ fn require_files(d: &Daemon) -> anyhow::Result<[u8; 32]> {
     })
 }
 
+#[cfg(any(test, debug_assertions, feature = "by-name"))]
 async fn handle(d: &Arc<Daemon>, req: &Value) -> anyhow::Result<Value> {
-    #[cfg(not(any(test, debug_assertions, feature = "by-name")))]
-    let _ = d;
     let cmd = arg(req, "cmd")?;
     match cmd {
         #[cfg(any(test, debug_assertions, feature = "by-name"))]

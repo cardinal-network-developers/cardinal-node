@@ -28,6 +28,7 @@ use std::time::{Duration, Instant};
 
 use cardinal_encoding::{Record, Value};
 use cardinal_link::{Priority, Service, Session, Stream};
+#[cfg(any(test, debug_assertions, feature = "by-name"))]
 use serde_json::{json, Value as Json};
 use tokio::io::AsyncWriteExt;
 
@@ -317,6 +318,7 @@ pub struct Measured {
 
 impl Measured {
     /// As JSON.
+    #[cfg(any(test, debug_assertions, feature = "by-name"))]
     pub fn to_json(&self) -> Json {
         json!({
             "receive": self.receive.round() as u64,

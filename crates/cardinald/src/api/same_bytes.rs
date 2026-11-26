@@ -29,10 +29,26 @@ async fn typed(d: &Arc<Daemon>, req: &Json) -> Vec<u8> {
 /// Both ways give `req` the same bytes; and the reply, read typed, is
 /// what it says.
 async fn same(d: &Arc<Daemon>, req: Json) -> Vec<u8> {
-    // the clock held still, as the service holds it to compare the two
-    let (old, new) =
-        crate::control::clock::still(async { (by_name(d, &req).await, typed(d, &req).await) })
-            .await;
+    // the clock held still, as the service holds it to compare the two;
+    // and, as the service does (`control::typed::beside`), the two asked
+    // in turn a few times, until one answer is the other's before it, for
+    // what changes between two asks (a live session's counts)
+    let (old, new) = crate::control::clock::still(async {
+        let mut old = by_name(d, &req).await;
+        let mut new = typed(d, &req).await;
+        for _ in 0..8 {
+            if old == new {
+                break;
+            }
+            old = by_name(d, &req).await;
+            if old == new {
+                break;
+            }
+            new = typed(d, &req).await;
+        }
+        (old, new)
+    })
+    .await;
     assert_eq!(
         old,
         new,

@@ -117,6 +117,7 @@ pub fn written_by(format: Option<u64>) -> &'static str {
 /// who it was `written_by` and the `refusal` in words. By name, as the
 /// service holds a reply; [`report`] is it as `cardinald --store` writes
 /// it.
+#[cfg(any(test, debug_assertions, feature = "by-name"))]
 pub fn says(paths: &Paths) -> serde_json::Value {
     let found = crate::clear::found(paths);
     let mut out = serde_json::json!({
@@ -193,6 +194,7 @@ pub(crate) fn report_by_name(paths: &Paths) -> Vec<u8> {
 /// A report the service's program wrote for `option`, by name: `ok`, and
 /// on an error `error` with why; then its fields. For a client, a tool or
 /// a test that reads one.
+#[cfg(any(test, debug_assertions, feature = "by-name"))]
 pub fn read_report(option: &str, bytes: &[u8]) -> anyhow::Result<serde_json::Value> {
     let spec = crate::api::program(option)
         .ok_or_else(|| anyhow::anyhow!("the service's program says nothing for {option}"))?;

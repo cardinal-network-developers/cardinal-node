@@ -19,6 +19,7 @@ use cardinal_blob::{BlobReader, BlobRef, NoFetch};
 use cardinal_encoding::Value;
 use cardinal_link::Priority;
 use cardinal_space::account::{self, ContactRecord};
+#[cfg(any(test, debug_assertions, feature = "by-name"))]
 use serde_json::{json, Value as Json};
 
 use crate::api::{ContactReply, Ref};
@@ -77,6 +78,7 @@ pub fn me(d: &Arc<Daemon>, name: Option<&str>) -> anyhow::Result<crate::api::MeR
 /// petname or else the name they suggest; `own`, whether it is this
 /// person's petname; `suggested`; and `picture`, a file on this device,
 /// where there is one and it is here.
+#[cfg(any(test, debug_assertions, feature = "by-name"))]
 pub fn shown(d: &Daemon, c: &ContactRecord) -> serde_json::Map<String, Json> {
     let mut m = serde_json::Map::new();
     m.insert("name".into(), json!(c.petname));
@@ -95,6 +97,7 @@ pub fn picture(d: &Daemon, c: &ContactRecord) -> Option<String> {
 }
 
 /// Adds [`shown`] to an object describing a contact.
+#[cfg(any(test, debug_assertions, feature = "by-name"))]
 pub fn with_shown(d: &Daemon, c: &ContactRecord, mut v: Json) -> Json {
     if let Some(o) = v.as_object_mut() {
         o.extend(shown(d, c));

@@ -451,6 +451,7 @@ impl Core {
     /// gives `ended`, with `at`: the newest noted for it or for any group
     /// it succeeds, since the note follows a group to its successor. Its
     /// `group` is `space`, whichever it was noted for.
+    #[cfg(any(test, debug_assertions, feature = "by-name"))]
     pub fn last_call(&self, space: &SpaceId) -> Option<serde_json::Value> {
         let noted = self.chain(space).into_iter();
         let noted = noted.filter_map(|s| self.spaces.get(&s)?.notes.last_call.as_ref());
