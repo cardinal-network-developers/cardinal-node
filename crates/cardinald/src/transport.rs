@@ -8,7 +8,7 @@
 use std::path::Path;
 
 /// The largest message either side sends (`apps.md#the-local-interface`).
-pub const MAX_MESSAGE: usize = 256 * 1024;
+pub use cardinal_interface::MAX_MESSAGE;
 
 /// What arrived on a connection.
 #[derive(Debug, PartialEq, Eq)]

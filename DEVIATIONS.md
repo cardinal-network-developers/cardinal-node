@@ -2311,9 +2311,9 @@ asks for around that is not built yet.
   256 KiB. Readings and choices:
   - **Typed records, replacing the way by name.** A request's arguments,
     its reply and each record in it are Rust values, declared once in
-    `api/table.rs` with `typed!`: the declaration is the struct, its row in
-    the tables, and its encoding both ways (`api/typed.rs`), so they cannot
-    drift. What the declaration compiles to is the list of its fields
+    `crates/interface/src/table.rs` with `typed!`: the declaration is the
+    struct, its row in the tables, and its encoding both ways
+    (`crates/interface/src/typed.rs`), so they cannot drift. What the declaration compiles to is the list of its fields
     (`Fields::each`, a call per field with its row) and their reading
     (`take_field` per field); measuring, checking, writing and paging
     are written once per field type or once in all, so that the release
@@ -2338,13 +2338,14 @@ asks for around that is not built yet.
     released is an `Option` for ever**, so that a newer client reads an
     older service still running (the state after every update until the
     service restarts).
-    `api::tests::what_the_last_release_lacked_is_an_option` holds
+    `cardinal_interface`'s `tests::what_the_last_release_lacked_is_an_option` holds
     every field the last release's tables lack (requests' arguments and
     replies, the program's replies, records) to that, against a copy of
-    those tables, `api/released-tables.md` (now v0.1.27's), which moves
-    forward with each release: written from the released source with
-    `CARDINAL_API_TABLES=<file> cargo test -p cardinald --lib
-    tables_for_the_specification`.
+    those tables, `crates/interface/src/released-tables.md` (now
+    v0.1.27's), which moves forward with each release: written from the
+    released source with `CARDINAL_API_TABLES=<file> cargo test -p
+    cardinal-interface --lib tables_for_the_specification` (before this
+    crate, `-p cardinald`).
     A reply a client cannot read is
     `api::typed::Unreadable`, and the command line says it could not read
     it, naming the field, not that the service is not running. `Option` is
@@ -2366,9 +2367,13 @@ asks for around that is not built yet.
     are in all, `api::typed::Precut`, cut by `page_precut` as the old
     pager cut a reply that said `_page_from` and `_page_total`), or
     `before <list> by
-    <id>`. The row holds the request's answering, made from `impl
-    Answer for Args` (`control::typed`), so a typed request without a
-    handler does not compile; handlers are async. The page's list, `more`
+    <id>`. Every request is listed once, in `each_request!` (`ask Args`,
+    `stream Args`, `gone ROW`), from which `REQUESTS` is made and a
+    request listed as a stream is checked to be declared one; the service
+    makes from the same list how each is answered (`control::typed`'s
+    `ANSWERERS`: `answering::<Args>`, which takes `impl Answer for
+    Args`), so a typed request without a handler does not compile;
+    handlers are async. The page's list, `more`
     and `next` are found by their names in the declaration, the page cut by
     encoded length (`api::typed::page_after`, `page_before`, counting as
     `api::page` did), and the command line's paging (`Ask::next_page`,
@@ -2390,6 +2395,31 @@ asks for around that is not built yet.
     `serde_json` is left only for the service's own files (what it keeps
     on disk between runs) and the command line's `--json` output, which
     it writes from the typed reply by the tables (`cardinal/src/output.rs`).
+  - **One crate of declarations, shared; one export for other languages.**
+    The declarations, the `Wire` trait and field types, the encoding of
+    requests, replies, events and frames both ways, both sides of paging,
+    `Reference` and `Ref`, the tables and the text rendering by their names
+    are the crate `cardinal-interface` (`crates/interface`), which holds no
+    service code and depends on `cardinal-encoding` and `bytes` only
+    (`tracing` too with its `tracing` feature, which the service turns on,
+    to log a value the encoding cannot hold; without it such a field is
+    left out all the same, unsaid). `cardinald::api` re-exports it whole,
+    by the same paths, with the way by name beside it; the command line
+    uses it directly. Its `client` module is a client's view with no I/O:
+    `Pages` (what to ask next and what to make of each reply, which the
+    command line drives over its own socket) and `ask` over a `Transport`
+    a client gives. A client's errors are the crate's own, `Unencodable`
+    and `Unreadable`, in place of `anyhow`. An id's fixed length is in its
+    row (`Ty::BytesOf(n)`, `bytes` in the tables). Clients in other
+    languages generate their records from `crates/interface/interface.bin`,
+    the declarations as one record in the base encoding (every request with
+    its arguments, reply, paging, lists, whether a stream, gone or the
+    node's own; every record, event and frame; each field's number, name,
+    type, whether optional and whether gone), with its text rendering by
+    the export's own names beside it, `interface.txt`; both are written by
+    `CARDINAL_INTERFACE_EXPORT=write cargo test -p cardinal-interface --lib
+    export`, and a test fails while they are not what the declarations
+    give (`crates/interface/src/export.rs` says what they hold).
   - **The way by name, kept to compare.** While requests are converted,
     main's handlers of the typed requests are kept whole, as `*_by_name`
     (with main's lookups and main's arms in `control::handle`), compiled
@@ -2418,9 +2448,9 @@ asks for around that is not built yet.
     `inspect/by_name.rs`, `api/same_bytes.rs`, and `control::typed::beside`
     with what holds the clock still for it (`#[cfg(any(test,
     debug_assertions))]`): removing them is deleting those. `apps.md`'s tables of numbers are generated
-    from `api/table.rs`, typed rows and rows by name alike
-    (`CARDINAL_API_TABLES=<file> cargo test -p cardinald --lib
-    api::tests::tables`).
+    from `crates/interface/src/table.rs`
+    (`CARDINAL_API_TABLES=<file> cargo test -p cardinal-interface --lib
+    tables_for_the_specification`).
   - **Old oddities kept, to be fixed one by one.** No byte changes while a
     request is typed, even to something better. Kept so far, each with its
     test in `api/same_bytes.rs`: a refused contact named by an id given as

@@ -63,6 +63,7 @@ contact/pairing                 quick   contacts        2
 update/lib                      quick   settings        1
 update/bin/cardinal-deploy      quick   settings        0
 update/bin/cardinal-release-sign quick  settings        0
+interface/lib                   quick   all             1
 cardinald/lib                   quick   all             8
 cardinald/bin/cardinald         quick   all             0
 cardinald/store                 quick   files           1

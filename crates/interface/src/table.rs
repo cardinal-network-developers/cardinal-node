@@ -23,6 +23,9 @@ pub enum Ty {
     /// Bytes: a key, an id or a hash. Typed, they are bytes; by name, the
     /// service holds them as hex.
     Bytes,
+    /// Bytes of exactly this length (an id, a key, a hash): `bytes` in the
+    /// tables, and read back only at that length.
+    BytesOf(usize),
     /// An unsigned integer.
     Uint,
     /// An integer.
@@ -82,17 +85,11 @@ pub struct Request {
     /// A request no longer answered: the service says it has no such
     /// request, and its number stays taken.
     pub gone: bool,
-    /// How a typed request is answered, from its message to its reply's;
-    /// `None` for one answered by name, or by the connection itself.
-    pub answer: Option<Answerer>,
+    /// Whether the connection carries a stream after it (`watch`,
+    /// `call-media`), answered by the connection itself rather than by a
+    /// reply's handler.
+    pub stream: bool,
 }
-
-/// How a typed request is answered (`control::typed::answering`).
-pub type Answerer =
-    for<'a> fn(
-        &'a std::sync::Arc<crate::daemon::Daemon>,
-        cardinal_encoding::Record,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Vec<u8>> + Send + 'a>>;
 
 /// How a request's answer comes in pages (`apps.md`, Pages). The lists of
 /// a paged reply are its fields that are lists, in the order of their
@@ -185,19 +182,19 @@ macro_rules! typed {
             [$($l)* ($n $f)] [$($a)* ($n $f ($t))] $($($rest)*)?);
     };
     (@row ($n:literal $f:ident (as {$row:ident} $($opt:tt)?))) => {
-        $crate::api::table::Field {
+        $crate::table::Field {
             n: $n,
-            name: $crate::api::typed::field_name(stringify!($f)),
-            ty: $crate::api::table::Ty::Rec(&$row),
+            name: $crate::typed::field_name(stringify!($f)),
+            ty: $crate::table::Ty::Rec(&$row),
             #[cfg(test)]
             optional: $crate::typed!(@opt $($opt)?),
         }
     };
     (@row ($n:literal $f:ident (as [$row:ident] $($opt:tt)?))) => {
-        $crate::api::table::Field {
+        $crate::table::Field {
             n: $n,
-            name: $crate::api::typed::field_name(stringify!($f)),
-            ty: $crate::api::table::Ty::Recs(&$row),
+            name: $crate::typed::field_name(stringify!($f)),
+            ty: $crate::table::Ty::Recs(&$row),
             #[cfg(test)]
             optional: $crate::typed!(@opt $($opt)?),
         }
@@ -205,21 +202,21 @@ macro_rules! typed {
     (@opt ?) => { true };
     (@opt) => { false };
     (@row ($n:literal $f:ident (gone $t:ty))) => {
-        $crate::api::table::Field {
+        $crate::table::Field {
             n: $n,
-            name: $crate::api::typed::field_name(stringify!($f)),
-            ty: $crate::api::table::Ty::Gone(&<$t as $crate::api::typed::Wire>::TY),
+            name: $crate::typed::field_name(stringify!($f)),
+            ty: $crate::table::Ty::Gone(&<$t as $crate::typed::Wire>::TY),
             #[cfg(test)]
             optional: true,
         }
     };
     (@row ($n:literal $f:ident ($t:ty))) => {
-        $crate::api::table::Field {
+        $crate::table::Field {
             n: $n,
-            name: $crate::api::typed::field_name(stringify!($f)),
-            ty: <$t as $crate::api::typed::Wire>::TY,
+            name: $crate::typed::field_name(stringify!($f)),
+            ty: <$t as $crate::typed::Wire>::TY,
             #[cfg(test)]
-            optional: <$t as $crate::api::typed::Wire>::OPTIONAL,
+            optional: <$t as $crate::typed::Wire>::OPTIONAL,
         }
     };
     // A record held in replies: its row, `$stat`, written out in the
@@ -231,31 +228,31 @@ macro_rules! typed {
         $crate::typed!(@body [$(#[$m])* $name] ($stat.fields) $s $r $o $l);
 
         #[doc = concat!("The *", $title, "* record's row in the tables.")]
-        pub static $stat: $crate::api::table::Rec = $crate::api::table::Rec {
+        pub static $stat: $crate::table::Rec = $crate::table::Rec {
             name: $title,
             fields: &[ $( $crate::typed!(@row $a) ),* ],
         };
 
-        impl $crate::api::typed::Wire for $name {
-            const TY: $crate::api::table::Ty = $crate::api::table::Ty::Rec(&$stat);
-            const LIST: $crate::api::table::Ty = $crate::api::table::Ty::Recs(&$stat);
+        impl $crate::typed::Wire for $name {
+            const TY: $crate::table::Ty = $crate::table::Ty::Rec(&$stat);
+            const LIST: $crate::table::Ty = $crate::table::Ty::Recs(&$stat);
             fn encode_into(&self, out: &mut Vec<u8>) {
-                $crate::api::typed::record_into(self, out)
+                $crate::typed::record_into(self, out)
             }
             fn encoded_len(&self) -> usize {
-                $crate::api::typed::record_len(self)
+                $crate::typed::record_len(self)
             }
             fn measured(&self) -> (usize, bool) {
-                $crate::api::typed::record_measured(self)
+                $crate::typed::record_measured(self)
             }
-            fn check(&self, at: &$crate::api::typed::At) -> Result<(), String> {
-                $crate::api::typed::record_check(self, at)
+            fn check(&self, at: &$crate::typed::At) -> Result<(), String> {
+                $crate::typed::record_check(self, at)
             }
             fn take(
-                v: cardinal_encoding::Value,
-                at: &$crate::api::typed::At,
+                v: $crate::__private::Value,
+                at: &$crate::typed::At,
             ) -> Result<Self, String> {
-                $crate::api::typed::record_take(v, at)
+                $crate::typed::record_take(v, at)
             }
         }
     };
@@ -263,7 +260,7 @@ macro_rules! typed {
     // their own, so that every crate that names them names the one.
     (@munch [$(#[$m:meta])* $name:ident] [] $s:tt $r:tt $o:tt $l:tt [$($a:tt)*]) => {
         $crate::typed!(@body [$(#[$m])* $name] ({
-            static FIELDS: &[$crate::api::table::Field] = &[ $( $crate::typed!(@row $a) ),* ];
+            static FIELDS: &[$crate::table::Field] = &[ $( $crate::typed!(@row $a) ),* ];
             FIELDS
         }) $s $r $o $l);
     };
@@ -288,15 +285,15 @@ macro_rules! typed {
             }
         }
 
-        impl $crate::api::typed::Fields for $name {
-            const FIELDS: &'static [$crate::api::table::Field] = $fields;
+        impl $crate::typed::Fields for $name {
+            const FIELDS: &'static [$crate::table::Field] = $fields;
 
-            fn each<V: $crate::api::typed::Visit>(&self, v: &mut V) {
+            fn each<V: $crate::typed::Visit>(&self, v: &mut V) {
                 $( v.field(
                     const {
-                        &<$name as $crate::api::typed::Fields>::FIELDS[
-                            $crate::api::typed::index(
-                                <$name as $crate::api::typed::Fields>::FIELDS,
+                        &<$name as $crate::typed::Fields>::FIELDS[
+                            $crate::typed::index(
+                                <$name as $crate::typed::Fields>::FIELDS,
                                 $ln,
                             )
                         ]
@@ -308,16 +305,16 @@ macro_rules! typed {
 
             #[allow(unused_mut, unused_variables)]
             fn take_fields(
-                mut r: cardinal_encoding::Record,
-                at: &$crate::api::typed::At,
+                mut r: $crate::__private::Record,
+                at: &$crate::typed::At,
             ) -> Result<Self, String> {
                 Ok($name { $(
-                    $lf: $crate::api::typed::take_field(
+                    $lf: $crate::typed::take_field(
                         &mut r,
                         const {
-                            &<$name as $crate::api::typed::Fields>::FIELDS[
-                                $crate::api::typed::index(
-                                    <$name as $crate::api::typed::Fields>::FIELDS,
+                            &<$name as $crate::typed::Fields>::FIELDS[
+                                $crate::typed::index(
+                                    <$name as $crate::typed::Fields>::FIELDS,
                                     $ln,
                                 )
                             ]
@@ -328,8 +325,8 @@ macro_rules! typed {
             }
         }
 
-        const _: () = $crate::api::typed::ascending(
-            <$name as $crate::api::typed::Fields>::FIELDS,
+        const _: () = $crate::typed::ascending(
+            <$name as $crate::typed::Fields>::FIELDS,
         );
     };
 }
@@ -347,8 +344,10 @@ macro_rules! typed {
 /// - `stream`: answered by the connection itself, which then carries a
 ///   stream (`watch`, `call-media`).
 ///
-/// Every request but a stream is answered by `impl Answer for Args`
-/// (`control::typed`): one declared without it does not compile. A paged
+/// Nothing here knows how a request is answered: [`each_request!`] lists
+/// every request with whether it is a stream, and the service makes its
+/// answering from that list, so that a request it has no handler for does
+/// not compile there (`cardinald`'s `control::typed`). A paged
 /// one says how after `how`: `after list` (by position; `after list by
 /// id` where an item too large names its `id`), `after a, b, c` (by
 /// position through several lists in turn, each a `Vec` or an
@@ -367,20 +366,33 @@ macro_rules! asks {
             reply: <$reply as Fields>::FIELDS,
             page: asks!(@page $($($page)*)?),
             gone: false,
-            answer: asks!(@answer $how $args),
+            stream: asks!(@stream $how),
         };
 
         impl super::typed::Ask for $args {
             const REQUEST: &'static Request = &$row;
             type Reply = $reply;
+            const STREAM: bool = asks!(@stream $how);
+            const LISTS: &'static [(&'static str, Option<&'static str>)] =
+                asks!(@lists $($($page)*)?);
             asks!(@reads $how $($unless $($or)*)?);
             asks!(@paging $args $reply $($($page)*)?);
         }
     };
-    (@answer stream $args:ident) => { None };
-    (@answer $how:ident $args:ident) => {
-        Some(crate::control::typed::answering::<$args> as super::table::Answerer)
+    (@stream stream) => { true };
+    (@stream $how:ident) => { false };
+    // The lists a paged reply is paged through, in turn, each with the
+    // field of its records that names one too large.
+    (@lists) => { &[] };
+    (@lists after $list:ident $(by $id:ident)? precut) => {
+        &[(stringify!($list), asks!(@by $($id)?))]
     };
+    (@lists after $($list:ident $(by $id:ident)?),+) => {
+        &[$((stringify!($list), asks!(@by $($id)?))),+]
+    };
+    (@lists before $list:ident by $id:ident) => { &[(stringify!($list), Some(stringify!($id)))] };
+    (@by) => { None };
+    (@by $id:ident) => { Some(stringify!($id)) };
     (@reads reads) => {
         fn reads(&self) -> bool {
             true
@@ -776,7 +788,7 @@ macro_rules! req {
             reply: &[$(f!($rn $rf $rt)),*],
             page: Page::Whole,
             gone: false,
-            answer: None,
+            stream: false,
         }
     };
 }
@@ -3706,160 +3718,271 @@ typed!(fields AppJoinReply {
 });
 asks!(APP_JOIN: 225 "app-join" AppJoinArgs -> AppJoinReply, writes);
 
-/// Every request, by number. Numbers are grouped by what they are about,
-/// with room in each group.
-pub static REQUESTS: &[Request] = &[
-    // ---- The service, this device, and the person's devices: 1 to 29 ----
-    HELLO,
-    STATUS,
-    WATCH,
-    STOP,
-    RELOAD,
-    CONDITIONS_NOW,
-    NETWORK_CHANGED,
-    SETUP_BEGIN,
-    SETUP_FINISH,
-    ME,
-    DEVICES,
-    DEVICE_RENAME,
-    REMOVE_DEVICE,
-    PAIR_SHOW,
-    PAIR_STATUS,
-    PAIR_TYPE,
-    // ---- People, conversations and invitations: 30 to 69 ----
-    CONTACTS,
-    CONTACT_CHANGE,
-    CONTACT_STATUS,
-    CONVERSATIONS,
-    MESSAGES,
-    SAY,
-    SAVE_ATTACHMENT,
-    EDIT_MESSAGE,
-    DELETE_MESSAGE,
-    REACT,
-    MARK_READ,
-    READ_MARKERS,
-    INVITE,
-    ACCEPT,
-    INVITATIONS,
-    CANCEL_INVITATION,
-    INTRODUCTIONS,
-    INTRODUCE,
-    INTRODUCTION_ACCEPT,
-    INTRODUCTION_DECLINE,
-    // ---- Groups: 70 to 99 ----
-    GROUPS,
-    GROUP_CREATE,
-    GROUP_JOIN,
-    GROUP_DECLINE,
-    GROUP_LEAVE,
-    GROUP_REACH_SET,
-    GROUP_ADD,
-    GROUP_REMOVE,
-    GROUP_MEMBERS,
-    GROUP_SET,
-    GROUP_MEMBER,
-    GROUP_CONNECT,
-    GROUP_ROLE,
-    GROUP_POST_AGAIN,
-    GROUP_MOVED_SEEN,
-    GROUP_CONFIRM_MOVE,
-    GROUP_LEAVING,
-    GROUP_REJOIN,
-    // ---- Calls and the clipboard: 100 to 119 ----
-    CALL_NOW,
-    CALL_START,
-    CALL_ANSWER,
-    CALL_END,
-    CALL_MEDIA,
-    CLIP_COPY,
-    CLIP,
-    // ---- The one folder: 120 to 149 ----
-    FILES,
-    MKDIR,
-    MOVE,
-    REMOVE,
-    COPY,
-    PUT,
-    SAVE,
-    WRITE,
-    SHARE,
-    MOUNT,
-    UNMOUNT,
-    FLUSH,
-    CONFLICTS,
-    HISTORY,
-    RESTORE,
-    PIN,
-    UNPIN,
-    RETENTION,
-    KEEP_OLD,
-    FREE_SPACE,
-    SPACE_USAGE_NOW,
-    HISTORY_EMPTY,
-    // ---- Guardians and recovery: 150 to 179 ----
-    GUARDIANS,
-    GUARDIANS_SET,
-    GUARDIANS_OBJECT,
-    GUARDIANS_ASK,
-    GUARDING,
-    GUARDING_INVITE,
-    GUARDING_ACCEPT,
-    GUARDING_CONFIRM_CHANGE,
-    GUARDING_NEVER,
-    GUARDING_CAUTION,
-    GUARDING_ENDORSE,
-    GUARDING_CONFIRM,
-    RECOVER,
-    RECOVER_START,
-    RECOVER_INVITE,
-    gone!(165 "recover-keep-succession" (1 "id" T, 2 "keep" BOOL) -> (
-        2 "answered" U, 3 "kept" BOOL)),
-    RECOVER_LOST_AT,
-    RECOVER_CANCEL,
-    RECOVER_FINISH,
-    KEEP_WORK,
-    RECOVERY_CHECK,
-    RECOVERY_SHEET,
-    RESTORE_FROM_HOST,
-    RECOVER_UNDO,
-    RECOVER_KEPT_SEEN,
-    RECOVER_STOP_WAITING,
-    // ---- Networks, hosts and peers: 180 to 199 ----
-    ROUTER_NOW,
-    BLUETOOTH_NOW,
-    NETWORK_NOW,
-    HOST_ON,
-    HOST_OFF,
-    PEER_ADD,
-    PEER_REMOVE,
-    PEER_LIST,
-    HOST_OFFER,
-    HOST_ACCEPT,
-    HOST_END,
-    HOSTING_NOW,
-    // ---- Inspection and measuring: 200 to 219 ----
-    INSPECT_ON,
-    INSPECT_OFF,
-    INSPECT,
-    INSPECT_IDENTITY_VIEW,
-    INSPECT_SPACE_VIEW,
-    INSPECT_ENTRIES,
-    INSPECT_ENTRY_VIEW,
-    INSPECT_NODES,
-    INSPECT_NODE,
-    DEBUG_TREE,
-    SPEEDTEST,
-    // ---- Applications: 220 to 239 ----
-    APP_QUESTIONS,
-    APP_ANSWER,
-    APPROVALS,
-    APPROVAL_REVOKE,
-    APP_OFFERS,
-    APP_JOIN,
-    WAKE,
-    DELETED,
-    UNDELETE,
+/// A request no longer answered: its number stays taken.
+pub static RECOVER_KEEP_SUCCESSION: Request = gone!(165 "recover-keep-succession" (
+    1 "id" T, 2 "keep" BOOL) -> (2 "answered" U, 3 "kept" BOOL));
+
+/// Every request, by number, as `$m!` takes them: each as `ask Args` (a
+/// typed request answered by a reply), `stream Args` (one after which the
+/// connection carries a stream, answered by the connection itself) or
+/// `gone ROW` (a number no longer answered). Numbers are grouped by what
+/// they are about, with room in each group.
+///
+/// This list is the one place the requests are listed: [`REQUESTS`] is
+/// made from it here, and the service makes from it how each is answered,
+/// so that a request it has no handler for does not compile; a client may
+/// make from it whatever it needs of every request.
+#[macro_export]
+macro_rules! each_request {
+    ($m:ident) => {
+        $m! {
+        // ---- The service, this device, and the person's devices: 1 to 29 ----
+        ask HelloArgs,
+        ask StatusArgs,
+        stream WatchArgs,
+        ask StopArgs,
+        ask ReloadArgs,
+        ask ConditionsArgs,
+        ask NetworkChangedArgs,
+        ask SetupBeginArgs,
+        ask SetupFinishArgs,
+        ask MeArgs,
+        ask DevicesArgs,
+        ask DeviceRenameArgs,
+        ask RemoveDeviceArgs,
+        ask PairShowArgs,
+        ask PairStatusArgs,
+        ask PairTypeArgs,
+        // ---- People, conversations and invitations: 30 to 69 ----
+        ask ContactsArgs,
+        ask ContactArgs,
+        ask ContactStatusArgs,
+        ask ConversationsArgs,
+        ask MessagesArgs,
+        ask SayArgs,
+        ask SaveAttachmentArgs,
+        ask EditMessageArgs,
+        ask DeleteMessageArgs,
+        ask ReactArgs,
+        ask MarkReadArgs,
+        ask ReadMarkersArgs,
+        ask InviteArgs,
+        ask AcceptArgs,
+        ask InvitationsArgs,
+        ask CancelInvitationArgs,
+        ask IntroductionsArgs,
+        ask IntroduceArgs,
+        ask IntroductionAcceptArgs,
+        ask IntroductionDeclineArgs,
+        // ---- Groups: 70 to 99 ----
+        ask GroupsArgs,
+        ask GroupCreateArgs,
+        ask GroupJoinArgs,
+        ask GroupDeclineArgs,
+        ask GroupLeaveArgs,
+        ask GroupReachArgs,
+        ask GroupAddArgs,
+        ask GroupRemoveArgs,
+        ask GroupMembersArgs,
+        ask GroupSetArgs,
+        ask GroupMemberArgs,
+        ask GroupConnectArgs,
+        ask GroupRoleArgs,
+        ask GroupPostAgainArgs,
+        ask GroupMovedSeenArgs,
+        ask GroupConfirmMoveArgs,
+        ask GroupLeavingArgs,
+        ask GroupRejoinArgs,
+        // ---- Calls and the clipboard: 100 to 119 ----
+        ask CallArgs,
+        ask CallStartArgs,
+        ask CallAnswerArgs,
+        ask CallEndArgs,
+        stream CallMediaArgs,
+        ask ClipCopyArgs,
+        ask ClipArgs,
+        // ---- The one folder: 120 to 149 ----
+        ask FilesArgs,
+        ask MkdirArgs,
+        ask MoveArgs,
+        ask RemoveArgs,
+        ask CopyArgs,
+        ask PutArgs,
+        ask SaveArgs,
+        ask WriteArgs,
+        ask ShareArgs,
+        ask MountArgs,
+        ask UnmountArgs,
+        ask FlushArgs,
+        ask ConflictsArgs,
+        ask HistoryArgs,
+        ask RestoreArgs,
+        ask PinArgs,
+        ask UnpinArgs,
+        ask RetentionArgs,
+        ask KeepOldArgs,
+        ask FreeSpaceArgs,
+        ask SpaceUsageArgs,
+        ask HistoryEmptyArgs,
+        // ---- Guardians and recovery: 150 to 179 ----
+        ask GuardiansArgs,
+        ask GuardiansSetArgs,
+        ask GuardiansObjectArgs,
+        ask GuardiansAskArgs,
+        ask GuardingArgs,
+        ask GuardingInviteArgs,
+        ask GuardingAcceptArgs,
+        ask GuardingConfirmChangeArgs,
+        ask GuardingNeverArgs,
+        ask GuardingCautionArgs,
+        ask GuardingEndorseArgs,
+        ask GuardingConfirmArgs,
+        ask RecoverArgs,
+        ask RecoverStartArgs,
+        ask RecoverInviteArgs,
+        gone RECOVER_KEEP_SUCCESSION,
+        ask RecoverLostAtArgs,
+        ask RecoverCancelArgs,
+        ask RecoverFinishArgs,
+        ask KeepWorkArgs,
+        ask RecoveryCheckArgs,
+        ask RecoverySheetArgs,
+        ask RestoreFromHostArgs,
+        ask RecoverUndoArgs,
+        ask RecoverKeptSeenArgs,
+        ask RecoverStopWaitingArgs,
+        // ---- Networks, hosts and peers: 180 to 199 ----
+        ask RouterArgs,
+        ask BluetoothArgs,
+        ask NetworkArgs,
+        ask HostArgs,
+        ask HostOffArgs,
+        ask PeerAddArgs,
+        ask PeerRemoveArgs,
+        ask PeerListArgs,
+        ask HostOfferArgs,
+        ask HostAcceptArgs,
+        ask HostEndArgs,
+        ask HostingArgs,
+        // ---- Inspection and measuring: 200 to 219 ----
+        ask InspectOnArgs,
+        ask InspectOffArgs,
+        ask InspectArgs,
+        ask InspectIdentityArgs,
+        ask InspectSpaceArgs,
+        ask InspectEntriesArgs,
+        ask InspectEntryArgs,
+        ask InspectNodesArgs,
+        ask InspectNodeArgs,
+        ask DebugTreeArgs,
+        ask SpeedtestArgs,
+        // ---- Applications: 220 to 239 ----
+        ask AppQuestionsArgs,
+        ask AppAnswerArgs,
+        ask ApprovalsArgs,
+        ask ApprovalRevokeArgs,
+        ask AppOffersArgs,
+        ask AppJoinArgs,
+        ask WakeArgs,
+        ask DeletedArgs,
+        ask UndeleteArgs,
+        }
+    };
+}
+
+/// [`REQUESTS`], from [`each_request!`]; and a request listed as a
+/// stream is declared one (`asks!(..., stream)`), and one not, not.
+macro_rules! request_rows {
+    ($($how:ident $x:ident,)*) => {
+        /// Every request, by number ([`each_request!`]).
+        pub static REQUESTS: &[Request] = &[$(request_rows!(@row $how $x)),*];
+        $(request_rows!(@check $how $x);)*
+    };
+    (@row gone $row:ident) => { $row };
+    (@row $how:ident $args:ident) => { *<$args as super::typed::Ask>::REQUEST };
+    (@check gone $row:ident) => {};
+    (@check ask $args:ident) => {
+        const _: () = assert!(
+            !<$args as super::typed::Ask>::STREAM,
+            concat!(stringify!($args), " is a stream's: list it as `stream`")
+        );
+    };
+    (@check stream $args:ident) => {
+        const _: () = assert!(
+            <$args as super::typed::Ask>::STREAM,
+            concat!(stringify!($args), " is not a stream's: list it as `ask`")
+        );
+    };
+}
+
+each_request!(request_rows);
+
+/// The requests this implementation answers that `apps.md` does not
+/// describe in words, the node's own: marked in its tables (†), and in the
+/// export.
+pub static NODE_ONLY: &[&str] = &[
+    "stop",
+    "reload",
+    "remove-device",
+    "contacts",
+    "read-markers",
+    "group-post-again",
+    "group-moved-seen",
+    "mount",
+    "unmount",
+    "flush",
+    "conflicts",
+    "pin",
+    "unpin",
+    "retention",
+    "keep-old",
+    "free-space",
+    "space-usage",
+    "history-empty",
+    "guardians",
+    "guardians-set",
+    "guardians-object",
+    "guardians-ask",
+    "guarding",
+    "guarding-invite",
+    "guarding-accept",
+    "guarding-confirm-change",
+    "guarding-never",
+    "guarding-caution",
+    "guarding-endorse",
+    "guarding-confirm",
+    "recover",
+    "recover-start",
+    "recover-invite",
+    "recover-lost-at",
+    "recover-undo",
+    "recover-kept-seen",
+    "recover-stop-waiting",
+    "recover-cancel",
+    "recover-finish",
+    "keep-work",
+    "recovery-check",
+    "recovery-sheet",
+    "restore-from-host",
+    "router",
+    "bluetooth",
+    "network",
+    "host",
+    "host-off",
+    "peer-add",
+    "peer-remove",
+    "peer-list",
+    "inspect-on",
+    "inspect-off",
+    "inspect",
+    "inspect-identity",
+    "inspect-space",
+    "inspect-entries",
+    "inspect-entry",
+    "inspect-nodes",
+    "inspect-node",
+    "debug-tree",
+    "speedtest",
 ];
 
 // ---- What the service's program says without starting ----
@@ -3902,7 +4025,7 @@ macro_rules! program {
             reply: <$reply as Fields>::FIELDS,
             page: Page::Whole,
             gone: false,
-            answer: None,
+            stream: false,
         };
     };
 }
@@ -3946,7 +4069,7 @@ macro_rules! streams {
             reply: &[],
             page: Page::Whole,
             gone: false,
-            answer: None,
+            stream: false,
         };
 
         impl super::typed::Streamed for $fields {

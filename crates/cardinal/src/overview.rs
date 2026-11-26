@@ -2,7 +2,7 @@
 //! groups together, newest first, with what is new in each, laid out for a
 //! person reading a terminal.
 
-use cardinald::api;
+use cardinal_interface as api;
 
 /// How the overview is drawn.
 pub struct Style {
