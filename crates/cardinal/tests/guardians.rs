@@ -1181,17 +1181,26 @@ fn a_recovery_undoes_the_lost_devices_successions() {
 /// back.
 #[test]
 fn a_move_confirmed_before_the_loss_stands_after_a_recovery() {
-    two_devices_move_then_recovery(true);
+    two_devices_move_then_recovery(true, false);
 }
 
 /// The same with the phone never confirming the move: it falls for
 /// everyone, Cy back in the old group, and nothing is listed to undo.
 #[test]
 fn a_move_not_confirmed_before_the_loss_falls_after_a_recovery() {
-    two_devices_move_then_recovery(false);
+    two_devices_move_then_recovery(false, false);
 }
 
-fn two_devices_move_then_recovery(confirmed: bool) {
+/// The confirmed move undone before the new device has reached Cy, so
+/// that it does not hold their relationship yet: the undo is made and
+/// kept, asking again answers the same group and makes no other, Bo
+/// follows it, and Cy is offered it once the new device reaches him.
+#[test]
+fn a_kept_removal_is_undone_before_the_one_added_back_is_reached() {
+    two_devices_move_then_recovery(true, true);
+}
+
+fn two_devices_move_then_recovery(confirmed: bool, undo_first: bool) {
     use serde_json::json;
     if !fuse_available() {
         eprintln!("skipping: /dev/fuse or fusermount3 is not available");
@@ -1287,6 +1296,10 @@ fn two_devices_move_then_recovery(confirmed: bool) {
     });
     let o = new.try_cli(&["recover", "finish", "--lost-at", &lost_at]);
     assert!(o.status.success(), "{}", out(&o));
+    if undo_first {
+        // nothing of cy's reaches the new device until the undo is made
+        cy.stop();
+    }
     let (bo_at, cy_at) = (
         format!("127.0.0.1:{}", bo.port),
         format!("127.0.0.1:{}", cy.port),
@@ -1328,6 +1341,42 @@ fn two_devices_move_then_recovery(confirmed: bool) {
     assert_eq!(listed[0]["group"], g.as_str(), "{kept}");
     assert_eq!(listed[0]["to"], g2.as_str(), "{kept}");
     assert_eq!(listed[0]["can_undo"], true, "{kept}");
+    if undo_first {
+        // Undone while cy's relationship is not here: made and kept all
+        // the same, the offer to cy owed.
+        let o = ask(&new, json!({"cmd": "recover-undo", "to": g2}));
+        let g3 = o["group"].as_str().unwrap().to_owned();
+        assert_ne!(g3, g2);
+        assert_eq!(o["kept_changes"][0]["undone"], g3.as_str(), "{o}");
+        let again = ask(&new, json!({"cmd": "recover-undo", "to": g2}));
+        assert_eq!(again["group"], g3.as_str(), "{again}");
+        wait("bo follows the undo", 60, || {
+            let _ = new.try_cli(&["contacts", "bo", "--look", "--at", &bo_at]);
+            stands(&bo, &g3)
+        });
+        assert!(stands(&new, &g3), "the undo stands for the person");
+        let groups = ask(&new, json!({"cmd": "groups"}));
+        let standing = groups["groups"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|x| x["ended"].is_null() && x["name"] == "Garden club")
+            .count();
+        assert_eq!(standing, 1, "one group stands, no other made: {groups}");
+        cy.start();
+        cy.wait_mounted();
+        wait("the group is offered to cy once he is reached", 120, || {
+            let _ = cy.try_cli(&["contacts", "Bo", "--look", "--at", &bo_at]);
+            let _ = new.try_cli(&["contacts", "cy", "--look", "--at", &cy_at]);
+            let r = ask(&cy, json!({"cmd": "groups"}));
+            r["offers"]
+                .as_array()
+                .is_some_and(|o| o.iter().any(|x| x["group"] == g3.as_str()))
+        });
+        ask(&cy, json!({"cmd": "group-join", "group": g3}));
+        wait("cy is in it", 60, || stands(&cy, &g3));
+        return;
+    }
     // Cy stays out, once he has heard of the recovery too.
     cy.stop();
     cy.start();

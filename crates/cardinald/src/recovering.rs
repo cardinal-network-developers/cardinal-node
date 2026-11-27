@@ -114,6 +114,13 @@ struct Recovered {
     /// to (hex), with the group the undo made.
     #[serde(default)]
     undone: BTreeMap<String, String>,
+    /// The offers an undo still owes (hex): each group an undo made, with
+    /// those it added back whose relationship this device did not hold
+    /// yet, so that the offer could not be written. Each is offered the
+    /// group (or what it has moved on to) once their relationship is here
+    /// ([`offer_owed`]): nothing else they hold leads to it.
+    #[serde(default)]
+    owed: BTreeMap<String, Vec<String>>,
     /// The guardians who confirmed and may not hold this device's first
     /// entries yet: the helper is kept for them while there is one.
     #[serde(default)]
@@ -1292,17 +1299,40 @@ fn kept_change(d: &Daemon, r: &Recovered, to: &[u8]) -> anyhow::Result<SpaceId> 
 /// before back. A group handed on cannot be taken back: its new owner holds
 /// it. Nothing is asked of anyone, and the change stays listed, undone,
 /// until the person dismisses it.
+///
+/// The undo is kept as soon as the group has moved on, and answered again
+/// as it was when asked again. Whoever it adds back whose relationship
+/// this device does not hold yet (a contact not reached since the
+/// recovery, who gives it back when they are, `hosts.md#restore`) is owed
+/// the offer, which is written once the relationship is here
+/// ([`offer_owed`]).
 pub async fn undo_kept(d: &Arc<Daemon>, to: &[u8]) -> anyhow::Result<crate::api::RecoverUndoReply> {
     let r = load_recovered(d).ok_or_else(|| anyhow::anyhow!("no recovery took place here"))?;
     let to = kept_change(d, &r, to)?;
+    if let Some(made) = r.undone.get(&hex::encode(to)) {
+        // undone already: the group it made, as the undo answered
+        let group = hex::decode(made).ok().and_then(|b| b.try_into().ok());
+        let group = group.ok_or_else(|| anyhow::anyhow!("the undo kept here is not an id"))?;
+        return Ok(crate::api::RecoverUndoReply {
+            group,
+            kept_changes: kept_of(d, &r),
+        });
+    }
     let undo = d.core().undo_of(&to)?;
     let done = crate::following::succeed(d, &to, |sp| crate::core::undo_named(sp, &undo)).await?;
     // Whoever it left out holds nothing that leads to the new group: it is
-    // offered to them, as an addition is.
+    // offered to them, as an addition is, now where their relationship is
+    // here and otherwise once it is.
     let back: Vec<[u8; 32]> = undo.out.iter().map(|(w, _)| *w).collect();
-    crate::groups::offer_to(d, &done.new, &back)?;
+    let owed = offer_where_held(d, &done.new, &back);
     update_recovered(d, |r| {
         r.undone.insert(hex::encode(to), hex::encode(done.new));
+        if !owed.is_empty() {
+            r.owed
+                .entry(hex::encode(done.new))
+                .or_default()
+                .extend(owed.iter().map(hex::encode));
+        }
     });
     d.bump();
     let r = load_recovered(d).unwrap_or_default();
@@ -1310,6 +1340,61 @@ pub async fn undo_kept(d: &Arc<Daemon>, to: &[u8]) -> anyhow::Result<crate::api:
         group: done.new,
         kept_changes: kept_of(d, &r),
     })
+}
+
+/// Offers the group `id` to each of `who` whose relationship this device
+/// holds: those it could not offer it to, for want of it, or for an error
+/// writing it, to be offered later.
+fn offer_where_held(d: &Arc<Daemon>, id: &SpaceId, who: &[[u8; 32]]) -> Vec<[u8; 32]> {
+    let mut owed = Vec::new();
+    for w in who {
+        if let Err(e) = crate::groups::offer_to(d, id, std::slice::from_ref(w)) {
+            tracing::debug!(
+                "the offer of {} to {} waits: {e:#}",
+                hex::encode(&id[..4]),
+                hex::encode(&w[..4])
+            );
+            owed.push(*w);
+        }
+    }
+    owed
+}
+
+/// After a session with `who` has asked what it asks of them: each group
+/// an undo owes them the offer of ([`undo_kept`]) is offered, as the group
+/// it has moved on to since, where their relationship is here now; the
+/// rest stays owed.
+pub fn offer_owed(d: &Arc<Daemon>, who: &[u8; 32]) {
+    let Some(r) = load_recovered(d) else {
+        return;
+    };
+    let them = hex::encode(who);
+    let groups: Vec<SpaceId> = r
+        .owed
+        .iter()
+        .filter(|(_, to)| to.contains(&them))
+        .filter_map(|(g, _)| hex::decode(g).ok()?.try_into().ok())
+        .collect();
+    let mut given = Vec::new();
+    for g in groups {
+        let now = d.core().current(&g);
+        if offer_where_held(d, &now, &[*who]).is_empty() {
+            given.push(hex::encode(g));
+        }
+    }
+    if given.is_empty() {
+        return;
+    }
+    update_recovered(d, |r| {
+        for g in &given {
+            if let Some(to) = r.owed.get_mut(g) {
+                to.retain(|w| *w != them);
+                if to.is_empty() {
+                    r.owed.remove(g);
+                }
+            }
+        }
+    });
 }
 
 /// `recover-kept-seen`: the person dismissed the kept group changes `to`

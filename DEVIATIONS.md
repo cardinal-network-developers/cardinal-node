@@ -861,7 +861,17 @@ differs or was read:
   new owner holds it. Nothing is asked or held back (`core.rs`,
   `a_change_kept_after_a_recovery_is_listed_and_can_be_undone`). Whoever
   undo adds back is offered the group, as an addition is: nothing they
-  hold leads to it. A successor the person started with a removed key
+  hold leads to it. The undo is kept as soon as the group has moved on,
+  and asked again it answers the group it made; one added back whose
+  relationship this device does not hold yet (a contact not reached since
+  the recovery, whose relationship comes back from them,
+  `hosts.md#restore`) is owed the offer, which is written, of the group or
+  what it has moved on to, once a session with them has asked what it
+  asks (`recovered.json`'s `owed`;
+  `a_kept_removal_is_undone_before_the_one_added_back_is_reached`). Before,
+  the offer's failure ("space not held") failed the undo after the group
+  had moved on, so that it was never noted, asking again found nothing
+  left to undo, and the one added back was never offered it. A successor the person started with a removed key
   counts for nobody on the new device until it writes the keep again, so
   it is synced with those its genesis names, who hold that keep
   (`guardians.rs`, `a_move_confirmed_before_the_loss_stands_after_a_recovery`).
@@ -2313,11 +2323,17 @@ asks for around that is not built yet.
     its reply and each record in it are Rust values, declared once in
     `crates/interface/src/table.rs` with `typed!`: the declaration is the
     struct, its row in the tables, and its encoding both ways
-    (`crates/interface/src/typed.rs`), so they cannot drift. What the declaration compiles to is the list of its fields
-    (`Fields::each`, a call per field with its row) and their reading
-    (`take_field` per field); measuring, checking, writing and paging
-    are written once per field type or once in all, so that the release
-    binaries are no larger than they were by name.
+    (`crates/interface/src/typed.rs`), so they cannot drift. What the
+    declaration compiles to is the list of its fields (`Fields::each`, a
+    call per field with its row, shown to one visitor, `Pass`, that
+    measures, checks or writes) and its reading (a slot for each field,
+    filled by `read_slots` over the record's rows, then the struct made of
+    the slots); measuring, checking, writing, reading a field of each type
+    (`Slot`), a list (`read_list`, over a `dyn` reader of its items), a
+    record held in another (`read_held`), a reply (`read_reply_into`, which
+    `read_reply` and a client's `Pages` are thin over), a request's
+    arguments, and paging are written once per field type or once in all,
+    so that the release binaries are no larger than they were by name.
     A field's Rust type gives its type in the tables: `String` or
     `Cow<'static, str>` text, `bool`, `u64` uint, `i64` int,
     `api::typed::Kind` a kind, `api::typed::Scalar` int or text, `[u8; N]`
@@ -2438,7 +2454,15 @@ asks for around that is not built yet.
     moved, retyped or given again). It does not say what each id
     identifies: the names do not settle it (38 fields called `id` name
     messages, calls, devices and more), so it would need a declaration on
-    each of some 260 fields of ids and refs.
+    each of some 260 fields of ids and refs. Nor, of a `ref`, which form a
+    request takes (text a person typed, an id's bytes, or either): the
+    handlers decide that, and the declarations know it only of the cursor
+    back from the newest, `before`, the id of the oldest item had, which
+    the export says (`form` `id`); the rest would need a declaration on
+    each of the 96 fields of refs. A request of the node's own that is its
+    tooling, not a window's, is marked `tooling`: inspection and
+    measuring (`TOOLING`, requests 200 to 210), which only the command line
+    asks, so that a generator for a window may leave them out.
   - **The way by name, kept to compare.** While requests are converted,
     main's handlers of the typed requests are kept whole, as `*_by_name`
     (with main's lookups and main's arms in `control::handle`), compiled

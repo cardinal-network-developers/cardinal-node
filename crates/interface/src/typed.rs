@@ -415,7 +415,7 @@ impl<'c, 'a> Walk<'c, 'a> {
     /// numbered `n`, its value then the next thing read (by the caller,
     /// before the walk is asked anything again). Each key is read after the
     /// value before it, as the decoder reads them.
-    #[inline(never)]
+    #[inline]
     pub fn to(&mut self, n: u64) -> Result<bool, Bad> {
         if self.broken {
             return Err(Bad::Form);
@@ -470,7 +470,8 @@ impl<'c, 'a> Walk<'c, 'a> {
 }
 
 /// Reads field `row` of the record `w` is in, straight from the bytes, as
-/// [`take_field`] reads it from the tree: once per field type.
+/// [`take_field`] reads it from the tree: once per field type, for a field
+/// read alone (an error's `why`); a record's are read by [`read_slots`].
 #[inline(never)]
 pub fn read_field<T: Wire>(w: &mut Walk, row: &'static Field, at: &At) -> Result<T, Bad> {
     let at = At::Field(at, row.name);
@@ -482,13 +483,146 @@ pub fn read_field<T: Wire>(w: &mut Walk, row: &'static Field, at: &At) -> Result
     }
 }
 
+/// A field of a record being read, whatever its type: the slot its value
+/// is read into ([`read_slots`]), empty until then. A field sent only when
+/// it is `Some` is its slot itself; one always sent is had from its slot.
+pub trait Slot {
+    /// Reads its value straight from the bytes, at nesting `depth`.
+    fn read(&mut self, c: &mut Cursor<'_>, depth: usize, at: &At) -> Result<(), Bad>;
+}
+
+impl<T: Wire> Slot for Option<T> {
+    fn read(&mut self, c: &mut Cursor<'_>, depth: usize, at: &At) -> Result<(), Bad> {
+        fill(self, T::read(c, depth, at)?);
+        Ok(())
+    }
+}
+
+/// In a record's rows as its reading names them ([`read_slots`]): that
+/// the field is sent only when it is `Some`, so that its absence is none.
+pub const MAY_BE_ABSENT: u16 = 1 << 15;
+
+/// Puts `v` in `slot`, which is empty: what was there (nothing) is not
+/// dropped, so that no code to drop it is written for each type.
+#[inline]
+fn fill<T>(slot: &mut Option<T>, v: T) {
+    std::mem::forget(slot.replace(v));
+}
+
+/// The place in `fields` of the field numbered `n`, as a record's reading
+/// names it ([`read_slots`]); the build fails without one.
+pub const fn row_of(fields: &[Field], n: u64) -> u16 {
+    let i = index(fields, n);
+    assert!(
+        i < MAY_BE_ABSENT as usize,
+        "a record has fewer fields than that"
+    );
+    i as u16
+}
+
+/// Reads the fields of a record on `w` into their slots, each by its row,
+/// `fields[rows[i]]` for `slots[i]`, in the order of their numbers, as
+/// [`take_field`] reads each from the tree: written once for every record,
+/// whatever its fields. A field that did not come leaves its slot empty if
+/// its row is marked [`MAY_BE_ABSENT`], and is missing otherwise; so every
+/// slot of a field always sent is filled unless it fails.
+#[inline(never)]
+pub fn read_slots(
+    w: &mut Walk,
+    at: &At,
+    fields: &'static [Field],
+    rows: &[u16],
+    slots: &mut [&mut dyn Slot],
+) -> Result<(), Bad> {
+    slots_on(w, at, fields, rows, slots)
+}
+
+/// [`read_slots`], written into each of the two that read a record's
+/// fields, so that a record held in another is read in one call.
+#[inline(always)]
+fn slots_on(
+    w: &mut Walk,
+    at: &At,
+    fields: &'static [Field],
+    rows: &[u16],
+    slots: &mut [&mut dyn Slot],
+) -> Result<(), Bad> {
+    // The record's keys, each read after the value before it, as the
+    // decoder reads them, met with its rows in the order of their numbers:
+    // a row passed with no key is absent, and a key with no row (one this
+    // build does not know, or a number no longer used) is passed over. So
+    // it is what asking the walk for each row in turn ([`Walk::to`]) does,
+    // with each key looked at once.
+    if w.broken {
+        return Err(Bad::Form);
+    }
+    let missing_at = |i: u16| {
+        let row = &fields[(i & !MAY_BE_ABSENT) as usize];
+        Bad::Field(missing(&At::Field(at, row.name)))
+    };
+    let mut r = 0;
+    loop {
+        if w.taken {
+            if w.left == 0 {
+                break;
+            }
+            w.left -= 1;
+            let last = (w.last != NO_KEY).then_some(w.last);
+            w.last = w.c.key(last)?;
+            w.taken = false;
+        }
+        let k = w.last;
+        while let Some(&i) = rows.get(r) {
+            let row = &fields[(i & !MAY_BE_ABSENT) as usize];
+            if row.n > k {
+                break;
+            }
+            r += 1;
+            if row.n == k {
+                w.taken = true;
+                let depth = w.depth as usize + 1;
+                slots[r - 1].read(w.c, depth, &At::Field(at, row.name))?;
+                break;
+            }
+            if i & MAY_BE_ABSENT == 0 {
+                return Err(missing_at(i));
+            }
+        }
+        if !w.taken {
+            w.c.skip(w.depth as usize + 1)?;
+            w.taken = true;
+        }
+    }
+    match rows[r.min(rows.len())..]
+        .iter()
+        .find(|&&i| i & MAY_BE_ABSENT == 0)
+    {
+        Some(&i) => Err(missing_at(i)),
+        None => Ok(()),
+    }
+}
+
+/// A record held in another, next in the bytes at nesting `depth`, its
+/// fields read into their slots ([`read_slots`]), the rest passed over:
+/// written once for every record held in others.
+#[inline(never)]
+pub fn read_held(
+    c: &mut Cursor<'_>,
+    depth: usize,
+    at: &At,
+    fields: &'static [Field],
+    rows: &[u16],
+    slots: &mut [&mut dyn Slot],
+) -> Result<(), Bad> {
+    let mut w = record_walk(c, depth, at)?;
+    slots_on(&mut w, at, fields, rows, slots)?;
+    w.finish()
+}
+
 /// A typed record held in another, read straight from the bytes.
 #[inline]
 pub fn record_read<R: Fields>(c: &mut Cursor<'_>, depth: usize, at: &At) -> Result<R, Bad> {
-    let mut w = record_walk(c, depth, at)?;
-    let r = R::read_fields(&mut w, at)?;
-    w.finish()?;
-    Ok(r)
+    R::read_held(c, depth, at)
 }
 
 /// The walk of the record next in the bytes, or why it is no record:
@@ -954,15 +1088,56 @@ impl<T: Wire> Wire for Vec<T> {
         }
         Ok(out)
     }
+    #[inline]
     fn read(c: &mut Cursor<'_>, depth: usize, at: &At) -> Result<Self, Bad> {
-        let count = list_count(c, depth, at)?;
-        // no more room first than the decoder itself keeps for a list
-        let mut out = Vec::with_capacity(count.min(MOST_RESERVED));
-        for i in 0..count {
-            out.push(T::read(c, depth + 1, &At::Item(at, i))?);
-        }
+        let mut out = Vec::new();
+        read_list(c, depth, at, &mut out)?;
         Ok(out)
     }
+}
+
+/// The items of a list being read, whatever they are: what the list's
+/// reading, written once ([`read_list`]), fills.
+trait Items {
+    /// The next item, read straight from the bytes, at nesting `depth`;
+    /// before the first, room for `first_of` of them.
+    fn item(
+        &mut self,
+        c: &mut Cursor<'_>,
+        depth: usize,
+        at: &At,
+        first_of: usize,
+    ) -> Result<(), Bad>;
+}
+
+impl<T: Wire> Items for Vec<T> {
+    fn item(
+        &mut self,
+        c: &mut Cursor<'_>,
+        depth: usize,
+        at: &At,
+        first_of: usize,
+    ) -> Result<(), Bad> {
+        if first_of > 0 {
+            self.reserve(first_of);
+        }
+        let x = T::read(c, depth, at)?;
+        self.push(x);
+        Ok(())
+    }
+}
+
+/// A list next in the bytes, at nesting `depth`, read into `items`: once
+/// for every list, whatever its items.
+#[inline(never)]
+fn read_list(c: &mut Cursor<'_>, depth: usize, at: &At, items: &mut dyn Items) -> Result<(), Bad> {
+    let count = list_count(c, depth, at)?;
+    // no more room first than the decoder itself keeps for a list
+    let mut room = count.min(MOST_RESERVED);
+    for i in 0..count {
+        items.item(c, depth + 1, &At::Item(at, i), std::mem::take(&mut room))?;
+    }
+    Ok(())
 }
 
 /// A value held on the heap, as a record that holds itself holds itself:
@@ -1073,10 +1248,14 @@ impl Wire for Reference {
 /// the list of its fields, which the shared code below walks to measure,
 /// check and write them ([`Body`]), and reading them back.
 ///
-/// A record's own code is only that list ([`Fields::each`]) and its
-/// reading ([`Fields::take_fields`]), each a call per field; what is done
-/// with a field is written once per field type, in the visitors here,
-/// rather than once per record, which is what keeps the binaries small.
+/// A record's own code is only that list ([`Fields::each`], one visitor,
+/// [`Pass`], for measuring, checking and writing) and its reading straight
+/// from the bytes, a slot for each field filled by [`read_slots`] over the
+/// record's rows, then the struct made of the slots: what is done with a
+/// field is written once per field type (a [`Slot`]), and once in all for
+/// a list ([`read_list`]), a record held in another ([`read_held`]), a
+/// reply ([`read_reply_into`]) and a request's arguments, rather than once
+/// per record, request or list, which is what keeps the binaries small.
 pub trait Fields: Sized {
     /// Every field, numbered, as the tables give them.
     const FIELDS: &'static [Field];
@@ -1093,6 +1272,9 @@ pub trait Fields: Sized {
     /// record: what [`Fields::take_fields`] makes of the same record, or
     /// the same refusal.
     fn read_fields(w: &mut Walk, at: &At) -> Result<Self, Bad>;
+    /// Reads it as a record held in another, next in the bytes at nesting
+    /// `depth`: what [`record_read`] does.
+    fn read_held(c: &mut Cursor<'_>, depth: usize, at: &At) -> Result<Self, Bad>;
 }
 
 /// What is done with each field of a record ([`Fields::each`]), given its
@@ -1101,14 +1283,31 @@ pub trait Visit {
     fn field<T: Wire>(&mut self, row: &'static Field, v: &T);
 }
 
-/// Counts the fields sent and adds up their encoded lengths, each with
-/// its number.
-struct Measure<'a> {
-    skip: &'a [u64],
-    n: u64,
-    len: usize,
-    /// Whether the encoding can hold every field measured.
-    ok: bool,
+/// What is done with each field of a record that is written, in one
+/// visitor ([`Fields::each`]), so that each record has one list of its
+/// fields compiled, whatever is done with them.
+pub struct Pass<'a>(How<'a>);
+
+enum How<'a> {
+    /// Counts the fields sent and adds up their encoded lengths, each with
+    /// its number; and whether the encoding can hold every field measured.
+    Measure {
+        skip: &'a [u64],
+        n: u64,
+        len: usize,
+        ok: bool,
+    },
+    /// Writes the fields sent, each after its number, and counts them.
+    Encode {
+        skip: &'a [u64],
+        out: &'a mut Vec<u8>,
+        n: u64,
+    },
+    /// Finds the fields the encoding cannot hold.
+    Invalid {
+        at: &'a At<'a>,
+        out: Vec<(u64, &'static str, String)>,
+    },
 }
 
 /// Whether `n` is one of the fields left out: rarely any are.
@@ -1122,59 +1321,44 @@ fn listed(skip: &[u64], n: u64) -> bool {
     skip.contains(&n)
 }
 
-impl Visit for Measure<'_> {
+impl Visit for Pass<'_> {
     #[inline(never)]
     fn field<T: Wire>(&mut self, row: &'static Field, v: &T) {
-        if v.sent() && !skipped(self.skip, row.n) {
-            let (len, ok) = v.measured();
-            self.n += 1;
-            self.len += key_len(row.n) + len;
-            self.ok &= ok;
-            // where the tests run, text of a closed set that holds none of
-            // its values is said, as this build's mistake; it is sent as it
-            // is, as a release build sends it
-            #[cfg(debug_assertions)]
-            if let Some(t) = v.unknown(row.known).filter(|_| !row.known.is_empty()) {
-                mistake(format_args!(
-                    "{} is {t:?}, which is none of the values its row names",
-                    row.name
-                ));
+        if !v.sent() {
+            return;
+        }
+        match &mut self.0 {
+            How::Measure { skip, n, len, ok } => {
+                if skipped(skip, row.n) {
+                    return;
+                }
+                let (l, o) = v.measured();
+                *n += 1;
+                *len += key_len(row.n) + l;
+                *ok &= o;
+                // where the tests run, text of a closed set that holds none
+                // of its values is said, as this build's mistake; it is sent
+                // as it is, as a release build sends it
+                #[cfg(debug_assertions)]
+                if let Some(t) = v.unknown(row.known).filter(|_| !row.known.is_empty()) {
+                    mistake(format_args!(
+                        "{} is {t:?}, which is none of the values its row names",
+                        row.name
+                    ));
+                }
             }
-        }
-    }
-}
-
-/// Writes the fields sent, each after its number, and counts them.
-struct Encode<'a> {
-    skip: &'a [u64],
-    out: &'a mut Vec<u8>,
-    n: u64,
-}
-
-impl Visit for Encode<'_> {
-    #[inline(never)]
-    fn field<T: Wire>(&mut self, row: &'static Field, v: &T) {
-        if v.sent() && !skipped(self.skip, row.n) {
-            key(row.n, self.out);
-            v.encode_into(self.out);
-            self.n += 1;
-        }
-    }
-}
-
-/// Finds the fields the encoding cannot hold.
-struct Invalid<'a> {
-    at: &'a At<'a>,
-    out: Vec<(u64, &'static str, String)>,
-}
-
-impl Visit for Invalid<'_> {
-    #[inline(never)]
-    fn field<T: Wire>(&mut self, row: &'static Field, v: &T) {
-        if v.sent() {
-            let at = At::Field(self.at, row.name);
-            if let Err(e) = v.check(&at) {
-                self.out.push((row.n, row.name, e));
+            How::Encode { skip, out, n } => {
+                if !skipped(skip, row.n) {
+                    key(row.n, out);
+                    v.encode_into(out);
+                    *n += 1;
+                }
+            }
+            How::Invalid { at, out } => {
+                let at = At::Field(at, row.name);
+                if let Err(e) = v.check(&at) {
+                    out.push((row.n, row.name, e));
+                }
             }
         }
     }
@@ -1183,41 +1367,56 @@ impl Visit for Invalid<'_> {
 /// A record's fields seen without its type: what the shared code that
 /// writes a message takes, so that it is written once.
 pub trait Body {
-    /// How many of its fields are sent, leaving out those numbered in
-    /// `skip`; their length, each with its number; and whether the
-    /// encoding can hold them all (whether [`Body::invalid`] finds none).
-    fn measure(&self, skip: &[u64]) -> (u64, usize, bool);
-    /// Writes the encodings of its fields, in order, each after its
-    /// number, leaving out those numbered in `skip`: how many.
-    fn write(&self, skip: &[u64], out: &mut Vec<u8>) -> u64;
-    /// Its fields that the encoding cannot hold, each with why, in the
-    /// order of their names: none, unless this build has made a mistake.
-    fn invalid(&self, at: &At) -> Vec<(u64, &'static str, String)>;
+    /// Shows `p` each of its fields, in order ([`Fields::each`]).
+    fn pass(&self, p: &mut Pass<'_>);
 }
 
 impl<R: Fields> Body for R {
-    fn measure(&self, skip: &[u64]) -> (u64, usize, bool) {
-        let mut v = Measure {
+    #[inline(never)]
+    fn pass(&self, p: &mut Pass<'_>) {
+        self.each(p)
+    }
+}
+
+impl dyn Body + '_ {
+    /// How many of its fields are sent, leaving out those numbered in
+    /// `skip`; their length, each with its number; and whether the
+    /// encoding can hold them all (whether `invalid` finds none).
+    pub fn measure(&self, skip: &[u64]) -> (u64, usize, bool) {
+        let mut p = Pass(How::Measure {
             skip,
             n: 0,
             len: 0,
             ok: true,
-        };
-        self.each(&mut v);
-        (v.n, v.len, v.ok)
+        });
+        self.pass(&mut p);
+        match p.0 {
+            How::Measure { n, len, ok, .. } => (n, len, ok),
+            _ => unreachable!(),
+        }
     }
-    fn write(&self, skip: &[u64], out: &mut Vec<u8>) -> u64 {
-        let mut v = Encode { skip, out, n: 0 };
-        self.each(&mut v);
-        v.n
+    /// Writes the encodings of its fields, in order, each after its
+    /// number, leaving out those numbered in `skip`: how many.
+    pub fn write(&self, skip: &[u64], out: &mut Vec<u8>) -> u64 {
+        let mut p = Pass(How::Encode { skip, out, n: 0 });
+        self.pass(&mut p);
+        match p.0 {
+            How::Encode { n, .. } => n,
+            _ => unreachable!(),
+        }
     }
-    fn invalid(&self, at: &At) -> Vec<(u64, &'static str, String)> {
-        let mut v = Invalid {
+    /// Its fields that the encoding cannot hold, each with why, in the
+    /// order of their names: none, unless this build has made a mistake.
+    pub fn invalid(&self, at: &At) -> Vec<(u64, &'static str, String)> {
+        let mut p = Pass(How::Invalid {
             at,
             out: Vec::new(),
-        };
-        self.each(&mut v);
-        by_name(v.out)
+        });
+        self.pass(&mut p);
+        match p.0 {
+            How::Invalid { out, .. } => by_name(out),
+            _ => unreachable!(),
+        }
     }
 }
 
@@ -1416,16 +1615,25 @@ pub trait Ask: Fields + Clone + Send + Sync + 'static {
     /// for a reader that opened the message itself, as the service does
     /// once for every request.
     fn read_args(w: &mut Walk, msg: &[u8]) -> Result<Self, Refused> {
-        // all but the arguments' own fields written once; one way out
-        let bad = match Self::read_fields(w, &At::Top(Self::REQUEST.name)) {
-            Ok(args) => match w.end() {
-                Ok(()) => return Ok(args),
-                Err(e) => e,
-            },
-            Err(e) => e,
-        };
-        Err(unread_request(msg, bad))
+        // all but the arguments' own fields written once
+        let mut args: Option<Self> = None;
+        args_into(w, msg, Self::REQUEST.name, &mut args)?;
+        Ok(args.unwrap_or_else(|| never_read()))
     }
+}
+
+/// A request's arguments, read into `into` on the walk through `msg`, and
+/// nothing after them; or why not, as error 2: written once.
+#[inline(never)]
+fn args_into(w: &mut Walk, msg: &[u8], name: &str, into: &mut dyn ReadInto) -> Result<(), Refused> {
+    let bad = match into.read_into(w, &At::Top(name)) {
+        Ok(()) => match w.end() {
+            Ok(()) => return Ok(()),
+            Err(e) => e,
+        },
+        Err(e) => e,
+    };
+    Err(unread_request(msg, bad))
 }
 
 /// A request that could not be read, in the tree's words, as error 2.
@@ -1664,17 +1872,82 @@ const STATUS: &str = "a reply's key 0 is its status";
 /// A reply off the wire, read straight from its bytes: what it says, or
 /// how it failed. An error is [`Unreadable`], in the words the way
 /// through the tree ([`read_reply_tree`]) says it in.
+#[inline]
 pub fn read_reply<A: Ask>(msg: &[u8]) -> Result<Result<A::Reply, Failed>, Unreadable> {
+    let mut reply: Option<A::Reply> = None;
+    match read_reply_into(msg, A::REQUEST.name, &mut reply)? {
+        Some(failed) => Ok(Err(failed)),
+        None => Ok(Ok(reply.unwrap_or_else(|| never_read()))),
+    }
+}
+
+/// A record's fields being read, whatever the record: where they go once
+/// read ([`Fields::read_fields`]), for the reading of a whole message,
+/// written once.
+pub trait ReadInto {
+    /// Reads the record's fields on `w`, into itself.
+    fn read_into(&mut self, w: &mut Walk, at: &At) -> Result<(), Bad>;
+}
+
+impl<R: Fields> ReadInto for Option<R> {
+    #[inline(never)]
+    fn read_into(&mut self, w: &mut Walk, at: &At) -> Result<(), Bad> {
+        fill(self, R::read_fields(w, at)?);
+        Ok(())
+    }
+}
+
+/// A reply off the wire, read straight from its bytes, its fields into
+/// `into`, as the request `name` answers: none, if it was done (`into`
+/// then holds them), or how it failed. Written once for every request:
+/// [`read_reply`] and a client's paging ([`crate::client::Pages`]) are
+/// thin over it.
+#[inline(never)]
+pub fn read_reply_into(
+    msg: &[u8],
+    name: &str,
+    into: &mut dyn ReadInto,
+) -> Result<Option<Failed>, Unreadable> {
     let mut c = Cursor::new(msg);
     let mut w = Walk::open(&mut c);
     let mut failed = None;
     if !reply_done(&mut w, msg, &mut failed)? {
         return match failed {
-            Some(failed) => Ok(Err(failed)),
+            Some(failed) => Ok(Some(failed)),
             None => Err(Unreadable(String::new())),
         };
     }
-    reply_fields(&mut w, msg, &At::Top(A::REQUEST.name)).map(Ok)
+    fields_into(&mut w, msg, &At::Top(name), into)?;
+    Ok(None)
+}
+
+/// A record's fields, read into `into` on the walk through `msg`, and
+/// nothing after them; or why not, in the tree's words.
+#[inline(never)]
+fn fields_into(
+    w: &mut Walk,
+    msg: &[u8],
+    at: &At,
+    into: &mut dyn ReadInto,
+) -> Result<(), Unreadable> {
+    let bad = match into.read_into(w, at) {
+        Ok(()) => match w.end() {
+            Ok(()) => return Ok(()),
+            Err(e) => e,
+        },
+        Err(e) => e,
+    };
+    Err(unread_reply(msg, bad))
+}
+
+/// What was read into is there once it was read: were it not, this
+/// build's mistake, which ends the program. It cannot unwind (`extern
+/// "C"`), so that no code to drop what was being read is written for each
+/// place that names it.
+#[cold]
+#[inline(never)]
+pub extern "C" fn never_read() -> ! {
+    panic!("a record read without a refusal is there")
 }
 
 /// A reply's status, on the walk through its message: whether it says it
@@ -1707,14 +1980,9 @@ pub fn reply_done(
 /// on with, and nothing after them.
 #[inline]
 pub fn reply_fields<R: Fields>(w: &mut Walk, msg: &[u8], at: &At) -> Result<R, Unreadable> {
-    let bad = match R::read_fields(w, at) {
-        Ok(reply) => match w.end() {
-            Ok(()) => return Ok(reply),
-            Err(e) => e,
-        },
-        Err(e) => e,
-    };
-    Err(unread_reply(msg, bad))
+    let mut reply: Option<R> = None;
+    fields_into(w, msg, at, &mut reply)?;
+    Ok(reply.unwrap_or_else(|| never_read()))
 }
 
 /// A reply that could not be read, in the tree's words.
@@ -1793,7 +2061,8 @@ pub fn reply_record(msg: &[u8]) -> Result<Result<Record, Failed>, Unreadable> {
 /// A reply that did not do what was asked: its status, why, and what more
 /// an error says ([`ErrorMore`](crate::table::ErrorMore)), as a message.
 pub fn error_message(status: u64, why: &str, more: &crate::table::ErrorMore) -> Vec<u8> {
-    let (n, len, _) = Body::measure(more, &[]);
+    let more: &dyn Body = more;
+    let (n, len, _) = more.measure(&[]);
     let mut out = Vec::with_capacity(8 + why.len() + len);
     header(T_RECORD, 2 + n, &mut out);
     write_varint(0, &mut out);
@@ -1801,7 +2070,7 @@ pub fn error_message(status: u64, why: &str, more: &crate::table::ErrorMore) -> 
     write_varint(WHY, &mut out);
     header(T_TEXT, why.len() as u64, &mut out);
     out.extend_from_slice(why.as_bytes());
-    Body::write(more, &[], &mut out);
+    more.write(&[], &mut out);
     out
 }
 

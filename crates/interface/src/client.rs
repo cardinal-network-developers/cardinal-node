@@ -54,9 +54,7 @@
 //! stream's messages by their key 0 ([`Event::read`](crate::Event::read),
 //! [`Frame::read`](crate::Frame::read)): no tree of the encoding between.
 
-use cardinal_encoding::Cursor;
-
-use crate::typed::{reply_done, reply_fields, Ask, At, Failed, Unencodable, Unreadable, Walk};
+use crate::typed::{never_read, read_reply_into, Ask, Failed, Unencodable, Unreadable};
 use crate::Request;
 
 /// Carries one request's message to the service and its reply's back: a
@@ -306,13 +304,13 @@ impl<A: Ask, P: Past<A>> Paging for Pages<A, P> {
         }
     }
     fn took(&mut self, reply: &[u8]) -> Result<bool, Unreadable> {
-        // a refusal is read into `failed` by code written once
-        let mut c = Cursor::new(reply);
-        let mut w = Walk::open(&mut c);
-        if !reply_done(&mut w, reply, &mut self.failed)? {
+        // the reply read by code written once, its page into `page`
+        let mut page: Option<A::Reply> = None;
+        if let Some(failed) = read_reply_into(reply, A::REQUEST.name, &mut page)? {
+            self.failed = Some(failed);
             return Ok(self.past.went_past(&mut self.asked, &mut self.failed));
         }
-        let page = reply_fields(&mut w, reply, &At::Top(A::REQUEST.name))?;
+        let page = page.unwrap_or_else(|| never_read());
         match &mut self.all {
             None => {
                 self.all = Some(page);

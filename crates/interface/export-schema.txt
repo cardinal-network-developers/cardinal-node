@@ -5,6 +5,7 @@ field 3 name text
 field 4 optional bool
 field 5 type {type}
 field 6 known [text] optional
+field 7 form text optional
 interface 1 error [{field}]
 interface 2 events [{message}]
 interface 3 frames [{message}]
@@ -45,6 +46,7 @@ request 9 stream bool
 request 10 reads bool
 request 11 unless [text] optional
 request 12 one_page [text] optional
+request 13 tooling bool
 status 1 n uint
 status 2 name text
 type 1 is text
