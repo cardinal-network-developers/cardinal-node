@@ -861,7 +861,17 @@ differs or was read:
   new owner holds it. Nothing is asked or held back (`core.rs`,
   `a_change_kept_after_a_recovery_is_listed_and_can_be_undone`). Whoever
   undo adds back is offered the group, as an addition is: nothing they
-  hold leads to it. A successor the person started with a removed key
+  hold leads to it. The undo is kept as soon as the group has moved on,
+  and asked again it answers the group it made; one added back whose
+  relationship this device does not hold yet (a contact not reached since
+  the recovery, whose relationship comes back from them,
+  `hosts.md#restore`) is owed the offer, which is written, of the group or
+  what it has moved on to, once a session with them has asked what it
+  asks (`recovered.json`'s `owed`;
+  `a_kept_removal_is_undone_before_the_one_added_back_is_reached`). Before,
+  the offer's failure ("space not held") failed the undo after the group
+  had moved on, so that it was never noted, asking again found nothing
+  left to undo, and the one added back was never offered it. A successor the person started with a removed key
   counts for nobody on the new device until it writes the keep again, so
   it is synced with those its genesis names, who hold that keep
   (`guardians.rs`, `a_move_confirmed_before_the_loss_stands_after_a_recovery`).

@@ -305,21 +305,23 @@ pub async fn sync_all(d: &Arc<Daemon>, s: &Session) {
     let Some(member) = member else {
         return;
     };
-    let Some(asks) = crate::recovering::asks_of(d, &member) else {
-        return;
-    };
-    let mut through = true;
-    for label in &asks {
-        if let Err(e) = reconcile_as(d, s, *label, Access::Offered).await {
-            through = false;
-            tracing::debug!(
-                "asking {} for {}: {e:#}",
-                short(&s.peer_static()),
-                short(label)
-            );
+    if let Some(asks) = crate::recovering::asks_of(d, &member) {
+        let mut through = true;
+        for label in &asks {
+            if let Err(e) = reconcile_as(d, s, *label, Access::Offered).await {
+                through = false;
+                tracing::debug!(
+                    "asking {} for {}: {e:#}",
+                    short(&s.peer_static()),
+                    short(label)
+                );
+            }
         }
+        crate::recovering::asked(d, &member, &asks, through);
     }
-    crate::recovering::asked(d, &member, &asks, through);
+    // An undo after the recovery that added them back owes them its offer
+    // until their relationship came, as it may just have.
+    crate::recovering::offer_owed(d, &member);
 }
 
 async fn handle_stream(d: &Arc<Daemon>, s: &Session, mut st: Stream) -> anyhow::Result<()> {
