@@ -4282,6 +4282,25 @@ pub static NODE_ONLY: &[&str] = &[
     "speedtest",
 ];
 
+/// Of the node's own requests ([`NODE_ONLY`]), those that are its tooling,
+/// not a window's: inspection and measuring, which the command line asks
+/// for a person looking into the node (`cardinal inspect`, `debug-tree`,
+/// `speedtest`), and which no window asks. Marked in the export, so that a
+/// generator for a window may leave them out.
+pub static TOOLING: &[&str] = &[
+    "inspect-on",
+    "inspect-off",
+    "inspect",
+    "inspect-identity",
+    "inspect-space",
+    "inspect-entries",
+    "inspect-entry",
+    "inspect-nodes",
+    "inspect-node",
+    "debug-tree",
+    "speedtest",
+];
+
 // ---- What the service's program says without starting ----
 
 typed!(DATA_HELD "data held" DataHeld {

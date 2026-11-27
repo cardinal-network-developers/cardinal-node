@@ -2454,7 +2454,15 @@ asks for around that is not built yet.
     moved, retyped or given again). It does not say what each id
     identifies: the names do not settle it (38 fields called `id` name
     messages, calls, devices and more), so it would need a declaration on
-    each of some 260 fields of ids and refs.
+    each of some 260 fields of ids and refs. Nor, of a `ref`, which form a
+    request takes (text a person typed, an id's bytes, or either): the
+    handlers decide that, and the declarations know it only of the cursor
+    back from the newest, `before`, the id of the oldest item had, which
+    the export says (`form` `id`); the rest would need a declaration on
+    each of the 96 fields of refs. A request of the node's own that is its
+    tooling, not a window's, is marked `tooling`: inspection and
+    measuring (`TOOLING`, requests 200 to 210), which only the command line
+    asks, so that a generator for a window may leave them out.
   - **The way by name, kept to compare.** While requests are converted,
     main's handlers of the typed requests are kept whole, as `*_by_name`
     (with main's lookups and main's arms in `control::handle`), compiled

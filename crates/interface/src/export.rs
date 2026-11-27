@@ -44,7 +44,10 @@
 //!   with the `id` field of its records that error 4 and `before` name it
 //!   by, whether it is a `stream` (the connection carries one after it),
 //!   whether it is `gone` (its number no longer answered), whether it
-//!   is the node's `own` (not in `apps.md`), and whether it `reads`:
+//!   is the node's `own` (not in `apps.md`), whether it is the node's
+//!   `tooling` (inspection and measuring, of the node's own: a request no
+//!   window asks, which a generator for a window may leave out), and
+//!   whether it `reads`:
 //!   answering it changes nothing, `unless` one of the arguments named
 //!   there is given (a request that writes, a stream's, or one no longer
 //!   answered does not); of a paged request, `one_page`, the arguments that
@@ -64,7 +67,12 @@
 //!   whether it is `gone` (its number no longer used: never sent, passed
 //!   over when read; `type` is what it held); of text whose values are a
 //!   closed set its declaration names, those values, `known` (it is still
-//!   text on the wire, and a client that meets another shows it as text).
+//!   text on the wire, and a client that meets another shows it as text);
+//!   of a `ref` whose form the declarations know, that `form`: `id`, the
+//!   bytes of an id, as for `before`, the oldest item had, which `next`
+//!   gives (without it, a `ref` is text a person typed or an id's bytes,
+//!   as the request's handler reads it, which the declarations do not
+//!   say).
 //! - *type*: what it `is` (`text`, `bytes`, `uint`, `int`, `bool`, `ref`,
 //!   `kind`, `int or text`, `list` or `record`); of `bytes` of one length
 //!   only, its `size`; of a list, its `item`; of a record, the `record`'s
@@ -81,7 +89,7 @@ use crate::table::{Field, Page, Request, Ty};
 use crate::typed::{Ask, Wire};
 use crate::{each_request, typed};
 use crate::{key, status, MAX_MESSAGE, MIN_SERVICE};
-use crate::{ERROR_FIELDS, EVENTS, FRAMES, NODE_ONLY, PROGRAM, REQUESTS, VERSION};
+use crate::{ERROR_FIELDS, EVENTS, FRAMES, NODE_ONLY, PROGRAM, REQUESTS, TOOLING, VERSION};
 
 typed!(
     /// A field's type.
@@ -99,6 +107,7 @@ typed!(FIELD "field" FieldOf {
     4 optional: bool,
     5 r#type: TypeOf,
     6 known: Option<Vec<String>>,
+    7 form: Option<String>,
 });
 typed!(LIST "list" ListOf {
     1 id: Option<String>,
@@ -117,6 +126,7 @@ typed!(REQUEST "request" RequestOf {
     10 reads: bool,
     11 unless: Option<Vec<String>>,
     12 one_page: Option<Vec<String>>,
+    13 tooling: bool,
 });
 typed!(MESSAGE "message" MessageOf {
     1 fields: Vec<FieldOf>,
@@ -196,6 +206,12 @@ fn type_of(ty: &Ty) -> TypeOf {
 }
 
 fn fields_of(fields: &[Field]) -> Vec<FieldOf> {
+    fields_with(fields, &[])
+}
+
+/// [`fields_of`], with the `ref` fields named in `ids` said to take an
+/// id's bytes (`form` `id`).
+fn fields_with(fields: &[Field], ids: &[&str]) -> Vec<FieldOf> {
     fields
         .iter()
         .map(|f| {
@@ -203,9 +219,11 @@ fn fields_of(fields: &[Field]) -> Vec<FieldOf> {
                 Ty::Gone(t) => (true, *t),
                 t => (false, t),
             };
+            let id = matches!(ty, Ty::Ref) && ids.contains(&f.name);
             FieldOf {
                 known: (!f.known.is_empty())
                     .then(|| f.known.iter().map(|k| (*k).to_owned()).collect()),
+                form: id.then(|| "id".to_owned()),
                 ..crate::new!(FieldOf {
                     gone,
                     n: f.n,
@@ -249,7 +267,11 @@ macro_rules! declared {
 }
 each_request!(declared);
 
-fn request_of(r: &Request, own: bool, (lists, reads, unless, one_page): Declared) -> RequestOf {
+fn request_of(
+    r: &Request,
+    (own, tooling): (bool, bool),
+    (lists, reads, unless, one_page): Declared,
+) -> RequestOf {
     let page = match r.page {
         Page::Whole => "whole",
         Page::After => "after",
@@ -265,11 +287,17 @@ fn request_of(r: &Request, own: bool, (lists, reads, unless, one_page): Declared
         })
         .collect();
     let names = |n: &[&str]| (!n.is_empty()).then(|| n.iter().map(|u| (*u).to_owned()).collect());
+    // back from the newest, the cursor is the id of the oldest had, as
+    // `next` gives it: the one `ref` whose form the declarations know
+    let ids: &[&str] = match r.page {
+        Page::Before { .. } => &["before"],
+        _ => &[],
+    };
     RequestOf {
         unless: names(unless),
         one_page: names(one_page),
         ..crate::new!(RequestOf {
-            args: fields_of(r.args),
+            args: fields_with(r.args, ids),
             gone: r.gone,
             lists,
             n: r.n,
@@ -278,7 +306,8 @@ fn request_of(r: &Request, own: bool, (lists, reads, unless, one_page): Declared
             page: page.to_owned(),
             reply: fields_of(r.reply),
             stream: r.stream,
-            reads
+            reads,
+            tooling
         })
     }
 }
@@ -345,12 +374,15 @@ fn interface() -> Interface {
         // and declare nothing beyond their rows
         program: PROGRAM
             .iter()
-            .map(|r| request_of(r, false, (&[], false, &[], &[])))
+            .map(|r| request_of(r, (false, false), (&[], false, &[], &[])))
             .collect(),
         records: records(),
         requests: REQUESTS
             .iter()
-            .map(|r| request_of(r, NODE_ONLY.contains(&r.name), declared_of(r.n)))
+            .map(|r| {
+                let marks = (NODE_ONLY.contains(&r.name), TOOLING.contains(&r.name));
+                request_of(r, marks, declared_of(r.n))
+            })
             .collect(),
         version: VERSION,
         layout: crate::new!(LayoutOf {
@@ -474,6 +506,36 @@ fn the_export_reads_back_and_holds_every_request() {
     // of their numbers
     assert!(back.program.iter().all(|p| p.lists.is_empty() && !p.reads));
     assert!(by("inspect").own && !by("files").own);
+    // the node's tooling is of its own, and named requests; a window's is not
+    for name in TOOLING {
+        let r = by(name);
+        assert!(r.tooling && r.own, "{name}");
+    }
+    assert!(!by("guardians").tooling && by("guardians").own && !by("files").tooling);
+    // the cursor back from the newest is an id; no other ref says its form
+    let before = |name: &str| {
+        let r = by(name);
+        r.args.iter().find(|f| f.name == "before").cloned()
+    };
+    assert_eq!(
+        before("messages").and_then(|f| f.form).as_deref(),
+        Some("id")
+    );
+    let formed: Vec<String> = back
+        .requests
+        .iter()
+        .flat_map(|r| r.args.iter().map(move |f| (r, f)))
+        .filter(|(_, f)| f.form.is_some())
+        .map(|(r, f)| format!("{}.{}", r.name, f.name))
+        .collect();
+    assert!(
+        back.requests
+            .iter()
+            .filter(|r| r.page == "before")
+            .all(|r| formed.contains(&format!("{}.before", r.name))),
+        "{formed:?}"
+    );
+    assert!(formed.iter().all(|f| f.ends_with(".before")), "{formed:?}");
     // a field the last release lacked is optional; one always sent is not
     let call = back
         .records
