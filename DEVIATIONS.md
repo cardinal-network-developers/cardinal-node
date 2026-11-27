@@ -2313,11 +2313,17 @@ asks for around that is not built yet.
     its reply and each record in it are Rust values, declared once in
     `crates/interface/src/table.rs` with `typed!`: the declaration is the
     struct, its row in the tables, and its encoding both ways
-    (`crates/interface/src/typed.rs`), so they cannot drift. What the declaration compiles to is the list of its fields
-    (`Fields::each`, a call per field with its row) and their reading
-    (`take_field` per field); measuring, checking, writing and paging
-    are written once per field type or once in all, so that the release
-    binaries are no larger than they were by name.
+    (`crates/interface/src/typed.rs`), so they cannot drift. What the
+    declaration compiles to is the list of its fields (`Fields::each`, a
+    call per field with its row, shown to one visitor, `Pass`, that
+    measures, checks or writes) and its reading (a slot for each field,
+    filled by `read_slots` over the record's rows, then the struct made of
+    the slots); measuring, checking, writing, reading a field of each type
+    (`Slot`), a list (`read_list`, over a `dyn` reader of its items), a
+    record held in another (`read_held`), a reply (`read_reply_into`, which
+    `read_reply` and a client's `Pages` are thin over), a request's
+    arguments, and paging are written once per field type or once in all,
+    so that the release binaries are no larger than they were by name.
     A field's Rust type gives its type in the tables: `String` or
     `Cow<'static, str>` text, `bool`, `u64` uint, `i64` int,
     `api::typed::Kind` a kind, `api::typed::Scalar` int or text, `[u8; N]`

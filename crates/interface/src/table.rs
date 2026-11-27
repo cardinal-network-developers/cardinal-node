@@ -161,7 +161,7 @@ macro_rules! typed {
     ) => {
         $crate::typed!(@munch $h $st
             [$($s)* ($(#[$fm])* $f : Option<$t>)] [$($r)*] [$($o)* $f]
-            [$($l)* ($n $f)] [$($a)* ($n $f (as $row ?))] $($($rest)*)?);
+            [$($l)* ($n $f opt ($t))] [$($a)* ($n $f (as $row ?))] $($($rest)*)?);
     };
     // A field always sent, of a record that holds itself.
     (@munch $h:tt $st:tt [$($s:tt)*] [$($r:tt)*] [$($o:tt)*] [$($l:tt)*] [$($a:tt)*]
@@ -169,7 +169,7 @@ macro_rules! typed {
     ) => {
         $crate::typed!(@munch $h $st
             [$($s)* ($(#[$fm])* $f : $t)] [$($r)* ($f : $t)] [$($o)*]
-            [$($l)* ($n $f)] [$($a)* ($n $f (as $row))] $($($rest)*)?);
+            [$($l)* ($n $f req ($t))] [$($a)* ($n $f (as $row))] $($($rest)*)?);
     };
     // A field of text sent only when it is `Some`, whose values are a
     // closed set: `where "a" | "b"`.
@@ -179,7 +179,7 @@ macro_rules! typed {
     ) => {
         $crate::typed!(@munch $h $st
             [$($s)* ($(#[$fm])* $f : Option<$t>)] [$($r)*] [$($o)* $f]
-            [$($l)* ($n $f)] [$($a)* ($n $f (Option<$t>) [$($k),+])] $($($rest)*)?);
+            [$($l)* ($n $f opt ($t))] [$($a)* ($n $f (Option<$t>) [$($k),+])] $($($rest)*)?);
     };
     // A field of text always sent, whose values are a closed set.
     (@munch $h:tt $st:tt [$($s:tt)*] [$($r:tt)*] [$($o:tt)*] [$($l:tt)*] [$($a:tt)*]
@@ -187,7 +187,7 @@ macro_rules! typed {
     ) => {
         $crate::typed!(@munch $h $st
             [$($s)* ($(#[$fm])* $f : $t)] [$($r)* ($f : $t)] [$($o)*]
-            [$($l)* ($n $f)] [$($a)* ($n $f ($t) [$($k),+])] $($($rest)*)?);
+            [$($l)* ($n $f req ($t))] [$($a)* ($n $f ($t) [$($k),+])] $($($rest)*)?);
     };
     // A field sent only when it is `Some`.
     (@munch $h:tt $st:tt [$($s:tt)*] [$($r:tt)*] [$($o:tt)*] [$($l:tt)*] [$($a:tt)*]
@@ -195,7 +195,7 @@ macro_rules! typed {
     ) => {
         $crate::typed!(@munch $h $st
             [$($s)* ($(#[$fm])* $f : Option<$t>)] [$($r)*] [$($o)* $f]
-            [$($l)* ($n $f)] [$($a)* ($n $f (Option<$t>))] $($($rest)*)?);
+            [$($l)* ($n $f opt ($t))] [$($a)* ($n $f (Option<$t>))] $($($rest)*)?);
     };
     // A field always sent.
     (@munch $h:tt $st:tt [$($s:tt)*] [$($r:tt)*] [$($o:tt)*] [$($l:tt)*] [$($a:tt)*]
@@ -203,7 +203,7 @@ macro_rules! typed {
     ) => {
         $crate::typed!(@munch $h $st
             [$($s)* ($(#[$fm])* $f : $t)] [$($r)* ($f : $t)] [$($o)*]
-            [$($l)* ($n $f)] [$($a)* ($n $f ($t))] $($($rest)*)?);
+            [$($l)* ($n $f req ($t))] [$($a)* ($n $f ($t))] $($($rest)*)?);
     };
     (@row ($n:literal $f:ident (as {$row:ident} $($opt:tt)?))) => {
         $crate::table::Field {
@@ -268,7 +268,8 @@ macro_rules! typed {
     (@munch [$(#[$m:meta])* $name:ident] [$stat:ident $title:literal]
         $s:tt $r:tt $o:tt $l:tt [$($a:tt)*]
     ) => {
-        // read where it is held, once (`typed::record_read`)
+        // read where it is held, once: in its `Wire::read`, which every
+        // field and list of it calls
         $crate::typed!(@body [$(#[$m])* $name] ($stat.fields) [inline] $s $r $o $l);
 
         #[doc = concat!("The *", $title, "* record's row in the tables.")]
@@ -309,20 +310,21 @@ macro_rules! typed {
             ) -> Result<Self, String> {
                 $crate::typed::record_take(v, at)
             }
-            #[inline]
+            #[inline(never)]
             fn read(
                 c: &mut $crate::__private::Cursor<'_>,
                 depth: usize,
                 at: &$crate::typed::At,
             ) -> Result<Self, $crate::typed::Bad> {
-                $crate::typed::record_read(c, depth, at)
+                <Self as $crate::typed::Fields>::read_held(c, depth, at)
             }
         }
     };
     // The arguments or the reply of a request: its rows in a static of
     // their own, so that every crate that names them names the one.
     (@munch [$(#[$m:meta])* $name:ident] [] $s:tt $r:tt $o:tt $l:tt [$($a:tt)*]) => {
-        // read from a whole message, once
+        // read from a whole message, once: in its `ReadInto`, which the
+        // reading of a reply or a request, written once for all, calls
         $crate::typed!(@body [$(#[$m])* $name] ({
             static FIELDS: [$crate::table::Field; $crate::typed!(@count $($a)*)] =
                 [ $( $crate::typed!(@row $a) ),* ];
@@ -346,11 +348,42 @@ macro_rules! typed {
     // How many rows: one for each field, gone or not.
     (@count $($a:tt)*) => { <[()]>::len(&[$($crate::typed!(@unit $a)),*]) };
     (@unit $a:tt) => { () };
+    // A record's fields read into a slot each by `$read`, given its rows
+    // and the slots, then the struct made of them: a slot for a field
+    // sent only when it is `Some` is the field itself, and one always sent
+    // is had from its slot, which its reading filled.
+    (@slots $name:ident [$(($lf:ident $lk:ident ($lt:ty)))*] [$($ln:literal)*]
+        $read:ident($($a:expr),*)
+    ) => {{
+        // each field's place among the rows, in the order of their
+        // numbers, as they come, and whether it may be absent
+        const ROWS: &[u16] = &[$(
+            $crate::typed::row_of(<$name as $crate::typed::Fields>::FIELDS, $ln)
+                | $crate::typed!(@may $lk),
+        )*];
+        let ($(mut $lf,)*): ($(Option<$lt>,)*) = ($(None::<$lt>,)*);
+        $crate::typed::$read(
+            $($a,)*
+            <$name as $crate::typed::Fields>::FIELDS,
+            ROWS,
+            &mut [$(&mut $lf as &mut dyn $crate::typed::Slot),*],
+        )?;
+        // every slot of a field always sent is filled once its reading
+        // did not fail
+        $($crate::typed!(@filled $lk $lf);)*
+        Ok($name { $($lf,)* })
+    }};
+    (@may opt) => { $crate::typed::MAY_BE_ABSENT };
+    (@may req) => { 0 };
+    (@filled opt $f:ident) => {};
+    (@filled req $f:ident) => {
+        let Some($f) = $f else { $crate::typed::never_read() };
+    };
     (@body [$(#[$m:meta])* $name:ident] ($fields:expr) [$inl:meta]
         [$(($(#[$fm:meta])* $sf:ident : $st:ty))*]
         [$(($rf:ident : $rt:ty))*]
         [$($of:ident)*]
-        [$(($ln:literal $lf:ident))*]
+        [$(($ln:literal $lf:ident $lk:ident ($lt:ty)))*]
     ) => {
         $(#[$m])*
         #[derive(Clone, Debug, PartialEq)]
@@ -415,29 +448,31 @@ macro_rules! typed {
             }
 
             // once for each record: a record held in others in the one
-            // place it is read from wherever it is held, the arguments or
-            // the reply of a request where a whole message is read
+            // place it is read from wherever it is held (`read_held`, which
+            // its `Wire::read` calls), the arguments or the reply of a
+            // request where a whole message is read (`read_fields`). Each
+            // field is read into a slot of its own by code written once for
+            // all (`typed::read_slots`), over its row; the record's own code
+            // is only its slots and the struct made of them.
             #[$inl]
-            #[allow(unused_variables)]
+            #[allow(unused_variables, unused_mut)]
             fn read_fields(
                 w: &mut $crate::typed::Walk,
                 at: &$crate::typed::At,
             ) -> Result<Self, $crate::typed::Bad> {
-                // in the order of their numbers, as they come
-                Ok($name { $(
-                    $lf: $crate::typed::read_field(
-                        w,
-                        const {
-                            &<$name as $crate::typed::Fields>::FIELDS[
-                                $crate::typed::index(
-                                    <$name as $crate::typed::Fields>::FIELDS,
-                                    $ln,
-                                )
-                            ]
-                        },
-                        at,
-                    )?,
-                )* })
+                $crate::typed!(@slots $name [$(($lf $lk ($lt)))*] [$($ln)*]
+                    read_slots(w, at))
+            }
+
+            #[inline]
+            #[allow(unused_variables, unused_mut)]
+            fn read_held(
+                c: &mut $crate::__private::Cursor<'_>,
+                depth: usize,
+                at: &$crate::typed::At,
+            ) -> Result<Self, $crate::typed::Bad> {
+                $crate::typed!(@slots $name [$(($lf $lk ($lt)))*] [$($ln)*]
+                    read_held(c, depth, at))
             }
         }
 
